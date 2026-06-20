@@ -22,7 +22,8 @@ const ChatBody = z.object({
 /** Write a single SSE event to the raw response stream. */
 function writeSSE(reply: FastifyReply, event: string, data: unknown): void {
   const payload = typeof data === "string" ? data : JSON.stringify(data);
-  reply.raw.write(`event: ${event}\ndata: ${payload}\n\n`);
+  const dataLines = payload.split("\n").map((l) => `data: ${l}`).join("\n");
+  reply.raw.write(`event: ${event}\n${dataLines}\n\n`);
 }
 
 /** Set the required SSE response headers. */

@@ -25,6 +25,14 @@ const roleLabels: Record<string, string> = {
 };
 
 const statusLabels: Record<string, { text: string; color: string }> = {
+  created: { text: "Created", color: "text-gray-400" },
+  active: { text: "Active", color: "text-emerald-400" },
+  promoted: { text: "Promoted", color: "text-blue-400" },
+  receiving: { text: "Receiving", color: "text-amber-400" },
+  merging: { text: "Merging", color: "text-purple-400" },
+  dissolving: { text: "Dissolving", color: "text-red-400" },
+  archived: { text: "Archived", color: "text-gray-500" },
+  // Legacy statuses (demo/fallback)
   idle: { text: "Idle", color: "text-gray-400" },
   working: { text: "Working", color: "text-emerald-400" },
   error: { text: "Error", color: "text-red-400" },
@@ -49,21 +57,26 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       return;
     }
 
-    // Load messages from store
+    // Load messages from store for this agent
     setMessages(chatSessions[agentId] || []);
 
     // Fetch agent details
     async function fetchAgent() {
       try {
         const data = await getAgent(agentId!);
-        setAgentInfo(data);
+        if (data && typeof data === "object" && data.id) {
+          setAgentInfo(data);
+        } else {
+          setAgentInfo({ id: agentId!, name: "Agent", role: "module_dev", status: "idle" });
+        }
       } catch (err) {
         console.error("Failed to fetch agent:", err);
         setAgentInfo({ id: agentId!, name: "Agent", role: "module_dev", status: "idle" });
       }
     }
     fetchAgent();
-  }, [agentId, chatSessions]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -102,7 +115,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       agentId,
       input.trim(),
       (event) => {
-        if (event.type === "token") {
+        if (event.type === "text") {
           accumulated += event.data;
           setMessages((prev) =>
             prev.map((m) =>
@@ -155,7 +168,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     );
   }
 
-  const statusInfo = statusLabels[agentInfo?.status || "idle"];
+  const statusInfo = statusLabels[agentInfo?.status || "idle"] || { text: agentInfo?.status || "Unknown", color: "text-gray-400" };
 
   return (
     <div className="h-full flex flex-col bg-surface">

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import {
   ReactFlow,
   Background,
@@ -101,20 +101,41 @@ function OrgTree() {
   // Fetch and layout org tree
   useEffect(() => {
     async function fetchTree() {
-      try {
-        const data = await getOrgTree();
-        const treeData: OrgNodeData = data.root || data;
-
+      const layoutRoots = (roots: OrgNodeData[]) => {
         const newNodes: Node[] = [];
         const newEdges: Edge[] = [];
 
-        // Start layout from center
-        const subtreeWidth = getSubtreeWidth(treeData);
-        const startX = subtreeWidth / 2 - NODE_WIDTH / 2;
-        layoutTree(treeData, startX, 0, newNodes, newEdges);
+        let offsetX = 0;
+        for (const root of roots) {
+          const w = getSubtreeWidth(root);
+          layoutTree(root, offsetX + w / 2 - NODE_WIDTH / 2, 0, newNodes, newEdges);
+          offsetX += w + X_SPACING;
+        }
 
         setNodes(newNodes);
         setEdges(newEdges);
+      };
+
+      try {
+        const data = await getOrgTree();
+
+        // API returns an array of root nodes: [rootAgent, ...]
+        let roots: OrgNodeData[];
+        if (Array.isArray(data)) {
+          roots = data.filter((n: any) => n && n.id);
+        } else if (data?.root && data.root.id) {
+          roots = [data.root];
+        } else if (data?.id) {
+          roots = [data];
+        } else {
+          roots = [];
+        }
+
+        if (roots.length === 0) {
+          console.warn("Unexpected org tree shape:", data);
+          throw new Error("No valid root nodes in tree data");
+        }
+        layoutRoots(roots);
       } catch (err) {
         console.error("Failed to fetch org tree:", err);
         // Fallback demo data
@@ -130,37 +151,14 @@ function OrgTree() {
               role: "manager",
               status: "working",
               children: [
-                {
-                  id: "dev-1",
-                  name: "Backend Dev",
-                  role: "module_dev",
-                  status: "idle",
-                },
-                {
-                  id: "dev-2",
-                  name: "Frontend Dev",
-                  role: "module_dev",
-                  status: "working",
-                },
+                { id: "dev-1", name: "Backend Dev", role: "module_dev", status: "idle" },
+                { id: "dev-2", name: "Frontend Dev", role: "module_dev", status: "working" },
               ],
             },
-            {
-              id: "qa-1",
-              name: "QA Engineer",
-              role: "qa",
-              status: "idle",
-            },
+            { id: "qa-1", name: "QA Engineer", role: "qa", status: "idle" },
           ],
         };
-
-        const newNodes: Node[] = [];
-        const newEdges: Edge[] = [];
-        const subtreeWidth = getSubtreeWidth(demoTree);
-        const startX = subtreeWidth / 2 - NODE_WIDTH / 2;
-        layoutTree(demoTree, startX, 0, newNodes, newEdges);
-
-        setNodes(newNodes);
-        setEdges(newEdges);
+        layoutRoots([demoTree]);
       }
     }
 

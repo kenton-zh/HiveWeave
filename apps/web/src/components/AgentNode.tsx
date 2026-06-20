@@ -11,6 +11,14 @@ const roleColors: Record<string, { bg: string; text: string; label: string }> = 
 };
 
 const statusColors: Record<string, string> = {
+  created: "bg-gray-400",
+  active: "bg-emerald-400 animate-pulse",
+  promoted: "bg-blue-400",
+  receiving: "bg-amber-400 animate-pulse",
+  merging: "bg-purple-400 animate-pulse",
+  dissolving: "bg-red-400",
+  archived: "bg-gray-500",
+  // Legacy
   idle: "bg-gray-400",
   working: "bg-emerald-400 animate-pulse",
   error: "bg-red-400",
@@ -32,6 +40,7 @@ function AgentNode({ data, id }: NodeProps) {
     <div
       onClick={() => setSelectedAgent(id)}
       className={`
+        nodrag
         w-[200px] h-[80px] rounded-xl bg-surface-card border-2 transition-all duration-200
         cursor-pointer flex flex-col justify-center px-4 gap-2
         hover:border-accent/60 hover:shadow-lg hover:shadow-accent/5
