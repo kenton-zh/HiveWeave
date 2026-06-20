@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* React Flow overrides */
+.react-flow__background { background: #0f1117 !important; }
+.react-flow__minimap { background: #1a1d27 !important; border-radius: 8px; }

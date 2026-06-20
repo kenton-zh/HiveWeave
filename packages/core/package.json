@@ -1,0 +1,20 @@
+{
+  "name": "@hiveweave/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hiveweave/db": "workspace:*",
+    "@hiveweave/shared": "workspace:*",
+    "drizzle-orm": "^0.44.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

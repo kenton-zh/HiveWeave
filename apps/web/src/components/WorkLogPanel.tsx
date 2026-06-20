@@ -1,0 +1,154 @@
+import { useState, useEffect } from "react";
+import { getWorkLogs } from "../api";
+
+interface WorkLog {
+  id: string;
+  type: string;
+  summary: string;
+  timestamp: number;
+  details?: string;
+}
+
+const typeColors: Record<string, { bg: string; text: string }> = {
+  task: { bg: "bg-blue-500/20", text: "text-blue-300" },
+  decision: { bg: "bg-purple-500/20", text: "text-purple-300" },
+  error: { bg: "bg-red-500/20", text: "text-red-300" },
+  completion: { bg: "bg-green-500/20", text: "text-green-300" },
+  delegation: { bg: "bg-amber-500/20", text: "text-amber-300" },
+};
+
+function formatTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+
+  if (diffMins < 1) return "刚刚";
+  if (diffMins < 60) return `${diffMins} 分钟前`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours} 小时前`;
+  return date.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+}
+
+function WorkLogPanel({ agentId }: { agentId: string | null }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [logs, setLogs] = useState<WorkLog[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!agentId || !isOpen) {
+      setLogs([]);
+      return;
+    }
+
+    async function fetchLogs() {
+      setLoading(true);
+      try {
+        const data = await getWorkLogs(agentId!, 10);
+        setLogs(data.logs || data || []);
+      } catch (err) {
+        console.error("Failed to fetch work logs:", err);
+        setLogs([]);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchLogs();
+  }, [agentId, isOpen]);
+
+  if (!agentId) return null;
+
+  return (
+    <div className="border-t border-surface-border bg-surface-card shrink-0">
+      {/* Toggle Header */}
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full px-6 py-3 flex items-center justify-between hover:bg-surface-border/30 transition-colors"
+      >
+        <div className="flex items-center gap-2">
+          <svg
+            className="w-4 h-4 text-gray-400"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"
+            />
+          </svg>
+          <span className="text-sm font-medium text-gray-300">Work Logs</span>
+          {logs.length > 0 && (
+            <span className="text-xs px-2 py-0.5 rounded-full bg-surface-border text-gray-400">
+              {logs.length}
+            </span>
+          )}
+        </div>
+        <svg
+          className={`w-4 h-4 text-gray-400 transition-transform ${isOpen ? "rotate-180" : ""}`}
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+
+      {/* Log Content */}
+      {isOpen && (
+        <div className="max-h-64 overflow-y-auto border-t border-surface-border">
+          {loading ? (
+            <div className="px-6 py-4 flex justify-center">
+              <div className="flex gap-1">
+                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+              </div>
+            </div>
+          ) : logs.length === 0 ? (
+            <div className="px-6 py-8 text-center">
+              <p className="text-sm text-gray-500">暂无工作日志</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-surface-border">
+              {logs.map((log) => {
+                const typeInfo = typeColors[log.type] || typeColors.task;
+                return (
+                  <div key={log.id} className="px-6 py-3 hover:bg-surface-border/20 transition-colors">
+                    <div className="flex items-start gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span
+                            className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${typeInfo.bg} ${typeInfo.text}`}
+                          >
+                            {log.type}
+                          </span>
+                          <span className="text-xs text-gray-500">
+                            {formatTime(log.timestamp)}
+                          </span>
+                        </div>
+                        <p className="text-sm text-gray-300 line-clamp-2">
+                          {log.summary}
+                        </p>
+                        {log.details && (
+                          <p className="text-xs text-gray-500 mt-1 line-clamp-2">
+                            {log.details}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default WorkLogPanel;
