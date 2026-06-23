@@ -740,12 +740,15 @@ export async function chatRoutes(fastify: FastifyInstance) {
     }
 
     // Split prompt: static identity (cacheable) + dynamic context
+    const isLeadership = agent.role.toLowerCase() === "ceo" || agent.role.toLowerCase() === "hr";
     const identityPrompt = buildIdentityPrompt({
       agentName: agent.name,
       role: agent.role,
       permissionType: agent.permissionType as "coordinator" | "executor",
       goal: agent.goal,
       backstory: agent.backstory,
+      includeParadigmCatalog: isLeadership,
+      hasBindingTools: isLeadership,
     });
 
     // --- Workspace info ---
@@ -1478,12 +1481,15 @@ export async function chatRoutes(fastify: FastifyInstance) {
       const subSystemPrompt = [ctxBlock, reworkBlock, hoBlock, await buildWorkspaceBlock(subAgent.projectId, subAgent.role)].filter(Boolean).join("\n\n");
 
       // Build identity prompt first to calculate token budget for history
+      const subIsLeadership = subAgent.role.toLowerCase() === "ceo" || subAgent.role.toLowerCase() === "hr";
       const subIdentityPrompt = buildIdentityPrompt({
         agentName: subAgent.name,
         role: subAgent.role,
         permissionType: subAgent.permissionType as "coordinator" | "executor",
         goal: subAgent.goal,
         backstory: subAgent.backstory,
+        includeParadigmCatalog: subIsLeadership,
+        hasBindingTools: subIsLeadership,
       });
 
       // Determine the user message for budget calculation
