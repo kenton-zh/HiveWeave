@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import {
   ReactFlow,
   Background,
@@ -9,10 +9,14 @@ import {
   type Node,
   type Edge,
   type NodeTypes,
+  type OnNodesChange,
+  MarkerType,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import AgentNode from "./AgentNode";
-import { getOrgTree } from "../api";
+import ApprovalDialog from "./ApprovalDialog";
+import { getOrgTree, getCommunications, getProjectPendingApprovals } from "../api";
+import { useAppStore } from "../store";
 
 interface OrgNodeData {
   id: string;
@@ -34,6 +38,17 @@ const nodeTypes: NodeTypes = {
 };
 
 // Recursive function to compute subtree width
+function findCeoInTree(nodes: OrgNodeData[]): OrgNodeData | null {
+  for (const n of nodes) {
+    if (n.role?.toLowerCase() === "ceo") return n;
+    if (n.children?.length) {
+      const found = findCeoInTree(n.children);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 function getSubtreeWidth(node: OrgNodeData): number {
   if (!node.children || node.children.length === 0) {
     return NODE_WIDTH;
@@ -53,17 +68,21 @@ function layoutTree(
   y: number,
   nodes: Node[],
   edges: Edge[],
-  parentId?: string
+  parentId?: string,
+  onApprovalClick?: (agentId: string) => void,
 ): void {
   // Add current node
   nodes.push({
     id: node.id,
     type: "agent",
     position: { x, y },
+    width: NODE_WIDTH,
+    height: NODE_HEIGHT,
     data: {
       name: node.name,
       role: node.role,
       status: node.status,
+      onApprovalClick,
     },
   });
 
@@ -88,15 +107,31 @@ function layoutTree(
     for (const child of node.children) {
       const childSubtreeWidth = getSubtreeWidth(child);
       const childCenterX = childX + childSubtreeWidth / 2 - NODE_WIDTH / 2;
-      layoutTree(child, childCenterX, childY, nodes, edges, node.id);
+      layoutTree(child, childCenterX, childY, nodes, edges, node.id, onApprovalClick);
       childX += childSubtreeWidth + (X_SPACING - NODE_WIDTH);
     }
   }
 }
 
 function OrgTree() {
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const orgTreeVersion = useAppStore((s) => s.orgTreeVersion);
+  const selectedProjectId = useAppStore((s) => s.selectedProjectId);
+  const activeCommunications = useAppStore((s) => s.activeCommunications);
+  const setActiveCommunications = useAppStore((s) => s.setActiveCommunications);
+  const setAllPendingApprovals = useAppStore((s) => s.setAllPendingApprovals);
+  const selectedAgentId = useAppStore((s) => s.selectedAgentId);
+  const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
+  const baseEdgesRef = useRef<Edge[]>([]);
+
+  // Approval dialog state
+  const [approvalAgentId, setApprovalAgentId] = useState<string | null>(null);
+
+  // Callback for when an approval bell is clicked
+  const handleApprovalClick = useCallback((agentId: string) => {
+    setApprovalAgentId(agentId);
+  }, []);
 
   // Fetch and layout org tree
   useEffect(() => {
@@ -108,16 +143,17 @@ function OrgTree() {
         let offsetX = 0;
         for (const root of roots) {
           const w = getSubtreeWidth(root);
-          layoutTree(root, offsetX + w / 2 - NODE_WIDTH / 2, 0, newNodes, newEdges);
+          layoutTree(root, offsetX + w / 2 - NODE_WIDTH / 2, 0, newNodes, newEdges, undefined, handleApprovalClick);
           offsetX += w + X_SPACING;
         }
 
+        baseEdgesRef.current = newEdges;
         setNodes(newNodes);
         setEdges(newEdges);
       };
 
       try {
-        const data = await getOrgTree();
+        const data = await getOrgTree(selectedProjectId || undefined);
 
         // API returns an array of root nodes: [rootAgent, ...]
         let roots: OrgNodeData[];
@@ -131,39 +167,112 @@ function OrgTree() {
           roots = [];
         }
 
+        // Empty tree is valid — project may have no agents yet
         if (roots.length === 0) {
-          console.warn("Unexpected org tree shape:", data);
-          throw new Error("No valid root nodes in tree data");
+          baseEdgesRef.current = [];
+          setNodes([]);
+          setEdges([]);
+          return;
         }
         layoutRoots(roots);
+        if (!selectedAgentId) {
+          const ceoNode = findCeoInTree(roots);
+          if (ceoNode) setSelectedAgent(ceoNode.id);
+        }
       } catch (err) {
         console.error("Failed to fetch org tree:", err);
-        // Fallback demo data
-        const demoTree: OrgNodeData = {
-          id: "architect-1",
-          name: "System Architect",
-          role: "architect",
-          status: "idle",
-          children: [
-            {
-              id: "manager-1",
-              name: "Project Manager",
-              role: "manager",
-              status: "working",
-              children: [
-                { id: "dev-1", name: "Backend Dev", role: "module_dev", status: "idle" },
-                { id: "dev-2", name: "Frontend Dev", role: "module_dev", status: "working" },
-              ],
-            },
-            { id: "qa-1", name: "QA Engineer", role: "qa", status: "idle" },
-          ],
-        };
-        layoutRoots([demoTree]);
+        // Show empty tree on error rather than demo data with fake IDs
+        baseEdgesRef.current = [];
+        setNodes([]);
+        setEdges([]);
       }
     }
 
     fetchTree();
-  }, [setNodes, setEdges]);
+  }, [setNodes, setEdges, orgTreeVersion, selectedProjectId, handleApprovalClick, selectedAgentId, setSelectedAgent]);
+
+  // Poll for active communications and update edges
+  useEffect(() => {
+    let mounted = true;
+
+    async function pollCommunications() {
+      try {
+        const comms = await getCommunications();
+        if (mounted) {
+          setActiveCommunications(comms);
+        }
+      } catch (err) {
+        console.error("Failed to fetch communications:", err);
+      }
+    }
+
+    pollCommunications();
+    const interval = setInterval(pollCommunications, 3000);
+
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, [setActiveCommunications]);
+
+  // Poll for pending approval requests
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    let mounted = true;
+
+    async function pollApprovals() {
+      try {
+        const approvals = await getProjectPendingApprovals(selectedProjectId!);
+        if (mounted) {
+          setAllPendingApprovals(approvals);
+        }
+      } catch (err) {
+        console.error("Failed to fetch pending approvals:", err);
+      }
+    }
+
+    pollApprovals();
+    const interval = setInterval(pollApprovals, 3000);
+
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, [selectedProjectId, setAllPendingApprovals]);
+
+  // Merge communication edges with structural edges
+  useEffect(() => {
+    const commEdges: Edge[] = activeCommunications.map((comm) => {
+      const colorMap: Record<string, string> = {
+        dispatch: "#6c8cff",
+        message: "#10b981",
+        trigger: "#f59e0b",
+        peer: "#22d3ee",
+      };
+      const color = colorMap[comm.type] || "#10b981";
+      return {
+        id: `comm-${comm.id}`,
+        source: comm.fromAgentId,
+        target: comm.toAgentId,
+        type: "smoothstep",
+        animated: true,
+        style: {
+          stroke: color,
+          strokeWidth: 3,
+          strokeDasharray: comm.type === "peer" ? "4 4" : "8 4",
+        },
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          color,
+          width: 15,
+          height: 15,
+        },
+        zIndex: 1000,
+      };
+    });
+
+    setEdges([...baseEdgesRef.current, ...commEdges]);
+  }, [activeCommunications, setEdges]);
 
   const defaultEdgeOptions = useMemo(
     () => ({
@@ -173,12 +282,20 @@ function OrgTree() {
     []
   );
 
+  // Keep agent nodes at fixed size — ignore accidental resize drags
+  const handleNodesChange: OnNodesChange = useCallback(
+    (changes) => {
+      onNodesChange(changes.filter((change) => change.type !== "dimensions"));
+    },
+    [onNodesChange],
+  );
+
   return (
     <div className="w-full h-full">
       <ReactFlow
         nodes={nodes}
         edges={edges}
-        onNodesChange={onNodesChange}
+        onNodesChange={handleNodesChange}
         onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
         defaultEdgeOptions={defaultEdgeOptions}
@@ -200,6 +317,14 @@ function OrgTree() {
           zoomable
         />
       </ReactFlow>
+
+      {/* Approval Dialog */}
+      {approvalAgentId && (
+        <ApprovalDialog
+          agentId={approvalAgentId}
+          onClose={() => setApprovalAgentId(null)}
+        />
+      )}
     </div>
   );
 }

@@ -12,9 +12,12 @@
   "dependencies": {
     "@hiveweave/db": "workspace:*",
     "@hiveweave/shared": "workspace:*",
-    "drizzle-orm": "^0.44.0"
+    "drizzle-orm": "^0.44.0",
+    "fast-glob": "^3.3.3",
+    "turndown": "^7.2.4"
   },
   "devDependencies": {
+    "@types/turndown": "^5.0.6",
     "typescript": "^5.8.0"
   }
 }

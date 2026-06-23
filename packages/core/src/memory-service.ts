@@ -1,5 +1,5 @@
-import { db } from "@hiveweave/db";
 import { memories } from "@hiveweave/db";
+import type { Database } from "@hiveweave/db";
 import { eq, and } from "drizzle-orm";
 import { randomUUID } from "crypto";
 
@@ -15,13 +15,14 @@ import { randomUUID } from "crypto";
  *                   available to successor agents via the revival protocol.
  */
 export class MemoryService {
+  constructor(private readonly db: Database) {}
 
   /**
    * Get project-level memories (shared across all agents).
    * These form the project constitution referenced in every agent's context.
    */
   async getProjectMemories(): Promise<any[]> {
-    return db.select().from(memories).where(eq(memories.scope, "project"));
+    return this.db.select().from(memories).where(eq(memories.scope, "project"));
   }
 
   /**
@@ -30,7 +31,7 @@ export class MemoryService {
    * @param agentId - UUID of the agent whose private memories to retrieve.
    */
   async getAgentMemories(agentId: string): Promise<any[]> {
-    return db.select().from(memories).where(
+    return this.db.select().from(memories).where(
       and(eq(memories.scope, "agent"), eq(memories.agentId, agentId))
     );
   }
@@ -45,7 +46,7 @@ export class MemoryService {
    * @param moduleId - UUID of the module whose archived memories to load.
    */
   async getArchivedMemories(moduleId: string): Promise<any[]> {
-    return db.select().from(memories).where(
+    return this.db.select().from(memories).where(
       and(eq(memories.scope, "archive"), eq(memories.moduleId, moduleId))
     );
   }
@@ -69,7 +70,7 @@ export class MemoryService {
     const id = randomUUID();
     const now = Date.now();
 
-    await db.insert(memories).values({
+    await this.db.insert(memories).values({
       id,
       agentId: input.agentId || null,
       scope: input.scope,
@@ -100,7 +101,7 @@ export class MemoryService {
     const now = Date.now();
 
     for (const mem of agentMems) {
-      await db.update(memories)
+      await this.db.update(memories)
         .set({ scope: "archive", updatedAt: now })
         .where(eq(memories.id, mem.id));
     }

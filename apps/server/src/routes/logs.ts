@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { OrgService, DispatchService } from "@hiveweave/core";
+import { getProjectDbForAgent } from "@hiveweave/db";
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -15,8 +16,15 @@ const LimitQuery = z.object({
 // ---------------------------------------------------------------------------
 
 export async function logRoutes(fastify: FastifyInstance) {
-  const orgService = new OrgService();
-  const dispatchService = new DispatchService();
+  // Helper to get per-project services from an agentId
+  async function getProjectServices(agentId: string) {
+    const projectDb = getProjectDbForAgent(agentId);
+    if (!projectDb) return null;
+    return {
+      orgService: new OrgService(projectDb),
+      dispatchService: new DispatchService(projectDb),
+    };
+  }
 
   /**
    * GET /:agentId — Get work logs for a specific agent.
@@ -41,13 +49,17 @@ export async function logRoutes(fastify: FastifyInstance) {
     }
 
     try {
-      // Verify the agent exists
-      const agent = await orgService.getAgent(agentId);
+      const services = await getProjectServices(agentId);
+      if (!services) {
+        return reply.status(404).send({ error: "Agent not found in any project" });
+      }
+
+      const agent = await services.orgService.getAgent(agentId);
       if (!agent) {
         return reply.status(404).send({ error: "Agent not found" });
       }
 
-      const logs = await dispatchService.getAgentLogs(agentId, parsedLimit.data.limit);
+      const logs = await services.dispatchService.getAgentLogs(agentId, parsedLimit.data.limit);
       return { agentId, logs, count: logs.length };
     } catch (error: any) {
       fastify.log.error(error, "Failed to fetch work logs");
@@ -82,13 +94,17 @@ export async function logRoutes(fastify: FastifyInstance) {
     }
 
     try {
-      // Verify the agent exists and is a coordinator
-      const agent = await orgService.getAgent(agentId);
+      const services = await getProjectServices(agentId);
+      if (!services) {
+        return reply.status(404).send({ error: "Agent not found in any project" });
+      }
+
+      const agent = await services.orgService.getAgent(agentId);
       if (!agent) {
         return reply.status(404).send({ error: "Agent not found" });
       }
 
-      const children = await orgService.getChildren(agentId);
+      const children = await services.orgService.getChildren(agentId);
       if (children.length === 0) {
         return { agentId, subordinates: {}, message: "No subordinates found" };
       }
@@ -96,7 +112,7 @@ export async function logRoutes(fastify: FastifyInstance) {
       const result: Record<string, { name: string; role: string; logs: any[] }> = {};
 
       for (const child of children) {
-        const logs = await dispatchService.getSubordinateLogs(child.id, parsedLimit.data.limit);
+        const logs = await services.dispatchService.getSubordinateLogs(child.id, parsedLimit.data.limit);
         result[child.id] = {
           name: child.name,
           role: child.role,

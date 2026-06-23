@@ -42,3 +42,40 @@ coverage/
 # Temp
 tmp/
 temp/
+_research/
+
+# Temp patch/fix scripts
+_fix*.mjs
+_fix*.py
+_patch*.py
+_patch*.mjs
+_patch*.cjs
+_p[0-9]*.cjs
+_pi.mjs
+_apply_*.py
+_ceo_*.txt
+_t.txt
+
+# Tool caches
+.playwright-cli/
+.turbo/
+.workbuddy/
+
+# Test fixtures
+test-*.json
+test_*.json
+
+# Build diagnostics
+tsc_err.txt
+tsc_out.txt
+*.tsbuildinfo
+.npmrc
+
+# Misc
+after-select.yaml
+
+# Generated assets
+image/
+apps/web/public/sprites/
+apps/web/scripts/refactor-*
+apps/server/patch-chat.mjs

@@ -1,7 +1,23 @@
-export { AgentRuntime } from "./agent-runtime.js";
-export type { AgentRuntimeConfig, StreamEvent } from "./agent-runtime.js";
+export { AgentRuntime, buildIdentityPrompt } from "./agent-runtime.js";
+export type {
+  AgentRuntimeConfig,
+  StreamEvent,
+  ToolExecutorCallback,
+  Message,
+  QueuedMessage,
+  MessagePoller,
+} from "./agent-runtime.js";
+export { getHiveWeaveTools } from "./permissions.js";
+export type { ChatCompletionTool } from "./permissions.js";
+export { createProviderInstance } from "./provider-factory.js";
+export type { ProviderType } from "./provider-factory.js";
 export {
-  COORDINATOR_TOOLS,
-  EXECUTOR_TOOLS,
-  getToolsForPermissionType,
-} from "./permissions.js";
+  MAX_RETRIES,
+  isRetryableStatus,
+  parseRetryAfterMs,
+  classifyHttpError,
+  classifyNetworkError,
+  computeBackoff,
+  isContextOverflow,
+} from "./retry-utils.js";
+export type { ErrorCategory, ClassifiedError, RateLimitInfo } from "./retry-utils.js";

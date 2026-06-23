@@ -1,6 +1,6 @@
 {
   "name": "@hiveweave/agent-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -10,8 +10,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/claude-code": "^1.0.0",
-    "@hiveweave/shared": "workspace:*"
+    "@ai-sdk/anthropic": "^3.0.85",
+    "@ai-sdk/google": "^3.0.83",
+    "@ai-sdk/openai": "^3.0.74",
+    "@ai-sdk/openai-compatible": "^2.0.51",
+    "@hiveweave/shared": "workspace:*",
+    "ai": "^6.0.208"
   },
   "devDependencies": {
     "typescript": "^5.8.0"

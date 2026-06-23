@@ -1,7 +1,9 @@
 export {
   AgentStatus,
   PermissionType,
+  PermissionMode,
   AgentRole,
+  ROLE_PRESETS,
   AgentSchema,
   type Agent,
 } from "./agent.js";
@@ -44,3 +46,26 @@ export {
   AgentUpdateRequest,
   OrgNode,
 } from "./api.js";
+
+export {
+  SOFTWARE_PARADIGMS,
+  getAllParadigms,
+  getParadigmById,
+  getParadigmCatalogSummary,
+} from "./org-paradigms.js";
+
+export type { OrgParadigm, OrgParadigmStructure } from "./org-paradigms.js";
+
+export {
+  CharterRoleSchema,
+  CharterArtifactKindSchema,
+  StaffingPolicySchema,
+  ProjectCharterSchema,
+  getDefaultCharter,
+  parseCharterJson,
+  formatCharterForPrompt,
+  type CharterRole,
+  type CharterArtifactKind,
+  type StaffingPolicy,
+  type ProjectCharter,
+} from "./charter.js";

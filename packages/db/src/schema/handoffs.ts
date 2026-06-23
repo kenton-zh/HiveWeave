@@ -8,11 +8,14 @@ export const handoffs = sqliteTable("handoffs", {
   summary: text("summary").notNull(),
   memorySnapshotId: text("memory_snapshot_id"),
   status: text("status", {
-    enum: ["pending", "accepted", "rejected", "completed"],
+    enum: ["pending", "accepted", "rejected", "completed", "approved"],
   })
     .notNull()
     .default("pending"),
+  expectReport: integer("expect_report", { mode: "boolean" }).notNull().default(false),
+  reportedUp: integer("reported_up", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "number" }),
 });
 
 export type Handoff = typeof handoffs.$inferSelect;

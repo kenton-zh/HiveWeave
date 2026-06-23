@@ -5,9 +5,7 @@ import { agents } from "./agents";
 export const modules = sqliteTable("modules", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
-  parentModuleId: text("parent_module_id").references(
-    (): typeof modules.id => modules.id,
-  ),
+  parentModuleId: text("parent_module_id"),
   status: text("status", {
     enum: ["active", "inactive", "archived"],
   })
