@@ -77,6 +77,11 @@ export function seedDefaultModel() {
   const count = metaSqlite.prepare("SELECT COUNT(*) as cnt FROM llm_models").get() as any;
   if (count.cnt > 0) return;
 
+  const apiKey = process.env.OPENCODE_API_KEY || "";
+  if (!apiKey) {
+    console.warn("[DB] OPENCODE_API_KEY not set — default model seeded without API key. Set it in .env or system env.");
+  }
+
   const now = Date.now();
   const id = crypto.randomUUID();
   metaSqlite.prepare(`
@@ -87,7 +92,7 @@ export function seedDefaultModel() {
     "DeepSeek V4 Flash Free",
     "deepseek-v4-flash-free",
     "https://opencode.ai/zen/v1",
-    "sk-SLUzQJ8EvnMP4rySJVo85m3njIAcMZvbn7aJSHDE5nk9vIRz7ikvwohstbrYqQ2U",
+    apiKey,
     128000,
     8192,
     0,
