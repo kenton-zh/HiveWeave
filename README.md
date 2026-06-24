@@ -125,11 +125,11 @@ hiveweave/
 # 安装依赖
 pnpm install
 
+# 初始化数据库（首次或 schema 变更后执行）
+pnpm db:push
+
 # 启动开发环境（前后端同时启动）
 pnpm dev
-
-# 数据库迁移
-pnpm db:push
 
 # 构建
 pnpm build
