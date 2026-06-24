@@ -7,8 +7,10 @@ import AddAgentDialog from "./components/AddAgentDialog";
 import FolderPicker from "./components/FolderPicker";
 import OfficeView from "./components/OfficeView";
 import ModelSettings from "./components/ModelSettings";
+import ProjectTimeBadge from "./components/ProjectTimeBadge";
+import QuestionDialog from "./components/QuestionDialog";
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState } from "./api";
+import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime } from "./api";
 
 interface Project {
   id: string;
@@ -186,13 +188,14 @@ function App() {
     <div className="h-screen flex flex-col bg-surface">
       {/* Top Bar */}
       <header className="h-14 border-b border-surface-border flex items-center px-6 bg-surface-card shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-accent flex items-center justify-center">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-8 h-8 rounded-lg bg-accent flex items-center justify-center shrink-0">
             <span className="text-white font-bold text-sm">H</span>
           </div>
-          <h1 className="text-lg font-semibold text-gray-100 tracking-tight">
+          <h1 className="text-lg font-semibold text-gray-100 tracking-tight shrink-0">
             HiveWeave
           </h1>
+          <ProjectTimeBadge projectId={selectedProjectId} />
         </div>
 
         {/* Project Selector */}
@@ -441,6 +444,9 @@ function App() {
       {showModelSettings && (
         <ModelSettings onClose={() => setShowModelSettings(false)} />
       )}
+
+      {/* Question Dialog — global, polled */}
+      <QuestionDialog />
     </div>
   );
 }

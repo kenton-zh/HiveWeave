@@ -23,6 +23,10 @@ export async function createProject(name: string, workspacePath?: string, descri
   });
 }
 
+export async function getProjectGameTime(projectId: string) {
+  return fetchJSON(`${BASE}/projects/${projectId}/game-time`);
+}
+
 export async function deleteProject(id: string) {
   return fetchJSON(`${BASE}/projects/${id}`, { method: "DELETE" });
 }
@@ -231,6 +235,40 @@ export async function markMessagesRead(ids: string[]) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ids }),
   });
+}
+
+export async function getUserPings(): Promise<{ agentIds: string[] }> {
+  return fetchJSON(`${BASE}/chat/user-pings`);
+}
+
+export interface PendingQuestion {
+  id: string;
+  agentId: string;
+  question: string;
+  options?: { label: string; description?: string }[];
+  createdAt: number;
+}
+
+export async function getQuestions(): Promise<PendingQuestion[]> {
+  return fetchJSON(`${BASE}/chat/questions`);
+}
+
+export async function answerQuestion(id: string, answer: string) {
+  return fetchJSON(`${BASE}/chat/questions/${id}/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answer }),
+  });
+}
+
+export interface AgentTodos {
+  agentId: string;
+  todos: { content: string; status: string }[];
+  updatedAt: number;
+}
+
+export async function getAgentTodos(agentId: string): Promise<AgentTodos> {
+  return fetchJSON(`${BASE}/chat/todos/${agentId}`);
 }
 
 export interface ActiveCommunication {

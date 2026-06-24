@@ -21,7 +21,7 @@ export class InboxService {
     fromAgentId: string,
     toAgentId: string,
     message: string,
-    messageType: "superior" | "peer" = "superior",
+    messageType: "superior" | "peer" | "alarm" = "superior",
     expectReport: boolean = false,
   ): Promise<string> {
     const id = randomUUID();
@@ -42,7 +42,7 @@ export class InboxService {
    * Get unread inbox messages for an agent.
    * @param messageType - Optional filter: "superior" or "peer". Omit to get all.
    */
-  async getPendingMessages(toAgentId: string, limit = 10, messageType?: "superior" | "peer") {
+  async getPendingMessages(toAgentId: string, limit = 10, messageType?: "superior" | "peer" | "alarm") {
     const conditions = [eq(inbox.toAgentId, toAgentId), eq(inbox.read, false)];
     if (messageType) {
       conditions.push(eq(inbox.messageType, messageType));
@@ -59,7 +59,7 @@ export class InboxService {
    * Mark messages for an agent as read.
    * @param messageType - Optional filter. Omit to mark all as read.
    */
-  async markAsRead(toAgentId: string, messageType?: "superior" | "peer"): Promise<number> {
+  async markAsRead(toAgentId: string, messageType?: "superior" | "peer" | "alarm"): Promise<number> {
     const pending = await this.getPendingMessages(toAgentId, 100, messageType);
     if (pending.length === 0) return 0;
     for (const msg of pending) {

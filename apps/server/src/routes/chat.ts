@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { randomUUID } from "crypto";
-import { OrgService, MemoryService, DispatchService, ToolExecutor, HandoffService, InboxService, ChatMessageService, TeamChatService, RosterService, FileService, ProjectService, communicationService, conversationStore, clawhubService, calculateHistoryBudget, estimateTokens, computePrefixHash, buildCompactionPrompt, statusEventBus, TemplateService, PermissionService, ApprovalService, waitForApprovalResponse, cancelApprovalWait, ModelService, ShellService, WebService } from "@hiveweave/core";
+import { OrgService, MemoryService, DispatchService, ToolExecutor, HandoffService, InboxService, ChatMessageService, TeamChatService, RosterService, FileService, ProjectService, communicationService, userPingTracker, drainQuestions, answerQuestion, getTodos, conversationStore, clawhubService, calculateHistoryBudget, estimateTokens, computePrefixHash, buildCompactionPrompt, statusEventBus, TemplateService, PermissionService, ApprovalService, waitForApprovalResponse, cancelApprovalWait, ModelService, ShellService, WebService, getGameTimeService, AlarmService, buildTimeContextBlock, prefixTriggerMessage } from "@hiveweave/core";
 import type { StoredMessage } from "@hiveweave/core";
 import { AgentRuntime, buildIdentityPrompt, createProviderInstance } from "@hiveweave/agent-runtime";
 import type { AgentRuntimeConfig, StreamEvent, ToolExecutorCallback, Message, QueuedMessage, MessagePoller } from "@hiveweave/agent-runtime";
@@ -9,6 +9,7 @@ import { z } from "zod";
 import { db, lookupAgentWorkspace, ensureProjectDb, getProjectDbForAgent, agents } from "@hiveweave/db";
 import { eq } from "drizzle-orm";
 import { formatCharterForPrompt } from "@hiveweave/shared";
+import { registerAlarmTrigger } from "../game-time-scheduler.js";
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -48,6 +49,7 @@ function setSSEHeaders(reply: FastifyReply): void {
 interface ResolvedModel {
   baseUrl: string;
   modelId: string;
+  modelName: string;
   apiKey: string;
   provider: string;
   supportsImages: boolean;
@@ -63,28 +65,41 @@ async function resolveModelForAgent(agentId: string): Promise<ResolvedModel> {
   const projectDb = getProjectDbForAgent(agentId);
   let agentModelId: string | null = null;
   let agentReasoningEffort: string | null = null;
+  let agentRole = "";
+  let agentPermissionType = "";
 
   if (projectDb) {
     const rows = await projectDb
-      .select({ modelId: agents.modelId, reasoningEffort: agents.reasoningEffort })
+      .select({ modelId: agents.modelId, reasoningEffort: agents.reasoningEffort, role: agents.role, permissionType: agents.permissionType })
       .from(agents)
       .where(eq(agents.id, agentId));
     if (rows.length > 0) {
       agentModelId = rows[0].modelId;
       agentReasoningEffort = rows[0].reasoningEffort;
+      agentRole = rows[0].role || "";
+      agentPermissionType = rows[0].permissionType || "";
     }
   }
 
   // 1. Try agent's specified model
   let model = agentModelId ? await modelService.getById(agentModelId) : null;
-  // 2. Fallback to default (first active model)
-  if (!model) model = await modelService.getDefault();
+  // 2. Role-based auto-selection
+  if (!model) {
+    const normalizedRole = agentRole.toLowerCase();
+    const isLeadership = normalizedRole === "ceo" || normalizedRole === "hr" || agentPermissionType === "coordinator";
+    if (isLeadership) {
+      model = await modelService.findActiveByModelId("deepseek-v4-flash") || await modelService.getDefault();
+    } else {
+      model = await modelService.findActiveByModelId("step-3.7-flash") || await modelService.getDefault();
+    }
+  }
   // 3. No models configured at all
   if (!model) throw new Error("No LLM model configured. Please add a model in Settings.");
 
   return {
     baseUrl: model.baseUrl,
     modelId: model.modelId,
+    modelName: model.name,
     apiKey: model.apiKey,
     provider: model.provider,
     supportsImages: model.supportsImages,
@@ -200,6 +215,43 @@ export async function chatRoutes(fastify: FastifyInstance) {
       }
     }
     return null;
+  }
+
+
+  const gameTimeService = getGameTimeService(db);
+
+  type ProjectServices = NonNullable<Awaited<ReturnType<typeof getProjectServices>>>;
+
+  function makeToolExecutor(services: ProjectServices, projectId?: string | null): ToolExecutor {
+    const alarmService = new AlarmService(services.projectDb);
+    return new ToolExecutor(
+      services.dispatchService,
+      services.memoryService,
+      services.orgService,
+      services.handoffService,
+      services.inboxService,
+      services.rosterService,
+      services.fileService,
+      projectService,
+      templateService,
+      new ShellService(),
+      new WebService(),
+      services.teamChatService,
+      gameTimeService,
+      alarmService,
+      projectId ?? null,
+    );
+  }
+
+  async function buildTimeBlock(projectId: string | null | undefined): Promise<string> {
+    if (!projectId) return "";
+    await gameTimeService.initProject(projectId);
+    return buildTimeContextBlock(gameTimeService.getSnapshot(projectId));
+  }
+
+  function prefixTriggerForProject(projectId: string | null | undefined, message: string): string {
+    if (!projectId) return message;
+    return prefixTriggerMessage(gameTimeService.getSnapshot(projectId), message);
   }
 
   /** Build a workspace info block for agent context prompts. */
@@ -582,8 +634,19 @@ export async function chatRoutes(fastify: FastifyInstance) {
       try {
         const pendingMessages = await services.inboxService.getPendingMessages(agentId);
         if (pendingMessages.length > 0) {
-          const superiorMsgs = pendingMessages.filter((m: any) => m.messageType !== "peer");
+          const alarmMsgs = pendingMessages.filter((m: any) => m.messageType === "alarm");
+          const superiorMsgs = pendingMessages.filter((m: any) => m.messageType !== "peer" && m.messageType !== "alarm");
           const peerMsgs = pendingMessages.filter((m: any) => m.messageType === "peer");
+
+          if (alarmMsgs.length > 0) {
+            inboxBlock += "## Scheduled Alarms\n";
+            for (const msg of alarmMsgs) {
+              const fromAgent = await services.orgService.getAgent(msg.fromAgentId);
+              const fromName = fromAgent?.name || msg.fromAgentId;
+              inboxBlock += `- **Alarm from ${fromName}**: "${msg.message}"\n`;
+              await services.teamChatService.recordIncoming(agentId, msg.fromAgentId, msg.message, msg.id);
+            }
+          }
 
           if (superiorMsgs.length > 0) {
             inboxBlock += "## Messages from Subordinates\n";
@@ -649,20 +712,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
       }
 
       // Create per-project ToolExecutor for mock mode
-      const mockToolExecutor = new ToolExecutor(
-        services.dispatchService,
-        services.memoryService,
-        services.orgService,
-        services.handoffService,
-        services.inboxService,
-        services.rosterService,
-        services.fileService,
-        projectService,
-        templateService,
-        new ShellService(),
-        new WebService(),
-        services.teamChatService,
-      );
+      const mockToolExecutor = makeToolExecutor(services, agent.projectId);
 
       // Collect tool_use events for execution after streaming
       const toolCalls: Array<{ tool: string; input: Record<string, any> }> = [];
@@ -788,7 +838,10 @@ export async function chatRoutes(fastify: FastifyInstance) {
       fastify.log.warn(err, "Failed to load bound skills, proceeding without");
     }
 
+    const timeBlock = await buildTimeBlock(agent.projectId);
+
     const contextPrompt = [
+      timeBlock,
       focusInstruction,
       projectBlock,
       charterBlock,
@@ -817,20 +870,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
     prefixHashTracker.set(agentId, currentHash);
 
     // Create per-project ToolExecutor
-    const toolExec = new ToolExecutor(
-      services.dispatchService,
-      services.memoryService,
-      services.orgService,
-      services.handoffService,
-      services.inboxService,
-      services.rosterService,
-      services.fileService,
-      projectService,
-      templateService,
-      new ShellService(),
-      new WebService(),
-      services.teamChatService,
-    );
+    const toolExec = makeToolExecutor(services, agent.projectId);
 
     const runtimeConfig: AgentRuntimeConfig = {
       agentId,
@@ -864,6 +904,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
       compactor: makeMidTurnCompactor(resolved),
       messagePoller: createMessagePoller(agentId, services),
     };
+
+    const prefixedMessage = prefixTriggerForProject(agent.projectId, message);
 
     const runtime = new AgentRuntime(runtimeConfig);
 
@@ -910,8 +952,15 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
     try {
       // Use manual iterator + Promise.race for SSE keepalive during approval waits
-      const iter = runtime.chat(message, images)[Symbol.asyncIterator]();
+      const iter = runtime.chat(prefixedMessage, images)[Symbol.asyncIterator]();
       while (true) {
+        if (statusEventBus.isPaused) {
+          fastify.log.info(`[CHAT:${agentId.slice(0, 8)}] Paused mid-stream — stopping`);
+          flushActivityBuffer();
+          writeSSE(reply, "error", "HiveWeave 已下班，所有工作已暂停。");
+          break;
+        }
+
         const result = await Promise.race([
           iter.next(),
           new Promise<{ keepalive: true }>((r) => setTimeout(() => r({ keepalive: true }), 15_000)),
@@ -1149,6 +1198,31 @@ export async function chatRoutes(fastify: FastifyInstance) {
     return messages;
   });
 
+  /** GET /user-pings — agents that have sent user-directed messages since last poll */
+  fastify.get("/user-pings", async (_request, _reply) => {
+    return { agentIds: userPingTracker.drain() };
+  });
+
+  /** GET /questions — pending user questions from agents (frontend polls this) */
+  fastify.get("/questions", async (_request, _reply) => {
+    return drainQuestions();
+  });
+
+  /** POST /questions/:id/answer — user answers an agent's question */
+  fastify.post<{ Params: { id: string }; Body: { answer: string } }>("/questions/:id/answer", async (request, reply) => {
+    const { id } = request.params;
+    const { answer } = request.body;
+    if (!answer) return reply.status(400).send({ error: "answer is required" });
+    const ok = answerQuestion(id, answer);
+    return ok ? { ok: true } : reply.status(404).send({ error: "Question not found or already answered" });
+  });
+
+  /** GET /todos/:agentId — get task list for an agent */
+  fastify.get<{ Params: { agentId: string } }>("/todos/:agentId", async (request, reply) => {
+    const todos = getTodos(request.params.agentId);
+    return todos || { agentId: request.params.agentId, todos: [], updatedAt: 0 };
+  });
+
   /** POST /mark-read — mark specific messages as read */
   fastify.post<{ Body: z.infer<typeof MarkReadBody> }>("/mark-read", async (request, reply) => {
     const parsed = MarkReadBody.safeParse(request.body);
@@ -1252,6 +1326,16 @@ export async function chatRoutes(fastify: FastifyInstance) {
    */
   fastify.get("/paused", async (_request, reply) => {
     return reply.send({ paused: statusEventBus.isPaused });
+  });
+
+  /** GET /resolved-model/:agentId — return actual model an agent would use */
+  fastify.get<{ Params: { agentId: string } }>("/resolved-model/:agentId", async (request, reply) => {
+    try {
+      const resolved = await resolveModelForAgent(request.params.agentId);
+      return reply.send({ agentId: request.params.agentId, modelName: resolved.modelName, modelId: resolved.modelId, source: "auto" });
+    } catch (err: any) {
+      return reply.status(500).send({ error: err.message });
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -1478,7 +1562,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
         }
       } catch { /* proceed without */ }
 
-      const subSystemPrompt = [ctxBlock, reworkBlock, hoBlock, await buildWorkspaceBlock(subAgent.projectId, subAgent.role)].filter(Boolean).join("\n\n");
+      const subTimeBlock = await buildTimeBlock(subAgent.projectId);
+      const subSystemPrompt = [subTimeBlock, ctxBlock, reworkBlock, hoBlock, await buildWorkspaceBlock(subAgent.projectId, subAgent.role)].filter(Boolean).join("\n\n");
 
       // Build identity prompt first to calculate token budget for history
       const subIsLeadership = subAgent.role.toLowerCase() === "ceo" || subAgent.role.toLowerCase() === "hr";
@@ -1514,20 +1599,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
       prefixHashTracker.set(agentId, subHash);
 
       // Create per-project ToolExecutor for subordinate
-      const subToolExec = new ToolExecutor(
-        subServices.dispatchService,
-        subServices.memoryService,
-        subServices.orgService,
-        subServices.handoffService,
-        subServices.inboxService,
-        subServices.rosterService,
-        subServices.fileService,
-        projectService,
-        templateService,
-        new ShellService(),
-        new WebService(),
-        subServices.teamChatService,
-      );
+      const subToolExec = makeToolExecutor(subServices, subAgent.projectId);
 
       const runtime = new AgentRuntime({
         agentId,
@@ -1563,7 +1635,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
       let subFullText = "";
       const subToolCalls: Array<{ tool: string; input: Record<string, any> }> = [];
 
-      for await (const event of runtime.chat(userMsg)) {
+      for await (const event of runtime.chat(prefixTriggerForProject(subAgent.projectId, userMsg))) {
         if (event.type === "text") {
           subFullText += event.content;
         } else if (event.type === "tool_use") {
@@ -1877,7 +1949,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
         }
       }
 
-      const systemPrompt = [ctxBlock, subLogsBlock, hoBlock, inboxBlock, selfReportBlock, await buildWorkspaceBlock(coordAgent.projectId, coordAgent.role)]
+      const coordTimeBlock = await buildTimeBlock(coordAgent.projectId);
+      const systemPrompt = [coordTimeBlock, ctxBlock, subLogsBlock, hoBlock, inboxBlock, selfReportBlock, await buildWorkspaceBlock(coordAgent.projectId, coordAgent.role)]
         .filter(Boolean)
         .join("\n\n");
 
@@ -1905,20 +1978,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
       prefixHashTracker.set(coordinatorId, coordHash);
 
       // Create per-project ToolExecutor for coordinator
-      const coordToolExec = new ToolExecutor(
-        coordServices.dispatchService,
-        coordServices.memoryService,
-        coordServices.orgService,
-        coordServices.handoffService,
-        coordServices.inboxService,
-        coordServices.rosterService,
-        coordServices.fileService,
-        projectService,
-        templateService,
-        new ShellService(),
-        new WebService(),
-        coordServices.teamChatService,
-      );
+      const coordToolExec = makeToolExecutor(coordServices, coordAgent.projectId);
 
       const runtime = new AgentRuntime({
         agentId: coordinatorId,
@@ -1954,7 +2014,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
       const coordPeersMessaged: Array<string> = [];
       const coordRejectedSubordinates: Array<string> = [];
 
-      for await (const event of runtime.chat(userMsg)) {
+      for await (const event of runtime.chat(prefixTriggerForProject(coordAgent.projectId, userMsg))) {
         if (event.type === "text") {
           fullText += event.content;
         } else if (event.type === "tool_use") {
@@ -2073,4 +2133,6 @@ export async function chatRoutes(fastify: FastifyInstance) {
       runningAutoTriggers.delete(coordinatorId);
     }
   }
+
+  registerAlarmTrigger(triggerSubordinate);
 }

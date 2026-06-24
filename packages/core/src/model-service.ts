@@ -1,7 +1,7 @@
 import { llmModels } from "@hiveweave/db";
 import type { MetaDatabase } from "@hiveweave/db";
 import type { LlmModel } from "@hiveweave/db";
-import { eq, asc } from "drizzle-orm";
+import { eq, and, asc, desc } from "drizzle-orm";
 import { randomUUID } from "crypto";
 
 export type { LlmModel };
@@ -57,13 +57,23 @@ export class ModelService {
     return rows[0] || null;
   }
 
-  /** Get the default model (first active model). */
+  /** Get the default model (most recently created active model). */
   async getDefault(): Promise<LlmModel | null> {
     const rows = await this.metaDb
       .select()
       .from(llmModels)
       .where(eq(llmModels.isActive, true))
-      .orderBy(asc(llmModels.createdAt))
+      .orderBy(desc(llmModels.createdAt))
+      .limit(1);
+    return rows[0] || null;
+  }
+
+  /** Find an active model by its modelId string (e.g. "deepseek-v4-flash"). */
+  async findActiveByModelId(modelId: string): Promise<LlmModel | null> {
+    const rows = await this.metaDb
+      .select()
+      .from(llmModels)
+      .where(and(eq(llmModels.isActive, true), eq(llmModels.modelId, modelId)))
       .limit(1);
     return rows[0] || null;
   }

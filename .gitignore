@@ -53,8 +53,13 @@ _patch*.cjs
 _p[0-9]*.cjs
 _pi.mjs
 _apply_*.py
+_apply_*.mjs
+apply-app-patch.mjs
 _ceo_*.txt
 _t.txt
+
+# Temp debug files
+check_db_tmp.ts
 
 # Tool caches
 .playwright-cli/

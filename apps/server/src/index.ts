@@ -13,6 +13,7 @@ import { modelRoutes } from "./routes/models.js";
 import { db, chatMessages, projects, agents, ensureProjectDb, registerProjectAgents, seedDefaultModel } from "@hiveweave/db";
 import { conversationStore, OrgService, ChatMessageService, ApprovalService, RosterService } from "@hiveweave/core";
 import "./services.js"; // clears in-memory pending approvals on import
+import { initGameTimeForAllProjects, runGameTimeTick, shutdownGameTime } from "./game-time-scheduler.js";
 import { eq } from "drizzle-orm";
 import { randomUUID } from "crypto";
 
@@ -153,7 +154,23 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000); // every hour
 
+await initGameTimeForAllProjects();
 console.log("Chat history and conversation store cleared for fresh session");
+
+setInterval(() => {
+  runGameTimeTick().catch((err) => console.error("[GameTime] tick error:", err));
+}, 5000);
+
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, async () => {
+    try {
+      await shutdownGameTime();
+    } catch (err) {
+      console.error("[GameTime] shutdown error:", err);
+    }
+    process.exit(0);
+  });
+}
 
 // Seed default LLM model if registry is empty
 seedDefaultModel();

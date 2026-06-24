@@ -75,6 +75,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   const [backstoryDraft, setBackstoryDraft] = useState("");
   const [saving, setSaving] = useState(false);
   const [models, setModels] = useState<LlmModel[]>([]);
+  const [resolvedModel, setResolvedModel] = useState<{ modelName: string; modelId: string } | null>(null);
 
   const refreshOrgTree = useAppStore((s) => s.refreshOrgTree);
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
@@ -122,6 +123,17 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   useEffect(() => {
     fetchAgent();
   }, [fetchAgent]);
+
+  // Fetch resolved model when agent has no explicit model
+  useEffect(() => {
+    if (!agentId) return;
+    fetch(`/api/chat/resolved-model/${agentId}`)
+      .then((r) => r.json())
+      .then((data: any) => {
+        if (data?.modelName) setResolvedModel({ modelName: data.modelName, modelId: data.modelId });
+      })
+      .catch(() => setResolvedModel(null));
+  }, [agentId, agent?.modelId]);
 
   // Load available models
   useEffect(() => {
@@ -335,7 +347,11 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                   disabled={saving}
                   className="w-full px-3 py-2 text-sm bg-surface border border-surface-border rounded-lg text-gray-200 focus:outline-none focus:border-accent disabled:opacity-50"
                 >
-                  <option value="">默认模型</option>
+                  <option value="">
+                    {resolvedModel?.modelName
+                      ? `自动 (${resolvedModel.modelName})`
+                      : "默认模型"}
+                  </option>
                   {models.map((m) => (
                     <option key={m.id} value={m.id}>
                       {m.name} ({m.modelId})
@@ -344,7 +360,9 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                 </select>
               ) : (
                 <span className="text-xs text-gray-500">
-                  {agent.modelId ? `已配置模型 ID: ${agent.modelId.slice(0, 8)}...` : "使用默认模型"}
+                  {agent.modelId ? `已配置模型 ID: ${agent.modelId.slice(0, 8)}...` :
+                   resolvedModel ? `自动选择: ${resolvedModel.modelName} (${resolvedModel.modelId})` :
+                   "使用默认模型"}
                 </span>
               )}
               {agent.modelId && models.length > 0 && (

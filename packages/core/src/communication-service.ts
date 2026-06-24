@@ -83,4 +83,33 @@ class CommunicationService {
   }
 }
 
-export const communicationService = new CommunicationService();
+export const communicationService = new CommunicationService(5_000);
+
+// ---------------------------------------------------------------------------
+// User Ping Tracker — agents that have sent user-directed messages
+// ---------------------------------------------------------------------------
+
+class UserPingTracker {
+  private pings = new Map<string, number>(); // agentId → timestamp
+  private TTL = 120_000; // 2 minutes (same as communication arrows)
+
+  /** Record that an agent sent a message to the human user. */
+  ping(agentId: string): void {
+    this.pings.set(agentId, Date.now());
+  }
+
+  /** Get agentIds with active pings and clear them (consume-on-read). */
+  drain(): string[] {
+    const now = Date.now();
+    const active: string[] = [];
+    for (const [agentId, ts] of this.pings) {
+      if (now - ts <= this.TTL) {
+        active.push(agentId);
+      }
+    }
+    this.pings.clear();
+    return active;
+  }
+}
+
+export const userPingTracker = new UserPingTracker();

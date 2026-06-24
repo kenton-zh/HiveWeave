@@ -71,6 +71,7 @@ metaSqlite.exec(`
 try { metaSqlite.exec(`ALTER TABLE llm_models ADD COLUMN provider TEXT NOT NULL DEFAULT 'openai-compatible'`); } catch { /* already exists */ }
 try { metaSqlite.exec(`ALTER TABLE llm_models ADD COLUMN supports_images INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
 try { metaSqlite.exec(`ALTER TABLE projects ADD COLUMN charter_json TEXT`); } catch { /* already exists */ }
+try { metaSqlite.exec(`ALTER TABLE projects ADD COLUMN game_time_accumulated_seconds INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
 
 /** Seed the default model if the registry is empty. */
 export function seedDefaultModel() {
@@ -242,6 +243,20 @@ function initProjectDbTables(projectDb: ReturnType<typeof createDb>) {
       expect_report INTEGER NOT NULL DEFAULT 0,
       read INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
+    )
+  `);
+
+  projectDb.run(sql`
+    CREATE TABLE IF NOT EXISTS scheduled_alarms (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      from_agent_id TEXT NOT NULL,
+      to_agent_id TEXT NOT NULL,
+      purpose TEXT NOT NULL,
+      fire_at_game_seconds INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL,
+      fired_at INTEGER
     )
   `);
 

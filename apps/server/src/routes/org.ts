@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { OrgService, MemoryService, RosterService, communicationService, statusEventBus } from "@hiveweave/core";
+import { OrgService, MemoryService, RosterService, communicationService, statusEventBus, mcpService } from "@hiveweave/core";
 import { db, projects, getProjectDbForAgent, ensureProjectDb, lookupAgentWorkspace } from "@hiveweave/db";
 import { eq } from "drizzle-orm";
 import { PermissionType } from "@hiveweave/shared";
@@ -296,5 +296,52 @@ export async function orgRoutes(fastify: FastifyInstance) {
       fastify.log.error(error, "Failed to fetch roster record");
       return reply.status(500).send({ error: "Failed to fetch roster record", details: error.message });
     }
+  });
+
+  // ── MCP Server Management ──────────────────────────────────────
+  const McpConfigBody = z.object({
+    name: z.string(),
+    transport: z.enum(["stdio", "http"]),
+    command: z.string().optional(),
+    args: z.array(z.string()).optional(),
+    env: z.record(z.string()).optional(),
+    cwd: z.string().optional(),
+    url: z.string().optional(),
+    enabled: z.boolean().default(true),
+  });
+
+  /** GET /mcp/servers — list configured MCP servers */
+  fastify.get("/mcp/servers", async () => {
+    return mcpService.listServers();
+  });
+
+  /** POST /mcp/servers — add or update an MCP server */
+  fastify.post("/mcp/servers", async (request, reply) => {
+    const parsed = McpConfigBody.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send(parsed.error.issues);
+    mcpService.setConfig(parsed.data);
+    return { ok: true };
+  });
+
+  /** DELETE /mcp/servers/:name — remove a server */
+  fastify.delete<{ Params: { name: string } }>("/mcp/servers/:name", async (request) => {
+    mcpService.removeConfig(request.params.name);
+    return { ok: true };
+  });
+
+  /** POST /mcp/servers/:name/connect — connect and discover tools */
+  fastify.post<{ Params: { name: string } }>("/mcp/servers/:name/connect", async (request, reply) => {
+    try {
+      const tools = await mcpService.connect(request.params.name);
+      return { tools };
+    } catch (err: any) {
+      return reply.status(500).send({ error: err.message });
+    }
+  });
+
+  /** POST /mcp/servers/:name/disconnect */
+  fastify.post<{ Params: { name: string } }>("/mcp/servers/:name/disconnect", async (request) => {
+    await mcpService.disconnect(request.params.name);
+    return { ok: true };
   });
 }

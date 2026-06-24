@@ -6,13 +6,25 @@ import { InboxService } from "./inbox-service.js";
 import { RosterService } from "./roster-service.js";
 import { FileService } from "./file-service.js";
 import { ProjectService } from "./project-service.js";
-import { communicationService } from "./communication-service.js";
+import { communicationService, userPingTracker } from "./communication-service.js";
 import { TemplateService } from "./template-service.js";
 import { clawhubService } from "./clawhub-service.js";
 import { ShellService } from "./shell-service.js";
 import { WebService } from "./web-service.js";
 import type { TeamChatService } from "./team-chat-service.js";
-import { ProjectCharterSchema, formatCharterForPrompt } from "@hiveweave/shared";
+import { ProjectCharterSchema, formatCharterForPrompt, parseGameTimeOffset, formatGameTime } from "@hiveweave/shared";
+import type { GameTimeService } from "./game-time-service.js";
+import type { AlarmService } from "./alarm-service.js";
+import { prefixInterAgentMessage } from "./time-context.js";
+import { randomUUID } from "crypto";
+import { runBashCommand } from "./tools/bash.js";
+import { executeGrep } from "./tools/grep.js";
+import { executeApplyPatch } from "./tools/apply-patch.js";
+import { executeQuestion } from "./tools/question.js";
+import { executeTodoWrite } from "./tools/todowrite.js";
+import { executeWebSearch } from "./tools/websearch.js";
+import { Effect } from "effect";
+import { mcpService } from "./mcp/mcp-service.js";
 
 // ---------------------------------------------------------------------------
 // Binding Registry — available skills and MCP servers
@@ -95,7 +107,21 @@ export class ToolExecutor {
     private readonly shell: ShellService,
     private readonly web: WebService,
     private readonly teamChat?: TeamChatService,
+    private readonly gameTimeService?: GameTimeService,
+    private readonly alarmService?: AlarmService,
+    private readonly projectId?: string | null,
   ) {}
+
+  private getTimeSnapshot() {
+    if (!this.gameTimeService || !this.projectId) return null;
+    return this.gameTimeService.getSnapshot(this.projectId);
+  }
+
+  private prefixForInbox(message: string): string {
+    const snap = this.getTimeSnapshot();
+    if (!snap) return message;
+    return prefixInterAgentMessage(snap, message);
+  }
 
   /**
    * Execute a single tool call and return a human-readable result string.
@@ -306,7 +332,7 @@ export class ToolExecutor {
             return "You don't have a superior to message. You are a root agent.";
           }
           const superiorId = currentAgent.parentId;
-          const msgId = await this.inbox.sendMessage(agentId, superiorId, message, "superior");
+          const msgId = await this.inbox.sendMessage(agentId, superiorId, this.prefixForInbox(message), "superior");
           const superior = await this.org.getAgent(superiorId);
           const superiorName = superior?.name || superiorId;
           // Track this as an active communication for the org chart
@@ -341,6 +367,52 @@ export class ToolExecutor {
             await this.teamChat.recordOutgoing(agentId, resolvedToId, message, JSON.stringify([{ tool: name, input }]));
           }
           return `Message sent to peer ${targetName} (${target.shortId}). msgId=${msgId}`;
+        }
+
+        // ── General Send Message (to user or agent) ──────────
+        case "send_message": {
+          const { content, recipients } = input;
+          if (!content || !recipients) {
+            return "Error: send_message requires content and recipients.";
+          }
+          const list = String(recipients).split(",").map((s: string) => s.trim()).filter(Boolean);
+          const results: string[] = [];
+          for (const rcpt of list) {
+            if (rcpt.toLowerCase() === "user") {
+              // Direct message to the human operator — visible in this agent's chat
+              if (this.teamChat) {
+                const msgId = randomUUID();
+                try {
+                  // Use team chat with null teamToAgentId for user-bound messages
+                  await (this.teamChat as any).chat.saveMessage({
+                    id: msgId,
+                    agentId,
+                    role: "assistant",
+                    content: `📩 ${this.prefixForInbox(content)}`,
+                    isBackground: false,
+                    isRead: false,
+                    createdAt: Date.now(),
+                  });
+                } catch { /* best-effort */ }
+              }
+              userPingTracker.ping(agentId);
+              results.push("Message delivered to human operator.");
+            } else {
+              const target = await this.org.resolveAgent(rcpt);
+              if (!target) {
+                results.push(`Error: Could not find agent matching "${rcpt}". Use read_roster to see available agents.`);
+                continue;
+              }
+              const msgId = await this.inbox.sendMessage(agentId, target.id, this.prefixForInbox(content), "peer");
+              communicationService.addCommunication(agentId, target.id, "peer");
+              if (this.teamChat) {
+                await this.teamChat.recordIncoming(target.id, agentId, content, msgId);
+                await this.teamChat.recordOutgoing(agentId, target.id, content, JSON.stringify([{ tool: name, input }]));
+              }
+              results.push(`Sent to ${target.name} (${target.shortId}).`);
+            }
+          }
+          return results.join("\n");
         }
 
         // ── List Subordinates (coordinator tool) ───────────
@@ -895,6 +967,24 @@ export class ToolExecutor {
           return await this.files.deleteFile(project.workspacePath, filePath);
         }
 
+        // ── Bash Shell Execution (Effect-based, ported from OpenCode) ─
+        case "bash": {
+          const caller = await this.org.getAgent(agentId);
+          if (!caller?.projectId) return "Error: Could not determine your project.";
+          const project = await this.projects.getProject(caller.projectId);
+          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
+          try {
+            const result = await Effect.runPromise(
+              runBashCommand(project.workspacePath, input).pipe(
+                Effect.catchAll((err) => Effect.succeed(`Error: ${err.message}`)),
+              ),
+            );
+            return result;
+          } catch (err: any) {
+            return `Error executing bash command: ${err.message || err}`;
+          }
+        }
+
         // ── Shell Command Execution ─────────────────────────────
         case "run_command": {
           const caller = await this.org.getAgent(agentId);
@@ -931,6 +1021,58 @@ export class ToolExecutor {
           );
         }
 
+        // ── Grep (regex file search, Effect-based) ──────────────
+        case "grep": {
+          const caller = await this.org.getAgent(agentId);
+          if (!caller?.projectId) return "Error: Could not determine your project.";
+          const project = await this.projects.getProject(caller.projectId);
+          if (!project?.workspacePath) return "Error: This project has no workspace configured.";
+          try {
+            return await Effect.runPromise(executeGrep(project.workspacePath, input).pipe(
+              Effect.catchAll((err) => Effect.succeed(`Error: ${err.message}`)),
+            ));
+          } catch (err: any) {
+            return `Error: ${err.message}`;
+          }
+        }
+
+        // ── Apply Patch (structured file editing) ─────────────
+        case "apply_patch": {
+          const caller = await this.org.getAgent(agentId);
+          if (!caller?.projectId) return "Error: Could not determine your project.";
+          const project = await this.projects.getProject(caller.projectId);
+          if (!project?.workspacePath) return "Error: This project has no workspace configured.";
+          try {
+            return await Effect.runPromise(executeApplyPatch(project.workspacePath, input).pipe(
+              Effect.catchAll((err) => Effect.succeed(`Error: ${err.message}`)),
+            ));
+          } catch (err: any) {
+            return `Error: ${err.message}`;
+          }
+        }
+
+        // ── Question (ask user interactively) ──────────────────
+        case "question": {
+          try {
+            return await Effect.runPromise(executeQuestion(agentId, input).pipe(
+              Effect.catchAll((err) => Effect.succeed(`Error: ${err.message}`)),
+            ));
+          } catch (err: any) {
+            return `Error: ${err.message}`;
+          }
+        }
+
+        // ── TodoWrite (task list) ──────────────────────────────
+        case "todowrite": {
+          try {
+            return await Effect.runPromise(executeTodoWrite(agentId, input).pipe(
+              Effect.catchAll((err) => Effect.succeed(`Error: ${err.message}`)),
+            ));
+          } catch (err: any) {
+            return `Error: ${err.message}`;
+          }
+        }
+
         // ── Fetch URL ───────────────────────────────────────────
         case "fetch_url": {
           const { url, maxChars } = input;
@@ -944,6 +1086,64 @@ export class ToolExecutor {
           } catch (err: any) {
             return `Error fetching URL: ${err.message || err}`;
           }
+        }
+
+        // ── Web Search (DuckDuckGo, Effect-based) ──────────────
+        case "websearch": {
+          try {
+            return await Effect.runPromise(executeWebSearch(input).pipe(
+              Effect.catchAll((err) => Effect.succeed(`Search error: ${err.message}`)),
+            ));
+          } catch (err: any) {
+            return `Search error: ${err.message}`;
+          }
+        }
+
+        // ── MCP Tools ──────────────────────────────────────────
+        case "mcp_list_tools": {
+          try {
+            const serverName = input.serverName as string | undefined;
+            if (serverName) {
+              const tools = await mcpService.listTools(serverName);
+              if (tools.length === 0) return `No tools found on MCP server "${serverName}".`;
+              return tools.map((t) => `- **${t.name}**: ${t.description}`).join("\n");
+            }
+            const all = await mcpService.listAllTools();
+            if (all.length === 0) return "No MCP servers configured or connected. Configure servers in Settings.";
+            const grouped: Record<string, string[]> = {};
+            for (const t of all) {
+              if (!grouped[t.serverName]) grouped[t.serverName] = [];
+              grouped[t.serverName].push(`  - ${t.name}: ${t.description}`);
+            }
+            return Object.entries(grouped).map(([srv, tools]) => `## ${srv}\n${tools.join("\n")}`).join("\n\n");
+          } catch (err: any) {
+            return `MCP error: ${err.message}`;
+          }
+        }
+
+        case "mcp_call": {
+          const { serverName, toolName, args } = input;
+          if (!serverName || !toolName) return "Error: mcp_call requires serverName and toolName.";
+          try {
+            return await mcpService.callTool(serverName, toolName, args || {});
+          } catch (err: any) {
+            return `MCP error: ${err.message}`;
+          }
+        }
+
+        case "mcp_configure": {
+          const { name, transport, command, args, cwd, url, enabled } = input;
+          if (!name || !transport) return "Error: mcp_configure requires name and transport.";
+          mcpService.setConfig({
+            name,
+            transport: transport as "stdio" | "http",
+            command: command as string | undefined,
+            args: args as string[] | undefined,
+            cwd: cwd as string | undefined,
+            url: url as string | undefined,
+            enabled: enabled !== "false",
+          });
+          return `MCP server "${name}" configured (${transport}). Use mcp_list_tools to discover its tools.`;
         }
 
         // ── Move / Rename File ──────────────────────────────────
@@ -1166,6 +1366,52 @@ export class ToolExecutor {
           current.splice(idx, 1);
           await this.org.updateAgent(target.id, { mcpServers: JSON.stringify(current) });
           return `MCP server "${mcpServer}" unbound from "${target.name}" (${target.shortId || target.id.slice(0, 8)}). Remaining MCP servers: [${current.join(", ")}]`;
+        }
+
+
+        case "get_project_time": {
+          if (!this.gameTimeService || !this.projectId) {
+            return "Error: project time service unavailable.";
+          }
+          const snap = this.gameTimeService.getSnapshot(this.projectId);
+          return "Current project time: " + snap.formatted + " (day " + snap.day + ", " + snap.gameSeconds + " project-seconds)";
+        }
+
+        case "get_real_time": {
+          const snap = this.getTimeSnapshot();
+          const real = snap?.realFormatted ?? new Date().toISOString();
+          return "Current real-world time: " + real + ". Use this for news, web, and external calendar queries.";
+        }
+
+        case "set_alarm": {
+          const { purpose, targetAgentId, dueInGameDays, dueInGameHours, dueInGameMinutes, dueInGameSeconds } = input;
+          if (!purpose) return "Error: set_alarm requires purpose.";
+          if (!this.alarmService || !this.gameTimeService || !this.projectId) {
+            return "Error: alarm service unavailable.";
+          }
+          const offset = parseGameTimeOffset({ dueInGameDays, dueInGameHours, dueInGameMinutes, dueInGameSeconds });
+          if (offset <= 0) {
+            return "Error: specify a positive due time (dueInGameDays/Hours/Minutes/Seconds).";
+          }
+          let toId = agentId;
+          let toName = "yourself";
+          if (targetAgentId) {
+            const target = await this.org.resolveAgent(String(targetAgentId).trim());
+            if (!target) return 'Error: No agent found matching "' + targetAgentId + '".';
+            toId = target.id;
+            toName = target.name || toId;
+          }
+          const current = this.gameTimeService.getCurrentGameSeconds(this.projectId);
+          const fireAt = current + offset;
+          const alarmId = await this.alarmService.schedule({
+            projectId: this.projectId,
+            fromAgentId: agentId,
+            toAgentId: toId,
+            purpose: String(purpose),
+            fireAtGameSeconds: fireAt,
+          });
+          const fireLabel = formatGameTime(fireAt);
+          return "Alarm set (id: " + alarmId.slice(0, 8) + "). Recipient: " + toName + ". Fires at project time " + fireLabel + ". Purpose: " + purpose;
         }
 
         default:

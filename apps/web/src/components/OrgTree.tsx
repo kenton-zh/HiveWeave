@@ -15,7 +15,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import AgentNode from "./AgentNode";
 import ApprovalDialog from "./ApprovalDialog";
-import { getOrgTree, getCommunications, getProjectPendingApprovals } from "../api";
+import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings } from "../api";
 import { useAppStore } from "../store";
 
 interface OrgNodeData {
@@ -121,6 +121,7 @@ function OrgTree() {
   const activeCommunications = useAppStore((s) => s.activeCommunications);
   const setActiveCommunications = useAppStore((s) => s.setActiveCommunications);
   const setAllPendingApprovals = useAppStore((s) => s.setAllPendingApprovals);
+  const setUserPingAgentIds = useAppStore((s) => s.setUserPingAgentIds);
   const selectedAgentId = useAppStore((s) => s.selectedAgentId);
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
   const baseEdgesRef = useRef<Edge[]>([]);
@@ -239,6 +240,30 @@ function OrgTree() {
       clearInterval(interval);
     };
   }, [selectedProjectId, setAllPendingApprovals]);
+
+  // Poll for user pings (agents that sent user-directed messages)
+  useEffect(() => {
+    let mounted = true;
+
+    async function pollUserPings() {
+      try {
+        const data = await getUserPings();
+        if (mounted) {
+          setUserPingAgentIds(data?.agentIds || []);
+        }
+      } catch (err) {
+        console.error("Failed to fetch user pings:", err);
+      }
+    }
+
+    pollUserPings();
+    const interval = setInterval(pollUserPings, 3000);
+
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, [setUserPingAgentIds]);
 
   // Merge communication edges with structural edges
   useEffect(() => {

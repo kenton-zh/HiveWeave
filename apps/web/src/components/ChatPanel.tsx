@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useAppStore } from "../store";
 import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead } from "../api";
 import ApprovalDialog from "./ApprovalDialog";
+import TodoBar from "./TodoBar";
 
 interface AgentInfo {
   id: string;
@@ -58,6 +59,8 @@ const toolCategories: Record<string, { color: string; bg: string; label: string 
   trigger_integration: { color: "text-amber-300", bg: "bg-amber-500/15", label: "Integration" },
   message_superior: { color: "text-emerald-300", bg: "bg-emerald-500/15", label: "Report Up" },
   message_peer: { color: "text-cyan-300", bg: "bg-cyan-500/15", label: "Peer Msg" },
+  send_message: { color: "text-cyan-300", bg: "bg-cyan-500/15", label: "Send" },
+  read_agent_status: { color: "text-green-300", bg: "bg-green-500/15", label: "Status" },
   list_subordinates: { color: "text-blue-300", bg: "bg-blue-500/15", label: "Team" },
   create_agent: { color: "text-pink-300", bg: "bg-pink-500/15", label: "Hire" },
   transfer_agent: { color: "text-orange-300", bg: "bg-orange-500/15", label: "Transfer" },
@@ -91,12 +94,10 @@ const statusLabels: Record<string, { text: string; color: string }> = {
   waiting: { text: "Waiting", color: "text-amber-400" },
 };
 
-const TEAM_TOOLS = new Set(["dispatch_task", "message_superior", "message_peer"]);
 
 function isTeamChannelMessage(msg: ChatMessage): boolean {
   if (msg.role === "team") return true;
   if (msg.isBackground) return true;
-  if (msg.toolCalls?.some((tc) => TEAM_TOOLS.has(tc.tool))) return true;
   return false;
 }
 
@@ -707,6 +708,8 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           </div>
         </div>
       )}
+
+      <TodoBar agentId={agentId} />
 
       <div ref={scrollContainerRef} onScroll={handleMessagesScroll} className="flex-1 min-h-0 overflow-y-auto px-6 py-4 space-y-4">
         {directMessages.length === 0 && !hasTeamComms && (

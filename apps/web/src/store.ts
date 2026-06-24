@@ -61,6 +61,9 @@ interface AppState {
   processingAgents: string[];
   setProcessingAgents: (ids: string[]) => void;
   updateProcessingAgent: (id: string, processing: boolean) => void;
+  // User ping notification — agents that have sent user-directed messages
+  userPingAgentIds: string[];
+  setUserPingAgentIds: (ids: string[]) => void;
   // Real-time activity feed — live agent actions visible in Logs
   activityFeed: ActivityEntry[];
   addActivity: (entry: ActivityEntry) => void;
@@ -177,6 +180,9 @@ export const useAppStore = create<AppState>((set) => ({
       else current.delete(id);
       return { processingAgents: [...current] };
     }),
+  // User ping notifications
+  userPingAgentIds: [],
+  setUserPingAgentIds: (ids) => set({ userPingAgentIds: ids }),
   activityFeed: [],
   addActivity: (entry) =>
     set((state) => ({

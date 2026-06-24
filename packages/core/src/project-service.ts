@@ -1,4 +1,4 @@
-import { projects, agents, chatMessages, workLogs, handoffs, inbox, memories, permissionRequests, personnelRecords, conversationTurns, modules, merges } from "@hiveweave/db";
+import { projects, agents, chatMessages, workLogs, handoffs, inbox, memories, permissionRequests, personnelRecords, conversationTurns, modules, merges, scheduledAlarms } from "@hiveweave/db";
 import type { Database } from "@hiveweave/db";
 import { eq, inArray, and, or } from "drizzle-orm";
 import { randomUUID } from "crypto";
@@ -102,6 +102,9 @@ export class ProjectService {
     // through agents. Delete all modules that have no remaining agents.
     // (Simpler: just delete all modules — they're project-scoped.)
     await pdb.delete(modules);
+
+    // Delete scheduled alarms for this project
+    await pdb.delete(scheduledAlarms).where(eq(scheduledAlarms.projectId, projectId));
 
     // Delete all agents in the project
     await pdb.delete(agents).where(eq(agents.projectId, projectId));

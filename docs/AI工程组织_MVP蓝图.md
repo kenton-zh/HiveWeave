@@ -405,6 +405,132 @@ merges (
 
 ---
 
+## 📊 实施进度 (截至 2026-06-23)
+
+> 基于代码仓库实际审查。✅ = 已完成 / 🔄 = 部分完成 / ⬜ = 未开始
+
+### Phase 1 — 跑通层级派活 ✅ 完成
+
+| 功能点 | 状态 | 实现细节 |
+|---|---|---|
+| 组织架构树 (React Flow) | ✅ | `OrgTree.tsx` 递归布局，自定义 `AgentNode`，MiniMap + Controls |
+| 层级创建 Agent | ✅ | `AddAgentDialog` 支持手动创建 + 模板创建，指定 parent/role/permission_type |
+| CEO+HR 自动初始化 | ✅ | `server/index.ts` 项目启动时自动创建 or 修复，HR 挂 CEO 下 |
+| Chat with Agent (SSE 流式) | ✅ | `chat.ts` 完整 SSE 流：text/tool_use/tool_result/approval_request/retry/done/error |
+| 跨级直达对话 | ✅ | 用户可直接跟任意层级 Agent 聊天 |
+| 日志逐级上报 | ✅ | `dispatch_task` → `report_completion` → `approve_work` / `reject_work` |
+| 工作日志 | ✅ | `WorkLogPanel` + `WorkLogService`，DB 持久化 |
+| 审批流 | ✅ | `ApprovalDialog` + `PermissionService` + `ApprovalService`，支持 remember |
+| 实时活动流 | ✅ | SSE `status` 事件 → `activityFeed`，含 text/tool_use/tool_result/thinking/done/error |
+| 通信可视化 | ✅ | React Flow 动画边，按 dispatch/message/trigger/peer 着色，3s 轮询 |
+| Agent 状态机 | ✅ | 7 种状态 (created/active/promoted/receiving/merging/dissolving/archived) |
+| 上班/下班 | ✅ | Pause/Resume 系统，SSE 实时同步 paused 状态 |
+| 停止生成 | ✅ | ChatPanel "停止"按钮 abort SSE stream |
+| 项目管理 | ✅ | 多项目创建/切换/删除，文件夹选择 workspace |
+| 模型配置 | ✅ | `ModelSettings` 全 CRUD，支持测试连接 |
+| 人员编制 (Roster) | ✅ | `RosterService` + API，记录部门/职位/职责 |
+| Agent 模板 | ✅ | `TemplateService`，按 source/division/role 筛选 |
+| 文件系统浏览 | ✅ | `FolderPicker` → `fs.ts` 路由，列出目录/盘符 |
+| 图片输入 | ✅ | 粘贴/选择图片，base64 传输，存储到 chat_messages |
+| 消息排队 | ✅ | Agent 繁忙时自动排队，完成后自动发送 |
+
+**Phase 1 已远超额完成。** 除了原始蓝图 "层级派活" 的目标外，还实现了审批流、实时活动、消息排队、图片输入、项目管理、模型配置等大量超出 range 的功能。
+
+---
+
+### Phase 2 — 记忆隔离 + 归档 + 极简办公室 🔄 大部分完成
+
+#### 记忆系统
+
+| 功能点 | 状态 | 实现细节 |
+|---|---|---|
+| 三层记忆模型 | ✅ | `memories` 表 `scope` 字段：`project` / `agent` / `archive` |
+| 项目宪法 (scope=project) | ✅ | `MemoryService.getProjectMemories()`，所有 Agent 启动时注入 |
+| Agent 私有记忆 (scope=agent) | ✅ | `MemoryService.getAgentMemories(agentId)`，按 agent_id 严格隔离 |
+| 归档记忆 (scope=archive) | ✅ | `MemoryService.getArchivedMemories(moduleId)`，按模块检索 |
+| 记忆 CRUD | ✅ | `MemoryService` 完整实现：save/getByType/getByAgent/listRecent |
+| Agent 解散时自动归档 | ✅ | `DELETE /agents/:id` 调用 `memoryService.archiveAgentMemories(id)` |
+| 文字记忆注入 context | ✅ | `chat.ts` 内 `buildSystemPrompt()` 聚合 project + agent + archive 记忆 |
+| LLM 总结生成交接文档 | 🔄 | `HandoffService` 实现了 dispatch→accept→complete 流程，但解散时的 LLM 总结生成未见明确调用 |
+| 向量语义检索 | ⚠️ | `memories` 表 DB schema 中**没有 embedding 列**（设计文档有但实际表无），未见 sqlite-vec 集成 |
+
+#### 交接 & 任务管理
+
+| 功能点 | 状态 | 实现细节 |
+|---|---|---|
+| Handoff 记录表 | ✅ | `handoffs` 表：from_agent/to_agent/summary/status |
+| 派活 → 接受 → 完成 | ✅ | `HandoffService.createHandoff()` / `acceptPendingHandoffs()` / `completeHandoff()` |
+| 验收通过/打回 | ✅ | `approveHandoff()` / `reopenHandoff()` |
+| 子任务完成通知上级 | ✅ | `report_completion` tool + `inboxService` 自动通知 |
+| 解散交接 (Handoff 6 步) | 🔄 | 冻结/读记忆/归档 路径已通，但"LLM 总结 → 写入接收方记忆"未见完整链 |
+
+#### 极简办公室
+
+| 功能点 | 状态 | 实现细节 |
+|---|---|---|
+| PixiJS 渲染引擎 | ✅ | `OfficeView.tsx` 使用 PixiJS 8.x，700×420 canvas |
+| 地板/墙壁/网格 | ✅ | 木地板 + 网格线 + 墙壁，函数 `createFloor()` |
+| 办公家具 | ✅ | 桌子/椅子/显示器/书架/绿植/饮水机/会议桌，`createFurnitureLayer()` |
+| 5 个固定工位 | ✅ | `WORKSTATIONS` 数组硬编码，3+2 布局 |
+| 角色精灵加载 | ✅ | `AgentSprite` 类，从 `walk.png` sprite sheet 切 7 帧，去背景色处理 |
+| 精灵动画状态机 | ✅ | idle/walking/sitting/typing 四个状态，`frameDelay=8` |
+| 测试序列 | ✅ | `runTestSequence()`：走进来→坐下→打字→换工位→再坐下→打字 |
+| **接入真实 Agent 数据** | ❌ | OfficeView **完全未对接** agent 数据。工位硬编码，精灵是测试精灵 |
+| 点击工位展开对话 | ❌ | 没有交互响应，没有事件处理 |
+| 空桌子创建 Agent | ❌ | 没有实现 |
+| 屏幕颜色反映状态 | ❌ | 显示器只是静态蓝色辉光 |
+
+**Phase 2 评估**: 记忆系统核心骨架完整（三层 scope + CRUD + 归档），但缺少向量检索和完整的 LLM 交接总结链。办公室画了很漂亮的场景但完全是独立测试模式——精灵和数据没接上。
+
+---
+
+### Phase 3 — 演化事件 + 像素办公室 🔄 部分完成
+
+#### 演化事件
+
+| 功能点 | 状态 | 实现细节 |
+|---|---|---|
+| 晋升状态 (Promoted) | 🔄 | 状态枚举存在，`AgentNode` 有颜色定义，但完整 5 步晋升流程未确认 |
+| 合并记忆 | ⚠️ | `merges` 表存在，但代码中未见完整的 conflict-detect → resolve → synthesize 流程 |
+| 冲突检测与仲裁 | ⚠️ | 高级合并功能未实现 |
+| AI 扩张权设闸 | 🔄 | 审批流基础能力已完备（PermissionService + ApprovalService），但"Agent 自主 spawn 需审批"的具体逻辑未确认 |
+
+#### 像素办公室高级特性
+
+| 功能点 | 状态 | 实现细节 |
+|---|---|---|
+| 行走动画 | ✅ | `walkTo()` 方法 + 帧动画 + 方向翻转，测试序列验证通过 |
+| 站位动画 | ✅ | `sitDown()` / `standUp()` |
+| 打字动画 | ✅ | `startTyping()` 帧循环 |
+| 协作可视化 (派活走过场) | ❌ | 未实现 |
+| 汇报递交动画 | ❌ | 未实现 |
+| 同级聊天气泡 | ❌ | 未实现 |
+| 办公室随团队扩展 | ❌ | 工位固定 5 个 |
+| 组织树缩略小地图 | ❌ | 未实现 |
+| 时间线回放 | ❌ | 未实现 |
+| 里程碑庆祝动画 | ❌ | 未实现 |
+
+**Phase 3 评估**: Agent Runtime 的部分能力已经非常深入（tool executor 支持完整的 dispatch/report/review 工具链），但"演化事件"的精髓（晋升 → 切换权限集 → spawn 子 Agent 的完整自动流程、合并记忆的冲突处理）还未完整实现。像素办公室做了很好的技术验证，但离蓝图里的"游戏发展国式实况办公室"还差很多。
+
+---
+
+### 超出蓝图的已实现功能
+
+这些功能原始 MVP 蓝图未规划但已实现：
+
+1. **消息排队系统** — Agent 繁忙时自动排队，空闲后自动发送
+2. **LLM 重试机制** — API 错误自动重试（最多 3 次，指数退避），ChatPanel 显示重试进度
+3. **API Key 安全** — `modelSettings.apiKey` 不返回原始值，仅返回 `***` 掩码
+4. **Agent 重命名** — `AgentDetailPanel` 支持修改 name/goal/backstory
+5. **权限规则配置** — `AgentDetailPanel` 支持配置 allowedTools/deniedTools/askTools/mcpServers/boundSkills
+6. **Agent 模板系统** — 从模板库创建 Agent（按部门/角色筛选）
+7. **Orphaned message 警告** — 用户发消息无回复时 ChatPanel 提示异常
+8. **Orphaned approval 清理** — 服务启动时清理前实例遗留的待审批请求
+9. **后台消息/未读标记** — team 频道消息支持 isBackground/isRead 标记
+10. **Agent 详情面板** — 6 个分区（Info / Permissions / Roster / Model / Capabilities / Actions）
+
+---
+
 ### 附录：和其他方案的差异点
 
 | 维度 | 本产品 | OpenHands | MetaGPT | CrewAI |

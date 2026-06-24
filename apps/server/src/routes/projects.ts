@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { ProjectService, OrgService, RosterService } from "@hiveweave/core";
+import { ProjectService, OrgService, RosterService, getGameTimeService } from "@hiveweave/core";
 import { db, projects, agents, ensureProjectDb, evictProjectDb, unregisterProjectAgents, registerProjectAgents } from "@hiveweave/db";
 import { randomUUID } from "crypto";
 import { existsSync, rmSync, mkdirSync, cpSync } from "fs";
@@ -17,6 +17,7 @@ const CreateProjectBody = z.object({
 export async function projectRoutes(fastify: FastifyInstance) {
   // ProjectService uses meta DB for projects table
   const projectService = new ProjectService(db);
+  const gameTimeService = getGameTimeService(db);
 
   fastify.get("/", async (_request, reply) => {
     try {
@@ -108,6 +109,28 @@ export async function projectRoutes(fastify: FastifyInstance) {
     } catch (error: any) {
       fastify.log.error(error, "Failed to create project");
       return reply.status(500).send({ error: "Failed to create project", details: error.message });
+    }
+  });
+
+
+  fastify.get<{ Params: { id: string } }>("/:id/game-time", async (request, reply) => {
+    const { id } = request.params;
+    try {
+      const project = await projectService.getProject(id);
+      if (!project) return reply.status(404).send({ error: "Project not found" });
+      await gameTimeService.initProject(id);
+      const snap = gameTimeService.getSnapshot(id);
+      return {
+        projectId: id,
+        gameSeconds: snap.gameSeconds,
+        day: snap.day,
+        formatted: snap.formatted,
+        realFormatted: snap.realFormatted,
+        realTimestamp: snap.realTimestamp,
+      };
+    } catch (error: any) {
+      fastify.log.error(error, "Failed to get project game time");
+      return reply.status(500).send({ error: "Failed to get project game time", details: error.message });
     }
   });
 

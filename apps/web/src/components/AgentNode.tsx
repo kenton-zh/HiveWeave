@@ -36,6 +36,7 @@ function AgentNode({ data, id }: NodeProps) {
   const pendingApprovals = useAppStore((s) => s.pendingApprovals);
   const openAddAgent = useAppStore((s) => s.openAddAgent);
   const processingAgents = useAppStore((s) => s.processingAgents);
+  const userPingAgentIds = useAppStore((s) => s.userPingAgentIds);
 
   const isSelected = selectedAgentId === id;
   const role = (data.role as string) || "module_dev";
@@ -57,6 +58,7 @@ function AgentNode({ data, id }: NodeProps) {
   const agentApprovals = pendingApprovals[id] || [];
   const hasPendingApprovals = agentApprovals.length > 0;
   const onApprovalClick = data.onApprovalClick as ((agentId: string) => void) | undefined;
+  const hasUserPing = userPingAgentIds.includes(id);
 
   return (
     <div
@@ -74,6 +76,16 @@ function AgentNode({ data, id }: NodeProps) {
         position={Position.Top}
         className="!w-2 !h-2 !bg-accent !border-surface-card !border-2"
       />
+
+      {/* User ping indicator (top-left) */}
+      {hasUserPing && (
+        <div
+          className="absolute -top-2 -left-2 w-5 h-5 bg-red-500 rounded-full flex items-center justify-center shadow-lg animate-pulse z-10"
+          title="该 Agent 有消息给你"
+        >
+          <span className="text-[10px] text-white font-bold">!</span>
+        </div>
+      )}
 
       {/* Pending approval indicator (top-right) */}
       {hasPendingApprovals && (

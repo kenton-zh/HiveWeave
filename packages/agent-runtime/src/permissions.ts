@@ -200,16 +200,15 @@ const CORE_TOOLS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
-      name: "hiveweave__message_peer",
-      description: "Send a message to a peer agent for collaboration.",
+      name: "hiveweave__send_message",
+      description: "Send a message to one or more recipients. Use \"user\" for the human operator, or agent names/IDs for colleagues. Can send to multiple recipients at once.",
       parameters: {
         type: "object",
         properties: {
-          toAgentId: { type: "string", description: "Peer agent UUID." },
-          message: { type: "string", description: "Message content." },
-          expectReport: { type: "boolean", description: "True if you need a reply. Default false." },
+          content: { type: "string", description: "Message content." },
+          recipients: { type: "string", description: 'Comma-separated list of recipients. Use "user" for the human operator, and/or agent names for colleagues. Example: "user, 后端开发工程师"\nOptions: "user" = human operator; agent names or IDs for colleagues.' },
         },
-        required: ["toAgentId", "message"],
+        required: ["content", "recipients"],
       },
     },
   },
@@ -233,6 +232,150 @@ const CORE_TOOLS: ChatCompletionTool[] = [
           content: { type: "string", description: "Concise, self-contained content." },
         },
         required: ["type", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__fetch_url",
+      description: "Fetch web page content as text (HTML converted to markdown). Use for reading documentation, API references, or any publicly accessible URL.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "HTTP/HTTPS URL to fetch." },
+          maxChars: { type: "string", description: "Max characters to return. Default 50000." },
+        },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__get_project_time",
+      description: "Get the current project (game) time. All inter-agent communication and deadlines use project time.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__get_real_time",
+      description: "Get the current real-world time. Use ONLY when interacting with the outside world (news, web, calendar events). Convert project-time deadlines to real time before external queries.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__set_alarm",
+      description: "Schedule an alarm message to yourself or another agent at a future project time. The recipient receives a queued inbox message when the alarm fires. Use this to plan reminders and avoid missing deadlines.",
+      parameters: {
+        type: "object",
+        properties: {
+          purpose: { type: "string", description: "What to remind about when the alarm fires." },
+          targetAgentId: { type: "string", description: "Recipient agent name or ID. Omit to alarm yourself." },
+          dueInGameDays: { type: "string", description: "Project days from now until alarm fires." },
+          dueInGameHours: { type: "string", description: "Project hours from now until alarm fires." },
+          dueInGameMinutes: { type: "string", description: "Project minutes from now until alarm fires." },
+          dueInGameSeconds: { type: "string", description: "Project seconds from now until alarm fires." },
+        },
+        required: ["purpose"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__question",
+      description: "Ask the human operator a question when you need a decision. Supports predefined options or free-text answer. Blocks until answered.",
+      parameters: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "The question to ask." },
+          options: { type: "array", description: "Optional predefined choices [{label, description}]. Max 4." },
+        },
+        required: ["question"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__todowrite",
+      description: "Maintain a structured task list. Pass the complete list of current todos with statuses. The human operator can see your progress.",
+      parameters: {
+        type: "object",
+        properties: {
+          todos: { type: "array", description: "Array of {content: string, status: pending|in_progress|completed|cancelled}." },
+        },
+        required: ["todos"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__websearch",
+      description: "Search the web via DuckDuckGo. Returns titles, URLs, and snippets. No API key needed.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query." },
+          numResults: { type: "string", description: "Max results (default 8, max 10)." },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__mcp_call",
+      description: "Call a tool on a connected MCP server. Use mcp_list_tools first to see available tools.",
+      parameters: {
+        type: "object",
+        properties: {
+          serverName: { type: "string", description: "MCP server name." },
+          toolName: { type: "string", description: "Tool name to call." },
+          args: { type: "array", description: "Tool arguments as key-value JSON object." },
+        },
+        required: ["serverName", "toolName"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__mcp_list_tools",
+      description: "List all available tools on a connected MCP server, or all servers if no name given.",
+      parameters: {
+        type: "object",
+        properties: {
+          serverName: { type: "string", description: "Optional: specific server name." },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__mcp_configure",
+      description: "Install or update an MCP server configuration. Pass name, transport (stdio|http), and the required fields.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "MCP server name." },
+          transport: { type: "string", description: "'stdio' or 'http'." },
+          command: { type: "string", description: "Command for stdio (e.g. 'npx')." },
+          args: { type: "array", description: "Args for stdio (e.g. ['-y', '@anthropic/mcp-filesystem'])." },
+          cwd: { type: "string", description: "Working dir for stdio." },
+          url: { type: "string", description: "URL for HTTP transport." },
+          enabled: { type: "string", description: "'true' or 'false' (default true)." },
+        },
+        required: ["name", "transport"],
       },
     },
   },
@@ -581,6 +724,22 @@ const FILE_TOOLS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "hiveweave__bash",
+      description: "Execute a shell command with full bash features (heredoc, pipes, multi-line). Uses Git Bash on Windows. Supports ssh, docker, git, npm, python and any CLI tool. Default timeout: 2 min, max: 10 min.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Shell command string to execute. Supports heredoc, pipes, && and ; separators." },
+          workdir: { type: "string", description: "Working directory. Defaults to workspace root." },
+          timeout: { type: "string", description: `Timeout in ms. Default ${2*60*1000}, max ${10*60*1000}.` },
+        },
+        required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "hiveweave__run_command",
       description: "Execute a shell command in the workspace. Must be non-interactive.",
       parameters: {
@@ -591,6 +750,38 @@ const FILE_TOOLS: ChatCompletionTool[] = [
           timeout: { type: "string", description: "Max ms (default 120000, max 600000)." },
         },
         required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__grep",
+      description: "Search files with regex pattern. Returns file paths with matching line numbers and content.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Regular expression to search for." },
+          path: { type: "string", description: "File/directory to search. Default: workspace root." },
+          include: { type: "string", description: "Glob filter (e.g. '*.ts')." },
+          head_limit: { type: "number", description: "Max results. Default 100." },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__apply_patch",
+      description: "Apply structured patches (add/update/delete files). Each patch entry specifies op, filePath, and content or oldString/newString.",
+      parameters: {
+        type: "object",
+        properties: {
+          description: { type: "string", description: "Summary of what this patch does." },
+          patches: { type: "array", description: "Array of {op, filePath, content?, oldString?, newString?}." },
+        },
+        required: ["patches"],
       },
     },
   },
@@ -714,9 +905,24 @@ const CEO_COORDINATOR_TOOL_NAMES = new Set([
 ]);
 
 const MESSAGE_SUPERIOR_TOOL_NAMES = new Set(["hiveweave__message_superior"]);
-const MESSAGE_PEER_ROSTER_TOOL_NAMES = new Set([
-  "hiveweave__message_peer",
+const CORE_TOOLS_NAMES = new Set([
+  "hiveweave__message_superior",
+  "hiveweave__send_message",
   "hiveweave__read_roster",
+  "hiveweave__write_memory",
+  "hiveweave__fetch_url",
+  "hiveweave__get_project_time",
+  "hiveweave__get_real_time",
+  "hiveweave__set_alarm",
+  "hiveweave__question",
+  "hiveweave__todowrite",
+  "hiveweave__websearch",
+  "hiveweave__mcp_call",
+  "hiveweave__mcp_list_tools",
+  "hiveweave__mcp_configure",
+  "hiveweave__list_available_mcp",
+  "hiveweave__bind_mcp",
+  "hiveweave__unbind_mcp",
 ]);
 const BINDING_AND_MEMORY_TOOL_NAMES = new Set([
   "hiveweave__bind_skill",
@@ -739,6 +945,7 @@ const CEO_READONLY_FILE_TOOL_NAMES = new Set([
   "hiveweave__list_files",
   "hiveweave__search_files",
   "hiveweave__glob",
+  "hiveweave__grep",
   "hiveweave__fetch_url",
 ]);
 
@@ -787,7 +994,7 @@ export function getHiveWeaveTools(
       ...pickTools(COORDINATOR_TOOLS, CEO_COORDINATOR_TOOL_NAMES),
       ...pickTools(CHARTER_TOOLS, SAVE_CHARTER_TOOL_NAMES),
       ...pickTools(CHARTER_TOOLS, READ_CHARTER_TOOL_NAMES),
-      ...pickTools(CORE_TOOLS, MESSAGE_PEER_ROSTER_TOOL_NAMES),
+      ...pickTools(CORE_TOOLS, CORE_TOOLS_NAMES),
       ...pickTools(HR_TOOLS, LIST_ALL_AGENTS_TOOL_NAMES),
       ...pickTools(BINDING_TOOLS, BINDING_AND_MEMORY_TOOL_NAMES),
       ...pickTools(EXECUTOR_TOOLS, READ_PROJECT_MEMORY_TOOL_NAMES),
@@ -798,7 +1005,7 @@ export function getHiveWeaveTools(
   if (normalizedRole === "hr") {
     return uniqueTools([
       ...pickTools(CORE_TOOLS, MESSAGE_SUPERIOR_TOOL_NAMES),
-      ...pickTools(CORE_TOOLS, MESSAGE_PEER_ROSTER_TOOL_NAMES),
+      ...pickTools(CORE_TOOLS, CORE_TOOLS_NAMES),
       ...pickTools(HR_TOOLS, HR_PERSONNEL_TOOL_NAMES),
       ...pickTools(HR_TOOLS, LIST_ALL_AGENTS_TOOL_NAMES),
       ...pickTools(CHARTER_TOOLS, READ_CHARTER_TOOL_NAMES),

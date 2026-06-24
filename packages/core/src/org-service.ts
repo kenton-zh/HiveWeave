@@ -194,6 +194,16 @@ export class OrgService {
       if (matches.length === 1) return matches[0];
       if (matches.length > 1) return matches[0];
     }
+
+    // 4. Fall back to name match (case-insensitive exact or partial)
+    const byName = await this.db.select().from(agents).where(eq(agents.name, input));
+    if (byName.length > 0) return byName[0];
+
+    // 5. Fall back to name prefix/contains match
+    const nameMatches = await this.db.select().from(agents).where(like(agents.name, `%${input}%`));
+    if (nameMatches.length === 1) return nameMatches[0];
+    if (nameMatches.length > 1) return nameMatches[0];
+
     return null;
   }
 
