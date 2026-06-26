@@ -39,6 +39,10 @@ export class FileService {
     "dist", "build", "target", ".next", ".nuxt", ".turbo",
     ".cache", "coverage", ".idea", ".vscode",
   ]);
+
+  /** HiveWeave system directory — must never be modified by agents */
+  private static readonly HIVEWEAVE_DIR = ".hiveweave";
+
   /** Sensitive file patterns — blocked from read/write/edit */
   private static readonly SENSITIVE_PATTERNS = [
     /^\.env(\..+)?$/i,                    // .env, .env.local, .env.production
@@ -113,6 +117,23 @@ export class FileService {
   }
 
   // ── Sensitive file check ───────────────────────────────────
+
+  /**
+   * Check if a file path is under the HiveWeave system directory.
+   * Throws if the path targets .hiveweave — agents must never touch it.
+   */
+  private checkHiveWeaveDir(absPath: string, workspacePath: string): void {
+    const wsRoot = path.resolve(workspacePath);
+    const hwRoot = path.join(wsRoot, FileService.HIVEWEAVE_DIR);
+    const normalized = path.resolve(absPath);
+    if (normalized === hwRoot || normalized.startsWith(hwRoot + path.sep)) {
+      throw new Error(
+        `Access denied: ".hiveweave" is the HiveWeave system directory. ` +
+        `It stores project agent data, memory, and internal state. ` +
+        `Never read, write, or delete files inside it.`,
+      );
+    }
+  }
 
   /**
    * Check if a file matches sensitive file patterns.
@@ -250,6 +271,7 @@ export class FileService {
     append?: boolean,
   ): Promise<string> {
     const absPath = await this.resolveSafe(workspacePath, filePath);
+    this.checkHiveWeaveDir(absPath, workspacePath);
     this.checkSensitive(filePath);
 
     // Auto-create parent directories
@@ -330,6 +352,7 @@ export class FileService {
     newText: string,
   ): Promise<string> {
     const absPath = await this.resolveSafe(workspacePath, filePath);
+    this.checkHiveWeaveDir(absPath, workspacePath);
     this.checkSensitive(filePath);
 
     // Mode: create new file (oldText is empty)
@@ -410,6 +433,7 @@ export class FileService {
     filePath: string,
   ): Promise<string> {
     const absPath = await this.resolveSafe(workspacePath, filePath);
+    this.checkHiveWeaveDir(absPath, workspacePath);
     this.checkSensitive(filePath);
 
     let stat: Stats;
@@ -447,6 +471,8 @@ export class FileService {
       ? await this.resolveSafe(workspacePath, dirPath)
       : path.resolve(workspacePath);
 
+    // Block direct listing of .hiveweave
+    this.checkHiveWeaveDir(targetPath, workspacePath);
     let stat: Stats;
     try {
       stat = await fs.stat(targetPath);
@@ -522,6 +548,8 @@ export class FileService {
       ? await this.resolveSafe(workspacePath, searchPath)
       : path.resolve(workspacePath);
 
+    // Block searching inside .hiveweave
+    this.checkHiveWeaveDir(targetDir, workspacePath);
     let regex: RegExp;
     try {
       regex = new RegExp(pattern, "gi");
@@ -694,6 +722,8 @@ export class FileService {
 
     const srcAbs = await this.resolveSafe(workspacePath, source);
     const destAbs = await this.resolveSafe(workspacePath, destination);
+    this.checkHiveWeaveDir(srcAbs, workspacePath);
+    this.checkHiveWeaveDir(destAbs, workspacePath);
 
     // Verify source exists
     try {
@@ -743,6 +773,7 @@ export class FileService {
     if (!dirPath) return "Error: create_directory requires a path.";
 
     const absPath = await this.resolveSafe(workspacePath, dirPath);
+    this.checkHiveWeaveDir(absPath, workspacePath);
     await fs.mkdir(absPath, { recursive: true });
     return `Directory created: "${dirPath}".`;
   }
@@ -759,6 +790,7 @@ export class FileService {
     if (!dirPath) return "Error: delete_directory requires a path.";
 
     const absPath = await this.resolveSafe(workspacePath, dirPath);
+    this.checkHiveWeaveDir(absPath, workspacePath);
 
     // Use rmdir (fails on non-empty dirs) — NOT rm({recursive: true})
     try {

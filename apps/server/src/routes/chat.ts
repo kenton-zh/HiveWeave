@@ -1,8 +1,9 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { randomUUID } from "crypto";
-import { OrgService, MemoryService, DispatchService, ToolExecutor, HandoffService, InboxService, ChatMessageService, TeamChatService, RosterService, FileService, ProjectService, communicationService, userPingTracker, drainQuestions, answerQuestion, getTodos, conversationStore, clawhubService, calculateHistoryBudget, estimateTokens, computePrefixHash, buildCompactionPrompt, statusEventBus, TemplateService, PermissionService, ApprovalService, waitForApprovalResponse, cancelApprovalWait, ModelService, ShellService, WebService, getGameTimeService, AlarmService, buildTimeContextBlock, prefixTriggerMessage } from "@hiveweave/core";
+import { OrgService, MemoryService, DispatchService, ToolExecutor, HandoffService, InboxService, ChatMessageService, TeamChatService, RosterService, FileService, ProjectService, communicationService, userPingTracker, drainQuestions, answerQuestion, getTodos, conversationStore, clawhubService, calculateHistoryBudget, estimateTokens, computePrefixHash, buildCompactionPrompt, statusEventBus, TemplateService, PermissionService, ApprovalService, waitForApprovalResponse, cancelApprovalWait, ModelService, ShellService, WebService, getGameTimeService, AlarmService, buildTimeContextBlock, prefixTriggerMessage, SettingsService, formatGoalsForPrompt, TOOL_OUTPUT_MAX_CHARS_COMPACTION } from "@hiveweave/core";
+import type { ReviewLLMCallback } from "@hiveweave/core";
 import type { StoredMessage } from "@hiveweave/core";
-import { AgentRuntime, buildIdentityPrompt, createProviderInstance } from "@hiveweave/agent-runtime";
+import { AgentRuntime, buildIdentityPrompt, createProviderInstance, ToolOutputStore } from "@hiveweave/agent-runtime";
 import type { AgentRuntimeConfig, StreamEvent, ToolExecutorCallback, Message, QueuedMessage, MessagePoller } from "@hiveweave/agent-runtime";
 import { generateText } from "ai";
 import { z } from "zod";
@@ -14,6 +15,12 @@ import { registerAlarmTrigger } from "../game-time-scheduler.js";
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
+
+/** Cached operator name — refreshed per request, not module-scoped. */
+async function getOperatorName(): Promise<string> {
+  const svc = new SettingsService(db);
+  return svc.get("operatorName");
+}
 
 const ChatBody = z.object({
   agentId: z.string().uuid(),
@@ -55,6 +62,10 @@ interface ResolvedModel {
   supportsImages: boolean;
   contextWindow: number;
   maxOutputTokens: number;
+  /** Explicit input token limit from model (model.limit.input). If set, used instead of context for overflow. */
+  limitInput?: number;
+  /** Whether this provider respects Anthropic-style inline cache hints. */
+  respectsInlineCacheHints?: boolean;
   temperature?: number;
   reasoningEffort?: string;
 }
@@ -83,13 +94,14 @@ async function resolveModelForAgent(agentId: string): Promise<ResolvedModel> {
 
   // 1. Try agent's specified model
   let model = agentModelId ? await modelService.getById(agentModelId) : null;
-  // 2. Role-based auto-selection
+  // 2. Permission-based auto-selection
   if (!model) {
-    const normalizedRole = agentRole.toLowerCase();
-    const isLeadership = normalizedRole === "ceo" || normalizedRole === "hr" || agentPermissionType === "coordinator";
-    if (isLeadership) {
+    const isCoordinator = agentPermissionType === "coordinator";
+    if (isCoordinator) {
+      // Management (CEO, HR, managers): DeepSeek via OpenCode Go
       model = await modelService.findActiveByModelId("deepseek-v4-flash") || await modelService.getDefault();
     } else {
+      // Leaf executors (developers, QA): Step 3.7 Flash
       model = await modelService.findActiveByModelId("step-3.7-flash") || await modelService.getDefault();
     }
   }
@@ -105,6 +117,8 @@ async function resolveModelForAgent(agentId: string): Promise<ResolvedModel> {
     supportsImages: model.supportsImages,
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,
+    limitInput: (model as any).limitInput,
+    respectsInlineCacheHints: (model as any).respectsInlineCacheHints ?? (model.provider === "anthropic" || model.provider === "bedrock"),
     temperature: model.temperature ? parseFloat(model.temperature) : undefined,
     reasoningEffort: agentReasoningEffort || model.defaultReasoningEffort || undefined,
   };
@@ -175,6 +189,11 @@ export async function chatRoutes(fastify: FastifyInstance) {
   const projectService = new ProjectService(db);
   const templateService = new TemplateService(db);
 
+  // Shared tool output store — enables truncation-to-file for large tool outputs.
+  // Full outputs are saved to temp dir; agent sees a preview + file path hint.
+  const toolOutputStore = new ToolOutputStore();
+  fastify.addHook("onClose", () => toolOutputStore.destroy());
+
   /** Create chat + team chat services sharing one ChatMessageService instance. */
   function createChatServices(projectDb: ReturnType<typeof ensureProjectDb>) {
     const chatMessageService = new ChatMessageService(projectDb);
@@ -222,8 +241,25 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
   type ProjectServices = NonNullable<Awaited<ReturnType<typeof getProjectServices>>>;
 
-  function makeToolExecutor(services: ProjectServices, projectId?: string | null): ToolExecutor {
+  function makeToolExecutor(services: ProjectServices, projectId?: string | null, resolvedModel?: ResolvedModel): ToolExecutor {
     const alarmService = new AlarmService(services.projectDb);
+
+    // Build review LLM callback from resolved model (only needed for Reviewer agent)
+    let reviewLLM: ReviewLLMCallback | undefined;
+    if (resolvedModel) {
+      const provider = createProviderInstance(resolvedModel.provider, resolvedModel.baseUrl, resolvedModel.apiKey);
+      reviewLLM = async (systemPrompt: string, userPrompt: string): Promise<string> => {
+        const { text } = await generateText({
+          model: provider(resolvedModel.modelId),
+          system: systemPrompt,
+          prompt: userPrompt,
+          temperature: 0.1, // low temperature for consistent review quality
+          maxOutputTokens: 4096,
+        });
+        return text;
+      };
+    }
+
     return new ToolExecutor(
       services.dispatchService,
       services.memoryService,
@@ -240,6 +276,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
       gameTimeService,
       alarmService,
       projectId ?? null,
+      reviewLLM,
     );
   }
 
@@ -263,7 +300,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
         const base = `## Workspace\nYour project workspace is at: \`${project.workspacePath}\`\nAll file paths are relative to the workspace root.`;
         const role = agentRole?.toLowerCase();
         if (role === "ceo") {
-          return `${base}\nYou have read-only filesystem access: use list_files, read_file, search_files, and glob to inspect the workspace. Do not use MCP tools for filesystem operations.`;
+          return `${base}\nYou have filesystem and shell access: use list_files, read_file, search_files, glob, bash, and run_command to inspect and manage the workspace. Do not write or edit files directly — delegate code changes to executors. Do not use MCP tools for filesystem operations.\n\n**IMPORTANT:** \`.hiveweave\` is the HiveWeave system directory — never touch it.`;
         }
         if (role === "hr") {
           return `${base}\nHR does not edit project files; use org and personnel tools instead of write_file, edit_file, or delete_file.`;
@@ -318,49 +355,111 @@ export async function chatRoutes(fastify: FastifyInstance) {
     }
   }
 
-    // --- Smart compaction: LLM summarizes old history instead of hard-truncating ---
-  // Resolves the default model at call time so it works even if models are added later.
-  const compactor = async (oldMessages: StoredMessage[]): Promise<string | null> => {
-    let model;
-    try { model = await modelService.getDefault(); } catch { return null; }
-    if (!model) return null;
-
-    const transcript = oldMessages.map((m) => {
-      if (m.role === "user") return `[User]: ${m.content}`;
-      if (m.role === "assistant") {
-        let t = m.content || "";
-        if (m.tool_calls) t += ` (${m.tool_calls.map((tc) => tc.function.name).join(", ")})`;
-        return `[Assistant]: ${t}`;
-      }
-      if (m.role === "tool") return `[Tool]: ${(m as any).content?.slice(0, 500) || ""}`;
-      if (m.role === "system") return `[Summary]: ${(m as any).content}`;
-      return "";
-    }).join("\n");
-
+  async function buildGoalsBlock(projectId: string | null): Promise<string> {
+    if (!projectId) return "";
     try {
-      const providerFactory = createProviderInstance(model.provider, model.baseUrl, model.apiKey);
-      const { text } = await generateText({
-        model: providerFactory(model.modelId),
-        messages: [{ role: "user", content: buildCompactionPrompt(transcript) }],
-        maxOutputTokens: 2048,
-        temperature: 0.3,
-      });
-      return text || null;
+      const goals = await projectService.getGoals(projectId);
+      return formatGoalsForPrompt(goals);
     } catch {
-      return null;
+      return "";
     }
+  }
+
+  /** Tell the CEO whether this is a fresh project or an established one. */
+  async function buildProjectStatusBlock(projectId: string | null, role: string): Promise<string> {
+    if (!projectId || role.toLowerCase() !== "ceo") return "";
+    try {
+      const project = await projectService.getProject(projectId);
+      if (!project) return "";
+      const ageMs = Date.now() - project.createdAt;
+      const ageMinutes = Math.floor(ageMs / 60000);
+      if (ageMinutes < 10) {
+        return `## Project Status\n🆕 This project was just created. No team exists yet — only you (CEO), HR, and QA. The user will guide you on the next steps.`;
+      }
+      return `## Project Status\nProject created ${ageMinutes} min ago. Use \`read_roster\` or \`list_subordinates\` to see current team size.`;
+    } catch {
+      return "";
+    }
+  }
+
+  // --- Structured Expert Command Parsing ---
+
+  interface ExpertCommand {
+    command: string;
+    role: string;
+    module: string;
+  }
+
+  const EXPERT_COMMAND_MAP: Record<string, string> = {
+    review: "code_reviewer",
+    test: "test_engineer",
+    audit: "security_auditor",
+    perf: "web_perf_auditor",
   };
 
-  // Configure the conversation store with the compactor callback
-  conversationStore.configure({ compactor });
+  function parseExpertCommand(message: string): ExpertCommand | null {
+    const trimmed = message.trim();
+    // Match: /review <module>, /test <module>, /audit <module>, /perf <module>
+    const match = trimmed.match(/^\/(review|test|audit|perf)\s+(.+)$/i);
+    if (!match) return null;
+    return {
+      command: match[1].toLowerCase(),
+      role: EXPERT_COMMAND_MAP[match[1].toLowerCase()],
+      module: match[2].trim(),
+    };
+  }
 
-  // Mid-turn compactor for AgentRuntime — summarizes in-memory messages when context overflows.
-  // Accepts an optional ResolvedModel so each agent uses its own model for compaction.
-  const makeMidTurnCompactor = (resolved?: ResolvedModel) => async (oldMessages: Message[]): Promise<string | null> => {
+    // --- Smart compaction: LLM summarizes old history (OpenCode-style) ---
+  // Incremental summaries are managed by conversationStore as the single source of truth.
+
+  /** Serialize messages for compaction transcript (aligned with OpenCode's TOOL_OUTPUT_MAX_CHARS=2000). */
+  function serializeForCompaction(messages: StoredMessage[] | Message[]): string {
+    return messages.map((m) => {
+      const msg = m as any;
+      if (msg.role === "user") return `[User]: ${typeof msg.content === "string" ? msg.content : ""}`;
+      if (msg.role === "assistant") {
+        let t = msg.content || "";
+        if (msg.tool_calls) t += ` (${msg.tool_calls.map((tc: any) => tc.function?.name || tc.toolName || "").join(", ")})`;
+        return `[Assistant]: ${t}`;
+      }
+      if (msg.role === "tool") return `[Tool]: ${(msg.content || "").slice(0, TOOL_OUTPUT_MAX_CHARS_COMPACTION)}`;
+      if (msg.role === "system") return `[System]: ${msg.content}`;
+      return "";
+    }).filter(Boolean).join("\n");
+  }
+
+  // Configure the conversation store for stored-message compaction
+  conversationStore.configure({
+    compactor: async (oldMessages: StoredMessage[]): Promise<string | null> => {
+      let model;
+      try { model = await modelService.getDefault(); } catch { return null; }
+      if (!model) return null;
+      const transcript = serializeForCompaction(oldMessages);
+      try {
+        const providerFactory = createProviderInstance(model.provider, model.baseUrl, model.apiKey);
+        const { text } = await generateText({
+          model: providerFactory(model.modelId),
+          messages: [{ role: "user", content: buildCompactionPrompt(transcript) }],
+          maxOutputTokens: 4096,
+          temperature: 0.3,
+        });
+        return text || null;
+      } catch {
+        return null;
+      }
+    },
+  });
+
+  /**
+   * Mid-turn compactor for AgentRuntime — summarizes in-memory messages when context overflows.
+   * Uses conversationStore for incremental summaries (single source of truth).
+   */
+  const makeMidTurnCompactor = (resolved?: ResolvedModel, agentId?: string, projectDb?: ReturnType<typeof ensureProjectDb>) => async (oldMessages: Message[]): Promise<string | null> => {
     let baseUrl: string;
     let apiKey: string;
     let modelId: string;
     let provider: string;
+    const agentKey = agentId || "unknown";
 
     if (resolved) {
       baseUrl = resolved.baseUrl;
@@ -378,27 +477,24 @@ export async function chatRoutes(fastify: FastifyInstance) {
       } catch { return null; }
     }
 
-    const transcript = oldMessages.map((m) => {
-      if (m.role === "user") return `[User]: ${typeof m.content === "string" ? m.content : ""}`;
-      if (m.role === "assistant") {
-        let t = m.content || "";
-        if (m.tool_calls) t += ` (${m.tool_calls.map((tc) => tc.function.name).join(", ")})`;
-        return `[Assistant]: ${t}`;
-      }
-      if (m.role === "tool") return `[Tool]: ${m.content?.slice(0, 500) || ""}`;
-      if (m.role === "system") return `[System]: ${m.content}`;
-      return "";
-    }).join("\n");
+    // Read previous summary from conversationStore (single source of truth)
+    const previousSummary = conversationStore.getCompactedPrefix(agentKey);
+    const transcript = serializeForCompaction(oldMessages);
 
     try {
       const providerFactory = createProviderInstance(provider, baseUrl, apiKey);
       const { text } = await generateText({
         model: providerFactory(modelId),
-        messages: [{ role: "user", content: buildCompactionPrompt(transcript) }],
-        maxOutputTokens: 2048,
+        messages: [{ role: "user", content: buildCompactionPrompt(transcript, previousSummary) }],
+        maxOutputTokens: 4096,
         temperature: 0.3,
       });
-      return text || null;
+      const summary = text || null;
+      // Persist to conversationStore for incremental summaries (single source of truth)
+      if (summary && projectDb) {
+        await conversationStore.setCompactedPrefix(agentKey, summary, projectDb);
+      }
+      return summary;
     } catch {
       return null;
     }
@@ -513,8 +609,160 @@ export async function chatRoutes(fastify: FastifyInstance) {
       createdAt: Date.now(),
     });
 
-    // Mark agent as processing (will be cleared after assistant message is persisted)
+    // Mark agent as processing — entire flow wrapped in try/finally for guaranteed cleanup
     statusEventBus.setProcessing(agentId, true);
+    try {
+
+    // --- Structured Expert Command Routing ---
+    // Intercept /review, /test, /audit, /perf commands and redirect message to the expert agent.
+    // The expert's normal message flow handles queue, context, and streaming.
+    const expertCmd = parseExpertCommand(message);
+    if (expertCmd && agent.projectId) {
+      try {
+        const expertAgent = await services.orgService.findAgentByRole(agent.projectId, expertCmd.role);
+        if (expertAgent) {
+          // Check if expert is busy
+          if (statusEventBus.isProcessing(expertAgent.id)) {
+            // Expert is busy — queue the message in the expert's inbox
+            const queuedMsg = `[From: ${agent.name}] /${expertCmd.command} ${expertCmd.module}\n\nPlease inspect "${expertCmd.module}" and provide your full report in your standard format. When done, use \`report_completion\` + \`message_superior\` to return the report.`;
+            await services.inboxService.sendMessage(
+              agentId, expertAgent.id, queuedMsg, "peer", true, "normal",
+            );
+            // Persist user message under original agent
+            await services.chatMessageService.saveMessage({
+              id: userMessageId, agentId, role: "user", content: message,
+              isBackground: false, isRead: true, createdAt: Date.now(),
+            });
+            const busyMsg = `⏳ **${expertAgent.name}**（${expertCmd.role.replace(/_/g, " ")}）正在处理其他请求，你的审查请求已加入队列，专家完成后会自动处理并通知你。`;
+            await services.chatMessageService.saveMessage({
+              id: assistantMessageId, agentId, role: "assistant", content: busyMsg,
+              toolCalls: "[]", isBackground: false, isRead: true, isStreaming: false, createdAt: Date.now(),
+            });
+            statusEventBus.setProcessing(agentId, false);
+            setSSEHeaders(reply);
+            writeSSE(reply, "text", busyMsg);
+            writeSSE(reply, "done", "");
+            return reply;
+          }
+
+          // Expert is free — redirect message directly to expert for immediate streaming
+          const redirectedMsg = `[From: ${agent.name}]\n/${expertCmd.command} ${expertCmd.module}\n\nPlease inspect "${expertCmd.module}" and provide your full report in your standard format. When done, use \`report_completion\` + \`message_superior\` to return the report.`;
+
+          // Persist under both agents
+          await services.chatMessageService.saveMessage({
+            id: userMessageId, agentId: expertAgent.id, role: "user", content: redirectedMsg,
+            isBackground: false, isRead: true, createdAt: Date.now(),
+          });
+          await services.chatMessageService.saveMessage({
+            id: randomUUID(), agentId, role: "user", content: message,
+            isBackground: false, isRead: true, createdAt: Date.now(),
+          });
+          statusEventBus.setProcessing(agentId, false);
+          statusEventBus.setProcessing(expertAgent.id, true);
+
+          try {
+            // Build expert context and stream response
+            setSSEHeaders(reply);
+            const expertResolved = await resolveModelForAgent(expertAgent.id);
+
+            const expertCtxBlock = await (async () => {
+              try { return await services.memoryService.buildAgentContext(expertAgent.id, expertAgent.moduleId || undefined); } catch { return ""; }
+            })();
+
+            // Cache-optimized split: static before history, dynamic after
+            const expertStaticContext = [
+              await buildGoalsBlock(expertAgent.projectId),
+              await buildWorkspaceBlock(expertAgent.projectId, expertAgent.role),
+            ].filter(Boolean).join("\n\n");
+
+            const expertDynamicContext = [
+              await buildTimeBlock(expertAgent.projectId),
+              expertCtxBlock,
+            ].filter(Boolean).join("\n\n");
+
+            const expertFullContext = [expertStaticContext, expertDynamicContext].filter(Boolean).join("\n\n");
+
+            const expertIdentityPrompt = buildIdentityPrompt({
+              agentName: expertAgent.name, role: expertAgent.role,
+              permissionType: expertAgent.permissionType as "coordinator" | "executor",
+              goal: expertAgent.goal, backstory: expertAgent.backstory,
+              operatorName: await getOperatorName(),
+            });
+
+            const expertHistory = await conversationStore.getHistory(
+              expertAgent.id,
+              calculateHistoryBudget(expertResolved.contextWindow, expertResolved.maxOutputTokens, expertIdentityPrompt, expertFullContext, redirectedMsg),
+              services.projectDb,
+            );
+
+            const expertRuntime = new AgentRuntime({
+              agentId: expertAgent.id, agentName: expertAgent.name, role: expertAgent.role,
+              permissionType: expertAgent.permissionType as "coordinator" | "executor",
+              goal: expertAgent.goal, backstory: expertAgent.backstory,
+              systemPrompt: "", identityPrompt: expertIdentityPrompt, contextPrompt: expertStaticContext || undefined, dynamicContextPrompt: expertDynamicContext || undefined,
+              history: expertHistory as Message[],
+              operatorName: await getOperatorName(),
+              baseUrl: expertResolved.baseUrl, model: expertResolved.modelId, provider: expertResolved.provider,
+              supportsImages: expertResolved.supportsImages, apiKey: expertResolved.apiKey,
+              contextWindow: expertResolved.contextWindow, maxOutputTokens: expertResolved.maxOutputTokens,
+              limitInput: expertResolved.limitInput,
+              respectsInlineCacheHints: expertResolved.respectsInlineCacheHints,
+              temperature: expertResolved.temperature, reasoningEffort: expertResolved.reasoningEffort,
+              sessionId: randomUUID(),
+              toolExecutor: makeToolExecutor(services, expertAgent.projectId),
+              messagePoller: createMessagePoller(expertAgent.id, services),
+              compactor: makeMidTurnCompactor(expertResolved, expertAgent.id, services.projectDb),
+              approvalHandler: async (aId, toolName, toolArgs, description) =>
+                services.approvalService.createRequest({ agentId: aId, toolName, toolArguments: toolArgs, description }),
+              approvalWaiter: (requestId) => waitForApprovalResponse(requestId),
+              toolOutputStore,
+            });
+
+            let expertFullText = "";
+            const expertToolCallsLog: Array<{ name: string; args: any }> = [];
+            try {
+              for await (const event of expertRuntime.chat(redirectedMsg)) {
+                if (event.type === "text") {
+                  expertFullText += event.content || "";
+                  writeSSE(reply, "text", event.content);
+                } else if (event.type === "tool_use") {
+                  expertToolCallsLog.push({ name: event.content, args: (event as any).metadata?.input });
+                  writeSSE(reply, "tool_use", { tool: event.content, input: (event as any).metadata?.input });
+                } else if (event.type === "tool_result") {
+                  writeSSE(reply, "tool_result", { tool: event.content, result: (event as any).metadata?.result });
+                } else if (event.type === "approval_request") {
+                  writeSSE(reply, "approval_request", { requestId: (event as any).metadata?.requestId, toolName: event.content, input: (event as any).metadata?.input });
+                } else if (event.type === "error") {
+                  writeSSE(reply, "error", (event as any).metadata?.error || event.content);
+                } else if (event.type === "done") { break; }
+              }
+            } catch (streamErr: any) {
+              writeSSE(reply, "error", streamErr?.message || "Expert stream error");
+            }
+
+            await services.chatMessageService.saveMessage({
+              id: assistantMessageId, agentId: expertAgent.id, role: "assistant",
+              content: expertFullText || "(expert report)",
+              toolCalls: JSON.stringify(expertToolCallsLog),
+              isBackground: false, isRead: true, isStreaming: false, createdAt: Date.now(),
+            });
+
+            writeSSE(reply, "done", "");
+            return reply;
+          } catch (err: any) {
+            fastify.log.warn(err, `Failed to route expert command /${expertCmd.command} ${expertCmd.module}`);
+            writeSSE(reply, "error", err?.message || "Expert routing error");
+            writeSSE(reply, "done", "");
+            return reply;
+          } finally {
+            statusEventBus.setProcessing(expertAgent.id, false);
+          }
+        }
+      } catch (err: any) {
+        fastify.log.warn(err, `Expert command routing failed for /${expertCmd.command} ${expertCmd.module}`);
+        // Fall through to normal processing if expert routing fails
+      }
+    }
 
     // --- Build context (project memories + private memories) ---
     let contextBlock = "";
@@ -771,26 +1019,35 @@ export async function chatRoutes(fastify: FastifyInstance) {
 - Only reference context (subordinate logs, memories, handoffs) when DIRECTLY relevant to the current question.
 - Avoid bullet-point reports unless the user asks for a status report or detailed analysis.`;
 
-    // --- If HR: inject current personnel roster into context ---
+    // --- Inject core team (CEO, HR, QA) into EVERY agent's context ---
+    // Everyone must know who leads the org and who handles quality.
+    // Other team members are discovered via read_roster / list_subordinates.
     let rosterBlock = "";
-    if ((agent.role.toLowerCase() === "hr" || agent.role.toLowerCase() === "ceo") && agent.projectId) {
+    if (agent.projectId) {
       try {
-        const records = await services.rosterService.getProjectRoster(agent.projectId);
-        if (records.length > 0) {
-          rosterBlock = "## Current Personnel Roster\n";
-          for (const r of records) {
-            rosterBlock += `- **${(r as any).position || "(no position)"}** | Agent ID: ${(r as any).agentId.slice(0, 8)} | Dept: ${(r as any).department || "—"} | Status: ${(r as any).status} | Responsibilities: ${(r as any).responsibilities || "—"}\n`;
+        const ceo = await services.orgService.findAgentByRole(agent.projectId, "ceo");
+        const hr = await services.orgService.findAgentByRole(agent.projectId, "hr");
+        const qa = await services.orgService.findAgentByRole(agent.projectId, "qa_engineer");
+        const core = [ceo, hr, qa].filter(Boolean);
+        if (core.length > 0) {
+          rosterBlock = "## Core Team (always available)\n";
+          for (const m of core) {
+            const isYou = m!.id === agent.id ? " ← YOU" : "";
+            const roleLabel = m!.role === "ceo" ? "CEO — final decision-maker, owns charter and org structure" :
+              m!.role === "hr" ? "HR — creates, transfers, and dismisses agents; manages personnel" :
+              "QA Engineer — code review, security audit, test analysis, performance audit";
+            rosterBlock += `- **${m!.name}** (${m!.shortId || m!.id.slice(0, 8)}) — ${roleLabel}${isYou}\n`;
           }
-        } else {
-          rosterBlock = "## Personnel Roster\n(empty — no team members yet besides yourself)";
+          rosterBlock += "\nOther team members can be found via the `read_roster` tool. If you are a manager, use `list_subordinates` to see your direct reports.";
         }
       } catch (err: any) {
-        fastify.log.warn(err, "Failed to load roster for HR agent");
+        fastify.log.warn(err, "Failed to load core team for agent context");
       }
     }
 
     // Split prompt: static identity (cacheable) + dynamic context
     const isLeadership = agent.role.toLowerCase() === "ceo" || agent.role.toLowerCase() === "hr";
+    const operatorName = await getOperatorName();
     const identityPrompt = buildIdentityPrompt({
       agentName: agent.name,
       role: agent.role,
@@ -799,6 +1056,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
       backstory: agent.backstory,
       includeParadigmCatalog: isLeadership,
       hasBindingTools: isLeadership,
+      operatorName,
     });
 
     // --- Workspace info ---
@@ -809,6 +1067,9 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
     const charterBlock = await buildCharterBlock(agent.projectId);
 
+    const goalsBlock = await buildGoalsBlock(agent.projectId);
+    const projectStatusBlock = await buildProjectStatusBlock(agent.projectId, agent.role);
+
     let staffingContactBlock = "";
     const agentRole = agent.role.toLowerCase();
     if (agentRole !== "hr" && agent.projectId) {
@@ -818,7 +1079,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
           const hrLabel = hrAgent.shortId || hrAgent.id.slice(0, 8);
           staffingContactBlock =
             `## Staffing\n` +
-            `Need to add team members? Use \`message_peer\` to contact **HR** (${hrAgent.name}, ID: ${hrLabel}). ` +
+            `Need to add team members? Use \`send_message\` to contact **HR** (${hrAgent.name}, ID: ${hrLabel}). ` +
             `Only HR can create, transfer, or dismiss agents.`;
         }
       } catch {
@@ -840,25 +1101,44 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
     const timeBlock = await buildTimeBlock(agent.projectId);
 
-    const contextPrompt = [
-      timeBlock,
-      focusInstruction,
-      projectBlock,
-      charterBlock,
-      staffingContactBlock,
-      workspaceBlock,
-      contextBlock,
-      rosterBlock,
-      skillsBlock,
-      subordinateLogsBlock ? `\n## Subordinate Work Logs\n${subordinateLogsBlock}` : "",
-      handoffBlock,
-      inboxBlock,
+    // --- Split context into STATIC and DYNAMIC parts for DeepSeek prefix caching ---
+    //
+    // DeepSeek uses implicit (byte-level) prefix caching: everything before the
+    // first differing byte is cached. By putting STATIC content before history
+    // and DYNAMIC content AFTER history, we maximize the cacheable prefix:
+    //
+    //   [identity — cached] [static context — cached] [history — cached prefix]
+    //   [dynamic context — miss] [user msg — miss]
+    //
+    // → ~70%+ cache hit rate (vs ~30% before when dynamic content was inline)
+
+    const staticContextPrompt = [
+      focusInstruction,       // STATIC
+      projectBlock,           // STATIC (rarely changes)
+      charterBlock,           // STATIC (rarely changes)
+      goalsBlock,             // SEMI-STATIC (changes occasionally)
+      projectStatusBlock,     // SEMI-STATIC (CEO-only: project age, team size)
+      staffingContactBlock,   // STATIC
+      workspaceBlock,         // STATIC
+      rosterBlock,            // SEMI-STATIC
+      skillsBlock,            // SEMI-STATIC (changes on bind/unbind)
     ]
       .filter(Boolean)
       .join("\n\n");
 
-    // Load conversation history — token budget derived from model's context window
-    const historyBudget = calculateHistoryBudget(resolved.contextWindow, resolved.maxOutputTokens, identityPrompt, contextPrompt, message);
+    const dynamicContextPrompt = [
+      timeBlock,              // DYNAMIC (time changes every call)
+      contextBlock,           // DYNAMIC (memories accumulate)
+      subordinateLogsBlock ? `\n## Subordinate Work Logs\n${subordinateLogsBlock}` : "", // DYNAMIC
+      handoffBlock,           // DYNAMIC
+      inboxBlock,             // DYNAMIC
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    // Load conversation history — token budget accounts for all static + dynamic parts
+    const fullContextForBudget = [staticContextPrompt, dynamicContextPrompt].filter(Boolean).join("\n\n");
+    const historyBudget = calculateHistoryBudget(resolved.contextWindow, resolved.maxOutputTokens, identityPrompt, fullContextForBudget, message);
     const history = await conversationStore.getHistory(agentId, historyBudget, services.projectDb);
 
     // Prefix hash: detect cache-invalidating changes to the static prompt
@@ -869,8 +1149,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
     }
     prefixHashTracker.set(agentId, currentHash);
 
-    // Create per-project ToolExecutor
-    const toolExec = makeToolExecutor(services, agent.projectId);
+    // Create per-project ToolExecutor (with reviewLLM for Reviewer agent)
+    const toolExec = makeToolExecutor(services, agent.projectId, resolved);
 
     const runtimeConfig: AgentRuntimeConfig = {
       agentId,
@@ -881,8 +1161,10 @@ export async function chatRoutes(fastify: FastifyInstance) {
       backstory: agent.backstory,
       systemPrompt: "", // unused in new mode
       identityPrompt,
-      contextPrompt: contextPrompt || undefined,
+      contextPrompt: staticContextPrompt || undefined,
+      dynamicContextPrompt: dynamicContextPrompt || undefined,
       history: history as Message[],
+      operatorName,
       baseUrl: resolved.baseUrl,
       model: resolved.modelId,
       provider: resolved.provider,
@@ -890,6 +1172,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
       apiKey: resolved.apiKey,
       contextWindow: resolved.contextWindow,
       maxOutputTokens: resolved.maxOutputTokens,
+      limitInput: resolved.limitInput,
+      respectsInlineCacheHints: resolved.respectsInlineCacheHints,
       temperature: resolved.temperature,
       reasoningEffort: resolved.reasoningEffort,
       sessionId: session,
@@ -901,8 +1185,9 @@ export async function chatRoutes(fastify: FastifyInstance) {
         services.approvalService.createRequest({ agentId: aId, toolName, toolArguments: toolArgs, description }),
       approvalWaiter: (requestId) =>
         waitForApprovalResponse(requestId, 5 * 60 * 1000),
-      compactor: makeMidTurnCompactor(resolved),
+      compactor: makeMidTurnCompactor(resolved, agent.id || agentId, services.projectDb),
       messagePoller: createMessagePoller(agentId, services),
+      toolOutputStore,
     };
 
     const prefixedMessage = prefixTriggerForProject(agent.projectId, message);
@@ -911,7 +1196,6 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
     // Collect dispatch_task events for auto-trigger
     const dispatchedSubordinates: Array<{ toAgentId: string; description: string }> = [];
-    const rejectedSubordinates: string[] = [];
     const peersMessaged: string[] = [];
     let fullText = "";
     const allToolCalls: Array<{ tool: string; input: Record<string, any> }> = [];
@@ -1013,19 +1297,26 @@ export async function chatRoutes(fastify: FastifyInstance) {
                 });
               }
             }
-            // Track reject_work for auto-trigger (subordinate needs to rework)
-            if (toolName === "reject_work" && event.metadata?.input) {
+            // Immediately trigger non-user recipients of send_message
+            if (toolName === "send_message" && event.metadata?.input) {
               const inp = event.metadata.input as Record<string, any>;
-              if (inp.subordinateId && !rejectedSubordinates.includes(inp.subordinateId)) {
-                rejectedSubordinates.push(inp.subordinateId);
-              }
-            }
-            // Track message_peer for auto-trigger (peer needs to process the message)
-            if (toolName === "message_peer" && event.metadata?.input) {
-              const inp = event.metadata.input as Record<string, any>;
-              const peerId = typeof inp.toAgentId === "string" ? inp.toAgentId.trim() : inp.toAgentId;
-              if (peerId && !peersMessaged.includes(peerId)) {
-                peersMessaged.push(peerId);
+              const recipients = String(inp.recipients || inp.toAgentId || "").split(",").map((s: string) => s.trim()).filter(Boolean);
+              for (const rcpt of recipients) {
+                if (rcpt.toLowerCase() === "user") continue;
+                try {
+                  const target = await services.orgService.resolveAgent(rcpt);
+                  if (target) {
+                    // Wake up recipient immediately — don't wait for stream end
+                    if (target.permissionType === "coordinator") {
+                      triggerCoordinator(target.id).catch(() => {});
+                    } else {
+                      triggerSubordinate(target.id).catch(() => {});
+                    }
+                    if (!peersMessaged.includes(target.id)) {
+                      peersMessaged.push(target.id);
+                    }
+                  }
+                } catch { /* resolution failed */ }
               }
             }
             // Track message_superior for auto-trigger (superior needs to process the report)
@@ -1136,20 +1427,6 @@ export async function chatRoutes(fastify: FastifyInstance) {
       }
     }
 
-    // --- Auto-trigger: re-trigger subordinates whose work was rejected ---
-    if (rejectedSubordinates.length > 0 && resolved) {
-      for (const subId of rejectedSubordinates) {
-        if (runningAutoTriggers.has(subId)) {
-          fastify.log.info(`Reject-rework auto-trigger skipped: ${subId} already running`);
-          continue;
-        }
-        fastify.log.info(`Reject-rework auto-trigger: ${agent.name} rejected work of ${subId}`);
-        triggerSubordinate(subId).catch((err) =>
-          fastify.log.error(err, `Reject-rework auto-trigger failed for ${subId}`),
-        );
-      }
-    }
-
     // --- Auto-trigger: wake up peers who received messages ---
     if (peersMessaged.length > 0 && resolved) {
       for (const peerId of peersMessaged) {
@@ -1162,6 +1439,12 @@ export async function chatRoutes(fastify: FastifyInstance) {
           fastify.log.error(err, `Peer auto-trigger failed for ${peerId}`),
         );
       }
+    }
+
+    } finally {
+      // Outer safety net — guarantees processing is cleared even if context building,
+      // inbox injection, model resolution, or any intermediate step throws.
+      statusEventBus.setProcessing(agentId, false);
     }
 
     return reply;
@@ -1274,8 +1557,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
       }
     });
 
-    // Subscribe to real-time activity events
-    const unsubActivity = statusEventBus.subscribeActivity((event) => {
+    // Subscribe to real-time activity events (live only — no replay of stale events)
+    const unsubActivity = statusEventBus.subscribeActivityLive((event) => {
       try {
         writeSSE(reply, "activity", event);
       } catch { /* closed */ }
@@ -1372,6 +1655,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
           message: msg.message,
           messageType: (msg as any).messageType || "superior",
           expectReport: (msg as any).expectReport || false,
+          priority: (msg as any).priority || "normal",
         });
       }
       return result;
@@ -1563,10 +1847,39 @@ export async function chatRoutes(fastify: FastifyInstance) {
       } catch { /* proceed without */ }
 
       const subTimeBlock = await buildTimeBlock(subAgent.projectId);
-      const subSystemPrompt = [subTimeBlock, ctxBlock, reworkBlock, hoBlock, await buildWorkspaceBlock(subAgent.projectId, subAgent.role)].filter(Boolean).join("\n\n");
+      const subGoalsBlock = await buildGoalsBlock(subAgent.projectId);
+      const subWorkspaceBlock = await buildWorkspaceBlock(subAgent.projectId, subAgent.role);
+
+      // Core team roster for subordinate (same as main handler)
+      let subRosterBlock = "";
+      if (subAgent.projectId) {
+        try {
+          const ceo = await subServices.orgService.findAgentByRole(subAgent.projectId, "ceo");
+          const hr = await subServices.orgService.findAgentByRole(subAgent.projectId, "hr");
+          const qa = await subServices.orgService.findAgentByRole(subAgent.projectId, "qa_engineer");
+          const core = [ceo, hr, qa].filter(Boolean);
+          if (core.length > 0) {
+            subRosterBlock = "## Core Team (always available)\n";
+            for (const m of core) {
+              const isYou = m!.id === agentId ? " ← YOU" : "";
+              const roleLabel = m!.role === "ceo" ? "CEO — final decision-maker, owns charter and org structure" :
+                m!.role === "hr" ? "HR — creates, transfers, and dismisses agents; manages personnel" :
+                "QA Engineer — code review, security audit, test analysis, performance audit";
+              subRosterBlock += `- **${m!.name}** (${m!.shortId || m!.id.slice(0, 8)}) — ${roleLabel}${isYou}\n`;
+            }
+            subRosterBlock += "\nOther team members can be found via the `read_roster` tool.";
+          }
+        } catch {}
+      }
+
+      // Cache-optimized split: static before history, dynamic after
+      const subStaticContext = [subGoalsBlock, subRosterBlock, subWorkspaceBlock].filter(Boolean).join("\n\n");
+      const subDynamicContext = [subTimeBlock, ctxBlock, reworkBlock, hoBlock].filter(Boolean).join("\n\n");
+      const subFullContext = [subStaticContext, subDynamicContext].filter(Boolean).join("\n\n");
 
       // Build identity prompt first to calculate token budget for history
       const subIsLeadership = subAgent.role.toLowerCase() === "ceo" || subAgent.role.toLowerCase() === "hr";
+      const subOperatorName = await getOperatorName();
       const subIdentityPrompt = buildIdentityPrompt({
         agentName: subAgent.name,
         role: subAgent.role,
@@ -1575,6 +1888,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
         backstory: subAgent.backstory,
         includeParadigmCatalog: subIsLeadership,
         hasBindingTools: subIsLeadership,
+        operatorName: subOperatorName,
       });
 
       // Determine the user message for budget calculation
@@ -1587,7 +1901,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
           : "Check your current tasks and continue working on them. Use write_work_log to document progress and report_completion when finished.";
 
       // Load conversation history — token budget derived from model's context window
-      const subBudget = calculateHistoryBudget(subModel.contextWindow, subModel.maxOutputTokens, subIdentityPrompt, subSystemPrompt, userMsg);
+      const subBudget = calculateHistoryBudget(subModel.contextWindow, subModel.maxOutputTokens, subIdentityPrompt, subFullContext, userMsg);
       const subHistory = await conversationStore.getHistory(agentId, subBudget, subServices.projectDb);
 
       // Prefix hash drift detection (subordinate)
@@ -1598,8 +1912,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
       }
       prefixHashTracker.set(agentId, subHash);
 
-      // Create per-project ToolExecutor for subordinate
-      const subToolExec = makeToolExecutor(subServices, subAgent.projectId);
+      // Create per-project ToolExecutor for subordinate (pass model for QA review tools)
+      const subToolExec = makeToolExecutor(subServices, subAgent.projectId, subModel);
 
       const runtime = new AgentRuntime({
         agentId,
@@ -1610,8 +1924,10 @@ export async function chatRoutes(fastify: FastifyInstance) {
         backstory: subAgent.backstory,
         systemPrompt: "", // unused in new mode
         identityPrompt: subIdentityPrompt,
-        contextPrompt: subSystemPrompt || undefined,
+        contextPrompt: subStaticContext || undefined,
+        dynamicContextPrompt: subDynamicContext || undefined,
         history: subHistory as Message[],
+        operatorName: subOperatorName,
         baseUrl: subModel.baseUrl,
         model: subModel.modelId,
         provider: subModel.provider,
@@ -1619,12 +1935,15 @@ export async function chatRoutes(fastify: FastifyInstance) {
         apiKey: subModel.apiKey,
         contextWindow: subModel.contextWindow,
         maxOutputTokens: subModel.maxOutputTokens,
+        limitInput: subModel.limitInput,
+        respectsInlineCacheHints: subModel.respectsInlineCacheHints,
         temperature: subModel.temperature,
         reasoningEffort: subModel.reasoningEffort,
         sessionId: randomUUID(),
         toolExecutor: subToolExec,
         messagePoller: createMessagePoller(agentId, subServices),
-        compactor: makeMidTurnCompactor(subModel),
+        compactor: makeMidTurnCompactor(subModel, agentId, subServices.projectDb),
+        toolOutputStore,
       });
 
       let calledMessageSuperior = false;
@@ -1635,12 +1954,41 @@ export async function chatRoutes(fastify: FastifyInstance) {
       let subFullText = "";
       const subToolCalls: Array<{ tool: string; input: Record<string, any> }> = [];
 
+      // Activity buffering for auto-trigger (same as main chat handler)
+      let subThinkBuf = "";
+      let subTextBuf = "";
+      let subActTimer: ReturnType<typeof setTimeout> | null = null;
+      const flushSubActivity = () => {
+        if (subActTimer) { clearTimeout(subActTimer); subActTimer = null; }
+        if (subThinkBuf) {
+          statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "thinking", content: subThinkBuf, timestamp: Date.now() });
+          subThinkBuf = "";
+        }
+        if (subTextBuf) {
+          statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "text", content: subTextBuf, timestamp: Date.now() });
+          subTextBuf = "";
+        }
+      };
+
       for await (const event of runtime.chat(prefixTriggerForProject(subAgent.projectId, userMsg))) {
-        if (event.type === "text") {
+        if (event.type === "thinking") {
+          subThinkBuf += event.content;
+          subActTimer = setTimeout(flushSubActivity, 300);
+        } else if (event.type === "text") {
+          flushSubActivity();
+          subTextBuf += event.content;
+          subActTimer = setTimeout(flushSubActivity, 300);
           subFullText += event.content;
         } else if (event.type === "tool_use") {
+          flushSubActivity();
           const tool = event.content.replace(/^hiveweave__/, "");
           subToolCalls.push({ tool, input: event.metadata?.input || {} });
+          statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "tool_use", toolName: tool, toolInput: JSON.stringify(event.metadata?.input || {}).slice(0, 200), timestamp: Date.now() });
+        } else if (event.type === "tool_result") {
+          const tool = (event.content || "").replace(/^hiveweave__/, "");
+          statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "tool_result", toolName: tool, toolResult: String(event.metadata?.result || "").slice(0, 300), timestamp: Date.now() });
+        } else if (event.type === "done") {
+          flushSubActivity();
         }
         // Detect message_superior calls so we can trigger coordinator auto-reply
         if (event.type === "tool_use" && event.content === "hiveweave__message_superior") {
@@ -1660,11 +2008,25 @@ export async function chatRoutes(fastify: FastifyInstance) {
             });
           }
         }
-        // Detect message_peer so peers are auto-triggered
-        if (event.type === "tool_use" && event.content === "hiveweave__message_peer" && event.metadata?.input) {
+        // Immediately trigger non-user recipients of send_message
+        if (event.type === "tool_use" && event.content === "hiveweave__send_message" && event.metadata?.input) {
           const inp = event.metadata.input as Record<string, any>;
-          if (inp.toAgentId && !subPeersMessaged.includes(inp.toAgentId)) {
-            subPeersMessaged.push(inp.toAgentId);
+          const recipients = String(inp.recipients || inp.toAgentId || "").split(",").map((s: string) => s.trim()).filter(Boolean);
+          for (const rcpt of recipients) {
+            if (rcpt.toLowerCase() === "user") continue;
+            try {
+              const target = await subServices.orgService.resolveAgent(rcpt);
+              if (target) {
+                if (target.permissionType === "coordinator") {
+                  triggerCoordinator(target.id).catch(() => {});
+                } else {
+                  triggerSubordinate(target.id).catch(() => {});
+                }
+                if (!subPeersMessaged.includes(target.id)) {
+                  subPeersMessaged.push(target.id);
+                }
+              }
+            } catch { /* resolution failed */ }
           }
         }
         // Capture final messages for history storage
@@ -1730,6 +2092,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
         }
       }
     } finally {
+      statusEventBus.emitActivity({ agentId, agentName: "Agent", type: "done", timestamp: Date.now() });
       statusEventBus.setProcessing(agentId, false);
       runningAutoTriggers.delete(agentId);
     }
@@ -1813,6 +2176,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
     const coordAssistantId = randomUUID();
     try {
       const coordAgent = resolved;
+      statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "thinking", content: "Auto-triggered", timestamp: Date.now() });
 
       await coordServices.chatMessageService.saveMessage({
         id: coordAssistantId,
@@ -1932,7 +2296,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
         }
         if (hasPeerExpectReport) {
           inboxBlock += "\n> **[SYSTEM MANDATORY]** Some peer messages above require your reply. " +
-            "You MUST respond to those peers using `hiveweave__message_peer` before finishing.\n";
+            "You MUST respond to those peers using `hiveweave__send_message` before finishing.\n";
         }
       }
 
@@ -1950,23 +2314,51 @@ export async function chatRoutes(fastify: FastifyInstance) {
       }
 
       const coordTimeBlock = await buildTimeBlock(coordAgent.projectId);
-      const systemPrompt = [coordTimeBlock, ctxBlock, subLogsBlock, hoBlock, inboxBlock, selfReportBlock, await buildWorkspaceBlock(coordAgent.projectId, coordAgent.role)]
-        .filter(Boolean)
-        .join("\n\n");
+      const coordGoalsBlock = await buildGoalsBlock(coordAgent.projectId);
+      const coordWorkspaceBlock = await buildWorkspaceBlock(coordAgent.projectId, coordAgent.role);
+
+      // Core team roster for coordinator (same as main handler)
+      let coordRosterBlock = "";
+      if (coordAgent.projectId) {
+        try {
+          const ceo = await coordServices.orgService.findAgentByRole(coordAgent.projectId, "ceo");
+          const hr = await coordServices.orgService.findAgentByRole(coordAgent.projectId, "hr");
+          const qa = await coordServices.orgService.findAgentByRole(coordAgent.projectId, "qa_engineer");
+          const core = [ceo, hr, qa].filter(Boolean);
+          if (core.length > 0) {
+            coordRosterBlock = "## Core Team (always available)\n";
+            for (const m of core) {
+              const isYou = m!.id === coordinatorId ? " ← YOU" : "";
+              const roleLabel = m!.role === "ceo" ? "CEO — final decision-maker, owns charter and org structure" :
+                m!.role === "hr" ? "HR — creates, transfers, and dismisses agents; manages personnel" :
+                "QA Engineer — code review, security audit, test analysis, performance audit";
+              coordRosterBlock += `- **${m!.name}** (${m!.shortId || m!.id.slice(0, 8)}) — ${roleLabel}${isYou}\n`;
+            }
+            coordRosterBlock += "\nOther team members can be found via the `read_roster` tool. If you are a manager, use `list_subordinates` to see your direct reports.";
+          }
+        } catch {}
+      }
+
+      // Cache-optimized split: static before history, dynamic after
+      const coordStaticContext = [coordGoalsBlock, coordRosterBlock, coordWorkspaceBlock].filter(Boolean).join("\n\n");
+      const coordDynamicContext = [coordTimeBlock, ctxBlock, subLogsBlock, hoBlock, inboxBlock, selfReportBlock].filter(Boolean).join("\n\n");
+      const coordFullContext = [coordStaticContext, coordDynamicContext].filter(Boolean).join("\n\n");
 
       // Build identity prompt first to calculate token budget for history
+      const coordOperatorName = await getOperatorName();
       const coordIdentityPrompt = buildIdentityPrompt({
         agentName: coordAgent.name,
         role: coordAgent.role,
         permissionType: coordAgent.permissionType as "coordinator" | "executor",
         goal: coordAgent.goal,
         backstory: coordAgent.backstory,
+        operatorName: coordOperatorName,
       });
 
       const userMsg = "You have received new messages from your subordinates and/or peers. Please review them and respond appropriately. Use your tools to check work logs and provide guidance. For peer messages, respond if collaboration is needed.";
 
       // Load conversation history — token budget derived from model's context window
-      const coordBudget = calculateHistoryBudget(coordModel.contextWindow, coordModel.maxOutputTokens, coordIdentityPrompt, systemPrompt, userMsg);
+      const coordBudget = calculateHistoryBudget(coordModel.contextWindow, coordModel.maxOutputTokens, coordIdentityPrompt, coordFullContext, userMsg);
       const coordHistory = await conversationStore.getHistory(coordinatorId, coordBudget, coordServices.projectDb);
 
       // Prefix hash drift detection (coordinator)
@@ -1989,8 +2381,10 @@ export async function chatRoutes(fastify: FastifyInstance) {
         backstory: coordAgent.backstory,
         systemPrompt: "", // unused in new mode
         identityPrompt: coordIdentityPrompt,
-        contextPrompt: systemPrompt || undefined,
+        contextPrompt: coordStaticContext || undefined,
+        dynamicContextPrompt: coordDynamicContext || undefined,
         history: coordHistory as Message[],
+        operatorName: coordOperatorName,
         baseUrl: coordModel.baseUrl,
         model: coordModel.modelId,
         provider: coordModel.provider,
@@ -1998,12 +2392,15 @@ export async function chatRoutes(fastify: FastifyInstance) {
         apiKey: coordModel.apiKey,
         contextWindow: coordModel.contextWindow,
         maxOutputTokens: coordModel.maxOutputTokens,
+        limitInput: coordModel.limitInput,
+        respectsInlineCacheHints: coordModel.respectsInlineCacheHints,
         temperature: coordModel.temperature,
         reasoningEffort: coordModel.reasoningEffort,
         sessionId: randomUUID(),
         toolExecutor: coordToolExec,
         messagePoller: createMessagePoller(coordinatorId, coordServices),
-        compactor: makeMidTurnCompactor(coordModel),
+        compactor: makeMidTurnCompactor(coordModel, coordinatorId, coordServices.projectDb),
+        toolOutputStore,
       });
 
       let fullText = "";
@@ -2012,7 +2409,6 @@ export async function chatRoutes(fastify: FastifyInstance) {
       let coordCalledMessageSuperior = false;
       const coordDispatchedSubordinates: Array<{ toAgentId: string; description: string }> = [];
       const coordPeersMessaged: Array<string> = [];
-      const coordRejectedSubordinates: Array<string> = [];
 
       for await (const event of runtime.chat(prefixTriggerForProject(coordAgent.projectId, userMsg))) {
         if (event.type === "text") {
@@ -2034,18 +2430,25 @@ export async function chatRoutes(fastify: FastifyInstance) {
               });
             }
           }
-          // Detect message_peer so the peer is auto-triggered
-          if (event.content === "hiveweave__message_peer" && event.metadata?.input) {
+          // Immediately trigger non-user recipients of send_message
+          if (event.content === "hiveweave__send_message" && event.metadata?.input) {
             const inp = event.metadata.input as Record<string, any>;
-            if (inp.toAgentId && !coordPeersMessaged.includes(inp.toAgentId)) {
-              coordPeersMessaged.push(inp.toAgentId);
-            }
-          }
-          // Detect reject_work so the subordinate is auto-triggered to rework
-          if (event.content === "hiveweave__reject_work" && event.metadata?.input) {
-            const inp = event.metadata.input as Record<string, any>;
-            if (inp.subordinateId && !coordRejectedSubordinates.includes(inp.subordinateId)) {
-              coordRejectedSubordinates.push(inp.subordinateId);
+            const recipients = String(inp.recipients || inp.toAgentId || "").split(",").map((s: string) => s.trim()).filter(Boolean);
+            for (const rcpt of recipients) {
+              if (rcpt.toLowerCase() === "user") continue;
+              try {
+                const target = await coordServices.orgService.resolveAgent(rcpt);
+                if (target) {
+                  if (target.permissionType === "coordinator") {
+                    triggerCoordinator(target.id).catch(() => {});
+                  } else {
+                    triggerSubordinate(target.id).catch(() => {});
+                  }
+                  if (!coordPeersMessaged.includes(target.id)) {
+                    coordPeersMessaged.push(target.id);
+                  }
+                }
+              } catch { /* resolution failed */ }
             }
           }
         }
@@ -2115,20 +2518,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
         }
       }
 
-      // Cascade: auto-trigger subordinates whose work was rejected (for rework)
-      if (coordRejectedSubordinates.length > 0) {
-        for (const subId of coordRejectedSubordinates) {
-          if (runningAutoTriggers.has(subId)) {
-            fastify.log.info(`Reject-rework auto-trigger skipped: ${subId} already running`);
-            continue;
-          }
-          fastify.log.info(`Reject-rework auto-trigger: ${coordAgent.name} rejected work of ${subId}`);
-          triggerSubordinate(subId).catch((err) =>
-            fastify.log.error(err, `Reject-rework auto-trigger failed for ${subId}`),
-          );
-        }
-      }
     } finally {
+      statusEventBus.emitActivity({ agentId: coordinatorId, agentName: "Coordinator", type: "done", timestamp: Date.now() });
       statusEventBus.setProcessing(coordinatorId, false);
       runningAutoTriggers.delete(coordinatorId);
     }

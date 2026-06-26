@@ -232,6 +232,30 @@ class ConversationStore {
     this.compactedPrefixCache.clear();
   }
 
+  /**
+   * Get the compacted prefix (cumulative summary of old turns) for an agent.
+   * Returns undefined if no compaction has occurred yet.
+   *
+   * This is the single source of truth — the mid-turn compactor should read
+   * from here to enable incremental summaries across multiple compactions.
+   */
+  getCompactedPrefix(agentId: string): string | undefined {
+    return this.compactedPrefixCache.get(agentId);
+  }
+
+  /**
+   * Set the compacted prefix for an agent. Called after a successful mid-turn
+   * compaction to enable incremental summaries across multiple compactions.
+   *
+   * @param agentId - The agent's UUID.
+   * @param prefix  - The compacted summary string.
+   * @param db      - The per-project database instance (for persistence).
+   */
+  async setCompactedPrefix(agentId: string, prefix: string, db: Database): Promise<void> {
+    this.compactedPrefixCache.set(agentId, prefix);
+    await this.persistCompacted(agentId, prefix, db);
+  }
+
   /** Get the number of cached messages for an agent (0 if not loaded). */
   size(agentId: string): number {
     return (this.cache.get(agentId) || []).length;

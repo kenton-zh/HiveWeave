@@ -114,6 +114,14 @@ class StatusEventBus {
     };
   }
 
+  /** Subscribe to live activity events only (no replay). Use for SSE reconnections. */
+  subscribeActivityLive(listener: ActivityListener): () => void {
+    this.activityListeners.add(listener);
+    return () => {
+      this.activityListeners.delete(listener);
+    };
+  }
+
   /** Reset all processing state (e.g., on server restart). */
   clearAll(): void {
     const ids = [...this.processing];

@@ -23,6 +23,7 @@ export class InboxService {
     message: string,
     messageType: "superior" | "peer" | "alarm" = "superior",
     expectReport: boolean = false,
+    priority: "low" | "normal" | "urgent" = "normal",
   ): Promise<string> {
     const id = randomUUID();
     await this.db.insert(inbox).values({
@@ -32,6 +33,7 @@ export class InboxService {
       message,
       messageType,
       expectReport,
+      priority,
       read: false,
       createdAt: Date.now(),
     });

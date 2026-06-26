@@ -47,7 +47,12 @@ function getApprovalServiceForAgent(agentId: string) {
 async function getApprovalServiceForProject(projectId: string) {
   const rows = await db.select().from(projects).where(eq(projects.id, projectId));
   if (rows.length === 0 || !rows[0].workspacePath) return null;
-  return new ApprovalService(ensureProjectDb(rows[0].workspacePath));
+  try {
+    return new ApprovalService(ensureProjectDb(rows[0].workspacePath));
+  } catch (err: any) {
+    console.error(`[Permissions] skip project ${projectId}: ${err.code || err.message?.slice(0, 80)}`);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

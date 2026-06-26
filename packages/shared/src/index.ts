@@ -83,3 +83,5 @@ export {
   parseGameTimeOffset,
   type GameTimeSnapshot,
 } from "./game-time.js";
+
+export { isFlowerName, generateFlowerName } from "./names.js";

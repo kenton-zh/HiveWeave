@@ -3,6 +3,7 @@ import { useAppStore } from "../store";
 import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead } from "../api";
 import ApprovalDialog from "./ApprovalDialog";
 import TodoBar from "./TodoBar";
+import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
 
 interface AgentInfo {
   id: string;
@@ -31,10 +32,15 @@ interface ChatMessage {
   teamToAgentId?: string;
 }
 
+interface MsgSegment {
+  type: "text" | "tool_call";
+  content?: string;
+  tool?: ToolCall;
+}
+
 interface StreamDraft {
   assistantId: string;
-  content: string;
-  toolCalls: ToolCall[];
+  segments: MsgSegment[];
 }
 
 const roleLabels: Record<string, string> = {
@@ -193,12 +199,12 @@ function ToolCallsBlock({ toolCalls }: { toolCalls: ToolCall[] }) {
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="w-full text-left text-[11px] text-gray-400 hover:text-gray-300 transition-colors font-mono truncate"
+        className="w-full text-left text-xs text-gray-400 hover:text-gray-300 transition-colors font-mono truncate"
       >
         {summary} \u5de5\u5177\u8c03\u7528 ({toolCalls.length}) \u2014 {preview}
       </button>
       {expanded && (
-        <ul className="mt-1.5 space-y-0.5 font-mono text-[10px] text-gray-500 pl-3 border-l border-surface-border/60">
+        <ul className="mt-1.5 space-y-0.5 font-mono text-xs text-gray-500 pl-3 border-l border-surface-border/60">
           {toolCalls.map((tc, i) => {
             const hint = formatToolInputHint(tc.tool, tc.input);
             return (
@@ -225,36 +231,68 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
     );
   }
 
+  // Use interleaved segments if available, otherwise fall back to flat content+toolCalls
+  const segments: MsgSegment[] = (msg as any)._segments || [];
+  const hasSegments = segments.length > 0;
+
+  const renderContent = () => (
+    <>
+      {hasSegments ? (
+        // Interleaved: render text and tool calls in arrival order
+        <div className="space-y-2">
+          {segments.map((seg, i) => {
+            if (seg.type === "text") {
+              return seg.content ? <p key={i} className="text-base whitespace-pre-wrap">{seg.content}</p> : null;
+            }
+            if (seg.type === "tool_call" && seg.tool) {
+              return (
+                <div key={i} className="text-xs text-gray-400 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent/50 animate-pulse" />
+                  <span>调用 {seg.tool.tool}</span>
+                </div>
+              );
+            }
+            return null;
+          })}
+        </div>
+      ) : (
+        // Fallback: flat rendering
+        <>
+          {msg.content && (
+            <p className="text-base whitespace-pre-wrap">{msg.content}</p>
+          )}
+          {msg.toolCalls && msg.toolCalls.length > 0 && (
+            <div className={msg.content ? "mt-2" : ""}>
+              <ToolCallsBlock toolCalls={msg.toolCalls} />
+            </div>
+          )}
+        </>
+      )}
+    </>
+  );
+
   return (
     <div className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
       <div
         className={`
-          max-w-[80%] rounded-2xl px-4 py-3
+          max-w-[95%] rounded-2xl px-4 py-3
           ${msg.role === "user"
-            ? "bg-accent text-white"
+            ? "bg-accent text-white max-w-[80%]"
             : "bg-surface-card border border-surface-border text-gray-200"
           }
         `}
       >
-        {msg.content && (
-          <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
-        )}
-
         {msg.images && msg.images.length > 0 && (
-          <div className={"flex gap-1.5 flex-wrap " + (msg.content ? "mt-2" : "")}>
+          <div className="flex gap-1.5 flex-wrap mb-2">
             {msg.images.map((url, i) => (
               <img key={i} src={url} className="max-h-48 max-w-[200px] rounded-lg object-cover" alt="" />
             ))}
           </div>
         )}
 
-        {msg.toolCalls && msg.toolCalls.length > 0 && (
-          <div className={msg.content ? "mt-3 pt-3 border-t border-surface-border/50" : ""}>
-            <ToolCallsBlock toolCalls={msg.toolCalls} />
-          </div>
-        )}
+        {renderContent()}
 
-        {msg.role === "assistant" && isStreaming && !msg.content && (!msg.toolCalls || msg.toolCalls.length === 0) && (
+        {msg.role === "assistant" && isStreaming && !hasSegments && !msg.content && (!msg.toolCalls || msg.toolCalls.length === 0) && (
           <div className="flex gap-1">
             <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
             <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
@@ -287,7 +325,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const [pendingApprovalTool, setPendingApprovalTool] = useState<string | null>(null);
   const [teamCommsExpanded, setTeamCommsExpanded] = useState(false);
   const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
-  const [agentNameCache, setAgentNameCache] = useState<Record<string, string>>({});
+  const [agentInfoCache, setAgentInfoCache] = useState<Record<string, { name: string; position?: string; role?: string }>>({});
   const [queuedCount, setQueuedCount] = useState(0);
   const pendingQueueRef = useRef<string[]>([]);
   const autoSendRef = useRef(false);
@@ -403,16 +441,18 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const displayMessages = useMemo(() => {
     let merged = messages;
     if (isStreaming && streamDraft) {
-      merged = messages.map((m) =>
-        m.id === streamDraft.assistantId
-          ? {
-              ...m,
-              content: streamDraft.content || m.content,
-              toolCalls: streamDraft.toolCalls.length > 0 ? streamDraft.toolCalls : m.toolCalls,
-              isStreaming: true,
-            }
-          : m
-      );
+      merged = messages.map((m) => {
+        if (m.id !== streamDraft.assistantId) return m;
+        const textParts = streamDraft.segments.filter(s => s.type === "text").map(s => s.content || "");
+        const newTools = streamDraft.segments.filter(s => s.type === "tool_call").map(s => s.tool!);
+        return {
+          ...m,
+          content: textParts.join(""),
+          toolCalls: [...(m.toolCalls || []), ...newTools],
+          _segments: streamDraft.segments,
+          isStreaming: true,
+        };
+      });
     }
     const foreground = merged.filter((m) => !m.isBackground && (m.role === "user" || m.role === "assistant"));
     let trailingUserCount = 0;
@@ -472,12 +512,12 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   useEffect(() => {
     const idsToFetch: string[] = [];
     for (const id of counterpartIds) {
-      if (!agentNameCache[id]) idsToFetch.push(id);
+      if (!agentInfoCache[id]) idsToFetch.push(id);
     }
     if (idsToFetch.length === 0) return;
     for (const id of idsToFetch) {
       getAgent(id).then((data) => {
-        if (data?.name) setAgentNameCache((prev) => ({ ...prev, [id]: data.name }));
+        if (data?.name) setAgentInfoCache((prev) => ({ ...prev, [id]: { name: data.name, position: data.position, role: data.role } }));
       }).catch(() => {});
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -577,11 +617,20 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         try {
           const parsed = JSON.parse(event.data);
           if (parsed.role === "assistant" && parsed.id) {
-            setStreamDraft({ assistantId: parsed.id, content: "", toolCalls: [] });
+            setStreamDraft({ assistantId: parsed.id, segments: [] });
           }
         } catch {}
       } else if (event.type === "text") {
-        setStreamDraft((prev) => prev ? { ...prev, content: prev.content + event.data } : prev);
+        setStreamDraft((prev) => {
+          if (!prev) return prev;
+          const last = prev.segments[prev.segments.length - 1];
+          if (last && last.type === "text") {
+            // Append to last text segment
+            return { ...prev, segments: [...prev.segments.slice(0, -1), { ...last, content: (last.content || "") + event.data }] };
+          }
+          // Start new text segment
+          return { ...prev, segments: [...prev.segments, { type: "text", content: event.data }] };
+        });
       } else if (event.type === "tool_use") {
         try {
           const toolData = JSON.parse(event.data);
@@ -590,7 +639,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
             input: toolData.input || {},
           };
           allToolsUsed.add(toolCall.tool);
-          setStreamDraft((prev) => prev ? { ...prev, toolCalls: [...prev.toolCalls, toolCall] } : prev);
+          setStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "tool_call", tool: toolCall }] } : prev);
         } catch {}
       } else if (event.type === "tool_result") {
         setPendingApprovalTool(null);
@@ -637,7 +686,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       } else if (event.type === "error") {
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setRetryInfo(null);
-        setStreamDraft((prev) => prev ? { ...prev, content: prev.content + "\n\nError: " + event.data } : prev);
+        setStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "text", content: "\n\nError: " + event.data }] } : prev);
         loadMessagesFromDb(sendingForAgentId);
         setStreamDraft(null);
         setIsStreaming(false);
@@ -692,7 +741,17 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const runtimeStatusInfo = agentInfo?.status === "active"
     ? isAgentProcessing ? { text: "工作中", color: "text-emerald-400" } : { text: "空闲", color: "text-gray-400" }
     : statusInfo;
-  const resolveName = (id: string) => agentNameCache[id] || id.substring(0, 8);
+  const resolveAgentInfo = (id: string) => agentInfoCache[id] || { name: id === "system" ? "系统通知" : id.substring(0, 8) };
+
+  // Role colors matching OrgTree
+  const roleDots: Record<string, string> = {
+    ceo: "bg-amber-400", hr: "bg-rose-400", architect: "bg-purple-400",
+    manager: "bg-blue-400", pm: "bg-blue-400",
+    developer: "bg-green-400", module_dev: "bg-green-400",
+    test_engineer: "bg-yellow-400", code_reviewer: "bg-indigo-400",
+    security_auditor: "bg-red-400", web_perf_auditor: "bg-cyan-400",
+    qa: "bg-yellow-400", devops: "bg-cyan-400",
+  };
 
   return (
     <div className="h-full flex flex-col bg-surface">
@@ -711,7 +770,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
 
       <TodoBar agentId={agentId} />
 
-      <div ref={scrollContainerRef} onScroll={handleMessagesScroll} className="flex-1 min-h-0 overflow-y-auto px-6 py-4 space-y-4">
+      <div ref={scrollContainerRef} onScroll={handleMessagesScroll} className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-4">
         {directMessages.length === 0 && !hasTeamComms && (
           <div className="text-center text-gray-500 text-sm mt-12">发送消息开始对话</div>
         )}
@@ -747,21 +806,24 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       </div>
 
       {hasTeamComms && (
-        <div className="shrink-0 border-t border-surface-border bg-surface-card">
-          <button onClick={() => { setTeamCommsExpanded(!teamCommsExpanded); if (teamCommsExpanded) setExpandedMessageId(null); }} className="w-full px-6 py-3 flex items-center justify-between hover:bg-surface-border/30 transition-colors">
+        <div className="shrink-0 border-t border-surface-border bg-surface-card overflow-hidden">
+          <button onClick={() => { setTeamCommsExpanded(!teamCommsExpanded); if (teamCommsExpanded) setExpandedMessageId(null); }} className="w-full px-4 py-2 flex items-center justify-between hover:bg-surface-border/30 transition-colors">
             <span className="text-sm font-medium text-gray-300">团队沟通 ({teamMessages.length})</span>
             <span className="text-xs text-gray-500">{teamCommsExpanded ? "收起" : "展开"}</span>
           </button>
           {teamCommsExpanded && (
-            <div className="max-h-[40vh] overflow-y-auto py-1">
+            <div className="max-h-[35vh] overflow-y-auto overflow-x-hidden py-1">
               {[...teamMessages].sort((a, b) => b.timestamp - a.timestamp).map((msg) => {
                 const isIncoming = msg.role === "user" || !!msg.teamFromAgentId;
                 const counterpartId = isIncoming
                   ? (msg.teamFromAgentId ?? null)
                   : (msg.teamToAgentId || getDirectedAgentId(msg, agentInfo?.parentId));
-                const label = isIncoming
-                  ? (msg.role === "user" ? userName : (counterpartId ? resolveName(counterpartId) : "Unknown"))
-                  : (counterpartId ? resolveName(counterpartId) : (agentInfo?.name || "Agent"));
+                const info = isIncoming
+                  ? (msg.role === "user" ? { name: userName } : (counterpartId ? resolveAgentInfo(counterpartId) : { name: "Unknown" }))
+                  : (counterpartId ? resolveAgentInfo(counterpartId) : { name: agentInfo?.name || "Agent" });
+                const roleStyle = getRoleStyle(info.role || "");
+                const positionLabel = getPositionLabel(info.position, info.role);
+                const dotColor = roleDots[info.role || ""] || "bg-gray-400";
                 const directionTag = isIncoming ? "收到" : "发送";
                 const preview = msg.content || (msg.toolCalls?.length ? msg.toolCalls.map((tc) => tc.tool).join(", ") : "(empty)");
                 const isExpanded = expandedMessageId === msg.id;
@@ -769,24 +831,30 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
                   <button
                     key={msg.id}
                     onClick={() => setExpandedMessageId(isExpanded ? null : msg.id)}
-                    className={"w-full px-6 py-3 text-left hover:bg-surface-border/30 transition-colors " + (!msg.isRead ? "bg-accent/5 " : "")}
+                    className={"w-full px-4 py-2 text-left hover:bg-surface-border/30 transition-colors " + (!msg.isRead ? "bg-accent/5 " : "")}
                   >
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className={"text-[10px] font-medium px-1.5 py-0.5 rounded " + (isIncoming ? "bg-emerald-500/15 text-emerald-300" : "bg-blue-500/15 text-blue-300")}>
+                    <div className="flex items-center gap-2 mb-0.5 min-w-0">
+                      <span className={"text-xs font-medium px-1.5 py-0.5 rounded shrink-0 " + (isIncoming ? "bg-emerald-500/15 text-emerald-300" : "bg-blue-500/15 text-blue-300")}>
                         {directionTag}
                       </span>
-                      <span className="text-sm font-medium text-gray-200">{label}</span>
+                      <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor}`} />
+                      <span className="text-sm font-medium text-gray-200 truncate min-w-0">{info.name}</span>
+                      {positionLabel && (
+                        <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full shrink-0 ${roleStyle.bg} ${roleStyle.text}`}>
+                          {positionLabel}
+                        </span>
+                      )}
                       {!msg.isRead && (
-                        <span className="text-[10px] text-accent font-medium">未读</span>
+                        <span className="text-xs text-accent font-medium shrink-0">未读</span>
                       )}
                     </div>
-                    <p className={"text-xs text-gray-500 " + (isExpanded ? "whitespace-pre-wrap" : "truncate")}>{preview}</p>
+                    <p className={"text-xs text-gray-500 " + (isExpanded ? "whitespace-pre-wrap break-all" : "truncate")}>{preview}</p>
                     {isExpanded && msg.toolCalls && msg.toolCalls.length > 0 && (
                       <div className="mt-2 space-y-1">
                         {msg.toolCalls.map((tc, i) => {
                           const cat = toolCategories[tc.tool] || { color: "text-gray-300", bg: "bg-gray-500/15", label: tc.tool };
                           return (
-                            <div key={i} className={"text-[11px] px-2 py-1 rounded " + cat.bg + " " + cat.color}>
+                            <div key={i} className={"text-xs px-2 py-1 rounded " + cat.bg + " " + cat.color}>
                               {cat.label}: {tc.tool}
                             </div>
                           );
@@ -807,7 +875,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
             {images.map((url, i) => (
               <div key={i} className="relative group">
                 <img src={url} className="h-16 w-16 object-cover rounded-lg border border-surface-border" alt="" />
-                <button onClick={() => removeImage(i)} className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white rounded-full text-[10px] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">x</button>
+                <button onClick={() => removeImage(i)} className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">x</button>
               </div>
             ))}
           </div>

@@ -102,7 +102,7 @@ export const SOFTWARE_PARADIGMS: OrgParadigm[] = [
     ],
     creationGuidance: [
       "创建 2-5 个 executor agent，全部设为 root-level（parentId: null）。",
-      "不设 coordinator，每个 agent 独立工作，通过 message_peer 互相沟通。",
+      "不设 coordinator，每个 agent 独立工作，通过 send_message 互相沟通。",
       "按职能划分角色（如前端开发、后端开发、测试），避免职责重叠。",
       "每个 agent 的 goal 中明确其独立交付物和与其他人的协作边界。",
       "如果需要一个轻量的技术把关人，可以把其中一个 developer 设为 coordinator + executor 混合体（但仍然不创建下属层级）。",
@@ -176,7 +176,7 @@ export const SOFTWARE_PARADIGMS: OrgParadigm[] = [
       "在架构师下创建开发团队（2-8 个 executor，role: developer），parentId 指向架构师。",
       "可选：创建独立的 QA（role: qa, executor），parentId 指向 PM 或架构师。",
       "这是 3 层结构：PM/Architect → Developers → (可选 sub-modules)。",
-      "PM 和架构师是平级关系，通过 message_peer 沟通。",
+      "PM 和架构师是平级关系，通过 send_message 沟通。",
     ].join("\n"),
   },
 
@@ -211,7 +211,7 @@ export const SOFTWARE_PARADIGMS: OrgParadigm[] = [
       "每个 Pod Lead 下创建 2-5 个 executor（role: developer），parentId 指向 Pod Lead。",
       "可选：每个 Pod 配 1 个 QA（role: qa），或创建共享的 QA 团队直接挂在总负责人下。",
       "这是 3 层结构：总负责人 → Pod Leads → Developers。",
-      "Pod 之间通过各自的 Lead 互相 message_peer 沟通。",
+      "Pod 之间通过各自的 Lead 互相 send_message 沟通。",
       "每个 Pod 应该能独立交付，减少跨 Pod 依赖。",
     ].join("\n"),
   },

@@ -41,18 +41,82 @@ const activityColors: Record<string, { bg: string; text: string; icon: string }>
   error: { bg: "bg-red-500/10", text: "text-red-300", icon: "错误" },
 };
 
+/** Merge thinking events per conversation — tool calls don't break the session. */
+function mergeThinkingSessions(events: ActivityEntry[]): (ActivityEntry & { isSession?: boolean })[] {
+  const merged: (ActivityEntry & { isSession?: boolean })[] = [];
+  let currentSession: (ActivityEntry & { isSession?: boolean }) | null = null;
+
+  for (const e of events) {
+    if (e.type === "thinking") {
+      if (currentSession) {
+        // Append to current thinking session
+        currentSession.content = (currentSession.content || "") + (e.content || "");
+        currentSession.timestamp = e.timestamp;
+      } else {
+        currentSession = { ...e, content: e.content || "", isSession: true };
+        merged.push(currentSession);
+      }
+    } else if (e.type === "done" || e.type === "error") {
+      // Conversation boundary — close the session
+      currentSession = null;
+      merged.push(e);
+    } else {
+      // tool_use, tool_result, text — pass through, don't break thinking session
+      merged.push(e);
+    }
+  }
+  return merged;
+}
+
+function ThinkingSession({ entry }: { entry: ActivityEntry }) {
+  const [expanded, setExpanded] = useState(false);
+  const content = entry.content || "";
+  const preview = content.slice(0, 100);
+
+  return (
+    <div className="px-4 py-1.5 border-b border-surface-border/30">
+      <div
+        className="flex items-start gap-2 cursor-pointer hover:bg-surface-border/10 rounded px-1 -mx-1 transition-colors"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded whitespace-nowrap bg-purple-500/10 text-purple-300 shrink-0 mt-0.5">
+          思考
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-gray-500">{entry.agentName}</span>
+            <span className="text-[10px] text-gray-600">{formatTime(entry.timestamp)}</span>
+            <span className="text-[10px] text-gray-500">{expanded ? "▲" : "▼"}</span>
+          </div>
+          {!expanded && (
+            <div className="text-[11px] text-gray-400 truncate mt-0.5 leading-relaxed">
+              {preview}{content.length > 100 ? "…" : ""}
+            </div>
+          )}
+        </div>
+      </div>
+      {expanded && (
+        <div className="mt-1.5 ml-6 p-2 rounded bg-surface-alt border border-surface-border text-[11px] text-gray-300 leading-relaxed whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+          {content}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ActivityLog({ agentId }: { agentId?: string | null }) {
   const activityFeed = useAppStore((s) => s.activityFeed);
   const clearActivity = useAppStore((s) => s.clearActivity);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const filtered = agentId ? activityFeed.filter((e) => e.agentId === agentId) : activityFeed;
+  const merged = mergeThinkingSessions(filtered);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [filtered.length]);
+  }, [merged.length]);
 
-  if (filtered.length === 0) return null;
+  if (merged.length === 0) return null;
 
   return (
     <div className="border-t border-surface-border bg-surface-card shrink-0">
@@ -60,20 +124,29 @@ function ActivityLog({ agentId }: { agentId?: string | null }) {
         <span className="text-xs font-medium text-gray-400">Live Activity</span>
         <button onClick={clearActivity} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">Clear</button>
       </div>
-      <div className="max-h-64 overflow-y-auto">
-        {filtered.map((e, i) => {
+      <div className="max-h-80 overflow-y-auto">
+        {merged.map((e, i) => {
+          if (e.isSession) {
+            return <ThinkingSession key={`ts-${i}`} entry={e} />;
+          }
           const c = activityColors[e.type] || activityColors.text;
-          const summary = e.type === "thinking" ? `thinking: ${(e.content || "").slice(0, 80)}` :
+          const summary =
             e.type === "text" ? (e.content || "").slice(0, 120) :
             e.type === "tool_use" ? `${e.toolName || "?"}` + (e.toolInput ? ` ${e.toolInput.slice(0, 60)}` : "") :
             e.type === "tool_result" ? `${e.toolName || "?"} ${(e.toolResult || "").slice(0, 80)}` :
             e.type === "error" ? (e.errorMessage || "error").slice(0, 120) :
             e.type === "done" ? "完成" : "";
           return (
-            <div key={i} className="px-6 py-1.5 hover:bg-surface-border/10 transition-colors border-b border-surface-border/30">
+            <div key={i} className="px-4 py-1.5 hover:bg-surface-border/10 transition-colors border-b border-surface-border/30">
               <div className="flex items-start gap-2">
-                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded whitespace-nowrap ${c.bg} ${c.text}`}>{c.icon}</span>
-                <span className="text-[11px] text-gray-300 truncate">{summary}</span>
+                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded whitespace-nowrap shrink-0 mt-0.5 ${c.bg} ${c.text}`}>{c.icon}</span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] text-gray-500">{e.agentName}</span>
+                    <span className="text-[10px] text-gray-600">{formatTime(e.timestamp)}</span>
+                  </div>
+                  <span className="text-[11px] text-gray-300 truncate block">{summary}</span>
+                </div>
               </div>
             </div>
           );

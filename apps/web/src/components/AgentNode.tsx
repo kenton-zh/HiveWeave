@@ -3,13 +3,14 @@ import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { useAppStore } from "../store";
 
 const roleColors: Record<string, { bg: string; text: string; label: string }> = {
-  hr: { bg: "bg-rose-500/20", text: "text-rose-300", label: "HR" },
-  architect: { bg: "bg-purple-500/20", text: "text-purple-300", label: "Architect" },
-  manager: { bg: "bg-blue-500/20", text: "text-blue-300", label: "Manager" },
-  developer: { bg: "bg-green-500/20", text: "text-green-300", label: "Developer" },
-  module_dev: { bg: "bg-green-500/20", text: "text-green-300", label: "Developer" },
-  qa: { bg: "bg-amber-500/20", text: "text-amber-300", label: "QA" },
-  devops: { bg: "bg-cyan-500/20", text: "text-cyan-300", label: "DevOps" },
+  ceo: { bg: "bg-amber-500/20", text: "text-amber-300", label: "首席执行官" },
+  hr: { bg: "bg-rose-500/20", text: "text-rose-300", label: "人力资源" },
+  architect: { bg: "bg-purple-500/20", text: "text-purple-300", label: "架构师" },
+  manager: { bg: "bg-blue-500/20", text: "text-blue-300", label: "经理" },
+  developer: { bg: "bg-green-500/20", text: "text-green-300", label: "开发者" },
+  module_dev: { bg: "bg-green-500/20", text: "text-green-300", label: "开发者" },
+  qa: { bg: "bg-amber-500/20", text: "text-amber-300", label: "测试" },
+  devops: { bg: "bg-cyan-500/20", text: "text-cyan-300", label: "运维" },
 };
 
 /** Generic fallback for unknown/freeform roles — show the raw role name with a neutral style */
@@ -42,6 +43,8 @@ function AgentNode({ data, id }: NodeProps) {
   const role = (data.role as string) || "module_dev";
   const status = (data.status as string) || "idle";
   const name = (data.name as string) || "Agent";
+  const position = (data.position as string) || "";
+  const displayName = position ? `${position}·${name}` : name;
   const matchedRole = roleColors[role];
   const roleInfo = matchedRole || { ...defaultRoleStyle, label: role.charAt(0).toUpperCase() + role.slice(1) };
 
@@ -116,7 +119,7 @@ function AgentNode({ data, id }: NodeProps) {
       <div className="flex items-center gap-2">
         <span className={`w-2 h-2 rounded-full shrink-0 ${statusColor}`} />
         <span className="text-sm font-medium text-gray-100 truncate">
-          {name}
+          {displayName}
         </span>
       </div>
 

@@ -17,6 +17,18 @@ export class ProjectService {
   }
 
   async createProject(name: string, workspacePath?: string, description?: string, orgParadigm?: string): Promise<string> {
+    // Check for duplicate workspace path
+    if (workspacePath) {
+      const normalized = workspacePath.replace(/\\/g, "/").replace(/\/+$/, "");
+      const existing = await this.metaDb
+        .select({ id: projects.id, name: projects.name })
+        .from(projects)
+        .where(eq(projects.workspacePath, workspacePath));
+      if (existing.length > 0) {
+        throw new Error(`Workspace path "${workspacePath}" is already used by project "${existing[0].name}". Each project must have a unique workspace.`);
+      }
+    }
+
     const id = randomUUID();
     const defaultCharter = getDefaultCharter();
     if (orgParadigm) defaultCharter.orgParadigm = orgParadigm;
@@ -132,4 +144,43 @@ export class ProjectService {
       .where(eq(projects.id, projectId));
   }
 
+  async getGoals(projectId: string): Promise<EnterpriseGoals | null> {
+    const project = await this.getProject(projectId);
+    if (!project?.goalsJson) return null;
+    try { return JSON.parse(project.goalsJson); } catch { return null; }
+  }
+
+  async saveGoals(projectId: string, goals: EnterpriseGoals): Promise<void> {
+    await this.metaDb.update(projects)
+      .set({ goalsJson: JSON.stringify({ ...goals, updatedAt: Date.now() }) })
+      .where(eq(projects.id, projectId));
+  }
+
+}
+
+/** Enterprise goals / workboard — visible to all agents, authored by CEO + user. */
+export interface EnterpriseGoals {
+  objective: string;
+  focus: string;
+  keyResults: Array<{ text: string; status: "todo" | "doing" | "done"; owner?: string }>;
+  updatedAt?: number;
+}
+
+/** Format goals into a compact, token-efficient prompt block. */
+export function formatGoalsForPrompt(goals: EnterpriseGoals | null): string {
+  if (!goals?.objective) return "";
+  const done = goals.keyResults.filter((k) => k.status === "done").length;
+  const total = goals.keyResults.length;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  const statusIcon = { todo: "○", doing: "◐", done: "●" } as const;
+  const krs = goals.keyResults
+    .map((kr) => `${statusIcon[kr.status] || "○"} ${kr.text}${kr.owner ? ` [${kr.owner}]` : ""}`)
+    .join("\n");
+  return `## Enterprise Goals (Workboard)
+Objective: ${goals.objective}
+Progress: ${done}/${total} (${pct}%)
+Current Focus: ${goals.focus || "—"}
+Key Results:
+${krs}
+— This workboard is set by leadership and the user. Align your work with these goals.`;
 }

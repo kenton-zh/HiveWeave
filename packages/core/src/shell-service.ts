@@ -73,6 +73,9 @@ const BLOCKED_PATTERNS: RegExp[] = [
   /^\s*reboot\b/,
   /^\s*init\s+[06]/,
   /^\s*poweroff\b/,
+
+  // HiveWeave system directory protection
+  /\.hiveweave\b/,
 ];
 
 // ---------------------------------------------------------------------------

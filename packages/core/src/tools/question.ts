@@ -33,7 +33,12 @@ export function drainQuestions(): PendingQuestion[] {
   const result: PendingQuestion[] = [];
   for (const [id, q] of pendingQuestions) {
     if (Date.now() - q.createdAt > 600_000) {
-      pendingQuestions.delete(id); // expire after 10 min
+      // Resolve with timeout message BEFORE deleting — otherwise the Effect.async fiber
+      // hangs forever (the resolve callback becomes unreachable after delete).
+      if (q.resolve) {
+        q.resolve("[用户未在 10 分钟内回答此问题，已自动跳过。请继续你的工作，必要时可以稍后重新提问。]");
+      }
+      pendingQuestions.delete(id);
     } else {
       result.push({ id: q.id, agentId: q.agentId, question: q.question, options: q.options, createdAt: q.createdAt });
     }

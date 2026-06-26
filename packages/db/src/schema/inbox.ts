@@ -7,6 +7,7 @@ export const inbox = sqliteTable("inbox", {
   message: text("message").notNull(),
   messageType: text("message_type").notNull().default("superior"),
   expectReport: integer("expect_report", { mode: "boolean" }).notNull().default(false),
+  priority: text("priority").notNull().default("normal"), // low | normal | urgent
   read: integer("read", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
 });

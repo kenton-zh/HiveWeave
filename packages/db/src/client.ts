@@ -7,16 +7,39 @@ import { dirname, resolve, join } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const META_DB_PATH = process.env.DB_PATH || resolve(__dirname, "../data/hiveweave.db");
+const META_DB_PATH = process.env.HIVEWEAVE_DB_PATH || resolve(__dirname, "../data/hiveweave.db");
 
 // ---------------------------------------------------------------------------
 // Factory: create a Drizzle database instance at any path
 // ---------------------------------------------------------------------------
 
-export function createDb(dbPath: string, schemaObj: typeof allSchema = allSchema) {
+/**
+ * Create a drizzle-wrapped SQLite database.
+ * @param journalMode - "wal" for multi-connection (meta DB), "delete" for single-connection (per-project DB).
+ *   On Windows, WAL mode can fail with SQLITE_IOERR_SHMOPEN after force-kill due to OS-level shared-memory
+ *   lock retention. Per-project DBs should use "delete" — they're single-connection and don't need WAL.
+ */
+export function createDb(dbPath: string, schemaObj: typeof allSchema = allSchema, journalMode: "wal" | "delete" = "wal") {
   mkdirSync(dirname(dbPath), { recursive: true });
   const sqlite = new Database(dbPath);
-  sqlite.pragma("journal_mode = WAL");
+
+  if (journalMode === "delete") {
+    // DELETE mode: no shared memory, no .db-wal/.db-shm files, safe against force-kill
+    sqlite.pragma("journal_mode = DELETE");
+  } else {
+    try {
+      sqlite.pragma("journal_mode = WAL");
+    } catch (err: any) {
+      if (err?.code === "SQLITE_IOERR_SHMOPEN") {
+        try { require("fs").unlinkSync(dbPath + "-wal"); } catch {}
+        try { require("fs").unlinkSync(dbPath + "-shm"); } catch {}
+        sqlite.pragma("journal_mode = WAL");
+      } else {
+        throw err;
+      }
+    }
+  }
+
   sqlite.pragma("foreign_keys = ON");
   return drizzle(sqlite, { schema: schemaObj });
 }
@@ -72,6 +95,19 @@ try { metaSqlite.exec(`ALTER TABLE llm_models ADD COLUMN provider TEXT NOT NULL 
 try { metaSqlite.exec(`ALTER TABLE llm_models ADD COLUMN supports_images INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
 try { metaSqlite.exec(`ALTER TABLE projects ADD COLUMN charter_json TEXT`); } catch { /* already exists */ }
 try { metaSqlite.exec(`ALTER TABLE projects ADD COLUMN game_time_accumulated_seconds INTEGER NOT NULL DEFAULT 0`); } catch { /* already exists */ }
+try { metaSqlite.exec(`ALTER TABLE projects ADD COLUMN goals_json TEXT`); } catch { /* already exists */ }
+
+// ---------------------------------------------------------------------------
+// Meta DB — global_settings (key-value store for app-wide preferences)
+// ---------------------------------------------------------------------------
+
+metaSqlite.exec(`
+  CREATE TABLE IF NOT EXISTS global_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  )
+`);
 
 /** Seed the default model if the registry is empty. */
 export function seedDefaultModel() {
@@ -241,10 +277,18 @@ function initProjectDbTables(projectDb: ReturnType<typeof createDb>) {
       message TEXT NOT NULL,
       message_type TEXT NOT NULL DEFAULT 'superior',
       expect_report INTEGER NOT NULL DEFAULT 0,
+      priority TEXT NOT NULL DEFAULT 'normal',
       read INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
     )
   `);
+
+  // Migration: add priority column if missing (existing databases)
+  try {
+    projectDb.run(sql`ALTER TABLE inbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'`);
+  } catch {
+    // Column already exists — expected on fresh databases
+  }
 
   projectDb.run(sql`
     CREATE TABLE IF NOT EXISTS scheduled_alarms (
@@ -331,6 +375,7 @@ function initProjectDbTables(projectDb: ReturnType<typeof createDb>) {
   try { projectDb.run(sql`ALTER TABLE chat_messages ADD COLUMN team_to_agent_id TEXT`); } catch { /* already exists */ }
   try { projectDb.run(sql`ALTER TABLE chat_messages ADD COLUMN images TEXT`); } catch { /* already exists */ }
   try { projectDb.run(sql`ALTER TABLE projects ADD COLUMN charter_json TEXT`); } catch { /* already exists */ }
+  try { projectDb.run(sql`ALTER TABLE projects ADD COLUMN goals_json TEXT`); } catch { /* already exists */ }
 
   // ── Migration: remove cross-DB FK constraints ────────────────────────
   // agents.project_id and personnel_records.project_id originally referenced
@@ -418,7 +463,7 @@ export function ensureProjectDb(workspacePath: string): ReturnType<typeof create
   mkdirSync(hwDir, { recursive: true });
 
   const dbPath = join(hwDir, PROJECT_DB_FILE);
-  const projectDb = createDb(dbPath, allSchema);
+  const projectDb = createDb(dbPath, allSchema, "delete");
 
   // Initialize tables for new or existing per-project DBs (idempotent)
   initProjectDbTables(projectDb);
@@ -443,6 +488,12 @@ export function evictProjectDb(workspacePath: string): void {
   const normalized = workspacePath.replace(/\\/g, "/");
   const cached = projectDbCache.get(normalized);
   if (cached) {
+    // Drizzle's BetterSQLite3Database stores the raw better-sqlite3 Database
+    // instance on `$client` (see drizzle-orm/better-sqlite3/driver.js).
+    // We must close THAT to release the file handle; otherwise Windows keeps
+    // the .db / .db-wal / .db-shm locked and rmSync hangs indefinitely.
+    try { (cached as any).$client?.close(); } catch { /* already closed */ }
+    // Belt-and-suspenders: also try the session path (older drizzle versions)
     try { (cached as any).session?.client?.close(); } catch { /* already closed */ }
     projectDbCache.delete(normalized);
   }

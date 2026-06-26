@@ -1,4 +1,4 @@
-import { agents, modules, workLogs } from "@hiveweave/db";
+import { agents, modules, workLogs, personnelRecords } from "@hiveweave/db";
 import type { Database } from "@hiveweave/db";
 import type { Agent } from "@hiveweave/db";
 import { registerAgent } from "@hiveweave/db";
@@ -11,6 +11,7 @@ export interface OrgNode {
   shortId: string | null;
   name: string;
   role: string;
+  position: string;  // From personnel_records
   status: string;
   permissionType: string;
   permissionMode: string;
@@ -60,8 +61,18 @@ export class OrgService {
       : await this.db.select().from(agents);
     // Exclude archived agents from the org tree
     const activeAgents = allAgents.filter((a: any) => a.status !== "archived");
+
+    // Fetch personnel positions for all agents
+    const positionMap = new Map<string, string>();
+    try {
+      const records = await this.db.select().from(personnelRecords);
+      for (const r of records) {
+        if (r.agentId && r.position) positionMap.set(r.agentId, r.position);
+      }
+    } catch { /* personnel table may not exist yet */ }
+
     const roots = activeAgents.filter(a => !a.parentId);
-    return roots.map(r => this.buildTree(r, activeAgents));
+    return roots.map(r => this.buildTree(r, activeAgents, positionMap));
   }
 
   /**
@@ -71,16 +82,17 @@ export class OrgService {
    * @param allAgents - The complete flat list of agent records.
    * @returns A fully-populated OrgNode with nested children.
    */
-  private buildTree(agent: any, allAgents: any[]): OrgNode {
+  private buildTree(agent: any, allAgents: any[], positionMap: Map<string, string>): OrgNode {
     const children = allAgents
       .filter(a => a.parentId === agent.id)
-      .map(a => this.buildTree(a, allAgents));
+      .map(a => this.buildTree(a, allAgents, positionMap));
 
     return {
       id: agent.id,
       shortId: agent.shortId || null,
       name: agent.name,
       role: agent.role,
+      position: positionMap.get(agent.id) || "",
       status: agent.status,
       permissionType: agent.permissionType,
       permissionMode: agent.permissionMode || "full",

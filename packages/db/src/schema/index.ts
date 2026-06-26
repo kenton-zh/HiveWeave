@@ -13,3 +13,4 @@ export * from "./agent-templates";
 export * from "./conversation-turns";
 export * from "./llm-models";
 export * from "./scheduled-alarms";
+export * from "./global-settings";

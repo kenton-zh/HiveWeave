@@ -17,7 +17,7 @@ export type PermissionResult = "allow" | "ask" | "deny";
 const READONLY_ALLOWED = [
   "list_subordinates",
   "read_work_logs",
-  "read_agent_status",
+  "check_agent_status",
   "read_project_memory",
   "review_code",
 ];
@@ -28,7 +28,6 @@ const READWRITE_ALLOWED = [
   "write_work_log",
   "report_completion",
   "message_superior",
-  "message_peer",
   "send_message",
   "dispatch_task",
   "approve_work",

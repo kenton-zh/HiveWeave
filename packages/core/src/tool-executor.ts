@@ -5,7 +5,8 @@ import { HandoffService } from "./handoff-service.js";
 import { InboxService } from "./inbox-service.js";
 import { RosterService } from "./roster-service.js";
 import { FileService } from "./file-service.js";
-import { ProjectService } from "./project-service.js";
+import { ProjectService, formatGoalsForPrompt } from "./project-service.js";
+import type { EnterpriseGoals } from "./project-service.js";
 import { communicationService, userPingTracker } from "./communication-service.js";
 import { TemplateService } from "./template-service.js";
 import { clawhubService } from "./clawhub-service.js";
@@ -16,6 +17,7 @@ import { ProjectCharterSchema, formatCharterForPrompt, parseGameTimeOffset, form
 import type { GameTimeService } from "./game-time-service.js";
 import type { AlarmService } from "./alarm-service.js";
 import { prefixInterAgentMessage } from "./time-context.js";
+import { statusEventBus } from "./status-event-bus.js";
 import { randomUUID } from "crypto";
 import { runBashCommand } from "./tools/bash.js";
 import { executeGrep } from "./tools/grep.js";
@@ -23,6 +25,10 @@ import { executeApplyPatch } from "./tools/apply-patch.js";
 import { executeQuestion } from "./tools/question.js";
 import { executeTodoWrite } from "./tools/todowrite.js";
 import { executeWebSearch } from "./tools/websearch.js";
+import { runCodeReview, runSecurityAudit, runTestReview, runPerfAudit, runFullReview } from "./tools/review.js";
+import type { ReviewLLMCallback, ReviewResult } from "./tools/review.js";
+import { GitWorktreeService } from "./git-worktree-service.js";
+import { existsSync } from "fs";
 import { Effect } from "effect";
 import { mcpService } from "./mcp/mcp-service.js";
 
@@ -68,8 +74,6 @@ const HR_ONLY_TOOLS = new Set([
   "transfer_agent",
   "dismiss_agent",
   "update_roster",
-  "browse_templates",
-  "create_from_template",
 ]);
 
 async function assertRole(
@@ -110,6 +114,7 @@ export class ToolExecutor {
     private readonly gameTimeService?: GameTimeService,
     private readonly alarmService?: AlarmService,
     private readonly projectId?: string | null,
+    private readonly reviewLLM?: ReviewLLMCallback,
   ) {}
 
   private getTimeSnapshot() {
@@ -198,7 +203,6 @@ export class ToolExecutor {
             ? await this.dispatch.getSubordinateLogs(subordinateId, limit || 10)
             : await this.dispatch.getAgentLogs(agentId, limit || 20);
           if (logs.length === 0) return "No work logs found.";
-          // Format logs concisely for Claude
           return logs
             .map((l: any) => {
               const time = new Date(l.createdAt).toISOString();
@@ -271,7 +275,6 @@ export class ToolExecutor {
         }
 
         case "review_code": {
-          // For now, read subordinate's recent logs as a code review proxy
           const { limit } = input;
           const subordinateId = typeof input.subordinateId === "string" ? input.subordinateId.trim() : input.subordinateId;
           if (!subordinateId) {
@@ -322,7 +325,7 @@ export class ToolExecutor {
 
         // ── Upward Communication ─────────────────────────────
         case "message_superior": {
-          const { message } = input;
+          const { message, priority } = input;
           if (!message) {
             return "Error: message_superior requires a message.";
           }
@@ -332,7 +335,8 @@ export class ToolExecutor {
             return "You don't have a superior to message. You are a root agent.";
           }
           const superiorId = currentAgent.parentId;
-          const msgId = await this.inbox.sendMessage(agentId, superiorId, this.prefixForInbox(message), "superior");
+          const validPriority = (priority === "low" || priority === "urgent") ? priority : "normal";
+          const msgId = await this.inbox.sendMessage(agentId, superiorId, this.prefixForInbox(message), "superior", false, validPriority);
           const superior = await this.org.getAgent(superiorId);
           const superiorName = superior?.name || superiorId;
           // Track this as an active communication for the org chart
@@ -345,36 +349,23 @@ export class ToolExecutor {
         }
 
         // ── Peer Communication ─────────────────────────────
-        case "message_peer": {
-          const { message, expectReport } = input;
-          const toAgentId = typeof input.toAgentId === "string" ? input.toAgentId.trim() : input.toAgentId;
-          if (!toAgentId || !message) {
-            return "Error: message_peer requires toAgentId and message.";
-          }
-          console.log(`[TOOL] message_peer: from=${agentId} to=${toAgentId}`);
-          const target = await this.org.resolveAgent(toAgentId);
-          if (!target) {
-            console.log(`[TOOL] message_peer: ERROR - No agent found with ID ${toAgentId}`);
-            return `Error: No agent found with ID ${toAgentId}.`;
-          }
-          const resolvedToId = target.id;
-          const targetName = target.name || toAgentId;
-          const msgId = await this.inbox.sendMessage(agentId, resolvedToId, message, "peer", expectReport === true);
-          // Track this as a peer communication for the org chart
-          communicationService.addCommunication(agentId, resolvedToId, "peer");
-          if (this.teamChat) {
-            await this.teamChat.recordIncoming(resolvedToId, agentId, message, msgId);
-            await this.teamChat.recordOutgoing(agentId, resolvedToId, message, JSON.stringify([{ tool: name, input }]));
-          }
-          return `Message sent to peer ${targetName} (${target.shortId}). msgId=${msgId}`;
-        }
-
-        // ── General Send Message (to user or agent) ──────────
+        // ── Send Message (to user or agent) — the ONLY inter-agent messaging tool ──
         case "send_message": {
-          const { content, recipients } = input;
-          if (!content || !recipients) {
-            return "Error: send_message requires content and recipients.";
+          // Support both new params (content/recipients) and legacy aliases (message/recipient/toAgentId)
+          const content = input.content || input.message;
+          let recipients = input.recipients || input.recipient || "";
+          const toAgentId = input.toAgentId; // legacy alias from old message_peer
+          const { expectReport, priority } = input;
+          if (!content || (!recipients && !toAgentId)) {
+            return "Error: send_message requires content and recipients (or recipient/toAgentId).";
           }
+          // Merge toAgentId into recipients list if present
+          if (toAgentId && !recipients) {
+            recipients = toAgentId;
+          } else if (toAgentId) {
+            recipients = String(recipients) + "," + toAgentId;
+          }
+          const validPriority = (priority === "low" || priority === "urgent") ? priority : "normal";
           const list = String(recipients).split(",").map((s: string) => s.trim()).filter(Boolean);
           const results: string[] = [];
           for (const rcpt of list) {
@@ -383,7 +374,6 @@ export class ToolExecutor {
               if (this.teamChat) {
                 const msgId = randomUUID();
                 try {
-                  // Use team chat with null teamToAgentId for user-bound messages
                   await (this.teamChat as any).chat.saveMessage({
                     id: msgId,
                     agentId,
@@ -400,16 +390,30 @@ export class ToolExecutor {
             } else {
               const target = await this.org.resolveAgent(rcpt);
               if (!target) {
-                results.push(`Error: Could not find agent matching "${rcpt}". Use read_roster to see available agents.`);
+                results.push(`Error: Could not find agent matching "${rcpt}". Try using their shortId (e.g. A001) instead — use \`read_roster\` to find it.`);
                 continue;
               }
-              const msgId = await this.inbox.sendMessage(agentId, target.id, this.prefixForInbox(content), "peer");
+              // Self-send guard: prevent agents from messaging themselves
+              if (target.id === agentId) {
+                const self = await this.org.getAgent(agentId);
+                const selfName = self?.name || "you";
+                results.push(
+                  `⚠️ STOP — You are trying to send a message to yourself ("${rcpt}" resolved to ${selfName}, which is YOU). ` +
+                  `If you meant to reply to someone, use their name as the recipient. ` +
+                  `Use \`list_subordinates\` to see your team, or \`read_roster\` to see all agents. ` +
+                  `If you meant to talk to the human operator, use recipients="user".`
+                );
+                continue;
+              }
+              const msgId = await this.inbox.sendMessage(agentId, target.id, this.prefixForInbox(content), "peer", expectReport === true, validPriority);
               communicationService.addCommunication(agentId, target.id, "peer");
               if (this.teamChat) {
                 await this.teamChat.recordIncoming(target.id, agentId, content, msgId);
                 await this.teamChat.recordOutgoing(agentId, target.id, content, JSON.stringify([{ tool: name, input }]));
               }
-              results.push(`Sent to ${target.name} (${target.shortId}).`);
+              const resultLine = `Sent to ${target.name}. msgId=${msgId}`;
+              if (expectReport) results.push(resultLine + " (report expected)");
+              else results.push(resultLine);
             }
           }
           return results.join("\n");
@@ -433,7 +437,9 @@ export class ToolExecutor {
                 ? `${pendingHandoffs.length} pending task(s)`
                 : "No active tasks";
               const subCount = acceptedHandoffs.length;
-              return `- **${child.name}** (${child.role}, ID: ${child.shortId || child.id}) — Status: ${child.status} | ${taskStatus} | Subordinates: ${subCount} | Last: ${lastActivity}`;
+              const busy = statusEventBus.isProcessing(child.id);
+              const statusBadge = busy ? "🔴 working" : "🟢 idle";
+              return `- **${child.name}** (${child.role}) — ${statusBadge} | ${taskStatus} | Subordinates: ${subCount} | Last: ${lastActivity}`;
             }),
           );
           return `## Your Subordinates (${children.length})\n${lines.join("\n")}`;
@@ -443,17 +449,29 @@ export class ToolExecutor {
         case "create_agent": {
           {
             const roleCheck = await assertRole(this.org, agentId, ["hr"]);
-            if (!roleCheck.ok) return roleCheck.error;
+            if (roleCheck.ok === false) return roleCheck.error;
           }
-          const { name, role, goal, backstory, permissionType, position, department, responsibilities } = input;
+          const { name, role, description, backstory: inputBackstory, permissionType, position, department, responsibilities } = input;
           const parentId = typeof input.parentId === "string" ? input.parentId.trim() : input.parentId;
-          if (!name || !role || !goal) {
-            return "Error: create_agent requires name, role, and goal.";
+          if (!name || !role || !description || !position) {
+            return "Error: create_agent requires name, role, description, and position (Chinese job title).";
+          }
+          // Name must contain Chinese characters
+          if (!/[\u4e00-\u9fa5]/.test(String(name))) {
+            return "Error: Agent name must contain Chinese characters (e.g. 张三, 李四).";
+          }
+          // Position must contain Chinese characters
+          if (!/[\u4e00-\u9fa5]/.test(String(position))) {
+            return "Error: Position must be a Chinese job title (e.g. 前端工程师, 后端开发, 产品经理).";
           }
           const normalizedRole = String(role).toLowerCase();
           if (normalizedRole === "ceo" || normalizedRole === "hr") {
             return "Error: Cannot create agents with role ceo or hr. These roles are reserved.";
           }
+
+          // Goal must be project-aligned; backstory MUST be a personal narrative from HR
+          const goal = input.goal || `As ${role}, fulfill the following responsibilities: ${description}`;
+          const backstory = inputBackstory || "";
 
           // Parse comma-separated skill and MCP server lists
           const initialSkills = typeof input.skills === "string" && input.skills.trim()
@@ -490,7 +508,7 @@ export class ToolExecutor {
 
           // Validate parentId — default to CEO when omitted (HR must not create root agents)
           let resolvedParentId: string | null = null;
-          let parentShortId: string | null = null;
+          let parentName: string | null = null;
           if (parentId) {
             const parentAgent = await this.org.resolveAgent(parentId);
             if (!parentAgent) {
@@ -500,12 +518,12 @@ export class ToolExecutor {
               return `Error: Parent agent belongs to a different project.`;
             }
             resolvedParentId = parentAgent.id;
-            parentShortId = parentAgent.shortId || null;
+            parentName = parentAgent.name;
           } else if (projectId) {
             const ceo = await this.org.findAgentByRole(projectId, "ceo");
             if (ceo) {
               resolvedParentId = ceo.id;
-              parentShortId = ceo.shortId || null;
+              parentName = ceo.name;
             }
           }
 
@@ -514,7 +532,7 @@ export class ToolExecutor {
           // IRON RULE: HR can NEVER create agents under itself
           if (caller.role?.toLowerCase() === "hr" && resolvedParentId === agentId) {
             console.log(`[TOOL] create_agent: BLOCKED — HR tried to create agent under itself`);
-            return "Error: HR cannot create agents under itself. You are a personnel service role, not an org manager. Set parentId to null (root-level) or to another agent's ID.";
+            return "Error: HR cannot create agents under itself. New agents default to the CEO — omit parentId to place them under the CEO, or specify another manager's ID explicitly.";
           }
 
           console.log(`[TOOL] create_agent: name="${name}" parentId=${resolvedParentId} callerId=${agentId} skills=${JSON.stringify(initialSkills)} mcp=${JSON.stringify(initialMcp)}`);
@@ -551,13 +569,13 @@ export class ToolExecutor {
           const newAgent = await this.org.getAgent(newId);
           const newShortId = newAgent?.shortId || newId;
           const parentLabel = resolvedParentId
-            ? `under parent agent ${parentShortId || resolvedParentId.slice(0, 8)}`
+            ? `under ${parentName || "unknown"}`
             : "as root-level agent";
           const bindingNote = [
             initialSkills.length > 0 ? `Skills: [${initialSkills.join(", ")}]` : null,
             initialMcp.length > 0 ? `MCP: [${initialMcp.join(", ")}]` : null,
           ].filter(Boolean).join(" | ");
-          return `Agent created successfully!\nName: ${name}\nID: ${newShortId}\nRole: ${role}\nType: ${permLabel}\nPlacement: ${parentLabel}${bindingNote ? `\n${bindingNote}` : ""}\nRoster entry created.${skillWarning}`;
+          return `Agent created successfully!\nName: ${name}\nRole: ${role}\nType: ${permLabel}\nPlacement: ${parentLabel}${bindingNote ? `\n${bindingNote}` : ""}\nRoster entry created.${skillWarning}`;
         }
 
         // ── HR: Transfer Agent (re-parent) ──────────────────
@@ -623,7 +641,7 @@ export class ToolExecutor {
           const parentLabel = resolvedParentId
             ? `under agent ${newParentShortId || resolvedParentId.slice(0, 8)}`
             : "as root-level (no parent)";
-          return `Agent "${target.name}" (${target.shortId || targetAgentId}) transferred ${parentLabel}.`;
+          return `Agent "${target.name}" transferred ${parentLabel}.`;
         }
 
         // ── HR: Dismiss Agent (soft-delete) ─────────────────
@@ -658,7 +676,7 @@ export class ToolExecutor {
           await this.roster.terminateRecord(resolvedTargetId, agentId);
 
           const reasonNote = reason ? ` Reason: ${reason}` : "";
-          return `Agent "${target.name}" (${target.shortId || resolvedTargetId.slice(0, 8)}) has been dismissed (archived). Roster record terminated.${reasonNote}`;
+          return `Agent "${target.name}" has been dismissed (archived). Roster record terminated.${reasonNote}`;
         }
 
         // ── HR: Update Roster ───────────────────────────────
@@ -708,7 +726,8 @@ export class ToolExecutor {
             const statusBadge = r.status === "active" ? "✅" : r.status === "probation" ? "⚠️" : "🔲";
             const agent = agentMap.get(r.agentId);
             const displayId = agent?.shortId || r.agentId.slice(0, 8);
-            return `${statusBadge} **${r.position || "(no position)"}** — Agent: ${displayId} | Dept: ${r.department || "—"} | Status: ${r.status}\n   Responsibilities: ${r.responsibilities || "—"}`;
+            const displayName = agent?.name ? ` ${agent.name}` : "";
+            return `${statusBadge} **${r.position || "(no position)"}** — ${displayName} (${displayId}) | Dept: ${r.department || "—"} | Status: ${r.status}\n   Responsibilities: ${r.responsibilities || "—"}`;
           });
           return `## Personnel Roster (${records.length} records)\n${lines.join("\n")}`;
         }
@@ -727,7 +746,7 @@ export class ToolExecutor {
             for (const node of nodes) {
               const indent = "  ".repeat(depth);
               const permBadge = node.permissionType === "coordinator" ? "👔" : "⚙️";
-              flatList.push(`${indent}${permBadge} **${node.name}** (role: ${node.role}, status: ${node.status}, ID: ${node.shortId || node.id.slice(0, 8)})`);
+              flatList.push(`${indent}${permBadge} **${node.name}** (${node.role})`);
               if (node.children && node.children.length > 0) {
                 flatten(node.children, depth + 1);
               }
@@ -739,139 +758,33 @@ export class ToolExecutor {
           return `## Full Organization (${flatList.length} agents)\n${flatList.join("\n")}`;
         }
 
-        // ── HR: Browse Templates ─────────────────────────────
-        case "browse_templates": {
-          {
-            const roleCheck = await assertRole(this.org, agentId, ["hr"]);
-            if (!roleCheck.ok) return roleCheck.error;
+        // ── Check Agent Status (real-time busy/idle) ──────────
+        case "check_agent_status": {
+          const targetId = typeof input.agentId === "string" ? input.agentId.trim() : input.agentId;
+          if (targetId) {
+            // Check a specific agent
+            const target = await this.org.resolveAgent(targetId);
+            if (!target) {
+              return `Error: No agent found with ID "${targetId}".`;
+            }
+            const busy = statusEventBus.isProcessing(target.id);
+            const status = busy ? "🔴 working (currently processing, do NOT disturb unless urgent)" : "🟢 idle (available for new tasks)";
+            return `**${target.name}** (${target.role}) — ${status}`;
           }
-          const { division, search, role } = input;
-          const templates = await this.templates.listTemplates({
-            division: division || undefined,
-            search: search || undefined,
-            role: role || undefined,
-          });
-          if (templates.length === 0) {
-            return "No templates found matching your criteria. Try a broader search or omit filters.";
-          }
-          const lines = templates.map((t: any) => {
-            const emoji = t.emoji || "📋";
-            return `${emoji} **${t.name}** [${t.division}] — role: ${t.role} | ${t.vibe || t.description.slice(0, 60) || "No description"}\n   ID: ${t.id}`;
-          });
-          return `## Agent Templates (${templates.length} results)\n${lines.join("\n")}\n\nTo create an agent from a template, use create_from_template with the template ID.`;
-        }
-
-        // ── HR: Create Agent from Template ───────────────────
-        case "create_from_template": {
-          {
-            const roleCheck = await assertRole(this.org, agentId, ["hr"]);
-            if (!roleCheck.ok) return roleCheck.error;
-          }
-          const { templateId, parentId, position, department } = input;
-          let { name, permissionType } = input;
-          const trimmedParentId = typeof parentId === "string" ? parentId.trim() : parentId;
-          if (!templateId) {
-            return "Error: create_from_template requires templateId. Use browse_templates first to find a template.";
-          }
-
-          // Parse comma-separated skill and MCP server lists
-          const initialSkills = typeof input.skills === "string" && input.skills.trim()
-            ? input.skills.split(",").map((s: string) => s.trim()).filter(Boolean)
-            : [];
-          const initialMcp = typeof input.mcpServers === "string" && input.mcpServers.trim()
-            ? input.mcpServers.split(",").map((s: string) => s.trim()).filter(Boolean)
-            : [];
-
-          // Load the template
-          const template = await this.templates.getTemplate(templateId);
-          if (!template) {
-            return `Error: No template found with ID ${templateId}.`;
-          }
-
-          // Use template defaults for unspecified fields
-          const agentName = name || template.name;
-          const agentRole = template.role;
-          if (String(agentRole).toLowerCase() === "ceo" || String(agentRole).toLowerCase() === "hr") {
-            return "Error: Cannot create agents with role ceo or hr from templates.";
-          }
-          const agentGoal = template.vibe || template.description || `Expert ${template.name.toLowerCase()} ready to work on assigned tasks.`;
-          const agentBackstory = template.promptBody || template.description || "";
-          const permType = permissionType === "coordinator" ? "coordinator" : "executor";
-
-          // Look up the calling agent to get projectId
+          // No specific agent — list all agents in the project with status
           const caller = await this.org.getAgent(agentId);
-          if (!caller) {
-            return "Error: Could not find your own agent record.";
+          if (!caller?.projectId) {
+            return "Error: Could not determine your project.";
           }
-          const projectId = caller.projectId || undefined;
-
-          // Validate parentId — default to CEO when omitted
-          let resolvedParentId: string | null = null;
-          let parentShortId: string | null = null;
-          if (trimmedParentId) {
-            const parentAgent = await this.org.resolveAgent(trimmedParentId);
-            if (!parentAgent) {
-              return `Error: No agent found with ID ${trimmedParentId}.`;
-            }
-            if (projectId && parentAgent.projectId !== projectId) {
-              return `Error: Parent agent belongs to a different project.`;
-            }
-            resolvedParentId = parentAgent.id;
-            parentShortId = parentAgent.shortId || null;
-          } else if (projectId) {
-            const ceo = await this.org.findAgentByRole(projectId, "ceo");
-            if (ceo) {
-              resolvedParentId = ceo.id;
-              parentShortId = ceo.shortId || null;
-            }
-          }
-
-          // IRON RULE: HR can NEVER create agents under itself
-          if (caller.role?.toLowerCase() === "hr" && resolvedParentId === agentId) {
-            return "Error: HR cannot create agents under itself. Set parentId to the CEO or a business manager.";
-          }
-
-          console.log(`[TOOL] create_from_template: template="${template.name}" name="${agentName}" parentId=${resolvedParentId} skills=${JSON.stringify(initialSkills)} mcp=${JSON.stringify(initialMcp)}`);
-          const newId = await this.org.createAgent({
-            name: agentName,
-            role: agentRole,
-            goal: agentGoal,
-            backstory: agentBackstory,
-            skills: [],
-            parentId: resolvedParentId || undefined,
-            projectId,
-            permissionType: permType,
-            mcpServers: initialMcp.length > 0 ? initialMcp : undefined,
-            boundSkills: initialSkills.length > 0 ? initialSkills : undefined,
+          const allAgents = await this.org.getProjectAgents(caller.projectId);
+          if (allAgents.length === 0) return "No agents in the project.";
+          const lines = allAgents.map((a: any) => {
+            const busy = statusEventBus.isProcessing(a.id);
+            const badge = busy ? "🔴 working" : "🟢 idle";
+            const permBadge = a.permissionType === "coordinator" ? "👔" : "⚙️";
+            return `- ${permBadge} **${a.name}** (${a.role}) — ${badge}`;
           });
-
-          // Auto-create roster entry
-          try {
-            await this.roster.upsertRecord({
-              projectId: projectId || "",
-              agentId: newId,
-              position: position || `${agentName} (${agentRole})`,
-              department: department || template.division || "",
-              responsibilities: agentGoal,
-              notes: `Created from template: ${template.name}`,
-              status: "active",
-              updatedBy: agentId,
-            });
-          } catch {
-            // Non-critical
-          }
-
-          const permLabel = permType === "coordinator" ? "协调者" : "执行者";
-          const newAgent = await this.org.getAgent(newId);
-          const newShortId = newAgent?.shortId || newId;
-          const parentLabel = resolvedParentId
-            ? `under parent agent ${parentShortId || resolvedParentId.slice(0, 8)}`
-            : "as root-level agent";
-          const bindingNote = [
-            initialSkills.length > 0 ? `Skills: [${initialSkills.join(", ")}]` : null,
-            initialMcp.length > 0 ? `MCP: [${initialMcp.join(", ")}]` : null,
-          ].filter(Boolean).join(" | ");
-          return `Agent created from template "${template.name}"!\nName: ${agentName}\nID: ${newShortId}\nRole: ${agentRole}\nType: ${permLabel}\nPlacement: ${parentLabel}${bindingNote ? `\n${bindingNote}` : ""}\nRoster entry created.`;
+          return `## Agent Status (${allAgents.length} agents)\n${lines.join("\n")}`;
         }
 
 
@@ -907,75 +820,98 @@ export class ToolExecutor {
           return formatCharterForPrompt(charter);
         }
 
-        // ── File Operations (workspace tools) ──────────────────
-        case "read_file": {
+        // ── Enterprise Goals (workboard — visible to ALL agents) ──
+        case "read_goals": {
           const caller = await this.org.getAgent(agentId);
           if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
+          const goals = await this.projects.getGoals(caller.projectId);
+          if (!goals) return "No enterprise goals have been set yet. The workboard is empty.";
+          return formatGoalsForPrompt(goals);
+        }
+
+        case "update_goals": {
+          const roleCheck = await assertRole(this.org, agentId, ["ceo", "manager", "coordinator"]);
+          if (!roleCheck.ok) return roleCheck.error;
+          const caller = roleCheck.caller;
+          if (!caller.projectId) return "Error: Could not determine your project.";
+          const existing = await this.projects.getGoals(caller.projectId) || {
+            objective: "",
+            focus: "",
+            keyResults: [],
+          };
+          if (input.objective !== undefined) existing.objective = input.objective;
+          if (input.focus !== undefined) existing.focus = input.focus;
+          if (Array.isArray(input.keyResults)) {
+            const newKRs = input.keyResults as Array<{ text: string; status: string; owner?: string }>;
+            for (const kr of newKRs) {
+              const idx = existing.keyResults.findIndex((k) => k.text === kr.text);
+              if (idx >= 0) {
+                existing.keyResults[idx] = {
+                  ...existing.keyResults[idx],
+                  status: (kr.status as "todo" | "doing" | "done") || existing.keyResults[idx].status,
+                  owner: kr.owner ?? existing.keyResults[idx].owner,
+                };
+              } else {
+                existing.keyResults.push({
+                  text: kr.text,
+                  status: (kr.status as "todo" | "doing" | "done") || "todo",
+                  owner: kr.owner,
+                });
+              }
+            }
+          }
+          await this.projects.saveGoals(caller.projectId, existing as EnterpriseGoals);
+          return "Enterprise goals updated. All agents will see the updated workboard.";
+        }
+
+        // ── File Operations (workspace tools) ──────────────────
+        case "read_file": {
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
           const { filePath, offset, limit } = input;
           if (!filePath) return "Error: read_file requires filePath.";
-          return await this.files.readFile(project.workspacePath, filePath, offset, limit);
+          return await this.files.readFile(wp, filePath, offset, limit);
         }
 
         case "write_file": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
           const { filePath, content, append } = input;
           if (!filePath || content === undefined) return "Error: write_file requires filePath and content.";
-          return await this.files.writeFile(project.workspacePath, filePath, content, append);
+          return await this.files.writeFile(wp, filePath, content, append);
         }
 
         case "edit_file": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
           const { filePath, oldText, newText } = input;
           if (!filePath) return "Error: edit_file requires filePath.";
-          return await this.files.editFile(project.workspacePath, filePath, oldText || "", newText || "");
+          return await this.files.editFile(wp, filePath, oldText || "", newText || "");
         }
 
         case "list_files": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
           const { dirPath, recursive } = input;
-          return await this.files.listFiles(project.workspacePath, dirPath, recursive);
+          return await this.files.listFiles(wp, dirPath, recursive);
         }
 
         case "search_files": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
           const { pattern, searchPath, include } = input;
           if (!pattern) return "Error: search_files requires pattern.";
-          return await this.files.searchFiles(project.workspacePath, pattern, searchPath, include);
+          return await this.files.searchFiles(wp, pattern, searchPath, include);
         }
 
         case "delete_file": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
           const { filePath } = input;
           if (!filePath) return "Error: delete_file requires filePath.";
-          return await this.files.deleteFile(project.workspacePath, filePath);
+          return await this.files.deleteFile(wp, filePath);
         }
 
         // ── Bash Shell Execution (Effect-based, ported from OpenCode) ─
         case "bash": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
           try {
             const result = await Effect.runPromise(
-              runBashCommand(project.workspacePath, input).pipe(
+              runBashCommand(wp, input).pipe(
                 Effect.catchAll((err) => Effect.succeed(`Error: ${err.message}`)),
               ),
             );
@@ -987,14 +923,10 @@ export class ToolExecutor {
 
         // ── Shell Command Execution ─────────────────────────────
         case "run_command": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
-          const { command, cwd, timeout } = input;
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const { command, cwd, timeout } = input;
           if (!command) return "Error: run_command requires a command.";
           try {
-            const result = await this.shell.runCommand(project.workspacePath, {
+            const result = await this.shell.runCommand(wp, {
               command,
               cwd: cwd || undefined,
               timeout: timeout ? parseInt(String(timeout), 10) : undefined,
@@ -1007,14 +939,10 @@ export class ToolExecutor {
 
         // ── Glob (file pattern matching) ────────────────────────
         case "glob": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
-          const { pattern, cwd, limit } = input;
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const { pattern, cwd, limit } = input;
           if (!pattern) return "Error: glob requires a pattern.";
           return await this.files.globFiles(
-            project.workspacePath,
+            wp,
             pattern,
             cwd || undefined,
             limit ? parseInt(String(limit), 10) : undefined,
@@ -1023,12 +951,8 @@ export class ToolExecutor {
 
         // ── Grep (regex file search, Effect-based) ──────────────
         case "grep": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured.";
-          try {
-            return await Effect.runPromise(executeGrep(project.workspacePath, input).pipe(
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          try {
+            return await Effect.runPromise(executeGrep(wp, input).pipe(
               Effect.catchAll((err) => Effect.succeed(`Error: ${err.message}`)),
             ));
           } catch (err: any) {
@@ -1038,12 +962,8 @@ export class ToolExecutor {
 
         // ── Apply Patch (structured file editing) ─────────────
         case "apply_patch": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured.";
-          try {
-            return await Effect.runPromise(executeApplyPatch(project.workspacePath, input).pipe(
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          try {
+            return await Effect.runPromise(executeApplyPatch(wp, input).pipe(
               Effect.catchAll((err) => Effect.succeed(`Error: ${err.message}`)),
             ));
           } catch (err: any) {
@@ -1148,14 +1068,10 @@ export class ToolExecutor {
 
         // ── Move / Rename File ──────────────────────────────────
         case "move_file": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
-          const { source, destination, overwrite } = input;
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const { source, destination, overwrite } = input;
           if (!source || !destination) return "Error: move_file requires source and destination.";
           return await this.files.moveFile(
-            project.workspacePath,
+            wp,
             source,
             destination,
             overwrite === true,
@@ -1164,24 +1080,16 @@ export class ToolExecutor {
 
         // ── Create Directory ────────────────────────────────────
         case "create_directory": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
-          const { path: dirPath } = input;
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const { path: dirPath } = input;
           if (!dirPath) return "Error: create_directory requires a path.";
-          return await this.files.createDirectory(project.workspacePath, dirPath);
+          return await this.files.createDirectory(wp, dirPath);
         }
 
         // ── Delete Directory ────────────────────────────────────
         case "delete_directory": {
-          const caller = await this.org.getAgent(agentId);
-          if (!caller?.projectId) return "Error: Could not determine your project.";
-          const project = await this.projects.getProject(caller.projectId);
-          if (!project?.workspacePath) return "Error: This project has no workspace configured. Ask the user to set a workspace path first.";
-          const { path: dirPath } = input;
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const { path: dirPath } = input;
           if (!dirPath) return "Error: delete_directory requires a path.";
-          return await this.files.deleteDirectory(project.workspacePath, dirPath);
+          return await this.files.deleteDirectory(wp, dirPath);
         }
 
         // ── Binding: Skills & MCP ──────────────────────────────
@@ -1414,6 +1322,204 @@ export class ToolExecutor {
           return "Alarm set (id: " + alarmId.slice(0, 8) + "). Recipient: " + toName + ". Fires at project time " + fireLabel + ". Purpose: " + purpose;
         }
 
+        // ── Review Tools ──────────────────────────────────────
+        // Called by the Reviewer agent. Each tool reads code,
+        // sends it to an LLM for analysis, and returns only results.
+        // The Reviewer agent does NOT see raw code in its context.
+
+        case "run_code_review": {
+          if (!this.reviewLLM) return "Error: Review LLM not configured.";
+          const { filePaths, files } = input;
+          const resolvedFiles = resolveFileList(filePaths, files);
+          if (resolvedFiles.length === 0) return "Error: run_code_review requires filePaths (array) or files (comma-separated).";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const result = await runCodeReview(wp, resolvedFiles, this.reviewLLM);
+          return formatReviewResult("Code Review", result);
+        }
+
+        case "run_security_audit": {
+          if (!this.reviewLLM) return "Error: Review LLM not configured.";
+          const { filePaths, files } = input;
+          const resolvedFiles = resolveFileList(filePaths, files);
+          if (resolvedFiles.length === 0) return "Error: run_security_audit requires filePaths (array) or files (comma-separated).";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const result = await runSecurityAudit(wp, resolvedFiles, this.reviewLLM);
+          return formatReviewResult("Security Audit", result);
+        }
+
+        case "run_tests": {
+          if (!this.reviewLLM) return "Error: Review LLM not configured.";
+          const { filePaths, files, testFiles: inputTestFiles } = input;
+          const resolvedFiles = resolveFileList(filePaths, files);
+          const resolvedTestFiles = resolveFileList(inputTestFiles, input.testFiles);
+          if (resolvedFiles.length === 0) return "Error: run_tests requires filePaths (source files).";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const result = await runTestReview(wp, resolvedFiles, resolvedTestFiles, this.reviewLLM);
+          return formatReviewResult("Test Review", result);
+        }
+
+        case "run_perf_audit": {
+          if (!this.reviewLLM) return "Error: Review LLM not configured.";
+          const { filePaths, files } = input;
+          const resolvedFiles = resolveFileList(filePaths, files);
+          if (resolvedFiles.length === 0) return "Error: run_perf_audit requires filePaths (array) or files (comma-separated).";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const result = await runPerfAudit(wp, resolvedFiles, this.reviewLLM);
+          return formatReviewResult("Performance Audit", result);
+        }
+
+        case "run_full_review": {
+          if (!this.reviewLLM) return "Error: Review LLM not configured.";
+          const { filePaths, files, testFiles: inputTestFiles } = input;
+          const resolvedFiles = resolveFileList(filePaths, files);
+          const resolvedTestFiles = resolveFileList(inputTestFiles, input.testFiles);
+          if (resolvedFiles.length === 0) return "Error: run_full_review requires filePaths.";
+          let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const combined = await runFullReview(wp, resolvedFiles, resolvedTestFiles, this.reviewLLM);
+          const sections = [
+            formatReviewResult("1. Code Review", combined.codeReview),
+            formatReviewResult("2. Security Audit", combined.securityAudit),
+            formatReviewResult("3. Test Review", combined.testReview),
+            formatReviewResult("4. Performance Audit", combined.perfAudit),
+            `## Overall\n- Score: **${combined.overallScore}/100**\n- Verdict: ${combined.overallPassed ? "✅ PASS" : "❌ FAIL"}`,
+          ];
+          return sections.join("\n\n---\n\n");
+        }
+
+        // ── Git Worktree tools (coordinator only) ─────────────
+        // Managers/CEO use these to give subordinates isolated workspaces.
+
+        case "git_worktree_create": {
+          const coordCheck = await assertCoordinator(this.org, agentId);
+          if (!coordCheck.ok) return coordCheck.error;
+          const { subordinateId, taskName, baseBranch } = input;
+          if (!subordinateId || !taskName) return "Error: git_worktree_create requires subordinateId and taskName.";
+          const sub = await this.org.resolveAgent(String(subordinateId).trim());
+          if (!sub) return `Error: No agent found with ID "${subordinateId}".`;
+          let wp: string; try { wp = await this.resolveMainWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
+          const git = new GitWorktreeService(wp);
+          const shortId = sub.shortId || sub.id.slice(0, 8);
+          try {
+            const { path, branch } = await git.createWorktree(shortId, String(taskName), baseBranch || undefined);
+            return `Worktree created for **${sub.name}** (${shortId}).\n- Branch: \`${branch}\`\n- Path: \`${path}\`\n\nTheir file operations (bash, write_file, edit_file) will operate in this isolated workspace. Use \`git_worktree_checkpoint\` to snapshot progress.`;
+          } catch (err: any) {
+            return `Error: ${err.message}`;
+          }
+        }
+
+        case "git_worktree_checkpoint": {
+          const coordCheck = await assertCoordinator(this.org, agentId);
+          if (!coordCheck.ok) return coordCheck.error;
+          const { subordinateId, message } = input;
+          if (!subordinateId) return "Error: git_worktree_checkpoint requires subordinateId.";
+          const sub = await this.org.resolveAgent(String(subordinateId).trim());
+          if (!sub) return `Error: No agent found with ID "${subordinateId}".`;
+          let wp: string; try { wp = await this.resolveMainWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
+          const git = new GitWorktreeService(wp);
+          const shortId = sub.shortId || sub.id.slice(0, 8);
+          try {
+            const result = await git.checkpoint(shortId, String(message || "manual checkpoint"));
+            if (result.count === 0) {
+              return `No changes to checkpoint for **${sub.name}** (${shortId}). HEAD: \`${result.hash}\``;
+            }
+            return `Checkpoint created for **${sub.name}** (${shortId}).\n- Commit: \`${result.hash}\`\n- Total checkpoints (7d): ${result.count}`;
+          } catch (err: any) {
+            return `Error: ${err.message}`;
+          }
+        }
+
+        case "git_worktree_merge": {
+          const coordCheck = await assertCoordinator(this.org, agentId);
+          if (!coordCheck.ok) return coordCheck.error;
+          const { subordinateId, taskName, baseBranch } = input;
+          if (!subordinateId || !taskName) return "Error: git_worktree_merge requires subordinateId and taskName.";
+          const sub = await this.org.resolveAgent(String(subordinateId).trim());
+          if (!sub) return `Error: No agent found with ID "${subordinateId}".`;
+          let wp: string; try { wp = await this.resolveMainWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
+          const git = new GitWorktreeService(wp);
+          const shortId = sub.shortId || sub.id.slice(0, 8);
+          try {
+            const { merged, hash } = await git.merge(shortId, String(taskName), baseBranch || undefined);
+            return `Worktree merged for **${sub.name}** (${shortId}).\n- Merged into main at \`${hash}\`\n- Worktree removed, branch deleted.\n\nThe subordinate's work is now integrated into the main workspace.`;
+          } catch (err: any) {
+            return `Merge failed: ${err.message}`;
+          }
+        }
+
+        case "git_worktree_rollback": {
+          const coordCheck = await assertCoordinator(this.org, agentId);
+          if (!coordCheck.ok) return coordCheck.error;
+          const { subordinateId, commitHash } = input;
+          if (!subordinateId) return "Error: git_worktree_rollback requires subordinateId.";
+          const sub = await this.org.resolveAgent(String(subordinateId).trim());
+          if (!sub) return `Error: No agent found with ID "${subordinateId}".`;
+          let wp: string; try { wp = await this.resolveMainWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
+          const git = new GitWorktreeService(wp);
+          const shortId = sub.shortId || sub.id.slice(0, 8);
+          try {
+            const { hash, message } = await git.rollback(shortId, commitHash || undefined);
+            return `Rollback complete for **${sub.name}** (${shortId}).\n- HEAD now at \`${hash}\`\n- Message: "${message}"\n\nThe subordinate can now rework from this checkpoint.`;
+          } catch (err: any) {
+            return `Rollback failed: ${err.message}`;
+          }
+        }
+
+        case "git_worktree_remove": {
+          const coordCheck = await assertCoordinator(this.org, agentId);
+          if (!coordCheck.ok) return coordCheck.error;
+          const { subordinateId, taskName } = input;
+          if (!subordinateId) return "Error: git_worktree_remove requires subordinateId.";
+          const sub = await this.org.resolveAgent(String(subordinateId).trim());
+          if (!sub) return `Error: No agent found with ID "${subordinateId}".`;
+          let wp: string; try { wp = await this.resolveMainWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
+          const git = new GitWorktreeService(wp);
+          const shortId = sub.shortId || sub.id.slice(0, 8);
+          try {
+            await git.removeWorktree(shortId, taskName || undefined);
+            return `Worktree removed for **${sub.name}** (${shortId}). Branch deleted.`;
+          } catch (err: any) {
+            return `Error: ${err.message}`;
+          }
+        }
+
+        case "git_worktree_list": {
+          let wp: string; try { wp = await this.resolveMainWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
+          const git = new GitWorktreeService(wp);
+          try {
+            const entries = await git.listWorktrees();
+            if (entries.length === 0) return "No HiveWeave-managed worktrees in this project.";
+            const lines = entries.map((e) => {
+              const status = e.active ? "🟢" : "🔴";
+              return `${status} **${e.shortId}** — \`${e.branch}\` @ \`${e.head}\``;
+            });
+            return `## Worktrees (${entries.length})\n${lines.join("\n")}`;
+          } catch (err: any) {
+            return `Error: ${err.message}`;
+          }
+        }
+
+        case "git_worktree_status": {
+          const { subordinateId } = input;
+          if (!subordinateId) return "Error: git_worktree_status requires subordinateId.";
+          const sub = await this.org.resolveAgent(String(subordinateId).trim());
+          if (!sub) return `Error: No agent found with ID "${subordinateId}".`;
+          let wp: string; try { wp = await this.resolveMainWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
+          const git = new GitWorktreeService(wp);
+          const shortId = sub.shortId || sub.id.slice(0, 8);
+          try {
+            const status = await git.getStatus(shortId);
+            if (!status) return `No worktree found for **${sub.name}** (${shortId}). Use \`git_worktree_create\` to allocate one.`;
+            const dirty = status.hasUncommitted ? " ⚠️ (uncommitted changes)" : "";
+            const cpLines = status.checkpoints.length > 0
+              ? status.checkpoints.map((c) => `  - \`${c.hash}\` ${c.date ? `[${c.date}] ` : ""}${c.message}`).join("\n")
+              : "  (no checkpoints yet)";
+            return [
+              `## Worktree Status — **${sub.name}** (${shortId})`,
+              `- Branch: \`${status.branch}\` @ \`${status.head}\`${dirty}`,
+              `- Active: ${status.active ? "✅" : "❌"}`,
+              `### Checkpoints`,
+              cpLines,
+            ].join("\n");
+          } catch (err: any) {
+            return `Error: ${err.message}`;
+          }
+        }
+
         default:
           return `Unknown tool: ${name}`;
       }
@@ -1422,6 +1528,37 @@ export class ToolExecutor {
       console.error(`[TOOL] ${name} failed:`, err);
       return `Tool ${name} failed: ${msg}`;
     }
+  }
+
+  /**
+   * Resolve the effective workspace path for an agent.
+   * If the agent has a git worktree, operations route there instead of main.
+   * Returns the path directly, or throws with a user-facing error string.
+   */
+  private async resolveWorkspace(agentId: string): Promise<string> {
+    const caller = await this.org.getAgent(agentId);
+    if (!caller?.projectId) throw "Could not determine your project.";
+    const project = await this.projects.getProject(caller.projectId);
+    if (!project?.workspacePath) throw "No workspace configured for this project. Ask the user to set a workspace path first.";
+    const shortId = caller.shortId || caller.id.slice(0, 8);
+    const wtPath = `${project.workspacePath}/.hiveweave/worktrees/${shortId}`;
+    if (existsSync(wtPath)) return wtPath;
+    return project.workspacePath;
+  }
+
+  /** Shorthand: resolveWorkspace wrapped in try/catch, returning error string on failure. */
+  private async workspaceOrError(agentId: string): Promise<string | null> {
+    try { return await this.resolveWorkspace(agentId); }
+    catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
+  }
+
+  /** Always resolve the MAIN workspace (skips worktree lookup — for git management operations). */
+  private async resolveMainWorkspace(agentId: string): Promise<string> {
+    const caller = await this.org.getAgent(agentId);
+    if (!caller?.projectId) throw "Could not determine your project.";
+    const project = await this.projects.getProject(caller.projectId);
+    if (!project?.workspacePath) throw "No workspace configured for this project.";
+    return project.workspacePath;
   }
 
   /**
@@ -1449,4 +1586,50 @@ export class ToolExecutor {
 
     return `Error: You are not authorized to modify bindings for this agent. Only the agent itself, its direct superior, or HR can manage bindings.`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Review tool helpers (used by ToolExecutor review cases)
+// ---------------------------------------------------------------------------
+
+/** Check that the caller has coordinator permission (CEO/HR/manager). */
+async function assertCoordinator(
+  org: OrgService,
+  agentId: string,
+): Promise<{ ok: true; caller: any } | { ok: false; error: string }> {
+  const caller = await org.getAgent(agentId);
+  if (!caller) return { ok: false, error: "Error: Could not find your own agent record." };
+  if (caller.permissionType === "coordinator") return { ok: true, caller };
+  const role = String(caller.role || "").toLowerCase();
+  if (role === "ceo" || role === "hr") return { ok: true, caller };
+  return { ok: false, error: "Error: Git worktree tools require coordinator permission. Your role does not have this authority." };
+}
+
+/** Resolve filePaths from either an array or a comma-separated string. */
+function resolveFileList(arrayInput: unknown, stringInput: unknown): string[] {
+  if (Array.isArray(arrayInput)) return arrayInput.map((s) => String(s).trim()).filter(Boolean);
+  if (typeof stringInput === "string") return stringInput.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
+}
+
+/** Format a ReviewResult into a readable markdown report string. */
+function formatReviewResult(label: string, result: ReviewResult): string {
+  const lines: string[] = [];
+  const verdict = result.passed ? "✅ PASS" : "❌ FAIL";
+  const score = result.score !== undefined ? ` | Score: **${result.score}/100**` : "";
+  lines.push(`## ${label}\n**${verdict}**${score}\n`);
+  lines.push(result.summary);
+
+  if (result.issues.length > 0) {
+    lines.push(`\n### Issues (${result.issues.length})`);
+    for (const issue of result.issues) {
+      const icon = issue.severity === "critical" ? "🔴" : issue.severity === "major" ? "🟠" : issue.severity === "minor" ? "🟡" : "ℹ️";
+      const location = issue.file ? `\`${issue.file}${issue.line ? `:${issue.line}` : ""}\`` : "";
+      lines.push(`\n${icon} **${issue.title}** [${issue.severity}] ${location}`);
+      lines.push(`  ${issue.description}`);
+      if (issue.suggestion) lines.push(`  → ${issue.suggestion}`);
+    }
+  }
+
+  return lines.join("\n");
 }

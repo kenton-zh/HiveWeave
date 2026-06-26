@@ -7,10 +7,12 @@ import AddAgentDialog from "./components/AddAgentDialog";
 import FolderPicker from "./components/FolderPicker";
 import OfficeView from "./components/OfficeView";
 import ModelSettings from "./components/ModelSettings";
+import GoalsPanel from "./components/GoalsPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import QuestionDialog from "./components/QuestionDialog";
+import NewProjectDialog from "./components/NewProjectDialog";
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime } from "./api";
+import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings } from "./api";
 
 interface Project {
   id: string;
@@ -49,6 +51,8 @@ function App() {
   const [showProjectMenu, setShowProjectMenu] = useState(false);
   const [showFolderPicker, setShowFolderPicker] = useState(false);
   const [showModelSettings, setShowModelSettings] = useState(false);
+  const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
+  const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
 
@@ -99,6 +103,15 @@ function App() {
     getPausedState().then((s) => setPaused(s.paused)).catch(() => {});
   }, []);
 
+  // Load operator name from global settings (overrides localStorage)
+  useEffect(() => {
+    getSettings().then((settings) => {
+      if (settings.operatorName) {
+        setUserName(settings.operatorName);
+      }
+    }).catch(() => {});
+  }, []);
+
   const handlePause = async () => {
     if (paused) {
       await resumeSystem();
@@ -138,7 +151,7 @@ function App() {
 
     const name = folderPath.split(/[\\/]/).filter(Boolean).pop() || "New Project";
     try {
-      const { id } = await createProject(name, folderPath);
+      const { id, mainAgentId } = await createProject(name, folderPath);
       const updated = await getProjects();
       setProjects(updated);
       setSelectedProjectId(id);
@@ -146,6 +159,11 @@ function App() {
       clearChatSessions();
       refreshOrgTree();
       setShowProjectMenu(false);
+      // Show the new-project onboarding dialog
+      if (mainAgentId) {
+        setNewProjectCEO(mainAgentId);
+        setShowNewProjectDialog(true);
+      }
     } catch (err) {
       console.error("Failed to create project:", err);
     }
@@ -169,6 +187,7 @@ function App() {
       setShowProjectMenu(false);
     } catch (err) {
       console.error("Failed to delete project:", err);
+      alert(`删除项目失败: ${err instanceof Error ? err.message : "未知错误"}`);
     }
   };
 
@@ -180,7 +199,12 @@ function App() {
 
   const saveName = () => {
     const trimmed = nameDraft.trim();
-    if (trimmed) setUserName(trimmed);
+    if (trimmed) {
+      setUserName(trimmed);
+      updateSettings({ operatorName: trimmed }).catch((err) => {
+        console.warn("Failed to sync operator name to backend:", err);
+      });
+    }
     setEditingName(false);
   };
 
@@ -229,6 +253,7 @@ function App() {
                     {p.name}
                   </span>
                   <button
+                    type="button"
                     onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
                     className="ml-2 text-gray-500 hover:text-red-400 transition-colors"
                     title="删除项目"
@@ -306,8 +331,8 @@ function App() {
 
       {/* Main Content */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left Panel - Org Tree / Office (40%) */}
-        <div className="w-2/5 border-r border-surface-border flex flex-col">
+        {/* Left Panel - Org Tree / Office */}
+        <div className="flex-1 border-r border-surface-border flex flex-col">
           <div className="px-4 py-3 border-b border-surface-border bg-surface-card flex items-center gap-3">
             {/* View tabs */}
             <div className="flex gap-1 bg-surface rounded-md p-0.5">
@@ -350,11 +375,21 @@ function App() {
           </div>
         </div>
 
-        {/* Right Panel - Chat / Agent / Logs (60%) */}
-        <div className="w-3/5 flex flex-col">
+        {/* Right Panel - Chat / Agent / Logs */}
+        <div className="w-2/5 flex flex-col">
           {/* Tab bar */}
           <div className="px-4 py-2 border-b border-surface-border bg-surface-card flex items-center gap-1">
-            {selectedAgentId ? (
+            <button
+              onClick={() => setRightPanelTab("goals")}
+              className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                rightPanelTab === "goals"
+                  ? "bg-accent/20 text-accent"
+                  : "text-gray-400 hover:text-gray-200"
+              }`}
+            >
+              Goals
+            </button>
+            {selectedAgentId && (
               <>
                 <button
                   onClick={() => setRightPanelTab("chat")}
@@ -387,14 +422,20 @@ function App() {
                   Logs
                 </button>
               </>
-            ) : (
-              <span className="text-xs text-gray-500">选择一个 Agent 开始对话</span>
             )}
           </div>
 
           {/* Tab content */}
           <div className="flex-1 overflow-hidden">
-            {!selectedAgentId ? (
+            {rightPanelTab === "goals" ? (
+              selectedProjectId ? (
+                <GoalsPanel projectId={selectedProjectId} />
+              ) : (
+                <div className="h-full flex items-center justify-center text-gray-500 text-sm">
+                  请先选择一个项目
+                </div>
+              )
+            ) : !selectedAgentId ? (
               <div className="h-full flex items-center justify-center text-gray-500 text-sm">
                 <div className="text-center">
                   <div className="w-16 h-16 rounded-full bg-surface-card border border-surface-border flex items-center justify-center mx-auto mb-4">
@@ -447,6 +488,15 @@ function App() {
 
       {/* Question Dialog — global, polled */}
       <QuestionDialog />
+      {showNewProjectDialog && newProjectCEO && (
+        <NewProjectDialog
+          ceoAgentId={newProjectCEO}
+          onClose={() => {
+            setShowNewProjectDialog(false);
+            setNewProjectCEO(null);
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -47,6 +47,31 @@ export async function updateWorkspacePath(projectId: string, workspacePath: stri
   });
 }
 
+export interface KeyResult {
+  text: string;
+  status: "todo" | "doing" | "done";
+  owner?: string;
+}
+
+export interface GoalsData {
+  objective: string;
+  focus: string;
+  keyResults: KeyResult[];
+  updatedAt?: number;
+}
+
+export async function getProjectGoals(projectId: string): Promise<{ goals: GoalsData | null }> {
+  return fetchJSON(`${BASE}/projects/${projectId}/goals`);
+}
+
+export async function updateProjectGoals(projectId: string, goals: Partial<GoalsData>): Promise<{ ok: boolean; goals: GoalsData }> {
+  return fetchJSON(`${BASE}/projects/${projectId}/goals`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(goals),
+  });
+}
+
 export async function getAgent(id: string) {
   return fetchJSON(`${BASE}/org/agents/${id}`);
 }
@@ -132,6 +157,22 @@ export function subscribeAgentStatus(
 ): AbortController {
   const controller = new AbortController();
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Server sends keepalive every 30s — if nothing arrives in 45s, connection is dead. */
+  const HEARTBEAT_TIMEOUT_MS = 45_000;
+
+  function resetHeartbeat(reader: ReadableStreamDefaultReader<Uint8Array>) {
+    if (heartbeatTimer) clearTimeout(heartbeatTimer);
+    heartbeatTimer = setTimeout(() => {
+      // Heartbeat timeout — connection is dead, force close and reconnect
+      try { reader.cancel(); } catch { /* ignore */ }
+    }, HEARTBEAT_TIMEOUT_MS);
+  }
+
+  function cleanup() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; }
+  }
 
   function connect() {
     if (controller.signal.aborted) return;
@@ -145,9 +186,16 @@ export function subscribeAgentStatus(
         const decoder = new TextDecoder();
         let buffer = "";
 
+        // Start heartbeat timer
+        resetHeartbeat(reader);
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+
+          // Reset heartbeat on every data chunk (includes keepalive comments)
+          resetHeartbeat(reader);
+
           buffer += decoder.decode(value, { stream: true });
 
           const parts = buffer.split("\n\n");
@@ -175,15 +223,19 @@ export function subscribeAgentStatus(
           }
         }
 
-        // Stream ended — reconnect after 3s (server may have restarted)
+        // Stream ended — clear stale state and reconnect after 3s
+        cleanup();
         if (!controller.signal.aborted) {
+          onSnapshot([], false); // Clear stale processing state immediately
           reconnectTimer = setTimeout(connect, 3000);
         }
       })
       .catch((err) => {
+        cleanup();
         if (err.name === "AbortError") return;
-        // Reconnect after 3 seconds
+        // Connection failed — clear stale state and reconnect after 3s
         if (!controller.signal.aborted) {
+          onSnapshot([], false); // Clear stale processing state immediately
           reconnectTimer = setTimeout(connect, 3000);
         }
       });
@@ -191,10 +243,10 @@ export function subscribeAgentStatus(
 
   connect();
 
-  // Wrap abort to also clear reconnect timer
+  // Wrap abort to also clean up timers
   const origAbort = controller.abort.bind(controller);
   controller.abort = ((...args: any[]) => {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
+    cleanup();
     origAbort(...args);
   }) as typeof controller.abort;
 
@@ -433,4 +485,18 @@ export async function getTemplateDivisions(): Promise<Array<{ division: string; 
 
 export async function getTemplate(id: string): Promise<AgentTemplate> {
   return fetchJSON(`${BASE}/templates/${id}`);
+}
+
+// --- Global Settings ---
+
+export async function getSettings(): Promise<Record<string, string>> {
+  return fetchJSON(`${BASE}/settings`);
+}
+
+export async function updateSettings(settings: Record<string, string>): Promise<{ ok: boolean }> {
+  return fetchJSON(`${BASE}/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
 }

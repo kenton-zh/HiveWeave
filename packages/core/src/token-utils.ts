@@ -5,12 +5,15 @@
  * budget from the model's context window size. This module provides:
  *
  *   1. `estimateTokens(text)` — cheap char-ratio approximation (~4 chars/token).
- *   2. `MODEL_CONFIGS` — per-model context window and reserved output tokens.
- *   3. `calculateHistoryBudget()` — subtracts static portions from the total
+ *   2. `calculateHistoryBudget()` — subtracts static portions from the total
  *      window to yield the token budget available for conversation history.
+ *   3. `calculateUsableContext()` — determines usable context after reserving
+ *      space for model output (aligned with OpenCode's overflow detection).
  *
  * The estimation is intentionally conservative (over-estimates by ~10-15%)
  * so we never accidentally exceed the model's hard limit.
+ *
+ * Aligned with OpenCode's overflow.ts and compaction.ts patterns.
  */
 
 // ---------------------------------------------------------------------------
@@ -46,8 +49,70 @@ export function estimateTokens(text: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// Budget calculation
+// Budget & overflow calculation (aligned with OpenCode)
 // ---------------------------------------------------------------------------
+
+/** Hard cap on max output tokens (aligned with OpenCode's ProviderTransform.OUTPUT_TOKEN_MAX). */
+export const OUTPUT_TOKEN_MAX = 32_000;
+/** Buffer reserved for model output + safety margin (aligned with OpenCode). */
+export const COMPACTION_BUFFER = 20_000;
+
+/** Min/max tokens to preserve for recent messages during compaction. */
+export const PRESERVE_RECENT_MIN = 2_000;
+export const PRESERVE_RECENT_MAX = 8_000;
+
+/** Default tail turns to keep during compaction. */
+export const DEFAULT_TAIL_TURNS = 2;
+
+/**
+ * Calculate the usable context window for determining when compaction is needed.
+ *
+ * Aligned with OpenCode's `usable()` in overflow.ts:
+ *   - If model has `limitInput`, use that minus reserved
+ *   - Otherwise, use context window minus maxOutput
+ *   - Reserved = min(COMPACTION_BUFFER, maxOutput)
+ *
+ * @param contextWindow  - Total context window in tokens.
+ * @param maxOutput      - Max output tokens for the model.
+ * @param limitInput     - Optional explicit input token limit from the model.
+ * @returns Usable token budget before compaction is needed.
+ */
+export function calculateUsableContext(
+  contextWindow: number,
+  modelLimitOutput: number,
+  limitInput?: number,
+): number {
+  if (contextWindow === 0) return 0;
+  // Cap max output to OUTPUT_TOKEN_MAX (aligned with OpenCode's ProviderTransform.maxOutputTokens)
+  const maxOut = Math.min(modelLimitOutput, OUTPUT_TOKEN_MAX) || OUTPUT_TOKEN_MAX;
+  const reserved = Math.min(COMPACTION_BUFFER, maxOut);
+  if (limitInput !== undefined) {
+    return Math.max(0, limitInput - reserved);
+  }
+  return Math.max(0, contextWindow - maxOut);
+}
+
+/**
+ * Calculate the token budget to preserve for recent messages during compaction.
+ *
+ * Aligned with OpenCode's `preserveRecentBudget()`:
+ *   - Uses explicit value if provided
+ *   - Falls back to 25% of usable context, clamped to [2K, 8K]
+ *
+ * @param usableContext  - Usable context from calculateUsableContext().
+ * @param explicitValue  - Optional explicit preserve value.
+ * @returns Token budget for recent messages.
+ */
+export function calculatePreserveRecentBudget(
+  usableContext: number,
+  explicitValue?: number,
+): number {
+  if (explicitValue !== undefined) return explicitValue;
+  return Math.max(
+    PRESERVE_RECENT_MIN,
+    Math.min(PRESERVE_RECENT_MAX, Math.floor(usableContext * 0.25)),
+  );
+}
 
 /**
  * Calculate the token budget available for conversation history.
@@ -63,6 +128,8 @@ export function estimateTokens(text: string): number {
  *   ├──────────────────────────────────────────────────────────┤
  *   │ reserved for model output                                │
  *   └──────────────────────────────────────────────────────────┘
+ *
+ * Uses the OpenCode-aligned usable context calculation internally.
  *
  * @param contextWindow  - Total context window in tokens (from model registry).
  * @param reservedOutput - Tokens reserved for model output (from model registry).
@@ -83,7 +150,9 @@ export function calculateHistoryBudget(
     estimateTokens(contextPrompt) +
     estimateTokens(currentMessage);
 
-  const budget = contextWindow - reservedOutput - staticTokens;
+  // Use the OpenCode-aligned usable context
+  const usable = calculateUsableContext(contextWindow, reservedOutput);
+  const budget = usable - staticTokens;
   // Floor at 4096 — even a tiny budget should allow a few recent turns
   return Math.max(budget, 4096);
 }
@@ -132,50 +201,59 @@ export function computePrefixHash(
  *
  * Inspired by CodeWhale's compact.md template (Tier 9 Precedent).
  */
-export function buildCompactionPrompt(oldTranscript: string): string {
-  return `You are a conversation summarizer. Below is an older portion of a conversation between an AI agent and its collaborators. This portion is being compacted to save context window space.
+export function buildCompactionPrompt(oldTranscript: string, previousSummary?: string): string {
+  return [
+    previousSummary
+      ? `Update the anchored summary below using the conversation history above.\nPreserve still-true details, remove stale details, and merge in the new facts.\n<previous-summary>\n${previousSummary}\n</previous-summary>`
+      : "Create a new anchored summary from the conversation history.",
+    `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
+<template>
+## Goal
+- [single-sentence task summary]
 
-Generate a structured summary that preserves all information needed to continue the conversation effectively. Focus on:
-- What was being worked on (goals, tasks)
-- What has been completed vs. in-progress vs. blocked
-- Key decisions made and WHY (not just what)
-- Important facts, constraints, or context discovered
-- The specific next step to take when resuming
+## Constraints & Preferences
+- [user constraints, preferences, specs, or "(none)"]
 
-Output ONLY the structured summary below — no preamble, no meta-commentary.
+## Progress
+### Done
+- [completed work or "(none)"]
 
-## Conversation Summary (Compacted History)
+### In Progress
+- [current work or "(none)"]
 
-### Goal
-[The high-level objective being worked on]
+### Blocked
+- [blockers or "(none)"]
 
-### Progress
-- **Done**: [Completed items with brief results]
-- **In Progress**: [Items mid-flight with current state]
-- **Blocked**: [Items stuck and why]
+## Key Decisions
+- [decision and why, or "(none)"]
 
-### Key Decisions
-[Architectural choices, design decisions, trade-offs — the WHY]
+## Next Steps
+- [ordered next actions or "(none)"]
 
-### Important Context
-[Facts, constraints, or discoveries that affect future work]
+## Critical Context
+- [important technical facts, errors, open questions, or "(none)"]
 
-### Next Step
-[The single concrete next action to take when resuming]
+## Relevant Files
+- [file or directory path: why it matters, or "(none)"]
+</template>
 
----
-
-Here is the conversation to summarize:
-
-${oldTranscript}`;
+Rules:
+- Keep every section, even when empty.
+- Use terse bullets, not prose paragraphs.
+- Preserve exact file paths, commands, error strings, and identifiers when known.
+- Do not mention the summary process or that context was compacted.`,
+    oldTranscript,
+  ].join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
 // Tool output truncation — keep context compact
 // ---------------------------------------------------------------------------
 
-/** Max chars for a single tool result in stored history. */
+/** Max chars for a single tool result in stored history (normal turns). */
 export const TOOL_OUTPUT_MAX_CHARS = 6_000;
+/** Max chars for a single tool result during compaction transcript building. */
+export const TOOL_OUTPUT_MAX_CHARS_COMPACTION = 2_000;
 /** Threshold above which we use head+tail truncation. */
 export const TOOL_OUTPUT_TRUNCATE_THRESHOLD = 4_000;
 

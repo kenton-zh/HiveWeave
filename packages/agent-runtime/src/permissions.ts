@@ -57,7 +57,7 @@ const COORDINATOR_TOOLS: ChatCompletionTool[] = [
       parameters: {
         type: "object",
         properties: {
-          subordinateId: { type: "string", description: "Subordinate agent UUID." },
+          subordinateId: { type: "string", description: "Subordinate agent UUID or short ID from list_subordinates." },
           limit: { type: "string", description: "Max entries to return (default 10)." },
         },
         required: ["subordinateId"],
@@ -72,7 +72,7 @@ const COORDINATOR_TOOLS: ChatCompletionTool[] = [
       parameters: {
         type: "object",
         properties: {
-          subordinateId: { type: "string", description: "Subordinate agent UUID." },
+          subordinateId: { type: "string", description: "Subordinate agent UUID or short ID from list_subordinates." },
           limit: { type: "string", description: "Recent log entries to review (default 5)." },
         },
         required: ["subordinateId"],
@@ -87,7 +87,7 @@ const COORDINATOR_TOOLS: ChatCompletionTool[] = [
       parameters: {
         type: "object",
         properties: {
-          subordinateId: { type: "string", description: "Subordinate agent UUID." },
+          subordinateId: { type: "string", description: "Subordinate agent UUID or short ID from list_subordinates." },
           review: { type: "string", description: "Optional quality comment." },
         },
         required: ["subordinateId"],
@@ -102,7 +102,7 @@ const COORDINATOR_TOOLS: ChatCompletionTool[] = [
       parameters: {
         type: "object",
         properties: {
-          subordinateId: { type: "string", description: "Subordinate agent UUID." },
+          subordinateId: { type: "string", description: "Subordinate agent UUID or short ID from list_subordinates." },
           feedback: { type: "string", description: "What needs to be revised." },
         },
         required: ["subordinateId", "feedback"],
@@ -127,7 +127,7 @@ const COORDINATOR_TOOLS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "hiveweave__list_subordinates",
-      description: "List direct subordinates with name, role, status, and current task.",
+      description: "List direct subordinates with their name, role, status, and current task. Address them by their name, never by ID.",
       parameters: { type: "object", properties: {}, required: [] },
     },
   },
@@ -187,11 +187,12 @@ const CORE_TOOLS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "hiveweave__message_superior",
-      description: "Send a message to your superior in the hierarchy.",
+      description: "Send a message to your superior in the hierarchy. Use priority='urgent' for time-critical issues that should interrupt their current work.",
       parameters: {
         type: "object",
         properties: {
           message: { type: "string", description: "Clear and concise message." },
+          priority: { type: "string", description: "Message priority: 'low' (batch after task), 'normal' (inject at breakpoint, default), 'urgent' (interrupt current task)." },
         },
         required: ["message"],
       },
@@ -201,12 +202,13 @@ const CORE_TOOLS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "hiveweave__send_message",
-      description: "Send a message to one or more recipients. Use \"user\" for the human operator, or agent names/IDs for colleagues. Can send to multiple recipients at once.",
+      description: "Send a message to one or more recipients. Use \"user\" for the human operator, or agent names/IDs for colleagues. Can send to multiple recipients at once. Use priority='urgent' for time-critical messages that should interrupt the recipient's current work.",
       parameters: {
         type: "object",
         properties: {
           content: { type: "string", description: "Message content." },
           recipients: { type: "string", description: 'Comma-separated list of recipients. Use "user" for the human operator, and/or agent names for colleagues. Example: "user, 后端开发工程师"\nOptions: "user" = human operator; agent names or IDs for colleagues.' },
+          priority: { type: "string", description: "Message priority: 'low' (batch after task), 'normal' (inject at breakpoint, default), 'urgent' (interrupt current task)." },
         },
         required: ["content", "recipients"],
       },
@@ -218,6 +220,20 @@ const CORE_TOOLS: ChatCompletionTool[] = [
       name: "hiveweave__read_roster",
       description: "Read the personnel roster (all active agents, positions, reporting structure).",
       parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__check_agent_status",
+      description: "Check real-time working/idle status of agents. MANDATORY: You MUST call this tool before mentioning ANY agent's current status. NEVER say an agent is 'working', 'busy', 'idle', or 'available' without calling this tool first — you cannot infer their status from context, task assignments, or messages. This is the ONLY source of truth for agent activity.",
+      parameters: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Agent name or ID to check. Omit to see all agents' status." },
+        },
+        required: [],
+      },
     },
   },
   {
@@ -379,6 +395,30 @@ const CORE_TOOLS: ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__read_goals",
+      description: "Read the enterprise goals / workboard. Shows project objectives, key results, and current focus. All agents should check this to align their work.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__update_goals",
+      description: "Update the enterprise goals / workboard. Only CEO and coordinators may update goals. Use to set objectives, key results, and current focus.",
+      parameters: {
+        type: "object",
+        properties: {
+          objective: { type: "string", description: "High-level project objective." },
+          focus: { type: "string", description: "Current focus / priority area." },
+          keyResults: { type: "array", description: "Array of {text: string, status: 'todo'|'doing'|'done', owner?: string}." },
+        },
+        required: [],
+      },
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -507,23 +547,23 @@ const HR_TOOLS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "hiveweave__create_agent",
-      description: "Create a new agent. Never set parentId to yourself (HR). Place under CEO or requesting manager.",
+      description: "Create a new agent with a CHINESE name and position. Every agent MUST have a Chinese job position (e.g. 前端工程师, 后端开发, 测试工程师) and a Chinese name (e.g. 张三, 李四). Never set parentId to yourself (HR). Place under CEO or requesting manager.",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Agent display name." },
-          role: { type: "string", description: "Agent role (hr, architect, manager, developer, qa, devops, etc.)." },
-          goal: { type: "string", description: "Core objective for this agent." },
-          backstory: { type: "string", description: "Optional persona description." },
+          name: { type: "string", description: "Chinese display name (e.g. 张三, 李四). Must contain Chinese characters." },
+          role: { type: "string", description: "Agent role (architect, manager, developer, qa, devops, etc.)." },
+          position: { type: "string", description: "Chinese job position/title (e.g. 前端工程师, 后端开发, 测试工程师, 产品经理). REQUIRED." },
+          description: { type: "string", description: "What this agent should do — responsibilities, skills focus, and project-specific context. Used to auto-generate goal." },
+          backstory: { type: "string", description: "A short personal narrative (2-4 sentences) about this individual. NOT project-related. Include: past experience, personality quirks, hobbies, age, where they worked before. Make them feel like a real character. Write in Chinese. (CRITICAL — every agent MUST have a backstory.)" },
           permissionType: { type: "string", description: "coordinator or executor. Default: executor.", enum: ["coordinator", "executor"] },
           parentId: { type: "string", description: "Parent agent UUID. Defaults to CEO if omitted." },
-          position: { type: "string", description: "Job position/title." },
           department: { type: "string", description: "Department name." },
           responsibilities: { type: "string", description: "Key responsibilities." },
           skills: { type: "string", description: "Comma-separated skill names to bind at creation." },
           mcpServers: { type: "string", description: "Comma-separated MCP server names to bind at creation." },
         },
-        required: ["name", "role", "goal"],
+        required: ["name", "role", "description", "position", "backstory"],
       },
     },
   },
@@ -582,43 +622,6 @@ const HR_TOOLS: ChatCompletionTool[] = [
       name: "hiveweave__list_all_agents",
       description: "List ALL agents with full hierarchy, roles, and status.",
       parameters: { type: "object", properties: {}, required: [] },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "hiveweave__browse_templates",
-      description: "Browse agent templates from the catalog. Filter by division or search keyword.",
-      parameters: {
-        type: "object",
-        properties: {
-          division: { type: "string", description: "Filter: engineering, design, marketing, sales, product, etc." },
-          search: { type: "string", description: "Search keyword." },
-          role: { type: "string", description: "Filter by role: developer, qa, designer, manager, etc." },
-        },
-        required: [],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "hiveweave__create_from_template",
-      description: "Create an agent from a template. Use browse_templates first to find a template ID.",
-      parameters: {
-        type: "object",
-        properties: {
-          templateId: { type: "string", description: "Template UUID from browse_templates." },
-          name: { type: "string", description: "Optional name override." },
-          parentId: { type: "string", description: "Parent agent UUID. Root-level if omitted." },
-          permissionType: { type: "string", description: "coordinator or executor.", enum: ["coordinator", "executor"] },
-          position: { type: "string", description: "Job position. Defaults to template name." },
-          department: { type: "string", description: "Department. Defaults to template division." },
-          skills: { type: "string", description: "Comma-separated skill names." },
-          mcpServers: { type: "string", description: "Comma-separated MCP server names." },
-        },
-        required: ["templateId"],
-      },
     },
   },
 ];
@@ -863,6 +866,197 @@ const FILE_TOOLS: ChatCompletionTool[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Git worktree tools — coordinator-only (manage subordinate workspaces)
+// Executors NEVER see these — they can't use them, wastes context.
+// ---------------------------------------------------------------------------
+
+const GIT_WORKTREE_TOOLS: ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__git_worktree_create",
+      description: "Create an isolated git worktree for a subordinate. Their file operations (bash, write_file, edit_file) will operate in this sandbox. Call BEFORE dispatching work.",
+      parameters: {
+        type: "object",
+        properties: {
+          subordinateId: { type: "string", description: "Subordinate agent name or ID." },
+          taskName: { type: "string", description: "Short task slug (e.g. 'login-feature'). Becomes branch name." },
+          baseBranch: { type: "string", description: "Base branch. Default: 'main'." },
+        },
+        required: ["subordinateId", "taskName"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__git_worktree_checkpoint",
+      description: "Snapshot a subordinate's worktree state (git add -A + commit). Creates a rollback point.",
+      parameters: {
+        type: "object",
+        properties: {
+          subordinateId: { type: "string", description: "Subordinate agent name or ID." },
+          message: { type: "string", description: "Checkpoint label (e.g. 'auth module done')." },
+        },
+        required: ["subordinateId", "message"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__git_worktree_merge",
+      description: "Merge a subordinate's worktree branch into main (QA passed). Removes worktree and branch after.",
+      parameters: {
+        type: "object",
+        properties: {
+          subordinateId: { type: "string", description: "Subordinate agent name or ID." },
+          taskName: { type: "string", description: "Task slug used when creating the worktree." },
+        },
+        required: ["subordinateId", "taskName"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__git_worktree_rollback",
+      description: "Rollback a subordinate's worktree to a checkpoint commit. Agent can then rework from a clean state.",
+      parameters: {
+        type: "object",
+        properties: {
+          subordinateId: { type: "string", description: "Subordinate agent name or ID." },
+          commitHash: { type: "string", description: "Specific checkpoint hash to reset to. Default: last checkpoint." },
+        },
+        required: ["subordinateId"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__git_worktree_remove",
+      description: "Remove a subordinate's worktree and branch (rejected / obsolete work).",
+      parameters: {
+        type: "object",
+        properties: {
+          subordinateId: { type: "string", description: "Subordinate agent name or ID." },
+          taskName: { type: "string", description: "Task slug used when creating the worktree." },
+        },
+        required: ["subordinateId"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__git_worktree_list",
+      description: "List all HiveWeave-managed worktrees in this project. Use to see which subordinates have isolated workspaces.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__git_worktree_status",
+      description: "Show a subordinate's worktree status — branch, HEAD, checkpoint history, uncommitted changes.",
+      parameters: {
+        type: "object",
+        properties: {
+          subordinateId: { type: "string", description: "Subordinate agent name or ID." },
+        },
+        required: ["subordinateId"],
+      },
+    },
+  },
+];
+
+// ---------------------------------------------------------------------------
+// QA Review tools — QA engineer only (executor with qa_engineer role)
+// These are stateless review functions. The QA agent sees results, not code.
+// ---------------------------------------------------------------------------
+
+const QA_REVIEW_TOOLS: ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__run_code_review",
+      description: "Run 5-axis code review (correctness, readability, architecture, security, performance) on specified files. Returns structured report with issues and score. The review is done by an internal LLM call — the code itself does NOT enter your context.",
+      parameters: {
+        type: "object",
+        properties: {
+          filePaths: { type: "array", description: "Array of file paths to review, relative to workspace." },
+          files: { type: "string", description: "Comma-separated file paths (alternative to filePaths)." },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__run_security_audit",
+      description: "Run security vulnerability audit (OWASP Top 10, hardcoded secrets, input validation, auth checks) on specified files. Returns structured report. Code does NOT enter your context.",
+      parameters: {
+        type: "object",
+        properties: {
+          filePaths: { type: "array", description: "Array of file paths to audit." },
+          files: { type: "string", description: "Comma-separated file paths (alternative to filePaths)." },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__run_tests",
+      description: "Analyze test coverage and quality for source files (and optional test files). Checks coverage gaps, edge cases, test quality, missing test types. Returns structured report.",
+      parameters: {
+        type: "object",
+        properties: {
+          filePaths: { type: "array", description: "Source files to analyze for test coverage." },
+          files: { type: "string", description: "Comma-separated source files (alternative to filePaths)." },
+          testFiles: { type: "array", description: "Optional test files to review." },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__run_perf_audit",
+      description: "Run web performance audit (bundle size, rendering, loading, network, runtime, assets) on frontend files. Returns structured report.",
+      parameters: {
+        type: "object",
+        properties: {
+          filePaths: { type: "array", description: "Array of file paths to audit." },
+          files: { type: "string", description: "Comma-separated file paths (alternative to filePaths)." },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "hiveweave__run_full_review",
+      description: "Run ALL 4 review dimensions in parallel (code review + security audit + test analysis + performance audit). Returns combined report with overall score. Use for comprehensive QA gate checks.",
+      parameters: {
+        type: "object",
+        properties: {
+          filePaths: { type: "array", description: "Files to review (all 4 dimensions)." },
+          files: { type: "string", description: "Comma-separated files (alternative to filePaths)." },
+          testFiles: { type: "array", description: "Optional test files for test analysis." },
+        },
+        required: [],
+      },
+    },
+  },
+];
+
+// ---------------------------------------------------------------------------
 // Charter tools — project charter (CEO writes, CEO+HR read)
 // ---------------------------------------------------------------------------
 
@@ -909,6 +1103,7 @@ const CORE_TOOLS_NAMES = new Set([
   "hiveweave__message_superior",
   "hiveweave__send_message",
   "hiveweave__read_roster",
+  "hiveweave__check_agent_status",
   "hiveweave__write_memory",
   "hiveweave__fetch_url",
   "hiveweave__get_project_time",
@@ -919,10 +1114,12 @@ const CORE_TOOLS_NAMES = new Set([
   "hiveweave__websearch",
   "hiveweave__mcp_call",
   "hiveweave__mcp_list_tools",
-  "hiveweave__mcp_configure",
   "hiveweave__list_available_mcp",
   "hiveweave__bind_mcp",
   "hiveweave__unbind_mcp",
+  "hiveweave__read_goals",
+  // update_goals → coordinator-only (assertRole blocks executors)
+  // mcp_configure → coordinator-only (no permission check, dangerous for executors)
 ]);
 const BINDING_AND_MEMORY_TOOL_NAMES = new Set([
   "hiveweave__bind_skill",
@@ -940,13 +1137,20 @@ const LIST_ALL_AGENTS_TOOL_NAMES = new Set(["hiveweave__list_all_agents"]);
 const READ_CHARTER_TOOL_NAMES = new Set(["hiveweave__read_charter"]);
 const SAVE_CHARTER_TOOL_NAMES = new Set(["hiveweave__save_charter"]);
 
-const CEO_READONLY_FILE_TOOL_NAMES = new Set([
+const CEO_FILE_TOOL_NAMES = new Set([
   "hiveweave__read_file",
   "hiveweave__list_files",
   "hiveweave__search_files",
   "hiveweave__glob",
   "hiveweave__grep",
   "hiveweave__fetch_url",
+  // No bash/run_command — CEO coordinates, does not execute code.
+]);
+
+// Tools that require coordinator permission — NOT visible to executors
+const COORD_MANAGEMENT_NAMES = new Set([
+  "hiveweave__update_goals",
+  "hiveweave__mcp_configure",
 ]);
 
 const HR_PERSONNEL_TOOL_NAMES = new Set([
@@ -954,8 +1158,6 @@ const HR_PERSONNEL_TOOL_NAMES = new Set([
   "hiveweave__transfer_agent",
   "hiveweave__dismiss_agent",
   "hiveweave__update_roster",
-  "hiveweave__browse_templates",
-  "hiveweave__create_from_template",
 ]);
 
 function pickTools(pool: ChatCompletionTool[], names: Set<string>): ChatCompletionTool[] {
@@ -995,10 +1197,12 @@ export function getHiveWeaveTools(
       ...pickTools(CHARTER_TOOLS, SAVE_CHARTER_TOOL_NAMES),
       ...pickTools(CHARTER_TOOLS, READ_CHARTER_TOOL_NAMES),
       ...pickTools(CORE_TOOLS, CORE_TOOLS_NAMES),
+      ...pickTools(CORE_TOOLS, COORD_MANAGEMENT_NAMES),
       ...pickTools(HR_TOOLS, LIST_ALL_AGENTS_TOOL_NAMES),
       ...pickTools(BINDING_TOOLS, BINDING_AND_MEMORY_TOOL_NAMES),
       ...pickTools(EXECUTOR_TOOLS, READ_PROJECT_MEMORY_TOOL_NAMES),
-      ...pickTools(FILE_TOOLS, CEO_READONLY_FILE_TOOL_NAMES),
+      ...pickTools(FILE_TOOLS, CEO_FILE_TOOL_NAMES),
+      ...GIT_WORKTREE_TOOLS,
     ]);
   }
 
@@ -1006,18 +1210,25 @@ export function getHiveWeaveTools(
     return uniqueTools([
       ...pickTools(CORE_TOOLS, MESSAGE_SUPERIOR_TOOL_NAMES),
       ...pickTools(CORE_TOOLS, CORE_TOOLS_NAMES),
+      ...pickTools(CORE_TOOLS, COORD_MANAGEMENT_NAMES),
       ...pickTools(HR_TOOLS, HR_PERSONNEL_TOOL_NAMES),
       ...pickTools(HR_TOOLS, LIST_ALL_AGENTS_TOOL_NAMES),
       ...pickTools(CHARTER_TOOLS, READ_CHARTER_TOOL_NAMES),
       ...pickTools(BINDING_TOOLS, BINDING_AND_MEMORY_TOOL_NAMES),
+      ...GIT_WORKTREE_TOOLS,
     ]);
   }
 
-  // Coordinator: coordination + core messaging + memory — NO file tools, NO binding tools
+  // Coordinator: coordination + core + git worktree + management — NO file tools, NO binding tools
   if (permissionType === "coordinator") {
-    return [...COORDINATOR_TOOLS, ...CORE_TOOLS];
+    return [...COORDINATOR_TOOLS, ...CORE_TOOLS, ...GIT_WORKTREE_TOOLS, ...pickTools(CORE_TOOLS, COORD_MANAGEMENT_NAMES)];
   }
 
-  // Executor: work tools + core messaging + memory + full file tools — NO binding tools
+  // QA engineer (executor): gets review tools on top of standard executor set
+  if (normalizedRole === "qa_engineer") {
+    return [...EXECUTOR_TOOLS, ...CORE_TOOLS, ...FILE_TOOLS, ...QA_REVIEW_TOOLS];
+  }
+
+  // Executor: work tools + core + full file tools — NO git worktree, NO review tools, NO binding tools
   return [...EXECUTOR_TOOLS, ...CORE_TOOLS, ...FILE_TOOLS];
 }

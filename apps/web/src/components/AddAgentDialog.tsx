@@ -26,6 +26,7 @@ const PERM_TYPES = [
 export default function AddAgentDialog({ projectId, parentId, onClose, onCreated }: AddAgentDialogProps) {
   const [mode, setMode] = useState<"manual" | "template">("manual");
   const [name, setName] = useState("");
+  const [position, setPosition] = useState("");
   const [role, setRole] = useState("");
   const [customRole, setCustomRole] = useState(false);
   const [goal, setGoal] = useState("");
@@ -41,7 +42,7 @@ export default function AddAgentDialog({ projectId, parentId, onClose, onCreated
     getModels().then(setModels).catch(() => {});
   }, []);
 
-  const canSubmit = name.trim() && role.trim() && goal.trim() && !loading;
+  const canSubmit = name.trim() && role.trim() && goal.trim() && position.trim() && !loading;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -50,6 +51,7 @@ export default function AddAgentDialog({ projectId, parentId, onClose, onCreated
     try {
       await createAgent({
         name: name.trim(),
+        position: position.trim(),
         role: role.trim(),
         goal: goal.trim(),
         backstory: backstory.trim(),
@@ -114,6 +116,7 @@ export default function AddAgentDialog({ projectId, parentId, onClose, onCreated
         {mode === "manual" ? (
           <ManualForm
             name={name} setName={setName}
+            position={position} setPosition={setPosition}
             role={role} setRole={setRole}
             customRole={customRole} setCustomRole={setCustomRole}
             goal={goal} setGoal={setGoal}
@@ -164,6 +167,7 @@ export default function AddAgentDialog({ projectId, parentId, onClose, onCreated
 
 function ManualForm(props: {
   name: string; setName: (v: string) => void;
+  position: string; setPosition: (v: string) => void;
   role: string; setRole: (v: string) => void;
   customRole: boolean; setCustomRole: (v: boolean) => void;
   goal: string; setGoal: (v: string) => void;
@@ -172,7 +176,7 @@ function ManualForm(props: {
   models: LlmModel[]; selectedModelId: string; setSelectedModelId: (v: string) => void;
   error: string;
 }) {
-  const { name, setName, role, setRole, customRole, setCustomRole, goal, setGoal, backstory, setBackstory, permissionType, setPermissionType, models, selectedModelId, setSelectedModelId, error } = props;
+  const { name, setName, position, setPosition, role, setRole, customRole, setCustomRole, goal, setGoal, backstory, setBackstory, permissionType, setPermissionType, models, selectedModelId, setSelectedModelId, error } = props;
 
   return (
     <div className="px-6 py-4 space-y-4 overflow-y-auto">
@@ -183,9 +187,21 @@ function ManualForm(props: {
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="例如：前端开发专家"
+          placeholder="例如：张三（中文姓名）"
           className="w-full px-3 py-2 text-sm bg-surface border border-surface-border rounded-lg text-gray-200 placeholder-gray-500 focus:outline-none focus:border-accent"
           autoFocus
+        />
+      </div>
+
+      {/* Position */}
+      <div>
+        <label className="block text-xs font-medium text-gray-400 mb-1">岗位</label>
+        <input
+          type="text"
+          value={position}
+          onChange={(e) => setPosition(e.target.value)}
+          placeholder="例如：前端工程师、后端开发、产品经理"
+          className="w-full px-3 py-2 text-sm bg-surface border border-surface-border rounded-lg text-gray-200 placeholder-gray-500 focus:outline-none focus:border-accent"
         />
       </div>
 
