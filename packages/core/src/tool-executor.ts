@@ -33,33 +33,47 @@ import { Effect } from "effect";
 import { mcpService } from "./mcp/mcp-service.js";
 
 // ---------------------------------------------------------------------------
-// Security: blocked command patterns — prevent agents from killing the server,
-// modifying system state, or escaping the workspace sandbox.
+// Security: prevent agents from killing the server's own process or running
+// destructive system commands. Killing other processes (e.g. a dev server on
+// a port conflict) is perfectly legitimate during development.
 // ---------------------------------------------------------------------------
 
-const BLOCKED_COMMAND_PATTERNS: RegExp[] = [
-  // Kill / stop processes
-  /Stop-Process/i,
-  /kill\s+-?\d/i,                          // kill PID, kill -9 PID
-  /taskkill/i,                             // Windows taskkill
-  /\bpkill\b/i,
-  /\bxkill\b/i,
-  // Shutdown / reboot
-  /shutdown/i,
-  /reboot/i,
-  /\bhalt\b/i,
-  /\bpoweroff\b/i,
-  // Stop the dev server itself
-  /\bctrl-?c\b/i,
-  // Destructive system commands
-  /\brm\s+-rf\s+\/\b/i,                    // rm -rf /
-  /\bformat\b/i,                           // format disk
-  /\bdiskpart\b/i,                         // Windows disk partitioning
-  // Network attack
-  /\bDDoS\b/i,
-  // Self-modification: agents should not edit their own runtime
-  // (covered by workspace path restriction, but add regex as defense-in-depth)
-];
+const SERVER_PID = process.pid;
+
+/**
+ * Check if a command attempts to kill the server's own process.
+ * Returns true if the command is dangerous to the server itself.
+ */
+function isSelfDestructive(command: string): boolean {
+  const pidStr = String(SERVER_PID);
+
+  // Direct PID match: Stop-Process -Id <pid>, kill <pid>, taskkill /pid <pid>
+  if (command.includes(pidStr)) {
+    // Only block if it's in a kill/stop context, not e.g. "echo <pid>"
+    const killPatterns = [
+      new RegExp(`Stop-Process.*${pidStr}`, "i"),
+      new RegExp(`\\bkill\\s+(-\\d+\\s+)?${pidStr}\\b`, "i"),
+      new RegExp(`\\bkill\\s+-\\w+\\s+${pidStr}\\b`, "i"),
+      new RegExp(`taskkill.*${pidStr}`, "i"),
+      new RegExp(`\\bpkill.*\\b${pidStr}\\b`, "i"),
+    ];
+    if (killPatterns.some((p) => p.test(command))) return true;
+  }
+
+  // System-wide destruction — always blocked regardless of PID
+  const systemDestructive = [
+    /\brm\s+-rf\s+\/\b/i,       // rm -rf /
+    /\bformat\b/i,              // format disk
+    /\bdiskpart\b/i,            // Windows disk partitioning
+    /shutdown/i,                // OS shutdown
+    /\breboot\b/i,              // OS reboot
+    /\bpoweroff\b/i,
+    /\bhalt\b/i,
+  ];
+  if (systemDestructive.some((p) => p.test(command))) return true;
+
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Binding Registry — available skills and MCP servers
@@ -938,11 +952,10 @@ export class ToolExecutor {
         // ── Bash Shell Execution (Effect-based, ported from OpenCode) ─
         case "bash": {
           let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
-          // Security: block commands that can kill the server process or corrupt system state
+          // Security: only block commands that target the server's own process or system destruction
           const bashCmd = typeof input.command === "string" ? input.command : "";
-          const dangerous = BLOCKED_COMMAND_PATTERNS.some((p) => p.test(bashCmd));
-          if (dangerous) {
-            return `Error: This command is blocked for safety. You cannot kill processes, stop the server, or modify system state from here.`;
+          if (isSelfDestructive(bashCmd)) {
+            return `Error: This command targets the HiveWeave server process (PID ${SERVER_PID}) or system state. You cannot kill the server itself, but killing other processes (e.g. dev servers on port conflicts) is allowed.`;
           }
           try {
             const result = await Effect.runPromise(
@@ -960,10 +973,9 @@ export class ToolExecutor {
         case "run_command": {
           let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const { command, cwd, timeout } = input;
           if (!command) return "Error: run_command requires a command.";
-          // Security: block commands that can kill the server process or corrupt system state
-          const dangerous2 = BLOCKED_COMMAND_PATTERNS.some((p) => p.test(String(command)));
-          if (dangerous2) {
-            return `Error: This command is blocked for safety. You cannot kill processes, stop the server, or modify system state from here.`;
+          // Security: only block commands that target the server's own process or system destruction
+          if (isSelfDestructive(String(command))) {
+            return `Error: This command targets the HiveWeave server process (PID ${SERVER_PID}) or system state. You cannot kill the server itself, but killing other processes (e.g. dev servers on port conflicts) is allowed.`;
           }
           try {
             const result = await this.shell.runCommand(wp, {
