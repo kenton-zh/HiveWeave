@@ -33,6 +33,35 @@ import { Effect } from "effect";
 import { mcpService } from "./mcp/mcp-service.js";
 
 // ---------------------------------------------------------------------------
+// Security: blocked command patterns — prevent agents from killing the server,
+// modifying system state, or escaping the workspace sandbox.
+// ---------------------------------------------------------------------------
+
+const BLOCKED_COMMAND_PATTERNS: RegExp[] = [
+  // Kill / stop processes
+  /Stop-Process/i,
+  /kill\s+-?\d/i,                          // kill PID, kill -9 PID
+  /taskkill/i,                             // Windows taskkill
+  /\bpkill\b/i,
+  /\bxkill\b/i,
+  // Shutdown / reboot
+  /shutdown/i,
+  /reboot/i,
+  /\bhalt\b/i,
+  /\bpoweroff\b/i,
+  // Stop the dev server itself
+  /\bctrl-?c\b/i,
+  // Destructive system commands
+  /\brm\s+-rf\s+\/\b/i,                    // rm -rf /
+  /\bformat\b/i,                           // format disk
+  /\bdiskpart\b/i,                         // Windows disk partitioning
+  // Network attack
+  /\bDDoS\b/i,
+  // Self-modification: agents should not edit their own runtime
+  // (covered by workspace path restriction, but add regex as defense-in-depth)
+];
+
+// ---------------------------------------------------------------------------
 // Binding Registry — available skills and MCP servers
 // Following OpenCode/OpenClaw pattern: config-driven registry, per-agent binding.
 // This is a static placeholder; will be replaced with DB-backed config later.
@@ -909,6 +938,12 @@ export class ToolExecutor {
         // ── Bash Shell Execution (Effect-based, ported from OpenCode) ─
         case "bash": {
           let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }
+          // Security: block commands that can kill the server process or corrupt system state
+          const bashCmd = typeof input.command === "string" ? input.command : "";
+          const dangerous = BLOCKED_COMMAND_PATTERNS.some((p) => p.test(bashCmd));
+          if (dangerous) {
+            return `Error: This command is blocked for safety. You cannot kill processes, stop the server, or modify system state from here.`;
+          }
           try {
             const result = await Effect.runPromise(
               runBashCommand(wp, input).pipe(
@@ -925,6 +960,11 @@ export class ToolExecutor {
         case "run_command": {
           let wp: string; try { wp = await this.resolveWorkspace(agentId); } catch (e: any) { return `Error: ${typeof e === "string" ? e : e.message}`; }          const { command, cwd, timeout } = input;
           if (!command) return "Error: run_command requires a command.";
+          // Security: block commands that can kill the server process or corrupt system state
+          const dangerous2 = BLOCKED_COMMAND_PATTERNS.some((p) => p.test(String(command)));
+          if (dangerous2) {
+            return `Error: This command is blocked for safety. You cannot kill processes, stop the server, or modify system state from here.`;
+          }
           try {
             const result = await this.shell.runCommand(wp, {
               command,
