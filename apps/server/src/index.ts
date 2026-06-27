@@ -45,6 +45,15 @@ for (const proj of existingProjects) {
     registerProjectAgents(proj.workspacePath!, projectAgents.map(a => a.id));
   }
 
+  // Clear stuck is_streaming=True flags — these are zombie messages left over
+  // from previous backend restarts while agents were mid-stream.
+  {
+    const stuck = await projectDb.update(chatMessages).set({ isStreaming: false }).where(eq(chatMessages.isStreaming, true));
+    if (stuck.changes > 0) {
+      console.log(`[Startup] Cleared ${stuck.changes} stuck streaming message(s) in project ${proj.name}`);
+    }
+  }
+
   // Ensure CEO + HR exist; migrate legacy HR-only roots under CEO
   {
     const orgService = new OrgService(projectDb, proj.workspacePath!);

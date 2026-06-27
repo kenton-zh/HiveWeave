@@ -541,7 +541,7 @@ export class ToolExecutor {
             role,
             goal,
             backstory: backstory || "",
-            skills: [],
+            skills: initialSkills,
             parentId: resolvedParentId || undefined,
             projectId,
             permissionType: permType,

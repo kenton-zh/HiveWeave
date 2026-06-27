@@ -68,13 +68,16 @@ interface AppState {
   activityFeed: ActivityEntry[];
   addActivity: (entry: ActivityEntry) => void;
   clearActivity: () => void;
+  _activityFeedInternal: ActivityEntry[];
+  _activityRafPending: boolean;
 }
 
 export interface ActivityEntry {
   agentId: string;
   agentName: string;
-  type: "thinking" | "text" | "tool_use" | "tool_result" | "done" | "error";
+  type: "thinking" | "text" | "tool_use" | "tool_result" | "done" | "error" | "text_delta" | "thinking_delta";
   content?: string;
+  deltaId?: string;
   toolName?: string;
   toolInput?: string;
   toolResult?: string;
@@ -92,7 +95,7 @@ interface ChatMessage {
   isRead?: boolean;
 }
 
-export const useAppStore = create<AppState>((set) => ({
+export const useAppStore = create<AppState>((set, get) => ({
   selectedAgentId: null,
   setSelectedAgent: (id) => set({ selectedAgentId: id }),
   activeView: "tree",
@@ -183,10 +186,58 @@ export const useAppStore = create<AppState>((set) => ({
   // User ping notifications
   userPingAgentIds: [],
   setUserPingAgentIds: (ids) => set({ userPingAgentIds: ids }),
+  // Live Activity: external immutable array triggers React re-render
   activityFeed: [],
-  addActivity: (entry) =>
-    set((state) => ({
-      activityFeed: [...state.activityFeed.slice(-199), { ...entry }],
-    })),
-  clearActivity: () => set({ activityFeed: [] }),
+  // Internal mutable buffer — deltas accumulate here without triggering React
+  _activityFeedInternal: [] as ActivityEntry[],
+  _activityRafPending: false,
+  addActivity: (entry) => {
+    const st = get();
+    const feed = st._activityFeedInternal;
+
+    if (entry.type === "text_delta" || entry.type === "thinking_delta") {
+      // Delta: append to matching entry (immutable update to avoid shared-object mutation)
+      let found = false;
+      for (let i = feed.length - 1; i >= 0; i--) {
+        const e = feed[i];
+        if (e.agentId === entry.agentId && e.deltaId === entry.deltaId && e.type === entry.type) {
+          // Immutable update: create a new object instead of mutating the shared one
+          feed[i] = { ...e, content: (e.content || "") + (entry.content || ""), timestamp: entry.timestamp };
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        feed.push({ ...entry });
+        // Cap at 200 entries to prevent unbounded growth in long streaming sessions
+        if (feed.length > 200) {
+          st._activityFeedInternal = feed.slice(-200);
+        }
+      }
+
+      // Throttle React re-render to ~60fps via RAF
+      if (!st._activityRafPending) {
+        st._activityRafPending = true;
+        requestAnimationFrame(() => {
+          const s = get();
+          s._activityRafPending = false;
+          set({ activityFeed: [...s._activityFeedInternal] });
+        });
+      }
+      return;
+    }
+
+    // Non-delta: add directly, sync to React immediately
+    feed.push({ ...entry });
+    if (feed.length > 200) {
+      st._activityFeedInternal = feed.slice(-200);
+    }
+    set({ activityFeed: [...st._activityFeedInternal] });
+  },
+  clearActivity: () => {
+    const st = get();
+    st._activityFeedInternal = [];
+    st._activityRafPending = false; // Reset RAF flag so pending callbacks don't re-populate
+    set({ activityFeed: [] });
+  },
 }));

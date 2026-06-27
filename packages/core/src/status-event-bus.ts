@@ -14,8 +14,10 @@ export type StatusListener = (agentId: string, processing: boolean) => void;
 export interface ActivityEvent {
   agentId: string;
   agentName: string;
-  type: "thinking" | "text" | "tool_use" | "tool_result" | "done" | "error";
+  type: "thinking" | "text" | "tool_use" | "tool_result" | "done" | "error" | "text_delta" | "thinking_delta";
   content?: string;
+  /** For delta events: identifies the streaming segment so the frontend can append */
+  deltaId?: string;
   toolName?: string;
   toolInput?: string;
   toolResult?: string;
@@ -89,9 +91,13 @@ class StatusEventBus {
 
   /** Broadcast a real-time activity event from an agent. */
   emitActivity(event: ActivityEvent): void {
-    this.recentActivity.push(event);
-    if (this.recentActivity.length > this.maxRecent) {
-      this.recentActivity = this.recentActivity.slice(-this.maxRecent);
+    // Delta events are transient — don't store in recentActivity buffer
+    const isDelta = event.type === "text_delta" || event.type === "thinking_delta";
+    if (!isDelta) {
+      this.recentActivity.push(event);
+      if (this.recentActivity.length > this.maxRecent) {
+        this.recentActivity = this.recentActivity.slice(-this.maxRecent);
+      }
     }
     for (const fn of this.activityListeners) {
       try { fn(event); } catch { /* ignore */ }

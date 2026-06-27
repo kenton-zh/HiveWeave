@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { getWorkLogs } from "../api";
 import { useAppStore } from "../store";
 import type { ActivityEntry } from "../store";
+
+// ── Types ──────────────────────────────────────────────────────
 
 interface WorkLog {
   id: string;
@@ -32,71 +34,236 @@ function formatTime(timestamp: number): string {
   return date.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
 }
 
-const activityColors: Record<string, { bg: string; text: string; icon: string }> = {
-  thinking: { bg: "bg-purple-500/10", text: "text-purple-300", icon: "思考" },
-  text: { bg: "bg-blue-500/10", text: "text-blue-300", icon: "文本" },
-  tool_use: { bg: "bg-amber-500/10", text: "text-amber-300", icon: "工具" },
-  tool_result: { bg: "bg-green-500/10", text: "text-green-300", icon: "结果" },
-  done: { bg: "bg-emerald-500/10", text: "text-emerald-300", icon: "完成" },
-  error: { bg: "bg-red-500/10", text: "text-red-300", icon: "错误" },
-};
-
-/** Merge thinking events per conversation — tool calls don't break the session. */
-function mergeThinkingSessions(events: ActivityEntry[]): (ActivityEntry & { isSession?: boolean })[] {
-  const merged: (ActivityEntry & { isSession?: boolean })[] = [];
-  let currentSession: (ActivityEntry & { isSession?: boolean }) | null = null;
-
-  for (const e of events) {
-    if (e.type === "thinking") {
-      if (currentSession) {
-        // Append to current thinking session
-        currentSession.content = (currentSession.content || "") + (e.content || "");
-        currentSession.timestamp = e.timestamp;
-      } else {
-        currentSession = { ...e, content: e.content || "", isSession: true };
-        merged.push(currentSession);
-      }
-    } else if (e.type === "done" || e.type === "error") {
-      // Conversation boundary — close the session
-      currentSession = null;
-      merged.push(e);
-    } else {
-      // tool_use, tool_result, text — pass through, don't break thinking session
-      merged.push(e);
-    }
-  }
-  return merged;
+function formatClock(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-function ThinkingSession({ entry }: { entry: ActivityEntry }) {
+// ── Conversation Aggregation ───────────────────────────────────
+
+/**
+ * A conversation = all activity events between a "done" boundary and the next.
+ * Each conversation aggregates: thinking + text + tool_use + tool_result.
+ */
+interface Conversation {
+  id: string;
+  agentId: string;
+  agentName: string;
+  startTime: number;
+  endTime: number;
+  events: ActivityEntry[];
+  isLive: boolean;
+}
+
+function aggregateConversations(events: ActivityEntry[], filterAgentId?: string | null): Conversation[] {
+  const filtered = filterAgentId
+    ? events.filter((e) => e.agentId === filterAgentId)
+    : events;
+
+  const conversations: Conversation[] = [];
+  let current: Conversation | null = null;
+
+  for (const e of filtered) {
+    // Start a new conversation on first event or when agent changes
+    if (!current || current.agentId !== e.agentId) {
+      if (current) conversations.push(current);
+      current = {
+        id: `${e.agentId}-${e.timestamp}`,
+        agentId: e.agentId,
+        agentName: e.agentName,
+        startTime: e.timestamp,
+        endTime: e.timestamp,
+        events: [],
+        isLive: true,
+      };
+    }
+
+    current.events.push(e);
+    current.endTime = e.timestamp;
+
+    // "done" or "error" ends the conversation
+    if (e.type === "done" || e.type === "error") {
+      current.isLive = false;
+      conversations.push(current);
+      current = null;
+    }
+  }
+  if (current) conversations.push(current);
+
+  return conversations;
+}
+
+// ── Conversation Card ──────────────────────────────────────────
+
+function ToolEntry({ entry }: { entry: ActivityEntry }) {
   const [expanded, setExpanded] = useState(false);
-  const content = entry.content || "";
-  const preview = content.slice(0, 100);
+  const input = entry.toolInput || "";
+  const result = entry.toolResult || "";
 
   return (
-    <div className="px-4 py-1.5 border-b border-surface-border/30">
+    <div className="ml-3 border-l border-amber-500/20 pl-2">
       <div
-        className="flex items-start gap-2 cursor-pointer hover:bg-surface-border/10 rounded px-1 -mx-1 transition-colors"
+        className="flex items-center gap-1.5 cursor-pointer hover:bg-amber-500/5 rounded px-1 -mx-1 transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
-        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded whitespace-nowrap bg-purple-500/10 text-purple-300 shrink-0 mt-0.5">
-          思考
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] text-gray-500">{entry.agentName}</span>
-            <span className="text-[10px] text-gray-600">{formatTime(entry.timestamp)}</span>
-            <span className="text-[10px] text-gray-500">{expanded ? "▲" : "▼"}</span>
-          </div>
-          {!expanded && (
-            <div className="text-[11px] text-gray-400 truncate mt-0.5 leading-relaxed">
-              {preview}{content.length > 100 ? "…" : ""}
+        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 shrink-0">工具</span>
+        <span className="text-[11px] text-gray-300 font-mono truncate">{entry.toolName}</span>
+        {input && <span className="text-[10px] text-gray-500 truncate flex-1">{input.slice(0, 80)}{input.length > 80 ? "…" : ""}</span>}
+        <span className="text-[10px] text-gray-600">{expanded ? "▲" : "▼"}</span>
+      </div>
+      {expanded && (
+        <div className="mt-1 space-y-1">
+          {input && (
+            <div className="text-[10px] text-gray-400 bg-surface-alt rounded px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
+              <span className="text-amber-400/60">input: </span>{input}
+            </div>
+          )}
+          {result && (
+            <div className="text-[10px] text-gray-400 bg-surface-alt rounded px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
+              <span className="text-green-400/60">result: </span>{result}
             </div>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+function ConversationCard({ conv }: { conv: Conversation }) {
+  const [expanded, setExpanded] = useState(conv.isLive);
+  const hasThinking = conv.events.some((e) => e.type === "thinking" || e.type === "thinking_delta");
+  const hasText = conv.events.some((e) => e.type === "text" || e.type === "text_delta");
+  const toolCount = conv.events.filter((e) => e.type === "tool_use").length;
+  const hasError = conv.events.some((e) => e.type === "error");
+
+  // If delta events exist, the finalized "text"/"thinking" event is a duplicate
+  // (the backend flushes the full accumulated buffer as a final event).
+  // Prefer delta entries (which accumulated incrementally) and skip the final duplicate.
+  const hasTextDelta = conv.events.some((e) => e.type === "text_delta");
+  const hasThinkingDelta = conv.events.some((e) => e.type === "thinking_delta");
+
+  // Build preview: first text or thinking content (from delta if available, else finalized)
+  const firstText = conv.events.find((e) => hasTextDelta ? e.type === "text_delta" : e.type === "text")?.content || "";
+  const firstThink = conv.events.find((e) => hasThinkingDelta ? e.type === "thinking_delta" : e.type === "thinking")?.content || "";
+  const preview = (firstText || firstThink).slice(0, 120);
+
+  // Merge thinking content — use delta if available, skip finalized duplicate
+  const thinkingContent = conv.events
+    .filter((e) => hasThinkingDelta ? e.type === "thinking_delta" : (e.type === "thinking" || e.type === "thinking_delta"))
+    .map((e) => e.content || "")
+    .join("");
+
+  // Merge text content — use delta if available, skip finalized duplicate
+  const textContent = conv.events
+    .filter((e) => hasTextDelta ? e.type === "text_delta" : (e.type === "text" || e.type === "text_delta"))
+    .map((e) => e.content || "")
+    .join("");
+
+  const durationMs = conv.endTime - conv.startTime;
+  const durationStr = durationMs > 1000 ? `${(durationMs / 1000).toFixed(1)}s` : "";
+
+  return (
+    <div className="border-b border-surface-border/30">
+      {/* Header — always visible */}
+      <div
+        className="flex items-start gap-2 px-4 py-2 cursor-pointer hover:bg-surface-border/10 transition-colors"
+        onClick={() => setExpanded(!expanded)}
+      >
+        {/* Agent name + status dot */}
+        <div className="flex items-center gap-1.5 shrink-0 mt-0.5">
+          <span className={`w-1.5 h-1.5 rounded-full ${conv.isLive ? "bg-emerald-400 animate-pulse" : hasError ? "bg-red-400" : "bg-gray-500"}`} />
+          <span className="text-[11px] font-medium text-gray-300 whitespace-nowrap">{conv.agentName}</span>
+        </div>
+
+        {/* Preview content */}
+        <div className="min-w-0 flex-1">
+          <div className="text-[11px] text-gray-400 truncate leading-relaxed">
+            {preview}{preview.length >= 120 ? "…" : ""}
+          </div>
+        </div>
+
+        {/* Badges */}
+        <div className="flex items-center gap-1 shrink-0 mt-0.5">
+          {hasThinking && <span className="text-[9px] px-1 py-0.5 rounded bg-purple-500/10 text-purple-300">思考</span>}
+          {toolCount > 0 && <span className="text-[9px] px-1 py-0.5 rounded bg-amber-500/10 text-amber-300">{toolCount}工具</span>}
+          {hasText && <span className="text-[9px] px-1 py-0.5 rounded bg-blue-500/10 text-blue-300">输出</span>}
+          {durationStr && <span className="text-[9px] text-gray-600">{durationStr}</span>}
+        </div>
+
+        <span className="text-[10px] text-gray-600 shrink-0 mt-0.5">{formatClock(conv.startTime)}</span>
+        <span className="text-[10px] text-gray-600 shrink-0 mt-0.5">{expanded ? "▲" : "▼"}</span>
+      </div>
+
+      {/* Expanded content — full conversation */}
+      {expanded && (
+        <div className="px-4 pb-2 space-y-1.5">
+          {/* Thinking block */}
+          {thinkingContent && (
+            <ThinkingBlock content={thinkingContent} />
+          )}
+
+          {/* Events in order */}
+          {conv.events
+            .filter((e) => e.type === "tool_use" || e.type === "tool_result")
+            .map((e, i) => (
+              <ToolEntry key={`tool-${i}`} entry={e} />
+            ))}
+
+          {/* Text output block */}
+          {textContent && (
+            <div className="ml-3 border-l border-blue-500/20 pl-2">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-300 shrink-0">输出</span>
+              </div>
+              <div className="mt-1 text-[11px] text-gray-300 leading-relaxed whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
+                {textContent}
+              </div>
+            </div>
+          )}
+
+          {/* Error */}
+          {conv.events.filter((e) => e.type === "error").map((e, i) => (
+            <div key={`err-${i}`} className="ml-3 border-l border-red-500/20 pl-2">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-red-500/10 text-red-300 shrink-0">错误</span>
+              </div>
+              <div className="mt-1 text-[11px] text-red-300 leading-relaxed">
+                {e.errorMessage}
+              </div>
+            </div>
+          ))}
+
+          {/* Done marker */}
+          {!conv.isLive && !hasError && (
+            <div className="flex items-center gap-1.5 ml-3">
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300">完成</span>
+              <span className="text-[9px] text-gray-600">{formatTime(conv.endTime)}</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ThinkingBlock({ content }: { content: string }) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div className="ml-3 border-l border-purple-500/20 pl-2">
+      <div
+        className="flex items-center gap-1.5 cursor-pointer hover:bg-purple-500/5 rounded px-1 -mx-1 transition-colors"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-300 shrink-0">思考</span>
+        {!expanded && (
+          <span className="text-[11px] text-gray-400 truncate flex-1">
+            {content.slice(0, 120)}{content.length > 120 ? "…" : ""}
+          </span>
+        )}
+        <span className="text-[10px] text-gray-600 shrink-0">{expanded ? "▲" : "▼"}</span>
       </div>
       {expanded && (
-        <div className="mt-1.5 ml-6 p-2 rounded bg-surface-alt border border-surface-border text-[11px] text-gray-300 leading-relaxed whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+        <div className="mt-1 text-[11px] text-gray-400 leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto bg-surface-alt rounded px-2 py-1.5">
           {content}
         </div>
       )}
@@ -104,58 +271,63 @@ function ThinkingSession({ entry }: { entry: ActivityEntry }) {
   );
 }
 
-function ActivityLog({ agentId }: { agentId?: string | null }) {
+// ── Live Activity Panel ─────────────────────────────────────────
+
+export function ActivityLog({ agentId }: { agentId?: string | null }) {
   const activityFeed = useAppStore((s) => s.activityFeed);
   const clearActivity = useAppStore((s) => s.clearActivity);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  const filtered = agentId ? activityFeed.filter((e) => e.agentId === agentId) : activityFeed;
-  const merged = mergeThinkingSessions(filtered);
+  const conversations = useMemo(
+    () => aggregateConversations(activityFeed, agentId),
+    [activityFeed, agentId],
+  );
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [merged.length]);
+  }, [conversations.length]);
 
-  if (merged.length === 0) return null;
+  if (conversations.length === 0) {
+    return (
+      <div className="border-t border-surface-border bg-surface-card shrink-0">
+        <div className="px-6 py-4 flex items-center justify-between border-b border-surface-border">
+          <span className="text-xs font-medium text-gray-400">Live Activity</span>
+        </div>
+        <div className="px-6 py-8 text-center">
+          <p className="text-sm text-gray-500">暂无活动</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="border-t border-surface-border bg-surface-card shrink-0">
-      <div className="px-6 py-2 flex items-center justify-between border-b border-surface-border">
-        <span className="text-xs font-medium text-gray-400">Live Activity</span>
-        <button onClick={clearActivity} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">Clear</button>
+      {/* Header */}
+      <div className="px-4 py-2 flex items-center justify-between border-b border-surface-border">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-gray-400">Live Activity</span>
+          {conversations.some((c) => c.isLive) && (
+            <span className="flex items-center gap-1 text-[10px] text-emerald-400">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              {conversations.filter((c) => c.isLive).length} 进行中
+            </span>
+          )}
+        </div>
+        <button onClick={clearActivity} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">清空</button>
       </div>
-      <div className="max-h-80 overflow-y-auto">
-        {merged.map((e, i) => {
-          if (e.isSession) {
-            return <ThinkingSession key={`ts-${i}`} entry={e} />;
-          }
-          const c = activityColors[e.type] || activityColors.text;
-          const summary =
-            e.type === "text" ? (e.content || "").slice(0, 120) :
-            e.type === "tool_use" ? `${e.toolName || "?"}` + (e.toolInput ? ` ${e.toolInput.slice(0, 60)}` : "") :
-            e.type === "tool_result" ? `${e.toolName || "?"} ${(e.toolResult || "").slice(0, 80)}` :
-            e.type === "error" ? (e.errorMessage || "error").slice(0, 120) :
-            e.type === "done" ? "完成" : "";
-          return (
-            <div key={i} className="px-4 py-1.5 hover:bg-surface-border/10 transition-colors border-b border-surface-border/30">
-              <div className="flex items-start gap-2">
-                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded whitespace-nowrap shrink-0 mt-0.5 ${c.bg} ${c.text}`}>{c.icon}</span>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] text-gray-500">{e.agentName}</span>
-                    <span className="text-[10px] text-gray-600">{formatTime(e.timestamp)}</span>
-                  </div>
-                  <span className="text-[11px] text-gray-300 truncate block">{summary}</span>
-                </div>
-              </div>
-            </div>
-          );
-        })}
+
+      {/* Conversation list */}
+      <div className="max-h-96 overflow-y-auto">
+        {conversations.map((conv) => (
+          <ConversationCard key={conv.id} conv={conv} />
+        ))}
         <div ref={bottomRef} />
       </div>
     </div>
   );
 }
+
+// ── Work Log Panel ──────────────────────────────────────────────
 
 function WorkLogPanel({ agentId }: { agentId: string | null }) {
   const [isOpen, setIsOpen] = useState(true);
@@ -279,6 +451,14 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
       <ActivityLog agentId={agentId} />
     </div>
   );
+}
+
+/**
+ * Standalone Live Activity bar — shows ALL agents' activity (no filter).
+ * Designed to sit at the bottom of the left panel (Org Tree area).
+ */
+export function ActivityLogBar() {
+  return <ActivityLog agentId={null} />;
 }
 
 export default WorkLogPanel;

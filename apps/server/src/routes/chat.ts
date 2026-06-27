@@ -506,6 +506,85 @@ export async function chatRoutes(fastify: FastifyInstance) {
   // Track agents currently running auto-trigger to prevent concurrent execution
   const runningAutoTriggers = new Set<string>();
 
+  // ── Empty-response retry tracking with exponential backoff ──────────────────
+  // When an agent's LLM call returns empty (no text, no tool calls), we schedule a
+  // delayed retry so the agent gets another chance to process its inbox messages.
+  // After MAX_EMPTY_RETRIES consecutive failures, we stop retrying and log an error
+  // to surface the problem (likely a model config issue or persistent API error).
+  const MAX_EMPTY_RETRIES = 3;
+  const BACKOFF_DELAYS_MS = [5_000, 15_000, 45_000]; // 5s, 15s, 45s
+  const emptyRetryCount = new Map<string, number>(); // agentId → consecutive empty count
+  const emptyRetryTimers = new Map<string, NodeJS.Timeout>(); // agentId → pending timer
+
+  /**
+   * Schedule a delayed retry for an agent whose LLM returned empty.
+   * Uses exponential backoff. After MAX_EMPTY_RETRIES, stops retrying,
+   * calls onEscalate to notify the agent's superior, and logs an error.
+   */
+  function scheduleEmptyRetry(
+    agentId: string,
+    agentName: string,
+    triggerFn: () => Promise<void>,
+    fastify: any,
+    onEscalate?: () => Promise<void>,
+  ): void {
+    const count = (emptyRetryCount.get(agentId) || 0) + 1;
+    emptyRetryCount.set(agentId, count);
+
+    if (count > MAX_EMPTY_RETRIES) {
+      fastify.log.error(
+        `[emptyRetry] ${agentName} (${agentId}): ${count - 1} consecutive empty responses — STOPPING retries. ` +
+        `Escalating to superior for intervention.`,
+      );
+      // Reset counter so a future manual/cascade trigger starts fresh
+      emptyRetryCount.set(agentId, 0);
+      // Escalate to the agent's superior — let the leader handle the malfunctioning agent
+      if (onEscalate) {
+        onEscalate().catch((err) =>
+          fastify.log.error(err, `[emptyRetry] ${agentName}: escalation to superior failed`),
+        );
+      }
+      return;
+    }
+
+    const delayIdx = Math.min(count - 1, BACKOFF_DELAYS_MS.length - 1);
+    const delay = BACKOFF_DELAYS_MS[delayIdx];
+    fastify.log.warn(
+      `[emptyRetry] ${agentName} (${agentId}): empty response #${count}, scheduling retry in ${delay / 1000}s`,
+    );
+
+    // Clear any existing pending timer for this agent
+    const existing = emptyRetryTimers.get(agentId);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(() => {
+      emptyRetryTimers.delete(agentId);
+      if (runningAutoTriggers.has(agentId)) {
+        fastify.log.info(`[emptyRetry] ${agentName}: retry skipped, agent already running`);
+        return;
+      }
+      fastify.log.info(`[emptyRetry] ${agentName}: firing retry #${count}`);
+      triggerFn().catch((err) =>
+        fastify.log.error(err, `[emptyRetry] ${agentName}: retry failed`),
+      );
+    }, delay);
+    emptyRetryTimers.set(agentId, timer);
+  }
+
+  /**
+   * Reset the empty-response counter for an agent that produced successful output.
+   */
+  function resetEmptyRetry(agentId: string): void {
+    if (emptyRetryCount.has(agentId)) {
+      emptyRetryCount.delete(agentId);
+    }
+    const timer = emptyRetryTimers.get(agentId);
+    if (timer) {
+      clearTimeout(timer);
+      emptyRetryTimers.delete(agentId);
+    }
+  }
+
   /**
    * POST /chat — Send a message to an agent and stream the response via SSE.
    *
@@ -1207,16 +1286,21 @@ export async function chatRoutes(fastify: FastifyInstance) {
     let thinkingBuffer = "";
     let bufferTimer: ReturnType<typeof setTimeout> | null = null;
     const BUFFER_THRESHOLD_MS = 300;
+    /** Delta streaming: each token gets a deltaId so the frontend can append in real-time */
+    let textDeltaId: string | null = null;
+    let thinkingDeltaId: string | null = null;
 
     function flushActivityBuffer(): void {
       if (bufferTimer) { clearTimeout(bufferTimer); bufferTimer = null; }
       if (thinkingBuffer) {
         statusEventBus.emitActivity({ agentId: agent.id, agentName: agent.name, type: "thinking", content: thinkingBuffer, timestamp: Date.now() });
         thinkingBuffer = "";
+        thinkingDeltaId = null;
       }
       if (textBuffer) {
         statusEventBus.emitActivity({ agentId: agent.id, agentName: agent.name, type: "text", content: textBuffer, timestamp: Date.now() });
         textBuffer = "";
+        textDeltaId = null;
       }
     }
 
@@ -1268,6 +1352,9 @@ export async function chatRoutes(fastify: FastifyInstance) {
             writeSSE(reply, "text", event.content);
             fullText += event.content;
             textBuffer += event.content;
+            // Emit delta for real-time Live Activity rendering (Pi-style streaming)
+            if (!textDeltaId) textDeltaId = randomUUID();
+            statusEventBus.emitActivity({ agentId: agent.id, agentName: agent.name, type: "text_delta", content: event.content, deltaId: textDeltaId, timestamp: Date.now() });
             // Debounce: emit merged text after a pause, or on next non-text event
             if (bufferTimer) clearTimeout(bufferTimer);
             bufferTimer = setTimeout(() => flushActivityBuffer(), BUFFER_THRESHOLD_MS);
@@ -1275,6 +1362,9 @@ export async function chatRoutes(fastify: FastifyInstance) {
           case "thinking":
             writeSSE(reply, "thinking", event.content);
             thinkingBuffer += event.content;
+            // Emit delta for real-time thinking rendering
+            if (!thinkingDeltaId) thinkingDeltaId = randomUUID();
+            statusEventBus.emitActivity({ agentId: agent.id, agentName: agent.name, type: "thinking_delta", content: event.content, deltaId: thinkingDeltaId, timestamp: Date.now() });
             if (bufferTimer) clearTimeout(bufferTimer);
             bufferTimer = setTimeout(() => flushActivityBuffer(), BUFFER_THRESHOLD_MS);
             break;
@@ -1445,6 +1535,12 @@ export async function chatRoutes(fastify: FastifyInstance) {
       // Outer safety net — guarantees processing is cleared even if context building,
       // inbox injection, model resolution, or any intermediate step throws.
       statusEventBus.setProcessing(agentId, false);
+      // Clear streaming flag on the assistant message — if we got here via an
+      // exception before updateMessage() ran, the message would be stuck as is_streaming=true
+      // forever (a "zombie message"). This prevents that.
+      try {
+        await services.chatMessageService.updateMessage(assistantMessageId, { isStreaming: false });
+      } catch { /* best-effort */ }
     }
 
     return reply;
@@ -1730,14 +1826,19 @@ export async function chatRoutes(fastify: FastifyInstance) {
       return;
     }
     const agentId = resolved.id;
+    // Skip archived/dismissed agents — they should not be auto-triggered
+    if (resolved.status === "archived" || resolved.status === "dismissed") {
+      fastify.log.info(`triggerSubordinate: skipping ${resolved.name} (status=${resolved.status})`);
+      return;
+    }
     if (runningAutoTriggers.has(agentId)) {
       return; // Already running
     }
     runningAutoTriggers.add(agentId);
     statusEventBus.setProcessing(agentId, true);
     const bgAssistantId = randomUUID();
+    const subAgent = resolved; // Hoisted out of try{} so finally{} can reference it
     try {
-      const subAgent = resolved;
 
       await subServices.chatMessageService.saveMessage({
         id: bgAssistantId,
@@ -1811,9 +1912,11 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
       // Check inbox for rework requests or other messages from coordinator
       let reworkBlock = "";
+      let subHasInboxMessages = false; // tracked to defer markAsRead until after LLM completes
       try {
         const inboxMsgs = await subServices.inboxService.getPendingMessages(agentId);
         if (inboxMsgs.length > 0) {
+          subHasInboxMessages = true;
           const reworkMsgs = inboxMsgs.filter((m: any) =>
             m.message && m.message.includes("[REWORK REQUESTED]"),
           );
@@ -1841,8 +1944,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
             }
           }
 
-          // Mark all inbox messages as read
-          await subServices.inboxService.markAsRead(agentId);
+          // BUGFIX: markAsRead deferred to after LLM completes — if LLM returns empty,
+          // we don't want to lose the inbox messages permanently
         }
       } catch { /* proceed without */ }
 
@@ -1958,25 +2061,33 @@ export async function chatRoutes(fastify: FastifyInstance) {
       let subThinkBuf = "";
       let subTextBuf = "";
       let subActTimer: ReturnType<typeof setTimeout> | null = null;
+      let subTextDeltaId: string | null = null;
+      let subThinkDeltaId: string | null = null;
       const flushSubActivity = () => {
         if (subActTimer) { clearTimeout(subActTimer); subActTimer = null; }
         if (subThinkBuf) {
           statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "thinking", content: subThinkBuf, timestamp: Date.now() });
           subThinkBuf = "";
+          subThinkDeltaId = null;
         }
         if (subTextBuf) {
           statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "text", content: subTextBuf, timestamp: Date.now() });
           subTextBuf = "";
+          subTextDeltaId = null;
         }
       };
 
       for await (const event of runtime.chat(prefixTriggerForProject(subAgent.projectId, userMsg))) {
         if (event.type === "thinking") {
           subThinkBuf += event.content;
+          if (!subThinkDeltaId) subThinkDeltaId = randomUUID();
+          statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "thinking_delta", content: event.content, deltaId: subThinkDeltaId, timestamp: Date.now() });
           subActTimer = setTimeout(flushSubActivity, 300);
         } else if (event.type === "text") {
           flushSubActivity();
           subTextBuf += event.content;
+          if (!subTextDeltaId) subTextDeltaId = randomUUID();
+          statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "text_delta", content: event.content, deltaId: subTextDeltaId, timestamp: Date.now() });
           subActTimer = setTimeout(flushSubActivity, 300);
           subFullText += event.content;
         } else if (event.type === "tool_use") {
@@ -2040,6 +2151,45 @@ export async function chatRoutes(fastify: FastifyInstance) {
         await conversationStore.appendTurn(agentId, subFinalMessages, subBudget, subServices.projectDb);
       }
 
+      // BUGFIX: Deferred markAsRead — only mark inbox messages as read if the LLM actually
+      // produced output. If LLM returned empty, keeping messages unread allows retry.
+      if (subHasInboxMessages) {
+        if (subFullText.trim().length > 0 || subToolCalls.length > 0) {
+          await subServices.inboxService.markAsRead(agentId);
+          resetEmptyRetry(agentId); // Success — reset retry counter
+        } else {
+          fastify.log.warn(`[triggerSubordinate] ${subAgent.name}: LLM returned empty (text=0, toolCalls=0), NOT marking inbox as read — messages will be retried on next trigger`);
+          // Schedule automatic retry with exponential backoff; escalate to superior on max retries
+          scheduleEmptyRetry(
+            agentId,
+            subAgent.name,
+            () => triggerSubordinate(agentId),
+            fastify,
+            // Escalation: notify the subordinate's coordinator (parent) about the malfunction
+            subAgent.parentId
+              ? async () => {
+                  fastify.log.warn(`[escalate] ${subAgent.name} → escalating to superior ${subAgent.parentId}`);
+                  await subServices.inboxService.sendMessage(
+                    agentId, // from: the malfunctioning agent
+                    subAgent.parentId, // to: the coordinator/parent
+                    `[SYSTEM ALARM] Your subordinate **${subAgent.name}** has failed to respond ${MAX_EMPTY_RETRIES} consecutive times. ` +
+                    `It may be stuck due to a model error, corrupted context, or API issue. ` +
+                    `Please investigate: check the agent's status, review recent activity, consider re-dispatching the task ` +
+                    `or adjusting the agent's configuration. The agent's unread inbox messages have been preserved.`,
+                    "alarm",
+                    false,
+                    "urgent",
+                  );
+                  // Trigger the superior to process the alarm
+                  triggerCoordinator(subAgent.parentId!).catch((err) =>
+                    fastify.log.error(err, `[escalate] superior trigger failed for ${subAgent.parentId}`),
+                  );
+                }
+              : undefined,
+          );
+        }
+      }
+
       // Finalize subordinate's background message (visible in team comms panel)
       await subServices.chatMessageService.updateMessage(bgAssistantId, {
         content: subFullText.trim(),
@@ -2092,9 +2242,11 @@ export async function chatRoutes(fastify: FastifyInstance) {
         }
       }
     } finally {
-      statusEventBus.emitActivity({ agentId, agentName: "Agent", type: "done", timestamp: Date.now() });
+      statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "done", timestamp: Date.now() });
       statusEventBus.setProcessing(agentId, false);
       runningAutoTriggers.delete(agentId);
+      // Clear streaming flag — prevents zombie messages if we exited before updateMessage
+      try { await subServices.chatMessageService.updateMessage(bgAssistantId, { isStreaming: false }); } catch { /* best-effort */ }
     }
   }
 
@@ -2168,14 +2320,19 @@ export async function chatRoutes(fastify: FastifyInstance) {
       return;
     }
     const coordinatorId = resolved.id;
+    // Skip archived/dismissed agents — they should not be auto-triggered
+    if (resolved.status === "archived" || resolved.status === "dismissed") {
+      fastify.log.info(`triggerCoordinator: skipping ${resolved.name} (status=${resolved.status})`);
+      return;
+    }
     if (runningAutoTriggers.has(coordinatorId)) {
       return; // Already running
     }
     runningAutoTriggers.add(coordinatorId);
     statusEventBus.setProcessing(coordinatorId, true);
     const coordAssistantId = randomUUID();
+    const coordAgent = resolved; // Hoisted out of try{} so finally{} can reference it
     try {
-      const coordAgent = resolved;
       statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "thinking", content: "Auto-triggered", timestamp: Date.now() });
 
       await coordServices.chatMessageService.saveMessage({
@@ -2201,6 +2358,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
       // Check for pending inbox messages
       const pendingMsgs = await coordServices.inboxService.getPendingMessages(coordinatorId);
+      fastify.log.info(`[triggerCoordinator] ${coordAgent.name}: pendingMsgs=${pendingMsgs.length}, model=${coordModel.modelId}`);
       if (pendingMsgs.length === 0) {
         await coordServices.chatMessageService.updateMessage(coordAssistantId, {
           content: "",
@@ -2410,12 +2568,44 @@ export async function chatRoutes(fastify: FastifyInstance) {
       const coordDispatchedSubordinates: Array<{ toAgentId: string; description: string }> = [];
       const coordPeersMessaged: Array<string> = [];
 
+      // Activity buffering for coordinator auto-trigger (same as triggerSubordinate)
+      let coordThinkBuf = "";
+      let coordTextBuf = "";
+      let coordActTimer: ReturnType<typeof setTimeout> | null = null;
+      let coordTextDeltaId: string | null = null;
+      let coordThinkDeltaId: string | null = null;
+      const flushCoordActivity = () => {
+        if (coordActTimer) { clearTimeout(coordActTimer); coordActTimer = null; }
+        if (coordThinkBuf) {
+          statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "thinking", content: coordThinkBuf, timestamp: Date.now() });
+          coordThinkBuf = "";
+          coordThinkDeltaId = null;
+        }
+        if (coordTextBuf) {
+          statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "text", content: coordTextBuf, timestamp: Date.now() });
+          coordTextBuf = "";
+          coordTextDeltaId = null;
+        }
+      };
+
       for await (const event of runtime.chat(prefixTriggerForProject(coordAgent.projectId, userMsg))) {
-        if (event.type === "text") {
+        if (event.type === "thinking") {
+          coordThinkBuf += event.content;
+          if (!coordThinkDeltaId) coordThinkDeltaId = randomUUID();
+          statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "thinking_delta", content: event.content, deltaId: coordThinkDeltaId, timestamp: Date.now() });
+          coordActTimer = setTimeout(flushCoordActivity, 300);
+        } else if (event.type === "text") {
+          flushCoordActivity();
+          coordTextBuf += event.content;
+          if (!coordTextDeltaId) coordTextDeltaId = randomUUID();
+          statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "text_delta", content: event.content, deltaId: coordTextDeltaId, timestamp: Date.now() });
+          coordActTimer = setTimeout(flushCoordActivity, 300);
           fullText += event.content;
         } else if (event.type === "tool_use") {
+          flushCoordActivity();
           const tool = event.content.replace(/^hiveweave__/, "");
           toolCalls.push({ tool, input: event.metadata?.input || {} });
+          statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "tool_use", toolName: tool, toolInput: JSON.stringify(event.metadata?.input || {}).slice(0, 200), timestamp: Date.now() });
           // Detect message_superior so we can cascade to the parent coordinator
           if (event.content === "hiveweave__message_superior") {
             coordCalledMessageSuperior = true;
@@ -2452,9 +2642,17 @@ export async function chatRoutes(fastify: FastifyInstance) {
             }
           }
         }
+        // Emit activity for tool_result events
+        if (event.type === "tool_result") {
+          const tool = (event.content || "").replace(/^hiveweave__/, "");
+          statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "tool_result", toolName: tool, toolResult: String(event.metadata?.result || "").slice(0, 300), timestamp: Date.now() });
+        }
         // Capture final messages for history storage
-        if (event.type === "done" && event.metadata?.messages) {
-          coordFinalMessages = event.metadata.messages as StoredMessage[];
+        if (event.type === "done") {
+          flushCoordActivity();
+          if (event.metadata?.messages) {
+            coordFinalMessages = event.metadata.messages as StoredMessage[];
+          }
         }
       }
 
@@ -2463,8 +2661,48 @@ export async function chatRoutes(fastify: FastifyInstance) {
         await conversationStore.appendTurn(coordinatorId, coordFinalMessages, coordBudget, coordServices.projectDb);
       }
 
-      // Mark inbox messages as read
-      await coordServices.inboxService.markAsRead(coordinatorId);
+      fastify.log.info(`[triggerCoordinator] ${coordAgent.name}: LLM done, fullText=${fullText.length}chars, toolCalls=${toolCalls.length}, dispatched=${coordDispatchedSubordinates.length}, peersMessaged=${coordPeersMessaged.length}, calledMsgSuperior=${coordCalledMessageSuperior}`);
+
+      // BUGFIX: Only mark inbox messages as read if the LLM actually produced output
+      // (text or tool calls). If the LLM returned empty, keeping messages unread allows
+      // the next trigger to retry processing them instead of silently losing them.
+      // This was the root cause of PM (拼图) not responding: corrupted history caused
+      // LLM to return empty → markAsRead cleared all messages → next trigger found
+      // nothing pending → early return → messages permanently lost.
+      if (fullText.trim().length > 0 || toolCalls.length > 0) {
+        await coordServices.inboxService.markAsRead(coordinatorId);
+        resetEmptyRetry(coordinatorId); // Success — reset retry counter
+      } else {
+        fastify.log.warn(`[triggerCoordinator] ${coordAgent.name}: LLM returned empty (text=0, toolCalls=0), NOT marking inbox as read — messages will be retried on next trigger`);
+        // Schedule automatic retry with exponential backoff; escalate to superior on max retries
+        scheduleEmptyRetry(
+          coordinatorId,
+          coordAgent.name,
+          () => triggerCoordinator(coordinatorId),
+          fastify,
+          // Escalation: notify the coordinator's parent (superior) about the malfunction
+          coordAgent.parentId
+            ? async () => {
+                fastify.log.warn(`[escalate] ${coordAgent.name} → escalating to superior ${coordAgent.parentId}`);
+                await coordServices.inboxService.sendMessage(
+                  coordinatorId, // from: the malfunctioning coordinator
+                  coordAgent.parentId, // to: the superior
+                  `[SYSTEM ALARM] Your subordinate coordinator **${coordAgent.name}** has failed to respond ${MAX_EMPTY_RETRIES} consecutive times. ` +
+                  `It may be stuck due to a model error, corrupted context, or API issue. ` +
+                  `Please investigate: check the coordinator's status, review recent activity, consider re-dispatching tasks ` +
+                  `or adjusting the coordinator's configuration. The coordinator's unread inbox messages have been preserved.`,
+                  "alarm",
+                  false,
+                  "urgent",
+                );
+                // Trigger the superior to process the alarm
+                triggerCoordinator(coordAgent.parentId!).catch((err) =>
+                  fastify.log.error(err, `[escalate] superior trigger failed for ${coordAgent.parentId}`),
+                );
+              }
+            : undefined,
+        );
+      }
 
       // If coordinator called message_superior, mark its handoffs as reportedUp
       // to prevent the self-check from re-injecting the reporting instruction on next trigger
@@ -2519,9 +2757,11 @@ export async function chatRoutes(fastify: FastifyInstance) {
       }
 
     } finally {
-      statusEventBus.emitActivity({ agentId: coordinatorId, agentName: "Coordinator", type: "done", timestamp: Date.now() });
+      statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "done", timestamp: Date.now() });
       statusEventBus.setProcessing(coordinatorId, false);
       runningAutoTriggers.delete(coordinatorId);
+      // Clear streaming flag — prevents zombie messages if we exited before updateMessage
+      try { await coordServices.chatMessageService.updateMessage(coordAssistantId, { isStreaming: false }); } catch { /* best-effort */ }
     }
   }
 

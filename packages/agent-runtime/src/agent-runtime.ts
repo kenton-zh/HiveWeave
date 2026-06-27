@@ -337,7 +337,9 @@ export class AgentRuntime {
 
     // Track where old content ends (system prompts + history) so we only
     // return NEW messages from this call.
-    const newMsgStart = messages.length;
+    // NOTE: mutable (let) because compaction may rebuild the messages array,
+    // requiring newMsgStart to be recalculated via findConversationStart().
+    let newMsgStart = messages.length;
 
     // Merge dynamic context INTO the user message (not as a separate message).
     // DeepSeek uses implicit prefix caching — only ONE contiguous prefix from
@@ -366,6 +368,11 @@ export class AgentRuntime {
           messages = this.rebuildAfterCompaction(messages, summary, recent, mergedMessage);
           console.log(`[RUNTIME:${this.config.agentName}] Pre-loop compaction: ${old.length} → summary (${recent.length} kept)`);
           this.pruneToolOutputs(messages);
+          // BUGFIX: Recalculate newMsgStart after compaction rebuilt the messages array.
+          // Without this, newMsgStart points to a stale position and newMessages (stored
+          // to DB via appendTurn) includes compaction system messages in the middle of
+          // the conversation, which corrupts future history and causes API 400 errors.
+          newMsgStart = this.findConversationStart(messages);
         }
       }
     }
@@ -611,6 +618,9 @@ export class AgentRuntime {
 
             // --- Tool output pruning: compact old tool outputs to markers ---
             this.pruneToolOutputs(messages);
+
+            // BUGFIX: Recalculate newMsgStart after mid-turn compaction rebuilt the messages array.
+            newMsgStart = this.findConversationStart(messages);
           }
         }
       }
@@ -786,6 +796,36 @@ export class AgentRuntime {
   }
 
   /**
+   * After compaction rebuilds the messages array, find the index where the actual
+   * conversation starts (skipping system prompts + compaction structure).
+   *
+   * The rebuilt array has the form:
+   *   [system...] + [user: summary] + [assistant: ack] + [user?: autoContinue] + [recent...]
+   *
+   * This method returns the index of the first "recent" message, so that newMessages
+   * stored via appendTurn does NOT include synthetic compaction messages that would
+   * corrupt future conversation history.
+   */
+  private findConversationStart(messages: Message[]): number {
+    const COMPACATION_PREFIX = "[Previous conversation summary";
+    const COMPACTON_ACK = "I understand the previous context. I'll continue from where we left off.";
+    const AUTO_CONTINUE = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.";
+
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (m.role === "system") continue;
+      const content = typeof m.content === "string" ? m.content : "";
+      if (content.startsWith(COMPACATION_PREFIX)) continue;
+      if (content === COMPACTON_ACK) continue;
+      if (content === AUTO_CONTINUE) continue;
+      // First non-system, non-compaction message = start of actual conversation
+      return i;
+    }
+    // All messages are system/compaction — return end of array
+    return messages.length;
+  }
+
+  /**
    * Rebuild the messages array after compaction:
    *   [system prompts] + [user: summary] + [assistant: ack] + [recent messages]
    *
@@ -798,8 +838,36 @@ export class AgentRuntime {
     recent: Message[],
     originalUserMsg?: string,
   ): Message[] {
-    // Extract system messages (always preserved)
+    // Extract system messages (always preserved at the beginning)
     const systemMsgs = messages.filter((m) => m.role === "system");
+
+    // BUGFIX: Filter OUT system messages from recent — splitMessagesForCompaction
+    // includes them in recent, but we already have them in systemMsgs. Without this
+    // filter, system messages get DUPLICATED (once at the beginning, once in recent),
+    // and the duplicate ends up in the middle of the conversation after compaction.
+    // OpenAI-compatible APIs reject system messages that appear after user/assistant msgs.
+    const recentNoSystem = recent.filter((m) => m.role !== "system");
+
+    // BUGFIX: Remove orphaned tool results — after compaction, tool results in recent
+    // may reference tool_call_ids from assistant messages that were in the "old" portion
+    // (now compacted away). These orphaned tool results cause API 400 errors because
+    // the API sees tool results without a matching assistant tool_calls message.
+    const assistantToolCallIds = new Set<string>();
+    for (const m of recentNoSystem) {
+      if (m.role === "assistant" && m.tool_calls) {
+        for (const tc of m.tool_calls) {
+          if (tc.id) assistantToolCallIds.add(tc.id);
+        }
+      }
+    }
+    // Also collect tool_call_ids from the compactionAck (it has no tool_calls, but just in case)
+    // and from systemMsgs (system messages don't have tool_calls, so skip)
+    const recentCleaned = recentNoSystem.filter((m) => {
+      if (m.role === "tool" && m.tool_call_id) {
+        return assistantToolCallIds.has(m.tool_call_id);
+      }
+      return true;
+    });
 
     const compactionUser: Message = {
       role: "user",
@@ -811,7 +879,7 @@ export class AgentRuntime {
     };
 
     // Check if the last user message was preserved in recent
-    const hasUserMsgInRecent = recent.some((m) => m.role === "user" && m.content === originalUserMsg);
+    const hasUserMsgInRecent = recentCleaned.some((m) => m.role === "user" && m.content === originalUserMsg);
 
     if (!hasUserMsgInRecent && originalUserMsg) {
       // Auto-continue: the user's original message was compacted away, inject a synthetic continue prompt
@@ -820,10 +888,10 @@ export class AgentRuntime {
         role: "user",
         content: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
       };
-      return [...systemMsgs, compactionUser, compactionAck, autoContinue, ...recent];
+      return [...systemMsgs, compactionUser, compactionAck, autoContinue, ...recentCleaned];
     }
 
-    return [...systemMsgs, compactionUser, compactionAck, ...recent];
+    return [...systemMsgs, compactionUser, compactionAck, ...recentCleaned];
   }
 
   /**
@@ -1374,6 +1442,18 @@ ${buildRolePermissionSection(this.config.role, this.config.permissionType, false
   2. **Escalate further up** — if it's beyond your authority, pass it to YOUR superior.
 - This creates an unbroken chain of accountability from any agent to the CEO. Problems flow up until they are solved.
 
+## Handling Subordinate Malfunction Alarms (MANDATORY)
+When you receive a \`[SYSTEM ALARM]\` message about a subordinate who has failed to respond multiple times, you MUST take action. Do NOT ignore the alarm. Follow this decision tree:
+
+1. **Diagnose** — Use \`hiveweave__check_agent_status\` to see if the subordinate is still processing. Use \`hiveweave__read_work_logs\` to review their recent activity and identify where they got stuck.
+2. **Assess** — Based on the diagnosis, choose one of the following actions:
+   - **Re-dispatch the task** — If the failure was likely transient (temporary API issue, rate limit), use \`hiveweave__dispatch_task\` to re-send the task with a slightly different framing. The subordinate's context (conversation history, prior work) is preserved.
+   - **Provide guidance** — If the subordinate seems confused or stuck, use \`hiveweave__send_message\` to provide clearer instructions or break the task into smaller steps.
+   - **Reject and rework** — If the subordinate produced output but it was wrong, use \`hiveweave__reject_work\` with specific feedback on what needs to change.
+   - **Reassign** — If the subordinate is fundamentally unsuited for this task, dispatch it to a different subordinate who has the right skills.
+   - **Escalate further** — If you cannot resolve the issue (e.g., all subordinates are failing, or the problem is beyond your authority), use \`hiveweave__message_superior\` to escalate to your superior with a full description of the situation.
+3. **Never abandon the task** — Every alarm must result in a concrete action. If you are unsure, escalate up rather than staying silent.
+
 ## Skill & MCP Binding Tools
 
 ### Progressive Skill Loading (IMPORTANT)
@@ -1615,6 +1695,14 @@ Every agent you create MUST have:
 - The \`goal\` should align with the project's needs — what they need to accomplish.
 - **The \`backstory\` (CRITICAL): Write a short personal narrative (2-4 sentences) about this individual.** NOT project-related. Include things like: their past experience, a memorable event, a personality quirk, hobbies, age, gender, where they worked before. Make each person feel like a real character. Example: "28岁，曾在两家初创公司担任全栈工程师。喜欢深夜写代码，桌上永远有杯冷咖啡。因为一次数据库事故差点被开除，从此对备份格外执着。业余时间在学陶艺，自称作品'抽象到没人看得懂'。"
 - Read the charter (\`read_charter\`) to understand the project's org structure and staffing policy before hiring.
+
+### Skill & MCP Binding at Hire Time (IMPORTANT)
+When creating an agent, **proactively bind relevant skills and MCP servers**:
+- Use \`list_available_skills("keyword")\` to search the ClawHub registry for skills matching the new agent's role (e.g. search "frontend" for a frontend engineer, "testing" for QA).
+- Pass matching skill slugs via the \`skills\` parameter (comma-separated). Example: \`skills="clawseccheck,pixellab-ai"\`.
+- Use \`list_available_mcp\` to check available MCP servers. If the agent's role needs specialized tools (browser automation, database access, GitHub, etc.), pass the server names via \`mcpServers\` (comma-separated).
+- **Do NOT leave skills/MCP empty when relevant skills exist.** A new agent without skills is like a new hire without tools — they cannot do their job effectively.
+- If no matching skills are found, proceed without skills — the agent can self-bind later via \`bind_skill\`.
 
 ### IRON RULE — HR NEVER has children
 **Never set \`parentId\` to your own ID.** You are a service role, not an org manager.

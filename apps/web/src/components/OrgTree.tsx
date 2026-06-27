@@ -348,6 +348,9 @@ function TreeNodeCard({
           : isActive && isProcessing
             ? `0 0 12px ${accentColor}15, 0 1px 3px rgba(0,0,0,0.3)`
             : "0 1px 3px rgba(0,0,0,0.25)",
+        // Re-rasterize text crisply at any CSS scale level
+        textRendering: "optimizeLegibility",
+        WebkitFontSmoothing: "antialiased",
       }}
     >
       {/* Row 1: status dot + name + expand + ping */}
@@ -797,8 +800,9 @@ function OrgTree() {
             style={{
               transform: `translate3d(${Math.round(transform.tx)}px, ${Math.round(transform.ty)}px, 0) scale(${transform.scale})`,
               transformOrigin: "0 0",
-              willChange: "transform",
-              backfaceVisibility: "hidden",
+              // NOTE: Do NOT add will-change/backface-visibility here.
+              // They force a GPU compositing layer with a cached raster, so
+              // zooming in (scale > 1) stretches that bitmap and text blurs.
             }}
           >
             <div
