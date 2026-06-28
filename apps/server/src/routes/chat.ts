@@ -7,7 +7,7 @@ import { AgentRuntime, buildIdentityPrompt, createProviderInstance, ToolOutputSt
 import type { AgentRuntimeConfig, StreamEvent, ToolExecutorCallback, Message, QueuedMessage, MessagePoller } from "@hiveweave/agent-runtime";
 import { generateText } from "ai";
 import { z } from "zod";
-import { db, lookupAgentWorkspace, ensureProjectDb, getProjectDbForAgent, agents } from "@hiveweave/db";
+import { db, lookupAgentWorkspace, ensureProjectDb, evictProjectDb, getProjectDbForAgent, agents } from "@hiveweave/db";
 import { eq } from "drizzle-orm";
 import { formatCharterForPrompt } from "@hiveweave/shared";
 import { registerAlarmTrigger } from "../game-time-scheduler.js";
@@ -42,11 +42,26 @@ function writeSSE(reply: FastifyReply, event: string, data: unknown): void {
 
 /** Set the required SSE response headers. */
 function setSSEHeaders(reply: FastifyReply): void {
+  // CORS: reply.raw bypasses @fastify/cors, so we must add Allow-Origin manually.
+  // Mirror the plugin's behavior: reflect the request Origin if it's an allowed origin.
+  const origin = reply.request.headers.origin;
+  const allowedOrigins = ["http://localhost:5173", "http://localhost:3200"];
+  const corsHeaders: Record<string, string> = {};
+  if (origin && allowedOrigins.includes(origin)) {
+    corsHeaders["Access-Control-Allow-Origin"] = origin;
+    corsHeaders["Vary"] = "Origin";
+  }
+
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+    ...corsHeaders,
   });
+  // Force immediate header transmission — critical for SSE streaming
+  // through proxies (Vite dev server, Nginx, etc.)
+  reply.raw.flushHeaders();
 }
 
 // ---------------------------------------------------------------------------
@@ -664,8 +679,37 @@ export async function chatRoutes(fastify: FastifyInstance) {
     const userMessageId = randomUUID();
     const assistantMessageId = randomUUID();
 
-    // --- Persist user message ---
-    await services.chatMessageService.saveMessage({
+    // --- Persist user message (with auto-recovery on stale DB connection) ---
+    // The projectDbCache can hold a stale/broken connection after crashes or
+    // evictions. If the first write fails with SQLITE_CANTOPEN/IOERR, evict
+    // the cached DB, create a fresh connection, and retry once.
+    const projectWsPath = services.project.workspacePath;
+    const saveWithRecovery = async (params: {
+      id: string; agentId: string; role: string; content: string;
+      toolCalls?: string; images?: string | null;
+      isBackground?: boolean; isRead?: boolean; isStreaming?: boolean;
+      createdAt: number;
+    }) => {
+      try {
+        await services.chatMessageService.saveMessage(params);
+      } catch (dbErr: any) {
+        if (
+          (dbErr.code === "SQLITE_CANTOPEN" || dbErr.code === "SQLITE_IOERR" || dbErr.code === "SQLITE_BUSY") &&
+          projectWsPath
+        ) {
+          console.warn(`[CHAT] DB ${dbErr.code} on saveMessage — evicting stale cache for ${projectWsPath} and retrying`);
+          evictProjectDb(projectWsPath);
+          const freshDb = ensureProjectDb(projectWsPath);
+          services.projectDb = freshDb;
+          services.chatMessageService = new ChatMessageService(freshDb);
+          await services.chatMessageService.saveMessage(params);
+        } else {
+          throw dbErr;
+        }
+      }
+    };
+
+    await saveWithRecovery({
       id: userMessageId,
       agentId,
       role: "user",
@@ -676,7 +720,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
       createdAt: Date.now(),
     });
 
-    await services.chatMessageService.saveMessage({
+    await saveWithRecovery({
       id: assistantMessageId,
       agentId,
       role: "assistant",
@@ -1007,6 +1051,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
     // --- Set SSE headers ---
     setSSEHeaders(reply);
+    // Disable TCP Nagle — prevents coalescing of small SSE writes into delayed packets
+    reply.raw.socket?.setNoDelay(true);
 
     // --- Send message IDs to client for dedup synchronization ---
     writeSSE(reply, "message_id", { role: "user", id: userMessageId });
@@ -1653,8 +1699,11 @@ export async function chatRoutes(fastify: FastifyInstance) {
       }
     });
 
-    // Subscribe to real-time activity events (live only — no replay of stale events)
-    const unsubActivity = statusEventBus.subscribeActivityLive((event) => {
+    // Subscribe to activity events WITH replay of recent events.
+    // This ensures late/reconnecting SSE subscribers see what currently-processing
+    // agents were doing, instead of showing "processing" with an empty activity feed.
+    // The frontend deduplicates replayed events by (agentId, timestamp, type, toolName).
+    const unsubActivity = statusEventBus.subscribeActivity((event) => {
       try {
         writeSSE(reply, "activity", event);
       } catch { /* closed */ }
@@ -1705,6 +1754,17 @@ export async function chatRoutes(fastify: FastifyInstance) {
    */
   fastify.get("/paused", async (_request, reply) => {
     return reply.send({ paused: statusEventBus.isPaused });
+  });
+
+  /**
+   * POST /reset-processing/:agentId — force-clear processing state for a stuck agent.
+   */
+  fastify.post<{ Params: { agentId: string } }>("/reset-processing/:agentId", async (request, reply) => {
+    const { agentId } = request.params;
+    statusEventBus.setProcessing(agentId, false);
+    // Also emit a done event so the activity feed properly closes
+    statusEventBus.emitActivity({ agentId, agentName: "(reset)", type: "done", timestamp: Date.now() });
+    return reply.send({ agentId, processing: false });
   });
 
   /** GET /resolved-model/:agentId — return actual model an agent would use */

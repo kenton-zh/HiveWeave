@@ -452,11 +452,26 @@ const PROJECT_DB_FILE = "data.db";
 /**
  * Get or create a per-project database at `<workspacePath>/.hiveweave/data.db`.
  * Creates the .hiveweave directory and initializes tables if they don't exist.
+ *
+ * Includes a health check: if the cached connection's underlying better-sqlite3
+ * Database is closed (e.g., after evictProjectDb or a crash), the stale cache
+ * entry is removed and a fresh connection is created.
  */
 export function ensureProjectDb(workspacePath: string): ReturnType<typeof createDb> {
   const normalized = workspacePath.replace(/\\/g, "/");
-  if (projectDbCache.has(normalized)) {
-    return projectDbCache.get(normalized)!;
+  const cached = projectDbCache.get(normalized);
+  if (cached) {
+    // Health check: verify the underlying connection is still open.
+    // After evictProjectDb() or a process crash, the cache may hold a
+    // closed Database handle — using it raises SQLITE_CANTOPEN on writes.
+    try {
+      const client = (cached as any).$client;
+      if (client && client.open === true) {
+        return cached;
+      }
+    } catch { /* fall through to recreate */ }
+    // Stale/closed connection — clean up and recreate
+    projectDbCache.delete(normalized);
   }
 
   const hwDir = join(workspacePath, HIVEWEAVE_DIR);

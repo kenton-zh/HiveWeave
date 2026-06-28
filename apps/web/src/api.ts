@@ -1,5 +1,18 @@
 const BASE = "/api";
 
+/**
+ * Returns the base URL for SSE endpoints.
+ * In dev mode, bypasses the Vite proxy (which may buffer SSE responses)
+ * by connecting directly to the backend on port 3200.
+ * In production, uses the same origin (Nginx handles SSE buffering via X-Accel-Buffering).
+ */
+function getSSEBase(): string {
+  if (typeof window !== "undefined" && window.location.hostname === "localhost") {
+    return "http://localhost:3200/api";
+  }
+  return "/api";
+}
+
 async function fetchJSON(url: string, init?: RequestInit) {
   const res = await fetch(url, init);
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
@@ -94,7 +107,7 @@ export async function updateAgent(id: string, data: { name?: string; goal?: stri
 
 export function streamChat(agentId: string, message: string, images: string[] | undefined, onEvent: (event: { type: string; data: string }) => void): AbortController {
   const controller = new AbortController();
-  fetch(`${BASE}/chat`, {
+  fetch(`${getSSEBase()}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ agentId, message, images: images?.length ? images : undefined }),
@@ -177,7 +190,7 @@ export function subscribeAgentStatus(
   function connect() {
     if (controller.signal.aborted) return;
 
-    fetch(`${BASE}/chat/status`, { signal: controller.signal })
+    fetch(`${getSSEBase()}/chat/status`, { signal: controller.signal })
       .then(async (res) => {
         if (!res.ok || !res.body) {
           throw new Error(`Status SSE: HTTP ${res.status}`);
@@ -263,6 +276,10 @@ export async function resumeSystem(): Promise<{ paused: boolean }> {
 
 export async function getPausedState(): Promise<{ paused: boolean }> {
   return fetchJSON(`${BASE}/chat/paused`);
+}
+
+export async function resetAgentProcessing(agentId: string): Promise<{ agentId: string; processing: boolean }> {
+  return fetchJSON(`${BASE}/chat/reset-processing/${agentId}`, { method: "POST" });
 }
 
 export async function getWorkLogs(agentId: string, limit = 10) {

@@ -32,9 +32,10 @@ class StatusEventBus {
   private listeners = new Set<StatusListener>();
   private activityListeners = new Set<ActivityListener>();
   private _paused = false;
-  /** Keep a rolling buffer of recent activity for late subscribers */
+  /** Keep a rolling buffer of recent activity for late subscribers.
+   *  Sized to cover multiple concurrent agents (~4 events/turn × several turns × several agents). */
   private recentActivity: ActivityEvent[] = [];
-  private readonly maxRecent = 50;
+  private readonly maxRecent = 100;
 
   /** Mark an agent as processing or idle, and broadcast the change. */
   setProcessing(agentId: string, value: boolean): void {
@@ -109,20 +110,15 @@ class StatusEventBus {
     return [...this.recentActivity];
   }
 
-  /** Subscribe to activity events. Returns unsubscribe function, replays recent events. */
+  /** Subscribe to activity events. Returns unsubscribe function, replays recent events.
+   *  Replay ensures late/reconnecting SSE subscribers see what currently-processing
+   *  agents were doing, instead of showing "processing" with an empty activity feed.
+   *  The frontend deduplicates replayed events by (agentId, timestamp, type, toolName). */
   subscribeActivity(listener: ActivityListener): () => void {
     this.activityListeners.add(listener);
     for (const event of this.recentActivity) {
       try { listener(event); } catch { /* ignore */ }
     }
-    return () => {
-      this.activityListeners.delete(listener);
-    };
-  }
-
-  /** Subscribe to live activity events only (no replay). Use for SSE reconnections. */
-  subscribeActivityLive(listener: ActivityListener): () => void {
-    this.activityListeners.add(listener);
     return () => {
       this.activityListeners.delete(listener);
     };

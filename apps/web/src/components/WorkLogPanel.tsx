@@ -9,7 +9,7 @@ interface WorkLog {
   id: string;
   type: string;
   summary: string;
-  timestamp: number;
+  createdAt: number;
   details?: string;
 }
 
@@ -18,8 +18,36 @@ const typeColors: Record<string, { bg: string; text: string }> = {
   decision: { bg: "bg-purple-500/20", text: "text-purple-300" },
   error: { bg: "bg-red-500/20", text: "text-red-300" },
   completion: { bg: "bg-green-500/20", text: "text-green-300" },
+  discussion: { bg: "bg-sky-500/20", text: "text-sky-300" },
   delegation: { bg: "bg-amber-500/20", text: "text-amber-300" },
 };
+
+/** Friendly Chinese labels for log types */
+const typeLabels: Record<string, string> = {
+  task: "任务",
+  decision: "决策",
+  error: "异常",
+  completion: "完成",
+  discussion: "派单",
+  delegation: "委派",
+};
+
+/** Extract a clean one-line summary (first line, max 100 chars) */
+function cleanSummary(raw: string): string {
+  // Strip leading markdown headers
+  const firstLine = raw.replace(/^#+\s*/, "").split("\n")[0].trim();
+  return firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine;
+}
+
+/** Try to pretty-print JSON string; return null if not JSON */
+function tryPrettyJson(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw);
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return null;
+  }
+}
 
 function formatTime(timestamp: number): string {
   const date = new Date(timestamp);
@@ -271,30 +299,97 @@ function ThinkingBlock({ content }: { content: string }) {
   );
 }
 
+// ── Work Log Entry ──────────────────────────────────────────────
+
+function WorkLogEntry({ log }: { log: WorkLog }) {
+  const [expanded, setExpanded] = useState(false);
+  const typeInfo = typeColors[log.type] || typeColors.task;
+  const label = typeLabels[log.type] || log.type;
+  const summary = cleanSummary(log.summary);
+
+  // Determine if details have meaningful content
+  const detailsRaw = log.details;
+  const hasDetails = detailsRaw && detailsRaw !== "{}" && detailsRaw !== "";
+  const prettyDetails = hasDetails ? (tryPrettyJson(detailsRaw) || detailsRaw) : null;
+
+  // Check if full summary is longer than the cleaned one-line version
+  const hasMoreSummary = log.summary.trim() !== summary;
+  const canExpand = hasDetails || hasMoreSummary;
+
+  return (
+    <div className="px-4 py-3 hover:bg-surface-border/20 transition-colors">
+      <div className="flex items-center gap-2 mb-1">
+        <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${typeInfo.bg} ${typeInfo.text}`}>
+          {label}
+        </span>
+        <span className="text-xs text-gray-500">{formatTime(log.createdAt)}</span>
+        {canExpand && (
+          <button
+            onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+            className="ml-auto text-xs text-gray-500 hover:text-gray-300 transition-colors px-2 py-0.5 rounded hover:bg-surface-border/40"
+          >
+            {expanded ? "收起 ▲" : "详情 ▼"}
+          </button>
+        )}
+      </div>
+      <p className="text-sm text-gray-300 leading-relaxed line-clamp-2">{summary}</p>
+
+      {/* Expanded: full summary + details */}
+      {expanded && (
+        <div className="mt-2 space-y-2">
+          {hasMoreSummary && (
+            <div className="text-xs text-gray-400 bg-surface-alt rounded px-3 py-2 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+              {log.summary}
+            </div>
+          )}
+          {prettyDetails && (
+            <div className="text-xs text-gray-400 bg-surface-alt rounded px-3 py-2 font-mono whitespace-pre-wrap break-all max-h-56 overflow-y-auto">
+              {prettyDetails}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Live Activity Panel ─────────────────────────────────────────
 
 export function ActivityLog({ agentId }: { agentId?: string | null }) {
   const activityFeed = useAppStore((s) => s.activityFeed);
   const clearActivity = useAppStore((s) => s.clearActivity);
-  const bottomRef = useRef<HTMLDivElement>(null);
 
   const conversations = useMemo(
     () => aggregateConversations(activityFeed, agentId),
     [activityFeed, agentId],
   );
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [conversations.length]);
+  // Group by agent: latest conversation first, plus a count of older turns
+  const agentRows = useMemo(() => {
+    const map = new Map<string, { latest: Conversation; olderCount: number }>();
+    for (let i = conversations.length - 1; i >= 0; i--) {
+      const c = conversations[i];
+      const existing = map.get(c.agentId);
+      if (!existing) {
+        map.set(c.agentId, { latest: c, olderCount: 0 });
+      } else {
+        existing.olderCount++;
+      }
+    }
+    return [...map.values()].sort((a, b) => {
+      if (a.latest.isLive !== b.latest.isLive) return a.latest.isLive ? -1 : 1;
+      return b.latest.endTime - a.latest.endTime;
+    });
+  }, [conversations]);
 
-  if (conversations.length === 0) {
+  const liveCount = agentRows.filter((r) => r.latest.isLive).length;
+
+  if (agentRows.length === 0) {
     return (
       <div className="border-t border-surface-border bg-surface-card shrink-0">
-        <div className="px-6 py-4 flex items-center justify-between border-b border-surface-border">
-          <span className="text-xs font-medium text-gray-400">Live Activity</span>
-        </div>
-        <div className="px-6 py-8 text-center">
-          <p className="text-sm text-gray-500">暂无活动</p>
+        <div className="px-4 py-2 flex items-center justify-between">
+          <span className="text-xs font-medium text-gray-500">Live Activity</span>
+          <span className="text-xs text-gray-600">空闲</span>
         </div>
       </div>
     );
@@ -303,26 +398,107 @@ export function ActivityLog({ agentId }: { agentId?: string | null }) {
   return (
     <div className="border-t border-surface-border bg-surface-card shrink-0">
       {/* Header */}
-      <div className="px-4 py-2 flex items-center justify-between border-b border-surface-border">
+      <div className="px-4 py-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-medium text-gray-400">Live Activity</span>
-          {conversations.some((c) => c.isLive) && (
-            <span className="flex items-center gap-1 text-[10px] text-emerald-400">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              {conversations.filter((c) => c.isLive).length} 进行中
+          <span className="text-xs font-medium text-gray-500">Live Activity</span>
+          {liveCount > 0 && (
+            <span className="flex items-center gap-1.5 text-xs text-emerald-400">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              {liveCount} 运行中
             </span>
           )}
         </div>
         <button onClick={clearActivity} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">清空</button>
       </div>
 
-      {/* Conversation list */}
-      <div className="max-h-96 overflow-y-auto">
-        {conversations.map((conv) => (
-          <ConversationCard key={conv.id} conv={conv} />
+      {/* Agent rows — click to expand */}
+      <div className="px-4 pb-3 space-y-1">
+        {agentRows.map(({ latest: conv, olderCount }) => (
+          <ActivityRow key={conv.agentId} conv={conv} olderCount={olderCount} />
         ))}
-        <div ref={bottomRef} />
       </div>
+    </div>
+  );
+}
+
+function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: number }) {
+  const [expanded, setExpanded] = useState(false);
+  const hasError = conv.events.some((e) => e.type === "error");
+
+  // Build preview
+  const hasTextDelta = conv.events.some((e) => e.type === "text_delta");
+  const hasThinkingDelta = conv.events.some((e) => e.type === "thinking_delta");
+  const firstText = conv.events.find((e) => hasTextDelta ? e.type === "text_delta" : e.type === "text")?.content || "";
+  const firstThink = conv.events.find((e) => hasThinkingDelta ? e.type === "thinking_delta" : e.type === "thinking")?.content || "";
+  const raw = (firstText || firstThink).replace(/\n/g, " ").trim();
+  const preview = raw.length > 100 ? raw.slice(0, 100) + "…" : raw;
+  const fullContent = firstText || firstThink;
+  const toolCount = conv.events.filter((e) => e.type === "tool_use").length;
+
+  // Thinking content for expanded view
+  const thinkingContent = conv.events
+    .filter((e) => hasThinkingDelta ? e.type === "thinking_delta" : (e.type === "thinking" || e.type === "thinking_delta"))
+    .map((e) => e.content || "")
+    .join("");
+
+  return (
+    <div
+      className="rounded-lg bg-surface-alt/50 hover:bg-surface-alt transition-colors cursor-pointer"
+      onClick={() => setExpanded(!expanded)}
+    >
+      {/* Compact row */}
+      <div className="flex items-start gap-2 px-3 py-2">
+        <span className={`w-2 h-2 rounded-full shrink-0 mt-1.5 ${conv.isLive ? "bg-emerald-400 animate-pulse" : hasError ? "bg-red-400" : "bg-gray-500"}`} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-0.5">
+            <span className="text-sm font-medium text-gray-200">{conv.agentName}</span>
+            {toolCount > 0 && (
+              <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400">{toolCount}工具</span>
+            )}
+            {olderCount > 0 && (
+              <span className="text-xs text-gray-600">+{olderCount}</span>
+            )}
+            <span className="text-xs text-gray-500 ml-auto shrink-0">{formatClock(conv.startTime)}</span>
+            <span className="text-xs text-gray-600 shrink-0">{expanded ? "▲" : "▼"}</span>
+          </div>
+          {!expanded && (
+            <p className="text-xs text-gray-500 truncate">{preview || "—"}</p>
+          )}
+        </div>
+      </div>
+
+      {/* Expanded content */}
+      {expanded && (
+        <div className="px-3 pb-3 pl-7 space-y-2">
+          {thinkingContent && (
+            <div>
+              <span className="text-xs font-medium text-purple-300 mb-1 block">思考</span>
+              <div className="text-xs text-gray-400 bg-surface-alt rounded px-3 py-2 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+                {thinkingContent}
+              </div>
+            </div>
+          )}
+          {fullContent && (
+            <div>
+              <span className="text-xs font-medium text-blue-300 mb-1 block">输出</span>
+              <div className="text-sm text-gray-300 bg-surface-alt rounded px-3 py-2 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed">
+                {fullContent}
+              </div>
+            </div>
+          )}
+          {conv.events.filter((e) => e.type === "error").map((e, i) => (
+            <div key={`err-${i}`}>
+              <span className="text-xs font-medium text-red-300 mb-1 block">错误</span>
+              <div className="text-xs text-red-300 bg-red-500/10 rounded px-3 py-2">
+                {e.errorMessage}
+              </div>
+            </div>
+          ))}
+          {!conv.isLive && !hasError && (
+            <span className="text-xs text-emerald-400">完成 · {formatTime(conv.endTime)}</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -400,7 +576,7 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
 
       {/* Log Content */}
       {isOpen && (
-        <div className="max-h-64 overflow-y-auto border-t border-surface-border">
+        <div className="max-h-80 overflow-y-auto border-t border-surface-border">
           {loading ? (
             <div className="px-6 py-4 flex justify-center">
               <div className="flex gap-1">
@@ -414,36 +590,10 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
               <p className="text-sm text-gray-500">暂无工作日志</p>
             </div>
           ) : (
-            <div className="divide-y divide-surface-border">
-              {logs.map((log) => {
-                const typeInfo = typeColors[log.type] || typeColors.task;
-                return (
-                  <div key={log.id} className="px-6 py-3 hover:bg-surface-border/20 transition-colors">
-                    <div className="flex items-start gap-3">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span
-                            className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${typeInfo.bg} ${typeInfo.text}`}
-                          >
-                            {log.type}
-                          </span>
-                          <span className="text-xs text-gray-500">
-                            {formatTime(log.timestamp)}
-                          </span>
-                        </div>
-                        <p className="text-sm text-gray-300 line-clamp-2">
-                          {log.summary}
-                        </p>
-                        {log.details && (
-                          <p className="text-xs text-gray-500 mt-1 line-clamp-2">
-                            {log.details}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+            <div className="divide-y divide-surface-border/50">
+              {logs.map((log) => (
+                <WorkLogEntry key={log.id} log={log} />
+              ))}
             </div>
           )}
         </div>

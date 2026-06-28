@@ -609,20 +609,52 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       finishTurn();
     }, 30_000);
     const allToolsUsed = new Set<string>();
+    let _dbgTextCount = 0;
+    let _dbgFirstText = 0;
     abortControllerRef.current?.abort();
     abortControllerRef.current = streamChat(sendingForAgentId, messageText, sendingImages, (event) => {
       if (!isActiveSession()) return;
       if (event.type === "message_id") {
-        loadMessagesFromDb(sendingForAgentId);
         try {
           const parsed = JSON.parse(event.data);
+          if (parsed.role === "user" && parsed.id) {
+            // Optimistic user message — appears immediately before loadMessagesFromDb resolves
+            const now = Date.now();
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === parsed.id)) return prev;
+              return [...prev, {
+                id: parsed.id, role: "user" as const, content: messageText,
+                timestamp: now, isBackground: false, isRead: true,
+              }];
+            });
+          }
           if (parsed.role === "assistant" && parsed.id) {
+            // Optimistic assistant placeholder — ensures displayMessages merge has a target
+            // before loadMessagesFromDb resolves, eliminating the async race condition
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === parsed.id)) return prev;
+              return [...prev, {
+                id: parsed.id, role: "assistant" as const, content: "",
+                timestamp: Date.now(), isBackground: false, isRead: true, isStreaming: true,
+              }];
+            });
             setStreamDraft({ assistantId: parsed.id, segments: [] });
+            console.log(`[SSE] streamDraft initialized: assistantId=${parsed.id}`);
           }
         } catch {}
+        // Load full messages from DB — will replace optimistic placeholders when resolved
+        loadMessagesFromDb(sendingForAgentId);
       } else if (event.type === "text") {
+        _dbgTextCount++;
+        if (_dbgTextCount === 1) _dbgFirstText = performance.now();
+        if (_dbgTextCount <= 3 || _dbgTextCount % 20 === 0) {
+          console.log(`[SSE] text #${_dbgTextCount}: ${event.data.length}chars, t=${(performance.now() - _dbgFirstText).toFixed(0)}ms`);
+        }
         setStreamDraft((prev) => {
-          if (!prev) return prev;
+          if (!prev) {
+            console.warn(`[SSE] text event dropped — streamDraft is null (message_id not yet processed)`);
+            return prev;
+          }
           const last = prev.segments[prev.segments.length - 1];
           if (last && last.type === "text") {
             // Append to last text segment
@@ -674,6 +706,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       } else if (event.type === "queued_message") {
         loadMessagesFromDb(sendingForAgentId);
       } else if (event.type === "done") {
+        console.log(`[SSE] done — total text events: ${_dbgTextCount}, elapsed: ${_dbgFirstText ? (performance.now() - _dbgFirstText).toFixed(0) : 'N/A'}ms`);
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setPendingApprovalTool(null);
         setRetryInfo(null);
@@ -889,11 +922,8 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
           </button>
           <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 支持粘贴图片)" className="flex-1 bg-surface border border-surface-border rounded-xl px-4 py-3 text-sm text-gray-100 resize-none focus:outline-none focus:border-accent" rows={1} disabled={isStreaming} />
-          {isStreaming ? (
-            <button onClick={handleStop} className="px-6 py-3 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-medium transition-colors">停止</button>
-          ) : (
-            <button onClick={handleSend} disabled={!input.trim() && images.length === 0} className="px-6 py-3 bg-accent text-white rounded-xl text-sm disabled:opacity-50">发送</button>
-          )}
+          <button onClick={handleSend} disabled={(!input.trim() && images.length === 0) || isStreaming} className="px-6 py-3 bg-accent text-white rounded-xl text-sm disabled:opacity-50 transition-colors">发送</button>
+          <button onClick={handleStop} disabled={!isStreaming} className="px-6 py-3 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed">停止</button>
         </div>
       </div>
 
