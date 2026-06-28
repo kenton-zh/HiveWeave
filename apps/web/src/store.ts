@@ -25,6 +25,18 @@ interface PendingApproval {
   createdAt: number;
 }
 
+/**
+ * Soonest pending alarm for an agent, used to render a countdown pill on the
+ * org-tree card. `currentGameSeconds`/`sampledAt` are sampled together so the
+ * frontend can extrapolate the live game time without an extra round-trip.
+ */
+export interface AgentAlarmInfo {
+  purpose: string;
+  fireAtGameSeconds: number;
+  currentGameSeconds: number;
+  sampledAt: number;
+}
+
 interface AppState {
   selectedAgentId: string | null;
   setSelectedAgent: (id: string | null) => void;
@@ -64,6 +76,9 @@ interface AppState {
   // User ping notification — agents that have sent user-directed messages
   userPingAgentIds: string[];
   setUserPingAgentIds: (ids: string[]) => void;
+  // Pending scheduled alarms — soonest alarm per agent (keyed by toAgentId)
+  agentAlarms: Record<string, AgentAlarmInfo>;
+  setAgentAlarms: (alarms: Record<string, AgentAlarmInfo>) => void;
   // Real-time activity feed — live agent actions visible in Logs
   activityFeed: ActivityEntry[];
   addActivity: (entry: ActivityEntry) => void;
@@ -186,6 +201,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   // User ping notifications
   userPingAgentIds: [],
   setUserPingAgentIds: (ids) => set({ userPingAgentIds: ids }),
+  // Pending scheduled alarms
+  agentAlarms: {},
+  setAgentAlarms: (alarms) => set({ agentAlarms: alarms }),
   // Live Activity: external immutable array triggers React re-render
   activityFeed: [],
   // Internal mutable buffer — deltas accumulate here without triggering React

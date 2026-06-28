@@ -67,6 +67,14 @@ export class AlarmService {
       .where(and(eq(scheduledAlarms.toAgentId, agentId), eq(scheduledAlarms.status, "pending")));
   }
 
+  /** List all pending alarms for a project (used by the frontend to render per-agent countdowns). */
+  async listPendingForProject(projectId: string) {
+    return this.db
+      .select()
+      .from(scheduledAlarms)
+      .where(and(eq(scheduledAlarms.projectId, projectId), eq(scheduledAlarms.status, "pending")));
+  }
+
   /**
    * Fire all alarms due at or before currentGameSeconds.
    * Returns list of recipients that should be auto-triggered.

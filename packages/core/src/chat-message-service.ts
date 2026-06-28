@@ -1,6 +1,6 @@
 import { chatMessages } from "@hiveweave/db";
 import type { Database } from "@hiveweave/db";
-import { eq, and, asc } from "drizzle-orm";
+import { eq, and, asc, desc } from "drizzle-orm";
 
 /**
  * ChatMessageService — persists user-visible chat history per agent.
@@ -65,15 +65,22 @@ export class ChatMessageService {
   }
 
   /**
-   * Get all messages for an agent, ordered chronologically (oldest first).
+   * Get the most recent messages for an agent, ordered chronologically (oldest first).
+   *
+   * Uses DESC + reverse (instead of ASC + LIMIT) so that when the message count
+   * exceeds the limit, the NEWEST messages are retained. A plain ASC+LIMIT would
+   * return the oldest N messages and silently drop everything recent — causing
+   * newly sent user messages to vanish from the chat panel immediately after the
+   * optimistic placeholder is overwritten by loadMessagesFromDb.
    */
   async getMessages(agentId: string, limit = 200) {
-    return this.db
+    const rows = await this.db
       .select()
       .from(chatMessages)
       .where(eq(chatMessages.agentId, agentId))
-      .orderBy(asc(chatMessages.createdAt))
+      .orderBy(desc(chatMessages.createdAt))
       .limit(limit);
+    return rows.reverse();
   }
 
   /**

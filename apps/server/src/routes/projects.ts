@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { ProjectService, OrgService, RosterService, getGameTimeService, formatGoalsForPrompt } from "@hiveweave/core";
+import { ProjectService, OrgService, RosterService, getGameTimeService, formatGoalsForPrompt, AlarmService } from "@hiveweave/core";
 import type { EnterpriseGoals } from "@hiveweave/core";
 import { db, projects, agents, ensureProjectDb, evictProjectDb, unregisterProjectAgents, registerProjectAgents } from "@hiveweave/db";
 import { randomUUID } from "crypto";
@@ -190,6 +190,56 @@ The name MUST feel earned by the story. A food-themed casual name makes sense fo
     } catch (error: any) {
       fastify.log.error(error, "Failed to get project game time");
       return reply.status(500).send({ error: "Failed to get project game time", details: error.message });
+    }
+  });
+
+  /**
+   * GET /:id/alarms — list pending scheduled alarms for a project plus the
+   * current game time, so the frontend can render a per-agent countdown of how
+   * long until each agent's alarm fires.
+   */
+  fastify.get<{ Params: { id: string } }>("/:id/alarms", async (request, reply) => {
+    const { id } = request.params;
+    try {
+      const project = await projectService.getProject(id);
+      if (!project) return reply.status(404).send({ error: "Project not found" });
+      await gameTimeService.initProject(id);
+      const currentGameSeconds = gameTimeService.getCurrentGameSeconds(id);
+
+      let alarms: Array<{
+        id: string;
+        fromAgentId: string;
+        toAgentId: string;
+        purpose: string;
+        fireAtGameSeconds: number;
+      }> = [];
+
+      if (project.workspacePath) {
+        try {
+          const projectDb = ensureProjectDb(project.workspacePath);
+          const alarmService = new AlarmService(projectDb);
+          const rows = await alarmService.listPendingForProject(id);
+          alarms = rows.map((a) => ({
+            id: a.id,
+            fromAgentId: a.fromAgentId,
+            toAgentId: a.toAgentId,
+            purpose: a.purpose,
+            fireAtGameSeconds: a.fireAtGameSeconds,
+          }));
+        } catch (err) {
+          fastify.log.warn({ err }, "Failed to load alarms for project");
+        }
+      }
+
+      return {
+        projectId: id,
+        currentGameSeconds,
+        realTimestamp: Date.now(),
+        alarms,
+      };
+    } catch (error: any) {
+      fastify.log.error(error, "Failed to get project alarms");
+      return reply.status(500).send({ error: "Failed to get project alarms", details: error.message });
     }
   });
 

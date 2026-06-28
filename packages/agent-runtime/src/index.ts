@@ -23,3 +23,4 @@ export {
 export type { ErrorCategory, ClassifiedError, RateLimitInfo } from "./retry-utils.js";
 export { ToolOutputStore } from "./tool-output-store.js";
 export type { TruncateOptions, TruncateResult } from "./tool-output-store.js";
+export { withIdleTimeout, StreamIdleTimeoutError, isStreamIdleTimeout } from "./stream-timeout.js";

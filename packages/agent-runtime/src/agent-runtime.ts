@@ -13,6 +13,7 @@ import {
   parseRetryAfterMs,
 } from "./retry-utils.js";
 import { ToolOutputStore } from "./tool-output-store.js";
+import { withIdleTimeout, isStreamIdleTimeout } from "./stream-timeout.js";
 
 // ---------------------------------------------------------------------------
 // Local overflow detection (avoids importing @hiveweave/core)
@@ -222,6 +223,18 @@ export type Message =
 const MAX_TURNS = 200;
 /** Doom loop threshold — same tool + same args N times in a row. */
 const DOOM_LOOP_THRESHOLD = 3;
+
+/**
+ * Stream idle timeout (防线 ②).
+ *
+ * Two-phase thresholds to avoid killing long-thinking models on first token:
+ *   - FIRST_CHUNK: max wait before the first chunk arrives (tolerates o1 / Claude thinking).
+ *   - IDLE:        max wait between consecutive chunks after the first.
+ *
+ * Tunable via env so operators can adjust without redeploying.
+ */
+const STREAM_FIRST_CHUNK_MS = Number(process.env.HW_STREAM_FIRST_MS ?? 120_000);
+const STREAM_IDLE_MS = Number(process.env.HW_STREAM_IDLE_MS ?? 60_000);
 
 // ---------------------------------------------------------------------------
 // Tool output truncation — keep stored history compact
@@ -1247,6 +1260,29 @@ export class AgentRuntime {
       const attemptToolCalls: ToolCall[] = [];
       let attemptUsageTotal = 0;
 
+      // ── 统一 HTTP 取消机制 (Unified HTTP Cancellation) ──────────────
+      // 每次尝试创建独立的 AbortController，signal 传给 streamText() → fetch()。
+      // 这样当超时触发时，调用 controller.abort() 就能立即终止底层 TCP 连接。
+      //
+      // 两个触发源：
+      //   1. 空闲超时 (防线 ②) 抛出 StreamIdleTimeoutError → catch 块中调 controller.abort()
+      //   2. 硬超时定时器 (REQUEST_TIMEOUT_MS) 兜底 → controller.abort()
+      //
+      // 为什么需要这个：
+      //   withIdleTimeout 的 finally 只调 it.return() (fire-and-forget)，释放了
+      //   JS 迭代器但不会终止 HTTP 连接。没有 controller.abort()，TCP 连接会
+      //   僵尸存活直到 timeoutFetch 的 AbortSignal.timeout(180s) 才被清理。
+      //   重试时会创建新连接，旧连接持续占用资源。
+      //
+      // abortSignal 传给 streamText() 后，AI SDK 会将其传给 fetch()。
+      // timeoutFetch 中通过 AbortSignal.any([init.signal, timeoutSignal]) 合并，
+      // 所以 controller.abort() 和 AbortSignal.timeout(180s) 任一触发都会终止连接。
+      const controller = new AbortController();
+      const hardTimer = setTimeout(
+        () => controller.abort(),
+        Number(process.env.HW_REQUEST_TIMEOUT_MS ?? 180_000),
+      );
+
       try {
         // Create provider instance from config
         const providerFactory = createProviderInstance(
@@ -1281,12 +1317,16 @@ export class AgentRuntime {
           tools: Object.keys(sdkTools).length > 0 ? sdkTools : undefined,
           maxOutputTokens: this.config.maxOutputTokens,
           temperature: this.config.temperature,
+          abortSignal: controller.signal, // 防线 ①: abort 立即终止底层 TCP 连接
           ...providerOptions,
         });
 
         // Stream events from AI SDK (v6: text-delta uses `.text`, reasoning via `reasoning-delta`,
         // tool-call parts use `.input`)
-        for await (const part of result.fullStream) {
+        // 防线 ②: idle watchdog — catches silent hangs where the connection stays
+        // open but no chunks arrive (half-open TCP, provider-side stall).
+        // Throws StreamIdleTimeoutError → caught by the outer catch → retry / error.
+        for await (const part of withIdleTimeout(result.fullStream, STREAM_FIRST_CHUNK_MS, STREAM_IDLE_MS)) {
           switch (part.type) {
             case "text-delta":
               attemptText += part.text;
@@ -1335,6 +1375,22 @@ export class AgentRuntime {
       } catch (err: any) {
         lastError = err.message || "Unknown error";
 
+        // 立即终止 HTTP 连接。无论是空闲超时、硬超时还是其他错误，
+        // 都要确保底层 TCP 连接被清理，防止僵尸连接累积。
+        // - 空闲超时：withIdleTimeout 释放了 JS 迭代器但没终止 HTTP 连接
+        // - HTTP 错误：连接可能已关闭，abort 是 no-op
+        // - 正常完成不会走到这里
+        controller.abort();
+
+        // 防线 ②: stream idle timeout — log clearly for diagnosis.
+        // classifyNetworkError will mark it retryable, so the existing retry
+        // chain (backoff + retry event) handles recovery automatically.
+        if (isStreamIdleTimeout(err)) {
+          console.warn(
+            `[RUNTIME:${this.config.agentName}] Stream idle timeout (${err.idleMs}ms, ${err.isfirstChunk ? "first-chunk" : "idle"}) — will retry if budget allows`,
+          );
+        }
+
         // Check if this is a context overflow — not retryable
         if (isContextOverflow(lastError)) {
           console.error(`[RUNTIME:${this.config.agentName}] Context overflow detected: ${lastError}`);
@@ -1369,6 +1425,12 @@ export class AgentRuntime {
           metadata: { attempt: attempt + 1, maxRetries: MAX_RETRIES, delayMs: delay, category: classified.category },
         };
         await new Promise((r) => setTimeout(r, delay));
+      } finally {
+        // 无论成功、失败还是重试，都要清除硬超时定时器。
+        // 如果不清除，定时器会在 180s 后调用 controller.abort()，
+        // 此时 controller 已废弃，abort 是 no-op，但定时器本身会
+        // 持续占用内存直到触发。在连续多轮对话中会累积大量废弃定时器。
+        clearTimeout(hardTimer);
       }
     }
 

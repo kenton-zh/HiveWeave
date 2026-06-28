@@ -40,6 +40,25 @@ export async function getProjectGameTime(projectId: string) {
   return fetchJSON(`${BASE}/projects/${projectId}/game-time`);
 }
 
+export interface ProjectAlarm {
+  id: string;
+  fromAgentId: string;
+  toAgentId: string;
+  purpose: string;
+  fireAtGameSeconds: number;
+}
+
+export interface ProjectAlarmsResponse {
+  projectId: string;
+  currentGameSeconds: number;
+  realTimestamp: number;
+  alarms: ProjectAlarm[];
+}
+
+export async function getProjectAlarms(projectId: string): Promise<ProjectAlarmsResponse> {
+  return fetchJSON(`${BASE}/projects/${projectId}/alarms`);
+}
+
 export async function deleteProject(id: string) {
   return fetchJSON(`${BASE}/projects/${id}`, { method: "DELETE" });
 }

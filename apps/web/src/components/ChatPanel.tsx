@@ -716,10 +716,26 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         setStreamDraft(null);
         setIsStreaming(false);
         finishTurn();
+      } else if (event.type === "busy") {
+        // Agent is processing a previous message — restore input so user doesn't lose their text
+        if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
+        setInput(messageText);
+        setStreamDraft(null);
+        setIsStreaming(false);
+        setRetryInfo(null);
+        // Drain queue since we can't send
+        pendingQueueRef.current = [];
+        setQueuedCount(0);
+        autoSendRef.current = false;
       } else if (event.type === "error") {
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setRetryInfo(null);
-        setStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "text", content: "\n\nError: " + event.data }] } : prev);
+        if (streamDraft) {
+          setStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "text", content: "\n\nError: " + event.data }] } : prev);
+        } else {
+          // streamDraft is null (server unreachable / no message_id received) — restore input
+          setInput(messageText);
+        }
         loadMessagesFromDb(sendingForAgentId);
         setStreamDraft(null);
         setIsStreaming(false);

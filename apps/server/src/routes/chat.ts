@@ -3,7 +3,7 @@ import { randomUUID } from "crypto";
 import { OrgService, MemoryService, DispatchService, ToolExecutor, HandoffService, InboxService, ChatMessageService, TeamChatService, RosterService, FileService, ProjectService, communicationService, userPingTracker, drainQuestions, answerQuestion, getTodos, conversationStore, clawhubService, calculateHistoryBudget, estimateTokens, computePrefixHash, buildCompactionPrompt, statusEventBus, TemplateService, PermissionService, ApprovalService, waitForApprovalResponse, cancelApprovalWait, ModelService, ShellService, WebService, getGameTimeService, AlarmService, buildTimeContextBlock, prefixTriggerMessage, SettingsService, formatGoalsForPrompt, TOOL_OUTPUT_MAX_CHARS_COMPACTION } from "@hiveweave/core";
 import type { ReviewLLMCallback } from "@hiveweave/core";
 import type { StoredMessage } from "@hiveweave/core";
-import { AgentRuntime, buildIdentityPrompt, createProviderInstance, ToolOutputStore } from "@hiveweave/agent-runtime";
+import { AgentRuntime, buildIdentityPrompt, createProviderInstance, ToolOutputStore, withIdleTimeout } from "@hiveweave/agent-runtime";
 import type { AgentRuntimeConfig, StreamEvent, ToolExecutorCallback, Message, QueuedMessage, MessagePoller } from "@hiveweave/agent-runtime";
 import { generateText } from "ai";
 import { z } from "zod";
@@ -518,8 +518,27 @@ export async function chatRoutes(fastify: FastifyInstance) {
   // Prefix hash drift detection — tracks changes to the static prompt portion
   const prefixHashTracker = new Map<string, string>();
 
-  // Track agents currently running auto-trigger to prevent concurrent execution
+  // Track agents currently running auto-trigger to prevent concurrent execution.
+  //
+  // CRITICAL: the `delete(agentId)` call MUST live in a `finally` block. If it
+  // ever moves into `try` (or gets dropped on an error path), any agent that
+  // throws mid-turn will be permanently stuck in this Set — every future
+  // trigger short-circuits at the guard and the agent is silent forever.
+  // This was a real bug in the zombie-PROCESSING investigation.
   const runningAutoTriggers = new Set<string>();
+
+  // 防线 ③: turn-level idle timeout (event stream watchdog).
+  //
+  // Wraps the `for await (event of runtime.chat(...))` loops so a turn that
+  // goes silent (tool execution hang like `uvicorn --reload`, approval waiter
+  // never resolving, mid-stream stall after Defense Lines ①/②) is aborted
+  // and the catch block can emit an error event + flip processing state.
+  //
+  // Threshold deliberately > bash tool default timeout (120s) so legitimate
+  // long commands aren't killed. Lowering this below 120s will start
+  // aborting turns mid-tool-execution — do NOT do that without also
+  // shortening the bash timeout.
+  const TURN_IDLE_MS = Number(process.env.HW_TURN_IDLE_MS ?? 300_000); // 5 min
 
   // ── Empty-response retry tracking with exponential backoff ──────────────────
   // When an agent's LLM call returns empty (no text, no tool calls), we schedule a
@@ -844,7 +863,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
             let expertFullText = "";
             const expertToolCallsLog: Array<{ name: string; args: any }> = [];
             try {
-              for await (const event of expertRuntime.chat(redirectedMsg)) {
+              for await (const event of withIdleTimeout(expertRuntime.chat(redirectedMsg), TURN_IDLE_MS, TURN_IDLE_MS)) {
                 if (event.type === "text") {
                   expertFullText += event.content || "";
                   writeSSE(reply, "text", event.content);
@@ -2137,7 +2156,9 @@ export async function chatRoutes(fastify: FastifyInstance) {
         }
       };
 
-      for await (const event of runtime.chat(prefixTriggerForProject(subAgent.projectId, userMsg))) {
+      // 防线 ②+③: wrap with idle watchdog. Removing this wrapper restores the
+      // zombie-PROCESSING bug — a hung stream/tool/approval will block forever.
+      for await (const event of withIdleTimeout(runtime.chat(prefixTriggerForProject(subAgent.projectId, userMsg)), TURN_IDLE_MS, TURN_IDLE_MS)) {
         if (event.type === "thinking") {
           subThinkBuf += event.content;
           if (!subThinkDeltaId) subThinkDeltaId = randomUUID();
@@ -2301,11 +2322,35 @@ export async function chatRoutes(fastify: FastifyInstance) {
           );
         }
       }
+    } catch (turnErr: any) {
+      // 防线 ③: catch turn-level stalls.
+      //
+      // WHY THIS CATCH MUST EXIST: without it, an idle-timeout (or any throw
+      // from runtime.chat) would propagate up, skip the `done` activity emit,
+      // and leave the agent pinned at `processing: true` forever — the
+      // original zombie-PROCESSING bug. The error event emitted here is what
+      // makes the Live Activity panel show *why* the turn ended instead of
+      // showing a blank panel under a "PROCESSING" indicator.
+      //
+      // DO NOT remove the emitActivity({type:"error"}) — without it the UI
+      // has no way to distinguish "turn ended cleanly" from "turn crashed".
+      const reason = turnErr?.message || String(turnErr);
+      fastify.log.error({ err: turnErr, agentId }, `triggerSubordinate turn aborted: ${reason}`);
+      statusEventBus.emitActivity({
+        agentId, agentName: subAgent.name, type: "error",
+        errorMessage: `Turn aborted: ${reason}`,
+        timestamp: Date.now(),
+      });
     } finally {
+      // CRITICAL — state flip trio. Removing ANY of these three lines
+      // re-introduces the zombie-PROCESSING bug:
+      //   1. emitActivity(done)     — closes the Live Activity conversation card
+      //   2. setProcessing(false)   — flips the agent node from PROCESSING back to idle
+      //   3. runningAutoTriggers.delete — re-enables future auto-triggers (else permanent deadlock)
+      // Plus the streaming-flag clear, which prevents zombie `is_streaming=true` rows.
       statusEventBus.emitActivity({ agentId, agentName: subAgent.name, type: "done", timestamp: Date.now() });
       statusEventBus.setProcessing(agentId, false);
       runningAutoTriggers.delete(agentId);
-      // Clear streaming flag — prevents zombie messages if we exited before updateMessage
       try { await subServices.chatMessageService.updateMessage(bgAssistantId, { isStreaming: false }); } catch { /* best-effort */ }
     }
   }
@@ -2393,8 +2438,22 @@ export async function chatRoutes(fastify: FastifyInstance) {
     const coordAssistantId = randomUUID();
     const coordAgent = resolved; // Hoisted out of try{} so finally{} can reference it
     try {
-      statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "thinking", content: "Auto-triggered", timestamp: Date.now() });
-
+      // NOTE: do NOT emit a placeholder "Auto-triggered" thinking event here.
+      //
+      // An earlier version did:
+      //   emitActivity({ type: "thinking", content: "Auto-triggered", ... })
+      // This polluted the Live Activity panel — the frontend concatenates all
+      // `thinking`/`thinking_delta` events' content into ThinkingBlock and uses
+      // the first thinking event for the card preview, so "Auto-triggered"
+      // appeared at the top of the thinking block AND as the card preview
+      // (making it look like both "thinking" and "output" were "Auto-triggered").
+      //
+      // triggerSubordinate (the parallel path) does not emit any such
+      // placeholder and works fine — the real `thinking_delta`/`text_delta`
+      // events from the stream populate Live Activity within ~1s. If you ever
+      // need to surface "this turn was auto-triggered", use a dedicated
+      // metadata field (e.g. metadata.triggerReason) on the done event, NOT
+      // a fake thinking event with string content.
       await coordServices.chatMessageService.saveMessage({
         id: coordAssistantId,
         agentId: coordinatorId,
@@ -2648,7 +2707,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
         }
       };
 
-      for await (const event of runtime.chat(prefixTriggerForProject(coordAgent.projectId, userMsg))) {
+      // 防线 ②+③: wrap with idle watchdog. See triggerSubordinate for rationale.
+      for await (const event of withIdleTimeout(runtime.chat(prefixTriggerForProject(coordAgent.projectId, userMsg)), TURN_IDLE_MS, TURN_IDLE_MS)) {
         if (event.type === "thinking") {
           coordThinkBuf += event.content;
           if (!coordThinkDeltaId) coordThinkDeltaId = randomUUID();
@@ -2816,11 +2876,23 @@ export async function chatRoutes(fastify: FastifyInstance) {
         }
       }
 
+    } catch (turnErr: any) {
+      // 防线 ③: catch turn-level stalls. See triggerSubordinate for the full
+      // rationale — same rules apply: catch must exist (else zombie PROCESSING),
+      // error activity must be emitted (else blank Live Activity panel).
+      const reason = turnErr?.message || String(turnErr);
+      fastify.log.error({ err: turnErr, agentId: coordinatorId }, `triggerCoordinator turn aborted: ${reason}`);
+      statusEventBus.emitActivity({
+        agentId: coordinatorId, agentName: coordAgent.name, type: "error",
+        errorMessage: `Turn aborted: ${reason}`,
+        timestamp: Date.now(),
+      });
     } finally {
+      // CRITICAL — state flip trio. See triggerSubordinate finally for why
+      // none of these three lines can be removed.
       statusEventBus.emitActivity({ agentId: coordinatorId, agentName: coordAgent.name, type: "done", timestamp: Date.now() });
       statusEventBus.setProcessing(coordinatorId, false);
       runningAutoTriggers.delete(coordinatorId);
-      // Clear streaming flag — prevents zombie messages if we exited before updateMessage
       try { await coordServices.chatMessageService.updateMessage(coordAssistantId, { isStreaming: false }); } catch { /* best-effort */ }
     }
   }

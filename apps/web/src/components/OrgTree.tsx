@@ -2,9 +2,10 @@ import {
   useEffect, useState, useCallback, useRef, useMemo, useLayoutEffect,
 } from "react";
 import ApprovalDialog from "./ApprovalDialog";
-import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings } from "../api";
-import { useAppStore } from "../store";
+import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings, getProjectAlarms } from "../api";
+import { useAppStore, type AgentAlarmInfo } from "../store";
 import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
+import { realMsToGameSeconds, gameSecondsToRealMs, decomposeGameSeconds } from "@hiveweave/shared";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -300,9 +301,23 @@ const ROLE_COLORS: Record<string, string> = {
   devops: "#06b6d4",
 };
 
+/** Format a real-time millisecond countdown into a compact label, e.g. "30秒", "5分12秒", "2时15分". */
+function formatAlarmCountdown(realMs: number): string {
+  if (realMs <= 0) return "即将";
+  const totalSec = Math.floor(realMs / 1000);
+  const d = Math.floor(totalSec / 86400);
+  const h = Math.floor((totalSec % 86400) / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (d > 0) return `${d}天${h}时`;
+  if (h > 0) return `${h}时${m}分`;
+  if (m > 0) return `${m}分${s}秒`;
+  return `${s}秒`;
+}
+
 function TreeNodeCard({
   node, isSelected, onSelect, onAddChild, onApproval, onToggle,
-  expanded, pendingCount, hasUserPing, isProcessing, isActive, nodeH,
+  expanded, pendingCount, hasUserPing, isProcessing, isActive, nodeH, alarm,
 }: {
   node: LayoutNode;
   isSelected: boolean;
@@ -316,12 +331,36 @@ function TreeNodeCard({
   isProcessing: boolean;
   isActive: boolean;
   nodeH: number;
+  alarm?: AgentAlarmInfo;
 }) {
   const compact = nodeH < 42;
   const hasChildren = !!node.children?.length;
   const roleStyle = getRoleStyle(node.role);
   const positionLabel = getPositionLabel(node.position, node.role);
   const accentColor = ROLE_COLORS[node.role] || "#6b7280";
+
+  // Live countdown tick — only runs while this agent has a pending alarm.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!alarm) return;
+    setNow(Date.now());
+    const i = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(i);
+  }, [alarm]);
+
+  // Extrapolate current game time from the sampled snapshot, then compute the
+  // remaining real time until the alarm fires.
+  let alarmLabel: string | null = null;
+  let alarmTitle = "";
+  if (alarm) {
+    const elapsedGameSec = realMsToGameSeconds(now - alarm.sampledAt);
+    const currentGameSec = alarm.currentGameSeconds + elapsedGameSec;
+    const remainingGameSec = alarm.fireAtGameSeconds - currentGameSec;
+    const remainingRealMs = gameSecondsToRealMs(remainingGameSec);
+    alarmLabel = formatAlarmCountdown(remainingRealMs);
+    const gt = decomposeGameSeconds(Math.max(0, remainingGameSec));
+    alarmTitle = `闹钟：${alarm.purpose}\n剩余游戏时间：${gt.day}天${gt.hours}时${gt.minutes}分`;
+  }
 
   return (
     <div
@@ -396,6 +435,19 @@ function TreeNodeCard({
           </span>
         ) : <span />}
         <span className="flex-1" />
+        {alarmLabel && (
+          <span
+            title={alarmTitle}
+            className={`shrink-0 font-medium bg-sky-500/20 text-sky-300 rounded leading-none flex items-center gap-0.5 ${
+              compact ? "text-[8px] px-0.5 py-px" : "text-[10px] px-1 py-0.5"
+            }`}
+          >
+            <svg className={compact ? "w-1.5 h-1.5" : "w-2 h-2"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            {alarmLabel}
+          </span>
+        )}
         {pendingCount > 0 && (
           <span
             onClick={(e) => { e.stopPropagation(); onApproval(node.id); }}
@@ -482,12 +534,14 @@ function OrgTree() {
   const setActiveCommunications = useAppStore((s) => s.setActiveCommunications);
   const setAllPendingApprovals = useAppStore((s) => s.setAllPendingApprovals);
   const setUserPingAgentIds = useAppStore((s) => s.setUserPingAgentIds);
+  const setAgentAlarms = useAppStore((s) => s.setAgentAlarms);
   const selectedAgentId = useAppStore((s) => s.selectedAgentId);
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
   const openAddAgent = useAppStore((s) => s.openAddAgent);
   const pendingApprovals = useAppStore((s) => s.pendingApprovals);
   const userPingAgentIds = useAppStore((s) => s.userPingAgentIds);
   const processingAgents = useAppStore((s) => s.processingAgents);
+  const agentAlarms = useAppStore((s) => s.agentAlarms);
 
   // State
   const [roots, setRoots] = useState<OrgNodeData[]>([]);
@@ -577,6 +631,35 @@ function OrgTree() {
     const i = setInterval(poll, 3000);
     return () => { mounted = false; clearInterval(i); };
   }, []);
+
+  // Polling: pending scheduled alarms (per-agent countdown pills)
+  useEffect(() => {
+    if (!selectedProjectId) { setAgentAlarms({}); return; }
+    let mounted = true;
+    const poll = async () => {
+      try {
+        const data = await getProjectAlarms(selectedProjectId);
+        if (!mounted) return;
+        // Keep only the soonest pending alarm per recipient agent
+        const map: Record<string, AgentAlarmInfo> = {};
+        for (const a of data.alarms) {
+          const ex = map[a.toAgentId];
+          if (!ex || a.fireAtGameSeconds < ex.fireAtGameSeconds) {
+            map[a.toAgentId] = {
+              purpose: a.purpose,
+              fireAtGameSeconds: a.fireAtGameSeconds,
+              currentGameSeconds: data.currentGameSeconds,
+              sampledAt: data.realTimestamp,
+            };
+          }
+        }
+        setAgentAlarms(map);
+      } catch { /* ignore */ }
+    };
+    poll();
+    const i = setInterval(poll, 3000);
+    return () => { mounted = false; clearInterval(i); };
+  }, [selectedProjectId]);
 
   const handleSelect = useCallback((id: string) => setSelectedAgent(id), [setSelectedAgent]);
 
@@ -853,6 +936,7 @@ function OrgTree() {
                     isProcessing={processingAgents.includes(n.id)}
                     isActive={n.status === "active"}
                     nodeH={params.nodeH}
+                    alarm={agentAlarms[n.id]}
                   />
                 ))}
               </div>
