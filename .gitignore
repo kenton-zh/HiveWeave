@@ -79,6 +79,9 @@ tsc_out.txt
 # Misc
 after-select.yaml
 
+# Design docs (local only)
+docs/AI工程组织_MVP蓝图.md
+
 # Generated assets
 image/
 apps/web/public/sprites/
