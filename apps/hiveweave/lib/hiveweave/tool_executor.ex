@@ -455,7 +455,7 @@ defmodule HiveWeave.ToolExecutor do
           "type" => "object",
           "properties" => %{
             "toAgentId" => %{"type" => "string", "description" => "Subordinate name/short_id/role/UUID"},
-            "description" => %{"type" => "string", "description" => "Clear task description for the subordinate"},
+            "description" => %{"type" => "string", "description" => "Task description for subordinate. CAVEMAN style: terse, drop articles/filler, fragments OK. Keep technical terms, file paths, exact. NOT for user."},
             "expectReport" => %{"type" => "boolean", "description" => "If true, subordinate MUST report back results (default: true)"}
           },
           "required" => ["toAgentId", "description"]
@@ -629,7 +629,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "summary" => %{"type" => "string", "description" => "Summary of what was accomplished"},
+            "summary" => %{"type" => "string", "description" => "Summary of what was accomplished. CAVEMAN style: terse, drop articles/filler, fragments OK. Keep technical terms, file paths, exact. Example: 'Login done. JWT auth + bcrypt. 3 files. Tests pass.'"},
             "handoffId" => %{"type" => "string", "description" => "Specific handoff ID (optional, defaults to most recent)"}
           }
         }
@@ -646,7 +646,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "message" => %{"type" => "string", "description" => "The message content"},
+            "message" => %{"type" => "string", "description" => "Message content. CAVEMAN style: terse, drop articles/filler, fragments OK. Keep technical terms, file paths, exact. NOT for user."},
             "priority" => %{"type" => "string", "enum" => ["low", "normal", "urgent"], "description" => "Message priority (default: normal)"}
           },
           "required" => ["message"]
@@ -664,7 +664,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "content" => %{"type" => "string", "description" => "Message content"},
+            "content" => %{"type" => "string", "description" => "Message content. If recipient is 'user': normal, complete, friendly. If recipient is an agent: CAVEMAN style — terse, drop articles/filler, fragments OK, keep technical terms exact."},
             "recipients" => %{"type" => "array", "items" => %{"type" => "string"}, "description" => "Agent name/short_id/role or 'user'"},
             "expectReport" => %{"type" => "boolean", "description" => "If true, expect a reply (default: false)"},
             "priority" => %{"type" => "string", "enum" => ["low", "normal", "urgent"], "description" => "Priority (default: normal)"}
