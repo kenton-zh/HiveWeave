@@ -16,7 +16,12 @@ defmodule HiveWeave.SkillRegistry do
 
   require Logger
 
-  # ── Built-in skill registry ──────────────────────────────────
+  # ── External skill source (agent-skills project) ────────────
+  # Skills loaded from filesystem. .compressed.md preferred over .md.
+  @external_skills_dir "d:/PC_AI/Project/agent-skills/skills"
+  @external_agents_dir "d:/PC_AI/Project/agent-skills/agents"
+
+  # ── Built-in skill registry (fallback) ──────────────────────
 
   @builtin_skills [
     %{
@@ -168,23 +173,19 @@ defmodule HiveWeave.SkillRegistry do
 
   # ── Public API ───────────────────────────────────────────────
 
-  @doc "List built-in skills, optionally filtered by search keyword."
+  @doc "List all skills — external (agent-skills) + built-in, optionally filtered."
   def list_builtin_skills(search \\ nil) do
-    case search do
-      nil -> @builtin_skills
-      "" -> @builtin_skills
-      keyword ->
-        k = String.downcase(keyword)
-        Enum.filter(@builtin_skills, fn s ->
-          String.contains?(String.downcase(s.slug), k) or
-          String.contains?(String.downcase(s.description), k)
-        end)
-    end
+    external = list_external_skills(nil)
+    all = external ++ @builtin_skills
+    filter_skills(all, search)
   end
 
-  @doc "Get a built-in skill by slug."
+  @doc "Get a skill by slug — checks external (agent-skills) first, then built-in."
   def get_builtin_skill(slug) do
-    Enum.find(@builtin_skills, fn s -> s.slug == slug end)
+    case get_external_skill(slug) do
+      nil -> Enum.find(@builtin_skills, fn s -> s.slug == slug end)
+      external -> external
+    end
   end
 
   @doc "List built-in MCP servers."
@@ -245,16 +246,25 @@ defmodule HiveWeave.SkillRegistry do
   def get_skill_detail(slug) do
     slug = String.trim(slug)
 
-    case get_builtin_skill(slug) do
-      %{instructions: instructions, description: desc} ->
+    cond do
+      # External skill (agent-skills filesystem)
+      get_external_skill(slug) != nil ->
+        %{description: desc} = get_external_skill(slug)
+        content = case read_external_skill_file(slug) do
+          {:ok, c} -> c
+          :not_found -> "Instructions not available."
+        end
+        "## Skill: #{slug}\n\n**Description:** #{desc}\n\n**Source:** agent-skills\n\n---\n\n#{content}"
+
+      # Built-in skill
+      %{instructions: instructions, description: desc} = Enum.find(@builtin_skills, fn s -> s.slug == slug end) ->
         "## Skill: #{slug}\n\n**Description:** #{desc}\n\n**Source:** Built-in\n\n---\n\n#{instructions}"
 
-      nil ->
+      true ->
         # Try ClawHub
         case fetch_clawhub_detail(slug) do
           {:ok, detail} ->
             "## Skill: #{slug}\n\n**Description:** #{detail[:summary] || detail[:description] || "No description"}\n\n**Source:** ClawHub Marketplace\n\n---\n\n#{detail[:skill_md] || "No instructions available."}"
-
           {:error, _reason} ->
             "Skill \"#{slug}\" not found in built-in registry or ClawHub. Use `list_available_skills` to search for available skills."
         end
@@ -263,26 +273,29 @@ defmodule HiveWeave.SkillRegistry do
 
   @doc """
   Read a skill's full instructions — used at runtime by agents.
-  Checks agent's bound skills first, then any skill by slug.
+  Checks external skills (agent-skills dir) first, then built-in, then ClawHub.
+  For external skills, reads .compressed.md first, falls back to .md.
   """
   def read_skill(slug, bound_skills \\ []) do
     slug = String.trim(slug)
-
-    # If agent has bound skills, check if this slug is bound
     is_bound = slug in bound_skills
     prefix = if is_bound, do: "(Bound skill) ", else: ""
 
-    case get_builtin_skill(slug) do
-      %{instructions: instructions} ->
-        "#{prefix}#{instructions}"
-
-      nil ->
-        case fetch_clawhub_detail(slug) do
-          {:ok, detail} ->
-            "#{prefix}#{detail[:skill_md] || detail[:summary] || "No instructions available."}"
-
-          {:error, _} ->
-            "Skill \"#{slug}\" not found. Use `list_available_skills` to discover available skills."
+    # 1. Try external skill file (.compressed.md first, then .md)
+    case read_external_skill_file(slug) do
+      {:ok, content} -> "#{prefix}#{content}"
+      :not_found ->
+        # 2. Try built-in
+        case get_builtin_skill(slug) do
+          %{instructions: instructions} -> "#{prefix}#{instructions}"
+          nil ->
+            # 3. Try ClawHub
+            case fetch_clawhub_detail(slug) do
+              {:ok, detail} ->
+                "#{prefix}#{detail[:skill_md] || detail[:summary] || "No instructions available."}"
+              {:error, _} ->
+                "Skill \"#{slug}\" not found. Use `list_available_skills` to discover available skills."
+            end
         end
     end
   end
@@ -386,4 +399,103 @@ defmodule HiveWeave.SkillRegistry do
   end
 
   defp parse_json_list(_), do: []
+
+  # ── External skill loading (agent-skills filesystem) ────────
+
+  defp filter_skills(skills, nil), do: skills
+  defp filter_skills(skills, ""), do: skills
+  defp filter_skills(skills, keyword) do
+    k = String.downcase(keyword)
+    Enum.filter(skills, fn s ->
+      String.contains?(String.downcase(s.slug || ""), k) or
+      String.contains?(String.downcase(s[:description] || ""), k)
+    end)
+  end
+
+  def list_external_skills(search \\ nil) do
+    case File.ls(@external_skills_dir) do
+      {:ok, dirs} ->
+        skills = Enum.flat_map(dirs, fn dir ->
+          skill_path = Path.join([@external_skills_dir, dir, "SKILL.md"])
+          if File.exists?(skill_path) do
+            case parse_frontmatter(skill_path) do
+              {:ok, %{name: name, description: desc}} ->
+                [%{slug: dir, name: name, description: desc, source: :external}]
+              _ -> []
+            end
+          else
+            []
+          end
+        end)
+        filter_skills(skills, search)
+      _ -> []
+    end
+  end
+
+  def get_external_skill(slug) do
+    skill_path = Path.join([@external_skills_dir, slug, "SKILL.md"])
+    if File.exists?(skill_path) do
+      case parse_frontmatter(skill_path) do
+        {:ok, %{name: name, description: desc}} ->
+          %{slug: slug, name: name, description: desc, source: :external}
+        _ -> nil
+      end
+    else
+      nil
+    end
+  end
+
+  def read_external_skill_file(slug) do
+    compressed = Path.join([@external_skills_dir, slug, "SKILL.compressed.md"])
+    original = Path.join([@external_skills_dir, slug, "SKILL.md"])
+
+    cond do
+      File.exists?(compressed) -> {:ok, File.read!(compressed)}
+      File.exists?(original) -> {:ok, File.read!(original)}
+      true -> :not_found
+    end
+  end
+
+  def read_external_persona(name) do
+    compressed = Path.join(@external_agents_dir, "#{name}.compressed.md")
+    original = Path.join(@external_agents_dir, "#{name}.md")
+
+    cond do
+      File.exists?(compressed) -> {:ok, File.read!(compressed)}
+      File.exists?(original) -> {:ok, File.read!(original)}
+      true -> :not_found
+    end
+  end
+
+  defp parse_frontmatter(path) do
+    case File.read(path) do
+      {:ok, content} ->
+        if String.starts_with?(content, "---") do
+          parts = String.split(content, ~r/^---\s*$/m, parts: 3)
+          case parts do
+            [_, frontmatter, _body] ->
+              name = extract_yaml_field(frontmatter, "name")
+              description = extract_yaml_field(frontmatter, "description")
+              {:ok, %{name: name, description: description}}
+            _ -> {:error, :invalid_frontmatter}
+          end
+        else
+          {:error, :no_frontmatter}
+        end
+      _ -> {:error, :read_error}
+    end
+  end
+
+  defp extract_yaml_field(yaml, field) do
+    pattern = ~r/^#{field}:\s*(.+)$/m
+    case Regex.run(pattern, yaml) do
+      [_, value] ->
+        String.trim(value)
+        |> String.trim("\"")
+        |> String.trim("'")
+        |> String.replace_prefix(">", "")
+        |> String.trim()
+      _ -> nil
+    end
+  end
 end

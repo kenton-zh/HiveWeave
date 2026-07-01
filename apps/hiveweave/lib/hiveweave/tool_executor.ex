@@ -24,6 +24,8 @@ defmodule HiveWeave.ToolExecutor do
     normalized_role = if is_binary(role), do: String.downcase(role), else: nil
     case permission_type do
       "coordinator" -> coordinator_tools(normalized_role)
+      _ when normalized_role in ["reviewer", "inspector", "审查员", "qa"] ->
+        executor_tools_for_reviewer()
       _ -> executor_tools()
     end
   end
@@ -209,6 +211,15 @@ defmodule HiveWeave.ToolExecutor do
   # ================================================================
   defp executor_tools do
     full_file_tools() ++
+    executor_specific_tools() ++
+    core_tools() ++
+    [read_skill_tool()]
+  end
+
+  # Reviewer/Inspector: file read + bash (run tests) + review tools + core + read_skill
+  defp executor_tools_for_reviewer do
+    full_file_tools() ++
+    qa_review_tools() ++
     executor_specific_tools() ++
     core_tools() ++
     [read_skill_tool()]
@@ -3948,19 +3959,56 @@ defmodule HiveWeave.ToolExecutor do
   end
 
   defp build_review_system_prompt("code_review") do
-    "You are a senior code reviewer performing a five-axis review:\n1. **Correctness** — bugs, edge cases, error handling gaps\n2. **Readability** — naming, comments, complexity, clarity\n3. **Architecture** — separation of concerns, coupling, patterns\n4. **Security** — injection, auth, data exposure (not a full audit)\n5. **Performance** — obvious bottlenecks, N+1 queries, memory leaks\n\nReturn ONLY valid JSON, no markdown or commentary:\n{\n  \"passed\": true/false,\n  \"score\": 0-100,\n  \"summary\": \"<one-paragraph overall assessment>\",\n  \"issues\": [\n    {\n      \"severity\": \"critical\" | \"major\" | \"minor\" | \"info\",\n      \"file\": \"<file path>\",\n      \"line\": <number or null>,\n      \"title\": \"<short title>\",\n      \"description\": \"<detailed explanation>\",\n      \"suggestion\": \"<how to fix>\"\n    }\n  ]\n}\nCRITICAL = security hole, data loss, crash. MAJOR = wrong behavior, broken feature.\nMINOR = style, naming, minor duplication. INFO = observation, no action needed."
+    persona = load_persona("code-reviewer")
+    skill = load_skill_content("code-review-and-quality")
+    base = "You are a senior code reviewer performing a five-axis review:\n1. **Correctness** — bugs, edge cases, error handling gaps\n2. **Readability** — naming, comments, complexity, clarity\n3. **Architecture** — separation of concerns, coupling, patterns\n4. **Security** — injection, auth, data exposure (not a full audit)\n5. **Performance** — obvious bottlenecks, N+1 queries, memory leaks"
+    format = "\n\nReturn ONLY valid JSON, no markdown or commentary:\n{\n  \"passed\": true/false,\n  \"score\": 0-100,\n  \"summary\": \"<one-paragraph overall assessment>\",\n  \"issues\": [\n    {\n      \"severity\": \"critical\" | \"major\" | \"minor\" | \"info\",\n      \"file\": \"<file path>\",\n      \"line\": <number or null>,\n      \"title\": \"<short title>\",\n      \"description\": \"<detailed explanation>\",\n      \"suggestion\": \"<how to fix>\"\n    }\n  ]\n}\nCRITICAL = security hole, data loss, crash. MAJOR = wrong behavior, broken feature.\nMINOR = style, naming, minor duplication. INFO = observation, no action needed."
+    combine_review_prompt(base, persona, skill, format)
   end
 
   defp build_review_system_prompt("security_audit") do
-    "You are a security engineer performing a focused vulnerability audit. Check for:\n1. **OWASP Top 10** — injection, broken auth, sensitive data exposure, XXE, access control, misconfig, XSS, deserialization, known vulns, logging gaps\n2. **Secrets & Keys** — hardcoded API keys, tokens, passwords, private keys\n3. **Input Validation** — missing sanitization, unsafe deserialization, prototype pollution\n4. **Auth & Authz** — missing auth checks, privilege escalation paths, session issues\n5. **Dependencies** — note any risky imports or patterns (can't check versions)\n\nReturn ONLY valid JSON:\n{\n  \"passed\": true/false,\n  \"score\": 0-100,\n  \"summary\": \"<one-paragraph assessment>\",\n  \"issues\": [\n    {\n      \"severity\": \"critical\" | \"major\" | \"minor\" | \"info\",\n      \"file\": \"<file path>\",\n      \"line\": <number or null>,\n      \"title\": \"<short title>\",\n      \"description\": \"<detailed explanation>\",\n      \"suggestion\": \"<how to fix>\"\n    }\n  ]\n}\nCRITICAL = exploitable vulnerability, exposed secret. MAJOR = insecure pattern, missing protection.\nMINOR = best-practice deviation. INFO = observation."
+    persona = load_persona("security-auditor")
+    skill = load_skill_content("security-and-hardening")
+    base = "You are a security engineer performing a focused vulnerability audit. Check for:\n1. **OWASP Top 10** — injection, broken auth, sensitive data exposure, XXE, access control, misconfig, XSS, deserialization, known vulns, logging gaps\n2. **Secrets & Keys** — hardcoded API keys, tokens, passwords, private keys\n3. **Input Validation** — missing sanitization, unsafe deserialization, prototype pollution\n4. **Auth & Authz** — missing auth checks, privilege escalation paths, session issues\n5. **Dependencies** — note any risky imports or patterns (can't check versions)"
+    format = "\n\nReturn ONLY valid JSON:\n{\n  \"passed\": true/false,\n  \"score\": 0-100,\n  \"summary\": \"<one-paragraph assessment>\",\n  \"issues\": [\n    {\n      \"severity\": \"critical\" | \"major\" | \"minor\" | \"info\",\n      \"file\": \"<file path>\",\n      \"line\": <number or null>,\n      \"title\": \"<short title>\",\n      \"description\": \"<detailed explanation>\",\n      \"suggestion\": \"<how to fix>\"\n    }\n  ]\n}\nCRITICAL = exploitable vulnerability, exposed secret. MAJOR = insecure pattern, missing protection.\nMINOR = best-practice deviation. INFO = observation."
+    combine_review_prompt(base, persona, skill, format)
   end
 
   defp build_review_system_prompt("test_review") do
-    "You are a QA engineer analyzing test quality and coverage. Review the following code and tests:\n\n1. **Coverage gaps** — which code paths are untested?\n2. **Test quality** — are tests meaningful or just coverage padding?\n3. **Edge cases** — missing boundary conditions, error paths, null/undefined\n4. **Test structure** — clarity, isolation, setup/teardown\n5. **Missing test types** — unit, integration, snapshot, e2e gaps\n\nReturn ONLY valid JSON:\n{\n  \"passed\": true/false,\n  \"score\": 0-100,\n  \"summary\": \"<one-paragraph assessment>\",\n  \"issues\": [\n    {\n      \"severity\": \"critical\" | \"major\" | \"minor\" | \"info\",\n      \"file\": \"<file path>\",\n      \"line\": <number or null>,\n      \"title\": \"<short title>\",\n      \"description\": \"<detailed explanation>\",\n      \"suggestion\": \"<how to fix>\"\n    }\n  ]\n}\nCRITICAL = core logic completely untested, broken test. MAJOR = significant coverage gap.\nMINOR = weak assertions, missing edge-case test. INFO = style suggestion."
+    persona = load_persona("test-engineer")
+    skill = load_skill_content("test-driven-development")
+    base = "You are a QA engineer analyzing test quality and coverage. Review the following code and tests:\n\n1. **Coverage gaps** — which code paths are untested?\n2. **Test quality** — are tests meaningful or just coverage padding?\n3. **Edge cases** — missing boundary conditions, error paths, null/undefined\n4. **Test structure** — clarity, isolation, setup/teardown\n5. **Missing test types** — unit, integration, snapshot, e2e gaps"
+    format = "\n\nReturn ONLY valid JSON:\n{\n  \"passed\": true/false,\n  \"score\": 0-100,\n  \"summary\": \"<one-paragraph assessment>\",\n  \"issues\": [\n    {\n      \"severity\": \"critical\" | \"major\" | \"minor\" | \"info\",\n      \"file\": \"<file path>\",\n      \"line\": <number or null>,\n      \"title\": \"<short title>\",\n      \"description\": \"<detailed explanation>\",\n      \"suggestion\": \"<how to fix>\"\n    }\n  ]\n}\nCRITICAL = core logic completely untested, broken test. MAJOR = significant coverage gap.\nMINOR = weak assertions, missing edge-case test. INFO = style suggestion."
+    combine_review_prompt(base, persona, skill, format)
   end
 
   defp build_review_system_prompt("perf_audit") do
-    "You are a web performance engineer auditing frontend code. Check for:\n\n1. **Bundle size** — large imports, tree-shaking issues, duplicate deps\n2. **Rendering** — unnecessary re-renders, missing memo, large component trees\n3. **Loading** — missing lazy loading, code splitting gaps, waterfall requests\n4. **Network** — unoptimized assets, missing compression hints, chatty APIs\n5. **Runtime** — memory leaks (event listeners, intervals), heavy computations on main thread\n6. **Images & Assets** — missing srcset, unoptimized formats, layout shift\n\nReturn ONLY valid JSON:\n{\n  \"passed\": true/false,\n  \"score\": 0-100,\n  \"summary\": \"<one-paragraph assessment>\",\n  \"issues\": [\n    {\n      \"severity\": \"critical\" | \"major\" | \"minor\" | \"info\",\n      \"file\": \"<file path>\",\n      \"line\": <number or null>,\n      \"title\": \"<short title>\",\n      \"description\": \"<detailed explanation>\",\n      \"suggestion\": \"<how to fix>\"\n    }\n  ]\n}\nCRITICAL = blocking perf issue (>3s impact). MAJOR = significant slowdown.\nMINOR = optimization opportunity. INFO = observation."
+    persona = load_persona("web-performance-auditor")
+    skill = load_skill_content("performance-optimization")
+    base = "You are a web performance engineer auditing frontend code. Check for:\n\n1. **Bundle size** — large imports, tree-shaking issues, duplicate deps\n2. **Rendering** — unnecessary re-renders, missing memo, large component trees\n3. **Loading** — missing lazy loading, code splitting gaps, waterfall requests\n4. **Network** — unoptimized assets, missing compression hints, chatty APIs\n5. **Runtime** — memory leaks (event listeners, intervals), heavy computations on main thread\n6. **Images & Assets** — missing srcset, unoptimized formats, layout shift"
+    format = "\n\nReturn ONLY valid JSON:\n{\n  \"passed\": true/false,\n  \"score\": 0-100,\n  \"summary\": \"<one-paragraph assessment>\",\n  \"issues\": [\n    {\n      \"severity\": \"critical\" | \"major\" | \"minor\" | \"info\",\n      \"file\": \"<file path>\",\n      \"line\": <number or null>,\n      \"title\": \"<short title>\",\n      \"description\": \"<detailed explanation>\",\n      \"suggestion\": \"<how to fix>\"\n    }\n  ]\n}\nCRITICAL = blocking perf issue (>3s impact). MAJOR = significant slowdown.\nMINOR = optimization opportunity. INFO = observation."
+    combine_review_prompt(base, persona, skill, format)
+  end
+
+  defp combine_review_prompt(base, persona, skill, format) do
+    parts = [base]
+    parts = if persona != "", do: parts ++ ["\n\n--- Persona ---\n#{persona}"], else: parts
+    parts = if skill != "", do: parts ++ ["\n\n--- Skill Workflow ---\n#{skill}"], else: parts
+    Enum.join(parts) <> format
+  end
+
+  defp load_persona(name) do
+    case HiveWeave.SkillRegistry.read_external_persona(name) do
+      {:ok, content} -> content
+      :not_found -> ""
+    end
+  end
+
+  defp load_skill_content(slug) do
+    case HiveWeave.SkillRegistry.read_external_skill_file(slug) do
+      {:ok, content} -> content
+      :not_found -> ""
+    end
   end
 
   defp call_review_llm(agent, system_prompt, user_prompt) do
