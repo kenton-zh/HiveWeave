@@ -12,13 +12,7 @@ import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import QuestionDialog from "./components/QuestionDialog";
 import NewProjectDialog from "./components/NewProjectDialog";
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings } from "./api";
-
-interface Project {
-  id: string;
-  name: string;
-  createdAt: number;
-}
+import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings, type Project } from "./api";
 
 function App() {
   const selectedAgentId = useAppStore((s) => s.selectedAgentId);
@@ -62,8 +56,13 @@ function App() {
       try {
         const list = await getProjects();
         setProjects(list);
-        if (list.length > 0 && !selectedProjectId) {
-          setSelectedProjectId(list[0].id);
+        if (list.length > 0) {
+          // Validate selectedProjectId — if it doesn't exist in the list, switch to the first one
+          const current = useAppStore.getState().selectedProjectId;
+          const exists = current && list.some((p) => p.id === current);
+          if (!exists) {
+            setSelectedProjectId(list[0].id);
+          }
         }
       } catch (err) {
         console.error("Failed to load projects:", err);
@@ -94,6 +93,7 @@ function App() {
       (event) => {
         useAppStore.getState().addActivity(event as any);
       },
+      () => refreshOrgTree(),
     );
     return () => controller.abort();
   }, []);
@@ -151,10 +151,10 @@ function App() {
 
     const name = folderPath.split(/[\\/]/).filter(Boolean).pop() || "New Project";
     try {
-      const { id, mainAgentId } = await createProject(name, folderPath);
+      const { project, mainAgentId } = await createProject(name, folderPath);
       const updated = await getProjects();
       setProjects(updated);
-      setSelectedProjectId(id);
+      setSelectedProjectId(project.id);
       setSelectedAgent(null);
       clearChatSessions();
       refreshOrgTree();

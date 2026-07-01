@@ -76,11 +76,30 @@ tsc_out.txt
 *.tsbuildinfo
 .npmrc
 
+# Elixir / Phoenix
+apps/hiveweave/_build/
+apps/hiveweave/deps/
+apps/hiveweave/priv/static/assets/
+erl_crash.dump
+
+# Temp test artifacts
+test_main_started.txt
+test_output.txt
+test-screenshots/
+frontend-e2e-test.mjs
+apps/web/frontend-e2e-test.mjs
+packages/db/check_agents.cjs
+packages/db/check_full.cjs
+packages/db/tmp_*.cjs
+
 # Misc
 after-select.yaml
 
 # Design docs (local only)
 docs/AI工程组织_MVP蓝图.md
+
+# Third-party skill sources
+.opencode/skills-sources/
 
 # Generated assets
 image/
