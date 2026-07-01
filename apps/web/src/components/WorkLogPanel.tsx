@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import { getWorkLogs } from "../api";
 import { useAppStore } from "../store";
 import type { ActivityEntry } from "../store";
+import { mergeContentChunks } from "../utils/mergeDelta";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -122,10 +123,24 @@ function aggregateConversations(events: ActivityEntry[], filterAgentId?: string 
 
 // ── Conversation Card ──────────────────────────────────────────
 
+/** Normalize tool input/result that may arrive as string OR object. The Elixir
+ *  streamer sends a string but the lobby_channel forwards the raw `input` object
+ *  from the SSE stream_event — both reach the activity feed. */
+function asString(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
 function ToolEntry({ entry }: { entry: ActivityEntry }) {
   const [expanded, setExpanded] = useState(false);
-  const input = entry.toolInput || "";
-  const result = entry.toolResult || "";
+  const input = asString(entry.toolInput);
+  const result = asString(entry.toolResult);
+  const inputPreview = input.length > 80 ? input.slice(0, 80) + "…" : input;
 
   return (
     <div className="ml-3 border-l border-amber-500/20 pl-2">
@@ -135,7 +150,7 @@ function ToolEntry({ entry }: { entry: ActivityEntry }) {
       >
         <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 shrink-0">工具</span>
         <span className="text-[11px] text-gray-300 font-mono truncate">{entry.toolName}</span>
-        {input && <span className="text-[10px] text-gray-500 truncate flex-1">{input.slice(0, 80)}{input.length > 80 ? "…" : ""}</span>}
+        {inputPreview && <span className="text-[10px] text-gray-500 truncate flex-1">{inputPreview}</span>}
         <span className="text-[10px] text-gray-600">{expanded ? "▲" : "▼"}</span>
       </div>
       {expanded && (
@@ -158,33 +173,17 @@ function ToolEntry({ entry }: { entry: ActivityEntry }) {
 
 function ConversationCard({ conv }: { conv: Conversation }) {
   const [expanded, setExpanded] = useState(conv.isLive);
-  const hasThinking = conv.events.some((e) => e.type === "thinking" || e.type === "thinking_delta");
-  const hasText = conv.events.some((e) => e.type === "text" || e.type === "text_delta");
-  const toolCount = conv.events.filter((e) => e.type === "tool_use").length;
   const hasError = conv.events.some((e) => e.type === "error");
+  const toolCount = conv.events.filter((e) => e.type === "tool_use").length;
 
-  // If delta events exist, the finalized "text"/"thinking" event is a duplicate
-  // (the backend flushes the full accumulated buffer as a final event).
-  // Prefer delta entries (which accumulated incrementally) and skip the final duplicate.
-  const hasTextDelta = conv.events.some((e) => e.type === "text_delta");
-  const hasThinkingDelta = conv.events.some((e) => e.type === "thinking_delta");
+  // Cross-deltaId merge + LLM cumulative-chunk dedup. See mergeAcrossDeltaIds.
+  const mergedText = useMemo(() => mergeAcrossDeltaIds(conv.events, "text_delta", "text"), [conv.events]);
+  const mergedThinking = useMemo(() => mergeAcrossDeltaIds(conv.events, "thinking_delta", "thinking"), [conv.events]);
 
-  // Build preview: first text or thinking content (from delta if available, else finalized)
-  const firstText = conv.events.find((e) => hasTextDelta ? e.type === "text_delta" : e.type === "text")?.content || "";
-  const firstThink = conv.events.find((e) => hasThinkingDelta ? e.type === "thinking_delta" : e.type === "thinking")?.content || "";
-  const preview = (firstText || firstThink).slice(0, 120);
-
-  // Merge thinking content — use delta if available, skip finalized duplicate
-  const thinkingContent = conv.events
-    .filter((e) => hasThinkingDelta ? e.type === "thinking_delta" : (e.type === "thinking" || e.type === "thinking_delta"))
-    .map((e) => e.content || "")
-    .join("");
-
-  // Merge text content — use delta if available, skip finalized duplicate
-  const textContent = conv.events
-    .filter((e) => hasTextDelta ? e.type === "text_delta" : (e.type === "text" || e.type === "text_delta"))
-    .map((e) => e.content || "")
-    .join("");
+  const firstLine = (mergedText || mergedThinking).replace(/\n+/g, " ").trim();
+  const preview = firstLine.length > 120 ? firstLine.slice(0, 120) + "…" : firstLine;
+  const hasThinking = !!mergedThinking;
+  const hasText = !!mergedText;
 
   const durationMs = conv.endTime - conv.startTime;
   const durationStr = durationMs > 1000 ? `${(durationMs / 1000).toFixed(1)}s` : "";
@@ -205,7 +204,7 @@ function ConversationCard({ conv }: { conv: Conversation }) {
         {/* Preview content */}
         <div className="min-w-0 flex-1">
           <div className="text-[11px] text-gray-400 truncate leading-relaxed">
-            {preview}{preview.length >= 120 ? "…" : ""}
+            {preview || (conv.isLive ? "正在处理…" : "")}
           </div>
         </div>
 
@@ -225,8 +224,8 @@ function ConversationCard({ conv }: { conv: Conversation }) {
       {expanded && (
         <div className="px-4 pb-2 space-y-1.5">
           {/* Thinking block */}
-          {thinkingContent && (
-            <ThinkingBlock content={thinkingContent} />
+          {mergedThinking && (
+            <ThinkingBlock content={mergedThinking} />
           )}
 
           {/* Events in order */}
@@ -237,13 +236,13 @@ function ConversationCard({ conv }: { conv: Conversation }) {
             ))}
 
           {/* Text output block */}
-          {textContent && (
+          {mergedText && (
             <div className="ml-3 border-l border-blue-500/20 pl-2">
               <div className="flex items-center gap-1.5">
                 <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-300 shrink-0">输出</span>
               </div>
               <div className="mt-1 text-[11px] text-gray-300 leading-relaxed whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
-                {textContent}
+                {mergedText}
               </div>
             </div>
           )}
@@ -422,85 +421,116 @@ export function ActivityLog({ agentId }: { agentId?: string | null }) {
 }
 
 function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: number }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
   const hasError = conv.events.some((e) => e.type === "error");
 
-  // Build preview
-  const hasTextDelta = conv.events.some((e) => e.type === "text_delta");
-  const hasThinkingDelta = conv.events.some((e) => e.type === "thinking_delta");
-  const firstText = conv.events.find((e) => hasTextDelta ? e.type === "text_delta" : e.type === "text")?.content || "";
-  const firstThink = conv.events.find((e) => hasThinkingDelta ? e.type === "thinking_delta" : e.type === "thinking")?.content || "";
-  const raw = (firstText || firstThink).replace(/\n/g, " ").trim();
-  const preview = raw.length > 100 ? raw.slice(0, 100) + "…" : raw;
-  const fullContent = firstText || firstThink;
-  const toolCount = conv.events.filter((e) => e.type === "tool_use").length;
+  // Merge text/thinking deltas across all deltaIds. The store already collapses
+  // chunks with the same deltaId; here we join across deltaIds for the final view
+  // and detect LLM-style cumulative chunks (next supersedes prev on prefix-match).
+  const mergedText = useMemo(() => mergeAcrossDeltaIds(conv.events, "text_delta", "text"), [conv.events]);
+  const mergedThinking = useMemo(() => mergeAcrossDeltaIds(conv.events, "thinking_delta", "thinking"), [conv.events]);
 
-  // Thinking content for expanded view
-  const thinkingContent = conv.events
-    .filter((e) => hasThinkingDelta ? e.type === "thinking_delta" : (e.type === "thinking" || e.type === "thinking_delta"))
-    .map((e) => e.content || "")
-    .join("");
+  const toolUseEvents = conv.events.filter((e) => e.type === "tool_use");
+  const toolCount = toolUseEvents.length;
+  const firstLine = (mergedText || mergedThinking).replace(/\n+/g, " ").trim();
+  const preview = firstLine.length > 80 ? firstLine.slice(0, 80) + "…" : firstLine;
 
   return (
-    <div
-      className="rounded-lg bg-surface-alt/50 hover:bg-surface-alt transition-colors cursor-pointer"
-      onClick={() => setExpanded(!expanded)}
-    >
-      {/* Compact row */}
-      <div className="flex items-start gap-2 px-3 py-2">
-        <span className={`w-2 h-2 rounded-full shrink-0 mt-1.5 ${conv.isLive ? "bg-emerald-400 animate-pulse" : hasError ? "bg-red-400" : "bg-gray-500"}`} />
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-0.5">
-            <span className="text-sm font-medium text-gray-200">{conv.agentName}</span>
-            {toolCount > 0 && (
-              <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400">{toolCount}工具</span>
-            )}
-            {olderCount > 0 && (
-              <span className="text-xs text-gray-600">+{olderCount}</span>
-            )}
-            <span className="text-xs text-gray-500 ml-auto shrink-0">{formatClock(conv.startTime)}</span>
-            <span className="text-xs text-gray-600 shrink-0">{expanded ? "▲" : "▼"}</span>
-          </div>
-          {!expanded && (
-            <p className="text-xs text-gray-500 truncate">{preview || "—"}</p>
-          )}
-        </div>
+    <div className="rounded-lg bg-surface-alt/40 border border-surface-border/40">
+      {/* Compact row — always visible, mirrors TRAE Work's "Agent · action" header */}
+      <div
+        className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-surface-alt/60 transition-colors rounded-t-lg"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className={`w-2 h-2 rounded-full shrink-0 ${conv.isLive ? "bg-emerald-400 animate-pulse" : hasError ? "bg-red-400" : "bg-gray-500"}`} />
+        <span className="text-sm font-medium text-gray-200 truncate">{conv.agentName}</span>
+        {conv.isLive && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 shrink-0">运行中</span>
+        )}
+        {toolCount > 0 && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 shrink-0">{toolCount} 工具</span>
+        )}
+        {olderCount > 0 && (
+          <span className="text-[10px] text-gray-600 shrink-0">+{olderCount}</span>
+        )}
+        <span className="text-[10px] text-gray-500 ml-auto shrink-0">{formatClock(conv.startTime)}</span>
+        <span className="text-[10px] text-gray-600 shrink-0">{expanded ? "▲" : "▼"}</span>
       </div>
 
-      {/* Expanded content */}
+      {!expanded && preview && (
+        <p className="px-3 pb-2 text-xs text-gray-500 truncate pl-7">{preview}</p>
+      )}
+
+      {/* Expanded — clean step list (think → tools → output), TRAE Work style */}
       {expanded && (
-        <div className="px-3 pb-3 pl-7 space-y-2">
-          {thinkingContent && (
-            <div>
-              <span className="text-xs font-medium text-purple-300 mb-1 block">思考</span>
-              <div className="text-xs text-gray-400 bg-surface-alt rounded px-3 py-2 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
-                {thinkingContent}
+        <div className="px-3 pb-3 pl-7 space-y-1.5">
+          {mergedThinking && (
+            <details className="group">
+              <summary className="text-[11px] text-purple-300 cursor-pointer list-none flex items-center gap-1.5 select-none">
+                <span className="text-[9px] text-gray-600 group-open:rotate-90 transition-transform">▶</span>
+                <span>思考</span>
+                <span className="text-[9px] text-gray-600">{mergedThinking.length} 字符</span>
+              </summary>
+              <div className="mt-1 text-[11px] text-gray-400 bg-surface-alt/70 rounded px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed">
+                {mergedThinking}
               </div>
-            </div>
+            </details>
           )}
-          {fullContent && (
-            <div>
-              <span className="text-xs font-medium text-blue-300 mb-1 block">输出</span>
-              <div className="text-sm text-gray-300 bg-surface-alt rounded px-3 py-2 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed">
-                {fullContent}
+
+          {toolUseEvents.map((e, i) => (
+            <ToolEntry key={`tool-${i}`} entry={e} />
+          ))}
+
+          {mergedText && (
+            <details className="group" open={conv.isLive}>
+              <summary className="text-[11px] text-blue-300 cursor-pointer list-none flex items-center gap-1.5 select-none">
+                <span className="text-[9px] text-gray-600 group-open:rotate-90 transition-transform">▶</span>
+                <span>输出</span>
+                <span className="text-[9px] text-gray-600">{mergedText.length} 字符</span>
+              </summary>
+              <div className="mt-1 text-[12px] text-gray-200 bg-surface-alt/70 rounded px-2.5 py-2 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed">
+                {mergedText}
               </div>
-            </div>
+            </details>
           )}
+
           {conv.events.filter((e) => e.type === "error").map((e, i) => (
             <div key={`err-${i}`}>
-              <span className="text-xs font-medium text-red-300 mb-1 block">错误</span>
-              <div className="text-xs text-red-300 bg-red-500/10 rounded px-3 py-2">
+              <span className="text-[11px] text-red-300 mb-1 block">错误</span>
+              <div className="text-[11px] text-red-300 bg-red-500/10 rounded px-2.5 py-1.5">
                 {e.errorMessage}
               </div>
             </div>
           ))}
+
           {!conv.isLive && !hasError && (
-            <span className="text-xs text-emerald-400">完成 · {formatTime(conv.endTime)}</span>
+            <div className="text-[10px] text-emerald-400 pt-0.5">完成 · {formatTime(conv.endTime)}</div>
           )}
         </div>
       )}
     </div>
   );
+}
+
+/**
+ * Merge text/thinking content across all deltaIds in a conversation.
+ * Handles three cases the store's per-deltaId merge does not:
+ *   1) Multiple rounds → multiple deltaIds → join the merged entries.
+ *   2) LLM/SDK cumulative chunk (next chunk contains prev as prefix) → drop prev.
+ *   3) Finalized "text" event present alongside deltas → skip (deltas already full).
+ */
+function mergeAcrossDeltaIds(
+  events: ActivityEntry[],
+  deltaType: "text_delta" | "thinking_delta",
+  fallbackType: "text" | "thinking",
+): string {
+  const hasDeltas = events.some((e) => e.type === deltaType);
+  const matching = events.filter((e) =>
+    hasDeltas ? e.type === deltaType : e.type === deltaType || e.type === fallbackType,
+  );
+  if (matching.length === 0) return "";
+  const texts = matching.map((e) => e.content || "").filter(Boolean);
+  return mergeContentChunks(texts);
 }
 
 // ── Work Log Panel ──────────────────────────────────────────────

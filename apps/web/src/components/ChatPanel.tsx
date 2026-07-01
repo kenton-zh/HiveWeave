@@ -28,6 +28,7 @@ interface ChatMessage {
   isBackground?: boolean;
   isRead?: boolean;
   isStreaming?: boolean;
+  isContext?: boolean;
   teamFromAgentId?: string;
   teamToAgentId?: string;
 }
@@ -102,9 +103,7 @@ const statusLabels: Record<string, { text: string; color: string }> = {
 
 
 function isTeamChannelMessage(msg: ChatMessage): boolean {
-  if (msg.role === "team") return true;
-  if (msg.isBackground) return true;
-  return false;
+  return msg.role === "team";
 }
 
 function tryParseToolCalls(raw: string): ToolCall[] {
@@ -134,11 +133,12 @@ function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
     role: m.role,
     content: m.content,
     images: typeof m.images === "string" ? tryParseImages(m.images) : m.images,
-    timestamp: m.createdAt,
+    timestamp: m.createdAt ?? m.created_at ?? Date.now(),
     toolCalls: m.toolCalls ? tryParseToolCalls(m.toolCalls) : undefined,
     isBackground: !!m.isBackground,
     isRead: !!m.isRead,
     isStreaming: !!m.isStreaming,
+    isContext: !!m.isContext,
     teamFromAgentId: m.teamFromAgentId ?? undefined,
     teamToAgentId: m.teamToAgentId ?? undefined,
   }));
@@ -152,6 +152,10 @@ function getDirectedAgentId(msg: ChatMessage, agentParentId?: string | null): st
     if (tc.tool === "message_superior" && agentParentId) return agentParentId;
   }
   return null;
+}
+
+function isInjectedContext(msg: ChatMessage): boolean {
+  return msg.isContext === true;
 }
 
 
@@ -308,6 +312,17 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const [agentInfo, setAgentInfo] = useState<AgentInfo | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [streamDraft, setStreamDraft] = useState<StreamDraft | null>(null);
+  // Mirror streamDraft synchronously so event handlers (which close over an
+  // older `streamDraft`) can read the latest value.
+  const streamDraftRef = useRef<StreamDraft | null>(null);
+  const updateStreamDraft = useCallback(
+    (updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)) => {
+      const next = typeof updater === "function" ? updater(streamDraftRef.current) : updater;
+      streamDraftRef.current = next;
+      setStreamDraft(next);
+    },
+    []
+  );
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -347,11 +362,12 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       if (activeAgentIdRef.current !== loadForAgentId) return;
       const converted = mapDbToChatMessages(dbMessages);
       setMessages(converted);
+      useAppStore.getState().setChatMessages(loadForAgentId, converted);
       const unreadIds = converted
         .filter((m) => !m.isRead && (m.isBackground || m.role === "team"))
         .map((m) => m.id);
       if (unreadIds.length > 0) {
-        markMessagesRead(unreadIds).catch(() => {});
+        markMessagesRead(unreadIds, loadForAgentId).catch(() => {});
         refreshOrgTree();
       }
     } catch (err) {
@@ -371,7 +387,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       setConfirmingDelete(false);
       setAgentInfo(null);
       setMessages([]);
-      setStreamDraft(null);
+      updateStreamDraft(null);
       refreshOrgTree();
       useAppStore.getState().setSelectedAgent(null);
     } catch (err: any) {
@@ -384,7 +400,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     if (!agentId) {
       setAgentInfo(null);
       setMessages([]);
-      setStreamDraft(null);
+      updateStreamDraft(null);
       setConfirmingDelete(false);
       setTeamCommsExpanded(false);
       setExpandedMessageId(null);
@@ -397,8 +413,17 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     const loadForAgentId = agentId;
     stickToBottomRef.current = true;
     setIsStreaming(false);
-    setStreamDraft(null);
-    setMessages([]);
+    updateStreamDraft(null);
+
+    // Use cached messages if available — switching back to a previously-viewed
+    // agent renders instantly without waiting for the DB round-trip. The
+    // background `loadMessagesFromDb` call below refreshes the cache.
+    const cached = useAppStore.getState().chatSessions[loadForAgentId];
+    if (cached && cached.length > 0) {
+      setMessages(cached);
+    } else {
+      setMessages([]);
+    }
 
     async function fetchAgent() {
       try {
@@ -442,32 +467,51 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     let merged = messages;
     if (isStreaming && streamDraft) {
       merged = messages.map((m) => {
-        if (m.id !== streamDraft.assistantId) return m;
+        if (m.id !== streamDraft.assistantId) {
+          // Any other message claiming to be streaming is stale (cached from a
+          // previous session) — strip the flag so the "..." bubble goes away.
+          return m.isStreaming ? { ...m, isStreaming: false } : m;
+        }
         const textParts = streamDraft.segments.filter(s => s.type === "text").map(s => s.content || "");
         const newTools = streamDraft.segments.filter(s => s.type === "tool_call").map(s => s.tool!);
         return {
           ...m,
           content: textParts.join(""),
-          toolCalls: [...(m.toolCalls || []), ...newTools],
+          // Use streamDraft tool calls as authoritative during streaming.
+          // The DB message may already contain tool calls saved by the streamer's
+          // intermediate update, so merging would duplicate them.
+          toolCalls: newTools.length > 0 ? newTools : (m.toolCalls || []),
           _segments: streamDraft.segments,
           isStreaming: true,
         };
       });
+    } else {
+      // Not currently streaming — no message should carry the streaming flag.
+      merged = merged.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m));
     }
+    // Drop auto-injected coordinator context blocks (e.g. "## Messages\n- From: <uuid>...\n
+    // [ESCALATION]...\n\n---\nProcess the above..."). The Elixir backend saves these as
+    // background user messages; they are LLM-facing context, not part of the user-facing
+    // conversation. We also drop background user messages with markdown-style content
+    // even when isBackground is not set, as a safety net for legacy rows.
+    merged = merged.filter((m) => !isInjectedContext(m));
+    // Only show foreground messages (user + assistant, non-background, non-team).
+    // Agent-to-agent messages (is_background=true or role="team") belong in the
+    // "团队沟通" panel, not the main ChatPanel.
     const foreground = merged.filter((m) => !m.isBackground && (m.role === "user" || m.role === "assistant"));
     let trailingUserCount = 0;
     for (let i = foreground.length - 1; i >= 0; i--) {
       if (foreground[i].role === "user") trailingUserCount++;
       else break;
     }
-    const hasStreamingPlaceholder = merged.some((m) => m.isStreaming && m.role === "assistant");
+    const hasStreamingPlaceholder = foreground.some((m) => m.isStreaming && m.role === "assistant");
     if (trailingUserCount >= 1 && !isAgentProcessing && !hasStreamingPlaceholder && !isStreaming) {
       const lastUser = foreground[foreground.length - 1];
       if (lastUser?.role === "user") {
         const warn = trailingUserCount >= 2
           ? "你已发送多条消息但 Agent 尚未回复。请等待当前任务完成，或检查网络/API 配置后重试。"
           : "⚠️ 上次对话未收到回复。Agent 可能遇到了异常，请重新发送消息。";
-        return [...merged, {
+        return [...foreground, {
           id: `${lastUser.id}-orphan`,
           role: "system" as const,
           content: warn,
@@ -475,7 +519,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         }];
       }
     }
-    return merged;
+    return foreground;
   }, [messages, isStreaming, streamDraft, isAgentProcessing]);
 
   useEffect(() => {
@@ -489,6 +533,35 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     if (!stickToBottomRef.current) return;
     messagesEndRef.current?.scrollIntoView({ behavior: isStreaming ? "auto" : "smooth" });
   }, [displayMessages, isStreaming]);
+
+  // Mirror messages into the store cache so a re-visit to this agent renders
+  // instantly. Throttled via RAF so streaming updates don't thrash the store.
+  // - Strip the per-message `isStreaming` flag (it is a local placeholder).
+  // - Drop transient empty assistant placeholders (`content === ""` with no
+  //   tool calls and no segments) — they survive remounts and would otherwise
+  //   render as a dark empty bubble, making the chat look black on revisit.
+  useEffect(() => {
+    if (!agentId) return;
+    let cancelled = false;
+    const id = requestAnimationFrame(() => {
+      if (cancelled) return;
+      const cached = useAppStore.getState().chatSessions[agentId];
+      const sanitized = messages
+        .map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m))
+        .filter((m) => !(
+          m.role === "assistant" &&
+          !m.isStreaming &&
+          !m.content &&
+          (!m.toolCalls || m.toolCalls.length === 0)
+        ));
+      if (cached && cached.length === sanitized.length && cached.every((c, i) => c === sanitized[i])) return;
+      useAppStore.getState().setChatMessages(agentId, sanitized);
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(id);
+    };
+  }, [agentId, messages]);
 
   const { directMessages, teamMessages } = useMemo(() => {
     const direct = displayMessages.filter((m) => !isTeamChannelMessage(m));
@@ -598,16 +671,16 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
 
     stickToBottomRef.current = true;
     setIsStreaming(true);
-    setStreamDraft(null);
+    updateStreamDraft(null);
     setRetryInfo(null);
     if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
     responseTimeoutRef.current = setTimeout(() => {
       if (!isActiveSession()) return;
       setIsStreaming(false);
-      setStreamDraft(null);
+      updateStreamDraft(null);
       loadMessagesFromDb(sendingForAgentId);
       finishTurn();
-    }, 30_000);
+    }, 120_000);
     const allToolsUsed = new Set<string>();
     let _dbgTextCount = 0;
     let _dbgFirstText = 0;
@@ -638,29 +711,57 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
                 timestamp: Date.now(), isBackground: false, isRead: true, isStreaming: true,
               }];
             });
-            setStreamDraft({ assistantId: parsed.id, segments: [] });
+            updateStreamDraft({ assistantId: parsed.id, segments: [] });
             console.log(`[SSE] streamDraft initialized: assistantId=${parsed.id}`);
           }
         } catch {}
         // Load full messages from DB — will replace optimistic placeholders when resolved
         loadMessagesFromDb(sendingForAgentId);
+        return;
+      }
+
+      // Ensure streamDraft is initialized before we get the first text chunk.
+      // The backend may not push an assistant message_id (it never does in our
+      // current pipeline), so we initialize lazily on the first text event.
+      if (event.type === "text" && !streamDraftRef.current) {
+        const placeholderId = `draft-${sendingForAgentId}-${Date.now()}`;
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === placeholderId)) return prev;
+          return [...prev, {
+            id: placeholderId, role: "assistant" as const, content: "",
+            timestamp: Date.now(), isBackground: false, isRead: true, isStreaming: true,
+          }];
+        });
+        updateStreamDraft({ assistantId: placeholderId, segments: [] });
+        console.log(`[SSE] streamDraft lazy-initialized: assistantId=${placeholderId}`);
       } else if (event.type === "text") {
         _dbgTextCount++;
         if (_dbgTextCount === 1) _dbgFirstText = performance.now();
         if (_dbgTextCount <= 3 || _dbgTextCount % 20 === 0) {
           console.log(`[SSE] text #${_dbgTextCount}: ${event.data.length}chars, t=${(performance.now() - _dbgFirstText).toFixed(0)}ms`);
         }
-        setStreamDraft((prev) => {
-          if (!prev) {
-            console.warn(`[SSE] text event dropped — streamDraft is null (message_id not yet processed)`);
-            return prev;
-          }
+        // Lazy init: if no message_id has arrived yet, initialize streamDraft
+        // with a placeholder id (backend may not push one for the assistant).
+        if (!streamDraftRef.current) {
+          const placeholderId = `draft-${sendingForAgentId}-${Date.now()}`;
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === placeholderId)) return prev;
+            return [...prev, {
+              id: placeholderId, role: "assistant" as const, content: "",
+              timestamp: Date.now(), isBackground: false, isRead: true, isStreaming: true,
+            }];
+          });
+          updateStreamDraft({ assistantId: placeholderId, segments: [{ type: "text", content: event.data }] });
+          console.log(`[SSE] streamDraft lazy-initialized: assistantId=${placeholderId}`);
+          return;
+        }
+
+        updateStreamDraft((prev) => {
+          if (!prev) return prev;
           const last = prev.segments[prev.segments.length - 1];
           if (last && last.type === "text") {
-            // Append to last text segment
             return { ...prev, segments: [...prev.segments.slice(0, -1), { ...last, content: (last.content || "") + event.data }] };
           }
-          // Start new text segment
           return { ...prev, segments: [...prev.segments, { type: "text", content: event.data }] };
         });
       } else if (event.type === "tool_use") {
@@ -671,7 +772,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
             input: toolData.input || {},
           };
           allToolsUsed.add(toolCall.tool);
-          setStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "tool_call", tool: toolCall }] } : prev);
+          updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "tool_call", tool: toolCall }] } : prev);
         } catch {}
       } else if (event.type === "tool_result") {
         setPendingApprovalTool(null);
@@ -697,7 +798,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           responseTimeoutRef.current = setTimeout(() => {
             if (!isActiveSession()) return;
             setIsStreaming(false);
-            setStreamDraft(null);
+            updateStreamDraft(null);
             setRetryInfo(null);
             loadMessagesFromDb(sendingForAgentId);
             finishTurn();
@@ -710,17 +811,21 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setPendingApprovalTool(null);
         setRetryInfo(null);
-        const ORG_TOOLS = new Set(["create_agent", "transfer_agent", "dismiss_agent", "create_from_template"]);
+        const ORG_TOOLS = new Set(["create_agent", "transfer_agent", "dismiss_agent", "create_from_template", "hire_agent"]);
         if ([...allToolsUsed].some((x) => ORG_TOOLS.has(x))) refreshOrgTree();
-        loadMessagesFromDb(sendingForAgentId);
-        setStreamDraft(null);
-        setIsStreaming(false);
+        // Load final messages from DB, THEN clear streamDraft and isStreaming.
+        // This prevents a flash of empty content between clearing streamDraft
+        // and the DB refresh arriving.
+        loadMessagesFromDb(sendingForAgentId).finally(() => {
+          updateStreamDraft(null);
+          setIsStreaming(false);
+        });
         finishTurn();
       } else if (event.type === "busy") {
         // Agent is processing a previous message — restore input so user doesn't lose their text
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setInput(messageText);
-        setStreamDraft(null);
+        updateStreamDraft(null);
         setIsStreaming(false);
         setRetryInfo(null);
         // Drain queue since we can't send
@@ -731,13 +836,13 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setRetryInfo(null);
         if (streamDraft) {
-          setStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "text", content: "\n\nError: " + event.data }] } : prev);
+          updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "text", content: "\n\nError: " + event.data }] } : prev);
         } else {
           // streamDraft is null (server unreachable / no message_id received) — restore input
           setInput(messageText);
         }
         loadMessagesFromDb(sendingForAgentId);
-        setStreamDraft(null);
+        updateStreamDraft(null);
         setIsStreaming(false);
         finishTurn();
       }
@@ -762,7 +867,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const handleStop = useCallback(() => {
     abortControllerRef.current?.abort();
     setIsStreaming(false);
-    setStreamDraft(null);
+    updateStreamDraft(null);
     setRetryInfo(null);
     if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
     if (pendingQueueRef.current.length > 0) {
@@ -807,7 +912,15 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       {agentInfo && (
         <div className="px-6 py-3 border-b border-surface-border bg-surface-card shrink-0">
           <div className="flex items-center gap-2">
-            <span className={`w-2 h-2 rounded-full ${agentInfo.status === "active" && isAgentProcessing ? "bg-emerald-400 animate-pulse" : "bg-gray-400"}`} />
+            <span className={`w-2 h-2 rounded-full ${
+              isAgentProcessing ? "bg-emerald-400 animate-pulse"
+              : agentInfo.status === "idle" || agentInfo.status === "inactive" ? "bg-gray-500"
+              : agentInfo.status === "promoted" ? "bg-blue-400"
+              : agentInfo.status === "receiving" ? "bg-amber-400 animate-pulse"
+              : agentInfo.status === "merging" ? "bg-purple-400 animate-pulse"
+              : agentInfo.status === "dissolving" || agentInfo.status === "archived" ? "bg-red-600"
+              : "bg-gray-400"
+            }`} />
             <span className="text-sm font-medium text-gray-200">{agentInfo.name}</span>
             <span className="text-xs text-gray-500">·</span>
             <span className="text-xs text-gray-400">{roleLabels[agentInfo.role] || agentInfo.role}</span>
@@ -863,7 +976,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           {teamCommsExpanded && (
             <div className="max-h-[35vh] overflow-y-auto overflow-x-hidden py-1">
               {[...teamMessages].sort((a, b) => b.timestamp - a.timestamp).map((msg) => {
-                const isIncoming = msg.role === "user" || !!msg.teamFromAgentId;
+                const isIncoming = msg.role === "user" || msg.teamToAgentId === agentId;
                 const counterpartId = isIncoming
                   ? (msg.teamFromAgentId ?? null)
                   : (msg.teamToAgentId || getDirectedAgentId(msg, agentInfo?.parentId));

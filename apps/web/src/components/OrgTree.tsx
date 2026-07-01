@@ -396,7 +396,14 @@ function TreeNodeCard({
       <div className={`flex items-center ${compact ? "gap-0.5 px-1 py-0.5" : "gap-1 px-1.5 py-0.5"}`}>
         <span
           className={`rounded-full shrink-0 ${compact ? "w-1 h-1" : "w-1.5 h-1.5"} ${
-            isActive && isProcessing ? "bg-emerald-400 animate-pulse" : "bg-gray-600"
+            node.status === "active"
+              ? isProcessing ? "bg-emerald-400 animate-pulse" : "bg-gray-500"
+              : node.status === "idle" || node.status === "inactive" ? "bg-gray-500"
+              : node.status === "promoted" ? "bg-blue-400"
+              : node.status === "receiving" ? "bg-amber-400 animate-pulse"
+              : node.status === "merging" ? "bg-purple-400 animate-pulse"
+              : node.status === "dissolving" || node.status === "archived" ? "bg-red-600"
+              : "bg-gray-500"
           }`}
         />
         <span
@@ -537,6 +544,7 @@ function OrgTree() {
   const setAgentAlarms = useAppStore((s) => s.setAgentAlarms);
   const selectedAgentId = useAppStore((s) => s.selectedAgentId);
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
+  const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
   const openAddAgent = useAppStore((s) => s.openAddAgent);
   const pendingApprovals = useAppStore((s) => s.pendingApprovals);
   const userPingAgentIds = useAppStore((s) => s.userPingAgentIds);
@@ -568,6 +576,8 @@ function OrgTree() {
         let parsed: OrgNodeData[];
         if (Array.isArray(data)) {
           parsed = data.filter((n: any) => n && n.id);
+        } else if (data && typeof data === "object" && "tree" in data) {
+          parsed = (data.tree as any[]).filter((n: any) => n && n.id);
         } else if (data && typeof data === "object" && "id" in data) {
           parsed = [data as OrgNodeData];
         } else {
@@ -661,7 +671,14 @@ function OrgTree() {
     return () => { mounted = false; clearInterval(i); };
   }, [selectedProjectId]);
 
-  const handleSelect = useCallback((id: string) => setSelectedAgent(id), [setSelectedAgent]);
+  const handleSelect = useCallback((id: string) => {
+    setSelectedAgent(id);
+    // Auto-switch from Goals tab to Chat tab when an agent is selected
+    const currentTab = useAppStore.getState().rightPanelTab;
+    if (currentTab === "goals") {
+      setRightPanelTab("chat");
+    }
+  }, [setSelectedAgent, setRightPanelTab]);
 
   // ── Layout computation ──
 
@@ -748,6 +765,8 @@ function OrgTree() {
     if (!el || !bounds) return null;
     const vw = el.clientWidth;
     const vh = el.clientHeight;
+    // Defer fit if container isn't ready yet (initial render race condition)
+    if (vw === 0 || vh === 0) return null;
     const pad = 48; // visual margin around the tree
     const bw = bounds.x2 - bounds.x1;
     const bh = bounds.y2 - bounds.y1;
@@ -776,9 +795,34 @@ function OrgTree() {
   const treeH = layoutData.maxH;
   useLayoutEffect(() => {
     if (!roots.length) return;
-    const t = computeFitTransform();
-    if (t) setTransform(t);
+    // Use rAF to defer fit until layout has settled (avoids container size race condition)
+    const rafId = requestAnimationFrame(() => {
+      const t = computeFitTransform();
+      if (t) setTransform(t);
+    });
+    return () => cancelAnimationFrame(rafId);
   }, [roots.length, selectedProjectId, treeW, treeH]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ResizeObserver: re-fit when container size changes (e.g. panel animation, window resize)
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    let prevW = el.clientWidth;
+    let prevH = el.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const w = el.clientWidth;
+      const h = el.clientHeight;
+      // Only re-fit if size actually changed significantly (avoid micro-triggers)
+      if (Math.abs(w - prevW) > 2 || Math.abs(h - prevH) > 2) {
+        prevW = w;
+        prevH = h;
+        const t = computeFitTransform();
+        if (t) setTransform(t);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [computeFitTransform]);
 
   // Wheel zoom (non-passive to allow preventDefault)
   useEffect(() => {

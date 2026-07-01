@@ -110,7 +110,16 @@ export default function OfficeView() {
       }
       try {
         const data = await getOrgTree(selectedProjectId);
-        const parsed = Array.isArray(data) ? data : data?.id ? [data] : [];
+        let parsed: any[];
+        if (Array.isArray(data)) {
+          parsed = data;
+        } else if (data?.tree && Array.isArray(data.tree)) {
+          parsed = data.tree;
+        } else if (data?.id) {
+          parsed = [data];
+        } else {
+          parsed = [];
+        }
         if (mounted) {
           setRoots(parsed);
           setError(null);

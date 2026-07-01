@@ -86,14 +86,23 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
     try {
       setLoading(true);
       setError("");
-      const data = await getAgent(agentId);
+      const raw = await getAgent(agentId);
+      // The Elixir backend wraps the response: `%{agent: serialize_agent(a)}`.
+      // Some endpoints (e.g. OrgTree) return the agent fields at the top level.
+      // Accept both shapes so missing `id` doesn't crash the render.
+      const data = (raw && typeof raw === "object" && "agent" in raw && raw.agent) ? raw.agent : raw;
+      if (!data || typeof data !== "object" || !data.id) {
+        setError("Agent 不存在");
+        setLoading(false);
+        return;
+      }
       setAgent({
         ...data,
-        allowedTools: JSON.parse(data.allowedTools || "[]"),
-        deniedTools: JSON.parse(data.deniedTools || "[]"),
-        askTools: JSON.parse(data.askTools || "[]"),
-        mcpServers: JSON.parse(data.mcpServers || "[]"),
-        boundSkills: JSON.parse(data.boundSkills || "[]"),
+        allowedTools: JSON.parse(data?.allowedTools || "[]"),
+        deniedTools: JSON.parse(data?.deniedTools || "[]"),
+        askTools: JSON.parse(data?.askTools || "[]"),
+        mcpServers: JSON.parse(data?.mcpServers || "[]"),
+        boundSkills: JSON.parse(data?.boundSkills || "[]"),
       });
       setGoalDraft(data.goal || "");
       setBackstoryDraft(data.backstory || "");
@@ -106,11 +115,11 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
         // Permissions endpoint might not exist yet, use agent data
         setPermissions({
           permissionMode: data.permissionMode || "full",
-          allowedTools: JSON.parse(data.allowedTools || "[]"),
-          deniedTools: JSON.parse(data.deniedTools || "[]"),
-          askTools: JSON.parse(data.askTools || "[]"),
-          mcpServers: JSON.parse(data.mcpServers || "[]"),
-          boundSkills: JSON.parse(data.boundSkills || "[]"),
+          allowedTools: JSON.parse(data?.allowedTools || "[]"),
+          deniedTools: JSON.parse(data?.deniedTools || "[]"),
+          askTools: JSON.parse(data?.askTools || "[]"),
+          mcpServers: JSON.parse(data?.mcpServers || "[]"),
+          boundSkills: JSON.parse(data?.boundSkills || "[]"),
         });
       }
     } catch (err: any) {
@@ -219,7 +228,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
         <section>
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">基础信息</h3>
-            <span className="text-xs text-gray-500 font-mono">{agent.shortId || agent.id.slice(0, 8)}</span>
+            <span className="text-xs text-gray-500 font-mono">{agent.shortId || (agent.id || "").slice(0, 8) || "—"}</span>
           </div>
 
           <div className="bg-surface-card border border-surface-border rounded-xl p-5 space-y-4">
@@ -236,7 +245,18 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
             {/* Status */}
             <div className="flex items-center gap-2 py-2 border-t border-surface-border/50">
-              <span className={`w-2.5 h-2.5 rounded-full ${agent.status === "active" && isProcessing ? "bg-emerald-400 animate-pulse" : "bg-gray-400"}`} />
+              <span
+                className={`w-2.5 h-2.5 rounded-full ${
+                  agent.status === "active"
+                    ? isProcessing ? "bg-emerald-400 animate-pulse" : "bg-gray-500"
+                    : agent.status === "idle" || agent.status === "inactive" ? "bg-gray-500"
+                    : agent.status === "promoted" ? "bg-blue-400"
+                    : agent.status === "receiving" ? "bg-amber-400 animate-pulse"
+                    : agent.status === "merging" ? "bg-purple-400 animate-pulse"
+                    : agent.status === "dissolving" || agent.status === "archived" ? "bg-red-600"
+                    : "bg-gray-400"
+                }`}
+              />
               <span className={`text-sm font-medium ${runtimeStatus.color}`}>{runtimeStatus.label}</span>
               <span className="text-xs text-gray-500 ml-1">— {runtimeStatus.desc}</span>
             </div>

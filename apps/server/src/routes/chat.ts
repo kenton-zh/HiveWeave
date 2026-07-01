@@ -91,8 +91,8 @@ async function resolveModelForAgent(agentId: string): Promise<ResolvedModel> {
   const projectDb = getProjectDbForAgent(agentId);
   let agentModelId: string | null = null;
   let agentReasoningEffort: string | null = null;
-  let agentRole = "";
   let agentPermissionType = "";
+  let agentRole = "";
 
   if (projectDb) {
     const rows = await projectDb
@@ -113,10 +113,12 @@ async function resolveModelForAgent(agentId: string): Promise<ResolvedModel> {
   if (!model) {
     const isCoordinator = agentPermissionType === "coordinator";
     if (isCoordinator) {
-      // Management (CEO, HR, managers): DeepSeek via OpenCode Go
-      model = await modelService.findActiveByModelId("deepseek-v4-flash") || await modelService.getDefault();
+      // Management (CEO, HR, managers): DeepSeek (免费版 → 付费版兜底)
+      model = await modelService.findActiveByModelId("deepseek-v4-flash-free")
+        || await modelService.findActiveByModelId("deepseek-v4-flash")
+        || await modelService.getDefault();
     } else {
-      // Leaf executors (developers, QA): Step 3.7 Flash
+      // Leaf executors (developers, QA): Step 3.7 Flash (阶跃星辰)
       model = await modelService.findActiveByModelId("step-3.7-flash") || await modelService.getDefault();
     }
   }

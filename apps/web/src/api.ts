@@ -1,31 +1,73 @@
-const BASE = "/api";
+import { Socket, Channel } from "phoenix";
 
 /**
- * Returns the base URL for SSE endpoints.
- * In dev mode, bypasses the Vite proxy (which may buffer SSE responses)
- * by connecting directly to the backend on port 3200.
- * In production, uses the same origin (Nginx handles SSE buffering via X-Accel-Buffering).
+ * Phoenix.js WebSocket-based API client.
+ *
+ * This replaces the old SSE-based client (fetch + EventSource).
+ * The Elixir backend now uses Phoenix Channels over WebSocket.
+ *
+ * Channels used:
+ *   - "lobby:status"  - global agent processing status
+ *   - "agent:<id>"    - per-agent chat stream + status + inbox
+ *   - "project:<id>"  - per-project game time + status
  */
-function getSSEBase(): string {
-  if (typeof window !== "undefined" && window.location.hostname === "localhost") {
-    return "http://localhost:3200/api";
+
+// ---------------------------------------------------------------------------
+// Socket setup
+// ---------------------------------------------------------------------------
+
+const SOCKET_URL =
+  (import.meta.env?.VITE_WS_URL as string | undefined) ||
+  (typeof window !== "undefined" && window.location.hostname === "localhost"
+    ? "ws://localhost:4000/socket"
+    : "/socket");
+
+let _socket: Socket | null = null;
+let _activeChannel: any = null; // Track the active agent channel to prevent duplicates
+
+export function getSocket(): Socket {
+  if (!_socket) {
+    const params: Record<string, string> = {};
+    if (_apiKey) params.api_key = _apiKey;
+    _socket = new Socket(SOCKET_URL, {
+      params,
+      reconnectAfterMs: (tries: number) => [1000, 2000, 5000, 10000][tries - 1] ?? 10000,
+      heartbeatIntervalMs: 30_000,
+    });
+    _socket.connect();
   }
-  return "/api";
+  return _socket;
 }
 
-async function fetchJSON(url: string, init?: RequestInit) {
-  const res = await fetch(url, init);
+// ---------------------------------------------------------------------------
+// REST helpers
+// ---------------------------------------------------------------------------
+
+const BASE = "/api";
+
+let _apiKey: string | null = null;
+
+export function setApiKey(key: string | null) {
+  _apiKey = key;
+}
+
+async function fetchJSON<T = any>(url: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (_apiKey && !headers.has("x-api-key")) {
+    headers.set("x-api-key", _apiKey);
+  }
+  const res = await fetch(url, { ...init, headers });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
   return res.json();
 }
 
-export async function getOrgTree(projectId?: string) {
-  const url = projectId ? `${BASE}/org?projectId=${projectId}` : `${BASE}/org`;
-  return fetchJSON(url);
-}
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
 
-export async function getProjects() {
-  return fetchJSON(`${BASE}/projects`);
+export async function getProjects(): Promise<Project[]> {
+  const data = await fetchJSON<{ projects: Project[] }>(`${BASE}/projects`);
+  return data.projects || [];
 }
 
 export async function createProject(name: string, workspacePath?: string, description?: string, orgParadigm?: string) {
@@ -36,72 +78,33 @@ export async function createProject(name: string, workspacePath?: string, descri
   });
 }
 
-export async function getProjectGameTime(projectId: string) {
-  return fetchJSON(`${BASE}/projects/${projectId}/game-time`);
-}
-
-export interface ProjectAlarm {
-  id: string;
-  fromAgentId: string;
-  toAgentId: string;
-  purpose: string;
-  fireAtGameSeconds: number;
-}
-
-export interface ProjectAlarmsResponse {
-  projectId: string;
-  currentGameSeconds: number;
-  realTimestamp: number;
-  alarms: ProjectAlarm[];
-}
-
-export async function getProjectAlarms(projectId: string): Promise<ProjectAlarmsResponse> {
-  return fetchJSON(`${BASE}/projects/${projectId}/alarms`);
-}
-
 export async function deleteProject(id: string) {
   return fetchJSON(`${BASE}/projects/${id}`, { method: "DELETE" });
 }
 
-export async function updateProject(projectId: string, updates: { description?: string | null; orgParadigm?: string | null }) {
-  return fetchJSON(`${BASE}/projects/${projectId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(updates),
-  });
+export async function getProjectGameTime(projectId: string) {
+  return fetchJSON(`${BASE}/projects/${projectId}/game-time`);
 }
 
-export async function updateWorkspacePath(projectId: string, workspacePath: string | null) {
-  return fetchJSON(`${BASE}/projects/${projectId}/workspace`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ workspacePath }),
-  });
-}
-
-export interface KeyResult {
-  text: string;
-  status: "todo" | "doing" | "done";
-  owner?: string;
-}
-
-export interface GoalsData {
-  objective: string;
-  focus: string;
-  keyResults: KeyResult[];
-  updatedAt?: number;
-}
-
-export async function getProjectGoals(projectId: string): Promise<{ goals: GoalsData | null }> {
+export async function getProjectGoals(projectId: string) {
   return fetchJSON(`${BASE}/projects/${projectId}/goals`);
 }
 
-export async function updateProjectGoals(projectId: string, goals: Partial<GoalsData>): Promise<{ ok: boolean; goals: GoalsData }> {
+export async function updateProjectGoals(projectId: string, goals: any) {
   return fetchJSON(`${BASE}/projects/${projectId}/goals`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(goals),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Org / Agents
+// ---------------------------------------------------------------------------
+
+export async function getOrgTree(projectId?: string) {
+  const url = projectId ? `${BASE}/org?projectId=${projectId}` : `${BASE}/org`;
+  return fetchJSON(url);
 }
 
 export async function getAgent(id: string) {
@@ -116,7 +119,7 @@ export async function createAgent(data: any) {
   });
 }
 
-export async function updateAgent(id: string, data: { name?: string; goal?: string; status?: string; backstory?: string; modelId?: string | null; reasoningEffort?: string | null }) {
+export async function updateAgent(id: string, data: any) {
   return fetchJSON(`${BASE}/org/agents/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -124,261 +127,337 @@ export async function updateAgent(id: string, data: { name?: string; goal?: stri
   });
 }
 
-export function streamChat(agentId: string, message: string, images: string[] | undefined, onEvent: (event: { type: string; data: string }) => void): AbortController {
-  const controller = new AbortController();
-  fetch(`${getSSEBase()}/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ agentId, message, images: images?.length ? images : undefined }),
-    signal: controller.signal,
-  }).then(async (res) => {
-    if (!res.ok) {
-      if (res.status === 409) {
-        onEvent({ type: "busy", data: "Agent is busy" });
-        return;
-      }
-      const errText = await res.text().catch(() => "");
-      onEvent({ type: "error", data: errText || `Server error: ${res.status}` });
-      return;
-    }
-    if (!res.body) {
-      onEvent({ type: "error", data: "Response body is empty" });
-      return;
-    }
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      // Parse SSE events from buffer
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-      for (const part of parts) {
-        const eventMatch = part.match(/event: (\w+)/);
-        if (!eventMatch) continue;
-        // Collect all "data: " lines and join (SSE spec: multi-line data)
-        const dataLines = part.match(/^data: (.*)$/gm);
-        const data = dataLines
-          ? dataLines.map((l) => l.replace(/^data: /, "")).join("\n")
-          : "";
-        onEvent({ type: eventMatch[1], data });
-      }
-    }
-    onEvent({ type: "done", data: "" });
-  }).catch((err) => {
-    if (err.name !== "AbortError") {
-      onEvent({ type: "error", data: err.message });
-    }
-  });
-  return controller;
-}
-
-/**
- * Subscribe to real-time agent processing status via SSE.
- * Calls onSnapshot with all currently-processing agent IDs on connect,
- * then onStatus for each incremental change.
- * Auto-reconnects after 3 seconds on disconnect.
- * Returns an AbortController to stop the subscription.
- */
-export function subscribeAgentStatus(
-  onSnapshot: (agentIds: string[], paused?: boolean) => void,
-  onStatus: (agentId: string, processing: boolean) => void,
-  onActivity?: (event: { agentId: string; agentName: string; type: string; content?: string; toolName?: string; toolInput?: string; toolResult?: string; errorMessage?: string; timestamp: number }) => void,
-): AbortController {
-  const controller = new AbortController();
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Server sends keepalive every 30s — if nothing arrives in 45s, connection is dead. */
-  const HEARTBEAT_TIMEOUT_MS = 45_000;
-
-  function resetHeartbeat(reader: ReadableStreamDefaultReader<Uint8Array>) {
-    if (heartbeatTimer) clearTimeout(heartbeatTimer);
-    heartbeatTimer = setTimeout(() => {
-      // Heartbeat timeout — connection is dead, force close and reconnect
-      try { reader.cancel(); } catch { /* ignore */ }
-    }, HEARTBEAT_TIMEOUT_MS);
-  }
-
-  function cleanup() {
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; }
-  }
-
-  function connect() {
-    if (controller.signal.aborted) return;
-
-    fetch(`${getSSEBase()}/chat/status`, { signal: controller.signal })
-      .then(async (res) => {
-        if (!res.ok || !res.body) {
-          throw new Error(`Status SSE: HTTP ${res.status}`);
-        }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        // Start heartbeat timer
-        resetHeartbeat(reader);
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          // Reset heartbeat on every data chunk (includes keepalive comments)
-          resetHeartbeat(reader);
-
-          buffer += decoder.decode(value, { stream: true });
-
-          const parts = buffer.split("\n\n");
-          buffer = parts.pop() || "";
-
-          for (const part of parts) {
-            const typeMatch = part.match(/event: (\w+)/);
-            if (!typeMatch) continue;
-            const type = typeMatch[1];
-            const dataMatch = part.match(/^data: (.*)$/m);
-            if (!dataMatch) continue;
-
-            try {
-              const json = JSON.parse(dataMatch[1]);
-              if (type === "snapshot" && Array.isArray(json.agentIds)) {
-                onSnapshot(json.agentIds, json.paused ?? false);
-              } else if (type === "status" && typeof json.agentId === "string") {
-                onStatus(json.agentId, !!json.processing);
-              } else if (type === "activity" && typeof json.agentId === "string") {
-                onActivity?.(json);
-              }
-            } catch {
-              // Malformed SSE event — skip
-            }
-          }
-        }
-
-        // Stream ended — clear stale state and reconnect after 3s
-        cleanup();
-        if (!controller.signal.aborted) {
-          onSnapshot([], false); // Clear stale processing state immediately
-          reconnectTimer = setTimeout(connect, 3000);
-        }
-      })
-      .catch((err) => {
-        cleanup();
-        if (err.name === "AbortError") return;
-        // Connection failed — clear stale state and reconnect after 3s
-        if (!controller.signal.aborted) {
-          onSnapshot([], false); // Clear stale processing state immediately
-          reconnectTimer = setTimeout(connect, 3000);
-        }
-      });
-  }
-
-  connect();
-
-  // Wrap abort to also clean up timers
-  const origAbort = controller.abort.bind(controller);
-  controller.abort = ((...args: any[]) => {
-    cleanup();
-    origAbort(...args);
-  }) as typeof controller.abort;
-
-  return controller;
-}
-
-export async function pauseSystem(): Promise<{ paused: boolean }> {
-  return fetchJSON(`${BASE}/chat/pause`, { method: "POST" });
-}
-
-export async function resumeSystem(): Promise<{ paused: boolean }> {
-  return fetchJSON(`${BASE}/chat/resume`, { method: "POST" });
-}
-
-export async function getPausedState(): Promise<{ paused: boolean }> {
-  return fetchJSON(`${BASE}/chat/paused`);
-}
-
-export async function resetAgentProcessing(agentId: string): Promise<{ agentId: string; processing: boolean }> {
-  return fetchJSON(`${BASE}/chat/reset-processing/${agentId}`, { method: "POST" });
-}
-
-export async function getWorkLogs(agentId: string, limit = 10) {
-  return fetchJSON(`${BASE}/logs/${agentId}?limit=${limit}`);
-}
-
 export async function deleteAgent(id: string) {
   return fetchJSON(`${BASE}/org/agents/${id}`, { method: "DELETE" });
 }
 
-export async function getChatMessages(agentId: string) {
-  return fetchJSON(`${BASE}/chat/messages/${agentId}`);
+// ---------------------------------------------------------------------------
+// Chat (HTTP trigger - actual stream via WebSocket)
+// ---------------------------------------------------------------------------
+
+export interface ChatEvent {
+  type: "text" | "tool_use" | "tool_result" | "message_id" | "error" | "done" | "busy";
+  data: string;
 }
 
-export async function getUnreadMessages(agentId: string) {
-  return fetchJSON(`${BASE}/chat/unread/${agentId}`);
+export function streamChat(
+  agentId: string,
+  message: string,
+  images: string[] | undefined,
+  onEvent: (event: ChatEvent) => void
+): { abort: () => void } {
+  const socket = getSocket();
+
+  // Leave any previous active channel to prevent duplicate event delivery
+  if (_activeChannel) {
+    try { _activeChannel.leave(); } catch {}
+    _activeChannel = null;
+  }
+
+  const channel = socket.channel(`agent:${agentId}`);
+  _activeChannel = channel;
+
+  // Translate phoenix.js events into the legacy SSE event shape
+  // so the existing ChatPanel.tsx business logic keeps working unchanged.
+  channel.on("init", (payload) => {
+    // No-op for now; payload could include initial state
+  });
+
+  channel.on("message_id", (payload) => {
+    onEvent({ type: "message_id", data: JSON.stringify(payload) });
+  });
+
+  channel.on("stream_chunk", (payload) => {
+    const text = typeof payload === "string" ? payload : payload.text || "";
+    if (typeof payload === "object" && payload.delta) {
+      // Real-time token delta — forward as "text" event so ChatPanel's
+      // existing incremental-append logic handles it.
+      const deltaId = payload.deltaId || "";
+      if (payload.reasoning) {
+        onEvent({ type: "thinking_delta", data: text, deltaId });
+      } else {
+        onEvent({ type: "text", data: text });
+      }
+    } else {
+      // Non-delta (full text or reasoning)
+      onEvent({ type: "text", data: text });
+    }
+  });
+
+  channel.on("stream_tool", (payload) => {
+    if (payload.type === "tool_use") {
+      onEvent({ type: "tool_use", data: JSON.stringify(payload) });
+    } else if (payload.type === "tool_result") {
+      onEvent({ type: "tool_result", data: JSON.stringify(payload) });
+    }
+  });
+
+  channel.on("status_change", (payload) => {
+    // Forward as "done"-like marker; ChatPanel mostly uses this to know activity ended
+  });
+
+  channel.on("done", () => {
+    onEvent({ type: "done", data: "" });
+    // Channel cleanup is handled by ChatPanel's abort; just clear the ref
+    if (_activeChannel === channel) _activeChannel = null;
+  });
+
+  channel.on("error", (payload) => {
+    onEvent({ type: "error", data: payload?.message || "Unknown error" });
+  });
+
+  channel.join().receive("ok", () => {
+    channel.push("chat", { message, images: images?.length ? images : undefined });
+  }).receive("error", (resp) => {
+    onEvent({ type: "error", data: JSON.stringify(resp) });
+  });
+
+  return {
+    abort: () => {
+      channel.push("cancel", {});
+      channel.leave();
+      if (_activeChannel === channel) _activeChannel = null;
+    },
+  };
 }
 
-export async function markMessagesRead(ids: string[]) {
+// ---------------------------------------------------------------------------
+// Agent status subscription (was SSE-based before)
+// ---------------------------------------------------------------------------
+
+export interface ActivityEntry {
+  agentId: string;
+  agentName: string;
+  type: string;
+  content?: string;
+  deltaId?: string;
+  toolName?: string;
+  // The Elixir backend sometimes forwards these as raw objects (from the
+  // stream_event) and sometimes as JSON strings (from the activity broadcast).
+  // Renderers must handle both shapes.
+  toolInput?: string | object;
+  toolResult?: string | object;
+  errorMessage?: string;
+  timestamp: number;
+}
+
+export function subscribeAgentStatus(
+  onSnapshot: (agentIds: string[], paused?: boolean) => void,
+  onStatus: (agentId: string, processing: boolean) => void,
+  onActivity?: (event: ActivityEntry) => void,
+  onOrgChanged?: () => void
+): { abort: () => void } {
+  const socket = getSocket();
+  const channel = socket.channel("lobby:status");
+
+  channel.on("init", (payload) => {
+    if (Array.isArray(payload.agentIds)) {
+      onSnapshot(payload.agentIds, payload.paused ?? false);
+    }
+  });
+
+  channel.on("status_change", (payload) => {
+    if (typeof payload.agentId === "string") {
+      onStatus(payload.agentId, !!payload.processing);
+    }
+  });
+
+  channel.on("org_changed", () => {
+    onOrgChanged?.();
+  });
+
+  channel.on("activity", (payload) => {
+    if (onActivity && typeof payload.agentId === "string") {
+      onActivity({
+        agentId: payload.agentId,
+        agentName: payload.agentName || "",
+        type: payload.type || "",
+        content: payload.content,
+        deltaId: payload.deltaId,
+        toolName: payload.toolName,
+        toolInput: payload.toolInput,
+        toolResult: payload.toolResult,
+        errorMessage: payload.errorMessage,
+        timestamp: payload.timestamp || Date.now(),
+      });
+    }
+  });
+
+  channel.join().receive("ok", () => {
+    // Initial snapshot is pushed via "init" event
+  }).receive("error", () => {
+    onSnapshot([], false);
+  });
+
+  return {
+    abort: () => {
+      channel.leave();
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Inbox
+// ---------------------------------------------------------------------------
+
+export async function getInbox(agentId: string) {
+  return fetchJSON(`${BASE}/chat/inbox/${agentId}`);
+}
+
+export async function sendInboxMessage(payload: {
+  fromAgentId: string;
+  toAgentId: string;
+  type?: string;
+  content: string;
+  subject?: string;
+  priority?: string;
+  metadata?: Record<string, any>;
+}) {
+  return fetchJSON(`${BASE}/chat/inbox`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Chat history
+// ---------------------------------------------------------------------------
+
+export async function getChatHistory(agentId: string) {
+  return fetchJSON(`${BASE}/chat/history/${agentId}`);
+}
+
+export async function markMessagesRead(ids: string[], agentId?: string) {
   return fetchJSON(`${BASE}/chat/mark-read`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ids }),
+    body: JSON.stringify({ ids, agentId: agentId || ids[0] || "" }),
   });
 }
 
-export async function getUserPings(): Promise<{ agentIds: string[] }> {
-  return fetchJSON(`${BASE}/chat/user-pings`);
+// ---------------------------------------------------------------------------
+// System pause/resume
+// ---------------------------------------------------------------------------
+
+export async function pauseSystem() {
+  return fetchJSON(`${BASE}/chat/pause`, { method: "POST" });
 }
 
-export interface PendingQuestion {
-  id: string;
-  agentId: string;
-  question: string;
-  options?: { label: string; description?: string }[];
-  createdAt: number;
+export async function resumeSystem() {
+  return fetchJSON(`${BASE}/chat/resume`, { method: "POST" });
 }
 
-export async function getQuestions(): Promise<PendingQuestion[]> {
-  return fetchJSON(`${BASE}/chat/questions`);
+export async function getPausedState() {
+  return fetchJSON(`${BASE}/chat/paused`);
 }
 
-export async function answerQuestion(id: string, answer: string) {
-  return fetchJSON(`${BASE}/chat/questions/${id}/answer`, {
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+export async function getSettings() {
+  return fetchJSON(`${BASE}/settings`);
+}
+
+export async function getSetting(key: string) {
+  return fetchJSON(`${BASE}/settings/${key}`);
+}
+
+export async function upsertSetting(key: string, value: string) {
+  return fetchJSON(`${BASE}/settings`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answer }),
+    body: JSON.stringify({ key, value }),
   });
 }
 
-export interface AgentTodos {
-  agentId: string;
-  todos: { content: string; status: string }[];
-  updatedAt: number;
+/** Bulk update settings. Accepts a map of { key: value }. */
+export async function updateSettings(settings: Record<string, string>) {
+  // If single key/value, use the simple endpoint
+  const entries = Object.entries(settings);
+  if (entries.length === 1) {
+    const [key, value] = entries[0];
+    return upsertSetting(key, value);
+  }
+  // Multiple - POST the first one, ignore rest (single-setting endpoint)
+  for (const [key, value] of entries) {
+    await upsertSetting(key, value);
+  }
+  return { ok: true };
 }
 
-export async function getAgentTodos(agentId: string): Promise<AgentTodos> {
-  return fetchJSON(`${BASE}/chat/todos/${agentId}`);
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+export async function getLlmModels() {
+  return fetchJSON(`${BASE}/llm-models`);
 }
 
-export interface ActiveCommunication {
+// ---------------------------------------------------------------------------
+// Templates
+// ---------------------------------------------------------------------------
+
+export async function getAgentTemplates() {
+  return fetchJSON(`${BASE}/agent-templates`);
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+export async function getHealth() {
+  return fetchJSON(`${BASE}/health`);
+}
+
+// ---------------------------------------------------------------------------
+// Approvals
+// ---------------------------------------------------------------------------
+
+export interface PendingApproval {
   id: string;
-  fromAgentId: string;
-  toAgentId: string;
-  type: "dispatch" | "message" | "trigger";
+  agentId: string;
+  toolName: string;
+  toolArguments: string;
+  description: string;
+  status: string;
   createdAt: number;
 }
 
-export async function getCommunications(): Promise<ActiveCommunication[]> {
-  return fetchJSON(`${BASE}/org/communications`);
+/** Get pending approval requests for a single agent. */
+export async function getPendingApprovals(agentId: string): Promise<PendingApproval[]> {
+  return fetchJSON(`${BASE}/permissions/pending/${agentId}`);
 }
 
-// --- Permission management ---
+/** Get all pending approval requests for a project. */
+export async function getProjectPendingApprovals(projectId: string): Promise<PendingApproval[]> {
+  return fetchJSON(`${BASE}/permissions/pending/project/${projectId}`);
+}
 
-export async function getPermissionRules(agentId: string) {
+/** Respond (approve/reject) to a pending approval request. */
+export async function respondToApproval(
+  requestId: string,
+  approved: boolean,
+  remember: boolean = false,
+  userNote?: string,
+  projectId?: string
+): Promise<{ ok: boolean; reason?: string }> {
+  return fetchJSON(`${BASE}/permissions/respond`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requestId, approved, remember, userNote, projectId }),
+  });
+}
+
+/** Get effective permission rules for an agent. */
+export async function getAgentPermissions(agentId: string) {
   return fetchJSON(`${BASE}/permissions/rules/${agentId}`);
 }
 
-export async function updatePermissionRules(agentId: string, rules: {
-  permissionMode?: string;
+/** Update permission rules for an agent. */
+export async function updateAgentPermissions(agentId: string, rules: {
+  permissionMode?: "readonly" | "readwrite" | "full" | "custom";
   allowedTools?: string[];
   deniedTools?: string[];
   askTools?: string[];
@@ -392,50 +471,25 @@ export async function updatePermissionRules(agentId: string, rules: {
   });
 }
 
-export async function getPendingApprovals(agentId: string) {
-  return fetchJSON(`${BASE}/permissions/pending/${agentId}`);
+// ---------------------------------------------------------------------------
+// Permission rules (alias for getAgentPermissions)
+// ---------------------------------------------------------------------------
+
+export async function getPermissionRules(agentId: string) {
+  return getAgentPermissions(agentId);
 }
 
-export async function getProjectPendingApprovals(projectId: string) {
-  return fetchJSON(`${BASE}/permissions/pending/project/${projectId}`);
+// ---------------------------------------------------------------------------
+// Chat messages (alias for getChatHistory)
+// ---------------------------------------------------------------------------
+
+export async function getChatMessages(agentId: string) {
+  return fetchJSON(`${BASE}/chat/messages/${agentId}`);
 }
 
-export async function respondToApproval(requestId: string, approved: boolean, remember = false, userNote?: string) {
-  return fetchJSON(`${BASE}/permissions/respond`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ requestId, approved, remember, userNote }),
-  });
-}
-
-// --- Roster (Personnel Records) ---
-
-export async function getRoster(projectId: string) {
-  return fetchJSON(`${BASE}/org/roster/${projectId}`);
-}
-
-export async function getAgentRoster(agentId: string) {
-  return fetchJSON(`${BASE}/org/roster/agent/${agentId}`);
-}
-
-// --- Filesystem browse (for folder picker) ---
-
-export interface BrowseResult {
-  currentPath: string;
-  parentPath: string | null;
-  entries: Array<{ name: string; isDir: boolean; fullPath: string }>;
-  drives: string[];
-  isRoot: boolean;
-}
-
-export async function browseDirectory(dirPath?: string): Promise<BrowseResult> {
-  const url = dirPath
-    ? `${BASE}/fs/browse?path=${encodeURIComponent(dirPath)}`
-    : `${BASE}/fs/browse`;
-  return fetchJSON(url);
-}
-
-// --- LLM Models ---
+// ---------------------------------------------------------------------------
+// LLM Models (alias for getLlmModels)
+// ---------------------------------------------------------------------------
 
 export interface LlmModel {
   id: string;
@@ -446,50 +500,42 @@ export interface LlmModel {
   contextWindow: number;
   maxOutputTokens: number;
   supportsThinking: boolean;
-  defaultReasoningEffort: string | null;
-  temperature: string | null;
+  defaultReasoningEffort?: string | null;
+  temperature?: string | null;
   isActive: boolean;
-  createdAt: number;
-  updatedAt: number;
 }
 
 export async function getModels(): Promise<LlmModel[]> {
-  return fetchJSON(`${BASE}/models`);
+  return fetchJSON(`${BASE}/llm-models`);
 }
 
-export async function getAllModels(): Promise<LlmModel[]> {
-  return fetchJSON(`${BASE}/models/all`);
-}
-
-export async function getModel(id: string): Promise<LlmModel> {
-  return fetchJSON(`${BASE}/models/${id}`);
-}
-
-export async function createModel(data: Partial<LlmModel>): Promise<LlmModel> {
-  return fetchJSON(`${BASE}/models`, {
+export async function createModel(payload: Partial<LlmModel>) {
+  return fetchJSON(`${BASE}/llm-models`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
+    body: JSON.stringify(payload),
   });
 }
 
-export async function updateModel(id: string, data: Partial<LlmModel>): Promise<LlmModel> {
-  return fetchJSON(`${BASE}/models/${id}`, {
+export async function updateModel(id: string, payload: Partial<LlmModel>) {
+  return fetchJSON(`${BASE}/llm-models/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
+    body: JSON.stringify(payload),
   });
 }
 
-export async function deleteModel(id: string): Promise<void> {
-  return fetchJSON(`${BASE}/models/${id}`, { method: "DELETE" });
+export async function deleteModel(id: string) {
+  return fetchJSON(`${BASE}/llm-models/${id}`, { method: "DELETE" });
 }
 
-export async function testModel(id: string): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
-  return fetchJSON(`${BASE}/models/${id}/test`, { method: "POST" });
+export async function testModel(id: string) {
+  return fetchJSON(`${BASE}/llm-models/${id}/test`, { method: "POST" });
 }
 
-// --- Agent Templates ---
+// ---------------------------------------------------------------------------
+// Agent Templates
+// ---------------------------------------------------------------------------
 
 export interface AgentTemplate {
   id: string;
@@ -501,38 +547,237 @@ export interface AgentTemplate {
   emoji: string;
   vibe: string;
   description: string;
+  promptBody: string;
   originalFile: string;
-  promptBody?: string;
+  createdAt: number;
 }
 
-export async function getTemplates(params?: { source?: string; division?: string; role?: string; search?: string }): Promise<AgentTemplate[]> {
-  const query = new URLSearchParams();
-  if (params?.source) query.set("source", params.source);
-  if (params?.division) query.set("division", params.division);
-  if (params?.role) query.set("role", params.role);
-  if (params?.search) query.set("search", params.search);
-  const qs = query.toString();
-  return fetchJSON(`${BASE}/templates${qs ? `?${qs}` : ""}`);
+export async function getTemplates(opts?: { division?: string; role?: string; source?: string }): Promise<AgentTemplate[]> {
+  const params = new URLSearchParams();
+  if (opts?.division) params.set("division", opts.division);
+  if (opts?.role) params.set("role", opts.role);
+  if (opts?.source) params.set("source", opts.source);
+  const qs = params.toString();
+  return fetchJSON(`${BASE}/agent-templates${qs ? "?" + qs : ""}`);
 }
 
-export async function getTemplateDivisions(): Promise<Array<{ division: string; count: number }>> {
-  return fetchJSON(`${BASE}/templates/divisions`);
+export async function getTemplateDivisions(): Promise<string[]> {
+  return fetchJSON(`${BASE}/agent-templates/divisions`);
 }
 
 export async function getTemplate(id: string): Promise<AgentTemplate> {
-  return fetchJSON(`${BASE}/templates/${id}`);
+  return fetchJSON(`${BASE}/agent-templates/${id}`);
 }
 
-// --- Global Settings ---
+// ---------------------------------------------------------------------------
+// Communications
+// ---------------------------------------------------------------------------
 
-export async function getSettings(): Promise<Record<string, string>> {
-  return fetchJSON(`${BASE}/settings`);
+export interface Communication {
+  id: string;
+  fromAgentId?: string;
+  toAgentId?: string;
+  type: string;
+  subject?: string;
+  content: string;
+  status: string;
+  metadata?: Record<string, any>;
+  createdAt: number;
 }
 
-export async function updateSettings(settings: Record<string, string>): Promise<{ ok: boolean }> {
-  return fetchJSON(`${BASE}/settings`, {
-    method: "PUT",
+export async function getCommunications(opts?: { projectId?: string; limit?: number }): Promise<Communication[]> {
+  const params = new URLSearchParams();
+  if (opts?.projectId) params.set("projectId", opts.projectId);
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const qs = params.toString();
+  return fetchJSON(`${BASE}/communications${qs ? "?" + qs : ""}`);
+}
+
+export async function sendCommunication(payload: {
+  fromAgentId?: string;
+  toAgentId: string;
+  type: string;
+  content: string;
+  subject?: string;
+  metadata?: Record<string, any>;
+}) {
+  return fetchJSON(`${BASE}/communications`, {
+    method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(settings),
+    body: JSON.stringify(payload),
   });
 }
+
+// ---------------------------------------------------------------------------
+// User Pings
+// ---------------------------------------------------------------------------
+
+export interface UserPing {
+  id: string;
+  agentId: string;
+  agentName?: string;
+  type: string;
+  content: string;
+  toolName?: string;
+  toolInput?: string;
+  timestamp: number;
+  read: boolean;
+}
+
+export async function getUserPings(opts?: { unreadOnly?: boolean; limit?: number }): Promise<UserPing[]> {
+  const params = new URLSearchParams();
+  if (opts?.unreadOnly) params.set("unreadOnly", "true");
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const qs = params.toString();
+  return fetchJSON(`${BASE}/user-pings${qs ? "?" + qs : ""}`);
+}
+
+export async function markPingRead(id: string) {
+  return fetchJSON(`${BASE}/user-pings/${id}/read`, { method: "POST" });
+}
+
+// ---------------------------------------------------------------------------
+// Alarms
+// ---------------------------------------------------------------------------
+
+export interface ProjectAlarm {
+  id: string;
+  fromAgentId?: string;
+  toAgentId: string;
+  purpose: string;
+  fireAtGameSeconds: number;
+  fired: boolean;
+  firedAt?: number;
+  createdAt: number;
+}
+
+export async function getProjectAlarms(projectId: string, opts?: { includeFired?: boolean }): Promise<ProjectAlarm[]> {
+  const params = new URLSearchParams();
+  if (opts?.includeFired) params.set("includeFired", "true");
+  const qs = params.toString();
+  return fetchJSON(`${BASE}/projects/${projectId}/alarms${qs ? "?" + qs : ""}`);
+}
+
+export async function scheduleAlarm(projectId: string, alarm: { fromAgentId?: string; toAgentId: string; purpose: string; fireAtGameSeconds: number }) {
+  return fetchJSON(`${BASE}/projects/${projectId}/alarms`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(alarm),
+  });
+}
+
+export async function cancelAlarm(projectId: string, alarmId: string) {
+  return fetchJSON(`${BASE}/projects/${projectId}/alarms/${alarmId}`, { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------
+// Todos
+// ---------------------------------------------------------------------------
+
+export interface AgentTodos {
+  agentId: string;
+  todos: Array<{
+    id: string;
+    content: string;
+    status: "pending" | "in_progress" | "completed";
+    createdAt: number;
+    updatedAt: number;
+  }>;
+}
+
+export async function getAgentTodos(agentId: string): Promise<AgentTodos> {
+  return fetchJSON(`${BASE}/chat/todos/${agentId}`);
+}
+
+export async function executeTodoWrite(agentId: string, todos: AgentTodos["todos"]) {
+  return fetchJSON(`${BASE}/chat/todos/${agentId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ todos }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Work Logs
+// ---------------------------------------------------------------------------
+
+export interface WorkLog {
+  id: string;
+  agentId: string;
+  action: string;
+  summary: string;
+  details?: string;
+  metadata?: Record<string, any>;
+  createdAt: number;
+}
+
+export async function getWorkLogs(agentId: string, limit: number = 50): Promise<WorkLog[]> {
+  return fetchJSON(`${BASE}/logs/${agentId}?limit=${limit}`);
+}
+
+// ---------------------------------------------------------------------------
+// Questions (Q&A)
+// ---------------------------------------------------------------------------
+
+export interface PendingQuestion {
+  id: string;
+  agentId: string;
+  agentName?: string;
+  question: string;
+  context?: string;
+  options?: string[];
+  status: "pending" | "answered" | "expired";
+  answer?: string;
+  createdAt: number;
+  answeredAt?: number;
+}
+
+export async function getQuestions(opts?: { agentId?: string; status?: string }): Promise<PendingQuestion[]> {
+  const params = new URLSearchParams();
+  if (opts?.agentId) params.set("agentId", opts.agentId);
+  if (opts?.status) params.set("status", opts.status);
+  const qs = params.toString();
+  return fetchJSON(`${BASE}/chat/questions${qs ? "?" + qs : ""}`);
+}
+
+export async function answerQuestion(id: string, answer: string) {
+  return fetchJSON(`${BASE}/chat/questions/${id}/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answer }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem browse
+// ---------------------------------------------------------------------------
+
+export interface BrowseResult {
+  path: string;
+  parent: string | null;
+  currentPath?: string;
+  parentPath?: string | null;
+  entries: Array<{
+    name: string;
+    path: string;
+    fullPath?: string;
+    isDir: boolean;
+    is_dir?: boolean;
+    size?: number;
+    modified?: number;
+  }>;
+  drives?: string[];
+  isRoot?: boolean;
+  error?: string;
+}
+
+export async function browseDirectory(path?: string): Promise<BrowseResult> {
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  const qs = params.toString();
+  return fetchJSON(`${BASE}/fs/browse${qs ? "?" + qs : ""}`);
+}
+
+
+// Re-export the Channel for advanced usage
+export { Channel };

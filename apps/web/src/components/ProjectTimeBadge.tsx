@@ -26,8 +26,8 @@ export default function ProjectTimeBadge({ projectId }: Props) {
         if (!cancelled && data.formatted) {
           setFormatted(data.formatted);
         }
-      } catch {
-        // ignore transient poll errors
+      } catch (e) {
+        console.warn("[ProjectTime] Poll failed:", e);
       }
     };
 
@@ -41,7 +41,7 @@ export default function ProjectTimeBadge({ projectId }: Props) {
   }, [projectId]);
 
   if (!projectId) {
-    return null;
+    return <div className="px-2.5 py-1 rounded-md bg-surface border border-surface-border text-xs text-gray-500 whitespace-nowrap shrink-0">No project</div>;
   }
 
   return (

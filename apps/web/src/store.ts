@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { mergeDeltaContent } from "./utils/mergeDelta";
 
 interface ActiveCommunication {
   id: string;
@@ -48,6 +49,7 @@ interface AppState {
   addMessage: (agentId: string, msg: ChatMessage) => void;
   replaceMessage: (agentId: string, oldId: string, newMsg: ChatMessage) => void;
   removeMessage: (agentId: string, msgId: string) => void;
+  setChatMessages: (agentId: string, messages: ChatMessage[]) => void;
   clearChatSessions: () => void;
   orgTreeVersion: number;
   refreshOrgTree: () => void;
@@ -94,20 +96,28 @@ export interface ActivityEntry {
   content?: string;
   deltaId?: string;
   toolName?: string;
-  toolInput?: string;
-  toolResult?: string;
+  // The Elixir backend sometimes forwards these as raw objects (from the
+  // stream_event) and sometimes as JSON strings (from the activity broadcast).
+  // Renderers must handle both shapes.
+  toolInput?: string | object;
+  toolResult?: string | object;
   errorMessage?: string;
   timestamp: number;
 }
 
 interface ChatMessage {
   id: string;
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant" | "system" | "team";
   content: string;
   images?: string[];
   timestamp: number;
   isBackground?: boolean;
   isRead?: boolean;
+  toolCalls?: Array<{ tool: string; input: Record<string, any> }>;
+  teamFromAgentId?: string;
+  teamToAgentId?: string;
+  isContext?: boolean;
+  isStreaming?: boolean;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -142,6 +152,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           (m) => m.id !== msgId
         ),
       },
+    })),
+  setChatMessages: (agentId, messages) =>
+    set((state) => ({
+      chatSessions: { ...state.chatSessions, [agentId]: messages },
     })),
   clearChatSessions: () => set({ chatSessions: {} }),
   orgTreeVersion: 0,
@@ -229,13 +243,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     if (entry.type === "text_delta" || entry.type === "thinking_delta") {
-      // Delta: append to matching entry (immutable update to avoid shared-object mutation)
+      // Delta: append/replace to matching entry (immutable update to avoid shared-object mutation).
+      // Some LLM/SDKs send the FULL accumulated text per chunk instead of incremental deltas.
+      // In that case the new chunk contains the existing content as a prefix — we REPLACE to
+      // avoid "好的 好的, 我先我先分析…" style duplication. Real deltas fall through to plain append.
       let found = false;
       for (let i = feed.length - 1; i >= 0; i--) {
         const e = feed[i];
         if (e.agentId === entry.agentId && e.deltaId === entry.deltaId && e.type === entry.type) {
-          // Immutable update: create a new object instead of mutating the shared one
-          feed[i] = { ...e, content: (e.content || "") + (entry.content || ""), timestamp: entry.timestamp };
+          feed[i] = { ...e, content: mergeDeltaContent(e.content || "", entry.content || ""), timestamp: entry.timestamp };
           found = true;
           break;
         }

@@ -121,6 +121,8 @@ export function seedDefaultModel() {
 
   const now = Date.now();
   const id = crypto.randomUUID();
+
+  // 免费版
   metaSqlite.prepare(`
     INSERT INTO llm_models (id, name, model_id, base_url, api_key, context_window, max_output_tokens, supports_thinking, default_reasoning_effort, temperature, is_active, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -130,7 +132,7 @@ export function seedDefaultModel() {
     "deepseek-v4-flash-free",
     "https://opencode.ai/zen/v1",
     apiKey,
-    128000,
+    200000,
     8192,
     0,
     null,
@@ -139,7 +141,29 @@ export function seedDefaultModel() {
     now,
     now,
   );
-  console.log(`[DB] Seeded default model: DeepSeek V4 Flash Free (${id})`);
+  console.log(`[DB] Seeded free model: DeepSeek V4 Flash Free (${id})`);
+
+  // 付费版（限流后自动切换）
+  const paidId = crypto.randomUUID();
+  metaSqlite.prepare(`
+    INSERT INTO llm_models (id, name, model_id, base_url, api_key, context_window, max_output_tokens, supports_thinking, default_reasoning_effort, temperature, is_active, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    paidId,
+    "DeepSeek V4 Flash Paid",
+    "deepseek-v4-flash",
+    "https://opencode.ai/zen/go/v1",
+    apiKey,
+    1_000_000,
+    8192,
+    0,
+    null,
+    null,
+    1,
+    now,
+    now,
+  );
+  console.log(`[DB] Seeded paid model: DeepSeek V4 Flash Paid (${paidId})`);
 }
 
 /**
