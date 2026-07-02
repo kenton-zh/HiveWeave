@@ -1951,10 +1951,10 @@ defmodule HiveWeave.ToolExecutor do
           msg_id = Ecto.UUID.generate()
           now_ms = System.system_time(:millisecond)
           sql = """
-          INSERT INTO chat_messages (id, agent_id, role, content, tool_calls, is_background, is_read, is_streaming, created_at)
-          VALUES (?, ?, 'assistant', ?, '[]', 0, 0, 0, ?)
+          INSERT INTO chat_messages (id, agent_id, role, content, tool_calls, is_background, is_read, is_streaming, team_from_agent_id, created_at)
+          VALUES (?, ?, 'assistant', ?, '[]', 0, 0, 0, ?, ?)
           """
-          HiveWeave.Repo.ProjectFactory.query_for_agent(agent.id, sql, [msg_id, agent.id, "📩 #{content}", now_ms])
+          HiveWeave.Repo.ProjectFactory.query_for_agent(agent.id, sql, [msg_id, agent.id, "📩 #{content}", agent.id, now_ms])
 
           # Log user_ping event for the ping badge in org tree
           HiveWeave.EventAudit.log(agent.id, "user_ping", %{from: agent.id, message: content})

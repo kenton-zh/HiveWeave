@@ -138,6 +138,8 @@ defmodule HiveWeave.LLM.Streamer do
            is_streaming: true,
            is_read: false,
            is_background: is_triggered,
+           team_from_agent_id: agent.id,
+           team_to_agent_id: if(is_triggered, do: Keyword.get(opts, :from_agent_id), else: nil),
            created_at: now_ms
          }) do
       {:ok, _} -> :ok
