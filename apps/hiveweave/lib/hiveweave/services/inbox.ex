@@ -159,6 +159,23 @@ defmodule HiveWeave.Services.Inbox do
     _ -> :ok
   end
 
+  @doc """
+  Mark specific inbox messages as read by their IDs.
+
+  This is used to avoid the race condition where new messages arrive between
+  build_trigger_context and mark_all_read — only the messages that were
+  actually included in the context get marked as read.
+  """
+  def mark_read_by_ids(agent_id, message_ids) when is_list(message_ids) and length(message_ids) > 0 do
+    placeholders = message_ids |> Enum.map(fn _ -> "?" end) |> Enum.join(", ")
+    sql = "UPDATE inbox SET read = 1 WHERE to_agent_id = ? AND id IN (#{placeholders})"
+    ProjectFactory.query_for_agent(agent_id, sql, [agent_id | message_ids])
+    :ok
+  rescue
+    _ -> :ok
+  end
+  def mark_read_by_ids(_agent_id, _message_ids), do: :ok
+
   defp row_to_message([id, from_agent_id, to_agent_id, message, read, created_at, message_type, expect_report, priority]) do
     %{
       id: id,

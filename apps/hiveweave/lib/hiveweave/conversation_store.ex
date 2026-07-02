@@ -373,7 +373,7 @@ defmodule HiveWeave.ConversationStore do
   defp format_messages_for_summary(messages) do
     Enum.map(messages, fn m ->
       role = m["role"] || "unknown"
-      content = m["content"] || ""
+      content = safe_content(m["content"])
 
       # Truncate very long content
       truncated = if String.length(content) > 500 do
@@ -388,6 +388,18 @@ defmodule HiveWeave.ConversationStore do
   end
 
   # ── Message cleaning ────────────────────────────────────────
+
+  # Normalize content to a binary string (multimodal content can be a list)
+  defp safe_content(nil), do: ""
+  defp safe_content(s) when is_binary(s), do: s
+  defp safe_content(list) when is_list(list) do
+    Enum.map_join(list, "", fn
+      %{"text" => t} when is_binary(t) -> t
+      t when is_binary(t) -> t
+      _ -> ""
+    end)
+  end
+  defp safe_content(other), do: to_string(other)
 
   defp clean_messages(messages) do
     messages

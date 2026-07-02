@@ -200,4 +200,42 @@ defmodule HiveWeave.Services.ChatMessage do
       Logger.warning("clear_stuck_streaming failed: #{inspect(e)}")
       :ok
   end
+
+  @doc """
+  Check if there are unanswered user messages for an agent.
+
+  An "unanswered user message" is a foreground (is_background=0) user message
+  that has no subsequent assistant message. This is used to detect the case
+  where a user sent a message while the agent was busy — the message was
+  saved to DB but never processed.
+  """
+  def has_unanswered_user_messages?(agent_id) do
+    sql = """
+    SELECT EXISTS(
+      SELECT 1 FROM chat_messages m1
+      WHERE m1.agent_id = ?
+        AND m1.role = 'user'
+        AND m1.is_background = 0
+        AND NOT EXISTS(
+          SELECT 1 FROM chat_messages m2
+          WHERE m2.agent_id = m1.agent_id
+            AND m2.role = 'assistant'
+            AND m2.is_background = 0
+            AND m2.created_at > m1.created_at
+        )
+    )
+    """
+
+    case ProjectFactory.query_for_agent(agent_id, sql, [agent_id]) do
+      {:ok, %{rows: [[1]]}} -> true
+      {:ok, %{rows: [[0]]}} -> false
+      {:ok, %{rows: [["true"]]}} -> true
+      {:ok, %{rows: [["false"]]}} -> false
+      _ -> false
+    end
+  rescue
+    e ->
+      Logger.warning("has_unanswered_user_messages? failed: #{inspect(e)}")
+      false
+  end
 end

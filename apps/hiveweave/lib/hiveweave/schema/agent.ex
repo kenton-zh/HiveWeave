@@ -35,7 +35,7 @@ defmodule HiveWeave.Schema.Agent do
       :id, :short_id, :project_id, :name, :role, :parent_id, :module_id,
       :status, :goal, :backstory, :skills, :permission_type, :permission_mode,
       :allowed_tools, :denied_tools, :ask_tools, :mcp_servers, :bound_skills,
-      :last_seen_log_at, :created_at, :updated_at, :reasoning_effort
+      :last_seen_log_at, :created_at, :updated_at, :reasoning_effort, :model_id
     ])
     |> validate_required([:name, :role])
     |> validate_inclusion(:status, ["created", "active", "promoted", "receiving", "merging", "dissolving", "archived"])

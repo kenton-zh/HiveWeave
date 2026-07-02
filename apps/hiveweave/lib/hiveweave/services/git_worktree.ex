@@ -26,7 +26,7 @@ defmodule HiveWeave.Services.GitWorktree do
     git(parse_git_args(args), cwd)
   end
 
-  defp git(args, cwd, _timeout) when is_list(args) do
+  defp git(args, cwd, _timeout) when is_list(args) and args != [] do
     cmd_name = hd(args)
     case System.cmd("git", args, cd: cwd, stderr_to_stdout: true) do
       {output, 0} -> String.trim(output)

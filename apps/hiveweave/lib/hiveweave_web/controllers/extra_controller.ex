@@ -126,6 +126,21 @@ defmodule HiveWeaveWeb.ExtraController do
         do: [{sets, "api_key = ?", params["api_key"] || params["apiKey"]}], else: sets
     sets = if params["is_active"] || params["isActive"],
             do: [{sets, "is_active = ?", if(params["is_active"] || params["isActive"], do: 1, else: 0)}], else: sets
+    sets =
+      if params["context_window"] || params["contextWindow"],
+        do: [{sets, "context_window = ?", params["context_window"] || params["contextWindow"]}], else: sets
+    sets =
+      if params["max_output_tokens"] || params["maxOutputTokens"],
+        do: [{sets, "max_output_tokens = ?", params["max_output_tokens"] || params["maxOutputTokens"]}], else: sets
+    sets =
+      if Map.has_key?(params, "supports_thinking") || Map.has_key?(params, "supportsThinking"),
+        do: [{sets, "supports_thinking = ?", if(params["supports_thinking"] || params["supportsThinking"], do: 1, else: 0)}], else: sets
+    sets =
+      if Map.has_key?(params, "default_reasoning_effort") || Map.has_key?(params, "defaultReasoningEffort"),
+        do: [{sets, "default_reasoning_effort = ?", params["default_reasoning_effort"] || params["defaultReasoningEffort"]}], else: sets
+    sets =
+      if Map.has_key?(params, "temperature") || Map.has_key?(params, "temperature"),
+        do: [{sets, "temperature = ?", params["temperature"]}], else: sets
 
     set_clauses =
       sets

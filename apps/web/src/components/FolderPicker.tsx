@@ -75,7 +75,7 @@ function WebFolderPicker({
     try {
       const result = await browseDirectory(dirPath);
       setData(result);
-      setAddressBar(result.currentPath);
+      setAddressBar(result.currentPath || "");
     } catch {
       // keep previous state on error
     }
@@ -153,7 +153,7 @@ function WebFolderPicker({
         </div>
 
         {/* Drive shortcuts (Windows) */}
-        {data && data.drives.length > 0 && (
+        {data && data.drives && data.drives.length > 0 && (
           <div className="flex items-center gap-1 px-4 py-1.5 border-b border-surface-border overflow-x-auto">
             {data.drives.map((drive) => (
               <button
@@ -161,7 +161,7 @@ function WebFolderPicker({
                 onClick={() => navigate(drive)}
                 disabled={loading}
                 className={`px-2 py-0.5 text-xs rounded border shrink-0 transition-colors ${
-                  data.currentPath.startsWith(drive)
+                  data.currentPath?.startsWith(drive)
                     ? "border-accent/50 text-accent bg-accent/10"
                     : "border-surface-border text-gray-500 hover:text-gray-300 hover:border-gray-600"
                 }`}

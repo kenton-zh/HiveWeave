@@ -11,6 +11,7 @@ interface AgentInfo {
   role: string;
   status: string;
   parentId?: string | null;
+  position?: string;
 }
 
 interface ToolCall {
@@ -103,7 +104,11 @@ const statusLabels: Record<string, { text: string; color: string }> = {
 
 
 function isTeamChannelMessage(msg: ChatMessage): boolean {
-  return msg.role === "team";
+  // Team channel includes explicit team messages AND background user/assistant
+  // messages (agent-to-agent triggers). Exclude isContext messages — those are
+  // system-injected trigger contexts, not real agent-to-agent dialogue.
+  if (msg.isContext) return false;
+  return msg.role === "team" || (msg.isBackground && (msg.role === "user" || msg.role === "assistant"));
 }
 
 function tryParseToolCalls(raw: string): ToolCall[] {
@@ -335,6 +340,10 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const refreshOrgTree = useAppStore((s) => s.refreshOrgTree);
   const userName = useAppStore((s) => s.userName);
   const processingAgents = useAppStore((s) => s.processingAgents);
+  const updateProcessingAgent = useAppStore((s) => s.updateProcessingAgent);
+  const orgTreeVersion = useAppStore((s) => s.orgTreeVersion);
+  const socketReconnectVersion = useAppStore((s) => s.socketReconnectVersion);
+  const prevReconnectVersion = useRef(0);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [showApprovalDialog, setShowApprovalDialog] = useState(false);
   const [pendingApprovalTool, setPendingApprovalTool] = useState<string | null>(null);
@@ -451,7 +460,29 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         responseTimeoutRef.current = null;
       }
     };
-  }, [agentId, loadMessagesFromDb]);
+  }, [agentId, loadMessagesFromDb, orgTreeVersion]);
+
+  // Reset stale streaming state when WebSocket reconnects.
+  // If the socket drops mid-stream, no done/error event will arrive, leaving
+  // isStreaming stuck. On reconnect, lobby:status fires an init snapshot —
+  // if the agent is no longer processing, we force-reset the UI.
+  useEffect(() => {
+    if (socketReconnectVersion === prevReconnectVersion.current) return;
+    prevReconnectVersion.current = socketReconnectVersion;
+    // Only reset if this is not the initial mount
+    if (socketReconnectVersion > 1) {
+      const stillProcessing = agentId ? processingAgents.includes(agentId) : false;
+      if (!stillProcessing && isStreaming) {
+        setIsStreaming(false);
+        updateStreamDraft(null);
+        setRetryInfo(null);
+        if (responseTimeoutRef.current) {
+          clearTimeout(responseTimeoutRef.current);
+          responseTimeoutRef.current = null;
+        }
+      }
+    }
+  }, [socketReconnectVersion, agentId, processingAgents, isStreaming]);
 
   const isAgentProcessing = agentId ? processingAgents.includes(agentId) : false;
 
@@ -498,7 +529,17 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     // Only show foreground messages (user + assistant, non-background, non-team).
     // Agent-to-agent messages (is_background=true or role="team") belong in the
     // "团队沟通" panel, not the main ChatPanel.
-    const foreground = merged.filter((m) => !m.isBackground && (m.role === "user" || m.role === "assistant"));
+    // Also filter out empty assistant messages (no content, no tool calls) that
+    // may be leftover placeholders from interrupted streams.
+    const foreground = merged.filter((m) => {
+      if (m.isBackground || (m.role !== "user" && m.role !== "assistant")) return false;
+      if (m.role === "assistant" && !m.isStreaming) {
+        const hasContent = m.content && m.content.trim().length > 0;
+        const hasToolCalls = m.toolCalls && m.toolCalls.length > 0;
+        if (!hasContent && !hasToolCalls) return false;
+      }
+      return true;
+    });
     let trailingUserCount = 0;
     for (let i = foreground.length - 1; i >= 0; i--) {
       if (foreground[i].role === "user") trailingUserCount++;
@@ -564,10 +605,14 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   }, [agentId, messages]);
 
   const { directMessages, teamMessages } = useMemo(() => {
+    // Team messages must be derived from the raw `messages` state, NOT from
+    // `displayMessages` — the latter only keeps foreground (user/assistant)
+    // messages and strips out role="team" entries, so filtering it for team
+    // messages would always yield an empty list.
+    const team = messages.filter((m) => isTeamChannelMessage(m));
     const direct = displayMessages.filter((m) => !isTeamChannelMessage(m));
-    const team = displayMessages.filter((m) => isTeamChannelMessage(m));
     return { directMessages: direct, teamMessages: team };
-  }, [displayMessages]);
+  }, [messages, displayMessages]);
 
   const counterpartIds = useMemo(() => {
     const ids = new Set<string>();
@@ -671,6 +716,9 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
 
     stickToBottomRef.current = true;
     setIsStreaming(true);
+    // Optimistically set processing state so the status indicator updates
+    // immediately, without waiting for the lobby:status WebSocket event.
+    updateProcessingAgent(sendingForAgentId, true);
     updateStreamDraft(null);
     setRetryInfo(null);
     if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
@@ -678,6 +726,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       if (!isActiveSession()) return;
       setIsStreaming(false);
       updateStreamDraft(null);
+      updateProcessingAgent(sendingForAgentId, false);
       loadMessagesFromDb(sendingForAgentId);
       finishTurn();
     }, 120_000);
@@ -799,6 +848,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
             if (!isActiveSession()) return;
             setIsStreaming(false);
             updateStreamDraft(null);
+            updateProcessingAgent(sendingForAgentId, false);
             setRetryInfo(null);
             loadMessagesFromDb(sendingForAgentId);
             finishTurn();
@@ -811,6 +861,9 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setPendingApprovalTool(null);
         setRetryInfo(null);
+        // Directly update processing state — don't rely solely on lobby:status
+        // WebSocket channel, which may have missed the status_change event.
+        if (sendingForAgentId) updateProcessingAgent(sendingForAgentId, false);
         const ORG_TOOLS = new Set(["create_agent", "transfer_agent", "dismiss_agent", "create_from_template", "hire_agent"]);
         if ([...allToolsUsed].some((x) => ORG_TOOLS.has(x))) refreshOrgTree();
         // Load final messages from DB, THEN clear streamDraft and isStreaming.
@@ -835,6 +888,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       } else if (event.type === "error") {
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setRetryInfo(null);
+        if (sendingForAgentId) updateProcessingAgent(sendingForAgentId, false);
         if (streamDraft) {
           updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "text", content: "\n\nError: " + event.data }] } : prev);
         } else {
@@ -870,11 +924,12 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     updateStreamDraft(null);
     setRetryInfo(null);
     if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
+    if (agentId) updateProcessingAgent(agentId, false);
     if (pendingQueueRef.current.length > 0) {
       pendingQueueRef.current = [];
       setQueuedCount(0);
     }
-  }, []);
+  }, [agentId]);
 
   if (!agentId) {
     return (
@@ -895,7 +950,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const runtimeStatusInfo = agentInfo?.status === "active"
     ? isAgentProcessing ? { text: "工作中", color: "text-emerald-400" } : { text: "空闲", color: "text-gray-400" }
     : statusInfo;
-  const resolveAgentInfo = (id: string) => agentInfoCache[id] || { name: id === "system" ? "系统通知" : id.substring(0, 8) };
+  const resolveAgentInfo = (id: string) => agentInfoCache[id] || { name: id === "system" ? "系统通知" : "加载中…" };
 
   // Role colors matching OrgTree
   const roleDots: Record<string, string> = {
@@ -976,13 +1031,22 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           {teamCommsExpanded && (
             <div className="max-h-[35vh] overflow-y-auto overflow-x-hidden py-1">
               {[...teamMessages].sort((a, b) => b.timestamp - a.timestamp).map((msg) => {
-                const isIncoming = msg.role === "user" || msg.teamToAgentId === agentId;
+                // Background user messages (agent-to-agent trigger context) have
+                // role="user" but are NOT from the human operator. Distinguish:
+                // - isBackground=true + role="user" → trigger context from another agent
+                // - isBackground=false + role="user" → real human operator message
+                const isUserMsg = msg.role === "user" && !msg.isBackground;
+                const isIncoming = isUserMsg || msg.teamToAgentId === agentId;
                 const counterpartId = isIncoming
                   ? (msg.teamFromAgentId ?? null)
                   : (msg.teamToAgentId || getDirectedAgentId(msg, agentInfo?.parentId));
                 const info = isIncoming
-                  ? (msg.role === "user" ? { name: userName } : (counterpartId ? resolveAgentInfo(counterpartId) : { name: "Unknown" }))
-                  : (counterpartId ? resolveAgentInfo(counterpartId) : { name: agentInfo?.name || "Agent" });
+                  ? (isUserMsg
+                      ? { name: userName || "操作员", position: "操作员", role: "" }
+                      : (counterpartId ? resolveAgentInfo(counterpartId) : { name: "系统", role: "" }))
+                  : (counterpartId
+                      ? resolveAgentInfo(counterpartId)
+                      : (agentInfo ? { name: agentInfo.name, role: agentInfo.role, position: agentInfo.position } : { name: "加载中…", role: "" }));
                 const roleStyle = getRoleStyle(info.role || "");
                 const positionLabel = getPositionLabel(info.position, info.role);
                 const dotColor = roleDots[info.role || ""] || "bg-gray-400";
