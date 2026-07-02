@@ -33,6 +33,7 @@ defmodule HiveWeaveWeb.ProjectsController do
       workspace_path: params["workspacePath"],
       org_paradigm: params["orgParadigm"],
       charter_json: params["charterJson"],
+      language: params["language"] || "zh",
       created_at: System.system_time(:millisecond)
     }
 
@@ -88,49 +89,44 @@ defmodule HiveWeaveWeb.ProjectsController do
         |> put_status(404)
         |> json(%{error: "Not found"})
       project ->
-        # 1. Stop project supervisor — bounded by 15s. Agent GenServers and
-        #    any in-flight LLM Tasks must die before we close the DB pool,
-        #    otherwise checked-out connections block pool shutdown.
-        stop_project_bounded(project.id, 15_000)
+        # 1. Stop project supervisor — bounded by 3s. Agent GenServers and
+        #    any in-flight LLM Tasks must die before we close the DB pool.
+        stop_project_bounded(project.id, 3_000)
 
-        # 2. Close the per-project DB pool — bounded by 5s. After this
-        #    returns, no BEAM process should hold the SQLite file handle.
+        # 2. Close the per-project DB pool — marks project as 'deleting' so
+        #    no new pool can be created, then kills connection processes.
         stop_repo_bounded(project.id, 5_000)
 
-        # 3. Remove .hiveweave/ from disk (DB file with retry, then dir).
-        #    Wrapped in try/rescue so a cleanup failure can never surface as
-        #    a 500 — the meta-DB records (steps 4-5) are removed regardless.
-        db_leftover =
-          if project.workspace_path && project.workspace_path != "" do
-            try do
-              cleanup_project_workspace(project.workspace_path)
-            rescue
-              e ->
-                Logger.error("cleanup_project_workspace raised: #{inspect(e)}")
-                true
-            end
-          else
-            false
-          end
-
-        # 4. Delete agents for this project from the meta DB.
+        # 3. Delete agents for this project from the meta DB FIRST.
+        #    This ensures the project disappears from the org tree immediately.
         try do
           HiveWeave.Repo.Meta.query("DELETE FROM agents WHERE project_id = ?", [project.id])
         rescue
           e -> Logger.warning("Failed to delete agents for project #{project.id}: #{inspect(e)}")
         end
 
-        # 5. Finally, drop the project record itself.
+        # 4. Drop the project record itself.
         case HiveWeave.Repo.Meta.delete(project) do
           {:ok, _} -> :ok
           {:error, reason} ->
             Logger.error("Failed to delete project record #{project.id}: #{inspect(reason)}")
         end
 
+        # 5. Spawn a BACKGROUND task to clean up .hiveweave/ files.
+        #    On Windows, SQLite file handles can take seconds to release after
+        #    the connection process is killed. Doing this synchronously would
+        #    block the API response for 15+ seconds. Instead, we return
+        #    immediately and let the background task retry file deletion.
+        if project.workspace_path && project.workspace_path != "" do
+          spawn(fn ->
+            cleanup_project_workspace_background(project.workspace_path, project.id)
+          end)
+        end
+
         # 6. Clear the 'deleting' flag so the project can be re-created if needed.
         HiveWeave.Repo.ProjectFactory.clear_deleting(project.id)
 
-        json(conn, %{ok: true, dbLeftover: db_leftover})
+        json(conn, %{ok: true, dbLeftover: false})
     end
   end
 
@@ -384,6 +380,52 @@ defmodule HiveWeaveWeb.ProjectsController do
     end)
   end
 
+  # Background cleanup: called via spawn/1 after the delete API has already
+  # returned. Retries file deletion for up to ~60 seconds, then gives up.
+  defp cleanup_project_workspace_background(workspace_path, project_id) do
+    hw_dir = Path.join(workspace_path, ".hiveweave")
+    db_path = Path.join(hw_dir, "data.db")
+
+    # Clean up git worktrees first (best-effort)
+    cleanup_git_worktrees(workspace_path)
+
+    # Retry loop: try every 2 seconds for 30 attempts (60 seconds total).
+    # The SQLite file handle is released when the BEAM GC collects the Exqlite
+    # NIF resource. This can take several seconds on Windows.
+    result =
+      Enum.reduce_while(1..30, :not_deleted, fn n, _acc ->
+        Process.sleep(2_000)
+
+        # Force GC before each attempt — the NIF resource destructor
+        # (sqlite3_close) runs during GC.
+        force_global_gc()
+
+        case File.rm(db_path) do
+          :ok ->
+            Logger.info("[delete-bg] Deleted #{db_path} on attempt #{n} (project #{project_id})")
+            {:halt, :ok}
+
+          {:error, :enoent} ->
+            Logger.info("[delete-bg] #{db_path} already gone (attempt #{n})")
+            {:halt, :ok}
+
+          {:error, reason} ->
+            Logger.debug("[delete-bg] Attempt #{n}/30 failed for #{db_path}: #{inspect(reason)}")
+            {:cont, :not_deleted}
+        end
+      end)
+
+    # Try to remove the entire .hiveweave directory
+    case File.rm_rf(hw_dir) do
+      {:ok, _} ->
+        Logger.info("[delete-bg] Cleaned up #{hw_dir}")
+      {:error, reason, failed_path} ->
+        Logger.warning("[delete-bg] Partial cleanup at #{inspect(failed_path)}: #{inspect(reason)}")
+    end
+
+    result
+  end
+
   # Best-effort cleanup of hiveweave-managed git worktrees and branches.
   # Mirrors apps/server/src/routes/projects.ts:282-311.
   defp cleanup_git_worktrees(workspace_path) do
@@ -593,6 +635,18 @@ defmodule HiveWeaveWeb.ProjectsController do
       # (those free gateways often don't support tool calling)
       default_model_id = pick_default_model()
 
+      # Default skills for CEO: strategic planning, spec-driven, documentation,
+      # context management, and the meta-skill for using other skills.
+      ceo_skills = [
+        "planning-and-task-breakdown",
+        "spec-driven-development",
+        "documentation-and-adrs",
+        "doubt-driven-development",
+        "context-engineering",
+        "using-agent-skills"
+      ]
+      ceo_skills_json = Jason.encode!(ceo_skills)
+
       ceo_attrs = %{
         id: ceo_id,
         short_id: ceo_short,
@@ -604,7 +658,7 @@ defmodule HiveWeaveWeb.ProjectsController do
         goal: "维护项目章程；选定组织范式；协调业务负责人",
         backstory:
           "花名#{ceo_name}，35岁，三次创业两次失败。第一次死在现金流，第二次死在合伙人跑路。第三次总算活了下来，但因为太累把公司卖了。现在只想用AI搭一个不会吵架的团队。口头禅：不急，先把方向聊清楚。",
-        skills: "[]",
+        skills: ceo_skills_json,
         model_id: default_model_id,
         permission_type: "coordinator",
         permission_mode: "full",
@@ -612,7 +666,7 @@ defmodule HiveWeaveWeb.ProjectsController do
         denied_tools: "[]",
         ask_tools: "[]",
         mcp_servers: "[]",
-        bound_skills: "[]",
+        bound_skills: ceo_skills_json,
         created_at: now,
         updated_at: now
       }
@@ -625,6 +679,15 @@ defmodule HiveWeaveWeb.ProjectsController do
           hr_name = generate_flower_name()
           hr_id = Ecto.UUID.generate()
 
+          # Default skills for HR: interview/hiring, documentation,
+          # and the meta-skill for using other skills.
+          hr_skills = [
+            "interview-me",
+            "documentation-and-adrs",
+            "using-agent-skills"
+          ]
+          hr_skills_json = Jason.encode!(hr_skills)
+
           hr_attrs = %{
             id: hr_id,
             short_id: hr_short,
@@ -636,7 +699,7 @@ defmodule HiveWeaveWeb.ProjectsController do
             goal: "人员招聘与配置；协调 agent 间协作",
             backstory:
               "花名#{hr_name}，32岁，前身是某大厂HRBP。因为帮一位被裁的同事争取到了超额补偿，被上级视为不够冷酷而调离。离职后决定用自己的方式帮人找到合适的位置。",
-            skills: "[]",
+            skills: hr_skills_json,
             model_id: default_model_id,
             permission_type: "coordinator",
             permission_mode: "full",
@@ -644,7 +707,7 @@ defmodule HiveWeaveWeb.ProjectsController do
             denied_tools: "[]",
             ask_tools: "[]",
             mcp_servers: "[]",
-            bound_skills: "[]",
+            bound_skills: hr_skills_json,
             created_at: now,
             updated_at: now
           }

@@ -82,6 +82,15 @@ defmodule HiveWeave.Application do
     import Ecto.Query
     alias HiveWeave.Schema.Project
 
+    # 0. Ensure projects table has language column (runtime migration)
+    try do
+      HiveWeave.Repo.Meta.query!(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'en'"
+      )
+    rescue
+      _ -> :ok
+    end
+
     # 1. Clear zombie streaming flags on startup
     try do
       HiveWeave.Services.ChatMessage.clear_stuck_streaming()
