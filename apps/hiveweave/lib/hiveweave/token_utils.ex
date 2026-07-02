@@ -57,13 +57,15 @@ defmodule HiveWeave.TokenUtils do
   @doc """
   Truncate tool output if it exceeds the threshold.
   """
-  def truncate_tool_output(text, max_chars \\ @tool_output_max_chars) do
+  def truncate_tool_output(text, max_chars \\ @tool_output_max_chars)
+  def truncate_tool_output(text, max_chars) when is_binary(text) do
     if String.length(text) > max_chars do
       String.slice(text, 0, max_chars) <> "\n... [truncated, original length: #{String.length(text)}]"
     else
       text
     end
   end
+  def truncate_tool_output(other, _max_chars), do: to_string(other)
 
   @doc """
   Compute a hash for prefix caching identification.

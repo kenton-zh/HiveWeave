@@ -550,7 +550,7 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
       setLoading(true);
       try {
         const data = await getWorkLogs(agentId!, 10);
-        setLogs(data.logs || data || []);
+        setLogs(Array.isArray(data) ? data : (data?.logs || []));
       } catch (err) {
         console.error("Failed to fetch work logs:", err);
         setLogs([]);

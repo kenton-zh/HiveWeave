@@ -61,16 +61,20 @@ export default function QuestionDialog() {
 
         {q.options && q.options.length > 0 && (
           <div className="space-y-2 mb-4">
-            {q.options.map((opt, i) => (
+            {q.options.map((opt, i) => {
+              const label = typeof opt === "string" ? opt : (opt as any)?.label ?? String(opt);
+              const desc = typeof opt === "object" && opt !== null ? (opt as any)?.description : undefined;
+              return (
               <button
                 key={i}
-                onClick={() => handleAnswer(q.id, opt.label)}
+                onClick={() => handleAnswer(q.id, label)}
                 className="w-full text-left px-4 py-3 rounded-lg bg-surface border border-surface-border hover:border-accent hover:bg-accent/10 transition-colors"
               >
-                <div className="text-sm font-medium text-gray-200">{opt.label}</div>
-                {opt.description && <div className="text-xs text-gray-500 mt-0.5">{opt.description}</div>}
+                <div className="text-sm font-medium text-gray-200">{label}</div>
+                {desc && <div className="text-xs text-gray-500 mt-0.5">{desc}</div>}
               </button>
-            ))}
+              );
+            })}
           </div>
         )}
 

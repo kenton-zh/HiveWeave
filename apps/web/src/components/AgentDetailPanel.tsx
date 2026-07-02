@@ -3,6 +3,15 @@ import { getAgent, updateAgent, getPermissionRules, getModels } from "../api";
 import type { LlmModel } from "../api";
 import { useAppStore } from "../store";
 
+// Safely parse a JSON array field that may be a string, array, or null.
+function safeJsonArray(val: unknown): string[] {
+  if (Array.isArray(val)) return val as string[];
+  if (typeof val === "string") {
+    try { const p = JSON.parse(val); return Array.isArray(p) ? p : []; } catch { return []; }
+  }
+  return [];
+}
+
 interface AgentDetail {
   id: string;
   shortId: string | null;
@@ -80,6 +89,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   const refreshOrgTree = useAppStore((s) => s.refreshOrgTree);
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
   const processingAgents = useAppStore((s) => s.processingAgents);
+  const orgTreeVersion = useAppStore((s) => s.orgTreeVersion);
 
   // Fetch agent details
   const fetchAgent = useCallback(async () => {
@@ -98,11 +108,11 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
       }
       setAgent({
         ...data,
-        allowedTools: JSON.parse(data?.allowedTools || "[]"),
-        deniedTools: JSON.parse(data?.deniedTools || "[]"),
-        askTools: JSON.parse(data?.askTools || "[]"),
-        mcpServers: JSON.parse(data?.mcpServers || "[]"),
-        boundSkills: JSON.parse(data?.boundSkills || "[]"),
+        allowedTools: safeJsonArray(data?.allowedTools),
+        deniedTools: safeJsonArray(data?.deniedTools),
+        askTools: safeJsonArray(data?.askTools),
+        mcpServers: safeJsonArray(data?.mcpServers),
+        boundSkills: safeJsonArray(data?.boundSkills),
       });
       setGoalDraft(data.goal || "");
       setBackstoryDraft(data.backstory || "");
@@ -133,6 +143,12 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
     fetchAgent();
   }, [fetchAgent]);
 
+  // Re-fetch agent details when org tree changes (e.g. status updates,
+  // new hires, role changes) so the panel stays in sync without a page reload.
+  useEffect(() => {
+    if (agentId) fetchAgent();
+  }, [orgTreeVersion]);
+
   // Fetch resolved model when agent has no explicit model
   useEffect(() => {
     if (!agentId) return;
@@ -156,6 +172,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
     try {
       await updateAgent(agent.id, { modelId: modelId || null });
       setAgent({ ...agent, modelId: modelId || null });
+      refreshOrgTree();
     } catch (err: any) {
       setError(`保存失败: ${err.message}`);
     } finally {

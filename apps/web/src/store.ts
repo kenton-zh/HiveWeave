@@ -53,6 +53,8 @@ interface AppState {
   clearChatSessions: () => void;
   orgTreeVersion: number;
   refreshOrgTree: () => void;
+  socketReconnectVersion: number;
+  bumpSocketReconnect: () => void;
   activeCommunications: ActiveCommunication[];
   setActiveCommunications: (comms: ActiveCommunication[]) => void;
   userName: string;
@@ -160,6 +162,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   clearChatSessions: () => set({ chatSessions: {} }),
   orgTreeVersion: 0,
   refreshOrgTree: () => set((s) => ({ orgTreeVersion: s.orgTreeVersion + 1 })),
+  socketReconnectVersion: 0,
+  bumpSocketReconnect: () => set((s) => ({ socketReconnectVersion: s.socketReconnectVersion + 1 })),
   activeCommunications: [],
   setActiveCommunications: (comms) => set({ activeCommunications: comms }),
   userName: (typeof localStorage !== "undefined" ? localStorage.getItem("hiveweave-user-name") : null) || "用户",
