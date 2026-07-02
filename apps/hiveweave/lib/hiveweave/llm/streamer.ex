@@ -39,6 +39,7 @@ defmodule HiveWeave.LLM.Streamer do
       _ -> 80  # executors, developers, etc.
     end
   end
+  defp max_tool_rounds_for(_), do: 80
 
   @doc """
   Stream a chat completion from the LLM.
@@ -121,7 +122,11 @@ defmodule HiveWeave.LLM.Streamer do
     # Build initial messages: system + history + user
     initial_messages = build_messages(agent, message, opts, history)
 
-    # Create placeholder assistant message
+    # Create placeholder assistant message.
+    # When triggered by coordinator (not by user), mark as background so it
+    # doesn't appear in the foreground chat panel — the user didn't message
+    # this agent directly; the response is internal agent-to-agent processing.
+    is_triggered = Keyword.get(opts, :trigger, false)
     assistant_msg_id = Ecto.UUID.generate()
     now_ms = System.system_time(:millisecond)
 
@@ -132,6 +137,7 @@ defmodule HiveWeave.LLM.Streamer do
            content: "",
            is_streaming: true,
            is_read: false,
+           is_background: is_triggered,
            created_at: now_ms
          }) do
       {:ok, _} -> :ok
@@ -405,7 +411,7 @@ defmodule HiveWeave.LLM.Streamer do
             |> Enum.uniq()
             |> Enum.join(", ")
             "🔧 Executing: #{tool_names}"
-          true -> "(no response)"
+          true -> "(模型未返回内容，可能该模型将回复放在 reasoning 字段中但未被捕获)"
         end
 
         tool_calls_json = case tool_history do
@@ -434,6 +440,10 @@ defmodule HiveWeave.LLM.Streamer do
         {:ok, :completed, display_text}
 
       {:error, reason} ->
+        # Just mark streaming as done. The placeholder may already have partial
+        # content from mid-stream updates (run_tool_loop_with_tools updates
+        # content during tool rounds). We don't have access to the accumulated
+        # text/tool_calls here, so we leave whatever was last written.
         ChatMessage.update_message(agent.id, assistant_msg_id, %{is_streaming: false})
 
         duration = System.monotonic_time(:millisecond) - start_time
@@ -746,10 +756,17 @@ defmodule HiveWeave.LLM.Streamer do
         - You report to the human operator. Use `send_message` with recipient "user".
         - Do NOT endlessly list files. After 2-3 file reads, immediately design and act.
 
-        ## Communication Style — Caveman for Agent-to-Agent
-        When reporting to other agents (report_completion, send_message to agent):
-        terse, drop articles/filler, fragments OK, technical terms exact.
-        When reporting to user (send_message to user): normal, complete, friendly.
+        ## Communication Style — STRICT DISCIPLINE
+        ### To other agents (report_completion, send_message to agent, dispatch_task)
+        CAVEMAN. Terse. NO pleasantries, NO praise, NO narration of your process.
+        BANNED phrases: "干得漂亮" "很好" "太棒了" "辛苦了" "整装待发" "干得好" "great work" "well done" "nice job" "I will now" "let me" "看起来" "让我".
+        Just state: what done, what found, what next. Fragments OK. Technical terms exact.
+        Example: "Team hired. 7 agents. Skills bound. Awaiting user priority input."
+        ### To user (send_message to user)
+        Normal, complete sentences. BUT: report CONCLUSIONS only, not process narration.
+        Do NOT describe every step you took ("让我先确认...", "现在我来检查...", "找到全ID了！").
+        User wants results, not your internal monologue. 2-3 sentences max per message.
+        Example: "7人团队已组建完成，技能已绑定。请问优先启动哪个模块？"
         """
 
       normalized == "hr" ->
@@ -786,6 +803,8 @@ defmodule HiveWeave.LLM.Streamer do
         When hiring agents, bind skills according to the role:
         | Role keywords | Skills to bind |
         |---|---|
+        | CEO/首席执行官 | planning-and-task-breakdown, spec-driven-development, documentation-and-adrs, doubt-driven-development, context-engineering, using-agent-skills |
+        | HR/人力资源 | interview-me, documentation-and-adrs, using-agent-skills |
         | 技术负责人/Manager/Tech Lead | planning-and-task-breakdown, doubt-driven-development, ci-cd-and-automation, deprecation-and-migration, documentation-and-adrs, git-workflow-and-versioning, shipping-and-launch |
         | Developer/开发/engineer | incremental-implementation, test-driven-development, source-driven-development, debugging-and-error-recovery, git-workflow-and-versioning, documentation-and-adrs, frontend-ui-engineering, api-and-interface-design |
         | 审查员/Reviewer/Inspector/QA | test-driven-development, browser-testing-with-devtools, debugging-and-error-recovery, code-simplification |
@@ -828,9 +847,12 @@ defmodule HiveWeave.LLM.Streamer do
         - If you need to hire team members, message HR via `send_message` with your hiring request.
         - Do NOT call `hire_agent` yourself — that is HR's exclusive tool.
 
-        ## Communication Style — Caveman for Agent-to-Agent
-        When reporting to other agents: terse, drop articles/filler, fragments OK, technical terms exact.
-        When reporting to user: normal, complete, friendly.
+        ## Communication Style — STRICT DISCIPLINE
+        ### To other agents: CAVEMAN. NO pleasantries, NO praise, NO process narration.
+        BANNED: "干得漂亮" "很好" "辛苦了" "让我" "看起来" "I will now" "let me" "great work".
+        State only: what done, what found, what next.
+        ### To user: Normal sentences, CONCLUSIONS only. No step-by-step narration.
+        2-3 sentences max. User wants results, not monologue.
         """
     end
   end
@@ -871,9 +893,10 @@ defmodule HiveWeave.LLM.Streamer do
         - Whether issues were fixed (update on re-review)
         Before reviewing, read_project_memory to check for recurring issue patterns.
 
-        ## Communication Style — Caveman for Agent-to-Agent
-        When reporting to superior: terse, drop articles/filler, fragments OK, technical terms exact.
-        Review reports use the one-line-per-finding format above.
+        ## Communication Style — STRICT DISCIPLINE
+        To superior: CAVEMAN. NO pleasantries, NO praise, NO process narration.
+        BANNED: "干得漂亮" "很好" "辛苦了" "让我" "看起来" "I will" "let me".
+        Review reports use one-line-per-finding format above.
         """
 
       true ->
@@ -884,10 +907,12 @@ defmodule HiveWeave.LLM.Streamer do
         3. Report completion via `report_completion` or `message_superior`
         Always read a file before editing it. Be thorough but efficient — don't over-explore.
 
-        ## Communication Style — Caveman for Agent-to-Agent
-        When reporting to superior (report_completion, send_message to agent):
-        terse, drop articles/filler, fragments OK, technical terms exact.
-        When reporting to user (send_message to user): normal, complete, friendly.
+        ## Communication Style — STRICT DISCIPLINE
+        ### To superior (report_completion, send_message to agent): CAVEMAN.
+        NO pleasantries, NO praise, NO process narration.
+        BANNED: "干得漂亮" "很好" "辛苦了" "让我" "看起来" "I will" "let me" "great work".
+        State only: what done, what found, what next.
+        ### To user: Normal sentences, CONCLUSIONS only. No step-by-step narration. 2-3 sentences max.
         """
     end
   end
@@ -959,15 +984,30 @@ defmodule HiveWeave.LLM.Streamer do
   # This is intentionally conservative (overestimate) to avoid hitting limits.
   defp estimate_tokens(messages) do
     Enum.reduce(messages, 0, fn msg, acc ->
-      content = msg["content"] || ""
+      content = safe_string(msg["content"])
       args = case msg["tool_calls"] do
         nil -> ""
         calls -> Enum.map_join(calls, "", &(&1["function"]["arguments"] || ""))
       end
+      args = safe_string(args)
       # ~3 chars per token as a blended average
       acc + div(byte_size(content), 3) + div(byte_size(args), 3) + 10  # +10 for JSON overhead per message
     end)
   end
+
+  # Normalize content to a binary string. OpenAI multimodal format uses
+  # content as a list of parts (e.g. [{"type":"text","text":"..."}]).
+  # byte_size/String functions crash on non-binary input.
+  defp safe_string(nil), do: ""
+  defp safe_string(s) when is_binary(s), do: s
+  defp safe_string(list) when is_list(list) do
+    Enum.map_join(list, "", fn
+      %{"text" => t} when is_binary(t) -> t
+      t when is_binary(t) -> t
+      _ -> ""
+    end)
+  end
+  defp safe_string(other), do: to_string(other)
 
   defp trim_context_if_needed(messages, max_tokens) do
     estimated = estimate_tokens(messages)
@@ -1177,7 +1217,19 @@ defmodule HiveWeave.LLM.Streamer do
     body = resp.body
     status = resp.status
 
-    if is_binary(body) do
+    # Check HTTP status code first. A non-200 response (e.g. 429 rate limit,
+    # 500 server error) won't contain valid SSE data — parsing it would
+    # silently produce empty text, resulting in "No response generated".
+    if status != 200 do
+      # Try to extract error message from body for better diagnostics
+      error_body = case body do
+        b when is_binary(b) -> String.slice(b, 0, 500)
+        _ -> "(streaming body)"
+      end
+      Logger.error("[Streamer] HTTP #{status} from LLM API: #{error_body}")
+      {:error, {:http_error, status, error_body}}
+    else
+      if is_binary(body) do
         # Fallback: raw binary body (shouldn't happen with into: :self, but handle gracefully)
         Logger.info("[Streamer] Got binary body (#{byte_size(body)} bytes) — parsing all at once")
         {events, leftover} = parse_sse(body)
@@ -1212,6 +1264,7 @@ defmodule HiveWeave.LLM.Streamer do
         Logger.info("[Streamer] Stream complete: #{String.length(final_text)} chars text, #{length(final_tool_calls)} tool_calls, finish=#{final_finish}")
         {:ok, status, final_text, final_reasoning, final_tool_calls, final_finish}
       end
+    end
   end
 
   # Old collect_req_chunks removed — replaced by handle_req_response
@@ -1431,9 +1484,10 @@ defmodule HiveWeave.LLM.Streamer do
       nil ->
         case Application.get_env(:hiveweave, :llm_providers) do
           nil -> nil
-          providers ->
-            Map.get(providers, String.to_atom(name) || name)
+          providers when is_binary(name) ->
+            Map.get(providers, String.to_existing_atom(name))
             |> normalize_config_model()
+          _ -> nil
         end
 
       model ->
