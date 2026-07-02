@@ -499,7 +499,59 @@ defmodule HiveWeave.LLM.Streamer do
           [%{ctx | "role" => "system"}]
       end
 
-    [sys_identity] ++ history_filtered ++ context ++ [user]
+    # Language anchor: detect user language, inject a system message RIGHT BEFORE
+    # the user message. This is the last thing LLM sees before generating output,
+    # so it has the strongest influence on output language.
+    lang_anchor = build_language_anchor(message)
+
+    [sys_identity] ++ history_filtered ++ context ++ lang_anchor ++ [user]
+  end
+
+  # Detect dominant language of user message and inject a strong language anchor.
+  # This counteracts the English-heavy system prompt (~20KB English) that biases
+  # the LLM toward English output even when the user speaks Chinese.
+  defp build_language_anchor(message) when is_binary(message) do
+    content = message || ""
+    # Count CJK characters vs Latin characters
+    cjk_count = content |> String.graphemes() |> Enum.count(&cjk_grapheme?/1)
+    latin_count = content |> String.graphemes() |> Enum.count(&latin_grapheme?/1)
+
+    cond do
+      cjk_count > latin_count and cjk_count > 0 ->
+        # User speaks Chinese — inject Chinese language anchor
+        [%{"role" => "system", "content" =>
+          "【语言规则】用户使用中文。你的所有输出必须使用中文。禁止用英文重复任何已用中文表达的内容。技术术语（API名、代码、文件路径）保持原文。"
+        }]
+
+      latin_count > 0 and cjk_count == 0 ->
+        # User speaks English — inject English language anchor
+        [%{"role" => "system", "content" =>
+          "[Language Rule] User speaks English. All output in English. Never repeat content in another language."
+        }]
+
+      true ->
+        []
+    end
+  end
+
+  defp build_language_anchor(_), do: []
+
+  defp cjk_grapheme?(g) do
+    case String.to_charlist(g) do
+      [cp] when cp >= 0x4E00 and cp <= 0x9FFF -> true   # CJK Unified Ideographs
+      [cp] when cp >= 0x3400 and cp <= 0x4DBF -> true   # CJK Extension A
+      [cp] when cp >= 0x3000 and cp <= 0x303F -> true   # CJK Symbols and Punctuation
+      [cp] when cp >= 0xFF00 and cp <= 0xFFEF -> true   # Fullwidth Forms
+      _ -> false
+    end
+  end
+
+  defp latin_grapheme?(g) do
+    case String.to_charlist(g) do
+      [cp] when cp >= ?A and cp <= ?Z -> true
+      [cp] when cp >= ?a and cp <= ?z -> true
+      _ -> false
+    end
   end
 
   # Static identity prompt — designed for LLM API prefix caching.
