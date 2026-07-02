@@ -1618,7 +1618,8 @@ defmodule HiveWeave.ToolExecutor do
           # Trigger the subordinate agent asynchronously
           HiveWeave.Agents.Agent.trigger_subordinate(to_agent_id)
 
-          "Task dispatched to agent #{to_agent_id}. They will begin working on it automatically."
+          target_name = get_agent_name(to_agent_id)
+          "Task dispatched to #{target_name} (#{to_agent_id}). They will begin working on it automatically."
 
         {:error, reason} ->
           "Error dispatching task: #{inspect(reason)}"
@@ -1879,7 +1880,8 @@ defmodule HiveWeave.ToolExecutor do
       HiveWeave.Agents.Agent.trigger_coordinator(parent_id)
     end
 
-    "Completion reported#{if result.completed, do: " (handoff marked completed)", else: " (no active handoff found)"}. Your superior has been notified."
+    parent_name = if parent_id, do: get_agent_name(parent_id), else: "N/A"
+    "Completion reported#{if result.completed, do: " (handoff marked completed)", else: " (no active handoff found)"}. #{parent_name} has been notified."
   end
 
   defp dispatch("message_superior", input, _workspace_path, agent) do
@@ -1905,7 +1907,7 @@ defmodule HiveWeave.ToolExecutor do
       prefixed_content = time_prefix <> message
 
       opts = %{priority: priority}
-      {:ok, _} = HiveWeave.Services.Inbox.send_message(agent.id, parent_id, "superior", message, opts)
+      {:ok, _} = HiveWeave.Services.Inbox.send_message(agent.id, parent_id, "superior", prefixed_content, opts)
 
       # Record team chat messages (visible in "团队沟通" panel)
       # Outgoing record on sender's side, incoming record on superior's side
@@ -1918,7 +1920,8 @@ defmodule HiveWeave.ToolExecutor do
       # Trigger superior to process the message
       HiveWeave.Agents.Agent.trigger_coordinator(parent_id)
 
-      "Message sent to your superior (priority: #{priority})."
+      parent_name = get_agent_name(parent_id)
+      "Message sent to #{parent_name} (priority: #{priority})."
     end
   end
 
@@ -1979,7 +1982,8 @@ defmodule HiveWeave.ToolExecutor do
               # Trigger recipient if it's a coordinator
               trigger_agent(resolved_id)
 
-              "#{r}: sent"
+              target_name = get_agent_name(resolved_id)
+              "Sent to #{target_name} (#{r})"
             end
           else
             "#{r}: agent not found"
@@ -3068,6 +3072,15 @@ defmodule HiveWeave.ToolExecutor do
   defp get_parent_id(agent) do
     agent = if is_map(agent), do: agent, else: %{}
     Map.get(agent, :parent_id)
+  end
+
+  defp get_agent_name(agent_id) do
+    case HiveWeave.Services.Org.get_agent(agent_id) do
+      %{name: name} when is_binary(name) and name != "" -> name
+      _ -> agent_id
+    end
+  rescue
+    _ -> agent_id
   end
 
   defp trigger_agent(agent_id) do
