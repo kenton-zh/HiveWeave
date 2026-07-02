@@ -70,11 +70,11 @@ export async function getProjects(): Promise<Project[]> {
   return data.projects || [];
 }
 
-export async function createProject(name: string, workspacePath?: string, description?: string, orgParadigm?: string) {
+export async function createProject(name: string, workspacePath?: string, description?: string, orgParadigm?: string, language?: string) {
   return fetchJSON(`${BASE}/projects`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, workspacePath, description, orgParadigm }),
+    body: JSON.stringify({ name, workspacePath, description, orgParadigm, language: language || "zh" }),
   });
 }
 
@@ -506,7 +506,9 @@ export interface LlmModel {
 }
 
 export async function getModels(): Promise<LlmModel[]> {
-  return fetchJSON(`${BASE}/llm-models`);
+  const data = await fetchJSON(`${BASE}/llm-models`);
+  // Backend returns { models: [...] }, unwrap it
+  return Array.isArray(data) ? data : (data?.models ?? []);
 }
 
 export async function createModel(payload: Partial<LlmModel>) {

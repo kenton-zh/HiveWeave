@@ -88,6 +88,8 @@ function App() {
       (agentIds, paused) => {
         setProcessingAgents(agentIds);
         if (paused !== undefined) setPaused(paused);
+        // Signal socket reconnect so ChatPanel can reset stale isStreaming state
+        useAppStore.getState().bumpSocketReconnect();
       },
       (agentId, processing) => updateProcessingAgent(agentId, processing),
       (event) => {
@@ -151,7 +153,7 @@ function App() {
 
     const name = folderPath.split(/[\\/]/).filter(Boolean).pop() || "New Project";
     try {
-      const { project, mainAgentId } = await createProject(name, folderPath);
+      const { project, mainAgentId } = await createProject(name, folderPath, undefined, undefined, "zh");
       const updated = await getProjects();
       setProjects(updated);
       setSelectedProjectId(project.id);

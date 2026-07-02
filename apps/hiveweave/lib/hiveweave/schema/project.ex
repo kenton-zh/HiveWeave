@@ -11,12 +11,13 @@ defmodule HiveWeave.Schema.Project do
     field :org_paradigm, :string
     field :charter_json, :string
     field :goals_json, :string
+    field :language, :string, default: "en"
     field :created_at, :integer
   end
 
   def changeset(project, attrs) do
     project
-    |> cast(attrs, [:id, :name, :description, :workspace_path, :org_paradigm, :charter_json, :goals_json, :created_at])
+    |> cast(attrs, [:id, :name, :description, :workspace_path, :org_paradigm, :charter_json, :goals_json, :language, :created_at])
     |> validate_required([:name, :created_at])
   end
 end
