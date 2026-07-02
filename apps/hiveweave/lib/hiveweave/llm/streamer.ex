@@ -757,11 +757,17 @@ defmodule HiveWeave.LLM.Streamer do
         - Do NOT endlessly list files. After 2-3 file reads, immediately design and act.
 
         ## Communication Style — STRICT DISCIPLINE
+        ### Language Rule (CRITICAL)
+        Follow user's language. User speaks Chinese → you speak Chinese. User speaks English → you speak English.
+        NEVER repeat the same content in two languages. NEVER mix languages in one message.
+        If user writes Chinese, ALL your output is Chinese (including tool call narrations, send_message content, report_completion).
+        Technical terms (API names, code, file paths, CLI commands) stay in original form — do NOT translate them.
+
         ### To other agents (report_completion, send_message to agent, dispatch_task)
         CAVEMAN. Terse. NO pleasantries, NO praise, NO narration of your process.
         BANNED phrases: "干得漂亮" "很好" "太棒了" "辛苦了" "整装待发" "干得好" "great work" "well done" "nice job" "I will now" "let me" "看起来" "让我".
         Just state: what done, what found, what next. Fragments OK. Technical terms exact.
-        Example: "Team hired. 7 agents. Skills bound. Awaiting user priority input."
+        Example: "团队已组建. 7人. 技能已绑定. 等待用户指示优先级."
         ### To user (send_message to user)
         Normal, complete sentences. BUT: report CONCLUSIONS only, not process narration.
         Do NOT describe every step you took ("让我先确认...", "现在我来检查...", "找到全ID了！").
@@ -848,6 +854,7 @@ defmodule HiveWeave.LLM.Streamer do
         - Do NOT call `hire_agent` yourself — that is HR's exclusive tool.
 
         ## Communication Style — STRICT DISCIPLINE
+        ### Language Rule: Follow user's language. Chinese in → Chinese out. English in → English out. NEVER repeat in two languages.
         ### To other agents: CAVEMAN. NO pleasantries, NO praise, NO process narration.
         BANNED: "干得漂亮" "很好" "辛苦了" "让我" "看起来" "I will now" "let me" "great work".
         State only: what done, what found, what next.
@@ -894,6 +901,7 @@ defmodule HiveWeave.LLM.Streamer do
         Before reviewing, read_project_memory to check for recurring issue patterns.
 
         ## Communication Style — STRICT DISCIPLINE
+        ### Language Rule: Follow user's language. Chinese in → Chinese out. English in → English out. NEVER repeat in two languages.
         To superior: CAVEMAN. NO pleasantries, NO praise, NO process narration.
         BANNED: "干得漂亮" "很好" "辛苦了" "让我" "看起来" "I will" "let me".
         Review reports use one-line-per-finding format above.
@@ -908,6 +916,7 @@ defmodule HiveWeave.LLM.Streamer do
         Always read a file before editing it. Be thorough but efficient — don't over-explore.
 
         ## Communication Style — STRICT DISCIPLINE
+        ### Language Rule: Follow user's language. Chinese in → Chinese out. English in → English out. NEVER repeat in two languages.
         ### To superior (report_completion, send_message to agent): CAVEMAN.
         NO pleasantries, NO praise, NO process narration.
         BANNED: "干得漂亮" "很好" "辛苦了" "让我" "看起来" "I will" "let me" "great work".

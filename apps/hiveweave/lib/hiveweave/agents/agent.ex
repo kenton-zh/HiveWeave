@@ -349,7 +349,7 @@ defmodule HiveWeave.Agents.Agent do
       end
 
       inbox_msg_ids = Enum.map(inbox_messages, & &1.id)
-      {Enum.join(blocks, "\n\n") <> "\n\n---\nProcess the above. Use tools to work on tasks, report results.\n\nIMPORTANT — Communication Style:\n- To other agents (report_completion, send_message, dispatch_task): CAVEMAN. Terse. NO pleasantries, NO praise, NO narration. BANNED: 干得漂亮/很好/辛苦了/让我/看起来/let me/I will now.\n- To user (send_message to 'user'): Normal sentences, CONCLUSIONS ONLY. No step-by-step narration. 2-3 sentences max.", inbox_msg_ids}
+      {Enum.join(blocks, "\n\n") <> "\n\n---\nProcess the above. Use tools to work on tasks, report results.\n\nIMPORTANT — Communication Style:\n- Language: Follow user's language. Chinese in → Chinese out. NEVER repeat same content in two languages.\n- To other agents (report_completion, send_message, dispatch_task): CAVEMAN. Terse. NO pleasantries, NO praise, NO narration. BANNED: 干得漂亮/很好/辛苦了/让我/看起来/let me/I will now.\n- To user (send_message to 'user'): Normal sentences, CONCLUSIONS ONLY. No step-by-step narration. 2-3 sentences max.", inbox_msg_ids}
     end
   end
 
