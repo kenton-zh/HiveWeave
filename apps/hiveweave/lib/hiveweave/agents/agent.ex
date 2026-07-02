@@ -202,35 +202,49 @@ defmodule HiveWeave.Agents.Agent do
           HiveWeave.Services.Handoff.accept_pending_handoffs(project_id, agent_id)
 
           # Build context message from handoffs + inbox
-          context = build_trigger_context(agent, trigger_type)
+          trigger_result = build_trigger_context(agent, trigger_type)
 
-          if context == nil do
-            Logger.info("[Trigger] Agent #{agent_id} has no context to process, skipping")
-            :skip
-          else
-            Logger.info("[Trigger] Triggering agent #{agent.name} (#{trigger_type}) with context: #{String.slice(context, 0, 100)}")
+          case trigger_result do
+            nil ->
+              Logger.info("[Trigger] Agent #{agent_id} has no context to process, skipping")
+              :skip
 
-            # Save as background message
-            msg_id = Ecto.UUID.generate()
-            now_ms = System.system_time(:millisecond)
+            {context, inbox_msg_ids} ->
+              Logger.info("[Trigger] Triggering agent #{agent.name} (#{trigger_type}) with context: #{String.slice(context, 0, 100)}")
 
-            HiveWeave.Services.ChatMessage.save_message(%{
-              id: msg_id,
-              agent_id: agent_id,
-              role: "user",
-              content: context,
-              is_background: true,
-              is_read: false,
-              is_streaming: true,
-              is_context: true,
-              created_at: now_ms
-            })
+              # Save as background message
+              msg_id = Ecto.UUID.generate()
+              now_ms = System.system_time(:millisecond)
 
-            # Call the agent's chat handler directly
-            GenServer.call(name(project_id, agent_id), {:chat, context, [trigger: true]}, 30_000)
+              HiveWeave.Services.ChatMessage.save_message(%{
+                id: msg_id,
+                agent_id: agent_id,
+                role: "user",
+                content: context,
+                is_background: true,
+                is_read: false,
+                is_streaming: false,
+                is_context: true,
+                created_at: now_ms
+              })
 
-            # Mark inbox as read after processing
-            HiveWeave.Services.Inbox.mark_all_read(agent_id)
+              # Call the agent's chat handler directly
+              result = GenServer.call(name(project_id, agent_id), {:chat, context, [trigger: true]}, 30_000)
+
+              # Only mark the inbox messages that were included in the context as read.
+              # This avoids the race condition where new messages arrive between
+              # build_trigger_context and mark_all_read — those new messages must
+              # remain unread for the next trigger cycle.
+              case result do
+                {:error, :busy} ->
+                  Logger.warning("[Trigger] Agent #{agent_id} was busy, inbox messages left unread for retry")
+                {:error, :paused} ->
+                  Logger.warning("[Trigger] Agent #{agent_id} system paused, inbox messages left unread for retry")
+                {:error, reason} ->
+                  Logger.warning("[Trigger] Agent #{agent_id} trigger failed: #{inspect(reason)}, inbox messages left unread for retry")
+                _ ->
+                  HiveWeave.Services.Inbox.mark_read_by_ids(agent_id, inbox_msg_ids)
+              end
           end
       end
     catch
@@ -271,7 +285,7 @@ defmodule HiveWeave.Agents.Agent do
       end) |> Enum.join("\n")
 
       ids = Enum.map(all_handoffs, & &1.id)
-      {blocks ++ ["## Pending Tasks Assigned to You\n#{handoff_text}"], ids}
+      {blocks ++ ["## Pending Tasks (respond in CAVEMAN style)\n#{handoff_text}"], ids}
     else
       {blocks, []}
     end
@@ -294,7 +308,7 @@ defmodule HiveWeave.Agents.Agent do
         "  - From: #{m.from_agent_id} (type=#{m.message_type}, priority=#{m.priority})\n    #{prefix}#{m.message}"
       end) |> Enum.join("\n")
 
-      blocks ++ ["## Messages\n#{msg_text}"]
+      blocks ++ ["## Messages (from other agents — reply in CAVEMAN style, NO pleasantries)\n#{msg_text}"]
     else
       blocks
     end
@@ -310,7 +324,7 @@ defmodule HiveWeave.Agents.Agent do
       end)
 
       blocks = if child_logs != [] do
-        blocks ++ ["## Subordinate Work Logs\n#{Enum.join(child_logs, "\n")}"]
+        blocks ++ ["## Subordinate Work Logs (terse format)\n#{Enum.join(child_logs, "\n")}"]
       else
         blocks
       end
@@ -334,7 +348,8 @@ defmodule HiveWeave.Agents.Agent do
         HiveWeave.Services.Handoff.mark_delivered(project_id, delivered_handoff_ids)
       end
 
-      Enum.join(blocks, "\n\n") <> "\n\n---\nProcess the above. Use your tools to work on tasks and report results."
+      inbox_msg_ids = Enum.map(inbox_messages, & &1.id)
+      {Enum.join(blocks, "\n\n") <> "\n\n---\nProcess the above. Use tools to work on tasks, report results.\n\nIMPORTANT — Communication Style:\n- To other agents (report_completion, send_message, dispatch_task): CAVEMAN. Terse. NO pleasantries, NO praise, NO narration. BANNED: 干得漂亮/很好/辛苦了/让我/看起来/let me/I will now.\n- To user (send_message to 'user'): Normal sentences, CONCLUSIONS ONLY. No step-by-step narration. 2-3 sentences max.", inbox_msg_ids}
     end
   end
 
@@ -437,10 +452,18 @@ defmodule HiveWeave.Agents.Agent do
 
     # Self-retrigger: if new inbox messages arrived while we were processing, trigger again
     pending = HiveWeave.Services.Inbox.get_pending_messages(state.id)
-    if pending != [] do
+    # Also check for unanswered user messages in chat_messages (user sent a
+    # message while agent was busy — the message was saved to DB but not processed)
+    has_unanswered_user_msgs = HiveWeave.Services.ChatMessage.has_unanswered_user_messages?(state.id)
+    if pending != [] or has_unanswered_user_msgs do
       spawn(fn ->
         Process.sleep(500)
-        HiveWeave.Agents.Agent.trigger_subordinate(state.id)
+        # Use the correct trigger method based on agent role
+        if state.config[:role] == "ceo" or state.config[:role] == "hr" do
+          HiveWeave.Agents.Agent.trigger_coordinator(state.id)
+        else
+          HiveWeave.Agents.Agent.trigger_subordinate(state.id)
+        end
       end)
     end
 
@@ -539,8 +562,7 @@ defmodule HiveWeave.Agents.Agent do
   defp extract_tokens(result) do
     case result do
       {:ok, :completed, text} when is_binary(text) ->
-        char_count = byte_size(text) + byte_size(String.length(to_string(text)))
-        div(char_count, 4)
+        div(byte_size(text), 4)
       {:ok, :completed} ->
         0
       _ ->
