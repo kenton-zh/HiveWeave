@@ -226,7 +226,7 @@ defmodule HiveWeave.Agents.Agent do
               Logger.info("[Trigger] Agent #{agent_id} has no context to process, skipping")
               :skip
 
-            {context, inbox_msg_ids} ->
+            {context, inbox_msg_ids, from_agent_id} ->
               Logger.info("[Trigger] Triggering agent #{agent.name} (#{trigger_type}) with context: #{String.slice(context, 0, 100)}")
 
               # Save as background message
@@ -242,11 +242,13 @@ defmodule HiveWeave.Agents.Agent do
                 is_read: false,
                 is_streaming: false,
                 is_context: true,
+                team_from_agent_id: from_agent_id,
+                team_to_agent_id: agent_id,
                 created_at: now_ms
               })
 
               # Call the agent's chat handler directly
-              result = GenServer.call(name(project_id, agent_id), {:chat, context, [trigger: true]}, 30_000)
+              result = GenServer.call(name(project_id, agent_id), {:chat, context, [trigger: true, from_agent_id: from_agent_id]}, 30_000)
 
               # Only mark the inbox messages that were included in the context as read.
               # This avoids the race condition where new messages arrive between
@@ -369,7 +371,14 @@ defmodule HiveWeave.Agents.Agent do
       end
 
       inbox_msg_ids = Enum.map(inbox_messages, & &1.id)
-      {Enum.join(blocks, "\n\n") <> "\n\n---\nProcess the above. Use tools to work on tasks, report results.", inbox_msg_ids}
+
+      # Extract the first from_agent_id for team chat display
+      all_from_ids =
+        Enum.map(inbox_messages, & &1.from_agent_id) ++
+        Enum.map(pending_handoffs ++ accepted_handoffs, & &1.from_agent_id)
+      from_agent_id = Enum.find(all_from_ids, &(&1 != nil and &1 != ""))
+
+      {Enum.join(blocks, "\n\n") <> "\n\n---\nProcess the above. Use tools to work on tasks, report results.", inbox_msg_ids, from_agent_id}
     end
   end
 
