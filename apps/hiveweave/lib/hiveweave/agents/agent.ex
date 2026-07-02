@@ -281,7 +281,8 @@ defmodule HiveWeave.Agents.Agent do
     {blocks, delivered_handoff_ids} = if pending_handoffs != [] or accepted_handoffs != [] do
       all_handoffs = pending_handoffs ++ accepted_handoffs
       handoff_text = Enum.map(all_handoffs, fn h ->
-        "  - From: #{h.from_agent_id}\n    Task: #{h.summary}\n    Status: #{h.status}#{if h.expect_report, do: " (report required)", else: ""}"
+        from_name = agent_name(h.from_agent_id)
+        "  - From: #{from_name}\n    Task: #{h.summary}\n    Status: #{h.status}#{if h.expect_report, do: " (report required)", else: ""}"
       end) |> Enum.join("\n")
 
       ids = Enum.map(all_handoffs, & &1.id)
@@ -293,7 +294,8 @@ defmodule HiveWeave.Agents.Agent do
     # Rework block
     blocks = if rework_msgs != [] do
       rework_text = Enum.map(rework_msgs, fn m ->
-        "  - From: #{m.from_agent_id}\n    #{m.message}"
+        from_name = agent_name(m.from_agent_id)
+        "  - From: #{from_name}\n    #{m.message}"
       end) |> Enum.join("\n")
 
       blocks ++ ["## WORK REJECTED — Rework Required\n#{rework_text}\n\nYou must fix the issues and call report_completion again."]
@@ -305,7 +307,8 @@ defmodule HiveWeave.Agents.Agent do
     blocks = if other_msgs != [] do
       msg_text = Enum.map(other_msgs, fn m ->
         prefix = if m.expect_report, do: "**[REPLY REQUIRED]** ", else: ""
-        "  - From: #{m.from_agent_id} (type=#{m.message_type}, priority=#{m.priority})\n    #{prefix}#{m.message}"
+        from_name = agent_name(m.from_agent_id)
+        "  - From: #{from_name} (type=#{m.message_type}, priority=#{m.priority})\n    #{prefix}#{m.message}"
       end) |> Enum.join("\n")
 
       blocks ++ ["## Messages (from other agents — reply in CAVEMAN style, NO pleasantries)\n#{msg_text}"]
@@ -351,6 +354,16 @@ defmodule HiveWeave.Agents.Agent do
       inbox_msg_ids = Enum.map(inbox_messages, & &1.id)
       {Enum.join(blocks, "\n\n") <> "\n\n---\nProcess the above. Use tools to work on tasks, report results.\n\nIMPORTANT — Communication Style:\n- Language: Follow user's language. Chinese in → Chinese out. NEVER repeat same content in two languages.\n- To other agents (report_completion, send_message, dispatch_task): CAVEMAN. Terse. NO pleasantries, NO praise, NO narration. BANNED: 干得漂亮/很好/辛苦了/让我/看起来/let me/I will now.\n- To user (send_message to 'user'): Normal sentences, CONCLUSIONS ONLY. No step-by-step narration. 2-3 sentences max.", inbox_msg_ids}
     end
+  end
+
+  # Helper: resolve agent_id to flower name for human-readable context
+  defp agent_name(agent_id) do
+    case HiveWeave.Services.Org.get_agent(agent_id) do
+      %{name: name} when is_binary(name) and name != "" -> name
+      _ -> agent_id
+    end
+  rescue
+    _ -> agent_id
   end
 
   # Server callbacks
