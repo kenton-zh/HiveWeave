@@ -221,7 +221,7 @@ defmodule HiveWeave.Services.ChatMessage do
           WHERE m2.agent_id = m1.agent_id
             AND m2.role = 'assistant'
             AND m2.is_background = 0
-            AND m2.created_at > m1.created_at
+            AND m2.created_at >= m1.created_at
         )
     )
     """

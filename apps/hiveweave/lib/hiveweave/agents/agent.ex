@@ -25,6 +25,7 @@ defmodule HiveWeave.Agents.Agent do
     :role,
     :permission_type,
     :model_id,
+    :language,
     :llm_task,
     :safety_timer,
     status: :idle,
@@ -82,7 +83,22 @@ defmodule HiveWeave.Agents.Agent do
 
   @impl true
   def init(agent_config) do
-    # Register in agent registry (via ProjectSupervisor / AgentSupervisor)
+    # Fetch project language once at init — cached in state to avoid per-turn DB queries
+    language =
+      try do
+        {:ok, r} = Ecto.Adapters.SQL.query(
+          HiveWeave.Repo.Meta,
+          "SELECT language FROM projects WHERE id = ? LIMIT 1",
+          [agent_config.project_id]
+        )
+        case r.rows do
+          [[lang]] when lang in ["zh", "en"] -> lang
+          _ -> "en"
+        end
+      rescue
+        _ -> "en"
+      end
+
     state = %Agent{
       id: agent_config.id,
       project_id: agent_config.project_id,
@@ -90,6 +106,7 @@ defmodule HiveWeave.Agents.Agent do
       role: agent_config.role,
       permission_type: agent_config.permission_type || "executor",
       model_id: agent_config.model_id,
+      language: language,
       config: Map.get(agent_config, :config) || %{},
       last_heartbeat: System.system_time(:millisecond)
     }

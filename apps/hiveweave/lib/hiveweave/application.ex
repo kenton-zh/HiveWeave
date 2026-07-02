@@ -83,9 +83,14 @@ defmodule HiveWeave.Application do
     alias HiveWeave.Schema.Project
 
     # 0. Ensure projects table has language column (runtime migration)
+    # Default 'zh' — user is Chinese, frontend defaults to "zh".
+    # Existing projects with NULL or 'en' are upgraded to 'zh'.
     try do
       HiveWeave.Repo.Meta.query!(
-        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'en'"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'zh'"
+      )
+      HiveWeave.Repo.Meta.query!(
+        "UPDATE projects SET language = 'zh' WHERE language IS NULL OR language = 'en'"
       )
     rescue
       _ -> :ok

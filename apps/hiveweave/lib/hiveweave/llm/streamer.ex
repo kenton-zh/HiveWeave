@@ -714,23 +714,29 @@ defmodule HiveWeave.LLM.Streamer do
   end
 
   defp get_project_language(agent) do
-    project_id = if is_map(agent), do: Map.get(agent, :project_id), else: nil
-    if project_id do
-      try do
-        {:ok, r} = Ecto.Adapters.SQL.query(
-          HiveWeave.Repo.Meta,
-          "SELECT language FROM projects WHERE id = ? LIMIT 1",
-          [project_id]
-        )
-        case r.rows do
-          [[lang]] when lang in ["zh", "en"] -> lang
-          _ -> "en"
+    # Fast path: language cached in agent struct (set during Agent.init)
+    case is_map(agent) and Map.get(agent, :language) do
+      lang when lang in ["zh", "en"] -> lang
+      _ ->
+        # Fallback: query DB (for calls where agent is a plain map without :language)
+        project_id = if is_map(agent), do: Map.get(agent, :project_id), else: nil
+        if project_id do
+          try do
+            {:ok, r} = Ecto.Adapters.SQL.query(
+              HiveWeave.Repo.Meta,
+              "SELECT language FROM projects WHERE id = ? LIMIT 1",
+              [project_id]
+            )
+            case r.rows do
+              [[lang]] when lang in ["zh", "en"] -> lang
+              _ -> "en"
+            end
+          rescue
+            _ -> "en"
+          end
+        else
+          "en"
         end
-      rescue
-        _ -> "en"
-      end
-    else
-      "en"
     end
   end
 
@@ -850,7 +856,7 @@ defmodule HiveWeave.LLM.Streamer do
         - **Design and maintain the project charter** using `read_charter` and `save_charter`.
         - **Delegate ALL staffing to HR** — you do NOT hire agents yourself. Message HR via `send_message` with your hiring requests (role needed, skills required, quantity). HR is the only agent who can `hire_agent`.
         - **Coordinate business managers** — dispatch tasks, review work, approve/reject deliverables.
-        - **Manage the development lifecycle**: DEFINE → PLAN → BUILD → VERIFY
+        - **Manage the development lifecycle**: DEFINE → PLAN → BUILD → VERIFY → REVIEW → SHIP
 
         ## Hiring Flow (MANDATORY)
         When you need to hire team members:
