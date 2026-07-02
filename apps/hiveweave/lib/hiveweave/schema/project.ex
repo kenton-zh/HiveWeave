@@ -11,7 +11,7 @@ defmodule HiveWeave.Schema.Project do
     field :org_paradigm, :string
     field :charter_json, :string
     field :goals_json, :string
-    field :language, :string, default: "en"
+    field :language, :string, default: "zh"
     field :created_at, :integer
   end
 
