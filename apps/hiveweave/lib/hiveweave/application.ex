@@ -83,17 +83,19 @@ defmodule HiveWeave.Application do
     alias HiveWeave.Schema.Project
 
     # 0. Ensure projects table has language column (runtime migration)
+    # SQLite does NOT support "ADD COLUMN IF NOT EXISTS" — check via PRAGMA first.
     # Default 'zh' — user is Chinese, frontend defaults to "zh".
-    # Existing projects with NULL or 'en' are upgraded to 'zh'.
     try do
-      HiveWeave.Repo.Meta.query!(
-        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'zh'"
-      )
-      HiveWeave.Repo.Meta.query!(
-        "UPDATE projects SET language = 'zh' WHERE language IS NULL OR language = 'en'"
-      )
+      {:ok, pragma} = Ecto.Adapters.SQL.query(HiveWeave.Repo.Meta, "PRAGMA table_info(projects)", [])
+      has_language = Enum.any?(pragma.rows, fn row -> match?([_, "language" | _], row) end)
+
+      unless has_language do
+        HiveWeave.Repo.Meta.query!("ALTER TABLE projects ADD COLUMN language TEXT DEFAULT 'zh'")
+      end
+
+      HiveWeave.Repo.Meta.query!("UPDATE projects SET language = 'zh' WHERE language IS NULL OR language = 'en'")
     rescue
-      _ -> :ok
+      e -> Logger.warning("language column migration failed: #{inspect(e)}")
     end
 
     # 1. Clear zombie streaming flags on startup
