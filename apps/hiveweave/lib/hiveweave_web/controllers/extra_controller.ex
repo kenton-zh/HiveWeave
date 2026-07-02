@@ -140,7 +140,7 @@ defmodule HiveWeaveWeb.ExtraController do
         do: [{sets, "default_reasoning_effort = ?", params["default_reasoning_effort"] || params["defaultReasoningEffort"]}], else: sets
     sets =
       if Map.has_key?(params, "temperature") || Map.has_key?(params, "temperature"),
-        do: [{sets, "temperature = ?", params["temperature"]}], else: sets
+        do: [{sets, "temperature = ?", to_float(params["temperature"])}], else: sets
 
     set_clauses =
       sets
@@ -938,6 +938,17 @@ defmodule HiveWeaveWeb.ExtraController do
   end
 
   defp parse_int(_, default), do: default
+
+  defp to_float(nil), do: nil
+  defp to_float(f) when is_float(f), do: f
+  defp to_float(f) when is_integer(f), do: f * 1.0
+  defp to_float(s) when is_binary(s) do
+    case Float.parse(s) do
+      {f, _} -> f
+      :error -> nil
+    end
+  end
+  defp to_float(_), do: nil
 
   defp to_uuid(id) do
     case Ecto.UUID.cast(id) do
