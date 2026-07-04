@@ -24,8 +24,12 @@ defmodule HiveWeave.ToolExecutor do
     normalized_role = if is_binary(role), do: String.downcase(role), else: nil
     case permission_type do
       "coordinator" -> coordinator_tools(normalized_role)
-      _ when normalized_role in ["reviewer", "inspector", "审查员", "qa"] ->
-        executor_tools_for_reviewer()
+      _ when normalized_role in ["qa", "qa_engineer"] ->
+        executor_tools_for_qa()
+      _ when normalized_role in ["test_engineer"] ->
+        executor_tools_for_test_engineer()
+      _ when normalized_role in ["reviewer", "inspector", "审查员", "code_reviewer", "security_auditor", "web_perf_auditor"] ->
+        executor_tools_for_auditor()
       _ -> executor_tools()
     end
   end
@@ -33,7 +37,6 @@ defmodule HiveWeave.ToolExecutor do
   # ---- Shared core tools (all roles get these) ----
   defp core_tools do
     [
-      message_superior_tool(),
       send_message_tool(),
       read_roster_tool(),
       check_agent_status_tool(),
@@ -47,7 +50,10 @@ defmodule HiveWeave.ToolExecutor do
       websearch_tool(),
       read_goals_tool(),
       mcp_list_tools_tool(),
-      mcp_call_tool()
+      mcp_call_tool(),
+      # run_command is available to ALL permission types (including
+      # coordinators). It skips the self-destructive guard that bash enforces.
+      run_command_tool()
     ]
   end
 
@@ -97,12 +103,12 @@ defmodule HiveWeave.ToolExecutor do
   # ---- Coordinator management tools (dispatch/review/approve) ----
   defp management_tools do
     [
-      dispatch_task_tool(),
       read_work_logs_tool(),
       review_code_tool(),
       approve_work_tool(),
       reject_work_tool(),
-      list_subordinates_tool()
+      list_subordinates_tool(),
+      view_org_chart_tool()
     ]
   end
 
@@ -120,6 +126,16 @@ defmodule HiveWeave.ToolExecutor do
     ]
   end
 
+  # ---- Self-service skill tools (all roles — bind to SELF only) ----
+  # Allows any agent to autonomously add skills as project evolves.
+  # Permission enforced by resolve_and_update_agent: agent can only bind to self.
+  defp self_skill_tools do
+    [
+      bind_skill_tool(),
+      list_available_skills_tool()
+    ]
+  end
+
   # ---- Charter tools ----
   defp charter_readonly do
     [read_charter_tool()]
@@ -133,7 +149,6 @@ defmodule HiveWeave.ToolExecutor do
   defp executor_specific_tools do
     [
       write_work_log_tool(),
-      report_completion_tool(),
       read_project_memory_tool()
     ]
   end
@@ -175,15 +190,14 @@ defmodule HiveWeave.ToolExecutor do
 
   # ================================================================
   # HR: hire/transfer/dismiss + binding + admin + charter_readonly
-  #     + git_worktree + readonly_file + core + list_all_agents
-  #     NO management tools, NO file write, NO save_charter, NO update_goals
+  #     + readonly_file + core + list_all_agents
+  #     NO management tools, NO git_worktree, NO save_charter, NO update_goals
   # ================================================================
   defp coordinator_tools("hr") do
-    [hire_agent_tool(), transfer_agent_tool(), dismiss_agent_tool(), update_roster_tool()] ++
+    [hire_agent_tool(), list_agent_templates_tool(), transfer_agent_tool(), dismiss_agent_tool(), update_roster_tool()] ++
     binding_tools() ++
     admin_tools() ++
     charter_readonly() ++
-    git_worktree_tools() ++
     readonly_file_tools() ++
     core_tools() ++
     [list_all_agents_tool(), write_work_log_tool()]
@@ -201,7 +215,8 @@ defmodule HiveWeave.ToolExecutor do
     admin_tools() ++
     readonly_file_tools() ++
     core_tools() ++
-    [update_goals_tool(), trigger_integration_tool(), read_charter_tool(), write_work_log_tool()]
+    [update_goals_tool(), trigger_integration_tool(), read_charter_tool(), write_work_log_tool()] ++
+    [read_skill_tool() | self_skill_tools()]
   end
 
   # ================================================================
@@ -213,16 +228,39 @@ defmodule HiveWeave.ToolExecutor do
     full_file_tools() ++
     executor_specific_tools() ++
     core_tools() ++
-    [read_skill_tool()]
+    [read_skill_tool()] ++
+    self_skill_tools()
   end
 
-  # Reviewer/Inspector: file read + bash (run tests) + review tools + core + read_skill
-  defp executor_tools_for_reviewer do
+  # QA Engineer: full_file (writes test code) + qa_review_tools + core + read_skill
+  defp executor_tools_for_qa do
     full_file_tools() ++
     qa_review_tools() ++
     executor_specific_tools() ++
     core_tools() ++
-    [read_skill_tool()]
+    [read_skill_tool()] ++
+    self_skill_tools()
+  end
+
+  # Test Engineer: bash (run tests) + readonly_file (no write) + core + read_skill
+  # Does NOT get qa_review_tools — runs tests via bash, not review tools
+  defp executor_tools_for_test_engineer do
+    [bash_tool() | readonly_file_tools()] ++
+    executor_specific_tools() ++
+    core_tools() ++
+    [read_skill_tool()] ++
+    self_skill_tools()
+  end
+
+  # Auditor (code_reviewer, security_auditor, web_perf_auditor, reviewer, inspector):
+  # bash (read-only commands) + readonly_file + qa_review_tools (no write)
+  defp executor_tools_for_auditor do
+    [bash_tool() | readonly_file_tools()] ++
+    qa_review_tools() ++
+    executor_specific_tools() ++
+    core_tools() ++
+    [read_skill_tool()] ++
+    self_skill_tools()
   end
 
   defp bash_tool do
@@ -236,6 +274,25 @@ defmodule HiveWeave.ToolExecutor do
           "properties" => %{
             "command" => %{"type" => "string", "description" => "Shell command"},
             "workdir" => %{"type" => "string", "description" => "Working dir"}
+          },
+          "required" => ["command"]
+        }
+      }
+    }
+  end
+
+  defp run_command_tool do
+    %{
+      "type" => "function",
+      "function" => %{
+        "name" => "run_command",
+        "description" => "Execute a shell command and return stdout+stderr. Unlike bash, this does NOT block self-destructive commands (use with care) and accepts a configurable timeout. Available to all roles.",
+        "parameters" => %{
+          "type" => "object",
+          "properties" => %{
+            "command" => %{"type" => "string", "description" => "Shell command to execute"},
+            "cwd" => %{"type" => "string", "description" => "Working directory (optional, defaults to workspace root)"},
+            "timeout" => %{"type" => "integer", "description" => "Timeout in milliseconds (optional, default 120000)"}
           },
           "required" => ["command"]
         }
@@ -379,7 +436,7 @@ defmodule HiveWeave.ToolExecutor do
       "type" => "function",
       "function" => %{
         "name" => "question",
-        "description" => "Ask user a question. Blocks until answered.",
+        "description" => "Ask the user a question and block until answered. Use for decisions, clarifications, or confirmations that the user should be involved in (per project charter).",
         "parameters" => %{
           "type" => "object",
           "properties" => %{
@@ -454,7 +511,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "toAgentId" => %{"type" => "string", "description" => "Subordinate name/short_id/role/UUID"},
+            "toAgentId" => %{"type" => "string", "description" => "Subordinate name (花名), short_id, or UUID. Do NOT use role titles."},
             "description" => %{"type" => "string", "description" => "Task description for subordinate. CAVEMAN style: terse, drop articles/filler, fragments OK. Keep technical terms, file paths, exact. NOT for user."},
             "expectReport" => %{"type" => "boolean", "description" => "If true, subordinate MUST report back results (default: true)"}
           },
@@ -469,19 +526,37 @@ defmodule HiveWeave.ToolExecutor do
       "type" => "function",
       "function" => %{
         "name" => "hire_agent",
-        "description" => "Create a new agent and start it. HR only.",
+        "description" => "Create a new agent and start it. HR only. Pass templateId to pre-fill role/goal/backstory/skills from an existing template.",
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "name" => %{"type" => "string", "description" => "Agent name (Chinese)"},
-            "role" => %{"type" => "string", "description" => "Role title"},
+            "name" => %{"type" => "string", "description" => "Agent name (Chinese 花名, 2-4 chars)"},
+            "role" => %{"type" => "string", "description" => "Role title (e.g. developer, reviewer, test_engineer)"},
             "permissionType" => %{"type" => "string", "description" => "'executor' or 'coordinator'"},
             "goal" => %{"type" => "string", "description" => "Agent goal"},
             "backstory" => %{"type" => "string", "description" => "Background (optional)"},
             "skills" => %{"type" => "string", "description" => "Skill slugs (comma-separated)"},
-            "mcpServers" => %{"type" => "string", "description" => "MCP servers (comma-separated)"}
+            "mcpServers" => %{"type" => "string", "description" => "MCP servers (comma-separated)"},
+            "templateId" => %{"type" => "string", "description" => "Template ID to pre-fill fields. Use list_agent_templates to browse. Explicit params override template values."}
           },
           "required" => ["name", "role", "goal"]
+        }
+      }
+    }
+  end
+
+  defp list_agent_templates_tool do
+    %{
+      "type" => "function",
+      "function" => %{
+        "name" => "list_agent_templates",
+        "description" => "Browse agent templates catalog. HR only. Returns templates with role/goal/skills pre-configured. Use templateId in hire_agent to apply.",
+        "parameters" => %{
+          "type" => "object",
+          "properties" => %{
+            "search" => %{"type" => "string", "description" => "Search keyword (name or description)"},
+            "division" => %{"type" => "string", "description" => "Filter by division (e.g. engineering, design, ops)"}
+          }
         }
       }
     }
@@ -542,11 +617,11 @@ defmodule HiveWeave.ToolExecutor do
       "type" => "function",
       "function" => %{
         "name" => "bind_skill",
-        "description" => "Bind a skill to an agent (yourself or a subordinate). The skill's instructions will be injected into the agent's prompt.",
+        "description" => "Bind a skill to an agent. If you are CEO or HR, you can bind to any agent in the project. Otherwise, only to yourself or your direct subordinates.",
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "agentId" => %{"type" => "string", "description" => "Target agent ID (your own ID or a subordinate's ID)"},
+            "agentId" => %{"type" => "string", "description" => "Target agent ID"},
             "skillName" => %{"type" => "string", "description" => "Skill slug to bind"}
           },
           "required" => ["agentId", "skillName"]
@@ -560,7 +635,7 @@ defmodule HiveWeave.ToolExecutor do
       "type" => "function",
       "function" => %{
         "name" => "unbind_skill",
-        "description" => "Remove a skill binding from an agent.",
+        "description" => "Remove a skill binding from an agent. If you are CEO or HR, you can unbind from any agent in the project.",
         "parameters" => %{
           "type" => "object",
           "properties" => %{
@@ -660,13 +735,13 @@ defmodule HiveWeave.ToolExecutor do
       "type" => "function",
       "function" => %{
         "name" => "send_message",
-        "description" => "Send a message to an agent (by name/short_id/role) or 'user'.",
+        "description" => "Send a message to one or more agents (or 'user'). This is the ONLY tool for sending messages — use it for task assignment, status reports, questions, peer chat, anything. The recipient's AI will read your message and decide how to respond. To reply to the user (human operator), just speak normally in your response — the system auto-delivers your text to the user's chat window with streaming.",
         "parameters" => %{
           "type" => "object",
           "properties" => %{
             "content" => %{"type" => "string", "description" => "Message content. If recipient is 'user': normal, complete, friendly. If recipient is an agent: CAVEMAN style — terse, drop articles/filler, fragments OK, keep technical terms exact."},
-            "recipients" => %{"type" => "array", "items" => %{"type" => "string"}, "description" => "Agent name/short_id/role or 'user'"},
-            "expectReport" => %{"type" => "boolean", "description" => "If true, expect a reply (default: false)"},
+            "recipients" => %{"type" => "array", "items" => %{"type" => "string"}, "description" => "REQUIRED. Agent 花名/short_id/UUID, or 'user'. Do NOT use role titles — a role may have multiple people. Example: [\"折纸\"] or [\"墨白\",\"星芒\"] or [\"user\"]."},
+            "expectReport" => %{"type" => "boolean", "description" => "If true, appends '[此消息需要回复]' to the message so the recipient knows a reply is expected. Default: false."},
             "priority" => %{"type" => "string", "enum" => ["low", "normal", "urgent"], "description" => "Priority (default: normal)"}
           },
           "required" => ["content", "recipients"]
@@ -684,7 +759,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "subordinateId" => %{"type" => "string", "description" => "Subordinate agent ID (optional)"},
+            "subordinateId" => %{"type" => "string", "description" => "Subordinate name (花名), short_id, or UUID (optional). Do NOT use role titles."},
             "limit" => %{"type" => "integer", "description" => "Max logs to return (default: 10)"}
           }
         }
@@ -734,6 +809,17 @@ defmodule HiveWeave.ToolExecutor do
       "function" => %{
         "name" => "list_subordinates",
         "description" => "List your direct subordinates with their current status, pending tasks, and recent work logs.",
+        "parameters" => %{"type" => "object", "properties" => %{}}
+      }
+    }
+  end
+
+  defp view_org_chart_tool do
+    %{
+      "type" => "function",
+      "function" => %{
+        "name" => "view_org_chart",
+        "description" => "View the complete organization chart — shows all agents, their names (花名), roles, and reporting hierarchy. Use this to understand who reports to whom, find your superior, and identify the right person to contact.",
         "parameters" => %{"type" => "object", "properties" => %{}}
       }
     }
@@ -832,7 +918,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "shortId" => %{"type" => "string", "description" => "Short ID of the subordinate agent"},
+            "shortId" => %{"type" => "string", "description" => "Subordinate agent's short_id (ASCII alphanumeric format like A001-XXXXXX, NOT 花名/UUID/role). Use list_subordinates or view_org_chart to look up short_id."},
             "taskName" => %{"type" => "string", "description" => "Task name for the branch (sluggified)"},
             "baseBranch" => %{"type" => "string", "description" => "Base branch to fork from (default: main)"}
           },
@@ -851,7 +937,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "shortId" => %{"type" => "string", "description" => "Short ID of the subordinate agent"},
+            "shortId" => %{"type" => "string", "description" => "Subordinate agent's short_id (ASCII alphanumeric format like A001-XXXXXX, NOT 花名/UUID/role). Use list_subordinates or view_org_chart to look up short_id."},
             "message" => %{"type" => "string", "description" => "Checkpoint message describing the saved state"}
           },
           "required" => ["shortId", "message"]
@@ -869,7 +955,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "shortId" => %{"type" => "string", "description" => "Short ID of the subordinate agent"},
+            "shortId" => %{"type" => "string", "description" => "Subordinate agent's short_id (ASCII alphanumeric format like A001-XXXXXX, NOT 花名/UUID/role). Use list_subordinates or view_org_chart to look up short_id."},
             "taskName" => %{"type" => "string", "description" => "Task name matching the worktree branch"},
             "targetBranch" => %{"type" => "string", "description" => "Target branch to merge into (default: main)"}
           },
@@ -888,7 +974,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "shortId" => %{"type" => "string", "description" => "Short ID of the subordinate agent"},
+            "shortId" => %{"type" => "string", "description" => "Subordinate agent's short_id (ASCII alphanumeric format like A001-XXXXXX, NOT 花名/UUID/role). Use list_subordinates or view_org_chart to look up short_id."},
             "commitHash" => %{"type" => "string", "description" => "Specific commit hash to rollback to (default: last checkpoint)"}
           },
           "required" => ["shortId"]
@@ -906,7 +992,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "shortId" => %{"type" => "string", "description" => "Short ID of the subordinate agent"},
+            "shortId" => %{"type" => "string", "description" => "Subordinate agent's short_id (ASCII alphanumeric format like A001-XXXXXX, NOT 花名/UUID/role). Use list_subordinates or view_org_chart to look up short_id."},
             "taskName" => %{"type" => "string", "description" => "Task name matching the branch to delete (optional)"}
           },
           "required" => ["shortId"]
@@ -938,7 +1024,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "shortId" => %{"type" => "string", "description" => "Short ID of the subordinate agent"}
+            "shortId" => %{"type" => "string", "description" => "Subordinate agent's short_id (ASCII alphanumeric format like A001-XXXXXX, NOT 花名/UUID/role). Use list_subordinates or view_org_chart to look up short_id."}
           },
           "required" => ["shortId"]
         }
@@ -1128,7 +1214,8 @@ defmodule HiveWeave.ToolExecutor do
           "properties" => %{
             "objective" => %{"type" => "string", "description" => "Primary objective"},
             "focus" => %{"type" => "string", "description" => "Focus area"},
-            "keyResults" => %{"type" => "array", "items" => %{"type" => "string"}, "description" => "Key results (list of strings)"}
+            "keyResults" => %{"type" => "array", "items" => %{"type" => "string"}, "description" => "Key results (list of strings)"},
+            "userInvolvement" => %{"type" => "string", "description" => "What types of decisions the user participates in (e.g. '宏观决策+技术选型', '纯宏观决策', '技术+设计'). Default: '宏观决策+技术选型'."}
           }
         }
       }
@@ -1266,7 +1353,7 @@ defmodule HiveWeave.ToolExecutor do
         "parameters" => %{
           "type" => "object",
           "properties" => %{
-            "agentId" => %{"type" => "string", "description" => "Agent ID to check"}
+            "agentId" => %{"type" => "string", "description" => "Agent name (花名), short_id, or UUID. Do NOT use role titles."}
           },
           "required" => ["agentId"]
         }
@@ -1443,17 +1530,18 @@ defmodule HiveWeave.ToolExecutor do
     Logger.info("[ToolExecutor] Agent #{agent.id} calling #{name} with #{inspect(input) |> String.slice(0, 200)}")
 
     # Permission gating: evaluate against permission presets + glob rules
-    case HiveWeave.Services.Permission.evaluate(agent, name) do
+    # Pass `input` so parameter-level patterns (e.g. `Bash(npm *)`) can match.
+    case HiveWeave.Services.Permission.evaluate(agent, name, input) do
       :deny ->
         {:ok, "Permission denied: #{name} is blocked for this agent."}
 
       :ask ->
         # Check if there's a saved allow rule first
         saved_rules = HiveWeave.Services.Approval.load_saved_rules(agent.id)
-        if HiveWeave.Services.Permission.matches_pattern?(name, saved_rules) do
+        if HiveWeave.Services.Permission.matches_pattern?(name, saved_rules, input) do
           try do
             result = dispatch(name, input, workspace_path, agent)
-            truncated = HiveWeave.TokenUtils.truncate_tool_output_full(result)
+            truncated = maybe_save_large_output(result, agent, name, workspace_path)
             {:ok, truncated}
           rescue
             e ->
@@ -1471,7 +1559,7 @@ defmodule HiveWeave.ToolExecutor do
             :ok ->
               try do
                 result = dispatch(name, input, workspace_path, agent)
-                truncated = HiveWeave.TokenUtils.truncate_tool_output_full(result)
+                truncated = maybe_save_large_output(result, agent, name, workspace_path)
                 {:ok, truncated}
               rescue
                 e ->
@@ -1491,7 +1579,7 @@ defmodule HiveWeave.ToolExecutor do
       :allow ->
         try do
           result = dispatch(name, input, workspace_path, agent)
-          truncated = HiveWeave.TokenUtils.truncate_tool_output_full(result)
+          truncated = maybe_save_large_output(result, agent, name, workspace_path)
           {:ok, truncated}
         rescue
           e ->
@@ -1500,6 +1588,102 @@ defmodule HiveWeave.ToolExecutor do
             {:ok, msg}
         end
     end
+  end
+
+  # ── Tool output file storage ────────────────────────────────
+  # Mirrors TS tool-output-store.ts: outputs exceeding 2000 lines or
+  # 50KB are saved to .hiveweave/tool_outputs/ and a bounded preview
+  # (head + tail) is returned to the LLM with a file-path hint.
+  # Temp files are retained for 7 days then auto-cleaned.
+
+  @tool_output_max_lines 2000
+  @tool_output_max_bytes 50_000
+  @tool_output_retention_days 7
+
+  @doc """
+  Check tool output size; if it exceeds thresholds, save the full output
+  to a temp file and return a truncated preview + file path hint.
+  Otherwise return the output unchanged (after light normalization).
+  """
+  def maybe_save_large_output(result, agent, tool_name, workspace_path) do
+    output = if is_binary(result), do: result, else: to_string(result)
+    lines = String.split(output, "\n")
+    bytes = byte_size(output)
+
+    if length(lines) > @tool_output_max_lines or bytes > @tool_output_max_bytes do
+      file_path = save_tool_output_file(output, agent, tool_name, workspace_path)
+
+      head_lines = Enum.take(lines, 20)
+      tail_lines = if length(lines) > 25, do: Enum.take(lines, -5), else: []
+
+      marker =
+        "\n\n... [output truncated: #{length(lines)} lines, #{bytes} bytes. " <>
+          "Full output saved to #{file_path}] ...\n\n"
+
+      (head_lines ++ [marker] ++ tail_lines)
+      |> Enum.join("\n")
+    else
+      output
+    end
+  end
+
+  @tool_output_file_max_bytes 10 * 1024 * 1024  # 10MB cap per file
+
+  defp save_tool_output_file(output, agent, tool_name, workspace_path) do
+    base_dir = workspace_path || File.cwd!()
+    out_dir = Path.join([base_dir, ".hiveweave", "tool_outputs"])
+    File.mkdir_p!(out_dir)
+
+    timestamp = System.system_time(:millisecond)
+    safe_name = tool_name |> String.replace(~r/[^a-zA-Z0-9_-]/, "_")
+    filename = "#{agent.id}_#{timestamp}_#{safe_name}.txt"
+    full_path = Path.join(out_dir, filename)
+
+    # Cap file size to prevent disk exhaustion from runaway tool output
+    capped = if byte_size(output) > @tool_output_file_max_bytes do
+      binary_part(output, 0, @tool_output_file_max_bytes) <>
+        "\n\n... [file capped at #{@tool_output_file_max_bytes} bytes]"
+    else
+      output
+    end
+    File.write!(full_path, capped)
+    full_path
+  end
+
+  @doc """
+  Clean up tool output files older than the retention period (7 days).
+  Intended to be called periodically (e.g. on server startup).
+  """
+  def cleanup_tool_outputs(workspace_path \\ nil) do
+    base_dir = workspace_path || File.cwd!()
+    out_dir = Path.join([base_dir, ".hiveweave", "tool_outputs"])
+
+    if File.dir?(out_dir) do
+      case File.ls(out_dir) do
+        {:ok, files} ->
+          Enum.each(files, fn f ->
+            full = Path.join(out_dir, f)
+
+            case File.stat(full) do
+              {:ok, %{mtime: mtime}} ->
+                mtime_dt = NaiveDateTime.from_erl!(mtime)
+                age_seconds = NaiveDateTime.diff(NaiveDateTime.utc_now(), mtime_dt, :second)
+
+                if age_seconds > @tool_output_retention_days * 86400 do
+                  File.rm(full)
+                end
+
+              _ ->
+                :ok
+            end
+          end)
+
+        _ ->
+          :ok
+      end
+    end
+
+    :ok
   end
 
   # ── Tool dispatch ───────────────────────────────────────────
@@ -1520,6 +1704,21 @@ defmodule HiveWeave.ToolExecutor do
         :ok ->
           execute_bash(command, workdir, eff_ws)
       end
+    end
+  end
+
+  defp dispatch("run_command", input, workspace_path, agent) do
+    eff_ws = get_effective_workspace(agent, workspace_path)
+    command = input["command"] || ""
+    cwd = input["cwd"] || ""
+    timeout = input["timeout"] || 120_000
+
+    if command == "" do
+      "Error: command is required"
+    else
+      # Note: deliberately NO self-destructive check here (that is
+      # bash-specific). run_command is a lower-level escape hatch.
+      execute_run_command(command, cwd, timeout, eff_ws)
     end
   end
 
@@ -1627,16 +1826,54 @@ defmodule HiveWeave.ToolExecutor do
     end
   end
 
+  defp dispatch("list_agent_templates", input, _workspace_path, agent) do
+    # 运行时角色检查 — 只有 HR 能浏览模板
+    unless agent.role && String.downcase(agent.role) == "hr" do
+      raise "Permission denied: only HR can browse agent templates"
+    end
+
+    opts = %{}
+    opts = if input["search"], do: Map.put(opts, :search, input["search"]), else: opts
+    opts = if input["division"], do: Map.put(opts, :division, input["division"]), else: opts
+
+    templates = HiveWeave.Services.Template.list_templates(opts)
+
+    if templates == [] do
+      "No templates found. Try a different search keyword or division."
+    else
+      lines = Enum.map(templates, fn t ->
+        "- #{t.name} (role: #{t.role}) — ID: #{t.id} — #{t.description || "no description"}"
+      end)
+      "Available agent templates (#{length(templates)} found):\n#{Enum.join(lines, "\n")}\n\nPass templateId in hire_agent to pre-fill role/goal/skills. Explicit params override template values."
+    end
+  end
+
   defp dispatch("hire_agent", input, _workspace_path, agent) do
     # 运行时角色检查 — 只有 HR 能招聘
     unless agent.role && String.downcase(agent.role) == "hr" do
       raise "Permission denied: only HR can hire agents"
     end
 
+    # 如果传了 templateId，从模板预填字段（显式参数优先）
+    template = case input["templateId"] || input["template_id"] do
+      nil -> nil
+      tid ->
+        case HiveWeave.Services.Template.get_template(tid) do
+          {:ok, t} -> t
+          {:error, _} ->
+            Logger.warning("[ToolExecutor] hire_agent: template #{tid} not found, ignoring")
+            nil
+        end
+    end
+
+    # 合并模板值与显式参数（显式参数优先）
+    # Note: template only pre-fills role/goal/backstory. Skills are NOT extracted
+    # from prompt_body (which is a full Markdown prompt, not a CSV list).
+    # HR should pass skills explicitly or rely on the role→skills mapping in the HR prompt.
     name = input["name"] || ""
-    role = input["role"] || ""
-    goal = input["goal"] || ""
-    backstory = input["backstory"] || ""
+    role = input["role"] || (template && template[:role]) || ""
+    goal = input["goal"] || (template && template[:description]) || ""
+    backstory = input["backstory"] || (template && template[:vibe]) || ""
     permission_type = input["permissionType"] || "executor"
 
     # Parse skills and MCP servers from comma-separated strings
@@ -1932,66 +2169,61 @@ defmodule HiveWeave.ToolExecutor do
     priority = input["priority"] || "normal"
     project_id = agent.project_id
 
-    # Add game time prefix to inter-agent messages
-    time_prefix = try do
-      game_seconds = HiveWeave.GameTime.Server.get_current_time(project_id)
-      day = div(game_seconds, 86400)
-      hours = div(rem(game_seconds, 86400), 3600)
-      minutes = div(rem(game_seconds, 3600), 60)
-      "[D#{day} #{String.pad_leading(Integer.to_string(hours), 2, "0")}:#{String.pad_leading(Integer.to_string(minutes), 2, "0")}] "
-    rescue
-      _ -> ""
-    end
-    prefixed_content = time_prefix <> content
-
-    results = Enum.map(recipients, fn r ->
-      cond do
-        r == "user" ->
-          # Save to chat_messages as assistant message (visible in user's chat window)
-          msg_id = Ecto.UUID.generate()
-          now_ms = System.system_time(:millisecond)
-          sql = """
-          INSERT INTO chat_messages (id, agent_id, role, content, tool_calls, is_background, is_read, is_streaming, team_from_agent_id, created_at)
-          VALUES (?, ?, 'assistant', ?, '[]', 0, 0, 0, ?, ?)
-          """
-          HiveWeave.Repo.ProjectFactory.query_for_agent(agent.id, sql, [msg_id, agent.id, "📩 #{content}", agent.id, now_ms])
-
-          # Log user_ping event for the ping badge in org tree
-          HiveWeave.EventAudit.log(agent.id, "user_ping", %{from: agent.id, message: content})
-
-          # Also broadcast via PubSub for real-time UI updates
-          Phoenix.PubSub.broadcast(HiveWeave.PubSub, "project:#{project_id}", {:user_ping, %{from: agent.id, message: content, agent_id: agent.id}})
-
-          "user: notified"
-
-        true ->
-          resolved_id = resolve_agent_id(r, agent)
-          if resolved_id do
-            if resolved_id == agent.id do
-              "⚠️ #{r}: Cannot send message to yourself — skipping self-send"
-            else
-              opts = %{priority: priority, expect_report: expect_report, message_type: "peer"}
-              {:ok, _} = HiveWeave.Services.Inbox.send_message(agent.id, resolved_id, "peer", prefixed_content, opts)
-
-              # Record team chat messages (visible in "团队沟通" panel)
-              # Outgoing record on sender's side
-              HiveWeave.Services.TeamChat.record_message(agent.id, agent.id, resolved_id, prefixed_content)
-              # Incoming record on recipient's side
-              HiveWeave.Services.TeamChat.record_message(resolved_id, agent.id, resolved_id, prefixed_content)
-
-              # Trigger recipient if it's a coordinator
-              trigger_agent(resolved_id)
-
-              target_name = get_agent_name(resolved_id)
-              "Sent to #{target_name} (#{r})"
-            end
-          else
-            "#{r}: agent not found"
-          end
+    # recipients is required
+    if recipients == [] or recipients == nil do
+      "Error: recipients is required. Specify agent 花名/short_id/UUID or 'user'."
+    else
+      # Add game time prefix
+      time_prefix = try do
+        game_seconds = HiveWeave.GameTime.Server.get_current_time(project_id)
+        day = div(game_seconds, 86400)
+        hours = div(rem(game_seconds, 86400), 3600)
+        minutes = div(rem(game_seconds, 3600), 60)
+        "[D#{day} #{String.pad_leading(Integer.to_string(hours), 2, "0")}:#{String.pad_leading(Integer.to_string(minutes), 2, "0")}] "
+      rescue
+        _ -> ""
       end
-    end)
 
-    "Message sent to: #{Enum.join(results, ", ")}"
+      # If expectReport, append a hint so the recipient knows a reply is expected
+      reply_hint = if expect_report, do: "\n\n[此消息需要回复]", else: ""
+      prefixed_content = time_prefix <> content <> reply_hint
+
+      results = Enum.map(recipients, fn r ->
+        cond do
+          r == "user" ->
+            msg_id = Ecto.UUID.generate()
+            now_ms = System.system_time(:millisecond)
+            sql = """
+            INSERT INTO chat_messages (id, agent_id, role, content, tool_calls, is_background, is_read, is_streaming, team_from_agent_id, created_at)
+            VALUES (?, ?, 'assistant', ?, '[]', 0, 0, 0, ?, ?)
+            """
+            HiveWeave.Repo.ProjectFactory.query_for_agent(agent.id, sql, [msg_id, agent.id, "📩 #{content}", agent.id, now_ms])
+            HiveWeave.EventAudit.log(agent.id, "user_ping", %{from: agent.id, message: content})
+            Phoenix.PubSub.broadcast(HiveWeave.PubSub, "project:#{project_id}", {:user_ping, %{from: agent.id, message: content, agent_id: agent.id}})
+            "user: notified"
+
+          true ->
+            resolved_id = resolve_agent_id(r, agent)
+            if resolved_id do
+              if resolved_id == agent.id do
+                "⚠️ #{r}: cannot send to yourself"
+              else
+                opts = %{priority: priority, expect_report: expect_report}
+                {:ok, _} = HiveWeave.Services.Inbox.send_message(agent.id, resolved_id, "peer", prefixed_content, opts)
+                HiveWeave.Services.TeamChat.record_message(agent.id, agent.id, resolved_id, prefixed_content)
+                HiveWeave.Services.TeamChat.record_message(resolved_id, agent.id, resolved_id, prefixed_content)
+                trigger_agent(resolved_id)
+                target_name = get_agent_name(resolved_id)
+                "Sent to #{target_name} (#{r})"
+              end
+            else
+              "#{r}: agent not found"
+            end
+        end
+      end)
+
+      "Message sent to: #{Enum.join(results, ", ")}"
+    end
   end
 
   defp dispatch("read_work_logs", input, _workspace_path, agent) do
@@ -2076,11 +2308,48 @@ defmodule HiveWeave.ToolExecutor do
 
         recent_logs = if logs == [], do: "  (no recent logs)", else: Enum.map(logs, fn l -> "  [#{l.type}] #{l.summary}" end) |> Enum.join("\n")
 
-        "#{child.name} (#{child.role}) — ID: #{child.id} — #{status}\n#{recent_logs}"
+        "#{child.name} (#{child.role}) — ID: #{child.short_id || child.id} — #{status}\n#{recent_logs}"
       end)
 
       Enum.join(entries, "\n---\n")
     end
+  end
+
+  defp dispatch("view_org_chart", _input, _workspace_path, agent) do
+    project_id = agent.project_id
+    tree = HiveWeave.Services.Org.build_tree(project_id)
+
+    # Format as indented tree showing the full hierarchy
+    # Also mark the current agent with ← YOU
+    lines = format_org_tree(tree, 0, agent.id)
+    if lines == "" do
+      "Organization chart is empty."
+    else
+      "=== Organization Chart ===\n#{lines}\n\n(← YOU = your position)"
+    end
+  end
+
+  defp format_org_tree(nodes, depth, current_agent_id) when is_list(nodes) do
+    nodes
+    |> Enum.map(fn node -> format_org_node(node, depth, current_agent_id) end)
+    |> Enum.filter(&(&1 != ""))
+    |> Enum.join("\n")
+  end
+
+  defp format_org_node(node, depth, current_agent_id) do
+    indent = String.duplicate("  ", depth)
+    marker = if node[:id] == current_agent_id, do: " ← YOU", else: ""
+    short = if node[:short_id], do: " [#{node[:short_id]}]", else: ""
+
+    line = "#{indent}#{node[:name]} (#{node[:role]})#{short}#{marker}"
+
+    children_line = if node[:children] && node[:children] != [] do
+      "\n" <> format_org_tree(node[:children], depth + 1, current_agent_id)
+    else
+      ""
+    end
+
+    line <> children_line
   end
 
   defp dispatch("write_work_log", input, _workspace_path, agent) do
@@ -2123,8 +2392,8 @@ defmodule HiveWeave.ToolExecutor do
 
   # ── Git worktree tools (coordinator only) ────────────────────
 
-  defp dispatch("git_worktree_create", input, workspace_path, _agent) do
-    short_id = input["shortId"] || ""
+  defp dispatch("git_worktree_create", input, workspace_path, agent) do
+    short_id = resolve_short_id(input["shortId"] || "", agent)
     task_name = input["taskName"] || ""
     base_branch = input["baseBranch"] || "main"
 
@@ -2140,8 +2409,8 @@ defmodule HiveWeave.ToolExecutor do
     end
   end
 
-  defp dispatch("git_worktree_checkpoint", input, workspace_path, _agent) do
-    short_id = input["shortId"] || ""
+  defp dispatch("git_worktree_checkpoint", input, workspace_path, agent) do
+    short_id = resolve_short_id(input["shortId"] || "", agent)
     message = input["message"] || ""
 
     if short_id == "" or message == "" do
@@ -2157,7 +2426,7 @@ defmodule HiveWeave.ToolExecutor do
   end
 
   defp dispatch("git_worktree_merge", input, workspace_path, agent) do
-    short_id = input["shortId"] || ""
+    short_id = resolve_short_id(input["shortId"] || "", agent)
     task_name = input["taskName"] || ""
     target_branch = input["targetBranch"] || "main"
 
@@ -2175,8 +2444,8 @@ defmodule HiveWeave.ToolExecutor do
     end
   end
 
-  defp dispatch("git_worktree_rollback", input, workspace_path, _agent) do
-    short_id = input["shortId"] || ""
+  defp dispatch("git_worktree_rollback", input, workspace_path, agent) do
+    short_id = resolve_short_id(input["shortId"] || "", agent)
     commit_hash = input["commitHash"]
 
     if short_id == "" do
@@ -2191,8 +2460,8 @@ defmodule HiveWeave.ToolExecutor do
     end
   end
 
-  defp dispatch("git_worktree_remove", input, workspace_path, _agent) do
-    short_id = input["shortId"] || ""
+  defp dispatch("git_worktree_remove", input, workspace_path, agent) do
+    short_id = resolve_short_id(input["shortId"] || "", agent)
     task_name = input["taskName"]
 
     if short_id == "" do
@@ -2222,8 +2491,8 @@ defmodule HiveWeave.ToolExecutor do
     end
   end
 
-  defp dispatch("git_worktree_status", input, workspace_path, _agent) do
-    short_id = input["shortId"] || ""
+  defp dispatch("git_worktree_status", input, workspace_path, agent) do
+    short_id = resolve_short_id(input["shortId"] || "", agent)
 
     if short_id == "" do
       "Error: shortId is required"
@@ -2380,14 +2649,16 @@ defmodule HiveWeave.ToolExecutor do
     objective = input["objective"]
     focus = input["focus"]
     key_results = input["keyResults"]
+    user_involvement = input["userInvolvement"]
 
-    if is_nil(objective) and is_nil(focus) and is_nil(key_results) do
-      "Error: at least one of objective, focus, or keyResults is required"
+    if is_nil(objective) and is_nil(focus) and is_nil(key_results) and is_nil(user_involvement) do
+      "Error: at least one of objective, focus, keyResults, or userInvolvement is required"
     else
       attrs = %{}
       attrs = if objective, do: Map.put(attrs, :objective, objective), else: attrs
       attrs = if focus, do: Map.put(attrs, :focus, focus), else: attrs
       attrs = if key_results, do: Map.put(attrs, :key_results, key_results), else: attrs
+      attrs = if user_involvement, do: Map.put(attrs, :user_involvement, user_involvement), else: attrs
 
       case HiveWeave.Services.Charter.update_goals(agent.project_id, attrs) do
         {:ok, _goals} -> "Enterprise goals updated."
@@ -2968,8 +3239,14 @@ defmodule HiveWeave.ToolExecutor do
       target.parent_id == caller_agent.id ->
         do_update_agent(target, update_fn)
 
+      # CEO and HR can bind/unbind skills on ANY agent in the same project,
+      # not just direct subordinates. This allows HR to bind skills to newly
+      # hired agents that are placed under other coordinators.
+      caller_agent.role in ["ceo", "hr", "CEO", "HR"] ->
+        do_update_agent(target, update_fn)
+
       true ->
-        {:error, "You can only bind/unbind skills on yourself or your direct subordinates."}
+        {:error, "You can only bind/unbind skills on yourself, your direct subordinates, or (if you are CEO/HR) any agent in the project."}
     end
   end
 
@@ -3052,12 +3329,13 @@ defmodule HiveWeave.ToolExecutor do
             String.length(input) >= 6 && String.starts_with?(a.id, input) -> a.id
             # 5. short_id prefix match
             a.short_id && String.starts_with?(String.downcase(a.short_id), String.downcase(input)) -> a.id
-            # 6. Name exact match (case-insensitive) — allows CEO to message HR by name
+            # 6. Name exact match (case-insensitive) — primary way to address agents
             a.name && String.downcase(a.name) == String.downcase(input) -> a.id
             # 7. Name partial/contains match (case-insensitive)
             a.name && String.contains?(String.downcase(a.name), String.downcase(input)) -> a.id
-            # 8. Role match (e.g. "hr", "HR") — convenient for CEO to message HR by role
-            a.role && String.downcase(a.role) == String.downcase(input) -> a.id
+            # NOTE: Role matching is intentionally removed — a role can have
+            # multiple people, so messaging by role is ambiguous. Agents must
+            # address each other by name (花名) or ID.
             true -> nil
           end
         end)
@@ -3069,9 +3347,36 @@ defmodule HiveWeave.ToolExecutor do
   end
   defp contains_chinese?(_), do: false
 
+  # Resolve a user/LLM-provided identifier (花名 / short_id / UUID) to the
+  # agent's canonical short_id. Worktree directories and branches must use
+  # short_id (ASCII), never 花名 (CJK), to avoid Windows path issues.
+  defp resolve_short_id(input, agent) when is_binary(input) and input != "" do
+    case resolve_agent_id(input, agent) do
+      nil -> input  # fallback to raw input
+      agent_id ->
+        case HiveWeave.Services.Org.get_agent(agent_id) do
+          %{short_id: sid} when is_binary(sid) and sid != "" -> sid
+          _ -> input
+        end
+    end
+  end
+  defp resolve_short_id(input, _agent), do: input
+
   defp get_parent_id(agent) do
     agent = if is_map(agent), do: agent, else: %{}
     Map.get(agent, :parent_id)
+  end
+
+  # Check if target_id is a subordinate of agent_id (direct or indirect).
+  defp agent_id_is_subordinate?(agent_id, target_id) do
+    case HiveWeave.Services.Org.get_agent(target_id) do
+      %{parent_id: pid} when is_binary(pid) and pid != "" ->
+        if pid == agent_id, do: true, else: agent_id_is_subordinate?(agent_id, pid)
+      _ ->
+        false
+    end
+  rescue
+    _ -> false
   end
 
   defp get_agent_name(agent_id) do
@@ -3159,6 +3464,50 @@ defmodule HiveWeave.ToolExecutor do
 
         nil ->
           "Error: Command timed out after 120 seconds"
+      end
+    end
+  rescue
+    e -> "Error: #{inspect(e)}"
+  end
+
+  # run_command execution — mirrors execute_bash but with a configurable
+  # timeout and WITHOUT the self-destructive-command guard.
+  defp execute_run_command(command, cwd_input, timeout, workspace_path) do
+    cwd =
+      if cwd_input == "" do
+        workspace_path
+      else
+        Path.expand(cwd_input, workspace_path)
+      end
+
+    # Validate cwd is within workspace
+    if not String.starts_with?(Path.expand(cwd), Path.expand(workspace_path)) do
+      "Error: Sandbox violation - cwd must be within workspace"
+    else
+      # Clamp timeout to a sane range
+      safe_timeout = timeout |> max(1_000) |> min(600_000)
+
+      task =
+        Task.async(fn ->
+          System.cmd("cmd", ["/c", command],
+            cd: cwd,
+            env: [{"HIVEWEAVE_BASH", "1"}, {"HIVEWEAVE_WORKSPACE", cwd}],
+            stderr_to_stdout: true
+          )
+        end)
+
+      case Task.yield(task, safe_timeout) || Task.shutdown(task, :brutal_kill) do
+        {:ok, {output, 0}} ->
+          truncate_output(output)
+
+        {:ok, {output, exit_code}} ->
+          truncate_output(output) <> "\nExit code: #{exit_code}"
+
+        {:exit, :timeout} ->
+          "Error: Command timed out after #{div(safe_timeout, 1000)} seconds"
+
+        nil ->
+          "Error: Command timed out after #{div(safe_timeout, 1000)} seconds"
       end
     end
   rescue
