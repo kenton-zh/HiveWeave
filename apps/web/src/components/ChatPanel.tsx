@@ -116,8 +116,32 @@ function isTeamChannelMessage(msg: ChatMessage): boolean {
 function tryParseToolCalls(raw: string): ToolCall[] {
   try {
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed;
-    return [];
+    if (!Array.isArray(parsed)) return [];
+    // Normalize OpenAI tool_call format to our ToolCall interface.
+    // Backend stores: [{"function": {"name": "list_files", "arguments": "{\"path\": \".\"}"}, "id": "...", "type": "function"}]
+    // Frontend expects: [{tool: "list_files", input: {path: "."}}]
+    return parsed.map((tc: any): ToolCall => {
+      // Already in our format
+      if (tc.tool && tc.input) {
+        return { tool: tc.tool, input: tc.input };
+      }
+      // OpenAI format: {function: {name, arguments}}
+      if (tc.function) {
+        let input: Record<string, any> = {};
+        if (typeof tc.function.arguments === "string") {
+          try {
+            input = JSON.parse(tc.function.arguments);
+          } catch {
+            input = {};
+          }
+        } else if (typeof tc.function.arguments === "object" && tc.function.arguments) {
+          input = tc.function.arguments;
+        }
+        return { tool: tc.function.name || "unknown", input };
+      }
+      // Unknown format — best effort
+      return { tool: tc.name || tc.tool || "unknown", input: tc.input || tc.arguments || {} };
+    });
   } catch {
     return [];
   }
