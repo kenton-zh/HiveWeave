@@ -984,37 +984,6 @@ defmodule HiveWeave.LLM.Streamer do
       #{if is_binary(goal) and goal != "", do: "## Your Role\n#{goal}", else: ""}
       #{if is_binary(backstory) and backstory != "", do: "## Background\n#{backstory}", else: ""}
 
-      ## ETHOS — 工程准则（所有角色共享）
-      ### 原则 1: Boil the Lake（做完整的事）
-      AI 让"完整性"的边际成本趋近于零。当完整实现只比捷径多花几分钟时，就做完整版。
-      - **湖**（可煮沸）：100% 测试覆盖、完整边界处理、完整错误路径——这些必须做完
-      - **海洋**（不可煮沸）：整体重写、跨季度迁移——这些分阶段做
-      - 反模式："省 70 行只做 90%"、"测试留到下个 PR"、"边界情况以后再说"
-
-      ### 原则 2: Search Before Building（先搜索后构建）
-      三层知识观：
-      - Layer 1: 验证过的成熟模式 → 直接用
-      - Layer 2: 新流行的实践 → 审视后用（人群会狂热）
-      - Layer 3: 第一性原理推导 → 最有价值，"11/10 的项目"往往来自这种 zig while others zag
-
-      ### 原则 3: User Involvement（用户参与度，可调）
-      用户主权不是固定铁律，而是可配置的参与度级别。具体级别由 charter 的 user_involvement 字段决定（高/中/低，见动态上下文）。
-      - **无论哪个级别，AI 都不能伪造结果、不能隐藏风险、不能跳过验证**
-      - 让渡的是决策权，不是诚实义务
-
-      ### 通用验证文化（不可协商）
-      - 每个动作必须有证据支撑——"看起来对"永远不够
-      - 测试通过须附输出、构建成功须附日志、运行时验证须附截图
-      - 没有证据的"完成"等于未完成
-
-      ### 通用反合理化表
-      | 借口 | 反驳 |
-      |---|---|
-      | "我稍后加测试" | 测试是代码的一部分，没有测试的代码是未完成的代码 |
-      | "这个改动太小不用测" | 小改动也能引入大 bug，每个改动都需要测试 |
-      | "先跑通再说" | 能跑 ≠ 正确，先验证再扩展 |
-      | "这个方向很明显不用问" | 根据用户参与度配置决定：高风险决策方向必须确认 |
-
       ## IMPORTANT: HiveWeave System Directory
       - **`.hiveweave`** is the HiveWeave system directory at the workspace root.
       - **NEVER read, write, edit, move, or delete any files inside `.hiveweave`.**
@@ -1060,8 +1029,8 @@ defmodule HiveWeave.LLM.Streamer do
       - If you say "I will instruct HR" — you MUST call `send_message` to HR in the same turn.
       - If you say "I will dispatch tasks" — you MUST call `send_message` with the subordinate as recipient and expectReport=true in the same turn.
       - A text-only response that describes actions without calling tools is a FAILURE.
-      - **ALWAYS write a brief one-sentence note BEFORE calling a tool** (e.g. "Reading docker-compose.yml to check the tech stack..."). The user sees this in real-time while the tool runs.
-      - Do NOT write long summaries until all actions are complete.
+      - **ALWAYS write a brief note BEFORE calling a tool** (e.g. "Reading docker-compose.yml to check the tech stack..."). The user sees this in real-time while the tool runs. This is MANDATORY — do not call tools silently.
+      - After completing a group of related actions, write a brief summary of what you found and what you're doing next.
       """
       |> String.trim()
       |> maybe_append_language_rule(model)
