@@ -120,6 +120,31 @@ MCP integration lives in `packages/core/src/mcp/mcp-service.ts` (`mcpService`).
 
 CEO is auto-created per project. HR is under CEO. Expert agents (`test_engineer`, `code_reviewer`, `security_auditor`, `web_perf_auditor`) are on-demand executors — only invoked when scheduled.
 
+### ETHOS 工程约束框架（注入所有角色）
+
+三层提示词架构：ETHOS 共享层 → 角色类型约束层 → 角色专属剧本层。定义在 `streamer.ex` 的 `build_identity_prompt`（静态）+ `build_context_prompt`（动态）中。
+
+**三原则**（注入所有角色共享前言）：
+1. **Boil the Lake** — 完整实现，边界处理不能"以后再说"
+2. **Search Before Building** — 先搜索成熟模式，再从零设计
+3. **User Involvement**（可调） — 用户参与度三级：high（全问用户）/ medium（技术自主+产品必问）/ low（仅通知）。通过 charter 的 `userInvolvement` 字段配置，`build_involvement_block` 每轮动态注入。让渡的是决策权，不是诚实义务。
+
+**角色纪律四件套**（每个角色必备）：何时不做 / 输出格式 / 验证清单 / 反合理化表。
+
+**工具权限矩阵**（`tool_executor.ex` `get_tools/2`）：
+- `coordinator_tools` — 管理工具 + worktree + readonly_file + self_skill_tools
+- `executor_tools` — full_file + core + self_skill_tools（通用执行者）
+- `executor_tools_for_qa` — full_file + qa_review_tools + self_skill_tools（QA 写测试代码）
+- `executor_tools_for_test_engineer` — bash + readonly_file（无 write，不写应用代码）
+- `executor_tools_for_auditor` — bash + readonly_file + qa_review_tools（无 write，只报告不改）
+- `hire_tools` — hire_agent + list_agent_templates + transfer/dismiss/update_roster（HR 独占）
+
+**技能自主添加**：所有角色都有 `bind_skill` + `list_available_skills`，可随项目推进自主绑定新技能。初始技能是起点，不是终点。
+
+**agent_templates 集成**：HR 可通过 `list_agent_templates` 浏览模板库，在 `hire_agent` 时传 `templateId` 预填 role/goal/backstory。显式参数覆盖模板值。
+
+**组织范式流程节点**：6 种范式（solo/flat_squad/tech_lead/pm_architect/pod/pipeline）各注入必经流程（如 solo 必须自审，flat_squad 交叉审查，pipeline 阶段门禁）。
+
 ## `GitWorktreeService` (coordinator-only)
 
 `packages/core/src/git-worktree-service.ts` — gives each leaf agent an isolated worktree under `.hiveweave/worktrees/<shortId>/` on branch `hw/<shortId>/<task-slug>`. Coordinators can `create`, `checkpoint` (lightweight commit), `merge` (fast-forward into main then cleanup), and `rollback` (git reset --hard). Tools that drive this live in `ToolExecutor` around `tool-executor.ts:1468`.
@@ -171,6 +196,18 @@ React 19 + Zustand (`store.ts`). React Flow renders the org chart (`OrgTree`, `A
 
 - `HIVEWEAVE_DB_PATH` — override meta DB path (default: `packages/db/data/hiveweave.db`)
 - `PORT` — server port (default: 3200)
+- `HIVEWEAVE_DIAG` — set to `1` or `true` to enable verbose `[Streamer-DIAG]` / `[Agent-DIAG]` logs for debugging multi-agent LLM request/response/tool-call parsing. Off by default. Compile-time flag (requires restart to toggle).
 - `BASH_SANDBOX` — `docker` to sandbox `bash` tool
 - `OPENCODE_API_KEY` — read by `seedDefaultModel`; per-provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, …) are read by the model registry
 - `HTTPS_PROXY` — for restricted networks (see `apps/server/.env.example`)
+
+<!-- CODEGRAPH_START -->
+## CodeGraph
+
+In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+
+- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
+- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
+
+If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
+<!-- CODEGRAPH_END -->
