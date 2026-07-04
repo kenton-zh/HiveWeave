@@ -88,46 +88,76 @@ defmodule HiveWeaveWeb.ProjectsController do
         conn
         |> put_status(404)
         |> json(%{error: "Not found"})
+
       project ->
-        # 1. Stop project supervisor — bounded by 3s. Agent GenServers and
-        #    any in-flight LLM Tasks must die before we close the DB pool.
-        stop_project_bounded(project.id, 3_000)
-
-        # 2. Close the per-project DB pool — marks project as 'deleting' so
-        #    no new pool can be created, then kills connection processes.
-        stop_repo_bounded(project.id, 5_000)
-
-        # 3. Delete agents for this project from the meta DB FIRST.
-        #    This ensures the project disappears from the org tree immediately.
+        # Wrap the entire deletion in try/rescue. When multiple projects
+        # share the same workspace_path, DB pool operations can raise
+        # (e.g. DBConnection errors when killing shared connections).
+        # We must still return 200 so the frontend can remove the project
+        # from the list — the meta-DB record is the source of truth.
         try do
-          HiveWeave.Repo.Meta.query("DELETE FROM agents WHERE project_id = ?", [project.id])
+          do_delete_project(conn, project)
         rescue
-          e -> Logger.warning("Failed to delete agents for project #{project.id}: #{inspect(e)}")
+          e ->
+            Logger.error("[delete] Project #{project.id} deletion failed: #{inspect(e)}\n#{Exception.format_stacktrace(__STACKTRACE__)}")
+            # Still try to clear the deleting flag so re-creation works
+            try do
+              HiveWeave.Repo.ProjectFactory.clear_deleting(project.id)
+            catch
+              :exit, _ -> :ok
+            end
+            json(conn, %{ok: true, dbLeftover: true, warning: "Project deleted with cleanup errors"})
         end
-
-        # 4. Drop the project record itself.
-        case HiveWeave.Repo.Meta.delete(project) do
-          {:ok, _} -> :ok
-          {:error, reason} ->
-            Logger.error("Failed to delete project record #{project.id}: #{inspect(reason)}")
-        end
-
-        # 5. Spawn a BACKGROUND task to clean up .hiveweave/ files.
-        #    On Windows, SQLite file handles can take seconds to release after
-        #    the connection process is killed. Doing this synchronously would
-        #    block the API response for 15+ seconds. Instead, we return
-        #    immediately and let the background task retry file deletion.
-        if project.workspace_path && project.workspace_path != "" do
-          spawn(fn ->
-            cleanup_project_workspace_background(project.workspace_path, project.id)
-          end)
-        end
-
-        # 6. Clear the 'deleting' flag so the project can be re-created if needed.
-        HiveWeave.Repo.ProjectFactory.clear_deleting(project.id)
-
-        json(conn, %{ok: true, dbLeftover: false})
     end
+  end
+
+  defp do_delete_project(conn, project) do
+    # 1. Stop project supervisor — bounded by 3s. Agent GenServers and
+    #    any in-flight LLM Tasks must die before we close the DB pool.
+    stop_project_bounded(project.id, 3_000)
+
+    # 2. Close the per-project DB pool — marks project as 'deleting' so
+    #    no new pool can be created, then kills connection processes.
+    stop_repo_bounded(project.id, 5_000)
+
+    # 3. Delete agents for this project from the meta DB FIRST.
+    #    This ensures the project disappears from the org tree immediately.
+    try do
+      HiveWeave.Repo.Meta.query("DELETE FROM agents WHERE project_id = ?", [project.id])
+    rescue
+      e -> Logger.warning("Failed to delete agents for project #{project.id}: #{inspect(e)}")
+    end
+
+    # 4. Drop the project record itself.
+    case HiveWeave.Repo.Meta.delete(project) do
+      {:ok, _} -> :ok
+      {:error, reason} ->
+        Logger.error("Failed to delete project record #{project.id}: #{inspect(reason)}")
+    end
+
+    # 5. Clean up .hiveweave/ files SYNCHRONOUSLY.
+    #    The previous design spawned a background task, but that task dies if
+    #    the server is killed/restarted before it finishes — leaving .hiveweave/
+    #    behind forever. The TS version awaits `rm(hwDir)` synchronously, and
+    #    so must we. The pool connections are already dead (step 2), so the
+    #    SQLite file handle is released; a short retry loop handles the
+    #    Windows handle-release lag.
+    db_leftover =
+      if project.workspace_path && project.workspace_path != "" do
+        cleanup_project_workspace(project.workspace_path)
+      else
+        false
+      end
+
+    # 6. Clear the 'deleting' flag so the project can be re-created if needed.
+    try do
+      HiveWeave.Repo.ProjectFactory.clear_deleting(project.id)
+    catch
+      :exit, reason ->
+        Logger.warning("[delete] clear_deleting failed for #{project.id}: #{inspect(reason)}")
+    end
+
+    json(conn, %{ok: true, dbLeftover: db_leftover})
   end
 
   # ── Project-deletion helpers ──────────────────────────────────
@@ -345,12 +375,11 @@ defmodule HiveWeaveWeb.ProjectsController do
           false
       end
 
-    case File.rm_rf(hw_dir) do
-      {:ok, _} ->
-        :ok
-      {:error, reason, failed_path} ->
-        Logger.warning("Partial .hiveweave cleanup at #{inspect(failed_path)}: #{inspect(reason)}")
-    end
+    # Force-remove the entire .hiveweave directory.
+    # File.rm_rf on Windows often fails on non-empty subdirectories
+    # (worktrees, tool_outputs) or when files are still locked.
+    # Fall back to `cmd /c rd /s /q` which is more aggressive.
+    force_remove_dir(hw_dir)
 
     # If the DB file still couldn't be deleted (e.g. pool release was
     # delayed), keep retrying in the background so it isn't left behind
@@ -362,16 +391,43 @@ defmodule HiveWeaveWeb.ProjectsController do
     not db_deleted
   end
 
+  # Aggressively remove a directory tree on Windows.
+  # Tries File.rm_rf first; if that fails, falls back to `cmd /c rd /s /q`
+  # which ignores read-only attributes and forces recursive deletion.
+  defp force_remove_dir(dir) do
+    case File.rm_rf(dir) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason, failed_path} ->
+        Logger.warning("File.rm_rf partial fail at #{inspect(failed_path)}: #{inspect(reason)}, trying cmd rd /s /q")
+
+        # Windows fallback: rd /s /q is the most forceful directory removal.
+        # /s = remove all subdirectories and files; /q = quiet, no confirmation
+        case System.cmd("cmd", ["/c", "rd", "/s", "/q", dir], stderr_to_stdout: true) do
+          {_, 0} ->
+            Logger.info("rd /s /q succeeded for #{dir}")
+            :ok
+
+          {output, _exit} ->
+            Logger.error("rd /s /q also failed for #{dir}: #{output}")
+            {:error, reason}
+        end
+    end
+  end
+
   defp async_cleanup_db(db_path, hw_dir) do
     Enum.reduce_while(1..15, :ok, fn n, _ ->
       Process.sleep(2_000)
       case File.rm(db_path) do
         :ok ->
           Logger.info("[delete] async cleanup deleted #{db_path} on attempt #{n}")
-          File.rm_rf(hw_dir)
+          force_remove_dir(hw_dir)
           {:halt, :ok}
 
         {:error, :enoent} ->
+          # DB already gone, but .hiveweave dir might still have subdirs
+          force_remove_dir(hw_dir)
           {:halt, :ok}
 
         {:error, _reason} ->
@@ -416,19 +472,65 @@ defmodule HiveWeaveWeb.ProjectsController do
       end)
 
     # Try to remove the entire .hiveweave directory
-    case File.rm_rf(hw_dir) do
-      {:ok, _} ->
-        Logger.info("[delete-bg] Cleaned up #{hw_dir}")
-      {:error, reason, failed_path} ->
-        Logger.warning("[delete-bg] Partial cleanup at #{inspect(failed_path)}: #{inspect(reason)}")
-    end
+    force_remove_dir(hw_dir)
 
     result
   end
 
   # Best-effort cleanup of hiveweave-managed git worktrees and branches.
   # Mirrors apps/server/src/routes/projects.ts:282-311.
+  # Kill processes whose command line references the .hiveweave/worktrees path.
+  # On Windows, these lock files and block directory deletion.
+  # Uses PowerShell via System.cmd for cross-platform compatibility (no-op on non-Windows).
+  defp kill_worktree_processes(workspace_path) do
+    wt_dir = Path.join(workspace_path, ".hiveweave/worktrees") |> String.replace("/", "\\")
+
+    case :os.type() do
+      {:win32, _} ->
+        # Find and kill node/esbuild/vite/next processes whose CommandLine
+        # references the worktrees path. PowerShell gives us CommandLine access.
+        # Pass wt_dir via environment variable to prevent command injection
+        # through workspace_path containing quotes, $, or other special chars.
+        script = """
+        $wtDir = $env:HW_WT_DIR
+        if (-not (Test-Path $wtDir)) { exit 0 }
+        $procs = Get-CimInstance Win32_Process | Where-Object {
+            $_.CommandLine -like "*$wtDir*" -and
+            $_.Name -in @("node.exe", "esbuild.exe", "next-server.exe", "vite.exe")
+        }
+        foreach ($p in $procs) {
+            try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; Write-Host "Killed $($p.Name) PID $($p.ProcessId)" }
+            catch { Write-Host "Failed to kill PID $($p.ProcessId): $_" }
+        }
+        """
+
+        tmp = System.tmp_dir!() |> Path.join("hw_kill_procs_#{System.unique_integer([:positive])}.ps1")
+        File.write!(tmp, script)
+
+        try do
+          {output, 0} = System.cmd("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp], env: [{"HW_WT_DIR", wt_dir}], stderr_to_stdout: true)
+          if String.length(output) > 0 do
+            Logger.info("[delete] Worktree process cleanup: #{String.trim(output)}")
+          end
+          # Give processes time to release file handles
+          Process.sleep(1000)
+        rescue
+          e -> Logger.warning("kill_worktree_processes failed: #{inspect(e)}")
+        after
+          File.rm(tmp)
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
   defp cleanup_git_worktrees(workspace_path) do
+    # Kill processes whose working directory is under .hiveweave/worktrees/.
+    # Agents may have started dev servers (next dev, vite, esbuild) inside
+    # worktrees; these lock files and prevent directory deletion on Windows.
+    kill_worktree_processes(workspace_path)
+
     try do
       {out, _} =
         System.cmd(
@@ -444,11 +546,21 @@ defmodule HiveWeaveWeb.ProjectsController do
       |> Enum.filter(&(Path.relative_to(&1, workspace_path) |> String.starts_with?(".hiveweave")))
       |> Enum.each(fn wt_path ->
         try do
-          System.cmd("git", ["-C", workspace_path, "worktree", "remove", "--force", wt_path],
-            stderr_to_stdout: true
-          )
+          {_output, exit} =
+            System.cmd("git", ["-C", workspace_path, "worktree", "remove", "--force", wt_path],
+              stderr_to_stdout: true
+            )
+
+          # If git worktree remove failed (non-zero exit), force-delete the dir.
+          # Common on Windows with Chinese paths or locked files.
+          if exit != 0 do
+            Logger.warning("git worktree remove failed for #{wt_path} (exit #{exit}), force-removing dir")
+            force_remove_dir(wt_path)
+          end
         rescue
-          _ -> :ok
+          e ->
+            Logger.warning("git worktree remove raised for #{wt_path}: #{inspect(e)}")
+            force_remove_dir(wt_path)
         end
       end)
     rescue
@@ -510,8 +622,10 @@ defmodule HiveWeaveWeb.ProjectsController do
     else
       {1, 0}
     end
-    hours = div(time_in_day * 24, 900)
-    mins = div(rem(time_in_day * 24 * 60, 900 * 60), 60)
+    # 900 real seconds = 1 game day (24h), so 1 game hour = 37.5s, 1 game minute = 0.625s
+    total_minutes = div(time_in_day * 24 * 60, 900)
+    hours = div(total_minutes, 60)
+    mins = rem(total_minutes, 60)
     formatted = "Day #{day} #{String.pad_leading(Integer.to_string(hours), 2, "0")}:#{String.pad_leading(Integer.to_string(mins), 2, "0")}"
     json(conn, %{gameSeconds: seconds, projectId: project_id, formatted: formatted})
   end
@@ -539,8 +653,130 @@ defmodule HiveWeaveWeb.ProjectsController do
         |> Project.changeset(%{charter_json: Jason.encode!(params)})
         |> HiveWeave.Repo.Meta.update()
         |> case do
-          {:ok, p} -> json(conn, %{ok: true, project: serialize_project(p)})
+          {:ok, p} ->
+            HiveWeave.Services.Charter.touch_goals_version(project_id)
+            json(conn, %{ok: true, project: serialize_project(p)})
           {:error, _} -> json(conn, %{error: "Failed to update goals"}) |> Plug.Conn.put_status(500)
+        end
+    end
+  end
+
+  def update_workspace(conn, %{"id" => project_id} = params) do
+    case get_project(project_id) do
+      nil ->
+        conn
+        |> put_status(404)
+        |> json(%{error: "Not found"})
+
+      project ->
+        new_path = params["workspacePath"]
+
+        cond do
+          # Case 1: path is nil — clear workspace, evict DB, unregister agents
+          new_path == nil or new_path == "" ->
+            # Stop project supervisor — kills all agent GenServers (unregister agents)
+            try do
+              HiveWeave.ProjectSupervisor.stop_project(project.id)
+            catch
+              :exit, _ -> :ok
+            end
+
+            # Evict the per-project DB pool so the SQLite file handle is released
+            HiveWeave.Repo.ProjectFactory.evict(project.id)
+
+            # Clear workspace_path in the project record
+            case project
+                 |> Project.changeset(%{workspace_path: nil})
+                 |> HiveWeave.Repo.Meta.update() do
+              {:ok, updated} ->
+                json(conn, %{ok: true, project: serialize_project(updated)})
+              {:error, _} ->
+                conn |> put_status(500) |> json(%{error: "Failed to clear workspace path"})
+            end
+
+          # Case 2: path unchanged — no-op
+          new_path == project.workspace_path ->
+            json(conn, %{ok: true, project: serialize_project(project)})
+
+          # Case 3: path changed — move .hiveweave/, update record, re-register agents
+          true ->
+            # Validate the new workspace path exists and is a directory
+            cond do
+              not is_binary(new_path) or String.trim(new_path) == "" ->
+                conn |> put_status(400) |> json(%{error: "workspacePath must be a non-empty string"})
+
+              not File.dir?(new_path) ->
+                conn |> put_status(400) |> json(%{error: "Workspace path does not exist or is not a directory: #{new_path}"})
+
+              true ->
+                old_path = project.workspace_path
+
+            # Stop project supervisor to release DB handles
+            try do
+              HiveWeave.ProjectSupervisor.stop_project(project.id)
+            catch
+              :exit, _ -> :ok
+            end
+
+            # Evict old DB pool
+            HiveWeave.Repo.ProjectFactory.evict(project.id)
+
+            # Give the OS a beat to release the SQLite file handle after the
+            # pool is killed (NIF resource destructor runs during GC).
+            Process.sleep(500)
+
+            # Copy .hiveweave/ directory from old to new location (if old exists)
+            if old_path && old_path != "" do
+              old_hw = Path.join(old_path, ".hiveweave")
+
+              if File.exists?(old_hw) do
+                new_hw = Path.join(new_path, ".hiveweave")
+
+                # Ensure parent directory exists
+                File.mkdir_p(new_hw)
+
+                # Copy old .hiveweave/ to new location
+                case File.cp_r(old_hw, new_hw) do
+                  {:ok, _} ->
+                    # Delete old .hiveweave/ directory
+                    File.rm_rf(old_hw)
+                  {:error, reason, _file} ->
+                    Logger.warning("Failed to copy .hiveweave/ to new workspace: #{inspect(reason)}")
+                end
+              end
+            end
+
+            # Update project record with new workspace_path
+            case project
+                 |> Project.changeset(%{workspace_path: new_path})
+                 |> HiveWeave.Repo.Meta.update() do
+              {:ok, updated} ->
+                # Sync workspace_path in agents table to match the project record.
+                # The agents table has a redundant workspace_path column used as
+                # a fallback by project_factory.ex:open_project_db. Without this
+                # sync, a DB recovery would open the old (deleted) workspace.
+                try do
+                  HiveWeave.Repo.Meta.query!(
+                    "UPDATE agents SET workspace_path = ? WHERE project_id = ?",
+                    [new_path, project.id]
+                  )
+                rescue
+                  e -> Logger.warning("Failed to sync agents.workspace_path: #{inspect(e)}")
+                end
+
+                # Re-register agents by restarting the project supervisor
+                case HiveWeave.ProjectSupervisor.start_project(updated.id, new_path) do
+                  {:ok, _} -> :ok
+                  {:error, {:already_started, _}} -> :ok
+                  other -> Logger.warning("Failed to restart project supervisor: #{inspect(other)}")
+                end
+
+                json(conn, %{ok: true, project: serialize_project(updated)})
+
+              {:error, _} ->
+                conn |> put_status(500) |> json(%{error: "Failed to update workspace path"})
+            end
+          end
         end
     end
   end
@@ -627,6 +863,7 @@ defmodule HiveWeaveWeb.ProjectsController do
 
       ceo_short = "A001-#{project_suffix}"
       hr_short = "A002-#{project_suffix}"
+      qa_short = "A003-#{project_suffix}"
 
       ceo_name = generate_flower_name()
       ceo_id = Ecto.UUID.generate()
@@ -715,7 +952,60 @@ defmodule HiveWeaveWeb.ProjectsController do
           case %Agent{}
                |> Ecto.Changeset.change(hr_attrs)
                |> HiveWeave.Repo.Meta.insert() do
-            {:ok, _} -> ceo_id
+            {:ok, _} ->
+              # Create QA Engineer under CEO
+              qa_name = generate_flower_name()
+              qa_id = Ecto.UUID.generate()
+
+              # Default skills for QA Engineer: code review and testing.
+              qa_skills = [
+                "code-review-and-quality",
+                "test-driven-development"
+              ]
+              qa_skills_json = Jason.encode!(qa_skills)
+
+              qa_attrs = %{
+                id: qa_id,
+                short_id: qa_short,
+                project_id: project_id,
+                name: qa_name,
+                role: "qa_engineer",
+                parent_id: ceo_id,
+                status: "active",
+                goal: "代码质量保证与测试审查",
+                backstory:
+                  "花名#{qa_name}，30岁，曾在大厂担任测试架构师。一次发布事故中，因为自动化测试覆盖不足导致线上故障，从此立誓要让每一段代码都经得起考验。信奉'质量不是检查出来的，是构建出来的'。",
+                skills: qa_skills_json,
+                model_id: default_model_id,
+                permission_type: "executor",
+                permission_mode: "full",
+                allowed_tools: "[]",
+                denied_tools: "[]",
+                ask_tools: "[]",
+                mcp_servers: "[]",
+                bound_skills: qa_skills_json,
+                created_at: now,
+                updated_at: now
+              }
+
+              case %Agent{}
+                   |> Ecto.Changeset.change(qa_attrs)
+                   |> HiveWeave.Repo.Meta.insert() do
+                {:ok, _} ->
+                  # Create roster record for QA Engineer
+                  try do
+                    HiveWeave.Services.Roster.update_roster(project_id, qa_id, %{
+                      position: "质量保证工程师",
+                      department: "质量部"
+                    })
+                  rescue
+                    _ -> :ok
+                  end
+                  ceo_id
+
+                {:error, _} -> ceo_id
+              end
+
             {:error, _} -> ceo_id
           end
 

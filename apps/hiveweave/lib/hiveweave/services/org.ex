@@ -100,8 +100,23 @@ defmodule HiveWeave.Services.Org do
 
   @doc """
   Create a new agent.
+
+  Backfills `workspace_path` from the projects table so the agents row carries
+  a redundant copy of the workspace path. This lets ProjectFactory reopen the
+  per-project DB even if the projects row is later lost — mirrors the TS
+  agentRegistry, but durable. See ProjectFactory.open_project_db/1.
   """
   def create_agent(attrs) do
+    attrs =
+      if Map.has_key?(attrs, :workspace_path) or Map.has_key?(attrs, "workspace_path") do
+        attrs
+      else
+        case resolve_workspace_path_for_agent(attrs) do
+          nil -> attrs
+          ws_path -> Map.put(attrs, :workspace_path, ws_path)
+        end
+      end
+
     result =
       %Agent{}
       |> Agent.changeset(attrs)
@@ -113,6 +128,30 @@ defmodule HiveWeave.Services.Org do
     end
 
     result
+  end
+
+  # Resolve the workspace_path to backfill onto a new agent.
+  # 1. Look up the project_id in the projects table.
+  # 2. Fall back to a sibling agent's workspace_path (same project_id) if the
+  #    projects row is missing — this covers the recovery window after a
+  #    projects-table wipe where agents have already been repaired.
+  defp resolve_workspace_path_for_agent(attrs) do
+    project_id = attrs[:project_id] || attrs["project_id"]
+    if is_nil(project_id), do: nil, else: resolve_workspace_path(project_id)
+  end
+
+  defp resolve_workspace_path(project_id) do
+    import Ecto.Query
+    alias HiveWeave.Repo.Meta
+    alias HiveWeave.Schema.{Project, Agent}
+
+    case Meta.one(from p in Project, where: p.id == ^project_id, select: p.workspace_path) do
+      nil ->
+        Meta.one(from a in Agent, where: a.project_id == ^project_id and not is_nil(a.workspace_path), select: a.workspace_path, limit: 1)
+
+      ws_path ->
+        ws_path
+    end
   end
 
   @doc """

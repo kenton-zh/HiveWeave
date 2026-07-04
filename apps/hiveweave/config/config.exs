@@ -29,6 +29,12 @@ config :hiveweave, HiveWeave.Repo.Meta,
 config :hiveweave, :project_db_dir, ".hiveweave"
 config :hiveweave, :project_db_filename, "data.db"
 
+# ── Agent cluster diagnostics ─────────────────────────────────
+# Set HIVEWEAVE_DIAG=1 (or "true") to enable verbose Streamer/Agent logs
+# for debugging multi-agent LLM issues. Off by default in production.
+# NOTE: The actual env var is read in config/runtime.exs (which is evaluated
+# at application start, not at compile time).
+
 # Configures Phoenix
 config :hiveweave, HiveWeaveWeb.Endpoint,
   url: [host: "localhost"],

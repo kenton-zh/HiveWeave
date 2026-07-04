@@ -52,8 +52,67 @@ defmodule HiveWeaveWeb.ExtraController do
   end
 
   # ---------------------------------------------------------------------------
-  # LLM Models CRUD
+  # Debug / Monitoring — agent LLM traces
   # ---------------------------------------------------------------------------
+
+  def debug_traces(conn, %{"agentId" => agent_id}) do
+    turns =
+      case HiveWeave.Repo.ProjectFactory.query_for_agent(
+             agent_id,
+             "SELECT id, agent_id, turn_index, raw_messages, approx_tokens, created_at FROM conversation_turns WHERE agent_id = ? ORDER BY created_at ASC",
+             [agent_id]
+           ) do
+        {:ok, r} ->
+          r.rows
+          |> Enum.map(fn row -> Enum.zip(r.columns, row) |> Enum.into(%{}) end)
+          |> Enum.map(&serialize_turn_map/1)
+
+        {:error, _} ->
+          []
+      end
+
+    events =
+      case HiveWeave.Repo.ProjectFactory.query_for_agent(
+             agent_id,
+             "SELECT id, agent_id, event_type, payload, created_at FROM agent_events WHERE agent_id = ? AND event_type IN ('llm_round', 'chat_done', 'chat_start', 'llm_fail') ORDER BY created_at ASC",
+             [agent_id]
+           ) do
+        {:ok, r} ->
+          r.rows
+          |> Enum.map(fn row -> Enum.zip(r.columns, row) |> Enum.into(%{}) end)
+          |> Enum.map(&serialize_event_map/1)
+
+        {:error, _} ->
+          []
+      end
+
+    json(conn, %{turns: turns, events: events})
+  rescue
+    _ -> json(conn, %{turns: [], events: []})
+  catch
+    :exit, _ -> json(conn, %{turns: [], events: []})
+  end
+
+  defp serialize_turn_map(m) do
+    %{
+      "id" => m["id"],
+      "agent_id" => m["agent_id"],
+      "turn_index" => m["turn_index"],
+      "raw_messages" => decode_json(m["raw_messages"]) || [],
+      "approx_tokens" => m["approx_tokens"],
+      "created_at" => m["created_at"]
+    }
+  end
+
+  defp serialize_event_map(m) do
+    %{
+      "id" => m["id"],
+      "agent_id" => m["agent_id"],
+      "event_type" => m["event_type"],
+      "payload" => decode_json(m["payload"]) || %{},
+      "created_at" => m["created_at"]
+    }
+  end
 
   def llm_models_index(conn, _params) do
     # Use raw SQL to avoid Ecto's auto-timestamp injection
@@ -172,8 +231,61 @@ defmodule HiveWeaveWeb.ExtraController do
   end
 
   def llm_model_test(conn, %{"id" => id}) do
-    # Stub: real implementation would POST to the model endpoint
-    json(conn, %{ok: true, model: id, latencyMs: 0, message: "Test endpoint stub"})
+    case HiveWeave.Services.Model.get_model(id) do
+      {:ok, model} ->
+        base_url = (model.base_url || "") |> to_string() |> String.trim_trailing("/")
+        url = "#{base_url}/chat/completions"
+
+        body =
+          Jason.encode!(%{
+            model: model.model_id,
+            messages: [%{role: "user", content: "Say 'OK' and nothing else."}],
+            max_tokens: 10
+          })
+
+        headers = [
+          {"content-type", "application/json"},
+          {"authorization", "Bearer #{model.api_key}"}
+        ]
+
+        {latency_us, result} =
+          :timer.tc(fn ->
+            Req.post(url, headers: headers, body: body, receive_timeout: 15_000)
+          end)
+
+        latency_ms = div(latency_us, 1000)
+
+        case result do
+          {:ok, %{status: 200, body: resp_body}} ->
+            decoded = if is_binary(resp_body), do: Jason.decode(resp_body), else: {:ok, resp_body}
+
+            response_text =
+              case decoded do
+                {:ok, %{"choices" => [%{"message" => %{"content" => content}} | _]}} ->
+                  content || ""
+
+                _ ->
+                  ""
+              end
+
+            json(conn, %{ok: true, latencyMs: latency_ms, response: response_text})
+
+          {:ok, %{status: status}} ->
+            json(conn, %{ok: false, latencyMs: latency_ms, error: "HTTP #{status}"})
+
+          {:error, reason} ->
+            json(conn, %{ok: false, latencyMs: latency_ms, error: inspect(reason)})
+        end
+
+      {:error, :not_found} ->
+        conn |> put_status(404) |> json(%{error: "Model not found"})
+
+      {:error, reason} ->
+        conn |> put_status(500) |> json(%{error: "Failed to load model: #{inspect(reason)}"})
+    end
+  rescue
+    e ->
+      json(conn, %{ok: false, latencyMs: 0, error: Exception.message(e)})
   end
 
   # ---------------------------------------------------------------------------
@@ -385,11 +497,22 @@ defmodule HiveWeaveWeb.ExtraController do
           end
       end
 
-    json(conn, alarms)
+    current_game_seconds =
+      try do
+        HiveWeave.GameTime.Server.get_current_time(uuid)
+      catch
+        :exit, _ -> 0
+      end
+
+    json(conn, %{
+      alarms: alarms,
+      currentGameSeconds: current_game_seconds,
+      realTimestamp: System.system_time(:millisecond)
+    })
   rescue
-    _ -> json(conn, [])
+    _ -> json(conn, %{alarms: [], currentGameSeconds: 0, realTimestamp: System.system_time(:millisecond)})
   catch
-    :exit, _ -> json(conn, [])
+    :exit, _ -> json(conn, %{alarms: [], currentGameSeconds: 0, realTimestamp: System.system_time(:millisecond)})
   end
 
   def project_alarms_create(conn, %{"project_id" => project_id} = params) do
@@ -552,6 +675,34 @@ defmodule HiveWeaveWeb.ExtraController do
     _ -> json(conn, %{logs: []})
   catch
     :exit, _ -> json(conn, %{logs: []})
+  end
+
+  def work_logs_subordinates(conn, %{"agentId" => agent_id}) do
+    case HiveWeave.Services.Org.get_agent(agent_id) do
+      nil ->
+        conn
+        |> put_status(404)
+        |> json(%{error: "Agent not found"})
+
+      agent ->
+        project_id = agent.project_id
+
+        children = HiveWeave.Services.Org.get_children(project_id, agent_id)
+
+        subordinates =
+          children
+          |> Enum.map(fn child ->
+            logs = HiveWeave.Services.Dispatch.get_agent_logs(project_id, child.id, 10)
+            {child.id, %{name: child.name, role: child.role, logs: logs}}
+          end)
+          |> Map.new()
+
+        json(conn, %{agentId: agent_id, subordinates: subordinates})
+    end
+  rescue
+    _ -> json(conn, %{agentId: agent_id, subordinates: %{}})
+  catch
+    :exit, _ -> json(conn, %{agentId: agent_id, subordinates: %{}})
   end
 
   # ---------------------------------------------------------------------------

@@ -13,6 +13,26 @@ defmodule HiveWeaveWeb.ChatController do
   The response is sent via the WebSocket channel, not this HTTP endpoint.
   This endpoint just triggers the agent to start processing.
   """
+  @expert_command_map %{
+    "review" => "code_reviewer",
+    "test" => "test_engineer",
+    "audit" => "security_auditor",
+    "perf" => "web_perf_auditor"
+  }
+
+  defp parse_expert_command(message) do
+    trimmed = String.trim(message || "")
+    case Regex.run(~r/^\/(review|test|audit|perf)\s+(.+)$/i, trimmed) do
+      [_, cmd, module_name] ->
+        %{
+          command: String.downcase(cmd),
+          role: Map.get(@expert_command_map, String.downcase(cmd)),
+          module: String.trim(module_name)
+        }
+      _ -> nil
+    end
+  end
+
   def send(conn, %{"agentId" => agent_id, "message" => message} = params) do
     case Org.get_agent(agent_id) do
       nil ->
@@ -21,6 +41,77 @@ defmodule HiveWeaveWeb.ChatController do
         |> json(%{error: "Agent not found"})
 
       agent ->
+        # ── Expert command routing (/review /test /audit /perf) ──
+        # Like TS parseExpertCommand — route to specialist agent if available
+        expert_cmd = parse_expert_command(message)
+
+        if expert_cmd && expert_cmd[:role] do
+          # Find expert agent by role in the same project
+          project_agents = Org.list_agents(agent.project_id)
+          expert_agent = Enum.find(project_agents, fn a ->
+            String.downcase(a.role || "") == expert_cmd[:role]
+          end)
+
+          if expert_agent && expert_agent.id != agent_id do
+            # Build the redirected message once — reused across all routing paths
+            redirected_msg = "[来自: #{agent.name}]\n/#{expert_cmd[:command]} #{expert_cmd[:module]}\n\n请检查 \"#{expert_cmd[:module]}\" 并提供完整的审查报告。完成后用 report_completion + message_superior 返回报告。"
+
+            # Expert found — check if busy via registered name
+            expert_name = Agent.name(expert_agent.project_id, expert_agent.id)
+            expert_pid = GenServer.whereis(expert_name)
+
+            cond do
+              expert_pid == nil ->
+                # Expert agent not started — start it, then route
+                ensure_agent_started(expert_agent)
+                expert_pid = GenServer.whereis(expert_name)
+
+                if expert_pid do
+                  ChatMessage.save_message(%{agent_id: agent_id, role: "user", content: message, is_read: true, is_streaming: false})
+                  ChatMessage.save_message(%{agent_id: expert_agent.id, role: "user", content: redirected_msg, is_read: true, is_streaming: false})
+                  Agent.chat(expert_pid, redirected_msg)
+                  json(conn, %{ok: true, routed: true, expert: expert_agent.name, started: true})
+                else
+                  nil  # Failed to start — fall through
+                end
+
+              true ->
+                case Agent.get_state(expert_pid) do
+                  %{status: :processing} ->
+                    # Expert is busy — queue in inbox
+                    Inbox.send_message(agent_id, expert_agent.id, "peer", redirected_msg, %{expect_report: true, priority: "normal"})
+
+                    ChatMessage.save_message(%{agent_id: agent_id, role: "user", content: message, is_read: true, is_streaming: false})
+                    ChatMessage.save_message(%{
+                      agent_id: agent_id, role: "assistant",
+                      content: "⏳ **#{expert_agent.name}**（#{expert_cmd[:role]}）正在处理其他请求，你的审查请求已加入队列，专家完成后会自动处理并通知你。",
+                      is_read: true, is_streaming: false
+                    })
+
+                    json(conn, %{ok: true, queued: true, expert: expert_agent.name})
+
+                  _ ->
+                    # Expert is free — redirect message to expert
+                    ChatMessage.save_message(%{agent_id: agent_id, role: "user", content: message, is_read: true, is_streaming: false})
+                    ChatMessage.save_message(%{agent_id: expert_agent.id, role: "user", content: redirected_msg, is_read: true, is_streaming: false})
+                    Agent.chat(expert_pid, redirected_msg)
+                    json(conn, %{ok: true, routed: true, expert: expert_agent.name})
+                end
+            end
+          else
+            # No expert agent found — fall through to normal processing
+            nil
+          end
+        else
+          # Not an expert command — fall through to normal processing
+          nil
+        end
+
+        # Normal processing (skip if expert routing already sent a response)
+        if conn.state == :sent do
+          # Expert routing already responded — skip normal processing
+          conn
+        else
         # Save user message
         case ChatMessage.save_message(%{
           agent_id: agent_id,
@@ -75,6 +166,7 @@ defmodule HiveWeaveWeb.ChatController do
             |> put_status(500)
             |> json(%{error: "Failed to save message"})
         end
+        end  # close if conn.halted / else
     end
   end
 
@@ -142,6 +234,74 @@ defmodule HiveWeaveWeb.ChatController do
     json(conn, %{paused: HiveWeave.Services.SystemState.paused?()})
   end
 
+  @doc """
+  Get unread background messages for an agent.
+  """
+  def unread(conn, %{"agentId" => agent_id}) do
+    case Org.get_agent(agent_id) do
+      nil ->
+        conn
+        |> put_status(404)
+        |> json(%{error: "Agent not found"})
+
+      _agent ->
+        messages = ChatMessage.get_unread_background(agent_id) |> Enum.map(&serialize_message/1)
+        json(conn, %{messages: messages, count: length(messages)})
+    end
+  end
+
+  @doc """
+  Force-clear a stuck processing state on an agent.
+  """
+  def reset_processing(conn, %{"agentId" => agent_id}) do
+    case Org.get_agent(agent_id) do
+      nil ->
+        conn
+        |> put_status(404)
+        |> json(%{error: "Agent not found"})
+
+      agent ->
+        name = Agent.name(agent.project_id, agent_id)
+        pid = GenServer.whereis(name)
+
+        if pid do
+          Kernel.send(pid, {:force_reset})
+        end
+
+        HiveWeaveWeb.Endpoint.broadcast(
+          "agent:#{agent_id}",
+          "status:changed",
+          %{status: "idle"}
+        )
+
+        json(conn, %{ok: true, agentId: agent_id, processing: false})
+    end
+  end
+
+  @doc """
+  Get the resolved model that will be used for an agent.
+  Delegates to HiveWeave.LLM.Streamer.resolve_model/1.
+  """
+  def resolved_model(conn, %{"agentId" => agent_id}) do
+    case Org.get_agent(agent_id) do
+      nil ->
+        conn
+        |> put_status(404)
+        |> json(%{error: "Agent not found"})
+
+      agent ->
+        model = HiveWeave.LLM.Streamer.resolve_model(agent)
+        model_id = Map.get(model, :id)
+        model_name = Map.get(model, :name)
+
+        if model_id do
+          json(conn, %{agentId: agent_id, modelName: model_name, modelId: model_id, source: "auto"})
+        else
+          json(conn, %{agentId: agent_id, modelName: model_name, modelId: nil, source: "none"})
+        end
+    end
+  end
+
   # Private helpers
 
   defp find_agent_pid(project_id, agent_id) do
@@ -207,11 +367,11 @@ defmodule HiveWeaveWeb.ChatController do
     is_processed = Map.get(m, :is_processed, false)
 
     %{
-      id: m.id,
-      from_agent_id: m.from_agent_id,
-      fromAgentId: m.from_agent_id,
-      to_agent_id: m.to_agent_id,
-      toAgentId: m.to_agent_id,
+      id: Map.get(m, :id),
+      from_agent_id: Map.get(m, :from_agent_id),
+      fromAgentId: Map.get(m, :from_agent_id),
+      to_agent_id: Map.get(m, :to_agent_id),
+      toAgentId: Map.get(m, :to_agent_id),
       type: mtype,
       subject: Map.get(m, :subject),
       content: content,
@@ -222,8 +382,8 @@ defmodule HiveWeaveWeb.ChatController do
       is_processed: is_processed,
       isProcessed: is_processed,
       metadata: Map.get(m, :metadata) || "{}",
-      created_at: m.created_at,
-      createdAt: m.created_at,
+      created_at: Map.get(m, :created_at),
+      createdAt: Map.get(m, :created_at),
       read_at: Map.get(m, :read_at),
       readAt: Map.get(m, :read_at),
       processed_at: Map.get(m, :processed_at),

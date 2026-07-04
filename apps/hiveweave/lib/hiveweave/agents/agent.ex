@@ -37,6 +37,11 @@ defmodule HiveWeave.Agents.Agent do
     # 工作状态
     current_job: nil,
     last_heartbeat: nil,
+    # 空响应重试计数
+    empty_retry_count: 0,
+    # 待标记已读的 inbox 消息 ID（仅 trigger 场景）。
+    # LLM 产出非空输出后才标记为已读；空响应时保留未读以便重试。
+    pending_inbox_msg_ids: nil,
     # 配置
     config: %{}
   ]
@@ -211,7 +216,11 @@ defmodule HiveWeave.Agents.Agent do
     try do
       case GenServer.call(name(project_id, agent_id), :get_state, 5_000) do
         %{status: :processing} ->
-          Logger.info("[Trigger] Agent #{agent_id} is already processing, skipping")
+          # Agent is busy — skip this trigger. The self-retrigger logic in
+          # handle_info({ref, result}) (line ~497) will check the inbox after
+          # the current task completes and auto-retrigger if there are pending
+          # messages. No explicit flag needed.
+          Logger.info("[Trigger] Agent #{agent_id} (#{agent.name}) is processing, will self-retrigger after completion")
           :skip
 
         _ ->
@@ -247,13 +256,13 @@ defmodule HiveWeave.Agents.Agent do
                 created_at: now_ms
               })
 
-              # Call the agent's chat handler directly
-              result = GenServer.call(name(project_id, agent_id), {:chat, context, [trigger: true, from_agent_id: from_agent_id]}, 30_000)
+              # Call the agent's chat handler directly.
+              # Pass inbox_msg_ids so the GenServer can mark them as read only
+              # after the LLM produces non-empty output (see handle_info({ref, _})).
+              # This prevents swallowing inbox messages on empty responses — they
+              # stay unread and are re-injected on the next trigger cycle.
+              result = GenServer.call(name(project_id, agent_id), {:chat, context, [trigger: true, from_agent_id: from_agent_id, inbox_msg_ids: inbox_msg_ids]}, 30_000)
 
-              # Only mark the inbox messages that were included in the context as read.
-              # This avoids the race condition where new messages arrive between
-              # build_trigger_context and mark_all_read — those new messages must
-              # remain unread for the next trigger cycle.
               case result do
                 {:error, :busy} ->
                   Logger.warning("[Trigger] Agent #{agent_id} was busy, inbox messages left unread for retry")
@@ -262,7 +271,9 @@ defmodule HiveWeave.Agents.Agent do
                 {:error, reason} ->
                   Logger.warning("[Trigger] Agent #{agent_id} trigger failed: #{inspect(reason)}, inbox messages left unread for retry")
                 _ ->
-                  HiveWeave.Services.Inbox.mark_read_by_ids(agent_id, inbox_msg_ids)
+                  # mark_read is deferred to handle_info({ref, result}) so it
+                  # only fires on non-empty LLM output.
+                  :ok
               end
           end
       end
@@ -427,7 +438,8 @@ defmodule HiveWeave.Agents.Agent do
         status: :processing,
         llm_task: task,
         safety_timer: timer_ref,
-        current_job: %{message: message, started_at: System.system_time(:millisecond)}
+        current_job: %{message: message, started_at: System.system_time(:millisecond)},
+        pending_inbox_msg_ids: Keyword.get(opts, :inbox_msg_ids)
       }
 
       # Broadcast status change: processing
@@ -455,7 +467,7 @@ defmodule HiveWeave.Agents.Agent do
       {:stream_event, %{type: "done", error: "cancelled"}}
     )
 
-    new_state = %{state | status: :idle, llm_task: nil, current_job: nil, safety_timer: nil}
+    new_state = %{state | status: :idle, llm_task: nil, current_job: nil, safety_timer: nil, pending_inbox_msg_ids: nil}
     broadcast_status(state.project_id, state.id, :idle)
     {:noreply, new_state}
   end
@@ -474,39 +486,131 @@ defmodule HiveWeave.Agents.Agent do
     duration = (System.system_time(:millisecond) - (state.current_job.started_at || 0))
     tokens = extract_tokens(result)
 
-    new_state = %{state |
-      status: :idle,
-      llm_task: nil,
-      safety_timer: nil,
-      current_job: nil,
-      last_heartbeat: System.system_time(:millisecond)
-    }
+    # ── Empty response retry with exponential backoff ──
+    # Like TS scheduleEmptyRetry: if LLM returned empty (no text, no tool calls),
+    # schedule a delayed retry. After MAX_EMPTY_RETRIES, escalate to superior.
+    case result do
+      {:empty, _tool_history, _thinking} ->
+        retry_count = state.empty_retry_count + 1
+        max_retries = 3
+        backoff_delays = [5_000, 15_000, 45_000]  # 5s, 15s, 45s
 
-    # Telemetry + audit
-    HiveWeave.Telemetry.agent_chat_done(state.id, duration, tokens)
-    HiveWeave.EventAudit.log(state.id, :chat_done, %{duration_ms: duration, tokens: tokens})
+        if retry_count > max_retries do
+          Logger.error("[Agent] #{state.name} (#{state.id}): #{retry_count - 1} consecutive empty responses — STOPPING retries, escalating to superior")
 
-    # Broadcast status change
-    broadcast_status(state.project_id, state.id, :idle)
+          # Escalate to superior — find parent agent
+          agents = HiveWeave.Services.Org.list_agents(state.project_id)
+          parent = Enum.find(agents, fn a -> a.id != state.id and coordinator?(a.role) end)
+          if parent do
+            HiveWeave.Services.Inbox.send_message(
+              state.id, parent.id, "alarm",
+              "[系统告警] 你的下属 **#{state.name}** 连续 #{max_retries} 次未响应。可能是模型错误、上下文损坏或 API 问题。请检查该 agent 的状态，考虑重新派发任务或调整配置。",
+              %{priority: "urgent"}
+            )
+          end
 
-    # Self-retrigger: if new inbox messages arrived while we were processing, trigger again
-    pending = HiveWeave.Services.Inbox.get_pending_messages(state.id)
-    # Also check for unanswered user messages in chat_messages (user sent a
-    # message while agent was busy — the message was saved to DB but not processed)
-    has_unanswered_user_msgs = HiveWeave.Services.ChatMessage.has_unanswered_user_messages?(state.id)
-    if pending != [] or has_unanswered_user_msgs do
-      spawn(fn ->
-        Process.sleep(500)
-        # Use the correct trigger method based on agent role
-        if state.config[:role] == "ceo" or state.config[:role] == "hr" do
-          HiveWeave.Agents.Agent.trigger_coordinator(state.id)
+          # Save error message to chat
+          HiveWeave.Services.ChatMessage.save_message(%{
+            agent_id: state.id,
+            role: "assistant",
+            content: "⚠️ 连续 #{max_retries} 次空响应，已上报上级。请稍后重试或检查模型配置。",
+            is_background: false
+          })
+          broadcast_status(state.project_id, state.id, :idle)
+
+          # Mark the inbox messages that triggered this run as read.
+          # Without this, self-retrigger would see them as pending and
+          # re-trigger → infinite loop (escalate → retrigger → empty → escalate).
+          if state.pending_inbox_msg_ids not in [nil, []] do
+            HiveWeave.Services.Inbox.mark_read_by_ids(state.id, state.pending_inbox_msg_ids)
+          end
+
+          new_state = %{state |
+            status: :idle, llm_task: nil, safety_timer: nil,
+            current_job: nil, empty_retry_count: 0,
+            pending_inbox_msg_ids: nil,
+            last_heartbeat: System.system_time(:millisecond)
+          }
+
+          # Do NOT self-retrigger after escalation — the escalation message
+          # itself will wake the parent, who can decide to re-dispatch.
+          # Self-retrigger here would cause an infinite loop because the
+          # messages are still unread and would keep triggering the agent.
+
+          {:noreply, new_state}
+
         else
-          HiveWeave.Agents.Agent.trigger_subordinate(state.id)
-        end
-      end)
-    end
+          delay_idx = min(retry_count - 1, length(backoff_delays) - 1)
+          delay = Enum.at(backoff_delays, delay_idx)
+          Logger.warning("[Agent] #{state.name}: empty response ##{retry_count}, scheduling retry in #{delay / 1000}s")
 
-    {:noreply, new_state}
+          # Schedule retry — keep agent in processing state.
+          # pending_inbox_msg_ids is intentionally kept so the retry can mark
+          # the messages as read if it produces non-empty output.
+          Process.send_after(self(), {:empty_retry, state.current_job}, delay)
+
+          new_state = %{state |
+            empty_retry_count: retry_count,
+            last_heartbeat: System.system_time(:millisecond)
+          }
+          {:noreply, new_state}
+        end
+
+      _ ->
+        # Normal completion — the LLM produced non-empty output.
+        # Mark the inbox messages that triggered this run as read now (they
+        # were deferred from run_triggered_agent). Empty responses above keep
+        # them unread for retry.
+        if state.pending_inbox_msg_ids not in [nil, []] do
+          HiveWeave.Services.Inbox.mark_read_by_ids(state.id, state.pending_inbox_msg_ids)
+        end
+
+        # Reset empty retry counter
+        new_state = %{state |
+          status: :idle,
+          llm_task: nil,
+          safety_timer: nil,
+          current_job: nil,
+          empty_retry_count: 0,
+          pending_inbox_msg_ids: nil,
+          last_heartbeat: System.system_time(:millisecond)
+        }
+
+        # Telemetry + audit
+        HiveWeave.Telemetry.agent_chat_done(state.id, duration, tokens)
+        HiveWeave.EventAudit.log(state.id, :chat_done, %{duration_ms: duration, tokens: tokens})
+
+        # Broadcast status change
+        broadcast_status(state.project_id, state.id, :idle)
+
+        # Self-retrigger: if new inbox messages arrived while we were processing, trigger again
+        maybe_self_retrigger(state)
+
+        {:noreply, new_state}
+    end
+  end
+
+  @impl true
+  def handle_info({:empty_retry, job}, state) do
+    # Retry after empty response — re-trigger the LLM stream
+    # Guard: if agent was cancelled/reset between scheduling and firing, skip
+    if state.status != :processing or state.current_job == nil do
+      Logger.info("[Agent] #{state.name}: empty retry skipped (status=#{state.status})")
+      {:noreply, state}
+    else
+      Logger.info("[Agent] #{state.name}: firing empty retry")
+
+      parent = self()
+      message = job.message || ""
+
+      # Re-run the stream with the same context
+      task = Task.Supervisor.async_nolink(HiveWeave.TaskSupervisor, fn ->
+        HiveWeave.LLM.Streamer.stream(state, message, [], parent)
+      end)
+
+      timer_ref = Process.send_after(self(), :safety_timeout, 300_000)
+      {:noreply, %{state | llm_task: task, safety_timer: timer_ref}}
+    end
   end
 
   @impl true
@@ -518,8 +622,11 @@ defmodule HiveWeave.Agents.Agent do
     HiveWeave.EventAudit.log(state.id, :llm_fail, %{reason: inspect(reason)})
 
     if state.safety_timer, do: Process.cancel_timer(state.safety_timer)
-    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil}
+
+    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil, pending_inbox_msg_ids: nil}
     broadcast_status(state.project_id, state.id, :idle)
+
+    maybe_self_retrigger(state)
 
     {:noreply, new_state}
   end
@@ -540,8 +647,10 @@ defmodule HiveWeave.Agents.Agent do
       {:stream_event, %{type: "done", error: "timeout"}}
     )
 
-    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil}
+    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil, pending_inbox_msg_ids: nil}
     broadcast_status(state.project_id, state.id, :idle)
+
+    maybe_self_retrigger(state)
 
     {:noreply, new_state}
   end
@@ -561,7 +670,7 @@ defmodule HiveWeave.Agents.Agent do
     end
     if state.safety_timer, do: Process.cancel_timer(state.safety_timer)
 
-    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil}
+    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil, pending_inbox_msg_ids: nil}
     broadcast_status(state.project_id, state.id, :idle)
 
     {:noreply, new_state}
@@ -625,5 +734,33 @@ defmodule HiveWeave.Agents.Agent do
       "lobby:status",
       {:status_change, agent_id, status}
     )
+  end
+
+  # ── Helpers ──────────────────────────────────────────────
+
+  # Returns true if the given role is a coordinator-type agent that should
+  # use trigger_coordinator instead of trigger_subordinate.
+  defp coordinator?(role) when is_binary(role) do
+    String.downcase(role) in ["ceo", "coordinator", "hr"]
+  end
+  defp coordinator?(_), do: false
+
+  # Check if there are pending inbox messages or unanswered user messages,
+  # and if so, spawn a delayed self-retrigger. Used by normal completion,
+  # task crash, and safety timeout paths to ensure no message is lost.
+  defp maybe_self_retrigger(state) do
+    pending = HiveWeave.Services.Inbox.get_pending_messages(state.id)
+    has_unanswered_user_msgs = HiveWeave.Services.ChatMessage.has_unanswered_user_messages?(state.id)
+
+    if pending != [] or has_unanswered_user_msgs do
+      spawn(fn ->
+        Process.sleep(500)
+        if coordinator?(state.role) do
+          HiveWeave.Agents.Agent.trigger_coordinator(state.id)
+        else
+          HiveWeave.Agents.Agent.trigger_subordinate(state.id)
+        end
+      end)
+    end
   end
 end

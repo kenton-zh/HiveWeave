@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useAppStore } from "../store";
-import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead } from "../api";
+import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead, leaveAgentChannel } from "../api";
+import { mergeDeltaContent } from "../utils/mergeDelta";
 import ApprovalDialog from "./ApprovalDialog";
 import TodoBar from "./TodoBar";
 import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
@@ -32,10 +33,11 @@ interface ChatMessage {
   isContext?: boolean;
   teamFromAgentId?: string;
   teamToAgentId?: string;
+  _thinking?: string;
 }
 
 interface MsgSegment {
-  type: "text" | "tool_call";
+  type: "text" | "tool_call" | "thinking";
   content?: string;
   tool?: ToolCall;
 }
@@ -137,6 +139,7 @@ function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
     id: m.id,
     role: m.role,
     content: m.content,
+    _thinking: m.thinking || undefined,
     images: typeof m.images === "string" ? tryParseImages(m.images) : m.images,
     timestamp: m.createdAt ?? m.created_at ?? Date.now(),
     toolCalls: m.toolCalls ? tryParseToolCalls(m.toolCalls) : undefined,
@@ -250,14 +253,29 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
         // Interleaved: render text and tool calls in arrival order
         <div className="space-y-2">
           {segments.map((seg, i) => {
+            if (seg.type === "thinking" && seg.content) {
+              return (
+                <details key={i} className="group mb-2">
+                  <summary className="text-xs text-purple-300 cursor-pointer list-none flex items-center gap-1.5 select-none">
+                    <span className="text-[9px] text-gray-600 group-open:rotate-90 transition-transform">▶</span>
+                    <span>思考过程</span>
+                  </summary>
+                  <div className="mt-1 text-xs text-gray-400 bg-surface-alt/70 rounded px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed border-l-2 border-purple-500/20">
+                    {seg.content}
+                  </div>
+                </details>
+              );
+            }
             if (seg.type === "text") {
               return seg.content ? <p key={i} className="text-base whitespace-pre-wrap">{seg.content}</p> : null;
             }
             if (seg.type === "tool_call" && seg.tool) {
+              const hint = formatToolInputHint(seg.tool.tool, seg.tool.input);
               return (
-                <div key={i} className="text-xs text-gray-400 flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-accent/50 animate-pulse" />
-                  <span>调用 {seg.tool.tool}</span>
+                <div key={i} className="text-xs text-gray-400 flex items-center gap-1.5 font-mono">
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent/50 shrink-0" />
+                  <span className="text-gray-300">{seg.tool.tool}</span>
+                  {hint && <span className="text-gray-600 truncate">— {hint}</span>}
                 </div>
               );
             }
@@ -267,6 +285,17 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
       ) : (
         // Fallback: flat rendering
         <>
+          {(msg as any)._thinking && (
+            <details className="group mb-2">
+              <summary className="text-xs text-purple-300 cursor-pointer list-none flex items-center gap-1.5 select-none">
+                <span className="text-[9px] text-gray-600 group-open:rotate-90 transition-transform">▶</span>
+                <span>思考过程</span>
+              </summary>
+              <div className="mt-1 text-xs text-gray-400 bg-surface-alt/70 rounded px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed border-l-2 border-purple-500/20">
+                {(msg as any)._thinking}
+              </div>
+            </details>
+          )}
           {msg.content && (
             <p className="text-base whitespace-pre-wrap">{msg.content}</p>
           )}
@@ -320,11 +349,24 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   // Mirror streamDraft synchronously so event handlers (which close over an
   // older `streamDraft`) can read the latest value.
   const streamDraftRef = useRef<StreamDraft | null>(null);
+  // RAF throttle for streamDraft updates — without this, 72+ delta events
+  // arriving in ~280ms each trigger a separate setStreamDraft → React re-render,
+  // causing bursty "结巴" (stutter) display. RAF coalesces them to ≤60fps.
+  const rafPendingRef = useRef(false);
   const updateStreamDraft = useCallback(
     (updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)) => {
       const next = typeof updater === "function" ? updater(streamDraftRef.current) : updater;
       streamDraftRef.current = next;
-      setStreamDraft(next);
+      // Throttle React state update via RAF — the ref is updated synchronously
+      // so event handlers always see the latest value, but React only re-renders
+      // once per animation frame (≤16ms), coalescing rapid delta bursts.
+      if (!rafPendingRef.current) {
+        rafPendingRef.current = true;
+        requestAnimationFrame(() => {
+          rafPendingRef.current = false;
+          setStreamDraft(streamDraftRef.current);
+        });
+      }
     },
     []
   );
@@ -436,7 +478,9 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
 
     async function fetchAgent() {
       try {
-        const data = await getAgent(loadForAgentId);
+        const raw = await getAgent(loadForAgentId);
+        // Backend wraps response as %{agent: serialize_agent(a)}
+        const data = (raw && typeof raw === "object" && "agent" in raw && raw.agent) ? raw.agent : raw;
         if (cancelled || activeAgentIdRef.current !== loadForAgentId) return;
         if (data && typeof data === "object" && data.id) {
           setAgentInfo(data);
@@ -459,6 +503,9 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         clearTimeout(responseTimeoutRef.current);
         responseTimeoutRef.current = null;
       }
+      // Leave the persistent WebSocket channel for this agent to avoid
+      // accumulating PubSub subscriptions on the backend.
+      if (loadForAgentId) leaveAgentChannel(loadForAgentId);
     };
   }, [agentId, loadMessagesFromDb, orgTreeVersion]);
 
@@ -504,6 +551,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           return m.isStreaming ? { ...m, isStreaming: false } : m;
         }
         const textParts = streamDraft.segments.filter(s => s.type === "text").map(s => s.content || "");
+        const thinkingParts = streamDraft.segments.filter(s => s.type === "thinking").map(s => s.content || "");
         const newTools = streamDraft.segments.filter(s => s.type === "tool_call").map(s => s.tool!);
         return {
           ...m,
@@ -513,6 +561,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           // intermediate update, so merging would duplicate them.
           toolCalls: newTools.length > 0 ? newTools : (m.toolCalls || []),
           _segments: streamDraft.segments,
+          _thinking: thinkingParts.join(""),
           isStreaming: true,
         };
       });
@@ -628,16 +677,31 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const hasTeamComms = teamMessages.length > 0;
 
   useEffect(() => {
-    const idsToFetch: string[] = [];
-    for (const id of counterpartIds) {
-      if (!agentInfoCache[id]) idsToFetch.push(id);
+    // Pre-populate cache with current agent's info so self-referencing
+    // team messages (teamFromAgentId === agentId) resolve instantly.
+    if (agentInfo && agentId) {
+      setAgentInfoCache((prev) => {
+        if (prev[agentId]) return prev;
+        return { ...prev, [agentId]: { name: agentInfo.name, position: agentInfo.position, role: agentInfo.role } };
+      });
     }
-    if (idsToFetch.length === 0) return;
-    for (const id of idsToFetch) {
-      getAgent(id).then((data) => {
-        if (data?.name) setAgentInfoCache((prev) => ({ ...prev, [id]: { name: data.name, position: data.position, role: data.role } }));
-      }).catch(() => {});
-    }
+    // Use functional update to read latest cache state, avoiding stale closures
+    setAgentInfoCache((currentCache) => {
+      const idsToFetch: string[] = [];
+      for (const id of counterpartIds) {
+        if (!currentCache[id]) idsToFetch.push(id);
+      }
+      if (idsToFetch.length === 0) return currentCache;
+      for (const id of idsToFetch) {
+        getAgent(id).then((raw) => {
+          const data = (raw && typeof raw === "object" && "agent" in raw && raw.agent) ? raw.agent : raw;
+          if (data?.name) {
+            setAgentInfoCache((prev) => ({ ...prev, [id]: { name: data.name, position: data.position, role: data.role } }));
+          }
+        }).catch(() => {});
+      }
+      return currentCache;
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [counterpartIds, agentInfo]);
 
@@ -772,7 +836,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       // Ensure streamDraft is initialized before we get the first text chunk.
       // The backend may not push an assistant message_id (it never does in our
       // current pipeline), so we initialize lazily on the first text event.
-      if (event.type === "text" && !streamDraftRef.current) {
+      if ((event.type === "text" || event.type === "text_delta") && !streamDraftRef.current) {
         const placeholderId = `draft-${sendingForAgentId}-${Date.now()}`;
         setMessages((prev) => {
           if (prev.some((m) => m.id === placeholderId)) return prev;
@@ -783,7 +847,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         });
         updateStreamDraft({ assistantId: placeholderId, segments: [] });
         console.log(`[SSE] streamDraft lazy-initialized: assistantId=${placeholderId}`);
-      } else if (event.type === "text") {
+      } else if (event.type === "text" || event.type === "text_delta") {
         _dbgTextCount++;
         if (_dbgTextCount === 1) _dbgFirstText = performance.now();
         if (_dbgTextCount <= 3 || _dbgTextCount % 20 === 0) {
@@ -809,9 +873,36 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           if (!prev) return prev;
           const last = prev.segments[prev.segments.length - 1];
           if (last && last.type === "text") {
-            return { ...prev, segments: [...prev.segments.slice(0, -1), { ...last, content: (last.content || "") + event.data }] };
+            // Use mergeDeltaContent to handle APIs that send full accumulated
+            // text instead of incremental deltas (causes "结巴" duplication
+            // if we naively append).
+            return { ...prev, segments: [...prev.segments.slice(0, -1), { ...last, content: mergeDeltaContent(last.content || "", event.data) }] };
           }
           return { ...prev, segments: [...prev.segments, { type: "text", content: event.data }] };
+        });
+      } else if (event.type === "thinking_delta") {
+        // Reasoning model thinking content — display in collapsible block
+        if (!streamDraftRef.current) {
+          const placeholderId = `draft-${sendingForAgentId}-${Date.now()}`;
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === placeholderId)) return prev;
+            return [...prev, {
+              id: placeholderId, role: "assistant" as const, content: "",
+              timestamp: Date.now(), isBackground: false, isRead: true, isStreaming: true,
+            }];
+          });
+          updateStreamDraft({ assistantId: placeholderId, segments: [{ type: "thinking", content: event.data }] });
+          return;
+        }
+        updateStreamDraft((prev) => {
+          if (!prev) return prev;
+          const last = prev.segments[prev.segments.length - 1];
+          if (last && last.type === "thinking") {
+            // Use mergeDeltaContent for thinking deltas too — same reasoning
+            // as text_delta: some APIs send full accumulated text per chunk.
+            return { ...prev, segments: [...prev.segments.slice(0, -1), { ...last, content: mergeDeltaContent(last.content || "", event.data) }] };
+          }
+          return { ...prev, segments: [...prev.segments, { type: "thinking", content: event.data }] };
         });
       } else if (event.type === "tool_use") {
         try {
@@ -950,7 +1041,15 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const runtimeStatusInfo = agentInfo?.status === "active"
     ? isAgentProcessing ? { text: "工作中", color: "text-emerald-400" } : { text: "空闲", color: "text-gray-400" }
     : statusInfo;
-  const resolveAgentInfo = (id: string) => agentInfoCache[id] || { name: id === "system" ? "系统通知" : "加载中…" };
+  const resolveAgentInfo = (id: string) => {
+    // Check cache first
+    if (agentInfoCache[id]) return agentInfoCache[id];
+    // Fallback to current agent's info if the ID matches (we're viewing their panel)
+    if (agentInfo && id === agentId) return { name: agentInfo.name, position: agentInfo.position, role: agentInfo.role };
+    // System messages
+    if (id === "system") return { name: "系统通知" };
+    return { name: "加载中…" };
+  };
 
   // Role colors matching OrgTree
   const roleDots: Record<string, string> = {
@@ -1031,14 +1130,17 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           {teamCommsExpanded && (
             <div className="max-h-[35vh] overflow-y-auto overflow-x-hidden py-1">
               {[...teamMessages].sort((a, b) => b.timestamp - a.timestamp).map((msg) => {
-                // Background user messages (agent-to-agent trigger context) have
-                // role="user" but are NOT from the human operator. Distinguish:
-                // - isBackground=true + role="user" → trigger context from another agent
-                // - isBackground=false + role="user" → real human operator message
+                // Determine direction:
+                // 1. Real user message (role=user, !isBackground) → incoming (operator → agent)
+                // 2. Background user message (role=user, isBackground) → incoming (other agent triggered current)
+                // 3. Background assistant message (role=assistant, isBackground) → outgoing (current agent replied)
+                // 4. Explicit team message (role=team) → check teamFromAgentId / teamToAgentId
                 const isUserMsg = msg.role === "user" && !msg.isBackground;
-                const isIncoming = isUserMsg || msg.teamToAgentId === agentId;
+                const isBgIncoming = msg.isBackground && msg.role === "user";
+                const isBgOutgoing = msg.isBackground && msg.role === "assistant";
+                const isIncoming = isUserMsg || isBgIncoming || (!isBgOutgoing && msg.teamToAgentId === agentId);
                 const counterpartId = isIncoming
-                  ? (msg.teamFromAgentId ?? null)
+                  ? (msg.teamFromAgentId ?? (isBgIncoming ? getDirectedAgentId(msg, agentInfo?.parentId) : null))
                   : (msg.teamToAgentId || getDirectedAgentId(msg, agentInfo?.parentId));
                 const info = isIncoming
                   ? (isUserMsg
@@ -1074,14 +1176,16 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
                         <span className="text-xs text-accent font-medium shrink-0">未读</span>
                       )}
                     </div>
-                    <p className={"text-xs text-gray-500 " + (isExpanded ? "whitespace-pre-wrap break-all" : "truncate")}>{preview}</p>
+                    <p className={"text-xs text-gray-500 " + (isExpanded ? "whitespace-pre-wrap break-words" : "truncate")}>{preview}</p>
                     {isExpanded && msg.toolCalls && msg.toolCalls.length > 0 && (
                       <div className="mt-2 space-y-1">
-                        {msg.toolCalls.map((tc, i) => {
+                        {msg.toolCalls.filter((tc) => tc.tool).map((tc, i) => {
                           const cat = toolCategories[tc.tool] || { color: "text-gray-300", bg: "bg-gray-500/15", label: tc.tool };
+                          const hint = formatToolInputHint(tc.tool, tc.input);
                           return (
-                            <div key={i} className={"text-xs px-2 py-1 rounded " + cat.bg + " " + cat.color}>
-                              {cat.label}: {tc.tool}
+                            <div key={i} className={"text-xs px-2 py-1 rounded flex items-center gap-1.5 " + cat.bg + " " + cat.color}>
+                              <span>{cat.label}</span>
+                              {hint && <span className="text-gray-500 truncate">— {hint}</span>}
                             </div>
                           );
                         })}

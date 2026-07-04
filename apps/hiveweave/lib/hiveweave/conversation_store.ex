@@ -28,6 +28,16 @@ defmodule HiveWeave.ConversationStore do
   @compaction_trigger_ratio 0.85  # Compact when total > 85% of budget
   @doom_loop_threshold 3
 
+  # ── OpenCode-inspired constants ─────────────────────────────
+  # Turn-level trimming: keep last N complete turns intact (OpenCode: DEFAULT_TAIL_TURNS=2)
+  @tail_turns 4
+  # Tool output prune: protect recent tool outputs (OpenCode: PRUNE_PROTECT=40K tokens)
+  @prune_protect_tokens 40_000
+  # Minimum reclaimable tokens to bother pruning (OpenCode: PRUNE_MINIMUM=20K)
+  @prune_minimum_tokens 20_000
+  # Max chars per tool output when summarizing (OpenCode: TOOL_OUTPUT_MAX_CHARS=2000)
+  @tool_output_max_chars 2_000
+
   defstruct [:cache]
 
   # ── Client API ──────────────────────────────────────────────
@@ -238,20 +248,45 @@ defmodule HiveWeave.ConversationStore do
     if model == nil or model.base_url == "" do
       {:error, :no_model_available}
     else
-      # Build conversation text for summarization
+      # Build conversation text for summarization (with tool output truncation)
       conversation_text = format_messages_for_summary(old_messages)
 
+      # OpenCode-inspired structured summary template
       prompt = """
-      Summarize the following conversation history concisely. Preserve:
-      - Key decisions and their rationale
-      - Important facts learned about the codebase or project
-      - Task progress and current state
-      - Any unresolved issues or open questions
+      Create a concise anchored summary from the conversation history below.
 
-      Conversation to summarize:
+      ## Summary Format (preserve ALL sections)
+      ### Goal
+      (What is the user trying to accomplish?)
+
+      ### Constraints & Preferences
+      (Technical constraints, style preferences, requirements)
+
+      ### Progress
+      - **Done**: (Completed work)
+      - **In Progress**: (Current tasks)
+      - **Blocked**: (Blockers with reasons)
+
+      ### Key Decisions
+      (Important decisions and their rationale)
+
+      ### Next Steps
+      (What needs to happen next)
+
+      ### Critical Context
+      (Any other context the assistant needs to continue effectively)
+
+      ### Relevant Files
+      (Important file paths mentioned)
+
+      ## Rules
+      - Use concise bullet points
+      - Preserve exact file paths, commands, error strings
+      - Do NOT mention the summarization process itself
+      - Keep all sections even if empty (write "None" if applicable)
+
+      ## Conversation to summarize:
       #{conversation_text}
-
-      Summary:
       """
 
       body = %{
@@ -375,14 +410,27 @@ defmodule HiveWeave.ConversationStore do
       role = m["role"] || "unknown"
       content = safe_content(m["content"])
 
-      # Truncate very long content
-      truncated = if String.length(content) > 500 do
-        String.slice(content, 0, 500) <> "...[truncated]"
+      # Truncate very long content (OpenCode: TOOL_OUTPUT_MAX_CHARS=2000)
+      truncated = if String.length(content) > @tool_output_max_chars do
+        String.slice(content, 0, @tool_output_max_chars) <> "...[truncated #{String.length(content) - @tool_output_max_chars} chars]"
       else
         content
       end
 
-      "[#{role}]: #{truncated}"
+      # Include tool call info for assistant messages
+      tool_info = if Map.has_key?(m, "tool_calls") and is_list(m["tool_calls"]) do
+        tools = Enum.map(m["tool_calls"], fn tc ->
+          name = get_in(tc, ["function", "name"]) || "unknown"
+          args = get_in(tc, ["function", "arguments"]) || ""
+          args_short = if String.length(args) > 200, do: String.slice(args, 0, 200) <> "...", else: args
+          "  - #{name}(#{args_short})"
+        end) |> Enum.join("\n")
+        "\n[Tool calls:\n#{tools}]"
+      else
+        ""
+      end
+
+      "[#{role}]: #{truncated}#{tool_info}"
     end)
     |> Enum.join("\n\n")
   end
@@ -515,20 +563,116 @@ defmodule HiveWeave.ConversationStore do
   defp trim_to_budget(messages, nil), do: messages
 
   defp trim_to_budget(messages, budget) when is_integer(budget) and budget > 0 do
-    total = estimate_total_tokens(messages)
+    # Step 1: Prune old tool outputs (lightweight — OpenCode's prune() approach)
+    pruned = prune_tool_outputs(messages)
+    total = estimate_total_tokens(pruned)
 
     if total <= budget do
-      messages
+      pruned
     else
-      do_trim(messages, budget, total)
+      # Step 2: Turn-level trimming (OpenCode's select() approach)
+      do_trim_turns(pruned, budget, total)
     end
   end
 
   defp trim_to_budget(messages, _), do: messages
 
-  defp do_trim([], _budget, _total), do: []
+  # ── Tool output pruning (OpenCode prune() inspired) ──────────
+  # Clear old tool result contents beyond a protect window, keeping
+  # the message structure intact but replacing output with a placeholder.
+  # This is much cheaper than full compaction and preserves turn structure.
+  defp prune_tool_outputs(messages) do
+    # Walk backwards, protect recent tool outputs within @prune_protect_tokens
+    {to_prune, _protected_tokens} =
+      Enum.reduce(Enum.reverse(messages), {[], 0}, fn msg, {prune_list, protected_total} ->
+        if Map.has_key?(msg, "tool_call_id") do
+          tokens = estimate_message_tokens(msg)
+          new_protected = protected_total + tokens
+          if new_protected <= @prune_protect_tokens do
+            {prune_list, new_protected}
+          else
+            {[msg | prune_list], new_protected}
+          end
+        else
+          {prune_list, protected_total}
+        end
+      end)
 
-  defp do_trim(messages, budget, total) do
+    # Only prune if we can reclaim enough tokens
+    prune_tokens = Enum.reduce(to_prune, 0, fn m, acc -> acc + estimate_message_tokens(m) end)
+
+    if prune_tokens < @prune_minimum_tokens do
+      messages
+    else
+      prune_ids = MapSet.new(to_prune, & &1["tool_call_id"])
+      Enum.map(messages, fn msg ->
+        if Map.has_key?(msg, "tool_call_id") and MapSet.member?(prune_ids, msg["tool_call_id"]) do
+          %{msg | "content" => "[Old tool result content cleared]"}
+        else
+          msg
+        end
+      end)
+    end
+  end
+
+  # ── Turn-level trimming (OpenCode select() inspired) ──────────
+  # Split messages into turns (each turn starts at a user message).
+  # Keep the last @tail_turns complete turns intact.
+  # Drop older turns from the front until within budget.
+  defp do_trim_turns(messages, budget, total) do
+    turns = split_into_turns(messages)
+
+    if length(turns) <= @tail_turns do
+      # Can't split by turns — fall back to message-level trim
+      do_trim_messages(messages, budget, total)
+    else
+      {old_turns, recent_turns} = Enum.split(turns, max(0, length(turns) - @tail_turns))
+      recent_messages = List.flatten(recent_turns)
+      recent_tokens = estimate_total_tokens(recent_messages)
+
+      if recent_tokens > budget do
+        # Even recent turns exceed budget — trim within recent
+        do_trim_messages(recent_messages, budget, recent_tokens)
+      else
+        # Try to fit some older turns too
+        fitting_old = fit_old_turns(Enum.reverse(old_turns), budget - recent_tokens, [])
+        fitting_old ++ recent_messages
+      end
+    end
+  end
+
+  # Split messages into turns. A turn = [user_msg, assistant_msg, tool_results...]
+  # Turns start at each "user" role message.
+  defp split_into_turns(messages) do
+    Enum.reduce(messages, {[], []}, fn msg, {turns, current} ->
+      if msg["role"] == "user" and current != [] do
+        {turns ++ [current], [msg]}
+      else
+        {turns, current ++ [msg]}
+      end
+    end)
+    |> case do
+      {turns, []} -> turns
+      {turns, last} -> turns ++ [last]
+    end
+  end
+
+  defp fit_old_turns([], _remaining_budget, acc), do: Enum.reverse(acc) |> List.flatten()
+
+  defp fit_old_turns([turn | rest], remaining_budget, acc) do
+    turn_tokens = estimate_total_tokens(turn)
+    if turn_tokens <= remaining_budget do
+      fit_old_turns(rest, remaining_budget - turn_tokens, [turn | acc])
+    else
+      # This turn doesn't fit — stop, keep what we have
+      Enum.reverse(acc) |> List.flatten()
+    end
+  end
+
+  # Fallback: message-level trimming (original logic, preserves tool pairs)
+  defp do_trim_messages([], _budget, _total), do: []
+
+  defp do_trim_messages(messages, budget, total) do
     [first | rest] = messages
     first_tokens = estimate_message_tokens(first)
 
@@ -557,7 +701,7 @@ defmodule HiveWeave.ConversationStore do
     if new_total <= budget do
       remaining
     else
-      do_trim(remaining, budget, new_total)
+      do_trim_messages(remaining, budget, new_total)
     end
   end
 
