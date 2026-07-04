@@ -392,12 +392,27 @@ defmodule HiveWeave.LLM.Streamer do
   # ── Execute tools and continue loop (extracted from run_tool_loop) ──
 
   defp run_tool_loop_with_tools(agent, model, provider_name, tools, workspace_path, messages, combined_text, combined_thinking, parent, round_num, tool_history, tool_calls, new_text, reasoning, assistant_msg_id, tool_turn_acc \\ []) do
-    # Save accumulated text + thinking to DB so a page refresh doesn't lose it
+    # Accumulate tool calls for history (moved up so mid-stream save can include it)
+    new_tool_history = tool_history ++ Enum.map(tool_calls, fn tc ->
+      %{
+        "id" => tc.id,
+        "type" => "function",
+        "function" => %{
+          "name" => tc.name,
+          "arguments" => tc.arguments
+        }
+      }
+    end)
+
+    # Save accumulated text + thinking + tool_calls to DB so a page refresh
+    # (or a crash in a later round) doesn't lose what the agent already did.
+    # Without tool_calls here, a crash/empty exit leaves tool_calls="[]" forever.
     if assistant_msg_id && combined_text != "" do
       try do
         HiveWeave.Services.ChatMessage.update_message(agent.id, assistant_msg_id, %{
           content: combined_text,
           thinking: combined_thinking,
+          tool_calls: Jason.encode!(new_tool_history),
           is_streaming: true
         })
       rescue
@@ -480,17 +495,7 @@ defmodule HiveWeave.LLM.Streamer do
     # what was added in this round, independent of any trim.
     new_tool_turn_acc = tool_turn_acc ++ [assistant_msg | tool_results]
 
-    # Accumulate tool calls for history
-    new_tool_history = tool_history ++ Enum.map(tool_calls, fn tc ->
-      %{
-        "id" => tc.id,
-        "type" => "function",
-        "function" => %{
-          "name" => tc.name,
-          "arguments" => tc.arguments
-        }
-      }
-    end)
+    # (new_tool_history was computed above before the mid-stream save)
 
     # ── messagePoller: poll inbox at natural breakpoint (between tool turns) ──
     # Like TS createMessagePoller — check for new inbox messages that arrived
@@ -711,8 +716,18 @@ defmodule HiveWeave.LLM.Streamer do
         # LLM returned no text and no tool_calls (likely only reasoning_content).
         # agent.ex's handle_info({ref, result}) matches on a 3-tuple {:empty, ...}
         # to drive its retry-with-backoff logic, so we unwrap the 4-tuple here.
-        # Do NOT persist — there's no assistant message to save.
-        ChatMessage.update_message(agent.id, assistant_msg_id, %{is_streaming: false})
+        # Save tool_history so the user can see what the agent already did
+        # (mid-stream saves in run_tool_loop_with_tools also save tool_calls,
+        # but this ensures the final value is correct even if rounds were
+        # trimmed or the history was rebuilt).
+        tool_calls_json = case tool_history do
+          [] -> "[]"
+          _ -> Jason.encode!(tool_history)
+        end
+        ChatMessage.update_message(agent.id, assistant_msg_id, %{
+          is_streaming: false,
+          tool_calls: tool_calls_json
+        })
         broadcast_chunk(agent, %{type: "done", status: :empty, id: assistant_msg_id})
         send(parent, {:stream_done, %{status: :empty}})
         {:empty, tool_history, combined_thinking}
@@ -790,10 +805,9 @@ defmodule HiveWeave.LLM.Streamer do
         {:ok, :completed, display_text}
 
       {:error, reason} ->
-        # Just mark streaming as done. The placeholder may already have partial
-        # content from mid-stream updates (run_tool_loop_with_tools updates
-        # content during tool rounds). We don't have access to the accumulated
-        # text/tool_calls here, so we leave whatever was last written.
+        # Mark streaming as done. Mid-stream saves in run_tool_loop_with_tools
+        # already persisted content, thinking, and tool_calls from completed
+        # rounds — we leave those intact and just flip the streaming flag.
         ChatMessage.update_message(agent.id, assistant_msg_id, %{is_streaming: false})
 
         duration = System.monotonic_time(:millisecond) - start_time
