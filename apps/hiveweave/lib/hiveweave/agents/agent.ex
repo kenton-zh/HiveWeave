@@ -479,6 +479,7 @@ defmodule HiveWeave.Agents.Agent do
 
   @impl true
   def handle_info({ref, result}, %{llm_task: %Task{ref: ref}} = state) do
+    try do
     # LLM task completed successfully
     Process.demonitor(ref, [:flush])
     if state.safety_timer, do: Process.cancel_timer(state.safety_timer)
@@ -588,6 +589,11 @@ defmodule HiveWeave.Agents.Agent do
 
         {:noreply, new_state}
     end
+    rescue
+      e ->
+        Logger.error("[Agent] #{state.id} CRASHED in handle_info({ref,result}): #{inspect(e)}\n#{Exception.format_stacktrace(__STACKTRACE__)}")
+        crash_recover(state, e, __STACKTRACE__)
+    end
   end
 
   @impl true
@@ -615,6 +621,7 @@ defmodule HiveWeave.Agents.Agent do
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{llm_task: %Task{ref: ref}} = state) do
+    try do
     # LLM task crashed
     Logger.warning("Agent #{state.id} LLM task crashed: #{inspect(reason)}")
 
@@ -644,6 +651,11 @@ defmodule HiveWeave.Agents.Agent do
     broadcast_status(state.project_id, state.id, :idle)
 
     {:noreply, new_state}
+    rescue
+      e ->
+        Logger.error("[Agent] #{state.id} CRASHED in handle_info({:DOWN}): #{inspect(e)}\n#{Exception.format_stacktrace(__STACKTRACE__)}")
+        crash_recover(state, e, __STACKTRACE__)
+    end
   end
 
   # Catch-all for :DOWN messages from Tasks whose llm_task was already cleared
@@ -761,11 +773,67 @@ defmodule HiveWeave.Agents.Agent do
   @impl true
   def terminate(reason, state) do
     Logger.info("Agent #{state.id} terminating: #{inspect(reason)}")
+
+    # File-based crash logging — terminal buffer is flooded with GET requests
+    # and unreliable. Write to a dedicated file so we never lose crash reasons.
+    try do
+      log_dir = Path.join(System.tmp_dir!(), "hiveweave_logs")
+      File.mkdir_p(log_dir)
+      log_path = Path.join(log_dir, "agent_crashes.log")
+      timestamp = DateTime.utc_now() |> DateTime.to_iso8601()
+      stacktrace = case Process.info(self(), :current_stacktrace) do
+        {:current_stacktrace, traces} ->
+          traces
+          |> Enum.map(fn {mod, fun, arity_or_file, loc} ->
+            "  #{mod}.#{fun}/#{arity_or_file} #{inspect(loc)}"
+          end)
+          |> Enum.join("\n")
+        _ -> "  (no stacktrace available)"
+      end
+      entry = "[#{timestamp}] Agent #{state.id} (#{state.name}) project=#{state.project_id} status=#{state.status}\n  Reason: #{inspect(reason, limit: :infinity)}\n  Stacktrace:\n#{stacktrace}\n---\n"
+      File.write(log_path, entry, [:append, :utf8])
+    rescue
+      _ -> :ok
+    end
+
     HiveWeave.Telemetry.agent_crash(state.id, reason)
     :ok
   end
 
   # Private helpers
+
+  # Crash recovery: clean up state and reset to idle, preventing GenServer
+  # crashes from cascading to the supervisor tree.
+  defp crash_recover(state, exception, stacktrace) do
+    # Write to file-based crash log
+    try do
+      log_dir = Path.join(System.tmp_dir!(), "hiveweave_logs")
+      File.mkdir_p(log_dir)
+      log_path = Path.join(log_dir, "agent_crashes.log")
+      timestamp = DateTime.utc_now() |> DateTime.to_iso8601()
+      entry = "[#{timestamp}] Agent #{state.id} (#{state.name}) project=#{state.project_id} CRASH_RECOVER\n  Exception: #{inspect(exception, limit: :infinity)}\n  Stacktrace:\n#{Exception.format_stacktrace(stacktrace)}\n---\n"
+      File.write(log_path, entry, [:append, :utf8])
+    rescue
+      _ -> :ok
+    end
+
+    # Clean up
+    if state.safety_timer, do: Process.cancel_timer(state.safety_timer)
+    try do HiveWeave.Services.ChatMessage.update_streaming_messages_done(state.id) rescue _ -> :ok end
+    try do Phoenix.PubSub.broadcast(HiveWeave.PubSub, "agent:#{state.id}", {:stream_event, %{type: "done", error: "crashed"}}) rescue _ -> :ok end
+    try do broadcast_status(state.project_id, state.id, :idle) rescue _ -> :ok end
+
+    new_state = %{state |
+      status: :idle,
+      llm_task: nil,
+      safety_timer: nil,
+      current_job: nil,
+      pending_inbox_msg_ids: nil,
+      empty_retry_count: 0,
+      last_heartbeat: System.system_time(:millisecond)
+    }
+    {:noreply, new_state}
+  end
 
   defp extract_tokens(result) do
     case result do
