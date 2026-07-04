@@ -646,6 +646,16 @@ defmodule HiveWeave.Agents.Agent do
     {:noreply, new_state}
   end
 
+  # Catch-all for :DOWN messages from Tasks whose llm_task was already cleared
+  # (e.g. by :force_reset or :safety_timeout). Without this, the :DOWN message
+  # would be silently dropped by the catch-all handler at the bottom, and we'd
+  # lose the crash reason. Log it so we can trace what happened.
+  @impl true
+  def handle_info({:DOWN, _ref, :process, _pid, reason}, state) do
+    Logger.info("Agent #{state.id} received :DOWN for unknown task (reason: #{inspect(reason)}). Likely cleared by force_reset/safety_timeout.")
+    {:noreply, state}
+  end
+
   @impl true
   def handle_info(:safety_timeout, %{status: :processing} = state) do
     Logger.warning("Agent #{state.id} safety timeout - force resetting to idle")
@@ -700,7 +710,27 @@ defmodule HiveWeave.Agents.Agent do
     end
     if state.safety_timer, do: Process.cancel_timer(state.safety_timer)
 
-    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil, pending_inbox_msg_ids: nil}
+    # Clean up zombie streaming messages so frontend stops showing "typing..."
+    HiveWeave.Services.ChatMessage.update_streaming_messages_done(state.id)
+
+    # Broadcast done event so frontend stops the streaming indicator
+    Phoenix.PubSub.broadcast(
+      HiveWeave.PubSub,
+      "agent:#{state.id}",
+      {:stream_event, %{type: "done", error: "reset"}}
+    )
+
+    # Record the reset event for debugging
+    HiveWeave.EventAudit.log(state.id, :force_reset, %{})
+
+    # Mark triggering inbox messages as read to prevent retrigger loops
+    if state.pending_inbox_msg_ids not in [nil, []] do
+      HiveWeave.Services.Inbox.mark_read_by_ids(state.id, state.pending_inbox_msg_ids)
+    end
+
+    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil,
+                         pending_inbox_msg_ids: nil, empty_retry_count: 0,
+                         last_heartbeat: System.system_time(:millisecond)}
     broadcast_status(state.project_id, state.id, :idle)
 
     {:noreply, new_state}
