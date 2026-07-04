@@ -31,6 +31,11 @@ defmodule HiveWeave.LLM.Streamer do
   # Like TS TURN_IDLE_MS — deliberately > bash tool timeout (120s) so legitimate
   # long commands aren't killed. If no chunks arrive for this duration, abort.
   @stream_idle_ms 300_000
+  # Default text broadcast when LLM returns tool_calls without any text.
+  # Gives the user a visual cue that the agent is working.
+  # IMPORTANT: this text must NOT be counted as "real" LLM output — if the
+  # LLM never produces actual text, we return :empty to trigger a retry.
+  @default_placeholder "好的，开始处理。\n"
   # Per-role tool round limits. CEO needs many rounds to analyze code +
   # write charter + message HR + coordinate. Executors need even more
   # for multi-file edits + testing + debugging.
@@ -315,33 +320,47 @@ defmodule HiveWeave.LLM.Streamer do
               Logger.warning("[Streamer] Round #{round_num}: finish_reason=#{finish_reason}, tool_calls may be incomplete — discarding")
 
               # Discard potentially incomplete tool_calls, append a warning to text
+              # Strip the placeholder prefix — it's not real LLM output
+              real_text = String.replace_leading(combined_text, @default_placeholder, "")
               warning = "\n\n⚠️ Response was truncated (#{finish_reason}). Some tool calls may be incomplete."
-              final_msg = %{"role" => "assistant", "content" => combined_text <> warning}
-              {:ok, combined_text <> warning, tool_history, combined_thinking, tool_turn_acc ++ [final_msg]}
+              final_msg = %{"role" => "assistant", "content" => real_text <> warning}
+              {:ok, real_text <> warning, tool_history, combined_thinking, tool_turn_acc ++ [final_msg]}
 
             finish_reason == "length" ->
               Logger.warning("[Streamer] Round #{round_num}: finish_reason=length, output was truncated (max_tokens too small?)")
-              final_msg = %{"role" => "assistant", "content" => combined_text <> "\n\n⚠️ 回复被截断（达到最大输出长度），请继续以完成。"}
-              {:ok, combined_text <> "\n\n⚠️ 回复被截断（达到最大输出长度），请继续以完成。", tool_history, combined_thinking, tool_turn_acc ++ [final_msg]}
+              real_text = String.replace_leading(combined_text, @default_placeholder, "")
+              warning = "\n\n⚠️ 回复被截断（达到最大输出长度），请继续以完成。"
+              final_msg = %{"role" => "assistant", "content" => real_text <> warning}
+              {:ok, real_text <> warning, tool_history, combined_thinking, tool_turn_acc ++ [final_msg]}
 
             finish_reason == "content_filter" ->
               Logger.warning("[Streamer] Round #{round_num}: finish_reason=content_filter, content was filtered")
-              final_msg = %{"role" => "assistant", "content" => combined_text <> "\n\n⚠️ 回复被内容过滤器截断。"}
-              {:ok, combined_text <> "\n\n⚠️ 回复被内容过滤器截断。", tool_history, combined_thinking, tool_turn_acc ++ [final_msg]}
+              real_text = String.replace_leading(combined_text, @default_placeholder, "")
+              warning = "\n\n⚠️ 回复被内容过滤器截断。"
+              final_msg = %{"role" => "assistant", "content" => real_text <> warning}
+              {:ok, real_text <> warning, tool_history, combined_thinking, tool_turn_acc ++ [final_msg]}
 
             tool_calls != [] ->
               # Execute tools and loop
               Logger.info("[Streamer] Round #{round_num}: #{length(tool_calls)} tool_calls to execute")
 
               # If no text has been produced at all (across all rounds), broadcast a
-              # default message so the user sees something in the chat window instead of
-              # silence. We check combined_text (which includes text_acc from prior rounds)
-              # rather than just new_text, to avoid repeating the default on every tool-loop
-              # round that happens to return tool_calls without text.
+              # default placeholder so the user sees something in the chat window
+              # instead of silence. We check combined_text (which includes text_acc
+              # from prior rounds) rather than just new_text, to avoid repeating
+              # the default on every tool-loop round that happens to return
+              # tool_calls without text.
+              #
+              # The placeholder is broadcast as a text_delta but is also added to
+              # combined_text so that:
+              #   1. It's not re-broadcast on subsequent rounds
+              #   2. The mid-stream DB save includes it (so refreshes show something)
+              # BUT: in the `true` branch below, we check if combined_text is ONLY
+              # the placeholder — if so, we return :empty to trigger a retry,
+              # because the LLM never produced real output.
               if combined_text == "" do
-                default_msg = "好的，开始处理。\n"
-                broadcast_chunk(agent, %{type: "text_delta", content: default_msg, delta_id: "default_#{round_num}"})
-                combined_text = default_msg
+                broadcast_chunk(agent, %{type: "text_delta", content: @default_placeholder, delta_id: "default_#{round_num}"})
+                combined_text = @default_placeholder
                 # Continue with updated combined_text
                 run_tool_loop_with_tools(agent, model, provider_name, tools, workspace_path, messages, combined_text, combined_thinking, parent, round_num, tool_history, tool_calls, new_text, reasoning, assistant_msg_id, tool_turn_acc)
               else
@@ -352,14 +371,25 @@ defmodule HiveWeave.LLM.Streamer do
               # No tool calls — we're done
               Logger.info("[Streamer] Round #{round_num}: done, no more tool_calls, total text=#{String.length(combined_text)} chars")
 
-              # Handle empty response: LLM returned neither text nor tool_calls
-              if combined_text == "" do
-                # Return special :empty marker so the agent can schedule a retry
-                Logger.warning("[Streamer] Round #{round_num}: empty response (no text, no tool_calls)")
+              # Check if the LLM actually produced any real text.
+              # combined_text might be @default_placeholder (broadcast when the
+              # first tool round had no text) even though the LLM never produced
+              # actual content. In that case, return :empty to trigger the
+              # agent's retry-with-backoff mechanism — otherwise the user sees
+              # only "好的，开始处理。" and the agent goes idle with no retry.
+              #
+              # If there IS real text, strip the placeholder prefix so it
+              # doesn't appear in the final saved content or conversation history.
+              has_real_text = combined_text != "" and combined_text != @default_placeholder
+
+              if not has_real_text do
+                Logger.warning("[Streamer] Round #{round_num}: empty response (no real text produced, only placeholder or truly empty)")
                 {:empty, tool_history, combined_thinking, tool_turn_acc}
               else
-                final_msg = %{"role" => "assistant", "content" => combined_text}
-                {:ok, combined_text, tool_history, combined_thinking, tool_turn_acc ++ [final_msg]}
+                # Strip the placeholder prefix — it's a UI hint, not LLM output.
+                final_text = String.replace_leading(combined_text, @default_placeholder, "")
+                final_msg = %{"role" => "assistant", "content" => final_text}
+                {:ok, final_text, tool_history, combined_thinking, tool_turn_acc ++ [final_msg]}
               end
           end
 
@@ -713,20 +743,36 @@ defmodule HiveWeave.LLM.Streamer do
   defp finalize_stream(agent, result, assistant_msg_id, user_message, start_time, parent, model, provider_name, opts) do
     case result do
       {:empty, tool_history, combined_thinking, _tool_turn_acc} ->
-        # LLM returned no text and no tool_calls (likely only reasoning_content).
-        # agent.ex's handle_info({ref, result}) matches on a 3-tuple {:empty, ...}
-        # to drive its retry-with-backoff logic, so we unwrap the 4-tuple here.
-        # Save tool_history so the user can see what the agent already did
-        # (mid-stream saves in run_tool_loop_with_tools also save tool_calls,
-        # but this ensures the final value is correct even if rounds were
-        # trimmed or the history was rebuilt).
+        # LLM returned no real text (either truly empty, or only the
+        # @default_placeholder was broadcast). agent.ex's handle_info({ref, result})
+        # matches on a 3-tuple {:empty, ...} to drive its retry-with-backoff
+        # logic, so we unwrap the 4-tuple here.
+        #
+        # Save tool_history so the user can see what the agent already did.
+        # Also update the content: if the mid-stream save left the placeholder
+        # "好的，开始处理。", replace it with a tool summary so the user knows
+        # what the agent actually did before the empty response.
         tool_calls_json = case tool_history do
           [] -> "[]"
           _ -> Jason.encode!(tool_history)
         end
+
+        # Show a meaningful summary instead of the placeholder
+        display_text = case tool_history do
+          [] ->
+            # No tools were called — truly empty response
+            ""
+          tools ->
+            tool_names = tools
+              |> Enum.map(fn tc -> get_in(tc, ["function", "name"]) end)
+              |> Enum.uniq()
+            "🔧 已执行: #{Enum.join(tool_names, ", ")}（正在重试…）"
+        end
+
         ChatMessage.update_message(agent.id, assistant_msg_id, %{
           is_streaming: false,
-          tool_calls: tool_calls_json
+          tool_calls: tool_calls_json,
+          content: display_text
         })
         broadcast_chunk(agent, %{type: "done", status: :empty, id: assistant_msg_id})
         send(parent, {:stream_done, %{status: :empty}})
