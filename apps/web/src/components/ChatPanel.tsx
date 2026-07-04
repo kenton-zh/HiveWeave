@@ -167,7 +167,8 @@ function isInjectedContext(msg: ChatMessage): boolean {
 }
 
 
-function formatToolInputHint(tool: string, input: Record<string, any>): string | null {
+function formatToolInputHint(tool: string, input: Record<string, any> | undefined | null): string | null {
+  if (!input || typeof input !== "object") return null;
   const pick = (...keys: string[]) => {
     for (const k of keys) {
       const v = input[k];
