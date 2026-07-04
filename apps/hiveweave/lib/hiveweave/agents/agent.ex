@@ -623,10 +623,25 @@ defmodule HiveWeave.Agents.Agent do
 
     if state.safety_timer, do: Process.cancel_timer(state.safety_timer)
 
-    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil, pending_inbox_msg_ids: nil}
-    broadcast_status(state.project_id, state.id, :idle)
+    # Clean up zombie streaming messages so frontend stops showing "typing..."
+    HiveWeave.Services.ChatMessage.update_streaming_messages_done(state.id)
 
-    maybe_self_retrigger(state)
+    # Broadcast done event so frontend stops the streaming indicator
+    Phoenix.PubSub.broadcast(
+      HiveWeave.PubSub,
+      "agent:#{state.id}",
+      {:stream_event, %{type: "done", error: "crashed"}}
+    )
+
+    # Mark triggering inbox messages as read to prevent infinite retrigger loop
+    if state.pending_inbox_msg_ids not in [nil, []] do
+      HiveWeave.Services.Inbox.mark_read_by_ids(state.id, state.pending_inbox_msg_ids)
+    end
+
+    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil,
+                         pending_inbox_msg_ids: nil, empty_retry_count: 0,
+                         last_heartbeat: System.system_time(:millisecond)}
+    broadcast_status(state.project_id, state.id, :idle)
 
     {:noreply, new_state}
   end
@@ -640,17 +655,32 @@ defmodule HiveWeave.Agents.Agent do
       Task.Supervisor.terminate_child(HiveWeave.TaskSupervisor, state.llm_task.pid)
     end
 
-    # Mark streaming messages as done
+    # Mark streaming messages as done so the frontend stops showing "typing..."
+    # Also update the DB record so is_streaming=false (otherwise the message
+    # stays as "streaming" forever and never gets finalized).
+    HiveWeave.Services.ChatMessage.update_streaming_messages_done(state.id)
+
     Phoenix.PubSub.broadcast(
       HiveWeave.PubSub,
       "agent:#{state.id}",
       {:stream_event, %{type: "done", error: "timeout"}}
     )
 
-    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil, pending_inbox_msg_ids: nil}
-    broadcast_status(state.project_id, state.id, :idle)
+    # Record the timeout event for debugging
+    HiveWeave.EventAudit.log(state.id, :safety_timeout, %{
+      message: state.current_job && state.current_job.message |> String.slice(0, 100)
+    })
 
-    maybe_self_retrigger(state)
+    # Mark the inbox messages that triggered this run as read — otherwise
+    # self-retrigger would pick them up and re-trigger → infinite timeout loop.
+    if state.pending_inbox_msg_ids not in [nil, []] do
+      HiveWeave.Services.Inbox.mark_read_by_ids(state.id, state.pending_inbox_msg_ids)
+    end
+
+    new_state = %{state | status: :idle, llm_task: nil, safety_timer: nil, current_job: nil,
+                         pending_inbox_msg_ids: nil, empty_retry_count: 0,
+                         last_heartbeat: System.system_time(:millisecond)}
+    broadcast_status(state.project_id, state.id, :idle)
 
     {:noreply, new_state}
   end

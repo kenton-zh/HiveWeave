@@ -52,6 +52,21 @@ defmodule HiveWeave.Services.ChatMessage do
     e -> {:error, e}
   end
 
+  @doc """
+  Mark all streaming messages for an agent as done (is_streaming = false).
+  Called by safety_timeout and :DOWN handlers to prevent zombie messages
+  that stay in "streaming" state forever after a crash/timeout.
+  """
+  def update_streaming_messages_done(agent_id) do
+    ProjectFactory.query_for_agent(
+      agent_id,
+      "UPDATE chat_messages SET is_streaming = 0 WHERE agent_id = ? AND is_streaming = 1",
+      [agent_id]
+    )
+  rescue
+    e -> {:error, e}
+  end
+
   defp to_int(v, _) when is_integer(v), do: v
   defp to_int(v, _) when is_boolean(v), do: if(v, do: 1, else: 0)
   defp to_int(nil, default), do: if(default, do: 1, else: 0)
