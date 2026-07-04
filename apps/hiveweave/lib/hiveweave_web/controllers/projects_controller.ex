@@ -616,14 +616,15 @@ defmodule HiveWeaveWeb.ProjectsController do
 
   def game_time(conn, %{"id" => project_id}) do
     seconds = HiveWeave.GameTime.Server.get_current_time(project_id)
-    # Format game time as "Day N HH:MM" (REAL_SECONDS_PER_GAME_DAY = 3600)
+    # Format game time as "Day N HH:MM"
+    # seconds is game_seconds (0..86400 per game day), independent of real-time speed.
     {day, time_in_day} = if seconds > 0 do
-      {div(seconds, 3600) + 1, rem(seconds, 3600)}
+      {div(seconds, 86400) + 1, rem(seconds, 86400)}
     else
       {1, 0}
     end
-    # 3600 real seconds = 1 game day (24h), so 1 game hour = 150s, 1 game minute = 2.5s
-    total_minutes = div(time_in_day * 24 * 60, 3600)
+    # Convert game seconds within the day to hours:minutes
+    total_minutes = div(time_in_day, 60)
     hours = div(total_minutes, 60)
     mins = rem(total_minutes, 60)
     formatted = "Day #{day} #{String.pad_leading(Integer.to_string(hours), 2, "0")}:#{String.pad_leading(Integer.to_string(mins), 2, "0")}"
