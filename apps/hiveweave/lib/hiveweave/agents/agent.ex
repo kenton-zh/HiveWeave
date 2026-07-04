@@ -431,8 +431,11 @@ defmodule HiveWeave.Agents.Agent do
         HiveWeave.LLM.Streamer.stream(state, message, opts, parent)
       end)
 
-      # Safety timeout: reset to idle after 5 minutes if task doesn't complete
-      timer_ref = Process.send_after(self(), :safety_timeout, 300_000)
+      # Safety timeout: reset to idle after 10 minutes if task doesn't complete.
+      # Was 5 min, but multi-round tool execution (each bash can take 120s) can
+      # legitimately exceed 5 min. 10 min gives headroom without letting truly
+      # stuck agents run forever.
+      timer_ref = Process.send_after(self(), :safety_timeout, 600_000)
 
       new_state = %{state |
         status: :processing,
@@ -608,17 +611,25 @@ defmodule HiveWeave.Agents.Agent do
 
       parent = self()
       message = job.message || ""
-      # Pass the original opts so the retry preserves trigger/background context
-      # and from_agent_id. Without this, triggered retries would create foreground
-      # messages and pollute ConversationStore.
+      # Inject a system hint on retry so the LLM changes behavior.
+      # Without this, the same input produces the same output (tool_calls with
+      # no text) → infinite empty retry loop.
       opts = Map.get(job, :opts, [])
+      retry_count = state.empty_retry_count
+
+      message = if retry_count >= 1 do
+        hint = "\n\n[系统提示] 上一轮你只调用了工具没有输出文字。请先用一句话说明你正在做什么，再继续调用工具。"
+        message <> hint
+      else
+        message
+      end
 
       # Re-run the stream with the same context
       task = Task.Supervisor.async_nolink(HiveWeave.TaskSupervisor, fn ->
         HiveWeave.LLM.Streamer.stream(state, message, opts, parent)
       end)
 
-      timer_ref = Process.send_after(self(), :safety_timeout, 300_000)
+      timer_ref = Process.send_after(self(), :safety_timeout, 600_000)
       {:noreply, %{state | llm_task: task, safety_timer: timer_ref}}
     end
   end

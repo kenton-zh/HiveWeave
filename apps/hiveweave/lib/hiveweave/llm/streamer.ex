@@ -422,6 +422,23 @@ defmodule HiveWeave.LLM.Streamer do
   # ── Execute tools and continue loop (extracted from run_tool_loop) ──
 
   defp run_tool_loop_with_tools(agent, model, provider_name, tools, workspace_path, messages, combined_text, combined_thinking, parent, round_num, tool_history, tool_calls, new_text, reasoning, assistant_msg_id, tool_turn_acc \\ []) do
+    # Cap tool_calls per round to prevent runaway execution time.
+    # LLM sometimes returns 10-15 tool_calls in a single round; executing all
+    # of them (even in parallel, each with 120s timeout) can blow past the
+    # safety_timeout. Cap at 5 — the rest can be picked up in subsequent rounds
+    # if the LLM still wants them.
+    max_tools_per_round = 5
+    {tool_calls, truncated} =
+      if length(tool_calls) > max_tools_per_round do
+        {Enum.take(tool_calls, max_tools_per_round), length(tool_calls) - max_tools_per_round}
+      else
+        {tool_calls, 0}
+      end
+
+    if truncated > 0 do
+      Logger.warning("[Streamer] Round #{round_num}: LLM returned #{length(tool_calls) + truncated} tool_calls, truncating to #{max_tools_per_round} (dropped #{truncated})")
+    end
+
     # Accumulate tool calls for history (moved up so mid-stream save can include it)
     new_tool_history = tool_history ++ Enum.map(tool_calls, fn tc ->
       %{
