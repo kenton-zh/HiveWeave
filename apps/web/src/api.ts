@@ -17,7 +17,7 @@ import { Socket, Channel } from "phoenix";
 // ---------------------------------------------------------------------------
 
 const SOCKET_URL =
-  (import.meta.env?.VITE_WS_URL as string | undefined) ||
+  (import.meta.env.VITE_WS_URL as string | undefined) ||
   (typeof window !== "undefined" && window.location.hostname === "localhost"
     ? "ws://localhost:4000/socket"
     : "/socket");
@@ -80,6 +80,16 @@ async function fetchJSON<T = any>(url: string, init?: RequestInit): Promise<T> {
 // ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
+
+export interface Project {
+  id: string;
+  name: string;
+  workspacePath?: string | null;
+  description?: string | null;
+  orgParadigm?: string | null;
+  language?: string | null;
+  createdAt: number;
+}
 
 export interface KeyResult {
   text: string;
@@ -168,7 +178,7 @@ export async function deleteAgent(id: string) {
 // ---------------------------------------------------------------------------
 
 export interface ChatEvent {
-  type: "text" | "text_delta" | "thinking_delta" | "tool_use" | "tool_result" | "message_id" | "error" | "done" | "busy";
+  type: "text" | "text_delta" | "thinking_delta" | "tool_use" | "tool_result" | "message_id" | "error" | "done" | "busy" | "approval_request" | "retry" | "queued_message";
   data: string;
   deltaId?: string;
 }
@@ -181,34 +191,22 @@ export function streamChat(
 ): { abort: () => void } {
   const socket = getSocket();
 
-  // Reset the delta sequence counter for this agent — new message starts
-  // a fresh stream, so seq numbers from the backend start from 1 again.
   if (!(globalThis as any).__hw_lastSeq) (globalThis as any).__hw_lastSeq = {};
   (globalThis as any).__hw_lastSeq[agentId] = 0;
-
-  // Swap the event handler to the latest caller's closure
   _agentHandlers.set(agentId, onEvent);
 
   let channel = _agentChannels.get(agentId);
 
   if (channel && channel.state === "joined") {
-    // Reuse existing joined channel — just push a new chat message.
-    // This avoids re-joining which would cause the backend to call
-    // Phoenix.PubSub.subscribe again (duplicate event delivery).
     channel.push("chat", { message, images: images?.length ? images : undefined });
   } else {
-    // First time or channel was closed — create, wire up, and join
     if (channel) {
-      // Clean up stale closed/error channel
       try { channel.leave(); } catch {}
       _agentChannels.delete(agentId);
     }
 
     channel = socket.channel(`agent:${agentId}`);
     _agentChannels.set(agentId, channel);
-
-    // All handlers forward to the CURRENT _agentHandlers entry for this agent,
-    // so the latest handleSend closure always receives events.
 
     channel.on("init", () => { /* initial state payload — no-op */ });
 
@@ -224,16 +222,10 @@ export function streamChat(
       if (typeof payload === "object" && payload.delta) {
         const deltaId = payload.deltaId || "";
         const seq = payload.seq;
-        // Deduplicate by monotonically increasing seq number.
-        // The backend assigns seq to each delta (1, 2, 3, ...).
-        // If two WebSocket connections deliver the same delta, only the
-        // first (with matching seq) is processed; subsequent duplicates
-        // are silently dropped. This is the definitive fix for the AABB
-        // "结巴" (stutter) pattern.
         if (typeof seq === "number") {
           const lastSeq = (globalThis as any).__hw_lastSeq ?? {};
           const last = lastSeq[agentId] ?? 0;
-          if (seq <= last) return; // Already processed — skip
+          if (seq <= last) return;
           lastSeq[agentId] = seq;
           (globalThis as any).__hw_lastSeq = lastSeq;
         }
@@ -264,8 +256,6 @@ export function streamChat(
     channel.on("done", () => {
       const handler = _agentHandlers.get(agentId);
       handler?.({ type: "done", data: "" });
-      // Do NOT clear _agentChannels or leave the channel here.
-      // The channel stays joined so the next message just pushes "chat".
     });
 
     channel.on("error", (payload: any) => {
@@ -283,7 +273,6 @@ export function streamChat(
 
   return {
     abort: () => {
-      // Cancel the current LLM task but keep the channel joined for reuse
       channel?.push("cancel", {});
       _agentHandlers.delete(agentId);
     },
@@ -335,15 +324,15 @@ export function subscribeAgentStatus(
   const socket = getSocket();
   const channel = socket.channel("lobby:status");
 
-  channel.on("init", (payload) => {
+  channel.on("init", (payload: Record<string, unknown>) => {
     if (Array.isArray(payload.agentIds)) {
-      onSnapshot(payload.agentIds, payload.paused ?? false);
+      onSnapshot(payload.agentIds, (payload.paused as boolean | undefined) ?? false);
     }
   });
 
-  channel.on("status_change", (payload) => {
+  channel.on("status_change", (payload: Record<string, unknown>) => {
     if (typeof payload.agentId === "string") {
-      onStatus(payload.agentId, !!payload.processing);
+      onStatus(payload.agentId, !!(payload.processing as boolean | undefined));
     }
   });
 
@@ -351,19 +340,19 @@ export function subscribeAgentStatus(
     onOrgChanged?.();
   });
 
-  channel.on("activity", (payload) => {
+  channel.on("activity", (payload: Record<string, unknown>) => {
     if (onActivity && typeof payload.agentId === "string") {
       onActivity({
-        agentId: payload.agentId,
-        agentName: payload.agentName || "",
-        type: payload.type || "",
-        content: payload.content,
-        deltaId: payload.deltaId,
-        toolName: payload.toolName,
-        toolInput: payload.toolInput,
-        toolResult: payload.toolResult,
-        errorMessage: payload.errorMessage,
-        timestamp: payload.timestamp || Date.now(),
+        agentId: payload.agentId as string,
+        agentName: (payload.agentName as string | undefined) || "",
+        type: (payload.type as string | undefined) || "",
+        content: payload.content as string | undefined,
+        deltaId: payload.deltaId as string | undefined,
+        toolName: payload.toolName as string | undefined,
+        toolInput: payload.toolInput as string | object | undefined,
+        toolResult: payload.toolResult as string | object | undefined,
+        errorMessage: payload.errorMessage as string | undefined,
+        timestamp: (payload.timestamp as number | undefined) || Date.now(),
       });
     }
   });
@@ -700,15 +689,16 @@ export async function sendCommunication(payload: {
 // ---------------------------------------------------------------------------
 
 export interface UserPing {
-  id: string;
-  agentId: string;
+  id?: string;
+  agentId?: string;
   agentName?: string;
-  type: string;
-  content: string;
+  type?: string;
+  content?: string;
   toolName?: string;
   toolInput?: string;
-  timestamp: number;
-  read: boolean;
+  timestamp?: number;
+  read?: boolean;
+  agentIds?: string[];
 }
 
 export async function getUserPings(opts?: { unreadOnly?: boolean; limit?: number }): Promise<UserPing[]> {

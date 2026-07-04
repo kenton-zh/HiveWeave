@@ -106,11 +106,11 @@ const statusLabels: Record<string, { text: string; color: string }> = {
 
 
 function isTeamChannelMessage(msg: ChatMessage): boolean {
-  // Team channel includes explicit team messages AND background user/assistant
-  // messages (agent-to-agent triggers). Exclude isContext messages — those are
-  // system-injected trigger contexts, not real agent-to-agent dialogue.
   if (msg.isContext) return false;
-  return msg.role === "team" || (msg.isBackground && (msg.role === "user" || msg.role === "assistant"));
+  return (
+    msg.role === "team" ||
+    (msg.isBackground && (msg.role === "user" || msg.role === "assistant"))
+  ) as boolean;
 }
 
 function tryParseToolCalls(raw: string): ToolCall[] {
@@ -822,8 +822,9 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     const allToolsUsed = new Set<string>();
     let _dbgTextCount = 0;
     let _dbgFirstText = 0;
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = streamChat(sendingForAgentId, messageText, sendingImages, (event) => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    streamChat(sendingForAgentId, messageText, sendingImages, (event) => {
       if (!isActiveSession()) return;
       if (event.type === "message_id") {
         try {
@@ -939,8 +940,6 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           allToolsUsed.add(toolCall.tool);
           updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "tool_call", tool: toolCall }] } : prev);
         } catch {}
-      } else if (event.type === "tool_result") {
-        setPendingApprovalTool(null);
       } else if (event.type === "approval_request") {
         try {
           const data = JSON.parse(event.data);
@@ -957,7 +956,6 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
             maxRetries: data.maxRetries || 3,
             reason: data.reason || "API error",
           });
-          // Extend response timeout to accommodate retry backoff (delay + 10s buffer)
           if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
           const extraMs = (data.delayMs || 5000) + 10000;
           responseTimeoutRef.current = setTimeout(() => {

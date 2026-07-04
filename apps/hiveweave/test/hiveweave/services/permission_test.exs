@@ -26,7 +26,7 @@ defmodule HiveWeave.Services.PermissionTest do
 
     test "denies bash in readonly mode", ctx do
       agent = Map.put(ctx.agent, :permission_type, "readonly")
-      assert Permission.evaluate(agent, "bash") == :ask
+      assert Permission.evaluate(agent, "bash") == :deny
     end
   end
 
