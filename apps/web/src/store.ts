@@ -1,18 +1,12 @@
 import { create } from "zustand";
 import { mergeDeltaContent } from "./utils/mergeDelta";
+import type { Project } from "./api";
 
 interface ActiveCommunication {
   id: string;
   fromAgentId: string;
   toAgentId: string;
   type: "dispatch" | "message" | "trigger" | "peer";
-  createdAt: number;
-}
-
-interface Project {
-  id: string;
-  name: string;
-  workspacePath: string | null;
   createdAt: number;
 }
 

@@ -13,7 +13,8 @@ import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import QuestionDialog from "./components/QuestionDialog";
 import NewProjectDialog from "./components/NewProjectDialog";
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings, type Project } from "./api";
+import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings } from "./api";
+import type { Project } from "./api";
 
 function App() {
   const selectedAgentId = useAppStore((s) => s.selectedAgentId);
