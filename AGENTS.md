@@ -151,7 +151,7 @@ CEO is auto-created per project. HR is under CEO. Expert agents (`test_engineer`
 
 ## Game time
 
-`REAL_SECONDS_PER_GAME_DAY = 900` (15 real min per game day) — `packages/shared/src/game-time.ts:2`. Agents schedule alarms at game-time offsets; server's `runGameTimeTick` (5s) fires due ones. Stalled agents (15+ min inactivity) escalate to superiors.
+`REAL_SECONDS_PER_GAME_DAY = 3600` (1 real hour per game day) — `packages/shared/src/game-time.ts:2` and `apps/hiveweave/lib/hiveweave/game_time/server.ex:17`. Game seconds use 86400 per day (standard 24h decomposition). Agents schedule alarms at game-time offsets; server's tick (5s) fires due ones. Stalled agents (15+ min inactivity) escalate to superiors.
 
 ## Frontend
 

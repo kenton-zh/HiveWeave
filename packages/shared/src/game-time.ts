@@ -1,5 +1,5 @@
 /** Real-world seconds that equal one project (game) day. */
-export const REAL_SECONDS_PER_GAME_DAY = 900; // 15 minutes
+export const REAL_SECONDS_PER_GAME_DAY = 3600; // 1 hour
 
 /** Seconds in one project day. */
 export const GAME_SECONDS_PER_DAY = 86_400;
