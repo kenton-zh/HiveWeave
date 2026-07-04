@@ -2,7 +2,7 @@ defmodule HiveWeave.GameTime.Server do
   @moduledoc """
   Per-project simulated game time with DB-persisted alarms.
 
-  - 15 real minutes per game day (REAL_SECONDS_PER_GAME_DAY = 900)
+  - 1 real hour per game day (REAL_SECONDS_PER_GAME_DAY = 3600)
   - 5-second tick broadcasts time and fires due alarms
   - Alarms persisted to scheduled_alarms table in per-project DB
   - On init, loads all unfired alarms from DB so they survive restarts
@@ -14,7 +14,7 @@ defmodule HiveWeave.GameTime.Server do
 
   require Logger
 
-  @real_seconds_per_game_day 900
+  @real_seconds_per_game_day 3600
   @tick_interval_ms 5_000
   @stall_check_interval_ticks 12  # 12 * 5s = 60s
   @stall_processing_threshold_ms 5 * 60 * 1000   # 5 min processing = stalled
@@ -298,7 +298,7 @@ defmodule HiveWeave.GameTime.Server do
   # ── Game-time persistence ───────────────────────────────────
   # The simulated clock is derived from real_started_at, so to survive
   # restarts we persist current_game_seconds and back-calculate
-  # real_started_at on init: game_seconds = (now - real_started_at) * 86400 / 900.
+  # real_started_at on init: game_seconds = (now - real_started_at) * 86400 / 3600.
 
   defp load_game_time_from_db(project_id) do
     sql = "SELECT game_seconds FROM game_time_state WHERE id = ? LIMIT 1"
