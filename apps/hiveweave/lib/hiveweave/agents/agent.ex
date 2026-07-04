@@ -438,7 +438,7 @@ defmodule HiveWeave.Agents.Agent do
         status: :processing,
         llm_task: task,
         safety_timer: timer_ref,
-        current_job: %{message: message, started_at: System.system_time(:millisecond)},
+        current_job: %{message: message, opts: opts, started_at: System.system_time(:millisecond)},
         pending_inbox_msg_ids: Keyword.get(opts, :inbox_msg_ids)
       }
 
@@ -608,10 +608,14 @@ defmodule HiveWeave.Agents.Agent do
 
       parent = self()
       message = job.message || ""
+      # Pass the original opts so the retry preserves trigger/background context
+      # and from_agent_id. Without this, triggered retries would create foreground
+      # messages and pollute ConversationStore.
+      opts = Map.get(job, :opts, [])
 
       # Re-run the stream with the same context
       task = Task.Supervisor.async_nolink(HiveWeave.TaskSupervisor, fn ->
-        HiveWeave.LLM.Streamer.stream(state, message, [], parent)
+        HiveWeave.LLM.Streamer.stream(state, message, opts, parent)
       end)
 
       timer_ref = Process.send_after(self(), :safety_timeout, 300_000)
