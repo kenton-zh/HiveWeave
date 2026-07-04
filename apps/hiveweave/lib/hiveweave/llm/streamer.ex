@@ -64,6 +64,13 @@ defmodule HiveWeave.LLM.Streamer do
     ensure_context_cache()
     agent = reload_agent(agent)
 
+    # Clear the injected-inbox tracking set at the start of each stream.
+    # This runs in the Task process (the same process that poll_and_inject_inbox
+    # runs in), so the Process dict is correctly scoped here.
+    # NOTE: agent.ex's Process.delete calls were no-ops because they ran in the
+    # GenServer process, not this Task process.
+    Process.delete(:hw_injected_inbox_ids)
+
     # Model-switch compaction check before resolving model
     old_ctx = get_cached_context_window(agent.id)
     model = resolve_model(agent)
@@ -484,43 +491,59 @@ defmodule HiveWeave.LLM.Streamer do
       if pending == [] do
         messages
       else
-        # Split by priority first — only mark injected messages as read.
-        # Low-priority messages stay unread so they appear in the next trigger context.
-        {urgent, normal, low} = split_by_priority(pending)
+        # Skip messages already injected in this stream to avoid duplicate injection.
+        # We use a Process-level MapSet (not mark_read) so that self-retrigger
+        # in handle_info({ref, result}) can still detect these messages via
+        # get_pending_messages and fire a proper trigger after the LLM finishes.
+        injected_set = Process.get(:hw_injected_inbox_ids) || MapSet.new()
+        pending = Enum.reject(pending, &MapSet.member?(injected_set, &1.id))
 
-        # Only mark urgent + normal as read — low stays unread for next trigger
-        injected_ids = Enum.map(urgent ++ normal, & &1.id)
-        if injected_ids != [], do: HiveWeave.Services.Inbox.mark_read_by_ids(agent.id, injected_ids)
-
-        # Resolve sender names — cached per-stream (agents rarely change mid-stream)
-        agents_map = Process.get(:hw_agents_map) || cache_agents_map(agent.project_id)
-
-        # Broadcast queued_message event to frontend
-        total = length(urgent) + length(normal) + length(low)
-        if total > 0 do
-          Logger.info("[Streamer] messagePoller: #{total} messages (urgent=#{length(urgent)} normal=#{length(normal)} low=#{length(low)})")
-          broadcast_chunk(agent, %{type: "queued_message", count: total, urgent: length(urgent), normal: length(normal), low: length(low)})
-        end
-
-        # Low priority: don't inject — left unread for next trigger context
-
-        # Normal priority: inject with "continue current task" guidance
-        messages = if normal != [] do
-          queue_text = format_normal_messages(normal, agents_map)
-          messages ++ [%{"role" => "user", "content" => queue_text}]
+        if pending == [] do
+          messages
         else
+          # Split by priority first.
+          # DO NOT mark injected messages as read here — that would make
+          # get_pending_messages return [] in the self-retrigger check after
+          # LLM completion, causing the agent to miss messages that arrived
+          # mid-stream (e.g. sub-ordinate replies). Instead, we track them
+          # in the Process dictionary and let build_trigger_context handle
+          # the formal mark_read after a successful LLM response.
+          {urgent, normal, low} = split_by_priority(pending)
+
+          # Track injected IDs to prevent re-injection in subsequent tool rounds
+          new_ids = Enum.map(urgent ++ normal ++ low, & &1.id)
+          Process.put(:hw_injected_inbox_ids, MapSet.union(injected_set, MapSet.new(new_ids)))
+
+          # Resolve sender names — cached per-stream (agents rarely change mid-stream)
+          agents_map = Process.get(:hw_agents_map) || cache_agents_map(agent.project_id)
+
+          # Broadcast queued_message event to frontend
+          total = length(urgent) + length(normal) + length(low)
+          if total > 0 do
+            Logger.info("[Streamer] messagePoller: #{total} messages (urgent=#{length(urgent)} normal=#{length(normal)} low=#{length(low)})")
+            broadcast_chunk(agent, %{type: "queued_message", count: total, urgent: length(urgent), normal: length(normal), low: length(low)})
+          end
+
+          # Low priority: don't inject — left unread for next trigger context
+
+          # Normal priority: inject with "continue current task" guidance
+          messages = if normal != [] do
+            queue_text = format_normal_messages(normal, agents_map)
+            messages ++ [%{"role" => "user", "content" => queue_text}]
+          else
+            messages
+          end
+
+          # Urgent priority: task switch — save progress, handle, resume
+          messages = if urgent != [] do
+            urgent_text = format_urgent_messages(urgent, agents_map)
+            messages ++ [%{"role" => "user", "content" => urgent_text}]
+          else
+            messages
+          end
+
           messages
         end
-
-        # Urgent priority: task switch — save progress, handle, resume
-        messages = if urgent != [] do
-          urgent_text = format_urgent_messages(urgent, agents_map)
-          messages ++ [%{"role" => "user", "content" => urgent_text}]
-        else
-          messages
-        end
-
-        messages
       end
     rescue
       e ->

@@ -20,6 +20,7 @@ defmodule HiveWeaveWeb.Router do
     get "/projects/:id", ProjectsController, :show
     patch "/projects/:id", ProjectsController, :update
     put "/projects/:id", ProjectsController, :update
+    put "/projects/:id/workspace", ProjectsController, :update_workspace
     delete "/projects/:id", ProjectsController, :delete
     get "/projects/:id/game-time", ProjectsController, :game_time
     get "/projects/:id/goals", ProjectsController, :goals
@@ -29,21 +30,26 @@ defmodule HiveWeaveWeb.Router do
     get "/org", OrgController, :tree
     get "/org/agents", OrgController, :list_agents
     get "/org/agents/:id", OrgController, :show_agent
+    get "/org/agents/:id/children", OrgController, :children
     post "/org/agents", OrgController, :create_agent
     patch "/org/agents/:id", OrgController, :update_agent
     put "/org/agents/:id", OrgController, :update_agent
     delete "/org/agents/:id", OrgController, :delete_agent
+    get "/org/modules", OrgController, :list_modules
 
     # Chat
     post "/chat", ChatController, :send
     get "/chat/history/:agentId", ChatController, :history
     get "/chat/messages/:agentId", ExtraController, :chat_messages
+    get "/chat/unread/:agentId", ChatController, :unread
     post "/chat/mark-read", ChatController, :mark_read
     get "/chat/inbox/:agentId", ChatController, :inbox
     post "/chat/inbox", ChatController, :send_inbox
     post "/chat/pause", ChatController, :pause
     post "/chat/resume", ChatController, :resume
     get "/chat/paused", ChatController, :paused
+    post "/chat/reset-processing/:agentId", ChatController, :reset_processing
+    get "/chat/resolved-model/:agentId", ChatController, :resolved_model
     get "/chat/todos/:agentId", ExtraController, :chat_todos
     post "/chat/todos/:agentId", ExtraController, :chat_todos_write
     get "/chat/questions", ExtraController, :chat_questions_index
@@ -86,6 +92,10 @@ defmodule HiveWeaveWeb.Router do
 
     # Work Logs
     get "/logs/:agentId", ExtraController, :work_logs_index
+    get "/logs/:agentId/subordinates", ExtraController, :work_logs_subordinates
+
+    # Debug / Monitoring
+    get "/debug/agents/:agentId/traces", ExtraController, :debug_traces
 
     # Filesystem
     get "/fs/browse", ExtraController, :fs_browse

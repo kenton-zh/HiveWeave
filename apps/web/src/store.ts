@@ -43,8 +43,8 @@ interface AppState {
   setSelectedAgent: (id: string | null) => void;
   activeView: "tree" | "office";
   setActiveView: (view: "tree" | "office") => void;
-  rightPanelTab: "chat" | "agent" | "logs" | "goals";
-  setRightPanelTab: (tab: "chat" | "agent" | "logs" | "goals") => void;
+  rightPanelTab: "chat" | "agent" | "logs" | "goals" | "monitor";
+  setRightPanelTab: (tab: "chat" | "agent" | "logs" | "goals" | "monitor") => void;
   chatSessions: Record<string, ChatMessage[]>;
   addMessage: (agentId: string, msg: ChatMessage) => void;
   replaceMessage: (agentId: string, oldId: string, newMsg: ChatMessage) => void;

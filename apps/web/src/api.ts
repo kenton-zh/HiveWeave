@@ -23,20 +23,36 @@ const SOCKET_URL =
     : "/socket");
 
 let _socket: Socket | null = null;
-let _activeChannel: any = null; // Track the active agent channel to prevent duplicates
+
+// Persistent per-agent channels: one joined channel per agent, reused across
+// messages.  This prevents the backend's join/3 from calling
+// Phoenix.PubSub.subscribe multiple times (which would duplicate event delivery).
+// IMPORTANT: Store on globalThis to survive Vite HMR module reloads.
+// Without this, HMR resets these Maps to empty, causing streamChat to create
+// duplicate agent channels — each receiving the same stream_chunk events,
+// resulting in "结巴" (stutter/duplication) in the streaming display.
+const _agentChannels: Map<string, any> = (globalThis as any).__hw_agentChannels ?? new Map();
+(globalThis as any).__hw_agentChannels = _agentChannels;
+const _agentHandlers: Map<string, (event: ChatEvent) => void> = (globalThis as any).__hw_agentHandlers ?? new Map();
+(globalThis as any).__hw_agentHandlers = _agentHandlers;
 
 export function getSocket(): Socket {
-  if (!_socket) {
+  // Use globalThis to survive Vite HMR — without this, HMR resets _socket
+  // to null, creating a second WebSocket connection while the old one stays
+  // alive. Two sockets = two agent channels = duplicate stream_chunk events.
+  if (!(globalThis as any).__hw_socket) {
     const params: Record<string, string> = {};
     if (_apiKey) params.api_key = _apiKey;
-    _socket = new Socket(SOCKET_URL, {
+    const socket = new Socket(SOCKET_URL, {
       params,
       reconnectAfterMs: (tries: number) => [1000, 2000, 5000, 10000][tries - 1] ?? 10000,
       heartbeatIntervalMs: 30_000,
     });
-    _socket.connect();
+    socket.connect();
+    (globalThis as any).__hw_socket = socket;
+    _socket = socket;
   }
-  return _socket;
+  return (globalThis as any).__hw_socket as Socket;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +80,19 @@ async function fetchJSON<T = any>(url: string, init?: RequestInit): Promise<T> {
 // ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
+
+export interface KeyResult {
+  text: string;
+  status: "todo" | "doing" | "done";
+  owner?: string;
+}
+
+export interface GoalsData {
+  objective: string;
+  focus: string;
+  keyResults: KeyResult[];
+  userInvolvement?: string;
+}
 
 export async function getProjects(): Promise<Project[]> {
   const data = await fetchJSON<{ projects: Project[] }>(`${BASE}/projects`);
@@ -108,7 +137,10 @@ export async function getOrgTree(projectId?: string) {
 }
 
 export async function getAgent(id: string) {
-  return fetchJSON(`${BASE}/org/agents/${id}`);
+  const raw = await fetchJSON(`${BASE}/org/agents/${id}`);
+  // Unwrap the {agent: ...} envelope once at the API layer so callers
+  // don't need to repeat this logic. Backend always returns %{agent: serialize_agent(a)}.
+  return (raw && typeof raw === "object" && "agent" in raw && raw.agent) ? raw.agent : raw;
 }
 
 export async function createAgent(data: any) {
@@ -136,8 +168,9 @@ export async function deleteAgent(id: string) {
 // ---------------------------------------------------------------------------
 
 export interface ChatEvent {
-  type: "text" | "tool_use" | "tool_result" | "message_id" | "error" | "done" | "busy";
+  type: "text" | "text_delta" | "thinking_delta" | "tool_use" | "tool_result" | "message_id" | "error" | "done" | "busy";
   data: string;
+  deltaId?: string;
 }
 
 export function streamChat(
@@ -148,77 +181,129 @@ export function streamChat(
 ): { abort: () => void } {
   const socket = getSocket();
 
-  // Leave any previous active channel to prevent duplicate event delivery
-  if (_activeChannel) {
-    try { _activeChannel.leave(); } catch {}
-    _activeChannel = null;
-  }
+  // Reset the delta sequence counter for this agent — new message starts
+  // a fresh stream, so seq numbers from the backend start from 1 again.
+  if (!(globalThis as any).__hw_lastSeq) (globalThis as any).__hw_lastSeq = {};
+  (globalThis as any).__hw_lastSeq[agentId] = 0;
 
-  const channel = socket.channel(`agent:${agentId}`);
-  _activeChannel = channel;
+  // Swap the event handler to the latest caller's closure
+  _agentHandlers.set(agentId, onEvent);
 
-  // Translate phoenix.js events into the legacy SSE event shape
-  // so the existing ChatPanel.tsx business logic keeps working unchanged.
-  channel.on("init", (payload) => {
-    // No-op for now; payload could include initial state
-  });
+  let channel = _agentChannels.get(agentId);
 
-  channel.on("message_id", (payload) => {
-    onEvent({ type: "message_id", data: JSON.stringify(payload) });
-  });
-
-  channel.on("stream_chunk", (payload) => {
-    const text = typeof payload === "string" ? payload : payload.text || "";
-    if (typeof payload === "object" && payload.delta) {
-      // Real-time token delta — forward as "text" event so ChatPanel's
-      // existing incremental-append logic handles it.
-      const deltaId = payload.deltaId || "";
-      if (payload.reasoning) {
-        onEvent({ type: "thinking_delta", data: text, deltaId });
-      } else {
-        onEvent({ type: "text", data: text });
-      }
-    } else {
-      // Non-delta (full text or reasoning)
-      onEvent({ type: "text", data: text });
-    }
-  });
-
-  channel.on("stream_tool", (payload) => {
-    if (payload.type === "tool_use") {
-      onEvent({ type: "tool_use", data: JSON.stringify(payload) });
-    } else if (payload.type === "tool_result") {
-      onEvent({ type: "tool_result", data: JSON.stringify(payload) });
-    }
-  });
-
-  channel.on("status_change", (payload) => {
-    // Forward as "done"-like marker; ChatPanel mostly uses this to know activity ended
-  });
-
-  channel.on("done", () => {
-    onEvent({ type: "done", data: "" });
-    // Channel cleanup is handled by ChatPanel's abort; just clear the ref
-    if (_activeChannel === channel) _activeChannel = null;
-  });
-
-  channel.on("error", (payload) => {
-    onEvent({ type: "error", data: payload?.message || "Unknown error" });
-  });
-
-  channel.join().receive("ok", () => {
+  if (channel && channel.state === "joined") {
+    // Reuse existing joined channel — just push a new chat message.
+    // This avoids re-joining which would cause the backend to call
+    // Phoenix.PubSub.subscribe again (duplicate event delivery).
     channel.push("chat", { message, images: images?.length ? images : undefined });
-  }).receive("error", (resp) => {
-    onEvent({ type: "error", data: JSON.stringify(resp) });
-  });
+  } else {
+    // First time or channel was closed — create, wire up, and join
+    if (channel) {
+      // Clean up stale closed/error channel
+      try { channel.leave(); } catch {}
+      _agentChannels.delete(agentId);
+    }
+
+    channel = socket.channel(`agent:${agentId}`);
+    _agentChannels.set(agentId, channel);
+
+    // All handlers forward to the CURRENT _agentHandlers entry for this agent,
+    // so the latest handleSend closure always receives events.
+
+    channel.on("init", () => { /* initial state payload — no-op */ });
+
+    channel.on("message_id", (payload: any) => {
+      const handler = _agentHandlers.get(agentId);
+      handler?.({ type: "message_id", data: JSON.stringify(payload) });
+    });
+
+    channel.on("stream_chunk", (payload: any) => {
+      const handler = _agentHandlers.get(agentId);
+      if (!handler) return;
+      const text = typeof payload === "string" ? payload : payload.text || "";
+      if (typeof payload === "object" && payload.delta) {
+        const deltaId = payload.deltaId || "";
+        const seq = payload.seq;
+        // Deduplicate by monotonically increasing seq number.
+        // The backend assigns seq to each delta (1, 2, 3, ...).
+        // If two WebSocket connections deliver the same delta, only the
+        // first (with matching seq) is processed; subsequent duplicates
+        // are silently dropped. This is the definitive fix for the AABB
+        // "结巴" (stutter) pattern.
+        if (typeof seq === "number") {
+          const lastSeq = (globalThis as any).__hw_lastSeq ?? {};
+          const last = lastSeq[agentId] ?? 0;
+          if (seq <= last) return; // Already processed — skip
+          lastSeq[agentId] = seq;
+          (globalThis as any).__hw_lastSeq = lastSeq;
+        }
+        if (payload.reasoning) {
+          handler({ type: "thinking_delta", data: text, deltaId });
+        } else {
+          handler({ type: "text_delta", data: text, deltaId });
+        }
+      } else {
+        handler({ type: "text", data: text });
+      }
+    });
+
+    channel.on("stream_tool", (payload: any) => {
+      const handler = _agentHandlers.get(agentId);
+      if (!handler) return;
+      if (payload.type === "tool_use") {
+        handler({ type: "tool_use", data: JSON.stringify(payload) });
+      } else if (payload.type === "tool_result") {
+        handler({ type: "tool_result", data: JSON.stringify(payload) });
+      }
+    });
+
+    channel.on("status_change", () => {
+      // ChatPanel uses lobby:status for processing state; this is informational
+    });
+
+    channel.on("done", () => {
+      const handler = _agentHandlers.get(agentId);
+      handler?.({ type: "done", data: "" });
+      // Do NOT clear _agentChannels or leave the channel here.
+      // The channel stays joined so the next message just pushes "chat".
+    });
+
+    channel.on("error", (payload: any) => {
+      const handler = _agentHandlers.get(agentId);
+      handler?.({ type: "error", data: payload?.message || "Unknown error" });
+    });
+
+    channel.join().receive("ok", () => {
+      channel.push("chat", { message, images: images?.length ? images : undefined });
+    }).receive("error", (resp: any) => {
+      const handler = _agentHandlers.get(agentId);
+      handler?.({ type: "error", data: JSON.stringify(resp) });
+    });
+  }
 
   return {
     abort: () => {
-      channel.push("cancel", {});
-      channel.leave();
-      if (_activeChannel === channel) _activeChannel = null;
+      // Cancel the current LLM task but keep the channel joined for reuse
+      channel?.push("cancel", {});
+      _agentHandlers.delete(agentId);
     },
   };
+}
+
+/**
+ * Explicitly leave an agent's persistent channel. Call this when the agent
+ * is deleted or when you need to force a fresh channel on the next message.
+ */
+export function leaveAgentChannel(agentId: string) {
+  const channel = _agentChannels.get(agentId);
+  if (channel) {
+    // Push cancel before leaving so the backend stops the LLM stream
+    // instead of running it to completion (wastes tokens).
+    try { channel.push("cancel", {}); } catch {}
+    try { channel.leave(); } catch {}
+    _agentChannels.delete(agentId);
+  }
+  _agentHandlers.delete(agentId);
 }
 
 // ---------------------------------------------------------------------------
@@ -653,7 +738,7 @@ export interface ProjectAlarm {
   createdAt: number;
 }
 
-export async function getProjectAlarms(projectId: string, opts?: { includeFired?: boolean }): Promise<ProjectAlarm[]> {
+export async function getProjectAlarms(projectId: string, opts?: { includeFired?: boolean }): Promise<{ alarms: ProjectAlarm[]; currentGameSeconds: number; realTimestamp: number }> {
   const params = new URLSearchParams();
   if (opts?.includeFired) params.set("includeFired", "true");
   const qs = params.toString();
@@ -778,6 +863,36 @@ export async function browseDirectory(path?: string): Promise<BrowseResult> {
   if (path) params.set("path", path);
   const qs = params.toString();
   return fetchJSON(`${BASE}/fs/browse${qs ? "?" + qs : ""}`);
+}
+
+// ---------------------------------------------------------------------------
+// Debug / Monitoring — Agent LLM Traces
+// ---------------------------------------------------------------------------
+
+export interface TraceTurn {
+  id: string;
+  agent_id: string;
+  turn_index: number;
+  raw_messages: any[];
+  approx_tokens: number;
+  created_at: number;
+}
+
+export interface TraceEvent {
+  id: string;
+  agent_id: string;
+  event_type: string;
+  payload: Record<string, any>;
+  created_at: number;
+}
+
+export interface AgentTraces {
+  turns: TraceTurn[];
+  events: TraceEvent[];
+}
+
+export async function getAgentTraces(agentId: string): Promise<AgentTraces> {
+  return fetchJSON(`${BASE}/debug/agents/${agentId}/traces`);
 }
 
 

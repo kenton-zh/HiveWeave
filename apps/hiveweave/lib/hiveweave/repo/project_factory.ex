@@ -79,14 +79,33 @@ defmodule HiveWeave.Repo.ProjectFactory do
   end
 
   @doc """
+  Evict a project's DB pool and clear its agent cache entries.
+
+  Unlike stop_repo/1, this does NOT mark the project as 'deleting' — a new
+  pool can be created immediately on the next query (e.g. after a workspace
+  path change). Used by the workspace-update endpoint to release the old
+  SQLite file handle so the .hiveweave/ directory can be moved.
+  """
+  def evict(project_id) do
+    GenServer.call(__MODULE__, {:evict, project_id})
+  end
+
+  @doc """
   Execute a raw SQL query against a project's database.
   Automatically resolves the project_id from agent_id if needed.
   Returns {:ok, %{columns: [...], rows: [...], num_rows: N}} or {:error, reason}.
   """
   def query_for_agent(agent_id, sql, params \\ []) do
-    with {:ok, project_id} <- resolve_project(agent_id),
-         {:ok, pool} <- ensure_repo(project_id) do
-      run_query(pool, sql, params)
+    case resolve_project(agent_id) do
+      {:ok, project_id} ->
+        with_project_recovery(project_id, fn ->
+          with {:ok, pool} <- ensure_repo(project_id) do
+            run_query(pool, sql, params)
+          end
+        end)
+
+      {:error, _} = err ->
+        err
     end
   catch
     :exit, reason ->
@@ -98,9 +117,11 @@ defmodule HiveWeave.Repo.ProjectFactory do
   Execute a raw SQL query against a project's database by project_id.
   """
   def query(project_id, sql, params \\ []) do
-    with {:ok, pool} <- ensure_repo(project_id) do
-      run_query(pool, sql, params)
-    end
+    with_project_recovery(project_id, fn ->
+      with {:ok, pool} <- ensure_repo(project_id) do
+        run_query(pool, sql, params)
+      end
+    end)
   catch
     :exit, reason ->
       Logger.warning("[ProjectFactory] query exit for project #{project_id}: #{inspect(reason)}")
@@ -188,6 +209,34 @@ defmodule HiveWeave.Repo.ProjectFactory do
   end
 
   @impl true
+  def handle_call({:evict, project_id}, _from, state) do
+    # Untrack the pool WITHOUT marking as 'deleting' so a new pool can be
+    # created immediately on the next ensure_repo call.
+    {pool, new_pools} = Map.pop(state.pools, project_id)
+
+    # If there's a live pool, try to stop it gracefully to release the
+    # SQLite file handle. Best-effort — don't block the GenServer.
+    if pool && Process.alive?(pool) do
+      try do
+        GenServer.stop(pool, :normal, 3_000)
+      catch
+        :exit, reason ->
+          Logger.warning("[ProjectFactory] evict: graceful stop failed for #{project_id}: #{inspect(reason)}")
+          Process.exit(pool, :kill)
+      end
+    end
+
+    # Clear agent cache entries for this project so resolve_project
+    # re-reads from the Meta DB on next access.
+    new_agent_cache =
+      state.agent_cache
+      |> Enum.reject(fn {_agent_id, cached_project_id} -> cached_project_id == project_id end)
+      |> Map.new()
+
+    {:reply, :ok, %{state | pools: new_pools, agent_cache: new_agent_cache}}
+  end
+
+  @impl true
   def handle_call({:resolve_project, agent_id}, _from, state) do
     case Map.get(state.agent_cache, agent_id) do
       nil ->
@@ -207,8 +256,61 @@ defmodule HiveWeave.Repo.ProjectFactory do
 
   # ── Private helpers ────────────────────────────────────────
 
+  # Project-aware recovery: on a SQLite connection error, evict the cached
+  # pool for this project (so a broken connection is replaced with a fresh
+  # one) and retry the operation once.
+  defp with_project_recovery(project_id, fun) do
+    fun.()
+  rescue
+    e in [DBConnection.ConnectionError, Exqlite.Error] ->
+      Logger.warning(
+        "[ProjectFactory] SQLite error for project #{project_id}, evicting pool and retrying: #{inspect(e)}"
+      )
+
+      evict_pool(project_id)
+      fun.()
+  end
+
+  # Stop and untrack a project's DB pool, then clear the 'deleting' flag so
+  # ensure_repo/1 can open a fresh pool on the next call.
+  defp evict_pool(project_id) do
+    case stop_repo(project_id) do
+      {:ok, pool} when is_pid(pool) ->
+        GenServer.stop(pool, :normal, 5_000)
+
+      _ ->
+        :ok
+    end
+
+    clear_deleting(project_id)
+  catch
+    :exit, _ -> :ok
+  end
+
   defp open_project_db(project_id) do
-    case Meta.one(from p in Project, where: p.id == ^project_id, select: p.workspace_path) do
+    # Primary source: the projects table.
+    workspace_path =
+      Meta.one(from p in Project, where: p.id == ^project_id, select: p.workspace_path)
+
+    # Fallback: any agent in this project that carries a redundant workspace_path.
+    # This mirrors the TS agentRegistry lookup and is what makes persistence
+    # survive a projects-table wipe. See Application.recover_projects_from_agents/0
+    # for the boot-time repair that keeps the two stores consistent.
+    workspace_path =
+      case workspace_path do
+        nil ->
+          Meta.one(
+            from a in Agent,
+              where: a.project_id == ^project_id and not is_nil(a.workspace_path) and a.workspace_path != "",
+              select: a.workspace_path,
+              limit: 1
+          )
+
+        ws ->
+          ws
+      end
+
+    case workspace_path do
       nil ->
         {:error, :project_or_workspace_not_found}
 
@@ -284,6 +386,11 @@ defmodule HiveWeave.Repo.ProjectFactory do
         tool_call_id TEXT,
         is_streaming INTEGER DEFAULT 0,
         is_background INTEGER DEFAULT 0,
+        is_read INTEGER DEFAULT 1,
+        is_context INTEGER DEFAULT 0,
+        team_from_agent_id TEXT,
+        team_to_agent_id TEXT,
+        images TEXT,
         metadata TEXT,
         created_at INTEGER
       )
@@ -431,6 +538,25 @@ defmodule HiveWeave.Repo.ProjectFactory do
         created_at INTEGER,
         updated_at INTEGER
       )
+      """,
+      """
+      CREATE TABLE IF NOT EXISTS game_time_state (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        game_seconds INTEGER DEFAULT 0,
+        updated_at INTEGER
+      )
+      """,
+      """
+      CREATE TABLE IF NOT EXISTS modules (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        description TEXT,
+        created_at INTEGER,
+        updated_at INTEGER
+      )
       """
     ]
 
@@ -445,6 +571,14 @@ defmodule HiveWeave.Repo.ProjectFactory do
         # Migrate existing tables: add columns that may be missing
         # (TS version created tables without these; they were added via ALTER)
         migrate_project_tables(pool)
+        # Verify tables were created
+        case exec_sql(pool, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name", []) do
+          {:ok, _, %Exqlite.Result{rows: rows}} ->
+            table_names = Enum.map(rows, fn [n] -> n end)
+            Logger.info("[ProjectFactory] Tables in project DB: #{inspect(table_names)}")
+          _ ->
+            Logger.warning("[ProjectFactory] Failed to verify tables in project DB")
+        end
         :ok
       err ->
         err

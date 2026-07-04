@@ -19,6 +19,7 @@ defmodule HiveWeave.GameTime.Server do
   @stall_check_interval_ticks 12  # 12 * 5s = 60s
   @stall_processing_threshold_ms 5 * 60 * 1000   # 5 min processing = stalled
   @stall_idle_threshold_ms 10 * 60 * 1000        # 10 min idle no heartbeat = stalled
+  @stall_alert_cooldown_ms 10 * 60 * 1000        # 10 min cooldown between escalations per agent
 
   defstruct [
     :project_id,
@@ -68,10 +69,17 @@ defmodule HiveWeave.GameTime.Server do
       Logger.info("[GameTime] Loaded #{length(db_alarms)} pending alarm(s) from DB for project #{project_id}")
     end
 
+    # Restore persisted game time so the simulated clock survives restarts.
+    {persisted_seconds, real_started_at} = load_game_time_from_db(project_id)
+
+    if persisted_seconds > 0 do
+      Logger.info("[GameTime] Restored game time #{persisted_seconds}s for project #{project_id}")
+    end
+
     state = %__MODULE__{
       project_id: project_id,
-      current_game_seconds: 0,
-      real_started_at: System.system_time(:second),
+      current_game_seconds: persisted_seconds,
+      real_started_at: real_started_at,
       alarms: db_alarms,
       last_tick_at: System.system_time(:millisecond)
     }
@@ -105,6 +113,17 @@ defmodule HiveWeave.GameTime.Server do
     # Remove from memory
     new_alarms = Enum.reject(state.alarms, fn a -> a.id == alarm_id end)
     {:reply, :ok, %{state | alarms: new_alarms}}
+  end
+
+  @impl true
+  def handle_call(:persist, _from, state) do
+    # Persist the current game time to DB so it survives restarts.
+    # Called from Application.prep_stop/1 during graceful shutdown.
+    now = System.system_time(:second)
+    elapsed_real = now - state.real_started_at
+    current_seconds = div(elapsed_real * 86_400, @real_seconds_per_game_day)
+    persist_game_time(state.project_id, current_seconds)
+    {:reply, :ok, %{state | current_game_seconds: current_seconds}}
   end
 
   @impl true
@@ -150,6 +169,18 @@ defmodule HiveWeave.GameTime.Server do
 
     schedule_tick()
     {:noreply, new_state}
+  end
+
+  @impl true
+  def handle_info({:stalled_agents, stalled_list}, state) do
+    # Received from the spawned stall-checker. Running the escalation here
+    # (in the long-lived GenServer process) lets the per-agent cooldown be
+    # tracked via the process dictionary across successive checks.
+    Enum.each(stalled_list, fn {agent, reason} ->
+      escalate_stall(state.project_id, agent, reason)
+    end)
+
+    {:noreply, state}
   end
 
   defp schedule_tick do
@@ -264,22 +295,70 @@ defmodule HiveWeave.GameTime.Server do
     end
   end
 
+  # ── Game-time persistence ───────────────────────────────────
+  # The simulated clock is derived from real_started_at, so to survive
+  # restarts we persist current_game_seconds and back-calculate
+  # real_started_at on init: game_seconds = (now - real_started_at) * 86400 / 900.
+
+  defp load_game_time_from_db(project_id) do
+    sql = "SELECT game_seconds FROM game_time_state WHERE id = ? LIMIT 1"
+
+    case ProjectFactory.query(project_id, sql, ["singleton"]) do
+      {:ok, %{rows: [[seconds]]}} when is_integer(seconds) ->
+        now = System.system_time(:second)
+        real_started_at = now - div(seconds * @real_seconds_per_game_day, 86_400)
+        {seconds, real_started_at}
+
+      _ ->
+        {0, System.system_time(:second)}
+    end
+  rescue
+    _ -> {0, System.system_time(:second)}
+  end
+
+  defp persist_game_time(project_id, game_seconds) do
+    now_ms = System.system_time(:millisecond)
+    sql = "INSERT OR REPLACE INTO game_time_state (id, project_id, game_seconds, updated_at) VALUES (?, ?, ?, ?)"
+
+    case ProjectFactory.query(project_id, sql, ["singleton", project_id, game_seconds, now_ms]) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("[GameTime] Failed to persist game time: #{inspect(reason)}")
+        :ok
+    end
+  rescue
+    e ->
+      Logger.warning("[GameTime] persist_game_time exception: #{inspect(e)}")
+      :ok
+  end
+
   # ── Stall detection ────────────────────────────────────────
 
   defp check_stalled_agents(project_id) do
     agents = HiveWeave.Services.Org.list_agents(project_id)
     now_ms = System.system_time(:millisecond)
 
-    Enum.each(agents, fn agent ->
-      if agent.status == "active" do
-        case check_agent_liveness(project_id, agent.id, now_ms) do
-          {:stalled, reason} ->
-            escalate_stall(project_id, agent, reason)
-          :ok ->
-            :ok
+    stalled =
+      Enum.flat_map(agents, fn agent ->
+        if agent.status == "active" do
+          case check_agent_liveness(project_id, agent.id, now_ms) do
+            {:stalled, reason} -> [{agent, reason}]
+            :ok -> []
+          end
+        else
+          []
         end
-      end
-    end)
+      end)
+
+    # Hand the stalled agents to the GenServer so escalation respects the
+    # per-agent cooldown stored in the GenServer's process dictionary.
+    # (This function runs in a freshly spawned process per check, so its own
+    # process dictionary would not survive between checks.)
+    if stalled != [] do
+      send(name(project_id), {:stalled_agents, stalled})
+    end
   rescue
     e ->
       Logger.warning("[GameTime] Stall check failed for project #{project_id}: #{inspect(e)}")
@@ -317,6 +396,27 @@ defmodule HiveWeave.GameTime.Server do
   end
 
   defp escalate_stall(project_id, agent, reason) do
+    # Cooldown deduplication: skip sending escalation messages for an agent
+    # if we already escalated within the cooldown window. The timestamp is
+    # kept in this (GenServer) process's dictionary so it persists across
+    # the periodic stall checks. Within cooldown we only log, never send.
+    cooldown_key = {:stall_alert, agent.id}
+    now_ms = System.system_time(:millisecond)
+    last_sent = Process.get(cooldown_key)
+
+    if last_sent != nil and now_ms - last_sent < @stall_alert_cooldown_ms do
+      Logger.info(
+        "[GameTime] Stall escalation for agent #{agent.name} (#{agent.id}) skipped (cooldown): " <>
+          "last sent #{div(now_ms - last_sent, 1000)}s ago, " <>
+          "cooldown #{div(@stall_alert_cooldown_ms, 1000)}s. reason=#{reason}"
+      )
+    else
+      Process.put(cooldown_key, now_ms)
+      do_escalate_stall(project_id, agent, reason)
+    end
+  end
+
+  defp do_escalate_stall(project_id, agent, reason) do
     Logger.warning("[GameTime] Agent #{agent.name} (#{agent.id}) stalled: #{reason}")
 
     if agent.parent_id do

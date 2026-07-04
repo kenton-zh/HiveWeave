@@ -3,5 +3,16 @@
   "plugin": ["superpowers@git+https://github.com/obra/superpowers.git"],
   "skills": {
     "paths": [".opencode/skills-sources/agent-skills/skills"]
+  },
+  "mcp": {
+    "codegraph": {
+      "type": "local",
+      "command": [
+        "codegraph",
+        "serve",
+        "--mcp"
+      ],
+      "enabled": true
+    }
   }
 }

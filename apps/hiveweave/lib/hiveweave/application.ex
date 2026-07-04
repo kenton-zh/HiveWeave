@@ -21,10 +21,11 @@ defmodule HiveWeave.Application do
     # Create ApprovalService ETS table (owned by this process, persists)
     HiveWeave.Services.Approval.ensure_table()
 
-    # Global system state (paused, etc.) — ETS-backed for cross-process visibility
-    HiveWeave.Services.SystemState.start_link([])
-
     children = [
+      # Global system state (paused flag + hourly approval-cleanup timer).
+      # Started first so the ETS table exists before any child reads it.
+      HiveWeave.Services.SystemState,
+
       # Telemetry supervisor
       HiveWeave.Telemetry,
 
@@ -80,7 +81,7 @@ defmodule HiveWeave.Application do
 
   defp boot_existing_projects do
     import Ecto.Query
-    alias HiveWeave.Schema.Project
+    alias HiveWeave.Schema.{Project, Agent}
 
     # 0. Ensure projects table has language column (runtime migration)
     # SQLite does NOT support "ADD COLUMN IF NOT EXISTS" — check via PRAGMA first.
@@ -96,6 +97,33 @@ defmodule HiveWeave.Application do
       HiveWeave.Repo.Meta.query!("UPDATE projects SET language = 'zh' WHERE language IS NULL OR language = 'en'")
     rescue
       e -> Logger.warning("language column migration failed: #{inspect(e)}")
+    end
+
+    # 0b. Ensure agents table has workspace_path column (runtime migration).
+    # This is the durable equivalent of the TS in-memory agentRegistry — it lets
+    # ProjectFactory reopen per-project DBs even when the projects table is empty.
+    try do
+      {:ok, pragma} = Ecto.Adapters.SQL.query(HiveWeave.Repo.Meta, "PRAGMA table_info(agents)", [])
+      has_ws = Enum.any?(pragma.rows, fn row -> match?([_, "workspace_path" | _], row) end)
+
+      unless has_ws do
+        HiveWeave.Repo.Meta.query!("ALTER TABLE agents ADD COLUMN workspace_path TEXT")
+        Logger.info("[Boot] Added workspace_path column to agents table")
+      end
+    rescue
+      e -> Logger.warning("agents.workspace_path migration failed: #{inspect(e)}")
+    end
+
+    # 0c. Recover lost projects table rows from the agents table.
+    # If a project row was deleted but its agents still carry workspace_path,
+    # recreate the project row so the per-project DB can be reopened on restart.
+    # This is the single most important persistence guard: it makes the
+    # workspace_path on agents the source of truth for "where is this project's
+    # DB", so a projects-table wipe no longer orphans every conversation.
+    try do
+      recover_projects_from_agents()
+    rescue
+      e -> Logger.warning("recover_projects_from_agents failed: #{inspect(e)}")
     end
 
     # 1. Clear zombie streaming flags on startup
@@ -120,6 +148,15 @@ defmodule HiveWeave.Application do
           Logger.warning("boot_existing_projects: failed to list projects: #{inspect(e)}")
           []
       end
+
+    # 3. Migrate CEO/HR agents that don't have a flower name (花名).
+    #    Done before starting projects so spawned agent GenServers pick up
+    #    the new name. Mirrors the TS startup rename of legacy CEO/HR agents.
+    try do
+      migrate_flower_names(projects)
+    rescue
+      e -> Logger.warning("flower name migration failed: #{inspect(e)}")
+    end
 
     Enum.each(projects, fn p ->
       case HiveWeave.ProjectSupervisor.start_project(p.id, p.workspace_path) do
@@ -174,9 +211,168 @@ defmodule HiveWeave.Application do
     end)
   end
 
+  defp migrate_flower_names(projects) do
+    import Ecto.Query
+    alias HiveWeave.Schema.Agent
+
+    Enum.each(projects, fn p ->
+      agents =
+        try do
+          HiveWeave.Repo.Meta.all(
+            from a in Agent,
+              where: a.project_id == ^p.id and a.role in ["ceo", "hr", "CEO", "HR"]
+          )
+        rescue
+          _ -> []
+        end
+
+      Enum.each(agents, fn agent ->
+        unless HiveWeave.Names.is_flower_name?(agent.name) do
+          new_name = HiveWeave.Names.generate_flower_name()
+          Logger.info("Migrating agent #{agent.id} (#{agent.name} -> #{new_name})")
+
+          HiveWeave.Repo.Meta.update_all(
+            from(a in Agent, where: a.id == ^agent.id),
+            set: [name: new_name]
+          )
+        end
+      end)
+    end)
+  end
+
+  # Reconstruct missing projects rows from the agents table so per-project DBs
+  # can be reopened after a projects-table wipe. Also backfills workspace_path
+  # onto any agent row that is still missing it (legacy rows created before the
+  # column existed).
+  #
+  # Bidirectional repair:
+  #   • projects row missing  + agent has workspace_path → recreate projects row
+  #   • projects row present  + agent missing workspace_path → backfill agent
+  # This makes the two stores self-healing: as long as ONE of them still has the
+  # workspace_path, both end up consistent after boot.
+  defp recover_projects_from_agents do
+    import Ecto.Query
+    alias HiveWeave.Schema.{Project, Agent}
+    alias HiveWeave.Repo.Meta
+
+    now = System.system_time(:millisecond)
+
+    # All known project_ids from either table.
+    project_ids_from_projects =
+      Meta.all(from p in Project, select: p.id) |> Enum.reject(&is_nil/1)
+
+    project_ids_from_agents =
+      Meta.all(from a in Agent, where: not is_nil(a.project_id), select: a.project_id, distinct: true)
+
+    all_project_ids = Enum.uniq(project_ids_from_projects ++ project_ids_from_agents)
+
+    Enum.each(all_project_ids, fn project_id ->
+      projects_ws =
+        Meta.one(from p in Project, where: p.id == ^project_id, select: p.workspace_path)
+
+      agent_ws =
+        Meta.one(
+          from a in Agent,
+            where: a.project_id == ^project_id and not is_nil(a.workspace_path) and a.workspace_path != "",
+            select: a.workspace_path,
+            limit: 1
+        )
+
+      cond do
+        # Both present — make sure they agree; prefer the projects table value.
+        projects_ws && agent_ws && projects_ws == agent_ws ->
+          :ok
+
+        # Projects row missing but an agent knows the workspace_path → recreate.
+        is_nil(projects_ws) && agent_ws ->
+          Logger.info("[Boot] Recovering project #{project_id} from agents (ws=#{agent_ws})")
+
+          # insert_all bypasses changesets, so validate_required doesn't run.
+          # We provide name + created_at (the required fields) explicitly.
+          Meta.insert_all(
+            Project,
+            [
+              %{
+                id: project_id,
+                name: "Recovered Project",
+                workspace_path: agent_ws,
+                language: "zh",
+                created_at: now
+              }
+            ],
+            on_conflict: {:replace, [:workspace_path]},
+            conflict_target: :id
+          )
+
+        # Projects row exists but agents lack workspace_path → backfill agents.
+        projects_ws && is_nil(agent_ws) ->
+          Meta.update_all(
+            from(a in Agent, where: a.project_id == ^project_id and (is_nil(a.workspace_path) or a.workspace_path == "")),
+            set: [workspace_path: projects_ws]
+          )
+
+          Logger.info("[Boot] Backfilled workspace_path onto agents of project #{project_id}")
+
+        # Both present but disagree — trust the projects table, fix agents.
+        projects_ws && agent_ws && projects_ws != agent_ws ->
+          Meta.update_all(
+            from(a in Agent, where: a.project_id == ^project_id),
+            set: [workspace_path: projects_ws]
+          )
+
+          Logger.warning(
+            "[Boot] workspace_path mismatch for project #{project_id}: projects=#{projects_ws} agents=#{agent_ws} — trusted projects table"
+          )
+
+        # Neither has it — nothing we can recover automatically.
+        true ->
+          Logger.warning("[Boot] Project #{project_id} has no workspace_path in either projects or agents table")
+      end
+    end)
+  end
+
   @impl true
   def config_change(changed, _new, removed) do
     HiveWeaveWeb.Endpoint.config_change(changed, removed)
+    :ok
+  end
+
+  @impl true
+  def prep_stop(_state) do
+    # Called BEFORE the supervision tree is torn down on SIGINT/SIGTERM.
+    # This is the correct hook to persist game time — by the time stop/1
+    # runs, the per-project GameTime servers have already been terminated.
+    Logger.info("[Application] Graceful shutdown — persisting game time for all projects")
+
+    project_ids =
+      try do
+        Registry.select(HiveWeave.ProjectRegistry, [{{:"$1", :_, :_}, [], [:"$1"]}])
+      catch
+        :exit, _ -> []
+      end
+
+    Enum.each(project_ids, fn project_id ->
+      case GenServer.whereis(HiveWeave.GameTime.Server.name(project_id)) do
+        nil ->
+          :ok
+
+        pid ->
+          try do
+            GenServer.call(pid, :persist, 5_000)
+          catch
+            :exit, _ -> :ok
+          end
+      end
+    end)
+
+    :ok
+  end
+
+  @impl true
+  def stop(_state) do
+    # Supervision tree already stopped by this point; game-time persistence
+    # is handled in prep_stop/1. Kept as the documented shutdown callback.
+    Logger.info("[Application] Stopped")
     :ok
   end
 end

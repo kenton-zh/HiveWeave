@@ -27,6 +27,10 @@ defmodule HiveWeave.Schema.Agent do
     field :created_at, :integer
     field :updated_at, :integer
     field :reasoning_effort, :string, default: nil
+    # Redundant copy of the project's workspace_path. Persisted so that
+    # per-project DBs can be re-opened even if the projects table is empty
+    # (mirrors the TS agentRegistry, but durable). See ProjectFactory.open_project_db/1.
+    field :workspace_path, :string
   end
 
   def changeset(agent, attrs) do
@@ -35,7 +39,8 @@ defmodule HiveWeave.Schema.Agent do
       :id, :short_id, :project_id, :name, :role, :parent_id, :module_id,
       :status, :goal, :backstory, :skills, :permission_type, :permission_mode,
       :allowed_tools, :denied_tools, :ask_tools, :mcp_servers, :bound_skills,
-      :last_seen_log_at, :created_at, :updated_at, :reasoning_effort, :model_id
+      :last_seen_log_at, :created_at, :updated_at, :reasoning_effort, :model_id,
+      :workspace_path
     ])
     |> validate_required([:name, :role])
     |> validate_inclusion(:status, ["created", "active", "promoted", "receiving", "merging", "dissolving", "archived"])

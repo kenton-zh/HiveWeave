@@ -1,6 +1,8 @@
 defmodule HiveWeave.Services.Charter do
   require Logger
 
+  @goals_sync_table :hiveweave_goals_sync
+
   # Ensure the agent_charters table exists in Meta DB
   defp ensure_table do
     Ecto.Adapters.SQL.query(HiveWeave.Repo.Meta, """
@@ -164,10 +166,14 @@ defmodule HiveWeave.Services.Charter do
     merged_focus = if focus != "", do: focus, else: Map.get(existing, "focus", Map.get(existing, :focus, ""))
     merged_krs = if key_results != [], do: key_results, else: Map.get(existing, "keyResults", Map.get(existing, :keyResults, []))
 
+    # User involvement — defaults to "宏观决策+技术选型" if not set
+    user_involvement = attrs[:user_involvement] || attrs["user_involvement"] || Map.get(existing, "userInvolvement", Map.get(existing, :userInvolvement, "宏观决策+技术选型"))
+
     goals_json = Jason.encode!(%{
       "objective" => merged_objective,
       "focus" => merged_focus,
-      "keyResults" => merged_krs
+      "keyResults" => merged_krs,
+      "userInvolvement" => user_involvement
     })
 
     sql = "UPDATE projects SET charter_json = ? WHERE id = ?"
@@ -175,6 +181,7 @@ defmodule HiveWeave.Services.Charter do
     case Ecto.Adapters.SQL.query(HiveWeave.Repo.Meta, sql, [goals_json, project_id]) do
       {:ok, _r} ->
         Logger.info("[Charter] Updated goals for project #{project_id}")
+        touch_goals_version(project_id)
         {:ok, "Goals updated successfully"}
 
       {:error, reason} ->
@@ -187,5 +194,71 @@ defmodule HiveWeave.Services.Charter do
   defp format_time(ms) when is_integer(ms) do
     DateTime.from_unix!(div(ms, 1000))
     |> Calendar.strftime("%Y-%m-%d %H:%M:%S")
+  end
+
+  # ── Goals sync (dirty-flag pattern) ──────────────────────────
+  #
+  # When the goals workbook is updated (even by one character), the project's
+  # goals version is bumped. Each agent remembers the version it last read.
+  # On the agent's next message, if its last-read version != current version,
+  # the latest goals are injected into context and the agent's version is updated.
+  # New agents start with version = nil, so they always read on first message.
+
+  defp ensure_goals_sync_table do
+    if :ets.whereis(@goals_sync_table) == :undefined do
+      try do
+        :ets.new(@goals_sync_table, [:set, :public, :named_table])
+      rescue
+        ArgumentError -> :ok  # already created by another process
+      end
+    end
+    :ok
+  end
+
+  @doc "Bump the goals version for a project. Call this whenever goals change."
+  def touch_goals_version(project_id) do
+    ensure_goals_sync_table()
+    now = System.monotonic_time(:nanosecond)
+    :ets.insert(@goals_sync_table, {{:version, project_id}, now})
+    :ok
+  end
+
+  @doc "Get the current goals version for a project (nil if never set)."
+  def get_goals_version(project_id) do
+    ensure_goals_sync_table()
+    case :ets.lookup(@goals_sync_table, {:version, project_id}) do
+      [{_, v}] -> v
+      [] -> nil
+    end
+  end
+
+  @doc "Get the version an agent last read (nil if never read)."
+  def get_agent_goals_version(project_id, agent_id) do
+    ensure_goals_sync_table()
+    case :ets.lookup(@goals_sync_table, {{:read, project_id, agent_id}}) do
+      [{_, v}] -> v
+      [] -> nil
+    end
+  end
+
+  @doc "Mark that an agent has read the goals at the given version."
+  def set_agent_goals_version(project_id, agent_id, version) do
+    ensure_goals_sync_table()
+    :ets.insert(@goals_sync_table, {{:read, project_id, agent_id}, version})
+    :ok
+  end
+
+  @doc "Check if an agent needs to re-read the goals (dirty flag).
+  An agent is dirty if:
+  - goals version exists AND agent hasn't read it (version mismatch or nil)
+  - OR goals have never been versioned but the agent has never read (first time)"
+  def goals_dirty?(project_id, agent_id) do
+    case get_goals_version(project_id) do
+      nil ->
+        # Goals never explicitly versioned. Agent is dirty if it has never read.
+        get_agent_goals_version(project_id, agent_id) == nil
+      version ->
+        version != get_agent_goals_version(project_id, agent_id)
+    end
   end
 end

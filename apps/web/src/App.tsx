@@ -3,6 +3,7 @@ import OrgTree from "./components/OrgTree";
 import ChatPanel from "./components/ChatPanel";
 import WorkLogPanel from "./components/WorkLogPanel";
 import AgentDetailPanel from "./components/AgentDetailPanel";
+import MonitorPanel from "./components/MonitorPanel";
 import AddAgentDialog from "./components/AddAgentDialog";
 import FolderPicker from "./components/FolderPicker";
 import OfficeView from "./components/OfficeView";
@@ -423,6 +424,16 @@ function App() {
                 >
                   Logs
                 </button>
+                <button
+                  onClick={() => setRightPanelTab("monitor")}
+                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                    rightPanelTab === "monitor"
+                      ? "bg-accent/20 text-accent"
+                      : "text-gray-400 hover:text-gray-200"
+                  }`}
+                >
+                  监控
+                </button>
               </>
             )}
           </div>
@@ -452,6 +463,8 @@ function App() {
               <ChatPanel key={selectedAgentId} agentId={selectedAgentId} />
             ) : rightPanelTab === "agent" ? (
               <AgentDetailPanel agentId={selectedAgentId} />
+            ) : rightPanelTab === "monitor" ? (
+              <MonitorPanel key={selectedAgentId} agentId={selectedAgentId} />
             ) : (
               <WorkLogPanel key={selectedAgentId} agentId={selectedAgentId} />
             )}

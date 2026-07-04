@@ -95,6 +95,47 @@ defmodule HiveWeaveWeb.OrgController do
     end
   end
 
+  def children(conn, %{"id" => id}) do
+    case get_agent_by_id(id) do
+      nil ->
+        conn
+        |> put_status(404)
+        |> json(%{error: "Not found"})
+      agent ->
+        children_list = Org.get_children(agent.project_id, id)
+        json(conn, %{children: Enum.map(children_list, &serialize_agent/1)})
+    end
+  end
+
+  def list_modules(conn, params) do
+    project_id = params["projectId"] || params["project_id"]
+
+    modules =
+      case project_id do
+        nil -> []
+        pid ->
+          case HiveWeave.Repo.ProjectFactory.query(
+                 pid,
+                 "SELECT id, name, parent_module_id, status, current_agent_id, created_at, updated_at FROM modules ORDER BY created_at ASC",
+                 []
+               ) do
+            {:ok, r} ->
+              r.rows
+              |> Enum.map(fn row -> Enum.zip(r.columns, row) |> Enum.into(%{}) end)
+              |> Enum.map(&serialize_module_map/1)
+
+            {:error, _} ->
+              []
+          end
+      end
+
+    json(conn, %{modules: modules})
+  rescue
+    _ -> json(conn, %{modules: []})
+  catch
+    :exit, _ -> json(conn, %{modules: []})
+  end
+
   defp get_agent_by_id(id) do
     Org.get_agent(id)
   rescue
@@ -151,6 +192,22 @@ defmodule HiveWeaveWeb.OrgController do
 
   defp format_errors(changeset) do
     Ecto.Changeset.traverse_errors(changeset, fn {msg, _} -> msg end)
+  end
+
+  defp serialize_module_map(m) do
+    %{
+      "id" => m["id"],
+      "name" => m["name"],
+      "parent_module_id" => m["parent_module_id"],
+      "parentModuleId" => m["parent_module_id"],
+      "status" => m["status"],
+      "current_agent_id" => m["current_agent_id"],
+      "currentAgentId" => m["current_agent_id"],
+      "created_at" => m["created_at"],
+      "createdAt" => m["created_at"],
+      "updated_at" => m["updated_at"],
+      "updatedAt" => m["updated_at"]
+    }
   end
 end
 

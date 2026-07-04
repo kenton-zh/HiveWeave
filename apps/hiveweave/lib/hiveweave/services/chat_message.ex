@@ -25,6 +25,7 @@ defmodule HiveWeave.Services.ChatMessage do
     role = attrs[:role] || attrs["role"] || "assistant"
     content = attrs[:content] || attrs["content"] || ""
     tool_calls = attrs[:tool_calls] || attrs["tool_calls"] || "[]"
+    thinking = attrs[:thinking] || attrs["thinking"]
     is_background = to_int(attrs[:is_background] || attrs["is_background"], false)
     is_read = to_int(attrs[:is_read] || attrs["is_read"], true)
     created_at = attrs[:created_at] || attrs["created_at"] || System.system_time(:millisecond)
@@ -34,12 +35,12 @@ defmodule HiveWeave.Services.ChatMessage do
     team_to_agent_id = attrs[:team_to_agent_id] || attrs["team_to_agent_id"]
 
     sql = """
-    INSERT INTO chat_messages (id, agent_id, role, content, tool_calls, is_background, is_read, is_streaming, is_context, team_from_agent_id, team_to_agent_id, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO chat_messages (id, agent_id, role, content, tool_calls, thinking, is_background, is_read, is_streaming, is_context, team_from_agent_id, team_to_agent_id, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     case ProjectFactory.query_for_agent(agent_id, sql, [
-           id, agent_id, role, content, tool_calls, is_background, is_read, is_streaming, is_context, team_from_agent_id, team_to_agent_id, created_at
+           id, agent_id, role, content, tool_calls, thinking, is_background, is_read, is_streaming, is_context, team_from_agent_id, team_to_agent_id, created_at
          ]) do
       {:ok, _} ->
         {:ok, %{id: id, role: role, content: content, created_at: created_at}}
@@ -90,6 +91,13 @@ defmodule HiveWeave.Services.ChatMessage do
         updates
       end
 
+    updates =
+      if Map.has_key?(attrs, :thinking) or Map.has_key?(attrs, "thinking") do
+        updates ++ [{"thinking", attrs[:thinking] || attrs["thinking"]}]
+      else
+        updates
+      end
+
     case updates do
       [] ->
         {:ok, %{id: id}}
@@ -119,7 +127,7 @@ defmodule HiveWeave.Services.ChatMessage do
   def get_messages(agent_id, limit \\ 200) do
     case ProjectFactory.query_for_agent(
            agent_id,
-            "SELECT id, agent_id, role, content, tool_calls, is_background, is_read, is_streaming, is_context, team_from_agent_id, team_to_agent_id, created_at FROM chat_messages WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, agent_id, role, content, tool_calls, thinking, is_background, is_read, is_streaming, is_context, team_from_agent_id, team_to_agent_id, created_at FROM chat_messages WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
            [agent_id, limit]
          ) do
       {:ok, r} ->

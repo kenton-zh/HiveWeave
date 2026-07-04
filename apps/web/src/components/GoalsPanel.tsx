@@ -24,7 +24,7 @@ function nextStatus(s: "todo" | "doing" | "done"): "todo" | "doing" | "done" {
 }
 
 export default function GoalsPanel({ projectId }: Props) {
-  const [goals, setGoals] = useState<GoalsData>({ objective: "", focus: "", keyResults: [] });
+  const [goals, setGoals] = useState<GoalsData>({ objective: "", focus: "", keyResults: [], userInvolvement: "宏观决策+技术选型" });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -56,7 +56,7 @@ export default function GoalsPanel({ projectId }: Props) {
     }
   };
 
-  const updateField = (field: "objective" | "focus", value: string) => {
+  const updateField = (field: "objective" | "focus" | "userInvolvement", value: string) => {
     setGoals((g) => ({ ...g, [field]: value }));
     setDirty(true);
   };
@@ -182,6 +182,18 @@ export default function GoalsPanel({ projectId }: Props) {
           placeholder="当前开发重点..."
           className="w-full px-3 py-2 bg-surface border border-surface-border rounded-lg text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-accent/50"
         />
+      </div>
+
+      {/* User Involvement */}
+      <div className="space-y-1.5">
+        <label className="text-xs text-gray-400 font-medium">用户参与度 User Involvement</label>
+        <input
+          value={goals.userInvolvement || ""}
+          onChange={(e) => updateField("userInvolvement", e.target.value)}
+          placeholder="例如:宏观决策+技术选型"
+          className="w-full px-3 py-2 bg-surface border border-surface-border rounded-lg text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-accent/50"
+        />
+        <p className="text-xs text-gray-600">定义哪些类型的问题该问用户。例如"宏观决策+技术选型"表示用户参与宏观和技术选型决策;改为"纯宏观决策"则技术问题由 AI 链式上报。</p>
       </div>
 
       {/* Key Results */}

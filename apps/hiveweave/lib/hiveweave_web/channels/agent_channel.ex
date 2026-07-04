@@ -143,11 +143,11 @@ defmodule HiveWeaveWeb.AgentChannel do
     case type do
       "text_delta" ->
         # Real-time text token — push immediately for streaming display
-        push(socket, "stream_chunk", %{text: event[:content] || event["content"] || "", delta: true, deltaId: event[:delta_id] || event["deltaId"]})
+        push(socket, "stream_chunk", %{text: event[:content] || event["content"] || "", delta: true, deltaId: event[:delta_id] || event["deltaId"], seq: event[:seq] || event["seq"]})
 
       "thinking_delta" ->
         # Real-time thinking token — push as reasoning delta
-        push(socket, "stream_chunk", %{text: event[:content] || event["content"] || "", reasoning: true, delta: true, deltaId: event[:delta_id] || event["deltaId"]})
+        push(socket, "stream_chunk", %{text: event[:content] || event["content"] || "", reasoning: true, delta: true, deltaId: event[:delta_id] || event["deltaId"], seq: event[:seq] || event["seq"]})
 
       "text" ->
         text = event[:content] || event["content"] || ""
