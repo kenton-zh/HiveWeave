@@ -432,20 +432,42 @@ defmodule HiveWeave.LLM.Streamer do
     end
 
     # Execute tool calls in parallel (independent tools can run concurrently)
+    # Use Task.Supervisor.async_nolink so a crashing tool doesn't kill siblings
+    # or the parent stream Task (which is itself async_nolink under TaskSupervisor).
     tool_results =
       if length(tool_calls) > 1 do
         tasks = Enum.map(tool_calls, fn tc ->
-          Task.async(fn ->
-            {tc, execute_single_tool(agent, tc, workspace_path)}
+          Task.Supervisor.async_nolink(HiveWeave.TaskSupervisor, fn ->
+            execute_single_tool(agent, tc, workspace_path)
           end)
         end)
         Enum.map(tasks, fn task ->
-          {_tc, result} = Task.await(task, 120_000)
-          result
+          case Task.yield(task, 120_000) || Task.shutdown(task, 5_000) do
+            {:ok, result} ->
+              # Normal completion — result is the %{"role" => "tool", ...} map
+              result
+            {:exit, reason} ->
+              # Task crashed — return error message as tool result
+              Logger.error("[Streamer] Tool task crashed: #{inspect(reason)}")
+              %{"role" => "tool", "content" => "[Tool Crash] #{inspect(reason)}"}
+            nil ->
+              # Task timed out or was killed
+              %{"role" => "tool", "content" => "[Tool Timeout] Task did not complete within 120s"}
+          end
         end)
       else
         Enum.map(tool_calls, fn tc ->
-          execute_single_tool(agent, tc, workspace_path)
+          try do
+            execute_single_tool(agent, tc, workspace_path)
+          rescue
+            e ->
+              Logger.error("[Streamer] Tool #{tc.name} raised: #{inspect(e)}")
+              %{
+                "role" => "tool",
+                "tool_call_id" => tc.id,
+                "content" => "[Tool Crash] #{tc.name}: #{inspect(e)}\n#{Exception.format_stacktrace()}"
+              }
+          end
         end)
       end
 
@@ -2005,11 +2027,25 @@ defmodule HiveWeave.LLM.Streamer do
   # This is intentionally conservative (overestimate) to avoid hitting limits.
   defp estimate_tokens(messages) do
     Enum.reduce(messages, 0, fn msg, acc ->
-      content = safe_string(msg["content"])
-      args = case msg["tool_calls"] do
-        nil -> ""
-        calls -> Enum.map_join(calls, "", &(&1["function"]["arguments"] || ""))
-      end
+      # Guard against non-map messages (tuples, atoms, etc.) that would crash
+      # Access.get. This shouldn't happen but tools can return unexpected shapes.
+      content =
+        case msg do
+          m when is_map(m) ->
+            safe_string(m["content"])
+          other ->
+            Logger.warning("[Streamer] estimate_tokens: non-map message: #{inspect(other) |> String.slice(0, 100)}")
+            safe_string(msg)
+        end
+      args =
+        case msg do
+          m when is_map(m) ->
+            case m["tool_calls"] do
+              nil -> ""
+              calls -> Enum.map_join(calls, "", &(&1["function"]["arguments"] || ""))
+            end
+          _ -> ""
+        end
       args = safe_string(args)
       # ~3 chars per token as a blended average
       acc + div(byte_size(content), 3) + div(byte_size(args), 3) + 10  # +10 for JSON overhead per message
@@ -2173,13 +2209,35 @@ defmodule HiveWeave.LLM.Streamer do
     #   { tool: name, input: args } — NOT { name, input }
     broadcast_chunk(agent, %{type: "tool_use", tool: tc.name, input: input, id: tc.id})
 
-    {:ok, result} = ToolExecutor.execute(agent, tc.name, input, workspace_path)
+    # Execute tool with error handling — a tool failure should NOT crash the
+    # entire LLM stream. Return an error message to the LLM so it can recover.
+    result =
+      try do
+        case ToolExecutor.execute(agent, tc.name, input, workspace_path) do
+          {:ok, res} ->
+            sanitized = sanitize_utf8(res)
+            result_preview = String.slice(sanitized, 0, 200)
+            Logger.info("[Streamer] Tool #{tc.name} result (#{String.length(sanitized)} chars): #{result_preview}")
+            sanitized
 
-    # Sanitize tool output: replace invalid UTF-8 bytes to prevent Jason.EncodeError
-    result = sanitize_utf8(result)
+          {:error, reason} ->
+            err_msg = "[Tool Error] #{tc.name}: #{inspect(reason)}"
+            Logger.warning("[Streamer] Tool #{tc.name} failed: #{inspect(reason)}")
+            err_msg
 
-    result_preview = String.slice(result, 0, 200)
-    Logger.info("[Streamer] Tool #{tc.name} result (#{String.length(result)} chars): #{result_preview}")
+          other ->
+            # ToolExecutor returned an unexpected shape (:ok, raw string, etc.)
+            Logger.warning("[Streamer] Tool #{tc.name} returned unexpected: #{inspect(other)}")
+            inspect(other)
+        end
+      rescue
+        e ->
+          Logger.error("[Streamer] Tool #{tc.name} raised: #{inspect(e)}")
+          "[Tool Crash] #{tc.name}: #{inspect(e)}"
+      end
+
+    # Ensure result is always a binary string
+    result = if is_binary(result), do: result, else: inspect(result)
 
     # Broadcast tool_result event (field name "tool" aligns with tool_use event)
     broadcast_chunk(agent, %{type: "tool_result", tool: tc.name, output: result, id: tc.id})
@@ -2816,3 +2874,4 @@ defmodule HiveWeave.LLM.Streamer do
     HiveWeave.TokenUtils.estimate_tokens_for_messages(messages)
   end
 end
+
