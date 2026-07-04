@@ -337,7 +337,7 @@ function TemplatePicker({ onSelectTemplate }: { onSelectTemplate: (tpl: AgentTem
   // Load divisions on mount
   useEffect(() => {
     getTemplateDivisions()
-      .then((divs) => setDivisions(divs.map((d) => ({ division: d, count: 0))))
+      .then((divs) => setDivisions(divs.map((d) => ({ division: d, count: 0 }))))
       .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
