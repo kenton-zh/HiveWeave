@@ -75,6 +75,8 @@ defmodule HiveWeave.LLM.Streamer do
     # NOTE: agent.ex's Process.delete calls were no-ops because they ran in the
     # GenServer process, not this Task process.
     Process.delete(:hw_injected_inbox_ids)
+    # Reset the consecutive text-less round counter at stream start
+    Process.delete(:hw_no_text_rounds)
 
     # Model-switch compaction check before resolving model
     old_ctx = get_cached_context_window(agent.id)
@@ -551,6 +553,31 @@ defmodule HiveWeave.LLM.Streamer do
     #   normal → inject with "continue current task" guidance
     #   low    → defer to end of task (don't inject)
     new_messages = poll_and_inject_inbox(agent, new_messages)
+
+    # Detect consecutive rounds with no text output and inject a system hint.
+    # step-3.7-flash tends to call tools without producing any text, round
+    # after round. Without intervention, this loops until max_tool_rounds or
+    # safety_timeout — the user sees only "好的，开始处理。" forever.
+    # After 3 consecutive text-less rounds, inject a system message forcing
+    # the LLM to output text on the next round.
+    new_messages = if combined_text == "" or combined_text == @default_placeholder do
+      no_text_rounds = Process.get(:hw_no_text_rounds) || 0
+      new_count = no_text_rounds + 1
+      Process.put(:hw_no_text_rounds, new_count)
+
+      if new_count >= 3 do
+        Logger.info("[Streamer] Round #{round_num}: #{new_count} consecutive text-less rounds, injecting system hint")
+        Process.put(:hw_no_text_rounds, 0)
+        hint = %{"role" => "system", "content" => "你已经连续#{new_count}轮只调用工具没有输出文字。从现在开始，你必须在调用工具之前先用一段文字说明你正在做什么、分析到了什么。不要只调用工具不说话。"}
+        new_messages ++ [hint]
+      else
+        new_messages
+      end
+    else
+      # LLM produced real text — reset counter
+      Process.put(:hw_no_text_rounds, 0)
+      new_messages
+    end
 
     run_tool_loop(agent, model, provider_name, tools, workspace_path, new_messages, combined_text, combined_thinking, parent, round_num + 1, new_tool_history, assistant_msg_id, new_tool_turn_acc)
   end
