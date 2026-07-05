@@ -200,7 +200,8 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "status": "active",
             }
         )
-        created_ids.append(ceo["id"])
+        ceo_id = ceo["id"]
+        created_ids.append(ceo_id)
         await org.create_agent(
             {
                 "project_id": project_id,
@@ -210,6 +211,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "backstory": "The human resources lead.",
                 "permission_type": "coordinator",
                 "status": "active",
+                "parent_id": ceo_id,
             }
         )
         await org.create_agent(
@@ -221,6 +223,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "backstory": "The quality assurance lead.",
                 "permission_type": "coordinator",
                 "status": "active",
+                "parent_id": ceo_id,
             }
         )
     except Exception as e:
