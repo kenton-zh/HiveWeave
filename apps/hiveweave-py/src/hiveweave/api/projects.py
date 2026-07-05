@@ -171,14 +171,23 @@ async def _set_active_project_id(project_id: str | None) -> None:
         )
 
 
-async def _seed_default_agents(project_id: str) -> None:
-    """新项目自动创建 CEO / HR / QA 三角色（幂等）。"""
+async def _seed_default_agents(project_id: str) -> list[str]:
+    """新项目自动创建 CEO / HR / QA 三角色（幂等）。
+
+    Returns:
+        创建的 agent ID 列表（第一个是 CEO）。
+    """
     org = OrgService()
     existing = await org.list_agents(project_id)
     if any(a.get("role") == "ceo" for a in existing):
-        return
+        # 已有 CEO — 返回其 ID
+        for a in existing:
+            if a.get("role") == "ceo":
+                return [a["id"]]
+        return []
+    created_ids: list[str] = []
     try:
-        await org.create_agent(
+        ceo = await org.create_agent(
             {
                 "project_id": project_id,
                 "name": "CEO",
@@ -188,6 +197,7 @@ async def _seed_default_agents(project_id: str) -> None:
                 "permission_type": "coordinator",
             }
         )
+        created_ids.append(ceo["id"])
         await org.create_agent(
             {
                 "project_id": project_id,
@@ -210,6 +220,7 @@ async def _seed_default_agents(project_id: str) -> None:
         )
     except Exception as e:
         log.warning("seed_default_agents_failed", project_id=project_id, error=str(e))
+    return created_ids
 
 
 @router.get("")
@@ -280,11 +291,14 @@ async def create_project(body: ProjectCreate) -> dict:
         raise HTTPException(status_code=500, detail="Failed to create project")
 
     # 自动创建默认 agent
-    await _seed_default_agents(project_id)
+    agent_ids = await _seed_default_agents(project_id)
 
     row = await meta_db.query_one("SELECT * FROM projects WHERE id = ?", [project_id])
     log.info("project_created", project_id=project_id, name=body.name, workspace=str(ws))
-    return {"project": _project_response(dict(row)) if row else {"id": project_id}}
+    return {
+        "project": _project_response(dict(row)) if row else {"id": project_id},
+        "mainAgentId": agent_ids[0] if agent_ids else None,
+    }
 
 
 @router.get("/{project_id}")
