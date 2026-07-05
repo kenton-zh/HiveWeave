@@ -7,13 +7,64 @@
 """
 
 import aiosqlite
+import structlog
 from pathlib import Path
 from typing import Any
 
 from hiveweave.db.schema import META_DB_TABLES, META_DB_INDEXES
 from hiveweave.config import settings as app_settings
 
+log = structlog.get_logger(__name__)
+
 _db: aiosqlite.Connection | None = None
+
+
+# ── Schema migration ───────────────────────────────────────
+# Python 后端复用 TS 后端创建的 Meta DB（packages/db/data/hiveweave.db），
+# 但 TS 创建的表可能缺少 Python 期望的某些列。以下迁移在创建表之后执行，
+# 用 ALTER TABLE ADD COLUMN 补齐缺失列，try/except 忽略"列已存在"错误。
+#
+# 对比依据：
+#   Python schema: apps/hiveweave-py/src/hiveweave/db/schema.py (META_DB_TABLES)
+#   TS schema:     packages/db/src/schema/*.ts + packages/db/src/client.ts
+#
+# 缺失列清单（TS 表已存在但缺列）：
+#   projects:        language, updated_at
+#   agents:          workspace_path, language  （TS Drizzle schema 无此两列）
+#   agent_templates: updated_at                （TS schema 无此列）
+
+_META_MIGRATIONS: list[tuple[str, str, str]] = [
+    # (table, column, column_def)
+    # projects — TS client.ts 创建时无 language / updated_at
+    ("projects", "language", "TEXT DEFAULT 'en'"),
+    ("projects", "updated_at", "INTEGER"),
+    # agents — TS Drizzle schema 无 workspace_path / language
+    ("agents", "workspace_path", "TEXT"),
+    ("agents", "language", "TEXT DEFAULT 'en'"),
+    # agent_templates — TS schema 无 updated_at
+    ("agent_templates", "updated_at", "INTEGER"),
+]
+
+
+async def _migrate_meta_schema(conn: aiosqlite.Connection) -> None:
+    """Run schema migrations for columns missing from TS-created tables.
+
+    对每个可能缺失的列执行 ALTER TABLE ADD COLUMN，用 try/except 忽略
+    "duplicate column name"（列已存在）和 "no such table"（表不存在）错误。
+    """
+    for table, column, col_def in _META_MIGRATIONS:
+        try:
+            await conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {col_def}"
+            )
+            log.info("schema_migrated", table=table, column=column)
+        except aiosqlite.OperationalError as e:
+            msg = str(e).lower()
+            if "duplicate column" in msg or "no such table" in msg:
+                # 列已存在（本就是 Python 创建的表）或表不存在（跳过）
+                continue
+            raise
+    await conn.commit()
 
 
 async def init_meta_db() -> None:
@@ -39,6 +90,9 @@ async def init_meta_db() -> None:
     # Create indexes
     for sql in META_DB_INDEXES:
         await _db.execute(sql)
+
+    # Migrate columns missing from TS-created tables
+    await _migrate_meta_schema(_db)
 
     await _db.commit()
 
