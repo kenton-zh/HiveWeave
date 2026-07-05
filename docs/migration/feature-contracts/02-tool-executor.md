@@ -79,7 +79,10 @@
 |---|---|---|---|---|---|---|---|
 | **core_tools**（send_message, read_roster, check_agent_status, write_memory, fetch_url, get_project_time, get_real_time, set_alarm, question, todowrite, websearch, read_goals, mcp_list_tools, mcp_call, run_command） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **readonly_file_tools**（read_file, list_files, grep, glob, search_files） | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
-| **full_file_tools**（bash, read_file, list_files, grep, glob, apply_patch, write_file, edit_file, delete_file, move_file, create_directory, delete_directory, search_files） | — | — | — | ✅ | ✅ | — | — |
+| **bash**（shell 执行；含自毁命令拦截） | — | — | — | ✅(via full_file) | ✅(via full_file) | ✅(单独授予) | ✅(单独授予) |
+| **full_file_tools**（read_file, list_files, grep, glob, apply_patch, write_file, edit_file, delete_file, move_file, create_directory, delete_directory, search_files） | — | — | — | ✅ | ✅ | — | — |
+
+> **RECONCILE 说明**：`bash` 在源码中是 `full_file_tools` 的首元素（Executor/QA 通过 `full_file_tools()` 获得），但 Test Engineer 和 Auditor 通过 `[bash_tool() | readonly_file_tools()]` **单独授予** bash，不使用 `full_file_tools`。因此矩阵表中 `bash` 单列一行，`full_file_tools` 行不再包含 bash。
 | **management_tools**（read_work_logs, review_code, approve_work, reject_work, list_subordinates, view_org_chart） | ✅ | — | ✅ | — | — | — | — |
 | **git_worktree_tools**（create, checkpoint, merge, rollback, remove, list, status） | ✅ | — | ✅ | — | — | — | — |
 | **binding_tools**（bind_skill, unbind_skill, list_available_skills, get_skill_detail, read_skill, bind_mcp, unbind_mcp, list_available_mcp） | ✅ | ✅ | — | — | — | — | — |
@@ -124,14 +127,23 @@
 
 ### 自毁命令拦截（bash 专用）
 
-| 模式 | 处理 |
-|---|---|
-| `rm -rf /` | 阻止："system-level destructive command" |
-| `format [a-z]:` | 阻止 |
-| `diskpart` | 阻止 |
-| `shutdown` / `reboot` / `poweroff` / `halt` | 阻止 |
+**匹配语义**：对 `String.downcase(command)` 执行正则匹配（`Regex.match?/2`）。命中任一模式即阻止，返回 `"Error: Command blocked: system-level destructive command"`。
 
-> `run_command` 工具**不执行**自毁检查——它是 bash 的底层逃生舱，由 coordinator 使用。
+**完整正则清单**（源码 `check_self_destructive/1`，共 7 条）：
+
+| 序号 | 正则模式 | 匹配类型 | 说明 |
+|---|---|---|---|
+| 1 | `~r/rm\s+-rf\s+\//` | 精确模式 | `rm` + 空格 + `-rf` + 空格 + `/` |
+| 2 | `~r/format\s+[a-z]:/i` | 精确模式 | `format` + 空格 + 盘符 + `:` |
+| 3 | `~r/diskpart/i` | **substring**（无边界） | 会误匹配 `diskpart_backup.sh` |
+| 4 | `~r/shutdown/i` | **substring**（无边界） | 会误匹配 `shutdown_server.sh` |
+| 5 | `~r/reboot/i` | **substring**（无边界） | 会误匹配 `reboot_log.txt` |
+| 6 | `~r/poweroff/i` | **substring**（无边界） | 会误匹配 `poweroff_script.py` |
+| 7 | `~r/halt\b/i` | **word boundary** | 仅 `halt` 单词匹配 |
+
+> **已知限制（RECONCILE）**：模式 3-6 使用无边界的 substring 匹配，可能误拦截合法命令（如 `shutdown_server.sh`）。Python 迁移时可考虑加 `\b` word boundary，但需同步更新并行对比测试用例。
+
+> `run_command` 工具**不执行**自毁检查——它是 bash 的底层逃生舱，**对所有角色开放**（包含在 `core_tools` 中，coordinator 和 executor 均可使用）。源码注释明确："deliberately NO self-destructive check here (that is bash-specific). run_command is a lower-level escape hatch."
 
 ### 路径沙箱
 
@@ -143,10 +155,24 @@
 
 ### 大输出截断
 
+存在**两层截断**，作用域不同：
+
+#### 层 1：`maybe_save_large_output`（所有工具的 dispatch 结果）
+
 | 条件 | 动作 |
 |---|---|
-| 输出 > 2000 行 **或** > 50KB | 保存全文到 `.hiveweave/tool_outputs/<agent>_<tool>_<timestamp>.txt`，保留 7 天 |
-| 截断后返回 | 前 20 行 + `... (N lines omitted, full output at <path>)` + 后 5 行 |
+| 输出 > 2000 行 **或** > 50KB | 保存全文到 `.hiveweave/tool_outputs/<agent_id>_<timestamp>_<tool_name>.txt`，保留 7 天 |
+| 文件大小上限 | 10MB（`@tool_output_file_max_bytes`），超过则截断并追加 `... [file capped at 10MB bytes]` |
+| 截断后返回 | 前 20 行 + `\n\n... [output truncated: N lines, N bytes. Full output saved to <path>] ...\n\n` + 后 5 行 |
+| 尾行条件 | 仅当总行数 > 25 时才返回后 5 行；否则尾行部分为空 |
+
+#### 层 2：`truncate_output`（bash 专用轻量截断）
+
+| 条件 | 动作 |
+|---|---|
+| bash 输出 > 1MB | 截断到 1MB 并追加 `\n... [output truncated at 1MB]`（不存盘） |
+
+> **RECONCILE 说明**：层 1 的截断标记格式与源码 `maybe_save_large_output/4` 严格对齐。原契约描述 `... (N lines omitted, full output at <path>)` 与源码 `... [output truncated: N lines, N bytes. Full output saved to <path>] ...` 不一致，已修正。文件命名格式为 `<agent_id>_<timestamp>_<safe_tool_name>.txt`（tool_name 经 `[^a-zA-Z0-9_-]` 替换为 `_`）。
 
 ## 错误处理
 
@@ -170,8 +196,10 @@
 | 大输出行数阈值 | `2000` 行 | 工具执行 |
 | 大输出字节阈值 | `50_000` bytes | 工具执行 |
 | 临时文件保留天数 | `7` 天 | 工具执行 |
+| 临时文件大小上限 | `10_485_760` bytes (10MB) | 工具执行 |
 | 截断预览头行数 | `20` | 工具执行 |
-| 截断预览尾行数 | `5` | 工具执行 |
+| 截断预览尾行数 | `5`（仅当总行数 > 25） | 工具执行 |
+| bash 轻量截断阈值 | `1_048_576` bytes (1MB) | 工具执行 |
 | read_file 默认 limit | `2000` | 工具执行 |
 | 审批超时 | `120_000` ms | 工具执行 |
 
