@@ -420,6 +420,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const [queuedCount, setQueuedCount] = useState(0);
   const pendingQueueRef = useRef<string[]>([]);
   const autoSendRef = useRef(false);
+  const handleSendRef = useRef<() => void>(() => {});
   const [retryInfo, setRetryInfo] = useState<{ attempt: number; maxRetries: number; reason: string } | null>(null);
   const [images, setImages] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -531,13 +532,11 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       pendingQueueRef.current = [pending.message];
       setQueuedCount(1);
       autoSendRef.current = true;
-      // Auto-send after a short delay to let the WebSocket channel join complete.
-      // Without this, the pending message sits in the queue until the drain
-      // effect fires — but the drain effect requires isAgentProcessing to be
-      // false, which may not update in time on first mount.
+      // Auto-send after WebSocket channel has time to join.
+      // 300ms ensures ChatPanel is fully mounted and channel join is initiated.
       setTimeout(() => {
-        handleSend();
-      }, 100);
+        handleSendRef.current();
+      }, 300);
     }
 
     return () => {
@@ -1052,6 +1051,9 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       }
     });
   }, [agentId, input, isStreaming, isAgentProcessing, hasUnansweredUser, refreshOrgTree, loadMessagesFromDb]);
+
+  // Keep handleSendRef in sync so setTimeout/effect can always call the latest version
+  handleSendRef.current = handleSend;
 
   // Drain queued messages when agent becomes idle (e.g. after background processing)
   useEffect(() => {
