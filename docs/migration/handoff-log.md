@@ -30,6 +30,39 @@
 
 ## 日志
 
+### [完成] 2026-07-05 | TRAE (Claude) | Phase 2-5 Python 后端完整实现
+- 做了什么：
+  1. **批次 1**（14 子任务）：项目骨架 + 两层 SQLite + 23 个服务模块（system_state/memory/inbox/handoff/game_time/permission/approval/charter/event_audit/telemetry/git_worktree/org/dispatch/skill_registry/mcp/names/roster/work_log/chat_message/model/template/settings/team_chat）
+  2. **批次 2**（3 子任务）：ETHOS 提示词系统（7 文件）+ LLM 流式调用层（5 文件，SSE+tool loop+熔断器+重试）+ 工具执行器（10 文件，7+1 内置工具）
+  3. **批次 3**（1 子任务）：Agent 编排系统（4 文件，状态机+trigger+崩溃重启）
+  4. **批次 4**（2 子任务）：实时通信层（4 文件，WebSocket 3 channel+EventBus）+ HTTP API 层（16 文件，67 端点 16 分组）
+  5. **批次 5**（集成验证）：服务器启动+Meta DB schema 迁移+API 路径兼容性修复+前端连接验证
+- 改了哪些文件：
+  - 创建 `apps/hiveweave-py/src/hiveweave/` 下 78 个 Python 文件，共 16,042 行代码
+  - 更新 `docs/migration/progress.md`（批次 1-5 全部完成）
+  - 修复 `db/meta.py`（schema 迁移：5 列 ALTER TABLE）
+  - 修复 `api/` 下 5 个路由文件（9 条 RESTful 兼容路由）
+  - 修复 `main.py`（完整 lifespan：init Meta DB→zombie 清理→seed model→game time→agent 恢复）
+  - 修复 `agents/supervisor.py`（SQL 查询列名 role_type→permission_type）
+- 验证结果：
+  - 服务器 uvicorn port 4000 无错误启动
+  - 基础 API 6/6 通过（health/version/settings/models/templates/root）
+  - 项目+组织 API 8/8 通过（创建项目→自动 seed CEO/HR/QA→创建 agent→组织树）
+  - 聊天+通信 API 16/16 通过（发消息→历史→收件箱→日志→权限）
+  - WebSocket 3/3 channel 通过（lobby init+pong / agent error / chat pong）
+  - 前端已连接，GET /api/chat/questions 200 OK
+- 已知遗留问题：
+  - ChatMessageService/GameTimeService 构造函数不接受 project_id（lifespan 中有 warning，非致命）
+  - agents 表 status 默认值差异（TS='created' vs Python='active'）
+  - `/api/logs/{agentId}/work-logs` 兼容路由 404（router prefix 不匹配）
+  - 未配置真实 LLM API key，agent 无法实际执行 LLM 调用
+- 下一个接手需要注意：
+  - 修复 3 个已知遗留问题
+  - 配置真实 LLM API key 进行端到端测试
+  - 对比 Elixir 后端与 Python 后端在相同输入下的输出一致性
+  - Phase 5 切换上线：前端 api.ts 指向 Python 后端（已在 4000 端口运行）
+- progress.md 已更新：是
+
 ### [完成] 2026-07-05 | TRAE (Claude) | Phase 1 迁移路径规划
 - 做了什么：完成 Phase 1 迁移路径规划，包含模块依赖图、5 批次迁移顺序、目录结构、并行对比测试策略、风险评估
 - 改了哪些文件：
