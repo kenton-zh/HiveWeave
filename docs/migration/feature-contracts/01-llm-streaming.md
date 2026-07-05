@@ -48,6 +48,7 @@
 | 创建 placeholder 消息 | 流式开始前 | DB chat_messages | `is_streaming=true, content=""`，保证刷新页面能看到正在进行的对话 |
 | 更新消息内容 | 每轮结束 | DB chat_messages | 追加文本、tool_calls，保证崩溃后不丢数据 |
 | 清除 streaming 标志 | 流式结束（成功/失败/崩溃） | DB chat_messages | `is_streaming=false`，必须有重试机制（3 次退避） |
+| 清除 zombie streaming 标志 | **应用启动时**（`application.ex` boot） | DB chat_messages | `clear_stuck_streaming()` 清除所有 `is_streaming=true` 的残留行（上次崩溃遗留），防止前端永远显示"正在输入" |
 | 广播 chunk | 每个 token 到达 | PubSub → WebSocket | 实时转发给前端 |
 | 广播 activity | 流式开始 | PubSub lobby:status | "正在思考..." |
 | Telemetry 计时 | 流式开始/结束 | Telemetry | LLM 调用耗时监控 |
@@ -132,12 +133,21 @@
 | HTTP 5xx（服务端） | 指数退避重试 | 最多 2 次 | 同上 |
 | HTTP 401（认证失败） | 不重试 | — | 返回"API Key 无效" |
 | 请求超时（30s 无响应） | 重试 | 最多 3 次 | 返回"请求超时" |
-| 流式 idle 超时（首 chunk 120s / 后续 60s） | 中断流，重试 | 最多 2 次 | 归类为网络错误 |
+| 流式 idle 超时（首 chunk 90s / 后续 60s） | 中断流，重试 | 最多 2 次 | 归类为网络错误 |
 | 空响应（无文本无 tool_calls） | 指数退避重试 | 最多 3 次（5s/15s/45s） | 重试耗尽 → 通知上级 agent |
 | 上下文溢出 | trim_context_if_needed | — | 修剪后继续 |
 | 连续无文字轮次（3 轮只调工具不出文字） | 注入系统提示 | — | 提示"请输出文字描述你的操作" |
 | doom loop（同一工具+同一参数 3 次） | 中断循环 | — | 返回错误 |
 | 熔断器 open | 切换 fallback provider | — | 无 fallback → 返回"所有 provider 不可用" |
+
+> **[RECONCILE 补充] 上下文溢出的两道防线 — trim_context vs compaction 职责边界**
+>
+| 机制 | 所在模块 | 触发时机 | 触发条件 | 同步/异步 | 行为 |
+|---|---|---|---|---|---|
+| `trim_context_if_needed` | Streamer（本契约） | tool loop 每轮 LLM 请求**前** | 估算 token > usable budget（硬溢出） | **同步** — 阻塞当前轮 | 保留首 2 条 + 末 N 条，中间消息尝试 LLM 摘要（`compact_with_llm`），失败则从前端硬截断。摘要存为 system 消息 |
+| `maybe_trigger_compaction` | ConversationStore（契约 03） | `append_turn` 后（每轮结束**后**） | total > budget * 0.85（软阈值，预防性） | **异步** — 不阻塞主流程 | 分割 old/recent，LLM 摘要 old 消息为结构化 handoff，前置 system 摘要消息。失败回退 `trim_to_budget` |
+>
+> **关键区别**：trim_context 是**轮内同步硬溢出处理**（即将超限时紧急裁剪），compaction 是**轮后异步预防性压缩**（85% 时提前压缩避免未来溢出）。两者独立运行，compaction 的摘要不会传递给 trim_context（因 clean_messages 过滤 system 消息，见契约 03 已知问题）。Python 实现应保留这两道防线，但建议让 compaction 摘要通过独立的 `compacted_prefix_cache` 传递，而非混入 history。
 
 ## 常量引用
 
@@ -181,6 +191,7 @@
 | C2 | 端口不一致 | 已确认用 4000 |
 | — | Elixir `@default_tail_turns 20` 是 dead code | 忽略，不迁移 |
 | — | Elixir 超时值（30s）与 TS 三层防线（180s/90s/60s/300s）差异大 | Python 采用 TS 三层防线模型（更完善），见决策依据 |
+| — | **[RECONCILE 修正]** 原 error handling 表写"首 chunk 120s"是将工具执行超时（`streamer.ex:565` `Task.yield(task, 120_000)`，用于并行工具）误当作首 chunk 超时。实际 Elixir 首 chunk/stream idle 超时为 `@stream_idle_ms = 30_000`（30s）；TS 首 chunk 为 90s。Python 采用 TS 值 90s | 已统一为 90s |
 
 > **超时值决策说明**：Elixir `streamer.ex` 使用单一 `@request_timeout_ms = 30_000` + `@stream_idle_ms = 30_000`，而 TS 参考实现有三层防线（180s 请求级 / 90s 首 chunk / 60s idle / 300s turn 级）。TS 的三层防线更完善：(1) 区分"首 chunk 等待"和"后续 chunk 间隔"；(2) 有 turn 级总超时兜底。Python 迁移采用 TS 三层防线模型。Elixir 的 30s 过于激进，thinking 模型（如 o1）首 token 可能需要 60-90s。
 
@@ -215,7 +226,7 @@
 - [ ] 达到最大轮次时，做一次无工具的总结调用
 - [ ] 流式结束（成功/失败/崩溃）后，`is_streaming` 标志一定被清除
 - [ ] HTTP 429/5xx 自动重试，最多 2 次，解析 Retry-After header
-- [ ] 流式 idle 超时（首 chunk 120s / 后续 60s）自动中断并重试
+- [ ] 流式 idle 超时（首 chunk 90s / 后续 60s）自动中断并重试
 - [ ] 空响应（无文本无 tool_calls）触发退避重试（5s/15s/45s）
 - [ ] 连续 3 轮只调工具不出文字时，注入系统提示
 - [ ] 同一工具+同一参数连续 3 次时，中断 doom loop
@@ -234,7 +245,7 @@
 | 工具调用对话 | 流式返回 text + tool_calls，执行工具，重新请求 | 相同 | 发送需要调工具的消息，对比工具执行结果和后续 LLM 响应 |
 | 多轮工具调用 | 循环执行工具直到完成 | 相同 | 发送复杂任务，对比轮次数和最终结果 |
 | HTTP 429 限流 | 重试 2 次，退避 | 相同 | mock API 返回 429，对比重试次数和退避时间 |
-| 流式超时 | 30s 超时（Elixir）| 120s 首 chunk / 60s idle 超时（Python） | mock API 不响应，对比超时时间（注意：值不同是预期的） |
+| 流式超时 | 30s 超时（Elixir）| 90s 首 chunk / 60s idle 超时（Python） | mock API 不响应，对比超时时间（注意：值不同是预期的） |
 | 空响应 | 退避重试 3 次 | 相同 | mock API 返回空 content + 空 tool_calls，对比重试行为 |
 | 最大轮次 | 达到上限后做总结调用 | 相同 | mock LLM 每轮都返回 tool_calls，对比总结调用 |
 | 熔断器 | 连续 3 次失败后 open | 相同 | mock 连续失败，对比熔断器状态转换 |
