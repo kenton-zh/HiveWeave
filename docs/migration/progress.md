@@ -109,13 +109,15 @@
 
 **批次 1 集成验证**：30 个模块（4 DB + 3 conversation + 23 services）全部导入成功，13 个服务类实例化通过。
 
-### 批次 2：业务逻辑层（Layer 2）⏳ 待开始
+### 批次 2：业务逻辑层（Layer 2）✅ 完成
 
-| 序号 | 模块 | 契约 | 依赖 | 预估工时 | 状态 |
-|---|---|---|---|---|---|
-| 2.1 | LLM 流式调用 | 01 | 03,08,13 | 3 天 | ⏳ |
-| 2.2 | 工具执行器 | 02 | 08,10,11 | 2 天 | ⏳ |
-| 2.3 | ETHOS 提示词 | 13 | 14,05,10 | 2 天 | ⏳ |
+| 序号 | 模块 | 契约 | Python 文件 | 状态 | 测试 | 最后更新 |
+|---|---|---|---|---|---|---|
+| 2.1 | ETHOS 提示词 | 13 | `prompts/identity.py`, `context.py`, `involvement.py`, `goals.py`, `coordinator.py`, `executor.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 2.2 | LLM 流式调用 | 01 | `llm/streamer.py`, `provider.py`, `retry.py`, `circuit_breaker.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 2.3 | 工具执行器 | 02 | `tools/executor.py`, `bash.py`, `file.py`, `patch.py`, `grep.py`, `websearch.py`, `review.py`, `question.py`, `todowrite.py` | ✅ | 集成测试通过（含功能测试） | 2026-07-05 |
+
+**批次 2 集成验证**：19 个模块（4 LLM + 10 tools + 7 prompts）全部导入成功，功能测试通过（bash 执行、文件读写、patch、grep、ToolExecutor 完整链路）。
 
 ### 批次 3-5 ⏳ 待开始
 
