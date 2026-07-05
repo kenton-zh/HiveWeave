@@ -80,7 +80,9 @@ async def lifespan(app: FastAPI):
         cleaned = 0
         for p in projects:
             try:
-                ws = p.get("workspace_path")
+                # R13 fix: p 是 aiosqlite.Row，不支持 .get()，改用 [] 索引
+                # （查询显式 SELECT workspace_path，列一定存在；NULL 时返回 None）
+                ws = p["workspace_path"]
                 if ws:
                     ToolExecutor.cleanup_tool_outputs(ws)
                     cleaned += 1
@@ -106,16 +108,15 @@ async def lifespan(app: FastAPI):
         log.warning("approval_restore_failed", error=str(e))
 
     # 4. Start game time tick loop
-    game_time_tasks: list = []
+    game_time_projects: list[str] = []
     try:
         from hiveweave.db import meta as meta_db
         projects = await meta_db.query("SELECT id FROM projects WHERE 1=1")
         for p in projects:
             try:
                 gt = GameTimeService(p["id"])
-                task = await gt.start_tick_loop()
-                if task:
-                    game_time_tasks.append(task)
+                await gt.start(p["id"])
+                game_time_projects.append(p["id"])
             except Exception as e:
                 log.warning("game_time_start_failed", project_id=p["id"], error=str(e))
         log.info("game_time_started", projects=len(projects))
@@ -142,8 +143,12 @@ async def lifespan(app: FastAPI):
     log.info("app_stopping")
 
     # Stop game time tick loops
-    for task in game_time_tasks:
-        task.cancel()
+    for pid in game_time_projects:
+        try:
+            gt = GameTimeService(pid)
+            await gt.stop(pid)
+        except Exception as e:
+            log.warning("game_time_stop_failed", project_id=pid, error=str(e))
     log.info("game_time_stopped")
 
     # Stop all agents
@@ -185,6 +190,8 @@ app.add_middleware(
 # ── Route Registration ──────────────────────────────────────
 from hiveweave.api.router import register_routes as _register_api
 from hiveweave.realtime.channels import register_ws_routes as _register_ws
+from hiveweave.realtime.phoenix_adapter import register_phoenix_route as _register_phoenix
 
 _register_api(app)
 _register_ws(app)
+_register_phoenix(app)  # /socket/websocket — 前端 phoenix.js 兼容

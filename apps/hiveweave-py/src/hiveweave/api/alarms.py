@@ -101,3 +101,34 @@ async def set_game_time_speed(project_id: str, speed: int = Query(...)) -> dict:
         "realSecondsPerGameDay": REAL_SECONDS_PER_GAME_DAY,
         "note": "speed is fixed at 24x (1 real hour = 1 game day) in this build",
     }
+
+
+# ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────
+# 前端 api.ts 期望 /api/projects/{projectId}/... 风格的嵌套路径，
+# 而原契约路由为扁平的 /api/alarms、/api/game-time/{id}。
+# 以下路由复用已有处理函数，仅做路径适配。COMPAT: 前端 api.ts 期望的 RESTful 路径
+
+
+@router.get("/api/projects/{project_id}/game-time")
+async def get_game_time_compat(project_id: str) -> dict:
+    """COMPAT: 前端 api.ts 期望的 RESTful 路径"""
+    return await get_game_time(project_id)
+
+
+@router.get("/api/projects/{project_id}/alarms")
+async def list_alarms_compat(project_id: str) -> dict:
+    """COMPAT: 前端 api.ts 期望的 RESTful 路径"""
+    return await list_alarms(projectId=project_id)
+
+
+@router.post("/api/projects/{project_id}/alarms")
+async def create_alarm_compat(project_id: str, body: AlarmCreate) -> dict:
+    """COMPAT: 前端 api.ts 期望的 RESTful 路径"""
+    body.projectId = project_id  # 覆盖为 path 参数
+    return await create_alarm(body)
+
+
+@router.delete("/api/projects/{project_id}/alarms/{alarm_id}")
+async def cancel_alarm_compat(project_id: str, alarm_id: str) -> dict:
+    """COMPAT: 前端 api.ts 期望的 RESTful 路径"""
+    return await cancel_alarm(alarm_id, projectId=project_id)

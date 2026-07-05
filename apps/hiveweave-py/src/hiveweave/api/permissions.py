@@ -94,6 +94,18 @@ async def get_rules(agent_id: str) -> dict:
     }
 
 
+@router.get("/pending/project/{project_id}")
+async def pending_for_project_path(project_id: str) -> dict:
+    """COMPAT: 前端 api.ts 期望的 RESTful 路径。
+
+    前端调用 GET /api/permissions/pending/project/{projectId}，
+    原契约只提供 GET /api/permissions/pending?projectId=...。
+    本路由必须定义在 /{agent_id} 之前，否则 "pending" 会被 {agent_id} 捕获。
+    """
+    requests = await approval_service.get_project_pending(project_id)
+    return {"requests": requests}
+
+
 @router.get("/pending/{agent_id}")
 async def pending_for_agent(agent_id: str) -> dict:
     """查 agent 待审批请求。"""
