@@ -390,6 +390,7 @@ class Agent:
                     tools=tools,
                     on_delta=self._on_delta,
                     on_tool_call=self._on_tool_call,
+                    max_tool_rounds=max_rounds,
                 )
 
                 status = result.get("status", "error")

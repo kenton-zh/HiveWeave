@@ -28,7 +28,10 @@ SUMMARY_TEMPERATURE = 0.3
 SUMMARY_MAX_TOKENS = 2000
 
 # 摘要消息特殊标记 — store 据此识别并提取到 compacted_prefix_cache
-# R9 fix: 与 Elixir streamer.ex:2260 保持一致（marker 字符串 + 单换行格式）
+# R10: 已验证与 Elixir streamer.ex:2260 完全一致 ——
+#   Elixir: "[Earlier conversation summary]\n#{summary}"
+#   Python: SUMMARY_MARKER + "\n\n" + summary
+# marker 字符串本身逐字符相同，store 用 startswith(SUMMARY_MARKER) 识别。
 SUMMARY_MARKER = "[Earlier conversation summary]"
 
 # LLM 回调类型：(prompt: str) -> summary_text | None

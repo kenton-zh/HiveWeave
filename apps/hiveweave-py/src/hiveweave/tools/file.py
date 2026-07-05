@@ -24,6 +24,7 @@ MAX_READ_LINES = 2000
 MAX_LINE_LENGTH = 2000
 BINARY_PROBE_SIZE = 8192
 MAX_LIST_FILES = 1000
+MAX_READ_BYTES = 10 * 1024 * 1024  # 10MB — 大文件读取上限（R5），防止 OOM
 
 # Directories to skip in list_files (common build/dep dirs)
 IGNORED_DIRS = frozenset({
@@ -176,8 +177,20 @@ async def read_file(
                 "error": f"Error: Cannot display binary file ({size} bytes). "
                          "Use list_files to see metadata instead."}
 
+    # R5: 大文件保护 — 超过 MAX_READ_BYTES 只读首块，防止一次性 read_text 导致 OOM
+    size = p.stat().st_size
+    truncated_note = ""
     try:
-        content = p.read_text(encoding="utf-8", errors="replace")
+        if size > MAX_READ_BYTES:
+            with open(full, "rb") as fh:
+                raw = fh.read(MAX_READ_BYTES)
+            content = raw.decode("utf-8", errors="replace")
+            truncated_note = (
+                f"\n\n⚠️ 文件较大（{_format_size(size)}），仅读取前 "
+                f"{_format_size(MAX_READ_BYTES)}。请使用 offset 参数读取后续部分。"
+            )
+        else:
+            content = p.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return {"success": False, "output": "",
                 "error": f"Error: {exc}"}
@@ -203,6 +216,8 @@ async def read_file(
 
     body = "\n".join(formatted_lines)
     suffix = f"\n\n(Showing lines {start + 1}-{end} of {total})"
+    if truncated_note:
+        suffix = truncated_note + suffix
     return {"success": True, "output": body + suffix, "error": None}
 
 
