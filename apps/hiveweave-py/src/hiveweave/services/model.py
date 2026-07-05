@@ -65,16 +65,18 @@ class ModelService:
         return {"id": model_pk, "name": name, "model_id": model_id}
 
     async def get(self, model_pk: str) -> dict | None:
-        """Get a model by ID. Returns full api_key (not masked).
+        """Get a model by ID or model_id. Returns full api_key (not masked).
 
         契约 18: get_model — api_key 完整返回（Streamer 需完整 key 调 LLM）。
+        支持按 id（UUID）或 model_id（如 step-3.7-flash）查询，因为 agent.config
+        中存储的是 model_id 字段而非数据库主键。
         """
         row = await meta_db.query_one(
             "SELECT id, name, model_id, base_url, api_key, context_window, "
             "max_output_tokens, supports_thinking, default_reasoning_effort, "
             "temperature, is_active, created_at, updated_at "
-            "FROM llm_models WHERE id = ? LIMIT 1",
-            [model_pk])
+            "FROM llm_models WHERE id = ? OR model_id = ? LIMIT 1",
+            [model_pk, model_pk])
         if row is None:
             return None
         return self._row_to_model(row, mask_key=False)
