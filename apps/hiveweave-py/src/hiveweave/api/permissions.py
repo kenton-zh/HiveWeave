@@ -122,3 +122,16 @@ async def respond_request(request_id: str, body: RespondBody) -> dict:
             status_code=400, detail=result.get("error", "Failed to resolve request")
         )
     return {"ok": True, "requestId": request_id}
+
+
+# ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────
+# 前端期望 GET /api/permissions/{agentId}（无 /mode 后缀）风格；
+# 保留现有 /{agentId}/mode 路由，额外提供 path 参数变体。
+# 注意：本路由必须定义在所有字面量路径（/pending、/requests/...）之后，
+# 以避免 {agent_id} 误捕获 "pending" 等字面量段。
+
+
+@router.get("/{agent_id}")
+async def get_mode_path(agent_id: str) -> dict:
+    """查 agent 权限模式（path: agentId，无 /mode 后缀）— 前端 RESTful 兼容路由。"""
+    return await get_mode(agent_id)

@@ -518,3 +518,21 @@ async def chat_stream(agent_id: str):
 def _sse(payload: dict) -> str:
     """构造一条 SSE data 行。"""
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+# ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────
+# 前端期望 /api/chat/{agentId}/messages 风格；保留现有 /messages/{agentId} 与
+# POST /api/chat（agentId in body）路由，额外提供 path 参数变体。
+
+
+@router.get("/{agent_id}/messages")
+async def chat_messages_path(agent_id: str) -> list:
+    """查 agent 消息（path: agentId）— 前端 RESTful 兼容路由。"""
+    return await chat_messages(agent_id)
+
+
+@router.post("/{agent_id}/messages")
+async def send_chat_path(agent_id: str, body: ChatSendBody) -> dict:
+    """触发 agent 聊天（path: agentId 覆盖 body agentId）— 前端 RESTful 兼容路由。"""
+    overridden = body.model_copy(update={"agentId": agent_id})
+    return await send_chat(overridden)

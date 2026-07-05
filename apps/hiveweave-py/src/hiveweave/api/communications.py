@@ -180,3 +180,16 @@ async def mark_ping_read(ping_id: str, agentId: str | None = Query(default=None)
         log.error("mark_ping_read_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to mark ping read")
     return {"ok": True}
+
+
+# ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────
+# 前端期望 /api/communications/{agentId}/inbox 风格；保留现有 query 风格路由，
+# 额外提供 path 参数变体。
+
+
+@router.get("/api/communications/{agent_id}/inbox")
+async def list_communications_inbox_path(
+    agent_id: str, limit: int = Query(default=100, le=500)
+) -> dict:
+    """agent 收件箱（path: agentId）— 前端 RESTful 兼容路由。"""
+    return await list_communications(agentId=agent_id, limit=limit)
