@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -20,9 +21,13 @@ from typing import Any, Callable, Awaitable
 
 import structlog
 
+from hiveweave.db import meta as meta_db
 from hiveweave.services.approval import (
     ApprovalService, PermissionRejected, PermissionTimeout,
 )
+from hiveweave.services.charter import CharterService
+from hiveweave.services.inbox import InboxService
+from hiveweave.services.org import OrgService
 from hiveweave.services.permission import PermissionService
 from hiveweave.tools.bash import execute_bash, execute_run_command
 from hiveweave.tools.file import read_file, write_file, list_files
@@ -79,6 +84,10 @@ class ToolExecutor:
         self.permission = permission_service
         self.approval = approval_service
         self.review_llm_callback = review_llm_callback
+        # Service instances for high-level orchestration tools
+        self._org = OrgService()
+        self._inbox = InboxService()
+        self._charter = CharterService()
 
     # ── Public API ────────────────────────────────────────
 
@@ -278,6 +287,36 @@ class ToolExecutor:
                 call_llm=self.review_llm_callback,
             )
 
+        # ── High-level orchestration tools ──────────────────
+        # These bridge the LLM tool calls to service-layer methods.
+
+        if name == "send_message":
+            return await self._tool_send_message(agent_id, args)
+
+        if name == "list_subordinates":
+            return await self._tool_list_subordinates(agent_id)
+
+        if name == "hire_agent":
+            return await self._tool_hire_agent(agent_id, args)
+
+        if name == "read_charter":
+            return await self._tool_read_charter(agent_id)
+
+        if name == "save_charter":
+            return await self._tool_save_charter(agent_id, args)
+
+        if name == "read_goals":
+            return await self._tool_read_goals(agent_id)
+
+        if name == "update_goals":
+            return await self._tool_update_goals(agent_id, args)
+
+        if name == "view_org_chart":
+            return await self._tool_view_org_chart(agent_id)
+
+        if name == "read_work_logs":
+            return await self._tool_read_work_logs(agent_id, args)
+
         # Unknown tool — contract 02 error handling
         return self._error(f"Unknown tool: {name}")
 
@@ -394,3 +433,391 @@ class ToolExecutor:
     def _error(message: str) -> dict[str, Any]:
         """Build an error result dict."""
         return {"success": False, "output": "", "error": message}
+
+    # ── High-level orchestration tool implementations ────
+
+    async def _get_project_id(self, agent_id: str) -> str | None:
+        """Resolve agent_id → project_id via Meta DB."""
+        return await meta_db.get_agent_project_id(agent_id)
+
+    async def _tool_send_message(self, agent_id: str, args: dict) -> dict:
+        """send_message: CEO/HR → subordinates/peers via InboxService.
+
+        Args (from LLM):
+            recipients: list[str] — short_id or name of target agents
+            message: str — message body (also accepts 'content')
+            expectReport: bool — whether a response is expected
+            priority: str — "normal" / "urgent"
+        """
+        recipients = args.get("recipients") or []
+        # Handle JSON string recipients (LLM sometimes sends '["HR"]' as string)
+        if isinstance(recipients, str):
+            try:
+                parsed = json.loads(recipients)
+                if isinstance(parsed, list):
+                    recipients = parsed
+                else:
+                    recipients = [recipients]
+            except (json.JSONDecodeError, ValueError):
+                recipients = [recipients]
+        message = args.get("message") or args.get("content") or args.get("body") or ""
+        expect_report = bool(args.get("expectReport") or args.get("expect_report") or False)
+        priority = args.get("priority") or "normal"
+
+        if not recipients:
+            return self._error("send_message requires 'recipients' (list of agent names or short_ids)")
+        if not message:
+            return self._error("send_message requires 'message' (body text)")
+
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project_id")
+
+        # Resolve each recipient: short_id (A001) or name → agent record
+        all_agents = await self._org.list_agents(project_id)
+        resolved = []
+        not_found = []
+        for r in recipients:
+            r_stripped = r.strip()
+            # Try short_id match
+            match = None
+            for a in all_agents:
+                if a.get("short_id", "").upper() == r_stripped.upper():
+                    match = a
+                    break
+            # Try name match (case-insensitive)
+            if not match:
+                for a in all_agents:
+                    if a.get("name", "").lower() == r_stripped.lower():
+                        match = a
+                        break
+            # Try role match (e.g. "HR")
+            if not match:
+                for a in all_agents:
+                    if a.get("role", "").lower() == r_stripped.lower():
+                        match = a
+                        break
+            if match:
+                resolved.append(match)
+            else:
+                not_found.append(r)
+
+        if not resolved:
+            return self._error(
+                f"No recipients found. Unknown: {not_found}. "
+                f"Available agents: {[(a['name'], a.get('short_id'), a.get('role')) for a in all_agents]}"
+            )
+
+        results = []
+        for target in resolved:
+            msg = await self._inbox.send_message(
+                from_agent_id=agent_id,
+                to_agent_id=target["id"],
+                message=message,
+                priority=priority,
+                expect_report=expect_report,
+            )
+            results.append({
+                "to": target["name"],
+                "short_id": target.get("short_id"),
+                "message_id": msg["id"],
+            })
+            # Trigger the recipient agent to process the inbox message
+            try:
+                from hiveweave.agents.trigger import trigger_coordinator, trigger_subordinate
+                target_perm = target.get("permission_type", "executor")
+                if target_perm == "coordinator":
+                    asyncio.create_task(trigger_coordinator(target["id"]))
+                else:
+                    asyncio.create_task(trigger_subordinate(target["id"]))
+                log.info("tool.send_message.triggered",
+                         from_agent=agent_id[:8],
+                         to_agent=target["id"][:8],
+                         trigger_type=target_perm)
+            except Exception as e:
+                log.warning("tool.send_message.trigger_failed",
+                            to_agent=target["id"][:8], error=str(e))
+
+        not_found_str = f" (not found: {not_found})" if not_found else ""
+        return {
+            "success": True,
+            "output": f"Message sent to {len(resolved)} agent(s): "
+                      f"{', '.join(r['to'] for r in results)}{not_found_str}",
+            "error": None,
+        }
+
+    async def _tool_list_subordinates(self, agent_id: str) -> dict:
+        """list_subordinates: list direct children of the calling agent."""
+        subs = await self._org.get_subordinates(agent_id)
+        if not subs:
+            return {"success": True, "output": "You have no direct subordinates.", "error": None}
+
+        lines = []
+        for s in subs:
+            lines.append(
+                f"- {s['name']} ({s.get('short_id', '?')}) | "
+                f"role={s.get('role', '?')} | "
+                f"status={s.get('status', '?')} | "
+                f"goal={s.get('goal', '')[:80]}"
+            )
+        return {
+            "success": True,
+            "output": f"Direct subordinates ({len(subs)}):\n" + "\n".join(lines),
+            "error": None,
+        }
+
+    async def _tool_hire_agent(self, agent_id: str, args: dict) -> dict:
+        """hire_agent: HR creates a new agent via OrgService.create_agent.
+
+        Args (from LLM):
+            name: str — agent codename (e.g. 折纸)
+            role: str — Chinese job title (e.g. 前端工程师)
+            backstory: str — 2-4 sentence character narrative
+            skills: list[str] — skill slugs
+            parentId: str — parent agent ID (default: CEO)
+            goal: str — agent's goal
+            templateId: str — optional template ID
+        """
+        name = args.get("name") or ""
+        role = args.get("role") or ""
+        backstory = args.get("backstory") or ""
+        skills = args.get("skills") or []
+        parent_id = args.get("parentId") or args.get("parent_id") or ""
+        goal = args.get("goal") or ""
+        template_id = args.get("templateId") or args.get("template_id")
+
+        if not name:
+            return self._error("hire_agent requires 'name' (agent codename)")
+        if not role:
+            return self._error("hire_agent requires 'role' (job title)")
+
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project_id")
+
+        # If no parentId specified, default to CEO
+        if not parent_id:
+            ceo = await self._org.get_agent_by_role(project_id, "ceo")
+            if ceo:
+                parent_id = ceo["id"]
+
+        # Determine permission_type: coordinator roles → coordinator, else executor
+        coordinator_roles = {"ceo", "hr", "qa", "cto", "architect", "manager", "pm"}
+        perm_type = "coordinator" if role.lower() in coordinator_roles else "executor"
+        perm_mode = "readonly" if perm_type == "coordinator" else "readwrite"
+
+        # Get default model_id from project's existing agents
+        existing_agents = await self._org.list_agents(project_id)
+        model_id = "step-3.7-flash"
+        if existing_agents:
+            for a in existing_agents:
+                if a.get("model_id"):
+                    model_id = a["model_id"]
+                    break
+
+        # Get language from project
+        project_row = await meta_db.query_one(
+            "SELECT language FROM projects WHERE id = ?", [project_id]
+        )
+        language = project_row["language"] if project_row else "zh"
+
+        attrs = {
+            "project_id": project_id,
+            "name": name,
+            "role": role,
+            "parent_id": parent_id,
+            "backstory": backstory,
+            "goal": goal or f"Execute {role} responsibilities.",
+            "model_id": model_id,
+            "permission_type": perm_type,
+            "permission_mode": perm_mode,
+            "skills": skills if isinstance(skills, list) else [],
+            "allowed_tools": [],
+            "language": language,
+            "status": "active",
+        }
+
+        try:
+            new_agent = await self._org.create_agent(attrs)
+            log.info("tool.hire_agent", agent_id=agent_id,
+                     new_agent_id=new_agent.get("id"),
+                     name=name, role=role)
+            return {
+                "success": True,
+                "output": (
+                    f"Agent hired successfully!\n"
+                    f"  Name: {name}\n"
+                    f"  Role: {role}\n"
+                    f"  Short ID: {new_agent.get('short_id', '?')}\n"
+                    f"  Agent ID: {new_agent.get('id', '?')}\n"
+                    f"  Parent: {parent_id[:8]}...\n"
+                    f"  Permission: {perm_type} / {perm_mode}\n"
+                    f"  Model: {model_id}\n"
+                    f"  Skills: {skills}\n"
+                    f"  Backstory: {backstory[:100]}"
+                ),
+                "error": None,
+            }
+        except Exception as e:
+            return self._error(f"Failed to hire agent: {e}")
+
+    async def _tool_read_charter(self, agent_id: str) -> dict:
+        """read_charter: read the project charter."""
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project_id")
+
+        charter = await self._charter.read_charter(project_id)
+        if not charter:
+            return {"success": True, "output": "No charter has been saved yet.", "error": None}
+
+        output = f"=== Project Charter ===\n"
+        output += f"Title: {charter.get('title', 'N/A')}\n"
+        output += f"Status: {charter.get('status', 'N/A')}\n"
+        output += f"Content:\n{charter.get('content', 'N/A')}\n"
+        return {"success": True, "output": output, "error": None}
+
+    async def _tool_save_charter(self, agent_id: str, args: dict) -> dict:
+        """save_charter: save/update the project charter."""
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project_id")
+
+        content = args.get("content") or args.get("charter") or ""
+        title = args.get("title") or "Project Charter"
+
+        if not content:
+            return self._error("save_charter requires 'content' (charter body)")
+
+        try:
+            charter_id = await self._charter.save_charter(
+                project_id, agent_id,
+                {"title": title, "content": content, "status": "active"},
+            )
+            return {
+                "success": True,
+                "output": f"Charter saved (id={charter_id[:8]}...). Title: {title}",
+                "error": None,
+            }
+        except Exception as e:
+            return self._error(f"Failed to save charter: {e}")
+
+    async def _tool_read_goals(self, agent_id: str) -> dict:
+        """read_goals: read enterprise goals."""
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project_id")
+
+        goals = await self._charter.read_goals(project_id)
+        if not goals:
+            return {"success": True, "output": "No goals have been set yet.", "error": None}
+
+        output = "=== Enterprise Goals ===\n"
+        output += f"Objective: {goals.get('objective', 'N/A')}\n"
+        output += f"Focus: {goals.get('focus', 'N/A')}\n"
+        output += f"User Involvement: {goals.get('userInvolvement', 'N/A')}\n"
+        krs = goals.get("keyResults", [])
+        if krs:
+            output += "Key Results:\n"
+            for i, kr in enumerate(krs, 1):
+                if isinstance(kr, dict):
+                    output += f"  {i}. {kr.get('description', kr.get('text', str(kr)))}\n"
+                else:
+                    output += f"  {i}. {kr}\n"
+        return {"success": True, "output": output, "error": None}
+
+    async def _tool_update_goals(self, agent_id: str, args: dict) -> dict:
+        """update_goals: update enterprise goals."""
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project_id")
+
+        goals = {
+            "objective": args.get("objective"),
+            "focus": args.get("focus"),
+            "key_results": args.get("keyResults") or args.get("key_results"),
+            "user_involvement": args.get("userInvolvement") or args.get("user_involvement"),
+        }
+        # Remove None values
+        goals = {k: v for k, v in goals.items() if v is not None}
+
+        if not goals:
+            return self._error("update_goals requires at least one of: objective, focus, keyResults, userInvolvement")
+
+        try:
+            await self._charter.update_goals(project_id, goals)
+            return {"success": True, "output": "Goals updated successfully.", "error": None}
+        except Exception as e:
+            return self._error(f"Failed to update goals: {e}")
+
+    async def _tool_view_org_chart(self, agent_id: str) -> dict:
+        """view_org_chart: show the full organization tree."""
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project_id")
+
+        tree = await self._org.get_full_tree(project_id)
+        if not tree:
+            return {"success": True, "output": "Org chart is empty.", "error": None}
+
+        def format_node(node, indent=0):
+            prefix = "  " * indent
+            line = f"{prefix}- {node['name']} ({node.get('short_id', '?')}) role={node.get('role', '?')}"
+            if node.get("goal"):
+                line += f" goal={node['goal'][:60]}"
+            lines = [line]
+            for child in (node.get("children") or []):
+                lines.extend(format_node(child, indent + 1))
+            return lines
+
+        all_lines = []
+        for root in tree:
+            all_lines.extend(format_node(root))
+
+        return {"success": True, "output": "=== Org Chart ===\n" + "\n".join(all_lines), "error": None}
+
+    async def _tool_read_work_logs(self, agent_id: str, args: dict) -> dict:
+        """read_work_logs: read work logs from subordinates or specific agent."""
+        target = args.get("agentId") or args.get("agent_id") or args.get("agent")
+
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project_id")
+
+        # If target specified, resolve it; otherwise list all subordinates' logs
+        if target:
+            target_agent = await self._org.resolve_agent(target)
+            if not target_agent:
+                return self._error(f"Agent not found: {target}")
+            target_ids = [target_agent["id"]]
+        else:
+            subs = await self._org.get_subordinates(agent_id)
+            target_ids = [s["id"] for s in subs]
+
+        if not target_ids:
+            return {"success": True, "output": "No agents to read work logs from.", "error": None}
+
+        # Query work_logs from per-project DB
+        from hiveweave.db import project as project_db
+        all_logs = []
+        for tid in target_ids:
+            try:
+                rows = await project_db.query(
+                    tid,
+                    "SELECT agent_id, content, log_type, created_at FROM work_logs "
+                    "WHERE agent_id = ? ORDER BY created_at DESC LIMIT 10",
+                    [tid],
+                )
+                for r in rows:
+                    all_logs.append(r)
+            except Exception:
+                pass  # Table might not exist yet
+
+        if not all_logs:
+            return {"success": True, "output": "No work logs found.", "error": None}
+
+        lines = []
+        for log in all_logs:
+            ts = log.get("created_at", 0)
+            lines.append(f"[{ts}] {log.get('agent_id', '?')[:8]}... ({log.get('log_type', '?')}): {log.get('content', '')[:100]}")
+        return {"success": True, "output": f"=== Work Logs ({len(all_logs)}) ===\n" + "\n".join(lines), "error": None}
