@@ -131,16 +131,22 @@ ToolCallCallback = Callable[[str, str, str], Awaitable[dict]]
 def parse_sse(buffer: str) -> tuple[list[dict], str]:
     """解析 SSE 缓冲区，返回 (events, leftover)。
 
-    SSE 格式: 事件之间用 \\n\\n 分隔，每个事件是 data: {json}\\n 的行。
-    最后一段可能是不完整的，作为 leftover 返回供下次拼接。
+    SSE 格式: 事件之间用空行分隔（\\n\\n 或 \\r\\n\\r\\n），每个事件是
+    data: {json} 的行。最后一段可能是不完整的，作为 leftover 返回供下次拼接。
+
+    R1: 同时处理 \\r\\n\\r\\n 和 \\n\\n 分隔符 —— 某些代理/CDN（如 Cloudflare、
+    Nginx 默认）会把 SSE 事件的空行分隔符规范化为 CRLF。先做 CRLF→LF 归一化，
+    再按 \\n\\n 分割，兼容两种分隔符。
 
     对齐 Elixir parse_sse/1。
     """
     if not buffer:
         return [], ""
 
-    parts = buffer.split("\n\n")
-    # 最后一段可能不完整（无结尾 \\n\\n）
+    # R1: 规范化 CRLF → LF，使 \r\n\r\n 成为 \n\n（兼容 CDN/代理的 CRLF 分隔）
+    normalized = buffer.replace("\r\n", "\n")
+    parts = normalized.split("\n\n")
+    # 最后一段可能不完整（无结尾 \n\n）
     *complete, leftover = parts
 
     events: list[dict] = []
@@ -390,6 +396,7 @@ class Streamer:
         tools: list[dict] | None = None,
         on_delta: DeltaCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
+        max_tool_rounds: int | None = None,
     ) -> dict:
         """流式调用 LLM，执行 tool loop，返回最终结果。
 
@@ -400,6 +407,9 @@ class Streamer:
             tools: 可用工具列表 [{type:"function", function:{name, description, parameters}}]
             on_delta: SSE delta 回调（text_delta/thinking_delta 等事件）
             on_tool_call: 工具执行回调，返回 {role:"tool", content, tool_call_id}
+            max_tool_rounds: 本轮调用的 tool loop 上限（R9）。若提供则覆盖构造器
+                默认值，用于注入角色专属上限（来自 agent config 的
+                MAX_TOOL_ROUNDS_BY_ROLE）。未提供时回退到 self.max_tool_rounds。
 
         Returns:
             结果 dict（见类文档字符串）
@@ -407,6 +417,10 @@ class Streamer:
         start_time = time.monotonic()
         provider = self._provider_factory.create(model_config)
         provider_name = model_config.get("name") or "primary"
+
+        # R9: 角色专属上限 — 优先用调用方传入的 max_tool_rounds（来自 agent config），
+        # 确保使用角色专属上限而非硬编码 25。
+        effective_max_rounds = max_tool_rounds if max_tool_rounds else self.max_tool_rounds
 
         log.info(
             "stream_start",
@@ -440,6 +454,7 @@ class Streamer:
                     tools=tools,
                     on_delta=on_delta,
                     on_tool_call=on_tool_call,
+                    max_tool_rounds=effective_max_rounds,
                 ),
                 timeout=TOTAL_TIMEOUT_S,
             )
@@ -475,23 +490,29 @@ class Streamer:
         tools: list[dict] | None,
         on_delta: DeltaCallback | None,
         on_tool_call: ToolCallCallback | None,
+        max_tool_rounds: int | None = None,
     ) -> dict:
         """Tool loop: 流式请求 → 检查 tool_calls → 执行工具 → 重复。"""
+        # R9: 使用调用方传入的角色专属上限，回退到实例默认值
+        rounds_cap = max_tool_rounds if max_tool_rounds else self.max_tool_rounds
         text_acc = ""
         thinking_acc = ""
         tool_history: list[dict] = []
         tool_turn_acc: list[dict] = []
         last_usage: dict | None = None
         no_text_rounds = 0
-        doom_tracker: dict[tuple[str, str], int] = {}
+        # R2: 跟踪连续相同的 (tool_name, tool_args) 调用。
+        # 累加式计数会误判合法的跨轮重复操作；改为「连续相同」计数，
+        # 遇到不同调用时重置。只在连续 DOOM_LOOP_THRESHOLD 次相同调用时才判定。
+        doom_tracker: dict[str, Any] = {"last_key": None, "count": 0}
 
-        for round_num in range(self.max_tool_rounds):
+        for round_num in range(rounds_cap):
             # 上下文溢出检查
             messages = self._trim_context_if_needed(messages, provider)
 
             # 中轮提醒: 80% 轮次时注入
             messages = self._maybe_inject_mid_round_reminder(
-                messages, round_num
+                messages, round_num, rounds_cap
             )
 
             log.info("tool_loop_round",
@@ -1146,18 +1167,32 @@ class Streamer:
     @staticmethod
     def _detect_doom_loop(
         tool_calls: list[dict],
-        tracker: dict[tuple[str, str], int],
+        tracker: dict[str, Any],
     ) -> str | None:
         """检测 doom loop: 同一工具+同一参数连续 N 次。
 
+        R2: 跟踪连续相同的 (tool_name, tool_args) 调用。遇到不同调用时重置计数，
+        只在连续 DOOM_LOOP_THRESHOLD 次相同调用时才判定为 doom loop。
+        合法的跨轮重复操作（不同参数或穿插其他调用）不会被误判。
+
         更新 tracker 并返回触发 doom loop 的工具名，或 None。
         """
+        last_key = tracker.get("last_key")
+        count = tracker.get("count", 0)
         for tc in tool_calls:
             key = (tc["name"], tc["arguments"])
-            count = tracker.get(key, 0) + 1
-            tracker[key] = count
+            if key == last_key:
+                count += 1
+            else:
+                # 遇到不同调用 → 重置计数，以本次调用为新的连续起点
+                last_key = key
+                count = 1
             if count >= DOOM_LOOP_THRESHOLD:
+                tracker["last_key"] = last_key
+                tracker["count"] = count
                 return tc["name"]
+        tracker["last_key"] = last_key
+        tracker["count"] = count
         return None
 
     # ── 上下文溢出修剪 ──────────────────────────────────────
@@ -1196,14 +1231,27 @@ class Streamer:
 
         # 从 tail 前端逐步裁剪直到 token 数达标
         while len(tail) > 2 and estimate_tokens_for_messages(head + tail) > usable:
-            # 不拆 assistant(tool_calls) / tool(result) 对
+            # R3: 保持 tool_calls + tool_result 对的完整性，避免产生孤儿 tool_result
+            # （没有对应 tool_calls 的 tool_result 会导致 API 400 错误）。
+            # 原实现只检查相邻 2 条，多 tool_result 批次会留下孤儿。
+            first = tail[0]
             drop = 1
-            if len(tail) > 1:
-                if "tool_calls" in tail[0] and "tool_call_id" in tail[1]:
-                    drop = 2
-                elif "tool_call_id" in tail[0] and "tool_calls" in tail[1]:
-                    drop = 2
+            if "tool_calls" in first:
+                # assistant(tool_calls) — 连同其后所有同批 tool_result 一起裁剪
+                drop = 1
+                while drop < len(tail) and "tool_call_id" in tail[drop]:
+                    drop += 1
+            elif "tool_call_id" in first:
+                # 孤儿 tool_result（其 tool_calls 已被裁剪）— 裁剪它及后续同批 tool_result
+                drop = 0
+                while drop < len(tail) and "tool_call_id" in tail[drop]:
+                    drop += 1
             tail = tail[drop:]
+
+        # R3: 最终清理 — 移除裁剪后可能残留在 tail 头部的孤儿 tool_result
+        # （循环可能因 len(tail)<=2 提前退出而留下孤儿）
+        while tail and "tool_call_id" in tail[0]:
+            tail = tail[1:]
 
         trimmed = head + tail
         log.info("context_trimmed",

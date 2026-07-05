@@ -13,6 +13,10 @@ handoffs 段为 Python 迁移新增（Elixir 未实现，契约 13 §build_conte
 空段自动跳过；全空返回 ""（caller 决定是否跳过 System 2）。
 
 移植自 Elixir streamer.ex: build_context_prompt + build_memory_block。
+
+R8 契约说明：本模块返回 str 而非 dict（{"role": "system", "content": ...}）。
+caller 需要自行包装为 system message dict，以便灵活控制消息布局（如 prefix cache
+分槽、跳过空 context 段等）。见 agent.py:_build_messages 中的用法。
 """
 
 from __future__ import annotations

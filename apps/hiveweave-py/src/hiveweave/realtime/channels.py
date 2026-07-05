@@ -47,6 +47,16 @@ WS_CLOSE_UNAUTHORIZED = 4401
 WS_CLOSE_NOT_FOUND = 4404
 """WebSocket 关闭码 — agent 未找到。"""
 
+WS_CLOSE_TOO_MANY_CONNECTIONS = 4429
+"""WebSocket 关闭码 — 连接数超限。"""
+
+MAX_WS_CONNECTIONS = 50
+"""最大并发 WebSocket 连接数。R10 fix: 防止大量连接耗尽内存（每连接双 task）。"""
+
+# 全局活跃连接计数器（R10 fix）
+_active_ws_connections: int = 0
+_ws_conn_lock = asyncio.Lock()
+
 
 # ── 认证 ────────────────────────────────────────────────────
 
@@ -195,11 +205,25 @@ async def _run_ws_session(
         )
         return
 
+    # 1b. R10 fix: 连接数上限检查（accept 之前拒绝）
+    global _active_ws_connections
+    async with _ws_conn_lock:
+        if _active_ws_connections >= MAX_WS_CONNECTIONS:
+            await websocket.close(
+                code=WS_CLOSE_TOO_MANY_CONNECTIONS,
+                reason=f"Too many connections (max {MAX_WS_CONNECTIONS})",
+            )
+            log.warning(
+                "ws_rejected_too_many",
+                active=_active_ws_connections,
+                limit=MAX_WS_CONNECTIONS,
+            )
+            return
+        _active_ws_connections += 1
+    log.debug("ws_conn_acquired", active=_active_ws_connections)
+
     # 2. Accept
     await websocket.accept()
-
-    # 3. Subscribe
-    queue = await bus.subscribe(channel, agent_id=agent_id)
 
     # 发送锁 — 避免 forward 和 receive 并发 send 导致交错
     send_lock = asyncio.Lock()
@@ -214,7 +238,13 @@ async def _run_ws_session(
             log.debug("ws_send_failed", error=str(e))
             return False
 
+    # R3+R10 fix: subscribe 可能 raise RuntimeError（订阅者上限），
+    # 放入 try 块以确保 finally 释放连接计数。
+    queue: asyncio.Queue[dict] | None = None
     try:
+        # 3. Subscribe
+        queue = await bus.subscribe(channel, agent_id=agent_id)
+
         # 4. 发送 init 事件
         if init_events:
             for event in init_events:
@@ -261,7 +291,12 @@ async def _run_ws_session(
         log.warning("ws_session_error", channel=channel, error=str(e))
     finally:
         # 6. 清理订阅
-        await bus.unsubscribe(queue)
+        if queue is not None:
+            await bus.unsubscribe(queue)
+        # R10 fix: 释放连接计数
+        async with _ws_conn_lock:
+            _active_ws_connections = max(0, _active_ws_connections - 1)
+        log.debug("ws_conn_released", active=_active_ws_connections)
         log.debug("ws_session_closed", channel=channel)
 
 

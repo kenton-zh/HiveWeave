@@ -17,11 +17,12 @@ class Settings(BaseSettings):
     # API Key auth (契约 19: ApiKeyAuth — 环境变量未设则开放)
     api_key: str = ""
 
-    # CORS origins
+    # CORS origins — 白名单（生产安全）。
+    # R1 fix: 不使用 ["*"]，仅允许前端 Vite dev (5173) + preview (4173) 端口。
     cors_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "http://localhost:5174",
+        "http://localhost:4173",
     ]
 
     # OpenCode API key (契约 18: seedDefaultModel 读此变量)

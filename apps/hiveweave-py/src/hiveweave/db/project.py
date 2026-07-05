@@ -9,6 +9,9 @@
 - 缓存：per-project DB 连接缓存，evict 时关闭
 """
 
+import asyncio
+from collections import OrderedDict
+
 import aiosqlite
 from pathlib import Path
 from typing import Any
@@ -19,11 +22,15 @@ from hiveweave.db import meta as meta_db
 # ── Connection cache ────────────────────────────────────────
 # key: workspace_path (normalized absolute path)
 # value: aiosqlite.Connection
-
-_cache: dict[str, aiosqlite.Connection] = {}
+# R3: OrderedDict 实现 LRU — 访问时 move_to_end，超限时 evict 最旧的（popitem(last=False)）
+MAX_CACHED_CONNECTIONS = 50
+_cache: OrderedDict[str, aiosqlite.Connection] = OrderedDict()
 
 # agent_id → workspace_path cache (avoids Meta DB lookup on every query)
 _agent_cache: dict[str, str] = {}
+
+# R2: 保护 ensure_project_db 的懒初始化，避免并发创建多个连接到同一 DB
+_ensure_lock = asyncio.Lock()
 
 
 def _db_path_for_workspace(workspace_path: str) -> str:
@@ -38,32 +45,48 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
     """Get or create the per-project DB for a workspace.
 
     契约 11: ensureProjectDb(workspacePath) lazily creates a per-project DB.
+
+    R2: 使用 asyncio.Lock 保护，避免并发调用创建多个连接。
+    R3: 缓存上限 MAX_CACHED_CONNECTIONS=50，超限时 evict 最久未用的连接（LRU）。
     """
     ws = str(Path(workspace_path).resolve())
-    if ws in _cache:
-        return _cache[ws]
 
-    db_path = _db_path_for_workspace(workspace_path)
-    conn = await aiosqlite.connect(db_path)
-    conn.row_factory = aiosqlite.Row
+    # 快速路径：无锁检查缓存（命中时只需 move_to_end，但需加锁保证 OrderedDict 一致）
+    async with _ensure_lock:
+        if ws in _cache:
+            _cache.move_to_end(ws)  # LRU: 标记为最近使用
+            return _cache[ws]
 
-    # DELETE journal mode (契约 11: 避免 Windows SQLITE_IOERR_SHMOPEN)
-    await conn.execute("PRAGMA journal_mode=DELETE")
-    await conn.execute("PRAGMA busy_timeout=5000")
-    await conn.execute("PRAGMA foreign_keys=ON")
+        db_path = _db_path_for_workspace(workspace_path)
+        conn = await aiosqlite.connect(db_path)
+        conn.row_factory = aiosqlite.Row
 
-    # Create tables
-    for sql in PROJECT_DB_TABLES:
-        await conn.execute(sql)
+        # DELETE journal mode (契约 11: 避免 Windows SQLITE_IOERR_SHMOPEN)
+        await conn.execute("PRAGMA journal_mode=DELETE")
+        await conn.execute("PRAGMA busy_timeout=5000")
+        await conn.execute("PRAGMA foreign_keys=ON")
 
-    # Create indexes
-    for sql in PROJECT_DB_INDEXES:
-        await conn.execute(sql)
+        # Create tables
+        for sql in PROJECT_DB_TABLES:
+            await conn.execute(sql)
 
-    await conn.commit()
+        # Create indexes
+        for sql in PROJECT_DB_INDEXES:
+            await conn.execute(sql)
 
-    _cache[ws] = conn
-    return conn
+        await conn.commit()
+
+        _cache[ws] = conn
+
+        # R3: LRU evict — 超过上限时关闭并移除最久未用的连接
+        while len(_cache) > MAX_CACHED_CONNECTIONS:
+            _, old_conn = _cache.popitem(last=False)
+            try:
+                await old_conn.close()
+            except Exception:
+                pass  # best-effort
+
+        return conn
 
 
 async def get_project_db_for_agent(agent_id: str) -> aiosqlite.Connection | None:
@@ -105,9 +128,11 @@ async def evict_project_db(workspace_path: str) -> None:
     """Close and remove a per-project DB from cache.
 
     契约 11: evictProjectDb() — best-effort close, caller catches errors.
+    R2: 加锁保证与 ensure_project_db 的缓存操作互斥。
     """
     ws = str(Path(workspace_path).resolve())
-    conn = _cache.pop(ws, None)
+    async with _ensure_lock:
+        conn = _cache.pop(ws, None)
     if conn is not None:
         try:
             await conn.close()

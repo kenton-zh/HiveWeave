@@ -129,9 +129,13 @@ async def respond_request(request_id: str, body: RespondBody) -> dict:
 # 保留现有 /{agentId}/mode 路由，额外提供 path 参数变体。
 # 注意：本路由必须定义在所有字面量路径（/pending、/requests/...）之后，
 # 以避免 {agent_id} 误捕获 "pending" 等字面量段。
+# COMPAT: 前端 api.ts 期望的 RESTful 路径
 
 
 @router.get("/{agent_id}")
 async def get_mode_path(agent_id: str) -> dict:
-    """查 agent 权限模式（path: agentId，无 /mode 后缀）— 前端 RESTful 兼容路由。"""
+    """查 agent 权限模式（path: agentId，无 /mode 后缀）— 前端 RESTful 兼容路由。
+
+    R11: COMPAT 兼容路由。
+    """
     return await get_mode(agent_id)

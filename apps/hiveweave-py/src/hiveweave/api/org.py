@@ -281,25 +281,35 @@ async def list_modules(projectId: str = Query(...)) -> dict:
 # ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────
 # 前端（TS/Elixir）期望 /api/org/{projectId}/... 风格；保留现有 query 风格路由，
 # 额外提供 path 参数变体。所有兼容路由直接委托给现有处理函数。
+# COMPAT: 前端 api.ts 期望的 RESTful 路径
 
 
 @router.get("/{project_id}/tree")
 async def get_tree_path(project_id: str) -> dict:
-    """组织树（path: projectId）— 前端 RESTful 兼容路由。"""
+    """组织树（path: projectId）— 前端 RESTful 兼容路由。
+
+    R11: COMPAT 兼容路由。
+    """
     validate_id(project_id, "project_id")
     return await get_tree(projectId=project_id)
 
 
 @router.get("/{project_id}/agents")
 async def list_agents_path(project_id: str) -> dict:
-    """列出 agent（path: projectId）— 前端 RESTful 兼容路由。"""
+    """列出 agent（path: projectId）— 前端 RESTful 兼容路由。
+
+    R11: COMPAT 兼容路由。
+    """
     validate_id(project_id, "project_id")
     return await list_agents(projectId=project_id)
 
 
 @router.post("/{project_id}/agents")
 async def create_agent_path(project_id: str, body: AgentCreate) -> dict:
-    """创建 agent（path: projectId 覆盖 body projectId）— 前端 RESTful 兼容路由。"""
+    """创建 agent（path: projectId 覆盖 body projectId）— 前端 RESTful 兼容路由。
+
+    R11: COMPAT 兼容路由。
+    """
     validate_id(project_id, "project_id")
     overridden = body.model_copy(update={"projectId": project_id})
     return await create_agent(overridden)

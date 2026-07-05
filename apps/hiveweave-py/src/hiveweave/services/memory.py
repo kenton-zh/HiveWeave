@@ -52,12 +52,55 @@ class MemoryService:
         _cache[key] = (data, time.time() + ttl)
 
     @classmethod
-    def invalidate(cls, project_id: str) -> None:
-        """Clear all cached memories for a project (契约 05: write 后失效)."""
-        to_remove = [k for k in _cache if k[0] == project_id]
+    def invalidate(cls, project_id: str, *, agent_id: str | None = None,
+                   scope: str | None = None, module_id: str | None = None) -> None:
+        """Clear cached memories matching the given filters (契约 05: write 后失效).
+
+        R5: 定向失效 — 只清除可能受写入影响的缓存，而非全项目清空。
+        缓存 key 格式:
+          - project 层: (project_id, "project")
+          - agent 层:   (project_id, "agent", agent_id, scope)
+          - archive 层: (project_id, "archive", module_id)
+
+        - 不传过滤参数 → 清除该项目全部缓存（向后兼容）。
+        - scope='project' → 只清 project 层。
+        - agent_id 指定 → 只清该 agent 的缓存（可再用 scope 收窄）。
+        - module_id 指定 → 只清该 module 的 archive 缓存。
+        """
+        to_remove = []
+        for k in _cache:
+            if k[0] != project_id:
+                continue
+            layer = k[1] if len(k) > 1 else None
+            if layer == "project":
+                # (project_id, "project")
+                if scope == "project" or (
+                    agent_id is None and scope is None and module_id is None
+                ):
+                    to_remove.append(k)
+            elif layer == "agent":
+                # (project_id, "agent", agent_id, scope)
+                if agent_id is not None:
+                    if k[2] == agent_id and (scope is None or k[3] == scope):
+                        to_remove.append(k)
+                elif scope == "agent" or (
+                    agent_id is None and scope is None and module_id is None
+                ):
+                    to_remove.append(k)
+            elif layer == "archive":
+                # (project_id, "archive", module_id)
+                if module_id is not None:
+                    if k[2] == module_id:
+                        to_remove.append(k)
+                elif scope == "archive" or (
+                    agent_id is None and scope is None and module_id is None
+                ):
+                    to_remove.append(k)
         for k in to_remove:
             _cache.pop(k, None)
-        log.debug("memory_cache_invalidated", project_id=project_id)
+        log.debug("memory_cache_invalidated", project_id=project_id,
+                  agent_id=agent_id, scope=scope, module_id=module_id,
+                  cleared=len(to_remove))
 
     # ── DB helper ─────────────────────────────────────────────
 
@@ -81,7 +124,7 @@ class MemoryService:
         cursor = await conn.execute(
             "SELECT id, agent_id, scope, module_id, type, content, source_agent_id, "
             "metadata, created_at, updated_at FROM memories WHERE scope = 'project' "
-            "ORDER BY created_at ASC")
+            "ORDER BY created_at ASC LIMIT 100")
         rows = await cursor.fetchall()
         await cursor.close()
         result = [self._row_to_memory(r) for r in rows]
@@ -99,7 +142,7 @@ class MemoryService:
         cursor = await conn.execute(
             "SELECT id, agent_id, scope, module_id, type, content, source_agent_id, "
             "metadata, created_at, updated_at FROM memories "
-            "WHERE scope = ? AND agent_id = ? ORDER BY created_at ASC",
+            "WHERE scope = ? AND agent_id = ? ORDER BY created_at ASC LIMIT 100",
             [scope, agent_id])
         rows = await cursor.fetchall()
         await cursor.close()
@@ -117,7 +160,7 @@ class MemoryService:
         cursor = await conn.execute(
             "SELECT id, agent_id, scope, module_id, type, content, source_agent_id, "
             "metadata, created_at, updated_at FROM memories WHERE scope = 'archive' "
-            "AND module_id = ? ORDER BY created_at ASC", [module_id])
+            "AND module_id = ? ORDER BY created_at ASC LIMIT 100", [module_id])
         rows = await cursor.fetchall()
         await cursor.close()
         result = [self._row_to_memory(r) for r in rows]

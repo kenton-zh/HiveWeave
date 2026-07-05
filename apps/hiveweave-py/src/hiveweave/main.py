@@ -49,8 +49,12 @@ async def lifespan(app: FastAPI):
     log.info("app_starting", port=settings.port)
 
     # 1. Init Meta DB
-    await init_meta_db()
-    log.info("meta_db_initialized")
+    # R5 fix: 每个步骤独立 try/except — init_meta_db 失败不阻塞后续步骤
+    try:
+        await init_meta_db()
+        log.info("meta_db_initialized")
+    except Exception as e:
+        log.error("meta_db_init_failed", error=str(e))
 
     # 2. Clear zombie streaming messages
     try:
@@ -67,6 +71,23 @@ async def lifespan(app: FastAPI):
         log.info("zombie_streaming_cleared", projects=len(projects))
     except Exception as e:
         log.warning("zombie_streaming_clear_failed", error=str(e))
+
+    # 2b. R12 fix: 清理过期工具输出临时文件（7 天保留期）
+    try:
+        from hiveweave.tools.executor import ToolExecutor
+        projects = await meta_db.query("SELECT id, workspace_path FROM projects WHERE 1=1")
+        cleaned = 0
+        for p in projects:
+            try:
+                ws = p.get("workspace_path")
+                if ws:
+                    ToolExecutor.cleanup_tool_outputs(ws)
+                    cleaned += 1
+            except Exception as e:
+                log.warning("tool_output_cleanup_failed", project_id=p["id"], error=str(e))
+        log.info("tool_outputs_cleaned", projects=cleaned)
+    except Exception as e:
+        log.warning("tool_output_cleanup_init_failed", error=str(e))
 
     # 3. Seed default model
     try:

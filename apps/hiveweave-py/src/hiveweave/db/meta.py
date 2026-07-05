@@ -6,6 +6,8 @@
 - agents 表在此（RECONCILE 修复：agent 路由依赖 Meta DB 的 agents 表）
 """
 
+import asyncio
+
 import aiosqlite
 import structlog
 from pathlib import Path
@@ -17,6 +19,13 @@ from hiveweave.config import settings as app_settings
 log = structlog.get_logger(__name__)
 
 _db: aiosqlite.Connection | None = None
+
+# R1: 保护 init_meta_db 的懒初始化，避免并发调用创建多个连接
+_init_lock = asyncio.Lock()
+
+# R7: per-connection 迁移标记。close_meta_db 时重置为 False，
+# 这样 DB 被重建后重新 init 会重新执行迁移（而非误认为已迁移）。
+_migrated: bool = False
 
 
 # ── Schema migration ───────────────────────────────────────
@@ -51,7 +60,13 @@ async def _migrate_meta_schema(conn: aiosqlite.Connection) -> None:
 
     对每个可能缺失的列执行 ALTER TABLE ADD COLUMN，用 try/except 忽略
     "duplicate column name"（列已存在）和 "no such table"（表不存在）错误。
+
+    R7: 使用 per-connection 的 _migrated 标记，避免每次调用都重复执行 ALTER。
+    标记在 close_meta_db 中重置，保证 DB 重建后能重新迁移。
     """
+    global _migrated
+    if _migrated:
+        return
     for table, column, col_def in _META_MIGRATIONS:
         try:
             await conn.execute(
@@ -65,36 +80,45 @@ async def _migrate_meta_schema(conn: aiosqlite.Connection) -> None:
                 continue
             raise
     await conn.commit()
+    _migrated = True
 
 
 async def init_meta_db() -> None:
-    """Initialize Meta DB — create tables and indexes if not exist."""
+    """Initialize Meta DB — create tables and indexes if not exist.
+
+    R1: 使用 asyncio.Lock 保护懒初始化，并发调用时只创建一个连接。
+    """
     global _db
     db_path = app_settings.get_meta_db_path()
 
-    # Ensure parent directory exists
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    async with _init_lock:
+        # Double-check：持锁后再次确认，已初始化则直接返回
+        if _db is not None:
+            return
 
-    _db = await aiosqlite.connect(db_path)
-    _db.row_factory = aiosqlite.Row
+        # Ensure parent directory exists
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # WAL mode for Meta DB (global, concurrent reads)
-    await _db.execute("PRAGMA journal_mode=WAL")
-    await _db.execute("PRAGMA busy_timeout=5000")
-    await _db.execute("PRAGMA foreign_keys=ON")
+        _db = await aiosqlite.connect(db_path)
+        _db.row_factory = aiosqlite.Row
 
-    # Create tables
-    for sql in META_DB_TABLES:
-        await _db.execute(sql)
+        # WAL mode for Meta DB (global, concurrent reads)
+        await _db.execute("PRAGMA journal_mode=WAL")
+        await _db.execute("PRAGMA busy_timeout=5000")
+        await _db.execute("PRAGMA foreign_keys=ON")
 
-    # Create indexes
-    for sql in META_DB_INDEXES:
-        await _db.execute(sql)
+        # Create tables
+        for sql in META_DB_TABLES:
+            await _db.execute(sql)
 
-    # Migrate columns missing from TS-created tables
-    await _migrate_meta_schema(_db)
+        # Create indexes
+        for sql in META_DB_INDEXES:
+            await _db.execute(sql)
 
-    await _db.commit()
+        # Migrate columns missing from TS-created tables
+        await _migrate_meta_schema(_db)
+
+        await _db.commit()
 
 
 async def get_meta_db() -> aiosqlite.Connection:
@@ -108,10 +132,13 @@ async def get_meta_db() -> aiosqlite.Connection:
 
 async def close_meta_db() -> None:
     """Close the Meta DB connection."""
-    global _db
-    if _db is not None:
-        await _db.close()
-        _db = None
+    global _db, _migrated
+    async with _init_lock:
+        if _db is not None:
+            await _db.close()
+            _db = None
+        # R7: 重置迁移标记，DB 重建后重新 init 会重新执行迁移
+        _migrated = False
 
 
 async def query(sql: str, params: list[Any] | None = None) -> list[aiosqlite.Row]:
