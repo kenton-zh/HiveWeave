@@ -50,6 +50,7 @@ class ProjectCreate(BaseModel):
     userInvolvement: str | None = None
     orgPattern: str | None = None
     operatorName: str | None = None
+    language: str | None = None
 
 
 class ProjectUpdate(BaseModel):
@@ -140,6 +141,7 @@ def _project_response(row: dict, active_id: str | None = None) -> dict:
         "workspacePath": row.get("workspace_path"),
         "org_paradigm": row.get("org_paradigm"),
         "orgParadigm": row.get("org_paradigm"),
+        "language": row.get("language"),
         "charter": charter,
         "is_active": is_active,
         "isActive": is_active,
@@ -195,6 +197,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "goal": "Coordinate the project, manage subordinates, deliver the charter.",
                 "backstory": "The chief executive officer of the project.",
                 "permission_type": "coordinator",
+                "status": "active",
             }
         )
         created_ids.append(ceo["id"])
@@ -206,6 +209,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "goal": "Manage personnel: hire, transfer, dismiss agents per CEO requests.",
                 "backstory": "The human resources lead.",
                 "permission_type": "coordinator",
+                "status": "active",
             }
         )
         await org.create_agent(
@@ -216,6 +220,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "goal": "Guard quality gates; review and test work before merge.",
                 "backstory": "The quality assurance lead.",
                 "permission_type": "coordinator",
+                "status": "active",
             }
         )
     except Exception as e:
@@ -281,7 +286,7 @@ async def create_project(body: ProjectCreate) -> dict:
                 str(ws),
                 charter.get("orgPattern", "solo"),
                 json.dumps(charter, ensure_ascii=False),
-                "en",
+                body.language or "en",
                 now_ms,
                 now_ms,
             ],
@@ -292,6 +297,18 @@ async def create_project(body: ProjectCreate) -> dict:
 
     # 自动创建默认 agent
     agent_ids = await _seed_default_agents(project_id)
+
+    # 启动 agent + game time（C3/C4 fix: 新项目创建后立即启动运行时资源）
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+        await agent_manager.start_project_agents(project_id)
+    except Exception as e:
+        log.warning("start_agents_after_create_failed", project_id=project_id, error=str(e))
+    try:
+        gt = GameTimeService(project_id)
+        await gt.start(project_id)
+    except Exception as e:
+        log.warning("start_game_time_after_create_failed", project_id=project_id, error=str(e))
 
     row = await meta_db.query_one("SELECT * FROM projects WHERE id = ?", [project_id])
     log.info("project_created", project_id=project_id, name=body.name, workspace=str(ws))
@@ -423,7 +440,7 @@ async def put_project(project_id: str, body: ProjectUpdate) -> dict:
 
 @router.delete("/{project_id}")
 async def delete_project(project_id: str) -> dict:
-    """删除项目（删库文件 + meta 删行）。"""
+    """删除项目（停 agent + 停 game time + 删库文件 + meta 删行 + 清内存）。"""
     row = await meta_db.query_one(
         "SELECT workspace_path FROM projects WHERE id = ?", [project_id]
     )
@@ -431,6 +448,56 @@ async def delete_project(project_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Project not found")
 
     workspace = row["workspace_path"] or ""
+
+    # C1 fix: 先停止该项目所有 agent（取消 LLM task + 清理内存对象）
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+        await agent_manager.stop_project_agents(project_id)
+    except Exception as e:
+        log.warning("stop_agents_before_delete_failed", project_id=project_id, error=str(e))
+
+    # C2 fix: 停止 game time tick loop
+    try:
+        gt = GameTimeService(project_id)
+        await gt.stop(project_id)
+    except Exception as e:
+        log.warning("stop_game_time_before_delete_failed", project_id=project_id, error=str(e))
+
+    # M2 fix: 清理 game_time 内存状态
+    try:
+        from hiveweave.services.game_time import _states, _alarm_project
+        _states.pop(project_id, None)
+        # 清理该项目的 alarm 映射
+        stale_alarms = [aid for aid, pid in _alarm_project.items() if pid == project_id]
+        for aid in stale_alarms:
+            _alarm_project.pop(aid, None)
+    except Exception:
+        pass
+
+    # M3 fix: 清理 approval_service 中该项目的 pending 请求
+    try:
+        from hiveweave.services.approval import approval_service
+        approval_service.cleanup_project(project_id)
+    except Exception:
+        pass
+
+    # M4+M5 fix: 清理 conversation_store 缓存 + status_event_bus processing 状态
+    try:
+        from hiveweave.conversation.store import conversation_store
+        from hiveweave.realtime.event_bus import status_event_bus
+        agents = await meta_db.query(
+            "SELECT id FROM agents WHERE project_id = ?", [project_id]
+        )
+        for a in agents:
+            aid = a["id"]
+            try:
+                await conversation_store.clear(aid, project_id)
+            except Exception:
+                pass
+            status_event_bus.set_processing(aid, False)
+    except Exception:
+        pass
+
     if workspace:
         try:
             await project_db.evict_project_db(workspace)

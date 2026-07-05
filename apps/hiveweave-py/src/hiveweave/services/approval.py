@@ -231,6 +231,24 @@ class ApprovalService:
                     restored=restored, rejected=rejected,
                     pending_in_memory=len(self._pending))
 
+    def cleanup_project(self, project_id: str) -> None:
+        """清理指定项目的所有 pending 审批请求（项目删除时调用）。
+
+        取消所有属于该项目的 pending Future，使等待审批的 agent task
+        收到 CancelledError 而非永久阻塞。
+        """
+        stale_ids = [
+            rid for rid, entry in self._pending.items()
+            if entry.project_id == project_id
+        ]
+        for rid in stale_ids:
+            entry = self._pending.pop(rid, None)
+            if entry and not entry.future.done():
+                entry.future.cancel()
+        if stale_ids:
+            logger.info("approval.cleanup_project",
+                        project_id=project_id, cleaned=len(stale_ids))
+
     async def _remember_rule(
         self, agent_id: str, tool_pattern: str, approved: bool
     ) -> None:
