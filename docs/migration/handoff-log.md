@@ -30,6 +30,30 @@
 
 ## 日志
 
+### [完成] 2026-07-05 | TRAE (Claude) | Phase 0 功能契约盘点
+- 做了什么：完成全部 13 个模块的功能契约草稿
+- 改了哪些文件：
+  - 创建 `feature-contracts/00-template.md`（契约模板）
+  - 创建 `feature-contracts/01-llm-streaming.md` 到 `13-prompt-ethos.md`（13 个契约文件）
+  - 更新 `progress.md`（Phase 0 → 🔄 进行中，13/13 草稿完成）
+- 研究方法：
+  - 模块 01-04：直接读 Elixir + TS + OpenCode 源码
+  - 模块 05-13：并行 3 个 Explore subagent 研究 9 个模块（记忆/收件箱/交接、游戏时间/权限审批、Git worktree/MCP/实时通信）
+- 关键发现：
+  - 01 LLM 流式：Elixir 30s 超时 vs TS 三层防线（180s/90s/60s/300s），Python 采用 TS 三层防线
+  - 02 工具执行器：Elixir 73 个 dispatch 分支 vs TS 68 个，以 Elixir 为准
+  - 03 对话历史：OpenCode compaction 是 HiveWeave TS 的源头，tail_turns=2
+  - 04 多 agent：OpenCode 无此功能，以 Elixir 为 P0 参考
+  - 06 交接：Elixir 有 context_delivered 防重复注入 + create_handoff 去重，TS 无
+  - 08 权限：Elixir readonly 22 个工具 vs TS 5 个，审批超时 120s vs 300s
+  - 10 MCP：Elixir 简化为 HTTP-only（E1），Python 用官方 mcp SDK 支持 stdio+HTTP
+- 下一个接手需要注意：
+  - 所有 13 个契约文件状态为"草稿"，等待用户逐模块确认
+  - 用户确认后标记为"已确认"才能进入实现阶段
+  - 契约文件位于 `docs/migration/feature-contracts/` 目录
+  - 下一步：等待用户审查契约，或开始 Phase 1（迁移路径规划）
+- progress.md 已更新：是
+
 ### [完成] 2026-07-05 | TRAE (Claude) | 4项常量确认
 - 做了什么：以 `D:\PC_AI\Project\opencode` 为 P0 参考源，确认 4 项 ⚠️ 待定常量
 - 改了哪些文件：
