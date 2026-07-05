@@ -26,6 +26,7 @@ from hiveweave.api.communications import router as communications_router
 from hiveweave.api.logs import router as logs_router
 from hiveweave.api.alarms import router as alarms_router
 from hiveweave.api.filesystem import router as filesystem_router
+from hiveweave.api.filesystem import fs_router as fs_browse_router
 from hiveweave.api.debug import router as debug_router
 
 log = structlog.get_logger(__name__)
@@ -44,6 +45,7 @@ _SUB_ROUTERS = [
     logs_router,
     alarms_router,
     filesystem_router,
+    fs_browse_router,  # /api/fs/browse — 全局文件系统浏览（新建项目用）
     debug_router,
 ]
 

@@ -23,6 +23,9 @@ log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/filesystem", tags=["filesystem"])
 
+# 独立 router 用于全局文件系统浏览（无 prefix，前端调用 /api/fs/browse）
+fs_router = APIRouter(tags=["filesystem"])
+
 #: 单次读取最大字节数（防 OOM）
 _MAX_READ_BYTES = 512 * 1024
 #: 单次 grep 最大返回行数
@@ -181,3 +184,110 @@ async def grep_files(
     except PermissionError:
         raise HTTPException(status_code=403, detail="Permission denied")
     return {"matches": matches, "truncated": False, "count": len(matches)}
+
+
+# ── 全局文件系统浏览（新建项目用，不需要 projectId）────────────
+
+# Windows 驱动器检测
+import os
+import platform
+
+
+def _list_windows_drives() -> list[str]:
+    """列出 Windows 可用驱动器（如 ['C:\\', 'D:\\']）。"""
+    drives: list[str] = []
+    if platform.system() != "Windows":
+        return drives
+    try:
+        import ctypes
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i in range(26):
+            if bitmask & (1 << i):
+                letter = chr(ord("A") + i)
+                drives.append(f"{letter}:\\")
+    except Exception:
+        # 回退：扫描 A-Z
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            drive = f"{letter}:\\"
+            if Path(drive).exists():
+                drives.append(drive)
+    return drives
+
+
+@fs_router.get("/api/fs/browse")
+async def fs_browse(path: str = Query(default="")) -> dict:
+    """全局文件系统浏览（用于新建项目选择目录）。
+
+    不需要 projectId — 浏览文件系统任意位置。
+    返回前端 BrowseResult 格式: currentPath, parentPath, entries, drives。
+    """
+    # 确定要浏览的路径
+    if not path:
+        # 默认：用户主目录
+        path = str(Path.home())
+
+    target = Path(path).resolve()
+
+    # 路径不存在 → 回退到主目录
+    if not target.exists():
+        target = Path.home()
+
+    # 如果是文件 → 浏览其父目录
+    if target.is_file():
+        target = target.parent
+
+    # 计算父目录
+    parent = str(target.parent) if target.parent != target else None
+
+    # 列目录内容
+    entries: list[dict] = []
+    try:
+        for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+            # 跳过隐藏文件和系统目录
+            if child.name.startswith(".") and child.name not in (".", ".."):
+                # 不跳过 . 开头的目录（用户可能需要）
+                pass
+            # 跳过 Windows 系统目录（减少噪声）
+            if child.name in ("$RECYCLE.BIN", "System Volume Information", "$WinREAgent"):
+                continue
+            try:
+                is_dir = child.is_dir()
+            except OSError:
+                continue
+
+            entries.append({
+                "name": child.name,
+                "path": str(child),
+                "fullPath": str(child),
+                "isDir": is_dir,
+                "is_dir": is_dir,
+                "size": 0 if is_dir else child.stat().st_size if child.exists() else 0,
+            })
+    except PermissionError:
+        return {
+            "currentPath": str(target),
+            "parentPath": parent,
+            "entries": [],
+            "drives": _list_windows_drives() if platform.system() == "Windows" else [],
+            "error": "Permission denied",
+        }
+    except Exception as e:
+        log.warning("fs_browse_failed", path=str(target), error=str(e))
+        return {
+            "currentPath": str(target),
+            "parentPath": parent,
+            "entries": [],
+            "drives": _list_windows_drives() if platform.system() == "Windows" else [],
+            "error": str(e),
+        }
+
+    return {
+        "path": str(target),
+        "currentPath": str(target),
+        "parentPath": parent,
+        "parent": parent,
+        "entries": entries,
+        "isFile": False,
+        "isRoot": parent is None,
+        "drives": _list_windows_drives() if platform.system() == "Windows" else [],
+    }
