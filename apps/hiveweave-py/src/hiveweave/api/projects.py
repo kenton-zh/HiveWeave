@@ -187,6 +187,18 @@ async def _seed_default_agents(project_id: str) -> list[str]:
             if a.get("role") == "ceo":
                 return [a["id"]]
         return []
+
+    # 获取默认模型 ID（第一个 active 模型）
+    default_model_id = None
+    try:
+        from hiveweave.services.model import ModelService
+        ms = ModelService()
+        active_models = await ms.list_active()
+        if active_models:
+            default_model_id = active_models[0].get("model_id") or active_models[0].get("id")
+    except Exception:
+        pass
+
     created_ids: list[str] = []
     try:
         ceo = await org.create_agent(
@@ -198,6 +210,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "backstory": "The chief executive officer of the project.",
                 "permission_type": "coordinator",
                 "status": "active",
+                "model_id": default_model_id,
             }
         )
         ceo_id = ceo["id"]
@@ -212,6 +225,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "permission_type": "coordinator",
                 "status": "active",
                 "parent_id": ceo_id,
+                "model_id": default_model_id,
             }
         )
         await org.create_agent(
@@ -224,6 +238,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "permission_type": "coordinator",
                 "status": "active",
                 "parent_id": ceo_id,
+                "model_id": default_model_id,
             }
         )
     except Exception as e:
