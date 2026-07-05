@@ -189,19 +189,28 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 return [a["id"]]
         return []
 
-    # 获取默认模型 ID（优先选择非 free 的 active 模型）
+    # 获取默认模型 ID（优先选择 step 系列，其次非 free 模型）
     default_model_id = None
     try:
         from hiveweave.services.model import ModelService
         ms = ModelService()
         active_models = await ms.list_active()
         if active_models:
-            # 优先选择非 free 模型
+            # 优先选择 step 系列模型
+            step_models = [m for m in active_models if "step" in (m.get("model_id") or "").lower()]
             non_free = [m for m in active_models if "free" not in (m.get("model_id") or "").lower()]
-            chosen = non_free[0] if non_free else active_models[0]
+            if step_models:
+                chosen = step_models[0]
+            elif non_free:
+                chosen = non_free[0]
+            else:
+                chosen = active_models[0]
             default_model_id = chosen.get("model_id") or chosen.get("id")
-    except Exception:
-        pass
+            log.info("seed_default_model", default_model_id=default_model_id, total_models=len(active_models))
+        else:
+            log.warning("seed_no_active_models")
+    except Exception as e:
+        log.warning("seed_default_model_failed", error=str(e))
 
     created_ids: list[str] = []
     try:
@@ -219,6 +228,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
         )
         ceo_id = ceo["id"]
         created_ids.append(ceo_id)
+        log.info("seed_ceo_created", ceo_id=ceo_id, model_id=default_model_id, returned_model_id=ceo.get("model_id"))
         await org.create_agent(
             {
                 "project_id": project_id,
