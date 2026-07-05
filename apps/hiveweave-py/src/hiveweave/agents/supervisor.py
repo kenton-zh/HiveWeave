@@ -220,10 +220,10 @@ class AgentManager:
         try:
             # 查询项目下所有 active agent
             rows = await meta_db.query(
-                "SELECT id, project_id, name, role, role_type, backstory, "
+                "SELECT id, project_id, name, role, permission_type as role_type, backstory, "
                 "model_id, goal, permission_mode, bound_skills, "
                 "allowed_tools, denied_tools, ask_tools, "
-                "involvement_level, status "
+                "short_id, status "
                 "FROM agents WHERE project_id = ? AND status = 'active'",
                 [project_id],
             )
