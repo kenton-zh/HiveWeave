@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HiveWeave 后端框架选型对比：Elixir vs TypeScript vs Python</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #181b24;
+    --surface-muted: #1f2330;
+    --border: #2a2f3d;
+    --text: #e6e8ee;
+    --text-muted: #9aa3b2;
+    --brand: #7c5cff;
+    --brand-soft: rgba(124, 92, 255, 0.14);
+    --accent: #2dd4bf;
+    --good: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --code-font: "JetBrains Mono", "Fira Code", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.7;
+    font-size: 15px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 28px 80px; }
+  h1 { font-size: 30px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.02em; }
+  .subtitle { color: var(--text-muted); font-size: 15px; margin-bottom: 40px; }
+  h2 {
+    font-size: 22px; font-weight: 600; margin: 48px 0 16px;
+    padding-bottom: 10px; border-bottom: 1px solid var(--border);
+    letter-spacing: -0.01em;
+  }
+  h3 { font-size: 17px; font-weight: 600; margin: 28px 0 12px; color: var(--text); }
+  p { margin: 10px 0; color: var(--text); }
+  .lead { font-size: 16px; color: var(--text); }
+  strong { color: var(--text); font-weight: 600; }
+  code {
+    background: var(--surface-muted); padding: 2px 6px; border-radius: 4px;
+    font-family: var(--code-font); font-size: 13px; color: var(--accent);
+  }
+  pre {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; overflow-x: auto;
+    font-family: var(--code-font); font-size: 13px; line-height: 1.6;
+  }
+  pre code { background: none; padding: 0; color: var(--text); }
+  table {
+    width: 100%; border-collapse: collapse; margin: 16px 0;
+    font-size: 14px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  }
+  th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--surface-muted); font-weight: 600; color: var(--text); font-size: 13px; }
+  td { color: var(--text-muted); }
+  tr:last-child td { border-bottom: none; }
+  .pill {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+  }
+  .p-good { background: rgba(52, 211, 153, 0.15); color: var(--good); }
+  .p-warn { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+  .p-bad  { background: rgba(248, 113, 113, 0.15); color: var(--bad); }
+  .p-brand { background: var(--brand-soft); color: var(--brand); }
+  .verdict-box {
+    background: linear-gradient(135deg, var(--brand-soft), transparent 60%);
+    border: 1px solid var(--brand);
+    border-radius: 12px; padding: 24px 28px; margin: 24px 0;
+  }
+  .verdict-box h3 { margin-top: 0; color: var(--brand); }
+  .swot-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0;
+  }
+  .swot-cell {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .swot-cell h4 {
+    margin: 0 0 8px; font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .swot-cell ul { margin: 0; padding-left: 18px; }
+  .swot-cell li { font-size: 13px; color: var(--text-muted); margin: 4px 0; }
+  .swot-s h4 { color: var(--good); }
+  .swot-w h4 { color: var(--bad); }
+  .swot-o h4 { color: var(--accent); }
+  .swot-t h4 { color: var(--warn); }
+  .callout {
+    border-left: 3px solid var(--brand); background: var(--surface);
+    padding: 14px 18px; margin: 16px 0; border-radius: 0 8px 8px 0;
+    font-size: 14px;
+  }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout.bad { border-left-color: var(--bad); }
+  .callout.good { border-left-color: var(--good); }
+  .toc {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 18px 24px; margin: 24px 0 40px;
+  }
+  .toc ol { margin: 6px 0 0; padding-left: 22px; }
+  .toc li { margin: 4px 0; }
+  .toc a { color: var(--brand); text-decoration: none; font-size: 14px; }
+  .toc a:hover { text-decoration: underline; }
+  .src { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .src a { color: var(--accent); text-decoration: none; word-break: break-all; }
+  .src a:hover { text-decoration: underline; }
+  .score-bar {
+    display: inline-block; width: 60px; height: 6px; background: var(--border);
+    border-radius: 3px; overflow: hidden; vertical-align: middle; margin-right: 6px;
+  }
+  .score-fill { display: block; height: 100%; background: var(--brand); border-radius: 3px; }
+  .tag-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>HiveWeave 后端框架选型对比</h1>
+<div class="subtitle">Elixir/Phoenix &nbsp;·&nbsp; TypeScript/Fastify &nbsp;·&nbsp; Python/FastAPI &nbsp;|&nbsp; 调研日期 2026-07-05</div>
+
+<div class="lead">
+这是一份针对 HiveWeave（类 OpenCode / Claude Code 的多 agent 编排系统）后端语言栈选型的技术对比报告。三方候选：<strong>当前 Elixir/Phoenix 后端</strong>、<strong>TS/Fastify 参考实现</strong>、<strong>候选的 Python（FastAPI + LangGraph）方案</strong>。用户前提：开发由 AI 完成，工作量与难度不在考虑范围，只关心最终框架能达到的最优效果。
+</div>
+
+<div class="verdict-box">
+<h3>核心结论（TL;DR）</h3>
+<p><strong>不建议整体重构为 Python。</strong> 对 HiveWeave 这种"多 agent 长时运行 + 实时流式 + 进程级隔离容错"系统，Elixir/BEAM 的 OTP 在最关键的<strong>并发隔离、故障自愈、实时广播</strong>三件事上有原生优势，是 TS 和 Python 都需要额外补齐的短板。Python 的优势集中在 LLM SDK 首发、agent 编排框架丰富、AI 代码生成可靠度高，但这些优势在 HiveWeave 当前架构里可以通过<strong>保留 Elixir 编排壳 + 把 LLM/工具执行下沉到 Python 微服务</strong>的混合方案拿到，而不必抛弃已有的 supervisor 树、Phoenix Channels、CircuitBreaker、per-agent GenServer 等已实现且难以在 Python 中等价复刻的工程资产。</p>
+<p>若一定要二选一整体换栈，<strong>Python &gt; TypeScript</strong>——因为 Python 在 LLM 生态、agent 框架、AI 开发可靠度上对 TS 形成代差优势，而 TS 相对 Elixir 在 HiveWeave 最关心的并发/容错维度上没有拉开差距。</p>
+</div>
+
+<div class="toc">
+<strong>目录</strong>
+<ol>
+<li><a href="#scope">调研范围与方法</a></li>
+<li><a href="#matrix">三方对比矩阵</a></li>
+<li><a href="#elixir">Elixir/Phoenix 后端深度评估</a></li>
+<li><a href="#ts">TS/Fastify 参考实现评估</a></li>
+<li><a href="#python">Python 候选方案评估</a></li>
+<li><a href="#swot">SWOT 对比</a></li>
+<li><a href="#fit">针对 HiveWeave 场景的适配性</a></li>
+<li><a href="#recommend">最终建议</a></li>
+<li><a href="#sources">参考资料</a></li>
+</ol>
+</div>
+
+<h2 id="scope">1. 调研范围与方法</h2>
+<p><strong>三方候选</strong>：</p>
+<ul>
+<li><strong>Elixir/Phoenix（当前）</strong>：基于实际代码库 <code>apps/hiveweave/</code> 调研，约 1.2 万行 Elixir，含 streamer（2685 行）、tool_executor（4131 行）、20 个 schema、16 个 service。</li>
+<li><strong>TS/Fastify（参考）</strong>：基于 <code>apps/server/</code> + <code>packages/</code> 实际代码调研，server 路由 9 个、core 服务 20+、agent-runtime 完整封装 Vercel AI SDK。</li>
+<li><strong>Python（候选）</strong>：基于网络调研，对应方案为 <code>FastAPI + LangGraph + Pydantic AI + OpenTelemetry/Phoenix</code>。</li>
+</ul>
+<p><strong>评估维度</strong>（仅关心"最终效果"）：LLM 生态完整度、agent 编排能力、并发隔离与容错、实时通信、长对话状态管理、工具系统、可观测性、AI 代码生成可靠度、长期维护风险。</p>
+
+<h2 id="matrix">2. 三方对比矩阵</h2>
+
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Elixir/Phoenix（当前）</th>
+<th>TS/Fastify（参考）</th>
+<th>Python/FastAPI（候选）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>LLM SDK 首发</strong></td>
+<td><span class="pill p-bad">社区库</span> Elixir LangChain，覆盖 OpenAI/Anthropic/Google/Ollama</td>
+<td><span class="pill p-good">一等</span> OpenAI/Anthropic 官方 Node SDK + Vercel AI SDK</td>
+<td><span class="pill p-good">一等</span> 所有主流厂商 Python SDK 首发</td>
+</tr>
+<tr>
+<td><strong>Agent 编排框架</strong></td>
+<td><span class="pill p-bad">无原生</span> 自建 OTP 编排</td>
+<td><span class="pill p-warn">中等</span> Vercel AI SDK、Mastra</td>
+<td><span class="pill p-good">最丰富</span> LangGraph、OpenAI Agents SDK、Pydantic AI、CrewAI、MAF</td>
+</tr>
+<tr>
+<td><strong>并发模型</strong></td>
+<td><span class="pill p-good">BEAM 原生</span> 轻量进程（百万级）+ supervisor 树 + 进程隔离</td>
+<td><span class="pill p-warn">event loop</span> IO 友好，无进程隔离</td>
+<td><span class="pill p-warn">asyncio</span> IO 友好，无进程隔离，GIL 限制 CPU 密集</td>
+</tr>
+<tr>
+<td><strong>故障自愈</strong></td>
+<td><span class="pill p-good">原生</span> supervisor 重启策略 + CircuitBreaker + crash_recovery</td>
+<td><span class="pill p-bad">需自建</span> 无原生</td>
+<td><span class="pill p-bad">需框架补齐</span> LangGraph 检查点可恢复，但无进程级隔离</td>
+</tr>
+<tr>
+<td><strong>实时通信</strong></td>
+<td><span class="pill p-good">原生</span> Phoenix Channels + PubSub 跨进程广播</td>
+<td><span class="pill p-warn">需自建</span> SSE + EventEmitter，无跨进程广播</td>
+<td><span class="pill p-warn">需自建</span> FastAPI SSE/WebSocket，需 Redis/NATS 补 PubSub</td>
+</tr>
+<tr>
+<td><strong>流式输出</strong></td>
+<td>WebSocket（Phoenix Channel）</td>
+<td>SSE over HTTP</td>
+<td>SSE 或 WebSocket（均原生支持）</td>
+</tr>
+<tr>
+<td><strong>类型安全</strong></td>
+<td><span class="pill p-warn">中等</span> 静态类型但无 schema 运行时校验</td>
+<td><span class="pill p-good">强</span> Effect + Zod，编译期+运行时双重</td>
+<td><span class="pill p-good">强</span> Pydantic + Pydantic AI，运行时校验</td>
+</tr>
+<tr>
+<td><strong>AI 代码生成可靠度</strong></td>
+<td><span class="pill p-bad">弱</span> BEAM 语料少，Task.yield/handle_info 等 AI 易出错</td>
+<td><span class="pill p-good">强</span> TS 语料充足</td>
+<td><span class="pill p-good">最强</span> Python AI 语料最多，错误率最低</td>
+</tr>
+<tr>
+<td><strong>可观测性生态</strong></td>
+<td><span class="pill p-warn">通用</span> Telemetry 库，LLM 专用工具少</td>
+<td><span class="pill p-good">良好</span> OpenTelemetry + Vercel AI SDK tracing</td>
+<td><span class="pill p-good">最完整</span> LangSmith / Phoenix / Langfuse / OTel 全覆盖</td>
+</tr>
+<tr>
+<td><strong>per-project DB 隔离</strong></td>
+<td>DBConnection 池 + Exqlite（多连接，已实现）</td>
+<td>better-sqlite3（单连接，已实现）</td>
+<td>SQLAlchemy async + aiosqlite（需实现）</td>
+</tr>
+<tr>
+<td><strong>工具系统成熟度</strong></td>
+<td><span class="pill p-good">完整</span> 73 个 dispatch 子句，权限矩阵 7 角色</td>
+<td><span class="pill p-good">完整</span> 68 个 case，Effect 类型安全</td>
+<td><span class="pill p-warn">需移植</span> 框架提供 hook，工具需重写</td>
+</tr>
+<tr>
+<td><strong>MCP 集成</strong></td>
+<td><span class="pill p-warn">简化</span> 仅 HTTP JSON-RPC，无 stdio</td>
+<td><span class="pill p-good">完整</span> @modelcontextprotocol/sdk，stdio+HTTP</td>
+<td><span class="pill p-good">完整</span> 官方 Python SDK，stdio+HTTP</td>
+</tr>
+<tr>
+<td><strong>人才可招性</strong></td>
+<td><span class="pill p-bad">稀缺</span></td>
+<td><span class="pill p-good">高</span></td>
+<td><span class="pill p-good">最高</span></td>
+</tr>
+<tr>
+<td><strong>当前实现完整度</strong></td>
+<td><span class="pill p-good">完整</span> 生产可用，OTP 容错增强</td>
+<td><span class="pill p-good">完整</span> 生产可用，类型安全更强</td>
+<td><span class="pill p-bad">未实现</span> 需从零移植</td>
+</tr>
+</tbody>
+</table>
+
+<h2 id="elixir">3. Elixir/Phoenix 后端深度评估</h2>
+
+<h3>架构亮点</h3>
+<p><strong>分层 OTP 监督树</strong>：顶层 <code>rest_for_one</code> 策略，<code>ProjectSupervisor</code>（DynamicSupervisor）→ 每项目 <code>AgentSupervisor</code>（DynamicSupervisor）→ 每 agent 独立 <code>Agent</code> GenServer（<code>restart: :transient</code>）。这意味着<strong>单个 agent 崩溃不会影响其他 agent</strong>，supervisor 会按策略自动重启。这是 BEAM 的原生能力，TS 和 Python 都没有等价物。</p>
+<p><strong>三态熔断器</strong>：<code>CircuitBreaker</code> GenServer（closed/open/half_open），probe owner 进程监控，probe 崩溃自动回 <code>:open</code>。LLM 调用前先 <code>CircuitBreaker.check</code>，连续失败触发熔断保护下游。</p>
+<p><strong>Phoenix PubSub 跨进程广播</strong>：三个 topic（<code>agent:{id}</code>、<code>project:{id}</code>、<code>lobby:status</code>）天然支持多 agent 状态变更的实时广播，前端通过 Phoenix Channel（WebSocket）接收。TS 的 <code>statusEventBus</code> 和 Python 的 FastAPI 都需要自建或引入 Redis 才能跨进程广播。</p>
+<p><strong>per-agent GenServer 状态机</strong>：idle ↔ processing，带 <code>crash_recover</code>（handle_info 异常时清理状态回 idle 防级联）、<code>safety_timeout</code>（10 分钟）、空响应指数退避重试（5s/15s/45s，超限上报上级）、<code>maybe_self_retrigger</code>（完成后检查 pending inbox 自动再触发）。</p>
+
+<h3>实现完整度</h3>
+<table>
+<thead><tr><th>模块</th><th>状态</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>OTP 监督树</td><td><span class="pill p-good">完整</span></td><td>分层 DynamicSupervisor + Registry + Task.Supervisor</td></tr>
+<tr><td>LLM 流式</td><td><span class="pill p-good">完整</span></td><td>SSE 解析 + WebSocket 推送，多 provider 兼容（DeepSeek/Step/OpenAI/Claude）</td></tr>
+<tr><td>工具循环</td><td><span class="pill p-good">完整</span></td><td>并行执行 + 120s 超时 + 5 个/轮上限 + doom loop 检测</td></tr>
+<tr><td>ConversationStore</td><td><span class="pill p-good">完整</span></td><td>token-budget 裁剪 + LLM compaction + 不拆 tool_call/result 对</td></tr>
+<tr><td>Memory 三层</td><td><span class="pill p-good">完整</span></td><td>ETS 缓存 + PubSub 失效，project/agent/archive</td></tr>
+<tr><td>Inbox/Handoff/Dispatch</td><td><span class="pill p-good">完整</span></td><td>完整状态机 + 去重 + expect_report</td></tr>
+<tr><td>GameTime</td><td><span class="pill p-good">完整</span></td><td>持久化 + alarms + 停滞检测 + per-agent cooldown</td></tr>
+<tr><td>per-project DB</td><td><span class="pill p-good">完整</span></td><td>DBConnection 池 + 自愈 + 运行时 migration</td></tr>
+<tr><td>权限矩阵</td><td><span class="pill p-good">完整</span></td><td>7 角色，73 个工具 dispatch</td></tr>
+<tr><td>GitWorktree</td><td><span class="pill p-good">完整</span></td><td>create/checkpoint/merge/rollback/remove/list/status</td></tr>
+<tr><td>MCP 集成</td><td><span class="pill p-warn">简化</span></td><td>仅 HTTP JSON-RPC，硬编码 4 个服务，无 stdio transport</td></tr>
+<tr><td>ETHOS 三层提示词</td><td><span class="pill p-good">完整</span></td><td>identity（静态）+ context（动态）+ involvement（可调）</td></tr>
+</tbody>
+</table>
+<p class="src">全 lib 目录 grep <code>TODO/FIXME/stub</code> 无匹配，无占位实现。唯一降级是 MCP。</p>
+
+<h3>关键短板</h3>
+<div class="callout bad">
+<strong>1. LLM 生态落后。</strong> 无原生 agent 编排框架，唯一选择是社区维护的 Elixir LangChain。LangGraph 级别的状态机/检查点/HITL 能力不存在。新 provider（如新的 OpenAI 模型、新的工具调用协议）通常 Python/TS SDK 先发，Elixir 需等社区跟进。
+</div>
+<div class="callout bad">
+<strong>2. AI 代码生成可靠度最弱。</strong> BEAM 特有 API（<code>Task.yield</code>、<code>handle_info</code>、<code>@stream_items</code>、<code>GenServer</code> 回调）在 LLM 训练语料中占比小，AI 生成 Elixir 代码的语法和惯用法错误率明显高于 Python/TS。这一点对"代码由 AI 开发"的前提是直接矛盾。
+</div>
+<div class="callout warn">
+<strong>3. MCP 集成降级。</strong> 当前仅 HTTP JSON-RPC，<code>guess_mcp_url</code> 硬编码 4 个已知服务，无 stdio transport、无动态服务发现。TS 和 Python 都有官方完整 SDK。
+</div>
+
+<h2 id="ts">4. TS/Fastify 参考实现评估</h2>
+
+<h3>架构亮点</h3>
+<p><strong>类型安全最强</strong>：Effect-TS + @effect/schema + Zod 提供编译期 + 运行时双重类型安全。<code>ToolExecutor</code> 和 7 个内置工具用 Effect 实现类型化错误与可组合执行。<code>agent-runtime</code> 刻意不用 Effect 以保持轻量——这种分层设计本身就体现了工程成熟度。</p>
+<p><strong>三层超时防线</strong>（Elixir 无对应）：① 请求级 <code>timeoutFetch</code> 180s AbortSignal ② 流级 <code>withIdleTimeout</code> idle watchdog（首 chunk 90s，后续 60s）③ turn 级 <code>HW_TURN_IDLE_MS=300s</code>。每次 attempt 独立 AbortController，超时立即 <code>controller.abort()</code> 终止 TCP。</p>
+<p><strong>DeepSeek 前缀缓存优化</strong>：消息布局为 identity（静态 system）→ context（静态 system）→ history（稳定前缀）→ dynamicContext 合并到 user message，98%+ 缓存命中率。<code>computePrefixHash</code> FNV-1a 哈希检测前缀漂移。Anthropic 还单独注入 inline cache hints。</p>
+<p><strong>retry-utils 最完整</strong>：18 条 overflow 正则覆盖 OpenAI/Anthropic/Google/DeepSeek 文案，9 类错误分类，Retry-After 支持 ms/秒/HTTP-date 三种格式，指数退避 + [0.8, 1.2] jitter。</p>
+
+<h3>实现完整度</h3>
+<p>所有 20+ core 服务、9 个路由、AgentRuntime、retry-utils、两层 SQLite、token-utils、GitWorktreeService、MCP（stdio+HTTP 完整）、多 agent 编排（triggerSubordinate/triggerCoordinator 级联）均完整实现。唯一 placeholder 是 <code>trigger_integration</code>（仅写日志）。</p>
+
+<h3>关键短板</h3>
+<div class="callout bad">
+<strong>1. 无原生并发隔离。</strong> Node.js 单进程 event loop，agent 状态在内存 Map 中，无进程级隔离。一个 agent 的异常可能影响整个进程。<code>runningAutoTriggers</code> Set 防重入是手动管理，不是 OS 级隔离。
+</div>
+<div class="callout warn">
+<strong>2. 无原生容错。</strong> 无 supervisor，无自动重启。进程崩溃 = 全部 agent 状态丢失（除非持久化到 DB 后重启恢复）。
+</div>
+<div class="callout warn">
+<strong>3. 无跨进程广播。</strong> <code>statusEventBus</code> 是进程内 EventEmitter，多实例部署需引入 Redis。Phoenix PubSub 是原生的。
+</div>
+
+<h2 id="python">5. Python 候选方案评估</h2>
+
+<h3>推荐技术栈</h3>
+<p><code>FastAPI（SSE/WebSocket）+ LangGraph（agent 编排/状态机/检查点/HITL）+ Pydantic AI（结构化输出/类型安全）+ OpenTelemetry + Phoenix（可观测）</code></p>
+
+<h3>核心优势</h3>
+<p><strong>LangGraph 是当前最成熟的 agent 编排框架</strong>，官方定位"low-level orchestration framework for long-running, stateful agents"，核心能力与 HiveWeave 需求 1:1 对应：</p>
+<ul>
+<li>状态机模型（图 + 节点 + 边 + 共享 State）</li>
+<li>持久化检查点（checkpointers）→ 容错恢复 + time travel</li>
+<li>原生 Human-in-the-Loop 断点 → 直接对应 ApprovalService 审批流</li>
+<li>原生 streaming + 多 agent 系统（supervisor/hierarchical 模式）→ 对应 coordinator/executor 层级</li>
+<li>Durable Execution：每步状态持久化，可中断恢复</li>
+</ul>
+<p class="src"><a href="https://langchain-ai.github.io/langgraph/concepts/">LangGraph 官方概念文档</a></p>
+
+<p><strong>OpenAI Agents SDK</strong>（原 Swarm 的 production-ready 升级）作为轻量替代：handoffs、sandbox agents（隔离工作区，对应 per-agent worktree）、sessions、MCP 集成、tracing。<a href="https://openai.github.io/openai-agents-python/">官方文档</a></p>
+
+<p><strong>可观测性生态最完整</strong>：LangSmith（商业）、Arize Phoenix（开源自部署）、Langfuse（开源 OTel 兼容）、OpenTelemetry 通用底座。MAF、Bedrock AgentCore、Claude Code 都用 OTel。</p>
+
+<p><strong>AI 代码生成可靠度最高</strong>：Python 训练语料远多于 Elixir，AI 在 Python 上语法和惯用法错误最少。OpenAI 2025-2026 收购 Astral（uv/ruff）强化 Python 工具链，进一步巩固地位。</p>
+
+<h3>关键短板</h3>
+<div class="callout bad">
+<strong>1. 无原生 actor + supervisor。</strong> 多 agent 并发隔离、故障自愈需自行设计。asyncio task 共享进程无隔离，multiprocessing 开销大且共享状态复杂。BEAM 的轻量进程 + supervisor 树是原生能力，Python 没有等价物。这是 HiveWeave 最核心的需求之一，也是 Python 方案最大的硬伤。
+</div>
+<div class="callout bad">
+<strong>2. 实时广播需自建。</strong> FastAPI 无原生 PubSub，需引入 Redis / Postgres LISTEN / NATS 补齐 Phoenix Channels 的跨进程广播能力。多实例部署的 agent 状态同步复杂度上升。
+</div>
+<div class="callout warn">
+<strong>3. 工具并发超时控制需重设计。</strong> Elixir 的 <code>Task.async_nolink</code> + <code>Task.yield(task, 120_000)</code> + 5 个/轮上限 + empty 重试注入，在 Python 中需用 <code>asyncio.gather</code> + <code>timeout</code> + 计数器复刻，语义清晰度相当但<strong>隔离性弱于 BEAM 进程</strong>（一个工具 panic 可能污染整个 event loop）。
+</div>
+<div class="callout warn">
+<strong>4. 框架可靠性有坑。</strong> 第三方横评（注：含推广偏向）显示 LangChain/CrewAI/AutoGen 在 100 次同任务测试中成功率 68-81%，都存在死循环、幻觉输出、缺幂等保护、缺熔断、缺 Schema 验证等问题。HiveWeave 现有的 tool 权限矩阵、审批流、safety_timeout 等可靠性基础设施仍需自建，不能依赖框架。
+</div>
+<div class="callout warn">
+<strong>5. 迁移成本。</strong> Elixir 后端已实现的 OTP 监督树、CircuitBreaker、crash_recovery、Phoenix PubSub、per-agent GenServer、空响应 escalation、GameTime 持久化等，在 Python 中需全部重写且难以等价复刻。
+</div>
+
+<h2 id="swot">6. SWOT 对比</h2>
+
+<h3>Elixir/Phoenix</h3>
+<div class="swot-grid">
+<div class="swot-cell swot-s"><h4>Strengths</h4><ul>
+<li>BEAM 原生进程隔离 + supervisor 自愈</li>
+<li>Phoenix PubSub 原生跨进程广播</li>
+<li>已实现 CircuitBreaker + crash_recovery + escalation</li>
+<li>per-agent GenServer 状态机，故障不扩散</li>
+</ul></div>
+<div class="swot-cell swot-w"><h4>Weaknesses</h4><ul>
+<li>LLM 生态落后，无原生 agent 框架</li>
+<li>AI 代码生成可靠度最弱</li>
+<li>MCP 仅简化 HTTP，无 stdio</li>
+<li>人才稀缺</li>
+</ul></div>
+<div class="swot-cell swot-o"><h4>Opportunities</h4><ul>
+<li>Nx/Bumblebee 本地推理生态在发展</li>
+<li>BEAM 对长时运行系统的优势随 agent 系统复杂度上升而凸显</li>
+</ul></div>
+<div class="swot-cell swot-t"><h4>Threats</h4><ul>
+<li>新 LLM provider/协议 Python/TS 先发</li>
+<li>AI 开发 Elixir 的错误率制约开发速度</li>
+<li>社区资源萎缩风险</li>
+</ul></div>
+</div>
+
+<h3>TS/Fastify</h3>
+<div class="swot-grid">
+<div class="swot-cell swot-s"><h4>Strengths</h4><ul>
+<li>Effect + Zod 类型安全最强</li>
+<li>三层超时防线 + DeepSeek 前缀缓存优化</li>
+<li>Vercel AI SDK 生态成熟</li>
+<li>MCP 完整 SDK（stdio+HTTP）</li>
+</ul></div>
+<div class="swot-cell swot-w"><h4>Weaknesses</h4><ul>
+<li>无原生并发隔离，单进程 event loop</li>
+<li>无 supervisor 自动重启</li>
+<li>无跨进程广播</li>
+</ul></div>
+<div class="swot-cell swot-o"><h4>Opportunities</h4><ul>
+<li>TS 语料充足，AI 开发可靠度高</li>
+<li>Vercel AI SDK 迭代活跃</li>
+</ul></div>
+<div class="swot-cell swot-t"><h4>Threats</h4><ul>
+<li>相对 Python 在 LLM/agent 生态代差劣势</li>
+<li>Node.js 单进程模型对 agent 隔离有硬上限</li>
+</ul></div>
+</div>
+
+<h3>Python/FastAPI</h3>
+<div class="swot-grid">
+<div class="swot-cell swot-s"><h4>Strengths</h4><ul>
+<li>LLM SDK 首发语言，所有厂商一等支持</li>
+<li>LangGraph 状态机+检查点+HITL 最成熟</li>
+<li>可观测性生态最完整（Phoenix/Langfuse/OTel）</li>
+<li>AI 代码生成可靠度最高</li>
+<li>Pydantic 类型安全</li>
+</ul></div>
+<div class="swot-cell swot-w"><h4>Weaknesses</h4><ul>
+<li>无原生 actor + supervisor，并发隔离弱</li>
+<li>无原生 PubSub，实时广播需 Redis</li>
+<li>GIL 限制 CPU 密集任务</li>
+<li>现有 HiveWeave 工程资产需全部重写</li>
+</ul></div>
+<div class="swot-cell swot-o"><h4>Opportunities</h4><ul>
+<li>LangGraph 持续迭代，durable execution 越成熟</li>
+<li>OpenAI 收购 Astral 强化 Python 工具链</li>
+<li>多 agent benchmark 上 Python 框架占榜首</li>
+</ul></div>
+<div class="swot-cell swot-t"><h4>Threats</h4><ul>
+<li>框架可靠性参差，需自建容错基础设施</li>
+<li>BEAM 级 supervisor/进程隔离无开箱方案</li>
+<li>asyncio + multiprocessing + threads 组合易出陷阱</li>
+</ul></div>
+</div>
+
+<h2 id="fit">7. 针对 HiveWeave 场景的适配性</h2>
+
+<h3>HiveWeave 的核心需求拆解</h3>
+<table>
+<thead><tr><th>需求</th><th>Elixir</th><th>TS</th><th>Python</th></tr></thead>
+<tbody>
+<tr><td>多 agent 长时运行 + 进程级隔离</td><td><span class="pill p-good">原生最优</span></td><td><span class="pill p-bad">弱</span></td><td><span class="pill p-warn">需自建</span></td></tr>
+<tr><td>agent 崩溃不影响其他 agent + 自动重启</td><td><span class="pill p-good">supervisor 原生</span></td><td><span class="pill p-bad">无</span></td><td><span class="pill p-warn">LangGraph 检查点</span></td></tr>
+<tr><td>实时状态广播（agent 状态变更、消息流）</td><td><span class="pill p-good">PubSub 原生</span></td><td><span class="pill p-warn">EventEmitter</span></td><td><span class="pill p-warn">需 Redis</span></td></tr>
+<tr><td>LLM 流式 + 工具调用 + 多 provider 兼容</td><td><span class="pill p-warn">社区库</span></td><td><span class="pill p-good">AI SDK</span></td><td><span class="pill p-good">SDK 首发</span></td></tr>
+<tr><td>审批流（HITL）</td><td><span class="pill p-good">已实现</span></td><td><span class="pill p-good">已实现</span></td><td><span class="pill p-good">LangGraph 原生</span></td></tr>
+<tr><td>长对话 token budget + compaction</td><td><span class="pill p-good">已实现</span></td><td><span class="pill p-good">已实现+前缀缓存</span></td><td><span class="pill p-warn">需实现</span></td></tr>
+<tr><td>per-project SQLite 隔离</td><td><span class="pill p-good">DBConnection 池</span></td><td><span class="pill p-good">better-sqlite3</span></td><td><span class="pill p-warn">aiosqlite</span></td></tr>
+<tr><td>per-agent worktree 隔离</td><td><span class="pill p-good">已实现</span></td><td><span class="pill p-good">已实现</span></td><td><span class="pill p-good">OpenAI SDK sandbox</span></td></tr>
+<tr><td>game time 模拟时钟 + 停滞升级</td><td><span class="pill p-good">已实现</span></td><td><span class="pill p-good">已实现</span></td><td><span class="pill p-warn">需实现</span></td></tr>
+<tr><td>由 AI 开发维护的代码可靠度</td><td><span class="pill p-bad">弱</span></td><td><span class="pill p-good">强</span></td><td><span class="pill p-good">最强</span></td></tr>
+</tbody>
+</table>
+
+<h3>关键判断</h3>
+<div class="callout">
+<strong>HiveWeave 的差异化价值在"多 agent 长时运行的隔离与容错"，而非"LLM 调用本身"。</strong> LLM 调用、工具执行、流式输出在三种语言里都能做，差距是生态便利度而非可行性。但"10 个 agent 同时跑，其中一个 LLM 调用死循环，如何确保其他 9 个不受影响"+"进程崩溃后自动恢复状态"——这件事 BEAM 是原生免费的，Python/TS 需要花大量工程自建且效果不如原生。
+</div>
+<div class="callout">
+<strong>Python 的 LangGraph 优势真实存在，但不是决定性的。</strong> LangGraph 的检查点恢复能近似 supervisor 的"状态恢复"，但它恢复的是"工作流状态"而非"进程隔离"。一个 agent 的内存泄漏或 CPU 死循环仍会影响整个 Python 进程。BEAM 进程是 OS 级隔离（独立堆，GC 独立），这是质的不同。
+</div>
+<div class="callout warn">
+<strong>AI 开发可靠度是 Elixir 的真实风险。</strong> 既然代码由 AI 开发，Elixir 语料少 → AI 生成错误多 → 调试成本高 → 迭代慢。这是用户前提下的一个反向因素。但这个问题的解法不是抛弃 Elixir，而是<strong>把 AI 高频生成的部分（工具实现、prompt、LLM 调用）放到 Python 微服务</strong>，Elixir 壳只做调度和容错（这部分代码相对稳定，不需要频繁 AI 生成）。
+</div>
+
+<h2 id="recommend">8. 最终建议</h2>
+
+<div class="verdict-box">
+<h3>推荐方案：保留 Elixir 编排壳 + Python AI 微服务（混合架构）</h3>
+<p><strong>不要整体重构为 Python。</strong> 理由：</p>
+<ol>
+<li><strong>Elixir 已实现的工程资产难以等价复刻。</strong> OTP 监督树、CircuitBreaker、crash_recovery、Phoenix PubSub、per-agent GenServer、空响应 escalation、GameTime 持久化——这些在 Python 中需全部重写，且 supervisor 级进程隔离根本无法等价复刻。这是沉没成本，但更是<strong>难以复制的工程价值</strong>。</li>
+<li><strong>HiveWeave 的核心差异化在并发隔离与容错，BEAM 在这点上有原生代差优势。</strong> 这是"最终效果"维度的优势，符合用户的评判标准。</li>
+<li><strong>Python 的优势可以通过微服务拿到。</strong> LLM 调用、工具执行、LangGraph 局部编排下沉到 Python 微服务，Elixir 通过 HTTP/gRPC 桥接。这样既拿到 Python 的 LLM 生态 + AI 开发可靠度，又保留 Elixir 的调度容错壳。</li>
+<li><strong>避免单一栈的短板。</strong> 纯 Python 方案的 supervisor/隔离/PubSub 短板会直接暴露给 HiveWeave 最核心的多 agent 运行场景；纯 Elixir 方案的 LLM 生态短板会拖慢迭代。</li>
+</ol>
+</div>
+
+<h3>若一定要整体换栈的优先级</h3>
+<p>若用户坚持放弃 Elixir 整体换栈，则 <strong>Python &gt; TypeScript</strong>：</p>
+<ul>
+<li>Python 在 LLM 生态、agent 框架、AI 开发可靠度上对 TS 形成代差优势。</li>
+<li>TS 相对 Elixir 在 HiveWeave 最关心的并发/容错维度没有拉开差距（都是单进程 event loop，都无原生 supervisor）。</li>
+<li>换 TS 意味着放弃 BEAM 优势但没换来对等补偿；换 Python 至少换来 LLM 生态的代差优势 + LangGraph 的 durable execution 近似补齐容错。</li>
+</ul>
+
+<h3>混合架构落地建议</h3>
+<table>
+<thead><tr><th>层</th><th>语言</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td>编排调度壳</td><td>Elixir/Phoenix（保留）</td><td>agent 生命周期、supervisor、Phoenix Channels、PubSub、GameTime、CircuitBreaker、审批流网关、per-project DB 路由</td></tr>
+<tr><td>LLM + 工具执行微服务</td><td>Python/FastAPI（新建）</td><td>LLM 流式调用（Vercel AI SDK 等价的 Python SDK）、工具执行（bash/file/grep/apply-patch）、LangGraph 局部 agent 编排、token budget + compaction、retry/overflow</td></tr>
+<tr><td>桥接</td><td>HTTP/gRPC + SSE</td><td>Elixir 调 Python 微服务，流式回传；Python 侧用 LangGraph 做 single-agent 内部编排，Elixir 做 cross-agent 编排</td></tr>
+<tr><td>可观测性</td><td>OpenTelemetry（跨语言）</td><td>两端都接 OTel，Python 侧额外用 Phoenix/Langfuse 做 LLM 专用追踪</td></tr>
+</tbody>
+</table>
+
+<div class="callout good">
+<strong>这个混合方案的取舍逻辑</strong>：Elixir 做它最擅长且 Python 做不好的事（进程隔离、supervisor、PubSub、长时运行容错），Python 做它最擅长且 Elixir 做不好的事（LLM SDK、agent 框架、AI 开发可靠度）。两者的短板都被对方补齐，而已有 Elixir 工程资产得以保留。
+</div>
+
+<div class="callout warn">
+<strong>唯一需要接受的代价</strong>：跨语言调用增加网络开销（本地 HTTP/gRPC，延迟可控制在 ms 级）；两套代码库的维护复杂度上升。但对"只关心最终效果"的前提，这个代价远小于整体换栈丢失 BEAM 优势的代价。
+</div>
+
+<h2 id="sources">9. 参考资料</h2>
+
+<div class="src">
+<a href="https://langchain-ai.github.io/langgraph/concepts/">[1] LangGraph 官方概念文档：low-level orchestration for long-running stateful agents，含 persistence/HITL/streaming/multi-agent</a><br>
+<a href="https://openai.github.io/openai-agents-python/">[2] OpenAI Agents SDK 官方文档：Swarm 的 production-ready 升级，含 handoffs/sandbox agents/sessions/MCP</a><br>
+<a href="http://m.toutiao.com/group/7619599767965876774/">[3] 2026 主流 Agent 框架全景对比：LangGraph/OpenAI Agents SDK/PydanticAI/CrewAI/MAF 横评</a><br>
+<a href="https://juejin.cn/post/7656556949945958443">[4] LangChain vs CrewAI vs AutoGen 可靠性横评（注：含 ark-trust 推广，数据有偏向）</a><br>
+<a href="http://m.toutiao.com/group/7614507849812673078/">[5] AutoGen 架构演进：v0.4 → Microsoft Agent Framework，含 OTel/DAG 工作流</a><br>
+<a href="https://blog.csdn.net/qq_46314975/article/details/161952569">[6] FastAPI 实时推送：SSE 到 WebSocket 实践</a><br>
+<a href="https://blog.csdn.net/yonggeit/article/details/162179745">[7] LLM 流式输出协议工程：SSE/WebSocket/gRPC 三方案（2026）</a><br>
+<a href="https://blog.51cto.com/u_12960863/14416903">[8] Asyncio 才是 LLM 高并发的王道：asyncio + httpx 高并发 LLM 请求</a><br>
+<a href="http://m.toutiao.com/group/7635180416705708559/">[9] Python 并发：Threads + Processes + Asyncio 组合陷阱</a><br>
+<a href="https://blog.csdn.net/gitblog_00953/article/details/142801933">[10] Elixir LangChain：Elixir 社区 AI 集成库，覆盖 OpenAI/Anthropic/Google/Ollama</a><br>
+<a href="http://m.toutiao.com/group/7619198607366832683/">[11] OpenAI 收购 Astral：强化 Python 工具链（uv/ruff 成事实标准）</a><br>
+<a href="http://m.toutiao.com/group/7623668201976529418/">[12] Claude Code 源码剖析：TypeScript + Bun + Anthropic SDK + OpenTelemetry</a><br>
+<a href="http://m.toutiao.com/group/7647699019086430755/">[13] Langfuse：开源 LLM 工程平台，LangSmith 的 OSS 对位</a><br>
+<a href="http://m.toutiao.com/group/7645841078561849896/">[14] Arize Phoenix：面向 Agent 工作流的开源评估平台</a><br>
+<a href="https://c.m.163.com/news/a/KBS0LTG1051494RM.html">[16] Amazon Bedrock AgentCore：OTel 兼容 Phoenix/LangSmith/Langfuse</a>
+</div>
+
+<p style="margin-top: 40px; color: var(--text-muted); font-size: 13px; border-top: 1px solid var(--border); padding-top: 16px;">
+本报告基于 HiveWeave 代码库实际调研（Elixir <code>apps/hiveweave/</code>、TS <code>apps/server/</code> + <code>packages/</code>）与外部网络调研（Python 生态）。代码侧结论基于实际文件探索，外部结论均附来源链接。未找到的数据标注为未找到，未编造。
+</p>
+
+</div>
+</body>
+</html>

@@ -7,7 +7,7 @@ defmodule HiveWeave.Application do
   def start(_type, _args) do
     finch_opts = [
       name: HiveWeave.Finch,
-      pool_size: 5
+      pool_size: 20
     ]
 
     finch_opts =

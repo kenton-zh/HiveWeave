@@ -26,11 +26,13 @@ defmodule HiveWeave.LLM.Streamer do
   alias HiveWeave.Services.ChatMessage
   alias HiveWeave.ToolExecutor
 
-  @request_timeout_ms 90_000
+  @request_timeout_ms 30_000
   # Turn-level idle timeout (watchdog for hung streams).
-  # Like TS TURN_IDLE_MS — deliberately > bash tool timeout (120s) so legitimate
-  # long commands aren't killed. If no chunks arrive for this duration, abort.
-  @stream_idle_ms 300_000
+  # If no response arrives within this duration, abort and retry.
+  # Was 300s — way too long: user sees "stuck" for 5 minutes before timeout.
+  # 30s is enough for normal LLM responses (typically 2-5s); if the API
+  # doesn't respond in 30s, it's hung and retry is the right action.
+  @stream_idle_ms 30_000
   # Default text broadcast when LLM returns tool_calls without any text.
   # Gives the user a visual cue that the agent is working.
   # IMPORTANT: this text must NOT be counted as "real" LLM output — if the
@@ -64,10 +66,19 @@ defmodule HiveWeave.LLM.Streamer do
   @doc """
   Stream a chat completion from the LLM.
   """
+  defp diag_log(agent_id, step) do
+    msg = "[DIAG] #{DateTime.utc_now() |> DateTime.to_iso8601()} agent=#{agent_id} step=#{step}"
+    File.write(Path.join(System.tmp_dir!(), "hiveweave_stream_diag.log"), msg <> "\n", [:append, :utf8])
+    Logger.info(msg)
+  end
+
   def stream(agent, message, opts, parent) do
+    diag_log(agent.id, "stream_start")
     Logger.info("[Streamer] stream/4 CALLED for agent #{agent.id}")
     ensure_context_cache()
+    diag_log(agent.id, "after_ensure_context_cache")
     agent = reload_agent(agent)
+    diag_log(agent.id, "after_reload_agent")
 
     # Clear the injected-inbox tracking set at the start of each stream.
     # This runs in the Task process (the same process that poll_and_inject_inbox
@@ -80,9 +91,12 @@ defmodule HiveWeave.LLM.Streamer do
 
     # Model-switch compaction check before resolving model
     old_ctx = get_cached_context_window(agent.id)
+    diag_log(agent.id, "after_get_cached_context_window")
     model = resolve_model(agent)
+    diag_log(agent.id, "after_resolve_model")
     new_ctx = model[:context_window] || 128_000
     current_tokens = estimate_current_tokens(agent.id, agent.project_id)
+    diag_log(agent.id, "after_estimate_current_tokens")
 
     if old_ctx != new_ctx and old_ctx > 0 do
       HiveWeave.ConversationStore.maybe_compact_on_model_switch(
@@ -91,12 +105,14 @@ defmodule HiveWeave.LLM.Streamer do
       )
     end
     cache_context_window(agent.id, new_ctx)
+    diag_log(agent.id, "after_compaction_check")
 
     Logger.info("[Streamer] Agent #{agent.id} model=#{inspect(model[:model_id])} permission_type=#{agent.permission_type}")
     provider_name = model[:name] || "primary"
 
     case HiveWeave.LLM.CircuitBreaker.check(provider_name) do
       :ok ->
+        diag_log(agent.id, "circuit_breaker_ok")
         execute_stream(agent, message, opts, parent, model, provider_name)
 
       {:fallback, fallback_name} when not is_nil(fallback_name) ->
@@ -139,6 +155,7 @@ defmodule HiveWeave.LLM.Streamer do
     # Load conversation history
     token_budget = (model[:context_window] || 128_000) - 20_000
     history = HiveWeave.ConversationStore.get_history(agent.id, agent.project_id, token_budget)
+    diag_log(agent.id, "after_get_history_execute_stream")
 
     Logger.info("[Streamer] Agent #{agent.id} history: #{length(history)} messages, " <>
                 "budget=#{token_budget}, new user msg=#{String.length(message || "")} chars")
@@ -150,11 +167,14 @@ defmodule HiveWeave.LLM.Streamer do
 
     # Get tools available to this agent
     tools = ToolExecutor.get_tools(permission_type, role)
+    diag_log(agent.id, "after_get_tools")
+
     Logger.info("[Streamer] Agent #{agent.id} permission_type=#{permission_type}, tools=#{length(tools)}: " <>
                 Enum.map_join(tools, ", ", fn t -> get_in(t, ["function", "name"]) end))
 
     # Build initial messages: system + history + user
     initial_messages = build_messages(agent, message, opts, history, model)
+    diag_log(agent.id, "after_build_messages")
 
     # Create placeholder assistant message.
     # When triggered by coordinator (not by user), mark as background so it
@@ -182,14 +202,47 @@ defmodule HiveWeave.LLM.Streamer do
 
     broadcast_chunk(agent, %{type: "start", id: assistant_msg_id})
 
-    # Run the tool loop
-    result = run_tool_loop(
-      agent, model, provider_name, tools, workspace_path,
-      initial_messages, "", "", parent, 0, [], assistant_msg_id,
-      []
-    )
+    # ── Guard: guarantee is_streaming is always cleared ──
+    # Even if run_tool_loop or finalize_stream crashes, or the DB write
+    # silently fails (per-project DB connection drops on Windows with DELETE
+    # journal mode), the after block will retry to clear the streaming flag.
+    # Without this, the assistant message stays is_streaming=1 forever and
+    # the agent appears "stuck" to the user (input disabled, no new messages).
+    try do
+      # Run the tool loop
+      result = run_tool_loop(
+        agent, model, provider_name, tools, workspace_path,
+        initial_messages, "", "", parent, 0, [], assistant_msg_id,
+        []
+      )
 
-    finalize_stream(agent, result, assistant_msg_id, message, start_time, parent, model, provider_name, opts)
+      finalize_stream(agent, result, assistant_msg_id, message, start_time, parent, model, provider_name, opts)
+    after
+      force_clear_streaming_flag(agent.id, assistant_msg_id)
+    end
+  end
+
+  # Retry clearing is_streaming in the DB. Called from try/after in execute_stream
+  # so it runs regardless of success, failure, or crash of the streaming pipeline.
+  # The per-project DB connection can silently drop on Windows (DELETE journal mode),
+  # causing update_message to fail without raising. Retry with backoff handles
+  # transient connection issues; if the connection is permanently lost, the agent's
+  # safety_timeout (10 min) will eventually clean up.
+  defp force_clear_streaming_flag(agent_id, msg_id, retries_left \\ 3) do
+    case ChatMessage.update_message(agent_id, msg_id, %{is_streaming: false}) do
+      {:ok, _} -> :ok
+      {:error, reason} when retries_left > 0 ->
+        Logger.warning("[Streamer] force_clear_streaming failed (#{retries_left} retries left): #{inspect(reason)}")
+        Process.sleep(200 * (4 - retries_left))
+        force_clear_streaming_flag(agent_id, msg_id, retries_left - 1)
+      {:error, reason} ->
+        Logger.error("[Streamer] force_clear_streaming FAILED after all retries for agent #{agent_id} msg #{msg_id}: #{inspect(reason)}")
+        :ok
+    end
+  rescue
+    e ->
+      Logger.error("[Streamer] force_clear_streaming exception: #{inspect(e)}")
+      :ok
   end
 
   # ── Tool loop: stream → check tool_calls → execute → repeat ─
@@ -267,12 +320,14 @@ defmodule HiveWeave.LLM.Streamer do
       request_body = if tools != [], do: Map.put(request_body, "tools", tools), else: request_body
 
       Logger.info("[Streamer] Round #{round_num}: sending request to LLM with #{length(messages)} messages")
+      diag_log(agent.id, "round_#{round_num}_before_request")
 
       # Generate a unique delta_id for this round so the frontend can group tokens
       delta_id = "r#{round_num}_#{:rand.uniform(999999)}"
 
       # Wrap HTTP request with retry logic (3 attempts, exponential backoff)
       result = request_with_retry(agent, model, request_body, delta_id, round_num, 3)
+      diag_log(agent.id, "round_#{round_num}_after_request")
 
       case result do
         {:ok, _status, new_text, reasoning, tool_calls, finish_reason, usage} ->
@@ -345,6 +400,7 @@ defmodule HiveWeave.LLM.Streamer do
             tool_calls != [] ->
               # Execute tools and loop
               Logger.info("[Streamer] Round #{round_num}: #{length(tool_calls)} tool_calls to execute")
+              diag_log(agent.id, "round_#{round_num}_before_tools")
 
               # If no text has been produced at all (across all rounds), broadcast a
               # default placeholder so the user sees something in the chat window
@@ -521,22 +577,25 @@ defmodule HiveWeave.LLM.Streamer do
         end)
       else
         Enum.map(tool_calls, fn tc ->
-          try do
+          task = Task.Supervisor.async_nolink(HiveWeave.TaskSupervisor, fn ->
             execute_single_tool(agent, tc, workspace_path)
-          rescue
-            e ->
-              Logger.error("[Streamer] Tool #{tc.name} raised: #{inspect(e)}")
-              %{
-                "role" => "tool",
-                "tool_call_id" => tc.id,
-                "content" => "[Tool Crash] #{tc.name}: #{inspect(e)}\n#{Exception.format_stacktrace()}"
-              }
+          end)
+          case Task.yield(task, 30_000) || Task.shutdown(task, 5_000) do
+            {:ok, result} ->
+              result
+            {:exit, reason} ->
+              Logger.error("[Streamer] Tool #{tc.name} crashed: #{inspect(reason)}")
+              %{"role" => "tool", "content" => "[Tool Crash] #{inspect(reason)}"}
+            nil ->
+              Logger.error("[Streamer] Tool #{tc.name} timed out after 30s")
+              %{"role" => "tool", "content" => "[Tool Timeout] #{tc.name} did not complete within 30s"}
           end
         end)
       end
 
     # Append assistant + tool results to messages, continue loop
     new_messages = messages ++ [assistant_msg | tool_results]
+    diag_log(agent.id, "round_#{round_num}_after_tools")
 
     # Accumulate this round's assistant + tool results for the conversation store.
     # We don't slice new_messages because mid-turn trim (line 194) can shrink
@@ -983,6 +1042,37 @@ defmodule HiveWeave.LLM.Streamer do
       You are "#{name}", a #{role} in the HiveWeave engineering organization.
       #{if is_binary(goal) and goal != "", do: "## Your Role\n#{goal}", else: ""}
       #{if is_binary(backstory) and backstory != "", do: "## Background\n#{backstory}", else: ""}
+
+      ## ETHOS — 工程准则（所有角色共享）
+      ### 原则 1: Boil the Lake（做完整的事）
+      AI 让"完整性"的边际成本趋近于零。当完整实现只比捷径多花几分钟时，就做完整版。
+      - **湖**（可煮沸）：100% 测试覆盖、完整边界处理、完整错误路径——这些必须做完
+      - **海洋**（不可煮沸）：整体重写、跨季度迁移——这些分阶段做
+      - 反模式："省 70 行只做 90%"、"测试留到下个 PR"、"边界情况以后再说"
+
+      ### 原则 2: Search Before Building（先搜索后构建）
+      三层知识观：
+      - Layer 1: 验证过的成熟模式 → 直接用
+      - Layer 2: 新流行的实践 → 审视后用（人群会狂热）
+      - Layer 3: 第一性原理推导 → 最有价值，"11/10 的项目"往往来自这种 zig while others zag
+
+      ### 原则 3: User Involvement（用户参与度，可调）
+      用户主权不是固定铁律，而是可配置的参与度级别。具体级别由 charter 的 user_involvement 字段决定（高/中/低，见动态上下文）。
+      - **无论哪个级别，AI 都不能伪造结果、不能隐藏风险、不能跳过验证**
+      - 让渡的是决策权，不是诚实义务
+
+      ### 通用验证文化（不可协商）
+      - 每个动作必须有证据支撑——"看起来对"永远不够
+      - 测试通过须附输出、构建成功须附日志、运行时验证须附截图
+      - 没有证据的"完成"等于未完成
+
+      ### 通用反合理化表
+      | 借口 | 反驳 |
+      |---|---|
+      | "我稍后加测试" | 测试是代码的一部分，没有测试的代码是未完成的代码 |
+      | "这个改动太小不用测" | 小改动也能引入大 bug，每个改动都需要测试 |
+      | "先跑通再说" | 能跑 ≠ 正确，先验证再扩展 |
+      | "这个方向很明显不用问" | 根据用户参与度配置决定：高风险决策方向必须确认 |
 
       ## IMPORTANT: HiveWeave System Directory
       - **`.hiveweave`** is the HiveWeave system directory at the workspace root.
@@ -2269,6 +2359,8 @@ defmodule HiveWeave.LLM.Streamer do
 
   defp execute_single_tool(agent, tc, workspace_path) do
     input = parse_tool_args(tc.arguments)
+    tool_start = System.monotonic_time(:millisecond)
+    diag_log(agent.id, "tool_start name=#{tc.name}")
     Logger.info("[Streamer] Executing tool: #{tc.name} with args: #{inspect(input) |> String.slice(0, 200)}")
 
     # Broadcast a brief narration so the user sees what's happening (even if LLM didn't say anything)
@@ -2315,6 +2407,8 @@ defmodule HiveWeave.LLM.Streamer do
     # Broadcast tool_result event (field name "tool" aligns with tool_use event)
     broadcast_chunk(agent, %{type: "tool_result", tool: tc.name, output: result, id: tc.id})
 
+    diag_log(agent.id, "tool_end name=#{tc.name} elapsed_ms=#{System.monotonic_time(:millisecond) - tool_start}")
+
     %{
       "role" => "tool",
       "tool_call_id" => tc.id,
@@ -2358,14 +2452,24 @@ defmodule HiveWeave.LLM.Streamer do
   # ── Retry wrapper for LLM streaming requests ─────────────────
 
   defp request_with_retry(agent, model, request_body, delta_id, round_num, attempts_left) do
-    task = Task.async(fn -> make_streaming_request(agent, model, request_body, delta_id) end)
+    diag_log(agent.id, "round_#{round_num}_retry_enter_attempts=#{attempts_left}")
+    # Use async_nolink (NOT Task.async) so that if make_streaming_request crashes
+    # (e.g. Req.post raises), the exit signal does NOT propagate to this process.
+    # Task.async creates a LINKED task — a crash in the HTTP request would kill
+    # this process before Task.yield can handle {:exit, reason}, bypassing the
+    # retry logic and leaving the stream without proper cleanup.
+    task = Task.Supervisor.async_nolink(HiveWeave.TaskSupervisor, fn ->
+      make_streaming_request(agent, model, request_body, delta_id)
+    end)
 
-    # Use @stream_idle_ms (300s) for the Task.yield timeout — this is the
-    # turn-level idle watchdog. Like TS withIdleTimeout, if the stream hangs
-    # (tool execution hang, approval waiter never resolving, mid-stream stall),
+    # Use @stream_idle_ms (30s) for the Task.yield timeout — this is the
+    # turn-level idle watchdog. If the stream hangs (tool execution hang,
+    # approval waiter never resolving, mid-stream stall),
     # the task is killed and retried.
+    diag_log(agent.id, "round_#{round_num}_yield_start_mb=#{Process.info(self(), :message_queue_len) |> elem(1)}")
     case Task.yield(task, @stream_idle_ms) || Task.shutdown(task, :brutal_kill) do
       nil ->
+        diag_log(agent.id, "round_#{round_num}_timeout_after_#{@stream_idle_ms}ms")
         Logger.error("[Streamer] Round #{round_num}: stream idle timeout after #{@stream_idle_ms}ms (#{attempts_left} attempts left)")
         if attempts_left > 1 do
           backoff = round(2000 * :math.pow(2, 3 - attempts_left))
@@ -2393,6 +2497,7 @@ defmodule HiveWeave.LLM.Streamer do
         end
 
       {:exit, reason} ->
+        diag_log(agent.id, "round_#{round_num}_crash_reason=#{inspect(reason) |> String.replace(["\n", " "], "")}")
         Logger.error("[Streamer] Round #{round_num}: request crashed: #{inspect(reason)} (#{attempts_left} attempts left)")
         if attempts_left > 1 do
           backoff = round(2000 * :math.pow(2, 3 - attempts_left))
@@ -2436,27 +2541,39 @@ defmodule HiveWeave.LLM.Streamer do
       body = Jason.encode!(request_body)
 
       Logger.info("[Streamer] Making STREAMING request to #{url} (body=#{byte_size(body)} bytes)")
-      diag_log("Request model=#{request_body["model"]} max_tokens=#{request_body["max_tokens"]} msg_count=#{length(request_body["messages"])} has_tools=#{Map.has_key?(request_body, "tools")}")
-      diag_log("model config: supports_thinking=#{model[:supports_thinking]} base_url=#{model[:base_url]} model_id=#{model[:model_id]}")
+      diag_log(agent.id, "req_post_start url=#{url} body_bytes=#{byte_size(body)}")
 
-      # Use Req with into: :self for REAL-TIME chunk streaming.
-      # This delivers SSE chunks to the process mailbox as they arrive,
-      # enabling token-by-token broadcasting to the frontend.
-      case Req.post(url,
-             headers: headers,
-             body: body,
-             receive_timeout: @request_timeout_ms,
-             into: :self,
-             finch: HiveWeave.Finch,
-             compressed: false,
-             decode_body: false
-           ) do
-        {:ok, resp} ->
-          handle_req_response(agent, resp, delta_id)
+      # Wrap Req.post in try/rescue to capture crashes that would otherwise
+      # kill the Task silently. With Task.Supervisor.async_nolink, a crash
+      # returns {:exit, reason} to Task.yield — but we want the DETAILS.
+      try do
+        case Req.post(url,
+               headers: headers,
+               body: body,
+               receive_timeout: @request_timeout_ms,
+               into: :self,
+               finch: HiveWeave.Finch,
+               compressed: false,
+               decode_body: false
+             ) do
+          {:ok, resp} ->
+            diag_log(agent.id, "req_post_done status=#{resp.status}")
+            handle_req_response(agent, resp, delta_id)
 
-        {:error, reason} ->
-          Logger.error("[Streamer] Req request failed: #{inspect(reason)}")
-          {:error, reason}
+          {:error, reason} ->
+            diag_log(agent.id, "req_post_error #{inspect(reason) |> String.replace(["\n", " "], "")}")
+            Logger.error("[Streamer] Req request failed: #{inspect(reason)}")
+            {:error, reason}
+        end
+      rescue
+        e ->
+          diag_log(agent.id, "req_post_crashed #{inspect(e) |> String.replace(["\n", " "], "")}")
+          Logger.error("[Streamer] Req.post raised: #{inspect(e)}\n#{Exception.format_stacktrace(__STACKTRACE__)}")
+          {:error, {:crash, e}}
+      catch
+        kind, reason ->
+          diag_log(agent.id, "req_post_thrown kind=#{inspect(kind)} reason=#{inspect(reason) |> String.replace(["\n", " "], "")}")
+          {:error, {:throw, kind, reason}}
       end
     end
   end

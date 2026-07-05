@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { getProjectGoals, updateProjectGoals } from "../api";
 import type { GoalsData, KeyResult } from "../api";
+import { useAppStore } from "../store";
 
 interface Props {
   projectId: string;
@@ -50,7 +51,7 @@ export default function GoalsPanel({ projectId }: Props) {
       setDirty(false);
     } catch (err) {
       console.error("Failed to save goals:", err);
-      alert("保存目标失败");
+      useAppStore.getState().showToast("保存目标失败", "error");
     } finally {
       setSaving(false);
     }

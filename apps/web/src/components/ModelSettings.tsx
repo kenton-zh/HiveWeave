@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { getModels, createModel, updateModel, deleteModel, testModel } from "../api";
 import type { LlmModel } from "../api";
+import { useAppStore } from "../store";
 
 interface Props {
   onClose: () => void;
@@ -93,7 +94,7 @@ export default function ModelSettings({ onClose }: Props) {
       loadModels();
     } catch (err: any) {
       console.error("Failed to save model:", err);
-      alert(err.message || "Failed to save model");
+      useAppStore.getState().showToast(err.message || "Failed to save model", "error");
     }
   };
 
@@ -104,7 +105,7 @@ export default function ModelSettings({ onClose }: Props) {
       loadModels();
     } catch (err: any) {
       console.error("Failed to delete model:", err);
-      alert(err.message || "Failed to delete model");
+      useAppStore.getState().showToast(err.message || "Failed to delete model", "error");
     }
   };
 

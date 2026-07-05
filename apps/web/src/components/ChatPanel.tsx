@@ -467,7 +467,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       refreshOrgTree();
       useAppStore.getState().setSelectedAgent(null);
     } catch (err: any) {
-      alert(err.message || "Failed to delete agent");
+      useAppStore.getState().showToast(err.message || "Failed to delete agent", "error");
       setConfirmingDelete(false);
     }
   }, [agentId, confirmingDelete, refreshOrgTree]);
@@ -521,18 +521,47 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     fetchAgent();
     loadMessagesFromDb(loadForAgentId);
 
+    // Check for pending initial message from NewProjectDialog.
+    // NewProjectDialog sets this instead of calling streamChat directly,
+    // so that ChatPanel can register its WebSocket event handler BEFORE
+    // the chat is pushed — ensuring streaming events are not lost.
+    const pending = useAppStore.getState().pendingInitialMessage;
+    if (pending && pending.agentId === loadForAgentId) {
+      useAppStore.getState().setPendingInitialMessage(null);
+      pendingQueueRef.current = [pending.message];
+      setQueuedCount(1);
+      autoSendRef.current = true;
+    }
+
     return () => {
+      // Only prevent stale fetchAgent/loadMessagesFromDb results from
+      // applying. Do NOT abort the stream or clear the response timeout here —
+      // this effect re-runs when loadMessagesFromDb or orgTreeVersion changes
+      // (e.g. after a lobby:status push), and aborting would kill the WebSocket
+      // stream mid-response, causing "stops after one sentence" bug.
+      // Stream/timeout/channel cleanup is handled by the [agentId] effect below.
       cancelled = true;
-      abortControllerRef.current?.abort();
-      if (responseTimeoutRef.current) {
-        clearTimeout(responseTimeoutRef.current);
-        responseTimeoutRef.current = null;
-      }
-      // Leave the persistent WebSocket channel for this agent to avoid
-      // accumulating PubSub subscriptions on the backend.
-      if (loadForAgentId) leaveAgentChannel(loadForAgentId);
     };
   }, [agentId, loadMessagesFromDb, orgTreeVersion]);
+
+  // Manage WebSocket channel + stream lifecycle — abort stream, clear timeout,
+  // and leave channel ONLY when agentId actually changes, not when
+  // loadMessagesFromDb or orgTreeVersion triggers a re-run of the main mount
+  // effect. This prevents the "stops after one sentence" bug where the stream
+  // gets killed mid-response because lobby:status or org tree refresh causes
+  // the mount effect to re-run.
+  useEffect(() => {
+    return () => {
+      if (agentId) {
+        abortControllerRef.current?.abort();
+        if (responseTimeoutRef.current) {
+          clearTimeout(responseTimeoutRef.current);
+          responseTimeoutRef.current = null;
+        }
+        leaveAgentChannel(agentId);
+      }
+    };
+  }, [agentId]);
 
   // Reset stale streaming state when WebSocket reconnects.
   // If the socket drops mid-stream, no done/error event will arrive, leaving
