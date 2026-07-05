@@ -305,6 +305,12 @@ class OrgService:
                     "status": kid.get("status", "active"),
                     "permission_type": kid.get("permission_type", "executor"),
                     "goal": kid.get("goal", ""),
+                    "model_id": kid.get("model_id"),
+                    "config": {
+                        "model_id": kid.get("model_id"),
+                        "system_prompt": kid.get("system_prompt"),
+                        "permission_type": kid.get("permission_type", "executor"),
+                    },
                     "children": sub if sub else None,
                 })
             return nodes

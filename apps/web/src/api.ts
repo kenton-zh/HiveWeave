@@ -67,16 +67,39 @@ export function setApiKey(key: string | null) {
   _apiKey = key;
 }
 
+// Debug log helper — writes to Zustand store without circular import
+function dbg(category: "api" | "ws" | "error" | "info" | "state", message: string, data?: any) {
+  try {
+    // Dynamic import would be async; use getState directly via a lazy ref
+    const store = (window as any).__hwStore;
+    if (store) store.getState().addDebugLog({ category, message, data });
+  } catch { /* noop */ }
+}
+
 async function fetchJSON<T = any>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (_apiKey && !headers.has("x-api-key")) {
     headers.set("x-api-key", _apiKey);
   }
-  const res = await fetch(url, { ...init, headers });
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-  const text = await res.text();
-  if (!text || text.length === 0) return {} as T;
-  return JSON.parse(text) as T;
+  const method = init?.method || "GET";
+  const t0 = performance.now();
+  dbg("api", `${method} ${url}`, { method, url, body: init?.body });
+  try {
+    const res = await fetch(url, { ...init, headers });
+    const elapsed = Math.round(performance.now() - t0);
+    const text = await res.text();
+    if (!res.ok) {
+      dbg("error", `${method} ${url} → ${res.status} (${elapsed}ms)`, { status: res.status, body: text.slice(0, 500) });
+      throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    }
+    const parsed = !text || text.length === 0 ? {} : JSON.parse(text);
+    dbg("api", `${method} ${url} → ${res.status} (${elapsed}ms)`, { status: res.status, bodyPreview: text.slice(0, 300) });
+    return parsed as T;
+  } catch (e: any) {
+    const elapsed = Math.round(performance.now() - t0);
+    dbg("error", `${method} ${url} FAILED (${elapsed}ms): ${e.message}`, { error: e.message });
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +215,7 @@ export function streamChat(
   onEvent: (event: ChatEvent) => void
 ): { abort: () => void } {
   const socket = getSocket();
+  dbg("ws", `streamChat called for ${agentId}`, { agentId, messageLen: message.length, socketConnected: socket.isConnected() });
 
   if (!(globalThis as any).__hw_lastSeq) (globalThis as any).__hw_lastSeq = {};
   (globalThis as any).__hw_lastSeq[agentId] = 0;
@@ -200,19 +224,23 @@ export function streamChat(
   let channel = _agentChannels.get(agentId);
 
   if (channel && channel.state === "joined") {
+    dbg("ws", `push chat (channel already joined) for ${agentId}`);
     channel.push("chat", { message, images: images?.length ? images : undefined });
   } else {
     if (channel) {
+      dbg("ws", `channel state=${channel.state}, leaving old channel for ${agentId}`);
       try { channel.leave(); } catch {}
       _agentChannels.delete(agentId);
     }
 
     channel = socket.channel(`agent:${agentId}`);
     _agentChannels.set(agentId, channel);
+    dbg("ws", `creating new channel agent:${agentId}`);
 
-    channel.on("init", () => { /* initial state payload — no-op */ });
+    channel.on("init", () => { dbg("ws", `init event for ${agentId}`); });
 
     channel.on("message_id", (payload: any) => {
+      dbg("ws", `message_id for ${agentId}`, payload);
       const handler = _agentHandlers.get(agentId);
       handler?.({ type: "message_id", data: JSON.stringify(payload) });
     });
@@ -237,6 +265,7 @@ export function streamChat(
           handler({ type: "text_delta", data: text, deltaId });
         }
       } else {
+        dbg("ws", `stream_chunk (non-delta) for ${agentId}: ${text.slice(0, 100)}`);
         handler({ type: "text", data: text });
       }
     });
@@ -245,29 +274,35 @@ export function streamChat(
       const handler = _agentHandlers.get(agentId);
       if (!handler) return;
       if (payload.type === "tool_use") {
+        dbg("ws", `tool_use for ${agentId}: ${payload.toolName}`, payload);
         handler({ type: "tool_use", data: JSON.stringify(payload) });
       } else if (payload.type === "tool_result") {
+        dbg("ws", `tool_result for ${agentId}: ${payload.toolName}`);
         handler({ type: "tool_result", data: JSON.stringify(payload) });
       }
     });
 
     channel.on("status_change", () => {
-      // ChatPanel uses lobby:status for processing state; this is informational
+      dbg("ws", `status_change for ${agentId}`);
     });
 
     channel.on("done", () => {
+      dbg("ws", `done event for ${agentId}`);
       const handler = _agentHandlers.get(agentId);
       handler?.({ type: "done", data: "" });
     });
 
     channel.on("error", (payload: any) => {
+      dbg("error", `error event for ${agentId}: ${payload?.message || "Unknown"}`, payload);
       const handler = _agentHandlers.get(agentId);
       handler?.({ type: "error", data: payload?.message || "Unknown error" });
     });
 
     channel.join().receive("ok", () => {
+      dbg("ws", `channel joined for ${agentId}, pushing chat`);
       channel.push("chat", { message, images: images?.length ? images : undefined });
     }).receive("error", (resp: any) => {
+      dbg("error", `channel join FAILED for ${agentId}`, resp);
       const handler = _agentHandlers.get(agentId);
       handler?.({ type: "error", data: JSON.stringify(resp) });
     });
@@ -275,6 +310,7 @@ export function streamChat(
 
   return {
     abort: () => {
+      dbg("ws", `abort called for ${agentId}`);
       channel?.push("cancel", {});
       _agentHandlers.delete(agentId);
     },

@@ -4,6 +4,7 @@ import ChatPanel from "./components/ChatPanel";
 import WorkLogPanel from "./components/WorkLogPanel";
 import AgentDetailPanel from "./components/AgentDetailPanel";
 import MonitorPanel from "./components/MonitorPanel";
+import DebugPanel from "./components/DebugPanel";
 import AddAgentDialog from "./components/AddAgentDialog";
 import FolderPicker from "./components/FolderPicker";
 import OfficeView from "./components/OfficeView";
@@ -454,6 +455,18 @@ function App() {
                 >
                   监控
                 </button>
+                {selectedAgentId && (
+                  <button
+                    onClick={() => setRightPanelTab("debug" as any)}
+                    className={
+                      (rightPanelTab === ("debug" as any))
+                        ? "bg-accent/20 text-accent"
+                        : "text-gray-400 hover:text-gray-200"
+                    }
+                  >
+                    调试
+                  </button>
+                )}
               </>
             )}
           </div>
@@ -485,6 +498,8 @@ function App() {
               <AgentDetailPanel agentId={selectedAgentId} />
             ) : rightPanelTab === "monitor" ? (
               <MonitorPanel key={selectedAgentId} agentId={selectedAgentId} />
+            ) : rightPanelTab === ("debug" as any) ? (
+              <DebugPanel />
             ) : (
               <WorkLogPanel key={selectedAgentId} agentId={selectedAgentId} />
             )}

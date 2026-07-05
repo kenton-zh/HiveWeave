@@ -21,7 +21,7 @@ Shutdown sequence:
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 import structlog
@@ -185,6 +185,47 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 请求日志中间件 — 记录每个 API 调用的耗时和状态码
+import time as _time
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    # 跳过高频轮询请求
+    path = request.url.path
+    skip_prefixes = (
+        "/api/projects/", "/api/chat/questions", "/api/user-pings",
+        "/api/communications", "/api/permissions/pending",
+    )
+    is_polling = any(path.startswith(p) for p in skip_prefixes) and request.method == "GET"
+
+    if is_polling:
+        return await call_next(request)
+
+    start = _time.monotonic()
+    try:
+        response = await call_next(request)
+        elapsed_ms = round((_time.monotonic() - start) * 1000)
+        # 记录关键 API 调用
+        if response.status_code >= 400 or path.startswith("/api/chat") or path.startswith("/api/org"):
+            log.info(
+                "http_request",
+                method=request.method,
+                path=path,
+                status=response.status_code,
+                elapsed_ms=elapsed_ms,
+            )
+        return response
+    except Exception as e:
+        elapsed_ms = round((_time.monotonic() - start) * 1000)
+        log.error(
+            "http_request_error",
+            method=request.method,
+            path=path,
+            error=str(e),
+            elapsed_ms=elapsed_ms,
+        )
+        raise
 
 
 # ── Route Registration ──────────────────────────────────────
