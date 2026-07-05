@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -521,14 +522,37 @@ async def delete_project(project_id: str) -> dict:
             await project_db.evict_project_db(workspace)
         except Exception:
             pass
+        # 等待 DB 连接完全释放（Windows 文件锁延迟）
+        await asyncio.sleep(0.3)
         # 删除整个 .hiveweave 目录（DB 文件 + worktrees + 临时文件）
-        try:
+        # 带重试机制处理 Windows 文件锁
+        hw_dir = Path(workspace) / ".hiveweave"
+        if hw_dir.exists():
             import shutil
-            hw_dir = Path(workspace) / ".hiveweave"
-            if hw_dir.exists():
-                shutil.rmtree(hw_dir, ignore_errors=True)
-        except Exception as e:
-            log.warning("delete_hiveweave_dir_failed", workspace=workspace, error=str(e))
+            import stat
+            import time as _time
+
+            def _on_error(func, path, exc_info):
+                """强制删除：去除只读属性后重试。"""
+                try:
+                    os.chmod(path, stat.S_IWRITE)
+                except Exception:
+                    pass
+                try:
+                    func(path)
+                except Exception:
+                    pass
+
+            for attempt in range(3):
+                try:
+                    shutil.rmtree(hw_dir, onerror=_on_error)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        _time.sleep(0.5)
+                    else:
+                        log.warning("delete_hiveweave_dir_failed",
+                                    workspace=workspace, error=str(e))
 
     # 若是当前激活项目，取消激活
     active_id = await _get_active_project_id()
