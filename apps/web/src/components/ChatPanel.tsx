@@ -522,23 +522,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     fetchAgent();
     loadMessagesFromDb(loadForAgentId);
 
-    // Check for pending initial message from NewProjectDialog.
-    // NewProjectDialog sets this instead of calling streamChat directly,
-    // so that ChatPanel can register its WebSocket event handler BEFORE
-    // the chat is pushed — ensuring streaming events are not lost.
-    const pending = useAppStore.getState().pendingInitialMessage;
-    if (pending && pending.agentId === loadForAgentId) {
-      useAppStore.getState().setPendingInitialMessage(null);
-      pendingQueueRef.current = [pending.message];
-      setQueuedCount(1);
-      autoSendRef.current = true;
-      // Auto-send after WebSocket channel has time to join.
-      // 300ms ensures ChatPanel is fully mounted and channel join is initiated.
-      setTimeout(() => {
-        handleSendRef.current();
-      }, 300);
-    }
-
+    // pendingInitialMessage is handled by the dedicated effect below
     return () => {
       // Only prevent stale fetchAgent/loadMessagesFromDb results from
       // applying. Do NOT abort the stream or clear the response timeout here —
@@ -549,6 +533,27 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       cancelled = true;
     };
   }, [agentId, loadMessagesFromDb, orgTreeVersion]);
+
+  // Dedicated effect: watch for pendingInitialMessage changes.
+  // This handles the case where ChatPanel is already mounted when
+  // NewProjectDialog sets the pending message (e.g. CEO was already selected).
+  const pendingInitialMessage = useAppStore((s) => s.pendingInitialMessage);
+  useEffect(() => {
+    if (!pendingInitialMessage || !agentId) return;
+    if (pendingInitialMessage.agentId !== agentId) return;
+
+    // Consume the pending message
+    useAppStore.getState().setPendingInitialMessage(null);
+    pendingQueueRef.current = [pendingInitialMessage.message];
+    setQueuedCount(1);
+    autoSendRef.current = true;
+
+    // Auto-send after a short delay to let WebSocket channel join complete
+    const timer = setTimeout(() => {
+      handleSendRef.current();
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [pendingInitialMessage, agentId]);
 
   // Manage WebSocket channel + stream lifecycle — abort stream, clear timeout,
   // and leave channel ONLY when agentId actually changes, not when
