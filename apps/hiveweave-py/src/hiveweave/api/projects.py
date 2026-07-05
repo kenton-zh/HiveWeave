@@ -189,14 +189,17 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 return [a["id"]]
         return []
 
-    # 获取默认模型 ID（第一个 active 模型）
+    # 获取默认模型 ID（优先选择非 free 的 active 模型）
     default_model_id = None
     try:
         from hiveweave.services.model import ModelService
         ms = ModelService()
         active_models = await ms.list_active()
         if active_models:
-            default_model_id = active_models[0].get("model_id") or active_models[0].get("id")
+            # 优先选择非 free 模型
+            non_free = [m for m in active_models if "free" not in (m.get("model_id") or "").lower()]
+            chosen = non_free[0] if non_free else active_models[0]
+            default_model_id = chosen.get("model_id") or chosen.get("id")
     except Exception:
         pass
 
