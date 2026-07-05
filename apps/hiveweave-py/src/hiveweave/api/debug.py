@@ -136,15 +136,30 @@ async def agent_traces(
 
     返回前端 MonitorPanel 期望的格式: { turns, events }。
     """
-    # 获取事件追踪
-    events = await event_audit.timeline(agent_id, hours=hours, limit=limit)
+    import asyncio
 
-    # 获取对话轮次
+    # 获取事件追踪（带超时保护，防止 DB 锁阻塞整个服务器）
+    try:
+        events = await asyncio.wait_for(
+            event_audit.timeline(agent_id, hours=hours, limit=limit),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        log.warning("agent_traces_events_timeout", agent_id=agent_id)
+        events = []
+    except Exception as e:
+        log.warning("agent_traces_events_failed", agent_id=agent_id, error=str(e))
+        events = []
+
+    # 获取对话轮次（带超时保护）
     turns: list[dict] = []
     try:
         project_id = await meta_db.get_agent_project_id(agent_id)
         if project_id:
-            history = await conversation_store.get_history(agent_id, project_id)
+            history = await asyncio.wait_for(
+                conversation_store.get_history(agent_id, project_id),
+                timeout=5.0,
+            )
             turns = [
                 {
                     "turn_index": i,
@@ -155,6 +170,8 @@ async def agent_traces(
                 }
                 for i, m in enumerate(history)
             ]
+    except asyncio.TimeoutError:
+        log.warning("agent_traces_turns_timeout", agent_id=agent_id)
     except Exception as e:
         log.warning("agent_traces_turns_failed", agent_id=agent_id, error=str(e))
 
