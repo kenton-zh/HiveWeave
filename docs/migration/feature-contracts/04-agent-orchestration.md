@@ -66,6 +66,14 @@
 5. agent 被 dismiss → stop_agent 终止进程
 ```
 
+> **[RECONCILE 修正] 崩溃恢复无检查点 — 与 known-issues T3 对齐**
+>
+> Elixir 崩溃恢复机制：DynamicSupervisor 重启 agent GenServer，但从 `init` 重新开始 — **所有内存状态丢失**（`empty_retry_count`、`current_job`、`pending_inbox_msg_ids`、`safety_timer`）。仅 DB 持久化的数据（agent 配置、conversation_turns、inbox 消息）在重启后恢复。`terminate` 回调（`agent.ex:789`）仅写文件日志，不保存检查点。
+>
+> 这与 `known-issues.md T3` 不矛盾：T3 描述的是 **TS** 无容错（Node.js 无 OTP），Python 正确做法是"自建 task 重启逻辑 **+ LangGraph 检查点恢复**"。契约 04 描述的是 **Elixir** 行为（有 supervisor 但无检查点）。Python 迁移应：
+> 1. 保留 Elixir 的 supervisor 重启语义（asyncio task 异常时重启）
+> 2. **新增**检查点恢复（对齐 T3）：将 `empty_retry_count`、`current_job`、`pending_inbox_msg_ids` 等关键状态持久化，重启后恢复
+
 ### Chat 流程
 
 ```
@@ -97,7 +105,7 @@
 2. trigger_coordinator(agent_id) — 触发 coordinator（仅当有未读消息）
 
 3. do_trigger(agent_id, trigger_type):
-   a. 延迟 100ms（等 DB 写入落盘）
+   a. 延迟 100ms（等 DB 写入落盘）**[workaround]**
    b. 从 DB 获取 agent
    c. 如果 agent 已 archived/dismissed → 跳过
    d. coordinator：检查是否有 pending inbox 消息，无则跳过
@@ -131,6 +139,16 @@
       - 重新触发 chat
 ```
 
+> **[RECONCILE 澄清] retry_count 边界 — 契约已正确，此为噪声澄清**
+>
+> `retry_count` 初始值为 0（`agent.ex:41` `empty_retry_count: 0`），每次空响应 +1。判断条件 `retry_count > 3`（`agent.ex:502`，`max_retries = 3`）意味着：
+> - 1st 空 → retry_count=1, 1>3? No → 重试 #1（5s 退避）
+> - 2nd 空 → retry_count=2, 2>3? No → 重试 #2（15s 退避）
+> - 3rd 空 → retry_count=3, 3>3? No → 重试 #3（45s 退避）
+> - 4th 空 → retry_count=4, 4>3? Yes → 升级上级
+>
+> 即 **1 次原始调用 + 3 次重试 = 4 次 LLM 调用**，第 4 次空响应时升级。"最多 3 次"指的是 3 次重试，契约描述与源码一致。升级消息中 "连续3次" 对应 `max_retries=3`（重试次数），非总空响应次数。
+
 ### 安全超时
 
 ```
@@ -141,16 +159,39 @@
    d. 日志记录
 ```
 
+> **[RECONCILE 补充] 停滞检测（5min）与安全超时（10min）的窗口行为**
+>
+| 时间点 | 机制 | 来源 | 行为 |
+|---|---|---|---|
+| 5min（processing） | 停滞检测 | `game_time/server.ex:376` | `check_agent_liveness` 判定 stalled → `escalate_stall` 向上级发送 inbox 消息 + trigger_coordinator。**agent 进程不受影响，继续 processing** |
+| 5-10min 窗口 | — | — | agent 仍在 processing，上级已收到 escalation 但未采取行动。agent 可能正常完成、被 cancel、或等到 10min 安全超时 |
+| 10min | 安全超时 | `agent.ex:438,687` | `:safety_timeout` → 终止 LLM task、清除 zombie streaming 消息、标记 inbox 已读、状态回 idle |
+>
+> **关键区别**：停滞检测（5min）是**通知机制**（告知上级），不终止 agent；安全超时（10min）是**强制回收机制**（终止 LLM task）。两者独立运行，停滞升级的 cooldown 为 10min（per-agent，防重复通知）。
+
 ### Cancel 流程
 
 ```
 1. cancel(agent_pid):
-   a. 终止 LLM task
+   a. 终止 LLM task（Task.Supervisor.terminate_child）
    b. 取消安全定时器
    c. 广播 done event（error: "cancelled"）
    d. 状态 → idle
    e. 广播 idle status
 ```
+
+> **[RECONCILE 补充] cancel 时工具清理与遗漏 — 有效可操作**
+>
+> 源码 `agent.ex:461-476` 的 cancel 实现有三个未描述的行为：
+>
+> 1. **工具任务不被终止**：LLM task 通过 `Task.Supervisor.terminate_child` 终止，但工具执行任务是通过 `Task.Supervisor.async_nolink`（`streamer.ex:560`）启动的 — **nolink 意味着工具任务不链接到 LLM task**。LLM task 被杀后，正在执行的工具（如 bash 命令）**继续在后台运行**直到自然完成或自身超时（120s/30s）。其结果被丢弃（无人 yield）。
+>    - Python 建议：cancel 时应遍历并取消正在执行的工具 task（`asyncio.Task.cancel()`），避免资源泄漏。
+>
+> 2. **zombie streaming 消息未清理**：cancel 调用了 `broadcast done` 但**未调用** `update_streaming_messages_done`（对比 `:safety_timeout` `agent.ex:698` 和 `:force_reset` `agent.ex:741` 都调用了）。这可能导致 DB 中 `is_streaming=true` 残留，直到下次应用启动时 `clear_stuck_streaming()` 清除。
+>    - Python 建议：cancel 时应调用 streaming 消息清理（与 safety_timeout 对齐）。
+>
+> 3. **pending inbox 消息未标记已读**：cancel 未标记 `pending_inbox_msg_ids` 为已读（对比 `:safety_timeout` `agent.ex:714` 和 `:DOWN` `agent.ex:659` 都标记了）。这意味着 cancel 后 inbox 消息仍为未读，下次 `maybe_self_retrigger` 会重新触发 — 但 cancel 也不调用 `maybe_self_retrigger`，所以消息会等到下一次外部 trigger 才被处理。
+>    - Python 建议：cancel 时应标记 pending inbox 为已读（与 safety_timeout 对齐），避免用户取消后被自动 re-trigger。
 
 ## 组织结构
 
@@ -213,7 +254,7 @@
 | 空响应退避 | `5_000 / 15_000 / 45_000` ms | — |
 | chat call 超时 | `30_000` ms | — |
 | get_state call 超时 | `5_000` ms | — |
-| trigger 延迟 | `100` ms | — |
+| trigger 延迟 | `100` ms | — | **[RECONCILE 权衡] workaround**：`Process.sleep(100)` 等 DB 写入落盘（`agent.ex:179`）。trigger 在 dispatch/handoff 写 DB 后立即 spawn，DB 可能未提交。100ms 给 SQLite 时间落盘。**接受理由**：替代方案（DB 写回调 / 同步写）增加复杂度且耦合 DB 层。Python 建议：用 `asyncio.sleep(0.1)` 保留此 workaround，或改用 DB 事务回调消除延迟 |
 | DynamicSupervisor max_restarts | `5` | — |
 | DynamicSupervisor max_seconds | `60` | — |
 | 最大 tool 轮次（CEO） | `60` | — |
@@ -230,7 +271,7 @@
 | 问题编号 | 说明 | Python 迁移处理 |
 |---|---|---|
 | T2 | TS 无原生并发隔离 | asyncio task + LangGraph checkpoints |
-| T3 | TS 无原生容错 | 自建 task 重启逻辑 |
+| T3 | TS 无原生容错 | 自建 task 重启逻辑 + LangGraph 检查点恢复（Elixir 有 supervisor 但无检查点，Python 应新增） |
 | E4 | 空收件人可能崩溃（待验证） | Pydantic 验证 |
 | — | OpenCode 无多 agent 编排（单 agent CLI） | 本模块以 Elixir 为 P0 参考 |
 

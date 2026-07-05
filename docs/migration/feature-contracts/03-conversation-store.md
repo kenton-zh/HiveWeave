@@ -81,8 +81,9 @@ Per-agent 持久化对话历史管理。基于 token budget（非消息条数）
 
 2. do_compaction(agent_id, project_id, messages, budget):
    a. 确定分割点：
-      - recent_count = min(PRESERVE_RECENT_MAX, max(PRESERVE_RECENT_MIN, len(messages)/3))
-      - 但实际保留的是按 turn 计算的 tail_turns（默认 2，见常量确认）
+      - **Elixir**：`recent_count = min(@preserve_recent_max, max(@preserve_recent_min, div(length(messages), 3)))` — 量纲为**消息条数**（10/30）
+      - **Python（对齐 TS）**：按 token 预算分割，`PRESERVE_RECENT_MIN=2000` / `PRESERVE_RECENT_MAX=8000` 为 token 数
+      - 但实际保留的还有按 turn 计算的 tail_turns（默认 2，见常量确认）
    b. 分割为 old_messages + recent_messages
    c. 如果 old 为空 → 直接 trim_to_budget
    d. 否则调用 LLM 摘要（call_compactor_llm）：
@@ -111,16 +112,33 @@ Per-agent 持久化对话历史管理。基于 token budget（非消息条数）
 3. 不拆分 assistant(tool_calls) + tool(result) 的 turn 对
 ```
 
+> **[RECONCILE 修正] compaction summary 被 clean_messages 误删 — Elixir 已知 bug**
+>
+> Elixir 源码中 `do_compaction` 将摘要存为 `{"role" => "system", "content" => "## Previous Conversation Summary\n..."}`（`conversation_store.ex:221-225`），并写入内存缓存。但下次 `get_history` 缓存命中时会执行 `clean_messages(cached)`，而 `clean_messages` 的第一步就是 `Enum.reject(fn m -> m["role"] == "system" end)`（`conversation_store.ex:454`）——**摘要被当作普通 system 消息过滤掉，压缩结果丢失**。
+>
+> 这意味着 Elixir 的异步 compaction 实际上只起到了"删除旧消息"的效果，摘要内容从未真正传递给 Streamer。Streamer 的 `trim_context_if_needed`（同步轮内压缩）独立生成自己的摘要，不受此 bug 影响。
+>
+> **Python 正确做法**：不将 compaction 摘要混入 history 消息列表，而是存入独立的 `compacted_prefix_cache: dict[tuple[project_id, agent_id], str]`。`get_history` 返回不含摘要的 history，Streamer 在构建消息列表时从 `compacted_prefix_cache` 读取摘要并作为 System 3 前置（对齐 DeepSeek 前缀缓存布局）。这样 `clean_messages` 过滤 system 消息不会影响摘要。
+
 ### Token 预算裁剪（trim_to_budget）
 
 ```
 1. 估算总 token 数
 2. 如果在预算内 → 直接返回
-3. 超出预算 → 从最旧的 turn 开始移除
-4. 每次移除一个完整 turn（user + assistant + 关联的 tool 消息）
-5. 保留最近 tail_turns 个 turn 不移除
-6. 如果移除到只剩 tail_turns 仍超预算 → 截断工具输出
-7. 如果仍超 → 截断消息内容
+3. [RECONCILE 补充] 第一步：prune_tool_outputs — 轻量级工具输出裁剪
+   a. 从末尾向前遍历，累计 tool 消息的 token 数
+   b. 累计 <= @prune_protect_tokens（40_000）的近期 tool 输出受保护，不清除
+   c. 超出保护窗口的旧 tool 输出标记为待裁剪
+   d. 仅当待裁剪 token 总量 >= @prune_minimum_tokens（20_000）时才执行裁剪（避免微量裁剪无意义）
+   e. 裁剪方式：将旧 tool 消息的 content 替换为 "[Old tool result content cleared]"，保留消息结构
+4. 裁剪后重新估算，如果在预算内 → 返回
+5. 仍超出预算 → 从最旧的 turn 开始移除（do_trim_turns）
+   a. 每次移除一个完整 turn（user + assistant + 关联的 tool 消息）
+   b. 保留最近 tail_turns 个 turn 不移除
+   c. 如果移除到只剩 tail_turns 仍超预算 → 尝试将更旧的 turn 塞入剩余预算（fit_old_turns）
+6. 如果 turn 级裁剪仍不够 → 消息级裁剪（do_trim_messages）
+   a. 不拆分 assistant(tool_calls) + tool(result) 对
+   b. 从最旧的消息开始移除
 ```
 
 ## 消息格式
@@ -176,6 +194,15 @@ conversation_turns 表：
 | DB 持久化失败 | 仅日志记录 | 异步写入，不阻塞主流程 |
 | 模型 context_window 查不到 | 默认 128_000 | — |
 
+> **[RECONCILE 权衡记录] async 写入失败丢数据 — 有效权衡（性能 vs 可靠性）**
+>
+> `persist_turn` 使用 `Task.start`（fire-and-forget 异步写入），失败时仅 `Logger.warning`（`conversation_store.ex:124-126, 532-536`）。这意味着 DB 写入失败时该轮消息**永久丢失**（内存缓存仍有，但重启后丢失）。
+>
+> **权衡分析**：
+> - **接受理由**：同步写入会阻塞 LLM 流式响应（SQLite 写入 ~1-5ms，但高并发下可能更高），影响用户体验。内存缓存保证当前会话内数据可用，仅影响崩溃恢复。
+> - **风险**：服务器崩溃时最近 1 轮未落盘的消息丢失。
+> - **Python 建议**：保持异步写入，但改用 `asyncio.create_task` + 可选的 write-ahead queue（如需要更强可靠性，可加一个轻量 WAL buffer，定期 flush）。当前接受此权衡，不阻塞迁移。
+
 ## 常量引用
 
 | 常量 | 值 | 所在章节 |
@@ -183,8 +210,8 @@ conversation_turns 表：
 | `tail_turns` | `2` | Token 预算与压缩（已确认，OpenCode 默认值） |
 | `COMPACTION_BUFFER` | `20_000` | 同上 |
 | `OUTPUT_TOKEN_MAX` | `32_000` | 同上 |
-| `PRESERVE_RECENT_MIN` | `2_000` | 同上（TS 值，OpenCode 用单一 DEFAULT_KEEP_TOKENS=8_000） |
-| `PRESERVE_RECENT_MAX` | `8_000` | 同上（OpenCode DEFAULT_KEEP_TOKENS） |
+| `PRESERVE_RECENT_MIN` | Elixir: `10`（消息条数）/ TS: `2_000`（token） | 同上 | **[RECONCILE 量纲澄清]** Elixir `@preserve_recent_min 10` 是**消息条数**（用于 `min(@preserve_recent_max, max(@preserve_recent_min, div(length(messages), 3)))`）；TS `2_000` 是 token 数。Python 采用 TS token 量纲（对齐 OpenCode） |
+| `PRESERVE_RECENT_MAX` | Elixir: `30`（消息条数）/ TS: `8_000`（token） | 同上（OpenCode DEFAULT_KEEP_TOKENS） | 同上。Elixir `@preserve_recent_max 30` 是消息条数 |
 | `@prune_protect_tokens` | `40_000` | 同上（Elixir 特有，保护近期工具输出） |
 | `@prune_minimum_tokens` | `20_000` | 同上 |
 | `@tool_output_max_chars` | `2_000` | 同上 |
