@@ -8,8 +8,8 @@
 |---|---|---|---|
 | Phase 0: 功能契约盘点 | ✅ 完成 | 19/19 模块 + 架构审查 + RECONCILE | 2026-07-05 |
 | Phase 1: 迁移路径规划 | ✅ 完成 | 5 批次 + 依赖图 + 目录结构 + 测试策略 | 2026-07-05 |
-| Phase 2: Python 骨架搭建 | ⏳ 未开始 | — | — |
-| Phase 3: 逐模块迁移 | ⏳ 未开始 | 0/19 模块（5 批次规划见 migration-plan.md） | — |
+| Phase 2: Python 骨架搭建 | 🔄 进行中 | 批次 1 完成（骨架+DB+26服务模块），批次 2 待开始 | 2026-07-05 |
+| Phase 3: 逐模块迁移 | 🔄 进行中 | 批次 1 完成（14/14 子任务），批次 2-5 待开始 | 2026-07-05 |
 | Phase 4: 并行验证 | ⏳ 未开始 | — | — |
 | Phase 5: 切换上线 | ⏳ 未开始 | — | — |
 
@@ -87,9 +87,37 @@
 
 > Phase 3 开始后在此表追踪每个模块的 Python 实现进度。
 
-| # | 模块 | 状态 | Python 文件 | 测试 | 并行对比 | 最后更新 |
+### 批次 1：基础设施 + 核心服务（Layer 0 + Layer 1）✅ 完成
+
+| 序号 | 模块 | 契约 | Python 文件 | 状态 | 测试 | 最后更新 |
 |---|---|---|---|---|---|---|
-| 01-19 | 见上方 | ⏳ | — | — | — | — |
+| 1.1 | 项目骨架 | — | `pyproject.toml`, `main.py`, `config.py` | ✅ | import OK | 2026-07-05 |
+| 1.2 | 两层 SQLite | 11 | `db/schema.py`, `db/meta.py`, `db/project.py` | ✅ | DB 读写测试通过 | 2026-07-05 |
+| 1.3 | SystemState | 15 | `services/system_state.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.4 | 对话历史与压缩 | 03 | `conversation/token_utils.py`, `compaction.py`, `store.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.5 | 三层记忆 | 05 | `services/memory.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.6 | 收件箱与交接 | 06 | `services/inbox.py`, `services/handoff.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.7 | 游戏时间 | 07 | `services/game_time.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.8 | 权限与审批 | 08 | `services/permission.py`, `services/approval.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.9 | Git worktree | 09 | `services/git_worktree.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.10 | MCP 与技能 | 10 | `services/skill_registry.py`, `services/mcp.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.11 | Charter | 14 | `services/charter.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.12 | Observability | 16 | `services/event_audit.py`, `services/telemetry.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.13 | Roster+WorkLog+ChatMsg | 17 | `services/roster.py`, `work_log.py`, `chat_message.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 1.14 | CRUD 服务集 | 18 | `services/model.py`, `template.py`, `settings.py`, `team_chat.py`, `names.py` | ✅ | 集成测试通过 | 2026-07-05 |
+| 补充 | 组织 CRUD | 04 | `services/org.py`, `services/dispatch.py` | ✅ | 集成测试通过 | 2026-07-05 |
+
+**批次 1 集成验证**：30 个模块（4 DB + 3 conversation + 23 services）全部导入成功，13 个服务类实例化通过。
+
+### 批次 2：业务逻辑层（Layer 2）⏳ 待开始
+
+| 序号 | 模块 | 契约 | 依赖 | 预估工时 | 状态 |
+|---|---|---|---|---|---|
+| 2.1 | LLM 流式调用 | 01 | 03,08,13 | 3 天 | ⏳ |
+| 2.2 | 工具执行器 | 02 | 08,10,11 | 2 天 | ⏳ |
+| 2.3 | ETHOS 提示词 | 13 | 14,05,10 | 2 天 | ⏳ |
+
+### 批次 3-5 ⏳ 待开始
 
 ## 状态图例
 
