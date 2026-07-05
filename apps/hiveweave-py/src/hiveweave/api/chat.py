@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 import structlog
 
+from hiveweave.api.auth import validate_id
 from hiveweave.agents.supervisor import agent_manager
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
@@ -270,6 +271,7 @@ async def _route_to_expert(
 @router.get("/history/{agent_id}")
 async def chat_history(agent_id: str) -> dict:
     """历史消息（限 200 条）。"""
+    validate_id(agent_id, "agent_id")
     messages = await _chat_msg.get_messages(agent_id, limit=200)
     return {"messages": messages}
 
@@ -277,6 +279,7 @@ async def chat_history(agent_id: str) -> dict:
 @router.get("/unread/{agent_id}")
 async def chat_unread(agent_id: str) -> dict:
     """未读背景消息。"""
+    validate_id(agent_id, "agent_id")
     messages = await _chat_msg.get_unread_background(agent_id)
     return {"messages": messages, "count": len(messages)}
 
@@ -291,6 +294,7 @@ async def chat_mark_read(body: MarkReadBody) -> dict:
 @router.get("/inbox/{agent_id}")
 async def chat_inbox(agent_id: str) -> dict:
     """收件箱。"""
+    validate_id(agent_id, "agent_id")
     messages = await _inbox.get_pending_messages(agent_id)
     unread = await _inbox.get_unread_count(agent_id)
     return {"messages": messages, "unreadCount": unread}
@@ -336,6 +340,7 @@ async def is_paused() -> dict:
 @router.post("/reset-processing/{agent_id}")
 async def reset_processing(agent_id: str) -> dict:
     """强制重置 agent 处理状态（force_reset 信号 + 重置 idle）。"""
+    validate_id(agent_id, "agent_id")
     agent = agent_manager.get_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -346,6 +351,7 @@ async def reset_processing(agent_id: str) -> dict:
 @router.get("/resolved-model/{agent_id}")
 async def resolved_model(agent_id: str) -> dict:
     """查 agent 解析后的实际模型。"""
+    validate_id(agent_id, "agent_id")
     config = await meta_db.get_agent_by_id(agent_id)
     if config is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -366,12 +372,14 @@ async def resolved_model(agent_id: str) -> dict:
 @router.get("/messages/{agent_id}")
 async def chat_messages(agent_id: str) -> list:
     """查 agent 消息（数组直返，限 200 条）。"""
+    validate_id(agent_id, "agent_id")
     return await _chat_msg.get_messages(agent_id, limit=200)
 
 
 @router.get("/todos/{agent_id}")
 async def get_todos(agent_id: str) -> dict:
     """查 agent 待办。"""
+    validate_id(agent_id, "agent_id")
     try:
         rows = await project_db.query(
             agent_id,
@@ -387,6 +395,7 @@ async def get_todos(agent_id: str) -> dict:
 @router.post("/todos/{agent_id}")
 async def set_todos(agent_id: str, body: TodosBody) -> dict:
     """覆盖写 agent 待办（先 DELETE 再 INSERT）。"""
+    validate_id(agent_id, "agent_id")
     try:
         await project_db.execute(agent_id, "DELETE FROM todos WHERE agent_id = ?", [agent_id])
         now_ms = int(time.time() * 1000)
@@ -449,6 +458,7 @@ async def get_questions(
 @router.post("/questions/{question_id}/answer")
 async def answer_question(question_id: str, body: QuestionAnswerBody) -> dict:
     """回答问题。"""
+    validate_id(question_id, "question_id")
     try:
         now_ms = int(time.time() * 1000)
         await project_db.execute(
@@ -476,6 +486,7 @@ async def chat_stream(agent_id: str):
         data: {"type":"text_delta","content":"..."}
         data: {"type":"done"}
     """
+    validate_id(agent_id, "agent_id")
     # 确保 agent 存在
     config = await meta_db.get_agent_by_id(agent_id)
     if config is None:
@@ -528,11 +539,13 @@ def _sse(payload: dict) -> str:
 @router.get("/{agent_id}/messages")
 async def chat_messages_path(agent_id: str) -> list:
     """查 agent 消息（path: agentId）— 前端 RESTful 兼容路由。"""
+    validate_id(agent_id, "agent_id")
     return await chat_messages(agent_id)
 
 
 @router.post("/{agent_id}/messages")
 async def send_chat_path(agent_id: str, body: ChatSendBody) -> dict:
     """触发 agent 聊天（path: agentId 覆盖 body agentId）— 前端 RESTful 兼容路由。"""
+    validate_id(agent_id, "agent_id")
     overridden = body.model_copy(update={"agentId": agent_id})
     return await send_chat(overridden)

@@ -348,6 +348,7 @@ class Agent:
 
         对齐 Elixir agent.ex:336 run_llm/2 + handle_info({ref, result})。
         """
+        current_task = asyncio.current_task()
         try:
             # 构建 messages
             messages = await self._build_messages(message, opts)
@@ -434,10 +435,13 @@ class Agent:
             await self._handle_error(e)
 
         finally:
-            self._cancel_safety_timer()
-            # 安全网：确保状态重置
-            if self.status == AgentState.PROCESSING:
-                self._reset_to_idle()
+            # 只有当前 task 仍是 self._llm_task 时才清理状态
+            # （cancel() 后若新 chat() 启动了新 task，不应清理新 task 的状态）
+            if self._llm_task is current_task:
+                self._llm_task = None
+                self._cancel_safety_timer()
+                if self.status == AgentState.PROCESSING:
+                    self._reset_to_idle()
 
     # ── 内部: 消息构建 ────────────────────────────────────────
 
