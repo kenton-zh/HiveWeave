@@ -125,11 +125,11 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
         // Permissions endpoint might not exist yet, use agent data
         setPermissions({
           permissionMode: data.permissionMode || "full",
-          allowedTools: JSON.parse(data?.allowedTools || "[]"),
-          deniedTools: JSON.parse(data?.deniedTools || "[]"),
-          askTools: JSON.parse(data?.askTools || "[]"),
-          mcpServers: JSON.parse(data?.mcpServers || "[]"),
-          boundSkills: JSON.parse(data?.boundSkills || "[]"),
+          allowedTools: safeJsonArray(data?.allowedTools),
+          deniedTools: safeJsonArray(data?.deniedTools),
+          askTools: safeJsonArray(data?.askTools),
+          mcpServers: safeJsonArray(data?.mcpServers),
+          boundSkills: safeJsonArray(data?.boundSkills),
         });
       }
     } catch (err: any) {

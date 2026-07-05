@@ -145,6 +145,25 @@ async def evict_project_db(workspace_path: str) -> None:
         del _agent_cache[aid]
 
 
+async def evict_project_db_for_agent(agent_id: str) -> None:
+    """Close the per-project DB connection associated with an agent.
+
+    Used during project deletion to ensure all agent-related DB connections
+    are released before attempting to delete the .hiveweave directory.
+    """
+    ws = _agent_cache.get(agent_id)
+    if ws is None:
+        return
+    async with _ensure_lock:
+        conn = _cache.pop(ws, None)
+    if conn is not None:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+    _agent_cache.pop(agent_id, None)
+
+
 async def close_all() -> None:
     """Close all per-project DB connections (shutdown)."""
     global _cache, _agent_cache

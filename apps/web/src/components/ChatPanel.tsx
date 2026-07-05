@@ -531,6 +531,13 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       pendingQueueRef.current = [pending.message];
       setQueuedCount(1);
       autoSendRef.current = true;
+      // Auto-send after a short delay to let the WebSocket channel join complete.
+      // Without this, the pending message sits in the queue until the drain
+      // effect fires — but the drain effect requires isAgentProcessing to be
+      // false, which may not update in time on first mount.
+      setTimeout(() => {
+        handleSend();
+      }, 100);
     }
 
     return () => {
