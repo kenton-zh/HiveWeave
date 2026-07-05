@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 from urllib.parse import parse_qs
 
@@ -123,3 +124,33 @@ async def verify_api_key(request: Request) -> None:
         from fastapi import HTTPException
 
         raise HTTPException(status_code=401, detail=_UNAUTHORIZED_BODY["error"])
+
+
+# ── 路径参数校验 ────────────────────────────────────────────
+
+#: 安全 ID 格式 — 仅允许字母、数字、下划线、短横线（防 ``../`` 注入）
+_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def validate_id(id_value: str, name: str = "id") -> None:
+    """校验路径参数 ID 格式，防止 ``../`` 等特殊字符注入。
+
+    仅允许字母、数字、下划线、短横线。UUID、short_id、project slug 均符合。
+
+    Args:
+        id_value: 路径参数值
+        name: 参数名（用于错误消息）
+
+    Raises:
+        HTTPException: 400 — 含非法字符
+    """
+    if not id_value or not _ID_PATTERN.match(id_value):
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid {name}: must be alphanumeric, dash, or underscore "
+                f"(no slashes, dots, or special chars)"
+            ),
+        )

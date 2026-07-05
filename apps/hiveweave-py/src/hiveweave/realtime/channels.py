@@ -188,17 +188,15 @@ async def _run_ws_session(
     """
     bus = bus or status_event_bus
 
-    # 1. Accept
-    await websocket.accept()
-
-    # 2. Auth
+    # 1. Auth (在 accept 之前 — 拒绝未认证连接，不进入 accept 状态)
     if not _authenticate_ws(websocket):
-        try:
-            await websocket.send_json({"type": "error", "error": "Unauthorized"})
-        except Exception:
-            pass
-        await websocket.close(code=WS_CLOSE_UNAUTHORIZED)
+        await websocket.close(
+            code=WS_CLOSE_UNAUTHORIZED, reason="Unauthorized"
+        )
         return
+
+    # 2. Accept
+    await websocket.accept()
 
     # 3. Subscribe
     queue = await bus.subscribe(channel, agent_id=agent_id)
@@ -375,6 +373,13 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
         websocket: FastAPI WebSocket
         agent_id: Agent UUID（路径参数）
     """
+    # 认证检查（在任意 DB/agent 操作之前 — 防止未认证请求触发 ensure_project_booted）
+    if not _authenticate_ws(websocket):
+        await websocket.close(
+            code=WS_CLOSE_UNAUTHORIZED, reason="Unauthorized"
+        )
+        return
+
     from hiveweave.db import meta as meta_db
     from hiveweave.services.chat_message import ChatMessageService
 

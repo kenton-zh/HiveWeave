@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 import structlog
 
+from hiveweave.api.auth import validate_id
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
 from hiveweave.services.org import OrgService
@@ -155,6 +156,7 @@ async def list_agents(
 @router.get("/agents/{agent_id}")
 async def get_agent(agent_id: str) -> dict:
     """查单个 agent（支持 short_id / UUID / UUID 前缀）。"""
+    validate_id(agent_id, "agent_id")
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -164,6 +166,7 @@ async def get_agent(agent_id: str) -> dict:
 @router.get("/agents/{agent_id}/children")
 async def get_children(agent_id: str) -> dict:
     """查直接子节点。"""
+    validate_id(agent_id, "agent_id")
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -186,6 +189,7 @@ async def create_agent(body: AgentCreate) -> dict:
 
 
 async def _do_update_agent(agent_id: str, body: AgentUpdate) -> dict:
+    validate_id(agent_id, "agent_id")
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -213,6 +217,7 @@ async def put_agent(agent_id: str, body: AgentUpdate) -> dict:
 @router.delete("/agents/{agent_id}")
 async def delete_agent(agent_id: str) -> dict:
     """删除 agent（硬删除，拒绝有下属的 agent）。"""
+    validate_id(agent_id, "agent_id")
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -225,6 +230,7 @@ async def delete_agent(agent_id: str) -> dict:
 @router.post("/agents/{agent_id}/dismiss")
 async def dismiss_agent(agent_id: str) -> dict:
     """软删除（归档）agent。"""
+    validate_id(agent_id, "agent_id")
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -240,6 +246,7 @@ async def dismiss_agent(agent_id: str) -> dict:
 @router.post("/agents/{agent_id}/transfer")
 async def transfer_agent(agent_id: str, body: TransferBody) -> dict:
     """转移 agent 到新上级（带环检测）。"""
+    validate_id(agent_id, "agent_id")
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -279,17 +286,20 @@ async def list_modules(projectId: str = Query(...)) -> dict:
 @router.get("/{project_id}/tree")
 async def get_tree_path(project_id: str) -> dict:
     """组织树（path: projectId）— 前端 RESTful 兼容路由。"""
+    validate_id(project_id, "project_id")
     return await get_tree(projectId=project_id)
 
 
 @router.get("/{project_id}/agents")
 async def list_agents_path(project_id: str) -> dict:
     """列出 agent（path: projectId）— 前端 RESTful 兼容路由。"""
+    validate_id(project_id, "project_id")
     return await list_agents(projectId=project_id)
 
 
 @router.post("/{project_id}/agents")
 async def create_agent_path(project_id: str, body: AgentCreate) -> dict:
     """创建 agent（path: projectId 覆盖 body projectId）— 前端 RESTful 兼容路由。"""
+    validate_id(project_id, "project_id")
     overridden = body.model_copy(update={"projectId": project_id})
     return await create_agent(overridden)
