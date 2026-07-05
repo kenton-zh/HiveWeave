@@ -10,7 +10,7 @@
 | Phase 1: 迁移路径规划 | ✅ 完成 | 5 批次 + 依赖图 + 目录结构 + 测试策略 | 2026-07-05 |
 | Phase 2: Python 骨架搭建 | ✅ 完成 | 批次 1-4 全部完成（73 模块） | 2026-07-05 |
 | Phase 3: 逐模块迁移 | ✅ 完成 | 5 批次全部完成（DB+服务+LLM+工具+提示词+编排+实时+API） | 2026-07-05 |
-| Phase 4: 并行验证 | ✅ 完成 | 服务器启动+API+WebSocket 测试通过+11 Critical 修复 | 2026-07-06 |
+| Phase 4: 并行验证 | ✅ 完成 | 11 Critical + 35 Required 全部修复，端到端 LLM 测试通过（Step 3.7 Flash） | 2026-07-06 |
 | Phase 5: 切换上线 | ⏳ 未开始 | — | — |
 
 ## 前置确认项（4 项 ⚠️ 待定常量）
@@ -149,10 +149,16 @@
 | 5.7 | 前端连接 | ✅ | 前端已连接，GET /api/chat/questions 200 OK | 2026-07-05 |
 | 5.8 | API 路径兼容性修复 | ✅ | 9 条 RESTful 兼容路由已添加 | 2026-07-05 |
 | 5.9 | Meta DB schema 迁移 | ✅ | 5 列已补齐（projects.language/updated_at, agents.workspace_path/language, agent_templates.updated_at） | 2026-07-05 |
+| 5.10 | 五轴代码审查 | ✅ | 78 文件/16K 行，发现 11 Critical + 35 Required + 25 Optional | 2026-07-06 |
+| 5.11 | 11 Critical 修复 | ✅ | 数据丢失/安全/功能全部修复（commits 6780def/61000dc/a71430d） | 2026-07-06 |
+| 5.12 | 端到端 LLM 测试 | ✅ | CEO 调用 Step 3.7 Flash 成功响应（commit afbb3f0） | 2026-07-06 |
+| 5.13 | 35 Required 修复 | ✅ | DB/LLM/API/Realtime 三组全部修复（commits d4b297b/4508d7d/105911c） | 2026-07-06 |
+| 5.14 | 修复后回归验证 | ✅ | 服务器重启+4 agent 初始化+端到端 LLM 调用通过，链路无错误 | 2026-07-06 |
 
 **已知遗留问题**：
-- ChatMessageService/GameTimeService 构造函数不接受 project_id 参数（lifespan 中的 zombie 清理和 game time 启动有 warning，非致命）
-- agents 表 status 默认值差异（TS='created' vs Python='active'），导致 start_project_agents 找不到 active agent
+- ✅ ChatMessageService/GameTimeService 构造函数已修复（接受 project_id 参数）
+- ✅ agents 表 status 默认值差异已修复（check_agents.py 将 status='created' 更新为 'active'）
+- GameTimeService.start_tick_loop 方法名不匹配（启动时有 warning，game time 仍正常启动，非致命）
 - `/api/logs/{agentId}/work-logs` 兼容路由返回 404（router prefix 不匹配，需后续修复）
 
 ## 状态图例
