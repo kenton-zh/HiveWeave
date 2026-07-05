@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { useAppStore } from "../store.js";
-import { streamChat } from "../api.js";
 
 interface Props {
   ceoAgentId: string;
@@ -15,13 +14,16 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
   const [customInput, setCustomInput] = useState("");
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
   const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
+  const setPendingInitialMessage = useAppStore((s) => s.setPendingInitialMessage);
 
   const handleSend = (message: string) => {
     // Switch to CEO chat panel
     setSelectedAgent(ceoAgentId);
     setRightPanelTab("chat");
-    // Send the message directly via API — ChatPanel will pick up the response on mount
-    streamChat(ceoAgentId, message, undefined, () => {});
+    // Store the message for ChatPanel to send on mount — this ensures
+    // the WebSocket event handler is properly registered by ChatPanel
+    // before the chat is pushed, so streaming events are not lost.
+    setPendingInitialMessage({ agentId: ceoAgentId, message });
     onClose();
   };
 

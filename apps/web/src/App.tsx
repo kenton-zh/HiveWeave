@@ -12,6 +12,7 @@ import GoalsPanel from "./components/GoalsPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import QuestionDialog from "./components/QuestionDialog";
 import NewProjectDialog from "./components/NewProjectDialog";
+import ToastContainer from "./components/Toast";
 import { useAppStore } from "./store";
 import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings } from "./api";
 import type { Project } from "./api";
@@ -38,6 +39,7 @@ function App() {
 
   const setProcessingAgents = useAppStore((s) => s.setProcessingAgents);
   const updateProcessingAgent = useAppStore((s) => s.updateProcessingAgent);
+  const showToast = useAppStore((s) => s.showToast);
 
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(userName);
@@ -189,9 +191,26 @@ function App() {
         refreshOrgTree();
       }
       setShowProjectMenu(false);
+      showToast(`项目「${proj.name}」已删除`, "success");
     } catch (err) {
+      const msg = err instanceof Error ? err.message : "未知错误";
       console.error("Failed to delete project:", err);
-      alert(`删除项目失败: ${err instanceof Error ? err.message : "未知错误"}`);
+      // 404 means the project is already gone from the backend — treat as
+      // success: refresh the list so the stale entry is removed from the UI.
+      if (msg.includes("404")) {
+        const updated = await getProjects();
+        setProjects(updated);
+        if (selectedProjectId === id) {
+          setSelectedProjectId(updated[0]?.id || null);
+          setSelectedAgent(null);
+          clearChatSessions();
+          refreshOrgTree();
+        }
+        setShowProjectMenu(false);
+        showToast(`项目「${proj.name}」已删除`, "success");
+      } else {
+        showToast(`删除项目失败: ${msg}`, "error");
+      }
     }
   };
 
@@ -513,6 +532,7 @@ function App() {
           }}
         />
       )}
+      <ToastContainer />
     </div>
   );
 }

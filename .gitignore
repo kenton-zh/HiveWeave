@@ -47,6 +47,8 @@ _research/
 # Temp patch/fix scripts
 _fix*.mjs
 _fix*.py
+_fix*.cjs
+_fix*.js
 _patch*.py
 _patch*.mjs
 _patch*.cjs
@@ -57,6 +59,15 @@ _apply_*.mjs
 apply-app-patch.mjs
 _ceo_*.txt
 _t.txt
+_inspect*.js
+
+# Chat history exports (other projects)
+*_chat_history.json
+*_chat_history.md
+
+# Empty temp files
+SUMMARY.md
+create_summary.py
 
 # Temp debug files
 check_db_tmp.ts

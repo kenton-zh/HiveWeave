@@ -111,13 +111,26 @@ defmodule HiveWeaveWeb.ProjectsController do
     end
   end
 
+  defp diag_log(msg) do
+    log_path = "c:/Users/99744/.trae-cn/work/6a4a11120724dad5e14c026b/delete_diag.log"
+    ts = :os.system_time(:millisecond)
+    File.write!(log_path, "[#{ts}] #{msg}\n", [:append])
+    Logger.info("[DIAG] #{msg}")
+  rescue
+    _ -> Logger.info("[DIAG] #{msg}")
+  end
+
   defp do_delete_project(conn, project) do
+    diag_log("=== DELETE START project=#{project.id} ws=#{inspect(project.workspace_path)} ===")
+
     # 1. Stop project supervisor — bounded by 3s. Agent GenServers and
     #    any in-flight LLM Tasks must die before we close the DB pool.
+    diag_log("step1: stop_project_bounded")
     stop_project_bounded(project.id, 3_000)
 
     # 2. Close the per-project DB pool — marks project as 'deleting' so
     #    no new pool can be created, then kills connection processes.
+    diag_log("step2: stop_repo_bounded")
     stop_repo_bounded(project.id, 5_000)
 
     # 3. Delete agents for this project from the meta DB FIRST.
@@ -148,6 +161,8 @@ defmodule HiveWeaveWeb.ProjectsController do
       else
         false
       end
+
+    diag_log("cleanup done, db_leftover=#{db_leftover}")
 
     # 6. Clear the 'deleting' flag so the project can be re-created if needed.
     try do
@@ -197,16 +212,24 @@ defmodule HiveWeaveWeb.ProjectsController do
 
     case pool do
       {:ok, nil} ->
+        diag_log("stop_repo returned nil pool — pool was NOT tracked (DB never opened)")
         Logger.info("[delete] stop_repo returned nil pool for #{project_id} — pool was not tracked")
         :ok
 
       {:ok, p} ->
+        diag_log("stop_repo returned pool #{inspect(p)} alive=#{Process.alive?(p)}")
         Logger.info("[delete] stop_repo returned pool #{inspect(p)} for #{project_id}")
         # Kill the Exqlite connection processes FIRST — they live under a
         # separate supervisor and are what actually holds the SQLite file
         # handle. Then stop the pool GenServer.
         kill_pool_connections(p)
         ensure_terminated(p, 2_000)
+        # NOW run GC — the pool GenServer is dead, so its references to
+        # prepared statement NIF resources are gone. GC will reclaim them,
+        # triggering sqlite3_finalize, which lets sqlite3_close_v2 complete
+        # and release the Windows file handle.
+        diag_log("pool GenServer terminated, running GC to reclaim statement NIFs")
+        force_global_gc()
         :ok
     end
   end
@@ -238,19 +261,15 @@ defmodule HiveWeaveWeb.ProjectsController do
       end
 
     Logger.info("[delete] kill_pool_connections: pool_gen_pid=#{inspect(pool_gen_pid)}, sup_children_count=#{length(all_pool_sups)}")
+    diag_log("kill_pool_connections: pool_gen=#{inspect(pool_gen_pid)} sup_count=#{length(all_pool_sups)}")
 
     try do
       for {_id, pool_sup, _type, _mods} <- all_pool_sups,
           is_pid(pool_sup) do
         if pool_sup_owns?(pool_sup, pool_gen_pid) do
           Logger.info("[delete] found pool supervisor #{inspect(pool_sup)} (owner #{inspect(pool_gen_pid)})")
+          diag_log("found pool supervisor #{inspect(pool_sup)}")
 
-          # Kill each connection process DIRECTLY. The connection processes
-          # hold the Exqlite NIF resource (sqlite3 db handle). Graceful
-          # supervisor shutdown calls terminate → disconnect → Sqlite3.close,
-          # but that can fail silently (e.g. unfinalized statements on
-          # Windows).  A direct :kill is untrappable — the process dies
-          # immediately and the NIF resource destructor runs during BEAM GC.
           conn_pids =
             try do
               for {child_id, conn_pid, _t, _m} <- Supervisor.which_children(pool_sup),
@@ -262,52 +281,74 @@ defmodule HiveWeaveWeb.ProjectsController do
               :exit, _ -> []
             end
 
-          Logger.info("[delete] found #{length(conn_pids)} connection processes to kill")
+          diag_log("found #{length(conn_pids)} connection processes: #{inspect(conn_pids)}")
+          Logger.info("[delete] found #{length(conn_pids)} connection processes to terminate")
 
           for conn_pid <- conn_pids do
-            Logger.info("[delete] killing connection #{inspect(conn_pid)}")
-            Process.exit(conn_pid, :kill)
-          end
-
-          # Wait for connections to actually die
-          for conn_pid <- conn_pids do
-            ref = Process.monitor(conn_pid)
-            receive do
-              {:DOWN, ^ref, :process, ^conn_pid, _} -> :ok
-            after
-              1_000 -> Process.demonitor(ref, [:flush])
+            diag_log("terminating connection #{inspect(conn_pid)} alive=#{Process.alive?(conn_pid)}")
+            Logger.info("[delete] gracefully terminating connection #{inspect(conn_pid)}")
+            try do
+              :sys.terminate(conn_pid, :shutdown, 3_000)
+              diag_log("connection #{inspect(conn_pid)} terminated OK (sqlite3_close called)")
+              Logger.info("[delete] connection #{inspect(conn_pid)} terminated (terminate → disconnect → sqlite3_close)")
+            catch
+              :exit, reason ->
+                diag_log("connection #{inspect(conn_pid)} terminate FAILED: #{inspect(reason)} alive=#{Process.alive?(conn_pid)}")
+                Logger.warning("[delete] terminate of #{inspect(conn_pid)} failed: #{inspect(reason)}")
+                if Process.alive?(conn_pid) do
+                  diag_log("force-killing connection #{inspect(conn_pid)}")
+                  Logger.warning("[delete] force-killing connection #{inspect(conn_pid)}")
+                  Process.exit(conn_pid, :kill)
+                end
             end
           end
 
           # Now stop the pool supervisor itself
           ensure_terminated(pool_sup, 1_000)
+          diag_log("pool supervisor stopped")
         else
-          # Log non-matching pool sups for debugging
           :ok
         end
       end
     catch
       :exit, reason ->
+        diag_log("kill_pool_connections enumerate FAILED: #{inspect(reason)}")
         Logger.warning("[delete] kill_pool_connections enumerate failed: #{inspect(reason)}")
     end
 
-    # Force garbage collection across all processes so the NIF resource
-    # destructor (sqlite3_close) actually runs and releases the file handle.
-    force_global_gc()
+    # NOTE: force_global_gc is NOT called here. It must be called AFTER
+    # the pool GenServer is terminated (in stop_repo_bounded), because the
+    # pool GenServer holds references to prepared statements (NIF resources).
+    # GC before pool GenServer termination won't reclaim statement resources.
 
     :ok
   end
 
   defp force_global_gc do
-    Enum.each(Process.list(), fn pid ->
-      if Process.alive?(pid) do
-        try do
-          :erlang.garbage_collect(pid)
-        catch
-          :error, _ -> :ok
+    # Run many GC passes to ensure NIF resource destructors run.
+    # NIF resources (Exqlite's sqlite3 handle AND prepared statement
+    # handles) are only freed during GC. Prepared statements must be
+    # finalized (via NIF destructor → sqlite3_finalize) before
+    # sqlite3_close_v2 can complete and release the file handle.
+    #
+    # We need many passes because:
+    # 1. Connection NIF resources may be in old gen → need major GC
+    # 2. Statement NIF resources may be in a different process's heap
+    # 3. Each finalize may trigger close_v2 completion, which is async
+    for _ <- 1..8 do
+      Enum.each(Process.list(), fn pid ->
+        if Process.alive?(pid) do
+          try do
+            :erlang.garbage_collect(pid)
+          catch
+            :error, _ -> :ok
+          end
         end
-      end
-    end)
+      end)
+      :erlang.garbage_collect()
+      Process.sleep(300)
+    end
+    :ok
   end
 
   defp pool_sup_owns?(pool_sup, pool_gen_pid) do
@@ -359,58 +400,190 @@ defmodule HiveWeaveWeb.ProjectsController do
     hw_dir = Path.join(workspace_path, ".hiveweave")
     db_path = Path.join(hw_dir, "data.db")
 
+    diag_log("cleanup: hw_dir=#{hw_dir} db_exists=#{File.exists?(db_path)}")
+    Logger.info("[delete-cleanup] workspace_path=#{inspect(workspace_path)} hw_dir=#{inspect(hw_dir)}")
+
+    # Kill workspace dev servers BEFORE touching files — their file watchers
+    # lock .hiveweave/ and cause File.rm_rf / rd /s /q to fail with :eacces.
+    kill_workspace_dev_servers(workspace_path)
+
     cleanup_git_worktrees(workspace_path)
 
-    # The pool connections were just killed and global GC was forced.
-    # Give the OS a beat to actually release the file handle after the
-    # NIF resource destructor (sqlite3_close) has run.
-    Process.sleep(500)
+    Process.sleep(1000)
 
-    db_deleted =
-      case delete_file_with_retry(db_path) do
-        :ok ->
-          true
-        {:error, reason} ->
-          Logger.error("Failed to delete #{db_path} after retries: #{inspect(reason)}")
+    # Check if data.db is still locked before trying rd
+    db_locked = check_file_locked(db_path)
+    diag_log("cleanup: after kill+sleep, db_locked=#{db_locked}")
+
+    dir_removed =
+      Enum.reduce_while(1..5, false, fn attempt, _acc ->
+        case force_remove_dir(hw_dir) do
+          :ok ->
+            diag_log("cleanup: .hiveweave removed on attempt #{attempt}")
+            Logger.info("[delete-cleanup] .hiveweave removed on attempt #{attempt}")
+            {:halt, true}
+
+          {:error, _} ->
+            diag_log("cleanup: attempt #{attempt}/5 failed, db_locked=#{check_file_locked(db_path)}")
+            Logger.info("[delete-cleanup] attempt #{attempt}/5 failed, waiting 3s...")
+            force_global_gc()
+            Process.sleep(3_000)
+            {:cont, false}
+        end
+      end)
+
+    if dir_removed do
+      false
+    else
+      # All retries failed. Try renaming the directory out of the way.
+      # On Windows, renaming a locked directory can succeed even when
+      # deleting it fails — but only if the lock is on a file inside,
+      # not on the directory itself.
+      Logger.warning("[delete-cleanup] all force_remove_dir attempts failed, trying rename for async cleanup")
+
+      case try_rename_for_async_cleanup(hw_dir) do
+        {:ok, renamed_dir} ->
+          Logger.info("[delete] Renamed #{hw_dir} -> #{renamed_dir} for async cleanup")
+          spawn(fn -> async_cleanup_dir(renamed_dir) end)
           false
+        :error ->
+          # Couldn't rename either — spawn async cleanup to keep retrying.
+          # Also try deleting just the db file in the background.
+          Logger.warning("[delete-cleanup] rename failed too, spawning async cleanup for #{hw_dir}")
+          spawn(fn -> async_cleanup_dir(hw_dir) end)
+          db_deleted = not File.exists?(db_path)
+          not db_deleted
       end
-
-    # Force-remove the entire .hiveweave directory.
-    # File.rm_rf on Windows often fails on non-empty subdirectories
-    # (worktrees, tool_outputs) or when files are still locked.
-    # Fall back to `cmd /c rd /s /q` which is more aggressive.
-    force_remove_dir(hw_dir)
-
-    # If the DB file still couldn't be deleted (e.g. pool release was
-    # delayed), keep retrying in the background so it isn't left behind
-    # forever. Best-effort; never blocks the HTTP response.
-    unless db_deleted do
-      spawn(fn -> async_cleanup_db(db_path, hw_dir) end)
     end
+  end
 
-    not db_deleted
+  # Rename a stubborn directory to <dir>._hw_del_<timestamp> so it's out of
+  # the way and can be cleaned up asynchronously. Returns {:ok, new_path} or
+  # :error.
+  defp try_rename_for_async_cleanup(dir) do
+    ts = System.system_time(:millisecond)
+    renamed = "#{dir}._hw_del_#{ts}"
+
+    try do
+      case File.rename(dir, renamed) do
+        :ok -> {:ok, renamed}
+        {:error, reason} ->
+          Logger.warning("[delete] Rename #{dir} -> #{renamed} failed: #{inspect(reason)}")
+          :error
+      end
+    rescue
+      e ->
+        Logger.warning("[delete] Rename raised: #{inspect(e)}")
+        :error
+    end
+  end
+
+  # Asynchronously retry deleting a directory that couldn't be removed
+  # synchronously. Retries every 3 seconds for ~90 seconds (30 attempts).
+  # The directory may have been renamed to <dir>._hw_del_<timestamp>.
+  defp async_cleanup_dir(dir) do
+    Enum.reduce_while(1..30, :not_deleted, fn n, _acc ->
+      Process.sleep(3_000)
+
+      case force_remove_dir(dir) do
+        :ok ->
+          Logger.info("[delete-async] Deleted #{dir} on attempt #{n}")
+          {:halt, :ok}
+
+        {:error, _} ->
+          Logger.debug("[delete-async] Attempt #{n}/30 failed for #{dir}")
+          {:cont, :not_deleted}
+      end
+    end)
+  end
+
+  # Check if a file is locked by another process (Windows only).
+  # Returns true if the file cannot be opened exclusively.
+  defp check_file_locked(path) do
+    case :os.type() do
+      {:win32, _} ->
+        win_path = String.replace(path, "/", "\\")
+        try do
+          {output, 0} = System.cmd("powershell",
+            ["-NoProfile", "-Command",
+             "try { $f=[System.IO.File]::Open('#{win_path}','Open','Read','None'); $f.Close(); 'unlocked' } catch { 'locked' }"],
+            stderr_to_stdout: true)
+          String.contains?(output, "locked")
+        rescue
+          _ -> false
+        end
+      _ ->
+        false
+    end
   end
 
   # Aggressively remove a directory tree on Windows.
-  # Tries File.rm_rf first; if that fails, falls back to `cmd /c rd /s /q`
-  # which ignores read-only attributes and forces recursive deletion.
+  #
+  # On Windows, we prefer `cmd /c rd /s /q` over `File.rm_rf` because:
+  #
+  # 1. `File.rm_rf` deletes files one by one, then removes the directory.
+  #    On NTFS, a deleted file's directory entry lingers briefly as a
+  #    "ghost file". When the subsequent `rd /s /q` (or even File.rm_rf's
+  #    own directory removal) tries to delete the ghost entry, it gets
+  #    ERROR_FILE_NOT_FOUND and aborts — leaving the directory behind.
+  #
+  # 2. `rd /s /q` handles file+directory removal in one atomic operation,
+  #    avoiding the ghost-file race.
+  #
+  # IMPORTANT: Windows `rd /s /q` treats a path segment starting with `/` as a
+  # command-line switch. When `dir` is something like
+  # `D:\PC_AI\Project\PoE2LI/.hiveweave` (mixed `\` and `/` from Path.join),
+  # `rd` sees `/.hiveweave` as a switch and fails with
+  # "Invalid switch - .hiveweave". We must normalize all `/` to `\` before
+  # passing the path to `rd`.
   defp force_remove_dir(dir) do
-    case File.rm_rf(dir) do
-      {:ok, _} ->
-        :ok
+    win_dir = String.replace(dir, "/", "\\")
 
-      {:error, reason, failed_path} ->
-        Logger.warning("File.rm_rf partial fail at #{inspect(failed_path)}: #{inspect(reason)}, trying cmd rd /s /q")
-
-        # Windows fallback: rd /s /q is the most forceful directory removal.
-        # /s = remove all subdirectories and files; /q = quiet, no confirmation
-        case System.cmd("cmd", ["/c", "rd", "/s", "/q", dir], stderr_to_stdout: true) do
+    case :os.type() do
+      {:win32, _} ->
+        # On Windows, ONLY use rd /s /q — do NOT fall back to File.rm_rf.
+        #
+        # File.rm_rf deletes files one by one via File.rm, which calls
+        # DeleteFile(). On NTFS, DeleteFile marks the file for deletion
+        # (returns :ok) but the directory entry lingers briefly as a
+        # "ghost file". When a subsequent rd /s /q retries, it sees the
+        # ghost entry, tries DeleteFile again, gets ERROR_FILE_NOT_FOUND,
+        # and aborts — leaving the directory behind forever.
+        #
+        # rd /s /q handles file+directory removal atomically in one
+        # operation, avoiding the ghost-file race. If it fails (e.g. file
+        # is locked by SQLite), the caller retries after GC — without
+        # File.rm_rf having created ghost entries.
+        case System.cmd("cmd", ["/c", "rd", "/s", "/q", win_dir], stderr_to_stdout: true) do
           {_, 0} ->
-            Logger.info("rd /s /q succeeded for #{dir}")
-            :ok
+            # CRITICAL: rd /s /q can return exit code 0 on Windows even when
+            # the directory was NOT actually deleted. This happens when a file
+            # inside (e.g. data.db) has been marked for deletion via
+            # DeleteFile() but is still held open by another process (e.g.
+            # SQLite/Exqlite NIF handle). DeleteFile succeeds (marks for
+            # deletion), rd sees the file as "deleted", removes the directory
+            # entry, and returns 0 — but the file and directory persist as
+            # "pending delete" NTFS entries until ALL handles are closed.
+            #
+            # We MUST verify the directory is actually gone.
+            if File.dir?(dir) do
+              Logger.warning("rd /s /q returned 0 but #{win_dir} still exists (pending delete)")
+              {:error, :still_exists}
+            else
+              :ok
+            end
 
           {output, _exit} ->
-            Logger.error("rd /s /q also failed for #{dir}: #{output}")
+            Logger.warning("rd /s /q failed for #{win_dir}: #{String.trim(output)}")
+            {:error, :eacces}
+        end
+
+      _ ->
+        # Non-Windows: File.rm_rf is reliable
+        case File.rm_rf(dir) do
+          {:ok, _} -> :ok
+          {:error, reason, failed_path} ->
+            Logger.error("File.rm_rf failed at #{inspect(failed_path)}: #{inspect(reason)}")
             {:error, reason}
         end
     end
@@ -516,6 +689,59 @@ defmodule HiveWeaveWeb.ProjectsController do
           Process.sleep(1000)
         rescue
           e -> Logger.warning("kill_worktree_processes failed: #{inspect(e)}")
+        after
+          File.rm(tmp)
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  # Kill dev-server processes (node/next/vite/esbuild) whose command line
+  # references ANY path under the workspace. These processes have file
+  # watchers that lock .hiveweave/ and prevent directory deletion on Windows.
+  # Broader than kill_worktree_processes — catches `next dev` running from
+  # workspace/frontend/, workspace/node_modules/.bin/next, etc.
+  defp kill_workspace_dev_servers(workspace_path) do
+    ws_dir = workspace_path |> String.replace("/", "\\")
+
+    case :os.type() do
+      {:win32, _} ->
+        script = """
+        $wsDir = $env:HW_WS_DIR
+        if (-not (Test-Path $wsDir)) { exit 0 }
+        # Find dev-server processes whose CommandLine references the workspace path.
+        # Match on the workspace directory itself (not just .hiveweave/worktrees).
+        $procs = Get-CimInstance Win32_Process | Where-Object {
+            $_.CommandLine -like "*$wsDir*" -and
+            $_.Name -in @("node.exe", "esbuild.exe", "next-server.exe", "vite.exe")
+        }
+        $killed = 0
+        foreach ($p in $procs) {
+            try {
+                Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+                Write-Host "Killed $($p.Name) PID $($p.ProcessId)"
+                $killed++
+            } catch {
+                Write-Host "Failed to kill PID $($p.ProcessId): $_"
+            }
+        }
+        Write-Host "Total killed: $killed"
+        """
+
+        tmp = System.tmp_dir!() |> Path.join("hw_kill_ws_#{System.unique_integer([:positive])}.ps1")
+        File.write!(tmp, script)
+
+        try do
+          {output, 0} = System.cmd("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp], env: [{"HW_WS_DIR", ws_dir}], stderr_to_stdout: true)
+          if String.length(output) > 0 do
+            Logger.info("[delete] Workspace dev-server cleanup: #{String.trim(output)}")
+          end
+          # Give processes time to release file handles and OS to flush
+          Process.sleep(1500)
+        rescue
+          e -> Logger.warning("kill_workspace_dev_servers failed: #{inspect(e)}")
         after
           File.rm(tmp)
         end

@@ -77,12 +77,28 @@ interface AppState {
   // Pending scheduled alarms — soonest alarm per agent (keyed by toAgentId)
   agentAlarms: Record<string, AgentAlarmInfo>;
   setAgentAlarms: (alarms: Record<string, AgentAlarmInfo>) => void;
+  // Pending initial message — set by NewProjectDialog, consumed by ChatPanel on mount
+  pendingInitialMessage: { agentId: string; message: string } | null;
+  setPendingInitialMessage: (msg: { agentId: string; message: string } | null) => void;
   // Real-time activity feed — live agent actions visible in Logs
   activityFeed: ActivityEntry[];
   addActivity: (entry: ActivityEntry) => void;
   clearActivity: () => void;
   _activityFeedInternal: ActivityEntry[];
   _activityRafPending: boolean;
+  // Toast notifications — replaces native alert() so messages are captured
+  // by browser automation tools and styled consistently with the app
+  toasts: ToastItem[];
+  showToast: (message: string, type?: ToastType) => void;
+  dismissToast: (id: string) => void;
+}
+
+export type ToastType = "info" | "success" | "error" | "warning";
+export interface ToastItem {
+  id: string;
+  message: string;
+  type: ToastType;
+  createdAt: number;
 }
 
 export interface ActivityEntry {
@@ -216,6 +232,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   // Pending scheduled alarms
   agentAlarms: {},
   setAgentAlarms: (alarms) => set({ agentAlarms: alarms }),
+  // Pending initial message
+  pendingInitialMessage: null,
+  setPendingInitialMessage: (msg) => set({ pendingInitialMessage: msg }),
   // Live Activity: external immutable array triggers React re-render
   activityFeed: [],
   // Internal mutable buffer — deltas accumulate here without triggering React
@@ -287,4 +306,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     st._activityRafPending = false; // Reset RAF flag so pending callbacks don't re-populate
     set({ activityFeed: [] });
   },
+  // Toast notifications
+  toasts: [],
+  showToast: (message, type = "info") => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const toast: ToastItem = { id, message, type, createdAt: Date.now() };
+    set({ toasts: [...get().toasts, toast] });
+    // Auto-dismiss after 4s for non-error, 6s for error
+    const ttl = type === "error" ? 6000 : 4000;
+    setTimeout(() => {
+      const cur = get().toasts;
+      const next = cur.filter((t) => t.id !== id);
+      if (next.length !== cur.length) set({ toasts: next });
+    }, ttl);
+  },
+  dismissToast: (id) => set({ toasts: get().toasts.filter((t) => t.id !== id) }),
 }));
