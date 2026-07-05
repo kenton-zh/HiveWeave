@@ -16,6 +16,9 @@
 | 源栈（当前） | Elixir/Phoenix（`apps/hiveweave/`，active）+ TS/Fastify（`apps/server/`+`packages/`，reference） |
 | 并发上限 | 100 agent（用户确认，影响并发模型选型） |
 | 代码开发方 | AI 开发，工作量/难度不在考虑范围，只关心最终效果 |
+| **Git 冻结点** | `main` 分支 commit `3e7282e` — "checkpoint: pre-migration snapshot" |
+| **迁移分支** | `migration/elixir-to-python`（基于 `3e7282e` 创建） |
+| **回退方式** | `git checkout main` 即可回到迁移前状态 |
 
 ## 当前状态速览
 
