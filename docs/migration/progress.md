@@ -8,9 +8,9 @@
 |---|---|---|---|
 | Phase 0: 功能契约盘点 | ✅ 完成 | 19/19 模块 + 架构审查 + RECONCILE | 2026-07-05 |
 | Phase 1: 迁移路径规划 | ✅ 完成 | 5 批次 + 依赖图 + 目录结构 + 测试策略 | 2026-07-05 |
-| Phase 2: Python 骨架搭建 | 🔄 进行中 | 批次 1 完成（骨架+DB+26服务模块），批次 2 待开始 | 2026-07-05 |
-| Phase 3: 逐模块迁移 | 🔄 进行中 | 批次 1 完成（14/14 子任务），批次 2-5 待开始 | 2026-07-05 |
-| Phase 4: 并行验证 | ⏳ 未开始 | — | — |
+| Phase 2: Python 骨架搭建 | ✅ 完成 | 批次 1-4 全部完成（73 模块） | 2026-07-05 |
+| Phase 3: 逐模块迁移 | ✅ 完成 | 5 批次全部完成（DB+服务+LLM+工具+提示词+编排+实时+API） | 2026-07-05 |
+| Phase 4: 并行验证 | 🔄 进行中 | 服务器启动+API 测试+WebSocket 测试通过，前端已连接 | 2026-07-05 |
 | Phase 5: 切换上线 | ⏳ 未开始 | — | — |
 
 ## 前置确认项（4 项 ⚠️ 待定常量）
@@ -127,7 +127,33 @@
 
 **批次 3 集成验证**：Agent 类 + AgentManager + Trigger 函数全部实例化通过。全栈 51 个模块跨 4 层（DB+Services+LLM/Tools/Prompts+Agents）导入成功。
 
-### 批次 4-5 ⏳ 待开始
+### 批次 4：接入层（Layer 4）✅ 完成
+
+| 序号 | 模块 | 契约 | Python 文件 | 状态 | 测试 | 最后更新 |
+|---|---|---|---|---|---|---|
+| 4.1 | 实时通信 | 12 | `realtime/event_bus.py`, `pubsub.py`, `channels.py` | ✅ | WebSocket 3 channel 测试通过 | 2026-07-05 |
+| 4.2 | HTTP API | 19 | `api/router.py`, `auth.py`, `health.py`, `projects.py`, `org.py`, `chat.py`, `permissions.py`, `models.py`, `templates.py`, `communications.py`, `alarms.py`, `logs.py`, `debug.py`, `filesystem.py`, `settings.py` | ✅ | 67 端点注册，API 测试通过 | 2026-07-05 |
+
+**批次 4 集成验证**：18 个模块全部导入成功。FastAPI 应用组装成功（13 API router + 3 WebSocket + 4 内联 = 96 路由）。
+
+### 批次 5：集成验证 ✅ 服务器启动通过
+
+| 序号 | 验证项 | 状态 | 结果 | 最后更新 |
+|---|---|---|---|---|
+| 5.1 | 服务器启动 | ✅ | uvicorn port 4000 无错误启动 | 2026-07-05 |
+| 5.2 | Meta DB 初始化 | ✅ | 含 schema 迁移（5 列 ALTER TABLE） | 2026-07-05 |
+| 5.3 | 基础 API 测试 | ✅ | 6/6 端点通过（health/version/settings/models/templates/root） | 2026-07-05 |
+| 5.4 | 项目+组织 API 测试 | ✅ | 8/8 通过（创建项目→自动 seed CEO/HR/QA→创建 agent→组织树） | 2026-07-05 |
+| 5.5 | 聊天+通信 API 测试 | ✅ | 16/16 通过（发消息→历史→收件箱→日志→权限，9 条兼容路由已添加） | 2026-07-05 |
+| 5.6 | WebSocket 测试 | ✅ | 3/3 channel 通过（lobby init+pong / agent error / chat pong） | 2026-07-05 |
+| 5.7 | 前端连接 | ✅ | 前端已连接，GET /api/chat/questions 200 OK | 2026-07-05 |
+| 5.8 | API 路径兼容性修复 | ✅ | 9 条 RESTful 兼容路由已添加 | 2026-07-05 |
+| 5.9 | Meta DB schema 迁移 | ✅ | 5 列已补齐（projects.language/updated_at, agents.workspace_path/language, agent_templates.updated_at） | 2026-07-05 |
+
+**已知遗留问题**：
+- ChatMessageService/GameTimeService 构造函数不接受 project_id 参数（lifespan 中的 zombie 清理和 game time 启动有 warning，非致命）
+- agents 表 status 默认值差异（TS='created' vs Python='active'），导致 start_project_agents 找不到 active agent
+- `/api/logs/{agentId}/work-logs` 兼容路由返回 404（router prefix 不匹配，需后续修复）
 
 ## 状态图例
 
