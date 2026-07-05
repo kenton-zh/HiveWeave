@@ -228,17 +228,19 @@ class GameTimeService:
                 continue  # A5: in-memory cooldown, restart loses
             state["stall_cooldowns"][aid] = now_ms
             reason = f"idle for {idle_ms // 60000}min"
-            parent_id = agent.get("parent_id")
-            log.warning("agent_stalled", agent_id=aid, name=agent.get("name"), reason=reason)
+            # R13 fix: agent 是 aiosqlite.Row，不支持 .get()，改用 [] 索引
+            # （列均由 SELECT 显式查询：id, name, parent_id, updated_at）
+            parent_id = agent["parent_id"]
+            log.warning("agent_stalled", agent_id=aid, name=agent["name"], reason=reason)
             try:
                 if parent_id:
                     from hiveweave.services.inbox import InboxService
-                    msg = (f"[ESCALATION] Your subordinate {agent.get('name', aid)} "
+                    msg = (f"[ESCALATION] Your subordinate {agent['name'] or aid} "
                            f"appears stalled: {reason}. Please check on them.")
                     await InboxService().send_message(
                         aid, parent_id, msg, message_type="escalation", priority="urgent")
                 else:
-                    log.warning("ceo_stalled", agent_id=aid, name=agent.get("name"))
+                    log.warning("ceo_stalled", agent_id=aid, name=agent["name"])
             except Exception as e:
                 log.error("escalate_failed", agent_id=aid, error=str(e))
 
