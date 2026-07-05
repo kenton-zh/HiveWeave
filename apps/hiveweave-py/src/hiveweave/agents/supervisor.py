@@ -177,8 +177,16 @@ class AgentManager:
         project_id = old_agent.project_id
         config = old_agent.config
 
+        # R11: stop_agent 会清空 _crash_history，但重启需要保留崩溃历史
+        # 才能让频率限制（MAX_SECONDS 内 MAX_RESTARTS 次）真正生效。
+        # 否则每次重启都清零，频率限制永远不触发。
+        saved_history = self._crash_history.get(agent_id, [])
+
         # 停止旧 agent
         await self.stop_agent(agent_id)
+
+        # 恢复崩溃历史（stop_agent 已清空）
+        self._crash_history[agent_id] = saved_history
 
         # 启动新 agent
         new_agent = await self.start_agent(agent_id, project_id, config)

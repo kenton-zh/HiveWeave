@@ -183,7 +183,9 @@ class MemoryService:
             [mem_id, agent_id, scope, module_id, type, content,
              source_agent_id, meta_json, now_ms, now_ms])
         await conn.commit()
-        self.invalidate(project_id)
+        # R5: 定向失效 — 只清受影响的缓存层，而非全项目
+        self.invalidate(project_id, agent_id=agent_id, scope=scope,
+                        module_id=module_id)
         log.info("memory_saved", scope=scope, type=type, agent_id=agent_id,
                  preview=content[:80])
         return mem_id
@@ -198,7 +200,8 @@ class MemoryService:
         await conn.commit()
         count = max(cursor.rowcount, 0)
         await cursor.close()
-        self.invalidate(project_id)
+        # R5: 只清该 agent 的私有缓存（archive 层由 TTL 自然过期）
+        self.invalidate(project_id, agent_id=agent_id, scope="agent")
         log.info("memory_archived", agent_id=agent_id, count=count)
         return count
 

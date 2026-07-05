@@ -43,6 +43,7 @@ async def lifespan(app: FastAPI):
     from hiveweave.services.model import ModelService
     from hiveweave.services.game_time import GameTimeService
     from hiveweave.services.chat_message import ChatMessageService
+    from hiveweave.services.approval import approval_service
     from hiveweave.agents.supervisor import agent_manager
 
     # ── Startup ──────────────────────────────────────────────
@@ -97,6 +98,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("default_model_seed_failed", error=str(e))
 
+    # R4: 恢复/清理 pending approval 请求（重启后 _pending 丢失）
+    try:
+        await approval_service.cleanup_orphaned_requests()
+        log.info("approval_requests_restored")
+    except Exception as e:
+        log.warning("approval_restore_failed", error=str(e))
+
     # 4. Start game time tick loop
     game_time_tasks: list = []
     try:
@@ -141,9 +149,13 @@ async def lifespan(app: FastAPI):
     # Stop all agents
     try:
         all_agents = agent_manager.list_all()
-        for agent_id in all_agents:
+        # R10: list_all() 返回 Agent 对象，stop_agent 期望 agent_id 字符串
+        agent_ids = [
+            a.id if hasattr(a, "id") else str(a) for a in all_agents
+        ]
+        for agent_id in agent_ids:
             await agent_manager.stop_agent(agent_id)
-        log.info("agents_stopped", count=len(all_agents))
+        log.info("agents_stopped", count=len(agent_ids))
     except Exception as e:
         log.warning("agent_stop_failed", error=str(e))
 
