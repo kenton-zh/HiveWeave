@@ -595,7 +595,33 @@ class ToolExecutor:
         if not project_id:
             return self._error(f"Agent {agent_id} has no project_id")
 
-        # If no parentId specified, default to CEO
+        # Resolve parent_id: LLM may pass short_id (e.g. "A001") instead of UUID.
+        # Try to resolve via short_id or name lookup.
+        all_agents = await self._org.list_agents(project_id)
+        if parent_id:
+            resolved_parent = None
+            # Check if it's a valid UUID matching an existing agent
+            for a in all_agents:
+                if a["id"] == parent_id:
+                    resolved_parent = parent_id
+                    break
+            # If not UUID match, try short_id match
+            if not resolved_parent:
+                for a in all_agents:
+                    if a.get("short_id", "").upper() == parent_id.upper():
+                        resolved_parent = a["id"]
+                        log.info("tool.hire_agent.parent_resolved",
+                                 short_id=parent_id, uuid=a["id"][:8])
+                        break
+            # If still not resolved, try name match
+            if not resolved_parent:
+                for a in all_agents:
+                    if a.get("name", "").lower() == parent_id.lower():
+                        resolved_parent = a["id"]
+                        break
+            parent_id = resolved_parent or ""
+
+        # If no parentId specified or resolved, default to CEO
         if not parent_id:
             ceo = await self._org.get_agent_by_role(project_id, "ceo")
             if ceo:
