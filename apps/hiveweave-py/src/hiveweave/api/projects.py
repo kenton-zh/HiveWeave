@@ -486,7 +486,6 @@ async def delete_project(project_id: str) -> dict:
     try:
         from hiveweave.services.game_time import _states, _alarm_project
         _states.pop(project_id, None)
-        # 清理该项目的 alarm 映射
         stale_alarms = [aid for aid, pid in _alarm_project.items() if pid == project_id]
         for aid in stale_alarms:
             _alarm_project.pop(aid, None)
@@ -501,6 +500,7 @@ async def delete_project(project_id: str) -> dict:
         pass
 
     # M4+M5 fix: 清理 conversation_store 缓存 + status_event_bus processing 状态
+    # 注意: 只清内存缓存，不调 conversation_store.clear()（它会重新打开 DB 连接）
     try:
         from hiveweave.conversation.store import conversation_store
         from hiveweave.realtime.event_bus import status_event_bus
@@ -510,19 +510,39 @@ async def delete_project(project_id: str) -> dict:
         for a in agents:
             aid = a["id"]
             try:
-                await conversation_store.clear(aid, project_id)
+                key = (project_id, aid)
+                conversation_store._cache.pop(key, None)
+                conversation_store._prefix_cache.pop(key, None)
             except Exception:
                 pass
             status_event_bus.set_processing(aid, False)
     except Exception:
         pass
 
+    # 等待 agent task 完全取消 + DB 连接释放（Windows 文件锁延迟）
+    await asyncio.sleep(1.0)
+
+    # 强制关闭该项目的所有 DB 连接（必须在所有内存清理之后，否则会重新打开）
     if workspace:
         try:
             await project_db.evict_project_db(workspace)
         except Exception:
             pass
-        # 等待 DB 连接完全释放（Windows 文件锁延迟）
+        try:
+            agents = await meta_db.query(
+                "SELECT id FROM agents WHERE project_id = ?", [project_id]
+            )
+            for a in agents:
+                try:
+                    await project_db.evict_project_db_for_agent(a["id"])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if workspace:
+        # DB 连接已在前面关闭，直接删除 .hiveweave 目录
+        # 等待 Windows 文件锁完全释放
         await asyncio.sleep(0.3)
         # 删除整个 .hiveweave 目录（DB 文件 + worktrees + 临时文件）
         # 带重试机制处理 Windows 文件锁
