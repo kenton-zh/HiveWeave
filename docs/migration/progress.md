@@ -119,7 +119,15 @@
 
 **批次 2 集成验证**：19 个模块（4 LLM + 10 tools + 7 prompts）全部导入成功，功能测试通过（bash 执行、文件读写、patch、grep、ToolExecutor 完整链路）。
 
-### 批次 3-5 ⏳ 待开始
+### 批次 3：Agent 编排（Layer 3）✅ 完成
+
+| 序号 | 模块 | 契约 | Python 文件 | 状态 | 测试 | 最后更新 |
+|---|---|---|---|---|---|---|
+| 3.1 | Agent 编排 | 04 | `agents/agent.py`, `supervisor.py`, `trigger.py` | ✅ | 全栈集成测试通过（51 模块） | 2026-07-05 |
+
+**批次 3 集成验证**：Agent 类 + AgentManager + Trigger 函数全部实例化通过。全栈 51 个模块跨 4 层（DB+Services+LLM/Tools/Prompts+Agents）导入成功。
+
+### 批次 4-5 ⏳ 待开始
 
 ## 状态图例
 
