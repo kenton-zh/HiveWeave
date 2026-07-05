@@ -506,13 +506,14 @@ async def delete_project(project_id: str) -> dict:
             await project_db.evict_project_db(workspace)
         except Exception:
             pass
-        # 删除 per-project DB 文件
+        # 删除整个 .hiveweave 目录（DB 文件 + worktrees + 临时文件）
         try:
-            db_path = str(Path(workspace) / ".hiveweave" / "data.db")
-            if os.path.exists(db_path):
-                os.remove(db_path)
+            import shutil
+            hw_dir = Path(workspace) / ".hiveweave"
+            if hw_dir.exists():
+                shutil.rmtree(hw_dir, ignore_errors=True)
         except Exception as e:
-            log.warning("delete_project_db_failed", workspace=workspace, error=str(e))
+            log.warning("delete_hiveweave_dir_failed", workspace=workspace, error=str(e))
 
     # 若是当前激活项目，取消激活
     active_id = await _get_active_project_id()
