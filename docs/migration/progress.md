@@ -6,7 +6,7 @@
 
 | 阶段 | 状态 | 进度 | 最后更新 |
 |---|---|---|---|
-| Phase 0: 功能契约盘点 | ⏳ 未开始 | 0/13 模块 | 2026-07-05 |
+| Phase 0: 功能契约盘点 | 🔄 进行中 | 13/13 模块草稿完成 | 2026-07-05 |
 | Phase 1: 迁移路径规划 | ⏳ 未开始 | — | — |
 | Phase 2: Python 骨架搭建 | ⏳ 未开始 | — | — |
 | Phase 3: 逐模块迁移 | ⏳ 未开始 | 0/13 模块 | — |
@@ -26,19 +26,19 @@
 
 | # | 模块 | 状态 | 契约文件 | 用户确认 | 最后更新 | 备注 |
 |---|---|---|---|---|---|---|
-| 01 | LLM 流式调用 | ⏳ 未开始 | `feature-contracts/01-llm-streaming.md` | ❌ | — | 含 SSE 解析、多 provider、三层超时 |
-| 02 | 工具执行器 | ⏳ 未开始 | `feature-contracts/02-tool-executor.md` | ❌ | — | 73 个 dispatch、权限矩阵 |
-| 03 | 对话历史与压缩 | ⏳ 未开始 | `feature-contracts/03-conversation-store.md` | ❌ | — | token budget、compaction、doom loop |
-| 04 | 多 agent 编排 | ⏳ 未开始 | `feature-contracts/04-agent-orchestration.md` | ❌ | — | trigger、级联、escalation |
-| 05 | 三层记忆 | ⏳ 未开始 | `feature-contracts/05-memory-service.md` | ❌ | — | project/agent/archive、缓存失效 |
-| 06 | 收件箱与交接 | ⏳ 未开始 | `feature-contracts/06-inbox-handoff.md` | ❌ | — | priority、状态机、去重 |
-| 07 | 游戏时间 | ⏳ 未开始 | `feature-contracts/07-game-time.md` | ❌ | — | 3600秒/天、alarms、停滞检测 |
-| 08 | 权限与审批 | ⏳ 未开始 | `feature-contracts/08-permission-approval.md` | ❌ | — | 异步审批、glob 规则 |
-| 09 | Git worktree | ⏳ 未开始 | `feature-contracts/09-git-worktree.md` | ❌ | — | 7 操作、coordinator-only |
-| 10 | MCP 与技能 | ⏳ 未开始 | `feature-contracts/10-mcp-skill.md` | ❌ | — | stdio+HTTP、技能绑定 |
-| 11 | 两层 SQLite | ⏳ 未开始 | `feature-contracts/11-database.md` | ❌ | — | meta+per-project、journal mode |
-| 12 | 实时通信 | ⏳ 未开始 | `feature-contracts/12-realtime-channel.md` | ❌ | — | PubSub、Channel、状态广播 |
-| 13 | ETHOS 提示词 | ⏳ 未开始 | `feature-contracts/13-prompt-ethos.md` | ❌ | — | 三层、involvement、角色纪律 |
+| 01 | LLM 流式调用 | 🔄 草稿完成 | `feature-contracts/01-llm-streaming.md` | ❌ | 2026-07-05 | 含 SSE 解析、多 provider、三层超时 |
+| 02 | 工具执行器 | 🔄 草稿完成 | `feature-contracts/02-tool-executor.md` | ❌ | 2026-07-05 | 73 个 dispatch、权限矩阵 |
+| 03 | 对话历史与压缩 | 🔄 草稿完成 | `feature-contracts/03-conversation-store.md` | ❌ | 2026-07-05 | token budget、compaction、doom loop |
+| 04 | 多 agent 编排 | 🔄 草稿完成 | `feature-contracts/04-agent-orchestration.md` | ❌ | 2026-07-05 | trigger、级联、escalation |
+| 05 | 三层记忆 | 🔄 草稿完成 | `feature-contracts/05-memory-service.md` | ❌ | 2026-07-05 | project/agent/archive、缓存失效 |
+| 06 | 收件箱与交接 | 🔄 草稿完成 | `feature-contracts/06-inbox-handoff.md` | ❌ | 2026-07-05 | priority、状态机、去重 |
+| 07 | 游戏时间 | 🔄 草稿完成 | `feature-contracts/07-game-time.md` | ❌ | 2026-07-05 | 3600秒/天、alarms、停滞检测 |
+| 08 | 权限与审批 | 🔄 草稿完成 | `feature-contracts/08-permission-approval.md` | ❌ | 2026-07-05 | 异步审批、glob 规则 |
+| 09 | Git worktree | 🔄 草稿完成 | `feature-contracts/09-git-worktree.md` | ❌ | 2026-07-05 | 7 操作、coordinator-only |
+| 10 | MCP 与技能 | 🔄 草稿完成 | `feature-contracts/10-mcp-skill.md` | ❌ | 2026-07-05 | stdio+HTTP、技能绑定 |
+| 11 | 两层 SQLite | 🔄 草稿完成 | `feature-contracts/11-database.md` | ❌ | 2026-07-05 | meta+per-project、journal mode |
+| 12 | 实时通信 | 🔄 草稿完成 | `feature-contracts/12-realtime-channel.md` | ❌ | 2026-07-05 | PubSub、Channel、状态广播 |
+| 13 | ETHOS 提示词 | 🔄 草稿完成 | `feature-contracts/13-prompt-ethos.md` | ❌ | 2026-07-05 | 三层、involvement、角色纪律 |
 
 ## 模块进度（Phase 3：逐模块迁移）
 
