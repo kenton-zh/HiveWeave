@@ -30,6 +30,24 @@
 
 ## 日志
 
+### [完成] 2026-07-05 | TRAE (Claude) | 4项常量确认
+- 做了什么：以 `D:\PC_AI\Project\opencode` 为 P0 参考源，确认 4 项 ⚠️ 待定常量
+- 改了哪些文件：
+  - `constants.md`：4 项 ⚠️ 全部改为 ✅，补充 OpenCode 对照值列，记录额外发现（Elixir token_utils.ex 的 dead code `@default_tail_turns 20`）
+  - `README.md`：新增"参考源码优先级"章节（P0 OpenCode → P1 TS → P2 Elixir），列出关键 OpenCode 文件
+  - `decision-record.md`：新增"决策 0：以 OpenCode 为 P0 参考源"
+  - `progress.md`：新增"前置确认项"表格，4 项全部 ✅
+- 确认结果：
+  - `tail_turns = 2`（OpenCode 默认）
+  - 停滞阈值 = Elixir 双阈值 5min/10min（OpenCode 无此机制）
+  - 端口 = 4000（前端兼容性）
+  - DB 连接池 = 单连接（对齐 OpenCode Effect SqlClient）
+- 下一个接手需要注意：
+  - 4 项常量已全部确认，Phase 0 障碍清除
+  - **OpenCode 路径 `D:\PC_AI\Project\opencode` 是 P0 参考源**，所有 AI 工具遇设计决策不确定时先查 OpenCode
+  - 下一步：开始 Phase 0 功能契约盘点，创建 `feature-contracts/00-template.md` 模板
+- progress.md 已更新：是
+
 ### [完成] 2026-07-05 | TRAE (Claude) | 初始会话
 - 做了什么：建立迁移工程的本地追踪文件结构 + Git 检查点
 - 改了哪些文件：

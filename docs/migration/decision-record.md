@@ -2,6 +2,27 @@
 
 > 本文件记录迁移工程的关键决策及其理由。任何 AI 工具质疑决策时，先读这里的依据。
 
+## 决策 0：以 OpenCode 原项目为 P0 参考源
+
+**决策**：迁移过程中遇到不确定的设计决策时，以 `D:\PC_AI\Project\opencode`（OpenCode 原项目）为最高优先参考。
+
+**日期**：2026-07-05
+
+**决策依据**：
+- HiveWeave 的 TS 参考实现（`packages/core/`、`packages/agent-runtime/`）本身就是从 OpenCode 衍生的
+- OpenCode 是成熟的 TS 项目，经过大量生产验证，其 compaction、token 估算、工具执行等核心逻辑是 HiveWeave TS 实现的源头
+- Elixir 实现在移植过程中可能引入偏差或简化（如 MCP 降级为 HTTP-only），OpenCode 是更可靠的"原始设计意图"来源
+
+**参考优先级**：P0 OpenCode → P1 HiveWeave TS → P2 HiveWeave Elixir
+
+**已用 OpenCode 确认的决策**：
+- `tail_turns = 2`（OpenCode 默认值，Elixir 自行调大为 4 不采用）
+- 停滞检测：OpenCode 无此机制（CLI 工具），采用 Elixir 的双阈值模型
+- Per-project DB 单连接（OpenCode Effect SqlClient 是单连接模型）
+- 端口 4000（OpenCode 无端口概念，基于前端兼容性决定）
+
+---
+
 ## 决策 1：整体换栈 Python，而非混合架构
 
 **决策**：将 Elixir/Phoenix 后端整体迁移到 Python（FastAPI + LangGraph + Pydantic AI），而非保留 Elixir 壳 + Python 微服务的混合架构。
