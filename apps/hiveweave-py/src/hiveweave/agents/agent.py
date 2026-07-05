@@ -685,7 +685,14 @@ class Agent:
         # 4. 状态 → idle
         self._reset_to_idle()
 
-        # 5. 自检 re-trigger
+        # 5. 发送 done 事件（前端 streamChat 等待此事件停止 loading）
+        self._broadcast_stream_event({
+            "type": "done",
+            "content": content,
+            "agentId": self.id,
+        })
+
+        # 6. 自检 re-trigger
         await self._maybe_self_retrigger()
 
     async def _handle_empty_response(
@@ -816,6 +823,13 @@ class Agent:
             self.pending_inbox_msg_ids = None
 
         self._reset_to_idle()
+
+        # 发送 error 事件（前端 streamChat 等待此事件停止 loading）
+        self._broadcast_stream_event({
+            "type": "error",
+            "message": error_msg,
+            "agentId": self.id,
+        })
 
     # ── 内部: 安全超时 ────────────────────────────────────────
 

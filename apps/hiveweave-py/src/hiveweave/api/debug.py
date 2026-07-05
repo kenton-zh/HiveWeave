@@ -124,3 +124,44 @@ async def traces(
     """事件追踪（agent_events 时间线）。"""
     events = await event_audit.timeline(agentId, hours=hours, limit=limit)
     return {"traces": events, "agentId": agentId, "count": len(events)}
+
+
+@router.get("/agents/{agent_id}/traces")
+async def agent_traces(
+    agent_id: str,
+    hours: int = Query(default=1, le=168),
+    limit: int = Query(default=100, le=500),
+) -> dict:
+    """COMPAT: 前端 getAgentTraces 调用 /debug/agents/{agentId}/traces。
+
+    返回前端 MonitorPanel 期望的格式: { turns, events }。
+    """
+    # 获取事件追踪
+    events = await event_audit.timeline(agent_id, hours=hours, limit=limit)
+
+    # 获取对话轮次
+    turns: list[dict] = []
+    try:
+        project_id = await meta_db.get_agent_project_id(agent_id)
+        if project_id:
+            history = await conversation_store.get_history(agent_id, project_id)
+            turns = [
+                {
+                    "turn_index": i,
+                    "role": m.get("role", ""),
+                    "content": m.get("content", ""),
+                    "timestamp": m.get("created_at"),
+                    "tokens": m.get("tokens"),
+                }
+                for i, m in enumerate(history)
+            ]
+    except Exception as e:
+        log.warning("agent_traces_turns_failed", agent_id=agent_id, error=str(e))
+
+    return {
+        "turns": turns,
+        "events": events,
+        "agentId": agent_id,
+        "turnCount": len(turns),
+        "eventCount": len(events),
+    }
