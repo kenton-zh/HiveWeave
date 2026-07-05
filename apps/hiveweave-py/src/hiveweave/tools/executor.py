@@ -290,7 +290,8 @@ class ToolExecutor:
         # ── High-level orchestration tools ──────────────────
         # These bridge the LLM tool calls to service-layer methods.
 
-        if name == "send_message":
+        if name in ("send_message", "message_subordinate", "message_superior",
+                     "message_peer", "message_team", "message_user"):
             return await self._tool_send_message(agent_id, args)
 
         if name == "list_subordinates":
@@ -449,7 +450,7 @@ class ToolExecutor:
             expectReport: bool — whether a response is expected
             priority: str — "normal" / "urgent"
         """
-        recipients = args.get("recipients") or []
+        recipients = args.get("recipients") or args.get("recipient") or []
         # Handle JSON string recipients (LLM sometimes sends '["HR"]' as string)
         if isinstance(recipients, str):
             try:
@@ -460,6 +461,8 @@ class ToolExecutor:
                     recipients = [recipients]
             except (json.JSONDecodeError, ValueError):
                 recipients = [recipients]
+        if isinstance(recipients, (list, tuple)) and len(recipients) == 0:
+            recipients = []
         message = args.get("message") or args.get("content") or args.get("body") or ""
         expect_report = bool(args.get("expectReport") or args.get("expect_report") or False)
         priority = args.get("priority") or "normal"
@@ -685,8 +688,7 @@ class ToolExecutor:
                     f"  权限: {perm_type}\n"
                     f"  模型: {model_id}\n"
                     f"  技能: {skills}\n"
-                    f"  背景: {backstory[:100] if backstory else '(无)'}\n"
-                    f"\n请通过 send_message 向 CEO 回报招聘结果（附上编号 {new_short}）。"
+                    f"  背景: {backstory[:100] if backstory else '(无)'}"
                 ),
                 "error": None,
             }

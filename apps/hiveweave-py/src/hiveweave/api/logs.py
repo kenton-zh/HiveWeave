@@ -149,3 +149,14 @@ async def event_audit_timeline_path(
     R11: COMPAT 兼容路由。
     """
     return await event_audit_timeline(agentId=agent_id, hours=hours, limit=limit)
+
+
+@router.get("/api/logs/{agent_id}")
+async def get_work_logs_flat(
+    agent_id: str, limit: int = Query(default=50, le=200)
+) -> dict:
+    """前端兼容路由: /api/logs/{agentId}?limit=N。
+
+    等价于 GET /api/work-logs/{agentId}。
+    """
+    return await get_work_logs(agent_id, limit=limit)

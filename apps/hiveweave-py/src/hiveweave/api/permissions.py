@@ -151,3 +151,12 @@ async def get_mode_path(agent_id: str) -> dict:
     R11: COMPAT 兼容路由。
     """
     return await get_mode(agent_id)
+
+
+@router.get("/rules/{agent_id}")
+async def get_rules_compat(agent_id: str) -> dict:
+    """前端兼容路由: /api/permissions/rules/{agentId}。
+
+    等价于 GET /api/permissions/{agentId}/rules。
+    """
+    return await get_rules(agent_id)
