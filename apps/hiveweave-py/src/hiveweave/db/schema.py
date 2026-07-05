@@ -136,7 +136,8 @@ PROJECT_DB_TABLES = [
         read INTEGER DEFAULT 0,
         created_at INTEGER,
         message_type TEXT,
-        expect_report INTEGER DEFAULT 0
+        expect_report INTEGER DEFAULT 0,
+        priority TEXT DEFAULT 'normal'
     )
     """,
     """
@@ -188,9 +189,14 @@ PROJECT_DB_TABLES = [
         id TEXT PRIMARY KEY,
         from_agent_id TEXT,
         to_agent_id TEXT,
+        module_id TEXT,
         summary TEXT,
         status TEXT,
-        created_at INTEGER
+        expect_report INTEGER DEFAULT 0,
+        reported_up INTEGER DEFAULT 0,
+        context_delivered INTEGER DEFAULT 0,
+        created_at INTEGER,
+        updated_at INTEGER
     )
     """,
     """
@@ -289,6 +295,7 @@ PROJECT_DB_TABLES = [
         responsibilities TEXT,
         notes TEXT,
         status TEXT DEFAULT 'active',
+        hire_date TEXT,
         updated_by TEXT,
         updated_at INTEGER
     )
@@ -345,5 +352,6 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_work_logs_agent_id ON work_logs(agent_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_agent_events_agent_id ON agent_events(agent_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_scheduled_alarms_project_id ON scheduled_alarms(project_id, fired)",
+    "CREATE INDEX IF NOT EXISTS idx_permission_requests_agent ON permission_requests(agent_id)",
     "CREATE INDEX IF NOT EXISTS idx_personnel_records_agent_id ON personnel_records(agent_id)",
 ]

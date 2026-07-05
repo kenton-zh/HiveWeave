@@ -48,7 +48,14 @@ async def _execute(project_id, sql, params=None):
 
 
 class GameTimeService:
-    """Per-project simulated clock with alarms and stall detection."""
+    """Per-project simulated clock with alarms and stall detection.
+
+    R12: 构造函数接受可选 project_id，供 main.py lifespan 等场景按项目实例化。
+    各方法仍接受 project_id 参数（向后兼容），未传时回退到 self._project_id。
+    """
+
+    def __init__(self, project_id: str | None = None) -> None:
+        self._project_id = project_id
 
     async def get_current_time(self, project_id: str) -> dict:
         state = _states.get(project_id) or await self._load_state(project_id)

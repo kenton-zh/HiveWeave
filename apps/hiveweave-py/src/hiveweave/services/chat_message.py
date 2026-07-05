@@ -26,7 +26,12 @@ class ChatMessageService:
 
     所有 agent 级操作路由到 per-project DB（通过 agent_id）。
     clear_stuck_streaming 遍历所有 project DB。
+
+    R12: 构造函数接受可选 project_id，供 main.py lifespan 等场景按项目实例化。
     """
+
+    def __init__(self, project_id: str | None = None) -> None:
+        self._project_id = project_id
 
     async def save_message(self, attrs: dict) -> dict:
         """Save a UI message. Returns {id, role, content, created_at}.
