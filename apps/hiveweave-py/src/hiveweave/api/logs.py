@@ -124,13 +124,17 @@ async def project_events(
 # 前端期望 /api/logs/{agentId}/work-logs 与 /api/logs/{agentId}/events 风格；
 # 保留现有 /api/work-logs/{agentId} 与 /api/events/audit?agentId= 路由，
 # 额外提供 path 参数变体。
+# COMPAT: 前端 api.ts 期望的 RESTful 路径
 
 
 @router.get("/api/logs/{agent_id}/work-logs")
 async def get_work_logs_path(
     agent_id: str, limit: int = Query(default=50, le=200)
 ) -> dict:
-    """agent 工作日志（path: agentId）— 前端 RESTful 兼容路由。"""
+    """agent 工作日志（path: agentId）— 前端 RESTful 兼容路由。
+
+    R11: COMPAT 兼容路由。
+    """
     return await get_work_logs(agent_id, limit=limit)
 
 
@@ -140,5 +144,8 @@ async def event_audit_timeline_path(
     hours: int = Query(default=1, le=168),
     limit: int = Query(default=100, le=500),
 ) -> dict:
-    """事件审计时间线（path: agentId）— 前端 RESTful 兼容路由。"""
+    """事件审计时间线（path: agentId）— 前端 RESTful 兼容路由。
+
+    R11: COMPAT 兼容路由。
+    """
     return await event_audit_timeline(agentId=agent_id, hours=hours, limit=limit)

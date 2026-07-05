@@ -79,6 +79,49 @@ def _build_charter_dict(body: ProjectCreate) -> dict:
     }
 
 
+def _validate_workspace_path(raw: str) -> Path:
+    """校验 workspace_path 安全性（R2 fix）。
+
+    检查：
+    1. 非空字符串
+    2. resolve() 后是绝对路径
+    3. 原始路径不含 ``..`` 路径穿越段
+    4. resolve() 后的路径不含 ``..`` 段（符号链接解析后）
+
+    Args:
+        raw: 用户传入的 workspace_path 字符串
+
+    Returns:
+        解析后的绝对 Path 对象
+
+    Raises:
+        HTTPException(400): 路径非法或含穿越段
+    """
+    if not raw or not raw.strip():
+        raise HTTPException(status_code=400, detail="workspace_path is required")
+    # 原始路径段级检查 — 拒绝任何 ".." 段
+    parts = Path(raw).parts
+    if ".." in parts:
+        raise HTTPException(
+            status_code=400,
+            detail="workspace_path must not contain '..' path traversal",
+        )
+    resolved = Path(raw).resolve()
+    # resolve 后必须为绝对路径
+    if not resolved.is_absolute():
+        raise HTTPException(
+            status_code=400,
+            detail="workspace_path must resolve to an absolute path",
+        )
+    # 二次校验：resolve 后的路径段也不含 ".."
+    if ".." in resolved.parts:
+        raise HTTPException(
+            status_code=400,
+            detail="workspace_path resolves to a path with '..' segments",
+        )
+    return resolved
+
+
 def _project_response(row: dict, active_id: str | None = None) -> dict:
     """把 DB 行转为响应 dict（同时含 snake_case 与 camelCase）。"""
     charter_raw = row.get("charter_json")
@@ -194,9 +237,10 @@ async def create_project(body: ProjectCreate) -> dict:
     - 自动创建 CEO / HR / QA 三个角色
     """
     workspace = body.workspacePath
+    # R2 fix: 校验 workspace_path 安全性（绝对路径 + 无 .. 穿越段）
+    ws = _validate_workspace_path(workspace)
     # 确保工作空间存在
     try:
-        ws = Path(workspace).resolve()
         ws.mkdir(parents=True, exist_ok=True)
         (ws / ".hiveweave").mkdir(parents=True, exist_ok=True)
     except Exception as e:
@@ -292,9 +336,10 @@ async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
         vals.append(body.description)
     if body.workspacePath is not None and body.workspacePath != old_workspace:
         # 迁移工作空间
-        new_ws = str(Path(body.workspacePath).resolve())
+        # R2 fix: 校验新 workspace_path 安全性
+        new_ws_dir = _validate_workspace_path(body.workspacePath)
+        new_ws = str(new_ws_dir)
         try:
-            new_ws_dir = Path(new_ws)
             new_ws_dir.mkdir(parents=True, exist_ok=True)
             (new_ws_dir / ".hiveweave").mkdir(parents=True, exist_ok=True)
             # 移动旧 .hiveweave 内容（若存在）

@@ -269,10 +269,14 @@ async def _route_to_expert(
 
 
 @router.get("/history/{agent_id}")
-async def chat_history(agent_id: str) -> dict:
-    """历史消息（限 200 条）。"""
+async def chat_history(
+    agent_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """历史消息（R7 fix: 分页 — limit 默认 100，offset 默认 0）。"""
     validate_id(agent_id, "agent_id")
-    messages = await _chat_msg.get_messages(agent_id, limit=200)
+    messages = await _chat_msg.get_messages(agent_id, limit=limit, offset=offset)
     return {"messages": messages}
 
 
@@ -370,10 +374,14 @@ async def resolved_model(agent_id: str) -> dict:
 
 
 @router.get("/messages/{agent_id}")
-async def chat_messages(agent_id: str) -> list:
-    """查 agent 消息（数组直返，限 200 条）。"""
+async def chat_messages(
+    agent_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list:
+    """查 agent 消息（数组直返，R7 fix: 分页 — limit 默认 100，offset 默认 0）。"""
     validate_id(agent_id, "agent_id")
-    return await _chat_msg.get_messages(agent_id, limit=200)
+    return await _chat_msg.get_messages(agent_id, limit=limit, offset=offset)
 
 
 @router.get("/todos/{agent_id}")
@@ -534,18 +542,30 @@ def _sse(payload: dict) -> str:
 # ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────
 # 前端期望 /api/chat/{agentId}/messages 风格；保留现有 /messages/{agentId} 与
 # POST /api/chat（agentId in body）路由，额外提供 path 参数变体。
+# COMPAT: 前端 api.ts 期望的 RESTful 路径
 
 
 @router.get("/{agent_id}/messages")
-async def chat_messages_path(agent_id: str) -> list:
-    """查 agent 消息（path: agentId）— 前端 RESTful 兼容路由。"""
+async def chat_messages_path(
+    agent_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list:
+    """查 agent 消息（path: agentId）— 前端 RESTful 兼容路由。
+
+    R7 fix: 分页参数透传。R11: COMPAT 兼容路由。
+    """
     validate_id(agent_id, "agent_id")
-    return await chat_messages(agent_id)
+    return await chat_messages(agent_id, limit=limit, offset=offset)
 
 
+# COMPAT: 前端 api.ts 期望的 RESTful 路径
 @router.post("/{agent_id}/messages")
 async def send_chat_path(agent_id: str, body: ChatSendBody) -> dict:
-    """触发 agent 聊天（path: agentId 覆盖 body agentId）— 前端 RESTful 兼容路由。"""
+    """触发 agent 聊天（path: agentId 覆盖 body agentId）— 前端 RESTful 兼容路由。
+
+    R11: COMPAT 兼容路由。
+    """
     validate_id(agent_id, "agent_id")
     overridden = body.model_copy(update={"agentId": agent_id})
     return await send_chat(overridden)

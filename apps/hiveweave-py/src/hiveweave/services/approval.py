@@ -171,14 +171,26 @@ class ApprovalService:
             return []
 
     async def cleanup_orphaned_requests(self) -> None:
-        """Clean up orphaned pending requests (startup). Status → 'timeout'."""
+        """Restore/reject pending requests on startup (R4).
+
+        服务器重启后 _pending 内存 dict 丢失，DB 中 status='pending' 的请求永远不会
+        被 resolve（resolve_request 只查 _pending，静默 warning）。
+
+        修复：启动时从 DB 加载所有 pending 请求：
+        - 过期的（created_at 早于 APPROVAL_TIMEOUT_S 前）→ 自动 reject（status='timeout'）
+        - 未过期的 → 重建 _PendingEntry 加入 _pending，使 resolve_request 仍可处理
+        """
         try:
             projects = await meta_db.query(
                 "SELECT id, workspace_path FROM projects"
             )
         except Exception:
             return
-        now = int(time.time() * 1000)
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - APPROVAL_TIMEOUT_S * 1000
+        loop = asyncio.get_event_loop()
+        restored = 0
+        rejected = 0
         for row in projects:
             p = dict(row)
             ws = p.get("workspace_path")
@@ -186,16 +198,38 @@ class ApprovalService:
                 continue
             try:
                 conn = await project_db.ensure_project_db(ws)
-                await conn.execute(
+
+                # 1. 自动 reject 过期的 pending 请求
+                cursor = await conn.execute(
                     "UPDATE permission_requests SET status = 'timeout', "
-                    "updated_at = ? WHERE status = 'pending'",
-                    [now],
+                    "updated_at = ? WHERE status = 'pending' AND created_at < ?",
+                    [now_ms, cutoff],
                 )
+                rejected += max(cursor.rowcount, 0)
+                await cursor.close()
                 await conn.commit()
+
+                # 2. 重建未过期 pending 请求到 _pending（resolve_request 仍可处理）
+                cursor = await conn.execute(
+                    "SELECT id, agent_id, project_id FROM permission_requests "
+                    "WHERE status = 'pending'",
+                )
+                rows = await cursor.fetchall()
+                await cursor.close()
+                for r in rows:
+                    req_id = r["id"]
+                    if req_id not in self._pending:
+                        future: asyncio.Future = loop.create_future()
+                        self._pending[req_id] = _PendingEntry(
+                            r["agent_id"], r["project_id"] or p.get("id", ""),
+                            future)
+                        restored += 1
             except Exception as e:
-                logger.warning("approval.cleanup_failed",
+                logger.warning("approval.restore_failed",
                                project=p.get("id"), error=str(e))
-        logger.info("approval.cleanup_done")
+        logger.info("approval.restore_done",
+                    restored=restored, rejected=rejected,
+                    pending_in_memory=len(self._pending))
 
     async def _remember_rule(
         self, agent_id: str, tool_pattern: str, approved: bool

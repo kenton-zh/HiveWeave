@@ -36,6 +36,9 @@ log = structlog.get_logger(__name__)
 RECENT_ACTIVITY_BUFFER = 100
 """最近活动缓冲区大小。对齐 Elixir recentActivity 缓冲 100 条。"""
 
+MAX_SUBSCRIBERS = 100
+"""最大订阅者总数（跨所有频道）。R3 fix: 防止恶意客户端创建大量订阅耗尽内存。"""
+
 # 流事件中仅发往 agent 频道（不转发到 lobby）的类型。
 # 契约 12: text_delta / thinking_delta 不转发到 lobby（避免重复渲染）。
 # start 同理 — 流式生命周期事件，仅 agent 频道关心。
@@ -102,6 +105,9 @@ class StatusEventBus:
         Returns:
             ``asyncio.Queue`` — 订阅者从此 queue ``get()`` 事件。
             事件为 dict，必须含 ``"type"`` 字段。
+
+        Raises:
+            RuntimeError: 全局订阅者数超过 ``MAX_SUBSCRIBERS`` (R3 fix)。
         """
         queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=256)
         channels = {channel}
@@ -109,6 +115,18 @@ class StatusEventBus:
             channels.add(f"agent:{agent_id}")
 
         async with self._lock:
+            # R3 fix: 全局订阅者上限，防止恶意客户端耗尽内存
+            if len(self._queue_channels) >= MAX_SUBSCRIBERS:
+                log.warning(
+                    "bus_subscribe_rejected",
+                    channel=channel,
+                    agent_id=agent_id,
+                    current=len(self._queue_channels),
+                    limit=MAX_SUBSCRIBERS,
+                )
+                raise RuntimeError(
+                    f"Subscriber limit reached ({MAX_SUBSCRIBERS})"
+                )
             for ch in channels:
                 self._subscribers.setdefault(ch, set()).add(queue)
             self._queue_channels[queue] = channels

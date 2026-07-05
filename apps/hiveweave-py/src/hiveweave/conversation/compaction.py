@@ -28,6 +28,7 @@ SUMMARY_TEMPERATURE = 0.3
 SUMMARY_MAX_TOKENS = 2000
 
 # 摘要消息特殊标记 — store 据此识别并提取到 compacted_prefix_cache
+# R9 fix: 与 Elixir streamer.ex:2260 保持一致（marker 字符串 + 单换行格式）
 SUMMARY_MARKER = "[Earlier conversation summary]"
 
 # LLM 回调类型：(prompt: str) -> summary_text | None
@@ -109,10 +110,10 @@ class Compaction:
         )
         summary_msg = {
             "role": "system",
-            "content": (
-                f"{SUMMARY_MARKER}\n\n{summary}\n\n"
-                "---\nBelow is the recent conversation:"
-            ),
+            # R9 fix: 格式对齐 Elixir streamer.ex:2260
+            #   "[Earlier conversation summary]\n#{summary}"
+            # store 通过 SUMMARY_MARKER 子串匹配提取，格式一致确保跨后端兼容。
+            "content": f"{SUMMARY_MARKER}\n{summary}",
         }
         return [summary_msg] + recent_messages
 

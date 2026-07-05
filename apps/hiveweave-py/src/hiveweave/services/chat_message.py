@@ -105,10 +105,13 @@ class ChatMessageService:
         await cursor.close()
         return ok
 
-    async def get_messages(self, agent_id: str, limit: int = 200) -> list[dict]:
+    async def get_messages(
+        self, agent_id: str, limit: int = 200, offset: int = 0
+    ) -> list[dict]:
         """Get recent messages for an agent (chronological order). Default limit 200.
 
         契约 17: DESC + reverse → 正序返回。异常返回 []（fail-empty）。
+        R7 fix: 支持 offset 分页（DESC 结果上跳过 offset 条再取 limit 条）。
         """
         try:
             rows = await project_db.query(
@@ -117,8 +120,8 @@ class ChatMessageService:
                 "tool_call_id, is_streaming, is_background, is_read, is_context, "
                 "team_from_agent_id, team_to_agent_id, images, metadata, created_at "
                 "FROM chat_messages WHERE agent_id = ? "
-                "ORDER BY created_at DESC LIMIT ?",
-                [agent_id, limit])
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                [agent_id, limit, offset])
             return [self._row_to_msg(r) for r in reversed(rows)]
         except Exception as e:
             log.warning("get_messages_failed", agent_id=agent_id, error=str(e))

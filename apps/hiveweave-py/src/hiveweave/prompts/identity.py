@@ -18,6 +18,10 @@
 
 移植自 Elixir streamer.ex: build_identity_prompt + maybe_append_language_rule。
 本模块为纯字符串构建。
+
+R8 契约说明：本模块返回 str 而非 dict（{"role": "system", "content": ...}）。
+caller 需要自行包装为 system message dict，以便灵活控制消息布局（如 prefix cache
+分槽、compacted prefix 注入等）。见 agent.py:_build_messages 中的用法。
 """
 
 from __future__ import annotations
