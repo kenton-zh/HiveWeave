@@ -180,14 +180,10 @@ async def _seed_default_agents(project_id: str) -> list[str]:
     Returns:
         创建的 agent ID 列表（第一个是 CEO）。
     """
+    log.info("seed_start", project_id=project_id)
     org = OrgService()
     existing = await org.list_agents(project_id)
-    if any(a.get("role") == "ceo" for a in existing):
-        # 已有 CEO — 返回其 ID
-        for a in existing:
-            if a.get("role") == "ceo":
-                return [a["id"]]
-        return []
+    log.info("seed_existing_agents", project_id=project_id, count=len(existing))
 
     # 获取默认模型 ID（优先选择 step 系列，其次非 free 模型）
     default_model_id = None
@@ -211,6 +207,22 @@ async def _seed_default_agents(project_id: str) -> list[str]:
             log.warning("seed_no_active_models")
     except Exception as e:
         log.warning("seed_default_model_failed", error=str(e))
+
+    # 如果已有 agent，更新它们的 model_id（可能来自旧项目残留）
+    if any(a.get("role") == "ceo" for a in existing):
+        # 更新现有 agent 的 model_id（如果为空或需要修正）
+        for a in existing:
+            current_model = a.get("model_id") or a.get("config", {}).get("model_id")
+            if not current_model and default_model_id:
+                try:
+                    await org.update_agent(a["id"], {"model_id": default_model_id})
+                    print(f"[SEED] updated {a.get('name')} model_id={default_model_id}", flush=True)
+                except Exception as e:
+                    print(f"[SEED] update {a.get('name')} model_id FAILED: {e}", flush=True)
+            # 返回 CEO ID
+            if a.get("role") == "ceo":
+                return [a["id"]]
+        return [existing[0]["id"]] if existing else []
 
     created_ids: list[str] = []
     try:
@@ -328,7 +340,12 @@ async def create_project(body: ProjectCreate) -> dict:
         raise HTTPException(status_code=500, detail="Failed to create project")
 
     # 自动创建默认 agent
+    import sys
+    sys.stderr.write(f"[CREATE] calling _seed_default_agents for project={project_id}\n")
+    sys.stderr.flush()
     agent_ids = await _seed_default_agents(project_id)
+    sys.stderr.write(f"[CREATE] _seed_default_agents returned {len(agent_ids)} agents\n")
+    sys.stderr.flush()
 
     # 启动 agent + game time（C3/C4 fix: 新项目创建后立即启动运行时资源）
     try:

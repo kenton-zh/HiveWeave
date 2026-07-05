@@ -91,6 +91,18 @@ interface AppState {
   toasts: ToastItem[];
   showToast: (message: string, type?: ToastType) => void;
   dismissToast: (id: string) => void;
+  // Debug log — captures all API calls, WebSocket events, and errors
+  debugLogs: DebugLogEntry[];
+  addDebugLog: (entry: Omit<DebugLogEntry, "id" | "timestamp">) => void;
+  clearDebugLogs: () => void;
+}
+
+export interface DebugLogEntry {
+  id: string;
+  timestamp: number;
+  category: "api" | "ws" | "error" | "info" | "state";
+  message: string;
+  data?: any;
 }
 
 export type ToastType = "info" | "success" | "error" | "warning";
@@ -321,4 +333,20 @@ export const useAppStore = create<AppState>((set, get) => ({
     }, ttl);
   },
   dismissToast: (id) => set({ toasts: get().toasts.filter((t) => t.id !== id) }),
+  // Debug logs
+  debugLogs: [],
+  addDebugLog: (entry) => {
+    const id = `dbg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const fullEntry: DebugLogEntry = { ...entry, id, timestamp: Date.now() };
+    const cur = get().debugLogs;
+    // Keep last 500 entries
+    const next = cur.length >= 500 ? cur.slice(-499) : cur;
+    set({ debugLogs: [...next, fullEntry] });
+  },
+  clearDebugLogs: () => set({ debugLogs: [] }),
 }));
+
+// Expose store globally for api.ts debug logging (avoids circular import)
+if (typeof window !== "undefined") {
+  (window as any).__hwStore = useAppStore;
+}
