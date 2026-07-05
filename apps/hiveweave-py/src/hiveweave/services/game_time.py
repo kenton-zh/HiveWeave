@@ -127,15 +127,19 @@ class GameTimeService:
         state["tick_count"] += 1
         await self._persist_time(project_id)
         # Fire due alarms
+        # C4 fix: _fire_alarm 失败时不标记 fired、不移出内存，下次 tick 重试
         due = [a for a in state["alarms"]
                if not a["fired"] and a["fire_at_game_seconds"] <= new_gs]
+        fired_ok = []
         for alarm in due:
             try:
                 await self._fire_alarm(alarm)
+                alarm["fired"] = True
+                fired_ok.append(alarm)
             except Exception as e:
                 log.error("alarm_fire_failed", alarm_id=alarm["id"], error=str(e))
-            alarm["fired"] = True
-        state["alarms"] = [a for a in state["alarms"] if a not in due]
+                # 不标记 fired，不移出内存，下次 tick 重试
+        state["alarms"] = [a for a in state["alarms"] if a not in fired_ok]
         if state["tick_count"] % STALL_CHECK_TICKS == 0:
             await self._check_stalled(project_id)
         log.debug("game_time_tick", project_id=project_id, game_seconds=new_gs)
@@ -184,9 +188,8 @@ class GameTimeService:
             [project_id, state["current_game_seconds"], int(time.time() * 1000)])
 
     async def _fire_alarm(self, alarm: dict) -> None:
-        await _execute(_alarm_project.get(alarm["id"], ""),
-            "UPDATE scheduled_alarms SET fired = 1, fired_at = ?, status = 'fired' "
-            "WHERE id = ?", [int(time.time() * 1000), alarm["id"]])
+        # C4 fix: 先发 inbox 消息，成功后再 UPDATE DB 标记 fired
+        # 原顺序是先标记 fired 再发消息，inbox 失败则告警永久丢失
         to_agent = alarm.get("to_agent_id")
         if to_agent:
             from hiveweave.services.inbox import InboxService
@@ -194,6 +197,9 @@ class GameTimeService:
             await InboxService().send_message(
                 alarm.get("from_agent_id") or to_agent, to_agent, msg,
                 message_type="alarm", priority="urgent")
+        await _execute(_alarm_project.get(alarm["id"], ""),
+            "UPDATE scheduled_alarms SET fired = 1, fired_at = ?, status = 'fired' "
+            "WHERE id = ?", [int(time.time() * 1000), alarm["id"]])
         log.info("alarm_fired", alarm_id=alarm["id"], purpose=alarm.get("purpose"))
 
     async def _check_stalled(self, project_id: str) -> None:

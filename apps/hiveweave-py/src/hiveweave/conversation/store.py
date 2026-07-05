@@ -159,6 +159,17 @@ class ConversationStore:
                 else:
                     history.append(m)
 
+            # C3 fix: merge 而非覆盖 — _do_compaction 是 fire-and-forget task，
+            # 耗时数秒，期间 append_turn 可能在 self._cache[key] 追加了新消息。
+            # 直接覆盖会丢失这些新消息。这里读取当前缓存尾部（压缩期间新增的）
+            # 追加到压缩结果后面再写回缓存。
+            original_len = len(messages)
+            current_cache = self._cache.get(key, [])
+            if len(current_cache) > original_len:
+                # 压缩期间新增的消息 = 当前缓存中超出原始 messages 数量的尾部
+                new_messages = current_cache[original_len:]
+                history = history + new_messages
+
             self._cache[key] = history
             if summary_text is not None:
                 self._prefix_cache[key] = summary_text
@@ -325,18 +336,16 @@ class ConversationStore:
             now = int(time.time() * 1000)
             raw = json.dumps(messages, ensure_ascii=False)
             tokens = estimate_tokens_for_messages(messages)
-            row = await project_db.query_one(
-                agent_id,
-                "SELECT MAX(turn_index) AS max_idx FROM conversation_turns WHERE agent_id = ?",
-                [agent_id],
-            )
-            max_idx = row["max_idx"] if row and row["max_idx"] is not None else -1
+            # C2 fix: 单语句原子计算 turn_index，消除 SELECT MAX + INSERT 的 TOCTOU 竞态
+            # COALESCE(MAX(turn_index), -1) + 1 在同一条 INSERT...SELECT 中完成，
+            # SQLite 的语句级原子性保证并发不会产生重复 turn_index
             await project_db.execute(
                 agent_id,
                 "INSERT INTO conversation_turns "
                 "(id, agent_id, turn_index, raw_messages, approx_tokens, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                [turn_id, agent_id, max_idx + 1, raw, tokens, now],
+                "SELECT ?, ?, COALESCE(MAX(turn_index), -1) + 1, ?, ?, ? "
+                "FROM conversation_turns WHERE agent_id = ?",
+                [turn_id, agent_id, raw, tokens, now, agent_id],
             )
         except Exception as e:
             logger.warning("persist_turn_failed", agent_id=agent_id, error=str(e))

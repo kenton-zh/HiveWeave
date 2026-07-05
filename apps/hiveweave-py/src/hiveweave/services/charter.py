@@ -68,6 +68,9 @@ class CharterService:
             )
             await db.commit()
         except Exception as e:
+            # C1 fix: 事务失败必须 rollback，否则失败的 DELETE 残留在连接上
+            # 会被后续操作的 commit 误提交，导致 charter 数据丢失
+            await db.rollback()
             logger.error("charter.save_failed", project_id=project_id,
                          error=str(e))
             raise
