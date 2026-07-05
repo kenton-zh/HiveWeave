@@ -16,6 +16,7 @@
 | 源栈（当前） | Elixir/Phoenix（`apps/hiveweave/`，active）+ TS/Fastify（`apps/server/`+`packages/`，reference） |
 | 并发上限 | 100 agent（用户确认，影响并发模型选型） |
 | 代码开发方 | AI 开发，工作量/难度不在考虑范围，只关心最终效果 |
+| **参考源码** | `D:\PC_AI\Project\opencode`（OpenCode 原项目，成熟 TS 实现） |
 | **Git 冻结点** | `main` 分支 commit `3e7282e` — "checkpoint: pre-migration snapshot" |
 | **迁移分支** | `migration/elixir-to-python`（基于 `3e7282e` 创建） |
 | **回退方式** | `git checkout main` 即可回到迁移前状态 |
@@ -90,6 +91,23 @@ docs/migration/
 | 层 1：功能契约 | `feature-contracts/*.md` | 1:1，但用 spec 描述 | 每个模块的输入/输出/副作用，不引用实现代码 |
 | 层 2：常量不变量 | `constants.md` | 精确复制 | 游戏时间、token budget、超时值、journal mode 等 |
 | 层 3：已知问题 | `known-issues.md` | 显式剔除 | 列出 Elixir/TS 实现中的 bug、quirk、技术债，迁移时用正确方式做 |
+
+## 参考源码优先级
+
+迁移过程中遇到不确定的设计决策时，按以下优先级参考：
+
+| 优先级 | 源 | 路径 | 说明 |
+|---|---|---|---|
+| **P0** | OpenCode 原项目 | `D:\PC_AI\Project\opencode` | 成熟 TS 实现，HiveWeave TS 参考实现的源头。compaction、token 估算、工具执行等核心逻辑以此为准 |
+| P1 | HiveWeave TS 参考实现 | `apps/server/` + `packages/` | 在 OpenCode 基础上扩展了多 agent 编排，但核心逻辑继承 OpenCode |
+| P2 | HiveWeave Elixir 实现 | `apps/hiveweave/` | active backend，但在 OpenCode 已有答案的设计决策上以 OpenCode 为准 |
+
+**关键 OpenCode 文件**（迁移时必读）：
+- `packages/core/src/session/compaction.ts` — compaction 核心逻辑（token-budget select + LLM 摘要）
+- `packages/core/src/util/token.ts` — token 估算（`CHARS_PER_TOKEN=4`）
+- `packages/core/src/v1/config/config.ts` — compaction 配置 schema（`tail_turns` 默认 2）
+- `packages/core/src/database/database.ts` — DB pragma 配置（WAL + busy_timeout=5000）
+- `packages/opencode/src/tool/truncate.ts` — 工具输出截断（MAX_LINES=2000, MAX_BYTES=50KB, 7 天保留）
 
 ## 迁移定律（来自 Migration Compass）
 

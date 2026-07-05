@@ -13,6 +13,15 @@
 | Phase 4: 并行验证 | ⏳ 未开始 | — | — |
 | Phase 5: 切换上线 | ⏳ 未开始 | — | — |
 
+## 前置确认项（4 项 ⚠️ 待定常量）
+
+| 常量 | 确认值 | 来源依据 | 状态 |
+|---|---|---|---|
+| `tail_turns` | `2` | OpenCode 默认值（`config.ts:156`） | ✅ 已确认 |
+| 停滞阈值 | processing 5min / idle 10min | Elixir 双阈值模型（OpenCode 无此机制） | ✅ 已确认 |
+| 端口 | `4000` | 前端兼容性（`api.ts:22` 硬编码 4000） | ✅ 已确认 |
+| Per-project DB 连接池 | 单连接 | OpenCode Effect SqlClient 单连接模型 | ✅ 已确认 |
+
 ## 模块进度（Phase 0：功能契约盘点）
 
 | # | 模块 | 状态 | 契约文件 | 用户确认 | 最后更新 | 备注 |
