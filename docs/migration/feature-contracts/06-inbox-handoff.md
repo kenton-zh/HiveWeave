@@ -93,6 +93,8 @@ pending ──accept──→ accepted ──complete──→ completed ──a
                                           completed ──reopen──→ accepted (rework，重置 context_delivered)
 ```
 
+> **已知限制（RECONCILE）**：源码 `handoff.ex` 中**无 cancel 和 timeout 转换**。handoff 一旦创建，只能沿上述路径流转至 `approved` 终态，或通过 `reopen` 回退。无超时自动取消机制——长期 pending/accepted 的 handoff 不会被自动清理。Python 迁移时如需超时取消，需新增状态转换逻辑（源码无此能力）。
+
 ## 核心流程
 
 ### 消息投递
@@ -116,9 +118,29 @@ pending ──accept──→ accepted ──complete──→ completed ──a
    - Messages block（inbox 消息）
    - Subordinate Logs block（coordinator 专属）
    - Report Required block（unreported handoffs）
-5. mark_delivered(handoff_ids)
-6. inbox 消息在 LLM 产出非空输出后才 mark_read_by_ids
+5. mark_delivered(handoff_ids)          ← LLM 调用前执行
+6. 调用 LLM
+7. LLM 产出非空输出 → mark_read_by_ids(inbox_msg_ids)
+   LLM 产出空输出   → 保留 inbox 未读（pending_inbox_msg_ids 不清空），等待重试
 ```
+
+#### 崩溃恢复行为（RECONCILE）
+
+`mark_delivered`（步骤 5）在 LLM 调用**前**执行，`mark_read_by_ids`（步骤 7）在 LLM 非空输出**后**执行。两者不在同一事务中，崩溃时存在不对称恢复行为：
+
+| 崩溃时机 | handoff 状态 | inbox 状态 | 恢复行为 |
+|---|---|---|---|
+| 步骤 5 之后、LLM 调用中崩溃 | `context_delivered=1`（已标记） | 未读（未标记） | handoff **不重注入**（delivered 不可逆）；inbox 消息保留未读，下次 trigger 重新注入 |
+| LLM 空输出重试中崩溃 | `context_delivered=1`（已标记） | 未读（未标记） | 同上 |
+
+> **有效权衡**：handoff 的 `context_delivered=1` 是**不可逆**的——即使 LLM 空输出或崩溃，handoff 也不会重新注入 context。这意味着 agent 可能"漏看" handoff 内容。设计取舍是避免无限重注入循环，代价是空输出场景下 handoff 信息丢失。inbox 消息则相反，保留未读直到非空输出，确保消息不丢失但可能重复注入。
+
+#### 空输出重试机制（RECONCILE）
+
+LLM 空输出时（`{:empty, _, _}`），agent 按指数退避重试（5s → 15s → 45s，最多 3 次）：
+- `pending_inbox_msg_ids` **保留不清空**，重试时可重新标记已读
+- 超过 3 次重试后，上报上级并**强制标记 inbox 已读**（避免 `escalate → retrigger → empty → escalate` 无限循环）
+- handoff 的 `context_delivered` 在首次 trigger 时已标记，重试不重注入
 
 ## 已知问题
 
@@ -126,6 +148,7 @@ pending ──accept──→ accepted ──complete──→ completed ──a
 |---|---|---|
 | — | Elixir inbox ASC 排序，TS DESC | 用 ASC（FIFO 语义，旧消息优先处理） |
 | — | Elixir 有 mark_read_by_ids，TS 无 | 必须保留，避免竞态 |
+| H1 | **mark_all_read 与 mark_read_by_ids 竞态**：两者都是直接 SQL UPDATE，无事务包裹。`mark_read_by_ids` 的存在正是为避免 `mark_all_read` 在 trigger 场景的竞态（新消息在 build_context 和 mark_all_read 之间到达会被误标记已读）。 | **有效权衡**：trigger 场景只用 `mark_read_by_ids`，不用 `mark_all_read`；`mark_all_read` 供前端手动操作。同一 agent 的 GenServer 序列化消息处理，不会并发；不同 agent 操作各自 inbox（`WHERE to_agent_id = ?`），不冲突。Python 侧保持同样分工即可。 |
 | — | Elixir handoff 有去重，TS 无 | 保留去重 |
 | — | Elixir handoff 有 context_delivered，TS 无 | 必须实现，防重复注入 |
 | — | Elixir complete_handoff 只完成 accepted，TS 会 fallback 到 pending | 以 Elixir 为准 |
