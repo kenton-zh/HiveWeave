@@ -269,3 +269,27 @@ async def list_modules(projectId: str = Query(...)) -> dict:
     except Exception as e:
         log.warning("list_modules_failed", project_id=projectId, error=str(e))
         return {"modules": []}
+
+
+# ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────
+# 前端（TS/Elixir）期望 /api/org/{projectId}/... 风格；保留现有 query 风格路由，
+# 额外提供 path 参数变体。所有兼容路由直接委托给现有处理函数。
+
+
+@router.get("/{project_id}/tree")
+async def get_tree_path(project_id: str) -> dict:
+    """组织树（path: projectId）— 前端 RESTful 兼容路由。"""
+    return await get_tree(projectId=project_id)
+
+
+@router.get("/{project_id}/agents")
+async def list_agents_path(project_id: str) -> dict:
+    """列出 agent（path: projectId）— 前端 RESTful 兼容路由。"""
+    return await list_agents(projectId=project_id)
+
+
+@router.post("/{project_id}/agents")
+async def create_agent_path(project_id: str, body: AgentCreate) -> dict:
+    """创建 agent（path: projectId 覆盖 body projectId）— 前端 RESTful 兼容路由。"""
+    overridden = body.model_copy(update={"projectId": project_id})
+    return await create_agent(overridden)

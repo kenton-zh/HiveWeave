@@ -67,13 +67,13 @@ def _root_html() -> str:
 </html>"""
 
 
-async def register_routes(app: FastAPI) -> None:
+def register_routes(app: FastAPI) -> None:
     """把所有子路由注册到 FastAPI app。
 
     用法::
 
         from hiveweave.api.router import register_routes
-        await register_routes(app)
+        register_routes(app)
     """
     # 根端点
     app.add_api_route("/", _root, methods=["GET"], include_in_schema=False)
