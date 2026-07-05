@@ -25,6 +25,8 @@ from typing import Any, Awaitable, Callable
 
 import structlog
 
+from hiveweave.tools.security import is_sensitive_path
+
 log = structlog.get_logger(__name__)
 
 # ── Types ───────────────────────────────────────────────────
@@ -159,6 +161,10 @@ _REVIEW_PROMPTS = {
 def _safe_read_file(workspace_path: str, file_path: str) -> str | None:
     """Read a file from the workspace; return None if not found / escapes."""
     if not file_path:
+        return None
+    # 敏感文件保护（C6）— 不读取 .env / *.pem / credentials 等内容
+    if is_sensitive_path(file_path):
+        log.warning("review.blocked_sensitive_file", path=file_path)
         return None
     try:
         ws = Path(workspace_path).resolve()

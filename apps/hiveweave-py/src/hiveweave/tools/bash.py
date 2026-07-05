@@ -30,6 +30,27 @@ MAX_TIMEOUT_S = 600              # 10 minutes hard cap
 MAX_CAPTURE_BYTES = 1_048_576    # 1MB — bash 专用轻量截断阈值
 DOCKER_SANDBOX_IMAGE = "hiveweave-bash:latest"
 
+# 环境变量白名单 — 只传系统必要变量给子进程，绝不传递任何含
+# KEY/SECRET/TOKEN/PASSWORD 的变量（C5: 防止 API 密钥泄露）。
+_SAFE_ENV_KEYS: frozenset[str] = frozenset({
+    "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    "TEMP", "TMP", "SystemRoot", "COMSPEC", "LANG", "LC_ALL",
+    "LC_CTYPE", "TERM", "SHELL", "USERNAME", "USERDOMAIN",
+    "COMPUTERNAME", "OS", "PATHEXT", "HOMEDRIVE", "HOMEPATH",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+})
+
+
+def _build_safe_env(cwd: str) -> dict[str, str]:
+    """构建白名单环境变量，仅传递系统必要变量 + HiveWeave 标记。
+
+    绝不传递 OPENAI_API_KEY / OPENCODE_API_KEY / DEEPSEEK_API_KEY 等密钥。
+    """
+    safe_env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS}
+    safe_env["HIVEWEAVE_BASH"] = "1"
+    safe_env["HIVEWEAVE_WORKSPACE"] = cwd
+    return safe_env
+
 # Self-destructive command patterns (契约 02 — 7 patterns)
 # Match semantics mirror Elixir check_self_destructive/1:
 #   patterns 1-2 use word-boundary-anchored regex
@@ -87,11 +108,7 @@ async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
     else:
         shell_args = ["bash", "-c", command]
 
-    env = {
-        **os.environ,
-        "HIVEWEAVE_BASH": "1",
-        "HIVEWEAVE_WORKSPACE": cwd,
-    }
+    env = _build_safe_env(cwd)
 
     try:
         proc = await asyncio.create_subprocess_exec(

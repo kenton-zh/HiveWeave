@@ -40,6 +40,34 @@ from hiveweave.llm.retry import (
 
 log = structlog.get_logger(__name__)
 
+
+class CircuitBreakerOpenError(Exception):
+    """熔断器已打开，请求被拒绝（C9）。
+
+    当 provider 连续失败达到阈值后抛出。携带 provider 名称和（可选的）
+    fallback 名称，供调用方决策是否切换到备用 provider。
+
+    简化方案：当前不实现自动 provider 切换（需要解析 fallback model config），
+    直接抛出此异常让调用方知道熔断器已打开，避免原代码「只打日志不 return」
+    继续用被熔断的 provider 发请求的死代码行为。
+    """
+
+    def __init__(self, provider: str, fallback: str | None = None) -> None:
+        self.provider = provider
+        self.fallback = fallback
+        if fallback:
+            msg = (
+                f"Circuit breaker open for provider '{provider}' "
+                f"(fallback '{fallback}' available but auto-switch "
+                f"not implemented)"
+            )
+        else:
+            msg = (
+                f"Circuit breaker open for provider '{provider}' "
+                f"and no fallback available"
+            )
+        super().__init__(msg)
+
 # ── 常量（契约 01）──────────────────────────────────────────
 
 MAX_TOOL_ROUNDS = 25
@@ -394,19 +422,10 @@ class Streamer:
             provider_name, fallback=provider.fallback
         )
 
-        # 熔断器检查
+        # 熔断器检查（C9: fallback 不再是无操作死代码 — 直接抛出明确异常）
         cb_result = await self._circuit_breaker.check(provider_name)
         if not cb_result.allowed:
-            if cb_result.fallback:
-                log.info("circuit_fallback",
-                         agent_id=agent_id,
-                         provider=provider_name,
-                         fallback=cb_result.fallback)
-                # 切换到 fallback（简化: 使用同一 config，实际应解析 fallback model）
-            else:
-                return self._error_result(
-                    "All providers unavailable", start_time
-                )
+            raise CircuitBreakerOpenError(provider_name, cb_result.fallback)
 
         # 广播 start 事件
         await self._fire_delta(on_delta, {"type": "start"})
@@ -424,8 +443,7 @@ class Streamer:
                 ),
                 timeout=TOTAL_TIMEOUT_S,
             )
-            # 报告熔断器成功
-            await self._circuit_breaker.report_success(provider_name)
+            # 熔断器成功/失败上报已移至 _stream_single_round 按轮次精确上报（C10）
             result["duration_ms"] = int((time.monotonic() - start_time) * 1000)
             return result
         except TimeoutError:
@@ -837,8 +855,24 @@ class Streamer:
             )
 
         try:
-            return await self._retry_handler.with_retry(do_request)
-        except (RetryableError, PermanentError) as e:
+            result = await self._retry_handler.with_retry(do_request)
+            # 成功完成 → 报告熔断器成功（C10: 按轮次精确上报）
+            await self._circuit_breaker.report_success(provider_name)
+            return result
+        except RetryableError as e:
+            # 可重试错误耗尽 → 报告熔断器失败（C10: 让熔断器感知 HTTP 429/503/504/529 + 网络错误）
+            await self._circuit_breaker.report_failure(provider_name)
+            return {
+                "status": "error",
+                "text": "",
+                "thinking": "",
+                "tool_calls": [],
+                "finish_reason": None,
+                "error": str(e),
+            }
+        except PermanentError as e:
+            # 不可重试错误（401/400 等）→ 不报告熔断器
+            # （客户端配置问题，非 provider 故障，不应触发熔断）
             return {
                 "status": "error",
                 "text": "",

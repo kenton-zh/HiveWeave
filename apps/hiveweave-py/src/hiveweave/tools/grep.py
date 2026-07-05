@@ -17,6 +17,8 @@ from typing import Any
 
 import structlog
 
+from hiveweave.tools.security import is_sensitive_path
+
 log = structlog.get_logger(__name__)
 
 # ── Constants ───────────────────────────────────────────────
@@ -245,6 +247,8 @@ async def execute_grep(
         search_path, pattern, include, limit, context, multiline
     )
     if rg_matches is not None:
+        # 过滤敏感文件路径的匹配（C6）— 不暴露 .env / *.pem / credentials 等内容
+        rg_matches = [m for m in rg_matches if not is_sensitive_path(m["file"])]
         return {"success": True, "output": _format_results(rg_matches),
                 "error": None}
 
@@ -260,4 +264,6 @@ async def execute_grep(
         return {"success": False, "output": "",
                 "error": f"Error: {exc}"}
 
+    # 过滤敏感文件路径的匹配（C6）
+    matches = [m for m in matches if not is_sensitive_path(m["file"])]
     return {"success": True, "output": _format_results(matches), "error": None}
