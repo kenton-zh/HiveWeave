@@ -57,21 +57,31 @@
 
 | 审查项 | 状态 | 发现数 | 已处理 | 最后更新 |
 |---|---|---|---|---|
-| 契约 01-13 对抗式审查 | ✅ 完成 | ~90 | 0（待 RECONCILE） | 2026-07-05 |
+| 契约 01-13 对抗式审查 | ✅ 完成 | ~90 | — | 2026-07-05 |
 | 契约 14-19 补写 | ✅ 完成 | — | — | 2026-07-05 |
 | 契约 13 提示词修订 | ✅ 完成 | 16 项遗漏 | 16 项已补 | 2026-07-05 |
-| 交叉模型审查 | ⏳ 待用户决定 | — | — | — |
-| RECONCILE（01-13 审查发现） | ⏳ 未开始 | ~90 | 0 | — |
+| 交叉模型审查 | ❌ 跳过（用户决定） | — | — | 2026-07-05 |
+| RECONCILE（01-13 审查发现） | ✅ 完成 | 49 | 49（31 有效可操作+8 权衡+7 误读+3 噪声） | 2026-07-05 |
+| known-issues.md 更新 | ✅ 完成 | 11 项 A1-A11 | — | 2026-07-05 |
 
-## 孤儿 schema（有表无 service，待用户决定）
+## 孤儿 schema（已决定）
 
-| Schema | 表 | 状态 |
+| Schema | 表 | 决策 | 理由 |
+|---|---|---|---|
+| charter_attachment | charter_attachments | **保留**（Python 补 service） | charter 附件是有意义的功能 |
+| merge | merges | **保留**（契约 09 补描述） | merge 操作的冲突记录 |
+| meta_index | meta_index | **删除** | 无引用，用途不明 |
+| module | modules | **保留**（Python 补 CRUD） | 被 handoff/memory 的 module_id 引用 |
+| project_index | project_index | **删除** | 无引用，用途不明 |
+
+## 已决定事项
+
+| 事项 | 决策 | 日期 |
 |---|---|---|
-| charter_attachment | charter_attachments | 有表无 service，契约 14 标注 |
-| merge | merges | 有表无 service，契约 09 提到 merge 操作但未描述此表 |
-| meta_index | meta_index | 有表无 service，用途不明 |
-| module | modules | 有表无 service，被 handoff/memory 的 module_id 引用 |
-| project_index | project_index | 有表无 service，用途不明 |
+| 交叉模型审查 | 跳过 | 2026-07-05 |
+| time-context 注入 | 不实现（Elixir 无，保持一致） | 2026-07-05 |
+| userInvolvement 默认值 | 以 charter medium 为准 | 2026-07-05 |
+| 孤儿 schema 处理 | 3 保留 2 删除（见上表） | 2026-07-05 |
 
 ## 模块进度（Phase 3：逐模块迁移）
 
