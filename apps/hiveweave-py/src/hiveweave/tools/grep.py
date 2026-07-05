@@ -23,7 +23,8 @@ log = structlog.get_logger(__name__)
 
 # ── Constants ───────────────────────────────────────────────
 
-MAX_RESULTS = 100
+MAX_RESULTS = 500
+"""默认结果上限（R4）。大目录搜索结果封顶，防止海量匹配导致输出过大。"""
 MAX_CHARS_PER_LINE = 500
 MAX_FILE_SIZE = 1_048_576  # 1MB — skip larger files
 
@@ -76,9 +77,13 @@ def _format_results(matches: list[dict[str, Any]]) -> str:
 
 async def _try_ripgrep(
     cwd: str, pattern: str, include: str | None,
-    head_limit: int, context: int, multiline: bool,
+    limit: int, context: int, multiline: bool,
 ) -> list[dict[str, Any]] | None:
-    """Try ripgrep; return None if rg is unavailable."""
+    """Try ripgrep; return None if rg is unavailable.
+
+    R4: 流式逐行读取 stdout，达到 limit 上限即终止 rg 进程，
+    避免大目录扫描全量输出载入内存。
+    """
     args = ["rg", "--line-number", "--no-heading", "--color=never"]
     if multiline:
         args.append("-U")
@@ -99,40 +104,51 @@ async def _try_ripgrep(
     except OSError:
         return None
 
-    try:
-        stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        return []
-
-    text = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
-    if not text.strip():
-        return []
-
     matches: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        if len(matches) >= head_limit:
-            break
-        # Format: <file>:<line>:<content>
-        idx1 = line.find(":")
-        if idx1 == -1:
-            continue
-        file = line[:idx1]
-        rest = line[idx1 + 1:]
-        idx2 = rest.find(":")
-        if idx2 == -1:
-            continue
+    assert proc.stdout is not None
+    try:
+        # R4: 逐行流式读取，达到上限即 break（不再 consume 全部输出）
+        while len(matches) < limit:
+            try:
+                raw_line = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=30
+                )
+            except asyncio.TimeoutError:
+                break
+            if not raw_line:
+                break
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                continue
+            # Format: <file>:<line>:<content>
+            idx1 = line.find(":")
+            if idx1 == -1:
+                continue
+            file = line[:idx1]
+            rest = line[idx1 + 1:]
+            idx2 = rest.find(":")
+            if idx2 == -1:
+                continue
+            try:
+                line_num = int(rest[:idx2])
+            except ValueError:
+                continue
+            content = rest[idx2 + 1:][:MAX_CHARS_PER_LINE]
+            # Normalize path separators
+            file = file.replace("\\", "/")
+            matches.append({"file": file, "line": line_num, "content": content})
+    finally:
+        # 达到上限或读取完毕后，若 rg 仍在运行则终止，释放资源
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
         try:
-            line_num = int(rest[:idx2])
-        except ValueError:
-            continue
-        content = rest[idx2 + 1:][:MAX_CHARS_PER_LINE]
-        # Normalize path separators
-        file = file.replace("\\", "/")
-        matches.append({"file": file, "line": line_num, "content": content})
+            await proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+
     return matches
 
 
@@ -223,8 +239,13 @@ async def execute_grep(
     head_limit: int | None = None,
     context: int = 0,
     multiline: bool = False,
+    max_results: int = 500,
 ) -> dict[str, Any]:
-    """Search files for a regex pattern. Returns {success, output, error}."""
+    """Search files for a regex pattern. Returns {success, output, error}.
+
+    R4: max_results 控制结果上限（默认 500），达到上限后停止搜索。
+    head_limit（若提供）与 max_results 取较小值作为有效上限。
+    """
     if not pattern:
         return {"success": False, "output": "",
                 "error": "Error: pattern is required"}
@@ -239,8 +260,11 @@ async def execute_grep(
         return {"success": False, "output": "",
                 "error": f"Error: Path not found: {path}"}
 
-    limit = head_limit or MAX_RESULTS
-    limit = min(limit, MAX_RESULTS)
+    # R4: 有效上限 = min(head_limit, max_results)，未提供 head_limit 时用 max_results
+    if head_limit is not None and head_limit > 0:
+        limit = min(head_limit, max_results)
+    else:
+        limit = max_results
 
     # 1. Try ripgrep first
     rg_matches = await _try_ripgrep(

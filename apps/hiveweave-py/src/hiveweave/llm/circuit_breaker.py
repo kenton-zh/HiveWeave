@@ -1,5 +1,11 @@
 """熔断器 — 三态状态机 (closed / open / half_open)。
 
+R8: 架构说明 —— 熔断器是 **per-provider** 的，而非全局单例状态机。
+CircuitBreaker 实例内部用 `_breakers: dict[str, _BreakerState]` 为每个
+provider 维护独立的状态机（fail_count / opened_at / probe_deadline）。
+模块级单例 `circuit_breaker` 是一个「多 provider 管理器」，本身不是共享状态机 ——
+不同 provider 之间互不干扰，一个 provider 熔断不影响其他 provider。
+
 契约 01: LLM 流式调用 — 重试与熔断
 - 连续失败 5 次后熔断（FAIL_THRESHOLD）
 - 熔断后 30s 冷却（COOLDOWN_MS）
@@ -99,6 +105,9 @@ class _BreakerState:
 class CircuitBreaker:
     """多 provider 熔断器管理器（异步安全）。
 
+    R8: 本类是 per-provider 的 —— 每个 provider 拥有独立的 _BreakerState
+    状态机，互不干扰。一个 provider 熔断不会牵连其他 provider。
+
     用法::
 
         cb = CircuitBreaker()
@@ -134,6 +143,8 @@ class CircuitBreaker:
         self.fail_threshold = fail_threshold
         self.cooldown_ms = cooldown_ms
         self.probe_timeout_ms = probe_timeout_ms
+        # R8: per-provider 状态机字典 —— key 为 provider 名，value 为独立状态。
+        # 每个注册的 provider 有自己的 fail_count / opened_at / probe_deadline。
         self._breakers: dict[str, _BreakerState] = {}
         self._lock = asyncio.Lock()
 
@@ -285,4 +296,9 @@ class CircuitBreaker:
 # ── 模块级单例 ──────────────────────────────────────────────
 
 circuit_breaker = CircuitBreaker()
-"""全局熔断器单例。所有 Streamer 实例共享。"""
+"""全局熔断器单例。所有 Streamer 实例共享。
+
+R8: 这里的「全局」指的是「所有 Streamer 共用同一个 CircuitBreaker 实例」，
+而非「所有 provider 共用一个状态机」。该实例内部按 provider 名分别维护
+独立的 _BreakerState，因此仍是 per-provider 的。
+"""

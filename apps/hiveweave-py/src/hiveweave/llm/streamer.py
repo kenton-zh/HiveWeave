@@ -753,7 +753,7 @@ class Streamer:
         # 达到最大轮次 — 做一次无工具的总结调用
         log.warning("max_rounds_reached",
                     agent_id=agent_id,
-                    max_rounds=self.max_tool_rounds)
+                    max_rounds=rounds_cap)
         summary = await self._make_max_rounds_summary(
             agent_id, provider, messages, on_delta
         )
@@ -768,7 +768,7 @@ class Streamer:
             "thinking": thinking_acc,
             "tool_calls": tool_history,
             "tool_turn_messages": tool_turn_acc,
-            "rounds": self.max_tool_rounds,
+            "rounds": rounds_cap,
             "usage": last_usage,
         }
 
@@ -1265,11 +1265,13 @@ class Streamer:
         self,
         messages: list[dict],
         round_num: int,
+        rounds_cap: int | None = None,
     ) -> list[dict]:
         """80% 轮次时注入「开始收尾」系统提示。"""
-        reminder_round = max(int(self.max_tool_rounds * MID_ROUND_REMINDER_RATIO), 1)
-        if round_num == reminder_round and round_num < self.max_tool_rounds:
-            rounds_left = self.max_tool_rounds - round_num
+        cap = rounds_cap if rounds_cap else self.max_tool_rounds
+        reminder_round = max(int(cap * MID_ROUND_REMINDER_RATIO), 1)
+        if round_num == reminder_round and round_num < cap:
+            rounds_left = cap - round_num
             log.info("inject_mid_round_reminder",
                      round=round_num, rounds_left=rounds_left)
             messages = messages + [{

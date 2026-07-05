@@ -142,7 +142,10 @@ class ToolExecutor:
             log.error("tool.dispatch_failed", tool=name, error=str(exc))
             return self._error(f"Error: {exc}")
 
-        # 4. Normalize result shape
+        # 4. Normalize result shape — R7: 统一工具返回契约
+        # 所有工具必须返回 {success, output, error} 三字段。此处作为单一保障点，
+        # 为任何遗漏字段的工具补默认值（success=True / output="" / error=None），
+        # 确保下游消费方（agent / conversation store）总能拿到一致结构。
         if not isinstance(result, dict):
             result = {"success": True, "output": str(result), "error": None}
         result.setdefault("success", True)
@@ -328,7 +331,11 @@ class ToolExecutor:
         tool_name: str,
         workspace_path: str,
     ) -> str:
-        """Save the full output to a temp file; return the file path."""
+        """Save the full output to a temp file; return the file path.
+
+        R6: 文件名内嵌创建时间戳（{agent_id}_{ts}_{tool}.txt），写入时 mtime
+        也同步记录创建时间。cleanup_tool_outputs 据此判断保留期。
+        """
         base_dir = workspace_path or os.getcwd()
         out_dir = Path(base_dir) / ".hiveweave" / "tool_outputs"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -360,7 +367,10 @@ class ToolExecutor:
     def cleanup_tool_outputs(workspace_path: str | None = None) -> None:
         """Delete tool output files older than the retention period (7 days).
 
-        Intended to be called periodically (e.g. on server startup).
+        R6: 清理机制 —— 在 main.py 的 lifespan 启动阶段对每个项目工作区调用
+        本方法（见 main.py "tool_outputs_cleaned"）。用文件 mtime 判断创建时间，
+        删除超过 TOOL_OUTPUT_RETENTION_DAYS（7 天）的临时文件。文件名中的时间戳
+        仅用于可读性，实际保留期判断以 mtime 为准（对齐 Elixir/TS 7 天保留策略）。
         """
         base_dir = workspace_path or os.getcwd()
         out_dir = Path(base_dir) / ".hiveweave" / "tool_outputs"
