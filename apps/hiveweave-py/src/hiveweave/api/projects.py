@@ -1,0 +1,457 @@
+"""Project CRUD endpoints (contract 19, group 2).
+
+契约 19: Projects — 项目元数据 + 目标 + 工作空间
+- GET    /api/projects              列出项目（query: status?）
+- POST   /api/projects              创建项目（含 charter 三段 + CEO/HR/QA 自动创建）
+- GET    /api/projects/{id}         查单个项目（汇总 agents/roster）
+- PATCH  /api/projects/{id}         更新项目（workspacePath 变化时迁移 + 失效缓存）
+- DELETE /api/projects/{id}         删除项目（删库文件 + meta 删行）
+- GET    /api/projects/{id}/activate    激活项目
+- GET    /api/projects/{id}/deactivate  取消激活
+- POST   /api/projects/{id}/goals   更新 charter goals 段
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+
+import structlog
+
+from hiveweave.db import meta as meta_db
+from hiveweave.db import project as project_db
+from hiveweave.services.org import OrgService
+from hiveweave.services.game_time import GameTimeService
+from hiveweave.services.roster import RosterService
+
+log = structlog.get_logger(__name__)
+
+router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+#: meta_index key 用于记录当前激活的项目
+_ACTIVE_KEY = "active_project_id"
+
+
+class ProjectCreate(BaseModel):
+    """创建项目请求体。"""
+
+    name: str
+    workspacePath: str
+    description: str | None = None
+    charterVision: str | None = None
+    charterGoals: str | None = None
+    charterConstraints: str | None = None
+    userInvolvement: str | None = None
+    orgPattern: str | None = None
+    operatorName: str | None = None
+
+
+class ProjectUpdate(BaseModel):
+    """更新项目请求体（所有字段可选）。"""
+
+    name: str | None = None
+    workspacePath: str | None = None
+    description: str | None = None
+    operatorName: str | None = None
+
+
+class CharterGoalsUpdate(BaseModel):
+    """charter goals 段更新请求体。"""
+
+    goals: str
+
+
+def _build_charter_dict(body: ProjectCreate) -> dict:
+    """组装 charter dict（vision/goals/constraints 三段）。"""
+    return {
+        "vision": body.charterVision or f"Build and operate the {body.name} project.",
+        "goals": body.charterGoals or "",
+        "constraints": body.charterConstraints or "",
+        "userInvolvement": body.userInvolvement or "medium",
+        "orgPattern": body.orgPattern or "solo",
+        "operatorName": body.operatorName or "operator",
+    }
+
+
+def _project_response(row: dict, active_id: str | None = None) -> dict:
+    """把 DB 行转为响应 dict（同时含 snake_case 与 camelCase）。"""
+    charter_raw = row.get("charter_json")
+    charter: dict | None = None
+    if charter_raw:
+        try:
+            charter = json.loads(charter_raw) if isinstance(charter_raw, str) else charter_raw
+        except (json.JSONDecodeError, TypeError):
+            charter = None
+    is_active = (row.get("id") == active_id) if active_id is not None else False
+    return {
+        "id": row.get("id"),
+        "name": row.get("name"),
+        "description": row.get("description"),
+        "workspace_path": row.get("workspace_path"),
+        "workspacePath": row.get("workspace_path"),
+        "org_paradigm": row.get("org_paradigm"),
+        "orgParadigm": row.get("org_paradigm"),
+        "charter": charter,
+        "is_active": is_active,
+        "isActive": is_active,
+        "created_at": row.get("created_at"),
+        "createdAt": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "updatedAt": row.get("updated_at"),
+    }
+
+
+async def _get_active_project_id() -> str | None:
+    """从 meta_index 读取当前激活的项目 id。"""
+    row = await meta_db.query_one(
+        "SELECT value FROM meta_index WHERE key = ? LIMIT 1", [_ACTIVE_KEY]
+    )
+    return row["value"] if row else None
+
+
+async def _set_active_project_id(project_id: str | None) -> None:
+    if project_id is None:
+        await meta_db.execute(
+            "DELETE FROM meta_index WHERE key = ?", [_ACTIVE_KEY]
+        )
+    else:
+        await meta_db.execute(
+            "INSERT OR REPLACE INTO meta_index (key, value, updated_at) "
+            "VALUES (?, ?, ?)",
+            [_ACTIVE_KEY, project_id, int(time.time() * 1000)],
+        )
+
+
+async def _seed_default_agents(project_id: str) -> None:
+    """新项目自动创建 CEO / HR / QA 三角色（幂等）。"""
+    org = OrgService()
+    existing = await org.list_agents(project_id)
+    if any(a.get("role") == "ceo" for a in existing):
+        return
+    try:
+        await org.create_agent(
+            {
+                "project_id": project_id,
+                "name": "CEO",
+                "role": "ceo",
+                "goal": "Coordinate the project, manage subordinates, deliver the charter.",
+                "backstory": "The chief executive officer of the project.",
+                "permission_type": "coordinator",
+            }
+        )
+        await org.create_agent(
+            {
+                "project_id": project_id,
+                "name": "HR",
+                "role": "hr",
+                "goal": "Manage personnel: hire, transfer, dismiss agents per CEO requests.",
+                "backstory": "The human resources lead.",
+                "permission_type": "coordinator",
+            }
+        )
+        await org.create_agent(
+            {
+                "project_id": project_id,
+                "name": "QA",
+                "role": "qa",
+                "goal": "Guard quality gates; review and test work before merge.",
+                "backstory": "The quality assurance lead.",
+                "permission_type": "coordinator",
+            }
+        )
+    except Exception as e:
+        log.warning("seed_default_agents_failed", project_id=project_id, error=str(e))
+
+
+@router.get("")
+async def list_projects(status: str | None = Query(default=None)) -> dict:
+    """列出项目（支持 status 过滤: active/inactive）。"""
+    rows = await meta_db.query(
+        "SELECT * FROM projects ORDER BY created_at DESC"
+    )
+    active_id = await _get_active_project_id()
+    projects = [_project_response(dict(r), active_id) for r in rows]
+    if status == "active":
+        projects = [p for p in projects if p["is_active"]]
+    elif status == "inactive":
+        projects = [p for p in projects if not p["is_active"]]
+    return {"projects": projects}
+
+
+@router.post("")
+async def create_project(body: ProjectCreate) -> dict:
+    """创建项目。
+
+    契约 19 特别流程 1: 三段 charter 校验；创建后:
+    - 确保工作空间目录存在（含 .hiveweave/）
+    - 初始化 per-project DB（schema）
+    - 自动创建 CEO / HR / QA 三个角色
+    """
+    workspace = body.workspacePath
+    # 确保工作空间存在
+    try:
+        ws = Path(workspace).resolve()
+        ws.mkdir(parents=True, exist_ok=True)
+        (ws / ".hiveweave").mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log.error("ensure_workspace_failed", workspace=workspace, error=str(e))
+        raise HTTPException(status_code=400, detail=f"Invalid workspace path: {e}")
+
+    # 初始化 per-project DB（建表）
+    try:
+        await project_db.ensure_project_db(workspace)
+    except Exception as e:
+        log.error("init_project_db_failed", workspace=workspace, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to initialize project DB")
+
+    charter = _build_charter_dict(body)
+    project_id = str(uuid.uuid4())
+    now_ms = int(time.time() * 1000)
+
+    try:
+        await meta_db.execute(
+            "INSERT INTO projects (id, name, description, workspace_path, "
+            "org_paradigm, charter_json, language, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                project_id,
+                body.name,
+                body.description or "",
+                str(ws),
+                charter.get("orgPattern", "solo"),
+                json.dumps(charter, ensure_ascii=False),
+                "en",
+                now_ms,
+                now_ms,
+            ],
+        )
+    except Exception as e:
+        log.error("create_project_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to create project")
+
+    # 自动创建默认 agent
+    await _seed_default_agents(project_id)
+
+    row = await meta_db.query_one("SELECT * FROM projects WHERE id = ?", [project_id])
+    log.info("project_created", project_id=project_id, name=body.name, workspace=str(ws))
+    return {"project": _project_response(dict(row)) if row else {"id": project_id}}
+
+
+@router.get("/{project_id}")
+async def get_project(project_id: str) -> dict:
+    """查单个项目（汇总 agents/roster）。"""
+    row = await meta_db.query_one(
+        "SELECT * FROM projects WHERE id = ?", [project_id]
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    active_id = await _get_active_project_id()
+    resp = _project_response(dict(row), active_id)
+
+    # 汇总 agents + roster
+    try:
+        org = OrgService()
+        resp["agents"] = await org.list_agents(project_id)
+        resp["agentCount"] = len(resp["agents"])
+    except Exception as e:
+        log.warning("list_agents_for_project_failed", error=str(e))
+        resp["agents"] = []
+        resp["agentCount"] = 0
+    try:
+        roster_svc = RosterService()
+        resp["roster"] = await roster_svc.list_by_project(project_id)
+    except Exception as e:
+        log.warning("list_roster_for_project_failed", error=str(e))
+        resp["roster"] = []
+    return {"project": resp}
+
+
+async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
+    row = await meta_db.query_one(
+        "SELECT * FROM projects WHERE id = ?", [project_id]
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    existing = dict(row)
+    old_workspace = existing.get("workspace_path") or ""
+
+    sets: list[str] = []
+    vals: list = []
+    if body.name is not None:
+        sets.append("name = ?")
+        vals.append(body.name)
+    if body.description is not None:
+        sets.append("description = ?")
+        vals.append(body.description)
+    if body.workspacePath is not None and body.workspacePath != old_workspace:
+        # 迁移工作空间
+        new_ws = str(Path(body.workspacePath).resolve())
+        try:
+            new_ws_dir = Path(new_ws)
+            new_ws_dir.mkdir(parents=True, exist_ok=True)
+            (new_ws_dir / ".hiveweave").mkdir(parents=True, exist_ok=True)
+            # 移动旧 .hiveweave 内容（若存在）
+            old_hw = Path(old_workspace) / ".hiveweave"
+            new_hw = new_ws_dir / ".hiveweave"
+            if old_hw.exists():
+                for item in old_hw.iterdir():
+                    target = new_hw / item.name
+                    if not target.exists():
+                        item.rename(target)
+        except Exception as e:
+            log.error(
+                "migrate_workspace_failed",
+                old=old_workspace,
+                new=new_ws,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=400, detail=f"Workspace migration failed: {e}"
+            )
+        # 失效 project db 缓存
+        try:
+            await project_db.evict_project_db(old_workspace)
+            await project_db.evict_project_db(new_ws)
+        except Exception:
+            pass
+        sets.append("workspace_path = ?")
+        vals.append(new_ws)
+    if body.operatorName is not None:
+        charter_raw = existing.get("charter_json")
+        charter: dict = {}
+        if charter_raw:
+            try:
+                charter = json.loads(charter_raw) if isinstance(charter_raw, str) else charter_raw
+            except (json.JSONDecodeError, TypeError):
+                charter = {}
+        charter["operatorName"] = body.operatorName
+        sets.append("charter_json = ?")
+        vals.append(json.dumps(charter, ensure_ascii=False))
+
+    if sets:
+        sets.append("updated_at = ?")
+        vals.append(int(time.time() * 1000))
+        vals.append(project_id)
+        await meta_db.execute(
+            f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", vals
+        )
+
+    updated = await meta_db.query_one(
+        "SELECT * FROM projects WHERE id = ?", [project_id]
+    )
+    active_id = await _get_active_project_id()
+    return {"project": _project_response(dict(updated)) if updated else {}}
+
+
+@router.patch("/{project_id}")
+async def update_project(project_id: str, body: ProjectUpdate) -> dict:
+    """更新项目（PATCH）。"""
+    return await _do_update_project(project_id, body)
+
+
+@router.put("/{project_id}")
+async def put_project(project_id: str, body: ProjectUpdate) -> dict:
+    """更新项目（PUT，同 PATCH）。"""
+    return await _do_update_project(project_id, body)
+
+
+@router.delete("/{project_id}")
+async def delete_project(project_id: str) -> dict:
+    """删除项目（删库文件 + meta 删行）。"""
+    row = await meta_db.query_one(
+        "SELECT workspace_path FROM projects WHERE id = ?", [project_id]
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    workspace = row["workspace_path"] or ""
+    if workspace:
+        try:
+            await project_db.evict_project_db(workspace)
+        except Exception:
+            pass
+        # 删除 per-project DB 文件
+        try:
+            db_path = str(Path(workspace) / ".hiveweave" / "data.db")
+            if os.path.exists(db_path):
+                os.remove(db_path)
+        except Exception as e:
+            log.warning("delete_project_db_failed", workspace=workspace, error=str(e))
+
+    # 若是当前激活项目，取消激活
+    active_id = await _get_active_project_id()
+    if active_id == project_id:
+        await _set_active_project_id(None)
+
+    try:
+        await meta_db.execute("DELETE FROM projects WHERE id = ?", [project_id])
+        # 同时删除该项目下的 agents 记录
+        await meta_db.execute(
+            "DELETE FROM agents WHERE project_id = ?", [project_id]
+        )
+    except Exception as e:
+        log.error("delete_project_failed", project_id=project_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to delete project")
+
+    log.info("project_deleted", project_id=project_id)
+    return {"ok": True}
+
+
+@router.get("/{project_id}/activate")
+async def activate_project(project_id: str) -> dict:
+    """激活项目。"""
+    row = await meta_db.query_one(
+        "SELECT id FROM projects WHERE id = ?", [project_id]
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    await _set_active_project_id(project_id)
+    return {"ok": True, "projectId": project_id}
+
+
+@router.get("/{project_id}/deactivate")
+async def deactivate_project(project_id: str) -> dict:
+    """取消激活项目。"""
+    row = await meta_db.query_one(
+        "SELECT id FROM projects WHERE id = ?", [project_id]
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    active_id = await _get_active_project_id()
+    if active_id == project_id:
+        await _set_active_project_id(None)
+    return {"ok": True, "projectId": project_id}
+
+
+@router.post("/{project_id}/goals")
+async def update_project_goals(project_id: str, body: CharterGoalsUpdate) -> dict:
+    """更新 charter goals 段（合并写入 charter_json）。"""
+    row = await meta_db.query_one(
+        "SELECT charter_json FROM projects WHERE id = ?", [project_id]
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    charter_raw = row["charter_json"]
+    charter: dict = {}
+    if charter_raw:
+        try:
+            charter = json.loads(charter_raw) if isinstance(charter_raw, str) else charter_raw
+        except (json.JSONDecodeError, TypeError):
+            charter = {}
+    charter["goals"] = body.goals
+    try:
+        await meta_db.execute(
+            "UPDATE projects SET charter_json = ?, updated_at = ? WHERE id = ?",
+            [json.dumps(charter, ensure_ascii=False), int(time.time() * 1000), project_id],
+        )
+    except Exception as e:
+        log.error("update_goals_failed", project_id=project_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to update goals")
+    return {"ok": True}
