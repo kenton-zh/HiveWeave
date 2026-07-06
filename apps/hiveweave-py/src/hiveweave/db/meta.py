@@ -29,15 +29,13 @@ _migrated: bool = False
 
 
 # ── Schema migration ───────────────────────────────────────
-# Python 后端复用 TS 后端创建的 Meta DB（packages/db/data/hiveweave.db），
-# 但 TS 创建的表可能缺少 Python 期望的某些列。以下迁移在创建表之后执行，
-# 用 ALTER TABLE ADD COLUMN 补齐缺失列，try/except 忽略"列已存在"错误。
+# Meta DB 现位于 apps/hiveweave-py/data/hiveweave.db。
+# 早期复用 TS 后端创建的 DB，可能缺少 Python 期望的某些列；
+# 以下迁移在创建表之后执行，用 ALTER TABLE ADD COLUMN 补齐，try/except 忽略"列已存在"。
 #
-# 对比依据：
-#   Python schema: apps/hiveweave-py/src/hiveweave/db/schema.py (META_DB_TABLES)
-#   TS schema:     packages/db/src/schema/*.ts + packages/db/src/client.ts
+# Python schema: apps/hiveweave-py/src/hiveweave/db/schema.py (META_DB_TABLES)
 #
-# 缺失列清单（TS 表已存在但缺列）：
+# 缺失列清单（旧 TS 表已存在但缺列）：
 #   projects:        language, updated_at
 #   agents:          workspace_path, language  （TS Drizzle schema 无此两列）
 #   agent_templates: updated_at                （TS schema 无此列）

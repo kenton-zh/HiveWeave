@@ -9,34 +9,28 @@ echo   HiveWeave Environment Setup
 echo ============================================
 echo.
 
-REM --- Check Erlang ---
-where erl >nul 2>&1
+REM --- Check Python ---
+where python >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] Erlang/OTP not found in PATH.
+    echo [ERROR] Python not found in PATH.
     echo.
-    echo Please install Erlang/OTP 26 from:
-    echo   https://www.erlang.org/downloads
+    echo Please install Python 3.12+ from:
+    echo   https://www.python.org/downloads/
     echo.
-    echo After installing, add the bin folder to your PATH.
-    echo Example: set PATH=C:\Program Files\erl-26.0\bin;%%PATH%%
+    echo After installing, ensure Python is in your PATH.
     echo.
     pause
     exit /b 1
 )
-echo [OK] Erlang found
+echo [OK] Python found
 
-REM --- Check Elixir ---
-where mix >nul 2>&1
+REM --- Check uv ---
+where uv >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] Elixir not found in PATH.
-    echo.
-    echo Please install Elixir from:
-    echo   https://elixir-lang.org/install.html
-    echo.
-    pause
-    exit /b 1
+    echo [INFO] Installing uv...
+    pip install uv
 )
-echo [OK] Elixir found
+echo [OK] uv ready
 
 REM --- Check Node.js ---
 where node >nul 2>&1
@@ -56,17 +50,17 @@ if %errorlevel% neq 0 (
 )
 echo [OK] pnpm ready
 
-REM --- Install Elixir dependencies ---
+REM --- Install Python backend dependencies ---
 echo.
-echo [INFO] Installing Elixir dependencies...
-cd /d "%~dp0apps\hiveweave"
-mix deps.get
+echo [INFO] Installing Python backend dependencies...
+cd /d "%~dp0apps\hiveweave-py"
+uv sync
 if %errorlevel% neq 0 (
-    echo [ERROR] Failed to install Elixir deps.
+    echo [ERROR] Failed to install Python deps.
     pause
     exit /b 1
 )
-echo [OK] Elixir dependencies installed
+echo [OK] Python backend dependencies installed
 
 REM --- Install frontend dependencies ---
 echo.
