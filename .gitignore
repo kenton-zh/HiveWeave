@@ -91,6 +91,8 @@ tsc_out.txt
 test_main_started.txt
 test_output.txt
 test-screenshots/
+test-*/
+test_*/
 frontend-e2e-test.mjs
 apps/web/frontend-e2e-test.mjs
 
