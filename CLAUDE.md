@@ -5,172 +5,117 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-pnpm install              # Install all dependencies
-pnpm dev                  # Start dev server + web (turborepo parallel)
-pnpm build                # Full build (turbo build)
-pnpm typecheck            # Type-check all packages
-pnpm -C apps/server dev   # Run server only (tsx watch, port 3200)
-pnpm -C apps/web dev      # Run web only (Vite dev server, port 5173)
-pnpm db:push              # Push Drizzle schema to SQLite
-pnpm db:studio            # Open Drizzle Studio for DB inspection
-```
+# 前端 (Node.js + pnpm)
+pnpm install              # 安装前端依赖
+pnpm dev                  # 启动 web dev server (turbo, port 5173)
+pnpm build                # 构建 web
 
-- No test suite exists yet. When adding tests, configure the test runner per-package.
-- `pnpm db:push` is **not** a migration — it diff-pushes schema directly. Only run after schema changes.
+# 后端 (Python + uvicorn)
+cd apps/hiveweave-py
+uv sync                   # 安装 Python 依赖 (或 pip install -e .)
+uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000
+
+# 或用启动脚本 (Windows)
+start-all.bat             # 后端 4000 + 前端 5173
+start-backend.bat         # Python/FastAPI, 端口 4000
+start-frontend.bat        # React/Vite, 端口 5173
+```
 
 ### Node version
 
-The project requires Node `>=22.0.0 <24.0.0`. The system has both Node 24 (global) and Node 22 (portable, at `%LOCALAPPDATA%\Programs\node-v22.20.0-win-x64`). Before running any pnpm/node command, prepend Node 22 to PATH:
+前端需要 Node `>=22.0.0 <24.0.0`。系统同时装有 Node 24 (全局) 和 Node 22 (便携版, `%LOCALAPPDATA%\Programs\node-v22.20.0-win-x64`)。运行 pnpm/node 命令前,将 Node 22 加入 PATH:
 
 ```bash
 export PATH="$LOCALAPPDATA/Programs/node-v22.20.0-win-x64:$PATH"
 ```
 
-`better-sqlite3` is a native module — if you switch Node versions, you must `rm -rf node_modules && pnpm install` to rebuild it.
-
 ## Architecture
 
-### Monorepo layout (pnpm + Turborepo)
+### 项目结构
 
 ```
-apps/server/     @hiveweave/server     Fastify API (port 3200)
-apps/web/        @hiveweave/web        React 19 + Vite + React Flow (port 5173)
-packages/shared/ @hiveweave/shared     Zod schemas, types, game-time utils, charter logic
-packages/db/     @hiveweave/db         Drizzle ORM + better-sqlite3, schema definitions
-packages/core/   @hiveweave/core       Business logic: 20+ services, tools, MCP, token utils
-packages/agent-runtime/  @hiveweave/agent-runtime  AI SDK wrapper, retry, overflow detection
+apps/hiveweave-py/     @hiveweave Python 后端 — FastAPI (port 4000)
+apps/web/              @hiveweave/web   React 19 + Vite + React Flow (port 5173)
 ```
 
-Dependency chain: `server → core → db → shared` and `server → agent-runtime → shared`. The web app only depends on `shared`.
+后端是纯 Python,前端是纯 React。前端通过 pnpm workspace 管理,后端通过 uv 管理。
+
+### Python 后端 (`apps/hiveweave-py/`)
+
+FastAPI + uvicorn,运行在端口 4000。核心模块:
+
+| 目录 | 职责 |
+|------|------|
+| `src/hiveweave/api/` | FastAPI 路由 (19 个模块, 96 路由) |
+| `src/hiveweave/agents/` | Agent + Supervisor + trigger |
+| `src/hiveweave/llm/` | LLM 流式调用 (streamer, provider, retry, circuit_breaker) |
+| `src/hiveweave/tools/` | 工具执行器 + 11 个内置工具 |
+| `src/hiveweave/services/` | 23 个业务服务 (org, dispatch, memory, handoff, ...) |
+| `src/hiveweave/conversation/` | 对话历史 + token budget + compaction |
+| `src/hiveweave/db/` | Meta DB + per-project DB (aiosqlite) |
+| `src/hiveweave/realtime/` | WebSocket (phoenix_adapter, channels, pubsub, event_bus) |
+| `src/hiveweave/prompts/` | ETHOS 提示词体系 |
+| `src/hiveweave/config.py` | pydantic-settings 配置 |
+| `src/hiveweave/main.py` | FastAPI app + lifespan |
 
 ### Dual-DB pattern
 
-There are **two SQLite database tiers**:
+两层 SQLite:
 
-1. **Meta DB** (`data/hiveweave.db`, WAL mode) — global tables: `projects`, `agent-templates`, `llm-models`, `global-settings`. One per server process.
-2. **Per-project DB** (one per workspace, DELETE journal mode) — project-scoped tables: `agents`, `memories`, `chat-messages`, `handoffs`, `inbox`, etc. Isolated per workspace.
+1. **Meta DB** (`apps/hiveweave-py/data/hiveweave.db`, WAL mode) — 全局表: `projects`, `agent-templates`, `llm-models`, `global-settings`。每个服务器进程一个。
+2. **Per-project DB** (每个工作区一个, DELETE journal mode) — 项目级表: `agents`, `memories`, `chat-messages`, `handoffs`, `inbox` 等。按工作区隔离。
 
-`ensureProjectDb(workspacePath)` lazily creates a per-project DB. Agent lookups go through `lookupAgentWorkspace()` → `getProjectDbForAgent()`.
+`ensureProjectDb(workspace_path)` 懒创建 per-project DB。
 
-### Agent runtime and AI SDK
+### LLM 流式调用
 
-`@hiveweave/agent-runtime` wraps Vercel `ai` SDK (`streamText`/`generateText`):
+`apps/hiveweave-py/src/hiveweave/llm/streamer.py` — httpx 流式 SSE,支持多 provider:
+- `provider.py`: provider 工厂,映射 `openai`/`anthropic`/`google` 到对应 API
+- `retry.py`: 429/503/504/529 重试,指数退避 + jitter,解析 `Retry-After`
+- `circuit_breaker.py`: 熔断器,探针锁防止多 Agent 同时冲击不稳定 API
+- Token 估算: char-ratio 启发式 (4 chars/token EN, ~1.5 CJK),预留 20K compaction buffer
 
-- **ProviderFactory** (`provider-factory.ts`): Maps `openai`/`anthropic`/`google` provider strings to AI SDK providers. Any unrecognized provider falls back to `@ai-sdk/openai-compatible` (covers DeepSeek, Groq, TogetherAI, etc.).
-- **Retry logic** (`retry-utils.ts`): Up to 2 retries on status 429/503/504/529, exponential backoff with jitter, `Retry-After` header parsing (OpenAI + Anthropic rate-limit headers).
-- **Context overflow detection**: Estimates tokens via char-ratio heuristic (4 chars/token English, ~1.5 for CJK), reserves `COMPACTION_BUFFER` (20K) for model output, trims history before hitting the model's context window.
-- **ToolOutputStore** (`tool-output-store.ts`): When tool output exceeds 2K lines or 50KB, the full output is saved to temp files (7-day retention) and a truncated preview is returned to the agent. Aligned with OpenCode's truncation pattern.
+### 对话管理
 
-### Conversation management
+`apps/hiveweave-py/src/hiveweave/conversation/store.py`:
+- **Token-budget 裁剪**: 按 token 预算裁剪历史,不按消息数。Turn 级裁剪 — 不拆分 `assistant(tool_calls)` / `tool(result)` 对
+- **智能压缩**: 旧 turn 被淘汰时,`compaction.py` 通过 LLM 摘要为结构化 handoff,prepend 到近期历史
+- **懒加载**: 历史从 DB 首次访问时加载,之后内存缓存
 
-`conversationStore` (`packages/core/src/conversation-store.ts`) persists per-agent conversation history to the `conversation_turns` table:
+### 工具系统
 
-- **Token-budget trimming**: History is trimmed by token budget (derived from model context window), not message count. Turn-level trimming — never splits `assistant(tool_calls)` / `tool(result)` pairs.
-- **Smart compaction**: When old turns must be evicted, a `compactor` callback can summarize them via LLM into a structured handoff prepended to recent history.
-- **DeepSeek prefix caching**: Identity prompt (first system msg) stays constant for cache hits; dynamic context (memories, handoffs) goes in a second system message; compacted prefix as a third.
-- **Lazy loading**: History loaded from DB on first access, then cached in memory.
+`apps/hiveweave-py/src/hiveweave/tools/executor.py` — 11 个内置工具: `bash`, `file`, `patch`, `grep`, `websearch`, `review`, `question`, `todowrite`, `security`。权限矩阵控制:
+- **Coordinator**: 只读文件,不能写代码
+- **Executor**: 可读写代码,运行测试
 
-### Agent tool system
+MCP 集成在 `apps/hiveweave-py/src/hiveweave/services/mcp.py`。
 
-Six built-in tools in `packages/core/src/tools/`: `bash`, `grep`, `apply-patch`, `question`, `todowrite`, `websearch`. Each exported as an Effect-based function. The `ToolExecutor` (`tool-executor.ts`) wraps them with:
-- **Permission gating**: Coordinator agents can only read, not execute. Executor agents can write code and run tests.
-- **Tool-binding registry**: Agents can be assigned specific tools, skills, and MCP servers via a config-driven registry.
-- **MCP integration**: `mcpService` (`mcp/mcp-service.ts`) manages MCP server lifecycle and tool discovery.
+### 实时通信
 
-### Agent types and permissions
+`apps/hiveweave-py/src/hiveweave/realtime/phoenix_adapter.py` — 兼容前端 phoenix.js WebSocket 协议 (`/socket/websocket`)。3 个 channel: lobby, project, agent。
 
-Two agent permission types (from `shared/src/agent.ts`):
-- **Coordinator** (架构师/经理): Can read subordinate logs/code, approve/reject work, spawn/dismiss agents, trigger integration tests. Cannot write code.
-- **Executor** (叶子Agent): Can read/write code, run tests, write work logs. Cannot spawn sub-agents or read other agents' private memory.
+### Agent 类型与组织
 
-### Organization structure
+- **Coordinator** (架构师/经理): 可读下级日志/代码,审批工作,spawn/dismiss agent。不能写代码。
+- **Executor** (叶子 Agent): 可读写代码,运行测试,写工作日志。不能 spawn 下级。
 
-Agents form a dynamic tree hierarchy. The CEO (root) is auto-created per project. HR (under CEO) handles staffing. Expert agents (test_engineer, code_reviewer, security_auditor, web_perf_auditor) are on-demand executors — they're only invoked when scheduled, avoiding idle token burn.
+CEO (root) 每项目自动创建。HR (CEO 下级) 负责招聘。Expert agents 按需调用。
 
-### Game time system
+### Game time
 
-Simulated project time at 15 real-minutes per game day (`REAL_SECONDS_PER_GAME_DAY = 900`). A 5-second tick persists time and fires due alarms. Agents can schedule alarms at game-time offsets, and stalled agents (15+ min inactivity) trigger escalation to superiors.
+模拟项目时间,`REAL_SECONDS_PER_GAME_DAY = 3600` (1 真实小时 = 1 游戏天)。5 秒 tick 持久化时间并触发到期告警。停滞 Agent (15+ 分钟无活动) 触发升级到上级。
 
-### Frontend state
+### 前端
 
-React 19 + Zustand for global state (`store.ts`). React Flow renders the org chart. Key panels: ChatPanel, OrgTree, AgentNode, GoalsPanel, QuestionDialog. API calls go through `api.ts` → Fastify routes under `/api/*`. Web supports Electron embedding (`pnpm electron:dev`).
+React 19 + Zustand (`store.ts`)。React Flow 渲染组织架构图。关键面板: ChatPanel, OrgTree, AgentNode, GoalsPanel, QuestionDialog。API 调用通过 `api.ts` → FastAPI 路由 (`/api/*`)。WebSocket 通过 phoenix.js。Electron 桌面端支持 (`apps/web/electron/main.cjs`)。
 
-### Key services in `@hiveweave/core`
+### 环境变量
 
-| Service | Purpose |
-|---------|---------|
-| `OrgService` | CRUD for agents, tree traversal, role lookup |
-| `DispatchService` | Task dispatch between agents |
-| `MemoryService` | Three-layer memory (project/agent-private/archive) |
-| `HandoffService` | Agent handoff lifecycle (dismiss → summarize → transfer → archive) |
-| `InboxService` | Message delivery with urgency levels |
-| `ApprovalService` | Async approval flow (request → wait → resolve/cancel) |
-| `RosterService` | Personnel records (position, department, responsibilities) |
-| `ProjectService` | Project CRUD, goals, enterprise metadata |
-| `SettingsService` | Global key-value settings (e.g., operatorName) |
-| `GameTimeService` | Per-project simulated clock |
-| `AlarmService` | Scheduled alarms on game time |
-| `ModelService` | LLM model registry CRUD |
-| `TemplateService` | Agent template CRUD |
-| `FileService` | Filesystem read/write within project workspace |
-| `ShellService` | Bash execution with Docker sandbox support |
-| `WebService` | URL fetching with JSDOM |
-| `ClawHubService` | Plugin/skill marketplace |
-| `TeamChatService` | Multi-agent group chat |
-| `ChatMessageService` | Chat message persistence |
-| `PermissionService` | Tool permission checking |
-| `CommunicationService` | Cross-agent communication tracking + user ping notifications |
+- `HIVEWEAVE_OPENCODE_API_KEY` — OpenCode API key (所有 AI 请求)
+- `HIVEWEAVE_META_DB_PATH` — 覆盖 Meta DB 路径 (默认: `apps/hiveweave-py/data/hiveweave.db`)
+- `HIVEWEAVE_API_KEY` — API key auth (未设则开放)
+- 其他 provider keys: `HIVEWEAVE_OPENAI_API_KEY`, `HIVEWEAVE_ANTHROPIC_API_KEY` 等
 
-### Effect usage
+## Migration history
 
-The codebase uses Effect (`effect` + `@effect/schema`) in `ToolExecutor` and tool implementations for typed error handling and composable execution chains. The agent-runtime package intentionally avoids Effect to keep the AI SDK wrapper lightweight.
-
-### Environment variables
-
-- `PORT` — server port (default: 3200)
-- `DB_PATH` — override meta DB path (default: `packages/db/data/hiveweave.db`)
-- `BASH_SANDBOX` — set to `docker` for Docker sandboxing of bash tool
-- Model API keys: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, etc. — per provider, read from env by the model registry
-
-## gstack (REQUIRED — global install)
-
-**Before doing ANY work, verify gstack is installed:**
-
-```bash
-test -d ~/.claude/skills/gstack/bin && echo "GSTACK_OK" || echo "GSTACK_MISSING"
-```
-
-If GSTACK_MISSING: STOP. Do not proceed. Tell the user:
-
-> gstack is required for all AI-assisted work in this repo.
-> Install it:
-> ```bash
-> git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack
-> cd ~/.claude/skills/gstack && ./setup --team
-> ```
-> Then restart your AI coding tool.
-
-Do not skip skills, ignore gstack errors, or work around missing gstack.
-
-Using gstack skills: After install, skills like /qa, /ship, /review, /investigate,
-and /browse are available. Use /browse for all web browsing.
-Use ~/.claude/skills/gstack/... for gstack file paths (the global path).
-
-## Skill routing
-
-When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
-
-Key routing rules:
-- Product ideas/brainstorming → invoke /office-hours
-- Strategy/scope → invoke /plan-ceo-review
-- Architecture → invoke /plan-eng-review
-- Design system/plan review → invoke /design-consultation or /plan-design-review
-- Full review pipeline → invoke /autoplan
-- Bugs/errors → invoke /investigate
-- QA/testing site behavior → invoke /qa or /qa-only
-- Code review/diff check → invoke /review
-- Visual polish → invoke /design-review
-- Ship/deploy/PR → invoke /ship or /land-and-deploy
-- Save progress → invoke /context-save
-- Resume context → invoke /context-restore
-- Author a backlog-ready spec/issue → invoke /spec
+本项目从 Elixir/Phoenix + Node.js/Fastify 双后端迁移到 Python/FastAPI 单后端。迁移文档在 `docs/migration/`。

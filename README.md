@@ -47,11 +47,10 @@ Claude Code、Cursor 这类工具是一个"全能型"Agent 独立完成所有工
 - **记忆继承** — Agent 离职时正式交接（解散 → 总结 → 移交 → 归档 → 可复活），记忆可沿袭给继任者
 - **Merge 合并** — 冲突检测 → 仲裁 → 合成新记忆，支持多 Agent 知识融合
 
-### BEAM 进程级容错
-- **进程隔离** — 每个 Agent 运行在独立 BEAM 进程中，单个 Agent 崩溃不会拖垮其他 Agent 或系统
+### asyncio 任务级容错
+- **任务隔离** — 每个 Agent 运行在独立 asyncio task 中，单个 Agent 崩溃不会拖垮其他 Agent 或系统
 - **熔断器** — LLM 提供商故障时自动熔断，带探针锁防止多个 Agent 同时冲击不稳定的 API
 - **自动重试** — 429/503/504/529 指数退避 + jitter，解析 `Retry-After` 头
-- **Supervisor 重启策略** — `max_restarts` 限制防止崩溃风暴
 
 ### 长任务支持
 - **多轮工具循环** — 执行者单次触发最多 80 轮工具调用，协调者最多 60 轮
@@ -92,61 +91,39 @@ Claude Code、Cursor 这类工具是一个"全能型"Agent 独立完成所有工
 
 | 层级 | 技术 |
 |------|------|
-| **活跃后端** | Elixir 1.17 + Phoenix + Bandit（端口 4000） |
-| **遗留后端** | Node.js + Fastify + TypeScript（端口 3200，仅参考，勿启动） |
+| **后端** | Python 3.12 + FastAPI + Uvicorn（端口 4000） |
 | **前端** | React 19 + Vite + React Flow + Electron（端口 5173） |
-| **数据库** | SQLite + Ecto（Elixir）/ Drizzle ORM（TS 遗留） |
-| **AI SDK** | `ai` SDK + Provider Factory（TS 参考）；Elixir 原生 OpenAI 兼容流式实现 |
-| **函数式编程** | Effect（TS 参考）/ Elixir 原生 |
-| **MCP** | `@modelcontextprotocol/sdk`（TS）/ 内置 `mcp_call`（Elixir） |
-| **沙箱** | Docker（TS `BASH_SANDBOX=docker`） |
-| **运行时** | Erlang/OTP 26 + Node.js 22.x + pnpm 10 + Turbo |
+| **数据库** | SQLite + aiosqlite（Meta DB WAL + Per-project DB DELETE journal） |
+| **AI/LLM** | httpx 流式 SSE + provider factory，OpenAI 兼容多 provider |
+| **实时通信** | phoenix.js（前端）+ phoenix_adapter（后端）WebSocket |
+| **MCP** | 内置 `mcp_call`，可对接任意 MCP 服务器 |
+| **沙箱** | Docker（`BASH_SANDBOX=docker`） |
+| **运行时** | Python >=3.12 + Node.js >=22 <24 + pnpm 10 + Turbo |
 
 ## 项目结构
 
 ```
 hiveweave/
 ├── apps/
-│   ├── hiveweave/                  # ✅ 活跃后端 — Elixir/Phoenix (port 4000)
-│   │   └── lib/
-│   │       ├── hiveweave/
-│   │       │   ├── agents/         # Agent GenServer (3-state + self-retrigger)
-│   │       │   ├── llm/            # streamer, circuit_breaker, provider_factory, retry
-│   │       │   ├── services/       # 16 services (org, dispatch, memory, handoff, ...)
-│   │       │   ├── tool_executor.ex # 30+ tools (bash, file ops, grep, websearch, MCP, ...)
-│   │       │   ├── conversation_store.ex
-│   │       │   └── compaction/     # context overflow handling
-│   │       └── hiveweave_web/
-│   │           ├── channels/       # WebSocket (lobby, project, agent)
-│   │           ├── controllers/    # 8 controllers + API key auth plug
-│   │           └── router.ex
-│   ├── server/                     # ⚠️ 遗留后端 — TS/Fastify (port 3200)，仅参考，勿启动
-│   │   └── src/
-│   │       ├── routes/             # API 路由 (chat, org, projects, fs, mcp, ...)
-│   │       └── game-time-scheduler.ts
-│   └── web/                        # 前端应用 — React 19 + Vite + Electron (port 5173)
+│   ├── hiveweave-py/              # 后端 — Python/FastAPI (port 4000)
+│   │   └── src/hiveweave/
+│   │       ├── agents/            # Agent + Supervisor + trigger
+│   │       ├── api/               # FastAPI 路由 (19 模块, 96 路由)
+│   │       ├── llm/               # streamer, circuit_breaker, provider, retry
+│   │       ├── services/          # 23 services (org, dispatch, memory, handoff, ...)
+│   │       ├── tools/             # executor + 11 工具模块 (bash, file, grep, ...)
+│   │       ├── conversation/      # 对话历史 + token budget + compaction
+│   │       ├── db/                # Meta DB + per-project DB (aiosqlite)
+│   │       ├── realtime/          # phoenix_adapter, channels, pubsub, event_bus
+│   │       └── prompts/           # ETHOS 提示词体系
+│   └── web/                       # 前端应用 — React 19 + Vite + Electron (port 5173)
 │       └── src/
-│           ├── components/         # 组件 (ChatPanel, OrgTree, AgentNode, ...)
-│           ├── store.ts            # 全局状态
-│           └── api.ts              # API 调用封装
-├── packages/
-│   ├── agent-runtime/              # Agent 执行引擎（TS 参考实现）
-│   │   └── src/
-│   │       ├── agent-runtime.ts    # 核心运行时 (streamText/generateText)
-│   │       ├── permissions.ts      # 工具权限控制
-│   │       └── provider-factory.ts # 模型 Provider 工厂
-│   ├── core/                       # 业务核心服务 (25+ services，TS 参考实现)
-│   │   └── src/
-│   │       ├── services/           # OrgService, ModelService, DispatchService, ...
-│   │       ├── tools/              # bash, grep, apply-patch, question, todowrite, websearch
-│   │       ├── mcp/                # MCP 服务管理
-│   │       └── index.ts            # 统一导出
-│   ├── db/                         # 数据库层
-│   │   └── src/schema/             # 19 张表 (agents, projects, memories, ...)
-│   └── shared/                     # 跨包共享类型/工具
-│       └── src/                    # agent, api, charter, game-time, handoff, memory, ...
+│           ├── components/        # 组件 (ChatPanel, OrgTree, AgentNode, ...)
+│           ├── utils/             # game-time, role-styles, ...
+│           ├── store.ts           # 全局状态
+│           └── api.ts             # API 调用封装
 └── docs/
-    └── AI工程组织_MVP蓝图.md        # 产品蓝图
+    └── migration/                 # 迁移历史文档
 ```
 
 ## 数据模型（19 张表）
@@ -174,31 +151,28 @@ hiveweave/
 
 ## 快速开始
 
-> **Erlang/Elixir 在非标准路径，不在系统 PATH 中。** 请使用启动脚本，它们会自动设置 PATH。
-
 ```bash
 # 启动后端 + 前端（分别在独立窗口）
 start-all.bat
 
 # 或单独启动
-start-backend.bat     # Elixir/Phoenix，端口 4000
+start-backend.bat     # Python/FastAPI，端口 4000
 start-frontend.bat    # React/Vite，端口 5173
 
 # 浏览器打开 http://localhost:5173
 ```
 
-TS 包的依赖安装与构建（仅参考实现需要）：
+后端依赖安装：
 
 ```bash
-# 安装依赖（Node 22 + pnpm 10）
+cd apps/hiveweave-py
+uv sync               # 或 pip install -e .
+```
+
+前端依赖安装：
+
+```bash
 pnpm install
-
-# 初始化 TS 遗留数据库（仅使用 TS 后端时需要）
-pnpm db:push
-
-# 类型检查 / 构建
-pnpm turbo typecheck
-pnpm build
 ```
 
 ## 文档

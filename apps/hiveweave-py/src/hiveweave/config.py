@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     port: int = 4000  # 契约 constants.md: 前端兼容性，端口 4000
 
     # Meta DB
-    # 契约 11: Meta DB 默认路径 packages/db/data/hiveweave.db
+    # 契约 11: Meta DB 默认路径 apps/hiveweave-py/data/hiveweave.db
     # Elixir 用 HIVEWEAVE_META_DB_PATH，TS 用 HIVEWEAVE_DB_PATH
     meta_db_path: str = ""
 
@@ -38,10 +38,11 @@ class Settings(BaseSettings):
         """Return resolved Meta DB path."""
         if self.meta_db_path:
             return self.meta_db_path
-        # Default: <repo_root>/packages/db/data/hiveweave.db
-        # From apps/hiveweave-py/ that's ../../packages/db/data/hiveweave.db
-        repo_root = Path(__file__).resolve().parents[4]
-        return str(repo_root / "packages" / "db" / "data" / "hiveweave.db")
+        # Default: apps/hiveweave-py/data/hiveweave.db
+        # config.py 位于 apps/hiveweave-py/src/hiveweave/config.py
+        # parents[2] = apps/hiveweave-py/
+        app_root = Path(__file__).resolve().parents[2]
+        return str(app_root / "data" / "hiveweave.db")
 
 
 settings = Settings()

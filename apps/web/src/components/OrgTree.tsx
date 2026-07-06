@@ -5,7 +5,7 @@ import ApprovalDialog from "./ApprovalDialog";
 import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings, getProjectAlarms } from "../api";
 import { useAppStore, type AgentAlarmInfo } from "../store";
 import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
-import { realMsToGameSeconds, gameSecondsToRealMs, decomposeGameSeconds } from "@hiveweave/shared";
+import { realMsToGameSeconds, gameSecondsToRealMs, decomposeGameSeconds } from "../utils/game-time";
 
 // ── Types ──────────────────────────────────────────────────────
 
