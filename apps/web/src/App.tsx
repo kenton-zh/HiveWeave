@@ -15,8 +15,8 @@ import QuestionDialog from "./components/QuestionDialog";
 import NewProjectDialog from "./components/NewProjectDialog";
 import ToastContainer from "./components/Toast";
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings } from "./api";
-import type { Project } from "./api";
+import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings } from "./api";
+import type { DeleteProjectResponse, Project } from "./api";
 
 function App() {
   const selectedAgentId = useAppStore((s) => s.selectedAgentId);
@@ -54,16 +54,29 @@ function App() {
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
+  const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
+  const [queuedDeleteIds, setQueuedDeleteIds] = useState<string[]>([]);
+  const deleteQueueRef = useRef<Array<{ id: string; name: string }>>([]);
+  const deleteRunningRef = useRef(false);
+
 
   // Load projects on mount
   useEffect(() => {
     async function load() {
       try {
+        // Clear any stale delete UI from a prior session / HMR
+        deleteQueueRef.current = [];
+        deleteRunningRef.current = false;
+        setDeletingProjectId(null);
+        setQueuedDeleteIds([]);
+
         const list = await getProjects();
         setProjects(list);
-        if (list.length > 0) {
-          // Validate selectedProjectId — if it doesn't exist in the list, switch to the first one
-          const current = useAppStore.getState().selectedProjectId;
+        const current = useAppStore.getState().selectedProjectId;
+        if (list.length === 0) {
+          setSelectedProjectId(null);
+          setSelectedAgent(null);
+        } else {
           const exists = current && list.some((p) => p.id === current);
           if (!exists) {
             setSelectedProjectId(list[0].id);
@@ -86,6 +99,21 @@ function App() {
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
   }, []);
+
+
+  // Safety net: never leave "正在删除项目" stuck if the queue died mid-flight.
+  useEffect(() => {
+    if (!deletingProjectId && queuedDeleteIds.length === 0) return;
+    const timer = window.setTimeout(() => {
+      if (!deleteRunningRef.current) return;
+      console.warn("[App] Delete UI state timed out — resetting");
+      deleteQueueRef.current = [];
+      deleteRunningRef.current = false;
+      setDeletingProjectId(null);
+      setQueuedDeleteIds([]);
+    }, 125_000);
+    return () => window.clearTimeout(timer);
+  }, [deletingProjectId, queuedDeleteIds.length]);
 
   // Subscribe to real-time agent processing status
   useEffect(() => {
@@ -162,57 +190,116 @@ function App() {
       const updated = await getProjects();
       setProjects(updated);
       setSelectedProjectId(project.id);
-      setSelectedAgent(null);
       clearChatSessions();
       refreshOrgTree();
       setShowProjectMenu(false);
-      // Show the new-project onboarding dialog
+      // Show the new-project onboarding dialog — but ONLY after selecting
+      // the CEO agent so ChatPanel mounts and WebSocket channel joins.
+      // This fixes the bug where clicking an onboarding option sends a message
+      // that never reaches the backend because the channel hasn't joined yet.
       if (mainAgentId) {
         setNewProjectCEO(mainAgentId);
-        setShowNewProjectDialog(true);
+        // Select CEO first so ChatPanel mounts + channel joins
+        setSelectedAgent(mainAgentId);
+        // Delay showing dialog to let ChatPanel mount and WS channel join
+        setTimeout(() => {
+          setShowNewProjectDialog(true);
+        }, 1500);
       }
     } catch (err) {
       console.error("Failed to create project:", err);
     }
   };
 
-  const handleDeleteProject = async (id: string) => {
-    const proj = projects.find((p) => p.id === id);
-    if (!proj) return;
-    if (!confirm(`确定删除项目「${proj.name}」吗？所有相关数据将被永久删除。`)) return;
-    try {
-      await deleteProject(id);
-      const updated = await getProjects();
-      setProjects(updated);
-      if (selectedProjectId === id) {
-        const next = updated[0]?.id || null;
-        setSelectedProjectId(next);
-        setSelectedAgent(null);
-        clearChatSessions();
-        refreshOrgTree();
-      }
-      setShowProjectMenu(false);
-      showToast(`项目「${proj.name}」已删除`, "success");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "未知错误";
-      console.error("Failed to delete project:", err);
-      // 404 means the project is already gone from the backend — treat as
-      // success: refresh the list so the stale entry is removed from the UI.
-      if (msg.includes("404")) {
-        const updated = await getProjects();
-        setProjects(updated);
-        if (selectedProjectId === id) {
-          setSelectedProjectId(updated[0]?.id || null);
-          setSelectedAgent(null);
-          clearChatSessions();
-          refreshOrgTree();
-        }
-        setShowProjectMenu(false);
-        showToast(`项目「${proj.name}」已删除`, "success");
-      } else {
-        showToast(`删除项目失败: ${msg}`, "error");
-      }
+  const detachDeletedProject = (id: string, remaining: Project[]) => {
+    if (useAppStore.getState().selectedProjectId !== id) return;
+    const next = remaining[0]?.id ?? null;
+    const activeAgentId = useAppStore.getState().selectedAgentId;
+    if (activeAgentId) {
+      try { leaveAgentChannel(activeAgentId); } catch { /* noop */ }
     }
+    setSelectedProjectId(next);
+    setSelectedAgent(null);
+    clearChatSessions();
+    setProcessingAgents([]);
+    setShowNewProjectDialog(false);
+    setNewProjectCEO(null);
+    refreshOrgTree();
+  };
+
+
+  const showDeleteCleanupToasts = (result: DeleteProjectResponse | undefined) => {
+    if (!result) return;
+    const wc = result.workspaceCleanup;
+    if (wc?.status === "skipped" && wc.reason === "shared") {
+      const peers = wc.sharedWith?.length ? wc.sharedWith.join(", ") : "其他项目";
+      showToast(`工作区 .hiveweave 已保留（与 ${peers} 共享路径）`, "info");
+    }
+    if (wc?.status === "scheduled") {
+      showToast("平台数据目录正在后台清理，请稍候", "info");
+    }
+    if (wc?.status === "failed") {
+      const suffix = wc.pendingDir ? `：${wc.pendingDir}` : "";
+      showToast(`工作区清理未完成${suffix}`, "error");
+    }
+    if (result.dbLeftover) {
+      showToast("部分数据库文件可能仍残留在磁盘上", "error");
+    }
+  };
+
+
+  const runDeleteQueue = async () => {
+    if (deleteRunningRef.current) return;
+    deleteRunningRef.current = true;
+    try {
+      while (deleteQueueRef.current.length > 0) {
+        const item = deleteQueueRef.current.shift()!;
+        setDeletingProjectId(item.id);
+        try {
+          const deleteResult = await deleteProject(item.id);
+          showToast(`项目「${item.name}」已删除`, "success");
+          showDeleteCleanupToasts(deleteResult);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "未知错误";
+          console.error("Failed to delete project:", err);
+          if (msg.includes("404") || msg.toLowerCase().includes("abort")) {
+            showToast(`项目「${item.name}」已删除`, "success");
+          } else {
+            showToast(`删除项目「${item.name}」失败: ${msg}`, "error");
+          }
+        }
+        try {
+          const updated = await getProjects();
+          setProjects(updated);
+          detachDeletedProject(item.id, updated);
+        } catch (err) {
+          console.error("Failed to refresh projects after delete:", err);
+          detachDeletedProject(item.id, useAppStore.getState().projects);
+        } finally {
+          setQueuedDeleteIds((prev) => prev.filter((id) => id !== item.id));
+        }
+      }
+    } finally {
+      setDeletingProjectId(null);
+      setQueuedDeleteIds([]);
+      deleteRunningRef.current = false;
+    }
+  };
+
+  const handleDeleteProject = (id: string) => {
+    const currentProjects = useAppStore.getState().projects;
+    const proj = currentProjects.find((p) => p.id === id);
+    if (!proj) return;
+    if (deleteQueueRef.current.some((item) => item.id === id)) return;
+    if (!confirm(`确定删除项目「${proj.name}」吗？所有相关数据将被永久删除。`)) return;
+
+    const remaining = currentProjects.filter((p) => p.id !== id);
+    setProjects(remaining);
+    detachDeletedProject(id, remaining);
+
+    deleteQueueRef.current.push({ id, name: proj.name });
+    setQueuedDeleteIds((prev) => [...prev, id]);
+    void runDeleteQueue();
   };
 
   const startEditName = () => {
@@ -261,6 +348,12 @@ function App() {
             </svg>
           </button>
 
+          {(deletingProjectId || queuedDeleteIds.length > 0) && (
+            <div className="absolute top-full left-0 mt-1 w-56 px-3 py-2 text-xs text-amber-400 bg-surface-card border border-surface-border rounded-lg shadow-xl z-50">
+              正在删除项目，请稍候...
+              {queuedDeleteIds.length > 1 ? `（队列 ${queuedDeleteIds.length} 个）` : ""}
+            </div>
+          )}
           {showProjectMenu && (
             <div className="absolute top-full left-0 mt-1 w-56 bg-surface-card border border-surface-border rounded-lg shadow-xl z-50 py-1">
               {projects.map((p) => (
@@ -278,9 +371,10 @@ function App() {
                   </span>
                   <button
                     type="button"
+                    disabled={deletingProjectId === p.id || queuedDeleteIds.includes(p.id)}
                     onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
-                    className="ml-2 text-gray-500 hover:text-red-400 transition-colors"
-                    title="删除项目"
+                    className="ml-2 text-gray-500 hover:text-red-400 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                    title={deletingProjectId === p.id ? "删除中..." : "删除项目"}
                   >
                     <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />

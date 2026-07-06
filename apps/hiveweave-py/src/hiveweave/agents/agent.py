@@ -125,7 +125,7 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
     "list_subordinates": "List direct subordinates.",
     "read_roster": "Read the personnel roster.",
     "write_work_log": "Write a work log entry.",
-    "hire_agent": "Hire a new agent (HR only).",
+    "hire_agent": "Hire a new agent (HR only). Places the new agent under a specified parent (default: CEO). Pass templateId to pre-fill role/goal/skills.",
     "transfer_agent": "Transfer an agent to a new parent.",
     "dismiss_agent": "Dismiss an agent.",
     "save_charter": "Save the project charter.",
@@ -135,28 +135,112 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
     "git_worktree_remove": "Remove a git worktree.",
     "git_worktree_list": "List all worktrees.",
     "git_worktree_status": "Check worktree status.",
+    "update_roster": "Update the personnel roster for an agent (HR only).",
+    "list_agent_templates": "Browse agent templates catalog. HR only. Returns templates with role/goal/skills pre-configured.",
+    "unbind_skill": "Unbind a skill from an agent.",
+    "read_charter": "Read the project charter.",
+    "read_goals": "Read enterprise goals.",
+    "view_org_chart": "View the full organization chart.",
+    "read_work_logs": "Read work logs from subordinates.",
+    "send_message": "Send a message to other agents.",
+}
+
+
+# Per-tool explicit parameter schemas. Tools listed here expose a typed
+# schema to the LLM (so it knows which params exist — e.g. parentId for
+# hire_agent, which lets HR place a new agent under a specific manager
+# instead of the default CEO). Tools not listed fall back to the
+# permissive schema in _build_tool_definitions.
+_TOOL_SCHEMAS: dict[str, dict] = {
+    "hire_agent": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": (
+                    "Agent codename — a creative Chinese flower-name (花名), "
+                    "2-4 chars. Example: 折纸, 拾光, 鹿鸣, 鲸落."
+                ),
+            },
+            "role": {
+                "type": "string",
+                "description": (
+                    "Chinese job title (e.g. 前端工程师, 后端开发, 测试工程师). "
+                    "Determines permission_type: coordinator roles "
+                    "(ceo/hr/qa/cto/architect/manager/pm) → readonly, others → readwrite."
+                ),
+            },
+            "goal": {
+                "type": "string",
+                "description": (
+                    "Agent's goal. Defaults to 'Execute {role} responsibilities.' "
+                    "if omitted."
+                ),
+            },
+            "backstory": {
+                "type": "string",
+                "description": (
+                    "2-4 sentence personal narrative — past experience, "
+                    "personality, hobbies. NOT project-related. Makes the agent "
+                    "feel like a real character."
+                ),
+            },
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Skill slugs to bind. Use list_available_skills to search "
+                    "by keyword. See HR Recruitment Skill Standards table for "
+                    "role→skills mapping."
+                ),
+            },
+            "parentId": {
+                "type": "string",
+                "description": (
+                    "Parent agent ID — places the new agent under a specific "
+                    "manager in the org tree. Accepts UUID, short_id (e.g. "
+                    "'A001'), or agent name. Default: CEO. "
+                    "IRON RULE: never set parentId to your own ID — HR is a "
+                    "service role, not an org manager. Default new agents under "
+                    "the CEO or the requesting business manager."
+                ),
+            },
+            "templateId": {
+                "type": "string",
+                "description": (
+                    "Template ID to pre-fill role/goal/backstory/skills. Use "
+                    "list_agent_templates to browse. Explicit params override "
+                    "template values."
+                ),
+            },
+        },
+        "required": ["name", "role"],
+    },
 }
 
 
 def _build_tool_definitions(tool_names: list[str]) -> list[dict]:
     """将工具名列表转为 LLM 工具定义。
 
-    参数 schema 用 permissive（additionalProperties: true），
-    实际参数校验由 ToolExecutor 执行。
+    优先使用 _TOOL_SCHEMAS 中的显式 schema（让 LLM 看到可用参数，如
+    hire_agent 的 parentId，从而支持创建时指定父级）。未列出的工具用
+    permissive schema（additionalProperties: true），实际参数校验由
+    ToolExecutor 执行。
     """
     tools: list[dict] = []
     for name in tool_names:
         desc = _TOOL_DESCRIPTIONS.get(name, f"Execute the {name} tool.")
+        params = _TOOL_SCHEMAS.get(name) or {
+            "type": "object",
+            "additionalProperties": True,
+        }
         tools.append(
             {
                 "type": "function",
                 "function": {
                     "name": name,
                     "description": desc,
-                    "parameters": {
-                        "type": "object",
-                        "additionalProperties": True,
-                    },
+                    "parameters": params,
                 },
             }
         )
@@ -976,13 +1060,16 @@ class Agent:
 
     def _broadcast_stream_event(self, event: dict) -> None:
         """广播流事件（通过回调，不直接依赖 WebSocket）。"""
+        etype = event.get("type", "?")
+        has_cb = self._on_stream_event is not None
+        log.debug("agent_broadcast_stream", agent_id=self.id, event_type=etype, has_callback=has_cb)
         if self._on_stream_event is not None:
             try:
                 result = self._on_stream_event(self.id, event)
                 if asyncio.iscoroutine(result):
                     asyncio.create_task(result)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("agent_broadcast_failed", agent_id=self.id, error=str(e))
 
     # ── Streamer 回调 ────────────────────────────────────────
 

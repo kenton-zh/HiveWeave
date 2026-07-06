@@ -108,6 +108,14 @@ async def _ensure_agent_started(agent_id: str) -> tuple[object, dict] | None:
     """确保 agent 已启动（带流事件回调）。返回 (agent, config) 或 None。"""
     agent = agent_manager.get_agent(agent_id)
     if agent is not None:
+        # 防御性修复：如果 agent 启动时没有设置流式回调，在此补充
+        if getattr(agent, "_on_stream_event", None) is None:
+            from hiveweave.realtime.event_bus import create_agent_callbacks
+            project_id = getattr(agent, "project_id", "") or ""
+            on_status, on_stream = create_agent_callbacks(agent_id, project_id)
+            agent._on_status_change = on_status
+            agent._on_stream_event = on_stream
+            log.info("rest_patch_agent_callbacks", agent_id=agent_id)
         return agent, agent.config
     config = await meta_db.get_agent_by_id(agent_id)
     if config is None:

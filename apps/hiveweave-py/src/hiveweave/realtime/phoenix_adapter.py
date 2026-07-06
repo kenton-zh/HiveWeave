@@ -474,6 +474,18 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
         )
         return
 
+    # 防御性修复：如果 agent 启动时没有设置流式回调（例如被
+    # start_project_agents 启动但没有传入 callback），在此补充。
+    # 没有这些回调，agent.chat() 不会广播 stream_chunk 事件，
+    # 前端永远收不到响应。
+    if getattr(agent, "_on_stream_event", None) is None:
+        from hiveweave.realtime.event_bus import create_agent_callbacks
+        project_id = getattr(agent, "project_id", "") or ""
+        on_status, on_stream = create_agent_callbacks(agent_id, project_id)
+        agent._on_status_change = on_status
+        agent._on_stream_event = on_stream
+        log.info("phoenix_patch_agent_callbacks", agent_id=agent_id)
+
     result = await agent.chat(message)
 
     if result.get("error") == "busy":
@@ -523,8 +535,10 @@ async def _forward_bus_events(
         event = await queue.get()
         try:
             event_name, payload = _map_event(event)
+            log.debug("phoenix_forward", topic=topic, event_name=event_name, raw_type=event.get("type"))
             phoenix_msg = [join_ref, None, topic, event_name, payload]
             if not await send_fn(phoenix_msg):
+                log.warning("phoenix_forward_send_failed", topic=topic)
                 break
         except Exception as e:
             log.warning("phoenix_forward_error", topic=topic, error=str(e))

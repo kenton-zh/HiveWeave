@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useAppStore } from "../store";
-import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead, leaveAgentChannel } from "../api";
+import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead, leaveAgentChannel, joinAgentChannel } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
 import ApprovalDialog from "./ApprovalDialog";
 import TodoBar from "./TodoBar";
@@ -542,18 +542,30 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     if (!pendingInitialMessage || !agentId) return;
     if (pendingInitialMessage.agentId !== agentId) return;
 
+    const message = pendingInitialMessage.message;
+    const sendingForAgentId = agentId;
     // Consume the pending message
     useAppStore.getState().setPendingInitialMessage(null);
-    pendingQueueRef.current = [pendingInitialMessage.message];
-    setQueuedCount(1);
-    autoSendRef.current = true;
 
-    // Auto-send after a short delay to let WebSocket channel join complete
-    const timer = setTimeout(() => {
-      handleSendRef.current();
-    }, 300);
-    return () => clearTimeout(timer);
+    // Send directly - onboarding messages must not show the queued-behind-busy UI.
+    // Do NOT return cleanup that cancels the send timer: clearing pendingInitialMessage
+    // re-runs this effect and the previous cleanup would cancel the send.
+    void joinAgentChannel(sendingForAgentId).finally(() => {
+      setTimeout(() => {
+        if (activeAgentIdRef.current !== sendingForAgentId) return;
+        autoSendRef.current = true;
+        pendingQueueRef.current = [message];
+        setQueuedCount(0);
+        handleSendRef.current();
+      }, 100);
+    });
   }, [pendingInitialMessage, agentId]);
+
+  // Pre-join the agent channel when the chat panel mounts.
+  useEffect(() => {
+    if (!agentId) return;
+    joinAgentChannel(agentId).catch(() => {});
+  }, [agentId]);
 
   // Manage WebSocket channel + stream lifecycle — abort stream, clear timeout,
   // and leave channel ONLY when agentId actually changes, not when
@@ -822,7 +834,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       if (!input.trim()) return;
       messageText = input.trim();
       setInput("");
-      if (isStreaming || isAgentProcessing || hasUnansweredUser) {
+      if (isStreaming || isAgentProcessing) {
         pendingQueueRef.current.push(messageText);
         setQueuedCount(pendingQueueRef.current.length);
         return;
@@ -858,7 +870,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       updateProcessingAgent(sendingForAgentId, false);
       loadMessagesFromDb(sendingForAgentId);
       finishTurn();
-    }, 120_000);
+    }, 300_000);
     const allToolsUsed = new Set<string>();
     let _dbgTextCount = 0;
     let _dbgFirstText = 0;

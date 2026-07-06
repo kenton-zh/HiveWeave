@@ -19,13 +19,17 @@ from hiveweave.db import meta as meta_db
 
 logger = structlog.get_logger()
 
-# readonly preset — 24 tools (契约 08)
+# readonly preset (契约 08)
 READONLY_TOOLS = frozenset({
-    "bash", "grep", "apply-patch", "question", "todowrite", "websearch",
+    "bash", "grep", "apply_patch", "question", "todowrite", "websearch",
     "review", "read_file", "read_skill", "list_available_skills", "bind_skill",
-    "read_memory", "write_memory", "message_superior", "message_subordinate",
-    "message_peer", "message_team", "read_roster", "write_work_log",
+    "unbind_skill", "read_memory", "write_memory",
+    "send_message", "message_superior", "message_subordinate",
+    "message_peer", "message_team",
+    "read_roster", "update_roster", "write_work_log",
     "report_completion", "request_review", "list_subordinates",
+    "list_agent_templates", "hire_agent",
+    "read_charter", "read_goals", "view_org_chart", "read_work_logs",
     "git_worktree_list", "git_worktree_status",
 })
 

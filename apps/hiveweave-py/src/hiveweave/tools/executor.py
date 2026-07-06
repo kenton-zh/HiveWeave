@@ -29,6 +29,9 @@ from hiveweave.services.charter import CharterService
 from hiveweave.services.inbox import InboxService
 from hiveweave.services.org import OrgService
 from hiveweave.services.permission import PermissionService
+from hiveweave.services.roster import RosterService
+from hiveweave.services.skill_registry import SkillRegistryService
+from hiveweave.services.template import TemplateService
 from hiveweave.tools.bash import execute_bash, execute_run_command
 from hiveweave.tools.file import read_file, write_file, list_files
 from hiveweave.tools.grep import execute_grep
@@ -88,6 +91,9 @@ class ToolExecutor:
         self._org = OrgService()
         self._inbox = InboxService()
         self._charter = CharterService()
+        self._roster = RosterService()
+        self._skills = SkillRegistryService()
+        self._templates = TemplateService()
 
     # ── Public API ────────────────────────────────────────
 
@@ -317,6 +323,148 @@ class ToolExecutor:
 
         if name == "read_work_logs":
             return await self._tool_read_work_logs(agent_id, args)
+
+        # ── Roster tools ────────────────────────────────────
+        if name == "read_roster":
+            project_id = await self._get_project_id(agent_id)
+            if not project_id:
+                return self._error(f"Agent {agent_id} has no project_id")
+            roster_text = await self._roster.get_roster(project_id)
+            return {"success": True, "output": roster_text, "error": None}
+
+        if name == "update_roster":
+            project_id = await self._get_project_id(agent_id)
+            if not project_id:
+                return self._error(f"Agent {agent_id} has no project_id")
+            target = args.get("agentId") or args.get("agent_id") or ""
+            if not target:
+                return self._error("update_roster requires 'agentId'")
+            target_agent = await self._org.resolve_agent(target)
+            if not target_agent:
+                return self._error(f"Agent not found: {target}")
+            roster_attrs = {k: v for k, v in args.items()
+                            if k in ("position", "department", "responsibilities",
+                                     "status", "hire_date")}
+            result = await self._roster.update_roster(
+                project_id, target_agent["id"], roster_attrs)
+            return {"success": True, "output": result, "error": None}
+
+        # ── Template tools ──────────────────────────────────
+        if name == "list_agent_templates":
+            # 运行时角色校验 — 仅 HR 可浏览模板（参照 Elixir tool_executor.ex）
+            caller = await self._org.get_agent(agent_id)
+            if not caller or caller.get("role", "").lower() != "hr":
+                return self._error(
+                    "Permission denied: only HR can browse agent templates")
+            opts: dict[str, Any] = {}
+            if args.get("search"):
+                opts["search"] = args["search"]
+            if args.get("division"):
+                opts["division"] = args["division"]
+            templates = await self._templates.list_all(opts)
+            if not templates:
+                return {"success": True, "output": "No templates found. Try a different search keyword or division.", "error": None}
+            lines = []
+            for t in templates:
+                lines.append(
+                    f"- {t['name']} (role: {t.get('role', '?')}) — "
+                    f"ID: {t['id']} — {t.get('description', 'no description')}")
+            output = (f"Available agent templates ({len(templates)} found):\n"
+                      + "\n".join(lines)
+                      + "\n\nPass templateId in hire_agent to pre-fill "
+                        "role/goal/skills.")
+            return {"success": True, "output": output, "error": None}
+
+        # ── Skill tools ─────────────────────────────────────
+        if name == "list_available_skills":
+            search = args.get("search")
+            result = await self._skills.list_available_skills(search)
+            return {"success": True, "output": result, "error": None}
+
+        if name == "read_skill":
+            slug = (args.get("slug") or args.get("skillName")
+                    or args.get("skill") or "")
+            if not slug:
+                return self._error("read_skill requires 'slug' (skill name)")
+            bound = await self._skills.get_bound_skills(agent_id)
+            result = await self._skills.read_skill(slug, bound)
+            return {"success": True, "output": result, "error": None}
+
+        if name == "bind_skill":
+            skill_name = (args.get("skillName") or args.get("skill")
+                          or args.get("slug") or "")
+            if not skill_name:
+                return self._error("bind_skill requires 'skillName' (skill slug)")
+            target_id = args.get("agentId") or args.get("agent_id") or agent_id
+            if target_id != agent_id:
+                target_agent = await self._org.resolve_agent(target_id)
+                if not target_agent:
+                    return self._error(f"Agent not found: {target_id}")
+                target_id = target_agent["id"]
+            result = await self._skills.bind_skill(target_id, skill_name)
+            if result.get("ok"):
+                return {"success": True, "output": f"Skill '{skill_name}' bound to agent {target_id[:8]}...", "error": None}
+            return self._error(result.get("error", "Unknown error"))
+
+        if name == "unbind_skill":
+            skill_name = (args.get("skillName") or args.get("skill")
+                          or args.get("slug") or "")
+            if not skill_name:
+                return self._error("unbind_skill requires 'skillName' (skill slug)")
+            target_id = args.get("agentId") or args.get("agent_id") or agent_id
+            if target_id != agent_id:
+                target_agent = await self._org.resolve_agent(target_id)
+                if not target_agent:
+                    return self._error(f"Agent not found: {target_id}")
+                target_id = target_agent["id"]
+            result = await self._skills.unbind_skill(target_id, skill_name)
+            if result.get("ok"):
+                return {"success": True, "output": f"Skill '{skill_name}' unbound from agent {target_id[:8]}...", "error": None}
+            return self._error(result.get("error", "Unknown error"))
+
+        # ── Agent lifecycle tools ───────────────────────────
+        if name == "dismiss_agent":
+            project_id = await self._get_project_id(agent_id)
+            if not project_id:
+                return self._error(f"Agent {agent_id} has no project_id")
+            target = args.get("agentId") or args.get("agent_id") or ""
+            if not target:
+                return self._error("dismiss_agent requires 'agentId'")
+            target_agent = await self._org.resolve_agent(target)
+            if not target_agent:
+                return self._error(f"Agent not found: {target}")
+            result = await self._org.dismiss_agent(
+                project_id, target_agent["id"])
+            if result.get("success"):
+                return {"success": True, "output": f"Agent {target_agent['name']} ({target_agent.get('short_id', '?')}) has been dismissed.", "error": None}
+            return self._error(result.get("message", "Unknown error"))
+
+        if name == "transfer_agent":
+            project_id = await self._get_project_id(agent_id)
+            if not project_id:
+                return self._error(f"Agent {agent_id} has no project_id")
+            target = args.get("agentId") or args.get("agent_id") or ""
+            new_parent = (args.get("newParentId")
+                          or args.get("new_parent_id")
+                          or args.get("parentId") or "")
+            if not target:
+                return self._error("transfer_agent requires 'agentId'")
+            target_agent = await self._org.resolve_agent(target)
+            if not target_agent:
+                return self._error(f"Agent not found: {target}")
+            resolved_parent = None
+            if new_parent:
+                parent_agent = await self._org.resolve_agent(new_parent)
+                if not parent_agent:
+                    return self._error(f"New parent agent not found: {new_parent}")
+                resolved_parent = parent_agent["id"]
+            result = await self._org.transfer_agent(
+                project_id, target_agent["id"], resolved_parent)
+            if result is None:
+                return self._error("Agent not found")
+            if isinstance(result, dict) and result.get("success") is False:
+                return self._error(result.get("message", "Unknown error"))
+            return {"success": True, "output": f"Agent {target_agent['name']} transferred to new parent.", "error": None}
 
         # Unknown tool — contract 02 error handling
         return self._error(f"Unknown tool: {name}")
