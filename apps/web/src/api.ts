@@ -134,6 +134,23 @@ export async function getProjects(): Promise<Project[]> {
   return data.projects || [];
 }
 
+
+export interface WorkspaceCleanupResult {
+  status: "ok" | "skipped" | "scheduled" | "failed";
+  hiveweaveDir?: string | null;
+  workspacePath?: string | null;
+  reason?: "shared" | "no_workspace" | "skipped" | "error";
+  sharedWith?: string[];
+  pendingDir?: string;
+}
+
+export interface DeleteProjectResponse {
+  ok: boolean;
+  dbLeftover?: boolean;
+  workspaceCleanup?: WorkspaceCleanupResult;
+  warning?: string;
+}
+
 export async function createProject(name: string, workspacePath?: string, description?: string, orgParadigm?: string, language?: string) {
   return fetchJSON(`${BASE}/projects`, {
     method: "POST",
@@ -142,8 +159,17 @@ export async function createProject(name: string, workspacePath?: string, descri
   });
 }
 
-export async function deleteProject(id: string) {
-  return fetchJSON(`${BASE}/projects/${id}`, { method: "DELETE" });
+export async function deleteProject(id: string): Promise<DeleteProjectResponse> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 120_000);
+  try {
+    return await fetchJSON<DeleteProjectResponse>(`${BASE}/projects/${id}`, {
+      method: "DELETE",
+      signal: controller.signal,
+    });
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 export async function getProjectGameTime(projectId: string) {
@@ -215,7 +241,7 @@ export function streamChat(
   onEvent: (event: ChatEvent) => void
 ): { abort: () => void } {
   const socket = getSocket();
-  dbg("ws", `streamChat called for ${agentId}`, { agentId, messageLen: message.length, socketConnected: socket.isConnected() });
+  dbg("ws", `streamChat called for ${agentId}`, { agentId, messageLen: message.length, socketConnected: (socket as any).isConnected?.() ?? false });
 
   if (!(globalThis as any).__hw_lastSeq) (globalThis as any).__hw_lastSeq = {};
   (globalThis as any).__hw_lastSeq[agentId] = 0;
@@ -223,9 +249,27 @@ export function streamChat(
 
   let channel = _agentChannels.get(agentId);
 
+  // Helper: push chat message to channel
+  const pushChat = (ch: any) => {
+    ch.push("chat", { message, images: images?.length ? images : undefined });
+  };
+
   if (channel && channel.state === "joined") {
     dbg("ws", `push chat (channel already joined) for ${agentId}`);
-    channel.push("chat", { message, images: images?.length ? images : undefined });
+    pushChat(channel);
+  } else if (channel && channel.state === "joining") {
+    // Channel is still joining — wait for join to complete, then push.
+    // This fixes the bug where NewProjectDialog sends a message before
+    // the WebSocket channel has finished joining.
+    dbg("ws", `channel still joining for ${agentId}, waiting for join`);
+    channel.join().receive("ok", () => {
+      dbg("ws", `channel joined (deferred) for ${agentId}, pushing chat`);
+      pushChat(channel);
+    }).receive("error", (resp: any) => {
+      dbg("error", `deferred channel join FAILED for ${agentId}`, resp);
+      const handler = _agentHandlers.get(agentId);
+      handler?.({ type: "error", data: JSON.stringify(resp) });
+    });
   } else {
     if (channel) {
       dbg("ws", `channel state=${channel.state}, leaving old channel for ${agentId}`);
@@ -237,70 +281,11 @@ export function streamChat(
     _agentChannels.set(agentId, channel);
     dbg("ws", `creating new channel agent:${agentId}`);
 
-    channel.on("init", () => { dbg("ws", `init event for ${agentId}`); });
-
-    channel.on("message_id", (payload: any) => {
-      dbg("ws", `message_id for ${agentId}`, payload);
-      const handler = _agentHandlers.get(agentId);
-      handler?.({ type: "message_id", data: JSON.stringify(payload) });
-    });
-
-    channel.on("stream_chunk", (payload: any) => {
-      const handler = _agentHandlers.get(agentId);
-      if (!handler) return;
-      const text = typeof payload === "string" ? payload : payload.text || "";
-      if (typeof payload === "object" && payload.delta) {
-        const deltaId = payload.deltaId || "";
-        const seq = payload.seq;
-        if (typeof seq === "number") {
-          const lastSeq = (globalThis as any).__hw_lastSeq ?? {};
-          const last = lastSeq[agentId] ?? 0;
-          if (seq <= last) return;
-          lastSeq[agentId] = seq;
-          (globalThis as any).__hw_lastSeq = lastSeq;
-        }
-        if (payload.reasoning) {
-          handler({ type: "thinking_delta", data: text, deltaId });
-        } else {
-          handler({ type: "text_delta", data: text, deltaId });
-        }
-      } else {
-        dbg("ws", `stream_chunk (non-delta) for ${agentId}: ${text.slice(0, 100)}`);
-        handler({ type: "text", data: text });
-      }
-    });
-
-    channel.on("stream_tool", (payload: any) => {
-      const handler = _agentHandlers.get(agentId);
-      if (!handler) return;
-      if (payload.type === "tool_use") {
-        dbg("ws", `tool_use for ${agentId}: ${payload.toolName}`, payload);
-        handler({ type: "tool_use", data: JSON.stringify(payload) });
-      } else if (payload.type === "tool_result") {
-        dbg("ws", `tool_result for ${agentId}: ${payload.toolName}`);
-        handler({ type: "tool_result", data: JSON.stringify(payload) });
-      }
-    });
-
-    channel.on("status_change", () => {
-      dbg("ws", `status_change for ${agentId}`);
-    });
-
-    channel.on("done", () => {
-      dbg("ws", `done event for ${agentId}`);
-      const handler = _agentHandlers.get(agentId);
-      handler?.({ type: "done", data: "" });
-    });
-
-    channel.on("error", (payload: any) => {
-      dbg("error", `error event for ${agentId}: ${payload?.message || "Unknown"}`, payload);
-      const handler = _agentHandlers.get(agentId);
-      handler?.({ type: "error", data: payload?.message || "Unknown error" });
-    });
+    bindAgentChannelEvents(channel, agentId);
 
     channel.join().receive("ok", () => {
       dbg("ws", `channel joined for ${agentId}, pushing chat`);
-      channel.push("chat", { message, images: images?.length ? images : undefined });
+      pushChat(channel);
     }).receive("error", (resp: any) => {
       dbg("error", `channel join FAILED for ${agentId}`, resp);
       const handler = _agentHandlers.get(agentId);
@@ -315,6 +300,108 @@ export function streamChat(
       _agentHandlers.delete(agentId);
     },
   };
+}
+
+
+function bindAgentChannelEvents(channel: any, agentId: string) {
+  channel.on("init", () => { dbg("ws", `init event for ${agentId}`); });
+
+  channel.on("message_id", (payload: any) => {
+    dbg("ws", `message_id for ${agentId}`, payload);
+    const handler = _agentHandlers.get(agentId);
+    handler?.({ type: "message_id", data: JSON.stringify(payload) });
+  });
+
+  channel.on("stream_chunk", (payload: any) => {
+    const handler = _agentHandlers.get(agentId);
+    if (!handler) return;
+    const text = typeof payload === "string" ? payload : payload.text || "";
+    if (typeof payload === "object" && payload.delta) {
+      const deltaId = payload.deltaId || "";
+      const seq = payload.seq;
+      if (typeof seq === "number") {
+        const lastSeq = (globalThis as any).__hw_lastSeq ?? {};
+        const last = lastSeq[agentId] ?? 0;
+        if (seq <= last) return;
+        lastSeq[agentId] = seq;
+        (globalThis as any).__hw_lastSeq = lastSeq;
+      }
+      if (payload.reasoning) {
+        handler({ type: "thinking_delta", data: text, deltaId });
+      } else {
+        handler({ type: "text_delta", data: text, deltaId });
+      }
+    } else {
+      dbg("ws", `stream_chunk (non-delta) for ${agentId}: ${text.slice(0, 100)}`);
+      handler({ type: "text", data: text });
+    }
+  });
+
+  channel.on("stream_tool", (payload: any) => {
+    const handler = _agentHandlers.get(agentId);
+    if (!handler) return;
+    if (payload.type === "tool_use") {
+      dbg("ws", `tool_use for ${agentId}: ${payload.toolName}`, payload);
+      handler({ type: "tool_use", data: JSON.stringify(payload) });
+    } else if (payload.type === "tool_result") {
+      dbg("ws", `tool_result for ${agentId}: ${payload.toolName}`);
+      handler({ type: "tool_result", data: JSON.stringify(payload) });
+    }
+  });
+
+  channel.on("status_change", () => {
+    dbg("ws", `status_change for ${agentId}`);
+  });
+
+  channel.on("done", () => {
+    dbg("ws", `done event for ${agentId}`);
+    const handler = _agentHandlers.get(agentId);
+    handler?.({ type: "done", data: "" });
+  });
+
+  channel.on("error", (payload: any) => {
+    dbg("error", `error event for ${agentId}: ${payload?.message || "Unknown"}`, payload);
+    const handler = _agentHandlers.get(agentId);
+    handler?.({ type: "error", data: payload?.message || "Unknown error" });
+  });
+}
+
+/**
+ * Join (or create) a persistent agent channel without sending a message.
+ * Used to warm up the WebSocket before onboarding / first chat.
+ */
+export function joinAgentChannel(agentId: string): Promise<void> {
+  const socket = getSocket();
+
+  const existing = _agentChannels.get(agentId);
+  if (existing?.state === "joined") {
+    return Promise.resolve();
+  }
+  if (existing?.state === "joining") {
+    return new Promise((resolve, reject) => {
+      existing.join().receive("ok", () => resolve()).receive("error", (resp: any) => reject(resp));
+    });
+  }
+
+  if (existing) {
+    try { existing.leave(); } catch {}
+    _agentChannels.delete(agentId);
+  }
+
+  const channel = socket.channel(`agent:${agentId}`);
+  _agentChannels.set(agentId, channel);
+  bindAgentChannelEvents(channel, agentId);
+  dbg("ws", `joinAgentChannel creating channel agent:${agentId}`);
+
+  return new Promise((resolve, reject) => {
+    channel.join().receive("ok", () => {
+      dbg("ws", `joinAgentChannel joined for ${agentId}`);
+      resolve();
+    }).receive("error", (resp: any) => {
+      dbg("error", `joinAgentChannel FAILED for ${agentId}`, resp);
+      reject(resp);
+    });
+  });
 }
 
 /**

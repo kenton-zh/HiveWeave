@@ -253,8 +253,19 @@ class AgentManager:
 
                 config = dict(row)
 
+                # 设置流式事件回调 — 连接到 WebSocket 广播
+                # 没有这些回调，agent.chat() 不会广播 stream_chunk 事件，
+                # 前端永远收不到响应，120 秒后超时
+                from hiveweave.realtime.event_bus import create_agent_callbacks
+                on_status, on_stream = create_agent_callbacks(
+                    agent_id, project_id)
+
                 try:
-                    await self.start_agent(agent_id, project_id, config)
+                    await self.start_agent(
+                        agent_id, project_id, config,
+                        on_status_change=on_status,
+                        on_stream_event=on_stream,
+                    )
                     started += 1
                 except Exception as e:
                     log.error(
