@@ -136,6 +136,7 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
     "git_worktree_remove": "Remove a git worktree.",
     "git_worktree_list": "List all worktrees.",
     "git_worktree_status": "Check worktree status.",
+    "git_worktree_checkpoint": "Save a checkpoint (commit) in an agent's worktree.",
     "update_roster": "Update the personnel roster for an agent (HR only).",
     "list_agent_templates": "Browse agent templates catalog. HR only. Returns templates with role/goal/skills pre-configured.",
     "unbind_skill": "Unbind a skill from an agent.",

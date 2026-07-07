@@ -487,8 +487,87 @@ class ToolExecutor:
                 return self._error(result.get("message", "Unknown error"))
             return {"success": True, "output": f"Agent {target_agent['name']} transferred to new parent.", "error": None}
 
+        # ── Git worktree tools (BUG-034: dispatchers were missing) ──
+        if name in ("git_worktree_create", "git_worktree_checkpoint",
+                     "git_worktree_merge", "git_worktree_remove",
+                     "git_worktree_list", "git_worktree_status"):
+            return await self._tool_git_worktree(agent_id, name, args)
+
         # Unknown tool — contract 02 error handling
         return self._error(f"Unknown tool: {name}")
+
+    # ── Git worktree tools (BUG-034) ─────────────────────
+
+    async def _tool_git_worktree(
+        self, agent_id: str, name: str, args: dict
+    ) -> dict:
+        """Git worktree operations: create/checkpoint/merge/remove/list/status."""
+        from hiveweave.services.git_worktree import GitWorktreeService
+        from hiveweave.db import meta as meta_db
+
+        gwt = GitWorktreeService()
+        workspace = await self._get_project_id(agent_id)
+        if not workspace:
+            return self._error(f"Agent {agent_id} has no project")
+        # Resolve workspace path from project
+        ws_path = await meta_db.get_project_workspace(workspace)
+        if not ws_path:
+            return self._error(f"No workspace path for project {workspace}")
+        workspace_path = str(ws_path)
+
+        # Ensure git repo exists (idempotent)
+        await gwt.ensure_git_repo(workspace_path)
+
+        # Resolve agent short_id for worktree naming
+        agent_rec = await self._org.get_agent(agent_id)
+        short_id = agent_rec.get("short_id", agent_id[:8]) if agent_rec else agent_id[:8]
+
+        if name == "git_worktree_create":
+            task_name = args.get("taskName") or args.get("task_name") or args.get("task") or "task"
+            result = await gwt.create(workspace_path, short_id, str(task_name))
+            if result.get("success"):
+                return {"success": True, "output": f"Worktree created at {result.get('path')} on branch {result.get('branch')}", "error": None}
+            return self._error(result.get("message", "Failed to create worktree"))
+
+        if name == "git_worktree_checkpoint":
+            task_name = args.get("taskName") or args.get("task_name") or args.get("task") or "checkpoint"
+            message = args.get("message") or args.get("summary") or "checkpoint"
+            result = await gwt.checkpoint(workspace_path, short_id, str(task_name), str(message))
+            if result.get("success"):
+                return {"success": True, "output": f"Checkpoint saved: {result.get('commit', 'unknown')}", "error": None}
+            return self._error(result.get("message", "Failed to checkpoint"))
+
+        if name == "git_worktree_merge":
+            task_name = args.get("taskName") or args.get("task_name") or args.get("task") or "task"
+            result = await gwt.merge(workspace_path, short_id, str(task_name))
+            if result.get("success"):
+                return {"success": True, "output": "Worktree merged and cleaned up", "error": None}
+            return self._error(result.get("message", "Failed to merge worktree"))
+
+        if name == "git_worktree_remove":
+            result = await gwt.delete(workspace_path, short_id)
+            if result.get("success"):
+                return {"success": True, "output": "Worktree removed", "error": None}
+            return self._error(result.get("message", "Failed to remove worktree"))
+
+        if name == "git_worktree_list":
+            result = await gwt.list(workspace_path)
+            if result.get("success"):
+                wts = result.get("worktrees", [])
+                if not wts:
+                    return {"success": True, "output": "No active worktrees", "error": None}
+                lines = [f"{w.get('short_id', '?')}: {w.get('branch', '?')} ({w.get('status', '?')})" for w in wts]
+                return {"success": True, "output": "\n".join(lines), "error": None}
+            return self._error(result.get("message", "Failed to list worktrees"))
+
+        if name == "git_worktree_status":
+            result = await gwt.info(workspace_path, short_id)
+            if result.get("success"):
+                info = result.get("info", {})
+                return {"success": True, "output": f"Branch: {info.get('branch', '?')}, Status: {info.get('status', '?')}", "error": None}
+            return self._error(result.get("message", "Failed to get worktree status"))
+
+        return self._error(f"Unknown git worktree operation: {name}")
 
     # ── Output truncation (layer 1) ──────────────────────
 
