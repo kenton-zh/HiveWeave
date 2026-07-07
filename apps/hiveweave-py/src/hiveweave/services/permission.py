@@ -21,7 +21,7 @@ logger = structlog.get_logger()
 
 # readonly preset (契约 08)
 READONLY_TOOLS = frozenset({
-    "bash", "grep", "apply_patch", "question", "todowrite", "websearch",
+    "bash", "grep", "apply_patch", "question", "todowrite", "websearch", "webfetch",
     "review", "read_file", "list_files", "read_skill", "list_available_skills", "bind_skill",
     "unbind_skill", "read_memory", "write_memory",
     "send_message", "message_superior", "message_subordinate",
@@ -37,7 +37,8 @@ READONLY_TOOLS = frozenset({
 READWRITE_TOOLS = READONLY_TOOLS | frozenset({
     "write_file", "edit_file", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
-    "dispatch_task", "hire_agent", "approve_work", "reject_work",
+    "dispatch_task", "report_completion", "request_review",
+    "hire_agent", "approve_work", "reject_work",
     "run_code_review", "run_security_audit", "run_tests",
     "run_perf_audit", "run_full_review",
     "git_worktree_create", "git_worktree_merge", "git_worktree_remove",

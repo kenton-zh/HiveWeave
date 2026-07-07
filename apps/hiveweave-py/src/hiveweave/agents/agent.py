@@ -103,6 +103,7 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
     "todowrite": "Update the task todo list.",
     "question": "Ask the user a question and wait for response.",
     "websearch": "Search the web.",
+    "webfetch": "Fetch a URL and convert HTML to readable text. Use to read documentation, API references, or any web page content.",
     "review": "Run a code review.",
     "run_code_review": "Run a code quality review.",
     "run_security_audit": "Run a security audit.",
