@@ -286,14 +286,25 @@ function ThinkingBlock({ content }: { content: string }) {
 
 function ToolCallInline({ name, input }: { name: string; input?: Record<string, any> }) {
   const hint = formatToolInputHint(name, input);
+  const icon = TOOL_ICONS[name] || "🔧";
   return (
-    <div className="flex items-center gap-2 py-1 text-[12px]">
-      <span className="w-1.5 h-1.5 rounded-full bg-amber-400/60 shrink-0" />
+    <div className="flex items-center gap-2 py-1 text-[12px] group">
+      <span className="text-[13px] shrink-0">{icon}</span>
       <span className="font-medium text-amber-200/90">{name}</span>
-      {hint && <span className="text-gray-500 truncate text-[11px]">— {hint}</span>}
+      {hint && <span className="text-gray-500 truncate text-[11px]">→ {hint}</span>}
     </div>
   );
 }
+
+const TOOL_ICONS: Record<string, string> = {
+  read_file: "📖", write_file: "✏️", edit_file: "✂️", delete_file: "🗑️",
+  list_files: "📂", search_files: "🔍", grep: "🔎", bash: "💻",
+  run_command: "⚡", websearch: "🌐", create_agent: "👤", hire_agent: "🤝",
+  dismiss_agent: "👋", message_agent: "💬", send_inbox: "📨",
+  read_charter: "📜", read_goals: "🎯", view_org_chart: "🏢",
+  write_charter: "📝", read_work_logs: "📋", write_work_log: "📊",
+  report_completion: "✅", ask_user: "❓",
+};
 
 function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: boolean }) {
   if (msg.role === "system") {
@@ -309,9 +320,6 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
   const segments: MsgSegment[] = (msg as any)._segments || [];
   const hasSegments = segments.length > 0;
   const thinking = (msg as any)._thinking || "";
-  // Separate thinking segments from the stream for grouped display
-  const thinkingSegs = hasSegments ? segments.filter(s => s.type === "thinking") : [];
-  const visibleSegs = hasSegments ? segments.filter(s => s.type !== "thinking") : [];
 
   const isUser = msg.role === "user";
   const isEmpty = !msg.content && !thinking && !hasSegments && (!msg.toolCalls || msg.toolCalls.length === 0);
@@ -331,35 +339,33 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
           </div>
         )}
 
-        {/* Thinking blocks — grouped at top for assistant */}
-        {!isUser && thinkingSegs.length > 0 && thinkingSegs.map((seg, i) => (
-          seg.content ? <ThinkingBlock key={`t-${i}`} content={seg.content} /> : null
-        ))}
-        {!isUser && !hasSegments && thinking && <ThinkingBlock content={thinking} />}
-
-        {/* Tool calls — shown above content for assistant */}
-        {!isUser && hasSegments && visibleSegs.filter(s => s.type === "tool_call").length > 0 && (
-          <div className="mb-3 space-y-0.5">
-            {visibleSegs.filter(s => s.type === "tool_call").map((seg, i) => (
-              seg.tool ? <ToolCallInline key={`tc-${i}`} name={seg.tool.tool} input={seg.tool.input} /> : null
-            ))}
-          </div>
-        )}
-        {!isUser && !hasSegments && msg.toolCalls && msg.toolCalls.length > 0 && (
-          <div className="mb-3">
-            <ToolCallsBlock toolCalls={msg.toolCalls} />
-          </div>
-        )}
-
-        {/* Main content */}
+        {/* Interleaved segments — render in arrival order preserving timeline */}
         {hasSegments ? (
           <div className="space-y-1">
-            {visibleSegs.filter(s => s.type === "text").map((seg, i) => (
-              seg.content ? <p key={`txt-${i}`} className="whitespace-pre-wrap">{seg.content}</p> : null
-            ))}
+            {segments.map((seg, i) => {
+              if (seg.type === "thinking" && seg.content) {
+                return <ThinkingBlock key={i} content={seg.content} />;
+              }
+              if (seg.type === "text" && seg.content) {
+                return <p key={i} className="whitespace-pre-wrap">{seg.content}</p>;
+              }
+              if (seg.type === "tool_call" && seg.tool) {
+                return <ToolCallInline key={i} name={seg.tool.tool} input={seg.tool.input} />;
+              }
+              return null;
+            })}
           </div>
         ) : (
-          msg.content && <p className="whitespace-pre-wrap">{msg.content}</p>
+          <>
+            {/* Flat rendering (DB-loaded messages without segments) */}
+            {!isUser && thinking && <ThinkingBlock content={thinking} />}
+            {msg.content && <p className="whitespace-pre-wrap">{msg.content}</p>}
+            {!isUser && msg.toolCalls && msg.toolCalls.length > 0 && (
+              <div className="mt-2">
+                <ToolCallsBlock toolCalls={msg.toolCalls} />
+              </div>
+            )}
+          </>
         )}
 
         {/* Empty streaming indicator */}
