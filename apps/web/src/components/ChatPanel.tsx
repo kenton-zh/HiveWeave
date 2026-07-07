@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useAppStore } from "../store";
-import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead, leaveAgentChannel, joinAgentChannel } from "../api";
+import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead, leaveAgentChannel, joinAgentChannel, subscribeAgentStream } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
 import ApprovalDialog from "./ApprovalDialog";
 import TodoBar from "./TodoBar";
@@ -499,7 +499,22 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     }
   }, [agentId, confirmingDelete, refreshOrgTree]);
 
+  // Per-agent streamDraft cache — preserves streaming state when switching
+  // between agents, so the bubble doesn't disappear mid-reply.
+  const savedDraftsRef = useRef<Record<string, StreamDraft | null>>({});
+  const prevAgentIdRef = useRef<string | null>(null);
+
   useEffect(() => {
+    // BUG-034: Save streamDraft from the PREVIOUS agent before switching.
+    // React runs cleanup(oldDeps) before effect(newDeps), but by the time
+    // the effect runs, activeAgentIdRef.current is already updated. Use
+    // prevAgentIdRef to track what we're switching FROM.
+    const switchingFrom = prevAgentIdRef.current;
+    if (switchingFrom && switchingFrom !== agentId && streamDraftRef.current) {
+      savedDraftsRef.current[switchingFrom] = streamDraftRef.current;
+    }
+    prevAgentIdRef.current = agentId;
+
     if (!agentId) {
       setAgentInfo(null);
       setMessages([]);
@@ -515,8 +530,46 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     let cancelled = false;
     const loadForAgentId = agentId;
     stickToBottomRef.current = true;
-    setIsStreaming(false);
-    updateStreamDraft(null);
+
+    // BUG-034: Restore saved streamDraft if switching back to an agent
+    // that was mid-reply, and it's still processing. Register a passive
+    // handler so incoming stream events continue updating the display.
+    const savedDraft = savedDraftsRef.current[agentId];
+    const isStillProcessing = useAppStore.getState().processingAgents.includes(agentId);
+    if (savedDraft && isStillProcessing) {
+      updateStreamDraft(savedDraft);
+      setIsStreaming(true);
+      // Register passive event handler for ongoing stream
+      subscribeAgentStream(agentId, (event) => {
+        if (activeAgentIdRef.current !== agentId) return;
+        if (event.type === "text_delta") {
+          updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "text", content: event.data }] } : prev);
+        } else if (event.type === "thinking_delta") {
+          updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "thinking", content: event.data }] } : prev);
+        } else if (event.type === "tool_use") {
+          try {
+            const toolData = JSON.parse(event.data);
+            updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "tool_call", tool: { tool: (toolData.tool || "").replace(/^hiveweave__/, ""), input: toolData.input || {} } }] } : prev);
+          } catch {}
+        } else if (event.type === "done") {
+          loadMessagesFromDb(agentId).then((ok) => {
+            if (ok) updateStreamDraft(null);
+          });
+          setIsStreaming(false);
+          updateProcessingAgent(agentId, false);
+          delete savedDraftsRef.current[agentId];
+        } else if (event.type === "error") {
+          setIsStreaming(false);
+          updateProcessingAgent(agentId, false);
+          delete savedDraftsRef.current[agentId];
+        }
+      });
+    } else {
+      setIsStreaming(false);
+      updateStreamDraft(null);
+      // Clean up saved draft if agent is no longer processing
+      if (savedDraft) delete savedDraftsRef.current[agentId];
+    }
 
     // Use cached messages if available — switching back to a previously-viewed
     // agent renders instantly without waiting for the DB round-trip. The
