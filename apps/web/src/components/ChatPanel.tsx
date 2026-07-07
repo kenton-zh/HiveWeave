@@ -230,32 +230,67 @@ function formatToolInputHint(tool: string, input: Record<string, any> | undefine
 
 function ToolCallsBlock({ toolCalls }: { toolCalls: ToolCall[] }) {
   const [expanded, setExpanded] = useState(false);
-  const names = toolCalls.map((tc) => tc.tool);
-  const preview = names.slice(0, 6).join(", ") + (names.length > 6 ? ", \u2026" : "");
-  const summary = expanded ? "\u25be" : "\u25b8";
 
   return (
-    <div>
+    <div className="rounded-lg border border-amber-500/15 bg-amber-500/5 overflow-hidden">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="w-full text-left text-xs text-gray-400 hover:text-gray-300 transition-colors font-mono truncate"
+        className="w-full flex items-center gap-2 px-3 py-2 text-left text-[11px] text-amber-200/70 hover:text-amber-100 transition-colors"
       >
-        {summary} \u5de5\u5177\u8c03\u7528 ({toolCalls.length}) \u2014 {preview}
+        <svg className={`w-3 h-3 text-amber-400/70 transition-transform ${expanded ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+        </svg>
+        <span className="font-medium">\u5de5\u5177\u8c03\u7528</span>
+        <span className="text-amber-400/50">({toolCalls.length})</span>
       </button>
       {expanded && (
-        <ul className="mt-1.5 space-y-0.5 font-mono text-xs text-gray-500 pl-3 border-l border-surface-border/60">
+        <div className="border-t border-amber-500/10 px-3 py-2 space-y-1">
           {toolCalls.map((tc, i) => {
             const hint = formatToolInputHint(tc.tool, tc.input);
             return (
-              <li key={i} className="truncate">
-                <span className="text-gray-400">{tc.tool}</span>
-                {hint && <span className="text-gray-600"> \u2014 {hint}</span>}
-              </li>
+              <div key={i} className="flex items-center gap-2 text-[11px] font-mono">
+                <span className="w-1 h-1 rounded-full bg-amber-400/40 shrink-0" />
+                <span className="text-amber-200/80">{tc.tool}</span>
+                {hint && <span className="text-gray-500 truncate">\u2014 {hint}</span>}
+              </div>
             );
           })}
-        </ul>
+        </div>
       )}
+    </div>
+  );
+}
+
+function ThinkingBlock({ content }: { content: string }) {
+  return (
+    <details className="group/think my-3 overflow-hidden rounded-xl border border-purple-500/20 bg-purple-950/10">
+      <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none hover:bg-purple-950/20 transition-colors">
+        <svg className="w-3.5 h-3.5 text-purple-400 group-open/think:rotate-90 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+        </svg>
+        <svg className="w-3.5 h-3.5 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+        </svg>
+        <span className="text-xs font-medium text-purple-300">思考过程</span>
+        <span className="text-[10px] text-gray-600 ml-auto">{content.length} 字</span>
+      </summary>
+      <div className="border-t border-purple-500/10 bg-black/20 px-3 py-2.5">
+        <div className="text-xs text-purple-200/70 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed font-mono text-[11px]">
+          {content}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function ToolCallInline({ name, input }: { name: string; input?: Record<string, any> }) {
+  const hint = formatToolInputHint(name, input);
+  return (
+    <div className="flex items-center gap-2 py-1 text-[12px]">
+      <span className="w-1.5 h-1.5 rounded-full bg-amber-400/60 shrink-0" />
+      <span className="font-medium text-amber-200/90">{name}</span>
+      {hint && <span className="text-gray-500 truncate text-[11px]">— {hint}</span>}
     </div>
   );
 }
@@ -263,106 +298,76 @@ function ToolCallsBlock({ toolCalls }: { toolCalls: ToolCall[] }) {
 function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: boolean }) {
   if (msg.role === "system") {
     return (
-      <div className="flex justify-center">
-        <div className="max-w-[90%] rounded-lg px-4 py-2 bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs text-center">
+      <div className="flex justify-center my-4">
+        <div className="rounded-xl px-4 py-2 bg-amber-500/10 border border-amber-500/20 text-amber-200/80 text-xs text-center">
           <p className="whitespace-pre-wrap">{msg.content}</p>
         </div>
       </div>
     );
   }
 
-  // Use interleaved segments if available, otherwise fall back to flat content+toolCalls
   const segments: MsgSegment[] = (msg as any)._segments || [];
   const hasSegments = segments.length > 0;
+  const thinking = (msg as any)._thinking || "";
+  // Separate thinking segments from the stream for grouped display
+  const thinkingSegs = hasSegments ? segments.filter(s => s.type === "thinking") : [];
+  const visibleSegs = hasSegments ? segments.filter(s => s.type !== "thinking") : [];
 
-  const renderContent = () => (
-    <>
-      {hasSegments ? (
-        // Interleaved: render text and tool calls in arrival order
-        <div className="space-y-2">
-          {segments.map((seg, i) => {
-            if (seg.type === "thinking" && seg.content) {
-              return (
-                <details key={i} className="group mb-2">
-                  <summary className="text-xs text-purple-300 cursor-pointer list-none flex items-center gap-1.5 select-none">
-                    <span className="text-[9px] text-gray-600 group-open:rotate-90 transition-transform">▶</span>
-                    <span>思考过程</span>
-                  </summary>
-                  <div className="mt-1 text-xs text-gray-400 bg-surface-alt/70 rounded px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed border-l-2 border-purple-500/20">
-                    {seg.content}
-                  </div>
-                </details>
-              );
-            }
-            if (seg.type === "text") {
-              return seg.content ? <p key={i} className="text-base whitespace-pre-wrap">{seg.content}</p> : null;
-            }
-            if (seg.type === "tool_call" && seg.tool) {
-              const hint = formatToolInputHint(seg.tool.tool, seg.tool.input);
-              return (
-                <div key={i} className="text-xs text-gray-400 flex items-center gap-1.5 font-mono">
-                  <span className="w-1.5 h-1.5 rounded-full bg-accent/50 shrink-0" />
-                  <span className="text-gray-300">{seg.tool.tool}</span>
-                  {hint && <span className="text-gray-600 truncate">— {hint}</span>}
-                </div>
-              );
-            }
-            return null;
-          })}
-        </div>
-      ) : (
-        // Fallback: flat rendering
-        <>
-          {(msg as any)._thinking && (
-            <details className="group mb-2">
-              <summary className="text-xs text-purple-300 cursor-pointer list-none flex items-center gap-1.5 select-none">
-                <span className="text-[9px] text-gray-600 group-open:rotate-90 transition-transform">▶</span>
-                <span>思考过程</span>
-              </summary>
-              <div className="mt-1 text-xs text-gray-400 bg-surface-alt/70 rounded px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed border-l-2 border-purple-500/20">
-                {(msg as any)._thinking}
-              </div>
-            </details>
-          )}
-          {msg.content && (
-            <p className="text-base whitespace-pre-wrap">{msg.content}</p>
-          )}
-          {msg.toolCalls && msg.toolCalls.length > 0 && (
-            <div className={msg.content ? "mt-2" : ""}>
-              <ToolCallsBlock toolCalls={msg.toolCalls} />
-            </div>
-          )}
-        </>
-      )}
-    </>
-  );
+  const isUser = msg.role === "user";
+  const isEmpty = !msg.content && !thinking && !hasSegments && (!msg.toolCalls || msg.toolCalls.length === 0);
 
   return (
-    <div className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-      <div
-        className={`
-          max-w-[95%] rounded-2xl px-4 py-3
-          ${msg.role === "user"
-            ? "bg-accent text-white max-w-[80%]"
-            : "bg-surface-card border border-surface-border text-gray-200"
-          }
-        `}
-      >
+    <div className={`flex ${isUser ? "justify-end" : "justify-start"} my-2`}>
+      <div className={isUser
+        ? "max-w-[75%] rounded-2xl bg-accent/90 px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-sm"
+        : "w-full max-w-full text-[15px] leading-relaxed text-gray-100"
+      }>
+        {/* Images */}
         {msg.images && msg.images.length > 0 && (
-          <div className="flex gap-1.5 flex-wrap mb-2">
+          <div className="flex gap-1.5 flex-wrap mb-3">
             {msg.images.map((url, i) => (
               <img key={i} src={url} className="max-h-48 max-w-[200px] rounded-lg object-cover" alt="" />
             ))}
           </div>
         )}
 
-        {renderContent()}
+        {/* Thinking blocks — grouped at top for assistant */}
+        {!isUser && thinkingSegs.length > 0 && thinkingSegs.map((seg, i) => (
+          seg.content ? <ThinkingBlock key={`t-${i}`} content={seg.content} /> : null
+        ))}
+        {!isUser && !hasSegments && thinking && <ThinkingBlock content={thinking} />}
 
-        {msg.role === "assistant" && isStreaming && !hasSegments && !msg.content && (!msg.toolCalls || msg.toolCalls.length === 0) && (
-          <div className="flex gap-1">
-            <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-            <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-            <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+        {/* Tool calls — shown above content for assistant */}
+        {!isUser && hasSegments && visibleSegs.filter(s => s.type === "tool_call").length > 0 && (
+          <div className="mb-3 space-y-0.5">
+            {visibleSegs.filter(s => s.type === "tool_call").map((seg, i) => (
+              seg.tool ? <ToolCallInline key={`tc-${i}`} name={seg.tool.tool} input={seg.tool.input} /> : null
+            ))}
+          </div>
+        )}
+        {!isUser && !hasSegments && msg.toolCalls && msg.toolCalls.length > 0 && (
+          <div className="mb-3">
+            <ToolCallsBlock toolCalls={msg.toolCalls} />
+          </div>
+        )}
+
+        {/* Main content */}
+        {hasSegments ? (
+          <div className="space-y-1">
+            {visibleSegs.filter(s => s.type === "text").map((seg, i) => (
+              seg.content ? <p key={`txt-${i}`} className="whitespace-pre-wrap">{seg.content}</p> : null
+            ))}
+          </div>
+        ) : (
+          msg.content && <p className="whitespace-pre-wrap">{msg.content}</p>
+        )}
+
+        {/* Empty streaming indicator */}
+        {!isUser && isEmpty && isStreaming && (
+          <div className="flex gap-1.5 py-1">
+            <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+            <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+            <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
           </div>
         )}
       </div>
@@ -1325,7 +1330,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
 
       <TodoBar agentId={agentId} />
 
-      <div ref={scrollContainerRef} onScroll={handleMessagesScroll} className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-4">
+      <div ref={scrollContainerRef} onScroll={handleMessagesScroll} className="flex-1 min-h-0 overflow-y-auto px-5 py-5 space-y-6">
         {directMessages.length === 0 && !hasTeamComms && (
           <div className="text-center text-gray-500 text-sm mt-12">发送消息开始对话</div>
         )}
