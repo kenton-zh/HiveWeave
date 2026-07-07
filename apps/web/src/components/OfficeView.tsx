@@ -28,6 +28,25 @@ function flattenAgents(nodes: OfficeAgent[]): OfficeAgent[] {
   return result;
 }
 
+/** BUG-018 fix: Recursively sanitize org-tree data, removing malformed nodes. */
+function sanitizeAgents(nodes: OfficeAgent[]): OfficeAgent[] {
+  const out: OfficeAgent[] = [];
+  for (const n of nodes) {
+    if (!n || !n.id) continue;
+    const cleaned: OfficeAgent = {
+      id: n.id,
+      name: n.name || "?",
+      role: n.role || "unknown",
+      status: n.status || "idle",
+    };
+    if (Array.isArray((n as any).children) && (n as any).children.length) {
+      (cleaned as any).children = sanitizeAgents((n as any).children);
+    }
+    out.push(cleaned);
+  }
+  return out;
+}
+
 // ── Component ─────────────────────────────────────────────────────
 
 export default function OfficeView() {
@@ -48,6 +67,7 @@ export default function OfficeView() {
   // ── Local state (from API) ─────────────────────────────────────
   const [roots, setRoots] = useState<OfficeAgent[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   // ── Derived data ───────────────────────────────────────────────
   const agents = useMemo(() => flattenAgents(roots), [roots]);
@@ -55,8 +75,8 @@ export default function OfficeView() {
   const communicatingIds = useMemo(() => {
     const ids = new Set<string>();
     activeCommunications.forEach((comm) => {
-      ids.add(comm.fromAgentId);
-      ids.add(comm.toAgentId);
+      if (comm.fromAgentId) ids.add(comm.fromAgentId);
+      if (comm.toAgentId) ids.add(comm.toAgentId);
     });
     return ids;
   }, [activeCommunications]);
@@ -106,8 +126,12 @@ export default function OfficeView() {
     async function loadOffice() {
       if (!selectedProjectId) {
         setRoots([]);
+        setLoading(false);
         return;
       }
+      // BUG-001 修复：fetch 期间保留旧 roots（stale-but-populated > empty flash），
+      // 只标记 loading 让 UI 可以选择显示遮罩而非清空。
+      setLoading(true);
       try {
         const data = await getOrgTree(selectedProjectId);
         let parsed: any[];
@@ -121,11 +145,15 @@ export default function OfficeView() {
           parsed = [];
         }
         if (mounted) {
-          setRoots(parsed);
+          setRoots(sanitizeAgents(parsed));
           setError(null);
         }
-      } catch (err) {
+      } catch (err: any) {
+        // BUG-018 修复：AbortError 静默忽略，不清空 roots
+        if (err?.name === "AbortError" || err?._aborted) return;
         if (mounted) setError(err instanceof Error ? err.message : "Failed to load office");
+      } finally {
+        if (mounted) setLoading(false);
       }
     }
     loadOffice();
@@ -138,17 +166,21 @@ export default function OfficeView() {
     let mounted = true;
     const poll = async () => {
       try {
-        const comms = await getCommunications();
-        if (mounted && Array.isArray(comms)) setActiveCommunications(comms);
+        const comms = await getCommunications({ projectId: selectedProjectId });
+        if (mounted) setActiveCommunications(comms);
       } catch {
         // Office renders fine without transient comm events
       }
     };
     poll();
-    const interval = setInterval(poll, 3000);
+    // BUG-005 fix: jittered interval to avoid lockstep polling
+    const jitter = () => 3000 + Math.random() * 800 - 400;
+    let timer: ReturnType<typeof setTimeout>;
+    function schedule() { timer = setTimeout(() => { poll().finally(schedule); }, jitter()); }
+    schedule();
     return () => {
       mounted = false;
-      clearInterval(interval);
+      clearTimeout(timer);
     };
   }, [selectedProjectId, setActiveCommunications]);
 

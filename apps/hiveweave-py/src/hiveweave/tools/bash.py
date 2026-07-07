@@ -232,6 +232,17 @@ async def execute_bash(
         return {"success": False, "output": "",
                 "error": f"Error: Command blocked: {reason}"}
 
+    # BUG-011 修复：敏感文件路径检查 — 阻止 `cat .env` / `cat ~/.ssh/id_rsa` 等
+    # 绕过 file.py 敏感检查的 bash 命令。用 security.is_sensitive_path 做子串匹配。
+    from hiveweave.tools.security import is_sensitive_path
+    if is_sensitive_path(command):
+        log.warning("bash.blocked_sensitive", command_preview=command[:120])
+        return {"success": False, "output": "",
+                "error": "Error: Command blocked: command references a "
+                         "sensitive file (e.g. .env, *.pem, id_rsa, "
+                         "credentials). Use read_file with explicit "
+                         "approval instead."}
+
     # 2. Resolve cwd and validate sandbox
     ws = workspace_path or os.getcwd()
     if workdir:

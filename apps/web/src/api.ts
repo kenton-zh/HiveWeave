@@ -96,6 +96,14 @@ async function fetchJSON<T = any>(url: string, init?: RequestInit): Promise<T> {
     dbg("api", `${method} ${url} → ${res.status} (${elapsed}ms)`, { status: res.status, bodyPreview: text.slice(0, 300) });
     return parsed as T;
   } catch (e: any) {
+    // BUG-006/018 修复：AbortError 不返回 null（会导致 caller 误设空数据），
+    // 也不污染 console。重新 throw 带 _aborted 标记，让 caller 静默处理。
+    if (e?.name === "AbortError") {
+      const abortErr = new Error("Aborted") as any;
+      abortErr.name = "AbortError";
+      abortErr._aborted = true;
+      throw abortErr;
+    }
     const elapsed = Math.round(performance.now() - t0);
     dbg("error", `${method} ${url} FAILED (${elapsed}ms): ${e.message}`, { error: e.message });
     throw e;
@@ -184,7 +192,7 @@ export async function updateProjectGoals(projectId: string, goals: any) {
   return fetchJSON(`${BASE}/projects/${projectId}/goals`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(goals),
+    body: JSON.stringify({ goals }),
   });
 }
 
@@ -791,7 +799,9 @@ export async function getCommunications(opts?: { projectId?: string; limit?: num
   if (opts?.projectId) params.set("projectId", opts.projectId);
   if (opts?.limit) params.set("limit", String(opts.limit));
   const qs = params.toString();
-  return fetchJSON(`${BASE}/communications${qs ? "?" + qs : ""}`);
+  const data = await fetchJSON<{ communications: Communication[] }>(`${BASE}/communications${qs ? "?" + qs : ""}`);
+  // BUG-028 fix: backend wraps in {communications: [...]}, unwrap here
+  return data?.communications ?? (Array.isArray(data) ? data : []);
 }
 
 export async function sendCommunication(payload: {
@@ -826,12 +836,14 @@ export interface UserPing {
   agentIds?: string[];
 }
 
-export async function getUserPings(opts?: { unreadOnly?: boolean; limit?: number }): Promise<UserPing[]> {
+export async function getUserPings(opts?: { projectId?: string; unreadOnly?: boolean; limit?: number }): Promise<UserPing[]> {
   const params = new URLSearchParams();
+  if (opts?.projectId) params.set("projectId", opts.projectId);
   if (opts?.unreadOnly) params.set("unreadOnly", "true");
   if (opts?.limit) params.set("limit", String(opts.limit));
   const qs = params.toString();
-  return fetchJSON(`${BASE}/user-pings${qs ? "?" + qs : ""}`);
+  const data = await fetchJSON<{ pings: UserPing[] }>(`${BASE}/user-pings${qs ? "?" + qs : ""}`);
+  return data?.pings ?? [];
 }
 
 export async function markPingRead(id: string) {
@@ -905,8 +917,8 @@ export async function executeTodoWrite(agentId: string, todos: AgentTodos["todos
 
 export interface WorkLog {
   id: string;
-  agentId: string;
-  action: string;
+  agentId?: string;
+  type: string;
   summary: string;
   details?: string;
   metadata?: Record<string, any>;
@@ -914,7 +926,17 @@ export interface WorkLog {
 }
 
 export async function getWorkLogs(agentId: string, limit: number = 50): Promise<WorkLog[]> {
-  return fetchJSON(`${BASE}/logs/${agentId}?limit=${limit}`);
+  const data = await fetchJSON<{ logs: any[]; agentId?: string }>(`${BASE}/logs/${agentId}?limit=${limit}`);
+  const rows = data?.logs ?? (Array.isArray(data) ? data : []);
+  return rows.map((r: any) => ({
+    id: r.id,
+    agentId: r.agentId ?? r.agent_id,
+    type: r.type ?? r.action ?? "discussion",
+    summary: r.summary ?? "",
+    details: typeof r.details === "string" ? r.details : (r.details ? JSON.stringify(r.details) : undefined),
+    metadata: r.metadata,
+    createdAt: r.createdAt ?? r.created_at ?? 0,
+  }));
 }
 
 // ---------------------------------------------------------------------------

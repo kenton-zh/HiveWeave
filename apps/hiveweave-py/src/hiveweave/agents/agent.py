@@ -45,6 +45,7 @@ from hiveweave.services.org import OrgService
 from hiveweave.services.permission import permission_service, PermissionService
 from hiveweave.services.skill_registry import SkillRegistryService
 from hiveweave.services.system_state import system_state
+from hiveweave.services.work_log import WorkLogService
 from hiveweave.tools.executor import ToolExecutor
 
 log = structlog.get_logger(__name__)
@@ -333,10 +334,27 @@ class Agent:
         self._model_service = ModelService()
         self._memory = MemoryService()
         self._chat_msg = ChatMessageService()
+        self._work_log = WorkLogService()
 
         # ── 缓存 ──
         self._identity_prompt: str | None = None
         self._workspace_path: str | None = None
+
+        # ── 后台 inbox watcher（BUG-010 修复）───────────────
+        # 启动协程，每 5s 轮询未读 inbox 消息并触发 trigger。
+        # 解决：executor inbox→agent.run() 链路断裂 — API 写入 inbox 后
+        # 没有调用方主动 trigger target agent。
+        self._inbox_watcher_task: asyncio.Task | None = None
+        self._stop_watcher = False
+        try:
+            loop = asyncio.get_running_loop()
+            self._inbox_watcher_task = loop.create_task(
+                self._inbox_watcher_loop(),
+                name=f"agent-{agent_id}-inbox-watcher",
+            )
+        except RuntimeError:
+            # 没有 running loop（e.g. 测试场景）— 跳过 watcher
+            pass
 
         log.info(
             "agent_init",
@@ -345,6 +363,78 @@ class Agent:
             name=config.get("name"),
             role=config.get("role"),
         )
+
+    async def _inbox_watcher_loop(self) -> None:
+        """BUG-010 修复：后台轮询 inbox，未读时触发 trigger_subordinate。
+
+        间隔 5s（与前端的 chat polling 节流一致），避免过度空转。
+        只在 idle 状态触发；processing 状态由 trigger 自己 skip。
+
+        BUG-010 增强：如果 trigger 返回后 agent 仍 idle 且仍有 pending
+        inbox 消息，说明 trigger 静默跳过了（e.g. auto-start 失败），
+        使用指数退避重试 [5s, 15s, 45s]。
+        """
+        INTERVAL_S = 5.0
+        RETRY_DELAYS = [5.0, 15.0, 45.0]  # 指数退避（秒）
+        trigger_fail_count = 0
+        # 启动后等 1s 再开始（避开与 trigger.py 的 100ms 起步冲突）
+        await asyncio.sleep(1.0)
+        while not self._stop_watcher:
+            try:
+                if self.status == AgentState.IDLE:
+                    pending = await self._inbox.get_pending_messages(self.id)
+                    if pending:
+                        log.info(
+                            "inbox_watcher_found_pending",
+                            agent_id=self.id,
+                            count=len(pending),
+                            trigger_fail_count=trigger_fail_count,
+                        )
+                        # 延迟导入避免循环
+                        from hiveweave.agents.trigger import trigger_subordinate
+                        await trigger_subordinate(self.id)
+
+                        # BUG-010 增强：短暂等待后检查 trigger 是否真的
+                        # 启动了处理。如果 idle 且仍有 pending，说明 trigger
+                        # 静默跳过（e.g. agent 不在 manager 中且 auto-start 失败）。
+                        await asyncio.sleep(2.0)
+                        still_pending = await self._inbox.get_pending_messages(self.id)
+                        if still_pending and self.status == AgentState.IDLE:
+                            trigger_fail_count += 1
+                            delay = (
+                                RETRY_DELAYS[min(trigger_fail_count - 1, len(RETRY_DELAYS) - 1)]
+                                if trigger_fail_count <= len(RETRY_DELAYS)
+                                else RETRY_DELAYS[-1]
+                            )
+                            log.warning(
+                                "inbox_watcher_trigger_ineffective",
+                                agent_id=self.id,
+                                pending_count=len(still_pending),
+                                trigger_fail_count=trigger_fail_count,
+                                retry_delay_s=delay,
+                            )
+                            # 退避重试 — 不 sleep interval，用退避延迟
+                            try:
+                                await asyncio.sleep(delay)
+                            except asyncio.CancelledError:
+                                break
+                            continue
+                        else:
+                            # trigger 成功，重置失败计数
+                            trigger_fail_count = 0
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(
+                    "inbox_watcher_error",
+                    agent_id=self.id,
+                    error=str(e),
+                )
+            # 用 sleep 替代固定 wait，便于 cancel
+            try:
+                await asyncio.sleep(INTERVAL_S)
+            except asyncio.CancelledError:
+                break
 
     # ── 公共 API ─────────────────────────────────────────────
 
@@ -410,8 +500,36 @@ class Agent:
             except asyncio.CancelledError:
                 pass
 
+        # BUG-010 修复：停 inbox watcher
+        self._stop_watcher = True
+        if self._inbox_watcher_task and not self._inbox_watcher_task.done():
+            self._inbox_watcher_task.cancel()
+            try:
+                await self._inbox_watcher_task
+            except asyncio.CancelledError:
+                pass
+            except RuntimeError as e:
+                # 跨 loop 取消（TestClient 等多 loop 场景）
+                if "attached to a different loop" in str(e):
+                    pass
+                else:
+                    raise
+
         # 确保状态重置
         if self.status == AgentState.PROCESSING:
+            # BUG-010 修复：cancel 时也标记 inbox 已读，避免 watcher 无限重试
+            if self.pending_inbox_msg_ids:
+                try:
+                    await self._inbox.mark_read_by_ids(
+                        self.id, self.pending_inbox_msg_ids
+                    )
+                    log.info("cancel_marked_inbox_read",
+                             agent_id=self.id,
+                             msg_count=len(self.pending_inbox_msg_ids))
+                except Exception as e:
+                    log.warning("cancel_mark_inbox_read_failed",
+                                agent_id=self.id, error=str(e))
+                self.pending_inbox_msg_ids = None
             self._reset_to_idle()
 
     async def trigger(self, trigger_type: str = "subordinate") -> dict:
@@ -750,6 +868,33 @@ class Agent:
                 "is_streaming": False,
             }
         )
+
+        # BUG-026 修复：自动写 work_log，确保前端 Logs tab 有内容。
+        # 不依赖 LLM 主动调用 write_work_log 工具——每轮完成都记录一条，
+        # summary 取最终输出（或用户消息），details 记录工具调用清单与轮次。
+        try:
+            summary_src = content if content else message
+            summary = (summary_src or "").strip().replace("\n", " ")[:140]
+            if not summary:
+                summary = "(empty response)"
+            log_type = "completion" if content else "discussion"
+            details: dict | None = None
+            if tool_calls:
+                names = sorted({
+                    tc.get("function", {}).get("name", "?")
+                    for tc in tool_calls
+                    if isinstance(tc, dict)
+                })
+                details = {
+                    "tool_calls": names,
+                    "rounds": result.get("rounds", 0),
+                }
+            await self._work_log.write_work_log(
+                self.project_id, self.id, None, log_type, summary,
+                details=details,
+            )
+        except Exception as e:
+            log.warning("auto_work_log_failed", agent_id=self.id, error=str(e))
 
         # 2. 追加到 conversation store
         # user message + tool turn messages (assistant+tool pairs) + final assistant

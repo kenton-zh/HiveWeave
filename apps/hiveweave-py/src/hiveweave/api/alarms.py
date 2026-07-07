@@ -73,7 +73,11 @@ async def cancel_alarm(alarm_id: str, projectId: str = Query(default=None)) -> d
 
 @router.get("/api/game-time/{project_id}")
 async def get_game_time(project_id: str) -> dict:
-    """查游戏时间。"""
+    """查游戏时间。
+
+    BUG-005 修复：返回 real_started_at + 速率让前端本地计算，
+    不再需要每秒 HTTP poll。
+    """
     try:
         result = await _game_time.get_current_time(project_id)
     except Exception as e:
@@ -83,6 +87,8 @@ async def get_game_time(project_id: str) -> dict:
         "projectId": project_id,
         "gameSeconds": result.get("game_seconds", 0),
         "formatted": result.get("formatted", ""),
+        "realStartedAt": result.get("real_started_at"),
+        "realSecondsPerGameDay": result.get("real_seconds_per_game_day", 3600),
     }
 
 
@@ -111,8 +117,28 @@ async def set_game_time_speed(project_id: str, speed: int = Query(...)) -> dict:
 
 @router.get("/api/projects/{project_id}/game-time")
 async def get_game_time_compat(project_id: str) -> dict:
-    """COMPAT: 前端 api.ts 期望的 RESTful 路径"""
-    return await get_game_time(project_id)
+    """COMPAT: 前端 api.ts 期望的 RESTful 路径。
+
+    BUG-020 fix: 优雅降级，避免 project 未初始化时返回 500。
+    """
+    try:
+        result = await _game_time.get_current_time(project_id)
+    except Exception as e:
+        log.warning("get_game_time_compat_failed", project_id=project_id, error=str(e))
+        return {
+            "projectId": project_id,
+            "gameSeconds": 0,
+            "formatted": "Day 0 00:00",
+            "realStartedAt": None,
+            "realSecondsPerGameDay": 3600,
+        }
+    return {
+        "projectId": project_id,
+        "gameSeconds": result.get("game_seconds", 0),
+        "formatted": result.get("formatted", ""),
+        "realStartedAt": result.get("real_started_at"),
+        "realSecondsPerGameDay": result.get("real_seconds_per_game_day", 3600),
+    }
 
 
 @router.get("/api/projects/{project_id}/alarms")

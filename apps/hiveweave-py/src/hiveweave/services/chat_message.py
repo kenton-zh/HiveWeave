@@ -249,4 +249,13 @@ class ChatMessageService:
         d["is_background"] = bool(d.get("is_background"))
         d["is_read"] = bool(d.get("is_read"))
         d["is_context"] = bool(d.get("is_context"))
+        # BUG-034 fix: add camelCase aliases — frontend mapDbToChatMessages()
+        # reads camelCase but DB columns are snake_case. Without these aliases,
+        # isTeamChannelMessage() always returns false and "团队沟通" never shows.
+        d["isBackground"] = d["is_background"]
+        d["isStreaming"] = d["is_streaming"]
+        d["isRead"] = d["is_read"]
+        d["isContext"] = d["is_context"]
+        d["teamFromAgentId"] = d.get("team_from_agent_id")
+        d["teamToAgentId"] = d.get("team_to_agent_id")
         return d

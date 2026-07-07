@@ -101,6 +101,8 @@ async def init_meta_db() -> None:
         _db.row_factory = aiosqlite.Row
 
         # WAL mode for Meta DB (global, concurrent reads)
+        # BUG-009/012/013 fix: explicitly set UTF-8 encoding to prevent CJK mojibake
+        await _db.execute("PRAGMA encoding = 'UTF-8'")
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA busy_timeout=5000")
         await _db.execute("PRAGMA foreign_keys=ON")

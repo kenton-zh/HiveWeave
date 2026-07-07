@@ -38,6 +38,28 @@ function countNodes(node: OrgNodeData): number {
   return n;
 }
 
+/** BUG-018 fix: Recursively sanitize org-tree data, removing nodes with
+ *  missing/empty ids and ensuring all required fields have defaults.
+ *  Prevents blank node cards caused by malformed agent records. */
+function sanitizeTree(nodes: OrgNodeData[]): OrgNodeData[] {
+  const out: OrgNodeData[] = [];
+  for (const n of nodes) {
+    if (!n || !n.id) continue; // skip malformed entries
+    const cleaned: OrgNodeData = {
+      id: n.id,
+      name: n.name || "?",
+      role: n.role || "unknown",
+      position: n.position || "",
+      status: n.status || "idle",
+    };
+    if (Array.isArray(n.children) && n.children.length) {
+      cleaned.children = sanitizeTree(n.children);
+    }
+    out.push(cleaned);
+  }
+  return out;
+}
+
 function getMaxDepth(node: OrgNodeData, d = 0): number {
   if (!node.children?.length) return d;
   return Math.max(...node.children.map((c) => getMaxDepth(c, d + 1)));
@@ -583,15 +605,19 @@ function OrgTree() {
         } else {
           parsed = [];
         }
-        setRoots(parsed);
+        // BUG-018: sanitize tree data before setting state
+        const sanitized = sanitizeTree(parsed);
+        setRoots(sanitized);
         // Reset fit flag so auto-fit triggers for new data
         fittedRef.current = null;
         // Auto-select CEO
-        if (parsed.length > 0 && !selectedAgentId) {
-          const ceo = findCEO(parsed);
+        if (sanitized.length > 0 && !selectedAgentId) {
+          const ceo = findCEO(sanitized);
           if (ceo) setSelectedAgent(ceo.id);
         }
-      } catch (err) {
+      } catch (err: any) {
+        // BUG-018 修复：AbortError 静默忽略，不清空 roots
+        if (err?.name === "AbortError" || err?._aborted) return;
         console.error("Failed to fetch org tree:", err);
         if (mounted) setRoots([]);
       }
@@ -611,46 +637,42 @@ function OrgTree() {
     return null;
   }
 
-  // Polling: communications + approvals
-  useEffect(() => {
-    if (!selectedProjectId) return;
-    let mounted = true;
-    const poll = async () => {
-      try {
-        const comms = await getCommunications();
-        if (mounted && Array.isArray(comms)) setActiveCommunications(comms);
-        const approvals = await getProjectPendingApprovals(selectedProjectId);
-        if (mounted) setAllPendingApprovals(approvals);
-      } catch { /* ignore */ }
-    };
-    poll();
-    const i = setInterval(poll, 3000);
-    return () => { mounted = false; clearInterval(i); };
-  }, [selectedProjectId]);
-
-  // Polling: user pings
-  useEffect(() => {
-    let mounted = true;
-    const poll = async () => {
-      try {
-        const pings = await getUserPings();
-        if (mounted && pings?.agentIds) setUserPingAgentIds(pings.agentIds);
-      } catch { /* ignore */ }
-    };
-    poll();
-    const i = setInterval(poll, 3000);
-    return () => { mounted = false; clearInterval(i); };
-  }, []);
-
-  // Polling: pending scheduled alarms (per-agent countdown pills)
+  // Combined polling: communications + approvals + user pings + alarms
+  // BUG-027/005 fix: merge 3 separate useEffect polling loops into 1 to
+  // reduce React hook pressure and HMR deps-array instability.
+  // Jitter each poll cycle randomly (3000 ± 400ms) so 3s-interval endpoints
+  // don't pile up synchronously.
   useEffect(() => {
     if (!selectedProjectId) { setAgentAlarms({}); return; }
+    const projectId = selectedProjectId; // non-null after guard
     let mounted = true;
-    const poll = async () => {
+
+    async function pollComms() {
       try {
-        const data = await getProjectAlarms(selectedProjectId);
+        const comms = await getCommunications({ projectId });
+        if (mounted) setActiveCommunications(comms);
+        const approvals = await getProjectPendingApprovals(projectId);
+        if (mounted) setAllPendingApprovals(approvals);
+      } catch { /* ignore transient network errors */ }
+    }
+
+    async function pollPings() {
+      try {
+        const pings = await getUserPings({ projectId });
+        if (!mounted || !Array.isArray(pings)) return;
+        const ids = new Set<string>();
+        for (const p of pings) {
+          if (Array.isArray(p.agentIds)) p.agentIds.forEach((id) => ids.add(id));
+          else if (p.agentId) ids.add(p.agentId);
+        }
+        setUserPingAgentIds([...ids]);
+      } catch { /* ignore */ }
+    }
+
+    async function pollAlarms() {
+      try {
+        const data = await getProjectAlarms(projectId);
         if (!mounted) return;
-        // Keep only the soonest pending alarm per recipient agent
         const map: Record<string, AgentAlarmInfo> = {};
         for (const a of data.alarms) {
           const ex = map[a.toAgentId];
@@ -665,10 +687,32 @@ function OrgTree() {
         }
         setAgentAlarms(map);
       } catch { /* ignore */ }
+    }
+
+    const jitter = () => 3000 + Math.random() * 800 - 400; // 2600–3400ms
+
+    // Initial polls staggered by 200ms to avoid thundering-herd
+    pollComms();
+    const t1 = setTimeout(() => pollPings(), 200);
+    const t2 = setTimeout(() => pollAlarms(), 400);
+
+    let commsTimer: ReturnType<typeof setTimeout>;
+    let pingsTimer: ReturnType<typeof setTimeout>;
+    let alarmsTimer: ReturnType<typeof setTimeout>;
+
+    function scheduleComms() { commsTimer = setTimeout(() => { pollComms(); scheduleComms(); }, jitter()); }
+    function schedulePings() { pingsTimer = setTimeout(() => { pollPings(); schedulePings(); }, jitter()); }
+    function scheduleAlarms() { alarmsTimer = setTimeout(() => { pollAlarms(); scheduleAlarms(); }, jitter()); }
+
+    scheduleComms();
+    schedulePings();
+    scheduleAlarms();
+
+    return () => {
+      mounted = false;
+      clearTimeout(t1); clearTimeout(t2);
+      clearTimeout(commsTimer); clearTimeout(pingsTimer); clearTimeout(alarmsTimer);
     };
-    poll();
-    const i = setInterval(poll, 3000);
-    return () => { mounted = false; clearInterval(i); };
   }, [selectedProjectId]);
 
   const handleSelect = useCallback((id: string) => {

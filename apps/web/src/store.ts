@@ -4,9 +4,9 @@ import type { Project } from "./api";
 
 interface ActiveCommunication {
   id: string;
-  fromAgentId: string;
-  toAgentId: string;
-  type: "dispatch" | "message" | "trigger" | "peer";
+  fromAgentId?: string;
+  toAgentId?: string;
+  type: string;
   createdAt: number;
 }
 
@@ -230,10 +230,20 @@ export const useAppStore = create<AppState>((set, get) => ({
   closeAddAgent: () => set({ showAddAgent: false, addAgentParentId: null }),
   // Runtime processing status
   processingAgents: [],
-  setProcessingAgents: (ids) => set({ processingAgents: ids }),
+  setProcessingAgents: (ids) => set((state) => {
+    // Avoid unnecessary re-renders when the list hasn't changed
+    if (state.processingAgents.length === ids.length &&
+        state.processingAgents.every((a, i) => a === ids[i])) {
+      return state;
+    }
+    return { processingAgents: ids };
+  }),
   updateProcessingAgent: (id, processing) =>
     set((state) => {
       const current = new Set(state.processingAgents);
+      const wasProcessing = current.has(id);
+      // No change — return same reference to skip re-render
+      if (processing === wasProcessing) return state;
       if (processing) current.add(id);
       else current.delete(id);
       return { processingAgents: [...current] };

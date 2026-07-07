@@ -345,6 +345,7 @@ META_DB_INDEXES = [
 
 PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_inbox_to_agent ON inbox(to_agent_id, read)",
+    "CREATE INDEX IF NOT EXISTS idx_inbox_created_at ON inbox(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_chat_messages_agent_id ON chat_messages(agent_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_conversation_turns_agent_id ON conversation_turns(agent_id, turn_index)",
     "CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories(agent_id, scope)",

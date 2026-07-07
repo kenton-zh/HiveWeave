@@ -25,21 +25,32 @@ function nextStatus(s: "todo" | "doing" | "done"): "todo" | "doing" | "done" {
 }
 
 export default function GoalsPanel({ projectId }: Props) {
-  const [goals, setGoals] = useState<GoalsData>({ objective: "", focus: "", keyResults: [], userInvolvement: "宏观决策+技术选型" });
+  const DEFAULT_GOALS: GoalsData = { objective: "", focus: "", keyResults: [], userInvolvement: "宏观决策+技术选型" };
+  const [goals, setGoals] = useState<GoalsData>(DEFAULT_GOALS);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [newKR, setNewKR] = useState("");
   const [editingIdx, setEditingIdx] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
 
   useEffect(() => {
     setLoading(true);
+    setError(null);
     getProjectGoals(projectId)
       .then((res) => {
-        if (res.goals) setGoals(res.goals);
+        // BUG-021 修复：goals 可能是 null/undefined，或缺少 keyResults 数组，
+        // 必须先 normalize 再 setState，否则 .filter() 崩溃。
+        const normalized = res?.goals
+          ? { ...DEFAULT_GOALS, ...res.goals, keyResults: res.goals.keyResults || [] }
+          : DEFAULT_GOALS;
+        setGoals(normalized);
       })
-      .catch((err) => console.warn("Failed to load goals:", err))
+      .catch((err) => {
+        console.warn("Failed to load goals:", err);
+        setError(err instanceof Error ? err.message : "加载目标失败");
+      })
       .finally(() => setLoading(false));
   }, [projectId]);
 
@@ -118,6 +129,33 @@ export default function GoalsPanel({ projectId }: Props) {
     return (
       <div className="h-full flex items-center justify-center text-gray-500 text-sm">
         加载中...
+      </div>
+    );
+  }
+
+  // BUG-007 修复：API 失败时显示错误+重试，而非静默空表单
+  if (error) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-3 text-sm">
+        <div className="text-red-400">{error}</div>
+        <button
+          onClick={() => {
+            setError(null);
+            setLoading(true);
+            getProjectGoals(projectId)
+              .then((res) => {
+                const normalized = res?.goals
+                  ? { ...DEFAULT_GOALS, ...res.goals, keyResults: res.goals.keyResults || [] }
+                  : DEFAULT_GOALS;
+                setGoals(normalized);
+              })
+              .catch((err) => setError(err instanceof Error ? err.message : "加载目标失败"))
+              .finally(() => setLoading(false));
+          }}
+          className="px-3 py-1 text-xs bg-surface-card border border-surface-border hover:border-accent/50 text-gray-300 rounded-md transition-colors"
+        >
+          重试
+        </button>
       </div>
     );
   }

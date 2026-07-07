@@ -27,6 +27,7 @@ from hiveweave.services.approval import (
 )
 from hiveweave.services.charter import CharterService
 from hiveweave.services.inbox import InboxService
+from hiveweave.services.model import ModelService
 from hiveweave.services.org import OrgService
 from hiveweave.services.permission import PermissionService
 from hiveweave.services.roster import RosterService
@@ -208,7 +209,8 @@ class ToolExecutor:
             )
 
         if name == "read_file":
-            file_path = args.get("filePath") or ""
+            # BUG-008 修复：兼容 LLM 试错的多种字段名（filePath / file_path / path）
+            file_path = (args.get("filePath") or args.get("file_path") or args.get("path") or "").strip()
             offset = int(args.get("offset") or 0)
             limit = int(args.get("limit") or 2000)
             return await read_file(
@@ -217,17 +219,33 @@ class ToolExecutor:
             )
 
         if name == "write_file":
-            file_path = args.get("filePath") or ""
+            # BUG-008 修复：兼容 LLM 试错的多种字段名
+            file_path = (args.get("filePath") or args.get("file_path") or args.get("path") or "").strip()
             content = args.get("content") or ""
             return await write_file(
                 file_path=file_path, content=content,
                 workspace_path=workspace_path,
             )
 
+        if name == "edit_file":
+            # BUG-008 修复：兼容多种字段名。apply_patch 内部 _normalize_patches
+            # 已经处理 single-patch 形式 + 多 key 别名，我们只负责把 LLM 输入
+            # 透传过去（让 _normalize 兜底）。
+            return await apply_patch(
+                patches=None,
+                workspace_path=workspace_path,
+                raw_input=args,
+            )
+
         if name == "list_files":
-            path = args.get("path") or ""
+            # BUG-008 修复：兼容 dirPath / directory / filePath
+            path = (args.get("dirPath") or args.get("directory") or args.get("path") or args.get("filePath") or "").strip()
+            # BUG-019 修复：支持 recursive + maxdepth
+            recursive = bool(args.get("recursive", False))
+            maxdepth = int(args.get("maxdepth") or 1)
             return await list_files(
                 path=path, workspace_path=workspace_path,
+                recursive=recursive, maxdepth=maxdepth,
             )
 
         if name == "grep":
@@ -323,6 +341,9 @@ class ToolExecutor:
 
         if name == "read_work_logs":
             return await self._tool_read_work_logs(agent_id, args)
+
+        if name == "write_work_log":
+            return await self._tool_write_work_log(agent_id, args)
 
         # ── Roster tools ────────────────────────────────────
         if name == "read_roster":
@@ -673,21 +694,10 @@ class ToolExecutor:
                 "short_id": target.get("short_id"),
                 "message_id": msg["id"],
             })
-            # Trigger the recipient agent to process the inbox message
-            try:
-                from hiveweave.agents.trigger import trigger_coordinator, trigger_subordinate
-                target_perm = target.get("permission_type", "executor")
-                if target_perm == "coordinator":
-                    asyncio.create_task(trigger_coordinator(target["id"]))
-                else:
-                    asyncio.create_task(trigger_subordinate(target["id"]))
-                log.info("tool.send_message.triggered",
-                         from_agent=agent_id[:8],
-                         to_agent=target["id"][:8],
-                         trigger_type=target_perm)
-            except Exception as e:
-                log.warning("tool.send_message.trigger_failed",
-                            to_agent=target["id"][:8], error=str(e))
+            # BUG-022 fix: do NOT trigger here — the target agent's inbox watcher
+            # (agent.py:_inbox_watcher_loop) polls every 5s and triggers autonomously.
+            # Double-triggering (here + watcher) caused the Engineer to receive the
+            # same task twice.
 
         not_found_str = f" (not found: {not_found})" if not_found else ""
         return {
@@ -783,14 +793,29 @@ class ToolExecutor:
         perm_type = "coordinator" if role.lower() in coordinator_roles else "executor"
         perm_mode = "readonly" if perm_type == "coordinator" else "readwrite"
 
-        # Get default model_id from project's existing agents
+        # Get default model_id: 优先从项目现有 agent 继承，其次从 ModelService 取第一个 active model
         existing_agents = await self._org.list_agents(project_id)
-        model_id = "step-3.7-flash"
+        model_id = None
         if existing_agents:
             for a in existing_agents:
                 if a.get("model_id"):
                     model_id = a["model_id"]
                     break
+        if not model_id:
+            try:
+                ms = ModelService()
+                active = await ms.list_active()
+                if active:
+                    # 优先选非 free 的 step 系列模型，否则第一个 active
+                    step_models = [m for m in active if "step" in (m.get("model_id") or "").lower()]
+                    non_free = [m for m in active if not (m.get("is_free") or m.get("free", False))]
+                    chosen = step_models[0] if step_models else (non_free[0] if non_free else active[0])
+                    model_id = chosen.get("model_id") or chosen.get("id")
+                    log.info("tool.hire_agent.model_from_service", model_id=model_id)
+            except Exception as e:
+                log.warning("tool.hire_agent.model_service_failed", error=str(e))
+        if not model_id:
+            model_id = "step-3.7-flash"  # fallback
 
         # Get language from project
         project_row = await meta_db.query_one(
@@ -821,6 +846,25 @@ class ToolExecutor:
             new_agent = await self._org.create_agent(attrs)
             new_id = new_agent.get("id", "?")
             new_short = new_agent.get("short_id", "?")
+
+            # BUG-010 修复：创建后立即启动 agent，让它能处理 inbox 消息。
+            # 否则 hire_agent 创建的 executor 只是 DB 一行，无法消费任务。
+            try:
+                from hiveweave.agents.supervisor import agent_manager
+                from hiveweave.realtime.event_bus import create_agent_callbacks
+                on_status, on_stream = create_agent_callbacks(new_id, project_id)
+                started = await agent_manager.start_agent(
+                    new_id, project_id, new_agent,
+                    on_stream_event=on_stream, on_status_change=on_status,
+                )
+                log.info("tool.hire_agent.started",
+                         agent_id=agent_id, new_agent_id=new_id,
+                         new_short_id=new_short, name=name, role=role,
+                         status=started.status.value if started else "none")
+            except Exception as start_err:
+                log.warning("tool.hire_agent.start_failed",
+                            new_agent_id=new_id, error=str(start_err))
+
             log.info("tool.hire_agent", agent_id=agent_id,
                      new_agent_id=new_id, new_short_id=new_short,
                      name=name, role=role)
@@ -1003,3 +1047,35 @@ class ToolExecutor:
             ts = log.get("created_at", 0)
             lines.append(f"[{ts}] {log.get('agent_id', '?')[:8]}... ({log.get('log_type', '?')}): {log.get('content', '')[:100]}")
         return {"success": True, "output": f"=== Work Logs ({len(all_logs)}) ===\n" + "\n".join(lines), "error": None}
+
+    async def _tool_write_work_log(self, agent_id: str, args: dict) -> dict:
+        """write_work_log: record a work log entry for the calling agent.
+
+        BUG-026 修复：补上 write_work_log 工具的实际分发。之前该工具只在
+        agent.py 的 _TOOL_DESCRIPTIONS 里声明，LLM 调用时 _dispatch 找不到
+        对应分支，返回 "Unknown tool: write_work_log"，导致 work-logs 永远为空。
+        """
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project_id")
+        from hiveweave.services.work_log import WorkLogService
+
+        wl = WorkLogService()
+        log_type = args.get("type") or args.get("logType") or "discussion"
+        summary = (
+            args.get("summary")
+            or args.get("content")
+            or args.get("message")
+            or ""
+        )
+        if not summary:
+            return self._error("write_work_log requires 'summary'")
+        details = args.get("details") or args.get("metadata")
+        log_id = await wl.write_work_log(
+            project_id, agent_id, None, log_type, summary, details=details,
+        )
+        return {
+            "success": True,
+            "output": f"Work log written (id={log_id[:8]}..., type={log_type}).",
+            "error": None,
+        }

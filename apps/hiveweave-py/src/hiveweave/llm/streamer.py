@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import time
 import uuid
@@ -1051,10 +1052,16 @@ class Streamer:
 
         用 asyncio.wait_for 包裹 aiter_bytes 的每次迭代。
         超时抛 asyncio.TimeoutError → 由调用方归类为 RetryableError。
+
+        BUG-009/012/013 修复：用增量 UTF-8 解码器（codecs.getincrementaldecoder）
+        替代逐 chunk `raw.decode("utf-8", errors="replace")`。后者会在多字节字符
+        被网络分片切断时产生 U+FFFD，导致中文花名/消息/工具参数损坏（mojibake）。
+        增量解码器跨 chunk 缓冲未完成字节，正确重组字符。
         """
         buffer = ""
         first_received = False
         aiter = response.aiter_bytes().__aiter__()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         while True:
             timeout = FIRST_CHUNK_TIMEOUT_S if not first_received else IDLE_TIMEOUT_S
@@ -1067,7 +1074,9 @@ class Streamer:
             if not raw:
                 continue
 
-            text = raw.decode("utf-8", errors="replace")
+            text = decoder.decode(raw)
+            if not text:
+                continue
             buffer += text
 
             # 解析完整的 SSE 事件
@@ -1075,7 +1084,10 @@ class Streamer:
             for event in events:
                 yield event
 
-        # 处理流结束后剩余的 buffer
+        # flush 增量解码器残余字节 + 处理流结束后剩余的 buffer
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            buffer += tail
         if buffer:
             events, _ = parse_sse(buffer)
             for event in events:

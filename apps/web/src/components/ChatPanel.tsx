@@ -106,10 +106,13 @@ const statusLabels: Record<string, { text: string; color: string }> = {
 
 
 function isTeamChannelMessage(msg: ChatMessage): boolean {
-  if (msg.isContext) return false;
+  // BUG-034 root-cause fix: 触发器保存的 team 消息同时标记了 is_context=True
+  // (用于 inbox 注入 LLM 上下文),但前端的 isTeamChannelMessage 不能因此排除
+  // 它们 — 否则 teamMessages 永远为空,hasTeamComms=false,折叠区永不显示。
+  // 判定完全交给 isBackground+role 双条件,已足够精确。
   return (
     msg.role === "team" ||
-    (msg.isBackground && (msg.role === "user" || msg.role === "assistant"))
+    (msg.isBackground === true && (msg.role === "user" || msg.role === "assistant"))
   ) as boolean;
 }
 
@@ -421,6 +424,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const pendingQueueRef = useRef<string[]>([]);
   const autoSendRef = useRef(false);
   const handleSendRef = useRef<() => void>(() => {});
+  const sendingLockRef = useRef(false);  // BUG-022 修复：防止快速双击导致重复发送
   const [retryInfo, setRetryInfo] = useState<{ attempt: number; maxRetries: number; reason: string } | null>(null);
   const [images, setImages] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -672,8 +676,16 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       else break;
     }
     const hasStreamingPlaceholder = foreground.some((m) => m.isStreaming && m.role === "assistant");
-    if (trailingUserCount >= 1 && !isAgentProcessing && !hasStreamingPlaceholder && !isStreaming) {
-      const lastUser = foreground[foreground.length - 1];
+    // BUG-003 修复：加 5s 时间阈值，避免 user 发消息瞬间 isAgentProcessing
+    // 还没来得及更新就误报"上次对话未收到回复"。
+    const ORPHAN_WARN_DELAY_MS = 5000;
+    const now = Date.now();
+    const lastUser = foreground[foreground.length - 1];
+    const userMsgAge = lastUser?.role === "user" && lastUser?.timestamp
+      ? now - lastUser.timestamp
+      : Infinity;
+    if (trailingUserCount >= 1 && !isAgentProcessing && !hasStreamingPlaceholder && !isStreaming
+        && userMsgAge > ORPHAN_WARN_DELAY_MS) {
       if (lastUser?.role === "user") {
         const warn = trailingUserCount >= 2
           ? "你已发送多条消息但 Agent 尚未回复。请等待当前任务完成，或检查网络/API 配置后重试。"
@@ -825,6 +837,17 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   const handleSend = useCallback(() => {
     if (!agentId) return;
 
+    // BUG-022 修复：防止快速双击/重连导致重复发送。
+    // autoSend 由 finishTurn 触发，此时当前 stream 已结束，锁已释放。
+    if (!autoSendRef.current && sendingLockRef.current) {
+      if (input.trim()) {
+        pendingQueueRef.current.push(input.trim());
+        setInput("");
+        setQueuedCount(pendingQueueRef.current.length);
+      }
+      return;
+    }
+
     let messageText: string;
     if (autoSendRef.current) {
       autoSendRef.current = false;
@@ -843,12 +866,16 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
 
     if (!messageText) return;
 
+    // 上锁，直到本次 stream 最终结束
+    sendingLockRef.current = true;
+
     const sendingImages = images;
     setImages([]);
 
     const sendingForAgentId = agentId;
     const isActiveSession = () => activeAgentIdRef.current === sendingForAgentId;
-    const finishTurn = () => {
+    const releaseLockAndFinish = () => {
+      sendingLockRef.current = false;
       if (pendingQueueRef.current.length > 0) {
         autoSendRef.current = true;
         setTimeout(() => handleSend(), 300);
@@ -869,26 +896,38 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       updateStreamDraft(null);
       updateProcessingAgent(sendingForAgentId, false);
       loadMessagesFromDb(sendingForAgentId);
-      finishTurn();
+      releaseLockAndFinish();
     }, 300_000);
     const allToolsUsed = new Set<string>();
     let _dbgTextCount = 0;
     let _dbgFirstText = 0;
     const controller = new AbortController();
     abortControllerRef.current = controller;
+    // BUG-FIX 优化：立即把 user 消息以 placeholder 形式显示，
+    // 避免 message_id 未到达前消息"消失"（最长可等 joinAgentChannel + 后端 save + WS 推送）。
+    // 当 message_id 事件到达时，会去重并替换为真实 ID。
+    const optimisticUserId = `pending-user-${sendingForAgentId}-${Date.now()}`;
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === optimisticUserId)) return prev;
+      return [...prev, {
+        id: optimisticUserId, role: "user" as const, content: messageText,
+        timestamp: Date.now(), isBackground: false, isRead: true,
+      }];
+    });
+
     streamChat(sendingForAgentId, messageText, sendingImages, (event) => {
       if (!isActiveSession()) return;
       if (event.type === "message_id") {
         try {
           const parsed = JSON.parse(event.data);
           if (parsed.role === "user" && parsed.id) {
-            // Optimistic user message — appears immediately before loadMessagesFromDb resolves
-            const now = Date.now();
+            // 用真实 ID 替换占位符
             setMessages((prev) => {
-              if (prev.some((m) => m.id === parsed.id)) return prev;
-              return [...prev, {
+              const without = prev.filter((m) => m.id !== optimisticUserId);
+              if (without.some((m) => m.id === parsed.id)) return without;
+              return [...without, {
                 id: parsed.id, role: "user" as const, content: messageText,
-                timestamp: now, isBackground: false, isRead: true,
+                timestamp: Date.now(), isBackground: false, isRead: true,
               }];
             });
           }
@@ -1017,7 +1056,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
             updateProcessingAgent(sendingForAgentId, false);
             setRetryInfo(null);
             loadMessagesFromDb(sendingForAgentId);
-            finishTurn();
+            releaseLockAndFinish();
           }, extraMs);
         } catch {}
       } else if (event.type === "queued_message") {
@@ -1039,7 +1078,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           updateStreamDraft(null);
           setIsStreaming(false);
         });
-        finishTurn();
+        releaseLockAndFinish();
       } else if (event.type === "busy") {
         // Agent is processing a previous message — restore input so user doesn't lose their text
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
@@ -1051,6 +1090,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         pendingQueueRef.current = [];
         setQueuedCount(0);
         autoSendRef.current = false;
+        sendingLockRef.current = false;
       } else if (event.type === "error") {
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setRetryInfo(null);
@@ -1064,7 +1104,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         loadMessagesFromDb(sendingForAgentId);
         updateStreamDraft(null);
         setIsStreaming(false);
-        finishTurn();
+        releaseLockAndFinish();
       }
     });
   }, [agentId, input, isStreaming, isAgentProcessing, hasUnansweredUser, refreshOrgTree, loadMessagesFromDb]);

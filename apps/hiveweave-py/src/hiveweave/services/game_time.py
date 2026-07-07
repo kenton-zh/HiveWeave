@@ -30,7 +30,13 @@ async def _conn(project_id: str):
     workspace = await meta_db.get_project_workspace(project_id)
     if not workspace:
         raise ValueError(f"Workspace not found for project {project_id}")
-    return await ensure_project_db(workspace)
+    # BUG-020 修复：切项目后 DB 可能尚未创建/迁移，强制 ensure schema 后再返回连接
+    try:
+        return await ensure_project_db(workspace)
+    except Exception as e:
+        log.error("game_time.ensure_project_db_failed",
+                  project_id=project_id, workspace=workspace, error=str(e))
+        raise
 
 
 async def _query(project_id, sql, params=None):
@@ -61,7 +67,14 @@ class GameTimeService:
         state = _states.get(project_id) or await self._load_state(project_id)
         _states[project_id] = state
         gs = state["current_game_seconds"]
-        return {"game_seconds": gs, "formatted": self._format(gs)}
+        # BUG-005 修复：返回 real_started_at 让前端能做纯本地时间计算，
+        # 不再需要每秒 HTTP poll 拉 formatted 字符串。
+        return {
+            "game_seconds": gs,
+            "formatted": self._format(gs),
+            "real_started_at": state.get("real_started_at", int(time.time())),
+            "real_seconds_per_game_day": REAL_SECONDS_PER_GAME_DAY,
+        }
 
     async def start(self, project_id: str) -> None:
         state = await self._load_state(project_id)
