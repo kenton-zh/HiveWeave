@@ -355,9 +355,7 @@ async def build_trigger_context(
             h_status = h.get("status") or ""
             report_tag = " (report required)" if h.get("expect_report") else ""
             lines.append(
-                f"  - From: {from_name}\n"
-                f"    Task: {summary}\n"
-                f"    Status: {h_status}{report_tag}"
+                f"[来自: {from_name}] Task: {summary} (Status: {h_status}{report_tag})"
             )
         handoff_text = "\n".join(lines)
         blocks.append(
@@ -370,7 +368,7 @@ async def build_trigger_context(
         lines = []
         for m in rework_msgs:
             from_name = await _agent_name(m.get("from_agent_id", ""))
-            lines.append(f"  - From: {from_name}\n    {m.get('message', '')}")
+            lines.append(f"[来自: {from_name}] REJECTED — {m.get('message', '')}")
         rework_text = "\n".join(lines)
         blocks.append(
             f"## WORK REJECTED — Rework Required\n{rework_text}\n\n"
@@ -378,21 +376,22 @@ async def build_trigger_context(
         )
 
     # ── 3. Messages block ──
+    # BUG-036: Use [来自: 名称] format matching the LLM prompt's expected
+    # format. Previously used "From: name" which LLMs didn't recognize.
     if other_msgs:
         lines = []
         for m in other_msgs:
-            prefix = "**[REPLY REQUIRED]** " if m.get("expect_report") else ""
+            reply_tag = " **[REPLY REQUIRED]**" if m.get("expect_report") else ""
             from_name = await _agent_name(m.get("from_agent_id", ""))
-            msg_type = m.get("message_type", "normal")
             priority = m.get("priority", "normal")
+            prio_tag = " 🔴" if priority == "urgent" else ""
             lines.append(
-                f"  - From: {from_name} (type={msg_type}, priority={priority})\n"
-                f"    {prefix}{m.get('message', '')}"
+                f"[来自: {from_name}]{reply_tag}{prio_tag}\n"
+                f"{m.get('message', '')}"
             )
-        msg_text = "\n".join(lines)
+        msg_text = "\n\n".join(lines)
         blocks.append(
-            f"## Messages (from other agents — reply in CAVEMAN style, "
-            f"NO pleasantries)\n{msg_text}"
+            f"## Messages (reply in CAVEMAN style, NO pleasantries)\n{msg_text}"
         )
 
     # ── 4 & 5. Coordinator 专属 blocks ──
