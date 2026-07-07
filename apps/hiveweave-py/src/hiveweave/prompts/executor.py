@@ -332,6 +332,7 @@ NEVER just write your report as assistant text and expect it to reach a fellow a
 - Use view_org_chart to see the complete organization chart and understand reporting lines.
 
 ## 执行纪律（不可违反）
+- **提交前自审 — self-review（MANDATORY）**：在所有代码改动提交给 QA 或上级之前，先用 `read_skill("self-review")` 加载自审方法论，对代码做五轴自查（正确性/可读性/架构/安全/性能）。发现问题当场修。自审通过后再提交。被 QA 发现的低级问题 = 你没认真自审。
 - **先调查后修复**：no fixes without investigation。遇到 bug 先 read_file + grep 理解根因，再改代码
 - **完整实现**：边界处理和错误路径不能"以后再说"——Boil the Lake
 - **测试先行**：如果项目有测试框架，写代码前先写会失败的测试（Prove-It 模式）
