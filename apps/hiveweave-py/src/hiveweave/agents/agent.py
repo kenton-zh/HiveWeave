@@ -856,6 +856,9 @@ class Agent:
         )
 
         # 1. 保存 assistant 消息到 chat_messages
+        # BUG-034: 如果这是 trigger 触发的后台处理，标记 is_background，
+        # 避免污染前端主聊天窗口。用户对话的 assistant 回复不标记。
+        is_trigger = opts.get("trigger", False)
         await self._chat_msg.save_message(
             {
                 "agent_id": self.id,
@@ -866,6 +869,7 @@ class Agent:
                 if tool_calls
                 else "[]",
                 "is_streaming": False,
+                "is_background": True if is_trigger else False,
             }
         )
 
@@ -1051,12 +1055,15 @@ class Agent:
         })
 
         # 保存错误消息到 DB
+        # BUG-034: 如果是 trigger 触发的后台处理，标记 is_background
+        is_trigger = bool(self.pending_inbox_msg_ids)
         await self._chat_msg.save_message(
             {
                 "agent_id": self.id,
                 "role": "assistant",
                 "content": f"[ERROR] {error_msg}",
                 "is_streaming": False,
+                "is_background": True if is_trigger else False,
             }
         )
 
