@@ -67,13 +67,16 @@ export function setApiKey(key: string | null) {
   _apiKey = key;
 }
 
-// Debug log helper — writes to Zustand store without circular import
+// Debug log helper — writes to Zustand store without circular import.
+// Uses queueMicrotask to avoid "Cannot update a component while rendering
+// a different component" warning when API calls happen during render.
 function dbg(category: "api" | "ws" | "error" | "info" | "state", message: string, data?: any) {
-  try {
-    // Dynamic import would be async; use getState directly via a lazy ref
-    const store = (window as any).__hwStore;
-    if (store) store.getState().addDebugLog({ category, message, data });
-  } catch { /* noop */ }
+  queueMicrotask(() => {
+    try {
+      const store = (window as any).__hwStore;
+      if (store) store.getState().addDebugLog({ category, message, data });
+    } catch { /* noop */ }
+  });
 }
 
 async function fetchJSON<T = any>(url: string, init?: RequestInit): Promise<T> {
