@@ -506,9 +506,6 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
 
   useEffect(() => {
     // BUG-034: Save streamDraft from the PREVIOUS agent before switching.
-    // React runs cleanup(oldDeps) before effect(newDeps), but by the time
-    // the effect runs, activeAgentIdRef.current is already updated. Use
-    // prevAgentIdRef to track what we're switching FROM.
     const switchingFrom = prevAgentIdRef.current;
     if (switchingFrom && switchingFrom !== agentId && streamDraftRef.current) {
       savedDraftsRef.current[switchingFrom] = streamDraftRef.current;
@@ -531,25 +528,47 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     const loadForAgentId = agentId;
     stickToBottomRef.current = true;
 
-    // BUG-034: Restore saved streamDraft if switching back to an agent
-    // that was mid-reply, and it's still processing. Register a passive
-    // handler so incoming stream events continue updating the display.
+    // BUG-034: Only reset streaming state on actual agent switch, not
+    // on orgTreeVersion re-triggers. orgTreeVersion bumps on every tool
+    // call — resetting here destroys the active stream and causes the
+    // passive handler (which doesn't merge deltas) to take over,
+    // producing thousands of "思考过程" blocks.
+    const isAgentSwitch = switchingFrom !== agentId;
+    const seemedProcessing = switchingFrom
+      ? savedDraftsRef.current[switchingFrom] != null
+      : false;
+
     const savedDraft = savedDraftsRef.current[agentId];
     const isStillProcessing = useAppStore.getState().processingAgents.includes(agentId);
-    if (savedDraft && isStillProcessing) {
+
+    if (isAgentSwitch && savedDraft && isStillProcessing) {
+      // Switching back to a still-processing agent — restore stream
       updateStreamDraft(savedDraft);
       setIsStreaming(true);
-      // Register passive event handler for ongoing stream
+      // Only use passive handler when there's no active streamChat
       subscribeAgentStream(agentId, (event) => {
         if (activeAgentIdRef.current !== agentId) return;
-        if (event.type === "text_delta") {
-          updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "text", content: event.data }] } : prev);
-        } else if (event.type === "thinking_delta") {
-          updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "thinking", content: event.data }] } : prev);
+        if (event.type === "text_delta" || event.type === "thinking_delta") {
+          // Merge deltas into last segment of same type instead of creating
+          // a new segment per event — otherwise each delta becomes a separate
+          // "思考过程" block, producing thousands of entries.
+          const segType = event.type === "thinking_delta" ? "thinking" : "text";
+          updateStreamDraft((prev) => {
+            if (!prev) return prev;
+            const last = prev.segments[prev.segments.length - 1];
+            if (last && last.type === segType) {
+              const merged = (last.content || "") + event.data;
+              return { ...prev, segments: [...prev.segments.slice(0, -1), { ...last, content: merged }] };
+            }
+            return { ...prev, segments: [...prev.segments, { type: segType, content: event.data }] };
+          });
         } else if (event.type === "tool_use") {
           try {
             const toolData = JSON.parse(event.data);
-            updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "tool_call", tool: { tool: (toolData.tool || "").replace(/^hiveweave__/, ""), input: toolData.input || {} } }] } : prev);
+            const rawName: string = toolData.tool || "";
+            const toolName = rawName.replace(/^hiveweave__/, "");
+            const toolCallSeg = { type: "tool_call" as const, tool: { tool: toolName, input: toolData.input || {} } };
+            updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, toolCallSeg] as MsgSegment[] } : prev);
           } catch {}
         } else if (event.type === "done") {
           loadMessagesFromDb(agentId).then((ok) => {
@@ -564,12 +583,14 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           delete savedDraftsRef.current[agentId];
         }
       });
-    } else {
+    } else if (isAgentSwitch) {
+      // Switching to a different agent (not restoring) — reset
       setIsStreaming(false);
       updateStreamDraft(null);
-      // Clean up saved draft if agent is no longer processing
       if (savedDraft) delete savedDraftsRef.current[agentId];
     }
+    // If NOT an agent switch (orgTreeVersion re-trigger), leave
+    // streaming state alone — the active streamChat callback handles it.
 
     // Use cached messages if available — switching back to a previously-viewed
     // agent renders instantly without waiting for the DB round-trip. The
