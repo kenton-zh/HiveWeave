@@ -347,51 +347,62 @@ async def build_trigger_context(
 
     # ── 1. Pending Tasks block ──
     if pending_handoffs or accepted_handoffs:
+        import json as _json
         all_handoffs = pending_handoffs + accepted_handoffs
         lines: list[str] = []
         for h in all_handoffs:
-            from_name = await _agent_name(h.get("from_agent_id", ""))
-            summary = h.get("summary") or ""
-            h_status = h.get("status") or ""
-            report_tag = " (report required)" if h.get("expect_report") else ""
-            lines.append(
-                f"[来自: {from_name}] Task: {summary} (Status: {h_status}{report_tag})"
-            )
-        handoff_text = "\n".join(lines)
+            entry = {
+                "from": await _agent_name(h.get("from_agent_id", "")),
+                "task": h.get("summary") or "",
+                "status": h.get("status") or "",
+            }
+            if h.get("expect_report"):
+                entry["report_required"] = True
+            lines.append(_json.dumps(entry, ensure_ascii=False))
         blocks.append(
-            f"## Pending Tasks (respond in CAVEMAN style)\n{handoff_text}"
+            "## Pending Tasks — each line is a JSON object with 'from', 'task', 'status', optional 'report_required'.\n"
+            + "\n".join(lines)
         )
         delivered_handoff_ids = [h["id"] for h in all_handoffs if h.get("id")]
 
     # ── 2. Rework block ──
     if rework_msgs:
+        import json as _json
         lines = []
         for m in rework_msgs:
-            from_name = await _agent_name(m.get("from_agent_id", ""))
-            lines.append(f"[来自: {from_name}] REJECTED — {m.get('message', '')}")
-        rework_text = "\n".join(lines)
+            entry = {
+                "from": await _agent_name(m.get("from_agent_id", "")),
+                "status": "rejected",
+                "content": m.get("message", ""),
+            }
+            lines.append(_json.dumps(entry, ensure_ascii=False))
         blocks.append(
-            f"## WORK REJECTED — Rework Required\n{rework_text}\n\n"
+            "## WORK REJECTED — Rework Required\n"
+            + "\n".join(lines) + "\n\n"
             "You must fix the issues and call report_completion again."
         )
 
     # ── 3. Messages block ──
-    # BUG-036: Use [来自: 名称] format matching the LLM prompt's expected
-    # format. Previously used "From: name" which LLMs didn't recognize.
+    # BUG-036: JSON-structured messages — no ambiguity from text formatting.
+    # Each message is one JSON line: {"from": "...", "content": "...", ...}
+    # LLM can parse fields unambiguously, unlike free-text [来自: xxx] format.
     if other_msgs:
+        import json as _json
         lines = []
         for m in other_msgs:
-            reply_tag = " **[REPLY REQUIRED]**" if m.get("expect_report") else ""
-            from_name = await _agent_name(m.get("from_agent_id", ""))
-            priority = m.get("priority", "normal")
-            prio_tag = " [URGENT]" if priority == "urgent" else ""
-            lines.append(
-                f"[来自: {from_name}]{reply_tag}{prio_tag}\n"
-                f"{m.get('message', '')}"
-            )
-        msg_text = "\n\n".join(lines)
+            entry = {
+                "from": await _agent_name(m.get("from_agent_id", "")),
+                "content": m.get("message", ""),
+            }
+            if m.get("expect_report"):
+                entry["reply_required"] = True
+            if m.get("priority") == "urgent":
+                entry["priority"] = "urgent"
+            lines.append(_json.dumps(entry, ensure_ascii=False))
+        msg_text = "\n".join(lines)
         blocks.append(
-            f"## Messages (reply in CAVEMAN style, NO pleasantries)\n{msg_text}"
+            f"## Messages — each line is a JSON object with 'from', 'content', optional 'reply_required' and 'priority'.\n"
+            f"Reply in CAVEMAN style, NO pleasantries.\n{msg_text}"
         )
 
     # ── 4 & 5. Coordinator 专属 blocks ──
