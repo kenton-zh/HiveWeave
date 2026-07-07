@@ -232,12 +232,21 @@ PROJECT_DB_TABLES = [
         to_agent_id TEXT,
         purpose TEXT,
         fire_at_game_seconds INTEGER,
+        repeat_interval_seconds INTEGER,
+        script_command TEXT,
         status TEXT DEFAULT 'pending',
         fired INTEGER DEFAULT 0,
         fired_at INTEGER,
+        last_fired_at INTEGER,
+        run_count INTEGER DEFAULT 0,
         created_at INTEGER
     )
     """,
+    # BUG-036 migration: add recurring + script columns to existing DBs
+    """ALTER TABLE scheduled_alarms ADD COLUMN repeat_interval_seconds INTEGER""",
+    """ALTER TABLE scheduled_alarms ADD COLUMN script_command TEXT""",
+    """ALTER TABLE scheduled_alarms ADD COLUMN last_fired_at INTEGER""",
+    """ALTER TABLE scheduled_alarms ADD COLUMN run_count INTEGER DEFAULT 0""",
     """
     CREATE TABLE IF NOT EXISTS questions (
         id TEXT PRIMARY KEY,

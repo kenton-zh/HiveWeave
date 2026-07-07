@@ -889,10 +889,12 @@ class ToolExecutor:
     async def _tool_schedule_alarm(
         self, agent_id: str, args: dict
     ) -> dict:
-        """Schedule a one-shot alarm/reminder."""
+        """Schedule an alarm: one-shot, recurring, with optional script."""
         to_agent = args.get("toAgentId") or args.get("to_agent_id") or ""
         purpose = args.get("purpose") or args.get("message") or ""
         fire_in = args.get("fireInGameSeconds") or args.get("fire_in_game_seconds") or 0
+        repeat = args.get("repeatIntervalSeconds") or args.get("repeat_interval_seconds") or 0
+        script = args.get("scriptCommand") or args.get("script_command") or ""
 
         if not purpose:
             return self._error("schedule_alarm requires 'purpose' (message delivered on fire)")
@@ -926,8 +928,12 @@ class ToolExecutor:
             to_agent_id=to_id,
             purpose=purpose,
             fire_at_game_seconds=fire_at,
+            repeat_interval_seconds=int(repeat) if repeat else 0,
+            script_command=str(script) if script else "",
         )
-        return {"success": True, "output": f"Alarm {alarm_id[:8]}... scheduled. Fires at game second {fire_at} (in {fire_in} game seconds).", "error": None}
+        kind = "recurring" if repeat else "one-shot"
+        extra = f", script bound" if script else ""
+        return {"success": True, "output": f"Alarm {alarm_id[:8]}... scheduled ({kind}{extra}). Fires at game second {fire_at} (in {fire_in} game seconds).", "error": None}
 
     async def _tool_list_alarms(self, agent_id: str) -> dict:
         """List all pending alarms for the project."""

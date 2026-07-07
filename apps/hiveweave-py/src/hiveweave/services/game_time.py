@@ -97,15 +97,18 @@ class GameTimeService:
 
     async def schedule_alarm(self, project_id: str, from_agent_id: str,
                              to_agent_id: str, purpose: str,
-                             fire_at_game_seconds: int) -> str:
+                             fire_at_game_seconds: int,
+                             repeat_interval_seconds: int = 0,
+                             script_command: str = "") -> str:
         alarm_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
             "INSERT INTO scheduled_alarms (id, project_id, from_agent_id, to_agent_id, "
-            "purpose, fire_at_game_seconds, status, fired, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?)",
+            "purpose, fire_at_game_seconds, repeat_interval_seconds, script_command, "
+            "status, fired, run_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?)",
             [alarm_id, project_id, from_agent_id, to_agent_id, purpose,
-             fire_at_game_seconds, now_ms])
+             fire_at_game_seconds, repeat_interval_seconds, script_command, now_ms])
         _alarm_project[alarm_id] = project_id
         state = _states.get(project_id)
         if state:
@@ -113,8 +116,11 @@ class GameTimeService:
                 "id": alarm_id, "project_id": project_id,
                 "from_agent_id": from_agent_id, "to_agent_id": to_agent_id,
                 "purpose": purpose, "fire_at_game_seconds": fire_at_game_seconds,
-                "fired": False})
-        log.info("alarm_scheduled", alarm_id=alarm_id, fire_at=fire_at_game_seconds)
+                "repeat_interval_seconds": repeat_interval_seconds,
+                "script_command": script_command,
+                "fired": False, "run_count": 0})
+        log.info("alarm_scheduled", alarm_id=alarm_id, fire_at=fire_at_game_seconds,
+                 recurring=repeat_interval_seconds > 0)
         return alarm_id
 
     async def cancel_alarm(self, alarm_id: str) -> None:
@@ -146,20 +152,24 @@ class GameTimeService:
         state["current_game_seconds"] = new_gs
         state["tick_count"] += 1
         await self._persist_time(project_id)
-        # Fire due alarms
-        # C4 fix: _fire_alarm 失败时不标记 fired、不移出内存，下次 tick 重试
+        # Fire due alarms (OpenClaw ordering: run BEFORE recompute, not after)
         due = [a for a in state["alarms"]
                if not a["fired"] and a["fire_at_game_seconds"] <= new_gs]
-        fired_ok = []
         for alarm in due:
             try:
-                await self._fire_alarm(alarm)
-                alarm["fired"] = True
-                fired_ok.append(alarm)
+                result = await self._fire_alarm(alarm)
+                if result:
+                    # Recurring: update in-memory state with new fire_at
+                    for i, a in enumerate(state["alarms"]):
+                        if a["id"] == alarm["id"]:
+                            state["alarms"][i] = result
+                            break
+                else:
+                    # One-shot: mark fired, remove from active list
+                    alarm["fired"] = True
             except Exception as e:
                 log.error("alarm_fire_failed", alarm_id=alarm["id"], error=str(e))
-                # 不标记 fired，不移出内存，下次 tick 重试
-        state["alarms"] = [a for a in state["alarms"] if a not in fired_ok]
+        state["alarms"] = [a for a in state["alarms"] if not a["fired"]]
         if state["tick_count"] % STALL_CHECK_TICKS == 0:
             await self._check_stalled(project_id)
         log.debug("game_time_tick", project_id=project_id, game_seconds=new_gs)
@@ -207,20 +217,65 @@ class GameTimeService:
             "updated_at) VALUES ('singleton', ?, ?, ?)",
             [project_id, state["current_game_seconds"], int(time.time() * 1000)])
 
-    async def _fire_alarm(self, alarm: dict) -> None:
-        # C4 fix: 先发 inbox 消息，成功后再 UPDATE DB 标记 fired
-        # 原顺序是先标记 fired 再发消息，inbox 失败则告警永久丢失
+    async def _fire_alarm(self, alarm: dict) -> dict | None:
+        """Fire an alarm. Returns updated alarm dict if recurring, None if one-shot.
+
+        C4 fix ordering preserved: send message/execute script BEFORE marking DB,
+        so failures don't lose the alarm.
+        """
+        # 1. Execute script if bound
+        script = alarm.get("script_command", "")
+        if script:
+            try:
+                import asyncio
+                proc = await asyncio.create_subprocess_shell(
+                    script,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=120
+                )
+                if proc.returncode != 0:
+                    log.warning("alarm_script_failed", alarm_id=alarm["id"],
+                                rc=proc.returncode, stderr=stderr.decode()[:200])
+            except Exception as e:
+                log.error("alarm_script_error", alarm_id=alarm["id"], error=str(e))
+
+        # 2. Send inbox notification
         to_agent = alarm.get("to_agent_id")
         if to_agent:
             from hiveweave.services.inbox import InboxService
-            msg = f"[ALARM] {alarm.get('purpose', '')}"
+            tag = "[RECURRING] " if alarm.get("repeat_interval_seconds", 0) > 0 else ""
+            msg = f"[ALARM] {tag}{alarm.get('purpose', '')}"
             await InboxService().send_message(
                 alarm.get("from_agent_id") or to_agent, to_agent, msg,
                 message_type="alarm", priority="urgent")
-        await _execute(_alarm_project.get(alarm["id"], ""),
-            "UPDATE scheduled_alarms SET fired = 1, fired_at = ?, status = 'fired' "
-            "WHERE id = ?", [int(time.time() * 1000), alarm["id"]])
-        log.info("alarm_fired", alarm_id=alarm["id"], purpose=alarm.get("purpose"))
+
+        # 3. Update DB
+        now_ms = int(time.time() * 1000)
+        repeat = alarm.get("repeat_interval_seconds", 0) or 0
+        if repeat > 0:
+            # Recurring: advance fire_at, increment run_count
+            new_fire_at = alarm["fire_at_game_seconds"] + repeat
+            await _execute(_alarm_project.get(alarm["id"], ""),
+                "UPDATE scheduled_alarms SET fired_at = ?, last_fired_at = ?, "
+                "fire_at_game_seconds = ?, run_count = run_count + 1 "
+                "WHERE id = ?",
+                [now_ms, now_ms, new_fire_at, alarm["id"]])
+            alarm["fire_at_game_seconds"] = new_fire_at
+            alarm["run_count"] = (alarm.get("run_count", 0) or 0) + 1
+            alarm["fired"] = False  # re-arm
+            log.info("alarm_recurring_fired", alarm_id=alarm["id"],
+                     next_fire=new_fire_at, run_count=alarm["run_count"])
+            return alarm
+        else:
+            # One-shot: mark fired
+            await _execute(_alarm_project.get(alarm["id"], ""),
+                "UPDATE scheduled_alarms SET fired = 1, fired_at = ?, status = 'fired' "
+                "WHERE id = ?", [now_ms, alarm["id"]])
+            log.info("alarm_fired", alarm_id=alarm["id"], purpose=alarm.get("purpose"))
+            return None
 
     async def _check_stalled(self, project_id: str) -> None:
         """Detect stalled agents and escalate (every 60s). Uses updated_at as heartbeat."""
