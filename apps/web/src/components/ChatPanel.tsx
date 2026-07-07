@@ -286,25 +286,15 @@ function ThinkingBlock({ content }: { content: string }) {
 
 function ToolCallInline({ name, input }: { name: string; input?: Record<string, any> }) {
   const hint = formatToolInputHint(name, input);
-  const icon = TOOL_ICONS[name] || "🔧";
   return (
     <div className="flex items-center gap-2 py-1 text-[12px] group">
-      <span className="text-[13px] shrink-0">{icon}</span>
-      <span className="font-medium text-amber-200/90">{name}</span>
+      {/* Dot indicator + tool name — cleaner than emoji, platform-consistent */}
+      <span className="w-2 h-2 rounded-full bg-amber-400/50 shrink-0 group-hover:bg-amber-400/80 transition-colors" />
+      <span className="font-medium text-amber-200/85 font-mono text-[11px]">{name}</span>
       {hint && <span className="text-gray-500 truncate text-[11px]">→ {hint}</span>}
     </div>
   );
 }
-
-const TOOL_ICONS: Record<string, string> = {
-  read_file: "📖", write_file: "✏️", edit_file: "✂️", delete_file: "🗑️",
-  list_files: "📂", search_files: "🔍", grep: "🔎", bash: "💻",
-  run_command: "⚡", websearch: "🌐", create_agent: "👤", hire_agent: "🤝",
-  dismiss_agent: "👋", message_agent: "💬", send_inbox: "📨",
-  read_charter: "📜", read_goals: "🎯", view_org_chart: "🏢",
-  write_charter: "📝", read_work_logs: "📋", write_work_log: "📊",
-  report_completion: "✅", ask_user: "❓",
-};
 
 function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: boolean }) {
   if (msg.role === "system") {
@@ -366,6 +356,11 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
               </div>
             )}
           </>
+        )}
+
+        {/* Streaming cursor — subtle pulsing indicator at end of text */}
+        {!isUser && isStreaming && hasSegments && (
+          <span className="inline-block w-0.5 h-4 bg-accent/60 ml-0.5 align-middle animate-pulse" />
         )}
 
         {/* Empty streaming indicator */}
