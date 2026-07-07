@@ -1026,11 +1026,23 @@ export async function browseDirectory(path?: string): Promise<BrowseResult> {
 
 export interface TraceTurn {
   id: string;
-  agent_id: string;
   turn_index: number;
-  raw_messages: any[];
+  raw_messages: RawTraceMessage[];
   approx_tokens: number;
+  tool_call_count: number;
+  summary: string;
+  message_count: number;
   created_at: number;
+}
+
+export interface RawTraceMessage {
+  role: string;
+  content?: string | null;
+  tool_calls?: any[];
+  tool_call_id?: string;
+  reasoning_content?: string;
+  thinking?: string;
+  created_at?: number;
 }
 
 export interface TraceEvent {
