@@ -30,6 +30,7 @@ from hiveweave.db import project as project_db
 from hiveweave.services.org import OrgService
 from hiveweave.services.game_time import GameTimeService
 from hiveweave.services.roster import RosterService
+from hiveweave.services.git_worktree import GitWorktreeService
 
 log = structlog.get_logger(__name__)
 
@@ -350,6 +351,18 @@ async def create_project(body: ProjectCreate) -> dict:
     except Exception as e:
         log.error("init_project_db_failed", workspace=workspace, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to initialize project DB")
+
+    # BUG-034: 初始化 git 仓库，确保后续 agent 可以通过
+    # GitWorktreeService 创建独立的工作区（worktree）进行隔离开发。
+    # 之前此步骤缺失，导致 .hiveweave/worktrees/ 目录从未创建。
+    try:
+        gwt = GitWorktreeService()
+        result = await gwt.ensure_git_repo(str(ws))
+        if result.get("initialized"):
+            log.info("project_git_initialized", workspace=str(ws))
+    except Exception as e:
+        log.warning("project_git_init_failed", workspace=str(ws), error=str(e))
+        # 非致命 — 项目仍可正常工作，只是 worktree 功能不可用
 
     charter = _build_charter_dict(body)
     project_id = str(uuid.uuid4())
