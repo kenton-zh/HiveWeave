@@ -236,6 +236,31 @@ _TOOL_SCHEMAS: dict[str, dict] = {
         },
         "required": ["question"],
     },
+    # BUG-036: send_message schema — LLM needs to know expectReport parameter
+    "send_message": {
+        "type": "object",
+        "properties": {
+            "recipients": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of recipient agent names, short_ids, or roles (e.g. ['HR'], ['A005'], ['墨言']).",
+            },
+            "message": {
+                "type": "string",
+                "description": "Message body. CAVEMAN style for agents — no pleasantries, just facts.",
+            },
+            "expectReport": {
+                "type": "boolean",
+                "description": "If true, recipient sees **[REPLY REQUIRED]** and should respond. Use for task assignments and review requests.",
+            },
+            "priority": {
+                "type": "string",
+                "enum": ["normal", "urgent"],
+                "description": "Message priority. Use 'urgent' for escalations and critical issues.",
+            },
+        },
+        "required": ["recipients", "message"],
+    },
     # BUG-036: update_goals schema — LLM needs to know expected parameter names
     "update_goals": {
         "type": "object",
