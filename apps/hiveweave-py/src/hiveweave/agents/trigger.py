@@ -451,6 +451,10 @@ async def build_trigger_context(
         if fid:
             all_from_ids.append(fid)
     from_agent_id = next((fid for fid in all_from_ids if fid), None)
+    # BUG-034: 如果没有找到发送者（inbox/handoff 缺少 from_agent_id），
+    # 使用 "system" 确保前端团队沟通面板不会显示"未知发送者"。
+    if not from_agent_id:
+        from_agent_id = "system"
 
     context = (
         "\n\n".join(blocks)
