@@ -111,5 +111,8 @@ image/
 apps/web/public/sprites/
 apps/web/scripts/refactor-*
 
+# Per-project DB directories (BUG-033: prevent source pollution)
+.hiveweave/
+
 # IDE / tool local state
 .trae/

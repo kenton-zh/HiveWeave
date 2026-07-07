@@ -33,6 +33,10 @@ from hiveweave.services.roster import RosterService
 
 log = structlog.get_logger(__name__)
 
+# BUG-020 修复：projects router 需要自己的 GameTimeService 实例，
+# 用于 /{project_id}/game-time 端点。
+_game_time = GameTimeService()
+
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 #: meta_index key 用于记录当前激活的项目
@@ -66,14 +70,34 @@ class ProjectUpdate(BaseModel):
 class CharterGoalsUpdate(BaseModel):
     """charter goals 段更新请求体。"""
 
-    goals: str
+    goals: dict
 
 
 def _build_charter_dict(body: ProjectCreate) -> dict:
     """组装 charter dict（vision/goals/constraints 三段）。"""
+    raw_goals = body.charterGoals
+    if isinstance(raw_goals, str) and raw_goals.strip():
+        try:
+            goals = json.loads(raw_goals)
+        except (json.JSONDecodeError, TypeError):
+            goals = {
+                "objective": "",
+                "focus": raw_goals,
+                "keyResults": [],
+                "userInvolvement": "宏观决策+技术选型",
+            }
+    elif isinstance(raw_goals, dict):
+        goals = raw_goals
+    else:
+        goals = {
+            "objective": "",
+            "focus": "",
+            "keyResults": [],
+            "userInvolvement": "宏观决策+技术选型",
+        }
     return {
         "vision": body.charterVision or f"Build and operate the {body.name} project.",
-        "goals": body.charterGoals or "",
+        "goals": goals,
         "constraints": body.charterConstraints or "",
         "userInvolvement": body.userInvolvement or "medium",
         "orgPattern": body.orgPattern or "solo",
@@ -120,6 +144,19 @@ def _validate_workspace_path(raw: str) -> Path:
         raise HTTPException(
             status_code=400,
             detail="workspace_path resolves to a path with '..' segments",
+        )
+    # BUG-033 fix: reject source-code/documentation directories to prevent
+    # per-project DBs from polluting the repo. .hiveweave/data.db should
+    # only live in real project workspaces, never in src/docs/tests/apps.
+    _SOURCE_SEGMENTS = {"src", "apps", "tests", "test", "docs", "doc", "node_modules",
+                        "__pycache__", ".git", ".claude", "dist", "build", "out"}
+    offending = [p for p in resolved.parts if p.lower() in _SOURCE_SEGMENTS]
+    if offending:
+        raise HTTPException(
+            status_code=400,
+            detail=f"workspace_path appears to be a source/documentation directory "
+                    f"(contains: {', '.join(offending)}). "
+                    f"Please choose a real project workspace instead.",
         )
     return resolved
 
@@ -649,9 +686,87 @@ async def deactivate_project(project_id: str) -> dict:
     return {"ok": True, "projectId": project_id}
 
 
-@router.post("/{project_id}/goals")
+@router.get("/{project_id}/game-time")
+async def get_project_game_time(project_id: str) -> dict:
+    """查项目游戏时间。
+
+    BUG-020 修复：前端请求的是 /api/projects/{id}/game-time，
+    但 endpoint 原本只在 /api/game-time/{id}。在此补一个 projects 前缀的路由。
+    """
+    try:
+        result = await _game_time.get_current_time(project_id)
+    except Exception as e:
+        # 优雅降级：workspace 不存在或 DB 未初始化时返回 0 而非 500，
+        # 避免前端 ProjectTimeBadge 崩溃（BUG-020）
+        log.warning("get_project_game_time_failed", project_id=project_id, error=str(e))
+        return {
+            "projectId": project_id,
+            "gameSeconds": 0,
+            "formatted": "Day 0 00:00",
+            "realStartedAt": None,
+            "realSecondsPerGameDay": 3600,
+        }
+    return {
+        "projectId": project_id,
+        "gameSeconds": result.get("game_seconds", 0),
+        "formatted": result.get("formatted", ""),
+        "realStartedAt": result.get("real_started_at"),
+        "realSecondsPerGameDay": result.get("real_seconds_per_game_day", 3600),
+    }
+
+
+@router.get("/{project_id}/goals")
+async def get_project_goals(project_id: str) -> dict:
+    """读取 charter goals 段。
+
+    BUG-016 修复：之前只有 POST 没有 GET，前端 GET /goals 返回 405。
+    """
+    row = await meta_db.query_one(
+        "SELECT charter_json FROM projects WHERE id = ?", [project_id]
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    charter_raw = row["charter_json"]
+    charter: dict = {}
+    if charter_raw:
+        try:
+            charter = json.loads(charter_raw) if isinstance(charter_raw, str) else charter_raw
+        except (json.JSONDecodeError, TypeError):
+            charter = {}
+    goals = charter.get("goals") if charter else None
+    # 兼容旧数据：goals 可能是空字符串或缺失，转成对象
+    if not goals:
+        goals = {
+            "objective": "",
+            "focus": "",
+            "keyResults": [],
+            "userInvolvement": "宏观决策+技术选型",
+        }
+    elif isinstance(goals, str):
+        try:
+            goals = json.loads(goals) or {
+                "objective": "",
+                "focus": "",
+                "keyResults": [],
+                "userInvolvement": "宏观决策+技术选型",
+            }
+        except (json.JSONDecodeError, TypeError):
+            goals = {
+                "objective": "",
+                "focus": goals,
+                "keyResults": [],
+                "userInvolvement": "宏观决策+技术选型",
+            }
+    return {"goals": goals, "projectId": project_id}
+
+
+@router.put("/{project_id}/goals")
 async def update_project_goals(project_id: str, body: CharterGoalsUpdate) -> dict:
-    """更新 charter goals 段（合并写入 charter_json）。"""
+    """更新 charter goals 段（合并写入 charter_json）。
+
+    BUG-016 修复：POST → PUT，与前端 updateProjectGoals 的 PUT 对齐。
+    保留 POST 别名以防旧客户端。
+    """
     row = await meta_db.query_one(
         "SELECT charter_json FROM projects WHERE id = ?", [project_id]
     )
@@ -674,3 +789,9 @@ async def update_project_goals(project_id: str, body: CharterGoalsUpdate) -> dic
         log.error("update_goals_failed", project_id=project_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to update goals")
     return {"ok": True}
+
+
+# BUG-016 兼容：保留 POST 别名
+@router.post("/{project_id}/goals")
+async def update_project_goals_post(project_id: str, body: CharterGoalsUpdate) -> dict:
+    return await update_project_goals(project_id, body)

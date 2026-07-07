@@ -49,6 +49,14 @@ function App() {
   // Project selector state
   const [showProjectMenu, setShowProjectMenu] = useState(false);
   const [showFolderPicker, setShowFolderPicker] = useState(false);
+  const [folderPickerInitialPath] = useState<string | undefined>(() => {
+    // Test affordance: allow ?folderPath=... to pre-fill the FolderPicker.
+    // Lets automated E2E tests bypass the click+doubleClick dance that's
+    // awkward to drive through a remote browser MCP.
+    if (typeof window === "undefined") return undefined;
+    const params = new URLSearchParams(window.location.search);
+    return params.get("folderPath") ?? undefined;
+  });
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
@@ -117,8 +125,13 @@ function App() {
 
   // Subscribe to real-time agent processing status
   useEffect(() => {
+    let lastSnapshotKey = "";
     const controller = subscribeAgentStatus(
       (agentIds, paused) => {
+        // Debounce: skip if the snapshot hasn't changed
+        const key = agentIds.slice().sort().join(",") + "|" + (paused ?? "");
+        if (key === lastSnapshotKey) return;
+        lastSnapshotKey = key;
         setProcessingAgents(agentIds);
         if (paused !== undefined) setPaused(paused);
         // Signal socket reconnect so ChatPanel can reset stale isStreaming state
@@ -160,11 +173,19 @@ function App() {
   const currentProject = projects.find((p) => p.id === selectedProjectId);
 
   const handleSwitchProject = (id: string) => {
-    setSelectedProjectId(id);
-    setSelectedAgent(null);
+    const st = useAppStore.getState();
+    if (st.selectedAgentId) {
+      try { leaveAgentChannel(st.selectedAgentId); } catch { /* noop */ }
+    }
+    // Batch all updates to avoid cascading re-renders
+    useAppStore.setState({
+      selectedProjectId: id,
+      selectedAgentId: null,
+      chatSessions: {},
+      processingAgents: [],
+      orgTreeVersion: st.orgTreeVersion + 1,
+    });
     setRightPanelTab("chat");
-    clearChatSessions();
-    refreshOrgTree();
     setShowProjectMenu(false);
   };
 
@@ -212,19 +233,22 @@ function App() {
   };
 
   const detachDeletedProject = (id: string, remaining: Project[]) => {
-    if (useAppStore.getState().selectedProjectId !== id) return;
+    const st = useAppStore.getState();
+    if (st.selectedProjectId !== id) return;
     const next = remaining[0]?.id ?? null;
-    const activeAgentId = useAppStore.getState().selectedAgentId;
-    if (activeAgentId) {
-      try { leaveAgentChannel(activeAgentId); } catch { /* noop */ }
+    if (st.selectedAgentId) {
+      try { leaveAgentChannel(st.selectedAgentId); } catch { /* noop */ }
     }
-    setSelectedProjectId(next);
-    setSelectedAgent(null);
-    clearChatSessions();
-    setProcessingAgents([]);
+    // Batch all updates in a single setState to avoid cascading re-renders
+    useAppStore.setState({
+      selectedProjectId: next,
+      selectedAgentId: null,
+      chatSessions: {},
+      processingAgents: [],
+      orgTreeVersion: st.orgTreeVersion + 1,
+    });
     setShowNewProjectDialog(false);
     setNewProjectCEO(null);
-    refreshOrgTree();
   };
 
 
@@ -617,6 +641,7 @@ function App() {
       {/* Folder Picker for workspace selection */}
       {showFolderPicker && (
         <FolderPicker
+          initialPath={folderPickerInitialPath}
           onSelect={(path) => {
             handleCreateProjectFromFolder(path);
             setShowFolderPicker(false);

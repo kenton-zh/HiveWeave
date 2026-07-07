@@ -8,6 +8,7 @@ export default function QuestionDialog() {
   const dismissedRef = useRef<Set<string>>(new Set());
 
   // Poll for pending questions
+  // BUG-005 修复：2s → 5s，减少 polling 频率（30→12 req/min）
   useEffect(() => {
     const timer = setInterval(async () => {
       try {
@@ -16,7 +17,7 @@ export default function QuestionDialog() {
         const visible = qs.filter((q) => !dismissedRef.current.has(q.id));
         setQuestions(visible);
       } catch { /* ignore poll errors */ }
-    }, 2000);
+    }, 5000);
     return () => clearInterval(timer);
   }, []);
 

@@ -25,7 +25,8 @@ export default function TodoBar({ agentId }: Props) {
       } catch { /* ignore */ }
     }
     poll();
-    const timer = setInterval(poll, 3000);
+    // BUG-005 修复：3s → 5s，减少 polling 频率（20→12 req/min）
+    const timer = setInterval(poll, 5000);
     return () => { mounted = false; clearInterval(timer); };
   }, [agentId]);
 
@@ -63,7 +64,7 @@ export default function TodoBar({ agentId }: Props) {
           {todos.todos.map((todo, i) => {
             const s = statusLabels[todo.status] || statusLabels.pending;
             return (
-              <div key={i} className={`flex items-center gap-2 text-xs py-0.5 ${todo.status === "cancelled" ? "line-through opacity-50" : ""}`}>
+              <div key={i} className={`flex items-center gap-2 text-xs py-0.5 ${(todo.status as string) === "cancelled" ? "line-through opacity-50" : ""}`}>
                 <span className="w-4 text-center">{s.icon}</span>
                 <span className={s.color}>{todo.content}</span>
               </div>

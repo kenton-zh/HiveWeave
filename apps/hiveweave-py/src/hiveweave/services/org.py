@@ -22,6 +22,31 @@ from hiveweave.db import meta as meta_db
 
 log = structlog.get_logger(__name__)
 
+
+def _fix_mojibake(s: str) -> str:
+    """尝试修复双重编码的 UTF-8 字符串。
+
+    BUG-009/012 修复：如果 str 看起来像 UTF-8 bytes 被当 latin-1/cp1252
+    解码的结果（mojibake），尝试 encode + decode('utf-8') 还原。
+
+    只在修复后包含 CJK 字符时才采用，避免误修合法的 latin-1 文本。
+    """
+    if not isinstance(s, str) or len(s) < 2:
+        return s
+    high_chars = sum(1 for c in s if ord(c) >= 0x80)
+    if high_chars < 2 or high_chars < len(s) * 0.3:
+        return s
+    # 尝试 latin-1 和 cp1252(Windows-1252) 两种编码
+    for encoding in ("latin-1", "cp1252"):
+        try:
+            fixed = s.encode(encoding).decode("utf-8")
+            if any("\u4e00" <= c <= "\u9fff" for c in fixed):
+                return fixed
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return s
+
+
 # Columns stored as JSON arrays in the agents table
 _JSON_COLS = frozenset({
     "skills",
@@ -376,4 +401,11 @@ class OrgService:
                     d[col] = []
             elif v is None:
                 d[col] = []
+        # BUG-009/012 修复：防御性 mojibake 修复。
+        # 如果 str 字段看起来像 UTF-8 bytes 被当 latin-1 解码的结果
+        # （双重编码），尝试 encode('latin-1').decode('utf-8') 还原。
+        # 只在修复后包含 CJK 字符时才采用，避免误修合法的 latin-1 文本。
+        for k, v in d.items():
+            if isinstance(v, str) and len(v) >= 2:
+                d[k] = _fix_mojibake(v)
         return d

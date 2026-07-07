@@ -267,9 +267,16 @@ async def write_file(
 async def list_files(
     path: str,
     workspace_path: str,
+    recursive: bool = False,
+    maxdepth: int = 1,
 ) -> dict[str, Any]:
-    """List directory contents with [DIR]/[FILE] tags and sizes."""
+    """List directory contents with [DIR]/[FILE] tags and sizes.
+
+    BUG-019 修复：支持 recursive + maxdepth 参数，让 CEO 一次看多层目录，
+    避免反复调 list_files 探索不同目录导致首次 chat 30s+。
+    """
     ws = workspace_path or "."
+    depth = max(1, min(maxdepth, 3)) if recursive else 1
 
     if path:
         full = _resolve_safe(workspace_path, path)
@@ -288,32 +295,42 @@ async def list_files(
         return {"success": False, "output": "",
                 "error": f"Error: Not a directory: {path}"}
 
-    try:
-        entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-    except OSError as exc:
-        return {"success": False, "output": "",
-                "error": f"Error: {exc}"}
-
     lines: list[str] = []
     count = 0
-    for entry in entries:
-        if count >= MAX_LIST_FILES:
-            lines.append(f"... (truncated at {MAX_LIST_FILES} entries)")
-            break
-        # Skip ignored directories for cleaner listing
-        if entry.is_dir() and entry.name in IGNORED_DIRS:
-            continue
+
+    def _walk(d: Path, prefix: str, current_depth: int):
+        nonlocal count
         try:
-            if entry.is_dir():
-                lines.append(f"[DIR]  {entry.name}/")
-            elif entry.is_file():
-                size = entry.stat().st_size
-                lines.append(f"[FILE] {entry.name} ({_format_size(size)})")
-            else:
-                lines.append(f"[???]  {entry.name}")
-            count += 1
-        except OSError:
-            continue
+            entries = sorted(d.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        except OSError as exc:
+            lines.append(f"{prefix}(error: {exc})")
+            return
+        for entry in entries:
+            if count >= MAX_LIST_FILES:
+                if not any("truncated" in l for l in lines[-1:]):
+                    lines.append(f"... (truncated at {MAX_LIST_FILES} entries)")
+                return
+            if entry.is_dir() and entry.name in IGNORED_DIRS:
+                continue
+            try:
+                rel = entry.relative_to(p)
+                indent = "  " * (current_depth - 1)
+                if entry.is_dir():
+                    lines.append(f"{indent}[DIR]  {rel}/")
+                    count += 1
+                    if current_depth < depth:
+                        _walk(entry, prefix, current_depth + 1)
+                elif entry.is_file():
+                    size = entry.stat().st_size
+                    lines.append(f"{indent}[FILE] {rel} ({_format_size(size)})")
+                    count += 1
+                else:
+                    lines.append(f"{indent}[???]  {rel}")
+                    count += 1
+            except OSError:
+                continue
+
+    _walk(p, "", 1)
 
     body = "\n".join(lines) if lines else "(empty directory)"
     return {"success": True, "output": body, "error": None}

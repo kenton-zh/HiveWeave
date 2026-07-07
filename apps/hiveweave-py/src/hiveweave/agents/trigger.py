@@ -150,8 +150,33 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
         manager = _get_agent_manager()
         agent = manager.get_agent(agent_id)
         if agent is None:
-            log.warning("trigger_no_agent_task", agent_id=agent_id)
-            return
+            # BUG-010 修复：agent 可能是 hire_agent API 刚创建但未
+            # start 的（DB 有行但 agent_manager 没实例）。让 supervisor
+            # 自动从 DB 加载并 start——下次 hire_agent 创建的 executor
+            # 收到 inbox 时不会再静默。
+            log.info("trigger_auto_start_begin",
+                     agent_id=agent_id,
+                     name=agent_record.get("name"))
+            try:
+                agent = await manager.start_agent(
+                    agent_id, agent_record["project_id"], agent_record
+                )
+                log.info(
+                    "trigger_auto_started_agent",
+                    agent_id=agent_id,
+                    name=agent_record.get("name"),
+                )
+            except Exception as e:
+                log.warning(
+                    "trigger_no_agent_task",
+                    agent_id=agent_id,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                return
+            if agent is None:
+                log.warning("trigger_no_agent_task", agent_id=agent_id)
+                return
 
         # 5. 检查 agent 是否正在 processing → 跳过
         # 对齐 Elixir agent.ex:217-224: 等完成后自检 re-trigger

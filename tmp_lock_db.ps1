@@ -1,0 +1,1 @@
+﻿$dbPath = "D:\PC_AI\Project\PoE2LI\.hiveweave\data.db"; $conn = [System.Data.SQLite.SQLiteConnection]::new(); $conn.ConnectionString = "Data Source=$dbPath"; $conn.Open(); Start-Sleep -Seconds 15; $conn.Close()

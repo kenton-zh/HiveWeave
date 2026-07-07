@@ -314,7 +314,12 @@ async def chat_inbox(agent_id: str) -> dict:
 
 @router.post("/inbox")
 async def chat_send_inbox(body: InboxSendBody) -> dict:
-    """发送 agent 间消息。"""
+    """发送 agent 间消息。
+
+    BUG-010 修复：写入 inbox 后显式触发目标 agent（比后台 watcher
+    5s 延迟更及时）。watcher 仍然兜底——如果 agent 实例不存在，
+    等后续 start_agent 时 inbox 仍在那里，下次轮询触发。
+    """
     try:
         msg = await _inbox.send_message(
             from_agent_id=body.fromAgentId,
@@ -326,6 +331,11 @@ async def chat_send_inbox(body: InboxSendBody) -> dict:
     except Exception as e:
         log.error("send_inbox_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to create communication")
+
+    # BUG-022 fix: remove explicit trigger — the target agent's inbox watcher
+    # handles this autonomously. Double-triggering (API + watcher + tool executor)
+    # caused duplicate task delivery.
+
     return {"ok": True, "message": msg}
 
 
@@ -577,3 +587,19 @@ async def send_chat_path(agent_id: str, body: ChatSendBody) -> dict:
     validate_id(agent_id, "agent_id")
     overridden = body.model_copy(update={"agentId": agent_id})
     return await send_chat(overridden)
+
+
+# ── COMPAT: /api/chat/comms (BUG-029 fix) ────────────────────
+
+@router.get("/comms")
+async def chat_comms_compat(
+    projectId: str | None = Query(default=None),
+    limit: int = Query(default=100, le=500),
+) -> dict:
+    """列出团队通信（兼容别名，委托到 /api/communications）。
+
+    BUG-029: 某些客户端/测试脚本使用 /api/chat/comms 而非 /api/communications。
+    此路由作为兼容别名，内部直接委托到 list_communications。
+    """
+    from hiveweave.api.communications import list_communications
+    return await list_communications(projectId=projectId, limit=limit)

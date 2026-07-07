@@ -68,6 +68,7 @@ function WebFolderPicker({
   const [loading, setLoading] = useState(true);
   const [addressBar, setAddressBar] = useState("");
   const [addressEditing, setAddressEditing] = useState(false);
+  const [selectedEntry, setSelectedEntry] = useState<string | null>(null);
   const addressRef = useRef<HTMLInputElement>(null);
 
   const navigate = async (dirPath?: string) => {
@@ -136,7 +137,7 @@ function WebFolderPicker({
               onChange={(e) => setAddressBar(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleAddressSubmit();
-                if (e.key === "Escape") { setAddressEditing(false); if (data) setAddressBar(data.currentPath); }
+                if (e.key === "Escape") { setAddressEditing(false); if (data) setAddressBar(data.currentPath ?? ""); }
               }}
               onBlur={handleAddressSubmit}
               className="flex-1 px-2 py-1 text-xs bg-surface-deep border border-accent rounded text-gray-200 focus:outline-none font-mono"
@@ -144,8 +145,19 @@ function WebFolderPicker({
           ) : (
             <div
               onClick={() => setAddressEditing(true)}
+              onPaste={(e) => {
+                // BUG-031 fix: support pasting a path directly into the
+                // address bar without clicking to enter edit mode first.
+                e.preventDefault();
+                const pasted = e.clipboardData?.getData("text")?.trim();
+                if (pasted) {
+                  setAddressBar(pasted);
+                  // Navigate immediately — user clearly wants to go there
+                  navigate(pasted);
+                }
+              }}
               className="flex-1 px-2 py-1 text-xs bg-surface-deep border border-surface-border rounded text-gray-400 cursor-text font-mono truncate hover:border-gray-600"
-              title="点击编辑路径"
+              title="点击编辑路径，或直接粘贴完整路径"
             >
               {addressBar || "..."}
             </div>
@@ -179,12 +191,26 @@ function WebFolderPicker({
           ) : data && data.entries.length === 0 ? (
             <div className="flex items-center justify-center h-full text-gray-500 text-sm">（空目录）</div>
           ) : data ? (
-            <div className="grid grid-cols-2 gap-0.5">
+            <div
+              className="grid grid-cols-2 gap-0.5 focus:outline-none"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                // BUG-031 fix: Enter navigates into selected directory
+                if (e.key === "Enter" && selectedEntry) {
+                  navigate(selectedEntry);
+                }
+              }}
+            >
               {data.entries.map((entry) => (
                 <button
                   key={entry.fullPath}
-                  onDoubleClick={() => navigate(entry.fullPath)}
-                  className="flex items-center gap-2 px-3 py-2 rounded text-left hover:bg-surface-hover group transition-colors"
+                  onClick={() => setSelectedEntry(entry.fullPath ?? null)}
+                  onDoubleClick={() => entry.fullPath && navigate(entry.fullPath)}
+                  className={`flex items-center gap-2 px-3 py-2 rounded text-left group transition-colors ${
+                    selectedEntry === entry.fullPath
+                      ? "bg-accent/20 border border-accent/40"
+                      : "hover:bg-surface-hover border border-transparent"
+                  }`}
                 >
                   <svg className="w-5 h-5 text-yellow-500/80 shrink-0" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z" />
@@ -209,7 +235,7 @@ function WebFolderPicker({
               取消
             </button>
             <button
-              onClick={() => data && onSelect(data.currentPath)}
+              onClick={() => data?.currentPath && onSelect(data.currentPath)}
               disabled={!data || loading}
               className="px-4 py-1.5 text-sm bg-accent text-white rounded hover:bg-accent/80 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >

@@ -186,6 +186,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# BUG-009/012/013 fix: ensure all JSON responses carry charset=utf-8
+# to prevent CJK mojibake when browsers/ proxies treat JSON as Latin-1
+@app.middleware("http")
+async def charset_middleware(request: Request, call_next):
+    response = await call_next(request)
+    ct = response.headers.get("content-type", "")
+    if "application/json" in ct and "charset" not in ct:
+        response.headers["content-type"] = f"{ct}; charset=utf-8"
+    return response
+
 # 请求日志中间件 — 记录每个 API 调用的耗时和状态码
 import time as _time
 
