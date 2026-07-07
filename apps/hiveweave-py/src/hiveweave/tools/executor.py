@@ -499,6 +499,76 @@ class ToolExecutor:
                      "git_worktree_list", "git_worktree_status"):
             return await self._tool_git_worktree(agent_id, name, args)
 
+        # ── File management tools (BUG-036: dispatchers were missing) ──
+        if name == "delete_file":
+            path = args.get("path") or args.get("file_path") or ""
+            if not path:
+                return self._error("delete_file requires 'path'")
+            return await self._tool_delete_file(agent_id, path, workspace_path)
+
+        if name == "move_file":
+            src = args.get("source") or args.get("src") or args.get("path") or ""
+            dst = args.get("destination") or args.get("dest") or args.get("to") or ""
+            if not src or not dst:
+                return self._error("move_file requires 'source' and 'destination'")
+            return await self._tool_move_file(agent_id, src, dst, workspace_path)
+
+        if name == "create_directory":
+            path = args.get("path") or ""
+            if not path:
+                return self._error("create_directory requires 'path'")
+            return await self._tool_create_directory(agent_id, path, workspace_path)
+
+        if name == "delete_directory":
+            path = args.get("path") or ""
+            if not path:
+                return self._error("delete_directory requires 'path'")
+            return await self._tool_delete_directory(agent_id, path, workspace_path)
+
+        if name == "search_files":
+            pattern = args.get("pattern") or args.get("glob") or ""
+            directory = args.get("directory") or args.get("path") or "."
+            if not pattern:
+                return self._error("search_files requires 'pattern' (glob pattern)")
+            return await self._tool_search_files(agent_id, pattern, directory, workspace_path)
+
+        # ── Memory tools ──
+        if name == "read_memory":
+            module_id = args.get("moduleId") or args.get("module_id")
+            return await self._tool_read_memory(agent_id, module_id)
+
+        if name == "write_memory":
+            content = args.get("content") or args.get("memory") or ""
+            module_id = args.get("moduleId") or args.get("module_id")
+            tags = args.get("tags") or []
+            if not content:
+                return self._error("write_memory requires 'content'")
+            return await self._tool_write_memory(agent_id, content, module_id, tags)
+
+        # ── Agent orchestration tools ──
+        if name == "dispatch_task":
+            return await self._tool_dispatch_task(agent_id, args)
+
+        if name == "report_completion":
+            return await self._tool_report_completion(agent_id, args)
+
+        if name == "request_review":
+            return await self._tool_request_review(agent_id, args)
+
+        if name == "approve_work":
+            return await self._tool_approve_work(agent_id, args)
+
+        if name == "reject_work":
+            return await self._tool_reject_work(agent_id, args)
+
+        # ── Web fetch (OpenCode parity) ──
+        if name == "webfetch":
+            url = args.get("url") or ""
+            prompt = args.get("prompt") or ""
+            if not url:
+                return self._error("webfetch requires 'url'")
+            return await self._tool_webfetch(agent_id, url, prompt)
+
         # Unknown tool — contract 02 error handling
         return self._error(f"Unknown tool: {name}")
 
@@ -574,6 +644,262 @@ class ToolExecutor:
             return self._error(result.get("message", "Failed to get worktree status"))
 
         return self._error(f"Unknown git worktree operation: {name}")
+
+    # ── File management tool implementations (BUG-036) ───
+
+    async def _tool_delete_file(
+        self, agent_id: str, path: str, workspace: str
+    ) -> dict:
+        """Delete a file from the workspace."""
+        from pathlib import Path
+        ws = Path(workspace)
+        target = (ws / path).resolve()
+        if not str(target).startswith(str(ws.resolve())):
+            return self._error(f"Path traversal denied: {path}")
+        if not target.exists():
+            return self._error(f"File not found: {path}")
+        try:
+            target.unlink()
+            return {"success": True, "output": f"Deleted: {path}", "error": None}
+        except Exception as e:
+            return self._error(f"Failed to delete {path}: {e}")
+
+    async def _tool_move_file(
+        self, agent_id: str, src: str, dst: str, workspace: str
+    ) -> dict:
+        """Move or rename a file."""
+        from pathlib import Path
+        ws = Path(workspace).resolve()
+        source = (ws / src).resolve()
+        dest = (ws / dst).resolve()
+        if not str(source).startswith(str(ws)) or not str(dest).startswith(str(ws)):
+            return self._error("Path traversal denied")
+        if not source.exists():
+            return self._error(f"Source not found: {src}")
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(dest)
+            return {"success": True, "output": f"Moved: {src} → {dst}", "error": None}
+        except Exception as e:
+            return self._error(f"Failed to move {src}: {e}")
+
+    async def _tool_create_directory(
+        self, agent_id: str, path: str, workspace: str
+    ) -> dict:
+        """Create a new directory."""
+        from pathlib import Path
+        ws = Path(workspace).resolve()
+        target = (ws / path).resolve()
+        if not str(target).startswith(str(ws)):
+            return self._error(f"Path traversal denied: {path}")
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            return {"success": True, "output": f"Created directory: {path}", "error": None}
+        except Exception as e:
+            return self._error(f"Failed to create directory: {e}")
+
+    async def _tool_delete_directory(
+        self, agent_id: str, path: str, workspace: str
+    ) -> dict:
+        """Delete a directory and its contents."""
+        from pathlib import Path
+        import shutil
+        ws = Path(workspace).resolve()
+        target = (ws / path).resolve()
+        if not str(target).startswith(str(ws)):
+            return self._error(f"Path traversal denied: {path}")
+        if not target.exists():
+            return self._error(f"Directory not found: {path}")
+        if not target.is_dir():
+            return self._error(f"Not a directory: {path}")
+        try:
+            shutil.rmtree(target)
+            return {"success": True, "output": f"Deleted directory: {path}", "error": None}
+        except Exception as e:
+            return self._error(f"Failed to delete directory: {e}")
+
+    async def _tool_search_files(
+        self, agent_id: str, pattern: str, directory: str, workspace: str
+    ) -> dict:
+        """Search for files by glob pattern."""
+        from pathlib import Path
+        ws = Path(workspace).resolve()
+        search_dir = (ws / directory).resolve() if directory != "." else ws
+        if not str(search_dir).startswith(str(ws)):
+            search_dir = ws
+        try:
+            matches = sorted(search_dir.rglob(pattern))
+            # Limit results
+            matches = [m for m in matches[:200] if ".hiveweave" not in str(m)]
+            paths = [str(m.relative_to(ws)) for m in matches[:50]]
+            if not paths:
+                return {"success": True, "output": f"No files matching '{pattern}'", "error": None}
+            return {"success": True, "output": "\n".join(paths), "error": None}
+        except Exception as e:
+            return self._error(f"File search failed: {e}")
+
+    # ── Memory tool implementations (BUG-036) ─────────────
+
+    async def _tool_read_memory(
+        self, agent_id: str, module_id: str | None
+    ) -> dict:
+        """Read agent memories."""
+        from hiveweave.services.memory import MemoryService
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+        mem = MemoryService()
+        try:
+            entries = await mem.get_agent_memories(agent_id, project_id, module_id)
+            if not entries:
+                return {"success": True, "output": "(no memories)", "error": None}
+            lines = [f"- [{e.get('category', '?')}] {e.get('content', '')}" for e in entries[:20]]
+            return {"success": True, "output": "\n".join(lines), "error": None}
+        except Exception as e:
+            return self._error(f"Failed to read memories: {e}")
+
+    async def _tool_write_memory(
+        self, agent_id: str, content: str, module_id: str | None, tags: list
+    ) -> dict:
+        """Write a memory entry."""
+        from hiveweave.services.memory import MemoryService
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+        mem = MemoryService()
+        try:
+            await mem.add_entry(
+                agent_id=agent_id, project_id=project_id,
+                content=content, category="tool_written",
+                module_id=module_id, tags=tags if isinstance(tags, list) else [],
+            )
+            return {"success": True, "output": "Memory saved.", "error": None}
+        except Exception as e:
+            return self._error(f"Failed to write memory: {e}")
+
+    # ── Agent orchestration implementations (BUG-036) ─────
+
+    async def _tool_dispatch_task(self, agent_id: str, args: dict) -> dict:
+        """Dispatch a task to a subordinate."""
+        target = args.get("target") or args.get("agentId") or args.get("subordinate") or ""
+        task = args.get("task") or args.get("description") or ""
+        expect_report = args.get("expectReport") or args.get("expect_report") or False
+        if not target or not task:
+            return self._error("dispatch_task requires 'target' and 'task'")
+        from hiveweave.services.dispatch import DispatchService
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+        ds = DispatchService()
+        result = await ds.dispatch(
+            project_id=project_id, from_agent_id=agent_id,
+            target_name=target, task=task, expect_report=expect_report,
+        )
+        if result.get("success"):
+            return {"success": True, "output": f"Task dispatched to {result.get('target_name', target)}", "error": None}
+        return self._error(result.get("message", "Dispatch failed"))
+
+    async def _tool_report_completion(self, agent_id: str, args: dict) -> dict:
+        """Report task completion to superior."""
+        summary = args.get("summary") or args.get("report") or ""
+        if not summary:
+            return self._error("report_completion requires 'summary'")
+        from hiveweave.services.handoff import HandoffService
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+        hs = HandoffService()
+        # Find accepted handoffs for this agent and report on the first
+        handoffs = await hs.get_accepted_handoffs(project_id, agent_id)
+        if not handoffs:
+            return self._error("No accepted handoffs to report on")
+        await hs.report(project_id, handoffs[0]["id"], summary)
+        return {"success": True, "output": "Completion reported to superior.", "error": None}
+
+    async def _tool_request_review(self, agent_id: str, args: dict) -> dict:
+        """Request a code review from superior."""
+        file_paths = args.get("filePaths") or args.get("files") or []
+        description = args.get("description") or args.get("summary") or "Please review my work."
+        from hiveweave.services.handoff import HandoffService
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+        hs = HandoffService()
+        handoffs = await hs.get_accepted_handoffs(project_id, agent_id)
+        if not handoffs:
+            return self._error("No accepted handoffs to request review on")
+        # Send a message to superior with review request
+        from hiveweave.services.inbox import InboxService
+        ib = InboxService()
+        superior = await self._org.get_superior(agent_id)
+        if not superior:
+            return self._error("No superior found")
+        files_str = ", ".join(file_paths) if file_paths else "all changes"
+        await ib.send_message(
+            from_agent_id=agent_id, to_agent_id=superior["id"],
+            message=f"[REVIEW REQUEST] {description}\nFiles: {files_str}",
+            message_type="review_request", priority="urgent",
+        )
+        return {"success": True, "output": "Review requested from superior.", "error": None}
+
+    async def _tool_approve_work(self, agent_id: str, args: dict) -> dict:
+        """Approve a subordinate's work."""
+        subordinate = args.get("subordinate") or args.get("agentId") or ""
+        if not subordinate:
+            return self._error("approve_work requires 'subordinate'")
+        from hiveweave.services.handoff import HandoffService
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+        hs = HandoffService()
+        result = await hs.approve(project_id, agent_id, subordinate)
+        if result.get("success"):
+            return {"success": True, "output": f"Work approved for {subordinate}.", "error": None}
+        return self._error(result.get("message", "Approval failed"))
+
+    async def _tool_reject_work(self, agent_id: str, args: dict) -> dict:
+        """Reject a subordinate's work (request rework)."""
+        subordinate = args.get("subordinate") or args.get("agentId") or ""
+        reason = args.get("reason") or args.get("feedback") or "Rework required."
+        if not subordinate:
+            return self._error("reject_work requires 'subordinate'")
+        from hiveweave.services.handoff import HandoffService
+        from hiveweave.services.inbox import InboxService
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+        hs = HandoffService()
+        result = await hs.reject(project_id, agent_id, subordinate, reason)
+        if result.get("success"):
+            return {"success": True, "output": f"Work rejected for {subordinate}: {reason}", "error": None}
+        return self._error(result.get("message", "Rejection failed"))
+
+    # ── Web fetch (OpenCode parity, BUG-036) ──────────────
+
+    async def _tool_webfetch(
+        self, agent_id: str, url: str, prompt: str
+    ) -> dict:
+        """Fetch a URL and convert to text, optionally answering a prompt."""
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": "HiveWeave/1.0"})
+                html = resp.text[:500_000]  # Cap at 500KB
+        except Exception as e:
+            return self._error(f"Failed to fetch {url}: {e}")
+
+        # Strip HTML tags for plain text
+        import re
+        text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        # Trim to reasonable size
+        text = text[:20_000]
+
+        if prompt:
+            return {"success": True, "output": f"Fetched {url} ({len(text)} chars). Prompt: {prompt}\n\n{text}", "error": None}
+        return {"success": True, "output": text, "error": None}
 
     # ── Output truncation (layer 1) ──────────────────────
 
