@@ -452,10 +452,31 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
     images = payload.get("images")
 
     from hiveweave.services.chat_message import ChatMessageService
+    from hiveweave.agents.supervisor import agent_manager
 
     chat_service = ChatMessageService()
 
-    # 保存用户消息
+    # BUG-036: 先检查 agent 是否 busy，再决定是否保存消息。
+    # 之前先存 DB 再检查 busy → agent 忙时消息被存但永不处理，
+    # 前端 5s 后检测到 orphan 消息并弹出"上次对话未收到回复"。
+    agent = agent_manager.get_agent(agent_id)
+    is_busy = agent is not None and agent.status.value == "processing"
+
+    if agent is None:
+        await send_fn(
+            [None, None, topic, "error",
+             {"message": "Agent not running", "agentId": agent_id}]
+        )
+        return
+
+    if is_busy:
+        await send_fn(
+            [None, None, topic, "busy",
+             {"message": "Agent is busy", "agentId": agent_id}]
+        )
+        return
+
+    # 保存用户消息（确认 agent 空闲后才存）
     try:
         saved = await chat_service.save_message(
             {
@@ -465,7 +486,6 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
                 "is_streaming": False,
             }
         )
-        # 发送 message_id 事件
         await send_fn(
             [None, None, topic, "message_id",
              {"id": saved["id"], "agentId": agent_id, "role": "user"}]
@@ -473,21 +493,7 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
     except Exception as e:
         log.warning("phoenix_chat_save_failed", agent_id=agent_id, error=str(e))
 
-    # 调用 agent.chat
-    from hiveweave.agents.supervisor import agent_manager
-
-    agent = agent_manager.get_agent(agent_id)
-    if agent is None:
-        await send_fn(
-            [None, None, topic, "error",
-             {"message": "Agent not running", "agentId": agent_id}]
-        )
-        return
-
-    # 防御性修复：如果 agent 启动时没有设置流式回调（例如被
-    # start_project_agents 启动但没有传入 callback），在此补充。
-    # 没有这些回调，agent.chat() 不会广播 stream_chunk 事件，
-    # 前端永远收不到响应。
+    # 防御性回调补丁
     if getattr(agent, "_on_stream_event", None) is None:
         from hiveweave.realtime.event_bus import create_agent_callbacks
         project_id = getattr(agent, "project_id", "") or ""
@@ -496,15 +502,14 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
         agent._on_stream_event = on_stream
         log.info("phoenix_patch_agent_callbacks", agent_id=agent_id)
 
-    # BUG-036: JSON-structured user message — unambiguous sender identification.
-    # Matches trigger.py's JSON message format: {"from": "...", "content": "..."}
+    # BUG-036: JSON-structured user message
     import json as _json
     user_msg = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)
     result = await agent.chat(user_msg)
 
     if result.get("error") == "busy":
         await send_fn(
-            [None, None, topic, "error",
+            [None, None, topic, "busy",
              {"message": "Agent is busy", "agentId": agent_id}]
         )
     elif result.get("error") == "paused":
