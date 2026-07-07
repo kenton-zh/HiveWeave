@@ -442,6 +442,26 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       const dbMessages = await getChatMessages(loadForAgentId);
       if (activeAgentIdRef.current !== loadForAgentId) return false;
       const converted = mapDbToChatMessages(dbMessages);
+      // BUG-034: When streaming is active, the message_id handler triggers
+      // loadMessagesFromDb before the assistant message exists in DB. The
+      // DB result only has the user message, which would wipe the lazy-init
+      // placeholder (draft-...) created by text_delta events. Preserve the
+      // streaming placeholder if streamDraft is active and its target
+      // message isn't in the DB results.
+      if (streamDraftRef.current?.assistantId) {
+        const hasTarget = converted.some((m) => m.id === streamDraftRef.current!.assistantId);
+        if (!hasTarget) {
+          converted.push({
+            id: streamDraftRef.current.assistantId,
+            role: "assistant" as const,
+            content: "",
+            timestamp: Date.now(),
+            isBackground: false,
+            isRead: true,
+            isStreaming: true,
+          });
+        }
+      }
       setMessages(converted);
       useAppStore.getState().setChatMessages(loadForAgentId, converted);
       const unreadIds = converted
