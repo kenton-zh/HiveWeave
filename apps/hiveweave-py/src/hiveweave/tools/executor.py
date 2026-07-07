@@ -276,7 +276,13 @@ class ToolExecutor:
             )
 
         if name == "question":
-            question = args.get("question") or ""
+            # BUG-036: accept multiple parameter name variants since LLMs
+            # without schemas often guess wrong (message/content/query/text)
+            question = (
+                args.get("question") or args.get("message")
+                or args.get("content") or args.get("query")
+                or args.get("text") or ""
+            )
             options = args.get("options")
             return await execute_question(
                 agent_id=agent_id, question=question, options=options,
@@ -1049,12 +1055,18 @@ class ToolExecutor:
         if not project_id:
             return self._error(f"Agent {agent_id} has no project_id")
 
-        goals = {
-            "objective": args.get("objective"),
-            "focus": args.get("focus"),
-            "key_results": args.get("keyResults") or args.get("key_results"),
-            "user_involvement": args.get("userInvolvement") or args.get("user_involvement"),
-        }
+        goals = {}
+        for param, key in [("objective", "objective"), ("focus", "focus")]:
+            if args.get(param) is not None:
+                goals[key] = args[param]
+        # keyResults: explicit None-check to preserve empty list []
+        kr = args.get("keyResults") if "keyResults" in args else args.get("key_results")
+        if kr is not None:
+            goals["key_results"] = kr
+        # userInvolvement: explicit None-check to preserve empty string ""
+        ui = args.get("userInvolvement") if "userInvolvement" in args else args.get("user_involvement")
+        if ui is not None:
+            goals["user_involvement"] = ui
         # Remove None values
         goals = {k: v for k, v in goals.items() if v is not None}
 

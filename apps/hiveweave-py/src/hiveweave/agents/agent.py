@@ -218,6 +218,46 @@ _TOOL_SCHEMAS: dict[str, dict] = {
         },
         "required": ["name", "role"],
     },
+    # BUG-036: question tool schema — without this the LLM guesses
+    # parameter names (message/content/query) and hits 'question is required'
+    "question": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The question to ask the user. Be clear and specific.",
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional list of choices for the user to pick from.",
+            },
+        },
+        "required": ["question"],
+    },
+    # BUG-036: update_goals schema — LLM needs to know expected parameter names
+    "update_goals": {
+        "type": "object",
+        "properties": {
+            "objective": {
+                "type": "string",
+                "description": "Updated project objective (mission statement).",
+            },
+            "focus": {
+                "type": "string",
+                "description": "Current focus area or priority.",
+            },
+            "keyResults": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": "List of key results, each with 'text' and optional 'status' fields.",
+            },
+            "userInvolvement": {
+                "type": "string",
+                "description": "Desired user involvement level: low/medium/high.",
+            },
+        },
+    },
 }
 
 
