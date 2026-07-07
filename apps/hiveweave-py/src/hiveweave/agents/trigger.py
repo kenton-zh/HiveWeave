@@ -361,6 +361,7 @@ async def build_trigger_context(
             lines.append(_json.dumps(entry, ensure_ascii=False))
         blocks.append(
             "## Pending Tasks — each line is a JSON object with 'from', 'task', 'status', optional 'report_required'.\n"
+            "Use send_message(recipients=[\"上级花名\"], message=\"...\", expectReport=true) to report results.\n"
             + "\n".join(lines)
         )
         delivered_handoff_ids = [h["id"] for h in all_handoffs if h.get("id")]
@@ -402,7 +403,9 @@ async def build_trigger_context(
         msg_text = "\n".join(lines)
         blocks.append(
             f"## Messages — each line is a JSON object with 'from', 'content', optional 'reply_required' and 'priority'.\n"
-            f"Reply in CAVEMAN style, NO pleasantries.\n{msg_text}"
+            f"To reply to these, you MUST call send_message(recipients=[\"对方花名\"], message=\"...\").\n"
+            f"Your assistant text DOES NOT reach other agents. Only send_message does.\n"
+            f"CAVEMAN style, NO pleasantries.\n{msg_text}"
         )
 
     # ── 4 & 5. Coordinator 专属 blocks ──
