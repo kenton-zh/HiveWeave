@@ -419,13 +419,31 @@ export function joinAgentChannel(agentId: string): Promise<void> {
 export function leaveAgentChannel(agentId: string) {
   const channel = _agentChannels.get(agentId);
   if (channel) {
-    // Push cancel before leaving so the backend stops the LLM stream
-    // instead of running it to completion (wastes tokens).
-    try { channel.push("cancel", {}); } catch {}
+    // BUG-034: 不再发送 cancel — 切换 agent 时不应停止后台 agent 的
+    // LLM 流。Agent 会继续运行，用户可以随时切回来查看结果。
     try { channel.leave(); } catch {}
     _agentChannels.delete(agentId);
   }
   _agentHandlers.delete(agentId);
+}
+
+/**
+ * Passively subscribe to an agent's stream events without sending a message.
+ * Used when switching back to an agent that's still processing — we resume
+ * receiving stream_chunk, stream_tool, done, and error events.
+ *
+ * Returns a cleanup function that unregisters the handler.
+ */
+export function subscribeAgentStream(
+  agentId: string,
+  onEvent: (event: ChatEvent) => void,
+): () => void {
+  _agentHandlers.set(agentId, onEvent);
+  // Ensure the channel is joined (reuses existing joined channel, or joins fresh)
+  joinAgentChannel(agentId).catch(() => {});
+  return () => {
+    _agentHandlers.delete(agentId);
+  };
 }
 
 // ---------------------------------------------------------------------------
