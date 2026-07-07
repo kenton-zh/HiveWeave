@@ -176,6 +176,191 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
             "7. Document your methodology — others should be able to reproduce.\n"
         ),
     },
+    # ── gstack Discipline Skills ─────────────────────────────
+    {
+        "slug": "self-review",
+        "name": "self-review",
+        "description": "Five-axis self-review before submitting code: correctness, readability, architecture, security, performance.",
+        "category": "discipline",
+        "instructions": (
+            "# Self-Review Discipline\n\n"
+            "Before submitting ANY code to QA or your superior, run a five-axis self-review:\n\n"
+            "1. **Correctness**: Does the code do what it claims? Edge cases handled? Null/empty states?\n"
+            "2. **Readability**: Can someone else understand this without asking? Clear naming? No magic numbers?\n"
+            "3. **Architecture**: Is this in the right place? No duplicated logic? Clean separation of concerns?\n"
+            "4. **Security**: Any injection risks? Hardcoded secrets? Unsanitized user input? Path traversal?\n"
+            "5. **Performance**: N+1 queries? Unbounded loops? Missing indexes? Memory leaks?\n\n"
+            "Fix everything you find BEFORE submitting. QA finding a basic issue = you didn't self-review seriously.\n"
+            "Output: a brief self-review report (what you checked, what you fixed, what you're unsure about).\n"
+        ),
+    },
+    {
+        "slug": "code-review-and-quality",
+        "name": "code-review-and-quality",
+        "description": "Structured five-axis code review with severity tagging and actionable feedback. Equivalent to gstack /review discipline.",
+        "category": "discipline",
+        "instructions": (
+            "# Code Review & Quality Discipline\n\n"
+            "When reviewing code, run a structured five-axis review:\n\n"
+            "1. **Correctness**: Logic errors, edge conditions, race conditions, error handling gaps.\n"
+            "2. **Readability**: Naming, structure, comments, complexity — would a new team member understand this?\n"
+            "3. **Architecture**: Layering, coupling, abstraction levels, Hyrum's Law, dependency direction.\n"
+            "4. **Security**: Input validation, auth/authz, data leaks, injection, OWASP Top 10.\n"
+            "5. **Performance**: Algorithm complexity, N+1 queries, memory leaks, async patterns.\n\n"
+            "Output format (MANDATORY):\n"
+            "- Verdict: APPROVE / CHANGES REQUESTED / REJECT\n"
+            "- Critical Issues: must-fix before merge (tagged CRITICAL)\n"
+            "- Warnings: should-fix (tagged WARNING)\n"
+            "- Nits: nice-to-fix (tagged NIT)\n"
+            "- What's Done Well: positive reinforcement\n"
+            "Each finding: path:line: [SEVERITY] problem. fix suggestion.\n"
+            "Standard: \"Would a staff engineer approve this?\"\n"
+        ),
+    },
+    {
+        "slug": "security-and-hardening",
+        "name": "security-and-hardening",
+        "description": "OWASP Top 10 + STRIDE threat modeling + exploit scenario construction. Equivalent to gstack /cso discipline.",
+        "category": "discipline",
+        "instructions": (
+            "# Security & Hardening Discipline\n\n"
+            "When auditing security, use exploit-driven analysis:\n\n"
+            "1. **OWASP Top 10**: Injection, XSS, CSRF, SSRF, broken auth, sensitive data exposure, XXE, broken access control, security misconfig, insufficient logging.\n"
+            "2. **STRIDE Threat Modeling**: Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, Elevation of Privilege.\n"
+            "3. **Secret Detection**: Hardcoded keys, tokens, passwords, API keys — in code AND config files.\n"
+            "4. **Dependency Supply Chain**: Known CVEs in dependencies.\n"
+            "5. **LLM/AI Security**: Prompt injection, excessive agency, unbounded consumption (OWASP LLM Top 10).\n\n"
+            "Every finding MUST include: CWE ID + CVSS estimate + concrete exploit scenario + specific fix.\n"
+            "Confidence threshold: 8/10 minimum to report. Can't construct an exploit? Don't report it.\n"
+            "Output: CLEAR / ISSUES FOUND / CRITICAL VULNERABILITY. Critical findings escalate immediately.\n"
+        ),
+    },
+    {
+        "slug": "debugging-and-error-recovery",
+        "name": "debugging-and-error-recovery",
+        "description": "Systematic root-cause investigation — reproduce, isolate, fix, verify. Equivalent to gstack /investigate discipline.",
+        "category": "discipline",
+        "instructions": (
+            "# Debugging & Error Recovery Discipline\n\n"
+            "When debugging, never guess — investigate:\n\n"
+            "1. **Reproduce**: Can you trigger the bug reliably? Write a reproduction script.\n"
+            "2. **Isolate**: Binary-search by commenting out code, checking git bisect, narrowing input.\n"
+            "3. **Read the Error**: The error message usually tells you exactly what's wrong. Don't skip it.\n"
+            "4. **Check Recent Changes**: git log/diff — what changed? When did it break?\n"
+            "5. **Add Logging**: Trace execution flow at the key decision points.\n"
+            "6. **Fix Root Cause**: Don't fix the symptom. Understand WHY it happened.\n"
+            "7. **Verify**: The reproduction script now passes. Add it as a regression test.\n"
+            "8. **Escalate if stalled**: After 3 failed repair attempts, escalate to superior with: what was tried, what was observed each time, what you suspect but can't confirm.\n"
+            "Never: comment out a failing test, apply a workaround without understanding, claim 'fixed' without verifying.\n"
+        ),
+    },
+    {
+        "slug": "design-consultation",
+        "name": "design-consultation",
+        "description": "Research competitors, extract design language, propose complete design system. Equivalent to gstack /design-consultation.",
+        "category": "discipline",
+        "instructions": (
+            "# Design Consultation Discipline\n\n"
+            "When designing UI/UX for a new feature or product:\n\n"
+            "1. **Understand the Product**: What do users do here? What's the core interaction?\n"
+            "2. **Research Competitors**: Study 2-3 comparable products — what patterns work? What's missing?\n"
+            "3. **Extract Design Language**: Colors, typography, spacing, component patterns, interaction models.\n"
+            "4. **Propose Design System**: Complete system covering: aesthetic direction, typography scale, color palette, spacing system, motion guidelines, component library.\n"
+            "5. **Apply Beautiful Defaults**: Composition-first, brand-first, cardless, poster-not-document.\n\n"
+            "Output: a design brief with mood, direction, and concrete specifications (font names, hex colors, spacing values).\n"
+            "Reference styles: poe.ninja, maxroll for dark data-dense UIs; Linear, Vercel for clean functional UIs.\n"
+        ),
+    },
+    {
+        "slug": "design-review",
+        "name": "design-review",
+        "description": "Pixel-level visual quality audit: spacing, hierarchy, AI slop patterns, interaction states. Equivalent to gstack /design-review.",
+        "category": "discipline",
+        "instructions": (
+            "# Design Review Discipline\n\n"
+            "When reviewing UI implementation against design specs:\n\n"
+            "1. **Spacing & Alignment**: Consistent padding/margins? Grid adherence? Baseline alignment?\n"
+            "2. **Typography**: Correct font, size, weight, line-height? Hierarchy clear?\n"
+            "3. **Color**: Exact hex values? Contrast ratios pass WCAG AA?\n"
+            "4. **Interaction States**: Hover, active, focus, disabled, loading, empty, error — all accounted for?\n"
+            "5. **AI Slop Patterns**: Generic card layouts, excessive rounded corners, same-size-everything, placeholder-looking content.\n"
+            "6. **Edge Cases**: Long names (47 chars), zero results, network error, first-time user, returning user.\n"
+            "7. **Information Hierarchy**: What does the user see first? second? third? Does the visual weight match the importance?\n\n"
+            "Output: PASS or numbered issues with screenshots where possible. Each issue: location, problem, fix.\n"
+        ),
+    },
+    {
+        "slug": "planning-and-task-breakdown",
+        "name": "planning-and-task-breakdown",
+        "description": "Decompose specs into atomic verifiable tasks with dependency ordering. Equivalent to gstack /plan-eng-review.",
+        "category": "discipline",
+        "instructions": (
+            "# Planning & Task Breakdown Discipline\n\n"
+            "When breaking down a spec into executable tasks:\n\n"
+            "1. **Atomic Tasks**: Each task is independently verifiable — has a clear pass/fail criterion.\n"
+            "2. **Dependency Order**: Order tasks by dependency. What must be done first?\n"
+            "3. **Acceptance Criteria**: Every task has concrete, testable acceptance criteria — not \"implement X\" but \"X works when Y input produces Z output\".\n"
+            "4. **Edge Cases Identified**: What breaks? What's the error path? What if the input is empty?\n"
+            "5. **Estimation**: Rough effort estimate per task (S/M/L). Don't over-precision.\n"
+            "6. **Interface Contracts**: Between-task interfaces must be explicit — what format, what fields, what guarantees?\n\n"
+            "Output: ordered task list with dependencies, acceptance criteria, and interface contracts.\n"
+            "Principle: No task without verification. No verification without evidence.\n"
+        ),
+    },
+    {
+        "slug": "shipping-and-launch",
+        "name": "shipping-and-launch",
+        "description": "Pre-launch checklist: tests, changelog, version bump, regression check, deployment verification. Equivalent to gstack /ship.",
+        "category": "discipline",
+        "instructions": (
+            "# Shipping & Launch Discipline\n\n"
+            "Before shipping any code:\n\n"
+            "1. **Tests Pass**: All tests green. No skipped tests. Coverage not decreased.\n"
+            "2. **No Regressions**: Run existing test suite — nothing broke.\n"
+            "3. **Changelog Updated**: What changed, what's new, what's fixed, what's deprecated.\n"
+            "4. **Version Bumped**: Semantic versioning (MAJOR.MINOR.PATCH) — breaking changes get MAJOR bump.\n"
+            "5. **Docs Updated**: API docs, README, deployment guides — all current.\n"
+            "6. **Deployment Verified**: Health check passes, smoke test passes, canary monitoring active.\n"
+            "7. **Rollback Plan**: If this deploy fails, how do we revert? Document the rollback steps.\n\n"
+            "Output: a ship report (version, changelog, test results, deployment status, rollback instructions).\n"
+            "Gate: ALL items must pass. Partial ship = no ship.\n"
+        ),
+    },
+    {
+        "slug": "spec-driven-development",
+        "name": "spec-driven-development",
+        "description": "Turn vague intent into precise executable specification before coding. Equivalent to gstack /spec.",
+        "category": "discipline",
+        "instructions": (
+            "# Spec-Driven Development Discipline\n\n"
+            "Before writing any code, produce a spec that answers:\n\n"
+            "1. **What**: What are we building? One-sentence problem statement.\n"
+            "2. **Who**: Who is this for? One specific user persona.\n"
+            "3. **Why**: Why now? What changes if we build this? What changes if we don't?\n"
+            "4. **Success Criteria**: How do we know it's done? Concrete, measurable outcomes.\n"
+            "5. **Constraints**: Technical, time, resource, compliance constraints.\n"
+            "6. **Edge Cases**: Empty states, error states, boundary conditions, concurrent access.\n"
+            "7. **Dependencies**: What must exist first? What blocks this?\n"
+            "8. **Out of Scope**: What are we explicitly NOT building? (Prevents scope creep)\n\n"
+            "Get explicit user sign-off before proceeding to PLAN.\n"
+            "Spec must be complete enough that an engineer who has never seen this project can implement it.\n"
+        ),
+    },
+    {
+        "slug": "context-engineering",
+        "name": "context-engineering",
+        "description": "Save and restore working context across sessions. Equivalent to gstack /context-save and /context-restore.",
+        "category": "discipline",
+        "instructions": (
+            "# Context Engineering Discipline\n\n"
+            "When working on long-running tasks across multiple sessions:\n\n"
+            "1. **Save Context**: After completing a logical unit, save: what was done, what decisions were made, what's next, what's blocked.\n"
+            "2. **Restore Context**: Before starting work, load the last saved context — don't rediscover what was already known.\n"
+            "3. **Handoff Notes**: When passing work between agents, include: what was done, what's pending, what problems were encountered, what the next agent needs to know.\n\n"
+            "Context persistence goes to: project memory (write_memory) for decisions, charter for project-level state, handoffs for agent-to-agent transfer.\n"
+            "Principle: Never make the next agent (or your future self) rediscover what you already know.\n"
+        ),
+    },
 ]
 
 

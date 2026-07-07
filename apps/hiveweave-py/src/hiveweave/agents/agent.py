@@ -865,6 +865,15 @@ class Agent:
             self.project_id, self.id
         )
 
+        # Project rules from charter (CEO 摸底后填入)
+        project_rules = ""
+        try:
+            charter_data = await charter_service.read_charter(self.project_id)
+            if charter_data and charter_data.get("project_rules"):
+                project_rules = charter_data["project_rules"]
+        except Exception:
+            pass  # charter not initialized yet
+
         context = build_context_prompt(
             agent_id=self.id,
             memories=memory_text or "",
@@ -873,6 +882,7 @@ class Agent:
             involvement_level=involvement,
             bound_skills=bound_skills_json,
             memory_text=memory_text,
+            project_rules=project_rules,
         )
 
         # 追加 skills section

@@ -45,6 +45,7 @@ def build_context_prompt(
     involvement_level: str | None = None,
     bound_skills: list[str] | str | None = None,
     memory_text: str | None = None,
+    project_rules: str | None = None,
 ) -> str:
     """构建动态上下文提示词（第 2 条 system 消息内容）。
 
@@ -58,14 +59,19 @@ def build_context_prompt(
         bound_skills:       已绑定技能：list[str] 或 JSON 字符串或 None
         memory_text:        预构建的记忆段文本（优先于 memories 列表；
                             caller 可直接传 memory_service.build_agent_context 输出）
+        project_rules:      项目特有规则（从 charter 加载）；None 或空不注入
 
     返回：
         上下文提示词字符串。空则返回 ""（caller 应跳过 System 2）。
         caller 负责包装为 `{"role": "system", "content": <返回值>}`。
 
-    段顺序：involvement → goals → memory(含 handoffs) → skills
+    段顺序：project_rules → involvement → goals → memory(含 handoffs) → skills
     """
     parts: list[str] = []
+
+    # 0. Project Rules（项目特有约束，CEO 摸底后填入 charter）
+    if project_rules and project_rules.strip():
+        parts.append(f"## Project Rules\n{project_rules.strip()}")
 
     # 1. User Involvement
     if involvement_level:
