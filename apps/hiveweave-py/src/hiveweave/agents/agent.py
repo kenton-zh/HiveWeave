@@ -146,8 +146,9 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
     "view_org_chart": "View the full organization chart.",
     "read_work_logs": "Read work logs from subordinates.",
     "schedule_alarm": "Schedule an alarm/reminder. One-shot fire at specified game time. Can target self (toAgentId=your own id) or others. Include a purpose message delivered on fire.",
-    "list_alarms": "List all pending alarms for the project.",
-    "cancel_alarm": "Cancel a pending alarm by its ID.",
+    "schedule_alarm": "Schedule a reminder. One-shot or recurring. Use when you need to: check back on something later (e.g. 'check build status in 1 game hour'), set a self-reminder before a deadline, or coordinate team timing. The alarm fires as an inbox message from '你自己的闹钟' or 'XXX的闹钟'.\n\nExamples:\n- Self-reminder: schedule_alarm(toAgentId='self', purpose='Check if HR has reported back', fireInGameSeconds=3600)\n- Recurring check: schedule_alarm(toAgentId='self', purpose='Poll build status', fireInGameSeconds=7200, repeatIntervalSeconds=7200)\n- Remind teammate: schedule_alarm(toAgentId='墨言', purpose='Sprint review in 30 game minutes', fireInGameSeconds=1800)",
+    "list_alarms": "List all pending alarms for the current project. Shows alarm ID, remaining game seconds until fire, and purpose.",
+    "cancel_alarm": "Cancel a pending alarm by its ID. Use when a reminder is no longer needed. Get the alarmId from list_alarms.",
     "send_message": "Send a message to other agents.",
 }
 
