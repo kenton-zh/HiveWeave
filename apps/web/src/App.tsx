@@ -621,17 +621,17 @@ function App() {
                 {/* BUG-034: ChatPanel 始终挂载，CSS 隐藏代替卸载。
                     无论切换到哪个 tab（Goals/Agent/Logs 等），ChatPanel
                     始终保持挂载，streamDraft/WebSocket channel 不丢失。 */}
-                <ChatPanel key="chat-panel" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
-                {rightPanelTab === "goals" && selectedProjectId && <GoalsPanel projectId={selectedProjectId} />}
+                <ChatPanel key="panel-chat" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
+                {rightPanelTab === "goals" && selectedProjectId && <GoalsPanel key="panel-goals" projectId={selectedProjectId} />}
                 {rightPanelTab === "goals" && !selectedProjectId && (
-                  <div className="h-full flex items-center justify-center text-gray-500 text-sm">
+                  <div key="panel-goals-empty" className="h-full flex items-center justify-center text-gray-500 text-sm">
                     请先选择一个项目
                   </div>
                 )}
-                {rightPanelTab === "agent" && <AgentDetailPanel agentId={selectedAgentId} />}
-                {rightPanelTab === "monitor" && <MonitorPanel key={selectedAgentId} agentId={selectedAgentId} />}
-                {rightPanelTab === ("debug" as any) && <DebugPanel />}
-                {rightPanelTab === "logs" && <WorkLogPanel key={selectedAgentId} agentId={selectedAgentId} />}
+                {rightPanelTab === "agent" && <AgentDetailPanel key="panel-agent" agentId={selectedAgentId} />}
+                {rightPanelTab === "monitor" && <MonitorPanel key="panel-monitor" agentId={selectedAgentId} />}
+                {rightPanelTab === ("debug" as any) && <DebugPanel key="panel-debug" />}
+                {rightPanelTab === "logs" && <WorkLogPanel key="panel-logs" agentId={selectedAgentId} />}
               </>
             )}
           </div>
