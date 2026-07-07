@@ -151,6 +151,46 @@ class CharterService:
         self.touch_goals_version(project_id)
         logger.info("charter.goals_updated", project_id=project_id)
 
+        # BUG-036: Send workbook update as inbox message to all agents.
+        # Uses same JSON format as other messages so it queues naturally.
+        try:
+            from hiveweave.services.inbox import InboxService
+            from hiveweave.services.org import OrgService
+            import json as _json
+
+            # Build a human-readable summary of the workbook
+            parts = []
+            if objective:
+                parts.append(f"Objective: {objective}")
+            if focus:
+                parts.append(f"Focus: {focus}")
+            if key_results:
+                kr_lines = "\n".join(
+                    f"  - [{kr.get('status', '?')}] {kr.get('text', str(kr))}"
+                    for kr in key_results
+                )
+                parts.append(f"Key Results:\n{kr_lines}")
+            if user_involvement:
+                parts.append(f"User Involvement: {user_involvement}")
+            content = "\n".join(parts) if parts else "Enterprise Goals Workbook updated."
+
+            msg = _json.dumps({"from": "工作簿更新", "content": content}, ensure_ascii=False)
+            inbox = InboxService()
+            org = OrgService()
+            agents = await org.list_agents(project_id)
+            for agent in agents:
+                if agent.get("status") in ("archived", "dismissed"):
+                    continue
+                try:
+                    await inbox.send_message(
+                        from_agent_id="system", to_agent_id=agent["id"],
+                        message=msg, message_type="goals_update", priority="normal",
+                    )
+                except Exception:
+                    pass  # best-effort per agent
+        except Exception as e:
+            logger.warning("charter.goals_inbox_failed", project_id=project_id, error=str(e))
+
     # ── Goals dirty-flag sync ─────────────────────────────────
 
     def touch_goals_version(self, project_id: str) -> None:
