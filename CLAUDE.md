@@ -13,7 +13,7 @@ pnpm build                # 构建 web
 # 后端 (Python + uvicorn)
 cd apps/hiveweave-py
 uv sync                   # 安装 Python 依赖 (或 pip install -e .)
-uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000
+uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000 --limit-concurrency 100 --backlog 2048 --timeout-keep-alive 30
 
 # 或用启动脚本 (Windows)
 start-all.bat             # 后端 4000 + 前端 5173
@@ -116,6 +116,35 @@ React 19 + Zustand (`store.ts`)。React Flow 渲染组织架构图。关键面�
 - `HIVEWEAVE_API_KEY` — API key auth (未设则开放)
 - 其他 provider keys: `HIVEWEAVE_OPENAI_API_KEY`, `HIVEWEAVE_ANTHROPIC_API_KEY` 等
 
+### 网络代理
+
+开发环境 HTTP/HTTPS 代理: `http://192.168.110.26:7890`
+
+需要网络访问的工具（pip, uv, httpx, curl 等）配置环境变量:
+```bash
+export HTTP_PROXY=http://192.168.110.26:7890
+export HTTPS_PROXY=http://192.168.110.26:7890
+```
+
 ## Migration history
 
 本项目从 Elixir/Phoenix + Node.js/Fastify 双后端迁移到 Python/FastAPI 单后端。迁移文档在 `docs/migration/`。
+
+## Skill routing
+
+When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
+
+Key routing rules:
+- Product ideas/brainstorming → invoke /office-hours
+- Strategy/scope → invoke /plan-ceo-review
+- Architecture → invoke /plan-eng-review
+- Design system/plan review → invoke /design-consultation or /plan-design-review
+- Full review pipeline → invoke /autoplan
+- Bugs/errors → invoke /investigate
+- QA/testing site behavior → invoke /qa or /qa-only
+- Code review/diff check → invoke /review
+- Visual polish → invoke /design-review
+- Ship/deploy/PR → invoke /ship or /land-and-deploy
+- Save progress → invoke /context-save
+- Resume context → invoke /context-restore
+- Author a backlog-ready spec/issue → invoke /spec
