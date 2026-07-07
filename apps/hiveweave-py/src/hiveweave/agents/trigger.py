@@ -384,7 +384,7 @@ async def build_trigger_context(
             reply_tag = " **[REPLY REQUIRED]**" if m.get("expect_report") else ""
             from_name = await _agent_name(m.get("from_agent_id", ""))
             priority = m.get("priority", "normal")
-            prio_tag = " 🔴" if priority == "urgent" else ""
+            prio_tag = " [URGENT]" if priority == "urgent" else ""
             lines.append(
                 f"[来自: {from_name}]{reply_tag}{prio_tag}\n"
                 f"{m.get('message', '')}"
