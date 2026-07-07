@@ -60,6 +60,26 @@ async def execute_question(
     except Exception as exc:  # noqa: BLE001
         log.warning("question.persist_failed", error=str(exc))
 
+    # BUG-036: Also save as a chat_message so the question appears in ChatPanel.
+    # Previously only saved to questions table — user couldn't see it in chat.
+    from hiveweave.services.chat_message import ChatMessageService
+    chat_msg = ChatMessageService()
+    options_text = ""
+    if options:
+        opts = [f"- {o.get('label', o.get('text', str(o)))}" for o in options[:6]]
+        options_text = "\n\n选项:\n" + "\n".join(opts)
+    try:
+        await chat_msg.save_message({
+            "agent_id": agent_id,
+            "role": "assistant",
+            "content": f"❓ {question}{options_text}",
+            "is_streaming": False,
+            "is_background": False,
+            "is_read": True,
+        })
+    except Exception as exc:
+        log.warning("question.chat_message_failed", error=str(exc))
+
     # Create a Future for the answer
     loop = asyncio.get_event_loop()
     future: asyncio.Future[str] = loop.create_future()
@@ -81,6 +101,19 @@ async def execute_question(
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("question.update_failed", error=str(exc))
+
+        # BUG-036: Save answer as user message in chat so the conversation is visible
+        try:
+            await chat_msg.save_message({
+                "agent_id": agent_id,
+                "role": "user",
+                "content": answer,
+                "is_streaming": False,
+                "is_background": False,
+                "is_read": True,
+            })
+        except Exception as exc:
+            log.warning("question.answer_chat_failed", error=str(exc))
 
         return {"success": True, "output": f"User answered: {answer}",
                 "error": None}
