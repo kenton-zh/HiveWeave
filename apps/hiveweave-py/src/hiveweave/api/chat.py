@@ -214,12 +214,14 @@ async def send_chat(body: ChatSendBody) -> dict:
     )
 
     # 4. 触发 chat（含 busy 重试）
-    result = await agent.chat(message)
+    # BUG-036: [来自: 用户] 前缀帮助 LLM 区分人类操作员和其他 agent
+    tagged_message = f"[来自: 用户]\n{message}"
+    result = await agent.chat(tagged_message)
     if result.get("error") == "busy":
         # force_reset + sleep + 重试
         await agent.cancel()
         await asyncio.sleep(_BUSY_RESET_SLEEP)
-        result = await agent.chat(message)
+        result = await agent.chat(tagged_message)
         if result.get("error") == "busy":
             raise HTTPException(status_code=409, detail="Agent is busy after reset")
         return {"ok": True, "userMessageId": user_msg["id"], "reset": True}

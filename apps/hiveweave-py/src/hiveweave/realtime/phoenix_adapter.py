@@ -496,7 +496,10 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
         agent._on_stream_event = on_stream
         log.info("phoenix_patch_agent_callbacks", agent_id=agent_id)
 
-    result = await agent.chat(message)
+    # BUG-036: 添加 [来自: 用户] 前缀，帮助 LLM 区分人类操作员
+    # 和其他 agent 的消息（后者通过 trigger 上下文以 [来自: 名称] 格式进入）。
+    # 保持与 trigger.py build_trigger_context 的格式一致。
+    result = await agent.chat(f"[来自: 用户]\n{message}")
 
     if result.get("error") == "busy":
         await send_fn(
