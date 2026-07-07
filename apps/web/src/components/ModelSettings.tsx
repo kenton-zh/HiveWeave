@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { getModels, createModel, updateModel, deleteModel, testModel } from "../api";
 import type { LlmModel } from "../api";
 import { useAppStore } from "../store";
+import ConfirmDialog from "./ConfirmDialog";
 
 interface Props {
   onClose: () => void;
@@ -16,6 +17,8 @@ export default function ModelSettings({ onClose }: Props) {
   const [showForm, setShowForm] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ ok: boolean; latencyMs: number; error?: string } | null>(null);
+  // Test-friendly confirm dialog
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   // Form state
   const [formName, setFormName] = useState("");
@@ -98,8 +101,15 @@ export default function ModelSettings({ onClose }: Props) {
     }
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm("Delete this model? Agents using it will fall back to the default model.")) return;
+  const handleDelete = (id: string) => {
+    // Test-friendly: custom ConfirmDialog instead of native window.confirm()
+    setConfirmDeleteId(id);
+  };
+
+  const confirmDelete = async () => {
+    if (!confirmDeleteId) return;
+    const id = confirmDeleteId;
+    setConfirmDeleteId(null);
     try {
       await deleteModel(id);
       loadModels();
@@ -346,6 +356,18 @@ export default function ModelSettings({ onClose }: Props) {
           )}
         </div>
       </div>
+
+      {/* Confirm Dialog — test-friendly */}
+      {confirmDeleteId && (
+        <ConfirmDialog
+          title="删除模型"
+          message="确定要删除此模型吗？使用该模型的 Agent 将回退到默认模型。"
+          confirmLabel="删除"
+          danger
+          onConfirm={confirmDelete}
+          onCancel={() => setConfirmDeleteId(null)}
+        />
+      )}
     </div>
   );
 }

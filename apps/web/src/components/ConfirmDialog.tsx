@@ -35,7 +35,7 @@ export default function ConfirmDialog({
   return (
     <div
       className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50"
-      onClick={onCancel}
+      onClick={(e) => { e.stopPropagation(); onCancel(); }}
     >
       <div
         className="bg-surface-card border border-surface-border rounded-xl shadow-2xl p-6 w-full max-w-md mx-4"
