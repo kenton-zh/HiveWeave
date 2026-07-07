@@ -36,6 +36,11 @@ log = structlog.get_logger(__name__)
 RECENT_ACTIVITY_BUFFER = 100
 """最近活动缓冲区大小。对齐 Elixir recentActivity 缓冲 100 条。"""
 
+AGENT_REPLAY_BUFFER = 50
+"""单 agent 事件重放缓冲区大小。参考 DeepTutor StreamBus replay 模式：
+新订阅者加入 agent 频道时，立即重放缓冲的最近事件，避免因 WebSocket
+join 延迟而丢失 stream_chunk / tool_call 等关键事件。"""
+
 MAX_SUBSCRIBERS = 100
 """最大订阅者总数（跨所有频道）。R3 fix: 防止恶意客户端创建大量订阅耗尽内存。"""
 
@@ -85,6 +90,8 @@ class StatusEventBus:
         self._processing: set[str] = set()
         # recent activity events (deque maxlen=100)
         self._recent_activity: deque[dict] = deque(maxlen=RECENT_ACTIVITY_BUFFER)
+        # per-agent replay buffers (参考 DeepTutor StreamBus replay)
+        self._agent_buffers: dict[str, deque[dict]] = {}
         # lock for subscriber management
         self._lock = asyncio.Lock()
 
@@ -276,7 +283,8 @@ class StatusEventBus:
         - text_delta / thinking_delta / start → 仅 ``agent:{agent_id}`` 频道
         - tool_call_start / tool_call_end / done / error → agent + lobby 频道
 
-        同时缓冲到 recent_activity（lobby replay 用）。
+        同时缓冲到 recent_activity（lobby replay 用）和 per-agent replay
+        buffer（参考 DeepTutor StreamBus replay 模式）。
 
         Args:
             agent_id: Agent ID
@@ -296,6 +304,29 @@ class StatusEventBus:
 
         # 缓冲活动事件
         self.emit_activity(event)
+
+        # Per-agent replay buffer（参考 DeepTutor StreamBus.subscribe() replay）
+        buf = self._agent_buffers.get(agent_id)
+        if buf is None:
+            buf = deque(maxlen=AGENT_REPLAY_BUFFER)
+            self._agent_buffers[agent_id] = buf
+        buf.append(event)
+
+    def get_agent_replay(self, agent_id: str) -> list[dict]:
+        """获取 agent 的缓冲事件用于重放，并清空缓冲区。
+
+        参考 DeepTutor StreamBus: subscribe() 立即重放已有事件给新订阅者。
+
+        Args:
+            agent_id: Agent ID
+
+        Returns:
+            缓冲的事件列表（按时间顺序）；如果 agent 无缓冲，返回空列表。
+        """
+        buf = self._agent_buffers.pop(agent_id, None)
+        if buf is None:
+            return []
+        return list(buf)
 
     async def publish_system_paused(self) -> None:
         """发布系统暂停通知到 lobby。"""

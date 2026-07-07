@@ -13,6 +13,7 @@ import GoalsPanel from "./components/GoalsPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import QuestionDialog from "./components/QuestionDialog";
 import NewProjectDialog from "./components/NewProjectDialog";
+import ConfirmDialog from "./components/ConfirmDialog";
 import ToastContainer from "./components/Toast";
 import { useAppStore } from "./store";
 import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings } from "./api";
@@ -60,6 +61,8 @@ function App() {
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
+  // Test-friendly confirm dialog — replaces native window.confirm()
+  const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
   const [paused, setPaused] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
@@ -222,10 +225,12 @@ function App() {
         setNewProjectCEO(mainAgentId);
         // Select CEO first so ChatPanel mounts + channel joins
         setSelectedAgent(mainAgentId);
-        // Delay showing dialog to let ChatPanel mount and WS channel join
+        // BUG-032: 减少延迟从 1500ms→500ms。后端 event_bus 的 replay
+        // 机制保证即使 WebSocket channel 尚未 join，事件也会在 join 后重放。
+        // 500ms 足够 React 挂载 ChatPanel + WebSocket join 往返（localhost）。
         setTimeout(() => {
           setShowNewProjectDialog(true);
-        }, 1500);
+        }, 500);
       }
     } catch (err) {
       console.error("Failed to create project:", err);
@@ -315,13 +320,22 @@ function App() {
     const proj = currentProjects.find((p) => p.id === id);
     if (!proj) return;
     if (deleteQueueRef.current.some((item) => item.id === id)) return;
-    if (!confirm(`确定删除项目「${proj.name}」吗？所有相关数据将被永久删除。`)) return;
+    // Test-friendly: custom ConfirmDialog instead of native window.confirm()
+    // so browser automation tools can see and click the confirm button.
+    setConfirmDelete({ id, name: proj.name });
+    setShowProjectMenu(false);
+  };
 
+  const handleConfirmDelete = () => {
+    if (!confirmDelete) return;
+    const { id, name } = confirmDelete;
+    setConfirmDelete(null);
+    const currentProjects = useAppStore.getState().projects;
     const remaining = currentProjects.filter((p) => p.id !== id);
     setProjects(remaining);
     detachDeletedProject(id, remaining);
 
-    deleteQueueRef.current.push({ id, name: proj.name });
+    deleteQueueRef.current.push({ id, name });
     setQueuedDeleteIds((prev) => [...prev, id]);
     void runDeleteQueue();
   };
@@ -653,6 +667,18 @@ function App() {
       {/* Model Settings Modal */}
       {showModelSettings && (
         <ModelSettings onClose={() => setShowModelSettings(false)} />
+      )}
+
+      {/* Confirm Dialog — test-friendly replacement for window.confirm() */}
+      {confirmDelete && (
+        <ConfirmDialog
+          title="删除项目"
+          message={`确定删除项目「${confirmDelete.name}」吗？所有相关数据将被永久删除。`}
+          confirmLabel="删除"
+          danger
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setConfirmDelete(null)}
+        />
       )}
 
       {/* Question Dialog — global, polled */}

@@ -554,14 +554,16 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     // Send directly - onboarding messages must not show the queued-behind-busy UI.
     // Do NOT return cleanup that cancels the send timer: clearing pendingInitialMessage
     // re-runs this effect and the previous cleanup would cancel the send.
+    //
+    // BUG-032: 移除脆弱的 100ms setTimeout。streamChat() 内部已正确处理
+    // "joining" 状态（等待 join 完成后 push）。后端 event_bus 的 replay
+    // 机制也保证即使事件先于 join 产生，也会在 join 后重放。
     void joinAgentChannel(sendingForAgentId).finally(() => {
-      setTimeout(() => {
-        if (activeAgentIdRef.current !== sendingForAgentId) return;
-        autoSendRef.current = true;
-        pendingQueueRef.current = [message];
-        setQueuedCount(0);
-        handleSendRef.current();
-      }, 100);
+      if (activeAgentIdRef.current !== sendingForAgentId) return;
+      autoSendRef.current = true;
+      pendingQueueRef.current = [message];
+      setQueuedCount(0);
+      handleSendRef.current();
     });
   }, [pendingInitialMessage, agentId]);
 
@@ -1082,6 +1084,8 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
       } else if (event.type === "busy") {
         // Agent is processing a previous message — restore input so user doesn't lose their text
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
+        // BUG-032: 清除 optimistic processing 状态，agent 已拒绝此消息
+        if (sendingForAgentId) updateProcessingAgent(sendingForAgentId, false);
         setInput(messageText);
         updateStreamDraft(null);
         setIsStreaming(false);
@@ -1092,18 +1096,19 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         autoSendRef.current = false;
         sendingLockRef.current = false;
       } else if (event.type === "error") {
+        // BUG-032 修复: 对齐 done 事件处理模式。之前 updateStreamDraft(null)
+        // 在 loadMessagesFromDb 完成前同步执行，会立即清空刚追加的错误文本。
+        // 参考 OpenCode 的 SSE 错误处理: 错误信息保存到 DB → 前端通过
+        // loadMessagesFromDb 加载后自然展示，不依赖 streamDraft 竞态。
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setRetryInfo(null);
         if (sendingForAgentId) updateProcessingAgent(sendingForAgentId, false);
-        if (streamDraft) {
-          updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "text", content: "\n\nError: " + event.data }] } : prev);
-        } else {
-          // streamDraft is null (server unreachable / no message_id received) — restore input
-          setInput(messageText);
-        }
-        loadMessagesFromDb(sendingForAgentId);
-        updateStreamDraft(null);
-        setIsStreaming(false);
+        // 从 DB 加载消息（包括后端 _handle_error 保存的 [ERROR] 消息）
+        // 等待完成后再清理 streamDraft，避免闪烁。
+        loadMessagesFromDb(sendingForAgentId).finally(() => {
+          updateStreamDraft(null);
+          setIsStreaming(false);
+        });
         releaseLockAndFinish();
       }
     });
