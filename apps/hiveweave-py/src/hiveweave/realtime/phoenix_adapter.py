@@ -456,11 +456,9 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
 
     chat_service = ChatMessageService()
 
-    # BUG-036: 先检查 agent 是否 busy，再决定是否保存消息。
-    # 之前先存 DB 再检查 busy → agent 忙时消息被存但永不处理，
-    # 前端 5s 后检测到 orphan 消息并弹出"上次对话未收到回复"。
+    # BUG-036: 如果 agent 正忙，消息进 inbox 排队——agent 闲了自动处理。
+    # 不再拒绝消息，也不留 orphan 消息在 chat_messages。
     agent = agent_manager.get_agent(agent_id)
-    is_busy = agent is not None and agent.status.value == "processing"
 
     if agent is None:
         await send_fn(
@@ -469,14 +467,35 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
         )
         return
 
-    if is_busy:
+    if agent.status.value == "processing":
+        # Agent busy — queue via inbox. Save to chat so user sees it,
+        # send to inbox so agent picks it up when idle.
+        import json as _json
+        queued = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)
+        try:
+            saved = await chat_service.save_message(
+                {"agent_id": agent_id, "role": "user", "content": message,
+                 "is_streaming": False, "is_read": True}
+            )
+            await send_fn(
+                [None, None, topic, "message_id",
+                 {"id": saved["id"], "agentId": agent_id, "role": "user"}]
+            )
+        except Exception as e:
+            log.warning("phoenix_chat_save_failed", agent_id=agent_id, error=str(e))
+        # Queue to inbox for processing when agent becomes idle
+        from hiveweave.services.inbox import InboxService
+        await InboxService().send_message(
+            from_agent_id="用户", to_agent_id=agent_id, message=queued,
+            message_type="user_message", priority="normal",
+        )
         await send_fn(
-            [None, None, topic, "busy",
-             {"message": "Agent is busy", "agentId": agent_id}]
+            [None, None, topic, "queued_message",
+             {"message": "Agent is busy — message queued", "agentId": agent_id}]
         )
         return
 
-    # 保存用户消息（确认 agent 空闲后才存）
+    # Agent idle — process immediately
     try:
         saved = await chat_service.save_message(
             {

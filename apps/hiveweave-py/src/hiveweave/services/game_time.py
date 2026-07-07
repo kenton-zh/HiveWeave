@@ -242,18 +242,28 @@ class GameTimeService:
             except Exception as e:
                 log.error("alarm_script_error", alarm_id=alarm["id"], error=str(e))
 
-        # 2. Send inbox notification — JSON format matching trigger messages
+        # 2. Send inbox notification — JSON format, sender identifies the creator
         to_agent = alarm.get("to_agent_id")
         if to_agent:
             from hiveweave.services.inbox import InboxService
+            from hiveweave.agents.trigger import _agent_name as _alarm_agent_name
             import json
+            from_id = alarm.get("from_agent_id") or ""
             repeat = alarm.get("repeat_interval_seconds", 0) or 0
-            entry = {"from": "闹钟", "content": alarm.get("purpose", "")}
+            # Resolve creator name: self-alarm → "你自己的闹钟", other → "XXX 的闹钟"
+            if from_id == to_agent:
+                sender = "你自己的闹钟"
+            elif from_id:
+                creator_name = await _alarm_agent_name(from_id)
+                sender = f"{creator_name}的闹钟"
+            else:
+                sender = "闹钟"
+            entry = {"from": sender, "content": alarm.get("purpose", "")}
             if repeat > 0:
                 entry["content"] = f"[每{repeat}游戏秒] {entry['content']}"
             msg = json.dumps(entry, ensure_ascii=False)
             await InboxService().send_message(
-                alarm.get("from_agent_id") or to_agent, to_agent, msg,
+                from_agent_id=from_id or to_agent, to_agent=to_agent, message=msg,
                 message_type="alarm", priority="normal")
 
         # 3. Update DB
