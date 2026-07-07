@@ -437,10 +437,10 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     stickToBottomRef.current = distFromBottom <= 72;
   }, []);
 
-  const loadMessagesFromDb = useCallback(async (loadForAgentId: string) => {
+  const loadMessagesFromDb = useCallback(async (loadForAgentId: string): Promise<boolean> => {
     try {
       const dbMessages = await getChatMessages(loadForAgentId);
-      if (activeAgentIdRef.current !== loadForAgentId) return;
+      if (activeAgentIdRef.current !== loadForAgentId) return false;
       const converted = mapDbToChatMessages(dbMessages);
       setMessages(converted);
       useAppStore.getState().setChatMessages(loadForAgentId, converted);
@@ -451,9 +451,11 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         markMessagesRead(unreadIds, loadForAgentId).catch(() => {});
         refreshOrgTree();
       }
+      return true;
     } catch (err) {
-      if (activeAgentIdRef.current !== loadForAgentId) return;
+      if (activeAgentIdRef.current !== loadForAgentId) return false;
       console.warn("Failed to load chat messages from DB:", err);
+      return false;
     }
   }, [refreshOrgTree]);
 
@@ -596,6 +598,8 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   // If the socket drops mid-stream, no done/error event will arrive, leaving
   // isStreaming stuck. On reconnect, lobby:status fires an init snapshot —
   // if the agent is no longer processing, we force-reset the UI.
+  // BUG-033: Don't clear streamDraft entirely — persist it so the streamed
+  // content doesn't vanish. The DB load on next user action will reconcile it.
   useEffect(() => {
     if (socketReconnectVersion === prevReconnectVersion.current) return;
     prevReconnectVersion.current = socketReconnectVersion;
@@ -603,8 +607,9 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
     if (socketReconnectVersion > 1) {
       const stillProcessing = agentId ? processingAgents.includes(agentId) : false;
       if (!stillProcessing && isStreaming) {
+        // Persist the streamed content rather than clearing it
+        updateStreamDraft((prev) => prev ? { ...prev, persisted: true } as any : prev);
         setIsStreaming(false);
-        updateStreamDraft(null);
         setRetryInfo(null);
         if (responseTimeoutRef.current) {
           clearTimeout(responseTimeoutRef.current);
@@ -626,16 +631,25 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
 
   const displayMessages = useMemo(() => {
     let merged = messages;
-    if (isStreaming && streamDraft) {
+    // BUG-033: Also merge streamDraft when it has persisted content (DB load
+    // failed after done event). This prevents streamed text from vanishing
+    // when the HTTP fetch for DB messages fails.
+    const hasPersistedDraft = streamDraft && (streamDraft as any).persisted;
+    if ((isStreaming && streamDraft) || hasPersistedDraft) {
       merged = messages.map((m) => {
-        if (m.id !== streamDraft.assistantId) {
+        const isTarget = m.id === streamDraft!.assistantId;
+        if (!isTarget && !hasPersistedDraft) {
           // Any other message claiming to be streaming is stale (cached from a
           // previous session) — strip the flag so the "..." bubble goes away.
           return m.isStreaming ? { ...m, isStreaming: false } : m;
         }
-        const textParts = streamDraft.segments.filter(s => s.type === "text").map(s => s.content || "");
-        const thinkingParts = streamDraft.segments.filter(s => s.type === "thinking").map(s => s.content || "");
-        const newTools = streamDraft.segments.filter(s => s.type === "tool_call").map(s => s.tool!);
+        if (!isTarget && hasPersistedDraft) {
+          // During persisted draft, show all messages normally except the target
+          return m;
+        }
+        const textParts = streamDraft!.segments.filter(s => s.type === "text").map(s => s.content || "");
+        const thinkingParts = streamDraft!.segments.filter(s => s.type === "thinking").map(s => s.content || "");
+        const newTools = streamDraft!.segments.filter(s => s.type === "tool_call").map(s => s.tool!);
         return {
           ...m,
           content: textParts.join(""),
@@ -643,9 +657,9 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
           // The DB message may already contain tool calls saved by the streamer's
           // intermediate update, so merging would duplicate them.
           toolCalls: newTools.length > 0 ? newTools : (m.toolCalls || []),
-          _segments: streamDraft.segments,
+          _segments: streamDraft!.segments,
           _thinking: thinkingParts.join(""),
-          isStreaming: true,
+          isStreaming: hasPersistedDraft ? false : true,
         };
       });
     } else {
@@ -1073,11 +1087,19 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         if (sendingForAgentId) updateProcessingAgent(sendingForAgentId, false);
         const ORG_TOOLS = new Set(["create_agent", "transfer_agent", "dismiss_agent", "create_from_template", "hire_agent"]);
         if ([...allToolsUsed].some((x) => ORG_TOOLS.has(x))) refreshOrgTree();
-        // Load final messages from DB, THEN clear streamDraft and isStreaming.
-        // This prevents a flash of empty content between clearing streamDraft
-        // and the DB refresh arriving.
-        loadMessagesFromDb(sendingForAgentId).finally(() => {
-          updateStreamDraft(null);
+        // BUG-033: Load final messages from DB, but only clear streamDraft
+        // if the DB load succeeds. If it fails (e.g. server restart), the
+        // streamed content stays visible instead of vanishing.
+        loadMessagesFromDb(sendingForAgentId).then((ok) => {
+          if (ok) {
+            // DB loaded successfully — clear the draft and show persisted messages
+            updateStreamDraft(null);
+          } else {
+            // DB load failed — keep streamDraft but mark content as final
+            // (not streaming), so displayMessages shows it as a regular message
+            updateStreamDraft((prev) => prev ? { ...prev, persisted: true } as any : prev);
+            // Don't clear streamDraft — the user should still see the streamed text
+          }
           setIsStreaming(false);
         });
         releaseLockAndFinish();
@@ -1096,17 +1118,17 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
         autoSendRef.current = false;
         sendingLockRef.current = false;
       } else if (event.type === "error") {
-        // BUG-032 修复: 对齐 done 事件处理模式。之前 updateStreamDraft(null)
-        // 在 loadMessagesFromDb 完成前同步执行，会立即清空刚追加的错误文本。
-        // 参考 OpenCode 的 SSE 错误处理: 错误信息保存到 DB → 前端通过
-        // loadMessagesFromDb 加载后自然展示，不依赖 streamDraft 竞态。
+        // BUG-033: 只在 DB 加载成功时清除 streamDraft。如果 HTTP 请求失败
+        // (服务重启等)，保留已流式传输的内容，避免"出现一瞬间就没了"。
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setRetryInfo(null);
         if (sendingForAgentId) updateProcessingAgent(sendingForAgentId, false);
-        // 从 DB 加载消息（包括后端 _handle_error 保存的 [ERROR] 消息）
-        // 等待完成后再清理 streamDraft，避免闪烁。
-        loadMessagesFromDb(sendingForAgentId).finally(() => {
-          updateStreamDraft(null);
+        loadMessagesFromDb(sendingForAgentId).then((ok) => {
+          if (ok) {
+            updateStreamDraft(null);
+          } else {
+            updateStreamDraft((prev) => prev ? { ...prev, persisted: true } as any : prev);
+          }
           setIsStreaming(false);
         });
         releaseLockAndFinish();
