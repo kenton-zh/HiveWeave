@@ -145,6 +145,9 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
     "read_goals": "Read enterprise goals.",
     "view_org_chart": "View the full organization chart.",
     "read_work_logs": "Read work logs from subordinates.",
+    "schedule_alarm": "Schedule an alarm/reminder. One-shot fire at specified game time. Can target self (toAgentId=your own id) or others. Include a purpose message delivered on fire.",
+    "list_alarms": "List all pending alarms for the project.",
+    "cancel_alarm": "Cancel a pending alarm by its ID.",
     "send_message": "Send a message to other agents.",
 }
 
@@ -235,6 +238,35 @@ _TOOL_SCHEMAS: dict[str, dict] = {
             },
         },
         "required": ["question"],
+    },
+    # BUG-036: alarm tool schemas
+    "schedule_alarm": {
+        "type": "object",
+        "properties": {
+            "toAgentId": {
+                "type": "string",
+                "description": "Agent ID to notify (use your own id for self-reminder, or another agent's id/name/short_id).",
+            },
+            "purpose": {
+                "type": "string",
+                "description": "Message delivered when the alarm fires (e.g. 'Check build status', 'Remind HR to report').",
+            },
+            "fireInGameSeconds": {
+                "type": "number",
+                "description": "Seconds of GAME TIME from now until fire. 1 real hour = 1 game day (86400 game seconds). E.g. 3600 game seconds ≈ 2.5 real minutes.",
+            },
+        },
+        "required": ["toAgentId", "purpose", "fireInGameSeconds"],
+    },
+    "cancel_alarm": {
+        "type": "object",
+        "properties": {
+            "alarmId": {
+                "type": "string",
+                "description": "The ID of the alarm to cancel.",
+            },
+        },
+        "required": ["alarmId"],
     },
     # BUG-036: send_message schema — LLM needs to know expectReport parameter
     "send_message": {
