@@ -72,7 +72,7 @@ async def execute_question(
         await chat_msg.save_message({
             "agent_id": agent_id,
             "role": "assistant",
-            "content": f"❓ {question}{options_text}",
+            "content": f"[QUESTION] {question}{options_text}",
             "is_streaming": False,
             "is_background": False,
             "is_read": True,
