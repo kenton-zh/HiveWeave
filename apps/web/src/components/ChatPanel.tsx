@@ -471,6 +471,14 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       const dbMessages = await getChatMessages(loadForAgentId);
       if (activeAgentIdRef.current !== loadForAgentId) return false;
       const converted = mapDbToChatMessages(dbMessages);
+      // BUG-036: dedup by ID — 5s poll + message_id handler both call
+      // loadMessagesFromDb, and if they overlap, duplicate messages appear.
+      const seen = new Set<string>();
+      const deduped = converted.filter((m) => {
+        if (seen.has(m.id)) return false;
+        seen.add(m.id);
+        return true;
+      });
       // BUG-034: When streaming is active, the message_id handler triggers
       // loadMessagesFromDb before the assistant message exists in DB. The
       // DB result only has the user message, which would wipe the lazy-init
@@ -478,9 +486,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       // streaming placeholder if streamDraft is active and its target
       // message isn't in the DB results.
       if (streamDraftRef.current?.assistantId) {
-        const hasTarget = converted.some((m) => m.id === streamDraftRef.current!.assistantId);
+        const hasTarget = deduped.some((m) => m.id === streamDraftRef.current!.assistantId);
         if (!hasTarget) {
-          converted.push({
+          deduped.push({
             id: streamDraftRef.current.assistantId,
             role: "assistant" as const,
             content: "",
@@ -491,9 +499,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           });
         }
       }
-      setMessages(converted);
-      useAppStore.getState().setChatMessages(loadForAgentId, converted);
-      const unreadIds = converted
+      setMessages(deduped);
+      useAppStore.getState().setChatMessages(loadForAgentId, deduped);
+      const unreadIds = deduped
         .filter((m) => !m.isRead && (m.isBackground || m.role === "team"))
         .map((m) => m.id);
       if (unreadIds.length > 0) {
@@ -842,12 +850,12 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     return foreground;
   }, [messages, isStreaming, streamDraft, isAgentProcessing]);
 
+  // BUG-036: 5s polling was causing message duplication when combined with
+  // message_id handler's loadMessagesFromDb. Rely on event-driven loading only.
   useEffect(() => {
     if (!agentId) return;
-    const pollForAgentId = agentId;
-    const timer = setInterval(() => loadMessagesFromDb(pollForAgentId), 5000);
-    return () => clearInterval(timer);
-  }, [agentId, loadMessagesFromDb]);
+    loadMessagesFromDb(agentId);
+  }, [agentId]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!stickToBottomRef.current) return;
