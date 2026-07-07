@@ -1026,15 +1026,31 @@ class Agent:
         """错误处理。
 
         对齐 Elixir agent.ex:644 handle_info({:DOWN, ref, :process, ...})。
+
+        BUG-032 修复: 先广播 error 事件再 reset_to_idle。之前顺序导致
+        前端先收到 status→idle 再收到 error，错误信息可能因 streamDraft
+        已被清理而无法展示。参考 OpenCode SSE 错误模式：错误事件作为终止
+        信号先于状态变更到达。
         """
         error_msg = str(error)
+        error_type = type(error).__name__
         log.error(
             "llm_error",
             agent_id=self.id,
             error=error_msg,
+            error_type=error_type,
         )
 
-        # 保存错误消息
+        # 发送 error 事件（前端 streamChat 等待此事件停止 loading）
+        # 必须在 _reset_to_idle 之前发送，确保前端先处理错误再看到 idle 状态
+        self._broadcast_stream_event({
+            "type": "error",
+            "message": error_msg,
+            "errorType": error_type,
+            "agentId": self.id,
+        })
+
+        # 保存错误消息到 DB
         await self._chat_msg.save_message(
             {
                 "agent_id": self.id,
@@ -1052,13 +1068,6 @@ class Agent:
             self.pending_inbox_msg_ids = None
 
         self._reset_to_idle()
-
-        # 发送 error 事件（前端 streamChat 等待此事件停止 loading）
-        self._broadcast_stream_event({
-            "type": "error",
-            "message": error_msg,
-            "agentId": self.id,
-        })
 
     # ── 内部: 安全超时 ────────────────────────────────────────
 

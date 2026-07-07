@@ -341,6 +341,16 @@ async def _handle_phoenix_join(
         # 订阅 agent 频道
         session.queue = await status_event_bus.subscribe(f"agent:{agent_id}")
 
+        # BUG-032: 事件重放（参考 DeepTutor StreamBus replay）。
+        # 新订阅者加入后，立即将 agent 缓冲的最近事件（stream_chunk、
+        # tool_call 等）推给客户端。这解决了 WebSocket join 延迟导致
+        # 前端错过初始事件的问题。
+        replay_events = status_event_bus.get_agent_replay(agent_id)
+        for evt in replay_events:
+            event_name, payload = _map_event(evt)
+            phoenix_msg = [join_ref, None, topic, event_name, payload]
+            await send_fn(phoenix_msg)
+
         # 获取历史消息
         from hiveweave.services.chat_message import ChatMessageService
 

@@ -158,8 +158,19 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                      agent_id=agent_id,
                      name=agent_record.get("name"))
             try:
+                # BUG-032 修复: 通过 create_agent_callbacks 注入流式回调,
+                # 确保 trigger 自动启动的 agent 也能向前端推送 stream_chunk
+                # 和 status_change 事件。参考 DeepTutor StreamBus replay 模式
+                # 和 OpenCode 的 SSE 统一事件流设计。
+                from hiveweave.realtime.event_bus import create_agent_callbacks
+
+                on_status, on_stream = create_agent_callbacks(
+                    agent_id, agent_record["project_id"]
+                )
                 agent = await manager.start_agent(
-                    agent_id, agent_record["project_id"], agent_record
+                    agent_id, agent_record["project_id"], agent_record,
+                    on_status_change=on_status,
+                    on_stream_event=on_stream,
                 )
                 log.info(
                     "trigger_auto_started_agent",
@@ -177,6 +188,19 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
             if agent is None:
                 log.warning("trigger_no_agent_task", agent_id=agent_id)
                 return
+
+        # BUG-032 修复: 防御性回调补丁。即使 agent 已在 agent_manager 中
+        # (manager.get_agent 非空)，回调也可能缺失（例如通过某些冷启动路径）。
+        # 参考 phoenix_adapter.py:481-487 和 DeepTutor StreamBus 的订阅保证。
+        if getattr(agent, "_on_stream_event", None) is None:
+            from hiveweave.realtime.event_bus import create_agent_callbacks
+
+            on_status, on_stream = create_agent_callbacks(
+                agent_id, agent_record["project_id"]
+            )
+            agent._on_status_change = on_status
+            agent._on_stream_event = on_stream
+            log.info("trigger_patch_agent_callbacks", agent_id=agent_id)
 
         # 5. 检查 agent 是否正在 processing → 跳过
         # 对齐 Elixir agent.ex:217-224: 等完成后自检 re-trigger
