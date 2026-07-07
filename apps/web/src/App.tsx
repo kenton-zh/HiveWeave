@@ -605,15 +605,7 @@ function App() {
 
           {/* Tab content */}
           <div className="flex-1 overflow-hidden">
-            {rightPanelTab === "goals" ? (
-              selectedProjectId ? (
-                <GoalsPanel projectId={selectedProjectId} />
-              ) : (
-                <div className="h-full flex items-center justify-center text-gray-500 text-sm">
-                  请先选择一个项目
-                </div>
-              )
-            ) : !selectedAgentId ? (
+            {!selectedAgentId ? (
               <div className="h-full flex items-center justify-center text-gray-500 text-sm">
                 <div className="text-center">
                   <div className="w-16 h-16 rounded-full bg-surface-card border border-surface-border flex items-center justify-center mx-auto mb-4">
@@ -626,11 +618,16 @@ function App() {
               </div>
             ) : (
               <>
-                {/* BUG-034: ChatPanel 始终挂载，用 CSS 隐藏代替卸载。
-                    这样 streamDraft / isStreaming / WebSocket channel 在
-                    切换 tab 时不丢失。Agent 继续后台运行，切回 Chat tab
-                    时立即看到正在进行的流输出。 */}
+                {/* BUG-034: ChatPanel 始终挂载，CSS 隐藏代替卸载。
+                    无论切换到哪个 tab（Goals/Agent/Logs 等），ChatPanel
+                    始终保持挂载，streamDraft/WebSocket channel 不丢失。 */}
                 <ChatPanel key="chat-panel" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
+                {rightPanelTab === "goals" && selectedProjectId && <GoalsPanel projectId={selectedProjectId} />}
+                {rightPanelTab === "goals" && !selectedProjectId && (
+                  <div className="h-full flex items-center justify-center text-gray-500 text-sm">
+                    请先选择一个项目
+                  </div>
+                )}
                 {rightPanelTab === "agent" && <AgentDetailPanel agentId={selectedAgentId} />}
                 {rightPanelTab === "monitor" && <MonitorPanel key={selectedAgentId} agentId={selectedAgentId} />}
                 {rightPanelTab === ("debug" as any) && <DebugPanel />}
