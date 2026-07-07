@@ -68,7 +68,6 @@ function WebFolderPicker({
   const [loading, setLoading] = useState(true);
   const [addressBar, setAddressBar] = useState("");
   const [addressEditing, setAddressEditing] = useState(false);
-  const [selectedEntry, setSelectedEntry] = useState<string | null>(null);
   const addressRef = useRef<HTMLInputElement>(null);
 
   const navigate = async (dirPath?: string) => {
@@ -192,25 +191,13 @@ function WebFolderPicker({
             <div className="flex items-center justify-center h-full text-gray-500 text-sm">（空目录）</div>
           ) : data ? (
             <div
-              className="grid grid-cols-2 gap-0.5 focus:outline-none"
-              tabIndex={0}
-              onKeyDown={(e) => {
-                // BUG-031 fix: Enter navigates into selected directory
-                if (e.key === "Enter" && selectedEntry) {
-                  navigate(selectedEntry);
-                }
-              }}
+              className="grid grid-cols-2 gap-0.5"
             >
               {data.entries.map((entry) => (
                 <button
                   key={entry.fullPath}
-                  onClick={() => setSelectedEntry(entry.fullPath ?? null)}
-                  onDoubleClick={() => entry.fullPath && navigate(entry.fullPath)}
-                  className={`flex items-center gap-2 px-3 py-2 rounded text-left group transition-colors ${
-                    selectedEntry === entry.fullPath
-                      ? "bg-accent/20 border border-accent/40"
-                      : "hover:bg-surface-hover border border-transparent"
-                  }`}
+                  onClick={() => entry.fullPath && navigate(entry.fullPath)}
+                  className="flex items-center gap-2 px-3 py-2 rounded text-left group transition-colors hover:bg-surface-hover border border-transparent"
                 >
                   <svg className="w-5 h-5 text-yellow-500/80 shrink-0" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z" />
