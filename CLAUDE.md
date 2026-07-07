@@ -148,3 +148,32 @@ Key routing rules:
 - Save progress → invoke /context-save
 - Resume context → invoke /context-restore
 - Author a backlog-ready spec/issue → invoke /spec
+
+## GBrain Configuration (configured by /setup-gbrain)
+- Mode: local-stdio
+- Engine: pglite
+- CLI: gbrain 0.42.57.0 (path: ~/gbrain/bin/gbrain.exe)
+- Config file: ~/.gbrain/config.json (mode 0600)
+- Setup date: 2026-07-07
+- MCP registered: yes (user scope, command: C:/Users/99744/gbrain/bin/gbrain serve)
+- Source: default — 64 pages indexed (D:/PC_AI/Project/HiveWeave)
+- Embedding: none (set OPENAI_API_KEY or VOYAGE_API_KEY and re-init for vector search)
+
+## GBrain Search Guidance (configured by /sync-gbrain)
+<!-- gstack-gbrain-search-guidance:start -->
+
+GBrain is set up on this machine. Prefer gbrain over Grep when the question
+is semantic or when you don't know the exact identifier yet.
+
+Prefer gbrain when:
+- "Where is X handled?" / semantic intent, no exact string:
+    `gbrain query "<question>"` or `gbrain search "<terms>"`
+- "Where is symbol Y defined?" / symbol-based code questions:
+    `gbrain code-def <symbol>` or `gbrain code-refs <symbol>`
+- "What calls Y?" / "What does Y depend on?":
+    `gbrain code-callers <symbol>` / `gbrain code-callees <symbol>`
+
+Grep is still right for known exact strings, regex, multiline patterns, and
+file globs. Run `/sync-gbrain` to force-refresh the index.
+
+<!-- gstack-gbrain-search-guidance:end -->
