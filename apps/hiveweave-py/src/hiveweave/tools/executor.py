@@ -681,6 +681,11 @@ class ToolExecutor:
             )
 
         results = []
+        # BUG-034: Also record team chat for the SENDER so they can see
+        # "发送 → RecipientName" in their team comms panel. Previously only
+        # the recipient's inbox was written — sender had no record.
+        from hiveweave.services.team_chat import TeamChatService
+        team_chat = TeamChatService()
         for target in resolved:
             msg = await self._inbox.send_message(
                 from_agent_id=agent_id,
@@ -694,6 +699,13 @@ class ToolExecutor:
                 "short_id": target.get("short_id"),
                 "message_id": msg["id"],
             })
+            # Record for sender so team comms panel shows outgoing messages
+            await team_chat.record_message(
+                agent_id=agent_id,
+                from_agent_id=agent_id,
+                to_agent_id=target["id"],
+                content=message,
+            )
             # BUG-022 fix: do NOT trigger here — the target agent's inbox watcher
             # (agent.py:_inbox_watcher_loop) polls every 5s and triggers autonomously.
             # Double-triggering (here + watcher) caused the Engineer to receive the
