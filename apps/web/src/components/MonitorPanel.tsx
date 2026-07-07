@@ -140,8 +140,7 @@ function extractToolHint(name: string, args: string | object): string {
 
 // ── Turn card ────────────────────────────────────────────────
 
-function TurnCard({ turn, events }: { turn: TraceTurn; events: TraceEvent[] }) {
-  const [expanded, setExpanded] = useState(false);
+function TurnCard({ turn, events, expanded, onToggle }: { turn: TraceTurn; events: TraceEvent[]; expanded: boolean; onToggle: () => void }) {
   const messages = turn.raw_messages || [];
 
   // Correlate LLM rounds with this turn's time window
@@ -169,7 +168,7 @@ function TurnCard({ turn, events }: { turn: TraceTurn; events: TraceEvent[] }) {
   return (
     <div className="rounded-lg border border-surface-border bg-surface-card overflow-hidden">
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={onToggle}
         className="w-full flex items-center gap-3 p-3 hover:bg-surface-hover transition-colors text-left"
       >
         <span className="text-[10px] font-mono text-gray-500 w-12 shrink-0">
@@ -294,6 +293,7 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [subTab, setSubTab] = useState<"turns" | "events">("turns");
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(new Set());
 
   const fetchTraces = useCallback(async () => {
     try {
@@ -425,7 +425,18 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
             </div>
           ) : (
             [...traces.turns].reverse().map(turn => (
-              <TurnCard key={turn.id} turn={turn} events={traces.events} />
+              <TurnCard
+                key={turn.id}
+                turn={turn}
+                events={traces.events}
+                expanded={expandedTurnIds.has(turn.id)}
+                onToggle={() => setExpandedTurnIds(prev => {
+                  const next = new Set(prev);
+                  if (next.has(turn.id)) next.delete(turn.id);
+                  else next.add(turn.id);
+                  return next;
+                })}
+              />
             ))
           )
         ) : (
