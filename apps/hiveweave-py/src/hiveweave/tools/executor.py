@@ -561,6 +561,16 @@ class ToolExecutor:
         if name == "reject_work":
             return await self._tool_reject_work(agent_id, args)
 
+        # ── Alarm tools (BUG-036) ──
+        if name == "schedule_alarm":
+            return await self._tool_schedule_alarm(agent_id, args)
+
+        if name == "list_alarms":
+            return await self._tool_list_alarms(agent_id)
+
+        if name == "cancel_alarm":
+            return await self._tool_cancel_alarm(agent_id, args)
+
         # ── Web fetch (OpenCode parity) ──
         if name == "webfetch":
             url = args.get("url") or ""
@@ -873,6 +883,85 @@ class ToolExecutor:
         if result.get("success"):
             return {"success": True, "output": f"Work rejected for {subordinate}: {reason}", "error": None}
         return self._error(result.get("message", "Rejection failed"))
+
+    # ── Alarm tool implementations (BUG-036) ──────────────
+
+    async def _tool_schedule_alarm(
+        self, agent_id: str, args: dict
+    ) -> dict:
+        """Schedule a one-shot alarm/reminder."""
+        to_agent = args.get("toAgentId") or args.get("to_agent_id") or ""
+        purpose = args.get("purpose") or args.get("message") or ""
+        fire_in = args.get("fireInGameSeconds") or args.get("fire_in_game_seconds") or 0
+
+        if not purpose:
+            return self._error("schedule_alarm requires 'purpose' (message delivered on fire)")
+        if not fire_in or int(fire_in) <= 0:
+            return self._error("schedule_alarm requires 'fireInGameSeconds' > 0")
+
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+
+        # Resolve to_agent: if empty or "self", use caller
+        to_id = agent_id
+        if to_agent and to_agent not in ("self", "me"):
+            from hiveweave.services.org import OrgService
+            org = OrgService()
+            agents = await org.list_agents(project_id)
+            for a in agents:
+                if (a.get("id") == to_agent or a.get("short_id") == to_agent
+                        or a.get("name") == to_agent):
+                    to_id = a["id"]
+                    break
+
+        from hiveweave.services.game_time import GameTimeService
+        gts = GameTimeService(project_id)
+        current = await gts.get_current_time(project_id)
+        fire_at = (current.get("game_seconds", 0) or 0) + int(fire_in)
+
+        alarm_id = await gts.schedule_alarm(
+            project_id=project_id,
+            from_agent_id=agent_id,
+            to_agent_id=to_id,
+            purpose=purpose,
+            fire_at_game_seconds=fire_at,
+        )
+        return {"success": True, "output": f"Alarm {alarm_id[:8]}... scheduled. Fires at game second {fire_at} (in {fire_in} game seconds).", "error": None}
+
+    async def _tool_list_alarms(self, agent_id: str) -> dict:
+        """List all pending alarms for the project."""
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+        from hiveweave.services.game_time import GameTimeService
+        gts = GameTimeService(project_id)
+        alarms = await gts.get_alarms(project_id)
+        pending = [a for a in alarms if a.get("status") == "pending"]
+        if not pending:
+            return {"success": True, "output": "(no pending alarms)", "error": None}
+        current = await gts.get_current_time(project_id)
+        now = current.get("game_seconds", 0) or 0
+        lines = []
+        for a in pending[:20]:
+            remaining = max(0, (a.get("fire_at_game_seconds", 0) or 0) - now)
+            lines.append(f"[{a['id'][:8]}] fire in {remaining}gs — {a.get('purpose', '?')}")
+        return {"success": True, "output": "\n".join(lines), "error": None}
+
+    async def _tool_cancel_alarm(
+        self, agent_id: str, args: dict
+    ) -> dict:
+        """Cancel a pending alarm."""
+        alarm_id = args.get("alarmId") or args.get("alarm_id") or ""
+        if not alarm_id:
+            return self._error("cancel_alarm requires 'alarmId'")
+        project_id = await self._get_project_id(agent_id)
+        if not project_id:
+            return self._error(f"Agent {agent_id} has no project")
+        from hiveweave.services.game_time import GameTimeService
+        gts = GameTimeService(project_id)
+        await gts.cancel_alarm(alarm_id)
+        return {"success": True, "output": f"Alarm {alarm_id[:8]}... cancellation requested.", "error": None}
 
     # ── Web fetch (OpenCode parity, BUG-036) ──────────────
 
