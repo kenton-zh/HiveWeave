@@ -68,9 +68,14 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
         await conn.execute("PRAGMA busy_timeout=5000")
         await conn.execute("PRAGMA foreign_keys=ON")
 
-        # Create tables
+        # Create tables + migrations (ALTER TABLE failures are non-fatal — column already exists)
         for sql in PROJECT_DB_TABLES:
-            await conn.execute(sql)
+            try:
+                await conn.execute(sql)
+            except Exception:
+                # ALTER TABLE ADD COLUMN fails if column exists — safe to ignore
+                if not sql.strip().upper().startswith("ALTER"):
+                    raise
 
         # Create indexes
         for sql in PROJECT_DB_INDEXES:

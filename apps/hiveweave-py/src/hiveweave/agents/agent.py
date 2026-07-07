@@ -245,15 +245,23 @@ _TOOL_SCHEMAS: dict[str, dict] = {
         "properties": {
             "toAgentId": {
                 "type": "string",
-                "description": "Agent ID to notify (use your own id for self-reminder, or another agent's id/name/short_id).",
+                "description": "Agent ID to notify (use your own id for self-reminder, or another agent's id/name/short_id). Use 'self' for self-targeting.",
             },
             "purpose": {
                 "type": "string",
-                "description": "Message delivered when the alarm fires (e.g. 'Check build status', 'Remind HR to report').",
+                "description": "Message delivered when the alarm fires (e.g. 'Check build status'). Delivered via inbox with [ALARM] prefix.",
             },
             "fireInGameSeconds": {
                 "type": "number",
-                "description": "Seconds of GAME TIME from now until fire. 1 real hour = 1 game day (86400 game seconds). E.g. 3600 game seconds ≈ 2.5 real minutes.",
+                "description": "Seconds of GAME TIME from now until first fire. 1 real hour = 1 game day (86400 game seconds). E.g. 3600 game seconds ≈ 2.5 real minutes.",
+            },
+            "repeatIntervalSeconds": {
+                "type": "number",
+                "description": "If set, alarm repeats every N game seconds. E.g. 43200 = repeat every 12 game hours (30 real minutes). Omit for one-shot.",
+            },
+            "scriptCommand": {
+                "type": "string",
+                "description": "Shell command to execute when the alarm fires (e.g. 'python check_build.py'). Runs BEFORE inbox notification. 120s timeout.",
             },
         },
         "required": ["toAgentId", "purpose", "fireInGameSeconds"],
