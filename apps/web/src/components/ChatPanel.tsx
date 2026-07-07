@@ -106,13 +106,15 @@ const statusLabels: Record<string, { text: string; color: string }> = {
 
 
 function isTeamChannelMessage(msg: ChatMessage): boolean {
-  // BUG-034 root-cause fix: 触发器保存的 team 消息同时标记了 is_context=True
-  // (用于 inbox 注入 LLM 上下文),但前端的 isTeamChannelMessage 不能因此排除
-  // 它们 — 否则 teamMessages 永远为空,hasTeamComms=false,折叠区永不显示。
-  // 判定完全交给 isBackground+role 双条件,已足够精确。
+  // 团队消息分三种:
+  // 1. role='team' — send_message 工具调用产生，两端可见
+  // 2. role='user', isBackground=true — trigger 上下文注入，表示
+  //    其他 agent 发来了消息(收到←某人)
+  // 3. role='assistant', isBackground=true — agent 内部处理(读文件、
+  //    分析等)，不是对外消息，排除
   return (
     msg.role === "team" ||
-    (msg.isBackground === true && (msg.role === "user" || msg.role === "assistant"))
+    (msg.isBackground === true && msg.role === "user")
   ) as boolean;
 }
 
