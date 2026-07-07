@@ -592,9 +592,11 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         } else if (event.type === "tool_use") {
           try {
             const toolData = JSON.parse(event.data);
-            const rawName: string = toolData.tool || "";
+            const rawName: string = toolData.toolName || toolData.tool_name || toolData.tool || "";
             const toolName = rawName.replace(/^hiveweave__/, "");
-            const toolCallSeg = { type: "tool_call" as const, tool: { tool: toolName, input: toolData.input || {} } };
+            const argsRaw = toolData.arguments || toolData.input || {};
+            const args = typeof argsRaw === "string" ? (() => { try { return JSON.parse(argsRaw); } catch { return {}; } })() : argsRaw;
+            const toolCallSeg = { type: "tool_call" as const, tool: { tool: toolName, input: args } };
             updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, toolCallSeg] as MsgSegment[] } : prev);
           } catch {}
         } else if (event.type === "done") {
@@ -1161,9 +1163,13 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       } else if (event.type === "tool_use") {
         try {
           const toolData = JSON.parse(event.data);
+          const rawName: string = toolData.toolName || toolData.tool_name || toolData.tool || "";
+          const toolName = rawName.replace(/^hiveweave__/, "");
+          const argsRaw = toolData.arguments || toolData.input || {};
+          const args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : argsRaw;
           const toolCall: ToolCall = {
-            tool: (toolData.tool || "").replace(/^hiveweave__/, ""),
-            input: toolData.input || {},
+            tool: toolName,
+            input: args,
           };
           allToolsUsed.add(toolCall.tool);
           updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, { type: "tool_call", tool: toolCall }] } : prev);
@@ -1308,13 +1314,14 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     ? isAgentProcessing ? { text: "工作中", color: "text-emerald-400" } : { text: "空闲", color: "text-gray-400" }
     : statusInfo;
   const resolveAgentInfo = (id: string) => {
+    if (!id) return { name: "系统", role: "" };
     // Check cache first
     if (agentInfoCache[id]) return agentInfoCache[id];
     // Fallback to current agent's info if the ID matches (we're viewing their panel)
     if (agentInfo && id === agentId) return { name: agentInfo.name, position: agentInfo.position, role: agentInfo.role };
     // System messages
     if (id === "system") return { name: "系统通知" };
-    // Unknown agent — show truncated ID instead of falling back to current agent
+    // Unknown agent — fetch happens in the effect above, show loading briefly
     return { name: id.slice(0, 8) + "…", role: "" };
   };
 
