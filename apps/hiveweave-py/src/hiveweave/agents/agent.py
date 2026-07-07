@@ -839,8 +839,14 @@ class Agent:
             self.id, self.project_id, module_id=None
         )
 
-        # Goals
-        goals = await charter_service.read_goals(self.project_id)
+        # Goals — only inject when dirty (CEO/user modified since last read).
+        # Saves tokens: unchanged goals skip the ~200-token workbook block.
+        goals = None
+        if charter_service.goals_dirty(self.id, self.project_id):
+            goals = await charter_service.read_goals(self.project_id)
+            if goals:
+                cur_ver = charter_service.get_goals_version(self.project_id)
+                await charter_service.set_agent_goals_version(self.id, cur_ver)
 
         # Involvement level
         involvement = self.config.get("involvement_level", "medium")
