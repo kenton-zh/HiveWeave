@@ -63,6 +63,7 @@ META_DB_TABLES = [
         vibe TEXT,
         description TEXT,
         prompt_body TEXT,
+        discipline_suite TEXT DEFAULT '',
         created_at INTEGER,
         updated_at INTEGER
     )
@@ -98,6 +99,7 @@ META_DB_TABLES = [
         agent_id TEXT,
         title TEXT,
         content TEXT,
+        project_rules TEXT DEFAULT '',
         status TEXT DEFAULT 'active',
         created_at INTEGER,
         updated_at INTEGER

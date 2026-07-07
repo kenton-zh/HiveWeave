@@ -50,6 +50,10 @@ _META_MIGRATIONS: list[tuple[str, str, str]] = [
     ("agents", "language", "TEXT DEFAULT 'en'"),
     # agent_templates — TS schema 无 updated_at
     ("agent_templates", "updated_at", "INTEGER"),
+    # agent_charters — add project_rules for gstack discipline integration
+    ("agent_charters", "project_rules", "TEXT DEFAULT ''"),
+    # agent_templates — add discipline_suite
+    ("agent_templates", "discipline_suite", "TEXT DEFAULT ''"),
 ]
 
 

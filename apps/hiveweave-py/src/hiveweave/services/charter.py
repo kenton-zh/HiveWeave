@@ -36,17 +36,19 @@ class CharterService:
     ) -> str:
         """Save or update the project charter (DELETE + INSERT).
 
-        content: str (charter body) or dict {title, content, status}.
+        content: str (charter body) or dict {title, content, status, project_rules}.
         Returns the new charter ID.
         """
         if isinstance(content, dict):
             title = content.get("title", "Project Charter")
             body = content.get("content", "")
             status = content.get("status", "active")
+            project_rules = content.get("project_rules", "")
         else:
             title = "Project Charter"
             body = str(content)
             status = "active"
+            project_rules = ""
 
         charter_id = str(uuid.uuid4())
         now = int(time.time() * 1000)
@@ -61,10 +63,10 @@ class CharterService:
             await db.execute(
                 """INSERT INTO agent_charters
                    (id, project_id, agent_id, title, content, status,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    project_rules, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [charter_id, project_id, agent_id, title, body,
-                 status, now, now],
+                 status, project_rules, now, now],
             )
             await db.commit()
         except Exception as e:
@@ -83,7 +85,7 @@ class CharterService:
         try:
             row = await meta_db.query_one(
                 """SELECT id, project_id, agent_id, title, content, status,
-                          created_at, updated_at
+                          project_rules, created_at, updated_at
                    FROM agent_charters WHERE project_id = ?
                    ORDER BY created_at DESC LIMIT 1""",
                 [project_id],

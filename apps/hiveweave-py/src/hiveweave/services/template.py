@@ -46,13 +46,15 @@ class TemplateService:
         vibe = attrs.get("vibe", "")
         description = attrs.get("description", "")
         prompt_body = attrs.get("prompt_body", "")
+        discipline_suite = attrs.get("discipline_suite", "")
 
         await meta_db.execute(
             "INSERT INTO agent_templates (id, source, division, name, role, "
-            "color, emoji, vibe, description, prompt_body, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "color, emoji, vibe, description, prompt_body, discipline_suite, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [template_id, source, division, name, role, color, emoji, vibe,
-             description, prompt_body, now_ms, now_ms])
+             description, prompt_body, discipline_suite, now_ms, now_ms])
         log.info("template_created", template_id=template_id, name=name,
                  source=source)
         return {"id": template_id, "name": name}
@@ -64,7 +66,7 @@ class TemplateService:
         """
         row = await meta_db.query_one(
             "SELECT id, source, division, name, role, color, emoji, vibe, "
-            "description, prompt_body, created_at, updated_at "
+            "description, prompt_body, discipline_suite, created_at, updated_at "
             "FROM agent_templates WHERE id = ? LIMIT 1",
             [template_id])
         return dict(row) if row else None
@@ -74,7 +76,7 @@ class TemplateService:
         fields: list[str] = []
         params: list = []
         for key in ("source", "division", "name", "role", "color", "emoji",
-                    "vibe", "description", "prompt_body"):
+                    "vibe", "description", "prompt_body", "discipline_suite"):
             if key in attrs and attrs[key] is not None:
                 fields.append(f"{key} = ?")
                 params.append(attrs[key])
@@ -129,7 +131,8 @@ class TemplateService:
         try:
             rows = await meta_db.query(
                 f"SELECT id, source, division, name, role, color, emoji, vibe, "
-                f"description, created_at, updated_at FROM agent_templates{where} "
+                f"description, discipline_suite, created_at, updated_at "
+                f"FROM agent_templates{where} "
                 f"ORDER BY source, division, name LIMIT {_LIST_LIMIT}",
                 params)
             return [dict(r) for r in rows]
