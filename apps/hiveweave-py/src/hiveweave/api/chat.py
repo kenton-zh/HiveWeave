@@ -201,7 +201,12 @@ async def send_chat(body: ChatSendBody) -> dict:
         raise HTTPException(status_code=404, detail="Agent not found")
     agent, config = started
 
-    # 3. 保存用户消息
+    # 3. BUG-036: 先检查 busy 再保存消息，避免 orphan 消息
+    agent_check = agent_manager.get_agent(agent_id)
+    if agent_check is not None and agent_check.status.value == "processing":
+        raise HTTPException(status_code=409, detail="Agent is busy")
+
+    # 4. 保存用户消息
     user_msg = await _chat_msg.save_message(
         {
             "agent_id": agent_id,
@@ -213,7 +218,7 @@ async def send_chat(body: ChatSendBody) -> dict:
         }
     )
 
-    # 4. 触发 chat（含 busy 重试）
+    # 5. 触发 chat
     # BUG-036: JSON-structured user message — unambiguous sender identification
     import json as _json
     user_msg = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)

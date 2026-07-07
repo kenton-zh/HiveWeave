@@ -375,6 +375,12 @@ function bindAgentChannelEvents(channel: any, agentId: string) {
     const handler = _agentHandlers.get(agentId);
     handler?.({ type: "error", data: payload?.message || "Unknown error" });
   });
+
+  channel.on("busy", (payload: any) => {
+    dbg("ws", `busy event for ${agentId}: ${payload?.message || "busy"}`, payload);
+    const handler = _agentHandlers.get(agentId);
+    handler?.({ type: "busy", data: payload?.message || "Agent is busy" });
+  });
 }
 
 /**
