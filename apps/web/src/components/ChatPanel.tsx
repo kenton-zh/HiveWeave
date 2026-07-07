@@ -370,7 +370,7 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
   );
 }
 
-function ChatPanel({ agentId }: { agentId: string | null }) {
+function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boolean }) {
   const [agentInfo, setAgentInfo] = useState<AgentInfo | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [streamDraft, setStreamDraft] = useState<StreamDraft | null>(null);
@@ -1280,7 +1280,7 @@ function ChatPanel({ agentId }: { agentId: string | null }) {
   };
 
   return (
-    <div className="h-full flex flex-col bg-surface">
+    <div className="h-full flex flex-col bg-surface" style={hidden ? { display: "none" } : undefined}>
       {agentInfo && (
         <div className="px-6 py-3 border-b border-surface-border bg-surface-card shrink-0">
           <div className="flex items-center gap-2">

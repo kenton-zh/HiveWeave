@@ -624,16 +624,18 @@ function App() {
                   <p>从左侧 Org Tree 选择一个 Agent</p>
                 </div>
               </div>
-            ) : rightPanelTab === "chat" ? (
-              <ChatPanel key={selectedAgentId} agentId={selectedAgentId} />
-            ) : rightPanelTab === "agent" ? (
-              <AgentDetailPanel agentId={selectedAgentId} />
-            ) : rightPanelTab === "monitor" ? (
-              <MonitorPanel key={selectedAgentId} agentId={selectedAgentId} />
-            ) : rightPanelTab === ("debug" as any) ? (
-              <DebugPanel />
             ) : (
-              <WorkLogPanel key={selectedAgentId} agentId={selectedAgentId} />
+              <>
+                {/* BUG-034: ChatPanel 始终挂载，用 CSS 隐藏代替卸载。
+                    这样 streamDraft / isStreaming / WebSocket channel 在
+                    切换 tab 时不丢失。Agent 继续后台运行，切回 Chat tab
+                    时立即看到正在进行的流输出。 */}
+                <ChatPanel key="chat-panel" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
+                {rightPanelTab === "agent" && <AgentDetailPanel agentId={selectedAgentId} />}
+                {rightPanelTab === "monitor" && <MonitorPanel key={selectedAgentId} agentId={selectedAgentId} />}
+                {rightPanelTab === ("debug" as any) && <DebugPanel />}
+                {rightPanelTab === "logs" && <WorkLogPanel key={selectedAgentId} agentId={selectedAgentId} />}
+              </>
             )}
           </div>
         </div>
