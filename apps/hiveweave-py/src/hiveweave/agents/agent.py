@@ -858,10 +858,10 @@ class Agent:
         # 1. 保存 assistant 消息到 chat_messages
         # BUG-034: 如果这是 trigger 触发的后台处理，标记 is_background，
         # 避免污染前端主聊天窗口。用户对话的 assistant 回复不标记。
+        # 注意: trigger assistant 回复是 agent 内部处理(读文件/分析)，
+        # 不是对外消息。真正的 agent 间通信由 send_message 工具通过
+        # TeamChatService (role='team') 记录。
         is_trigger = opts.get("trigger", False)
-        # BUG-034: 设置 team_from/to_agent_id 以便前端团队沟通面板正确
-        # 显示 sender/receiver（而非 agent 自己的名字）
-        from_id = opts.get("from_agent_id") if is_trigger else None
         await self._chat_msg.save_message(
             {
                 "agent_id": self.id,
@@ -873,8 +873,6 @@ class Agent:
                 else "[]",
                 "is_streaming": False,
                 "is_background": True if is_trigger else False,
-                "team_from_agent_id": self.id if is_trigger else None,
-                "team_to_agent_id": from_id,
             }
         )
 
@@ -1062,7 +1060,6 @@ class Agent:
         # 保存错误消息到 DB
         # BUG-034: 如果是 trigger 触发的后台处理，标记 is_background
         is_trigger = bool(self.pending_inbox_msg_ids)
-        from_id = (self.current_job or {}).get("opts", {}).get("from_agent_id") if is_trigger else None
         await self._chat_msg.save_message(
             {
                 "agent_id": self.id,
@@ -1070,8 +1067,6 @@ class Agent:
                 "content": f"[ERROR] {error_msg}",
                 "is_streaming": False,
                 "is_background": True if is_trigger else False,
-                "team_from_agent_id": self.id if is_trigger else None,
-                "team_to_agent_id": from_id,
             }
         )
 
