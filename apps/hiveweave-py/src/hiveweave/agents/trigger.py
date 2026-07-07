@@ -471,7 +471,16 @@ async def build_trigger_context(
 
     context = (
         "\n\n".join(blocks)
-        + "\n\n---\nProcess the above. Use tools to work on tasks, report results."
+        + "\n\n---\n## ESCALATION RULES\n"
+        "- If any message asks for approval/confirmation of product decisions, "
+        "architecture changes, or anything flagged as '需要确认'/'需要审批', "
+        "you MUST call the `question` tool to ask the user BEFORE replying 'approved'.\n"
+        "- Do NOT tell a subordinate '计划已批准' if there are unresolved items "
+        "requiring user input.\n"
+        "- Default answer to unconfirmed product decisions is 'hold for user', not 'approved'.\n"
+        "- Technical decisions (tool choices, code patterns, test strategies) you can approve.\n"
+        "- Use `send_message` to reply to the sender, `question` to ask the user.\n"
+        "- Use tools to work on tasks, report results."
     )
 
     return context, inbox_msg_ids, from_agent_id
