@@ -285,13 +285,34 @@ function ThinkingBlock({ content }: { content: string }) {
 }
 
 function ToolCallInline({ name, input }: { name: string; input?: Record<string, any> }) {
+  const [showArgs, setShowArgs] = useState(false);
   const hint = formatToolInputHint(name, input);
+  // Parse args for display
+  let argsPreview = "";
+  try {
+    if (input && typeof input === "object" && Object.keys(input).length > 0) {
+      const entries = Object.entries(input).slice(0, 3);
+      argsPreview = entries.map(([k, v]) => {
+        const val = typeof v === "string" ? (v.length > 50 ? v.slice(0, 50) + "…" : v) : JSON.stringify(v).slice(0, 50);
+        return `${k}=${val}`;
+      }).join(", ");
+    }
+  } catch { /* ignore */ }
   return (
-    <div className="flex items-center gap-2 py-1 text-[12px] group">
-      {/* Dot indicator + tool name — cleaner than emoji, platform-consistent */}
-      <span className="w-2 h-2 rounded-full bg-amber-400/50 shrink-0 group-hover:bg-amber-400/80 transition-colors" />
-      <span className="font-medium text-amber-200/85 font-mono text-[11px]">{name}</span>
-      {hint && <span className="text-gray-500 truncate text-[11px]">→ {hint}</span>}
+    <div className="py-1.5 px-3 my-1 rounded-lg border border-amber-500/15 bg-amber-500/5 text-[12px]">
+      <div className="flex items-center gap-2 cursor-pointer select-none" onClick={() => setShowArgs(!showArgs)}>
+        <svg className={`w-3 h-3 text-amber-400/70 transition-transform ${showArgs ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+        </svg>
+        <span className="font-medium text-amber-200/85 font-mono text-[11px]">{name}</span>
+        {hint && <span className="text-gray-500 text-[11px]">→ {hint}</span>}
+        {argsPreview && <span className="text-gray-600 text-[10px] ml-auto truncate hidden sm:inline">{argsPreview}</span>}
+      </div>
+      {showArgs && input && Object.keys(input).length > 0 && (
+        <pre className="mt-1.5 text-[10px] text-amber-300/60 whitespace-pre-wrap break-all font-mono leading-relaxed pl-5 border-l border-amber-500/10">
+          {JSON.stringify(input, null, 2)}
+        </pre>
+      )}
     </div>
   );
 }
@@ -1293,7 +1314,8 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     if (agentInfo && id === agentId) return { name: agentInfo.name, position: agentInfo.position, role: agentInfo.role };
     // System messages
     if (id === "system") return { name: "系统通知" };
-    return { name: "加载中…" };
+    // Unknown agent — show truncated ID instead of falling back to current agent
+    return { name: id.slice(0, 8) + "…", role: "" };
   };
 
   // Role colors matching OrgTree
@@ -1376,24 +1398,52 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             <div className="max-h-[35vh] overflow-y-auto overflow-x-hidden py-1">
               {[...teamMessages].sort((a, b) => b.timestamp - a.timestamp).map((msg) => {
                 // Determine direction:
-                // 1. Real user message (role=user, !isBackground) → incoming (operator → agent)
-                // 2. Background user message (role=user, isBackground) → incoming (other agent triggered current)
-                // 3. Background assistant message (role=assistant, isBackground) → outgoing (current agent replied)
-                // 4. Explicit team message (role=team) → check teamFromAgentId / teamToAgentId
+                // 1. role=team → explicit team message: use teamFromAgentId/teamToAgentId
+                // 2. role=user, isBackground → incoming context from another agent
+                // 3. role=assistant, isBackground → outgoing reply from current agent
+                // 4. role=user, !isBackground → operator message to current agent
+                const isTeamMsg = msg.role === "team";
                 const isUserMsg = msg.role === "user" && !msg.isBackground;
                 const isBgIncoming = msg.isBackground && msg.role === "user";
                 const isBgOutgoing = msg.isBackground && msg.role === "assistant";
-                const isIncoming = isUserMsg || isBgIncoming || (!isBgOutgoing && msg.teamToAgentId === agentId);
-                const counterpartId = isIncoming
-                  ? (msg.teamFromAgentId ?? (isBgIncoming ? getDirectedAgentId(msg, agentInfo?.parentId) : null))
-                  : (msg.teamToAgentId || getDirectedAgentId(msg, agentInfo?.parentId));
-                const info = isIncoming
+
+                let isIncoming: boolean;
+                let counterpartId: string | null;
+
+                if (isTeamMsg) {
+                  // Role=team messages: direction from team_to_agent_id/team_from_agent_id
+                  if (msg.teamToAgentId === agentId && msg.teamFromAgentId !== agentId) {
+                    isIncoming = true;
+                    counterpartId = msg.teamFromAgentId ?? null;
+                  } else if (msg.teamFromAgentId === agentId && msg.teamToAgentId !== agentId) {
+                    isIncoming = false;
+                    counterpartId = msg.teamToAgentId ?? null;
+                  } else {
+                    // Self-message or ambiguous — use from/to IDs as-is
+                    isIncoming = msg.teamToAgentId === agentId;
+                    counterpartId = isIncoming ? (msg.teamFromAgentId ?? null) : (msg.teamToAgentId ?? null);
+                  }
+                } else if (isBgIncoming) {
+                  isIncoming = true;
+                  counterpartId = msg.teamFromAgentId ?? null;
+                } else if (isBgOutgoing) {
+                  isIncoming = false;
+                  counterpartId = msg.teamToAgentId ?? null;
+                } else {
+                  // User message from operator
+                  isIncoming = true;
+                  counterpartId = null;
+                }
+
+                const fromName = isIncoming
                   ? (isUserMsg
                       ? { name: userName || "操作员", position: "操作员", role: "" }
                       : (counterpartId ? resolveAgentInfo(counterpartId) : { name: "系统", role: "" }))
                   : (counterpartId
                       ? resolveAgentInfo(counterpartId)
-                      : (agentInfo ? { name: agentInfo.name, role: agentInfo.role, position: agentInfo.position } : { name: "加载中…", role: "" }));
+                      : (agentInfo ? { name: agentInfo.name, role: agentInfo.role, position: agentInfo.position } : { name: "未知", role: "" }));
+
+                const info = fromName;
                 const roleStyle = getRoleStyle(info.role || "");
                 const positionLabel = getPositionLabel(info.position, info.role);
                 const dotColor = roleDots[info.role || ""] || "bg-gray-400";
