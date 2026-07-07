@@ -408,6 +408,40 @@ async def build_trigger_context(
             f"CAVEMAN style, NO pleasantries.\n{msg_text}"
         )
 
+    # ── 3.5. Goals workbook update (dirty check) ──
+    # Only shown when dirty — doesn't trigger the agent on its own.
+    # Queues alongside regular messages, delivered when agent is already
+    # processing something else (user message or other agent's message).
+    from hiveweave.services.charter import charter_service as _cs
+    import json as _json
+    if _cs.goals_dirty(agent_id, project_id):
+        goals = await _cs.read_goals(project_id)
+        if goals:
+            parts = []
+            obj = goals.get("objective", "")
+            focus = goals.get("focus", "")
+            krs = goals.get("keyResults", [])
+            inv = goals.get("userInvolvement", "")
+            if obj:
+                parts.append(f"Objective: {obj}")
+            if focus:
+                parts.append(f"Focus: {focus}")
+            if krs:
+                kr_lines = "\n".join(
+                    f"  - [{kr.get('status', '?')}] {kr.get('text', str(kr))}"
+                    for kr in krs if isinstance(kr, dict)
+                )
+                parts.append(f"Key Results:\n{kr_lines}")
+            if inv:
+                parts.append(f"User Involvement: {inv}")
+            content = "\n".join(parts) if parts else "(empty)"
+            goals_entry = _json.dumps(
+                {"from": "工作簿更新", "content": content}, ensure_ascii=False
+            )
+            blocks.insert(0, f"## Goals Workbook (updated)\n{goals_entry}")
+            cur_ver = _cs.get_goals_version(project_id)
+            await _cs.set_agent_goals_version(agent_id, cur_ver)
+
     # ── 4 & 5. Coordinator 专属 blocks ──
     if trigger_type == "coordinator":
         children = await _org_service.get_subordinates(agent_id)
