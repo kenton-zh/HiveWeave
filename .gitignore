@@ -101,7 +101,7 @@ after-select.yaml
 erl_crash.dump
 
 # Design docs (local only)
-docs/AI工程组织_MVP蓝图.md
+docs/
 
 # Third-party skill sources
 .opencode/skills-sources/
