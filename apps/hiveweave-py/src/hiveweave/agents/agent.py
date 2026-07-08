@@ -1447,18 +1447,27 @@ class Agent:
             "agentId": self.id,
         })
 
-        # 保存错误消息到 DB
-        # BUG-034: 如果是 trigger 触发的后台处理，标记 is_background
+        # 保存错误消息到 DB — 更新 streaming placeholder 而非插入新消息
         is_trigger = bool(self.pending_inbox_msg_ids)
-        await self._chat_msg.save_message(
-            {
-                "agent_id": self.id,
-                "role": "assistant",
-                "content": f"[ERROR] {error_msg}",
-                "is_streaming": False,
-                "is_background": True if is_trigger else False,
-            }
-        )
+        if self._streaming_msg_id:
+            await self._chat_msg.update_message(
+                self.id, self._streaming_msg_id,
+                {
+                    "content": f"[ERROR] {error_msg}",
+                    "is_streaming": False,
+                },
+            )
+            self._streaming_msg_id = None
+        else:
+            await self._chat_msg.save_message(
+                {
+                    "agent_id": self.id,
+                    "role": "assistant",
+                    "content": f"[ERROR] {error_msg}",
+                    "is_streaming": False,
+                    "is_background": True if is_trigger else False,
+                }
+            )
 
         # 标记 inbox 已读（避免僵尸消息）
         if self.pending_inbox_msg_ids:
@@ -1519,15 +1528,25 @@ class Agent:
             )
             self.pending_inbox_msg_ids = None
 
-        # 保存超时消息
-        await self._chat_msg.save_message(
-            {
-                "agent_id": self.id,
-                "role": "assistant",
-                "content": "[TIMEOUT] LLM call exceeded 10 minute safety limit.",
-                "is_streaming": False,
-            }
-        )
+        # 更新 streaming placeholder（如果有的话）为超时标记
+        if self._streaming_msg_id:
+            await self._chat_msg.update_message(
+                self.id, self._streaming_msg_id,
+                {
+                    "content": "[TIMEOUT] LLM call exceeded 10 minute safety limit.",
+                    "is_streaming": False,
+                },
+            )
+            self._streaming_msg_id = None
+        else:
+            await self._chat_msg.save_message(
+                {
+                    "agent_id": self.id,
+                    "role": "assistant",
+                    "content": "[TIMEOUT] LLM call exceeded 10 minute safety limit.",
+                    "is_streaming": False,
+                }
+            )
 
         self._reset_to_idle()
 
