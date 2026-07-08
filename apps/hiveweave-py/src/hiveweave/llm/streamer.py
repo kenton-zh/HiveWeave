@@ -71,8 +71,8 @@ class CircuitBreakerOpenError(Exception):
 
 # ── 常量（契约 01）──────────────────────────────────────────
 
-MAX_TOOL_ROUNDS = 25
-"""默认最大 tool loop 轮次。用户指定 25 轮。"""
+MAX_TOOL_ROUNDS = 100
+"""默认最大 tool loop 轮次。对齐 OpenCode (Infinity)，实际由 doom loop 兜底。"""
 
 MAX_TOOLS_PER_ROUND = 5
 """单轮工具调用数上限。对齐 Elixir streamer.ex:488。"""
