@@ -3,14 +3,14 @@
 契约 01: LLM 流式调用
 
 本包实现 LLM 调用的全链路:
-- provider: Provider 工厂（openai/anthropic/google/openai-compatible，统一 OpenAI 兼容格式）
+- provider: Provider 工厂（多格式: openai/anthropic/google/openai-compatible）
 - retry: 重试逻辑（429/503/504/529，指数退避+jitter，Retry-After header）
 - circuit_breaker: 熔断器（连续失败 5 次熔断，30s 冷却，半开试探）
-- streamer: 核心流式调用 + tool loop（SSE 解析，最多 25 轮，空响应重试）
+- streamer: 核心流式调用 + tool loop（多格式 SSE 解析，最多 25 轮，空响应重试）
 
 参考:
+- OpenCode: apps/opencode/packages/llm/src/ (Protocol/Endpoint/Auth/Framing 分层架构)
 - Elixir: apps/hiveweave/lib/hiveweave/llm/{streamer,circuit_breaker,retry,provider_factory}.ex
-- TS: packages/agent-runtime/src/{provider-factory,retry-utils,agent-runtime}.ts
 """
 
 from hiveweave.llm.circuit_breaker import (
@@ -20,6 +20,13 @@ from hiveweave.llm.circuit_breaker import (
     circuit_breaker,
 )
 from hiveweave.llm.provider import (
+    FORMAT_HANDLERS,
+    ApiFormat,
+    AnthropicHandler,
+    FormatHandler,
+    GoogleHandler,
+    OpenAICompatibleHandler,
+    OpenAIHandler,
     ProviderConfig,
     ProviderFactory,
     ProviderType,
@@ -51,7 +58,15 @@ __all__ = [
     "sse_to_chunks",
     "merge_tool_calls",
     "MAX_TOOL_ROUNDS",
-    # provider
+    # provider — formats
+    "ApiFormat",
+    "FormatHandler",
+    "OpenAIHandler",
+    "AnthropicHandler",
+    "GoogleHandler",
+    "OpenAICompatibleHandler",
+    "FORMAT_HANDLERS",
+    # provider — config + factory
     "ProviderFactory",
     "ProviderConfig",
     "ProviderType",

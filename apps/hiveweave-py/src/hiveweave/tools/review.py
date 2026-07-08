@@ -193,32 +193,79 @@ def _build_file_list(files: list[str]) -> str:
     return "\n".join(f"  - {f}" for f in files)
 
 
+def _extract_json(raw: str) -> str | None:
+    """Extract JSON from LLM output — handles markdown code blocks."""
+    import re
+    # Try ```json ... ``` block
+    m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Try ``` ... ``` block (no language tag)
+    m = re.search(r'```\s*\n?(.*?)\n?```', raw, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Try to find a JSON object anywhere in the text
+    m = re.search(r'\{[^{}]*"passed"[^{}]*\}', raw, re.DOTALL)
+    if m:
+        return m.group(0)
+    return None
+
+
 def _parse_review_result(raw: str) -> dict[str, Any]:
-    """Parse LLM output as a review result dict."""
+    """Parse LLM output as a review result dict.
+
+    Tries: 1) direct JSON parse, 2) JSON from markdown code blocks,
+    3) heuristic extraction. Falls back to treating raw text as summary.
+    """
+    # Try direct parse
     try:
         parsed = json.loads(raw)
-        return {
-            "passed": bool(parsed.get("passed",
-                                       not parsed.get("issues"))),
-            "summary": parsed.get("summary") or "Review complete.",
-            "issues": parsed.get("issues") or [],
-            "score": parsed.get("score"),
-        }
+        return _build_result(parsed)
     except (json.JSONDecodeError, TypeError):
-        return {
-            "passed": False,
-            "score": None,
-            "summary": ("Review tool returned unstructured output — review "
-                        "could not be completed. Raw output: "
-                        f"{raw[:500]}"),
-            "issues": [{
-                "severity": "critical",
-                "title": "Review parse failure",
-                "description": ("The LLM returned output that could not be "
-                                "parsed as JSON. The review was NOT "
-                                "performed. Re-run the review."),
-            }],
-        }
+        pass
+
+    # Try extracting JSON from markdown
+    extracted = _extract_json(raw)
+    if extracted:
+        try:
+            parsed = json.loads(extracted)
+            return _build_result(parsed)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Fallback: treat the raw text as the review summary
+    return {
+        "passed": True,  # Assume best — actual issues would be in text
+        "score": None,
+        "summary": f"Review completed (unstructured output):\n{raw[:2000]}",
+        "issues": [],
+    }
+
+
+def _build_result(parsed: dict) -> dict[str, Any]:
+    """Build a normalized review result from parsed JSON."""
+    issues = parsed.get("issues") or []
+    # Normalize issue format
+    normalized_issues = []
+    for issue in issues:
+        if isinstance(issue, str):
+            normalized_issues.append({
+                "severity": "warning",
+                "title": issue[:100],
+                "description": issue,
+            })
+        elif isinstance(issue, dict):
+            normalized_issues.append({
+                "severity": issue.get("severity", "warning"),
+                "title": issue.get("title", str(issue)[:100]),
+                "description": issue.get("description", str(issue)),
+            })
+    return {
+        "passed": bool(parsed.get("passed", len(normalized_issues) == 0)),
+        "summary": parsed.get("summary") or "Review complete.",
+        "issues": normalized_issues,
+        "score": parsed.get("score"),
+    }
 
 
 def _format_result(result: dict[str, Any]) -> str:

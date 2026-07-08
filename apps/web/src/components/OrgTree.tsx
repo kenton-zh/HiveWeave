@@ -1,4 +1,4 @@
-import {
+﻿import {
   useEffect, useState, useCallback, useRef, useMemo, useLayoutEffect,
 } from "react";
 import ApprovalDialog from "./ApprovalDialog";
@@ -89,23 +89,23 @@ function computeLayoutParams(roots: OrgNodeData[]): LayoutParams {
   const maxDepth = Math.max(0, ...roots.map((r) => getMaxDepth(r)));
   const maxBreadth = Math.max(0, ...roots.map(getMaxBreadth));
 
-  let nodeH = 46, hGap = 20, vGap = 30;
-  let minW = 85, maxW = 200;
+  let nodeH = 54, hGap = 20, vGap = 36;
+  let minW = 100, maxW = 220;
   let strokeWidth = 1.5;
 
   if (total > 30 || maxBreadth > 8) {
     // Large / flat tree — compact everything
-    nodeH = 38;
+    nodeH = 44;
     hGap = Math.max(8, 20 - (maxBreadth - 8) * 2);
-    vGap = Math.max(16, 30 - (maxDepth - 3) * 3);
-    minW = 75; maxW = 150;
+    vGap = Math.max(18, 36 - (maxDepth - 3) * 3);
+    minW = 90; maxW = 170;
     strokeWidth = 1;
   } else if (total > 15 || maxBreadth > 5) {
     // Medium tree — slightly compressed
-    nodeH = 42;
+    nodeH = 48;
     hGap = 14;
-    vGap = 24;
-    minW = 80; maxW = 170;
+    vGap = 28;
+    minW = 90; maxW = 190;
     strokeWidth = 1.2;
   }
 
@@ -232,7 +232,7 @@ function Connectors({
         <svg className="absolute inset-0 pointer-events-none" style={{ overflow: "visible" }}>
           <line
             x1={px} y1={py} x2={cx} y2={childY}
-            stroke="#6b7280" strokeWidth={strokeWidth} strokeLinecap="round"
+            stroke="#bdc1c6" strokeWidth={strokeWidth} strokeLinecap="round"
           />
         </svg>
       );
@@ -251,7 +251,7 @@ function Connectors({
     return (
       <svg className="absolute inset-0 pointer-events-none" style={{ overflow: "visible" }}>
         <path
-          d={d} fill="none" stroke="#6b7280" strokeWidth={strokeWidth}
+          d={d} fill="none" stroke="#bdc1c6" strokeWidth={strokeWidth}
           strokeLinejoin="round" strokeLinecap="round"
         />
       </svg>
@@ -293,7 +293,7 @@ function Connectors({
       <line
         key={c.id}
         x1={cx} y1={midY} x2={cx} y2={childY}
-        stroke="#6b7280" strokeWidth={strokeWidth}
+        stroke="#cbc0aa" strokeWidth={strokeWidth}
       />
     );
   });
@@ -301,11 +301,11 @@ function Connectors({
   return (
     <svg className="absolute inset-0 pointer-events-none" style={{ overflow: "visible" }}>
       <path
-        d={trunk} fill="none" stroke="#6b7280"
+        d={trunk} fill="none" stroke="#bdc1c6"
         strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round"
       />
       <path
-        d={branch} fill="none" stroke="#6b7280"
+        d={branch} fill="none" stroke="#cbc0aa"
         strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round"
       />
       {drops}
@@ -389,11 +389,13 @@ function TreeNodeCard({
       onClick={(e) => { e.stopPropagation(); onSelect(node.id); }}
       data-interactive="true"
       className={[
-        "absolute cursor-pointer rounded-lg overflow-hidden",
+        "absolute cursor-pointer rounded-gm overflow-hidden",
         "transition-colors duration-150 ease-out group",
         isSelected
-          ? "ring-1 ring-[#6c8cff]/60"
-          : "hover:border-gray-500/50",
+          ? "ring-1 ring-g-blue/50"
+          : node.role === "ceo"
+            ? "ring-1 ring-g-blue/30 hover:border-g-blue/40"
+            : "hover:border-g-blue/40",
       ].join(" ")}
       style={{
         left: node.x,
@@ -401,14 +403,24 @@ function TreeNodeCard({
         width: node.w,
         minHeight: nodeH,
         borderLeft: `3px solid ${accentColor}`,
+        border: isSelected
+          ? undefined
+          : isProcessing
+            ? "1px solid rgba(52,168,83,.30)"
+            : "1px solid #ebebeb",
+        borderLeftWidth: 3,
+        borderLeftStyle: "solid",
+        borderLeftColor: accentColor,
         background: isSelected
-          ? "rgba(108,140,255,0.10)"
-          : "rgba(22,25,35,0.92)",
+          ? "rgba(66,133,244,0.08)"
+          : "rgba(255,255,255,1)",
         boxShadow: isSelected
-          ? `0 0 20px ${accentColor}18, 0 1px 8px rgba(0,0,0,0.4)`
-          : isActive && isProcessing
-            ? `0 0 12px ${accentColor}15, 0 1px 3px rgba(0,0,0,0.3)`
-            : "0 1px 3px rgba(0,0,0,0.25)",
+          ? "0 0 0 1px rgba(66,133,244,.25), 0 2px 8px rgba(60,64,67,.18)"
+          : node.role === "ceo"
+            ? "0 1px 4px rgba(66,133,244,.15)"
+            : isActive && isProcessing
+              ? "0 1px 3px rgba(60,64,67,.20)"
+              : "0 1px 1px rgba(60,64,67,.10)",
         // Re-rasterize text crisply at any CSS scale level
         textRendering: "optimizeLegibility",
         WebkitFontSmoothing: "antialiased",
@@ -419,8 +431,8 @@ function TreeNodeCard({
         <span
           className={`rounded-full shrink-0 ${compact ? "w-1 h-1" : "w-1.5 h-1.5"} ${
             node.status === "active"
-              ? isProcessing ? "bg-emerald-400 animate-pulse" : "bg-gray-500"
-              : node.status === "idle" || node.status === "inactive" ? "bg-gray-500"
+              ? isProcessing ? "bg-emerald-400 animate-pulse" : "bg-g-fg-4"
+              : node.status === "idle" || node.status === "inactive" ? "bg-g-fg-4"
               : node.status === "promoted" ? "bg-blue-400"
               : node.status === "receiving" ? "bg-amber-400 animate-pulse"
               : node.status === "merging" ? "bg-purple-400 animate-pulse"
@@ -430,7 +442,7 @@ function TreeNodeCard({
         />
         <span
           className={`font-medium truncate ${compact ? "text-[10px]" : "text-xs"} ${
-            isSelected ? "text-gray-100" : "text-gray-200"
+            isSelected ? "text-g-fg" : "text-g-fg"
           }`}
         >
           {node.name}
@@ -438,10 +450,11 @@ function TreeNodeCard({
         {hasChildren && (
           <span
             onClick={(e) => { e.stopPropagation(); onToggle(); }}
-            className="text-gray-500 hover:text-gray-300 cursor-pointer shrink-0 ml-0.5"
-            style={{ fontSize: compact ? 8 : 10 }}
+            className="text-g-fg-3 hover:text-g-fg cursor-pointer shrink-0 ml-0.5 flex items-center"
           >
-            {expanded ? "▼" : "▶"}
+            <svg className={compact ? "w-2.5 h-2.5" : "w-3 h-3"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+              <path strokeLinecap="round" strokeLinejoin="round" d={expanded ? "M19 9l-7 7-7-7" : "M9 5l7 7-7 7"} />
+            </svg>
           </span>
         )}
         <span className="flex-1" />
@@ -454,9 +467,9 @@ function TreeNodeCard({
       <div className={`flex items-center ${compact ? "gap-0.5 px-1 pb-0.5" : "gap-1 px-1.5 pb-0.5"}`}>
         {positionLabel ? (
           <span
-            className={`font-medium rounded truncate ${compact ? "text-[8px] px-0.5" : "text-[10px] px-1"}`}
+            className={`font-medium rounded truncate ${compact ? "text-[8px] px-1" : "text-[10px] px-1.5 py-px"}`}
             style={{
-              background: `${accentColor}20`,
+              background: `${accentColor}18`,
               color: accentColor,
             }}
           >
@@ -467,7 +480,7 @@ function TreeNodeCard({
         {alarmLabel && (
           <span
             title={alarmTitle}
-            className={`shrink-0 font-medium bg-sky-500/20 text-sky-300 rounded leading-none flex items-center gap-0.5 ${
+            className={`shrink-0 font-medium bg-g-blue-bg text-g-blue rounded leading-none flex items-center gap-0.5 ${
               compact ? "text-[8px] px-0.5 py-px" : "text-[10px] px-1 py-0.5"
             }`}
           >
@@ -480,7 +493,7 @@ function TreeNodeCard({
         {pendingCount > 0 && (
           <span
             onClick={(e) => { e.stopPropagation(); onApproval(node.id); }}
-            className={`shrink-0 font-medium bg-amber-500/20 text-amber-300 rounded cursor-pointer hover:bg-amber-500/30 leading-none ${
+            className={`shrink-0 font-medium bg-g-yellow-bg text-amber-700 rounded cursor-pointer hover:bg-amber-500/30 leading-none ${
               compact ? "text-[8px] px-0.5 py-px" : "text-[10px] px-1 py-0.5"
             }`}
           >
@@ -492,7 +505,7 @@ function TreeNodeCard({
       {/* Add child — absolutely positioned, does NOT affect row layout */}
       <span
         onClick={(e) => { e.stopPropagation(); onAddChild(node.id); }}
-        className="absolute bottom-0.5 right-0.5 rounded hidden group-hover:flex items-center justify-center text-gray-500 hover:text-[#6c8cff] hover:bg-[#6c8cff]/10"
+        className="absolute bottom-0.5 right-0.5 rounded hidden group-hover:flex items-center justify-center text-g-fg-3 hover:text-g-blue hover:bg-g-blue/10"
         style={{ width: compact ? 14 : 16, height: compact ? 14 : 16 }}
       >
         <svg
@@ -520,7 +533,7 @@ function ZoomControls({
     <div
       data-interactive="true"
       onPointerDown={(e) => e.stopPropagation()}
-      className="absolute bottom-3 right-3 flex items-center gap-0.5 bg-gray-900/85 backdrop-blur-md rounded-lg border border-gray-700/40 p-0.5 z-20"
+      className="absolute bottom-3 right-3 flex items-center gap-0.5 bg-white/90 backdrop-blur-sm rounded-lg border border-g-border p-0.5 z-20"
     >
       {[
         { label: "−", onClick: onZoomOut, title: "缩小" },
@@ -532,13 +545,13 @@ function ZoomControls({
         { label: "⊡", onClick: onFit, title: "适应屏幕" },
       ].map((btn, i) =>
         btn === null ? (
-          <div key={i} className="w-px h-4 bg-gray-700/50" />
+          <div key={i} className="w-px h-4 bg-g-border" />
         ) : (
           <button
             key={i}
             onClick={btn.onClick}
             title={btn.title}
-            className={`rounded-md text-gray-400 hover:text-gray-100 hover:bg-gray-700/40 transition-colors flex items-center justify-center ${
+            className={`rounded-md text-g-fg-3 hover:text-g-fg hover:bg-g-bg-soft transition-colors flex items-center justify-center ${
               "isText" in btn && btn.isText
                 ? "text-[10px] px-1.5 py-1 min-w-[40px] font-mono"
                 : "w-7 h-7 text-sm"
@@ -961,7 +974,7 @@ function OrgTree() {
       onPointerUp={handlePointerUp}
     >
       {roots.length === 0 ? (
-        <div className="flex items-center justify-center h-full text-gray-500 text-sm">
+        <div className="flex items-center justify-center h-full text-g-fg-3 text-sm">
           暂无组织成员
         </div>
       ) : (

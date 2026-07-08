@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+﻿import { useEffect, useState, useRef } from "react";
 import { getQuestions, answerQuestion, type PendingQuestion } from "../api";
 import { useAppStore } from "../store";
 
@@ -43,13 +43,13 @@ export default function QuestionDialog() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={(e) => { if (e.target === e.currentTarget) handleDismiss(q.id); }}>
-      <div className="bg-surface-card border border-surface-border rounded-xl shadow-2xl w-[480px] max-h-[80vh] overflow-auto p-6">
+      <div className="bg-g-bg border border-g-border rounded-xl shadow-2xl w-[480px] max-h-[80vh] overflow-auto p-6">
         <div className="flex items-center gap-2 mb-4">
           <span className="text-lg">📋</span>
-          <h3 className="text-sm font-semibold text-gray-300 flex-1">Agent 需要你的决定</h3>
+          <h3 className="text-sm font-semibold text-g-fg flex-1">Agent 需要你的决定</h3>
           <button
             onClick={() => handleDismiss(q.id)}
-            className="text-gray-500 hover:text-gray-300 transition-colors p-1 rounded hover:bg-white/10"
+            className="text-g-fg-4 hover:text-g-fg transition-colors p-1 rounded hover:bg-g-bg-soft"
             title="暂时忽略"
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -58,7 +58,7 @@ export default function QuestionDialog() {
           </button>
         </div>
 
-        <p className="text-gray-100 text-base mb-6 whitespace-pre-wrap">{q.question}</p>
+        <p className="text-g-fg text-base mb-6 whitespace-pre-wrap">{q.question}</p>
 
         {q.options && q.options.length > 0 && (
           <div className="space-y-2 mb-4">
@@ -69,10 +69,10 @@ export default function QuestionDialog() {
               <button
                 key={i}
                 onClick={() => handleAnswer(q.id, label)}
-                className="w-full text-left px-4 py-3 rounded-lg bg-surface border border-surface-border hover:border-accent hover:bg-accent/10 transition-colors"
+                className="w-full text-left px-4 py-3 rounded-lg bg-g-bg border border-g-border hover:border-g-blue hover:bg-g-blue/10 transition-colors"
               >
-                <div className="text-sm font-medium text-gray-200">{label}</div>
-                {desc && <div className="text-xs text-gray-500 mt-0.5">{desc}</div>}
+                <div className="text-sm font-medium text-g-fg">{label}</div>
+                {desc && <div className="text-xs text-g-fg-4 mt-0.5">{desc}</div>}
               </button>
               );
             })}
@@ -90,14 +90,14 @@ export default function QuestionDialog() {
                 handleAnswer(q.id, customAnswers[q.id].trim());
               }
             }}
-            className="flex-1 px-3 py-2 rounded-lg bg-surface border border-surface-border text-gray-200 text-sm focus:outline-none focus:border-accent"
+            className="flex-1 px-3 py-2 rounded-lg bg-g-bg border border-g-border text-g-fg text-sm focus:outline-none focus:border-g-blue"
           />
           <button
             onClick={() => {
               if (customAnswers[q.id]?.trim()) handleAnswer(q.id, customAnswers[q.id].trim());
             }}
             disabled={!customAnswers[q.id]?.trim()}
-            className="px-4 py-2 rounded-lg bg-accent text-white text-sm font-medium hover:bg-accent/80 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="px-4 py-2 rounded-lg bg-g-blue text-white text-sm font-medium hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             发送
           </button>

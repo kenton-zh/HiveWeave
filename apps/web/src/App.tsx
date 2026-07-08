@@ -51,9 +51,6 @@ function App() {
   const [showProjectMenu, setShowProjectMenu] = useState(false);
   const [showFolderPicker, setShowFolderPicker] = useState(false);
   const [folderPickerInitialPath] = useState<string | undefined>(() => {
-    // Test affordance: allow ?folderPath=... to pre-fill the FolderPicker.
-    // Lets automated E2E tests bypass the click+doubleClick dance that's
-    // awkward to drive through a remote browser MCP.
     if (typeof window === "undefined") return undefined;
     const params = new URLSearchParams(window.location.search);
     return params.get("folderPath") ?? undefined;
@@ -61,7 +58,6 @@ function App() {
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
-  // Test-friendly confirm dialog — replaces native window.confirm()
   const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
   const [paused, setPaused] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
@@ -75,7 +71,6 @@ function App() {
   useEffect(() => {
     async function load() {
       try {
-        // Clear any stale delete UI from a prior session / HMR
         deleteQueueRef.current = [];
         deleteRunningRef.current = false;
         setDeletingProjectId(null);
@@ -112,7 +107,6 @@ function App() {
   }, []);
 
 
-  // Safety net: never leave "正在删除项目" stuck if the queue died mid-flight.
   useEffect(() => {
     if (!deletingProjectId && queuedDeleteIds.length === 0) return;
     const timer = window.setTimeout(() => {
@@ -131,13 +125,11 @@ function App() {
     let lastSnapshotKey = "";
     const controller = subscribeAgentStatus(
       (agentIds, paused) => {
-        // Debounce: skip if the snapshot hasn't changed
         const key = agentIds.slice().sort().join(",") + "|" + (paused ?? "");
         if (key === lastSnapshotKey) return;
         lastSnapshotKey = key;
         setProcessingAgents(agentIds);
         if (paused !== undefined) setPaused(paused);
-        // Signal socket reconnect so ChatPanel can reset stale isStreaming state
         useAppStore.getState().bumpSocketReconnect();
       },
       (agentId, processing) => updateProcessingAgent(agentId, processing),
@@ -145,16 +137,15 @@ function App() {
         useAppStore.getState().addActivity(event as any);
       },
       () => refreshOrgTree(),
+      (projectId: string) => useAppStore.getState().bumpGoalsVersion(projectId),
     );
     return () => controller.abort();
   }, []);
 
-  // Check system pause state on mount
   useEffect(() => {
     getPausedState().then((s) => setPaused(s.paused)).catch(() => {});
   }, []);
 
-  // Load operator name from global settings (overrides localStorage)
   useEffect(() => {
     getSettings().then((settings) => {
       if (settings.operatorName) {
@@ -180,7 +171,6 @@ function App() {
     if (st.selectedAgentId) {
       try { leaveAgentChannel(st.selectedAgentId); } catch { /* noop */ }
     }
-    // Batch all updates to avoid cascading re-renders
     useAppStore.setState({
       selectedProjectId: id,
       selectedAgentId: null,
@@ -193,18 +183,17 @@ function App() {
   };
 
   const handleCreateProjectFromFolder = async (folderPath: string) => {
-    // Check if a project with this workspace path already exists
     const normalizedPath = folderPath.replace(/\\/g, "/");
     const existing = projects.find(
       (p) => p.workspacePath?.replace(/\\/g, "/") === normalizedPath
     );
     if (existing) {
-      // Switch to the existing project instead of creating a duplicate
       setSelectedProjectId(existing.id);
       setSelectedAgent(null);
       clearChatSessions();
       refreshOrgTree();
       setShowProjectMenu(false);
+      showToast(`该目录已有项目「${existing.name}」，已切换到该项目`, "info");
       return;
     }
 
@@ -217,23 +206,17 @@ function App() {
       clearChatSessions();
       refreshOrgTree();
       setShowProjectMenu(false);
-      // Show the new-project onboarding dialog — but ONLY after selecting
-      // the CEO agent so ChatPanel mounts and WebSocket channel joins.
-      // This fixes the bug where clicking an onboarding option sends a message
-      // that never reaches the backend because the channel hasn't joined yet.
       if (mainAgentId) {
         setNewProjectCEO(mainAgentId);
-        // Select CEO first so ChatPanel mounts + channel joins
         setSelectedAgent(mainAgentId);
-        // BUG-032: 减少延迟从 1500ms→500ms。后端 event_bus 的 replay
-        // 机制保证即使 WebSocket channel 尚未 join，事件也会在 join 后重放。
-        // 500ms 足够 React 挂载 ChatPanel + WebSocket join 往返（localhost）。
         setTimeout(() => {
           setShowNewProjectDialog(true);
         }, 500);
       }
     } catch (err) {
       console.error("Failed to create project:", err);
+      const msg = err instanceof Error ? err.message : String(err);
+      showToast(`创建项目失败：${msg}`, "error");
     }
   };
 
@@ -244,7 +227,6 @@ function App() {
     if (st.selectedAgentId) {
       try { leaveAgentChannel(st.selectedAgentId); } catch { /* noop */ }
     }
-    // Batch all updates in a single setState to avoid cascading re-renders
     useAppStore.setState({
       selectedProjectId: next,
       selectedAgentId: null,
@@ -320,8 +302,6 @@ function App() {
     const proj = currentProjects.find((p) => p.id === id);
     if (!proj) return;
     if (deleteQueueRef.current.some((item) => item.id === id)) return;
-    // Test-friendly: custom ConfirmDialog instead of native window.confirm()
-    // so browser automation tools can see and click the confirm button.
     setConfirmDelete({ id, name: proj.name });
     setShowProjectMenu(false);
   };
@@ -358,14 +338,14 @@ function App() {
   };
 
   return (
-    <div className="h-screen flex flex-col bg-surface">
-      {/* Top Bar */}
-      <header className="h-14 border-b border-surface-border flex items-center px-6 bg-surface-card shrink-0">
+    <div className="h-screen flex flex-col bg-g-bg">
+      {/* Top Bar — Google Material header */}
+      <header className="h-14 border-b border-g-border flex items-center px-6 bg-white shadow-gm-sm shrink-0">
         <div className="flex items-center gap-3 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-accent flex items-center justify-center shrink-0">
+          <div className="w-8 h-8 rounded-gm bg-g-blue flex items-center justify-center shrink-0 shadow-gm-sm">
             <span className="text-white font-bold text-sm">H</span>
           </div>
-          <h1 className="text-lg font-semibold text-gray-100 tracking-tight shrink-0">
+          <h1 className="text-lg font-semibold text-g-fg tracking-tight shrink-0">
             HiveWeave
           </h1>
           <ProjectTimeBadge projectId={selectedProjectId} />
@@ -375,30 +355,30 @@ function App() {
         <div className="ml-6 relative" ref={projectMenuRef}>
           <button
             onClick={() => setShowProjectMenu(!showProjectMenu)}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-surface border border-surface-border hover:border-accent/50 transition-colors text-sm text-gray-200"
+            className="flex items-center gap-2 px-3 py-1.5 rounded-gm bg-white border border-g-border hover:border-g-blue/40 transition-all text-sm text-g-fg shadow-gm-sm"
           >
-            <svg className="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className="w-4 h-4 text-g-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
             </svg>
             <span className="max-w-[120px] truncate">{currentProject?.name || "选择项目"}</span>
-            <svg className="w-3 h-3 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className="w-3 h-3 text-g-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
             </svg>
           </button>
 
           {(deletingProjectId || queuedDeleteIds.length > 0) && (
-            <div className="absolute top-full left-0 mt-1 w-56 px-3 py-2 text-xs text-amber-400 bg-surface-card border border-surface-border rounded-lg shadow-xl z-50">
+            <div className="absolute top-full left-0 mt-1 w-56 px-3 py-2 text-xs text-g-fg-2 bg-white border border-g-border rounded-gm shadow-gm-md z-50">
               正在删除项目，请稍候...
               {queuedDeleteIds.length > 1 ? `（队列 ${queuedDeleteIds.length} 个）` : ""}
             </div>
           )}
           {showProjectMenu && (
-            <div className="absolute top-full left-0 mt-1 w-56 bg-surface-card border border-surface-border rounded-lg shadow-xl z-50 py-1">
+            <div className="absolute top-full left-0 mt-1 w-56 bg-white border border-g-border rounded-gm shadow-gm-lg z-50 py-1">
               {projects.map((p) => (
                 <div
                   key={p.id}
-                  className={`flex items-center justify-between px-3 py-2 text-sm cursor-pointer hover:bg-surface transition-colors ${
-                    p.id === selectedProjectId ? "text-accent bg-accent/5" : "text-gray-300"
+                  className={`flex items-center justify-between px-3 py-2 text-sm cursor-pointer hover:bg-g-bg-muted transition-colors ${
+                    p.id === selectedProjectId ? "text-g-blue bg-g-blue-bg" : "text-g-fg"
                   }`}
                 >
                   <span
@@ -411,7 +391,7 @@ function App() {
                     type="button"
                     disabled={deletingProjectId === p.id || queuedDeleteIds.includes(p.id)}
                     onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
-                    className="ml-2 text-gray-500 hover:text-red-400 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                    className="ml-2 text-g-fg-4 hover:text-red-600 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                     title={deletingProjectId === p.id ? "删除中..." : "删除项目"}
                   >
                     <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -421,10 +401,10 @@ function App() {
                 </div>
               ))}
 
-              <div className="border-t border-surface-border mt-1 pt-1">
+              <div className="border-t border-g-border mt-1 pt-1">
                 <button
                   onClick={() => setShowFolderPicker(true)}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-sm text-gray-400 hover:text-accent hover:bg-surface transition-colors"
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm text-g-fg-3 hover:text-g-blue hover:bg-g-bg-muted transition-colors"
                 >
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
@@ -440,7 +420,7 @@ function App() {
           {/* Model Settings gear icon */}
           <button
             onClick={() => setShowModelSettings(true)}
-            className="text-gray-400 hover:text-gray-200 transition-colors"
+            className="text-g-fg-3 hover:text-g-fg transition-colors"
             title="Model Settings"
           >
             <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -456,12 +436,12 @@ function App() {
               onChange={(e) => setNameDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") saveName(); if (e.key === "Escape") setEditingName(false); }}
               onBlur={saveName}
-              className="w-24 px-2 py-1 text-xs bg-surface border border-accent/50 rounded text-gray-200 focus:outline-none focus:border-accent"
+              className="w-24 px-2 py-1 text-xs bg-white border border-g-blue/40 rounded-gm text-g-fg focus:outline-none focus:border-g-blue"
             />
           ) : (
             <button
               onClick={startEditName}
-              className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors"
+              className="flex items-center gap-1.5 text-xs text-g-fg-3 hover:text-g-fg transition-colors"
               title="点击修改你的名称"
             >
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -472,14 +452,14 @@ function App() {
           )}
           <button
             onClick={handlePause}
-            className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg transition-colors ${
+            className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-gm transition-all shadow-gm-sm ${
               paused
-                ? "bg-red-500/15 text-red-400 hover:bg-red-500/25"
-                : "bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25"
+                ? "bg-g-red-bg text-g-red hover:bg-red-100 border border-red-200"
+                : "bg-g-green-bg text-g-green hover:bg-green-100 border border-green-200"
             }`}
             title={paused ? "点击上班，恢复所有 Agent" : "点击下班，暂停所有 Agent"}
           >
-            <span className={`w-2 h-2 rounded-full ${paused ? "bg-red-400" : "bg-emerald-400 animate-pulse"}`} />
+            <span className={`w-2 h-2 rounded-full ${paused ? "bg-red-500" : "bg-emerald-500 animate-pulse"}`} />
             <span>{paused ? "已下班" : "上班中"}</span>
           </button>
         </div>
@@ -487,27 +467,27 @@ function App() {
 
       {/* Main Content */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left Panel - Org Tree / Office */}
-        <div className="flex-1 border-r border-surface-border flex flex-col">
-          <div className="px-4 py-3 border-b border-surface-border bg-surface-card flex items-center gap-3">
+        {/* Left Panel - Org Tree / Office — tinted background for visual depth */}
+        <div className="flex-1 border-r border-g-border flex flex-col bg-[#f4f6f9]">
+          <div className="px-4 py-3 border-b border-g-border bg-white/80 backdrop-blur-sm flex items-center gap-3">
             {/* View tabs */}
-            <div className="flex gap-1 bg-surface rounded-md p-0.5">
+            <div className="flex gap-1 bg-g-bg-muted rounded-full p-0.5">
               <button
                 onClick={() => setActiveView("tree")}
-                className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                className={`px-3 py-1 text-xs rounded-full transition-all ${
                   activeView === "tree"
-                    ? "bg-accent/20 text-accent"
-                    : "text-gray-400 hover:text-gray-200"
+                    ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                    : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
                 }`}
               >
                 Org Tree
               </button>
               <button
                 onClick={() => setActiveView("office")}
-                className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                className={`px-3 py-1 text-xs rounded-full transition-all ${
                   activeView === "office"
-                    ? "bg-accent/20 text-accent"
-                    : "text-gray-400 hover:text-gray-200"
+                    ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                    : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
                 }`}
               >
                 Office
@@ -516,7 +496,7 @@ function App() {
             {selectedProjectId && activeView === "tree" && (
               <button
                 onClick={() => openAddAgent(null)}
-                className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-accent hover:bg-accent/10 rounded-md transition-colors ml-auto"
+                className="flex items-center gap-1 px-2.5 py-1 text-xs text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg rounded-gm transition-colors ml-auto"
                 title="Create Agent"
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -532,15 +512,16 @@ function App() {
         </div>
 
         {/* Right Panel - Chat / Agent / Logs */}
-        <div className="w-2/5 flex flex-col">
+        <div className="w-2/5 flex flex-col bg-white">
           {/* Tab bar */}
-          <div className="px-4 py-2 border-b border-surface-border bg-surface-card flex items-center gap-1">
+          <div className="px-4 py-2 border-b border-g-border bg-white flex items-center gap-1">
+            <div className="flex gap-1 bg-[#f4f6f9] rounded-full p-0.5 mr-2">
             <button
               onClick={() => setRightPanelTab("goals")}
-              className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+              className={`px-3 py-1.5 text-xs rounded-full transition-all ${
                 rightPanelTab === "goals"
-                  ? "bg-accent/20 text-accent"
-                  : "text-gray-400 hover:text-gray-200"
+                  ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                  : "text-g-fg-3 hover:text-g-fg"
               }`}
             >
               Goals
@@ -549,40 +530,40 @@ function App() {
               <>
                 <button
                   onClick={() => setRightPanelTab("chat")}
-                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                  className={`px-3 py-1.5 text-xs rounded-full transition-all ${
                     rightPanelTab === "chat"
-                      ? "bg-accent/20 text-accent"
-                      : "text-gray-400 hover:text-gray-200"
+                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                      : "text-g-fg-3 hover:text-g-fg"
                   }`}
                 >
                   Chat
                 </button>
                 <button
                   onClick={() => setRightPanelTab("agent")}
-                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                  className={`px-3 py-1.5 text-xs rounded-full transition-all ${
                     rightPanelTab === "agent"
-                      ? "bg-accent/20 text-accent"
-                      : "text-gray-400 hover:text-gray-200"
+                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                      : "text-g-fg-3 hover:text-g-fg"
                   }`}
                 >
                   Agent
                 </button>
                 <button
                   onClick={() => setRightPanelTab("logs")}
-                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                  className={`px-3 py-1.5 text-xs rounded-full transition-all ${
                     rightPanelTab === "logs"
-                      ? "bg-accent/20 text-accent"
-                      : "text-gray-400 hover:text-gray-200"
+                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                      : "text-g-fg-3 hover:text-g-fg"
                   }`}
                 >
                   Logs
                 </button>
                 <button
                   onClick={() => setRightPanelTab("monitor")}
-                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                  className={`px-3 py-1.5 text-xs rounded-full transition-all ${
                     rightPanelTab === "monitor"
-                      ? "bg-accent/20 text-accent"
-                      : "text-gray-400 hover:text-gray-200"
+                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                      : "text-g-fg-3 hover:text-g-fg"
                   }`}
                 >
                   监控
@@ -592,8 +573,8 @@ function App() {
                     onClick={() => setRightPanelTab("debug" as any)}
                     className={
                       (rightPanelTab === ("debug" as any))
-                        ? "bg-accent/20 text-accent"
-                        : "text-gray-400 hover:text-gray-200"
+                        ? "bg-white text-g-blue shadow-gm-sm font-medium px-3 py-1.5 text-xs rounded-full"
+                        : "text-g-fg-3 hover:text-g-fg px-3 py-1.5 text-xs rounded-full"
                     }
                   >
                     调试
@@ -601,30 +582,28 @@ function App() {
                 )}
               </>
             )}
+            </div>
           </div>
 
           {/* Tab content */}
           <div className="flex-1 overflow-hidden">
             {!selectedAgentId ? (
-              <div className="h-full flex items-center justify-center text-gray-500 text-sm">
+              <div className="h-full flex items-center justify-center text-g-fg-3 text-sm">
                 <div className="text-center">
-                  <div className="w-16 h-16 rounded-full bg-surface-card border border-surface-border flex items-center justify-center mx-auto mb-4">
-                    <svg className="w-8 h-8 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <div className="w-16 h-16 rounded-full bg-g-bg-muted border border-g-border flex items-center justify-center mx-auto mb-4 shadow-gm-sm">
+                    <svg className="w-8 h-8 text-g-fg-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
                     </svg>
                   </div>
-                  <p>从左侧 Org Tree 选择一个 Agent</p>
+                  <p className="text-g-fg-3">从左侧 Org Tree 选择一个 Agent</p>
                 </div>
               </div>
             ) : (
               <>
-                {/* BUG-034: ChatPanel 始终挂载，CSS 隐藏代替卸载。
-                    无论切换到哪个 tab（Goals/Agent/Logs 等），ChatPanel
-                    始终保持挂载，streamDraft/WebSocket channel 不丢失。 */}
                 <ChatPanel key="panel-chat" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
                 {rightPanelTab === "goals" && selectedProjectId && <GoalsPanel key="panel-goals" projectId={selectedProjectId} />}
                 {rightPanelTab === "goals" && !selectedProjectId && (
-                  <div key="panel-goals-empty" className="h-full flex items-center justify-center text-gray-500 text-sm">
+                  <div key="panel-goals-empty" className="h-full flex items-center justify-center text-g-fg-3 text-sm">
                     请先选择一个项目
                   </div>
                 )}
@@ -651,7 +630,6 @@ function App() {
         />
       )}
 
-      {/* Folder Picker for workspace selection */}
       {showFolderPicker && (
         <FolderPicker
           initialPath={folderPickerInitialPath}
@@ -663,12 +641,10 @@ function App() {
         />
       )}
 
-      {/* Model Settings Modal */}
       {showModelSettings && (
         <ModelSettings onClose={() => setShowModelSettings(false)} />
       )}
 
-      {/* Confirm Dialog — test-friendly replacement for window.confirm() */}
       {confirmDelete && (
         <ConfirmDialog
           title="删除项目"
@@ -680,7 +656,6 @@ function App() {
         />
       )}
 
-      {/* Question Dialog — global, polled */}
       <QuestionDialog />
       {showNewProjectDialog && newProjectCEO && (
         <NewProjectDialog

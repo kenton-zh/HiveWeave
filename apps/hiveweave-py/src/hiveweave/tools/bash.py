@@ -38,6 +38,13 @@ _SAFE_ENV_KEYS: frozenset[str] = frozenset({
     "LC_CTYPE", "TERM", "SHELL", "USERNAME", "USERDOMAIN",
     "COMPUTERNAME", "OS", "PATHEXT", "HOMEDRIVE", "HOMEPATH",
     "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    # Python runtime support — not secrets, needed for venv/pip to work
+    "VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME", "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    # Node.js runtime support
+    "NODE_PATH", "NODE_OPTIONS",
+    # Proxy settings (needed for network access in tools)
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
 })
 
 
@@ -49,6 +56,12 @@ def _build_safe_env(cwd: str) -> dict[str, str]:
     safe_env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS}
     safe_env["HIVEWEAVE_BASH"] = "1"
     safe_env["HIVEWEAVE_WORKSPACE"] = cwd
+    # Force UTF-8 everywhere — prevents GBK encoding crashes on Windows
+    # when agent output contains emoji or CJK extension chars (✅, 🚀, etc.)
+    safe_env["PYTHONIOENCODING"] = "utf-8"
+    safe_env["PYTHONUTF8"] = "1"
+    safe_env["LANG"] = "en_US.UTF-8"
+    safe_env["LC_ALL"] = "en_US.UTF-8"
     return safe_env
 
 # Self-destructive command patterns (契约 02 — 7 patterns)
@@ -92,16 +105,48 @@ def _is_within_workspace(candidate: str, workspace: str) -> bool:
 
 
 def _truncate_output(output: str) -> str:
-    """Light-weight truncation: cap at 1MB (layer 2, bash-specific)."""
+    """Light-weight truncation: cap at 1MB (layer 2, bash-specific).
+
+    P1 修复：不再直接截断丢数据。当输出超过 1MB 时，保留 head + tail 预览，
+    并提示完整输出已由 ToolExecutor layer 1 存盘。
+    （layer 1 阈值 50KB 会先于 layer 2 触发存盘）
+    """
     encoded = output.encode("utf-8", errors="replace")
     if len(encoded) <= MAX_CAPTURE_BYTES:
         return output
-    truncated = encoded[:MAX_CAPTURE_BYTES].decode("utf-8", errors="replace")
-    return truncated + "\n... [output truncated at 1MB]"
+    # 超过 1MB — 保留 head 50 行 + tail 20 行
+    lines = output.split("\n")
+    if len(lines) <= 100:
+        # 行数不多但单行超长（如 minified JS），按字符截断
+        truncated = encoded[:MAX_CAPTURE_BYTES].decode("utf-8", errors="replace")
+        return truncated + f"\n... [output truncated at 1MB, {len(encoded)} bytes total]"
+    head = "\n".join(lines[:50])
+    tail = "\n".join(lines[-20:])
+    total = len(lines)
+    return (
+        f"{head}\n"
+        f"\n... [{total - 70} lines omitted, {len(encoded)} bytes total. "
+        f"See tool output file for full content] ...\n\n"
+        f"{tail}"
+    )
+
+
+def _normalize_command(command: str) -> str:
+    """Pre-process command for cross-platform compatibility.
+
+    - python3 → python (Windows: python3.exe doesn't exist; Unix: alias if absent)
+    - pip3 → pip
+    """
+    import re
+    # Replace python3/pip3 with python/pip (word-boundary safe)
+    cmd = re.sub(r'\bpython3\b', 'python', command)
+    cmd = re.sub(r'\bpip3\b', 'pip', command)
+    return cmd
 
 
 async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
     """Execute command via the OS native shell (cmd / bash)."""
+    command = _normalize_command(command)
     is_windows = sys.platform.startswith("win")
     if is_windows:
         shell_args = ["cmd", "/c", command]

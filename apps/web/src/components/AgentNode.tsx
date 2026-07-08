@@ -1,20 +1,20 @@
-import { memo } from "react";
+﻿import { memo } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { useAppStore } from "../store";
 
 const roleColors: Record<string, { bg: string; text: string; label: string }> = {
-  ceo: { bg: "bg-amber-500/20", text: "text-amber-300", label: "首席执行官" },
-  hr: { bg: "bg-rose-500/20", text: "text-rose-300", label: "人力资源" },
-  architect: { bg: "bg-purple-500/20", text: "text-purple-300", label: "架构师" },
-  manager: { bg: "bg-blue-500/20", text: "text-blue-300", label: "经理" },
-  developer: { bg: "bg-green-500/20", text: "text-green-300", label: "开发者" },
-  module_dev: { bg: "bg-green-500/20", text: "text-green-300", label: "开发者" },
-  qa: { bg: "bg-amber-500/20", text: "text-amber-300", label: "测试" },
-  devops: { bg: "bg-cyan-500/20", text: "text-cyan-300", label: "运维" },
+  ceo: { bg: "bg-amber-100", text: "text-amber-700", label: "首席执行官" },
+  hr: { bg: "bg-rose-100", text: "text-rose-700", label: "人力资源" },
+  architect: { bg: "bg-purple-100", text: "text-purple-700", label: "架构师" },
+  manager: { bg: "bg-blue-100", text: "text-blue-700", label: "经理" },
+  developer: { bg: "bg-green-100", text: "text-green-700", label: "开发者" },
+  module_dev: { bg: "bg-green-100", text: "text-green-700", label: "开发者" },
+  qa: { bg: "bg-amber-100", text: "text-amber-700", label: "测试" },
+  devops: { bg: "bg-cyan-100", text: "text-cyan-700", label: "运维" },
 };
 
 /** Generic fallback for unknown/freeform roles — show the raw role name with a neutral style */
-const defaultRoleStyle = { bg: "bg-gray-500/20", text: "text-gray-300" };
+const defaultRoleStyle = { bg: "bg-gray-100", text: "text-gray-600" };
 
 const statusColors: Record<string, string> = {
   created: "bg-gray-400",
@@ -67,17 +67,17 @@ function AgentNode({ data, id }: NodeProps) {
     <div
       onClick={() => setSelectedAgent(id)}
       className={`
-        w-[200px] h-[80px] rounded-xl bg-surface-card border-2 transition-all duration-200
+        w-[200px] h-[80px] rounded-gm bg-white border transition-all duration-200
         cursor-pointer flex flex-col justify-center px-4 gap-2 relative
-        hover:border-accent/60 hover:shadow-lg hover:shadow-accent/5
-        ${isSelected ? "border-accent shadow-lg shadow-accent/10" : "border-surface-border"}
+        hover:border-g-blue/50 hover:shadow-gm-md
+        ${isSelected ? "border-g-blue shadow-gm-md ring-1 ring-g-blue/20" : "border-g-border shadow-gm-sm"}
       `}
     >
       {/* Target handle (top) */}
       <Handle
         type="target"
         position={Position.Top}
-        className="!w-2 !h-2 !bg-accent !border-surface-card !border-2"
+        className="!w-2 !h-2 !bg-g-blue !border-g-bg !border-2"
       />
 
       {/* User ping indicator (top-left) */}
@@ -118,7 +118,7 @@ function AgentNode({ data, id }: NodeProps) {
       {/* Agent Name + Status */}
       <div className="flex items-center gap-2">
         <span className={`w-2 h-2 rounded-full shrink-0 ${statusColor}`} />
-        <span className="text-sm font-medium text-gray-100 truncate">
+        <span className="text-sm font-medium text-g-fg truncate">
           {displayName}
         </span>
       </div>
@@ -139,7 +139,7 @@ function AgentNode({ data, id }: NodeProps) {
             e.stopPropagation();
             openAddAgent(id);
           }}
-          className="w-5 h-5 rounded-md bg-surface hover:bg-accent/20 text-gray-500 hover:text-accent transition-colors flex items-center justify-center"
+          className="w-5 h-5 rounded-md bg-g-bg hover:bg-g-blue-bg text-g-fg-3 hover:text-g-blue transition-colors flex items-center justify-center"
           title="创建子 Agent"
         >
           <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
@@ -152,7 +152,7 @@ function AgentNode({ data, id }: NodeProps) {
       <Handle
         type="source"
         position={Position.Bottom}
-        className="!w-2 !h-2 !bg-accent !border-surface-card !border-2"
+        className="!w-2 !h-2 !bg-g-blue !border-g-bg !border-2"
       />
     </div>
   );

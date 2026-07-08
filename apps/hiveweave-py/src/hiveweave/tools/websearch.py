@@ -207,7 +207,7 @@ async def _search_keyless(
         proxy_url = proxy_env
 
     async with httpx.AsyncClient(
-        timeout=timeout, proxy=proxy_url, verify=False
+        timeout=timeout, proxy=proxy_url
     ) as client:
         # 1. Brave
         try:

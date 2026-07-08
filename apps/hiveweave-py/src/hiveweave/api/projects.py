@@ -146,17 +146,17 @@ def _validate_workspace_path(raw: str) -> Path:
             status_code=400,
             detail="workspace_path resolves to a path with '..' segments",
         )
-    # BUG-033 fix: reject source-code/documentation directories to prevent
-    # per-project DBs from polluting the repo. .hiveweave/data.db should
-    # only live in real project workspaces, never in src/docs/tests/apps.
-    _SOURCE_SEGMENTS = {"src", "apps", "tests", "test", "docs", "doc", "node_modules",
+    # BUG-033 fix: reject when the workspace root directory itself is a known
+    # source-code/build directory. Only check the FINAL path segment (the
+    # project root), NOT intermediate parent directories — otherwise legitimate
+    # paths like D:\Work\src\my-project get falsely rejected.
+    _SOURCE_SEGMENTS = {"src", "apps", "docs", "node_modules",
                         "__pycache__", ".git", ".claude", "dist", "build", "out"}
-    offending = [p for p in resolved.parts if p.lower() in _SOURCE_SEGMENTS]
-    if offending:
+    if resolved.name.lower() in _SOURCE_SEGMENTS:
         raise HTTPException(
             status_code=400,
-            detail=f"workspace_path appears to be a source/documentation directory "
-                    f"(contains: {', '.join(offending)}). "
+            detail=f"workspace_path directory '{resolved.name}' is a reserved "
+                    f"source-code/build directory name. "
                     f"Please choose a real project workspace instead.",
         )
     return resolved
@@ -223,22 +223,15 @@ async def _seed_default_agents(project_id: str) -> list[str]:
     existing = await org.list_agents(project_id)
     log.info("seed_existing_agents", project_id=project_id, count=len(existing))
 
-    # 获取默认模型 ID（优先选择 step 系列，其次非 free 模型）
+    # 获取默认模型 ID — 选最新添加的 active 模型（用户最近加的就是首选）
     default_model_id = None
     try:
         from hiveweave.services.model import ModelService
         ms = ModelService()
         active_models = await ms.list_active()
         if active_models:
-            # 优先选择 step 系列模型
-            step_models = [m for m in active_models if "step" in (m.get("model_id") or "").lower()]
-            non_free = [m for m in active_models if "free" not in (m.get("model_id") or "").lower()]
-            if step_models:
-                chosen = step_models[0]
-            elif non_free:
-                chosen = non_free[0]
-            else:
-                chosen = active_models[0]
+            # 最新的 active 模型 = 用户最近的偏好
+            chosen = active_models[-1]
             default_model_id = chosen.get("model_id") or chosen.get("id")
             log.info("seed_default_model", default_model_id=default_model_id, total_models=len(active_models))
         else:
@@ -337,6 +330,27 @@ async def create_project(body: ProjectCreate) -> dict:
     workspace = body.workspacePath
     # R2 fix: 校验 workspace_path 安全性（绝对路径 + 无 .. 穿越段）
     ws = _validate_workspace_path(workspace)
+
+    # 唯一性检查：同一 workspace_path 不允许创建多个项目
+    # 前端去重逻辑依赖 workspace_path 匹配，如果存在重复会导致用户
+    # "选中旧项目但没有 .hiveweave" 的困惑。
+    ws_normalized = str(ws).replace("\\", "/").lower()
+    existing_rows = await meta_db.query(
+        "SELECT id, name, workspace_path FROM projects"
+    )
+    for row in existing_rows:
+        row_dict = dict(row)
+        row_ws = (row_dict.get("workspace_path") or "").replace("\\", "/").lower()
+        if row_ws == ws_normalized:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Workspace already used by project '{row_dict.get('name')}' "
+                       f"(id: {row_dict.get('id')}). Delete it first or choose a "
+                       f"different directory.",
+            )
+
+    # 清除可能的旧驱逐标记 — 同路径重建项目时恢复 DB 访问
+    project_db.clear_evicted_workspace(str(ws))
     # 确保工作空间存在
     try:
         ws.mkdir(parents=True, exist_ok=True)
@@ -469,6 +483,8 @@ async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
         # R2 fix: 校验新 workspace_path 安全性
         new_ws_dir = _validate_workspace_path(body.workspacePath)
         new_ws = str(new_ws_dir)
+        # 新路径清除驱逐标记（旧路径的标记保留，防止 rename 过程中旧 DB 被重连）
+        project_db.clear_evicted_workspace(new_ws)
         try:
             new_ws_dir.mkdir(parents=True, exist_ok=True)
             (new_ws_dir / ".hiveweave").mkdir(parents=True, exist_ok=True)
@@ -633,26 +649,41 @@ async def delete_project(project_id: str) -> dict:
             import time as _time
 
             def _on_error(func, path, exc_info):
-                """强制删除：去除只读属性后重试。"""
+                """强制删除：去除只读属性后重试。重试失败则抛异常（不吞）。"""
                 try:
                     os.chmod(path, stat.S_IWRITE)
                 except Exception:
                     pass
-                try:
-                    func(path)
-                except Exception:
-                    pass
+                func(path)  # 不 catch — 让异常传播触发外层重试
 
+            _rmtree_ok = False
+            _rmtree_err = ""
             for attempt in range(3):
                 try:
                     shutil.rmtree(hw_dir, onerror=_on_error)
+                    _rmtree_ok = True
                     break
                 except Exception as e:
+                    _rmtree_err = str(e)
                     if attempt < 2:
                         _time.sleep(0.5)
                     else:
                         log.warning("delete_hiveweave_dir_failed",
-                                    workspace=workspace, error=str(e))
+                                    workspace=workspace, error=_rmtree_err)
+
+            # 验证目录是否真的删掉了（rmtree 可能因 _on_error 部分吞异常而"假成功"）
+            if hw_dir.exists():
+                _remaining = [str(p) for p in hw_dir.rglob("*")][:10]
+                log.error("hiveweave_dir_residue",
+                          workspace=workspace,
+                          rmtree_ok=_rmtree_ok,
+                          rmtree_err=_rmtree_err,
+                          remaining_files=_remaining)
+                # 不静默成功 — 抛异常让 API 返回真实错误
+                raise HTTPException(
+                    status_code=500,
+                    detail=f".hiveweave 目录删除失败，可能被其他进程锁定。请手动删除: {hw_dir}"
+                )
 
     # 若是当前激活项目，取消激活
     active_id = await _get_active_project_id()
@@ -732,45 +763,45 @@ async def get_project_game_time(project_id: str) -> dict:
 async def get_project_goals(project_id: str) -> dict:
     """读取 charter goals 段。
 
-    BUG-016 修复：之前只有 POST 没有 GET，前端 GET /goals 返回 405。
+    优先从 goals_json（agent 写）读，兼容 charter_json.goals（前端写）。
     """
     row = await meta_db.query_one(
-        "SELECT charter_json FROM projects WHERE id = ?", [project_id]
+        "SELECT goals_json, charter_json FROM projects WHERE id = ?", [project_id]
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    DEFAULT_GOALS = {
+        "objective": "",
+        "focus": "",
+        "keyResults": [],
+        "userInvolvement": "宏观决策+技术选型",
+    }
+
+    # 1. Try goals_json (agent-facing, flat format)
+    goals_raw = row["goals_json"]
+    if goals_raw:
+        try:
+            goals = json.loads(goals_raw) if isinstance(goals_raw, str) else goals_raw
+            if isinstance(goals, dict) and goals:
+                return {"goals": goals, "projectId": project_id}
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 2. Fallback: charter_json.goals (human-facing, nested format)
     charter_raw = row["charter_json"]
-    charter: dict = {}
     if charter_raw:
         try:
             charter = json.loads(charter_raw) if isinstance(charter_raw, str) else charter_raw
+            goals = charter.get("goals") if isinstance(charter, dict) else None
+            if goals and isinstance(goals, dict):
+                return {"goals": {**DEFAULT_GOALS, **goals}, "projectId": project_id}
+            if isinstance(goals, str):
+                return {"goals": {**DEFAULT_GOALS, "focus": goals}, "projectId": project_id}
         except (json.JSONDecodeError, TypeError):
-            charter = {}
-    goals = charter.get("goals") if charter else None
-    # 兼容旧数据：goals 可能是空字符串或缺失，转成对象
-    if not goals:
-        goals = {
-            "objective": "",
-            "focus": "",
-            "keyResults": [],
-            "userInvolvement": "宏观决策+技术选型",
-        }
-    elif isinstance(goals, str):
-        try:
-            goals = json.loads(goals) or {
-                "objective": "",
-                "focus": "",
-                "keyResults": [],
-                "userInvolvement": "宏观决策+技术选型",
-            }
-        except (json.JSONDecodeError, TypeError):
-            goals = {
-                "objective": "",
-                "focus": goals,
-                "keyResults": [],
-                "userInvolvement": "宏观决策+技术选型",
-            }
-    return {"goals": goals, "projectId": project_id}
+            pass
+
+    return {"goals": DEFAULT_GOALS, "projectId": project_id}
 
 
 @router.put("/{project_id}/goals")
@@ -801,6 +832,12 @@ async def update_project_goals(project_id: str, body: CharterGoalsUpdate) -> dic
     except Exception as e:
         log.error("update_goals_failed", project_id=project_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to update goals")
+    # 推送 WebSocket 事件 — 前端 GoalsPanel 监听后重新拉取
+    try:
+        from hiveweave.realtime.event_bus import status_event_bus
+        await status_event_bus.publish_goals_updated(project_id)
+    except Exception as e:
+        log.warning("goals_updated_push_failed", project_id=project_id, error=str(e))
     return {"ok": True}
 
 

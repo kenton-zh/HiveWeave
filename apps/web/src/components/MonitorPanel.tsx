@@ -25,7 +25,7 @@ function TokenBar({ input, output }: { input: number; output: number }) {
   return (
     <div className="flex items-center gap-2 text-[10px] font-mono">
       <span className="text-blue-400 shrink-0">in:{tokenLabel(input)}</span>
-      <div className="flex-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+      <div className="flex-1 h-1.5 bg-g-bg-muted rounded-full overflow-hidden">
         <div className="flex h-full">
           <div className="bg-blue-500/60 h-full" style={{ width: `${inPct}%` }} />
           <div className="bg-emerald-500/60 h-full" style={{ width: `${100 - inPct}%` }} />
@@ -57,7 +57,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
       ? content.slice(0, 200) + "…"
       : content;
     return (
-      <div className="ml-4 pl-3 border-l-2 border-amber-500/20 text-[10px] text-gray-500 font-mono">
+      <div className="ml-4 pl-3 border-l-2 border-amber-500/20 text-[10px] text-g-fg-4 font-mono">
         <span className="text-amber-500/60">→ result:</span>{" "}
         <span className="whitespace-pre-wrap break-all">{preview}</span>
       </div>
@@ -75,7 +75,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
         <details className="group mb-1">
           <summary
             onClick={(e) => { e.preventDefault(); setShowThinking(!showThinking); }}
-            className="text-[10px] text-purple-400 cursor-pointer hover:text-purple-300 select-none flex items-center gap-1"
+            className="text-[10px] text-purple-500 cursor-pointer hover:text-purple-600 select-none flex items-center gap-1"
           >
             <span className="text-[9px] transition-transform" style={showThinking ? {} : {}}>
               {showThinking ? "▼" : "▶"}
@@ -83,7 +83,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
             💭 思考过程 ({thinking.length} chars)
           </summary>
           {showThinking && (
-            <div className="mt-1 ml-4 pl-2 border-l-2 border-purple-500/20 text-[10px] text-purple-300/70 whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed">
+            <div className="mt-1 ml-4 pl-2 border-l-2 border-purple-200 text-[10px] text-purple-500 whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed">
               {thinking}
             </div>
           )}
@@ -92,7 +92,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
 
       {/* Content */}
       {content && (
-        <div className="text-xs text-gray-200 whitespace-pre-wrap break-words leading-relaxed">
+        <div className="text-xs text-g-fg whitespace-pre-wrap break-words leading-relaxed">
           {content}
         </div>
       )}
@@ -104,7 +104,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
         return (
           <div key={i} className="ml-2 mt-1 flex items-center gap-1.5">
             <ToolBadge name={name} />
-            {hint && <span className="text-[10px] text-gray-600 truncate">{hint}</span>}
+            {hint && <span className="text-[10px] text-g-fg-4/70 truncate">{hint}</span>}
           </div>
         );
       })}
@@ -166,19 +166,19 @@ function TurnCard({ turn, events, expanded, onToggle }: { turn: TraceTurn; event
     : turn.summary || "(空轮次)";
 
   return (
-    <div className="rounded-lg border border-surface-border bg-surface-card overflow-hidden">
+    <div className="rounded-lg border border-g-border bg-g-bg overflow-hidden">
       <button
         onClick={onToggle}
-        className="w-full flex items-center gap-3 p-3 hover:bg-surface-hover transition-colors text-left"
+        className="w-full flex items-center gap-3 p-3 hover:bg-g-bg-soft transition-colors text-left"
       >
-        <span className="text-[10px] font-mono text-gray-500 w-12 shrink-0">
+        <span className="text-[10px] font-mono text-g-fg-4 w-12 shrink-0">
           #{turn.turn_index}
         </span>
 
         <div className="flex-1 min-w-0">
-          <div className="text-xs text-gray-300 truncate">{intent}</div>
+          <div className="text-xs text-g-fg truncate">{intent}</div>
           <div className="flex items-center gap-3 mt-0.5">
-            <span className="text-[10px] text-gray-500">
+            <span className="text-[10px] text-g-fg-4">
               {turn.message_count} msgs
             </span>
             {turn.tool_call_count > 0 && (
@@ -186,7 +186,7 @@ function TurnCard({ turn, events, expanded, onToggle }: { turn: TraceTurn; event
                 {turn.tool_call_count} tools
               </span>
             )}
-            <span className="text-[10px] text-gray-600">
+            <span className="text-[10px] text-g-fg-4/70">
               ~{tokenLabel(turn.approx_tokens)} tok est.
             </span>
           </div>
@@ -198,9 +198,9 @@ function TurnCard({ turn, events, expanded, onToggle }: { turn: TraceTurn; event
           </div>
         )}
 
-        <span className="text-[10px] text-gray-600 shrink-0">{formatTime(turn.created_at)}</span>
+        <span className="text-[10px] text-g-fg-4/70 shrink-0">{formatTime(turn.created_at)}</span>
         <svg
-          className={`w-4 h-4 text-gray-500 transition-transform shrink-0 ${expanded ? "rotate-180" : ""}`}
+          className={`w-4 h-4 text-g-fg-4 transition-transform shrink-0 ${expanded ? "rotate-180" : ""}`}
           fill="none" viewBox="0 0 24 24" stroke="currentColor"
         >
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -208,24 +208,24 @@ function TurnCard({ turn, events, expanded, onToggle }: { turn: TraceTurn; event
       </button>
 
       {expanded && (
-        <div className="px-3 pb-3 border-t border-surface-border">
+        <div className="px-3 pb-3 border-t border-g-border">
           {/* Token summary header */}
           {turnEvents.length > 0 && (
-            <div className="py-2 mb-2 border-b border-surface-border/50">
-              <div className="text-[10px] text-gray-500 mb-1">
+            <div className="py-2 mb-2 border-b border-g-border/50">
+              <div className="text-[10px] text-g-fg-4 mb-1">
                 {turnEvents.length} LLM call{turnEvents.length > 1 ? "s" : ""}
                 {" · "}
                 total in:{tokenLabel(totalInput)} out:{tokenLabel(totalOutput)}
               </div>
               <div className="space-y-0.5">
                 {turnEvents.map((ev, i) => (
-                  <div key={ev.id} className="flex items-center gap-2 text-[10px] font-mono text-gray-600">
+                  <div key={ev.id} className="flex items-center gap-2 text-[10px] font-mono text-g-fg-4/70">
                     <span className="text-cyan-400 w-6">R{i}</span>
                     <span>in:{tokenLabel(ev.payload?.input_tokens)}</span>
                     <span>out:{tokenLabel(ev.payload?.output_tokens)}</span>
-                    {ev.payload?.model && <span className="text-gray-700">{ev.payload.model}</span>}
+                    {ev.payload?.model && <span className="text-g-fg-4/50">{ev.payload.model}</span>}
                     {ev.payload?.finish_reason && (
-                      <span className="text-gray-500">finish:{ev.payload.finish_reason}</span>
+                      <span className="text-g-fg-4">finish:{ev.payload.finish_reason}</span>
                     )}
                   </div>
                 ))}
@@ -252,20 +252,20 @@ function EventRow({ event }: { event: TraceEvent }) {
   const isRound = event.event_type === "llm_round";
 
   let label = event.event_type;
-  let color = "text-gray-400";
-  if (isRound) { label = `LLM Round`; color = "text-cyan-300"; }
-  else if (event.event_type === "chat_start") { label = "对话开始"; color = "text-blue-300"; }
-  else if (event.event_type === "chat_done") { label = "对话完成"; color = "text-green-300"; }
-  else if (event.event_type === "llm_fail") { label = "LLM 失败"; color = "text-red-300"; }
+  let color = "text-g-fg-3";
+  if (isRound) { label = `LLM Round`; color = "text-cyan-600"; }
+  else if (event.event_type === "chat_start") { label = "对话开始"; color = "text-blue-600"; }
+  else if (event.event_type === "chat_done") { label = "对话完成"; color = "text-green-600"; }
+  else if (event.event_type === "llm_fail") { label = "LLM 失败"; color = "text-red-600"; }
 
   return (
-    <div className="rounded-lg border border-surface-border bg-surface-card p-3">
+    <div className="rounded-lg border border-g-border bg-g-bg p-3">
       <div className="flex items-center gap-3">
         <span className={`text-[10px] font-bold ${color} w-16`}>{label}</span>
         {isRound && (
           <>
             <TokenBar input={p.input_tokens || 0} output={p.output_tokens || 0} />
-            <div className="flex flex-wrap gap-2 text-[10px] text-gray-500">
+            <div className="flex flex-wrap gap-2 text-[10px] text-g-fg-4">
               {p.model && <span>model: {p.model}</span>}
               {p.finish_reason && <span>finish: {p.finish_reason}</span>}
               {p.msg_count != null && <span>msgs: {p.msg_count}</span>}
@@ -274,12 +274,12 @@ function EventRow({ event }: { event: TraceEvent }) {
           </>
         )}
         {event.event_type === "chat_done" && (
-          <span className="text-[10px] text-gray-500">
+          <span className="text-[10px] text-g-fg-4">
             {p.duration_ms != null && `${(p.duration_ms / 1000).toFixed(1)}s `}
             {p.tokens != null && `${p.tokens} tok`}
           </span>
         )}
-        <span className="text-[10px] text-gray-600 ml-auto">{formatTime(event.created_at)}</span>
+        <span className="text-[10px] text-g-fg-4/70 ml-auto">{formatTime(event.created_at)}</span>
       </div>
     </div>
   );
@@ -348,7 +348,7 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
 
   if (loading) {
     return (
-      <div className="h-full flex items-center justify-center text-gray-500 text-sm">
+      <div className="h-full flex items-center justify-center text-g-fg-4 text-sm">
         加载监控数据...
       </div>
     );
@@ -356,9 +356,9 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
 
   if (error) {
     return (
-      <div className="h-full flex flex-col items-center justify-center text-red-400 text-sm">
+      <div className="h-full flex flex-col items-center justify-center text-red-600 text-sm">
         <p>{error}</p>
-        <button onClick={fetchTraces} className="mt-2 text-xs text-accent hover:underline">
+        <button onClick={fetchTraces} className="mt-2 text-xs text-g-blue hover:underline">
           重试
         </button>
       </div>
@@ -366,21 +366,21 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
   }
 
   return (
-    <div className="h-full flex flex-col bg-surface">
+    <div className="h-full flex flex-col bg-g-bg">
       {/* Header — Token-centric stats */}
-      <div className="px-3 py-2 border-b border-surface-border bg-surface-card">
-        <div className="flex items-center gap-4 text-[11px] text-gray-400">
-          <span>对话轮次: <span className="text-gray-200 font-mono">{traces.turns.length}</span></span>
-          <span>LLM 调用: <span className="text-cyan-300 font-mono">{llmRounds.length}</span></span>
+      <div className="px-3 py-2 border-b border-g-border bg-g-bg">
+        <div className="flex items-center gap-4 text-[11px] text-g-fg-3">
+          <span>对话轮次: <span className="text-g-fg font-mono">{traces.turns.length}</span></span>
+          <span>LLM 调用: <span className="text-cyan-600 font-mono">{llmRounds.length}</span></span>
           <span>
             Tokens:
             <span className="text-blue-400 font-mono ml-1">in:{tokenLabel(totalInput)}</span>
-            <span className="text-gray-600 mx-1">/</span>
+            <span className="text-g-fg-4/70 mx-1">/</span>
             <span className="text-emerald-400 font-mono">out:{tokenLabel(totalOutput)}</span>
-            <span className="text-gray-600 mx-1">=</span>
-            <span className="text-gray-200 font-mono">{tokenLabel(totalTokens)}</span>
+            <span className="text-g-fg-4/70 mx-1">=</span>
+            <span className="text-g-fg font-mono">{tokenLabel(totalTokens)}</span>
           </span>
-          <span>耗时: <span className="text-gray-200 font-mono">{(totalDuration / 1000).toFixed(1)}s</span></span>
+          <span>耗时: <span className="text-g-fg font-mono">{(totalDuration / 1000).toFixed(1)}s</span></span>
           <label className="ml-auto flex items-center gap-1 cursor-pointer">
             <input
               type="checkbox"
@@ -390,18 +390,18 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
             />
             <span className="text-[10px]">自动刷新</span>
           </label>
-          <button onClick={fetchTraces} className="text-[10px] text-accent hover:underline">
+          <button onClick={fetchTraces} className="text-[10px] text-g-blue hover:underline">
             刷新
           </button>
         </div>
       </div>
 
       {/* Sub-tabs */}
-      <div className="px-3 py-1.5 border-b border-surface-border bg-surface-card flex gap-1">
+      <div className="px-3 py-1.5 border-b border-g-border bg-g-bg flex gap-1">
         <button
           onClick={() => setSubTab("turns")}
           className={`px-2.5 py-1 text-[11px] rounded transition-colors ${
-            subTab === "turns" ? "bg-accent/20 text-accent" : "text-gray-400 hover:text-gray-200"
+            subTab === "turns" ? "bg-g-blue/15 text-g-blue" : "text-g-fg-3 hover:text-g-fg"
           }`}
         >
           对话轮次 ({traces.turns.length})
@@ -409,7 +409,7 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
         <button
           onClick={() => setSubTab("events")}
           className={`px-2.5 py-1 text-[11px] rounded transition-colors ${
-            subTab === "events" ? "bg-accent/20 text-accent" : "text-gray-400 hover:text-gray-200"
+            subTab === "events" ? "bg-g-blue/15 text-g-blue" : "text-g-fg-3 hover:text-g-fg"
           }`}
         >
           LLM Token 明细 ({llmRounds.length})
@@ -420,7 +420,7 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
       <div className="flex-1 overflow-y-auto p-3 space-y-2">
         {subTab === "turns" ? (
           traces.turns.length === 0 ? (
-            <div className="text-center text-gray-500 text-sm py-8">
+            <div className="text-center text-g-fg-4 text-sm py-8">
               暂无对话轮次数据
             </div>
           ) : (
@@ -441,7 +441,7 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
           )
         ) : (
           llmRounds.length === 0 ? (
-            <div className="text-center text-gray-500 text-sm py-8">
+            <div className="text-center text-g-fg-4 text-sm py-8">
               暂无 LLM Token 数据
             </div>
           ) : (

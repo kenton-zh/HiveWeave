@@ -60,6 +60,578 @@ APPROVAL_TIMEOUT_S = 120
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
+# ── Tool parameter schemas ──────────────────────────────────
+# Centralized JSON Schema definitions for every tool. Used for:
+# 1. Sending to LLM (so it knows correct parameter names — no more guessing)
+# 2. Validating LLM args before execution (auto-generate helpful errors)
+# 3. Accepting multiple parameter name aliases (Python arg_name in "aliases")
+
+TOOL_PARAM_SCHEMAS: dict[str, dict] = {
+    "bash": {
+        "properties": {
+            "command": {"type": "string", "aliases": ["cmd", "run"]},
+            "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"]},
+        },
+        "required": ["command"],
+    },
+    "read_file": {
+        "properties": {
+            "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
+            "offset": {"type": "integer", "aliases": ["startLine"]},
+            "limit": {"type": "integer", "aliases": ["maxLines", "lineLimit"]},
+        },
+        "required": ["filePath"],
+    },
+    "write_file": {
+        "properties": {
+            "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
+            "content": {"type": "string", "aliases": ["data", "text", "body"]},
+        },
+        "required": ["filePath", "content"],
+    },
+    "list_files": {
+        "properties": {
+            "dirPath": {"type": "string", "aliases": ["path", "directory", "dir"]},
+        },
+        "required": [],
+    },
+    "grep": {
+        "properties": {
+            "pattern": {"type": "string", "aliases": ["regex", "query", "search"]},
+            "path": {"type": "string", "aliases": ["filePath", "file", "directory", "dir"]},
+            "include": {"type": "string", "aliases": ["glob", "filter"]},
+            "head_limit": {"type": "integer", "aliases": ["headLimit", "maxResults", "limit"]},
+            "context": {"type": "integer", "aliases": ["contextLines", "contextAround"]},
+            "multiline": {"type": "boolean", "aliases": ["multiLine", "dotAll"]},
+        },
+        "required": ["pattern"],
+    },
+    "search_files": {
+        "properties": {
+            "pattern": {"type": "string", "aliases": ["glob", "query", "search", "name"]},
+            "directory": {"type": "string", "aliases": ["path", "dir"]},
+        },
+        "required": ["pattern"],
+    },
+    "edit_file": {
+        "properties": {
+            "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
+            "old_string": {"type": "string", "aliases": ["oldString", "old_str", "search", "find"]},
+            "new_string": {"type": "string", "aliases": ["newString", "new_str", "replace", "replacement"]},
+            "replace_all": {"type": "boolean", "aliases": ["replaceAll"]},
+        },
+        "required": ["filePath", "old_string", "new_string"],
+    },
+    "apply_patch": {
+        "properties": {
+            "patches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "description": "File path to patch"},
+                        "search": {"type": "string", "description": "Text to find"},
+                        "replace": {"type": "string", "description": "Text to replace with"},
+                        "oldText": {"type": "string", "description": "Old text (alternative to search)"},
+                        "newText": {"type": "string", "description": "New text (alternative to replace)"},
+                        "action": {"type": "string", "enum": ["replace", "insert", "delete"], "description": "Patch action type"},
+                    },
+                    "required": ["file"]
+                },
+                "description": "Array of patch objects. Each must have 'file' and one of: search+replace, oldText+newText, or action."
+            },
+        },
+        "required": ["patches"],
+    },
+    "websearch": {
+        "properties": {
+            "query": {"type": "string", "aliases": ["search", "q", "term"]},
+            "numResults": {"type": "integer", "aliases": ["num_results", "limit", "count"]},
+        },
+        "required": ["query"],
+    },
+    "question": {
+        "properties": {
+            "question": {"type": "string", "aliases": ["message", "content", "query", "text"]},
+            "options": {"type": "array", "aliases": ["choices"]},
+        },
+        "required": ["question"],
+    },
+    "todowrite": {
+        "properties": {
+            "todos": {"type": "array", "aliases": ["tasks", "items", "list"]},
+        },
+        "required": ["todos"],
+    },
+    "send_message": {
+        "properties": {
+            "recipients": {"type": "array", "aliases": ["recipient", "to", "targets"]},
+            "message": {"type": "string", "aliases": ["content", "body", "text"]},
+            "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
+            "priority": {"type": "string", "aliases": ["level"]},
+        },
+        "required": ["recipients", "message"],
+    },
+    "hire_agent": {
+        "properties": {
+            "name": {"type": "string"},
+            "role": {"type": "string"},
+            "goal": {"type": "string"},
+            "backstory": {"type": "string"},
+            "skills": {"type": "array", "items": {"type": "string"}},
+            "parentId": {"type": "string", "aliases": ["parent_id", "parent"]},
+        },
+        "required": ["name", "role"],
+    },
+    "read_charter": {
+        "properties": {},
+        "required": [],
+    },
+    "save_charter": {
+        "properties": {
+            "content": {"type": "string", "aliases": ["charter", "body", "text"]},
+            "title": {"type": "string", "aliases": ["name"]},
+        },
+        "required": ["content"],
+    },
+    "read_goals": {
+        "properties": {},
+        "required": [],
+    },
+    "update_goals": {
+        "properties": {
+            "objective": {"type": "string"},
+            "focus": {"type": "string"},
+            "keyResults": {"type": "array", "aliases": ["key_results"]},
+            "userInvolvement": {"type": "string", "aliases": ["user_involvement"]},
+        },
+        "required": [],
+    },
+    "read_memory": {
+        "properties": {
+            "moduleId": {"type": "string", "aliases": ["module_id", "id", "key"]},
+        },
+        "required": ["moduleId"],
+    },
+    "write_memory": {
+        "properties": {
+            "content": {"type": "string", "aliases": ["data", "body", "text", "memory"]},
+            "moduleId": {"type": "string", "aliases": ["module_id", "id", "key"]},
+            "tags": {"type": "array", "items": {"type": "string"}, "aliases": []},
+        },
+        "required": ["content"],
+    },
+    "list_available_skills": {
+        "properties": {},
+        "required": [],
+    },
+    "read_skill": {
+        "properties": {
+            "skill": {"type": "string", "aliases": ["name", "slug", "id"]},
+        },
+        "required": ["skill"],
+    },
+    "read_roster": {
+        "properties": {},
+        "required": [],
+    },
+    "update_roster": {
+        "properties": {
+            "agentId": {"type": "string", "aliases": ["agent_id", "target", "id"]},
+            "position": {"type": "string"},
+            "department": {"type": "string"},
+            "responsibilities": {"type": "string"},
+            "status": {"type": "string"},
+            "hire_date": {"type": "string", "aliases": ["hireDate"]},
+        },
+        "required": ["agentId"],
+    },
+    "view_org_chart": {
+        "properties": {},
+        "required": [],
+    },
+    "list_subordinates": {
+        "properties": {},
+        "required": [],
+    },
+    "list_alarms": {
+        "properties": {},
+        "required": [],
+    },
+    "cancel_alarm": {
+        "properties": {
+            "alarmId": {"type": "string", "aliases": ["alarm_id", "id"]},
+        },
+        "required": ["alarmId"],
+    },
+    "schedule_alarm": {
+        "properties": {
+            "toAgentId": {"type": "string", "aliases": ["to_agent_id", "target"]},
+            "purpose": {"type": "string", "aliases": ["message", "description"]},
+            "fireInGameSeconds": {"type": "integer", "aliases": ["fire_in_game_seconds", "delay"]},
+            "repeatIntervalSeconds": {"type": "integer", "aliases": ["repeat_interval_seconds", "interval"]},
+        },
+        "required": ["toAgentId", "purpose", "fireInGameSeconds"],
+    },
+    "read_work_logs": {
+        "properties": {
+            "agentId": {"type": "string", "aliases": ["agent_id", "target"]},
+            "limit": {"type": "integer", "aliases": ["count", "max"]},
+        },
+        "required": [],
+    },
+    "run_code_review": {
+        "properties": {
+            "filePaths": {"type": "array", "items": {"type": "string"},
+                "aliases": ["files", "target", "path", "file", "module"]},
+            "testFiles": {"type": "array", "items": {"type": "string"},
+                "aliases": ["test_files"]},
+        },
+        "required": ["filePaths"],
+    },
+    "run_security_audit": {
+        "properties": {
+            "filePaths": {"type": "array", "items": {"type": "string"},
+                "aliases": ["files", "target", "path", "file", "module"]},
+            "testFiles": {"type": "array", "items": {"type": "string"},
+                "aliases": ["test_files"]},
+        },
+        "required": ["filePaths"],
+    },
+    "run_tests": {
+        "properties": {
+            "filePaths": {"type": "array", "items": {"type": "string"},
+                "aliases": ["files", "target", "path", "file", "module", "testPath"]},
+            "testFiles": {"type": "array", "items": {"type": "string"},
+                "aliases": ["test_files"]},
+        },
+        "required": ["filePaths"],
+    },
+    "run_perf_audit": {
+        "properties": {
+            "filePaths": {"type": "array", "items": {"type": "string"},
+                "aliases": ["files", "target", "path", "file", "module"]},
+            "testFiles": {"type": "array", "items": {"type": "string"},
+                "aliases": ["test_files"]},
+        },
+        "required": ["filePaths"],
+    },
+    "run_full_review": {
+        "properties": {
+            "filePaths": {"type": "array", "items": {"type": "string"},
+                "aliases": ["files", "target", "path", "file", "module"]},
+            "testFiles": {"type": "array", "items": {"type": "string"},
+                "aliases": ["test_files"]},
+        },
+        "required": ["filePaths"],
+    },
+    "delete_file": {
+        "properties": {
+            "path": {"type": "string", "aliases": ["filePath", "file_path", "file"]},
+        },
+        "required": ["path"],
+    },
+    "create_directory": {
+        "properties": {
+            "path": {"type": "string", "aliases": ["dirPath", "directory", "dir"]},
+        },
+        "required": ["path"],
+    },
+    "delete_directory": {
+        "properties": {
+            "path": {"type": "string", "aliases": ["dirPath", "directory", "dir"]},
+        },
+        "required": ["path"],
+    },
+    # — Agent management —
+    "dismiss_agent": {
+        "properties": {
+            "agentId": {"type": "string", "aliases": ["agent_id", "id", "target"]},
+        },
+        "required": ["agentId"],
+    },
+    "transfer_agent": {
+        "properties": {
+            "agentId": {"type": "string", "aliases": ["agent_id", "id"]},
+            "newParentId": {"type": "string", "aliases": ["new_parent_id", "parentId", "parent_id", "target"]},
+        },
+        "required": ["agentId", "newParentId"],
+    },
+    "list_agent_templates": {
+        "properties": {},
+        "required": [],
+    },
+    "bind_skill": {
+        "properties": {
+            "agentId": {"type": "string", "aliases": ["agent_id", "id"]},
+            "skill": {"type": "string", "aliases": ["slug", "name", "skillSlug"]},
+        },
+        "required": ["agentId", "skill"],
+    },
+    "unbind_skill": {
+        "properties": {
+            "agentId": {"type": "string", "aliases": ["agent_id", "id"]},
+            "skill": {"type": "string", "aliases": ["slug", "name", "skillSlug"]},
+        },
+        "required": ["agentId", "skill"],
+    },
+    # — Messaging —
+    "message_subordinate": {
+        "properties": {
+            "recipient": {"type": "string", "aliases": ["to", "target", "agentId", "agent_id"]},
+            "message": {"type": "string", "aliases": ["content", "body", "text"]},
+            "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
+        },
+        "required": ["recipient", "message"],
+    },
+    "message_superior": {
+        "properties": {
+            "message": {"type": "string", "aliases": ["content", "body", "text"]},
+            "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
+        },
+        "required": ["message"],
+    },
+    "message_peer": {
+        "properties": {
+            "recipient": {"type": "string", "aliases": ["to", "target", "agentId", "agent_id"]},
+            "message": {"type": "string", "aliases": ["content", "body", "text"]},
+        },
+        "required": ["recipient", "message"],
+    },
+    "message_team": {
+        "properties": {
+            "teamId": {"type": "string", "aliases": ["team_id", "team"]},
+            "message": {"type": "string", "aliases": ["content", "body", "text"]},
+        },
+        "required": ["teamId", "message"],
+    },
+    # — Dispatch + review —
+    "dispatch_task": {
+        "properties": {
+            "toAgentId": {"type": "string", "aliases": ["to_agent_id", "target", "recipient", "agentId"]},
+            "description": {"type": "string", "aliases": ["task", "message", "content", "summary"]},
+            "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
+        },
+        "required": ["toAgentId", "description"],
+    },
+    "review": {
+        "properties": {
+            "filePaths": {"type": "array", "items": {"type": "string"},
+                "aliases": ["files", "target", "path", "file", "module"]},
+            "reviewType": {"type": "string",
+                "aliases": ["review_type", "type"]},
+        },
+        "required": ["filePaths"],
+    },
+    "request_review": {
+        "properties": {
+            "reviewerId": {"type": "string", "aliases": ["reviewer_id", "reviewer", "target", "agentId"]},
+            "target": {"type": "string", "aliases": ["file", "path", "module", "description"]},
+            "reviewType": {"type": "string", "aliases": ["review_type", "type"]},
+        },
+        "required": ["reviewerId", "target"],
+    },
+    "review": {
+        "properties": {
+            "target": {"type": "string", "aliases": ["file", "path", "module", "code"]},
+            "reviewType": {"type": "string", "aliases": ["review_type", "type"]},
+        },
+        "required": ["target"],
+    },
+    "report_completion": {
+        "properties": {
+            "summary": {"type": "string", "aliases": ["message", "content", "report", "description"]},
+            "handoffId": {"type": "string", "aliases": ["handoff_id", "taskId", "task_id"]},
+        },
+        "required": ["summary"],
+    },
+    "approve_work": {
+        "properties": {
+            "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
+            "review": {"type": "string", "aliases": ["comment", "feedback", "notes"]},
+        },
+        "required": ["subordinate"],
+    },
+    "reject_work": {
+        "properties": {
+            "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
+            "reason": {"type": "string", "aliases": ["feedback", "review", "comment", "message"]},
+        },
+        "required": ["subordinate", "reason"],
+    },
+    "write_work_log": {
+        "properties": {
+            "summary": {"type": "string", "aliases": ["message", "content", "description"]},
+            "details": {"type": "string", "aliases": ["data", "extra"]},
+            "type": {"type": "string", "aliases": ["logType", "log_type"]},
+        },
+        "required": ["summary"],
+    },
+    # — Git worktrees —
+    "git_worktree_create": {
+        "properties": {
+            "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
+        },
+        "required": ["branchName"],
+    },
+    "git_worktree_list": {
+        "properties": {},
+        "required": [],
+    },
+    "git_worktree_merge": {
+        "properties": {
+            "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
+        },
+        "required": ["branchName"],
+    },
+    "git_worktree_remove": {
+        "properties": {
+            "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
+        },
+        "required": ["branchName"],
+    },
+    "git_worktree_status": {
+        "properties": {
+            "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
+        },
+        "required": [],
+    },
+    "git_worktree_checkpoint": {
+        "properties": {
+            "message": {"type": "string", "aliases": ["commitMessage", "commit_message", "summary"]},
+        },
+        "required": ["message"],
+    },
+    # — Network + file ops —
+    "webfetch": {
+        "properties": {
+            "url": {"type": "string", "aliases": ["link", "href", "address"]},
+            "prompt": {"type": "string", "aliases": ["query", "question", "instruction"]},
+        },
+        "required": ["url"],
+    },
+    "move_file": {
+        "properties": {
+            "source": {"type": "string", "aliases": ["from", "src", "sourcePath", "source_path"]},
+            "destination": {"type": "string", "aliases": ["to", "dst", "destPath", "dest_path", "target"]},
+        },
+        "required": ["source", "destination"],
+    },
+}
+
+def _resolve_alias_for_tool(arg_name: str, props: dict) -> str | None:
+    """Check if arg_name is an alias for any known parameter in this tool.
+
+    Returns the canonical parameter name, or None if unknown.
+    """
+    # Is it already a canonical name?
+    if arg_name in props:
+        return arg_name
+    # Check aliases
+    for prop_name, prop_schema in props.items():
+        if arg_name in prop_schema.get("aliases", []):
+            return prop_name
+    return None
+
+
+def validate_tool_args(tool_name: str, args: dict) -> tuple[dict, str | None]:
+    """Validate and normalize tool arguments against the schema.
+
+    Returns (normalized_args, error_message).
+    - normalized_args: args with aliases resolved to canonical names
+    - error_message: None if valid, else a helpful message listing
+      the tool's expected parameters and what was received
+    """
+    schema = TOOL_PARAM_SCHEMAS.get(tool_name)
+    if schema is None:
+        # Unknown tool — pass through as-is
+        return args, None
+
+    props: dict = schema.get("properties", {})
+    normalized: dict = {}
+    missing: list[str] = []
+    unknown: list[str] = []
+
+    # Check required params & resolve aliases (per-tool, no cross-tool leakage)
+    for req in schema.get("required", []):
+        found = False
+        for key, value in args.items():
+            if value is None:
+                continue
+            canonical = _resolve_alias_for_tool(key, props)
+            if canonical == req:
+                normalized[req] = value
+                found = True
+                break
+        if not found:
+            missing.append(req)
+
+    # Resolve remaining args through per-tool aliases
+    for key, value in args.items():
+        if key in normalized:  # already resolved as a required param
+            continue
+        canonical = _resolve_alias_for_tool(key, props)
+        if canonical is not None:
+            if canonical not in normalized:
+                normalized[canonical] = value
+        else:
+            unknown.append(key)
+
+    # Coerce types: wrap single string → array when schema expects array
+    for key, value in list(normalized.items()):
+        prop = props.get(key, {})
+        if prop.get("type") == "array" and isinstance(value, str):
+            normalized[key] = [value]
+        elif prop.get("type") == "boolean" and isinstance(value, str):
+            normalized[key] = value.lower() in ("true", "1", "yes")
+        elif prop.get("type") == "integer" and isinstance(value, str):
+            try:
+                normalized[key] = int(value)
+            except ValueError:
+                pass
+
+    if missing:
+        expected = ", ".join(f"'{r}'" for r in missing)
+        received = ", ".join(f"'{k}'" for k in args.keys()) if args else "(none)"
+        return normalized, (
+            f"Missing required parameters: {expected}. "
+            f"You passed: {received}. "
+            f"Please retry with the correct parameter names."
+        )
+
+    if unknown:
+        known = ", ".join(f"'{p}'" for p in props.keys())
+        unknown_str = ", ".join(f"'{u}'" for u in unknown)
+        return normalized, (
+            f"Unknown parameters: {unknown_str}. "
+            f"Expected: {known}. "
+            f"Please retry with correct parameter names."
+        )
+
+    return normalized, None
+
+
+def get_tool_schema_for_llm(tool_name: str) -> dict:
+    """Get a clean JSON Schema for sending to the LLM (no aliases, no internals).
+
+    Strips 'aliases' from property definitions so the LLM only sees canonical names.
+    """
+    schema = TOOL_PARAM_SCHEMAS.get(tool_name)
+    if schema is None:
+        return {"type": "object", "additionalProperties": True}
+    # Deep copy and strip aliases
+    import copy
+    clean: dict = {"type": "object"}
+    if "properties" in schema:
+        clean["properties"] = {}
+        for name, prop in schema["properties"].items():
+            clean_prop = {k: v for k, v in prop.items() if k != "aliases"}
+            clean["properties"][name] = clean_prop
+    if "required" in schema and schema["required"]:
+        clean["required"] = schema["required"]
+    return clean
+
+
 # ── Result type ────────────────────────────────────────────
 
 class ToolResult(dict):
@@ -113,6 +685,15 @@ class ToolExecutor:
 
         log.info("tool.execute", agent_id=agent_id, tool=name,
                  args_preview=str(tool_args)[:200])
+
+        # 1.5. Validate & normalize args against schema — auto-correct
+        # parameter name mistakes (e.g. LLM passes "query" → canonical "pattern")
+        normalized_args, validation_error = validate_tool_args(name, tool_args)
+        if validation_error:
+            log.info("tool.args_invalid", agent_id=agent_id, tool=name,
+                     error=validation_error[:200])
+            return self._error(f"Parameter error in '{name}': {validation_error}")
+        tool_args = normalized_args
 
         # 2. Permission evaluation
         try:
@@ -296,10 +877,11 @@ class ToolExecutor:
             )
 
         if name in (
-            "run_code_review", "run_security_audit", "run_tests",
+            "review", "run_code_review", "run_security_audit", "run_tests",
             "run_perf_audit", "run_full_review",
         ):
             review_type_map = {
+                "review": "full_review",
                 "run_code_review": "code_review",
                 "run_security_audit": "security_audit",
                 "run_tests": "test_review",
@@ -526,8 +1108,12 @@ class ToolExecutor:
             return await self._tool_delete_directory(agent_id, path, workspace_path)
 
         if name == "search_files":
-            pattern = args.get("pattern") or args.get("glob") or ""
-            directory = args.get("directory") or args.get("path") or "."
+            # Accept multiple param name variants — LLMs often guess wrong
+            pattern = (
+                args.get("pattern") or args.get("glob") or args.get("query")
+                or args.get("search") or args.get("name") or ""
+            )
+            directory = args.get("directory") or args.get("path") or args.get("dir") or "."
             if not pattern:
                 return self._error("search_files requires 'pattern' (glob pattern)")
             return await self._tool_search_files(agent_id, pattern, directory, workspace_path)
@@ -616,9 +1202,8 @@ class ToolExecutor:
             return self._error(result.get("message", "Failed to create worktree"))
 
         if name == "git_worktree_checkpoint":
-            task_name = args.get("taskName") or args.get("task_name") or args.get("task") or "checkpoint"
             message = args.get("message") or args.get("summary") or "checkpoint"
-            result = await gwt.checkpoint(workspace_path, short_id, str(task_name), str(message))
+            result = await gwt.checkpoint(workspace_path, short_id, str(message))
             if result.get("success"):
                 return {"success": True, "output": f"Checkpoint saved: {result.get('commit', 'unknown')}", "error": None}
             return self._error(result.get("message", "Failed to checkpoint"))
@@ -656,16 +1241,22 @@ class ToolExecutor:
         return self._error(f"Unknown git worktree operation: {name}")
 
     # ── File management tool implementations (BUG-036) ───
+    # P0 安全修复：所有内联文件工具复用 file.py 的 _resolve_safe() + 敏感检查，
+    # 不再使用有漏洞的 startswith() 前缀匹配。
 
     async def _tool_delete_file(
         self, agent_id: str, path: str, workspace: str
     ) -> dict:
         """Delete a file from the workspace."""
-        from pathlib import Path
-        ws = Path(workspace)
-        target = (ws / path).resolve()
-        if not str(target).startswith(str(ws.resolve())):
+        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir, _is_sensitive
+        resolved = _resolve_safe(workspace, path)
+        if resolved is None:
             return self._error(f"Path traversal denied: {path}")
+        if _check_hiveweave_dir(resolved, workspace):
+            return self._error("Access denied: cannot modify .hiveweave directory")
+        if _is_sensitive(resolved):
+            return self._error(f"Access denied: '{path}' is a sensitive file")
+        target = Path(resolved)
         if not target.exists():
             return self._error(f"File not found: {path}")
         try:
@@ -678,12 +1269,17 @@ class ToolExecutor:
         self, agent_id: str, src: str, dst: str, workspace: str
     ) -> dict:
         """Move or rename a file."""
-        from pathlib import Path
-        ws = Path(workspace).resolve()
-        source = (ws / src).resolve()
-        dest = (ws / dst).resolve()
-        if not str(source).startswith(str(ws)) or not str(dest).startswith(str(ws)):
+        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir, _is_sensitive
+        src_resolved = _resolve_safe(workspace, src)
+        dst_resolved = _resolve_safe(workspace, dst)
+        if src_resolved is None or dst_resolved is None:
             return self._error("Path traversal denied")
+        if _check_hiveweave_dir(src_resolved, workspace) or _check_hiveweave_dir(dst_resolved, workspace):
+            return self._error("Access denied: cannot modify .hiveweave directory")
+        if _is_sensitive(src_resolved) or _is_sensitive(dst_resolved):
+            return self._error("Access denied: cannot move sensitive files")
+        source = Path(src_resolved)
+        dest = Path(dst_resolved)
         if not source.exists():
             return self._error(f"Source not found: {src}")
         try:
@@ -697,13 +1293,14 @@ class ToolExecutor:
         self, agent_id: str, path: str, workspace: str
     ) -> dict:
         """Create a new directory."""
-        from pathlib import Path
-        ws = Path(workspace).resolve()
-        target = (ws / path).resolve()
-        if not str(target).startswith(str(ws)):
+        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir
+        resolved = _resolve_safe(workspace, path)
+        if resolved is None:
             return self._error(f"Path traversal denied: {path}")
+        if _check_hiveweave_dir(resolved, workspace):
+            return self._error("Access denied: cannot modify .hiveweave directory")
         try:
-            target.mkdir(parents=True, exist_ok=True)
+            Path(resolved).mkdir(parents=True, exist_ok=True)
             return {"success": True, "output": f"Created directory: {path}", "error": None}
         except Exception as e:
             return self._error(f"Failed to create directory: {e}")
@@ -712,12 +1309,14 @@ class ToolExecutor:
         self, agent_id: str, path: str, workspace: str
     ) -> dict:
         """Delete a directory and its contents."""
-        from pathlib import Path
         import shutil
-        ws = Path(workspace).resolve()
-        target = (ws / path).resolve()
-        if not str(target).startswith(str(ws)):
+        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir
+        resolved = _resolve_safe(workspace, path)
+        if resolved is None:
             return self._error(f"Path traversal denied: {path}")
+        if _check_hiveweave_dir(resolved, workspace):
+            return self._error("Access denied: cannot modify .hiveweave directory")
+        target = Path(resolved)
         if not target.exists():
             return self._error(f"Directory not found: {path}")
         if not target.is_dir():
@@ -732,15 +1331,22 @@ class ToolExecutor:
         self, agent_id: str, pattern: str, directory: str, workspace: str
     ) -> dict:
         """Search for files by glob pattern."""
-        from pathlib import Path
+        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir
         ws = Path(workspace).resolve()
-        search_dir = (ws / directory).resolve() if directory != "." else ws
-        if not str(search_dir).startswith(str(ws)):
+        if directory != ".":
+            resolved = _resolve_safe(workspace, directory)
+            if resolved is None:
+                return self._error(f"Path traversal denied: {directory}")
+            search_dir = Path(resolved)
+        else:
             search_dir = ws
         try:
             matches = sorted(search_dir.rglob(pattern))
-            # Limit results
-            matches = [m for m in matches[:200] if ".hiveweave" not in str(m)]
+            # 排除 .hiveweave 目录下的文件
+            matches = [
+                m for m in matches[:200]
+                if not _check_hiveweave_dir(str(m), workspace)
+            ]
             paths = [str(m.relative_to(ws)) for m in matches[:50]]
             if not paths:
                 return {"success": True, "output": f"No files matching '{pattern}'", "error": None}
@@ -970,16 +1576,94 @@ class ToolExecutor:
         return {"success": True, "output": f"Alarm {alarm_id[:8]}... cancellation requested.", "error": None}
 
     # ── Web fetch (OpenCode parity, BUG-036) ──────────────
+    # P0 安全修复：scheme 校验 + SSRF 防护 + 流式读取 + content-length 检查
+
+    # SSRF 防护：禁止访问内网地址
+    _SSRF_BLOCKED_HOSTS = frozenset({
+        "localhost", "127.0.0.1", "0.0.0.0", "::1",
+        "169.254.169.254",  # 云元数据
+        "metadata.google.internal",
+    })
+
+    @staticmethod
+    def _is_ssrf_blocked(host: str) -> bool:
+        """Check if a host is an internal/blocked address."""
+        host_lower = host.lower().rstrip(".")
+        if host_lower in ToolExecutor._SSRF_BLOCKED_HOSTS:
+            return True
+        # Block private IP ranges
+        try:
+            import ipaddress
+            ip = ipaddress.ip_address(host_lower)
+            return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+        except ValueError:
+            pass  # Not an IP, it's a hostname
+        # Block common internal hostnames
+        if host_lower.endswith(".internal") or host_lower.endswith(".local"):
+            return True
+        return False
 
     async def _tool_webfetch(
         self, agent_id: str, url: str, prompt: str
     ) -> dict:
-        """Fetch a URL and convert to text, optionally answering a prompt."""
+        """Fetch a URL and convert to text, optionally answering a prompt.
+
+        P0 安全修复：
+        - scheme 校验：只允许 http/https
+        - SSRF 防护：拒绝内网 IP / localhost / 链路本地地址
+        - content-length 预检：拒绝 >5MB 响应
+        - 流式读取：避免全量缓冲撑爆内存
+        """
         import httpx
+        from urllib.parse import urlparse
+
+        # 1. URL scheme 校验
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return self._error(f"Invalid URL scheme: {parsed.scheme}. Only http/https allowed.")
+        if not parsed.hostname:
+            return self._error("Invalid URL: no hostname")
+
+        # 2. SSRF 防护
+        if self._is_ssrf_blocked(parsed.hostname):
+            return self._error(f"Access denied: cannot fetch internal address {parsed.hostname}")
+
         try:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            # 3. 先 HEAD 请求检查 content-length（如果服务器支持）
+            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+                # HEAD 请求预检
+                try:
+                    head_resp = await client.head(url, headers={"User-Agent": "HiveWeave/1.0"})
+                    cl = head_resp.headers.get("content-length")
+                    if cl and int(cl) > 5_000_000:
+                        return self._error(f"Response too large: {int(cl)} bytes (max 5MB)")
+                except Exception:
+                    pass  # 有些服务器不支持 HEAD，继续 GET
+
+                # GET 请求 — 不自动跟随重定向，手动校验每个重定向目标
                 resp = await client.get(url, headers={"User-Agent": "HiveWeave/1.0"})
-                html = resp.text[:500_000]  # Cap at 500KB
+                # 手动处理重定向（最多 5 次），每次校验目标 URL
+                redirects = 0
+                while resp.is_redirect and redirects < 5:
+                    loc = resp.headers.get("location", "")
+                    if not loc:
+                        break
+                    # 构建完整重定向 URL
+                    redirect_url = str(httpx.URL(url).join(loc))
+                    redirect_parsed = urlparse(redirect_url)
+                    if redirect_parsed.scheme not in ("http", "https"):
+                        return self._error(f"Redirect to non-http scheme blocked: {redirect_parsed.scheme}")
+                    if self._is_ssrf_blocked(redirect_parsed.hostname):
+                        return self._error(f"Redirect to internal address blocked: {redirect_parsed.hostname}")
+                    url = redirect_url
+                    resp = await client.get(url, headers={"User-Agent": "HiveWeave/1.0"})
+                    redirects += 1
+
+                # 4. 流式读取 + 大小限制
+                content_length = len(resp.content)
+                if content_length > 5_000_000:
+                    return self._error(f"Response too large: {content_length} bytes (max 5MB)")
+                html = resp.text[:500_000]  # Cap at 500KB for processing
         except Exception as e:
             return self._error(f"Failed to fetch {url}: {e}")
 
@@ -988,6 +1672,9 @@ class ToolExecutor:
         text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"<[^>]+>", " ", text)
+        # 解码常见 HTML 实体
+        import html as html_mod
+        text = html_mod.unescape(text)
         text = re.sub(r"\s+", " ", text).strip()
         # Trim to reasonable size
         text = text[:20_000]
@@ -1151,6 +1838,42 @@ class ToolExecutor:
         if not project_id:
             return self._error(f"Agent {agent_id} has no project_id")
 
+        # Handle "user" / "用户" as a special recipient — write to chat_messages
+        # so the message appears in the user's Chat window. This is the only
+        # way for agents to proactively notify the user (trigger-based assistant
+        # text is marked is_background=True and doesn't show in Chat).
+        user_aliases = {"user", "用户", "boss", "老板"}
+        user_recipients = [r for r in recipients if r.strip().lower() in user_aliases]
+        agent_recipients = [r for r in recipients if r.strip().lower() not in user_aliases]
+
+        results = []
+        if user_recipients:
+            from hiveweave.services.chat_message import ChatMessageService
+            chat_service = ChatMessageService()
+            await chat_service.save_message({
+                "agent_id": agent_id,
+                "role": "assistant",
+                "content": message,
+                "thinking": None,
+                "tool_calls": "[]",
+                "is_streaming": False,
+                "is_background": False,
+            })
+            # Push via WebSocket so the frontend updates in real-time
+            from hiveweave.realtime.event_bus import event_bus
+            await event_bus.publish_chat_message(
+                project_id=project_id,
+                agent_id=agent_id,
+                role="assistant",
+                content=message,
+            )
+            results.append({"to": "user", "message_id": "user-msg"})
+
+        # Resolve remaining agent recipients
+        recipients = agent_recipients
+        if not recipients:
+            return {"ok": True, "results": results}
+
         # Resolve each recipient: short_id (A001) or name → agent record
         all_agents = await self._org.list_agents(project_id)
         resolved = []
@@ -1176,17 +1899,24 @@ class ToolExecutor:
                         match = a
                         break
             if match:
+                # Skip self — sending to yourself is a no-op
+                if match["id"] == agent_id:
+                    log.info("send_message_self_skip", agent_id=agent_id,
+                             recipient=r, match_name=match.get("name"))
+                    continue
                 resolved.append(match)
             else:
                 not_found.append(r)
 
         if not resolved:
+            # If we already sent to user, return partial success
+            if results:
+                return {"ok": True, "results": results, "not_found": not_found}
             return self._error(
                 f"No recipients found. Unknown: {not_found}. "
                 f"Available agents: {[(a['name'], a.get('short_id'), a.get('role')) for a in all_agents]}"
             )
 
-        results = []
         # BUG-034: Also record team chat for the SENDER so they can see
         # "发送 → RecipientName" in their team comms panel. Previously only
         # the recipient's inbox was written — sender had no record.
@@ -1324,10 +2054,8 @@ class ToolExecutor:
                 ms = ModelService()
                 active = await ms.list_active()
                 if active:
-                    # 优先选非 free 的 step 系列模型，否则第一个 active
-                    step_models = [m for m in active if "step" in (m.get("model_id") or "").lower()]
-                    non_free = [m for m in active if not (m.get("is_free") or m.get("free", False))]
-                    chosen = step_models[0] if step_models else (non_free[0] if non_free else active[0])
+                    # 选最新的 active 模型（用户最近加的就是首选）
+                    chosen = active[-1]
                     model_id = chosen.get("model_id") or chosen.get("id")
                     log.info("tool.hire_agent.model_from_service", model_id=model_id)
             except Exception as e:
@@ -1386,6 +2114,15 @@ class ToolExecutor:
             log.info("tool.hire_agent", agent_id=agent_id,
                      new_agent_id=new_id, new_short_id=new_short,
                      name=name, role=role)
+
+            # Push realtime event so frontend org tree updates immediately
+            try:
+                from hiveweave.realtime.event_bus import status_event_bus
+                await status_event_bus.publish_agent_created(new_id, role, name)
+                await status_event_bus.publish_org_changed()
+            except Exception as evt_err:
+                log.debug("hire_agent_event_push_failed", error=str(evt_err))
+
             return {
                 "success": True,
                 "output": (

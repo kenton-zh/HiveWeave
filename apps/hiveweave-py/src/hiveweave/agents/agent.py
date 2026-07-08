@@ -47,6 +47,7 @@ from hiveweave.services.skill_registry import SkillRegistryService
 from hiveweave.services.system_state import system_state
 from hiveweave.services.work_log import WorkLogService
 from hiveweave.tools.executor import ToolExecutor
+from hiveweave.tools.review import ReviewLLMCallback
 
 log = structlog.get_logger(__name__)
 
@@ -325,6 +326,182 @@ _TOOL_SCHEMAS: dict[str, dict] = {
             },
         },
     },
+    # BUG-036: edit_file schema — LLM needs explicit parameter names to avoid
+    # guessing wrong field names (oldText/newText vs oldString/newString)
+    "edit_file": {
+        "type": "object",
+        "properties": {
+            "filePath": {
+                "type": "string",
+                "description": "Path to the file to edit (relative to workspace or absolute).",
+            },
+            "oldString": {
+                "type": "string",
+                "description": "The exact text to search for in the file. Must be unique — if it matches multiple places, the edit fails. Include enough context lines to make it unique.",
+            },
+            "newString": {
+                "type": "string",
+                "description": "The replacement text. Use empty string to delete the matched text.",
+            },
+        },
+        "required": ["filePath", "oldString", "newString"],
+    },
+    # apply_patch schema — supports both single-patch and multi-patch format
+    "apply_patch": {
+        "type": "object",
+        "properties": {
+            "patches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "enum": ["add", "update", "delete"],
+                            "description": "Operation: add (create new file), update (search-and-replace), delete (remove file).",
+                        },
+                        "filePath": {
+                            "type": "string",
+                            "description": "Path to the file (relative to workspace or absolute).",
+                        },
+                        "oldString": {
+                            "type": "string",
+                            "description": "(update only) Text to search for. Must be unique in the file.",
+                        },
+                        "newString": {
+                            "type": "string",
+                            "description": "(update only) Replacement text.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "(add only) Full content for the new file.",
+                        },
+                    },
+                    "required": ["op", "filePath"],
+                },
+                "description": "List of patch operations to apply.",
+            },
+        },
+        "required": ["patches"],
+    },
+    # bash schema — LLM needs to know parameter names
+    "bash": {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "The shell command to execute.",
+            },
+            "workdir": {
+                "type": "string",
+                "description": "Working directory (relative to workspace). Defaults to workspace root.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in milliseconds. Default 120000 (2 min), max 600000 (10 min).",
+            },
+        },
+        "required": ["command"],
+    },
+    # read_file schema
+    "read_file": {
+        "type": "object",
+        "properties": {
+            "filePath": {
+                "type": "string",
+                "description": "Path to the file to read (relative to workspace or absolute).",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Line number to start reading from (0-based). Default 0.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines to read. Default 2000.",
+            },
+        },
+        "required": ["filePath"],
+    },
+    # write_file schema
+    "write_file": {
+        "type": "object",
+        "properties": {
+            "filePath": {
+                "type": "string",
+                "description": "Path to the file to write (relative to workspace or absolute).",
+            },
+            "content": {
+                "type": "string",
+                "description": "Full content to write to the file.",
+            },
+        },
+        "required": ["filePath", "content"],
+    },
+    # list_files schema
+    "list_files": {
+        "type": "object",
+        "properties": {
+            "dirPath": {
+                "type": "string",
+                "description": "Directory path (relative to workspace). Defaults to workspace root.",
+            },
+            "recursive": {
+                "type": "boolean",
+                "description": "If true, list files recursively. Default false.",
+            },
+        },
+    },
+    # grep schema
+    "grep": {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Regex pattern to search for.",
+            },
+            "path": {
+                "type": "string",
+                "description": "Directory or file to search in (relative to workspace).",
+            },
+            "include": {
+                "type": "string",
+                "description": "File glob pattern to filter (e.g. '*.py').",
+            },
+            "context": {
+                "type": "integer",
+                "description": "Lines of context around matches. Default 0.",
+            },
+        },
+        "required": ["pattern"],
+    },
+    # run_code_review / run_tests / etc schema
+    "run_code_review": {
+        "type": "object",
+        "properties": {
+            "filePaths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of file paths to review.",
+            },
+        },
+        "required": ["filePaths"],
+    },
+    "run_tests": {
+        "type": "object",
+        "properties": {
+            "filePaths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of source file paths to analyze for test coverage.",
+            },
+            "testFiles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of test file paths to analyze.",
+            },
+        },
+        "required": ["filePaths"],
+    },
 }
 
 
@@ -339,10 +516,9 @@ def _build_tool_definitions(tool_names: list[str]) -> list[dict]:
     tools: list[dict] = []
     for name in tool_names:
         desc = _TOOL_DESCRIPTIONS.get(name, f"Execute the {name} tool.")
-        params = _TOOL_SCHEMAS.get(name) or {
-            "type": "object",
-            "additionalProperties": True,
-        }
+        # Use centralized schema from executor (with proper params, no more guessing)
+        from hiveweave.tools.executor import get_tool_schema_for_llm
+        params = get_tool_schema_for_llm(name)
         tools.append(
             {
                 "type": "function",
@@ -423,6 +599,7 @@ class Agent:
         self.pending_inbox_msg_ids: list[str] | None = None
         self.current_job: dict | None = None
         self._cancel_reason: str | None = None
+        self._message_queue: list[tuple[str, dict, int]] = []
 
         # ── asyncio 原语 ──
         self._llm_task: asyncio.Task | None = None
@@ -435,7 +612,10 @@ class Agent:
 
         # ── 服务实例 ──
         self._streamer: Streamer | None = None  # 延迟创建（需要 role）
-        self._tool_executor = ToolExecutor(permission_service, approval_service)
+        self._tool_executor = ToolExecutor(
+            permission_service, approval_service,
+            review_llm_callback=self._review_llm_callback,
+        )
         self._conversation = conversation_store
         self._inbox = InboxService()
         self._org = OrgService()
@@ -499,8 +679,16 @@ class Agent:
                             trigger_fail_count=trigger_fail_count,
                         )
                         # 延迟导入避免循环
-                        from hiveweave.agents.trigger import trigger_subordinate
-                        await trigger_subordinate(self.id)
+                        from hiveweave.agents.trigger import (
+                            is_coordinator,
+                            trigger_coordinator,
+                            trigger_subordinate,
+                        )
+                        role = self.config.get("role", "")
+                        if is_coordinator(role):
+                            await trigger_coordinator(self.id)
+                        else:
+                            await trigger_subordinate(self.id)
 
                         # BUG-010 增强：短暂等待后检查 trigger 是否真的
                         # 启动了处理。如果 idle 且仍有 pending，说明 trigger
@@ -558,9 +746,19 @@ class Agent:
         opts = opts or {}
 
         async with self._lock:
-            # 检查 busy
+            # 检查 busy → queue the message instead of dropping it
             if self.status == AgentState.PROCESSING:
-                return {"error": "busy"}
+                self._message_queue.append((message, opts, int(time.time() * 1000)))
+                # Save to chat_history so the message persists in the UI
+                await self._chat_msg.save_message({
+                    "agent_id": self.id, "role": "user",
+                    "content": message,
+                    "is_background": False, "is_read": False,
+                })
+                log.info("chat_queued", agent_id=self.id,
+                         queue_len=len(self._message_queue),
+                         preview=message[:80])
+                return {"ok": True, "queued": True}
 
             # 检查暂停
             if system_state.paused():
@@ -903,6 +1101,46 @@ class Agent:
             return None
         return await self._model_service.get(model_id)
 
+    async def _review_llm_callback(self, system_prompt: str, user_prompt: str) -> str:
+        """LLM callback for review tools — makes a non-streaming LLM call.
+
+        Uses the agent's model config + provider to call the LLM with
+        system_prompt + user_prompt and return the text response.
+        This is used by run_code_review / run_tests / etc.
+        """
+        model_config = await self._get_model_config()
+        if model_config is None:
+            raise RuntimeError("No model configured for review LLM callback")
+
+        from hiveweave.llm.provider import provider_factory
+        provider = provider_factory.create(model_config)
+
+        import httpx
+        body = provider.build_body(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            stream=False,
+            temperature=0.3,
+        )
+        headers = provider.build_headers()
+        # Non-streaming: override Accept header
+        headers["Accept"] = "application/json"
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+        ) as client:
+            resp = await client.post(
+                provider.build_url(), json=body, headers=headers
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choices = data.get("choices", [])
+            if choices:
+                return choices[0].get("message", {}).get("content", "")
+            return ""
+
     async def _get_tool_definitions(self) -> list[dict]:
         """获取工具定义列表。
 
@@ -1052,7 +1290,10 @@ class Agent:
             "agentId": self.id,
         })
 
-        # 6. 自检 re-trigger
+        # 6. Process queued user messages (sent while agent was busy)
+        await self._drain_message_queue()
+
+        # 7. 自检 re-trigger
         await self._maybe_self_retrigger()
 
     async def _handle_empty_response(
@@ -1318,6 +1559,19 @@ class Agent:
             await trigger_subordinate(self.id)
 
     # ── 内部: 状态管理 ────────────────────────────────────────
+
+    async def _drain_message_queue(self) -> None:
+        """Process queued user messages that arrived while the agent was busy."""
+        if not self._message_queue:
+            return
+        message, opts, _ts = self._message_queue.pop(0)
+        log.info("chat_dequeued", agent_id=self.id,
+                 remaining=len(self._message_queue),
+                 preview=message[:80])
+        # Process asynchronously — don't block the current completion
+        import asyncio
+        # Use chat() to go through normal flow (acquires lock, sets PROCESSING)
+        await self.chat(message, opts)
 
     def _reset_to_idle(self) -> None:
         """重置到 idle 状态。

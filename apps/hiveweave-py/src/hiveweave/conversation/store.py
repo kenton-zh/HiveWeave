@@ -43,7 +43,17 @@ class ConversationStore:
         self._cache: dict[tuple[str, str], list[dict]] = {}
         # 压缩摘要缓存：(project_id, agent_id) -> summary_text
         self._prefix_cache: dict[tuple[str, str], str] = {}
+        # per-agent 压缩锁 — 防止同一 agent 并发压缩导致竞态丢消息
+        self._compaction_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._compaction = Compaction()
+
+    def _get_compaction_lock(self, key: tuple[str, str]) -> asyncio.Lock:
+        """获取或创建 per-agent 压缩锁。"""
+        lock = self._compaction_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._compaction_locks[key] = lock
+        return lock
 
     # ── 公共 API ─────────────────────────────────────────────
 
@@ -55,6 +65,9 @@ class ConversationStore:
         if key not in self._cache:
             loaded = await self._load_from_db(agent_id)
             self._cache[key] = self._clean_messages(loaded)
+            # 加载持久化的压缩摘要（CRITICAL #1 持久化修复）
+            if key not in self._prefix_cache:
+                await self._load_compacted_prefix(agent_id, project_id)
         cleaned = self._clean_messages(self._cache[key])
         return self._trim_to_budget(cleaned, token_budget)
 
@@ -68,6 +81,9 @@ class ConversationStore:
         if key not in self._cache:
             loaded = await self._load_from_db(agent_id)
             existing = self._clean_messages(loaded)
+            # 加载持久化的压缩摘要（CRITICAL #1 持久化修复）
+            if key not in self._prefix_cache:
+                await self._load_compacted_prefix(agent_id, project_id)
         else:
             existing = self._clean_messages(self._cache[key])
 
@@ -90,6 +106,7 @@ class ConversationStore:
         key = (project_id, agent_id)
         self._cache.pop(key, None)
         self._prefix_cache.pop(key, None)
+        self._compaction_locks.pop(key, None)
         try:
             await project_db.execute(
                 agent_id,
@@ -103,6 +120,7 @@ class ConversationStore:
         """清空所有内存缓存（不删 DB）— 启动时调用。"""
         self._cache.clear()
         self._prefix_cache.clear()
+        self._compaction_locks.clear()
 
     def get_compacted_prefix(self, project_id: str, agent_id: str) -> str | None:
         """获取压缩摘要（DeepSeek 前缀缓存 System 3 布局）。"""
@@ -126,8 +144,11 @@ class ConversationStore:
         messages = self._cache.get(key) or await self._load_from_db(agent_id)
         if not messages:
             return False
-        logger.info("model_switch_compact", agent_id=agent_id, budget=budget)
-        await self._do_compaction(agent_id, project_id, key, messages, budget)
+        # 对齐读取预算（#4）
+        read_budget = max(new_context_window // 2, 16_000)
+        target_budget = min(budget, read_budget)
+        logger.info("model_switch_compact", agent_id=agent_id, budget=target_budget)
+        await self._do_compaction(agent_id, project_id, key, messages, target_budget)
         return True
 
     # ── Compaction ──────────────────────────────────────────
@@ -139,48 +160,100 @@ class ConversationStore:
         ctx = await self._get_agent_context_window(agent_id)
         budget = self._compaction.check_overflow(total, ctx)
         if budget is not None:
-            logger.info("compaction_triggered", agent_id=agent_id, total=total)
+            # 压缩目标对齐读取预算 — _build_messages 用 ctx//2 读取，
+            # 压缩后 cache 应在此值以下，否则压缩对读取路径无帮助（#4）。
+            read_budget = max(ctx // 2, 16_000)
+            target_budget = min(budget, read_budget)
+            logger.info(
+                "compaction_triggered",
+                agent_id=agent_id,
+                total=total,
+                target=target_budget,
+            )
             asyncio.create_task(
-                self._do_compaction(agent_id, project_id, key, messages, budget)
+                self._do_compaction(agent_id, project_id, key, messages, target_budget)
             )
 
     async def _do_compaction(self, agent_id, project_id, key, messages, budget) -> None:
+        lock = self._get_compaction_lock(key)
+        if lock.locked():
+            # 已有压缩在进行 — 跳过，下次 append_turn 会重新检查
+            logger.info("compaction_skipped_concurrent", agent_id=agent_id)
+            return
+        async with lock:
+            try:
+                callback = await resolve_compactor_callback(agent_id)
+                compacted = await self._compaction.compact(messages, budget, callback)
+
+                # 提取摘要到 prefix_cache，history 不含 summary（RECONCILE A1）
+                summary_text = None
+                history = []
+                for m in compacted:
+                    content = m.get("content") or ""
+                    if m.get("role") == "system" and SUMMARY_MARKER in content:
+                        summary_text = content
+                    else:
+                        history.append(m)
+
+                # C3 fix: merge 而非覆盖 — _do_compaction 是 fire-and-forget task，
+                # 耗时数秒，期间 append_turn 可能在 self._cache[key] 追加了新消息。
+                # 直接覆盖会丢失这些新消息。这里读取当前缓存尾部（压缩期间新增的）
+                # 追加到压缩结果后面再写回缓存。
+                original_len = len(messages)
+                current_cache = self._cache.get(key, [])
+                if len(current_cache) > original_len:
+                    # 压缩期间新增的消息 = 当前缓存中超出原始 messages 数量的尾部
+                    new_messages = current_cache[original_len:]
+                    history = history + new_messages
+
+                self._cache[key] = history
+                if summary_text is not None:
+                    self._prefix_cache[key] = summary_text
+
+                # 持久化压缩结果到 DB — 删除旧 turn 行，写入压缩后的 turn
+                # 防止重启后从 DB 加载到已压缩的旧消息（CRITICAL #1）
+                await self._persist_compaction(agent_id, history, summary_text)
+
+                logger.info(
+                    "compaction_applied",
+                    agent_id=agent_id,
+                    kept=len(history),
+                    has_summary=summary_text is not None,
+                )
+            except Exception as e:
+                logger.warning("compaction_error", agent_id=agent_id, error=str(e))
+
+    async def _persist_compaction(
+        self, agent_id: str, history: list[dict], summary: str | None
+    ) -> None:
+        """持久化压缩结果：删除旧 turn 行，写入压缩后的 turn + summary。
+
+        防止重启后 _load_from_db 加载到已压缩的旧消息（CRITICAL #1）。
+        summary 存入 agents 表的 compacted_prefix 列（如果存在），
+        或作为特殊 turn 行写入 conversation_turns 表。
+        """
         try:
-            callback = await resolve_compactor_callback(agent_id)
-            compacted = await self._compaction.compact(messages, budget, callback)
-
-            # 提取摘要到 prefix_cache，history 不含 summary（RECONCILE A1）
-            summary_text = None
-            history = []
-            for m in compacted:
-                content = m.get("content") or ""
-                if m.get("role") == "system" and SUMMARY_MARKER in content:
-                    summary_text = content
-                else:
-                    history.append(m)
-
-            # C3 fix: merge 而非覆盖 — _do_compaction 是 fire-and-forget task，
-            # 耗时数秒，期间 append_turn 可能在 self._cache[key] 追加了新消息。
-            # 直接覆盖会丢失这些新消息。这里读取当前缓存尾部（压缩期间新增的）
-            # 追加到压缩结果后面再写回缓存。
-            original_len = len(messages)
-            current_cache = self._cache.get(key, [])
-            if len(current_cache) > original_len:
-                # 压缩期间新增的消息 = 当前缓存中超出原始 messages 数量的尾部
-                new_messages = current_cache[original_len:]
-                history = history + new_messages
-
-            self._cache[key] = history
-            if summary_text is not None:
-                self._prefix_cache[key] = summary_text
-            logger.info(
-                "compaction_applied",
-                agent_id=agent_id,
-                kept=len(history),
-                has_summary=summary_text is not None,
+            # 删除所有旧 turn
+            await project_db.execute(
+                agent_id,
+                "DELETE FROM conversation_turns WHERE agent_id = ?",
+                [agent_id],
             )
+            # 写入压缩后的 history 为单个 turn
+            if history:
+                await self._persist_turn(agent_id, history)
+            # summary 持久化到 agent 配置（通过 meta DB）
+            if summary is not None:
+                try:
+                    await meta_db.execute(
+                        "UPDATE agents SET compacted_prefix = ? WHERE id = ?",
+                        [summary, agent_id],
+                    )
+                except Exception:
+                    # compacted_prefix 列可能不存在（旧 schema）— 忽略
+                    pass
         except Exception as e:
-            logger.warning("compaction_error", agent_id=agent_id, error=str(e))
+            logger.warning("persist_compaction_failed", agent_id=agent_id, error=str(e))
 
     async def _get_agent_context_window(self, agent_id: str) -> int:
         try:
@@ -329,6 +402,26 @@ class ConversationStore:
         except Exception as e:
             logger.warning("load_from_db_failed", agent_id=agent_id, error=str(e))
             return []
+
+    async def _load_compacted_prefix(
+        self, agent_id: str, project_id: str
+    ) -> None:
+        """从 Meta DB 加载持久化的压缩摘要到 _prefix_cache。
+
+        CRITICAL #1 修复：重启后 _prefix_cache 为空，需从 agents.compacted_prefix
+        列恢复，否则 agent 重新面对完整未压缩历史。
+        """
+        key = (project_id, agent_id)
+        try:
+            row = await meta_db.query_one(
+                "SELECT compacted_prefix FROM agents WHERE id = ? LIMIT 1",
+                [agent_id],
+            )
+            if row and row["compacted_prefix"]:
+                self._prefix_cache[key] = row["compacted_prefix"]
+        except Exception as e:
+            # compacted_prefix 列可能不存在（旧 schema 未迁移）— 静默跳过
+            logger.debug("load_compacted_prefix_skipped", agent_id=agent_id, error=str(e))
 
     async def _persist_turn(self, agent_id: str, messages: list[dict]) -> None:
         try:

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -39,6 +40,7 @@ class ModelCreate(BaseModel):
     modelId: str | None = None
     baseUrl: str | None = None
     apiKey: str | None = None
+    providerType: str | None = None  # openai/anthropic/google/openai-compatible
     contextWindow: int | None = None
     maxOutputTokens: int | None = None
     supportsThinking: bool | None = None
@@ -54,6 +56,7 @@ class ModelUpdate(BaseModel):
     modelId: str | None = None
     baseUrl: str | None = None
     apiKey: str | None = None
+    providerType: str | None = None  # openai/anthropic/google/openai-compatible
     contextWindow: int | None = None
     maxOutputTokens: int | None = None
     supportsThinking: bool | None = None
@@ -69,6 +72,7 @@ def _normalize_attrs(body: BaseModel) -> dict:
         "modelId": "model_id",
         "baseUrl": "base_url",
         "apiKey": "api_key",
+        "providerType": "provider_type",
         "contextWindow": "context_window",
         "maxOutputTokens": "max_output_tokens",
         "supportsThinking": "supports_thinking",
@@ -92,6 +96,8 @@ def _model_response(model: dict) -> dict:
         "baseUrl": model.get("base_url"),
         "api_key": model.get("api_key"),
         "apiKey": model.get("api_key"),
+        "provider_type": model.get("provider_type"),
+        "providerType": model.get("provider_type"),
         "context_window": model.get("context_window"),
         "contextWindow": model.get("context_window"),
         "max_output_tokens": model.get("max_output_tokens"),
@@ -179,9 +185,10 @@ async def delete_model(model_id: str) -> dict:
 
 @router.post("/{model_id}/test")
 async def test_model(model_id: str) -> dict:
-    """探测请求 — POST {base_url}/chat/completions 测延迟。
+    """探测请求 — 使用多格式 handler 测延迟。
 
     契约 19 特别流程 5: 15s 超时，返回 {ok, latencyMs, response|error}。
+    支持所有 provider 格式（OpenAI/Anthropic/Google/OpenAI-compatible）。
     """
     model = await _model.get(model_id)
     if model is None:
@@ -191,33 +198,55 @@ async def test_model(model_id: str) -> dict:
     api_key = model.get("api_key") or ""
     model_name = model.get("model_id") or ""
 
+    # Use format handler to build correct URL/headers/body per provider
+    from hiveweave.llm.provider import ProviderFactory, provider_factory
+
+    factory: ProviderFactory = provider_factory
+    try:
+        config = factory.create(model)
+    except ValueError as e:
+        return {"ok": False, "latencyMs": 0, "error": str(e)}
+
+    url = config.build_url()
+    headers = config.build_headers()
+    body = config.build_body(
+        messages=[{"role": "user", "content": "Say 'OK' and nothing else."}],
+        stream=False,
+        max_tokens=10,
+        tools=None,
+    )
+
     start = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
             resp = await client.post(
-                f"{base_url}/chat/completions",
-                json={
-                    "model": model_name,
-                    "messages": [
-                        {"role": "user", "content": "Say 'OK' and nothing else."}
-                    ],
-                    "max_tokens": 10,
-                },
-                headers={
-                    "content-type": "application/json",
-                    "authorization": f"Bearer {api_key}",
-                },
+                url,
+                json=body,
+                headers=headers,
             )
         latency_ms = int((time.perf_counter() - start) * 1000)
         if resp.status_code == 200:
             data = resp.json()
+            # Try OpenAI format first
             choices = data.get("choices") or []
-            response_text = ""
             if choices:
-                response_text = (
-                    choices[0].get("message", {}).get("content", "")
-                )
-            return {"ok": True, "latencyMs": latency_ms, "response": response_text}
+                response_text = choices[0].get("message", {}).get("content", "")
+                return {"ok": True, "latencyMs": latency_ms, "response": response_text}
+            # Try Anthropic format
+            content_blocks = data.get("content") or []
+            if content_blocks:
+                for block in content_blocks:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        return {"ok": True, "latencyMs": latency_ms, "response": block.get("text", "")}
+            # Try Gemini format
+            candidates = data.get("candidates") or []
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts") or []
+                for part in parts:
+                    if isinstance(part, dict) and "text" in part:
+                        return {"ok": True, "latencyMs": latency_ms, "response": part["text"]}
+            # Generic — return raw JSON preview
+            return {"ok": True, "latencyMs": latency_ms, "response": json.dumps(data, ensure_ascii=False)[:200]}
         return {"ok": False, "latencyMs": latency_ms, "error": f"HTTP {resp.status_code}"}
     except httpx.TimeoutException:
         latency_ms = int((time.perf_counter() - start) * 1000)

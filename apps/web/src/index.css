@@ -2,6 +2,98 @@
 @tailwind components;
 @tailwind utilities;
 
-/* React Flow overrides */
-.react-flow__background { background: #0f1117 !important; }
-.react-flow__minimap { background: #1a1d27 !important; border-radius: 8px; }
+/* ── Google Material Base Styles ── */
+@layer base {
+  * {
+    @apply border-g-border;
+  }
+
+  body {
+    font-family: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #dadce0;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #bdc1c6;
+  }
+
+  ::selection {
+    background: rgba(66, 133, 244, 0.15);
+    color: #0e1115;
+  }
+}
+
+/* ── React Flow overrides ── */
+.react-flow__background {
+  background: #f4f6f9 !important;
+}
+.react-flow__minimap {
+  background: rgba(255,255,255,0.85) !important;
+  border-radius: 8px;
+  border: 1px solid #ebebeb !important;
+}
+
+/* ── Focus ring (Google blue) ── */
+@layer utilities {
+  .focus-g {
+    @apply outline-none ring-2 ring-g-blue/40 ring-offset-2 ring-offset-g-bg;
+  }
+}
+
+/* ── Google Material Components ── */
+@layer components {
+  .gm-card {
+    @apply bg-g-bg border border-g-border rounded-gm shadow-gm-sm;
+  }
+
+  .gm-btn-primary {
+    @apply bg-g-blue text-white px-4 py-2 rounded-gm font-medium text-sm
+           hover:bg-blue-600 transition-colors duration-150 shadow-gm-sm
+           active:scale-[0.98];
+  }
+
+  .gm-btn-secondary {
+    @apply bg-g-bg-soft text-g-fg-2 px-4 py-2 rounded-gm font-medium text-sm
+           hover:bg-g-bg-muted transition-colors duration-150 border border-g-border;
+  }
+
+  .gm-input {
+    @apply w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm
+           text-g-fg placeholder-g-fg-4
+           focus:outline-none focus:border-g-blue focus:ring-1 focus:ring-g-blue/30
+           transition-colors duration-150;
+  }
+
+  .gm-badge {
+    @apply inline-flex items-center text-[10px] font-medium px-2 py-0.5 rounded-full;
+  }
+}
+
+/* ── Material Design hover elevation ── */
+@layer utilities {
+  .hover-lift {
+    @apply transition-shadow duration-200;
+  }
+  .hover-lift:hover {
+    box-shadow: 0 2px 6px 2px rgba(60,64,67,.15), 0 1px 2px 0 rgba(60,64,67,.30);
+  }
+}
+
+/* ── Section divider accent ── */
+@layer components {
+  .section-header {
+    @apply px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-g-fg-3 border-b border-g-border bg-g-bg-soft;
+  }
+}

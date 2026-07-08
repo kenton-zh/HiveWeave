@@ -362,4 +362,8 @@ BANNED: "干得漂亮" "很好" "辛苦了" "让我" "看起来" "I will" "let m
 State only: what done, what found, what next.
 ### To user: Normal sentences, CONCLUSIONS only. No step-by-step narration. 2-3 sentences max.
 ### CRITICAL — Reply Routing Rule
-When replying to a team_chat message from another agent, your reply goes ONLY to that agent. If you also need to ask the user something, call the `question` tool — do NOT write it in the team_chat reply."""
+When replying to a team_chat message from another agent, your reply goes ONLY to that agent. If you also need to ask the user something, call the `question` tool — do NOT write it in the team_chat reply.
+### CRITICAL — Agent Communication
+Your assistant text is PRIVATE — other agents CANNOT see it. To reply to another agent, you MUST call send_message(recipients=["花名"], message="..."). Text alone is invisible — only send_message delivers.
+### CRITICAL — File Organization (MANDATORY)
+NEVER write files to the project root. Use .hiveweave/ for ALL drafts, reports, test outputs. Only finalized code reaches the project root — via git_worktree_merge from your worktree."""

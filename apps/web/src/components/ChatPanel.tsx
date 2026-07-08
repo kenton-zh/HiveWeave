@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+﻿import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useAppStore } from "../store";
 import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead, leaveAgentChannel, joinAgentChannel, subscribeAgentStream } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
@@ -58,50 +58,50 @@ const roleLabels: Record<string, string> = {
 };
 
 const toolCategories: Record<string, { color: string; bg: string; label: string }> = {
-  dispatch_task: { color: "text-blue-300", bg: "bg-blue-500/15", label: "Dispatch" },
-  write_work_log: { color: "text-green-300", bg: "bg-green-500/15", label: "Log" },
-  read_work_logs: { color: "text-green-300", bg: "bg-green-500/15", label: "Read Logs" },
-  report_completion: { color: "text-green-300", bg: "bg-green-500/15", label: "Complete" },
-  approve_work: { color: "text-purple-300", bg: "bg-purple-500/15", label: "Approve" },
-  reject_work: { color: "text-red-300", bg: "bg-red-500/15", label: "Reject" },
-  review_code: { color: "text-purple-300", bg: "bg-purple-500/15", label: "Review" },
-  read_project_memory: { color: "text-amber-300", bg: "bg-amber-500/15", label: "Memory" },
-  trigger_integration: { color: "text-amber-300", bg: "bg-amber-500/15", label: "Integration" },
-  message_superior: { color: "text-emerald-300", bg: "bg-emerald-500/15", label: "Report Up" },
-  message_peer: { color: "text-cyan-300", bg: "bg-cyan-500/15", label: "Peer Msg" },
-  send_message: { color: "text-cyan-300", bg: "bg-cyan-500/15", label: "Send" },
-  read_agent_status: { color: "text-green-300", bg: "bg-green-500/15", label: "Status" },
-  list_subordinates: { color: "text-blue-300", bg: "bg-blue-500/15", label: "Team" },
-  create_agent: { color: "text-pink-300", bg: "bg-pink-500/15", label: "Hire" },
-  transfer_agent: { color: "text-orange-300", bg: "bg-orange-500/15", label: "Transfer" },
-  dismiss_agent: { color: "text-red-300", bg: "bg-red-500/15", label: "Dismiss" },
-  update_roster: { color: "text-rose-300", bg: "bg-rose-500/15", label: "Roster" },
-  read_roster: { color: "text-rose-300", bg: "bg-rose-500/15", label: "View Roster" },
-  list_all_agents: { color: "text-blue-300", bg: "bg-blue-500/15", label: "List All" },
-  read_file: { color: "text-slate-300", bg: "bg-slate-500/15", label: "Read" },
-  write_file: { color: "text-slate-300", bg: "bg-slate-500/15", label: "Write" },
-  edit_file: { color: "text-slate-300", bg: "bg-slate-500/15", label: "Edit" },
-  list_files: { color: "text-slate-300", bg: "bg-slate-500/15", label: "List" },
-  search_files: { color: "text-slate-300", bg: "bg-slate-500/15", label: "Search" },
-  delete_file: { color: "text-red-300", bg: "bg-red-500/15", label: "Delete" },
-  glob: { color: "text-slate-300", bg: "bg-slate-500/15", label: "Glob" },
-  fetch_url: { color: "text-indigo-300", bg: "bg-indigo-500/15", label: "Fetch" },
-  read_charter: { color: "text-violet-300", bg: "bg-violet-500/15", label: "Charter" },
-  save_charter: { color: "text-violet-300", bg: "bg-violet-500/15", label: "Save Charter" },
+  dispatch_task: { color: "text-blue-600", bg: "bg-blue-500/15", label: "Dispatch" },
+  write_work_log: { color: "text-green-600", bg: "bg-green-500/15", label: "Log" },
+  read_work_logs: { color: "text-green-600", bg: "bg-green-500/15", label: "Read Logs" },
+  report_completion: { color: "text-green-600", bg: "bg-green-500/15", label: "Complete" },
+  approve_work: { color: "text-purple-600", bg: "bg-purple-500/15", label: "Approve" },
+  reject_work: { color: "text-red-600", bg: "bg-red-500/15", label: "Reject" },
+  review_code: { color: "text-purple-600", bg: "bg-purple-500/15", label: "Review" },
+  read_project_memory: { color: "text-amber-600", bg: "bg-amber-500/15", label: "Memory" },
+  trigger_integration: { color: "text-amber-600", bg: "bg-amber-500/15", label: "Integration" },
+  message_superior: { color: "text-emerald-600", bg: "bg-emerald-500/15", label: "Report Up" },
+  message_peer: { color: "text-cyan-600", bg: "bg-cyan-500/15", label: "Peer Msg" },
+  send_message: { color: "text-cyan-600", bg: "bg-cyan-500/15", label: "Send" },
+  read_agent_status: { color: "text-green-600", bg: "bg-green-500/15", label: "Status" },
+  list_subordinates: { color: "text-blue-600", bg: "bg-blue-500/15", label: "Team" },
+  create_agent: { color: "text-pink-600", bg: "bg-pink-500/15", label: "Hire" },
+  transfer_agent: { color: "text-orange-600", bg: "bg-orange-500/15", label: "Transfer" },
+  dismiss_agent: { color: "text-red-600", bg: "bg-red-500/15", label: "Dismiss" },
+  update_roster: { color: "text-rose-600", bg: "bg-rose-500/15", label: "Roster" },
+  read_roster: { color: "text-rose-600", bg: "bg-rose-500/15", label: "View Roster" },
+  list_all_agents: { color: "text-blue-600", bg: "bg-blue-500/15", label: "List All" },
+  read_file: { color: "text-slate-600", bg: "bg-slate-500/15", label: "Read" },
+  write_file: { color: "text-slate-600", bg: "bg-slate-500/15", label: "Write" },
+  edit_file: { color: "text-slate-600", bg: "bg-slate-500/15", label: "Edit" },
+  list_files: { color: "text-slate-600", bg: "bg-slate-500/15", label: "List" },
+  search_files: { color: "text-slate-600", bg: "bg-slate-500/15", label: "Search" },
+  delete_file: { color: "text-red-600", bg: "bg-red-500/15", label: "Delete" },
+  glob: { color: "text-slate-600", bg: "bg-slate-500/15", label: "Glob" },
+  fetch_url: { color: "text-indigo-600", bg: "bg-indigo-500/15", label: "Fetch" },
+  read_charter: { color: "text-violet-600", bg: "bg-violet-500/15", label: "Charter" },
+  save_charter: { color: "text-violet-600", bg: "bg-violet-500/15", label: "Save Charter" },
 };
 
 const statusLabels: Record<string, { text: string; color: string }> = {
-  created: { text: "Created", color: "text-gray-400" },
-  active: { text: "Active", color: "text-emerald-400" },
-  promoted: { text: "Promoted", color: "text-blue-400" },
-  receiving: { text: "Receiving", color: "text-amber-400" },
-  merging: { text: "Merging", color: "text-purple-400" },
-  dissolving: { text: "Dissolving", color: "text-red-400" },
-  archived: { text: "Archived", color: "text-gray-500" },
-  idle: { text: "Idle", color: "text-gray-400" },
-  working: { text: "Working", color: "text-emerald-400" },
-  error: { text: "Error", color: "text-red-400" },
-  waiting: { text: "Waiting", color: "text-amber-400" },
+  created: { text: "Created", color: "text-g-fg-3" },
+  active: { text: "Active", color: "text-emerald-600" },
+  promoted: { text: "Promoted", color: "text-blue-600" },
+  receiving: { text: "Receiving", color: "text-amber-600" },
+  merging: { text: "Merging", color: "text-purple-600" },
+  dissolving: { text: "Dissolving", color: "text-red-600" },
+  archived: { text: "Archived", color: "text-g-fg-4" },
+  idle: { text: "Idle", color: "text-g-fg-3" },
+  working: { text: "Working", color: "text-emerald-600" },
+  error: { text: "Error", color: "text-red-600" },
+  waiting: { text: "Waiting", color: "text-amber-600" },
 };
 
 
@@ -234,27 +234,27 @@ function ToolCallsBlock({ toolCalls }: { toolCalls: ToolCall[] }) {
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div className="rounded-lg border border-amber-500/15 bg-amber-500/5 overflow-hidden">
+    <div className="rounded-lg border border-g-border bg-g-bg-muted overflow-hidden">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="w-full flex items-center gap-2 px-3 py-2 text-left text-[11px] text-amber-200/70 hover:text-amber-100 transition-colors"
+        className="w-full flex items-center gap-2 px-3 py-2 text-left text-[11px] text-g-fg-3 hover:text-g-fg transition-colors"
       >
-        <svg className={`w-3 h-3 text-amber-400/70 transition-transform ${expanded ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <svg className={`w-3 h-3 text-g-fg-4 transition-transform ${expanded ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
         </svg>
         <span className="font-medium">\u5de5\u5177\u8c03\u7528</span>
-        <span className="text-amber-400/50">({toolCalls.length})</span>
+        <span className="text-g-fg-4">({toolCalls.length})</span>
       </button>
       {expanded && (
-        <div className="border-t border-amber-500/10 px-3 py-2 space-y-1">
+        <div className="border-t border-g-border px-3 py-2 space-y-1">
           {toolCalls.map((tc, i) => {
             const hint = formatToolInputHint(tc.tool, tc.input);
             return (
               <div key={i} className="flex items-center gap-2 text-[11px] font-mono">
-                <span className="w-1 h-1 rounded-full bg-amber-400/40 shrink-0" />
-                <span className="text-amber-200/80">{tc.tool}</span>
-                {hint && <span className="text-gray-500 truncate">\u2014 {hint}</span>}
+                <span className="w-1 h-1 rounded-full bg-amber-500 shrink-0" />
+                <span className="text-g-fg-2">{tc.tool}</span>
+                {hint && <span className="text-g-fg-4 truncate">\u2014 {hint}</span>}
               </div>
             );
           })}
@@ -266,19 +266,19 @@ function ToolCallsBlock({ toolCalls }: { toolCalls: ToolCall[] }) {
 
 function ThinkingBlock({ content }: { content: string }) {
   return (
-    <details className="group/think my-3 overflow-hidden rounded-xl border border-purple-500/20 bg-purple-950/10">
-      <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none hover:bg-purple-950/20 transition-colors">
-        <svg className="w-3.5 h-3.5 text-purple-400 group-open/think:rotate-90 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+    <details className="group/think my-3 overflow-hidden rounded-xl border border-g-border bg-g-bg-muted">
+      <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none hover:bg-g-bg-muted transition-colors">
+        <svg className="w-3.5 h-3.5 text-purple-500 group-open/think:rotate-90 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
         </svg>
-        <svg className="w-3.5 h-3.5 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <svg className="w-3.5 h-3.5 text-purple-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
         </svg>
-        <span className="text-xs font-medium text-purple-300">思考过程</span>
-        <span className="text-[10px] text-gray-600 ml-auto">{content.length} 字</span>
+        <span className="text-xs font-medium text-purple-600">思考过程</span>
+        <span className="text-[10px] text-g-fg-4/70 ml-auto">{content.length} 字</span>
       </summary>
-      <div className="border-t border-purple-500/10 bg-black/20 px-3 py-2.5">
-        <div className="text-xs text-purple-200/70 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed font-mono text-[11px]">
+      <div className="border-t border-g-border bg-g-bg-soft px-3 py-2.5">
+        <div className="text-xs text-g-fg-3 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed font-mono text-[11px]">
           {content}
         </div>
       </div>
@@ -301,17 +301,17 @@ function ToolCallInline({ name, input }: { name: string; input?: Record<string, 
     }
   } catch { /* ignore */ }
   return (
-    <div className="py-1.5 px-3 my-1 rounded-lg border border-amber-500/15 bg-amber-500/5 text-[12px]">
+    <div className="py-1.5 px-3 my-1 rounded-lg border border-g-border bg-g-bg-muted text-[12px]">
       <div className="flex items-center gap-2 cursor-pointer select-none" onClick={() => setShowArgs(!showArgs)}>
-        <svg className={`w-3 h-3 text-amber-400/70 transition-transform ${showArgs ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <svg className={`w-3 h-3 text-g-fg-4 transition-transform ${showArgs ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
         </svg>
-        <span className="font-medium text-amber-200/85 font-mono text-[11px]">{name}</span>
-        {hint && <span className="text-gray-500 text-[11px]">→ {hint}</span>}
-        {argsPreview && <span className="text-gray-600 text-[10px] ml-auto truncate hidden sm:inline">{argsPreview}</span>}
+        <span className="font-medium text-g-fg-2 font-mono text-[11px]">{name}</span>
+        {hint && <span className="text-g-fg-4 text-[11px]">→ {hint}</span>}
+        {argsPreview && <span className="text-g-fg-4/70 text-[10px] ml-auto truncate hidden sm:inline">{argsPreview}</span>}
       </div>
       {showArgs && input && Object.keys(input).length > 0 && (
-        <pre className="mt-1.5 text-[10px] text-amber-300/60 whitespace-pre-wrap break-all font-mono leading-relaxed pl-5 border-l border-amber-500/10">
+        <pre className="mt-1.5 text-[10px] text-amber-600 whitespace-pre-wrap break-all font-mono leading-relaxed pl-5 border-l border-g-border">
           {JSON.stringify(input, null, 2)}
         </pre>
       )}
@@ -323,7 +323,7 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
   if (msg.role === "system") {
     return (
       <div className="flex justify-center my-4">
-        <div className="rounded-xl px-4 py-2 bg-amber-500/10 border border-amber-500/20 text-amber-200/80 text-xs text-center">
+        <div className="rounded-xl px-4 py-2 bg-g-bg-muted border border-g-border text-g-fg-3 text-xs text-center">
           <p className="whitespace-pre-wrap">{msg.content}</p>
         </div>
       </div>
@@ -340,8 +340,8 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"} my-2`}>
       <div className={isUser
-        ? "max-w-[75%] rounded-2xl bg-accent/90 px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-sm"
-        : "w-full max-w-full text-[15px] leading-relaxed text-gray-100"
+        ? "max-w-[75%] rounded-2xl bg-g-blue px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-sm"
+        : "w-full max-w-full text-[15px] leading-relaxed text-g-fg"
       }>
         {/* Images */}
         {msg.images && msg.images.length > 0 && (
@@ -383,7 +383,7 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
 
         {/* Streaming cursor — subtle pulsing indicator at end of text */}
         {!isUser && isStreaming && hasSegments && (
-          <span className="inline-block w-0.5 h-4 bg-accent/60 ml-0.5 align-middle animate-pulse" />
+          <span className="inline-block w-0.5 h-4 bg-g-blue/60 ml-0.5 align-middle animate-pulse" />
         )}
 
         {/* Empty streaming indicator */}
@@ -1306,22 +1306,22 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
 
   if (!agentId) {
     return (
-      <div className="h-full flex items-center justify-center bg-surface">
+      <div className="h-full flex items-center justify-center bg-g-bg">
         <div className="text-center">
-          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-surface-card border border-surface-border flex items-center justify-center">
-            <svg className="w-8 h-8 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-g-bg border border-g-border flex items-center justify-center">
+            <svg className="w-8 h-8 text-g-fg-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
             </svg>
           </div>
-          <p className="text-gray-500 text-sm">选择一个 Agent 开始对话</p>
+          <p className="text-g-fg-4 text-sm">选择一个 Agent 开始对话</p>
         </div>
       </div>
     );
   }
 
-  const statusInfo = statusLabels[agentInfo?.status || "idle"] || { text: agentInfo?.status || "Unknown", color: "text-gray-400" };
+  const statusInfo = statusLabels[agentInfo?.status || "idle"] || { text: agentInfo?.status || "Unknown", color: "text-g-fg-3" };
   const runtimeStatusInfo = agentInfo?.status === "active"
-    ? isAgentProcessing ? { text: "工作中", color: "text-emerald-400" } : { text: "空闲", color: "text-gray-400" }
+    ? isAgentProcessing ? { text: "工作中", color: "text-emerald-600" } : { text: "空闲", color: "text-g-fg-3" }
     : statusInfo;
   const resolveAgentInfo = (id: string) => {
     if (!id) return { name: "系统", role: "" };
@@ -1346,24 +1346,36 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
   };
 
   return (
-    <div className="h-full flex flex-col bg-surface" style={hidden ? { display: "none" } : undefined}>
+    <div className="h-full flex flex-col bg-white" style={hidden ? { display: "none" } : undefined}>
       {agentInfo && (
-        <div className="px-6 py-3 border-b border-surface-border bg-surface-card shrink-0">
-          <div className="flex items-center gap-2">
-            <span className={`w-2 h-2 rounded-full ${
-              isAgentProcessing ? "bg-emerald-400 animate-pulse"
-              : agentInfo.status === "idle" || agentInfo.status === "inactive" ? "bg-gray-500"
-              : agentInfo.status === "promoted" ? "bg-blue-400"
-              : agentInfo.status === "receiving" ? "bg-amber-400 animate-pulse"
-              : agentInfo.status === "merging" ? "bg-purple-400 animate-pulse"
-              : agentInfo.status === "dissolving" || agentInfo.status === "archived" ? "bg-red-600"
-              : "bg-gray-400"
-            }`} />
-            <span className="text-sm font-medium text-gray-200">{agentInfo.name}</span>
-            <span className="text-xs text-gray-500">·</span>
-            <span className="text-xs text-gray-400">{roleLabels[agentInfo.role] || agentInfo.role}</span>
-            <span className="text-xs text-gray-500">·</span>
-            <span className={`text-xs ${runtimeStatusInfo.color}`}>{runtimeStatusInfo.text}</span>
+        <div className="px-4 py-3 border-b border-g-border bg-g-bg-soft shrink-0">
+          <div className="flex items-center gap-3">
+            <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 text-sm font-bold text-white ${
+              agentInfo.role === "ceo" ? "bg-amber-500" :
+              agentInfo.role === "hr" ? "bg-rose-500" :
+              agentInfo.role === "architect" ? "bg-purple-500" :
+              agentInfo.role === "manager" || agentInfo.role === "pm" ? "bg-blue-500" :
+              agentInfo.role === "developer" || agentInfo.role === "module_dev" ? "bg-green-500" :
+              "bg-g-fg-3"
+            }`}>
+              {agentInfo.name.charAt(0)}
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-g-fg truncate">{agentInfo.name}</span>
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                  isAgentProcessing ? "bg-emerald-500 animate-pulse"
+                  : agentInfo.status === "idle" || agentInfo.status === "inactive" ? "bg-gray-400"
+                  : agentInfo.status === "promoted" ? "bg-blue-400"
+                  : agentInfo.status === "receiving" ? "bg-amber-400 animate-pulse"
+                  : agentInfo.status === "merging" ? "bg-purple-400 animate-pulse"
+                  : agentInfo.status === "dissolving" || agentInfo.status === "archived" ? "bg-red-500"
+                  : "bg-gray-400"
+                }`} />
+                <span className={`text-[11px] shrink-0 ${runtimeStatusInfo.color}`}>{runtimeStatusInfo.text}</span>
+              </div>
+              <span className="text-xs text-g-fg-3">{roleLabels[agentInfo.role] || agentInfo.role}</span>
+            </div>
           </div>
         </div>
       )}
@@ -1372,32 +1384,32 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
 
       <div ref={scrollContainerRef} onScroll={handleMessagesScroll} className="flex-1 min-h-0 overflow-y-auto px-5 py-5 space-y-6">
         {directMessages.length === 0 && !hasTeamComms && (
-          <div className="text-center text-gray-500 text-sm mt-12">发送消息开始对话</div>
+          <div className="text-center text-g-fg-4 text-sm mt-12">发送消息开始对话</div>
         )}
         {directMessages.map((msg) => (
           <MessageBubble key={msg.id} msg={msg} isStreaming={!!msg.isStreaming || (isStreaming && streamDraft?.assistantId === msg.id)} />
         ))}
         {pendingApprovalTool && isStreaming && (
           <div className="flex justify-start">
-            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-amber-500/10 border border-amber-500/30">
+            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-g-yellow-bg border border-g-yellow">
               <div className="flex items-center gap-2">
-                <span className="text-sm text-amber-300">等待审批: {pendingApprovalTool.replace(/^hiveweave__/, "").replace(/_/g, " ")}</span>
+                <span className="text-sm text-amber-700">等待审批: {pendingApprovalTool.replace(/^hiveweave__/, "").replace(/_/g, " ")}</span>
               </div>
             </div>
           </div>
         )}
         {retryInfo && isStreaming && (
           <div className="flex justify-start">
-            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-orange-500/10 border border-orange-500/30">
+            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-g-bg-muted border border-g-border">
               <div className="flex items-center gap-2">
-                <svg className="w-4 h-4 text-orange-400 animate-spin" fill="none" viewBox="0 0 24 24">
+                <svg className="w-4 h-4 text-orange-500 animate-spin" fill="none" viewBox="0 0 24 24">
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                 </svg>
-                <span className="text-sm text-orange-300">
+                <span className="text-sm text-orange-600">
                   重试中... {retryInfo.attempt}/{retryInfo.maxRetries}
                 </span>
-                <span className="text-xs text-orange-400/70">{retryInfo.reason}</span>
+                <span className="text-xs text-orange-500/70">{retryInfo.reason}</span>
               </div>
             </div>
           </div>
@@ -1406,10 +1418,18 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       </div>
 
       {hasTeamComms && (
-        <div className="shrink-0 border-t border-surface-border bg-surface-card overflow-hidden">
-          <button onClick={() => { setTeamCommsExpanded(!teamCommsExpanded); if (teamCommsExpanded) setExpandedMessageId(null); }} className="w-full px-4 py-2 flex items-center justify-between hover:bg-surface-border/30 transition-colors">
-            <span className="text-sm font-medium text-gray-300">团队沟通 ({teamMessages.length})</span>
-            <span className="text-xs text-gray-500">{teamCommsExpanded ? "收起" : "展开"}</span>
+        <div className="shrink-0 border-t-2 border-g-border bg-[#f4f6f9] overflow-hidden">
+          <button onClick={() => { setTeamCommsExpanded(!teamCommsExpanded); if (teamCommsExpanded) setExpandedMessageId(null); }} className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-[#eef0f4] transition-colors">
+            <div className="flex items-center gap-2">
+              <svg className="w-3.5 h-3.5 text-g-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z" />
+              </svg>
+              <span className="text-xs font-semibold text-g-fg-2 uppercase tracking-wide">团队沟通</span>
+              <span className="bg-g-blue text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none">{teamMessages.length}</span>
+            </div>
+            <svg className={`w-3.5 h-3.5 text-g-fg-4 transition-transform ${teamCommsExpanded ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+            </svg>
           </button>
           {teamCommsExpanded && (
             <div className="max-h-[35vh] overflow-y-auto overflow-x-hidden py-1">
@@ -1471,33 +1491,33 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                   <button
                     key={msg.id}
                     onClick={() => setExpandedMessageId(isExpanded ? null : msg.id)}
-                    className={"w-full px-4 py-2 text-left hover:bg-surface-border/30 transition-colors " + (!msg.isRead ? "bg-accent/5 " : "")}
+                    className={"w-full px-4 py-2 text-left hover:bg-g-bg-muted transition-colors " + (!msg.isRead ? "bg-g-blue/5 " : "")}
                   >
                     <div className="flex items-center gap-2 mb-0.5 min-w-0">
-                      <span className={"text-xs font-medium px-1.5 py-0.5 rounded shrink-0 " + (isIncoming ? "bg-emerald-500/15 text-emerald-300" : "bg-blue-500/15 text-blue-300")}>
+                      <span className={"text-xs font-medium px-1.5 py-0.5 rounded shrink-0 " + (isIncoming ? "bg-g-green-bg text-g-green" : "bg-g-blue-bg text-g-blue")}>
                         {directionTag}
                       </span>
                       <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor}`} />
-                      <span className="text-sm font-medium text-gray-200 truncate min-w-0">{info.name}</span>
+                      <span className="text-sm font-medium text-g-fg truncate min-w-0">{info.name}</span>
                       {positionLabel && (
                         <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full shrink-0 ${roleStyle.bg} ${roleStyle.text}`}>
                           {positionLabel}
                         </span>
                       )}
                       {!msg.isRead && (
-                        <span className="text-xs text-accent font-medium shrink-0">未读</span>
+                        <span className="text-xs text-g-blue font-medium shrink-0">未读</span>
                       )}
                     </div>
-                    <p className={"text-xs text-gray-500 " + (isExpanded ? "whitespace-pre-wrap break-words" : "truncate")}>{preview}</p>
+                    <p className={"text-xs text-g-fg-4 " + (isExpanded ? "whitespace-pre-wrap break-words" : "truncate")}>{preview}</p>
                     {isExpanded && msg.toolCalls && msg.toolCalls.length > 0 && (
                       <div className="mt-2 space-y-1">
                         {msg.toolCalls.filter((tc) => tc.tool).map((tc, i) => {
-                          const cat = toolCategories[tc.tool] || { color: "text-gray-300", bg: "bg-gray-500/15", label: tc.tool };
+                          const cat = toolCategories[tc.tool] || { color: "text-g-fg", bg: "bg-gray-500/15", label: tc.tool };
                           const hint = formatToolInputHint(tc.tool, tc.input);
                           return (
                             <div key={i} className={"text-xs px-2 py-1 rounded flex items-center gap-1.5 " + cat.bg + " " + cat.color}>
                               <span>{cat.label}</span>
-                              {hint && <span className="text-gray-500 truncate">— {hint}</span>}
+                              {hint && <span className="text-g-fg-4 truncate">— {hint}</span>}
                             </div>
                           );
                         })}
@@ -1511,12 +1531,12 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         </div>
       )}
 
-      <div className="px-6 py-4 border-t border-surface-border bg-surface-card shrink-0">
+      <div className="px-6 py-4 border-t border-g-border bg-g-bg shrink-0">
         {images.length > 0 && (
           <div className="flex gap-2 mb-2 flex-wrap">
             {images.map((url, i) => (
               <div key={i} className="relative group">
-                <img src={url} className="h-16 w-16 object-cover rounded-lg border border-surface-border" alt="" />
+                <img src={url} className="h-16 w-16 object-cover rounded-lg border border-g-border" alt="" />
                 <button onClick={() => removeImage(i)} className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">x</button>
               </div>
             ))}
@@ -1527,12 +1547,12 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         )}
         <div className="flex gap-2 items-end">
           <input type="file" ref={fileInputRef} onChange={handleFileInput} accept="image/*" multiple className="hidden" />
-          <button onClick={() => fileInputRef.current?.click()} disabled={images.length >= 5 || isStreaming} className="px-3 py-3 text-gray-400 hover:text-accent disabled:opacity-30 transition-colors" title="添加图片 (支持粘贴/拖拽)">
+          <button onClick={() => fileInputRef.current?.click()} disabled={images.length >= 5 || isStreaming} className="px-3 py-3 text-g-fg-3 hover:text-g-blue disabled:opacity-30 transition-colors" title="添加图片 (支持粘贴/拖拽)">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
           </button>
-          <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 支持粘贴图片)" className="flex-1 bg-surface border border-surface-border rounded-xl px-4 py-3 text-sm text-gray-100 resize-none focus:outline-none focus:border-accent" rows={1} disabled={isStreaming} />
-          <button onClick={handleSend} disabled={(!input.trim() && images.length === 0) || isStreaming} className="px-6 py-3 bg-accent text-white rounded-xl text-sm disabled:opacity-50 transition-colors">发送</button>
-          <button onClick={handleStop} disabled={!isStreaming} className="px-6 py-3 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed">停止</button>
+          <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 支持粘贴图片)" className="flex-1 bg-g-bg border border-g-border rounded-gm px-4 py-3 text-sm text-g-fg resize-none focus:outline-none focus:border-g-blue focus:ring-1 focus:ring-g-blue/30" rows={1} disabled={isStreaming} />
+          <button onClick={handleSend} disabled={(!input.trim() && images.length === 0) || isStreaming} className="px-6 py-3 bg-g-blue text-white rounded-gm text-sm disabled:opacity-50 transition-colors">发送</button>
+          <button onClick={handleStop} disabled={!isStreaming} className="px-6 py-3 bg-red-500 hover:bg-red-600 text-white rounded-gm text-sm font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed">停止</button>
         </div>
       </div>
 

@@ -1,4 +1,4 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 import { useAppStore } from "../store.js";
 
 interface Props {
@@ -33,17 +33,17 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
       onClick={onClose}
     >
       <div
-        className="bg-surface-card border border-surface-border rounded-xl shadow-2xl p-6 w-full max-w-lg mx-4"
+        className="bg-g-bg border border-g-border rounded-xl shadow-2xl p-6 w-full max-w-lg mx-4"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="flex items-center justify-between mb-5">
-          <h2 className="text-lg font-semibold text-white">
+          <h2 className="text-lg font-semibold text-g-fg">
             项目已创建 — 接下来做什么？
           </h2>
           <button
             onClick={onClose}
-            className="text-gray-400 hover:text-white text-xl leading-none transition-colors"
+            className="text-g-fg-3 hover:text-g-fg text-xl leading-none transition-colors"
           >
             ✕
           </button>
@@ -53,12 +53,12 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
         <div className="space-y-3 mb-4">
           <button
             onClick={() => handleSend(ANALYZE_AND_BUILD)}
-            className="w-full text-left px-4 py-3 rounded-lg border border-surface-border bg-surface-alt hover:bg-surface-hover transition-colors"
+            className="w-full text-left px-4 py-3 rounded-lg border border-g-border bg-g-bg-soft hover:bg-g-bg-soft transition-colors"
           >
-            <div className="text-white font-medium">
+            <div className="text-g-fg font-medium">
               让 CEO 分析项目并搭建组织架构
             </div>
-            <div className="text-gray-400 text-sm mt-0.5">
+            <div className="text-g-fg-3 text-sm mt-0.5">
               CEO 会先阅读代码库，了解技术栈和模块结构，然后设计适合的组织架构
             </div>
           </button>
@@ -66,12 +66,12 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
           <button
             
             onClick={() => handleSend(BRAINSTORM)}
-            className="w-full text-left px-4 py-3 rounded-lg border border-surface-border bg-surface-alt hover:bg-surface-hover transition-colors"
+            className="w-full text-left px-4 py-3 rounded-lg border border-g-border bg-g-bg-soft hover:bg-g-bg-soft transition-colors"
           >
-            <div className="text-white font-medium">
+            <div className="text-g-fg font-medium">
               与 CEO 讨论项目方向
             </div>
-            <div className="text-gray-400 text-sm mt-0.5">
+            <div className="text-g-fg-3 text-sm mt-0.5">
               在搭建团队之前，先和 CEO 聊聊项目目标、优先级和注意事项
             </div>
           </button>
@@ -79,9 +79,9 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
 
         {/* Divider */}
         <div className="flex items-center gap-3 mb-4">
-          <div className="flex-1 h-px bg-surface-border" />
-          <span className="text-gray-500 text-sm">或者</span>
-          <div className="flex-1 h-px bg-surface-border" />
+          <div className="flex-1 h-px bg-g-border" />
+          <span className="text-g-fg-4 text-sm">或者</span>
+          <div className="flex-1 h-px bg-g-border" />
         </div>
 
         {/* Custom input */}
@@ -96,13 +96,13 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
               }
             }}
             placeholder="输入你想让 CEO 做的事情…"
-            className="flex-1 px-3 py-2 bg-surface-alt border border-surface-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 text-sm"
+            className="flex-1 px-3 py-2 bg-g-bg-soft border border-g-border rounded-lg text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue text-sm"
             
           />
           <button
             disabled={!customInput.trim()}
             onClick={() => customInput.trim() && handleSend(customInput.trim())}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded-lg text-sm font-medium transition-colors"
+            className="px-4 py-2 bg-g-blue text-white hover:bg-blue-600 disabled:opacity-40 text-white rounded-lg text-sm font-medium transition-colors"
           >
             发送
           </button>

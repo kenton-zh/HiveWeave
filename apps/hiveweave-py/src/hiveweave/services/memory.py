@@ -167,6 +167,24 @@ class MemoryService:
         self._cache_put(key, result, _ARCHIVE_TTL)
         return result
 
+    async def add_entry(self, agent_id: str, project_id: str,
+                         content: str, category: str = "tool_written",
+                         module_id: str | None = None,
+                         tags: list | None = None,
+                         source_agent_id: str | None = None,
+                         metadata: dict | None = None) -> str:
+        """Write a memory entry (tool-facing alias for save_memory).
+
+        Maps category → type for the underlying save_memory call.
+        """
+        scope = "agent"  # Tool-written memories default to agent scope
+        return await self.save_memory(
+            agent_id=agent_id, project_id=project_id, scope=scope,
+            content=content, type=category, module_id=module_id,
+            source_agent_id=source_agent_id,
+            metadata=(metadata or {}) | ({"tags": tags} if tags else {}),
+        )
+
     async def save_memory(self, agent_id: str, project_id: str, scope: str,
                           content: str, type: str = "fact", module_id: str | None = None,
                           source_agent_id: str | None = None,

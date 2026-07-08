@@ -83,8 +83,56 @@ EMPTY_RESPONSE_MAX_RETRIES = 3
 EMPTY_RESPONSE_BACKOFF_MS = [5_000, 15_000, 45_000]
 """空响应退避序列（5s/15s/45s）。契约 01。"""
 
-DOOM_LOOP_THRESHOLD = 3
-"""Doom loop 阈值: 同一工具+同一参数连续 3 次中断。"""
+DOOM_LOOP_DEFAULT_LIMIT = 3
+"""默认 doom loop 阈值 — 同一工具+同一参数连续 N 次中断。"""
+
+DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
+    # 只读工具 — 高容忍，重复查询是正常的探索行为
+    "list_files": 15,
+    "read_file": 12,
+    "grep": 10,
+    "search_files": 10,
+    "list_subordinates": 10,
+    "read_charter": 10,
+    "read_goals": 10,
+    "read_work_logs": 10,
+    "get_subordinate_logs": 10,
+    "list_available_skills": 10,
+    "read_skill": 10,
+    "view_org_chart": 10,
+    # 审查工具 — 中容忍，重试可能是 LLM 纠正输出格式
+    "run_code_review": 6,
+    "run_security_audit": 6,
+    "run_tests": 6,
+    "run_perf_audit": 6,
+    "run_full_review": 6,
+    # 幂等写入 — 中容忍，覆盖写入无害但不应无限重复
+    "write_file": 8,
+    "save_charter": 8,
+    "save_goals": 8,
+    "save_memory": 8,
+    "update_roster": 8,
+    "todowrite": 8,
+    "mark_read": 8,
+    "write_work_log": 8,
+    "update_goals": 8,
+    # 外发消息 — 低容忍，避免刷屏
+    "send_message": 5,
+    "question": 4,
+    # 副作用工具 — 最低容忍，防止真实损害
+    "bash": 3,
+    "apply_patch": 3,
+    "websearch": 3,
+    "execute_code": 3,
+}
+"""Per-tool doom loop thresholds. 不同工具不同限制：
+
+- 只读工具 (10-15次): 重复查询可能是 agent 在探索不同角度的正常行为
+- 审查工具 (6次): LLM 可能在纠正输出格式，需要更多尝试
+- 幂等写入 (8次): 覆盖写入无害，但不应无限重复
+- 外发消息 (4-5次): 避免对其他 agent 或用户造成骚扰
+- 副作用工具 (3次): 真实命令执行，严格限制防止损害
+"""
 
 NO_TEXT_ROUNDS_THRESHOLD = 3
 """连续无文字轮次阈值: 3 轮后注入系统提示。"""
@@ -160,19 +208,24 @@ def parse_sse(buffer: str) -> tuple[list[dict], str]:
 
 
 def _extract_data(block: str) -> dict | None:
-    """从 SSE 事件块提取 data 字段并解析 JSON。
+    """从 SSE 事件块提取 data + event 字段并解析 JSON。
 
+    支持 OpenAI SSE（仅 data: 行）和 Anthropic SSE（event: + data: 行）。
     一个事件块可能有多行 data:（多行 JSON 拼接），对齐 Elixir extract_data/1。
+    如果有 event: 行，存储为 _event_type 字段供 handler 使用。
     """
     if not block:
         return None
 
     data_parts: list[str] = []
+    event_type: str | None = None
     for line in block.split("\n"):
         if line.startswith("data:"):
             value = line[5:]  # 去掉 "data:" 前缀
             data_parts.append(value.strip())
-        # 忽略 event:/id:/retry: 等其他 SSE 字段
+        elif line.startswith("event:"):
+            event_type = line[6:].strip()
+        # 忽略 id:/retry: 等其他 SSE 字段
 
     if not data_parts:
         return None
@@ -183,7 +236,12 @@ def _extract_data(block: str) -> dict | None:
 
     try:
         parsed = json.loads(data_str)
-        return parsed if isinstance(parsed, dict) else None
+        if isinstance(parsed, dict):
+            # Preserve SSE event type for Anthropic-style SSE
+            if event_type and "type" not in parsed:
+                parsed["_event_type"] = event_type
+            return parsed
+        return None
     except (json.JSONDecodeError, TypeError):
         return None
 
@@ -971,8 +1029,8 @@ class Streamer:
                             ),
                         }
 
-                    # 解析 chunks
-                    for c in sse_to_chunks(event):
+                    # 解析 chunks — delegate to format handler
+                    for c in provider.parse_stream_chunk(event):
                         ctype = c.get("type")
                         if ctype == "text":
                             content = c["content"]
@@ -993,6 +1051,31 @@ class Streamer:
                             thinking_acc += content
                         elif ctype == "tool_call_delta":
                             tool_call_deltas.append(c["tool_call"])
+                        elif ctype == "tool_call_start":
+                            # Anthropic: content_block_start with tool_use type
+                            tc = c.get("tool_call", {})
+                            if tc:
+                                tool_call_deltas.append(tc)
+                        elif ctype == "tool_call_end":
+                            # Anthropic: content_block_stop — no action needed
+                            pass
+                        elif ctype == "thinking_start":
+                            # Anthropic: content_block_start with thinking type
+                            pass
+                        elif ctype == "thinking_signature":
+                            # Anthropic: signature_delta — store in thinking
+                            content = c.get("content", "")
+                            if content:
+                                thinking_acc += f"[sig:{content}]"
+                        elif ctype == "usage":
+                            # Provider-specific usage info
+                            u = c.get("usage", {})
+                            if u:
+                                usage = usage or {}
+                                usage.update(u)
+                        elif ctype == "message_stop":
+                            # Anthropic: message_stop — stream end indicator
+                            pass
                         elif ctype == "finish":
                             finish_reason = c["reason"]
                         elif ctype == "error":
@@ -1181,13 +1264,15 @@ class Streamer:
         tool_calls: list[dict],
         tracker: dict[str, Any],
     ) -> str | None:
-        """检测 doom loop: 同一工具+同一参数连续 N 次。
+        """检测 doom loop: 同一工具+同一参数连续超过工具专属限制。
 
-        R2: 跟踪连续相同的 (tool_name, tool_args) 调用。遇到不同调用时重置计数，
-        只在连续 DOOM_LOOP_THRESHOLD 次相同调用时才判定为 doom loop。
-        合法的跨轮重复操作（不同参数或穿插其他调用）不会被误判。
+        不同工具有不同的容忍度（见 DOOM_LOOP_TOOL_LIMITS）：
+        - 只读工具 10-15 次 — 探索式重复查询是正常的
+        - 审查工具 6 次 — LLM 可能在纠正输出格式
+        - 幂等写入 8 次 — 覆盖写入无害但不应无限
+        - 副作用工具 3 次 — bash/apply_patch 严格限制
 
-        更新 tracker 并返回触发 doom loop 的工具名，或 None。
+        遇到不同调用时重置计数。更新 tracker 并返回触发 doom loop 的工具名，或 None。
         """
         last_key = tracker.get("last_key")
         count = tracker.get("count", 0)
@@ -1196,10 +1281,10 @@ class Streamer:
             if key == last_key:
                 count += 1
             else:
-                # 遇到不同调用 → 重置计数，以本次调用为新的连续起点
                 last_key = key
                 count = 1
-            if count >= DOOM_LOOP_THRESHOLD:
+            limit = DOOM_LOOP_TOOL_LIMITS.get(tc["name"], DOOM_LOOP_DEFAULT_LIMIT)
+            if count >= limit:
                 tracker["last_key"] = last_key
                 tracker["count"] = count
                 return tc["name"]

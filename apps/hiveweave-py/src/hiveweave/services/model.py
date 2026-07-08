@@ -46,6 +46,7 @@ class ModelService:
         model_id = attrs.get("model_id", "")
         base_url = attrs.get("base_url", "")
         api_key = attrs.get("api_key", "")
+        provider_type = attrs.get("provider_type", "")
         context_window = attrs.get("context_window", _DEFAULT_CONTEXT_WINDOW)
         max_output = attrs.get("max_output_tokens", _DEFAULT_MAX_OUTPUT)
         supports_thinking = 1 if attrs.get("supports_thinking", False) else 0
@@ -55,10 +56,12 @@ class ModelService:
 
         await meta_db.execute(
             "INSERT INTO llm_models (id, name, model_id, base_url, api_key, "
+            "provider_type, "
             "context_window, max_output_tokens, supports_thinking, "
             "default_reasoning_effort, temperature, is_active, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [model_pk, name, model_id, base_url, api_key,
+             provider_type,
              context_window, max_output, supports_thinking,
              default_reasoning_effort, temperature, is_active, now_ms, now_ms])
         log.info("model_created", model_pk=model_pk, name=name, model_id=model_id)
@@ -72,7 +75,8 @@ class ModelService:
         中存储的是 model_id 字段而非数据库主键。
         """
         row = await meta_db.query_one(
-            "SELECT id, name, model_id, base_url, api_key, context_window, "
+            "SELECT id, name, model_id, base_url, api_key, provider_type, "
+            "context_window, "
             "max_output_tokens, supports_thinking, default_reasoning_effort, "
             "temperature, is_active, created_at, updated_at "
             "FROM llm_models WHERE id = ? OR model_id = ? LIMIT 1",
@@ -93,6 +97,7 @@ class ModelService:
         fields: list[str] = []
         params: list = []
         for key in ("name", "model_id", "base_url", "api_key",
+                    "provider_type",
                     "context_window", "max_output_tokens",
                     "default_reasoning_effort", "temperature"):
             if key in attrs and attrs[key] is not None:
@@ -129,7 +134,8 @@ class ModelService:
         """
         try:
             rows = await meta_db.query(
-                "SELECT id, name, model_id, base_url, api_key, context_window, "
+                "SELECT id, name, model_id, base_url, api_key, provider_type, "
+                "context_window, "
                 "max_output_tokens, supports_thinking, default_reasoning_effort, "
                 "temperature, is_active, created_at, updated_at "
                 "FROM llm_models ORDER BY created_at ASC")

@@ -1,30 +1,30 @@
-import { useAppStore } from "../store";
+﻿import { useAppStore } from "../store";
 import type { ToastType } from "../store";
 
 const STYLES: Record<ToastType, { bg: string; border: string; icon: string; iconColor: string }> = {
   info: {
-    bg: "bg-slate-800/95",
-    border: "border-slate-600",
+    bg: "bg-g-bg",
+    border: "border-g-border shadow-gm-sm-lg",
     icon: "i",
-    iconColor: "text-sky-400",
+    iconColor: "text-sky-700",
   },
   success: {
-    bg: "bg-emerald-950/95",
-    border: "border-emerald-700",
+    bg: "bg-emerald-50",
+    border: "border-emerald-200",
     icon: "✓",
-    iconColor: "text-emerald-400",
+    iconColor: "text-emerald-700",
   },
   error: {
-    bg: "bg-red-950/95",
-    border: "border-red-700",
+    bg: "bg-red-50",
+    border: "border-red-200",
     icon: "!",
-    iconColor: "text-red-400",
+    iconColor: "text-red-700",
   },
   warning: {
-    bg: "bg-amber-950/95",
-    border: "border-amber-700",
+    bg: "bg-amber-50",
+    border: "border-amber-200",
     icon: "⚠",
-    iconColor: "text-amber-400",
+    iconColor: "text-amber-700",
   },
 };
 
@@ -49,12 +49,12 @@ export default function ToastContainer() {
             <span className={`${s.iconColor} font-bold text-base leading-tight mt-0.5`}>
               {s.icon}
             </span>
-            <p className="flex-1 text-sm text-gray-100 leading-relaxed break-words whitespace-pre-wrap">
+            <p className="flex-1 text-sm text-g-fg leading-relaxed break-words whitespace-pre-wrap">
               {t.message}
             </p>
             <button
               onClick={() => dismissToast(t.id)}
-              className="text-gray-500 hover:text-gray-300 transition-colors text-lg leading-none -mt-0.5"
+              className="text-g-fg-4 hover:text-g-fg transition-colors text-lg leading-none -mt-0.5"
               aria-label="关闭"
             >
               ×

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 import { getAgentTodos, type AgentTodos } from "../api";
 
 interface Props {
@@ -6,10 +6,10 @@ interface Props {
 }
 
 const statusLabels: Record<string, { icon: string; color: string }> = {
-  completed: { icon: "✅", color: "text-emerald-400" },
-  in_progress: { icon: "🔄", color: "text-amber-400" },
-  pending: { icon: "⬜", color: "text-gray-500" },
-  cancelled: { icon: "❌", color: "text-red-400/60" },
+  completed: { icon: "✅", color: "text-emerald-700" },
+  in_progress: { icon: "🔄", color: "text-amber-700" },
+  pending: { icon: "⬜", color: "text-g-fg-3" },
+  cancelled: { icon: "❌", color: "text-red-500/60" },
 };
 
 export default function TodoBar({ agentId }: Props) {
@@ -36,12 +36,12 @@ export default function TodoBar({ agentId }: Props) {
   const total = todos.todos.length;
 
   return (
-    <div className="border-b border-surface-border bg-surface-card shrink-0">
+    <div className="border-b border-g-border bg-g-bg shrink-0">
       <button
         onClick={() => setCollapsed(!collapsed)}
-        className="w-full flex items-center gap-2 px-6 py-2 text-xs hover:bg-surface/50 transition-colors"
+        className="w-full flex items-center gap-2 px-6 py-2 text-xs hover:bg-g-bg-soft transition-colors"
       >
-        <span className="text-gray-400">
+        <span className="text-g-fg-3">
           {collapsed ? (
             <svg className="w-3 h-3 rotate-180" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -52,10 +52,10 @@ export default function TodoBar({ agentId }: Props) {
             </svg>
           )}
         </span>
-        <span className="text-gray-400 font-medium">📋 任务清单</span>
-        <span className="text-gray-500">{done}/{total} 完成</span>
+        <span className="text-g-fg-3 font-medium">📋 任务清单</span>
+        <span className="text-g-fg-4">{done}/{total} 完成</span>
         {done === total && total > 0 && (
-          <span className="text-emerald-400 text-[10px]">全部完成</span>
+          <span className="text-emerald-700 text-[10px]">全部完成</span>
         )}
       </button>
 

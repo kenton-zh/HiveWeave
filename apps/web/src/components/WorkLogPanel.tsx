@@ -15,12 +15,12 @@ interface WorkLog {
 }
 
 const typeColors: Record<string, { bg: string; text: string }> = {
-  task: { bg: "bg-blue-500/20", text: "text-blue-300" },
-  decision: { bg: "bg-purple-500/20", text: "text-purple-300" },
-  error: { bg: "bg-red-500/20", text: "text-red-300" },
-  completion: { bg: "bg-green-500/20", text: "text-green-300" },
-  discussion: { bg: "bg-sky-500/20", text: "text-sky-300" },
-  delegation: { bg: "bg-amber-500/20", text: "text-amber-300" },
+  task: { bg: "bg-blue-100", text: "text-blue-600" },
+  decision: { bg: "bg-purple-100", text: "text-purple-600" },
+  error: { bg: "bg-red-100", text: "text-red-600" },
+  completion: { bg: "bg-green-100", text: "text-green-600" },
+  discussion: { bg: "bg-sky-100", text: "text-sky-600" },
+  delegation: { bg: "bg-amber-100", text: "text-amber-600" },
 };
 
 /** Friendly Chinese labels for log types */
@@ -148,20 +148,20 @@ function ToolEntry({ entry }: { entry: ActivityEntry }) {
         className="flex items-center gap-1.5 cursor-pointer hover:bg-amber-500/5 rounded px-1 -mx-1 transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
-        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 shrink-0">工具</span>
-        <span className="text-[11px] text-gray-300 font-mono truncate">{entry.toolName}</span>
-        {inputPreview && <span className="text-[10px] text-gray-500 truncate flex-1">{inputPreview}</span>}
-        <span className="text-[10px] text-gray-600">{expanded ? "▲" : "▼"}</span>
+        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 shrink-0">工具</span>
+        <span className="text-[11px] text-g-fg font-mono truncate">{entry.toolName}</span>
+        {inputPreview && <span className="text-[10px] text-g-fg-4 truncate flex-1">{inputPreview}</span>}
+        <span className="text-[10px] text-g-fg-4/70">{expanded ? "▲" : "▼"}</span>
       </div>
       {expanded && (
         <div className="mt-1 space-y-1">
           {input && (
-            <div className="text-[10px] text-gray-400 bg-surface-alt rounded px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
+            <div className="text-[10px] text-g-fg-3 bg-g-bg-soft rounded px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
               <span className="text-amber-400/60">input: </span>{input}
             </div>
           )}
           {result && (
-            <div className="text-[10px] text-gray-400 bg-surface-alt rounded px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
+            <div className="text-[10px] text-g-fg-3 bg-g-bg-soft rounded px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
               <span className="text-green-400/60">result: </span>{result}
             </div>
           )}
@@ -189,35 +189,35 @@ function ConversationCard({ conv }: { conv: Conversation }) {
   const durationStr = durationMs > 1000 ? `${(durationMs / 1000).toFixed(1)}s` : "";
 
   return (
-    <div className="border-b border-surface-border/30">
+    <div className="border-b border-g-border/30">
       {/* Header — always visible */}
       <div
-        className="flex items-start gap-2 px-4 py-2 cursor-pointer hover:bg-surface-border/10 transition-colors"
+        className="flex items-start gap-2 px-4 py-2 cursor-pointer hover:bg-g-border/10 transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
         {/* Agent name + status dot */}
         <div className="flex items-center gap-1.5 shrink-0 mt-0.5">
           <span className={`w-1.5 h-1.5 rounded-full ${conv.isLive ? "bg-emerald-400 animate-pulse" : hasError ? "bg-red-400" : "bg-gray-500"}`} />
-          <span className="text-[11px] font-medium text-gray-300 whitespace-nowrap">{conv.agentName}</span>
+          <span className="text-[11px] font-medium text-g-fg whitespace-nowrap">{conv.agentName}</span>
         </div>
 
         {/* Preview content */}
         <div className="min-w-0 flex-1">
-          <div className="text-[11px] text-gray-400 truncate leading-relaxed">
+          <div className="text-[11px] text-g-fg-3 truncate leading-relaxed">
             {preview || (conv.isLive ? "正在处理…" : "")}
           </div>
         </div>
 
         {/* Badges */}
         <div className="flex items-center gap-1 shrink-0 mt-0.5">
-          {hasThinking && <span className="text-[9px] px-1 py-0.5 rounded bg-purple-500/10 text-purple-300">思考</span>}
-          {toolCount > 0 && <span className="text-[9px] px-1 py-0.5 rounded bg-amber-500/10 text-amber-300">{toolCount}工具</span>}
-          {hasText && <span className="text-[9px] px-1 py-0.5 rounded bg-blue-500/10 text-blue-300">输出</span>}
-          {durationStr && <span className="text-[9px] text-gray-600">{durationStr}</span>}
+          {hasThinking && <span className="text-[9px] px-1 py-0.5 rounded bg-purple-500/10 text-purple-600">思考</span>}
+          {toolCount > 0 && <span className="text-[9px] px-1 py-0.5 rounded bg-amber-500/10 text-amber-600">{toolCount}工具</span>}
+          {hasText && <span className="text-[9px] px-1 py-0.5 rounded bg-blue-500/10 text-blue-600">输出</span>}
+          {durationStr && <span className="text-[9px] text-g-fg-4/70">{durationStr}</span>}
         </div>
 
-        <span className="text-[10px] text-gray-600 shrink-0 mt-0.5">{formatClock(conv.startTime)}</span>
-        <span className="text-[10px] text-gray-600 shrink-0 mt-0.5">{expanded ? "▲" : "▼"}</span>
+        <span className="text-[10px] text-g-fg-4/70 shrink-0 mt-0.5">{formatClock(conv.startTime)}</span>
+        <span className="text-[10px] text-g-fg-4/70 shrink-0 mt-0.5">{expanded ? "▲" : "▼"}</span>
       </div>
 
       {/* Expanded content — full conversation */}
@@ -239,9 +239,9 @@ function ConversationCard({ conv }: { conv: Conversation }) {
           {mergedText && (
             <div className="ml-3 border-l border-blue-500/20 pl-2">
               <div className="flex items-center gap-1.5">
-                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-300 shrink-0">输出</span>
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 shrink-0">输出</span>
               </div>
-              <div className="mt-1 text-[11px] text-gray-300 leading-relaxed whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
+              <div className="mt-1 text-[11px] text-g-fg leading-relaxed whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
                 {mergedText}
               </div>
             </div>
@@ -251,9 +251,9 @@ function ConversationCard({ conv }: { conv: Conversation }) {
           {conv.events.filter((e) => e.type === "error").map((e, i) => (
             <div key={`err-${i}`} className="ml-3 border-l border-red-500/20 pl-2">
               <div className="flex items-center gap-1.5">
-                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-red-500/10 text-red-300 shrink-0">错误</span>
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-red-500/10 text-red-600 shrink-0">错误</span>
               </div>
-              <div className="mt-1 text-[11px] text-red-300 leading-relaxed">
+              <div className="mt-1 text-[11px] text-red-600 leading-relaxed">
                 {e.errorMessage}
               </div>
             </div>
@@ -262,8 +262,8 @@ function ConversationCard({ conv }: { conv: Conversation }) {
           {/* Done marker */}
           {!conv.isLive && !hasError && (
             <div className="flex items-center gap-1.5 ml-3">
-              <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300">完成</span>
-              <span className="text-[9px] text-gray-600">{formatTime(conv.endTime)}</span>
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600">完成</span>
+              <span className="text-[9px] text-g-fg-4/70">{formatTime(conv.endTime)}</span>
             </div>
           )}
         </div>
@@ -281,16 +281,16 @@ function ThinkingBlock({ content }: { content: string }) {
         className="flex items-center gap-1.5 cursor-pointer hover:bg-purple-500/5 rounded px-1 -mx-1 transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
-        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-300 shrink-0">思考</span>
+        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-600 shrink-0">思考</span>
         {!expanded && (
-          <span className="text-[11px] text-gray-400 truncate flex-1">
+          <span className="text-[11px] text-g-fg-3 truncate flex-1">
             {content.slice(0, 120)}{content.length > 120 ? "…" : ""}
           </span>
         )}
-        <span className="text-[10px] text-gray-600 shrink-0">{expanded ? "▲" : "▼"}</span>
+        <span className="text-[10px] text-g-fg-4/70 shrink-0">{expanded ? "▲" : "▼"}</span>
       </div>
       {expanded && (
-        <div className="mt-1 text-[11px] text-gray-400 leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto bg-surface-alt rounded px-2 py-1.5">
+        <div className="mt-1 text-[11px] text-g-fg-3 leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto bg-g-bg-soft rounded px-2 py-1.5">
           {content}
         </div>
       )}
@@ -316,33 +316,33 @@ function WorkLogEntry({ log }: { log: WorkLog }) {
   const canExpand = hasDetails || hasMoreSummary;
 
   return (
-    <div className="px-4 py-3 hover:bg-surface-border/20 transition-colors">
+    <div className="px-4 py-3 hover:bg-g-border/20 transition-colors">
       <div className="flex items-center gap-2 mb-1">
         <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${typeInfo.bg} ${typeInfo.text}`}>
           {label}
         </span>
-        <span className="text-xs text-gray-500">{formatTime(log.createdAt)}</span>
+        <span className="text-xs text-g-fg-4">{formatTime(log.createdAt)}</span>
         {canExpand && (
           <button
             onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
-            className="ml-auto text-xs text-gray-500 hover:text-gray-300 transition-colors px-2 py-0.5 rounded hover:bg-surface-border/40"
+            className="ml-auto text-xs text-g-fg-4 hover:text-g-fg transition-colors px-2 py-0.5 rounded hover:bg-g-bg-soft"
           >
             {expanded ? "收起 ▲" : "详情 ▼"}
           </button>
         )}
       </div>
-      <p className="text-sm text-gray-300 leading-relaxed line-clamp-2">{summary}</p>
+      <p className="text-sm text-g-fg leading-relaxed line-clamp-2">{summary}</p>
 
       {/* Expanded: full summary + details */}
       {expanded && (
         <div className="mt-2 space-y-2">
           {hasMoreSummary && (
-            <div className="text-xs text-gray-400 bg-surface-alt rounded px-3 py-2 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+            <div className="text-xs text-g-fg-3 bg-g-bg-soft rounded px-3 py-2 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
               {log.summary}
             </div>
           )}
           {prettyDetails && (
-            <div className="text-xs text-gray-400 bg-surface-alt rounded px-3 py-2 font-mono whitespace-pre-wrap break-all max-h-56 overflow-y-auto">
+            <div className="text-xs text-g-fg-3 bg-g-bg-soft rounded px-3 py-2 font-mono whitespace-pre-wrap break-all max-h-56 overflow-y-auto">
               {prettyDetails}
             </div>
           )}
@@ -385,21 +385,21 @@ export function ActivityLog({ agentId }: { agentId?: string | null }) {
 
   if (agentRows.length === 0) {
     return (
-      <div className="border-t border-surface-border bg-surface-card shrink-0">
+      <div className="border-t border-g-border bg-g-bg shrink-0">
         <div className="px-4 py-2 flex items-center justify-between">
-          <span className="text-xs font-medium text-gray-500">Live Activity</span>
-          <span className="text-xs text-gray-600">空闲</span>
+          <span className="text-xs font-medium text-g-fg-4">Live Activity</span>
+          <span className="text-xs text-g-fg-4/70">空闲</span>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="border-t border-surface-border bg-surface-card shrink-0">
+    <div className="border-t border-g-border bg-g-bg shrink-0">
       {/* Header */}
       <div className="px-4 py-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-medium text-gray-500">Live Activity</span>
+          <span className="text-xs font-medium text-g-fg-4">Live Activity</span>
           {liveCount > 0 && (
             <span className="flex items-center gap-1.5 text-xs text-emerald-400">
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
@@ -407,7 +407,7 @@ export function ActivityLog({ agentId }: { agentId?: string | null }) {
             </span>
           )}
         </div>
-        <button onClick={clearActivity} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">清空</button>
+        <button onClick={clearActivity} className="text-xs text-g-fg-4 hover:text-g-fg transition-colors">清空</button>
       </div>
 
       {/* Agent rows — click to expand */}
@@ -436,29 +436,29 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
   const preview = firstLine.length > 80 ? firstLine.slice(0, 80) + "…" : firstLine;
 
   return (
-    <div className="rounded-lg bg-surface-alt/40 border border-surface-border/40">
+    <div className="rounded-lg bg-g-bg-soft/60 border border-g-border/40">
       {/* Compact row — always visible, mirrors TRAE Work's "Agent · action" header */}
       <div
-        className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-surface-alt/60 transition-colors rounded-t-lg"
+        className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-g-bg-soft/80 transition-colors rounded-t-lg"
         onClick={() => setExpanded(!expanded)}
       >
         <span className={`w-2 h-2 rounded-full shrink-0 ${conv.isLive ? "bg-emerald-400 animate-pulse" : hasError ? "bg-red-400" : "bg-gray-500"}`} />
-        <span className="text-sm font-medium text-gray-200 truncate">{conv.agentName}</span>
+        <span className="text-sm font-medium text-g-fg truncate">{conv.agentName}</span>
         {conv.isLive && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 shrink-0">运行中</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-600 shrink-0">运行中</span>
         )}
         {toolCount > 0 && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 shrink-0">{toolCount} 工具</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 shrink-0">{toolCount} 工具</span>
         )}
         {olderCount > 0 && (
-          <span className="text-[10px] text-gray-600 shrink-0">+{olderCount}</span>
+          <span className="text-[10px] text-g-fg-4/70 shrink-0">+{olderCount}</span>
         )}
-        <span className="text-[10px] text-gray-500 ml-auto shrink-0">{formatClock(conv.startTime)}</span>
-        <span className="text-[10px] text-gray-600 shrink-0">{expanded ? "▲" : "▼"}</span>
+        <span className="text-[10px] text-g-fg-4 ml-auto shrink-0">{formatClock(conv.startTime)}</span>
+        <span className="text-[10px] text-g-fg-4/70 shrink-0">{expanded ? "▲" : "▼"}</span>
       </div>
 
       {!expanded && preview && (
-        <p className="px-3 pb-2 text-xs text-gray-500 truncate pl-7">{preview}</p>
+        <p className="px-3 pb-2 text-xs text-g-fg-4 truncate pl-7">{preview}</p>
       )}
 
       {/* Expanded — clean step list (think → tools → output), TRAE Work style */}
@@ -466,12 +466,12 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
         <div className="px-3 pb-3 pl-7 space-y-1.5">
           {mergedThinking && (
             <details className="group">
-              <summary className="text-[11px] text-purple-300 cursor-pointer list-none flex items-center gap-1.5 select-none">
-                <span className="text-[9px] text-gray-600 group-open:rotate-90 transition-transform">▶</span>
+              <summary className="text-[11px] text-purple-600 cursor-pointer list-none flex items-center gap-1.5 select-none">
+                <span className="text-[9px] text-g-fg-4/70 group-open:rotate-90 transition-transform">▶</span>
                 <span>思考</span>
-                <span className="text-[9px] text-gray-600">{mergedThinking.length} 字符</span>
+                <span className="text-[9px] text-g-fg-4/70">{mergedThinking.length} 字符</span>
               </summary>
-              <div className="mt-1 text-[11px] text-gray-400 bg-surface-alt/70 rounded px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed">
+              <div className="mt-1 text-[11px] text-g-fg-3 bg-g-bg-soft/90 rounded px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed">
                 {mergedThinking}
               </div>
             </details>
@@ -483,12 +483,12 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
 
           {mergedText && (
             <details className="group" open={conv.isLive}>
-              <summary className="text-[11px] text-blue-300 cursor-pointer list-none flex items-center gap-1.5 select-none">
-                <span className="text-[9px] text-gray-600 group-open:rotate-90 transition-transform">▶</span>
+              <summary className="text-[11px] text-blue-600 cursor-pointer list-none flex items-center gap-1.5 select-none">
+                <span className="text-[9px] text-g-fg-4/70 group-open:rotate-90 transition-transform">▶</span>
                 <span>输出</span>
-                <span className="text-[9px] text-gray-600">{mergedText.length} 字符</span>
+                <span className="text-[9px] text-g-fg-4/70">{mergedText.length} 字符</span>
               </summary>
-              <div className="mt-1 text-[12px] text-gray-200 bg-surface-alt/70 rounded px-2.5 py-2 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed">
+              <div className="mt-1 text-[12px] text-g-fg bg-g-bg-soft/90 rounded px-2.5 py-2 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed">
                 {mergedText}
               </div>
             </details>
@@ -496,8 +496,8 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
 
           {conv.events.filter((e) => e.type === "error").map((e, i) => (
             <div key={`err-${i}`}>
-              <span className="text-[11px] text-red-300 mb-1 block">错误</span>
-              <div className="text-[11px] text-red-300 bg-red-500/10 rounded px-2.5 py-1.5">
+              <span className="text-[11px] text-red-600 mb-1 block">错误</span>
+              <div className="text-[11px] text-red-600 bg-red-500/10 rounded px-2.5 py-1.5">
                 {e.errorMessage}
               </div>
             </div>
@@ -567,15 +567,15 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
   }
 
   return (
-    <div className="border-t border-surface-border bg-surface-card shrink-0">
+    <div className="border-t border-g-border bg-g-bg shrink-0">
       {/* Toggle Header */}
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="w-full px-6 py-3 flex items-center justify-between hover:bg-surface-border/30 transition-colors"
+        className="w-full px-6 py-3 flex items-center justify-between hover:bg-g-border/30 transition-colors"
       >
         <div className="flex items-center gap-2">
           <svg
-            className="w-4 h-4 text-gray-400"
+            className="w-4 h-4 text-g-fg-3"
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -587,15 +587,15 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
               d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"
             />
           </svg>
-          <span className="text-sm font-medium text-gray-300">Work Logs</span>
+          <span className="text-sm font-medium text-g-fg">Work Logs</span>
           {logs.length > 0 && (
-            <span className="text-xs px-2 py-0.5 rounded-full bg-surface-border text-gray-400">
+            <span className="text-xs px-2 py-0.5 rounded-full bg-g-border text-g-fg-3">
               {logs.length}
             </span>
           )}
         </div>
         <svg
-          className={`w-4 h-4 text-gray-400 transition-transform ${isOpen ? "rotate-180" : ""}`}
+          className={`w-4 h-4 text-g-fg-3 transition-transform ${isOpen ? "rotate-180" : ""}`}
           fill="none"
           viewBox="0 0 24 24"
           stroke="currentColor"
@@ -606,7 +606,7 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
 
       {/* Log Content */}
       {isOpen && (
-        <div className="max-h-80 overflow-y-auto border-t border-surface-border">
+        <div className="max-h-80 overflow-y-auto border-t border-g-border">
           {loading ? (
             <div className="px-6 py-4 flex justify-center">
               <div className="flex gap-1">
@@ -617,7 +617,7 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
             </div>
           ) : logs.length === 0 ? (
             <div className="px-6 py-8 text-center">
-              <p className="text-sm text-gray-500">暂无工作日志</p>
+              <p className="text-sm text-g-fg-4">暂无工作日志</p>
             </div>
           ) : (
             <div className="divide-y divide-surface-border/50">

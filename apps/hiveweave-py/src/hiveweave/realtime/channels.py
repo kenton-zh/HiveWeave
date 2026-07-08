@@ -442,6 +442,15 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
         log.warning("ws_agent_history_failed", agent_id=agent_id, error=str(e))
         history = []
 
+    # 获取待处理 inbox 消息
+    from hiveweave.services.inbox import InboxService
+    inbox_service = InboxService()
+    try:
+        pending_inbox = await inbox_service.get_pending_messages(agent_id)
+    except Exception as e:
+        log.warning("ws_agent_inbox_failed", agent_id=agent_id, error=str(e))
+        pending_inbox = []
+
     # 构建初始快照
     init_events: list[dict] = [
         {
@@ -450,7 +459,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
             "name": agent_config.get("name", ""),
             "role": agent_config.get("role", ""),
             "history": history,
-            "inbox": [],  # TODO: 契约 12 — join 时返回 inbox
+            "inbox": pending_inbox,
         }
     ]
 
