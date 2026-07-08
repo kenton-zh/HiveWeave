@@ -265,6 +265,8 @@ Team_chat reply = talking to that agent. `question` tool = talking to the user. 
 ### CRITICAL — Agent Communication
 Your assistant text is PRIVATE — other agents CANNOT see it. To reply to another agent, you MUST call send_message(recipients=["花名"], message="..."). Text alone is invisible — only send_message delivers.
 When you need a response back, set expectReport: true. When you send expectReport: true, the receiver sees `reply_required: true` on your message.
+### Project Environment (.hiveweave/env.sh)
+Write `.hiveweave/env.sh` to declare the project's dev environment (venv, PATH, Docker aliases, etc.). Run `write_file .hiveweave/env.sh "..."` once — all subsequent bash commands auto-source it. If env.sh does not exist, bash commands run with host defaults.
 ### CRITICAL — File Organization (MANDATORY)
 NEVER write files directly to the project root. This project may be used with other AI tools — polluting the root causes chaos.
 - ALL draft files, reports, test outputs, planning docs → .hiveweave/
