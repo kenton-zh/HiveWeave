@@ -6,20 +6,21 @@ export default function QuestionDialog() {
   const [questions, setQuestions] = useState<PendingQuestion[]>([]);
   const [customAnswers, setCustomAnswers] = useState<Record<string, string>>({});
   const dismissedRef = useRef<Set<string>>(new Set());
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
 
   // Poll for pending questions
   // BUG-005 修复：2s → 5s，减少 polling 频率（30→12 req/min）
   useEffect(() => {
     const timer = setInterval(async () => {
       try {
-        const qs = await getQuestions();
+        const qs = await getQuestions({ projectId: activeProjectId || undefined });
         // Filter out locally dismissed questions; always sync (clear when server has none)
         const visible = qs.filter((q) => !dismissedRef.current.has(q.id));
         setQuestions(visible);
       } catch { /* ignore poll errors */ }
     }, 5000);
     return () => clearInterval(timer);
-  }, []);
+  }, [activeProjectId]);
 
   const handleAnswer = async (id: string, answer: string) => {
     await answerQuestion(id, answer);

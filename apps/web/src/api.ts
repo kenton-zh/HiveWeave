@@ -990,9 +990,10 @@ export interface PendingQuestion {
   answeredAt?: number;
 }
 
-export async function getQuestions(opts?: { agentId?: string; status?: string }): Promise<PendingQuestion[]> {
+export async function getQuestions(opts?: { agentId?: string; projectId?: string; status?: string }): Promise<PendingQuestion[]> {
   const params = new URLSearchParams();
   if (opts?.agentId) params.set("agentId", opts.agentId);
+  if (opts?.projectId) params.set("projectId", opts.projectId);
   if (opts?.status) params.set("status", opts.status);
   const qs = params.toString();
   return fetchJSON(`${BASE}/chat/questions${qs ? "?" + qs : ""}`);
