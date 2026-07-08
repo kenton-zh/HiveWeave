@@ -28,7 +28,7 @@ log = structlog.get_logger(__name__)
 DEFAULT_TIMEOUT_S = 120          # 2 minutes
 MAX_TIMEOUT_S = 600              # 10 minutes hard cap
 MAX_CAPTURE_BYTES = 1_048_576    # 1MB — bash 专用轻量截断阈值
-DOCKER_SANDBOX_IMAGE = "hiveweave-bash:latest"
+DOCKER_SANDBOX_IMAGE = "hiveweave/sandbox:latest"
 
 # 环境变量白名单 — 只传系统必要变量给子进程，绝不传递任何含
 # KEY/SECRET/TOKEN/PASSWORD 的变量（C5: 防止 API 密钥泄露）。
@@ -256,6 +256,7 @@ async def execute_bash(
     workspace_path: str,
     timeout_ms: int | None = None,
     use_docker: bool | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute a bash command and return {success, output, error}.
 
@@ -263,7 +264,7 @@ async def execute_bash(
       1. Self-destructive command check (7 patterns)
       2. Sandbox validation (workdir must be within workspace)
       3. Timeout clamping (1s..600s)
-      4. Execute (native or Docker sandbox)
+      4. Execute (persistent sandbox > one-shot docker > native)
       5. Truncate output at 1MB (layer 2, bash-specific)
     """
     if not command or not command.strip():
@@ -309,18 +310,28 @@ async def execute_bash(
     timeout_ms = max(1000, min(int(timeout_ms), MAX_TIMEOUT_S * 1000))
     timeout_s = timeout_ms / 1000
 
-    # 4. Choose execution backend
-    sandbox_env = os.environ.get("BASH_SANDBOX", "").lower()
-    if use_docker is None:
-        use_docker = sandbox_env == "docker"
+    # 4. Choose execution backend (priority: persistent sandbox > one-shot docker > native)
+    result = None
 
-    log.info("bash.execute", cwd=cwd, timeout_s=timeout_s,
-             docker=use_docker, command_preview=command[:120])
+    # 4a. Try persistent sandbox (per-project container, preserves npm/pip installs)
+    if use_docker is not False and project_id:  # None or True
+        try:
+            from hiveweave.services.sandbox import SandboxService
+            sandbox = SandboxService(enabled=True)
+            if sandbox.enabled and not sandbox.should_use_host(command):
+                result = await sandbox.exec(project_id, command, timeout_s)
+                if result.get("error") is None:
+                    log.info("bash.sandbox", project_id=project_id)
+        except Exception as e:
+            log.debug("bash.sandbox_unavailable", error=str(e))
 
-    if use_docker:
-        result = await _run_docker(command, cwd, int(timeout_s))
-    else:
-        result = await _run_native(command, cwd, int(timeout_s))
+    # 4b. Fallback: one-shot docker (BASH_SANDBOX=docker env var)
+    if result is None:
+        sandbox_env = os.environ.get("BASH_SANDBOX", "").lower()
+        if use_docker or sandbox_env == "docker":
+            result = await _run_docker(command, cwd, int(timeout_s))
+        else:
+            result = await _run_native(command, cwd, int(timeout_s))
 
     if result.get("error"):
         return {"success": False, "output": "",
