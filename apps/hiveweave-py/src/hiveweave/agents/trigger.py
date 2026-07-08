@@ -49,6 +49,10 @@ _inbox_service = InboxService()
 _handoff_service = HandoffService()
 _dispatch_service = DispatchService()
 
+# Dedup: track last goals version shown to each agent via chat_message.
+# Prevents back-to-back triggers from saving the same Goals Workbook block twice.
+_last_goals_msg_version: dict[str, int] = {}
+
 
 # ── 辅助函数 ────────────────────────────────────────────────
 
@@ -65,6 +69,15 @@ async def _agent_name(agent_id: str) -> str:
     except Exception:
         pass
     return agent_id
+
+
+def _strip_goals_block(context: str) -> str:
+    """Remove the Goals Workbook block from context to avoid duplicate display."""
+    import re
+    return re.sub(
+        r'\n*## Goals Workbook \(updated\)\n\{[^}]*"from":\s*"[^"]*"[^}]*\}\n*',
+        '', context
+    ).strip()
 
 
 def is_coordinator(role: str | None) -> bool:
@@ -231,7 +244,16 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
             context_preview=context[:100],
         )
 
-        # 8. 保存为 background user 消息
+        # 8. 保存为 background user 消息（去重 goals workbook block）
+        # 如果连续两个 trigger 都带相同的 Goals Workbook 块，第二条前端刷屏。
+        from hiveweave.services.charter import charter_service as _cs
+        goals_ver = _cs.get_goals_version(project_id)
+        chat_context = context
+        if goals_ver and goals_ver == _last_goals_msg_version.get(agent_id):
+            chat_context = _strip_goals_block(context)
+        if goals_ver:
+            _last_goals_msg_version[agent_id] = goals_ver
+
         from hiveweave.services.chat_message import ChatMessageService
 
         chat_msg_service = ChatMessageService()
@@ -239,7 +261,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
             {
                 "agent_id": agent_id,
                 "role": "user",
-                "content": context,
+                "content": chat_context,
                 "is_background": True,
                 "is_read": False,
                 "is_context": True,
