@@ -21,39 +21,52 @@
 
 ---
 
+**[What is HiveWeave](#what-is-hiveweave) · [Quick Start](#quick-start) · [Architecture](#architecture) · [Core Capabilities](#core-capabilities) · [Tech Stack](#tech-stack) · [Features](#features) · [Docs](#documentation)**
+
+---
+
 ## What is HiveWeave
 
 HiveWeave replaces the single-AI-agent model with a **multi-agent engineering organization**. Instead of one AI doing everything, you get a CEO, managers, engineers, QA, and HR — each with their own role, memory, tools, and worktree. They hire, delegate, review, merge, and report. You manage them like a real team.
 
 > **Why**: Single-agent tools (Claude Code, Codex, Cursor) lose context across modules, can't parallelize, and have no quality gate. HiveWeave splits the work across specialized agents with isolated contexts, independent worktrees, and a four-layer review chain before anything reaches you.
 
+|  | Single-agent tools (Claude Code, Cursor, Codex) | HiveWeave |
+|:---|:---|:---|
+| **Context** | One shared context, degrades as the codebase grows | Per-agent context — the frontend agent never loads backend code |
+| **Parallelism** | One task at a time | Parallel agents, each on its own `git worktree` |
+| **Quality gate** | You review everything yourself | 4-layer review: Executor → QA → Manager → CEO → you |
+| **Cost model** | Same model for every task | Premium models for decisions, cheap models for execution |
+| **Memory** | Reset or manually re-primed each session | Three-tier memory with handoff inheritance between agents |
+
 ## Quick Start
 
+**Prerequisites:** Python ≥3.12, Node 22.x (see `.nvmrc`), [pnpm](https://pnpm.io) 10, [uv](https://github.com/astral-sh/uv), and an API key for at least one LLM provider.
+
 ```bash
-# Clone
+# 1. Clone
 git clone https://github.com/kenton-zh/HiveWeave.git
 cd HiveWeave
 
-# Backend (Python/FastAPI, port 4000)
+# 2. Configure your API key
+cp apps/hiveweave-py/.env.example apps/hiveweave-py/.env
+# edit apps/hiveweave-py/.env and set HIVEWEAVE_OPENCODE_API_KEY
+# (add OpenAI / Anthropic / DeepSeek / Groq / Google keys later from in-app Settings)
+
+# 3. Backend (Python/FastAPI, port 4000)
 cd apps/hiveweave-py
 uv sync
 uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000
 
-# Frontend (React/Vite, port 5173)
+# 4. Frontend (React/Vite, port 5173) — in a new terminal
 cd apps/web
-export PATH="$LOCALAPPDATA/Programs/node-v22.20.0-win-x64:$PATH"  # Windows only
 pnpm install
 pnpm dev
 ```
 
-Or use the startup scripts (Windows):
-```bash
-start-all.bat          # Backend + Frontend
-start-backend.bat      # Backend only (port 4000)
-start-frontend.bat     # Frontend only (port 5173)
-```
-
 Open `http://localhost:5173` to create your first project and meet your CEO.
+
+**On Windows**, `start-all.bat` / `start-backend.bat` / `start-frontend.bat` run steps 3–4 for you — just make sure Node is on `PATH` first.
 
 ## Architecture
 
@@ -139,9 +152,8 @@ hiveweave/
 │   │       ├── realtime/              # phoenix_adapter, channels, pubsub, event_bus
 │   │       └── prompts/               # ETHOS prompt system (identity + context)
 │   └── web/                           # Frontend — React 19 + Vite + Electron (port 5173)
-├── docs/
-│   ├── migration/                     # Migration history (Elixir/TS → Python)
-│   └── PoE2LI-team-config.md          # Example team configuration
+├── assets/
+│   └── screenshots/                   # Screenshots for README
 ├── start-all.bat                      # Windows startup script
 └── CLAUDE.md                          # AI tooling instructions
 ```
@@ -186,9 +198,7 @@ hiveweave/
 
 ## Documentation
 
-- [CLAUDE.md](./CLAUDE.md) — AI tooling instructions & architecture deep-dive
-- [Migration History](./docs/migration/) — Elixir/TS → Python migration records
-- [PoE2LI Team Config](./docs/PoE2LI-team-config.md) — Example team configuration template
+- [CLAUDE.md](./CLAUDE.md) — AI tooling instructions & full architecture reference
 
 ## Acknowledgments
 
@@ -205,7 +215,9 @@ HiveWeave builds on ideas, code, and workflows from these projects:
 
 ## Contributing
 
-HiveWeave is in active development. The project is built by AI agents (CEO + team) with human oversight at key verification nodes. See [CLAUDE.md](./CLAUDE.md) for the full development workflow.
+HiveWeave is in active development and built largely by its own AI agent team (CEO + org), with human review at key checkpoints — see [CLAUDE.md](./CLAUDE.md) for that workflow if you're driving it through Claude Code or a similar coding agent.
+
+Human contributions are just as welcome: open an issue for bugs or ideas, or fork and send a PR. No special process required.
 
 ---
 
