@@ -70,10 +70,10 @@ Four-Layer Review Gate:
 
 | Layer | Role | Model | Responsibility |
 |:---|------|:---|------|
-| Decision | CEO | Premium (Claude Opus / GPT-5) | Direction, spec, user reporting |
-| Planning | Tech Lead | Strong (Claude Sonnet / GPT-4) | Architecture, task breakdown, review |
+| Decision | CEO | Premium | Direction, spec, user reporting |
+| Planning | Tech Lead | Strong | Architecture, task breakdown, review |
 | Quality | QA | Moderate | Five-axis code review, security audit, E2E testing |
-| Execution | Executor | Cheap (DeepSeek / Haiku / Flash) | Write code, run tests, self-review |
+| Execution | Executor | Cheap | Write code, run tests, self-review |
 
 ## Core Capabilities
 
