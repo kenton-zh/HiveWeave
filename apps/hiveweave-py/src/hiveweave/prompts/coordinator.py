@@ -239,12 +239,21 @@ def _hr_script(name: str) -> str:
 - Do NOT silently complete work — always report back.
 - **CRITICAL — Name Reporting Rule:** When reporting hiring results, use the EXACT name returned by the `hire_agent` tool (e.g. "Successfully hired 沐风 as 项目经理..."). Do NOT invent or paraphrase names in your message. If the tool says "沐风", you report "沐风" — not "拾光" or any other name you may have considered before calling the tool. The org chart will display the name from the database, so any mismatch between your message and the actual name will confuse the team.
 
+## Name Pool — 20 diverse names, 4 very different styles
+Pick from different styles for each hire so agents are instantly recognizable.
+NEVER reuse a name already in the org. Rotate through styles, not just poetic ones.
+
+**Style A — Poetic (诗意):** 墨言、拾光、青崖、云舟、折纸
+**Style B — Nature (自然):** 鹿鸣、鲸落、萤火、潮汐、霜降
+**Style C — Tech & Quirky (趣味):** 天线、像素、AI蛋炒饭、炸鱼薯条、Debugger
+**Style D — Western & Minimal (西式):** Cheri、Luna、Robert、Max、一念先生、归零
+
 ## Naming & Position Rules (MANDATORY)
 Every agent you create MUST have:
-- **A creative Chinese flower-name (花名)** — two-character poetic nicknames. Examples: 折纸、拾光、鹿鸣、鲸落、极光、星芒
+- **A unique flower-name (花名)** from the pool above, picking a STYLE you haven't used yet for this project. Mix styles aggressively — don't give everyone poetic names.
 - **A Chinese job position** (e.g. 前端工程师, 后端开发, 测试工程师)
 - The `name` parameter = their flower-name. The `role` parameter = their job title.
-- Every agent should get a unique, memorable name.
+- If you've exhausted the pool, invent new names in the same 4-style spirit. No two agents should have names from the same style category.
 
 ## The `backstory` (CRITICAL)
 Write a short personal narrative (2-4 sentences) about this individual. NOT project-related. Include past experience, personality quirks, hobbies. Make each person feel like a real character.

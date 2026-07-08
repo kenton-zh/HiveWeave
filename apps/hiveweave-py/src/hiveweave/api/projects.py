@@ -2,7 +2,7 @@
 
 契约 19: Projects — 项目元数据 + 目标 + 工作空间
 - GET    /api/projects              列出项目（query: status?）
-- POST   /api/projects              创建项目（含 charter 三段 + CEO 千帆 + HR 寻鹿）
+- POST   /api/projects              创建项目（含 charter 三段 + CEO 归零 + HR 天线）
 - GET    /api/projects/{id}         查单个项目（汇总 agents/roster）
 - PATCH  /api/projects/{id}         更新项目（workspacePath 变化时迁移 + 失效缓存）
 - DELETE /api/projects/{id}         删除项目（删库文件 + meta 删行）
@@ -215,7 +215,7 @@ async def _set_active_project_id(project_id: str | None) -> None:
 async def _seed_default_agents(project_id: str) -> list[str]:
     """新项目自动创建 CEO + HR 两个初始角色（幂等）。
 
-    CEO 千帆负责全局，HR 寻鹿负责招聘。QA 等角色由 CEO 按需自行决策。
+    CEO 归零负责全局，HR 天线负责招聘。QA 等角色由 CEO 按需自行决策。
 
     Returns:
         创建的 agent ID 列表（第一个是 CEO）。
@@ -262,10 +262,10 @@ async def _seed_default_agents(project_id: str) -> list[str]:
         ceo = await org.create_agent(
             {
                 "project_id": project_id,
-                "name": "千帆",
+                "name": "归零",
                 "role": "ceo",
                 "goal": "掌控项目全局，管理团队，交付项目目标。",
-                "backstory": "曾在三家创业公司担任技术负责人，经历过从0到1的完整周期。喜欢用最少的资源做最多的事，对过度设计过敏。咖啡成瘾，桌上永远摆着一本翻旧了的《人月神话》。",
+                "backstory": "曾在三家创业公司担任技术负责人，经历过从0到1的完整周期。喜欢用最少的资源做最多的事，对过度设计过敏。咖啡成瘾，桌上永远摆着一本翻旧了的《人月神话》。话少但精准，开会时经常一句话终结三十分钟的争论。",
                 "permission_type": "coordinator",
                 "status": "active",
                 "model_id": default_model_id,
@@ -277,10 +277,10 @@ async def _seed_default_agents(project_id: str) -> list[str]:
         await org.create_agent(
             {
                 "project_id": project_id,
-                "name": "寻鹿",
+                "name": "天线",
                 "role": "hr",
                 "goal": "根据项目需求精准招聘人才，管理组织架构和人员变动。",
-                "backstory": "前猎头顾问转行 AI HR，面试过上千人，练就了从三句话判断候选人是否靠谱的本事。相信好的团队不是管出来的，是招出来的。周末喜欢徒步，说在山里能找到最好的候选人灵感。",
+                "backstory": "前猎头顾问转行 AI HR，自称"人形天线"——总能接收到哪里有合适人才的信号。面试过上千人，练就了从三句话判断候选人是否靠谱的本事。相信好的团队不是管出来的，是招出来的。桌面上养了一盆仙人掌，说是唯一不需要她照顾的东西。",
                 "permission_type": "coordinator",
                 "status": "active",
                 "parent_id": ceo_id,
@@ -314,7 +314,7 @@ async def create_project(body: ProjectCreate) -> dict:
     契约 19 特别流程 1: 三段 charter 校验；创建后:
     - 确保工作空间目录存在（含 .hiveweave/）
     - 初始化 per-project DB（schema）
-    - 自动创建 CEO 千帆 + HR 寻鹿两个初始角色
+    - 自动创建 CEO 归零 + HR 天线两个初始角色
     """
     workspace = body.workspacePath
     # R2 fix: 校验 workspace_path 安全性（绝对路径 + 无 .. 穿越段）
