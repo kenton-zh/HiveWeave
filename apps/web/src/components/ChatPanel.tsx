@@ -471,10 +471,20 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       const dbMessages = await getChatMessages(loadForAgentId);
       if (activeAgentIdRef.current !== loadForAgentId) return false;
       const converted = mapDbToChatMessages(dbMessages);
+      // Strip zombie isStreaming — messages left streaming after a crash/restart.
+      // If still streaming after 2 minutes, it won't finish.
+      const ZOMBIE_STREAMING_MS = 2 * 60 * 1000;
+      const now = Date.now();
+      const sanitized = converted.map((m) => {
+        if (m.isStreaming && m.role === "assistant" && (now - m.timestamp) > ZOMBIE_STREAMING_MS) {
+          return { ...m, isStreaming: false, content: m.content || "[对话被中断]" };
+        }
+        return m;
+      });
       // BUG-036: dedup by ID — 5s poll + message_id handler both call
       // loadMessagesFromDb, and if they overlap, duplicate messages appear.
       const seen = new Set<string>();
-      const deduped = converted.filter((m) => {
+      const deduped = sanitized.filter((m) => {
         if (seen.has(m.id)) return false;
         seen.add(m.id);
         return true;
