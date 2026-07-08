@@ -48,6 +48,54 @@ _SAFE_ENV_KEYS: frozenset[str] = frozenset({
 })
 
 
+def _force_local_deps(command: str, hw_dir: str) -> str:
+    """Rewrite install commands to force dependencies into .hiveweave/.
+
+    pip install X  →  pip install --target .hiveweave/pip-packages X
+    npm install    →  npm install --prefix .hiveweave/node
+    pip/npm -g     →  blocked with error
+    """
+    import re
+
+    cmd = command.strip()
+
+    # ── pip install / pip3 install ──
+    m = re.match(r'^(pip3?|python3?\s+-m\s+pip)\s+install\s+(.*)$', cmd)
+    if m:
+        pip_cmd = m.group(1)
+        rest = m.group(2)
+        if re.search(r'(?<!\S)(-g|--global)(?!\S)', rest):
+            return f"echo 'BLOCKED: pip install -g is forbidden. Use --target {hw_dir}/pip-packages' && exit 1"
+        if '--target' not in rest:
+            target = f"{hw_dir}/pip-packages"
+            return f"mkdir -p {target} 2>/dev/null; {pip_cmd} install --target {target} {rest}"
+        return command  # already has --target, leave alone
+
+    # ── npm install ──
+    m = re.match(r'^npm\s+install\s+(.*)$', cmd)
+    if m:
+        rest = m.group(1)
+        if re.search(r'(?<!\S)(-g|--global)(?!\S)', rest):
+            return f"echo 'BLOCKED: npm install -g is forbidden. Use --prefix {hw_dir}/node' && exit 1"
+        if '--prefix' not in rest:
+            prefix = f"{hw_dir}/node"
+            return f"mkdir -p {prefix} 2>/dev/null; npm install --prefix {prefix} {rest}"
+        return command
+
+    # ── npm i (shorthand) ──
+    m = re.match(r'^npm\s+i\s+(.*)$', cmd)
+    if m:
+        rest = m.group(1)
+        if re.search(r'(?<!\S)(-g|--global)(?!\S)', rest):
+            return f"echo 'BLOCKED: npm i -g is forbidden. Use --prefix {hw_dir}/node' && exit 1"
+        if '--prefix' not in rest:
+            prefix = f"{hw_dir}/node"
+            return f"mkdir -p {prefix} 2>/dev/null; npm i --prefix {prefix} {rest}"
+        return command
+
+    return command
+
+
 def _build_safe_env(cwd: str) -> dict[str, str]:
     """构建白名单环境变量，仅传递系统必要变量 + HiveWeave 标记。
 
@@ -288,6 +336,11 @@ async def execute_bash(
                          "sensitive file (e.g. .env, *.pem, id_rsa, "
                          "credentials). Use read_file with explicit "
                          "approval instead."}
+
+    # 1.5. Force dependency installation into .hiveweave/ instead of system/global.
+    # Agents often run `pip install` or `npm install` — rewrite to project-local paths.
+    hw_dir = str(Path(workspace_path) / ".hiveweave")
+    command = _force_local_deps(command, hw_dir)
 
     # 2. Resolve cwd and validate sandbox
     ws = workspace_path or os.getcwd()
