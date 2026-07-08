@@ -403,14 +403,14 @@ function TreeNodeCard({
         width: node.w,
         minHeight: nodeH,
         borderLeft: `3px solid ${accentColor}`,
-        border: isSelected
-          ? undefined
-          : isProcessing
-            ? "1px solid rgba(52,168,83,.30)"
-            : "1px solid #ebebeb",
-        borderLeftWidth: 3,
-        borderLeftStyle: "solid",
-        borderLeftColor: accentColor,
+        borderTop: "1px solid #ebebeb",
+        borderRight: "1px solid #ebebeb",
+        borderBottom: "1px solid #ebebeb",
+        ...(isProcessing ? {
+          borderTopColor: "rgba(52,168,83,.30)",
+          borderRightColor: "rgba(52,168,83,.30)",
+          borderBottomColor: "rgba(52,168,83,.30)",
+        } : {}),
         background: isSelected
           ? "rgba(66,133,244,0.08)"
           : "rgba(255,255,255,1)",
