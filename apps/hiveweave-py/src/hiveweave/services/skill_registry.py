@@ -25,13 +25,15 @@ from typing import Any
 import httpx
 import structlog
 
+from hiveweave.config import settings
 from hiveweave.db import meta as meta_db
 
 log = structlog.get_logger(__name__)
 
 # ── 常量 ────────────────────────────────────────────────────
 # 外部技能目录（best-effort；不存在则返回空）
-EXTERNAL_SKILLS_DIR = Path("d:/PC_AI/Project/agent-skills/skills")
+# 通过环境变量 HIVEWEAVE_EXTERNAL_SKILLS_DIR 配置；未设则无外部技能
+EXTERNAL_SKILLS_DIR = Path(settings.external_skills_dir) if settings.external_skills_dir else None
 
 CLAWHUB_BASE_URL = "https://clawhub.ai/api/v1/skills"
 CLAWHUB_TIMEOUT = 5.0  # 契约 10: ClawHub 5s 超时，失败静默降级
@@ -437,7 +439,7 @@ class SkillRegistryService:
     @staticmethod
     def _list_external_skills(search: str | None = None) -> list[dict]:
         """扫描外部技能目录，解析每个子目录的 SKILL.md frontmatter。"""
-        if not EXTERNAL_SKILLS_DIR.exists():
+        if not EXTERNAL_SKILLS_DIR or not EXTERNAL_SKILLS_DIR.exists():
             return []
         results: list[dict] = []
         try:
@@ -465,6 +467,8 @@ class SkillRegistryService:
     @staticmethod
     def _get_external_skill(slug: str) -> dict | None:
         """取单个外部技能的元信息（不含全文）。"""
+        if not EXTERNAL_SKILLS_DIR:
+            return None
         skill_md = EXTERNAL_SKILLS_DIR / slug / "SKILL.md"
         if not skill_md.exists():
             return None
@@ -483,6 +487,8 @@ class SkillRegistryService:
     @staticmethod
     def _read_external_skill_file(slug: str) -> str | None:
         """读取外部技能全文（.compressed.md 优先于 .md）。"""
+        if not EXTERNAL_SKILLS_DIR:
+            return None
         compressed = EXTERNAL_SKILLS_DIR / slug / "SKILL.compressed.md"
         original = EXTERNAL_SKILLS_DIR / slug / "SKILL.md"
         if compressed.exists():

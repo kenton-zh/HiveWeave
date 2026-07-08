@@ -872,7 +872,7 @@ class Agent:
             if charter_data and charter_data.get("project_rules"):
                 project_rules = charter_data["project_rules"]
         except Exception:
-            pass  # charter not initialized yet
+            log.debug("read_charter for project_rules failed", project_id=self.project_id, exc_info=True)
 
         context = build_context_prompt(
             agent_id=self.id,
