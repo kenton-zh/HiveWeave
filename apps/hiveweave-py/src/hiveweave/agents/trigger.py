@@ -236,6 +236,11 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
 
         context, inbox_msg_ids, from_agent_id = result
 
+        # Mark inbox read NOW, before processing. If the agent crashes or
+        # hits doom loop mid-processing, the message won't re-trigger endlessly.
+        if inbox_msg_ids:
+            await _inbox_service.mark_read_by_ids(agent_id, inbox_msg_ids)
+
         log.info(
             "trigger_firing",
             agent_id=agent_id,
