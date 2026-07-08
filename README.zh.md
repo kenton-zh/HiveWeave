@@ -161,15 +161,26 @@ hiveweave/
 | 特性 | 说明 |
 |:---|------|
 | **按角色配模型** | CEO/专家用顶级 LLM；Executor 用便宜模型。规模化成本可控。 |
-| **Worktree 隔离** | 每个 Agent 独立 `git worktree`。并行开发，零冲突。 |
-| **CAVEMAN 通信** | Agent 间消息简洁技术化。无寒暄，不浪费 token。 |
+| **Agent 可单独指定模型** | 每个 Agent 可独立覆盖模型配置。混合 OpenAI、Anthropic、DeepSeek、Groq 等多供应商。 |
+| **每个 Agent 独立工作区** | 每个 Agent 拥有自己的 `git worktree`（`hw/<shortId>/<task>`）。完整文件系统隔离。checkpoint、回滚、合并——全部通过协调者。 |
+| **提交前自审** | Executor 提交代码前先做五轴自查（正确性/可读性/架构/安全/性能）。提前发现问题，减少审查来回。 |
 | **四层把关** | Executor → QA → 经理 → CEO → 你。未经验证的代码到不了你面前。 |
-| **自然语言参与度** | 不是枚举配置。"我只在前端功能完成后验收"——CEO 理解并遵守。 |
-| **Asyncio 任务隔离** | Agent 崩溃不拖垮系统。熔断器 + 指数退避应对 LLM 故障。 |
-| **游戏时间调度** | 15 真实分钟 = 1 游戏天。停滞 Agent 自动升级。基于模拟时钟的定时闹钟。 |
-| **MCP 协议** | 通过 Model Context Protocol 扩展工具。按 Agent 绑定 MCP 服务器。 |
-| **ClawHub 市场** | 远程技能市场。HR 动态搜索和绑定技能。 |
-| **30+ 内置工具** | bash、grep、文件操作、patch、websearch、question、todowrite、review、security、MCP 工具。 |
+| **自然语言参与度** | 不是下拉菜单。_"我只在前端功能完成后验收，后端开发过程不参与。"_ CEO 理解并遵守你的意图。 |
+| **Agent 人格** | 每个 Agent 有花名、个人背景、性格怪癖和爱好。他们像角色，不像函数。 |
+| **纪律套装** | 角色获得定义"怎么思考"的纪律技能集，不只是"用什么工具"。预制套装（QA 套、经理套、Executor 套）或 CEO 自定义。 |
+| **双层技能绑定** | 纪律技能（必绑，定义角色）+ 工具技能（HR 市场匹配）。HR 服务所有协调者，不只 CEO。 |
+| **6 种组织范式** | 单兵、扁平小组、Tech Lead、PM+架构师、Pod、流水线。CEO 选匹配项目规模的结构。 |
+| **Phase 0.5 经理动员** | 经理到位后先摸索领域、拆分任务，再招下属。不过度招聘、不闲置 Agent。 |
+| **CAVEMAN 通信** | Agent 间消息简洁技术化。_"模块已拆分. 3人已招. 等待优先级."_ 无寒暄，零 token 浪费。 |
+| **三层记忆** | 项目记忆（共享）、Agent 私有记忆、归档记忆（离职 Agent）。知识跨会话和交接持久化。 |
+| **交接继承** | Agent 离职时记忆总结并移交给继任者。知识零丢失。 |
+| **专家按需召唤** | 团队遇到解决不了的难题，CEO 召唤专家 Agent（最贵模型）。团队提炼后的问题 → 同样花费得到更好答案。只在真正需要时烧专家 token。 |
+| **Asyncio 任务隔离** | 每个 Agent 运行在独立 asyncio task 中。崩溃不拖垮系统。熔断器 + 指数退避应对 LLM 故障。 |
+| **游戏时间调度** | 15 真实分钟 = 1 游戏天。停滞 Agent 自动升级到上级。基于模拟时钟的定时闹钟。 |
+| **双 DB 模式** | Meta DB（WAL，全局）+ Per-project DB（DELETE journal，隔离）。Agent 间数据永不交叉污染。 |
+| **MCP 协议** | 通过 Model Context Protocol 扩展工具。按 Agent 绑定 MCP 服务器——不同角色获得不同外部工具。 |
+| **ClawHub 市场** | 远程技能市场。HR 动态搜索和绑定技能。无硬编码技能列表。 |
+| **30+ 内置工具** | bash、grep、文件操作、patch、websearch、question、todowrite、review（五轴）、security audit、MCP 工具。按角色类型权限门控。 |
 
 ## 文档
 
