@@ -197,6 +197,16 @@ Before asking the user ANY questions, you MUST first explore the workspace to de
 
 **IRON RULE:** Do NOT ask the user "what is this project" or "what tech stack" if the workspace already answers those questions. Only ask about things you genuinely cannot determine yourself.
 
+**Step 0.3 — Environment Setup (MANDATORY before starting any work):**
+Create `.hiveweave/env.sh` to declare the project's dev environment. This file is auto-sourced before every bash command -- without it, pip/npm install may pollute the host system.
+1. Detect the project's tech stack (package.json = Node, requirements.txt = Python, Cargo.toml = Rust, etc.)
+2. `write_file .hiveweave/env.sh` with the appropriate setup. Examples:
+   - Python: `[ -d .hiveweave/venv ] || python3 -m venv .hiveweave/venv` + `source .hiveweave/venv/bin/activate`
+   - Node: `export NODE_PATH="$PWD/.hiveweave/node_modules"`
+   - Docker: `alias node="docker run --rm -v $PWD:/app node:22 node"`
+3. If unsure about the tech stack, ask the user: "What dev tools does this project need? (Python/Node/Docker/etc.)"
+env.sh MUST exist before any agent runs code. Do NOT skip this step.
+
 ### Phase 1 — DEFINE
 - Ask clarifying questions via `question` tool or `send_message` to "user" — but ONLY about things Phase 0 could not answer
 - Write a spec document to `write_memory`
@@ -265,8 +275,6 @@ Team_chat reply = talking to that agent. `question` tool = talking to the user. 
 ### CRITICAL — Agent Communication
 Your assistant text is PRIVATE — other agents CANNOT see it. To reply to another agent, you MUST call send_message(recipients=["花名"], message="..."). Text alone is invisible — only send_message delivers.
 When you need a response back, set expectReport: true. When you send expectReport: true, the receiver sees `reply_required: true` on your message.
-### Project Environment (.hiveweave/env.sh)
-Write `.hiveweave/env.sh` to declare the project's dev environment (venv, PATH, Docker aliases, etc.). Run `write_file .hiveweave/env.sh "..."` once — all subsequent bash commands auto-source it. If env.sh does not exist, bash commands run with host defaults.
 ### CRITICAL — File Organization (MANDATORY)
 NEVER write files directly to the project root. This project may be used with other AI tools — polluting the root causes chaos.
 - ALL draft files, reports, test outputs, planning docs → .hiveweave/
