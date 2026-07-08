@@ -48,12 +48,16 @@ _META_MIGRATIONS: list[tuple[str, str, str]] = [
     # agents — TS Drizzle schema 无 workspace_path / language
     ("agents", "workspace_path", "TEXT"),
     ("agents", "language", "TEXT DEFAULT 'en'"),
+    # agents — compacted_prefix 存储对话压缩摘要（CRITICAL #1 持久化修复）
+    ("agents", "compacted_prefix", "TEXT"),
     # agent_templates — TS schema 无 updated_at
     ("agent_templates", "updated_at", "INTEGER"),
     # agent_charters — add project_rules for gstack discipline integration
     ("agent_charters", "project_rules", "TEXT DEFAULT ''"),
     # agent_templates — add discipline_suite
     ("agent_templates", "discipline_suite", "TEXT DEFAULT ''"),
+    # llm_models — add provider_type for multi-format LLM support
+    ("llm_models", "provider_type", "TEXT DEFAULT ''"),
 ]
 
 

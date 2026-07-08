@@ -91,18 +91,34 @@ def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
 
 
 def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
-    """Return True if the path targets .hiveweave (forbidden)."""
+    """Return True if the path targets protected .hiveweave internals.
+
+    Agent work files (.hiveweave/reports/, .hiveweave/drafts/, etc.) are
+    ALLOWED. Only system internals (data.db, tool_outputs/) are blocked.
+    """
     try:
         ws = Path(workspace_path).resolve()
         hw_root = ws / HIVEWEAVE_DIR
         target = Path(abs_path).resolve()
-        if target == hw_root:
-            return True
         try:
             target.relative_to(hw_root)
-            return True
         except ValueError:
-            return False
+            return False  # Not in .hiveweave — allowed
+        # Block only system-critical internals
+        protected = {
+            hw_root / "data.db",
+            hw_root / "data.db-shm",
+            hw_root / "data.db-wal",
+            hw_root / "tool_outputs",
+        }
+        if target in protected:
+            return True
+        try:
+            target.relative_to(hw_root / "tool_outputs")
+            return True  # Inside tool_outputs/ — system-managed
+        except ValueError:
+            pass
+        return False  # Inside .hiveweave but not protected — allowed
     except (OSError, ValueError):
         return False
 
@@ -253,7 +269,9 @@ async def write_file(
     p = Path(full)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        # Normalize to LF — prevents CRLF/LF mismatch breaking grep
+        normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+        p.write_text(normalized, encoding="utf-8", newline="")
     except OSError as exc:
         return {"success": False, "output": "",
                 "error": f"Error: {exc}"}

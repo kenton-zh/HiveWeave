@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+﻿import { useState, useEffect, useCallback } from "react";
 import { getAgent, updateAgent, getPermissionRules, getModels } from "../api";
 import type { LlmModel } from "../api";
 import { useAppStore } from "../store";
@@ -45,13 +45,13 @@ interface PermissionRules {
 }
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; desc: string }> = {
-  created: { label: "待激活", color: "text-gray-400", desc: "Agent 已创建，尚未开始工作" },
-  active: { label: "工作中", color: "text-emerald-400", desc: "Agent 正在执行任务" },
-  promoted: { label: "已晋升", color: "text-blue-400", desc: "Agent 已晋升为协调者" },
-  receiving: { label: "交接中", color: "text-amber-400", desc: "正在接收工作交接" },
-  merging: { label: "合并中", color: "text-purple-400", desc: "代码正在合并" },
-  dissolving: { label: "解散中", color: "text-red-400", desc: "Agent 正在解散" },
-  archived: { label: "已归档", color: "text-gray-500", desc: "Agent 已归档，不再活跃" },
+  created: { label: "待激活", color: "text-g-fg-3", desc: "Agent 已创建，尚未开始工作" },
+  active: { label: "工作中", color: "text-emerald-700", desc: "Agent 正在执行任务" },
+  promoted: { label: "已晋升", color: "text-blue-700", desc: "Agent 已晋升为协调者" },
+  receiving: { label: "交接中", color: "text-amber-700", desc: "正在接收工作交接" },
+  merging: { label: "合并中", color: "text-purple-700", desc: "代码正在合并" },
+  dissolving: { label: "解散中", color: "text-red-600", desc: "Agent 正在解散" },
+  archived: { label: "已归档", color: "text-g-fg-4", desc: "Agent 已归档，不再活跃" },
 };
 
 const PERMISSION_MODES = [
@@ -197,7 +197,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
   if (loading) {
     return (
-      <div className="h-full flex items-center justify-center text-gray-500">
+      <div className="h-full flex items-center justify-center text-g-fg-4">
         加载中...
       </div>
     );
@@ -205,7 +205,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
   if (error && !agent) {
     return (
-      <div className="h-full flex items-center justify-center text-red-400 text-sm p-4 text-center">
+      <div className="h-full flex items-center justify-center text-red-600 text-sm p-4 text-center">
         {error}
       </div>
     );
@@ -213,8 +213,8 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
   if (!agent) {
     return (
-      <div className="h-full flex items-center justify-center text-gray-500">
-        Agent 不存在
+      <div className="h-full flex items-center justify-center text-g-fg-4">
+      Agent 不存在
       </div>
     );
   }
@@ -224,8 +224,8 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   // Override status display for "active" agents based on runtime processing state
   const runtimeStatus = agent.status === "active"
     ? isProcessing
-      ? { label: "工作中", color: "text-emerald-400", desc: "Agent 正在执行任务" }
-      : { label: "空闲", color: "text-gray-400", desc: "Agent 已激活，等待任务" }
+      ? { label: "工作中", color: "text-emerald-700", desc: "Agent 正在执行任务" }
+      : { label: "空闲", color: "text-g-fg-3", desc: "Agent 已激活，等待任务" }
     : statusConfig;
   const roleLabel = ROLE_LABELS[agent.role] || agent.role;
   const createdAt = new Date(agent.createdAt).toLocaleString("zh-CN");
@@ -235,33 +235,33 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
       <div className="max-w-2xl mx-auto p-6 space-y-6">
         {/* Error banner */}
         {error && (
-          <div className="bg-red-900/30 border border-red-800 text-red-300 px-4 py-2 rounded-lg text-sm">
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-2 rounded-lg text-sm">
             {error}
-            <button onClick={() => setError("")} className="ml-2 text-red-400 hover:text-red-200">×</button>
+            <button onClick={() => setError("")} className="ml-2 text-red-600 hover:text-red-700">×</button>
           </div>
         )}
 
         {/* ─── Profile Section ─── */}
         <section>
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">基础信息</h3>
-            <span className="text-xs text-gray-500 font-mono">{agent.shortId || (agent.id || "").slice(0, 8) || "—"}</span>
+            <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider">基础信息</h3>
+            <span className="text-xs text-g-fg-4 font-mono">{agent.shortId || (agent.id || "").slice(0, 8) || "—"}</span>
           </div>
 
-          <div className="bg-surface-card border border-surface-border rounded-xl p-5 space-y-4">
+          <div className="bg-g-bg border border-g-border rounded-xl p-5 space-y-4">
             {/* Name + Role */}
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-lg bg-accent/20 flex items-center justify-center text-accent font-bold">
+              <div className="w-10 h-10 rounded-lg bg-g-blue/15 flex items-center justify-center text-g-blue font-bold">
                 {agent.name.charAt(0).toUpperCase()}
               </div>
               <div>
-                <h2 className="text-lg font-semibold text-gray-100">{agent.name}</h2>
-                <span className="text-xs text-gray-400">{roleLabel} · {agent.permissionType === "coordinator" ? "协调者" : "执行者"}</span>
+                <h2 className="text-lg font-semibold text-g-fg">{agent.name}</h2>
+                <span className="text-xs text-g-fg-3">{roleLabel} · {agent.permissionType === "coordinator" ? "协调者" : "执行者"}</span>
               </div>
             </div>
 
             {/* Status */}
-            <div className="flex items-center gap-2 py-2 border-t border-surface-border/50">
+            <div className="flex items-center gap-2 py-2 border-t border-g-border/50">
               <span
                 className={`w-2.5 h-2.5 rounded-full ${
                   agent.status === "active"
@@ -275,17 +275,17 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                 }`}
               />
               <span className={`text-sm font-medium ${runtimeStatus.color}`}>{runtimeStatus.label}</span>
-              <span className="text-xs text-gray-500 ml-1">— {runtimeStatus.desc}</span>
+              <span className="text-xs text-g-fg-4 ml-1">— {runtimeStatus.desc}</span>
             </div>
 
             {/* Goal (editable) */}
             <div>
               <div className="flex items-center justify-between mb-1">
-                <label className="text-xs font-medium text-gray-400">目标</label>
+                <label className="text-xs font-medium text-g-fg-3">目标</label>
                 {!editingGoal && (
                   <button
                     onClick={() => { setGoalDraft(agent.goal); setEditingGoal(true); }}
-                    className="text-xs text-accent hover:text-accent/80 transition-colors"
+                    className="text-xs text-g-blue hover:text-g-blue/80 transition-colors"
                   >
                     编辑
                   </button>
@@ -297,38 +297,38 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                     value={goalDraft}
                     onChange={(e) => setGoalDraft(e.target.value)}
                     rows={3}
-                    className="w-full px-3 py-2 text-sm bg-surface border border-accent/50 rounded-lg text-gray-200 focus:outline-none focus:border-accent resize-none"
+                    className="w-full px-3 py-2 text-sm bg-g-bg border border-g-blue/40 rounded-lg text-g-fg focus:outline-none focus:border-g-blue resize-none"
                     autoFocus
                   />
                   <div className="flex gap-2 justify-end">
                     <button
                       onClick={() => setEditingGoal(false)}
-                      className="px-3 py-1 text-xs text-gray-400 hover:text-gray-200"
+                      className="px-3 py-1 text-xs text-g-fg-3 hover:text-g-fg"
                     >
                       取消
                     </button>
                     <button
                       onClick={() => { saveField("goal", goalDraft); setEditingGoal(false); }}
                       disabled={saving}
-                      className="px-3 py-1 text-xs bg-accent text-white rounded-md disabled:opacity-50"
+                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-xl disabled:opacity-50"
                     >
                       保存
                     </button>
                   </div>
                 </div>
               ) : (
-                <p className="text-sm text-gray-300 whitespace-pre-wrap">{agent.goal || "(未设置)"}</p>
+                <p className="text-sm text-g-fg whitespace-pre-wrap">{agent.goal || "(未设置)"}</p>
               )}
             </div>
 
             {/* Backstory (editable) */}
             <div>
               <div className="flex items-center justify-between mb-1">
-                <label className="text-xs font-medium text-gray-400">背景故事</label>
+                <label className="text-xs font-medium text-g-fg-3">背景故事</label>
                 {!editingBackstory && (
                   <button
                     onClick={() => { setBackstoryDraft(agent.backstory); setEditingBackstory(true); }}
-                    className="text-xs text-accent hover:text-accent/80 transition-colors"
+                    className="text-xs text-g-blue hover:text-g-blue/80 transition-colors"
                   >
                     编辑
                   </button>
@@ -340,32 +340,32 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                     value={backstoryDraft}
                     onChange={(e) => setBackstoryDraft(e.target.value)}
                     rows={3}
-                    className="w-full px-3 py-2 text-sm bg-surface border border-accent/50 rounded-lg text-gray-200 focus:outline-none focus:border-accent resize-none"
+                    className="w-full px-3 py-2 text-sm bg-g-bg border border-g-blue/40 rounded-lg text-g-fg focus:outline-none focus:border-g-blue resize-none"
                     autoFocus
                   />
                   <div className="flex gap-2 justify-end">
                     <button
                       onClick={() => setEditingBackstory(false)}
-                      className="px-3 py-1 text-xs text-gray-400 hover:text-gray-200"
+                      className="px-3 py-1 text-xs text-g-fg-3 hover:text-g-fg"
                     >
                       取消
                     </button>
                     <button
                       onClick={() => { saveField("backstory", backstoryDraft); setEditingBackstory(false); }}
                       disabled={saving}
-                      className="px-3 py-1 text-xs bg-accent text-white rounded-md disabled:opacity-50"
+                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-xl disabled:opacity-50"
                     >
                       保存
                     </button>
                   </div>
                 </div>
               ) : (
-                <p className="text-sm text-gray-400 whitespace-pre-wrap">{agent.backstory || "(未设置)"}</p>
+                <p className="text-sm text-g-fg-3 whitespace-pre-wrap">{agent.backstory || "(未设置)"}</p>
               )}
             </div>
 
             {/* Created at */}
-            <div className="text-xs text-gray-500 pt-2 border-t border-surface-border/50">
+            <div className="text-xs text-g-fg-4 pt-2 border-t border-g-border/50">
               创建于 {createdAt}
             </div>
           </div>
@@ -373,16 +373,16 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
         {/* ─── Model Configuration ─── */}
         <section>
-          <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider mb-3">模型配置</h3>
-          <div className="bg-surface-card border border-surface-border rounded-xl p-5 space-y-3">
+          <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider mb-3">模型配置</h3>
+          <div className="bg-g-bg border border-g-border rounded-xl p-5 space-y-3">
             <div>
-              <label className="text-xs font-medium text-gray-400 mb-2 block">使用模型</label>
+              <label className="text-xs font-medium text-g-fg-3 mb-2 block">使用模型</label>
               {models.length > 0 ? (
                 <select
                   value={agent.modelId || ""}
                   onChange={(e) => changeModel(e.target.value)}
                   disabled={saving}
-                  className="w-full px-3 py-2 text-sm bg-surface border border-surface-border rounded-lg text-gray-200 focus:outline-none focus:border-accent disabled:opacity-50"
+                  className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-lg text-g-fg focus:outline-none focus:border-g-blue disabled:opacity-50"
                 >
                   <option value="">
                     {resolvedModel?.modelName
@@ -396,14 +396,14 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                   ))}
                 </select>
               ) : (
-                <span className="text-xs text-gray-500">
+                <span className="text-xs text-g-fg-4">
                   {agent.modelId ? `已配置模型 ID: ${agent.modelId.slice(0, 8)}...` :
                    resolvedModel ? `自动选择: ${resolvedModel.modelName} (${resolvedModel.modelId})` :
                    "使用默认模型"}
                 </span>
               )}
               {agent.modelId && models.length > 0 && (
-                <div className="mt-1.5 text-[10px] text-gray-500">
+                <div className="mt-1.5 text-[10px] text-g-fg-4">
                   {(() => {
                     const m = models.find((x) => x.id === agent.modelId);
                     return m ? `上下文 ${m.contextWindow.toLocaleString()} tokens · 最大输出 ${m.maxOutputTokens.toLocaleString()} tokens${m.supportsThinking ? " · 支持思考" : ""}` : "";
@@ -416,20 +416,20 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
         {/* ─── Permissions Section (read-only; CEO sets charter, HR assigns permissions) ─── */}
         <section>
-          <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider mb-3">权限配置</h3>
-          <p className="text-xs text-gray-500 mb-3">CEO 维护项目章程与组织设计；HR 为各 Agent 分配权限与技能绑定。</p>
-          <div className="bg-surface-card border border-surface-border rounded-xl p-5 space-y-4">
+          <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider mb-3">权限配置</h3>
+          <p className="text-xs text-g-fg-4 mb-3">CEO 维护项目章程与组织设计；HR 为各 Agent 分配权限与技能绑定。</p>
+          <div className="bg-g-bg border border-g-border rounded-xl p-5 space-y-4">
             {/* Current permission mode */}
             <div>
-              <label className="text-xs font-medium text-gray-400 mb-2 block">权限模式</label>
+              <label className="text-xs font-medium text-g-fg-3 mb-2 block">权限模式</label>
               <div className="grid grid-cols-3 gap-2">
                 {PERMISSION_MODES.map((mode) => (
                   <div
                     key={mode.value}
                     className={`px-3 py-2.5 text-xs rounded-lg border text-left ${
                       permissions?.permissionMode === mode.value
-                        ? "bg-accent/20 border-accent text-accent"
-                        : "bg-surface border-surface-border text-gray-500 opacity-50"
+                        ? "bg-g-blue/15 border-g-blue text-g-blue"
+                        : "bg-g-bg border-g-border text-g-fg-4 opacity-50"
                     }`}
                   >
                     <div className="font-medium">{mode.label}</div>
@@ -440,32 +440,32 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
             </div>
 
             {/* MCP & Skills */}
-            <div className="space-y-3 pt-3 border-t border-surface-border/50">
+            <div className="space-y-3 pt-3 border-t border-g-border/50">
               <div>
-                <label className="text-xs font-medium text-gray-400 mb-1 block">MCP 服务器</label>
+                <label className="text-xs font-medium text-g-fg-3 mb-1 block">MCP 服务器</label>
                 <div className="flex flex-wrap gap-1">
                   {agent.mcpServers.length > 0 ? (
                     agent.mcpServers.map((s, i) => (
-                      <span key={i} className="px-2 py-0.5 text-[10px] bg-blue-900/30 text-blue-300 rounded-md">
+                      <span key={i} className="px-2 py-0.5 text-[10px] bg-blue-100 text-blue-700 rounded-md">
                         {s}
                       </span>
                     ))
                   ) : (
-                    <span className="text-xs text-gray-500">未绑定</span>
+                    <span className="text-xs text-g-fg-4">未绑定</span>
                   )}
                 </div>
               </div>
               <div>
-                <label className="text-xs font-medium text-gray-400 mb-1 block">绑定技能</label>
+                <label className="text-xs font-medium text-g-fg-3 mb-1 block">绑定技能</label>
                 <div className="flex flex-wrap gap-1">
                   {agent.boundSkills.length > 0 ? (
                     agent.boundSkills.map((s, i) => (
-                      <span key={i} className="px-2 py-0.5 text-[10px] bg-purple-900/30 text-purple-300 rounded-md">
+                      <span key={i} className="px-2 py-0.5 text-[10px] bg-purple-100 text-purple-700 rounded-md">
                         {s}
                       </span>
                     ))
                   ) : (
-                    <span className="text-xs text-gray-500">未绑定</span>
+                    <span className="text-xs text-g-fg-4">未绑定</span>
                   )}
                 </div>
               </div>
@@ -475,24 +475,24 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
         {/* ─── Hierarchy Section ─── */}
         <section>
-          <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider mb-3">组织关系</h3>
-          <div className="bg-surface-card border border-surface-border rounded-xl p-5 space-y-3">
+          <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider mb-3">组织关系</h3>
+          <div className="bg-g-bg border border-g-border rounded-xl p-5 space-y-3">
             <div>
-              <label className="text-xs font-medium text-gray-400 mb-1 block">上级</label>
+              <label className="text-xs font-medium text-g-fg-3 mb-1 block">上级</label>
               {agent.parentId ? (
                 <button
                   onClick={() => setSelectedAgent(agent.parentId)}
-                  className="text-sm text-accent hover:text-accent/80 transition-colors"
+                  className="text-sm text-g-blue hover:text-g-blue/80 transition-colors"
                 >
                   查看上级 Agent →
                 </button>
               ) : (
-                <span className="text-xs text-gray-500">无（顶级 Agent）</span>
+                <span className="text-xs text-g-fg-4">无（顶级 Agent）</span>
               )}
             </div>
             <div>
-              <label className="text-xs font-medium text-gray-400 mb-1 block">所属项目</label>
-              <span className="text-sm text-gray-300">{agent.projectId ? agent.projectId.slice(0, 8) + "..." : "未分配"}</span>
+              <label className="text-xs font-medium text-g-fg-3 mb-1 block">所属项目</label>
+              <span className="text-sm text-g-fg">{agent.projectId ? agent.projectId.slice(0, 8) + "..." : "未分配"}</span>
             </div>
           </div>
         </section>

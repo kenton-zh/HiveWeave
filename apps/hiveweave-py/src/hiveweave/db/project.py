@@ -32,6 +32,10 @@ _agent_cache: dict[str, str] = {}
 # R2: 保护 ensure_project_db 的懒初始化，避免并发创建多个连接到同一 DB
 _ensure_lock = asyncio.Lock()
 
+# 已驱逐的工作区集合 — delete_project 调用 evict 后标记，
+# 防止 cancel 路径的收尾 DB 操作通过 get_project_db_for_agent 重连锁住 data.db
+_evicted_workspaces: set[str] = set()
+
 
 def _db_path_for_workspace(workspace_path: str) -> str:
     """Get the per-project DB path for a workspace."""
@@ -41,15 +45,22 @@ def _db_path_for_workspace(workspace_path: str) -> str:
     return str(hw_dir / "data.db")
 
 
-async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
+async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection | None:
     """Get or create the per-project DB for a workspace.
 
     契约 11: ensureProjectDb(workspacePath) lazily creates a per-project DB.
+    返回 None 表示 workspace 已被驱逐（项目删除中），调用方应处理此情况。
 
     R2: 使用 asyncio.Lock 保护，避免并发调用创建多个连接。
     R3: 缓存上限 MAX_CACHED_CONNECTIONS=50，超限时 evict 最久未用的连接（LRU）。
     """
     ws = str(Path(workspace_path).resolve())
+
+    # 驱逐检查 — 项目删除后拒绝重连，防止 cancel 收尾操作锁住 data.db
+    # 返回 None 而非 raise，与 get_project_db_for_agent 保持一致；
+    # 调用方已有 None 检查，raise 会导致未 try/except 的新端点 500
+    if ws in _evicted_workspaces:
+        return None
 
     # 快速路径：无锁检查缓存（命中时只需 move_to_end，但需加锁保证 OrderedDict 一致）
     async with _ensure_lock:
@@ -109,6 +120,8 @@ async def get_project_db_for_agent(agent_id: str) -> aiosqlite.Connection | None
     # Check cache
     if agent_id in _agent_cache:
         ws = _agent_cache[agent_id]
+        if ws in _evicted_workspaces:
+            return None  # 项目已删除，拒绝重连
         if ws in _cache:
             return _cache[ws]
 
@@ -122,11 +135,15 @@ async def get_project_db_for_agent(agent_id: str) -> aiosqlite.Connection | None
     if workspace_path is None:
         return None
 
+    ws_resolved = str(Path(workspace_path).resolve())
+    if ws_resolved in _evicted_workspaces:
+        return None  # 项目已删除，拒绝重连
+
     # Ensure DB exists
     conn = await ensure_project_db(workspace_path)
 
     # Cache the mapping
-    _agent_cache[agent_id] = str(Path(workspace_path).resolve())
+    _agent_cache[agent_id] = ws_resolved
 
     return conn
 
@@ -136,8 +153,11 @@ async def evict_project_db(workspace_path: str) -> None:
 
     契约 11: evictProjectDb() — best-effort close, caller catches errors.
     R2: 加锁保证与 ensure_project_db 的缓存操作互斥。
+    标记 workspace 为已驱逐，后续 get_project_db_for_agent / ensure_project_db
+    拒绝重连，防止 delete_project 收尾阶段 cancel 路径重连锁住 data.db。
     """
     ws = str(Path(workspace_path).resolve())
+    _evicted_workspaces.add(ws)  # 标记 — 拒绝后续重连
     async with _ensure_lock:
         conn = _cache.pop(ws, None)
     if conn is not None:
@@ -181,6 +201,13 @@ async def close_all() -> None:
             pass
     _cache.clear()
     _agent_cache.clear()
+    _evicted_workspaces.clear()
+
+
+def clear_evicted_workspace(workspace_path: str) -> None:
+    """清除工作区的驱逐标记 — 用于同路径重建项目时恢复 DB 访问。"""
+    ws = str(Path(workspace_path).resolve())
+    _evicted_workspaces.discard(ws)
 
 
 # ── Query helpers ───────────────────────────────────────────

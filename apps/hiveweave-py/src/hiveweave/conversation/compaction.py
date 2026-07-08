@@ -80,6 +80,35 @@ class Compaction:
             max(PRESERVE_RECENT_MIN, len(messages) // 3),
         )
         split_idx = max(0, len(messages) - recent_count)
+
+        # 边界对齐：避免拆散 assistant(tool_calls) / tool(result) 对。
+        # 如果分割点恰好落在 tool_calls 之后（下一条是 tool result），
+        # 将 tool result 也纳入 old_messages（向前扩展 split_idx），
+        # 或将 tool_calls 也纳入 recent_messages（向后收缩 split_idx）。
+        # 选择后者（收缩）—— 保留完整的 tool 对在 recent 中更安全。
+        if split_idx > 0 and split_idx < len(messages):
+            prev = messages[split_idx - 1]
+            curr = messages[split_idx]
+            # case 1: prev 是 assistant(tool_calls), curr 是 tool(result) → 收缩
+            if (
+                "tool_calls" in prev
+                and curr.get("role") == "tool"
+            ):
+                split_idx -= 1  # 把 assistant(tool_calls) 也纳入 recent
+            # case 2: prev 是 tool(result), curr 是 assistant(tool_calls) → 不需调整（两段各自完整）
+            # case 3: prev 的 tool_calls 对应的 result 在更前面 → 向前找到 result 纳入 old
+            elif curr.get("role") == "tool" and "tool_calls" not in prev:
+                # curr 是孤立 tool result — 检查它的 tool_call_id 是否在 old_messages 的末尾
+                tc_id = curr.get("tool_call_id")
+                if tc_id:
+                    for i in range(split_idx - 1, max(split_idx - 5, -1), -1):
+                        if i < 0:
+                            break
+                        tcs = messages[i].get("tool_calls") or []
+                        if any(tc.get("id") == tc_id for tc in tcs):
+                            split_idx = i  # 把 assistant(tool_calls) 及其 result 都纳入 recent
+                            break
+
         old_messages = messages[:split_idx]
         recent_messages = messages[split_idx:]
 

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+﻿import { useState, useEffect } from "react";
 import { getProjectGameTime } from "../api";
 
 interface Props {
@@ -85,11 +85,11 @@ export default function ProjectTimeBadge({ projectId }: Props) {
   }, [projectId]);
 
   if (!projectId) {
-    return <div className="px-2.5 py-1 rounded-md bg-surface border border-surface-border text-xs text-gray-500 whitespace-nowrap shrink-0">No project</div>;
+    return <div className="px-2.5 py-1 rounded-md bg-g-bg border border-g-border text-xs text-g-fg-3 whitespace-nowrap shrink-0">No project</div>;
   }
 
   return (
-    <div className="px-2.5 py-1 rounded-md bg-surface border border-surface-border text-xs text-gray-400 whitespace-nowrap shrink-0">
+    <div className="px-2.5 py-1 rounded-md bg-g-bg border border-g-border text-xs text-g-fg-3 whitespace-nowrap shrink-0">
       项目时间 {formatted ?? "—"}
     </div>
   );

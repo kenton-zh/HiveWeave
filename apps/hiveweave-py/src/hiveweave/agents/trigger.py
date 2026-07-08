@@ -67,7 +67,7 @@ async def _agent_name(agent_id: str) -> str:
     return agent_id
 
 
-def _is_coordinator(role: str | None) -> bool:
+def is_coordinator(role: str | None) -> bool:
     """判断角色是否为 coordinator 类型。
 
     对齐 Elixir agent.ex:886 coordinator?/1。
@@ -402,10 +402,8 @@ async def build_trigger_context(
             lines.append(_json.dumps(entry, ensure_ascii=False))
         msg_text = "\n".join(lines)
         blocks.append(
-            f"## Messages — each line is a JSON object with 'from', 'content', optional 'reply_required' and 'priority'.\n"
-            f"To reply to these, you MUST call send_message(recipients=[\"对方花名\"], message=\"...\").\n"
-            f"Your assistant text DOES NOT reach other agents. Only send_message does.\n"
-            f"CAVEMAN style, NO pleasantries.\n{msg_text}"
+            f"## Messages — JSON: {{\"from\":..., \"content\":..., \"reply_required\":true/false, \"priority\":\"normal\"/\"urgent\"}}\n"
+            f"{msg_text}"
         )
 
     # ── 3.5. Goals workbook update (dirty check) ──
@@ -503,10 +501,7 @@ async def build_trigger_context(
     if not from_agent_id:
         from_agent_id = "system"
 
-    context = (
-        "\n\n".join(blocks)
-        + "\n\n---\nProcess the above. Use tools to work on tasks, report results."
-    )
+    context = "\n\n".join(blocks)
 
     return context, inbox_msg_ids, from_agent_id
 

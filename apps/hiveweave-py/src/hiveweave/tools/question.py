@@ -66,7 +66,12 @@ async def execute_question(
     chat_msg = ChatMessageService()
     options_text = ""
     if options:
-        opts = [f"- {o.get('label', o.get('text', str(o)))}" for o in options[:6]]
+        opts: list[str] = []
+        for o in options[:6]:
+            if isinstance(o, dict):
+                opts.append(f"- {o.get('label', o.get('text', str(o)))}")
+            else:
+                opts.append(f"- {o}")
         options_text = "\n\n选项:\n" + "\n".join(opts)
     try:
         await chat_msg.save_message({

@@ -479,7 +479,8 @@ export function subscribeAgentStatus(
   onSnapshot: (agentIds: string[], paused?: boolean) => void,
   onStatus: (agentId: string, processing: boolean) => void,
   onActivity?: (event: ActivityEntry) => void,
-  onOrgChanged?: () => void
+  onOrgChanged?: () => void,
+  onGoalsUpdated?: (projectId: string) => void
 ): { abort: () => void } {
   const socket = getSocket();
   const channel = socket.channel("lobby:status");
@@ -498,6 +499,12 @@ export function subscribeAgentStatus(
 
   channel.on("org_changed", () => {
     onOrgChanged?.();
+  });
+
+  channel.on("goals_updated", (payload: Record<string, unknown>) => {
+    if (typeof payload.projectId === "string") {
+      onGoalsUpdated?.(payload.projectId);
+    }
   });
 
   channel.on("activity", (payload: Record<string, unknown>) => {

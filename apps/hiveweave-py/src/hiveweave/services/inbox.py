@@ -60,6 +60,26 @@ class InboxService:
              message_type, expect, priority])
         log.info("inbox_sent", from_agent_id=from_agent_id, to_agent_id=to_agent_id,
                  message_type=message_type, priority=priority, preview=message[:80])
+
+        # Push real-time event to notify recipient's frontend immediately.
+        # Without this, the recipient only learns about new messages via
+        # the 5-second inbox watcher poll — or never, if the agent isn't running.
+        try:
+            from hiveweave.realtime.event_bus import status_event_bus
+            await status_event_bus.publish_chat_message(
+                to_agent_id,
+                {
+                    "role": "team",
+                    "content": message,
+                    "from_agent_id": from_agent_id,
+                    "message_type": message_type,
+                    "priority": priority,
+                    "inbox_id": msg_id,
+                },
+            )
+        except Exception as e:
+            log.debug("inbox_event_push_failed", error=str(e))
+
         return {
             "id": msg_id, "from_agent_id": from_agent_id, "to_agent_id": to_agent_id,
             "message": message, "message_type": message_type, "priority": priority,

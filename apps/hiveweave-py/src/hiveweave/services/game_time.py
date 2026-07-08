@@ -170,8 +170,11 @@ class GameTimeService:
             except Exception as e:
                 log.error("alarm_fire_failed", alarm_id=alarm["id"], error=str(e))
         state["alarms"] = [a for a in state["alarms"] if not a["fired"]]
-        if state["tick_count"] % STALL_CHECK_TICKS == 0:
-            await self._check_stalled(project_id)
+        # idle escalation 已禁用 — 原 _check_stalled 每 10 分钟给 idle agent 的
+        # superior 发 escalation，导致 CEO 陷入循环（HR/QA idle → escalation →
+        # CEO 回复"待命" → 10min 后再次 escalation）。如果需要恢复，取消下行注释。
+        # if state["tick_count"] % STALL_CHECK_TICKS == 0:
+        #     await self._check_stalled(project_id)
         log.debug("game_time_tick", project_id=project_id, game_seconds=new_gs)
 
     # ── Internal ──────────────────────────────────────────────

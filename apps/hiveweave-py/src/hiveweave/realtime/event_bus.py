@@ -336,6 +336,15 @@ class StatusEventBus:
         """发布系统恢复通知到 lobby。"""
         await self.publish("lobby", {"type": "system_resumed"})
 
+    async def publish_goals_updated(self, project_id: str) -> None:
+        """发布企业目标更新通知到 lobby + project 频道。
+
+        前端 GoalsPanel 监听此事件重新拉取 goals，实现 agent 更新后实时刷新。
+        """
+        event = {"type": "goals_updated", "projectId": project_id}
+        await self.publish("lobby", event)
+        await self.publish(f"project:{project_id}", event)
+
     async def publish_agent_created(
         self, agent_id: str, role: str, name: str | None = None
     ) -> None:
@@ -352,6 +361,10 @@ class StatusEventBus:
     async def publish_agent_dismissed(self, agent_id: str) -> None:
         """发布 agent 离开通知到 lobby。"""
         await self.publish("lobby", {"type": "agent_dismissed", "agentId": agent_id})
+
+    async def publish_org_changed(self) -> None:
+        """发布组织架构变更通知到 lobby — 前端 org tree 监听此事件刷新。"""
+        await self.publish("lobby", {"type": "org_changed"})
 
     async def publish_chat_message(
         self, agent_id: str, message: dict

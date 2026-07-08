@@ -75,6 +75,7 @@ META_DB_TABLES = [
         model_id TEXT NOT NULL,
         base_url TEXT,
         api_key TEXT,
+        provider_type TEXT DEFAULT '',
         context_window INTEGER DEFAULT 128000,
         max_output_tokens INTEGER DEFAULT 4096,
         supports_thinking INTEGER DEFAULT 0,

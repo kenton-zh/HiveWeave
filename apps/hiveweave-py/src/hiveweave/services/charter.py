@@ -99,25 +99,37 @@ class CharterService:
         return d
 
     async def read_goals(self, project_id: str) -> dict:
-        """Read enterprise goals from projects.charter_json.
+        """Read enterprise goals from projects.goals_json (agent-facing).
+
+        Uses the dedicated goals_json column to avoid overwriting the human-facing
+        charter_json. Falls back to charter_json.goals for old data.
 
         Returns dict {objective, focus, keyResults, userInvolvement} or {}.
-        Old-format plain text is wrapped as {objective: text}.
         """
         row = await meta_db.query_one(
-            "SELECT charter_json FROM projects WHERE id = ?", [project_id]
+            "SELECT goals_json, charter_json FROM projects WHERE id = ?", [project_id]
         )
-        if row is None or row["charter_json"] is None:
+        if row is None:
             return {}
-        raw = row["charter_json"]
-        try:
-            decoded = json.loads(raw)
-            if isinstance(decoded, dict):
-                return decoded
-        except json.JSONDecodeError:
-            pass
-        # Old format: raw text → wrap as objective
-        return {"objective": raw, "focus": None, "keyResults": []}
+        # Prefer goals_json (agent-facing column)
+        raw = row["goals_json"]
+        if raw:
+            try:
+                decoded = json.loads(raw)
+                if isinstance(decoded, dict):
+                    return decoded
+            except json.JSONDecodeError:
+                pass
+        # Fallback: extract goals from charter_json (human-facing, nested format)
+        charter_raw = row["charter_json"]
+        if charter_raw:
+            try:
+                charter = json.loads(charter_raw)
+                if isinstance(charter, dict) and "goals" in charter:
+                    return charter["goals"]
+            except json.JSONDecodeError:
+                pass
+        return {}
 
     async def update_goals(self, project_id: str, goals: dict) -> None:
         """Update enterprise goals (merge with existing, bump version)."""
@@ -146,14 +158,27 @@ class CharterService:
             "userInvolvement": user_involvement,
         })
 
+        # Write to dedicated goals_json column (agent-facing), NOT charter_json.
+        # charter_json is human-facing and uses a nested {"vision","goals","constraints"} format.
         await meta_db.execute(
-            "UPDATE projects SET charter_json = ? WHERE id = ?",
+            "UPDATE projects SET goals_json = ? WHERE id = ?",
             [goals_json, project_id],
         )
         self.touch_goals_version(project_id)
         logger.info("charter.goals_updated", project_id=project_id)
 
+        # 推送 WebSocket 事件 — 前端 GoalsPanel 监听后重新拉取
+        try:
+            from hiveweave.realtime.event_bus import status_event_bus
+            await status_event_bus.publish_goals_updated(project_id)
+        except Exception as e:
+            logger.warning("goals_updated_push_failed", project_id=project_id, error=str(e))
+
     # ── Goals dirty-flag sync ─────────────────────────────────
+
+    # Sentinel for "never initialized" — distinct from "synced to empty state".
+    # Prevents 0==0 bug where agent synced to version 0 is always dirty.
+    _VERSION_UNSET: int = -1
 
     def touch_goals_version(self, project_id: str) -> None:
         """Bump the goals version for a project (monotonic ns)."""
@@ -164,11 +189,13 @@ class CharterService:
         return self._goals_version.get(project_id, 0)
 
     async def get_agent_goals_version(self, agent_id: str) -> int:
-        """Get the version an agent last read (0 if never read)."""
+        """Get the version an agent last read. Returns _VERSION_UNSET if never read."""
         project_id = await meta_db.get_agent_project_id(agent_id)
         if project_id is None:
-            return 0
-        return self._agent_goals_version.get((project_id, agent_id), 0)
+            return self._VERSION_UNSET
+        return self._agent_goals_version.get(
+            (project_id, agent_id), self._VERSION_UNSET
+        )
 
     async def set_agent_goals_version(self, agent_id: str, version: int) -> None:
         """Mark that an agent has read the goals at the given version."""
@@ -180,13 +207,17 @@ class CharterService:
     def goals_dirty(self, agent_id: str, project_id: str) -> bool:
         """Check if an agent needs to re-read the goals.
 
-        - v_cur == 0 (never versioned): dirty iff agent never read (v_read == 0)
-        - v_cur != 0: dirty iff v_cur != v_read
+        Uses _VERSION_UNSET (-1) as sentinel for "never read" to avoid
+        the 0==0 infinite-dirty bug after backend restart.
         """
         v_cur = self._goals_version.get(project_id, 0)
-        v_read = self._agent_goals_version.get((project_id, agent_id), 0)
-        if v_cur == 0:
-            return v_read == 0
+        v_read = self._agent_goals_version.get(
+            (project_id, agent_id), self._VERSION_UNSET
+        )
+        # Never read at all → dirty
+        if v_read == self._VERSION_UNSET:
+            return True
+        # Already read but version changed → dirty
         return v_cur != v_read
 
     # ── Helpers ───────────────────────────────────────────────

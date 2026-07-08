@@ -199,6 +199,8 @@ def _scan_python(
     for fp in files:
         try:
             text = fp.read_text(encoding="utf-8", errors="replace")
+            # Normalize CRLF → LF so grep works on Windows-written files
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
         except OSError:
             continue
         if multiline:

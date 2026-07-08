@@ -1,4 +1,4 @@
-/**
+﻿/**
  * OfficeView — Thin React host for the PixiJS Office Scene.
  *
  * Responsibilities:
@@ -198,15 +198,15 @@ export default function OfficeView() {
 
   // ── Render ─────────────────────────────────────────────────────
   return (
-    <div className="relative h-full w-full overflow-hidden bg-[#09111f]">
+    <div className="relative h-full w-full overflow-hidden bg-g-bg-soft">
       <div ref={hostRef} className="h-full w-full" />
       {error && (
-        <div className="absolute top-4 left-4 rounded-md border border-red-500/40 bg-red-950/80 px-3 py-2 text-xs text-red-100 z-10">
+        <div className="absolute top-4 left-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 z-10 shadow-gm-sm">
           {error}
         </div>
       )}
       {!error && (
-        <div className="absolute top-2 right-2 text-[10px] text-gray-600 z-10 font-mono">
+        <div className="absolute top-2 right-2 text-[10px] text-g-fg-4 z-10 font-mono">
           PixiJS v8 · {agents.length} agents · {processingAgents.length} active
         </div>
       )}

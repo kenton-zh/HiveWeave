@@ -20,8 +20,11 @@ REM Start FastAPI via uvicorn (port 4000, matches frontend proxy)
 REM BUG-035 fix: increase concurrency limits to prevent 502 under LLM streaming load.
 REM Single-worker architecture (agents share in-memory state), so we tune
 REM connection handling rather than spawning multiple processes.
-uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000 ^
+REM IMPORTANT: do NOT add --limit-max-requests here. That flag terminates the
+REM process after N requests, which silently kills the backend mid-run.
+REM The single worker keeps agents' in-memory state alive for the whole
+REM server lifetime.
+uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000 --workers 1 ^
     --limit-concurrency 100 ^
     --backlog 2048 ^
-    --timeout-keep-alive 30 ^
-    --limit-max-requests 10000
+    --timeout-keep-alive 30

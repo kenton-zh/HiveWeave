@@ -47,6 +47,9 @@ interface AppState {
   clearChatSessions: () => void;
   orgTreeVersion: number;
   refreshOrgTree: () => void;
+  goalsVersion: number;
+  goalsUpdatedProjectId: string | null;
+  bumpGoalsVersion: (projectId: string) => void;
   socketReconnectVersion: number;
   bumpSocketReconnect: () => void;
   activeCommunications: ActiveCommunication[];
@@ -184,6 +187,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   clearChatSessions: () => set({ chatSessions: {} }),
   orgTreeVersion: 0,
   refreshOrgTree: () => set((s) => ({ orgTreeVersion: s.orgTreeVersion + 1 })),
+  goalsVersion: 0,
+  goalsUpdatedProjectId: null,
+  bumpGoalsVersion: (projectId: string) => set((s) => ({ goalsVersion: s.goalsVersion + 1, goalsUpdatedProjectId: projectId })),
   socketReconnectVersion: 0,
   bumpSocketReconnect: () => set((s) => ({ socketReconnectVersion: s.socketReconnectVersion + 1 })),
   activeCommunications: [],
