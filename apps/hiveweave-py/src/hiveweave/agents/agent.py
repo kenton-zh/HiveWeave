@@ -1660,8 +1660,25 @@ class Agent:
     # ── Streamer 回调 ────────────────────────────────────────
 
     async def _on_delta(self, event: dict) -> None:
-        """SSE delta 回调 — 转发给流事件回调。"""
+        """SSE delta 回调 — 转发给流事件回调 + 定期落库。"""
         self._broadcast_stream_event(event)
+        # Persist partial content to the streaming placeholder every N chunks.
+        # This way if the backend restarts or agent crashes, the partial output
+        # survives in the DB — not just ephemeral WebSocket events.
+        if event.get("type") == "text_delta" and self._streaming_msg_id:
+            acc = getattr(self, "_streaming_text_acc", "")
+            acc += event.get("content", "")
+            self._streaming_text_acc = acc
+            counter = getattr(self, "_streaming_save_counter", 0) + 1
+            self._streaming_save_counter = counter
+            if counter % 5 == 0:  # Save every 5 text chunks
+                try:
+                    await self._chat_msg.update_message(
+                        self.id, self._streaming_msg_id,
+                        {"content": acc},
+                    )
+                except Exception:
+                    pass  # Best-effort — don't crash on DB write fail
 
     async def _on_tool_call(
         self, tool_name: str, arguments: str, tool_call_id: str
