@@ -196,9 +196,6 @@ HiveWeave 构建于以下项目的思想、代码和工作流之上：
 |:---|------|
 | **[OpenCode](https://github.com/anomalyco/opencode)** | LLM 流式架构、token 估算（4 字符/token）、对话压缩、工具输出截断、熔断器模式。所有核心逻辑的 P0 参考源。 |
 | **[gstack](https://github.com/garrytan/gstack)** | 工程规范流程系统 — `/spec` `/plan-eng-review` `/review` `/qa` `/ship` 管线。融入 HiveWeave 的**纪律套装**模型，用于 Agent 角色定义。技能路由规则和 ETHOS 原则同样源自于此。 |
-| **[Harbor](https://github.com/laude-institute/harbor)** | 沙箱级网络隔离与按 Agent 白名单。用于 SWE-Marathon 评测。 |
-| **[SWE-Marathon](https://github.com/abundant-ai/swe-marathon)** | 长程软件工程基准。HiveWeave 的目标验证套件，用于证明多 Agent 架构有效性。 |
-| **[LangGraph](https://github.com/langchain-ai/langgraph)** | Agent 编排原语——状态机、检查点、持久化执行模式。 |
 | **[FastAPI](https://github.com/fastapi/fastapi)** | 原生支持 WebSocket/SSE 的 Web 框架。 |
 | **[React Flow](https://github.com/xyflow/xyflow)** | 组织架构图可视化引擎。 |
 

@@ -196,9 +196,6 @@ HiveWeave builds on ideas, code, and workflows from these projects:
 |:---|------|
 | **[OpenCode](https://github.com/anomalyco/opencode)** | LLM streaming architecture, token estimation (4 chars/token), conversation compaction, tool output truncation, circuit breaker pattern. The P0 reference for all core logic. |
 | **[gstack](https://github.com/garrytan/gstack)** | Engineering workflow discipline system — `/spec` `/plan-eng-review` `/review` `/qa` `/ship` pipelines. Adapted into HiveWeave's **discipline suite** model for agent role definition. Skill routing rules and ETHOS principles also originated here. |
-| **[Harbor](https://github.com/laude-institute/harbor)** | Sandbox-level network blocking with per-agent allowlists. Used in SWE-Marathon evaluation. |
-| **[SWE-Marathon](https://github.com/abundant-ai/swe-marathon)** | Long-horizon software engineering benchmark. HiveWeave's target validation suite for proving multi-agent architecture effectiveness. |
-| **[LangGraph](https://github.com/langchain-ai/langgraph)** | Agent orchestration primitives — state machine, checkpoint, durable execution patterns. |
 | **[FastAPI](https://github.com/fastapi/fastapi)** | Web framework with first-class WebSocket/SSE support. |
 | **[React Flow](https://github.com/xyflow/xyflow)** | Org chart visualization engine. |
 
