@@ -48,52 +48,23 @@ _SAFE_ENV_KEYS: frozenset[str] = frozenset({
 })
 
 
-def _force_local_deps(command: str, hw_dir: str) -> str:
-    """Rewrite install commands to force dependencies into .hiveweave/.
+def _source_env_sh(command: str, hw_dir: str) -> str:
+    """Prepend .hiveweave/env.sh sourcing if the file exists.
 
-    pip install X  →  pip install --target .hiveweave/pip-packages X
-    npm install    →  npm install --prefix .hiveweave/node
-    pip/npm -g     →  blocked with error
+    The project declares its own environment (venv, Docker alias, PATH, etc.)
+    in a single shell script. HiveWeave just sources it before every command.
+    No guessing — the project knows what it needs.
+
+    Example .hiveweave/env.sh:
+        [ -d .hiveweave/venv ] || python3 -m venv .hiveweave/venv
+        source .hiveweave/venv/bin/activate
+        export NODE_PATH="$PWD/.hiveweave/node_modules"
     """
-    import re
-
-    cmd = command.strip()
-
-    # ── pip install / pip3 install ──
-    m = re.match(r'^(pip3?|python3?\s+-m\s+pip)\s+install\s+(.*)$', cmd)
-    if m:
-        pip_cmd = m.group(1)
-        rest = m.group(2)
-        if re.search(r'(?<!\S)(-g|--global)(?!\S)', rest):
-            return f"echo 'BLOCKED: pip install -g is forbidden. Use --target {hw_dir}/pip-packages' && exit 1"
-        if '--target' not in rest:
-            target = f"{hw_dir}/pip-packages"
-            return f"mkdir -p {target} 2>/dev/null; {pip_cmd} install --target {target} {rest}"
-        return command  # already has --target, leave alone
-
-    # ── npm install ──
-    m = re.match(r'^npm\s+install\s+(.*)$', cmd)
-    if m:
-        rest = m.group(1)
-        if re.search(r'(?<!\S)(-g|--global)(?!\S)', rest):
-            return f"echo 'BLOCKED: npm install -g is forbidden. Use --prefix {hw_dir}/node' && exit 1"
-        if '--prefix' not in rest:
-            prefix = f"{hw_dir}/node"
-            return f"mkdir -p {prefix} 2>/dev/null; npm install --prefix {prefix} {rest}"
+    env_file = f"{hw_dir}/env.sh"
+    if not os.path.exists(env_file):
         return command
-
-    # ── npm i (shorthand) ──
-    m = re.match(r'^npm\s+i\s+(.*)$', cmd)
-    if m:
-        rest = m.group(1)
-        if re.search(r'(?<!\S)(-g|--global)(?!\S)', rest):
-            return f"echo 'BLOCKED: npm i -g is forbidden. Use --prefix {hw_dir}/node' && exit 1"
-        if '--prefix' not in rest:
-            prefix = f"{hw_dir}/node"
-            return f"mkdir -p {prefix} 2>/dev/null; npm i --prefix {prefix} {rest}"
-        return command
-
-    return command
+    # Source env.sh, then run the command in the same shell
+    return f"source {env_file} && {command}"
 
 
 def _build_safe_env(cwd: str) -> dict[str, str]:
@@ -337,10 +308,10 @@ async def execute_bash(
                          "credentials). Use read_file with explicit "
                          "approval instead."}
 
-    # 1.5. Force dependency installation into .hiveweave/ instead of system/global.
-    # Agents often run `pip install` or `npm install` — rewrite to project-local paths.
+    # 1.5. Auto-source .hiveweave/env.sh if the project has one.
+    # The project declares its own environment setup.
     hw_dir = str(Path(workspace_path) / ".hiveweave")
-    command = _force_local_deps(command, hw_dir)
+    command = _source_env_sh(command, hw_dir)
 
     # 2. Resolve cwd and validate sandbox
     ws = workspace_path or os.getcwd()
