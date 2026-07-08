@@ -126,14 +126,16 @@ def _validate_workspace_path(raw: str) -> Path:
     """
     if not raw or not raw.strip():
         raise HTTPException(status_code=400, detail="workspace_path is required")
+    # Expand Windows env vars (%SystemDrive% → C:)
+    expanded = os.path.expandvars(raw.strip())
     # 原始路径段级检查 — 拒绝任何 ".." 段
-    parts = Path(raw).parts
+    parts = Path(expanded).parts
     if ".." in parts:
         raise HTTPException(
             status_code=400,
             detail="workspace_path must not contain '..' path traversal",
         )
-    resolved = Path(raw).resolve()
+    resolved = Path(expanded).resolve()
     # resolve 后必须为绝对路径
     if not resolved.is_absolute():
         raise HTTPException(
