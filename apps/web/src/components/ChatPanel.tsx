@@ -1237,6 +1237,20 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         // BUG-033: Load final messages from DB, but only clear streamDraft
         // if the DB load succeeds. If it fails (e.g. server restart), the
         // streamed content stays visible instead of vanishing.
+        // Bake streamDraft text into the message content BEFORE clearing the draft.
+        // Otherwise the text lives only in segments, which get dropped when the
+        // placeholder is replaced by the persisted DB message.
+        const draftContent = streamDraftRef.current?.segments
+          ?.filter((s) => s.type === "text" || s.type === "thinking")
+          ?.map((s) => s.content || "")
+          ?.join("") || "";
+        if (draftContent) {
+          setMessages((prev) => prev.map((m) =>
+            m.isStreaming && m.role === "assistant" && !m.content
+              ? { ...m, content: draftContent }
+              : m
+          ));
+        }
         loadMessagesFromDb(sendingForAgentId).then((ok) => {
           if (ok) {
             // DB loaded successfully — clear the draft and show persisted messages
