@@ -127,6 +127,40 @@ class HandoffService:
         log.info("handoff_complete", handoff_id=handoff_id, completed=ok)
         return ok
 
+    async def approve(self, project_id: str, reviewer_id: str,
+                       subordinate_id: str) -> dict:
+        """Approve a subordinate's completed handoff. Returns {success, message}."""
+        await _ensure_schema(project_id)
+        conn = await _conn(project_id)
+        cursor = await conn.execute(
+            "SELECT id FROM handoffs WHERE to_agent_id = ? AND from_agent_id = ? "
+            "AND status = 'completed' ORDER BY created_at DESC LIMIT 1",
+            [reviewer_id, subordinate_id])
+        row = await cursor.fetchone()
+        await cursor.close()
+        if not row:
+            return {"success": False, "message": "No completed handoff found for this subordinate"}
+        handoff_id = row["id"]
+        ok = await self.approve_handoff(project_id, handoff_id)
+        return {"success": ok, "message": "Approved" if ok else "Failed to approve"}
+
+    async def reject(self, project_id: str, reviewer_id: str,
+                      subordinate_id: str, reason: str) -> dict:
+        """Reject a subordinate's completed handoff with feedback. Returns {success, message}."""
+        await _ensure_schema(project_id)
+        conn = await _conn(project_id)
+        cursor = await conn.execute(
+            "SELECT id FROM handoffs WHERE to_agent_id = ? AND from_agent_id = ? "
+            "AND status = 'completed' ORDER BY created_at DESC LIMIT 1",
+            [reviewer_id, subordinate_id])
+        row = await cursor.fetchone()
+        await cursor.close()
+        if not row:
+            return {"success": False, "message": "No completed handoff found for this subordinate"}
+        handoff_id = row["id"]
+        ok = await self.reopen_handoff(project_id, handoff_id)
+        return {"success": ok, "message": f"Rejected: {reason}" if ok else "Failed to reject"}
+
     async def approve_handoff(self, project_id: str, handoff_id: str) -> bool:
         """Approve a handoff (completed → approved, terminal state)."""
         await _ensure_schema(project_id)

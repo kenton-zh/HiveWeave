@@ -408,11 +408,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     # — Dispatch + review —
     "dispatch_task": {
         "properties": {
-            "toAgentId": {"type": "string", "aliases": ["to_agent_id", "target", "recipient", "agentId"]},
-            "description": {"type": "string", "aliases": ["task", "message", "content", "summary"]},
+            "target": {"type": "string", "aliases": ["toAgentId", "to_agent_id", "recipient", "agentId"]},
+            "task": {"type": "string", "aliases": ["description", "message", "content", "summary"]},
             "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
         },
-        "required": ["toAgentId", "description"],
+        "required": ["target", "task"],
     },
     "review": {
         "properties": {
@@ -903,8 +903,23 @@ class ToolExecutor:
         # ── High-level orchestration tools ──────────────────
         # These bridge the LLM tool calls to service-layer methods.
 
-        if name in ("send_message", "message_subordinate", "message_superior",
-                     "message_peer", "message_team", "message_user"):
+        if name == "message_superior":
+            # Auto-resolve: message → superior (no recipients needed)
+            superior = await self._org.get_superior(agent_id)
+            if not superior:
+                return self._error("No superior found")
+            args["recipients"] = [superior.get("short_id") or superior["id"]]
+            return await self._tool_send_message(agent_id, args)
+
+        if name == "message_subordinate":
+            # Auto-resolve: message → all direct subordinates
+            children = await self._org.get_subordinates(agent_id)
+            if not children:
+                return self._error("No subordinates found")
+            args["recipients"] = [c.get("short_id") or c.get("id") for c in children]
+            return await self._tool_send_message(agent_id, args)
+
+        if name in ("send_message", "message_peer", "message_team", "message_user"):
             return await self._tool_send_message(agent_id, args)
 
         if name == "list_subordinates":
