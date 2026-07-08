@@ -600,6 +600,7 @@ class Agent:
         self.current_job: dict | None = None
         self._cancel_reason: str | None = None
         self._message_queue: list[tuple[str, dict, int]] = []
+        self._streaming_msg_id: str | None = None
 
         # ── asyncio 原语 ──
         self._llm_task: asyncio.Task | None = None
@@ -779,6 +780,19 @@ class Agent:
                 "opts": opts,
                 "started_at": int(time.time() * 1000),
             }
+
+            # Save a streaming placeholder BEFORE the LLM call.
+            # If the agent crashes mid-response, this partial record survives.
+            is_trigger = opts.get("trigger", False)
+            self._streaming_msg_id = await self._chat_msg.save_message({
+                "agent_id": self.id,
+                "role": "assistant",
+                "content": "",
+                "thinking": None,
+                "tool_calls": "[]",
+                "is_streaming": True,
+                "is_background": True if is_trigger else False,
+            })
 
             # 启动 LLM task
             self._llm_task = asyncio.create_task(
@@ -1218,25 +1232,36 @@ class Agent:
         )
 
         # 1. 保存 assistant 消息到 chat_messages
-        # BUG-034: 如果这是 trigger 触发的后台处理，标记 is_background，
-        # 避免污染前端主聊天窗口。用户对话的 assistant 回复不标记。
-        # 注意: trigger assistant 回复是 agent 内部处理(读文件/分析)，
-        # 不是对外消息。真正的 agent 间通信由 send_message 工具通过
-        # TeamChatService (role='team') 记录。
+        # 更新先前保存的 streaming placeholder，而非插入新消息。
+        # 如果 agent 中途崩溃，placeholder 保留在 DB 中（is_streaming=True），
+        # 调试时可看到"回答被中断"的标记。
         is_trigger = opts.get("trigger", False)
-        await self._chat_msg.save_message(
-            {
-                "agent_id": self.id,
-                "role": "assistant",
-                "content": content,
-                "thinking": thinking,
-                "tool_calls": json.dumps(tool_calls, ensure_ascii=False)
-                if tool_calls
-                else "[]",
-                "is_streaming": False,
-                "is_background": True if is_trigger else False,
-            }
-        )
+        if self._streaming_msg_id:
+            await self._chat_msg.update_message(
+                self.id, self._streaming_msg_id,
+                {
+                    "content": content,
+                    "thinking": thinking,
+                    "tool_calls": json.dumps(tool_calls, ensure_ascii=False)
+                    if tool_calls else "[]",
+                    "is_streaming": False,
+                },
+            )
+            self._streaming_msg_id = None
+        else:
+            await self._chat_msg.save_message(
+                {
+                    "agent_id": self.id,
+                    "role": "assistant",
+                    "content": content,
+                    "thinking": thinking,
+                    "tool_calls": json.dumps(tool_calls, ensure_ascii=False)
+                    if tool_calls
+                    else "[]",
+                    "is_streaming": False,
+                    "is_background": True if is_trigger else False,
+                }
+            )
 
         # BUG-026 修复：自动写 work_log，确保前端 Logs tab 有内容。
         # 不依赖 LLM 主动调用 write_work_log 工具——每轮完成都记录一条，
