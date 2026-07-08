@@ -366,25 +366,11 @@ async def execute_bash(
     # 4. Choose execution backend (priority: persistent sandbox > one-shot docker > native)
     result = None
 
-    # 4a. Try persistent sandbox (per-project container, preserves npm/pip installs)
-    if use_docker is not False and project_id:  # None or True
-        try:
-            from hiveweave.services.sandbox import SandboxService
-            sandbox = SandboxService(enabled=True)
-            if sandbox.enabled and not sandbox.should_use_host(command):
-                result = await sandbox.exec(project_id, command, timeout_s)
-                if result.get("error") is None:
-                    log.info("bash.sandbox", project_id=project_id)
-        except Exception as e:
-            log.debug("bash.sandbox_unavailable", error=str(e))
-
-    # 4b. Fallback: one-shot docker (BASH_SANDBOX=docker env var)
-    if result is None:
-        sandbox_env = os.environ.get("BASH_SANDBOX", "").lower()
-        if use_docker or sandbox_env == "docker":
-            result = await _run_docker(command, cwd, int(timeout_s))
-        else:
-            result = await _run_native(command, cwd, int(timeout_s))
+    # 4. Choose execution backend
+    if use_docker:
+        result = await _run_docker(command, cwd, int(timeout_s))
+    else:
+        result = await _run_native(command, cwd, int(timeout_s))
 
     if result.get("error"):
         return {"success": False, "output": "",
