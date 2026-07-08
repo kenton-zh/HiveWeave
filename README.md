@@ -1,180 +1,190 @@
-# HiveWeave
+<p align="center">
+  <h1 align="center">HiveWeave</h1>
+</p>
+<p align="center"><strong>AI Engineering Organization</strong> — Multi-Agent Hierarchical Collaborative Platform</p>
+<p align="center"><em>不是 AI 编程工具，而是一个会自我演化的 AI 工程组织</em></p>
 
-AI 工程组织 — 多 Agent 层级协作编程平台。
+<p align="center">
+  <a href="https://github.com/kenton-zh/HiveWeave"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kenton-zh/HiveWeave?style=flat-square" /></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" /></a>
+  <img alt="Python" src="https://img.shields.io/badge/python-3.12+-3776AB?style=flat-square&logo=python&logoColor=white" />
+  <img alt="React" src="https://img.shields.io/badge/react-19-61DAFB?style=flat-square&logo=react&logoColor=black" />
+  <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white" />
+</p>
 
-> **不是"AI 编程工具"，而是一个会自我演化的 AI 工程组织。**
+<p align="center">
+  <a href="README.md">English</a> |
+  <a href="README.md">中文</a>
+</p>
 
-Agent 有职级、记忆可继承、离职有交接。用户可以像管理真实团队一样管理 AI 团队——有组织架构、任务分配、编制调整、审批流转。每个 Agent 在独立的 Git 工作区中开发，经上级审核通过后才合并至主分支。
+---
 
-## 为什么不用单 Agent
+## What is HiveWeave / 这是什么
 
-Claude Code、Cursor 这类工具是一个"全能型"Agent 独立完成所有工作。HiveWeave 换了个思路：**像真实工程团队一样分工协作**。这个架构带来了四个单 Agent 无法实现的优势：
+HiveWeave replaces the single-AI-agent model with a **multi-agent engineering organization**. Instead of one AI doing everything, you get a CEO, managers, engineers, QA, and HR — each with their own role, memory, tools, and worktree. They hire, delegate, review, merge, and report. You manage them like a real team.
 
-| 优势 | 做法 | 效果 |
-|------|------|------|
-| **模型成本优化** | 协调者（CEO/架构师）用高级模型做规划与审查；执行者（叶子 Agent）用廉价模型写代码 | 把昂贵的 token 花在决策上，重复性的编码交给便宜模型 |
-| **上下文隔离** | 前端 Agent 只装前端代码，后端 Agent 只装后端代码；用户直接和具体负责人对话 | 单 Agent 上下文里塞满整个项目容易混淆；按职责隔离后每个 Agent 专注自己那部分 |
-| **并行隔离开发** | 每个 Agent 拥有独立 Git worktree，在自己的分支上写代码 | 多个 Agent 同时开发不同模块互不干扰 |
-| **审核后合并** | 执行者完成后上报，协调者审查代码与 worktree 状态，通过才合并到主分支 | 代码质量有闸门，不合格直接驳回返工 |
+HiveWeave 把单 AI Agent 模式替换为**多 Agent 工程组织**。CEO、技术经理、开发工程师、QA、HR——每个角色有自己的职责、记忆、工具和独立工作区。他们招聘、分配任务、审查代码、合并分支、汇报进度。你像管理真实团队一样管理他们。
 
-## 核心特性
+> **Why**: Single-agent tools (Claude Code, Codex, Cursor) lose context across modules, can't parallelize, and have no quality gate. HiveWeave splits the work across specialized agents with isolated contexts, independent worktrees, and a four-layer review chain before anything reaches you.
 
-### 模型分级策略
-- **按角色分配模型** — 系统维护 `default_model_coordinator` 和 `default_model_executor` 两套独立模型配置；协调者用 Claude/GPT-4 级别模型做规划与审查，执行者用 DeepSeek 级别模型写代码
-- **单 Agent 粒度覆盖** — 每个 Agent 可单独指定模型，灵活混合多供应商（OpenAI / Anthropic / DeepSeek / Groq 等）
-- **成本可控** — 决策 token 少但贵，编码 token 多但便宜，总体成本远低于全程使用顶级模型
+## Quick Start / 快速开始
 
-### 精准对话与上下文隔离
-- **直达任意层级** — 用户可以直接与子节点、甚至叶子 Agent 对话，不必事事通过 CEO 中转。前端有问题找前端 Agent，后端有问题找后端 Agent，各修各的
-- **上下文按职责隔离** — 每个 Agent 的上下文只装载自己负责的代码和职责，前端 Agent 只看前端代码，后端 Agent 只看后端代码，不会把整个项目塞进一个上下文里导致混淆
-- **超大型项目按模块拆分** — 可以为每个模块分配专属 Agent（如 `auth-agent`、`payment-agent`、`search-agent`），每个 Agent 只维护自己负责的模块代码，上下文精简、职责清晰
-- **多面板并行对话** — 前端可同时打开多个 Agent 的对话面板，分别给前端、后端、测试 Agent 下达指令，互不干扰
+```bash
+# Clone
+git clone https://github.com/kenton-zh/HiveWeave.git
+cd HiveWeave
 
-### Git Worktree 隔离开发
-- **独立工作区** — 每个 Agent 获得隔离的 Git worktree（`.hiveweave/worktrees/<shortId>/`），在专属分支 `hw/<shortId>/<task>` 上开发
-- **检查点机制** — Agent 可随时 `checkpoint` 保存进度（轻量 commit），支持回滚到任意检查点
-- **审核合并流程** — 执行者 `report_completion` → 协调者 `review_code` 审查日志与 worktree 状态 → `approve_work` 合并到 main / `reject_work` 驳回返工
-- **安全回滚** — 审核不通过可 `rollback` 到之前的检查点，不会污染主分支
+# Backend (Python/FastAPI, port 4000)
+cd apps/hiveweave-py
+uv sync
+uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000
 
-### Agent 组织管理
-- **动态层级架构** — CEO → HR → 技术负责人/架构师/经理 → 叶子 Agent，上级协调不写代码，叶子才写代码
-- **职责分离** — 协调者只有只读文件权限（不能直接写代码），执行者没有派发权限（不能 spawn 下级），权限矩阵强制分工
-- **人事档案系统** — 职级、履历、权限类型、任职记录，像管理真实团队一样管理 Agent
-- **模板系统** — 从预设模板一键创建 Agent（test_engineer、code_reviewer、security_auditor 等）
+# Frontend (React/Vite, port 5173)
+cd apps/web
+export PATH="$LOCALAPPDATA/Programs/node-v22.20.0-win-x64:$PATH"  # Windows only
+pnpm install
+pnpm dev
+```
 
-### 三层记忆与交接继承
-- **三层记忆模型** — 项目共享记忆 / Agent 私有记忆 / 归档记忆
-- **记忆继承** — Agent 离职时正式交接（解散 → 总结 → 移交 → 归档 → 可复活），记忆可沿袭给继任者
-- **Merge 合并** — 冲突检测 → 仲裁 → 合成新记忆，支持多 Agent 知识融合
+Or use the startup scripts (Windows):
+```bash
+start-all.bat          # Backend + Frontend
+start-backend.bat      # Backend only (port 4000)
+start-frontend.bat     # Frontend only (port 5173)
+```
 
-### asyncio 任务级容错
-- **任务隔离** — 每个 Agent 运行在独立 asyncio task 中，单个 Agent 崩溃不会拖垮其他 Agent 或系统
-- **熔断器** — LLM 提供商故障时自动熔断，带探针锁防止多个 Agent 同时冲击不稳定的 API
-- **自动重试** — 429/503/504/529 指数退避 + jitter，解析 `Retry-After` 头
+Open `http://localhost:5173` to create your first project and meet your CEO.
 
-### 长任务支持
-- **多轮工具循环** — 执行者单次触发最多 80 轮工具调用，协调者最多 60 轮
-- **自重触发** — 处理完成后如有新 inbox 消息自动再次触发，支持超越单次上限的长任务链
-- **上下文压缩** — token 预算裁剪 + LLM 摘要压缩（compactor），超长对话不溢出
-- **游戏时间调度** — 15 真实分钟 = 1 游戏天，停滞 Agent（15+ 分钟无活动）自动升级到上级处理
+## Architecture / 架构
 
-### 工具系统（30+ 内置工具）
-- **文件操作** — `read_file` / `write_file` / `edit_file` / `apply_patch` / `delete_file` / `move_file` / `create_directory` / `list_files`
-- **代码搜索** — `grep` / `glob` / `search_files`
-- **命令执行** — `bash`（带自毁命令阻断、路径沙箱）
-- **网络** — `websearch` / `fetch_url`
-- **代码审查** — `review`（runCodeReview / runSecurityAudit / runTestReview / runPerfAudit / runFullReview）
-- **MCP 集成** — `mcp_list_tools` / `mcp_call`，可对接任意 MCP 服务器
-- **协作工具** — `dispatch_task` / `report_completion` / `message_superior` / `send_message` / `review_code` / `approve_work` / `reject_work`
-- **组织管理** — `hire_agent` / `list_subordinates` / `read_work_logs` / `write_work_log` / `write_memory` / `read_project_memory`
-- **按角色分层授权** — 协调者拥有 git worktree 管理工具，执行者拥有文件写入工具，互不越权
+```
+你 (Human Operator)
+  ↕                    ↕ (via question tool / chat)
+CEO ─── 专家 (Expert, on-demand, most expensive model)
+  ↕
+技术经理 (Tech Lead / PM / Architect)
+  ↕
+QA + Executor (cheaper models for execution)
 
-### 通信与协作
-- **跨级直达通信** — 可在组织架构任意层级间发出消息
-- **团队聊天** — TeamChat 支持多 Agent 群组讨论
-- **收件箱系统** — 消息投递 + 定时提醒 + 优先级
-- **CAVEMAN 通信风格** — Agent 间通信使用简洁技术语言，去掉寒暄和客套，降低 token 消耗
+四层把关 (Four-Layer Review Gate):
+  Executor → QA(/review) → 技术经理(spec compliance) → CEO(intent fit) → 你(eye check)
+```
 
-### 实时可视化
-- **组织架构图** — React Flow 驱动的可视化层级图，拖拽可缩放
-- **多面板对话** — 同时与多个 Agent 对话
-- **Agent 详情面板** — 实时查看 Agent 状态、记忆、待办、工作日志
-- **实时流式** — Phoenix Channels WebSocket 推送，token 级实时响应
-- **Electron 桌面端** — 可作为桌面应用运行
+| Layer / 层 | Role / 角色 | Model / 模型 | Responsibility / 职责 |
+|:---|------|:---|------|
+| Decision / 决策 | CEO | Premium (Claude Opus / GPT-5) | Direction, spec, user reporting |
+| Planning / 规划 | Tech Lead | Strong (Claude Sonnet / GPT-4) | Architecture, task breakdown, review |
+| Quality / 质量 | QA | Moderate | Five-axis code review, security audit, E2E testing |
+| Execution / 执行 | Executor | Cheap (DeepSeek / Haiku / Flash) | Write code, run tests, self-review |
 
-### 扩展性
-- **MCP 协议** — Model Context Protocol 支持，可对接任意 MCP 服务器扩展工具能力
-- **ClawHub** — Skill 市场 / 插件注册机制
-- **定时闹钟** — 基于游戏时间的定时消息触发，支持长周期任务调度
+## Core Capabilities / 核心能力
 
-## 技术栈
+### Multi-Agent Organization / 多 Agent 组织
+- **Dynamic hierarchy** — CEO → HR → Managers → Executors. Coordinators plan and review; Executors write code. Never the other way around.
+- **Hiring flow** — CEO designs org → HR hires → Managers break down domains → HR hires more. Three-wave staffing that matches real team growth.
+- **Discipline suites** — Each role gets a discipline skill set (code-review-and-quality, self-review, security-and-hardening, etc.) that defines HOW they think, not just WHAT tools they use.
+- **Two-tier skill binding** — Discipline skills (mandatory, role-defining) + Tool skills (marketplace-matched by HR). HR serves every coordinator, not just the CEO.
 
-| 层级 | 技术 |
-|------|------|
-| **后端** | Python 3.12 + FastAPI + Uvicorn（端口 4000） |
-| **前端** | React 19 + Vite + React Flow + Electron（端口 5173） |
-| **数据库** | SQLite + aiosqlite（Meta DB WAL + Per-project DB DELETE journal） |
-| **AI/LLM** | httpx 流式 SSE + provider factory，OpenAI 兼容多 provider |
-| **实时通信** | phoenix.js（前端）+ phoenix_adapter（后端）WebSocket |
-| **MCP** | 内置 `mcp_call`，可对接任意 MCP 服务器 |
-| **沙箱** | Docker（`BASH_SANDBOX=docker`） |
-| **运行时** | Python >=3.12 + Node.js >=22 <24 + pnpm 10 + Turbo |
+### Context Isolation / 上下文隔离
+- **Per-agent context** — Frontend agent only loads frontend code. Backend agent only loads backend. No cross-contamination.
+- **Per-agent model routing** — CEO uses Claude Opus. Executor uses DeepSeek Flash. Expensive tokens on decisions; cheap tokens on execution.
+- **Direct chat** — You can talk directly to any agent at any level. Frontend issue? Talk to the frontend dev. Don't route through CEO.
 
-## 项目结构
+### Git Worktree Development / Git 工作区隔离
+- **Isolated worktrees** — Each agent gets its own `git worktree` (`hw/<shortId>/<task>`). No conflicts between parallel agents.
+- **Checkpoint + rollback** — Agents checkpoint before risky changes. Rollback without polluting main.
+- **Review → Merge gate** — Executor reports completion → QA reviews → Manager approves → CEO signs off → Merge to main. Four gates before code reaches you.
+
+### Memory & Handoff / 记忆与交接
+- **Three-tier memory** — Project memory (shared), Agent memory (private), Archived memory (former agents). Knowledge persists across sessions.
+- **Handoff inheritance** — When an agent is dismissed, their memory is summarized and transferred to a successor. No knowledge loss.
+- **Continuous learning** — Agents can `skillify` successful workflows and `learn` from failures. Cross-project patterns are logged by the Boss Assistant.
+
+### Model Budget Layering / 模型预算分层
+- **按角色分模型** — Coordinators get premium models for planning and review. Executors get cheap models for coding.
+- **专家通道** — When the team hits a wall, CEO summons an Expert agent running the most expensive model. AI-refined questions get better answers per dollar.
+- **Configurable** — Each agent can individually override its model. Mix providers across OpenAI, Anthropic, DeepSeek, Groq, etc.
+
+### Real-time Dashboard / 实时可视化
+- **Org chart** — React Flow-powered visualization. Drag, zoom, see who reports to whom.
+- **Multi-panel chat** — Talk to multiple agents simultaneously. Frontend dev in one panel, backend dev in another.
+- **Live streaming** — Token-level streaming via WebSocket. Watch agents type in real-time.
+
+## Tech Stack / 技术栈
+
+| Layer / 层 | Stack | Notes |
+|:---|------|------|
+| Backend | Python 3.12 + FastAPI + Uvicorn | Port 4000, 96 routes, 19 API modules |
+| Frontend | React 19 + Vite + React Flow + Zustand | Port 5173, Electron desktop support |
+| Database | SQLite + aiosqlite | Dual-DB: Meta DB (WAL) + Per-project DB |
+| AI/LLM | httpx SSE streaming + Provider Factory | OpenAI, Anthropic, DeepSeek, Groq, Google |
+| Realtime | phoenix.js + phoenix_adapter (WebSocket) | 3 channels: lobby, project, agent |
+| Sandbox | Docker (optional) | `BASH_SANDBOX=docker` |
+| Package | pnpm 10 + uv | Monorepo + Python packages |
+
+## Project Structure / 项目结构
 
 ```
 hiveweave/
 ├── apps/
-│   ├── hiveweave-py/              # 后端 — Python/FastAPI (port 4000)
+│   ├── hiveweave-py/                  # Backend — Python/FastAPI (port 4000)
 │   │   └── src/hiveweave/
-│   │       ├── agents/            # Agent + Supervisor + trigger
-│   │       ├── api/               # FastAPI 路由 (19 模块, 96 路由)
-│   │       ├── llm/               # streamer, circuit_breaker, provider, retry
-│   │       ├── services/          # 23 services (org, dispatch, memory, handoff, ...)
-│   │       ├── tools/             # executor + 11 工具模块 (bash, file, grep, ...)
-│   │       ├── conversation/      # 对话历史 + token budget + compaction
-│   │       ├── db/                # Meta DB + per-project DB (aiosqlite)
-│   │       ├── realtime/          # phoenix_adapter, channels, pubsub, event_bus
-│   │       └── prompts/           # ETHOS 提示词体系
-│   └── web/                       # 前端应用 — React 19 + Vite + Electron (port 5173)
-│       └── src/
-│           ├── components/        # 组件 (ChatPanel, OrgTree, AgentNode, ...)
-│           ├── utils/             # game-time, role-styles, ...
-│           ├── store.ts           # 全局状态
-│           └── api.ts             # API 调用封装
-└── docs/
-    └── migration/                 # 迁移历史文档
+│   │       ├── agents/                # Agent lifecycle + Supervisor + trigger
+│   │       ├── api/                   # 19 FastAPI router modules, 96 routes
+│   │       ├── llm/                   # Streamer, provider factory, retry, circuit_breaker
+│   │       ├── services/              # 23 services (org, dispatch, memory, handoff, MCP, ...)
+│   │       ├── tools/                 # 11 built-in tools (bash, file, grep, patch, review, ...)
+│   │       ├── conversation/          # Token budget, compaction, conversation store
+│   │       ├── db/                    # Meta DB + Per-project DB (aiosqlite)
+│   │       ├── realtime/              # phoenix_adapter, channels, pubsub, event_bus
+│   │       └── prompts/               # ETHOS prompt system (identity + context)
+│   └── web/                           # Frontend — React 19 + Vite + Electron (port 5173)
+├── docs/
+│   ├── migration/                     # Migration history (Elixir/TS → Python)
+│   └── PoE2LI-team-config.md          # Example team configuration
+├── start-all.bat                      # Windows startup script
+└── CLAUDE.md                          # AI tooling instructions
 ```
 
-## 数据模型（19 张表）
+## How It Works / 工作流程
 
-| 表 | 用途 |
-|----|------|
-| `agents` | Agent 定义与配置 |
-| `agent-templates` | Agent 预设模板 |
-| `projects` | 项目定义 |
-| `project-index` | 项目索引 |
-| `memories` | 记忆存储 |
-| `handoffs` | 交接记录 |
-| `merges` | 合并记录 |
-| `chat-messages` | 聊天消息 |
-| `conversation-turns` | 对话轮次 |
-| `inbox` | 收件箱 |
-| `personnel-records` | 人事档案 |
-| `modules` | 模块/组件 |
-| `llm-models` | LLM 模型配置 |
-| `permission-requests` | 权限请求 |
-| `work-logs` | 工作日志 |
-| `scheduled-alarms` | 定时闹钟 |
-| `meta-index` | 元索引 |
-| `agent-charters` / `charter-attachments` | 项目章程 |
-
-## 快速开始
-
-```bash
-# 启动后端 + 前端（分别在独立窗口）
-start-all.bat
-
-# 或单独启动
-start-backend.bat     # Python/FastAPI，端口 4000
-start-frontend.bat    # React/Vite，端口 5173
-
-# 浏览器打开 http://localhost:5173
+```
+1. 创建项目 → CEO + HR 自动生成
+2. CEO 摸底 (EXPLORE) → 读文档 → 选组织范式 → 设计纪律套装
+3. CEO → HR: "招一个后端经理，纪律用 Manager Suite"
+4. HR: 绑定纪律技能 (必绑) → 搜市场补工具技能 → 创建 Agent
+5. 后端经理到位 → EXPLORE 自己的领域 → 拆任务 → 向 HR 招下属
+6. Executor 写代码 → self-review 自审 → QA 审查 → 经理验收 → CEO 对齐 → 你肉眼看
+7. 每个肉眼可见的节点后 → 下一批任务
 ```
 
-后端依赖安装：
+## Features / 特性
 
-```bash
-cd apps/hiveweave-py
-uv sync               # 或 pip install -e .
-```
+| Feature / 特性 | Description |
+|:---|------|
+| **Role-based models** | CEO/Expert get premium LLMs; Executors get cheap ones. Cost-effective at scale. |
+| **Worktree isolation** | Each agent has independent `git worktree`. Parallel agents, zero conflicts. |
+| **CAVEMAN comms** | Agent-to-agent messages are terse and technical. No pleasantries, no token waste. |
+| **4-layer review gate** | Executor → QA → Manager → CEO → You. Nothing reaches you unverified. |
+| **Natural language user involvement** | Not enum config. "我只在前端功能完成后验收" — CEO interprets and honors it. |
+| **Asyncio task isolation** | Agent crash doesn't crash the system. Circuit breaker + exponential retry for LLM outages. |
+| **Game time scheduling** | 15 real minutes = 1 game day. Stalled agents auto-escalate. Alarms on simulated clock. |
+| **MCP protocol** | Tool extension via Model Context Protocol. Bind MCP servers per agent. |
+| **ClawHub marketplace** | Remote skill marketplace. HR searches and binds skills dynamically. |
+| **30+ built-in tools** | bash, grep, file ops, patch, websearch, question, todowrite, review, security, MCP tools. |
 
-前端依赖安装：
+## Documentation / 文档
 
-```bash
-pnpm install
-```
+- [CLAUDE.md](./CLAUDE.md) — AI tooling instructions & architecture deep-dive
+- [Migration History](./docs/migration/) — Elixir/TS → Python migration records
+- [PoE2LI Team Config](./docs/PoE2LI-team-config.md) — Example team configuration template
 
-## 文档
+## Contributing / 贡献
 
-- [MVP 技术蓝图](./docs/AI工程组织_MVP蓝图.md) — 产品定位、架构决策、设计原则
+HiveWeave is in active development. The project is built by AI agents (CEO + team) with human oversight at key verification nodes. See [CLAUDE.md](./CLAUDE.md) for the full development workflow.
+
+---
+
+<p align="center">
+  Built with HiveWeave — an AI engineering organization that builds itself.
+</p>
