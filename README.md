@@ -17,6 +17,8 @@
   <a href="README.zh.md">中文</a>
 </p>
 
+[![HiveWeave Dashboard](assets/screenshots/dashboard.png)](https://github.com/kenton-zh/HiveWeave)
+
 ---
 
 ## What is HiveWeave

@@ -17,6 +17,8 @@
   <a href="README.zh.md">中文</a>
 </p>
 
+[![HiveWeave 仪表盘](assets/screenshots/dashboard.png)](https://github.com/kenton-zh/HiveWeave)
+
 ---
 
 ## 这是什么
