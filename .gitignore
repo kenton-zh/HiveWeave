@@ -117,3 +117,4 @@ apps/web/scripts/refactor-*
 # IDE / tool local state
 .trae/
 .gstack/
+.e2e-sandbox/
