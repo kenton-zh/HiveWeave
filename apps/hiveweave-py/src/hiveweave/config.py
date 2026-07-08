@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # OpenCode API key (契约 18: seedDefaultModel 读此变量)
     opencode_api_key: str = ""
 
+    # External skills directory (best-effort; 不存在则返回空)
+    # 默认为空 — 需通过环境变量 HIVEWEAVE_EXTERNAL_SKILLS_DIR 指定
+    external_skills_dir: str = ""
+
     model_config = {
         "env_prefix": "HIVEWEAVE_",
         "env_file": ".env",

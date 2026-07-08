@@ -52,7 +52,7 @@ class TemplateService:
             "INSERT INTO agent_templates (id, source, division, name, role, "
             "color, emoji, vibe, description, prompt_body, discipline_suite, "
             "created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [template_id, source, division, name, role, color, emoji, vibe,
              description, prompt_body, discipline_suite, now_ms, now_ms])
         log.info("template_created", template_id=template_id, name=name,
