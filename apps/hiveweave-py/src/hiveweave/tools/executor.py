@@ -777,6 +777,7 @@ class ToolExecutor:
                 workdir=workdir,
                 workspace_path=workspace_path,
                 timeout_ms=int(timeout) if timeout else None,
+                project_id=await self._get_project_id(agent_id),
             )
 
         if name == "run_command":
