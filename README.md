@@ -161,15 +161,26 @@ hiveweave/
 | Feature | Description |
 |:---|------|
 | **Role-based models** | CEO/Expert get premium LLMs; Executors get cheap ones. Cost-effective at scale. |
-| **Worktree isolation** | Each agent has independent `git worktree`. Parallel agents, zero conflicts. |
-| **CAVEMAN comms** | Agent-to-agent messages are terse and technical. No pleasantries, no token waste. |
+| **Per-agent model override** | Any agent can individually specify its model. Mix providers — OpenAI, Anthropic, DeepSeek, Groq. |
+| **Git worktree per agent** | Every agent gets its own `git worktree` (`hw/<shortId>/<task>`). Full filesystem isolation. Checkpoint, rollback, merge — all through the coordinator. |
+| **Self-review before QA** | Executors run five-axis self-review (correctness/readability/architecture/security/performance) BEFORE submitting. Catches issues early, reduces review churn. |
 | **4-layer review gate** | Executor → QA → Manager → CEO → You. Nothing reaches you unverified. |
-| **Natural language user involvement** | Not enum config. "I only verify after frontend features are done" — CEO interprets and honors. |
-| **Asyncio task isolation** | Agent crash doesn't crash the system. Circuit breaker + exponential retry for LLM outages. |
-| **Game time scheduling** | 15 real minutes = 1 game day. Stalled agents auto-escalate. Alarms on simulated clock. |
-| **MCP protocol** | Tool extension via Model Context Protocol. Bind MCP servers per agent. |
-| **ClawHub marketplace** | Remote skill marketplace. HR searches and binds skills dynamically. |
-| **30+ built-in tools** | bash, grep, file ops, patch, websearch, question, todowrite, review, security, MCP tools. |
+| **Natural language user involvement** | Not an enum dropdown. "I only verify after frontend features are done. Backend — I don't want to see it." CEO interprets and honors your intent. |
+| **Agent personalities** | Every agent has a 花名 (Chinese poetic nickname), personal backstory, quirks, and hobbies. They feel like characters, not functions. |
+| **Discipline suites** | Roles get discipline skill sets that define HOW they think, not just WHAT tools they use. Pre-built suites (QA Suite, Manager Suite, Executor Suite) or CEO-designs-custom. |
+| **Two-tier skill binding** | Discipline skills (mandatory, role-defining) + Tool skills (HR matches from marketplace). HR serves every coordinator, not just the CEO. |
+| **6 org paradigms** | Solo, Flat Squad, Tech Lead, PM+Architect, Pod, Pipeline. CEO picks the structure that fits the project. |
+| **Phase 0.5 manager mobilization** | Managers explore their domain and break down tasks BEFORE hiring subordinates. No over-hiring, no idle agents. |
+| **CAVEMAN comms** | Agent-to-agent messages are terse and technical. "模块已拆分. 3人已招. 等待优先级." No pleasantries, zero token waste. |
+| **Three-tier memory** | Project memory (shared), Agent private memory, Archived memory (former agents). Knowledge persists across sessions and handoffs. |
+| **Handoff inheritance** | When an agent is dismissed, their memory is summarized and transferred to a successor. No knowledge loss. |
+| **Expert on-demand** | When the team hits a wall, CEO summons an Expert agent (most expensive model). Team-refined questions → better answers per dollar. Only burns expert tokens when truly needed. |
+| **Asyncio task isolation** | Each agent runs in its own asyncio task. Crash doesn't crash the system. Circuit breaker + exponential backoff for LLM outages. |
+| **Game time scheduling** | 15 real minutes = 1 game day. Stalled agents auto-escalate to superiors. Timed alarms on simulated clock. |
+| **Dual-DB pattern** | Meta DB (WAL, global) + Per-project DB (DELETE journal, isolated). Agents never cross-contaminate data. |
+| **MCP protocol** | Tool extension via Model Context Protocol. Bind MCP servers per agent — different agents get different external tools. |
+| **ClawHub marketplace** | Remote skill marketplace. HR searches and binds skills dynamically. No hardcoded skill lists. |
+| **30+ built-in tools** | bash, grep, file ops, patch, websearch, question, todowrite, review (5-axis), security audit, MCP tools. Permission-gated per role type. |
 
 ## Documentation
 
