@@ -25,6 +25,11 @@ SANDBOX_WORKSPACE_MOUNT = "/workspace"
 # (e.g., git worktree operations that modify .hiveweave/worktrees/)
 _HOST_ONLY_COMMANDS: frozenset[str] = frozenset({
     "git worktree",
+    # Docker commands run on the HOST, not inside the sandbox container.
+    # This lets agents manage the project's own Docker setup (docker build,
+    # docker compose up, etc.) while still being sandboxed for everything else.
+    "docker",
+    "docker-compose",
 })
 
 
