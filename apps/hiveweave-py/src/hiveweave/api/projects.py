@@ -607,10 +607,16 @@ async def delete_project(project_id: str) -> dict:
         pass
 
     # 等待 agent task 完全取消 + DB 连接释放（Windows 文件锁延迟）
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(2.0)
 
     # 强制关闭该项目的所有 DB 连接（必须在所有内存清理之后，否则会重新打开）
     if workspace:
+        try:
+            await project_db.evict_project_db(workspace)
+        except Exception:
+            pass
+        # Windows: retry eviction to ensure all handles are released
+        await asyncio.sleep(0.5)
         try:
             await project_db.evict_project_db(workspace)
         except Exception:
