@@ -21,39 +21,52 @@
 
 ---
 
+**[这是什么](#这是什么) · [快速开始](#快速开始) · [架构](#架构) · [核心能力](#核心能力) · [技术栈](#技术栈) · [特性](#特性) · [文档](#文档)**
+
+---
+
 ## 这是什么
 
 HiveWeave 把单 AI Agent 模式替换为**多 Agent 工程组织**。CEO、技术经理、开发工程师、QA、HR——每个角色有自己的职责、记忆、工具和独立工作区。他们招聘、分配任务、审查代码、合并分支、汇报进度。你像管理真实团队一样管理他们。
 
 > **为什么**：单 Agent 工具（Claude Code、Codex、Cursor）跨模块丢上下文、无法并行开发、没有质量闸门。HiveWeave 把工作拆分给专业 Agent，每个拥有独立的上下文和工作区，经过四层把关后才到你眼前。
 
+|  | 单 Agent 工具（Claude Code、Cursor、Codex） | HiveWeave |
+|:---|:---|:---|
+| **上下文** | 共享一份上下文，随代码库变大而退化 | 按 Agent 隔离上下文——前端 Agent 永远看不到后端代码 |
+| **并行度** | 一次只能做一件事 | 多个 Agent 并行，各自独立 `git worktree` |
+| **质量把关** | 全靠你自己审查 | 四层把关：Executor → QA → 经理 → CEO → 你 |
+| **成本模型** | 所有任务用同一个模型 | 决策用顶级模型，执行用便宜模型 |
+| **记忆** | 每次会话重置或需手动重新铺垫 | 三层记忆，Agent 间可交接继承 |
+
 ## 快速开始
 
+**环境要求：** Python ≥3.12、Node 22.x（见 `.nvmrc`）、[pnpm](https://pnpm.io) 10、[uv](https://github.com/astral-sh/uv)，以及至少一个 LLM 供应商的 API key。
+
 ```bash
-# 克隆仓库
+# 1. 克隆仓库
 git clone https://github.com/kenton-zh/HiveWeave.git
 cd HiveWeave
 
-# 后端（Python/FastAPI，端口 4000）
+# 2. 配置 API key
+cp apps/hiveweave-py/.env.example apps/hiveweave-py/.env
+# 编辑 apps/hiveweave-py/.env，填入 HIVEWEAVE_OPENCODE_API_KEY
+# （OpenAI / Anthropic / DeepSeek / Groq / Google 的 key 之后可在应用内 Settings 里补充）
+
+# 3. 后端（Python/FastAPI，端口 4000）
 cd apps/hiveweave-py
 uv sync
 uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000
 
-# 前端（React/Vite，端口 5173）
+# 4. 前端（React/Vite，端口 5173）—— 新开一个终端
 cd apps/web
-export PATH="$LOCALAPPDATA/Programs/node-v22.20.0-win-x64:$PATH"  # 仅 Windows
 pnpm install
 pnpm dev
 ```
 
-或使用启动脚本（Windows）：
-```bash
-start-all.bat          # 后端 + 前端
-start-backend.bat      # 仅后端（端口 4000）
-start-frontend.bat     # 仅前端（端口 5173）
-```
-
 打开 `http://localhost:5173`，创建第一个项目，认识你的 CEO。
+
+**Windows 用户**可以直接用 `start-all.bat` / `start-backend.bat` / `start-frontend.bat`，等价于上面第 3–4 步——先确保 Node 已加入 `PATH`。
 
 ## 架构
 
@@ -139,9 +152,8 @@ hiveweave/
 │   │       ├── realtime/              # phoenix_adapter、channels、pubsub、event_bus
 │   │       └── prompts/               # ETHOS 提示词体系（identity + context）
 │   └── web/                           # 前端 — React 19 + Vite + Electron（端口 5173）
-├── docs/
-│   ├── migration/                     # 迁移历史（Elixir/TS → Python）
-│   └── PoE2LI-team-config.md          # 示例团队配置
+├── assets/
+│   └── screenshots/                   # README 截图
 ├── start-all.bat                      # Windows 启动脚本
 └── CLAUDE.md                          # AI 工具指令
 ```
@@ -186,9 +198,7 @@ hiveweave/
 
 ## 文档
 
-- [CLAUDE.md](./CLAUDE.md) — AI 工具指令与架构深度文档
-- [迁移历史](./docs/migration/) — Elixir/TS → Python 迁移记录
-- [PoE2LI 团队配置](./docs/PoE2LI-team-config.md) — 示例团队配置模板
+- [CLAUDE.md](./CLAUDE.md) — AI 工具指令与完整架构参考
 
 ## 致谢
 
@@ -205,7 +215,9 @@ HiveWeave 构建于以下项目的思想、代码和工作流之上：
 
 ## 贡献
 
-HiveWeave 正在活跃开发中。项目由 AI Agent（CEO + 团队）在人类的关键验证节点监督下构建。详见 [CLAUDE.md](./CLAUDE.md) 了解完整开发工作流。
+HiveWeave 正在活跃开发中，主要由它自己的 AI Agent 团队（CEO + 组织）构建，人类在关键节点做审查——如果你是通过 Claude Code 或类似的编程 Agent 来驱动开发，可以看 [CLAUDE.md](./CLAUDE.md) 了解这套工作流。
+
+人类直接参与贡献同样欢迎：有 bug 或想法直接开 issue，想改代码就 fork 后提 PR，没有额外门槛。
 
 ---
 
