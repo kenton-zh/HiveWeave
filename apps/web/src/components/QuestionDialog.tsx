@@ -1,4 +1,4 @@
-﻿import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import { getQuestions, answerQuestion, type PendingQuestion } from "../api";
 import { useAppStore } from "../store";
 
@@ -13,11 +13,12 @@ export default function QuestionDialog() {
   useEffect(() => {
     const timer = setInterval(async () => {
       try {
-        const qs = await getQuestions({ projectId: activeProjectId || undefined });
+        // 只查 pending 状态的问题，避免已答/超时问题反复弹出
+        const qs = await getQuestions({ projectId: activeProjectId || undefined, status: "pending" });
         // Filter out locally dismissed questions; always sync (clear when server has none)
         const visible = qs.filter((q) => !dismissedRef.current.has(q.id));
         setQuestions(visible);
-      } catch { /* ignore poll errors */ }
+      } catch (e) { console.warn("QuestionDialog poll failed:", e); }
     }, 5000);
     return () => clearInterval(timer);
   }, [activeProjectId]);

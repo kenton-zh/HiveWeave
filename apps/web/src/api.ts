@@ -984,7 +984,7 @@ export interface PendingQuestion {
   question: string;
   context?: string;
   options?: string[];
-  status: "pending" | "answered" | "expired";
+  status: "pending" | "answered" | "timeout" | "cancelled" | "expired";
   answer?: string;
   createdAt: number;
   answeredAt?: number;
@@ -996,7 +996,9 @@ export async function getQuestions(opts?: { agentId?: string; projectId?: string
   if (opts?.projectId) params.set("projectId", opts.projectId);
   if (opts?.status) params.set("status", opts.status);
   const qs = params.toString();
-  return fetchJSON(`${BASE}/chat/questions${qs ? "?" + qs : ""}`);
+  // 后端返回 { questions: PendingQuestion[] }，这里解包成数组
+  const data = await fetchJSON<{ questions: PendingQuestion[] }>(`${BASE}/chat/questions${qs ? "?" + qs : ""}`);
+  return data.questions ?? [];
 }
 
 export async function answerQuestion(id: string, answer: string) {
