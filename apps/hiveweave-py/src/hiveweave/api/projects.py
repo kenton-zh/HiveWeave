@@ -365,7 +365,10 @@ async def create_project(body: ProjectCreate) -> dict:
     for attempt in range(3):
         try:
             ws.mkdir(parents=True, exist_ok=True)
-            (ws / ".hiveweave").mkdir(parents=True, exist_ok=True)
+            hw = ws / ".hiveweave"
+            hw.mkdir(parents=True, exist_ok=True)
+            # 团队共享空间 — 所有 agent 可读可写（文档、计划、临时文件、脚本）
+            (hw / "shared").mkdir(exist_ok=True)
             break
         except Exception as e:
             _mkdir_err = str(e)
