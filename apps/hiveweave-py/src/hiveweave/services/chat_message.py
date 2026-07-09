@@ -50,6 +50,11 @@ class ChatMessageService:
         thinking = attrs.get("thinking")
         tool_calls = attrs.get("tool_calls", "[]")
         tool_call_id = attrs.get("tool_call_id")
+        # Defend against dict/list values — SQLite only accepts scalars
+        if isinstance(thinking, (dict, list)):
+            thinking = json.dumps(thinking, ensure_ascii=False)
+        if isinstance(tool_calls, (dict, list)):
+            tool_calls = json.dumps(tool_calls, ensure_ascii=False)
         is_streaming = 1 if attrs.get("is_streaming", False) else 0
         is_background = 1 if attrs.get("is_background", False) else 0
         is_read = 1 if attrs.get("is_read", True) else 0
@@ -93,6 +98,13 @@ class ChatMessageService:
                 val = attrs[key]
                 if key in ("is_read", "is_streaming", "is_context", "is_background"):
                     val = 1 if val else 0
+                # Defend against dict/list values — SQLite only accepts scalars.
+                # These arrive when upstream code passes raw objects instead of
+                # JSON strings (e.g. thinking as dict, tool_calls as list).
+                if isinstance(val, (dict, list)):
+                    val = json.dumps(val, ensure_ascii=False)
+                elif not isinstance(val, (str, int, float, bool, type(None))):
+                    val = str(val)
                 fields.append(f"{key} = ?")
                 params.append(val)
         if not fields:

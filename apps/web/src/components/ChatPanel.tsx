@@ -106,12 +106,6 @@ const statusLabels: Record<string, { text: string; color: string }> = {
 
 
 function isTeamChannelMessage(msg: ChatMessage): boolean {
-  // 团队消息分三种:
-  // 1. role='team' — send_message 工具调用产生，两端可见
-  // 2. role='user', isBackground=true — trigger 上下文注入，表示
-  //    其他 agent 发来了消息(收到←某人)
-  // 3. role='assistant', isBackground=true — agent 内部处理(读文件、
-  //    分析等)，不是对外消息，排除
   return (
     msg.role === "team" ||
     (msg.isBackground === true && msg.role === "user")
@@ -401,6 +395,8 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
 
 function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boolean }) {
   const [agentInfo, setAgentInfo] = useState<AgentInfo | null>(null);
+  const agentInfoRef = useRef<AgentInfo | null>(null);  // sync ref for callbacks
+  useEffect(() => { agentInfoRef.current = agentInfo; }, [agentInfo]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [streamDraft, setStreamDraft] = useState<StreamDraft | null>(null);
   // Mirror streamDraft synchronously so event handlers (which close over an
@@ -472,11 +468,22 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       if (activeAgentIdRef.current !== loadForAgentId) return false;
       const converted = mapDbToChatMessages(dbMessages);
       // Strip zombie isStreaming — messages left streaming after a crash/restart.
-      // If still streaming after 2 minutes, it won't finish.
-      const ZOMBIE_STREAMING_MS = 2 * 60 * 1000;
+      // Don't rely solely on time. Check real signals first:
+      //   1. Active streamDraft → agent is producing output → alive
+      //   2. Agent status not idle → still processing → alive
+      //   3. Only if neither signal is present AND the message is old → zombie
+      const ZOMBIE_STREAMING_MS = 12 * 60 * 1000;
       const now = Date.now();
+      const hasStreamDraft = streamDraftRef.current !== null;
+      const agentIsActive = agentInfoRef.current?.status && agentInfoRef.current.status !== "idle";
       const sanitized = converted.map((m) => {
-        if (m.isStreaming && m.role === "assistant" && (now - m.timestamp) > ZOMBIE_STREAMING_MS) {
+        if (!m.isStreaming || m.role !== "assistant") return m;
+        // If streamDraft is actively receiving output for this message, it's alive
+        if (hasStreamDraft && streamDraftRef.current?.assistantId === m.id) return m;
+        // If agent status is known and not idle, it's still processing
+        if (agentIsActive) return m;
+        // Fallback: time-based — only mark as zombie if old with no live signals
+        if ((now - m.timestamp) > ZOMBIE_STREAMING_MS) {
           return { ...m, isStreaming: false, content: m.content || "[对话被中断]" };
         }
         return m;

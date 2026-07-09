@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -106,6 +107,19 @@ def _build_charter_dict(body: ProjectCreate) -> dict:
     }
 
 
+def _expand_windows_env_vars(path: str) -> str:
+    """Expand only %VAR% patterns (Windows cmd.exe syntax).
+
+    Unlike os.path.expandvars() which also expands $var/${var} on Python 3.9+,
+    this ONLY handles %VAR% — safe for Windows paths where '$' is a valid
+    filename character. Unknown variables are left unchanged.
+    """
+    def _replacer(m: re.Match) -> str:
+        var = m.group(1)
+        return os.environ.get(var, m.group(0))  # leave %VAR% unchanged if not found
+    return re.sub(r'%(\w+)%', _replacer, path)
+
+
 def _validate_workspace_path(raw: str) -> Path:
     """校验 workspace_path 安全性（R2 fix）。
 
@@ -126,8 +140,10 @@ def _validate_workspace_path(raw: str) -> Path:
     """
     if not raw or not raw.strip():
         raise HTTPException(status_code=400, detail="workspace_path is required")
-    # Expand Windows env vars (%SystemDrive% → C:)
-    expanded = os.path.expandvars(raw.strip())
+    # Expand ONLY %VAR% patterns (Windows cmd.exe style), NOT $var (sh style).
+    # os.path.expandvars() on Python 3.9+ also expands $var/${var}, turning
+    # legitimate paths like D:\Project\$null into unresolved garbage.
+    expanded = _expand_windows_env_vars(raw.strip())
     # 原始路径段级检查 — 拒绝任何 ".." 段
     parts = Path(expanded).parts
     if ".." in parts:
@@ -149,11 +165,11 @@ def _validate_workspace_path(raw: str) -> Path:
             detail="workspace_path resolves to a path with '..' segments",
         )
     # BUG-033 fix: reject when the workspace root directory itself is a known
-    # source-code/build directory. Only check the FINAL path segment (the
-    # project root), NOT intermediate parent directories — otherwise legitimate
-    # paths like D:\Work\src\my-project get falsely rejected.
-    _SOURCE_SEGMENTS = {"src", "apps", "docs", "node_modules",
-                        "__pycache__", ".git", ".claude", "dist", "build", "out"}
+    # tool/artifact directory that agents should never use as a project root.
+    # Only block names that are ALWAYS tool-generated (never legitimate project
+    # roots): .git, node_modules, __pycache__, .claude.
+    # src/apps/docs/dist/build/out can all be legitimate project root names.
+    _SOURCE_SEGMENTS = {"node_modules", "__pycache__", ".git", ".claude"}
     if resolved.name.lower() in _SOURCE_SEGMENTS:
         raise HTTPException(
             status_code=400,

@@ -221,13 +221,13 @@ async def send_chat(body: ChatSendBody) -> dict:
     # 5. 触发 chat
     # BUG-036: JSON-structured user message — unambiguous sender identification
     import json as _json
-    user_msg = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)
-    result = await agent.chat(user_msg)
+    user_msg_str = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)
+    result = await agent.chat(user_msg_str)
     if result.get("error") == "busy":
         # force_reset + sleep + 重试
         await agent.cancel()
         await asyncio.sleep(_BUSY_RESET_SLEEP)
-        result = await agent.chat(user_msg)
+        result = await agent.chat(user_msg_str)
         if result.get("error") == "busy":
             raise HTTPException(status_code=409, detail="Agent is busy after reset")
         return {"ok": True, "userMessageId": user_msg["id"], "reset": True}
@@ -463,7 +463,7 @@ async def get_questions(
         if agentId:
             rows = await project_db.query(
                 agentId,
-                "SELECT id, agent_id, question, answer, status, created_at, "
+                "SELECT id, agent_id, question, options, answer, status, created_at, "
                 "answered_at FROM questions WHERE agent_id = ? "
                 "ORDER BY created_at DESC",
                 [agentId],
@@ -474,7 +474,7 @@ async def get_questions(
                 return {"questions": []}
             conn = await project_db.ensure_project_db(workspace)
             cursor = await conn.execute(
-                "SELECT id, agent_id, question, answer, status, created_at, "
+                "SELECT id, agent_id, question, options, answer, status, created_at, "
                 "answered_at FROM questions WHERE project_id = ? "
                 "ORDER BY created_at DESC",
                 [projectId],
@@ -483,7 +483,17 @@ async def get_questions(
             await cursor.close()
         else:
             return {"questions": []}
-        return {"questions": [dict(r) for r in rows]}
+        # Parse options JSON string → array for frontend
+        result: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            if d.get("options") and isinstance(d["options"], str):
+                try:
+                    d["options"] = json.loads(d["options"])
+                except (json.JSONDecodeError, TypeError):
+                    d["options"] = None
+            result.append(d)
+        return {"questions": result}
     except Exception as e:
         log.warning("get_questions_failed", error=str(e))
         return {"questions": []}

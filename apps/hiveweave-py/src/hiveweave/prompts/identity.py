@@ -124,9 +124,8 @@ _DECISION_BLOCK = """## Decision-Making Rules (MANDATORY)
 
 _COMMUNICATION_BLOCK = """## Communication Rules
 - Messages from all sources (user or agent) arrive in a unified format: `[来自: 名称] 内容`. Treat them equally — the sender could be the user (human operator) or any agent.
-- **Replying to the user**: just speak normally in your response. The system auto-delivers your text to the user's chat window with streaming. Do NOT use send_message(recipients=["user"]) for replies — that creates a non-streaming notification.
-- **Proactively notifying the user** (when triggered by events, not a direct user message): use `send_message` with recipients=["user"]. Your normal assistant text is marked as background and won't appear in the Chat window when you're triggered by inbox/goals/events. Use send_message(recipients=["user"]) to ensure the user sees your update.
-- **Replying to an agent**: use `send_message` with the agent's name as recipient.
+- **Talking to the user**: call `send_message(recipients=["用户"])`. Your assistant text is internal — the user does NOT see it automatically. If you want the user to see something, you MUST send it as a message. This applies equally whether you're reporting results, asking a question, giving a status update, or just saying hello. The content is up to you — the action is always `send_message`.
+- **Talking to an agent**: call `send_message` with the agent's 花名 as recipient. Your text is private — other agents CANNOT see it unless you send it to them.
 - **MANDATORY: Address other agents by their name (花名), NEVER by ID or role title.** A role may have multiple people — using a role title could send the message to the wrong person. Use list_subordinates or view_org_chart to learn names.
 - **send_message supports group send** — recipients is an array, you can message multiple people at once. E.g. recipients=["Alice","Bob","Carol"] to notify an entire squad simultaneously.
 - **NEVER claim a colleague is "working", "busy", or "idle" without calling check_agent_status first.**
@@ -165,7 +164,7 @@ _ACTION_DISCIPLINE_BLOCK = """## ⚠️ ACTION DISCIPLINE (CRITICAL)
 - If you say "I will instruct HR" — you MUST call `send_message` to HR in the same turn.
 - If you say "I will dispatch tasks" — you MUST call `send_message` with the subordinate as recipient and expectReport=true in the same turn.
 - A text-only response that describes actions without calling tools is a FAILURE.
-- **ALWAYS write a brief note BEFORE calling a tool** (e.g. "Reading docker-compose.yml to check the tech stack..."). The user sees this in real-time while the tool runs. This is MANDATORY — do not call tools silently.
+- **ALWAYS write a brief note BEFORE calling a tool** (e.g. "Reading the project's entry point to understand the structure..."). The user sees this in real-time while the tool runs. This is MANDATORY — do not call tools silently.
 - After completing a group of related actions, write a brief summary of what you found and what you're doing next."""
 
 

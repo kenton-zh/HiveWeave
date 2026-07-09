@@ -19,6 +19,12 @@ uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000 --limit-concurrency 100 --
 start-all.bat             # 后端 4000 + 前端 5173
 start-backend.bat         # Python/FastAPI, 端口 4000
 start-frontend.bat        # React/Vite, 端口 5173
+
+# 类型检查（提交前必须跑）
+uv run mypy src/hiveweave/ --ignore-missing-imports
+
+# 回归测试（提交前必须跑）
+cd apps/hiveweave-py && uv run pytest tests/ -v
 ```
 
 ### Node version

@@ -123,16 +123,12 @@ async def pending_for_project(projectId: str = Query(...)) -> dict:
 @router.post("/requests/{request_id}/respond")
 async def respond_request(request_id: str, body: RespondBody) -> dict:
     """响应审批请求。"""
-    result = await approval_service.resolve_request(
+    await approval_service.resolve_request(
         request_id=request_id,
         approved=body.approved,
         remember=body.remember,
         user_note=body.userNote or "",
     )
-    if not result.get("ok"):
-        raise HTTPException(
-            status_code=400, detail=result.get("error", "Failed to resolve request")
-        )
     return {"ok": True, "requestId": request_id}
 
 

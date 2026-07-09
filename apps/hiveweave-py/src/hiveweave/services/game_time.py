@@ -266,7 +266,7 @@ class GameTimeService:
                 entry["content"] = f"[每{repeat}游戏秒] {entry['content']}"
             msg = json.dumps(entry, ensure_ascii=False)
             await InboxService().send_message(
-                from_agent_id=from_id or to_agent, to_agent=to_agent, message=msg,
+                from_agent_id=from_id or to_agent, to_agent_id=to_agent, message=msg,
                 message_type="alarm", priority="normal")
 
         # 3. Update DB

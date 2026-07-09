@@ -68,6 +68,7 @@ _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "bash": {
+        "description": "Executes a shell command on the local system. Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command.",
         "properties": {
             "command": {"type": "string", "aliases": ["cmd", "run"]},
             "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"]},
@@ -75,6 +76,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["command"],
     },
     "read_file": {
+        "description": "Reads the contents of a file from the filesystem. Use it to view source code, config files, logs, or any text file. Returns the file content with line numbers.",
         "properties": {
             "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
             "offset": {"type": "integer", "aliases": ["startLine"]},
@@ -83,6 +85,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePath"],
     },
     "write_file": {
+        "description": "Creates a new file or overwrites an existing file with the given content. Use it to write source code, configs, or data files. No explicit return value on success.",
         "properties": {
             "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
             "content": {"type": "string", "aliases": ["data", "text", "body"]},
@@ -90,12 +93,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePath", "content"],
     },
     "list_files": {
+        "description": "Lists files and directories at the given path. Use it to explore directory structure, find files by location, or verify file existence. Returns a list of file/directory names.",
         "properties": {
             "dirPath": {"type": "string", "aliases": ["path", "directory", "dir"]},
         },
         "required": [],
     },
     "grep": {
+        "description": "Searches file CONTENTS using a regex pattern. Use it to find occurrences of text, code, or string matches inside files. Returns matching file paths and lines. For filename/glob-based search, use search_files instead.",
         "properties": {
             "pattern": {"type": "string", "aliases": ["regex", "query", "search"]},
             "path": {"type": "string", "aliases": ["filePath", "file", "directory", "dir"]},
@@ -107,6 +112,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["pattern"],
     },
     "search_files": {
+        "description": "Searches for files by FILENAME or GLOB pattern. Use it to find files by name, extension, or glob expression. Returns matching file paths. For content search inside files, use grep instead.",
         "properties": {
             "pattern": {"type": "string", "aliases": ["glob", "query", "search", "name"]},
             "directory": {"type": "string", "aliases": ["path", "dir"]},
@@ -114,6 +120,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["pattern"],
     },
     "edit_file": {
+        "description": "Applies a targeted text replacement in a file. Use it to make surgical edits by locating a unique old_string and replacing it with new_string. Returns success or an error message if the old_string is not found.",
         "properties": {
             "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
             "old_string": {"type": "string", "aliases": ["oldString", "old_str", "search", "find"]},
@@ -123,6 +130,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePath", "old_string", "new_string"],
     },
     "apply_patch": {
+        "description": "Applies one or more structured patch operations (replace, insert, or delete) to files. Use it for file modifications where each patch targets specific text. Returns the result of each patch operation.",
         "properties": {
             "patches": {
                 "type": "array",
@@ -144,6 +152,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["patches"],
     },
     "websearch": {
+        "description": "Searches the public internet using a text query. Use it to find current information, research topics, look up documentation, or answer questions. Returns search result snippets with URLs.",
         "properties": {
             "query": {"type": "string", "aliases": ["search", "q", "term"]},
             "numResults": {"type": "integer", "aliases": ["num_results", "limit", "count"]},
@@ -151,6 +160,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["query"],
     },
     "question": {
+        "description": "Asks the user a question and optionally presents a list of choices. Use it to request clarification, get input on decisions, or present options when human guidance is needed. Returns the user response.",
         "properties": {
             "question": {"type": "string", "aliases": ["message", "content", "query", "text"]},
             "options": {"type": "array", "aliases": ["choices"]},
@@ -158,12 +168,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["question"],
     },
     "todowrite": {
+        "description": "Manages the agent own task list. Use it to add, update, or replace outstanding tasks the agent is tracking. For recording completed work, use write_work_log instead.",
         "properties": {
             "todos": {"type": "array", "aliases": ["tasks", "items", "list"]},
         },
         "required": ["todos"],
     },
     "send_message": {
+        "description": "Sends a message to one or more specific recipients by name or agent ID. Use it to communicate directly with named agents. For convenience shortcuts, use message_subordinate, message_superior, or message_peer.",
         "properties": {
             "recipients": {"type": "array", "aliases": ["recipient", "to", "targets"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
@@ -173,6 +185,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["recipients", "message"],
     },
     "hire_agent": {
+        "description": "Creates and deploys a new agent with a specified name, role, goal, and backstory. Use it to bring new team members into the organization. Returns the new agent ID.",
         "properties": {
             "name": {"type": "string"},
             "role": {"type": "string"},
@@ -184,10 +197,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["name", "role"],
     },
     "read_charter": {
+        "description": "Reads the organization charter document. Use it to review the mission, purpose, rules, and operating principles that govern the agent organization. Returns the charter text.",
         "properties": {},
         "required": [],
     },
     "save_charter": {
+        "description": "Creates or updates the organization charter document. Use it to define or amend the mission, purpose, rules, and operating principles. Takes the charter content as input.",
         "properties": {
             "content": {"type": "string", "aliases": ["charter", "body", "text"]},
             "title": {"type": "string", "aliases": ["name"]},
@@ -195,10 +210,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["content"],
     },
     "read_goals": {
+        "description": "Reads the current organizational goals and objectives. Use it to review what the organization is working toward. Returns the goals document.",
         "properties": {},
         "required": [],
     },
     "update_goals": {
+        "description": "Updates the organizational goals, objectives, focus areas, and key results. Use it to set or revise what the organization and its agents are working toward.",
         "properties": {
             "objective": {"type": "string"},
             "focus": {"type": "string"},
@@ -208,12 +225,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "read_memory": {
+        "description": "Reads previously stored memory or state for a specific module ID. Use it to retrieve saved information or context that was stored via write_memory. Returns the stored content.",
         "properties": {
             "moduleId": {"type": "string", "aliases": ["module_id", "id", "key"]},
         },
         "required": ["moduleId"],
     },
     "write_memory": {
+        "description": "Writes content to the agent memory system under a given module ID, with optional tags. Use it to store information, context, or state for later retrieval by read_memory.",
         "properties": {
             "content": {"type": "string", "aliases": ["data", "body", "text", "memory"]},
             "moduleId": {"type": "string", "aliases": ["module_id", "id", "key"]},
@@ -222,20 +241,24 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["content"],
     },
     "list_available_skills": {
+        "description": "Lists all skills currently available to the agent. Use it to discover what capabilities, tools, or skill modules can be invoked or assigned. Returns a list of skill names and descriptions.",
         "properties": {},
         "required": [],
     },
     "read_skill": {
+        "description": "Reads the documentation and definition of a specific skill by name or slug. Use it to understand what a skill does, how to use it, and how to invoke it.",
         "properties": {
             "skill": {"type": "string", "aliases": ["name", "slug", "id"]},
         },
         "required": ["skill"],
     },
     "read_roster": {
+        "description": "Read the team roster listing all agents and their roles/departments.",
         "properties": {},
         "required": [],
     },
     "update_roster": {
+        "description": "Update an agent's position, department, responsibilities, or status in the roster.",
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "target", "id"]},
             "position": {"type": "string"},
@@ -247,24 +270,29 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["agentId"],
     },
     "view_org_chart": {
+        "description": "View the full organizational hierarchy tree showing reporting lines.",
         "properties": {},
         "required": [],
     },
     "list_subordinates": {
+        "description": "List your direct reports (subordinates).",
         "properties": {},
         "required": [],
     },
     "list_alarms": {
+        "description": "List all pending scheduled alarms.",
         "properties": {},
         "required": [],
     },
     "cancel_alarm": {
+        "description": "Cancel a scheduled alarm by its ID.",
         "properties": {
             "alarmId": {"type": "string", "aliases": ["alarm_id", "id"]},
         },
         "required": ["alarmId"],
     },
     "schedule_alarm": {
+        "description": "Schedule an alarm to fire after a game-time delay, optionally repeating.",
         "properties": {
             "toAgentId": {"type": "string", "aliases": ["to_agent_id", "target"]},
             "purpose": {"type": "string", "aliases": ["message", "description"]},
@@ -274,6 +302,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["toAgentId", "purpose", "fireInGameSeconds"],
     },
     "read_work_logs": {
+        "description": "Read work logs. Can read any agent's logs (including your own, subordinates, or peers). Use agentId to specify whose logs to read; omit it to read all subordinates' logs. Each log entry shows what the agent did (type) and a summary.",
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "target"]},
             "limit": {"type": "integer", "aliases": ["count", "max"]},
@@ -281,6 +310,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "run_code_review": {
+        "description": "Analyze files for code quality, correctness, and style issues. Returns findings.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -290,6 +320,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "run_security_audit": {
+        "description": "Analyze files for security vulnerabilities. Returns findings.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -299,6 +330,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "run_tests": {
+        "description": "Run tests for specified files and return results.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module", "testPath"]},
@@ -308,6 +340,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "run_perf_audit": {
+        "description": "Analyze files for performance bottlenecks. Returns optimization suggestions.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -317,6 +350,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "run_full_review": {
+        "description": "Run all review types (code, security, tests, performance) combined.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -326,18 +360,21 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "delete_file": {
+        "description": "Permanently delete a file at the specified path.",
         "properties": {
             "path": {"type": "string", "aliases": ["filePath", "file_path", "file"]},
         },
         "required": ["path"],
     },
     "create_directory": {
+        "description": "Create a new directory at the specified path.",
         "properties": {
             "path": {"type": "string", "aliases": ["dirPath", "directory", "dir"]},
         },
         "required": ["path"],
     },
     "delete_directory": {
+        "description": "Permanently delete a directory and all its contents.",
         "properties": {
             "path": {"type": "string", "aliases": ["dirPath", "directory", "dir"]},
         },
@@ -345,12 +382,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Agent management —
     "dismiss_agent": {
+        "description": "Permanently remove/fire an agent from the organization. Cannot be undone.",
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "id", "target"]},
         },
         "required": ["agentId"],
     },
     "transfer_agent": {
+        "description": "Reassign an agent to a new parent/supervisor in the hierarchy.",
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "id"]},
             "newParentId": {"type": "string", "aliases": ["new_parent_id", "parentId", "parent_id", "target"]},
@@ -358,10 +397,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["agentId", "newParentId"],
     },
     "list_agent_templates": {
+        "description": "List available agent templates for hiring.",
         "properties": {},
         "required": [],
     },
     "bind_skill": {
+        "description": "Attach a skill to an agent, granting them that capability.",
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "id"]},
             "skill": {"type": "string", "aliases": ["slug", "name", "skillSlug"]},
@@ -369,6 +410,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["agentId", "skill"],
     },
     "unbind_skill": {
+        "description": "Remove a skill from an agent.",
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "id"]},
             "skill": {"type": "string", "aliases": ["slug", "name", "skillSlug"]},
@@ -377,6 +419,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Messaging —
     "message_subordinate": {
+        "description": "Send a message to ALL your direct subordinates at once. Use dispatch_task to delegate specific work.",
         "properties": {
             "recipient": {"type": "string", "aliases": ["to", "target", "agentId", "agent_id"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
@@ -385,6 +428,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["recipient", "message"],
     },
     "message_superior": {
+        "description": "Send a message to your parent/superior. Use report_completion when finishing a delegated task.",
         "properties": {
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
             "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
@@ -392,6 +436,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["message"],
     },
     "message_peer": {
+        "description": "Send a direct message to a single peer agent at the same level.",
         "properties": {
             "recipient": {"type": "string", "aliases": ["to", "target", "agentId", "agent_id"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
@@ -399,6 +444,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["recipient", "message"],
     },
     "message_team": {
+        "description": "Broadcast a message to every agent in a specified team.",
         "properties": {
             "teamId": {"type": "string", "aliases": ["team_id", "team"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
@@ -407,6 +453,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Dispatch + review —
     "dispatch_task": {
+        "description": "Delegate a specific task to another agent for execution. Set expectReport to request a follow-up.",
         "properties": {
             "target": {"type": "string", "aliases": ["toAgentId", "to_agent_id", "recipient", "agentId"]},
             "task": {"type": "string", "aliases": ["description", "message", "content", "summary"]},
@@ -415,6 +462,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["target", "task"],
     },
     "review": {
+        "description": "Review code, design, or deliverables for quality. Specify reviewType (code/design/security).",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -424,6 +472,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "request_review": {
+        "description": "Ask a specific reviewer to review code, design, or deliverables.",
         "properties": {
             "reviewerId": {"type": "string", "aliases": ["reviewer_id", "reviewer", "target", "agentId"]},
             "target": {"type": "string", "aliases": ["file", "path", "module", "description"]},
@@ -432,6 +481,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["reviewerId", "target"],
     },
     "review": {
+        "description": "Review code, design, or deliverables for quality. Specify reviewType (code/design/security).",
         "properties": {
             "target": {"type": "string", "aliases": ["file", "path", "module", "code"]},
             "reviewType": {"type": "string", "aliases": ["review_type", "type"]},
@@ -439,6 +489,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["target"],
     },
     "report_completion": {
+        "description": "Notify your superior that a delegated task is finished.",
         "properties": {
             "summary": {"type": "string", "aliases": ["message", "content", "report", "description"]},
             "handoffId": {"type": "string", "aliases": ["handoff_id", "taskId", "task_id"]},
@@ -446,6 +497,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["summary"],
     },
     "approve_work": {
+        "description": "Approve a subordinate's deliverable. Optionally add review comments.",
         "properties": {
             "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
             "review": {"type": "string", "aliases": ["comment", "feedback", "notes"]},
@@ -453,6 +505,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["subordinate"],
     },
     "reject_work": {
+        "description": "Reject a subordinate's work with a required reason. They must redo it.",
         "properties": {
             "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
             "reason": {"type": "string", "aliases": ["feedback", "review", "comment", "message"]},
@@ -460,6 +513,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["subordinate", "reason"],
     },
     "write_work_log": {
+        "description": "Record what you just did in your work log. Use todowrite for planning future tasks.",
         "properties": {
             "summary": {"type": "string", "aliases": ["message", "content", "description"]},
             "details": {"type": "string", "aliases": ["data", "extra"]},
@@ -469,34 +523,40 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Git worktrees —
     "git_worktree_create": {
+        "description": "Create an isolated git worktree on a new branch for safe parallel development.",
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
         },
         "required": ["branchName"],
     },
     "git_worktree_list": {
+        "description": "List all active git worktrees with their branch names and paths.",
         "properties": {},
         "required": [],
     },
     "git_worktree_merge": {
+        "description": "Merge a worktree branch back into main and remove the worktree.",
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
         },
         "required": ["branchName"],
     },
     "git_worktree_remove": {
+        "description": "Remove a worktree and its branch without merging. Discards changes.",
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
         },
         "required": ["branchName"],
     },
     "git_worktree_status": {
+        "description": "Show uncommitted changes and branch status for worktrees.",
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
         },
         "required": [],
     },
     "git_worktree_checkpoint": {
+        "description": "Stage all changes and create a checkpoint commit in the active worktree.",
         "properties": {
             "message": {"type": "string", "aliases": ["commitMessage", "commit_message", "summary"]},
         },
@@ -504,6 +564,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Network + file ops —
     "webfetch": {
+        "description": "Fetch a URL, extract readable text, and optionally answer a question about the page. Has SSRF protection.",
         "properties": {
             "url": {"type": "string", "aliases": ["link", "href", "address"]},
             "prompt": {"type": "string", "aliases": ["query", "question", "instruction"]},
@@ -511,6 +572,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["url"],
     },
     "move_file": {
+        "description": "Move or rename a file or directory to a new location.",
         "properties": {
             "source": {"type": "string", "aliases": ["from", "src", "sourcePath", "source_path"]},
             "destination": {"type": "string", "aliases": ["to", "dst", "destPath", "dest_path", "target"]},
@@ -622,6 +684,8 @@ def get_tool_schema_for_llm(tool_name: str) -> dict:
     # Deep copy and strip aliases
     import copy
     clean: dict = {"type": "object"}
+    if "description" in schema:
+        clean["description"] = schema["description"]
     if "properties" in schema:
         clean["properties"] = {}
         for name, prop in schema["properties"].items():
@@ -1423,9 +1487,9 @@ class ToolExecutor:
         if not project_id:
             return self._error(f"Agent {agent_id} has no project")
         ds = DispatchService()
-        result = await ds.dispatch(
+        result = await ds.dispatch_task(
             project_id=project_id, from_agent_id=agent_id,
-            target_name=target, task=task, expect_report=expect_report,
+            to_agent_id=target, description=task, expect_report=expect_report,
         )
         if result.get("success"):
             return {"success": True, "output": f"Task dispatched to {result.get('target_name', target)}", "error": None}
@@ -1445,7 +1509,7 @@ class ToolExecutor:
         handoffs = await hs.get_accepted_handoffs(project_id, agent_id)
         if not handoffs:
             return self._error("No accepted handoffs to report on")
-        await hs.report(project_id, handoffs[0]["id"], summary)
+        await hs.complete_handoff(project_id, handoffs[0]["id"])
         return {"success": True, "output": "Completion reported to superior.", "error": None}
 
     async def _tool_request_review(self, agent_id: str, args: dict) -> dict:
@@ -1876,12 +1940,10 @@ class ToolExecutor:
                 "is_background": False,
             })
             # Push via WebSocket so the frontend updates in real-time
-            from hiveweave.realtime.event_bus import event_bus
-            await event_bus.publish_chat_message(
-                project_id=project_id,
+            from hiveweave.realtime.event_bus import status_event_bus
+            await status_event_bus.publish_chat_message(
                 agent_id=agent_id,
-                role="assistant",
-                content=message,
+                message={"role": "assistant", "content": message},
             )
             results.append({"to": "user", "message_id": "user-msg"})
 
@@ -1948,7 +2010,7 @@ class ToolExecutor:
             )
             results.append({
                 "to": target["name"],
-                "short_id": target.get("short_id"),
+                "short_id": target.get("short_id") or "",
                 "message_id": msg["id"],
             })
             # Record for sender so team comms panel shows outgoing messages

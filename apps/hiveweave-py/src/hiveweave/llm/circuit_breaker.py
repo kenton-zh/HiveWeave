@@ -288,9 +288,9 @@ class CircuitBreaker:
                 for b in self._breakers.values():
                     b.reset()
             else:
-                b = self._breakers.get(name)
-                if b:
-                    b.reset()
+                breaker_state = self._breakers.get(name)
+                if breaker_state:
+                    breaker_state.reset()
 
 
 # ── 模块级单例 ──────────────────────────────────────────────
