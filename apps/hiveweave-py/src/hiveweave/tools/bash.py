@@ -71,8 +71,11 @@ def _build_safe_env(cwd: str) -> dict[str, str]:
     """构建白名单环境变量，仅传递系统必要变量 + HiveWeave 标记。
 
     绝不传递 OPENAI_API_KEY / OPENCODE_API_KEY / DEEPSEEK_API_KEY 等密钥。
+    Windows 环境变量大小写不敏感（Path 与 PATH 等价），白名单匹配也必须
+    大小写不敏感，否则可能漏传 PATH（系统常存为 'Path'）。
     """
-    safe_env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS}
+    safe_keys_upper = {k.upper() for k in _SAFE_ENV_KEYS}
+    safe_env = {k: v for k, v in os.environ.items() if k.upper() in safe_keys_upper}
     safe_env["HIVEWEAVE_BASH"] = "1"
     safe_env["HIVEWEAVE_WORKSPACE"] = cwd
     # Force UTF-8 everywhere — prevents GBK encoding crashes on Windows
@@ -168,7 +171,11 @@ async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
     command = _normalize_command(command)
     is_windows = sys.platform.startswith("win")
     if is_windows:
-        shell_args = ["cmd", "/c", command]
+        # 用 /s /c "command" 而非 /c command，让 cmd 按字面执行整条命令。
+        # /s 开关禁用 cmd 的隐式首尾引号剥离规则，避免嵌套引号被吃掉。
+        # 例如 node -e "console.log('hi')" 经 /c 会丢失内层引号，
+        # 经 /s /c "..." 则原样传递。
+        shell_args = ["cmd", "/s", "/c", command]
     else:
         shell_args = ["bash", "-c", command]
 
@@ -361,10 +368,16 @@ async def execute_bash(
                 "error": None}
 
     body = output if output.strip() else "(no output)"
+    # 把输出首行摘要放进 error 字段，LLM 即使只读 error 也能快速判断
+    # 失败原因（如 "'ls' is not recognized" → 命令不存在）
+    first_line = output.strip().split("\n", 1)[0][:200] if output.strip() else ""
+    error_msg = f"Command exited with code {exit_code}"
+    if first_line:
+        error_msg = f"{error_msg}: {first_line}"
     return {
         "success": False,  # non-zero exit is not success
         "output": f"{body}\n\nExit code: {exit_code}",
-        "error": f"Command exited with code {exit_code}",
+        "error": error_msg,
     }
 
 

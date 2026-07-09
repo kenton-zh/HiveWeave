@@ -303,15 +303,17 @@ async def apply_patch(
         try:
             status = _apply_single(entry, workspace_path)
         except Exception as exc:  # noqa: BLE001
-            status = f"ERROR: {exc}"
+            status = f"ERROR: {type(exc).__name__}: {exc}"
             has_error = True
         results.append(status)
         if status.startswith("ERROR"):
             has_error = True
 
     body = "\n".join(results)
+    total = len(patches)
+    failed = sum(1 for r in results if r.startswith("ERROR"))
     return {
         "success": not has_error,
         "output": body,
-        "error": None if not has_error else "One or more patches failed",
+        "error": None if not has_error else f"{failed}/{total} patches failed (see output for details)",
     }

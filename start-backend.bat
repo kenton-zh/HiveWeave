@@ -13,18 +13,11 @@ echo.
 
 cd /d "%~dp0apps\hiveweave-py"
 
-REM Activate virtualenv (uvicorn installed inside)
-call .venv\Scripts\activate.bat
-
-REM Start FastAPI via uvicorn (port 4000, matches frontend proxy)
-REM BUG-035 fix: increase concurrency limits to prevent 502 under LLM streaming load.
-REM Single-worker architecture (agents share in-memory state), so we tune
-REM connection handling rather than spawning multiple processes.
-REM IMPORTANT: do NOT add --limit-max-requests here. That flag terminates the
-REM process after N requests, which silently kills the backend mid-run.
-REM The single worker keeps agents' in-memory state alive for the whole
-REM server lifetime.
-uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000 --workers 1 ^
+REM 直接使用 .venv 的 python.exe 启动 uvicorn（不经过 activate.bat）
+REM activate.bat 会触发 TRAE 沙箱对工作目录树之外的写入限制，
+REM 导致创建项目时无法在用户工作空间创建 .hiveweave 目录（WinError 5）。
+REM 直接 python.exe 启动无此限制。
+.venv\Scripts\python.exe -m uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000 --workers 1 ^
     --limit-concurrency 100 ^
     --backlog 2048 ^
     --timeout-keep-alive 30

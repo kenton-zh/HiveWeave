@@ -1068,7 +1068,11 @@ class Streamer:
             for c in provider.parse_stream_chunk(event):
                 ctype = c.get("type")
                 if ctype == "text":
-                    pass
+                    content = c["content"]
+                    await self._fire_delta(on_delta, {
+                        "type": "text_delta", "content": content,
+                        "delta_id": delta_id})
+                    text_acc += content
                 elif ctype == "reasoning":
                     content = c["content"]
                     await self._fire_delta(on_delta, {
