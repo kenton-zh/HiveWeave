@@ -189,17 +189,47 @@ class MemoryService:
                           content: str, type: str = "fact", module_id: str | None = None,
                           source_agent_id: str | None = None,
                           metadata: dict | None = None) -> str:
-        """Write a new memory entry and invalidate cache."""
-        mem_id = str(uuid.uuid4())
+        """Write a memory entry and invalidate cache.
+
+        BUG-040: 当 module_id 非空时，使用 upsert 语义 —
+        相同 (agent_id, scope, module_id) 的记录会被 UPDATE 而非 INSERT 新行。
+        """
         now_ms = int(time.time() * 1000)
         meta_json = json.dumps(metadata) if metadata else "{}"
         conn = await self._conn(project_id)
-        await conn.execute(
-            "INSERT INTO memories (id, agent_id, scope, module_id, type, content, "
-            "source_agent_id, metadata, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [mem_id, agent_id, scope, module_id, type, content,
-             source_agent_id, meta_json, now_ms, now_ms])
+
+        # Upsert: module_id 非空时先查已有记录
+        existing_id = None
+        if module_id:
+            cursor = await conn.execute(
+                "SELECT id FROM memories "
+                "WHERE agent_id = ? AND scope = ? AND module_id = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                [agent_id, scope, module_id],
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row:
+                existing_id = row["id"]
+
+        if existing_id:
+            # UPDATE 已有记录
+            await conn.execute(
+                "UPDATE memories SET content = ?, type = ?, "
+                "source_agent_id = ?, metadata = ?, updated_at = ? "
+                "WHERE id = ?",
+                [content, type, source_agent_id, meta_json, now_ms, existing_id],
+            )
+            mem_id = existing_id
+        else:
+            # INSERT 新记录
+            mem_id = str(uuid.uuid4())
+            await conn.execute(
+                "INSERT INTO memories (id, agent_id, scope, module_id, type, content, "
+                "source_agent_id, metadata, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [mem_id, agent_id, scope, module_id, type, content,
+                 source_agent_id, meta_json, now_ms, now_ms])
         await conn.commit()
         # R5: 定向失效 — 只清受影响的缓存层，而非全项目
         self.invalidate(project_id, agent_id=agent_id, scope=scope,

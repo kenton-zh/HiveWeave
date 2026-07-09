@@ -511,6 +511,14 @@ async def answer_question(question_id: str, body: QuestionAnswerBody) -> dict:
             "answered_at = ? WHERE id = ?",
             [body.answer, now_ms, question_id],
         )
+        # BUG-037: resolve 内存中的 Future，让阻塞中的 execute_question 继续
+        from hiveweave.tools.question import resolve_question
+        resolved = resolve_question(question_id, body.answer)
+        if not resolved:
+            log.info("answer_question_no_pending_future",
+                     question_id=question_id,
+                     msg="Question answered in DB but no in-memory Future found "
+                         "(may have timed out or been cancelled)")
     except Exception as e:
         log.error("answer_question_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to answer question")

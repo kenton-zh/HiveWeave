@@ -168,7 +168,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["question"],
     },
     "todowrite": {
-        "description": "Manages the agent own task list. Use it to add, update, or replace outstanding tasks the agent is tracking. For recording completed work, use write_work_log instead.",
+        "description": "Manages the agent's task list. Use it to plan tasks and track progress. When a task is completed, update its status to 'completed'. Use write_work_log for detailed work records.",
         "properties": {
             "todos": {"type": "array", "aliases": ["tasks", "items", "list"]},
         },
@@ -479,14 +479,6 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "reviewType": {"type": "string", "aliases": ["review_type", "type"]},
         },
         "required": ["reviewerId", "target"],
-    },
-    "review": {
-        "description": "Review code, design, or deliverables for quality. Specify reviewType (code/design/security).",
-        "properties": {
-            "target": {"type": "string", "aliases": ["file", "path", "module", "code"]},
-            "reviewType": {"type": "string", "aliases": ["review_type", "type"]},
-        },
-        "required": ["target"],
     },
     "report_completion": {
         "description": "Notify your superior that a delegated task is finished.",

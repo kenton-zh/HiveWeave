@@ -859,6 +859,8 @@ class Agent:
                     if not should_retry:
                         # 已升级上级，退出循环
                         break
+                    # 重置文本累积器 — 防止跨重试轮次堆叠"（收到空响应…）"
+                    self._streaming_text_acc = ""
                     # 重新构建 messages（注入重试提示）
                     current_messages = await self._build_messages(
                         message, opts, retry_hint=True
@@ -1340,9 +1342,10 @@ class Agent:
         对齐 Elixir agent.ex:610 escalate_empty/1。
 
         流程:
-        1. 标记 pending inbox 已读（避免重复触发）
-        2. 通知上级 agent
-        3. 状态 → idle
+        1. 清理 streaming placeholder（防止僵尸消息）
+        2. 标记 pending inbox 已读（避免重复触发）
+        3. 通知上级 agent
+        4. 状态 → idle
         """
         log.warning(
             "empty_escalate",
@@ -1350,6 +1353,26 @@ class Agent:
             retry_count=self.empty_retry_count,
             msg="escalating to superior after max empty retries",
         )
+
+        # BUG-038: 清理 streaming placeholder — 其他退出路径都清理了，
+        # 但 _escalate_empty_response 遗漏，导致 is_streaming=1 僵尸消息
+        try:
+            if self._streaming_msg_id:
+                await self._chat_msg.update_message(
+                    self.id, self._streaming_msg_id,
+                    {
+                        "content": getattr(self, "_streaming_text_acc", "") or
+                                   "[空响应超限，已升级上级处理]",
+                        "is_streaming": False,
+                    },
+                )
+                self._streaming_msg_id = None
+            # 兜底：批量清理该 agent 的所有残留 streaming 消息
+            await self._chat_msg.update_streaming_messages_done(self.id)
+        except Exception as e:
+            log.warning("empty_escalate_streaming_cleanup_failed",
+                        agent_id=self.id, error=str(e))
+        self._streaming_text_acc = ""
 
         # 标记 inbox 已读
         if self.pending_inbox_msg_ids:
