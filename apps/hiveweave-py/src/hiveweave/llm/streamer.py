@@ -31,7 +31,7 @@ import httpx
 import structlog
 
 from hiveweave.llm.circuit_breaker import CircuitBreaker, circuit_breaker
-from hiveweave.llm.provider import ProviderConfig, ProviderFactory, provider_factory
+from hiveweave.llm.provider import ProviderConfig, ProviderFactory, provider_factory, READ_TIMEOUT_S
 from hiveweave.llm.retry import (
     PermanentError,
     RetryHandler,
