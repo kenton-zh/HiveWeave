@@ -20,6 +20,7 @@ from hiveweave.db import meta as meta_db
 logger = structlog.get_logger()
 
 # readonly preset (契约 08)
+# Coordinator/管理角色使用此模式 — 包含所有管理工具，但不包含代码写入工具
 READONLY_TOOLS = frozenset({
     "bash", "grep", "apply_patch", "question", "todowrite", "websearch", "webfetch",
     "schedule_alarm", "list_alarms", "cancel_alarm",
@@ -32,19 +33,20 @@ READONLY_TOOLS = frozenset({
     "list_agent_templates", "hire_agent",
     "read_charter", "read_goals", "view_org_chart", "read_work_logs",
     "git_worktree_list", "git_worktree_status",
+    # 管理工具 — coordinator 需要用来派活、审批、写 charter、管理组织
+    "dispatch_task", "approve_work", "reject_work",
+    "save_charter", "update_goals", "dismiss_agent", "transfer_agent",
 })
 
-# readwrite = readonly + write/edit/dispatch tools
+# readwrite = readonly + 代码写入/审查工具
+# Executor/开发者角色使用此模式
 READWRITE_TOOLS = READONLY_TOOLS | frozenset({
     "write_file", "edit_file", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
-    "dispatch_task", "report_completion", "request_review",
-    "hire_agent", "approve_work", "reject_work",
     "run_code_review", "run_security_audit", "run_tests",
     "run_perf_audit", "run_full_review",
     "git_worktree_create", "git_worktree_merge", "git_worktree_remove",
     "git_worktree_checkpoint",
-    "save_charter", "update_goals", "dismiss_agent", "transfer_agent",
 })
 
 # All known tools (full mode)

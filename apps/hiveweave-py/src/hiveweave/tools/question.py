@@ -21,10 +21,13 @@ from hiveweave.db import project as project_db
 
 log = structlog.get_logger(__name__)
 
-QUESTION_TIMEOUT_S = 120
+QUESTION_TIMEOUT_S = 180
 
 # In-memory pending questions: question_id -> asyncio.Future
 _pending: dict[str, asyncio.Future[str]] = {}
+
+# 去重窗口：同一 agent 在此时间内有 pending question 则不允许再提问
+DEDUP_WINDOW_MS = 30 * 60 * 1000  # 30 分钟
 
 
 class QuestionTimeout(Exception):
@@ -45,8 +48,30 @@ async def execute_question(
                 "error": "Error: question is required"}
 
     project_id = await meta_db.get_agent_project_id(agent_id) or ""
-    question_id = str(uuid.uuid4())
     now_ms = int(time.time() * 1000)
+
+    # 去重检查：同一 agent 在 30 分钟内有 pending question 则不允许再提问
+    try:
+        rows = await project_db.query(
+            agent_id,
+            "SELECT id, question FROM questions "
+            "WHERE agent_id = ? AND status = 'pending' AND created_at > ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            [agent_id, now_ms - DEDUP_WINDOW_MS],
+        )
+        if rows:
+            existing_q = rows[0]
+            return {
+                "success": True,
+                "output": (f"已有待回答的问题（已跳过重复提问）。"
+                           f"请等待用户回答上一个问题后再提问。"
+                           f"上一个问题: {existing_q['question'][:100]}"),
+                "error": None,
+            }
+    except Exception as exc:
+        log.warning("question.dedup_check_failed", error=str(exc))
+
+    question_id = str(uuid.uuid4())
 
     # Persist question to per-project DB
     import json as _json
@@ -140,6 +165,25 @@ async def execute_question(
             "success": True,  # not an error — agent continues
             "output": (f"Question timed out ({QUESTION_TIMEOUT_S}s). "
                        "Proceeding without user input."),
+            "error": None,
+        }
+    except asyncio.CancelledError:
+        # streamer 的 TOOL_EXECUTION_TIMEOUT_S 可能在 question 超时前取消此 task
+        # 必须标记 DB 状态，否则永远停在 'pending'
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE questions SET status = 'cancelled' WHERE id = ?",
+                [question_id],
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("question.cancel_update_failed", error=str(exc))
+        log.info("question.cancelled", question_id=question_id, agent_id=agent_id)
+        # 不 re-raise — 返回友好消息让 agent 继续
+        return {
+            "success": True,
+            "output": "Question was cancelled (tool execution timeout). "
+                      "Proceeding without user input.",
             "error": None,
         }
     finally:

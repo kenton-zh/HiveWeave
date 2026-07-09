@@ -149,8 +149,14 @@ SAFETY_BUFFER_TOKENS = 4_096
 OUTPUT_TOKEN_GLOBAL_CAP = 32_000
 """非 reasoning 模型的 max_tokens 全局上限。"""
 
-TOTAL_TIMEOUT_S = 300.0
-"""整个 stream 调用的总超时（兜底防线）。"""
+TOTAL_TIMEOUT_S = 540.0
+"""整个 stream 调用的总超时（兜底防线）。
+
+BUG-041: 原 300s 包裹整个 _run_tool_loop，多轮工具调用（每轮含 HTTP +
+工具执行）合法场景也会超时。放大到 540s（9分钟），给 agent safety_timeout
+(600s) 留 60s 余量。同时超时不再报熔断失败——多轮工具调用超时不是 provider
+不稳定的问题。
+"""
 
 FIRST_CHUNK_TIMEOUT_S = 90.0
 """首 chunk 超时（TS 防线②，thinking 模型首 token 可能 60-90s）。"""
@@ -521,7 +527,8 @@ class Streamer:
             result["duration_ms"] = int((time.monotonic() - start_time) * 1000)
             return result
         except TimeoutError:
-            await self._circuit_breaker.report_failure(provider_name)
+            # BUG-041: total timeout 通常是多轮工具调用累计超时，
+            # 不是 provider 不稳定 — 不报熔断失败
             log.error("stream_total_timeout", agent_id=agent_id,
                       timeout_s=TOTAL_TIMEOUT_S)
             await self._fire_delta(on_delta, {

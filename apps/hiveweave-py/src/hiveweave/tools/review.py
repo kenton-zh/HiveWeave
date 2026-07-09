@@ -446,15 +446,18 @@ async def run_full_review(
         else fallback(results[3])
 
     all_results = [code_review, security_audit, test_review, perf_audit]
-    effective = [r for r in all_results
-                 if r.get("score") is not None
-                 and not r.get("summary", "").startswith("No files found")]
-    scores = [r["score"] for r in effective if r.get("score") is not None]
+    # 只用有 score 的子结果算平均分，但不踢出 passed 判定
+    scored = [r for r in all_results
+              if r.get("score") is not None
+              and not r.get("summary", "").startswith("No files found")]
+    scores = [r["score"] for r in scored if r.get("score") is not None]
     overall_score = (
         round(sum(scores) / len(scores)) if scores else 0
     )
+    # BUG-039: overall_passed 应基于 all_results 而非 scored，
+    # 否则 passed=True 但 score=None 的子结果会被误判为 FAIL
     overall_passed = (
-        all(r.get("passed") for r in effective) if effective else False
+        all(r.get("passed") for r in all_results) if all_results else False
     )
 
     return {
