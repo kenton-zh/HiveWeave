@@ -163,6 +163,14 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
     if full is None:
         return f"ERROR: Sandbox violation: {file_path}"
 
+    # .hiveweave 系统目录保护 — 阻止 patch 修改/删除 data.db 等系统文件
+    from hiveweave.tools.file import _check_hiveweave_dir
+    if _check_hiveweave_dir(full, workspace_path):
+        return (f"ERROR: `.hiveweave` is the HiveWeave system directory. "
+                f"NEVER patch files inside .hiveweave (data.db, "
+                f"tool_outputs/, etc.). System files are managed by "
+                f"HiveWeave internals.")
+
     p = Path(full)
 
     if op == "add":

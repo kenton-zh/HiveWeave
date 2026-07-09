@@ -258,6 +258,15 @@ async def execute_grep(
                 "error": "Error: Sandbox violation - "
                          "path must be within workspace"}
 
+    # .hiveweave 系统目录保护 — 拒绝显式搜索系统目录（data.db 等不应被 grep）
+    from hiveweave.tools.file import _check_hiveweave_dir, HIVEWEAVE_DIR
+    if _check_hiveweave_dir(search_path, workspace_path) or \
+       Path(search_path).name == HIVEWEAVE_DIR:
+        return {"success": False, "output": "",
+                "error": "Error: `.hiveweave` is the HiveWeave system "
+                         "directory. NEVER grep files inside .hiveweave. "
+                         "System files are managed by HiveWeave internals."}
+
     if not Path(search_path).exists():
         return {"success": False, "output": "",
                 "error": f"Error: Path not found: {path}"}

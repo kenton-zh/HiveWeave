@@ -184,6 +184,11 @@ def _safe_read_file(workspace_path: str, file_path: str) -> str | None:
                 return None
         if not full.exists() or not full.is_file():
             return None
+        # .hiveweave 系统目录保护 — 不读取 data.db 等系统文件
+        from hiveweave.tools.file import _check_hiveweave_dir
+        if _check_hiveweave_dir(str(full), workspace_path):
+            log.warning("review.blocked_hiveweave", path=file_path)
+            return None
         return full.read_text(encoding="utf-8", errors="replace")
     except (OSError, ValueError):
         return None
