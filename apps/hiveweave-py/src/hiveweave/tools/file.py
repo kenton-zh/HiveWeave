@@ -97,6 +97,7 @@ def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
     保护策略（分层）:
     - `.hiveweave` 根目录下的直接文件（data.db, env.sh, *.db-* 等）→ 保护
     - `.hiveweave/tool_outputs/` → 保护（系统管理的工具输出）
+    - `.hiveweave/shared/` → 放行（团队共享空间，所有 agent 可读可写）
     - `.hiveweave/reports/`, `.hiveweave/drafts/`, `.hiveweave/worktrees/` → 放行（agent 工作文件）
     - 其他 `.hiveweave/<subdir>/` → 保护（未知子目录默认保护）
     """
@@ -109,8 +110,8 @@ def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
         except ValueError:
             return False  # Not in .hiveweave — allowed
 
-        # 放行的 agent 工作子目录
-        allowed_subdirs = {"reports", "drafts", "worktrees"}
+        # 放行的 agent 工作子目录（shared = 团队共享空间）
+        allowed_subdirs = {"shared", "reports", "drafts", "worktrees"}
         for sub in allowed_subdirs:
             try:
                 target.relative_to(hw_root / sub)

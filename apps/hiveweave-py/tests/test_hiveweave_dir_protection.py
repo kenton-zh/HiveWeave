@@ -244,3 +244,102 @@ class TestCheckHiveweaveDir:
         assert _check_hiveweave_dir(
             str(tmp_path / "README.md"), str(tmp_path)
         ) is False
+
+    def test_allows_shared(self, tmp_path: Path):
+        """shared/ 是团队共享空间，应放行。"""
+        from hiveweave.tools.file import _check_hiveweave_dir
+        assert _check_hiveweave_dir(
+            str(tmp_path / ".hiveweave" / "shared" / "plan.md"), str(tmp_path)
+        ) is False
+
+    def test_allows_shared_nested(self, tmp_path: Path):
+        """shared/ 下的嵌套子目录也应放行。"""
+        from hiveweave.tools.file import _check_hiveweave_dir
+        assert _check_hiveweave_dir(
+            str(tmp_path / ".hiveweave" / "shared" / "docs" / "notes.md"),
+            str(tmp_path),
+        ) is False
+
+
+# ── shared/ 共享空间放行测试 ─────────────────────────────────
+
+
+class TestSharedDirAccess:
+    """团队共享空间 .hiveweave/shared/ 应允许所有工具读写。"""
+
+    def test_bash_allows_shared_write(self):
+        """bash 应放行指向 .hiveweave/shared/ 的文件操作。"""
+        from hiveweave.tools.bash import _check_hiveweave_command
+        assert _check_hiveweave_command(
+            "echo notes > .hiveweave/shared/notes.md"
+        ) is False
+
+    def test_bash_allows_shared_cat(self):
+        from hiveweave.tools.bash import _check_hiveweave_command
+        assert _check_hiveweave_command(
+            "cat .hiveweave/shared/plan.md"
+        ) is False
+
+    def test_bash_allows_shared_windows_path(self):
+        """Windows 反斜杠路径也应放行。"""
+        from hiveweave.tools.bash import _check_hiveweave_command
+        assert _check_hiveweave_command(
+            r"type .hiveweave\shared\notes.md"
+        ) is False
+
+    def test_bash_still_blocks_data_db(self):
+        """放行 shared/ 后，data.db 仍应被拦截。"""
+        from hiveweave.tools.bash import _check_hiveweave_command
+        assert _check_hiveweave_command(
+            "cat .hiveweave/data.db"
+        ) is True
+
+    def test_bash_still_blocks_tool_outputs(self):
+        """放行 shared/ 后，tool_outputs/ 仍应被拦截。"""
+        from hiveweave.tools.bash import _check_hiveweave_command
+        assert _check_hiveweave_command(
+            "cat .hiveweave/tool_outputs/log.txt"
+        ) is True
+
+    @pytest.mark.asyncio
+    async def test_file_write_shared_allowed(self, tmp_path: Path):
+        """write_file 应允许写入 .hiveweave/shared/。"""
+        from hiveweave.tools.file import write_file
+        hw_shared = tmp_path / ".hiveweave" / "shared"
+        hw_shared.mkdir(parents=True)
+        result = await write_file(
+            file_path=".hiveweave/shared/plan.md",
+            content="# Team Plan",
+            workspace_path=str(tmp_path),
+        )
+        assert result["success"] is True
+        assert (hw_shared / "plan.md").read_text() == "# Team Plan"
+
+    @pytest.mark.asyncio
+    async def test_file_read_shared_allowed(self, tmp_path: Path):
+        """read_file 应允许读取 .hiveweave/shared/。"""
+        from hiveweave.tools.file import read_file
+        hw_shared = tmp_path / ".hiveweave" / "shared"
+        hw_shared.mkdir(parents=True)
+        (hw_shared / "notes.md").write_text("team notes")
+        result = await read_file(
+            file_path=".hiveweave/shared/notes.md",
+            offset=0,
+            limit=100,
+            workspace_path=str(tmp_path),
+        )
+        assert result["success"] is True
+        assert "team notes" in result["output"]
+
+    @pytest.mark.asyncio
+    async def test_patch_shared_allowed(self, tmp_path: Path):
+        """patch 应允许修改 .hiveweave/shared/ 内文件。"""
+        from hiveweave.tools.patch import apply_patch
+        hw_shared = tmp_path / ".hiveweave" / "shared"
+        hw_shared.mkdir(parents=True)
+        result = await apply_patch(
+            patches=[{"op": "add", "filePath": ".hiveweave/shared/doc.md",
+                      "content": "# Shared Doc"}],
+            workspace_path=str(tmp_path),
+        )
+        assert (hw_shared / "doc.md").exists()

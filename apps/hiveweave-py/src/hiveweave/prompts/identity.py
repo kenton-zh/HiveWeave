@@ -103,8 +103,11 @@ _SYSTEM_DIR_BLOCK = """## IMPORTANT: HiveWeave System Directory
 - **System files (NEVER touch)**: `data.db`, `data.db-shm`, `data.db-wal`, `tool_outputs/`.
   These are managed by HiveWeave internals — NEVER read, write, patch, grep, list, or delete them.
 - **NEVER run shell commands that target `.hiveweave` system files** (rm, mv, cp, cat, type, del, sqlite3, strings, etc.).
-- **Work files (ALLOWED)**: `reports/`, `drafts/`, and other non-system subdirectories under `.hiveweave/`
-  are for your drafts, reports, and test outputs. You CAN write to them per your role guidelines."""
+- **Team shared space (ALLOWED, read+write)**: `.hiveweave/shared/` is the team shared directory.
+  All team members can read and write here — documents, plans, temp files, scripts, anything.
+  Use it to collaborate: drop notes, share drafts, coordinate via files.
+- **Work files (ALLOWED)**: `.hiveweave/reports/`, `.hiveweave/drafts/`, `.hiveweave/worktrees/`
+  are for your individual drafts, reports, and test outputs."""
 
 
 _HONESTY_BLOCK = """## Honesty & Integrity Rules (MANDATORY — ZERO TOLERANCE)
