@@ -103,8 +103,13 @@ class FormatHandler(ABC):
         extra: dict[str, Any] | None = None,
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
+        supports_prompt_cache: bool = False,
     ) -> dict[str, Any]:
-        """Build the provider-native request body."""
+        """Build the provider-native request body.
+
+        supports_prompt_cache: 若 True，handler 可在请求体中添加缓存断点
+        （如 Anthropic 的 cache_control: {type: ephemeral}）。
+        """
         ...
 
     @abstractmethod
@@ -179,7 +184,10 @@ class OpenAIHandler(FormatHandler):
         extra: dict[str, Any] | None = None,
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
+        supports_prompt_cache: bool = False,
     ) -> dict[str, Any]:
+        # OpenAI 用隐式 prefix caching，不接受 inline cache_control markers。
+        # supports_prompt_cache 参数在此为 no-op，仅为统一接口签名。
         body: dict[str, Any] = {
             "model": model_id,
             "messages": messages,
@@ -334,6 +342,7 @@ class AnthropicHandler(FormatHandler):
         extra: dict[str, Any] | None = None,
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
+        supports_prompt_cache: bool = False,
     ) -> dict[str, Any]:
         """Build Anthropic-format request body.
 
@@ -342,6 +351,16 @@ class AnthropicHandler(FormatHandler):
         - user messages → role: "user" with content blocks
         - assistant messages → role: "assistant" with content blocks + tool_use
         - tool messages → role: "user" with tool_result blocks
+
+        Prompt caching (supports_prompt_cache=True):
+        参考 opencode cache-policy.ts 的 auto 策略，在 3 个位置注入
+        cache_control: {type: "ephemeral"} 断点：
+        1. 最后一个 tool 定义（缓存 tools schema）
+        2. 最后一个 system block（缓存 system prompt）
+        3. 最后一条 user 消息的最后一个 text block（缓存到当前轮次前缀）
+
+        Anthropic 最多 4 个断点，3 个 auto 断点在安全范围内。
+        tool loop 中前缀不变，每轮都能命中缓存，显著降低 token 成本和延迟。
         """
         system_blocks: list[dict] = []
         anthropic_messages: list[dict] = []
@@ -371,6 +390,11 @@ class AnthropicHandler(FormatHandler):
                     }],
                 })
 
+        # Prompt cache 断点注入（参考 opencode cache-policy.ts auto 策略）
+        # 仅标记 system_blocks 和 anthropic_messages；tools 在 normalize_tools 后单独标记
+        if supports_prompt_cache:
+            self._apply_cache_breakpoints(system_blocks, anthropic_messages)
+
         body: dict[str, Any] = {
             "model": model_id,
             "messages": anthropic_messages,
@@ -386,6 +410,9 @@ class AnthropicHandler(FormatHandler):
 
         if tools:
             body["tools"] = self.normalize_tools(tools)
+            # 标记最后一个 tool 的 cache_control（缓存 tools schema）
+            if supports_prompt_cache and body["tools"]:
+                body["tools"][-1]["cache_control"] = {"type": "ephemeral"}
 
         # Thinking support
         if supports_thinking and reasoning_effort:
@@ -451,6 +478,50 @@ class AnthropicHandler(FormatHandler):
         if not blocks:
             blocks.append({"type": "text", "text": ""})
         return blocks
+
+    @staticmethod
+    def _apply_cache_breakpoints(
+        system_blocks: list[dict],
+        anthropic_messages: list[dict],
+    ) -> None:
+        """注入 prompt cache 断点（参考 opencode cache-policy.ts auto 策略）。
+
+        在 2 个位置标记 cache_control: {type: "ephemeral"}：
+        1. 最后一个 system block — 缓存 system prompt（身份/上下文/技能摘要）
+        2. 最后一条 user 消息的最后一个 text block — 缓存到当前轮次前缀
+
+        tools 的断点在 build_body 中 normalize_tools 后单独标记（第 3 个断点）。
+        共 3 个断点，在 Anthropic 4 断点上限内。
+
+        设计依据：HiveWeave tool loop 中，每轮 LLM 请求的前缀（system +
+        history + 最新 user）不变，只有尾部追加 assistant+tool_result。
+        缓存这个前缀让每轮都命中 cache_read，大幅降低 token 成本和延迟。
+        """
+        # 断点 1: 最后一个 system block
+        if system_blocks:
+            last_system = system_blocks[-1]
+            if "cache_control" not in last_system:
+                last_system["cache_control"] = {"type": "ephemeral"}
+
+        # 断点 2: 最后一条 user 消息的最后一个 text block
+        # 逆序找最后一条 user 消息
+        for msg in reversed(anthropic_messages):
+            if msg.get("role") != "user":
+                continue
+            blocks = msg.get("content")
+            if not isinstance(blocks, list) or not blocks:
+                break
+            # 优先标记最后一个 text block，没有则标记最后一个 block
+            text_idx = -1
+            for i in range(len(blocks) - 1, -1, -1):
+                if isinstance(blocks[i], dict) and blocks[i].get("type") == "text":
+                    text_idx = i
+                    break
+            mark_idx = text_idx if text_idx >= 0 else len(blocks) - 1
+            target = blocks[mark_idx]
+            if isinstance(target, dict) and "cache_control" not in target:
+                target["cache_control"] = {"type": "ephemeral"}
+            break  # 只标记最后一条 user 消息
 
     def normalize_tools(self, tools: list[dict]) -> list[dict]:
         """Convert OpenAI tool format to Anthropic tool format.
@@ -603,9 +674,22 @@ class AnthropicHandler(FormatHandler):
 
     @staticmethod
     def extract_usage(chunk: dict) -> dict | None:
+        """提取 usage，含 prompt cache 命中统计。
+
+        Anthropic 在 usage 中返回 cache 字段：
+        - cache_creation_input_tokens: 写入缓存的 token 数（计费 1.25x）
+        - cache_read_input_tokens: 命中缓存的 token 数（计费 0.1x）
+        参考 opencode anthropic-messages.ts mapUsage。
+        """
         u = chunk.get("usage")
         if u:
-            return u
+            return {
+                "input": u.get("input_tokens", 0),
+                "output": u.get("output_tokens", 0),
+                "total": (u.get("input_tokens", 0) + u.get("output_tokens", 0)),
+                "cache_creation": u.get("cache_creation_input_tokens", 0),
+                "cache_read": u.get("cache_read_input_tokens", 0),
+            }
         # Also check message-level usage
         msg = chunk.get("message", {})
         u2 = msg.get("usage")
@@ -614,6 +698,8 @@ class AnthropicHandler(FormatHandler):
                 "input": u2.get("input_tokens", 0),
                 "output": u2.get("output_tokens", 0),
                 "total": (u2.get("input_tokens", 0) + u2.get("output_tokens", 0)),
+                "cache_creation": u2.get("cache_creation_input_tokens", 0),
+                "cache_read": u2.get("cache_read_input_tokens", 0),
             }
         return None
 
@@ -670,10 +756,13 @@ class GoogleHandler(FormatHandler):
         extra: dict[str, Any] | None = None,
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
+        supports_prompt_cache: bool = False,
     ) -> dict[str, Any]:
         """Build Google Gemini-format request body.
 
         Converts OpenAI-format messages to Gemini contents + systemInstruction.
+        Gemini 用隐式缓存 + out-of-band CachedContent，不接受 inline cache markers，
+        supports_prompt_cache 参数在此为 no-op。
         """
         contents: list[dict] = []
         system_instruction: dict | None = None
@@ -937,6 +1026,7 @@ class ProviderConfig:
         fallback: str | None = None,
         handler: FormatHandler | None = None,
         extra_headers: dict[str, str] | None = None,
+        supports_prompt_cache: bool = False,
     ) -> None:
         self.api_format = api_format
         self.base_url = base_url.rstrip("/")
@@ -950,6 +1040,9 @@ class ProviderConfig:
         self.fallback = fallback
         self._handler = handler or FORMAT_HANDLERS.get(api_format, OpenAICompatibleHandler())
         self._extra_headers = extra_headers or {}
+        # Prompt cache 支持：仅 Anthropic 格式有效（OpenAI/Gemini 用隐式缓存）
+        # 参考 opencode RESPECTS_INLINE_HINTS = {"anthropic-messages", "bedrock-converse"}
+        self.supports_prompt_cache = supports_prompt_cache and api_format == ApiFormat.ANTHROPIC
 
     @property
     def provider_type(self) -> str:
@@ -997,6 +1090,7 @@ class ProviderConfig:
             extra=extra,
             supports_thinking=self.supports_thinking,
             reasoning_effort=self.reasoning_effort,
+            supports_prompt_cache=self.supports_prompt_cache,
         )
 
     def parse_stream_chunk(self, raw_json: dict) -> list[dict]:
@@ -1054,6 +1148,14 @@ class ProviderFactory:
         # Detect format: explicit provider_type takes priority, then auto-detect
         api_format = self._detect_format(model_config)
 
+        # Prompt cache: Anthropic 格式默认开启（5min cache 写 1.25x，读 0.1x，
+        # 单次复用即回本）。可被 model_config.supports_prompt_cache 显式关闭。
+        # 参考 opencode: undefined → auto（默认开启）
+        if "supports_prompt_cache" in model_config:
+            supports_cache = bool(model_config["supports_prompt_cache"])
+        else:
+            supports_cache = api_format == ApiFormat.ANTHROPIC
+
         return ProviderConfig(
             api_format=api_format,
             base_url=base_url,
@@ -1065,6 +1167,7 @@ class ProviderFactory:
             reasoning_effort=model_config.get("default_reasoning_effort"),
             temperature=float(model_config.get("temperature") or 0.7),
             fallback=model_config.get("fallback"),
+            supports_prompt_cache=supports_cache,
         )
 
     def _detect_format(self, model_config: dict) -> ApiFormat:
