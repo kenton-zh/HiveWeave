@@ -457,27 +457,35 @@ async def set_todos(agent_id: str, body: TodosBody) -> dict:
 async def get_questions(
     agentId: str | None = Query(default=None),
     projectId: str | None = Query(default=None),
+    status: str | None = Query(default=None),
 ) -> dict:
-    """查待答问题（query: agentId 或 projectId）。"""
+    """查待答问题（query: agentId 或 projectId，可选 status 过滤）。"""
     try:
+        # status 过滤条件（仅在 status 非空时追加）
+        status_clause = " AND status = ?" if status else ""
+
         if agentId:
+            params: list = [agentId] + ([status] if status else [])
             rows = await project_db.query(
                 agentId,
                 "SELECT id, agent_id, question, options, answer, status, created_at, "
-                "answered_at FROM questions WHERE agent_id = ? "
-                "ORDER BY created_at DESC",
-                [agentId],
+                "answered_at FROM questions WHERE agent_id = ?"
+                + status_clause +
+                " ORDER BY created_at DESC",
+                params,
             )
         elif projectId:
             workspace = await meta_db.get_project_workspace(projectId)
             if not workspace:
                 return {"questions": []}
             conn = await project_db.ensure_project_db(workspace)
+            params2: list = [projectId] + ([status] if status else [])
             cursor = await conn.execute(
                 "SELECT id, agent_id, question, options, answer, status, created_at, "
-                "answered_at FROM questions WHERE project_id = ? "
-                "ORDER BY created_at DESC",
-                [projectId],
+                "answered_at FROM questions WHERE project_id = ?"
+                + status_clause +
+                " ORDER BY created_at DESC",
+                params2,
             )
             rows = await cursor.fetchall()
             await cursor.close()
