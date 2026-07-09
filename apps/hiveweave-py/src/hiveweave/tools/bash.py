@@ -110,6 +110,30 @@ def check_self_destructive(command: str) -> tuple[bool, str]:
     return False, ""
 
 
+# .hiveweave 系统目录保护的文件操作命令前缀。
+# cd .hiveweave 不拦（无害），只拦真正会读/写/删/复制文件的命令。
+_HIVEWEAVE_FILE_OPS = re.compile(
+    r"\b(?:rm|del|erase|cat|type|cp|copy|mv|move|xcopy|robocopy|"
+    r"echo|printf|tee|dd|truncate|strings|xxd|hexdump|od|base64|"
+    r"touch|mkdir|rmdir|rd|ln|link|chmod|chown|attrib|cacls|"
+    r"sqlite3|\.sqlite3|open|export|tar|zip|unzip|gzip|gunzip|"
+    r"7z|rar|dump|backup|restore|import|load)\b",
+    re.IGNORECASE,
+)
+_HIVEWEAVE_REF = re.compile(r"\.hiveweave\b", re.IGNORECASE)
+
+
+def _check_hiveweave_command(command: str) -> bool:
+    """Return True if the command targets `.hiveweave` with a file operation.
+
+    拦截 agent 通过 bash 读写/删除/复制 .hiveweave 内系统文件（data.db 等）。
+    `cd .hiveweave` 和 `ls .hiveweave` 这类无害命令不拦。
+    """
+    if not _HIVEWEAVE_REF.search(command):
+        return False
+    return bool(_HIVEWEAVE_FILE_OPS.search(command))
+
+
 def _is_within_workspace(candidate: str, workspace: str) -> bool:
     """Check whether `candidate` path stays inside `workspace` (after resolve)."""
     try:
@@ -314,6 +338,19 @@ async def execute_bash(
                          "sensitive file (e.g. .env, *.pem, id_rsa, "
                          "credentials). Use read_file with explicit "
                          "approval instead."}
+
+    # .hiveweave 系统目录保护 — 阻止 agent 通过 bash 操作 data.db 等系统文件。
+    # 仅拦截 agent 原始命令中对 .hiveweave 的文件操作（rm/cat/cp/mv/type/del/xcopy 等），
+    # 不影响下方 _source_env_sh 的内部 source（那是系统行为，非 agent 命令）。
+    blocked_hw = _check_hiveweave_command(command)
+    if blocked_hw:
+        log.warning("bash.blocked_hiveweave", command_preview=command[:120])
+        return {"success": False, "output": "",
+                "error": "Error: Command blocked: `.hiveweave` is the HiveWeave "
+                         "system directory. NEVER run shell commands that target "
+                         ".hiveweave (rm, mv, cp, cat, type, del, etc.). "
+                         "System files (data.db, tool_outputs/) are managed by "
+                         "HiveWeave internals."}
 
     # 1.5. Auto-source .hiveweave/env.sh if the project has one.
     # The project declares its own environment setup.

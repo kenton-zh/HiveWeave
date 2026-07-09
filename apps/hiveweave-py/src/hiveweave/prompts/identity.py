@@ -100,8 +100,11 @@ AI 让"完整性"的边际成本趋近于零。当完整实现只比捷径多花
 
 _SYSTEM_DIR_BLOCK = """## IMPORTANT: HiveWeave System Directory
 - **`.hiveweave`** is the HiveWeave system directory at the workspace root.
-- **NEVER read, write, edit, move, or delete any files inside `.hiveweave`.**
-- **NEVER run shell commands that target `.hiveweave`** (rm, mv, cp, etc.)."""
+- **System files (NEVER touch)**: `data.db`, `data.db-shm`, `data.db-wal`, `tool_outputs/`.
+  These are managed by HiveWeave internals — NEVER read, write, patch, grep, list, or delete them.
+- **NEVER run shell commands that target `.hiveweave` system files** (rm, mv, cp, cat, type, del, sqlite3, strings, etc.).
+- **Work files (ALLOWED)**: `reports/`, `drafts/`, and other non-system subdirectories under `.hiveweave/`
+  are for your drafts, reports, and test outputs. You CAN write to them per your role guidelines."""
 
 
 _HONESTY_BLOCK = """## Honesty & Integrity Rules (MANDATORY — ZERO TOLERANCE)

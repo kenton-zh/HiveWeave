@@ -26,11 +26,12 @@ BINARY_PROBE_SIZE = 8192
 MAX_LIST_FILES = 1000
 MAX_READ_BYTES = 10 * 1024 * 1024  # 10MB — 大文件读取上限（R5），防止 OOM
 
-# Directories to skip in list_files (common build/dep dirs)
+# Directories to skip in list_files (common build/dep dirs + HiveWeave system dir)
 IGNORED_DIRS = frozenset({
     "node_modules", ".git", ".svn", ".hg", "__pycache__",
     "dist", "build", "target", ".next", ".nuxt", ".turbo",
     ".cache", "coverage", ".idea", ".vscode",
+    ".hiveweave",  # HiveWeave 系统目录 — agent 不应遍历
 })
 
 # HiveWeave system directory — agents must never touch it
@@ -93,8 +94,11 @@ def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
 def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
     """Return True if the path targets protected .hiveweave internals.
 
-    Agent work files (.hiveweave/reports/, .hiveweave/drafts/, etc.) are
-    ALLOWED. Only system internals (data.db, tool_outputs/) are blocked.
+    保护策略（分层）:
+    - `.hiveweave` 根目录下的直接文件（data.db, env.sh, *.db-* 等）→ 保护
+    - `.hiveweave/tool_outputs/` → 保护（系统管理的工具输出）
+    - `.hiveweave/reports/`, `.hiveweave/drafts/`, `.hiveweave/worktrees/` → 放行（agent 工作文件）
+    - 其他 `.hiveweave/<subdir>/` → 保护（未知子目录默认保护）
     """
     try:
         ws = Path(workspace_path).resolve()
@@ -104,21 +108,25 @@ def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
             target.relative_to(hw_root)
         except ValueError:
             return False  # Not in .hiveweave — allowed
-        # Block only system-critical internals
-        protected = {
-            hw_root / "data.db",
-            hw_root / "data.db-shm",
-            hw_root / "data.db-wal",
-            hw_root / "tool_outputs",
-        }
-        if target in protected:
-            return True
+
+        # 放行的 agent 工作子目录
+        allowed_subdirs = {"reports", "drafts", "worktrees"}
+        for sub in allowed_subdirs:
+            try:
+                target.relative_to(hw_root / sub)
+                return False  # 在允许的工作子目录内
+            except ValueError:
+                pass
+
+        # tool_outputs/ 保护
         try:
             target.relative_to(hw_root / "tool_outputs")
-            return True  # Inside tool_outputs/ — system-managed
+            return True
         except ValueError:
             pass
-        return False  # Inside .hiveweave but not protected — allowed
+
+        # .hiveweave 根目录下的直接文件或其他未知子目录 → 保护
+        return True
     except (OSError, ValueError):
         return False
 
@@ -302,6 +310,14 @@ async def list_files(
             return {"success": False, "output": "",
                     "error": "Error: Sandbox violation - "
                              "path must be within workspace"}
+        # .hiveweave 系统目录保护 — 拒绝显式列出系统目录内容
+        if _check_hiveweave_dir(full, workspace_path) or \
+           Path(full).name == HIVEWEAVE_DIR:
+            return {"success": False, "output": "",
+                    "error": "Error: `.hiveweave` is the HiveWeave system "
+                             "directory. NEVER list, read, or modify files "
+                             "inside .hiveweave. System files (data.db, "
+                             "tool_outputs/) are managed by HiveWeave internals."}
     else:
         full = str(Path(ws).resolve())
 
