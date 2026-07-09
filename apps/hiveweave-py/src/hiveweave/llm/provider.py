@@ -1097,6 +1097,10 @@ class ProviderConfig:
         """Parse a raw SSE JSON object into canonical chunks using the format handler."""
         return self._handler.parse_stream_chunk(raw_json)
 
+    def extract_usage(self, chunk: dict) -> dict | None:
+        """Extract usage (含 cache 命中统计) from a chunk using the format handler."""
+        return self._handler.extract_usage(chunk)
+
     def build_client(self) -> httpx.AsyncClient:
         timeout = self._handler.get_timeout()
         return httpx.AsyncClient(timeout=timeout)
