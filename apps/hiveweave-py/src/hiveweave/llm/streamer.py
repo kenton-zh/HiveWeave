@@ -1060,11 +1060,11 @@ class Streamer:
         for event in raw["events"]:
             if not isinstance(event, dict):
                 continue
-            if "usage" in event and event["usage"]:
-                u = event["usage"]
-                usage = {"input": u.get("prompt_tokens", 0),
-                         "output": u.get("completion_tokens", 0),
-                         "total": u.get("prompt_tokens", 0) + u.get("completion_tokens", 0)}
+            # 统一用 provider.extract_usage 提取 usage（含 cache_creation/cache_read）
+            # 参考 opencode anthropic-messages.ts mapUsage
+            extracted = provider.extract_usage(event)
+            if extracted:
+                usage = extracted
             for c in provider.parse_stream_chunk(event):
                 ctype = c.get("type")
                 if ctype == "text":
@@ -1105,6 +1105,13 @@ class Streamer:
                     log.warning("sse_error_chunk", agent_id=agent_id, error=c.get("content"))
 
         tool_calls = merge_tool_calls([], tool_call_deltas)
+        # 记录 cache 命中情况（Anthropic prompt caching）
+        cache_read = (usage or {}).get("cache_read", 0)
+        cache_creation = (usage or {}).get("cache_creation", 0)
+        if cache_read or cache_creation:
+            log.info("prompt_cache_hit", agent_id=agent_id, round=round_num,
+                     cache_read=cache_read, cache_creation=cache_creation,
+                     input_tokens=(usage or {}).get("input", 0))
         log.info("round_http_done", agent_id=agent_id, round=round_num,
                  text_len=len(text_acc), tool_count=len(tool_calls), finish=finish_reason)
         return {"status": "ok", "text": text_acc, "thinking": thinking_acc,
