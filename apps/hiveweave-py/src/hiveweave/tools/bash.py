@@ -387,14 +387,23 @@ async def execute_run_command(
     timeout_ms: int,
     workspace_path: str,
 ) -> dict[str, Any]:
-    """Lower-level escape hatch — NO self-destructive guard.
+    """Lower-level escape hatch with self-destructive guard (A3 fix).
 
     Contract 02: run_command is the bash escape hatch included in core_tools.
-    It is available to all roles but does NOT run the self-destructive check.
+    Previously skipped self-destructive check — now unified with execute_bash
+    to prevent rm -rf /, format, shutdown etc. across all command execution.
     """
     if not command or not command.strip():
         return {"success": False, "output": "",
                 "error": "Error: command is required"}
+
+    # A3 修复：统一自毁检查，与 execute_bash 一致
+    blocked, reason = check_self_destructive(command)
+    if blocked:
+        log.warning("run_command.blocked", reason=reason,
+                    command_preview=command[:120])
+        return {"success": False, "output": "",
+                "error": f"Error: Command blocked: {reason}"}
 
     ws = workspace_path or os.getcwd()
     if cwd:

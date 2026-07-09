@@ -274,6 +274,15 @@ class OrgService:
         if not updated:
             return {"success": False, "message": "Agent not found"}
 
+        # A4 修复：清理该 agent 的所有 pending 闹钟，防止触发到已 archived agent
+        try:
+            from hiveweave.services.game_time import GameTimeService
+            gt = GameTimeService()
+            await gt.cancel_alarms_for_agent(project_id, agent_id)
+        except Exception as e:
+            log.warning("dismiss_cancel_alarms_failed",
+                        agent_id=agent_id, error=str(e))
+
         log.info("org.dismiss_agent", agent_id=agent_id,
                  project_id=project_id)
         return {"success": True, "agent": updated}

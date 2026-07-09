@@ -135,6 +135,33 @@ class GameTimeService:
             state["alarms"] = [a for a in state["alarms"] if a["id"] != alarm_id]
         _alarm_project.pop(alarm_id, None)
 
+    async def cancel_alarms_for_agent(self, project_id: str, agent_id: str) -> int:
+        """Cancel all pending alarms for an agent (A4 fix).
+
+        Called when an agent is dismissed to prevent alarms from firing
+        on an archived agent. Cancels alarms where to_agent_id or
+        from_agent_id matches.
+
+        Returns number of alarms cancelled.
+        """
+        await _execute(project_id,
+            "UPDATE scheduled_alarms SET status = 'cancelled' "
+            "WHERE (to_agent_id = ? OR from_agent_id = ?) AND status = 'pending'",
+            [agent_id, agent_id])
+        state = _states.get(project_id)
+        cancelled = 0
+        if state:
+            before = len(state["alarms"])
+            state["alarms"] = [
+                a for a in state["alarms"]
+                if a.get("to_agent_id") != agent_id
+                and a.get("from_agent_id") != agent_id
+            ]
+            cancelled = before - len(state["alarms"])
+        log.info("alarms_cancelled_for_agent",
+                 agent_id=agent_id, project_id=project_id, count=cancelled)
+        return cancelled
+
     async def get_alarms(self, project_id: str) -> list[dict]:
         rows = await _query(project_id,
             "SELECT id, project_id, from_agent_id, to_agent_id, purpose, "
