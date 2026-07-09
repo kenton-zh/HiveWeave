@@ -87,73 +87,6 @@ CONTEXT_WINDOW_DEFAULT = 128_000
 # PermissionService 返回工具名列表，Streamer 需要完整定义。
 # 这里维护一个名称→描述的映射，参数 schema 用 permissive（additionalProperties: true）。
 
-_TOOL_DESCRIPTIONS: dict[str, str] = {
-    "bash": "Execute a bash command in the workspace.",
-    "run_command": "Run a shell command (restricted).",
-    "read_file": "Read file contents from the workspace.",
-    "write_file": "Write content to a file in the workspace.",
-    "edit_file": "Edit an existing file using search-and-replace.",
-    "delete_file": "Delete a file from the workspace.",
-    "move_file": "Move or rename a file.",
-    "list_files": "List files in a directory.",
-    "search_files": "Search for files by glob pattern.",
-    "create_directory": "Create a new directory.",
-    "delete_directory": "Delete a directory.",
-    "grep": "Search for patterns in files (ripgrep).",
-    "apply_patch": "Apply a multi-file patch.",
-    "todowrite": "Update the task todo list.",
-    "question": "Ask the user a question and wait for response.",
-    "websearch": "Search the web.",
-    "webfetch": "Fetch a URL and convert HTML to readable text. Use to read documentation, API references, or any web page content.",
-    "review": "Run a code review.",
-    "run_code_review": "Run a code quality review.",
-    "run_security_audit": "Run a security audit.",
-    "run_tests": "Run tests and review results.",
-    "run_perf_audit": "Run a performance audit.",
-    "run_full_review": "Run full review (code + security + tests + perf).",
-    "read_skill": "Read a skill's full instructions.",
-    "list_available_skills": "List available skills.",
-    "bind_skill": "Bind a skill to this agent.",
-    "read_memory": "Read memories (project/agent/archive layer).",
-    "write_memory": "Write a memory entry.",
-    "message_superior": "Send a message to the superior agent.",
-    "message_subordinate": "Send a message to a subordinate agent.",
-    "message_peer": "Send a message to a peer agent.",
-    "message_team": "Send a message to the team group chat.",
-    "dispatch_task": "Dispatch a task to a subordinate agent.",
-    "report_completion": "Report task completion to superior.",
-    "request_review": "Request a code review from superior.",
-    "approve_work": "Approve a subordinate's work.",
-    "reject_work": "Reject a subordinate's work (request rework).",
-    "list_subordinates": "List direct subordinates.",
-    "read_roster": "Read the personnel roster.",
-    "write_work_log": "Write a work log entry.",
-    "hire_agent": "Hire a new agent (HR only). Places the new agent under a specified parent (default: CEO). Pass templateId to pre-fill role/goal/skills.",
-    "transfer_agent": "Transfer an agent to a new parent.",
-    "dismiss_agent": "Dismiss an agent.",
-    "save_charter": "Save the project charter.",
-    "update_goals": "Update enterprise goals.",
-    "git_worktree_create": "Create a git worktree for an agent.",
-    "git_worktree_merge": "Merge a worktree branch into main.",
-    "git_worktree_remove": "Remove a git worktree.",
-    "git_worktree_list": "List all worktrees.",
-    "git_worktree_status": "Check worktree status.",
-    "git_worktree_checkpoint": "Save a checkpoint (commit) in an agent's worktree.",
-    "update_roster": "Update the personnel roster for an agent (HR only).",
-    "list_agent_templates": "Browse agent templates catalog. HR only. Returns templates with role/goal/skills pre-configured.",
-    "unbind_skill": "Unbind a skill from an agent.",
-    "read_charter": "Read the project charter.",
-    "read_goals": "Read enterprise goals.",
-    "view_org_chart": "View the full organization chart.",
-    "read_work_logs": "Read work logs from subordinates.",
-    "schedule_alarm": "Schedule an alarm/reminder. One-shot fire at specified game time. Can target self (toAgentId=your own id) or others. Include a purpose message delivered on fire.",
-    "schedule_alarm": "Schedule a reminder. One-shot or recurring. Use when you need to: check back on something later (e.g. 'check build status in 1 game hour'), set a self-reminder before a deadline, or coordinate team timing. The alarm fires as an inbox message from '你自己的闹钟' or 'XXX的闹钟'.\n\nExamples:\n- Self-reminder: schedule_alarm(toAgentId='self', purpose='Check if HR has reported back', fireInGameSeconds=3600)\n- Recurring check: schedule_alarm(toAgentId='self', purpose='Poll build status', fireInGameSeconds=7200, repeatIntervalSeconds=7200)\n- Remind teammate: schedule_alarm(toAgentId='墨言', purpose='Sprint review in 30 game minutes', fireInGameSeconds=1800)",
-    "list_alarms": "List all pending alarms for the current project. Shows alarm ID, remaining game seconds until fire, and purpose.",
-    "cancel_alarm": "Cancel a pending alarm by its ID. Use when a reminder is no longer needed. Get the alarmId from list_alarms.",
-    "send_message": "Send a message to other agents.",
-}
-
-
 # Per-tool explicit parameter schemas. Tools listed here expose a typed
 # schema to the LLM (so it knows which params exist — e.g. parentId for
 # hire_agent, which lets HR place a new agent under a specific manager
@@ -515,10 +448,10 @@ def _build_tool_definitions(tool_names: list[str]) -> list[dict]:
     """
     tools: list[dict] = []
     for name in tool_names:
-        desc = _TOOL_DESCRIPTIONS.get(name, f"Execute the {name} tool.")
-        # Use centralized schema from executor (with proper params, no more guessing)
-        from hiveweave.tools.executor import get_tool_schema_for_llm
+        # Use centralized schema from executor for BOTH description and params
+        from hiveweave.tools.executor import get_tool_schema_for_llm, TOOL_PARAM_SCHEMAS
         params = get_tool_schema_for_llm(name)
+        desc = TOOL_PARAM_SCHEMAS.get(name, {}).get("description") or f"Execute the {name} tool."
         tools.append(
             {
                 "type": "function",
@@ -784,7 +717,7 @@ class Agent:
             # Save a streaming placeholder BEFORE the LLM call.
             # If the agent crashes mid-response, this partial record survives.
             is_trigger = opts.get("trigger", False)
-            self._streaming_msg_id = await self._chat_msg.save_message({
+            saved = await self._chat_msg.save_message({
                 "agent_id": self.id,
                 "role": "assistant",
                 "content": "",
@@ -793,6 +726,7 @@ class Agent:
                 "is_streaming": True,
                 "is_background": True if is_trigger else False,
             })
+            self._streaming_msg_id = saved["id"]
 
             # 启动 LLM task
             self._llm_task = asyncio.create_task(
@@ -1231,41 +1165,10 @@ class Agent:
             usage=result.get("usage"),
         )
 
-        # 1. 保存 assistant 消息到 chat_messages
-        # 更新先前保存的 streaming placeholder，而非插入新消息。
-        # 如果 agent 中途崩溃，placeholder 保留在 DB 中（is_streaming=True），
-        # 调试时可看到"回答被中断"的标记。
-        is_trigger = opts.get("trigger", False)
-        if self._streaming_msg_id:
-            await self._chat_msg.update_message(
-                self.id, self._streaming_msg_id,
-                {
-                    "content": content,
-                    "thinking": thinking,
-                    "tool_calls": json.dumps(tool_calls, ensure_ascii=False)
-                    if tool_calls else "[]",
-                    "is_streaming": False,
-                },
-            )
-            self._streaming_msg_id = None
-        else:
-            await self._chat_msg.save_message(
-                {
-                    "agent_id": self.id,
-                    "role": "assistant",
-                    "content": content,
-                    "thinking": thinking,
-                    "tool_calls": json.dumps(tool_calls, ensure_ascii=False)
-                    if tool_calls
-                    else "[]",
-                    "is_streaming": False,
-                    "is_background": True if is_trigger else False,
-                }
-            )
-
+        # 1. 先写 work_log（在 update_message 之前，确保监控有数据）
         # BUG-026 修复：自动写 work_log，确保前端 Logs tab 有内容。
-        # 不依赖 LLM 主动调用 write_work_log 工具——每轮完成都记录一条，
-        # summary 取最终输出（或用户消息），details 记录工具调用清单与轮次。
+        # 放在 update_message 之前——update_message 可能因类型问题崩溃
+        # （如 thinking 意外为 dict），work_log 不应被其连累。
         try:
             summary_src = content if content else message
             summary = (summary_src or "").strip().replace("\n", " ")[:140]
@@ -1290,9 +1193,74 @@ class Agent:
         except Exception as e:
             log.warning("auto_work_log_failed", agent_id=self.id, error=str(e))
 
-        # 2. 追加到 conversation store
+        # 2. 保存 assistant 消息到 chat_messages
+        # 更新先前保存的 streaming placeholder，而非插入新消息。
+        # 用 try/except 包裹——保存失败不应导致整个 completion 崩溃。
+        # 失败了就降级保存一条简单消息 + 注入对话反馈，让 AI 知道格式有问题。
+        is_trigger = opts.get("trigger", False)
+        _save_failed = False
+        _save_error_msg = ""
+        try:
+            if self._streaming_msg_id:
+                await self._chat_msg.update_message(
+                    self.id, self._streaming_msg_id,
+                    {
+                        "content": content,
+                        "thinking": thinking,
+                        "tool_calls": json.dumps(tool_calls, ensure_ascii=False)
+                        if tool_calls else "[]",
+                        "is_streaming": False,
+                    },
+                )
+                self._streaming_msg_id = None
+            else:
+                await self._chat_msg.save_message(
+                    {
+                        "agent_id": self.id,
+                        "role": "assistant",
+                        "content": content,
+                        "thinking": thinking,
+                        "tool_calls": json.dumps(tool_calls, ensure_ascii=False)
+                        if tool_calls
+                        else "[]",
+                        "is_streaming": False,
+                        "is_background": True if is_trigger else False,
+                    }
+                )
+        except Exception as e:
+            _save_failed = True
+            _save_error_msg = str(e)
+            log.error("completion_save_failed",
+                      agent_id=self.id, error=_save_error_msg)
+            # 降级：清掉 is_streaming flag，至少不让前端显示僵尸
+            try:
+                if self._streaming_msg_id:
+                    await self._chat_msg.update_message(
+                        self.id, self._streaming_msg_id,
+                        {"content": content[:500] if content else "(empty)",
+                         "is_streaming": False},
+                    )
+                    self._streaming_msg_id = None
+            except Exception:
+                pass  # 尽力了
+
+        # 3. 追加到 conversation store
         # user message + tool turn messages (assistant+tool pairs) + final assistant
         turn_messages: list[dict] = [{"role": "user", "content": message}]
+        # 如果消息保存失败，注入错误反馈让 AI 意识到问题
+        if _save_failed:
+            turn_messages.append({
+                "role": "tool",
+                "tool_call_id": "_save_message",
+                "content": (
+                    f"SYSTEM ERROR: Your last response was produced successfully "
+                    f"(content length: {len(content)}, tool calls: {len(tool_calls)}), "
+                    f"but saving it to the database failed with: {_save_error_msg}. "
+                    f"This is a platform bug (type mismatch in message field), NOT your fault. "
+                    f"The user can still see your response in the conversation history. "
+                    f"Continue your work as normal."
+                ),
+            })
         turn_messages.extend(tool_turn_messages)
         await self._conversation.append_turn(
             self.id, self.project_id, turn_messages
@@ -1438,6 +1406,29 @@ class Agent:
             error_type=error_type,
         )
 
+        # 写 work_log — 确保错误在监控面板可见
+        try:
+            await self._work_log.write_work_log(
+                self.project_id, self.id, None,
+                "error",
+                f"[{error_type}] {error_msg}"[:140],
+                details={"error_type": error_type, "error": error_msg[:500]},
+            )
+        except Exception:
+            pass
+
+        # 写 agent_events — 监控面板依赖此表
+        try:
+            from hiveweave.services.event_audit import event_audit
+            await event_audit.log(
+                project_id=self.project_id,
+                agent_id=self.id,
+                event_type=f"llm_error.{error_type}",
+                payload={"error": error_msg[:500], "error_type": error_type},
+            )
+        except Exception:
+            pass
+
         # 发送 error 事件（前端 streamChat 等待此事件停止 loading）
         # 必须在 _reset_to_idle 之前发送，确保前端先处理错误再看到 idle 状态
         self._broadcast_stream_event({
@@ -1448,26 +1439,31 @@ class Agent:
         })
 
         # 保存错误消息到 DB — 更新 streaming placeholder 而非插入新消息
+        # 包 try/except: 保存失败不应阻止 agent 恢复到 idle
         is_trigger = bool(self.pending_inbox_msg_ids)
-        if self._streaming_msg_id:
-            await self._chat_msg.update_message(
-                self.id, self._streaming_msg_id,
-                {
-                    "content": f"[ERROR] {error_msg}",
-                    "is_streaming": False,
-                },
-            )
-            self._streaming_msg_id = None
-        else:
-            await self._chat_msg.save_message(
-                {
-                    "agent_id": self.id,
-                    "role": "assistant",
-                    "content": f"[ERROR] {error_msg}",
-                    "is_streaming": False,
-                    "is_background": True if is_trigger else False,
-                }
-            )
+        try:
+            if self._streaming_msg_id:
+                await self._chat_msg.update_message(
+                    self.id, self._streaming_msg_id,
+                    {
+                        "content": f"[ERROR] {error_msg}",
+                        "is_streaming": False,
+                    },
+                )
+                self._streaming_msg_id = None
+            else:
+                await self._chat_msg.save_message(
+                    {
+                        "agent_id": self.id,
+                        "role": "assistant",
+                        "content": f"[ERROR] {error_msg}",
+                        "is_streaming": False,
+                        "is_background": True if is_trigger else False,
+                    }
+                )
+        except Exception as e:
+            log.error("error_save_failed",
+                      agent_id=self.id, save_error=str(e))
 
         # 标记 inbox 已读（避免僵尸消息）
         if self.pending_inbox_msg_ids:
@@ -1660,25 +1656,27 @@ class Agent:
     # ── Streamer 回调 ────────────────────────────────────────
 
     async def _on_delta(self, event: dict) -> None:
-        """SSE delta 回调 — 转发给流事件回调 + 定期落库。"""
+        """SSE delta 回调 — 转发给流事件回调 + 实时落库。
+
+        每次 text_delta 都立即写入 DB streaming placeholder，确保：
+        1. 前端长时间看不到新消息时（agent 多轮工具调用，
+           placeholder 一直空），不会误判为 [对话被中断]
+        2. 后端崩溃/重启时，部分输出已持久化
+        """
         self._broadcast_stream_event(event)
-        # Persist partial content to the streaming placeholder every N chunks.
-        # This way if the backend restarts or agent crashes, the partial output
-        # survives in the DB — not just ephemeral WebSocket events.
         if event.get("type") == "text_delta" and self._streaming_msg_id:
             acc = getattr(self, "_streaming_text_acc", "")
             acc += event.get("content", "")
             self._streaming_text_acc = acc
-            counter = getattr(self, "_streaming_save_counter", 0) + 1
-            self._streaming_save_counter = counter
-            if counter % 5 == 0:  # Save every 5 text chunks
-                try:
-                    await self._chat_msg.update_message(
-                        self.id, self._streaming_msg_id,
-                        {"content": acc},
-                    )
-                except Exception:
-                    pass  # Best-effort — don't crash on DB write fail
+            # Save every chunk (not batch) — long tool-call sequences
+            # produce few text deltas, and DB writes are cheap.
+            try:
+                await self._chat_msg.update_message(
+                    self.id, self._streaming_msg_id,
+                    {"content": acc},
+                )
+            except Exception:
+                pass  # Best-effort
 
     async def _on_tool_call(
         self, tool_name: str, arguments: str, tool_call_id: str

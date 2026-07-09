@@ -17,6 +17,7 @@ Inspired by OpenCode's Protocol/Endpoint/Auth/Framing separation
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any
@@ -48,7 +49,7 @@ def _api_format_to_provider_type(fmt: ApiFormat) -> ProviderType:
 
 # ── Timeout constants (contract 01) ────────────────────────────
 CONNECT_TIMEOUT_S = 10.0
-READ_TIMEOUT_S = 120.0
+READ_TIMEOUT_S = 95.0   # <= FIRST_CHUNK_TIMEOUT_S (90s) + buffer; lets httpx native timeout fire first
 TOTAL_TIMEOUT_S = 300.0
 WRITE_TIMEOUT_S = 10.0
 POOL_TIMEOUT_S = 10.0

@@ -152,8 +152,8 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
         "instructions": (
             "# Deployment Skill\n\n"
             "When managing deployments:\n"
-            "1. Use infrastructure-as-code — Dockerfile, docker-compose, IaC.\n"
-            "2. Separate build and run stages in Dockerfiles.\n"
+            "1. Use infrastructure-as-code where appropriate.\n"
+            "2. Separate build and run stages.\n"
             "3. Use environment variables for configuration — never hardcode.\n"
             "4. Run tests in CI before deploying.\n"
             "5. Use blue-green or canary deployments for zero-downtime.\n"
@@ -585,7 +585,8 @@ class SkillRegistryService:
 
         if not builtin and not clawhub_skills:
             return (
-                f'Available Skills{f" (search: \"{search}\")" if search else ""}:\n\n'
+                f'Available Skills'
+                f'{f" (search: {chr(34)}{search}{chr(34)})" if search else ""}:\n\n'
                 "No skills found. Try a different search term.\n\n"
                 "To bind a skill, use `bind_skill` with the slug as skillName."
             )
@@ -603,7 +604,8 @@ class SkillRegistryService:
                 desc = s.get("summary") or s.get("description") or "No description"
                 lines.append(f"- **{s.get('slug')}**: {desc}")
 
-        header = f'Available Skills{f" (search: \"{search}\")" if search else ""}:\n\n'
+        q = chr(34)
+        header = f'Available Skills{f" (search: {q}{search}{q})" if search else ""}:\n\n'
         return (
             header
             + "\n".join(lines)

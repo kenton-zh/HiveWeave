@@ -49,13 +49,15 @@ async def execute_question(
     now_ms = int(time.time() * 1000)
 
     # Persist question to per-project DB
+    import json as _json
+    options_json = _json.dumps(options, ensure_ascii=False) if options else None
     try:
         await project_db.execute(
             agent_id,
             """INSERT INTO questions
-               (id, agent_id, project_id, question, status, created_at)
-               VALUES (?, ?, ?, ?, 'pending', ?)""",
-            [question_id, agent_id, project_id, question, now_ms],
+               (id, agent_id, project_id, question, options, status, created_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+            [question_id, agent_id, project_id, question, options_json, now_ms],
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("question.persist_failed", error=str(exc))

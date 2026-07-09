@@ -82,7 +82,7 @@ async def list_templates(
 async def list_divisions() -> dict:
     """列出所有部门（去重排序）。"""
     templates = await _template.list_all()
-    divisions = sorted({t.get("division") for t in templates if t.get("division")})
+    divisions = sorted({d for t in templates if (d := t.get("division"))})
     return {"divisions": divisions}
 
 

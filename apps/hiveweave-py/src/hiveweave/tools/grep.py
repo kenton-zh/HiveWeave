@@ -218,8 +218,8 @@ def _scan_python(
             for line_idx, line in enumerate(text.split("\n"), start=1):
                 if len(matches) >= head_limit:
                     return matches
-                m = regex.search(line)
-                if m:
+                match = regex.search(line)
+                if match:
                     content = line[:MAX_CHARS_PER_LINE]
                     rel = str(fp).replace(root_str + os_sep(), "").replace("\\", "/")
                     matches.append({"file": rel, "line": line_idx,

@@ -19,6 +19,16 @@ Shutdown sequence:
 4. Close Meta DB
 """
 
+import sys
+
+# Force UTF-8 for stdout/stderr on Windows — prevents GBK encoding crashes
+# when logging Unicode characters (emoji, CJK names) via structlog.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass  # Best-effort; may fail on redirected pipes
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request

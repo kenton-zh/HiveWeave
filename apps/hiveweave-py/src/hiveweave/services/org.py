@@ -154,7 +154,7 @@ class OrgService:
                 "ORDER BY created_at ASC",
                 [project_id],
             )
-        return [self._row(r) for r in rows]
+        return [d for r in rows if (d := self._row(r)) is not None]
 
     async def resolve_agent(self, agent_id_or_short_id: str) -> dict | None:
         """Resolve by short_id (A007), full UUID, or UUID prefix.
@@ -286,7 +286,7 @@ class OrgService:
             "SELECT * FROM agents WHERE parent_id = ? AND status != 'archived'",
             [agent_id],
         )
-        return [self._row(r) for r in rows]
+        return [d for r in rows if (d := self._row(r)) is not None]
 
     async def get_superior(self, agent_id: str) -> dict | None:
         """Get the parent (superior) of an agent, or None if root."""

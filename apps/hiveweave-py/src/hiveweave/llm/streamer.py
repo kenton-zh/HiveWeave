@@ -697,7 +697,7 @@ class Streamer:
                         "rounds": round_num + 1,
                         "usage": last_usage,
                         "error": f"Doom loop detected: tool '{doom}' called "
-                                 f"{DOOM_LOOP_THRESHOLD}+ times with same args",
+                                 f"{DOOM_LOOP_DEFAULT_LIMIT}+ times with same args",
                     }
 
                 # 构建 assistant 消息（含 tool_calls）
@@ -977,10 +977,14 @@ class Streamer:
     ) -> dict:
         """执行实际的流式 HTTP 请求，解析 SSE chunks。
 
-        实现:
-        - httpx.AsyncClient.stream() 流式读取
-        - 首 chunk 超时（FIRST_CHUNK_TIMEOUT_S）+ idle 超时（IDLE_TIMEOUT_S）
-        - 逐 chunk 解析 SSE，广播 delta，累积 text/thinking/tool_calls
+        双超时机制（参考 OpenCode AbortController 模式）：
+        1. httpx 原生 read timeout (95s) — socket 级，主防线
+        2. Watchdog 任务 — FIRST_CHUNK_TIMEOUT_S 后调用 client.aclose()
+           强制关闭 TCP 连接，类似 AbortController.abort()
+
+        Windows 上 asyncio.wait_for 的 CancelledError 可能无法中断
+        httpx 的底层 socket read，因此必须用 client.aclose() 关闭
+        连接来强制解除阻塞。
         """
         client = provider.build_client()
         text_acc = ""
@@ -990,11 +994,33 @@ class Streamer:
         usage: dict | None = None
         first_chunk_received = False
 
+        # Watchdog: 参考 OpenCode FetchHttpClient + AbortController 模式。
+        # AbortController.abort() → 关闭 TCP 连接 → 等价于 client.aclose()。
+        # 不用 asyncio.wait_for 取消 __anext__()——Windows 上 CancelledError
+        # 无法中断 httpx 的 socket read。
+        _watchdog_triggered = False
+
+        async def _watchdog(delay: float) -> None:
+            nonlocal _watchdog_triggered
+            await asyncio.sleep(delay)
+            _watchdog_triggered = True
+            log.warning("stream_watchdog_fired",
+                        agent_id=agent_id, round=round_num, delay=delay)
+            await client.aclose()
+
+        _watchdog_task = asyncio.create_task(
+            _watchdog(FIRST_CHUNK_TIMEOUT_S)
+        )
+
         try:
             async with client.stream(
                 "POST", url, headers=headers,
                 content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             ) as response:
+                # 首 chunk 成功到达 → 取消首 chunk watchdog，
+                # 后续 idle 由 httpx read timeout (95s) 保证
+                _watchdog_task.cancel()
+
                 # 检查 HTTP 状态码
                 if response.status_code != 200:
                     error_body = await self._read_error_body(response)
@@ -1010,8 +1036,12 @@ class Streamer:
                         status=response.status_code,
                     )
 
-                # 流式读取 SSE（带首 chunk + idle 超时）
+                # 流式读取 SSE（httpx read timeout 为主防线）
                 async for event in self._iter_sse_with_timeout(response):
+                    if _watchdog_triggered:
+                        raise RetryableError(
+                            f"Stream cancelled by watchdog ({FIRST_CHUNK_TIMEOUT_S}s)"
+                        )
                     if not isinstance(event, dict):
                         continue
                     first_chunk_received = True
@@ -1105,12 +1135,18 @@ class Streamer:
             raise
         except httpx.ReadTimeout:
             raise RetryableError(
-                f"Stream read timeout (idle={IDLE_TIMEOUT_S}s)",
+                f"Stream read timeout (httpx read={provider.build_client().timeout.read}s)",
             )
         except httpx.ConnectError as e:
             raise RetryableError(f"Connection error: {e}")
         except httpx.RemoteProtocolError as e:
             raise RetryableError(f"Protocol error: {e}")
+        except asyncio.CancelledError:
+            # Watchdog client.aclose() can trigger task cancellation.
+            # Convert to RetryableError so retry handler can retry.
+            raise RetryableError(
+                f"Stream cancelled (watchdog={FIRST_CHUNK_TIMEOUT_S}s)"
+            )
         except asyncio.TimeoutError:
             if not first_chunk_received:
                 raise RetryableError(
@@ -1120,7 +1156,12 @@ class Streamer:
                 f"Stream idle timeout ({IDLE_TIMEOUT_S}s)",
             )
         finally:
-            await client.aclose()
+            # Cancel watchdog if still running
+            _watchdog_task.cancel()
+            try:
+                await client.aclose()
+            except Exception:
+                pass  # client may already be closed by watchdog
 
     # ── SSE 迭代器（带首 chunk + idle 超时）──────────────────
 
@@ -1130,11 +1171,12 @@ class Streamer:
     ) -> AsyncIterator[dict]:
         """带超时的 SSE 事件迭代器。
 
-        - 首 chunk: FIRST_CHUNK_TIMEOUT_S（90s，容忍 thinking 模型）
-        - 后续 chunk: IDLE_TIMEOUT_S（60s）
+        双超时机制：
+        1. httpx 原生 read timeout (95s) — socket 级，Windows 可靠
+        2. time.monotonic() 跟踪 — 应用级，在收到数据后检查 deadline
 
-        用 asyncio.wait_for 包裹 aiter_bytes 的每次迭代。
-        超时抛 asyncio.TimeoutError → 由调用方归类为 RetryableError。
+        不再依赖 asyncio.wait_for 取消 __anext__() —— Windows 上 CancelledError
+        可能无法中断 httpx 的底层 socket read。
 
         BUG-009/012/013 修复：用增量 UTF-8 解码器（codecs.getincrementaldecoder）
         替代逐 chunk `raw.decode("utf-8", errors="replace")`。后者会在多字节字符
@@ -1143,19 +1185,32 @@ class Streamer:
         """
         buffer = ""
         first_received = False
-        aiter = response.aiter_bytes().__aiter__()
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        start_time = time.monotonic()
+        last_event_time = start_time
 
-        while True:
-            timeout = FIRST_CHUNK_TIMEOUT_S if not first_received else IDLE_TIMEOUT_S
-            try:
-                raw = await asyncio.wait_for(aiter.__anext__(), timeout=timeout)
-                first_received = True
-            except StopAsyncIteration:
-                break
+        async for raw in response.aiter_bytes():
+            now = time.monotonic()
+
+            # Per-chunk deadline check (belt, httpx read timeout is suspenders)
+            if not first_received:
+                if now - start_time > FIRST_CHUNK_TIMEOUT_S:
+                    raise asyncio.TimeoutError(
+                        f"First chunk timeout ({FIRST_CHUNK_TIMEOUT_S}s)"
+                    )
+            else:
+                if now - last_event_time > IDLE_TIMEOUT_S:
+                    raise asyncio.TimeoutError(
+                        f"Stream idle timeout ({IDLE_TIMEOUT_S}s)"
+                    )
+
+            last_event_time = now
 
             if not raw:
                 continue
+
+            if not first_received:
+                first_received = True
 
             text = decoder.decode(raw)
             if not text:
@@ -1208,7 +1263,7 @@ class Streamer:
         tool_results: list[dict] = []
         for i, result in enumerate(results):
             tc = tool_calls[i]
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 log.error("tool_execution_error",
                           agent_id=agent_id,
                           tool=tc["name"],

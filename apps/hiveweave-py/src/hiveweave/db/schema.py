@@ -256,12 +256,14 @@ PROJECT_DB_TABLES = [
         agent_id TEXT NOT NULL,
         project_id TEXT,
         question TEXT NOT NULL,
+        options TEXT,
         answer TEXT,
         status TEXT DEFAULT 'pending',
         created_at INTEGER,
         answered_at INTEGER
     )
     """,
+    """ALTER TABLE questions ADD COLUMN options TEXT""",
     """
     CREATE TABLE IF NOT EXISTS todos (
         id TEXT PRIMARY KEY,

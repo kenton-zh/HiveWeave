@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from hiveweave.services.dispatch import DispatchService
+
 from hiveweave.services.handoff import HandoffService
 from hiveweave.services.inbox import InboxService
 from hiveweave.services.org import OrgService
@@ -47,8 +47,6 @@ SELF_RETRIGGER_DELAY_MS = 500
 _org_service = OrgService()
 _inbox_service = InboxService()
 _handoff_service = HandoffService()
-_dispatch_service = DispatchService()
-
 # Dedup: track last goals version shown to each agent via chat_message.
 # Prevents back-to-back triggers from saving the same Goals Workbook block twice.
 _last_goals_msg_version: dict[str, int] = {}
@@ -467,32 +465,9 @@ async def build_trigger_context(
             cur_ver = _cs.get_goals_version(project_id)
             await _cs.set_agent_goals_version(agent_id, cur_ver)
 
-    # ── 4 & 5. Coordinator 专属 blocks ──
+    # ── 4. Coordinator 专属 blocks ──
     if trigger_type == "coordinator":
-        children = await _org_service.get_subordinates(agent_id)
-
-        # 4. Subordinate Logs
-        child_log_lines: list[str] = []
-        for child in children:
-            child_id = child["id"]
-            child_name = child.get("name") or child_id
-            logs = await _dispatch_service.get_subordinate_logs(
-                project_id, child_id, limit=5
-            )
-            for l in logs:
-                log_type = l.get("type", "unknown")
-                summary = l.get("summary", "")
-                child_log_lines.append(
-                    f"  [{child_name}] [{log_type}] {summary}"
-                )
-
-        if child_log_lines:
-            blocks.append(
-                f"## Subordinate Work Logs (terse format)\n"
-                f"{chr(10).join(child_log_lines)}"
-            )
-
-        # 5. Report Required
+        # 4. Report Required
         if unreported:
             blocks.append(
                 f"## IMPORTANT — Report Required\n"
