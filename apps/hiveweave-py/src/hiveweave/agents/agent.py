@@ -784,6 +784,20 @@ class Agent:
                     log.warning("cancel_mark_inbox_read_failed",
                                 agent_id=self.id, error=str(e))
                 self.pending_inbox_msg_ids = None
+            # A6(2) 修复：cancel 时清理 streaming 标志，防止僵尸消息
+            # 对齐错误路径和安全超时路径，它们都调用了此清理
+            try:
+                if self._streaming_msg_id:
+                    await self._chat_msg.update_message(
+                        self.id, self._streaming_msg_id,
+                        {"content": "[对话被中断]", "is_streaming": False},
+                    )
+                    self._streaming_msg_id = None
+                # 兜底：清理该 agent 的所有僵尸 streaming 消息
+                await self._chat_msg.update_streaming_messages_done(self.id)
+            except Exception as e:
+                log.warning("cancel_clear_streaming_failed",
+                            agent_id=self.id, error=str(e))
             self._reset_to_idle()
 
     async def trigger(self, trigger_type: str = "subordinate") -> dict:
