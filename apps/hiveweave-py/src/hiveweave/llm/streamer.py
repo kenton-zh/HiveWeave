@@ -962,7 +962,7 @@ class Streamer:
                 "error": str(e),
             }
 
-    # ── 实际流式 HTTP 请求 ──────────────────────────────────
+    # ── 实际流式 HTTP 请求（线程池 + 同步 httpx）────────────────
 
     async def _do_streaming_request(
         self,
@@ -975,193 +975,129 @@ class Streamer:
         delta_id: str,
         round_num: int,
     ) -> dict:
-        """执行实际的流式 HTTP 请求，解析 SSE chunks。
+        """执行 HTTP 流式请求（同步 httpx 跑在线程池里）。
 
-        双超时机制（参考 OpenCode AbortController 模式）：
-        1. httpx 原生 read timeout (95s) — socket 级，主防线
-        2. Watchdog 任务 — FIRST_CHUNK_TIMEOUT_S 后调用 client.aclose()
-           强制关闭 TCP 连接，类似 AbortController.abort()
-
-        Windows 上 asyncio.wait_for 的 CancelledError 可能无法中断
-        httpx 的底层 socket read，因此必须用 client.aclose() 关闭
-        连接来强制解除阻塞。
+        Windows 上 asyncio CancelledError 无法中断 httpx 的 socket read，
+        因此改用同步 httpx.Client + run_in_executor。同步版的超时走
+        socket.settimeout()（OS 级），线程阻塞后能正常返回而非永远挂起。
         """
-        client = provider.build_client()
+        body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        read_to = httpx.Timeout(read=READ_TIMEOUT_S, connect=10, write=10, pool=10)
+
+        def _run_sync() -> dict:
+            """在线程中执行：HTTP 请求 + SSE 解析。"""
+            http_client = httpx.Client(timeout=read_to)
+            events: list[dict] = []
+            try:
+                with http_client.stream(
+                    "POST", url, headers=headers, content=body_bytes,
+                ) as response:
+                    if response.status_code != 200:
+                        body_text = response.read().decode("utf-8", errors="replace")[:500]
+                        return {"ok": False, "http_status": response.status_code,
+                                "body": body_text, "headers": dict(response.headers)}
+                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                    buffer = ""
+                    for raw in response.iter_bytes():
+                        text = decoder.decode(raw)
+                        if text:
+                            buffer += text
+                            parsed, buffer = parse_sse(buffer)
+                            events.extend(parsed)
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        buffer += tail
+                        parsed, _ = parse_sse(buffer)
+                        events.extend(parsed)
+                return {"ok": True, "events": events}
+            except httpx.ReadTimeout:
+                return {"ok": False, "timeout": True}
+            except httpx.ConnectError as e:
+                return {"ok": False, "connect_error": str(e)}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            finally:
+                http_client.close()
+
+        loop = asyncio.get_running_loop()
+        deadline = FIRST_CHUNK_TIMEOUT_S + READ_TIMEOUT_S + 10
+
+        try:
+            raw = await asyncio.wait_for(
+                loop.run_in_executor(None, _run_sync), timeout=deadline)
+        except asyncio.TimeoutError:
+            raise RetryableError(f"HTTP request timed out after {deadline}s")
+
+        if not raw.get("ok"):
+            if raw.get("timeout"):
+                raise RetryableError(f"HTTP read timeout ({READ_TIMEOUT_S}s)")
+            if raw.get("connect_error"):
+                raise RetryableError(f"Connection error: {raw['connect_error']}")
+            if raw.get("http_status"):
+                if is_retryable_status(raw["http_status"]):
+                    raise RetryableError(
+                        f"HTTP {raw['http_status']}: {raw['body'][:500]}",
+                        status=raw["http_status"], headers=raw.get("headers", {}))
+                raise PermanentError(
+                    f"HTTP {raw['http_status']}: {raw['body'][:500]}",
+                    status=raw["http_status"])
+            raise RetryableError(raw.get("error", "Unknown HTTP error"))
+
+        # Process parsed SSE events in the async context
         text_acc = ""
         thinking_acc = ""
         tool_call_deltas: list[dict] = []
         finish_reason: str | None = None
         usage: dict | None = None
-        first_chunk_received = False
 
-        # Watchdog: 参考 OpenCode FetchHttpClient + AbortController 模式。
-        # AbortController.abort() → 关闭 TCP 连接 → 等价于 client.aclose()。
-        # 不用 asyncio.wait_for 取消 __anext__()——Windows 上 CancelledError
-        # 无法中断 httpx 的 socket read。
-        _watchdog_triggered = False
+        for event in raw["events"]:
+            if not isinstance(event, dict):
+                continue
+            if "usage" in event and event["usage"]:
+                u = event["usage"]
+                usage = {"input": u.get("prompt_tokens", 0),
+                         "output": u.get("completion_tokens", 0),
+                         "total": u.get("prompt_tokens", 0) + u.get("completion_tokens", 0)}
+            for c in provider.parse_stream_chunk(event):
+                ctype = c.get("type")
+                if ctype == "text":
+                    pass
+                elif ctype == "reasoning":
+                    content = c["content"]
+                    await self._fire_delta(on_delta, {
+                        "type": "thinking_delta", "content": content, "delta_id": delta_id})
+                    thinking_acc += content
+                elif ctype == "tool_call_delta":
+                    tool_call_deltas.append(c["tool_call"])
+                elif ctype == "tool_call_start":
+                    tc = c.get("tool_call", {})
+                    if tc:
+                        tool_call_deltas.append(tc)
+                elif ctype == "tool_call_end":
+                    pass
+                elif ctype == "thinking_start":
+                    pass
+                elif ctype == "thinking_signature":
+                    content = c.get("content", "")
+                    if content:
+                        thinking_acc += f"[sig:{content}]"
+                elif ctype == "usage":
+                    u = c.get("usage", {})
+                    if u:
+                        usage = usage or {}
+                        usage.update(u)
+                elif ctype == "message_stop":
+                    pass
+                elif ctype == "finish":
+                    finish_reason = c["reason"]
+                elif ctype == "error":
+                    log.warning("sse_error_chunk", agent_id=agent_id, error=c.get("content"))
 
-        async def _watchdog(delay: float) -> None:
-            nonlocal _watchdog_triggered
-            await asyncio.sleep(delay)
-            _watchdog_triggered = True
-            log.warning("stream_watchdog_fired",
-                        agent_id=agent_id, round=round_num, delay=delay)
-            await client.aclose()
-
-        _watchdog_task = asyncio.create_task(
-            _watchdog(FIRST_CHUNK_TIMEOUT_S)
-        )
-
-        try:
-            async with client.stream(
-                "POST", url, headers=headers,
-                content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            ) as response:
-                # 首 chunk 成功到达 → 取消首 chunk watchdog，
-                # 后续 idle 由 httpx read timeout (95s) 保证
-                _watchdog_task.cancel()
-
-                # 检查 HTTP 状态码
-                if response.status_code != 200:
-                    error_body = await self._read_error_body(response)
-                    resp_headers = dict(response.headers)
-                    if is_retryable_status(response.status_code):
-                        raise RetryableError(
-                            f"HTTP {response.status_code}: {error_body[:500]}",
-                            status=response.status_code,
-                            headers=resp_headers,
-                        )
-                    raise PermanentError(
-                        f"HTTP {response.status_code}: {error_body[:500]}",
-                        status=response.status_code,
-                    )
-
-                # 流式读取 SSE（httpx read timeout 为主防线）
-                async for event in self._iter_sse_with_timeout(response):
-                    if _watchdog_triggered:
-                        raise RetryableError(
-                            f"Stream cancelled by watchdog ({FIRST_CHUNK_TIMEOUT_S}s)"
-                        )
-                    if not isinstance(event, dict):
-                        continue
-                    first_chunk_received = True
-
-                    # 提取 usage（最后一个 chunk 携带）
-                    if "usage" in event and event["usage"]:
-                        u = event["usage"]
-                        usage = {
-                            "input": u.get("prompt_tokens", 0),
-                            "output": u.get("completion_tokens", 0),
-                            "total": u.get(
-                                "total_tokens",
-                                u.get("prompt_tokens", 0)
-                                + u.get("completion_tokens", 0),
-                            ),
-                        }
-
-                    # 解析 chunks — delegate to format handler
-                    for c in provider.parse_stream_chunk(event):
-                        ctype = c.get("type")
-                        if ctype == "text":
-                            content = c["content"]
-                            if content:
-                                await self._fire_delta(on_delta, {
-                                    "type": "text_delta",
-                                    "content": content,
-                                    "delta_id": delta_id,
-                                })
-                                text_acc += content
-                        elif ctype == "reasoning":
-                            content = c["content"]
-                            await self._fire_delta(on_delta, {
-                                "type": "thinking_delta",
-                                "content": content,
-                                "delta_id": delta_id,
-                            })
-                            thinking_acc += content
-                        elif ctype == "tool_call_delta":
-                            tool_call_deltas.append(c["tool_call"])
-                        elif ctype == "tool_call_start":
-                            # Anthropic: content_block_start with tool_use type
-                            tc = c.get("tool_call", {})
-                            if tc:
-                                tool_call_deltas.append(tc)
-                        elif ctype == "tool_call_end":
-                            # Anthropic: content_block_stop — no action needed
-                            pass
-                        elif ctype == "thinking_start":
-                            # Anthropic: content_block_start with thinking type
-                            pass
-                        elif ctype == "thinking_signature":
-                            # Anthropic: signature_delta — store in thinking
-                            content = c.get("content", "")
-                            if content:
-                                thinking_acc += f"[sig:{content}]"
-                        elif ctype == "usage":
-                            # Provider-specific usage info
-                            u = c.get("usage", {})
-                            if u:
-                                usage = usage or {}
-                                usage.update(u)
-                        elif ctype == "message_stop":
-                            # Anthropic: message_stop — stream end indicator
-                            pass
-                        elif ctype == "finish":
-                            finish_reason = c["reason"]
-                        elif ctype == "error":
-                            log.warning("sse_error_chunk",
-                                        agent_id=agent_id,
-                                        error=c.get("content"))
-
-            # 合并 tool_calls
-            tool_calls = merge_tool_calls([], tool_call_deltas)
-
-            log.info("round_http_done",
-                     agent_id=agent_id, round=round_num,
-                     text_len=len(text_acc),
-                     tool_count=len(tool_calls),
-                     finish=finish_reason)
-
-            return {
-                "status": "ok",
-                "text": text_acc,
-                "thinking": thinking_acc,
-                "tool_calls": tool_calls,
-                "finish_reason": finish_reason,
-                "usage": usage,
-            }
-
-        except (RetryableError, PermanentError):
-            raise
-        except httpx.ReadTimeout:
-            raise RetryableError(
-                f"Stream read timeout (httpx read={provider.build_client().timeout.read}s)",
-            )
-        except httpx.ConnectError as e:
-            raise RetryableError(f"Connection error: {e}")
-        except httpx.RemoteProtocolError as e:
-            raise RetryableError(f"Protocol error: {e}")
-        except asyncio.CancelledError:
-            # Watchdog client.aclose() can trigger task cancellation.
-            # Convert to RetryableError so retry handler can retry.
-            raise RetryableError(
-                f"Stream cancelled (watchdog={FIRST_CHUNK_TIMEOUT_S}s)"
-            )
-        except asyncio.TimeoutError:
-            if not first_chunk_received:
-                raise RetryableError(
-                    f"First chunk timeout ({FIRST_CHUNK_TIMEOUT_S}s)",
-                )
-            raise RetryableError(
-                f"Stream idle timeout ({IDLE_TIMEOUT_S}s)",
-            )
-        finally:
-            # Cancel watchdog if still running
-            _watchdog_task.cancel()
-            try:
-                await client.aclose()
-            except Exception:
-                pass  # client may already be closed by watchdog
+        tool_calls = merge_tool_calls([], tool_call_deltas)
+        log.info("round_http_done", agent_id=agent_id, round=round_num,
+                 text_len=len(text_acc), tool_count=len(tool_calls), finish=finish_reason)
+        return {"status": "ok", "text": text_acc, "thinking": thinking_acc,
+                "tool_calls": tool_calls, "finish_reason": finish_reason, "usage": usage}
 
     # ── SSE 迭代器（带首 chunk + idle 超时）──────────────────
 
