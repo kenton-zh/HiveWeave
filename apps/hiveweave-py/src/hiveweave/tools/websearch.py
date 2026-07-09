@@ -209,6 +209,8 @@ async def _search_keyless(
     async with httpx.AsyncClient(
         timeout=timeout, proxy=proxy_url
     ) as client:
+        errors: list[str] = []
+
         # 1. Brave
         try:
             r = await _brave_search(client, query, limit)
@@ -216,6 +218,7 @@ async def _search_keyless(
                 return r
         except Exception as exc:  # noqa: BLE001
             log.debug("websearch.brave_failed", error=str(exc))
+            errors.append(f"Brave: {type(exc).__name__}: {exc}")
 
         # 2. DuckDuckGo
         try:
@@ -224,13 +227,20 @@ async def _search_keyless(
                 return r
         except Exception as exc:  # noqa: BLE001
             log.debug("websearch.duckduckgo_failed", error=str(exc))
+            errors.append(f"DuckDuckGo: {type(exc).__name__}: {exc}")
 
         # 3. Bing (works in China without proxy)
         try:
             return await _bing_search(client, query, limit)
         except Exception as exc:  # noqa: BLE001
             log.warning("websearch.all_backends_failed", error=str(exc))
-            return []
+            errors.append(f"Bing: {type(exc).__name__}: {exc}")
+
+        # 所有后端全挂 → 显式失败，不要伪装成"无结果"
+        # 否则 LLM 会误以为查询太冷门而反复换词搜索
+        raise RuntimeError(
+            f"All search backends failed: {'; '.join(errors)}"
+        )
 
 
 def _format_results(results: list[SearchResult]) -> str:

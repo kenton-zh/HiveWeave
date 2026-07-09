@@ -209,7 +209,7 @@ async def read_file(
             content = p.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return {"success": False, "output": "",
-                "error": f"Error: {exc}"}
+                "error": f"Error: {type(exc).__name__}: {exc}"}
 
     # Split keeping line semantics
     lines = content.split("\n")
@@ -274,7 +274,7 @@ async def write_file(
         p.write_text(normalized, encoding="utf-8", newline="")
     except OSError as exc:
         return {"success": False, "output": "",
-                "error": f"Error: {exc}"}
+                "error": f"Error: {type(exc).__name__}: {exc}"}
 
     size = len(content.encode("utf-8"))
     log.info("file.write", path=file_path, bytes=size)

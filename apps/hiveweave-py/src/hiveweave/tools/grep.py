@@ -274,9 +274,13 @@ async def execute_grep(
     )
     if rg_matches is not None:
         # 过滤敏感文件路径的匹配（C6）— 不暴露 .env / *.pem / credentials 等内容
+        total_before = len(rg_matches)
         rg_matches = [m for m in rg_matches if not is_sensitive_path(m["file"])]
-        return {"success": True, "output": _format_results(rg_matches),
-                "error": None}
+        hidden = total_before - len(rg_matches)
+        out = _format_results(rg_matches)
+        if hidden > 0:
+            out += f"\n\n({hidden} results hidden by security policy — sensitive file patterns)"
+        return {"success": True, "output": out, "error": None}
 
     # 2. Fallback to Python scan
     try:
@@ -285,11 +289,16 @@ async def execute_grep(
         )
     except ValueError as exc:
         return {"success": False, "output": "",
-                "error": f"Error: {exc}"}
+                "error": f"Error: {type(exc).__name__}: {exc}"}
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "output": "",
-                "error": f"Error: {exc}"}
+                "error": f"Error: {type(exc).__name__}: {exc}"}
 
     # 过滤敏感文件路径的匹配（C6）
+    total_before = len(matches)
     matches = [m for m in matches if not is_sensitive_path(m["file"])]
-    return {"success": True, "output": _format_results(matches), "error": None}
+    hidden = total_before - len(matches)
+    out = _format_results(matches)
+    if hidden > 0:
+        out += f"\n\n({hidden} results hidden by security policy — sensitive file patterns)"
+    return {"success": True, "output": out, "error": None}

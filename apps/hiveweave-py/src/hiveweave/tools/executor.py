@@ -793,7 +793,7 @@ class ToolExecutor:
             )
         except Exception as exc:  # noqa: BLE001
             log.error("tool.dispatch_failed", tool=name, error=str(exc))
-            return self._error(f"Error: {exc}")
+            return self._error(f"Error: {type(exc).__name__}: {exc}")
 
         # 4. Normalize result shape — R7: 统一工具返回契约
         # 所有工具必须返回 {success, output, error} 三字段。此处作为单一保障点，

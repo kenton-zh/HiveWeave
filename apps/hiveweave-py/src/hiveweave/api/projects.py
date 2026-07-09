@@ -358,13 +358,32 @@ async def create_project(body: ProjectCreate) -> dict:
 
     # 清除可能的旧驱逐标记 — 同路径重建项目时恢复 DB 访问
     project_db.clear_evicted_workspace(str(ws))
-    # 确保工作空间存在
-    try:
-        ws.mkdir(parents=True, exist_ok=True)
-        (ws / ".hiveweave").mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        log.error("ensure_workspace_failed", workspace=workspace, error=str(e))
-        raise HTTPException(status_code=400, detail=f"Invalid workspace path: {e}")
+    # 确保工作空间存在（带重试，处理 Windows 文件锁 / 实时扫描瞬时拦截）
+    # 之前无重试，遇到瞬时 WinError 5（如刚浏览过该目录、Defender 扫描）
+    # 会直接 400 失败，用户无法创建项目。
+    _mkdir_err = ""
+    for attempt in range(3):
+        try:
+            ws.mkdir(parents=True, exist_ok=True)
+            (ws / ".hiveweave").mkdir(parents=True, exist_ok=True)
+            break
+        except Exception as e:
+            _mkdir_err = str(e)
+            if attempt < 2:
+                await asyncio.sleep(0.5)
+            else:
+                log.error(
+                    "ensure_workspace_failed",
+                    workspace=workspace,
+                    error=_mkdir_err,
+                    attempts=3,
+                    parent_exists=ws.exists(),
+                    parent_writable=os.access(str(ws), os.W_OK),
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"无法创建工作空间目录（可能被其他进程锁定或权限不足）: {e}",
+                )
 
     # 初始化 per-project DB（建表）
     try:
