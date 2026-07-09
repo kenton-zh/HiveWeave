@@ -132,6 +132,71 @@ export HTTP_PROXY=http://192.168.110.26:7890
 export HTTPS_PROXY=http://192.168.110.26:7890
 ```
 
+## Agent Diagnosis
+
+### 查看 Agent 状态
+```bash
+# Meta DB（全局）— agent 列表、状态、模型
+cd D:\PC_AI\Project\HiveWeave
+uv run python -c "
+import sqlite3
+conn = sqlite3.connect('apps/hiveweave-py/data/hiveweave.db')
+conn.row_factory = sqlite3.Row
+for a in conn.execute('SELECT id, name, role, status, project_id, model_id FROM agents WHERE status!=\"archived\"').fetchall():
+    print(f'[{a[\"status\"]}] {a[\"name\"]} ({a[\"role\"]}) model={a[\"model_id\"]}')
+conn.close()
+"
+```
+
+### 查看 Agent 对话和收件箱
+```bash
+# Per-project DB — chat_messages + inbox
+uv run python -c "
+import sqlite3, os
+# 先查 Meta DB 找 workspace_path
+mconn = sqlite3.connect('apps/hiveweave-py/data/hiveweave.db')
+ws = mconn.execute('SELECT workspace_path FROM projects WHERE name=\"TEST\"').fetchone()
+mconn.close()
+pdb = os.path.join(os.path.expandvars(ws[0]), '.hiveweave', 'data.db')
+conn = sqlite3.connect(pdb)
+conn.row_factory = sqlite3.Row
+
+# 最近对话
+for m in conn.execute('SELECT role, is_background, substr(content,1,200) as c FROM chat_messages ORDER BY created_at DESC LIMIT 15').fetchall():
+    print(f'[{m[\"role\"]} bg={m[\"is_background\"]}] {m[\"c\"][:120]}')
+
+# 未读收件箱
+for i in conn.execute('SELECT from_agent_id, to_agent_id, read, substr(message,1,150) as m FROM inbox ORDER BY created_at DESC LIMIT 10').fetchall():
+    print(f'from={i[\"from_agent_id\"][:12]} to={i[\"to_agent_id\"][:12]} read={i[\"read\"]}: {i[\"m\"][:80]}')
+
+# 工作日志
+for l in conn.execute('SELECT agent_id, type, substr(summary,1,150) as s FROM work_logs ORDER BY created_at DESC LIMIT 10').fetchall():
+    print(f'[{l[\"type\"]}] {l[\"s\"]}')
+conn.close()
+"
+```
+
+### 查看后端日志
+```bash
+# 日志文件: tasks/ 目录下最新的 .output 文件
+# 搜索错误/超时
+grep -E "error|timeout|watchdog|completion_save_failed" tasks/<最新>.output
+
+# 跟踪最近 activity
+tail -30 tasks/<最新>.output
+```
+
+### 清除僵尸消息
+```bash
+uv run python -c "
+import sqlite3, os
+pdb = os.path.join(os.path.expandvars('D:\\\\PC_AI\\\\Project\\\\TEST'), '.hiveweave', 'data.db')
+conn = sqlite3.connect(pdb)
+c = conn.execute(\"UPDATE chat_messages SET is_streaming=0, content='[对话被中断]' WHERE is_streaming=1\")
+conn.commit(); print(f'Cleared {c.rowcount} zombie(s)'); conn.close()
+"
+```
+
 ## Migration history
 
 本项目从 Elixir/Phoenix + Node.js/Fastify 双后端迁移到 Python/FastAPI 单后端。迁移文档在 `docs/migration/`。
