@@ -243,15 +243,16 @@ async def _seed_default_agents(project_id: str) -> list[str]:
     existing = await org.list_agents(project_id)
     log.info("seed_existing_agents", project_id=project_id, count=len(existing))
 
-    # 获取默认模型 ID — 选最新添加的 active 模型（用户最近加的就是首选）
+    # 获取默认模型 ID — 优先选阶跃星辰(step-)，其次选最新添加的 active 模型
     default_model_id = None
     try:
         from hiveweave.services.model import ModelService
         ms = ModelService()
         active_models = await ms.list_active()
         if active_models:
-            # 最新的 active 模型 = 用户最近的偏好
-            chosen = active_models[-1]
+            # 优先选 step- 前缀（阶跃星辰），没有才回退到最新添加的
+            step_models = [m for m in active_models if (m.get("model_id") or "").lower().startswith("step-")]
+            chosen = step_models[-1] if step_models else active_models[-1]
             default_model_id = chosen.get("model_id") or chosen.get("id")
             log.info("seed_default_model", default_model_id=default_model_id, total_models=len(active_models))
         else:
