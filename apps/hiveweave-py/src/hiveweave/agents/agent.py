@@ -1142,8 +1142,28 @@ class Agent:
         return self.config.get("_context_window", CONTEXT_WINDOW_DEFAULT)
 
     async def _get_workspace_path(self) -> str:
-        """获取项目工作区路径（缓存）。"""
+        """获取工作区路径（缓存）。
+
+        优先使用 agent 专属的 worktree 路径（agents.workspace_path），
+        实现 agent 间工作区隔离。若未分配 worktree（coordinator 角色
+        或旧数据），回退到项目根目录。
+        """
         if self._workspace_path is None:
+            # 1. 先查 agents.workspace_path（executor 应有自己的 worktree）
+            try:
+                from hiveweave.services.org import OrgService
+                org = OrgService()
+                agent_row = await org.get_agent(self.id)
+                if agent_row and agent_row.get("workspace_path"):
+                    ws = agent_row["workspace_path"]
+                    # 校验 worktree 目录确实存在（防止指向已删除的目录）
+                    import os as _os
+                    if _os.path.isdir(ws):
+                        self._workspace_path = ws
+                        return self._workspace_path
+            except Exception:
+                pass  # 回退到项目根
+            # 2. 回退：项目根目录
             ws = await meta_db.get_project_workspace(self.project_id)
             self._workspace_path = ws or ""
         return self._workspace_path
