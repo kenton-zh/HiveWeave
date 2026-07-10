@@ -108,6 +108,9 @@ class GitWorktreeService:
     async def ensure_git_repo(self, workspace_path: str) -> dict:
         """Ensure workspace is a git repo. Auto-init + master→main if needed.
 
+        初始化时自动 commit 现有项目文件到 main 分支，这样 worktree
+        创建时能继承完整代码。.gitignore 排除 node_modules/.hiveweave 等。
+
         Returns ``{success, initialized}`` or ``{success: False, message}``.
         """
         if _has_git(workspace_path):
@@ -128,13 +131,63 @@ class GitWorktreeService:
         await _git(["config", "user.email", "hiveweave@agent.local"], workspace_path)
         await _git(["config", "user.name", "HiveWeave Agent"], workspace_path)
 
-        # Empty root commit so HEAD exists for worktree creation
-        ok, _ = await _git(
-            ["commit", "--allow-empty", "-m", "root: initialized by HiveWeave"],
+        # 创建 .gitignore — 排除不应进入 worktree 的文件
+        # (node_modules 每个 worktree 独立安装; .hiveweave 是系统目录;
+        #  *.db 是数据库; dist/build 是构建产物; .env 是密钥)
+        gitignore_path = Path(workspace_path) / ".gitignore"
+        if not gitignore_path.exists():
+            gitignore_content = """\
+# HiveWeave 系统目录 (worktree 不继承)
+.hiveweave/
+
+# 依赖 (每个 worktree 独立安装)
+node_modules/
+.venv/
+venv/
+
+# 数据库
+*.db
+*.db-shm
+*.db-wal
+
+# 构建产物
+dist/
+build/
+.next/
+.nuxt/
+.turbo/
+
+# 密钥
+.env
+.env.*
+!.env.example
+
+# 缓存
+__pycache__/
+*.pyc
+.cache/
+coverage/
+
+# IDE
+.idea/
+.vscode/
+"""
+            gitignore_path.write_text(gitignore_content, encoding="utf-8")
+
+        # 把现有项目文件 commit 到 main 分支
+        await _git(["add", "-A"], workspace_path)
+        ok, out = await _git(
+            ["commit", "-m", "initial: project files imported by HiveWeave"],
             workspace_path,
         )
         if not ok:
-            return {"success": False, "message": "Failed to create initial commit."}
+            # 没有文件可 commit (空目录) — 用空提交兜底
+            ok, _ = await _git(
+                ["commit", "--allow-empty", "-m", "root: initialized by HiveWeave"],
+                workspace_path,
+            )
+            if not ok:
+                return {"success": False, "message": "Failed to create initial commit."}
 
         log.info("git_worktree.init_repo", workspace=workspace_path)
         return {"success": True, "initialized": True}
