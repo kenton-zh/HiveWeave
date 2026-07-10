@@ -2163,6 +2163,34 @@ class ToolExecutor:
             new_id = new_agent.get("id", "?")
             new_short = new_agent.get("short_id", "?")
 
+            # 为 executor 自动创建隔离 worktree（coordinator 不需要写代码，
+            # 用项目根目录即可）。worktree 路径写入 agents.workspace_path，
+            # Agent._get_workspace_path() 会优先读取此字段重定向工具执行目录。
+            worktree_path = ""
+            if perm_type == "executor":
+                try:
+                    from hiveweave.services.git_worktree import GitWorktreeService
+                    gwt = GitWorktreeService()
+                    project_ws = await meta_db.get_project_workspace(project_id)
+                    if project_ws:
+                        wt_result = await gwt.create(
+                            workspace_path=project_ws,
+                            short_id=new_short,
+                            task_name=role,  # 用角色作为 task slug
+                        )
+                        if wt_result.get("success") and wt_result.get("path"):
+                            worktree_path = wt_result["path"]
+                            await self._org.update_agent(new_id, {
+                                "workspace_path": worktree_path,
+                            })
+                            log.info("tool.hire_agent.worktree_created",
+                                     agent_id=new_id, short_id=new_short,
+                                     worktree=worktree_path)
+                except Exception as wt_err:
+                    log.warning("tool.hire_agent.worktree_failed",
+                                agent_id=new_id, error=str(wt_err))
+                    # worktree 创建失败不阻断招聘 — agent 回退到项目根
+
             # BUG-010 修复：创建后立即启动 agent，让它能处理 inbox 消息。
             # 否则 hire_agent 创建的 executor 只是 DB 一行，无法消费任务。
             try:
@@ -2193,6 +2221,11 @@ class ToolExecutor:
             except Exception as evt_err:
                 log.debug("hire_agent_event_push_failed", error=str(evt_err))
 
+            wt_info = (
+                f"  工作区: {worktree_path}\n"
+                if worktree_path else
+                "  工作区: (共享项目根目录)\n"
+            )
             return {
                 "success": True,
                 "output": (
@@ -2204,6 +2237,7 @@ class ToolExecutor:
                     f"  上级: {parent_id[:8]}...\n"
                     f"  权限: {perm_type}\n"
                     f"  模型: {model_id}\n"
+                    f"{wt_info}"
                     f"  技能: {skills}\n"
                     f"  背景: {backstory[:100] if backstory else '(无)'}"
                 ),

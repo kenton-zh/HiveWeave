@@ -283,6 +283,22 @@ class OrgService:
             log.warning("dismiss_cancel_alarms_failed",
                         agent_id=agent_id, error=str(e))
 
+        # 清理该 agent 的隔离 worktree（executor 才有）
+        try:
+            short_id = updated.get("short_id", "")
+            ws_path = updated.get("workspace_path", "")
+            if short_id and ws_path:
+                from hiveweave.services.git_worktree import GitWorktreeService
+                gwt = GitWorktreeService()
+                project_ws = await meta_db.get_project_workspace(project_id)
+                if project_ws:
+                    await gwt.delete(project_ws, short_id)
+                    log.info("org.dismiss_agent.worktree_cleaned",
+                             agent_id=agent_id, short_id=short_id)
+        except Exception as e:
+            log.warning("dismiss_clean_worktree_failed",
+                        agent_id=agent_id, error=str(e))
+
         log.info("org.dismiss_agent", agent_id=agent_id,
                  project_id=project_id)
         return {"success": True, "agent": updated}
