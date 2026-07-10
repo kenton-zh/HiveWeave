@@ -163,24 +163,25 @@ class ModelService:
 
         契约 18: seed_default_model (E14: Elixir 未实现，Python 必须实现)
         - 表已有记录 → 返回 'already_seeded'
-        - OPENCODE_API_KEY 缺失 → 返回 {'error': 'no_api_key'}
-        - 否则种子 DeepSeek V4 Flash Free 并返回模型 dict
+        - STEP_API_KEY 缺失 → 返回 {'error': 'no_api_key'}
+        - 否则种子阶跃星辰 step-3.7-flash 并返回模型 dict
         """
         count_row = await meta_db.query_one(
             "SELECT COUNT(*) AS cnt FROM llm_models")
         if count_row and count_row["cnt"] > 0:
             return "already_seeded"
 
-        api_key = os.environ.get("OPENCODE_API_KEY", "")
+        api_key = os.environ.get("STEP_API_KEY", "")
         if not api_key:
             log.warning("seed_default_model_no_api_key")
             return {"error": "no_api_key"}
 
         attrs = {
-            "name": "DeepSeek V4 Flash Free",
-            "model_id": "deepseek-v4-flash-free",
-            "base_url": "https://opencode.ai/zen/v1",
+            "name": "Step 3.7 Flash",
+            "model_id": "step-3.7-flash",
+            "base_url": "https://api.stepfun.com/step_plan/v1",
             "api_key": api_key,
+            "provider_type": "anthropic",
             "context_window": 200_000,
             "max_output_tokens": _DEFAULT_MAX_OUTPUT,
             "supports_thinking": False,
