@@ -65,6 +65,31 @@ let _apiKey: string | null = null;
 
 export function setApiKey(key: string | null) {
   _apiKey = key;
+  // 同步到 Zustand store（通过全局引用避免循环依赖）
+  try {
+    const store = (window as any).__hwStore;
+    if (store) store.getState().setApiKey(key);
+  } catch { /* noop */ }
+  // 持久化到 localStorage
+  try {
+    if (key) localStorage.setItem("hiveweave_api_key", key);
+    else localStorage.removeItem("hiveweave_api_key");
+  } catch { /* noop */ }
+}
+
+/** 从 localStorage 恢复 apiKey — 应用启动时调用 */
+export function initApiKeyFromStorage(): string | null {
+  try {
+    const key = localStorage.getItem("hiveweave_api_key");
+    if (key) {
+      _apiKey = key;
+      const store = (window as any).__hwStore;
+      if (store) store.getState().setApiKey(key);
+    }
+    return key;
+  } catch {
+    return null;
+  }
 }
 
 // Debug log helper — writes to Zustand store without circular import.
@@ -93,6 +118,13 @@ async function fetchJSON<T = any>(url: string, init?: RequestInit): Promise<T> {
     const text = await res.text();
     if (!res.ok) {
       dbg("error", `${method} ${url} → ${res.status} (${elapsed}ms)`, { status: res.status, body: text.slice(0, 500) });
+      // 401 — API key 缺失或无效，提示用户输入
+      if (res.status === 401) {
+        try {
+          const store = (window as any).__hwStore;
+          if (store) store.getState().showToast?.("需要 API Key — 请点击右上角钥匙图标设置", "error");
+        } catch { /* noop */ }
+      }
       throw new Error(`HTTP ${res.status}: ${res.statusText}`);
     }
     const parsed = !text || text.length === 0 ? {} : JSON.parse(text);
@@ -240,9 +272,10 @@ export async function deleteAgent(id: string) {
 // ---------------------------------------------------------------------------
 
 export interface ChatEvent {
-  type: "text" | "text_delta" | "thinking_delta" | "tool_use" | "tool_result" | "message_id" | "error" | "done" | "busy" | "approval_request" | "retry" | "queued_message";
+  type: "text" | "text_delta" | "thinking_delta" | "tool_use" | "tool_result" | "message_id" | "error" | "done" | "busy" | "approval_request" | "retry" | "queued_message" | "thinking";
   data: string;
   deltaId?: string;
+  elapsed_s?: number;
 }
 
 export function streamChat(
@@ -364,6 +397,13 @@ function bindAgentChannelEvents(channel: any, agentId: string) {
     dbg("ws", `status_change for ${agentId}`);
   });
 
+  channel.on("thinking", (payload: any) => {
+    const handler = _agentHandlers.get(agentId);
+    if (!handler) return;
+    const elapsed = typeof payload === "object" ? payload.elapsed_s : undefined;
+    handler({ type: "thinking", data: "", elapsed_s: elapsed });
+  });
+
   channel.on("done", () => {
     dbg("ws", `done event for ${agentId}`);
     const handler = _agentHandlers.get(agentId);
@@ -480,7 +520,8 @@ export function subscribeAgentStatus(
   onStatus: (agentId: string, processing: boolean) => void,
   onActivity?: (event: ActivityEntry) => void,
   onOrgChanged?: () => void,
-  onGoalsUpdated?: (projectId: string) => void
+  onGoalsUpdated?: (projectId: string) => void,
+  onQuestionAsked?: () => void,
 ): { abort: () => void } {
   const socket = getSocket();
   const channel = socket.channel("lobby:status");
@@ -505,6 +546,10 @@ export function subscribeAgentStatus(
     if (typeof payload.projectId === "string") {
       onGoalsUpdated?.(payload.projectId);
     }
+  });
+
+  channel.on("question_asked", () => {
+    onQuestionAsked?.();
   });
 
   channel.on("activity", (payload: Record<string, unknown>) => {
@@ -594,6 +639,18 @@ export async function getPausedState() {
 }
 
 // ---------------------------------------------------------------------------
+// System control (restart)
+// ---------------------------------------------------------------------------
+
+export async function restartBackend() {
+  return fetchJSON(`${BASE}/system/restart-backend`, { method: "POST" });
+}
+
+export async function restartFrontend() {
+  return fetchJSON(`${BASE}/system/restart-frontend`, { method: "POST" });
+}
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -668,12 +725,14 @@ export interface PendingApproval {
 
 /** Get pending approval requests for a single agent. */
 export async function getPendingApprovals(agentId: string): Promise<PendingApproval[]> {
-  return fetchJSON(`${BASE}/permissions/pending/${agentId}`);
+  const data = await fetchJSON<{ requests: PendingApproval[] }>(`${BASE}/permissions/pending/${agentId}`);
+  return data.requests || [];
 }
 
 /** Get all pending approval requests for a project. */
 export async function getProjectPendingApprovals(projectId: string): Promise<PendingApproval[]> {
-  return fetchJSON(`${BASE}/permissions/pending/project/${projectId}`);
+  const data = await fetchJSON<{ requests: PendingApproval[] }>(`${BASE}/permissions/pending/project/${projectId}`);
+  return data.requests || [];
 }
 
 /** Respond (approve/reject) to a pending approval request. */
@@ -1001,11 +1060,11 @@ export async function getQuestions(opts?: { agentId?: string; projectId?: string
   return data.questions ?? [];
 }
 
-export async function answerQuestion(id: string, answer: string) {
+export async function answerQuestion(id: string, answer: string, agentId: string) {
   return fetchJSON(`${BASE}/chat/questions/${id}/answer`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answer }),
+    body: JSON.stringify({ answer, agentId }),
   });
 }
 

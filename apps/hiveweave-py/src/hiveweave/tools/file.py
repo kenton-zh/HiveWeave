@@ -133,9 +133,18 @@ def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
 
 
 def _is_sensitive(file_path: str) -> bool:
-    """Return True if the basename matches a sensitive file pattern."""
+    """Return True if the file path matches any sensitive file pattern.
+
+    Uses two complementary checks:
+    1. Basename-anchored patterns (exact match on filename)
+    2. Full-path substring patterns from security.py (broader, catches paths like .ssh/id_rsa)
+    """
     base = Path(file_path).name
-    return any(p.search(base) for p in SENSITIVE_PATTERNS)
+    if any(p.search(base) for p in SENSITIVE_PATTERNS):
+        return True
+    # Also check via security.py for path-level patterns (.ssh/, .aws/, etc.)
+    from hiveweave.tools.security import is_sensitive_path
+    return is_sensitive_path(file_path)
 
 
 def _is_binary(abs_path: str) -> bool:
@@ -311,14 +320,31 @@ async def list_files(
             return {"success": False, "output": "",
                     "error": "Error: Sandbox violation - "
                              "path must be within workspace"}
-        # .hiveweave 系统目录保护 — 拒绝显式列出系统目录内容
-        if _check_hiveweave_dir(full, workspace_path) or \
-           Path(full).name == HIVEWEAVE_DIR:
+        # .hiveweave 系统目录保护 — 对 protected 区域返回错误，
+        # 但允许列出 .hiveweave 根目录（只显示 agent 可用子目录）
+        if Path(full).name == HIVEWEAVE_DIR and \
+           _check_hiveweave_dir(full, workspace_path):
+            # Listing .hiveweave root — show only accessible subdirectories
+            hw_root = Path(full)
+            allowed_subs = ["shared", "worktrees", "reports", "drafts"]
+            lines = []
+            for sub in allowed_subs:
+                sub_path = hw_root / sub
+                if sub_path.exists() and sub_path.is_dir():
+                    lines.append(f"[DIR]  {sub}/")
+            msg = "Accessible agent work directories in .hiveweave/:" if lines \
+                  else "No agent work directories found in .hiveweave/."
+            return {
+                "success": True,
+                "output": msg + ("\n" + "\n".join(lines) if lines else ""),
+                "error": None,
+            }
+        if _check_hiveweave_dir(full, workspace_path):
             return {"success": False, "output": "",
-                    "error": "Error: `.hiveweave` is the HiveWeave system "
-                             "directory. NEVER list, read, or modify files "
-                             "inside .hiveweave. System files (data.db, "
-                             "tool_outputs/) are managed by HiveWeave internals."}
+                    "error": "Error: This part of `.hiveweave/` is a protected "
+                             "system area. Accessible subdirectories: "
+                             "`.hiveweave/shared/`, `.hiveweave/worktrees/`, "
+                             "`.hiveweave/reports/`, `.hiveweave/drafts/`."}
     else:
         full = str(Path(ws).resolve())
 
@@ -369,3 +395,124 @@ async def list_files(
 
     body = "\n".join(lines) if lines else "(empty directory)"
     return {"success": True, "output": body, "error": None}
+
+
+# ── Pydantic models + @tool registration (Phase 2 migration) ──────
+
+from pydantic import BaseModel, Field, ConfigDict
+
+from .base import tool
+from .result import ToolResult
+
+
+class ReadFileParams(BaseModel):
+    """Parameters for read_file tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    file_path: str = Field(
+        alias="filePath",
+        description="Path to the file to read (relative to workspace).",
+        json_schema_extra={"aliases": ["path", "file_path", "file"]},
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Starting line number (0-based, default: 0).",
+    )
+    limit: int = Field(
+        default=2000,
+        ge=1,
+        description="Max lines to read (default: 2000).",
+    )
+
+
+class WriteFileParams(BaseModel):
+    """Parameters for write_file tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    file_path: str = Field(
+        alias="filePath",
+        description="Path to the file to write (relative to workspace).",
+        json_schema_extra={"aliases": ["path", "file_path", "file"]},
+    )
+    content: str = Field(
+        description="Full file content to write. Overwrites existing file.",
+    )
+
+
+class ListFilesParams(BaseModel):
+    """Parameters for list_files tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    dir_path: str | None = Field(
+        default=None,
+        alias="dirPath",
+        description="Directory path to list (relative to workspace). Default: workspace root.",
+        json_schema_extra={"aliases": ["path", "directory", "dir", "dir_path"]},
+    )
+    recursive: bool = Field(
+        default=False,
+        description="If true, list recursively. Default: false.",
+    )
+    maxdepth: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description="Max depth when recursive (1-3). Default: 1.",
+    )
+
+
+@tool(
+    "read_file",
+    "Reads file contents with line numbers. Use it to inspect source code, config files, or text data. Returns line-numbered text.",
+    requires_workspace=True,
+    security_level="file_op",
+)
+async def read_file_tool(params: ReadFileParams, agent_id: str, workspace: str) -> ToolResult:
+    """Read a file with line numbers. Refuses binary files."""
+    result = await read_file(
+        file_path=params.file_path,
+        offset=params.offset,
+        limit=params.limit,
+        workspace_path=workspace,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    return ToolResult.err(result.get("error", "Unknown error"))
+
+
+@tool(
+    "write_file",
+    "Writes content to a file (overwrite). Auto-creates parent directories. Use it to create or replace files.",
+    requires_workspace=True,
+    security_level="file_op",
+)
+async def write_file_tool(params: WriteFileParams, agent_id: str, workspace: str) -> ToolResult:
+    """Write a file (overwrite). Auto-creates parent directories."""
+    result = await write_file(
+        file_path=params.file_path,
+        content=params.content,
+        workspace_path=workspace,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    return ToolResult.err(result.get("error", "Unknown error"))
+
+
+@tool(
+    "list_files",
+    "Lists files and directories at the given path. Use it to explore directory structure, find files by location, or verify file existence.",
+    requires_workspace=True,
+    security_level="file_op",
+)
+async def list_files_tool(params: ListFilesParams, agent_id: str, workspace: str) -> ToolResult:
+    """List directory contents with [DIR]/[FILE] tags and sizes."""
+    result = await list_files(
+        path=params.dir_path or "",
+        workspace_path=workspace,
+        recursive=params.recursive,
+        maxdepth=params.maxdepth,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    return ToolResult.err(result.get("error", "Unknown error"))

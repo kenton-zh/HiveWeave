@@ -147,6 +147,27 @@ def _check_hiveweave_command(command: str) -> bool:
     return True
 
 
+def _validate_command_safety(command: str) -> tuple[bool, str]:
+    """统一命令安全校验 — 所有 shell 执行入口必须调用。
+
+    整合三项检查: 自毁命令、敏感路径、.hiveweave 系统目录。
+    Returns: (blocked, reason) — blocked=True 表示命令应被拦截。
+    """
+    blocked, reason = check_self_destructive(command)
+    if blocked:
+        return True, f"Command blocked: {reason}"
+    from hiveweave.tools.security import is_sensitive_path
+    if is_sensitive_path(command):
+        return True, ("Command references a sensitive file (e.g. .env, *.pem, "
+                      "id_rsa, credentials). Use read_file with explicit "
+                      "approval instead.")
+    if _check_hiveweave_command(command):
+        return True, ("Command targets `.hiveweave` system directory. "
+                      "System files (data.db, tool_outputs/) are managed by "
+                      "HiveWeave internals.")
+    return False, ""
+
+
 def _is_within_workspace(candidate: str, workspace: str) -> bool:
     """Check whether `candidate` path stays inside `workspace` (after resolve)."""
     try:
@@ -334,36 +355,12 @@ async def execute_bash(
         return {"success": False, "output": "",
                 "error": "Error: command is required"}
 
-    # 1. Self-destructive guard
-    blocked, reason = check_self_destructive(command)
+    # 1. 统一命令安全校验 — 自毁命令 + 敏感路径 + .hiveweave 系统目录
+    blocked, reason = _validate_command_safety(command)
     if blocked:
         log.warning("bash.blocked", reason=reason, command_preview=command[:120])
         return {"success": False, "output": "",
-                "error": f"Error: Command blocked: {reason}"}
-
-    # BUG-011 修复：敏感文件路径检查 — 阻止 `cat .env` / `cat ~/.ssh/id_rsa` 等
-    # 绕过 file.py 敏感检查的 bash 命令。用 security.is_sensitive_path 做子串匹配。
-    from hiveweave.tools.security import is_sensitive_path
-    if is_sensitive_path(command):
-        log.warning("bash.blocked_sensitive", command_preview=command[:120])
-        return {"success": False, "output": "",
-                "error": "Error: Command blocked: command references a "
-                         "sensitive file (e.g. .env, *.pem, id_rsa, "
-                         "credentials). Use read_file with explicit "
-                         "approval instead."}
-
-    # .hiveweave 系统目录保护 — 阻止 agent 通过 bash 操作 data.db 等系统文件。
-    # 仅拦截 agent 原始命令中对 .hiveweave 的文件操作（rm/cat/cp/mv/type/del/xcopy 等），
-    # 不影响下方 _source_env_sh 的内部 source（那是系统行为，非 agent 命令）。
-    blocked_hw = _check_hiveweave_command(command)
-    if blocked_hw:
-        log.warning("bash.blocked_hiveweave", command_preview=command[:120])
-        return {"success": False, "output": "",
-                "error": "Error: Command blocked: `.hiveweave` is the HiveWeave "
-                         "system directory. NEVER run shell commands that target "
-                         ".hiveweave (rm, mv, cp, cat, type, del, etc.). "
-                         "System files (data.db, tool_outputs/) are managed by "
-                         "HiveWeave internals."}
+                "error": f"Error: {reason}"}
 
     # 1.5. Auto-source .hiveweave/env.sh if the project has one.
     # The project declares its own environment setup.
@@ -388,7 +385,11 @@ async def execute_bash(
     # 3. Clamp timeout
     if timeout_ms is None:
         timeout_ms = DEFAULT_TIMEOUT_S * 1000
-    timeout_ms = max(1000, min(int(timeout_ms), MAX_TIMEOUT_S * 1000))
+    timeout_ms = int(timeout_ms)
+    # Heuristic: values 1-600 are likely seconds, not milliseconds
+    if 1 <= timeout_ms <= 600:
+        timeout_ms = timeout_ms * 1000
+    timeout_ms = max(5000, min(timeout_ms, MAX_TIMEOUT_S * 1000))
     timeout_s = timeout_ms / 1000
 
     # 4. Choose execution backend (priority: persistent sandbox > one-shot docker > native)
@@ -447,13 +448,13 @@ async def execute_run_command(
         return {"success": False, "output": "",
                 "error": "Error: command is required"}
 
-    # A3 修复：统一自毁检查，与 execute_bash 一致
-    blocked, reason = check_self_destructive(command)
+    # 统一命令安全校验 — 自毁命令 + 敏感路径 + .hiveweave 系统目录（A3 + 旁路修复）
+    blocked, reason = _validate_command_safety(command)
     if blocked:
         log.warning("run_command.blocked", reason=reason,
                     command_preview=command[:120])
         return {"success": False, "output": "",
-                "error": f"Error: Command blocked: {reason}"}
+                "error": f"Error: {reason}"}
 
     ws = workspace_path or os.getcwd()
     if cwd:
@@ -469,7 +470,10 @@ async def execute_run_command(
         return {"success": False, "output": "",
                 "error": f"Error: Working directory does not exist: {full_cwd}"}
 
-    safe_timeout = max(1000, min(int(timeout_ms or 120_000), MAX_TIMEOUT_S * 1000))
+    safe_timeout = int(timeout_ms or 120_000)
+    if 1 <= safe_timeout <= 600:
+        safe_timeout = safe_timeout * 1000
+    safe_timeout = max(5000, min(safe_timeout, MAX_TIMEOUT_S * 1000))
     timeout_s = safe_timeout // 1000
 
     log.info("run_command.execute", cwd=full_cwd, timeout_s=timeout_s,
@@ -499,3 +503,88 @@ async def execute_run_command(
         "output": f"{body}\n\nExit code: {exit_code}",
         "error": f"Command exited with code {exit_code}",
     }
+
+
+# ── Pydantic models + @tool registration (Phase 2 migration) ──────
+
+from pydantic import BaseModel, Field, ConfigDict
+
+from .base import tool
+from .result import ToolResult
+
+
+class BashParams(BaseModel):
+    """Parameters for bash tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    command: str = Field(
+        description="Shell command to execute.",
+        json_schema_extra={"aliases": ["cmd", "run"]},
+    )
+    timeout: int = Field(
+        default=120000,
+        ge=5000,
+        le=600000,
+        description="Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds (e.g. 30 = 30s). Use 120000 for npm install.",
+        json_schema_extra={"aliases": ["timeout_ms", "timeoutMs"]},
+    )
+
+
+class RunCommandParams(BaseModel):
+    """Parameters for run_command tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    command: str = Field(
+        description="Command to execute.",
+        json_schema_extra={"aliases": ["cmd", "run"]},
+    )
+    cwd: str = Field(
+        default="",
+        description="Working directory (relative to workspace). Default: workspace root.",
+    )
+    timeout: int = Field(
+        default=120000,
+        ge=5000,
+        le=600000,
+        description="Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds.",
+        json_schema_extra={"aliases": ["timeout_ms", "timeoutMs"]},
+    )
+
+
+@tool(
+    "bash",
+    "Executes a shell command on the local system. Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command.",
+    requires_workspace=True,
+    security_level="shell",
+)
+async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolResult:
+    """Execute a bash command."""
+    result = await execute_bash(
+        command=params.command,
+        workdir="",
+        workspace_path=workspace,
+        timeout_ms=params.timeout,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    # For bash, output contains the command output even on failure
+    return ToolResult.err(result.get("error", "Command failed"))
+
+
+@tool(
+    "run_command",
+    "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command.",
+    requires_workspace=True,
+    security_level="shell",
+)
+async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: str) -> ToolResult:
+    """Execute a command with explicit cwd."""
+    result = await execute_run_command(
+        command=params.command,
+        cwd=params.cwd,
+        timeout_ms=params.timeout,
+        workspace_path=workspace,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    return ToolResult.err(result.get("error", "Command failed"))

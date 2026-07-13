@@ -313,7 +313,7 @@ function ToolCallInline({ name, input }: { name: string; input?: Record<string, 
   );
 }
 
-function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: boolean }) {
+function MessageBubble({ msg, isStreaming, thinkingElapsed }: { msg: ChatMessage; isStreaming?: boolean; thinkingElapsed?: number | null }) {
   if (msg.role === "system") {
     return (
       <div className="flex justify-center my-4">
@@ -380,12 +380,27 @@ function MessageBubble({ msg, isStreaming }: { msg: ChatMessage; isStreaming?: b
           <span className="inline-block w-0.5 h-4 bg-g-blue/60 ml-0.5 align-middle animate-pulse" />
         )}
 
-        {/* Empty streaming indicator */}
+        {/* Empty streaming indicator — thinking heartbeat or bouncing dots */}
         {!isUser && isEmpty && isStreaming && (
-          <div className="flex gap-1.5 py-1">
-            <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-            <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-            <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+          <div className="flex items-center gap-2 py-1">
+            {thinkingElapsed != null ? (
+              <>
+                <span className="flex gap-1">
+                  <span className="w-2 h-2 bg-g-blue/70 rounded-full animate-pulse" style={{ animationDelay: "0ms" }} />
+                  <span className="w-2 h-2 bg-g-blue/70 rounded-full animate-pulse" style={{ animationDelay: "200ms" }} />
+                  <span className="w-2 h-2 bg-g-blue/70 rounded-full animate-pulse" style={{ animationDelay: "400ms" }} />
+                </span>
+                <span className="text-xs text-g-fg-3">
+                  思考中{thinkingElapsed > 0 ? ` · ${Math.floor(thinkingElapsed)}s` : ""}...
+                </span>
+              </>
+            ) : (
+              <span className="flex gap-1.5">
+                <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+              </span>
+            )}
           </div>
         )}
       </div>
@@ -425,6 +440,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
   );
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
+  const [thinkingElapsed, setThinkingElapsed] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -603,6 +619,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       subscribeAgentStream(agentId, (event) => {
         if (activeAgentIdRef.current !== agentId) return;
         if (event.type === "text_delta" || event.type === "thinking_delta") {
+          setThinkingElapsed(null);
           // Merge deltas into last segment of same type instead of creating
           // a new segment per event — otherwise each delta becomes a separate
           // "思考过程" block, producing thousands of entries.
@@ -616,7 +633,10 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             }
             return { ...prev, segments: [...prev.segments, { type: segType, content: event.data }] };
           });
+        } else if (event.type === "thinking") {
+          setThinkingElapsed(event.elapsed_s ?? null);
         } else if (event.type === "tool_use") {
+          setThinkingElapsed(null);
           try {
             const toolData = JSON.parse(event.data);
             const rawName: string = toolData.toolName || toolData.tool_name || toolData.tool || "";
@@ -627,6 +647,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             updateStreamDraft((prev) => prev ? { ...prev, segments: [...prev.segments, toolCallSeg] as MsgSegment[] } : prev);
           } catch {}
         } else if (event.type === "done") {
+          setThinkingElapsed(null);
           loadMessagesFromDb(agentId).then((ok) => {
             if (ok) updateStreamDraft(null);
           });
@@ -634,6 +655,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           updateProcessingAgent(agentId, false);
           delete savedDraftsRef.current[agentId];
         } else if (event.type === "error") {
+          setThinkingElapsed(null);
           setIsStreaming(false);
           updateProcessingAgent(agentId, false);
           delete savedDraftsRef.current[agentId];
@@ -1130,7 +1152,12 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         });
         updateStreamDraft({ assistantId: placeholderId, segments: [] });
         console.log(`[SSE] streamDraft lazy-initialized: assistantId=${placeholderId}`);
+      } else if (event.type === "thinking") {
+        // Thinking heartbeat — agent is still working but hasn't produced output yet
+        setThinkingElapsed(event.elapsed_s ?? null);
       } else if (event.type === "text" || event.type === "text_delta") {
+        // First real output → clear thinking indicator
+        setThinkingElapsed(null);
         _dbgTextCount++;
         if (_dbgTextCount === 1) _dbgFirstText = performance.now();
         if (_dbgTextCount <= 3 || _dbgTextCount % 20 === 0) {
@@ -1164,7 +1191,8 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           return { ...prev, segments: [...prev.segments, { type: "text", content: event.data }] };
         });
       } else if (event.type === "thinking_delta") {
-        // Reasoning model thinking content — display in collapsible block
+        // Reasoning model thinking content — clear heartbeat, display in collapsible block
+        setThinkingElapsed(null);
         if (!streamDraftRef.current) {
           const placeholderId = `draft-${sendingForAgentId}-${Date.now()}`;
           setMessages((prev) => {
@@ -1188,6 +1216,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           return { ...prev, segments: [...prev.segments, { type: "thinking", content: event.data }] };
         });
       } else if (event.type === "tool_use") {
+        setThinkingElapsed(null);
         try {
           const toolData = JSON.parse(event.data);
           const rawName: string = toolData.toolName || toolData.tool_name || toolData.tool || "";
@@ -1232,6 +1261,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       } else if (event.type === "queued_message") {
         loadMessagesFromDb(sendingForAgentId);
       } else if (event.type === "done") {
+        setThinkingElapsed(null);
         console.log(`[SSE] done — total text events: ${_dbgTextCount}, elapsed: ${_dbgFirstText ? (performance.now() - _dbgFirstText).toFixed(0) : 'N/A'}ms`);
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         setPendingApprovalTool(null);
@@ -1272,6 +1302,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         });
         releaseLockAndFinish();
       } else if (event.type === "busy") {
+        setThinkingElapsed(null);
         // Agent is processing a previous message — restore input so user doesn't lose their text
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
         // BUG-032: 清除 optimistic processing 状态，agent 已拒绝此消息
@@ -1286,6 +1317,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         autoSendRef.current = false;
         sendingLockRef.current = false;
       } else if (event.type === "error") {
+        setThinkingElapsed(null);
         // BUG-033: 只在 DB 加载成功时清除 streamDraft。如果 HTTP 请求失败
         // (服务重启等)，保留已流式传输的内容，避免"出现一瞬间就没了"。
         if (responseTimeoutRef.current) { clearTimeout(responseTimeoutRef.current); responseTimeoutRef.current = null; }
@@ -1418,7 +1450,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           <div className="text-center text-g-fg-4 text-sm mt-12">发送消息开始对话</div>
         )}
         {directMessages.map((msg) => (
-          <MessageBubble key={msg.id} msg={msg} isStreaming={!!msg.isStreaming || (isStreaming && streamDraft?.assistantId === msg.id)} />
+          <MessageBubble key={msg.id} msg={msg} isStreaming={!!msg.isStreaming || (isStreaming && streamDraft?.assistantId === msg.id)} thinkingElapsed={isStreaming && streamDraft?.assistantId === msg.id ? thinkingElapsed : null} />
         ))}
         {pendingApprovalTool && isStreaming && (
           <div className="flex justify-start">

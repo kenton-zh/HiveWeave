@@ -46,6 +46,11 @@ class ConversationStore:
         # per-agent 压缩锁 — 防止同一 agent 并发压缩导致竞态丢消息
         self._compaction_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._compaction = Compaction()
+        # per-agent 写队列 — 串行化所有 DB 写操作，防止 persist/compaction/clear 竞态
+        self._write_queues: dict[tuple[str, str], asyncio.Queue] = {}
+        self._write_workers: dict[tuple[str, str], asyncio.Task] = {}
+        # 标记已被 clear 的 agent，使排队中的 persist 任务被丢弃
+        self._cleared_agents: set[tuple[str, str]] = set()
 
     def _get_compaction_lock(self, key: tuple[str, str]) -> asyncio.Lock:
         """获取或创建 per-agent 压缩锁。"""
@@ -54,6 +59,45 @@ class ConversationStore:
             lock = asyncio.Lock()
             self._compaction_locks[key] = lock
         return lock
+
+    def _get_write_queue(self, key: tuple[str, str]) -> asyncio.Queue:
+        """获取或创建 per-agent 写队列。"""
+        if key not in self._write_queues:
+            self._write_queues[key] = asyncio.Queue()
+            self._write_workers[key] = asyncio.create_task(
+                self._write_worker(key)
+            )
+        return self._write_queues[key]
+
+    async def _write_worker(self, key: tuple[str, str]) -> None:
+        """per-agent 写队列 worker — 顺序执行所有 DB 写操作。"""
+        queue = self._write_queues[key]
+        while True:
+            try:
+                task = await queue.get()
+                if task is None:
+                    # 哨兵值，停止 worker
+                    break
+                func, args = task
+                # 如果 agent 已被 clear 且这是 persist 操作，跳过
+                if key in self._cleared_agents and func.__name__ == "_persist_turn":
+                    logger.debug("persist_skipped_after_clear", key=key)
+                    queue.task_done()
+                    continue
+                try:
+                    await func(*args)
+                except Exception as e:
+                    logger.warning("write_queue_task_error", key=key, error=str(e))
+                queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("write_worker_error", key=key, error=str(e))
+
+    async def _enqueue_write(self, key: tuple[str, str], func, *args) -> None:
+        """向 per-agent 写队列投递一个写任务。"""
+        queue = self._get_write_queue(key)
+        await queue.put((func, args))
 
     # ── 公共 API ─────────────────────────────────────────────
 
@@ -78,6 +122,8 @@ class ConversationStore:
         if not messages:
             return
         key = (project_id, agent_id)
+        # 新消息写入，清除 clear 标记
+        self._cleared_agents.discard(key)
         if key not in self._cache:
             loaded = await self._load_from_db(agent_id)
             existing = self._clean_messages(loaded)
@@ -95,8 +141,8 @@ class ConversationStore:
         combined = existing + filtered_new
         self._cache[key] = combined
 
-        # 异步持久化（fire-and-forget，失败仅日志）
-        asyncio.create_task(self._persist_turn(agent_id, filtered_new))
+        # 通过 per-agent 写队列串行化持久化，防止与 compaction 竞态
+        await self._enqueue_write(key, self._persist_turn, agent_id, filtered_new)
 
         # 触发 compaction 检查
         await self._maybe_trigger_compaction(agent_id, project_id, key, combined)
@@ -107,6 +153,7 @@ class ConversationStore:
         self._cache.pop(key, None)
         self._prefix_cache.pop(key, None)
         self._compaction_locks.pop(key, None)
+        self._cleared_agents.add(key)  # 标记已清除，排队中的 persist 将被丢弃
         try:
             await project_db.execute(
                 agent_id,
@@ -115,12 +162,38 @@ class ConversationStore:
             )
         except Exception as e:
             logger.warning("clear_failed", agent_id=agent_id, error=str(e))
+        # 清除标记（给一个短暂的窗口让排队任务被丢弃，然后移除标记）
+        # 实际清除由下次 append_turn 重新创建队列时重置
 
     def clear_all(self) -> None:
         """清空所有内存缓存（不删 DB）— 启动时调用。"""
         self._cache.clear()
         self._prefix_cache.clear()
         self._compaction_locks.clear()
+        self._cleared_agents.clear()
+        # 停止所有 worker
+        for key, queue in self._write_queues.items():
+            queue.put_nowait(None)  # 哨兵值停止 worker
+        self._write_queues.clear()
+        self._write_workers.clear()
+
+    def stop_project_workers(self, project_id: str) -> None:
+        """停止项目下所有 agent 的 write worker — 删除项目时调用。
+
+        防止后台 worker 在 evict_project_db 后重新打开 DB 连接。
+        """
+        keys_to_stop = [k for k in self._write_queues if k[0] == project_id]
+        for key in keys_to_stop:
+            queue = self._write_queues.pop(key, None)
+            worker = self._write_workers.pop(key, None)
+            if queue is not None:
+                queue.put_nowait(None)  # 哨兵值停止 worker
+            # worker 会在下一个循环迭代退出，不需要 cancel
+            # 清理缓存
+            self._cache.pop(key, None)
+            self._prefix_cache.pop(key, None)
+            self._compaction_locks.pop(key, None)
+            self._cleared_agents.add(key)
 
     def get_compacted_prefix(self, project_id: str, agent_id: str) -> str | None:
         """获取压缩摘要（DeepSeek 前缀缓存 System 3 布局）。"""
@@ -170,8 +243,8 @@ class ConversationStore:
                 total=total,
                 target=target_budget,
             )
-            asyncio.create_task(
-                self._do_compaction(agent_id, project_id, key, messages, target_budget)
+            await self._enqueue_write(
+                key, self._do_compaction, agent_id, project_id, key, messages, target_budget
             )
 
     async def _do_compaction(self, agent_id, project_id, key, messages, budget) -> None:
@@ -242,10 +315,11 @@ class ConversationStore:
             # 写入压缩后的 history 为单个 turn
             if history:
                 await self._persist_turn(agent_id, history)
-            # summary 持久化到 agent 配置（通过 meta DB）
+            # summary 持久化到 agent 配置（通过 per-project DB）
             if summary is not None:
                 try:
-                    await meta_db.execute(
+                    await project_db.execute(
+                        agent_id,
                         "UPDATE agents SET compacted_prefix = ? WHERE id = ?",
                         [summary, agent_id],
                     )
@@ -257,14 +331,19 @@ class ConversationStore:
 
     async def _get_agent_context_window(self, agent_id: str) -> int:
         try:
-            row = await meta_db.query_one(
-                "SELECT a.model_id, m.context_window FROM agents a "
-                "LEFT JOIN llm_models m ON a.model_id = m.id "
-                "WHERE a.id = ? LIMIT 1",
+            # agents 表在 per-project DB，llm_models 在 meta DB — 无法 JOIN
+            agent_row = await project_db.query_one(
+                agent_id,
+                "SELECT model_id FROM agents WHERE id = ? LIMIT 1",
                 [agent_id],
             )
-            if row and row["context_window"] and row["context_window"] > 0:
-                return row["context_window"]
+            if agent_row and agent_row["model_id"]:
+                model_row = await meta_db.query_one(
+                    "SELECT context_window FROM llm_models WHERE id = ? LIMIT 1",
+                    [agent_row["model_id"]],
+                )
+                if model_row and model_row["context_window"] and model_row["context_window"] > 0:
+                    return model_row["context_window"]
         except Exception as e:
             logger.warning("get_context_window_failed", error=str(e))
         return DEFAULT_CONTEXT_WINDOW
@@ -406,14 +485,15 @@ class ConversationStore:
     async def _load_compacted_prefix(
         self, agent_id: str, project_id: str
     ) -> None:
-        """从 Meta DB 加载持久化的压缩摘要到 _prefix_cache。
+        """从 per-project DB 加载持久化的压缩摘要到 _prefix_cache。
 
         CRITICAL #1 修复：重启后 _prefix_cache 为空，需从 agents.compacted_prefix
         列恢复，否则 agent 重新面对完整未压缩历史。
         """
         key = (project_id, agent_id)
         try:
-            row = await meta_db.query_one(
+            row = await project_db.query_one(
+                agent_id,
                 "SELECT compacted_prefix FROM agents WHERE id = ? LIMIT 1",
                 [agent_id],
             )

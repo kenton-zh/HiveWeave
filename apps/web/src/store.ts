@@ -52,6 +52,8 @@ interface AppState {
   bumpGoalsVersion: (projectId: string) => void;
   socketReconnectVersion: number;
   bumpSocketReconnect: () => void;
+  questionVersion: number;
+  bumpQuestionVersion: () => void;
   activeCommunications: ActiveCommunication[];
   setActiveCommunications: (comms: ActiveCommunication[]) => void;
   userName: string;
@@ -60,6 +62,8 @@ interface AppState {
   setProjects: (projects: Project[]) => void;
   selectedProjectId: string | null;
   setSelectedProjectId: (id: string | null) => void;
+  apiKey: string | null;
+  setApiKey: (key: string | null) => void;
   // Pending approvals
   pendingApprovals: Record<string, PendingApproval[]>; // keyed by agentId
   setPendingApprovals: (agentId: string, approvals: PendingApproval[]) => void;
@@ -192,6 +196,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   bumpGoalsVersion: (projectId: string) => set((s) => ({ goalsVersion: s.goalsVersion + 1, goalsUpdatedProjectId: projectId })),
   socketReconnectVersion: 0,
   bumpSocketReconnect: () => set((s) => ({ socketReconnectVersion: s.socketReconnectVersion + 1 })),
+  questionVersion: 0,
+  bumpQuestionVersion: () => set((s) => ({ questionVersion: s.questionVersion + 1 })),
   activeCommunications: [],
   setActiveCommunications: (comms) => set({ activeCommunications: comms }),
   userName: (typeof localStorage !== "undefined" ? localStorage.getItem("hiveweave-user-name") : null) || "用户",
@@ -203,6 +209,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   setProjects: (projects) => set({ projects }),
   selectedProjectId: null,
   setSelectedProjectId: (id) => set({ selectedProjectId: id }),
+  apiKey: null,
+  setApiKey: (key) => set({ apiKey: key }),
   // Pending approvals
   pendingApprovals: {},
   setPendingApprovals: (agentId, approvals) =>

@@ -28,6 +28,7 @@ import httpx
 import structlog
 
 from hiveweave.db import meta as meta_db
+from hiveweave.db import project as project_db
 
 log = structlog.get_logger(__name__)
 
@@ -339,7 +340,8 @@ class McpService:
 
         bound.append(server_name)
         now_ms = int(time.time() * 1000)
-        await meta_db.execute(
+        await project_db.execute(
+            agent_id,
             "UPDATE agents SET mcp_servers=?, updated_at=? WHERE id=?",
             [json.dumps(bound), now_ms, agent_id],
         )
@@ -353,7 +355,8 @@ class McpService:
             return {"ok": False, "error": f"MCP server '{server_name}' is not bound"}
         bound.remove(server_name)
         now_ms = int(time.time() * 1000)
-        await meta_db.execute(
+        await project_db.execute(
+            agent_id,
             "UPDATE agents SET mcp_servers=?, updated_at=? WHERE id=?",
             [json.dumps(bound), now_ms, agent_id],
         )
@@ -362,8 +365,8 @@ class McpService:
 
     async def get_bound_mcp(self, agent_id: str) -> list[str]:
         """获取 agent 当前已绑定的 MCP 服务器名列表。"""
-        row = await meta_db.query_one(
-            "SELECT mcp_servers FROM agents WHERE id=? LIMIT 1", [agent_id]
+        row = await project_db.query_one(
+            agent_id, "SELECT mcp_servers FROM agents WHERE id=? LIMIT 1", [agent_id]
         )
         if row is None:
             return []

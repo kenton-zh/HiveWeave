@@ -20,6 +20,7 @@ from pydantic import BaseModel
 import structlog
 
 from hiveweave.db import meta as meta_db
+from hiveweave.db import project as project_db
 from hiveweave.services.permission import permission_service
 from hiveweave.services.approval import approval_service
 
@@ -36,6 +37,16 @@ class RespondBody(BaseModel):
     approved: bool
     remember: bool = False
     userNote: str | None = None
+
+
+class RespondBodyCompat(BaseModel):
+    """前端 api.ts 调用 POST /api/permissions/respond (requestId 在 body) 的兼容模型。"""
+
+    requestId: str
+    approved: bool
+    remember: bool = False
+    userNote: str | None = None
+    projectId: str | None = None
 
 
 def _parse_json_list(raw) -> list:
@@ -71,7 +82,8 @@ async def update_mode(agent_id: str, body: ModeUpdate) -> dict:
             status_code=422,
             detail=f"Invalid mode; must be one of {sorted(valid)}",
         )
-    await meta_db.execute(
+    await project_db.execute(
+        agent_id,
         "UPDATE agents SET permission_mode = ?, updated_at = ? WHERE id = ?",
         [body.mode, int(time.time() * 1000), agent_id],
     )
@@ -123,6 +135,26 @@ async def pending_for_project(projectId: str = Query(...)) -> dict:
 @router.post("/requests/{request_id}/respond")
 async def respond_request(request_id: str, body: RespondBody) -> dict:
     """响应审批请求。"""
+    await approval_service.resolve_request(
+        request_id=request_id,
+        approved=body.approved,
+        remember=body.remember,
+        user_note=body.userNote or "",
+    )
+    return {"ok": True, "requestId": request_id}
+
+
+@router.post("/respond")
+async def respond_request_compat(body: RespondBodyCompat) -> dict:
+    """COMPAT: 前端 api.ts 调用 POST /api/permissions/respond（requestId 在 body）。
+
+    前端 respondToApproval 把 requestId 放进 body 而非 path，
+    原契约只提供 POST /api/permissions/requests/{request_id}/respond。
+    本路由从 body 读取 requestId 后复用 approval_service.resolve_request。
+
+    注意：必须定义在 /{agent_id} 路由之前，否则 "respond" 会被 {agent_id} 捕获。
+    """
+    request_id = body.requestId
     await approval_service.resolve_request(
         request_id=request_id,
         approved=body.approved,

@@ -31,6 +31,28 @@ from hiveweave.prompts.coordinator import build_coordinator_script
 from hiveweave.prompts.executor import build_executor_script
 
 
+# ── CJK 标点规范化 ───────────────────────────────────────────
+# 部分 LLM API（如 Step 3.7 Flash）在处理 system prompt 中的全角标点时
+# 会无限期挂起。将全角引号、破折号替换为 ASCII 等效字符。
+_CJK_PUNCT_FIX: dict[str, str] = {
+    "\u300c": '"',   # 「
+    "\u300d": '"',   # 」
+    "\u300e": '"',   # 『
+    "\u300f": '"',   # 』
+    "\u2014\u2014": "--",  # —— (em dash pair, common in Chinese)
+    "\u2014": "-",   # — (single em dash)
+    "\u2015": "-",   # ― (horizontal bar)
+    "\u2500": "-",   # ─ (box drawing horizontal)
+}
+
+
+def _normalize_cjk_punct(text: str) -> str:
+    """将全角标点替换为 ASCII 等效字符（仅影响发送给 LLM 的文本）。"""
+    for old, new in _CJK_PUNCT_FIX.items():
+        text = text.replace(old, new)
+    return text
+
+
 # ── 中文模型检测 ─────────────────────────────────────────────
 # 中文训练模型：基线指令不足以稳定镜像用户语言，需追加硬规则。
 # 西方模型（Claude / GPT / Gemini）信任其自动镜像能力，不追加。
@@ -135,7 +157,7 @@ _COMMUNICATION_BLOCK = """## Communication Rules
 - **MANDATORY: Address other agents by their name (花名), NEVER by ID or role title.** A role may have multiple people — using a role title could send the message to the wrong person. Use list_subordinates or view_org_chart to learn names.
 - **send_message supports group send** — recipients is an array, you can message multiple people at once. E.g. recipients=["Alice","Bob","Carol"] to notify an entire squad simultaneously.
 - **NEVER claim a colleague is "working", "busy", or "idle" without calling check_agent_status first.**
-- After completing a task, ALWAYS `send_message` to your superior (recipients=["上级花名"], expectReport=true) with a brief summary
+- After completing a task, use `submit_task(taskId, summary)` to submit your work for review (executor perspective). As a coordinator, use `review_task(taskId, decision)` to review your subordinates' submissions.
 - If blocked, use `send_message` (recipients=["上级花名"]) to ask your superior for clarification
 - Use tools proactively to record progress"""
 
@@ -168,7 +190,7 @@ _ACTION_DISCIPLINE_BLOCK = """## ⚠️ ACTION DISCIPLINE (CRITICAL)
 - DO NOT output a summary or plan as your final message without executing the tools first.
 - If you say "I will save the charter" — you MUST call `save_charter` in the same turn.
 - If you say "I will instruct HR" — you MUST call `send_message` to HR in the same turn.
-- If you say "I will dispatch tasks" — you MUST call `send_message` with the subordinate as recipient and expectReport=true in the same turn.
+- If you say "I will dispatch tasks" — you MUST call `dispatch_task` in the same turn. (dispatch_task auto-creates the task; only call create_task first if you need to set acceptance criteria, then pass taskId to dispatch_task.)
 - A text-only response that describes actions without calling tools is a FAILURE.
 - **ALWAYS write a brief note BEFORE calling a tool** (e.g. "Reading the project's entry point to understand the structure..."). The user sees this in real-time while the tool runs. This is MANDATORY — do not call tools silently.
 - After completing a group of related actions, write a brief summary of what you found and what you're doing next."""
@@ -233,4 +255,5 @@ def build_identity_prompt(
     sections.append(_ACTION_DISCIPLINE_BLOCK)
 
     prompt = "\n\n".join(sections).strip()
+    prompt = _normalize_cjk_punct(prompt)
     return prompt + _language_rule_suffix(model_id)

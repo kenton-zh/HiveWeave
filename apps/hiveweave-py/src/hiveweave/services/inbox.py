@@ -22,17 +22,24 @@ log = structlog.get_logger(__name__)
 # Idempotent migration tracking: agent_ids whose inbox has been checked
 _migrated: set[str] = set()
 
+# Columns missing from older inbox tables
+_MISSING_COLUMNS = [
+    ("priority", "TEXT DEFAULT 'normal'"),
+    ("task_id", "TEXT"),
+]
+
 
 async def _ensure_schema(agent_id: str) -> None:
-    """Add missing priority column to inbox table (idempotent)."""
+    """Add missing columns to inbox table (idempotent)."""
     if agent_id in _migrated:
         return
-    try:
-        await project_db.execute(
-            agent_id,
-            "ALTER TABLE inbox ADD COLUMN priority TEXT DEFAULT 'normal'")
-    except Exception:
-        pass  # Column already exists — safe to ignore
+    for col_name, col_def in _MISSING_COLUMNS:
+        try:
+            await project_db.execute(
+                agent_id,
+                f"ALTER TABLE inbox ADD COLUMN {col_name} {col_def}")
+        except Exception:
+            pass  # Column already exists — safe to ignore
     _migrated.add(agent_id)
 
 
@@ -41,7 +48,8 @@ class InboxService:
 
     async def send_message(self, from_agent_id: str, to_agent_id: str, message: str,
                            message_type: str = "normal", priority: str = "normal",
-                           expect_report: bool = False) -> dict:
+                           expect_report: bool = False,
+                           task_id: str | None = None) -> dict:
         """Send a message to an agent's inbox.
 
         Writes to the per-project DB routed via to_agent_id.
@@ -54,12 +62,13 @@ class InboxService:
         await project_db.execute(
             to_agent_id,
             "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, read, "
-            "created_at, message_type, expect_report, priority) "
-            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",
+            "created_at, message_type, expect_report, priority, task_id) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
             [msg_id, from_agent_id, to_agent_id, message, now_ms,
-             message_type, expect, priority])
+             message_type, expect, priority, task_id])
         log.info("inbox_sent", from_agent_id=from_agent_id, to_agent_id=to_agent_id,
-                 message_type=message_type, priority=priority, preview=message[:80])
+                 message_type=message_type, priority=priority, preview=message[:80],
+                 task_id=task_id)
 
         # Push real-time event to notify recipient's frontend immediately.
         # Without this, the recipient only learns about new messages via
@@ -84,6 +93,7 @@ class InboxService:
             "id": msg_id, "from_agent_id": from_agent_id, "to_agent_id": to_agent_id,
             "message": message, "message_type": message_type, "priority": priority,
             "expect_report": expect_report, "read": False, "created_at": now_ms,
+            "task_id": task_id,
         }
 
     async def get_pending_messages(self, agent_id: str) -> list[dict]:

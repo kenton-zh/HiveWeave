@@ -39,6 +39,7 @@ from hiveweave.tools.grep import execute_grep
 from hiveweave.tools.patch import apply_patch
 from hiveweave.tools.question import execute_question
 from hiveweave.tools.review import execute_review, ReviewLLMCallback
+from hiveweave.tools.task_tools import TaskToolsMixin
 from hiveweave.tools.todowrite import execute_todowrite
 from hiveweave.tools.websearch import execute_websearch
 
@@ -71,7 +72,18 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": "Executes a shell command on the local system. Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command.",
         "properties": {
             "command": {"type": "string", "aliases": ["cmd", "run"]},
-            "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"]},
+            "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"],
+                        "description": "Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds (e.g. 30 = 30s). Use 120000 for npm install."},
+        },
+        "required": ["command"],
+    },
+    "run_command": {
+        "description": "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command.",
+        "properties": {
+            "command": {"type": "string", "aliases": ["cmd", "run"]},
+            "cwd": {"type": "string", "description": "Working directory (relative to workspace). Default: workspace root."},
+            "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"],
+                        "description": "Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds."},
         },
         "required": ["command"],
     },
@@ -79,8 +91,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": "Reads the contents of a file from the filesystem. Use it to view source code, config files, logs, or any text file. Returns the file content with line numbers.",
         "properties": {
             "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
-            "offset": {"type": "integer", "aliases": ["startLine"]},
-            "limit": {"type": "integer", "aliases": ["maxLines", "lineLimit"]},
+            "offset": {"type": "integer", "aliases": ["startLine"],
+                "description": "Starting line number (0-based, default: 0)."},
+            "limit": {"type": "integer", "aliases": ["maxLines", "lineLimit"],
+                "description": "Max lines to read (default: 2000)."},
         },
         "required": ["filePath"],
     },
@@ -96,6 +110,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": "Lists files and directories at the given path. Use it to explore directory structure, find files by location, or verify file existence. Returns a list of file/directory names.",
         "properties": {
             "dirPath": {"type": "string", "aliases": ["path", "directory", "dir"]},
+            "recursive": {"type": "boolean", "description": "If true, list recursively. Default: false."},
+            "maxdepth": {"type": "integer", "description": "Max depth when recursive (1-3). Default: 1."},
         },
         "required": [],
     },
@@ -105,8 +121,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "pattern": {"type": "string", "aliases": ["regex", "query", "search"]},
             "path": {"type": "string", "aliases": ["filePath", "file", "directory", "dir"]},
             "include": {"type": "string", "aliases": ["glob", "filter"]},
-            "head_limit": {"type": "integer", "aliases": ["headLimit", "maxResults", "limit"]},
-            "context": {"type": "integer", "aliases": ["contextLines", "contextAround"]},
+            "head_limit": {"type": "integer", "aliases": ["headLimit", "maxResults", "limit"],
+                "description": "Max results to return (default: 500)."},
+            "context": {"type": "integer", "aliases": ["contextLines", "contextAround"],
+                "description": "Number of context lines around each match (default: 0)."},
             "multiline": {"type": "boolean", "aliases": ["multiLine", "dotAll"]},
         },
         "required": ["pattern"],
@@ -130,32 +148,31 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePath", "old_string", "new_string"],
     },
     "apply_patch": {
-        "description": "Applies one or more structured patch operations (replace, insert, or delete) to files. Use it for file modifications where each patch targets specific text. Returns the result of each patch operation.",
+        "description": "Apply file patch operations (create/update/delete files). Each patch specifies a file path, operation type, and content.",
         "properties": {
             "patches": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "file": {"type": "string", "description": "File path to patch"},
-                        "search": {"type": "string", "description": "Text to find"},
-                        "replace": {"type": "string", "description": "Text to replace with"},
-                        "oldText": {"type": "string", "description": "Old text (alternative to search)"},
-                        "newText": {"type": "string", "description": "New text (alternative to replace)"},
-                        "action": {"type": "string", "enum": ["replace", "insert", "delete"], "description": "Patch action type"},
+                        "op": {"type": "string", "description": "Operation: 'add' (create), 'update' (replace), or 'delete'"},
+                        "filePath": {"type": "string", "description": "Path to the file (relative to workspace)"},
+                        "oldString": {"type": "string", "description": "For update: text to find in the file"},
+                        "newString": {"type": "string", "description": "For update: replacement text"},
+                        "content": {"type": "string", "description": "For add: full file content"},
                     },
-                    "required": ["file"]
                 },
-                "description": "Array of patch objects. Each must have 'file' and one of: search+replace, oldText+newText, or action."
+                "description": "Array of patch operations",
             },
         },
-        "required": ["patches"],
+        "required": [],
     },
     "websearch": {
         "description": "Searches the public internet using a text query. Use it to find current information, research topics, look up documentation, or answer questions. Returns search result snippets with URLs.",
         "properties": {
             "query": {"type": "string", "aliases": ["search", "q", "term"]},
-            "numResults": {"type": "integer", "aliases": ["num_results", "limit", "count"]},
+            "numResults": {"type": "integer", "aliases": ["num_results", "limit", "count"],
+                "description": "Number of results (1-8, default: 5)."},
         },
         "required": ["query"],
     },
@@ -188,10 +205,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": "Creates and deploys a new agent with a specified name, role, goal, and backstory. Use it to bring new team members into the organization. Returns the new agent ID.",
         "properties": {
             "name": {"type": "string"},
-            "role": {"type": "string"},
+            "role": {"type": "string", "description": "Chinese job title. Display label only — does NOT determine permission. Use permissionType to set authority."},
+            "permissionType": {
+                "type": "string",
+                "enum": ["coordinator", "executor"],
+                "description": "MANDATORY. coordinator = manages subordinates (dispatch_task/review_task); executor = hands-on work (claim_task/submit_task). CEO's hiring request specifies this — pass it through verbatim.",
+            },
             "goal": {"type": "string"},
             "backstory": {"type": "string"},
-            "skills": {"type": "array", "items": {"type": "string"}},
+            "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills to bind. Tool skills: use \"#N\" to reference skills from list_available_skills by number (e.g. \"#1\"). Discipline skills: use full slug from matching table (e.g. \"self-review\", \"incremental-implementation\"). NOT raw tech names like 'React 18'."},
             "parentId": {"type": "string", "aliases": ["parent_id", "parent"]},
         },
         "required": ["name", "role"],
@@ -241,8 +263,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["content"],
     },
     "list_available_skills": {
-        "description": "Lists all skills currently available to the agent. Use it to discover what capabilities, tools, or skill modules can be invoked or assigned. Returns a list of skill names and descriptions.",
-        "properties": {},
+        "description": "Lists all skills available in the marketplace (built-in + external + skills.sh). Pass 'search' to filter by keyword. Returns numbered skills (e.g. #1, #2). Use \"#N\" in hire_agent's skills parameter to reference by number, or use full slug.",
+        "properties": {
+            "search": {"type": "string", "description": "Optional keyword to filter skills (e.g. 'react', 'testing', 'planning'). Case-insensitive."},
+        },
         "required": [],
     },
     "read_skill": {
@@ -296,8 +320,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "properties": {
             "toAgentId": {"type": "string", "aliases": ["to_agent_id", "target"]},
             "purpose": {"type": "string", "aliases": ["message", "description"]},
-            "fireInGameSeconds": {"type": "integer", "aliases": ["fire_in_game_seconds", "delay"]},
-            "repeatIntervalSeconds": {"type": "integer", "aliases": ["repeat_interval_seconds", "interval"]},
+            "fireInGameSeconds": {"type": "integer", "aliases": ["fire_in_game_seconds", "delay"],
+                "description": "Delay in game-time seconds before the alarm fires."},
+            "repeatIntervalSeconds": {"type": "integer", "aliases": ["repeat_interval_seconds", "interval"],
+                "description": "If set, alarm repeats every N game-time seconds. Omit for one-shot."},
         },
         "required": ["toAgentId", "purpose", "fireInGameSeconds"],
     },
@@ -428,7 +454,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["recipient", "message"],
     },
     "message_superior": {
-        "description": "Send a message to your parent/superior. Use report_completion when finishing a delegated task.",
+        "description": "Send a message to your parent/superior. Use submit_task when finishing a delegated task. DEPRECATED: message_superior is only for questions, not task completion.",
         "properties": {
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
             "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
@@ -453,21 +479,24 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Dispatch + review —
     "dispatch_task": {
-        "description": "Delegate a specific task to another agent for execution. Set expectReport to request a follow-up.",
+        "description": "Delegate a task to a subordinate agent for execution. Automatically creates a Task Ledger entry — do NOT call create_task first. Returns task_id. If you already created a task via create_task, pass its taskId to avoid duplication.",
         "properties": {
             "target": {"type": "string", "aliases": ["toAgentId", "to_agent_id", "recipient", "agentId"]},
             "task": {"type": "string", "aliases": ["description", "message", "content", "summary"]},
             "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
+            "taskId": {"type": "string", "aliases": ["task_id", "existing_task_id"],
+                "description": "Optional: reuse an existing task instead of creating a new one"},
         },
         "required": ["target", "task"],
     },
     "review": {
-        "description": "Review code, design, or deliverables for quality. Specify reviewType (code/design/security).",
+        "description": "Review code, design, or deliverables for quality. Specify reviewType (code_review/security_audit/test_review/perf_audit).",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
             "reviewType": {"type": "string",
-                "aliases": ["review_type", "type"]},
+                "aliases": ["review_type", "type"],
+                "description": "Review type: 'code_review', 'security_audit', 'test_review', or 'perf_audit'. Default: code_review."},
         },
         "required": ["filePaths"],
     },
@@ -481,7 +510,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["reviewerId", "target"],
     },
     "report_completion": {
-        "description": "Notify your superior that a delegated task is finished.",
+        "description": "DEPRECATED: Use submit_task instead. Notify your superior that a delegated task is finished.",
         "properties": {
             "summary": {"type": "string", "aliases": ["message", "content", "report", "description"]},
             "handoffId": {"type": "string", "aliases": ["handoff_id", "taskId", "task_id"]},
@@ -489,7 +518,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["summary"],
     },
     "approve_work": {
-        "description": "Approve a subordinate's deliverable. Optionally add review comments.",
+        "description": "DEPRECATED: Use review_task with decision='approve' instead. Approve a subordinate's deliverable. Optionally add review comments.",
         "properties": {
             "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
             "review": {"type": "string", "aliases": ["comment", "feedback", "notes"]},
@@ -497,7 +526,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["subordinate"],
     },
     "reject_work": {
-        "description": "Reject a subordinate's work with a required reason. They must redo it.",
+        "description": "DEPRECATED: Use review_task with decision='rework' instead. Reject a subordinate's work with a required reason. They must redo it.",
         "properties": {
             "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
             "reason": {"type": "string", "aliases": ["feedback", "review", "comment", "message"]},
@@ -514,13 +543,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["summary"],
     },
     # — Git worktrees —
-    "git_worktree_create": {
-        "description": "Create an isolated git worktree on a new branch for safe parallel development.",
-        "properties": {
-            "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
-        },
-        "required": ["branchName"],
-    },
+    # NOTE: git_worktree_create is intentionally excluded from executor tools.
+    # Executors already work inside a worktree; allowing create causes nested
+    # worktrees (D:\...\A005\.hiveweave\worktrees\A005\...). Only coordinator
+    # can create worktrees (via hire_agent which auto-creates them).
     "git_worktree_list": {
         "description": "List all active git worktrees with their branch names and paths.",
         "properties": {},
@@ -570,6 +596,90 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "destination": {"type": "string", "aliases": ["to", "dst", "destPath", "dest_path", "target"]},
         },
         "required": ["source", "destination"],
+    },
+    # — Task Ledger tools (Task 4) —
+    "create_task": {
+        "description": "Create a new task in the Task Ledger. This is the recommended way to create tasks. Use instead of send_message for task assignment. Task starts in 'created' status. Use dispatch_task for delegation to a subordinate, or assign directly via assigneeId.",
+        "properties": {
+            "title": {"type": "string", "aliases": ["name", "summary"]},
+            "description": {"type": "string", "aliases": ["detail", "body"]},
+            "priority": {"type": "integer", "aliases": ["level"],
+                "description": "Priority level (0-5, default: 2). Higher = more urgent."},
+            "dueAt": {"type": "integer", "aliases": ["due_at", "deadline"],
+                "description": "Due time in game-time seconds (epoch). Use 0 or omit for no deadline."},
+            "assigneeId": {"type": "string", "aliases": ["assignee_id", "assignee"]},
+            "acceptanceCriteria": {"type": "array", "items": {"type": "string"},
+                "aliases": ["acceptance_criteria"]},
+            "parentTaskId": {"type": "string", "aliases": ["parent_task_id", "parent"]},
+            "dependsOn": {"type": "array", "items": {"type": "string"},
+                "aliases": ["depends_on"]},
+            "expectedModules": {"type": "array", "items": {"type": "string"},
+                "aliases": ["expected_modules"]},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["title", "description"],
+    },
+    "claim_task": {
+        "description": "Claim a task in 'created' status (created → claimed). Sets you as the assignee. Only unassigned or created tasks can be claimed.",
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+        },
+        "required": ["taskId"],
+    },
+    "update_task_status": {
+        "description": "Update task status to 'running' (start or unblock work) or 'blocked' (with a reason). For 'running', tries start first then unblock. For 'blocked', requires blockedReason. If status omitted, defaults to 'running'.",
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "status": {"type": "string",
+                "description": "Target status: 'running' or 'blocked'. Defaults to 'running'.",
+                "enum": ["running", "blocked"]},
+            "blockedReason": {"type": "string",
+                "aliases": ["blocked_reason", "reason"]},
+        },
+        "required": ["taskId"],
+    },
+    "update_progress": {
+        "description": "Update task progress as a percentage (0-100). Does not change task status. Use while a task is running.",
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "progress": {"type": "integer", "aliases": ["percent"],
+                "description": "Progress percentage (0-100)."},
+        },
+        "required": ["taskId", "progress"],
+    },
+    "submit_task": {
+        "description": "Submit a task for review. Automatically handles claim+start if needed (created→claimed→running→submitted). Submit with evidence (commit, files_changed, tests_passed, summary). If taskId omitted, auto-detects your current task.",
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "summary": {"type": "string", "aliases": ["report", "description"]},
+            "commit": {"type": "string",
+                "aliases": ["commitSha", "commit_sha"]},
+            "filesChanged": {"type": "array", "items": {"type": "string"},
+                "aliases": ["files_changed", "files"]},
+            "testsPassed": {"type": "boolean", "aliases": ["tests_passed"]},
+        },
+        "required": ["summary"],
+    },
+    "review_task": {
+        "description": "Review a submitted task (reviewing → approved/rework). This replaces approve_work/reject_work. Use decision='approve' or 'rework'. Coordinator reviews submitted work. decision='approve' closes the review; decision='rework' sends it back for rework.",
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "decision": {"type": "string",
+                "description": "'approve' or 'rework'",
+                "aliases": ["verdict"]},
+            "feedback": {"type": "string",
+                "aliases": ["comment", "reason"]},
+        },
+        "required": ["taskId", "decision"],
+    },
+    "get_tasks": {
+        "description": "List tasks in the Task Ledger. Optional filters by status (e.g. 'created', 'claimed', 'running', 'blocked', 'submitted', 'reviewing', 'approved', 'rework', 'closed') or assignee. Excludes archived tasks.",
+        "properties": {
+            "status": {"type": "string"},
+            "assigneeId": {"type": "string",
+                "aliases": ["assignee_id", "assignee"]},
+        },
+        "required": [],
     },
 }
 
@@ -696,7 +806,7 @@ class ToolResult(dict):
 
 # ── ToolExecutor ───────────────────────────────────────────
 
-class ToolExecutor:
+class ToolExecutor(TaskToolsMixin):
     """Routes tool calls to implementations with permission gating +
     sandbox checks + output truncation.
 
@@ -742,6 +852,44 @@ class ToolExecutor:
         log.info("tool.execute", agent_id=agent_id, tool=name,
                  args_preview=str(tool_args)[:200])
 
+        # ── New pipeline path (Phase 2 migration) ──────────
+        # Try the registered tool pipeline first. If the tool is registered
+        # (via @tool decorator), it goes through Pydantic validation +
+        # unified security checks + permission evaluation.
+        # If the tool is NOT registered, fall through to the legacy path.
+        from hiveweave.tools.pipeline import execute_registered_tool, ToolContext
+
+        # Build context for orchestration tools that need service access
+        ctx = ToolContext(
+            org=self._org,
+            inbox=self._inbox,
+            charter=self._charter,
+            roster=self._roster,
+            skills=self._skills,
+            templates=self._templates,
+            permission=self.permission,
+            approval=self.approval,
+            review_llm_callback=self.review_llm_callback,
+        )
+
+        registered_result = await execute_registered_tool(
+            tool_name=name,
+            raw_args=tool_args,
+            agent_id=agent_id,
+            workspace_path=workspace_path,
+            permission=self.permission,
+            approval=self.approval,
+            ctx=ctx,
+        )
+        if registered_result is not None:
+            # Tool was handled by the new pipeline — apply truncation and return
+            if registered_result.get("output"):
+                registered_result["output"] = self._maybe_save_large_output(
+                    registered_result["output"], agent_id, name, workspace_path
+                )
+            return registered_result
+
+        # ── Legacy path (unregistered tools) ───────────────
         # 1.5. Validate & normalize args against schema — auto-correct
         # parameter name mistakes (e.g. LLM passes "query" → canonical "pattern")
         normalized_args, validation_error = validate_tool_args(name, tool_args)
@@ -761,9 +909,18 @@ class ToolExecutor:
             return self._error(f"Error: Permission check failed: {exc}")
 
         if decision == "deny":
-            return self._error(
-                f"Permission denied: {name} is blocked for this agent."
-            )
+            # 获取 agent 的 permission_type 以给出更精准的提示
+            agent_info = await meta_db.get_agent_by_id(agent_id)
+            perm_type = (agent_info or {}).get("permission_type", "")
+            if perm_type == "coordinator":
+                hint = (
+                    f"Permission denied: coordinator agents cannot use '{name}'. "
+                    f"This is a read-only role. Use dispatch_task to assign this work "
+                    f"to an executor agent, or use send_message to request an executor to do it."
+                )
+            else:
+                hint = f"Permission denied: {name} is blocked for this agent."
+            return self._error(hint)
 
         if decision == "ask":
             # Request approval (120s timeout)
@@ -839,7 +996,9 @@ class ToolExecutor:
         if name == "run_command":
             command = args.get("command") or ""
             cwd = args.get("cwd") or ""
-            timeout = args.get("timeout") or 120_000
+            timeout = args.get("timeout")
+            if timeout is None:
+                timeout = 120_000
             return await execute_run_command(
                 command=command, cwd=cwd,
                 timeout_ms=int(timeout),
@@ -1059,7 +1218,7 @@ class ToolExecutor:
         # ── Skill tools ─────────────────────────────────────
         if name == "list_available_skills":
             search = args.get("search")
-            result = await self._skills.list_available_skills(search)
+            result = await self._skills.list_available_skills(search, agent_id=agent_id)
             return {"success": True, "output": result, "error": None}
 
         if name == "read_skill":
@@ -1084,7 +1243,7 @@ class ToolExecutor:
                 target_id = target_agent["id"]
             result = await self._skills.bind_skill(target_id, skill_name)
             if result.get("ok"):
-                return {"success": True, "output": f"Skill '{skill_name}' bound to agent {target_id[:8]}...", "error": None}
+                return {"success": True, "output": f"Skill '{skill_name}' bound to agent {target_id}.", "error": None}
             return self._error(result.get("error", "Unknown error"))
 
         if name == "unbind_skill":
@@ -1100,7 +1259,7 @@ class ToolExecutor:
                 target_id = target_agent["id"]
             result = await self._skills.unbind_skill(target_id, skill_name)
             if result.get("ok"):
-                return {"success": True, "output": f"Skill '{skill_name}' unbound from agent {target_id[:8]}...", "error": None}
+                return {"success": True, "output": f"Skill '{skill_name}' unbound from agent {target_id}.", "error": None}
             return self._error(result.get("error", "Unknown error"))
 
         # ── Agent lifecycle tools ───────────────────────────
@@ -1148,7 +1307,15 @@ class ToolExecutor:
             return {"success": True, "output": f"Agent {target_agent['name']} transferred to new parent.", "error": None}
 
         # ── Git worktree tools (BUG-034: dispatchers were missing) ──
-        if name in ("git_worktree_create", "git_worktree_checkpoint",
+        # Executor 已在 worktree 中，禁止 create（防止嵌套）。
+        # 只允许 checkpoint/merge/remove/list/status。
+        if name == "git_worktree_create":
+            return self._error(
+                "You are already in a worktree. Do NOT create nested worktrees. "
+                "Use git_worktree_checkpoint to save progress, "
+                "git_worktree_merge to merge to main."
+            )
+        if name in ("git_worktree_checkpoint",
                      "git_worktree_merge", "git_worktree_remove",
                      "git_worktree_list", "git_worktree_status"):
             return await self._tool_git_worktree(agent_id, name, args)
@@ -1206,6 +1373,28 @@ class ToolExecutor:
         # ── Agent orchestration tools ──
         if name == "dispatch_task":
             return await self._tool_dispatch_task(agent_id, args)
+
+        # ── Task Ledger tools (Task 4) ──
+        if name == "create_task":
+            return await self._tool_create_task(agent_id, args)
+
+        if name == "claim_task":
+            return await self._tool_claim_task(agent_id, args)
+
+        if name == "update_task_status":
+            return await self._tool_update_task_status(agent_id, args)
+
+        if name == "update_progress":
+            return await self._tool_update_progress(agent_id, args)
+
+        if name == "submit_task":
+            return await self._tool_submit_task(agent_id, args)
+
+        if name == "review_task":
+            return await self._tool_review_task(agent_id, args)
+
+        if name == "get_tasks":
+            return await self._tool_get_tasks(agent_id, args)
 
         if name == "report_completion":
             return await self._tool_report_completion(agent_id, args)
@@ -1365,12 +1554,14 @@ class ToolExecutor:
         self, agent_id: str, path: str, workspace: str
     ) -> dict:
         """Create a new directory."""
-        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir
+        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir, _is_sensitive
         resolved = _resolve_safe(workspace, path)
         if resolved is None:
             return self._error(f"Path traversal denied: {path}")
         if _check_hiveweave_dir(resolved, workspace):
             return self._error("Access denied: cannot modify .hiveweave directory")
+        if _is_sensitive(path):
+            return self._error(f"Access denied: '{path}' matches a sensitive file pattern")
         try:
             Path(resolved).mkdir(parents=True, exist_ok=True)
             return {"success": True, "output": f"Created directory: {path}", "error": None}
@@ -1382,12 +1573,14 @@ class ToolExecutor:
     ) -> dict:
         """Delete a directory and its contents."""
         import shutil
-        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir
+        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir, _is_sensitive
         resolved = _resolve_safe(workspace, path)
         if resolved is None:
             return self._error(f"Path traversal denied: {path}")
         if _check_hiveweave_dir(resolved, workspace):
             return self._error("Access denied: cannot modify .hiveweave directory")
+        if _is_sensitive(path):
+            return self._error(f"Access denied: '{path}' matches a sensitive file pattern")
         target = Path(resolved)
         if not target.exists():
             return self._error(f"Directory not found: {path}")
@@ -1403,7 +1596,7 @@ class ToolExecutor:
         self, agent_id: str, pattern: str, directory: str, workspace: str
     ) -> dict:
         """Search for files by glob pattern."""
-        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir
+        from hiveweave.tools.file import _resolve_safe, _check_hiveweave_dir, _is_sensitive
         ws = Path(workspace).resolve()
         if directory != ".":
             resolved = _resolve_safe(workspace, directory)
@@ -1414,10 +1607,11 @@ class ToolExecutor:
             search_dir = ws
         try:
             matches = sorted(search_dir.rglob(pattern))
-            # 排除 .hiveweave 目录下的文件
+            # 排除 .hiveweave 目录下和敏感文件
             matches = [
                 m for m in matches[:200]
                 if not _check_hiveweave_dir(str(m), workspace)
+                and not _is_sensitive(str(m))
             ]
             paths = [str(m.relative_to(ws)) for m in matches[:50]]
             if not paths:
@@ -1466,29 +1660,16 @@ class ToolExecutor:
             return self._error(f"Failed to write memory: {e}")
 
     # ── Agent orchestration implementations (BUG-036) ─────
-
-    async def _tool_dispatch_task(self, agent_id: str, args: dict) -> dict:
-        """Dispatch a task to a subordinate."""
-        target = args.get("target") or args.get("agentId") or args.get("subordinate") or ""
-        task = args.get("task") or args.get("description") or ""
-        expect_report = args.get("expectReport") or args.get("expect_report") or False
-        if not target or not task:
-            return self._error("dispatch_task requires 'target' and 'task'")
-        from hiveweave.services.dispatch import DispatchService
-        project_id = await self._get_project_id(agent_id)
-        if not project_id:
-            return self._error(f"Agent {agent_id} has no project")
-        ds = DispatchService()
-        result = await ds.dispatch_task(
-            project_id=project_id, from_agent_id=agent_id,
-            to_agent_id=target, description=task, expect_report=expect_report,
-        )
-        if result.get("success"):
-            return {"success": True, "output": f"Task dispatched to {result.get('target_name', target)}", "error": None}
-        return self._error(result.get("message", "Dispatch failed"))
+    # Task Ledger tools (_tool_dispatch_task, _tool_create_task, _tool_claim_task,
+    # _tool_update_task_status, _tool_update_progress, _tool_submit_task,
+    # _tool_review_task, _tool_get_tasks) are in tools/task_tools.py (TaskToolsMixin).
 
     async def _tool_report_completion(self, agent_id: str, args: dict) -> dict:
-        """Report task completion to superior."""
+        """Report task completion to superior.
+
+        DEPRECATED: Use submit_task instead. This tool uses the legacy
+        HandoffService flow and does not record evidence in the Task Ledger.
+        """
         summary = args.get("summary") or args.get("report") or ""
         if not summary:
             return self._error("report_completion requires 'summary'")
@@ -1531,7 +1712,12 @@ class ToolExecutor:
         return {"success": True, "output": "Review requested from superior.", "error": None}
 
     async def _tool_approve_work(self, agent_id: str, args: dict) -> dict:
-        """Approve a subordinate's work."""
+        """Approve a subordinate's work.
+
+        DEPRECATED: Use review_task with decision='approve' instead. This tool
+        uses the legacy HandoffService flow and does not update Task Ledger
+        status.
+        """
         subordinate = args.get("subordinate") or args.get("agentId") or ""
         if not subordinate:
             return self._error("approve_work requires 'subordinate'")
@@ -1546,7 +1732,12 @@ class ToolExecutor:
         return self._error(result.get("message", "Approval failed"))
 
     async def _tool_reject_work(self, agent_id: str, args: dict) -> dict:
-        """Reject a subordinate's work (request rework)."""
+        """Reject a subordinate's work (request rework).
+
+        DEPRECATED: Use review_task with decision='rework' instead. This tool
+        uses the legacy HandoffService flow and does not update Task Ledger
+        status.
+        """
         subordinate = args.get("subordinate") or args.get("agentId") or ""
         reason = args.get("reason") or args.get("feedback") or "Rework required."
         if not subordinate:
@@ -1611,7 +1802,7 @@ class ToolExecutor:
         )
         kind = "recurring" if repeat else "one-shot"
         extra = f", script bound" if script else ""
-        return {"success": True, "output": f"Alarm {alarm_id[:8]}... scheduled ({kind}{extra}). Fires at game second {fire_at} (in {fire_in} game seconds).", "error": None}
+        return {"success": True, "output": f"Alarm scheduled ({kind}{extra}). Fires at game second {fire_at} (in {fire_in} game seconds). Use alarm_id={alarm_id} to cancel.", "error": None, "alarm_id": alarm_id}
 
     async def _tool_list_alarms(self, agent_id: str) -> dict:
         """List all pending alarms for the project."""
@@ -1629,7 +1820,7 @@ class ToolExecutor:
         lines = []
         for a in pending[:20]:
             remaining = max(0, (a.get("fire_at_game_seconds", 0) or 0) - now)
-            lines.append(f"[{a['id'][:8]}] fire in {remaining}gs — {a.get('purpose', '?')}")
+            lines.append(f"[{a['id']}] fire in {remaining}gs — {a.get('purpose', '?')}")
         return {"success": True, "output": "\n".join(lines), "error": None}
 
     async def _tool_cancel_alarm(
@@ -1645,7 +1836,7 @@ class ToolExecutor:
         from hiveweave.services.game_time import GameTimeService
         gts = GameTimeService(project_id)
         await gts.cancel_alarm(alarm_id)
-        return {"success": True, "output": f"Alarm {alarm_id[:8]}... cancellation requested.", "error": None}
+        return {"success": True, "output": f"Alarm {alarm_id} cancellation requested.", "error": None}
 
     # ── Web fetch (OpenCode parity, BUG-036) ──────────────
     # P0 安全修复：scheme 校验 + SSRF 防护 + 流式读取 + content-length 检查
@@ -1697,8 +1888,9 @@ class ToolExecutor:
             return self._error("Invalid URL: no hostname")
 
         # 2. SSRF 防护
-        if self._is_ssrf_blocked(parsed.hostname):
-            return self._error(f"Access denied: cannot fetch internal address {parsed.hostname}")
+        hostname = parsed.hostname
+        if hostname and self._is_ssrf_blocked(hostname):
+            return self._error(f"Access denied: cannot fetch internal address {hostname}")
 
         try:
             # 3. 先 HEAD 请求检查 content-length（如果服务器支持）
@@ -1725,8 +1917,9 @@ class ToolExecutor:
                     redirect_parsed = urlparse(redirect_url)
                     if redirect_parsed.scheme not in ("http", "https"):
                         return self._error(f"Redirect to non-http scheme blocked: {redirect_parsed.scheme}")
-                    if self._is_ssrf_blocked(redirect_parsed.hostname):
-                        return self._error(f"Redirect to internal address blocked: {redirect_parsed.hostname}")
+                    redirect_hostname = redirect_parsed.hostname
+                    if redirect_hostname and self._is_ssrf_blocked(redirect_hostname):
+                        return self._error(f"Redirect to internal address blocked: {redirect_hostname}")
                     url = redirect_url
                     resp = await client.get(url, headers={"User-Agent": "HiveWeave/1.0"})
                     redirects += 1
@@ -1875,6 +2068,32 @@ class ToolExecutor:
         """Resolve agent_id → project_id via Meta DB."""
         return await meta_db.get_agent_project_id(agent_id)
 
+    async def _resolve_agent_id(self, project_id: str, name_or_id: str) -> str | None:
+        """Resolve agent name/short_id/UUID to a real agent_id within a project.
+
+        Priority: UUID exact → short_id → UUID prefix → name → role.
+        Returns the agent_id (UUID) or None if not found.
+        """
+        if not name_or_id:
+            return None
+        inp = name_or_id.strip()
+
+        # 1. Try resolve_agent (handles UUID, short_id, UUID prefix)
+        agent = await self._org.resolve_agent(inp)
+        if agent and agent.get("project_id") == project_id:
+            return agent["id"]
+
+        # 2. Try name / role match within the project
+        all_agents = await self._org.list_agents(project_id)
+        for a in all_agents:
+            if a.get("name", "").lower() == inp.lower():
+                return a["id"]
+        for a in all_agents:
+            if a.get("role", "").lower() == inp.lower():
+                return a["id"]
+
+        return None
+
     async def _tool_send_message(self, agent_id: str, args: dict) -> dict:
         """send_message: CEO/HR → subordinates/peers via InboxService.
 
@@ -1942,7 +2161,7 @@ class ToolExecutor:
         # Resolve remaining agent recipients
         recipients = agent_recipients
         if not recipients:
-            return {"ok": True, "results": results}
+            return {"success": True, "output": f"Messages sent. Results: {results}", "error": None, "results": results}
 
         # Resolve each recipient: short_id (A001) or name → agent record
         all_agents = await self._org.list_agents(project_id)
@@ -1962,11 +2181,15 @@ class ToolExecutor:
                     if a.get("name", "").lower() == r_stripped.lower():
                         match = a
                         break
-            # Try role match (e.g. "HR")
+            # Try role match (e.g. "HR") — last resort, warn to use 花名
             if not match:
                 for a in all_agents:
                     if a.get("role", "").lower() == r_stripped.lower():
                         match = a
+                        log.warning("send_message_role_fallback",
+                                    agent_id=agent_id,
+                                    recipient=r, matched_name=match.get("name"),
+                                    hint="use 花名 or short_id instead of role")
                         break
             if match:
                 # Skip self — sending to yourself is a no-op
@@ -1981,7 +2204,7 @@ class ToolExecutor:
         if not resolved:
             # If we already sent to user, return partial success
             if results:
-                return {"ok": True, "results": results, "not_found": not_found}
+                return {"success": True, "output": f"Messages sent. Results: {results}", "error": None, "results": results, "not_found": not_found}
             return self._error(
                 f"No recipients found. Unknown: {not_found}. "
                 f"Available agents: {[(a['name'], a.get('short_id'), a.get('role')) for a in all_agents]}"
@@ -2064,6 +2287,12 @@ class ToolExecutor:
         parent_id = args.get("parentId") or args.get("parent_id") or ""
         goal = args.get("goal") or ""
         template_id = args.get("templateId") or args.get("template_id")
+        # permissionType: HR 显式指定 (MANDATORY per schema). 角色名不可枚举
+        # (跨领域: 前端架构师/内容策划主管/美术指导/数据科学负责人...), 不能靠
+        # role 字符串推断权限. 显式 > 隐式.
+        perm_type_arg = (
+            args.get("permissionType") or args.get("permission_type") or ""
+        ).strip().lower()
 
         if not name:
             return self._error("hire_agent requires 'name' (agent codename)")
@@ -2106,9 +2335,21 @@ class ToolExecutor:
             if ceo:
                 parent_id = ceo["id"]
 
-        # Determine permission_type: coordinator roles → coordinator, else executor
-        coordinator_roles = {"ceo", "hr", "qa", "cto", "architect", "manager", "pm"}
-        perm_type = "coordinator" if role.lower() in coordinator_roles else "executor"
+        # Determine permission_type: 优先用 HR 显式指定的 permissionType.
+        # 角色名不可枚举 (跨领域), 旧的关键词精确匹配会误判中文管理角色
+        # (如 "前端架构师" ≠ "architect" → 被判 executor, Task Ledger 断裂).
+        # 显式指定是根因修复; 关键词回退仅为向后兼容旧 agent, 并打 warning.
+        if perm_type_arg in ("coordinator", "executor"):
+            perm_type = perm_type_arg
+        else:
+            coordinator_roles = {"ceo", "hr", "qa", "cto", "architect", "manager", "pm"}
+            perm_type = "coordinator" if role.lower() in coordinator_roles else "executor"
+            log.warning(
+                "tool.hire_agent.permission_type_inferred",
+                role=role, inferred=perm_type,
+                hint="HR should pass explicit permissionType; role-string "
+                     "inference is unreliable for non-English/unknown roles",
+            )
         perm_mode = "readonly" if perm_type == "coordinator" else "readwrite"
 
         # Get default model_id: 优先从项目现有 agent 继承，其次从 ModelService 取第一个 active model
@@ -2139,6 +2380,49 @@ class ToolExecutor:
         )
         language = project_row["language"] if project_row else "zh"
 
+        # 校验 skill slug 有效性（漏洞1修复）
+        # 1. 先解析 "#N" 格式引用 → 真实 slug（来自 list_available_skills 缓存）
+        # 2. 内置 skill 同步检查；skills.sh skill 异步检查（8s 超时）
+        # 3. 无效 slug 直接拒绝招聘，避免 agent 运行时 read_skill 失败
+        if skills and isinstance(skills, list):
+            # 解析 #N 引用
+            resolved_skills: list[str] = []
+            unresolved: list[str] = []
+            for sk in skills:
+                sk = sk.strip() if isinstance(sk, str) else str(sk).strip()
+                resolved = self._skills.resolve_skill_ref(agent_id, sk)
+                if resolved is None:
+                    unresolved.append(sk)
+                else:
+                    resolved_skills.append(resolved)
+            if unresolved:
+                return self._error(
+                    f"Unresolved skill references: {unresolved}. "
+                    "Use list_available_skills first, then reference by \"#N\" or use full slug."
+                )
+
+            # 校验 slug 有效性
+            valid_skills: list[str] = []
+            invalid_skills: list[str] = []
+            for sk in resolved_skills:
+                # 先查内置（同步）
+                if self._skills._get_builtin_skill(sk) is not None:
+                    valid_skills.append(sk)
+                else:
+                    # 查 skills.sh（异步）
+                    detail = await self._skills._fetch_skills_sh_detail(sk)
+                    if detail is not None:
+                        valid_skills.append(sk)
+                    else:
+                        invalid_skills.append(sk)
+            if invalid_skills:
+                return self._error(
+                    f"Invalid skill slugs: {invalid_skills}. "
+                    "Use list_available_skills to find valid slugs. "
+                    "Raw tech names like 'React 18' are NOT valid slugs."
+                )
+            skills = valid_skills
+
         attrs = {
             "project_id": project_id,
             "name": name,
@@ -2167,6 +2451,7 @@ class ToolExecutor:
             # 用项目根目录即可）。worktree 路径写入 agents.workspace_path，
             # Agent._get_workspace_path() 会优先读取此字段重定向工具执行目录。
             worktree_path = ""
+            worktree_error = ""
             if perm_type == "executor":
                 try:
                     from hiveweave.services.git_worktree import GitWorktreeService
@@ -2189,7 +2474,9 @@ class ToolExecutor:
                 except Exception as wt_err:
                     log.warning("tool.hire_agent.worktree_failed",
                                 agent_id=new_id, error=str(wt_err))
+                    worktree_error = str(wt_err)
                     # worktree 创建失败不阻断招聘 — agent 回退到项目根
+                    # 但启动时会自动恢复（main.py lifespan step 2c）
 
             # BUG-010 修复：创建后立即启动 agent，让它能处理 inbox 消息。
             # 否则 hire_agent 创建的 executor 只是 DB 一行，无法消费任务。
@@ -2221,11 +2508,16 @@ class ToolExecutor:
             except Exception as evt_err:
                 log.debug("hire_agent_event_push_failed", error=str(evt_err))
 
-            wt_info = (
-                f"  工作区: {worktree_path}\n"
-                if worktree_path else
-                "  工作区: (共享项目根目录)\n"
-            )
+            if worktree_path:
+                wt_info = f"  Worktree: {worktree_path}\n"
+            elif worktree_error:
+                wt_info = (
+                    f"  Worktree: creation failed ({worktree_error})\n"
+                    f"  Agent will use project root until next restart\n"
+                    f"  (worktree auto-recovers on backend restart)\n"
+                )
+            else:
+                wt_info = "  Worktree: (shared project root)\n"
             return {
                 "success": True,
                 "output": (

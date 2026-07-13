@@ -99,10 +99,8 @@ async def system_dump() -> dict:
 
     active_agents: list[str] = []
     try:
-        rows = await meta_db.query(
-            "SELECT id FROM agents WHERE status = 'active' LIMIT 1000"
-        )
-        active_agents = [r["id"] for r in rows]
+        from hiveweave.services.agent_router import agent_router
+        active_agents = [r.agent_id for r in agent_router.list_active_routes()]
     except Exception as e:
         log.warning("system_dump_agents_failed", error=str(e))
 

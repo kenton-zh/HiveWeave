@@ -264,7 +264,8 @@ class ApprovalService:
             tools = []
         if tool_pattern not in tools:
             tools.append(tool_pattern)
-            await meta_db.execute(
+            await project_db.execute(
+                agent_id,
                 f"UPDATE agents SET {field_name} = ? WHERE id = ?",
                 [json.dumps(tools), agent_id],
             )

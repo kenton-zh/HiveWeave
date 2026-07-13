@@ -222,22 +222,27 @@ coverage/
 
         # 3-level fallback: origin/<base> → <base> → master
         # (契约 09 RECONCILE: master 兜底处理遗留仓库)
+        # Use -B (force create) instead of -b: if the branch already exists
+        # from a previous worktree that was physically deleted but not
+        # git-pruned, -b fails with "already exists". -B resets the ref
+        # to the base, which is safe since the old worktree is gone.
         fwd_path = path.replace("\\", "/")
         attempts = [
-            ["worktree", "add", fwd_path, "-b", branch, f"origin/{base_branch}"],
-            ["worktree", "add", fwd_path, "-b", branch, base_branch],
-            ["worktree", "add", fwd_path, "-b", branch, "master"],
+            ["worktree", "add", fwd_path, "-B", branch, f"origin/{base_branch}"],
+            ["worktree", "add", fwd_path, "-B", branch, base_branch],
+            ["worktree", "add", fwd_path, "-B", branch, "master"],
         ]
         for args in attempts:
-            ok, _ = await _git(args, workspace_path)
+            ok, out = await _git(args, workspace_path)
             if ok:
                 log.info("git_worktree.create", short_id=short_id,
                          branch=branch, base=base_branch)
                 return {"success": True, "path": path, "branch": branch}
+            last_error = out
 
         log.error("git_worktree.create_failed", short_id=short_id,
-                  path=path, branch=branch)
-        return {"success": False, "message": "Failed to create worktree"}
+                  path=path, branch=branch, error=last_error)
+        return {"success": False, "message": f"Failed to create worktree: {last_error}"}
 
     # ── 2. CHECKPOINT ────────────────────────────────────────
 

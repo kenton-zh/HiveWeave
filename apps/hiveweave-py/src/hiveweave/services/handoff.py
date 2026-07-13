@@ -29,6 +29,7 @@ _MISSING_COLUMNS = [
     ("reported_up", "INTEGER DEFAULT 0"),
     ("updated_at", "INTEGER"),
     ("context_delivered", "INTEGER DEFAULT 0"),
+    ("task_id", "TEXT"),
 ]
 _migrated: set[str] = set()
 
@@ -73,7 +74,8 @@ class HandoffService:
 
     async def create_handoff(self, project_id: str, from_agent_id: str,
                              to_agent_id: str, summary: str,
-                             expect_report: bool = False) -> str:
+                             expect_report: bool = False,
+                             task_id: str | None = None) -> str:
         """Create a handoff with dedup (同 from/to/summary 1 分钟内不重复)."""
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
@@ -93,11 +95,12 @@ class HandoffService:
         handoff_id = str(uuid.uuid4())
         await _execute(project_id,
             "INSERT INTO handoffs (id, from_agent_id, to_agent_id, module_id, summary, "
-            "status, expect_report, reported_up, created_at, updated_at) "
-            "VALUES (?, ?, ?, NULL, ?, 'pending', ?, 0, ?, ?)",
-            [handoff_id, from_agent_id, to_agent_id, summary, expect, now_ms, now_ms])
+            "status, expect_report, reported_up, created_at, updated_at, task_id) "
+            "VALUES (?, ?, ?, NULL, ?, 'pending', ?, 0, ?, ?, ?)",
+            [handoff_id, from_agent_id, to_agent_id, summary, expect, now_ms, now_ms,
+             task_id])
         log.info("handoff_created", from_agent_id=from_agent_id,
-                 to_agent_id=to_agent_id, summary=summary[:60])
+                 to_agent_id=to_agent_id, summary=summary[:60], task_id=task_id)
         return handoff_id
 
     async def accept_pending_handoffs(self, project_id: str, agent_id: str) -> int:
@@ -220,6 +223,46 @@ class HandoffService:
         await _execute(project_id,
             f"UPDATE handoffs SET context_delivered = 1, updated_at = ? "
             f"WHERE id IN ({placeholders})", [now_ms] + handoff_ids)
+
+    async def mark_reported(self, project_id: str, agent_id: str,
+                            task_id: str | None = None,
+                            to_sender_id: str | None = None) -> int:
+        """Mark handoffs as reported_up=1 when agent submits task or sends reply.
+
+        Args:
+            agent_id: The agent who is reporting (to_agent_id in handoff).
+            task_id: If provided, only clear handoffs with matching task_id.
+            to_sender_id: If provided, only clear handoffs FROM this sender
+                          (from_agent_id). Used when agent replies to a specific
+                          person — should NOT clear obligations from other senders.
+        Returns number of handoffs updated.
+        """
+        await _ensure_schema(project_id)
+        now_ms = int(time.time() * 1000)
+
+        conditions = ["to_agent_id = ?", "status = 'accepted'",
+                      "expect_report = 1", "reported_up = 0"]
+        params: list = [agent_id]
+
+        if task_id:
+            conditions.append("(task_id = ? OR task_id IS NULL)")
+            params.append(task_id)
+        if to_sender_id:
+            conditions.append("from_agent_id = ?")
+            params.append(to_sender_id)
+
+        where = " AND ".join(conditions)
+        rows = await _query(project_id,
+            f"SELECT id FROM handoffs WHERE {where}", params)
+
+        if not rows:
+            return 0
+        ids = [r["id"] for r in rows]
+        placeholders = ", ".join(["?"] * len(ids))
+        await _execute(project_id,
+            f"UPDATE handoffs SET reported_up = 1, updated_at = ? "
+            f"WHERE id IN ({placeholders})", [now_ms] + ids)
+        return len(ids)
 
     async def get_unreported_accepted_handoffs(self, project_id: str,
                                                agent_id: str) -> list[dict]:

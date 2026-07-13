@@ -130,20 +130,25 @@ class TestPatchHiveweaveBlock:
 
 
 class TestListFilesHiveweaveBlock:
-    """list_files 应拒绝显式列出 .hiveweave 目录。"""
+    """list_files 允许列出 .hiveweave 根目录，但过滤敏感文件（data.db 等）。"""
 
     @pytest.mark.asyncio
-    async def test_list_files_explicit_hiveweave_blocked(self, tmp_path: Path):
+    async def test_list_files_hiveweave_filters_sensitive(self, tmp_path: Path):
         from hiveweave.tools.file import list_files
         hw_dir = tmp_path / ".hiveweave"
         hw_dir.mkdir()
         (hw_dir / "data.db").write_text("fake")
+        (hw_dir / "shared").mkdir()
         result = await list_files(
             path=".hiveweave",
             workspace_path=str(tmp_path),
         )
-        assert result["success"] is False
-        assert ".hiveweave" in result["error"]
+        # 列出成功（允许访问 .hiveweave 根目录）
+        assert result["success"] is True
+        # 敏感文件 data.db 被过滤
+        assert "data.db" not in result.get("output", "")
+        # shared 子目录可见
+        assert "shared" in result.get("output", "")
 
     @pytest.mark.asyncio
     async def test_list_files_skips_hiveweave_in_recursive(self, tmp_path: Path):

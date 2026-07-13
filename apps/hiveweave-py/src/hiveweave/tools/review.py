@@ -542,3 +542,66 @@ async def execute_review(
                 "error": f"Error: Review failed — {exc}"}
 
     return {"success": True, "output": _format_result(result), "error": None}
+
+
+# ── Pydantic models + @tool registration (Phase 3 migration) ──────
+
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+
+from .base import tool
+from .helpers import coerce_to_list
+from .result import ToolResult
+
+
+class ReviewParams(BaseModel):
+    """Parameters for review tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    file_paths: list[str] = Field(
+        alias="filePaths",
+        description="List of file paths to review.",
+        json_schema_extra={"aliases": ["files", "target", "path", "file", "module", "file_paths"]},
+    )
+    review_type: str = Field(
+        default="code_review",
+        alias="reviewType",
+        description="Review type: 'code_review', 'security_audit', 'test_review', 'perf_audit', or 'full_review'.",
+        json_schema_extra={"aliases": ["review_type", "type"]},
+    )
+    test_files: list[str] | None = Field(
+        default=None,
+        alias="testFiles",
+        description="Test file paths (for test_review only).",
+        json_schema_extra={"aliases": ["test_files", "tests"]},
+    )
+
+    @field_validator("file_paths", mode="before")
+    @classmethod
+    def _coerce_file_paths(cls, v: Any) -> Any:
+        return coerce_to_list(v)
+
+    @field_validator("test_files", mode="before")
+    @classmethod
+    def _coerce_test_files(cls, v: Any) -> Any:
+        return coerce_to_list(v)
+
+
+@tool(
+    "review",
+    "Review code, design, or deliverables for quality. Specify reviewType (code_review/security_audit/test_review/perf_audit/full_review).",
+    requires_workspace=True,
+    security_level="standard",
+)
+async def review_tool(params: ReviewParams, agent_id: str, workspace: str, ctx=None) -> ToolResult:
+    """Run a code review."""
+    callback = ctx.review_llm_callback if ctx else None
+    result = await execute_review(
+        review_type=params.review_type,
+        file_paths=params.file_paths,
+        test_files=params.test_files,
+        workspace_path=workspace,
+        call_llm=callback,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    return ToolResult.err(result.get("error", "Review failed"))

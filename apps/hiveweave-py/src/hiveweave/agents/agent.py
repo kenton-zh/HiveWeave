@@ -68,382 +68,25 @@ TRIGGER_DELAY_MS = 100
 SELF_RETRIGGER_DELAY_MS = 500
 """自检 retrigger 前的延迟。"""
 
-MAX_TOOL_ROUNDS_BY_ROLE: dict[str, int] = {
-    "CEO": 60,
-    "HR": 40,
-    "coordinator": 50,
-    "manager": 50,
-    "executor": 80,
-}
-"""角色专属 tool loop 最大轮次。对齐 Elixir agent.ex:39 max_tool_rounds_for_role/1。"""
-
-DEFAULT_MAX_TOOL_ROUNDS = 25
-"""未知角色的默认 tool loop 轮次。"""
+DEFAULT_MAX_TOOL_ROUNDS = 100
+"""所有角色统一的 tool loop 最大轮次。不再按角色区别对待。"""
 
 CONTEXT_WINDOW_DEFAULT = 128_000
 """默认 context window（模型配置缺失时）。"""
 
-# ── 工具描述（最小注册表）────────────────────────────────────
-# PermissionService 返回工具名列表，Streamer 需要完整定义。
-# 这里维护一个名称→描述的映射，参数 schema 用 permissive（additionalProperties: true）。
-
-# Per-tool explicit parameter schemas. Tools listed here expose a typed
-# schema to the LLM (so it knows which params exist — e.g. parentId for
-# hire_agent, which lets HR place a new agent under a specific manager
-# instead of the default CEO). Tools not listed fall back to the
-# permissive schema in _build_tool_definitions.
-_TOOL_SCHEMAS: dict[str, dict] = {
-    "hire_agent": {
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": (
-                    "Agent codename — a creative Chinese flower-name (花名), "
-                    "2-4 chars. Example: 折纸, 拾光, 鹿鸣, 鲸落."
-                ),
-            },
-            "role": {
-                "type": "string",
-                "description": (
-                    "Chinese job title (e.g. 前端工程师, 后端开发, 测试工程师). "
-                    "Determines permission_type: coordinator roles "
-                    "(ceo/hr/qa/cto/architect/manager/pm) → readonly, others → readwrite."
-                ),
-            },
-            "goal": {
-                "type": "string",
-                "description": (
-                    "Agent's goal. Defaults to 'Execute {role} responsibilities.' "
-                    "if omitted."
-                ),
-            },
-            "backstory": {
-                "type": "string",
-                "description": (
-                    "2-4 sentence personal narrative — past experience, "
-                    "personality, hobbies. NOT project-related. Makes the agent "
-                    "feel like a real character."
-                ),
-            },
-            "skills": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "Skill slugs to bind. Use list_available_skills to search "
-                    "by keyword. See HR Recruitment Skill Standards table for "
-                    "role→skills mapping."
-                ),
-            },
-            "parentId": {
-                "type": "string",
-                "description": (
-                    "Parent agent ID — places the new agent under a specific "
-                    "manager in the org tree. Accepts UUID, short_id (e.g. "
-                    "'A001'), or agent name. Default: CEO. "
-                    "IRON RULE: never set parentId to your own ID — HR is a "
-                    "service role, not an org manager. Default new agents under "
-                    "the CEO or the requesting business manager."
-                ),
-            },
-            "templateId": {
-                "type": "string",
-                "description": (
-                    "Template ID to pre-fill role/goal/backstory/skills. Use "
-                    "list_agent_templates to browse. Explicit params override "
-                    "template values."
-                ),
-            },
-        },
-        "required": ["name", "role"],
-    },
-    # BUG-036: question tool schema — without this the LLM guesses
-    # parameter names (message/content/query) and hits 'question is required'
-    "question": {
-        "type": "object",
-        "properties": {
-            "question": {
-                "type": "string",
-                "description": "The question to ask the user. Be clear and specific.",
-            },
-            "options": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional list of choices for the user to pick from.",
-            },
-        },
-        "required": ["question"],
-    },
-    # BUG-036: alarm tool schemas
-    "schedule_alarm": {
-        "type": "object",
-        "properties": {
-            "toAgentId": {
-                "type": "string",
-                "description": "Agent ID to notify (use your own id for self-reminder, or another agent's id/name/short_id). Use 'self' for self-targeting.",
-            },
-            "purpose": {
-                "type": "string",
-                "description": "Message delivered when the alarm fires (e.g. 'Check build status'). Delivered via inbox with [ALARM] prefix.",
-            },
-            "fireInGameSeconds": {
-                "type": "number",
-                "description": "Seconds of GAME TIME from now until first fire. 1 real hour = 1 game day (86400 game seconds). E.g. 3600 game seconds ≈ 2.5 real minutes.",
-            },
-            "repeatIntervalSeconds": {
-                "type": "number",
-                "description": "If set, alarm repeats every N game seconds. E.g. 43200 = repeat every 12 game hours (30 real minutes). Omit for one-shot.",
-            },
-            "scriptCommand": {
-                "type": "string",
-                "description": "Shell command to execute when the alarm fires (e.g. 'python check_build.py'). Runs BEFORE inbox notification. 120s timeout.",
-            },
-        },
-        "required": ["toAgentId", "purpose", "fireInGameSeconds"],
-    },
-    "cancel_alarm": {
-        "type": "object",
-        "properties": {
-            "alarmId": {
-                "type": "string",
-                "description": "The ID of the alarm to cancel.",
-            },
-        },
-        "required": ["alarmId"],
-    },
-    # BUG-036: send_message schema — LLM needs to know expectReport parameter
-    "send_message": {
-        "type": "object",
-        "properties": {
-            "recipients": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "List of recipient agent names, short_ids, or roles (e.g. ['HR'], ['A005'], ['墨言']).",
-            },
-            "message": {
-                "type": "string",
-                "description": "Message body. CAVEMAN style for agents — no pleasantries, just facts.",
-            },
-            "expectReport": {
-                "type": "boolean",
-                "description": "If true, recipient sees **[REPLY REQUIRED]** and should respond. Use for task assignments and review requests.",
-            },
-            "priority": {
-                "type": "string",
-                "enum": ["normal", "urgent"],
-                "description": "Message priority. Use 'urgent' for escalations and critical issues.",
-            },
-        },
-        "required": ["recipients", "message"],
-    },
-    # BUG-036: update_goals schema — LLM needs to know expected parameter names
-    "update_goals": {
-        "type": "object",
-        "properties": {
-            "objective": {
-                "type": "string",
-                "description": "Updated project objective (mission statement).",
-            },
-            "focus": {
-                "type": "string",
-                "description": "Current focus area or priority.",
-            },
-            "keyResults": {
-                "type": "array",
-                "items": {"type": "object"},
-                "description": "List of key results, each with 'text' and optional 'status' fields.",
-            },
-            "userInvolvement": {
-                "type": "string",
-                "description": "Desired user involvement level: low/medium/high.",
-            },
-        },
-    },
-    # BUG-036: edit_file schema — LLM needs explicit parameter names to avoid
-    # guessing wrong field names (oldText/newText vs oldString/newString)
-    "edit_file": {
-        "type": "object",
-        "properties": {
-            "filePath": {
-                "type": "string",
-                "description": "Path to the file to edit (relative to workspace or absolute).",
-            },
-            "oldString": {
-                "type": "string",
-                "description": "The exact text to search for in the file. Must be unique — if it matches multiple places, the edit fails. Include enough context lines to make it unique.",
-            },
-            "newString": {
-                "type": "string",
-                "description": "The replacement text. Use empty string to delete the matched text.",
-            },
-        },
-        "required": ["filePath", "oldString", "newString"],
-    },
-    # apply_patch schema — supports both single-patch and multi-patch format
-    "apply_patch": {
-        "type": "object",
-        "properties": {
-            "patches": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "op": {
-                            "type": "string",
-                            "enum": ["add", "update", "delete"],
-                            "description": "Operation: add (create new file), update (search-and-replace), delete (remove file).",
-                        },
-                        "filePath": {
-                            "type": "string",
-                            "description": "Path to the file (relative to workspace or absolute).",
-                        },
-                        "oldString": {
-                            "type": "string",
-                            "description": "(update only) Text to search for. Must be unique in the file.",
-                        },
-                        "newString": {
-                            "type": "string",
-                            "description": "(update only) Replacement text.",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "(add only) Full content for the new file.",
-                        },
-                    },
-                    "required": ["op", "filePath"],
-                },
-                "description": "List of patch operations to apply.",
-            },
-        },
-        "required": ["patches"],
-    },
-    # bash schema — LLM needs to know parameter names
-    "bash": {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "The shell command to execute.",
-            },
-            "workdir": {
-                "type": "string",
-                "description": "Working directory (relative to workspace). Defaults to workspace root.",
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Timeout in milliseconds. Default 120000 (2 min), max 600000 (10 min).",
-            },
-        },
-        "required": ["command"],
-    },
-    # read_file schema
-    "read_file": {
-        "type": "object",
-        "properties": {
-            "filePath": {
-                "type": "string",
-                "description": "Path to the file to read (relative to workspace or absolute).",
-            },
-            "offset": {
-                "type": "integer",
-                "description": "Line number to start reading from (0-based). Default 0.",
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Maximum number of lines to read. Default 2000.",
-            },
-        },
-        "required": ["filePath"],
-    },
-    # write_file schema
-    "write_file": {
-        "type": "object",
-        "properties": {
-            "filePath": {
-                "type": "string",
-                "description": "Path to the file to write (relative to workspace or absolute).",
-            },
-            "content": {
-                "type": "string",
-                "description": "Full content to write to the file.",
-            },
-        },
-        "required": ["filePath", "content"],
-    },
-    # list_files schema
-    "list_files": {
-        "type": "object",
-        "properties": {
-            "dirPath": {
-                "type": "string",
-                "description": "Directory path (relative to workspace). Defaults to workspace root.",
-            },
-            "recursive": {
-                "type": "boolean",
-                "description": "If true, list files recursively. Default false.",
-            },
-        },
-    },
-    # grep schema
-    "grep": {
-        "type": "object",
-        "properties": {
-            "pattern": {
-                "type": "string",
-                "description": "Regex pattern to search for.",
-            },
-            "path": {
-                "type": "string",
-                "description": "Directory or file to search in (relative to workspace).",
-            },
-            "include": {
-                "type": "string",
-                "description": "File glob pattern to filter (e.g. '*.py').",
-            },
-            "context": {
-                "type": "integer",
-                "description": "Lines of context around matches. Default 0.",
-            },
-        },
-        "required": ["pattern"],
-    },
-    # run_code_review / run_tests / etc schema
-    "run_code_review": {
-        "type": "object",
-        "properties": {
-            "filePaths": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "List of file paths to review.",
-            },
-        },
-        "required": ["filePaths"],
-    },
-    "run_tests": {
-        "type": "object",
-        "properties": {
-            "filePaths": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "List of source file paths to analyze for test coverage.",
-            },
-            "testFiles": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "List of test file paths to analyze.",
-            },
-        },
-        "required": ["filePaths"],
-    },
-}
+# ── 工具描述 ────────────────────────────────────────────────
+# PermissionService 返回工具名列表，_build_tool_definitions 从
+# hiveweave.tools.executor.TOOL_PARAM_SCHEMAS 取参数 schema。
+# 本模块不再维护工具 schema 副本 (历史 _TOOL_SCHEMAS 已删除 — 存在
+# 两份副本导致改一处忘改另一处, hire_agent permissionType 就是因此漏改)。
 
 
 def _build_tool_definitions(tool_names: list[str]) -> list[dict]:
     """将工具名列表转为 LLM 工具定义。
 
-    优先使用 _TOOL_SCHEMAS 中的显式 schema（让 LLM 看到可用参数，如
-    hire_agent 的 parentId，从而支持创建时指定父级）。未列出的工具用
-    permissive schema（additionalProperties: true），实际参数校验由
+    从 hiveweave.tools.executor.TOOL_PARAM_SCHEMAS 取参数 schema（让 LLM
+    看到可用参数，如 hire_agent 的 parentId/permissionType）。未列出的工具
+    用 permissive schema（additionalProperties: true），实际参数校验由
     ToolExecutor 执行。
     """
     tools: list[dict] = []
@@ -534,11 +177,15 @@ class Agent:
         self._cancel_reason: str | None = None
         self._message_queue: list[tuple[str, dict, int]] = []
         self._streaming_msg_id: str | None = None
+        self._reply_reminder_count = 0  # expect_reply 提示次数，3 次后升级到上级
+        self._REPLY_REMINDER_MAX = 3   # 即时提醒上限
 
         # ── asyncio 原语 ──
         self._llm_task: asyncio.Task | None = None
         self._safety_timer: asyncio.TimerHandle | None = None
         self._lock = asyncio.Lock()
+        self._heartbeat_task: asyncio.Task | None = None
+        self._heartbeat_active = False
 
         # ── 回调 ──
         self._on_status_change = on_status_change
@@ -837,7 +484,7 @@ class Agent:
             # 获取工具定义
             tools = await self._get_tool_definitions()
 
-            # 创建 Streamer（角色专属 max_tool_rounds）
+            # 创建 Streamer（统一 max_tool_rounds = 100）
             max_rounds = self._get_max_tool_rounds()
             streamer = Streamer(max_tool_rounds=max_rounds)
 
@@ -849,6 +496,9 @@ class Agent:
                 max_rounds=max_rounds,
                 msg_count=len(messages),
             )
+
+            # 启动 thinking 心跳 — 让前端知道 agent 在工作
+            self._start_heartbeat()
 
             # 空响应重试循环
             current_messages = list(messages)
@@ -908,6 +558,8 @@ class Agent:
             await self._handle_error(e)
 
         finally:
+            # 确保心跳停止（所有退出路径的兜底）
+            self._stop_heartbeat()
             # 只有当前 task 仍是 self._llm_task 时才清理状态
             # （cancel() 后若新 chat() 启动了新 task，不应清理新 task 的状态）
             if self._llm_task is current_task:
@@ -1010,6 +662,16 @@ class Agent:
                 cur_ver = charter_service.get_goals_version(self.project_id)
                 await charter_service.set_agent_goals_version(self.id, cur_ver)
 
+        # Org directory — only inject when dirty (org chart changed since last read).
+        # 仿照 goals_dirty: create/dismiss/transfer agent 时 bump version,
+        # agent 首次对话注入一次精简通讯录后清除标记, 避免重复注入浪费 token.
+        org_directory = ""
+        if self._org.org_dirty(self.id, self.project_id):
+            org_directory = await self._org.build_org_directory(self.project_id)
+            if org_directory:
+                cur_org_ver = self._org.get_org_version(self.project_id)
+                await self._org.set_agent_org_version(self.id, cur_org_ver)
+
         # Involvement level
         involvement = self.config.get("involvement_level", "medium")
 
@@ -1050,6 +712,10 @@ class Agent:
         # 追加 skills section
         if skills_section:
             context = f"{context}\n\n{skills_section}"
+
+        # 追加 org directory (仅 org chart 变更后首次对话注入)
+        if org_directory:
+            context = f"{context}\n\n{org_directory}"
 
         return context
 
@@ -1126,12 +792,8 @@ class Agent:
         return _build_tool_definitions(tool_names)
 
     def _get_max_tool_rounds(self) -> int:
-        """获取角色专属 tool loop 最大轮次。
-
-        对齐 Elixir agent.ex:39 max_tool_rounds_for_role/1。
-        """
-        role = self.config.get("role", "")
-        return MAX_TOOL_ROUNDS_BY_ROLE.get(role, DEFAULT_MAX_TOOL_ROUNDS)
+        """获取 tool loop 最大轮次。所有角色统一 100 次。"""
+        return DEFAULT_MAX_TOOL_ROUNDS
 
     def _get_context_window(self) -> int:
         """获取 context window 大小。"""
@@ -1304,12 +966,51 @@ class Agent:
 
         # 3. 标记 inbox 已读（仅非空输出时）
         if self.pending_inbox_msg_ids:
-            await self._inbox.mark_read_by_ids(
-                self.id, self.pending_inbox_msg_ids
-            )
+            # 分组：需要回复的 vs 不需要回复的
+            unreplied = await self._check_unreplied_expect_report(tool_calls)
+
+            if unreplied and self._reply_reminder_count < self._REPLY_REMINDER_MAX:
+                # 只标记不需要回复的消息已读，需要回复的保持未读
+                unreplied_ids = {m["id"] for m in unreplied}
+                no_reply_ids = [
+                    mid for mid in self.pending_inbox_msg_ids
+                    if mid not in unreplied_ids
+                ]
+                if no_reply_ids:
+                    await self._inbox.mark_read_by_ids(self.id, no_reply_ids)
+
+                # 注入精准提示：列出已回复和未回复的人
+                hint = await self._build_reply_hint(unreplied)
+                await self._conversation.append_turn(
+                    self.id, self.project_id,
+                    [{"role": "user", "content": hint}]
+                )
+                self._reply_reminder_count += 1
+                log.info(
+                    "reply_reminder_injected",
+                    agent_id=self.id,
+                    from_count=len(unreplied),
+                    marked_read=len(no_reply_ids),
+                    reminder_round=self._reply_reminder_count,
+                )
+            elif unreplied and self._reply_reminder_count >= self._REPLY_REMINDER_MAX:
+                # 达到上限仍未回复 → 升级到上级
+                await self._inbox.mark_read_by_ids(
+                    self.id, self.pending_inbox_msg_ids
+                )
+                await self._escalate_unreplied(unreplied)
+                self._reply_reminder_count = 0
+            else:
+                # 全部标记已读（已回复 / 无需回复）
+                await self._inbox.mark_read_by_ids(
+                    self.id, self.pending_inbox_msg_ids
+                )
+                self._reply_reminder_count = 0
+
             self.pending_inbox_msg_ids = None
 
-        # 4. 状态 → idle
+        # 4. 状态 → idle (先取消 safety timer，再 reset)
+        self._cancel_safety_timer()
         self._reset_to_idle()
 
         # 5. 发送 done 事件（前端 streamChat 等待此事件停止 loading）
@@ -1442,6 +1143,7 @@ class Agent:
                 msg="no superior to escalate to",
             )
 
+        self._cancel_safety_timer()
         self._reset_to_idle()
 
     async def _handle_error(self, error: Exception) -> None:
@@ -1529,7 +1231,51 @@ class Agent:
             )
             self.pending_inbox_msg_ids = None
 
+        self._cancel_safety_timer()
         self._reset_to_idle()
+
+    # ── 内部: thinking 心跳 ──────────────────────────────────
+
+    _HEARTBEAT_INTERVAL_S: float = 5.0
+    """心跳间隔（秒）。每 5 秒发一次 thinking 事件，让前端知道 agent 还在工作。"""
+
+    def _start_heartbeat(self) -> None:
+        """启动 thinking 心跳任务。
+
+        在 LLM 调用期间周期性广播 thinking 事件，让前端在 agent
+        长时间无输出（thinking 模式/多轮工具调用）时不至于"看似卡死"。
+        首个 text_delta/thinking_delta/tool_call_start 事件会停止心跳。
+        """
+        if self._heartbeat_task is not None:
+            return
+        self._heartbeat_active = True
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name=f"agent-{self.id}-heartbeat"
+        )
+
+    async def _heartbeat_loop(self) -> None:
+        """心跳循环 — 每 N 秒广播一次 thinking 事件。"""
+        elapsed = 0.0
+        try:
+            while self._heartbeat_active:
+                await asyncio.sleep(self._HEARTBEAT_INTERVAL_S)
+                if not self._heartbeat_active:
+                    break
+                elapsed += self._HEARTBEAT_INTERVAL_S
+                self._broadcast_stream_event({
+                    "type": "thinking",
+                    "elapsed_s": elapsed,
+                    "agentId": self.id,
+                })
+        except asyncio.CancelledError:
+            pass
+
+    def _stop_heartbeat(self) -> None:
+        """停止 thinking 心跳任务。"""
+        self._heartbeat_active = False
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
 
     # ── 内部: 安全超时 ────────────────────────────────────────
 
@@ -1601,6 +1347,7 @@ class Agent:
                 }
             )
 
+        self._cancel_safety_timer()
         self._reset_to_idle()
 
     async def _handle_cancel(self) -> None:
@@ -1614,7 +1361,173 @@ class Agent:
         # 保留 inbox 未读（用户取消不应标记已读）
         # pending_inbox_msg_ids 保持不变，下次 trigger 可重新处理
 
+        self._cancel_safety_timer()
         self._reset_to_idle()
+
+    # ── 内部: expect_reply 回复检查 ──────────────────────────
+
+    async def _check_unreplied_expect_report(
+        self, tool_calls: list
+    ) -> list[dict]:
+        """检查这轮处理的 inbox 消息中，是否有 expect_report=1 但没被 send_message 回复的。
+
+        精准检测：A 收到 B/C/D 要求回复的消息，只回复了 B → 仍返回 C/D 的消息。
+        不再因为"调了 send_message"就认为全部已回复。
+
+        返回需要回复的消息列表（空列表 = 不需要提示）。
+        """
+        if not self.pending_inbox_msg_ids:
+            return []
+
+        pending = await self._inbox.get_pending_messages(self.id)
+        msg_ids_set = set(self.pending_inbox_msg_ids)
+        target_msgs = [m for m in pending if m["id"] in msg_ids_set]
+
+        expect_reply_msgs = [m for m in target_msgs if m.get("expect_report")]
+        if not expect_reply_msgs:
+            return []
+
+        # 批量解析 from_agent_id → name（避免 N+1 查询）
+        from_ids = {m.get("from_agent_id", "") for m in expect_reply_msgs if m.get("from_agent_id")}
+        name_map: dict[str, str] = {}
+        for fid in from_ids:
+            agent = await meta_db.get_agent_by_id(fid)
+            if agent:
+                name_map[fid] = agent.get("name", fid[:8])
+        for m in expect_reply_msgs:
+            fid = m.get("from_agent_id", "")
+            m["from_name"] = name_map.get(fid, fid[:8])
+
+        # 从 tool_calls 中提取 send_message 的实际收件人
+        replied_to: set[str] = set()
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function", {})
+            if func.get("name") != "send_message":
+                continue
+            raw_args = func.get("arguments", "")
+            if isinstance(raw_args, str):
+                try:
+                    args = json.loads(raw_args)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            elif isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                continue
+            recipients = args.get("recipients") or args.get("to") or []
+            if isinstance(recipients, str):
+                recipients = [recipients]
+            replied_to.update(recipients)
+
+        # 如果没有调 send_message，全部未回复
+        if not replied_to:
+            return expect_reply_msgs
+
+        # 精准过滤：只保留 A 没有回复的消息
+        unreplied: list[dict] = []
+        for m in expect_reply_msgs:
+            from_id = m.get("from_agent_id", "")
+            from_name = m.get("from_name", "")
+            if from_id in replied_to or (from_name and from_name in replied_to):
+                continue  # 已回复
+            unreplied.append(m)
+
+        return unreplied
+
+    async def _build_reply_hint(self, unreplied_msgs: list[dict]) -> str:
+        """构建精准回复提示：列出已回复和未回复的人。
+
+        场景: A 收到 B/C/D/E 消息，B/C/D 要求回复，A 只回复了 B。
+        提示应明确告诉 A："你已回复 B，但 C/D 仍未回复"。
+        """
+        # unreplied_msgs 已带有 from_name（由 _check_unreplied_expect_report 解析）
+        unreplied_details: list[str] = []
+        unreplied_names: list[str] = []
+        for m in unreplied_msgs:
+            name = m.get("from_name") or m.get("from_agent_id", "?")[:8]
+            unreplied_names.append(name)
+            preview = (m.get("message") or "")[:60]
+            unreplied_details.append(f"  ❌ {name}：{preview}")
+
+        # 查找本轮已回复的人
+        replied_names: list[str] = []
+        if self.pending_inbox_msg_ids:
+            pending = await self._inbox.get_pending_messages(self.id)
+            unreplied_ids = {m["id"] for m in unreplied_msgs}
+            # 需要解析名字的 from_id 集合
+            replied_from_ids = [
+                m.get("from_agent_id", "") for m in pending
+                if m["id"] in self.pending_inbox_msg_ids
+                and m["id"] not in unreplied_ids
+                and m.get("expect_report")
+            ]
+            # 批量解析
+            for fid in replied_from_ids:
+                agent = await meta_db.get_agent_by_id(fid)
+                name = agent.get("name", fid[:8]) if agent else fid[:8]
+                replied_names.append(name)
+
+        round_num = self._reply_reminder_count + 1
+        parts = [f"[REPLY REQUIRED] (第 {round_num} 次提醒)"]
+
+        if replied_names:
+            parts.append(f"你已回复：{', '.join(replied_names)} ✅")
+            parts.append(f"但以下 {len(unreplied_names)} 人仍在等待你的回复：")
+        else:
+            parts.append(f"以下 {len(unreplied_names)} 人标记了需要回复，但你上一轮没有调用 send_message：")
+
+        parts.extend(unreplied_details)
+        parts.append(
+            "你的文字输出其他 agent 看不到。"
+            "请立即调用 send_message(recipients=['花名'], message='...') "
+            "回复上述每一个人。注意：回复给其他人不算回复给这些人。"
+        )
+        return "\n".join(parts)
+
+    async def _escalate_unreplied(self, unreplied_msgs: list[dict]) -> None:
+        """达到提醒上限后，升级到上级。
+
+        给上级发消息，列出下属未回复的人员和消息。
+        """
+        # 获取自己的 name 和 parent_id
+        me = await meta_db.get_agent_by_id(self.id)
+        my_name = me.get("name", self.id[:8]) if me else self.id[:8]
+        parent_id = me.get("parent_id") if me else None
+
+        if not parent_id:
+            log.warning("escalate_no_parent",
+                        agent_id=self.id, name=my_name,
+                        unreplied_count=len(unreplied_msgs))
+            return
+
+        # unreplied_msgs 已带有 from_name（由 _check_unreplied_expect_report 解析）
+        lines = []
+        for m in unreplied_msgs:
+            from_name = m.get("from_name") or m.get("from_agent_id", "?")[:8]
+            preview = (m.get("message") or "")[:60]
+            lines.append(f"  - {from_name}：{preview}")
+
+        msg = (
+            f"[ESCALATION] 你的下属 {my_name} 经过 {self._REPLY_REMINDER_MAX} 次提醒后，"
+            f"仍未回复以下 {len(unreplied_msgs)} 人的消息，请直接介入协调：\n"
+            + "\n".join(lines)
+        )
+
+        try:
+            from hiveweave.services.inbox import InboxService
+            await InboxService().send_message(
+                "system", parent_id, msg,
+                message_type="system", priority="urgent")
+            from hiveweave.agents.trigger import trigger_subordinate
+            await trigger_subordinate(parent_id)
+            log.warning("reply_escalated",
+                        agent_id=self.id, name=my_name,
+                        parent_id=parent_id,
+                        unreplied_count=len(unreplied_msgs))
+        except Exception as e:
+            log.error("escalate_failed", agent_id=self.id, error=str(e))
 
     # ── 内部: 自检 re-trigger ────────────────────────────────
 
@@ -1720,6 +1633,8 @@ class Agent:
            placeholder 一直空），不会误判为 [对话被中断]
         2. 后端崩溃/重启时，部分输出已持久化
         """
+        # 第一个 delta 到达 → 停止心跳（LLM 开始产出内容了）
+        self._stop_heartbeat()
         self._broadcast_stream_event(event)
         if event.get("type") == "text_delta" and self._streaming_msg_id:
             acc = getattr(self, "_streaming_text_acc", "")
@@ -1750,6 +1665,9 @@ class Agent:
             tool_args = {}
 
         workspace = await self._get_workspace_path()
+
+        # 工具调用开始 → 停止心跳（agent 已进入工具执行阶段）
+        self._stop_heartbeat()
 
         # 广播工具调用开始
         self._broadcast_stream_event(

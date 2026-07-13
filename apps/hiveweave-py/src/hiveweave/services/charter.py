@@ -1,8 +1,8 @@
 """Charter service — project charter and enterprise goals management.
 
 契约 14: 项目章程与企业目标
-- agent_charters table in Meta DB (save: DELETE + INSERT in single transaction)
-- goals workbook in projects.charter_json (JSON: objective/focus/keyResults/userInvolvement)
+- agent_charters table in per-project DB (save: DELETE + INSERT in single transaction)
+- goals workbook in project_meta.goals_json (JSON: objective/focus/keyResults/userInvolvement)
 - Goals dirty-flag sync via in-memory version dict (replaces Elixir ETS)
 - userInvolvement default: "宏观决策+技术选型" (medium level)
 - key_results normalization: string → {text, status:"doing", owner:nil}
@@ -17,6 +17,8 @@ from typing import Any
 import structlog
 
 from hiveweave.db import meta as meta_db
+from hiveweave.db.project import ensure_project_db, get_project_db_by_project_id
+from hiveweave.services.agent_router import agent_router
 
 logger = structlog.get_logger()
 
@@ -38,6 +40,9 @@ class CharterService:
 
         content: str (charter body) or dict {title, content, status, project_rules}.
         Returns the new charter ID.
+
+        Writes to the per-project DB (agent_charters table). The project_id
+        is resolved via AgentRouter from agent_id to ensure correct routing.
         """
         if isinstance(content, dict):
             title = content.get("title", "Project Charter")
@@ -53,43 +58,67 @@ class CharterService:
         charter_id = str(uuid.uuid4())
         now = int(time.time() * 1000)
 
-        # Use raw connection for transaction (DELETE + INSERT atomically)
-        db = await meta_db.get_meta_db()
-        try:
-            await db.execute(
-                "DELETE FROM agent_charters WHERE project_id = ?",
-                [project_id],
+        # Route to per-project DB via AgentRouter
+        routed_pid = agent_router.get_project_id(agent_id)
+        if routed_pid is None:
+            raise ValueError(
+                f"Agent {agent_id} not found in AgentRouter"
             )
-            await db.execute(
+        workspace = await meta_db.get_project_workspace(routed_pid)
+        if workspace is None:
+            raise ValueError(
+                f"Workspace not found for project {routed_pid}"
+            )
+        conn = await ensure_project_db(workspace)
+        if conn is None:
+            raise ValueError(
+                f"Per-project DB unavailable for workspace {workspace}"
+            )
+
+        # Use per-project DB connection for transaction (DELETE + INSERT atomically)
+        try:
+            await conn.execute(
+                "DELETE FROM agent_charters WHERE project_id = ?",
+                [routed_pid],
+            )
+            await conn.execute(
                 """INSERT INTO agent_charters
                    (id, project_id, agent_id, title, content, status,
                     project_rules, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [charter_id, project_id, agent_id, title, body,
+                [charter_id, routed_pid, agent_id, title, body,
                  status, project_rules, now, now],
             )
-            await db.commit()
+            await conn.commit()
         except Exception as e:
             # C1 fix: 事务失败必须 rollback，否则失败的 DELETE 残留在连接上
             # 会被后续操作的 commit 误提交，导致 charter 数据丢失
-            await db.rollback()
-            logger.error("charter.save_failed", project_id=project_id,
+            await conn.rollback()
+            logger.error("charter.save_failed", project_id=routed_pid,
                          error=str(e))
             raise
 
-        logger.info("charter.saved", project_id=project_id, title=title[:80])
+        logger.info("charter.saved", project_id=routed_pid, title=title[:80])
         return charter_id
 
     async def read_charter(self, project_id: str) -> dict | None:
-        """Read the current project charter. Returns dict with 'formatted' or None."""
+        """Read the current project charter from per-project DB.
+
+        Returns dict with 'formatted' or None.
+        """
+        conn = await get_project_db_by_project_id(project_id)
+        if conn is None:
+            return None
         try:
-            row = await meta_db.query_one(
+            cursor = await conn.execute(
                 """SELECT id, project_id, agent_id, title, content, status,
                           project_rules, created_at, updated_at
                    FROM agent_charters WHERE project_id = ?
                    ORDER BY created_at DESC LIMIT 1""",
                 [project_id],
             )
+            row = await cursor.fetchone()
+            await cursor.close()
         except Exception:
             return None
         if row is None:
@@ -99,16 +128,25 @@ class CharterService:
         return d
 
     async def read_goals(self, project_id: str) -> dict:
-        """Read enterprise goals from projects.goals_json (agent-facing).
+        """Read enterprise goals from project_meta.goals_json (agent-facing).
 
         Uses the dedicated goals_json column to avoid overwriting the human-facing
         charter_json. Falls back to charter_json.goals for old data.
 
         Returns dict {objective, focus, keyResults, userInvolvement} or {}.
         """
-        row = await meta_db.query_one(
-            "SELECT goals_json, charter_json FROM projects WHERE id = ?", [project_id]
-        )
+        conn = await get_project_db_by_project_id(project_id)
+        if conn is None:
+            return {}
+        try:
+            cursor = await conn.execute(
+                "SELECT goals_json, charter_json FROM project_meta WHERE project_id = ?",
+                [project_id],
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        except Exception:
+            return {}
         if row is None:
             return {}
         # Prefer goals_json (agent-facing column)
@@ -132,7 +170,10 @@ class CharterService:
         return {}
 
     async def update_goals(self, project_id: str, goals: dict) -> None:
-        """Update enterprise goals (merge with existing, bump version)."""
+        """Update enterprise goals (merge with existing, bump version).
+
+        Writes to project_meta.goals_json in the per-project DB.
+        """
         existing = await self.read_goals(project_id)
 
         objective = goals.get("objective") or existing.get("objective", "")
@@ -158,12 +199,24 @@ class CharterService:
             "userInvolvement": user_involvement,
         })
 
-        # Write to dedicated goals_json column (agent-facing), NOT charter_json.
-        # charter_json is human-facing and uses a nested {"vision","goals","constraints"} format.
-        await meta_db.execute(
-            "UPDATE projects SET goals_json = ? WHERE id = ?",
-            [goals_json, project_id],
+        # Write to project_meta.goals_json in per-project DB (agent-facing).
+        # Uses UPSERT to handle the case where the project_meta row doesn't exist yet.
+        conn = await get_project_db_by_project_id(project_id)
+        if conn is None:
+            logger.warning(
+                "goals_update_no_db", project_id=project_id
+            )
+            return
+        now = int(time.time() * 1000)
+        await conn.execute(
+            """INSERT INTO project_meta (project_id, goals_json, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(project_id) DO UPDATE SET
+                   goals_json = excluded.goals_json,
+                   updated_at = excluded.updated_at""",
+            [project_id, goals_json, now],
         )
+        await conn.commit()
         self.touch_goals_version(project_id)
         logger.info("charter.goals_updated", project_id=project_id)
 

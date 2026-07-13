@@ -5,6 +5,7 @@ fire alarms, detect stalls. Absolute time model. Cooldown in-memory (A5).
 """
 
 import asyncio
+import os
 import time
 import uuid
 
@@ -13,14 +14,29 @@ import structlog
 from hiveweave.db import meta as meta_db
 from hiveweave.db.project import ensure_project_db
 
+# ── Constants ────────────────────────────────────────────────
+
+# Minimal environment variable whitelist for alarm script execution.
+# Filters out API keys, DB credentials, and other sensitive env vars.
+_SAFE_ENV_KEYS = frozenset({
+    "PATH", "HOME", "USER", "USERNAME", "USERPROFILE",
+    "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
+    "LANG", "LC_ALL", "LC_CTYPE",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME", "PYTHONIOENCODING",
+    "NODE_PATH", "NODE_OPTIONS",
+    "PROJECT_NAME", "PROJECT_ID",
+})
+
 log = structlog.get_logger(__name__)
 
 REAL_SECONDS_PER_GAME_DAY = 3600
 GAME_SECONDS_PER_DAY = 86400
 TICK_INTERVAL = 5
-STALL_CHECK_TICKS = 12        # 12 * 5s = 60s
-STALL_IDLE_MS = 10 * 60 * 1000        # 10 min
-STALL_COOLDOWN_MS = 10 * 60 * 1000    # 10 min (in-memory, A5)
+STALL_CHECK_TICKS = 24        # 24 * 5s = 120s = 2min
+STALL_IDLE_MS = 10 * 60 * 1000        # 10 min idle threshold
+STALL_COOLDOWN_MS = 15 * 60 * 1000    # 15 min cooldown (避免重复触发)
+STALL_ESCALATION_THRESHOLD = 3        # 同一对未回复触发 3 次后升级到上级
 
 _states: dict[str, dict] = {}          # project_id → state
 _alarm_project: dict[str, str] = {}    # alarm_id → project_id
@@ -197,11 +213,9 @@ class GameTimeService:
             except Exception as e:
                 log.error("alarm_fire_failed", alarm_id=alarm["id"], error=str(e))
         state["alarms"] = [a for a in state["alarms"] if not a["fired"]]
-        # idle escalation 已禁用 — 原 _check_stalled 每 10 分钟给 idle agent 的
-        # superior 发 escalation，导致 CEO 陷入循环（HR/QA idle → escalation →
-        # CEO 回复"待命" → 10min 后再次 escalation）。如果需要恢复，取消下行注释。
-        # if state["tick_count"] % STALL_CHECK_TICKS == 0:
-        #     await self._check_stalled(project_id)
+        # Watchdog: 每 2 分钟检查停滞 agent，直接触发（不经过上级）
+        if state["tick_count"] % STALL_CHECK_TICKS == 0:
+            await self._check_stalled(project_id)
         log.debug("game_time_tick", project_id=project_id, game_seconds=new_gs)
 
     # ── Internal ──────────────────────────────────────────────
@@ -257,18 +271,29 @@ class GameTimeService:
         script = alarm.get("script_command", "")
         if script:
             try:
-                import asyncio
-                proc = await asyncio.create_subprocess_shell(
-                    script,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=120
-                )
-                if proc.returncode != 0:
-                    log.warning("alarm_script_failed", alarm_id=alarm["id"],
-                                rc=proc.returncode, stderr=stderr.decode()[:200])
+                from hiveweave.tools.bash import _validate_command_safety
+                blocked, reason = _validate_command_safety(script)
+                if blocked:
+                    log.warning("alarm_script_blocked", alarm_id=alarm["id"], reason=reason)
+                    # 跳过脚本执行，继续后续 inbox 通知
+                else:
+                    import asyncio
+                    safe_env = {
+                        k: v for k, v in os.environ.items()
+                        if k.upper() in _SAFE_ENV_KEYS
+                    }
+                    proc = await asyncio.create_subprocess_shell(
+                        script,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=safe_env,
+                    )
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=120
+                    )
+                    if proc.returncode != 0:
+                        log.warning("alarm_script_failed", alarm_id=alarm["id"],
+                                    rc=proc.returncode, stderr=stderr.decode()[:200])
             except Exception as e:
                 log.error("alarm_script_error", alarm_id=alarm["id"], error=str(e))
 
@@ -322,39 +347,270 @@ class GameTimeService:
             return None
 
     async def _check_stalled(self, project_id: str) -> None:
-        """Detect stalled agents and escalate (every 60s). Uses updated_at as heartbeat."""
+        """Watchdog: 精准检测"该回复但没回复"的 agent（每 2 分钟）。
+
+        只触发以下情况的 agent:
+        1. 有未读的 expect_report=1 inbox 消息（inbox watcher 兜底）
+        2. 有已读但未回复的 expect_report=1 inbox 消息（agent 处理了但忘了回复）
+        3. 有 accepted handoff 且 expect_report=1 且 reported_up=0（接收了任务上下文但没提交）
+
+        不会触发:
+        - 阶段性完成工作、等待新任务的 agent
+        - 没有待回复消息的 idle agent
+        """
         state = _states.get(project_id)
         if not state:
             return
-        agents = await meta_db.query(
-            "SELECT id, name, parent_id, updated_at FROM agents "
-            "WHERE project_id = ? AND status = 'active'", [project_id])
+
         now_ms = int(time.time() * 1000)
-        for agent in agents:
-            aid = agent["id"]
-            idle_ms = now_ms - (agent["updated_at"] or now_ms)
-            if idle_ms < STALL_IDLE_MS:
+
+        # ── Case 1: 未读的 expect_report 消息（inbox watcher 兜底）──
+        unread_reply = await _query(project_id,
+            "SELECT i.to_agent_id, i.from_agent_id, i.message, i.created_at, i.id "
+            "FROM inbox i "
+            "WHERE i.read = 0 AND i.expect_report = 1 "
+            f"AND i.created_at < {now_ms - STALL_IDLE_MS} "
+            "AND i.to_agent_id IN ("
+            "  SELECT id FROM agents WHERE status = 'active')",
+            [])
+
+        # ── Case 2: 已读但未回复的 expect_report 消息 ──
+        # 检测方式: 收到 expect_report 消息后，没有给发送方发过任何回复
+        read_unreplied = await _query(project_id,
+            "SELECT i.to_agent_id, i.from_agent_id, i.message, i.created_at, i.id "
+            "FROM inbox i "
+            "WHERE i.read = 1 AND i.expect_report = 1 "
+            f"AND i.created_at < {now_ms - STALL_IDLE_MS} "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM inbox r "
+            "  WHERE r.from_agent_id = i.to_agent_id "
+            "  AND r.to_agent_id = i.from_agent_id "
+            "  AND r.created_at > i.created_at"
+            ") "
+            "AND i.to_agent_id IN ("
+            "  SELECT id FROM agents WHERE status = 'active')",
+            [])
+
+        # ── Case 3: accepted handoff 且 expect_report=1 且 reported_up=0 ──
+        unreported_handoffs = await _query(project_id,
+            "SELECT h.to_agent_id, h.from_agent_id, h.summary, h.created_at, h.id, h.task_id "
+            "FROM handoffs h "
+            "WHERE h.status = 'accepted' AND h.expect_report = 1 "
+            "AND h.reported_up = 0 "
+            f"AND h.created_at < {now_ms - STALL_IDLE_MS} "
+            "AND h.to_agent_id IN ("
+            "  SELECT id FROM agents WHERE status = 'active')",
+            [])
+
+        # 汇总需要触发的 agent → 结构化待办列表
+        # trigger_map: agent_id → list of {type, from_id, from_name, message_preview, msg_created_at}
+        trigger_map: dict[str, list[dict]] = {}
+
+        # 批量获取所有涉及的 agent name 和 parent_id
+        all_agent_ids = set()
+        for m in unread_reply + read_unreplied:
+            all_agent_ids.add(m["to_agent_id"])
+            all_agent_ids.add(m["from_agent_id"])
+        for h in unreported_handoffs:
+            all_agent_ids.add(h["to_agent_id"])
+            all_agent_ids.add(h["from_agent_id"])
+
+        name_map: dict[str, str] = {}
+        parent_map: dict[str, str | None] = {}
+        if all_agent_ids:
+            id_placeholders = ", ".join(["?"] * len(all_agent_ids))
+            name_rows = await _query(project_id,
+                f"SELECT id, name, parent_id FROM agents WHERE id IN ({id_placeholders})",
+                list(all_agent_ids))
+            name_map = {r["id"]: r["name"] for r in name_rows}
+            parent_map = {r["id"]: r["parent_id"] for r in name_rows}
+
+        def _name(aid: str) -> str:
+            return name_map.get(aid, aid[:8])
+
+        # Case 1: 未读的 expect_report 消息
+        for m in unread_reply:
+            aid = m["to_agent_id"]
+            trigger_map.setdefault(aid, []).append({
+                "type": "unread",
+                "from_id": m["from_agent_id"],
+                "from_name": _name(m["from_agent_id"]),
+                "preview": (m["message"] or "")[:80],
+                "msg_created_at": m["created_at"],
+            })
+
+        # Case 2: 已读但未回复的 expect_report 消息
+        # 注意：不跳过已出现在 trigger_map 中的 agent —
+        # A 可能同时有未读消息（from X）和已读未回复消息（from D, E）
+        for m in read_unreplied:
+            aid = m["to_agent_id"]
+            # 避免重复：如果同一条消息已在 unread_reply 中则跳过
+            existing_ids = {e["from_id"] for e in trigger_map.get(aid, []) if e["type"] == "unread"}
+            if m["from_agent_id"] in existing_ids:
                 continue
-            last = state["stall_cooldowns"].get(aid, 0)
-            if now_ms - last < STALL_COOLDOWN_MS:
-                continue  # A5: in-memory cooldown, restart loses
-            state["stall_cooldowns"][aid] = now_ms
-            reason = f"idle for {idle_ms // 60000}min"
-            # R13 fix: agent 是 aiosqlite.Row，不支持 .get()，改用 [] 索引
-            # （列均由 SELECT 显式查询：id, name, parent_id, updated_at）
-            parent_id = agent["parent_id"]
-            log.warning("agent_stalled", agent_id=aid, name=agent["name"], reason=reason)
-            try:
-                if parent_id:
-                    from hiveweave.services.inbox import InboxService
-                    msg = (f"[ESCALATION] Your subordinate {agent['name'] or aid} "
-                           f"appears stalled: {reason}. Please check on them.")
-                    await InboxService().send_message(
-                        aid, parent_id, msg, message_type="escalation", priority="urgent")
+            trigger_map.setdefault(aid, []).append({
+                "type": "unreplied",
+                "from_id": m["from_agent_id"],
+                "from_name": _name(m["from_agent_id"]),
+                "preview": (m["message"] or "")[:80],
+                "msg_created_at": m["created_at"],
+            })
+
+        # Case 3: 未报告的 handoff
+        for h in unreported_handoffs:
+            aid = h["to_agent_id"]
+            trigger_map.setdefault(aid, []).append({
+                "type": "unreported",
+                "from_id": h["from_agent_id"],
+                "from_name": _name(h["from_agent_id"]),
+                "preview": (h["summary"] or "")[:80],
+                "msg_created_at": h["created_at"],
+            })
+
+        if not trigger_map:
+            return
+
+        log.info("watchdog_scan",
+                 project_id=project_id,
+                 agents_to_trigger=len(trigger_map),
+                 unread=len(unread_reply),
+                 unreplied=len(read_unreplied),
+                 unreported=len(unreported_handoffs))
+
+        # 初始化 stall_trackers: {agent_id: {sender_id: {ts, count}}}
+        if "stall_trackers" not in state:
+            state["stall_trackers"] = {}
+
+        # 清理已回复的 tracker：
+        # 如果 A 当前不再出现在 trigger_map 中，说明所有消息已回复，重置计数
+        for aid in list(state["stall_trackers"].keys()):
+            if aid not in trigger_map:
+                del state["stall_trackers"][aid]
+
+        # 对于仍在 trigger_map 中的 agent，清理已回复的 sender
+        for aid, items in trigger_map.items():
+            trackers = state["stall_trackers"].get(aid, {})
+            current_senders = {it["from_id"] for it in items}
+            # 删除不再 pending 的 sender
+            for sid in list(trackers.keys()):
+                if sid not in current_senders:
+                    del trackers[sid]
+
+        # 只触发需要回复的 agent
+        for aid, items in trigger_map.items():
+            trackers = state["stall_trackers"].setdefault(aid, {})
+
+            # 按 sender 分组，检查每个 sender 的触发次数
+            # 过滤掉已在 cooldown 内的 sender
+            pending_items = []
+            escalated_senders = []
+            for it in items:
+                sender_id = it["from_id"]
+                tracker = trackers.get(sender_id, {"ts": 0, "count": 0})
+
+                # cooldown 检查（按 sender 粒度）
+                if now_ms - tracker["ts"] < STALL_COOLDOWN_MS:
+                    continue
+
+                # 更新计数
+                tracker["ts"] = now_ms
+                tracker["count"] += 1
+                trackers[sender_id] = tracker
+
+                if tracker["count"] >= STALL_ESCALATION_THRESHOLD:
+                    escalated_senders.append(it)
                 else:
-                    log.warning("ceo_stalled", agent_id=aid, name=agent["name"])
+                    pending_items.append(it)
+
+            if not pending_items and not escalated_senders:
+                continue
+
+            agent_name = _name(aid)
+
+            log.warning("watchdog_trigger",
+                        agent_id=aid, name=agent_name,
+                        pending_count=len(pending_items),
+                        escalated_count=len(escalated_senders),
+                        senders=[it["from_name"] for it in items])
+
+            try:
+                from hiveweave.services.inbox import InboxService
+                inbox = InboxService()
+
+                # ── 1. 给 A 发精准通知（列出已回复和未回复的人）──
+                if pending_items:
+                    # 查询 A 在最近已经回复了哪些人（用于对比显示）
+                    replied_senders = set()
+                    all_expect_senders = {it["from_id"] for it in items}
+                    for sid in all_expect_senders:
+                        # 检查 A 是否在 D 的消息之后给 D 发过消息
+                        replied_rows = await _query(project_id,
+                            "SELECT 1 FROM inbox r "
+                            "WHERE r.from_agent_id = ? AND r.to_agent_id = ? "
+                            "AND r.created_at > ? LIMIT 1",
+                            [aid, sid, items[0]["msg_created_at"]])
+                        if replied_rows:
+                            replied_senders.add(sid)
+
+                    lines = []
+                    for it in pending_items:
+                        tag = {"unread": "未读", "unreplied": "已读未回复", "unreported": "未报告"}[it["type"]]
+                        lines.append(
+                            f"  ❌ [{tag}] {it['from_name']}：{it['preview']}"
+                        )
+
+                    replied_names = [_name(sid) for sid in replied_senders if sid not in {i["from_id"] for i in pending_items}]
+                    header = "[WATCHDOG] 以下人员正在等待你的回复，你尚未回复：\n"
+                    if replied_names:
+                        header = f"[WATCHDOG] 你已回复：{', '.join(replied_names)}，但以下人员仍未收到你的回复：\n"
+
+                    msg = (
+                        header
+                        + "\n".join(lines)
+                        + "\n请调用 send_message(recipients=['花名'], message='...') "
+                        "回复上述每一位。注意：回复给其他人不算回复给这些人。"
+                    )
+                    await inbox.send_message(
+                        "system", aid, msg,
+                        message_type="system", priority="urgent")
+
+                    from hiveweave.agents.trigger import trigger_subordinate
+                    await trigger_subordinate(aid)
+
+                # ── 2. 升级到 A 的上级 ──
+                if escalated_senders:
+                    parent_id = parent_map.get(aid)
+                    if parent_id:
+                        esc_lines = []
+                        for it in escalated_senders:
+                            esc_lines.append(
+                                f"  - {agent_name} 已 {STALL_ESCALATION_THRESHOLD} 次未回复 "
+                                f"{it['from_name']} 的消息：{it['preview']}"
+                            )
+                        esc_msg = (
+                            f"[WATCHDOG ESCALATION] 你的下属 {agent_name} "
+                            f"多次未能回复以下人员，请直接介入协调：\n"
+                            + "\n".join(esc_lines)
+                        )
+                        await inbox.send_message(
+                            "system", parent_id, esc_msg,
+                            message_type="system", priority="urgent")
+
+                        from hiveweave.agents.trigger import trigger_subordinate
+                        await trigger_subordinate(parent_id)
+
+                        log.warning("watchdog_escalated",
+                                    agent_id=aid, name=agent_name,
+                                    parent_id=parent_id,
+                                    escalated_senders=[it["from_name"] for it in escalated_senders])
+                    else:
+                        # A 没有上级（CEO），直接再触发一次
+                        log.warning("watchdog_cea_unesclatable",
+                                    agent_id=aid, name=agent_name)
+
             except Exception as e:
-                log.error("escalate_failed", agent_id=aid, error=str(e))
+                log.error("watchdog_trigger_failed",
+                          agent_id=aid, error=str(e))
 
     @staticmethod
     def _format(game_seconds: int) -> str:

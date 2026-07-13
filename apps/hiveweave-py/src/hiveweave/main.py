@@ -20,6 +20,7 @@ Shutdown sequence:
 """
 
 import sys
+from pathlib import Path
 
 # Force UTF-8 for stdout/stderr on Windows — prevents GBK encoding crashes
 # when logging Unicode characters (emoji, CJK names) via structlog.
@@ -102,6 +103,75 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("tool_output_cleanup_init_failed", error=str(e))
 
+    # 2b-migration: Legacy agent migration from meta_db to per-project DB
+    # has been removed. The old 'agents' table and 'agent_index' table are
+    # cleaned up by _migrate_meta_schema() in meta.py (DROP TABLE IF EXISTS).
+    # Agent routing is now handled by AgentRouter (in-memory) rebuilt at startup.
+
+    # 2c. Recover stale git worktrees for executor agents
+    # If a worktree directory was deleted (e.g., by sandbox cleanup or manual
+    # deletion), the git branch ref remains and blocks re-creation with -b.
+    # Step 1: prune stale worktree metadata. Step 2: re-create missing worktrees
+    # for active executor agents and update their workspace_path in DB.
+    try:
+        from hiveweave.services.git_worktree import GitWorktreeService, _git
+        from hiveweave.db import meta as meta_db
+        from hiveweave.db import project as project_db
+        import time as _wt_time
+        projects = await meta_db.query(
+            "SELECT id, workspace_path FROM projects WHERE 1=1"
+        )
+        recovered = 0
+        for p in projects:
+            ws = p["workspace_path"]
+            if not ws or not (Path(ws) / ".git").exists():
+                continue
+            # Prune stale worktree metadata
+            await _git(["worktree", "prune"], ws)
+            # Find executor agents with missing worktrees (agents 表在 per-project DB)
+            proj_conn = await project_db.get_project_db_by_project_id(p["id"])
+            if proj_conn is None:
+                continue
+            agent_cursor = await proj_conn.execute(
+                "SELECT id, name, role, short_id, workspace_path "
+                "FROM agents WHERE project_id=? AND status='active' "
+                "AND role NOT IN ('ceo', 'hr')",
+                [p["id"]],
+            )
+            agents = await agent_cursor.fetchall()
+            await agent_cursor.close()
+            gwt = GitWorktreeService()
+            for a in agents:
+                short_id = a["short_id"]
+                cur_ws = a["workspace_path"] or ""
+                # Check if worktree directory exists
+                if cur_ws and Path(cur_ws).exists() and (Path(cur_ws) / ".git").exists():
+                    continue  # Worktree is fine
+                # Recreate
+                role = a["role"] or "developer"
+                result = await gwt.create(
+                    workspace_path=ws,
+                    short_id=short_id,
+                    task_name=role,
+                )
+                if result.get("success") and result.get("path"):
+                    await project_db.execute(
+                        a["id"],
+                        "UPDATE agents SET workspace_path=?, updated_at=? WHERE id=?",
+                        [result["path"], int(_wt_time.time() * 1000), a["id"]],
+                    )
+                    recovered += 1
+                    log.info("worktree_recovered",
+                             agent_id=a["id"], short_id=short_id,
+                             path=result["path"])
+                else:
+                    log.warning("worktree_recover_failed",
+                                agent_id=a["id"], short_id=short_id,
+                                error=result.get("message"))
+        log.info("worktree_recovery_done", recovered=recovered)
+    except Exception as e:
+        log.warning("worktree_recovery_init_failed", error=str(e))
+
     # 3. Seed default model
     try:
         model_svc = ModelService()
@@ -132,6 +202,16 @@ async def lifespan(app: FastAPI):
         log.info("game_time_started", projects=len(projects))
     except Exception as e:
         log.warning("game_time_init_failed", error=str(e))
+
+    # 4b. Rebuild agent_router (in-memory agent_id → project_id routing)
+    # Must run after init_meta_db and before start_project_agents,
+    # so that agent_manager can resolve agent_id → project_id via agent_router.
+    try:
+        from hiveweave.services.agent_router import agent_router
+        total = await agent_router.rebuild()
+        log.info("agent_router_rebuilt", total_agents=total)
+    except Exception as e:
+        log.warning("agent_router_rebuild_failed", error=str(e))
 
     # 5. Recover + start agents for all projects
     try:
@@ -195,6 +275,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 契约 19: ApiKeyAuth — 校验所有 /api/* 端点（settings.api_key 为空时全放行）
+from hiveweave.api.auth import ApiKeyMiddleware
+app.add_middleware(ApiKeyMiddleware)
 
 # BUG-009/012/013 fix: ensure all JSON responses carry charset=utf-8
 # to prevent CJK mojibake when browsers/ proxies treat JSON as Latin-1
