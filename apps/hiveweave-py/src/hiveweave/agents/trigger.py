@@ -152,7 +152,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
         proj = await meta_db.query_one(
             "SELECT is_started FROM projects WHERE id = ?", [project_id]
         )
-        if not proj or not proj.get("is_started"):
+        if not proj or not dict(proj).get("is_started"):
             log.info("trigger_project_not_started_skip",
                      agent_id=agent_id, project_id=project_id)
             return
