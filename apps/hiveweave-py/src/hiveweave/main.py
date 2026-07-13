@@ -155,11 +155,14 @@ async def lifespan(app: FastAPI):
                     task_name=role,
                 )
                 if result.get("success") and result.get("path"):
-                    await project_db.execute(
-                        a["id"],
+                    # BUG-FIX: 直接用 proj_conn 更新，不走 project_db.execute(agent_id)。
+                    # 后者依赖 agent_router 内存映射，启动恢复时映射可能尚未包含
+                    # 新创建的 agent，导致 "No project DB found for agent" 错误。
+                    await proj_conn.execute(
                         "UPDATE agents SET workspace_path=?, updated_at=? WHERE id=?",
                         [result["path"], int(_wt_time.time() * 1000), a["id"]],
                     )
+                    await proj_conn.commit()
                     recovered += 1
                     log.info("worktree_recovered",
                              agent_id=a["id"], short_id=short_id,

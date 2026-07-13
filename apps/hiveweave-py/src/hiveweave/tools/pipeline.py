@@ -255,7 +255,10 @@ def _check_shell_security(params: Any) -> str | None:
     if not command:
         return None
 
-    if check_self_destructive(command):
+    # check_self_destructive returns (bool, str) tuple — must unpack, not truthy-check
+    # (False, "") is truthy as a non-empty tuple, which would block ALL commands
+    blocked, _reason = check_self_destructive(command)
+    if blocked:
         return "Error: Command blocked - self-destructive pattern detected"
 
     if _check_hiveweave_command(command):

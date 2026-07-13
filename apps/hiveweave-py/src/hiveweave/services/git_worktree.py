@@ -215,22 +215,28 @@ coverage/
         path = _worktree_path(workspace_path, short_id)
         branch = _branch_name(short_id, task_name)
 
-        # Already exists — idempotent
+        # Already exists and valid — idempotent
         if _has_git(path):
             return {"success": True, "path": path, "branch": branch,
                     "message": "worktree already exists"}
 
-        # 3-level fallback: origin/<base> → <base> → master
-        # (契约 09 RECONCILE: master 兜底处理遗留仓库)
-        # Use -B (force create) instead of -b: if the branch already exists
-        # from a previous worktree that was physically deleted but not
-        # git-pruned, -b fails with "already exists". -B resets the ref
-        # to the base, which is safe since the old worktree is gone.
+        # Stale directory cleanup: if the worktree directory exists but .git
+        # is missing (e.g., partial deletion), git worktree add will fail with
+        # "'<path>' already exists". Remove the stale directory and prune.
+        if Path(path).exists():
+            import shutil as _shutil
+            _shutil.rmtree(path, ignore_errors=True)
+            await _git(["worktree", "prune"], workspace_path)
+            # Also delete stale branch ref so -B doesn't conflict
+            await _git(["branch", "-D", branch], workspace_path)
+
+        # 3-level fallback: origin/<base> → <base> → HEAD
+        # HEAD 作为最终兜底（当前分支），避免在只有 main 的仓库上尝试不存在的 master
         fwd_path = path.replace("\\", "/")
         attempts = [
             ["worktree", "add", fwd_path, "-B", branch, f"origin/{base_branch}"],
             ["worktree", "add", fwd_path, "-B", branch, base_branch],
-            ["worktree", "add", fwd_path, "-B", branch, "master"],
+            ["worktree", "add", fwd_path, "-B", branch, "HEAD"],
         ]
         for args in attempts:
             ok, out = await _git(args, workspace_path)
