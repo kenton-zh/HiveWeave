@@ -351,7 +351,7 @@ class Agent:
                 "SELECT is_started FROM projects WHERE id = ?",
                 [self.project_id]
             )
-            if not _proj or not _proj.get("is_started"):
+            if not _proj or not dict(_proj).get("is_started"):
                 return {"error": "project_not_started"}
 
             # 设置状态

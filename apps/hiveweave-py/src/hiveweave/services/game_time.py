@@ -485,7 +485,7 @@ class GameTimeService:
         _proj = await _meta_db.query_one(
             "SELECT is_started FROM projects WHERE id = ?", [project_id]
         )
-        if not _proj or not _proj.get("is_started"):
+        if not _proj or not dict(_proj).get("is_started"):
             return
 
         # 扫描所有非终态 task，检查在当前状态停留是否超过阈值
