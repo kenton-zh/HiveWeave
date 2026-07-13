@@ -49,6 +49,7 @@ TASK_STALL_THRESHOLDS = {
     "claimed":    5 * 60 * 1000,   # 5 min: assignee 该开始
 }
 TASK_STALL_COOLDOWN_MS = 15 * 60 * 1000  # 15 min: 同一 task 不重复催
+TASK_STALL_MAX_AGE_MS = 2 * 60 * 60 * 1000  # 2h: 超过此时间的 task 视为旧会话残留，跳过
 
 _states: dict[str, dict] = {}          # project_id → state
 _alarm_project: dict[str, str] = {}    # alarm_id → project_id
@@ -509,6 +510,9 @@ class GameTimeService:
                 continue
             stall_ms = now_ms - entered_at
             if stall_ms < threshold:
+                continue
+            # 跳过旧会话残留 task（超过 2 小时未更新）
+            if stall_ms > TASK_STALL_MAX_AGE_MS:
                 continue
             # 确定负责人：submitted/reviewing → creator，其他 → assignee
             if status in ("submitted", "reviewing"):
