@@ -220,25 +220,69 @@ class GitWorktreeMergeParams(BaseModel):
 async def git_worktree_merge_tool(
     params: GitWorktreeMergeParams, agent_id: str, workspace: str, ctx=None
 ) -> ToolResult:
-    """Merge a git worktree branch."""
+    """Merge a git worktree branch back into main and remove the worktree.
+
+    Bug G fix: 支持架构师合并其他 agent 的 worktree。
+    branch_name 可以是：
+    - short_id (如 "A066") — 自动查找该 agent 的分支
+    - 完整分支名 (如 "hw/A066/后端工程师") — 直接使用
+    - task_name (如 "后端工程师") — 用调用者自己的 short_id
+    """
     from hiveweave.services.git_worktree import GitWorktreeService
 
     wt_ctx = await _get_worktree_context(agent_id, ctx)
     if isinstance(wt_ctx, ToolResult):
         return wt_ctx
-    workspace_path, short_id, _ = wt_ctx
+    workspace_path, caller_short_id, project_id = wt_ctx
 
     gwt = GitWorktreeService()
     await gwt.ensure_git_repo(workspace_path)
 
-    task_name = params.branch_name or "task"
+    branch_name = params.branch_name or "task"
     target_branch = params.target_branch or "main"
 
-    result = await gwt.merge(
-        workspace_path, short_id, str(task_name), target_branch
-    )
+    # Bug G fix: 智能解析 branch_name
+    if branch_name.startswith("hw/"):
+        # 完整分支名 — 直接 merge
+        result = await gwt.merge_by_branch(
+            workspace_path, branch_name, target_branch
+        )
+    elif len(branch_name) <= 8 and branch_name.isalnum():
+        # 看起来是 short_id (如 "A066") — 查找该 agent 的实际分支
+        import subprocess
+        r = subprocess.run(
+            ["git", "branch", "--list", f"hw/{branch_name}/*"],
+            capture_output=True, text=True, cwd=workspace_path
+        )
+        branches = [b.strip().lstrip("* ").strip()
+                    for b in r.stdout.strip().split("\n") if b.strip()]
+        if not branches:
+            return ToolResult.err(
+                f"No worktree branch found for agent {branch_name}")
+        if len(branches) == 1:
+            result = await gwt.merge_by_branch(
+                workspace_path, branches[0], target_branch
+            )
+        else:
+            # 多个分支 — 尝试 merge 第一个，报告其他的
+            result = await gwt.merge_by_branch(
+                workspace_path, branches[0], target_branch
+            )
+            if result.get("success") and len(branches) > 1:
+                remaining = branches[1:]
+                result["message"] = (
+                    f"Merged {branches[0]}. "
+                    f"Remaining branches: {remaining}"
+                )
+    else:
+        # task_name — 用调用者自己的 short_id (原始行为)
+        result = await gwt.merge(
+            workspace_path, caller_short_id, str(branch_name), target_branch
+        )
+
     if result.get("success"):
-        return ToolResult.ok("Worktree merged and cleaned up")
+        return ToolResult.ok(
+            result.get("message", "Worktree merged and cleaned up"))
     return ToolResult.err(result.get("message", "Failed to merge worktree"))
 
 

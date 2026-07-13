@@ -69,8 +69,38 @@ class TransferBody(BaseModel):
     newParentId: str | None = None
 
 
-def _agent_response(a: dict) -> dict:
-    """同时输出 snake_case 与 camelCase 字段。"""
+async def _resolve_project_language(project_id: str | None) -> str:
+    """从 per-project DB project_meta 读项目语言（真相源）。
+
+    meta_db.projects 不再存此列 — 真相源归一到 per-project DB 的 project_meta.
+    """
+    if not project_id:
+        return "en"
+    try:
+        pj_conn = await project_db.get_project_db_by_project_id(project_id)
+        if pj_conn is None:
+            return "en"
+        pj_cursor = await pj_conn.execute(
+            "SELECT language FROM project_meta WHERE project_id = ?",
+            [project_id],
+        )
+        pj_row = await pj_cursor.fetchone()
+        await pj_cursor.close()
+        if pj_row and pj_row["language"]:
+            return pj_row["language"]
+    except Exception as e:
+        log.warning("org.read_project_language_failed",
+                    project_id=project_id, error=str(e))
+    return "en"
+
+
+def _agent_response(a: dict, *, project_language: str = "en") -> dict:
+    """同时输出 snake_case 与 camelCase 字段。
+
+    language 优先取 agents.language（向后兼容旧行），
+    缺失时回退到 project_meta.language（真相源）。
+    """
+    lang = a.get("language") or project_language
     return {
         "id": a.get("id"),
         "short_id": a.get("short_id"),
@@ -107,7 +137,7 @@ def _agent_response(a: dict) -> dict:
         "reasoningEffort": a.get("reasoning_effort"),
         "workspace_path": a.get("workspace_path"),
         "workspacePath": a.get("workspace_path"),
-        "language": a.get("language", "en"),
+        "language": lang,
         "created_at": a.get("created_at"),
         "createdAt": a.get("created_at"),
         "updated_at": a.get("updated_at"),
@@ -150,7 +180,8 @@ async def list_agents(
     """列出 agent（query: projectId 或 project_id）。"""
     pid = projectId or project_id
     agents = await _org.list_agents(pid)
-    return {"agents": [_agent_response(a) for a in agents]}
+    pl = await _resolve_project_language(pid)
+    return {"agents": [_agent_response(a, project_language=pl) for a in agents]}
 
 
 @router.get("/agents/{agent_id}")
@@ -160,7 +191,8 @@ async def get_agent(agent_id: str) -> dict:
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
-    return {"agent": _agent_response(agent)}
+    pl = await _resolve_project_language(agent.get("project_id"))
+    return {"agent": _agent_response(agent, project_language=pl)}
 
 
 @router.get("/agents/{agent_id}/children")
@@ -170,8 +202,9 @@ async def get_children(agent_id: str) -> dict:
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    pl = await _resolve_project_language(agent.get("project_id"))
     children = await _org.get_subordinates(agent["id"])
-    return {"children": [_agent_response(c) for c in children]}
+    return {"children": [_agent_response(c, project_language=pl) for c in children]}
 
 
 @router.post("/agents")
@@ -185,7 +218,8 @@ async def create_agent(body: AgentCreate) -> dict:
     except Exception as e:
         log.error("create_agent_failed", error=str(e))
         raise HTTPException(status_code=422, detail=f"Failed to create agent: {e}")
-    return {"agent": _agent_response(agent)}
+    pl = await _resolve_project_language(agent.get("project_id"))
+    return {"agent": _agent_response(agent, project_language=pl)}
 
 
 async def _do_update_agent(agent_id: str, body: AgentUpdate) -> dict:
@@ -199,7 +233,8 @@ async def _do_update_agent(agent_id: str, body: AgentUpdate) -> dict:
     except Exception as e:
         log.error("update_agent_failed", agent_id=agent_id, error=str(e))
         raise HTTPException(status_code=422, detail=f"Failed to update agent: {e}")
-    return {"agent": _agent_response(updated or {})}
+    pl = await _resolve_project_language(agent.get("project_id"))
+    return {"agent": _agent_response(updated or {}, project_language=pl)}
 
 
 @router.patch("/agents/{agent_id}")
@@ -240,7 +275,8 @@ async def dismiss_agent(agent_id: str) -> dict:
         raise HTTPException(
             status_code=400, detail=result.get("message", "Failed to dismiss")
         )
-    return {"ok": True, "agent": _agent_response(result.get("agent", {}))}
+    pl = await _resolve_project_language(project_id)
+    return {"ok": True, "agent": _agent_response(result.get("agent", {}), project_language=pl)}
 
 
 @router.post("/agents/{agent_id}/transfer")
@@ -254,7 +290,8 @@ async def transfer_agent(agent_id: str, body: TransferBody) -> dict:
     result = await _org.transfer_agent(project_id, agent["id"], body.newParentId)
     if isinstance(result, dict) and result.get("success") is False:
         raise HTTPException(status_code=400, detail=result.get("message", "Failed"))
-    return {"agent": _agent_response(result or {})}
+    pl = await _resolve_project_language(project_id)
+    return {"agent": _agent_response(result or {}, project_language=pl)}
 
 
 @router.get("/modules")

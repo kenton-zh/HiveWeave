@@ -147,20 +147,82 @@ def _check_hiveweave_command(command: str) -> bool:
     return True
 
 
+def _extract_file_paths_from_command(command: str) -> list[str]:
+    """从 bash 命令中提取可能的文件路径参数。
+
+    Bug C-2 fix: 只提取重定向目标 (>, >>) 和行首命令的路径参数。
+    不再匹配 heredoc 内容中的代码（如 setPassword(...)），
+    避免 is_sensitive_path 误判。
+    """
+    paths: list[str] = []
+    # 1. 重定向目标 (>, >>) — 只匹配 shell 重定向，不匹配代码中的 > =>
+    # 按行处理，避免跨行匹配
+    for line in command.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        # 匹配 > 或 >> 后面的文件名
+        # 排除: <=>, =>, >=, -> 以及 heredoc 标记 <<
+        redirect_re = re.compile(r'(?<![<=>-])>(?:>)?\s+(\S+)')
+        for m in redirect_re.finditer(line):
+            token = m.group(1)
+            # 跳过管道符、控制字符和代码 token
+            if token in ('&', '|', '&&', '||', ';'):
+                continue
+            # 跳过含括号的 token（是代码不是文件路径）
+            if '(' in token or ')' in token:
+                continue
+            paths.append(token)
+    # 2. 按行分割，只检查每行开头的命令
+    for line in command.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        # 跳过 heredoc 内容行（不以命令开头的行）
+        parts = line.split()
+        if not parts:
+            continue
+        # 检查行首是否是文件操作命令
+        file_cmds = {'cat', 'cp', 'mv', 'rm', 'touch', 'mkdir', 'chmod',
+                     'chown', 'source', 'head', 'tail', 'less', 'more',
+                     'tee', 'dd', 'ln'}
+        cmd = parts[0].lower()
+        # 处理 sudo 前缀
+        if cmd == 'sudo' and len(parts) > 1:
+            parts = parts[1:]
+            cmd = parts[0].lower()
+        if cmd in file_cmds:
+            for part in parts[1:]:
+                if part.startswith('-') or part in ('&&', '||', ';', '|', '&'):
+                    continue
+                # 跳过明显是代码的 token（含 = 或括号）
+                if '=' in part or '(' in part or ')' in part:
+                    continue
+                paths.append(part)
+    return paths
+
+
 def _validate_command_safety(command: str) -> tuple[bool, str]:
     """统一命令安全校验 — 所有 shell 执行入口必须调用。
 
     整合三项检查: 自毁命令、敏感路径、.hiveweave 系统目录。
     Returns: (blocked, reason) — blocked=True 表示命令应被拦截。
+
+    Bug C fix: is_sensitive_path 只检查提取出的文件路径参数，
+    不再检查整个命令字符串。避免代码内容中包含 password/token
+    等词时被误判为敏感文件引用。
     """
     blocked, reason = check_self_destructive(command)
     if blocked:
         return True, f"Command blocked: {reason}"
     from hiveweave.tools.security import is_sensitive_path
-    if is_sensitive_path(command):
-        return True, ("Command references a sensitive file (e.g. .env, *.pem, "
-                      "id_rsa, credentials). Use read_file with explicit "
-                      "approval instead.")
+    # Bug C fix: 只检查命令中的文件路径参数，不检查整个命令字符串
+    file_paths = _extract_file_paths_from_command(command)
+    for fp in file_paths:
+        if is_sensitive_path(fp):
+            return True, (f"Command references a sensitive file: {fp} "
+                          f"(e.g. .env, *.pem, id_rsa, credentials). "
+                          f"Use read_file with explicit approval instead.")
     if _check_hiveweave_command(command):
         return True, ("Command targets `.hiveweave` system directory. "
                       "System files (data.db, tool_outputs/) are managed by "

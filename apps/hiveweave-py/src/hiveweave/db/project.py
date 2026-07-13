@@ -72,10 +72,10 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection | None:
         conn = await aiosqlite.connect(db_path)
         conn.row_factory = aiosqlite.Row
 
-        # DELETE journal mode (契约 11: 避免 Windows SQLITE_IOERR_SHMOPEN)
+        # Bug F fix: WAL 模式支持多进程并发读写，外部只读进程不会损坏数据
         # BUG-009/012/013 fix: explicitly set UTF-8 encoding to prevent CJK mojibake
         await conn.execute("PRAGMA encoding = 'UTF-8'")
-        await conn.execute("PRAGMA journal_mode=DELETE")
+        await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute("PRAGMA busy_timeout=5000")
         await conn.execute("PRAGMA foreign_keys=ON")
 

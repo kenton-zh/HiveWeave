@@ -174,6 +174,21 @@ FIRST_CHUNK_TIMEOUT_S = 90.0
 IDLE_TIMEOUT_S = 60.0
 """后续 chunk idle 超时（TS 防线②）。"""
 
+# ── Bug B fix: 全局 LLM 并发控制 ───────────────────────────
+# 防止多 agent 同时打 LLM API 超过 provider 并发限制（默认 8）。
+# Semaphore 在 HTTP 请求级别获取/释放，tool 执行期间不占槽。
+import os as _os
+_LLM_MAX_CONCURRENT = int(_os.environ.get("HIVEWEAVE_LLM_MAX_CONCURRENT", "8"))
+_LLM_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    """Lazy-init global LLM semaphore (must be created inside event loop)."""
+    global _LLM_SEMAPHORE
+    if _LLM_SEMAPHORE is None:
+        _LLM_SEMAPHORE = asyncio.Semaphore(_LLM_MAX_CONCURRENT)
+    return _LLM_SEMAPHORE
+
 TOOL_EXECUTION_TIMEOUT_S = 120.0
 """单个工具执行超时。对齐 Elixir Task.yield(task, 120_000)。"""
 
@@ -513,6 +528,31 @@ class Streamer:
         # 熔断器检查（C9: fallback 不再是无操作死代码 — 直接抛出明确异常）
         cb_result = await self._circuit_breaker.check(provider_name)
         if not cb_result.allowed:
+            # Bug J fix: 如果有 fallback provider，自动切换重试
+            if cb_result.fallback:
+                log.info("circuit_fallback_switch",
+                         from_provider=provider_name,
+                         to_provider=cb_result.fallback)
+                try:
+                    from hiveweave.services.model import ModelService
+                    model_svc = ModelService()
+                    fallback_config = await model_svc.get(
+                        cb_result.fallback)
+                    if fallback_config and fallback_config.get("is_active"):
+                        # 用 fallback model config 递归调用 stream
+                        return await self.stream(
+                            agent_id=agent_id,
+                            messages=messages,
+                            model_config=fallback_config,
+                            tools=tools,
+                            on_delta=on_delta,
+                            on_tool_call=on_tool_call,
+                            max_tool_rounds=max_tool_rounds,
+                        )
+                except Exception as fb_err:
+                    log.warning("circuit_fallback_failed",
+                                fallback=cb_result.fallback,
+                                error=str(fb_err))
             raise CircuitBreakerOpenError(provider_name, cb_result.fallback)
 
         # 广播 start 事件
@@ -581,6 +621,11 @@ class Streamer:
         # 累加式计数会误判合法的跨轮重复操作；改为「连续相同」计数，
         # 遇到不同调用时重置。只在连续 DOOM_LOOP_THRESHOLD 次相同调用时才判定。
         doom_tracker: dict[str, Any] = {"last_key": None, "count": 0}
+
+        # Bug-5 修复: 跟踪本对话是否已注入过占位符，避免 LLM 把占位符当
+        # 自己的输出后陷入 "调工具不说话 → 占位注入 → LLM 看到 '好的开始处理'
+        # → 不结束 → 再调工具 → 再注入" 的死循环。
+        placeholder_injected: bool = False
 
         for round_num in range(rounds_cap):
             # 上下文溢出检查
@@ -691,14 +736,18 @@ class Streamer:
                                 capped=MAX_TOOLS_PER_ROUND)
                     tool_calls = tool_calls[:MAX_TOOLS_PER_ROUND]
 
-                # 占位文本: 如果累积文本为空，广播占位（UI 提示）
-                if not combined_text:
+                # 占位文本: 如果累积文本为空且本轮还没注入过占位符，广播占位（UI 提示）
+                # Bug-5 修复: 1) 同一 round 只注入一次 2) 占位不进入 text_acc
+                # 避免 UI 上看到 5 个 "好的，开始处理" 的循环。
+                if not combined_text and not placeholder_injected:
                     await self._fire_delta(on_delta, {
                         "type": "text_delta",
                         "content": DEFAULT_PLACEHOLDER,
                         "delta_id": f"default_{round_num}",
+                        "is_placeholder": True,
                     })
-                    combined_text = DEFAULT_PLACEHOLDER
+                    # 不要把占位符塞进 combined_text / text_acc，避免下一轮再次注入
+                    placeholder_injected = True
 
                 # Doom loop 检测
                 doom = self._detect_doom_loop(tool_calls, doom_tracker)
@@ -714,7 +763,7 @@ class Streamer:
                         "rounds": round_num + 1,
                         "usage": last_usage,
                         "error": f"Doom loop detected: tool '{doom}' called "
-                                 f"{DOOM_LOOP_DEFAULT_LIMIT}+ times with same args",
+                                 f"{DOOM_LOOP_TOOL_LIMITS.get(doom, DOOM_LOOP_DEFAULT_LIMIT)}+ times with same args",
                     }
 
                 # 构建 assistant 消息（含 tool_calls）
@@ -815,7 +864,8 @@ class Streamer:
                 else:
                     no_text_rounds = 0
 
-                text_acc = combined_text
+                # Bug-5 修复: 累积前剥除可能混入的占位符（防御性，多余但安全）
+                text_acc = self._strip_placeholder(combined_text)
                 thinking_acc = combined_thinking
                 continue
 
@@ -968,16 +1018,19 @@ class Streamer:
                  url=url, body_size=len(body_json))
 
         async def do_request() -> dict:
-            return await self._do_streaming_request(
-                agent_id=agent_id,
-                provider=provider,
-                url=url,
-                headers=headers,
-                body=body,
-                on_delta=on_delta,
-                delta_id=delta_id,
-                round_num=round_num,
-            )
+            # Bug B fix: 全局并发控制 — 在 HTTP 请求级别限流
+            sem = _get_llm_semaphore()
+            async with sem:
+                return await self._do_streaming_request(
+                    agent_id=agent_id,
+                    provider=provider,
+                    url=url,
+                    headers=headers,
+                    body=body,
+                    on_delta=on_delta,
+                    delta_id=delta_id,
+                    round_num=round_num,
+                )
 
         try:
             result = await self._retry_handler.with_retry(do_request)
@@ -1496,9 +1549,15 @@ class Streamer:
 
     @staticmethod
     def _strip_placeholder(text: str) -> str:
-        """剥离开头的占位文本（不计为真实 LLM 输出）。"""
-        if text.startswith(DEFAULT_PLACEHOLDER):
-            return text[len(DEFAULT_PLACEHOLDER):]
+        """剥离开头的占位文本（不计为真实 LLM 输出）。
+
+        Bug-5 修复: 用 while 循环剥除所有重复出现的占位符（防御旧消息历史
+        中可能存在的累积占位符）。
+        """
+        if not text:
+            return text
+        while text.startswith(DEFAULT_PLACEHOLDER):
+            text = text[len(DEFAULT_PLACEHOLDER):]
         return text
 
     @staticmethod

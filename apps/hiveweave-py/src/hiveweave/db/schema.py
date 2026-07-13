@@ -281,6 +281,8 @@ PROJECT_DB_TABLES = [
     )
     """,
     """ALTER TABLE questions ADD COLUMN options TEXT""",
+    # BUG-A migration: persist worktree creation errors for observability
+    """ALTER TABLE agents ADD COLUMN worktree_error TEXT""",
     """
     CREATE TABLE IF NOT EXISTS todos (
         id TEXT PRIMARY KEY,

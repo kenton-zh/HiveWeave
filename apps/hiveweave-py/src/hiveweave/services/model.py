@@ -78,7 +78,7 @@ class ModelService:
             "SELECT id, name, model_id, base_url, api_key, provider_type, "
             "context_window, "
             "max_output_tokens, supports_thinking, default_reasoning_effort, "
-            "temperature, is_active, created_at, updated_at "
+            "temperature, is_active, fallback, created_at, updated_at "
             "FROM llm_models WHERE id = ? OR model_id = ? LIMIT 1",
             [model_pk, model_pk])
         if row is None:

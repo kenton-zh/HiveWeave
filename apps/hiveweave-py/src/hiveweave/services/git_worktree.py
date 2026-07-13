@@ -331,6 +331,45 @@ coverage/
                  target=target_branch, hash=head if ok else "")
         return {"success": True, "merged": True, "hash": head if ok else ""}
 
+    async def merge_by_branch(self, workspace_path: str, branch: str,
+                              target_branch: str = "main") -> dict:
+        """Merge a specific branch by full name (Bug G fix).
+
+        Unlike ``merge``, this takes a full branch name (e.g. ``hw/A066/后端工程师``)
+        instead of constructing one from short_id + task_name.
+        This allows coordinators to merge other agents' worktrees.
+
+        Returns ``{success, merged, hash, message?}`` or ``{success: False, message}``.
+        """
+        ok, _ = await _git(["checkout", target_branch], workspace_path)
+        if not ok:
+            return {"success": False,
+                    "message": f"Failed to checkout {target_branch}"}
+
+        ok, _ = await _git(["merge", branch, "--no-edit"], workspace_path)
+        if not ok:
+            await _git(["merge", "--abort"], workspace_path)
+            return {"success": False,
+                    "message": f"Merge conflict for {branch} into "
+                               f"{target_branch}. Resolve manually or rollback."}
+
+        ok, head = await _git(["rev-parse", "--short", "HEAD"], workspace_path)
+
+        # Auto-remove worktree + branch on success
+        # 从分支名解析 short_id: hw/{short_id}/{task_name}
+        parts = branch.split("/", 2)
+        if len(parts) >= 2:
+            short_id = parts[1]
+            try:
+                await self.delete(workspace_path, short_id,
+                                  parts[2] if len(parts) > 2 else "task")
+            except Exception:
+                pass  # worktree 可能已不存在
+
+        log.info("git_worktree.merge_by_branch", branch=branch,
+                 target=target_branch, hash=head if ok else "")
+        return {"success": True, "merged": True, "hash": head if ok else ""}
+
     # ── 4. ROLLBACK ─────────────────────────────────────────
 
     async def rollback(self, workspace_path: str, short_id: str,

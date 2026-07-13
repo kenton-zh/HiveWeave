@@ -25,6 +25,8 @@ from .base import tool
 from .result import ToolResult
 from .helpers import coerce_to_list, get_project_id, resolve_agent_id
 
+from hiveweave.db import meta as meta_db
+
 log = structlog.get_logger(__name__)
 
 
@@ -215,13 +217,26 @@ async def hire_agent_tool(
     if not model_id:
         model_id = "step-3.7-flash"
 
-    # Get language from project
-    from hiveweave.db import meta as meta_db
+    # Get language from per-project DB project_meta.
+    # 真相源: per-project DB project_meta.language.
+    # meta_db.projects 不再存此列 (见 db/schema.py META_DB_TABLES).
+    from hiveweave.db import project as project_db
 
-    project_row = await meta_db.query_one(
-        "SELECT language FROM projects WHERE id = ?", [project_id]
-    )
-    language = project_row["language"] if project_row else "zh"
+    language = "zh"
+    try:
+        pj_conn = await project_db.get_project_db_by_project_id(project_id)
+        if pj_conn is not None:
+            pj_cursor = await pj_conn.execute(
+                "SELECT language FROM project_meta WHERE project_id = ?",
+                [project_id],
+            )
+            pj_row = await pj_cursor.fetchone()
+            await pj_cursor.close()
+            if pj_row and pj_row["language"]:
+                language = pj_row["language"]
+    except Exception as e:
+        log.warning("tool.hire_agent.read_language_failed",
+                    project_id=project_id, error=str(e))
 
     # Validate skill slug validity
     if skills and isinstance(skills, list):
@@ -314,6 +329,13 @@ async def hire_agent_tool(
                     error=str(wt_err),
                 )
                 worktree_error = str(wt_err)
+                # Bug D fix: persist error to agent record for observability
+                try:
+                    await ctx.org.update_agent(new_id, {
+                        "worktree_error": worktree_error,
+                    })
+                except Exception:
+                    pass  # don't let logging failure break hire
 
         # Start the agent so it can process inbox messages
         try:
