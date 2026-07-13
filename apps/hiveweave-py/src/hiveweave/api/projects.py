@@ -750,6 +750,41 @@ async def put_project(project_id: str, body: ProjectUpdate) -> dict:
     return await _do_update_project(project_id, body)
 
 
+async def _deferred_cleanup_hiveweave(hw_dir: str, project_id: str) -> None:
+    """后台延迟清理 .hiveweave 目录。
+
+    delete_project 的 rmtree 可能因 Windows 文件锁（aiosqlite 连接未完全释放）
+    而失败。此任务在后台持续重试，直到文件锁解除后成功删除。
+
+    重试策略：每 15 秒一次，持续 5 分钟（共 20 次）。
+    """
+    import shutil as _shutil
+    import os as _os
+    from pathlib import Path as _Path
+
+    hw = _Path(hw_dir)
+    max_retries = 20
+    for i in range(max_retries):
+        await asyncio.sleep(15)
+        if not hw.exists():
+            log.info("deferred_cleanup_success",
+                     hw_dir=hw_dir, project_id=project_id, attempts=i + 1)
+            return
+        try:
+            _shutil.rmtree(hw, ignore_errors=True)
+            if not hw.exists():
+                log.info("deferred_cleanup_success",
+                         hw_dir=hw_dir, project_id=project_id, attempts=i + 1)
+                return
+        except Exception as e:
+            log.debug("deferred_cleanup_retry",
+                      hw_dir=hw_dir, attempt=i + 1, error=str(e))
+
+    log.error("deferred_cleanup_exhausted",
+              hw_dir=hw_dir, project_id=project_id,
+              attempts=max_retries)
+
+
 @router.delete("/{project_id}")
 async def delete_project(project_id: str) -> dict:
     """删除项目（停 agent + 停 game time + 删库文件 + meta 删行 + 清内存）。"""
@@ -926,11 +961,16 @@ async def delete_project(project_id: str) -> dict:
                           rmtree_ok=_rmtree_ok,
                           rmtree_err=_rmtree_err,
                           remaining_files=_remaining)
-                # 不抛异常 — Meta DB 已删除，项目在系统层面已不存在
-                # 残留目录由用户手动清理
+
+                # 启动后台延迟清理任务：文件锁会在连接释放后解除
+                # 持续重试 5 分钟，每 15 秒一次
+                asyncio.create_task(
+                    _deferred_cleanup_hiveweave(str(hw_dir), project_id)
+                )
+
                 return {
                     "ok": True,
-                    "warning": f".hiveweave 目录删除失败，请手动删除: {hw_dir}",
+                    "warning": f".hiveweave 目录将在后台清理: {hw_dir}",
                 }
 
     log.info("project_deleted", project_id=project_id)
