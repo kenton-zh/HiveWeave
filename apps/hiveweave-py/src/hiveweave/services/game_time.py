@@ -49,7 +49,6 @@ TASK_STALL_THRESHOLDS = {
     "claimed":    5 * 60 * 1000,   # 5 min: assignee 该开始
 }
 TASK_STALL_COOLDOWN_MS = 15 * 60 * 1000  # 15 min: 同一 task 不重复催
-TASK_STALL_MAX_AGE_MS = 2 * 60 * 60 * 1000  # 2h: 超过此时间的 task 视为旧会话残留，跳过
 
 _states: dict[str, dict] = {}          # project_id → state
 _alarm_project: dict[str, str] = {}    # alarm_id → project_id
@@ -481,6 +480,14 @@ class GameTimeService:
             })
 
         # ── Case 4: task 状态停留超时（Bug K）──
+        # 只检查已"上班"的项目
+        from hiveweave.db import meta as _meta_db
+        _proj = await _meta_db.query_one(
+            "SELECT is_started FROM projects WHERE id = ?", [project_id]
+        )
+        if not _proj or not _proj.get("is_started"):
+            return
+
         # 扫描所有非终态 task，检查在当前状态停留是否超过阈值
         # 按 assignee/creator 分组合并消息，每个 agent 只 trigger 一次
         stalled_tasks = await _query(project_id,
@@ -510,9 +517,6 @@ class GameTimeService:
                 continue
             stall_ms = now_ms - entered_at
             if stall_ms < threshold:
-                continue
-            # 跳过旧会话残留 task（超过 2 小时未更新）
-            if stall_ms > TASK_STALL_MAX_AGE_MS:
                 continue
             # 确定负责人：submitted/reviewing → creator，其他 → assignee
             if status in ("submitted", "reviewing"):

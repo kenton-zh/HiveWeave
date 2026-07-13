@@ -979,10 +979,10 @@ async def delete_project(project_id: str) -> dict:
 
 @router.get("/{project_id}/activate")
 async def activate_project(project_id: str) -> dict:
-    """激活项目。
+    """激活项目（上班）。
 
-    同时启动 agents 和 game time（如果未运行）。
-    修复：之前只设置 active ID，不启动运行时资源。
+    设置 is_started=1，启动 agents 和 game time。
+    后端重启后所有项目默认 is_started=0，需要用户手动 activate。
     """
     row = await meta_db.query_one(
         "SELECT id FROM projects WHERE id = ?", [project_id]
@@ -990,6 +990,11 @@ async def activate_project(project_id: str) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     await _set_active_project_id(project_id)
+
+    # Bug K fix: 标记项目为"上班"状态
+    await meta_db.execute(
+        "UPDATE projects SET is_started = 1 WHERE id = ?", [project_id]
+    )
 
     # 启动 agents（如果未运行）— start_project_agents 内部会跳过已存在的
     try:
@@ -1005,21 +1010,50 @@ async def activate_project(project_id: str) -> dict:
     except Exception as e:
         log.warning("activate_start_game_time_failed", project_id=project_id, error=str(e))
 
-    return {"ok": True, "projectId": project_id}
+    return {"ok": True, "projectId": project_id, "is_started": True}
 
 
 @router.get("/{project_id}/deactivate")
 async def deactivate_project(project_id: str) -> dict:
-    """取消激活项目。"""
+    """取消激活项目（下班）。
+
+    设置 is_started=0，停止 agents 和 game time。
+    """
     row = await meta_db.query_one(
         "SELECT id FROM projects WHERE id = ?", [project_id]
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Bug K fix: 标记项目为"下班"状态
+    await meta_db.execute(
+        "UPDATE projects SET is_started = 0 WHERE id = ?", [project_id]
+    )
+
+    # 停止 game time
+    try:
+        gt = GameTimeService(project_id)
+        await gt.stop(project_id)
+    except Exception as e:
+        log.warning("deactivate_stop_game_time_failed", project_id=project_id, error=str(e))
+
+    # 停止该项目的所有 agents
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+        from hiveweave.services.agent_router import agent_router
+        agent_ids = agent_router.get_project_agent_ids(project_id)
+        for aid in agent_ids:
+            try:
+                await agent_manager.stop_agent(aid)
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("deactivate_stop_agents_failed", project_id=project_id, error=str(e))
+
     active_id = await _get_active_project_id()
     if active_id == project_id:
         await _set_active_project_id(None)
-    return {"ok": True, "projectId": project_id}
+    return {"ok": True, "projectId": project_id, "is_started": False}
 
 
 @router.get("/{project_id}/game-time")
