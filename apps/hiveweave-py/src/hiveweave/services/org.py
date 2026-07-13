@@ -1,8 +1,9 @@
 """Organization service — agent CRUD and tree traversal (contract 04).
 
-契约 04: 多 Agent 编排 (org 部分)
-- agent 数据存在 Meta DB 的 agents 表 (契约 11 RECONCILE: 全局路由依赖)
-- CRUD: create_agent / get_agent / update_agent / delete_agent
+契约 04: 多 Agent 编制 (org 部分)
+- agent 数据存在 per-project DB 的 agents 表 (按项目物理隔离)
+- AgentRouter (内存) 存路由信息 (agent_id → project_id + 展示字段)
+- CRUD: create_agent / get_agent / delete_agent
 - 树遍历: get_subordinates / get_superior / get_full_tree
 - resolve_agent: short_id (A007) → UUID exact → UUID prefix
 - transfer_agent: 带环检测 (新父不能是后代)
@@ -11,6 +12,7 @@
 - JSON 列 (skills / allowed_tools / ...) 自动编解码
 """
 
+import asyncio
 import json
 import re
 import time
@@ -19,6 +21,8 @@ import uuid
 import structlog
 
 from hiveweave.db import meta as meta_db
+from hiveweave.db import project as project_db
+from hiveweave.services.agent_router import AgentRoute, agent_router
 
 log = structlog.get_logger(__name__)
 
@@ -81,7 +85,27 @@ _SHORT_ID_NUM_RE = re.compile(r"^A(\d+)$")
 
 
 class OrgService:
-    """Organization CRUD + tree traversal — agents live in Meta DB."""
+    """Organization CRUD + tree traversal — agents live in per-project DB.
+
+    AgentRouter (in-memory) provides routing (agent_id → project_id + display
+    fields). Full agent data (name, role, skills, etc.) is in per-project
+    DB.agents.
+    """
+
+    # ── Org chart dirty-flag sync (仿照 goals_dirty) ──────────
+    # 组织架构变更时 bump version，agent 下次对话注入一次精简 org chart 后清除标记。
+    # 避免 agent 不知道同事花名、误用 role 找人（如 send_message(recipients=["HR"])）。
+
+    _VERSION_UNSET: int = -1
+
+    # Class-level lock — protects short_id generation + agent creation
+    # across concurrent hire_agent calls (HR can hire multiple agents in
+    # one tool round, all calling create_agent in parallel).
+    _create_lock: asyncio.Lock = asyncio.Lock()
+
+    def __init__(self) -> None:
+        self._org_version: dict[str, int] = {}
+        self._agent_org_version: dict[tuple[str, str], int] = {}
 
     # ── CREATE ───────────────────────────────────────────────
 
@@ -90,13 +114,24 @@ class OrgService:
 
         Auto-generates ``id`` (UUID) and ``short_id`` (A001-style) if not
         provided. JSON list columns are encoded automatically.
+
+        Writes to per-project DB (agents table) + registers in AgentRouter
+        (in-memory) for routing.
+
+        bound_skills is initialized as a copy of skills — these are the
+        纪律技能 (discipline skills) that get injected into the agent's
+        system prompt at runtime.
         """
         agent_id = attrs.get("id") or str(uuid.uuid4())
-        short_id = attrs.get("short_id") or await self.generate_short_id()
         now_ms = int(time.time() * 1000)
+        project_id = attrs.get("project_id", "")
+
+        # Initialize bound_skills from skills if not explicitly set
+        if "bound_skills" not in attrs and "skills" in attrs:
+            attrs = {**attrs, "bound_skills": attrs["skills"]}
 
         cols: list[str] = ["id", "short_id", "created_at", "updated_at"]
-        vals: list = [agent_id, short_id, now_ms, now_ms]
+        vals: list = [agent_id, None, now_ms, now_ms]  # short_id filled under lock
 
         for col in _SCALAR_COLS:
             if col in attrs:
@@ -111,12 +146,41 @@ class OrgService:
 
         placeholders = ", ".join(["?"] * len(cols))
         col_list = ", ".join(cols)
-        await meta_db.execute(
-            f"INSERT INTO agents ({col_list}) VALUES ({placeholders})", vals
-        )
+
+        # Lock: protect short_id generation → DB insert → agent_router registration
+        # Prevents race condition when HR hires multiple agents in one tool round
+        # (parallel create_agent calls would all read the same max short_id).
+        async with self._create_lock:
+            short_id = attrs.get("short_id") or await self.generate_short_id()
+            vals[1] = short_id  # Fill short_id into vals list
+
+            # Write to per-project DB
+            conn = await project_db.get_project_db_by_project_id(project_id)
+            if conn is None:
+                raise ValueError(f"Project not found: {project_id}")
+            await conn.execute(
+                f"INSERT INTO agents ({col_list}) VALUES ({placeholders})", vals
+            )
+            await conn.commit()
+
+            # Register in agent_router for routing
+            workspace_path = attrs.get("workspace_path", "")
+            if not workspace_path:
+                workspace_path = await meta_db.get_project_workspace(project_id) or ""
+            agent_router.register(AgentRoute(
+                agent_id=agent_id,
+                project_id=project_id,
+                workspace_path=workspace_path,
+                short_id=short_id,
+                name=attrs.get("name", ""),
+                role=attrs.get("role", ""),
+                status=attrs.get("status", "active"),
+            ))
 
         log.info("org.create_agent", agent_id=agent_id, short_id=short_id,
                  role=attrs.get("role"), name=attrs.get("name"))
+
+        self.touch_org_version(project_id)
 
         agent = await self.get_agent(agent_id)
         return agent or {"id": agent_id, "short_id": short_id}
@@ -124,19 +188,26 @@ class OrgService:
     # ── READ ─────────────────────────────────────────────────
 
     async def get_agent(self, agent_id: str) -> dict | None:
-        """Get agent by full UUID."""
-        row = await meta_db.query_one(
-            "SELECT * FROM agents WHERE id = ? LIMIT 1", [agent_id]
-        )
-        return self._row(row) if row else None
+        """Get agent by full UUID.
+
+        Routes through meta_db.get_agent_by_id() which transparently
+        resolves agent_id → AgentRouter → per-project DB.
+        """
+        agent = await meta_db.get_agent_by_id(agent_id)
+        return self._row(agent) if agent else None
 
     async def get_agent_by_role(self, project_id: str, role: str) -> dict | None:
         """Get first active agent by role within a project."""
-        row = await meta_db.query_one(
+        conn = await project_db.get_project_db_by_project_id(project_id)
+        if conn is None:
+            return None
+        cursor = await conn.execute(
             "SELECT * FROM agents WHERE project_id = ? AND role = ? "
             "AND status != 'archived' LIMIT 1",
             [project_id, role],
         )
+        row = await cursor.fetchone()
+        await cursor.close()
         return self._row(row) if row else None
 
     async def list_agents(self, project_id: str | None = None) -> list[dict]:
@@ -145,15 +216,28 @@ class OrgService:
         Ordered by ``created_at`` ASC (oldest first).
         """
         if project_id is None:
-            rows = await meta_db.query(
-                "SELECT * FROM agents ORDER BY created_at ASC"
-            )
-        else:
-            rows = await meta_db.query(
-                "SELECT * FROM agents WHERE project_id = ? "
-                "ORDER BY created_at ASC",
-                [project_id],
-            )
+            # List across all projects — use agent_router to find all agent_ids,
+            # then load each from its per-project DB
+            routes = agent_router.list_active_routes()
+            result: list[dict] = []
+            for route in routes:
+                agent = await self.get_agent(route.agent_id)
+                if agent:
+                    result.append(agent)
+            # Sort by created_at
+            result.sort(key=lambda a: a.get("created_at", 0))
+            return result
+
+        conn = await project_db.get_project_db_by_project_id(project_id)
+        if conn is None:
+            return []
+        cursor = await conn.execute(
+            "SELECT * FROM agents WHERE project_id = ? "
+            "ORDER BY created_at ASC",
+            [project_id],
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
         return [d for r in rows if (d := self._row(r)) is not None]
 
     async def resolve_agent(self, agent_id_or_short_id: str) -> dict | None:
@@ -166,11 +250,9 @@ class OrgService:
         # 1. short_id exact match (case-insensitive)
         if _SHORT_ID_RE.match(inp):
             norm = "A" + inp[1:].upper()
-            row = await meta_db.query_one(
-                "SELECT * FROM agents WHERE short_id = ? LIMIT 1", [norm]
-            )
-            if row:
-                return self._row(row)
+            route = agent_router.find_by_short_id(norm)
+            if route:
+                return await self.get_agent(route.agent_id)
 
         # 2. UUID exact match
         agent = await self.get_agent(inp)
@@ -179,11 +261,9 @@ class OrgService:
 
         # 3. UUID prefix match (ambiguous → first match)
         if 6 <= len(inp) < 36:
-            rows = await meta_db.query(
-                "SELECT * FROM agents WHERE id LIKE ? LIMIT 2", [f"{inp}%"]
-            )
-            if rows:
-                return self._row(rows[0])
+            matches = agent_router.find_by_uuid_prefix(inp, limit=2)
+            if matches:
+                return await self.get_agent(matches[0].agent_id)
 
         return None
 
@@ -193,7 +273,8 @@ class OrgService:
         """Update agent fields. Returns updated agent or None if not found.
 
         JSON list columns are encoded automatically. ``id`` and ``created_at``
-        are immutable.
+        are immutable. Writes to per-project DB + syncs AgentRouter for
+        display fields (name, role, status).
         """
         agent = await self.get_agent(agent_id)
         if not agent:
@@ -216,24 +297,43 @@ class OrgService:
         vals.append(int(time.time() * 1000))
         vals.append(agent_id)
 
-        await meta_db.execute(
+        await project_db.execute(
+            agent_id,
             f"UPDATE agents SET {', '.join(sets)} WHERE id = ?", vals
         )
         log.info("org.update_agent", agent_id=agent_id,
                  fields=list(attrs.keys()))
+
+        # Sync agent_router for display fields
+        router_kwargs: dict = {}
+        for k in ("name", "role", "status"):
+            if k in attrs:
+                router_kwargs[k] = attrs[k]
+        if router_kwargs:
+            agent_router.update(agent_id, **router_kwargs)
+
+        # org chart 变更时触发 dirty（仅 name/role 变更影响通讯录）
+        if any(k in attrs for k in ("name", "role", "parent_id")):
+            project_id = agent.get("project_id", "")
+            if project_id:
+                self.touch_org_version(project_id)
+
         return await self.get_agent(agent_id)
 
     async def update_status(self, agent_id: str, status: str) -> None:
         """Update only the status field (lightweight)."""
-        await meta_db.execute(
+        await project_db.execute(
+            agent_id,
             "UPDATE agents SET status = ?, updated_at = ? WHERE id = ?",
             [status, int(time.time() * 1000), agent_id],
         )
+        agent_router.update(agent_id, status=status)
 
     async def update_parent(self, agent_id: str,
                             new_parent_id: str | None) -> None:
         """Update only the parent_id field (re-parenting)."""
-        await meta_db.execute(
+        await project_db.execute(
+            agent_id,
             "UPDATE agents SET parent_id = ?, updated_at = ? WHERE id = ?",
             [new_parent_id, int(time.time() * 1000), agent_id],
         )
@@ -255,7 +355,10 @@ class OrgService:
                     "message": f"Agent has {len(children)} subordinate(s). "
                                "Transfer or dismiss them first."}
 
-        await meta_db.execute("DELETE FROM agents WHERE id = ?", [agent_id])
+        await project_db.execute(
+            agent_id, "DELETE FROM agents WHERE id = ?", [agent_id]
+        )
+        agent_router.unregister(agent_id)
         log.info("org.delete_agent", agent_id=agent_id)
         return {"success": True}
 
@@ -301,13 +404,78 @@ class OrgService:
 
         log.info("org.dismiss_agent", agent_id=agent_id,
                  project_id=project_id)
+        self.touch_org_version(project_id)
         return {"success": True, "agent": updated}
+
+    # ── Org chart dirty-flag sync ────────────────────────────
+
+    def touch_org_version(self, project_id: str) -> None:
+        """Bump the org version for a project (monotonic ns)."""
+        self._org_version[project_id] = time.monotonic_ns()
+
+    def get_org_version(self, project_id: str) -> int:
+        """Get the current org version (0 if never set)."""
+        return self._org_version.get(project_id, 0)
+
+    async def get_agent_org_version(self, agent_id: str) -> int:
+        """Get the org version an agent last read. _VERSION_UNSET if never."""
+        project_id = await meta_db.get_agent_project_id(agent_id)
+        if project_id is None:
+            return self._VERSION_UNSET
+        return self._agent_org_version.get(
+            (project_id, agent_id), self._VERSION_UNSET
+        )
+
+    async def set_agent_org_version(self, agent_id: str, version: int) -> None:
+        """Mark that an agent has read the org chart at the given version."""
+        project_id = await meta_db.get_agent_project_id(agent_id)
+        if project_id is None:
+            return
+        self._agent_org_version[(project_id, agent_id)] = version
+
+    def org_dirty(self, agent_id: str, project_id: str) -> bool:
+        """Check if an agent needs to re-read the org chart."""
+        v_cur = self._org_version.get(project_id, 0)
+        v_read = self._agent_org_version.get(
+            (project_id, agent_id), self._VERSION_UNSET
+        )
+        if v_read == self._VERSION_UNSET:
+            return True
+        return v_cur != v_read
+
+    async def build_org_directory(self, project_id: str) -> str:
+        """构建精简组织通讯录——只含花名、short_id、role、层级关系。
+
+        供 context prompt 注入。org chart 变更后每个 agent 首次对话注入一次，
+        之后跳过直到下次变更（仿照 goals_dirty 机制）。
+        """
+        tree = await self.get_full_tree(project_id)
+        if not tree:
+            return ""
+
+        lines: list[str] = []
+
+        def walk(node: dict, depth: int) -> None:
+            prefix = "  " * depth
+            name = node.get("name", "?")
+            sid = node.get("short_id", "?")
+            role = node.get("role", "?")
+            perm = node.get("permission_type", "executor")
+            lines.append(f"{prefix}- {name} ({sid}) role={role} [{perm}]")
+            for child in (node.get("children") or []):
+                walk(child, depth + 1)
+
+        for root in tree:
+            walk(root, 0)
+
+        return "## Team Directory（组织通讯录 — 用花名或 short_id 找人, 勿用 role）\n" + "\n".join(lines)
 
     # ── TREE TRAVERSAL ───────────────────────────────────────
 
     async def get_subordinates(self, agent_id: str) -> list[dict]:
         """Get direct children of an agent (excludes archived)."""
-        rows = await meta_db.query(
+        rows = await project_db.query(
+            agent_id,
             "SELECT * FROM agents WHERE parent_id = ? AND status != 'archived'",
             [agent_id],
         )
@@ -387,19 +555,22 @@ class OrgService:
                         "message": "Cannot transfer: new parent is a descendant "
                                    "(would create a cycle)"}
 
-        return await self.update_agent(agent_id, {"parent_id": new_parent_id})
+        updated = await self.update_agent(agent_id, {"parent_id": new_parent_id})
+        if updated:
+            self.touch_org_version(project_id)
+        return updated
 
     # ── SHORT ID ─────────────────────────────────────────────
 
     async def generate_short_id(self) -> str:
         """Generate next short ID (A001, A002, ...).
 
-        Finds the current maximum A-number and increments (TS pattern).
+        Finds the current maximum A-number from agent_router and increments.
+        short_id is globally unique across all projects.
         """
-        rows = await meta_db.query("SELECT short_id FROM agents")
+        short_ids = agent_router.list_all_short_ids()
         max_num = 0
-        for r in rows:
-            sid = r["short_id"]
+        for sid in short_ids:
             if not sid:
                 continue
             m = _SHORT_ID_NUM_RE.match(sid)

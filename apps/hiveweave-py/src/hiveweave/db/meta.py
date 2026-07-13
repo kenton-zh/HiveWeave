@@ -1,9 +1,10 @@
-"""Meta DB — global SQLite database for projects, agents, models, settings.
+"""Meta DB — global SQLite database for projects + global config.
 
 契约 11: Meta DB
 - 全局单例，WAL 模式
-- 表: projects, agents, agent_templates, llm_models, global_settings, agent_charters, charter_attachments, meta_index
-- agents 表在此（RECONCILE 修复：agent 路由依赖 Meta DB 的 agents 表）
+- 表: projects (id, name, workspace_path, created_at), agent_templates, llm_models, global_settings, meta_index
+- 不再存储 agent_index 或任何 per-project 业务数据
+- agent_id → project_id 路由由 AgentRouter 内存映射完成
 """
 
 import asyncio
@@ -27,52 +28,71 @@ _init_lock = asyncio.Lock()
 # 这样 DB 被重建后重新 init 会重新执行迁移（而非误认为已迁移）。
 _migrated: bool = False
 
-
 # ── Schema migration ───────────────────────────────────────
-# Meta DB 现位于 apps/hiveweave-py/data/hiveweave.db。
-# 早期复用 TS 后端创建的 DB，可能缺少 Python 期望的某些列；
-# 以下迁移在创建表之后执行，用 ALTER TABLE ADD COLUMN 补齐，try/except 忽略"列已存在"。
-#
-# Python schema: apps/hiveweave-py/src/hiveweave/db/schema.py (META_DB_TABLES)
-#
-# 缺失列清单（旧 TS 表已存在但缺列）：
-#   projects:        language, updated_at
-#   agents:          workspace_path, language  （TS Drizzle schema 无此两列）
-#   agent_templates: updated_at                （TS schema 无此列）
+# 旧 Meta DB 可能有已删除的表（agent_index, agent_charters, chat_messages 等）。
+# 迁移时执行 DROP TABLE IF EXISTS 清理这些遗留表。
+# 同时用 ALTER TABLE ADD COLUMN 补齐缺失列。
 
 _META_MIGRATIONS: list[tuple[str, str, str]] = [
     # (table, column, column_def)
-    # projects — TS client.ts 创建时无 language / updated_at
-    ("projects", "language", "TEXT DEFAULT 'en'"),
-    ("projects", "updated_at", "INTEGER"),
-    # agents — TS Drizzle schema 无 workspace_path / language
-    ("agents", "workspace_path", "TEXT"),
-    ("agents", "language", "TEXT DEFAULT 'en'"),
-    # agents — compacted_prefix 存储对话压缩摘要（CRITICAL #1 持久化修复）
-    ("agents", "compacted_prefix", "TEXT"),
     # agent_templates — TS schema 无 updated_at
     ("agent_templates", "updated_at", "INTEGER"),
-    # agent_charters — add project_rules for gstack discipline integration
-    ("agent_charters", "project_rules", "TEXT DEFAULT ''"),
     # agent_templates — add discipline_suite
     ("agent_templates", "discipline_suite", "TEXT DEFAULT ''"),
     # llm_models — add provider_type for multi-format LLM support
     ("llm_models", "provider_type", "TEXT DEFAULT ''"),
 ]
 
+# 旧 Meta DB 中需要 DROP 的遗留表（已迁移到 per-project DB 或已废弃）
+_LEGACY_TABLES_TO_DROP = [
+    "agent_index",
+    "agent_charters",
+    "charter_attachments",
+    "chat_messages",
+    "conversation_turns",
+    "handoffs",
+    "inbox",
+    "memories",
+    "work_logs",
+    "personnel_records",
+    "permission_requests",
+    "permission_rules",
+    "modules",
+    "merges",
+    "__new_agents",
+]
+
 
 async def _migrate_meta_schema(conn: aiosqlite.Connection) -> None:
-    """Run schema migrations for columns missing from TS-created tables.
+    """Run schema migrations — drop legacy tables + add missing columns.
 
-    对每个可能缺失的列执行 ALTER TABLE ADD COLUMN，用 try/except 忽略
-    "duplicate column name"（列已存在）和 "no such table"（表不存在）错误。
-
-    R7: 使用 per-connection 的 _migrated 标记，避免每次调用都重复执行 ALTER。
+    R7: 使用 per-connection 的 _migrated 标记，避免每次调用都重复执行。
     标记在 close_meta_db 中重置，保证 DB 重建后能重新迁移。
     """
     global _migrated
     if _migrated:
         return
+
+    # 1. Drop legacy per-project tables that no longer belong in Meta DB
+    for table_name in _LEGACY_TABLES_TO_DROP:
+        try:
+            await conn.execute(f"DROP TABLE IF EXISTS [{table_name}]")
+        except Exception:
+            pass  # Table doesn't exist — fine
+
+    # 2. Drop legacy indexes that reference dropped tables
+    legacy_indexes = [
+        "idx_agent_index_project_id",
+        "idx_agent_index_short_id",
+        "idx_agent_charters_project_id",
+    ]
+    for idx_name in legacy_indexes:
+        try:
+            await conn.execute(f"DROP INDEX IF EXISTS [{idx_name}]")
+        except Exception:
+            pass
+
+    # 3. Add missing columns to remaining tables
     for table, column, col_def in _META_MIGRATIONS:
         try:
             await conn.execute(
@@ -82,9 +102,9 @@ async def _migrate_meta_schema(conn: aiosqlite.Connection) -> None:
         except aiosqlite.OperationalError as e:
             msg = str(e).lower()
             if "duplicate column" in msg or "no such table" in msg:
-                # 列已存在（本就是 Python 创建的表）或表不存在（跳过）
                 continue
             raise
+
     await conn.commit()
     _migrated = True
 
@@ -98,18 +118,15 @@ async def init_meta_db() -> None:
     db_path = app_settings.get_meta_db_path()
 
     async with _init_lock:
-        # Double-check：持锁后再次确认，已初始化则直接返回
         if _db is not None:
             return
 
-        # Ensure parent directory exists
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
         _db = await aiosqlite.connect(db_path)
         _db.row_factory = aiosqlite.Row
 
         # WAL mode for Meta DB (global, concurrent reads)
-        # BUG-009/012/013 fix: explicitly set UTF-8 encoding to prevent CJK mojibake
         await _db.execute("PRAGMA encoding = 'UTF-8'")
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA busy_timeout=5000")
@@ -123,7 +140,7 @@ async def init_meta_db() -> None:
         for sql in META_DB_INDEXES:
             await _db.execute(sql)
 
-        # Migrate columns missing from TS-created tables
+        # Migrate: drop legacy tables + add missing columns
         await _migrate_meta_schema(_db)
 
         await _db.commit()
@@ -145,7 +162,6 @@ async def close_meta_db() -> None:
         if _db is not None:
             await _db.close()
             _db = None
-        # R7: 重置迁移标记，DB 重建后重新 init 会重新执行迁移
         _migrated = False
 
 
@@ -174,18 +190,7 @@ async def execute(sql: str, params: list[Any] | None = None) -> None:
     await db.commit()
 
 
-async def get_agent_project_id(agent_id: str) -> str | None:
-    """Look up which project an agent belongs to.
-
-    契约 11: agent 路由 — agent_id → Meta DB agents 表查 project_id → per-project DB
-    """
-    row = await query_one(
-        "SELECT project_id FROM agents WHERE id = ? LIMIT 1", [agent_id]
-    )
-    if row is None:
-        return None
-    return row["project_id"]
-
+# ── Project routing (Meta DB projects table) ──────────────
 
 async def get_project_workspace(project_id: str) -> str | None:
     """Look up a project's workspace path."""
@@ -198,8 +203,43 @@ async def get_project_workspace(project_id: str) -> str | None:
 
 
 async def get_agent_by_id(agent_id: str) -> dict | None:
-    """Get full agent record from Meta DB."""
-    row = await query_one("SELECT * FROM agents WHERE id = ? LIMIT 1", [agent_id])
+    """Get full agent record from per-project DB.
+
+    路由链: agent_id → AgentRouter(内存) → project_id → projects(Meta DB) → workspace_path
+            → per-project DB → agents 表
+    """
+    from hiveweave.services.agent_router import agent_router
+
+    # Step 1: agent_id → project_id (in-memory route)
+    project_id = agent_router.get_project_id(agent_id)
+    if project_id is None:
+        return None
+
+    # Step 2: project_id → workspace_path
+    workspace_path = await get_project_workspace(project_id)
+    if workspace_path is None:
+        return None
+
+    # Step 3: Open per-project DB and query agents table
+    from hiveweave.db.project import ensure_project_db
+    conn = await ensure_project_db(workspace_path)
+    if conn is None:
+        return None
+
+    cursor = await conn.execute(
+        "SELECT * FROM agents WHERE id = ? LIMIT 1", [agent_id]
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
     if row is None:
         return None
     return dict(row)
+
+
+async def get_agent_project_id(agent_id: str) -> str | None:
+    """Look up which project an agent belongs to.
+
+    路由链: agent_id → AgentRouter(内存) → project_id
+    """
+    from hiveweave.services.agent_router import agent_router
+    return agent_router.get_project_id(agent_id)

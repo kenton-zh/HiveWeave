@@ -118,3 +118,44 @@ async def get_todos(agent_id: str) -> list[dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         log.warning("todowrite.get_failed", error=str(exc))
         return []
+
+
+# ── Pydantic models + @tool registration (Phase 2 migration) ──────
+
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+
+from .base import tool
+from .helpers import coerce_to_list
+from .result import ToolResult
+
+
+class TodoWriteParams(BaseModel):
+    """Parameters for todowrite tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    todos: list[dict[str, Any]] = Field(
+        description="Full todo list to replace the existing one. Each item: {content, status, priority}.",
+        json_schema_extra={"aliases": ["items", "tasks"]},
+    )
+
+    @field_validator("todos", mode="before")
+    @classmethod
+    def _coerce_todos(cls, v: Any) -> Any:
+        return coerce_to_list(v)
+
+
+@tool(
+    "todowrite",
+    "Update the agent's todo list. Replaces all existing todos with the provided list. Each todo has content, status (pending/in_progress/completed/cancelled), and priority (low/medium/high).",
+    requires_workspace=True,
+    security_level="standard",
+)
+async def todowrite_tool(params: TodoWriteParams, agent_id: str, workspace: str) -> ToolResult:
+    """Replace the agent's todo list."""
+    result = await execute_todowrite(
+        agent_id=agent_id,
+        todos=params.todos,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    return ToolResult.err(result.get("error", "Unknown error"))

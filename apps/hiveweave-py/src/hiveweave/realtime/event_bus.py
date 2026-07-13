@@ -48,7 +48,7 @@ MAX_SUBSCRIBERS = 100
 # 契约 12: text_delta / thinking_delta 不转发到 lobby（避免重复渲染）。
 # start 同理 — 流式生命周期事件，仅 agent 频道关心。
 _DELTA_ONLY_TYPES: frozenset[str] = frozenset(
-    {"text_delta", "thinking_delta", "start"}
+    {"text_delta", "thinking_delta", "start", "thinking"}
 )
 
 
@@ -365,6 +365,31 @@ class StatusEventBus:
     async def publish_org_changed(self) -> None:
         """发布组织架构变更通知到 lobby — 前端 org tree 监听此事件刷新。"""
         await self.publish("lobby", {"type": "org_changed"})
+
+    async def publish_question_asked(
+        self,
+        agent_id: str,
+        project_id: str,
+        question_id: str,
+        question: str,
+        options: list | None = None,
+    ) -> None:
+        """发布 question 事件到 lobby + project 频道。
+
+        前端 QuestionDialog 监听此事件后立即拉取 pending questions，
+        无需等待 5s 轮询。
+        """
+        event: dict[str, Any] = {
+            "type": "question_asked",
+            "agentId": agent_id,
+            "projectId": project_id,
+            "questionId": question_id,
+            "question": question[:200],
+        }
+        if options:
+            event["options"] = options
+        await self.publish("lobby", event)
+        await self.publish(f"project:{project_id}", event)
 
     async def publish_chat_message(
         self, agent_id: str, message: dict

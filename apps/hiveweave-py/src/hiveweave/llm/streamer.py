@@ -5,7 +5,7 @@
 - OpenAI 兼容 API（/chat/completions with stream:true）
 - httpx.AsyncClient 流式读取
 - 三层超时: connect=10s / read=120s / total=300s
-- Tool loop: LLM 返回 tool_calls → 执行工具 → 结果追加 → 重新请求，最多 25 轮
+- Tool loop: LLM 返回 tool_calls → 执行工具 → 结果追加 → 重新请求，最多 100 轮（所有角色统一）
 - 空响应重试: 无 content 无 tool_calls 时重试，最多 3 次
 - Doom loop 检测: 同一工具+同一参数 3 次中断
 - 中轮提醒: 80% 轮次时注入「开始收尾」系统提示
@@ -136,6 +136,16 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
 
 NO_TEXT_ROUNDS_THRESHOLD = 3
 """连续无文字轮次阈值: 3 轮后注入系统提示。"""
+
+NO_TEXT_HINT_MAX = 5
+"""无文字提示注入上限: 超过 5 次后强制结束 tool loop 走总结。
+
+设计意图 (project_memory):
+- 连续 3 轮只调工具不说话 → 第 1 次注入提示，计数重置
+- 重复 5 次（共 ~18 轮）→ 第 5 次注入触发 break，强制走 _make_max_rounds_summary
+- 给 executor 更多空间完成多文件写入（如初始化项目骨架需 10+ write_file）
+- 仍可避免卡死的 agent 空转到 60/80 硬上限
+"""
 
 DEFAULT_PLACEHOLDER = "好的，开始处理。\n"
 """默认占位文本（UI 提示，不计为真实输出）。"""
@@ -472,9 +482,9 @@ class Streamer:
             tools: 可用工具列表 [{type:"function", function:{name, description, parameters}}]
             on_delta: SSE delta 回调（text_delta/thinking_delta 等事件）
             on_tool_call: 工具执行回调，返回 {role:"tool", content, tool_call_id}
-            max_tool_rounds: 本轮调用的 tool loop 上限（R9）。若提供则覆盖构造器
-                默认值，用于注入角色专属上限（来自 agent config 的
-                MAX_TOOL_ROUNDS_BY_ROLE）。未提供时回退到 self.max_tool_rounds。
+            max_tool_rounds: 本轮调用的 tool loop 上限。若提供则覆盖构造器
+                默认值（来自 agent 的 DEFAULT_MAX_TOOL_ROUNDS = 100）。
+                未提供时回退到 self.max_tool_rounds。
 
         Returns:
             结果 dict（见类文档字符串）
@@ -483,8 +493,7 @@ class Streamer:
         provider = self._provider_factory.create(model_config)
         provider_name = model_config.get("name") or "primary"
 
-        # R9: 角色专属上限 — 优先用调用方传入的 max_tool_rounds（来自 agent config），
-        # 确保使用角色专属上限而非硬编码 25。
+        # 优先用调用方传入的 max_tool_rounds，未提供时回退到实例默认值
         effective_max_rounds = max_tool_rounds if max_tool_rounds else self.max_tool_rounds
 
         log.info(
@@ -559,7 +568,7 @@ class Streamer:
         max_tool_rounds: int | None = None,
     ) -> dict:
         """Tool loop: 流式请求 → 检查 tool_calls → 执行工具 → 重复。"""
-        # R9: 使用调用方传入的角色专属上限，回退到实例默认值
+        # 使用调用方传入的上限，回退到实例默认值
         rounds_cap = max_tool_rounds if max_tool_rounds else self.max_tool_rounds
         text_acc = ""
         thinking_acc = ""
@@ -567,6 +576,7 @@ class Streamer:
         tool_turn_acc: list[dict] = []
         last_usage: dict | None = None
         no_text_rounds = 0
+        no_text_hint_count = 0  # 无文字提示注入次数，超过 NO_TEXT_HINT_MAX 时 break
         # R2: 跟踪连续相同的 (tool_name, tool_args) 调用。
         # 累加式计数会误判合法的跨轮重复操作；改为「连续相同」计数，
         # 遇到不同调用时重置。只在连续 DOOM_LOOP_THRESHOLD 次相同调用时才判定。
@@ -764,8 +774,35 @@ class Streamer:
                 if not new_text:
                     no_text_rounds += 1
                     if no_text_rounds >= NO_TEXT_ROUNDS_THRESHOLD:
+                        no_text_hint_count += 1
+                        if no_text_hint_count > NO_TEXT_HINT_MAX:
+                            # 第 2 次注入后仍然只调工具不说话 → 强制结束 tool loop
+                            log.warning("no_text_hint_exhausted",
+                                        agent_id=agent_id,
+                                        round=round_num,
+                                        hint_count=no_text_hint_count)
+                            summary = await self._make_max_rounds_summary(
+                                agent_id, provider, messages, on_delta
+                            )
+                            final_text = (
+                                (text_acc + "\n\n" + summary) if text_acc else summary
+                            )
+                            final_text = self._strip_placeholder(final_text)
+                            tool_turn_acc.append(
+                                {"role": "assistant", "content": final_text}
+                            )
+                            return {
+                                "status": "ok",
+                                "content": final_text,
+                                "thinking": thinking_acc,
+                                "tool_calls": tool_history,
+                                "tool_turn_messages": tool_turn_acc,
+                                "rounds": round_num + 1,
+                                "usage": last_usage,
+                            }
                         log.info("inject_no_text_hint", round=round_num,
-                                 no_text_rounds=no_text_rounds)
+                                 no_text_rounds=no_text_rounds,
+                                 hint_count=no_text_hint_count)
                         messages.append({
                             "role": "system",
                             "content": (
@@ -925,9 +962,10 @@ class Streamer:
             tools=tools,
         )
 
+        body_json = json.dumps(body, ensure_ascii=False)
         log.info("http_request",
                  agent_id=agent_id, round=round_num,
-                 url=url, body_size=len(json.dumps(body, ensure_ascii=False)))
+                 url=url, body_size=len(body_json))
 
         async def do_request() -> dict:
             return await self._do_streaming_request(
@@ -1088,10 +1126,9 @@ class Streamer:
                     pass
                 elif ctype == "thinking_start":
                     pass
+                # thinking_signature: provider 层已丢弃, 此分支保留为防御性空操作
                 elif ctype == "thinking_signature":
-                    content = c.get("content", "")
-                    if content:
-                        thinking_acc += f"[sig:{content}]"
+                    pass
                 elif ctype == "usage":
                     u = c.get("usage", {})
                     if u:

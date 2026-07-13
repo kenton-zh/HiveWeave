@@ -22,6 +22,7 @@ from hiveweave.db import meta as meta_db
 from hiveweave.db.project import ensure_project_db
 from hiveweave.services.handoff import HandoffService
 from hiveweave.services.inbox import InboxService
+from hiveweave.services.task import TaskService
 
 log = structlog.get_logger(__name__)
 
@@ -52,6 +53,26 @@ async def _execute(project_id: str, sql: str,
     await conn.commit()
 
 
+# Columns missing from older work_logs tables
+_MISSING_COLUMNS = [
+    ("task_id", "TEXT"),
+]
+_migrated: set[str] = set()
+
+
+async def _ensure_schema(project_id: str) -> None:
+    """Add missing columns to work_logs table (idempotent)."""
+    if project_id in _migrated:
+        return
+    for col_name, col_def in _MISSING_COLUMNS:
+        try:
+            await _execute(project_id,
+                           f"ALTER TABLE work_logs ADD COLUMN {col_name} {col_def}")
+        except Exception:
+            pass  # Column already exists
+    _migrated.add(project_id)
+
+
 class DispatchService:
     """Task dispatch → execute → review workflow.
 
@@ -66,6 +87,7 @@ class DispatchService:
     def __init__(self) -> None:
         self.inbox = InboxService()
         self.handoff = HandoffService()
+        self.task_service = TaskService()
 
     # ── DISPATCH ─────────────────────────────────────────────
 
@@ -73,58 +95,90 @@ class DispatchService:
                             to_agent_id: str, description: str,
                             session_id: str | None = None,
                             expect_report: bool = False,
-                            create_handoff: bool = True) -> dict:
+                            create_handoff: bool = True,
+                            existing_task_id: str | None = None) -> dict:
         """Coordinator dispatches a task to a subordinate.
 
-        1. Write ``work_log`` (type=discussion) on coordinator's side —
-           traceable in the session timeline (日志读取协议).
-        2. Send inbox message to subordinate via :class:`InboxService`.
-        3. Create handoff record via :class:`HandoffService` (if
+        1. Create a Task Ledger entry via :class:`TaskService` — obtains
+           the canonical ``task_id`` that threads through inbox / work_log /
+           handoff (Task Ledger 全链路串联). If ``existing_task_id`` is
+           provided, reuse it instead of creating a new one.
+        2. Write ``work_log`` (type=discussion) on coordinator's side —
+           traceable in the session timeline (日志读取协议), 携带 task_id.
+        3. Send inbox message to subordinate via :class:`InboxService`,
+           携带 task_id.
+        4. Create handoff record via :class:`HandoffService` (if
            ``create_handoff``) — enables lifecycle tracking (pending →
-           accepted → completed → approved).
+           accepted → completed → approved), 携带 task_id.
 
-        Returns ``{task_id, handoff_id, from_agent_id, to_agent_id, description}``.
+        Returns ``{success, task_id, handoff_id, from_agent_id, to_agent_id,
+        description}``.
         """
+        await _ensure_schema(project_id)
+
+        # 1) Task Ledger: 创建 task 记录，获得真正的 task_id（全链路主键）
+        #    如果传入了 existing_task_id，复用已有 task 而不是创建新的
+        if existing_task_id:
+            task_id = existing_task_id
+            # 更新 assignee 为实际接收者
+            await self.task_service.update_task(
+                project_id, task_id, assignee_id=to_agent_id
+            )
+        else:
+            task_id = await self.task_service.create_task(
+                project_id=project_id,
+                title=description[:100],
+                description=description,
+                creator_id=from_agent_id,
+                assignee_id=to_agent_id,
+                source="agent",
+            )
+
         log_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
 
         details = json.dumps({
             "type": "dispatch",
+            "task_id": task_id,
             "from_agent_id": from_agent_id,
             "to_agent_id": to_agent_id,
             "description": description,
         })
 
+        # 2) work_log 携带 task_id
         await _execute(
             project_id,
             "INSERT INTO work_logs (id, agent_id, project_id, session_id, "
-            "type, summary, details, created_at) "
-            "VALUES (?, ?, ?, ?, 'discussion', ?, ?, ?)",
+            "type, summary, details, created_at, task_id) "
+            "VALUES (?, ?, ?, ?, 'discussion', ?, ?, ?, ?)",
             [log_id, from_agent_id, project_id, session_id,
-             description, details, now_ms],
+             description, details, now_ms, task_id],
         )
 
-        # Send inbox message to subordinate (triggers their processing)
+        # 3) inbox 消息携带 task_id
         await self.inbox.send_message(
             from_agent_id, to_agent_id, description,
             message_type="task",
             expect_report=expect_report,
+            task_id=task_id,
         )
 
-        # Create handoff record for lifecycle tracking
+        # 4) handoff 携带 task_id（如启用）
         handoff_id: str | None = None
         if create_handoff:
             handoff_id = await self.handoff.create_handoff(
                 project_id, from_agent_id, to_agent_id, description,
                 expect_report=expect_report,
+                task_id=task_id,
             )
 
         log.info("dispatch.task", from_agent_id=from_agent_id,
-                 to_agent_id=to_agent_id, task_id=log_id,
-                 handoff_id=handoff_id, preview=description[:80])
+                 to_agent_id=to_agent_id, task_id=task_id,
+                 log_id=log_id, handoff_id=handoff_id, preview=description[:80])
 
         return {
-            "task_id": log_id,
+            "success": True,
+            "task_id": task_id,
             "handoff_id": handoff_id,
             "from_agent_id": from_agent_id,
             "to_agent_id": to_agent_id,
@@ -136,11 +190,13 @@ class DispatchService:
     async def write_work_log(self, project_id: str, agent_id: str,
                              session_id: str | None, log_type: str,
                              summary: str,
-                             details: dict | None = None) -> str:
+                             details: dict | None = None,
+                             task_id: str | None = None) -> str:
         """Write a work log entry for an agent.
 
         Returns the UUID of the newly created log entry.
         """
+        await _ensure_schema(project_id)
         log_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
         details_json = json.dumps(details) if details else "{}"
@@ -148,10 +204,10 @@ class DispatchService:
         await _execute(
             project_id,
             "INSERT INTO work_logs (id, agent_id, project_id, session_id, "
-            "type, summary, details, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "type, summary, details, created_at, task_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [log_id, agent_id, project_id, session_id,
-             log_type or "discussion", summary, details_json, now_ms],
+             log_type or "discussion", summary, details_json, now_ms, task_id],
         )
         return log_id
 
@@ -163,6 +219,7 @@ class DispatchService:
         Implements the 日志读取协议 — coordinator reads subordinate progress
         before each conversation turn.
         """
+        await _ensure_schema(project_id)
         rows = await _query(
             project_id,
             "SELECT id, agent_id, type, summary, details, created_at "
@@ -181,12 +238,29 @@ class DispatchService:
                                          subordinate_agent_id: str,
                                          since_timestamp: int) -> list[dict]:
         """Get logs since a timestamp (oldest first, for incremental reads)."""
+        await _ensure_schema(project_id)
         rows = await _query(
             project_id,
             "SELECT id, agent_id, type, summary, details, created_at "
             "FROM work_logs WHERE agent_id = ? AND created_at > ? "
             "ORDER BY created_at ASC",
             [subordinate_agent_id, since_timestamp],
+        )
+        return [self._row(r) for r in rows]
+
+    async def get_work_logs_for_task(self, project_id: str,
+                                     task_id: str) -> list[dict]:
+        """Get all work logs associated with a task (oldest first).
+
+        Public API for querying work_logs by task_id — used by the Task Ledger
+        API to include related logs in task detail responses.
+        """
+        await _ensure_schema(project_id)
+        rows = await _query(
+            project_id,
+            "SELECT id, agent_id, type, summary, details, created_at, task_id "
+            "FROM work_logs WHERE task_id = ? ORDER BY created_at ASC",
+            [task_id],
         )
         return [self._row(r) for r in rows]
 

@@ -87,6 +87,19 @@ async def execute_question(
     except Exception as exc:  # noqa: BLE001
         log.warning("question.persist_failed", error=str(exc))
 
+    # 实时推送 question_asked 事件 — 前端监听后立即弹窗，无需等 5s 轮询
+    try:
+        from hiveweave.realtime.event_bus import status_event_bus
+        await status_event_bus.publish_question_asked(
+            agent_id=agent_id,
+            project_id=project_id,
+            question_id=question_id,
+            question=question,
+            options=options,
+        )
+    except Exception as exc:
+        log.warning("question.push_failed", error=str(exc))
+
     # BUG-036: Also save as a chat_message so the question appears in ChatPanel.
     # Previously only saved to questions table — user couldn't see it in chat.
     from hiveweave.services.chat_message import ChatMessageService
@@ -219,3 +232,45 @@ def drain_expired_questions() -> list[str]:
     for qid in expired:
         _pending.pop(qid, None)
     return expired
+
+
+# ── Pydantic models + @tool registration (Phase 2 migration) ──────
+
+from typing import Optional
+
+from pydantic import BaseModel, Field, ConfigDict
+
+from .base import tool
+from .result import ToolResult
+
+
+class QuestionParams(BaseModel):
+    """Parameters for question tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    question: str = Field(
+        description="The question to ask the user.",
+        json_schema_extra={"aliases": ["prompt", "text"]},
+    )
+    options: Optional[list[Any]] = Field(
+        default=None,
+        description="Optional list of choices. Each item can be a string or an object with 'label'/'text' keys.",
+    )
+
+
+@tool(
+    "question",
+    "Ask the user a question and wait for their answer. Use when you need clarification or a decision from the user.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def question_tool(params: QuestionParams, agent_id: str, workspace: str) -> ToolResult:
+    """Ask the user a question and block until answered."""
+    result = await execute_question(
+        agent_id=agent_id,
+        question=params.question,
+        options=params.options,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    return ToolResult.err(result.get("error", "Unknown error"))

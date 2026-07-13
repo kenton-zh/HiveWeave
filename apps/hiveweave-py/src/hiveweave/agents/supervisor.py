@@ -223,11 +223,15 @@ class AgentManager:
         """项目启动时为所有持久化 agent 启动 task。
 
         对齐 Elixir project_supervisor.ex:67 spawn_agents/1。
-        从 Meta DB 查询项目下所有 active agent，为每个创建 Agent 实例。
+        从 per-project DB 查询 agents，为每个创建 Agent 实例。
         """
         try:
-            # 查询项目下所有 active agent
-            rows = await meta_db.query(
+            from hiveweave.db import project as project_db
+            conn = await project_db.get_project_db_by_project_id(project_id)
+            if conn is None:
+                log.info("start_project_agents_none", project_id=project_id)
+                return
+            cursor = await conn.execute(
                 "SELECT id, project_id, name, role, permission_type as role_type, backstory, "
                 "model_id, goal, permission_mode, bound_skills, "
                 "allowed_tools, denied_tools, ask_tools, "
@@ -235,6 +239,8 @@ class AgentManager:
                 "FROM agents WHERE project_id = ? AND status = 'active'",
                 [project_id],
             )
+            rows = await cursor.fetchall()
+            await cursor.close()
 
             if not rows:
                 log.info("start_project_agents_none", project_id=project_id)

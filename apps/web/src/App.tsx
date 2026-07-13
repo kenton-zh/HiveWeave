@@ -9,6 +9,7 @@ import AddAgentDialog from "./components/AddAgentDialog";
 import FolderPicker from "./components/FolderPicker";
 import OfficeView from "./components/OfficeView";
 import ModelSettings from "./components/ModelSettings";
+import ApiKeyDialog from "./components/ApiKeyDialog";
 import GoalsPanel from "./components/GoalsPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import QuestionDialog from "./components/QuestionDialog";
@@ -16,7 +17,7 @@ import NewProjectDialog from "./components/NewProjectDialog";
 import ConfirmDialog from "./components/ConfirmDialog";
 import ToastContainer from "./components/Toast";
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings } from "./api";
+import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend } from "./api";
 import type { DeleteProjectResponse, Project } from "./api";
 
 function App() {
@@ -56,6 +57,7 @@ function App() {
     return params.get("folderPath") ?? undefined;
   });
   const [showModelSettings, setShowModelSettings] = useState(false);
+  const [showApiKeyDialog, setShowApiKeyDialog] = useState(false);
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
@@ -66,6 +68,11 @@ function App() {
   const deleteQueueRef = useRef<Array<{ id: string; name: string }>>([]);
   const deleteRunningRef = useRef(false);
 
+
+  // Restore API key from localStorage on mount
+  useEffect(() => {
+    initApiKeyFromStorage();
+  }, []);
 
   // Load projects on mount
   useEffect(() => {
@@ -138,6 +145,7 @@ function App() {
       },
       () => refreshOrgTree(),
       (projectId: string) => useAppStore.getState().bumpGoalsVersion(projectId),
+      () => useAppStore.getState().bumpQuestionVersion(),
     );
     return () => controller.abort();
   }, []);
@@ -255,6 +263,9 @@ function App() {
     }
     if (result.dbLeftover) {
       showToast("部分数据库文件可能仍残留在磁盘上", "error");
+    }
+    if (result.warning) {
+      showToast(result.warning, "warning");
     }
   };
 
@@ -417,6 +428,44 @@ function App() {
         </div>
 
         <div className="ml-auto flex items-center gap-4">
+          {/* Restart buttons */}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={async () => {
+                if (!confirm("Restart backend? This will kill and relaunch the uvicorn server.")) return;
+                try {
+                  await restartBackend();
+                  showToast("Backend restarting...", "info");
+                } catch {
+                  showToast("Failed to trigger backend restart", "error");
+                }
+              }}
+              className="text-g-fg-3 hover:text-g-fg transition-colors"
+              title="Restart Backend"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            </button>
+            <span className="text-g-fg-4 text-xs">|</span>
+            <button
+              onClick={async () => {
+                if (!confirm("Restart frontend? This will kill and relaunch the Vite dev server.")) return;
+                try {
+                  await restartFrontend();
+                  showToast("Frontend restarting...", "info");
+                } catch {
+                  showToast("Failed to trigger frontend restart", "error");
+                }
+              }}
+              className="text-g-fg-3 hover:text-g-fg transition-colors"
+              title="Restart Frontend"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2" />
+              </svg>
+            </button>
+          </div>
           {/* Model Settings gear icon */}
           <button
             onClick={() => setShowModelSettings(true)}
@@ -426,6 +475,16 @@ function App() {
             <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </button>
+          {/* API Key 设置 */}
+          <button
+            onClick={() => setShowApiKeyDialog(true)}
+            className="text-g-fg-3 hover:text-g-fg transition-colors"
+            title="API Key 设置"
+          >
+            <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a4 4 0 11-8 0 4 4 0 018 0zM12 15v6m-3-3h6" />
             </svg>
           </button>
           {/* Editable user name */}
@@ -643,6 +702,10 @@ function App() {
 
       {showModelSettings && (
         <ModelSettings onClose={() => setShowModelSettings(false)} />
+      )}
+
+      {showApiKeyDialog && (
+        <ApiKeyDialog onClose={() => setShowApiKeyDialog(false)} />
       )}
 
       {confirmDelete && (

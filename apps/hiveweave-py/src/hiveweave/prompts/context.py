@@ -25,6 +25,7 @@ import json
 from typing import Any
 
 from hiveweave.prompts.goals import format_goals_block
+from hiveweave.prompts.identity import _normalize_cjk_punct
 from hiveweave.prompts.involvement import (
     build_involvement_block,
     normalize_involvement_level,
@@ -92,7 +93,7 @@ def build_context_prompt(
     if skill_block:
         parts.append(skill_block)
 
-    return "\n\n".join(parts)
+    return _normalize_cjk_punct("\n\n".join(parts))
 
 
 # ── Helpers ─────────────────────────────────────────────────

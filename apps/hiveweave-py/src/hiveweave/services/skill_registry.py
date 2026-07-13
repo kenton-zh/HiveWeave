@@ -1,21 +1,22 @@
 """Skill registry service — SKILL.md-style instruction binding.
 
 契约 10: MCP 与技能（技能部分）
-- 技能来源三层：外部文件系统（agent-skills）→ 内置注册表 → ClawHub 远程市场
+- 技能来源三层：外部文件系统（agent-skills）→ 内置注册表 → skills.sh 远程市场
 - 技能定义包含：slug / name / description / instructions / category
 - bind_skill / unbind_skill 修改 agents.bound_skills（Meta DB）
 - skills 字段为不可变入职快照（hire 时写入，bind/unbind 不动）
 - bound_skills 为运行时可变集合（初始化为 skills 副本）
 - build_active_skills_section 注入 system prompt 摘要段（仅摘要，read_skill 按需加载全文）
-- ClawHub best-effort（5s 超时，失败静默降级到 外部 + 内置）
+- skills.sh best-effort（8s 超时，失败静默降级到 外部 + 内置）
 
 权限门禁（resolve_and_update_agent，由 tool_executor 层强制）：
 - 自身 / 直属下属 / CEO+HR 可操作项目内任意 agent；跨项目拒绝
 - 本服务只做数据层操作，权限校验由上游 tool_executor 负责
 
-移植自 Elixir skill_registry.ex + TS clawhub-service.ts。
+移植自 Elixir skill_registry.ex + TS clawhub-service.ts。已迁移到 skills.sh。
 """
 
+import asyncio
 import json
 import re
 import time
@@ -27,6 +28,7 @@ import structlog
 
 from hiveweave.config import settings
 from hiveweave.db import meta as meta_db
+from hiveweave.db import project as project_db
 
 log = structlog.get_logger(__name__)
 
@@ -35,8 +37,14 @@ log = structlog.get_logger(__name__)
 # 通过环境变量 HIVEWEAVE_EXTERNAL_SKILLS_DIR 配置；未设则无外部技能
 EXTERNAL_SKILLS_DIR = Path(settings.external_skills_dir) if settings.external_skills_dir else None
 
-CLAWHUB_BASE_URL = "https://clawhub.ai/api/v1/skills"
-CLAWHUB_TIMEOUT = 5.0  # 契约 10: ClawHub 5s 超时，失败静默降级
+CLAWHUB_BASE_URL = "https://clawhub.ai/api/v1/skills"  # legacy, unused
+CLAWHUB_TIMEOUT = 5.0  # 契约 10: 5s 超时，失败静默降级
+
+# skills.sh — Open Agent Skills Ecosystem (https://www.skills.sh)
+# 技能格式: owner/repo/skill-name (e.g. anthropics/skills/frontend-design)
+# SKILL.md 内容在详情页服务端渲染，可直接 httpx 抓取。
+SKILLS_SH_BASE_URL = "https://www.skills.sh"
+SKILLS_SH_TIMEOUT = 8.0  # skills.sh 页面较大，给 8s
 
 
 # ── Built-in skill registry（8 个内置技能）──────────────────
@@ -363,6 +371,84 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
             "Principle: Never make the next agent (or your future self) rediscover what you already know.\n"
         ),
     },
+    {
+        "slug": "incremental-implementation",
+        "name": "incremental-implementation",
+        "description": "Deliver changes incrementally. Use when implementing any feature or change that touches more than one file.",
+        "category": "discipline",
+        "instructions": (
+            "# Incremental Implementation Discipline\n\n"
+            "When implementing a feature or change:\n\n"
+            "1. **Break down**: Split the work into small, independently verifiable steps.\n"
+            "2. **Implement step by step**: Complete one step fully before starting the next.\n"
+            "3. **Verify each step**: After each step, confirm it works before moving on.\n"
+            "4. **Commit early and often**: Each completed step should be a checkpoint.\n"
+            "5. **Never batch unrelated changes**: One logical change per step.\n\n"
+            "Principle: Small, verified steps are faster than one big batch that breaks in mysterious ways.\n"
+        ),
+    },
+    {
+        "slug": "test-driven-development",
+        "name": "test-driven-development",
+        "description": "Drive development with tests. Use when implementing any logic, fixing any bug, or changing any behavior.",
+        "category": "discipline",
+        "instructions": (
+            "# Test-Driven Development Discipline\n\n"
+            "When implementing or changing behavior:\n\n"
+            "1. **Write a failing test first**: Define the expected behavior before writing code.\n"
+            "2. **Write minimal code to pass**: Implement just enough to make the test green.\n"
+            "3. **Refactor**: Clean up the code while keeping tests green.\n"
+            "4. **Edge cases**: Add tests for boundary conditions, error paths, and empty inputs.\n\n"
+            "Principle: If it's not tested, it doesn't work. Tests are the specification.\n"
+        ),
+    },
+    {
+        "slug": "frontend-ui-engineering",
+        "name": "frontend-ui-engineering",
+        "description": "Build production-quality UIs. Use when creating or modifying user-facing interfaces, components, or layouts.",
+        "category": "tool",
+        "instructions": (
+            "# Frontend UI Engineering Skill\n\n"
+            "When building user interfaces:\n\n"
+            "1. **Component-first**: Break UI into reusable components with clear props and responsibilities.\n"
+            "2. **State management**: Choose the right state approach (local, context, global) — don't over-engineer.\n"
+            "3. **Accessibility**: Semantic HTML, keyboard navigation, ARIA labels where needed.\n"
+            "4. **Responsive**: Design for mobile-first, then scale up.\n"
+            "5. **Performance**: Lazy-load heavy components, memoize expensive renders, avoid unnecessary re-renders.\n"
+            "6. **Error boundaries**: Wrap components that might fail; show fallback UI.\n\n"
+            "Principle: The UI must look and feel production-quality, not AI-generated.\n"
+        ),
+    },
+    {
+        "slug": "interview-me",
+        "name": "interview-me",
+        "description": "Extract what the user actually wants through one-question-at-a-time interviews. Use when requirements are underspecified.",
+        "category": "discipline",
+        "instructions": (
+            "# Interview Discipline\n\n"
+            "When requirements are vague or underspecified:\n\n"
+            "1. **One question at a time**: Never overwhelm with a list of questions.\n"
+            "2. **Understand intent**: Ask 'why' before 'what' — the goal matters more than the feature.\n"
+            "3. **Confirm understanding**: Restate what you heard before proceeding.\n"
+            "4. **Stop when confident**: End the interview when you have ~95% confidence.\n\n"
+            "Principle: Don't silently fill in ambiguous requirements — ask first.\n"
+        ),
+    },
+    {
+        "slug": "documentation-and-adrs",
+        "name": "documentation-and-adrs",
+        "description": "Record decisions and documentation. Use when making architectural decisions or changing public APIs.",
+        "category": "discipline",
+        "instructions": (
+            "# Documentation & ADR Discipline\n\n"
+            "When making significant decisions:\n\n"
+            "1. **Record the decision**: What was decided, when, by whom, and why.\n"
+            "2. **Capture alternatives**: What other options were considered? Why were they rejected?\n"
+            "3. **Document consequences**: What impact does this decision have on the system?\n"
+            "4. **Update docs**: Keep API docs, READMEs, and architecture diagrams in sync.\n\n"
+            "Principle: Future engineers (and agents) need to understand WHY, not just WHAT.\n"
+        ),
+    },
 ]
 
 
@@ -431,7 +517,7 @@ def _extract_yaml_field(yaml_text: str, field: str) -> str:
 class SkillRegistryService:
     """Skill registry — list, bind, unbind, read SKILL.md instructions.
 
-    三层来源优先级：外部文件系统 → 内置注册表 → ClawHub 远程市场。
+    三层来源优先级：外部文件系统 → 内置注册表 → skills.sh 远程市场。
     """
 
     # ── 外部技能（文件系统，同步）──────────────────────────────
@@ -503,11 +589,11 @@ class SkillRegistryService:
                 return None
         return None
 
-    # ── 内置 + 外部（同步，无 ClawHub）────────────────────────
+    # ── 内置 + 外部（同步，无 skills.sh）────────────────────────
 
     @staticmethod
     def _get_builtin_skill(slug: str) -> dict | None:
-        """按 slug 取技能：外部优先，其次内置。不含 ClawHub。"""
+        """按 slug 取技能：外部优先，其次内置。不含 skills.sh。"""
         ext = SkillRegistryService._get_external_skill(slug)
         if ext is not None:
             return ext
@@ -518,72 +604,226 @@ class SkillRegistryService:
 
     @staticmethod
     def _list_builtin_skills(search: str | None = None) -> list[dict]:
-        """列出 外部 + 内置 技能（不含 ClawHub）。"""
+        """列出 外部 + 内置 技能（不含 skills.sh）。"""
         external = SkillRegistryService._list_external_skills(search)
         all_skills = external + BUILTIN_SKILLS
         return _filter_skills(all_skills, search)
 
-    # ── ClawHub（异步，best-effort）──────────────────────────
+    # ── skills.sh（异步，best-effort）──────────────────────────
+    # skills.sh 是 Open Agent Skills Ecosystem，技能格式 owner/repo/skill-name。
+    # 搜索：抓取 leaderboard 页面 HTML，用正则提取技能链接和描述。
+    # 详情：抓取技能详情页，提取 SKILL.md 段落内容。
+    # 超时/失败静默降级到内置技能。
 
-    async def _search_clawhub(self, search: str | None = None) -> list[dict]:
-        """搜索 ClawHub 市场（5s 超时，失败返回 []）。"""
-        params: dict[str, Any] = {"limit": 10}
-        if search:
-            params["search"] = search
+    # 简单内存缓存：避免同一 skill 重复抓取（slug → detail dict）
+    _skills_sh_cache: dict[str, dict] = {}
+
+    # Per-agent 搜索结果缓存：agent_id → [slug1, slug2, ...]
+    # HR 调 list_available_skills 后，结果按序号存入此缓存。
+    # hire_agent 的 skills 参数接受 "#1" 格式，从此缓存解析为真实 slug。
+    _skill_search_cache: dict[str, list[str]] = {}
+
+    async def _search_skills_sh(self, search: str | None = None) -> list[dict]:
+        """搜索 skills.sh marketplace（8s 超时，失败返回 []）。
+
+        抓取 leaderboard 页面，正则提取技能 slug（owner/repo/skill-name）。
+        为每个候选并发抓取详情页 summary，让 HR 有描述可看。
+        如果有 search 参数，在客户端做关键词过滤。
+        """
         try:
-            async with httpx.AsyncClient(timeout=CLAWHUB_TIMEOUT) as client:
-                resp = await client.get(CLAWHUB_BASE_URL, params=params)
+            async with httpx.AsyncClient(timeout=SKILLS_SH_TIMEOUT) as client:
+                resp = await client.get(SKILLS_SH_BASE_URL)
                 if resp.status_code != 200:
                     return []
-                body = resp.json()
-                if not isinstance(body, dict):
-                    return []
-                items = body.get("items", []) or []
-                return [
-                    {
-                        "slug": s.get("slug"),
-                        "summary": s.get("summary"),
-                        "description": s.get("description"),
-                        "displayName": s.get("displayName"),
-                    }
-                    for s in items
-                    if isinstance(s, dict)
-                ]
+                html = resp.text
+
+            # 正则提取技能链接：href="/owner/repo/skill-name"
+            # 排除 /trending, /hot, /topic/ 等非技能路径
+            pattern = r'href="/([^/]+/[^/]+/[^"]+)"'
+            raw_matches = re.findall(pattern, html)
+
+            # 去重 + 过滤非技能路径，按热度排序（leaderboard 本身按安装量降序）
+            # 只取前 3 个匹配的，给 HR 选择空间但不过多占用上下文
+            seen: set[str] = set()
+            candidates: list[str] = []
+            for slug in raw_matches:
+                # 排除导航路径
+                if slug in ("trending", "hot"):
+                    continue
+                if slug.startswith(("topic/", "site/")):
+                    continue
+                if slug in seen:
+                    continue
+                seen.add(slug)
+
+                # 从 slug 提取 skill-name 作为显示名
+                parts = slug.split("/")
+                skill_name = parts[-1] if parts else slug
+
+                # 如果有 search，做客户端过滤
+                if search:
+                    if search.lower() not in slug.lower() and search.lower() not in skill_name.lower():
+                        continue
+
+                candidates.append(slug)
+                if len(candidates) >= 3:
+                    break
+
+            if not candidates:
+                return []
+
+            # 并发抓取每个候选的详情页 summary（让 HR 有描述可看）
+            details = await asyncio.gather(
+                *[self._fetch_skills_sh_detail(s) for s in candidates],
+                return_exceptions=True,
+            )
+
+            skills: list[dict] = []
+            for slug, detail in zip(candidates, details):
+                parts = slug.split("/")
+                skill_name = parts[-1] if parts else slug
+                if isinstance(detail, dict) and detail:
+                    summary = detail.get("summary") or detail.get("description") or ""
+                    skills.append({
+                        "slug": slug,
+                        "summary": f"{skill_name}: {summary}" if summary else f"{skill_name} — from {parts[0]}/{parts[1]}",
+                        "description": summary or "",
+                        "displayName": skill_name,
+                    })
+                else:
+                    skills.append({
+                        "slug": slug,
+                        "summary": f"{skill_name} — from {parts[0]}/{parts[1]}",
+                        "description": "",
+                        "displayName": skill_name,
+                    })
+
+            return skills
         except Exception as e:
-            log.debug("clawhub_search_failed", error=str(e))
+            log.debug("skills_sh_search_failed", error=str(e))
             return []
 
-    async def _fetch_clawhub_detail(self, slug: str) -> dict | None:
-        """取 ClawHub 单个技能详情（5s 超时，失败返回 None）。"""
+    async def _fetch_skills_sh_detail(self, slug: str) -> dict | None:
+        """取 skills.sh 单个技能详情（8s 超时，失败返回 None）。
+
+        抓取 https://www.skills.sh/{slug} 页面，提取 SKILL.md 段落内容。
+        结果缓存在内存中避免重复抓取。
+        """
+        # 检查缓存
+        if slug in self._skills_sh_cache:
+            return self._skills_sh_cache[slug]
+
         try:
-            async with httpx.AsyncClient(timeout=CLAWHUB_TIMEOUT) as client:
-                resp = await client.get(f"{CLAWHUB_BASE_URL}/{slug}")
+            url = f"{SKILLS_SH_BASE_URL}/{slug}"
+            async with httpx.AsyncClient(timeout=SKILLS_SH_TIMEOUT) as client:
+                resp = await client.get(url)
                 if resp.status_code != 200:
                     return None
-                body = resp.json()
-                if not isinstance(body, dict):
-                    return None
-                return {
-                    "slug": body.get("slug"),
-                    "summary": body.get("summary"),
-                    "description": body.get("description"),
-                    "skill_md": body.get("skillMd") or body.get("skill_md"),
-                }
+                html = resp.text
+
+            # 提取 SKILL.md 内容：页面中 "SKILL.md" 标题之后的内容
+            # skills.sh 详情页将 SKILL.md 内容渲染在页面中，用正则提取
+            # 策略：找 SKILL.md 之后的文本，直到下一个 section（Installs / Repository / Related）
+            skill_md = self._extract_skill_md(html, slug)
+
+            # 提取 summary（页面上 Summary 段落的描述）
+            summary = self._extract_summary(html)
+
+            result = {
+                "slug": slug,
+                "summary": summary or slug,
+                "description": summary or "",
+                "skill_md": skill_md or f"# {slug.split('/')[-1]}\n\nNo SKILL.md content available.",
+            }
+
+            # 缓存
+            self._skills_sh_cache[slug] = result
+            return result
         except Exception as e:
-            log.debug("clawhub_detail_failed", slug=slug, error=str(e))
+            log.debug("skills_sh_detail_failed", slug=slug, error=str(e))
             return None
+
+    @staticmethod
+    def _extract_skill_md(html: str, slug: str) -> str | None:
+        """从 skills.sh 详情页 HTML 中提取 SKILL.md 内容。
+
+        skills.sh 页面结构：SKILL.md 标题后跟着技能指令内容，
+        然后是 Installs / Repository 等元数据 section。
+        我们提取 SKILL.md 标题之后、下一个 section 之前的内容。
+        """
+        # 尝试多种分隔符模式
+        # 1. 找 "SKILL.md" 标记后的内容
+        md_start_patterns = [
+            r"SKILL\.md\s*</(?:h\d|div|section)[^>]*>\s*<[^>]*>",  # 标题后跟内容
+            r"SKILL\.md\s*\n",
+        ]
+
+        # 简化策略：用正则提取所有 <p> 和 <pre> 标签内容，组合成文本
+        # skills.sh 将 SKILL.md 渲染为 HTML 段落
+        # 找到 SKILL.md 标题位置
+        md_idx = html.find("SKILL.md")
+        if md_idx == -1:
+            return None
+
+        # 从 SKILL.md 标题后开始，截取到 "Installs" 或 "Repository" 或 "Related skills" 之前
+        after_md = html[md_idx:]
+
+        # 找结束位置
+        end_markers = ["Installs", "Repository", "Related skills", "Security Audits"]
+        end_idx = len(after_md)
+        for marker in end_markers:
+            mi = after_md.find(marker, 20)  # 跳过标题本身
+            if mi != -1 and mi < end_idx:
+                end_idx = mi
+
+        content_html = after_md[:end_idx]
+
+        # 从 HTML 提取纯文本：移除标签
+        text = re.sub(r"<[^>]+>", "\n", content_html)
+        # 清理多余空行
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        # 移除开头的 "SKILL.md"
+        if text.startswith("SKILL.md"):
+            text = text[8:].strip()
+
+        return text if text else None
+
+    @staticmethod
+    def _extract_summary(html: str) -> str | None:
+        """从 skills.sh 详情页 HTML 中提取 Summary 段落描述。"""
+        idx = html.find("Summary")
+        if idx == -1:
+            return None
+        after = html[idx:]
+        # 找下一个 section 标记
+        end_markers = ["Installation", "SKILL.md", "Installs", "Repository"]
+        end_idx = len(after)
+        for marker in end_markers:
+            mi = after.find(marker, 10)
+            if mi != -1 and mi < end_idx:
+                end_idx = mi
+        content = after[:end_idx]
+        text = re.sub(r"<[^>]+>", "\n", content)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        if text.startswith("Summary"):
+            text = text[7:].strip()
+        return text if text else None
 
     # ── 公共 API：技能发现 ───────────────────────────────────
 
-    async def list_available_skills(self, search: str | None = None) -> str:
-        """列出所有可用技能（外部 + 内置 + ClawHub），返回格式化字符串。
+    async def list_available_skills(
+        self, search: str | None = None, agent_id: str | None = None
+    ) -> str:
+        """列出所有可用技能（外部 + 内置 + skills.sh），返回带序号的格式化字符串。
 
-        ClawHub 不可用时静默降级到 外部 + 内置。
+        skills.sh 不可用时静默降级到 外部 + 内置。
+        如果传入 agent_id，搜索结果会按序号存入 per-agent 缓存，
+        之后 hire_agent 的 skills 参数可用 "#1" 格式引用。
         """
         builtin = self._list_builtin_skills(search)
-        clawhub_skills = await self._search_clawhub(search)
+        skills_sh = await self._search_skills_sh(search)
 
-        if not builtin and not clawhub_skills:
+        if not builtin and not skills_sh:
             return (
                 f'Available Skills'
                 f'{f" (search: {chr(34)}{search}{chr(34)})" if search else ""}:\n\n'
@@ -591,29 +831,74 @@ class SkillRegistryService:
                 "To bind a skill, use `bind_skill` with the slug as skillName."
             )
 
+        # 所有结果统一编号，存入 per-agent 缓存
+        # 序号从缓存已有数量 +1 开始，确保多次搜索序号连续且唯一
+        existing_cache = self._skill_search_cache.get(agent_id, []) if agent_id else []
+        all_slugs: list[str] = []
         lines: list[str] = []
+        idx = len(existing_cache)  # 续编号
+
         if builtin:
             lines.append("## Built-in Skills")
             for s in builtin:
-                lines.append(f"- **{s['slug']}**: {s.get('description', '')} [built-in]")
+                slug = s["slug"]
+                if slug in existing_cache:
+                    # 已在缓存中，用已有的序号
+                    existing_idx = existing_cache.index(slug) + 1
+                    lines.append(f"- **#{existing_idx}** {slug}: {s.get('description', '')} [built-in]")
+                else:
+                    idx += 1
+                    all_slugs.append(slug)
+                    lines.append(f"- **#{idx}** {slug}: {s.get('description', '')} [built-in]")
 
-        if clawhub_skills:
+        if skills_sh:
             lines.append("")
-            lines.append("## ClawHub Marketplace")
-            for s in clawhub_skills:
+            lines.append("## skills.sh Marketplace")
+            for s in skills_sh:
+                slug = s["slug"]
                 desc = s.get("summary") or s.get("description") or "No description"
-                lines.append(f"- **{s.get('slug')}**: {desc}")
+                if slug in existing_cache:
+                    existing_idx = existing_cache.index(slug) + 1
+                    lines.append(f"- **#{existing_idx}** {slug}: {desc}")
+                else:
+                    idx += 1
+                    all_slugs.append(slug)
+                    lines.append(f"- **#{idx}** {slug}: {desc}")
+
+        # 存缓存：追加新发现的 slug（去重）
+        if agent_id and all_slugs:
+            existing_cache.extend(all_slugs)
+            self._skill_search_cache[agent_id] = existing_cache
 
         q = chr(34)
         header = f'Available Skills{f" (search: {q}{search}{q})" if search else ""}:\n\n'
         return (
             header
             + "\n".join(lines)
-            + "\n\nTo bind a skill, use `bind_skill` with the slug as skillName."
+            + "\n\nTo bind a skill in hire_agent, use \"#N\" (e.g. \"#1\") to reference by number, "
+            "or use the full slug. Discipline skills from the matching table use full slug."
         )
 
+    def resolve_skill_ref(self, agent_id: str, ref: str) -> str | None:
+        """将 "#N" 格式的技能引用解析为真实 slug。
+
+        如果 ref 不以 "#" 开头，直接返回 ref（视为完整 slug）。
+        如果 ref 是 "#N" 但缓存中不存在或序号越界，返回 None。
+        """
+        ref = ref.strip()
+        if not ref.startswith("#"):
+            return ref  # 完整 slug，直接返回
+        try:
+            n = int(ref[1:])
+        except ValueError:
+            return None
+        cache = self._skill_search_cache.get(agent_id, [])
+        if 1 <= n <= len(cache):
+            return cache[n - 1]
+        return None
+
     async def get_skill_detail(self, slug: str) -> str:
-        """取技能详情（外部 → 内置 → ClawHub），返回格式化字符串。"""
+        """取技能详情（外部 → 内置 → skills.sh），返回格式化字符串。"""
         slug = slug.strip()
 
         # 1. 外部技能
@@ -637,26 +922,26 @@ class SkillRegistryService:
                     f"{s['instructions']}"
                 )
 
-        # 3. ClawHub
-        detail = await self._fetch_clawhub_detail(slug)
+        # 3. skills.sh
+        detail = await self._fetch_skills_sh_detail(slug)
         if detail is not None:
             desc = detail.get("summary") or detail.get("description") or "No description"
             return (
                 f"## Skill: {slug}\n\n"
                 f"**Description:** {desc}\n\n"
-                "**Source:** ClawHub Marketplace\n\n---\n\n"
+                "**Source:** skills.sh Marketplace\n\n---\n\n"
                 f"{detail.get('skill_md') or 'No instructions available.'}"
             )
 
         return (
-            f'Skill "{slug}" not found in built-in registry or ClawHub. '
+            f'Skill "{slug}" not found in built-in registry or skills.sh. '
             "Use `list_available_skills` to search for available skills."
         )
 
     async def read_skill(
         self, slug: str, bound_skills: list[str] | None = None
     ) -> str:
-        """读取技能全文（外部 → 内置 → ClawHub）。
+        """读取技能全文（外部 → 内置 → skills.sh）。
 
         agent 运行时按需调用以加载完整指令。bound_skills 非空且 slug 在其中时
         加 "(Bound skill) " 前缀。
@@ -675,8 +960,8 @@ class SkillRegistryService:
         if skill is not None and skill.get("instructions"):
             return f"{prefix}{skill['instructions']}"
 
-        # 3. ClawHub
-        detail = await self._fetch_clawhub_detail(slug)
+        # 3. skills.sh
+        detail = await self._fetch_skills_sh_detail(slug)
         if detail is not None:
             return f"{prefix}{detail.get('skill_md') or detail.get('summary') or 'No instructions available.'}"
 
@@ -689,8 +974,8 @@ class SkillRegistryService:
 
     async def get_bound_skills(self, agent_id: str) -> list[str]:
         """获取 agent 当前已绑定的技能 slug 列表。"""
-        row = await meta_db.query_one(
-            "SELECT bound_skills FROM agents WHERE id = ? LIMIT 1", [agent_id]
+        row = await project_db.query_one(
+            agent_id, "SELECT bound_skills FROM agents WHERE id = ? LIMIT 1", [agent_id]
         )
         if row is None:
             return []
@@ -711,9 +996,9 @@ class SkillRegistryService:
         if agent is None:
             return {"ok": False, "error": f"Agent '{agent_id}' not found"}
 
-        # 1. 检查技能存在（外部 → 内置 → ClawHub best-effort）
+        # 1. 检查技能存在（外部 → 内置 → skills.sh best-effort）
         if self._get_builtin_skill(skill_name) is None:
-            detail = await self._fetch_clawhub_detail(skill_name)
+            detail = await self._fetch_skills_sh_detail(skill_name)
             if detail is None:
                 return {"ok": False, "error": f"Skill '{skill_name}' not found"}
 
@@ -725,7 +1010,8 @@ class SkillRegistryService:
         # 3. UPDATE bound_skills（skills 字段为不可变入职快照，不动）
         bound.append(skill_name)
         now_ms = int(time.time() * 1000)
-        await meta_db.execute(
+        await project_db.execute(
+            agent_id,
             "UPDATE agents SET bound_skills = ?, updated_at = ? WHERE id = ?",
             [json.dumps(bound), now_ms, agent_id],
         )
@@ -740,7 +1026,8 @@ class SkillRegistryService:
             return {"ok": False, "error": f"Skill '{skill_name}' is not bound"}
         bound.remove(skill_name)
         now_ms = int(time.time() * 1000)
-        await meta_db.execute(
+        await project_db.execute(
+            agent_id,
             "UPDATE agents SET bound_skills = ?, updated_at = ? WHERE id = ?",
             [json.dumps(bound), now_ms, agent_id],
         )
@@ -754,7 +1041,7 @@ class SkillRegistryService:
         """构建注入 system prompt 的 "Active Skills" 摘要段。
 
         仅显示摘要（节省上下文）；agent 通过 read_skill 按需加载全文。
-        使用 _get_builtin_skill（外部 + 内置，同步，不查 ClawHub）—— 避免
+        使用 _get_builtin_skill（外部 + 内置，同步，不查 skills.sh）—— 避免
         prompt 构建时阻塞网络。
         """
         slugs = _parse_json_list(bound_skills_json)

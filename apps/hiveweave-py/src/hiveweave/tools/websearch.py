@@ -275,3 +275,45 @@ async def execute_websearch(
                 "error": f"Error: Search failed — {exc}"}
 
     return {"success": True, "output": _format_results(results), "error": None}
+
+
+# ── Pydantic models + @tool registration (Phase 2 migration) ──────
+
+from pydantic import BaseModel, Field, ConfigDict
+
+from .base import tool
+from .result import ToolResult
+
+
+class WebSearchParams(BaseModel):
+    """Parameters for websearch tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    query: str = Field(
+        description="Search query string.",
+        json_schema_extra={"aliases": ["search", "q", "term"]},
+    )
+    num_results: int = Field(
+        default=5,
+        ge=1,
+        le=8,
+        description="Number of results to return (1-8). Default: 5.",
+        json_schema_extra={"aliases": ["limit", "count"]},
+    )
+
+
+@tool(
+    "websearch",
+    "Search the web for information. Returns results with title, URL, and snippet from Brave/DuckDuckGo/Bing.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def websearch_tool(params: WebSearchParams, agent_id: str, workspace: str) -> ToolResult:
+    """Search the web for a query."""
+    result = await execute_websearch(
+        query=params.query,
+        num_results=params.num_results,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    return ToolResult.err(result.get("error", "Unknown error"))

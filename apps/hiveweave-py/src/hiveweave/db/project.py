@@ -148,6 +148,18 @@ async def get_project_db_for_agent(agent_id: str) -> aiosqlite.Connection | None
     return conn
 
 
+async def get_project_db_by_project_id(project_id: str) -> aiosqlite.Connection | None:
+    """Get the per-project DB connection by project_id.
+
+    路由链: project_id → meta_db.projects → workspace_path → ensure_project_db
+    Convenience helper for services that have project_id but not agent_id.
+    """
+    workspace_path = await meta_db.get_project_workspace(project_id)
+    if workspace_path is None:
+        return None
+    return await ensure_project_db(workspace_path)
+
+
 async def evict_project_db(workspace_path: str) -> None:
     """Close and remove a per-project DB from cache.
 

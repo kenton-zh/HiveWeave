@@ -41,6 +41,15 @@ from hiveweave.tools.review import (
 from hiveweave.tools.todowrite import execute_todowrite, get_todos
 from hiveweave.tools.websearch import execute_websearch
 
+# Import tool registration modules to trigger @tool decorators
+import hiveweave.tools.file_mgmt  # noqa: F401 — registers delete_file, move_file, etc.
+import hiveweave.tools.orchestration_tools  # noqa: F401 — registers messaging, charter, memory, alarm
+import hiveweave.tools.org_tools  # noqa: F401 — registers hire_agent, dismiss_agent, skills, etc.
+import hiveweave.tools.misc_tools  # noqa: F401 — registers git_worktree, legacy tasks, webfetch, etc.
+from hiveweave.tools.base import _TOOL_REGISTRY, list_tool_names  # noqa: F401
+from hiveweave.tools.result import ToolResult as ToolResultDataclass  # noqa: F401
+from hiveweave.tools.pipeline import ToolContext  # noqa: F401
+
 __all__ = [
     # Executor
     "ToolExecutor",

@@ -230,6 +230,23 @@ async def _set_active_project_id(project_id: str | None) -> None:
         )
 
 
+async def _fetch_project_meta(project_id: str) -> dict | None:
+    """从 per-project DB 的 project_meta 表读取项目元数据。
+
+    Meta DB slimming 后, description / org_paradigm / charter_json /
+    goals_json / language 等字段存储在 per-project DB 的 project_meta 表中。
+    """
+    conn = await project_db.get_project_db_by_project_id(project_id)
+    if conn is None:
+        return None
+    cursor = await conn.execute(
+        "SELECT * FROM project_meta WHERE project_id = ?", [project_id]
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    return dict(row) if row else None
+
+
 async def _seed_default_agents(project_id: str) -> list[str]:
     """新项目自动创建 CEO + HR 两个初始角色（幂等）。
 
@@ -240,6 +257,39 @@ async def _seed_default_agents(project_id: str) -> list[str]:
     """
     log.info("seed_start", project_id=project_id)
     org = OrgService()
+
+    # ── Sync stale project_id ──────────────────────────────
+    # 当 per-project DB 从旧项目残留（项目重建时 rmtree 失败或 Meta DB 被重置），
+    # agents 表中的 project_id 可能仍是旧值。list_agents 按 project_id 过滤，
+    # 查不到这些 agent → 会创建重复的 CEO/HR。此处先同步 project_id。
+    try:
+        conn = await project_db.get_project_db_by_project_id(project_id)
+        if conn is not None:
+            cursor = await conn.execute(
+                "SELECT id, project_id FROM agents WHERE project_id != ?",
+                [project_id],
+            )
+            stale = await cursor.fetchall()
+            await cursor.close()
+            if stale:
+                log.warning(
+                    "seed_stale_project_id",
+                    project_id=project_id,
+                    stale_count=len(stale),
+                )
+                await conn.execute(
+                    "UPDATE agents SET project_id = ? WHERE project_id != ?",
+                    [project_id, project_id],
+                )
+                await conn.commit()
+                # agent_router (内存路由) 在启动时 rebuild，此处无需同步
+                log.info(
+                    "seed_stale_project_id_fixed",
+                    fixed_count=len(stale),
+                )
+    except Exception as e:
+        log.warning("seed_sync_project_id_failed", error=str(e))
+
     existing = await org.list_agents(project_id)
     log.info("seed_existing_agents", project_id=project_id, count=len(existing))
 
@@ -288,6 +338,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "permission_type": "coordinator",
                 "status": "active",
                 "model_id": default_model_id,
+                "skills": ["spec-driven-development", "planning-and-task-breakdown", "context-engineering"],
             }
         )
         ceo_id = ceo["id"]
@@ -304,6 +355,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "status": "active",
                 "parent_id": ceo_id,
                 "model_id": default_model_id,
+                "skills": ["interview-me", "documentation-and-adrs"],
             }
         )
     except Exception as e:
@@ -313,9 +365,13 @@ async def _seed_default_agents(project_id: str) -> list[str]:
 
 @router.get("")
 async def list_projects(status: str | None = Query(default=None)) -> dict:
-    """列出项目（支持 status 过滤: active/inactive）。"""
+    """列出项目（支持 status 过滤: active/inactive）。
+
+    Meta DB slimming 后只返回 id, name, workspace_path, created_at。
+    前端可通过 GET /api/projects/{id} 获取完整详情（含 charter 等）。
+    """
     rows = await meta_db.query(
-        "SELECT * FROM projects ORDER BY created_at DESC"
+        "SELECT id, name, workspace_path, created_at FROM projects ORDER BY created_at DESC"
     )
     active_id = await _get_active_project_id()
     projects = [_project_response(dict(r), active_id) for r in rows]
@@ -359,6 +415,48 @@ async def create_project(body: ProjectCreate) -> dict:
 
     # 清除可能的旧驱逐标记 — 同路径重建项目时恢复 DB 访问
     project_db.clear_evicted_workspace(str(ws))
+
+    # 修复：如果旧 .hiveweave 目录残留（删除项目时 rmtree 可能因 Windows 文件锁失败），
+    # 先 evict 旧 aiosqlite 连接再 rmtree，防止旧 data.db 污染新项目。
+    # 症状：旧 agents/chat_messages 残留，新 agent 数据写入 aiosqlite 内存但 commit 不落盘。
+    hw_old = ws / ".hiveweave"
+    if hw_old.exists():
+        try:
+            await project_db.evict_project_db(str(ws))
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+        import shutil as _shutil
+        import stat as _stat
+
+        def _rmtree_on_error(func, path, exc_info):
+            try:
+                os.chmod(path, _stat.S_IWRITE)
+            except Exception:
+                pass
+            try:
+                func(path)
+            except Exception:
+                pass
+
+        for _attempt in range(3):
+            try:
+                _shutil.rmtree(hw_old, onerror=_rmtree_on_error)
+                break
+            except Exception as e:
+                log.warning("cleanup_old_hiveweave_failed",
+                            workspace=str(ws), error=str(e), attempt=_attempt + 1)
+                if _attempt < 2:
+                    await asyncio.sleep(0.5)
+        if hw_old.exists():
+            log.warning("cleanup_old_hiveweave_still_exists",
+                        workspace=str(ws),
+                        remaining=[str(p) for p in list(hw_old.rglob("*"))[:10]])
+
+    # BUG-FIX: evict_project_db 在清理旧 .hiveweave 时设置了 eviction flag，
+    # 如果不在 rmtree 后清除，后续 ensure_project_db 会返回 None → 项目无 DB。
+    project_db.clear_evicted_workspace(str(ws))
+
     # 确保工作空间存在（带重试，处理 Windows 文件锁 / 实时扫描瞬时拦截）
     # 之前无重试，遇到瞬时 WinError 5（如刚浏览过该目录、Defender 扫描）
     # 会直接 400 失败，用户无法创建项目。
@@ -391,10 +489,15 @@ async def create_project(body: ProjectCreate) -> dict:
 
     # 初始化 per-project DB（建表）
     try:
-        await project_db.ensure_project_db(workspace)
+        conn = await project_db.ensure_project_db(workspace)
+        if conn is None:
+            raise RuntimeError(
+                f"ensure_project_db returned None for workspace={workspace} "
+                f"(eviction flag may still be set)"
+            )
     except Exception as e:
         log.error("init_project_db_failed", workspace=workspace, error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to initialize project DB")
+        raise HTTPException(status_code=500, detail=f"Failed to initialize project DB: {e}")
 
     # BUG-034: 初始化 git 仓库，确保后续 agent 可以通过
     # GitWorktreeService 创建独立的工作区（worktree）进行隔离开发。
@@ -414,18 +517,12 @@ async def create_project(body: ProjectCreate) -> dict:
 
     try:
         await meta_db.execute(
-            "INSERT INTO projects (id, name, description, workspace_path, "
-            "org_paradigm, charter_json, language, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO projects (id, name, workspace_path, created_at) "
+            "VALUES (?, ?, ?, ?)",
             [
                 project_id,
                 body.name,
-                body.description or "",
                 str(ws),
-                charter.get("orgPattern", "solo"),
-                json.dumps(charter, ensure_ascii=False),
-                body.language or "en",
-                now_ms,
                 now_ms,
             ],
         )
@@ -441,6 +538,28 @@ async def create_project(body: ProjectCreate) -> dict:
     sys.stderr.write(f"[CREATE] _seed_default_agents returned {len(agent_ids)} agents\n")
     sys.stderr.flush()
 
+    # 写入 per-project 元数据到 project_meta 表
+    # (description, org_paradigm, charter_json, language 等字段从 Meta DB 迁移到 per-project DB)
+    try:
+        conn = await project_db.ensure_project_db(str(ws))
+        if conn is not None:
+            await conn.execute(
+                "INSERT INTO project_meta (project_id, description, org_paradigm, "
+                "charter_json, goals_json, language, game_time_accumulated_seconds, "
+                "updated_at) VALUES (?, ?, ?, ?, '[]', ?, 0, ?)",
+                [
+                    project_id,
+                    body.description or "",
+                    charter.get("orgPattern", "solo"),
+                    json.dumps(charter, ensure_ascii=False),
+                    body.language or "en",
+                    now_ms,
+                ],
+            )
+            await conn.commit()
+    except Exception as e:
+        log.warning("create_project_meta_failed", project_id=project_id, error=str(e))
+
     # 启动 agent + game time（C3/C4 fix: 新项目创建后立即启动运行时资源）
     try:
         from hiveweave.agents.supervisor import agent_manager
@@ -453,25 +572,45 @@ async def create_project(body: ProjectCreate) -> dict:
     except Exception as e:
         log.warning("start_game_time_after_create_failed", project_id=project_id, error=str(e))
 
-    row = await meta_db.query_one("SELECT * FROM projects WHERE id = ?", [project_id])
+    row = await meta_db.query_one(
+        "SELECT id, name, workspace_path, created_at FROM projects WHERE id = ?",
+        [project_id],
+    )
+    # 合并 project_meta (per-project DB) 到响应中
+    row_dict = dict(row) if row else {"id": project_id}
+    meta = await _fetch_project_meta(project_id)
+    if meta:
+        # project_meta 的字段覆盖 row 中的同名字段 (description, charter_json 等)
+        row_dict.update({k: v for k, v in meta.items() if k != "project_id"})
     log.info("project_created", project_id=project_id, name=body.name, workspace=str(ws))
     return {
-        "project": _project_response(dict(row)) if row else {"id": project_id},
+        "project": _project_response(row_dict),
         "mainAgentId": agent_ids[0] if agent_ids else None,
     }
 
 
 @router.get("/{project_id}")
 async def get_project(project_id: str) -> dict:
-    """查单个项目（汇总 agents/roster）。"""
+    """查单个项目（汇总 agents/roster）。
+
+    Meta DB 只存 id/name/workspace_path/created_at，
+    其余字段（description, charter_json, language 等）从 per-project DB project_meta 表读取。
+    """
     row = await meta_db.query_one(
-        "SELECT * FROM projects WHERE id = ?", [project_id]
+        "SELECT id, name, workspace_path, created_at FROM projects WHERE id = ?",
+        [project_id],
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # 合并 project_meta (per-project DB) 到行数据中
+    row_dict = dict(row)
+    meta = await _fetch_project_meta(project_id)
+    if meta:
+        row_dict.update({k: v for k, v in meta.items() if k != "project_id"})
+
     active_id = await _get_active_project_id()
-    resp = _project_response(dict(row), active_id)
+    resp = _project_response(row_dict, active_id)
 
     # 汇总 agents + roster
     try:
@@ -493,21 +632,20 @@ async def get_project(project_id: str) -> dict:
 
 async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
     row = await meta_db.query_one(
-        "SELECT * FROM projects WHERE id = ?", [project_id]
+        "SELECT id, name, workspace_path, created_at FROM projects WHERE id = ?",
+        [project_id],
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     existing = dict(row)
     old_workspace = existing.get("workspace_path") or ""
 
-    sets: list[str] = []
-    vals: list = []
+    # ── Meta DB fields (name, workspace_path) ──────────────
+    meta_sets: list[str] = []
+    meta_vals: list = []
     if body.name is not None:
-        sets.append("name = ?")
-        vals.append(body.name)
-    if body.description is not None:
-        sets.append("description = ?")
-        vals.append(body.description)
+        meta_sets.append("name = ?")
+        meta_vals.append(body.name)
     if body.workspacePath is not None and body.workspacePath != old_workspace:
         # 迁移工作空间
         # R2 fix: 校验新 workspace_path 安全性
@@ -542,10 +680,25 @@ async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
             await project_db.evict_project_db(new_ws)
         except Exception:
             pass
-        sets.append("workspace_path = ?")
-        vals.append(new_ws)
+        meta_sets.append("workspace_path = ?")
+        meta_vals.append(new_ws)
+
+    if meta_sets:
+        meta_vals.append(project_id)
+        await meta_db.execute(
+            f"UPDATE projects SET {', '.join(meta_sets)} WHERE id = ?", meta_vals
+        )
+
+    # ── Per-project DB fields (description, charter_json) ──
+    proj_sets: list[str] = []
+    proj_vals: list = []
+    if body.description is not None:
+        proj_sets.append("description = ?")
+        proj_vals.append(body.description)
     if body.operatorName is not None:
-        charter_raw = existing.get("charter_json")
+        # 从 project_meta 读取现有 charter
+        meta = await _fetch_project_meta(project_id)
+        charter_raw = (meta or {}).get("charter_json")
         charter: dict = {}
         if charter_raw:
             try:
@@ -553,22 +706,36 @@ async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
             except (json.JSONDecodeError, TypeError):
                 charter = {}
         charter["operatorName"] = body.operatorName
-        sets.append("charter_json = ?")
-        vals.append(json.dumps(charter, ensure_ascii=False))
+        proj_sets.append("charter_json = ?")
+        proj_vals.append(json.dumps(charter, ensure_ascii=False))
 
-    if sets:
-        sets.append("updated_at = ?")
-        vals.append(int(time.time() * 1000))
-        vals.append(project_id)
-        await meta_db.execute(
-            f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", vals
-        )
+    if proj_sets:
+        proj_sets.append("updated_at = ?")
+        proj_vals.append(int(time.time() * 1000))
+        proj_vals.append(project_id)
+        try:
+            conn = await project_db.get_project_db_by_project_id(project_id)
+            if conn is not None:
+                await conn.execute(
+                    f"UPDATE project_meta SET {', '.join(proj_sets)} "
+                    f"WHERE project_id = ?",
+                    proj_vals,
+                )
+                await conn.commit()
+        except Exception as e:
+            log.warning("update_project_meta_failed", project_id=project_id, error=str(e))
 
+    # ── Build response ─────────────────────────────────────
     updated = await meta_db.query_one(
-        "SELECT * FROM projects WHERE id = ?", [project_id]
+        "SELECT id, name, workspace_path, created_at FROM projects WHERE id = ?",
+        [project_id],
     )
+    row_dict = dict(updated) if updated else {}
+    meta = await _fetch_project_meta(project_id)
+    if meta:
+        row_dict.update({k: v for k, v in meta.items() if k != "project_id"})
     active_id = await _get_active_project_id()
-    return {"project": _project_response(dict(updated)) if updated else {}}
+    return {"project": _project_response(row_dict) if updated else {}}
 
 
 @router.patch("/{project_id}")
@@ -627,25 +794,21 @@ async def delete_project(project_id: str) -> dict:
 
     # M4+M5 fix: 清理 conversation_store 缓存 + status_event_bus processing 状态
     # 注意: 只清内存缓存，不调 conversation_store.clear()（它会重新打开 DB 连接）
+    # 关键: 必须停止 write worker，否则后台 worker 会在 evict 后重新打开 DB
     try:
         from hiveweave.conversation.store import conversation_store
         from hiveweave.realtime.event_bus import status_event_bus
-        agents = await meta_db.query(
-            "SELECT id FROM agents WHERE project_id = ?", [project_id]
-        )
-        for a in agents:
-            aid = a["id"]
-            try:
-                key = (project_id, aid)
-                conversation_store._cache.pop(key, None)
-                conversation_store._prefix_cache.pop(key, None)
-            except Exception:
-                pass
+        from hiveweave.services.agent_router import agent_router
+        agent_ids = agent_router.get_project_agent_ids(project_id)
+        # 停止所有 write worker + 清理缓存（防止 evict 后重连）
+        conversation_store.stop_project_workers(project_id)
+        for aid in agent_ids:
             status_event_bus.set_processing(aid, False)
     except Exception:
         pass
 
     # 等待 agent task 完全取消 + DB 连接释放（Windows 文件锁延迟）
+    # worker 收到哨兵值后需要时间退出，给足缓冲
     await asyncio.sleep(2.0)
 
     # 强制关闭该项目的所有 DB 连接（必须在所有内存清理之后，否则会重新打开）
@@ -661,27 +824,47 @@ async def delete_project(project_id: str) -> dict:
         except Exception:
             pass
         try:
-            agents = await meta_db.query(
-                "SELECT id FROM agents WHERE project_id = ?", [project_id]
-            )
-            for a in agents:
+            from hiveweave.services.agent_router import agent_router
+            agent_ids = agent_router.get_project_agent_ids(project_id)
+            for aid in agent_ids:
                 try:
-                    await project_db.evict_project_db_for_agent(a["id"])
+                    await project_db.evict_project_db_for_agent(aid)
                 except Exception:
                     pass
         except Exception:
             pass
 
+    # 若是当前激活项目，取消激活
+    active_id = await _get_active_project_id()
+    if active_id == project_id:
+        await _set_active_project_id(None)
+
+    # 先删 Meta DB 记录（projects 表）
+    # 这样即使 rmtree 失败，get_project_db_for_agent 也会因 Meta DB 无记录而返回 None
+    # 避免 write worker 在 evict 后重新打开 DB
+    try:
+        await meta_db.execute("DELETE FROM projects WHERE id = ?", [project_id])
+    except Exception as e:
+        log.error("delete_project_failed", project_id=project_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to delete project")
+
+    # 清理 agent_router 内存路由（替代旧 agent_index 表删除）
+    try:
+        from hiveweave.services.agent_router import agent_router
+        agent_router.clear_project(project_id)
+    except Exception:
+        pass
+
+    # 再删除 .hiveweave 目录（DB 文件 + worktrees + 临时文件）
+    # 此时 Meta DB 已无记录，任何残留的 worker 都不会重连 DB
     if workspace:
-        # DB 连接已在前面关闭，直接删除 .hiveweave 目录
-        # 等待 Windows 文件锁完全释放
-        await asyncio.sleep(0.3)
-        # 删除整个 .hiveweave 目录（DB 文件 + worktrees + 临时文件）
-        # 带重试机制处理 Windows 文件锁
+        await asyncio.sleep(1.0)  # 延长等待，确保 Windows 文件锁释放
         hw_dir = Path(workspace) / ".hiveweave"
         if hw_dir.exists():
+            import gc
             import shutil
             import stat
+            import subprocess
             import time as _time
 
             def _on_error(func, path, exc_info):
@@ -694,6 +877,11 @@ async def delete_project(project_id: str) -> dict:
 
             _rmtree_ok = False
             _rmtree_err = ""
+
+            # 强制 GC：释放可能悬空的 aiosqlite 连接对象，
+            # 避免其底层文件句柄阻止 Windows 删除 data.db
+            gc.collect()
+
             for attempt in range(3):
                 try:
                     shutil.rmtree(hw_dir, onerror=_on_error)
@@ -702,10 +890,33 @@ async def delete_project(project_id: str) -> dict:
                 except Exception as e:
                     _rmtree_err = str(e)
                     if attempt < 2:
-                        _time.sleep(0.5)
+                        _time.sleep(2.0)  # 延长等待，给 Windows 足够时间释放文件锁
+                        gc.collect()       # 每次重试前再 GC 一次
                     else:
                         log.warning("delete_hiveweave_dir_failed",
                                     workspace=workspace, error=_rmtree_err)
+
+            # Windows 兜底：shutil.rmtree 全部失败后，用原生 cmd /c rmdir 强制删除
+            # Windows 原生命令对文件锁的容忍度有时高于 Python 的 os.unlink
+            if not _rmtree_ok and hw_dir.exists():
+                try:
+                    # ignore_errors=True: 即使部分文件失败也继续，避免中途退出
+                    shutil.rmtree(str(hw_dir), ignore_errors=True)
+                    # 再用 rmdir 清理残留的空目录结构
+                    result = subprocess.run(
+                        ["cmd", "/c", "rmdir", "/s", "/q", str(hw_dir)],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    if not hw_dir.exists():
+                        _rmtree_ok = True
+                    else:
+                        log.warning("windows_rmdir_fallback_failed",
+                                    workspace=workspace,
+                                    returncode=result.returncode,
+                                    stderr=result.stderr.strip())
+                except Exception as e:
+                    log.warning("windows_rmdir_fallback_error",
+                                workspace=workspace, error=str(e))
 
             # 验证目录是否真的删掉了（rmtree 可能因 _on_error 部分吞异常而"假成功"）
             if hw_dir.exists():
@@ -715,26 +926,12 @@ async def delete_project(project_id: str) -> dict:
                           rmtree_ok=_rmtree_ok,
                           rmtree_err=_rmtree_err,
                           remaining_files=_remaining)
-                # 不静默成功 — 抛异常让 API 返回真实错误
-                raise HTTPException(
-                    status_code=500,
-                    detail=f".hiveweave 目录删除失败，可能被其他进程锁定。请手动删除: {hw_dir}"
-                )
-
-    # 若是当前激活项目，取消激活
-    active_id = await _get_active_project_id()
-    if active_id == project_id:
-        await _set_active_project_id(None)
-
-    try:
-        await meta_db.execute("DELETE FROM projects WHERE id = ?", [project_id])
-        # 同时删除该项目下的 agents 记录
-        await meta_db.execute(
-            "DELETE FROM agents WHERE project_id = ?", [project_id]
-        )
-    except Exception as e:
-        log.error("delete_project_failed", project_id=project_id, error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to delete project")
+                # 不抛异常 — Meta DB 已删除，项目在系统层面已不存在
+                # 残留目录由用户手动清理
+                return {
+                    "ok": True,
+                    "warning": f".hiveweave 目录删除失败，请手动删除: {hw_dir}",
+                }
 
     log.info("project_deleted", project_id=project_id)
     return {"ok": True}
@@ -742,13 +939,32 @@ async def delete_project(project_id: str) -> dict:
 
 @router.get("/{project_id}/activate")
 async def activate_project(project_id: str) -> dict:
-    """激活项目。"""
+    """激活项目。
+
+    同时启动 agents 和 game time（如果未运行）。
+    修复：之前只设置 active ID，不启动运行时资源。
+    """
     row = await meta_db.query_one(
         "SELECT id FROM projects WHERE id = ?", [project_id]
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     await _set_active_project_id(project_id)
+
+    # 启动 agents（如果未运行）— start_project_agents 内部会跳过已存在的
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+        await agent_manager.start_project_agents(project_id)
+    except Exception as e:
+        log.warning("activate_start_agents_failed", project_id=project_id, error=str(e))
+
+    # 启动 game time（如果未运行）
+    try:
+        gt = GameTimeService(project_id)
+        await gt.start(project_id)
+    except Exception as e:
+        log.warning("activate_start_game_time_failed", project_id=project_id, error=str(e))
+
     return {"ok": True, "projectId": project_id}
 
 
@@ -800,9 +1016,11 @@ async def get_project_goals(project_id: str) -> dict:
     """读取 charter goals 段。
 
     优先从 goals_json（agent 写）读，兼容 charter_json.goals（前端写）。
+    数据源: per-project DB project_meta 表。
     """
+    # 先检查项目是否存在（Meta DB）
     row = await meta_db.query_one(
-        "SELECT goals_json, charter_json FROM projects WHERE id = ?", [project_id]
+        "SELECT id FROM projects WHERE id = ?", [project_id]
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -814,8 +1032,12 @@ async def get_project_goals(project_id: str) -> dict:
         "userInvolvement": "宏观决策+技术选型",
     }
 
+    # 从 per-project DB project_meta 表读取
+    meta = await _fetch_project_meta(project_id)
+    goals_raw = (meta or {}).get("goals_json")
+    charter_raw = (meta or {}).get("charter_json")
+
     # 1. Try goals_json (agent-facing, flat format)
-    goals_raw = row["goals_json"]
     if goals_raw:
         try:
             goals = json.loads(goals_raw) if isinstance(goals_raw, str) else goals_raw
@@ -825,7 +1047,6 @@ async def get_project_goals(project_id: str) -> dict:
             pass
 
     # 2. Fallback: charter_json.goals (human-facing, nested format)
-    charter_raw = row["charter_json"]
     if charter_raw:
         try:
             charter = json.loads(charter_raw) if isinstance(charter_raw, str) else charter_raw
@@ -846,13 +1067,18 @@ async def update_project_goals(project_id: str, body: CharterGoalsUpdate) -> dic
 
     BUG-016 修复：POST → PUT，与前端 updateProjectGoals 的 PUT 对齐。
     保留 POST 别名以防旧客户端。
+    数据源: per-project DB project_meta 表。
     """
+    # 先检查项目是否存在（Meta DB）
     row = await meta_db.query_one(
-        "SELECT charter_json FROM projects WHERE id = ?", [project_id]
+        "SELECT id FROM projects WHERE id = ?", [project_id]
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
-    charter_raw = row["charter_json"]
+
+    # 从 project_meta 读取现有 charter
+    meta = await _fetch_project_meta(project_id)
+    charter_raw = (meta or {}).get("charter_json")
     charter: dict = {}
     if charter_raw:
         try:
@@ -861,10 +1087,17 @@ async def update_project_goals(project_id: str, body: CharterGoalsUpdate) -> dic
             charter = {}
     charter["goals"] = body.goals
     try:
-        await meta_db.execute(
-            "UPDATE projects SET charter_json = ?, updated_at = ? WHERE id = ?",
+        conn = await project_db.get_project_db_by_project_id(project_id)
+        if conn is None:
+            raise HTTPException(status_code=500, detail="Project DB not available")
+        await conn.execute(
+            "UPDATE project_meta SET charter_json = ?, updated_at = ? "
+            "WHERE project_id = ?",
             [json.dumps(charter, ensure_ascii=False), int(time.time() * 1000), project_id],
         )
+        await conn.commit()
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("update_goals_failed", project_id=project_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to update goals")

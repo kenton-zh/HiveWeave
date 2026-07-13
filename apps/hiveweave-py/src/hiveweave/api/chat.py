@@ -492,6 +492,7 @@ async def get_questions(
         else:
             return {"questions": []}
         # Parse options JSON string → array for frontend
+        # Also convert snake_case keys to camelCase for frontend compatibility
         result: list[dict] = []
         for r in rows:
             d = dict(r)
@@ -500,6 +501,13 @@ async def get_questions(
                     d["options"] = json.loads(d["options"])
                 except (json.JSONDecodeError, TypeError):
                     d["options"] = None
+            # snake_case → camelCase for frontend (PendingQuestion interface)
+            d["agentId"] = d.pop("agent_id", None)
+            d["agentName"] = d.pop("agent_name", None)
+            if "created_at" in d:
+                d["createdAt"] = d.pop("created_at")
+            if "answered_at" in d:
+                d["answeredAt"] = d.pop("answered_at")
             result.append(d)
         return {"questions": result}
     except Exception as e:

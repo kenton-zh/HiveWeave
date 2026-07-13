@@ -154,6 +154,9 @@ def _match_indent_flexible(content: str, old_str: str) -> tuple[str, int, int] |
 def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
     """Apply a single patch entry; return a status string."""
     op = (patch.get("op") or "").strip().lower()
+    # LLMs sometimes use "replace" — treat it as "update"
+    if op == "replace":
+        op = "update"
     file_path = patch.get("filePath") or patch.get("file_path") or ""
 
     # 敏感文件保护（C6）— 在路径解析前检查，阻止对 .env / *.pem / credentials 等的写入/删除
@@ -190,6 +193,7 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
     if op == "update":
         old_str = patch.get("oldString", patch.get("old_string"))
         new_str = patch.get("newString", patch.get("new_string"))
+        replace_all = patch.get("replace_all", patch.get("replaceAll", False))
         if old_str is None or new_str is None:
             return 'ERROR: update requires "oldString" and "newString"'
         if not p.exists():
@@ -203,6 +207,16 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
 
         # 精确匹配（原逻辑）
         count = content.count(old_str) if old_str else 0
+
+        # replace_all: skip uniqueness check, replace all occurrences
+        if replace_all and count > 0:
+            new_content = content.replace(old_str, new_str)
+            try:
+                p.write_text(new_content, encoding="utf-8")
+            except OSError as exc:
+                return f"ERROR: {exc}"
+            return (f"Updated {file_path} ({count} occurrences replaced, "
+                    f"replace_all=True)")
 
         if count == 0 and old_str:
             # P1 容错匹配 — 参考 OpenCode edit.ts 的多策略匹配
@@ -325,3 +339,191 @@ async def apply_patch(
         "output": body,
         "error": None if not has_error else f"{failed}/{total} patches failed (see output for details)",
     }
+
+
+# ── Pydantic models + @tool registration (Phase 2 migration) ──────
+
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+
+from .base import tool
+from .helpers import coerce_to_list
+from .result import ToolResult
+
+
+class PatchItem(BaseModel):
+    """Single patch operation."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    op: str = Field(
+        description="Operation: 'add' (create), 'update' (replace), or 'delete'.",
+    )
+    file_path: str = Field(
+        alias="filePath",
+        description="Path to the file (relative to workspace).",
+        json_schema_extra={"aliases": ["file_path", "file", "path"]},
+    )
+    old_string: str | None = Field(
+        default=None,
+        alias="oldString",
+        description="For update: text to find in the file.",
+        json_schema_extra={"aliases": ["old_string", "old_str", "oldText", "search"]},
+    )
+    new_string: str | None = Field(
+        default=None,
+        alias="newString",
+        description="For update: replacement text.",
+        json_schema_extra={"aliases": ["new_string", "new_str", "newText", "replace"]},
+    )
+    content: str | None = Field(
+        default=None,
+        description="For add: full file content.",
+    )
+    replace_all: bool = Field(
+        default=False,
+        description="If true, replace all occurrences (skip uniqueness check).",
+        json_schema_extra={"aliases": ["replaceAll"]},
+    )
+
+
+class ApplyPatchParams(BaseModel):
+    """Parameters for apply_patch tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    patches: list[PatchItem] = Field(
+        default_factory=list,
+        description="Array of patch operations.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_direct_params(cls, data: Any) -> Any:
+        """Handle LLM passing direct single-patch params instead of patches[] array.
+
+        LLMs often call apply_patch with:
+            {"filePath": "...", "oldString": "...", "newString": "..."}
+        instead of:
+            {"patches": [{"op": "update", "filePath": "...", ...}]}
+
+        This validator detects direct params and wraps them into a patches array,
+        mirroring the legacy _normalize_patches() logic.
+        """
+        if not isinstance(data, dict):
+            return data
+        # Already has patches — let field_validator handle coercion
+        if "patches" in data and data["patches"]:
+            return data
+        # Check for direct single-patch params
+        direct_keys = {"filePath", "file_path", "file", "path",
+                       "oldString", "old_string", "old_str", "oldText", "search",
+                       "newString", "new_string", "new_str", "newText", "replace",
+                       "content", "op", "replaceAll", "replace_all"}
+        found_keys = direct_keys & data.keys()
+        if not found_keys:
+            return data
+        # Build a single patch entry from direct params
+        patch: dict[str, Any] = {}
+        for k, v in data.items():
+            if k in direct_keys:
+                patch[k] = v
+        # Infer op if not provided
+        if "op" not in patch:
+            if any(k in patch for k in ("oldString", "old_string", "old_str", "oldText", "search")):
+                patch["op"] = "update"
+            elif "content" in patch:
+                patch["op"] = "add"
+            else:
+                patch["op"] = "add"
+        return {"patches": [patch]}
+
+    @field_validator("patches", mode="before")
+    @classmethod
+    def _coerce_patches(cls, v: Any) -> Any:
+        """Coerce JSON string to list if LLM passes a string instead of array."""
+        if isinstance(v, str):
+            import json
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return v
+
+
+class EditFileParams(BaseModel):
+    """Parameters for edit_file tool (single-patch shortcut)."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    file_path: str = Field(
+        alias="filePath",
+        description="Path to the file to edit.",
+        json_schema_extra={"aliases": ["file_path", "file", "path"]},
+    )
+    old_string: str = Field(
+        alias="oldString",
+        description="Text to find in the file.",
+        json_schema_extra={"aliases": ["old_string", "old_str", "oldText", "search"]},
+    )
+    new_string: str = Field(
+        alias="newString",
+        description="Replacement text.",
+        json_schema_extra={"aliases": ["new_string", "new_str", "newText", "replace"]},
+    )
+    replace_all: bool = Field(
+        default=False,
+        description="If true, replace all occurrences.",
+        json_schema_extra={"aliases": ["replaceAll"]},
+    )
+
+
+@tool(
+    "apply_patch",
+    "Apply file patch operations (create/update/delete files). Each patch specifies a file path, operation type, and content.",
+    requires_workspace=True,
+    security_level="file_op",
+)
+async def apply_patch_tool(params: ApplyPatchParams, agent_id: str, workspace: str) -> ToolResult:
+    """Apply a list of patch operations."""
+    # Convert Pydantic models back to dicts for the existing implementation
+    patches_raw = [p.model_dump(by_alias=True, exclude_none=True) for p in params.patches]
+    result = await apply_patch(
+        patches=patches_raw,
+        workspace_path=workspace,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    # Include detailed output in error so LLM can understand WHY a patch failed
+    # (e.g., "File already exists" vs "oldString not found" vs "Sandbox violation")
+    error_msg = result.get("error", "Unknown error")
+    output = result.get("output", "")
+    if output:
+        error_msg = f"{error_msg}\nDetails:\n{output}"
+    return ToolResult.err(error_msg)
+
+
+@tool(
+    "edit_file",
+    "Targeted text replacement in a file. Finds old_string and replaces with new_string. Use apply_patch for multi-file operations.",
+    requires_workspace=True,
+    security_level="file_op",
+)
+async def edit_file_tool(params: EditFileParams, agent_id: str, workspace: str) -> ToolResult:
+    """Single-file edit via apply_patch."""
+    patch_dict = {
+        "op": "update",
+        "filePath": params.file_path,
+        "oldString": params.old_string,
+        "newString": params.new_string,
+        "replace_all": params.replace_all,
+    }
+    result = await apply_patch(
+        patches=[patch_dict],
+        workspace_path=workspace,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    error_msg = result.get("error", "Unknown error")
+    output = result.get("output", "")
+    if output:
+        error_msg = f"{error_msg}\nDetails:\n{output}"
+    return ToolResult.err(error_msg)

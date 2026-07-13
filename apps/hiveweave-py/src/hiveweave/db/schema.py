@@ -1,54 +1,23 @@
 """Database schema definitions — SQL DDL for Meta DB and Per-project DB.
 
 契约 11: 两层 SQLite
-- Meta DB: 全局表（projects, agents, agent_templates, llm_models, ...）
-- Per-project DB: 每项目一个 data.db（agents 表在 Meta DB 中，不在 per-project）
+- Meta DB: 全局路由表（projects: id, name, workspace_path, created_at）+ 全局配置表
+  不再存储任何 per-project 业务数据
+- Per-project DB: 每项目一个 data.db（含 agents 表 + 业务数据表 + project_meta）
+  agent_id → project_id 路由由 AgentRouter 内存映射完成
 """
 
 # ── Meta DB 表 ──────────────────────────────────────────────
-# 契约 11 RECONCILE 修复: agents 表在 Meta DB（全局路由依赖），非 per-project
+# Meta DB 只存全局路由和配置，不存任何 per-project 业务数据
+# agent_index 已移除 — 路由由 AgentRouter 内存映射替代
 
 META_DB_TABLES = [
     """
     CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        description TEXT,
         workspace_path TEXT,
-        org_paradigm TEXT DEFAULT 'solo',
-        charter_json TEXT,
-        goals_json TEXT,
-        language TEXT DEFAULT 'en',
-        created_at INTEGER,
-        updated_at INTEGER
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS agents (
-        id TEXT PRIMARY KEY,
-        short_id TEXT,
-        project_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        role TEXT NOT NULL,
-        parent_id TEXT,
-        module_id TEXT,
-        status TEXT DEFAULT 'active',
-        goal TEXT,
-        backstory TEXT,
-        skills TEXT DEFAULT '[]',
-        model_id TEXT,
-        permission_type TEXT DEFAULT 'executor',
-        permission_mode TEXT DEFAULT 'readonly',
-        allowed_tools TEXT DEFAULT '[]',
-        denied_tools TEXT DEFAULT '[]',
-        ask_tools TEXT DEFAULT '[]',
-        mcp_servers TEXT DEFAULT '[]',
-        bound_skills TEXT DEFAULT '[]',
-        reasoning_effort TEXT,
-        workspace_path TEXT,
-        language TEXT DEFAULT 'en',
-        created_at INTEGER,
-        updated_at INTEGER
+        created_at INTEGER
     )
     """,
     """
@@ -94,30 +63,6 @@ META_DB_TABLES = [
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS agent_charters (
-        id TEXT PRIMARY KEY,
-        project_id TEXT,
-        agent_id TEXT,
-        title TEXT,
-        content TEXT,
-        project_rules TEXT DEFAULT '',
-        status TEXT DEFAULT 'active',
-        created_at INTEGER,
-        updated_at INTEGER
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS charter_attachments (
-        id TEXT PRIMARY KEY,
-        charter_id TEXT NOT NULL,
-        filename TEXT NOT NULL,
-        content_type TEXT,
-        file_path TEXT,
-        file_size INTEGER,
-        created_at INTEGER
-    )
-    """,
-    """
     CREATE TABLE IF NOT EXISTS meta_index (
         key TEXT PRIMARY KEY,
         value TEXT,
@@ -128,8 +73,50 @@ META_DB_TABLES = [
 
 # ── Per-project DB 表 ──────────────────────────────────────
 # 契约 11: 文件名 data.db（非 project.db），DELETE journal mode，busy_timeout 5000
+# agents 表在 per-project DB 中 — 完整 agent 数据按项目物理隔离
 
 PROJECT_DB_TABLES = [
+    """
+    CREATE TABLE IF NOT EXISTS agents (
+        id TEXT PRIMARY KEY,
+        short_id TEXT,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        parent_id TEXT,
+        module_id TEXT,
+        status TEXT DEFAULT 'active',
+        goal TEXT,
+        backstory TEXT,
+        skills TEXT DEFAULT '[]',
+        model_id TEXT,
+        permission_type TEXT DEFAULT 'executor',
+        permission_mode TEXT DEFAULT 'readonly',
+        allowed_tools TEXT DEFAULT '[]',
+        denied_tools TEXT DEFAULT '[]',
+        ask_tools TEXT DEFAULT '[]',
+        mcp_servers TEXT DEFAULT '[]',
+        bound_skills TEXT DEFAULT '[]',
+        reasoning_effort TEXT,
+        workspace_path TEXT,
+        language TEXT DEFAULT 'en',
+        compacted_prefix TEXT,
+        created_at INTEGER,
+        updated_at INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS project_meta (
+        project_id TEXT PRIMARY KEY,
+        description TEXT DEFAULT '',
+        org_paradigm TEXT DEFAULT 'solo',
+        charter_json TEXT DEFAULT '{}',
+        goals_json TEXT DEFAULT '[]',
+        language TEXT DEFAULT 'en',
+        game_time_accumulated_seconds INTEGER DEFAULT 0,
+        updated_at INTEGER
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS inbox (
         id TEXT PRIMARY KEY,
@@ -140,7 +127,8 @@ PROJECT_DB_TABLES = [
         created_at INTEGER,
         message_type TEXT,
         expect_report INTEGER DEFAULT 0,
-        priority TEXT DEFAULT 'normal'
+        priority TEXT DEFAULT 'normal',
+        task_id TEXT
     )
     """,
     """
@@ -199,7 +187,8 @@ PROJECT_DB_TABLES = [
         reported_up INTEGER DEFAULT 0,
         context_delivered INTEGER DEFAULT 0,
         created_at INTEGER,
-        updated_at INTEGER
+        updated_at INTEGER,
+        task_id TEXT
     )
     """,
     """
@@ -216,6 +205,34 @@ PROJECT_DB_TABLES = [
         details TEXT DEFAULT '{}',
         metadata TEXT DEFAULT '{}',
         created_at INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        assignee_id TEXT,
+        creator_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'created',
+        priority INTEGER DEFAULT 2,
+        progress INTEGER DEFAULT 0,
+        tags TEXT,
+        parent_task_id TEXT,
+        depends_on TEXT,
+        acceptance_criteria TEXT,
+        evidence TEXT,
+        expected_modules TEXT,
+        blocked_reason TEXT,
+        source TEXT DEFAULT 'agent',
+        retry_count INTEGER DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        claimed_at INTEGER,
+        submitted_at INTEGER,
+        closed_at INTEGER,
+        updated_at INTEGER NOT NULL,
+        is_archived INTEGER DEFAULT 0
     )
     """,
     """
@@ -317,8 +334,12 @@ PROJECT_DB_TABLES = [
     """
     CREATE TABLE IF NOT EXISTS agent_charters (
         id TEXT PRIMARY KEY,
+        project_id TEXT,
         agent_id TEXT NOT NULL,
+        title TEXT,
         content TEXT,
+        project_rules TEXT DEFAULT '',
+        status TEXT DEFAULT 'active',
         version TEXT DEFAULT '1.0',
         created_at INTEGER,
         updated_at INTEGER
@@ -348,16 +369,15 @@ PROJECT_DB_TABLES = [
 # ── Meta DB 索引 ────────────────────────────────────────────
 
 META_DB_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS idx_agents_project_id ON agents(project_id)",
-    "CREATE INDEX IF NOT EXISTS idx_agents_short_id ON agents(short_id)",
-    "CREATE INDEX IF NOT EXISTS idx_agents_parent_id ON agents(parent_id)",
-    "CREATE INDEX IF NOT EXISTS idx_agent_charters_project_id ON agent_charters(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_llm_models_is_active ON llm_models(is_active)",
 ]
 
 # ── Per-project DB 索引 ────────────────────────────────────
 
 PROJECT_DB_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_agents_project_id ON agents(project_id)",
+    "CREATE INDEX IF NOT EXISTS idx_agents_short_id ON agents(short_id)",
+    "CREATE INDEX IF NOT EXISTS idx_agents_parent_id ON agents(parent_id)",
     "CREATE INDEX IF NOT EXISTS idx_inbox_to_agent ON inbox(to_agent_id, read)",
     "CREATE INDEX IF NOT EXISTS idx_inbox_created_at ON inbox(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_chat_messages_agent_id ON chat_messages(agent_id, created_at)",
@@ -365,8 +385,12 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories(agent_id, scope)",
     "CREATE INDEX IF NOT EXISTS idx_handoffs_to_agent ON handoffs(to_agent_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_work_logs_agent_id ON work_logs(agent_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)",
     "CREATE INDEX IF NOT EXISTS idx_agent_events_agent_id ON agent_events(agent_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_scheduled_alarms_project_id ON scheduled_alarms(project_id, fired)",
     "CREATE INDEX IF NOT EXISTS idx_permission_requests_agent ON permission_requests(agent_id)",
     "CREATE INDEX IF NOT EXISTS idx_personnel_records_agent_id ON personnel_records(agent_id)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_charters_project_id ON agent_charters(project_id)",
 ]

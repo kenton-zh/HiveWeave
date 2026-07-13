@@ -311,3 +311,86 @@ async def execute_grep(
     if hidden > 0:
         out += f"\n\n({hidden} results hidden by security policy — sensitive file patterns)"
     return {"success": True, "output": out, "error": None}
+
+
+# ── Pydantic models + @tool registration (Phase 2 migration) ──────
+
+from pydantic import BaseModel, Field, ConfigDict
+
+from .base import tool
+from .result import ToolResult
+
+
+class GrepParams(BaseModel):
+    """Parameters for grep tool."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    pattern: str = Field(
+        description="Regular expression pattern to search for.",
+        json_schema_extra={"aliases": ["regex", "query", "search"]},
+    )
+    path: str = Field(
+        default=".",
+        description="Directory path to search in (relative to workspace). Default: workspace root.",
+        json_schema_extra={"aliases": ["dir", "directory", "search_path"]},
+    )
+    include: str = Field(
+        default="",
+        description="Glob pattern to include (e.g. '*.py'). Empty means all files.",
+        json_schema_extra={"aliases": ["glob", "filter"]},
+    )
+    exclude: str = Field(
+        default="",
+        description="Glob pattern to exclude (e.g. '*.test.py'). Empty means no exclusions.",
+        json_schema_extra={"aliases": ["ignore", "skip"]},
+    )
+    context: int = Field(
+        default=0,
+        ge=0,
+        description="Number of context lines to show around each match. Default: 0.",
+        json_schema_extra={"aliases": ["context_lines", "before_after"]},
+    )
+    head_limit: int = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        description="Maximum number of matching results to return. Default: 500.",
+        json_schema_extra={"aliases": ["limit", "max_results"]},
+    )
+    output_mode: str = Field(
+        default="content",
+        description="Output mode: 'content' shows matching lines, 'files_with_matches' lists only file names. Default: 'content'.",
+        json_schema_extra={"aliases": ["mode", "format"]},
+    )
+    case_insensitive: bool = Field(
+        default=False,
+        description="If true, perform case-insensitive matching. Default: false.",
+        json_schema_extra={"aliases": ["ignore_case", "i"]},
+    )
+    multiline: bool = Field(
+        default=False,
+        description="If true, enable multiline mode where patterns can span multiple lines. Default: false.",
+        json_schema_extra={"aliases": ["multi_line"]},
+    )
+
+
+@tool(
+    "grep",
+    "Search file contents using regex (ripgrep). Returns matching lines with file/line info.",
+    requires_workspace=True,
+    security_level="standard",
+)
+async def grep_tool(params: GrepParams, agent_id: str, workspace: str) -> ToolResult:
+    """Search files for a regex pattern."""
+    result = await execute_grep(
+        pattern=params.pattern,
+        path=params.path,
+        include=params.include or None,
+        context=params.context,
+        head_limit=params.head_limit,
+        multiline=params.multiline,
+        workspace_path=workspace,
+    )
+    if result.get("success"):
+        return ToolResult.ok(result["output"])
+    return ToolResult.err(result.get("error", "Unknown error"))

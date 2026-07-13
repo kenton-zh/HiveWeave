@@ -240,10 +240,12 @@ async def resolve_compactor_callback(agent_id: str) -> LLMCallback | None:
     无可用模型时返回 None（compact 将回退到硬截断）。
     """
     from hiveweave.db import meta as meta_db
+    from hiveweave.db import project as project_db
 
     try:
-        # 1. 取 agent 的 model_id
-        agent_row = await meta_db.query_one(
+        # 1. 取 agent 的 model_id（agents 表在 per-project DB）
+        agent_row = await project_db.query_one(
+            agent_id,
             "SELECT model_id FROM agents WHERE id = ? LIMIT 1", [agent_id]
         )
         model_id = agent_row["model_id"] if agent_row else None

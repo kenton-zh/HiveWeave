@@ -19,10 +19,23 @@ from hiveweave.db import meta as meta_db
 
 logger = structlog.get_logger()
 
+# ──────────────────────────────────────────────────────────────────────────
+# DEPRECATED 工具（保留向后兼容，不破坏旧 agent 的 saved_rules / DB 状态）
+# 新 agent 应改用 Task Ledger 工具。映射关系：
+#   report_completion  → submit_task   (executor-only)
+#   approve_work       → review_task   (coordinator-only, decision='approve')
+#   reject_work        → review_task   (coordinator-only, decision='rework')
+#   dispatch_task      → create_task + dispatch_task  (dispatch_task 仍在白名单，
+#                        但建议先 create_task 落账再 dispatch)
+#   message_superior   → 仅用于提问，完成任务用 submit_task
+# 旧工具保留在 READONLY_TOOLS 白名单中以避免历史 agent 因规则失效而被 deny，
+# 但 LLM 端的 TOOL_PARAM_SCHEMAS 已标注 DEPRECATED，引导迁移到新工具。
+# ──────────────────────────────────────────────────────────────────────────
+
 # readonly preset (契约 08)
 # Coordinator/管理角色使用此模式 — 包含所有管理工具，但不包含代码写入工具
 READONLY_TOOLS = frozenset({
-    "bash", "grep", "apply_patch", "question", "todowrite", "websearch", "webfetch",
+    "bash", "grep", "question", "todowrite", "websearch", "webfetch",
     "schedule_alarm", "list_alarms", "cancel_alarm",
     "review", "read_file", "list_files", "read_skill", "list_available_skills", "bind_skill",
     "unbind_skill", "read_memory", "write_memory",
@@ -36,6 +49,11 @@ READONLY_TOOLS = frozenset({
     # 管理工具 — coordinator 需要用来派活、审批、写 charter、管理组织
     "dispatch_task", "approve_work", "reject_work",
     "save_charter", "update_goals", "dismiss_agent", "transfer_agent",
+    # Task Ledger 查询 — 所有角色可查（只读）
+    "get_tasks",
+    # Task Ledger 操作 — coordinator 也可能被分配任务（如 EXPLORE 调研），
+    # 需要 claim/update_status/submit 来管理自己的任务
+    "claim_task", "update_task_status", "submit_task", "update_progress",
 })
 
 # readwrite = readonly + 代码写入/审查工具
@@ -43,6 +61,7 @@ READONLY_TOOLS = frozenset({
 READWRITE_TOOLS = READONLY_TOOLS | frozenset({
     "write_file", "edit_file", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
+    "apply_patch",
     "run_code_review", "run_security_audit", "run_tests",
     "run_perf_audit", "run_full_review",
     "git_worktree_create", "git_worktree_merge", "git_worktree_remove",
@@ -51,6 +70,20 @@ READWRITE_TOOLS = READONLY_TOOLS | frozenset({
 
 # All known tools (full mode)
 ALL_TOOLS = READWRITE_TOOLS | frozenset({"run_command"})
+
+# Task Ledger 工具角色限制（契约 08 — 强制角色边界）
+# coordinator-only: 派活、审批；executor 不可用
+COORDINATOR_ONLY_TOOLS = frozenset({
+    "create_task", "dispatch_task", "review_task",
+})
+# executor-only: 认领、推进、提交；coordinator 不可用
+# NOTE: claim_task, update_task_status, submit_task, update_progress 已移至 READONLY_TOOLS，
+# 因为 coordinator 也可能被分配任务（如 EXPLORE 调研）需要管理自己的任务。
+# EXECUTOR_ONLY_TOOLS 仅保留真正只属于 executor 的工具（目前为空集）
+EXECUTOR_ONLY_TOOLS = frozenset({
+    # "claim_task", "update_task_status", "update_progress", "submit_task",
+    # ↑ 已移至 READONLY_TOOLS — coordinator 也需要
+})
 
 
 class PermissionService:
@@ -86,6 +119,20 @@ class PermissionService:
             return "ask"
         if self._matches_pattern(tool_name, allowed, tool_args):
             return "allow"
+
+        permission_type = (agent.get("permission_type") or "").lower()
+
+        # Task Ledger 工具角色限制 — 强制角色边界（在 coordinator 只读检查之前）
+        if tool_name in COORDINATOR_ONLY_TOOLS:
+            return "allow" if permission_type == "coordinator" else "deny"
+        if tool_name in EXECUTOR_ONLY_TOOLS:
+            return "allow" if permission_type == "executor" else "deny"
+
+        # Coordinator 角色强制只读边界 — 即使 mode=readwrite/full 也只允许 READONLY_TOOLS
+        # 用 deny 而非 ask：ask 会触发 120s 审批超时，agent 误以为工具超时会不断重试，
+        # 浪费 tool rounds。deny 给出即时反馈，agent 会转而委派给 executor。
+        if permission_type == "coordinator":
+            return "allow" if tool_name in READONLY_TOOLS else "deny"
 
         # Fallback based on mode
         if mode == "full":

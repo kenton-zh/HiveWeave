@@ -386,7 +386,7 @@ async def build_trigger_context(
             lines.append(_json.dumps(entry, ensure_ascii=False))
         blocks.append(
             "## Pending Tasks — each line is a JSON object with 'from', 'task', 'status', optional 'report_required'.\n"
-            "Use send_message(recipients=[\"上级花名\"], message=\"...\", expectReport=true) to report results.\n"
+            "Use submit_task(taskId, summary) to submit your work for review.\n"
             + "\n".join(lines)
         )
         delivered_handoff_ids = [h["id"] for h in all_handoffs if h.get("id")]
@@ -405,7 +405,7 @@ async def build_trigger_context(
         blocks.append(
             "## WORK REJECTED — Rework Required\n"
             + "\n".join(lines) + "\n\n"
-            "You must fix the issues and call report_completion again."
+            "You must fix the issues and call submit_task again after fixing."
         )
 
     # ── 3. Messages block ──
@@ -472,8 +472,8 @@ async def build_trigger_context(
             blocks.append(
                 f"## IMPORTANT — Report Required\n"
                 f"You have {len(unreported)} task(s) with expect_report that "
-                f"haven't been reported up. You MUST call message_superior to "
-                f"report results to your superior."
+                f"haven't been submitted for review. You MUST call "
+                f"submit_task(taskId, summary) to submit your work for review."
             )
 
     # 无上下文 → 返回 None
