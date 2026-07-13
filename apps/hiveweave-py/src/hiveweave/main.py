@@ -190,11 +190,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("approval_restore_failed", error=str(e))
 
-    # 4. Start game time tick loop
+    # 4. Start game time tick loop — only for started projects
     game_time_projects: list[str] = []
     try:
         from hiveweave.db import meta as meta_db
-        projects = await meta_db.query("SELECT id FROM projects WHERE 1=1")
+        # Bug K fix: 重启后所有项目默认"下班"，不自动启动 agents/game_time
+        # 用户需要手动调用 POST /api/projects/{id}/activate 来"上班"
+        await meta_db.execute(
+            "UPDATE projects SET is_started = 0"
+        )
+        # 只启动 is_started=1 的项目（重启前已经"上班"的）
+        # 由于上面刚重置为 0，这里实际上不会启动任何项目
+        projects = await meta_db.query(
+            "SELECT id FROM projects WHERE is_started = 1"
+        )
         for p in projects:
             try:
                 gt = GameTimeService(p["id"])
@@ -202,13 +211,12 @@ async def lifespan(app: FastAPI):
                 game_time_projects.append(p["id"])
             except Exception as e:
                 log.warning("game_time_start_failed", project_id=p["id"], error=str(e))
-        log.info("game_time_started", projects=len(projects))
+        log.info("game_time_started", started_projects=len(projects),
+                 total_projects="all reset to 0 on startup")
     except Exception as e:
         log.warning("game_time_init_failed", error=str(e))
 
     # 4b. Rebuild agent_router (in-memory agent_id → project_id routing)
-    # Must run after init_meta_db and before start_project_agents,
-    # so that agent_manager can resolve agent_id → project_id via agent_router.
     try:
         from hiveweave.services.agent_router import agent_router
         total = await agent_router.rebuild()
@@ -216,15 +224,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("agent_router_rebuild_failed", error=str(e))
 
-    # 5. Recover + start agents for all projects
+    # 5. Start agents only for started projects
     try:
-        projects = await meta_db.query("SELECT id FROM projects WHERE 1=1")
+        projects = await meta_db.query(
+            "SELECT id FROM projects WHERE is_started = 1"
+        )
         for p in projects:
             try:
                 await agent_manager.start_project_agents(p["id"])
             except Exception as e:
                 log.warning("agent_start_failed", project_id=p["id"], error=str(e))
-        log.info("agents_started", projects=len(projects))
+        log.info("agents_started", started_projects=len(projects))
     except Exception as e:
         log.warning("agent_recovery_failed", error=str(e))
 

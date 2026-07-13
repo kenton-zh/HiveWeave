@@ -147,6 +147,16 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
 
         project_id = agent_record["project_id"]
 
+        # Bug K fix: 检查项目是否"上班"状态，未上班则跳过
+        from hiveweave.db import meta as meta_db
+        proj = await meta_db.query_one(
+            "SELECT is_started FROM projects WHERE id = ?", [project_id]
+        )
+        if not proj or not proj.get("is_started"):
+            log.info("trigger_project_not_started_skip",
+                     agent_id=agent_id, project_id=project_id)
+            return
+
         # 4. coordinator：检查是否有 pending inbox 消息
         if trigger_type == "coordinator":
             pending = await _inbox_service.get_pending_messages(agent_id)

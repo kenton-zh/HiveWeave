@@ -345,6 +345,15 @@ class Agent:
             if system_state.paused():
                 return {"error": "paused"}
 
+            # Bug K fix: 检查项目是否"上班"状态
+            from hiveweave.db import meta as _meta_db
+            _proj = await _meta_db.query_one(
+                "SELECT is_started FROM projects WHERE id = ?",
+                [self.project_id]
+            )
+            if not _proj or not _proj.get("is_started"):
+                return {"error": "project_not_started"}
+
             # 设置状态
             self.status = AgentState.PROCESSING
             self._cancel_reason = None
