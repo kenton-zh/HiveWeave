@@ -41,6 +41,12 @@ _META_MIGRATIONS: list[tuple[str, str, str]] = [
     ("agent_templates", "discipline_suite", "TEXT DEFAULT ''"),
     # llm_models — add provider_type for multi-format LLM support
     ("llm_models", "provider_type", "TEXT DEFAULT ''"),
+    # Bug J fix: add fallback column for circuit breaker fallback
+    ("llm_models", "fallback", "TEXT"),
+    # 注: 不再添加 projects.language — 该列的真相源在 per-project DB
+    # 的 project_meta 表（见 db/schema.py PROJECT_DB_TABLES），见
+    # api/projects.py:_fetch_project_meta 注释。旧 DB 残留的 language 列
+    # 是孤儿列, 无害, 不读即可。
 ]
 
 # 旧 Meta DB 中需要 DROP 的遗留表（已迁移到 per-project DB 或已废弃）
@@ -60,6 +66,12 @@ _LEGACY_TABLES_TO_DROP = [
     "modules",
     "merges",
     "__new_agents",
+]
+
+# 旧 Meta DB 中需要 DROP 的遗留列（真相源已迁到 per-project DB project_meta）
+# 见 db/schema.py PROJECT_DB_TABLES / api/projects.py:_fetch_project_meta 注释
+_LEGACY_COLUMNS_TO_DROP = [
+    ("projects", "language"),
 ]
 
 
@@ -102,6 +114,20 @@ async def _migrate_meta_schema(conn: aiosqlite.Connection) -> None:
         except aiosqlite.OperationalError as e:
             msg = str(e).lower()
             if "duplicate column" in msg or "no such table" in msg:
+                continue
+            raise
+
+    # 4. Drop legacy columns that no longer belong in Meta DB
+    #    真相源已迁到 per-project DB (见 db/schema.py PROJECT_DB_TABLES / project_meta).
+    for table, column in _LEGACY_COLUMNS_TO_DROP:
+        try:
+            await conn.execute(
+                f"ALTER TABLE {table} DROP COLUMN {column}"
+            )
+            log.info("schema_column_dropped", table=table, column=column)
+        except aiosqlite.OperationalError as e:
+            msg = str(e).lower()
+            if "no such column" in msg or "no such table" in msg:
                 continue
             raise
 

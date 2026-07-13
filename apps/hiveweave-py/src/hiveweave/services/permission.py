@@ -34,10 +34,12 @@ logger = structlog.get_logger()
 
 # readonly preset (契约 08)
 # Coordinator/管理角色使用此模式 — 包含所有管理工具，但不包含代码写入工具
+# Bug E fix: 加入 write_file 让架构师可以输出 spec 文件到 docs/ 目录。
+# 安全由 file.py 的路径沙箱 + is_sensitive_path 保证。
 READONLY_TOOLS = frozenset({
     "bash", "grep", "question", "todowrite", "websearch", "webfetch",
     "schedule_alarm", "list_alarms", "cancel_alarm",
-    "review", "read_file", "list_files", "read_skill", "list_available_skills", "bind_skill",
+    "review", "read_file", "write_file", "list_files", "read_skill", "list_available_skills", "bind_skill",
     "unbind_skill", "read_memory", "write_memory",
     "send_message", "message_superior", "message_subordinate",
     "message_peer", "message_team",

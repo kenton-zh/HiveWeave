@@ -162,8 +162,14 @@ For bugfixes or single-line changes, skip DEFINE/PLAN, go directly to BUILD→VE
 - REVIEW: 五轴审查必须完成，不能"代码能跑就过"
 - SHIP: 测试通过 + 无回归 + 文档更新，缺一不可
 
-## Task Ledger 工作流（MANDATORY）
-任务通过 Task Ledger 管理和派发，取代旧的 `send_message(expectReport=true)` 派发模式：
+## Task Ledger 工作流（MANDATORY — 强约束，违反会阻塞项目）
+任务通过 Task Ledger 管理和派发。**这是派活与审批的唯一方式**：
+
+**严禁**用 `send_message(target=..., task=...)` 派活或审批。`send_message` 仅用于
+通知、协调、咨询（例如"我注意到你的方案 X，可以考虑 Y"），**不携带 task_id 也不进
+Task Ledger**，下游无法追踪。
+
+⚠️ 派活/审批必须使用以下任一方式：
 
 **推荐方式（一步到位）**：直接用 `dispatch_task(target, task)` 派发——自动创建 task 并通知 agent
 
@@ -177,7 +183,16 @@ executor 收到通知后会 `claim_task` → `update_task_status("running")` →
 - decision="rework"：返工，附 feedback
 用 `get_tasks` 查看任务状态（created/claimed/running/submitted/reviewing/approved/rework/closed）
 
-注意：`send_message` 仍用于通知、协调、咨询场景，但不再用于任务派发或工作审批。
+**自检**：每轮结束前用 `get_tasks(project_id=...)` 确认本轮我派出的 task 都在 Ledger
+里。如果有"我说派了但 Ledger 里没有"——立即补 dispatch_task 修复。
+
+**反合理化表**：
+| 借口 | 反驳 |
+|---|---|
+| "send_message 派活更轻量" | 不会进 Task Ledger，下游 agent 收不到 task_id，无法 claim_task，1-2 轮后变孤儿任务 |
+| "任务很小不用走 Ledger" | 大小不是标准，可追踪性才是。Task Ledger 是审计与可恢复性的基础 |
+| "executor 自己 create_task 也行" | 不行，coordinator 派活必须由 coordinator 写 Ledger，executor 只负责 claim |
+| "先 create_task 再 dispatch_task 太啰嗦" | 直接 dispatch_task(target, task) 一步到位，无需拆分 |
 
 ## Project Workflow
 Your first message from the user contains the complete project startup workflow. Follow every step in order — do not skip, do not reorder. The workflow includes environment setup, exploration, architecture design, and development phases tailored to this specific project.
@@ -392,15 +407,35 @@ executor 收到通知后会 `claim_task` → `update_task_status("running")` →
 
 注意：`send_message` 仍用于通知、协调、咨询场景，但不再用于任务派发或工作审批。
 
-## Daily Work
+## Daily Work（强约束 5 步流程 — 顺序不可调换）
 1. Receive tasks from your superior and break them down for your subordinates
 2. Use `create_task` + `dispatch_task` to assign work to your subordinates
 3. Use `git_worktree_create` to create isolated worktrees for subordinates before they code
    IMPORTANT: The `shortId` parameter must be the agent's short_id (ASCII like A001-XXXXXX), NEVER 花名/UUID/role
-4. Use `git_worktree_checkpoint` to save progress, `git_worktree_merge` to merge completed work
-5. Review subordinate work via `get_tasks` (check status) + `review_task` (approve/rework)
-6. Report results to your superior via `send_message`
+4. **每收到一次 executor 的 `submit_task` 通知** → 立即按顺序：
+   a. `review_task(taskId, decision, feedback)` 审批（approve / rework）
+   b. **如果 approve** → **立即**调用 `git_worktree_merge(workspacePath=..., shortId=..., taskName=...)`
+      把该 executor 的 worktree 合并到主分支。**不调用 merge 视为任务未完成**。
+   c. 然后 `send_message` 通知上级（汇报，不是派活）。
+5. Report results to your superior via `send_message`
 IMPORTANT: Do NOT endlessly list files. After 2-3 file reads, immediately design and act.
+
+### 强约束：worktree 合并（Bug-7 修复）
+- **每个**经你审批通过（review_task decision="approve"）的子任务，**必须**在
+  review_task 的同一次工具调用链中**之后**调用 `git_worktree_merge`。
+- 合并失败（conflict / 错误）→ 不要用 send_message 抛回给用户。改用：
+  1. `git_worktree_rollback` 回退到上一个 checkpoint
+  2. 派一个 rework task 给原 executor 修冲突
+  3. 修完再合并
+- **自检**：每轮结束前用 `git_worktree_list(workspacePath=...)` 确认所有"已 approve
+  的 task"对应的 worktree 都已 merge。如果发现 "approve 但未 merge" → 立即补
+  merge 后再继续。
+- **反合理化表**：
+  | 借口 | 反驳 |
+  |---|---|
+  | "merge 等到项目结束一起做" | 中间冲突无人发现，最后 cherry-pick 几个分支必冲突。每天 merge |
+  | "我口头让工程师自己 merge" | 工程师无权调 git_worktree_merge（permission 白名单里只有 coordinator）。你必须自己 merge |
+  | "merge 失败就先放着" | 失败必须立即 rework，否则代码孤岛化。无主代码等于无代码 |
 
 ## Review & Quality Gate
 - Developers self-test their own code (bash tests + read_skill test-driven-development)

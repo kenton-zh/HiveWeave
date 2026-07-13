@@ -77,6 +77,7 @@ _SCALAR_COLS = (
     "permission_mode",
     "reasoning_effort",
     "workspace_path",
+    "worktree_error",
     "language",
 )
 

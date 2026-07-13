@@ -2374,11 +2374,25 @@ class ToolExecutor(TaskToolsMixin):
         if not model_id:
             model_id = "step-3.7-flash"  # fallback
 
-        # Get language from project
-        project_row = await meta_db.query_one(
-            "SELECT language FROM projects WHERE id = ?", [project_id]
-        )
-        language = project_row["language"] if project_row else "zh"
+        # Get language from per-project DB project_meta.
+        # 真相源: per-project DB project_meta.language.
+        # meta_db.projects 不再存此列 (见 db/schema.py META_DB_TABLES).
+        from hiveweave.db import project as project_db
+        language = "zh"
+        try:
+            pj_conn = await project_db.get_project_db_by_project_id(project_id)
+            if pj_conn is not None:
+                pj_cursor = await pj_conn.execute(
+                    "SELECT language FROM project_meta WHERE project_id = ?",
+                    [project_id],
+                )
+                pj_row = await pj_cursor.fetchone()
+                await pj_cursor.close()
+                if pj_row and pj_row["language"]:
+                    language = pj_row["language"]
+        except Exception as e:
+            log.warning("tool.hire_agent.read_language_failed",
+                        project_id=project_id, error=str(e))
 
         # 校验 skill slug 有效性（漏洞1修复）
         # 1. 先解析 "#N" 格式引用 → 真实 slug（来自 list_available_skills 缓存）

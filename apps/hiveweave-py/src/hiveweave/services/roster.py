@@ -185,31 +185,73 @@ class RosterService:
         """Get formatted roster text for a project.
 
         契约 17: markdown 格式，每条含 name/short_id/role + position/department/...
-        LEFT JOIN agents 取 name/role/short_id。空结果返回提示文本。
+
+        真相源归一到 per-project DB 的 agents 表（HR 招聘自动写入），
+        personnel_records 通过 LEFT JOIN 补齐 position/department/responsibilities
+        等扩展字段。如果某个 agent 在 personnel_records 中没有记录（HR 尚未
+        手工 update_roster），仍会展示其 name/short_id/role 基础信息。
+
+        Bug-2 修复: 旧实现只读 personnel_records，所以"刚刚 hire 但未手动
+        update_roster"的 agent 在 read_roster 工具里看不到，导致 CEO 误判
+        Roster 为空。
         """
-        records = await self.list_by_project(project_id)
-        if not records:
-            return "Roster is empty. No personnel records found."
+        # 真相源: per-project DB agents 表
+        conn = await _conn(project_id)
+        try:
+            cursor = await conn.execute(
+                "SELECT id, short_id, name, role, status "
+                "FROM agents WHERE project_id = ? AND status != 'archived' "
+                "ORDER BY short_id", [project_id])
+            agents_rows = await cursor.fetchall()
+            await cursor.close()
+        except Exception as e:
+            log.warning("roster.read_agents_failed",
+                        project_id=project_id, error=str(e))
+            return f"## Personnel Roster\n\nRoster read failed: {e}"
+
+        if not agents_rows:
+            return "Roster is empty. No agents found in this project."
+
+        # 扩展字段: 尝试 LEFT JOIN personnel_records
+        records_by_agent: dict[str, dict] = {}
+        try:
+            await _ensure_schema(project_id)
+            pr_cursor = await conn.execute(
+                "SELECT agent_id, position, department, responsibilities, status, hire_date "
+                "FROM personnel_records WHERE project_id = ?",
+                [project_id])
+            pr_rows = await pr_cursor.fetchall()
+            await pr_cursor.close()
+            records_by_agent = {r["agent_id"]: dict(r) for r in pr_rows}
+        except Exception as e:
+            log.debug("roster.read_personnel_records_skipped",
+                      project_id=project_id, error=str(e))
 
         entries: list[str] = []
-        for r in records:
-            agent = await meta_db.get_agent_by_id(r["agent_id"])
-            if agent:
-                name = agent.get("name", "")
-                short_id = agent.get("short_id", "") or ""
-                role = agent.get("role", "")
-                if short_id:
-                    header = f"{name} ({short_id}) — {role}"
-                else:
-                    header = f"{name} — {role}"
+        for a in agents_rows:
+            agent_id = a["id"]
+            short_id = a["short_id"] or ""
+            name = a["name"] or ""
+            role = a["role"] or ""
+            agent_status = a["status"] or "active"
+
+            if short_id:
+                header = f"{name} ({short_id}) — {role}"
             else:
-                header = r["agent_id"]
-            lines = [
-                header,
-                f"  Position: {r.get('position') or ''}",
-                f"  Department: {r.get('department') or ''}",
-                f"  Responsibilities: {r.get('responsibilities') or ''}",
-                f"  Status: {r.get('status') or 'active'}",
-            ]
+                header = f"{name} — {role}"
+
+            r = records_by_agent.get(agent_id)
+            lines = [header]
+            if r:
+                lines.append(f"  Position: {r.get('position') or ''}")
+                lines.append(f"  Department: {r.get('department') or ''}")
+                lines.append(f"  Responsibilities: {r.get('responsibilities') or ''}")
+                lines.append(f"  Status: {r.get('status') or 'active'}")
+            else:
+                # 没手工登记 personnel_records 也展示 agent 自带 status
+                lines.append(f"  Status: {agent_status}")
+                lines.append(f"  (no roster record yet — basic info from agents table)")
+
             entries.append("\n".join(lines))
+
         return "## Personnel Roster\n\n" + "\n---\n".join(entries)
