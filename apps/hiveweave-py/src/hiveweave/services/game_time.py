@@ -38,6 +38,18 @@ STALL_IDLE_MS = 10 * 60 * 1000        # 10 min idle threshold
 STALL_COOLDOWN_MS = 15 * 60 * 1000    # 15 min cooldown (避免重复触发)
 STALL_ESCALATION_THRESHOLD = 3        # 同一对未回复触发 3 次后升级到上级
 
+# Bug K: task 状态停留超时阈值（毫秒）
+# 每个 task 状态有一个"合理停留时间"，超过则催办负责人
+TASK_STALL_THRESHOLDS = {
+    "running":   20 * 60 * 1000,   # 20 min: assignee 该提交或更新进度
+    "submitted": 10 * 60 * 1000,   # 10 min: creator 该审查
+    "reviewing": 10 * 60 * 1000,   # 10 min: reviewer 该审批
+    "rework":    10 * 60 * 1000,   # 10 min: assignee 该返工
+    "created":    5 * 60 * 1000,   # 5 min: assignee 该认领
+    "claimed":    5 * 60 * 1000,   # 5 min: assignee 该开始
+}
+TASK_STALL_COOLDOWN_MS = 15 * 60 * 1000  # 15 min: 同一 task 不重复催
+
 _states: dict[str, dict] = {}          # project_id → state
 _alarm_project: dict[str, str] = {}    # alarm_id → project_id
 
@@ -466,6 +478,124 @@ class GameTimeService:
                 "preview": (h["summary"] or "")[:80],
                 "msg_created_at": h["created_at"],
             })
+
+        # ── Case 4: task 状态停留超时（Bug K）──
+        # 扫描所有非终态 task，检查在当前状态停留是否超过阈值
+        # 按 assignee/creator 分组合并消息，每个 agent 只 trigger 一次
+        stalled_tasks = await _query(project_id,
+            "SELECT id, title, status, assignee_id, creator_id, "
+            "updated_at, submitted_at, claimed_at "
+            "FROM tasks WHERE status IN ('created','claimed','running',"
+            "'submitted','reviewing','rework') "
+            "AND assignee_id IS NOT NULL",
+            [])
+
+        # 按 agent 分组超时 task
+        # key: agent_id, value: list of {task_id, title, status, stall_ms}
+        task_trigger_map: dict[str, list[dict]] = {}
+        for t in stalled_tasks:
+            status = t["status"]
+            threshold = TASK_STALL_THRESHOLDS.get(status)
+            if not threshold:
+                continue
+            # 确定状态进入时间
+            if status == "submitted":
+                entered_at = t["submitted_at"] or t["updated_at"]
+            elif status == "claimed":
+                entered_at = t["claimed_at"] or t["updated_at"]
+            else:
+                entered_at = t["updated_at"]
+            if not entered_at:
+                continue
+            stall_ms = now_ms - entered_at
+            if stall_ms < threshold:
+                continue
+            # 确定负责人：submitted/reviewing → creator，其他 → assignee
+            if status in ("submitted", "reviewing"):
+                responsible = t["creator_id"]
+            else:
+                responsible = t["assignee_id"]
+            if not responsible:
+                continue
+            task_trigger_map.setdefault(responsible, []).append({
+                "task_id": t["id"],
+                "title": t["title"] or "(untitled)",
+                "status": status,
+                "stall_ms": stall_ms,
+            })
+
+        # 处理超时 task：按 agent 合并消息 + trigger
+        if task_trigger_map:
+            # 补充 name_map
+            for aid in task_trigger_map:
+                if aid not in name_map:
+                    all_agent_ids.add(aid)
+            if all_agent_ids:
+                id_placeholders = ", ".join(["?"] * len(all_agent_ids))
+                name_rows = await _query(project_id,
+                    f"SELECT id, name, parent_id FROM agents WHERE id IN ({id_placeholders})",
+                    list(all_agent_ids))
+                name_map = {r["id"]: r["name"] for r in name_rows}
+                parent_map = {r["id"]: r["parent_id"] for r in name_rows}
+
+            # task stall 冷却追踪器（独立于 inbox stall）
+            if "task_stall_trackers" not in state:
+                state["task_stall_trackers"] = {}
+            task_trackers = state["task_stall_trackers"]
+
+            for aid, tasks in task_trigger_map.items():
+                # 冷却检查：跳过最近催过的 task
+                pending_tasks = []
+                for t in tasks:
+                    tracker = task_trackers.get(t["task_id"], {"ts": 0})
+                    if now_ms - tracker["ts"] < TASK_STALL_COOLDOWN_MS:
+                        continue
+                    task_trackers[t["task_id"]] = {"ts": now_ms}
+                    pending_tasks.append(t)
+
+                if not pending_tasks:
+                    continue
+
+                agent_name = _name(aid)
+
+                # 构建合并消息
+                status_labels = {
+                    "running": "进行中，请提交成果或更新进度",
+                    "submitted": "已提交，等待你的审查",
+                    "reviewing": "审查中，请完成审批",
+                    "rework": "需返工，请尽快处理",
+                    "created": "待认领，请开始处理",
+                    "claimed": "已认领，请开始执行",
+                }
+                lines = []
+                for t in pending_tasks:
+                    minutes = int(t["stall_ms"] / 60000)
+                    label = status_labels.get(t["status"], "需推进")
+                    lines.append(f"  - [{t['title']}] 状态：{t['status']}（{label}），已停留 {minutes} 分钟")
+                msg = (
+                    "[TASK WATCHDOG] 以下任务需要你推进：\n"
+                    + "\n".join(lines)
+                    + "\n请尽快处理：提交成果(submit_task)、审查(review_task)或更新进度。"
+                )
+
+                log.warning("task_stall_trigger",
+                            project_id=project_id,
+                            agent_id=aid, name=agent_name,
+                            stalled_tasks=len(pending_tasks),
+                            statuses=[t["status"] for t in pending_tasks])
+
+                try:
+                    from hiveweave.services.inbox import InboxService
+                    inbox = InboxService()
+                    await inbox.send_message(
+                        "system", aid, msg,
+                        message_type="system", priority="urgent")
+
+                    from hiveweave.agents.trigger import trigger_subordinate
+                    await trigger_subordinate(aid)
+                except Exception as e:
+                    log.error("task_stall_trigger_failed",
+                              agent_id=aid, error=str(e))
 
         if not trigger_map:
             return
