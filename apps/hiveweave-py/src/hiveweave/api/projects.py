@@ -561,6 +561,13 @@ async def create_project(body: ProjectCreate) -> dict:
         log.warning("create_project_meta_failed", project_id=project_id, error=str(e))
 
     # 启动 agent + game time（C3/C4 fix: 新项目创建后立即启动运行时资源）
+    # 同时设置 is_started=1 — 创建项目即"上班"，后端重启后自动恢复
+    try:
+        await meta_db.execute(
+            "UPDATE projects SET is_started = 1 WHERE id = ?", [project_id]
+        )
+    except Exception as e:
+        log.warning("set_is_started_after_create_failed", project_id=project_id, error=str(e))
     try:
         from hiveweave.agents.supervisor import agent_manager
         await agent_manager.start_project_agents(project_id)
