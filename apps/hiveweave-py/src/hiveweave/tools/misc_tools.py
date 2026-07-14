@@ -249,13 +249,13 @@ async def git_worktree_merge_tool(
         )
     elif len(branch_name) <= 8 and branch_name.isalnum():
         # 看起来是 short_id (如 "A066") — 查找该 agent 的实际分支
-        import subprocess
-        r = subprocess.run(
-            ["git", "branch", "--list", f"hw/{branch_name}/*"],
-            capture_output=True, text=True, cwd=workspace_path
+        from hiveweave.services.git_worktree import _git
+        ok, branch_out = await _git(
+            ["branch", "--list", f"hw/{branch_name}/*"],
+            workspace_path
         )
         branches = [b.strip().lstrip("* ").strip()
-                    for b in r.stdout.strip().split("\n") if b.strip()]
+                    for b in branch_out.strip().split("\n") if b.strip()]
         if not branches:
             return ToolResult.err(
                 f"No worktree branch found for agent {branch_name}")
