@@ -1042,6 +1042,13 @@ class Agent:
         # 成功完成 → 清除 resume 冷却
         self._resume_cooldown_until = 0.0
 
+        # 3.5 持久化裁剪旧工具输出（OpenCode prune 模式）
+        # 每轮结束后清除保护窗口外的旧 tool 输出，防止历史无限膨胀
+        try:
+            await self._conversation.prune_persisted(self.id, self.project_id)
+        except Exception as e:
+            log.warning("prune_persisted_failed", agent_id=self.id, error=str(e))
+
         # 4. 状态 → idle (先取消 safety timer，再 reset)
         self._cancel_safety_timer()
         self._reset_to_idle()
