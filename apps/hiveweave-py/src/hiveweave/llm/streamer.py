@@ -31,6 +31,7 @@ import httpx
 import structlog
 
 from hiveweave.llm.circuit_breaker import CircuitBreaker, circuit_breaker
+from hiveweave.conversation.token_utils import estimate_tokens_for_messages
 from hiveweave.llm.provider import ProviderConfig, ProviderFactory, provider_factory, READ_TIMEOUT_S
 from hiveweave.llm.retry import (
     PermanentError,
@@ -1393,16 +1394,81 @@ class Streamer:
 
     # ── 上下文溢出修剪 ──────────────────────────────────────
 
+    #: Prune 保护窗口（token）— 最近工具输出保留原文
+    _PRUNE_PROTECT_TOKENS = 40_000
+    #: Prune 最低收益（token）— 候选总量不足此值则不执行
+    _PRUNE_MINIMUM_TOKENS = 10_000
+    #: Prune 占位符
+    _PRUNE_PLACEHOLDER = "[Old tool result content cleared]"
+
+    def _prune_old_tool_outputs(self, messages: list[dict]) -> list[dict]:
+        """在 tool loop 中裁剪旧工具输出（OpenCode prune 模式，临时版）。
+
+        逆序遍历：跳过最近 2 轮（assistant 消息计轮次），保护窗口(40K)外的
+        旧 tool 输出替换为占位符。候选总量 > 10K 时才执行。
+        """
+        if len(messages) < 6:
+            return messages
+
+        to_prune_indices: list[int] = []
+        protected = 0
+        turns = 0
+
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            role = msg.get("role", "")
+
+            if role == "assistant":
+                turns += 1
+            if turns < 2:
+                continue
+
+            if "tool_call_id" not in msg:
+                continue
+
+            # 已被裁剪过 → 停止
+            if msg.get("content") == self._PRUNE_PLACEHOLDER:
+                break
+
+            tokens = estimate_tokens_for_messages([msg])
+            new_protected = protected + tokens
+            if new_protected <= self._PRUNE_PROTECT_TOKENS:
+                protected = new_protected
+            else:
+                to_prune_indices.append(i)
+
+        if not to_prune_indices:
+            return messages
+
+        prune_tokens = sum(
+            estimate_tokens_for_messages([messages[i]]) for i in to_prune_indices
+        )
+        if prune_tokens < self._PRUNE_MINIMUM_TOKENS:
+            return messages  # 收益不足
+
+        result = list(messages)
+        for i in to_prune_indices:
+            result[i] = {**result[i], "content": self._PRUNE_PLACEHOLDER}
+
+        log.info(
+            "tool_loop_prune",
+            pruned_count=len(to_prune_indices),
+            pruned_tokens=prune_tokens,
+            protected_tokens=protected,
+        )
+        return result
+
     def _trim_context_if_needed(
         self,
         messages: list[dict],
         provider: ProviderConfig,
     ) -> list[dict]:
-        """上下文溢出检查: 估算 token 数，超 usable 则裁剪。
+        """上下文溢出检查: 先 prune 旧工具输出，再估算 token，超 usable 则硬截断。
 
-        对齐 Elixir trim_context_if_needed（简化版: 从前端硬截断，不做 LLM 摘要）。
+        对齐 Elixir trim_context_if_needed + OpenCode prune 模式。
         """
-        from hiveweave.conversation.token_utils import estimate_tokens_for_messages
+        # Step 1: Prune 旧工具输出（替换为占位符，不丢弃消息）
+        messages = self._prune_old_tool_outputs(messages)
 
         max_output = provider.max_output_tokens
         if provider.supports_thinking:
