@@ -102,7 +102,7 @@ class InboxService:
         rows = await project_db.query(
             agent_id,
             "SELECT id, from_agent_id, to_agent_id, message, read, created_at, "
-            "message_type, expect_report, priority FROM inbox "
+            "message_type, expect_report, priority, task_id FROM inbox "
             "WHERE to_agent_id = ? AND read = 0 ORDER BY created_at ASC LIMIT 50",
             [agent_id])
         return [self._row_to_msg(r) for r in rows]

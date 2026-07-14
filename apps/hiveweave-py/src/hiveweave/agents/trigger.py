@@ -244,17 +244,17 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
 
         context, inbox_msg_ids, from_agent_id = result
 
-        # Mark inbox read NOW, before processing. If the agent crashes or
-        # hits doom loop mid-processing, the message won't re-trigger endlessly.
-        if inbox_msg_ids:
-            await _inbox_service.mark_read_by_ids(agent_id, inbox_msg_ids)
-
+        # Do NOT mark inbox read here. ACK happens only after a successful
+        # non-empty completion (agent.py). Timeout/error leave messages unread
+        # so the info chain can resume; doom-loop is prevented by a cooldown
+        # arm on the Agent after timeout/error.
         log.info(
             "trigger_firing",
             agent_id=agent_id,
             name=agent_record.get("name"),
             trigger_type=trigger_type,
             context_preview=context[:100],
+            inbox_pending=len(inbox_msg_ids or []),
         )
 
         # 8. 保存为 background user 消息（去重 goals workbook block）

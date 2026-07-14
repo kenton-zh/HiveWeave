@@ -510,23 +510,21 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["reviewerId", "target"],
     },
     "report_completion": {
-        "description": "DEPRECATED: Use submit_task instead. Notify your superior that a delegated task is finished.",
+        "description": "REMOVED. Use submit_task(taskId, summary, testsPassed=true) instead.",
         "properties": {
             "summary": {"type": "string", "aliases": ["message", "content", "report", "description"]},
-            "handoffId": {"type": "string", "aliases": ["handoff_id", "taskId", "task_id"]},
         },
         "required": ["summary"],
     },
     "approve_work": {
-        "description": "DEPRECATED: Use review_task with decision='approve' instead. Approve a subordinate's deliverable. Optionally add review comments.",
+        "description": "REMOVED. Use review_task(taskId, decision='approve') instead.",
         "properties": {
             "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
-            "review": {"type": "string", "aliases": ["comment", "feedback", "notes"]},
         },
         "required": ["subordinate"],
     },
     "reject_work": {
-        "description": "DEPRECATED: Use review_task with decision='rework' instead. Reject a subordinate's work with a required reason. They must redo it.",
+        "description": "REMOVED. Use review_task(taskId, decision='rework', feedback=...) instead.",
         "properties": {
             "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
             "reason": {"type": "string", "aliases": ["feedback", "review", "comment", "message"]},
@@ -648,7 +646,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["taskId", "progress"],
     },
     "submit_task": {
-        "description": "Submit a task for review. Automatically handles claim+start if needed (created→claimed→running→submitted). Submit with evidence (commit, files_changed, tests_passed, summary). If taskId omitted, auto-detects your current task.",
+        "description": "Submit a task for review. REQUIRES testsPassed=true after running real tests. Auto claim+start if needed. Optional testOutput strengthens evidence.",
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
             "summary": {"type": "string", "aliases": ["report", "description"]},
@@ -656,12 +654,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["commitSha", "commit_sha"]},
             "filesChanged": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files_changed", "files"]},
-            "testsPassed": {"type": "boolean", "aliases": ["tests_passed"]},
+            "testsPassed": {"type": "boolean", "aliases": ["tests_passed"],
+                "description": "Must be true. Run tests first."},
+            "testOutput": {"type": "string", "aliases": ["test_output", "testLog"],
+                "description": "Brief test command output / proof."},
         },
-        "required": ["summary"],
+        "required": ["summary", "testsPassed"],
     },
     "review_task": {
-        "description": "Review a submitted task (reviewing → approved/rework). This replaces approve_work/reject_work. Use decision='approve' or 'rework'. Coordinator reviews submitted work. decision='approve' closes the review; decision='rework' sends it back for rework.",
+        "description": "Review a submitted task (reviewing → approved/rework). approve requires evidence.tests_passed=true and spawns a mandatory VERIFY child task; then call git_worktree_merge.",
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
             "decision": {"type": "string",
@@ -1665,39 +1666,20 @@ class ToolExecutor(TaskToolsMixin):
     # _tool_review_task, _tool_get_tasks) are in tools/task_tools.py (TaskToolsMixin).
 
     async def _tool_report_completion(self, agent_id: str, args: dict) -> dict:
-        """Report task completion to superior.
-
-        DEPRECATED: Use submit_task instead. This tool uses the legacy
-        HandoffService flow and does not record evidence in the Task Ledger.
-        """
-        summary = args.get("summary") or args.get("report") or ""
-        if not summary:
-            return self._error("report_completion requires 'summary'")
-        from hiveweave.services.handoff import HandoffService
-        project_id = await self._get_project_id(agent_id)
-        if not project_id:
-            return self._error(f"Agent {agent_id} has no project")
-        hs = HandoffService()
-        # Find accepted handoffs for this agent and report on the first
-        handoffs = await hs.get_accepted_handoffs(project_id, agent_id)
-        if not handoffs:
-            return self._error("No accepted handoffs to report on")
-        await hs.complete_handoff(project_id, handoffs[0]["id"])
-        return {"success": True, "output": "Completion reported to superior.", "error": None}
+        """DEPRECATED — hard-redirect to submit_task."""
+        return self._error(
+            "report_completion is removed. Use submit_task(taskId, summary, "
+            "testsPassed=true, testOutput=...) instead so the Task Ledger "
+            "and verification gate stay consistent."
+        )
 
     async def _tool_request_review(self, agent_id: str, args: dict) -> dict:
         """Request a code review from superior."""
         file_paths = args.get("filePaths") or args.get("files") or []
         description = args.get("description") or args.get("summary") or "Please review my work."
-        from hiveweave.services.handoff import HandoffService
         project_id = await self._get_project_id(agent_id)
         if not project_id:
             return self._error(f"Agent {agent_id} has no project")
-        hs = HandoffService()
-        handoffs = await hs.get_accepted_handoffs(project_id, agent_id)
-        if not handoffs:
-            return self._error("No accepted handoffs to request review on")
-        # Send a message to superior with review request
         from hiveweave.services.inbox import InboxService
         ib = InboxService()
         superior = await self._org.get_superior(agent_id)
@@ -1712,46 +1694,18 @@ class ToolExecutor(TaskToolsMixin):
         return {"success": True, "output": "Review requested from superior.", "error": None}
 
     async def _tool_approve_work(self, agent_id: str, args: dict) -> dict:
-        """Approve a subordinate's work.
-
-        DEPRECATED: Use review_task with decision='approve' instead. This tool
-        uses the legacy HandoffService flow and does not update Task Ledger
-        status.
-        """
-        subordinate = args.get("subordinate") or args.get("agentId") or ""
-        if not subordinate:
-            return self._error("approve_work requires 'subordinate'")
-        from hiveweave.services.handoff import HandoffService
-        project_id = await self._get_project_id(agent_id)
-        if not project_id:
-            return self._error(f"Agent {agent_id} has no project")
-        hs = HandoffService()
-        result = await hs.approve(project_id, agent_id, subordinate)
-        if result.get("success"):
-            return {"success": True, "output": f"Work approved for {subordinate}.", "error": None}
-        return self._error(result.get("message", "Approval failed"))
+        """DEPRECATED — hard-redirect to review_task."""
+        return self._error(
+            "approve_work is removed. Use review_task(taskId, decision='approve') "
+            "instead. Then call git_worktree_merge and wait for the VERIFY task."
+        )
 
     async def _tool_reject_work(self, agent_id: str, args: dict) -> dict:
-        """Reject a subordinate's work (request rework).
-
-        DEPRECATED: Use review_task with decision='rework' instead. This tool
-        uses the legacy HandoffService flow and does not update Task Ledger
-        status.
-        """
-        subordinate = args.get("subordinate") or args.get("agentId") or ""
-        reason = args.get("reason") or args.get("feedback") or "Rework required."
-        if not subordinate:
-            return self._error("reject_work requires 'subordinate'")
-        from hiveweave.services.handoff import HandoffService
-        from hiveweave.services.inbox import InboxService
-        project_id = await self._get_project_id(agent_id)
-        if not project_id:
-            return self._error(f"Agent {agent_id} has no project")
-        hs = HandoffService()
-        result = await hs.reject(project_id, agent_id, subordinate, reason)
-        if result.get("success"):
-            return {"success": True, "output": f"Work rejected for {subordinate}: {reason}", "error": None}
-        return self._error(result.get("message", "Rejection failed"))
+        """DEPRECATED — hard-redirect to review_task."""
+        return self._error(
+            "reject_work is removed. Use review_task(taskId, decision='rework', "
+            "feedback=...) instead so Task Ledger + inbox rework chain stays intact."
+        )
 
     # ── Alarm tool implementations (BUG-036) ──────────────
 

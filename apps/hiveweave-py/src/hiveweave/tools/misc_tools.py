@@ -281,8 +281,17 @@ async def git_worktree_merge_tool(
         )
 
     if result.get("success"):
-        return ToolResult.ok(
-            result.get("message", "Worktree merged and cleaned up"))
+        # Post-merge: nudge VERIFY tasks so final tests run on main
+        try:
+            from hiveweave.tools.task_tools import nudge_verify_tasks_after_merge
+            nudged = await nudge_verify_tasks_after_merge(project_id, agent_id)
+        except Exception as e:
+            log.warning("verify_nudge_after_merge_failed", error=str(e))
+            nudged = 0
+        msg = result.get("message", "Worktree merged and cleaned up")
+        if nudged:
+            msg = f"{msg} Nudged {nudged} VERIFY task(s) to run final tests on main."
+        return ToolResult.ok(msg)
     return ToolResult.err(result.get("message", "Failed to merge worktree"))
 
 
