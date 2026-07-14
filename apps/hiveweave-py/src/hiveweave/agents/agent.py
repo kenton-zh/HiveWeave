@@ -7,7 +7,7 @@
 2. _run_llm(): LLM 调用 + tool loop + 空响应重试
 3. _handle_completion(): 保存消息 + 标记 inbox 已读 + 自检 re-trigger
 4. _handle_empty_response(): 退避重试 [5s, 15s, 45s]，超限升级上级
-5. _handle_safety_timeout(): 10 分钟安全超时 → 清理 zombie → 重置 idle
+5. _handle_safety_timeout(): 10 分钟安全超时 → 清理 zombie → inbox 保持未读 + RESUME CHECKPOINT + 冷却后恢复
 6. cancel(): 取消当前 LLM task → 清理 → 重置 idle
 
 消息布局（DeepSeek 前缀缓存友好）:
@@ -67,6 +67,16 @@ TRIGGER_DELAY_MS = 100
 
 SELF_RETRIGGER_DELAY_MS = 500
 """自检 retrigger 前的延迟。"""
+
+TIMEOUT_RESUME_COOLDOWN_S = 90.0
+"""超时/可恢复错误后，禁止立即重触发同一 agent 的冷却时间。
+
+防止「inbox 未 ACK → watcher 立刻再 trigger → 再超时」的 doom loop，
+同时保留消息未读，冷却结束后由 watcher / stall watchdog 恢复信息链。
+"""
+
+ERROR_RESUME_COOLDOWN_S = 30.0
+"""可恢复 LLM 错误后的短冷却。"""
 
 DEFAULT_MAX_TOOL_ROUNDS = 100
 """所有角色统一的 tool loop 最大轮次。不再按角色区别对待。"""
@@ -179,6 +189,7 @@ class Agent:
         self._streaming_msg_id: str | None = None
         self._reply_reminder_count = 0  # expect_reply 提示次数，3 次后升级到上级
         self._REPLY_REMINDER_MAX = 3   # 即时提醒上限
+        self._resume_cooldown_until: float = 0.0  # monotonic deadline；超时后防 doom loop
 
         # ── asyncio 原语 ──
         self._llm_task: asyncio.Task | None = None
@@ -251,6 +262,16 @@ class Agent:
         while not self._stop_watcher:
             try:
                 if self.status == AgentState.IDLE:
+                    if self._in_resume_cooldown():
+                        log.debug(
+                            "inbox_watcher_cooldown_skip",
+                            agent_id=self.id,
+                            cooldown_remaining_s=round(
+                                self._resume_cooldown_until - time.monotonic(), 1
+                            ),
+                        )
+                        await asyncio.sleep(INTERVAL_S)
+                        continue
                     pending = await self._inbox.get_pending_messages(self.id)
                     if pending:
                         log.info(
@@ -1018,6 +1039,9 @@ class Agent:
 
             self.pending_inbox_msg_ids = None
 
+        # 成功完成 → 清除 resume 冷却
+        self._resume_cooldown_until = 0.0
+
         # 4. 状态 → idle (先取消 safety timer，再 reset)
         self._cancel_safety_timer()
         self._reset_to_idle()
@@ -1233,12 +1257,21 @@ class Agent:
             log.error("error_save_failed",
                       agent_id=self.id, save_error=str(e))
 
-        # 标记 inbox 已读（避免僵尸消息）
-        if self.pending_inbox_msg_ids:
-            await self._inbox.mark_read_by_ids(
-                self.id, self.pending_inbox_msg_ids
+        # 不 ACK inbox — 可恢复错误应保留未读，冷却后 resume
+        inbox_ids = list(self.pending_inbox_msg_ids or [])
+        if inbox_ids:
+            await self._write_resume_checkpoint(
+                reason=f"llm_error:{error_type}",
+                inbox_ids=inbox_ids,
             )
+            self._arm_resume_cooldown(ERROR_RESUME_COOLDOWN_S)
             self.pending_inbox_msg_ids = None
+            log.warning(
+                "llm_error_inbox_left_unread",
+                agent_id=self.id,
+                inbox_left_unread=len(inbox_ids),
+                cooldown_s=ERROR_RESUME_COOLDOWN_S,
+            )
 
         self._cancel_safety_timer()
         self._reset_to_idle()
@@ -1324,24 +1357,25 @@ class Agent:
     async def _handle_safety_timeout(self) -> None:
         """安全超时异步清理。
 
-        对齐 Elixir agent.ex:675 on_safety_timeout/1。
+        信息链恢复语义:
+        - 不 ACK inbox（消息保持未读，冷却结束后可 resume）
+        - 写入 RESUME CHECKPOINT，让下一轮带着断点上下文继续
+        - 记录 work_log，便于监控/stall watchdog 关联
         """
         # 清理 zombie streaming 消息
         await self._chat_msg.update_streaming_messages_done(self.id)
 
-        # 标记 inbox 已读
-        if self.pending_inbox_msg_ids:
-            await self._inbox.mark_read_by_ids(
-                self.id, self.pending_inbox_msg_ids
-            )
-            self.pending_inbox_msg_ids = None
+        inbox_ids = list(self.pending_inbox_msg_ids or [])
 
         # 更新 streaming placeholder（如果有的话）为超时标记
         if self._streaming_msg_id:
             await self._chat_msg.update_message(
                 self.id, self._streaming_msg_id,
                 {
-                    "content": "[TIMEOUT] LLM call exceeded 10 minute safety limit.",
+                    "content": (
+                        "[TIMEOUT] LLM call exceeded 10 minute safety limit. "
+                        "Inbox left unread for resume after cooldown."
+                    ),
                     "is_streaming": False,
                 },
             )
@@ -1351,13 +1385,32 @@ class Agent:
                 {
                     "agent_id": self.id,
                     "role": "assistant",
-                    "content": "[TIMEOUT] LLM call exceeded 10 minute safety limit.",
+                    "content": (
+                        "[TIMEOUT] LLM call exceeded 10 minute safety limit. "
+                        "Inbox left unread for resume after cooldown."
+                    ),
                     "is_streaming": False,
                 }
             )
 
+        await self._write_resume_checkpoint(
+            reason="safety_timeout",
+            inbox_ids=inbox_ids,
+        )
+        self._arm_resume_cooldown(TIMEOUT_RESUME_COOLDOWN_S)
+
+        # Keep pending_inbox_msg_ids cleared from this turn, but messages
+        # stay unread in DB so watcher can pick them up after cooldown.
+        self.pending_inbox_msg_ids = None
+
         self._cancel_safety_timer()
         self._reset_to_idle()
+        log.warning(
+            "safety_timeout_resume_armed",
+            agent_id=self.id,
+            inbox_left_unread=len(inbox_ids),
+            cooldown_s=TIMEOUT_RESUME_COOLDOWN_S,
+        )
 
     async def _handle_cancel(self) -> None:
         """用户取消处理。
@@ -1551,6 +1604,16 @@ class Agent:
         """
         await asyncio.sleep(SELF_RETRIGGER_DELAY_MS / 1000.0)
 
+        if self._in_resume_cooldown():
+            log.info(
+                "self_retrigger_cooldown_skip",
+                agent_id=self.id,
+                cooldown_remaining_s=round(
+                    self._resume_cooldown_until - time.monotonic(), 1
+                ),
+            )
+            return
+
         # 检查未读 inbox
         pending = await self._inbox.get_pending_messages(self.id)
         if pending:
@@ -1576,6 +1639,64 @@ class Agent:
             from hiveweave.agents.trigger import trigger_subordinate
 
             await trigger_subordinate(self.id)
+
+    # ── 内部: 超时/错误恢复 ──────────────────────────────────
+
+    def _in_resume_cooldown(self) -> bool:
+        """Whether this agent is inside a post-timeout/error resume cooldown."""
+        return time.monotonic() < self._resume_cooldown_until
+
+    def _arm_resume_cooldown(self, seconds: float) -> None:
+        """Arm cooldown so inbox watcher won't immediately re-fire."""
+        self._resume_cooldown_until = time.monotonic() + max(0.0, seconds)
+
+    async def _write_resume_checkpoint(
+        self, *, reason: str, inbox_ids: list[str]
+    ) -> None:
+        """Persist a structured resume hint into conversation + work_log.
+
+        Next successful trigger loads conversation history, so the agent can
+        continue unfinished work instead of treating the obligation as gone.
+        """
+        now_ms = int(time.time() * 1000)
+        ids_preview = ", ".join(inbox_ids[:8]) if inbox_ids else "(none)"
+        checkpoint = (
+            "[RESUME CHECKPOINT]\n"
+            f"reason: {reason}\n"
+            f"timeout_at_ms: {now_ms}\n"
+            f"pending_inbox_ids: {ids_preview}\n"
+            "Instruction: Your previous turn did not finish. Continue the "
+            "unfinished work from where you left off. Do NOT restart from "
+            "scratch if partial progress exists. Call get_tasks to locate any "
+            "running/claimed/rework tasks and resume them."
+        )
+        try:
+            await self._conversation.append_turn(
+                self.id,
+                self.project_id,
+                [{"role": "user", "content": checkpoint}],
+            )
+        except Exception as e:
+            log.warning(
+                "resume_checkpoint_persist_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+        try:
+            await self._work_log.write_work_log(
+                self.project_id,
+                self.id,
+                None,
+                "error",
+                f"[{reason}] turn interrupted; inbox left unread for resume",
+                details={
+                    "reason": reason,
+                    "inbox_ids": inbox_ids[:20],
+                    "resume": True,
+                },
+            )
+        except Exception:
+            pass
 
     # ── 内部: 状态管理 ────────────────────────────────────────
 
