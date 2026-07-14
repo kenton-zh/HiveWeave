@@ -1668,7 +1668,10 @@ class Agent:
             "Instruction: Your previous turn did not finish. Continue the "
             "unfinished work from where you left off. Do NOT restart from "
             "scratch if partial progress exists. Call get_tasks to locate any "
-            "running/claimed/rework tasks and resume them."
+            "running/claimed/rework tasks and resume them.\n"
+            "IMPORTANT: For tasks already in 'running' status, DO NOT call "
+            "claim_task or update_task_status again — just continue coding "
+            "and call submit_task when done."
         )
         try:
             await self._conversation.append_turn(

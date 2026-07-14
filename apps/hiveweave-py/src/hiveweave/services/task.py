@@ -6,7 +6,7 @@
 合法转换 (_TRANSITIONS):
     created   → claimed | closed
     claimed   → running | created
-    running   → blocked | submitted | claimed
+    running   → blocked | submitted
     blocked   → running | closed
     submitted → reviewing | running
     reviewing → approved | rework
@@ -35,7 +35,9 @@ log = structlog.get_logger(__name__)
 _TRANSITIONS: dict[str, set[str]] = {
     "created": {"claimed", "closed"},               # 可认领或直接关闭
     "claimed": {"running", "created"},              # 开始执行或放弃认领
-    "running": {"blocked", "submitted", "claimed"},  # 阻塞/提交/放弃
+    # running → claimed 已移除：防止 LLM 超时后 RESUME 时误调 claim_task
+    # 导致 running↔claimed 无限弹跳。如需放弃任务请用 blocked。
+    "running": {"blocked", "submitted"},             # 阻塞/提交
     "blocked": {"running", "closed"},               # 解除阻塞或关闭
     "submitted": {"reviewing", "running"},          # 进入评审或撤回
     "reviewing": {"approved", "rework"},            # 审批通过或返工
@@ -184,7 +186,24 @@ class TaskService:
                  to_status=final)
 
     async def claim_task(self, project_id: str, task_id: str, agent_id: str) -> None:
-        """Claim a task (created → claimed). Sets assignee_id + claimed_at."""
+        """Claim a task (created → claimed). Sets assignee_id + claimed_at.
+
+        Only 'created' tasks can be claimed. If the task is already
+        'claimed' or 'running' (e.g. after an LLM timeout + RESUME),
+        raises ValueError with a clear message so the LLM agent knows
+        to continue working instead of re-claiming.
+        """
+        rows = await _query(project_id,
+            "SELECT status FROM tasks WHERE id = ?", [task_id])
+        if not rows:
+            raise ValueError(f"Task not found: {task_id}")
+        current = rows[0]["status"]
+        if current != "created":
+            raise ValueError(
+                f"Task {task_id[:8]} is already '{current}'. "
+                f"Only 'created' tasks can be claimed. "
+                f"If the task is running, continue working and submit_task when done."
+            )
         await self._transition(project_id, task_id, "claimed")
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
