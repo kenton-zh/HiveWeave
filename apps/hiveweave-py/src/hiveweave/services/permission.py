@@ -44,12 +44,13 @@ READONLY_TOOLS = frozenset({
     "send_message", "message_superior", "message_subordinate",
     "message_peer", "message_team",
     "read_roster", "update_roster", "write_work_log",
-    "report_completion", "request_review", "list_subordinates",
+    "request_review", "list_subordinates",
     "list_agent_templates", "hire_agent",
     "read_charter", "read_goals", "view_org_chart", "read_work_logs",
     "git_worktree_list", "git_worktree_status",
     # 管理工具 — coordinator 需要用来派活、审批、写 charter、管理组织
-    "dispatch_task", "approve_work", "reject_work",
+    # legacy approve_work/reject_work/report_completion 已移出白名单（硬重定向）
+    "dispatch_task",
     "save_charter", "update_goals", "dismiss_agent", "transfer_agent",
     # Task Ledger 查询 — 所有角色可查（只读）
     "get_tasks",
@@ -60,23 +61,28 @@ READONLY_TOOLS = frozenset({
 
 # readwrite = readonly + 代码写入/审查工具
 # Executor/开发者角色使用此模式
+# NOTE: git_worktree_create/merge/remove 不在此集合 — 仅 coordinator 可管理
+# worktree 生命周期（见 COORDINATOR_ONLY_TOOLS）。executor 仅保留 checkpoint。
 READWRITE_TOOLS = READONLY_TOOLS | frozenset({
     "write_file", "edit_file", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
     "apply_patch",
     "run_code_review", "run_security_audit", "run_tests",
     "run_perf_audit", "run_full_review",
-    "git_worktree_create", "git_worktree_merge", "git_worktree_remove",
     "git_worktree_checkpoint",
 })
 
 # All known tools (full mode)
-ALL_TOOLS = READWRITE_TOOLS | frozenset({"run_command"})
+ALL_TOOLS = READWRITE_TOOLS | frozenset({
+    "run_command",
+    "git_worktree_create", "git_worktree_merge", "git_worktree_remove",
+})
 
 # Task Ledger 工具角色限制（契约 08 — 强制角色边界）
-# coordinator-only: 派活、审批；executor 不可用
+# coordinator-only: 派活、审批、worktree 合并；executor 不可用
 COORDINATOR_ONLY_TOOLS = frozenset({
     "create_task", "dispatch_task", "review_task",
+    "git_worktree_create", "git_worktree_merge", "git_worktree_remove",
 })
 # executor-only: 认领、推进、提交；coordinator 不可用
 # NOTE: claim_task, update_task_status, submit_task, update_progress 已移至 READONLY_TOOLS，

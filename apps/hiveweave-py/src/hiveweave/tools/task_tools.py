@@ -273,16 +273,20 @@ class TaskToolsMixin:
         summary = args.get("summary") or ""
         if not task_id or not summary:
             return self._error("submit_task requires 'taskId' and 'summary'")
+        if args.get("testsPassed") is not True:
+            return self._error(
+                "submit_task requires testsPassed=true after running real tests"
+            )
         project_id = await self._get_project_id(agent_id)
         if not project_id:
             return self._error(f"Agent {agent_id} has no project")
-        evidence: dict = {"summary": summary}
+        evidence: dict = {"summary": summary, "tests_passed": True}
         if args.get("commit"):
             evidence["commit"] = args["commit"]
         if args.get("filesChanged"):
             evidence["files_changed"] = args["filesChanged"]
-        if args.get("testsPassed") is not None:
-            evidence["tests_passed"] = args["testsPassed"]
+        if args.get("testOutput"):
+            evidence["test_output"] = str(args["testOutput"])[:4000]
         try:
             ts = TaskService()
             await ts.submit_task(project_id, task_id, evidence)
@@ -758,8 +762,18 @@ class SubmitTaskParams(BaseModel):
     tests_passed: bool | None = Field(
         default=None,
         alias="testsPassed",
-        description="Whether tests passed (optional).",
+        description=(
+            "MANDATORY for code tasks: true only after you actually ran tests "
+            "(npm test / pytest / etc.) and they passed. "
+            "Documentation/explore-only tasks may set true with summary noting N/A."
+        ),
         json_schema_extra={"aliases": ["testsPassed", "tests_passed"]},
+    )
+    test_output: str | None = Field(
+        default=None,
+        alias="testOutput",
+        description="Brief test command output / proof (recommended).",
+        json_schema_extra={"aliases": ["testOutput", "test_output", "testLog"]},
     )
 
     @field_validator("files_changed", mode="before")
@@ -770,7 +784,9 @@ class SubmitTaskParams(BaseModel):
 
 @tool(
     "submit_task",
-    "Submit a task for review (running -> submitted). Attaches evidence (summary, commit, files, tests). If taskId omitted, auto-detects your current running task.",
+    "Submit a task for review (running -> submitted). REQUIRES testsPassed=true "
+    "after running real tests (or N/A for docs/explore-only). "
+    "If taskId omitted, auto-detects your current running task.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -781,6 +797,16 @@ async def submit_task_tool(
     project_id = await get_project_id(agent_id)
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project")
+
+    # 强制验证门禁：必须显式声明 testsPassed=true
+    if params.tests_passed is not True:
+        return ToolResult.err(
+            "submit_task requires testsPassed=true. Run the project's tests "
+            "(npm test / pytest / etc.), then resubmit with testsPassed=true "
+            "and include a brief testOutput or mention results in summary. "
+            "For docs/explore-only work, set testsPassed=true and note "
+            "'N/A — no runtime tests' in summary."
+        )
 
     task_id = params.task_id
     if not task_id:
@@ -803,13 +829,16 @@ async def submit_task_tool(
             )
         task_id = active[0]["id"]
 
-    evidence: dict[str, Any] = {"summary": params.summary}
+    evidence: dict[str, Any] = {
+        "summary": params.summary,
+        "tests_passed": True,
+    }
     if params.commit:
         evidence["commit"] = params.commit
     if params.files_changed:
         evidence["files_changed"] = params.files_changed
-    if params.tests_passed is not None:
-        evidence["tests_passed"] = params.tests_passed
+    if params.test_output:
+        evidence["test_output"] = params.test_output[:4000]
 
     try:
         ts = TaskService()
@@ -894,7 +923,8 @@ class ReviewTaskParams(BaseModel):
 
 @tool(
     "review_task",
-    "Review a submitted task (reviewing -> approved/rework). If task is 'submitted', starts review automatically.",
+    "Review a submitted task (reviewing -> approved/rework). If task is 'submitted', starts review automatically. "
+    "approve requires evidence.tests_passed=true from submit_task; on approve a mandatory VERIFY child task is created.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -917,6 +947,22 @@ async def review_task_tool(
         task = await ts.get_task(project_id, params.task_id)
         if not task:
             return ToolResult.err(f"Task not found: {params.task_id}")
+
+        # 强制验证门禁：approve 前必须有测试通过证据
+        if decision == "approve":
+            evidence = task.get("evidence") or {}
+            if isinstance(evidence, str):
+                try:
+                    evidence = json.loads(evidence)
+                except Exception:
+                    evidence = {}
+            if not isinstance(evidence, dict) or evidence.get("tests_passed") is not True:
+                return ToolResult.err(
+                    "Cannot approve: submit evidence missing tests_passed=true. "
+                    "Send the task back for rework (decision='rework') and require "
+                    "the executor to run tests before resubmitting."
+                )
+
         current_status = task["status"]
         if current_status == "submitted":
             await ts.start_review(project_id, params.task_id)
@@ -939,7 +985,8 @@ async def review_task_tool(
                 if decision == "approve":
                     msg = (
                         f"[TASK APPROVED] Task '{task_after.get('title', '')[:60]}' "
-                        f"has been approved. You can proceed with your next task."
+                        f"has been approved. Wait for coordinator to merge your "
+                        f"worktree, then complete the mandatory VERIFY follow-up task."
                     )
                     priority = "normal"
                 else:
@@ -961,11 +1008,130 @@ async def review_task_tool(
                 from hiveweave.agents.trigger import trigger_subordinate
                 await trigger_subordinate(assignee_id)
 
+        verify_note = ""
+        if decision == "approve" and task_after:
+            verify_id = await _spawn_post_approve_verify_task(
+                ts, project_id, agent_id, task_after
+            )
+            if verify_id:
+                verify_note = (
+                    f" Mandatory VERIFY task created: {verify_id}. "
+                    f"After git_worktree_merge, that VERIFY task will be nudged "
+                    f"to run final tests on main."
+                )
+
         if decision == "approve":
-            return ToolResult.ok(f"Task {params.task_id} approved.")
+            return ToolResult.ok(
+                f"Task {params.task_id} approved.{verify_note} "
+                f"Next: call git_worktree_merge for the assignee's worktree."
+            )
         return ToolResult.ok(f"Task {params.task_id} sent back for rework.")
     except Exception as e:
         return ToolResult.err(f"Failed to review task: {e}")
+
+
+async def _spawn_post_approve_verify_task(
+    ts: TaskService,
+    project_id: str,
+    reviewer_id: str,
+    parent_task: dict,
+) -> str | None:
+    """Create a mandatory VERIFY child task after approve.
+
+    The VERIFY task is claimed/run after merge lands on main. Tags mark it
+    so git_worktree_merge can nudge the assignee.
+    """
+    parent_id = parent_task.get("id")
+    if not parent_id:
+        return None
+    # Avoid spawning duplicate VERIFY children for the same parent
+    existing = await ts.list_tasks(project_id)
+    for t in existing:
+        tags = t.get("tags") or []
+        if (
+            t.get("parent_task_id") == parent_id
+            and isinstance(tags, list)
+            and "verify" in tags
+            and t.get("status") not in ("closed", "approved")
+        ):
+            return t.get("id")
+
+    title = parent_task.get("title") or "task"
+    assignee = parent_task.get("assignee_id")
+    verify_id = await ts.create_task(
+        project_id,
+        title=f"VERIFY: {title}"[:200],
+        description=(
+            f"Mandatory post-merge verification for parent task {parent_id}.\n"
+            "1. Confirm coordinator has merged the worktree to main.\n"
+            "2. On the MAIN workspace (not a stale worktree), install deps if needed "
+            "and run the project's test suite (npm test / pytest / etc.).\n"
+            "3. submit_task with testsPassed=true and testOutput summarizing results.\n"
+            "If tests fail, fix on a new branch/worktree path or report blockers."
+        ),
+        creator_id=reviewer_id,
+        assignee_id=assignee,
+        priority=1,
+        acceptance_criteria=[
+            {"text": "Final version on main passes project tests", "required": True},
+            {"text": "submit_task includes testsPassed=true + testOutput", "required": True},
+        ],
+        parent_task_id=parent_id,
+        tags=["verify", "mandatory", "post-merge"],
+        source="system",
+    )
+    log.info(
+        "verify_task_spawned",
+        parent_task_id=parent_id,
+        verify_task_id=verify_id,
+        assignee_id=assignee,
+    )
+    return verify_id
+
+
+async def nudge_verify_tasks_after_merge(
+    project_id: str, from_agent_id: str
+) -> int:
+    """After a successful merge, nudge open VERIFY tasks so final tests run on main."""
+    ts = TaskService()
+    tasks = await ts.list_tasks(project_id)
+    nudged = 0
+    from hiveweave.services.inbox import InboxService
+    from hiveweave.agents.trigger import trigger_subordinate
+
+    inbox = InboxService()
+    for t in tasks:
+        tags = t.get("tags") or []
+        if not (isinstance(tags, list) and "verify" in tags):
+            continue
+        if t.get("status") not in ("created", "claimed", "running"):
+            continue
+        assignee = t.get("assignee_id")
+        if not assignee:
+            continue
+        await inbox.send_message(
+            from_agent_id=from_agent_id,
+            to_agent_id=assignee,
+            message=(
+                f"[POST-MERGE VERIFY] Worktree merge completed. "
+                f"Run final verification NOW on main for task "
+                f"'{t.get('title', '')[:60]}' (id={t.get('id')}). "
+                f"claim_task if needed, run tests on main, then "
+                f"submit_task(testsPassed=true, testOutput=...)."
+            ),
+            message_type="task",
+            priority="urgent",
+            task_id=t.get("id"),
+        )
+        await trigger_subordinate(assignee)
+        nudged += 1
+    if nudged:
+        log.info(
+            "verify_tasks_nudged_after_merge",
+            project_id=project_id,
+            count=nudged,
+        )
+    return nudged
 
 
 # ── get_tasks ───────────────────────────────────────────
