@@ -1044,6 +1044,25 @@ async def _spawn_post_approve_verify_task(
     parent_id = parent_task.get("id")
     if not parent_id:
         return None
+    # ── Prevent infinite VERIFY chain ──────────────────────────────
+    # If the parent task itself is already a VERIFY task (identified by
+    # its tags or a "VERIFY:" title prefix), do NOT spawn another VERIFY.
+    # The original engineering task already has its VERIFY; allowing a
+    # VERIFY-of-VERIFY-of-VERIFY… chain wastes architect/CEO review
+    # cycles indefinitely.
+    parent_tags = parent_task.get("tags") or []
+    parent_title = parent_task.get("title") or ""
+    if (isinstance(parent_tags, list) and "verify" in parent_tags) or (
+        isinstance(parent_title, str) and parent_title.startswith("VERIFY:")
+    ):
+        log.info(
+            "verify_chain_stopped",
+            parent_task_id=parent_id,
+            parent_title=parent_title[:80],
+            reason="parent is already a VERIFY task",
+        )
+        return None
+    # ────────────────────────────────────────────────────────────────
     # Avoid spawning duplicate VERIFY children for the same parent
     existing = await ts.list_tasks(project_id)
     for t in existing:
