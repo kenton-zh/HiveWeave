@@ -370,41 +370,121 @@ class ConversationStore:
             if not m.get("tool_call_id") or m["tool_call_id"] in tool_call_ids
         ]
 
+    # ── 持久化裁剪（OpenCode prune 模式）──────────────────
+
+    #: 永远不被裁剪的工具名（如 skill）
+    _PRUNE_PROTECTED_TOOLS: set[str] = set()
+
+    async def prune_persisted(self, agent_id: str, project_id: str) -> None:
+        """持久化裁剪旧工具输出 — OpenCode prune() 模式。
+
+        每轮结束后调用。逆序遍历 cache 中的消息：
+        1. 跳过最近 2 轮（保护当前上下文）
+        2. 停在压缩摘要边界
+        3. 累积 tool 输出 token；保护窗口(40K)外的旧 tool 输出标记为裁剪候选
+        4. 候选总量 > 20K 时，永久替换 cache + DB 中的内容为占位符
+
+        与 _prune_tool_outputs（读时临时裁剪）的区别：
+        - 本方法写入 cache 和 DB，后续请求永远看不到旧工具输出
+        - 避免历史无限膨胀导致每次 get_history 都加载完整数据
+        """
+        key = (project_id, agent_id)
+        messages = self._cache.get(key)
+        if not messages or len(messages) < 6:
+            return
+
+        to_prune_indices: list[int] = []
+        protected = 0
+        turns = 0
+
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            role = msg.get("role", "")
+
+            # 计算轮次（user 消息 = 一轮开始）
+            if role == "user":
+                turns += 1
+            # 跳过最近 2 轮
+            if turns < 2:
+                continue
+
+            # 停在压缩摘要边界
+            if role == "system" and SUMMARY_MARKER in (msg.get("content") or ""):
+                break
+
+            # 只处理 tool 结果消息
+            if "tool_call_id" not in msg:
+                continue
+
+            # 已被裁剪过 → 停止（更早的也已裁剪）
+            if msg.get("content") == "[Old tool result content cleared]":
+                break
+
+            tokens = estimate_tokens_for_messages([msg])
+            new_protected = protected + tokens
+            if new_protected <= PRUNE_PROTECT_TOKENS:
+                protected = new_protected
+            else:
+                to_prune_indices.append(i)
+
+        if not to_prune_indices:
+            return
+
+        prune_tokens = sum(
+            estimate_tokens_for_messages([messages[i]]) for i in to_prune_indices
+        )
+        if prune_tokens < PRUNE_MINIMUM_TOKENS:
+            return  # 收益不足，不执行
+
+        # 永久替换 cache 中的内容（in-place 修改）
+        for i in to_prune_indices:
+            messages[i] = {**messages[i], "content": "[Old tool result content cleared]"}
+
+        # 持久化到 DB — 通过写队列串行化，读取执行时的最新 cache
+        await self._enqueue_write(key, self._persist_pruned, agent_id, key)
+
+        logger.info(
+            "prune_persisted",
+            agent_id=agent_id,
+            pruned_count=len(to_prune_indices),
+            pruned_tokens=prune_tokens,
+            protected_tokens=protected,
+        )
+
+    async def _persist_pruned(self, agent_id: str, key: tuple[str, str]) -> None:
+        """持久化裁剪后的历史到 DB — 删除所有旧 turn，写入当前 cache 为单个 turn。
+
+        在写队列中执行，读取执行时的最新 cache（可能包含 prune 后新追加的消息）。
+        """
+        messages = self._cache.get(key)
+        if not messages:
+            return
+        try:
+            await project_db.execute(
+                agent_id,
+                "DELETE FROM conversation_turns WHERE agent_id = ?",
+                [agent_id],
+            )
+            if messages:
+                await self._persist_turn(agent_id, list(messages))
+        except Exception as e:
+            logger.warning("persist_pruned_failed", agent_id=agent_id, error=str(e))
+
     # ── Token 预算裁剪 ───────────────────────────────────────
 
     @staticmethod
     def _trim_to_budget(messages: list[dict], budget: int | None) -> list[dict]:
+        """裁剪到 token budget 内。
+
+        持久化 prune 已在 append_turn 后执行，cache 中的旧工具输出已是占位符。
+        此方法仅做预算检查：如果仍超限，用 turn-level 裁剪丢弃最旧的轮次。
+        """
         if budget is None or budget <= 0:
             return messages
-        pruned = ConversationStore._prune_tool_outputs(messages)
-        total = estimate_tokens_for_messages(pruned)
+        total = estimate_tokens_for_messages(messages)
         if total <= budget:
-            return pruned
-        return ConversationStore._trim_turns(pruned, budget, total)
-
-    @staticmethod
-    def _prune_tool_outputs(messages: list[dict]) -> list[dict]:
-        """清除保护窗口外的旧 tool 输出（OpenCode prune() 模式）。"""
-        to_prune: list[dict] = []
-        protected = 0
-        for msg in reversed(messages):
-            if "tool_call_id" in msg:
-                tokens = estimate_tokens_for_messages([msg])
-                new_protected = protected + tokens
-                if new_protected <= PRUNE_PROTECT_TOKENS:
-                    protected = new_protected
-                else:
-                    to_prune.append(msg)
-        prune_tokens = sum(estimate_tokens_for_messages([m]) for m in to_prune)
-        if prune_tokens < PRUNE_MINIMUM_TOKENS:
             return messages
-        prune_ids = {m["tool_call_id"] for m in to_prune}
-        return [
-            {**m, "content": "[Old tool result content cleared]"}
-            if "tool_call_id" in m and m["tool_call_id"] in prune_ids
-            else m
-            for m in messages
-        ]
+        return ConversationStore._trim_turns(messages, budget, total)
 
     @staticmethod
     def _trim_turns(messages: list[dict], budget: int, total: int) -> list[dict]:
