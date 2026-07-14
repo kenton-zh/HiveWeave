@@ -23,6 +23,9 @@ build/
 .DS_Store
 Thumbs.db
 
+# PID files (runtime process IDs — machine-specific, must not be tracked)
+*.pid
+
 # Logs
 *.log
 npm-debug.log*
