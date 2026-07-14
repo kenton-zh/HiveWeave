@@ -401,10 +401,11 @@ class ConversationStore:
             msg = messages[i]
             role = msg.get("role", "")
 
-            # 计算轮次（user 消息 = 一轮开始）
-            if role == "user":
+            # 计算轮次（assistant 消息 = 一轮 LLM 回复的开始）
+            # HiveWeave 用 OpenAI 格式：tool 结果 role="tool"（不是 "user"）
+            if role == "assistant":
                 turns += 1
-            # 跳过最近 2 轮
+            # 跳过最近 2 轮（保护当前上下文）
             if turns < 2:
                 continue
 
@@ -428,12 +429,26 @@ class ConversationStore:
                 to_prune_indices.append(i)
 
         if not to_prune_indices:
+            logger.debug(
+                "prune_no_candidates",
+                agent_id=agent_id,
+                msg_count=len(messages),
+                turns=turns,
+                protected_tokens=protected,
+            )
             return
 
         prune_tokens = sum(
             estimate_tokens_for_messages([messages[i]]) for i in to_prune_indices
         )
         if prune_tokens < PRUNE_MINIMUM_TOKENS:
+            logger.debug(
+                "prune_insufficient",
+                agent_id=agent_id,
+                prune_tokens=prune_tokens,
+                minimum=PRUNE_MINIMUM_TOKENS,
+                candidates=len(to_prune_indices),
+            )
             return  # 收益不足，不执行
 
         # 永久替换 cache 中的内容（in-place 修改）
