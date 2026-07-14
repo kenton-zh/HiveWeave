@@ -105,7 +105,24 @@ class GameTimeService:
         }
 
     async def start(self, project_id: str) -> None:
+        """Start the game-time tick loop (idempotent).
+
+        If a tick loop is already running for this project, keep it and return.
+        This prevents duplicate activate() from stacking orphaned tick tasks
+        that would double-fire alarms and stall watchdogs.
+        """
+        existing = _states.get(project_id)
+        old_task = existing.get("task") if existing else None
+        if old_task is not None and not old_task.done():
+            log.info("game_time_start_idempotent_skip", project_id=project_id)
+            return
+
         state = await self._load_state(project_id)
+        # Preserve in-memory trackers across restart of a finished task
+        if existing:
+            for key in ("stall_trackers", "task_stall_trackers", "stall_cooldowns"):
+                if key in existing and key not in state:
+                    state[key] = existing[key]
         _states[project_id] = state
         state["task"] = asyncio.create_task(self._tick_loop(project_id))
         log.info("game_time_start", project_id=project_id,
