@@ -333,33 +333,124 @@ coverage/
 
     async def merge_by_branch(self, workspace_path: str, branch: str,
                               target_branch: str = "main") -> dict:
-        """Merge a specific branch by full name (Bug G fix).
+        """Merge a specific branch by full name (Bug G fix + Bug L enhancement).
 
-        Unlike ``merge``, this takes a full branch name (e.g. ``hw/A066/后端工程师``)
-        instead of constructing one from short_id + task_name.
-        This allows coordinators to merge other agents' worktrees.
+        Enhanced merge flow:
+        1. Rebase worktree branch onto latest target_branch (reduces conflicts)
+        2. Attempt git merge
+        3. On conflict: try semantic merge for package.json, report conflict files
+        4. Post-merge verification: check key files exist
+        5. Auto-remove worktree on success
 
-        Returns ``{success, merged, hash, message?}`` or ``{success: False, message}``.
+        Returns ``{success, merged, hash, message?, conflicts?}`` or
+        ``{success: False, message, conflicts?}``.
         """
+        import json as _json
+        from pathlib import Path as _Path
+
+        # Step 0: Fetch latest target_branch
         ok, _ = await _git(["checkout", target_branch], workspace_path)
         if not ok:
             return {"success": False,
                     "message": f"Failed to checkout {target_branch}"}
 
-        ok, _ = await _git(["merge", branch, "--no-edit"], workspace_path)
+        # Step 1: Rebase worktree branch onto target_branch to minimize conflicts
+        parts = branch.split("/", 2)
+        short_id = parts[1] if len(parts) >= 2 else ""
+        wt_path = _worktree_path(workspace_path, short_id) if short_id else ""
+
+        if wt_path and _Path(wt_path).is_dir():
+            # Checkpoint worktree state before rebase
+            await _git(["add", "-A"], wt_path)
+            await _git(["commit", "-m", "pre-merge-checkpoint", "--allow-empty"],
+                       wt_path)
+            # Rebase onto target_branch
+            ok_reb, reb_out = await _git(
+                ["rebase", target_branch], wt_path)
+            if not ok_reb:
+                # Rebase conflict — abort rebase, continue with 3-way merge
+                await _git(["rebase", "--abort"], wt_path)
+                log.warning("git_worktree.rebase_failed",
+                            branch=branch, output=reb_out[:200])
+
+        # Step 2: Merge with target_branch
+        ok, merge_out = await _git(["merge", branch, "--no-edit"], workspace_path)
+
         if not ok:
-            await _git(["merge", "--abort"], workspace_path)
-            return {"success": False,
-                    "message": f"Merge conflict for {branch} into "
-                               f"{target_branch}. Resolve manually or rollback."}
+            # Step 3: Conflict handling — identify conflicted files
+            ok_diff, diff_out = await _git(
+                ["diff", "--name-only", "--diff-filter=U"], workspace_path)
+            conflict_files = [f.strip() for f in diff_out.split("\n") if f.strip()]
+
+            # Try semantic merge for package.json
+            resolved = []
+            pkg_path = _Path(workspace_path) / "package.json"
+            if "package.json" in conflict_files and pkg_path.exists():
+                try:
+                    # Get the three versions
+                    ok_ours, ours_raw = await _git(
+                        ["show", f"{target_branch}:package.json"], workspace_path)
+                    ok_theirs, theirs_raw = await _git(
+                        ["show", f"{branch}:package.json"], workspace_path)
+                    if ok_ours and ok_theirs:
+                        ours = _json.loads(ours_raw)
+                        theirs = _json.loads(theirs_raw)
+                        # Merge dependencies semantically
+                        for dep_key in ("dependencies", "devDependencies",
+                                        "peerDependencies", "scripts"):
+                            if dep_key in ours or dep_key in theirs:
+                                merged_deps = ours.get(dep_key, {})
+                                merged_deps.update(theirs.get(dep_key, {}))
+                                ours[dep_key] = merged_deps
+                        pkg_path.write_text(
+                            _json.dumps(ours, indent=2, ensure_ascii=False) + "\n",
+                            encoding="utf-8")
+                        await _git(["add", "package.json"], workspace_path)
+                        resolved.append("package.json")
+                except Exception as e:
+                    log.warning("git_worktree.package_merge_failed",
+                                branch=branch, error=str(e))
+
+            if resolved:
+                # Re-attempt commit after resolving conflicts
+                ok_commit, _ = await _git(
+                    ["commit", "--no-edit"], workspace_path)
+                if ok_commit:
+                    ok = True  # merge succeeded after resolution
+                    log.info("git_worktree.semantic_merge_resolved",
+                             branch=branch, resolved_files=resolved)
+
+            if not ok:
+                # Report conflict files to agent
+                await _git(["merge", "--abort"], workspace_path)
+                return {"success": False,
+                        "message": f"Merge conflict for {branch} into "
+                                   f"{target_branch}. Conflicted files: "
+                                   f"{', '.join(conflict_files[:10])}",
+                        "conflicts": conflict_files}
+
+        # Step 4: Post-merge verification
+        verification_errors = []
+        pkg_path = _Path(workspace_path) / "package.json"
+        if pkg_path.exists():
+            try:
+                pkg = _json.loads(pkg_path.read_text(encoding="utf-8"))
+                if not pkg.get("scripts"):
+                    verification_errors.append("package.json missing scripts")
+                if not pkg.get("dependencies") and not pkg.get("devDependencies"):
+                    verification_errors.append("package.json missing dependencies")
+            except Exception:
+                verification_errors.append("package.json is invalid JSON")
+
+        if verification_errors:
+            log.warning("git_worktree.merge_verification_failed",
+                        branch=branch, errors=verification_errors)
+            # Don't rollback — warn but allow (agent can fix)
 
         ok, head = await _git(["rev-parse", "--short", "HEAD"], workspace_path)
 
-        # Auto-remove worktree + branch on success
-        # 从分支名解析 short_id: hw/{short_id}/{task_name}
-        parts = branch.split("/", 2)
-        if len(parts) >= 2:
-            short_id = parts[1]
+        # Step 5: Auto-remove worktree + branch on success
+        if short_id:
             try:
                 await self.delete(workspace_path, short_id,
                                   parts[2] if len(parts) > 2 else "task")
@@ -367,8 +458,12 @@ coverage/
                 pass  # worktree 可能已不存在
 
         log.info("git_worktree.merge_by_branch", branch=branch,
-                 target=target_branch, hash=head if ok else "")
-        return {"success": True, "merged": True, "hash": head if ok else ""}
+                 target=target_branch, hash=head if ok else "",
+                 warnings=verification_errors)
+        result = {"success": True, "merged": True, "hash": head if ok else ""}
+        if verification_errors:
+            result["warnings"] = verification_errors
+        return result
 
     # ── 4. ROLLBACK ─────────────────────────────────────────
 
