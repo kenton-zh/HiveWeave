@@ -17,7 +17,7 @@ import NewProjectDialog from "./components/NewProjectDialog";
 import ConfirmDialog from "./components/ConfirmDialog";
 import ToastContainer from "./components/Toast";
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, pauseSystem, resumeSystem, getPausedState, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend } from "./api";
+import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend } from "./api";
 import type { DeleteProjectResponse, Project } from "./api";
 
 function App() {
@@ -61,7 +61,7 @@ function App() {
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
-  const [paused, setPaused] = useState(false);
+  const [projectStarting, setProjectStarting] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [queuedDeleteIds, setQueuedDeleteIds] = useState<string[]>([]);
@@ -131,12 +131,11 @@ function App() {
   useEffect(() => {
     let lastSnapshotKey = "";
     const controller = subscribeAgentStatus(
-      (agentIds, paused) => {
-        const key = agentIds.slice().sort().join(",") + "|" + (paused ?? "");
+      (agentIds) => {
+        const key = agentIds.slice().sort().join(",");
         if (key === lastSnapshotKey) return;
         lastSnapshotKey = key;
         setProcessingAgents(agentIds);
-        if (paused !== undefined) setPaused(paused);
         useAppStore.getState().bumpSocketReconnect();
       },
       (agentId, processing) => updateProcessingAgent(agentId, processing),
@@ -151,10 +150,6 @@ function App() {
   }, []);
 
   useEffect(() => {
-    getPausedState().then((s) => setPaused(s.paused)).catch(() => {});
-  }, []);
-
-  useEffect(() => {
     getSettings().then((settings) => {
       if (settings.operatorName) {
         setUserName(settings.operatorName);
@@ -162,13 +157,26 @@ function App() {
     }).catch(() => {});
   }, []);
 
-  const handlePause = async () => {
-    if (paused) {
-      await resumeSystem();
-      setPaused(false);
-    } else {
-      await pauseSystem();
-      setPaused(true);
+  const handleToggleProjectStart = async () => {
+    if (!selectedProjectId || projectStarting) return;
+    setProjectStarting(true);
+    try {
+      const isStarted = currentProject?.isStarted;
+      if (isStarted) {
+        await deactivateProject(selectedProjectId);
+        showToast("已下班，Agent 已暂停", "info");
+      } else {
+        await activateProject(selectedProjectId);
+        showToast("已上班，Agent 已启动", "info");
+      }
+      // 刷新项目列表以获取最新 isStarted 状态
+      const list = await getProjects();
+      setProjects(list);
+    } catch (err) {
+      console.error("Toggle project start failed:", err);
+      showToast("操作失败", "error");
+    } finally {
+      setProjectStarting(false);
     }
   };
 
@@ -509,18 +517,6 @@ function App() {
               <span>{userName}</span>
             </button>
           )}
-          <button
-            onClick={handlePause}
-            className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-gm transition-all shadow-gm-sm ${
-              paused
-                ? "bg-g-red-bg text-g-red hover:bg-red-100 border border-red-200"
-                : "bg-g-green-bg text-g-green hover:bg-green-100 border border-green-200"
-            }`}
-            title={paused ? "点击上班，恢复所有 Agent" : "点击下班，暂停所有 Agent"}
-          >
-            <span className={`w-2 h-2 rounded-full ${paused ? "bg-red-500" : "bg-emerald-500 animate-pulse"}`} />
-            <span>{paused ? "已下班" : "上班中"}</span>
-          </button>
         </div>
       </header>
 
@@ -552,10 +548,28 @@ function App() {
                 Office
               </button>
             </div>
+
+            {/* Project-level start/stop button */}
+            {selectedProjectId && (
+              <button
+                onClick={handleToggleProjectStart}
+                disabled={projectStarting}
+                className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-gm transition-all shadow-gm-sm ml-auto ${
+                  currentProject?.isStarted
+                    ? "bg-g-green-bg text-g-green hover:bg-green-100 border border-green-200"
+                    : "bg-g-red-bg text-g-red hover:bg-red-100 border border-red-200"
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                title={currentProject?.isStarted ? "点击下班，暂停该项目所有 Agent" : "点击上班，启动该项目所有 Agent"}
+              >
+                <span className={`w-2 h-2 rounded-full ${currentProject?.isStarted ? "bg-emerald-500 animate-pulse" : "bg-red-500"}`} />
+                <span>{projectStarting ? "处理中..." : currentProject?.isStarted ? "上班中" : "已下班"}</span>
+              </button>
+            )}
+
             {selectedProjectId && activeView === "tree" && (
               <button
                 onClick={() => openAddAgent(null)}
-                className="flex items-center gap-1 px-2.5 py-1 text-xs text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg rounded-gm transition-colors ml-auto"
+                className="flex items-center gap-1 px-2.5 py-1 text-xs text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg rounded-gm transition-colors"
                 title="Create Agent"
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
