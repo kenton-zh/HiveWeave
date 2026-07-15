@@ -80,7 +80,7 @@ _KNOWN_CONTEXT_WINDOWS: list[tuple[str, int]] = [
     ("qwen2-72b", 128_000),
     # ── Tencent / Hunyuan ──
     ("hunyuan", 32_000),         # 混元标准版 32K
-    ("hy3", 32_000),             # Hunyuan 3 简写
+    ("hy3", 262_144),            # Hunyuan 3 (OpenRouter 实测 256K)
     # ── 其他 ──
     ("yi-34b", 4_000),
     ("yi-large", 16_000),
@@ -148,6 +148,316 @@ async def _detect_context_window(
             return ctx
 
     return None
+
+
+#: 推理模型预设表（按 model_id 子串匹配）
+#  这些模型会产生 thinking/reasoning tokens，需要 supports_thinking=1
+_REASONING_MODEL_PATTERNS: list[str] = [
+    "o1", "o3", "o4",               # OpenAI reasoning 系列
+    "claude-3-5-sonnet",            # Claude extended thinking
+    "deepseek-r1",                  # DeepSeek reasoning
+    "hy3",                          # Hunyuan 3 (推理模型)
+    "qwen3",                        # Qwen 3 (推理模型)
+    "gemini-2.5",                   # Gemini 2.5 (推理模型)
+    "step-3",                       # Step 3.x (推理模型)
+]
+
+
+async def _detect_model_capabilities(
+    base_url: str, api_key: str, model_id: str
+) -> dict:
+    """自动检测模型的推理能力和最大输出 token 数。
+
+    返回 dict:
+    - supports_thinking: bool | None
+    - max_output_tokens: int | None
+    - source: str (preset / openrouter / unknown)
+    """
+    result: dict = {"supports_thinking": None, "max_output_tokens": None, "source": "unknown"}
+    base_lower = (base_url or "").lower()
+    mid_lower = (model_id or "").lower()
+
+    # ── 策略 1: OpenRouter API ──
+    if "openrouter.ai" in base_lower:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(_OPENROUTER_MODELS_URL)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models_list = data.get("data") or data.get("models") or []
+                    for m in models_list:
+                        m_id = m.get("id", "")
+                        if m_id == model_id or m_id.lower() == mid_lower:
+                            # max_completion_tokens
+                            max_tokens = None
+                            top_provider = m.get("top_provider") or {}
+                            if top_provider and isinstance(top_provider, dict):
+                                max_tokens = top_provider.get("max_completion_tokens")
+                            if max_tokens is None:
+                                max_tokens = m.get("max_completion_tokens")
+                            if max_tokens and isinstance(max_tokens, int) and max_tokens > 0:
+                                result["max_output_tokens"] = max_tokens
+
+                            # 推理模型检测：architecture.modality 含 "reasoning" 或 id 匹配预设
+                            arch = m.get("architecture") or {}
+                            if isinstance(arch, dict):
+                                input_modal = arch.get("input_modalities") or []
+                                output_modal = arch.get("output_modalities") or []
+                                if isinstance(input_modal, list) and "reasoning" in [str(x).lower() for x in input_modal]:
+                                    result["supports_thinking"] = True
+                                elif isinstance(output_modal, list) and "reasoning" in [str(x).lower() for x in output_modal]:
+                                    result["supports_thinking"] = True
+
+                            # 预设表兜底
+                            if result["supports_thinking"] is None:
+                                for pattern in _REASONING_MODEL_PATTERNS:
+                                    if pattern in mid_lower:
+                                        result["supports_thinking"] = True
+                                        break
+
+                            result["source"] = "openrouter"
+                            log.info(
+                                "model_capabilities_detected",
+                                source="openrouter",
+                                model_id=model_id,
+                                supports_thinking=result["supports_thinking"],
+                                max_output_tokens=result["max_output_tokens"],
+                            )
+                            return result
+        except Exception as e:
+            log.warning("openrouter_capability_detection_failed", error=str(e))
+
+    # ── 策略 2: 预设表匹配 ──
+    for pattern in _REASONING_MODEL_PATTERNS:
+        if pattern in mid_lower:
+            result["supports_thinking"] = True
+            result["source"] = "preset"
+            break
+
+    # 预设 max_output_tokens（常见模型）
+    _PRESET_MAX_OUTPUT: list[tuple[str, int]] = [
+        ("o1", 100_000), ("o3", 100_000),
+        ("claude-3-5-sonnet", 8_192),
+        ("deepseek-r1", 32_768),
+        ("hy3", 32_000),
+        ("qwen3", 32_000),
+        ("gemini-2.5", 8_192),
+        ("gpt-4o", 16_384),
+        ("gpt-4-turbo", 4_096),
+        ("longcat", 8_192),
+    ]
+    if result["max_output_tokens"] is None:
+        for pattern, max_tok in _PRESET_MAX_OUTPUT:
+            if pattern in mid_lower:
+                result["max_output_tokens"] = max_tok
+                if result["source"] == "unknown":
+                    result["source"] = "preset"
+                break
+
+    return result
+
+
+def _extract_usage_from_response(data: dict) -> dict:
+    """从 LLM 响应中提取 usage 信息。
+
+    返回 dict:
+    - input_tokens: int
+    - output_tokens: int
+    - reasoning_tokens: int (thinking tokens)
+    - total_tokens: int
+    """
+    usage = data.get("usage") or {}
+    if not usage:
+        return {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
+
+    input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    output_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    total_tokens = usage.get("total_tokens") or (input_tokens + output_tokens)
+
+    # reasoning/thinking tokens (OpenRouter: completion_tokens_details.reasoning_tokens)
+    reasoning_tokens = 0
+    details = usage.get("completion_tokens_details") or {}
+    if isinstance(details, dict):
+        reasoning_tokens = details.get("reasoning_tokens") or 0
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+async def _do_self_test(model: dict) -> dict:
+    """统一自检函数：连通性测试 + 自动检测 + 自动修正 DB 配置。
+
+    被 create_model 和 test_model 共用。
+    返回完整的检测结果 dict。
+    """
+    model_pk = model.get("id", "")
+    base_url = (model.get("base_url") or "").rstrip("/")
+    api_key = model.get("api_key") or ""
+    model_name = model.get("model_id") or ""
+    configured_ctx = model.get("context_window") or 0
+    configured_thinking = model.get("supports_thinking")
+    configured_max_output = model.get("max_output_tokens") or 0
+
+    from hiveweave.llm.provider import ProviderFactory, provider_factory
+
+    factory: ProviderFactory = provider_factory
+    try:
+        config = factory.create(model)
+    except ValueError as e:
+        return {"ok": False, "latencyMs": 0, "error": str(e)}
+
+    url = config.build_url()
+    headers = config.build_headers()
+    body = config.build_body(
+        messages=[{"role": "user", "content": "Say 'OK' and nothing else."}],
+        stream=False,
+        max_tokens=10,
+        tools=None,
+    )
+
+    start = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
+            resp = await client.post(url, json=body, headers=headers)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+    except httpx.TimeoutException:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        # 即使超时也检测 context_window 和 capabilities
+        detected_ctx = await _detect_context_window(base_url, api_key, model_name)
+        caps = await _detect_model_capabilities(base_url, api_key, model_name)
+        result = {"ok": False, "latencyMs": latency_ms, "error": "request timed out"}
+        if detected_ctx is not None:
+            result["detectedContextWindow"] = detected_ctx
+        result["detectedSupportsThinking"] = caps.get("supports_thinking")
+        result["detectedMaxOutputTokens"] = caps.get("max_output_tokens")
+        return result
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        detected_ctx = await _detect_context_window(base_url, api_key, model_name)
+        caps = await _detect_model_capabilities(base_url, api_key, model_name)
+        result = {"ok": False, "latencyMs": latency_ms, "error": str(e)}
+        if detected_ctx is not None:
+            result["detectedContextWindow"] = detected_ctx
+        result["detectedSupportsThinking"] = caps.get("supports_thinking")
+        result["detectedMaxOutputTokens"] = caps.get("max_output_tokens")
+        return result
+
+    # ── 并行检测 context_window 和 capabilities ──
+    detected_ctx = await _detect_context_window(base_url, api_key, model_name)
+    caps = await _detect_model_capabilities(base_url, api_key, model_name)
+
+    result = {"ok": False, "latencyMs": latency_ms}
+
+    # 解析响应
+    response_text = ""
+    usage_data = None
+    if resp.status_code == 200:
+        data = resp.json()
+        # 提取 usage
+        usage_data = _extract_usage_from_response(data)
+
+        # Try OpenAI format
+        choices = data.get("choices") or []
+        if choices:
+            response_text = choices[0].get("message", {}).get("content", "")
+            result = {"ok": True, "latencyMs": latency_ms, "response": response_text}
+        # Try Anthropic format
+        else:
+            content_blocks = data.get("content") or []
+            if content_blocks:
+                for block in content_blocks:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        response_text = block.get("text", "")
+                        result = {"ok": True, "latencyMs": latency_ms, "response": response_text}
+                        break
+            # Try Gemini format
+            else:
+                candidates = data.get("candidates") or []
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts") or []
+                    for part in parts:
+                        if isinstance(part, dict) and "text" in part:
+                            response_text = part["text"]
+                            result = {"ok": True, "latencyMs": latency_ms, "response": response_text}
+                            break
+                else:
+                    result = {"ok": True, "latencyMs": latency_ms, "response": json.dumps(data, ensure_ascii=False)[:200]}
+    else:
+        result = {"ok": False, "latencyMs": latency_ms, "error": f"HTTP {resp.status_code}"}
+
+    # ── 附加检测结果 ──
+    if detected_ctx is not None:
+        result["detectedContextWindow"] = detected_ctx
+        # context_window 异常警告
+        if configured_ctx > 0:
+            ratio = configured_ctx / detected_ctx
+            if ratio > 2.0:
+                result["contextWindowWarning"] = (
+                    f"配置的 context_window ({configured_ctx:,}) 远大于"
+                    f"检测到的实际值 ({detected_ctx:,})，"
+                    f"可能导致上下文溢出。建议更新为 {detected_ctx:,}。"
+                )
+            elif ratio < 0.5:
+                result["contextWindowWarning"] = (
+                    f"配置的 context_window ({configured_ctx:,}) 远小于"
+                    f"检测到的实际值 ({detected_ctx:,})，"
+                    f"可能导致压缩过于频繁。建议更新为 {detected_ctx:,}。"
+                )
+
+    # ── 推理模型检测 ──
+    detected_thinking = caps.get("supports_thinking")
+    detected_max_output = caps.get("max_output_tokens")
+
+    # 运行时推理 token 检测（最权威）— 如果响应中有 reasoning_tokens，确认是推理模型
+    if usage_data and usage_data.get("reasoning_tokens", 0) > 0:
+        detected_thinking = True
+        result["reasoningTokens"] = usage_data["reasoning_tokens"]
+
+    if detected_thinking is not None:
+        result["detectedSupportsThinking"] = detected_thinking
+        # 配置异常警告
+        if configured_thinking is not None and configured_thinking != detected_thinking:
+            result["thinkingWarning"] = (
+                f"配置的 supports_thinking={configured_thinking} 与检测值"
+                f"={detected_thinking} 不一致，已自动修正。"
+            )
+
+    if detected_max_output is not None:
+        result["detectedMaxOutputTokens"] = detected_max_output
+        if configured_max_output > 0 and configured_max_output < detected_max_output // 4:
+            result["maxOutputWarning"] = (
+                f"配置的 max_output_tokens ({configured_max_output:,}) 远小于"
+                f"检测到的实际值 ({detected_max_output:,})，"
+                f"可能导致推理模型输出不足。建议更新为 {detected_max_output:,}。"
+            )
+
+    # ── 自动修正 DB 配置 ──
+    updates: dict = {}
+    if detected_ctx is not None and (configured_ctx == 0 or configured_ctx != detected_ctx):
+        # 仅在差异显著时更新
+        if configured_ctx == 0 or abs(configured_ctx - detected_ctx) / max(detected_ctx, 1) > 0.1:
+            updates["context_window"] = detected_ctx
+    if detected_thinking is not None and configured_thinking != detected_thinking:
+        updates["supports_thinking"] = detected_thinking
+    if detected_max_output is not None and (
+        configured_max_output == 0
+        or (configured_max_output > 0 and configured_max_output < detected_max_output // 4)
+    ):
+        updates["max_output_tokens"] = detected_max_output
+
+    if updates:
+        try:
+            await _model.update(model_pk, updates)
+            result["autoCorrected"] = updates
+            log.info("model_auto_corrected", model_pk=model_pk, updates=updates)
+        except Exception as e:
+            log.warning("model_auto_correct_failed", model_pk=model_pk, error=str(e))
+
+    return result
 
 
 class ModelCreate(BaseModel):
@@ -244,10 +554,12 @@ async def list_models() -> dict:
 async def create_model(body: ModelCreate) -> dict:
     """创建模型。
 
-    如果用户未提供 contextWindow，自动检测：
-    1. OpenRouter 模型 → 查询 OpenRouter /api/v1/models
-    2. 其他模型 → 内置预设表匹配
-    检测到的值会写入数据库并返回给用户。
+    自动检测并填充：
+    - context_window（OpenRouter API / 预设表）
+    - supports_thinking（推理模型预设表 / OpenRouter API）
+    - max_output_tokens（OpenRouter API / 预设表）
+
+    创建后自动触发自检，一次请求完成连通性测试 + 自动修正配置。
     """
     try:
         attrs = _normalize_attrs(body)
@@ -267,7 +579,34 @@ async def create_model(body: ModelCreate) -> dict:
                     context_window=detected,
                 )
 
+        # ── 自动检测 supports_thinking 和 max_output_tokens ──
+        # 用 "key not in attrs" 而非 "not attrs.get(key)"，避免覆盖用户显式设的 False / 0
+        if "supports_thinking" not in attrs or "max_output_tokens" not in attrs:
+            caps = await _detect_model_capabilities(
+                attrs.get("base_url", ""),
+                attrs.get("api_key", ""),
+                attrs.get("model_id", ""),
+            )
+            if "supports_thinking" not in attrs and caps.get("supports_thinking") is not None:
+                attrs["supports_thinking"] = caps["supports_thinking"]
+            if "max_output_tokens" not in attrs and caps.get("max_output_tokens") is not None:
+                attrs["max_output_tokens"] = caps["max_output_tokens"]
+
         result = await _model.create(attrs)
+
+        # ── 创建后自动触发自检（连通性 + 运行时推理 token 检测 + DB 修正）──
+        created_model = await _model.get(result["id"])
+        if created_model:
+            try:
+                test_result = await _do_self_test(created_model)
+                log.info(
+                    "create_model_self_test_done",
+                    model_id=result["id"],
+                    ok=test_result.get("ok"),
+                    auto_corrected=test_result.get("autoCorrected"),
+                )
+            except Exception as e:
+                log.warning("create_model_self_test_failed", error=str(e))
     except Exception as e:
         log.error("create_model_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to create model")
@@ -324,115 +663,21 @@ async def delete_model(model_id: str) -> dict:
 
 @router.post("/{model_id}/test")
 async def test_model(model_id: str) -> dict:
-    """探测请求 — 使用多格式 handler 测延迟 + 检测 context_window。
+    """自检请求 — 连通性测试 + 自动检测 + 自动修正 DB 配置。
 
     契约 19 特别流程 5: 15s 超时，返回 {ok, latencyMs, response|error}。
     支持所有 provider 格式（OpenAI/Anthropic/Google/OpenAI-compatible）。
-    额外返回 detectedContextWindow（自动检测值）+ contextWindowWarning（配置异常提示）。
+
+    额外返回：
+    - detectedContextWindow: 自动检测的 context_window
+    - detectedSupportsThinking: 是否推理模型
+    - detectedMaxOutputTokens: 最大输出 token 数
+    - reasoningTokens: 响应中的推理 token 数（运行时检测）
+    - autoCorrected: 自动修正的配置项
+    - contextWindowWarning / thinkingWarning / maxOutputWarning: 配置异常提示
     """
     model = await _model.get(model_id)
     if model is None:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    base_url = (model.get("base_url") or "").rstrip("/")
-    api_key = model.get("api_key") or ""
-    model_name = model.get("model_id") or ""
-    configured_ctx = model.get("context_window") or 0
-
-    # Use format handler to build correct URL/headers/body per provider
-    from hiveweave.llm.provider import ProviderFactory, provider_factory
-
-    factory: ProviderFactory = provider_factory
-    try:
-        config = factory.create(model)
-    except ValueError as e:
-        return {"ok": False, "latencyMs": 0, "error": str(e)}
-
-    url = config.build_url()
-    headers = config.build_headers()
-    body = config.build_body(
-        messages=[{"role": "user", "content": "Say 'OK' and nothing else."}],
-        stream=False,
-        max_tokens=10,
-        tools=None,
-    )
-
-    start = time.perf_counter()
-    try:
-        async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
-            resp = await client.post(
-                url,
-                json=body,
-                headers=headers,
-            )
-        latency_ms = int((time.perf_counter() - start) * 1000)
-
-        # 检测 context_window（探测请求后执行，不阻塞主路径）
-        detected_ctx = await _detect_context_window(base_url, api_key, model_name)
-
-        # 构建响应
-        result: dict = {"ok": False, "latencyMs": latency_ms}
-
-        if resp.status_code == 200:
-            data = resp.json()
-            # Try OpenAI format first
-            choices = data.get("choices") or []
-            if choices:
-                response_text = choices[0].get("message", {}).get("content", "")
-                result = {"ok": True, "latencyMs": latency_ms, "response": response_text}
-            # Try Anthropic format
-            else:
-                content_blocks = data.get("content") or []
-                if content_blocks:
-                    for block in content_blocks:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            result = {"ok": True, "latencyMs": latency_ms, "response": block.get("text", "")}
-                            break
-                # Try Gemini format
-                else:
-                    candidates = data.get("candidates") or []
-                    if candidates:
-                        parts = candidates[0].get("content", {}).get("parts") or []
-                        for part in parts:
-                            if isinstance(part, dict) and "text" in part:
-                                result = {"ok": True, "latencyMs": latency_ms, "response": part["text"]}
-                                break
-                    else:
-                        result = {"ok": True, "latencyMs": latency_ms, "response": json.dumps(data, ensure_ascii=False)[:200]}
-        else:
-            result = {"ok": False, "latencyMs": latency_ms, "error": f"HTTP {resp.status_code}"}
-
-        # ── 附加 context_window 检测结果 ──
-        if detected_ctx is not None:
-            result["detectedContextWindow"] = detected_ctx
-            # 如果用户配置的值与检测值差异超过 2 倍，发出警告
-            if configured_ctx > 0:
-                ratio = configured_ctx / detected_ctx
-                if ratio > 2.0:
-                    result["contextWindowWarning"] = (
-                        f"配置的 context_window ({configured_ctx:,}) 远大于"
-                        f"检测到的实际值 ({detected_ctx:,})，"
-                        f"可能导致上下文溢出。建议更新为 {detected_ctx:,}。"
-                    )
-                elif ratio < 0.5:
-                    result["contextWindowWarning"] = (
-                        f"配置的 context_window ({configured_ctx:,}) 远小于"
-                        f"检测到的实际值 ({detected_ctx:,})，"
-                        f"可能导致压缩过于频繁。建议更新为 {detected_ctx:,}。"
-                    )
-
-        return result
-    except httpx.TimeoutException:
-        latency_ms = int((time.perf_counter() - start) * 1000)
-        detected_ctx = await _detect_context_window(base_url, api_key, model_name)
-        result: dict = {"ok": False, "latencyMs": latency_ms, "error": "request timed out"}
-        if detected_ctx is not None:
-            result["detectedContextWindow"] = detected_ctx
-        return result
-    except Exception as e:
-        latency_ms = int((time.perf_counter() - start) * 1000)
-        detected_ctx = await _detect_context_window(base_url, api_key, model_name)
-        result: dict = {"ok": False, "latencyMs": latency_ms, "error": str(e)}
-        if detected_ctx is not None:
-            result["detectedContextWindow"] = detected_ctx
-        return result
+    return await _do_self_test(model)

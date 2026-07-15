@@ -154,8 +154,12 @@ DEFAULT_PLACEHOLDER = "好的，开始处理。\n"
 MID_ROUND_REMINDER_RATIO = 0.8
 """中轮提醒注入时机: 80% 轮次时。"""
 
-SAFETY_BUFFER_TOKENS = 4_096
-"""上下文溢出检查的安全缓冲。"""
+SAFETY_BUFFER_TOKENS = 20_000
+"""上下文溢出检查的安全缓冲。
+
+覆盖未计量开销：工具定义 JSON Schema（15-25K tokens）、system prompt 框架文本等。
+旧值 4K 远不够，导致 token 估算认为还有空间但实际 API 已超限。
+"""
 
 OUTPUT_TOKEN_GLOBAL_CAP = 32_000
 """非 reasoning 模型的 max_tokens 全局上限。"""

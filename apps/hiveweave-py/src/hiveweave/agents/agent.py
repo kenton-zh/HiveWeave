@@ -42,7 +42,7 @@ from hiveweave.services.inbox import InboxService
 from hiveweave.services.memory import MemoryService
 from hiveweave.services.model import ModelService
 from hiveweave.services.org import OrgService
-from hiveweave.services.permission import permission_service, PermissionService
+from hiveweave.services.permission import permission_service, PermissionService, COORDINATOR_ONLY_TOOLS
 from hiveweave.services.skill_registry import SkillRegistryService
 from hiveweave.services.system_state import system_state
 from hiveweave.services.work_log import WorkLogService
@@ -805,6 +805,10 @@ class Agent:
         """获取工具定义列表。
 
         对齐 Elixir tool_executor.ex: get_tools/2。
+
+        Bug fix: coordinator 角色（role_type=coordinator）需要额外获得
+        COORDINATOR_ONLY_TOOLS（review_task, create_task, git_worktree_merge 等）。
+        虽然 evaluate() 运行时会正确 allow，但 LLM 看不到工具定义就无法调用。
         """
         mode = await permission_service.get_permission_mode(self.id)
         tool_names = permission_service.get_tools_for_mode(mode)
@@ -818,6 +822,14 @@ class Agent:
                 ) else (allowed_raw or [])
             except (json.JSONDecodeError, TypeError):
                 tool_names = []
+
+        # Coordinator 角色额外获得 COORDINATOR_ONLY_TOOLS
+        # evaluate() 已有角色边界检查，确保 executor 不会拿到这些工具
+        role_type = self.config.get("role_type", "executor")
+        if role_type == "coordinator":
+            tool_names = list(tool_names) + [
+                t for t in COORDINATOR_ONLY_TOOLS if t not in tool_names
+            ]
 
         return _build_tool_definitions(tool_names)
 
