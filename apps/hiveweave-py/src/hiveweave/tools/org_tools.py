@@ -192,51 +192,71 @@ async def hire_agent_tool(
         )
     perm_mode = "readonly" if perm_type == "coordinator" else "readwrite"
 
-    # Get default model_id — mixed-model routing:
-    #   coordinator (CEO/HR/architect/…) → inherit from existing coordinators
-    #   executor    (engineer/…)          → prefer a *different* active model
-    existing_agents = await ctx.org.list_agents(project_id)
+    # existing_agents 已在上方 parent_id 解析时获取（all_agents）
+    existing_agents = all_agents
+
+    # ── 默认模型分配 ──
+    # 优先从 global_settings 读取 default_coordinator_model / default_executor_model
+    # 未配置时回退到旧逻辑（继承现有 coordinator 模型 / 挑不同的活跃模型）
+    from hiveweave.services.settings import SettingsService
+
+    settings = SettingsService()
     model_id = None
 
-    # Find the model used by existing coordinators (the "leadership" model)
-    coordinator_model = None
-    for a in existing_agents:
-        if a.get("model_id"):
-            coordinator_model = a["model_id"]
-            break
-
     if perm_type == "coordinator":
-        # Leaders inherit the same model as existing leaders
-        model_id = coordinator_model
+        # 1. 全局设置: default_coordinator_model
+        configured = await settings.get("default_coordinator_model")
+        if configured:
+            model_id = configured
+            log.info("hire_agent.model_from_setting", role=role, setting="default_coordinator_model", model_id=model_id)
+
+        # 2. 回退: 继承现有 coordinator 的模型
+        if not model_id:
+            for a in existing_agents:
+                if a.get("model_id"):
+                    model_id = a["model_id"]
+                    log.info("hire_agent.model_inherited", role=role, from_agent=a.get("name"), model_id=model_id)
+                    break
     else:
-        # Executors: pick an active model that differs from the
-        # coordinator model, enabling heterogeneous (mixed) model teams.
-        try:
-            from hiveweave.services.model import ModelService
+        # 1. 全局设置: default_executor_model
+        configured = await settings.get("default_executor_model")
+        if configured:
+            model_id = configured
+            log.info("hire_agent.model_from_setting", role=role, setting="default_executor_model", model_id=model_id)
 
-            ms = ModelService()
-            active = await ms.list_active()
-            if active:
-                for m in active:
-                    mid = m.get("model_id") or m.get("id")
-                    if mid != coordinator_model:
-                        model_id = mid
-                        log.info(
-                            "tool.hire_agent.executor_model_routed",
-                            model_id=model_id,
-                            coordinator_model=coordinator_model,
-                        )
-                        break
-                if not model_id:
-                    # Fallback: last active model
-                    chosen = active[-1]
-                    model_id = chosen.get("model_id") or chosen.get("id")
-        except Exception as e:
-            log.warning("tool.hire_agent.model_service_failed", error=str(e))
+        # 2. 回退: 挑一个与 coordinator 不同的活跃模型
+        if not model_id:
+            coordinator_model = None
+            for a in existing_agents:
+                if a.get("model_id"):
+                    coordinator_model = a["model_id"]
+                    break
 
-    # Final fallback for coordinators that couldn't inherit
+            try:
+                from hiveweave.services.model import ModelService
+
+                ms = ModelService()
+                active = await ms.list_active()
+                if active:
+                    for m in active:
+                        mid = m.get("model_id") or m.get("id")
+                        if mid != coordinator_model:
+                            model_id = mid
+                            log.info(
+                                "tool.hire_agent.executor_model_routed",
+                                model_id=model_id,
+                                coordinator_model=coordinator_model,
+                            )
+                            break
+                    if not model_id:
+                        chosen = active[-1]
+                        model_id = chosen.get("model_id") or chosen.get("id")
+            except Exception as e:
+                log.warning("tool.hire_agent.model_service_failed", error=str(e))
+
+    # Final fallback
     if not model_id:
-        model_id = coordinator_model or "step-3.7-flash"
+        model_id = "step-3.7-flash"
 
     # Get language from per-project DB project_meta.
     # 真相源: per-project DB project_meta.language.
