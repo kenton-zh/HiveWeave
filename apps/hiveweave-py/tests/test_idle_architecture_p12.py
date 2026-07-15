@@ -104,6 +104,59 @@ async def test_wait_contract_persist_and_match(wait_env):
     assert await svc.list_active(pid, AGENT_ID) == []
 
 
+def test_wait_ref_matches_flower_name_not_just_uuid():
+    """Regression: commit_turn stores 花名; inbox from_agent_id is UUID."""
+    waits = [
+        {
+            "kind": "agent",
+            "ref": "天线",
+            "wakeOn": ["ask_reply", "message_from_ref", "timeout"],
+        }
+    ]
+    # UUID alone must NOT match 花名
+    assert (
+        event_matches_waits(
+            waits,
+            event="message_from_ref",
+            from_agent_id="c9dd2fad-299c-409a-9a93-236324f7d9d5",
+        )
+        is False
+    )
+    # With name → wake
+    assert (
+        event_matches_waits(
+            waits,
+            event="message_from_ref",
+            from_agent_id="c9dd2fad-299c-409a-9a93-236324f7d9d5",
+            from_agent_name="天线",
+            from_short_id="A002",
+        )
+        is True
+    )
+    assert (
+        should_wake(
+            "command",
+            disposition="waiting_agent",
+            from_agent_id="c9dd2fad-299c-409a-9a93-236324f7d9d5",
+            from_agent_name="天线",
+            from_short_id="A002",
+            active_waits=waits,
+        )
+        is True
+    )
+    # Wrong agent must not wake
+    assert (
+        should_wake(
+            "command",
+            disposition="waiting_agent",
+            from_agent_id="other-uuid",
+            from_agent_name="潮汐",
+            from_short_id="A003",
+            active_waits=waits,
+        )
+        is False
+    )
+
 def test_category_to_wake_event():
     assert category_to_wake_event("command", from_agent_id="user") == "user_message"
     assert category_to_wake_event("task_transition") == "task_transition"

@@ -245,13 +245,49 @@ class WaitContractService:
         return cur.rowcount or 0
 
 
+def _ref_matches_sender(
+    ref: str,
+    *,
+    from_agent_id: str | None = None,
+    from_agent_name: str | None = None,
+    from_short_id: str | None = None,
+) -> bool:
+    """Match wait ref (花名 / short_id / uuid) against the sender identity."""
+    r = (ref or "").strip().lower()
+    if not r:
+        return False
+    candidates = [
+        (from_agent_id or "").strip().lower(),
+        (from_agent_name or "").strip().lower(),
+        (from_short_id or "").strip().lower(),
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        if c == r:
+            return True
+        # uuid / short_id prefix
+        if len(r) >= 4 and (c.startswith(r) or r.startswith(c)):
+            return True
+        # flower name contained (rare) / exact short_id like a002
+        if r == c.replace(" ", ""):
+            return True
+    return False
+
+
 def event_matches_waits(
     waits: list[dict],
     *,
     event: str,
     from_agent_id: str | None = None,
+    from_agent_name: str | None = None,
+    from_short_id: str | None = None,
 ) -> bool:
-    """True if any active wait accepts this wake event."""
+    """True if any active wait accepts this wake event.
+
+    ``message_from_ref`` matches wait.ref against sender id **or** 花名/short_id
+    (commit_turn usually stores the flower name, inbox uses UUID).
+    """
     if not waits:
         return True  # no contract → fall back to disposition policy
     now = int(time.time() * 1000)
@@ -260,17 +296,41 @@ def event_matches_waits(
         if exp is not None and int(exp) <= now:
             continue
         wake_on = w.get("wakeOn") or w.get("wake_on") or []
-        if event in wake_on:
-            if event == "message_from_ref" and from_agent_id:
-                ref = (w.get("ref") or "").lower()
-                if (
-                    from_agent_id.lower() == ref
-                    or from_agent_id.startswith(ref)
-                    or ref in from_agent_id.lower()
-                ):
-                    return True
-                continue
-            return True
+        if isinstance(wake_on, str):
+            try:
+                wake_on = json.loads(wake_on)
+            except Exception:
+                wake_on = []
+        kind = (w.get("kind") or "").lower()
+        ref = w.get("ref") or ""
+
+        # kind=agent: any non-timeout event from that agent should wake
+        if kind == "agent" and event in (
+            "message_from_ref",
+            "ask_reply",
+            "command",
+        ):
+            if _ref_matches_sender(
+                ref,
+                from_agent_id=from_agent_id,
+                from_agent_name=from_agent_name,
+                from_short_id=from_short_id,
+            ):
+                return True
+
+        if event not in wake_on:
+            continue
+
+        if event == "message_from_ref":
+            if _ref_matches_sender(
+                ref,
+                from_agent_id=from_agent_id,
+                from_agent_name=from_agent_name,
+                from_short_id=from_short_id,
+            ):
+                return True
+            continue
+        return True
     return False
 
 
