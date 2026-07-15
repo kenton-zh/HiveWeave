@@ -160,6 +160,7 @@ _REASONING_MODEL_PATTERNS: list[str] = [
     "qwen3",                        # Qwen 3 (推理模型)
     "gemini-2.5",                   # Gemini 2.5 (推理模型)
     "step-3",                       # Step 3.x (推理模型)
+    "longcat",                      # LongCat (推理模型, Anthropic 格式 thinking block)
 ]
 
 
@@ -315,7 +316,7 @@ async def _do_self_test(model: dict) -> dict:
     body = config.build_body(
         messages=[{"role": "user", "content": "Say 'OK' and nothing else."}],
         stream=False,
-        max_tokens=10,
+        max_tokens=256,  # 推理模型需要足够空间：thinking + 实际输出
         tools=None,
     )
 
@@ -355,6 +356,7 @@ async def _do_self_test(model: dict) -> dict:
     # 解析响应
     response_text = ""
     usage_data = None
+    runtime_detected_thinking = False  # 运行时检测到推理模型（thinking block 或 reasoning_tokens）
     if resp.status_code == 200:
         data = resp.json()
         # 提取 usage
@@ -369,11 +371,27 @@ async def _do_self_test(model: dict) -> dict:
         else:
             content_blocks = data.get("content") or []
             if content_blocks:
+                # 优先找 text block
+                found_text = False
                 for block in content_blocks:
                     if isinstance(block, dict) and block.get("type") == "text":
                         response_text = block.get("text", "")
                         result = {"ok": True, "latencyMs": latency_ms, "response": response_text}
+                        found_text = True
                         break
+                # 没有 text block 但有 thinking block → 推理模型，thinking 占满 token
+                if not found_text:
+                    for block in content_blocks:
+                        if isinstance(block, dict) and block.get("type") == "thinking":
+                            thinking_text = block.get("thinking", "")
+                            result = {
+                                "ok": True,
+                                "latencyMs": latency_ms,
+                                "response": f"[thinking only] {thinking_text[:100]}",
+                            }
+                            # 响应中有 thinking block = 推理模型
+                            runtime_detected_thinking = True
+                            break
             # Try Gemini format
             else:
                 candidates = data.get("candidates") or []
@@ -387,7 +405,7 @@ async def _do_self_test(model: dict) -> dict:
                 else:
                     result = {"ok": True, "latencyMs": latency_ms, "response": json.dumps(data, ensure_ascii=False)[:200]}
     else:
-        result = {"ok": False, "latencyMs": latency_ms, "error": f"HTTP {resp.status_code}"}
+        result = {"ok": False, "latencyMs": latency_ms, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
 
     # ── 附加检测结果 ──
     if detected_ctx is not None:
@@ -412,10 +430,12 @@ async def _do_self_test(model: dict) -> dict:
     detected_thinking = caps.get("supports_thinking")
     detected_max_output = caps.get("max_output_tokens")
 
-    # 运行时推理 token 检测（最权威）— 如果响应中有 reasoning_tokens，确认是推理模型
+    # 运行时推理检测（最权威）— 两个信号：reasoning_tokens > 0 或 Anthropic thinking block
     if usage_data and usage_data.get("reasoning_tokens", 0) > 0:
         detected_thinking = True
         result["reasoningTokens"] = usage_data["reasoning_tokens"]
+    if runtime_detected_thinking:
+        detected_thinking = True
 
     if detected_thinking is not None:
         result["detectedSupportsThinking"] = detected_thinking
