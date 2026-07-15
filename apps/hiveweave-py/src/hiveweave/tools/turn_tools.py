@@ -1,0 +1,190 @@
+"""Turn protocol tools: commit_turn, ask_agent, notify_agent."""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from hiveweave.tools.helpers import coerce_to_list
+from hiveweave.tools.base import tool
+from hiveweave.tools.result import ToolResult
+from hiveweave.services.turn_result import (
+    TURN_RESULT_SCHEMA_VERSION,
+    parse_turn_result,
+    validate_phase_fields,
+)
+from hiveweave.services.turn_session import set_pending_turn_result
+
+
+# ── commit_turn ──────────────────────────────────────────
+
+
+class CommitTurnParams(BaseModel):
+    """Mandatory end-of-turn return value (TurnResult ABI)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    phase: Literal["in_progress", "waiting", "blocked", "done_slice"] = Field(
+        description=(
+            "Control plane: in_progress=keep working; waiting=legal wait; "
+            "blocked=stuck; done_slice=obligations for this slice cleared"
+        ),
+    )
+    summary: str = Field(
+        description="1-2 sentences: what this turn accomplished",
+        json_schema_extra={"aliases": ["content", "message", "text"]},
+    )
+    waiting_on: list[dict[str, Any]] | None = Field(
+        default=None,
+        alias="waitingOn",
+        description=(
+            "Required for waiting/blocked. "
+            "Items: {kind: agent|task|user|timer|external, ref: str, note?: str}"
+        ),
+        json_schema_extra={"aliases": ["waitingOn", "waiting_on"]},
+    )
+    result: dict[str, Any] | None = Field(
+        default=None,
+        description="Data plane payload (replies, tasks, artifacts, …). May be {}",
+    )
+    extensions: dict[str, Any] | None = Field(
+        default=None,
+        description="Forward-compatible extensions. May be {}",
+    )
+
+
+@tool(
+    "commit_turn",
+    "MANDATORY end-of-turn return value. Every turn is a function call — "
+    "you MUST commit_turn before stopping. phase=in_progress keeps you working; "
+    "waiting/blocked require waiting_on; done_slice only when this slice's "
+    "obligations are cleared. Assistant text is NOT a return value.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def commit_turn_tool(
+    params: CommitTurnParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """Validate and buffer TurnResult for exit gates + persist."""
+    raw: dict[str, Any] = {
+        "schema_version": TURN_RESULT_SCHEMA_VERSION,
+        "phase": params.phase,
+        "summary": params.summary,
+        "waiting_on": params.waiting_on or [],
+        "result": params.result if params.result is not None else {},
+        "extensions": params.extensions if params.extensions is not None else {},
+    }
+    try:
+        tr = parse_turn_result(raw)
+    except Exception as e:
+        return ToolResult.err(f"Invalid TurnResult: {e}")
+
+    field_violations = validate_phase_fields(tr)
+    if field_violations:
+        return ToolResult.err(
+            "commit_turn rejected: "
+            + ", ".join(field_violations)
+            + ". waiting/blocked require waiting_on=[{kind, ref}]."
+        )
+
+    payload = tr.to_persist_dict()
+    set_pending_turn_result(agent_id, payload)
+
+    # Persist for observability
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.work_log import WorkLogService
+
+        project_id = await meta_db.get_agent_project_id(agent_id)
+        if not project_id and ctx is not None:
+            project_id = getattr(ctx, "project_id", None)
+        if project_id:
+            await WorkLogService().write_work_log(
+                project_id,
+                agent_id,
+                None,
+                "turn_result",
+                f"[{tr.phase}] {tr.summary}"[:140],
+                details=payload,
+            )
+    except Exception:
+        pass
+
+    return ToolResult.ok(
+        f"TurnResult accepted: phase={tr.phase}. "
+        f"{'Will continue working.' if tr.phase == 'in_progress' else 'Ready to exit if gates pass.'}",
+        turn_result=payload,
+    )
+
+
+# ── ask_agent / notify_agent ─────────────────────────────
+
+
+class AskNotifyParams(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    recipients: list[str] = Field(
+        description="Recipient 花名, short_id, or UUID list",
+        json_schema_extra={"aliases": ["recipient", "to", "targets", "target"]},
+    )
+    message: str = Field(
+        description="Message body",
+        json_schema_extra={"aliases": ["content", "body", "text"]},
+    )
+    priority: str = Field(
+        default="normal",
+        description="'normal' or 'urgent'",
+        json_schema_extra={"aliases": ["level"]},
+    )
+
+    @field_validator("recipients", mode="before")
+    @classmethod
+    def _coerce_recipients(cls, v: Any) -> Any:
+        return coerce_to_list(v)
+
+
+@tool(
+    "ask_agent",
+    "Ask one or more agents and REQUIRE a reply via send_message/ask_agent/notify_agent. "
+    "Use for tool checks, opinions, reports. Prefer this over send_message(expectReport=true).",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def ask_agent_tool(
+    params: AskNotifyParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    from hiveweave.tools.orchestration_tools import _send_message_core
+
+    return await _send_message_core(
+        agent_id=agent_id,
+        recipients=params.recipients,
+        message=params.message,
+        priority=params.priority,
+        expect_report=True,
+        ctx=ctx,
+        message_type="ask",
+    )
+
+
+@tool(
+    "notify_agent",
+    "Notify agents (FYI) — does NOT require a reply. "
+    "Use for status broadcasts. Prefer this over send_message for one-way updates.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def notify_agent_tool(
+    params: AskNotifyParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    from hiveweave.tools.orchestration_tools import _send_message_core
+
+    return await _send_message_core(
+        agent_id=agent_id,
+        recipients=params.recipients,
+        message=params.message,
+        priority=params.priority,
+        expect_report=False,
+        ctx=ctx,
+        message_type="notify",
+    )

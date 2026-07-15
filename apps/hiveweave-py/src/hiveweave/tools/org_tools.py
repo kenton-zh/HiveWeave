@@ -316,6 +316,19 @@ async def hire_agent_tool(
             )
         skills = valid_skills
 
+    # Hard org invariants (name / role / parent / span)
+    from hiveweave.services.org_invariants import validate_hire
+
+    hire_err = validate_hire(
+        agents=existing_agents,
+        name=name,
+        role=role,
+        permission_type=perm_type,
+        parent_id=parent_id,
+    )
+    if hire_err:
+        return ToolResult.err(hire_err)
+
     attrs = {
         "project_id": project_id,
         "name": name,
@@ -356,12 +369,27 @@ async def hire_agent_tool(
                         worktree_path = wt_result["path"]
                         await ctx.org.update_agent(new_id, {
                             "workspace_path": worktree_path,
+                            "worktree_error": None,
                         })
                         log.info(
                             "tool.hire_agent.worktree_created",
                             agent_id=new_id,
                             short_id=new_short,
                             worktree=worktree_path,
+                        )
+                    else:
+                        worktree_error = (
+                            wt_result.get("message")
+                            or "worktree create returned success=false"
+                        )
+                        await ctx.org.update_agent(new_id, {
+                            "worktree_error": worktree_error,
+                        })
+                        log.warning(
+                            "tool.hire_agent.worktree_soft_fail",
+                            agent_id=new_id,
+                            short_id=new_short,
+                            error=worktree_error,
                         )
             except Exception as wt_err:
                 log.warning(
@@ -472,8 +500,9 @@ class DismissAgentParams(BaseModel):
 
 @tool(
     "dismiss_agent",
-    "Permanently remove/fire an agent from the organization. "
-    "Cannot be undone.",
+    "Archive/remove an agent. PREFER transfer_agent over dismiss+rehire when "
+    "the person is fine but reporting line/role is wrong. Dismiss closes their "
+    "open tasks and inbox; cannot undo.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -530,7 +559,9 @@ class TransferAgentParams(BaseModel):
 
 @tool(
     "transfer_agent",
-    "Reassign an agent to a new parent/supervisor in the hierarchy.",
+    "PREFERRED over dismiss+rehire: reassign an agent to a new parent/"
+    "supervisor (and keep their worktree/identity). Use this for org redesign, "
+    "span fixes, and module ownership moves.",
     requires_workspace=False,
     security_level="standard",
 )

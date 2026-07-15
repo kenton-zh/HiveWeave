@@ -1078,139 +1078,207 @@ class Streamer:
         delta_id: str,
         round_num: int,
     ) -> dict:
-        """执行 HTTP 流式请求（同步 httpx 跑在线程池里）。
+        """执行 HTTP 流式请求（同步 httpx 跑在线程池里，事件边收边推）。
 
         Windows 上 asyncio CancelledError 无法中断 httpx 的 socket read，
         因此改用同步 httpx.Client + run_in_executor。同步版的超时走
-        socket.settimeout()（OS 级），线程阻塞后能正常返回而非永远挂起。
+        socket.settimeout()（OS 级）。
+
+        真流式：线程内解析 SSE 后通过 queue 推到事件循环，立刻 _fire_delta，
+        避免整包收完才刷新（否则 UI 长时间冻住，误判为 streaming 僵尸）。
         """
         body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
         read_to = httpx.Timeout(read=READ_TIMEOUT_S, connect=10, write=10, pool=10)
 
-        def _run_sync() -> dict:
-            """在线程中执行：HTTP 请求 + SSE 解析。"""
+        loop = asyncio.get_running_loop()
+        event_q: asyncio.Queue = asyncio.Queue()
+        _DONE = object()
+        _ERR = object()
+
+        def _run_sync() -> None:
+            """在线程中执行：HTTP 请求 + SSE 解析，事件即时入队。"""
             http_client = httpx.Client(timeout=read_to)
-            events: list[dict] = []
             try:
                 with http_client.stream(
                     "POST", url, headers=headers, content=body_bytes,
                 ) as response:
                     if response.status_code != 200:
-                        body_text = response.read().decode("utf-8", errors="replace")[:500]
-                        return {"ok": False, "http_status": response.status_code,
-                                "body": body_text, "headers": dict(response.headers)}
-                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                        body_text = response.read().decode(
+                            "utf-8", errors="replace"
+                        )[:500]
+                        loop.call_soon_threadsafe(
+                            event_q.put_nowait,
+                            (
+                                _ERR,
+                                {
+                                    "ok": False,
+                                    "http_status": response.status_code,
+                                    "body": body_text,
+                                    "headers": dict(response.headers),
+                                },
+                            ),
+                        )
+                        return
+                    decoder = codecs.getincrementaldecoder("utf-8")(
+                        errors="replace"
+                    )
                     buffer = ""
                     for raw in response.iter_bytes():
                         text = decoder.decode(raw)
                         if text:
                             buffer += text
                             parsed, buffer = parse_sse(buffer)
-                            events.extend(parsed)
+                            for ev in parsed:
+                                loop.call_soon_threadsafe(
+                                    event_q.put_nowait, ("event", ev)
+                                )
                     tail = decoder.decode(b"", final=True)
                     if tail:
                         buffer += tail
                         parsed, _ = parse_sse(buffer)
-                        events.extend(parsed)
-                return {"ok": True, "events": events}
+                        for ev in parsed:
+                            loop.call_soon_threadsafe(
+                                event_q.put_nowait, ("event", ev)
+                            )
+                loop.call_soon_threadsafe(event_q.put_nowait, (_DONE, None))
             except httpx.ReadTimeout:
-                return {"ok": False, "timeout": True}
+                loop.call_soon_threadsafe(
+                    event_q.put_nowait,
+                    (_ERR, {"ok": False, "timeout": True}),
+                )
             except httpx.ConnectError as e:
-                return {"ok": False, "connect_error": str(e)}
+                loop.call_soon_threadsafe(
+                    event_q.put_nowait,
+                    (_ERR, {"ok": False, "connect_error": str(e)}),
+                )
             except Exception as e:
-                return {"ok": False, "error": str(e)}
+                loop.call_soon_threadsafe(
+                    event_q.put_nowait,
+                    (_ERR, {"ok": False, "error": str(e)}),
+                )
             finally:
                 http_client.close()
 
-        loop = asyncio.get_running_loop()
         deadline = FIRST_CHUNK_TIMEOUT_S + READ_TIMEOUT_S + 10
+        executor_task = loop.run_in_executor(None, _run_sync)
 
-        try:
-            raw = await asyncio.wait_for(
-                loop.run_in_executor(None, _run_sync), timeout=deadline)
-        except asyncio.TimeoutError:
-            raise RetryableError(f"HTTP request timed out after {deadline}s")
-
-        if not raw.get("ok"):
-            if raw.get("timeout"):
-                raise RetryableError(f"HTTP read timeout ({READ_TIMEOUT_S}s)")
-            if raw.get("connect_error"):
-                raise RetryableError(f"Connection error: {raw['connect_error']}")
-            if raw.get("http_status"):
-                if is_retryable_status(raw["http_status"]):
-                    raise RetryableError(
-                        f"HTTP {raw['http_status']}: {raw['body'][:500]}",
-                        status=raw["http_status"], headers=raw.get("headers", {}))
-                raise PermanentError(
-                    f"HTTP {raw['http_status']}: {raw['body'][:500]}",
-                    status=raw["http_status"])
-            raise RetryableError(raw.get("error", "Unknown HTTP error"))
-
-        # Process parsed SSE events in the async context
         text_acc = ""
         thinking_acc = ""
         tool_call_deltas: list[dict] = []
         finish_reason: str | None = None
         usage: dict | None = None
 
-        for event in raw["events"]:
-            if not isinstance(event, dict):
-                continue
-            # 统一用 provider.extract_usage 提取 usage（含 cache_creation/cache_read）
-            # 参考 opencode anthropic-messages.ts mapUsage
-            extracted = provider.extract_usage(event)
-            if extracted:
-                usage = extracted
-            for c in provider.parse_stream_chunk(event):
-                ctype = c.get("type")
-                if ctype == "text":
-                    content = c["content"]
-                    await self._fire_delta(on_delta, {
-                        "type": "text_delta", "content": content,
-                        "delta_id": delta_id})
-                    text_acc += content
-                elif ctype == "reasoning":
-                    content = c["content"]
-                    await self._fire_delta(on_delta, {
-                        "type": "thinking_delta", "content": content, "delta_id": delta_id})
-                    thinking_acc += content
-                elif ctype == "tool_call_delta":
-                    tool_call_deltas.append(c["tool_call"])
-                elif ctype == "tool_call_start":
-                    tc = c.get("tool_call", {})
-                    if tc:
-                        tool_call_deltas.append(tc)
-                elif ctype == "tool_call_end":
-                    pass
-                elif ctype == "thinking_start":
-                    pass
-                # thinking_signature: provider 层已丢弃, 此分支保留为防御性空操作
-                elif ctype == "thinking_signature":
-                    pass
-                elif ctype == "usage":
-                    u = c.get("usage", {})
-                    if u:
-                        usage = usage or {}
-                        usage.update(u)
-                elif ctype == "message_stop":
-                    pass
-                elif ctype == "finish":
-                    finish_reason = c["reason"]
-                elif ctype == "error":
-                    log.warning("sse_error_chunk", agent_id=agent_id, error=c.get("content"))
+        try:
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        event_q.get(), timeout=deadline
+                    )
+                except asyncio.TimeoutError:
+                    raise RetryableError(
+                        f"HTTP request timed out after {deadline}s"
+                    )
+
+                if kind is _DONE:
+                    break
+                if kind is _ERR:
+                    raw = payload
+                    if raw.get("timeout"):
+                        raise RetryableError(
+                            f"HTTP read timeout ({READ_TIMEOUT_S}s)"
+                        )
+                    if raw.get("connect_error"):
+                        raise RetryableError(
+                            f"Connection error: {raw['connect_error']}"
+                        )
+                    if raw.get("http_status"):
+                        if is_retryable_status(raw["http_status"]):
+                            raise RetryableError(
+                                f"HTTP {raw['http_status']}: "
+                                f"{raw['body'][:500]}",
+                                status=raw["http_status"],
+                                headers=raw.get("headers", {}),
+                            )
+                        raise PermanentError(
+                            f"HTTP {raw['http_status']}: {raw['body'][:500]}",
+                            status=raw["http_status"],
+                        )
+                    raise RetryableError(
+                        raw.get("error", "Unknown HTTP error")
+                    )
+
+                event = payload
+                if not isinstance(event, dict):
+                    continue
+                extracted = provider.extract_usage(event)
+                if extracted:
+                    usage = extracted
+                for c in provider.parse_stream_chunk(event):
+                    ctype = c.get("type")
+                    if ctype == "text":
+                        content = c["content"]
+                        await self._fire_delta(on_delta, {
+                            "type": "text_delta", "content": content,
+                            "delta_id": delta_id})
+                        text_acc += content
+                    elif ctype == "reasoning":
+                        content = c["content"]
+                        await self._fire_delta(on_delta, {
+                            "type": "thinking_delta", "content": content,
+                            "delta_id": delta_id})
+                        thinking_acc += content
+                    elif ctype == "tool_call_delta":
+                        tool_call_deltas.append(c["tool_call"])
+                    elif ctype == "tool_call_start":
+                        tc = c.get("tool_call", {})
+                        if tc:
+                            tool_call_deltas.append(tc)
+                    elif ctype == "tool_call_end":
+                        pass
+                    elif ctype in ("thinking_start", "thinking_signature",
+                                   "message_stop"):
+                        pass
+                    elif ctype == "usage":
+                        u = c.get("usage", {})
+                        if u:
+                            usage = usage or {}
+                            usage.update(u)
+                    elif ctype == "finish":
+                        finish_reason = (
+                            c.get("reason")
+                            or c.get("finish_reason")
+                            or finish_reason
+                        )
+                    elif ctype == "error":
+                        log.warning(
+                            "sse_error_chunk",
+                            agent_id=agent_id,
+                            error=c.get("content"),
+                        )
+        finally:
+            try:
+                await executor_task
+            except Exception:
+                pass
 
         tool_calls = merge_tool_calls([], tool_call_deltas)
-        # 记录 cache 命中情况（Anthropic prompt caching）
         cache_read = (usage or {}).get("cache_read", 0)
         cache_creation = (usage or {}).get("cache_creation", 0)
         if cache_read or cache_creation:
-            log.info("prompt_cache_hit", agent_id=agent_id, round=round_num,
-                     cache_read=cache_read, cache_creation=cache_creation,
-                     input_tokens=(usage or {}).get("input", 0))
+            log.info(
+                "prompt_cache_hit",
+                agent_id=agent_id,
+                round=round_num,
+                cache_read=cache_read,
+                cache_creation=cache_creation,
+                input_tokens=(usage or {}).get("input", 0),
+            )
         log.info("round_http_done", agent_id=agent_id, round=round_num,
-                 text_len=len(text_acc), tool_count=len(tool_calls), finish=finish_reason)
+                 text_len=len(text_acc), tool_count=len(tool_calls),
+                 finish=finish_reason)
         return {"status": "ok", "text": text_acc, "thinking": thinking_acc,
-                "tool_calls": tool_calls, "finish_reason": finish_reason, "usage": usage}
+                "tool_calls": tool_calls, "finish_reason": finish_reason,
+                "usage": usage}
 
     # ── SSE 迭代器（带首 chunk + idle 超时）──────────────────
 

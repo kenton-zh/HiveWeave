@@ -56,7 +56,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 | `src/hiveweave/agents/` | Agent + Supervisor + trigger |
 | `src/hiveweave/llm/` | LLM 流式调用 (streamer, provider, retry, circuit_breaker) |
 | `src/hiveweave/tools/` | 工具执行器 + 66 个内置工具 |
-| `src/hiveweave/services/` | 24 个业务服务 (org, dispatch, memory, handoff, skill_registry, ...) |
+| `src/hiveweave/services/` | 业务服务 (org, dispatch, memory, handoff, skill_registry, turn_*, git_worktree, game_time, chat_message, ...) |
 | `src/hiveweave/conversation/` | 对话历史 + token budget + compaction |
 | `src/hiveweave/db/` | Meta DB + per-project DB (aiosqlite) |
 | `src/hiveweave/realtime/` | WebSocket (phoenix_adapter, channels, pubsub, event_bus) |
@@ -77,7 +77,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 
 ### LLM 流式调用
 
-`apps/hiveweave-py/src/hiveweave/llm/streamer.py` — httpx 流式 SSE,支持多 provider:
+`apps/hiveweave-py/src/hiveweave/llm/streamer.py` — httpx 流式 SSE,支持多 provider。同步 httpx 在线程池解析 SSE 后经 queue **边收边推** `_fire_delta`（真流式，避免整包收完才刷新导致 UI 冻住假象）:
 - `provider.py`: provider 工厂,映射 `openai`/`anthropic`/`google` 到对应 API
 - `retry.py`: 429/503/504/529 重试,指数退避 + jitter,解析 `Retry-After`
 - `circuit_breaker.py`: 熔断器,探针锁防止多 Agent 同时冲击不稳定 API
@@ -103,7 +103,8 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 | 补丁 | `apply_patch` |
 | 搜索 | `grep`, `websearch`, `webfetch` |
 | Git worktree | `git_worktree_create`, `git_worktree_list`, `git_worktree_remove`, `git_worktree_status`, `git_worktree_checkpoint`, `git_worktree_merge` |
-| 沟通 | `send_message`, `message_peer`, `message_subordinate`, `message_superior`, `message_team` |
+| 沟通 | `send_message`, `message_peer`, `message_subordinate`, `message_superior`, `message_team`, `ask_agent`, `notify_agent` |
+| 回合出口 | `commit_turn`（每轮必须；TurnResult） |
 | 组织管理 | `hire_agent`, `dismiss_agent`, `transfer_agent`, `list_subordinates`, `view_org_chart`, `read_roster`, `update_roster` |
 | 任务 | `dispatch_task`, `claim_task`, `submit_task`, `review_task`, `approve_work`, `reject_work`, `create_task`, `get_tasks`, `update_task_status`, `report_completion`, `request_review` |
 | 技能 | `list_available_skills`, `read_skill`, `bind_skill`, `unbind_skill` |
@@ -142,6 +143,43 @@ MCP 集成在 `apps/hiveweave-py/src/hiveweave/services/mcp.py`。
 
 CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 expert agents。HR 根据角色匹配表绑定纪律技能（MANDATORY），搜索 skills.sh 绑定工具技能。
 
+**Naming**: executor 的 `role` 必须是「模块短名 + 工种」（如「签到排行榜工程师」），禁止一排裸「前端工程师」。Coordinator 用领域职称（如「游戏逻辑架构师」）。
+
+### TurnResult 出口闸门（回合必须有返回值）
+
+每轮对话视为一次函数调用，不能空转收工：
+
+| 工具 | 用途 |
+|------|------|
+| `commit_turn` | 提交 TurnResult：`phase=in_progress\|waiting\|blocked\|done_slice` |
+| `ask_agent` | 需要对方回复（结构化意图，不靠文案猜） |
+| `notify_agent` | 单向通知，不要求回复 |
+
+实现: `services/turn_result.py`, `turn_session.py`, `turn_exit.py`, `tools/turn_tools.py`。  
+`_handle_completion` 跑 exit gates：未 `commit_turn` / 未回 ask / 有未完成义务 → 拦截并续跑（最多 3 次）。`phase=in_progress` 自动续跑。
+
+### Git worktree 隔离（executor）
+
+- hire executor 时自动 `GitWorktreeService.create` → 写入 `agents.workspace_path`
+- 软失败（`success=false`）必须写 `worktree_error`（两条 hire 路径: `executor.py` / `org_tools.py`）
+- `create` 在目录已删但 git 仍登记时会 **prune + 挂回已有分支**（不 `-B` 抹提交）
+- Agent 每轮 chat 清空 `_workspace_path` 缓存；executor 无有效 worktree 时 **懒创建并写回 DB**
+- 启动 lifespan 按 `permission_type='executor'` 恢复缺失 worktree
+- **审查口径**: coordinator 审代码读 `.hiveweave/worktrees/<shortId>/`，不要只看项目根 main 就判「没改」；approve 后须 `git_worktree_merge`
+
+### Streaming 僵尸自愈（不要靠人工清）
+
+`chat_messages.is_streaming=1` 三种含义：正常流式（PROCESSING）/ 卡住中的流 / 真孤儿（agent 已 idle 但标志未关）。
+
+系统收尾必须确认写库成功：
+- `ChatMessageService.finalize_streaming_message` — `update_message` 返回 False 时 agent-wide 兜底
+- Agent `_finalize_streaming_turn` — completion/error/cancel/timeout/finally 统一走这里；确认成功后才清 `_streaming_msg_id`
+- 新一轮 chat 开始前清该 agent 残留 streaming
+- game_time 每 30s（`STREAMING_SWEEP_TICKS`）扫孤儿：非 PROCESSING 的 `is_streaming=1` 清掉；PROCESSING 的保留（避免误杀）
+- 启动时仍全量清崩溃残留
+
+**不要**把「手动 SQL 清僵尸」当成常规运维；那是自愈失效时的最后手段。
+
 ### Org chart dirty-flag 机制
 
 `OrgService` 维护 `_org_version` 和 `_agent_org_version` 两个内存 dict:
@@ -149,9 +187,18 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 - Agent 首次对话检查 `org_dirty` → 注入精简通讯录（花名 + short_id + role + 层级）→ 清除标记
 - 未变更时不注入，零 token 浪费（仿照 goals dirty 机制）
 
+### Org hire / dismiss 硬不变式
+
+软提示词挡不住「dismiss 重招」与组织膨胀，工具边界硬拒绝：
+
+- `services/org_invariants.validate_hire`：active 花名唯一、executor 岗位唯一、禁裸角色名、executor 不得挂 CEO、直属 ≤7、禁挂 archived parent、保留名（归零/知远）
+- `dismiss_agent` 闭合生命周期：开任务转交上级或归档、inbox 全 ACK、取消闹钟、清 worktree
+- `InboxService.send_message` 拒投 archived；stall / reply-watchdog / post-merge nudge 只碰 active，且 `supersede_watchdog_messages` 先清旧催办再插新（upsert）
+- 纠偏优先序：`transfer_agent` → `bind_skill` → 才 `dismiss`+hire
+
 ### Game time
 
-模拟项目时间,`REAL_SECONDS_PER_GAME_DAY = 3600` (1 真实小时 = 1 游戏天)。5 秒 tick 持久化时间并触发到期告警。停滞 Agent (15+ 分钟无活动) 触发升级到上级。
+模拟项目时间,`REAL_SECONDS_PER_GAME_DAY = 3600` (1 真实小时 = 1 游戏天)。5 秒 tick 持久化时间并触发到期告警。每 30s 扫 orphan streaming；每 2min 查停滞 Agent / 未回复 ask。停滞 Agent (15+ 分钟无活动) 触发升级到上级。
 
 ### 前端
 
@@ -223,20 +270,41 @@ conn.close()
 ```bash
 # 日志文件: tasks/ 目录下最新的 .output 文件
 # 搜索错误/超时
-grep -E "error|timeout|watchdog|completion_save_failed" tasks/<最新>.output
+grep -E "error|timeout|watchdog|completion_save_failed|finalize_streaming|orphan_streaming|worktree_soft_fail|worktree_recovered" tasks/<最新>.output
 
 # 跟踪最近 activity
 tail -30 tasks/<最新>.output
 ```
 
-### 清除僵尸消息
+### 清除僵尸消息（最后手段；正常应靠自愈）
+
+产品已有：启动清残留、每轮 chat 前清、`finalize_streaming_*` 收尾、game_time 30s 孤儿扫描。  
+仅当自愈失效（例如后端未加载新代码）时才手动：
+
 ```bash
 uv run python -c "
 import sqlite3, os
 pdb = os.path.join(os.path.expandvars('D:\\\\PC_AI\\\\Project\\\\TEST'), '.hiveweave', 'data.db')
 conn = sqlite3.connect(pdb)
-c = conn.execute(\"UPDATE chat_messages SET is_streaming=0, content='[对话被中断]' WHERE is_streaming=1\")
+c = conn.execute(\"UPDATE chat_messages SET is_streaming=0, content=CASE WHEN content IS NULL OR TRIM(content)='' THEN '[对话被中断]' ELSE content END WHERE is_streaming=1\")
 conn.commit(); print(f'Cleared {c.rowcount} zombie(s)'); conn.close()
+"
+```
+
+查 executor worktree 是否绑定：
+
+```bash
+uv run python -c "
+import sqlite3, os
+from pathlib import Path
+m=sqlite3.connect('apps/hiveweave-py/data/hiveweave.db')
+ws=m.execute('SELECT workspace_path FROM projects WHERE name=\"TEST\"').fetchone()[0]
+m.close()
+c=sqlite3.connect(str(Path(ws)/'.hiveweave'/'data.db')); c.row_factory=sqlite3.Row
+for a in c.execute(\"SELECT short_id,name,permission_type,workspace_path,worktree_error FROM agents ORDER BY short_id\"):
+    wp=a['workspace_path']; ok=bool(wp and Path(wp).exists() and (Path(wp)/'.git').exists())
+    print(a['short_id'], a['name'], a['permission_type'], 'wt_ok='+str(ok), a['worktree_error'])
+c.close()
 "
 ```
 

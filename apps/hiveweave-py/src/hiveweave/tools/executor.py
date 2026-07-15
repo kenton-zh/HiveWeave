@@ -192,20 +192,90 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["todos"],
     },
     "send_message": {
-        "description": "Sends a message to one or more specific recipients by name or agent ID. Use it to communicate directly with named agents. For convenience shortcuts, use message_subordinate, message_superior, or message_peer.",
+        "description": (
+            "Sends a message to agents. Prefer ask_agent (needs reply) or "
+            "notify_agent (FYI). Assistant text is private — recipients only see "
+            "tool-sent messages. Every turn must end with commit_turn."
+        ),
         "properties": {
             "recipients": {"type": "array", "aliases": ["recipient", "to", "targets"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
-            "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
+            "expectReport": {
+                "type": "boolean",
+                "aliases": ["expect_report"],
+                "description": (
+                    "Prefer ask_agent instead. True when recipient must reply. "
+                    "Also auto-set when message text clearly requests a reply."
+                ),
+            },
             "priority": {"type": "string", "aliases": ["level"]},
         },
         "required": ["recipients", "message"],
+    },
+    "ask_agent": {
+        "description": (
+            "Ask agents and REQUIRE a reply. Use for verification, opinions, "
+            "reports. Prefer over send_message(expectReport=true)."
+        ),
+        "properties": {
+            "recipients": {"type": "array", "aliases": ["recipient", "to", "targets", "target"]},
+            "message": {"type": "string", "aliases": ["content", "body", "text"]},
+            "priority": {"type": "string", "aliases": ["level"]},
+        },
+        "required": ["recipients", "message"],
+    },
+    "notify_agent": {
+        "description": (
+            "FYI notify — does NOT require a reply. Prefer for status broadcasts."
+        ),
+        "properties": {
+            "recipients": {"type": "array", "aliases": ["recipient", "to", "targets", "target"]},
+            "message": {"type": "string", "aliases": ["content", "body", "text"]},
+            "priority": {"type": "string", "aliases": ["level"]},
+        },
+        "required": ["recipients", "message"],
+    },
+    "commit_turn": {
+        "description": (
+            "MANDATORY end-of-turn return value (TurnResult). Every turn is a "
+            "function call — you MUST commit_turn before stopping. "
+            "phase: in_progress|waiting|blocked|done_slice. "
+            "waiting/blocked require waiting_on. Assistant text is NOT a return value."
+        ),
+        "properties": {
+            "phase": {
+                "type": "string",
+                "enum": ["in_progress", "waiting", "blocked", "done_slice"],
+            },
+            "summary": {
+                "type": "string",
+                "aliases": ["content", "message", "text"],
+                "description": "1-2 sentences: what this turn did",
+            },
+            "waitingOn": {
+                "type": "array",
+                "aliases": ["waiting_on"],
+                "description": (
+                    "Required for waiting/blocked. "
+                    "Items: {kind: agent|task|user|timer|external, ref: string, note?: string}"
+                ),
+            },
+            "result": {
+                "type": "object",
+                "description": "Data plane (replies/tasks/artifacts). May be {}",
+            },
+            "extensions": {
+                "type": "object",
+                "description": "Forward-compatible extensions. May be {}",
+            },
+        },
+        "required": ["phase", "summary"],
     },
     "hire_agent": {
         "description": "Creates and deploys a new agent with a specified name, role, goal, and backstory. Use it to bring new team members into the organization. Returns the new agent ID.",
         "properties": {
             "name": {"type": "string"},
-            "role": {"type": "string", "description": "Chinese job title. Display label only — does NOT determine permission. Use permissionType to set authority."},
+            "role": {"type": "string", "description": "Chinese job title (display label — does NOT set permission; use permissionType). For executors MUST include owned module, e.g. 签到排行榜工程师 / 认证API工程师 — NOT bare 前端工程师."},
             "permissionType": {
                 "type": "string",
                 "enum": ["coordinator", "executor"],
@@ -479,7 +549,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Dispatch + review —
     "dispatch_task": {
-        "description": "Delegate a task to a subordinate agent for execution. Automatically creates a Task Ledger entry — do NOT call create_task first. Returns task_id. If you already created a task via create_task, pass its taskId to avoid duplication.",
+        "description": "Deliver work to a subordinate NOW: creates/reuses a Task Ledger entry AND sends inbox (wakes them). Default for immediate work. If you already called create_task (draft or queue), pass taskId to avoid a duplicate. create_task alone does NOT wake anyone.",
         "properties": {
             "target": {"type": "string", "aliases": ["toAgentId", "to_agent_id", "recipient", "agentId"]},
             "task": {"type": "string", "aliases": ["description", "message", "content", "summary"]},
@@ -597,7 +667,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Task Ledger tools (Task 4) —
     "create_task": {
-        "description": "Create a new task in the Task Ledger. This is the recommended way to create tasks. Use instead of send_message for task assignment. Task starts in 'created' status. Use dispatch_task for delegation to a subordinate, or assign directly via assigneeId.",
+        "description": "Write a task into the Task Ledger only (status=created). Does NOT send inbox or wake anyone — even with assigneeId. Use for (1) drafting with acceptance criteria before dispatch_task(taskId=...), or (2) queue-only parking until ready. To actually assign and wake a subordinate, you MUST call dispatch_task.",
         "properties": {
             "title": {"type": "string", "aliases": ["name", "summary"]},
             "description": {"type": "string", "aliases": ["detail", "body"]},
@@ -632,7 +702,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": "Target status: 'running' or 'blocked'. Defaults to 'running'.",
                 "enum": ["running", "blocked"]},
             "blockedReason": {"type": "string",
-                "aliases": ["blocked_reason", "reason"]},
+                "aliases": ["blocked_reason", "reason"],
+                "description": "Required when blocked. Prefer prefixes: dependency:<id|why>, timer:<why>, user:<why>, external:<why>. Do not stay running while waiting."},
         },
         "required": ["taskId"],
     },
@@ -2071,7 +2142,15 @@ class ToolExecutor(TaskToolsMixin):
         if isinstance(recipients, (list, tuple)) and len(recipients) == 0:
             recipients = []
         message = args.get("message") or args.get("content") or args.get("body") or ""
-        expect_report = bool(args.get("expectReport") or args.get("expect_report") or False)
+        from hiveweave.services.reply_policy import resolve_expect_report
+
+        explicit = args.get("expectReport")
+        if explicit is None:
+            explicit = args.get("expect_report")
+        expect_report = resolve_expect_report(
+            bool(explicit) if explicit is not None else None,
+            message,
+        )
         priority = args.get("priority") or "normal"
 
         if not recipients:
@@ -2391,6 +2470,20 @@ class ToolExecutor(TaskToolsMixin):
                 )
             skills = valid_skills
 
+        # Hard org invariants
+        from hiveweave.services.org_invariants import validate_hire
+
+        existing = await self._org.list_agents(project_id)
+        hire_err = validate_hire(
+            agents=existing,
+            name=name,
+            role=role,
+            permission_type=perm_type,
+            parent_id=parent_id,
+        )
+        if hire_err:
+            return self._error(hire_err)
+
         attrs = {
             "project_id": project_id,
             "name": name,
@@ -2435,16 +2528,37 @@ class ToolExecutor(TaskToolsMixin):
                             worktree_path = wt_result["path"]
                             await self._org.update_agent(new_id, {
                                 "workspace_path": worktree_path,
+                                "worktree_error": None,
                             })
                             log.info("tool.hire_agent.worktree_created",
                                      agent_id=new_id, short_id=new_short,
                                      worktree=worktree_path)
+                        else:
+                            worktree_error = (
+                                wt_result.get("message")
+                                or "worktree create returned success=false"
+                            )
+                            await self._org.update_agent(new_id, {
+                                "worktree_error": worktree_error,
+                            })
+                            log.warning(
+                                "tool.hire_agent.worktree_soft_fail",
+                                agent_id=new_id,
+                                short_id=new_short,
+                                error=worktree_error,
+                            )
                 except Exception as wt_err:
                     log.warning("tool.hire_agent.worktree_failed",
                                 agent_id=new_id, error=str(wt_err))
                     worktree_error = str(wt_err)
                     # worktree 创建失败不阻断招聘 — agent 回退到项目根
                     # 但启动时会自动恢复（main.py lifespan step 2c）
+                    try:
+                        await self._org.update_agent(new_id, {
+                            "worktree_error": worktree_error,
+                        })
+                    except Exception:
+                        pass
 
             # BUG-010 修复：创建后立即启动 agent，让它能处理 inbox 消息。
             # 否则 hire_agent 创建的 executor 只是 DB 一行，无法消费任务。

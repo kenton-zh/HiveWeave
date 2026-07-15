@@ -438,7 +438,7 @@ class DispatchTaskParams(BaseModel):
 
 @tool(
     "dispatch_task",
-    "Dispatch a task to a subordinate agent. Resolves target by name, short_id, or UUID.",
+    "Deliver work NOW: ledger entry + inbox wake. Pass taskId if create_task already drafted/queued it.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -548,7 +548,7 @@ class CreateTaskParams(BaseModel):
 
 @tool(
     "create_task",
-    "Create a new task in the Task Ledger (status=created).",
+    "Ledger-only: draft or queue a task (status=created). Does NOT wake anyone — call dispatch_task to deliver.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -647,7 +647,10 @@ class UpdateTaskStatusParams(BaseModel):
     blocked_reason: str | None = Field(
         default=None,
         alias="blockedReason",
-        description="Reason for blocking (used when status='blocked').",
+        description=(
+            "Required when blocked. Prefer typed prefixes: "
+            "dependency:<taskId|why>, timer:<why>, user:<why>, external:<why>."
+        ),
         json_schema_extra={"aliases": ["blockedReason", "blocked_reason", "reason"]},
     )
 
@@ -1117,6 +1120,7 @@ async def nudge_verify_tasks_after_merge(
     nudged = 0
     from hiveweave.services.inbox import InboxService
     from hiveweave.agents.trigger import trigger_subordinate
+    from hiveweave.db import meta as meta_db
 
     inbox = InboxService()
     for t in tasks:
@@ -1128,20 +1132,29 @@ async def nudge_verify_tasks_after_merge(
         assignee = t.get("assignee_id")
         if not assignee:
             continue
-        await inbox.send_message(
-            from_agent_id=from_agent_id,
-            to_agent_id=assignee,
-            message=(
-                f"[POST-MERGE VERIFY] Worktree merge completed. "
-                f"Run final verification NOW on main for task "
-                f"'{t.get('title', '')[:60]}' (id={t.get('id')}). "
-                f"claim_task if needed, run tests on main, then "
-                f"submit_task(testsPassed=true, testOutput=...)."
-            ),
-            message_type="task",
-            priority="urgent",
-            task_id=t.get("id"),
+        dest = await meta_db.get_agent_by_id(assignee)
+        if not dest or (dest.get("status") or "") != "active":
+            continue
+        await inbox.supersede_watchdog_messages(
+            assignee, prefixes=["[POST-MERGE VERIFY]"]
         )
+        try:
+            await inbox.send_message(
+                from_agent_id=from_agent_id,
+                to_agent_id=assignee,
+                message=(
+                    f"[POST-MERGE VERIFY] Worktree merge completed. "
+                    f"Run final verification NOW on main for task "
+                    f"'{t.get('title', '')[:60]}' (id={t.get('id')}). "
+                    f"claim_task if needed, run tests on main, then "
+                    f"submit_task(testsPassed=true, testOutput=...)."
+                ),
+                message_type="task",
+                priority="urgent",
+                task_id=t.get("id"),
+            )
+        except ValueError:
+            continue
         await trigger_subordinate(assignee)
         nudged += 1
     if nudged:

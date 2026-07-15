@@ -113,6 +113,11 @@ class ChatMessageService:
 
         conn = await project_db.get_project_db_for_agent(agent_id)
         if conn is None:
+            log.warning(
+                "update_message_no_db",
+                agent_id=agent_id,
+                msg_id=msg_id,
+            )
             return False
         cursor = await conn.execute(
             f"UPDATE chat_messages SET {', '.join(fields)} "
@@ -120,7 +125,75 @@ class ChatMessageService:
         await conn.commit()
         ok = cursor.rowcount > 0
         await cursor.close()
+        if not ok:
+            log.warning(
+                "update_message_no_row",
+                agent_id=agent_id,
+                msg_id=msg_id,
+                fields=list(attrs.keys()),
+            )
         return ok
+
+    async def finalize_streaming_message(
+        self,
+        agent_id: str,
+        msg_id: str | None,
+        attrs: dict | None = None,
+        *,
+        allow_agent_wide_fallback: bool = True,
+    ) -> bool:
+        """Guarantee ``is_streaming=0`` for a turn's placeholder.
+
+        Root cause of orphan zombies: callers treated ``update_message`` as
+        success even when it returned False (no DB / no row), cleared the
+        in-memory msg id, and left the DB row streaming forever.
+
+        Strategy:
+        1. UPDATE the specific row with ``is_streaming=0`` (+ optional fields).
+        2. If that fails and ``allow_agent_wide_fallback``, clear ALL streaming
+           rows for this agent (safe when the turn is ending and no newer
+           placeholder should exist yet).
+        3. Returns True if the flag is known cleared; False only if both
+           attempts failed (caller should log; runtime sweep is last resort).
+        """
+        payload = dict(attrs or {})
+        payload["is_streaming"] = False
+
+        ok = False
+        if msg_id:
+            try:
+                ok = await self.update_message(agent_id, msg_id, payload)
+            except Exception as e:
+                log.warning(
+                    "finalize_streaming_update_failed",
+                    agent_id=agent_id,
+                    msg_id=msg_id,
+                    error=str(e),
+                )
+                ok = False
+
+        if ok:
+            return True
+
+        if not allow_agent_wide_fallback:
+            return False
+
+        try:
+            await self.update_streaming_messages_done(agent_id)
+            log.warning(
+                "finalize_streaming_used_agent_wide_fallback",
+                agent_id=agent_id,
+                msg_id=msg_id,
+            )
+            return True
+        except Exception as e:
+            log.error(
+                "finalize_streaming_failed",
+                agent_id=agent_id,
+                msg_id=msg_id,
+                error=str(e),
+            )
+            return False
 
     async def get_messages(
         self, agent_id: str, limit: int = 200, offset: int = 0
@@ -152,12 +225,86 @@ class ChatMessageService:
         """Mark all streaming messages for an agent as done (is_streaming=0).
 
         契约 17: 用于 safety_timeout / :DOWN handler，防止崩溃后僵尸流式消息。
+        Empty content is stamped so the UI does not show a blank bubble forever.
         """
         await project_db.execute(
             agent_id,
-            "UPDATE chat_messages SET is_streaming = 0 "
+            "UPDATE chat_messages SET is_streaming = 0, "
+            "content = CASE "
+            "  WHEN content IS NULL OR TRIM(content) = '' "
+            "  THEN '[对话被中断]' ELSE content END "
             "WHERE agent_id = ? AND is_streaming = 1",
-            [agent_id])
+            [agent_id],
+        )
+
+    async def clear_orphan_streaming(
+        self,
+        project_id: str,
+        *,
+        protect_agent_ids: set[str] | frozenset[str] | None = None,
+        hard_age_ms: int = 11 * 60 * 1000,
+    ) -> int:
+        """Auto-heal stuck streaming rows for one project (runtime, not only boot).
+
+        A message is an orphan when ``is_streaming=1`` and either:
+        - its agent is **not** currently PROCESSING (idle / dead / never started), or
+        - it is older than ``hard_age_ms`` (past the 10min safety timeout).
+
+        Legitimate in-flight streams (agent in ``protect_agent_ids`` and young)
+        are left alone. Returns number of rows cleared.
+        """
+        import time as _time
+
+        protect = set(protect_agent_ids or ())
+        now_ms = int(_time.time() * 1000)
+        cutoff = now_ms - hard_age_ms
+        try:
+            conn = await project_db.get_project_db_by_project_id(project_id)
+            if conn is None:
+                return 0
+
+            if protect:
+                placeholders = ", ".join("?" * len(protect))
+                sql = (
+                    "UPDATE chat_messages SET is_streaming = 0, "
+                    "content = CASE "
+                    "  WHEN content IS NULL OR TRIM(content) = '' "
+                    "  THEN '[对话被中断]' ELSE content END "
+                    f"WHERE is_streaming = 1 AND ("
+                    f"  agent_id NOT IN ({placeholders}) OR created_at < ?"
+                    f")"
+                )
+                params: list = [*protect, cutoff]
+            else:
+                # No agent processing — every streaming row is a zombie
+                sql = (
+                    "UPDATE chat_messages SET is_streaming = 0, "
+                    "content = CASE "
+                    "  WHEN content IS NULL OR TRIM(content) = '' "
+                    "  THEN '[对话被中断]' ELSE content END "
+                    "WHERE is_streaming = 1"
+                )
+                params = []
+
+            cursor = await conn.execute(sql, params)
+            cleared = cursor.rowcount or 0
+            await conn.commit()
+            await cursor.close()
+            if cleared:
+                log.info(
+                    "orphan_streaming_cleared",
+                    project_id=project_id,
+                    cleared=cleared,
+                    protected=len(protect),
+                )
+            return cleared
+        except Exception as e:
+            log.warning(
+                "clear_orphan_streaming_failed",
+                project_id=project_id,
+                error=str(e),
+            )
+            return 0
 
     async def mark_as_read(self, agent_id: str, msg_ids: list[str]) -> int:
         """Mark messages as read by ID list. Returns count marked.
@@ -242,7 +389,10 @@ class ChatMessageService:
                 try:
                     conn = await project_db.ensure_project_db(workspace)
                     await conn.execute(
-                        "UPDATE chat_messages SET is_streaming = 0 "
+                        "UPDATE chat_messages SET is_streaming = 0, "
+                        "content = CASE "
+                        "  WHEN content IS NULL OR TRIM(content) = '' "
+                        "  THEN '[对话被中断]' ELSE content END "
                         "WHERE is_streaming = 1")
                     await conn.commit()
                 except Exception as e:

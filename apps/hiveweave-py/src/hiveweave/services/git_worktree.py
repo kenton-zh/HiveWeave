@@ -220,23 +220,52 @@ coverage/
             return {"success": True, "path": path, "branch": branch,
                     "message": "worktree already exists"}
 
-        # Stale directory cleanup: if the worktree directory exists but .git
-        # is missing (e.g., partial deletion), git worktree add will fail with
-        # "'<path>' already exists". Remove the stale directory and prune.
+        # Stale cleanup. Two failure modes we must handle before add:
+        # 1) Path exists but is not a valid worktree (partial delete) →
+        #    `worktree add` fails with "'<path>' already exists".
+        # 2) Path is gone but git still has a registered worktree entry →
+        #    add fails with "is a missing but registered worktree" until prune.
+        # Always prune when the target is not a valid worktree.
         if Path(path).exists():
-            import shutil as _shutil
-            _shutil.rmtree(path, ignore_errors=True)
-            await _git(["worktree", "prune"], workspace_path)
-            # Also delete stale branch ref so -B doesn't conflict
-            await _git(["branch", "-D", branch], workspace_path)
+            shutil.rmtree(path, ignore_errors=True)
+        await _git(["worktree", "prune"], workspace_path)
+
+        fwd_path = path.replace("\\", "/")
+
+        # If the agent branch already exists (worktree dir deleted but branch
+        # kept), attach to it — do NOT -B reset, or we wipe executor commits.
+        ok_list, branch_list = await _git(
+            ["branch", "--list", branch], workspace_path
+        )
+        branch_exists = bool(
+            ok_list and any(
+                ln.strip().lstrip("* ").strip() == branch
+                for ln in branch_list.splitlines()
+                if ln.strip()
+            )
+        )
+        if branch_exists:
+            ok, out = await _git(
+                ["worktree", "add", fwd_path, branch], workspace_path
+            )
+            if ok:
+                log.info("git_worktree.create", short_id=short_id,
+                         branch=branch, base="existing-branch")
+                return {"success": True, "path": path, "branch": branch}
+            last_error = out
+            # Fall through: branch may be checked out elsewhere; try -B paths
+        else:
+            last_error = ""
 
         # 3-level fallback: origin/<base> → <base> → HEAD
         # HEAD 作为最终兜底（当前分支），避免在只有 main 的仓库上尝试不存在的 master
-        fwd_path = path.replace("\\", "/")
+        # Use -b (create) when branch was absent; -B only as last resort after
+        # attach failed (e.g. branch locked by another worktree).
+        flag = "-B" if branch_exists else "-b"
         attempts = [
-            ["worktree", "add", fwd_path, "-B", branch, f"origin/{base_branch}"],
-            ["worktree", "add", fwd_path, "-B", branch, base_branch],
-            ["worktree", "add", fwd_path, "-B", branch, "HEAD"],
+            ["worktree", "add", fwd_path, flag, branch, f"origin/{base_branch}"],
+            ["worktree", "add", fwd_path, flag, branch, base_branch],
+            ["worktree", "add", fwd_path, flag, branch, "HEAD"],
         ]
         for args in attempts:
             ok, out = await _git(args, workspace_path)
@@ -249,7 +278,6 @@ coverage/
         log.error("git_worktree.create_failed", short_id=short_id,
                   path=path, branch=branch, error=last_error)
         return {"success": False, "message": f"Failed to create worktree: {last_error}"}
-
     # ── 2. CHECKPOINT ────────────────────────────────────────
 
     async def checkpoint(self, workspace_path: str, short_id: str,

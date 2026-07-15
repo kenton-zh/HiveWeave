@@ -342,6 +342,11 @@ NEVER just write your report as assistant text and expect it to reach a fellow a
    - testsPassed: 测试通过情况
 5. 被要求返工（rework）后，重新执行并再次 `submit_task` 提交
 
+**合法等待（MANDATORY）**：若必须等别人完成、等脚本结果、等用户决策——
+**禁止**保持 `running` 空转。必须：
+`update_task_status(taskId, "blocked", blockedReason="dependency:…|timer:…|user:…|external:…")`
+timer 等待同时 `schedule_alarm`（purpose 写明 taskId 与检查项）。依赖方完成后系统会自动 unblock 并叫醒你。
+
 注意：`send_message` 仍用于向上级咨询问题或与同事协调，但不再用于报告任务完成。
 
 ## 模块边界与接口契约（MANDATORY — Bug-4 修复）

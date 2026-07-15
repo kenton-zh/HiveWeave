@@ -54,7 +54,24 @@ class InboxService:
 
         Writes to the per-project DB routed via to_agent_id.
         Returns the created message dict.
+        Raises ValueError if recipient is archived (dead mailbox).
         """
+        # Refuse mail to archived agents — otherwise watchdogs + coordinators
+        # fill ghost inboxes that trigger will never ACK.
+        try:
+            from hiveweave.db import meta as meta_db
+
+            dest = await meta_db.get_agent_by_id(to_agent_id)
+            if dest and (dest.get("status") or "") == "archived":
+                raise ValueError(
+                    f"Cannot message archived agent {to_agent_id[:12]} "
+                    f"({dest.get('name', '?')})"
+                )
+        except ValueError:
+            raise
+        except Exception as e:
+            log.warning("inbox_archived_check_failed", error=str(e))
+
         await _ensure_schema(to_agent_id)
         msg_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
@@ -128,6 +145,37 @@ class InboxService:
             agent_id,
             "UPDATE inbox SET read = 1 WHERE to_agent_id = ? AND read = 0",
             [agent_id])
+
+    async def supersede_watchdog_messages(
+        self, agent_id: str, prefixes: list[str] | None = None
+    ) -> int:
+        """Mark prior watchdog/nudge rows read before inserting a replacement.
+
+        Prevents additive backlog: each stall tick used to INSERT without
+        clearing the previous urgent nudge.
+        """
+        await _ensure_schema(agent_id)
+        prefixes = prefixes or (
+            "[TASK WATCHDOG]",
+            "[WATCHDOG]",
+            "[POST-MERGE VERIFY]",
+        )
+        # Build OR of LIKE clauses
+        clauses = " OR ".join(["message LIKE ?" for _ in prefixes])
+        params = [agent_id] + [f"{p}%" for p in prefixes]
+        try:
+            await project_db.execute(
+                agent_id,
+                f"UPDATE inbox SET read = 1 WHERE to_agent_id = ? AND read = 0 "
+                f"AND ({clauses})",
+                params,
+            )
+            return 1
+        except Exception as e:
+            log.warning(
+                "supersede_watchdog_failed", agent_id=agent_id, error=str(e)
+            )
+            return 0
 
     async def get_unread_count(self, agent_id: str) -> int:
         """Get unread message count for an agent."""
