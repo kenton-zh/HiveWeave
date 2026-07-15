@@ -98,6 +98,8 @@ class InboxService:
         )
         if wake is None:
             active_waits = None
+            from_name = None
+            from_short = None
             try:
                 from hiveweave.db import meta as meta_db
                 from hiveweave.services.wait_contract import wait_contract_service
@@ -107,12 +109,36 @@ class InboxService:
                     active_waits = await wait_contract_service.list_active(
                         pid, to_agent_id
                     )
+                # Resolve sender 花名/short_id — Wait Contract refs use names
+                try:
+                    sender = await meta_db.get_agent_by_id(from_agent_id)
+                    if sender:
+                        from_name = sender.get("name")
+                        from_short = sender.get("short_id")
+                except Exception:
+                    pass
+                if not from_name:
+                    try:
+                        row = await project_db.query_one(
+                            to_agent_id,
+                            "SELECT name, short_id FROM agents WHERE id = ?",
+                            [from_agent_id],
+                        )
+                        if row:
+                            from_name = row["name"] if "name" in row.keys() else None
+                            from_short = (
+                                row["short_id"] if "short_id" in row.keys() else None
+                            )
+                    except Exception:
+                        pass
             except Exception as e:
                 log.debug("inbox_wait_lookup_failed", error=str(e))
             wake_flag = should_wake(
                 category,
                 disposition=recipient_disposition,
                 from_agent_id=from_agent_id,
+                from_agent_name=from_name,
+                from_short_id=from_short,
                 active_waits=active_waits or None,
             )
         else:

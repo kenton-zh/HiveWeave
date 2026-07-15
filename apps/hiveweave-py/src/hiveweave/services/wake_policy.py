@@ -80,6 +80,8 @@ def should_wake(
     *,
     disposition: str | None = None,
     from_agent_id: str | None = None,
+    from_agent_name: str | None = None,
+    from_short_id: str | None = None,
     active_waits: list[dict] | None = None,
 ) -> bool:
     """Whether delivering this message may start an LLM turn.
@@ -98,7 +100,11 @@ def should_wake(
 
         event = category_to_wake_event(category, from_agent_id=from_agent_id)
         if not event_matches_waits(
-            active_waits, event=event, from_agent_id=from_agent_id
+            active_waits,
+            event=event,
+            from_agent_id=from_agent_id,
+            from_agent_name=from_agent_name,
+            from_short_id=from_short_id,
         ):
             return False
         # Matched a wait — still apply waiting_human hardening below if needed
