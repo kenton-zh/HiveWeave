@@ -374,7 +374,7 @@ async def list_projects(status: str | None = Query(default=None)) -> dict:
     前端可通过 GET /api/projects/{id} 获取完整详情（含 charter 等）。
     """
     rows = await meta_db.query(
-        "SELECT id, name, workspace_path, created_at FROM projects ORDER BY created_at DESC"
+        "SELECT id, name, workspace_path, is_started, created_at FROM projects ORDER BY created_at DESC"
     )
     active_id = await _get_active_project_id()
     projects = [_project_response(dict(r), active_id) for r in rows]
@@ -583,7 +583,7 @@ async def create_project(body: ProjectCreate) -> dict:
         log.warning("start_game_time_after_create_failed", project_id=project_id, error=str(e))
 
     row = await meta_db.query_one(
-        "SELECT id, name, workspace_path, created_at FROM projects WHERE id = ?",
+        "SELECT id, name, workspace_path, is_started, created_at FROM projects WHERE id = ?",
         [project_id],
     )
     # 合并 project_meta (per-project DB) 到响应中
@@ -607,7 +607,7 @@ async def get_project(project_id: str) -> dict:
     其余字段（description, charter_json, language 等）从 per-project DB project_meta 表读取。
     """
     row = await meta_db.query_one(
-        "SELECT id, name, workspace_path, created_at FROM projects WHERE id = ?",
+        "SELECT id, name, workspace_path, is_started, created_at FROM projects WHERE id = ?",
         [project_id],
     )
     if row is None:
@@ -642,7 +642,7 @@ async def get_project(project_id: str) -> dict:
 
 async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
     row = await meta_db.query_one(
-        "SELECT id, name, workspace_path, created_at FROM projects WHERE id = ?",
+        "SELECT id, name, workspace_path, is_started, created_at FROM projects WHERE id = ?",
         [project_id],
     )
     if row is None:
@@ -737,7 +737,7 @@ async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
 
     # ── Build response ─────────────────────────────────────
     updated = await meta_db.query_one(
-        "SELECT id, name, workspace_path, created_at FROM projects WHERE id = ?",
+        "SELECT id, name, workspace_path, is_started, created_at FROM projects WHERE id = ?",
         [project_id],
     )
     row_dict = dict(updated) if updated else {}
