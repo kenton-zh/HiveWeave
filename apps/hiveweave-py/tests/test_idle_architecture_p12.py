@@ -157,6 +157,38 @@ def test_wait_ref_matches_flower_name_not_just_uuid():
         is False
     )
 
+
+def test_command_pierces_timer_external_waits():
+    """CEO npm-install nudge must wake blocked 白鹭 despite timer wait."""
+    waits = [
+        {
+            "kind": "timer",
+            "ref": "alarm-1",
+            "wakeOn": ["alarm", "timeout"],  # legacy contract without message_from_ref
+        }
+    ]
+    assert (
+        should_wake(
+            "command",
+            disposition="blocked",
+            from_agent_id="ceo-uuid",
+            from_agent_name="归零",
+            from_short_id="A001",
+            active_waits=waits,
+        )
+        is True
+    )
+    assert (
+        should_wake(
+            "progress",
+            disposition="blocked",
+            from_agent_id="ceo-uuid",
+            from_agent_name="归零",
+            active_waits=waits,
+        )
+        is False
+    )
+
 def test_category_to_wake_event():
     assert category_to_wake_event("command", from_agent_id="user") == "user_message"
     assert category_to_wake_event("task_transition") == "task_transition"

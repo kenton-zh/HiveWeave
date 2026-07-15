@@ -99,15 +99,25 @@ def should_wake(
         )
 
         event = category_to_wake_event(category, from_agent_id=from_agent_id)
-        if not event_matches_waits(
+        matched = event_matches_waits(
             active_waits,
             event=event,
             from_agent_id=from_agent_id,
             from_agent_name=from_agent_name,
             from_short_id=from_short_id,
-        ):
-            return False
-        # Matched a wait — still apply waiting_human hardening below if needed
+        )
+        if not matched:
+            # Timer/external/task waits must not swallow superior commands —
+            # otherwise blocked workers stay dead after npm-install nudges.
+            # Agent-waits still require sender match (no pierce).
+            kinds = {(w.get("kind") or "") for w in (active_waits or [])}
+            pierce_ok = bool(kinds) and kinds <= {"timer", "external", "task"}
+            if not (
+                pierce_ok
+                and category in ("command", "ask", "approval", "task_transition")
+            ):
+                return False
+        # Matched (or timer/external pierce) — still apply waiting_human below
 
     if disposition == "waiting_human":
         # Only user replies or new task transitions wake a waiting_human agent
