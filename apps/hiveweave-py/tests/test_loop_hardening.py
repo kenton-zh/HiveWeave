@@ -218,10 +218,26 @@ class TestVerificationGates:
             ts, pid, env["coordinator_id"], parent
         )
 
-        with patch(
-            "hiveweave.agents.trigger.trigger_subordinate",
-            AsyncMock(),
-        ) as trig:
+        async def fake_get_agent(aid: str):
+            if aid == env["executor_id"]:
+                return {
+                    "id": aid,
+                    "name": "Exec",
+                    "status": "active",
+                    "project_id": pid,
+                }
+            return None
+
+        with (
+            patch(
+                "hiveweave.db.meta.get_agent_by_id",
+                new=fake_get_agent,
+            ),
+            patch(
+                "hiveweave.agents.trigger.trigger_subordinate",
+                AsyncMock(),
+            ) as trig,
+        ):
             nudged = await nudge_verify_tasks_after_merge(
                 pid, env["coordinator_id"]
             )

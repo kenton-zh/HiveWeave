@@ -196,7 +196,7 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 - `InboxService.send_message` 拒投 archived；stall / reply-watchdog / post-merge nudge 只碰 active，且 `supersede_watchdog_messages` 先清旧催办再插新（upsert）
 - 纠偏优先序：`transfer_agent` → `bind_skill` → 才 `dismiss`+hire
 
-### 合法 Idle（P0）
+### 合法 Idle（P0–P2）
 
 不要把「有消息 / 有义务 / 跑 LLM / UI 忙」绑成一件事：
 
@@ -205,6 +205,16 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 - gate 只校验：缺 commit 最多修 1 次；账本不一致停泊；连续无进展 → blocked
 - inbox 分级：progress/ACK（含「全部完成」）`wake=0` 不触发 LLM；`waiting_human` 时仅用户/新任务可唤醒
 - 平台保留端口 `4000/5173/4173`；项目用 `start_dev_server`；禁止裸 `vite`/`npm run dev` 默认撞 5173
+
+**P1**
+- Wait Contract：`commit_turn(waiting|blocked)` 持久化到 `agent_waits`（ref / wake_on / expires_at / obligation_version）；唤醒须匹配 contract
+- single-flight：busy 时 trigger 入队；收工后 300ms 合并窗口 coalesce 多次 trigger
+- `GET /api/debug/agents/{id}/runtime` → RuntimeSnapshot（execution / disposition / waits / obligations）
+
+**P2**
+- `prepare_spawn_command` / `spawn_project_process`：拦截保留端口，裸 vite 自动改写到项目端口
+- `heal_project_executor_worktrees`：`start_project_agents` 前自愈缺失 worktree
+- `GET /api/debug/metrics`：wake 原因 / 无进展熔断 / inbox dedupe 计数
 
 ### Game time
 

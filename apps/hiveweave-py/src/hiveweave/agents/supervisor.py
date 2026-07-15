@@ -250,6 +250,26 @@ class AgentManager:
                     error=str(e),
                 )
 
+            # P2: heal executor worktrees before first LLM turn
+            try:
+                from hiveweave.services.git_worktree import (
+                    heal_project_executor_worktrees,
+                )
+
+                healed = await heal_project_executor_worktrees(project_id)
+                if healed.get("recovered") or healed.get("failed"):
+                    log.info(
+                        "worktree_heal_before_start",
+                        project_id=project_id,
+                        **healed,
+                    )
+            except Exception as e:
+                log.warning(
+                    "worktree_heal_before_start_failed",
+                    project_id=project_id,
+                    error=str(e),
+                )
+
             cursor = await conn.execute(
                 "SELECT id, project_id, name, role, permission_type as role_type, backstory, "
                 "model_id, goal, permission_mode, bound_skills, "

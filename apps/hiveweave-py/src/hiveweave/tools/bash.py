@@ -621,16 +621,21 @@ class RunCommandParams(BaseModel):
 )
 async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolResult:
     """Execute a bash command."""
-    from hiveweave.services.process_registry import check_command_reserved_ports
+    from hiveweave.services.process_registry import prepare_spawn_command
+    from hiveweave.tools.helpers import get_project_id
 
-    reserved_err = check_command_reserved_ports(params.command)
+    project_id = await get_project_id(agent_id)
+    cmd, _env, reserved_err = prepare_spawn_command(
+        params.command, project_id=project_id
+    )
     if reserved_err:
         return ToolResult.err(reserved_err)
     result = await execute_bash(
-        command=params.command,
+        command=cmd,
         workdir="",
         workspace_path=workspace,
         timeout_ms=params.timeout,
+        project_id=project_id,
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])
@@ -646,13 +651,17 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
 )
 async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: str) -> ToolResult:
     """Execute a command with explicit cwd."""
-    from hiveweave.services.process_registry import check_command_reserved_ports
+    from hiveweave.services.process_registry import prepare_spawn_command
+    from hiveweave.tools.helpers import get_project_id
 
-    reserved_err = check_command_reserved_ports(params.command)
+    project_id = await get_project_id(agent_id)
+    cmd, _env, reserved_err = prepare_spawn_command(
+        params.command, project_id=project_id
+    )
     if reserved_err:
         return ToolResult.err(reserved_err)
     result = await execute_run_command(
-        command=params.command,
+        command=cmd,
         cwd=params.cwd,
         timeout_ms=params.timeout,
         workspace_path=workspace,

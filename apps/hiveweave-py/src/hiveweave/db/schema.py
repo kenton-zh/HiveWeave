@@ -311,6 +311,22 @@ PROJECT_DB_TABLES = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS agent_waits (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        ref TEXT NOT NULL,
+        wake_on TEXT NOT NULL DEFAULT '[]',
+        expires_at INTEGER,
+        obligation_version TEXT,
+        phase TEXT,
+        note TEXT,
+        created_at INTEGER NOT NULL,
+        cleared_at INTEGER
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS team_chat_dedupe (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,

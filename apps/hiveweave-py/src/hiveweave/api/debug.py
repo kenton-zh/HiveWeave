@@ -45,6 +45,83 @@ async def agent_state(agent_id: str) -> dict:
     }
 
 
+@router.get("/agents/{agent_id}/runtime")
+async def agent_runtime_snapshot(agent_id: str) -> dict:
+    """P1 RuntimeSnapshot: execution / disposition / visibility / waits / obligations."""
+    config = await meta_db.get_agent_by_id(agent_id)
+    if config is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    project_id = await meta_db.get_agent_project_id(agent_id)
+    if not project_id:
+        raise HTTPException(status_code=404, detail="Agent project not found")
+
+    agent = agent_manager.get_agent(agent_id)
+    execution = "processing" if (agent and agent.status.value == "processing") else "idle"
+    if agent and getattr(agent, "disposition", None) == "blocked":
+        # no-progress faulted sits in idle+blocked; surface as faulted hint
+        pass
+    disposition = getattr(agent, "disposition", None) or "runnable"
+    visibility = getattr(agent, "visibility", None) or "foreground"
+    queue_len = len(getattr(agent, "_message_queue", []) or []) if agent else 0
+    slice_budget = getattr(agent, "_slice_budget", 0) if agent else 0
+    no_progress = getattr(agent, "_no_progress_streak", 0) if agent else 0
+
+    waits: list = []
+    try:
+        from hiveweave.services.wait_contract import wait_contract_service
+
+        waits = await wait_contract_service.list_active(project_id, agent_id)
+    except Exception as e:
+        log.warning("runtime_waits_failed", agent_id=agent_id, error=str(e))
+
+    obligations: list = []
+    try:
+        from hiveweave.services.task import TaskService
+
+        obligations = await TaskService().get_actionable_obligations(
+            project_id, agent_id
+        )
+    except Exception as e:
+        log.warning("runtime_obligations_failed", agent_id=agent_id, error=str(e))
+
+    return {
+        "agentId": agent_id,
+        "projectId": project_id,
+        "execution": execution,
+        "disposition": disposition,
+        "visibility": visibility,
+        "waits": waits,
+        "obligations": [
+            {
+                "id": t.get("id"),
+                "title": t.get("title"),
+                "status": t.get("status"),
+                "assigneeId": t.get("assignee_id"),
+                "creatorId": t.get("creator_id"),
+            }
+            for t in obligations
+        ],
+        "queueLen": queue_len,
+        "sliceBudget": slice_budget,
+        "noProgressStreak": no_progress,
+        "inMemory": agent is not None,
+        "name": config.get("name"),
+        "role": config.get("role"),
+    }
+
+
+@router.get("/metrics")
+async def debug_metrics() -> dict:
+    """P2 observability counters (wake / no-progress / inbox dedupe)."""
+    from hiveweave.services import process_registry as preg
+    from hiveweave.services.telemetry import telemetry
+
+    return {
+        "counters": telemetry.snapshot_counters(),
+        "processRegistrySize": len(preg._registry),
+    }
+
+
 @router.get("/agents/{agent_id}/conversation")
 async def conversation_dump(agent_id: str) -> dict:
     """对话历史 dump（conversation_turns 表）。"""

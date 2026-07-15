@@ -27,11 +27,15 @@ AGENT_CHAT_DONE = "agent.chat_done"
 AGENT_CRASH = "agent.crash"
 CIRCUIT_OPEN = "circuit.open"
 CIRCUIT_CLOSE = "circuit.close"
+AGENT_WAKE = "agent.wake"
+AGENT_NO_PROGRESS = "agent.no_progress_fault"
+INBOX_DEDUPED = "inbox.deduped"
 
 ALL_EVENTS = frozenset({
     LLM_STREAM_START, LLM_STREAM_CHUNK, LLM_STREAM_DONE, LLM_STREAM_FAIL,
     AGENT_CHAT_START, AGENT_CHAT_DONE, AGENT_CRASH,
     CIRCUIT_OPEN, CIRCUIT_CLOSE,
+    AGENT_WAKE, AGENT_NO_PROGRESS, INBOX_DEDUPED,
 })
 
 
@@ -45,26 +49,68 @@ class Telemetry:
 
     def __init__(self) -> None:
         self._handlers: list[Callable[[str, dict], None]] = []
+        # P2: in-process counters for GET /api/debug/metrics
+        self._counters: dict[str, int] = {
+            "wake_total": 0,
+            "wake_by_reason": 0,  # placeholder; use _wake_reasons
+            "no_progress_faults": 0,
+            "inbox_deduped": 0,
+        }
+        self._wake_reasons: dict[str, int] = {}
 
     def add_handler(self, handler: Callable[[str, dict], None]) -> None:
         """Register a custom event handler."""
         self._handlers.append(handler)
 
+    def snapshot_counters(self) -> dict[str, Any]:
+        """Return a copy of observability counters (P2)."""
+        return {
+            "wake_total": self._counters.get("wake_total", 0),
+            "wake_by_reason": dict(self._wake_reasons),
+            "no_progress_faults": self._counters.get("no_progress_faults", 0),
+            "inbox_deduped": self._counters.get("inbox_deduped", 0),
+        }
+
+    def reset_counters_for_tests(self) -> None:
+        self._counters = {
+            "wake_total": 0,
+            "wake_by_reason": 0,
+            "no_progress_faults": 0,
+            "inbox_deduped": 0,
+        }
+        self._wake_reasons.clear()
+
     def emit(self, event_name: str, payload: dict | None = None) -> None:
         """Dispatch a telemetry event to all handlers + structlog."""
         data = payload or {}
 
+        # P2 counters
+        if event_name == AGENT_WAKE:
+            self._counters["wake_total"] = self._counters.get("wake_total", 0) + 1
+            reason = str(data.get("reason") or "unknown")
+            self._wake_reasons[reason] = self._wake_reasons.get(reason, 0) + 1
+        elif event_name == AGENT_NO_PROGRESS:
+            self._counters["no_progress_faults"] = (
+                self._counters.get("no_progress_faults", 0) + 1
+            )
+        elif event_name == INBOX_DEDUPED:
+            self._counters["inbox_deduped"] = (
+                self._counters.get("inbox_deduped", 0) + 1
+            )
+
         # Default dispatch: structured logging via structlog
         if event_name.startswith("llm"):
-            logger.debug("telemetry.llm", event=event_name, **data)
+            logger.debug("telemetry.llm", telem_event=event_name, **data)
         elif event_name == AGENT_CRASH:
             logger.warning("telemetry.agent_crash", **data)
         elif event_name.startswith("agent"):
-            logger.debug("telemetry.agent", event=event_name, **data)
+            logger.debug("telemetry.agent", telem_event=event_name, **data)
         elif event_name.startswith("circuit"):
-            logger.info("telemetry.circuit", event=event_name, **data)
+            logger.info("telemetry.circuit", telem_event=event_name, **data)
+        elif event_name.startswith("inbox"):
+            logger.info("telemetry.inbox", telem_event=event_name, **data)
         else:
-            logger.info("telemetry.event", event=event_name, **data)
+            logger.info("telemetry.event", telem_event=event_name, **data)
 
         # Custom handlers
         for handler in self._handlers:
@@ -156,6 +202,24 @@ class Telemetry:
     def circuit_close(self, provider: str) -> None:
         self.emit(CIRCUIT_CLOSE, {
             "provider": provider, "system_time": time.time(),
+        })
+
+    def agent_wake(self, agent_id: str, reason: str, **extra: Any) -> None:
+        self.emit(AGENT_WAKE, {
+            "agent_id": agent_id, "reason": reason, **extra,
+            "system_time": time.time(),
+        })
+
+    def agent_no_progress(self, agent_id: str, streak: int = 0) -> None:
+        self.emit(AGENT_NO_PROGRESS, {
+            "agent_id": agent_id, "streak": streak,
+            "system_time": time.time(),
+        })
+
+    def inbox_deduped(self, to_agent_id: str, category: str = "") -> None:
+        self.emit(INBOX_DEDUPED, {
+            "to_agent_id": to_agent_id, "category": category,
+            "system_time": time.time(),
         })
 
 

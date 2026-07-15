@@ -18,7 +18,7 @@ _PROGRESS_PATTERNS = (
     re.compile(r"三人交付全部"),
     re.compile(r"^\[TASK WATCHDOG\]"),
     re.compile(r"^\[WATCHDOG\]"),
-    re.compile(r"^\[POST-MERGE VERIFY\]"),
+    # NOTE: [POST-MERGE VERIFY] is a real work order — not progress
     re.compile(r"done_slice", re.I),
     re.compile(r"已汇报"),
     re.compile(r"无需处理"),
@@ -27,6 +27,7 @@ _PROGRESS_PATTERNS = (
 _TASK_TRANSITION_PATTERNS = (
     re.compile(r"^\[TASK SUBMITTED\]"),
     re.compile(r"^\[TASK\s", re.I),
+    re.compile(r"^\[POST-MERGE VERIFY\]"),
 )
 
 _USER_IDS = frozenset({"user", "用户", "human", "operator"})
@@ -79,10 +80,29 @@ def should_wake(
     *,
     disposition: str | None = None,
     from_agent_id: str | None = None,
+    active_waits: list[dict] | None = None,
 ) -> bool:
-    """Whether delivering this message may start an LLM turn."""
+    """Whether delivering this message may start an LLM turn.
+
+    When ``active_waits`` is provided (P1 Wait Contract), event must match
+    a contract's wake_on. Otherwise fall back to disposition whitelist.
+    """
     if category == "progress":
         return False
+
+    if active_waits is not None:
+        from hiveweave.services.wait_contract import (
+            category_to_wake_event,
+            event_matches_waits,
+        )
+
+        event = category_to_wake_event(category, from_agent_id=from_agent_id)
+        if not event_matches_waits(
+            active_waits, event=event, from_agent_id=from_agent_id
+        ):
+            return False
+        # Matched a wait — still apply waiting_human hardening below if needed
+
     if disposition == "waiting_human":
         # Only user replies or new task transitions wake a waiting_human agent
         if is_user_sender(from_agent_id):
