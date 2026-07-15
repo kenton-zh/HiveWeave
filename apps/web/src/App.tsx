@@ -31,6 +31,7 @@ function App() {
   const setProjects = useAppStore((s) => s.setProjects);
   const selectedProjectId = useAppStore((s) => s.selectedProjectId);
   const setSelectedProjectId = useAppStore((s) => s.setSelectedProjectId);
+  const socketReconnectVersion = useAppStore((s) => s.socketReconnectVersion);
   const showAddAgent = useAppStore((s) => s.showAddAgent);
   const addAgentParentId = useAppStore((s) => s.addAgentParentId);
   const openAddAgent = useAppStore((s) => s.openAddAgent);
@@ -101,6 +102,12 @@ function App() {
     }
     load();
   }, []);
+
+  // WebSocket 重连后重新获取项目列表（同步 isStarted 等状态）
+  useEffect(() => {
+    if (socketReconnectVersion === 0) return; // 跳过初始值
+    getProjects().then(setProjects).catch(() => {});
+  }, [socketReconnectVersion]);
 
   // Close project menu on outside click
   useEffect(() => {
