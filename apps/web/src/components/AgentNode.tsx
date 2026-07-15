@@ -37,6 +37,7 @@ function AgentNode({ data, id }: NodeProps) {
   const pendingApprovals = useAppStore((s) => s.pendingApprovals);
   const openAddAgent = useAppStore((s) => s.openAddAgent);
   const processingAgents = useAppStore((s) => s.processingAgents);
+  const agentDispositions = useAppStore((s) => s.agentDispositions);
   const userPingAgentIds = useAppStore((s) => s.userPingAgentIds);
 
   const isSelected = selectedAgentId === id;
@@ -48,14 +49,29 @@ function AgentNode({ data, id }: NodeProps) {
   const matchedRole = roleColors[role];
   const roleInfo = matchedRole || { ...defaultRoleStyle, label: role.charAt(0).toUpperCase() + role.slice(1) };
 
-  // Runtime status: only "active" agents show working/idle; other lifecycle states keep their color
+  // Runtime: disposition is user-facing; processingAgents is execution-only
   const isProcessing = processingAgents.includes(id);
-  const statusColor =
-    status === "active"
-      ? isProcessing
-        ? "bg-emerald-400 animate-pulse"
-        : "bg-gray-400"
-      : statusColors[status] || statusColors.idle;
+  const disp = agentDispositions[id] || "";
+
+  let statusColor: string;
+  let runtimeLabel = "";
+  if (disp === "waiting_human") {
+    statusColor = "bg-amber-400";
+    runtimeLabel = "等待你验收";
+  } else if (disp === "blocked") {
+    statusColor = "bg-red-400";
+    runtimeLabel = "阻塞";
+  } else if (disp === "complete") {
+    statusColor = "bg-blue-400";
+    runtimeLabel = "已交付";
+  } else if (status === "active") {
+    statusColor = isProcessing
+      ? "bg-emerald-400 animate-pulse"
+      : "bg-gray-400";
+    runtimeLabel = isProcessing ? "实现中" : "";
+  } else {
+    statusColor = statusColors[status] || statusColors.idle;
+  }
 
   // Check if this agent has pending approval requests
   const agentApprovals = pendingApprovals[id] || [];
@@ -121,6 +137,11 @@ function AgentNode({ data, id }: NodeProps) {
         <span className="text-sm font-medium text-g-fg truncate">
           {displayName}
         </span>
+        {runtimeLabel && (
+          <span className="text-[10px] text-g-fg-3 truncate shrink-0">
+            {runtimeLabel}
+          </span>
+        )}
       </div>
 
       {/* Role Badge */}

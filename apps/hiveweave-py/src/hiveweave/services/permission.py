@@ -44,6 +44,7 @@ READONLY_TOOLS = frozenset({
     "send_message", "message_superior", "message_subordinate",
     "message_peer", "message_team",
     "ask_agent", "notify_agent", "commit_turn",
+    "start_dev_server", "lookup_dev_server",
     "read_roster", "update_roster", "write_work_log",
     "request_review", "list_subordinates",
     "list_agent_templates", "hire_agent",

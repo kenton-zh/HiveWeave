@@ -220,18 +220,33 @@ async def _send_message_core(
 
     team_chat = TeamChatService()
     for target in resolved:
-        msg = await ctx.inbox.send_message(
-            from_agent_id=agent_id,
-            to_agent_id=target["id"],
-            message=message,
-            priority=priority,
-            expect_report=expect_report,
-            message_type=message_type,
-        )
+        recipient_disposition = None
+        try:
+            from hiveweave.agents.supervisor import agent_manager
+
+            live = agent_manager.get_agent(target["id"])
+            if live is not None:
+                recipient_disposition = getattr(live, "disposition", None)
+        except Exception:
+            pass
+        try:
+            msg = await ctx.inbox.send_message(
+                from_agent_id=agent_id,
+                to_agent_id=target["id"],
+                message=message,
+                priority=priority,
+                expect_report=expect_report,
+                message_type=message_type,
+                recipient_disposition=recipient_disposition,
+            )
+        except ValueError as e:
+            return ToolResult.err(str(e))
         results.append({
             "to": target["name"],
             "short_id": target.get("short_id") or "",
             "message_id": msg["id"],
+            "should_wake": msg.get("should_wake", True),
+            "category": msg.get("category"),
         })
         # Record for sender so team comms panel shows outgoing
         # messages (BUG-034 fix).

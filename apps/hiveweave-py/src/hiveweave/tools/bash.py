@@ -621,6 +621,11 @@ class RunCommandParams(BaseModel):
 )
 async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolResult:
     """Execute a bash command."""
+    from hiveweave.services.process_registry import check_command_reserved_ports
+
+    reserved_err = check_command_reserved_ports(params.command)
+    if reserved_err:
+        return ToolResult.err(reserved_err)
     result = await execute_bash(
         command=params.command,
         workdir="",
@@ -641,6 +646,11 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
 )
 async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: str) -> ToolResult:
     """Execute a command with explicit cwd."""
+    from hiveweave.services.process_registry import check_command_reserved_ports
+
+    reserved_err = check_command_reserved_ports(params.command)
+    if reserved_err:
+        return ToolResult.err(reserved_err)
     result = await execute_run_command(
         command=params.command,
         cwd=params.cwd,

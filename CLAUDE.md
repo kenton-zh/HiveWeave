@@ -196,6 +196,16 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 - `InboxService.send_message` 拒投 archived；stall / reply-watchdog / post-merge nudge 只碰 active，且 `supersede_watchdog_messages` 先清旧催办再插新（upsert）
 - 纠偏优先序：`transfer_agent` → `bind_skill` → 才 `dismiss`+hire
 
+### 合法 Idle（P0）
+
+不要把「有消息 / 有义务 / 跑 LLM / UI 忙」绑成一件事：
+
+- `disposition`（waiting_human / blocked / complete / …）与 `execution`（idle/processing）正交；前端主文案跟 disposition
+- `phase=in_progress` **不再**无限续跑；有义务且有进展时最多再 1 个 slice
+- gate 只校验：缺 commit 最多修 1 次；账本不一致停泊；连续无进展 → blocked
+- inbox 分级：progress/ACK（含「全部完成」）`wake=0` 不触发 LLM；`waiting_human` 时仅用户/新任务可唤醒
+- 平台保留端口 `4000/5173/4173`；项目用 `start_dev_server`；禁止裸 `vite`/`npm run dev` 默认撞 5173
+
 ### Game time
 
 模拟项目时间,`REAL_SECONDS_PER_GAME_DAY = 3600` (1 真实小时 = 1 游戏天)。5 秒 tick 持久化时间并触发到期告警。每 30s 扫 orphan streaming；每 2min 查停滞 Agent / 未回复 ask。停滞 Agent (15+ 分钟无活动) 触发升级到上级。

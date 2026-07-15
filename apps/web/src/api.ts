@@ -528,7 +528,7 @@ export interface ActivityEntry {
 
 export function subscribeAgentStatus(
   onSnapshot: (agentIds: string[], paused?: boolean) => void,
-  onStatus: (agentId: string, processing: boolean) => void,
+  onStatus: (agentId: string, processing: boolean, disposition?: string) => void,
   onActivity?: (event: ActivityEntry) => void,
   onOrgChanged?: () => void,
   onGoalsUpdated?: (projectId: string) => void,
@@ -545,7 +545,13 @@ export function subscribeAgentStatus(
 
   channel.on("status_change", (payload: Record<string, unknown>) => {
     if (typeof payload.agentId === "string") {
-      onStatus(payload.agentId, !!(payload.processing as boolean | undefined));
+      const processing =
+        typeof payload.processing === "boolean"
+          ? payload.processing
+          : payload.status === "processing";
+      const disposition =
+        typeof payload.disposition === "string" ? payload.disposition : undefined;
+      onStatus(payload.agentId, !!processing, disposition);
     }
   });
 

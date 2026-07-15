@@ -78,6 +78,9 @@ interface AppState {
   processingAgents: string[];
   setProcessingAgents: (ids: string[]) => void;
   updateProcessingAgent: (id: string, processing: boolean) => void;
+  // Orthogonal disposition (waiting_human / blocked / complete / …)
+  agentDispositions: Record<string, string>;
+  setAgentDisposition: (id: string, disposition: string) => void;
   // User ping notification — agents that have sent user-directed messages
   userPingAgentIds: string[];
   setUserPingAgentIds: (ids: string[]) => void;
@@ -261,6 +264,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (processing) current.add(id);
       else current.delete(id);
       return { processingAgents: [...current] };
+    }),
+  agentDispositions: {},
+  setAgentDisposition: (id, disposition) =>
+    set((state) => {
+      if (state.agentDispositions[id] === disposition) return state;
+      return {
+        agentDispositions: { ...state.agentDispositions, [id]: disposition },
+      };
     }),
   // User ping notifications
   userPingAgentIds: [],

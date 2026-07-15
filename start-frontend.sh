@@ -1,30 +1,33 @@
 #!/bin/bash
-# start-frontend.sh — Linux/macOS 版前端启动脚本
-# 行为对齐 start-frontend.bat: kill node 残留 + 启动 vite
+# start-frontend.sh — Linux/macOS frontend starter (HiveWeave UI on :5173)
+# Does NOT globally pkill vite/node — that kills project app servers.
 
 set -e
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)/apps/hiveweave-ts"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$ROOT/apps/web"
 LOG_FILE="$PROJECT_DIR/frontend.log"
 PID_FILE="$PROJECT_DIR/frontend.pid"
 
-echo "[start-frontend.sh] Killing any vite/node processes ..."
-pkill -f "vite" 2>/dev/null || true
-pkill -f "node.*5173" 2>/dev/null || true
+if [ ! -d "$PROJECT_DIR" ]; then
+  echo "[start-frontend.sh] ERROR: $PROJECT_DIR not found"
+  exit 1
+fi
 
+# Kill only our previous HiveWeave vite (pidfile), never all node/vite
 if [ -f "$PID_FILE" ]; then
   OLD_PID=$(cat "$PID_FILE")
   if kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "[start-frontend.sh] Killing old PID from pidfile: $OLD_PID"
+    echo "[start-frontend.sh] Stopping previous HiveWeave frontend PID $OLD_PID"
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 1
     kill -9 "$OLD_PID" 2>/dev/null || true
   fi
   rm -f "$PID_FILE"
 fi
 
-sleep 1
-
 cd "$PROJECT_DIR"
-echo "[start-frontend.sh] Starting vite dev server ..."
+echo "[start-frontend.sh] Starting HiveWeave Vite on port 5173 ..."
 nohup npm run dev > "$LOG_FILE" 2>&1 &
 NEW_PID=$!
 echo $NEW_PID > "$PID_FILE"

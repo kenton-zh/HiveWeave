@@ -1076,6 +1076,10 @@ async def _spawn_post_approve_verify_task(
             and "verify" in tags
             and t.get("status") not in ("closed", "approved")
         ):
+            try:
+                await ts.mark_verifying(project_id, parent_id)
+            except Exception:
+                pass
             return t.get("id")
 
     title = parent_task.get("title") or "task"
@@ -1102,6 +1106,14 @@ async def _spawn_post_approve_verify_task(
         tags=["verify", "mandatory", "post-merge"],
         source="system",
     )
+    try:
+        await ts.mark_verifying(project_id, parent_id)
+    except Exception as e:
+        log.warning(
+            "parent_mark_verifying_failed",
+            parent_id=parent_id,
+            error=str(e),
+        )
     log.info(
         "verify_task_spawned",
         parent_task_id=parent_id,

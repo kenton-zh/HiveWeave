@@ -1,7 +1,7 @@
 """Task service — Task Ledger core service layer.
 
 任务账本 (Task Ledger) 的核心服务层。
-状态机: created → claimed → running → blocked/submitted → reviewing → approved/rework → closed
+状态机: created → claimed → running → blocked/submitted → reviewing → approved/rework → verifying → closed
 
 合法转换 (_TRANSITIONS):
     created   → claimed | closed
@@ -10,7 +10,8 @@
     blocked   → running | closed
     submitted → reviewing | running
     reviewing → approved | rework
-    approved  → closed
+    approved  → verifying | closed
+    verifying → closed
     rework    → running
     closed    → (终态)
 
@@ -41,7 +42,8 @@ _TRANSITIONS: dict[str, set[str]] = {
     "blocked": {"running", "closed"},               # 解除阻塞或关闭
     "submitted": {"reviewing", "running"},          # 进入评审或撤回
     "reviewing": {"approved", "rework"},            # 审批通过或返工
-    "approved": {"closed"},                         # 关闭
+    "approved": {"verifying", "closed"},            # 进入 VERIFY 或直接关闭
+    "verifying": {"closed"},                        # VERIFY 通过 → 关闭父任务
     "rework": {"running"},                          # 返工回到运行
     "closed": set(),                                # 终态
 }
@@ -413,38 +415,17 @@ class TaskService:
             log.info("task_reviewed", task_id=task_id, decision=decision,
                      has_feedback=feedback is not None)
             await self._wake_dependent_tasks(project_id, task_id)
-            # VERIFY tasks: approve completes the loop → auto-close
-            title = ""
+            # VERIFY child: close VERIFY + close parent in one lifecycle step
             try:
-                trow = await _query(
-                    project_id, "SELECT title, tags FROM tasks WHERE id = ?",
-                    [task_id],
-                )
-                if trow:
-                    title = trow[0]["title"] or ""
-                    tags_raw = trow[0]["tags"]
-                    tags = []
-                    if isinstance(tags_raw, str):
-                        try:
-                            tags = json.loads(tags_raw)
-                        except (json.JSONDecodeError, TypeError):
-                            tags = []
-                    elif isinstance(tags_raw, list):
-                        tags = tags_raw
-                    if (
-                        title.startswith("VERIFY:")
-                        or "verify" in [str(x).lower() for x in tags]
-                    ):
-                        try:
-                            await self.close_task(project_id, task_id)
-                        except Exception as e:
-                            log.warning(
-                                "verify_auto_close_failed",
-                                task_id=task_id,
-                                error=str(e),
-                            )
+                task = await self.get_task(project_id, task_id)
+                if task and self._is_verify_task(task):
+                    await self._close_verify_and_parent(project_id, task)
             except Exception as e:
-                log.debug("verify_auto_close_check_failed", error=str(e))
+                log.warning(
+                    "verify_auto_close_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
         else:
             # rework: reviewing → rework → running (atomic single UPDATE,
             # no intermediate "rework" state visible to concurrent readers)
@@ -456,13 +437,121 @@ class TaskService:
                      has_feedback=feedback is not None)
 
     async def close_task(self, project_id: str, task_id: str) -> None:
-        """Close a task (approved → closed). Sets closed_at."""
+        """Close a task (approved|verifying → closed). Sets closed_at."""
         await self._transition(project_id, task_id, "closed")
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
             "UPDATE tasks SET closed_at = ?, updated_at = ? WHERE id = ?",
             [now_ms, now_ms, task_id])
         await self._wake_dependent_tasks(project_id, task_id)
+
+    async def mark_verifying(self, project_id: str, task_id: str) -> None:
+        """Parent task enters verifying after VERIFY child is spawned."""
+        rows = await _query(
+            project_id, "SELECT status FROM tasks WHERE id = ?", [task_id]
+        )
+        if not rows:
+            raise ValueError(f"Task not found: {task_id}")
+        current = rows[0]["status"]
+        if current == "verifying":
+            return
+        if current == "approved":
+            await self._transition(project_id, task_id, "verifying")
+            return
+        if current == "closed":
+            return
+        raise ValueError(f"Cannot mark verifying from status={current}")
+
+    @staticmethod
+    def _is_verify_task(task: dict) -> bool:
+        title = task.get("title") or ""
+        tags = task.get("tags") or []
+        if isinstance(title, str) and title.startswith("VERIFY:"):
+            return True
+        if isinstance(tags, list) and "verify" in [str(x).lower() for x in tags]:
+            return True
+        return False
+
+    async def _close_verify_and_parent(
+        self, project_id: str, verify_task: dict
+    ) -> None:
+        """Close VERIFY child and its parent (approved|verifying → closed)."""
+        verify_id = verify_task.get("id")
+        if not verify_id:
+            return
+        # Close VERIFY itself (approved → closed)
+        try:
+            await self.close_task(project_id, verify_id)
+        except Exception as e:
+            log.warning(
+                "verify_child_close_failed",
+                task_id=verify_id,
+                error=str(e),
+            )
+            return
+
+        parent_id = verify_task.get("parent_task_id")
+        if not parent_id:
+            # Infer: title "VERIFY: <parent title>" + same assignee
+            return
+        parent = await self.get_task(project_id, parent_id)
+        if not parent:
+            return
+        status = parent.get("status")
+        if status in ("approved", "verifying"):
+            try:
+                await self.close_task(project_id, parent_id)
+                log.info(
+                    "verify_parent_closed",
+                    verify_id=verify_id,
+                    parent_id=parent_id,
+                )
+            except Exception as e:
+                log.warning(
+                    "verify_parent_close_failed",
+                    parent_id=parent_id,
+                    error=str(e),
+                )
+
+    async def migrate_orphan_approved(self, project_id: str) -> dict:
+        """One-shot: approved with open VERIFY → verifying; else → closed."""
+        await _ensure_schema(project_id)
+        rows = await _query(
+            project_id,
+            f"SELECT {self._COLUMNS} FROM tasks "
+            "WHERE is_archived = 0 AND status = 'approved'",
+        )
+        to_verifying = 0
+        to_closed = 0
+        for r in rows:
+            task = self._row(r)
+            if self._is_verify_task(task):
+                # Orphan approved VERIFY → close (and parent if any)
+                await self._close_verify_and_parent(project_id, task)
+                to_closed += 1
+                continue
+            tid = task["id"]
+            children = await _query(
+                project_id,
+                f"SELECT {self._COLUMNS} FROM tasks "
+                "WHERE parent_task_id = ? AND is_archived = 0",
+                [tid],
+            )
+            has_open_verify = False
+            for ch in children:
+                child = self._row(ch)
+                if self._is_verify_task(child) and child.get("status") not in (
+                    "closed",
+                ):
+                    has_open_verify = True
+                    break
+            if has_open_verify:
+                await self.mark_verifying(project_id, tid)
+                to_verifying += 1
+            else:
+                await self.close_task(project_id, tid)
+                to_closed += 1
+        return {"verifying": to_verifying, "closed": to_closed}
 
     async def get_task(self, project_id: str, task_id: str) -> dict | None:
         """Get a single task by id. Returns all fields or None."""
@@ -502,8 +591,8 @@ class TaskService:
     ) -> list[dict]:
         """Tasks this agent must act on now (open-task reminder / stall helpers).
 
-        - As assignee: claimed | running | rework
-        - As creator: submitted | reviewing
+        - As assignee: claimed | running | rework | verifying (VERIFY assignee)
+        - As creator: submitted | reviewing  (NOT approved — that is parked)
         Excludes blocked / approved / closed / archived.
         Each dict includes role_hint: 'assignee' | 'creator'.
         """
@@ -511,17 +600,22 @@ class TaskService:
         rows = await _query(
             project_id,
             f"SELECT {self._COLUMNS} FROM tasks WHERE is_archived = 0 AND ("
-            "  (assignee_id = ? AND status IN ('claimed','running','rework'))"
-            "  OR (creator_id = ? AND status IN ('submitted','reviewing','approved'))"
+            "  (assignee_id = ? AND status IN "
+            "   ('claimed','running','rework','verifying'))"
+            "  OR (creator_id = ? AND status IN ('submitted','reviewing'))"
             ") ORDER BY updated_at DESC",
             [agent_id, agent_id],
         )
         out: list[dict] = []
         for r in rows:
             d = self._row(r)
-            if d.get("assignee_id") == agent_id and d.get("status") in (
-                "claimed", "running", "rework",
+            status = d.get("status")
+            if d.get("assignee_id") == agent_id and status in (
+                "claimed", "running", "rework", "verifying",
             ):
+                # verifying on non-VERIFY assignee is not actionable for them
+                if status == "verifying" and not self._is_verify_task(d):
+                    continue
                 d["role_hint"] = "assignee"
             else:
                 d["role_hint"] = "creator"

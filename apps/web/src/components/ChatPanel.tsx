@@ -99,6 +99,11 @@ const statusLabels: Record<string, { text: string; color: string }> = {
   dissolving: { text: "Dissolving", color: "text-red-600" },
   archived: { text: "Archived", color: "text-g-fg-4" },
   idle: { text: "Idle", color: "text-g-fg-3" },
+  waiting_human: { text: "等待你验收", color: "text-amber-600" },
+  waiting_agent: { text: "等待同事", color: "text-amber-600" },
+  blocked: { text: "阻塞", color: "text-red-600" },
+  complete: { text: "已交付", color: "text-blue-600" },
+  runnable: { text: "Idle", color: "text-g-fg-3" },
   working: { text: "Working", color: "text-emerald-600" },
   error: { text: "Error", color: "text-red-600" },
   waiting: { text: "Waiting", color: "text-amber-600" },
@@ -1382,10 +1387,17 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     );
   }
 
+  const agentDispositions = useAppStore((s) => s.agentDispositions);
+  const disposition = agentId ? agentDispositions[agentId] : undefined;
   const statusInfo = statusLabels[agentInfo?.status || "idle"] || { text: agentInfo?.status || "Unknown", color: "text-g-fg-3" };
-  const runtimeStatusInfo = agentInfo?.status === "active"
-    ? isAgentProcessing ? { text: "工作中", color: "text-emerald-600" } : { text: "空闲", color: "text-g-fg-3" }
-    : statusInfo;
+  const runtimeStatusInfo =
+    disposition && statusLabels[disposition]
+      ? statusLabels[disposition]
+      : agentInfo?.status === "active"
+        ? isAgentProcessing
+          ? { text: "实现中", color: "text-emerald-600" }
+          : { text: "空闲", color: "text-g-fg-3" }
+        : statusInfo;
   const resolveAgentInfo = (id: string) => {
     if (!id) return { name: "系统", role: "" };
     // Check cache first
