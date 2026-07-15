@@ -1,7 +1,7 @@
 """Token estimation and budget calculation utilities.
 
 契约 03: 对话历史与压缩
-- char-ratio 启发式：4 chars/token EN, ~1.5 CJK
+- char-ratio 启发式：4 chars/token EN, ~1.0 CJK
 - 对齐 Elixir token_utils.ex + TS token-utils.ts
 - 工具输出超限截断并保存到临时文件（OpenCode ToolOutputStore 模式）
 """
@@ -39,7 +39,7 @@ def estimate_tokens(text) -> int:
 
     char-ratio 启发式：
     - 非 CJK：~4 chars/token
-    - CJK：~1.5 chars/token
+    - CJK：~1.0 chars/token（实测混元/Claude 约 0.8-1.2 chars/token）
     保守高估 ~10-15%，确保不超模型硬限制。
     """
     if not text:
@@ -48,7 +48,7 @@ def estimate_tokens(text) -> int:
         text = str(text)
     cjk_count = len(_CJK_RE.findall(text))
     non_cjk = len(text) - cjk_count
-    return math.ceil(non_cjk / 4 + cjk_count / 1.5)
+    return math.ceil(non_cjk / 4 + cjk_count / 1.0)
 
 
 def estimate_tokens_for_messages(messages: list) -> int:
