@@ -24,9 +24,15 @@ _migrated: set[str] = set()
 DEFAULT_WAKE_ON: dict[str, list[str]] = {
     "user": ["user_message", "task_transition", "timeout"],
     "agent": ["ask_reply", "message_from_ref", "timeout"],
-    "task": ["task_transition", "timeout"],
-    "timer": ["alarm", "timeout"],
-    "external": ["external", "timeout"],
+    "task": ["task_transition", "timeout", "message_from_ref"],
+    "timer": ["alarm", "timeout", "message_from_ref", "ask_reply", "user_message"],
+    "external": [
+        "external",
+        "timeout",
+        "message_from_ref",
+        "ask_reply",
+        "user_message",
+    ],
 }
 
 CREATE_SQL = """
