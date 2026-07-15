@@ -156,6 +156,7 @@ export interface Project {
   description?: string | null;
   orgParadigm?: string | null;
   language?: string | null;
+  isStarted?: boolean;
   createdAt: number;
 }
 
@@ -175,6 +176,16 @@ export interface GoalsData {
 export async function getProjects(): Promise<Project[]> {
   const data = await fetchJSON<{ projects: Project[] }>(`${BASE}/projects`);
   return data.projects || [];
+}
+
+export async function activateProject(projectId: string): Promise<boolean> {
+  const data = await fetchJSON<{ is_started: boolean }>(`${BASE}/projects/${projectId}/activate`);
+  return data.is_started ?? true;
+}
+
+export async function deactivateProject(projectId: string): Promise<boolean> {
+  const data = await fetchJSON<{ is_started: boolean }>(`${BASE}/projects/${projectId}/deactivate`);
+  return data.is_started ?? false;
 }
 
 

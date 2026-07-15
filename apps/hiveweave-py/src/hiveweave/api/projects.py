@@ -190,6 +190,7 @@ def _project_response(row: dict, active_id: str | None = None) -> dict:
         except (json.JSONDecodeError, TypeError):
             charter = None
     is_active = (row.get("id") == active_id) if active_id is not None else False
+    is_started = bool(row.get("is_started") or 0)
     return {
         "id": row.get("id"),
         "name": row.get("name"),
@@ -202,6 +203,8 @@ def _project_response(row: dict, active_id: str | None = None) -> dict:
         "charter": charter,
         "is_active": is_active,
         "isActive": is_active,
+        "is_started": is_started,
+        "isStarted": is_started,
         "created_at": row.get("created_at"),
         "createdAt": row.get("created_at"),
         "updated_at": row.get("updated_at"),
