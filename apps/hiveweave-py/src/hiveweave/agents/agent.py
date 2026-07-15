@@ -192,8 +192,13 @@ class Agent:
         self._task_reminder_count = 0  # open-task 收工续跑次数
         self._TASK_REMINDER_MAX = 2    # 防死循环
         self._turn_gate_count = 0      # TurnResult 退出门禁续跑次数
-        self._TURN_GATE_MAX = 3
+        self._TURN_GATE_MAX = 1        # P0: at most one repair retrigger
         self._resume_cooldown_until: float = 0.0  # monotonic deadline；超时后防 doom loop
+        self.disposition: str = "runnable"  # waiting_human|blocked|complete|…
+        self._slice_budget: int = 0  # remaining auto-slices for this external wake
+        self._SLICE_BUDGET_MAX = 2
+        self._progress_fingerprint: str | None = None
+        self._no_progress_streak: int = 0
 
         # ── asyncio 原语 ──
         self._llm_task: asyncio.Task | None = None
@@ -383,7 +388,21 @@ class Agent:
             self.status = AgentState.PROCESSING
             self._cancel_reason = None
             self.empty_retry_count = 0
-            self._broadcast_status("processing")
+            source = (opts or {}).get("source") or ""
+            # External wakes refill slice budget; gate repair does not
+            if source not in ("turn_exit_gate", "open_task_reminder"):
+                self._slice_budget = self._SLICE_BUDGET_MAX
+                if source in ("user", "chat", "") or not opts.get("trigger"):
+                    # User-facing chat clears waiting_human into runnable while processing
+                    if self.disposition == "waiting_human" and not opts.get("trigger"):
+                        self.disposition = "runnable"
+            self._broadcast_status(
+                "processing",
+                {"disposition": self.disposition, "visibility": (
+                    "system" if source in ("turn_exit_gate", "open_task_reminder")
+                    else "foreground" if not opts.get("trigger") else "background"
+                )},
+            )
 
             # Fresh turn — drop stale TurnResult + re-resolve workspace (worktree may bind mid-flight)
             from hiveweave.services.turn_session import clear_pending_turn_result
@@ -1066,7 +1085,7 @@ class Agent:
             self.id, self.project_id, turn_messages
         )
 
-        # 3. Turn exit gates — must commit_turn (function return) before idle
+        # 3. Turn exit gates — validate only; scheduler decides continue/park
         from hiveweave.db import meta as meta_db
         from hiveweave.services.turn_exit import (
             ExitContext,
@@ -1106,6 +1125,7 @@ class Agent:
                 error=str(e),
             )
 
+        tasks_advanced = self._task_ids_advanced_this_turn(tool_calls)
         exit_decision = evaluate_turn_exit(
             ExitContext(
                 agent_id=self.id,
@@ -1114,40 +1134,81 @@ class Agent:
                 pending_inbox_msgs=pending_msgs,
                 unreplied_asks=unreplied_asks,
                 open_task_obligations=open_obligations,
-                tasks_advanced=self._task_ids_advanced_this_turn(tool_calls),
+                tasks_advanced=tasks_advanced,
             )
         )
 
         gate_retrigger_hint: str | None = None
-        continue_work = False
+        continue_slice = False
+        carry_inbox_ids: list[str] | None = None
+
+        # Progress fingerprint for no-progress circuit breaker
+        fp = self._compute_progress_fingerprint(
+            open_obligations, tool_calls, tasks_advanced
+        )
+        if self._progress_fingerprint == fp:
+            self._no_progress_streak += 1
+        else:
+            self._no_progress_streak = 0
+            self._progress_fingerprint = fp
 
         if not exit_decision.ok:
-            if self._turn_gate_count < self._TURN_GATE_MAX:
-                unreplied_ids = {m["id"] for m in unreplied_asks}
-                if self.pending_inbox_msg_ids:
-                    no_reply_ids = [
-                        mid
-                        for mid in self.pending_inbox_msg_ids
-                        if mid not in unreplied_ids
-                    ]
-                    if no_reply_ids:
-                        await self._inbox.mark_read_by_ids(self.id, no_reply_ids)
-                    # Keep unreplied asks unread so self_retrigger / next turn sees them
+            unreplied_ids = {m["id"] for m in unreplied_asks}
+            if self.pending_inbox_msg_ids:
+                no_reply_ids = [
+                    mid
+                    for mid in self.pending_inbox_msg_ids
+                    if mid not in unreplied_ids
+                ]
+                if no_reply_ids:
+                    await self._inbox.mark_read_by_ids(self.id, no_reply_ids)
+
+            if exit_decision.should_park or (
+                "OPEN_TASKS_UNDECLARED" in exit_decision.violations
+                and not exit_decision.should_repair
+            ):
+                # Ledger mismatch → park on real books, do not re-run LLM
+                pop_pending_turn_result(self.id)
+                self._turn_gate_count = 0
+                self.disposition = exit_decision.disposition or "runnable"
+                if open_obligations:
+                    self.disposition = "runnable"
+                log.warning(
+                    "turn_exit_parked",
+                    agent_id=self.id,
+                    violations=exit_decision.violations,
+                    disposition=self.disposition,
+                )
+                if self.pending_inbox_msg_ids and not unreplied_asks:
+                    await self._inbox.mark_read_by_ids(
+                        self.id, self.pending_inbox_msg_ids
+                    )
+                self.pending_inbox_msg_ids = None
+            elif (
+                exit_decision.should_repair
+                and self._turn_gate_count < self._TURN_GATE_MAX
+            ):
                 self._turn_gate_count += 1
                 gate_retrigger_hint = exit_decision.hint
+                carry_inbox_ids = list(self.pending_inbox_msg_ids or [])
+                # Keep unreplied ask ids for the repair turn
+                if unreplied_asks:
+                    carry_inbox_ids = list(
+                        {*(carry_inbox_ids or []), *(m["id"] for m in unreplied_asks)}
+                    )
                 await self._conversation.append_turn(
                     self.id,
                     self.project_id,
                     [{"role": "user", "content": gate_retrigger_hint}],
                 )
                 log.info(
-                    "turn_exit_blocked",
+                    "turn_exit_repair",
                     agent_id=self.id,
                     violations=exit_decision.violations,
                     gate_round=self._turn_gate_count,
                 )
+                # Do not clear pending_inbox_msg_ids yet — carried into opts
             else:
-                # Cap reached — escalate unreplied asks, force-clear gate
                 if unreplied_asks:
                     await self._escalate_unreplied(unreplied_asks)
                 if self.pending_inbox_msg_ids:
@@ -1157,14 +1218,14 @@ class Agent:
                 pop_pending_turn_result(self.id)
                 self._turn_gate_count = 0
                 self._reply_reminder_count = 0
+                self.disposition = "blocked"
                 log.warning(
                     "turn_exit_gate_exhausted",
                     agent_id=self.id,
                     violations=exit_decision.violations,
                 )
-            self.pending_inbox_msg_ids = None
+                self.pending_inbox_msg_ids = None
         else:
-            # Gates passed
             if self.pending_inbox_msg_ids:
                 await self._inbox.mark_read_by_ids(
                     self.id, self.pending_inbox_msg_ids
@@ -1174,7 +1235,34 @@ class Agent:
             self._reply_reminder_count = 0
             self._task_reminder_count = 0
             pop_pending_turn_result(self.id)
-            continue_work = exit_decision.continue_work
+            self.disposition = exit_decision.disposition or "runnable"
+
+            # No-progress fault
+            if self._no_progress_streak >= 2 and open_obligations:
+                self.disposition = "blocked"
+                log.warning(
+                    "faulted_no_progress",
+                    agent_id=self.id,
+                    streak=self._no_progress_streak,
+                    fingerprint=fp[:16] if fp else None,
+                )
+            else:
+                # At most one more slice if obligations remain AND fingerprint moved
+                # and phase was in_progress (declaration only — scheduler decides)
+                phase = (
+                    exit_decision.turn_result.phase
+                    if exit_decision.turn_result
+                    else None
+                )
+                if (
+                    phase == "in_progress"
+                    and open_obligations
+                    and self._no_progress_streak == 0
+                    and self._slice_budget > 0
+                ):
+                    continue_slice = True
+                    self._slice_budget -= 1
+
             log.info(
                 "turn_exit_ok",
                 agent_id=self.id,
@@ -1183,7 +1271,9 @@ class Agent:
                     if exit_decision.turn_result
                     else None
                 ),
-                continue_work=continue_work,
+                disposition=self.disposition,
+                continue_slice=continue_slice,
+                slice_budget=self._slice_budget,
             )
 
         # 成功完成 → 清除 resume 冷却
@@ -1204,38 +1294,71 @@ class Agent:
             "type": "done",
             "content": content,
             "agentId": self.id,
+            "disposition": self.disposition,
         })
 
         # 6. Process queued user messages (sent while agent was busy)
         await self._drain_message_queue()
 
-        # 7–8. Prefer turn-gate / continue-work over generic self_retrigger
+        # 7–8. Repair once OR one progress slice — never unlimited in_progress
         if gate_retrigger_hint:
-            await self._retrigger_for_turn_gate(gate_retrigger_hint)
-        elif continue_work:
             await self._retrigger_for_turn_gate(
-                "[TURN CONTINUE] You committed phase=in_progress. "
-                "Continue the work now — then commit_turn again when this slice ends."
+                gate_retrigger_hint, inbox_msg_ids=carry_inbox_ids
+            )
+        elif continue_slice:
+            await self._retrigger_for_turn_gate(
+                "[TURN CONTINUE] You still have actionable obligations and made "
+                "progress this slice. Continue once more, then commit_turn "
+                "(prefer waiting/done_slice when idle on the user).",
+                inbox_msg_ids=None,
             )
         else:
             await self._maybe_self_retrigger()
-    async def _retrigger_for_turn_gate(self, hint: str) -> None:
-        """Re-enter chat with a turn-exit / continue hint."""
+
+    def _compute_progress_fingerprint(
+        self,
+        obligations: list[dict],
+        tool_calls: list,
+        tasks_advanced: set[str],
+    ) -> str:
+        """Minimal fingerprint: task versions + tool outcome signals."""
+        import hashlib
+
+        parts: list[str] = []
+        for t in obligations:
+            parts.append(f"{t.get('id')}:{t.get('status')}")
+        parts.sort()
+        replied = any(
+            isinstance(tc, dict)
+            and ((tc.get("function") or {}).get("name") in (
+                "send_message", "ask_agent", "notify_agent", "submit_task",
+                "review_task", "claim_task", "write_file", "edit_file", "bash",
+            ))
+            for tc in (tool_calls or [])
+        )
+        parts.append(f"adv={','.join(sorted(tasks_advanced))}")
+        parts.append(f"replied={int(replied)}")
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+    async def _retrigger_for_turn_gate(
+        self, hint: str, *, inbox_msg_ids: list[str] | None = None
+    ) -> None:
+        """Re-enter chat with a turn-exit / continue hint; preserve inbox ids."""
         await asyncio.sleep(SELF_RETRIGGER_DELAY_MS / 1000.0)
         if self._in_resume_cooldown():
             return
         if self.status != AgentState.IDLE:
             return
         log.info("turn_gate_retrigger", agent_id=self.id)
+        opts: dict = {
+            "trigger": True,
+            "is_background": True,
+            "source": "turn_exit_gate",
+        }
+        if inbox_msg_ids:
+            opts["inbox_msg_ids"] = inbox_msg_ids
         asyncio.create_task(
-            self.chat(
-                hint,
-                opts={
-                    "trigger": True,
-                    "is_background": True,
-                    "source": "turn_exit_gate",
-                },
-            ),
+            self.chat(hint, opts=opts),
             name=f"agent-{self.id}-turn-gate-retrigger",
         )
 
@@ -2103,7 +2226,10 @@ class Agent:
         self.current_job = None
         self._llm_task = None
         self._cancel_reason = None
-        self._broadcast_status("idle")
+        self._broadcast_status(
+            "idle",
+            {"disposition": self.disposition},
+        )
 
     # ── 内部: 回调 ───────────────────────────────────────────
 

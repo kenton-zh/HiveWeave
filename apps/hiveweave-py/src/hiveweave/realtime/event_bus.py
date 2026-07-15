@@ -250,6 +250,7 @@ class StatusEventBus:
         agent_id: str,
         status: str,
         project_id: str | None = None,
+        extra: dict | None = None,
     ) -> None:
         """发布 agent 状态变更到 lobby + agent + project 频道。
 
@@ -260,6 +261,7 @@ class StatusEventBus:
             agent_id: Agent ID
             status: ``"processing"`` 或 ``"idle"``
             project_id: 可选 — 如果提供，同时推送到 ``project:{project_id}``
+            extra: optional disposition / visibility
         """
         self.set_processing(agent_id, status == "processing")
         event: dict[str, Any] = {
@@ -267,7 +269,13 @@ class StatusEventBus:
             "agentId": agent_id,
             "status": status,
             "project_id": project_id,
+            "processing": status == "processing",
         }
+        if extra:
+            if "disposition" in extra:
+                event["disposition"] = extra["disposition"]
+            if "visibility" in extra:
+                event["visibility"] = extra["visibility"]
         # 推送到 lobby
         await self.publish("lobby", event)
         # 推送到 agent 频道
@@ -465,7 +473,7 @@ def create_agent_callbacks(
     async def on_status_change(aid: str, status: str, extra: dict) -> None:
         """状态变更回调 — 发布到 lobby + agent + project 频道。"""
         pid = extra.get("project_id") or project_id
-        await bus.publish_status_change(aid, status, pid)
+        await bus.publish_status_change(aid, status, pid, extra=extra)
 
     async def on_stream_event(aid: str, event: dict) -> None:
         """流事件回调 — 按转发规则发布。"""

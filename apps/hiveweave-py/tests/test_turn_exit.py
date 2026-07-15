@@ -79,7 +79,8 @@ def test_exit_ok_done_slice():
     pop_pending_turn_result("a1")
 
 
-def test_exit_in_progress_continues():
+def test_exit_in_progress_does_not_autoscale():
+    """phase=in_progress is a declaration only — continue_work stays False."""
     clear_pending_turn_result("a1")
     set_pending_turn_result(
         "a1",
@@ -95,7 +96,56 @@ def test_exit_in_progress_continues():
         ExitContext(agent_id="a1", project_id="p1", tool_calls=[])
     )
     assert d.ok
-    assert d.continue_work
+    assert d.continue_work is False
+    assert d.disposition == "runnable"
+    pop_pending_turn_result("a1")
+
+
+def test_exit_waiting_user_sets_disposition():
+    clear_pending_turn_result("a1")
+    set_pending_turn_result(
+        "a1",
+        {
+            "phase": "waiting",
+            "summary": "Waiting for browser check",
+            "waiting_on": [{"kind": "user", "ref": "user"}],
+            "result": {},
+            "extensions": {},
+        },
+    )
+    d = evaluate_turn_exit(
+        ExitContext(agent_id="a1", project_id="p1", tool_calls=[])
+    )
+    assert d.ok
+    assert d.disposition == "waiting_human"
+    pop_pending_turn_result("a1")
+
+
+def test_exit_open_tasks_parks():
+    clear_pending_turn_result("a1")
+    set_pending_turn_result(
+        "a1",
+        {
+            "phase": "done_slice",
+            "summary": "Pretend done",
+            "waiting_on": [],
+            "result": {},
+            "extensions": {},
+        },
+    )
+    d = evaluate_turn_exit(
+        ExitContext(
+            agent_id="a1",
+            project_id="p1",
+            tool_calls=[],
+            open_task_obligations=[{"id": "task-1", "status": "running"}],
+            tasks_advanced=set(),
+        )
+    )
+    assert not d.ok
+    assert "OPEN_TASKS_UNDECLARED" in d.violations
+    assert d.should_park is True
+    assert d.should_repair is False
     pop_pending_turn_result("a1")
 
 

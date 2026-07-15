@@ -1,7 +1,7 @@
-"""Turn exit gates — violations block idle (function must return TurnResult).
+"""Turn exit gates — validate TurnResult; do not schedule work.
 
-Handlers are listed explicitly; add new rules here instead of scattering
-if-branches across agent.py / game_time.py.
+P0: gate only validates. Scheduler (agent) decides continue/park.
+phase=in_progress never implies unlimited continue_work.
 """
 
 from __future__ import annotations
@@ -19,6 +19,20 @@ from hiveweave.services.turn_result import (
 from hiveweave.services.turn_session import get_pending_turn_result
 
 log = structlog.get_logger(__name__)
+
+# Violations that warrant at most one repair retrigger
+REPAIR_VIOLATIONS = frozenset({
+    "MISSING_COMMIT_TURN",
+    "INVALID_TURN_RESULT",
+    "WAITING_ON_REQUIRED",
+    "BLOCKED_WAITING_ON_REQUIRED",
+    "UNREPLIED_ASKS",
+})
+
+# Ledger / obligation mismatches → park, do not immediately re-run LLM
+PARK_VIOLATIONS = frozenset({
+    "OPEN_TASKS_UNDECLARED",
+})
 
 
 @dataclass
@@ -38,8 +52,12 @@ class ExitDecision:
     violations: list[str] = field(default_factory=list)
     turn_result: TurnResult | None = None
     hint: str = ""
-    # After a valid commit: schedule another turn instead of true idle
+    # Deprecated for auto-schedule: always False from evaluate; agent decides
     continue_work: bool = False
+    # P0: repair once vs park on ledger mismatch
+    should_repair: bool = False
+    should_park: bool = False
+    disposition: str = "runnable"  # runnable|waiting_human|waiting_agent|blocked|complete
 
 
 def collect_unreplied_asks(
@@ -47,9 +65,7 @@ def collect_unreplied_asks(
     tool_calls: list,
     name_by_id: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Messages that require a reply (ask / expect_report / reply language)
-    and were not answered via ask_agent/notify_agent/send_message this turn.
-    """
+    """Messages that require a reply and were not answered this turn."""
     name_by_id = name_by_id or {}
     expects: list[dict] = []
     for m in pending_msgs:
@@ -102,8 +118,29 @@ def collect_unreplied_asks(
     return unreplied
 
 
+def _disposition_from_result(
+    turn_result: TurnResult | None,
+    obligations: list[dict],
+) -> str:
+    if turn_result is None:
+        return "runnable"
+    phase = turn_result.phase
+    if phase == "waiting":
+        kinds = {w.kind for w in turn_result.waiting_on}
+        if "user" in kinds:
+            return "waiting_human"
+        if "timer" in kinds:
+            return "waiting_timer"
+        return "waiting_agent"
+    if phase == "blocked":
+        return "blocked"
+    if phase == "done_slice" and not obligations:
+        return "complete"
+    return "runnable"
+
+
 def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
-    """Run all exit gates. Pure-ish (uses ctx snapshot only)."""
+    """Validate turn exit. Never sets continue_work for unlimited re-entry."""
     violations: list[str] = []
     raw = get_pending_turn_result(ctx.agent_id)
     turn_result: TurnResult | None = None
@@ -129,6 +166,7 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
     if unreplied:
         violations.append("UNREPLIED_ASKS")
 
+    remaining_obligations = list(ctx.open_task_obligations)
     if turn_result and turn_result.phase == "done_slice":
         remaining = []
         for t in ctx.open_task_obligations:
@@ -142,10 +180,10 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
             ):
                 continue
             remaining.append(t)
+        remaining_obligations = remaining
         if remaining:
             violations.append("OPEN_TASKS_UNDECLARED")
 
-    # Deduplicate while preserving order
     seen: set[str] = set()
     uniq: list[str] = []
     for v in violations:
@@ -153,13 +191,31 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
             seen.add(v)
             uniq.append(v)
 
+    disposition = _disposition_from_result(turn_result, remaining_obligations)
+
     if uniq:
+        park = bool(PARK_VIOLATIONS.intersection(uniq)) and not bool(
+            REPAIR_VIOLATIONS.intersection(uniq) - PARK_VIOLATIONS
+        )
+        # Mixed: prefer repair if unreplied/missing commit present
+        repair_only = bool(REPAIR_VIOLATIONS.intersection(uniq)) and not park
+        if PARK_VIOLATIONS.intersection(uniq) and REPAIR_VIOLATIONS.intersection(uniq):
+            # Both → repair unreplied first if present, else park ledger
+            repair_only = "UNREPLIED_ASKS" in uniq or "MISSING_COMMIT_TURN" in uniq
+            park = not repair_only
+        if park:
+            disposition = "runnable" if remaining_obligations else disposition
         return ExitDecision(
             ok=False,
             violations=uniq,
             turn_result=turn_result,
             hint=_build_gate_hint(uniq, unreplied, turn_result),
             continue_work=False,
+            should_repair=repair_only,
+            should_park=park or (bool(PARK_VIOLATIONS.intersection(uniq)) and not repair_only),
+            disposition=disposition if not park else (
+                "runnable" if remaining_obligations else "complete"
+            ),
         )
 
     assert turn_result is not None
@@ -168,7 +224,10 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
         violations=[],
         turn_result=turn_result,
         hint="",
-        continue_work=(turn_result.phase == "in_progress"),
+        continue_work=False,  # agent scheduler may still continue one slice
+        should_repair=False,
+        should_park=False,
+        disposition=disposition,
     )
 
 
@@ -202,8 +261,13 @@ def _build_gate_hint(
     if "MISSING_COMMIT_TURN" in violations:
         lines.append(
             "调用示例：commit_turn(phase='done_slice', summary='…') "
-            "或 phase='waiting' + waiting_on=[{kind:'agent', ref:'花名'}] "
-            "或 phase='in_progress' 表示还要继续。"
+            "或 phase='waiting' + waiting_on=[{kind:'user', ref:'user'}] "
+            "或 phase='in_progress' 表示本 slice 有进展。"
+        )
+    if "OPEN_TASKS_UNDECLARED" in violations:
+        lines.append(
+            "系统将按真实账本停泊，不会无限续跑。"
+            "请在下一外部事件（新任务/用户消息）到来时再推进。"
         )
     lines.append("assistant 文字不是返回值。请立即用工具修正后再次 commit_turn。")
     return "\n".join(lines)

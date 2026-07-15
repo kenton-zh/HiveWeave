@@ -145,7 +145,12 @@ function App() {
         setProcessingAgents(agentIds);
         useAppStore.getState().bumpSocketReconnect();
       },
-      (agentId, processing) => updateProcessingAgent(agentId, processing),
+      (agentId, processing, disposition) => {
+        updateProcessingAgent(agentId, processing);
+        if (disposition) {
+          useAppStore.getState().setAgentDisposition(agentId, disposition);
+        }
+      },
       (event) => {
         useAppStore.getState().addActivity(event as any);
       },

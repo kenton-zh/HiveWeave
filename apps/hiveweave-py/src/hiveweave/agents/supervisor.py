@@ -231,6 +231,25 @@ class AgentManager:
             if conn is None:
                 log.info("start_project_agents_none", project_id=project_id)
                 return
+
+            # P0: heal orphan approved tasks (approved→verifying|closed) before agents wake
+            try:
+                from hiveweave.services.task import TaskService
+
+                migrated = await TaskService().migrate_orphan_approved(project_id)
+                if migrated.get("verifying") or migrated.get("closed"):
+                    log.info(
+                        "orphan_approved_migrated",
+                        project_id=project_id,
+                        **migrated,
+                    )
+            except Exception as e:
+                log.warning(
+                    "orphan_approved_migrate_failed",
+                    project_id=project_id,
+                    error=str(e),
+                )
+
             cursor = await conn.execute(
                 "SELECT id, project_id, name, role, permission_type as role_type, backstory, "
                 "model_id, goal, permission_mode, bound_skills, "

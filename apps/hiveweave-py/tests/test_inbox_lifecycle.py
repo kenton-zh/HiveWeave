@@ -35,6 +35,9 @@ async def test_send_message_allows_active_recipient(monkeypatch):
     async def fake_execute(aid, sql, params):
         executed.append((aid, sql, params))
 
+    async def fake_query_one(aid, sql, params=None):
+        return None
+
     async def fake_publish(*args, **kwargs):
         return None
 
@@ -42,16 +45,18 @@ async def test_send_message_allows_active_recipient(monkeypatch):
         patch("hiveweave.db.meta.get_agent_by_id", new=fake_get),
         patch("hiveweave.services.inbox._ensure_schema", new=fake_ensure),
         patch("hiveweave.db.project.execute", new=fake_execute),
+        patch("hiveweave.db.project.query_one", new=fake_query_one),
         patch(
             "hiveweave.realtime.event_bus.status_event_bus.publish_chat_message",
             new=fake_publish,
         ),
     ):
-        msg = await svc.send_message("from-1", "to-active", "hello")
+        msg = await svc.send_message("from-1", "to-active", "hello please reply")
 
     assert msg["to_agent_id"] == "to-active"
-    assert msg["message"] == "hello"
-    assert len(executed) == 1
+    assert msg["message"] == "hello please reply"
+    assert msg.get("should_wake") is True
+    assert any("INSERT INTO inbox" in str(e[1]) for e in executed)
 
 
 @pytest.mark.asyncio
