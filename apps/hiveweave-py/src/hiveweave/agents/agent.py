@@ -199,6 +199,8 @@ class Agent:
         self._SLICE_BUDGET_MAX = 2
         self._progress_fingerprint: str | None = None
         self._no_progress_streak: int = 0
+        self.visibility: str = "foreground"  # foreground|background|system
+        self._MERGE_WINDOW_MS = 300  # P1: coalesce trigger wakes
 
         # ── asyncio 原语 ──
         self._llm_task: asyncio.Task | None = None
@@ -396,12 +398,39 @@ class Agent:
                     # User-facing chat clears waiting_human into runnable while processing
                     if self.disposition == "waiting_human" and not opts.get("trigger"):
                         self.disposition = "runnable"
+                        # Clear wait contracts on user-driven wake
+                        try:
+                            from hiveweave.services.wait_contract import (
+                                wait_contract_service,
+                            )
+
+                            await wait_contract_service.clear_waits(
+                                self.project_id, self.id
+                            )
+                        except Exception as e:
+                            log.debug("clear_waits_on_user_wake_failed", error=str(e))
+            self.visibility = (
+                "system" if source in ("turn_exit_gate", "open_task_reminder")
+                else "foreground" if not opts.get("trigger") else "background"
+            )
+            try:
+                from hiveweave.services.telemetry import telemetry
+
+                reason = (
+                    "user" if not opts.get("trigger")
+                    else source or "trigger"
+                )
+                if opts.get("merged_wakes"):
+                    reason = "merged_trigger"
+                telemetry.agent_wake(self.id, reason, source=source)
+            except Exception:
+                pass
             self._broadcast_status(
                 "processing",
-                {"disposition": self.disposition, "visibility": (
-                    "system" if source in ("turn_exit_gate", "open_task_reminder")
-                    else "foreground" if not opts.get("trigger") else "background"
-                )},
+                {
+                    "disposition": self.disposition,
+                    "visibility": self.visibility,
+                },
             )
 
             # Fresh turn — drop stale TurnResult + re-resolve workspace (worktree may bind mid-flight)
@@ -1237,6 +1266,30 @@ class Agent:
             pop_pending_turn_result(self.id)
             self.disposition = exit_decision.disposition or "runnable"
 
+            # P1: persist / clear Wait Contracts from accepted TurnResult
+            try:
+                from hiveweave.services.wait_contract import wait_contract_service
+
+                tr = exit_decision.turn_result
+                if tr and tr.phase in ("waiting", "blocked") and tr.waiting_on:
+                    await wait_contract_service.replace_waits(
+                        self.project_id,
+                        self.id,
+                        tr.waiting_on,
+                        phase=tr.phase,
+                        obligations=open_obligations,
+                    )
+                else:
+                    await wait_contract_service.clear_waits(
+                        self.project_id, self.id
+                    )
+            except Exception as e:
+                log.warning(
+                    "wait_contract_persist_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
+
             # No-progress fault
             if self._no_progress_streak >= 2 and open_obligations:
                 self.disposition = "blocked"
@@ -1246,6 +1299,14 @@ class Agent:
                     streak=self._no_progress_streak,
                     fingerprint=fp[:16] if fp else None,
                 )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.agent_no_progress(
+                        self.id, streak=self._no_progress_streak
+                    )
+                except Exception:
+                    pass
             else:
                 # At most one more slice if obligations remain AND fingerprint moved
                 # and phase was in_progress (declaration only — scheduler decides)
@@ -2159,18 +2220,75 @@ class Agent:
 
     # ── 内部: 状态管理 ────────────────────────────────────────
 
+    async def enqueue_wake(
+        self, message: str, opts: dict | None = None
+    ) -> dict:
+        """Enqueue a wake while busy (P1 single-flight). Does not start LLM."""
+        opts = opts or {}
+        async with self._lock:
+            self._message_queue.append(
+                (message, opts, int(time.time() * 1000))
+            )
+            log.info(
+                "wake_enqueued",
+                agent_id=self.id,
+                queue_len=len(self._message_queue),
+                trigger=bool(opts.get("trigger")),
+                preview=(message or "")[:80],
+            )
+            return {"ok": True, "queued": True}
+
     async def _drain_message_queue(self) -> None:
-        """Process queued user messages that arrived while the agent was busy."""
+        """Process queued wakes with a short merge window (P1).
+
+        Trigger/watcher wakes coalesce into one turn; user messages stay FIFO.
+        """
         if not self._message_queue:
             return
-        message, opts, _ts = self._message_queue.pop(0)
-        log.info("chat_dequeued", agent_id=self.id,
-                 remaining=len(self._message_queue),
-                 preview=message[:80])
-        # Process asynchronously — don't block the current completion
-        import asyncio
-        # Use chat() to go through normal flow (acquires lock, sets PROCESSING)
-        await self.chat(message, opts)
+        # Merge window: let near-simultaneous triggers pile up
+        await asyncio.sleep(self._MERGE_WINDOW_MS / 1000.0)
+        if not self._message_queue:
+            return
+
+        batch = list(self._message_queue)
+        self._message_queue.clear()
+
+        triggers = [(m, o, t) for m, o, t in batch if (o or {}).get("trigger")]
+        users = [(m, o, t) for m, o, t in batch if not (o or {}).get("trigger")]
+
+        if triggers:
+            inbox_ids: list[str] = []
+            for _m, o, _t in triggers:
+                for mid in (o or {}).get("inbox_msg_ids") or []:
+                    if mid not in inbox_ids:
+                        inbox_ids.append(mid)
+            message = triggers[-1][0]
+            opts = dict(triggers[-1][1] or {})
+            opts["inbox_msg_ids"] = inbox_ids
+            opts["merged_wakes"] = len(triggers)
+            opts.setdefault("source", "merged_trigger")
+            # User messages wait behind the coalesced trigger
+            self._message_queue.extend(users)
+            log.info(
+                "wake_merged",
+                agent_id=self.id,
+                merged=len(triggers),
+                inbox_ids=len(inbox_ids),
+                users_queued=len(users),
+            )
+            await self.chat(message, opts)
+            return
+
+        if users:
+            message, opts, _ts = users[0]
+            self._message_queue.extend(users[1:])
+            log.info(
+                "chat_dequeued",
+                agent_id=self.id,
+                remaining=len(self._message_queue),
+                preview=message[:80],
+            )
+            await self.chat(message, opts)
 
     async def _finalize_streaming_turn(
         self,

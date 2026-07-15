@@ -644,3 +644,76 @@ coverage/
                 msg = msg[len(CHECKPOINT_PREFIX) + 1:]
             entries.append({"hash": h, "date": date, "message": msg})
         return entries
+
+
+async def heal_project_executor_worktrees(project_id: str) -> dict:
+    """P2: ensure every active executor has a valid worktree before agents start.
+
+    Prunes stale metadata, recreates missing worktrees, updates agents.workspace_path.
+    """
+    from hiveweave.db import meta as meta_db
+    from hiveweave.db import project as project_db
+    import time as _time
+
+    ws = await meta_db.get_project_workspace(project_id)
+    if not ws or not (Path(ws) / ".git").exists():
+        return {"recovered": 0, "failed": 0, "skipped": True}
+
+    await _git(["worktree", "prune"], ws)
+    conn = await project_db.get_project_db_by_project_id(project_id)
+    if conn is None:
+        return {"recovered": 0, "failed": 0, "skipped": True}
+
+    cur = await conn.execute(
+        "SELECT id, name, role, short_id, workspace_path, permission_type "
+        "FROM agents WHERE project_id=? AND status='active' "
+        "AND permission_type='executor'",
+        [project_id],
+    )
+    agents = await cur.fetchall()
+    await cur.close()
+
+    gwt = GitWorktreeService()
+    recovered = 0
+    failed = 0
+    for a in agents:
+        short_id = a["short_id"]
+        cur_ws = a["workspace_path"] or ""
+        if cur_ws and Path(cur_ws).exists() and (Path(cur_ws) / ".git").exists():
+            continue
+        role = a["role"] or "developer"
+        result = await gwt.create(
+            workspace_path=ws,
+            short_id=short_id,
+            task_name=role,
+        )
+        now = int(_time.time() * 1000)
+        if result.get("success") and result.get("path"):
+            await conn.execute(
+                "UPDATE agents SET workspace_path=?, worktree_error=NULL, "
+                "updated_at=? WHERE id=?",
+                [result["path"], now, a["id"]],
+            )
+            await conn.commit()
+            recovered += 1
+            log.info(
+                "worktree_healed",
+                agent_id=a["id"],
+                short_id=short_id,
+                path=result["path"],
+            )
+        else:
+            err = result.get("message") or "worktree heal failed"
+            await conn.execute(
+                "UPDATE agents SET worktree_error=?, updated_at=? WHERE id=?",
+                [err, now, a["id"]],
+            )
+            await conn.commit()
+            failed += 1
+            log.warning(
+                "worktree_heal_failed",
+                agent_id=a["id"],
+                short_id=short_id,
+                error=err,
+            )
+    return {"recovered": recovered, "failed": failed, "skipped": False}

@@ -97,10 +97,23 @@ class InboxService:
             task_id=task_id,
         )
         if wake is None:
+            active_waits = None
+            try:
+                from hiveweave.db import meta as meta_db
+                from hiveweave.services.wait_contract import wait_contract_service
+
+                pid = await meta_db.get_agent_project_id(to_agent_id)
+                if pid:
+                    active_waits = await wait_contract_service.list_active(
+                        pid, to_agent_id
+                    )
+            except Exception as e:
+                log.debug("inbox_wait_lookup_failed", error=str(e))
             wake_flag = should_wake(
                 category,
                 disposition=recipient_disposition,
                 from_agent_id=from_agent_id,
+                active_waits=active_waits or None,
             )
         else:
             wake_flag = bool(wake)
@@ -142,6 +155,12 @@ class InboxService:
                     category=category,
                     key=key[:12],
                 )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.inbox_deduped(to_agent_id, category)
+                except Exception:
+                    pass
                 return {
                     "id": existing["id"],
                     "from_agent_id": from_agent_id,

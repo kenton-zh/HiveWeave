@@ -1,12 +1,14 @@
-"""Project process registry + platform reserved ports (P0).
+"""Project process registry + platform reserved ports (P0/P2).
 
-Full process proxy is P2. P0: refuse reserved binds in agent tools and
-register start_dev_server entries for URL→cwd/pid lookup.
+P0: refuse reserved binds in agent tools and register start_dev_server.
+P2: spawn_project_process injects reserved-port env and rewrites known CLIs.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -24,6 +26,10 @@ _PORT_FLAG_RE = re.compile(
 )
 _PORT_ENV_RE = re.compile(
     r"(?:PORT|VITE_PORT)\s*=\s*(\d{2,5})",
+    re.IGNORECASE,
+)
+_VITE_BARE_RE = re.compile(
+    r"\b(npx\s+)?vite\b|\bnpm\s+run\s+dev\b|\bpnpm\s+(?:run\s+)?dev\b",
     re.IGNORECASE,
 )
 
@@ -96,6 +102,113 @@ def allocate_project_port(project_id: str, preferred: int = 3000) -> int:
             port = 3000
             break
     return port
+
+
+def prepare_spawn_command(
+    command: str,
+    *,
+    project_id: str | None = None,
+    preferred_port: int = 3000,
+) -> tuple[str, dict[str, str], str | None]:
+    """P2 process proxy: rewrite/guard command + inject reserved-port env.
+
+    Returns (command, extra_env, error_message).
+    """
+    extra_env = {
+        "HIVEWEAVE_RESERVED_PORTS": ",".join(
+            str(p) for p in sorted(RESERVED_PORTS)
+        ),
+        "HIVEWEAVE_FORBID_PORTS": ",".join(
+            str(p) for p in sorted(RESERVED_PORTS)
+        ),
+    }
+
+    # Explicit reserved port → hard reject
+    for port in extract_ports_from_command(command):
+        if is_reserved_port(port):
+            return (
+                command,
+                {},
+                (
+                    f"Port {port} is reserved for HiveWeave platform "
+                    f"(API/UI). Use a project port (e.g. 3000+) via "
+                    f"start_dev_server, not --port {port}."
+                ),
+            )
+
+    ports = extract_ports_from_command(command)
+    if ports:
+        return command, extra_env, None
+
+    # Bare vite/npm run dev → allocate project port (don't leave as 5173)
+    if _VITE_BARE_RE.search(command or ""):
+        pid = project_id or "default"
+        port = allocate_project_port(pid, preferred_port)
+        extra_env["PORT"] = str(port)
+        extra_env["VITE_PORT"] = str(port)
+        if "vite" in (command or "").lower():
+            rewritten = f"{command.rstrip()} --port {port} --strictPort"
+        else:
+            rewritten = f"PORT={port} {command}"
+        log.info(
+            "spawn_proxy_rewrote_vite",
+            project_id=project_id,
+            port=port,
+            original=(command or "")[:80],
+        )
+        return rewritten, extra_env, None
+
+    return command, extra_env, None
+
+
+def spawn_project_process(
+    command: str,
+    *,
+    cwd: str,
+    project_id: str | None = None,
+    preferred_port: int = 3000,
+    env: dict[str, str] | None = None,
+    **popen_kwargs: Any,
+) -> tuple[subprocess.Popen | None, str | None, dict[str, Any]]:
+    """Spawn with reserved-port proxy. Returns (proc, error, meta)."""
+    cmd, extra_env, err = prepare_spawn_command(
+        command, project_id=project_id, preferred_port=preferred_port
+    )
+    if err:
+        return None, err, {}
+
+    child_env = os.environ.copy()
+    for key in ("PORT", "VITE_PORT"):
+        val = child_env.get(key)
+        if val and val.isdigit() and is_reserved_port(int(val)):
+            child_env.pop(key, None)
+    if env:
+        child_env.update(env)
+    child_env.update(extra_env)
+
+    creationflags = popen_kwargs.pop("creationflags", 0)
+    if os.name == "nt" and creationflags == 0:
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            shell=True,
+            env=child_env,
+            creationflags=creationflags,
+            **popen_kwargs,
+        )
+    except Exception as e:
+        return None, f"Failed to spawn: {e}", {}
+
+    meta = {
+        "command": cmd,
+        "cwd": cwd,
+        "pid": proc.pid,
+        "env_port": child_env.get("PORT") or child_env.get("VITE_PORT"),
+    }
+    return proc, None, meta
 
 
 def register(record: ProcessRecord) -> ProcessRecord:

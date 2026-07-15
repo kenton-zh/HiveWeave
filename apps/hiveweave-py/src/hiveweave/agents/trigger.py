@@ -223,13 +223,29 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
             agent._on_stream_event = on_stream
             log.info("trigger_patch_agent_callbacks", agent_id=agent_id)
 
-        # 5. 检查 agent 是否正在 processing → 跳过
-        # 对齐 Elixir agent.ex:217-224: 等完成后自检 re-trigger
+        # 5. If busy → enqueue wake (P1 single-flight) instead of drop
         if agent.status.value == "processing":
+            await _handoff_service.accept_pending_handoffs(project_id, agent_id)
+            result = await build_trigger_context(agent_record, trigger_type)
+            if result is None:
+                log.info("trigger_busy_no_context", agent_id=agent_id)
+                return
+            context, inbox_msg_ids, from_agent_id = result
+            await agent.enqueue_wake(
+                context,
+                opts={
+                    "trigger": True,
+                    "from_agent_id": from_agent_id,
+                    "inbox_msg_ids": inbox_msg_ids,
+                    "source": "trigger_busy_queue",
+                    "is_background": True,
+                },
+            )
             log.info(
-                "trigger_busy_skip",
+                "trigger_busy_enqueued",
                 agent_id=agent_id,
                 name=agent_record.get("name"),
+                inbox_pending=len(inbox_msg_ids or []),
             )
             return
 
@@ -293,6 +309,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 "trigger": True,
                 "from_agent_id": from_agent_id,
                 "inbox_msg_ids": inbox_msg_ids,
+                "source": "trigger",
             },
         )
 

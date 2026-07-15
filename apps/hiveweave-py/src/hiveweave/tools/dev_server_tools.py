@@ -20,6 +20,7 @@ from hiveweave.services.process_registry import (
     lookup_by_port,
     lookup_by_project,
     register,
+    spawn_project_process,
 )
 
 
@@ -85,18 +86,17 @@ async def start_dev_server_tool(
         cmd = f"npx vite --host 0.0.0.0 --port {port} --strictPort"
 
     try:
-        # Detached process so agent turn can end
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        proc = subprocess.Popen(
+        proc, spawn_err, meta = spawn_project_process(
             cmd,
             cwd=work_cwd,
-            shell=True,
+            project_id=project_id,
+            preferred_port=port,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
         )
+        if spawn_err or proc is None:
+            return ToolResult.err(spawn_err or "Failed to start")
+        cmd = meta.get("command") or cmd
     except Exception as e:
         return ToolResult.err(f"Failed to start: {e}")
 
