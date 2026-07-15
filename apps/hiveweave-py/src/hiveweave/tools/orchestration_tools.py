@@ -40,6 +40,7 @@ async def _send_message_core(
     priority: str,
     expect_report: bool,
     ctx,
+    message_type: str = "normal",
 ) -> ToolResult:
     """Core message-sending logic shared by all ``message_*`` tools.
 
@@ -51,6 +52,7 @@ async def _send_message_core(
       fallback).
     - Self-skip (sending to yourself is a no-op).
     - TeamChat recording for the sender (BUG-034 fix).
+    - message_type: ``ask`` forces expect_report; ``notify`` forces no expect.
     """
     if not ctx or not getattr(ctx, "inbox", None):
         return ToolResult.err(
@@ -81,6 +83,15 @@ async def _send_message_core(
         )
     if not message:
         return ToolResult.err("send_message requires 'message' (body text)")
+
+    if message_type == "ask":
+        expect_report = True
+    elif message_type == "notify":
+        expect_report = False
+    else:
+        from hiveweave.services.reply_policy import resolve_expect_report
+
+        expect_report = resolve_expect_report(expect_report, message)
 
     project_id = await get_project_id(agent_id)
     if not project_id:
@@ -126,25 +137,30 @@ async def _send_message_core(
         )
 
     all_agents = await ctx.org.list_agents(project_id)
+    # Prefer active agents; never deliver to archived (ghost mailbox)
+    active_agents = [
+        a for a in all_agents if (a.get("status") or "active") == "active"
+    ]
     resolved: list[dict[str, Any]] = []
     not_found: list[str] = []
+    archived_hits: list[str] = []
     for r in recipients:
         r_stripped = r.strip()
         match = None
-        # Try short_id match
-        for a in all_agents:
+        # Try short_id match (active first)
+        for a in active_agents:
             if a.get("short_id", "").upper() == r_stripped.upper():
                 match = a
                 break
         # Try name match (case-insensitive)
         if not match:
-            for a in all_agents:
+            for a in active_agents:
                 if a.get("name", "").lower() == r_stripped.lower():
                     match = a
                     break
         # Try role match (e.g. "HR") -- last resort, warn to use 花名
         if not match:
-            for a in all_agents:
+            for a in active_agents:
                 if a.get("role", "").lower() == r_stripped.lower():
                     match = a
                     log.warning(
@@ -155,19 +171,29 @@ async def _send_message_core(
                         hint="use 花名 or short_id instead of role",
                     )
                     break
-        if match:
-            # Skip self -- sending to yourself is a no-op
-            if match["id"] == agent_id:
-                log.info(
-                    "send_message_self_skip",
-                    agent_id=agent_id,
-                    recipient=r,
-                    match_name=match.get("name"),
-                )
-                continue
-            resolved.append(match)
-        else:
+        if not match:
+            # Detect archived-only hits for a clear error
+            for a in all_agents:
+                if (a.get("status") or "") != "archived":
+                    continue
+                if (
+                    a.get("short_id", "").upper() == r_stripped.upper()
+                    or a.get("name", "").lower() == r_stripped.lower()
+                ):
+                    archived_hits.append(r_stripped)
+                    break
             not_found.append(r)
+            continue
+        # Skip self -- sending to yourself is a no-op
+        if match["id"] == agent_id:
+            log.info(
+                "send_message_self_skip",
+                agent_id=agent_id,
+                recipient=r,
+                match_name=match.get("name"),
+            )
+            continue
+        resolved.append(match)
 
     if not resolved:
         # If we already sent to user, return partial success
@@ -177,10 +203,16 @@ async def _send_message_core(
                 results=results,
                 not_found=not_found,
             )
+        hint = ""
+        if archived_hits:
+            hint = (
+                f" Archived (cannot message): {archived_hits}. "
+                "Use transfer_agent or hire a replacement — do not message ghosts."
+            )
         return ToolResult.err(
-            f"No recipients found. Unknown: {not_found}. "
-            f"Available agents: "
-            f"{[(a['name'], a.get('short_id'), a.get('role')) for a in all_agents]}"
+            f"No active recipients found. Unknown: {not_found}.{hint} "
+            f"Available active agents: "
+            f"{[(a['name'], a.get('short_id'), a.get('role')) for a in active_agents]}"
         )
 
     # ── Send to each resolved recipient ─────────────────
@@ -194,6 +226,7 @@ async def _send_message_core(
             message=message,
             priority=priority,
             expect_report=expect_report,
+            message_type=message_type,
         )
         results.append({
             "to": target["name"],
@@ -255,7 +288,10 @@ class SendMessageParams(BaseModel):
     expect_report: bool = Field(
         default=False,
         alias="expectReport",
-        description="Whether a response is expected from the recipient.",
+        description=(
+            "True when recipient must reply via send_message. "
+            "Also auto-set when message text asks for 回复/report back."
+        ),
         json_schema_extra={"aliases": ["expectReport", "expect_report"]},
     )
 
@@ -1054,7 +1090,10 @@ class ScheduleAlarmParams(BaseModel):
         },
     )
     purpose: str = Field(
-        description="Message delivered when the alarm fires.",
+        description=(
+            "Message delivered when the alarm fires. "
+            "For task waits include taskId, e.g. 'task <id>: check script result'."
+        ),
         json_schema_extra={"aliases": ["message", "description"]},
     )
     repeat_interval_seconds: int = Field(

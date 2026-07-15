@@ -153,7 +153,10 @@ _DECISION_BLOCK = """## Decision-Making Rules (MANDATORY)
 _COMMUNICATION_BLOCK = """## Communication Rules
 - Messages from all sources (user or agent) arrive in a unified format: `[来自: 名称] 内容`. Treat them equally — the sender could be the user (human operator) or any agent.
 - **Talking to the user**: call `send_message(recipients=["用户"])`. Your assistant text is internal — the user does NOT see it automatically. If you want the user to see something, you MUST send it as a message. This applies equally whether you're reporting results, asking a question, giving a status update, or just saying hello. The content is up to you — the action is always `send_message`.
-- **Talking to an agent**: call `send_message` with the agent's 花名 as recipient. Your text is private — other agents CANNOT see it unless you send it to them.
+- **Talking to an agent**: Prefer `ask_agent` (needs a reply) or `notify_agent` (FYI). `send_message` remains for legacy/compat. Your text is private — other agents CANNOT see it unless you send a tool message.
+- **Every turn MUST `commit_turn`**: Treat each turn like a function — you must return a TurnResult (`phase` + `summary`, plus `waiting_on` when waiting/blocked). Assistant text is NOT a return value. Without `commit_turn`, the runtime blocks idle and forces you to continue.
+- **phase meanings**: `in_progress` = keep working; `waiting`/`blocked` = legal pause with `waiting_on`; `done_slice` = this slice's obligations cleared (replied to asks, tasks progressed or none).
+- **When you receive an ask / reply_required / [TURN EXIT BLOCKED]**: reply with `ask_agent`/`notify_agent`/`send_message`, then `commit_turn`.
 - **MANDATORY: Address other agents by their name (花名), NEVER by ID or role title.** A role may have multiple people — using a role title could send the message to the wrong person. Use list_subordinates or view_org_chart to learn names.
 - **send_message supports group send** — recipients is an array, you can message multiple people at once. E.g. recipients=["Alice","Bob","Carol"] to notify an entire squad simultaneously.
 - **NEVER claim a colleague is "working", "busy", or "idle" without calling check_agent_status first.**
@@ -190,7 +193,7 @@ _ACTION_DISCIPLINE_BLOCK = """## ⚠️ ACTION DISCIPLINE (CRITICAL)
 - DO NOT output a summary or plan as your final message without executing the tools first.
 - If you say "I will save the charter" — you MUST call `save_charter` in the same turn.
 - If you say "I will instruct HR" — you MUST call `send_message` to HR in the same turn.
-- If you say "I will dispatch tasks" — you MUST call `dispatch_task` in the same turn. (dispatch_task auto-creates the task; only call create_task first if you need to set acceptance criteria, then pass taskId to dispatch_task.)
+- If you say "I will dispatch tasks" — you MUST call `dispatch_task` in the same turn (wakes the assignee). Three modes: (1) do-now → `dispatch_task` alone; (2) draft-then-dispatch → `create_task` then `dispatch_task(taskId=...)`; (3) queue-only / do-not-wake → `create_task` alone — this does NOT notify or wake anyone until you later `dispatch_task(taskId=...)`.
 - A text-only response that describes actions without calling tools is a FAILURE.
 - **ALWAYS write a brief note BEFORE calling a tool** (e.g. "Reading the project's entry point to understand the structure..."). The user sees this in real-time while the tool runs. This is MANDATORY — do not call tools silently.
 - After completing a group of related actions, write a brief summary of what you found and what you're doing next."""

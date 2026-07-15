@@ -34,9 +34,12 @@ REAL_SECONDS_PER_GAME_DAY = 3600
 GAME_SECONDS_PER_DAY = 86400
 TICK_INTERVAL = 5
 STALL_CHECK_TICKS = 24        # 24 * 5s = 120s = 2min
+STREAMING_SWEEP_TICKS = 6     # 6 * 5s = 30s — auto-heal orphan is_streaming=1
 STALL_IDLE_MS = 10 * 60 * 1000        # 10 min idle threshold
 STALL_COOLDOWN_MS = 15 * 60 * 1000    # 15 min cooldown (避免重复触发)
 STALL_ESCALATION_THRESHOLD = 3        # 同一对未回复触发 3 次后升级到上级
+# Sender asked for a reply but got silence — wake waiter sooner than recipient stall
+AWAITING_REPLY_MS = 3 * 60 * 1000     # 3 min
 
 # Bug K: task 状态停留超时阈值（毫秒）
 # 每个 task 状态有一个"合理停留时间"，超过则催办负责人
@@ -242,6 +245,9 @@ class GameTimeService:
             except Exception as e:
                 log.error("alarm_fire_failed", alarm_id=alarm["id"], error=str(e))
         state["alarms"] = [a for a in state["alarms"] if not a["fired"]]
+        # Auto-heal: clear orphan streaming messages (agent idle but is_streaming=1)
+        if state["tick_count"] % STREAMING_SWEEP_TICKS == 0:
+            await self._sweep_orphan_streaming(project_id)
         # Watchdog: 每 2 分钟检查停滞 agent，直接触发（不经过上级）
         if state["tick_count"] % STALL_CHECK_TICKS == 0:
             await self._check_stalled(project_id)
@@ -256,6 +262,32 @@ class GameTimeService:
                 await self.tick(project_id)
             except Exception as e:
                 log.error("game_time_tick_error", project_id=project_id, error=str(e))
+
+    async def _sweep_orphan_streaming(self, project_id: str) -> None:
+        """Clear is_streaming=1 rows whose agent is not actively PROCESSING.
+
+        Users must never need a manual/AI 'zombie clear'. Boot clears crash
+        leftovers; this runtime sweep catches mid-session orphans within ~30s.
+        """
+        try:
+            from hiveweave.agents.supervisor import agent_manager
+            from hiveweave.services.chat_message import ChatMessageService
+
+            protect = {
+                aid
+                for aid, pid in agent_manager.list_processing()
+                if pid == project_id
+            }
+            await ChatMessageService().clear_orphan_streaming(
+                project_id,
+                protect_agent_ids=protect,
+            )
+        except Exception as e:
+            log.warning(
+                "streaming_sweep_failed",
+                project_id=project_id,
+                error=str(e),
+            )
 
     async def _load_state(self, project_id: str) -> dict:
         rows = await _query(project_id,
@@ -393,22 +425,29 @@ class GameTimeService:
 
         now_ms = int(time.time() * 1000)
 
-        # ── Case 1: 未读的 expect_report 消息（inbox watcher 兜底）──
-        unread_reply = await _query(project_id,
-            "SELECT i.to_agent_id, i.from_agent_id, i.message, i.created_at, i.id "
+        # ── Case 1: 未读的 expect_report / 文案要求回复（inbox watcher 兜底）──
+        unread_candidates = await _query(project_id,
+            "SELECT i.to_agent_id, i.from_agent_id, i.message, i.created_at, i.id, "
+            "i.expect_report "
             "FROM inbox i "
-            "WHERE i.read = 0 AND i.expect_report = 1 "
+            "WHERE i.read = 0 "
+            "AND (i.expect_report = 1 OR i.message LIKE '%回复%' "
+            "     OR lower(i.message) LIKE '%reply%' "
+            "     OR lower(i.message) LIKE '%report back%') "
             f"AND i.created_at < {now_ms - STALL_IDLE_MS} "
             "AND i.to_agent_id IN ("
             "  SELECT id FROM agents WHERE status = 'active')",
             [])
 
-        # ── Case 2: 已读但未回复的 expect_report 消息 ──
-        # 检测方式: 收到 expect_report 消息后，没有给发送方发过任何回复
-        read_unreplied = await _query(project_id,
-            "SELECT i.to_agent_id, i.from_agent_id, i.message, i.created_at, i.id "
+        # ── Case 2: 已读但未回复 ──
+        read_candidates = await _query(project_id,
+            "SELECT i.to_agent_id, i.from_agent_id, i.message, i.created_at, i.id, "
+            "i.expect_report "
             "FROM inbox i "
-            "WHERE i.read = 1 AND i.expect_report = 1 "
+            "WHERE i.read = 1 "
+            "AND (i.expect_report = 1 OR i.message LIKE '%回复%' "
+            "     OR lower(i.message) LIKE '%reply%' "
+            "     OR lower(i.message) LIKE '%report back%') "
             f"AND i.created_at < {now_ms - STALL_IDLE_MS} "
             "AND NOT EXISTS ("
             "  SELECT 1 FROM inbox r "
@@ -419,6 +458,16 @@ class GameTimeService:
             "AND i.to_agent_id IN ("
             "  SELECT id FROM agents WHERE status = 'active')",
             [])
+
+        from hiveweave.services.reply_policy import message_requests_reply
+
+        def _needs_reply(row: dict) -> bool:
+            return bool(row.get("expect_report")) or message_requests_reply(
+                row.get("message")
+            )
+
+        unread_reply = [m for m in unread_candidates if _needs_reply(m)]
+        read_unreplied = [m for m in read_candidates if _needs_reply(m)]
 
         # ── Case 3: accepted handoff 且 expect_report=1 且 reported_up=0 ──
         unreported_handoffs = await _query(project_id,
@@ -507,13 +556,65 @@ class GameTimeService:
 
         # 扫描所有非终态 task，检查在当前状态停留是否超过阈值
         # 按 assignee/creator 分组合并消息，每个 agent 只 trigger 一次
-        stalled_tasks = await _query(project_id,
-            "SELECT id, title, status, assignee_id, creator_id, "
-            "updated_at, submitted_at, claimed_at "
-            "FROM tasks WHERE status IN ('created','claimed','running',"
-            "'submitted','reviewing','rework') "
-            "AND assignee_id IS NOT NULL",
-            [])
+        # blocked 故意不入选：合法等待不按沉默催办
+        for col, coldef in (("wait_kind", "TEXT"), ("wake_at", "INTEGER")):
+            try:
+                await _execute(
+                    project_id,
+                    f"ALTER TABLE tasks ADD COLUMN {col} {coldef}",
+                )
+            except Exception:
+                pass
+
+        try:
+            stalled_tasks = await _query(project_id,
+                "SELECT id, title, status, assignee_id, creator_id, "
+                "updated_at, submitted_at, claimed_at, wake_at "
+                "FROM tasks WHERE status IN ('created','claimed','running',"
+                "'submitted','reviewing','rework') "
+                "AND is_archived = 0",
+                [])
+        except Exception:
+            stalled_tasks = await _query(project_id,
+                "SELECT id, title, status, assignee_id, creator_id, "
+                "updated_at, submitted_at, claimed_at "
+                "FROM tasks WHERE status IN ('created','claimed','running',"
+                "'submitted','reviewing','rework') "
+                "AND is_archived = 0",
+                [])
+
+        # handoff 存在 ⇒ 已 dispatch；纯 create 入队无 handoff
+        handoff_task_ids: set[str] = set()
+        try:
+            hrows = await _query(
+                project_id,
+                "SELECT DISTINCT task_id FROM handoffs WHERE task_id IS NOT NULL",
+                [],
+            )
+            handoff_task_ids = {
+                r["task_id"] for r in hrows if r["task_id"]
+            }
+        except Exception:
+            handoff_task_ids = set()
+
+        # 有未来 alarm 的 agent：跳过 task stall（主动等待）
+        agents_with_future_alarms: set[str] = set()
+        try:
+            state_gs = int(
+                (_states.get(project_id) or {}).get("current_game_seconds") or 0
+            )
+            arows = await _query(
+                project_id,
+                "SELECT DISTINCT to_agent_id FROM scheduled_alarms "
+                "WHERE fired = 0 AND status = 'pending' "
+                "AND fire_at_game_seconds > ?",
+                [state_gs],
+            )
+            agents_with_future_alarms = {
+                r["to_agent_id"] for r in arows if r["to_agent_id"]
+            }
+        except Exception:
+            agents_with_future_alarms = set()
 
         # 按 agent 分组超时 task
         # key: agent_id, value: list of {task_id, title, status, stall_ms}
@@ -522,6 +623,13 @@ class GameTimeService:
             status = t["status"]
             threshold = TASK_STALL_THRESHOLDS.get(status)
             if not threshold:
+                continue
+            # Future wake_at → still legally waiting on a timer
+            try:
+                wake_at = t["wake_at"]
+            except (KeyError, IndexError, TypeError):
+                wake_at = None
+            if wake_at is not None and int(wake_at) > now_ms:
                 continue
             # 确定状态进入时间
             if status == "submitted":
@@ -533,20 +641,39 @@ class GameTimeService:
             if not entered_at:
                 continue
             stall_ms = now_ms - entered_at
-            if stall_ms < threshold:
+            # Activity stretch: recent updates buy more silence budget
+            updated_at = t["updated_at"] or entered_at
+            activity_age = now_ms - int(updated_at)
+            if activity_age < 3 * 60 * 1000:
+                effective = int(threshold * 2.0)
+            elif activity_age < 10 * 60 * 1000:
+                effective = int(threshold * 1.5)
+            else:
+                effective = threshold
+            if stall_ms < effective:
                 continue
-            # 确定负责人：submitted/reviewing → creator，其他 → assignee
+            # 确定负责人：
+            # - submitted/reviewing → creator
+            # - created 且从未 dispatch（无 handoff）→ creator（队列入账，催派发）
+            # - 其他 → assignee
             if status in ("submitted", "reviewing"):
+                responsible = t["creator_id"]
+            elif status == "created" and t["id"] not in handoff_task_ids:
                 responsible = t["creator_id"]
             else:
                 responsible = t["assignee_id"]
             if not responsible:
+                continue
+            if responsible in agents_with_future_alarms:
                 continue
             task_trigger_map.setdefault(responsible, []).append({
                 "task_id": t["id"],
                 "title": t["title"] or "(untitled)",
                 "status": status,
                 "stall_ms": stall_ms,
+                "queued_undispatched": (
+                    status == "created" and t["id"] not in handoff_task_ids
+                ),
             })
 
         # 处理超时 task：按 agent 合并消息 + trigger
@@ -569,6 +696,20 @@ class GameTimeService:
             task_trackers = state["task_stall_trackers"]
 
             for aid, tasks in task_trigger_map.items():
+                # Skip archived / non-active agents (dead mailbox)
+                agent_row = None
+                try:
+                    arows = await _query(
+                        project_id,
+                        "SELECT id, name, status FROM agents WHERE id = ? LIMIT 1",
+                        [aid],
+                    )
+                    agent_row = arows[0] if arows else None
+                except Exception:
+                    agent_row = None
+                if not agent_row or (agent_row.get("status") or "") != "active":
+                    continue
+
                 # 冷却检查：跳过最近催过的 task
                 pending_tasks = []
                 for t in tasks:
@@ -595,12 +736,19 @@ class GameTimeService:
                 lines = []
                 for t in pending_tasks:
                     minutes = int(t["stall_ms"] / 60000)
-                    label = status_labels.get(t["status"], "需推进")
-                    lines.append(f"  - [{t['title']}] 状态：{t['status']}（{label}），已停留 {minutes} 分钟")
+                    if t.get("queued_undispatched"):
+                        label = "仅入队未派发，请 dispatch_task(taskId=...) 叫醒执行者"
+                    else:
+                        label = status_labels.get(t["status"], "需推进")
+                    lines.append(
+                        f"  - [{t['title']}] 状态：{t['status']}（{label}），"
+                        f"已停留 {minutes} 分钟"
+                    )
                 msg = (
                     "[TASK WATCHDOG] 以下任务需要你推进：\n"
                     + "\n".join(lines)
-                    + "\n请尽快处理：提交成果(submit_task)、审查(review_task)或更新进度。"
+                    + "\n请尽快处理：提交成果(submit_task)、审查(review_task)、"
+                    "派发(dispatch_task)或更新进度。"
                 )
 
                 log.warning("task_stall_trigger",
@@ -612,6 +760,8 @@ class GameTimeService:
                 try:
                     from hiveweave.services.inbox import InboxService
                     inbox = InboxService()
+                    # Upsert semantics: clear prior watchdog nudges first
+                    await inbox.supersede_watchdog_messages(aid)
                     await inbox.send_message(
                         "system", aid, msg,
                         message_type="system", priority="urgent")
@@ -621,6 +771,10 @@ class GameTimeService:
                 except Exception as e:
                     log.error("task_stall_trigger_failed",
                               agent_id=aid, error=str(e))
+
+        # ── Case 5: 等待方自救 — 发出「请回复」后对方一直没回 ──
+        # 覆盖 expect_report=1 与文案要求回复但漏标 flag 的情况
+        await self._nudge_awaiting_replies(project_id, now_ms, name_map)
 
         if not trigger_map:
             return
@@ -725,6 +879,10 @@ class GameTimeService:
                         + "\n请调用 send_message(recipients=['花名'], message='...') "
                         "回复上述每一位。注意：回复给其他人不算回复给这些人。"
                     )
+                    # Upsert: clear prior [WATCHDOG] nudges before inserting
+                    await inbox.supersede_watchdog_messages(
+                        aid, prefixes=["[WATCHDOG]"]
+                    )
                     await inbox.send_message(
                         "system", aid, msg,
                         message_type="system", priority="urgent")
@@ -766,6 +924,136 @@ class GameTimeService:
             except Exception as e:
                 log.error("watchdog_trigger_failed",
                           agent_id=aid, error=str(e))
+
+    async def _nudge_awaiting_replies(
+        self,
+        project_id: str,
+        now_ms: int,
+        name_map: dict[str, str],
+    ) -> None:
+        """Wake senders who asked for a reply but got silence (Case 5).
+
+        Recipient-side stall (Cases 1–2) may also fire; this wakes the *waiter*
+        so they can follow up or proceed (e.g. dispatch_task) instead of
+        hanging forever on \"等待回复\".
+        """
+        state = _states.get(project_id)
+        if not state:
+            return
+
+        from hiveweave.services.reply_policy import message_requests_reply
+
+        candidates = await _query(
+            project_id,
+            "SELECT i.id, i.from_agent_id, i.to_agent_id, i.message, "
+            "i.created_at, i.expect_report "
+            "FROM inbox i "
+            "WHERE i.from_agent_id IN ("
+            "  SELECT id FROM agents WHERE status = 'active') "
+            "AND i.to_agent_id IN ("
+            "  SELECT id FROM agents WHERE status = 'active') "
+            "AND (i.expect_report = 1 OR i.message LIKE '%回复%' "
+            "     OR lower(i.message) LIKE '%reply%' "
+            "     OR lower(i.message) LIKE '%report back%') "
+            f"AND i.created_at < {now_ms - AWAITING_REPLY_MS} "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM inbox r "
+            "  WHERE r.from_agent_id = i.to_agent_id "
+            "  AND r.to_agent_id = i.from_agent_id "
+            "  AND r.created_at > i.created_at"
+            ")",
+            [],
+        )
+
+        by_waiter: dict[str, list[dict]] = {}
+        for m in candidates:
+            if not (
+                m.get("expect_report") or message_requests_reply(m.get("message"))
+            ):
+                continue
+            by_waiter.setdefault(m["from_agent_id"], []).append(m)
+
+        if not by_waiter:
+            return
+
+        # Fill missing names
+        missing = [aid for aid in by_waiter if aid not in name_map]
+        for mlist in by_waiter.values():
+            for m in mlist:
+                tid = m["to_agent_id"]
+                if tid not in name_map:
+                    missing.append(tid)
+        if missing:
+            ph = ", ".join(["?"] * len(set(missing)))
+            rows = await _query(
+                project_id,
+                f"SELECT id, name FROM agents WHERE id IN ({ph})",
+                list(set(missing)),
+            )
+            for r in rows:
+                name_map[r["id"]] = r["name"]
+
+        if "await_reply_trackers" not in state:
+            state["await_reply_trackers"] = {}
+        trackers: dict = state["await_reply_trackers"]
+
+        for waiter_id, msgs in by_waiter.items():
+            tracker = trackers.get(waiter_id, {"ts": 0})
+            if now_ms - tracker["ts"] < STALL_COOLDOWN_MS:
+                continue
+            trackers[waiter_id] = {"ts": now_ms}
+
+            # Dedupe by recipient
+            seen: set[str] = set()
+            lines: list[str] = []
+            for m in msgs:
+                tid = m["to_agent_id"]
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                tname = name_map.get(tid, tid[:8])
+                minutes = max(1, int((now_ms - int(m["created_at"])) / 60000))
+                preview = (m.get("message") or "")[:40].replace("\n", " ")
+                lines.append(f"  - {tname}（已等待 {minutes} 分钟）：{preview}")
+
+            if not lines:
+                continue
+
+            msg = (
+                "[AWAITING REPLIES] 你发出的消息要求对方回复，但以下人员尚未"
+                "通过 send_message 回复你：\n"
+                + "\n".join(lines)
+                + "\n不要无限空等。请二选一：\n"
+                "1) send_message 催促未回复者（expectReport=true）\n"
+                "2) 若已足够推进（如工具验证可视为完成）→ 立刻用 "
+                "dispatch_task / create_task 进入下一阶段"
+            )
+
+            log.warning(
+                "awaiting_reply_nudge",
+                project_id=project_id,
+                waiter_id=waiter_id,
+                waiter=name_map.get(waiter_id, waiter_id[:8]),
+                pending=len(lines),
+            )
+            try:
+                from hiveweave.services.inbox import InboxService
+                from hiveweave.agents.trigger import trigger_subordinate
+
+                await InboxService().send_message(
+                    "system",
+                    waiter_id,
+                    msg,
+                    message_type="system",
+                    priority="urgent",
+                )
+                await trigger_subordinate(waiter_id)
+            except Exception as e:
+                log.error(
+                    "awaiting_reply_nudge_failed",
+                    waiter_id=waiter_id,
+                    error=str(e),
+                )
 
     @staticmethod
     def _format(game_seconds: int) -> str:

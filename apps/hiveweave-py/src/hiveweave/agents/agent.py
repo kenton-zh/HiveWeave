@@ -189,6 +189,10 @@ class Agent:
         self._streaming_msg_id: str | None = None
         self._reply_reminder_count = 0  # expect_reply 提示次数，3 次后升级到上级
         self._REPLY_REMINDER_MAX = 3   # 即时提醒上限
+        self._task_reminder_count = 0  # open-task 收工续跑次数
+        self._TASK_REMINDER_MAX = 2    # 防死循环
+        self._turn_gate_count = 0      # TurnResult 退出门禁续跑次数
+        self._TURN_GATE_MAX = 3
         self._resume_cooldown_until: float = 0.0  # monotonic deadline；超时后防 doom loop
 
         # ── asyncio 原语 ──
@@ -381,6 +385,12 @@ class Agent:
             self.empty_retry_count = 0
             self._broadcast_status("processing")
 
+            # Fresh turn — drop stale TurnResult + re-resolve workspace (worktree may bind mid-flight)
+            from hiveweave.services.turn_session import clear_pending_turn_result
+
+            clear_pending_turn_result(self.id)
+            self._workspace_path = None
+
             # 保存 inbox_msg_ids（在 LLM 非空输出后标记已读）
             self.pending_inbox_msg_ids = opts.get("inbox_msg_ids")
 
@@ -390,6 +400,17 @@ class Agent:
                 "opts": opts,
                 "started_at": int(time.time() * 1000),
             }
+
+            # Drop leftover streaming rows from a prior incomplete turn before
+            # inserting a new placeholder (product auto-heal — no manual clear).
+            try:
+                await self._chat_msg.update_streaming_messages_done(self.id)
+            except Exception as e:
+                log.warning(
+                    "pre_turn_clear_streaming_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
 
             # Save a streaming placeholder BEFORE the LLM call.
             # If the agent crashes mid-response, this partial record survives.
@@ -462,16 +483,10 @@ class Agent:
                                 agent_id=self.id, error=str(e))
                 self.pending_inbox_msg_ids = None
             # A6(2) 修复：cancel 时清理 streaming 标志，防止僵尸消息
-            # 对齐错误路径和安全超时路径，它们都调用了此清理
             try:
-                if self._streaming_msg_id:
-                    await self._chat_msg.update_message(
-                        self.id, self._streaming_msg_id,
-                        {"content": "[对话被中断]", "is_streaming": False},
-                    )
-                    self._streaming_msg_id = None
-                # 兜底：清理该 agent 的所有僵尸 streaming 消息
-                await self._chat_msg.update_streaming_messages_done(self.id)
+                await self._finalize_streaming_turn(
+                    content="[对话被中断]",
+                )
             except Exception as e:
                 log.warning("cancel_clear_streaming_failed",
                             agent_id=self.id, error=str(e))
@@ -496,6 +511,9 @@ class Agent:
         对齐 Elixir agent.ex:336 run_llm/2 + handle_info({ref, result})。
         """
         current_task = asyncio.current_task()
+        # Placeholder created in chat() before this task starts — own it so
+        # finally never clears a newer turn's streaming row.
+        owned_streaming_id = self._streaming_msg_id
         try:
             # 构建 messages
             messages = await self._build_messages(message, opts)
@@ -595,6 +613,23 @@ class Agent:
             if self._llm_task is current_task:
                 self._llm_task = None
                 self._cancel_safety_timer()
+                # Finalize only this task's placeholder. Prefer row update;
+                # allow agent-wide fallback only if we still own the pointer
+                # (no newer chat() has replaced _streaming_msg_id).
+                if owned_streaming_id:
+                    try:
+                        await self._finalize_streaming_turn(
+                            msg_id=owned_streaming_id,
+                            allow_agent_wide_fallback=(
+                                self._streaming_msg_id == owned_streaming_id
+                            ),
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "finally_clear_streaming_failed",
+                            agent_id=self.id,
+                            error=str(e),
+                        )
                 if self.status == AgentState.PROCESSING:
                     self._reset_to_idle()
 
@@ -846,30 +881,62 @@ class Agent:
         return self.config.get("_context_window", CONTEXT_WINDOW_DEFAULT)
 
     async def _get_workspace_path(self) -> str:
-        """获取工作区路径（缓存）。
+        """获取工作区路径（每轮 chat 开始会清空缓存）。
 
         优先使用 agent 专属的 worktree 路径（agents.workspace_path），
-        实现 agent 间工作区隔离。若未分配 worktree（coordinator 角色
-        或旧数据），回退到项目根目录。
+        实现 agent 间工作区隔离。Executor 若未绑定或路径失效，会懒创建
+        worktree 并写回 DB（不依赖仅启动时的 lifespan recovery）。
+        Coordinator / 恢复失败时回退到项目根目录。
         """
-        if self._workspace_path is None:
-            # 1. 先查 agents.workspace_path（executor 应有自己的 worktree）
-            try:
-                from hiveweave.services.org import OrgService
-                org = OrgService()
-                agent_row = await org.get_agent(self.id)
-                if agent_row and agent_row.get("workspace_path"):
-                    ws = agent_row["workspace_path"]
-                    # 校验 worktree 目录确实存在（防止指向已删除的目录）
-                    import os as _os
-                    if _os.path.isdir(ws):
-                        self._workspace_path = ws
+        if self._workspace_path is not None:
+            return self._workspace_path
+
+        import os as _os
+        from pathlib import Path as _Path
+
+        project_ws = await meta_db.get_project_workspace(self.project_id) or ""
+
+        try:
+            from hiveweave.services.org import OrgService
+
+            org = OrgService()
+            agent_row = await org.get_agent(self.id)
+            if agent_row:
+                ws = agent_row.get("workspace_path") or ""
+                if ws and _os.path.isdir(ws) and (_Path(ws) / ".git").exists():
+                    self._workspace_path = ws
+                    return self._workspace_path
+
+                # Executor without a valid worktree — allocate now
+                if (
+                    agent_row.get("permission_type") == "executor"
+                    and project_ws
+                    and (_Path(project_ws) / ".git").exists()
+                ):
+                    from hiveweave.services.git_worktree import GitWorktreeService
+
+                    gwt = GitWorktreeService()
+                    short = agent_row.get("short_id") or "A000"
+                    role = agent_row.get("role") or "executor"
+                    result = await gwt.create(project_ws, short, role)
+                    if result.get("success") and result.get("path"):
+                        await org.update_agent(self.id, {
+                            "workspace_path": result["path"],
+                            "worktree_error": None,
+                        })
+                        self._workspace_path = result["path"]
                         return self._workspace_path
-            except Exception:
-                pass  # 回退到项目根
-            # 2. 回退：项目根目录
-            ws = await meta_db.get_project_workspace(self.project_id)
-            self._workspace_path = ws or ""
+                    err = result.get("message") or "lazy worktree create failed"
+                    try:
+                        await org.update_agent(self.id, {
+                            "worktree_error": err,
+                        })
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # 回退到项目根
+
+        self._workspace_path = project_ws
         return self._workspace_path
 
     # ── 内部: 完成处理 ────────────────────────────────────────
@@ -941,18 +1008,18 @@ class Agent:
         _save_failed = False
         _save_error_msg = ""
         try:
+            tool_calls_json = (
+                json.dumps(tool_calls, ensure_ascii=False) if tool_calls else "[]"
+            )
             if self._streaming_msg_id:
-                await self._chat_msg.update_message(
-                    self.id, self._streaming_msg_id,
-                    {
-                        "content": content,
-                        "thinking": thinking,
-                        "tool_calls": json.dumps(tool_calls, ensure_ascii=False)
-                        if tool_calls else "[]",
-                        "is_streaming": False,
-                    },
+                cleared = await self._finalize_streaming_turn(
+                    content=content,
+                    thinking=thinking if thinking is not None else None,
+                    tool_calls_json=tool_calls_json,
                 )
-                self._streaming_msg_id = None
+                if not cleared:
+                    _save_failed = True
+                    _save_error_msg = "finalize_streaming_turn failed"
             else:
                 await self._chat_msg.save_message(
                     {
@@ -960,9 +1027,7 @@ class Agent:
                         "role": "assistant",
                         "content": content,
                         "thinking": thinking,
-                        "tool_calls": json.dumps(tool_calls, ensure_ascii=False)
-                        if tool_calls
-                        else "[]",
+                        "tool_calls": tool_calls_json,
                         "is_streaming": False,
                         "is_background": True if is_trigger else False,
                     }
@@ -972,15 +1037,10 @@ class Agent:
             _save_error_msg = str(e)
             log.error("completion_save_failed",
                       agent_id=self.id, error=_save_error_msg)
-            # 降级：清掉 is_streaming flag，至少不让前端显示僵尸
             try:
-                if self._streaming_msg_id:
-                    await self._chat_msg.update_message(
-                        self.id, self._streaming_msg_id,
-                        {"content": content[:500] if content else "(empty)",
-                         "is_streaming": False},
-                    )
-                    self._streaming_msg_id = None
+                await self._finalize_streaming_turn(
+                    content=content[:500] if content else "(empty)",
+                )
             except Exception:
                 pass  # 尽力了
 
@@ -1006,56 +1066,130 @@ class Agent:
             self.id, self.project_id, turn_messages
         )
 
-        # 3. 标记 inbox 已读（仅非空输出时）
+        # 3. Turn exit gates — must commit_turn (function return) before idle
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.turn_exit import (
+            ExitContext,
+            collect_unreplied_asks,
+            evaluate_turn_exit,
+        )
+        from hiveweave.services.turn_session import pop_pending_turn_result
+
+        pending_msgs: list[dict] = []
         if self.pending_inbox_msg_ids:
-            # 分组：需要回复的 vs 不需要回复的
-            unreplied = await self._check_unreplied_expect_report(tool_calls)
+            all_pending = await self._inbox.get_pending_messages(self.id)
+            id_set = set(self.pending_inbox_msg_ids)
+            pending_msgs = [m for m in all_pending if m["id"] in id_set]
 
-            if unreplied and self._reply_reminder_count < self._REPLY_REMINDER_MAX:
-                # 只标记不需要回复的消息已读，需要回复的保持未读
-                unreplied_ids = {m["id"] for m in unreplied}
-                no_reply_ids = [
-                    mid for mid in self.pending_inbox_msg_ids
-                    if mid not in unreplied_ids
-                ]
-                if no_reply_ids:
-                    await self._inbox.mark_read_by_ids(self.id, no_reply_ids)
+        name_by_id: dict[str, str] = {}
+        for m in pending_msgs:
+            fid = m.get("from_agent_id") or ""
+            if fid and fid not in name_by_id:
+                ag = await meta_db.get_agent_by_id(fid)
+                name_by_id[fid] = ag.get("name", fid[:8]) if ag else fid[:8]
 
-                # 注入精准提示：列出已回复和未回复的人
-                hint = await self._build_reply_hint(unreplied)
+        unreplied_asks = collect_unreplied_asks(
+            pending_msgs, tool_calls, name_by_id
+        )
+
+        open_obligations: list[dict] = []
+        try:
+            from hiveweave.services.task import TaskService
+
+            open_obligations = await TaskService().get_actionable_obligations(
+                self.project_id, self.id
+            )
+        except Exception as e:
+            log.warning(
+                "turn_exit_obligations_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+
+        exit_decision = evaluate_turn_exit(
+            ExitContext(
+                agent_id=self.id,
+                project_id=self.project_id,
+                tool_calls=tool_calls,
+                pending_inbox_msgs=pending_msgs,
+                unreplied_asks=unreplied_asks,
+                open_task_obligations=open_obligations,
+                tasks_advanced=self._task_ids_advanced_this_turn(tool_calls),
+            )
+        )
+
+        gate_retrigger_hint: str | None = None
+        continue_work = False
+
+        if not exit_decision.ok:
+            if self._turn_gate_count < self._TURN_GATE_MAX:
+                unreplied_ids = {m["id"] for m in unreplied_asks}
+                if self.pending_inbox_msg_ids:
+                    no_reply_ids = [
+                        mid
+                        for mid in self.pending_inbox_msg_ids
+                        if mid not in unreplied_ids
+                    ]
+                    if no_reply_ids:
+                        await self._inbox.mark_read_by_ids(self.id, no_reply_ids)
+                    # Keep unreplied asks unread so self_retrigger / next turn sees them
+                self._turn_gate_count += 1
+                gate_retrigger_hint = exit_decision.hint
                 await self._conversation.append_turn(
-                    self.id, self.project_id,
-                    [{"role": "user", "content": hint}]
+                    self.id,
+                    self.project_id,
+                    [{"role": "user", "content": gate_retrigger_hint}],
                 )
-                self._reply_reminder_count += 1
                 log.info(
-                    "reply_reminder_injected",
+                    "turn_exit_blocked",
                     agent_id=self.id,
-                    from_count=len(unreplied),
-                    marked_read=len(no_reply_ids),
-                    reminder_round=self._reply_reminder_count,
+                    violations=exit_decision.violations,
+                    gate_round=self._turn_gate_count,
                 )
-            elif unreplied and self._reply_reminder_count >= self._REPLY_REMINDER_MAX:
-                # 达到上限仍未回复 → 升级到上级
-                await self._inbox.mark_read_by_ids(
-                    self.id, self.pending_inbox_msg_ids
-                )
-                await self._escalate_unreplied(unreplied)
-                self._reply_reminder_count = 0
             else:
-                # 全部标记已读（已回复 / 无需回复）
+                # Cap reached — escalate unreplied asks, force-clear gate
+                if unreplied_asks:
+                    await self._escalate_unreplied(unreplied_asks)
+                if self.pending_inbox_msg_ids:
+                    await self._inbox.mark_read_by_ids(
+                        self.id, self.pending_inbox_msg_ids
+                    )
+                pop_pending_turn_result(self.id)
+                self._turn_gate_count = 0
+                self._reply_reminder_count = 0
+                log.warning(
+                    "turn_exit_gate_exhausted",
+                    agent_id=self.id,
+                    violations=exit_decision.violations,
+                )
+            self.pending_inbox_msg_ids = None
+        else:
+            # Gates passed
+            if self.pending_inbox_msg_ids:
                 await self._inbox.mark_read_by_ids(
                     self.id, self.pending_inbox_msg_ids
                 )
-                self._reply_reminder_count = 0
-
             self.pending_inbox_msg_ids = None
+            self._turn_gate_count = 0
+            self._reply_reminder_count = 0
+            self._task_reminder_count = 0
+            pop_pending_turn_result(self.id)
+            continue_work = exit_decision.continue_work
+            log.info(
+                "turn_exit_ok",
+                agent_id=self.id,
+                phase=(
+                    exit_decision.turn_result.phase
+                    if exit_decision.turn_result
+                    else None
+                ),
+                continue_work=continue_work,
+            )
 
         # 成功完成 → 清除 resume 冷却
         self._resume_cooldown_until = 0.0
 
         # 3.5 持久化裁剪旧工具输出（OpenCode prune 模式）
-        # 每轮结束后清除保护窗口外的旧 tool 输出，防止历史无限膨胀
         try:
             await self._conversation.prune_persisted(self.id, self.project_id)
         except Exception as e:
@@ -1075,8 +1209,35 @@ class Agent:
         # 6. Process queued user messages (sent while agent was busy)
         await self._drain_message_queue()
 
-        # 7. 自检 re-trigger
-        await self._maybe_self_retrigger()
+        # 7–8. Prefer turn-gate / continue-work over generic self_retrigger
+        if gate_retrigger_hint:
+            await self._retrigger_for_turn_gate(gate_retrigger_hint)
+        elif continue_work:
+            await self._retrigger_for_turn_gate(
+                "[TURN CONTINUE] You committed phase=in_progress. "
+                "Continue the work now — then commit_turn again when this slice ends."
+            )
+        else:
+            await self._maybe_self_retrigger()
+    async def _retrigger_for_turn_gate(self, hint: str) -> None:
+        """Re-enter chat with a turn-exit / continue hint."""
+        await asyncio.sleep(SELF_RETRIGGER_DELAY_MS / 1000.0)
+        if self._in_resume_cooldown():
+            return
+        if self.status != AgentState.IDLE:
+            return
+        log.info("turn_gate_retrigger", agent_id=self.id)
+        asyncio.create_task(
+            self.chat(
+                hint,
+                opts={
+                    "trigger": True,
+                    "is_background": True,
+                    "source": "turn_exit_gate",
+                },
+            ),
+            name=f"agent-{self.id}-turn-gate-retrigger",
+        )
 
     async def _handle_empty_response(
         self,
@@ -1142,20 +1303,14 @@ class Agent:
         )
 
         # BUG-038: 清理 streaming placeholder — 其他退出路径都清理了，
-        # 但 _escalate_empty_response 遗漏，导致 is_streaming=1 僵尸消息
+        # 但 _escalate_empty_response 曾遗漏，导致 is_streaming=1 僵尸消息
         try:
-            if self._streaming_msg_id:
-                await self._chat_msg.update_message(
-                    self.id, self._streaming_msg_id,
-                    {
-                        "content": getattr(self, "_streaming_text_acc", "") or
-                                   "[空响应超限，已升级上级处理]",
-                        "is_streaming": False,
-                    },
-                )
-                self._streaming_msg_id = None
-            # 兜底：批量清理该 agent 的所有残留 streaming 消息
-            await self._chat_msg.update_streaming_messages_done(self.id)
+            await self._finalize_streaming_turn(
+                content=(
+                    getattr(self, "_streaming_text_acc", "")
+                    or "[空响应超限，已升级上级处理]"
+                ),
+            )
         except Exception as e:
             log.warning("empty_escalate_streaming_cleanup_failed",
                         agent_id=self.id, error=str(e))
@@ -1250,18 +1405,12 @@ class Agent:
         })
 
         # 保存错误消息到 DB — 更新 streaming placeholder 而非插入新消息
-        # 包 try/except: 保存失败不应阻止 agent 恢复到 idle
         is_trigger = bool(self.pending_inbox_msg_ids)
         try:
             if self._streaming_msg_id:
-                await self._chat_msg.update_message(
-                    self.id, self._streaming_msg_id,
-                    {
-                        "content": f"[ERROR] {error_msg}",
-                        "is_streaming": False,
-                    },
+                await self._finalize_streaming_turn(
+                    content=f"[ERROR] {error_msg}",
                 )
-                self._streaming_msg_id = None
             else:
                 await self._chat_msg.save_message(
                     {
@@ -1275,6 +1424,10 @@ class Agent:
         except Exception as e:
             log.error("error_save_failed",
                       agent_id=self.id, save_error=str(e))
+            try:
+                await self._finalize_streaming_turn()
+            except Exception:
+                pass
 
         # 不 ACK inbox — 可恢复错误应保留未读，冷却后 resume
         inbox_ids = list(self.pending_inbox_msg_ids or [])
@@ -1381,33 +1534,21 @@ class Agent:
         - 写入 RESUME CHECKPOINT，让下一轮带着断点上下文继续
         - 记录 work_log，便于监控/stall watchdog 关联
         """
-        # 清理 zombie streaming 消息
-        await self._chat_msg.update_streaming_messages_done(self.id)
-
         inbox_ids = list(self.pending_inbox_msg_ids or [])
 
-        # 更新 streaming placeholder（如果有的话）为超时标记
+        timeout_msg = (
+            "[TIMEOUT] LLM call exceeded 10 minute safety limit. "
+            "Inbox left unread for resume after cooldown."
+        )
         if self._streaming_msg_id:
-            await self._chat_msg.update_message(
-                self.id, self._streaming_msg_id,
-                {
-                    "content": (
-                        "[TIMEOUT] LLM call exceeded 10 minute safety limit. "
-                        "Inbox left unread for resume after cooldown."
-                    ),
-                    "is_streaming": False,
-                },
-            )
-            self._streaming_msg_id = None
+            await self._finalize_streaming_turn(content=timeout_msg)
         else:
+            await self._chat_msg.update_streaming_messages_done(self.id)
             await self._chat_msg.save_message(
                 {
                     "agent_id": self.id,
                     "role": "assistant",
-                    "content": (
-                        "[TIMEOUT] LLM call exceeded 10 minute safety limit. "
-                        "Inbox left unread for resume after cooldown."
-                    ),
+                    "content": timeout_msg,
                     "is_streaming": False,
                 }
             )
@@ -1436,8 +1577,7 @@ class Agent:
 
         对齐 Elixir agent.ex:131 handle_cast(:cancel)。
         """
-        # 清理 zombie streaming 消息
-        await self._chat_msg.update_streaming_messages_done(self.id)
+        await self._finalize_streaming_turn(content="[对话被中断]")
 
         # 保留 inbox 未读（用户取消不应标记已读）
         # pending_inbox_msg_ids 保持不变，下次 trigger 可重新处理
@@ -1464,7 +1604,14 @@ class Agent:
         msg_ids_set = set(self.pending_inbox_msg_ids)
         target_msgs = [m for m in pending if m["id"] in msg_ids_set]
 
-        expect_reply_msgs = [m for m in target_msgs if m.get("expect_report")]
+        from hiveweave.services.reply_policy import message_requests_reply
+
+        # Hard flag OR reply-request language (covers expect_report=0 mistakes)
+        expect_reply_msgs = [
+            m
+            for m in target_msgs
+            if m.get("expect_report") or message_requests_reply(m.get("message"))
+        ]
         if not expect_reply_msgs:
             return []
 
@@ -1523,6 +1670,8 @@ class Agent:
         场景: A 收到 B/C/D/E 消息，B/C/D 要求回复，A 只回复了 B。
         提示应明确告诉 A："你已回复 B，但 C/D 仍未回复"。
         """
+        from hiveweave.services.reply_policy import message_requests_reply
+
         # unreplied_msgs 已带有 from_name（由 _check_unreplied_expect_report 解析）
         unreplied_details: list[str] = []
         unreplied_names: list[str] = []
@@ -1542,7 +1691,10 @@ class Agent:
                 m.get("from_agent_id", "") for m in pending
                 if m["id"] in self.pending_inbox_msg_ids
                 and m["id"] not in unreplied_ids
-                and m.get("expect_report")
+                and (
+                    m.get("expect_report")
+                    or message_requests_reply(m.get("message"))
+                )
             ]
             # 批量解析
             for fid in replied_from_ids:
@@ -1609,6 +1761,168 @@ class Agent:
                         unreplied_count=len(unreplied_msgs))
         except Exception as e:
             log.error("escalate_failed", agent_id=self.id, error=str(e))
+
+    # ── 内部: open-task 收工提醒 ─────────────────────────────
+
+    @staticmethod
+    def _tool_call_name(tc: dict) -> str:
+        if not isinstance(tc, dict):
+            return ""
+        func = tc.get("function") or {}
+        if isinstance(func, dict) and func.get("name"):
+            return str(func["name"])
+        return str(tc.get("name") or "")
+
+    @staticmethod
+    def _tool_call_args(tc: dict) -> dict:
+        if not isinstance(tc, dict):
+            return {}
+        func = tc.get("function") or {}
+        raw = func.get("arguments") if isinstance(func, dict) else tc.get("arguments")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
+    def _task_ids_advanced_this_turn(self, tool_calls: list) -> set[str]:
+        """Task IDs that this turn already progressed (submit/review/block)."""
+        advanced: set[str] = set()
+        for tc in tool_calls or []:
+            name = self._tool_call_name(tc)
+            args = self._tool_call_args(tc)
+            tid = args.get("taskId") or args.get("task_id") or args.get("id")
+            if not tid:
+                continue
+            tid = str(tid)
+            if name == "submit_task":
+                advanced.add(tid)
+            elif name == "review_task":
+                advanced.add(tid)
+            elif name == "update_task_status":
+                status = str(args.get("status") or "running").lower()
+                if status == "blocked":
+                    advanced.add(tid)
+            elif name == "close_task":
+                advanced.add(tid)
+        return advanced
+
+    def _build_open_task_hint(self, obligations: list[dict]) -> str:
+        lines = [
+            "[OPEN TASKS]",
+            f"你还有 {len(obligations)} 个未完成的可行动任务。不要只口头说下一步——本轮用工具推进，"
+            "或显式 blocked（dependency:/timer:/user:/external:）并 schedule_alarm。",
+        ]
+        for t in obligations[:8]:
+            tid = str(t.get("id") or "")
+            title = (t.get("title") or "(untitled)").split("\n")[0][:60]
+            status = t.get("status") or "?"
+            role = t.get("role_hint") or "assignee"
+            progress = t.get("progress")
+            prog = f" progress={progress}%" if progress is not None else ""
+            if role == "creator":
+                if status == "approved":
+                    next_step = "合并/VERIFY 完成后 close_task，或确认已关闭"
+                else:
+                    next_step = "用 review_task(taskId, decision, feedback) 审批"
+            elif status == "rework":
+                next_step = "按反馈返工后重新 submit_task"
+            elif status == "claimed":
+                next_step = "update_task_status(running) 后继续执行"
+            else:
+                next_step = "继续执行或 submit_task / update_task_status(blocked)"
+            lines.append(
+                f"- [{status}] {tid[:8]}… ({role}){prog} {title} → {next_step}"
+            )
+        if len(obligations) > 8:
+            lines.append(f"- …还有 {len(obligations) - 8} 条未列出")
+        return "\n".join(lines)
+
+    async def _maybe_open_task_reminder(self, tool_calls: list) -> str | None:
+        """若仍有可行动任务则构造 [OPEN TASKS] hint。
+
+        Returns hint string to chat() after idle, or None to skip.
+        Does not append_turn here — chat() persists the user message.
+        """
+        if self._task_reminder_count >= self._TASK_REMINDER_MAX:
+            log.info(
+                "open_task_reminder_cap",
+                agent_id=self.id,
+                count=self._task_reminder_count,
+            )
+            return None
+
+        try:
+            from hiveweave.services.task import TaskService
+
+            ts = TaskService()
+            obligations = await ts.get_actionable_obligations(
+                self.project_id, self.id
+            )
+        except Exception as e:
+            log.warning(
+                "open_task_reminder_query_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+            return None
+
+        if not obligations:
+            self._task_reminder_count = 0
+            return None
+
+        advanced = self._task_ids_advanced_this_turn(tool_calls)
+        remaining: list[dict] = []
+        for t in obligations:
+            tid = str(t.get("id") or "")
+            if tid in advanced:
+                continue
+            if any(
+                tid.startswith(a) or a.startswith(tid)
+                for a in advanced
+                if len(a) >= 8
+            ):
+                continue
+            remaining.append(t)
+
+        if not remaining:
+            self._task_reminder_count = 0
+            return None
+
+        hint = self._build_open_task_hint(remaining)
+        self._task_reminder_count += 1
+        log.info(
+            "open_task_reminder_prepared",
+            agent_id=self.id,
+            count=len(remaining),
+            reminder_round=self._task_reminder_count,
+        )
+        return hint
+
+    async def _retrigger_for_open_tasks(self, hint: str) -> None:
+        """Chat with [OPEN TASKS] hint — trigger_* skips when inbox is empty."""
+        await asyncio.sleep(SELF_RETRIGGER_DELAY_MS / 1000.0)
+        if self._in_resume_cooldown():
+            return
+        if self.status != AgentState.IDLE:
+            return
+        log.info("open_task_retrigger", agent_id=self.id)
+        # Fire-and-forget like _drain_message_queue — avoid nested completion
+        asyncio.create_task(
+            self.chat(
+                hint,
+                opts={
+                    "trigger": True,
+                    "is_background": True,
+                    "source": "open_task_reminder",
+                },
+            ),
+            name=f"agent-{self.id}-open-task-retrigger",
+        )
 
     # ── 内部: 自检 re-trigger ────────────────────────────────
 
@@ -1734,6 +2048,50 @@ class Agent:
         import asyncio
         # Use chat() to go through normal flow (acquires lock, sets PROCESSING)
         await self.chat(message, opts)
+
+    async def _finalize_streaming_turn(
+        self,
+        *,
+        msg_id: str | None = None,
+        content: str | None = None,
+        thinking: object | None = None,
+        tool_calls_json: str | None = None,
+        allow_agent_wide_fallback: bool = True,
+    ) -> bool:
+        """Close this turn's streaming placeholder — never leave a DB orphan.
+
+        ``update_message`` can return False without raising (no DB / no row).
+        Callers used to clear ``_streaming_msg_id`` anyway → true orphans.
+        This helper only drops the in-memory pointer after a confirmed clear.
+        """
+        target_id = self._streaming_msg_id if msg_id is None else msg_id
+        attrs: dict = {}
+        if content is not None:
+            attrs["content"] = content
+        if thinking is not None:
+            attrs["thinking"] = thinking
+        if tool_calls_json is not None:
+            attrs["tool_calls"] = tool_calls_json
+
+        # Never agent-wide-clear if a newer turn already owns another placeholder
+        fallback = allow_agent_wide_fallback
+        if (
+            fallback
+            and target_id is not None
+            and self._streaming_msg_id is not None
+            and self._streaming_msg_id != target_id
+        ):
+            fallback = False
+
+        cleared = await self._chat_msg.finalize_streaming_message(
+            self.id,
+            target_id,
+            attrs or None,
+            allow_agent_wide_fallback=fallback,
+        )
+        if cleared and self._streaming_msg_id == target_id:
+            self._streaming_msg_id = None
+        return cleared
 
     def _reset_to_idle(self) -> None:
         """重置到 idle 状态。

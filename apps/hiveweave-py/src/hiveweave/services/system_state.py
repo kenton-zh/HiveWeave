@@ -20,8 +20,14 @@ logger = structlog.get_logger()
 # 每小时清理间隔（秒）— 契约 15: 3_600_000 ms
 HOURLY_CLEANUP_INTERVAL = 3600
 
-# 清除 zombie streaming 的 SQL
-_ZOMBIE_STREAMING_SQL = "UPDATE chat_messages SET is_streaming = 0 WHERE is_streaming = 1"
+# 清除 zombie streaming 的 SQL（空内容盖章，避免前端空白气泡）
+_ZOMBIE_STREAMING_SQL = (
+    "UPDATE chat_messages SET is_streaming = 0, "
+    "content = CASE "
+    "  WHEN content IS NULL OR TRIM(content) = '' "
+    "  THEN '[对话被中断]' ELSE content END "
+    "WHERE is_streaming = 1"
+)
 
 
 class SystemState:

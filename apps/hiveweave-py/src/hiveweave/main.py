@@ -133,9 +133,9 @@ async def lifespan(app: FastAPI):
             if proj_conn is None:
                 continue
             agent_cursor = await proj_conn.execute(
-                "SELECT id, name, role, short_id, workspace_path "
+                "SELECT id, name, role, short_id, workspace_path, permission_type "
                 "FROM agents WHERE project_id=? AND status='active' "
-                "AND role NOT IN ('ceo', 'hr')",
+                "AND permission_type='executor'",
                 [p["id"]],
             )
             agents = await agent_cursor.fetchall()
@@ -159,7 +159,8 @@ async def lifespan(app: FastAPI):
                     # 后者依赖 agent_router 内存映射，启动恢复时映射可能尚未包含
                     # 新创建的 agent，导致 "No project DB found for agent" 错误。
                     await proj_conn.execute(
-                        "UPDATE agents SET workspace_path=?, updated_at=? WHERE id=?",
+                        "UPDATE agents SET workspace_path=?, worktree_error=NULL, "
+                        "updated_at=? WHERE id=?",
                         [result["path"], int(_wt_time.time() * 1000), a["id"]],
                     )
                     await proj_conn.commit()
@@ -168,9 +169,15 @@ async def lifespan(app: FastAPI):
                              agent_id=a["id"], short_id=short_id,
                              path=result["path"])
                 else:
+                    err = result.get("message") or "worktree recover failed"
+                    await proj_conn.execute(
+                        "UPDATE agents SET worktree_error=?, updated_at=? WHERE id=?",
+                        [err, int(_wt_time.time() * 1000), a["id"]],
+                    )
+                    await proj_conn.commit()
                     log.warning("worktree_recover_failed",
                                 agent_id=a["id"], short_id=short_id,
-                                error=result.get("message"))
+                                error=err)
         log.info("worktree_recovery_done", recovered=recovered)
     except Exception as e:
         log.warning("worktree_recovery_init_failed", error=str(e))

@@ -46,9 +46,11 @@ _TRANSITIONS: dict[str, set[str]] = {
     "closed": set(),                                # 终态
 }
 
-# schema.py 的 tasks 表缺 due_at 列，启动时 ALTER TABLE 补齐（幂等）
+# schema.py 的 tasks 表缺列，启动时 ALTER TABLE 补齐（幂等）
 _MISSING_COLUMNS = [
     ("due_at", "INTEGER"),
+    ("wait_kind", "TEXT"),
+    ("wake_at", "INTEGER"),
 ]
 _migrated: set[str] = set()
 
@@ -91,13 +93,13 @@ async def _ensure_schema(project_id: str) -> None:
 class TaskService:
     """Task Ledger — task lifecycle from creation to closure with rework support."""
 
-    # 列顺序与 tasks 表一致（含 due_at）
+    # 列顺序与 tasks 表一致（含 due_at / wait_kind / wake_at）
     _COLUMNS = (
         "id, project_id, title, description, assignee_id, creator_id, "
         "status, priority, progress, tags, parent_task_id, depends_on, "
         "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
         "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
-        "is_archived, due_at"
+        "is_archived, due_at, wait_kind, wake_at"
     )
 
     async def create_task(self, project_id: str, title: str, description: str,
@@ -215,20 +217,147 @@ class TaskService:
         await self._transition(project_id, task_id, "running")
 
     async def block_task(self, project_id: str, task_id: str, reason: str) -> None:
-        """Block a task (running → blocked). Sets blocked_reason."""
+        """Block a task (running → blocked). Sets blocked_reason.
+
+        Prefer typed prefixes in reason: dependency: / timer: / user: / external:
+        """
         await self._transition(project_id, task_id, "blocked")
         now_ms = int(time.time() * 1000)
-        await _execute(project_id,
-            "UPDATE tasks SET blocked_reason = ?, updated_at = ? WHERE id = ?",
-            [reason, now_ms, task_id])
+        reason = (reason or "Blocked by agent").strip()
+        wait_kind = self._infer_wait_kind(reason)
+        # Best-effort: set wait_kind / clear wake_at when columns exist
+        try:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET blocked_reason = ?, wait_kind = ?, "
+                "wake_at = CASE WHEN ? = 'timer' THEN wake_at ELSE NULL END, "
+                "updated_at = ? WHERE id = ?",
+                [reason, wait_kind, wait_kind, now_ms, task_id],
+            )
+        except Exception:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET blocked_reason = ?, updated_at = ? WHERE id = ?",
+                [reason, now_ms, task_id],
+            )
 
     async def unblock_task(self, project_id: str, task_id: str) -> None:
         """Unblock a task (blocked → running). Clears blocked_reason."""
         await self._transition(project_id, task_id, "running")
         now_ms = int(time.time() * 1000)
-        await _execute(project_id,
-            "UPDATE tasks SET blocked_reason = NULL, updated_at = ? WHERE id = ?",
-            [now_ms, task_id])
+        try:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET blocked_reason = NULL, wait_kind = NULL, "
+                "wake_at = NULL, updated_at = ? WHERE id = ?",
+                [now_ms, task_id],
+            )
+        except Exception:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET blocked_reason = NULL, updated_at = ? WHERE id = ?",
+                [now_ms, task_id],
+            )
+
+    @staticmethod
+    def _infer_wait_kind(reason: str) -> str | None:
+        r = (reason or "").strip().lower()
+        for kind in ("dependency", "timer", "user", "external"):
+            if r.startswith(f"{kind}:"):
+                return kind
+        return None
+
+    async def _wake_dependent_tasks(
+        self, project_id: str, completed_task_id: str
+    ) -> None:
+        """Unblock + notify assignees whose depends_on are all approved/closed."""
+        rows = await _query(
+            project_id,
+            f"SELECT {self._COLUMNS} FROM tasks "
+            "WHERE status = 'blocked' AND is_archived = 0",
+            [],
+        )
+        if not rows:
+            return
+
+        completed = set()
+        done_rows = await _query(
+            project_id,
+            "SELECT id FROM tasks WHERE status IN ('approved','closed') "
+            "AND is_archived = 0",
+            [],
+        )
+        completed = {r["id"] for r in done_rows}
+        completed.add(completed_task_id)
+
+        for row in rows:
+            task = self._row(row)
+            tid = task["id"]
+            deps = task.get("depends_on") or []
+            if isinstance(deps, str):
+                try:
+                    deps = json.loads(deps)
+                except (json.JSONDecodeError, TypeError):
+                    deps = []
+            if not isinstance(deps, list):
+                deps = []
+
+            reason = (task.get("blocked_reason") or "").strip()
+            reason_l = reason.lower()
+            mentions = completed_task_id in reason or completed_task_id[:8] in reason
+            if completed_task_id not in deps and not (
+                reason_l.startswith("dependency:") and mentions
+            ):
+                continue
+
+            # All explicit depends_on must be done (if any)
+            if deps and not all(d in completed for d in deps):
+                continue
+
+            assignee = task.get("assignee_id")
+            try:
+                await self.unblock_task(project_id, tid)
+            except Exception as e:
+                log.warning(
+                    "dependent_unblock_failed",
+                    task_id=tid,
+                    completed=completed_task_id,
+                    error=str(e),
+                )
+                continue
+
+            log.info(
+                "dependent_task_unblocked",
+                task_id=tid,
+                completed=completed_task_id,
+                assignee=assignee,
+            )
+            if not assignee:
+                continue
+            try:
+                from hiveweave.services.inbox import InboxService
+                from hiveweave.agents.trigger import trigger_subordinate
+
+                title = (task.get("title") or "")[:80]
+                await InboxService().send_message(
+                    "system",
+                    assignee,
+                    (
+                        f"[DEPENDENCY MET] Blocker {completed_task_id[:8]}… is done. "
+                        f"Your blocked task '{title}' is unblocked (running). "
+                        f"Continue work or submit_task."
+                    ),
+                    message_type="system",
+                    priority="urgent",
+                    task_id=tid,
+                )
+                await trigger_subordinate(assignee)
+            except Exception as e:
+                log.warning(
+                    "dependent_wake_failed",
+                    task_id=tid,
+                    error=str(e),
+                )
 
     async def submit_task(self, project_id: str, task_id: str,
                           evidence: dict) -> None:
@@ -278,15 +407,53 @@ class TaskService:
         if decision == "approve":
             # reviewing → approved
             await self._transition(project_id, task_id, "approved")
+            await _execute(project_id,
+                "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+                [json.dumps(evidence), now_ms, task_id])
+            log.info("task_reviewed", task_id=task_id, decision=decision,
+                     has_feedback=feedback is not None)
+            await self._wake_dependent_tasks(project_id, task_id)
+            # VERIFY tasks: approve completes the loop → auto-close
+            title = ""
+            try:
+                trow = await _query(
+                    project_id, "SELECT title, tags FROM tasks WHERE id = ?",
+                    [task_id],
+                )
+                if trow:
+                    title = trow[0]["title"] or ""
+                    tags_raw = trow[0]["tags"]
+                    tags = []
+                    if isinstance(tags_raw, str):
+                        try:
+                            tags = json.loads(tags_raw)
+                        except (json.JSONDecodeError, TypeError):
+                            tags = []
+                    elif isinstance(tags_raw, list):
+                        tags = tags_raw
+                    if (
+                        title.startswith("VERIFY:")
+                        or "verify" in [str(x).lower() for x in tags]
+                    ):
+                        try:
+                            await self.close_task(project_id, task_id)
+                        except Exception as e:
+                            log.warning(
+                                "verify_auto_close_failed",
+                                task_id=task_id,
+                                error=str(e),
+                            )
+            except Exception as e:
+                log.debug("verify_auto_close_check_failed", error=str(e))
         else:
             # rework: reviewing → rework → running (atomic single UPDATE,
             # no intermediate "rework" state visible to concurrent readers)
             await self._transition_multi(project_id, task_id, "rework", "running")
-        await _execute(project_id,
-            "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
-            [json.dumps(evidence), now_ms, task_id])
-        log.info("task_reviewed", task_id=task_id, decision=decision,
-                 has_feedback=feedback is not None)
+            await _execute(project_id,
+                "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+                [json.dumps(evidence), now_ms, task_id])
+            log.info("task_reviewed", task_id=task_id, decision=decision,
+                     has_feedback=feedback is not None)
 
     async def close_task(self, project_id: str, task_id: str) -> None:
         """Close a task (approved → closed). Sets closed_at."""
@@ -295,6 +462,7 @@ class TaskService:
         await _execute(project_id,
             "UPDATE tasks SET closed_at = ?, updated_at = ? WHERE id = ?",
             [now_ms, now_ms, task_id])
+        await self._wake_dependent_tasks(project_id, task_id)
 
     async def get_task(self, project_id: str, task_id: str) -> dict | None:
         """Get a single task by id. Returns all fields or None."""
@@ -328,6 +496,49 @@ class TaskService:
             "WHERE assignee_id = ? AND is_archived = 0 ORDER BY created_at DESC",
             [agent_id])
         return [self._row(r) for r in rows]
+
+    async def get_actionable_obligations(
+        self, project_id: str, agent_id: str
+    ) -> list[dict]:
+        """Tasks this agent must act on now (open-task reminder / stall helpers).
+
+        - As assignee: claimed | running | rework
+        - As creator: submitted | reviewing
+        Excludes blocked / approved / closed / archived.
+        Each dict includes role_hint: 'assignee' | 'creator'.
+        """
+        await _ensure_schema(project_id)
+        rows = await _query(
+            project_id,
+            f"SELECT {self._COLUMNS} FROM tasks WHERE is_archived = 0 AND ("
+            "  (assignee_id = ? AND status IN ('claimed','running','rework'))"
+            "  OR (creator_id = ? AND status IN ('submitted','reviewing','approved'))"
+            ") ORDER BY updated_at DESC",
+            [agent_id, agent_id],
+        )
+        out: list[dict] = []
+        for r in rows:
+            d = self._row(r)
+            if d.get("assignee_id") == agent_id and d.get("status") in (
+                "claimed", "running", "rework",
+            ):
+                d["role_hint"] = "assignee"
+            else:
+                d["role_hint"] = "creator"
+            out.append(d)
+        return out
+
+    async def set_wake_at(
+        self, project_id: str, task_id: str, wake_at_ms: int | None
+    ) -> None:
+        """Set or clear wake_at (real-time ms) for timer waits."""
+        await _ensure_schema(project_id)
+        now_ms = int(time.time() * 1000)
+        await _execute(
+            project_id,
+            "UPDATE tasks SET wake_at = ?, updated_at = ? WHERE id = ?",
+            [wake_at_ms, now_ms, task_id],
+        )
 
     async def update_progress(self, project_id: str, task_id: str,
                               progress: int) -> None:

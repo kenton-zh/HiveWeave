@@ -366,7 +366,9 @@ class OrgService:
     async def dismiss_agent(self, project_id: str, agent_id: str) -> dict:
         """Soft-delete (archive) an agent. Verifies no subordinates.
 
-        Returns ``{success, agent}`` or ``{success: False, message}``.
+        Closes the lifecycle: open tasks reassigned/archived, inbox ACKed,
+        alarms cancelled, worktree cleaned. Returns ``{success, agent}`` or
+        ``{success: False, message}``.
         """
         children = await self.get_subordinates(agent_id)
         if children:
@@ -374,9 +376,61 @@ class OrgService:
                     "message": f"Cannot dismiss agent with {len(children)} "
                                "subordinate(s). Transfer or dismiss them first."}
 
+        agent_before = await self.get_agent(agent_id)
+        if not agent_before:
+            return {"success": False, "message": "Agent not found"}
+
         updated = await self.update_agent(agent_id, {"status": "archived"})
         if not updated:
             return {"success": False, "message": "Agent not found"}
+
+        parent_id = agent_before.get("parent_id") or ""
+        now_ms = int(time.time() * 1000)
+
+        # Close Task Ledger obligations — reassign open work to parent, else archive
+        try:
+            conn = await project_db.get_project_db_by_project_id(project_id)
+            if conn is not None:
+                if parent_id:
+                    await conn.execute(
+                        "UPDATE tasks SET assignee_id = ?, status = 'created', "
+                        "claimed_at = NULL, updated_at = ? "
+                        "WHERE assignee_id = ? AND is_archived = 0 "
+                        "AND status NOT IN ('closed', 'approved')",
+                        [parent_id, now_ms, agent_id],
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE tasks SET is_archived = 1, status = 'closed', "
+                        "closed_at = ?, updated_at = ? "
+                        "WHERE assignee_id = ? AND is_archived = 0 "
+                        "AND status NOT IN ('closed')",
+                        [now_ms, now_ms, agent_id],
+                    )
+                await conn.commit()
+                log.info(
+                    "org.dismiss_agent.tasks_closed",
+                    agent_id=agent_id,
+                    reassigned_to=parent_id or None,
+                )
+        except Exception as e:
+            log.warning(
+                "dismiss_close_tasks_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
+
+        # ACK all unread inbox — archived agents are never woken
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().mark_all_read(agent_id)
+        except Exception as e:
+            log.warning(
+                "dismiss_mark_inbox_read_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
 
         # A4 修复：清理该 agent 的所有 pending 闹钟，防止触发到已 archived agent
         try:
