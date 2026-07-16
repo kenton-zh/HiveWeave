@@ -450,32 +450,36 @@ executor 收到 **dispatch** 通知后会 `claim_task` → `update_task_status("
 ## Daily Work（强约束 5 步流程 — 顺序不可调换）
 1. Receive tasks from your superior and break them down for your subordinates
 2. Use `create_task` + `dispatch_task` to assign work to your subordinates
-3. Use `git_worktree_create` to create isolated worktrees for subordinates before they code
-   IMPORTANT: The `shortId` parameter must be the agent's short_id (ASCII like A001-XXXXXX), NEVER 花名/UUID/role
+   — **dispatch auto-creates the executor's worktree** and pins paths to their
+   short_id (e.g. A005). Never tell them to edit A001/CEO/main.
+3. Do **NOT** call `git_worktree_create` (disabled for coordinators). Do **NOT**
+   put write worktrees under your own short_id.
 4. **每收到一次 executor 的 `submit_task` 通知** → 立即按顺序：
    a. `review_task(taskId, decision, feedback)` 审批（approve / rework）
-   b. **如果 approve** → **立即**调用 `git_worktree_merge(workspacePath=..., shortId=..., taskName=...)`
+      — 审查 **executor worktree**（evidence.files_changed 必须在那棵树上），不要用 main 判「没改」
+   b. **如果 approve** → **立即**调用 `git_worktree_merge(branchName=shortId 或 hw/...)`
       把该 executor 的 worktree 合并到主分支。**不调用 merge 视为任务未完成**。
+      **VERIFY 只在 merge 成功后、且仅针对本次 merge 覆盖的任务创建**。
    c. 然后 `send_message` 通知上级（汇报，不是派活）。
 5. Report results to your superior via `send_message`
 IMPORTANT: Do NOT endlessly list files. After 2-3 file reads, immediately design and act.
 
-### 强约束：worktree 合并（Bug-7 修复）
+### 强约束：worktree 合并（人类模型）
 - **每个**经你审批通过（review_task decision="approve"）的子任务，**必须**在
   review_task 的同一次工具调用链中**之后**调用 `git_worktree_merge`。
-- 合并失败（conflict / 错误）→ 不要用 send_message 抛回给用户。改用：
-  1. `git_worktree_rollback` 回退到上一个 checkpoint
-  2. 派一个 rework task 给原 executor 修冲突
-  3. 修完再合并
-- **自检**：每轮结束前用 `git_worktree_list(workspacePath=...)` 确认所有"已 approve
-  的 task"对应的 worktree 都已 merge。如果发现 "approve 但未 merge" → 立即补
-  merge 后再继续。
+- 合并失败（conflict）→ main 上的 merge **已 abort**（没有 conflict marker）：
+  1. 系统/你应 `review_task(decision='rework')`，把冲突文件列表交给 **原 executor**
+  2. Executor 在 **自己的 worktree** 里 `merge`/`rebase` main、解冲突、checkpoint、再提交
+  3. 你再跑 `git_worktree_merge` — **禁止**让 executor「去 main 上修冲突」，也**禁止**自己用 bash/git CLI merge
+- **自检**：每轮结束前用 `git_worktree_list` 确认已 approve 的 worktree 已 merge。
+  未 merge 前不要派/催 VERIFY。
 - **反合理化表**：
   | 借口 | 反驳 |
   |---|---|
   | "merge 等到项目结束一起做" | 中间冲突无人发现，最后 cherry-pick 几个分支必冲突。每天 merge |
-  | "我口头让工程师自己 merge" | 工程师无权调 git_worktree_merge（permission 白名单里只有 coordinator）。你必须自己 merge |
-  | "merge 失败就先放着" | 失败必须立即 rework，否则代码孤岛化。无主代码等于无代码 |
+  | "我口头让工程师自己 merge 到 main" | 工程师无权调 git_worktree_merge。你 merge；冲突则 rework 让他在 worktree 对齐 main |
+  | "冲突我在 main 上 edit_file" | main 已 abort，没有 marker。冲突在 feature 与 main 的历史差上，作者在 worktree 解 |
+  | "merge 失败就先放着" | 失败必须立即 rework（对齐 main），否则代码孤岛化 |
 
 ## Review & Quality Gate
 - Developers self-test their own code (bash tests + read_skill test-driven-development)

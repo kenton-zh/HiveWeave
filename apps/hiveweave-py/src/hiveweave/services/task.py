@@ -32,9 +32,23 @@ from hiveweave.db.project import ensure_project_db
 
 log = structlog.get_logger(__name__)
 
+
+def resolve_task_policy(
+    title: str | None = None,
+    tags: list[str] | None = None,
+    description: str | None = None,
+) -> str:
+    """Infer attestation policy_id from task metadata.
+
+    Returns: ``ui_browser_e2e`` | ``docs_only`` | ``generic_tests``.
+    """
+    from hiveweave.services.attestation import resolve_task_policy as _resolve
+
+    return _resolve(title, tags, description)
+
 # 合法状态转换
 _TRANSITIONS: dict[str, set[str]] = {
-    "created": {"claimed", "closed"},               # 可认领或直接关闭
+    "created": {"claimed", "closed", "blocked"},    # blocked: system VERIFY w/o QA
     "claimed": {"running", "created"},              # 开始执行或放弃认领
     # running → claimed 已移除：防止 LLM 超时后 RESUME 时误调 claim_task
     # 导致 running↔claimed 无限弹跳。如需放弃任务请用 blocked。
@@ -42,7 +56,7 @@ _TRANSITIONS: dict[str, set[str]] = {
     "blocked": {"running", "closed"},               # 解除阻塞或关闭
     "submitted": {"reviewing", "running"},          # 进入评审或撤回
     "reviewing": {"approved", "rework"},            # 审批通过或返工
-    "approved": {"verifying", "closed"},            # 进入 VERIFY 或直接关闭
+    "approved": {"verifying", "closed", "rework"},   # VERIFY、关闭、或 merge 冲突返工
     "verifying": {"closed"},                        # VERIFY 通过 → 关闭父任务
     "rework": {"running"},                          # 返工回到运行
     "closed": set(),                                # 终态
@@ -53,6 +67,7 @@ _MISSING_COLUMNS = [
     ("due_at", "INTEGER"),
     ("wait_kind", "TEXT"),
     ("wake_at", "INTEGER"),
+    ("policy_id", "TEXT"),
 ]
 _migrated: set[str] = set()
 
@@ -95,13 +110,13 @@ async def _ensure_schema(project_id: str) -> None:
 class TaskService:
     """Task Ledger — task lifecycle from creation to closure with rework support."""
 
-    # 列顺序与 tasks 表一致（含 due_at / wait_kind / wake_at）
+    # 列顺序与 tasks 表一致（含 due_at / wait_kind / wake_at / policy_id）
     _COLUMNS = (
         "id, project_id, title, description, assignee_id, creator_id, "
         "status, priority, progress, tags, parent_task_id, depends_on, "
         "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
         "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
-        "is_archived, due_at, wait_kind, wake_at"
+        "is_archived, due_at, wait_kind, wake_at, policy_id"
     )
 
     async def create_task(self, project_id: str, title: str, description: str,
@@ -117,22 +132,24 @@ class TaskService:
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
         task_id = str(uuid.uuid4())
+        policy_id = resolve_task_policy(title, tags, description)
         await _execute(project_id,
             "INSERT INTO tasks (id, project_id, title, description, assignee_id, "
             "creator_id, status, priority, progress, tags, parent_task_id, depends_on, "
             "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
             "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
-            "is_archived, due_at) "
+            "is_archived, due_at, policy_id) "
             "VALUES (?, ?, ?, ?, ?, ?, 'created', ?, 0, ?, ?, ?, ?, NULL, ?, NULL, ?, "
-            "0, ?, NULL, NULL, NULL, ?, 0, ?)",
+            "0, ?, NULL, NULL, NULL, ?, 0, ?, ?)",
             [task_id, project_id, title, description, assignee_id, creator_id,
              priority, json.dumps(tags) if tags else None, parent_task_id,
              json.dumps(depends_on) if depends_on else None,
              json.dumps(acceptance_criteria) if acceptance_criteria else None,
              json.dumps(expected_modules) if expected_modules else None,
-             source, now_ms, now_ms, due_at])
+             source, now_ms, now_ms, due_at, policy_id])
         log.info("task_created", task_id=task_id, title=title[:60],
-                 creator_id=creator_id, assignee_id=assignee_id)
+                 creator_id=creator_id, assignee_id=assignee_id,
+                 policy_id=policy_id)
         return task_id
 
     async def _transition(self, project_id: str, task_id: str, target: str) -> None:
@@ -377,10 +394,10 @@ class TaskService:
 
     async def review_task(self, project_id: str, task_id: str, decision: str,
                           feedback: str | None = None) -> None:
-        """Review a task (reviewing → approved/rework).
+        """Review a task (reviewing → approved/rework, or approved → rework).
 
         decision='approve': reviewing → approved.
-        decision='rework':  reviewing → rework → running (两步合一).
+        decision='rework':  reviewing|approved → rework → running (两步合一).
         feedback stored in evidence.review_feedback.
         """
         await _ensure_schema(project_id)
@@ -391,9 +408,10 @@ class TaskService:
 
         # 取现有 evidence 以便合并 feedback（不覆盖已提交的 evidence）
         rows = await _query(project_id,
-            "SELECT evidence FROM tasks WHERE id = ?", [task_id])
+            "SELECT evidence, status FROM tasks WHERE id = ?", [task_id])
         if not rows:
             raise ValueError(f"Task not found: {task_id}")
+        current_status = rows[0]["status"]
         existing = rows[0]["evidence"]
         evidence: dict = {}
         if existing:
@@ -407,6 +425,10 @@ class TaskService:
 
         now_ms = int(time.time() * 1000)
         if decision == "approve":
+            if current_status != "reviewing":
+                raise ValueError(
+                    f"Illegal transition: {current_status} → approved"
+                )
             # reviewing → approved
             await self._transition(project_id, task_id, "approved")
             await _execute(project_id,
@@ -427,14 +449,18 @@ class TaskService:
                     error=str(e),
                 )
         else:
-            # rework: reviewing → rework → running (atomic single UPDATE,
-            # no intermediate "rework" state visible to concurrent readers)
+            # rework from reviewing (normal) or approved (merge conflict)
+            if current_status not in ("reviewing", "approved"):
+                raise ValueError(
+                    f"Illegal transition: {current_status} → rework"
+                )
             await self._transition_multi(project_id, task_id, "rework", "running")
             await _execute(project_id,
                 "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
                 [json.dumps(evidence), now_ms, task_id])
             log.info("task_reviewed", task_id=task_id, decision=decision,
-                     has_feedback=feedback is not None)
+                     has_feedback=feedback is not None,
+                     from_status=current_status)
 
     async def close_task(self, project_id: str, task_id: str) -> None:
         """Close a task (approved|verifying → closed). Sets closed_at."""

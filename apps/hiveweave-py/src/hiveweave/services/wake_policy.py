@@ -98,6 +98,7 @@ def should_wake(
             event_matches_waits,
         )
 
+        # message text not threaded here; WAIT_TIMEOUT sent after clear → empty waits
         event = category_to_wake_event(category, from_agent_id=from_agent_id)
         matched = event_matches_waits(
             active_waits,

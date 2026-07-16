@@ -36,6 +36,16 @@ class Settings(BaseSettings):
     # Example Windows: C:\Users\...\ .claude\skills\gstack\browse\dist\browse.exe
     browse_bin: str = ""
 
+    # Wait Contract default TTLs (ms) — P0 Hard Gates Phase 2
+    wait_ttl_agent_ms: int = 15 * 60 * 1000
+    wait_ttl_user_ms: int = 60 * 60 * 1000
+    wait_ttl_task_ms: int = 30 * 60 * 1000
+    wait_ttl_external_ms: int = 30 * 60 * 1000
+    wait_ttl_timer_ms: int = 15 * 60 * 1000
+
+    # Attestation max age (ms) — Phase 3
+    attestation_max_age_ms: int = 24 * 60 * 60 * 1000
+
     model_config = {
         "env_prefix": "HIVEWEAVE_",
         "env_file": ".env",

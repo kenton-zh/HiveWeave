@@ -566,6 +566,14 @@ async def create_task_tool(
         resolved = await resolve_agent_id(project_id, assignee_id, org_service)
         if resolved:
             assignee_id = resolved
+            try:
+                from hiveweave.services.git_worktree import ensure_executor_worktree
+
+                await ensure_executor_worktree(
+                    project_id, assignee_id, task_name=params.title
+                )
+            except Exception:
+                pass
 
     try:
         ts = TaskService()
@@ -778,17 +786,32 @@ class SubmitTaskParams(BaseModel):
         description="Brief test command output / proof (recommended).",
         json_schema_extra={"aliases": ["testOutput", "test_output", "testLog"]},
     )
+    attestation_ids: list[str] | None = Field(
+        default=None,
+        alias="attestationIds",
+        description=(
+            "Server-issued attestation ids from browse/bash test runs. "
+            "Required for UI/code tasks (bare testsPassed is rejected)."
+        ),
+        json_schema_extra={"aliases": ["attestationIds", "attestation_ids"]},
+    )
 
     @field_validator("files_changed", mode="before")
     @classmethod
     def _coerce_files_changed(cls, v: Any) -> Any:
         return _coerce_to_list(v)
 
+    @field_validator("attestation_ids", mode="before")
+    @classmethod
+    def _coerce_attestation_ids(cls, v: Any) -> Any:
+        return _coerce_to_list(v)
+
 
 @tool(
     "submit_task",
-    "Submit a task for review (running -> submitted). REQUIRES testsPassed=true "
-    "after running real tests (or N/A for docs/explore-only). "
+    "Submit a task for review (running -> submitted). Requires server "
+    "attestationIds from browse (UI) or bash test runs (code). "
+    "docs/explore tasks may use tags docs/explore. "
     "If taskId omitted, auto-detects your current running task.",
     requires_workspace=False,
     security_level="standard",
@@ -801,20 +824,9 @@ async def submit_task_tool(
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project")
 
-    # 强制验证门禁：必须显式声明 testsPassed=true
-    if params.tests_passed is not True:
-        return ToolResult.err(
-            "submit_task requires testsPassed=true. Run the project's tests "
-            "(npm test / pytest / etc.), then resubmit with testsPassed=true "
-            "and include a brief testOutput or mention results in summary. "
-            "For docs/explore-only work, set testsPassed=true and note "
-            "'N/A — no runtime tests' in summary."
-        )
-
     task_id = params.task_id
+    ts = TaskService()
     if not task_id:
-        # Auto-detect: find agent's current running/claimed task
-        ts = TaskService()
         tasks = await ts.list_tasks(project_id, assignee_id=agent_id)
         active = [t for t in tasks if t.get("status") in ("running", "claimed")]
         if not active:
@@ -832,9 +844,59 @@ async def submit_task_tool(
             )
         task_id = active[0]["id"]
 
+    task = await ts.get_task(project_id, task_id)
+    if not task:
+        return ToolResult.err(f"Task not found: {task_id}")
+
+    from hiveweave.services.attestation import (
+        attestation_service,
+        required_attestation_kinds,
+        resolve_task_policy,
+    )
+
+    tags = task.get("tags") or []
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            tags = []
+    policy_id = (
+        task.get("policy_id")
+        or resolve_task_policy(
+            title=task.get("title") or "",
+            tags=tags if isinstance(tags, list) else [],
+            description=task.get("description") or "",
+        )
+    )
+    needed = required_attestation_kinds(policy_id)
+    attest_ids = list(params.attestation_ids or [])
+
+    if needed:
+        ok, err = await attestation_service.verify_ids(
+            project_id,
+            attest_ids,
+            expected_agent_id=agent_id,
+            expected_kinds=needed,
+            task_id=task_id,
+        )
+        if not ok:
+            return ToolResult.err(
+                f"submit_task attestation gate failed ({policy_id}): {err}. "
+                f"Run browse (UI) or bash tests, then pass attestationIds. "
+                f"Bare testsPassed is rejected."
+            )
+    elif params.tests_passed is not True:
+        # docs_only still asks for explicit ack
+        return ToolResult.err(
+            "docs_only submit still requires testsPassed=true "
+            "(note N/A in summary)."
+        )
+
     evidence: dict[str, Any] = {
         "summary": params.summary,
         "tests_passed": True,
+        "policy_id": policy_id,
+        "attestation_ids": attest_ids,
     }
     if params.commit:
         evidence["commit"] = params.commit
@@ -844,12 +906,8 @@ async def submit_task_tool(
         evidence["test_output"] = params.test_output[:4000]
 
     try:
-        ts = TaskService()
         # Auto-transition: if task is in 'created' or 'claimed' status,
         # automatically claim/start it before submitting.
-        # This simplifies the LLM workflow — no need to call claim_task +
-        # update_task_status before submit_task.
-        task = await ts.get_task(project_id, task_id)
         if task:
             status = task.get("status", "")
             if status == "created":
@@ -927,7 +985,9 @@ class ReviewTaskParams(BaseModel):
 @tool(
     "review_task",
     "Review a submitted task (reviewing -> approved/rework). If task is 'submitted', starts review automatically. "
-    "approve requires evidence.tests_passed=true from submit_task; on approve a mandatory VERIFY child task is created.",
+    "approve requires valid attestation_ids in evidence (not bare testsPassed) and "
+    "assignee worktree context; does NOT spawn VERIFY — call git_worktree_merge next; "
+    "VERIFY is created only after merge succeeds.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -951,45 +1011,115 @@ async def review_task_tool(
         if not task:
             return ToolResult.err(f"Task not found: {params.task_id}")
 
-        # 强制验证门禁：approve 前必须有测试通过证据
+        # Phase 3: approve requires attestation evidence
         if decision == "approve":
+            from hiveweave.services.attestation import (
+                attestation_service,
+                required_attestation_kinds,
+                resolve_task_policy,
+            )
+            from hiveweave.services.worktree_review import review_worktree_gate
+
             evidence = task.get("evidence") or {}
             if isinstance(evidence, str):
                 try:
                     evidence = json.loads(evidence)
                 except Exception:
                     evidence = {}
-            if not isinstance(evidence, dict) or evidence.get("tests_passed") is not True:
+            if not isinstance(evidence, dict):
+                evidence = {}
+            tags = task.get("tags") or []
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except Exception:
+                    tags = []
+            policy_id = (
+                evidence.get("policy_id")
+                or task.get("policy_id")
+                or resolve_task_policy(
+                    title=task.get("title") or "",
+                    tags=tags if isinstance(tags, list) else [],
+                    description=task.get("description") or "",
+                )
+            )
+            needed = required_attestation_kinds(policy_id)
+            if needed:
+                aids = evidence.get("attestation_ids") or []
+                if not isinstance(aids, list):
+                    aids = []
+                ok, err = await attestation_service.verify_ids(
+                    project_id,
+                    [str(x) for x in aids],
+                    expected_kinds=needed,
+                    task_id=params.task_id,
+                )
+                if not ok:
+                    return ToolResult.err(
+                        f"Cannot approve: attestation gate failed ({policy_id}): {err}. "
+                        "Send rework and require real browse/test attestations."
+                    )
+            elif evidence.get("tests_passed") is not True:
                 return ToolResult.err(
-                    "Cannot approve: submit evidence missing tests_passed=true. "
-                    "Send the task back for rework (decision='rework') and require "
-                    "the executor to run tests before resubmitting."
+                    "Cannot approve docs_only task without tests_passed=true ack."
                 )
 
-        current_status = task["status"]
-        if current_status == "submitted":
-            await ts.start_review(project_id, params.task_id)
-        elif current_status != "reviewing":
-            return ToolResult.err(
-                f"Task must be 'submitted' or 'reviewing' to review, "
-                f"but is '{current_status}'"
+            # (1) Force worktree context — ensure assignee tree exists, then gate
+            if task.get("assignee_id"):
+                try:
+                    from hiveweave.services.git_worktree import ensure_executor_worktree
+
+                    await ensure_executor_worktree(
+                        project_id, str(task["assignee_id"])
+                    )
+                except Exception:
+                    pass
+            wt_deny, wt_meta = await review_worktree_gate(
+                project_id, task, evidence
             )
+            if wt_deny:
+                return ToolResult.err(wt_deny)
+
+        current_status = task["status"]
+        if decision == "approve":
+            if current_status == "submitted":
+                await ts.start_review(project_id, params.task_id)
+            elif current_status != "reviewing":
+                return ToolResult.err(
+                    f"Task must be 'submitted' or 'reviewing' to approve, "
+                    f"but is '{current_status}'"
+                )
+        else:
+            # rework from reviewing (normal) or approved (post-approve merge conflict)
+            if current_status == "submitted":
+                await ts.start_review(project_id, params.task_id)
+            elif current_status not in ("reviewing", "approved"):
+                return ToolResult.err(
+                    f"Task must be 'submitted', 'reviewing', or 'approved' "
+                    f"to rework, but is '{current_status}'"
+                )
         await ts.review_task(project_id, params.task_id, decision, params.feedback)
 
+
         # ── 通知 assignee/executor 审查结果 ──
-        # Task Ledger 通知链：review 后必须通知 assignee，否则 executor
-        # 不知道审批结果 → idle → 团队停滞。
         task_after = await ts.get_task(project_id, params.task_id)
         if task_after and task_after.get("assignee_id"):
             assignee_id = task_after["assignee_id"]
-            if assignee_id != agent_id:  # 不通知自己
+            if assignee_id != agent_id:
                 from hiveweave.services.inbox import InboxService
                 inbox = InboxService()
                 if decision == "approve":
+                    from hiveweave.services.worktree_review import agent_worktree_path
+
+                    wt_path = await agent_worktree_path(assignee_id)
                     msg = (
                         f"[TASK APPROVED] Task '{task_after.get('title', '')[:60]}' "
-                        f"has been approved. Wait for coordinator to merge your "
-                        f"worktree, then complete the mandatory VERIFY follow-up task."
+                        f"has been approved. Wait for your coordinator to "
+                        f"git_worktree_merge your worktree"
+                        f"{f' ({wt_path})' if wt_path else ''}. "
+                        f"VERIFY runs only AFTER merge lands on main — do not "
+                        f"self-verify. If merge conflicts, you will get rework "
+                        f"to rebase/merge main in YOUR worktree (not on main)."
                     )
                     priority = "normal"
                 else:
@@ -1007,26 +1137,31 @@ async def review_task_tool(
                     priority=priority,
                     task_id=params.task_id,
                 )
-                # 触发 executor 处理
                 from hiveweave.agents.trigger import trigger_subordinate
                 await trigger_subordinate(assignee_id)
 
-        verify_note = ""
-        if decision == "approve" and task_after:
-            verify_id = await _spawn_post_approve_verify_task(
-                ts, project_id, agent_id, task_after
-            )
-            if verify_id:
-                verify_note = (
-                    f" Mandatory VERIFY task created: {verify_id}. "
-                    f"After git_worktree_merge, that VERIFY task will be nudged "
-                    f"to run final tests on main."
-                )
-
+        # (3) Do NOT spawn VERIFY on approve — only after successful merge
         if decision == "approve":
+            from hiveweave.services.worktree_review import agent_worktree_path
+
+            asg = (task_after or {}).get("assignee_id")
+            wt = await agent_worktree_path(asg) if asg else None
+            short = ""
+            if asg:
+                try:
+                    from hiveweave.services.org import OrgService
+                    a = await OrgService().resolve_agent(asg)
+                    short = (a or {}).get("short_id") or ""
+                except Exception:
+                    pass
             return ToolResult.ok(
-                f"Task {params.task_id} approved.{verify_note} "
-                f"Next: call git_worktree_merge for the assignee's worktree."
+                f"Task {params.task_id} approved against assignee worktree"
+                f"{f' ({wt})' if wt else ''}. "
+                f"VERIFY is NOT created yet. "
+                f"Next (YOU, coordinator): git_worktree_merge("
+                f"branchName='{short or 'hw/<short_id>/...'}'). "
+                f"On conflict: rework executor to rebase/merge main in their "
+                f"worktree (main merge is aborted — no markers on main)."
             )
         return ToolResult.ok(f"Task {params.task_id} sent back for rework.")
     except Exception as e:
@@ -1039,10 +1174,10 @@ async def _spawn_post_approve_verify_task(
     reviewer_id: str,
     parent_task: dict,
 ) -> str | None:
-    """Create a mandatory VERIFY child task after approve.
+    """Create a mandatory VERIFY child after successful worktree merge.
 
-    The VERIFY task is claimed/run after merge lands on main. Tags mark it
-    so git_worktree_merge can nudge the assignee.
+    Call sites: nudge_verify_tasks_after_merge only (not review_task approve).
+    VERIFY stays created until merge/stale nudge claims it.
     """
     parent_id = parent_task.get("id")
     if not parent_id:
@@ -1083,27 +1218,51 @@ async def _spawn_post_approve_verify_task(
             return t.get("id")
 
     title = parent_task.get("title") or "task"
-    assignee = parent_task.get("assignee_id")
+    original_assignee = parent_task.get("assignee_id")
+    qa_assignee = await _find_independent_qa(
+        project_id, original_assignee=original_assignee
+    )
+    blocked_note = ""
+    if not qa_assignee:
+        blocked_note = (
+            " No independent QA agent found — VERIFY left unassigned/blocked; "
+            "notify HR to hire QA."
+        )
+
+    verify_tags = ["verify", "mandatory", "post-merge"]
+    from hiveweave.services.attestation import resolve_task_policy
+
+    parent_policy = parent_task.get("policy_id") or resolve_task_policy(
+        title=parent_task.get("title") or "",
+        tags=parent_tags if isinstance(parent_tags, list) else [],
+        description=parent_task.get("description") or "",
+    )
+    if parent_policy == "ui_browser_e2e":
+        verify_tags.append("ui")
+
     verify_id = await ts.create_task(
         project_id,
         title=f"VERIFY: {title}"[:200],
         description=(
             f"Mandatory post-merge verification for parent task {parent_id}.\n"
-            "1. Confirm coordinator has merged the worktree to main.\n"
-            "2. On the MAIN workspace (not a stale worktree), install deps if needed "
-            "and run the project's test suite (npm test / pytest / etc.).\n"
-            "3. submit_task with testsPassed=true and testOutput summarizing results.\n"
-            "If tests fail, fix on a new branch/worktree path or report blockers."
+            "1. Work is already on MAIN (coordinator merged the worktree).\n"
+            "2. On the MAIN workspace only, run the project test suite "
+            "(npm test / pytest / etc.).\n"
+            "3. If the parent task touched user-visible screens, also run visual "
+            "acceptance on main.\n"
+            "4. submit_task with attestationIds from those runs.\n"
+            "If checks fail, report blockers — do not silently pass.\n"
+            f"Original implementer must NOT self-verify (was: {original_assignee})."
         ),
         creator_id=reviewer_id,
-        assignee_id=assignee,
+        assignee_id=qa_assignee,
         priority=1,
         acceptance_criteria=[
             {"text": "Final version on main passes project tests", "required": True},
-            {"text": "submit_task includes testsPassed=true + testOutput", "required": True},
+            {"text": "submit_task includes attestationIds", "required": True},
         ],
         parent_task_id=parent_id,
-        tags=["verify", "mandatory", "post-merge"],
+        tags=verify_tags,
         source="system",
     )
     try:
@@ -1114,15 +1273,114 @@ async def _spawn_post_approve_verify_task(
             parent_id=parent_id,
             error=str(e),
         )
-    # Stay in created until merge/stale nudge claims — VERIFY is post-merge work.
-    # Making it claimed+actionable at approve thrashs agents before main is ready.
+
+    if not qa_assignee:
+        try:
+            await ts.block_task(
+                project_id,
+                verify_id,
+                "No independent QA agent; hire QA before VERIFY can run",
+            )
+        except Exception:
+            try:
+                await ts.update_task(
+                    project_id,
+                    verify_id,
+                    blocked_reason="No independent QA; hire QA",
+                )
+            except Exception:
+                pass
+        # Notify HR + reviewer
+        try:
+            from hiveweave.services.inbox import InboxService
+            from hiveweave.services.org import OrgService
+
+            agents = await OrgService().list_agents(project_id)
+            hr_ids = [
+                a["id"]
+                for a in agents
+                if (a.get("status") or "active") == "active"
+                and a.get("id")
+                and (
+                    (a.get("role") or "").lower() == "hr"
+                    or "人力资源" in (a.get("role") or "")
+                )
+            ]
+            inbox = InboxService()
+            msg = (
+                f"[VERIFY BLOCKED] Task {verify_id[:8]} needs independent QA "
+                f"(≠ implementer {str(original_assignee)[:8]}). Please hire QA."
+            )
+            for hid in hr_ids:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=hid,
+                    message=msg,
+                    message_type="system",
+                    priority="urgent",
+                    task_id=verify_id,
+                )
+            if reviewer_id:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=reviewer_id,
+                    message=msg,
+                    message_type="system",
+                    priority="normal",
+                    task_id=verify_id,
+                )
+        except Exception as e:
+            log.warning("verify_qa_notify_failed", error=str(e))
+
     log.info(
         "verify_task_spawned",
         parent_task_id=parent_id,
         verify_task_id=verify_id,
-        assignee_id=assignee,
+        assignee_id=qa_assignee,
+        original_assignee=original_assignee,
     )
     return verify_id
+
+
+async def _find_independent_qa(
+    project_id: str, *, original_assignee: str | None
+) -> str | None:
+    """Pick QA-capability agent ≠ original implementer (prefer same parent)."""
+    from hiveweave.services.org import OrgService
+    from hiveweave.services.policy import (
+        Capability,
+        has_capability,
+        infer_role_family,
+    )
+
+    agents = await OrgService().list_agents(project_id)
+    active = [
+        a
+        for a in agents
+        if (a.get("status") or "active") == "active"
+        and a.get("id")
+        and a.get("id") != original_assignee
+    ]
+    original_parent = None
+    if original_assignee:
+        for a in agents:
+            if a.get("id") == original_assignee:
+                original_parent = a.get("parent_id")
+                break
+
+    def is_qa(a: dict) -> bool:
+        if infer_role_family(a) == "qa":
+            return True
+        return has_capability(a, Capability.BROWSER_ACCEPTANCE)
+
+    qa_agents = [a for a in active if is_qa(a)]
+    if not qa_agents:
+        return None
+    if original_parent:
+        same = [a for a in qa_agents if a.get("parent_id") == original_parent]
+        if same:
+            return same[0]["id"]
+    return qa_agents[0]["id"]
 
 
 # Stale VERIFY child under a verifying parent (ms) — matches stall cooldown scale
@@ -1198,11 +1456,183 @@ async def _nudge_one_verify_task(
     return True
 
 
-async def nudge_verify_tasks_after_merge(
-    project_id: str, from_agent_id: str
-) -> int:
-    """After a successful merge, nudge open VERIFY tasks so final tests run on main."""
+async def spawn_verify_for_approved_assignee(
+    project_id: str,
+    coordinator_id: str,
+    *,
+    assignee_id: str,
+    merged_files: list[str] | None = None,
+) -> list[str]:
+    """Create VERIFY children for tasks covered by this merge (post-merge)."""
+    from hiveweave.services.worktree_review import select_tasks_for_merged_work
+
     ts = TaskService()
+    tasks = await ts.list_tasks(project_id)
+    selected = select_tasks_for_merged_work(
+        tasks,
+        assignee_id=assignee_id,
+        merged_files=merged_files,
+        statuses=("approved", "verifying"),
+    )
+    spawned: list[str] = []
+    for t in selected:
+        vid = await _spawn_post_approve_verify_task(
+            ts, project_id, coordinator_id, t
+        )
+        if vid:
+            spawned.append(vid)
+    return spawned
+
+
+def parse_short_id_from_branch(branch_name: str) -> str | None:
+    b = (branch_name or "").strip()
+    if b.startswith("hw/"):
+        parts = b.split("/")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    if b and len(b) <= 8 and b[0].upper() == "A" and b.isalnum():
+        return b.upper() if b[0].isupper() else ("A" + b[1:])
+    return None
+
+
+async def resolve_agent_id_by_short_id(
+    project_id: str, short_id: str
+) -> str | None:
+    from hiveweave.services.org import OrgService
+
+    agents = await OrgService().list_agents(project_id)
+    sid = (short_id or "").strip().upper()
+    for a in agents:
+        if (a.get("short_id") or "").upper() == sid:
+            return a.get("id")
+    return None
+
+
+async def rework_tasks_after_merge_conflict(
+    project_id: str,
+    from_agent_id: str,
+    *,
+    merged_short_id: str | None = None,
+    merged_branch: str | None = None,
+    conflicts: list[str] | None = None,
+    merged_files: list[str] | None = None,
+) -> int:
+    """On merge conflict: rework scoped approved tasks; wake executor in worktree."""
+    from hiveweave.services.inbox import InboxService
+    from hiveweave.services.worktree_review import select_tasks_for_merged_work
+    from hiveweave.agents.trigger import trigger_subordinate
+
+    ts = TaskService()
+    short = merged_short_id or (
+        parse_short_id_from_branch(merged_branch or "") if merged_branch else None
+    )
+    agent_id = None
+    if short:
+        agent_id = await resolve_agent_id_by_short_id(project_id, short)
+    if not agent_id:
+        return 0
+
+    tasks = await ts.list_tasks(project_id)
+    selected = select_tasks_for_merged_work(
+        tasks,
+        assignee_id=agent_id,
+        merged_files=merged_files or conflicts,
+        statuses=("approved",),
+    )
+    files = ", ".join((conflicts or merged_files or [])[:12]) or "(unknown)"
+    feedback = (
+        f"[MERGE CONFLICT] Main merge aborted. In YOUR worktree, merge or "
+        f"rebase main into your branch, resolve: {files}. "
+        f"Then checkpoint and re-submit. Do NOT edit main."
+    )
+    inbox = InboxService()
+    count = 0
+    for t in selected:
+        tid = t.get("id")
+        if not tid:
+            continue
+        try:
+            await ts.review_task(project_id, tid, "rework", feedback)
+        except Exception as e:
+            log.warning("merge_conflict_rework_task_failed", task_id=tid, error=str(e))
+            continue
+        try:
+            await inbox.send_message(
+                from_agent_id=from_agent_id,
+                to_agent_id=agent_id,
+                message=f"[REWORK REQUESTED] {feedback}",
+                message_type="task",
+                priority="urgent",
+                task_id=tid,
+            )
+            await trigger_subordinate(agent_id)
+        except Exception as e:
+            log.warning("merge_conflict_inbox_failed", error=str(e))
+        count += 1
+    if count:
+        log.info(
+            "merge_conflict_tasks_reworked",
+            project_id=project_id,
+            assignee_id=agent_id,
+            count=count,
+        )
+    return count
+
+
+async def nudge_verify_tasks_after_merge(
+    project_id: str,
+    from_agent_id: str,
+    *,
+    merged_short_id: str | None = None,
+    merged_agent_id: str | None = None,
+    merged_branch: str | None = None,
+    merged_files: list[str] | None = None,
+) -> int:
+    """After successful merge: spawn VERIFY for scoped tasks, then nudge.
+
+    VERIFY is intentionally NOT created at approve time — only here.
+    Scope is the merged work (files/branch), not every approved task.
+    """
+    from hiveweave.services.worktree_review import select_tasks_for_merged_work
+
+    ts = TaskService()
+    agent_id = merged_agent_id
+    short = merged_short_id or (
+        parse_short_id_from_branch(merged_branch or "") if merged_branch else None
+    )
+    if not agent_id and short:
+        agent_id = await resolve_agent_id_by_short_id(project_id, short)
+
+    parent_ids: set[str] = set()
+    if agent_id:
+        try:
+            all_tasks = await ts.list_tasks(project_id)
+            selected = select_tasks_for_merged_work(
+                all_tasks,
+                assignee_id=agent_id,
+                merged_files=merged_files,
+                statuses=("approved", "verifying"),
+            )
+            parent_ids = {t["id"] for t in selected if t.get("id")}
+            spawned = []
+            for t in selected:
+                vid = await _spawn_post_approve_verify_task(
+                    ts, project_id, from_agent_id, t
+                )
+                if vid:
+                    spawned.append(vid)
+            if spawned:
+                log.info(
+                    "verify_spawned_after_merge",
+                    project_id=project_id,
+                    assignee_id=agent_id,
+                    count=len(spawned),
+                    parent_ids=list(parent_ids),
+                )
+        except Exception as e:
+            log.warning("verify_spawn_after_merge_failed", error=str(e))
+            raise
+
     tasks = await ts.list_tasks(project_id)
     nudged = 0
     for t in tasks:
@@ -1211,6 +1641,16 @@ async def nudge_verify_tasks_after_merge(
             continue
         if t.get("status") not in ("created", "claimed", "running"):
             continue
+        # Only VERIFY children of parents covered by this merge
+        if parent_ids:
+            if t.get("parent_task_id") not in parent_ids:
+                continue
+        elif agent_id:
+            parent_id = t.get("parent_task_id")
+            if parent_id:
+                parent = next((p for p in tasks if p.get("id") == parent_id), None)
+                if parent and parent.get("assignee_id") not in (None, agent_id):
+                    continue
         if await _nudge_one_verify_task(
             project_id, from_agent_id, t, reason="merge"
         ):

@@ -105,44 +105,45 @@ class GitWorktreeCreateParams(BaseModel):
 
 @tool(
     "git_worktree_create",
-    "Create an isolated git worktree on a new branch for safe parallel "
-    "development.",
+    "DEPRECATED for agents: executor worktrees are created automatically on "
+    "hire/dispatch. Coordinators must not create worktrees (especially not "
+    "under their own short_id). Use git_worktree_merge after approve.",
     requires_workspace=True,
     security_level="standard",
 )
 async def git_worktree_create_tool(
     params: GitWorktreeCreateParams, agent_id: str, workspace: str, ctx=None
 ) -> ToolResult:
-    """Create a git worktree."""
+    """Create a git worktree — blocked for coordinators; prefer system ensure."""
+    # Hard ban: coordinators must not own/create write worktrees
+    try:
+        from hiveweave.services.org import OrgService
+
+        caller = await OrgService().resolve_agent(agent_id)
+        perm = ((caller or {}).get("permission_type") or "").lower()
+        if perm == "coordinator" or perm == "hr":
+            return ToolResult.err(
+                "git_worktree_create is disabled for coordinators/HR. "
+                "Executor worktrees are auto-created on hire and dispatch "
+                "(ensure_executor_worktree). You only git_worktree_merge after "
+                "approve. Never create a worktree under CEO/A001/your short_id."
+            )
+    except Exception:
+        pass
+
     # BUG-034: 防止嵌套 worktree — 如果 agent 已在 worktree 中，拒绝创建
     if ".hiveweave" in workspace and "worktrees" in workspace:
         return ToolResult.err(
             "You are already inside a worktree. Do NOT create nested worktrees. "
             "Write code directly in your current directory. "
-            "Use git_worktree_checkpoint to save progress, "
-            "git_worktree_merge to merge to main."
+            "Use git_worktree_checkpoint to save progress."
         )
 
-    from hiveweave.services.git_worktree import GitWorktreeService
-
-    wt_ctx = await _get_worktree_context(agent_id, ctx)
-    if isinstance(wt_ctx, ToolResult):
-        return wt_ctx
-    workspace_path, short_id, _ = wt_ctx
-
-    gwt = GitWorktreeService()
-    await gwt.ensure_git_repo(workspace_path)
-
-    task_name = params.branch_name or "task"
-    base_branch = params.base_branch or "main"
-
-    result = await gwt.create(workspace_path, short_id, str(task_name), base_branch)
-    if result.get("success"):
-        return ToolResult.ok(
-            f"Worktree created at {result.get('path')} "
-            f"on branch {result.get('branch')}"
-        )
-    return ToolResult.err(result.get("message", "Failed to create worktree"))
+    return ToolResult.err(
+        "git_worktree_create is not available. "
+        "Worktrees are provisioned automatically when an executor is hired "
+        "or receives dispatch_task."
+    )
 
 
 # ── git_worktree_list ────────────────────────────────────
@@ -213,7 +214,10 @@ class GitWorktreeMergeParams(BaseModel):
 
 @tool(
     "git_worktree_merge",
-    "Merge a worktree branch back into main and remove the worktree.",
+    "Merge a worktree branch into main and remove the worktree. "
+    "On conflict: main merge is aborted; rework the executor to rebase/merge "
+    "main in THEIR worktree, then retry. On success: spawns VERIFY only for "
+    "tasks covered by this merge (post-merge only).",
     requires_workspace=True,
     security_level="standard",
 )
@@ -240,10 +244,15 @@ async def git_worktree_merge_tool(
 
     branch_name = params.branch_name or "task"
     target_branch = params.target_branch or "main"
+    merged_branch: str | None = None
+    merged_short: str | None = None
 
     # Bug G fix: 智能解析 branch_name
     if branch_name.startswith("hw/"):
-        # 完整分支名 — 直接 merge
+        merged_branch = branch_name
+        from hiveweave.tools.task_tools import parse_short_id_from_branch
+
+        merged_short = parse_short_id_from_branch(branch_name)
         result = await gwt.merge_by_branch(
             workspace_path, branch_name, target_branch
         )
@@ -257,42 +266,93 @@ async def git_worktree_merge_tool(
         branches = [b.strip().lstrip("* ").strip()
                     for b in branch_out.strip().split("\n") if b.strip()]
         if not branches:
+            from hiveweave.services.worktree_review import MERGE_CONFLICT_HINT
+
             return ToolResult.err(
-                f"No worktree branch found for agent {branch_name}")
-        if len(branches) == 1:
-            result = await gwt.merge_by_branch(
-                workspace_path, branches[0], target_branch
+                f"No worktree branch found for agent {branch_name}\n\n"
+                f"{MERGE_CONFLICT_HINT}"
             )
-        else:
-            # 多个分支 — 尝试 merge 第一个，报告其他的
-            result = await gwt.merge_by_branch(
-                workspace_path, branches[0], target_branch
+        merged_short = branch_name
+        merged_branch = branches[0]
+        result = await gwt.merge_by_branch(
+            workspace_path, branches[0], target_branch
+        )
+        if result.get("success") and len(branches) > 1:
+            remaining = branches[1:]
+            result["message"] = (
+                f"Merged {branches[0]}. "
+                f"Remaining branches: {remaining}"
             )
-            if result.get("success") and len(branches) > 1:
-                remaining = branches[1:]
-                result["message"] = (
-                    f"Merged {branches[0]}. "
-                    f"Remaining branches: {remaining}"
-                )
     else:
         # task_name — 用调用者自己的 short_id (原始行为)
+        merged_short = caller_short_id
+        merged_branch = f"hw/{caller_short_id}/{branch_name}"
         result = await gwt.merge(
             workspace_path, caller_short_id, str(branch_name), target_branch
         )
 
+    short = result.get("short_id") or merged_short or caller_short_id
+    branch = result.get("branch") or merged_branch
+    files = result.get("files") or result.get("conflicts")
+
     if result.get("success"):
-        # Post-merge: nudge VERIFY tasks so final tests run on main
+        # Post-merge: spawn VERIFY scoped to this merge + nudge on main
         try:
             from hiveweave.tools.task_tools import nudge_verify_tasks_after_merge
-            nudged = await nudge_verify_tasks_after_merge(project_id, agent_id)
+
+            nudged = await nudge_verify_tasks_after_merge(
+                project_id,
+                agent_id,
+                merged_short_id=short,
+                merged_branch=branch,
+                merged_files=files if isinstance(files, list) else None,
+            )
         except Exception as e:
             log.warning("verify_nudge_after_merge_failed", error=str(e))
-            nudged = 0
+            return ToolResult.ok(
+                f"{result.get('message', 'Worktree merged and cleaned up')} "
+                f"WARNING: VERIFY spawn/nudge failed ({e}). "
+                f"Retry merge nudge or spawn VERIFY manually for the merged task."
+            )
         msg = result.get("message", "Worktree merged and cleaned up")
         if nudged:
-            msg = f"{msg} Nudged {nudged} VERIFY task(s) to run final tests on main."
+            msg = (
+                f"{msg} Spawned/nudged {nudged} VERIFY task(s) for this merge "
+                f"on MAIN (VERIFY is post-merge + merge-scoped)."
+            )
+        elif files is not None:
+            msg = (
+                f"{msg} No VERIFY spawned (no matching approved task for "
+                f"this merge scope)."
+            )
         return ToolResult.ok(msg)
-    return ToolResult.err(result.get("message", "Failed to merge worktree"))
+
+    # Conflict: auto-rework matching approved task(s) → executor fixes in worktree
+    try:
+        from hiveweave.tools.task_tools import rework_tasks_after_merge_conflict
+
+        reworked = await rework_tasks_after_merge_conflict(
+            project_id,
+            agent_id,
+            merged_short_id=short,
+            merged_branch=branch,
+            conflicts=result.get("conflicts") if isinstance(result.get("conflicts"), list) else None,
+            merged_files=files if isinstance(files, list) else None,
+        )
+    except Exception as e:
+        log.warning("merge_conflict_rework_failed", error=str(e))
+        reworked = 0
+
+    from hiveweave.services.worktree_review import format_merge_conflict_message
+
+    err = result.get("message") or format_merge_conflict_message(
+        branch=str(branch or branch_name),
+        target=target_branch,
+        conflicts=result.get("conflicts") if isinstance(result.get("conflicts"), list) else None,
+    )
+    if reworked:
+        err = f"{err}\n\nAuto-reworked {reworked} approved task(s) → executor."
+    return ToolResult.err(err)
 
 
 # ── git_worktree_remove ──────────────────────────────────

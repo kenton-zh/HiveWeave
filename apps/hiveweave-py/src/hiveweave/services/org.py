@@ -110,7 +110,7 @@ class OrgService:
 
     # ── CREATE ───────────────────────────────────────────────
 
-    async def create_agent(self, attrs: dict) -> dict:
+    async def create_agent(self, attrs: dict, *, bootstrap: bool = False) -> dict:
         """Create a new agent. Returns the created agent dict.
 
         Auto-generates ``id`` (UUID) and ``short_id`` (A001-style) if not
@@ -122,7 +122,11 @@ class OrgService:
         bound_skills is initialized as a copy of skills — these are the
         纪律技能 (discipline skills) that get injected into the agent's
         system prompt at runtime.
+
+        ``bootstrap=True`` skips hire invariants (CEO/HR seed only).
         """
+        from hiveweave.services.org_invariants import validate_hire
+
         agent_id = attrs.get("id") or str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
         project_id = attrs.get("project_id", "")
@@ -130,6 +134,20 @@ class OrgService:
         # Initialize bound_skills from skills if not explicitly set
         if "bound_skills" not in attrs and "skills" in attrs:
             attrs = {**attrs, "bound_skills": attrs["skills"]}
+
+        # Hard org gates (tools + REST share this path)
+        if not bootstrap and project_id:
+            existing = await self.list_agents(project_id)
+            err = validate_hire(
+                agents=existing,
+                name=str(attrs.get("name") or ""),
+                role=str(attrs.get("role") or ""),
+                permission_type=str(attrs.get("permission_type") or "executor"),
+                parent_id=str(attrs.get("parent_id") or ""),
+                bootstrap=False,
+            )
+            if err:
+                raise ValueError(err)
 
         cols: list[str] = ["id", "short_id", "created_at", "updated_at"]
         vals: list = [agent_id, None, now_ms, now_ms]  # short_id filled under lock

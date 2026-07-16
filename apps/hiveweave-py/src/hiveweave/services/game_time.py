@@ -245,6 +245,11 @@ class GameTimeService:
             except Exception as e:
                 log.error("alarm_fire_failed", alarm_id=alarm["id"], error=str(e))
         state["alarms"] = [a for a in state["alarms"] if not a["fired"]]
+        # P0 Phase 2: Wait TTL expiry + SCC cycle break (every tick)
+        try:
+            await self._process_wait_contracts(project_id)
+        except Exception as e:
+            log.error("wait_contract_tick_failed", project_id=project_id, error=str(e))
         # Auto-heal: clear orphan streaming messages (agent idle but is_streaming=1)
         if state["tick_count"] % STREAMING_SWEEP_TICKS == 0:
             await self._sweep_orphan_streaming(project_id)
@@ -276,6 +281,111 @@ class GameTimeService:
                 project_id=project_id,
                 error=str(e),
             )
+
+    async def _process_wait_contracts(self, project_id: str) -> None:
+        """Expire waits (WAIT_TIMEOUT) and break agent wait cycles."""
+        from hiveweave.agents.trigger import trigger_subordinate
+        from hiveweave.services.inbox import InboxService
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.wait_contract import wait_contract_service
+
+        await wait_contract_service.backfill_null_expires(project_id)
+        cleared = await wait_contract_service.clear_expired(project_id)
+        inbox = InboxService()
+        for w in cleared:
+            aid = w.get("agentId") or ""
+            if not aid:
+                continue
+            kind = w.get("kind") or "?"
+            ref = w.get("ref") or "?"
+            try:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=aid,
+                    message=(
+                        f"[WAIT_TIMEOUT] Your wait ({kind}:{ref}) expired. "
+                        "Resume work or re-establish a wait."
+                    ),
+                    message_type="system",
+                    priority="urgent",
+                )
+                await trigger_subordinate(aid)
+            except Exception as e:
+                log.warning(
+                    "wait_timeout_notify_failed",
+                    agent_id=aid,
+                    error=str(e),
+                )
+
+        agents = await OrgService().list_agents(project_id)
+        by_key: dict[str, str] = {}
+        for a in agents:
+            aid = a.get("id") or ""
+            if not aid:
+                continue
+            by_key[aid.lower()] = aid
+            if a.get("short_id"):
+                by_key[str(a["short_id"]).lower()] = aid
+            if a.get("name"):
+                by_key[str(a["name"]).lower()] = aid
+
+        def resolve_ref(ref: str) -> str | None:
+            r = (ref or "").strip().lower()
+            if not r:
+                return None
+            if r in by_key:
+                return by_key[r]
+            for k, v in by_key.items():
+                if len(r) >= 4 and (k.startswith(r) or r.startswith(k)):
+                    return v
+            return None
+
+        breaks = await wait_contract_service.break_wait_cycles(
+            project_id, resolve_ref
+        )
+        for b in breaks:
+            breaker = b.get("breakerId") or ""
+            cycle = b.get("cycle") or []
+            if not breaker:
+                continue
+            try:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=breaker,
+                    message=(
+                        f"[WAIT_CYCLE] Deadlock broken among {cycle}. "
+                        "Your agent-waits were cleared — resume or re-wait."
+                    ),
+                    message_type="system",
+                    priority="urgent",
+                )
+                await trigger_subordinate(breaker)
+            except Exception as e:
+                log.warning(
+                    "wait_cycle_notify_failed",
+                    breaker=breaker,
+                    error=str(e),
+                )
+            # Ping common superior (parent of breaker) if any
+            parent_id = None
+            for a in agents:
+                if a.get("id") == breaker:
+                    parent_id = a.get("parent_id")
+                    break
+            if parent_id and parent_id not in cycle:
+                try:
+                    await inbox.send_message(
+                        from_agent_id="system",
+                        to_agent_id=parent_id,
+                        message=(
+                            f"[WAIT_CYCLE] Subordinate wait deadlock broken "
+                            f"(cycle={cycle}, breaker={breaker[:8]})."
+                        ),
+                        message_type="system",
+                        priority="normal",
+                    )
+                except Exception:
+                    pass
 
     async def _sweep_orphan_streaming(self, project_id: str) -> None:
         """Clear is_streaming=1 rows whose agent is not actively PROCESSING.
@@ -357,11 +467,14 @@ class GameTimeService:
                         k: v for k, v in os.environ.items()
                         if k.upper() in _SAFE_ENV_KEYS
                     }
+                    from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
                     proc = await asyncio.create_subprocess_shell(
                         script,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         env=safe_env,
+                        **windows_no_window_kwargs(),
                     )
                     stdout, stderr = await asyncio.wait_for(
                         proc.communicate(), timeout=120

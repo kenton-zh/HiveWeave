@@ -302,6 +302,8 @@ async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
     env = _build_safe_env(cwd)
 
     try:
+        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
         proc = await asyncio.create_subprocess_exec(
             *shell_args,
             cwd=cwd,
@@ -309,6 +311,7 @@ async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
+            **windows_no_window_kwargs(),
         )
     except FileNotFoundError as exc:
         return {"output": "", "exit_code": None, "timed_out": False,
@@ -361,12 +364,15 @@ async def _run_docker(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
     ]
 
     try:
+        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
         proc = await asyncio.create_subprocess_exec(
             *docker_cmd,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
+            **windows_no_window_kwargs(),
         )
     except FileNotFoundError:
         log.warning("bash.docker_unavailable", reason="docker binary not found")
@@ -638,7 +644,37 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
         project_id=project_id,
     )
     if result.get("success"):
-        return ToolResult.ok(result["output"])
+        out = result["output"]
+        # Phase 3: attest test runs
+        try:
+            from hiveweave.services.attestation import (
+                attestation_service,
+                is_test_command,
+            )
+            from hiveweave.services.task import TaskService
+
+            if project_id and is_test_command(params.command or ""):
+                tasks = await TaskService().list_tasks(
+                    project_id, assignee_id=agent_id
+                )
+                active = [
+                    t for t in tasks if t.get("status") in ("running", "claimed")
+                ]
+                task_id = active[0].get("id") if len(active) == 1 else None
+                aid = await attestation_service.create(
+                    project_id,
+                    agent_id=agent_id,
+                    kind="test_run",
+                    command_or_url=(params.command or "")[:500],
+                    exit_code=0,
+                    workspace=workspace or "",
+                    stdout=str(out)[-8000:],
+                    task_id=task_id,
+                )
+                out = f"{out}\n\n[attestation_id={aid} kind=test_run]"
+        except Exception:
+            pass
+        return ToolResult.ok(out)
     # For bash, output contains the command output even on failure
     return ToolResult.err(result.get("error", "Command failed"))
 
@@ -667,5 +703,34 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         workspace_path=workspace,
     )
     if result.get("success"):
-        return ToolResult.ok(result["output"])
+        out = result["output"]
+        try:
+            from hiveweave.services.attestation import (
+                attestation_service,
+                is_test_command,
+            )
+            from hiveweave.services.task import TaskService
+
+            if project_id and is_test_command(params.command or ""):
+                tasks = await TaskService().list_tasks(
+                    project_id, assignee_id=agent_id
+                )
+                active = [
+                    t for t in tasks if t.get("status") in ("running", "claimed")
+                ]
+                task_id = active[0].get("id") if len(active) == 1 else None
+                aid = await attestation_service.create(
+                    project_id,
+                    agent_id=agent_id,
+                    kind="test_run",
+                    command_or_url=(params.command or "")[:500],
+                    exit_code=0,
+                    workspace=workspace or "",
+                    stdout=str(out)[-8000:],
+                    task_id=task_id,
+                )
+                out = f"{out}\n\n[attestation_id={aid} kind=test_run]"
+        except Exception:
+            pass
+        return ToolResult.ok(out)
     return ToolResult.err(result.get("error", "Command failed"))

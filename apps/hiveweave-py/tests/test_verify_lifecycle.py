@@ -79,11 +79,17 @@ async def test_spawn_verify_stays_created(task_env):
     await ts.review_task(pid, parent_id, "approve")
     parent = await ts.get_task(pid, parent_id)
 
-    verify_id = await _spawn_post_approve_verify_task(ts, pid, COORD, parent)
+    qa_id = "qa-verify-1"
+    with patch(
+        "hiveweave.tools.task_tools._find_independent_qa",
+        AsyncMock(return_value=qa_id),
+    ):
+        verify_id = await _spawn_post_approve_verify_task(ts, pid, COORD, parent)
     assert verify_id
     verify = await ts.get_task(pid, verify_id)
     assert verify["status"] == "created"
-    assert verify["assignee_id"] == EXEC
+    assert verify["assignee_id"] == qa_id
+    assert verify["assignee_id"] != EXEC
     parent2 = await ts.get_task(pid, parent_id)
     assert parent2["status"] == "verifying"
 
