@@ -270,6 +270,33 @@ class AgentManager:
                     error=str(e),
                 )
 
+            # 同步 stale project_id — per-project DB 中的 agents.project_id
+            # 可能在项目重建后残留旧值，导致按当前 project_id 查不到 agents
+            try:
+                cursor = await conn.execute(
+                    "SELECT id FROM agents WHERE project_id != ? AND status = 'active'",
+                    [project_id],
+                )
+                stale = await cursor.fetchall()
+                await cursor.close()
+                if stale:
+                    log.warning(
+                        "start_agents_stale_project_id",
+                        project_id=project_id,
+                        stale_count=len(stale),
+                    )
+                    await conn.execute(
+                        "UPDATE agents SET project_id = ? WHERE project_id != ?",
+                        [project_id, project_id],
+                    )
+                    await conn.commit()
+                    log.info(
+                        "start_agents_stale_project_id_fixed",
+                        fixed_count=len(stale),
+                    )
+            except Exception as e:
+                log.warning("start_agents_sync_project_id_failed", error=str(e))
+
             cursor = await conn.execute(
                 "SELECT id, project_id, name, role, permission_type as role_type, backstory, "
                 "model_id, goal, permission_mode, bound_skills, "

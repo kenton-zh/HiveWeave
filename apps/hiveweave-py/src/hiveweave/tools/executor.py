@@ -77,6 +77,34 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["command"],
     },
+    "browse": {
+        "description": (
+            "Drive a real Chromium browser via gstack browse CLI for UI E2E / visual QA. "
+            "Use after start_dev_server/lookup_dev_server. Typical flow: "
+            "browse(args=[\"goto\",\"http://127.0.0.1:PORT\"]) → "
+            "browse(args=[\"snapshot\",\"-i\"]) → browse(args=[\"click\",\"@e3\"]) → "
+            "browse(args=[\"screenshot\",\"evidence/bug.png\"]). "
+            "Also: console, network, fill, text. Prefer this over raw bash $B."
+        ),
+        "properties": {
+            "args": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": 'CLI argv e.g. ["goto","http://127.0.0.1:3000"] or ["snapshot","-i"]',
+            },
+            "command": {
+                "type": "string",
+                "aliases": ["cmd"],
+                "description": "Alternative to args: space-separated subcommand string.",
+            },
+            "timeoutSec": {
+                "type": "integer",
+                "aliases": ["timeout_sec", "timeout"],
+                "description": "Timeout in seconds (default 60, max 300).",
+            },
+        },
+        "required": [],
+    },
     "run_command": {
         "description": "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command.",
         "properties": {

@@ -30,12 +30,14 @@ CIRCUIT_CLOSE = "circuit.close"
 AGENT_WAKE = "agent.wake"
 AGENT_NO_PROGRESS = "agent.no_progress_fault"
 INBOX_DEDUPED = "inbox.deduped"
+VERIFY_STALE_NUDGE = "verify.stale_nudge"
 
 ALL_EVENTS = frozenset({
     LLM_STREAM_START, LLM_STREAM_CHUNK, LLM_STREAM_DONE, LLM_STREAM_FAIL,
     AGENT_CHAT_START, AGENT_CHAT_DONE, AGENT_CRASH,
     CIRCUIT_OPEN, CIRCUIT_CLOSE,
     AGENT_WAKE, AGENT_NO_PROGRESS, INBOX_DEDUPED,
+    VERIFY_STALE_NUDGE,
 })
 
 
@@ -55,6 +57,7 @@ class Telemetry:
             "wake_by_reason": 0,  # placeholder; use _wake_reasons
             "no_progress_faults": 0,
             "inbox_deduped": 0,
+            "verify_stale_nudge": 0,
         }
         self._wake_reasons: dict[str, int] = {}
 
@@ -69,6 +72,7 @@ class Telemetry:
             "wake_by_reason": dict(self._wake_reasons),
             "no_progress_faults": self._counters.get("no_progress_faults", 0),
             "inbox_deduped": self._counters.get("inbox_deduped", 0),
+            "verify_stale_nudge": self._counters.get("verify_stale_nudge", 0),
         }
 
     def reset_counters_for_tests(self) -> None:
@@ -77,6 +81,7 @@ class Telemetry:
             "wake_by_reason": 0,
             "no_progress_faults": 0,
             "inbox_deduped": 0,
+            "verify_stale_nudge": 0,
         }
         self._wake_reasons.clear()
 
@@ -96,6 +101,10 @@ class Telemetry:
         elif event_name == INBOX_DEDUPED:
             self._counters["inbox_deduped"] = (
                 self._counters.get("inbox_deduped", 0) + 1
+            )
+        elif event_name == VERIFY_STALE_NUDGE:
+            self._counters["verify_stale_nudge"] = (
+                self._counters.get("verify_stale_nudge", 0) + 1
             )
 
         # Default dispatch: structured logging via structlog

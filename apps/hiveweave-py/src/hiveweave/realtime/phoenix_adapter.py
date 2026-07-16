@@ -460,7 +460,48 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
     # 不再拒绝消息，也不留 orphan 消息在 chat_messages。
     agent = agent_manager.get_agent(agent_id)
 
+    async def _save_user_and_ack() -> None:
+        try:
+            saved = await chat_service.save_message(
+                {
+                    "agent_id": agent_id,
+                    "role": "user",
+                    "content": message,
+                    "is_streaming": False,
+                    "is_read": True,
+                }
+            )
+            await send_fn(
+                [None, None, topic, "message_id",
+                 {"id": saved["id"], "agentId": agent_id, "role": "user"}]
+            )
+        except Exception as e:
+            log.warning("phoenix_chat_save_failed", agent_id=agent_id, error=str(e))
+
+    async def _reply_off_duty() -> None:
+        from hiveweave.services.off_duty import send_off_duty_auto_reply
+
+        await _save_user_and_ack()
+        try:
+            asst = await send_off_duty_auto_reply(agent_id)
+            await send_fn(
+                [None, None, topic, "message_id",
+                 {"id": asst["id"], "agentId": agent_id, "role": "assistant",
+                  "content": asst["content"]}]
+            )
+        except Exception as e:
+            log.warning("phoenix_off_duty_reply_failed", agent_id=agent_id, error=str(e))
+            await send_fn(
+                [None, None, topic, "error",
+                 {"message": "Agent is off duty", "agentId": agent_id}]
+            )
+
     if agent is None:
+        from hiveweave.services.off_duty import is_agent_off_duty
+
+        if await is_agent_off_duty(agent_id):
+            await _reply_off_duty()
+            return
         await send_fn(
             [None, None, topic, "error",
              {"message": "Agent not running", "agentId": agent_id}]
@@ -472,17 +513,7 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
         # send to inbox so agent picks it up when idle.
         import json as _json
         queued = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)
-        try:
-            saved = await chat_service.save_message(
-                {"agent_id": agent_id, "role": "user", "content": message,
-                 "is_streaming": False, "is_read": True}
-            )
-            await send_fn(
-                [None, None, topic, "message_id",
-                 {"id": saved["id"], "agentId": agent_id, "role": "user"}]
-            )
-        except Exception as e:
-            log.warning("phoenix_chat_save_failed", agent_id=agent_id, error=str(e))
+        await _save_user_and_ack()
         # Queue to inbox for processing when agent becomes idle
         from hiveweave.services.inbox import InboxService
         await InboxService().send_message(
@@ -536,6 +567,19 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
             [None, None, topic, "error",
              {"message": "System is paused", "agentId": agent_id}]
         )
+    elif result.get("error") == "project_not_started":
+        # User msg already saved; only send assistant off-duty reply
+        from hiveweave.services.off_duty import send_off_duty_auto_reply
+
+        try:
+            asst = await send_off_duty_auto_reply(agent_id)
+            await send_fn(
+                [None, None, topic, "message_id",
+                 {"id": asst["id"], "agentId": agent_id, "role": "assistant",
+                  "content": asst["content"]}]
+            )
+        except Exception as e:
+            log.warning("phoenix_off_duty_reply_failed", agent_id=agent_id, error=str(e))
     # ok → 流式事件由 bus 自动推送
 
 

@@ -106,18 +106,20 @@ def should_wake(
             from_agent_name=from_agent_name,
             from_short_id=from_short_id,
         )
-        if not matched:
-            # Timer/external/task waits must not swallow superior commands —
-            # otherwise blocked workers stay dead after npm-install nudges.
-            # Agent-waits still require sender match (no pierce).
-            kinds = {(w.get("kind") or "") for w in (active_waits or [])}
-            pierce_ok = bool(kinds) and kinds <= {"timer", "external", "task"}
-            if not (
-                pierce_ok
-                and category in ("command", "ask", "approval", "task_transition")
-            ):
-                return False
-        # Matched (or timer/external pierce) — still apply waiting_human below
+        if matched:
+            # Wait Contract match is authoritative — including when disposition
+            # is waiting_human. Otherwise peer replies that satisfy agent-waits
+            # (模块方案/审批请求) land as wake=0 and the org deadlocks.
+            return True
+        # No match: timer/external/task waits must not swallow superior commands
+        kinds = {(w.get("kind") or "") for w in (active_waits or [])}
+        pierce_ok = bool(kinds) and kinds <= {"timer", "external", "task"}
+        if not (
+            pierce_ok
+            and category in ("command", "ask", "approval", "task_transition")
+        ):
+            return False
+        # pierced — fall through to waiting_human check
 
     if disposition == "waiting_human":
         # Only user replies or new task transitions wake a waiting_human agent

@@ -1114,6 +1114,8 @@ async def _spawn_post_approve_verify_task(
             parent_id=parent_id,
             error=str(e),
         )
+    # Stay in created until merge/stale nudge claims — VERIFY is post-merge work.
+    # Making it claimed+actionable at approve thrashs agents before main is ready.
     log.info(
         "verify_task_spawned",
         parent_task_id=parent_id,
@@ -1123,6 +1125,79 @@ async def _spawn_post_approve_verify_task(
     return verify_id
 
 
+# Stale VERIFY child under a verifying parent (ms) — matches stall cooldown scale
+VERIFY_STALE_MS = 15 * 60 * 1000
+VERIFY_STALE_COOLDOWN_MS = 15 * 60 * 1000  # don't re-nudge same VERIFY every tick
+_stale_verify_cooldowns: dict[str, int] = {}  # verify_task_id → last_nudge_ms
+
+
+async def _nudge_one_verify_task(
+    project_id: str,
+    from_agent_id: str,
+    task: dict,
+    *,
+    reason: str = "merge",
+) -> bool:
+    """Claim (if created) + send [POST-MERGE VERIFY] + trigger. Returns True if sent."""
+    assignee = task.get("assignee_id")
+    if not assignee:
+        return False
+    from hiveweave.services.inbox import InboxService
+    from hiveweave.agents.trigger import trigger_subordinate
+    from hiveweave.db import meta as meta_db
+
+    dest = await meta_db.get_agent_by_id(assignee)
+    if not dest or (dest.get("status") or "") != "active":
+        return False
+
+    # Claim on nudge — this is when VERIFY becomes actionable (post-merge / stale)
+    tid = task.get("id")
+    if tid and task.get("status") == "created":
+        try:
+            await TaskService().claim_task(project_id, tid, assignee)
+            task = {**task, "status": "claimed"}
+        except Exception as e:
+            log.warning(
+                "verify_nudge_claim_failed",
+                verify_task_id=tid,
+                error=str(e),
+            )
+
+    inbox = InboxService()
+    await inbox.supersede_watchdog_messages(
+        assignee, prefixes=["[POST-MERGE VERIFY]"]
+    )
+    title = (task.get("title") or "")[:60]
+    if reason == "stale":
+        body = (
+            f"[POST-MERGE VERIFY] Stale verification — parent is still "
+            f"'verifying'. Confirm merge landed, then run final tests on MAIN "
+            f"for task '{title}' (id={tid}). "
+            f"Run tests, then submit_task(testsPassed=true, testOutput=...)."
+        )
+    else:
+        body = (
+            f"[POST-MERGE VERIFY] Worktree merge completed. "
+            f"Run final verification NOW on main for task "
+            f"'{title}' (id={tid}). "
+            f"Run tests on main, then "
+            f"submit_task(testsPassed=true, testOutput=...)."
+        )
+    try:
+        await inbox.send_message(
+            from_agent_id=from_agent_id,
+            to_agent_id=assignee,
+            message=body,
+            message_type="task",
+            priority="urgent",
+            task_id=tid,
+        )
+    except ValueError:
+        return False
+    await trigger_subordinate(assignee)
+    return True
+
+
 async def nudge_verify_tasks_after_merge(
     project_id: str, from_agent_id: str
 ) -> int:
@@ -1130,48 +1205,92 @@ async def nudge_verify_tasks_after_merge(
     ts = TaskService()
     tasks = await ts.list_tasks(project_id)
     nudged = 0
-    from hiveweave.services.inbox import InboxService
-    from hiveweave.agents.trigger import trigger_subordinate
-    from hiveweave.db import meta as meta_db
-
-    inbox = InboxService()
     for t in tasks:
         tags = t.get("tags") or []
         if not (isinstance(tags, list) and "verify" in tags):
             continue
         if t.get("status") not in ("created", "claimed", "running"):
             continue
-        assignee = t.get("assignee_id")
-        if not assignee:
-            continue
-        dest = await meta_db.get_agent_by_id(assignee)
-        if not dest or (dest.get("status") or "") != "active":
-            continue
-        await inbox.supersede_watchdog_messages(
-            assignee, prefixes=["[POST-MERGE VERIFY]"]
-        )
-        try:
-            await inbox.send_message(
-                from_agent_id=from_agent_id,
-                to_agent_id=assignee,
-                message=(
-                    f"[POST-MERGE VERIFY] Worktree merge completed. "
-                    f"Run final verification NOW on main for task "
-                    f"'{t.get('title', '')[:60]}' (id={t.get('id')}). "
-                    f"claim_task if needed, run tests on main, then "
-                    f"submit_task(testsPassed=true, testOutput=...)."
-                ),
-                message_type="task",
-                priority="urgent",
-                task_id=t.get("id"),
-            )
-        except ValueError:
-            continue
-        await trigger_subordinate(assignee)
-        nudged += 1
+        if await _nudge_one_verify_task(
+            project_id, from_agent_id, t, reason="merge"
+        ):
+            nudged += 1
     if nudged:
         log.info(
             "verify_tasks_nudged_after_merge",
+            project_id=project_id,
+            count=nudged,
+        )
+    return nudged
+
+
+async def nudge_stale_verify_tasks(
+    project_id: str,
+    *,
+    stale_ms: int = VERIFY_STALE_MS,
+    now_ms: int | None = None,
+) -> int:
+    """Nudge VERIFY children stuck under verifying parents past stale_ms.
+
+    Closes the gap when merge nudge never fired: parent stays verifying and
+    VERIFY sits in created/claimed with nobody woken.
+    """
+    import time as _time
+
+    ts = TaskService()
+    tasks = await ts.list_tasks(project_id)
+    now = now_ms if now_ms is not None else int(_time.time() * 1000)
+
+    verifying_parents = {
+        t["id"]
+        for t in tasks
+        if t.get("status") == "verifying" and not ts._is_verify_task(t)
+    }
+    if not verifying_parents:
+        return 0
+
+    nudged = 0
+    for t in tasks:
+        if not ts._is_verify_task(t):
+            continue
+        if t.get("status") not in ("created", "claimed"):
+            continue
+        parent_id = t.get("parent_task_id")
+        if not parent_id or parent_id not in verifying_parents:
+            continue
+        updated = int(t.get("updated_at") or 0)
+        if updated and (now - updated) < stale_ms:
+            continue
+        tid = t.get("id") or ""
+        last = _stale_verify_cooldowns.get(tid, 0)
+        if now - last < VERIFY_STALE_COOLDOWN_MS:
+            continue
+        if await _nudge_one_verify_task(
+            project_id, "system", t, reason="stale"
+        ):
+            _stale_verify_cooldowns[tid] = now
+            nudged += 1
+            try:
+                from hiveweave.services.telemetry import (
+                    telemetry,
+                    VERIFY_STALE_NUDGE,
+                )
+
+                telemetry.emit(
+                    VERIFY_STALE_NUDGE,
+                    {
+                        "project_id": project_id,
+                        "verify_task_id": t.get("id"),
+                        "parent_task_id": parent_id,
+                        "assignee_id": t.get("assignee_id"),
+                    },
+                )
+            except Exception:
+                pass
+
+    if nudged:
+        log.warning(
+            "verify_stale_tasks_nudged",
             project_id=project_id,
             count=nudged,
         )

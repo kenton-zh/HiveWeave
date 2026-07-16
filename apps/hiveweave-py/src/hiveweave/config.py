@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # 默认为空 — 需通过环境变量 HIVEWEAVE_EXTERNAL_SKILLS_DIR 指定
     external_skills_dir: str = ""
 
+    # gstack browse CLI binary (optional). Empty = auto-detect common install paths.
+    # Example Windows: C:\Users\...\ .claude\skills\gstack\browse\dist\browse.exe
+    browse_bin: str = ""
+
     model_config = {
         "env_prefix": "HIVEWEAVE_",
         "env_file": ".env",
@@ -50,3 +54,28 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def resolve_browse_bin() -> Path | None:
+    """Locate the gstack browse CLI binary.
+
+    Order: HIVEWEAVE_BROWSE_BIN → common Claude skills installs → D:\\PC_AI\\Project\\gstack.
+    """
+    if settings.browse_bin:
+        p = Path(settings.browse_bin).expanduser()
+        if p.is_file():
+            return p
+
+    home = Path.home()
+    candidates = [
+        home / ".claude" / "skills" / "gstack" / "browse" / "dist" / "browse.exe",
+        home / ".claude" / "skills" / "gstack" / "browse" / "dist" / "browse",
+        Path(r"D:\PC_AI\Project\gstack\browse\dist\browse.exe"),
+        Path(r"D:\PC_AI\Project\gstack\browse\dist\browse"),
+        home / ".claude" / "skills" / "browse" / "dist" / "browse.exe",
+        home / ".claude" / "skills" / "browse" / "dist" / "browse",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None

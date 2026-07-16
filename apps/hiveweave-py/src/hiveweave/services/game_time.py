@@ -251,6 +251,7 @@ class GameTimeService:
         # Watchdog: 每 2 分钟检查停滞 agent，直接触发（不经过上级）
         if state["tick_count"] % STALL_CHECK_TICKS == 0:
             await self._check_stalled(project_id)
+            await self._nudge_stale_verify(project_id)
         log.debug("game_time_tick", project_id=project_id, game_seconds=new_gs)
 
     # ── Internal ──────────────────────────────────────────────
@@ -262,6 +263,19 @@ class GameTimeService:
                 await self.tick(project_id)
             except Exception as e:
                 log.error("game_time_tick_error", project_id=project_id, error=str(e))
+
+    async def _nudge_stale_verify(self, project_id: str) -> None:
+        """Wake assignees of VERIFY children stuck under verifying parents."""
+        try:
+            from hiveweave.tools.task_tools import nudge_stale_verify_tasks
+
+            await nudge_stale_verify_tasks(project_id)
+        except Exception as e:
+            log.error(
+                "stale_verify_nudge_failed",
+                project_id=project_id,
+                error=str(e),
+            )
 
     async def _sweep_orphan_streaming(self, project_id: str) -> None:
         """Clear is_streaming=1 rows whose agent is not actively PROCESSING.

@@ -78,7 +78,7 @@ TIMEOUT_RESUME_COOLDOWN_S = 90.0
 ERROR_RESUME_COOLDOWN_S = 30.0
 """可恢复 LLM 错误后的短冷却。"""
 
-DEFAULT_MAX_TOOL_ROUNDS = 100
+DEFAULT_MAX_TOOL_ROUNDS = 600
 """所有角色统一的 tool loop 最大轮次。不再按角色区别对待。"""
 
 CONTEXT_WINDOW_DEFAULT = 128_000
@@ -194,6 +194,8 @@ class Agent:
         self._turn_gate_count = 0      # TurnResult 退出门禁续跑次数
         self._TURN_GATE_MAX = 1        # P0: at most one repair retrigger
         self._resume_cooldown_until: float = 0.0  # monotonic deadline；超时后防 doom loop
+        self._consecutive_errors: int = 0  # 连续错误次数，超过阈值后停止 resume
+        self._CONSECUTIVE_ERROR_MAX = 3   # 连续错误上限，超过后 ACK inbox 不再 resume
         self.disposition: str = "runnable"  # waiting_human|blocked|complete|…
         self._slice_budget: int = 0  # remaining auto-slices for this external wake
         self._SLICE_BUDGET_MAX = 2
@@ -362,15 +364,35 @@ class Agent:
             # 检查 busy → queue the message instead of dropping it
             if self.status == AgentState.PROCESSING:
                 self._message_queue.append((message, opts, int(time.time() * 1000)))
-                # Save to chat_history so the message persists in the UI
-                await self._chat_msg.save_message({
-                    "agent_id": self.id, "role": "user",
-                    "content": message,
-                    "is_background": False, "is_read": False,
-                })
+                # FIX(dup-user-msg): API 层在调 chat() 前已保存了 user 消息，
+                # 但如果 API 的 busy 预检和 chat() 的锁之间发生竞态（agent 刚变
+                # busy），这里会再存一份。用 3 秒窗口去重。
+                already_saved = False
+                try:
+                    recent = await self._chat_msg.get_messages(
+                        self.id, limit=3
+                    )
+                    now_ms = int(time.time() * 1000)
+                    for m in (recent or []):
+                        if (
+                            m.get("role") == "user"
+                            and m.get("content") == message
+                            and (now_ms - (m.get("created_at") or 0)) < 3000
+                        ):
+                            already_saved = True
+                            break
+                except Exception:
+                    pass  # 去重失败不阻断，宁可多存一条
+                if not already_saved:
+                    await self._chat_msg.save_message({
+                        "agent_id": self.id, "role": "user",
+                        "content": message,
+                        "is_background": False, "is_read": False,
+                    })
                 log.info("chat_queued", agent_id=self.id,
                          queue_len=len(self._message_queue),
-                         preview=message[:80])
+                         preview=message[:80],
+                         deduped=already_saved)
                 return {"ok": True, "queued": True}
 
             # 检查暂停
@@ -580,7 +602,7 @@ class Agent:
             # 获取工具定义
             tools = await self._get_tool_definitions()
 
-            # 创建 Streamer（统一 max_tool_rounds = 100）
+            # 创建 Streamer（统一 max_tool_rounds = 600）
             max_rounds = self._get_max_tool_rounds()
             streamer = Streamer(max_tool_rounds=max_rounds)
 
@@ -723,7 +745,9 @@ class Agent:
         messages.extend(history)
 
         # 4. Context prompt (System 2 — 动态)
-        context = await self._build_context_prompt()
+        # FIX(trigger-dedup): trigger 调用时跳过 handoffs（已在 trigger 上下文中）
+        is_trigger = bool(opts.get("trigger"))
+        context = await self._build_context_prompt(skip_handoffs=is_trigger)
         if context:
             messages.append({"role": "system", "content": context})
 
@@ -756,10 +780,13 @@ class Agent:
         )
         return self._identity_prompt
 
-    async def _build_context_prompt(self) -> str:
+    async def _build_context_prompt(self, *, skip_handoffs: bool = False) -> str:
         """构建 context prompt（动态，每轮重建）。
 
         对齐 Elixir streamer.ex: build_context_prompt/1。
+
+        skip_handoffs: trigger 调用时为 True — trigger 上下文的 Pending Tasks
+        block 已包含 handoff 信息，context prompt 不再重复。
         """
         # Memories
         memory_text = await self._memory.build_agent_context(
@@ -795,12 +822,16 @@ class Agent:
         )
 
         # Handoffs (accepted, for context)
+        # FIX(trigger-dedup): trigger 上下文已包含 handoff 信息，跳过以避免重复
         from hiveweave.services.handoff import HandoffService
 
         handoff_service = HandoffService()
-        handoffs = await handoff_service.get_accepted_handoffs(
-            self.project_id, self.id
-        )
+        if skip_handoffs:
+            handoffs = None
+        else:
+            handoffs = await handoff_service.get_accepted_handoffs(
+                self.project_id, self.id
+            )
 
         # Project rules from charter (CEO 摸底后填入)
         project_rules = ""
@@ -917,7 +948,7 @@ class Agent:
         return _build_tool_definitions(tool_names)
 
     def _get_max_tool_rounds(self) -> int:
-        """获取 tool loop 最大轮次。所有角色统一 100 次。"""
+        """获取 tool loop 最大轮次。所有角色统一 600 次。"""
         return DEFAULT_MAX_TOOL_ROUNDS
 
     def _get_context_window(self) -> int:
@@ -1225,11 +1256,10 @@ class Agent:
                     carry_inbox_ids = list(
                         {*(carry_inbox_ids or []), *(m["id"] for m in unreplied_asks)}
                     )
-                await self._conversation.append_turn(
-                    self.id,
-                    self.project_id,
-                    [{"role": "user", "content": gate_retrigger_hint}],
-                )
+                # FIX(dup-hint): 不再直接 append_turn — retrigger_for_turn_gate
+                # 调用 chat(hint) 时 hint 会作为 user 消息正常保存。之前这里
+                # 额外 append 了一次，导致同一条 [TURN EXIT BLOCKED] 在
+                # conversation_turns 中出现两份（一份来自这里，一份来自 chat()）。
                 log.info(
                     "turn_exit_repair",
                     agent_id=self.id,
@@ -1337,8 +1367,9 @@ class Agent:
                 slice_budget=self._slice_budget,
             )
 
-        # 成功完成 → 清除 resume 冷却
+        # 成功完成 → 清除 resume 冷却 + 重置连续错误计数
         self._resume_cooldown_until = 0.0
+        self._consecutive_errors = 0
 
         # 3.5 持久化裁剪旧工具输出（OpenCode prune 模式）
         try:
@@ -1613,9 +1644,11 @@ class Agent:
             except Exception:
                 pass
 
-        # 不 ACK inbox — 可恢复错误应保留未读，冷却后 resume
+        # 连续错误计数 — 超过阈值后 ACK inbox，不再 resume
+        self._consecutive_errors += 1
         inbox_ids = list(self.pending_inbox_msg_ids or [])
-        if inbox_ids:
+        if inbox_ids and self._consecutive_errors <= self._CONSECUTIVE_ERROR_MAX:
+            # 未超阈值: 保留未读，冷却后 resume
             await self._write_resume_checkpoint(
                 reason=f"llm_error:{error_type}",
                 inbox_ids=inbox_ids,
@@ -1627,7 +1660,21 @@ class Agent:
                 agent_id=self.id,
                 inbox_left_unread=len(inbox_ids),
                 cooldown_s=ERROR_RESUME_COOLDOWN_S,
+                consecutive_errors=self._consecutive_errors,
             )
+        elif inbox_ids and self._consecutive_errors > self._CONSECUTIVE_ERROR_MAX:
+            # 超过阈值: ACK inbox，停止 resume 循环
+            try:
+                await self._inbox.mark_read_by_ids(self.id, inbox_ids)
+                log.warning(
+                    "llm_error_inbox_acked_max_errors",
+                    agent_id=self.id,
+                    inbox_acked=len(inbox_ids),
+                    consecutive_errors=self._consecutive_errors,
+                )
+            except Exception as ack_err:
+                log.error("inbox_ack_failed", agent_id=self.id, error=str(ack_err))
+            self.pending_inbox_msg_ids = None
 
         self._cancel_safety_timer()
         self._reset_to_idle()
@@ -2386,10 +2433,19 @@ class Agent:
         1. 前端长时间看不到新消息时（agent 多轮工具调用，
            placeholder 一直空），不会误判为 [对话被中断]
         2. 后端崩溃/重启时，部分输出已持久化
+
+        FIX(text-acc): 收到 round_start 事件时重置累积器，
+        避免工具循环中间轮的文本在前端实时显示中重复堆叠。
         """
         # 第一个 delta 到达 → 停止心跳（LLM 开始产出内容了）
         self._stop_heartbeat()
         self._broadcast_stream_event(event)
+
+        # 工具循环新一轮 → 重置文本累积器
+        if event.get("type") == "round_start":
+            self._streaming_text_acc = ""
+            return
+
         if event.get("type") == "text_delta" and self._streaming_msg_id:
             acc = getattr(self, "_streaming_text_acc", "")
             acc += event.get("content", "")
