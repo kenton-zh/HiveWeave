@@ -292,7 +292,7 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [subTab, setSubTab] = useState<"turns" | "events">("turns");
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [autoRefresh, setAutoRefresh] = useState(false);
   const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(new Set());
 
   const fetchTraces = useCallback(async () => {

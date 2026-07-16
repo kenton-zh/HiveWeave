@@ -1,21 +1,24 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, lazy, Suspense } from "react";
 import OrgTree from "./components/OrgTree";
 import ChatPanel from "./components/ChatPanel";
-import WorkLogPanel from "./components/WorkLogPanel";
-import AgentDetailPanel from "./components/AgentDetailPanel";
-import MonitorPanel from "./components/MonitorPanel";
-import DebugPanel from "./components/DebugPanel";
-import AddAgentDialog from "./components/AddAgentDialog";
-import FolderPicker from "./components/FolderPicker";
-import OfficeView from "./components/OfficeView";
-import ModelSettings from "./components/ModelSettings";
-import ApiKeyDialog from "./components/ApiKeyDialog";
-import GoalsPanel from "./components/GoalsPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
-import QuestionDialog from "./components/QuestionDialog";
-import NewProjectDialog from "./components/NewProjectDialog";
-import ConfirmDialog from "./components/ConfirmDialog";
 import ToastContainer from "./components/Toast";
+
+// Lazy-loaded: only fetched when the user navigates to them.
+// OfficeView alone pulls in pixi.js (~1MB); dialogs are interaction-only.
+const WorkLogPanel = lazy(() => import("./components/WorkLogPanel"));
+const AgentDetailPanel = lazy(() => import("./components/AgentDetailPanel"));
+const MonitorPanel = lazy(() => import("./components/MonitorPanel"));
+const DebugPanel = lazy(() => import("./components/DebugPanel"));
+const AddAgentDialog = lazy(() => import("./components/AddAgentDialog"));
+const FolderPicker = lazy(() => import("./components/FolderPicker"));
+const OfficeView = lazy(() => import("./components/OfficeView"));
+const ModelSettings = lazy(() => import("./components/ModelSettings"));
+const ApiKeyDialog = lazy(() => import("./components/ApiKeyDialog"));
+const GoalsPanel = lazy(() => import("./components/GoalsPanel"));
+const QuestionDialog = lazy(() => import("./components/QuestionDialog"));
+const NewProjectDialog = lazy(() => import("./components/NewProjectDialog"));
+const ConfirmDialog = lazy(() => import("./components/ConfirmDialog"));
 import { useAppStore } from "./store";
 import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend } from "./api";
 import type { DeleteProjectResponse, Project } from "./api";
@@ -592,7 +595,11 @@ function App() {
             )}
           </div>
           <div className="flex-1 overflow-hidden">
-            {activeView === "tree" ? <OrgTree /> : <OfficeView />}
+            {activeView === "tree" ? <OrgTree /> : (
+              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm">Loading...</div>}>
+                <OfficeView />
+              </Suspense>
+            )}
           </div>
         </div>
 
@@ -686,75 +693,79 @@ function App() {
             ) : (
               <>
                 <ChatPanel key="panel-chat" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
-                {rightPanelTab === "goals" && selectedProjectId && <GoalsPanel key="panel-goals" projectId={selectedProjectId} />}
-                {rightPanelTab === "goals" && !selectedProjectId && (
-                  <div key="panel-goals-empty" className="h-full flex items-center justify-center text-g-fg-3 text-sm">
-                    请先选择一个项目
-                  </div>
-                )}
-                {rightPanelTab === "agent" && <AgentDetailPanel key="panel-agent" agentId={selectedAgentId} />}
-                {rightPanelTab === "monitor" && <MonitorPanel key="panel-monitor" agentId={selectedAgentId} />}
-                {rightPanelTab === ("debug" as any) && <DebugPanel key="panel-debug" />}
-                {rightPanelTab === "logs" && <WorkLogPanel key="panel-logs" agentId={selectedAgentId} />}
+                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm">Loading...</div>}>
+                  {rightPanelTab === "goals" && selectedProjectId && <GoalsPanel key="panel-goals" projectId={selectedProjectId} />}
+                  {rightPanelTab === "goals" && !selectedProjectId && (
+                    <div key="panel-goals-empty" className="h-full flex items-center justify-center text-g-fg-3 text-sm">
+                      请先选择一个项目
+                    </div>
+                  )}
+                  {rightPanelTab === "agent" && <AgentDetailPanel key="panel-agent" agentId={selectedAgentId} />}
+                  {rightPanelTab === "monitor" && <MonitorPanel key="panel-monitor" agentId={selectedAgentId} />}
+                  {rightPanelTab === ("debug" as any) && <DebugPanel key="panel-debug" />}
+                  {rightPanelTab === "logs" && <WorkLogPanel key="panel-logs" agentId={selectedAgentId} />}
+                </Suspense>
               </>
             )}
           </div>
         </div>
       </div>
 
-      {/* Add Agent Dialog */}
-      {showAddAgent && selectedProjectId && (
-        <AddAgentDialog
-          projectId={selectedProjectId}
-          parentId={addAgentParentId}
-          onClose={closeAddAgent}
-          onCreated={() => {
-            closeAddAgent();
-            refreshOrgTree();
-          }}
-        />
-      )}
+      {/* Lazy-loaded dialogs — wrapped in Suspense, fallback=null since they're overlays */}
+      <Suspense fallback={null}>
+        {showAddAgent && selectedProjectId && (
+          <AddAgentDialog
+            projectId={selectedProjectId}
+            parentId={addAgentParentId}
+            onClose={closeAddAgent}
+            onCreated={() => {
+              closeAddAgent();
+              refreshOrgTree();
+            }}
+          />
+        )}
 
-      {showFolderPicker && (
-        <FolderPicker
-          initialPath={folderPickerInitialPath}
-          onSelect={(path) => {
-            handleCreateProjectFromFolder(path);
-            setShowFolderPicker(false);
-          }}
-          onCancel={() => setShowFolderPicker(false)}
-        />
-      )}
+        {showFolderPicker && (
+          <FolderPicker
+            initialPath={folderPickerInitialPath}
+            onSelect={(path) => {
+              handleCreateProjectFromFolder(path);
+              setShowFolderPicker(false);
+            }}
+            onCancel={() => setShowFolderPicker(false)}
+          />
+        )}
 
-      {showModelSettings && (
-        <ModelSettings onClose={() => setShowModelSettings(false)} />
-      )}
+        {showModelSettings && (
+          <ModelSettings onClose={() => setShowModelSettings(false)} />
+        )}
 
-      {showApiKeyDialog && (
-        <ApiKeyDialog onClose={() => setShowApiKeyDialog(false)} />
-      )}
+        {showApiKeyDialog && (
+          <ApiKeyDialog onClose={() => setShowApiKeyDialog(false)} />
+        )}
 
-      {confirmDelete && (
-        <ConfirmDialog
-          title="删除项目"
-          message={`确定删除项目「${confirmDelete.name}」吗？所有相关数据将被永久删除。`}
-          confirmLabel="删除"
-          danger
-          onConfirm={handleConfirmDelete}
-          onCancel={() => setConfirmDelete(null)}
-        />
-      )}
+        {confirmDelete && (
+          <ConfirmDialog
+            title="删除项目"
+            message={`确定删除项目「${confirmDelete.name}」吗？所有相关数据将被永久删除。`}
+            confirmLabel="删除"
+            danger
+            onConfirm={handleConfirmDelete}
+            onCancel={() => setConfirmDelete(null)}
+          />
+        )}
 
-      <QuestionDialog />
-      {showNewProjectDialog && newProjectCEO && (
-        <NewProjectDialog
-          ceoAgentId={newProjectCEO}
-          onClose={() => {
-            setShowNewProjectDialog(false);
-            setNewProjectCEO(null);
-          }}
-        />
-      )}
+        <QuestionDialog />
+        {showNewProjectDialog && newProjectCEO && (
+          <NewProjectDialog
+            ceoAgentId={newProjectCEO}
+            onClose={() => {
+              setShowNewProjectDialog(false);
+              setNewProjectCEO(null);
+            }}
+          />
+        )}
+      </Suspense>
       <ToastContainer />
     </div>
   );

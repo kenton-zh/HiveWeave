@@ -503,7 +503,7 @@ class Streamer:
             on_delta: SSE delta 回调（text_delta/thinking_delta 等事件）
             on_tool_call: 工具执行回调，返回 {role:"tool", content, tool_call_id}
             max_tool_rounds: 本轮调用的 tool loop 上限。若提供则覆盖构造器
-                默认值（来自 agent 的 DEFAULT_MAX_TOOL_ROUNDS = 100）。
+                默认值（来自 agent 的 DEFAULT_MAX_TOOL_ROUNDS = 600）。
                 未提供时回退到 self.max_tool_rounds。
 
         Returns:
@@ -627,12 +627,23 @@ class Streamer:
         # 遇到不同调用时重置。只在连续 DOOM_LOOP_THRESHOLD 次相同调用时才判定。
         doom_tracker: dict[str, Any] = {"last_key": None, "count": 0}
 
+        # Doom loop 警告标志: 第一次触发时注入反馈给 LLM 纠正机会，
+        # 只有第二次再次触发才真正中断。
+        doom_warning_given: bool = False
+
         # Bug-5 修复: 跟踪本对话是否已注入过占位符，避免 LLM 把占位符当
         # 自己的输出后陷入 "调工具不说话 → 占位注入 → LLM 看到 '好的开始处理'
         # → 不结束 → 再调工具 → 再注入" 的死循环。
         placeholder_injected: bool = False
 
         for round_num in range(rounds_cap):
+            # 通知回调：新一轮开始（用于重置流式文本累积器）
+            if round_num > 0 and on_delta:
+                await self._fire_delta(on_delta, {
+                    "type": "round_start",
+                    "round": round_num,
+                })
+
             # 上下文溢出检查
             messages = self._trim_context_if_needed(messages, provider)
 
@@ -757,19 +768,76 @@ class Streamer:
                 # Doom loop 检测
                 doom = self._detect_doom_loop(tool_calls, doom_tracker)
                 if doom:
-                    log.warning("doom_loop_detected",
-                                agent_id=agent_id, tool=doom)
-                    return {
-                        "status": "error",
-                        "content": text_acc or "",
-                        "thinking": thinking_acc,
-                        "tool_calls": tool_history,
-                        "tool_turn_messages": tool_turn_acc,
-                        "rounds": round_num + 1,
-                        "usage": last_usage,
-                        "error": f"Doom loop detected: tool '{doom}' called "
-                                 f"{DOOM_LOOP_TOOL_LIMITS.get(doom, DOOM_LOOP_DEFAULT_LIMIT)}+ times with same args",
-                    }
+                    limit = DOOM_LOOP_TOOL_LIMITS.get(doom, DOOM_LOOP_DEFAULT_LIMIT)
+                    if not doom_warning_given:
+                        # 第一次触发: 拦截重复调用，注入反馈给 LLM 纠正机会
+                        log.warning("doom_loop_warned",
+                                    agent_id=agent_id, tool=doom, count=limit)
+                        doom_warning_given = True
+                        # 构造 assistant 消息（含 tool_calls）让 LLM 看到自己的请求
+                        doom_assistant_msg: dict[str, Any] = {
+                            "role": "assistant",
+                            "content": new_text if new_text else None,
+                            "tool_calls": [
+                                {
+                                    "id": tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["name"],
+                                        "arguments": tc["arguments"],
+                                    },
+                                }
+                                for tc in tool_calls
+                            ],
+                        }
+                        if provider.supports_thinking and new_thinking:
+                            doom_assistant_msg["reasoning_content"] = new_thinking
+                        tool_turn_acc.append(doom_assistant_msg)
+                        for tc in tool_calls:
+                            tool_history.append({
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": tc["arguments"],
+                                },
+                            })
+                        # 返回拦截结果（不执行真正的工具）
+                        tool_results = [
+                            {
+                                "role": "tool",
+                                "content": (
+                                    f"[DOOM LOOP 拦截] 你已连续 {limit} 次用完全相同的参数调用 '{doom}'。"
+                                    f"这可能是死循环。请换用其他工具、调整参数，或先用文字说明"
+                                    f"你为何需要重复执行相同命令。"
+                                ),
+                                "tool_call_id": tc["id"],
+                            }
+                            for tc in tool_calls
+                        ]
+                        messages = messages + [doom_assistant_msg] + tool_results
+                        tool_turn_acc.extend(tool_results)
+                        # 重置 tracker，给 LLM 一轮纠正机会
+                        doom_tracker = {"last_key": None, "count": 0}
+                        # 累积文本和 thinking
+                        text_acc = self._strip_placeholder(combined_text)
+                        thinking_acc = combined_thinking
+                        continue
+                    else:
+                        # 第二次触发: 真正中断
+                        log.warning("doom_loop_detected",
+                                    agent_id=agent_id, tool=doom)
+                        return {
+                            "status": "error",
+                            "content": text_acc or "",
+                            "thinking": thinking_acc,
+                            "tool_calls": tool_history,
+                            "tool_turn_messages": tool_turn_acc,
+                            "rounds": round_num + 1,
+                            "usage": last_usage,
+                            "error": f"Doom loop detected: tool '{doom}' called "
+                                     f"{limit}+ times with same args (after warning)",
+                        }
 
                 # 构建 assistant 消息（含 tool_calls）
                 assistant_msg: dict[str, Any] = {
@@ -838,10 +906,8 @@ class Streamer:
                             summary = await self._make_max_rounds_summary(
                                 agent_id, provider, messages, on_delta
                             )
-                            final_text = (
-                                (text_acc + "\n\n" + summary) if text_acc else summary
-                            )
-                            final_text = self._strip_placeholder(final_text)
+                            # FIX(text-acc): 同 max_rounds 路径，只用 summary
+                            final_text = self._strip_placeholder(summary)
                             tool_turn_acc.append(
                                 {"role": "assistant", "content": final_text}
                             )
@@ -889,7 +955,12 @@ class Streamer:
                 }
 
             # 有真实文本 — 剥离占位符，结束
-            final_text = self._strip_placeholder(combined_text)
+            # FIX(text-acc): 只用最终轮的文本 (new_text)，不拼接中间轮。
+            # 中间轮文本已通过 line 777 的 per-round assistant 消息保存在
+            # tool_turn_acc 中，无需在最终消息中重复。之前的 combined_text
+            # 会拼接所有轮的文本，导致同一分析语句在最终消息中重复 3-5 次，
+            # 进而污染 conversation_turns 和下一轮的 LLM 上下文。
+            final_text = self._strip_placeholder(new_text)
             final_msg = {"role": "assistant", "content": final_text}
             tool_turn_acc.append(final_msg)
 
@@ -915,8 +986,10 @@ class Streamer:
         summary = await self._make_max_rounds_summary(
             agent_id, provider, messages, on_delta
         )
-        final_text = (text_acc + "\n\n" + summary) if text_acc else summary
-        final_text = self._strip_placeholder(final_text)
+        # FIX(text-acc): 只用 summary，不拼接 text_acc。
+        # summary 是专门的 LLM 调用，已概括全部进展。拼接 text_acc 会引入
+        # 所有中间轮的重复文本（同正常退出路径的修复逻辑）。
+        final_text = self._strip_placeholder(summary)
         final_msg = {"role": "assistant", "content": final_text}
         tool_turn_acc.append(final_msg)
 

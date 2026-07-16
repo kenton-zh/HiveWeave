@@ -48,6 +48,7 @@ import hiveweave.tools.org_tools  # noqa: F401 — registers hire_agent, dismiss
 import hiveweave.tools.misc_tools  # noqa: F401 — registers git_worktree, legacy tasks, webfetch, etc.
 import hiveweave.tools.turn_tools  # noqa: F401 — registers commit_turn, ask_agent, notify_agent
 import hiveweave.tools.dev_server_tools  # noqa: F401 — start_dev_server / lookup_dev_server
+import hiveweave.tools.browse_tools  # noqa: F401 — browse (gstack Chromium CLI)
 from hiveweave.tools.base import _TOOL_REGISTRY, list_tool_names  # noqa: F401
 from hiveweave.tools.result import ToolResult as ToolResultDataclass  # noqa: F401
 from hiveweave.tools.pipeline import ToolContext  # noqa: F401

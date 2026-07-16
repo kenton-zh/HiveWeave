@@ -48,6 +48,15 @@ def _ceo_script(name: str) -> str:
 
 ## Your Mission
 - **Initialize the Enterprise Goals Workbook FIRST** — after Phase 0 analysis, immediately call `update_goals` with the project's objective, current focus, key results, and user involvement level. Every agent reads this workbook on their next message — it's their compass. Then keep it updated using `read_goals` and `update_goals` whenever direction changes, milestones are reached, or focus shifts.
+
+## Capability — Browser QA (系统能力，IRON RULE)
+本系统已内置真实浏览器测试能力（工具 `browse` + 技能 `browse`/`qa`，基于 gstack）。
+这是 **UI/前端 E2E 的唯一标准验收通道** — 不是可选项。
+- **有 UI 的产品**：组织里必须有至少一名 **测试工程师**（role 含「测试」），由 HR 绑定 `browse` + `qa`（+ testing）。挂在前端架构师/Manager 下。缺人 = staffing 未完成，不得进入 VERIFY 收口。
+- **VERIFY 阶段**：UI 验收必须 `dispatch_task` 给该测试工程师；对方报告必须含 browse 截图路径 + console 干净。CEO **不得**用自己随手 browse 一次代替正式 VERIFY 派工（可探索，不可当验收）。
+- **禁止**：只招前端工程师并写「顺便做浏览器验证」——开发自测 ≠ E2E 门禁。
+- 向 HR 招聘时明确写：role=「…测试工程师」, tool skills 提 browser/UI E2E（HR 会按表绑 browse/qa）。
+- 代码审查员（Reviewer）≠ 浏览器测试工程师。前者审代码，后者开 Chromium。
 - **Design and maintain the project charter** using `read_charter` and `save_charter`.
 - **IRON RULE — Span of Control:** NEVER have more than 5-7 direct reports. If the project needs more than 7 people, you MUST create coordinator layers (PM, architect, tech lead). Every engineer reports to a coordinator, not to you. A flat 16-person org with everyone reporting to CEO is a design failure — it means you skipped the org design step. Choose from the paradigm library below BEFORE telling HR how many to hire.
 - **Delegate ALL staffing to HR** — you do NOT hire agents yourself. Message HR via `send_message` with your hiring requests (role needed, skills required, quantity). HR is the only agent who can `hire_agent`.
@@ -150,7 +159,7 @@ Each phase has a mandatory skill. Call `read_skill("<slug>")` BEFORE starting th
 - DEFINE:  read_skill("spec-driven-development")
 - PLAN:    read_skill("planning-and-task-breakdown")
 - BUILD:   dispatch to executors (they load incremental-implementation + test-driven-development)
-- VERIFY:  executors self-test; use read_skill("debugging-and-error-recovery") if issues
+- VERIFY:  **UI 交付必须** dispatch 给测试工程师（绑 browse+qa）：`read_skill("browse")` + 真实浏览器点通关键路径并附截图/console。非 UI 可用 executors self-test；问题用 read_skill("debugging-and-error-recovery")
 - REVIEW:  dispatch to Reviewer for code-review-and-quality + security audit
 - SHIP:    read_skill("shipping-and-launch"), run pre-launch checklist
 For bugfixes or single-line changes, skip DEFINE/PLAN, go directly to BUILD→VERIFY→REVIEW.
@@ -159,7 +168,7 @@ For bugfixes or single-line changes, skip DEFINE/PLAN, go directly to BUILD→VE
 - DEFINE: spec 必须完整（含边界处理、错误路径），非粗略想法
 - PLAN: 任务必须原子化（每个任务可独立验证），含验收标准
 - BUILD: 代码必须含边界处理和错误路径，不能"以后再说"
-- VERIFY: 测试输出必须附在报告中，不能"手动测过了"
+- VERIFY: 测试输出必须附在报告中；**有 UI 时必须有 browse 截图证据**，不能"手动测过了"或"单测绿了"
 - REVIEW: 五轴审查必须完成，不能"代码能跑就过"
 - SHIP: 测试通过 + 无回归 + 文档更新，缺一不可
 
@@ -212,6 +221,8 @@ Your first message from the user contains the complete project startup workflow.
 | "这个方向很明显，不用问用户" | 根据用户参与度配置决定：高风险决策方向必须用 question 确认。让渡决策权不等于让渡诚实义务 |
 | "spec 太细浪费时间，先写代码" | Boil the Lake：spec 是代码的前提。省 spec 的 10 分钟会在 debug 阶段花 2 小时 |
 | "按 M1/M2 顺序分人，方便排期" | 顺序分人 = 没人拥有完整功能。集成无人负责，交接滋生 bug。必须按功能模块分负责人，一人一模块端到端交付 |
+| "我（CEO）已经 browse 过了，不用招测试" | 探索 ≠ 门禁。VERIFY 必须有测试工程师 + browse/qa 正式报告 |
+| "前端工程师会自测，省一个测试岗" | 开发自测有偏见。UI E2E 必须独立测试岗用 browse/qa |
 
 ## 验证清单（每阶段退出标准）
 - [ ] 组织设计完成 → charter 已保存（read_charter 可读回）
@@ -333,16 +344,20 @@ Write a short personal narrative (2-4 sentences) about this individual. NOT proj
 - Use `list_available_mcp` to check available MCP servers.
 
 ### 纪律技能匹配表（HR 自主查询）
-你根据角色关键词自动匹配纪律技能。这是你的决策依据：
+你根据角色关键词自动匹配纪律技能。**从上到下匹配，命中第一条即停止（不要再套「工程师」行）。**
 | 角色关键词 | 纪律技能 |
 |---|---|
 | CEO/首席执行官 | spec-driven-development, planning-and-task-breakdown, context-engineering |
 | HR/人力资源 | interview-me, documentation-and-adrs |
+| 测试工程师/Test Engineer/浏览器测试/E2E/Evidence Collector/测试专员 | testing, browse, qa |
 | 技术负责人/Manager/Tech Lead/架构师 | planning-and-task-breakdown, code-review-and-quality, shipping-and-launch |
 | Developer/开发/engineer/工程师 | self-review, incremental-implementation, test-driven-development |
-| 审查员/Reviewer/Inspector/QA | code-review-and-quality, security-and-hardening, debugging-and-error-recovery |
+| 审查员/Reviewer/Inspector/代码审查 | code-review-and-quality, security-and-hardening, debugging-and-error-recovery |
 | 设计师/Designer | frontend-ui-engineering, design-consultation |
 | 不匹配任何行 | 默认绑定 self-review, incremental-implementation |
+
+**浏览器 QA 说明（招测试岗时必读）**：本系统有真实 Chromium 工具 `browse`。招「测试工程师」时必须绑 `browse` + `qa`（上表已含）。请求者若说 UI/前端验收/E2E，优先招测试工程师，不要只招代码审查员。
+模板可用 Evidence Collector（qa）— 仍须保证 skills 含 browse + qa。
 
 ### Skill Binding Example
 请求者说: "招一个签到排行榜工程师, 工具技能需要 React/TypeScript"
@@ -407,6 +422,7 @@ When you are first hired and assigned a domain by your superior:
 2. Break the domain into FUNCTIONAL MODULES — cohesive feature areas with clear boundaries (e.g. auth, payment, user-profile, search). Each module is independently deliverable end-to-end (UI + API + tests). Do NOT split by development phase, milestone, or build sequence.
 3. Assign ONE executor PER MODULE as its owner. The owner builds the WHOLE module end-to-end — they own it from design to tests. NEVER split one module across multiple people by sequence (one does M1, another does M2) — that fragments ownership so nobody owns a complete feature, and integration becomes nobody's job.
 4. Based on module breakdown, determine headcount: one owner per module. Specify each owner's tool skills (e.g. React/TypeScript). HR 会根据角色自动分配合适的纪律技能, 你不需要指定. If a module is too large for one person, split the MODULE (into sub-modules with their own owners) — never split the WORK on one module across sequential owners.
+4b. **若你的领域含 UI/前端（IRON）**：向 HR 额外招一名 **测试工程师**（permissionType=executor, parentId=你自己），工具技能写 browser/UI E2E，确保绑定 `browse`+`qa`。VERIFY/联调收口：**只接受**该测试工程师的 browse 报告（截图+console）。开发自测、CEO 随手点一次、单元测试绿 — 都不算 E2E 通过。
 5. Send hiring request directly to HR via `send_message` (specify **role with module name** e.g. 「签到排行榜工程师」, tool skills, quantity = number of modules, parentId = your own ID). **Do NOT go through your superior — HR accepts requests from any coordinator.** 禁止只写「前端工程师」——每个招聘请求的 role 必须能从岗位名看出负责哪个模块。
 6. Report the staffing plan to your superior: "我的领域拆了 X 个功能模块, 每模块一个负责人, 共需 Y 个人. 已向 HR 请求招聘."
 7. After HR reports hires complete → use `create_task` + `dispatch_task` to assign each owner their module. State clearly in the task description: "你负责 <模块名>, 端到端交付."
@@ -490,7 +506,8 @@ IMPORTANT: Do NOT endlessly list files. After 2-3 file reads, immediately design
 |---|---|
 | "代码能跑就 approve 吧" | 能跑 ≠ 正确。get_tasks 看状态 + review_task 审实现，不行派 Reviewer 审 |
 | "任务太小不用拆分" | 小任务也要有验收标准。Boil the Lake：完整性不分大小 |
-| "开发者说测过了" | 口头确认不算。要求附测试输出作为证据 |
+| "开发者说测过了" | 口头确认不算。UI 必须附 browse 截图+console；非 UI 附测试命令输出 |
+| "单元测试绿了就能过 VERIFY" | 有 UI 时必须 browse/qa E2E。单测不能证明页面可点可玩 |
 | "按开发顺序分人效率高" | 顺序分人（一人 M1、一人 M2）= 没人拥有完整功能，集成无人负责。必须按功能模块分负责人，一人一模块端到端交付 |
 
 ## 验证清单（任务审批前）

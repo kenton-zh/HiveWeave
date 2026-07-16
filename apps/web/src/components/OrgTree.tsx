@@ -703,7 +703,7 @@ function OrgTree() {
       } catch { /* ignore */ }
     }
 
-    const jitter = () => 3000 + Math.random() * 800 - 400; // 2600–3400ms
+    const jitter = () => 10000 + Math.random() * 2000 - 1000; // 9000–11000ms
 
     // Initial polls staggered by 200ms to avoid thundering-herd
     pollComms();

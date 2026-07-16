@@ -592,6 +592,8 @@ class TaskService:
         """Tasks this agent must act on now (open-task reminder / stall helpers).
 
         - As assignee: claimed | running | rework | verifying (VERIFY assignee)
+          VERIFY stays created until merge/stale nudge claims it — created is
+          NOT an obligation (post-merge work must not thrash pre-merge).
         - As creator: submitted | reviewing  (NOT approved — that is parked)
         Excludes blocked / approved / closed / archived.
         Each dict includes role_hint: 'assignee' | 'creator'.

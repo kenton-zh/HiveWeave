@@ -195,6 +195,37 @@ async def send_chat(body: ChatSendBody) -> dict:
         if routed is not None:
             return routed
 
+    # 1b. 下班：不启动 agent，保存用户消息 + 自动回复
+    from hiveweave.services.off_duty import (
+        is_agent_off_duty,
+        send_off_duty_auto_reply,
+        OFF_DUTY_REPLY,
+    )
+
+    if await is_agent_off_duty(agent_id):
+        # 确认 agent 存在（否则 404）
+        config = await meta_db.get_agent_by_id(agent_id)
+        if config is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        user_msg = await _chat_msg.save_message(
+            {
+                "agent_id": agent_id,
+                "role": "user",
+                "content": message,
+                "is_streaming": False,
+                "is_read": True,
+                "images": body.images,
+            }
+        )
+        asst = await send_off_duty_auto_reply(agent_id)
+        return {
+            "ok": True,
+            "userMessageId": user_msg["id"],
+            "offDuty": True,
+            "reply": OFF_DUTY_REPLY,
+            "assistantMessageId": asst["id"],
+        }
+
     # 2. 解析 agent
     started = await _ensure_agent_started(agent_id)
     if started is None:
@@ -233,6 +264,15 @@ async def send_chat(body: ChatSendBody) -> dict:
         return {"ok": True, "userMessageId": user_msg["id"], "reset": True}
     if result.get("error") == "paused":
         raise HTTPException(status_code=409, detail="System is paused")
+    if result.get("error") == "project_not_started":
+        asst = await send_off_duty_auto_reply(agent_id)
+        return {
+            "ok": True,
+            "userMessageId": user_msg["id"],
+            "offDuty": True,
+            "reply": OFF_DUTY_REPLY,
+            "assistantMessageId": asst["id"],
+        }
     if not result.get("ok"):
         raise HTTPException(status_code=500, detail="Failed to trigger chat")
 

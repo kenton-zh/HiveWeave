@@ -270,3 +270,44 @@ async def test_merge_window_coalesces_triggers():
     # user still queued
     assert len(agent._message_queue) == 1
     assert agent._message_queue[0][0] == "user hi"
+
+
+def test_matched_agent_wait_wakes_even_if_waiting_human():
+    """Peer reply that satisfies an agent-wait must pierce waiting_human.
+
+    Regression: CEO waited on 潮汐/墨染 while disposition=waiting_human;
+    their module-split replies matched Wait Contract but wake_policy still
+    returned False → inbox wake=0 → org deadlock.
+    """
+    waits = [
+        {
+            "kind": "agent",
+            "ref": "潮汐",
+            "wake_on": ["ask_reply", "message_from_ref", "timeout"],
+            "phase": "waiting",
+        }
+    ]
+    cat = "command"
+    assert (
+        should_wake(
+            cat,
+            disposition="waiting_human",
+            from_agent_id="uuid-chaoxi",
+            from_agent_name="潮汐",
+            from_short_id="A003",
+            active_waits=waits,
+        )
+        is True
+    )
+    # Unrelated peer still blocked
+    assert (
+        should_wake(
+            cat,
+            disposition="waiting_human",
+            from_agent_id="uuid-other",
+            from_agent_name="路人",
+            from_short_id="A099",
+            active_waits=waits,
+        )
+        is False
+    )

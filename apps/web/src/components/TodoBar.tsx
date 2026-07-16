@@ -25,8 +25,8 @@ export default function TodoBar({ agentId }: Props) {
       } catch { /* ignore */ }
     }
     poll();
-    // BUG-005 修复：3s → 5s，减少 polling 频率（20→12 req/min）
-    const timer = setInterval(poll, 5000);
+    // BUG-005 修复：3s → 5s → 15s，减少 polling 频率（4 req/min）
+    const timer = setInterval(poll, 15000);
     return () => { mounted = false; clearInterval(timer); };
   }, [agentId]);
 
