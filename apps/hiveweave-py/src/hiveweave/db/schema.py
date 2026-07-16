@@ -382,6 +382,26 @@ PROJECT_DB_TABLES = [
         updated_at INTEGER
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS tool_attestations (
+        id TEXT PRIMARY KEY,
+        tool_call_id TEXT,
+        task_id TEXT,
+        agent_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        command_or_url TEXT,
+        exit_code INTEGER,
+        workspace TEXT,
+        commit_hash TEXT,
+        stdout_hash TEXT,
+        artifact_hashes TEXT,
+        console_errors INTEGER,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        project_id TEXT NOT NULL
+    )
+    """,
+    """ALTER TABLE tasks ADD COLUMN policy_id TEXT""",
 ]
 
 # ── Meta DB 索引 ────────────────────────────────────────────
@@ -406,6 +426,7 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id)",
     "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_tool_attestations_project ON tool_attestations(project_id, kind)",
     "CREATE INDEX IF NOT EXISTS idx_agent_events_agent_id ON agent_events(agent_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_scheduled_alarms_project_id ON scheduled_alarms(project_id, fired)",
     "CREATE INDEX IF NOT EXISTS idx_permission_requests_agent ON permission_requests(agent_id)",

@@ -71,12 +71,15 @@ async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT) -> tuple
     stderr merged into stdout (mirrors Elixir stderr_to_stdout: true).
     """
     try:
+        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
         proc = await asyncio.create_subprocess_exec(
             "git",
             *args,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **windows_no_window_kwargs(),
         )
     except FileNotFoundError:
         return False, "git not found on PATH"
@@ -331,24 +334,50 @@ coverage/
         """Merge agent branch into target (git merge --no-edit), then cleanup.
 
         契约 09 RECONCILE: 用 --no-edit (非 ff-only), 成功后自动 remove worktree+分支.
-        冲突时 abort, worktree 保留.
+        冲突时 abort, worktree 保留 — executor 在自己的 worktree 里合 main 解冲突.
 
-        Returns ``{success, merged, hash}`` or ``{success: False, message}``.
+        Returns ``{success, merged, hash, branch, files?}`` or
+        ``{success: False, message, conflicts?, branch, files?}``.
         """
         branch = _branch_name(short_id, task_name)
 
         ok, _ = await _git(["checkout", target_branch], workspace_path)
         if not ok:
             return {"success": False,
-                    "message": f"Failed to checkout {target_branch}"}
+                    "message": f"Failed to checkout {target_branch}",
+                    "branch": branch}
+
+        # Capture files covered by this branch before merge mutates history
+        ok_f, files_out = await _git(
+            ["diff", "--name-only", f"{target_branch}...{branch}"],
+            workspace_path,
+        )
+        branch_files = [
+            f.strip() for f in (files_out or "").split("\n") if f.strip()
+        ] if ok_f else []
 
         ok, _ = await _git(["merge", branch, "--no-edit"], workspace_path)
         if not ok:
-            # Abort merge — worktree+branch preserved for retry/rollback
+            ok_diff, diff_out = await _git(
+                ["diff", "--name-only", "--diff-filter=U"], workspace_path)
+            conflict_files = [
+                f.strip() for f in (diff_out or "").split("\n") if f.strip()
+            ] if ok_diff else []
             await _git(["merge", "--abort"], workspace_path)
-            return {"success": False,
-                    "message": f"Merge conflict for {short_id} into "
-                               f"{target_branch}. Resolve manually or rollback."}
+            from hiveweave.services.worktree_review import format_merge_conflict_message
+
+            return {
+                "success": False,
+                "message": format_merge_conflict_message(
+                    branch=branch,
+                    target=target_branch,
+                    conflicts=conflict_files or branch_files,
+                ),
+                "conflicts": conflict_files or branch_files,
+                "branch": branch,
+                "files": branch_files,
+                "short_id": short_id,
+            }
 
         ok, head = await _git(["rev-parse", "--short", "HEAD"], workspace_path)
 
@@ -357,7 +386,14 @@ coverage/
 
         log.info("git_worktree.merge", short_id=short_id,
                  target=target_branch, hash=head if ok else "")
-        return {"success": True, "merged": True, "hash": head if ok else ""}
+        return {
+            "success": True,
+            "merged": True,
+            "hash": head if ok else "",
+            "branch": branch,
+            "files": branch_files,
+            "short_id": short_id,
+        }
 
     async def merge_by_branch(self, workspace_path: str, branch: str,
                               target_branch: str = "main") -> dict:
@@ -400,6 +436,15 @@ coverage/
                 await _git(["rebase", "--abort"], wt_path)
                 log.warning("git_worktree.rebase_failed",
                             branch=branch, output=reb_out[:200])
+
+        # Capture files covered by this branch before merge
+        ok_f, files_out = await _git(
+            ["diff", "--name-only", f"{target_branch}...{branch}"],
+            workspace_path,
+        )
+        branch_files = [
+            f.strip() for f in (files_out or "").split("\n") if f.strip()
+        ] if ok_f else []
 
         # Step 2: Merge with target_branch
         ok, merge_out = await _git(["merge", branch, "--no-edit"], workspace_path)
@@ -449,13 +494,24 @@ coverage/
                              branch=branch, resolved_files=resolved)
 
             if not ok:
-                # Report conflict files to agent
+                # Abort — leave no conflict markers on main; executor fixes in worktree
                 await _git(["merge", "--abort"], workspace_path)
-                return {"success": False,
-                        "message": f"Merge conflict for {branch} into "
-                                   f"{target_branch}. Conflicted files: "
-                                   f"{', '.join(conflict_files[:10])}",
-                        "conflicts": conflict_files}
+                from hiveweave.services.worktree_review import (
+                    format_merge_conflict_message,
+                )
+
+                return {
+                    "success": False,
+                    "message": format_merge_conflict_message(
+                        branch=branch,
+                        target=target_branch,
+                        conflicts=conflict_files,
+                    ),
+                    "conflicts": conflict_files,
+                    "branch": branch,
+                    "files": branch_files,
+                    "short_id": short_id,
+                }
 
         # Step 4: Post-merge verification
         verification_errors = []
@@ -488,7 +544,14 @@ coverage/
         log.info("git_worktree.merge_by_branch", branch=branch,
                  target=target_branch, hash=head if ok else "",
                  warnings=verification_errors)
-        result = {"success": True, "merged": True, "hash": head if ok else ""}
+        result = {
+            "success": True,
+            "merged": True,
+            "hash": head if ok else "",
+            "branch": branch,
+            "files": branch_files,
+            "short_id": short_id,
+        }
         if verification_errors:
             result["warnings"] = verification_errors
         return result
@@ -646,14 +709,146 @@ coverage/
         return entries
 
 
+async def ensure_executor_worktree(
+    project_id: str,
+    agent_id: str,
+    *,
+    task_name: str | None = None,
+) -> dict:
+    """Ensure an executor has a live worktree and ``agents.workspace_path``.
+
+    Refuses coordinators/HR — they must not own write worktrees.
+    Idempotent if a valid worktree is already bound.
+
+    Returns ``{success, path, short_id, branch?}`` or ``{success: False, message}``.
+    """
+    from hiveweave.db import meta as meta_db
+    from hiveweave.services.org import OrgService
+
+    org = OrgService()
+    agent = await org.resolve_agent(agent_id)
+    if not agent:
+        return {"success": False, "message": f"Agent not found: {agent_id}"}
+
+    perm = (agent.get("permission_type") or "").lower()
+    if perm != "executor":
+        return {
+            "success": False,
+            "message": (
+                f"Refusing worktree for {agent.get('short_id')} "
+                f"(permission_type={perm or 'unknown'}). "
+                "Only executors get write worktrees — coordinators review/merge only."
+            ),
+        }
+
+    short_id = (agent.get("short_id") or "").strip()
+    if not short_id:
+        return {"success": False, "message": "Agent has no short_id"}
+
+    ws = await meta_db.get_project_workspace(project_id)
+    if not ws or not (Path(ws) / ".git").exists():
+        return {"success": False, "message": "Project has no git workspace"}
+
+    cur = (agent.get("workspace_path") or "").strip()
+    if cur and Path(cur).is_dir() and (Path(cur) / ".git").exists():
+        # Accept only if path is under this agent's short_id worktree dir
+        norm = cur.replace("\\", "/")
+        needle = f"/worktrees/{short_id}"
+        if needle in norm or norm.rstrip("/").endswith(f"/worktrees/{short_id}"):
+            return {
+                "success": True,
+                "path": cur,
+                "short_id": short_id,
+                "message": "worktree already bound",
+            }
+        # Path exists but not this agent's tree — recreate under correct short_id
+        log.warning(
+            "worktree_path_mismatch",
+            agent_id=agent_id,
+            short_id=short_id,
+            workspace_path=cur,
+        )
+
+    gwt = GitWorktreeService()
+    name = task_name or agent.get("role") or "task"
+    result = await gwt.create(ws, short_id, str(name))
+    if not result.get("success") or not result.get("path"):
+        err = result.get("message") or "worktree create failed"
+        try:
+            await org.update_agent(agent_id, {"worktree_error": err})
+        except Exception:
+            pass
+        return {"success": False, "message": err, "short_id": short_id}
+
+    path = result["path"]
+    try:
+        await org.update_agent(
+            agent_id,
+            {"workspace_path": path, "worktree_error": None},
+        )
+    except Exception as e:
+        log.warning("worktree_bind_failed", agent_id=agent_id, error=str(e))
+
+    log.info(
+        "executor_worktree_ensured",
+        agent_id=agent_id,
+        short_id=short_id,
+        path=path,
+    )
+    return {
+        "success": True,
+        "path": path,
+        "short_id": short_id,
+        "branch": result.get("branch"),
+    }
+
+
+def pin_dispatch_message_to_worktree(
+    description: str,
+    *,
+    short_id: str,
+    worktree_path: str,
+) -> str:
+    """Rewrite wrong worktree paths and append a mandatory WORKTREE PIN footer."""
+    import re
+
+    text = description or ""
+    sid = (short_id or "").strip()
+    if not sid:
+        return text
+
+    def _repl(m: re.Match[str]) -> str:
+        other = m.group(1)
+        if other.upper() == sid.upper():
+            return m.group(0)
+        return f".hiveweave/worktrees/{sid}"
+
+    text = re.sub(
+        r"\.hiveweave[/\\]+worktrees[/\\]+(A\d+)",
+        _repl,
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Avoid pointing at bare project-root file edits without worktree context
+    footer = (
+        f"\n\n[WORKTREE PIN] You MUST edit only under your worktree ({sid}):\n"
+        f"  {worktree_path}\n"
+        f"Do NOT edit project root/main or other agents' worktrees "
+        f"(e.g. A001/CEO). After submit, coordinator merges with "
+        f"git_worktree_merge(branchName='{sid}')."
+    )
+    if "[WORKTREE PIN]" not in text:
+        text = text.rstrip() + footer
+    return text
+
+
 async def heal_project_executor_worktrees(project_id: str) -> dict:
-    """P2: ensure every active executor has a valid worktree before agents start.
+    """Ensure every active executor has a valid worktree before agents start.
 
     Prunes stale metadata, recreates missing worktrees, updates agents.workspace_path.
     """
     from hiveweave.db import meta as meta_db
     from hiveweave.db import project as project_db
-    import time as _time
 
     ws = await meta_db.get_project_workspace(project_id)
     if not ws or not (Path(ws) / ".git").exists():
@@ -673,47 +868,17 @@ async def heal_project_executor_worktrees(project_id: str) -> dict:
     agents = await cur.fetchall()
     await cur.close()
 
-    gwt = GitWorktreeService()
     recovered = 0
     failed = 0
     for a in agents:
-        short_id = a["short_id"]
-        cur_ws = a["workspace_path"] or ""
-        if cur_ws and Path(cur_ws).exists() and (Path(cur_ws) / ".git").exists():
-            continue
-        role = a["role"] or "developer"
-        result = await gwt.create(
-            workspace_path=ws,
-            short_id=short_id,
-            task_name=role,
+        result = await ensure_executor_worktree(
+            project_id,
+            a["id"],
+            task_name=a["role"] or "developer",
         )
-        now = int(_time.time() * 1000)
-        if result.get("success") and result.get("path"):
-            await conn.execute(
-                "UPDATE agents SET workspace_path=?, worktree_error=NULL, "
-                "updated_at=? WHERE id=?",
-                [result["path"], now, a["id"]],
-            )
-            await conn.commit()
-            recovered += 1
-            log.info(
-                "worktree_healed",
-                agent_id=a["id"],
-                short_id=short_id,
-                path=result["path"],
-            )
+        if result.get("success"):
+            if result.get("message") != "worktree already bound":
+                recovered += 1
         else:
-            err = result.get("message") or "worktree heal failed"
-            await conn.execute(
-                "UPDATE agents SET worktree_error=?, updated_at=? WHERE id=?",
-                [err, now, a["id"]],
-            )
-            await conn.commit()
             failed += 1
-            log.warning(
-                "worktree_heal_failed",
-                agent_id=a["id"],
-                short_id=short_id,
-                error=err,
-            )
     return {"recovered": recovered, "failed": failed, "skipped": False}

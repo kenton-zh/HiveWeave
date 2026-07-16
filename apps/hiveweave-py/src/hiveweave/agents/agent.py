@@ -42,7 +42,7 @@ from hiveweave.services.inbox import InboxService
 from hiveweave.services.memory import MemoryService
 from hiveweave.services.model import ModelService
 from hiveweave.services.org import OrgService
-from hiveweave.services.permission import permission_service, PermissionService, COORDINATOR_ONLY_TOOLS
+from hiveweave.services.permission import permission_service, PermissionService
 from hiveweave.services.skill_registry import SkillRegistryService
 from hiveweave.services.system_state import system_state
 from hiveweave.services.work_log import WorkLogService
@@ -916,18 +916,19 @@ class Agent:
             return ""
 
     async def _get_tool_definitions(self) -> list[dict]:
-        """获取工具定义列表。
-
-        对齐 Elixir tool_executor.ex: get_tools/2。
-
-        Bug fix: coordinator 角色（role_type=coordinator）需要额外获得
-        COORDINATOR_ONLY_TOOLS（review_task, create_task, git_worktree_merge 等）。
-        虽然 evaluate() 运行时会正确 allow，但 LLM 看不到工具定义就无法调用。
-        """
+        """获取工具定义列表（family-aware；硬能力由 PolicyService 在 evaluate 时再挡）。"""
         mode = await permission_service.get_permission_mode(self.id)
-        tool_names = permission_service.get_tools_for_mode(mode)
+        role_type = self.config.get("role_type", "executor")
+        tool_names = permission_service.get_tools_for_agent({
+            **self.config,
+            "role": self.config.get("role") or role_type,
+            "permission_type": self.config.get("permission_type")
+            or ("coordinator" if role_type == "coordinator" else "executor"),
+            "permission_mode": mode,
+        })
+        if not tool_names:
+            tool_names = permission_service.get_tools_for_mode(mode)
 
-        # custom 模式返回空列表 — 需要从 agent 配置获取 allowed_tools
         if not tool_names and mode == "custom":
             allowed_raw = self.config.get("allowed_tools", "[]")
             try:
@@ -936,14 +937,6 @@ class Agent:
                 ) else (allowed_raw or [])
             except (json.JSONDecodeError, TypeError):
                 tool_names = []
-
-        # Coordinator 角色额外获得 COORDINATOR_ONLY_TOOLS
-        # evaluate() 已有角色边界检查，确保 executor 不会拿到这些工具
-        role_type = self.config.get("role_type", "executor")
-        if role_type == "coordinator":
-            tool_names = list(tool_names) + [
-                t for t in COORDINATOR_ONLY_TOOLS if t not in tool_names
-            ]
 
         return _build_tool_definitions(tool_names)
 
@@ -981,37 +974,39 @@ class Agent:
             org = OrgService()
             agent_row = await org.get_agent(self.id)
             if agent_row:
+                perm = (agent_row.get("permission_type") or "").lower()
                 ws = agent_row.get("workspace_path") or ""
+
+                # Coordinators/HR must never work from a write worktree
+                if perm in ("coordinator", "hr"):
+                    if ws and "worktrees" in ws.replace("\\", "/"):
+                        try:
+                            await org.update_agent(self.id, {"workspace_path": None})
+                        except Exception:
+                            pass
+                    self._workspace_path = project_ws
+                    return self._workspace_path
+
                 if ws and _os.path.isdir(ws) and (_Path(ws) / ".git").exists():
                     self._workspace_path = ws
                     return self._workspace_path
 
                 # Executor without a valid worktree — allocate now
                 if (
-                    agent_row.get("permission_type") == "executor"
+                    perm == "executor"
                     and project_ws
                     and (_Path(project_ws) / ".git").exists()
                 ):
-                    from hiveweave.services.git_worktree import GitWorktreeService
+                    from hiveweave.services.git_worktree import ensure_executor_worktree
 
-                    gwt = GitWorktreeService()
-                    short = agent_row.get("short_id") or "A000"
-                    role = agent_row.get("role") or "executor"
-                    result = await gwt.create(project_ws, short, role)
-                    if result.get("success") and result.get("path"):
-                        await org.update_agent(self.id, {
-                            "workspace_path": result["path"],
-                            "worktree_error": None,
-                        })
-                        self._workspace_path = result["path"]
+                    ensured = await ensure_executor_worktree(
+                        self.project_id,
+                        self.id,
+                        task_name=agent_row.get("role") or "executor",
+                    )
+                    if ensured.get("success") and ensured.get("path"):
+                        self._workspace_path = ensured["path"]
                         return self._workspace_path
-                    err = result.get("message") or "lazy worktree create failed"
-                    try:
-                        await org.update_agent(self.id, {
-                            "worktree_error": err,
-                        })
-                    except Exception:
-                        pass
         except Exception:
             pass  # 回退到项目根
 

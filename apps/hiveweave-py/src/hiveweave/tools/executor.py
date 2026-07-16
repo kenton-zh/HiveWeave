@@ -649,7 +649,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "git_worktree_merge": {
-        "description": "Merge a worktree branch back into main and remove the worktree.",
+        "description": "Merge a worktree branch into main and remove the worktree. On conflict: abort + rework executor to rebase/merge main in their worktree. On success: spawn VERIFY only for tasks covered by this merge.",
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
         },
@@ -757,11 +757,20 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": "Must be true. Run tests first."},
             "testOutput": {"type": "string", "aliases": ["test_output", "testLog"],
                 "description": "Brief test command output / proof."},
+            "attestationIds": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["attestation_ids"],
+                "description": (
+                    "Server-issued attestation ids from browse/bash. "
+                    "Required for UI/code tasks."
+                ),
+            },
         },
         "required": ["summary", "testsPassed"],
     },
     "review_task": {
-        "description": "Review a submitted task (reviewing → approved/rework). approve requires evidence.tests_passed=true and spawns a mandatory VERIFY child task; then call git_worktree_merge.",
+        "description": "Review a submitted task (reviewing → approved/rework). approve requires attestation evidence + assignee worktree context; does NOT spawn VERIFY — next call git_worktree_merge; VERIFY is created only after merge succeeds.",
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
             "decision": {"type": "string",
@@ -1796,7 +1805,7 @@ class ToolExecutor(TaskToolsMixin):
         """DEPRECATED — hard-redirect to review_task."""
         return self._error(
             "approve_work is removed. Use review_task(taskId, decision='approve') "
-            "instead. Then call git_worktree_merge and wait for the VERIFY task."
+            "then git_worktree_merge. VERIFY is created only after merge succeeds."
         )
 
     async def _tool_reject_work(self, agent_id: str, args: dict) -> dict:

@@ -116,6 +116,45 @@ class DispatchService:
         """
         await _ensure_schema(project_id)
 
+        # Ensure executor worktree + pin paths in the delivery message
+        description_out = description
+        wt_meta: dict = {}
+        try:
+            from hiveweave.services.git_worktree import (
+                ensure_executor_worktree,
+                pin_dispatch_message_to_worktree,
+            )
+            from hiveweave.services.org import OrgService
+
+            assignee = await OrgService().resolve_agent(to_agent_id)
+            if assignee and (assignee.get("permission_type") or "").lower() == "executor":
+                ensured = await ensure_executor_worktree(
+                    project_id,
+                    to_agent_id,
+                    task_name=(description[:40] if description else None),
+                )
+                wt_meta = ensured
+                if ensured.get("success") and ensured.get("path"):
+                    description_out = pin_dispatch_message_to_worktree(
+                        description,
+                        short_id=ensured.get("short_id") or assignee.get("short_id") or "",
+                        worktree_path=ensured["path"],
+                    )
+                else:
+                    log.warning(
+                        "dispatch_worktree_ensure_failed",
+                        to_agent_id=to_agent_id,
+                        error=ensured.get("message"),
+                    )
+            elif assignee and (assignee.get("permission_type") or "").lower() != "executor":
+                log.warning(
+                    "dispatch_to_non_executor",
+                    to_agent_id=to_agent_id,
+                    permission_type=assignee.get("permission_type"),
+                )
+        except Exception as e:
+            log.warning("dispatch_worktree_pin_failed", error=str(e))
+
         # 1) Task Ledger: 创建 task 记录，获得真正的 task_id（全链路主键）
         #    如果传入了 existing_task_id，复用已有 task 而不是创建新的
         if existing_task_id:
@@ -128,7 +167,7 @@ class DispatchService:
             task_id = await self.task_service.create_task(
                 project_id=project_id,
                 title=description[:100],
-                description=description,
+                description=description_out,
                 creator_id=from_agent_id,
                 assignee_id=to_agent_id,
                 source="agent",
@@ -142,7 +181,9 @@ class DispatchService:
             "task_id": task_id,
             "from_agent_id": from_agent_id,
             "to_agent_id": to_agent_id,
-            "description": description,
+            "description": description_out,
+            "worktree_path": wt_meta.get("path"),
+            "worktree_short_id": wt_meta.get("short_id"),
         })
 
         # 2) work_log 携带 task_id
@@ -152,12 +193,12 @@ class DispatchService:
             "type, summary, details, created_at, task_id) "
             "VALUES (?, ?, ?, ?, 'discussion', ?, ?, ?, ?)",
             [log_id, from_agent_id, project_id, session_id,
-             description, details, now_ms, task_id],
+             description_out, details, now_ms, task_id],
         )
 
-        # 3) inbox 消息携带 task_id
+        # 3) inbox 消息携带 task_id（路径已钉到 assignee worktree）
         await self.inbox.send_message(
-            from_agent_id, to_agent_id, description,
+            from_agent_id, to_agent_id, description_out,
             message_type="task",
             expect_report=expect_report,
             task_id=task_id,
@@ -167,14 +208,16 @@ class DispatchService:
         handoff_id: str | None = None
         if create_handoff:
             handoff_id = await self.handoff.create_handoff(
-                project_id, from_agent_id, to_agent_id, description,
+                project_id, from_agent_id, to_agent_id, description_out,
                 expect_report=expect_report,
                 task_id=task_id,
             )
 
         log.info("dispatch.task", from_agent_id=from_agent_id,
                  to_agent_id=to_agent_id, task_id=task_id,
-                 log_id=log_id, handoff_id=handoff_id, preview=description[:80])
+                 log_id=log_id, handoff_id=handoff_id,
+                 worktree=wt_meta.get("path"),
+                 preview=description_out[:80])
 
         return {
             "success": True,
@@ -182,7 +225,9 @@ class DispatchService:
             "handoff_id": handoff_id,
             "from_agent_id": from_agent_id,
             "to_agent_id": to_agent_id,
-            "description": description,
+            "description": description_out,
+            "worktree_path": wt_meta.get("path"),
+            "worktree_short_id": wt_meta.get("short_id"),
         }
 
     # ── WORK LOG ─────────────────────────────────────────────

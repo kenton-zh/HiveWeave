@@ -187,8 +187,12 @@ def spawn_project_process(
     child_env.update(extra_env)
 
     creationflags = popen_kwargs.pop("creationflags", 0)
-    if os.name == "nt" and creationflags == 0:
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    if os.name == "nt":
+        from hiveweave.util.win_subprocess import merge_creationflags
+        import subprocess as _sp
+
+        base = creationflags or getattr(_sp, "CREATE_NEW_PROCESS_GROUP", 0)
+        creationflags = merge_creationflags(base)
 
     try:
         proc = subprocess.Popen(

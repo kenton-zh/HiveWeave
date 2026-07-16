@@ -3,13 +3,7 @@
 任务账本 HTTP 接口 — 围绕 TaskService 状态机:
     created → claimed → running → blocked/submitted → reviewing → approved/rework → closed
 
-- GET    /api/projects/{project_id}/tasks            列表（可按 status/assignee 过滤）
-- POST   /api/projects/{project_id}/tasks            创建
-- GET    /api/projects/{project_id}/tasks/{task_id}  详情（含关联 work_logs）
-- PATCH  /api/projects/{project_id}/tasks/{task_id}  更新可变字段
-- POST   /api/projects/{project_id}/tasks/{task_id}/claim    认领
-- POST   /api/projects/{project_id}/tasks/{task_id}/submit   提交（带 evidence）
-- POST   /api/projects/{project_id}/tasks/{task_id}/review   审批（approve/rework）
+P0 Hard Gates: submit/review enforce attestation; create may require actor capability.
 """
 
 from __future__ import annotations
@@ -21,6 +15,13 @@ from pydantic import BaseModel
 import structlog
 
 from hiveweave.services import dispatch as dispatch_svc
+from hiveweave.services.attestation import (
+    attestation_service,
+    required_attestation_kinds,
+    resolve_task_policy,
+)
+from hiveweave.services.org import OrgService
+from hiveweave.services.policy import policy_service
 from hiveweave.services.task import TaskService
 
 log = structlog.get_logger(__name__)
@@ -28,6 +29,7 @@ log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/projects/{project_id}/tasks", tags=["tasks"])
 
 _tasks = TaskService()
+_org = OrgService()
 
 
 class TaskCreate(BaseModel):
@@ -43,6 +45,7 @@ class TaskCreate(BaseModel):
     expectedModules: list[str] | None = None
     tags: list[str] | None = None
     source: str = "user"
+    actorAgentId: str | None = None
 
 
 class TaskUpdate(BaseModel):
@@ -58,11 +61,13 @@ class TaskUpdate(BaseModel):
 
 class TaskSubmit(BaseModel):
     evidence: dict[str, Any]
+    actorAgentId: str | None = None
 
 
 class TaskReview(BaseModel):
     decision: str  # "approve" or "rework"
     feedback: str | None = None
+    actorAgentId: str | None = None
 
 
 class TaskClaim(BaseModel):
@@ -75,6 +80,45 @@ def _raise_from_value_error(e: ValueError) -> None:
     if "not found" in msg.lower():
         raise HTTPException(status_code=404, detail=msg)
     raise HTTPException(status_code=400, detail=msg)
+
+
+async def _gate_attestation_for_task(
+    project_id: str, task: dict, evidence: dict
+) -> None:
+    tags = task.get("tags") or []
+    if isinstance(tags, str):
+        import json
+
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            tags = []
+    policy_id = (
+        evidence.get("policy_id")
+        or task.get("policy_id")
+        or resolve_task_policy(
+            title=task.get("title") or "",
+            tags=tags if isinstance(tags, list) else [],
+            description=task.get("description") or "",
+        )
+    )
+    needed = required_attestation_kinds(policy_id)
+    if not needed:
+        return
+    aids = evidence.get("attestation_ids") or []
+    if not isinstance(aids, list):
+        aids = []
+    ok, err = await attestation_service.verify_ids(
+        project_id,
+        [str(x) for x in aids],
+        expected_kinds=needed,
+        task_id=task.get("id"),
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Attestation gate failed ({policy_id}): {err}",
+        )
 
 
 @router.get("")
@@ -92,13 +136,25 @@ async def list_tasks(
 
 @router.post("")
 async def create_task(project_id: str, body: TaskCreate) -> dict:
-    """创建任务。"""
+    """创建任务。Agent actors need dispatch capability; user creator is open."""
+    creator = body.creatorId or "user"
+    actor_id = (body.actorAgentId or "").strip()
+    if actor_id or (creator and creator not in ("user", "用户", "human")):
+        aid = actor_id or creator
+        actor = await _org.resolve_agent(aid)
+        if actor is None:
+            raise HTTPException(status_code=404, detail=f"Actor not found: {aid}")
+        hard = policy_service.hard_check(actor, "create_task", {})
+        if hard:
+            raise HTTPException(status_code=403, detail=hard)
+        creator = actor.get("id") or creator
+
     try:
         task_id = await _tasks.create_task(
             project_id,
             title=body.title,
             description=body.description or "",
-            creator_id=body.creatorId,
+            creator_id=creator,
             assignee_id=body.assigneeId,
             priority=body.priority,
             due_at=body.dueAt,
@@ -120,7 +176,6 @@ async def get_task(project_id: str, task_id: str) -> dict:
     task = await _tasks.get_task(project_id, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    # 查关联 work_logs（通过 DispatchService 公开 API）
     try:
         ds = dispatch_svc.DispatchService()
         logs = await ds.get_work_logs_for_task(project_id, task_id)
@@ -141,7 +196,6 @@ async def update_task(project_id: str, task_id: str, body: TaskUpdate) -> dict:
             await _tasks.update_progress(project_id, task_id, progress)
         except ValueError as e:
             _raise_from_value_error(e)
-    # camelCase → snake_case 映射（TaskService.update_task 用 snake_case）
     camel_to_snake = {
         "assigneeId": "assignee_id",
         "dueAt": "due_at",
@@ -158,7 +212,6 @@ async def claim_task(project_id: str, task_id: str, body: TaskClaim) -> dict:
     """认领任务（created → claimed → running，一步到位）。"""
     try:
         await _tasks.claim_task(project_id, task_id, body.agentId)
-        # 认领即开始执行，自动推进到 running
         await _tasks.start_task(project_id, task_id)
     except ValueError as e:
         _raise_from_value_error(e)
@@ -167,9 +220,14 @@ async def claim_task(project_id: str, task_id: str, body: TaskClaim) -> dict:
 
 @router.post("/{task_id}/submit")
 async def submit_task(project_id: str, task_id: str, body: TaskSubmit) -> dict:
-    """提交任务（running → submitted），附 evidence。"""
+    """提交任务（running → submitted），附 evidence + attestation gate."""
+    task = await _tasks.get_task(project_id, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    evidence = dict(body.evidence or {})
+    await _gate_attestation_for_task(project_id, task, evidence)
     try:
-        await _tasks.submit_task(project_id, task_id, body.evidence)
+        await _tasks.submit_task(project_id, task_id, evidence)
     except ValueError as e:
         _raise_from_value_error(e)
     return {"success": True}
@@ -177,26 +235,70 @@ async def submit_task(project_id: str, task_id: str, body: TaskSubmit) -> dict:
 
 @router.post("/{task_id}/review")
 async def review_task(project_id: str, task_id: str, body: TaskReview) -> dict:
-    """审批任务（submitted/reviewing → approved/rework）。
+    """审批任务（submitted/reviewing → approved/rework）。"""
+    actor_id = (body.actorAgentId or "").strip()
+    if not actor_id:
+        raise HTTPException(
+            status_code=400,
+            detail="actorAgentId is required to review tasks",
+        )
+    actor = await _org.resolve_agent(actor_id)
+    if actor is None:
+        raise HTTPException(status_code=404, detail=f"Actor not found: {actor_id}")
+    hard = policy_service.hard_check(actor, "review_task", {})
+    if hard:
+        raise HTTPException(status_code=403, detail=hard)
 
-    decision='approve' → approved; decision='rework' → rework → running.
-    若任务处于 submitted，自动先推进到 reviewing。
-    """
     try:
-        # Check current status and only call start_review when needed,
-        # instead of try/except pass which silently swallows real errors.
         task = await _tasks.get_task(project_id, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
+        if body.decision.lower() == "approve":
+            evidence = task.get("evidence") or {}
+            if isinstance(evidence, str):
+                import json
+
+                try:
+                    evidence = json.loads(evidence)
+                except Exception:
+                    evidence = {}
+            if not isinstance(evidence, dict):
+                evidence = {}
+            await _gate_attestation_for_task(project_id, task, evidence)
+            if task.get("assignee_id"):
+                try:
+                    from hiveweave.services.git_worktree import ensure_executor_worktree
+
+                    await ensure_executor_worktree(
+                        project_id, str(task["assignee_id"])
+                    )
+                except Exception:
+                    pass
+            from hiveweave.services.worktree_review import review_worktree_gate
+
+            wt_deny, _ = await review_worktree_gate(project_id, task, evidence)
+            if wt_deny:
+                raise HTTPException(status_code=400, detail=wt_deny)
         current_status = task["status"]
-        if current_status == "submitted":
-            await _tasks.start_review(project_id, task_id)  # submitted → reviewing
-        elif current_status != "reviewing":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Task must be 'submitted' or 'reviewing' to review, "
-                       f"but is '{current_status}'",
-            )
+        decision = body.decision.lower()
+        if decision == "approve":
+            if current_status == "submitted":
+                await _tasks.start_review(project_id, task_id)
+            elif current_status != "reviewing":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Task must be 'submitted' or 'reviewing' to approve, "
+                           f"but is '{current_status}'",
+                )
+        else:
+            if current_status == "submitted":
+                await _tasks.start_review(project_id, task_id)
+            elif current_status not in ("reviewing", "approved"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Task must be 'submitted', 'reviewing', or 'approved' "
+                           f"to rework, but is '{current_status}'",
+                )
         await _tasks.review_task(
             project_id, task_id, body.decision, body.feedback
         )

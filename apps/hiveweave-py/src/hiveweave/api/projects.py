@@ -342,7 +342,8 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "status": "active",
                 "model_id": default_model_id,
                 "skills": ["spec-driven-development", "planning-and-task-breakdown", "context-engineering"],
-            }
+            },
+            bootstrap=True,
         )
         ceo_id = ceo["id"]
         created_ids.append(ceo_id)
@@ -359,7 +360,8 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "parent_id": ceo_id,
                 "model_id": default_model_id,
                 "skills": ["interview-me", "documentation-and-adrs"],
-            }
+            },
+            bootstrap=True,
         )
     except Exception as e:
         log.warning("seed_default_agents_failed", project_id=project_id, error=str(e))

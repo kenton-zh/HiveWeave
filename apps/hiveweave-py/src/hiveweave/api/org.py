@@ -49,6 +49,8 @@ class AgentCreate(BaseModel):
     modelId: str | None = None
     moduleId: str | None = None
     templateId: str | None = None
+    # P0 Hard Gates: REST hire must name an actor with staffing capability
+    actorAgentId: str | None = None
 
 
 class AgentUpdate(BaseModel):
@@ -209,12 +211,36 @@ async def get_children(agent_id: str) -> dict:
 
 @router.post("/agents")
 async def create_agent(body: AgentCreate) -> dict:
-    """创建 agent（short_id 自动生成）。"""
+    """创建 agent（short_id 自动生成）。
+
+    P0: requires actorAgentId with staffing capability; validate_hire runs
+    inside OrgService.create_agent (unless bootstrap seed).
+    """
+    actor_id = (body.actorAgentId or "").strip()
+    if not actor_id:
+        raise HTTPException(
+            status_code=400,
+            detail="actorAgentId is required to create agents (staffing gate)",
+        )
+    actor = await _org.resolve_agent(actor_id)
+    if actor is None:
+        raise HTTPException(status_code=404, detail=f"Actor agent not found: {actor_id}")
+
+    from hiveweave.services.policy import policy_service
+
+    hard = policy_service.hard_check(actor, "hire_agent", {})
+    if hard:
+        raise HTTPException(status_code=403, detail=hard)
+
     attrs = _normalize_agent_attrs(body)
+    attrs.pop("actorAgentId", None)
+    attrs.pop("actor_agent_id", None)
     if "template_id" in attrs:
         attrs.pop("template_id", None)  # 模板预填由 HR 工具处理，此处忽略
     try:
         agent = await _org.create_agent(attrs)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         log.error("create_agent_failed", error=str(e))
         raise HTTPException(status_code=422, detail=f"Failed to create agent: {e}")

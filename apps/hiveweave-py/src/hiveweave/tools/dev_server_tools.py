@@ -136,12 +136,15 @@ async def start_dev_server_tool(
 
     commit = ""
     try:
+        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
         r = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=workspace,
             capture_output=True,
             text=True,
             timeout=5,
+            **windows_no_window_kwargs(),
         )
         if r.returncode == 0:
             commit = (r.stdout or "").strip()

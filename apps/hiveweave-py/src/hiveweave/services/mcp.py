@@ -175,6 +175,8 @@ class _StdioTransport:
             return self._proc
         # 合并环境变量（子进程需要 PATH 等）
         env = {**os.environ, **(self.env or {})}
+        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
         self._proc = await asyncio.create_subprocess_exec(
             self.command,
             *self.args,
@@ -183,6 +185,7 @@ class _StdioTransport:
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=self.cwd or None,
+            **windows_no_window_kwargs(),
         )
         log.info(
             "mcp_stdio_spawned",

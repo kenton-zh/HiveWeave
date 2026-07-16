@@ -453,4 +453,7 @@ You are ALREADY in an isolated git worktree. Your current working directory IS y
 - Write code files DIRECTLY in the current directory (e.g. src/, tests/, package.json). Do NOT create subdirectories like hw/A0XX/ or .hiveweave/worktrees/ — you are already inside one.
 - Use .hiveweave/ ONLY for draft notes and reports within your worktree.
 - Do NOT call git_worktree_create — you already have a worktree. Use git_worktree_checkpoint to save progress.
-- Only finalized, reviewed code reaches the project root — via git_worktree_merge."""
+- Only finalized, reviewed code reaches the project root — via git_worktree_merge (coordinator).
+- **Merge conflict rework**: If you get rework saying MERGE CONFLICT, do NOT touch main.
+  In YOUR worktree: merge or rebase `main` into your branch, resolve conflict markers here,
+  `git_worktree_checkpoint`, then re-submit. Coordinator will retry `git_worktree_merge`."""
