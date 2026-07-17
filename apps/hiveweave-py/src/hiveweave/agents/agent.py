@@ -2511,4 +2511,7 @@ class Agent:
             "role": "tool",
             "content": content,
             "tool_call_id": tool_call_id,
+            # success 透传给 streamer（doom 检测的失败重试豁免需要真实错误信号；
+            # 该键不会进入发给 LLM 的消息体 —— _execute_tools 重新组包）
+            "success": result.get("success", False),
         }
