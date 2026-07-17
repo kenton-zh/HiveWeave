@@ -25,7 +25,8 @@ from hiveweave.tools.misc_tools import (
 
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(
-        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
     )
 
 
@@ -85,6 +86,7 @@ async def test_coordinator_merges_executor_branch_by_name(git_repo: Path) -> Non
     branches = subprocess.run(
         ["git", "branch", "--list", "hw/*/*"],
         cwd=git_repo, capture_output=True, text=True, check=True,
+        encoding="utf-8", errors="replace",
     ).stdout
     assert "feat-tictactoe-a004" not in branches  # 分支已清理
 

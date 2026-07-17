@@ -188,11 +188,19 @@ def spawn_project_process(
 
     creationflags = popen_kwargs.pop("creationflags", 0)
     if os.name == "nt":
-        from hiveweave.util.win_subprocess import merge_creationflags
+        from hiveweave.util.win_subprocess import (
+            merge_creationflags,
+            windows_no_window_kwargs,
+        )
         import subprocess as _sp
 
         base = creationflags or getattr(_sp, "CREATE_NEW_PROCESS_GROUP", 0)
         creationflags = merge_creationflags(base)
+        # Hidden console for the whole tree — CREATE_NO_WINDOW alone would
+        # let console grandchildren (node/bun/vite) allocate visible windows.
+        popen_kwargs.setdefault(
+            "startupinfo", windows_no_window_kwargs().get("startupinfo")
+        )
 
     try:
         proc = subprocess.Popen(
