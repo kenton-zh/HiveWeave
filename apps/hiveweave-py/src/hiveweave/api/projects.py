@@ -296,22 +296,32 @@ async def _seed_default_agents(project_id: str) -> list[str]:
     existing = await org.list_agents(project_id)
     log.info("seed_existing_agents", project_id=project_id, count=len(existing))
 
-    # 获取默认模型 ID — 优先选阶跃星辰(step-)，其次选最新添加的 active 模型
+    # 获取默认模型 ID — 与 org_tools.hire_agent 保持一致:
+    # 1. 优先读 global_settings.default_coordinator_model (管理员显式配置)
+    # 2. 回退:选最新添加的 active 模型 (不再硬编码 step- 前缀偏好)
     default_model_id = None
     try:
-        from hiveweave.services.model import ModelService
-        ms = ModelService()
-        active_models = await ms.list_active()
-        if active_models:
-            # 优先选 step- 前缀（阶跃星辰），没有才回退到最新添加的
-            step_models = [m for m in active_models if (m.get("model_id") or "").lower().startswith("step-")]
-            chosen = step_models[-1] if step_models else active_models[-1]
-            default_model_id = chosen.get("model_id") or chosen.get("id")
-            log.info("seed_default_model", default_model_id=default_model_id, total_models=len(active_models))
-        else:
-            log.warning("seed_no_active_models")
+        from hiveweave.services.settings import SettingsService
+        configured = await SettingsService().get("default_coordinator_model")
+        if configured:
+            default_model_id = configured
+            log.info("seed_default_model_from_setting", default_model_id=default_model_id)
     except Exception as e:
-        log.warning("seed_default_model_failed", error=str(e))
+        log.warning("seed_default_model_setting_read_failed", error=str(e))
+
+    if not default_model_id:
+        try:
+            from hiveweave.services.model import ModelService
+            ms = ModelService()
+            active_models = await ms.list_active()
+            if active_models:
+                chosen = active_models[-1]
+                default_model_id = chosen.get("model_id") or chosen.get("id")
+                log.info("seed_default_model_fallback", default_model_id=default_model_id, total_models=len(active_models))
+            else:
+                log.warning("seed_no_active_models")
+        except Exception as e:
+            log.warning("seed_default_model_failed", error=str(e))
 
     # 如果已有 agent，更新它们的 model_id（可能来自旧项目残留）
     if any(a.get("role") == "ceo" for a in existing):
@@ -950,9 +960,17 @@ async def delete_project(project_id: str) -> dict:
                     # ignore_errors=True: 即使部分文件失败也继续，避免中途退出
                     shutil.rmtree(str(hw_dir), ignore_errors=True)
                     # 再用 rmdir 清理残留的空目录结构
+                    from hiveweave.util.win_subprocess import (
+                        windows_no_window_kwargs,
+                    )
+
                     result = subprocess.run(
                         ["cmd", "/c", "rmdir", "/s", "/q", str(hw_dir)],
                         capture_output=True, text=True, timeout=30,
+                        # cmd 输出跟随系统 ANSI 代码页（中文机为 GBK），
+                        # 显式 locale 解码 + replace 防 illegal sequence 崩线程
+                        errors="replace",
+                        **windows_no_window_kwargs(),
                     )
                     if not hw_dir.exists():
                         _rmtree_ok = True

@@ -18,6 +18,10 @@ def _git(cwd: Path, *args: str) -> None:
         check=True,
         capture_output=True,
         text=True,
+        # git 输出是 UTF-8；中文 Windows 默认 GBK 会让 reader 线程
+        # UnicodeDecodeError 崩溃（进程退出时挂死的根因）
+        encoding="utf-8",
+        errors="replace",
     )
 
 
