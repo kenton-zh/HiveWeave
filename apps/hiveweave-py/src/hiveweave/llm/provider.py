@@ -1035,6 +1035,19 @@ class ProviderConfig:
         self.context_window = context_window
         self.max_output_tokens = max_output_tokens
         self.supports_thinking = supports_thinking
+
+        # 物理不变量 fail-fast：输出预算 >= 窗口在物理上不可能（输入零空间）。
+        # 治本：非法配置在 ProviderConfig 构造时就拒绝，不让非法对象被创建出来
+        # 流入 streamer。正常情况下检测层 + 存储层已拦住，这里是最后防线——
+        # 一旦触发说明 DB 里有脏数据（如手动 SQL 改坏），应立即暴露而非静默运行。
+        if self.max_output_tokens >= self.context_window:
+            raise ValueError(
+                f"Invalid ProviderConfig: max_output_tokens "
+                f"({self.max_output_tokens:,}) >= context_window "
+                f"({self.context_window:,}). 输出预算吃掉整个窗口，"
+                f"输入零空间，物理不可能。请修复模型配置。"
+            )
+
         self.reasoning_effort = reasoning_effort
         self.temperature = temperature
         self.fallback = fallback

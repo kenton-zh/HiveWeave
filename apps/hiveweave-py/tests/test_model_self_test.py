@@ -115,7 +115,13 @@ class TestDetectModelCapabilities:
 
     @pytest.mark.asyncio
     async def test_openrouter_api_query(self):
-        """OpenRouter base_url 应触发 API 查询（mocked）。"""
+        """OpenRouter 返回脏数据时，预设真值表必须压过 API（三层防御检测层）。
+
+        mock 的 max_completion_tokens=262144 正是线上事故数据：hy3:free 的
+        API 把 context_length 串线成 max_output（输出预算=整个窗口，物理不可能）。
+        旧行为盲信 API 值；防御层引入后，预设表 hy3→32000 必须获胜。
+        API 仅补充 supports_thinking（architecture 信号可信）。
+        """
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
@@ -143,8 +149,41 @@ class TestDetectModelCapabilities:
             )
 
         assert result["supports_thinking"] is True
-        assert result["max_output_tokens"] == 262144
-        assert result["source"] == "openrouter"
+        assert result["max_output_tokens"] == 32_000  # 预设表获胜，非 API 脏数据
+        assert result["source"] == "preset"
+
+    @pytest.mark.asyncio
+    async def test_openrouter_api_query_no_preset_hit(self):
+        """预设表未命中时，才采纳 OpenRouter API 的 max_output 候选（且需过 sanitize）。"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "data": [
+                {
+                    "id": "somevendor/future-model-9000",
+                    "context_length": 262144,
+                    "top_provider": {"max_completion_tokens": 65536},
+                    "architecture": {"input_modalities": ["text", "reasoning"]},
+                }
+            ]
+        }
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            result = await _detect_model_capabilities(
+                base_url="https://openrouter.ai/api/v1",
+                api_key="",
+                model_id="somevendor/future-model-9000",
+            )
+
+        assert result["supports_thinking"] is True
+        assert result["max_output_tokens"] == 65536
+        assert result["source"] == "external-api"
 
 
 # ── 预设表完整性 ──────────────────────────────────────────────
