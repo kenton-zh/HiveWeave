@@ -379,6 +379,11 @@ async def build_trigger_context(
     # 获取 inbox 未读消息
     inbox_messages = await _inbox_service.get_pending_messages(agent_id)
 
+    # 获取 background 消息（wake=0 的 progress/ACK，不触发 LLM 但随本次
+    # 触发捎带进上下文 —— BUGFIX: 此前这类消息写入即 read=1，永不进上下文，
+    # 导致"验证通过/交付完成"等证据对接收方不可见）
+    background_msgs = await _inbox_service.get_undelivered_background(agent_id)
+
     # 分离 rework 消息和其他消息
     rework_msgs: list[dict] = []
     other_msgs: list[dict] = []
@@ -458,6 +463,21 @@ async def build_trigger_context(
             f"{msg_text}"
         )
 
+    # ── 3b. Background updates（progress/ACK 捎带，无需回复）──
+    if background_msgs:
+        import json as _json
+        lines = []
+        for m in background_msgs:
+            entry = {
+                "from": await _agent_name(m.get("from_agent_id", "")),
+                "content": m.get("message", ""),
+            }
+            lines.append(_json.dumps(entry, ensure_ascii=False))
+        blocks.append(
+            "## Background updates — 同事进度/回执（仅供参考，无需回复；"
+            "其中可能包含你等待的交付证据）\n" + "\n".join(lines)
+        )
+
     # ── 3.5. Goals workbook update (dirty check) ──
     # Only shown when dirty — doesn't trigger the agent on its own.
     # Queues alongside regular messages, delivered when agent is already
@@ -511,8 +531,11 @@ async def build_trigger_context(
     if delivered_handoff_ids:
         await _handoff_service.mark_delivered(project_id, delivered_handoff_ids)
 
-    # 收集 inbox 消息 ID（在 LLM 非空输出后标记已读）
+    # 收集 inbox 消息 ID（在 LLM 非空输出后标记已读 + 已交付）
+    # background 消息 ID 一并并入：mark_read_by_ids 会同时置 read=1/delivered=1，
+    # 输出失败/超时不标记 → 下次触发重试捎带（与 wake 消息同一可靠性语义）
     inbox_msg_ids = [m["id"] for m in inbox_messages if m.get("id")]
+    inbox_msg_ids += [m["id"] for m in background_msgs if m.get("id")]
 
     # 提取第一个非空 from_agent_id（用于 team chat 显示）
     all_from_ids: list[str] = []
