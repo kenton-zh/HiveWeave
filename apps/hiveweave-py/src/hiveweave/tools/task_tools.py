@@ -409,6 +409,38 @@ from .helpers import get_project_id, resolve_agent_id
 
 # ── dispatch_task ───────────────────────────────────────
 
+# 只读协调角色提醒（中性，不阻断派发）——派发给 coordinator 时追加到返回文本
+_READONLY_ASSIGNEE_REMINDER = (
+    "提醒：对方是只读协调角色（不能修改代码文件）。"
+    "若任务包含代码修改，请改派 executor（可写代码）角色。"
+)
+
+
+async def _get_assignee_permission_type(
+    agent_id: str, org_service: Any = None
+) -> str | None:
+    """只读查询 assignee 的 permission_type（per-project DB agents 表）。
+
+    返回小写 permission_type（如 "coordinator" / "executor"）；查无此人或
+    查询失败时返回 None —— 失败只记日志、按"无提醒"处理，绝不阻断派发。
+    """
+    try:
+        if org_service is None:
+            from hiveweave.services.org import OrgService
+            org_service = OrgService()
+        agent = await org_service.get_agent(agent_id)
+        if not agent:
+            return None
+        perm = (agent.get("permission_type") or "").strip().lower()
+        return perm or None
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "dispatch_assignee_permission_lookup_failed",
+            agent_id=agent_id,
+            error=str(exc),
+        )
+        return None
+
 
 class DispatchTaskParams(BaseModel):
     """Parameters for dispatch_task tool."""
@@ -470,11 +502,16 @@ async def dispatch_task_tool(
         existing_task_id=params.task_id,
     )
     if result.get("success"):
-        return ToolResult.ok(
+        output = (
             f"Task dispatched to {result.get('to_agent_id', resolved_id)} "
-            f"(task_id={result.get('task_id', '')})",
-            task_id=result.get("task_id"),
+            f"(task_id={result.get('task_id', '')})"
         )
+        # 派发成功后做只读角色检查：assignee 是 coordinator（只读协调角色）时
+        # 追加中性提醒。不阻断派发、不改动 assignee 收到的 inbox/任务内容。
+        perm = await _get_assignee_permission_type(resolved_id, org_service)
+        if perm == "coordinator":
+            output = f"{output}\n{_READONLY_ASSIGNEE_REMINDER}"
+        return ToolResult.ok(output, task_id=result.get("task_id"))
     return ToolResult.err(result.get("message", "Dispatch failed"))
 
 

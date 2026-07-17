@@ -238,6 +238,76 @@ class GitWorktreeMergeParams(BaseModel):
     )
 
 
+async def _route_conflict_marker_cleanup(
+    project_id: str,
+    creator_id: str,
+    *,
+    merged_short_id: str | None,
+    files: list[str],
+) -> str:
+    """merge 成功后 main 残留冲突标记 → 给被合并 worktree 的 owner 建清理任务。
+
+    走 TaskService.create_task (与 VERIFY spawn 同一条系统建账路径),
+    assignee 从被合并分支的 short_id (worktree 记录) 解析。
+    任务创建失败不回滚 merge — 降级为纯警告。返回拼进 tool result 的警告文本。
+    """
+    shown = [str(f) for f in files[:20]]
+    file_list = ", ".join(shown)
+
+    owner_id: str | None = None
+    if merged_short_id:
+        try:
+            from hiveweave.tools.task_tools import resolve_agent_id_by_short_id
+
+            owner_id = await resolve_agent_id_by_short_id(
+                project_id, merged_short_id
+            )
+        except Exception as e:
+            log.warning("conflict_marker_owner_resolve_failed",
+                        short_id=merged_short_id, error=str(e))
+
+    description = (
+        "git_worktree_merge 成功后，main 上仍检测到未解决的 git 冲突标记 "
+        "(<<<<<<< / >>>>>>>)。请在你的 worktree 内修复这些文件（不要在 main "
+        "上直接改），对齐 main 后 checkpoint 并通知 coordinator 重新合并：\n"
+        + "\n".join(f"  - {f}" for f in shown)
+    )
+    try:
+        from hiveweave.services.task import TaskService
+
+        task_id = await TaskService().create_task(
+            project_id,
+            title="清理合并残留冲突标记",
+            description=description,
+            creator_id=creator_id,
+            assignee_id=owner_id,
+            priority=1,
+            tags=["merge-cleanup"],
+            source="system",
+        )
+    except Exception as e:
+        # 建账失败不拖垮 merge — 合并已完成不可回滚, 只留警告兜底
+        log.warning("conflict_marker_cleanup_task_failed",
+                    short_id=merged_short_id, error=str(e))
+        return (
+            f" WARNING: unresolved git conflict markers remain on main "
+            f"after merge: {file_list}. Failed to create cleanup task ({e}) "
+            f"— manually rework {merged_short_id or 'the worktree owner'} "
+            f"to fix them inside their worktree."
+        )
+
+    owner_note = merged_short_id if owner_id else "unassigned (owner not resolved)"
+    log.info("conflict_marker_cleanup_task_created",
+             task_id=task_id, short_id=merged_short_id, file_count=len(files))
+    return (
+        f" WARNING: unresolved git conflict markers remain on main "
+        f"after merge: {file_list}. Created cleanup task "
+        f"'清理合并残留冲突标记' (id={task_id}, assignee={owner_note}) "
+        f"— the worktree owner fixes them inside their worktree; "
+        f"coordinator reviews only."
+    )
+
+
 @tool(
     "git_worktree_merge",
     "Merge a worktree branch into main and remove the worktree. "
@@ -375,6 +445,27 @@ async def git_worktree_merge_tool(
     files = result.get("files") or result.get("conflicts")
 
     if result.get("success"):
+        # 残留冲突标记路由: merge 成功 ≠ main 干净 — 命中则给被合并
+        # worktree 的 owner 建清理任务。任何失败只降级为警告文本,
+        # 绝不影响已完成的 merge。
+        marker_warning = ""
+        marker_files = result.get("conflict_markers")
+        if isinstance(marker_files, list) and marker_files:
+            try:
+                marker_warning = await _route_conflict_marker_cleanup(
+                    project_id,
+                    agent_id,
+                    merged_short_id=short,
+                    files=[str(f) for f in marker_files],
+                )
+            except Exception as e:
+                log.warning("conflict_marker_route_failed", error=str(e))
+                marker_warning = (
+                    " WARNING: unresolved git conflict markers remain on "
+                    "main after merge: "
+                    + ", ".join(str(f) for f in marker_files[:20])
+                )
+
         # Post-merge: spawn VERIFY scoped to this merge + nudge on main
         try:
             from hiveweave.tools.task_tools import nudge_verify_tasks_after_merge
@@ -392,6 +483,7 @@ async def git_worktree_merge_tool(
                 f"{result.get('message', 'Worktree merged and cleaned up')} "
                 f"WARNING: VERIFY spawn/nudge failed ({e}). "
                 f"Retry merge nudge or spawn VERIFY manually for the merged task."
+                f"{marker_warning}"
             )
         msg = result.get("message", "Worktree merged and cleaned up")
         if nudged:
@@ -404,7 +496,7 @@ async def git_worktree_merge_tool(
                 f"{msg} No VERIFY spawned (no matching approved task for "
                 f"this merge scope)."
             )
-        return ToolResult.ok(msg)
+        return ToolResult.ok(f"{msg}{marker_warning}")
 
     # Conflict: auto-rework matching approved task(s) → executor fixes in worktree
     try:

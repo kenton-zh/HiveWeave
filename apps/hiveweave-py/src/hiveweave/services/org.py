@@ -84,6 +84,19 @@ _SCALAR_COLS = (
 _SHORT_ID_RE = re.compile(r"^[aA]\d{1,4}$")
 _SHORT_ID_NUM_RE = re.compile(r"^A(\d+)$")
 
+# 权限类型的可读标签 — 事故修复: LLM 经常误读 [coordinator]/[executor],
+# 把代码任务派给只读的协调者。标签保留原始类型便于程序解析。
+PERMISSION_TYPE_LABELS: dict[str, str] = {
+    "coordinator": "只读协调·coordinator",
+    "executor": "可写代码·executor",
+}
+
+# 通讯录/花名册共用的单行图例
+PERMISSION_LABEL_LEGEND: str = (
+    "图例: [只读协调] = 只能规划/审批/派单，不能修改代码文件; "
+    "[可写代码] = 可在自己的 worktree 修改代码"
+)
+
 
 class OrgService:
     """Organization CRUD + tree traversal — agents live in per-project DB.
@@ -517,7 +530,7 @@ class OrgService:
         return v_cur != v_read
 
     async def build_org_directory(self, project_id: str) -> str:
-        """构建精简组织通讯录——只含花名、short_id、role、层级关系。
+        """构建精简组织通讯录——只含花名、short_id、role、权限标签、层级关系。
 
         供 context prompt 注入。org chart 变更后每个 agent 首次对话注入一次，
         之后跳过直到下次变更（仿照 goals_dirty 机制）。
@@ -533,15 +546,21 @@ class OrgService:
             name = node.get("name", "?")
             sid = node.get("short_id", "?")
             role = node.get("role", "?")
-            perm = node.get("permission_type", "executor")
-            lines.append(f"{prefix}- {name} ({sid}) role={role} [{perm}]")
+            # 可读权限标签: 避免 LLM 误读原始类型而把代码任务派给只读协调者
+            perm = str(node.get("permission_type") or "executor")
+            label = PERMISSION_TYPE_LABELS.get(perm.lower(), perm)
+            lines.append(f"{prefix}- {name} ({sid}) role={role} [{label}]")
             for child in (node.get("children") or []):
                 walk(child, depth + 1)
 
         for root in tree:
             walk(root, 0)
 
-        return "## Team Directory（组织通讯录 — 用花名或 short_id 找人, 勿用 role）\n" + "\n".join(lines)
+        header = (
+            "## Team Directory（组织通讯录 — 用花名或 short_id 找人, 勿用 role）\n"
+            + PERMISSION_LABEL_LEGEND
+        )
+        return header + "\n" + "\n".join(lines)
 
     # ── TREE TRAVERSAL ───────────────────────────────────────
 
