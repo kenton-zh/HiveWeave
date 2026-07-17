@@ -374,12 +374,12 @@ function App() {
   return (
     <div className="h-screen flex flex-col bg-g-bg">
       {/* Top Bar — Google Material header */}
-      <header className="h-14 border-b border-g-border flex items-center px-6 bg-white shadow-gm-sm shrink-0">
+      <header className="h-14 border-b border-g-border flex items-center px-6 bg-white/90 backdrop-blur-md shadow-gm-sm shrink-0 relative z-30">
         <div className="flex items-center gap-3 min-w-0">
-          <div className="w-8 h-8 rounded-gm bg-g-blue flex items-center justify-center shrink-0 shadow-gm-sm">
-            <span className="text-white font-bold text-sm">H</span>
+          <div className="w-8 h-8 rounded-gm bg-gradient-to-br from-g-blue to-blue-600 flex items-center justify-center shrink-0 shadow-gm-sm ring-1 ring-white/40 transition-transform duration-200 hover:scale-105">
+            <span className="text-white font-bold text-sm drop-shadow-sm">H</span>
           </div>
-          <h1 className="text-lg font-semibold text-g-fg tracking-tight shrink-0">
+          <h1 className="text-lg font-semibold text-g-fg tracking-tight shrink-0 select-none">
             HiveWeave
           </h1>
           <ProjectTimeBadge projectId={selectedProjectId} />
@@ -389,29 +389,31 @@ function App() {
         <div className="ml-6 relative" ref={projectMenuRef}>
           <button
             onClick={() => setShowProjectMenu(!showProjectMenu)}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-gm bg-white border border-g-border hover:border-g-blue/40 transition-all text-sm text-g-fg shadow-gm-sm"
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-gm bg-white border transition-all duration-200 text-sm text-g-fg shadow-gm-sm hover:shadow-gm-md active:scale-[0.98] ${
+              showProjectMenu ? "border-g-blue/60 ring-2 ring-g-blue/20" : "border-g-border hover:border-g-blue/40"
+            }`}
           >
             <svg className="w-4 h-4 text-g-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
             </svg>
             <span className="max-w-[120px] truncate">{currentProject?.name || "选择项目"}</span>
-            <svg className="w-3 h-3 text-g-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className={`w-3 h-3 text-g-fg-3 transition-transform duration-200 ${showProjectMenu ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
             </svg>
           </button>
 
           {(deletingProjectId || queuedDeleteIds.length > 0) && (
-            <div className="absolute top-full left-0 mt-1 w-56 px-3 py-2 text-xs text-g-fg-2 bg-white border border-g-border rounded-gm shadow-gm-md z-50">
+            <div className="absolute top-full left-0 mt-1.5 w-56 px-3 py-2 text-xs text-g-fg-2 bg-white border border-g-border rounded-gm shadow-gm-md z-50 animate-slide-down">
               正在删除项目，请稍候...
               {queuedDeleteIds.length > 1 ? `（队列 ${queuedDeleteIds.length} 个）` : ""}
             </div>
           )}
           {showProjectMenu && (
-            <div className="absolute top-full left-0 mt-1 w-56 bg-white border border-g-border rounded-gm shadow-gm-lg z-50 py-1">
+            <div className="absolute top-full left-0 mt-1.5 w-56 bg-white border border-g-border rounded-gmLg shadow-gm-pop z-50 py-1.5 px-1 animate-scale-in origin-top-left">
               {projects.map((p) => (
                 <div
                   key={p.id}
-                  className={`flex items-center justify-between px-3 py-2 text-sm cursor-pointer hover:bg-g-bg-muted transition-colors ${
+                  className={`flex items-center justify-between px-3 py-2 text-sm cursor-pointer rounded-gm hover:bg-g-bg-muted transition-colors ${
                     p.id === selectedProjectId ? "text-g-blue bg-g-blue-bg" : "text-g-fg"
                   }`}
                 >
@@ -425,7 +427,7 @@ function App() {
                     type="button"
                     disabled={deletingProjectId === p.id || queuedDeleteIds.includes(p.id)}
                     onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
-                    className="ml-2 text-g-fg-4 hover:text-red-600 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                    className="ml-2 text-g-fg-4 hover:text-red-600 hover:bg-red-50 rounded-full p-1 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
                     title={deletingProjectId === p.id ? "删除中..." : "删除项目"}
                   >
                     <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -438,7 +440,7 @@ function App() {
               <div className="border-t border-g-border mt-1 pt-1">
                 <button
                   onClick={() => setShowFolderPicker(true)}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-sm text-g-fg-3 hover:text-g-blue hover:bg-g-bg-muted transition-colors"
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-gm transition-colors"
                 >
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
@@ -450,7 +452,7 @@ function App() {
           )}
         </div>
 
-        <div className="ml-auto flex items-center gap-4">
+        <div className="ml-auto flex items-center gap-3">
           {/* Restart buttons */}
           <div className="flex items-center gap-1">
             <button
@@ -463,14 +465,14 @@ function App() {
                   showToast("Failed to trigger backend restart", "error");
                 }
               }}
-              className="text-g-fg-3 hover:text-g-fg transition-colors"
+              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-full p-1.5 transition-all active:scale-90"
               title="Restart Backend"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
             </button>
-            <span className="text-g-fg-4 text-xs">|</span>
+            <span className="text-g-fg-4 text-xs select-none">|</span>
             <button
               onClick={async () => {
                 if (!confirm("Restart frontend? This will kill and relaunch the Vite dev server.")) return;
@@ -481,7 +483,7 @@ function App() {
                   showToast("Failed to trigger frontend restart", "error");
                 }
               }}
-              className="text-g-fg-3 hover:text-g-fg transition-colors"
+              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-full p-1.5 transition-all active:scale-90"
               title="Restart Frontend"
             >
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -492,7 +494,7 @@ function App() {
           {/* Model Settings gear icon */}
           <button
             onClick={() => setShowModelSettings(true)}
-            className="text-g-fg-3 hover:text-g-fg transition-colors"
+            className="text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-full p-1.5 transition-all duration-200 active:scale-90 active:rotate-45"
             title="Model Settings"
           >
             <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -503,7 +505,7 @@ function App() {
           {/* API Key 设置 */}
           <button
             onClick={() => setShowApiKeyDialog(true)}
-            className="text-g-fg-3 hover:text-g-fg transition-colors"
+            className="text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-full p-1.5 transition-all active:scale-90"
             title="API Key 设置"
           >
             <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -518,12 +520,12 @@ function App() {
               onChange={(e) => setNameDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") saveName(); if (e.key === "Escape") setEditingName(false); }}
               onBlur={saveName}
-              className="w-24 px-2 py-1 text-xs bg-white border border-g-blue/40 rounded-gm text-g-fg focus:outline-none focus:border-g-blue"
+              className="w-24 px-2 py-1 text-xs bg-white border border-g-blue/40 rounded-gm text-g-fg focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/25 transition-all"
             />
           ) : (
             <button
               onClick={startEditName}
-              className="flex items-center gap-1.5 text-xs text-g-fg-3 hover:text-g-fg transition-colors"
+              className="flex items-center gap-1.5 text-xs text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-full px-2.5 py-1.5 transition-all active:scale-95"
               title="点击修改你的名称"
             >
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -538,13 +540,13 @@ function App() {
       {/* Main Content */}
       <div className="flex flex-1 overflow-hidden">
         {/* Left Panel - Org Tree / Office — tinted background for visual depth */}
-        <div className="flex-1 border-r border-g-border flex flex-col bg-[#f4f6f9]">
+        <div className="flex-1 border-r border-g-border flex flex-col bg-app-tint">
           <div className="px-4 py-3 border-b border-g-border bg-white/80 backdrop-blur-sm flex items-center gap-3">
             {/* View tabs */}
-            <div className="flex gap-1 bg-g-bg-muted rounded-full p-0.5">
+            <div className="flex gap-1 bg-g-bg-muted rounded-full p-0.5 shadow-inner">
               <button
                 onClick={() => setActiveView("tree")}
-                className={`px-3 py-1 text-xs rounded-full transition-all ${
+                className={`px-3 py-1 text-xs rounded-full transition-all duration-200 active:scale-95 ${
                   activeView === "tree"
                     ? "bg-white text-g-blue shadow-gm-sm font-medium"
                     : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
@@ -554,7 +556,7 @@ function App() {
               </button>
               <button
                 onClick={() => setActiveView("office")}
-                className={`px-3 py-1 text-xs rounded-full transition-all ${
+                className={`px-3 py-1 text-xs rounded-full transition-all duration-200 active:scale-95 ${
                   activeView === "office"
                     ? "bg-white text-g-blue shadow-gm-sm font-medium"
                     : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
@@ -569,14 +571,19 @@ function App() {
               <button
                 onClick={handleToggleProjectStart}
                 disabled={projectStarting}
-                className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-gm transition-all shadow-gm-sm ml-auto ${
+                className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-gm transition-all duration-200 shadow-gm-sm ml-auto hover:shadow-gm-md active:scale-[0.97] ${
                   currentProject?.isStarted
                     ? "bg-g-green-bg text-g-green hover:bg-green-100 border border-green-200"
                     : "bg-g-red-bg text-g-red hover:bg-red-100 border border-red-200"
                 } disabled:opacity-50 disabled:cursor-not-allowed`}
                 title={currentProject?.isStarted ? "点击下班，暂停该项目所有 Agent" : "点击上班，启动该项目所有 Agent"}
               >
-                <span className={`w-2 h-2 rounded-full ${currentProject?.isStarted ? "bg-emerald-500 animate-pulse" : "bg-red-500"}`} />
+                <span className="relative flex w-2 h-2">
+                  {currentProject?.isStarted && (
+                    <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 animate-ping-ring" />
+                  )}
+                  <span className={`relative inline-flex w-2 h-2 rounded-full ${currentProject?.isStarted ? "bg-emerald-500" : "bg-red-500"}`} />
+                </span>
                 <span>{projectStarting ? "处理中..." : currentProject?.isStarted ? "上班中" : "已下班"}</span>
               </button>
             )}
@@ -584,7 +591,7 @@ function App() {
             {selectedProjectId && activeView === "tree" && (
               <button
                 onClick={() => openAddAgent(null)}
-                className="flex items-center gap-1 px-2.5 py-1 text-xs text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg rounded-gm transition-colors"
+                className="flex items-center gap-1 px-2.5 py-1 text-xs text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg rounded-gm transition-all active:scale-95"
                 title="Create Agent"
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -596,7 +603,7 @@ function App() {
           </div>
           <div className="flex-1 overflow-hidden">
             {activeView === "tree" ? <OrgTree /> : (
-              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm">Loading...</div>}>
+              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
                 <OfficeView />
               </Suspense>
             )}
@@ -607,7 +614,7 @@ function App() {
         <div className="w-2/5 flex flex-col bg-white">
           {/* Tab bar */}
           <div className="px-4 py-2 border-b border-g-border bg-white flex items-center gap-1">
-            <div className="flex gap-1 bg-[#f4f6f9] rounded-full p-0.5 mr-2">
+            <div className="flex gap-1 bg-[#f4f6f9] rounded-full p-0.5 mr-2 shadow-inner">
             <button
               onClick={() => setRightPanelTab("goals")}
               className={`px-3 py-1.5 text-xs rounded-full transition-all ${
@@ -680,20 +687,21 @@ function App() {
           {/* Tab content */}
           <div className="flex-1 overflow-hidden">
             {!selectedAgentId ? (
-              <div className="h-full flex items-center justify-center text-g-fg-3 text-sm">
+              <div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-fade-in">
                 <div className="text-center">
-                  <div className="w-16 h-16 rounded-full bg-g-bg-muted border border-g-border flex items-center justify-center mx-auto mb-4 shadow-gm-sm">
+                  <div className="w-16 h-16 rounded-full bg-gradient-to-br from-g-bg-soft to-g-bg-muted border border-g-border flex items-center justify-center mx-auto mb-4 shadow-gm-sm ring-4 ring-g-bg-muted/50">
                     <svg className="w-8 h-8 text-g-fg-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
                     </svg>
                   </div>
-                  <p className="text-g-fg-3">从左侧 Org Tree 选择一个 Agent</p>
+                  <p className="text-g-fg-3 font-medium">从左侧 Org Tree 选择一个 Agent</p>
+                  <p className="text-g-fg-4 text-xs mt-1.5">选择后即可查看对话、目标与日志</p>
                 </div>
               </div>
             ) : (
               <>
                 <ChatPanel key="panel-chat" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
-                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm">Loading...</div>}>
+                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
                   {rightPanelTab === "goals" && selectedProjectId && <GoalsPanel key="panel-goals" projectId={selectedProjectId} />}
                   {rightPanelTab === "goals" && !selectedProjectId && (
                     <div key="panel-goals-empty" className="h-full flex items-center justify-center text-g-fg-3 text-sm">

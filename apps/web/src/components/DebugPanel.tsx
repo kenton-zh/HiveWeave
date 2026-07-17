@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useAppStore, type DebugLogEntry } from "../store";
 
 const CATEGORY_COLORS: Record<string, string> = {
@@ -53,11 +53,11 @@ export default function DebugPanel() {
   return (
     <div className="h-full flex flex-col bg-g-bg">
       {/* Header */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-g-border shrink-0">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-g-border bg-g-bg-soft/60 shrink-0">
         <span className="text-xs font-semibold text-g-fg">调试日志</span>
         <span className="text-xs text-g-fg-4">({debugLogs.length})</span>
         {errorCount > 0 && (
-          <span className="text-xs text-red-600 px-1.5 py-0.5 bg-red-50 rounded">
+          <span className="text-xs text-red-600 px-1.5 py-0.5 bg-red-50 border border-red-100 rounded-gm">
             {errorCount} 错误
           </span>
         )}
@@ -65,7 +65,7 @@ export default function DebugPanel() {
         <select
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          className="text-xs bg-g-bg-soft border border-g-border rounded px-2 py-1 text-g-fg"
+          className="text-xs bg-g-bg border border-g-border rounded-gm px-2 py-1 text-g-fg focus:outline-none focus:border-g-blue/50 cursor-pointer"
         >
           <option value="all">全部</option>
           <option value="api">API ({apiCount})</option>
@@ -74,13 +74,17 @@ export default function DebugPanel() {
         </select>
         <button
           onClick={() => setAutoScroll(!autoScroll)}
-          className={`text-xs px-2 py-1 rounded ${autoScroll ? "bg-g-blue/15 text-g-blue" : "text-g-fg-3"}`}
+          className={`text-xs px-2 py-1 rounded-gm border active:scale-[0.96] transition-all ${
+            autoScroll
+              ? "bg-g-blue-bg/60 text-g-blue border-g-blue/30"
+              : "text-g-fg-3 border-g-border hover:text-g-fg hover:bg-g-bg-muted"
+          }`}
         >
           自动滚动
         </button>
         <button
           onClick={clearDebugLogs}
-          className="text-xs px-2 py-1 text-g-fg-3 hover:text-red-600 rounded"
+          className="text-xs px-2 py-1 rounded-gm border border-g-border text-g-fg-3 hover:text-red-600 hover:border-red-200 hover:bg-red-50 active:scale-[0.96] transition-all"
         >
           清除
         </button>
@@ -89,14 +93,15 @@ export default function DebugPanel() {
       {/* Log entries */}
       <div className="flex-1 overflow-y-auto font-mono text-xs">
         {filtered.length === 0 ? (
-          <div className="h-full flex items-center justify-center text-g-fg-4/70">
-            暂无日志
+          <div className="h-full flex flex-col items-center justify-center gap-1.5 text-g-fg-4/70">
+            <span className="text-2xl">🛰️</span>
+            <span>暂无日志</span>
           </div>
         ) : (
           filtered.map((entry) => (
             <div
               key={entry.id}
-              className="border-b border-g-border/50 hover:bg-g-bg-soft/60 cursor-pointer"
+              className="border-b border-g-border/50 hover:bg-g-blue-bg/20 cursor-pointer transition-colors"
               onClick={() => setExpanded(expanded === entry.id ? null : entry.id)}
             >
               <div className="flex items-start gap-2 px-2 py-1">
@@ -110,7 +115,7 @@ export default function DebugPanel() {
               </div>
               {expanded === entry.id && entry.data && (
                 <div className="px-2 pb-2 pl-12">
-                  <pre className="text-g-fg-4/70 whitespace-pre-wrap break-all text-xs bg-g-bg-muted p-2 rounded">
+                  <pre className="text-g-fg-3 whitespace-pre-wrap break-all text-xs bg-g-bg-muted border border-g-border/60 p-2 rounded-gm">
                     {typeof entry.data === "string"
                       ? entry.data
                       : JSON.stringify(entry.data, null, 2)}

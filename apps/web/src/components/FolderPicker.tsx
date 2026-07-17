@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { browseDirectory, type BrowseResult } from "../api";
 
 interface FolderPickerProps {
@@ -70,6 +70,13 @@ function WebFolderPicker({
   const [addressEditing, setAddressEditing] = useState(false);
   const addressRef = useRef<HTMLInputElement>(null);
 
+  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
+  const [entered, setEntered] = useState(false);
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => setEntered(true));
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   const navigate = async (dirPath?: string) => {
     setLoading(true);
     try {
@@ -103,9 +110,12 @@ function WebFolderPicker({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onCancel}>
+    <div
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
+      onClick={onCancel}
+    >
       <div
-        className="bg-g-bg border border-g-border rounded-lg shadow-2xl w-[640px] max-h-[80vh] flex flex-col"
+        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg w-[640px] max-h-[80vh] flex flex-col transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -172,10 +182,10 @@ function WebFolderPicker({
                 key={drive}
                 onClick={() => navigate(drive)}
                 disabled={loading}
-                className={`px-2 py-0.5 text-xs rounded border shrink-0 transition-colors ${
+                className={`px-2.5 py-0.5 text-xs rounded-full border shrink-0 active:scale-[0.96] transition-all ${
                   data.currentPath?.startsWith(drive)
-                    ? "border-g-blue/50 text-g-blue bg-g-blue/10"
-                    : "border-g-border text-g-fg-4 hover:text-g-fg hover:border-g-border"
+                    ? "border-g-blue/50 text-g-blue bg-g-blue-bg/60 shadow-gm-sm"
+                    : "border-g-border text-g-fg-4 hover:text-g-fg hover:border-g-border-strong hover:bg-g-bg-soft"
                 }`}
               >
                 {drive.replace("\\", "")}
@@ -198,9 +208,9 @@ function WebFolderPicker({
                 <button
                   key={entry.fullPath}
                   onClick={() => entry.fullPath && navigate(entry.fullPath)}
-                  className="flex items-center gap-2 px-3 py-2 rounded text-left group transition-colors hover:bg-g-bg-soft border border-transparent"
+                  className="flex items-center gap-2 px-3 py-2 rounded-gm text-left group transition-colors hover:bg-g-blue-bg/50 border border-transparent hover:border-g-blue/20"
                 >
-                  <svg className="w-5 h-5 text-yellow-500/80 shrink-0" fill="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-5 h-5 text-yellow-500/80 shrink-0 group-hover:scale-110 transition-transform" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z" />
                   </svg>
                   <span className="text-sm text-g-fg group-hover:text-g-fg truncate">{entry.name}</span>
@@ -218,14 +228,14 @@ function WebFolderPicker({
           <div className="flex items-center gap-2">
             <button
               onClick={onCancel}
-              className="px-4 py-1.5 text-sm text-g-fg-3 hover:text-g-fg border border-g-border rounded hover:border-g-border transition-colors"
+              className="px-4 py-1.5 text-sm text-g-fg-3 hover:text-g-fg border border-g-border rounded-gm hover:bg-g-bg-muted hover:border-g-border-strong active:scale-[0.97] transition-all"
             >
               取消
             </button>
             <button
               onClick={() => data?.currentPath && onSelect(data.currentPath)}
               disabled={!data || loading}
-              className="px-4 py-1.5 text-sm bg-g-blue text-white rounded hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              className="px-4 py-1.5 text-sm bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
             >
               选择文件夹
             </button>

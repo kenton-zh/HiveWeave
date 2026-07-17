@@ -8,30 +8,76 @@
     @apply border-g-border;
   }
 
+  html {
+    scroll-behavior: smooth;
+  }
+
   body {
     font-family: "DM Sans", ui-sans-serif, system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    background-color: #ffffff;
   }
 
+  /* Refined scrollbar — floating thumb with soft hover */
   ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+    width: 10px;
+    height: 10px;
   }
   ::-webkit-scrollbar-track {
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: #dadce0;
-    border-radius: 4px;
+    background: rgba(60, 64, 67, 0.22);
+    border-radius: 8px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    transition: background-color 0.2s ease;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: #bdc1c6;
+    background: rgba(60, 64, 67, 0.4);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:active {
+    background: rgba(66, 133, 244, 0.55);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  /* Firefox scrollbar */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(60, 64, 67, 0.28) transparent;
   }
 
   ::selection {
-    background: rgba(66, 133, 244, 0.15);
+    background: rgba(66, 133, 244, 0.18);
     color: #0e1115;
+    text-shadow: none;
+  }
+
+  /* Unified keyboard focus ring */
+  :focus-visible {
+    outline: 2px solid rgba(66, 133, 244, 0.55);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* Respect reduced-motion preferences */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
   }
 }
 
@@ -43,6 +89,8 @@
   background: rgba(255,255,255,0.85) !important;
   border-radius: 8px;
   border: 1px solid #ebebeb !important;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 2px 6px 2px rgba(60,64,67,.10);
 }
 
 /* ── Focus ring (Google blue) ── */
@@ -55,25 +103,26 @@
 /* ── Google Material Components ── */
 @layer components {
   .gm-card {
-    @apply bg-g-bg border border-g-border rounded-gm shadow-gm-sm;
+    @apply bg-g-bg border border-g-border rounded-gm shadow-gm-sm transition-shadow duration-200;
   }
 
   .gm-btn-primary {
     @apply bg-g-blue text-white px-4 py-2 rounded-gm font-medium text-sm
-           hover:bg-blue-600 transition-colors duration-150 shadow-gm-sm
-           active:scale-[0.98];
+           hover:bg-blue-600 hover:shadow-gm-md transition-all duration-150 shadow-gm-sm
+           active:scale-[0.97] active:shadow-gm-sm;
   }
 
   .gm-btn-secondary {
     @apply bg-g-bg-soft text-g-fg-2 px-4 py-2 rounded-gm font-medium text-sm
-           hover:bg-g-bg-muted transition-colors duration-150 border border-g-border;
+           hover:bg-g-bg-muted hover:shadow-gm-sm transition-all duration-150 border border-g-border
+           active:scale-[0.98];
   }
 
   .gm-input {
     @apply w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm
            text-g-fg placeholder-g-fg-4
-           focus:outline-none focus:border-g-blue focus:ring-1 focus:ring-g-blue/30
-           transition-colors duration-150;
+           focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/25
+           transition-all duration-150;
   }
 
   .gm-badge {
@@ -88,6 +137,21 @@
   }
   .hover-lift:hover {
     box-shadow: 0 2px 6px 2px rgba(60,64,67,.15), 0 1px 2px 0 rgba(60,64,67,.30);
+  }
+
+  /* Frosted glass surface for floating chrome */
+  .glass {
+    background: rgba(255, 255, 255, 0.78);
+    backdrop-filter: blur(10px) saturate(1.4);
+    -webkit-backdrop-filter: blur(10px) saturate(1.4);
+  }
+
+  /* Soft branded tint wash */
+  .bg-app-tint {
+    background:
+      radial-gradient(1200px 500px at 15% -10%, rgba(66, 133, 244, 0.05), transparent 60%),
+      radial-gradient(900px 420px at 90% -20%, rgba(52, 168, 83, 0.04), transparent 55%),
+      #f4f6f9;
   }
 }
 
