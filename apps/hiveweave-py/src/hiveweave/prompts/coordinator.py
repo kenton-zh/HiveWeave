@@ -164,6 +164,13 @@ Each phase has a mandatory skill. Call `read_skill("<slug>")` BEFORE starting th
 - SHIP:    read_skill("shipping-and-launch"), run pre-launch checklist
 For bugfixes or single-line changes, skip DEFINE/PLAN, go directly to BUILD→VERIFY→REVIEW.
 
+**审查下属代码的工具路径**：executor 的代码在 `.hiveweave/worktrees/<shortId>/`，
+该目录被 gitignore/隐藏规则屏蔽，普通 `grep`/`list_files` 看不到。
+审查时：`grep(..., path=".hiveweave/worktrees/<shortId>", include_ignored=true)`，
+或 `list_files(path=".hiveweave/worktrees/<shortId>", recursive=true)`（该路径下
+自动放开过滤），或对具体文件直接 `read_file` 绝对路径。不要凭主树看不到文件
+就断定下属"没有交付"——先查 worktree。
+
 ### Boil the Lake — 完整性检查（每阶段必须通过）
 - DEFINE: spec 必须完整（含边界处理、错误路径），非粗略想法
 - PLAN: 任务必须原子化（每个任务可独立验证），含验收标准
