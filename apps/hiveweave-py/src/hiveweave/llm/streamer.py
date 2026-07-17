@@ -107,6 +107,9 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
     "run_tests": 6,
     "run_perf_audit": 6,
     "run_full_review": 6,
+    # 每轮强制出口 — 被出口闸门拒收后必须重试，默认阈值 3 会误杀
+    # （井字棋实测：CEO 首条指令即撞 doom，无任何正常输出）
+    "commit_turn": 6,
     # 幂等写入 — 中容忍，覆盖写入无害但不应无限重复
     "write_file": 8,
     "save_charter": 8,
@@ -880,13 +883,18 @@ class Streamer:
                          "tool_call_id": tc["id"]}
                         for tc in tool_calls
                     ]
+                    doom_tracker["last_errored"] = True
                 else:
-                    tool_results = await self._execute_tools(
+                    tool_results, error_ids = await self._execute_tools(
                         agent_id=agent_id,
                         tool_calls=tool_calls,
                         on_tool_call=on_tool_call,
                         on_delta=on_delta,
                     )
+                    # doom 检测的失败重试豁免：本轮有工具出错时，下一轮同参数
+                    # 重试不计 doom（合法的重试，如 commit_turn 被出口闸门拒收后
+                    # 履行义务再提交）
+                    doom_tracker["last_errored"] = bool(error_ids)
 
                 # 追加 assistant + tool_results 到 messages
                 messages = messages + [assistant_msg] + tool_results
@@ -1429,10 +1437,11 @@ class Streamer:
         tool_calls: list[dict],
         on_tool_call: ToolCallCallback,
         on_delta: DeltaCallback | None,
-    ) -> list[dict]:
-        """执行一批工具调用，返回 tool result 消息列表。
+    ) -> tuple[list[dict], set[str]]:
+        """执行一批工具调用，返回 (tool result 消息列表, 出错的 tool_call_id 集合)。
 
         并行执行独立的工具调用（对齐 Elixir Task.Supervisor.async_nolink）。
+        error_ids 供 doom 检测区分"盲目重复"与"失败后重试"（后者是合法行为）。
         """
         # 广播 tool_use 事件
         for tc in tool_calls:
@@ -1451,6 +1460,7 @@ class Streamer:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         tool_results: list[dict] = []
+        error_ids: set[str] = set()
         for i, result in enumerate(results):
             tc = tool_calls[i]
             if isinstance(result, BaseException):
@@ -1459,8 +1469,14 @@ class Streamer:
                           tool=tc["name"],
                           error=str(result))
                 content = f"[Tool Error] {type(result).__name__}: {result}"
+                error_ids.add(tc["id"])
             else:
                 content = result.get("content", "")
+                if (
+                    result.get("success") is False
+                    or content.startswith(("[Tool Timeout]", "[Tool Error]"))
+                ):
+                    error_ids.add(tc["id"])
             tool_results.append({
                 "role": "tool",
                 "content": content,
@@ -1473,7 +1489,7 @@ class Streamer:
                 "content": content,
             })
 
-        return tool_results
+        return tool_results, error_ids
 
     async def _execute_single_tool(
         self,
@@ -1517,24 +1533,36 @@ class Streamer:
         - 幂等写入 8 次 — 覆盖写入无害但不应无限
         - 副作用工具 3 次 — bash/apply_patch 严格限制
 
+        失败重试豁免（井字棋实测 #1）：上一轮同参数调用**执行失败**时，
+        本次同参数调用是合法重试（如 commit_turn 被出口闸门拒收后履行义务
+        再提交），不计 doom。真正的死循环仍由 MAX_ROUNDS / 无进展熔断兜底。
+
         遇到不同调用时重置计数。更新 tracker 并返回触发 doom loop 的工具名，或 None。
         """
         last_key = tracker.get("last_key")
         count = tracker.get("count", 0)
+        last_errored = tracker.get("last_errored", False)
         for tc in tool_calls:
             key = (tc["name"], tc["arguments"])
             if key == last_key:
-                count += 1
+                if last_errored:
+                    # 失败后重试：计数保持不变，且豁免标志只消费一次
+                    last_errored = False
+                else:
+                    count += 1
             else:
                 last_key = key
                 count = 1
+                last_errored = False
             limit = DOOM_LOOP_TOOL_LIMITS.get(tc["name"], DOOM_LOOP_DEFAULT_LIMIT)
             if count >= limit:
                 tracker["last_key"] = last_key
                 tracker["count"] = count
+                tracker["last_errored"] = last_errored
                 return tc["name"]
         tracker["last_key"] = last_key
         tracker["count"] = count
+        tracker["last_errored"] = last_errored
         return None
 
     # ── 上下文溢出修剪 ──────────────────────────────────────
