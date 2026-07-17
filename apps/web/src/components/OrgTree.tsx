@@ -1,4 +1,4 @@
-﻿import {
+import {
   useEffect, useState, useCallback, useRef, useMemo, useLayoutEffect,
 } from "react";
 import ApprovalDialog from "./ApprovalDialog";
@@ -340,6 +340,7 @@ function formatAlarmCountdown(realMs: number): string {
 function TreeNodeCard({
   node, isSelected, onSelect, onAddChild, onApproval, onToggle,
   expanded, pendingCount, hasUserPing, isProcessing, isActive, nodeH, alarm,
+  healthError,
 }: {
   node: LayoutNode;
   isSelected: boolean;
@@ -354,8 +355,11 @@ function TreeNodeCard({
   isActive: boolean;
   nodeH: number;
   alarm?: AgentAlarmInfo;
+  /** Health-error message (LLM/model call failure); null/undefined = healthy. */
+  healthError?: string | null;
 }) {
   const compact = nodeH < 42;
+  const hasError = !!healthError;
   const hasChildren = !!node.children?.length;
   const roleStyle = getRoleStyle(node.role);
   const positionLabel = getPositionLabel(node.position, node.role);
@@ -405,23 +409,25 @@ function TreeNodeCard({
         borderLeft: `3px solid ${accentColor}`,
         borderTopWidth: "1px",
         borderTopStyle: "solid",
-        borderTopColor: isProcessing ? "rgba(52,168,83,.30)" : "#ebebeb",
+        borderTopColor: hasError ? "rgba(239,68,68,.55)" : isProcessing ? "rgba(52,168,83,.30)" : "#ebebeb",
         borderRightWidth: "1px",
         borderRightStyle: "solid",
-        borderRightColor: isProcessing ? "rgba(52,168,83,.30)" : "#ebebeb",
+        borderRightColor: hasError ? "rgba(239,68,68,.55)" : isProcessing ? "rgba(52,168,83,.30)" : "#ebebeb",
         borderBottomWidth: "1px",
         borderBottomStyle: "solid",
-        borderBottomColor: isProcessing ? "rgba(52,168,83,.30)" : "#ebebeb",
+        borderBottomColor: hasError ? "rgba(239,68,68,.55)" : isProcessing ? "rgba(52,168,83,.30)" : "#ebebeb",
         background: isSelected
           ? "rgba(66,133,244,0.08)"
           : "rgba(255,255,255,1)",
-        boxShadow: isSelected
-          ? "0 0 0 1px rgba(66,133,244,.25), 0 2px 8px rgba(60,64,67,.18)"
-          : node.role === "ceo"
-            ? "0 1px 4px rgba(66,133,244,.15)"
-            : isActive && isProcessing
-              ? "0 1px 3px rgba(60,64,67,.20)"
-              : "0 1px 1px rgba(60,64,67,.10)",
+        boxShadow: hasError
+          ? "0 0 0 1px rgba(239,68,68,.35), 0 0 12px rgba(239,68,68,.28)"
+          : isSelected
+            ? "0 0 0 1px rgba(66,133,244,.25), 0 2px 8px rgba(60,64,67,.18)"
+            : node.role === "ceo"
+              ? "0 1px 4px rgba(66,133,244,.15)"
+              : isActive && isProcessing
+                ? "0 1px 3px rgba(60,64,67,.20)"
+                : "0 1px 1px rgba(60,64,67,.10)",
         // Re-rasterize text crisply at any CSS scale level
         textRendering: "optimizeLegibility",
         WebkitFontSmoothing: "antialiased",
@@ -448,6 +454,16 @@ function TreeNodeCard({
         >
           {node.name}
         </span>
+        {hasError && (
+          <span
+            className="shrink-0 text-red-500 flex items-center"
+            title={`模型/LLM 调用出错：${healthError}`}
+          >
+            <svg className={compact ? "w-2.5 h-2.5" : "w-3 h-3"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+            </svg>
+          </span>
+        )}
         {hasChildren && (
           <span
             onClick={(e) => { e.stopPropagation(); onToggle(); }}
@@ -586,6 +602,7 @@ function OrgTree() {
   const userPingAgentIds = useAppStore((s) => s.userPingAgentIds);
   const processingAgents = useAppStore((s) => s.processingAgents);
   const agentAlarms = useAppStore((s) => s.agentAlarms);
+  const agentHealth = useAppStore((s) => s.agentHealth);
 
   // State
   const [roots, setRoots] = useState<OrgNodeData[]>([]);
@@ -657,6 +674,8 @@ function OrgTree() {
   // Jitter each poll cycle randomly (3000 ± 400ms) so 3s-interval endpoints
   // don't pile up synchronously.
   useEffect(() => {
+    // Project switched — drop stale health-error flags from the previous one
+    useAppStore.getState().clearAgentHealth();
     if (!selectedProjectId) { setAgentAlarms({}); return; }
     const projectId = selectedProjectId; // non-null after guard
     let mounted = true;
@@ -1014,7 +1033,14 @@ function OrgTree() {
                 ))}
 
                 {/* Node cards */}
-                {visible.map((n) => (
+                {visible.map((n) => {
+                  const h = agentHealth[n.id];
+                  const healthError =
+                    h && h.health === "error" &&
+                    (!h.projectId || h.projectId === selectedProjectId)
+                      ? h.message || "未知错误"
+                      : null;
+                  return (
                   <TreeNodeCard
                     key={n.id}
                     node={n}
@@ -1039,8 +1065,10 @@ function OrgTree() {
                     isActive={n.status === "active"}
                     nodeH={params.nodeH}
                     alarm={agentAlarms[n.id]}
+                    healthError={healthError}
                   />
-                ))}
+                  );
+                })}
               </div>
             </div>
           </div>

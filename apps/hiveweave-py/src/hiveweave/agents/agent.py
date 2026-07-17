@@ -1384,6 +1384,9 @@ class Agent:
             "disposition": self.disposition,
         })
 
+        # 5.5 广播健康事件 — 成功完成一轮 LLM 调用 → health="ok"
+        self._broadcast_agent_health("ok")
+
         # 6. Process queued user messages (sent while agent was busy)
         await self._drain_message_queue()
 
@@ -1614,6 +1617,9 @@ class Agent:
             "agentId": self.id,
         })
 
+        # 广播健康事件 — LLM 调用出错 → health="error"（message 截断 200 字符）
+        self._broadcast_agent_health("error", error_msg[:200])
+
         # 保存错误消息到 DB — 更新 streaming placeholder 而非插入新消息
         is_trigger = bool(self.pending_inbox_msg_ids)
         try:
@@ -1791,6 +1797,11 @@ class Agent:
 
         self._cancel_safety_timer()
         self._reset_to_idle()
+
+        # 广播健康事件 — LLM 调用 10 分钟安全超时 → health="error"
+        self._broadcast_agent_health(
+            "error", "LLM call exceeded 10 minute safety limit"
+        )
         log.warning(
             "safety_timeout_resume_armed",
             agent_id=self.id,
@@ -2418,6 +2429,34 @@ class Agent:
                     asyncio.create_task(result)
             except Exception as e:
                 log.warning("agent_broadcast_failed", agent_id=self.id, error=str(e))
+
+    def _broadcast_agent_health(self, health: str, message: str = "") -> None:
+        """广播 agent 健康事件（LLM 调用出错 / 恢复）。
+
+        前端契约（经 publish_stream_event 发到 lobby + agent:{id} 频道）::
+
+            {"type": "agent_health", "agentId": ..., "projectId": ...,
+             "health": "error" | "ok", "message": "<错误摘要，截断 200 字符；ok 时为空串>",
+             "at": <毫秒时间戳>}
+
+        "agent_health" 不属于 _DELTA_ONLY_TYPES，因此会分发到 lobby。
+        广播失败静默吞掉 —— 绝不能因广播异常搞挂 agent。
+        """
+        try:
+            self._broadcast_stream_event({
+                "type": "agent_health",
+                "agentId": self.id,
+                "projectId": self.project_id,
+                "health": health,
+                "message": message[:200],
+                "at": int(time.time() * 1000),
+            })
+        except Exception as e:
+            log.warning(
+                "agent_health_broadcast_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
 
     # ── Streamer 回调 ────────────────────────────────────────
 
