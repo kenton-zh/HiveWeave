@@ -28,6 +28,11 @@ _MISSING_COLUMNS = [
     ("task_id", "TEXT"),
     ("wake", "INTEGER DEFAULT 1"),
     ("idempotency_key", "TEXT"),
+    # delivered: 是否进入过对话上下文。与 read/wake 正交——
+    # progress 类消息 wake=0（不触发 LLM）但必须能在下一次自然触发时
+    # 作为 background updates 捎带进上下文，否则证据类消息永久静默丢失。
+    # 存量行默认 1（视为已交付，避免迁移后历史消息倒灌）。
+    ("delivered", "INTEGER DEFAULT 1"),
 ]
 
 
@@ -155,11 +160,13 @@ class InboxService:
         await _ensure_schema(to_agent_id)
 
         # Progress: supersede prior unread progress from same sender
+        # 同时 delivered=1：被取代的旧进度不应再作为 background 回灌
         if category == "progress":
             try:
                 await project_db.execute(
                     to_agent_id,
-                    "UPDATE inbox SET read = 1 WHERE to_agent_id = ? AND read = 0 "
+                    "UPDATE inbox SET read = 1, delivered = 1 WHERE to_agent_id = ? "
+                    "AND read = 0 "
                     "AND from_agent_id = ? AND COALESCE(wake, 1) = 0",
                     [to_agent_id, from_agent_id],
                 )
@@ -195,7 +202,9 @@ class InboxService:
                     "message_type": message_type,
                     "priority": priority,
                     "expect_report": expect_report,
-                    "read": bool(existing.get("read")),
+                    # Row 对象无 .get（此前这里抛异常 → 落入 INSERT 撞 UNIQUE
+                    # → 返回未落库的幻影 id；修复后正确返回已存在行的 id）
+                    "read": bool(existing["read"]),
                     "created_at": int(time.time() * 1000),
                     "task_id": task_id,
                     "should_wake": False,
@@ -211,14 +220,21 @@ class InboxService:
         wake_int = 1 if wake_flag else 0
         # Non-waking progress: insert as already-read so watcher ignores
         read_int = 0 if wake_flag else 1
+        # delivered 语义（BUGFIX 消息静默丢失）：
+        # wake=1 的消息走 read=0 正常通道进上下文，无需 delivered 追踪（=1）。
+        # wake=0 的 progress/ACK 不唤醒 LLM，但**必须**在下一次自然触发时
+        # 作为 background updates 捎带进上下文（delivered=0 → 待捎带）。
+        # 此前 wake=0 直接 read=1 了事，导致验证通过/交付完成的证据类消息
+        # 永远不会进入接收方上下文（CEO 看不到下属的成果证据）。
+        delivered_int = 1 if wake_flag else 0
 
         try:
             await project_db.execute(
                 to_agent_id,
                 "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, read, "
                 "created_at, message_type, expect_report, priority, task_id, "
-                "wake, idempotency_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "wake, idempotency_key, delivered) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     msg_id,
                     from_agent_id,
@@ -232,6 +248,7 @@ class InboxService:
                     task_id,
                     wake_int,
                     key,
+                    delivered_int,
                 ],
             )
         except Exception as e:
@@ -317,14 +334,42 @@ class InboxService:
         )
         return [self._row_to_msg(r) for r in rows]
 
+    async def get_undelivered_background(
+        self, agent_id: str, limit: int = 20
+    ) -> list[dict]:
+        """wake=0 且尚未进过任何对话上下文的消息（progress/ACK 类）。
+
+        这些消息不触发 LLM（wake=0），但必须在 agent 因其他原因自然醒来时
+        捎带进上下文（作为 background updates），否则交付证据类信息永久丢失。
+        """
+        await _ensure_schema(agent_id)
+        rows = await project_db.query(
+            agent_id,
+            "SELECT id, from_agent_id, to_agent_id, message, read, created_at, "
+            "message_type, expect_report, priority, task_id, "
+            "COALESCE(wake, 1) AS wake "
+            "FROM inbox "
+            "WHERE to_agent_id = ? AND COALESCE(wake, 1) = 0 "
+            "AND COALESCE(delivered, 1) = 0 "
+            "ORDER BY created_at ASC LIMIT ?",
+            [agent_id, limit],
+        )
+        return [self._row_to_msg(r) for r in rows]
+
     async def mark_read_by_ids(self, agent_id: str, message_ids: list[str]) -> None:
+        """标记消息已读 + 已交付（进过上下文）。
+
+        delivered 与 read 同步置 1：凡是进入过对话上下文的消息（无论 wake 通道
+        还是 background 捎带）都视为已交付，不再重复捎带。
+        """
         if not message_ids:
             return
         await _ensure_schema(agent_id)
         placeholders = ", ".join(["?"] * len(message_ids))
         await project_db.execute(
             agent_id,
-            f"UPDATE inbox SET read = 1 WHERE to_agent_id = ? AND id IN ({placeholders})",
+            f"UPDATE inbox SET read = 1, delivered = 1 "
+            f"WHERE to_agent_id = ? AND id IN ({placeholders})",
             [agent_id] + message_ids,
         )
 
@@ -332,7 +377,8 @@ class InboxService:
         await _ensure_schema(agent_id)
         await project_db.execute(
             agent_id,
-            "UPDATE inbox SET read = 1 WHERE to_agent_id = ? AND read = 0",
+            "UPDATE inbox SET read = 1, delivered = 1 "
+            "WHERE to_agent_id = ? AND read = 0",
             [agent_id],
         )
 
@@ -350,7 +396,8 @@ class InboxService:
         try:
             await project_db.execute(
                 agent_id,
-                f"UPDATE inbox SET read = 1 WHERE to_agent_id = ? AND read = 0 "
+                f"UPDATE inbox SET read = 1, delivered = 1 "
+                f"WHERE to_agent_id = ? AND read = 0 "
                 f"AND ({clauses})",
                 params,
             )
