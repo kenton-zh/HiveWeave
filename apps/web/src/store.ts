@@ -32,6 +32,19 @@ export interface AgentAlarmInfo {
   sampledAt: number;
 }
 
+/**
+ * Latest health state for an agent, driven by lobby "agent_health" events
+ * ({ type, agentId, projectId, health: "error" | "ok", message, at }).
+ * Nodes read this to turn their card red on LLM/model call errors.
+ * `projectId` lets nodes ignore stale entries from a previously open project.
+ */
+export interface AgentHealthInfo {
+  health: "error" | "ok";
+  message: string;
+  at: number;
+  projectId?: string;
+}
+
 interface AppState {
   selectedAgentId: string | null;
   setSelectedAgent: (id: string | null) => void;
@@ -87,6 +100,10 @@ interface AppState {
   // Pending scheduled alarms — soonest alarm per agent (keyed by toAgentId)
   agentAlarms: Record<string, AgentAlarmInfo>;
   setAgentAlarms: (alarms: Record<string, AgentAlarmInfo>) => void;
+  // Agent health — lobby "agent_health" events flag agents with LLM/model errors
+  agentHealth: Record<string, AgentHealthInfo>;
+  setAgentHealth: (agentId: string, info: AgentHealthInfo | null) => void;
+  clearAgentHealth: () => void;
   // Pending initial message — set by NewProjectDialog, consumed by ChatPanel on mount
   pendingInitialMessage: { agentId: string; message: string } | null;
   setPendingInitialMessage: (msg: { agentId: string; message: string } | null) => void;
@@ -279,6 +296,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   // Pending scheduled alarms
   agentAlarms: {},
   setAgentAlarms: (alarms) => set({ agentAlarms: alarms }),
+  // Agent health (LLM/model call errors) — "ok" (or null) clears the entry
+  agentHealth: {},
+  setAgentHealth: (agentId, info) =>
+    set((state) => {
+      const next = { ...state.agentHealth };
+      if (!info || info.health === "ok") {
+        if (!(agentId in next)) return state; // nothing to clear
+        delete next[agentId];
+      } else {
+        const prev = next[agentId];
+        if (prev && prev.message === info.message && prev.at === info.at) return state;
+        next[agentId] = info;
+      }
+      return { agentHealth: next };
+    }),
+  clearAgentHealth: () =>
+    set((state) =>
+      Object.keys(state.agentHealth).length ? { agentHealth: {} } : state
+    ),
   // Pending initial message
   pendingInitialMessage: null,
   setPendingInitialMessage: (msg) => set({ pendingInitialMessage: msg }),
@@ -288,6 +324,38 @@ export const useAppStore = create<AppState>((set, get) => ({
   _activityFeedInternal: [] as ActivityEntry[],
   _activityRafPending: false,
   addActivity: (entry) => {
+    // Intercept lobby "agent_health" events (not an ActivityEntry — arrives via
+    // `as any`): they only drive the agentHealth map that turns org-tree node
+    // cards red, and never enter the activity feed.
+    const rawEvent = entry as unknown as {
+      type?: string;
+      agentId?: string;
+      projectId?: string;
+      health?: string;
+      message?: unknown;
+      at?: unknown;
+    };
+    if (rawEvent?.type === "agent_health") {
+      const agentId = rawEvent.agentId;
+      if (typeof agentId === "string" && agentId) {
+        if (rawEvent.health === "ok") {
+          get().setAgentHealth(agentId, null);
+        } else {
+          get().setAgentHealth(agentId, {
+            health: "error",
+            message:
+              typeof rawEvent.message === "string"
+                ? rawEvent.message
+                : String(rawEvent.message ?? ""),
+            at: typeof rawEvent.at === "number" ? rawEvent.at : Date.now(),
+            projectId:
+              typeof rawEvent.projectId === "string" ? rawEvent.projectId : undefined,
+          });
+        }
+      }
+      return;
+    }
+
     const st = get();
     const feed = st._activityFeedInternal;
 

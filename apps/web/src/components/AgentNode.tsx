@@ -1,4 +1,4 @@
-﻿import { memo } from "react";
+import { memo } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { useAppStore } from "../store";
 
@@ -39,6 +39,8 @@ function AgentNode({ data, id }: NodeProps) {
   const processingAgents = useAppStore((s) => s.processingAgents);
   const agentDispositions = useAppStore((s) => s.agentDispositions);
   const userPingAgentIds = useAppStore((s) => s.userPingAgentIds);
+  const agentHealth = useAppStore((s) => s.agentHealth);
+  const selectedProjectId = useAppStore((s) => s.selectedProjectId);
 
   const isSelected = selectedAgentId === id;
   const role = (data.role as string) || "module_dev";
@@ -79,6 +81,16 @@ function AgentNode({ data, id }: NodeProps) {
   const onApprovalClick = data.onApprovalClick as ((agentId: string) => void) | undefined;
   const hasUserPing = userPingAgentIds.includes(id);
 
+  // Health error (LLM/model call failure) — red card + ⚠ icon until an "ok"
+  // event clears it. Ignore stale entries from other projects.
+  const healthInfo = agentHealth[id];
+  const healthError =
+    healthInfo &&
+    healthInfo.health === "error" &&
+    (!healthInfo.projectId || healthInfo.projectId === selectedProjectId)
+      ? healthInfo
+      : null;
+
   return (
     <div
       onClick={() => setSelectedAgent(id)}
@@ -86,7 +98,11 @@ function AgentNode({ data, id }: NodeProps) {
         w-[200px] h-[80px] rounded-gm bg-white border transition-all duration-200
         cursor-pointer flex flex-col justify-center px-4 gap-2 relative
         hover:border-g-blue/50 hover:shadow-gm-md
-        ${isSelected ? "border-g-blue shadow-gm-md ring-1 ring-g-blue/20" : "border-g-border shadow-gm-sm"}
+        ${healthError
+          ? "border-red-500 ring-2 ring-red-400/40 shadow-[0_0_12px_rgba(239,68,68,0.35)]"
+          : isSelected
+            ? "border-g-blue shadow-gm-md ring-1 ring-g-blue/20"
+            : "border-g-border shadow-gm-sm"}
       `}
     >
       {/* Target handle (top) */}
@@ -134,6 +150,16 @@ function AgentNode({ data, id }: NodeProps) {
       {/* Agent Name + Status */}
       <div className="flex items-center gap-2">
         <span className={`w-2 h-2 rounded-full shrink-0 ${statusColor}`} />
+        {healthError && (
+          <span
+            className="shrink-0 text-red-500 flex items-center"
+            title={`模型/LLM 调用出错：${healthError.message || "未知错误"}`}
+          >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+            </svg>
+          </span>
+        )}
         <span className="text-sm font-medium text-g-fg truncate">
           {displayName}
         </span>

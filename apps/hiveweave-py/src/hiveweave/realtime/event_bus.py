@@ -16,7 +16,7 @@
 
 事件转发规则（契约 12: PubSub 事件转发）：
 - text_delta / thinking_delta / start → 仅 agent 频道
-- tool_call_start / tool_call_end / done / error → agent + lobby 频道
+- tool_call_start / tool_call_end / done / error / agent_health → agent + lobby 频道
 - status_change → lobby + agent + project 频道
 """
 
@@ -289,7 +289,7 @@ class StatusEventBus:
 
         转发规则：
         - text_delta / thinking_delta / start → 仅 ``agent:{agent_id}`` 频道
-        - tool_call_start / tool_call_end / done / error → agent + lobby 频道
+        - tool_call_start / tool_call_end / done / error / agent_health → agent + lobby 频道
 
         同时缓冲到 recent_activity（lobby replay 用）和 per-agent replay
         buffer（参考 DeepTutor StreamBus replay 模式）。
