@@ -167,6 +167,13 @@ SAFETY_BUFFER_TOKENS = 20_000
 OUTPUT_TOKEN_GLOBAL_CAP = 32_000
 """非 reasoning 模型的 max_tokens 全局上限。"""
 
+CONTINUE_SENTINEL = "(continue)"
+"""网关兼容性哨兵：追加在请求末尾的静态 user 消息。
+
+见 _stream_single_round 的 FIX(gateway-tool-id-400) 注释。
+保持内容恒定且极短（约 1 token），不改变模型行为。
+"""
+
 TOTAL_TIMEOUT_S = 540.0
 """整个 stream 调用的总超时（兜底防线）。
 
@@ -1092,8 +1099,23 @@ class Streamer:
         """
         url = provider.build_url()
         headers = provider.build_headers()
+
+        # FIX(gateway-tool-id-400): opencode zen go 网关（Console Go）在请求
+        # 尾部为 tool/system 消息时，会校验尾部 tool_call id 链的签名；
+        # 跨连接/跨节点回声历史 id 会被判为未知 id，整包拒绝并返回
+        # HTTP 400 invalid_request_error（agent 多轮工具循环被 doom 的根因，
+        # 实测：末尾为 tool 消息 + 非本网关签发 id → 必 400）。
+        # 在请求末尾追加一条静态 user 哨兵消息即可跳过该校验（实测 200），
+        # 模型行为不受影响。注意只追加到请求副本，不回写 messages，
+        # 避免污染 tool_turn_messages 持久化历史。
+        req_messages = messages
+        if req_messages and req_messages[-1].get("role") != "user":
+            req_messages = [
+                *req_messages,
+                {"role": "user", "content": CONTINUE_SENTINEL},
+            ]
         body = provider.build_body(
-            messages=messages,
+            messages=req_messages,
             stream=True,
             tools=tools,
         )
