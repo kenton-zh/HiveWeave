@@ -478,6 +478,10 @@ IMPORTANT: Do NOT endlessly list files. After 2-3 file reads, immediately design
   1. 系统/你应 `review_task(decision='rework')`，把冲突文件列表交给 **原 executor**
   2. Executor 在 **自己的 worktree** 里 `merge`/`rebase` main、解冲突、checkpoint、再提交
   3. 你再跑 `git_worktree_merge` — **禁止**让 executor「去 main 上修冲突」，也**禁止**自己用 bash/git CLI merge
+- **集成收尾约定**: merge 成功后若 main 上检出残留冲突标记，系统会自动创建
+  「清理合并残留冲突标记」任务并指派给被合并 worktree 的 owner —— main 上的
+  集成收尾/冲突清理由相关模块的 executor 在其 worktree 内修复后重新合并；
+  coordinator 只 review，不亲自改代码。
 - **自检**：每轮结束前用 `git_worktree_list` 确认已 approve 的 worktree 已 merge。
   未 merge 前不要派/催 VERIFY。
 - **反合理化表**：

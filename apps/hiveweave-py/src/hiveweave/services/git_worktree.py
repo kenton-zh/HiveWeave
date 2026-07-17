@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
 from pathlib import Path
@@ -63,6 +64,53 @@ def _worktree_path(workspace_path: str, short_id: str) -> str:
 
 def _has_git(path: str) -> bool:
     return (Path(path) / ".git").exists()
+
+
+# ── 冲突标记扫描 (merge 成功后 main 树残留检测) ─────────────
+# 行首锚定 <<<<<<< / >>>>>>> (标准 git conflict marker, 7 字符)。
+# 故意不含 ^={7} — 一行等号同时是 setext 标题下划线, 误报率高。
+_CONFLICT_MARKER_RE = re.compile(r"^(?:<{7}|>{7})", re.MULTILINE)
+
+# 扫描时跳过的目录: 系统目录 / 依赖 / 构建产物 (口径与 ensure_git_repo
+# 生成的 .gitignore 一致, 另含 worktree 宿主目录 .hiveweave)
+_MARKER_SCAN_SKIP_DIRS = frozenset({
+    ".git", ".hiveweave", "node_modules", "dist", "build",
+    ".next", ".nuxt", ".turbo", ".venv", "venv", "__pycache__",
+    ".cache", "coverage", ".idea", ".vscode",
+})
+
+_MARKER_SCAN_MAX_BYTES = 1_000_000  # 大文件跳过 (大概率是产物/压缩包)
+_MARKER_SCAN_MAX_HITS = 50          # 报告上限, 防止异常输出刷屏
+
+
+def scan_conflict_markers(root: str) -> list[str]:
+    """Scan *root* for unresolved git conflict markers (merge 后残留检测).
+
+    行首锚定 ``<<<<<<<`` / ``>>>>>>>``。只扫文本文件 — 跳过
+    .git/.hiveweave/node_modules/dist/build 等目录、含 NUL 字节的二进制
+    文件、以及 >1MB 的大文件。返回 POSIX 风格相对路径的排序列表。
+    """
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return []
+    hits: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        dirnames[:] = [d for d in dirnames if d not in _MARKER_SCAN_SKIP_DIRS]
+        for name in filenames:
+            if len(hits) >= _MARKER_SCAN_MAX_HITS:
+                return sorted(hits)
+            fpath = Path(dirpath) / name
+            try:
+                if fpath.stat().st_size > _MARKER_SCAN_MAX_BYTES:
+                    continue
+                raw = fpath.read_bytes()
+            except OSError:
+                continue
+            if b"\x00" in raw[:8192]:
+                continue  # 二进制文件不扫
+            if _CONFLICT_MARKER_RE.search(raw.decode("utf-8", errors="replace")):
+                hits.append(fpath.relative_to(root_path).as_posix())
+    return sorted(hits)
 
 
 async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT) -> tuple[bool, str]:
@@ -384,9 +432,17 @@ coverage/
         # Auto-remove worktree + branch on success (契约 09 RECONCILE)
         await self.delete(workspace_path, short_id, task_name)
 
+        # merge 成功 ≠ main 干净 — 残留冲突标记会随提交一并落地。
+        # 扫描目标树并随结果返回, 由调用方 (git_worktree_merge tool) 路由清理。
+        marker_files = scan_conflict_markers(workspace_path)
+        if marker_files:
+            log.warning("git_worktree.merge_markers_found",
+                        short_id=short_id, target=target_branch,
+                        files=marker_files[:10])
+
         log.info("git_worktree.merge", short_id=short_id,
                  target=target_branch, hash=head if ok else "")
-        return {
+        result = {
             "success": True,
             "merged": True,
             "hash": head if ok else "",
@@ -394,6 +450,9 @@ coverage/
             "files": branch_files,
             "short_id": short_id,
         }
+        if marker_files:
+            result["conflict_markers"] = marker_files
+        return result
 
     async def merge_by_branch(self, workspace_path: str, branch: str,
                               target_branch: str = "main") -> dict:
@@ -541,6 +600,13 @@ coverage/
             except Exception:
                 pass  # worktree 可能已不存在
 
+        # merge 成功 ≠ main 干净 — 扫描残留冲突标记, 交给调用方路由清理
+        marker_files = scan_conflict_markers(workspace_path)
+        if marker_files:
+            log.warning("git_worktree.merge_markers_found",
+                        branch=branch, target=target_branch,
+                        files=marker_files[:10])
+
         log.info("git_worktree.merge_by_branch", branch=branch,
                  target=target_branch, hash=head if ok else "",
                  warnings=verification_errors)
@@ -554,6 +620,8 @@ coverage/
         }
         if verification_errors:
             result["warnings"] = verification_errors
+        if marker_files:
+            result["conflict_markers"] = marker_files
         return result
 
     # ── 4. ROLLBACK ─────────────────────────────────────────

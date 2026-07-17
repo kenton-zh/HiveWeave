@@ -15,6 +15,7 @@ import structlog
 
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
+from hiveweave.services.org import PERMISSION_LABEL_LEGEND, PERMISSION_TYPE_LABELS
 
 log = structlog.get_logger(__name__)
 
@@ -184,7 +185,7 @@ class RosterService:
     async def get_roster(self, project_id: str) -> str:
         """Get formatted roster text for a project.
 
-        契约 17: markdown 格式，每条含 name/short_id/role + position/department/...
+        契约 17: markdown 格式，每条含 name/short_id/role/权限标签 + position/department/...
 
         真相源归一到 per-project DB 的 agents 表（HR 招聘自动写入），
         personnel_records 通过 LEFT JOIN 补齐 position/department/responsibilities
@@ -199,7 +200,7 @@ class RosterService:
         conn = await _conn(project_id)
         try:
             cursor = await conn.execute(
-                "SELECT id, short_id, name, role, status "
+                "SELECT id, short_id, name, role, permission_type, status "
                 "FROM agents WHERE project_id = ? AND status != 'archived' "
                 "ORDER BY short_id", [project_id])
             agents_rows = await cursor.fetchall()
@@ -234,11 +235,14 @@ class RosterService:
             name = a["name"] or ""
             role = a["role"] or ""
             agent_status = a["status"] or "active"
+            # 可读权限标签: 与组织通讯录一致, 防止把代码任务派给只读协调者
+            perm = str(a["permission_type"] or "executor")
+            perm_label = PERMISSION_TYPE_LABELS.get(perm.lower(), perm)
 
             if short_id:
-                header = f"{name} ({short_id}) — {role}"
+                header = f"{name} ({short_id}) — {role} [{perm_label}]"
             else:
-                header = f"{name} — {role}"
+                header = f"{name} — {role} [{perm_label}]"
 
             r = records_by_agent.get(agent_id)
             lines = [header]
@@ -254,4 +258,5 @@ class RosterService:
 
             entries.append("\n".join(lines))
 
-        return "## Personnel Roster\n\n" + "\n---\n".join(entries)
+        return ("## Personnel Roster\n\n" + PERMISSION_LABEL_LEGEND + "\n\n"
+                + "\n---\n".join(entries))
