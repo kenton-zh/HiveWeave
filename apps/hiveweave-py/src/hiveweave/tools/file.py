@@ -305,11 +305,15 @@ async def list_files(
     workspace_path: str,
     recursive: bool = False,
     maxdepth: int = 1,
+    include_ignored: bool = False,
 ) -> dict[str, Any]:
     """List directory contents with [DIR]/[FILE] tags and sizes.
 
     BUG-019 修复：支持 recursive + maxdepth 参数，让 CEO 一次看多层目录，
     避免反复调 list_files 探索不同目录导致首次 chat 30s+。
+
+    include_ignored: 列出被 IGNORED_DIRS 屏蔽的 .hiveweave 子目录——
+    coordinator 审查 worktree 代码时需要（默认 .hiveweave 整目录被跳过）。
     """
     ws = workspace_path or "."
     depth = max(1, min(maxdepth, 3)) if recursive else 1
@@ -349,6 +353,14 @@ async def list_files(
         full = str(Path(ws).resolve())
 
     p = Path(full)
+    # worktrees 内的列表自动放开 ignore 过滤（审查场景）
+    try:
+        rel = p.resolve().relative_to(Path(ws).resolve())
+        if len(rel.parts) >= 2 and rel.parts[0] == HIVEWEAVE_DIR \
+           and rel.parts[1] == "worktrees":
+            include_ignored = True
+    except ValueError:
+        pass
     if not p.exists():
         return {"success": False, "output": "",
                 "error": f"Error: Directory not found: {path}"}
@@ -358,6 +370,8 @@ async def list_files(
 
     lines: list[str] = []
     count = 0
+    # include_ignored（审查 worktree 场景）：放开 .hiveweave 目录过滤
+    ignored = IGNORED_DIRS - {HIVEWEAVE_DIR} if include_ignored else IGNORED_DIRS
 
     def _walk(d: Path, prefix: str, current_depth: int):
         nonlocal count
@@ -371,7 +385,7 @@ async def list_files(
                 if not any("truncated" in l for l in lines[-1:]):
                     lines.append(f"... (truncated at {MAX_LIST_FILES} entries)")
                 return
-            if entry.is_dir() and entry.name in IGNORED_DIRS:
+            if entry.is_dir() and entry.name in ignored:
                 continue
             try:
                 rel = entry.relative_to(p)
@@ -460,6 +474,12 @@ class ListFilesParams(BaseModel):
         le=3,
         description="Max depth when recursive (1-3). Default: 1.",
     )
+    include_ignored: bool = Field(
+        default=False,
+        description="Also list .hiveweave subdirectories (e.g. worktrees when "
+        "reviewing executor code). Default: false.",
+        json_schema_extra={"aliases": ["include_ignored", "no_ignore"]},
+    )
 
 
 @tool(
@@ -512,6 +532,7 @@ async def list_files_tool(params: ListFilesParams, agent_id: str, workspace: str
         workspace_path=workspace,
         recursive=params.recursive,
         maxdepth=params.maxdepth,
+        include_ignored=params.include_ignored,
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])

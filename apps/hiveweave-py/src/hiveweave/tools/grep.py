@@ -78,6 +78,7 @@ def _format_results(matches: list[dict[str, Any]]) -> str:
 async def _try_ripgrep(
     cwd: str, pattern: str, include: str | None,
     limit: int, context: int, multiline: bool,
+    include_ignored: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Try ripgrep; return None if rg is unavailable.
 
@@ -85,6 +86,9 @@ async def _try_ripgrep(
     避免大目录扫描全量输出载入内存。
     """
     args = ["rg", "--line-number", "--no-heading", "--color=never"]
+    if include_ignored:
+        # 审查 worktree 等被 gitignore/隐藏规则屏蔽的目录
+        args.extend(["--no-ignore-vcs", "--hidden"])
     if multiline:
         args.append("-U")
     if context > 0:
@@ -155,7 +159,9 @@ async def _try_ripgrep(
     return matches
 
 
-def _walk_files(root: Path, include: str | None) -> list[Path]:
+def _walk_files(
+    root: Path, include: str | None, include_ignored: bool = False
+) -> list[Path]:
     """Walk the tree, returning files that match the include glob (if any)."""
     out: list[Path] = []
     if include:
@@ -168,11 +174,12 @@ def _walk_files(root: Path, include: str | None) -> list[Path]:
     else:
         glob_re = None
 
+    ignored = IGNORED_DIRS - {".hiveweave"} if include_ignored else IGNORED_DIRS
     for path in root.rglob("*"):
         if not path.is_file():
             continue
         # Skip ignored dirs
-        if any(part in IGNORED_DIRS for part in path.parts):
+        if any(part in ignored for part in path.parts):
             continue
         if path.stat().st_size > MAX_FILE_SIZE:
             continue
@@ -185,6 +192,7 @@ def _walk_files(root: Path, include: str | None) -> list[Path]:
 def _scan_python(
     root: Path, pattern: str, include: str | None,
     head_limit: int, context: int, multiline: bool,
+    include_ignored: bool = False,
 ) -> list[dict[str, Any]]:
     """Fallback grep using Python's re module."""
     try:
@@ -197,7 +205,7 @@ def _scan_python(
         raise ValueError(f"Invalid regex: {exc}") from exc
 
     matches: list[dict[str, Any]] = []
-    files = _walk_files(root, include)
+    files = _walk_files(root, include, include_ignored=include_ignored)
     root_str = str(root)
     for fp in files:
         try:
@@ -245,11 +253,17 @@ async def execute_grep(
     context: int = 0,
     multiline: bool = False,
     max_results: int = 500,
+    include_ignored: bool = False,
 ) -> dict[str, Any]:
     """Search files for a regex pattern. Returns {success, output, error}.
 
     R4: max_results 控制结果上限（默认 500），达到上限后停止搜索。
     head_limit（若提供）与 max_results 取较小值作为有效上限。
+
+    include_ignored: 跳过 gitignore/hidden/IGNORED_DIRS 过滤——
+    coordinator 审查 worktree 代码时需要（.hiveweave/worktrees 默认被
+    rg 的 gitignore 规则和内置 IGNORED_DIRS 双重屏蔽，井字棋实测 #4）。
+    搜索路径位于 .hiveweave/worktrees 下时自动开启。
     """
     if not pattern:
         return {"success": False, "output": "",
@@ -260,6 +274,17 @@ async def execute_grep(
         return {"success": False, "output": "",
                 "error": "Error: Sandbox violation - "
                          "path must be within workspace"}
+
+    # worktrees 内的搜索自动放开 ignore 过滤（审查场景）
+    try:
+        rel_to_ws = Path(search_path).resolve().relative_to(
+            Path(workspace_path).resolve()
+        )
+        if len(rel_to_ws.parts) >= 2 and rel_to_ws.parts[0] == ".hiveweave" \
+           and rel_to_ws.parts[1] == "worktrees":
+            include_ignored = True
+    except ValueError:
+        pass
 
     # .hiveweave 系统目录保护 — 拒绝显式搜索系统目录（data.db 等不应被 grep）
     from hiveweave.tools.file import _check_hiveweave_dir, HIVEWEAVE_DIR
@@ -282,7 +307,8 @@ async def execute_grep(
 
     # 1. Try ripgrep first
     rg_matches = await _try_ripgrep(
-        search_path, pattern, include, limit, context, multiline
+        search_path, pattern, include, limit, context, multiline,
+        include_ignored=include_ignored,
     )
     if rg_matches is not None:
         # 过滤敏感文件路径的匹配（C6）— 不暴露 .env / *.pem / credentials 等内容
@@ -297,7 +323,8 @@ async def execute_grep(
     # 2. Fallback to Python scan
     try:
         matches = _scan_python(
-            Path(search_path), pattern, include, limit, context, multiline
+            Path(search_path), pattern, include, limit, context, multiline,
+            include_ignored=include_ignored,
         )
     except ValueError as exc:
         return {"success": False, "output": "",
@@ -353,6 +380,12 @@ class GrepParams(BaseModel):
         description="Number of context lines to show around each match. Default: 0.",
         json_schema_extra={"aliases": ["context_lines", "before_after"]},
     )
+    include_ignored: bool = Field(
+        default=False,
+        description="Search inside gitignored/hidden dirs too (e.g. "
+        ".hiveweave/worktrees when reviewing executor code). Default: false.",
+        json_schema_extra={"aliases": ["include_ignored", "no_ignore"]},
+    )
     head_limit: int = Field(
         default=500,
         ge=1,
@@ -393,6 +426,7 @@ async def grep_tool(params: GrepParams, agent_id: str, workspace: str) -> ToolRe
         head_limit=params.head_limit,
         multiline=params.multiline,
         workspace_path=workspace,
+        include_ignored=params.include_ignored,
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])
