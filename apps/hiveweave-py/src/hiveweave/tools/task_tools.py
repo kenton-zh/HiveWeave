@@ -1179,6 +1179,104 @@ async def review_task_tool(
         return ToolResult.err(f"Failed to review task: {e}")
 
 
+# ── cancel_task / unclaim_task ────────────────────────────────
+
+
+class CancelTaskParams(BaseModel):
+    """Parameters for cancel_task tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    task_id: str = Field(
+        alias="taskId",
+        description="ID of the task to cancel/archive.",
+        json_schema_extra={"aliases": ["taskId", "task_id", "id"]},
+    )
+    reason: str = Field(
+        description="Why this task is being cancelled (required, for audit).",
+    )
+
+
+@tool(
+    "cancel_task",
+    "Cancel/archive a task that was created by mistake or is no longer needed "
+    "(coordinator only). Archived tasks disappear from all task lists and "
+    "obligations. Use for mis-assigned or obsolete tasks instead of leaving "
+    "them stuck in claimed/blocked forever.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def cancel_task_tool(
+    params: CancelTaskParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """废弃误建/误绑/过时的任务（可审计的正式通道）。
+
+    背景：此前没有废弃路径，误绑 task 永远卡在 claimed（井字棋实测 #5）。
+    """
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project")
+
+    reason = (params.reason or "").strip()
+    if not reason:
+        return ToolResult.err("cancel_task requires a non-empty 'reason'.")
+
+    ts = TaskService()
+    try:
+        from_status = await ts.archive_task(
+            project_id, params.task_id, archived_by=agent_id, reason=reason
+        )
+    except ValueError as e:
+        return ToolResult.err(str(e))
+    except Exception as e:
+        return ToolResult.err(f"Failed to cancel task: {e}")
+    return ToolResult.ok(
+        f"Task {params.task_id} archived (was '{from_status}'). "
+        f"It no longer appears in task lists or obligations."
+    )
+
+
+class UnclaimTaskParams(BaseModel):
+    """Parameters for unclaim_task tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    task_id: str = Field(
+        alias="taskId",
+        description="ID of the task to release back to 'created' for reassignment.",
+        json_schema_extra={"aliases": ["taskId", "task_id", "id"]},
+    )
+
+
+@tool(
+    "unclaim_task",
+    "Release a claimed task back to 'created' and clear its assignee "
+    "(coordinator only). Use when a task was claimed by the wrong agent: "
+    "unclaim, then dispatch to the right one — no zombie task left behind.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def unclaim_task_tool(
+    params: UnclaimTaskParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """释放误绑的认领（claimed → created，清空 assignee）。"""
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project")
+
+    ts = TaskService()
+    try:
+        await ts.unclaim_task(project_id, params.task_id)
+    except ValueError as e:
+        return ToolResult.err(str(e))
+    except Exception as e:
+        return ToolResult.err(f"Failed to unclaim task: {e}")
+    return ToolResult.ok(
+        f"Task {params.task_id} released to 'created' (assignee cleared). "
+        f"Dispatch it to the correct agent now."
+    )
+
+
 # ── waive_attestation ────────────────────────────────────────
 
 

@@ -218,6 +218,38 @@ async def claim_task(project_id: str, task_id: str, body: TaskClaim) -> dict:
     return {"success": True}
 
 
+class TaskArchive(BaseModel):
+    reason: str
+    actorAgentId: str | None = None
+
+
+@router.post("/{task_id}/archive")
+async def archive_task(project_id: str, task_id: str, body: TaskArchive) -> dict:
+    """废弃任务（任意非 closed 状态 → archived，人类操作者通道）。"""
+    if not (body.reason or "").strip():
+        raise HTTPException(status_code=400, detail="reason is required")
+    try:
+        from_status = await _tasks.archive_task(
+            project_id,
+            task_id,
+            archived_by=(body.actorAgentId or "human-operator"),
+            reason=body.reason,
+        )
+    except ValueError as e:
+        _raise_from_value_error(e)
+    return {"success": True, "fromStatus": from_status}
+
+
+@router.post("/{task_id}/unclaim")
+async def unclaim_task(project_id: str, task_id: str) -> dict:
+    """释放认领（claimed → created，清空 assignee，供重新分配）。"""
+    try:
+        await _tasks.unclaim_task(project_id, task_id)
+    except ValueError as e:
+        _raise_from_value_error(e)
+    return {"success": True}
+
+
 @router.post("/{task_id}/submit")
 async def submit_task(project_id: str, task_id: str, body: TaskSubmit) -> dict:
     """提交任务（running → submitted），附 evidence + attestation gate."""

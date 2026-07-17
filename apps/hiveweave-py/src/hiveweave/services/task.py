@@ -68,6 +68,10 @@ _MISSING_COLUMNS = [
     ("wait_kind", "TEXT"),
     ("wake_at", "INTEGER"),
     ("policy_id", "TEXT"),
+    # archive 审计字段（cancel_task 工具写入）：谁在什么时间为什么废弃
+    ("archived_by", "TEXT"),
+    ("archived_reason", "TEXT"),
+    ("archived_at", "INTEGER"),
 ]
 _migrated: set[str] = set()
 
@@ -470,6 +474,83 @@ class TaskService:
             "UPDATE tasks SET closed_at = ?, updated_at = ? WHERE id = ?",
             [now_ms, now_ms, task_id])
         await self._wake_dependent_tasks(project_id, task_id)
+
+    async def archive_task(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        archived_by: str,
+        reason: str,
+    ) -> str:
+        """废弃任务（任意非 closed 状态 → archived）。coordinator 纠错通道。
+
+        背景（井字棋实测 #5）：误绑的 task 卡在 claimed，状态机无出口
+        （claimed 只能 →running/created），没有废弃路径 → 僵尸任务永远挂着，
+        还会一直占据 assignee 的 obligations 导致 exit-gate 误判。
+
+        archive 不走 _TRANSITIONS（它是生命周期外的纠偏操作，不是状态机的一环），
+        但必须留审计痕迹：archived_by / archived_reason / archived_at。
+        所有查询（list/obligations/stall）已过滤 is_archived=0，立即生效。
+
+        Returns: 任务废弃前的状态。
+        """
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("archive_task requires a non-empty reason (audit)")
+        await _ensure_schema(project_id)
+        rows = await _query(
+            project_id,
+            "SELECT status, is_archived FROM tasks WHERE id = ?", [task_id],
+        )
+        if not rows:
+            raise ValueError(f"Task not found: {task_id}")
+        current, is_arch = rows[0]["status"], rows[0]["is_archived"]
+        if is_arch:
+            raise ValueError(f"Task {task_id[:8]} is already archived")
+        if current == "closed":
+            raise ValueError(
+                f"Task {task_id[:8]} is already closed; archiving is a no-op. "
+                "Closed tasks are the terminal success state."
+            )
+        now_ms = int(time.time() * 1000)
+        await _execute(
+            project_id,
+            "UPDATE tasks SET is_archived = 1, archived_by = ?, "
+            "archived_reason = ?, archived_at = ?, wake_at = NULL, "
+            "updated_at = ? WHERE id = ?",
+            [archived_by, reason[:500], now_ms, now_ms, task_id],
+        )
+        log.info(
+            "task_archived",
+            project_id=project_id,
+            task_id=task_id,
+            from_status=current,
+            archived_by=archived_by,
+            reason=reason[:120],
+        )
+        return current
+
+    async def unclaim_task(self, project_id: str, task_id: str) -> None:
+        """释放认领（claimed → created），清空 assignee 供重新分配。
+
+        误绑纠正的另一半：coordinator 把任务绑错人后，release 回 created
+        再 dispatch 给正确的人（不必像过去那样新建任务、留僵尸）。
+        """
+        rows = await _query(
+            project_id, "SELECT status FROM tasks WHERE id = ?", [task_id]
+        )
+        if not rows:
+            raise ValueError(f"Task not found: {task_id}")
+        await self._transition(project_id, task_id, "created")
+        now_ms = int(time.time() * 1000)
+        await _execute(
+            project_id,
+            "UPDATE tasks SET assignee_id = NULL, claimed_at = NULL, "
+            "updated_at = ? WHERE id = ?",
+            [now_ms, task_id],
+        )
+        log.info("task_unclaimed", project_id=project_id, task_id=task_id)
 
     async def mark_verifying(self, project_id: str, task_id: str) -> None:
         """Parent task enters verifying after VERIFY child is spawned."""

@@ -79,6 +79,8 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "unbind_skill": frozenset({Capability.BIND_SKILL}),
     "create_task": frozenset({Capability.DISPATCH}),
     "dispatch_task": frozenset({Capability.DISPATCH}),
+    "cancel_task": frozenset({Capability.DISPATCH}),
+    "unclaim_task": frozenset({Capability.DISPATCH}),
     "review_task": frozenset({Capability.REVIEW}),
     "waive_attestation": frozenset({Capability.REVIEW}),
     "git_worktree_create": frozenset({Capability.MERGE}),
