@@ -24,6 +24,40 @@ _DEFAULT_CONTEXT_WINDOW = 128_000
 _DEFAULT_MAX_OUTPUT = 8_192
 
 
+class InvalidModelConfig(ValueError):
+    """模型配置违反物理不变量（如 max_output_tokens >= context_window）。
+
+    治本设计：非法配置必须在 Service 层被拒绝，而非 clamp 后悄悄落库。
+    上游（检测层/Pydantic/API）正常情况下不会产出非法值，此异常作为
+    最后防线——一旦触发说明上游有 bug，应让调用方明确感知并修复，
+    而不是用 clamp 掩盖后让带病配置流入运行时。
+    """
+
+
+def _validate_invariant(context_window: int, max_output_tokens: int) -> None:
+    """强制物理不变量：max_output_tokens 必须严格小于 context_window。
+
+    语义：输出预算不可能吃掉整个窗口，必须给输入留空间。
+    违反则抛 InvalidModelConfig，绝不 clamp。留 20% 给输入作为下限
+    （推理模型 thinking + 实际输出可能很大，但再大也不能 > 80% 窗口）。
+    """
+    if max_output_tokens >= context_window:
+        raise InvalidModelConfig(
+            f"max_output_tokens ({max_output_tokens:,}) >= context_window "
+            f"({context_window:,}): 输出预算吃掉整个窗口，输入零空间，"
+            f"物理上不可能。请配置合理的 max_output_tokens。"
+        )
+    # 留至少 20% 窗口给输入 + 安全 buffer
+    min_input_reserve = max(context_window * 0.2, 8_192)
+    if max_output_tokens > context_window - min_input_reserve:
+        raise InvalidModelConfig(
+            f"max_output_tokens ({max_output_tokens:,}) 过大："
+            f"context_window={context_window:,} 需至少留 "
+            f"{int(min_input_reserve):,} 给输入，"
+            f"max_output_tokens 上限为 {int(context_window - min_input_reserve):,}。"
+        )
+
+
 class ModelService:
     """LLM model registry — CRUD on Meta DB.
 
@@ -53,6 +87,10 @@ class ModelService:
         is_active = 0 if attrs.get("is_active") is False else 1
         default_reasoning_effort = attrs.get("default_reasoning_effort")
         temperature = attrs.get("temperature")
+
+        # 物理不变量：max_output_tokens 必须严格小于 context_window。
+        # 治本：非法配置在落库前拒绝，绝不 clamp 后悄悄写入。
+        _validate_invariant(context_window, max_output)
 
         await meta_db.execute(
             "INSERT INTO llm_models (id, name, model_id, base_url, api_key, "
@@ -111,6 +149,17 @@ class ModelService:
             params.append(1 if attrs["is_active"] else 0)
         if not fields:
             return None
+
+        # 物理不变量校验（PATCH 语义：merge 现有值后校验）。
+        # 治本：若本次 update 会把 max_output/context_window 改成非法组合，
+        # 在落库前拒绝。auto-correct 走的也是这条路径，脏数据检测值若
+        # 违反不变量会被这里拦住，不会流入 DB。
+        existing = await self.get(model_pk)
+        if existing is not None:
+            merged_ctx = attrs.get("context_window", existing.get("context_window")) or _DEFAULT_CONTEXT_WINDOW
+            merged_max = attrs.get("max_output_tokens", existing.get("max_output_tokens")) or _DEFAULT_MAX_OUTPUT
+            _validate_invariant(merged_ctx, merged_max)
+
         now_ms = int(time.time() * 1000)
         fields.append("updated_at = ?")
         params.append(now_ms)

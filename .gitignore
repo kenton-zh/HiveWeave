@@ -121,3 +121,8 @@ apps/web/scripts/refactor-*
 .trae/
 .gstack/
 .e2e-sandbox/
+
+# Agent test playgrounds (nested git repos used by agent teams during tests —
+# committing them creates broken gitlinks without .gitmodules)
+sheep-game/
+tictactoe-game/

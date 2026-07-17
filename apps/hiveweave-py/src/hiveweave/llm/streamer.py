@@ -1621,7 +1621,22 @@ class Streamer:
         else:
             max_output = min(max_output, OUTPUT_TOKEN_GLOBAL_CAP)
 
-        usable = max(provider.context_window - max_output - SAFETY_BUFFER_TOKENS, 8_192)
+        # 治本：不再用 max(负数, 8192) 掩盖非法配置。
+        # 若 context_window - max_output - buffer <= 0，说明配置非法
+        # （输出预算吃掉整个窗口），ProviderConfig 构造时本应已拦住。
+        # 此处若仍触发 = DB 有脏数据绕过了构造校验，硬失败暴露问题，
+        # 绝不静默 floor 到 8192 后带病发请求（那会导致 400 且原因难定位）。
+        input_budget = provider.context_window - max_output - SAFETY_BUFFER_TOKENS
+        if input_budget <= 0:
+            raise ValueError(
+                f"非法模型配置：context_window={provider.context_window:,} - "
+                f"max_output={max_output:,} - safety_buffer={SAFETY_BUFFER_TOKENS:,} "
+                f"= {input_budget}（输入预算 <= 0）。输出预算吃掉整个窗口，"
+                f"请修复模型配置的 max_output_tokens。"
+            )
+        # 合法小窗口模型的兜底：input_budget > 0 但小于 8192 时，
+        # 保证输入至少有 8192 可用（此时 max_output 会被 cap 到不超限）。
+        usable = max(input_budget, 8_192)
         total = estimate_tokens_for_messages(messages)
 
         if total <= usable:

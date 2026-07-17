@@ -165,77 +165,36 @@ _REASONING_MODEL_PATTERNS: list[str] = [
 
 
 async def _detect_model_capabilities(
-    base_url: str, api_key: str, model_id: str
+    base_url: str, api_key: str, model_id: str,
+    context_window: int | None = None,
 ) -> dict:
     """自动检测模型的推理能力和最大输出 token 数。
 
     返回 dict:
     - supports_thinking: bool | None
     - max_output_tokens: int | None
-    - source: str (preset / openrouter / unknown)
+    - source: str (preset / external-api / unknown)
+
+    通用性设计：本函数对所有 provider 通用，不写死任何特定平台。
+    - 预设表（人类已验证真值）优先于任何 API 返回值
+    - 外部 API（OpenRouter 及未来其他 /models 端点）的返回值作为候选，
+      必须通过 _sanitize_max_output 通用校验后才能采纳
+    - 脏数据判据是物理不变量（max_output < context_window），不是魔数
+
+    Args:
+        context_window: 已检测到的上下文窗口（若有）。传入后用于脏数据校验，
+            判据为 max_output >= context_window → 脏数据丢弃。若为 None，
+            用合理上界兜底（见 _MAX_OUTPUT_SANITY_UPPER_BOUND 注释）。
     """
     result: dict = {"supports_thinking": None, "max_output_tokens": None, "source": "unknown"}
     base_lower = (base_url or "").lower()
     mid_lower = (model_id or "").lower()
 
-    # ── 策略 1: OpenRouter API ──
-    if "openrouter.ai" in base_lower:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(_OPENROUTER_MODELS_URL)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    models_list = data.get("data") or data.get("models") or []
-                    for m in models_list:
-                        m_id = m.get("id", "")
-                        if m_id == model_id or m_id.lower() == mid_lower:
-                            # max_completion_tokens
-                            max_tokens = None
-                            top_provider = m.get("top_provider") or {}
-                            if top_provider and isinstance(top_provider, dict):
-                                max_tokens = top_provider.get("max_completion_tokens")
-                            if max_tokens is None:
-                                max_tokens = m.get("max_completion_tokens")
-                            if max_tokens and isinstance(max_tokens, int) and max_tokens > 0:
-                                result["max_output_tokens"] = max_tokens
-
-                            # 推理模型检测：architecture.modality 含 "reasoning" 或 id 匹配预设
-                            arch = m.get("architecture") or {}
-                            if isinstance(arch, dict):
-                                input_modal = arch.get("input_modalities") or []
-                                output_modal = arch.get("output_modalities") or []
-                                if isinstance(input_modal, list) and "reasoning" in [str(x).lower() for x in input_modal]:
-                                    result["supports_thinking"] = True
-                                elif isinstance(output_modal, list) and "reasoning" in [str(x).lower() for x in output_modal]:
-                                    result["supports_thinking"] = True
-
-                            # 预设表兜底
-                            if result["supports_thinking"] is None:
-                                for pattern in _REASONING_MODEL_PATTERNS:
-                                    if pattern in mid_lower:
-                                        result["supports_thinking"] = True
-                                        break
-
-                            result["source"] = "openrouter"
-                            log.info(
-                                "model_capabilities_detected",
-                                source="openrouter",
-                                model_id=model_id,
-                                supports_thinking=result["supports_thinking"],
-                                max_output_tokens=result["max_output_tokens"],
-                            )
-                            return result
-        except Exception as e:
-            log.warning("openrouter_capability_detection_failed", error=str(e))
-
-    # ── 策略 2: 预设表匹配 ──
-    for pattern in _REASONING_MODEL_PATTERNS:
-        if pattern in mid_lower:
-            result["supports_thinking"] = True
-            result["source"] = "preset"
-            break
-
-    # 预设 max_output_tokens（常见模型）
+    # ── 策略 1: 预设表（人类已验证真值，最高优先级）──
+    # 预设值本身已合理，无需再过 sanitize（它是真值源，不是待校验候选）。
+    # 为什么预设优先：外部 /models API 对部分模型（尤其免费模型）会返回
+    # 不可靠的 max_completion_tokens（如把 context_length 串成它），
+    # 盲信会产出物理不可能的配置。预设表是经过验证的真值，应先采纳。
     _PRESET_MAX_OUTPUT: list[tuple[str, int]] = [
         ("o1", 100_000), ("o3", 100_000),
         ("claude-3-5-sonnet", 8_192),
@@ -247,15 +206,146 @@ async def _detect_model_capabilities(
         ("gpt-4-turbo", 4_096),
         ("longcat", 8_192),
     ]
-    if result["max_output_tokens"] is None:
-        for pattern, max_tok in _PRESET_MAX_OUTPUT:
-            if pattern in mid_lower:
-                result["max_output_tokens"] = max_tok
-                if result["source"] == "unknown":
-                    result["source"] = "preset"
-                break
+    for pattern, max_tok in _PRESET_MAX_OUTPUT:
+        if pattern in mid_lower:
+            result["max_output_tokens"] = max_tok
+            result["source"] = "preset"
+            break
+
+    # supports_thinking 预设兜底
+    for pattern in _REASONING_MODEL_PATTERNS:
+        if pattern in mid_lower:
+            result["supports_thinking"] = True
+            if result["source"] == "unknown":
+                result["source"] = "preset"
+            break
+
+    # ── 策略 2: 外部 /models API（补充检测，不覆盖预设真值）──
+    # 通用：任何提供 /models 端点的 provider 都可在此补充。
+    # 当前实现 OpenRouter，未来接其他平台时在此扩展。
+    # 所有外部值都是「候选」，必须通过 _sanitize_max_output 校验才能采纳。
+    external_caps = await _fetch_caps_from_models_api(base_url, model_id)
+    if external_caps is not None:
+        # supports_thinking：architecture 信号可信，补充检测（不覆盖预设）
+        if result["supports_thinking"] is None and external_caps.get("supports_thinking"):
+            result["supports_thinking"] = external_caps["supports_thinking"]
+        # max_output_tokens：仅预设未命中时采纳候选，且过通用 sanitize
+        if result["max_output_tokens"] is None and external_caps.get("max_output_tokens") is not None:
+            candidate = external_caps["max_output_tokens"]
+            sanitized = _sanitize_max_output(candidate, context_window, model_id)
+            if sanitized is not None:
+                result["max_output_tokens"] = sanitized
+                if result["source"] in ("unknown", "preset"):
+                    result["source"] = "external-api"
+
+        log.info(
+            "model_capabilities_detected",
+            source=result["source"],
+            model_id=model_id,
+            supports_thinking=result["supports_thinking"],
+            max_output_tokens=result["max_output_tokens"],
+        )
 
     return result
+
+
+#: max_output_tokens 合理性上界。语义：真实模型的 max_output 极少超过此值。
+#: 当前顶配是 o1/o3 的 100k。设 200k 作为「明显是 context_length 串线」的判据。
+#: 仅当 context_window 未知（无法用物理不变量校验）时作为兜底判据使用；
+#: context_window 已知时，判据是物理不变量 max_output < context_window。
+_MAX_OUTPUT_SANITY_UPPER_BOUND = 200_000
+
+
+def _sanitize_max_output(
+    candidate: int,
+    context_window: int | None,
+    model_id: str,
+) -> int | None:
+    """通用脏数据校验：对所有 provider 的 max_output 候选值生效。
+
+    判据是物理不变量，不是某个平台的特例：
+    - 若 context_window 已知：candidate >= context_window → 脏数据（输出预算
+      吃掉整个窗口，输入零空间，物理不可能），丢弃
+    - 若 context_window 未知：candidate >= _MAX_OUTPUT_SANITY_UPPER_BOUND →
+      疑似 context_length 串线，丢弃
+    - 否则：采纳
+
+    返回 None 表示脏数据应丢弃，调用方应保持 None（让存储层要求显式配置）。
+    """
+    if candidate is None or not isinstance(candidate, int) or candidate <= 0:
+        return None
+
+    if context_window is not None and candidate >= context_window:
+        log.warning(
+            "max_output_suspicious",
+            model_id=model_id,
+            candidate=candidate,
+            context_window=context_window,
+            reason=">= context_window, physically impossible, discarded",
+        )
+        return None
+
+    if context_window is None and candidate >= _MAX_OUTPUT_SANITY_UPPER_BOUND:
+        log.warning(
+            "max_output_suspicious",
+            model_id=model_id,
+            candidate=candidate,
+            reason=f">= {_MAX_OUTPUT_SANITY_UPPER_BOUND}, likely context_length leaked, discarded",
+        )
+        return None
+
+    return candidate
+
+
+async def _fetch_caps_from_models_api(
+    base_url: str, model_id: str
+) -> dict | None:
+    """从 provider 的 /models 端点获取能力信息（supports_thinking, max_output）。
+
+    通用性：当前实现 OpenRouter，未来接其他平台时在此扩展（如 OpenAI /v1/models、
+    Anthropic /v1/models 等）。所有平台的返回值都是「候选」，由调用方过 sanitize。
+    """
+    base_lower = (base_url or "").lower()
+
+    if "openrouter.ai" in base_lower:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(_OPENROUTER_MODELS_URL)
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+                models_list = data.get("data") or data.get("models") or []
+                for m in models_list:
+                    m_id = m.get("id", "")
+                    if m_id == model_id or m_id.lower() == model_id.lower():
+                        caps: dict = {}
+                        # supports_thinking：architecture.modality 含 "reasoning"
+                        arch = m.get("architecture") or {}
+                        if isinstance(arch, dict):
+                            input_modal = arch.get("input_modalities") or []
+                            output_modal = arch.get("output_modalities") or []
+                            if isinstance(input_modal, list) and "reasoning" in [str(x).lower() for x in input_modal]:
+                                caps["supports_thinking"] = True
+                            elif isinstance(output_modal, list) and "reasoning" in [str(x).lower() for x in output_modal]:
+                                caps["supports_thinking"] = True
+                        # max_output_tokens 候选值（待 sanitize）
+                        max_tokens = None
+                        top_provider = m.get("top_provider") or {}
+                        if top_provider and isinstance(top_provider, dict):
+                            max_tokens = top_provider.get("max_completion_tokens")
+                        if max_tokens is None:
+                            max_tokens = m.get("max_completion_tokens")
+                        if max_tokens and isinstance(max_tokens, int) and max_tokens > 0:
+                            caps["max_output_tokens"] = max_tokens
+                        return caps
+        except Exception as e:
+            log.warning("models_api_capability_detection_failed", provider="openrouter", error=str(e))
+
+    # 未来扩展：其他 provider 的 /models 端点在此添加
+    # if "api.openai.com" in base_lower: ...
+    # if "api.anthropic.com" in base_lower: ...
+
+    return None
 
 
 def _extract_usage_from_response(data: dict) -> dict:
@@ -329,7 +419,7 @@ async def _do_self_test(model: dict) -> dict:
         latency_ms = int((time.perf_counter() - start) * 1000)
         # 即使超时也检测 context_window 和 capabilities
         detected_ctx = await _detect_context_window(base_url, api_key, model_name)
-        caps = await _detect_model_capabilities(base_url, api_key, model_name)
+        caps = await _detect_model_capabilities(base_url, api_key, model_name, context_window=detected_ctx)
         result = {"ok": False, "latencyMs": latency_ms, "error": "request timed out"}
         if detected_ctx is not None:
             result["detectedContextWindow"] = detected_ctx
@@ -339,7 +429,7 @@ async def _do_self_test(model: dict) -> dict:
     except Exception as e:
         latency_ms = int((time.perf_counter() - start) * 1000)
         detected_ctx = await _detect_context_window(base_url, api_key, model_name)
-        caps = await _detect_model_capabilities(base_url, api_key, model_name)
+        caps = await _detect_model_capabilities(base_url, api_key, model_name, context_window=detected_ctx)
         result = {"ok": False, "latencyMs": latency_ms, "error": str(e)}
         if detected_ctx is not None:
             result["detectedContextWindow"] = detected_ctx
@@ -347,9 +437,9 @@ async def _do_self_test(model: dict) -> dict:
         result["detectedMaxOutputTokens"] = caps.get("max_output_tokens")
         return result
 
-    # ── 并行检测 context_window 和 capabilities ──
+    # ── 顺序检测：先 context_window，再 capabilities（用 ctx 真值做脏数据校验）──
     detected_ctx = await _detect_context_window(base_url, api_key, model_name)
-    caps = await _detect_model_capabilities(base_url, api_key, model_name)
+    caps = await _detect_model_capabilities(base_url, api_key, model_name, context_window=detected_ctx)
 
     result = {"ok": False, "latencyMs": latency_ms}
 
@@ -463,10 +553,9 @@ async def _do_self_test(model: dict) -> dict:
             updates["context_window"] = detected_ctx
     if detected_thinking is not None and configured_thinking != detected_thinking:
         updates["supports_thinking"] = detected_thinking
-    if detected_max_output is not None and (
-        configured_max_output == 0
-        or (configured_max_output > 0 and configured_max_output < detected_max_output // 4)
-    ):
+    if detected_max_output is not None and configured_max_output != detected_max_output:
+        # 检测层已保证 detected_max_output 是真值（预设优先 + 外部 API 脏数据丢弃），
+        # 配置值不一致就修正——包括 configured 过大（如历史脏数据 262144）和过小。
         updates["max_output_tokens"] = detected_max_output
 
     if updates:
