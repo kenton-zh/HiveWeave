@@ -80,6 +80,7 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "create_task": frozenset({Capability.DISPATCH}),
     "dispatch_task": frozenset({Capability.DISPATCH}),
     "review_task": frozenset({Capability.REVIEW}),
+    "waive_attestation": frozenset({Capability.REVIEW}),
     "git_worktree_create": frozenset({Capability.MERGE}),
     "git_worktree_merge": frozenset({Capability.MERGE}),
     "git_worktree_remove": frozenset({Capability.MERGE}),

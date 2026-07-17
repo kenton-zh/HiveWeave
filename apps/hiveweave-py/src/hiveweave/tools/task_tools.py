@@ -872,19 +872,25 @@ async def submit_task_tool(
     attest_ids = list(params.attestation_ids or [])
 
     if needed:
-        ok, err = await attestation_service.verify_ids(
-            project_id,
-            attest_ids,
-            expected_agent_id=agent_id,
-            expected_kinds=needed,
-            task_id=task_id,
-        )
-        if not ok:
-            return ToolResult.err(
-                f"submit_task attestation gate failed ({policy_id}): {err}. "
-                f"Run browse (UI) or bash tests, then pass attestationIds. "
-                f"Bare testsPassed is rejected."
+        # Waiver 短路：coordinator 已显式豁免（CLI/脚本类任务正式出口）
+        from hiveweave.services.attestation import has_valid_waiver
+
+        if not await has_valid_waiver(project_id, task_id):
+            ok, err = await attestation_service.verify_ids(
+                project_id,
+                attest_ids,
+                expected_agent_id=agent_id,
+                expected_kinds=needed,
+                task_id=task_id,
             )
+            if not ok:
+                return ToolResult.err(
+                    f"submit_task attestation gate failed ({policy_id}): {err}. "
+                    f"Run browse (UI) or bash tests, then pass attestationIds. "
+                    f"Bare testsPassed is rejected. "
+                    f"For CLI-only tasks, ask your coordinator to "
+                    f"waive_attestation(taskId, reason)."
+                )
     elif params.tests_passed is not True:
         # docs_only still asks for explicit ack
         return ToolResult.err(
@@ -1045,20 +1051,25 @@ async def review_task_tool(
             )
             needed = required_attestation_kinds(policy_id)
             if needed:
-                aids = evidence.get("attestation_ids") or []
-                if not isinstance(aids, list):
-                    aids = []
-                ok, err = await attestation_service.verify_ids(
-                    project_id,
-                    [str(x) for x in aids],
-                    expected_kinds=needed,
-                    task_id=params.task_id,
-                )
-                if not ok:
-                    return ToolResult.err(
-                        f"Cannot approve: attestation gate failed ({policy_id}): {err}. "
-                        "Send rework and require real browse/test attestations."
+                from hiveweave.services.attestation import has_valid_waiver
+
+                waived = await has_valid_waiver(project_id, params.task_id)
+                if not waived:
+                    aids = evidence.get("attestation_ids") or []
+                    if not isinstance(aids, list):
+                        aids = []
+                    ok, err = await attestation_service.verify_ids(
+                        project_id,
+                        [str(x) for x in aids],
+                        expected_kinds=needed,
+                        task_id=params.task_id,
                     )
+                    if not ok:
+                        return ToolResult.err(
+                            f"Cannot approve: attestation gate failed ({policy_id}): {err}. "
+                            "Send rework and require real browse/test attestations, "
+                            "or waive_attestation(taskId, reason) for CLI-only tasks."
+                        )
             elif evidence.get("tests_passed") is not True:
                 return ToolResult.err(
                     "Cannot approve docs_only task without tests_passed=true ack."
@@ -1166,6 +1177,107 @@ async def review_task_tool(
         return ToolResult.ok(f"Task {params.task_id} sent back for rework.")
     except Exception as e:
         return ToolResult.err(f"Failed to review task: {e}")
+
+
+# ── waive_attestation ────────────────────────────────────────
+
+
+class WaiveAttestationParams(BaseModel):
+    """Parameters for waive_attestation tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    task_id: str = Field(
+        alias="taskId",
+        description="ID of the task whose attestation gate should be waived.",
+        json_schema_extra={"aliases": ["taskId", "task_id", "id"]},
+    )
+    reason: str = Field(
+        description="Why this task is exempt (e.g. 'CLI 任务无 UI 可 browse，"
+        "以 bash 验证日志替代'). Required for auditability.",
+    )
+
+
+@tool(
+    "waive_attestation",
+    "Waive the attestation gate for a task (coordinator only). Use for CLI-only "
+    "tasks with no browsable UI, where bash verification logs replace "
+    "browse/test attestations. The waiver is persisted (auditable) and expires "
+    "in 24h. After waiving, the assignee can submit_task without attestationIds.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def waive_attestation_tool(
+    params: WaiveAttestationParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """Coordinator 显式豁免任务的 attestation 门禁（可审计的正式通道）。
+
+    替代过去的 charter 口头豁免（工具层不读 charter，口头豁免无效）。
+    """
+    from hiveweave.services.attestation import create_waiver
+
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project")
+
+    reason = (params.reason or "").strip()
+    if not reason:
+        return ToolResult.err(
+            "waive_attestation requires a non-empty 'reason' (auditability)."
+        )
+
+    ts = TaskService()
+    try:
+        task = await ts.get_task(project_id, params.task_id)
+    except Exception as e:
+        return ToolResult.err(f"Failed to load task: {e}")
+    if not task:
+        return ToolResult.err(f"Task not found: {params.task_id}")
+
+    try:
+        waiver_id = await create_waiver(
+            project_id,
+            task_id=params.task_id,
+            waived_by=agent_id,
+            reason=reason,
+        )
+    except Exception as e:
+        return ToolResult.err(f"Failed to create waiver: {e}")
+
+    # 通知 assignee 现在可以无 attestationIds 提交（task 通道，wake=1）
+    assignee = task.get("assignee_id")
+    if assignee and assignee != agent_id:
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().send_message(
+                from_agent_id=agent_id,
+                to_agent_id=assignee,
+                message=(
+                    f"[TASK] Attestation gate waived for task "
+                    f"'{(task.get('title') or '')[:60]}' ({params.task_id}). "
+                    f"Reason: {reason[:200]}. You may now submit_task without "
+                    f"attestationIds (bash 验证日志已在 summary 中说明)。"
+                ),
+                message_type="task",
+                priority="normal",
+                task_id=params.task_id,
+            )
+        except Exception as e:
+            log.warning("waiver_notify_failed", error=str(e))
+
+    log.info(
+        "attestation_waived",
+        project_id=project_id,
+        task_id=params.task_id,
+        waived_by=agent_id,
+        reason=reason[:120],
+    )
+    return ToolResult.ok(
+        f"Attestation waived for task {params.task_id} "
+        f"(waiver {waiver_id[:8]}, expires in 24h). "
+        f"Assignee may now submit_task without attestationIds."
+    )
 
 
 async def _spawn_post_approve_verify_task(

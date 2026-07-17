@@ -40,13 +40,16 @@ CREATE TABLE IF NOT EXISTS tool_attestations (
 """
 
 # npm test, pytest, vitest, yarn/pnpm test, go test, cargo test, etc.
+# 以及 CLI 脚本验证（井字棋实测暴露的盲区）：
+#   python verify_ai.py / python test_game.py / python -m unittest / bash check_xx.sh
 _TEST_COMMAND_RE = re.compile(
     r"(?:"
     r"\bnpm\s+(?:run\s+)?test\b|"
     r"\bnpx\s+vitest\b|"
     r"\bvitest\b|"
     r"\bpytest\b|"
-    r"\bpython\s+-m\s+pytest\b|"
+    r"\bpython3?\s+-m\s+pytest\b|"
+    r"\bpython3?\s+-m\s+unittest\b|"
     r"\byarn\s+(?:run\s+)?test\b|"
     r"\bpnpm\s+(?:run\s+)?test\b|"
     r"\bgo\s+test\b|"
@@ -57,7 +60,13 @@ _TEST_COMMAND_RE = re.compile(
     r"\bdotnet\s+test\b|"
     r"\bjest\b|"
     r"\bmocha\b|"
-    r"\buv\s+run\s+pytest\b"
+    r"\buv\s+run\s+pytest\b|"
+    # python/node/bash 直接跑验证/测试脚本（test_*.py, *_test.py,
+    # verify_*.py, check_*.py 及对应 .js/.mjs/.ts/.sh 变体）
+    r"\b(?:python3?|uv\s+run\s+python3?|node|bash|sh)\s+"
+    r"(?:[^\s;&|]*/)?(?:test_|verify_|check_)[^\s;&|]*\.(?:py|[jm]js|ts|sh)\b|"
+    r"\b(?:python3?|uv\s+run\s+python3?|node|bash|sh)\s+"
+    r"[^\s;&|]*_test\.(?:py|[jm]js|ts|sh)\b"
     r")",
     re.IGNORECASE,
 )
@@ -253,6 +262,60 @@ def hash_stdout(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8")).hexdigest()[:16]
 
 
+# ── Attestation waiver（coordinator 豁免通道）────────────────────
+#
+# 背景（井字棋实测 #2）：attestation 门禁为 UI/browse 任务设计，纯 CLI 任务
+# 没有可 browse 的界面，bash 验证脚本又不一定命中 is_test_command → submit
+# 被硬拒。CEO 在 charter 里"口头豁免"无效——工具层不读 charter。
+# 这里提供正式的豁免通道：coordinator 显式 waive（落库、可审计、24h 过期），
+# 保留硬闸门的防假装完成功能，同时给 CLI/脚本类任务一个留痕出口。
+
+WAIVER_KIND = "waiver"
+
+
+async def create_waiver(
+    project_id: str,
+    *,
+    task_id: str,
+    waived_by: str,
+    reason: str,
+    ttl_ms: int | None = None,
+) -> str:
+    """Coordinator 豁免某任务的 attestation 门禁。返回 waiver attestation id。"""
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("waiver reason is required (auditability)")
+    return await attestation_service.create(
+        project_id,
+        agent_id=waived_by,
+        kind=WAIVER_KIND,
+        task_id=task_id,
+        command_or_url=f"waive_attestation: {reason[:450]}",
+        stdout=reason,  # 只存 hash，作为审计指纹
+        ttl_ms=ttl_ms,
+    )
+
+
+async def has_valid_waiver(project_id: str, task_id: str | None) -> bool:
+    """任务是否有未过期的 waiver。"""
+    if not task_id:
+        return False
+    await attestation_service.ensure_schema(project_id)
+    conn = await _conn(project_id)
+    if conn is None:
+        return False
+    now = int(time.time() * 1000)
+    cur = await conn.execute(
+        "SELECT 1 FROM tool_attestations "
+        "WHERE project_id = ? AND task_id = ? AND kind = ? "
+        "AND (expires_at IS NULL OR expires_at > ?) LIMIT 1",
+        [project_id, task_id, WAIVER_KIND, now],
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return row is not None
+
+
 def resolve_task_policy(
     title: str | None = None,
     tags: list[str] | None = None,
@@ -337,6 +400,10 @@ async def check_task_attestations(
     if required is None:
         return None  # docs_only — no attestations required
 
+    # Waiver 通道：coordinator 显式豁免（CLI/脚本类任务的正式出口）
+    if await has_valid_waiver(project_id, task.get("id")):
+        return None
+
     ids = [i for i in (attestation_ids or []) if i]
     evidence = task.get("evidence") or {}
     if isinstance(evidence, str):
@@ -353,7 +420,9 @@ async def check_task_attestations(
         return (
             f"REJECT: policy '{policy}' requires attestation(s) of kind "
             f"{sorted(required)}. Run real tests/browse first; "
-            f"testsPassed=true alone is insufficient. Pass attestationIds."
+            f"testsPassed=true alone is insufficient. Pass attestationIds. "
+            f"For CLI-only tasks without a browsable UI, ask your coordinator "
+            f"to waive_attestation(taskId, reason)."
         )
 
     svc = attestation_service
