@@ -192,7 +192,7 @@ function ConversationCard({ conv }: { conv: Conversation }) {
     <div className="border-b border-g-border/30">
       {/* Header — always visible */}
       <div
-        className="flex items-start gap-2 px-4 py-2 cursor-pointer hover:bg-g-border/10 transition-colors"
+        className="flex items-start gap-2 px-4 py-2 cursor-pointer hover:bg-g-bg-soft/70 transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
         {/* Agent name + status dot */}
@@ -316,9 +316,9 @@ function WorkLogEntry({ log }: { log: WorkLog }) {
   const canExpand = hasDetails || hasMoreSummary;
 
   return (
-    <div className="px-4 py-3 hover:bg-g-border/20 transition-colors">
+    <div className="px-4 py-3 hover:bg-g-bg-soft/80 transition-colors">
       <div className="flex items-center gap-2 mb-1">
-        <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${typeInfo.bg} ${typeInfo.text}`}>
+        <span className={`text-xs font-medium px-1.5 py-0.5 rounded-gm ${typeInfo.bg} ${typeInfo.text}`}>
           {label}
         </span>
         <span className="text-xs text-g-fg-4">{formatTime(log.createdAt)}</span>
@@ -388,7 +388,10 @@ export function ActivityLog({ agentId }: { agentId?: string | null }) {
       <div className="border-t border-g-border bg-g-bg shrink-0">
         <div className="px-4 py-2 flex items-center justify-between">
           <span className="text-xs font-medium text-g-fg-4">Live Activity</span>
-          <span className="text-xs text-g-fg-4/70">空闲</span>
+          <span className="text-xs text-g-fg-4/70 flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-g-border-strong" />
+            空闲
+          </span>
         </div>
       </div>
     );
@@ -401,13 +404,13 @@ export function ActivityLog({ agentId }: { agentId?: string | null }) {
         <div className="flex items-center gap-2">
           <span className="text-xs font-medium text-g-fg-4">Live Activity</span>
           {liveCount > 0 && (
-            <span className="flex items-center gap-1.5 text-xs text-emerald-400">
+            <span className="flex items-center gap-1.5 text-xs text-emerald-600 px-1.5 py-0.5 bg-emerald-50 border border-emerald-100 rounded-gm">
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
               {liveCount} 运行中
             </span>
           )}
         </div>
-        <button onClick={clearActivity} className="text-xs text-g-fg-4 hover:text-g-fg transition-colors">清空</button>
+        <button onClick={clearActivity} className="text-xs px-2 py-0.5 rounded-gm text-g-fg-4 hover:text-red-600 hover:bg-red-50 transition-colors">清空</button>
       </div>
 
       {/* Agent rows — click to expand */}
@@ -436,10 +439,10 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
   const preview = firstLine.length > 80 ? firstLine.slice(0, 80) + "…" : firstLine;
 
   return (
-    <div className="rounded-lg bg-g-bg-soft/60 border border-g-border/40">
+    <div className="rounded-gmLg bg-g-bg border border-g-border/60 shadow-gm-sm hover:shadow-gm transition-shadow">
       {/* Compact row — always visible, mirrors TRAE Work's "Agent · action" header */}
       <div
-        className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-g-bg-soft/80 transition-colors rounded-t-lg"
+        className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-g-bg-soft/70 transition-colors rounded-t-gmLg"
         onClick={() => setExpanded(!expanded)}
       >
         <span className={`w-2 h-2 rounded-full shrink-0 ${conv.isLive ? "bg-emerald-400 animate-pulse" : hasError ? "bg-red-400" : "bg-gray-500"}`} />
@@ -571,7 +574,7 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
       {/* Toggle Header */}
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="w-full px-6 py-3 flex items-center justify-between hover:bg-g-border/30 transition-colors"
+        className="w-full px-6 py-3 flex items-center justify-between hover:bg-g-bg-soft transition-colors"
       >
         <div className="flex items-center gap-2">
           <svg
@@ -589,7 +592,7 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
           </svg>
           <span className="text-sm font-medium text-g-fg">Work Logs</span>
           {logs.length > 0 && (
-            <span className="text-xs px-2 py-0.5 rounded-full bg-g-border text-g-fg-3">
+            <span className="text-xs px-2 py-0.5 rounded-full bg-g-bg-muted border border-g-border/60 text-g-fg-3">
               {logs.length}
             </span>
           )}
@@ -616,11 +619,13 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
               </div>
             </div>
           ) : logs.length === 0 ? (
-            <div className="px-6 py-8 text-center">
+            <div className="px-6 py-8 flex flex-col items-center justify-center gap-1.5 text-center">
+              <span className="text-2xl">📝</span>
               <p className="text-sm text-g-fg-4">暂无工作日志</p>
+              <p className="text-[11px] text-g-fg-4/70">Agent 完成任务后会在这里留下记录</p>
             </div>
           ) : (
-            <div className="divide-y divide-surface-border/50">
+            <div className="divide-y divide-g-border/50">
               {logs.map((log) => (
                 <WorkLogEntry key={log.id} log={log} />
               ))}

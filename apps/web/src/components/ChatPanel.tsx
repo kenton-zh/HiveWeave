@@ -42,6 +42,63 @@ interface MsgSegment {
   tool?: ToolCall;
 }
 
+/**
+ * Visual-only motion tokens. Inlined as a <style> tag because index.css
+ * is owned by another workstream — keep these scoped with the `hw-` prefix.
+ */
+const CHAT_MOTION_CSS = `
+@keyframes hw-msg-in {
+  from { opacity: 0; transform: translateY(8px) scale(.985); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes hw-dot-bounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: .45; }
+  40%           { transform: translateY(-4px); opacity: 1; }
+}
+@keyframes hw-cursor-blink {
+  0%, 100% { opacity: .9; }
+  50%      { opacity: .15; }
+}
+@keyframes hw-glow-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(52, 168, 83, .5); }
+  70%  { box-shadow: 0 0 0 5px rgba(52, 168, 83, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(52, 168, 83, 0); }
+}
+@keyframes hw-shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes hw-badge-pop {
+  0%   { transform: scale(.5); }
+  60%  { transform: scale(1.18); }
+  100% { transform: scale(1); }
+}
+.hw-msg-in { animation: hw-msg-in .28s cubic-bezier(.21, 1.02, .73, 1) both; }
+.hw-typing-dot { animation: hw-dot-bounce 1.15s ease-in-out infinite; }
+.hw-stream-cursor { animation: hw-cursor-blink 1s ease-in-out infinite; }
+.hw-status-live { animation: hw-glow-pulse 1.8s ease-out infinite; }
+.hw-thinking-shimmer {
+  background: linear-gradient(90deg, #7f8d9f 25%, #4285f4 50%, #7f8d9f 75%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: hw-shimmer 2.2s linear infinite;
+}
+.hw-badge-pop { animation: hw-badge-pop .32s ease-out both; }
+@media (prefers-reduced-motion: reduce) {
+  .hw-msg-in, .hw-typing-dot, .hw-stream-cursor,
+  .hw-status-live, .hw-thinking-shimmer, .hw-badge-pop {
+    animation: none !important;
+  }
+}
+`;
+
+function ChatMotionStyles() {
+  return <style>{CHAT_MOTION_CSS}</style>;
+}
+
 interface StreamDraft {
   assistantId: string;
   segments: MsgSegment[];
@@ -233,25 +290,30 @@ function ToolCallsBlock({ toolCalls }: { toolCalls: ToolCall[] }) {
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div className="rounded-lg border border-g-border bg-g-bg-muted overflow-hidden">
+    <div className="rounded-lg border border-g-border bg-g-bg-muted/70 overflow-hidden shadow-gm-sm">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="w-full flex items-center gap-2 px-3 py-2 text-left text-[11px] text-g-fg-3 hover:text-g-fg transition-colors"
+        className="w-full flex items-center gap-2 px-3 py-2 text-left text-[11px] text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted transition-colors"
       >
-        <svg className={`w-3 h-3 text-g-fg-4 transition-transform ${expanded ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <svg className={`w-3 h-3 text-g-fg-4 transition-transform duration-200 ${expanded ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
         </svg>
+        <svg className="w-3.5 h-3.5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M11.42 15.17L17.25 21A2.652 2.652 0 0021 17.25l-5.877-5.877M11.42 15.17l2.496-3.03c.317-.384.74-.626 1.208-.766M11.42 15.17l-4.655 5.653a2.548 2.548 0 11-3.586-3.586l6.837-5.63m5.108-.233c.55-.164 1.163-.188 1.743-.14a4.5 4.5 0 004.486-6.336l-3.276 3.277a3.004 3.004 0 01-2.25-2.25l3.276-3.276a4.5 4.5 0 00-6.336 4.486c.091 1.076-.071 2.264-.904 2.95l-.102.085" />
+        </svg>
         <span className="font-medium">\u5de5\u5177\u8c03\u7528</span>
-        <span className="text-g-fg-4">({toolCalls.length})</span>
+        <span className="ml-auto text-[10px] font-semibold text-g-fg-3 bg-g-bg border border-g-border rounded-full px-1.5 py-px leading-none">{toolCalls.length}</span>
       </button>
       {expanded && (
         <div className="border-t border-g-border px-3 py-2 space-y-1">
           {toolCalls.map((tc, i) => {
             const hint = formatToolInputHint(tc.tool, tc.input);
+            const cat = toolCategories[tc.tool];
+            const dot = cat ? cat.color.replace("text-", "bg-") : "bg-amber-500";
             return (
               <div key={i} className="flex items-center gap-2 text-[11px] font-mono">
-                <span className="w-1 h-1 rounded-full bg-amber-500 shrink-0" />
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot}`} />
                 <span className="text-g-fg-2">{tc.tool}</span>
                 {hint && <span className="text-g-fg-4 truncate">\u2014 {hint}</span>}
               </div>
@@ -265,18 +327,20 @@ function ToolCallsBlock({ toolCalls }: { toolCalls: ToolCall[] }) {
 
 function ThinkingBlock({ content }: { content: string }) {
   return (
-    <details className="group/think my-3 overflow-hidden rounded-xl border border-g-border bg-g-bg-muted">
-      <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none hover:bg-g-bg-muted transition-colors">
-        <svg className="w-3.5 h-3.5 text-purple-500 group-open/think:rotate-90 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+    <details className="group/think my-3 overflow-hidden rounded-xl border border-purple-200/70 bg-purple-50/50 shadow-gm-sm">
+      <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none hover:bg-purple-100/40 transition-colors">
+        <svg className="w-3.5 h-3.5 text-purple-500 group-open/think:rotate-90 transition-transform duration-200" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
         </svg>
-        <svg className="w-3.5 h-3.5 text-purple-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-        </svg>
+        <span className="w-5 h-5 rounded-md bg-purple-500/15 flex items-center justify-center shrink-0">
+          <svg className="w-3.5 h-3.5 text-purple-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+          </svg>
+        </span>
         <span className="text-xs font-medium text-purple-600">思考过程</span>
-        <span className="text-[10px] text-g-fg-4/70 ml-auto">{content.length} 字</span>
+        <span className="text-[10px] text-purple-400/90 ml-auto">{content.length} 字</span>
       </summary>
-      <div className="border-t border-g-border bg-g-bg-soft px-3 py-2.5">
+      <div className="border-t border-purple-200/60 bg-white/60 px-3 py-2.5">
         <div className="text-xs text-g-fg-3 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed font-mono text-[11px]">
           {content}
         </div>
@@ -299,14 +363,17 @@ function ToolCallInline({ name, input }: { name: string; input?: Record<string, 
       }).join(", ");
     }
   } catch { /* ignore */ }
+  const cat = toolCategories[name];
+  const catDot = cat ? cat.color.replace("text-", "bg-") : "bg-g-fg-4";
   return (
-    <div className="py-1.5 px-3 my-1 rounded-lg border border-g-border bg-g-bg-muted text-[12px]">
+    <div className="py-1.5 px-3 my-1 rounded-lg border border-g-border bg-g-bg-muted/60 text-[12px] transition-colors hover:bg-g-bg-muted hover:border-g-border-strong">
       <div className="flex items-center gap-2 cursor-pointer select-none" onClick={() => setShowArgs(!showArgs)}>
-        <svg className={`w-3 h-3 text-g-fg-4 transition-transform ${showArgs ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <svg className={`w-3 h-3 text-g-fg-4 transition-transform duration-200 ${showArgs ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
         </svg>
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${catDot}`} />
         <span className="font-medium text-g-fg-2 font-mono text-[11px]">{name}</span>
-        {hint && <span className="text-g-fg-4 text-[11px]">→ {hint}</span>}
+        {hint && <span className="text-g-fg-4 text-[11px] truncate">→ {hint}</span>}
         {argsPreview && <span className="text-g-fg-4/70 text-[10px] ml-auto truncate hidden sm:inline">{argsPreview}</span>}
       </div>
       {showArgs && input && Object.keys(input).length > 0 && (
@@ -321,8 +388,8 @@ function ToolCallInline({ name, input }: { name: string; input?: Record<string, 
 function MessageBubble({ msg, isStreaming, thinkingElapsed }: { msg: ChatMessage; isStreaming?: boolean; thinkingElapsed?: number | null }) {
   if (msg.role === "system") {
     return (
-      <div className="flex justify-center my-4">
-        <div className="rounded-xl px-4 py-2 bg-g-bg-muted border border-g-border text-g-fg-3 text-xs text-center">
+      <div className="flex justify-center my-4 hw-msg-in">
+        <div className="rounded-xl px-4 py-2 bg-g-bg-muted/80 border border-g-border text-g-fg-3 text-xs text-center leading-relaxed shadow-gm-sm">
           <p className="whitespace-pre-wrap">{msg.content}</p>
         </div>
       </div>
@@ -337,16 +404,19 @@ function MessageBubble({ msg, isStreaming, thinkingElapsed }: { msg: ChatMessage
   const isEmpty = !msg.content && !thinking && !hasSegments && (!msg.toolCalls || msg.toolCalls.length === 0);
 
   return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"} my-2`}>
-      <div className={isUser
-        ? "max-w-[75%] rounded-2xl bg-g-blue px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-sm"
-        : "w-full max-w-full text-[15px] leading-relaxed text-g-fg"
-      }>
+    <div className={`flex ${isUser ? "justify-end" : "justify-start"} my-2 hw-msg-in`}>
+      <div
+        className={isUser
+          ? "max-w-[78%] rounded-2xl rounded-br-md px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-gm-sm"
+          : "w-full max-w-full text-[15px] leading-relaxed text-g-fg"
+        }
+        style={isUser ? { background: "linear-gradient(135deg, #4a8bff 0%, #4285f4 55%, #3574e2 100%)" } : undefined}
+      >
         {/* Images */}
         {msg.images && msg.images.length > 0 && (
           <div className="flex gap-1.5 flex-wrap mb-3">
             {msg.images.map((url, i) => (
-              <img key={i} src={url} className="max-h-48 max-w-[200px] rounded-lg object-cover" alt="" />
+              <img key={i} src={url} className={`max-h-48 max-w-[200px] rounded-lg object-cover ${isUser ? "ring-1 ring-white/30" : "border border-g-border"}`} alt="" />
             ))}
           </div>
         )}
@@ -380,30 +450,30 @@ function MessageBubble({ msg, isStreaming, thinkingElapsed }: { msg: ChatMessage
           </>
         )}
 
-        {/* Streaming cursor — subtle pulsing indicator at end of text */}
+        {/* Streaming cursor — subtle blinking caret at end of text */}
         {!isUser && isStreaming && hasSegments && (
-          <span className="inline-block w-0.5 h-4 bg-g-blue/60 ml-0.5 align-middle animate-pulse" />
+          <span className="inline-block w-[3px] h-4 rounded-full bg-g-blue ml-1 align-middle hw-stream-cursor" />
         )}
 
         {/* Empty streaming indicator — thinking heartbeat or bouncing dots */}
         {!isUser && isEmpty && isStreaming && (
-          <div className="flex items-center gap-2 py-1">
+          <div className="flex items-center gap-2.5 py-1">
             {thinkingElapsed != null ? (
               <>
-                <span className="flex gap-1">
-                  <span className="w-2 h-2 bg-g-blue/70 rounded-full animate-pulse" style={{ animationDelay: "0ms" }} />
-                  <span className="w-2 h-2 bg-g-blue/70 rounded-full animate-pulse" style={{ animationDelay: "200ms" }} />
-                  <span className="w-2 h-2 bg-g-blue/70 rounded-full animate-pulse" style={{ animationDelay: "400ms" }} />
+                <span className="flex gap-1.5">
+                  {[0, 160, 320].map((d) => (
+                    <span key={d} className="w-2 h-2 rounded-full bg-g-blue hw-typing-dot" style={{ animationDelay: `${d}ms` }} />
+                  ))}
                 </span>
-                <span className="text-xs text-g-fg-3">
-                  思考中{thinkingElapsed > 0 ? ` · ${Math.floor(thinkingElapsed)}s` : ""}...
+                <span className="text-xs font-medium hw-thinking-shimmer">
+                  思考中{thinkingElapsed > 0 ? ` · ${Math.floor(thinkingElapsed)}s` : ""}…
                 </span>
               </>
             ) : (
               <span className="flex gap-1.5">
-                <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                {[0, 160, 320].map((d) => (
+                  <span key={d} className="w-2 h-2 rounded-full bg-g-fg-4 hw-typing-dot" style={{ animationDelay: `${d}ms` }} />
+                ))}
               </span>
             )}
           </div>
@@ -1375,13 +1445,18 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
   if (!agentId) {
     return (
       <div className="h-full flex items-center justify-center bg-g-bg">
-        <div className="text-center">
-          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-g-bg border border-g-border flex items-center justify-center">
-            <svg className="w-8 h-8 text-g-fg-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+        <ChatMotionStyles />
+        <div className="text-center hw-msg-in">
+          <div
+            className="w-16 h-16 mx-auto mb-4 rounded-full flex items-center justify-center shadow-gm-md"
+            style={{ background: "linear-gradient(135deg, #e8f0fe 0%, #dbeafe 100%)" }}
+          >
+            <svg className="w-8 h-8 text-g-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
             </svg>
           </div>
-          <p className="text-g-fg-4 text-sm">选择一个 Agent 开始对话</p>
+          <p className="text-g-fg-3 text-sm font-medium">选择一个 Agent 开始对话</p>
+          <p className="text-g-fg-4 text-xs mt-1">从左侧组织架构或办公室视图中挑选成员</p>
         </div>
       </div>
     );
@@ -1422,10 +1497,11 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
 
   return (
     <div className="h-full flex flex-col bg-white" style={hidden ? { display: "none" } : undefined}>
+      <ChatMotionStyles />
       {agentInfo && (
-        <div className="px-4 py-3 border-b border-g-border bg-g-bg-soft shrink-0">
+        <div className="px-4 py-3 border-b border-g-border shrink-0" style={{ background: "linear-gradient(180deg, #fbfbfc 0%, #f5f6f8 100%)" }}>
           <div className="flex items-center gap-3">
-            <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 text-sm font-bold text-white ${
+            <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 text-sm font-bold text-white ring-2 ring-white shadow-gm-sm ${
               agentInfo.role === "ceo" ? "bg-amber-500" :
               agentInfo.role === "hr" ? "bg-rose-500" :
               agentInfo.role === "architect" ? "bg-purple-500" :
@@ -1439,7 +1515,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
               <div className="flex items-center gap-2">
                 <span className="text-sm font-semibold text-g-fg truncate">{agentInfo.name}</span>
                 <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                  isAgentProcessing ? "bg-emerald-500 animate-pulse"
+                  isAgentProcessing ? "bg-emerald-500 hw-status-live"
                   : agentInfo.status === "idle" || agentInfo.status === "inactive" ? "bg-gray-400"
                   : agentInfo.status === "promoted" ? "bg-blue-400"
                   : agentInfo.status === "receiving" ? "bg-amber-400 animate-pulse"
@@ -1465,17 +1541,18 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           <MessageBubble key={msg.id} msg={msg} isStreaming={!!msg.isStreaming || (isStreaming && streamDraft?.assistantId === msg.id)} thinkingElapsed={isStreaming && streamDraft?.assistantId === msg.id ? thinkingElapsed : null} />
         ))}
         {pendingApprovalTool && isStreaming && (
-          <div className="flex justify-start">
-            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-g-yellow-bg border border-g-yellow">
+          <div className="flex justify-start hw-msg-in">
+            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-g-yellow-bg border border-g-yellow/70 shadow-gm-sm">
               <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse shrink-0" />
                 <span className="text-sm text-amber-700">等待审批: {pendingApprovalTool.replace(/^hiveweave__/, "").replace(/_/g, " ")}</span>
               </div>
             </div>
           </div>
         )}
         {retryInfo && isStreaming && (
-          <div className="flex justify-start">
-            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-g-bg-muted border border-g-border">
+          <div className="flex justify-start hw-msg-in">
+            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-g-bg-muted border border-g-border shadow-gm-sm">
               <div className="flex items-center gap-2">
                 <svg className="w-4 h-4 text-orange-500 animate-spin" fill="none" viewBox="0 0 24 24">
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
@@ -1493,16 +1570,16 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       </div>
 
       {hasTeamComms && (
-        <div className="shrink-0 border-t-2 border-g-border bg-[#f4f6f9] overflow-hidden">
+        <div className="shrink-0 border-t border-g-border-strong bg-[#f4f6f9] overflow-hidden">
           <button onClick={() => { setTeamCommsExpanded(!teamCommsExpanded); if (teamCommsExpanded) setExpandedMessageId(null); }} className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-[#eef0f4] transition-colors">
             <div className="flex items-center gap-2">
               <svg className="w-3.5 h-3.5 text-g-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z" />
               </svg>
               <span className="text-xs font-semibold text-g-fg-2 uppercase tracking-wide">团队沟通</span>
-              <span className="bg-g-blue text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none">{teamMessages.length}</span>
+              <span className="bg-g-blue text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none shadow-gm-sm hw-badge-pop" key={teamMessages.length}>{teamMessages.length}</span>
             </div>
-            <svg className={`w-3.5 h-3.5 text-g-fg-4 transition-transform ${teamCommsExpanded ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+            <svg className={`w-3.5 h-3.5 text-g-fg-4 transition-transform duration-200 ${teamCommsExpanded ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
             </svg>
           </button>
@@ -1566,7 +1643,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                   <button
                     key={msg.id}
                     onClick={() => setExpandedMessageId(isExpanded ? null : msg.id)}
-                    className={"w-full px-4 py-2 text-left hover:bg-g-bg-muted transition-colors " + (!msg.isRead ? "bg-g-blue/5 " : "")}
+                    className={"w-full px-4 py-2 text-left hover:bg-g-bg-muted transition-colors " + (!msg.isRead ? "bg-g-blue/5 shadow-[inset_2px_0_0_0_#4285f4] " : "")}
                   >
                     <div className="flex items-center gap-2 mb-0.5 min-w-0">
                       <span className={"text-xs font-medium px-1.5 py-0.5 rounded shrink-0 " + (isIncoming ? "bg-g-green-bg text-g-green" : "bg-g-blue-bg text-g-blue")}>
@@ -1606,28 +1683,33 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         </div>
       )}
 
-      <div className="px-6 py-4 border-t border-g-border bg-g-bg shrink-0">
+      <div className="px-6 py-4 border-t border-g-border bg-g-bg-soft/70 shrink-0">
         {images.length > 0 && (
           <div className="flex gap-2 mb-2 flex-wrap">
             {images.map((url, i) => (
-              <div key={i} className="relative group">
-                <img src={url} className="h-16 w-16 object-cover rounded-lg border border-g-border" alt="" />
-                <button onClick={() => removeImage(i)} className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">x</button>
+              <div key={i} className="relative group hw-msg-in">
+                <img src={url} className="h-16 w-16 object-cover rounded-lg border border-g-border shadow-gm-sm" alt="" />
+                <button onClick={() => removeImage(i)} className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all shadow-gm-sm hover:scale-110">×</button>
               </div>
             ))}
           </div>
         )}
         {queuedCount > 0 && (
-          <p className="text-xs text-amber-400 mb-2">已排队 {queuedCount} 条消息，将在当前回复完成后自动发送</p>
+          <p className="flex items-center gap-1.5 w-fit text-xs text-amber-700 bg-g-yellow-bg border border-g-yellow/50 rounded-full px-3 py-1 mb-2">
+            <svg className="w-3 h-3 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l2 2m6-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            已排队 {queuedCount} 条消息，将在当前回复完成后自动发送
+          </p>
         )}
         <div className="flex gap-2 items-end">
           <input type="file" ref={fileInputRef} onChange={handleFileInput} accept="image/*" multiple className="hidden" />
-          <button onClick={() => fileInputRef.current?.click()} disabled={images.length >= 5 || isStreaming} className="px-3 py-3 text-g-fg-3 hover:text-g-blue disabled:opacity-30 transition-colors" title="添加图片 (支持粘贴/拖拽)">
+          <button onClick={() => fileInputRef.current?.click()} disabled={images.length >= 5 || isStreaming} className="px-3 py-3 rounded-gm text-g-fg-3 hover:text-g-blue hover:bg-g-bg-muted disabled:opacity-30 transition-colors" title="添加图片 (支持粘贴/拖拽)">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
           </button>
-          <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 支持粘贴图片)" className="flex-1 bg-g-bg border border-g-border rounded-gm px-4 py-3 text-sm text-g-fg resize-none focus:outline-none focus:border-g-blue focus:ring-1 focus:ring-g-blue/30" rows={1} disabled={isStreaming} />
-          <button onClick={handleSend} disabled={(!input.trim() && images.length === 0) || isStreaming} className="px-6 py-3 bg-g-blue text-white rounded-gm text-sm disabled:opacity-50 transition-colors">发送</button>
-          <button onClick={handleStop} disabled={!isStreaming} className="px-6 py-3 bg-red-500 hover:bg-red-600 text-white rounded-gm text-sm font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed">停止</button>
+          <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 支持粘贴图片)" className="flex-1 bg-g-bg border border-g-border rounded-gm px-4 py-3 text-sm text-g-fg resize-none transition-shadow focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/25 focus:shadow-gm-sm" rows={1} disabled={isStreaming} />
+          <button onClick={handleSend} disabled={(!input.trim() && images.length === 0) || isStreaming} className="px-6 py-3 text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm-md hover:brightness-105 active:scale-95 disabled:opacity-50 disabled:shadow-none disabled:hover:brightness-100" style={{ background: "linear-gradient(135deg, #4a8bff 0%, #4285f4 55%, #3574e2 100%)" }}>发送</button>
+          <button onClick={handleStop} disabled={!isStreaming} className="px-6 py-3 bg-red-500 hover:bg-red-600 text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm-md active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed disabled:shadow-none">停止</button>
         </div>
       </div>
 

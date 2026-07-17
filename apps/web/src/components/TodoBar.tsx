@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { getAgentTodos, type AgentTodos } from "../api";
 
 interface Props {
@@ -41,21 +41,22 @@ export default function TodoBar({ agentId }: Props) {
         onClick={() => setCollapsed(!collapsed)}
         className="w-full flex items-center gap-2 px-6 py-2 text-xs hover:bg-g-bg-soft transition-colors"
       >
-        <span className="text-g-fg-3">
-          {collapsed ? (
-            <svg className="w-3 h-3 rotate-180" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          ) : (
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          )}
+        <span className="text-g-fg-3 transition-transform duration-200" style={{ transform: collapsed ? "rotate(-90deg)" : "rotate(0deg)" }}>
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
         </span>
         <span className="text-g-fg-3 font-medium">📋 任务清单</span>
         <span className="text-g-fg-4">{done}/{total} 完成</span>
+        {/* Mini progress bar */}
+        <span className="w-16 h-1 bg-g-bg-muted rounded-full overflow-hidden shrink-0">
+          <span
+            className="block h-full bg-gradient-to-r from-g-blue to-emerald-400 rounded-full transition-all duration-500"
+            style={{ width: `${total > 0 ? Math.round((done / total) * 100) : 0}%` }}
+          />
+        </span>
         {done === total && total > 0 && (
-          <span className="text-emerald-700 text-[10px]">全部完成</span>
+          <span className="text-emerald-700 text-[10px] px-1.5 py-0.5 bg-emerald-50 border border-emerald-100 rounded-gm">全部完成</span>
         )}
       </button>
 
@@ -64,7 +65,7 @@ export default function TodoBar({ agentId }: Props) {
           {todos.todos.map((todo, i) => {
             const s = statusLabels[todo.status] || statusLabels.pending;
             return (
-              <div key={i} className={`flex items-center gap-2 text-xs py-0.5 ${(todo.status as string) === "cancelled" ? "line-through opacity-50" : ""}`}>
+              <div key={i} className={`flex items-center gap-2 text-xs py-1 px-2 -mx-2 rounded-gm hover:bg-g-bg-soft transition-colors ${(todo.status as string) === "cancelled" ? "line-through opacity-50" : ""}`}>
                 <span className="w-4 text-center">{s.icon}</span>
                 <span className={s.color}>{todo.content}</span>
               </div>

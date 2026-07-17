@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 import { getProjectGameTime } from "../api";
 
 interface Props {
@@ -85,12 +85,22 @@ export default function ProjectTimeBadge({ projectId }: Props) {
   }, [projectId]);
 
   if (!projectId) {
-    return <div className="px-2.5 py-1 rounded-md bg-g-bg border border-g-border text-xs text-g-fg-3 whitespace-nowrap shrink-0">No project</div>;
+    return (
+      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-gm bg-g-bg border border-g-border text-xs text-g-fg-3 whitespace-nowrap shrink-0">
+        <svg className="w-3.5 h-3.5 text-g-fg-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        No project
+      </div>
+    );
   }
 
   return (
-    <div className="px-2.5 py-1 rounded-md bg-g-bg border border-g-border text-xs text-g-fg-3 whitespace-nowrap shrink-0">
-      项目时间 {formatted ?? "—"}
+    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-gm bg-g-bg border border-g-border shadow-gm-sm text-xs text-g-fg-3 whitespace-nowrap shrink-0 hover:border-g-border-strong transition-colors">
+      <svg className="w-3.5 h-3.5 text-g-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+      <span>项目时间 <span className="font-mono text-g-fg">{formatted ?? "—"}</span></span>
     </div>
   );
 }

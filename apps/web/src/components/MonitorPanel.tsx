@@ -166,10 +166,10 @@ function TurnCard({ turn, events, expanded, onToggle }: { turn: TraceTurn; event
     : turn.summary || "(空轮次)";
 
   return (
-    <div className="rounded-lg border border-g-border bg-g-bg overflow-hidden">
+    <div className="rounded-gmLg border border-g-border bg-g-bg shadow-gm-sm hover:shadow-gm transition-shadow overflow-hidden">
       <button
         onClick={onToggle}
-        className="w-full flex items-center gap-3 p-3 hover:bg-g-bg-soft transition-colors text-left"
+        className="w-full flex items-center gap-3 p-3 hover:bg-g-bg-soft/70 transition-colors text-left"
       >
         <span className="text-[10px] font-mono text-g-fg-4 w-12 shrink-0">
           #{turn.turn_index}
@@ -259,7 +259,7 @@ function EventRow({ event }: { event: TraceEvent }) {
   else if (event.event_type === "llm_fail") { label = "LLM 失败"; color = "text-red-600"; }
 
   return (
-    <div className="rounded-lg border border-g-border bg-g-bg p-3">
+    <div className="rounded-gmLg border border-g-border bg-g-bg shadow-gm-sm hover:shadow-gm transition-shadow p-3">
       <div className="flex items-center gap-3">
         <span className={`text-[10px] font-bold ${color} w-16`}>{label}</span>
         {isRound && (
@@ -368,29 +368,32 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
   return (
     <div className="h-full flex flex-col bg-g-bg">
       {/* Header — Token-centric stats */}
-      <div className="px-3 py-2 border-b border-g-border bg-g-bg">
+      <div className="px-3 py-2 border-b border-g-border bg-g-bg-soft/60">
         <div className="flex items-center gap-4 text-[11px] text-g-fg-3">
-          <span>对话轮次: <span className="text-g-fg font-mono">{traces.turns.length}</span></span>
-          <span>LLM 调用: <span className="text-cyan-600 font-mono">{llmRounds.length}</span></span>
+          <span>对话轮次: <span className="text-g-fg font-mono font-medium">{traces.turns.length}</span></span>
+          <span className="w-px h-3.5 bg-g-border" />
+          <span>LLM 调用: <span className="text-cyan-600 font-mono font-medium">{llmRounds.length}</span></span>
+          <span className="w-px h-3.5 bg-g-border" />
           <span>
             Tokens:
-            <span className="text-blue-400 font-mono ml-1">in:{tokenLabel(totalInput)}</span>
+            <span className="text-blue-500 font-mono ml-1">in:{tokenLabel(totalInput)}</span>
             <span className="text-g-fg-4/70 mx-1">/</span>
-            <span className="text-emerald-400 font-mono">out:{tokenLabel(totalOutput)}</span>
+            <span className="text-emerald-500 font-mono">out:{tokenLabel(totalOutput)}</span>
             <span className="text-g-fg-4/70 mx-1">=</span>
-            <span className="text-g-fg font-mono">{tokenLabel(totalTokens)}</span>
+            <span className="text-g-fg font-mono font-medium">{tokenLabel(totalTokens)}</span>
           </span>
-          <span>耗时: <span className="text-g-fg font-mono">{(totalDuration / 1000).toFixed(1)}s</span></span>
-          <label className="ml-auto flex items-center gap-1 cursor-pointer">
+          <span className="w-px h-3.5 bg-g-border" />
+          <span>耗时: <span className="text-g-fg font-mono font-medium">{(totalDuration / 1000).toFixed(1)}s</span></span>
+          <label className="ml-auto flex items-center gap-1 cursor-pointer hover:text-g-fg transition-colors">
             <input
               type="checkbox"
               checked={autoRefresh}
               onChange={e => setAutoRefresh(e.target.checked)}
-              className="w-3 h-3"
+              className="w-3 h-3 accent-g-blue"
             />
             <span className="text-[10px]">自动刷新</span>
           </label>
-          <button onClick={fetchTraces} className="text-[10px] text-g-blue hover:underline">
+          <button onClick={fetchTraces} className="text-[10px] px-2 py-0.5 rounded-gm text-g-blue hover:bg-g-blue-bg/60 active:scale-[0.96] transition-all">
             刷新
           </button>
         </div>
@@ -398,30 +401,34 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
 
       {/* Sub-tabs */}
       <div className="px-3 py-1.5 border-b border-g-border bg-g-bg flex gap-1">
-        <button
-          onClick={() => setSubTab("turns")}
-          className={`px-2.5 py-1 text-[11px] rounded transition-colors ${
-            subTab === "turns" ? "bg-g-blue/15 text-g-blue" : "text-g-fg-3 hover:text-g-fg"
-          }`}
-        >
-          对话轮次 ({traces.turns.length})
-        </button>
-        <button
-          onClick={() => setSubTab("events")}
-          className={`px-2.5 py-1 text-[11px] rounded transition-colors ${
-            subTab === "events" ? "bg-g-blue/15 text-g-blue" : "text-g-fg-3 hover:text-g-fg"
-          }`}
-        >
-          LLM Token 明细 ({llmRounds.length})
-        </button>
+        <div className="flex bg-g-bg-muted rounded-gm p-0.5 gap-0.5">
+          <button
+            onClick={() => setSubTab("turns")}
+            className={`px-2.5 py-1 text-[11px] rounded-[6px] transition-all ${
+              subTab === "turns" ? "bg-g-bg text-g-fg shadow-gm-sm font-medium" : "text-g-fg-3 hover:text-g-fg"
+            }`}
+          >
+            对话轮次 ({traces.turns.length})
+          </button>
+          <button
+            onClick={() => setSubTab("events")}
+            className={`px-2.5 py-1 text-[11px] rounded-[6px] transition-all ${
+              subTab === "events" ? "bg-g-bg text-g-fg shadow-gm-sm font-medium" : "text-g-fg-3 hover:text-g-fg"
+            }`}
+          >
+            LLM Token 明细 ({llmRounds.length})
+          </button>
+        </div>
       </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-3 space-y-2">
         {subTab === "turns" ? (
           traces.turns.length === 0 ? (
-            <div className="text-center text-g-fg-4 text-sm py-8">
-              暂无对话轮次数据
+            <div className="flex flex-col items-center justify-center py-12 text-center">
+              <span className="text-3xl mb-2">📈</span>
+              <p className="text-g-fg-4 text-sm">暂无对话轮次数据</p>
+              <p className="text-[11px] text-g-fg-4/70 mt-1">Agent 开始对话后，这里会显示每轮的 Token 用量</p>
             </div>
           ) : (
             [...traces.turns].reverse().map(turn => (
@@ -441,8 +448,10 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
           )
         ) : (
           llmRounds.length === 0 ? (
-            <div className="text-center text-g-fg-4 text-sm py-8">
-              暂无 LLM Token 数据
+            <div className="flex flex-col items-center justify-center py-12 text-center">
+              <span className="text-3xl mb-2">🔍</span>
+              <p className="text-g-fg-4 text-sm">暂无 LLM Token 数据</p>
+              <p className="text-[11px] text-g-fg-4/70 mt-1">每次 LLM 调用的输入/输出明细会记录在这里</p>
             </div>
           ) : (
             [...llmRounds].reverse().map(event => (

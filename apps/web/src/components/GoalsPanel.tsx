@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { getProjectGoals, updateProjectGoals } from "../api";
 import type { GoalsData } from "../api";
 import { useAppStore } from "../store";
@@ -188,7 +188,7 @@ export default function GoalsPanel({ projectId }: Props) {
           <button
             onClick={handleSave}
             disabled={saving}
-            className="px-3 py-1 text-xs bg-g-blue text-white rounded-xl hover:bg-blue-600 transition-colors disabled:opacity-50"
+            className="px-3 py-1 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all disabled:opacity-50"
           >
             {saving ? "保存中..." : "保存"}
           </button>
@@ -197,20 +197,22 @@ export default function GoalsPanel({ projectId }: Props) {
 
       {/* Progress bar */}
       {total > 0 && (
-        <div className="space-y-1.5">
+        <div className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-sm p-4 space-y-2">
           <div className="flex items-center justify-between text-xs text-g-fg-3">
-            <span>整体进度</span>
-            <span>{done}/{total} ({pct}%)</span>
+            <span className="font-medium">整体进度</span>
+            <span className="font-mono">{done}/{total} ({pct}%)</span>
           </div>
-          <div className="h-2 bg-g-bg rounded-full overflow-hidden">
+          <div className="h-2 bg-g-bg-muted rounded-full overflow-hidden">
             <div
-              className="h-full bg-g-blue rounded-full transition-all duration-500"
+              className="h-full bg-gradient-to-r from-g-blue to-blue-400 rounded-full transition-all duration-500"
               style={{ width: `${pct}%` }}
             />
           </div>
         </div>
       )}
 
+      {/* Basics card */}
+      <div className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-sm p-4 space-y-4">
       {/* Objective */}
       <div className="space-y-1.5">
         <label className="text-xs text-g-fg-3 font-medium">目标 Objective</label>
@@ -218,7 +220,7 @@ export default function GoalsPanel({ projectId }: Props) {
           value={goals.objective}
           onChange={(e) => updateField("objective", e.target.value)}
           placeholder="项目总体目标..."
-          className="w-full px-3 py-2 bg-g-bg border border-g-border rounded-lg text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/40"
+          className="w-full px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
         />
       </div>
 
@@ -229,7 +231,7 @@ export default function GoalsPanel({ projectId }: Props) {
           value={goals.focus}
           onChange={(e) => updateField("focus", e.target.value)}
           placeholder="当前开发重点..."
-          className="w-full px-3 py-2 bg-g-bg border border-g-border rounded-lg text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/40"
+          className="w-full px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
         />
       </div>
 
@@ -240,25 +242,26 @@ export default function GoalsPanel({ projectId }: Props) {
           value={goals.userInvolvement || ""}
           onChange={(e) => updateField("userInvolvement", e.target.value)}
           placeholder="例如:宏观决策+技术选型"
-          className="w-full px-3 py-2 bg-g-bg border border-g-border rounded-lg text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/40"
+          className="w-full px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
         />
         <p className="text-xs text-g-fg-4/70">定义哪些类型的问题该问用户。例如"宏观决策+技术选型"表示用户参与宏观和技术选型决策;改为"纯宏观决策"则技术问题由 AI 链式上报。</p>
       </div>
+      </div>
 
       {/* Key Results */}
-      <div className="space-y-2">
+      <div className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-sm p-4 space-y-2">
         <label className="text-xs text-g-fg-3 font-medium">关键结果 Key Results</label>
 
         <div className="space-y-1.5">
           {goals.keyResults.map((kr, idx) => (
             <div
               key={idx}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg border border-g-border ${STATUS_BG[kr.status]} transition-colors`}
+              className={`flex items-center gap-2 px-3 py-2 rounded-gm border border-g-border ${STATUS_BG[kr.status]} hover:border-g-border-strong hover:shadow-gm-sm transition-all`}
             >
               {/* Status toggle */}
               <button
                 onClick={() => toggleStatus(idx)}
-                className={`text-lg leading-none ${STATUS_COLOR[kr.status]} hover:opacity-80 transition-opacity shrink-0`}
+                className={`text-lg leading-none ${STATUS_COLOR[kr.status]} hover:scale-125 transition-transform shrink-0`}
                 title={`点击切换: ${STATUS_LABEL[kr.status]} → ${STATUS_LABEL[nextStatus(kr.status)]}`}
               >
                 {STATUS_ICON[kr.status]}
@@ -296,7 +299,7 @@ export default function GoalsPanel({ projectId }: Props) {
               {/* Delete */}
               <button
                 onClick={() => removeKR(idx)}
-                className="text-g-fg-4/70 hover:text-red-600 transition-colors shrink-0"
+                className="p-1 rounded-gm text-g-fg-4/70 hover:text-red-600 hover:bg-red-50 transition-colors shrink-0"
                 title="删除"
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -305,6 +308,13 @@ export default function GoalsPanel({ projectId }: Props) {
               </button>
             </div>
           ))}
+          {goals.keyResults.length === 0 && (
+            <div className="flex flex-col items-center justify-center py-6 text-center">
+              <span className="text-2xl mb-1.5">🎯</span>
+              <p className="text-xs text-g-fg-4">尚未设定关键结果</p>
+              <p className="text-[10px] text-g-fg-4/70 mt-0.5">在下方输入框添加第一条 KR</p>
+            </div>
+          )}
         </div>
 
         {/* Add new KR */}
@@ -314,12 +324,12 @@ export default function GoalsPanel({ projectId }: Props) {
             onChange={(e) => setNewKR(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") addKeyResult(); }}
             placeholder="添加关键结果..."
-            className="flex-1 px-3 py-1.5 bg-g-bg border border-g-border rounded-md text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/40"
+            className="flex-1 px-3 py-1.5 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
           />
           <button
             onClick={addKeyResult}
             disabled={!newKR.trim()}
-            className="px-3 py-1.5 text-xs bg-g-bg border border-g-border hover:border-g-blue/40 text-g-fg rounded-md transition-colors disabled:opacity-30"
+            className="px-3 py-1.5 text-xs bg-g-bg border border-g-border hover:border-g-blue/50 hover:text-g-blue hover:bg-g-blue-bg/40 text-g-fg rounded-gm active:scale-[0.97] transition-all disabled:opacity-30"
           >
             添加
           </button>
@@ -327,7 +337,7 @@ export default function GoalsPanel({ projectId }: Props) {
       </div>
 
       {/* Info note */}
-      <p className="text-xs text-g-fg-4/70 leading-relaxed pt-2 border-t border-g-border">
+      <p className="text-xs text-g-fg-4/70 leading-relaxed px-3 py-2.5 bg-g-bg-soft border border-g-border/60 rounded-gm">
         此工作簿对所有 AI Agent 可见。高层和用户共同决定开发方向，每位 Agent 会在系统提示中看到这些目标并据此对齐工作。
         点击状态图标切换: ○ 待办 → ◐ 进行中 → ● 已完成。
       </p>

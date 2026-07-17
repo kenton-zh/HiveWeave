@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { getAgent, updateAgent, getPermissionRules, getModels } from "../api";
 import type { LlmModel } from "../api";
 import { useAppStore } from "../store";
@@ -235,7 +235,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
       <div className="max-w-2xl mx-auto p-6 space-y-6">
         {/* Error banner */}
         {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-2 rounded-lg text-sm">
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-2 rounded-gm shadow-gm-sm text-sm">
             {error}
             <button onClick={() => setError("")} className="ml-2 text-red-600 hover:text-red-700">×</button>
           </div>
@@ -244,14 +244,14 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
         {/* ─── Profile Section ─── */}
         <section>
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider">基础信息</h3>
+            <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider flex items-center gap-2"><span className="w-1 h-3.5 rounded-full bg-g-blue/70 shrink-0" />基础信息</h3>
             <span className="text-xs text-g-fg-4 font-mono">{agent.shortId || (agent.id || "").slice(0, 8) || "—"}</span>
           </div>
 
-          <div className="bg-g-bg border border-g-border rounded-xl p-5 space-y-4">
+          <div className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-sm hover:shadow-gm transition-shadow p-5 space-y-4">
             {/* Name + Role */}
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-lg bg-g-blue/15 flex items-center justify-center text-g-blue font-bold">
+              <div className="w-10 h-10 rounded-gmLg bg-g-blue-bg flex items-center justify-center text-g-blue font-bold shadow-gm-sm ring-1 ring-g-blue/20">
                 {agent.name.charAt(0).toUpperCase()}
               </div>
               <div>
@@ -261,7 +261,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
             </div>
 
             {/* Status */}
-            <div className="flex items-center gap-2 py-2 border-t border-g-border/50">
+            <div className="flex items-center gap-2 px-3 py-2 rounded-gm border border-g-border/60 bg-g-bg-soft">
               <span
                 className={`w-2.5 h-2.5 rounded-full ${
                   agent.status === "active"
@@ -303,14 +303,14 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                   <div className="flex gap-2 justify-end">
                     <button
                       onClick={() => setEditingGoal(false)}
-                      className="px-3 py-1 text-xs text-g-fg-3 hover:text-g-fg"
+                      className="px-3 py-1 text-xs text-g-fg-3 hover:text-g-fg rounded-gm hover:bg-g-bg-muted transition-colors"
                     >
                       取消
                     </button>
                     <button
                       onClick={() => { saveField("goal", goalDraft); setEditingGoal(false); }}
                       disabled={saving}
-                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-xl disabled:opacity-50"
+                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all disabled:opacity-50"
                     >
                       保存
                     </button>
@@ -346,14 +346,14 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                   <div className="flex gap-2 justify-end">
                     <button
                       onClick={() => setEditingBackstory(false)}
-                      className="px-3 py-1 text-xs text-g-fg-3 hover:text-g-fg"
+                      className="px-3 py-1 text-xs text-g-fg-3 hover:text-g-fg rounded-gm hover:bg-g-bg-muted transition-colors"
                     >
                       取消
                     </button>
                     <button
                       onClick={() => { saveField("backstory", backstoryDraft); setEditingBackstory(false); }}
                       disabled={saving}
-                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-xl disabled:opacity-50"
+                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all disabled:opacity-50"
                     >
                       保存
                     </button>
@@ -373,8 +373,8 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
         {/* ─── Model Configuration ─── */}
         <section>
-          <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider mb-3">模型配置</h3>
-          <div className="bg-g-bg border border-g-border rounded-xl p-5 space-y-3">
+          <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider mb-3 flex items-center gap-2"><span className="w-1 h-3.5 rounded-full bg-g-blue/70 shrink-0" />模型配置</h3>
+          <div className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-sm hover:shadow-gm transition-shadow p-5 space-y-3">
             <div>
               <label className="text-xs font-medium text-g-fg-3 mb-2 block">使用模型</label>
               {models.length > 0 ? (
@@ -416,9 +416,9 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
         {/* ─── Permissions Section (read-only; CEO sets charter, HR assigns permissions) ─── */}
         <section>
-          <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider mb-3">权限配置</h3>
+          <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider mb-3 flex items-center gap-2"><span className="w-1 h-3.5 rounded-full bg-g-blue/70 shrink-0" />权限配置</h3>
           <p className="text-xs text-g-fg-4 mb-3">CEO 维护项目章程与组织设计；HR 为各 Agent 分配权限与技能绑定。</p>
-          <div className="bg-g-bg border border-g-border rounded-xl p-5 space-y-4">
+          <div className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-sm hover:shadow-gm transition-shadow p-5 space-y-4">
             {/* Current permission mode */}
             <div>
               <label className="text-xs font-medium text-g-fg-3 mb-2 block">权限模式</label>
@@ -426,9 +426,9 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                 {PERMISSION_MODES.map((mode) => (
                   <div
                     key={mode.value}
-                    className={`px-3 py-2.5 text-xs rounded-lg border text-left ${
+                    className={`px-3 py-2.5 text-xs rounded-gm border text-left transition-all ${
                       permissions?.permissionMode === mode.value
-                        ? "bg-g-blue/15 border-g-blue text-g-blue"
+                        ? "bg-g-blue/10 border-g-blue/60 text-g-blue shadow-gm-sm"
                         : "bg-g-bg border-g-border text-g-fg-4 opacity-50"
                     }`}
                   >
@@ -446,7 +446,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                 <div className="flex flex-wrap gap-1">
                   {agent.mcpServers.length > 0 ? (
                     agent.mcpServers.map((s, i) => (
-                      <span key={i} className="px-2 py-0.5 text-[10px] bg-blue-100 text-blue-700 rounded-md">
+                      <span key={i} className="px-2 py-0.5 text-[10px] bg-g-blue-bg text-g-blue rounded-gm">
                         {s}
                       </span>
                     ))
@@ -460,7 +460,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                 <div className="flex flex-wrap gap-1">
                   {agent.boundSkills.length > 0 ? (
                     agent.boundSkills.map((s, i) => (
-                      <span key={i} className="px-2 py-0.5 text-[10px] bg-purple-100 text-purple-700 rounded-md">
+                      <span key={i} className="px-2 py-0.5 text-[10px] bg-purple-100 text-purple-700 rounded-gm">
                         {s}
                       </span>
                     ))
@@ -475,8 +475,8 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
         {/* ─── Hierarchy Section ─── */}
         <section>
-          <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider mb-3">组织关系</h3>
-          <div className="bg-g-bg border border-g-border rounded-xl p-5 space-y-3">
+          <h3 className="text-sm font-semibold text-g-fg uppercase tracking-wider mb-3 flex items-center gap-2"><span className="w-1 h-3.5 rounded-full bg-g-blue/70 shrink-0" />组织关系</h3>
+          <div className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-sm hover:shadow-gm transition-shadow p-5 space-y-3">
             <div>
               <label className="text-xs font-medium text-g-fg-3 mb-1 block">上级</label>
               {agent.parentId ? (

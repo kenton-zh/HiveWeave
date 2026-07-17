@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useAppStore } from "../store.js";
 
 interface Props {
@@ -46,6 +46,13 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
   const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
   const setPendingInitialMessage = useAppStore((s) => s.setPendingInitialMessage);
 
+  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
+  const [entered, setEntered] = useState(false);
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => setEntered(true));
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   const handleSend = (message: string) => {
     setSelectedAgent(ceoAgentId);
     setRightPanelTab("chat");
@@ -55,11 +62,11 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
       onClick={onClose}
     >
       <div
-        className="bg-g-bg border border-g-border rounded-xl shadow-2xl p-6 w-full max-w-lg mx-4"
+        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg p-6 w-full max-w-lg mx-4 transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -69,7 +76,7 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
           </h2>
           <button
             onClick={onClose}
-            className="text-g-fg-3 hover:text-g-fg text-xl leading-none transition-colors"
+            className="w-7 h-7 flex items-center justify-center rounded-gm text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted text-base leading-none transition-colors"
           >
             ✕
           </button>
@@ -79,10 +86,13 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
         <div className="space-y-3 mb-4">
           <button
             onClick={() => handleSend(ANALYZE_AND_BUILD)}
-            className="w-full text-left px-4 py-3 rounded-lg border border-g-border bg-g-bg-soft hover:bg-g-bg-soft transition-colors"
+            className="w-full text-left px-4 py-3 rounded-gmLg border border-g-border bg-g-bg hover:border-g-blue/50 hover:bg-g-blue-bg/30 hover:shadow-gm active:scale-[0.99] transition-all group"
           >
-            <div className="text-g-fg font-medium">
-              已有代码 — 分析项目并搭建团队
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-g-fg font-medium">
+                已有代码 — 分析项目并搭建团队
+              </div>
+              <span className="text-g-blue opacity-0 group-hover:opacity-100 -translate-x-1 group-hover:translate-x-0 transition-all shrink-0">→</span>
             </div>
             <div className="text-g-fg-3 text-sm mt-0.5">
               探索 → 环境 → 按模块招人 → 短烟测 → dispatch 开工
@@ -91,10 +101,13 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
 
           <button
             onClick={() => handleSend(BRAINSTORM)}
-            className="w-full text-left px-4 py-3 rounded-lg border border-g-border bg-g-bg-soft hover:bg-g-bg-soft transition-colors"
+            className="w-full text-left px-4 py-3 rounded-gmLg border border-g-border bg-g-bg hover:border-g-blue/50 hover:bg-g-blue-bg/30 hover:shadow-gm active:scale-[0.99] transition-all group"
           >
-            <div className="text-g-fg font-medium">
-              空项目 — 先讨论再动手
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-g-fg font-medium">
+                空项目 — 先讨论再动手
+              </div>
+              <span className="text-g-blue opacity-0 group-hover:opacity-100 -translate-x-1 group-hover:translate-x-0 transition-all shrink-0">→</span>
             </div>
             <div className="text-g-fg-3 text-sm mt-0.5">
               先对齐目标/技术栈/范围，确认后再招人派活
@@ -103,10 +116,13 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
 
           <button
             onClick={() => handleSend(QUICK_PROTOTYPE)}
-            className="w-full text-left px-4 py-3 rounded-lg border border-g-border bg-g-bg-soft hover:bg-g-bg-soft transition-colors"
+            className="w-full text-left px-4 py-3 rounded-gmLg border border-g-border bg-g-bg hover:border-g-blue/50 hover:bg-g-blue-bg/30 hover:shadow-gm active:scale-[0.99] transition-all group"
           >
-            <div className="text-g-fg font-medium">
-              快速原型 — 最小团队交付
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-g-fg font-medium">
+                快速原型 — 最小团队交付
+              </div>
+              <span className="text-g-blue opacity-0 group-hover:opacity-100 -translate-x-1 group-hover:translate-x-0 transition-all shrink-0">→</span>
             </div>
             <div className="text-g-fg-3 text-sm mt-0.5">
               只招 1 名工程师，CEO 派活验收，适合小任务
@@ -133,13 +149,13 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
               }
             }}
             placeholder="自己写开局指令…"
-            className="flex-1 px-3 py-2 bg-g-bg-soft border border-g-border rounded-lg text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue text-sm"
+            className="flex-1 px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/15 text-sm transition-shadow"
 
           />
           <button
             disabled={!customInput.trim()}
             onClick={() => customInput.trim() && handleSend(customInput.trim())}
-            className="px-4 py-2 bg-g-blue text-white hover:bg-blue-600 disabled:opacity-40 text-white rounded-lg text-sm font-medium transition-colors"
+            className="px-4 py-2 bg-g-blue text-white hover:bg-blue-600 disabled:opacity-40 text-white rounded-gm text-sm font-medium shadow-gm-sm active:scale-[0.97] transition-all"
           >
             发送
           </button>

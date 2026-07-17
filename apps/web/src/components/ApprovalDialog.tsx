@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useAppStore } from "../store";
 import { getPendingApprovals, respondToApproval } from "../api";
 
@@ -26,6 +26,13 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
 
   const setPendingApprovals = useAppStore((s) => s.setPendingApprovals);
   const removeApproval = useAppStore((s) => s.removeApproval);
+
+  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
+  const [entered, setEntered] = useState(false);
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => setEntered(true));
+    return () => cancelAnimationFrame(raf);
+  }, []);
 
   const fetchApprovals = useCallback(async () => {
     try {
@@ -85,16 +92,19 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+    <div
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
+      onClick={onClose}
+    >
       <div
-        className="bg-g-bg border border-g-border rounded-xl shadow-2xl w-full max-w-lg max-h-[80vh] flex flex-col"
+        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg w-full max-w-lg max-h-[80vh] flex flex-col transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-g-border">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-amber-500/20 rounded-lg flex items-center justify-center">
-              <svg className="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <div className="w-8 h-8 bg-amber-50 ring-1 ring-amber-200/60 rounded-gm flex items-center justify-center">
+              <svg className="w-5 h-5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
               </svg>
             </div>
@@ -120,8 +130,10 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
               <div className="w-6 h-6 border-2 border-g-blue border-t-transparent rounded-full animate-spin" />
             </div>
           ) : approvals.length === 0 ? (
-            <div className="text-center py-8 text-g-fg-3">
-              <p>暂无待审批的请求</p>
+            <div className="text-center py-10">
+              <div className="text-3xl mb-2">✅</div>
+              <p className="text-sm text-g-fg-3">暂无待审批的请求</p>
+              <p className="text-xs text-g-fg-4 mt-1">Agent 发起敏感操作时会出现在这里</p>
             </div>
           ) : (
             approvals.map((approval) => {
@@ -129,12 +141,12 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
               return (
                 <div
                   key={approval.id}
-                  className="bg-g-bg rounded-lg border border-g-border p-4"
+                  className="bg-g-bg rounded-gmLg border border-g-border shadow-gm-sm hover:shadow-gm transition-shadow p-4"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-1">
-                        <span className="text-xs font-mono bg-blue-100 text-blue-700 px-2 py-0.5 rounded">
+                        <span className="text-xs font-mono bg-g-blue-bg text-g-blue px-2 py-0.5 rounded-gm">
                           {formatToolName(approval.toolName)}
                         </span>
                         <span className="text-[10px] text-g-fg-4">
@@ -145,7 +157,7 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
                         <p className="text-sm text-g-fg mt-2">{approval.description}</p>
                       )}
                       {formattedArgs && (
-                        <pre className="text-xs text-g-fg-3 bg-g-bg rounded p-2 mt-2 overflow-x-auto max-h-32">
+                        <pre className="text-xs text-g-fg-3 bg-g-bg-soft border border-g-border/60 rounded-gm p-2 mt-2 overflow-x-auto max-h-32">
                           {formattedArgs}
                         </pre>
                       )}
@@ -153,18 +165,18 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
                   </div>
 
                   {/* Per-request actions */}
-                  <div className="flex items-center gap-2 mt-3 pt-3 border-t border-g-border">
+                  <div className="flex items-center gap-2 mt-3 pt-3 border-t border-g-border/60">
                     <button
                       onClick={() => handleRespond(approval.id, true)}
                       disabled={processing === approval.id}
-                      className="flex-1 px-3 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-md transition-colors"
+                      className="flex-1 px-3 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
                     >
                       {processing === approval.id ? "处理中..." : "同意"}
                     </button>
                     <button
                       onClick={() => handleRespond(approval.id, false)}
                       disabled={processing === approval.id}
-                      className="flex-1 px-3 py-1.5 text-xs font-medium bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-md transition-colors"
+                      className="flex-1 px-3 py-1.5 text-xs font-medium bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
                     >
                       {processing === approval.id ? "处理中..." : "拒绝"}
                     </button>
@@ -195,7 +207,7 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
               value={userNote}
               onChange={(e) => setUserNote(e.target.value)}
               placeholder="添加备注（可选）"
-              className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-md text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue"
+              className="w-full px-3 py-2 text-sm bg-g-bg-soft border border-g-border rounded-gm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/15 transition-shadow"
             />
 
             {/* Bulk actions */}
@@ -204,14 +216,14 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
                 <button
                   onClick={() => handleBulkRespond(true)}
                   disabled={processing !== null}
-                  className="flex-1 px-3 py-2 text-sm font-medium bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-md transition-colors"
+                  className="flex-1 px-3 py-2 text-sm font-medium bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
                 >
                   全部同意 ({approvals.length})
                 </button>
                 <button
                   onClick={() => handleBulkRespond(false)}
                   disabled={processing !== null}
-                  className="flex-1 px-3 py-2 text-sm font-medium bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-md transition-colors"
+                  className="flex-1 px-3 py-2 text-sm font-medium bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
                 >
                   全部拒绝
                 </button>

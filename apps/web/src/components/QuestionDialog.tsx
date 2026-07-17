@@ -9,6 +9,13 @@ export default function QuestionDialog() {
   const selectedProjectId = useAppStore((s) => s.selectedProjectId);
   const questionVersion = useAppStore((s) => s.questionVersion);
 
+  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
+  const [entered, setEntered] = useState(false);
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => setEntered(true));
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   // 立即拉取一次 pending questions（WebSocket question_asked 事件触发）
   useEffect(() => {
     let cancelled = false;
@@ -68,8 +75,13 @@ export default function QuestionDialog() {
   const q = questions[0];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={(e) => { if (e.target === e.currentTarget) handleDismiss(q.id, q.agentId); }}>
-      <div className="bg-g-bg border border-g-border rounded-xl shadow-2xl w-[480px] max-h-[80vh] overflow-auto p-6">
+    <div
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
+      onClick={(e) => { if (e.target === e.currentTarget) handleDismiss(q.id, q.agentId); }}
+    >
+      <div
+        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg w-[480px] max-h-[80vh] overflow-auto p-6 transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
+      >
         <div className="flex items-center gap-2 mb-4">
           <span className="text-lg">📋</span>
           <h3 className="text-sm font-semibold text-g-fg flex-1">Agent 需要你的决定</h3>
@@ -97,7 +109,7 @@ export default function QuestionDialog() {
                 key={i}
                 onClick={() => handleAnswer(q.id, label, q.agentId)}
                 disabled={submitting}
-                className="w-full text-left px-4 py-3 rounded-lg bg-g-bg border border-g-border hover:border-g-blue hover:bg-g-blue/10 transition-colors disabled:opacity-50"
+                className="w-full text-left px-4 py-3 rounded-gm bg-g-bg border border-g-border hover:border-g-blue/50 hover:bg-g-blue-bg/40 hover:shadow-gm-sm active:scale-[0.99] transition-all disabled:opacity-50"
               >
                 <div className="text-sm font-medium text-g-fg">{label}</div>
                 {desc && <div className="text-xs text-g-fg-4 mt-0.5">{desc}</div>}
@@ -119,14 +131,14 @@ export default function QuestionDialog() {
               }
             }}
             disabled={submitting}
-            className="flex-1 px-3 py-2 rounded-lg bg-g-bg border border-g-border text-g-fg text-sm focus:outline-none focus:border-g-blue disabled:opacity-50"
+            className="flex-1 px-3 py-2 rounded-gm bg-g-bg-soft border border-g-border text-g-fg placeholder-g-fg-4/70 text-sm focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/15 disabled:opacity-50 transition-shadow"
           />
           <button
             onClick={() => {
               if (customAnswers[q.id]?.trim()) handleAnswer(q.id, customAnswers[q.id].trim(), q.agentId);
             }}
             disabled={!customAnswers[q.id]?.trim() || submitting}
-            className="px-4 py-2 rounded-lg bg-g-blue text-white text-sm font-medium hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="px-4 py-2 rounded-gm bg-g-blue text-white text-sm font-medium shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
           >
             发送
           </button>

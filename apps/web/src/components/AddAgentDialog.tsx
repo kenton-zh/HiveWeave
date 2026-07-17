@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { createAgent, getTemplates, getTemplateDivisions, getTemplate, getModels, type AgentTemplate, type LlmModel } from "../api";
 
 interface AddAgentDialogProps {
@@ -37,6 +37,13 @@ export default function AddAgentDialog({ projectId, parentId, onClose, onCreated
   const [models, setModels] = useState<LlmModel[]>([]);
   const [selectedModelId, setSelectedModelId] = useState<string>("");
 
+  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
+  const [entered, setEntered] = useState(false);
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => setEntered(true));
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   // Load available models on mount
   useEffect(() => {
     getModels().then(setModels).catch(() => {});
@@ -69,11 +76,14 @@ export default function AddAgentDialog({ projectId, parentId, onClose, onCreated
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+    <div
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
+      onClick={onClose}
+    >
       <div
-        className={`bg-g-bg border border-g-border rounded-xl shadow-2xl flex flex-col ${
+        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg flex flex-col transform transition-all duration-200 ease-out ${
           mode === "template" ? "w-full max-w-2xl max-h-[85vh]" : "w-full max-w-md"
-        }`}
+        } ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -144,14 +154,14 @@ export default function AddAgentDialog({ projectId, parentId, onClose, onCreated
         <div className="flex justify-end gap-2 px-6 py-4 border-t border-g-border shrink-0">
           <button
             onClick={onClose}
-            className="px-4 py-2 text-sm text-g-fg-3 hover:text-g-fg transition-colors"
+            className="px-4 py-2 text-sm text-g-fg-3 hover:text-g-fg rounded-gm hover:bg-g-bg-muted active:scale-[0.97] transition-all"
           >
             取消
           </button>
           <button
             onClick={handleSubmit}
             disabled={!canSubmit}
-            className="px-4 py-2 text-sm font-medium bg-g-blue hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+            className="px-4 py-2 text-sm font-medium bg-g-blue hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
           >
             {loading ? "创建中..." : "创建"}
           </button>
@@ -231,10 +241,10 @@ function ManualForm(props: {
               <button
                 key={r.value}
                 onClick={() => setRole(r.value)}
-                className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors border ${
+                className={`px-2.5 py-1 text-[11px] font-medium rounded-gm border active:scale-[0.96] transition-all ${
                   role === r.value
-                    ? "bg-g-blue/15 border-g-blue text-g-blue"
-                    : "bg-g-bg border-g-border text-g-fg-3 hover:border-g-border"
+                    ? "bg-g-blue/10 border-g-blue/60 text-g-blue shadow-gm-sm"
+                    : "bg-g-bg border-g-border text-g-fg-3 hover:border-g-border-strong hover:text-g-fg hover:shadow-gm-sm"
                 }`}
                 title={r.desc}
               >
@@ -243,7 +253,7 @@ function ManualForm(props: {
             ))}
             <button
               onClick={() => { setCustomRole(true); setRole(""); }}
-              className="px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors border bg-g-bg border-dashed border-g-border text-g-fg-4 hover:border-gray-400 hover:text-g-fg"
+              className="px-2.5 py-1 text-[11px] font-medium rounded-gm border bg-g-bg border-dashed border-g-border text-g-fg-4 hover:border-g-blue/50 hover:text-g-blue active:scale-[0.96] transition-all"
             >
               + 自定义
             </button>
@@ -259,10 +269,10 @@ function ManualForm(props: {
             <button
               key={p.value}
               onClick={() => setPermissionType(p.value as "coordinator" | "executor")}
-              className={`px-3 py-2 text-xs rounded-lg transition-colors border text-left ${
+              className={`px-3 py-2 text-xs rounded-gm border text-left active:scale-[0.98] transition-all ${
                 permissionType === p.value
-                  ? "bg-g-blue/15 border-g-blue text-g-blue"
-                  : "bg-g-bg border-g-border text-g-fg-3 hover:border-g-border"
+                  ? "bg-g-blue/10 border-g-blue/60 text-g-blue shadow-gm-sm"
+                  : "bg-g-bg border-g-border text-g-fg-3 hover:border-g-border-strong hover:shadow-gm-sm"
               }`}
             >
               <span className="font-medium">{p.label}</span>
@@ -379,10 +389,10 @@ function TemplatePicker({ onSelectTemplate }: { onSelectTemplate: (tpl: AgentTem
         <div className="flex flex-wrap gap-1.5">
           <button
             onClick={() => setActiveDivision("")}
-            className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors border ${
+            className={`px-2.5 py-1 text-[11px] font-medium rounded-gm border active:scale-[0.96] transition-all ${
               !activeDivision
-                ? "bg-g-blue/15 border-g-blue text-g-blue"
-                : "bg-g-bg border-g-border text-g-fg-3 hover:border-g-border"
+                ? "bg-g-blue/10 border-g-blue/60 text-g-blue shadow-gm-sm"
+                : "bg-g-bg border-g-border text-g-fg-3 hover:border-g-border-strong hover:text-g-fg"
             }`}
           >
             全部
@@ -391,10 +401,10 @@ function TemplatePicker({ onSelectTemplate }: { onSelectTemplate: (tpl: AgentTem
             <button
               key={d.division}
               onClick={() => setActiveDivision(d.division === activeDivision ? "" : d.division)}
-              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors border ${
+              className={`px-2.5 py-1 text-[11px] font-medium rounded-gm border active:scale-[0.96] transition-all ${
                 activeDivision === d.division
-                  ? "bg-g-blue/15 border-g-blue text-g-blue"
-                  : "bg-g-bg border-g-border text-g-fg-3 hover:border-g-border"
+                  ? "bg-g-blue/10 border-g-blue/60 text-g-blue shadow-gm-sm"
+                  : "bg-g-bg border-g-border text-g-fg-3 hover:border-g-border-strong hover:text-g-fg"
               }`}
             >
               {d.division} ({d.count})
@@ -408,8 +418,11 @@ function TemplatePicker({ onSelectTemplate }: { onSelectTemplate: (tpl: AgentTem
         {loading ? (
           <div className="flex items-center justify-center h-32 text-g-fg-4 text-sm">加载中...</div>
         ) : templates.length === 0 ? (
-          <div className="flex items-center justify-center h-32 text-g-fg-4 text-sm">
-            {search || activeDivision ? "没有找到匹配的模板" : "模板库为空，请先运行导入脚本"}
+          <div className="flex flex-col items-center justify-center h-32 gap-1.5">
+            <span className="text-2xl">🗂️</span>
+            <span className="text-g-fg-4 text-sm">
+              {search || activeDivision ? "没有找到匹配的模板" : "模板库为空，请先运行导入脚本"}
+            </span>
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-2">
@@ -417,9 +430,9 @@ function TemplatePicker({ onSelectTemplate }: { onSelectTemplate: (tpl: AgentTem
               <button
                 key={tpl.id}
                 onClick={() => onSelectTemplate(tpl)}
-                className="flex items-start gap-2.5 px-3 py-2.5 rounded-lg border border-g-border bg-g-bg hover:border-g-blue/40 hover:bg-g-blue/5 text-left transition-colors group"
+                className="flex items-start gap-2.5 px-3 py-2.5 rounded-gmLg border border-g-border bg-g-bg hover:border-g-blue/40 hover:bg-g-blue-bg/30 hover:shadow-gm active:scale-[0.99] text-left transition-all group"
               >
-                <span className="text-lg shrink-0 mt-0.5">{tpl.emoji || "📋"}</span>
+                <span className="text-lg shrink-0 mt-0.5 group-hover:scale-110 transition-transform">{tpl.emoji || "📋"}</span>
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <span className="text-sm font-medium text-g-fg group-hover:text-g-blue transition-colors truncate">

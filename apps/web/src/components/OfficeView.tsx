@@ -201,13 +201,35 @@ export default function OfficeView() {
     <div className="relative h-full w-full overflow-hidden bg-g-bg-soft">
       <div ref={hostRef} className="h-full w-full" />
       {error && (
-        <div className="absolute top-4 left-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 z-10 shadow-gm-sm">
+        <div className="absolute top-4 left-4 rounded-xl border border-red-200 bg-red-50/95 backdrop-blur-sm px-3.5 py-2.5 text-xs text-red-700 z-10 shadow-gm-md flex items-center gap-2">
+          <svg className="w-4 h-4 text-red-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+          </svg>
           {error}
         </div>
       )}
       {!error && (
-        <div className="absolute top-2 right-2 text-[10px] text-g-fg-4 z-10 font-mono">
-          PixiJS v8 · {agents.length} agents · {processingAgents.length} active
+        <div className="absolute top-2 right-2 z-10 flex items-center gap-1.5 rounded-full bg-white/75 backdrop-blur-sm border border-g-border px-2.5 py-1 shadow-gm-sm">
+          <span className={`w-1.5 h-1.5 rounded-full ${processingAgents.length > 0 ? "bg-emerald-500 animate-pulse" : "bg-g-fg-4"}`} />
+          <span className="text-[10px] text-g-fg-3 font-mono">
+            PixiJS v8 · {agents.length} agents · {processingAgents.length} active
+          </span>
+        </div>
+      )}
+      {!error && !loading && agents.length > 0 && (
+        <div className="absolute bottom-2 left-2 z-10 rounded-full bg-white/65 backdrop-blur-sm border border-g-border px-2.5 py-1 shadow-gm-sm pointer-events-none">
+          <span className="text-[10px] text-g-fg-4">点击小人打开对话</span>
+        </div>
+      )}
+      {!error && loading && agents.length === 0 && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
+          <div className="flex items-center gap-2.5 rounded-2xl bg-white/80 backdrop-blur-sm border border-g-border px-4 py-3 shadow-gm-md">
+            <svg className="w-4 h-4 text-g-blue animate-spin" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+            <span className="text-xs text-g-fg-3">正在加载办公室…</span>
+          </div>
         </div>
       )}
     </div>

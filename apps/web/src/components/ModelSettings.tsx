@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 import { getModels, createModel, updateModel, deleteModel, testModel } from "../api";
 import type { LlmModel } from "../api";
 import { useAppStore } from "../store";
@@ -19,6 +19,13 @@ export default function ModelSettings({ onClose }: Props) {
   const [testResult, setTestResult] = useState<{ ok: boolean; latencyMs: number; error?: string } | null>(null);
   // Test-friendly confirm dialog
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
+  const [entered, setEntered] = useState(false);
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => setEntered(true));
+    return () => cancelAnimationFrame(raf);
+  }, []);
 
   // Form state
   const [formName, setFormName] = useState("");
@@ -139,9 +146,12 @@ export default function ModelSettings({ onClose }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
+    <div
+      className={`fixed inset-0 bg-black/60 backdrop-blur-[2px] flex items-center justify-center z-50 transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
+      onClick={onClose}
+    >
       <div
-        className="bg-g-bg border border-g-border rounded-xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col"
+        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg w-[640px] max-h-[80vh] flex flex-col transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -150,11 +160,11 @@ export default function ModelSettings({ onClose }: Props) {
           <div className="flex items-center gap-2">
             <button
               onClick={() => { resetForm(); setShowForm(true); }}
-              className="px-3 py-1.5 text-sm bg-g-blue text-white rounded-xl hover:bg-blue-600 transition-colors"
+              className="px-3 py-1.5 text-sm bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all"
             >
               + Add Model
             </button>
-            <button onClick={onClose} className="text-g-fg-3 hover:text-g-fg transition-colors">
+            <button onClick={onClose} className="w-8 h-8 flex items-center justify-center rounded-gm text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted transition-colors">
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
               </svg>
@@ -167,16 +177,17 @@ export default function ModelSettings({ onClose }: Props) {
           {loading ? (
             <div className="text-center text-g-fg-3 py-8">Loading models...</div>
           ) : models.length === 0 ? (
-            <div className="text-center text-g-fg-3 py-8">
-              No models configured. Add a model to get started.
+            <div className="text-center py-10">
+              <div className="text-3xl mb-2">🔌</div>
+              <p className="text-sm text-g-fg-3">No models configured. Add a model to get started.</p>
             </div>
           ) : (
             <div className="space-y-3">
               {models.map((model, idx) => (
                 <div
                   key={model.id}
-                  className={`border rounded-lg p-4 transition-colors ${
-                    idx === 0 ? "border-g-blue/40 bg-g-blue/5" : "border-g-border bg-g-bg"
+                  className={`border rounded-gmLg p-4 transition-all hover:shadow-gm ${
+                    idx === 0 ? "border-g-blue/40 bg-g-blue-bg/20 shadow-gm-sm" : "border-g-border bg-g-bg shadow-gm-sm"
                   }`}
                 >
                   <div className="flex items-start justify-between">
@@ -184,12 +195,12 @@ export default function ModelSettings({ onClose }: Props) {
                       <div className="flex items-center gap-2">
                         <span className="font-medium text-g-fg truncate">{model.name}</span>
                         {idx === 0 && (
-                          <span className="text-[10px] px-1.5 py-0.5 bg-g-blue/15 text-g-blue rounded font-medium">
+                          <span className="text-[10px] px-1.5 py-0.5 bg-g-blue-bg text-g-blue rounded-gm font-medium">
                             DEFAULT
                           </span>
                         )}
                         {model.supportsThinking && (
-                          <span className="text-[10px] px-1.5 py-0.5 bg-purple-50 text-purple-700 rounded font-medium">
+                          <span className="text-[10px] px-1.5 py-0.5 bg-purple-50 text-purple-700 rounded-gm font-medium">
                             THINKING
                           </span>
                         )}
@@ -204,19 +215,19 @@ export default function ModelSettings({ onClose }: Props) {
                       <button
                         onClick={() => handleTest(model.id)}
                         disabled={testingId === model.id}
-                        className="px-2 py-1 text-xs rounded border border-g-border text-g-fg-3 hover:text-g-fg hover:border-g-border transition-colors disabled:opacity-50"
+                        className="px-2 py-1 text-xs rounded-gm border border-g-border text-g-fg-3 hover:text-g-blue hover:border-g-blue/40 hover:bg-g-blue-bg/40 active:scale-[0.96] transition-all disabled:opacity-50"
                       >
                         {testingId === model.id ? "Testing..." : "Test"}
                       </button>
                       <button
                         onClick={() => startEdit(model)}
-                        className="px-2 py-1 text-xs rounded border border-g-border text-g-fg-3 hover:text-g-fg hover:border-g-border transition-colors"
+                        className="px-2 py-1 text-xs rounded-gm border border-g-border text-g-fg-3 hover:text-g-fg hover:border-g-border-strong hover:bg-g-bg-soft active:scale-[0.96] transition-all"
                       >
                         Edit
                       </button>
                       <button
                         onClick={() => handleDelete(model.id)}
-                        className="px-2 py-1 text-xs rounded border border-g-border text-g-fg-3 hover:text-red-600 hover:border-red-200 transition-colors"
+                        className="px-2 py-1 text-xs rounded-gm border border-g-border text-g-fg-3 hover:text-red-600 hover:border-red-200 hover:bg-red-50 active:scale-[0.96] transition-all"
                       >
                         Delete
                       </button>
@@ -234,7 +245,7 @@ export default function ModelSettings({ onClose }: Props) {
 
           {/* Add/Edit Form */}
           {showForm && (
-            <div className="mt-4 border border-g-blue/30 rounded-lg p-4 bg-g-bg">
+            <div className="mt-4 border border-g-blue/30 rounded-gmLg p-4 bg-g-bg-soft shadow-gm-sm">
               <h3 className="text-sm font-medium text-g-fg mb-3">
                 {editingId ? "Edit Model" : "Add New Model"}
               </h3>
@@ -340,13 +351,13 @@ export default function ModelSettings({ onClose }: Props) {
                 <div className="flex items-center gap-2 pt-2">
                   <button
                     onClick={handleSubmit}
-                    className="px-4 py-2 text-sm bg-g-blue text-white rounded-xl hover:bg-blue-600 transition-colors"
+                    className="px-4 py-2 text-sm bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all"
                   >
                     {editingId ? "Save Changes" : "Add Model"}
                   </button>
                   <button
                     onClick={resetForm}
-                    className="px-4 py-2 text-sm text-g-fg-3 hover:text-g-fg transition-colors"
+                    className="px-4 py-2 text-sm text-g-fg-3 hover:text-g-fg rounded-gm hover:bg-g-bg-muted active:scale-[0.97] transition-all"
                   >
                     Cancel
                   </button>
