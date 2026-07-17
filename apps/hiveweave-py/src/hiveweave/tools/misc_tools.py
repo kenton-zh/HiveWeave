@@ -191,6 +191,32 @@ async def git_worktree_list_tool(
 
 # ── git_worktree_merge ───────────────────────────────────
 
+# short_id 形状：ASCII 字母 + 2-4 位数字（A001/A066）。
+# 不能用 str.isalnum() 判断 —— CJK 字符同样 isalnum，
+# 短中文任务名（如"后端工程师"）会被误判为 short_id 走错查询路径。
+_SHORT_ID_RE = re.compile(r"[A-Za-z]\d{2,4}")
+
+
+def _parse_branch_list(branch_out: str) -> list[str]:
+    """解析 `git branch --list` 输出为干净分支名列表。
+
+    输出前缀规则：当前分支 "* name"，worktree 检出分支 "+ name"，其他 "  name"。
+    此前用 lstrip("* ") 无法去掉 "+ " 前缀 → worktree 分支名被解析成
+    "+ hw/A004/..."，git merge 拿这个名字直接失败，被误判成"假冲突"。
+    """
+    out: list[str] = []
+    for line in (branch_out or "").strip().split("\n"):
+        line = line.rstrip()
+        if not line.strip():
+            continue
+        if line.startswith(("* ", "+ ")):
+            name = line[2:].strip()
+        else:
+            name = line.strip()
+        if name:
+            out.append(name)
+    return out
+
 
 class GitWorktreeMergeParams(BaseModel):
     """Parameters for git_worktree_merge tool."""
@@ -227,10 +253,12 @@ async def git_worktree_merge_tool(
     """Merge a git worktree branch back into main and remove the worktree.
 
     Bug G fix: 支持架构师合并其他 agent 的 worktree。
-    branch_name 可以是：
-    - short_id (如 "A066") — 自动查找该 agent 的分支
-    - 完整分支名 (如 "hw/A066/后端工程师") — 直接使用
-    - task_name (如 "后端工程师") — 用调用者自己的 short_id
+    branch_name 解析顺序：
+    - "hw/..." 完整分支名 — 直接使用
+    - short_id (如 "A066") — 查找该 agent 的分支
+    - task_name (如 "后端工程师" / "feat-x") — 先查调用者自己的分支；
+      查不到再全局搜索 hw/*/<name>，唯一匹配则合并，
+      零匹配/多匹配则报错并列出候选分支（不再静默拼调用者前缀）。
     """
     from hiveweave.services.git_worktree import GitWorktreeService
 
@@ -256,15 +284,16 @@ async def git_worktree_merge_tool(
         result = await gwt.merge_by_branch(
             workspace_path, branch_name, target_branch
         )
-    elif len(branch_name) <= 8 and branch_name.isalnum():
-        # 看起来是 short_id (如 "A066") — 查找该 agent 的实际分支
+    elif _SHORT_ID_RE.fullmatch(branch_name):
+        # 严格 short_id 形状（字母+数字，如 "A066"）— 查找该 agent 的分支。
+        # 注意：不能用 isalnum() —— CJK 字符也算 alnum，短中文任务名
+        # （如"后端工程师"）会被误判成 short_id。
         from hiveweave.services.git_worktree import _git
         ok, branch_out = await _git(
             ["branch", "--list", f"hw/{branch_name}/*"],
             workspace_path
         )
-        branches = [b.strip().lstrip("* ").strip()
-                    for b in branch_out.strip().split("\n") if b.strip()]
+        branches = _parse_branch_list(branch_out)
         if not branches:
             from hiveweave.services.worktree_review import MERGE_CONFLICT_HINT
 
@@ -284,12 +313,62 @@ async def git_worktree_merge_tool(
                 f"Remaining branches: {remaining}"
             )
     else:
-        # task_name — 用调用者自己的 short_id (原始行为)
-        merged_short = caller_short_id
-        merged_branch = f"hw/{caller_short_id}/{branch_name}"
-        result = await gwt.merge(
-            workspace_path, caller_short_id, str(branch_name), target_branch
+        # task_name — 先按原行为查调用者自己的分支；查不到则全局搜索
+        # hw/*/<slug>（coordinator 按名字合并 executor 分支的场景）。
+        # 旧行为：静默用调用者 short_id 拼前缀 → coordinator 传 executor 的
+        # 分支名时必然找错（井字棋实测：解析成 hw/A001/feat-tictactoe-a004）。
+        from hiveweave.services.git_worktree import _git, _slugify
+
+        slug = _slugify(branch_name)
+        caller_branch = f"hw/{caller_short_id}/{slug}"
+        ok_c, out_c = await _git(
+            ["branch", "--list", caller_branch], workspace_path
         )
+        caller_exists = bool(ok_c and caller_branch in (out_c or ""))
+
+        if caller_exists:
+            merged_short = caller_short_id
+            merged_branch = caller_branch
+            result = await gwt.merge(
+                workspace_path, caller_short_id, str(branch_name), target_branch
+            )
+        else:
+            ok_g, out_g = await _git(
+                ["branch", "--list", f"hw/*/{slug}"], workspace_path
+            )
+            matches = _parse_branch_list(out_g)
+            if len(matches) == 1:
+                merged_branch = matches[0]
+                from hiveweave.tools.task_tools import (
+                    parse_short_id_from_branch,
+                )
+
+                merged_short = parse_short_id_from_branch(matches[0])
+                result = await gwt.merge_by_branch(
+                    workspace_path, matches[0], target_branch
+                )
+            else:
+                ok_all, out_all = await _git(
+                    ["branch", "--list", "hw/*/*"], workspace_path
+                )
+                all_branches = _parse_branch_list(out_all)
+                listing = (
+                    "Available worktree branches:\n"
+                    + "\n".join(f"  - {b}" for b in all_branches)
+                    if all_branches
+                    else "No hw/*/* worktree branches exist."
+                )
+                if len(matches) > 1:
+                    return ToolResult.err(
+                        f"Ambiguous branch name '{branch_name}' matches "
+                        f"{len(matches)} branches — pass the full name "
+                        f"(hw/<shortId>/<name>) instead:\n"
+                        + "\n".join(f"  - {m}" for m in matches)
+                    )
+                return ToolResult.err(
+                    f"No worktree branch found matching '{branch_name}' "
+                    f"(tried '{caller_branch}' and 'hw/*/{slug}').\n\n{listing}"
+                )
 
     short = result.get("short_id") or merged_short or caller_short_id
     branch = result.get("branch") or merged_branch
