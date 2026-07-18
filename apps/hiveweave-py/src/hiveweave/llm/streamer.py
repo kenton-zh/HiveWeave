@@ -7,7 +7,7 @@
 - 三层超时: connect=10s / read=120s / total=300s
 - Tool loop: LLM 返回 tool_calls → 执行工具 → 结果追加 → 重新请求，最多 100 轮（所有角色统一）
 - 空响应重试: 无 content 无 tool_calls 时重试，最多 3 次
-- Doom loop 检测: 同一工具+同一参数 3 次中断
+- Doom loop 检测: 同一工具+同一参数 3 次中断；只读轮询工具豁免计数，15 次保险丝熔断
 - 中轮提醒: 80% 轮次时注入「开始收尾」系统提示
 - 参考: Elixir streamer.ex + TS agent-runtime.ts
 
@@ -87,20 +87,47 @@ EMPTY_RESPONSE_BACKOFF_MS = [5_000, 15_000, 45_000]
 DOOM_LOOP_DEFAULT_LIMIT = 3
 """默认 doom loop 阈值 — 同一工具+同一参数连续 N 次中断。"""
 
+# ── 只读/幂等轮询工具豁免集合 ──────────────────────────────
+# 实锤事故（生产日志）：归零/拾光/潮汐各被 doom 杀过一次 ——
+# 「Doom loop detected: tool get_tasks called 3+ times with same args」。
+# agent 没有订阅机制，轮询 get_tasks / read_file 是它获取状态的唯一手段，
+# 按默认阈值 3 判定 doom 属于误杀。
+# 以 tools/executor.py 实际注册的工具名为准（勿写 service 层方法名）：
+DOOM_LOOP_READONLY_TOOLS: frozenset[str] = frozenset({
+    # 任务账本 / 状态轮询 — agent 获取任务与进度的唯一通道
+    "get_tasks",
+    # 文件探索
+    "read_file",
+    "list_files",
+    "grep",
+    "search_files",
+    # 组织 / 角色 / 技能查询
+    "read_charter",
+    "read_goals",
+    "read_memory",
+    "read_roster",
+    "read_skill",
+    "list_available_skills",
+    "view_org_chart",
+    "list_subordinates",
+    "list_agent_templates",
+    # 日志 / 告警查询
+    "read_work_logs",
+    "list_alarms",
+    # worktree 只读查询
+    "git_worktree_list",
+    "git_worktree_status",
+})
+"""只读/幂等工具集合 — 同参重复调用不按 doom 阈值计数，只受保险丝约束。"""
+
+DOOM_LOOP_READONLY_FUSE = 15
+"""只读工具保险丝阈值 — 同参连续调用超过 15 次仍熔断。
+
+豁免不等于放任：只读轮询每次往返都烧 token（请求+响应全量进上下文），
+15 次同参连续调用已远超正常轮询节奏，熔断防 token 烧钱。
+"""
+
 DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
-    # 只读工具 — 高容忍，重复查询是正常的探索行为
-    "list_files": 15,
-    "read_file": 12,
-    "grep": 10,
-    "search_files": 10,
-    "list_subordinates": 10,
-    "read_charter": 10,
-    "read_goals": 10,
-    "read_work_logs": 10,
-    "get_subordinate_logs": 10,
-    "list_available_skills": 10,
-    "read_skill": 10,
-    "view_org_chart": 10,
     # 审查工具 — 中容忍，重试可能是 LLM 纠正输出格式
     "run_code_review": 6,
     "run_security_audit": 6,
@@ -129,14 +156,22 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
     "websearch": 3,
     "execute_code": 3,
 }
-"""Per-tool doom loop thresholds. 不同工具不同限制：
+"""Per-tool doom loop thresholds（写类/副作用工具）。不同工具不同限制：
 
-- 只读工具 (10-15次): 重复查询可能是 agent 在探索不同角度的正常行为
 - 审查工具 (6次): LLM 可能在纠正输出格式，需要更多尝试
 - 幂等写入 (8次): 覆盖写入无害，但不应无限重复
 - 外发消息 (4-5次): 避免对其他 agent 或用户造成骚扰
 - 副作用工具 (3次): 真实命令执行，严格限制防止损害
+
+只读工具不在此表 —— 见 DOOM_LOOP_READONLY_TOOLS + DOOM_LOOP_READONLY_FUSE。
 """
+
+
+def doom_loop_limit(tool_name: str) -> int:
+    """返回工具的 doom 阈值：只读工具走保险丝，其余查表/默认 3。"""
+    if tool_name in DOOM_LOOP_READONLY_TOOLS:
+        return DOOM_LOOP_READONLY_FUSE
+    return DOOM_LOOP_TOOL_LIMITS.get(tool_name, DOOM_LOOP_DEFAULT_LIMIT)
 
 NO_TEXT_ROUNDS_THRESHOLD = 3
 """连续无文字轮次阈值: 3 轮后注入系统提示。"""
@@ -778,7 +813,7 @@ class Streamer:
                 # Doom loop 检测
                 doom = self._detect_doom_loop(tool_calls, doom_tracker)
                 if doom:
-                    limit = DOOM_LOOP_TOOL_LIMITS.get(doom, DOOM_LOOP_DEFAULT_LIMIT)
+                    limit = doom_loop_limit(doom)
                     if not doom_warning_given:
                         # 第一次触发: 拦截重复调用，注入反馈给 LLM 纠正机会
                         log.warning("doom_loop_warned",
@@ -1549,8 +1584,9 @@ class Streamer:
     ) -> str | None:
         """检测 doom loop: 同一工具+同一参数连续超过工具专属限制。
 
-        不同工具有不同的容忍度（见 DOOM_LOOP_TOOL_LIMITS）：
-        - 只读工具 10-15 次 — 探索式重复查询是正常的
+        不同工具有不同的容忍度（见 doom_loop_limit）：
+        - 只读轮询工具（DOOM_LOOP_READONLY_TOOLS）15 次保险丝 — agent 无订阅
+          机制，轮询 get_tasks/read_file 是获取状态的唯一手段，不算 doom
         - 审查工具 6 次 — LLM 可能在纠正输出格式
         - 幂等写入 8 次 — 覆盖写入无害但不应无限
         - 副作用工具 3 次 — bash/apply_patch 严格限制
@@ -1576,7 +1612,7 @@ class Streamer:
                 last_key = key
                 count = 1
                 last_errored = False
-            limit = DOOM_LOOP_TOOL_LIMITS.get(tc["name"], DOOM_LOOP_DEFAULT_LIMIT)
+            limit = doom_loop_limit(tc["name"])
             if count >= limit:
                 tracker["last_key"] = last_key
                 tracker["count"] = count
