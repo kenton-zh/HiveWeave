@@ -23,7 +23,56 @@ import structlog
 from .base import _TOOL_REGISTRY, ToolDef
 from .result import ToolResult
 
+from hiveweave.services.policy import COORDINATOR_WRITE_PREFIXES
+
 log = structlog.get_logger()
+
+
+# 拒绝时应向 coordinator/HR 展示写白名单的源码写工具
+_SOURCE_WRITE_TOOLS = frozenset({
+    "write_file", "edit_file", "apply_patch", "delete_file",
+    "move_file", "create_directory", "delete_directory",
+})
+
+
+def build_deny_hint(
+    tool_name: str, family: str, hard_reason: str | None = None
+) -> str:
+    """Build a truthful permission-deny hint for the agent model.
+
+    旧文案把 coordinator 一概定性为 'read-only role'，与 policy 不符：
+    coordinator/HR 实际拥有受限写白名单（docs/、.hiveweave/shared/ 等）。
+    hard_reason 为 policy 硬门的真实拒绝原因（此前只写日志、不返回模型）。
+    """
+    base = (
+        f"Permission denied: {hard_reason}"
+        if hard_reason
+        else f"Permission denied: {tool_name} is blocked for this agent."
+    )
+    scope = (
+        ", ".join(COORDINATOR_WRITE_PREFIXES)
+        + ", charter.md/goals.md/spec.md"
+    )
+    if family == "coordinator":
+        if tool_name in _SOURCE_WRITE_TOOLS:
+            return (
+                f"{base} Coordinator agents may write only to: {scope}. "
+                f"For source-code changes, use dispatch_task to assign the "
+                f"work to an executor agent (or send_message to request it)."
+            )
+        return (
+            f"{base} This tool is outside coordinator capabilities "
+            f"(dispatch/review/merge tasks, docs writes). Use dispatch_task "
+            f"to assign the work to an executor agent."
+        )
+    if family == "hr":
+        if tool_name in _SOURCE_WRITE_TOOLS:
+            return f"{base} HR agents may write only to: {scope}."
+        return (
+            f"{base} This tool is outside HR capabilities "
+            f"(staffing/org management, docs writes)."
+        )
+    return base
 
 
 @dataclass
@@ -94,24 +143,27 @@ async def execute_registered_tool(
         return ToolResult.err(f"Error: Permission check failed: {exc}").to_dict()
 
     if decision == "deny":
-        # Build a helpful hint for coordinator agents
+        # 如实提示：返回 policy 硬门真实原因 + coordinator/HR 写白名单指引
         try:
-            from hiveweave.db import meta_db
+            from hiveweave.db import meta as meta_db
+            from hiveweave.services.policy import (
+                infer_role_family,
+                policy_service,
+            )
 
             agent_info = await meta_db.get_agent_by_id(agent_id)
-            perm_type = (agent_info or {}).get("permission_type", "")
-        except Exception:
-            perm_type = ""
-
-        if perm_type == "coordinator":
-            hint = (
-                f"Permission denied: coordinator agents cannot use '{tool_name}'. "
-                f"This is a read-only role. Use dispatch_task to assign this work "
-                f"to an executor agent, or use send_message to request an executor to do it."
+            family = infer_role_family(agent_info or {})
+            hard_reason = (
+                policy_service.hard_check(agent_info, tool_name, raw_args)
+                if agent_info
+                else None
             )
-        else:
-            hint = f"Permission denied: {tool_name} is blocked for this agent."
-        return ToolResult.err(hint).to_dict()
+        except Exception:
+            family, hard_reason = "", None
+
+        return ToolResult.err(
+            build_deny_hint(tool_name, family, hard_reason)
+        ).to_dict()
 
     if decision == "ask":
         from hiveweave.services.approval import PermissionRejected, PermissionTimeout
