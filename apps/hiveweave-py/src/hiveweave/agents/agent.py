@@ -239,15 +239,7 @@ class Agent:
         # 没有调用方主动 trigger target agent。
         self._inbox_watcher_task: asyncio.Task | None = None
         self._stop_watcher = False
-        try:
-            loop = asyncio.get_running_loop()
-            self._inbox_watcher_task = loop.create_task(
-                self._inbox_watcher_loop(),
-                name=f"agent-{agent_id}-inbox-watcher",
-            )
-        except RuntimeError:
-            # 没有 running loop（e.g. 测试场景）— 跳过 watcher
-            pass
+        self._ensure_watcher_alive()
 
         log.info(
             "agent_init",
@@ -347,6 +339,37 @@ class Agent:
             except asyncio.CancelledError:
                 break
 
+    def _ensure_watcher_alive(self) -> None:
+        """确保 inbox watcher 存活；被 cancel() 杀掉后复活它。
+
+        cancel() 置 _stop_watcher=True 并取消 watcher 协程，但 Agent 对象
+        仍留在 manager 中可被再次激活（chat/trigger；deactivate→activate
+        时 supervisor 跳过已存在实例）。不复活的话 watcher 永久死亡，
+        agent 读不到同伴消息（"失联"），直到进程重启。
+
+        幂等：watcher 存活时直接返回，不重复启动。同步方法（检查与赋值
+        之间无 await），与 cancel() 在同一事件循环内不会交错；
+        cancel() 置标志 + cancel task 之间同样无 await，即时停止语义不变。
+        """
+        if not hasattr(self, "_stop_watcher"):
+            # object.__new__(Agent) 裸实例（测试 double，未走 __init__）—
+            # watcher 不在其生命周期内，跳过
+            return
+        task = self._inbox_watcher_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 没有 running loop（e.g. 测试场景）— 跳过，下次激活再试
+            return
+        self._stop_watcher = False
+        self._inbox_watcher_task = loop.create_task(
+            self._inbox_watcher_loop(),
+            name=f"agent-{self.id}-inbox-watcher",
+        )
+        log.info("inbox_watcher_started", agent_id=self.id)
+
     # ── 公共 API ─────────────────────────────────────────────
 
     async def chat(self, message: str, opts: dict | None = None) -> dict:
@@ -361,6 +384,10 @@ class Agent:
         opts = opts or {}
 
         async with self._lock:
+            # cancel() 会杀掉 inbox watcher — agent 再次被激活时复活它，
+            # 否则 agent 此后读不到同伴消息（"失联"）直到进程重启。
+            self._ensure_watcher_alive()
+
             # 检查 busy → queue the message instead of dropping it
             if self.status == AgentState.PROCESSING:
                 self._message_queue.append((message, opts, int(time.time() * 1000)))
@@ -522,7 +549,8 @@ class Agent:
             except asyncio.CancelledError:
                 pass
 
-        # BUG-010 修复：停 inbox watcher
+        # BUG-010 修复：停 inbox watcher（下次激活时由
+        # _ensure_watcher_alive() 复活 — 见 chat()/enqueue_wake()）
         self._stop_watcher = True
         if self._inbox_watcher_task and not self._inbox_watcher_task.done():
             self._inbox_watcher_task.cancel()
@@ -2279,6 +2307,8 @@ class Agent:
         """Enqueue a wake while busy (P1 single-flight). Does not start LLM."""
         opts = opts or {}
         async with self._lock:
+            # 与 chat() 同理：busy 期间的 trigger wake 也算一次激活信号
+            self._ensure_watcher_alive()
             self._message_queue.append(
                 (message, opts, int(time.time() * 1000))
             )
