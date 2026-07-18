@@ -96,8 +96,12 @@ def git_repo(tmp_path: Path) -> Path:
 
 
 async def _make_branch_with_file(repo: Path, short_id: str, task: str,
-                                 filename: str, content: str) -> None:
-    """创建 executor worktree 并在其分支上提交一个文件。"""
+                                 filename: str, content: str) -> str:
+    """创建 executor worktree 并在其分支上提交一个文件。返回实际分支名。
+
+    P0 命名稳定化后 create() 产出稳定名 (hw/<sid>/work 或 t-<id8>),
+    调用方一律用返回的分支名, 不再按 task 文本重算。
+    """
     gwt = GitWorktreeService()
     res = await gwt.create(str(repo), short_id, task)
     assert res["success"] is True, res
@@ -105,12 +109,13 @@ async def _make_branch_with_file(repo: Path, short_id: str, task: str,
     (wt / filename).write_text(content, encoding="utf-8")
     _git(wt, "add", filename)
     _git(wt, "commit", "-m", f"add {filename}")
+    return res["branch"]
 
 
 async def _make_marked_branch(repo: Path, short_id: str, task: str,
-                              filename: str) -> None:
+                              filename: str) -> str:
     """executor 把含冲突标记的文件提交进自己分支 (残留标记来源)。"""
-    await _make_branch_with_file(repo, short_id, task, filename, MARKED)
+    return await _make_branch_with_file(repo, short_id, task, filename, MARKED)
 
 
 async def _call_merge_tool(repo: Path, caller: str, branch_name: str,
@@ -134,10 +139,10 @@ async def _call_merge_tool(repo: Path, caller: str, branch_name: str,
 
 async def test_service_merge_reports_conflict_markers(git_repo: Path) -> None:
     """service 层: merge 成功结果携带 conflict_markers (相对路径)。"""
-    await _make_marked_branch(git_repo, "A004", "feat-x", "marked.py")
+    branch = await _make_marked_branch(git_repo, "A004", "feat-x", "marked.py")
 
     gwt = GitWorktreeService()
-    res = await gwt.merge_by_branch(str(git_repo), "hw/A004/feat-x", "main")
+    res = await gwt.merge_by_branch(str(git_repo), branch, "main")
 
     assert res["success"] is True, res
     assert res["conflict_markers"] == ["marked.py"]
@@ -146,11 +151,11 @@ async def test_service_merge_reports_conflict_markers(git_repo: Path) -> None:
 async def test_service_clean_merge_has_no_conflict_markers(
     git_repo: Path,
 ) -> None:
-    await _make_branch_with_file(git_repo, "A004", "feat-clean", "clean.py",
-                                 "print('ok')\n")
+    branch = await _make_branch_with_file(git_repo, "A004", "feat-clean",
+                                          "clean.py", "print('ok')\n")
 
     gwt = GitWorktreeService()
-    res = await gwt.merge_by_branch(str(git_repo), "hw/A004/feat-clean", "main")
+    res = await gwt.merge_by_branch(str(git_repo), branch, "main")
 
     assert res["success"] is True, res
     assert "conflict_markers" not in res
