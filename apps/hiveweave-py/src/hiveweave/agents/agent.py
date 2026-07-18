@@ -7,7 +7,8 @@
 2. _run_llm(): LLM 调用 + tool loop + 空响应重试
 3. _handle_completion(): 保存消息 + 标记 inbox 已读 + 自检 re-trigger
 4. _handle_empty_response(): 退避重试 [5s, 15s, 45s]，超限升级上级
-5. _handle_safety_timeout(): 10 分钟安全超时 → 清理 zombie → inbox 保持未读 + RESUME CHECKPOINT + 冷却后恢复
+5. _handle_safety_timeout(): 10 分钟安全超时 → 清理 zombie → 与 _handle_error 统一计数；
+   未超限: inbox 保持未读 + RESUME CHECKPOINT + 冷却后恢复；超限: ACK 放弃 + 升级上级
 6. cancel(): 取消当前 LLM task → 清理 → 重置 idle
 
 消息布局（DeepSeek 前缀缓存友好）:
@@ -1695,7 +1696,7 @@ class Agent:
                 consecutive_errors=self._consecutive_errors,
             )
         elif inbox_ids and self._consecutive_errors > self._CONSECUTIVE_ERROR_MAX:
-            # 超过阈值: ACK inbox，停止 resume 循环
+            # 超过阈值: ACK inbox，停止 resume 循环 + 升级上级一次
             try:
                 await self._inbox.mark_read_by_ids(self.id, inbox_ids)
                 log.warning(
@@ -1707,6 +1708,7 @@ class Agent:
             except Exception as ack_err:
                 log.error("inbox_ack_failed", agent_id=self.id, error=str(ack_err))
             self.pending_inbox_msg_ids = None
+            await self._escalate_turn_interruption(reason=f"llm_error:{error_type}")
 
         self._cancel_safety_timer()
         self._reset_to_idle()
@@ -1792,16 +1794,27 @@ class Agent:
     async def _handle_safety_timeout(self) -> None:
         """安全超时异步清理。
 
-        信息链恢复语义:
-        - 不 ACK inbox（消息保持未读，冷却结束后可 resume）
-        - 写入 RESUME CHECKPOINT，让下一轮带着断点上下文继续
+        与 _handle_error 统一的非致命中断策略（计数 + 冷却 resume + 超限放弃）:
+        - 未超限: 不 ACK inbox（消息保持未读）+ RESUME CHECKPOINT + 冷却 resume
+        - 连续超限: ACK inbox 放弃本轮 + 升级上级一次 —— 堵住
+          「10min 超时 → 90s 冷却 → 再超时」的无限死循环，且不再注入
+          CHECKPOINT 撑大上下文让下一轮更易超时
         - 记录 work_log，便于监控/stall watchdog 关联
         """
         inbox_ids = list(self.pending_inbox_msg_ids or [])
 
+        # 连续中断计数 — 与 _handle_error 共用同一阈值
+        self._consecutive_errors += 1
+        give_up = self._consecutive_errors > self._CONSECUTIVE_ERROR_MAX
+
         timeout_msg = (
             "[TIMEOUT] LLM call exceeded 10 minute safety limit. "
-            "Inbox left unread for resume after cooldown."
+            + (
+                f"Gave up after {self._consecutive_errors} consecutive "
+                "interrupted turns; escalated to superior."
+                if give_up
+                else "Inbox left unread for resume after cooldown."
+            )
         )
         if self._streaming_msg_id:
             await self._finalize_streaming_turn(content=timeout_msg)
@@ -1816,14 +1829,39 @@ class Agent:
                 }
             )
 
-        await self._write_resume_checkpoint(
-            reason="safety_timeout",
-            inbox_ids=inbox_ids,
-        )
-        self._arm_resume_cooldown(TIMEOUT_RESUME_COOLDOWN_S)
+        if not give_up:
+            # 未超阈值: 保留未读 + CHECKPOINT + 冷却，watcher 冷却后恢复信息链
+            await self._write_resume_checkpoint(
+                reason="safety_timeout",
+                inbox_ids=inbox_ids,
+            )
+            self._arm_resume_cooldown(TIMEOUT_RESUME_COOLDOWN_S)
+        else:
+            # 超阈值放弃: ACK inbox 停止 resume 循环，升级上级一次
+            if inbox_ids:
+                try:
+                    await self._inbox.mark_read_by_ids(self.id, inbox_ids)
+                except Exception as ack_err:
+                    log.error("inbox_ack_failed", agent_id=self.id, error=str(ack_err))
+            try:
+                await self._work_log.write_work_log(
+                    self.project_id, self.id, None,
+                    "error",
+                    f"[safety_timeout] gave up after {self._consecutive_errors} "
+                    "consecutive interrupted turns; inbox ACKed, escalated",
+                    details={
+                        "reason": "safety_timeout",
+                        "inbox_ids": inbox_ids[:20],
+                        "consecutive_errors": self._consecutive_errors,
+                        "resume": False,
+                    },
+                )
+            except Exception:
+                pass
+            await self._escalate_turn_interruption(reason="safety_timeout")
 
-        # Keep pending_inbox_msg_ids cleared from this turn, but messages
-        # stay unread in DB so watcher can pick them up after cooldown.
+        # Keep pending_inbox_msg_ids cleared from this turn; 未放弃时消息
+        # 在 DB 保持未读，冷却结束后由 watcher 恢复信息链。
         self.pending_inbox_msg_ids = None
 
         self._cancel_safety_timer()
@@ -1834,11 +1872,63 @@ class Agent:
             "error", "LLM call exceeded 10 minute safety limit"
         )
         log.warning(
-            "safety_timeout_resume_armed",
+            "safety_timeout_gave_up" if give_up else "safety_timeout_resume_armed",
             agent_id=self.id,
-            inbox_left_unread=len(inbox_ids),
-            cooldown_s=TIMEOUT_RESUME_COOLDOWN_S,
+            inbox_left_unread=0 if give_up else len(inbox_ids),
+            inbox_acked=len(inbox_ids) if give_up else 0,
+            consecutive_errors=self._consecutive_errors,
+            cooldown_s=0.0 if give_up else TIMEOUT_RESUME_COOLDOWN_S,
         )
+
+    async def _escalate_turn_interruption(self, *, reason: str) -> None:
+        """连续中断超限，给上级发一次升级消息。
+
+        每个失败 streak 只升级一次（计数恰好越限的那次）——后续连续失败仍
+        ACK inbox 止血，但不重复打扰上级，避免「升级 → 上级追问 → 再失败 →
+        再升级」的跨 agent 振荡。成功后计数归零，新的 streak 会再次升级。
+        best-effort：升级失败只记日志，不阻断清理流程。
+        """
+        if self._consecutive_errors != self._CONSECUTIVE_ERROR_MAX + 1:
+            return
+        try:
+            superior = await self._org.get_superior(self.id)
+            if superior:
+                agent_name = self.config.get("name", self.id)
+                await self._inbox.send_message(
+                    from_agent_id=self.id,
+                    to_agent_id=superior["id"],
+                    message=(
+                        f"[ESCALATION] Subordinate {agent_name} gave up a turn "
+                        f"after {self._consecutive_errors} consecutive "
+                        f"interruptions (last: {reason}). Pending inbox "
+                        f"messages were ACKed to break the resume loop. "
+                        f"Please check on them."
+                    ),
+                    message_type="escalation",
+                    priority="urgent",
+                )
+                # 触发上级
+                from hiveweave.agents.trigger import trigger_coordinator
+
+                await trigger_coordinator(superior["id"])
+                log.warning(
+                    "interruption_escalated",
+                    agent_id=self.id,
+                    superior_id=superior["id"],
+                    reason=reason,
+                    consecutive_errors=self._consecutive_errors,
+                )
+            else:
+                log.warning(
+                    "interruption_escalate_no_superior",
+                    agent_id=self.id,
+                    reason=reason,
+                    msg="no superior to escalate to",
+                )
+        except Exception as e:
+            log.error(
+                "interruption_escalate_failed", agent_id=self.id, error=str(e)
+            )
 
     async def _handle_cancel(self) -> None:
         """用户取消处理。
