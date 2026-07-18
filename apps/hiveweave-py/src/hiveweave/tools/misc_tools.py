@@ -236,6 +236,47 @@ class GitWorktreeMergeParams(BaseModel):
         description="Target branch to merge into (default: main).",
         json_schema_extra={"aliases": ["targetBranch", "target_branch", "target"]},
     )
+    task_id: str | None = Field(
+        default=None,
+        alias="taskId",
+        description=(
+            "Optional task ID. When given, the stable P0 branch "
+            "hw/<shortId>/t-<taskId[:8]> of the task assignee is tried "
+            "first (exact hit); falls back to legacy name resolution."
+        ),
+        json_schema_extra={"aliases": ["taskId", "task_id"]},
+    )
+
+
+async def _resolve_stable_task_branch(
+    workspace_path: str, project_id: str, task_id: str
+) -> tuple[str, str] | None:
+    """P0 稳定命名解析：task_id → 任务 assignee → hw/<sid>/t-<taskid8> 精确命中。
+
+    分支真实存在才返回 ``(branch, short_id)``；任何一步失败返回 None，
+    调用方回落 legacy 解析（老 slug 命名分支依然可 merge）。
+    """
+    try:
+        from hiveweave.services.git_worktree import _git, compute_branch_name
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.task import TaskService
+
+        task = await TaskService().get_task(project_id, task_id)
+        assignee_id = (task or {}).get("assignee_id")
+        if not assignee_id:
+            return None
+        agent = await OrgService().resolve_agent(str(assignee_id))
+        short_id = (agent or {}).get("short_id")
+        if not short_id:
+            return None
+        candidate = compute_branch_name(str(short_id), task_id)
+        ok, out = await _git(["branch", "--list", candidate], workspace_path)
+        if ok and candidate in _parse_branch_list(out):
+            return candidate, str(short_id)
+    except Exception as e:
+        log.warning("merge_stable_branch_resolve_failed",
+                    task_id=task_id, error=str(e))
+    return None
 
 
 async def _route_conflict_marker_cleanup(
@@ -311,6 +352,8 @@ async def _route_conflict_marker_cleanup(
 @tool(
     "git_worktree_merge",
     "Merge a worktree branch into main and remove the worktree. "
+    "Pass taskId for an exact hit on the stable branch "
+    "hw/<shortId>/t-<taskId[:8]>. "
     "On conflict: main merge is aborted; rework the executor to rebase/merge "
     "main in THEIR worktree, then retry. On success: spawns VERIFY only for "
     "tasks covered by this merge (post-merge only).",
@@ -324,6 +367,8 @@ async def git_worktree_merge_tool(
 
     Bug G fix: 支持架构师合并其他 agent 的 worktree。
     branch_name 解析顺序：
+    - task_id 提供时（P0 稳定命名）— 按契约算 hw/<sid>/t-<taskid8>
+      精确命中；未命中回落下列 legacy 路径
     - "hw/..." 完整分支名 — 直接使用
     - short_id (如 "A066") — 查找该 agent 的分支
     - task_name (如 "后端工程师" / "feat-x") — 先查调用者自己的分支；
@@ -345,8 +390,23 @@ async def git_worktree_merge_tool(
     merged_branch: str | None = None
     merged_short: str | None = None
 
+    # P0 稳定命名优先：调用方提供 task_id 时按契约 hw/<sid>/t-<taskid8>
+    # 精确命中；未命中/解析失败回落下面的 legacy 解析（老 slug 分支照合）。
+    stable = (
+        await _resolve_stable_task_branch(
+            workspace_path, project_id, params.task_id
+        )
+        if params.task_id
+        else None
+    )
+
     # Bug G fix: 智能解析 branch_name
-    if branch_name.startswith("hw/"):
+    if stable:
+        merged_branch, merged_short = stable
+        result = await gwt.merge_by_branch(
+            workspace_path, merged_branch, target_branch
+        )
+    elif branch_name.startswith("hw/"):
         merged_branch = branch_name
         from hiveweave.tools.task_tools import parse_short_id_from_branch
 

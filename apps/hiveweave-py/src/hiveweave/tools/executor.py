@@ -2562,7 +2562,9 @@ class ToolExecutor(TaskToolsMixin):
                         wt_result = await gwt.create(
                             workspace_path=project_ws,
                             short_id=new_short,
-                            task_name=role,  # 用角色作为 task slug
+                            task_name=role,  # 兼容保留，P0 起不再用于命名
+                            # 招聘时无任务上下文 → 不传 task_id，
+                            # 落 hw/<shortId>/work 稳定分支
                         )
                         if wt_result.get("success") and wt_result.get("path"):
                             worktree_path = wt_result["path"]
