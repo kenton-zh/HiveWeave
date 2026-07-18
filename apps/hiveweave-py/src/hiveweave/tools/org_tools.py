@@ -8,7 +8,8 @@ Migrated from executor.py ``_tool_*`` methods and inline dispatch code to
 Tools:
     Org management: hire_agent, dismiss_agent, transfer_agent,
                     list_subordinates, view_org_chart, read_roster,
-                    update_roster, list_agent_templates
+                    update_roster, list_agent_templates,
+                    check_agent_status
     Skills:         list_available_skills, read_skill, bind_skill,
                     unbind_skill
 """
@@ -604,6 +605,168 @@ async def transfer_agent_tool(
 
     return ToolResult.ok(
         f"Agent {target_agent['name']} transferred to new parent."
+    )
+
+
+# ── check_agent_status ───────────────────────────────────
+
+
+class CheckAgentStatusParams(BaseModel):
+    """Parameters for check_agent_status tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    agent_id: str | None = Field(
+        default=None,
+        alias="agentId",
+        description=(
+            "Agent name (花名), short_id (e.g. A002), or UUID. "
+            "Do NOT use role titles. Omit to list all agents in the project."
+        ),
+        json_schema_extra={
+            "aliases": ["agentId", "agent_id", "name", "target"]
+        },
+    )
+
+
+def _format_live_badge(target_id: str, db_status: str) -> tuple[str, str]:
+    """Build (short_emoji, detailed_badge) from runtime + DB status.
+
+    Ported from Elixir/Node ``check_agent_status``; enriched with disposition
+    (waiting_human / blocked) so callers know *why* an idle agent is stuck.
+    """
+    from hiveweave.agents.supervisor import agent_manager
+
+    archived = (db_status or "").lower() in ("archived", "dismissed")
+    if archived:
+        return "🔲", "🔲 archived"
+
+    live = agent_manager.get_agent(target_id)
+    if live is None:
+        # Not in memory — treat as idle (may be off-duty / not started)
+        return "🟢", "🟢 idle (not running)"
+
+    busy = live.status.value == "processing"
+    disposition = getattr(live, "disposition", None) or "runnable"
+
+    if busy:
+        return (
+            "🔴",
+            "🔴 working (currently processing — do NOT expect immediate reply)",
+        )
+
+    # Idle execution, but disposition may explain a legal pause
+    if disposition == "waiting_human":
+        return (
+            "🟡",
+            "🟡 idle+waiting_human "
+            "(paused waiting for a human/superior reply — answer them, do NOT nag)",
+        )
+    if disposition == "blocked":
+        return (
+            "🟠",
+            "🟠 idle+blocked (stuck — diagnose via work logs, do NOT blind-urge)",
+        )
+    if disposition == "complete":
+        return "🟢", "🟢 idle (slice complete)"
+    if disposition and disposition != "runnable":
+        return "🟢", f"🟢 idle (disposition={disposition})"
+    return "🟢", "🟢 idle (available)"
+
+
+def _format_agent_status_line(agent: dict, *, detailed: bool = False) -> str:
+    """One-line status for a single agent dict from OrgService."""
+    aid = agent["id"]
+    name = agent.get("name") or "?"
+    short = agent.get("short_id") or "no-id"
+    role = agent.get("role") or "?"
+    db_status = agent.get("status") or "active"
+    perm = agent.get("permission_type") or ""
+    perm_badge = "👔" if perm == "coordinator" else "⚙️"
+    short_badge, detail_badge = _format_live_badge(aid, db_status)
+
+    if detailed:
+        live = None
+        try:
+            from hiveweave.agents.supervisor import agent_manager
+
+            live = agent_manager.get_agent(aid)
+        except Exception:
+            pass
+        extra = ""
+        if live is not None:
+            queue_len = len(getattr(live, "_message_queue", []) or [])
+            if queue_len:
+                extra = f" | queue={queue_len}"
+        return (
+            f"{perm_badge} **{name}** ({short}) — {detail_badge} | role: {role}{extra}"
+        )
+    return (
+        f"  {short_badge} {perm_badge} {name} ({short}) — {role} | {detail_badge}"
+    )
+
+
+@tool(
+    "check_agent_status",
+    "Check whether a colleague is busy (processing) or idle, and their "
+    "disposition (waiting_human / blocked / runnable). "
+    "ALWAYS call this BEFORE claiming someone is busy/idle, and BEFORE "
+    "urging/nagging a colleague who has not replied. "
+    "Pass agentId=花名/short_id/UUID for one agent; omit agentId to list "
+    "everyone in the project.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def check_agent_status_tool(
+    params: CheckAgentStatusParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """Live busy/idle (+ disposition) for one agent or the whole project.
+
+    Restored from pre-migration Elixir/Node ``check_agent_status`` (deleted
+    with the old backends; Python port was missing).
+    """
+    if not ctx or not getattr(ctx, "org", None):
+        return ToolResult.err(
+            "OrgService not available (ctx.org is missing)"
+        )
+
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project_id")
+
+    target_ref = (params.agent_id or "").strip() or None
+
+    if target_ref:
+        resolved = await resolve_agent_id(project_id, target_ref, ctx.org)
+        if not resolved:
+            return ToolResult.err(
+                f'No agent found matching "{target_ref}". '
+                "Use 花名, short_id (A002), or UUID — not role titles."
+            )
+        target = await ctx.org.get_agent(resolved)
+        if not target:
+            return ToolResult.err(f'No agent found matching "{target_ref}".')
+        if target.get("project_id") and target["project_id"] != project_id:
+            return ToolResult.err(
+                f'Agent "{target_ref}" is not in your project.'
+            )
+        return ToolResult.ok(_format_agent_status_line(target, detailed=True))
+
+    # No target — list all agents in the project
+    all_agents = await ctx.org.list_agents(project_id)
+    if not all_agents:
+        return ToolResult.ok("No agents in project.")
+
+    # Prefer active agents first, archived last
+    def _sort_key(a: dict) -> tuple:
+        st = (a.get("status") or "active").lower()
+        archived = 1 if st in ("archived", "dismissed") else 0
+        return (archived, a.get("short_id") or "", a.get("name") or "")
+
+    sorted_agents = sorted(all_agents, key=_sort_key)
+    lines = [_format_agent_status_line(a) for a in sorted_agents]
+    return ToolResult.ok(
+        f"## Agent Status ({len(sorted_agents)} agents)\n" + "\n".join(lines)
     )
 
 

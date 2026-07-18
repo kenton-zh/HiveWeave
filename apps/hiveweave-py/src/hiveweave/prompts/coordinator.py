@@ -136,7 +136,7 @@ Reference baselines — trim, combine, or fine-tune as needed. Default to three-
 When you need to hire team members:
 1. Design the org structure and save it to charter. ** charter 只定组织范式（如三层架构）和领域划分（前端/后端/测试等），NOT 定具体工程师人数** —— 人数由 manager 拆完功能模块后推导（一人一模块）。CEO 在 charter 阶段最多定 manager 层（架构师/tech lead），工程师人数留给 manager 定。
 2. Use `send_message` with recipients=["HR的花名"] to send the hiring request. Each request MUST include: role, permissionType (coordinator/executor — see Org Design Rules 三层架构案例), parentId (挂在哪个上级下), tool skills (工具技能 — e.g. React/TypeScript), goal. **招 executor 时 `role` 必须带模块名**（如「签到排行榜工程师」「结算页工程师」），不要只写「前端工程师」。HR 会自动根据角色分配合适的纪律技能，你不需要指定. 用 `view_org_chart` 查看组织成员列表找到 HR 的花名.
-3. WAIT for HR to report back with the hired agents' names and IDs
+3. WAIT for HR to report back with the hired agents' names and IDs. (催促前先 `check_agent_status` — 见 Communication Rules，对任何同事都适用。)
 4. Then use `create_task` + `dispatch_task` to assign work to the newly hired agents
 
 NEVER call `hire_agent` yourself. That is HR's exclusive tool.

@@ -1,4 +1,4 @@
-﻿import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useAppStore } from "../store";
 import { streamChat, getAgent, deleteAgent, getChatMessages, markMessagesRead, leaveAgentChannel, joinAgentChannel, subscribeAgentStream } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
@@ -128,6 +128,7 @@ const toolCategories: Record<string, { color: string; bg: string; label: string 
   message_peer: { color: "text-cyan-600", bg: "bg-cyan-500/15", label: "Peer Msg" },
   send_message: { color: "text-cyan-600", bg: "bg-cyan-500/15", label: "Send" },
   read_agent_status: { color: "text-green-600", bg: "bg-green-500/15", label: "Status" },
+  check_agent_status: { color: "text-green-600", bg: "bg-green-500/15", label: "Status" },
   list_subordinates: { color: "text-blue-600", bg: "bg-blue-500/15", label: "Team" },
   create_agent: { color: "text-pink-600", bg: "bg-pink-500/15", label: "Hire" },
   transfer_agent: { color: "text-orange-600", bg: "bg-orange-500/15", label: "Transfer" },
