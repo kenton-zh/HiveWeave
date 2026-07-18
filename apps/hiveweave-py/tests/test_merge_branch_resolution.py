@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from hiveweave.services.git_worktree import GitWorktreeService
+from hiveweave.services.git_worktree import GitWorktreeService, _slugify
 from hiveweave.tools.misc_tools import (
     GitWorktreeMergeParams,
     git_worktree_merge_tool,
@@ -45,11 +45,16 @@ def git_repo(tmp_path: Path) -> Path:
 
 async def _make_executor_branch(repo: Path, short_id: str, task: str,
                                 filename: str) -> None:
-    """创建 executor worktree 并在其分支上提交一个文件。"""
+    """创建 executor worktree 并在其分支上提交一个文件 (legacy slug 分支)。
+
+    P0 命名稳定化后 create() 产出 hw/<sid>/work; 这里把分支改名为存量
+    legacy slug 形状, 验证 merge 工具的名称解析对老分支向后兼容。
+    """
     gwt = GitWorktreeService()
     res = await gwt.create(str(repo), short_id, task)
     assert res["success"] is True, res
     wt = Path(res["path"])
+    _git(wt, "branch", "-m", res["branch"], f"hw/{short_id}/{_slugify(task)}")
     (wt / filename).write_text(f"print('from {short_id}')\n", encoding="utf-8")
     _git(wt, "add", filename)
     _git(wt, "commit", "-m", f"add {filename}")
