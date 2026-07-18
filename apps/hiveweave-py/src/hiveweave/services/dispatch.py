@@ -103,11 +103,14 @@ class DispatchService:
            the canonical ``task_id`` that threads through inbox / work_log /
            handoff (Task Ledger 全链路串联). If ``existing_task_id`` is
            provided, reuse it instead of creating a new one.
-        2. Write ``work_log`` (type=discussion) on coordinator's side —
+        2. Ensure executor worktree (branch hw/<shortId>/t-<taskid8>,
+           P0 稳定命名) and pin the worktree path into the delivery
+           message; the pinned description is synced back to the task row.
+        3. Write ``work_log`` (type=discussion) on coordinator's side —
            traceable in the session timeline (日志读取协议), 携带 task_id.
-        3. Send inbox message to subordinate via :class:`InboxService`,
+        4. Send inbox message to subordinate via :class:`InboxService`,
            携带 task_id.
-        4. Create handoff record via :class:`HandoffService` (if
+        5. Create handoff record via :class:`HandoffService` (if
            ``create_handoff``) — enables lifecycle tracking (pending →
            accepted → completed → approved), 携带 task_id.
 
@@ -115,6 +118,26 @@ class DispatchService:
         description}``.
         """
         await _ensure_schema(project_id)
+
+        # 1) Task Ledger: 先创建 task 记录，获得真正的 task_id（全链路主键）。
+        #    worktree 分支命名契约 hw/<shortId>/t-<taskid8> 依赖它（P0 分支
+        #    命名稳定化），所以建账必须先于 ensure_executor_worktree。
+        #    如果传入了 existing_task_id，复用已有 task 而不是创建新的
+        if existing_task_id:
+            task_id = existing_task_id
+            # 更新 assignee 为实际接收者
+            await self.task_service.update_task(
+                project_id, task_id, assignee_id=to_agent_id
+            )
+        else:
+            task_id = await self.task_service.create_task(
+                project_id=project_id,
+                title=description[:100],
+                description=description,
+                creator_id=from_agent_id,
+                assignee_id=to_agent_id,
+                source="agent",
+            )
 
         # Ensure executor worktree + pin paths in the delivery message
         description_out = description
@@ -132,6 +155,7 @@ class DispatchService:
                     project_id,
                     to_agent_id,
                     task_name=(description[:40] if description else None),
+                    task_id=task_id,
                 )
                 wt_meta = ensured
                 if ensured.get("success") and ensured.get("path"):
@@ -140,6 +164,19 @@ class DispatchService:
                         short_id=ensured.get("short_id") or assignee.get("short_id") or "",
                         worktree_path=ensured["path"],
                     )
+                    # task 行先行创建时存的是原始 description —— 钉上 worktree
+                    # 路径后回写，保持 Task Ledger 里可见路径（与原行为一致）。
+                    if description_out != description:
+                        try:
+                            await self.task_service.update_task(
+                                project_id, task_id,
+                                description=description_out,
+                            )
+                        except Exception as e:
+                            log.warning(
+                                "dispatch_task_desc_pin_failed",
+                                task_id=task_id, error=str(e),
+                            )
                 else:
                     log.warning(
                         "dispatch_worktree_ensure_failed",
@@ -155,24 +192,6 @@ class DispatchService:
         except Exception as e:
             log.warning("dispatch_worktree_pin_failed", error=str(e))
 
-        # 1) Task Ledger: 创建 task 记录，获得真正的 task_id（全链路主键）
-        #    如果传入了 existing_task_id，复用已有 task 而不是创建新的
-        if existing_task_id:
-            task_id = existing_task_id
-            # 更新 assignee 为实际接收者
-            await self.task_service.update_task(
-                project_id, task_id, assignee_id=to_agent_id
-            )
-        else:
-            task_id = await self.task_service.create_task(
-                project_id=project_id,
-                title=description[:100],
-                description=description_out,
-                creator_id=from_agent_id,
-                assignee_id=to_agent_id,
-                source="agent",
-            )
-
         log_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
 
@@ -186,7 +205,7 @@ class DispatchService:
             "worktree_short_id": wt_meta.get("short_id"),
         })
 
-        # 2) work_log 携带 task_id
+        # 3) work_log 携带 task_id
         await _execute(
             project_id,
             "INSERT INTO work_logs (id, agent_id, project_id, session_id, "
@@ -196,7 +215,7 @@ class DispatchService:
              description_out, details, now_ms, task_id],
         )
 
-        # 3) inbox 消息携带 task_id（路径已钉到 assignee worktree）
+        # 4) inbox 消息携带 task_id（路径已钉到 assignee worktree）
         await self.inbox.send_message(
             from_agent_id, to_agent_id, description_out,
             message_type="task",
@@ -204,7 +223,7 @@ class DispatchService:
             task_id=task_id,
         )
 
-        # 4) handoff 携带 task_id（如启用）
+        # 5) handoff 携带 task_id（如启用）
         handoff_id: str | None = None
         if create_handoff:
             handoff_id = await self.handoff.create_handoff(

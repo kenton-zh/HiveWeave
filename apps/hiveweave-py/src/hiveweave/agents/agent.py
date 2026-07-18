@@ -1027,6 +1027,9 @@ class Agent:
                 ):
                     from hiveweave.services.git_worktree import ensure_executor_worktree
 
+                    # P0: 此处没有当前任务上下文（agent 不跟踪 current task），
+                    # 不传 task_id → 落 hw/<shortId>/work 稳定分支；
+                    # task_name 兼容保留但不再参与命名。
                     ensured = await ensure_executor_worktree(
                         self.project_id,
                         self.id,

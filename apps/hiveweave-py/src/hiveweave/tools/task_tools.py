@@ -1118,7 +1118,8 @@ async def review_task_tool(
                     from hiveweave.services.git_worktree import ensure_executor_worktree
 
                     await ensure_executor_worktree(
-                        project_id, str(task["assignee_id"])
+                        project_id, str(task["assignee_id"]),
+                        task_id=params.task_id,  # P0 稳定命名 hw/<sid>/t-<taskid8>
                     )
                 except Exception:
                     pass

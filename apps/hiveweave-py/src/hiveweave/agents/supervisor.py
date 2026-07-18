@@ -270,6 +270,33 @@ class AgentManager:
                     error=str(e),
                 )
 
+            # P0: 孤儿 worktree/残留分支回收对账（delete-safe 链路的最后一道）。
+            # try/except 只告警不阻断启动 — reconcile 失败时 agents 照常唤醒。
+            try:
+                from hiveweave.services.git_worktree import reconcile_worktrees
+
+                workspace_path = await meta_db.get_project_workspace(project_id)
+                if workspace_path:
+                    reconciled = await reconcile_worktrees(workspace_path)
+                    if (
+                        reconciled.get("pruned")
+                        or reconciled.get("removed_dirs")
+                        or reconciled.get("deleted_branches")
+                        or reconciled.get("preserved_branches")
+                        or reconciled.get("errors")
+                    ):
+                        log.info(
+                            "worktree_reconcile_on_start",
+                            project_id=project_id,
+                            **reconciled,
+                        )
+            except Exception as e:
+                log.warning(
+                    "worktree_reconcile_on_start_failed",
+                    project_id=project_id,
+                    error=str(e),
+                )
+
             # 同步 stale project_id — per-project DB 中的 agents.project_id
             # 可能在项目重建后残留旧值，导致按当前 project_id 查不到 agents
             try:
