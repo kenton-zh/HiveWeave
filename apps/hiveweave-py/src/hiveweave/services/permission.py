@@ -46,6 +46,8 @@ COORDINATOR_TOOLS = _BASE_TOOLS | frozenset({
     "write_file",  # docs/shared only via policy scope
     "bind_skill", "unbind_skill",
     "create_task", "dispatch_task", "review_task",
+    # 台账出口：废弃/释放误绑任务 + 豁免 attestation（policy 已映射 DISPATCH/REVIEW）
+    "cancel_task", "unclaim_task", "waive_attestation",
     "save_charter", "update_goals", "dismiss_agent", "transfer_agent",
     # merge/remove only — create is system-side on dispatch/hire for executors
     "git_worktree_merge", "git_worktree_remove",
@@ -85,12 +87,15 @@ ALL_TOOLS = READWRITE_TOOLS | COORDINATOR_TOOLS | HR_TOOLS | frozenset({
     "save_charter", "update_goals",
 })
 
+# 工具本体（task_tools）无角色守卫；executor 滥用由两层拦截：
+# policy 硬能力门（DISPATCH/REVIEW，executor 族不具备）+ 此集合 deny。
 COORDINATOR_ONLY_TOOLS = frozenset({
     "create_task", "dispatch_task", "review_task",
+    "cancel_task", "unclaim_task", "waive_attestation",
     "git_worktree_merge", "git_worktree_remove",
 })
 
-EXECUTOR_ONLY_TOOLS = frozenset()
+EXECUTOR_ONLY_TOOLS: frozenset[str] = frozenset()
 
 
 class PermissionService:

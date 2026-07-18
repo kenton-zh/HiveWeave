@@ -62,6 +62,9 @@ FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
     }),
     "qa": frozenset({
         Capability.BROWSER_ACCEPTANCE,
+        # 测试工程师的本职是写测试代码；hire 流程对 executor 一律给 readwrite
+        # + worktree，缺 SOURCE_WRITE 会把 write_file 硬门死（Echo 事故）。
+        Capability.SOURCE_WRITE,
         Capability.TEST_RUN,
         Capability.SOURCE_READ,
         Capability.BASH_SHELL,
@@ -191,7 +194,7 @@ def write_path_allowed(agent: dict[str, Any], file_path: str) -> str | None:
     if Capability.SOURCE_WRITE in caps:
         return None  # executors may write anywhere in sandbox
 
-    # Coordinators / HR / QA without source_write: docs & shared only
+    # Coordinators / HR without source_write: docs & shared only
     norm = (file_path or "").replace("\\", "/").lstrip("./")
     for prefix in COORDINATOR_WRITE_PREFIXES:
         if prefix.endswith("/"):

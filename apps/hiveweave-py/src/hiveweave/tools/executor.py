@@ -1018,18 +1018,21 @@ class ToolExecutor(TaskToolsMixin):
             return self._error(f"Error: Permission check failed: {exc}")
 
         if decision == "deny":
-            # 获取 agent 的 permission_type 以给出更精准的提示
+            # 如实提示：返回 policy 硬门真实原因 + coordinator/HR 写白名单指引
+            from hiveweave.services.policy import (
+                infer_role_family,
+                policy_service,
+            )
+            from hiveweave.tools.pipeline import build_deny_hint
+
             agent_info = await meta_db.get_agent_by_id(agent_id)
-            perm_type = (agent_info or {}).get("permission_type", "")
-            if perm_type == "coordinator":
-                hint = (
-                    f"Permission denied: coordinator agents cannot use '{name}'. "
-                    f"This is a read-only role. Use dispatch_task to assign this work "
-                    f"to an executor agent, or use send_message to request an executor to do it."
-                )
-            else:
-                hint = f"Permission denied: {name} is blocked for this agent."
-            return self._error(hint)
+            family = infer_role_family(agent_info or {})
+            hard_reason = (
+                policy_service.hard_check(agent_info, name, tool_args)
+                if agent_info
+                else None
+            )
+            return self._error(build_deny_hint(name, family, hard_reason))
 
         if decision == "ask":
             # Request approval (120s timeout)
