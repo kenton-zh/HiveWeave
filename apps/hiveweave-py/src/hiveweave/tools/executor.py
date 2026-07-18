@@ -2632,6 +2632,21 @@ class ToolExecutor(TaskToolsMixin):
             except Exception as evt_err:
                 log.debug("hire_agent_event_push_failed", error=str(evt_err))
 
+            # VERIFY 死区回头路：新 QA 到岗后，把创建时因缺独立 QA 被
+            # blocked 且 assignee=NULL 的存量 VERIFY 重新挂人并唤醒。
+            # 失败只告警，不阻断 hire。
+            try:
+                from hiveweave.tools.task_tools import (
+                    retry_qa_blocked_verify_tasks,
+                )
+                reattached = await retry_qa_blocked_verify_tasks(project_id)
+                if reattached:
+                    log.info("tool.hire_agent.verify_reattached",
+                             project_id=project_id, count=reattached)
+            except Exception as qa_err:
+                log.warning("tool.hire_agent.verify_retry_failed",
+                            error=str(qa_err))
+
             if worktree_path:
                 wt_info = f"  Worktree: {worktree_path}\n"
             elif worktree_error:

@@ -1631,6 +1631,102 @@ async def _find_independent_qa(
     return qa_agents[0]["id"]
 
 
+async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
+    """Re-attach VERIFY tasks left blocked+unassigned for lack of QA.
+
+    背景（VERIFY 死区）：VERIFY 创建时若找不到独立 QA（≠ 父任务实施者），
+    `_spawn_post_approve_verify_task` 会把它置为 blocked 且 assignee=NULL，
+    只通知 HR 招人。人到岗后此前没有任何回头路 —— `_nudge_one_verify_task`
+    在 assignee 为空时直接 return False，新 QA 只能闲置。
+    本函数在 hire_agent 成功后被调用：扫描 blocked 且 assignee IS NULL 的
+    VERIFY，复用 `_find_independent_qa` 重新挑人，挂回 created 并唤醒。
+
+    单个任务失败不影响其余；找不到 QA 的任务保持 blocked 不动。
+    Returns: 成功重挂（assign + unblock）的 VERIFY 数量。
+    """
+    import time as _time
+
+    from hiveweave.services import task as task_module
+
+    ts = TaskService()
+    tasks = await ts.list_tasks(project_id)
+    by_id = {t.get("id"): t for t in tasks if t.get("id")}
+    reattached = 0
+    for t in tasks:
+        if not ts._is_verify_task(t):
+            continue
+        if t.get("status") != "blocked" or t.get("assignee_id"):
+            continue
+        tid = t.get("id")
+        if not tid:
+            continue
+        try:
+            # 独立性别名规则：排除父任务实施者，与创建时同一套查找逻辑
+            parent = by_id.get(t.get("parent_task_id") or "")
+            original = (parent or {}).get("assignee_id")
+            qa = await _find_independent_qa(
+                project_id, original_assignee=original
+            )
+            if not qa:
+                log.info(
+                    "verify_retry_no_qa",
+                    project_id=project_id,
+                    verify_task_id=tid,
+                )
+                continue
+            await ts.update_task(project_id, tid, assignee_id=qa)
+            # blocked → created 不在 _TRANSITIONS 内（状态机只允许
+            # blocked → running/closed）。但这是 spawn 时兜底阻塞的纠偏：
+            # 任务从未被认领执行，回到 created 等价于回到创建时刻，随后由
+            # 既有 nudge 通道（claim + [POST-MERGE VERIFY] + trigger）接管。
+            # 参照 archive_task：生命周期外纠偏，不走 _TRANSITIONS。
+            now_ms = int(_time.time() * 1000)
+            try:
+                await task_module._execute(
+                    project_id,
+                    "UPDATE tasks SET status = 'created', blocked_reason = NULL, "
+                    "wait_kind = NULL, wake_at = NULL, updated_at = ? "
+                    "WHERE id = ?",
+                    [now_ms, tid],
+                )
+            except Exception:
+                await task_module._execute(
+                    project_id,
+                    "UPDATE tasks SET status = 'created', "
+                    "blocked_reason = NULL, updated_at = ? WHERE id = ?",
+                    [now_ms, tid],
+                )
+            nudged = await _nudge_one_verify_task(
+                project_id,
+                "system",
+                {**t, "assignee_id": qa, "status": "created"},
+                reason="merge",
+            )
+            reattached += 1
+            log.info(
+                "verify_retry_reattached",
+                project_id=project_id,
+                verify_task_id=tid,
+                qa_assignee=qa,
+                original_assignee=original,
+                nudged=nudged,
+            )
+        except Exception as e:
+            log.warning(
+                "verify_retry_task_failed",
+                project_id=project_id,
+                verify_task_id=tid,
+                error=str(e),
+            )
+    if reattached:
+        log.info(
+            "verify_retry_done",
+            project_id=project_id,
+            reattached=reattached,
+        )
+    return reattached
+
+
 # Stale VERIFY child under a verifying parent (ms) — matches stall cooldown scale
 VERIFY_STALE_MS = 15 * 60 * 1000
 VERIFY_STALE_COOLDOWN_MS = 15 * 60 * 1000  # don't re-nudge same VERIFY every tick
