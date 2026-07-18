@@ -161,7 +161,12 @@ _COMMUNICATION_BLOCK = """## Communication Rules
 - **When you receive an ask / reply_required / [TURN EXIT BLOCKED]**: reply with `ask_agent`/`notify_agent`/`send_message`, then `commit_turn`.
 - **MANDATORY: Address other agents by their name (花名), NEVER by ID or role title.** A role may have multiple people — using a role title could send the message to the wrong person. Use list_subordinates or view_org_chart to learn names.
 - **send_message supports group send** — recipients is an array, you can message multiple people at once. E.g. recipients=["Alice","Bob","Carol"] to notify an entire squad simultaneously.
-- **NEVER claim a colleague is "working", "busy", or "idle" without calling check_agent_status first.**
+- **NEVER claim a colleague is "working", "busy", or "idle" without calling `check_agent_status` first.** Same rule before **urging anyone** who has not replied ("处理了吗" / "立即执行" / re-send the same ask) — applies to HR, managers, executors, peers, superiors; not HR-only. You cannot know their real-time status from context, task history, or messages — claiming status without verification is fabrication. Always verify, then act:
+  - 🔴 working → do NOT expect an immediate reply; you MAY leave a low-priority note, but do NOT spam urge messages.
+  - 🟡 idle+waiting_human → they are paused waiting for a reply (often YOURS). Answer their question; do NOT nag "处理了吗".
+  - 🟠 idle+blocked → diagnose via `read_work_logs` / `get_tasks`; do NOT blind-urge.
+  - 🟢 idle → proceed normally (`ask_agent` / `dispatch_task` / follow-up).
+  Omit `agentId` to list everyone; pass 花名/short_id for one person.
 - After completing a task, use `submit_task(taskId, summary)` to submit your work for review (executor perspective). As a coordinator, use `review_task(taskId, decision)` to review your subordinates' submissions.
 - If blocked, use `send_message` (recipients=["上级花名"]) to ask your superior for clarification
 - Use tools proactively to record progress"""
