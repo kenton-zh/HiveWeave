@@ -558,29 +558,53 @@ async def git_worktree_merge_tool(
             )
         return ToolResult.ok(f"{msg}{marker_warning}")
 
-    # Conflict: auto-rework matching approved task(s) → executor fixes in worktree
-    try:
-        from hiveweave.tools.task_tools import rework_tasks_after_merge_conflict
+    # Conflict: auto-rework only for real content conflicts.
+    # untracked_on_target / merge_failed are MAIN hygiene or unknown — do NOT rework.
+    reason = result.get("reason") or ""
+    reworked = 0
+    if reason == "merge_conflict" or (
+        not reason
+        and isinstance(result.get("conflicts"), list)
+        and result.get("conflicts")
+    ):
+        try:
+            from hiveweave.tools.task_tools import rework_tasks_after_merge_conflict
 
-        reworked = await rework_tasks_after_merge_conflict(
-            project_id,
-            agent_id,
-            merged_short_id=short,
-            merged_branch=branch,
-            conflicts=result.get("conflicts") if isinstance(result.get("conflicts"), list) else None,
-            merged_files=files if isinstance(files, list) else None,
-        )
-    except Exception as e:
-        log.warning("merge_conflict_rework_failed", error=str(e))
-        reworked = 0
+            reworked = await rework_tasks_after_merge_conflict(
+                project_id,
+                agent_id,
+                merged_short_id=short,
+                merged_branch=branch,
+                conflicts=result.get("conflicts") if isinstance(result.get("conflicts"), list) else None,
+                merged_files=files if isinstance(files, list) else None,
+            )
+        except Exception as e:
+            log.warning("merge_conflict_rework_failed", error=str(e))
+            reworked = 0
 
-    from hiveweave.services.worktree_review import format_merge_conflict_message
-
-    err = result.get("message") or format_merge_conflict_message(
-        branch=str(branch or branch_name),
-        target=target_branch,
-        conflicts=result.get("conflicts") if isinstance(result.get("conflicts"), list) else None,
+    from hiveweave.services.worktree_review import (
+        format_merge_conflict_message,
+        format_untracked_on_target_message,
     )
+
+    err = result.get("message")
+    if not err:
+        if reason == "untracked_on_target":
+            err = format_untracked_on_target_message(
+                branch=str(branch or branch_name),
+                target=target_branch,
+                untracked=result.get("untracked")
+                if isinstance(result.get("untracked"), list)
+                else None,
+            )
+        else:
+            err = format_merge_conflict_message(
+                branch=str(branch or branch_name),
+                target=target_branch,
+                conflicts=result.get("conflicts")
+                if isinstance(result.get("conflicts"), list)
+                else None,
+            )
     if reworked:
         err = f"{err}\n\nAuto-reworked {reworked} approved task(s) → executor."
     return ToolResult.err(err)
