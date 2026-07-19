@@ -59,18 +59,53 @@ def _norm_set(files: list[Any] | None) -> set[str]:
     return set(_rel_paths(list(files or [])))
 
 
+async def worktree_commits_ahead(
+    main_ws: str, worktree_ws: str, *, target_branch: str = "main"
+) -> int | None:
+    """How many commits worktree HEAD is ahead of target branch tip.
+
+    ``0`` → already on main (pure verification / already merged).
+    ``None`` → could not determine (git error).
+    """
+    try:
+        from hiveweave.services.git_worktree import _git
+
+        ok_m, main_tip = await _git(
+            ["rev-parse", target_branch], main_ws
+        )
+        if not ok_m or not (main_tip or "").strip():
+            return None
+        ok_w, wt_tip = await _git(["rev-parse", "HEAD"], worktree_ws)
+        if not ok_w or not (wt_tip or "").strip():
+            return None
+        if main_tip.strip() == wt_tip.strip():
+            return 0
+        ok_c, count_out = await _git(
+            ["rev-list", "--count", f"{main_tip.strip()}..HEAD"],
+            worktree_ws,
+        )
+        if not ok_c:
+            return None
+        return int((count_out or "0").strip() or "0")
+    except Exception as e:
+        log.warning("worktree_commits_ahead_failed", error=str(e))
+        return None
+
+
 def compare_worktree_to_main(
     *,
     main_ws: str,
     worktree_ws: str,
     files_changed: list[Any] | None,
+    allow_empty_files: bool = False,
 ) -> tuple[str | None, dict[str, Any]]:
     """Return (deny_reason, meta) for review against assignee worktree.
 
     Deny when:
-    - files_changed is empty (no proof of what to review)
+    - files_changed is empty AND allow_empty_files is False
+      (no proof of what to review for a code-changing task)
     - any claimed file is missing in worktree
-    - any claimed file is identical to main
+    - any claimed file is identical to main (when a list was provided)
     """
     meta: dict[str, Any] = {
         "mainWorkspace": main_ws,
@@ -82,10 +117,16 @@ def compare_worktree_to_main(
     }
     rels = _rel_paths(list(files_changed or []))
     if not rels:
+        if allow_empty_files:
+            meta["skipped"] = "empty_files_changed_allowed"
+            return None, meta
         return (
             "Approve blocked: evidence.files_changed is empty. "
             "List the paths you reviewed in the assignee worktree "
-            "(not main). Without that list there is no worktree proof.",
+            "(not main). Without that list there is no worktree proof. "
+            "Pure verification / no-code tasks: submit with attestation "
+            "and empty files_changed only when the worktree has 0 commits "
+            "ahead of main (or tag the task VERIFY).",
             meta,
         )
 
@@ -132,12 +173,31 @@ def compare_worktree_to_main(
     return None, meta
 
 
+def _is_no_code_evidence(evidence: dict[str, Any]) -> bool:
+    """Explicit no-code / verification-only delivery flags on evidence."""
+    for key in (
+        "no_code_change",
+        "noCodeChange",
+        "verification_only",
+        "verificationOnly",
+    ):
+        if evidence.get(key) is True:
+            return True
+    return False
+
+
 async def review_worktree_gate(
     project_id: str,
     task: dict[str, Any],
     evidence: dict[str, Any],
 ) -> tuple[str | None, dict[str, Any]]:
-    """Hard gate for approve: evidence must exist in assignee worktree."""
+    """Hard gate for approve: code tasks need worktree proof; verify/no-diff do not.
+
+    Pure verification (VERIFY: title/tag, or 0 commits ahead of main with empty
+    files_changed) must be approvable — otherwise CEO can only cancel.
+    """
+    from hiveweave.services.task import TaskService
+
     assignee = task.get("assignee_id")
     main_ws = await project_main_workspace(project_id)
     if not main_ws:
@@ -145,12 +205,22 @@ async def review_worktree_gate(
     if not assignee:
         return None, {"mainWorkspace": main_ws}
 
-    wt = await agent_worktree_path(str(assignee))
     meta: dict[str, Any] = {
         "mainWorkspace": main_ws,
-        "worktreeWorkspace": wt,
         "assigneeId": assignee,
     }
+
+    # VERIFY child / tagged verify: delivery is attestation/script, not a diff
+    if TaskService._is_verify_task(task):
+        meta["skipped"] = "verify_task"
+        return None, meta
+
+    if _is_no_code_evidence(evidence):
+        meta["skipped"] = "no_code_change_flag"
+        return None, meta
+
+    wt = await agent_worktree_path(str(assignee))
+    meta["worktreeWorkspace"] = wt
     if not wt:
         return (
             "Approve blocked: assignee has no worktree path. "
@@ -160,10 +230,35 @@ async def review_worktree_gate(
         )
 
     files = evidence.get("files_changed") or evidence.get("filesChanged") or []
+    ahead = await worktree_commits_ahead(main_ws, wt)
+    meta["commitsAhead"] = ahead
+
+    # Empty files_changed + worktree already on main → verification-only OK
+    allow_empty = False
+    if not _rel_paths(list(files or [])):
+        if ahead == 0:
+            allow_empty = True
+            meta["skipped"] = "zero_commits_ahead"
+        elif ahead is None:
+            # Can't measure — still allow empty when attestation-backed
+            # caller already passed attestation gate before this.
+            aids = evidence.get("attestation_ids") or evidence.get(
+                "attestationIds"
+            )
+            if isinstance(aids, list) and aids:
+                allow_empty = True
+                meta["skipped"] = "attestation_only_unknown_ahead"
+
     deny, cmp_meta = compare_worktree_to_main(
-        main_ws=main_ws, worktree_ws=wt, files_changed=files
+        main_ws=main_ws,
+        worktree_ws=wt,
+        files_changed=files,
+        allow_empty_files=allow_empty,
     )
     meta.update(cmp_meta)
+    # Prefer the more specific skip reason over compare's generic flag
+    if allow_empty and ahead == 0:
+        meta["skipped"] = "zero_commits_ahead"
     return deny, meta
 
 
@@ -180,6 +275,17 @@ MERGE_CONFLICT_HINT = (
     "VERIFY is created only after a successful merge."
 )
 
+# Untracked on MAIN is a coordinator/main hygiene issue — NOT executor rework
+UNTRACKED_ON_TARGET_HINT = (
+    "[UNTRACKED ON MAIN — NOT A MERGE CONFLICT] "
+    "Main has untracked files that would be overwritten by the merge. "
+    "This is NOT an executor worktree problem — do NOT rework the assignee "
+    "and do NOT ask them to 'fix it in the worktree'. "
+    "Coordinator: quarantine/remove those untracked files on MAIN "
+    "(or let git_worktree_merge auto-quarantine), then retry merge. "
+    "If branch tip already equals main tip, merge is a no-op after cleanup."
+)
+
 # Back-compat alias for older imports / messages
 COORDINATOR_MERGE_OWNERSHIP = MERGE_CONFLICT_HINT
 
@@ -194,6 +300,19 @@ def format_merge_conflict_message(
     return (
         f"Merge conflict for {branch} into {target}. "
         f"Conflicted files: {files}.\n\n{MERGE_CONFLICT_HINT}"
+    )
+
+
+def format_untracked_on_target_message(
+    *,
+    branch: str,
+    target: str,
+    untracked: list[str] | None,
+) -> str:
+    files = ", ".join((untracked or [])[:12]) or "(unknown)"
+    return (
+        f"Merge blocked for {branch} into {target}: untracked files on "
+        f"{target} would be overwritten: {files}.\n\n{UNTRACKED_ON_TARGET_HINT}"
     )
 
 

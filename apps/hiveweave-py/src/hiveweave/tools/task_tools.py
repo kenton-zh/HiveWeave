@@ -1190,11 +1190,29 @@ async def review_task_tool(
                 await trigger_subordinate(assignee_id)
 
         # (3) Do NOT spawn VERIFY on approve — only after successful merge
+        # Exception: VERIFY child approve already closed parent; pure no-diff
+        # tasks need no merge.
         if decision == "approve":
-            from hiveweave.services.worktree_review import agent_worktree_path
+            from hiveweave.services.worktree_review import (
+                agent_worktree_path,
+                worktree_commits_ahead,
+                project_main_workspace,
+            )
+
+            if ts._is_verify_task(task_after or task):
+                return ToolResult.ok(
+                    f"VERIFY task {params.task_id} approved — parent closed. "
+                    "No git_worktree_merge needed."
+                )
 
             asg = (task_after or {}).get("assignee_id")
             wt = await agent_worktree_path(asg) if asg else None
+            main_ws = await project_main_workspace(project_id)
+            ahead = (
+                await worktree_commits_ahead(main_ws, wt)
+                if main_ws and wt
+                else None
+            )
             short = ""
             if asg:
                 try:
@@ -1203,14 +1221,66 @@ async def review_task_tool(
                     short = (a or {}).get("short_id") or ""
                 except Exception:
                     pass
+
+            # Only auto-close when there is truly nothing to merge: empty
+            # files_changed + 0 commits ahead. Non-empty files_changed with
+            # ahead==0 usually means uncommitted worktree dirt — do NOT close
+            # (merge tip wouldn't pick those up either; executor must checkpoint).
+            evidence_after = (task_after or {}).get("evidence") or {}
+            if isinstance(evidence_after, str):
+                try:
+                    evidence_after = json.loads(evidence_after)
+                except Exception:
+                    evidence_after = {}
+            if not isinstance(evidence_after, dict):
+                evidence_after = {}
+            claimed_files = evidence_after.get("files_changed") or evidence_after.get(
+                "filesChanged"
+            ) or []
+            from hiveweave.services.worktree_review import _rel_paths
+
+            has_claimed_files = bool(_rel_paths(list(claimed_files or [])))
+
+            if ahead == 0 and not has_claimed_files:
+                try:
+                    await ts.close_task(project_id, params.task_id)
+                except Exception as e:
+                    log.warning(
+                        "approve_no_diff_close_failed",
+                        task_id=params.task_id,
+                        error=str(e),
+                    )
+                    return ToolResult.ok(
+                        f"Task {params.task_id} approved; worktree already on "
+                        f"main (0 commits ahead, no files_changed). "
+                        f"Close manually if needed ({e}). No merge required."
+                    )
+                return ToolResult.ok(
+                    f"Task {params.task_id} approved; assignee worktree already "
+                    f"matches main (0 commits ahead, no files_changed) — "
+                    f"closed without merge. No git_worktree_merge needed."
+                )
+
+            if ahead == 0 and has_claimed_files:
+                return ToolResult.ok(
+                    f"Task {params.task_id} approved against assignee worktree"
+                    f"{f' ({wt})' if wt else ''}, but HEAD is 0 commits ahead "
+                    f"of main while evidence.files_changed is non-empty "
+                    f"(likely uncommitted changes). Executor must "
+                    f"git_worktree_checkpoint before you merge; do NOT treat "
+                    f"as already-merged. Next: confirm checkpoint, then "
+                    f"git_worktree_merge(branchName='{short or 'hw/<short_id>/...'}')."
+                )
+
             return ToolResult.ok(
                 f"Task {params.task_id} approved against assignee worktree"
                 f"{f' ({wt})' if wt else ''}. "
                 f"VERIFY is NOT created yet. "
                 f"Next (YOU, coordinator): git_worktree_merge("
                 f"branchName='{short or 'hw/<short_id>/...'}'). "
-                f"On conflict: rework executor to rebase/merge main in their "
-                f"worktree (main merge is aborted — no markers on main)."
+                f"On real content conflict: rework executor to rebase/merge "
+                f"main in their worktree. On untracked-on-main: that is MAIN "
+                f"hygiene — retry merge (auto-quarantine), do NOT rework."
             )
         return ToolResult.ok(f"Task {params.task_id} sent back for rework.")
     except Exception as e:

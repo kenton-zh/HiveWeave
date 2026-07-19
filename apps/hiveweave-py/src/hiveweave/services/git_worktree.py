@@ -43,6 +43,15 @@ _SLUG_TRIM = re.compile(r"^-+|-+$")
 # Match: "<path>  <hash> [<branch>]" from `git worktree list`
 _WT_LIST_RE = re.compile(r"^(.+?)\s+([a-f0-9]+)\s*(?:\[(.+?)\])?$")
 
+# git merge/checkout: untracked files would be overwritten
+_UNTRACKED_OVERWRITE_RE = re.compile(
+    r"(?:untracked working tree files would be overwritten|"
+    r"The following untracked working tree files would be overwritten)"
+    r"[\s\S]*?(?:Please move or remove them|Aborting)",
+    re.IGNORECASE,
+)
+_UNTRACKED_FILE_LINE_RE = re.compile(r"^\t(.+)$", re.MULTILINE)
+
 
 def _slugify(name: str) -> str:
     """Slugify a task name (契约 09 slugify 规则).
@@ -180,6 +189,148 @@ async def _current_branch(worktree_path: str) -> str | None:
     if ok and out and out.strip() != "HEAD":
         return out.strip()
     return None
+
+
+def parse_untracked_overwrite(git_output: str) -> list[str]:
+    """Extract paths from 'untracked working tree files would be overwritten'."""
+    if not git_output or not _UNTRACKED_OVERWRITE_RE.search(git_output):
+        return []
+    files: list[str] = []
+    for m in _UNTRACKED_FILE_LINE_RE.finditer(git_output):
+        path = m.group(1).strip().replace("\\", "/")
+        if path and path not in files:
+            files.append(path)
+    return files
+
+
+async def quarantine_untracked_on_target(
+    workspace_path: str, files: list[str]
+) -> list[str]:
+    """Move untracked files that block merge into ``.hiveweave/merge-quarantine/``.
+
+    Returns list of successfully quarantined relative paths.
+    """
+    import time as _time
+
+    root = Path(workspace_path)
+    stamp = _time.strftime("%Y%m%d-%H%M%S")
+    dest_root = root / ".hiveweave" / "merge-quarantine" / stamp
+    moved: list[str] = []
+    for rel in files:
+        src = root / rel
+        if not src.exists():
+            continue
+        # Only quarantine untracked / not in index
+        ok_ls, ls_out = await _git(["ls-files", "--", rel], workspace_path)
+        if ok_ls and (ls_out or "").strip():
+            continue  # tracked — leave alone
+        dest = dest_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(src), str(dest))
+            moved.append(rel.replace("\\", "/"))
+        except OSError as e:
+            log.warning(
+                "git_worktree.quarantine_failed",
+                path=rel,
+                error=str(e),
+            )
+    if moved:
+        log.info(
+            "git_worktree.quarantined_untracked",
+            count=len(moved),
+            dest=str(dest_root),
+            files=moved[:12],
+        )
+    return moved
+
+
+async def _merge_failure_result(
+    *,
+    workspace_path: str,
+    branch: str,
+    target_branch: str,
+    merge_out: str,
+    branch_files: list[str],
+    short_id: str = "",
+    auto_quarantine: bool = True,
+) -> dict | None:
+    """Classify merge failure. May quarantine untracked and return None to retry.
+
+    Returns a failure dict, or ``None`` when caller should retry merge once
+    after auto-quarantine.
+    """
+    untracked = parse_untracked_overwrite(merge_out)
+    if untracked:
+        # Abort any in-progress merge so main is clean
+        await _git(["merge", "--abort"], workspace_path)
+        if auto_quarantine:
+            moved = await quarantine_untracked_on_target(
+                workspace_path, untracked
+            )
+            if moved:
+                return None  # signal retry
+        from hiveweave.services.worktree_review import (
+            format_untracked_on_target_message,
+        )
+
+        return {
+            "success": False,
+            "reason": "untracked_on_target",
+            "message": format_untracked_on_target_message(
+                branch=branch,
+                target=target_branch,
+                untracked=untracked,
+            ),
+            "untracked": untracked,
+            "conflicts": [],
+            "branch": branch,
+            "files": branch_files,
+            "short_id": short_id,
+        }
+
+    ok_diff, diff_out = await _git(
+        ["diff", "--name-only", "--diff-filter=U"], workspace_path
+    )
+    conflict_files = [
+        f.strip() for f in (diff_out or "").split("\n") if f.strip()
+    ] if ok_diff else []
+    await _git(["merge", "--abort"], workspace_path)
+
+    from hiveweave.services.worktree_review import format_merge_conflict_message
+
+    if conflict_files:
+        return {
+            "success": False,
+            "reason": "merge_conflict",
+            "message": format_merge_conflict_message(
+                branch=branch,
+                target=target_branch,
+                conflicts=conflict_files,
+            ),
+            "conflicts": conflict_files,
+            "branch": branch,
+            "files": branch_files,
+            "short_id": short_id,
+        }
+
+    # Not a content conflict — surface raw git output; do NOT fake conflicts
+    # from branch_files (that caused "same commit" false conflict loops).
+    return {
+        "success": False,
+        "reason": "merge_failed",
+        "message": (
+            f"Merge of {branch} into {target_branch} failed "
+            f"(not a content conflict):\n{(merge_out or '')[:800]}\n\n"
+            "Do NOT ask the executor to 'fix merge conflict in worktree' "
+            "unless conflicted files are listed. Inspect main hygiene "
+            "(untracked / local edits) and retry."
+        ),
+        "conflicts": [],
+        "branch": branch,
+        "files": branch_files,
+        "short_id": short_id,
+    }
 
 
 class GitWorktreeService:
@@ -475,28 +626,36 @@ coverage/
             f.strip() for f in (files_out or "").split("\n") if f.strip()
         ] if ok_f else []
 
-        ok, _ = await _git(["merge", branch, "--no-edit"], workspace_path)
+        ok, merge_out = await _git(["merge", branch, "--no-edit"], workspace_path)
         if not ok:
-            ok_diff, diff_out = await _git(
-                ["diff", "--name-only", "--diff-filter=U"], workspace_path)
-            conflict_files = [
-                f.strip() for f in (diff_out or "").split("\n") if f.strip()
-            ] if ok_diff else []
-            await _git(["merge", "--abort"], workspace_path)
-            from hiveweave.services.worktree_review import format_merge_conflict_message
-
-            return {
-                "success": False,
-                "message": format_merge_conflict_message(
-                    branch=branch,
-                    target=target_branch,
-                    conflicts=conflict_files or branch_files,
-                ),
-                "conflicts": conflict_files or branch_files,
-                "branch": branch,
-                "files": branch_files,
-                "short_id": short_id,
-            }
+            fail = await _merge_failure_result(
+                workspace_path=workspace_path,
+                branch=branch,
+                target_branch=target_branch,
+                merge_out=merge_out or "",
+                branch_files=branch_files,
+                short_id=short_id,
+                auto_quarantine=True,
+            )
+            if fail is None:
+                # Quarantined untracked — retry once
+                ok, merge_out = await _git(
+                    ["merge", branch, "--no-edit"], workspace_path
+                )
+                if not ok:
+                    fail = await _merge_failure_result(
+                        workspace_path=workspace_path,
+                        branch=branch,
+                        target_branch=target_branch,
+                        merge_out=merge_out or "",
+                        branch_files=branch_files,
+                        short_id=short_id,
+                        auto_quarantine=False,
+                    )
+                    assert fail is not None
+                    return fail
+            else:
+                return fail
 
         ok, head = await _git(["rev-parse", "--short", "HEAD"], workspace_path)
 
@@ -512,8 +671,10 @@ coverage/
                         short_id=short_id, target=target_branch,
                         files=marker_files[:10])
 
+        already = "already up to date" in (merge_out or "").lower()
         log.info("git_worktree.merge", short_id=short_id,
-                 target=target_branch, hash=head if ok else "")
+                 target=target_branch, hash=head if ok else "",
+                 already_up_to_date=already)
         result = {
             "success": True,
             "merged": True,
@@ -522,6 +683,12 @@ coverage/
             "files": branch_files,
             "short_id": short_id,
         }
+        if already:
+            result["already_up_to_date"] = True
+            result["message"] = (
+                f"Branch {branch} already on {target_branch} "
+                f"(no new commits) — treated as merged."
+            )
         if marker_files:
             result["conflict_markers"] = marker_files
         return result
@@ -581,68 +748,134 @@ coverage/
         ok, merge_out = await _git(["merge", branch, "--no-edit"], workspace_path)
 
         if not ok:
-            # Step 3: Conflict handling — identify conflicted files
-            ok_diff, diff_out = await _git(
-                ["diff", "--name-only", "--diff-filter=U"], workspace_path)
-            conflict_files = [f.strip() for f in diff_out.split("\n") if f.strip()]
+            # Step 3a: Untracked on MAIN — quarantine + retry (NOT executor rework)
+            untracked = parse_untracked_overwrite(merge_out or "")
+            if untracked:
+                await _git(["merge", "--abort"], workspace_path)
+                moved = await quarantine_untracked_on_target(
+                    workspace_path, untracked
+                )
+                if moved:
+                    ok, merge_out = await _git(
+                        ["merge", branch, "--no-edit"], workspace_path
+                    )
+                if not ok:
+                    still = parse_untracked_overwrite(merge_out or "")
+                    if still or not moved:
+                        # Still untracked (or quarantine moved nothing) —
+                        # do NOT fall through as content-conflict / fake rework.
+                        await _git(["merge", "--abort"], workspace_path)
+                        from hiveweave.services.worktree_review import (
+                            format_untracked_on_target_message,
+                        )
 
-            # Try semantic merge for package.json
-            resolved = []
-            pkg_path = _Path(workspace_path) / "package.json"
-            if "package.json" in conflict_files and pkg_path.exists():
-                try:
-                    # Get the three versions
-                    ok_ours, ours_raw = await _git(
-                        ["show", f"{target_branch}:package.json"], workspace_path)
-                    ok_theirs, theirs_raw = await _git(
-                        ["show", f"{branch}:package.json"], workspace_path)
-                    if ok_ours and ok_theirs:
-                        ours = _json.loads(ours_raw)
-                        theirs = _json.loads(theirs_raw)
-                        # Merge dependencies semantically
-                        for dep_key in ("dependencies", "devDependencies",
-                                        "peerDependencies", "scripts"):
-                            if dep_key in ours or dep_key in theirs:
-                                merged_deps = ours.get(dep_key, {})
-                                merged_deps.update(theirs.get(dep_key, {}))
-                                ours[dep_key] = merged_deps
-                        pkg_path.write_text(
-                            _json.dumps(ours, indent=2, ensure_ascii=False) + "\n",
-                            encoding="utf-8")
-                        await _git(["add", "package.json"], workspace_path)
-                        resolved.append("package.json")
-                except Exception as e:
-                    log.warning("git_worktree.package_merge_failed",
-                                branch=branch, error=str(e))
-
-            if resolved:
-                # Re-attempt commit after resolving conflicts
-                ok_commit, _ = await _git(
-                    ["commit", "--no-edit"], workspace_path)
-                if ok_commit:
-                    ok = True  # merge succeeded after resolution
-                    log.info("git_worktree.semantic_merge_resolved",
-                             branch=branch, resolved_files=resolved)
+                        return {
+                            "success": False,
+                            "reason": "untracked_on_target",
+                            "message": format_untracked_on_target_message(
+                                branch=branch,
+                                target=target_branch,
+                                untracked=still or untracked,
+                            ),
+                            "untracked": still or untracked,
+                            "conflicts": [],
+                            "branch": branch,
+                            "files": branch_files,
+                            "short_id": short_id,
+                        }
+                    # Quarantine worked but retry failed for another reason
+                    # (e.g. real content conflict) — fall through to 3b.
 
             if not ok:
-                # Abort — leave no conflict markers on main; executor fixes in worktree
-                await _git(["merge", "--abort"], workspace_path)
-                from hiveweave.services.worktree_review import (
-                    format_merge_conflict_message,
+                # Step 3b: Content conflict — try semantic merge for package.json
+                ok_diff, diff_out = await _git(
+                    ["diff", "--name-only", "--diff-filter=U"], workspace_path
                 )
+                conflict_files = [
+                    f.strip()
+                    for f in (diff_out or "").split("\n")
+                    if f.strip()
+                ]
 
-                return {
-                    "success": False,
-                    "message": format_merge_conflict_message(
+                resolved = []
+                pkg_path = _Path(workspace_path) / "package.json"
+                if "package.json" in conflict_files and pkg_path.exists():
+                    try:
+                        ok_ours, ours_raw = await _git(
+                            ["show", f"{target_branch}:package.json"],
+                            workspace_path,
+                        )
+                        ok_theirs, theirs_raw = await _git(
+                            ["show", f"{branch}:package.json"], workspace_path
+                        )
+                        if ok_ours and ok_theirs:
+                            ours = _json.loads(ours_raw)
+                            theirs = _json.loads(theirs_raw)
+                            for dep_key in (
+                                "dependencies",
+                                "devDependencies",
+                                "peerDependencies",
+                                "scripts",
+                            ):
+                                if dep_key in ours or dep_key in theirs:
+                                    merged_deps = ours.get(dep_key, {})
+                                    merged_deps.update(theirs.get(dep_key, {}))
+                                    ours[dep_key] = merged_deps
+                            pkg_path.write_text(
+                                _json.dumps(
+                                    ours, indent=2, ensure_ascii=False
+                                )
+                                + "\n",
+                                encoding="utf-8",
+                            )
+                            await _git(["add", "package.json"], workspace_path)
+                            resolved.append("package.json")
+                    except Exception as e:
+                        log.warning(
+                            "git_worktree.package_merge_failed",
+                            branch=branch,
+                            error=str(e),
+                        )
+
+                if resolved:
+                    ok_commit, _ = await _git(
+                        ["commit", "--no-edit"], workspace_path
+                    )
+                    if ok_commit:
+                        ok = True
+                        log.info(
+                            "git_worktree.semantic_merge_resolved",
+                            branch=branch,
+                            resolved_files=resolved,
+                        )
+
+                if not ok:
+                    fail2 = await _merge_failure_result(
+                        workspace_path=workspace_path,
                         branch=branch,
-                        target=target_branch,
-                        conflicts=conflict_files,
-                    ),
-                    "conflicts": conflict_files,
-                    "branch": branch,
-                    "files": branch_files,
-                    "short_id": short_id,
-                }
+                        target_branch=target_branch,
+                        merge_out=merge_out or "",
+                        branch_files=branch_files,
+                        short_id=short_id,
+                        auto_quarantine=False,
+                    )
+                    assert fail2 is not None
+                    if conflict_files and fail2.get("reason") != "untracked_on_target":
+                        from hiveweave.services.worktree_review import (
+                            format_merge_conflict_message,
+                        )
+
+                        fail2 = {
+                            **fail2,
+                            "reason": "merge_conflict",
+                            "conflicts": conflict_files,
+                            "message": format_merge_conflict_message(
+                                branch=branch,
+                                target=target_branch,
+                                conflicts=conflict_files,
+                            ),
+                        }
+                    return fail2
 
         # Step 4: Post-merge verification
         verification_errors = []
@@ -662,7 +895,9 @@ coverage/
                         branch=branch, errors=verification_errors)
             # Don't rollback — warn but allow (agent can fix)
 
-        ok, head = await _git(["rev-parse", "--short", "HEAD"], workspace_path)
+        ok_head, head = await _git(
+            ["rev-parse", "--short", "HEAD"], workspace_path
+        )
 
         # Step 5: Auto-remove worktree + branch on success
         # 显式传已合并的分支全名 — delete 走 branch -d 安全链, 必然成功
@@ -679,17 +914,24 @@ coverage/
                         branch=branch, target=target_branch,
                         files=marker_files[:10])
 
+        already = "already up to date" in (merge_out or "").lower()
         log.info("git_worktree.merge_by_branch", branch=branch,
-                 target=target_branch, hash=head if ok else "",
-                 warnings=verification_errors)
+                 target=target_branch, hash=head if ok_head else "",
+                 warnings=verification_errors, already_up_to_date=already)
         result = {
             "success": True,
             "merged": True,
-            "hash": head if ok else "",
+            "hash": head if ok_head else "",
             "branch": branch,
             "files": branch_files,
             "short_id": short_id,
         }
+        if already:
+            result["already_up_to_date"] = True
+            result["message"] = (
+                f"Branch {branch} already on {target_branch} "
+                f"(no new commits) — treated as merged."
+            )
         if verification_errors:
             result["warnings"] = verification_errors
         if marker_files:
