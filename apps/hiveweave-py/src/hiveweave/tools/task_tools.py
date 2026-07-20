@@ -284,7 +284,13 @@ class TaskToolsMixin:
         if args.get("commit"):
             evidence["commit"] = args["commit"]
         if args.get("filesChanged"):
-            evidence["files_changed"] = args["filesChanged"]
+            from hiveweave.services.worktree_review import normalize_files_changed
+
+            evidence["files_changed"] = normalize_files_changed(
+                args["filesChanged"]
+                if isinstance(args["filesChanged"], list)
+                else [args["filesChanged"]]
+            )
         if args.get("testOutput"):
             evidence["test_output"] = str(args["testOutput"])[:4000]
         try:
@@ -409,11 +415,14 @@ from .helpers import get_project_id, resolve_agent_id
 
 # ── dispatch_task ───────────────────────────────────────
 
-# 只读协调角色提醒（中性，不阻断派发）——派发给 coordinator 时追加到返回文本
-_READONLY_ASSIGNEE_REMINDER = (
-    "提醒：对方是只读协调角色（不能修改代码文件）。"
-    "若任务包含代码修改，请改派 executor（可写代码）角色。"
+# 只读协调角色 — 硬拒绝派活（不再只是软提醒）
+_COORDINATOR_ASSIGNEE_BLOCK = (
+    "拒绝派活：对方是 coordinator（只读协调角色），不能承接改代码任务。"
+    "请改派 executor（工程师/QA 等可写角色），或让对方再 dispatch 给下属。"
 )
+
+# 保留常量名供旧测试/文档引用；语义已改为硬门文案前缀
+_READONLY_ASSIGNEE_REMINDER = _COORDINATOR_ASSIGNEE_BLOCK
 
 
 async def _get_assignee_permission_type(
@@ -422,7 +431,7 @@ async def _get_assignee_permission_type(
     """只读查询 assignee 的 permission_type（per-project DB agents 表）。
 
     返回小写 permission_type（如 "coordinator" / "executor"）；查无此人或
-    查询失败时返回 None —— 失败只记日志、按"无提醒"处理，绝不阻断派发。
+    查询失败时返回 None。
     """
     try:
         if org_service is None:
@@ -470,7 +479,8 @@ class DispatchTaskParams(BaseModel):
 
 @tool(
     "dispatch_task",
-    "Deliver work NOW: ledger entry + inbox wake. Pass taskId if create_task already drafted/queued it.",
+    "Deliver work NOW: ledger entry + inbox wake. Pass taskId if create_task already drafted/queued it. "
+    "Only direct reports; never assign coordinators code work.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -479,6 +489,11 @@ async def dispatch_task_tool(
 ) -> ToolResult:
     """Dispatch a task to a subordinate."""
     from hiveweave.services.dispatch import DispatchService
+    from hiveweave.services.org_span import (
+        validate_dispatch_span,
+        validate_executor_assignee,
+    )
+    from hiveweave.services.task import TaskService
 
     project_id = await get_project_id(agent_id)
     if not project_id:
@@ -492,6 +507,30 @@ async def dispatch_task_tool(
             f"Use the agent's name, short_id (e.g. A009), or UUID."
         )
 
+    span_err = await validate_dispatch_span(agent_id, resolved_id, org_service)
+    if span_err:
+        return ToolResult.err(span_err)
+
+    coord_err = await validate_executor_assignee(resolved_id, org_service)
+    if coord_err:
+        return ToolResult.err(coord_err)
+
+    # Dedup: same assignee + similar title already open → reuse via taskId hint
+    if not params.task_id:
+        try:
+            dup = await TaskService().find_similar_open_task(
+                project_id, params.task[:100], assignee_id=resolved_id
+            )
+            if dup:
+                return ToolResult.err(
+                    f"已有相似未完成任务 id={dup['id']} status={dup.get('status')} "
+                    f"title={dup.get('title', '')[:60]!r}。"
+                    f"请复用：dispatch_task(..., taskId=\"{dup['id']}\")，"
+                    f"或先 cancel_task(taskId=\"{dup['id']}\", reason=\"...\") 再新建。"
+                )
+        except Exception as e:
+            log.warning("dispatch_dedup_check_failed", error=str(e))
+
     ds = DispatchService()
     result = await ds.dispatch_task(
         project_id=project_id,
@@ -502,15 +541,21 @@ async def dispatch_task_tool(
         existing_task_id=params.task_id,
     )
     if result.get("success"):
+        # Align with review_task: inbox alone is not enough — wake assignee
+        try:
+            from hiveweave.agents.trigger import trigger_subordinate
+
+            await trigger_subordinate(resolved_id)
+        except Exception as e:
+            log.warning(
+                "dispatch_trigger_failed",
+                target=resolved_id,
+                error=str(e),
+            )
         output = (
             f"Task dispatched to {result.get('to_agent_id', resolved_id)} "
             f"(task_id={result.get('task_id', '')})"
         )
-        # 派发成功后做只读角色检查：assignee 是 coordinator（只读协调角色）时
-        # 追加中性提醒。不阻断派发、不改动 assignee 收到的 inbox/任务内容。
-        perm = await _get_assignee_permission_type(resolved_id, org_service)
-        if perm == "coordinator":
-            output = f"{output}\n{_READONLY_ASSIGNEE_REMINDER}"
         return ToolResult.ok(output, task_id=result.get("task_id"))
     return ToolResult.err(result.get("message", "Dispatch failed"))
 
@@ -593,16 +638,27 @@ async def create_task_tool(
     params: CreateTaskParams, agent_id: str, workspace: str, ctx=None
 ) -> ToolResult:
     """Create a new task."""
+    from hiveweave.services.org_span import (
+        validate_dispatch_span,
+        validate_executor_assignee,
+    )
+
     project_id = await get_project_id(agent_id)
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project")
 
     assignee_id = params.assignee_id
+    org_service = ctx.org if ctx else None
     if assignee_id:
-        org_service = ctx.org if ctx else None
         resolved = await resolve_agent_id(project_id, assignee_id, org_service)
         if resolved:
             assignee_id = resolved
+            span_err = await validate_dispatch_span(agent_id, assignee_id, org_service)
+            if span_err:
+                return ToolResult.err(span_err)
+            coord_err = await validate_executor_assignee(assignee_id, org_service)
+            if coord_err:
+                return ToolResult.err(coord_err)
             try:
                 from hiveweave.services.git_worktree import ensure_executor_worktree
 
@@ -614,6 +670,16 @@ async def create_task_tool(
 
     try:
         ts = TaskService()
+        dup = await ts.find_similar_open_task(
+            project_id, params.title, assignee_id=assignee_id
+        )
+        if dup:
+            return ToolResult.err(
+                f"已有相似未完成任务 id={dup['id']} status={dup.get('status')} "
+                f"title={dup.get('title', '')[:60]!r}。"
+                f"请复用该 taskId 调用 dispatch_task，或先 "
+                f"cancel_task(taskId=\"{dup['id']}\", reason=\"重复\")。"
+            )
         task_id = await ts.create_task(
             project_id=project_id,
             title=params.title,
@@ -913,6 +979,21 @@ async def submit_task_tool(
         from hiveweave.services.attestation import has_valid_waiver
 
         if not await has_valid_waiver(project_id, task_id):
+            # TEST4: auto-attach recent matching attestations if LLM omitted ids
+            if not attest_ids:
+                attest_ids = await attestation_service.find_recent_for_agent(
+                    project_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    kinds=needed,
+                )
+                if attest_ids:
+                    log.info(
+                        "submit_task_auto_attached_attestations",
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        count=len(attest_ids),
+                    )
             ok, err = await attestation_service.verify_ids(
                 project_id,
                 attest_ids,
@@ -923,10 +1004,14 @@ async def submit_task_tool(
             if not ok:
                 return ToolResult.err(
                     f"submit_task attestation gate failed ({policy_id}): {err}. "
-                    f"Run browse (UI) or bash tests, then pass attestationIds. "
-                    f"Bare testsPassed is rejected. "
-                    f"For CLI-only tasks, ask your coordinator to "
-                    f"waive_attestation(taskId, reason)."
+                    f"taskId={task_id} (use this full id).\n"
+                    f"Options:\n"
+                    f"1) Run bash/tests as the assignee, then "
+                    f"submit_task(taskId=\"{task_id}\", attestationIds=[...]).\n"
+                    f"2) Coordinator: "
+                    f"waive_attestation(taskId=\"{task_id}\", "
+                    f"reason=\"<why exempt>\").\n"
+                    f"Bare testsPassed is rejected."
                 )
     elif params.tests_passed is not True:
         # docs_only still asks for explicit ack
@@ -944,7 +1029,9 @@ async def submit_task_tool(
     if params.commit:
         evidence["commit"] = params.commit
     if params.files_changed:
-        evidence["files_changed"] = params.files_changed
+        from hiveweave.services.worktree_review import normalize_files_changed
+
+        evidence["files_changed"] = normalize_files_changed(params.files_changed)
     if params.test_output:
         evidence["test_output"] = params.test_output[:4000]
 
@@ -992,6 +1079,8 @@ async def submit_task_tool(
                     message_type="task",
                     priority="normal",
                     task_id=task_id,
+                    # Force wake: Wait Contract must not starve review (TEST3).
+                    wake=True,
                 )
                 # 触发 coordinator 处理
                 from hiveweave.agents.trigger import trigger_coordinator
@@ -1102,10 +1191,17 @@ async def review_task_tool(
                         task_id=params.task_id,
                     )
                     if not ok:
+                        tid = task.get("id") or params.task_id
                         return ToolResult.err(
                             f"Cannot approve: attestation gate failed ({policy_id}): {err}. "
-                            "Send rework and require real browse/test attestations, "
-                            "or waive_attestation(taskId, reason) for CLI-only tasks."
+                            f"taskId={tid} (use this full id).\n"
+                            f"Options:\n"
+                            f"1) Send rework; require assignee to attach real "
+                            f"browse/test attestationIds on resubmit.\n"
+                            f"2) waive_attestation(taskId=\"{tid}\", "
+                            f"reason=\"<why exempt>\") then approve again.\n"
+                            f"3) Have an executor/QA run tests and submit "
+                            f"attestationIds on this task first."
                         )
             elif evidence.get("tests_passed") is not True:
                 return ToolResult.err(
@@ -1185,6 +1281,8 @@ async def review_task_tool(
                     message_type="task",
                     priority=priority,
                     task_id=params.task_id,
+                    # Force wake: approve/rework must reach assignee (TEST3).
+                    wake=True,
                 )
                 from hiveweave.agents.trigger import trigger_subordinate
                 await trigger_subordinate(assignee_id)
@@ -1298,10 +1396,23 @@ class CancelTaskParams(BaseModel):
     task_id: str = Field(
         alias="taskId",
         description="ID of the task to cancel/archive.",
-        json_schema_extra={"aliases": ["taskId", "task_id", "id"]},
+        json_schema_extra={
+            "aliases": ["taskId", "task_id", "id"],
+        },
     )
     reason: str = Field(
         description="Why this task is being cancelled (required, for audit).",
+        json_schema_extra={
+            "aliases": [
+                "reason",
+                "feedback",
+                "comment",
+                "description",
+                "message",
+                "why",
+                "note",
+            ],
+        },
     )
 
 
@@ -2030,11 +2141,31 @@ async def nudge_verify_tasks_after_merge(
             parent_ids = {t["id"] for t in selected if t.get("id")}
             spawned = []
             for t in selected:
-                vid = await _spawn_post_approve_verify_task(
-                    ts, project_id, from_agent_id, t
-                )
-                if vid:
-                    spawned.append(vid)
+                tid = t.get("id")
+                try:
+                    vid = await _spawn_post_approve_verify_task(
+                        ts, project_id, from_agent_id, t
+                    )
+                    if vid:
+                        spawned.append(vid)
+                    elif tid:
+                        # Spawn returned None without raising — still advance
+                        # parent out of bare approved so it cannot stall forever.
+                        try:
+                            await ts.mark_verifying(project_id, tid)
+                        except Exception:
+                            pass
+                except Exception as spawn_err:
+                    log.warning(
+                        "verify_spawn_one_failed",
+                        parent_id=tid,
+                        error=str(spawn_err),
+                    )
+                    if tid:
+                        try:
+                            await ts.mark_verifying(project_id, tid)
+                        except Exception:
+                            pass
             if spawned:
                 log.info(
                     "verify_spawned_after_merge",

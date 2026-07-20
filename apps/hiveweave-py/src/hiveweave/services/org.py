@@ -79,6 +79,7 @@ _SCALAR_COLS = (
     "workspace_path",
     "worktree_error",
     "language",
+    "last_active_at",
 )
 
 _SHORT_ID_RE = re.compile(r"^[aA]\d{1,4}$")
@@ -188,8 +189,6 @@ class OrgService:
 
             # Write to per-project DB
             conn = await project_db.get_project_db_by_project_id(project_id)
-            if conn is None:
-                raise ValueError(f"Project not found: {project_id}")
             await conn.execute(
                 f"INSERT INTO agents ({col_list}) VALUES ({placeholders})", vals
             )
@@ -229,9 +228,13 @@ class OrgService:
         return self._row(agent) if agent else None
 
     async def get_agent_by_role(self, project_id: str, role: str) -> dict | None:
-        """Get first active agent by role within a project."""
-        conn = await project_db.get_project_db_by_project_id(project_id)
-        if conn is None:
+        """Get first active agent by role within a project.
+
+        project 不存在（ProjectDbError）时返回 None。
+        """
+        try:
+            conn = await project_db.get_project_db_by_project_id(project_id)
+        except project_db.ProjectDbError:
             return None
         cursor = await conn.execute(
             "SELECT * FROM agents WHERE project_id = ? AND role = ? "
@@ -260,8 +263,9 @@ class OrgService:
             result.sort(key=lambda a: a.get("created_at", 0))
             return result
 
-        conn = await project_db.get_project_db_by_project_id(project_id)
-        if conn is None:
+        try:
+            conn = await project_db.get_project_db_by_project_id(project_id)
+        except project_db.ProjectDbError:
             return []
         cursor = await conn.execute(
             "SELECT * FROM agents WHERE project_id = ? "
@@ -421,29 +425,28 @@ class OrgService:
         # Close Task Ledger obligations — reassign open work to parent, else archive
         try:
             conn = await project_db.get_project_db_by_project_id(project_id)
-            if conn is not None:
-                if parent_id:
-                    await conn.execute(
-                        "UPDATE tasks SET assignee_id = ?, status = 'created', "
-                        "claimed_at = NULL, updated_at = ? "
-                        "WHERE assignee_id = ? AND is_archived = 0 "
-                        "AND status NOT IN ('closed', 'approved')",
-                        [parent_id, now_ms, agent_id],
-                    )
-                else:
-                    await conn.execute(
-                        "UPDATE tasks SET is_archived = 1, status = 'closed', "
-                        "closed_at = ?, updated_at = ? "
-                        "WHERE assignee_id = ? AND is_archived = 0 "
-                        "AND status NOT IN ('closed')",
-                        [now_ms, now_ms, agent_id],
-                    )
-                await conn.commit()
-                log.info(
-                    "org.dismiss_agent.tasks_closed",
-                    agent_id=agent_id,
-                    reassigned_to=parent_id or None,
+            if parent_id:
+                await conn.execute(
+                    "UPDATE tasks SET assignee_id = ?, status = 'created', "
+                    "claimed_at = NULL, updated_at = ? "
+                    "WHERE assignee_id = ? AND is_archived = 0 "
+                    "AND status NOT IN ('closed', 'approved')",
+                    [parent_id, now_ms, agent_id],
                 )
+            else:
+                await conn.execute(
+                    "UPDATE tasks SET is_archived = 1, status = 'closed', "
+                    "closed_at = ?, updated_at = ? "
+                    "WHERE assignee_id = ? AND is_archived = 0 "
+                    "AND status NOT IN ('closed')",
+                    [now_ms, now_ms, agent_id],
+                )
+            await conn.commit()
+            log.info(
+                "org.dismiss_agent.tasks_closed",
+                agent_id=agent_id,
+                reassigned_to=parent_id or None,
+            )
         except Exception as e:
             log.warning(
                 "dismiss_close_tasks_failed",
@@ -671,6 +674,18 @@ class OrgService:
                 if num > max_num:
                     max_num = num
         return f"A{str(max_num + 1).zfill(3)}"
+
+    async def touch_last_active(self, agent_id: str) -> None:
+        """Persist activity timestamp (stall/silence must not use lifecycle status)."""
+        now_ms = int(time.time() * 1000)
+        try:
+            await self.update_agent(agent_id, {"last_active_at": now_ms})
+        except Exception as e:
+            log.warning(
+                "touch_last_active_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
 
     # ── HELPERS ──────────────────────────────────────────────
 

@@ -33,6 +33,7 @@ from pydantic import BaseModel
 import structlog
 
 from hiveweave.api.auth import validate_id
+from hiveweave.agents.agent import Agent
 from hiveweave.agents.supervisor import agent_manager
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
@@ -104,7 +105,7 @@ async def _stream_callback(agent_id: str, event: dict) -> None:
 # ── Agent 启动辅助 ───────────────────────────────────────────
 
 
-async def _ensure_agent_started(agent_id: str) -> tuple[object, dict] | None:
+async def _ensure_agent_started(agent_id: str) -> tuple[Agent, dict] | None:
     """确保 agent 已启动（带流事件回调）。返回 (agent, config) 或 None。"""
     agent = agent_manager.get_agent(agent_id)
     if agent is not None:

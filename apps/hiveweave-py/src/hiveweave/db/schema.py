@@ -102,7 +102,8 @@ PROJECT_DB_TABLES = [
         language TEXT DEFAULT 'en',
         compacted_prefix TEXT,
         created_at INTEGER,
-        updated_at INTEGER
+        updated_at INTEGER,
+        last_active_at INTEGER
     )
     """,
     """
@@ -283,6 +284,8 @@ PROJECT_DB_TABLES = [
     """ALTER TABLE questions ADD COLUMN options TEXT""",
     # BUG-A migration: persist worktree creation errors for observability
     """ALTER TABLE agents ADD COLUMN worktree_error TEXT""",
+    # D6: activity timestamp — stall/UI must not treat lifecycle status as busy
+    """ALTER TABLE agents ADD COLUMN last_active_at INTEGER""",
     """
     CREATE TABLE IF NOT EXISTS todos (
         id TEXT PRIMARY KEY,

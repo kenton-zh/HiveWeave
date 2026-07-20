@@ -11,6 +11,7 @@ schema.py 的 personnel_records 表缺 hire_date 列，首次访问时 ALTER TAB
 import time
 import uuid
 
+import aiosqlite
 import structlog
 
 from hiveweave.db import meta as meta_db
@@ -23,11 +24,11 @@ log = structlog.get_logger(__name__)
 _migrated: set[str] = set()
 
 
-async def _conn(project_id: str):
+async def _conn(project_id: str) -> aiosqlite.Connection:
     """Resolve project_id to per-project DB connection."""
     workspace = await meta_db.get_project_workspace(project_id)
     if not workspace:
-        raise ValueError(f"Workspace not found for project {project_id}")
+        raise project_db.ProjectDbError(f"Workspace not found for project {project_id}")
     return await project_db.ensure_project_db(workspace)
 
 

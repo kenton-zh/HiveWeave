@@ -50,7 +50,9 @@ def _api_format_to_provider_type(fmt: ApiFormat) -> ProviderType:
 # ── Timeout constants (contract 01) ────────────────────────────
 CONNECT_TIMEOUT_S = 10.0
 READ_TIMEOUT_S = 95.0   # <= FIRST_CHUNK_TIMEOUT_S (90s) + buffer; lets httpx native timeout fire first
-TOTAL_TIMEOUT_S = 300.0
+# Unused by build_timeout() — stream envelope lives in streamer.TOTAL_TIMEOUT_S
+# (env HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S). Kept only to avoid import breakages.
+TOTAL_TIMEOUT_S = 300.0  # DEPRECATED: not wired into httpx; see streamer.TOTAL_TIMEOUT_S
 WRITE_TIMEOUT_S = 10.0
 POOL_TIMEOUT_S = 10.0
 
@@ -205,8 +207,10 @@ class OpenAIHandler(FormatHandler):
         if stream and include_usage:
             body["stream_options"] = {"include_usage": True}
 
-        if supports_thinking and reasoning_effort:
-            body["reasoning_effort"] = reasoning_effort
+        if supports_thinking:
+            # DeepSeek V4 / OpenCode / OpenRouter: thinking needs an explicit
+            # effort (or defaults off). Prefer configured effort, else "high".
+            body["reasoning_effort"] = reasoning_effort or "high"
 
         if tools:
             body["tools"] = tools

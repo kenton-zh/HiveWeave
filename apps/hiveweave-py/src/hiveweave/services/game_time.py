@@ -6,13 +6,15 @@ fire alarms, detect stalls. Absolute time model. Cooldown in-memory (A5).
 
 import asyncio
 import os
+import shlex
 import time
 import uuid
 
+import aiosqlite
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ensure_project_db
+from hiveweave.db.project import ProjectDbError, ensure_project_db
 
 # ── Constants ────────────────────────────────────────────────
 
@@ -35,6 +37,7 @@ GAME_SECONDS_PER_DAY = 86400
 TICK_INTERVAL = 5
 STALL_CHECK_TICKS = 24        # 24 * 5s = 120s = 2min
 STREAMING_SWEEP_TICKS = 6     # 6 * 5s = 30s — auto-heal orphan is_streaming=1
+WORKTREE_RECONCILE_TICKS = 72  # 72 * 5s = 6min — retry orphan worktree cleanup
 STALL_IDLE_MS = 10 * 60 * 1000        # 10 min idle threshold
 STALL_COOLDOWN_MS = 15 * 60 * 1000    # 15 min cooldown (避免重复触发)
 STALL_ESCALATION_THRESHOLD = 3        # 同一对未回复触发 3 次后升级到上级
@@ -66,10 +69,10 @@ _states: dict[str, dict] = {}          # project_id → state
 _alarm_project: dict[str, str] = {}    # alarm_id → project_id
 
 
-async def _conn(project_id: str):
+async def _conn(project_id: str) -> aiosqlite.Connection:
     workspace = await meta_db.get_project_workspace(project_id)
     if not workspace:
-        raise ValueError(f"Workspace not found for project {project_id}")
+        raise ProjectDbError(f"Workspace not found for project {project_id}")
     # BUG-020 修复：切项目后 DB 可能尚未创建/迁移，强制 ensure schema 后再返回连接
     try:
         return await ensure_project_db(workspace)
@@ -102,6 +105,44 @@ class GameTimeService:
 
     def __init__(self, project_id: str | None = None) -> None:
         self._project_id = project_id
+
+    async def _watchdog_trigger(
+        self, agent_id: str, *, role: str | None = None
+    ) -> None:
+        """Wake an agent after a watchdog nudge.
+
+        Skips ``complete`` agents with no open obligations (quota burn).
+        Uses ``trigger_coordinator`` for coordinator roles so empty-pending
+        backgrounds do not start an LLM turn.
+        """
+        from hiveweave.agents.supervisor import agent_manager
+        from hiveweave.agents.trigger import (
+            is_coordinator,
+            trigger_coordinator,
+            trigger_subordinate,
+        )
+
+        inst = agent_manager.get_agent(agent_id)
+        if inst is not None and getattr(inst, "disposition", None) == "complete":
+            try:
+                from hiveweave.services.task import TaskService
+
+                obs = await TaskService().get_actionable_obligations(
+                    inst.project_id, agent_id
+                )
+                if not obs:
+                    log.info("watchdog_skip_complete", agent_id=agent_id)
+                    return
+            except Exception as e:
+                log.debug("watchdog_complete_check_failed", error=str(e))
+
+        r = role
+        if r is None and inst is not None:
+            r = (getattr(inst, "config", None) or {}).get("role", "")
+        if is_coordinator(r or ""):
+            await trigger_coordinator(agent_id)
+        else:
+            await trigger_subordinate(agent_id)
 
     async def get_current_time(self, project_id: str) -> dict:
         state = _states.get(project_id) or await self._load_state(project_id)
@@ -263,6 +304,16 @@ class GameTimeService:
         # Auto-heal: clear orphan streaming messages (agent idle but is_streaming=1)
         if state["tick_count"] % STREAMING_SWEEP_TICKS == 0:
             await self._sweep_orphan_streaming(project_id)
+        # D5: periodic worktree reconcile (merge cleanup failures / orphans)
+        if state["tick_count"] % WORKTREE_RECONCILE_TICKS == 0:
+            try:
+                await self._reconcile_worktrees(project_id)
+            except Exception as e:
+                log.error(
+                    "worktree_reconcile_tick_failed",
+                    project_id=project_id,
+                    error=str(e),
+                )
         # Watchdog: 每 2 分钟检查停滞 agent，直接触发（不经过上级）
         if state["tick_count"] % STALL_CHECK_TICKS == 0:
             await self._check_stalled(project_id)
@@ -298,9 +349,53 @@ class GameTimeService:
                 error=str(e),
             )
 
+    async def _reconcile_worktrees(self, project_id: str) -> None:
+        """Retry orphan worktree cleanup after merge soft-failures.
+
+        Order matches supervisor activate: heal missing executor worktrees
+        first, then reconcile orphans (TEST3 — avoid deleting active dirs).
+        """
+        from hiveweave.services.git_worktree import (
+            heal_project_executor_worktrees,
+            reconcile_worktrees,
+        )
+        from hiveweave.services.worktree_review import project_main_workspace
+
+        try:
+            healed = await heal_project_executor_worktrees(project_id)
+            if healed and not healed.get("skipped"):
+                log.info(
+                    "worktree_heal_tick",
+                    project_id=project_id,
+                    recovered=healed.get("recovered"),
+                    failed=healed.get("failed"),
+                )
+        except Exception as e:
+            log.warning(
+                "worktree_heal_tick_failed",
+                project_id=project_id,
+                error=str(e),
+            )
+
+        workspace_path = await project_main_workspace(project_id)
+        if not workspace_path:
+            return
+        result = await reconcile_worktrees(workspace_path)
+        if result and (
+            result.get("removed_dirs")
+            or result.get("skipped_active_dirs")
+            or result.get("reattached_dirs")
+            or result.get("preserved_branches")
+            or result.get("deleted_branches")
+        ):
+            log.info(
+                "worktree_reconcile_tick",
+                project_id=project_id,
+                result=result,
+            )
+
     async def _process_wait_contracts(self, project_id: str) -> None:
         """Expire waits (WAIT_TIMEOUT) and break agent wait cycles."""
-        from hiveweave.agents.trigger import trigger_subordinate
         from hiveweave.services.inbox import InboxService
         from hiveweave.services.org import OrgService
         from hiveweave.services.wait_contract import wait_contract_service
@@ -325,7 +420,7 @@ class GameTimeService:
                     message_type="system",
                     priority="urgent",
                 )
-                await trigger_subordinate(aid)
+                await self._watchdog_trigger(aid)
             except Exception as e:
                 log.warning(
                     "wait_timeout_notify_failed",
@@ -360,29 +455,34 @@ class GameTimeService:
             project_id, resolve_ref
         )
         for b in breaks:
-            breaker = b.get("breakerId") or ""
-            cycle = b.get("cycle") or []
-            if not breaker:
-                continue
-            try:
-                await inbox.send_message(
-                    from_agent_id="system",
-                    to_agent_id=breaker,
-                    message=(
-                        f"[WAIT_CYCLE] Deadlock broken among {cycle}. "
-                        "Your agent-waits were cleared — resume or re-wait."
-                    ),
-                    message_type="system",
-                    priority="urgent",
-                )
-                await trigger_subordinate(breaker)
-            except Exception as e:
-                log.warning(
-                    "wait_cycle_notify_failed",
-                    breaker=breaker,
-                    error=str(e),
-                )
-            # Ping common superior (parent of breaker) if any
+            members = list(b.get("memberIds") or b.get("cycle") or [])
+            cycle = b.get("cycle") or members
+            if not members and b.get("breakerId"):
+                members = [b["breakerId"]]
+            for member in members:
+                if not member:
+                    continue
+                try:
+                    await inbox.send_message(
+                        from_agent_id="system",
+                        to_agent_id=member,
+                        message=(
+                            f"[WAIT_CYCLE] Deadlock broken among {cycle}. "
+                            "Your waits were cleared — resume or re-wait."
+                        ),
+                        message_type="system",
+                        priority="urgent",
+                        wake=True,
+                    )
+                    await self._watchdog_trigger(member)
+                except Exception as e:
+                    log.warning(
+                        "wait_cycle_notify_failed",
+                        member=member,
+                        error=str(e),
+                    )
+            # Ping common superior (parent of first member) if outside cycle
+            breaker = members[0] if members else ""
             parent_id = None
             for a in agents:
                 if a.get("id") == breaker:
@@ -395,13 +495,143 @@ class GameTimeService:
                         to_agent_id=parent_id,
                         message=(
                             f"[WAIT_CYCLE] Subordinate wait deadlock broken "
-                            f"(cycle={cycle}, breaker={breaker[:8]})."
+                            f"(cycle={cycle})."
                         ),
                         message_type="system",
                         priority="normal",
                     )
                 except Exception:
                     pass
+
+        # Peer-review mutual wait: each blocked/waiting on the other's review
+        await self._break_peer_review_deadlocks(project_id, agents, inbox)
+
+    async def _break_peer_review_deadlocks(
+        self,
+        project_id: str,
+        agents: list[dict],
+        inbox,
+    ) -> None:
+        """Detect A waits on B's review while B waits on A's (TEST3 mutual peer).
+
+        Escalates shared parent once; clears agent waits for both and triggers.
+        """
+        now_ms = int(time.time() * 1000)
+        # Tasks that look like peer-review and are stuck submitted/blocked
+        rows = await _query(
+            project_id,
+            "SELECT id, title, status, assignee_id, creator_id, updated_at, "
+            "submitted_at FROM tasks "
+            "WHERE COALESCE(is_archived, 0) = 0 "
+            "AND status IN ('submitted', 'blocked') "
+            "AND ("
+            "  title LIKE '%互审%' OR lower(title) LIKE '%peer review%' "
+            "  OR lower(title) LIKE '%cross-review%' "
+            "  OR lower(title) LIKE '%cross review%'"
+            ")",
+            [],
+        )
+        if len(rows) < 2:
+            return
+
+        # Pair by reciprocal assignees (A reviews B's work, B reviews A's)
+        by_assignee: dict[str, list[dict]] = {}
+        for t in rows:
+            aid = t.get("assignee_id") or ""
+            if aid:
+                by_assignee.setdefault(aid, []).append(t)
+
+        notified_parents: set[str] = set()
+        pairs: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for a_id, a_tasks in by_assignee.items():
+            for b_id, b_tasks in by_assignee.items():
+                if a_id >= b_id:
+                    continue
+                # Heuristic: each has a review task whose title mentions the other
+                # OR both have open peer-review tasks under same creator
+                if not a_tasks or not b_tasks:
+                    continue
+                key = (a_id, b_id)
+                if key in seen:
+                    continue
+                # Age gate: both sides idle on these tasks for STALL_IDLE_MS
+                a_old = any(
+                    (t.get("submitted_at") or t.get("updated_at") or now_ms)
+                    < now_ms - STALL_IDLE_MS
+                    for t in a_tasks
+                )
+                b_old = any(
+                    (t.get("submitted_at") or t.get("updated_at") or now_ms)
+                    < now_ms - STALL_IDLE_MS
+                    for t in b_tasks
+                )
+                if not (a_old and b_old):
+                    continue
+                # Same creator (shared peer-review batch) reduces false pairs
+                a_creators = {t.get("creator_id") for t in a_tasks if t.get("creator_id")}
+                b_creators = {t.get("creator_id") for t in b_tasks if t.get("creator_id")}
+                if not (a_creators & b_creators):
+                    continue
+                seen.add(key)
+                pairs.append((a_id, b_id))
+
+        if not pairs:
+            return
+
+        from hiveweave.services.wait_contract import wait_contract_service
+
+        parent_of = {a.get("id"): a.get("parent_id") for a in agents}
+        for a_id, b_id in pairs:
+            try:
+                await wait_contract_service.clear_waits(project_id, a_id)
+                await wait_contract_service.clear_waits(project_id, b_id)
+            except Exception as e:
+                log.warning("peer_review_clear_waits_failed", error=str(e))
+            for member in (a_id, b_id):
+                try:
+                    await inbox.send_message(
+                        from_agent_id="system",
+                        to_agent_id=member,
+                        message=(
+                            "[WAIT_CYCLE] Peer-review mutual wait detected. "
+                            "Cross-review concurrently — do not wait for the "
+                            "other side to finish first. Waits cleared."
+                        ),
+                        message_type="system",
+                        priority="urgent",
+                        wake=True,
+                    )
+                    await self._watchdog_trigger(member)
+                except Exception as e:
+                    log.warning(
+                        "peer_review_cycle_notify_failed",
+                        member=member,
+                        error=str(e),
+                    )
+            parent = parent_of.get(a_id) or parent_of.get(b_id)
+            if parent and parent not in (a_id, b_id) and parent not in notified_parents:
+                notified_parents.add(parent)
+                try:
+                    await inbox.send_message(
+                        from_agent_id="system",
+                        to_agent_id=parent,
+                        message=(
+                            f"[WAIT_CYCLE] Peer-review deadlock between "
+                            f"{a_id[:8]} and {b_id[:8]} — both nudged to "
+                            "cross-review concurrently."
+                        ),
+                        message_type="system",
+                        priority="normal",
+                    )
+                except Exception:
+                    pass
+            log.info(
+                "peer_review_deadlock_broken",
+                project_id=project_id,
+                a=a_id,
+                b=b_id,
+            )
 
     async def _sweep_orphan_streaming(self, project_id: str) -> None:
         """Clear is_streaming=1 rows whose agent is not actively PROCESSING.
@@ -411,6 +641,7 @@ class GameTimeService:
         """
         try:
             from hiveweave.agents.supervisor import agent_manager
+            from hiveweave.agents.agent import SAFETY_TIMEOUT_MS
             from hiveweave.services.chat_message import ChatMessageService
 
             protect = {
@@ -421,6 +652,8 @@ class GameTimeService:
             await ChatMessageService().clear_orphan_streaming(
                 project_id,
                 protect_agent_ids=protect,
+                soft_age_ms=SAFETY_TIMEOUT_MS,
+                hard_age_ms=SAFETY_TIMEOUT_MS + 60_000,
             )
         except Exception as e:
             log.warning(
@@ -478,26 +711,50 @@ class GameTimeService:
                     log.warning("alarm_script_blocked", alarm_id=alarm["id"], reason=reason)
                     # 跳过脚本执行，继续后续 inbox 通知
                 else:
-                    import asyncio
                     safe_env = {
                         k: v for k, v in os.environ.items()
                         if k.upper() in _SAFE_ENV_KEYS
                     }
                     from hiveweave.util.win_subprocess import windows_no_window_kwargs
 
-                    proc = await asyncio.create_subprocess_shell(
-                        script,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env=safe_env,
-                        **windows_no_window_kwargs(),
-                    )
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=120
-                    )
-                    if proc.returncode != 0:
-                        log.warning("alarm_script_failed", alarm_id=alarm["id"],
-                                    rc=proc.returncode, stderr=stderr.decode()[:200])
+                    # Security: 用 create_subprocess_exec + shlex.split 取代
+                    # create_subprocess_shell，避免 shell=True 的 prompt injection
+                    # 风险（agent 可控的 script_command 不再经 shell 解释）。
+                    # Windows 下 shlex.split(posix=True) 对含空格/反斜杠的路径
+                    # 可能解析不当 — 解析失败时 ValueError 被捕获并跳过执行。
+                    try:
+                        cmd_parts = shlex.split(script, posix=True)
+                    except ValueError as ve:
+                        log.warning(
+                            "alarm_script_parse_failed",
+                            alarm_id=alarm["id"],
+                            error=str(ve),
+                        )
+                        cmd_parts = []
+
+                    if not cmd_parts:
+                        log.warning(
+                            "alarm_script_empty_or_unparseable",
+                            alarm_id=alarm["id"],
+                        )
+                    else:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd_parts,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=safe_env,
+                            **windows_no_window_kwargs(),
+                        )
+                        stdout, stderr = await asyncio.wait_for(
+                            proc.communicate(), timeout=120
+                        )
+                        if proc.returncode != 0:
+                            log.warning(
+                                "alarm_script_failed",
+                                alarm_id=alarm["id"],
+                                rc=proc.returncode,
+                                stderr=stderr.decode()[:200],
+                            )
             except Exception as e:
                 log.error("alarm_script_error", alarm_id=alarm["id"], error=str(e))
 
@@ -564,6 +821,15 @@ class GameTimeService:
         """
         state = _states.get(project_id)
         if not state:
+            return
+
+        # 下班项目：整段 watchdog 跳过（含 Case 1–3 查询），避免空转与误升级
+        from hiveweave.db import meta as _meta_db_early
+
+        _proj_early = await _meta_db_early.query_one(
+            "SELECT is_started FROM projects WHERE id = ?", [project_id]
+        )
+        if not _proj_early or not dict(_proj_early).get("is_started"):
             return
 
         now_ms = int(time.time() * 1000)
@@ -689,13 +955,7 @@ class GameTimeService:
             })
 
         # ── Case 4: task 状态停留超时（Bug K）──
-        # 只检查已"上班"的项目
-        from hiveweave.db import meta as _meta_db
-        _proj = await _meta_db.query_one(
-            "SELECT is_started FROM projects WHERE id = ?", [project_id]
-        )
-        if not _proj or not dict(_proj).get("is_started"):
-            return
+        # is_started 已在入口检查
 
         # 扫描所有非终态 task，检查在当前状态停留是否超过阈值
         # 按 assignee/creator 分组合并消息，每个 agent 只 trigger 一次
@@ -909,8 +1169,7 @@ class GameTimeService:
                         "system", aid, msg,
                         message_type="system", priority="urgent")
 
-                    from hiveweave.agents.trigger import trigger_subordinate
-                    await trigger_subordinate(aid)
+                    await self._watchdog_trigger(aid)
                 except Exception as e:
                     log.error("task_stall_trigger_failed",
                               agent_id=aid, error=str(e))
@@ -950,6 +1209,19 @@ class GameTimeService:
 
         # 只触发需要回复的 agent
         for aid, items in trigger_map.items():
+            # 正在 processing / 不在 manager（刚被 cancel）→ 不催不升级
+            try:
+                from hiveweave.agents.agent import AgentState
+                from hiveweave.agents.supervisor import agent_manager
+
+                live = agent_manager.get_agent(aid)
+                if live is None:
+                    continue
+                if live.status == AgentState.PROCESSING:
+                    continue
+            except Exception:
+                pass
+
             trackers = state["stall_trackers"].setdefault(aid, {})
 
             # 按 sender 分组，检查每个 sender 的触发次数
@@ -1030,8 +1302,7 @@ class GameTimeService:
                         "system", aid, msg,
                         message_type="system", priority="urgent")
 
-                    from hiveweave.agents.trigger import trigger_subordinate
-                    await trigger_subordinate(aid)
+                    await self._watchdog_trigger(aid)
 
                 # ── 2. 升级到 A 的上级 ──
                 if escalated_senders:
@@ -1052,8 +1323,7 @@ class GameTimeService:
                             "system", parent_id, esc_msg,
                             message_type="system", priority="urgent")
 
-                        from hiveweave.agents.trigger import trigger_subordinate
-                        await trigger_subordinate(parent_id)
+                        await self._watchdog_trigger(parent_id)
 
                         log.warning("watchdog_escalated",
                                     agent_id=aid, name=agent_name,
@@ -1181,7 +1451,6 @@ class GameTimeService:
             )
             try:
                 from hiveweave.services.inbox import InboxService
-                from hiveweave.agents.trigger import trigger_subordinate
 
                 await InboxService().send_message(
                     "system",
@@ -1190,7 +1459,7 @@ class GameTimeService:
                     message_type="system",
                     priority="urgent",
                 )
-                await trigger_subordinate(waiter_id)
+                await self._watchdog_trigger(waiter_id)
             except Exception as e:
                 log.error(
                     "awaiting_reply_nudge_failed",
@@ -1236,7 +1505,7 @@ class GameTimeService:
         now_ms = int(time.time() * 1000)
 
         agents = await _query(project_id,
-            "SELECT id, name, parent_id, created_at FROM agents "
+            "SELECT id, name, parent_id, created_at, last_active_at FROM agents "
             "WHERE status = 'active'", [])
         if not agents:
             return
@@ -1263,14 +1532,19 @@ class GameTimeService:
             if exp is None or int(exp) > now_ms:
                 live_waits.setdefault(w.get("agentId") or "", []).append(w)
 
-        # 最后产出时间：assistant 消息 / work_logs 取较新者
+        # 最后活跃：优先 last_active_at，再 assistant/work_logs，再 created_at
         last_output: dict[str, int] = {}
+        for a in agents:
+            la = a["last_active_at"]
+            if la:
+                last_output[a["id"]] = int(la)
         rows = await _query(project_id,
             "SELECT agent_id, MAX(created_at) AS last_ts FROM chat_messages "
             "WHERE role = 'assistant' GROUP BY agent_id", [])
         for r in rows:
             if r["last_ts"]:
-                last_output[r["agent_id"]] = int(r["last_ts"])
+                aid = r["agent_id"]
+                last_output[aid] = max(last_output.get(aid, 0), int(r["last_ts"]))
         rows = await _query(project_id,
             "SELECT agent_id, MAX(created_at) AS last_ts FROM work_logs "
             "GROUP BY agent_id", [])
@@ -1293,6 +1567,12 @@ class GameTimeService:
                 inst = agent_manager.get_agent(aid)
                 disp = getattr(inst, "disposition", None) if inst else None
                 if disp is None or disp in _WAITING_DISPOSITIONS:
+                    continue
+            else:
+                # No active wait contracts — still skip complete (idle-by-design)
+                inst = agent_manager.get_agent(aid)
+                disp = getattr(inst, "disposition", None) if inst else None
+                if disp == "complete":
                     continue
 
             baseline = last_output.get(aid) or int(a["created_at"] or now_ms)
@@ -1346,8 +1626,7 @@ class GameTimeService:
                     log.warning("silence_health_broadcast_failed",
                                 agent_id=aid, error=str(e))
                 try:
-                    from hiveweave.agents.trigger import trigger_subordinate
-                    await trigger_subordinate(aid)
+                    await self._watchdog_trigger(aid)
                 except Exception as e:
                     log.error("silence_wake_failed",
                               agent_id=aid, error=str(e))
@@ -1369,8 +1648,7 @@ class GameTimeService:
                             f"{minutes} 分钟无任何产出（chat/work_log），"
                             "唤醒尝试未恢复，请介入检查。",
                             message_type="system", priority="urgent")
-                        from hiveweave.agents.trigger import trigger_subordinate
-                        await trigger_subordinate(parent_id)
+                        await self._watchdog_trigger(parent_id)
                     except Exception as e:
                         log.error("silence_notify_failed",
                                   agent_id=aid, parent_id=parent_id,

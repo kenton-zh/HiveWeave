@@ -69,6 +69,10 @@ _KNOWN_CONTEXT_WINDOWS: list[tuple[str, int]] = [
     ("mistral-small", 32_000),
     ("mixtral", 32_000),
     # ── DeepSeek ──
+    # free 必须写在付费子串前面，否则 "deepseek-v4-flash" 会误匹配 free
+    ("deepseek-v4-flash-free", 200_000),  # OpenCode Zen free-tier cap
+    ("deepseek-v4-flash", 1_024_000),
+    ("deepseek-v4", 1_024_000),
     ("deepseek-v3", 64_000),
     ("deepseek-r1", 64_000),
     ("deepseek-coder", 64_000),
@@ -79,11 +83,14 @@ _KNOWN_CONTEXT_WINDOWS: list[tuple[str, int]] = [
     ("qwen2.5-7b", 128_000),
     ("qwen2-72b", 128_000),
     # ── Tencent / Hunyuan ──
+    ("hy3-free", 190_000),       # OpenCode Zen free-tier (models.dev)
+    ("hy3:free", 262_144),       # OpenRouter tencent/hy3:free
     ("hunyuan", 32_000),         # 混元标准版 32K
-    ("hy3", 262_144),            # Hunyuan 3 (OpenRouter 实测 256K)
+    ("hy3", 262_144),            # Hunyuan 3 (OpenRouter 实测 256K+)
     # ── 其他 ──
     ("yi-34b", 4_000),
     ("yi-large", 16_000),
+    ("glm-5.2", 1_024_000),
     ("glm-4", 128_000),
     ("glm-4-plus", 128_000),
     ("baichuan", 4_096),
@@ -155,6 +162,7 @@ async def _detect_context_window(
 _REASONING_MODEL_PATTERNS: list[str] = [
     "o1", "o3", "o4",               # OpenAI reasoning 系列
     "claude-3-5-sonnet",            # Claude extended thinking
+    "deepseek-v4-flash",            # V4 Flash (含 -free) 支持 reasoning
     "deepseek-r1",                  # DeepSeek reasoning
     "hy3",                          # Hunyuan 3 (推理模型)
     "qwen3",                        # Qwen 3 (推理模型)
@@ -198,7 +206,10 @@ async def _detect_model_capabilities(
     _PRESET_MAX_OUTPUT: list[tuple[str, int]] = [
         ("o1", 100_000), ("o3", 100_000),
         ("claude-3-5-sonnet", 8_192),
+        ("deepseek-v4-flash-free", 128_000),  # OpenCode Zen free (models.dev)
         ("deepseek-r1", 32_768),
+        ("hy3-free", 64_000),                 # OpenCode Zen free (models.dev)
+        ("hy3:free", 64_000),                 # OpenRouter tencent/hy3:free
         ("hy3", 32_000),
         ("qwen3", 32_000),
         ("gemini-2.5", 8_192),
@@ -250,10 +261,10 @@ async def _detect_model_capabilities(
 
 
 #: max_output_tokens 合理性上界。语义：真实模型的 max_output 极少超过此值。
-#: 当前顶配是 o1/o3 的 100k。设 200k 作为「明显是 context_length 串线」的判据。
+#: DeepSeek V4 Flash 等可到 ~384k；设 400k 作为「明显是 context_length 串线」的判据。
 #: 仅当 context_window 未知（无法用物理不变量校验）时作为兜底判据使用；
 #: context_window 已知时，判据是物理不变量 max_output < context_window。
-_MAX_OUTPUT_SANITY_UPPER_BOUND = 200_000
+_MAX_OUTPUT_SANITY_UPPER_BOUND = 400_000
 
 
 def _sanitize_max_output(

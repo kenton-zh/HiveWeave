@@ -48,6 +48,8 @@ def _make_agent(stream_events: list | None = None) -> Agent:
     agent._resume_cooldown_until = 0.0
     agent._consecutive_errors = 0
     agent._CONSECUTIVE_ERROR_MAX = 3
+    agent._resume_suppressed = False
+    agent._pending_resume_hint = None
     agent.disposition = "runnable"
     agent._llm_task = None
     agent._safety_timer = None
@@ -63,8 +65,12 @@ def _make_agent(stream_events: list | None = None) -> Agent:
     agent._turn_gate_count = 0
     agent._TURN_GATE_MAX = 1
     agent._slice_budget = 0
+    agent._SLICE_BUDGET_MAX = 2
     agent._progress_fingerprint = None
     agent._no_progress_streak = 0
+    agent.visibility = "foreground"
+    agent._MERGE_WINDOW_MS = 300
+    agent._workspace_path = None
     # 服务依赖全部 mock
     agent._conversation = AsyncMock()
     agent._inbox = AsyncMock()
@@ -100,11 +106,11 @@ class TestSafetyTimeoutResume:
         assert 0 < remaining <= TIMEOUT_RESUME_COOLDOWN_S
         # inbox 未 ACK（保持未读，等 watcher 冷却后恢复）
         agent._inbox.mark_read_by_ids.assert_not_called()
-        # RESUME CHECKPOINT 已写入 conversation
-        appended = agent._conversation.append_turn.await_args.args[2]
-        assert any(
-            "[RESUME CHECKPOINT]" in (m.get("content") or "") for m in appended
-        )
+        # RESUME CHECKPOINT is ephemeral — not appended to conversation history
+        agent._conversation.append_turn.assert_not_called()
+        assert agent._pending_resume_hint is not None
+        assert "[RESUME CHECKPOINT]" in agent._pending_resume_hint
+        assert "safety_timeout" in agent._pending_resume_hint
         # 本轮 pending 清空、状态回 idle、广播 error 红框
         assert agent.pending_inbox_msg_ids is None
         assert agent.status == AgentState.IDLE
@@ -140,12 +146,14 @@ class TestSafetyTimeoutGiveUp:
             await agent._handle_safety_timeout()
 
         assert agent._consecutive_errors == agent._CONSECUTIVE_ERROR_MAX + 1
-        # 放弃: ACK inbox 停止 resume 循环
+        # 放弃: ACK inbox 停止 resume 循环 + latch
+        assert agent._resume_suppressed is True
         agent._inbox.mark_read_by_ids.assert_awaited_once_with(
             AGENT_ID, ["inbox-1", "inbox-2"]
         )
         # 不再注入 CHECKPOINT（避免撑大上下文）、不再 arm 冷却
         agent._conversation.append_turn.assert_not_called()
+        assert agent._pending_resume_hint is None
         assert agent._in_resume_cooldown() is False
         # 升级上级一次 + 触发上级
         agent._inbox.send_message.assert_awaited_once()
@@ -206,10 +214,9 @@ class TestHandleErrorUnifiedCounting:
         remaining = agent._resume_cooldown_until - time.monotonic()
         assert 0 < remaining <= ERROR_RESUME_COOLDOWN_S
         agent._inbox.mark_read_by_ids.assert_not_called()
-        appended = agent._conversation.append_turn.await_args.args[2]
-        assert any(
-            "llm_error:ValueError" in (m.get("content") or "") for m in appended
-        )
+        agent._conversation.append_turn.assert_not_called()
+        assert agent._pending_resume_hint is not None
+        assert "llm_error:ValueError" in agent._pending_resume_hint
         health = _health_events(events)
         assert health and health[-1]["health"] == "error"
 
@@ -226,6 +233,7 @@ class TestHandleErrorUnifiedCounting:
             await agent._handle_error(ValueError("boom"))
 
         assert agent._consecutive_errors == agent._CONSECUTIVE_ERROR_MAX + 1
+        assert agent._resume_suppressed is True
         agent._inbox.mark_read_by_ids.assert_awaited_once_with(
             AGENT_ID, ["inbox-1", "inbox-2"]
         )
@@ -297,6 +305,81 @@ class TestSuccessResetsCounter:
         assert agent._consecutive_errors == 0
         assert agent._in_resume_cooldown() is False
         assert agent._resume_cooldown_until == 0.0
+        assert agent._resume_suppressed is False
         assert agent.status == AgentState.IDLE
         health = _health_events(events)
         assert health and health[-1]["health"] == "ok"
+
+
+class TestResumeHintEphemeral:
+    async def test_build_messages_consumes_hint_once(self):
+        agent = _make_agent([])
+        agent._pending_resume_hint = "[RESUME CHECKPOINT]\nreason: test\n"
+        agent._conversation.get_compacted_prefix = lambda *_a, **_k: None
+        agent._conversation.get_history = AsyncMock(return_value=[])
+        agent._get_identity_prompt = lambda: "identity"
+        agent._get_context_window = lambda: 32_000
+        agent._build_context_prompt = AsyncMock(return_value="")
+
+        msgs = await agent._build_messages("hello", {})
+        assert any(
+            "[RESUME CHECKPOINT]" in (m.get("content") or "") for m in msgs
+        )
+        assert agent._pending_resume_hint is None
+
+        msgs2 = await agent._build_messages("hello again", {})
+        assert not any(
+            "[RESUME CHECKPOINT]" in (m.get("content") or "") for m in msgs2
+        )
+
+
+class TestResumeSuppressedLatch:
+    async def test_give_up_blocks_trigger_chat(self):
+        agent = _make_agent([])
+        agent.status = AgentState.IDLE
+        agent._resume_suppressed = True
+        agent._ensure_watcher_alive = lambda: None
+        agent._lock = __import__("asyncio").Lock()
+
+        with patch(
+            "hiveweave.services.system_state.system_state.paused",
+            return_value=False,
+        ), patch(
+            "hiveweave.db.meta.query_one",
+            AsyncMock(return_value={"is_started": 1}),
+        ):
+            result = await agent.chat("trigger ctx", {"trigger": True})
+
+        assert result.get("suppressed") is True
+        assert agent.status == AgentState.IDLE
+
+    async def test_user_chat_clears_suppressed(self):
+        agent = _make_agent([])
+        agent.status = AgentState.IDLE
+        agent._resume_suppressed = True
+        agent._ensure_watcher_alive = lambda: None
+        agent._lock = __import__("asyncio").Lock()
+        agent._chat_msg.update_streaming_messages_done = AsyncMock()
+        agent._chat_msg.save_message = AsyncMock(
+            return_value={"id": "msg-1"}
+        )
+        agent._broadcast_status = lambda *a, **k: None
+        agent._start_safety_timer = lambda: None
+        agent._run_llm = AsyncMock()
+
+        with patch(
+            "hiveweave.services.system_state.system_state.paused",
+            return_value=False,
+        ), patch(
+            "hiveweave.db.meta.query_one",
+            AsyncMock(return_value={"is_started": 1}),
+        ), patch(
+            "hiveweave.services.turn_session.clear_pending_turn_result",
+        ):
+            # chat will set PROCESSING and start llm task — mock create_task
+            with patch("asyncio.create_task", return_value=None):
+                result = await agent.chat("user says hi", {})
+
+        assert agent._resume_suppressed is False
+        assert result.get("ok") is True
+        assert result.get("suppressed") is not True

@@ -41,6 +41,8 @@ async def _send_message_core(
     expect_report: bool,
     ctx,
     message_type: str = "normal",
+    *,
+    enforce_span: bool = True,
 ) -> ToolResult:
     """Core message-sending logic shared by all ``message_*`` tools.
 
@@ -53,6 +55,8 @@ async def _send_message_core(
     - Self-skip (sending to yourself is a no-op).
     - TeamChat recording for the sender (BUG-034 fix).
     - message_type: ``ask`` forces expect_report; ``notify`` forces no expect.
+    - enforce_span: command-chain gate (direct/superior/peer). ``message_team``
+      sets False for intentional org-wide broadcast.
     """
     if not ctx or not getattr(ctx, "inbox", None):
         return ToolResult.err(
@@ -214,6 +218,38 @@ async def _send_message_core(
             f"Available active agents: "
             f"{[(a['name'], a.get('short_id'), a.get('role')) for a in active_agents]}"
         )
+
+    # 指挥链硬门：只能联系直属下属 / 上级 / 同级（peer）
+    # message_team 广播豁免（enforce_span=False）
+    span_blocked: list[str] = []
+    if enforce_span:
+        from hiveweave.services.org_span import validate_message_span
+
+        span_ok: list[dict[str, Any]] = []
+        for target in resolved:
+            err = await validate_message_span(agent_id, target["id"], ctx.org)
+            if err:
+                span_blocked.append(f"{target.get('name')}: {err}")
+            else:
+                span_ok.append(target)
+        if not span_ok:
+            if results:
+                return ToolResult.ok(
+                    f"Messages sent (user only). Cross-level blocked: {span_blocked}",
+                    results=results,
+                    blocked=span_blocked,
+                )
+            return ToolResult.err(
+                "全部收件人被指挥链拒绝（禁止跨级沟通）。" + "; ".join(span_blocked)
+            )
+        if span_blocked:
+            log.info(
+                "send_message_span_filtered",
+                agent_id=agent_id,
+                blocked=span_blocked,
+                allowed=[t.get("name") for t in span_ok],
+            )
+        resolved = span_ok
 
     # ── Send to each resolved recipient ─────────────────
     from hiveweave.services.team_chat import TeamChatService
@@ -537,6 +573,7 @@ async def message_team_tool(
         priority="normal",
         expect_report=False,
         ctx=ctx,
+        enforce_span=False,
     )
 
 
@@ -976,34 +1013,40 @@ async def read_work_logs_tool(
     if not target_ids:
         return ToolResult.ok("No agents to read work logs from.")
 
-    # Query work_logs from per-project DB
-    from hiveweave.db import project as project_db
+    from hiveweave.services.work_log import WorkLogService
 
+    wls = WorkLogService()
     all_logs: list[dict[str, Any]] = []
     for tid in target_ids:
         try:
-            rows = await project_db.query(
-                tid,
-                "SELECT agent_id, content, log_type, created_at "
-                "FROM work_logs "
-                "WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
-                [tid, params.limit],
+            rows = await wls.get_recent(project_id, tid, params.limit)
+            all_logs.extend(rows)
+        except Exception as exc:
+            log.warning(
+                "read_work_logs_failed",
+                agent_id=tid,
+                project_id=project_id,
+                error=str(exc),
             )
-            for r in rows:
-                all_logs.append(r)
-        except Exception:
-            pass  # Table might not exist yet
 
     if not all_logs:
         return ToolResult.ok("No work logs found.")
 
+    # Newest first across agents
+    all_logs.sort(key=lambda r: int(r.get("created_at") or 0), reverse=True)
+
     lines = []
     for log_entry in all_logs:
         ts = log_entry.get("created_at", 0)
+        summary = (
+            log_entry.get("summary")
+            or log_entry.get("content")
+            or ""
+        )
         lines.append(
             f"[{ts}] {log_entry.get('agent_id', '?')} "
-            f"({log_entry.get('log_type', '?')}): "
-            f"{log_entry.get('content', '')[:100]}"
+            f"({log_entry.get('type', '?')}): "
+            f"{str(summary)[:100]}"
         )
     return ToolResult.ok(
         f"=== Work Logs ({len(all_logs)}) ===\n" + "\n".join(lines)

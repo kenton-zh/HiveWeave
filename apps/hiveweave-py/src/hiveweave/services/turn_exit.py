@@ -27,12 +27,43 @@ REPAIR_VIOLATIONS = frozenset({
     "WAITING_ON_REQUIRED",
     "BLOCKED_WAITING_ON_REQUIRED",
     "UNREPLIED_ASKS",
+    "ASSIGNEE_MUST_SUBMIT",
+    "CREATOR_MUST_REVIEW",
 })
 
 # Ledger / obligation mismatches → park, do not immediately re-run LLM
 PARK_VIOLATIONS = frozenset({
     "OPEN_TASKS_UNDECLARED",
 })
+
+
+def _task_ref_matches(ref: str, tid: str) -> bool:
+    if not ref or not tid:
+        return False
+    if tid == ref:
+        return True
+    if len(ref) >= 8 and (tid.startswith(ref) or ref.startswith(tid)):
+        return True
+    return False
+
+
+def _waiting_on_task(turn_result: TurnResult | None, tid: str) -> bool:
+    if turn_result is None:
+        return False
+    for w in turn_result.waiting_on or []:
+        if w.kind == "task" and _task_ref_matches(str(w.ref or ""), tid):
+            return True
+    return False
+
+
+def _task_advanced(tid: str, advanced: set[str]) -> bool:
+    if tid in advanced:
+        return True
+    return any(
+        tid.startswith(a) or a.startswith(tid)
+        for a in advanced
+        if len(a) >= 8
+    )
 
 
 @dataclass
@@ -167,22 +198,45 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
         violations.append("UNREPLIED_ASKS")
 
     remaining_obligations = list(ctx.open_task_obligations)
-    if turn_result and turn_result.phase == "done_slice":
+    if turn_result and turn_result.phase in ("done_slice", "waiting"):
         remaining = []
         for t in ctx.open_task_obligations:
             tid = str(t.get("id") or "")
-            if tid in ctx.tasks_advanced:
+            if _task_advanced(tid, ctx.tasks_advanced):
                 continue
-            if any(
-                tid.startswith(a) or a.startswith(tid)
-                for a in ctx.tasks_advanced
-                if len(a) >= 8
+            # Explicit wait on this task is a legal idle exit
+            if turn_result.phase == "waiting" and _waiting_on_task(
+                turn_result, tid
             ):
+                remaining.append(t)
                 continue
+            role = t.get("role_hint")
+            status = t.get("status")
+            if role == "assignee" and status in (
+                "running", "claimed", "rework",
+            ):
+                violations.append("ASSIGNEE_MUST_SUBMIT")
+            elif role == "creator" and status in ("submitted", "reviewing"):
+                violations.append("CREATOR_MUST_REVIEW")
             remaining.append(t)
         remaining_obligations = remaining
-        if remaining:
-            violations.append("OPEN_TASKS_UNDECLARED")
+        # Park leftover ledger mismatches not covered by repair (e.g. verifying)
+        if turn_result.phase == "done_slice":
+            leftover = [
+                t for t in remaining
+                if not (
+                    (
+                        t.get("role_hint") == "assignee"
+                        and t.get("status") in ("running", "claimed", "rework")
+                    )
+                    or (
+                        t.get("role_hint") == "creator"
+                        and t.get("status") in ("submitted", "reviewing")
+                    )
+                )
+            ]
+            if leftover:
+                violations.append("OPEN_TASKS_UNDECLARED")
 
     seen: set[str] = set()
     uniq: list[str] = []
@@ -197,11 +251,15 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
         park = bool(PARK_VIOLATIONS.intersection(uniq)) and not bool(
             REPAIR_VIOLATIONS.intersection(uniq) - PARK_VIOLATIONS
         )
-        # Mixed: prefer repair if unreplied/missing commit present
+        # Mixed: prefer repair if unreplied/missing commit / submit-review present
         repair_only = bool(REPAIR_VIOLATIONS.intersection(uniq)) and not park
         if PARK_VIOLATIONS.intersection(uniq) and REPAIR_VIOLATIONS.intersection(uniq):
-            # Both → repair unreplied first if present, else park ledger
-            repair_only = "UNREPLIED_ASKS" in uniq or "MISSING_COMMIT_TURN" in uniq
+            repair_only = (
+                "UNREPLIED_ASKS" in uniq
+                or "MISSING_COMMIT_TURN" in uniq
+                or "ASSIGNEE_MUST_SUBMIT" in uniq
+                or "CREATOR_MUST_REVIEW" in uniq
+            )
             park = not repair_only
         if park:
             disposition = "runnable" if remaining_obligations else disposition
@@ -247,6 +305,15 @@ def _build_gate_hint(
         "BLOCKED_WAITING_ON_REQUIRED": "phase=blocked 必须提供 waiting_on",
         "UNREPLIED_ASKS": "有人 ask 了你，必须用 ask_agent/notify_agent/send_message 回复后才能收工",
         "OPEN_TASKS_UNDECLARED": "仍有可行动任务 — 请推进任务，或用 phase=in_progress/waiting/blocked 声明状态（禁止假装 done_slice）",
+        "ASSIGNEE_MUST_SUBMIT": (
+            "有 running/claimed/rework 任务未 submit_task — "
+            "请调用 submit_task(taskId, summary, testsPassed=true)，"
+            "或 phase=waiting + waiting_on=[{kind:'task', ref:taskId}]"
+        ),
+        "CREATOR_MUST_REVIEW": (
+            "有 submitted/reviewing 任务待你 review — "
+            "请调用 review_task，或 phase=waiting + waiting_on=[{kind:'task', ref:taskId}]"
+        ),
     }
     for v in violations:
         lines.append(f"- {labels.get(v, v)}")

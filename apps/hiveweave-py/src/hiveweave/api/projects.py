@@ -239,8 +239,9 @@ async def _fetch_project_meta(project_id: str) -> dict | None:
     Meta DB slimming 后, description / org_paradigm / charter_json /
     goals_json / language 等字段存储在 per-project DB 的 project_meta 表中。
     """
-    conn = await project_db.get_project_db_by_project_id(project_id)
-    if conn is None:
+    try:
+        conn = await project_db.get_project_db_by_project_id(project_id)
+    except project_db.ProjectDbError:
         return None
     cursor = await conn.execute(
         "SELECT * FROM project_meta WHERE project_id = ?", [project_id]
@@ -267,29 +268,28 @@ async def _seed_default_agents(project_id: str) -> list[str]:
     # 查不到这些 agent → 会创建重复的 CEO/HR。此处先同步 project_id。
     try:
         conn = await project_db.get_project_db_by_project_id(project_id)
-        if conn is not None:
-            cursor = await conn.execute(
-                "SELECT id, project_id FROM agents WHERE project_id != ?",
-                [project_id],
+        cursor = await conn.execute(
+            "SELECT id, project_id FROM agents WHERE project_id != ?",
+            [project_id],
+        )
+        stale = await cursor.fetchall()
+        await cursor.close()
+        if stale:
+            log.warning(
+                "seed_stale_project_id",
+                project_id=project_id,
+                stale_count=len(stale),
             )
-            stale = await cursor.fetchall()
-            await cursor.close()
-            if stale:
-                log.warning(
-                    "seed_stale_project_id",
-                    project_id=project_id,
-                    stale_count=len(stale),
-                )
-                await conn.execute(
-                    "UPDATE agents SET project_id = ? WHERE project_id != ?",
-                    [project_id, project_id],
-                )
-                await conn.commit()
-                # agent_router (内存路由) 在启动时 rebuild，此处无需同步
-                log.info(
-                    "seed_stale_project_id_fixed",
-                    fixed_count=len(stale),
-                )
+            await conn.execute(
+                "UPDATE agents SET project_id = ? WHERE project_id != ?",
+                [project_id, project_id],
+            )
+            await conn.commit()
+            # agent_router (内存路由) 在启动时 rebuild，此处无需同步
+            log.info(
+                "seed_stale_project_id_fixed",
+                fixed_count=len(stale),
+            )
     except Exception as e:
         log.warning("seed_sync_project_id_failed", error=str(e))
 
@@ -505,11 +505,6 @@ async def create_project(body: ProjectCreate) -> dict:
     # 初始化 per-project DB（建表）
     try:
         conn = await project_db.ensure_project_db(workspace)
-        if conn is None:
-            raise RuntimeError(
-                f"ensure_project_db returned None for workspace={workspace} "
-                f"(eviction flag may still be set)"
-            )
     except Exception as e:
         log.error("init_project_db_failed", workspace=workspace, error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to initialize project DB: {e}")
@@ -557,21 +552,20 @@ async def create_project(body: ProjectCreate) -> dict:
     # (description, org_paradigm, charter_json, language 等字段从 Meta DB 迁移到 per-project DB)
     try:
         conn = await project_db.ensure_project_db(str(ws))
-        if conn is not None:
-            await conn.execute(
-                "INSERT INTO project_meta (project_id, description, org_paradigm, "
-                "charter_json, goals_json, language, game_time_accumulated_seconds, "
-                "updated_at) VALUES (?, ?, ?, ?, '[]', ?, 0, ?)",
-                [
-                    project_id,
-                    body.description or "",
-                    charter.get("orgPattern", "solo"),
-                    json.dumps(charter, ensure_ascii=False),
-                    body.language or "en",
-                    now_ms,
-                ],
-            )
-            await conn.commit()
+        await conn.execute(
+            "INSERT INTO project_meta (project_id, description, org_paradigm, "
+            "charter_json, goals_json, language, game_time_accumulated_seconds, "
+            "updated_at) VALUES (?, ?, ?, ?, '[]', ?, 0, ?)",
+            [
+                project_id,
+                body.description or "",
+                charter.get("orgPattern", "solo"),
+                json.dumps(charter, ensure_ascii=False),
+                body.language or "en",
+                now_ms,
+            ],
+        )
+        await conn.commit()
     except Exception as e:
         log.warning("create_project_meta_failed", project_id=project_id, error=str(e))
 
@@ -737,13 +731,12 @@ async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
         proj_vals.append(project_id)
         try:
             conn = await project_db.get_project_db_by_project_id(project_id)
-            if conn is not None:
-                await conn.execute(
-                    f"UPDATE project_meta SET {', '.join(proj_sets)} "
-                    f"WHERE project_id = ?",
-                    proj_vals,
-                )
-                await conn.commit()
+            await conn.execute(
+                f"UPDATE project_meta SET {', '.join(proj_sets)} "
+                f"WHERE project_id = ?",
+                proj_vals,
+            )
+            await conn.commit()
         except Exception as e:
             log.warning("update_project_meta_failed", project_id=project_id, error=str(e))
 
@@ -1013,6 +1006,7 @@ async def activate_project(project_id: str) -> dict:
 
     设置 is_started=1，启动 agents 和 game time。
     后端重启后所有项目默认 is_started=0，需要用户手动 activate。
+    复工时把下班期间 park 的 inbox 合并成每 agent 一条 briefing，避免踩踏。
     """
     row = await meta_db.query_one(
         "SELECT id FROM projects WHERE id = ?", [project_id]
@@ -1021,7 +1015,19 @@ async def activate_project(project_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Project not found")
     await _set_active_project_id(project_id)
 
-    # Bug K fix: 标记项目为"上班"状态
+    # 先 park 积压（此时仍 is_started=0，残留 watcher 不会开火）
+    try:
+        from hiveweave.services.project_lifecycle import park_project_inbox
+
+        await park_project_inbox(project_id)
+    except Exception as e:
+        log.warning(
+            "activate_prepark_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+
+    # 再标记上班
     await meta_db.execute(
         "UPDATE projects SET is_started = 1 WHERE id = ?", [project_id]
     )
@@ -1033,6 +1039,19 @@ async def activate_project(project_id: str) -> dict:
     except Exception as e:
         log.warning("activate_start_agents_failed", project_id=project_id, error=str(e))
 
+    # 合并已 park 的 inbox → 每 agent 一条 wake briefing
+    briefing_stats: dict = {}
+    try:
+        from hiveweave.services.project_lifecycle import deliver_resume_briefings
+
+        briefing_stats = await deliver_resume_briefings(project_id)
+    except Exception as e:
+        log.warning(
+            "activate_resume_briefings_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+
     # 启动 game time（如果未运行）
     try:
         gt = GameTimeService(project_id)
@@ -1040,14 +1059,20 @@ async def activate_project(project_id: str) -> dict:
     except Exception as e:
         log.warning("activate_start_game_time_failed", project_id=project_id, error=str(e))
 
-    return {"ok": True, "projectId": project_id, "is_started": True}
+    return {
+        "ok": True,
+        "projectId": project_id,
+        "is_started": True,
+        "resumeBriefings": briefing_stats,
+    }
 
 
 @router.get("/{project_id}/deactivate")
 async def deactivate_project(project_id: str) -> dict:
     """取消激活项目（下班）。
 
-    设置 is_started=0，停止 agents 和 game time。
+    1) is_started=0  2) park 未读 wake inbox  3) 停 game time
+    4) 彻底停光 agent + watcher（off_duty graceful cancel）
     """
     row = await meta_db.query_one(
         "SELECT id FROM projects WHERE id = ?", [project_id]
@@ -1055,10 +1080,18 @@ async def deactivate_project(project_id: str) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Bug K fix: 标记项目为"下班"状态
+    # Bug K fix: 标记项目为"下班"状态（先落库，阻断新 trigger）
     await meta_db.execute(
         "UPDATE projects SET is_started = 0 WHERE id = ?", [project_id]
     )
+
+    parked = 0
+    try:
+        from hiveweave.services.project_lifecycle import park_project_inbox
+
+        parked = await park_project_inbox(project_id)
+    except Exception as e:
+        log.warning("deactivate_park_inbox_failed", project_id=project_id, error=str(e))
 
     # 停止 game time
     try:
@@ -1067,23 +1100,24 @@ async def deactivate_project(project_id: str) -> dict:
     except Exception as e:
         log.warning("deactivate_stop_game_time_failed", project_id=project_id, error=str(e))
 
-    # 停止该项目的所有 agents
+    stop_stats: dict = {}
     try:
-        from hiveweave.agents.supervisor import agent_manager
-        from hiveweave.services.agent_router import agent_router
-        agent_ids = agent_router.get_project_agent_ids(project_id)
-        for aid in agent_ids:
-            try:
-                await agent_manager.stop_agent(aid)
-            except Exception:
-                pass
+        from hiveweave.services.project_lifecycle import stop_project_cleanly
+
+        stop_stats = await stop_project_cleanly(project_id)
     except Exception as e:
         log.warning("deactivate_stop_agents_failed", project_id=project_id, error=str(e))
 
     active_id = await _get_active_project_id()
     if active_id == project_id:
         await _set_active_project_id(None)
-    return {"ok": True, "projectId": project_id, "is_started": False}
+    return {
+        "ok": True,
+        "projectId": project_id,
+        "is_started": False,
+        "parkedInbox": parked,
+        "stoppedAgents": stop_stats,
+    }
 
 
 @router.get("/{project_id}/game-time")
@@ -1192,8 +1226,6 @@ async def update_project_goals(project_id: str, body: CharterGoalsUpdate) -> dic
     charter["goals"] = body.goals
     try:
         conn = await project_db.get_project_db_by_project_id(project_id)
-        if conn is None:
-            raise HTTPException(status_code=500, detail="Project DB not available")
         await conn.execute(
             "UPDATE project_meta SET charter_json = ?, updated_at = ? "
             "WHERE project_id = ?",

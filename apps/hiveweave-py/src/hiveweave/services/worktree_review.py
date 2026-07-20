@@ -8,6 +8,7 @@ P0 contract (human-aligned):
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,17 @@ from hiveweave.db import meta as meta_db
 from hiveweave.services.org import OrgService
 
 log = structlog.get_logger(__name__)
+
+# Strip accidental worktree prefixes from evidence.files_changed (TEST4).
+# Matches: .hiveweave/worktrees/<sid>/, hiveweave/worktrees/<sid>/,
+# and absolute paths containing those segments.
+_WORKTREE_PREFIX_RE = re.compile(
+    r"(?:^|/)\.?hiveweave/worktrees/[^/]+/",
+    re.IGNORECASE,
+)
+_BARE_WORKTREE_PREFIX_RE = re.compile(
+    r"(?:^|/)worktrees/[A-Za-z0-9_-]+/",
+)
 
 
 async def project_main_workspace(project_id: str) -> str | None:
@@ -46,13 +58,45 @@ async def agent_worktree_path(agent_id: str) -> str | None:
     return None
 
 
-def _rel_paths(files: list[Any]) -> list[str]:
+def normalize_evidence_path(path: str | Any) -> str:
+    """Normalize a claimed file path to repo-relative (main) form.
+
+    Executors often pass worktree-relative or absolute worktree paths
+    (e.g. ``.hiveweave/worktrees/A004/module_a.py``). Approve compares
+    against the worktree checkout using repo-relative names.
+    """
+    s = str(path or "").replace("\\", "/").strip()
+    if not s:
+        return ""
+    # Strip only "./" / leading "/", NOT every "." — lstrip("./") wrongly
+    # turns ".editorconfig" into "editorconfig" (TEST5 approve miss).
+    while s.startswith("./"):
+        s = s[2:]
+    s = s.lstrip("/")
+    m = _WORKTREE_PREFIX_RE.search(s)
+    if m:
+        s = s[m.end() :]
+    else:
+        m2 = _BARE_WORKTREE_PREFIX_RE.search(s)
+        if m2:
+            s = s[m2.end() :]
+    return s.lstrip("/")
+
+
+def normalize_files_changed(files: list[Any] | None) -> list[str]:
+    """Normalize + dedupe files_changed while preserving order."""
     out: list[str] = []
+    seen: set[str] = set()
     for f in files or []:
-        s = str(f or "").replace("\\", "/").lstrip("./")
-        if s:
+        s = normalize_evidence_path(f)
+        if s and s not in seen:
+            seen.add(s)
             out.append(s)
     return out
+
+
+def _rel_paths(files: list[Any]) -> list[str]:
+    return normalize_files_changed(list(files or []))
 
 
 def _norm_set(files: list[Any] | None) -> set[str]:
@@ -327,7 +371,9 @@ def select_tasks_for_merged_work(
 
     - One matching approved/verifying task → that one
     - Several → intersect evidence.files_changed with merged_files
-    - Still ambiguous → most recently updated only (never all)
+    - Still ambiguous (same assignee, no file overlap) → **all** of them
+      (same worktree merge covers that assignee's approved work; do not
+      silently drop siblings with ``[:1]``)
     """
     from hiveweave.services.task import TaskService
 
@@ -369,6 +415,6 @@ def select_tasks_for_merged_work(
         if matched:
             return matched
 
-    # Ambiguous multi-task: only the newest — avoid VERIFY for unmerged siblings
+    # Same assignee — this worktree merge covers all their approved tasks
     candidates.sort(key=lambda x: int(x.get("updated_at") or 0), reverse=True)
-    return candidates[:1]
+    return candidates

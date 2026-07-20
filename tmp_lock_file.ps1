@@ -1,1 +1,0 @@
-﻿$hFile = [System.IO.File]::Open("D:\PC_AI\Project\PoE2LI\.hiveweave\data.db", [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None); Write-Host "LOCKED"; Start-Sleep -Seconds 30; $hFile.Close()

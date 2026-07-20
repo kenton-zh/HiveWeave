@@ -31,29 +31,43 @@ def _tracker() -> dict:
 
 class TestReadonlyExemption:
     def test_get_tasks_10_same_args_no_doom(self):
-        """get_tasks 同参连续 10 次不触发 —— 事故核心回归。"""
+        """get_tasks 同参连续 10 次不触发 —— 事故核心回归。
+
+        TEST3: get_tasks 专属阈值降为 6，故 5 次仍安全。
+        """
         tracker = _tracker()
-        for i in range(10):
+        for i in range(5):
             hit = Streamer._detect_doom_loop(
                 [_tc("get_tasks", '{"status":"open"}')], tracker
             )
             assert hit is None, f"第 {i + 1} 次调用误触发 doom"
 
     def test_readonly_set_tools_no_doom_within_10(self):
-        """集合内只读工具 3-10 次同参均不触发。"""
-        for name in sorted(DOOM_LOOP_READONLY_TOOLS):
+        """集合内只读工具（非专属低阈值）3-10 次同参均不触发。"""
+        low = {"check_agent_status", "get_tasks"}
+        for name in sorted(DOOM_LOOP_READONLY_TOOLS - low):
             tracker = _tracker()
             for i in range(10):
                 hit = Streamer._detect_doom_loop([_tc(name)], tracker)
                 assert hit is None, f"{name} 第 {i + 1} 次调用误触发 doom"
 
+    def test_status_poll_fuse_trips_early(self):
+        """check_agent_status / get_tasks 专属低保险丝（TEST3）。"""
+        assert doom_loop_limit("check_agent_status") == 5
+        assert doom_loop_limit("get_tasks") == 6
+        tracker = _tracker()
+        hit = None
+        for _ in range(5):
+            hit = Streamer._detect_doom_loop([_tc("check_agent_status")], tracker)
+        assert hit == "check_agent_status"
+
     def test_readonly_fuse_trips_at_15(self):
-        """只读工具同参连续 15 次仍熔断 —— 保险丝兜底防 token 烧钱。"""
+        """一般只读工具同参连续 15 次仍熔断 —— 保险丝兜底防 token 烧钱。"""
         tracker = _tracker()
         hit = None
         for _ in range(DOOM_LOOP_READONLY_FUSE):
-            hit = Streamer._detect_doom_loop([_tc("get_tasks")], tracker)
-        assert hit == "get_tasks"
+            hit = Streamer._detect_doom_loop([_tc("read_file", '{"path":"a"}')], tracker)
+        assert hit == "read_file"
 
     def test_readonly_below_fuse_no_doom(self):
         """只读工具同参连续 14 次（保险丝 -1）不触发。"""
@@ -116,8 +130,13 @@ class TestWriteToolsUnchanged:
 
 class TestDoomLoopLimitMapping:
     def test_readonly_tools_map_to_fuse(self):
+        from hiveweave.llm.streamer import DOOM_LOOP_TOOL_LIMITS
+
         for name in DOOM_LOOP_READONLY_TOOLS:
-            assert doom_loop_limit(name) == DOOM_LOOP_READONLY_FUSE
+            if name in DOOM_LOOP_TOOL_LIMITS:
+                assert doom_loop_limit(name) == DOOM_LOOP_TOOL_LIMITS[name]
+            else:
+                assert doom_loop_limit(name) == DOOM_LOOP_READONLY_FUSE
 
     def test_write_tools_keep_table_limits(self):
         assert doom_loop_limit("bash") == 3

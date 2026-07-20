@@ -104,22 +104,6 @@ async def execute_todowrite(
     return {"success": True, "output": summary, "error": None}
 
 
-async def get_todos(agent_id: str) -> list[dict[str, Any]]:
-    """Return the agent's current todos (read helper, not a tool)."""
-    try:
-        rows = await project_db.query(
-            agent_id,
-            """SELECT content, status, priority, updated_at
-               FROM todos WHERE agent_id = ?
-               ORDER BY created_at ASC""",
-            [agent_id],
-        )
-        return [dict(r) for r in rows]
-    except Exception as exc:  # noqa: BLE001
-        log.warning("todowrite.get_failed", error=str(exc))
-        return []
-
-
 # ── Pydantic models + @tool registration (Phase 2 migration) ──────
 
 from pydantic import BaseModel, Field, ConfigDict, field_validator

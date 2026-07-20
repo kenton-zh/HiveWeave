@@ -70,10 +70,6 @@ class CharterService:
                 f"Workspace not found for project {routed_pid}"
             )
         conn = await ensure_project_db(workspace)
-        if conn is None:
-            raise ValueError(
-                f"Per-project DB unavailable for workspace {workspace}"
-            )
 
         # Use per-project DB connection for transaction (DELETE + INSERT atomically)
         try:
@@ -105,10 +101,9 @@ class CharterService:
         """Read the current project charter from per-project DB.
 
         Returns dict with 'formatted' or None.
+        底层 get_project_db_by_project_id 失败时 raise ProjectDbError，由调用方处理。
         """
         conn = await get_project_db_by_project_id(project_id)
-        if conn is None:
-            return None
         try:
             cursor = await conn.execute(
                 """SELECT id, project_id, agent_id, title, content, status,
@@ -134,10 +129,9 @@ class CharterService:
         charter_json. Falls back to charter_json.goals for old data.
 
         Returns dict {objective, focus, keyResults, userInvolvement} or {}.
+        底层 get_project_db_by_project_id 失败时 raise ProjectDbError，由调用方处理。
         """
         conn = await get_project_db_by_project_id(project_id)
-        if conn is None:
-            return {}
         try:
             cursor = await conn.execute(
                 "SELECT goals_json, charter_json FROM project_meta WHERE project_id = ?",
@@ -202,11 +196,6 @@ class CharterService:
         # Write to project_meta.goals_json in per-project DB (agent-facing).
         # Uses UPSERT to handle the case where the project_meta row doesn't exist yet.
         conn = await get_project_db_by_project_id(project_id)
-        if conn is None:
-            logger.warning(
-                "goals_update_no_db", project_id=project_id
-            )
-            return
         now = int(time.time() * 1000)
         await conn.execute(
             """INSERT INTO project_meta (project_id, goals_json, updated_at)

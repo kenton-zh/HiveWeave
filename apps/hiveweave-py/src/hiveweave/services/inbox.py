@@ -33,6 +33,11 @@ _MISSING_COLUMNS = [
     # 作为 background updates 捎带进上下文，否则证据类消息永久静默丢失。
     # 存量行默认 1（视为已交付，避免迁移后历史消息倒灌）。
     ("delivered", "INTEGER DEFAULT 1"),
+    # parked: deactivate 时把 wake=1 未读压住，activate 时合并成一条 briefing
+    ("parked", "INTEGER DEFAULT 0"),
+    # triage: batch assignment + persisted wake category for digests
+    ("triage_batch_id", "TEXT"),
+    ("wake_category", "TEXT"),
 ]
 
 
@@ -101,6 +106,15 @@ class InboxService:
             priority=priority,
             task_id=task_id,
         )
+        if recipient_disposition is None:
+            try:
+                from hiveweave.agents.supervisor import agent_manager
+
+                live = agent_manager.get_agent(to_agent_id)
+                if live is not None:
+                    recipient_disposition = getattr(live, "disposition", None)
+            except Exception:
+                pass
         if wake is None:
             active_waits = None
             from_name = None
@@ -233,8 +247,8 @@ class InboxService:
                 to_agent_id,
                 "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, read, "
                 "created_at, message_type, expect_report, priority, task_id, "
-                "wake, idempotency_key, delivered) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "wake, idempotency_key, delivered, wake_category) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     msg_id,
                     from_agent_id,
@@ -249,6 +263,7 @@ class InboxService:
                     wake_int,
                     key,
                     delivered_int,
+                    category,
                 ],
             )
         except Exception as e:
@@ -326,13 +341,38 @@ class InboxService:
             agent_id,
             "SELECT id, from_agent_id, to_agent_id, message, read, created_at, "
             "message_type, expect_report, priority, task_id, "
-            "COALESCE(wake, 1) AS wake "
+            "COALESCE(wake, 1) AS wake, wake_category, triage_batch_id "
             "FROM inbox "
             "WHERE to_agent_id = ? AND read = 0 AND COALESCE(wake, 1) = 1 "
-            "ORDER BY created_at ASC LIMIT 50",
+            "ORDER BY created_at ASC LIMIT 80",
             [agent_id],
         )
         return [self._row_to_msg(r) for r in rows]
+
+    async def count_pending_and_background(self, agent_id: str) -> tuple[int, int]:
+        """Total wake=1 unread and undelivered background (no LIMIT)."""
+        await _ensure_schema(agent_id)
+        pending = 0
+        background = 0
+        try:
+            row = await project_db.query_one(
+                agent_id,
+                "SELECT COUNT(*) AS c FROM inbox "
+                "WHERE to_agent_id = ? AND read = 0 AND COALESCE(wake, 1) = 1",
+                [agent_id],
+            )
+            pending = int(row["c"]) if row else 0
+            row2 = await project_db.query_one(
+                agent_id,
+                "SELECT COUNT(*) AS c FROM inbox "
+                "WHERE to_agent_id = ? AND COALESCE(wake, 1) = 0 "
+                "AND COALESCE(delivered, 1) = 0",
+                [agent_id],
+            )
+            background = int(row2["c"]) if row2 else 0
+        except Exception as e:
+            log.debug("inbox_count_failed", error=str(e))
+        return pending, background
 
     async def get_undelivered_background(
         self, agent_id: str, limit: int = 20
@@ -347,7 +387,7 @@ class InboxService:
             agent_id,
             "SELECT id, from_agent_id, to_agent_id, message, read, created_at, "
             "message_type, expect_report, priority, task_id, "
-            "COALESCE(wake, 1) AS wake "
+            "COALESCE(wake, 1) AS wake, wake_category, triage_batch_id "
             "FROM inbox "
             "WHERE to_agent_id = ? AND COALESCE(wake, 1) = 0 "
             "AND COALESCE(delivered, 1) = 0 "
@@ -368,29 +408,46 @@ class InboxService:
         placeholders = ", ".join(["?"] * len(message_ids))
         await project_db.execute(
             agent_id,
-            f"UPDATE inbox SET read = 1, delivered = 1 "
+            f"UPDATE inbox SET read = 1, delivered = 1, wake = 0 "
             f"WHERE to_agent_id = ? AND id IN ({placeholders})",
             [agent_id] + message_ids,
         )
+        # Consume triage batch(es) covering these messages
+        try:
+            from hiveweave.services.inbox_triage import inbox_triage_service
+
+            rows = await project_db.query(
+                agent_id,
+                f"SELECT DISTINCT triage_batch_id FROM inbox "
+                f"WHERE id IN ({placeholders}) AND triage_batch_id IS NOT NULL",
+                message_ids,
+            )
+            for r in rows or []:
+                bid = r["triage_batch_id"] if "triage_batch_id" in r.keys() else None
+                if bid:
+                    await inbox_triage_service.mark_consumed(agent_id, bid)
+        except Exception as e:
+            log.debug("inbox_triage_consume_on_read_failed", error=str(e))
 
     async def mark_all_read(self, agent_id: str) -> None:
         await _ensure_schema(agent_id)
         await project_db.execute(
             agent_id,
-            "UPDATE inbox SET read = 1, delivered = 1 "
+            "UPDATE inbox SET read = 1, delivered = 1, wake = 0 "
             "WHERE to_agent_id = ? AND read = 0",
             [agent_id],
         )
 
     async def supersede_watchdog_messages(
-        self, agent_id: str, prefixes: list[str] | None = None
+        self, agent_id: str, prefixes: list[str] | tuple[str, ...] | None = None
     ) -> int:
         await _ensure_schema(agent_id)
-        prefixes = prefixes or (
-            "[TASK WATCHDOG]",
-            "[WATCHDOG]",
-            "[POST-MERGE VERIFY]",
-        )
+        if prefixes is None:
+            prefixes = [
+                "[TASK WATCHDOG]",
+                "[WATCHDOG]",
+                "[POST-MERGE VERIFY]",
+            ]
         clauses = " OR ".join(["message LIKE ?" for _ in prefixes])
         params = [agent_id] + [f"{p}%" for p in prefixes]
         try:
@@ -417,8 +474,96 @@ class InboxService:
         )
         return row["cnt"] if row else 0
 
+    async def park_pending_wakes(self, agent_id: str) -> int:
+        """Deactivate: demote wake=1 unread → wake=0 + parked=1 (no LLM stampede)."""
+        await _ensure_schema(agent_id)
+        try:
+            conn = await project_db.get_project_db_for_agent(agent_id)
+            cursor = await conn.execute(
+                "UPDATE inbox SET wake = 0, parked = 1 "
+                "WHERE to_agent_id = ? AND read = 0 AND COALESCE(wake, 1) = 1",
+                [agent_id],
+            )
+            await conn.commit()
+            n = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            await cursor.close()
+            if n:
+                log.info("inbox_parked", agent_id=agent_id, count=n)
+            return int(n)
+        except Exception as e:
+            log.warning("inbox_park_failed", agent_id=agent_id, error=str(e))
+            return 0
+
+    async def list_parked_messages(self, agent_id: str, limit: int = 50) -> list[dict]:
+        await _ensure_schema(agent_id)
+        rows = await project_db.query(
+            agent_id,
+            "SELECT id, from_agent_id, to_agent_id, message, read, created_at, "
+            "message_type, expect_report, priority, task_id, "
+            "COALESCE(wake, 0) AS wake, COALESCE(parked, 0) AS parked "
+            "FROM inbox "
+            "WHERE to_agent_id = ? AND COALESCE(parked, 0) = 1 AND read = 0 "
+            "ORDER BY created_at ASC LIMIT ?",
+            [agent_id, limit],
+        )
+        return [self._row_to_msg(r) for r in rows]
+
+    async def deliver_parked_briefing(self, agent_id: str) -> tuple[int, bool]:
+        """Activate: coalesce parked inbox into one wake message; clear parked rows.
+
+        Returns (parked_cleared_count, briefing_sent).
+        """
+        parked = await self.list_parked_messages(agent_id)
+        if not parked:
+            return 0, False
+
+        # Resolve sender names for a short digest
+        lines: list[str] = []
+        for m in parked[:12]:
+            preview = (m.get("message") or "").replace("\n", " ").strip()[:100]
+            lines.append(f"- from={m.get('from_agent_id', '?')[:8]}…: {preview}")
+        extra = len(parked) - len(lines)
+        if extra > 0:
+            lines.append(f"- …另有 {extra} 条已折叠")
+
+        briefing = (
+            f"[RESUME AFTER OFF-DUTY] 下班期间积压 {len(parked)} 条待处理消息"
+            f"（已合并，避免复工踩踏）。请按优先级处理：\n"
+            + "\n".join(lines)
+        )
+
+        ids = [m["id"] for m in parked if m.get("id")]
+        await self.mark_read_by_ids(agent_id, ids)
+        # Clear parked flag even if already marked read
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE inbox SET parked = 0 WHERE to_agent_id = ? AND COALESCE(parked, 0) = 1",
+                [agent_id],
+            )
+        except Exception as e:
+            log.warning("clear_parked_flag_failed", agent_id=agent_id, error=str(e))
+
+        # One coalesced wake from system — wakes the agent once
+        await self.send_message(
+            from_agent_id="system",
+            to_agent_id=agent_id,
+            message=briefing,
+            message_type="resume_briefing",
+            priority="normal",
+            expect_report=False,
+            wake=True,
+        )
+        log.info(
+            "resume_briefing_sent",
+            agent_id=agent_id,
+            parked_cleared=len(ids),
+        )
+        return len(ids), True
+
     @staticmethod
     def _row_to_msg(r) -> dict:
+        keys = r.keys() if hasattr(r, "keys") else []
         return {
             "id": r["id"],
             "from_agent_id": r["from_agent_id"],
@@ -426,9 +571,14 @@ class InboxService:
             "message": r["message"],
             "read": bool(r["read"]),
             "created_at": r["created_at"],
-            "message_type": r["message_type"] if "message_type" in r.keys() else "normal",
-            "expect_report": bool(r["expect_report"]) if "expect_report" in r.keys() else False,
-            "priority": r["priority"] if "priority" in r.keys() else "normal",
-            "task_id": r["task_id"] if "task_id" in r.keys() else None,
-            "wake": bool(r["wake"]) if "wake" in r.keys() else True,
+            "message_type": r["message_type"] if "message_type" in keys else "normal",
+            "expect_report": bool(r["expect_report"]) if "expect_report" in keys else False,
+            "priority": r["priority"] if "priority" in keys else "normal",
+            "task_id": r["task_id"] if "task_id" in keys else None,
+            "wake": bool(r["wake"]) if "wake" in keys else True,
+            "parked": bool(r["parked"]) if "parked" in keys else False,
+            "wake_category": r["wake_category"] if "wake_category" in keys else None,
+            "triage_batch_id": (
+                r["triage_batch_id"] if "triage_batch_id" in keys else None
+            ),
         }

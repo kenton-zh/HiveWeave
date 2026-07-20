@@ -127,10 +127,22 @@ async def execute_registered_tool(
             tool=tool_name,
             error=error[:200],
         )
-        # Include received args keys to help LLM understand what went wrong
+        # Include received args keys + expected required fields so the LLM
+        # can self-correct (empty [] usually means schema was missing upstream).
         received_keys = list(raw_args.keys()) if raw_args else []
+        expected = ""
+        try:
+            schema = tool_def.to_llm_schema()
+            req = schema.get("required") or []
+            props = list((schema.get("properties") or {}).keys())
+            if req:
+                expected = f" Required: {req}."
+            elif props:
+                expected = f" Expected parameters: {props}."
+        except Exception:
+            pass
         return ToolResult.err(
-            f"Parameter error in '{tool_name}': {error}. "
+            f"Parameter error in '{tool_name}': {error}.{expected} "
             f"You provided these parameters: {received_keys}. "
             f"Check the parameter names and make sure all required fields are included."
         ).to_dict()
@@ -186,7 +198,12 @@ async def execute_registered_tool(
 
     # 4. Security checks (auto-injected based on security_level)
     if tool_def.security_level == "file_op":
-        security_error = _check_file_security(params, workspace_path)
+        project_root = None
+        if ctx is not None:
+            project_root = ctx.extra.get("project_root")
+        security_error = _check_file_security(
+            params, workspace_path, tool_name=tool_name, project_root=project_root
+        )
         if security_error:
             return ToolResult.err(security_error).to_dict()
     elif tool_def.security_level == "shell":
@@ -229,13 +246,36 @@ async def execute_registered_tool(
 # ── Security helpers ─────────────────────────────────────
 
 
-def _check_file_security(params: Any, workspace_path: str) -> str | None:
+def _check_file_security(
+    params: Any,
+    workspace_path: str,
+    tool_name: str = "",
+    project_root: str | None = None,
+) -> str | None:
     """Unified file operation security check.
 
     Checks path traversal, .hiveweave protection, and sensitive file patterns.
     Returns an error message string, or ``None`` if the path is safe.
+
+    Read tools (read_file / list_files / search_files / …) may resolve
+    anywhere under the project root; write tools stay inside workspace_path.
     """
-    from .file import _resolve_safe, _check_hiveweave_dir, _is_sensitive
+    from .file import (
+        READ_PATH_TOOLS,
+        _check_hiveweave_dir,
+        _is_sensitive,
+        _resolve_safe,
+        infer_project_root,
+        resolve_for_read,
+    )
+
+    allow_project_read = tool_name in READ_PATH_TOOLS
+    root = project_root or infer_project_root(workspace_path)
+
+    def _resolve(path: str) -> str | None:
+        if allow_project_read:
+            return resolve_for_read(workspace_path, path, root)
+        return _resolve_safe(workspace_path, path)
 
     # Extract file path from params — try common field names
     file_path = (
@@ -244,6 +284,9 @@ def _check_file_security(params: Any, workspace_path: str) -> str | None:
         or getattr(params, "path", None)
         or getattr(params, "dirPath", None)
         or getattr(params, "dir_path", None)
+        or getattr(params, "directory", None)
+        or getattr(params, "source_path", None)
+        or getattr(params, "destination_path", None)
     )
 
     # For patch operations, check each patch's file_path
@@ -255,33 +298,67 @@ def _check_file_security(params: Any, workspace_path: str) -> str | None:
                 or getattr(patch, "filePath", None)
             )
             if patch_path:
-                err = _check_single_file(patch_path, workspace_path,
-                                         _resolve_safe, _check_hiveweave_dir,
-                                         _is_sensitive)
+                err = _check_single_file(
+                    patch_path,
+                    workspace_path,
+                    _resolve,
+                    _check_hiveweave_dir,
+                    _is_sensitive,
+                    hiveweave_root=root if allow_project_read else workspace_path,
+                    allow_project_read=allow_project_read,
+                )
                 if err:
                     return err
+        return None
+
+    # move_file: both source and destination must pass write sandbox
+    src = getattr(params, "source_path", None)
+    dst = getattr(params, "destination_path", None)
+    if src and dst and tool_name == "move_file":
+        for p in (src, dst):
+            err = _check_single_file(
+                p,
+                workspace_path,
+                _resolve,
+                _check_hiveweave_dir,
+                _is_sensitive,
+                hiveweave_root=workspace_path,
+                allow_project_read=False,
+            )
+            if err:
+                return err
         return None
 
     if not file_path:
         return None  # No file path to check
 
-    return _check_single_file(file_path, workspace_path,
-                              _resolve_safe, _check_hiveweave_dir,
-                              _is_sensitive)
+    return _check_single_file(
+        file_path,
+        workspace_path,
+        _resolve,
+        _check_hiveweave_dir,
+        _is_sensitive,
+        hiveweave_root=root if allow_project_read else workspace_path,
+        allow_project_read=allow_project_read,
+    )
 
 
 def _check_single_file(
     file_path: str,
     workspace_path: str,
-    _resolve_safe,
+    _resolve,
     _check_hiveweave_dir,
     _is_sensitive,
+    hiveweave_root: str | None = None,
+    allow_project_read: bool = False,
 ) -> str | None:
     """Check a single file path for security violations."""
-    resolved = _resolve_safe(workspace_path, file_path)
+    resolved = _resolve(file_path)
     if resolved is None:
-        return f"Error: Sandbox violation - path must be within workspace: {file_path}"
-    if _check_hiveweave_dir(resolved, workspace_path):
+        scope = "project" if allow_project_read else "workspace"
+        return f"Error: Sandbox violation - path must be within {scope}: {file_path}"
+    hw_base = hiveweave_root or workspace_path
+    if _check_hiveweave_dir(resolved, hw_base):
         # Allow listing .hiveweave root (read-only, shows subdirs)
         # but block write operations to protected areas
         from pathlib import Path

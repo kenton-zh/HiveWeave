@@ -539,12 +539,24 @@ async def git_worktree_merge_tool(
             )
         except Exception as e:
             log.warning("verify_nudge_after_merge_failed", error=str(e))
+            try:
+                from hiveweave.services.task import TaskService
+
+                await TaskService().migrate_orphan_approved(project_id)
+            except Exception:
+                pass
             return ToolResult.ok(
                 f"{result.get('message', 'Worktree merged and cleaned up')} "
                 f"WARNING: VERIFY spawn/nudge failed ({e}). "
                 f"Retry merge nudge or spawn VERIFY manually for the merged task."
                 f"{marker_warning}"
             )
+        try:
+            from hiveweave.services.task import TaskService
+
+            await TaskService().migrate_orphan_approved(project_id)
+        except Exception as mig_err:
+            log.warning("orphan_migrate_after_merge_failed", error=str(mig_err))
         msg = result.get("message", "Worktree merged and cleaned up")
         if nudged:
             msg = (
@@ -663,10 +675,23 @@ class GitWorktreeStatusParams(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
+    short_id: str | None = Field(
+        default=None,
+        alias="shortId",
+        description=(
+            "Agent short_id whose worktree to inspect (e.g. A004). "
+            "Omit to use the caller's own worktree."
+        ),
+        json_schema_extra={
+            "aliases": ["shortId", "short_id", "agentShortId", "target"]
+        },
+    )
+
 
 @tool(
     "git_worktree_status",
-    "Show uncommitted changes and branch status for worktrees.",
+    "Show branch, dirty flag, and HEAD for an agent worktree. "
+    "Pass shortId to inspect a subordinate's worktree.",
     requires_workspace=True,
     security_level="standard",
 )
@@ -681,17 +706,37 @@ async def git_worktree_status_tool(
         return wt_ctx
     workspace_path, short_id, _ = wt_ctx
 
+    target_sid = (params.short_id or "").strip() or short_id
+    # Resolve name/UUID → short_id when coordinator passes an agent ref
+    if params.short_id and ctx and getattr(ctx, "org", None):
+        try:
+            resolved = await ctx.org.resolve_agent(params.short_id)
+            if resolved and resolved.get("short_id"):
+                target_sid = resolved["short_id"]
+        except Exception:
+            pass
+
     gwt = GitWorktreeService()
     await gwt.ensure_git_repo(workspace_path)
 
-    result = await gwt.info(workspace_path, short_id)
-    if result.get("success"):
-        info = result.get("info", {})
-        return ToolResult.ok(
-            f"Branch: {info.get('branch', '?')}, "
-            f"Status: {info.get('status', '?')}"
+    result = await gwt.info(workspace_path, target_sid)
+    if not result.get("success"):
+        return ToolResult.err(result.get("message", "Failed to get worktree status"))
+
+    # GitWorktreeService.info returns {success, status: {...}} — not "info"
+    info = result.get("status")
+    if info is None:
+        return ToolResult.err(
+            f"No worktree found for short_id={target_sid}. "
+            f"Expected path under .hiveweave/worktrees/{target_sid}/"
         )
-    return ToolResult.err(result.get("message", "Failed to get worktree status"))
+    branch = info.get("branch") or "?"
+    dirty = bool(info.get("has_uncommitted"))
+    head = info.get("head") or "?"
+    return ToolResult.ok(
+        f"short_id={target_sid}, Branch: {branch}, "
+        f"dirty={dirty}, head={head}"
+    )
 
 
 # ── git_worktree_checkpoint ──────────────────────────────

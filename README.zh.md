@@ -56,7 +56,9 @@ cp apps/hiveweave-py/.env.example apps/hiveweave-py/.env
 # 3. 后端（Python/FastAPI，端口 4000）
 cd apps/hiveweave-py
 uv sync
-uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000
+uvicorn hiveweave.main:app --host 127.0.0.1 --port 4000
+# 注意：--host 127.0.0.1 仅绑定本机回环（安全默认值）。
+# 若要局域网访问，请显式设置 --host 0.0.0.0 并配置 HIVEWEAVE_API_KEY。
 
 # 4. 前端（React/Vite，端口 5173）—— 新开一个终端
 cd apps/web
@@ -127,7 +129,7 @@ pnpm dev
 
 | 层 | 技术 | 备注 |
 |:---|------|------|
-| 后端 | Python 3.12 + FastAPI + Uvicorn | 端口 4000，96 路由，19 API 模块 |
+| 后端 | Python 3.12 + FastAPI + Uvicorn | 端口 4000，122 路由，16 API 模块 |
 | 前端 | React 19 + Vite + React Flow + Zustand | 端口 5173，支持 Electron 桌面端 |
 | 数据库 | SQLite + aiosqlite | 双 DB：Meta DB（WAL）+ Per-project DB |
 | AI/LLM | httpx SSE 流式 + Provider Factory | OpenAI、Anthropic、DeepSeek、Groq、Google |
@@ -143,10 +145,10 @@ hiveweave/
 │   ├── hiveweave-py/                  # 后端 — Python/FastAPI（端口 4000）
 │   │   └── src/hiveweave/
 │   │       ├── agents/                # Agent 生命周期 + Supervisor + trigger
-│   │       ├── api/                   # 19 个 FastAPI 路由模块，96 路由
+│   │       ├── api/                   # 16 个 FastAPI 路由模块，122 路由
 │   │       ├── llm/                   # Streamer、provider factory、retry、circuit_breaker
 │   │       ├── services/              # 23 个服务（org、dispatch、memory、handoff、MCP 等）
-│   │       ├── tools/                 # 11 个内置工具（bash、file、grep、patch、review 等）
+│   │       ├── tools/                 # 74 个内置工具（bash、file、grep、patch、review 等）
 │   │       ├── conversation/          # Token budget、compaction、conversation store
 │   │       ├── db/                    # Meta DB + Per-project DB（aiosqlite）
 │   │       ├── realtime/              # phoenix_adapter、channels、pubsub、event_bus
@@ -190,11 +192,11 @@ hiveweave/
 | **交接继承** | Agent 离职时记忆总结并移交给继任者。知识零丢失。 |
 | **专家按需召唤** | 团队遇到解决不了的难题，CEO 召唤专家 Agent（最贵模型）。团队提炼后的问题 → 同样花费得到更好答案。只在真正需要时烧专家 token。 |
 | **Asyncio 任务隔离** | 每个 Agent 运行在独立 asyncio task 中。崩溃不拖垮系统。熔断器 + 指数退避应对 LLM 故障。 |
-| **游戏时间调度** | 15 真实分钟 = 1 游戏天。停滞 Agent 自动升级到上级。基于模拟时钟的定时闹钟。 |
-| **双 DB 模式** | Meta DB（WAL，全局）+ Per-project DB（DELETE journal，隔离）。Agent 间数据永不交叉污染。 |
+| **游戏时间调度** | 1 真实小时 = 1 游戏天。停滞 Agent：10min 催办，~40min+ 升级到上级。基于模拟时钟的定时闹钟。 |
+| **双 DB 模式** | Meta DB（WAL，全局）+ Per-project DB（WAL，隔离）。Agent 间数据永不交叉污染。 |
 | **MCP 协议** | 通过 Model Context Protocol 扩展工具。按 Agent 绑定 MCP 服务器——不同角色获得不同外部工具。 |
-| **ClawHub 市场** | 远程技能市场。HR 动态搜索和绑定技能。无硬编码技能列表。 |
-| **30+ 内置工具** | bash、grep、文件操作、patch、websearch、question、todowrite、review（五轴）、security audit、MCP 工具。按角色类型权限门控。 |
+| **skills.sh 市场** | 远程技能市场。HR 动态搜索和绑定技能。无硬编码技能列表。 |
+| **74 内置工具** | bash、grep、文件操作、patch、websearch、question、todowrite、review（五轴）、security audit、MCP 工具。按角色类型权限门控。 |
 
 ## 文档
 

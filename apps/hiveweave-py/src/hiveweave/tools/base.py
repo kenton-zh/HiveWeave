@@ -67,31 +67,37 @@ class ToolDef:
         """Generate JSON Schema for LLM consumption.
 
         Strips Pydantic internals (title, $defs), keeps type/description/enum.
-        Preserves ``aliases`` from field metadata for the alias resolver.
+        Property keys prefer Field.alias (camelCase) so LLM sees taskId not
+        task_id. ``aliases`` are preserved for the alias resolver.
         """
         schema = self.params_model.model_json_schema()
         props: dict[str, Any] = {}
+        required: list[str] = []
         for field_name, field_info in self.params_model.model_fields.items():
+            public_name = _llm_prop_name(field_name, field_info)
             # Build a clean property entry
             prop_schema = schema.get("properties", {}).get(field_name, {})
+            # Pydantic may key by alias in model_json_schema depending on config
+            if not prop_schema:
+                prop_schema = schema.get("properties", {}).get(public_name, {})
             cleaned: dict[str, Any] = {
                 "type": _json_type_from_py(field_info.annotation),
             }
             if "description" in prop_schema:
                 cleaned["description"] = prop_schema["description"]
+            elif field_info.description:
+                cleaned["description"] = field_info.description
             if "enum" in prop_schema:
                 cleaned["enum"] = prop_schema["enum"]
-            # Preserve aliases from field metadata
+            # Preserve aliases (include snake_case field name for resolvers)
             aliases = _extract_aliases(field_info)
+            if field_name not in aliases:
+                aliases = [field_name, *aliases]
             if aliases:
                 cleaned["aliases"] = aliases
-            props[field_name] = cleaned
-
-        required = [
-            name
-            for name, info in self.params_model.model_fields.items()
-            if info.is_required()
-        ]
+            props[public_name] = cleaned
+            if field_info.is_required():
+                required.append(public_name)
 
         return {
             "description": self.description,
@@ -166,14 +172,34 @@ class ToolDef:
 
 def _extract_aliases(field_info) -> list[str]:
     """Extract aliases list from a Pydantic FieldInfo's metadata."""
+    aliases: list[str] = []
+    # Field(alias="taskId") — primary LLM-facing name
+    alias = getattr(field_info, "alias", None)
+    if isinstance(alias, str) and alias:
+        aliases.append(alias)
     for item in field_info.metadata:
         if isinstance(item, dict) and "aliases" in item:
-            return item["aliases"]
+            for a in item["aliases"]:
+                if a not in aliases:
+                    aliases.append(a)
     # Also check json_schema_extra for aliases
     extra = field_info.json_schema_extra
     if isinstance(extra, dict) and "aliases" in extra:
-        return extra["aliases"]
-    return []
+        for a in extra["aliases"]:
+            if a not in aliases:
+                aliases.append(a)
+    return aliases
+
+
+def _llm_prop_name(field_name: str, field_info) -> str:
+    """Prefer camelCase Field.alias as the name shown to the LLM."""
+    alias = getattr(field_info, "alias", None)
+    if isinstance(alias, str) and alias and alias != field_name:
+        return alias
+    for a in _extract_aliases(field_info):
+        if a != field_name and any(c.isupper() for c in a):
+            return a
+    return field_name
 
 
 def _json_type_from_py(annotation: Any) -> str:

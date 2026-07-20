@@ -233,8 +233,8 @@ function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
     isRead: !!m.isRead,
     isStreaming: !!m.isStreaming,
     isContext: !!m.isContext,
-    teamFromAgentId: m.teamFromAgentId ?? undefined,
-    teamToAgentId: m.teamToAgentId ?? undefined,
+    teamFromAgentId: m.teamFromAgentId ?? m.team_from_agent_id ?? undefined,
+    teamToAgentId: m.teamToAgentId ?? m.team_to_agent_id ?? undefined,
   }));
 }
 
@@ -562,18 +562,20 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       // Strip zombie isStreaming — messages left streaming after a crash/restart.
       // Don't rely solely on time. Check real signals first:
       //   1. Active streamDraft → agent is producing output → alive
-      //   2. Agent status not idle → still processing → alive
+      //   2. processingAgents (execution), NOT lifecycle agents.status
       //   3. Only if neither signal is present AND the message is old → zombie
       const ZOMBIE_STREAMING_MS = 12 * 60 * 1000;
       const now = Date.now();
       const hasStreamDraft = streamDraftRef.current !== null;
-      const agentIsActive = agentInfoRef.current?.status && agentInfoRef.current.status !== "idle";
+      const agentIsProcessing = useAppStore
+        .getState()
+        .processingAgents.includes(loadForAgentId);
       const sanitized = converted.map((m) => {
         if (!m.isStreaming || m.role !== "assistant") return m;
         // If streamDraft is actively receiving output for this message, it's alive
         if (hasStreamDraft && streamDraftRef.current?.assistantId === m.id) return m;
-        // If agent status is known and not idle, it's still processing
-        if (agentIsActive) return m;
+        // Execution busy — still processing (do not confuse with lifecycle "active")
+        if (agentIsProcessing) return m;
         // Fallback: time-based — only mark as zombie if old with no live signals
         if ((now - m.timestamp) > ZOMBIE_STREAMING_MS) {
           return { ...m, isStreaming: false, content: m.content || "[对话被中断]" };
@@ -1032,10 +1034,27 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
   useEffect(() => {
     // Pre-populate cache with current agent's info so self-referencing
     // team messages (teamFromAgentId === agentId) resolve instantly.
-    if (agentInfo && agentId) {
+    // MUST verify agentInfo.id === agentId: on panel switch agentId updates
+    // before fetchAgent finishes, and a stale agentInfo would poison the
+    // cache (e.g. cache[天线]=归零). Once poisoned, "收到 天线" renders as
+    // "收到 归零" while the message body still correctly says from 天线.
+    if (agentInfo && agentId && agentInfo.id === agentId) {
+      const next = {
+        name: agentInfo.name,
+        position: agentInfo.position,
+        role: agentInfo.role,
+      };
       setAgentInfoCache((prev) => {
-        if (prev[agentId]) return prev;
-        return { ...prev, [agentId]: { name: agentInfo.name, position: agentInfo.position, role: agentInfo.role } };
+        const cur = prev[agentId];
+        if (
+          cur &&
+          cur.name === next.name &&
+          cur.role === next.role &&
+          cur.position === next.position
+        ) {
+          return prev;
+        }
+        return { ...prev, [agentId]: next };
       });
     }
     // Use functional update to read latest cache state, avoiding stale closures
@@ -1048,15 +1067,19 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       for (const id of idsToFetch) {
         getAgent(id).then((raw) => {
           const data = (raw && typeof raw === "object" && "agent" in raw && raw.agent) ? raw.agent : raw;
-          if (data?.name) {
-            setAgentInfoCache((prev) => ({ ...prev, [id]: { name: data.name, position: data.position, role: data.role } }));
+          // Reject mismatched payloads so we never cache the wrong agent under this id
+          if (data?.name && (!data.id || data.id === id)) {
+            setAgentInfoCache((prev) => ({
+              ...prev,
+              [id]: { name: data.name, position: data.position, role: data.role },
+            }));
           }
         }).catch(() => {});
       }
       return currentCache;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [counterpartIds, agentInfo]);
+  }, [counterpartIds, agentInfo, agentId]);
 
   const addImages = useCallback((files: FileList | File[]) => {
     const readers: Promise<string>[] = [];

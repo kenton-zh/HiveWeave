@@ -25,10 +25,11 @@ import json
 import time
 import uuid
 
+import aiosqlite
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ensure_project_db
+from hiveweave.db.project import ProjectDbError, ensure_project_db
 
 log = structlog.get_logger(__name__)
 
@@ -76,11 +77,11 @@ _MISSING_COLUMNS = [
 _migrated: set[str] = set()
 
 
-async def _conn(project_id: str):
+async def _conn(project_id: str) -> aiosqlite.Connection:
     """Resolve project_id to per-project DB connection."""
     workspace = await meta_db.get_project_workspace(project_id)
     if not workspace:
-        raise ValueError(f"Workspace not found for project {project_id}")
+        raise ProjectDbError(f"Workspace not found for project {project_id}")
     return await ensure_project_db(workspace)
 
 
@@ -111,6 +112,20 @@ async def _ensure_schema(project_id: str) -> None:
     _migrated.add(project_id)
 
 
+# Progress floors driven by lifecycle events (LLM may only raise further)
+_PROGRESS_FLOORS: dict[str, int] = {
+    "claimed": 10,
+    "running": 20,
+    "test_attestation": 70,
+    "submitted": 90,
+    "reviewing": 92,
+    "approved": 95,
+    "verifying": 97,
+    "rework": 40,
+    "closed": 100,
+}
+
+
 class TaskService:
     """Task Ledger — task lifecycle from creation to closure with rework support."""
 
@@ -122,6 +137,73 @@ class TaskService:
         "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
         "is_archived, due_at, wait_kind, wake_at, policy_id"
     )
+
+    async def _raise_progress_floor(
+        self, project_id: str, task_id: str, floor: int
+    ) -> None:
+        """Raise progress to at least ``floor`` (never decrease)."""
+        if floor <= 0:
+            return
+        await _ensure_schema(project_id)
+        rows = await _query(
+            project_id, "SELECT progress FROM tasks WHERE id = ?", [task_id]
+        )
+        if not rows:
+            return
+        current = int(rows[0]["progress"] or 0)
+        if current >= floor:
+            return
+        now_ms = int(time.time() * 1000)
+        await _execute(
+            project_id,
+            "UPDATE tasks SET progress = ?, updated_at = ? WHERE id = ?",
+            [floor, now_ms, task_id],
+        )
+
+    async def emit_task_event(
+        self,
+        project_id: str,
+        task_id: str,
+        event: str,
+        *,
+        agent_id: str | None = None,
+        summary: str | None = None,
+    ) -> None:
+        """System event: progress floor + optional work_log (best-effort).
+
+        ``event`` keys match ``_PROGRESS_FLOORS`` (claimed/running/submitted/…).
+        """
+        floor = _PROGRESS_FLOORS.get(event, 0)
+        try:
+            if floor:
+                await self._raise_progress_floor(project_id, task_id, floor)
+        except Exception as e:
+            log.warning(
+                "emit_task_event_progress_failed",
+                task_id=task_id,
+                event=event,
+                error=str(e),
+            )
+        if not agent_id:
+            return
+        try:
+            from hiveweave.services.work_log import WorkLogService
+
+            await WorkLogService().append_log(
+                project_id,
+                agent_id,
+                log_type="task_event",
+                summary=summary
+                or f"[{event}] task {task_id[:8]}",
+                details={"task_id": task_id, "event": event},
+            )
+        except Exception as e:
+            log.warning(
+                "emit_task_event_worklog_failed",
+                task_id=task_id,
+                event=event,
+                error=str(e),
+            )
 
     async def create_task(self, project_id: str, title: str, description: str,
                           creator_id: str, assignee_id: str | None = None,
@@ -234,10 +316,28 @@ class TaskService:
         await _execute(project_id,
             "UPDATE tasks SET assignee_id = ?, claimed_at = ?, updated_at = ? "
             "WHERE id = ?", [agent_id, now_ms, now_ms, task_id])
+        await self.emit_task_event(
+            project_id,
+            task_id,
+            "claimed",
+            agent_id=agent_id,
+            summary=f"[claimed] task {task_id[:8]} by agent",
+        )
 
     async def start_task(self, project_id: str, task_id: str) -> None:
         """Start a task (claimed → running)."""
         await self._transition(project_id, task_id, "running")
+        rows = await _query(
+            project_id, "SELECT assignee_id FROM tasks WHERE id = ?", [task_id]
+        )
+        agent_id = rows[0]["assignee_id"] if rows else None
+        await self.emit_task_event(
+            project_id,
+            task_id,
+            "running",
+            agent_id=agent_id,
+            summary=f"[running] task {task_id[:8]} started",
+        )
 
     async def block_task(self, project_id: str, task_id: str, reason: str) -> None:
         """Block a task (running → blocked). Sets blocked_reason.
@@ -391,6 +491,17 @@ class TaskService:
             "UPDATE tasks SET evidence = ?, submitted_at = ?, updated_at = ? "
             "WHERE id = ?",
             [json.dumps(evidence), now_ms, now_ms, task_id])
+        rows = await _query(
+            project_id, "SELECT assignee_id FROM tasks WHERE id = ?", [task_id]
+        )
+        agent_id = rows[0]["assignee_id"] if rows else None
+        await self.emit_task_event(
+            project_id,
+            task_id,
+            "submitted",
+            agent_id=agent_id,
+            summary=f"[submitted] task {task_id[:8]}",
+        )
 
     async def start_review(self, project_id: str, task_id: str) -> None:
         """Start review (submitted → reviewing)."""
@@ -452,6 +563,12 @@ class TaskService:
                     task_id=task_id,
                     error=str(e),
                 )
+            await self.emit_task_event(
+                project_id,
+                task_id,
+                "approved",
+                summary=f"[approved] task {task_id[:8]}",
+            )
         else:
             # rework from reviewing (normal) or approved (merge conflict)
             if current_status not in ("reviewing", "approved"):
@@ -465,6 +582,19 @@ class TaskService:
             log.info("task_reviewed", task_id=task_id, decision=decision,
                      has_feedback=feedback is not None,
                      from_status=current_status)
+            rows2 = await _query(
+                project_id,
+                "SELECT assignee_id FROM tasks WHERE id = ?",
+                [task_id],
+            )
+            aid = rows2[0]["assignee_id"] if rows2 else None
+            await self.emit_task_event(
+                project_id,
+                task_id,
+                "rework",
+                agent_id=aid,
+                summary=f"[rework] task {task_id[:8]}",
+            )
 
     async def close_task(self, project_id: str, task_id: str) -> None:
         """Close a task (approved|verifying → closed). Sets closed_at."""
@@ -473,6 +603,12 @@ class TaskService:
         await _execute(project_id,
             "UPDATE tasks SET closed_at = ?, updated_at = ? WHERE id = ?",
             [now_ms, now_ms, task_id])
+        await self.emit_task_event(
+            project_id,
+            task_id,
+            "closed",
+            summary=f"[closed] task {task_id[:8]}",
+        )
         await self._wake_dependent_tasks(project_id, task_id)
 
     async def archive_task(
@@ -564,6 +700,12 @@ class TaskService:
             return
         if current == "approved":
             await self._transition(project_id, task_id, "verifying")
+            await self.emit_task_event(
+                project_id,
+                task_id,
+                "verifying",
+                summary=f"[verifying] task {task_id[:8]}",
+            )
             return
         if current == "closed":
             return
@@ -582,7 +724,11 @@ class TaskService:
     async def _close_verify_and_parent(
         self, project_id: str, verify_task: dict
     ) -> None:
-        """Close VERIFY child and its parent (approved|verifying → closed)."""
+        """Close VERIFY child and its parent (approved|verifying → closed).
+
+        Also archives/closes sibling open VERIFY tasks for the same parent
+        (system + manual duplicates left behind after one VERIFY succeeds).
+        """
         verify_id = verify_task.get("id")
         if not verify_id:
             return
@@ -598,6 +744,11 @@ class TaskService:
             return
 
         parent_id = verify_task.get("parent_task_id")
+        if parent_id:
+            await self._close_sibling_verify_tasks(
+                project_id, parent_id, except_id=verify_id
+            )
+
         if not parent_id:
             # Infer: title "VERIFY: <parent title>" + same assignee
             return
@@ -619,6 +770,63 @@ class TaskService:
                     parent_id=parent_id,
                     error=str(e),
                 )
+
+    async def _close_sibling_verify_tasks(
+        self,
+        project_id: str,
+        parent_id: str,
+        *,
+        except_id: str | None = None,
+    ) -> int:
+        """Close/archive other open VERIFY children of the same parent."""
+        await _ensure_schema(project_id)
+        tasks = await self.list_tasks(project_id)
+        closed = 0
+        for t in tasks:
+            tid = t.get("id")
+            if not tid or tid == except_id:
+                continue
+            if t.get("parent_task_id") != parent_id:
+                continue
+            if not self._is_verify_task(t):
+                continue
+            if t.get("status") in ("closed",):
+                continue
+            try:
+                # Prefer close when legal; else archive so they leave the ledger
+                st = t.get("status")
+                if st in ("approved", "verifying", "submitted", "reviewing"):
+                    # Force closed via archive path for non-closable states
+                    await self.archive_task(
+                        project_id,
+                        tid,
+                        archived_by="system",
+                        reason="sibling VERIFY closed; duplicate cleaned up",
+                    )
+                elif st in ("created", "claimed", "running", "blocked"):
+                    await self.archive_task(
+                        project_id,
+                        tid,
+                        archived_by="system",
+                        reason="sibling VERIFY closed; duplicate cleaned up",
+                    )
+                else:
+                    await self.close_task(project_id, tid)
+                closed += 1
+            except Exception as e:
+                log.warning(
+                    "verify_sibling_cleanup_failed",
+                    task_id=tid,
+                    parent_id=parent_id,
+                    error=str(e),
+                )
+        if closed:
+            log.info(
+                "verify_siblings_cleaned",
+                parent_id=parent_id,
+                closed=closed,
+            )
+        return closed
 
     async def migrate_orphan_approved(self, project_id: str) -> dict:
         """One-shot: approved with open VERIFY → verifying; else → closed."""
@@ -660,11 +868,60 @@ class TaskService:
                 to_closed += 1
         return {"verifying": to_verifying, "closed": to_closed}
 
-    async def get_task(self, project_id: str, task_id: str) -> dict | None:
-        """Get a single task by id. Returns all fields or None."""
+    async def resolve_task_id(self, project_id: str, ref: str) -> str | None:
+        """Resolve a task reference to a full UUID.
+
+        Accepts: full UUID, 8-char prefix (UI short id), or unique title substring.
+        Returns None if not found / ambiguous.
+        """
         await _ensure_schema(project_id)
+        raw = (ref or "").strip()
+        if not raw:
+            return None
+        # Exact id
+        rows = await _query(
+            project_id, "SELECT id FROM tasks WHERE id = ? LIMIT 1", [raw]
+        )
+        if rows:
+            return rows[0]["id"] if isinstance(rows[0], dict) else rows[0][0]
+        # 8+ char prefix (UUID without dashes or first segment)
+        prefix = raw.lower().replace("-", "")
+        if len(raw) >= 8:
+            # Match id starting with raw (case-insensitive) or dashed form
+            all_rows = await _query(
+                project_id,
+                "SELECT id FROM tasks WHERE lower(id) LIKE ? OR replace(lower(id), '-', '') LIKE ?",
+                [f"{raw.lower()}%", f"{prefix}%"],
+            )
+            ids = [
+                (r["id"] if isinstance(r, dict) else r[0]) for r in all_rows
+            ]
+            # Prefer non-archived if multiple
+            if len(ids) == 1:
+                return ids[0]
+            if len(ids) > 1:
+                open_rows = await _query(
+                    project_id,
+                    "SELECT id FROM tasks WHERE is_archived = 0 AND ("
+                    "lower(id) LIKE ? OR replace(lower(id), '-', '') LIKE ?)",
+                    [f"{raw.lower()}%", f"{prefix}%"],
+                )
+                open_ids = [
+                    (r["id"] if isinstance(r, dict) else r[0]) for r in open_rows
+                ]
+                if len(open_ids) == 1:
+                    return open_ids[0]
+                return None  # ambiguous
+        return None
+
+    async def get_task(self, project_id: str, task_id: str) -> dict | None:
+        """Get a single task by id (full UUID or short prefix). Returns all fields or None."""
+        await _ensure_schema(project_id)
+        resolved = await self.resolve_task_id(project_id, task_id)
+        if not resolved:
+            return None
         rows = await _query(project_id,
-            f"SELECT {self._COLUMNS} FROM tasks WHERE id = ?", [task_id])
+            f"SELECT {self._COLUMNS} FROM tasks WHERE id = ?", [resolved])
         return self._row(rows[0]) if rows else None
 
     async def list_tasks(self, project_id: str, status: str | None = None,
@@ -682,6 +939,45 @@ class TaskService:
         sql += " ORDER BY created_at DESC"
         rows = await _query(project_id, sql, params)
         return [self._row(r) for r in rows]
+
+    async def find_similar_open_task(
+        self,
+        project_id: str,
+        title: str,
+        assignee_id: str | None = None,
+    ) -> dict | None:
+        """Find an open (non-terminal) task with same assignee + similar title.
+
+        Used to block duplicate scaffold/module tickets. Similarity = normalized
+        title equality or shared prefix (≥12 chars).
+        """
+        await _ensure_schema(project_id)
+        norm = " ".join((title or "").lower().split())
+        if not norm:
+            return None
+        prefix = norm[:24]
+        sql = (
+            f"SELECT {self._COLUMNS} FROM tasks "
+            "WHERE is_archived = 0 "
+            "AND status NOT IN ('done','cancelled','archived','completed','closed') "
+        )
+        params: list = []
+        if assignee_id:
+            sql += "AND assignee_id = ? "
+            params.append(assignee_id)
+        sql += "ORDER BY created_at DESC LIMIT 40"
+        rows = await _query(project_id, sql, params)
+        for r in rows:
+            row = self._row(r)
+            other = " ".join((row.get("title") or "").lower().split())
+            if not other:
+                continue
+            if other == norm or (
+                len(prefix) >= 12
+                and (other.startswith(prefix) or norm.startswith(other[:24]))
+            ):
+                return row
+        return None
 
     async def get_tasks_for_agent(self, project_id: str,
                                   agent_id: str) -> list[dict]:
@@ -745,14 +1041,25 @@ class TaskService:
 
     async def update_progress(self, project_id: str, task_id: str,
                               progress: int) -> None:
-        """Update progress (0-100). Does not change status."""
+        """Update progress (0-100). Never decreases below current value.
+
+        Lifecycle floors (claim/start/submit/…) set a lower bound; LLM
+        ``update_progress`` may only raise further.
+        """
         if not 0 <= progress <= 100:
             raise ValueError(f"progress must be 0-100, got {progress}")
         await _ensure_schema(project_id)
+        rows = await _query(
+            project_id, "SELECT progress FROM tasks WHERE id = ?", [task_id]
+        )
+        current = int(rows[0]["progress"] or 0) if rows else 0
+        new_val = max(current, progress)
+        if new_val == current:
+            return
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
             "UPDATE tasks SET progress = ?, updated_at = ? WHERE id = ?",
-            [progress, now_ms, task_id])
+            [new_val, now_ms, task_id])
 
     async def update_task(self, project_id: str, task_id: str, **fields) -> None:
         """Generic PATCH update.

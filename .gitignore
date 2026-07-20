@@ -29,6 +29,7 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+tasks/*.output
 
 # Docker
 .docker/
@@ -46,6 +47,8 @@ coverage/
 tmp/
 temp/
 _research/
+.research/
+.uploads/
 
 # Temp patch/fix scripts
 _fix*.mjs
@@ -126,3 +129,4 @@ apps/web/scripts/refactor-*
 # committing them creates broken gitlinks without .gitmodules)
 sheep-game/
 tictactoe-game/
+tictactoe-game3/

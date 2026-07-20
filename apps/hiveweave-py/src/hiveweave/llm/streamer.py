@@ -129,15 +129,18 @@ DOOM_LOOP_READONLY_FUSE = 15
 """
 
 DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
+    # Status polling — tighter than generic readonly (TEST3/TEST4 poll storms)
+    "check_agent_status": 5,
+    "get_tasks": 6,
     # 审查工具 — 中容忍，重试可能是 LLM 纠正输出格式
     "run_code_review": 6,
     "run_security_audit": 6,
     "run_tests": 6,
     "run_perf_audit": 6,
     "run_full_review": 6,
-    # 每轮强制出口 — 被出口闸门拒收后必须重试，默认阈值 3 会误杀
+    # 每轮强制出口 — 被出口闸门拒收后必须重试；同参指纹才计数
     # （井字棋实测：CEO 首条指令即撞 doom，无任何正常输出）
-    "commit_turn": 6,
+    "commit_turn": 8,
     # 幂等写入 — 中容忍，覆盖写入无害但不应无限重复
     "write_file": 8,
     "save_charter": 8,
@@ -169,10 +172,12 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
 
 
 def doom_loop_limit(tool_name: str) -> int:
-    """返回工具的 doom 阈值：只读工具走保险丝，其余查表/默认 3。"""
+    """返回工具的 doom 阈值：显式表优先，只读工具走保险丝，其余默认 3。"""
+    if tool_name in DOOM_LOOP_TOOL_LIMITS:
+        return DOOM_LOOP_TOOL_LIMITS[tool_name]
     if tool_name in DOOM_LOOP_READONLY_TOOLS:
         return DOOM_LOOP_READONLY_FUSE
-    return DOOM_LOOP_TOOL_LIMITS.get(tool_name, DOOM_LOOP_DEFAULT_LIMIT)
+    return DOOM_LOOP_DEFAULT_LIMIT
 
 NO_TEXT_ROUNDS_THRESHOLD = 3
 """连续无文字轮次阈值: 3 轮后注入系统提示。"""
@@ -200,18 +205,39 @@ SAFETY_BUFFER_TOKENS = 20_000
 旧值 4K 远不够，导致 token 估算认为还有空间但实际 API 已超限。
 """
 
+# Hard trim is an API safety net near the true usable input ceiling.
+# Soft compaction (COMPACTION_TRIGGER_RATIO=0.50) is a separate product policy
+# that summarizes old turns earlier; do NOT conflate the two.
+# Leave a small headroom so one large tool result does not immediately 400.
+CONTEXT_TRIM_TRIGGER_RATIO = 0.95
+"""输入预算占用达到该比例时才硬截断历史（保留 system 头 + 最近 turn）。"""
+
 OUTPUT_TOKEN_GLOBAL_CAP = 32_000
 """非 reasoning 模型的 max_tokens 全局上限。"""
 
-CONTINUE_SENTINEL = "(continue)"
-"""网关兼容性哨兵：追加在请求末尾的静态 user 消息。
+CONTINUE_SENTINEL = (
+    "[HiveWeave runtime] Re-invoking this turn: the request did not end with a "
+    "user message (usually after tool/assistant output). The platform treats "
+    "your work as still open, so you are woken again to continue — finish "
+    "outstanding steps or commit_turn. This is not a new human instruction."
+)
+"""Appended as a trailing user message on the HTTP request copy only.
 
-见 _stream_single_round 的 FIX(gateway-tool-id-400) 注释。
-保持内容恒定且极短（约 1 token），不改变模型行为。
+Dual purpose:
+1. Gateway FIX(gateway-tool-id-400): trailing non-user history can 400; a
+   static user tail skips that check (see ``_stream_single_round``).
+2. Model clarity: explain *why* this invocation exists so the agent does not
+   invent a human ``(continue)`` / user wake. Content must stay constant.
 """
 
-TOTAL_TIMEOUT_S = 540.0
+import os as _os
+
+TOTAL_TIMEOUT_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S", "540") or "540"
+)
 """整个 stream 调用的总超时（兜底防线）。
+
+可通过 env ``HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S`` 覆盖（默认 540）。
 
 BUG-041: 原 300s 包裹整个 _run_tool_loop，多轮工具调用（每轮含 HTTP +
 工具执行）合法场景也会超时。放大到 540s（9分钟），给 agent safety_timeout
@@ -228,7 +254,6 @@ IDLE_TIMEOUT_S = 60.0
 # ── Bug B fix: 全局 LLM 并发控制 ───────────────────────────
 # 防止多 agent 同时打 LLM API 超过 provider 并发限制（默认 8）。
 # Semaphore 在 HTTP 请求级别获取/释放，tool 执行期间不占槽。
-import os as _os
 _LLM_MAX_CONCURRENT = int(_os.environ.get("HIVEWEAVE_LLM_MAX_CONCURRENT", "8"))
 _LLM_SEMAPHORE: asyncio.Semaphore | None = None
 
@@ -242,6 +267,76 @@ def _get_llm_semaphore() -> asyncio.Semaphore:
 
 TOOL_EXECUTION_TIMEOUT_S = 120.0
 """单个工具执行超时。对齐 Elixir Task.yield(task, 120_000)。"""
+
+# Status-poll cache / waiting gate (TEST3 — stop check_agent_status storms)
+# get_tasks is intentionally NOT gated while waiting — resume turns need it.
+# Per-turn hard reject (TEST4): same get_tasks fingerprint ≥3 → force waiting.
+_POLL_CACHE_TOOLS = frozenset({"check_agent_status", "get_tasks"})
+_WAITING_GATE_TOOLS = frozenset({"check_agent_status"})
+_POLL_HARD_REJECT_TOOLS = frozenset({"get_tasks"})
+_POLL_HARD_REJECT_LIMIT = 3
+_POLL_CACHE_TTL_S = 30.0
+_poll_result_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
+
+
+def _poll_cache_get(agent_id: str, tool_name: str, arguments: str) -> str | None:
+    if tool_name not in _POLL_CACHE_TOOLS:
+        return None
+    key = (agent_id, tool_name, arguments or "")
+    entry = _poll_result_cache.get(key)
+    if not entry:
+        return None
+    expires, content = entry
+    if time.monotonic() > expires:
+        _poll_result_cache.pop(key, None)
+        return None
+    return f"[cached {tool_name} ≤{_POLL_CACHE_TTL_S:.0f}s] {content}"
+
+
+def _poll_cache_put(
+    agent_id: str, tool_name: str, arguments: str, content: str
+) -> None:
+    if tool_name not in _POLL_CACHE_TOOLS:
+        return
+    key = (agent_id, tool_name, arguments or "")
+    _poll_result_cache[key] = (time.monotonic() + _POLL_CACHE_TTL_S, content)
+
+
+async def _poll_waiting_gate_block_async(
+    agent_id: str, tool_name: str
+) -> str | None:
+    """Block repeated check_agent_status while wait contract is active.
+
+    Does not block get_tasks — woken agents must be able to locate work.
+    """
+    if tool_name not in _WAITING_GATE_TOOLS:
+        return None
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+        from hiveweave.services.wait_contract import wait_contract_service
+
+        agent = agent_manager.get_agent(agent_id)
+        if agent is None:
+            return None
+        disp = (getattr(agent, "disposition", None) or "")
+        if not disp.startswith("waiting"):
+            return None
+        project_id = getattr(agent, "project_id", None)
+        if not project_id:
+            return None
+        waits = await wait_contract_service.list_active(project_id, agent_id)
+        if not waits:
+            return None
+        refs = ", ".join(
+            f"{w.get('kind')}:{w.get('ref')}" for w in waits[:4]
+        )
+        return (
+            f"[wait contract active] disposition={disp}; waits=[{refs}]. "
+            f"Do NOT poll {tool_name} again — call commit_turn(phase='waiting') "
+            "if needed and wait for event wake (ask_reply / task_transition / timeout)."
+        )
+    except Exception:
+        return None
 
 # ── 类型别名 ────────────────────────────────────────────────
 
@@ -631,6 +726,11 @@ class Streamer:
             # 不是 provider 不稳定 — 不报熔断失败
             log.error("stream_total_timeout", agent_id=agent_id,
                       timeout_s=TOTAL_TIMEOUT_S)
+            try:
+                from hiveweave.services.telemetry import telemetry
+                telemetry.stream_total_timeout(agent_id)
+            except Exception:
+                pass
             await self._fire_delta(on_delta, {
                 "type": "error", "content": f"请求总超时（{TOTAL_TIMEOUT_S}s）"
             })
@@ -681,6 +781,9 @@ class Streamer:
         # 自己的输出后陷入 "调工具不说话 → 占位注入 → LLM 看到 '好的开始处理'
         # → 不结束 → 再调工具 → 再注入" 的死循环。
         placeholder_injected: bool = False
+
+        # Per-turn poll fingerprint counts (TEST4 get_tasks hard reject)
+        poll_turn_counts: dict[tuple[str, str], int] = {}
 
         for round_num in range(rounds_cap):
             # 通知回调：新一轮开始（用于重置流式文本累积器）
@@ -819,6 +922,11 @@ class Streamer:
                         # 第一次触发: 拦截重复调用，注入反馈给 LLM 纠正机会
                         log.warning("doom_loop_warned",
                                     agent_id=agent_id, tool=doom, count=limit)
+                        try:
+                            from hiveweave.services.telemetry import telemetry
+                            telemetry.doom_loop(agent_id, doom, stage="warned")
+                        except Exception:
+                            pass
                         doom_warning_given = True
                         # 构造 assistant 消息（含 tool_calls）让 LLM 看到自己的请求
                         doom_assistant_msg: dict[str, Any] = {
@@ -873,6 +981,11 @@ class Streamer:
                         # 第二次触发: 真正中断
                         log.warning("doom_loop_detected",
                                     agent_id=agent_id, tool=doom)
+                        try:
+                            from hiveweave.services.telemetry import telemetry
+                            telemetry.doom_loop(agent_id, doom, stage="detected")
+                        except Exception:
+                            pass
                         return {
                             "status": "error",
                             "content": text_acc or "",
@@ -933,6 +1046,7 @@ class Streamer:
                         tool_calls=tool_calls,
                         on_tool_call=on_tool_call,
                         on_delta=on_delta,
+                        poll_turn_counts=poll_turn_counts,
                     )
                     # doom 检测的失败重试豁免：本轮有工具出错时，下一轮同参数
                     # 重试不计 doom（合法的重试，如 commit_turn 被出口闸门拒收后
@@ -1141,9 +1255,10 @@ class Streamer:
         # 跨连接/跨节点回声历史 id 会被判为未知 id，整包拒绝并返回
         # HTTP 400 invalid_request_error（agent 多轮工具循环被 doom 的根因，
         # 实测：末尾为 tool 消息 + 非本网关签发 id → 必 400）。
-        # 在请求末尾追加一条静态 user 哨兵消息即可跳过该校验（实测 200），
-        # 模型行为不受影响。注意只追加到请求副本，不回写 messages，
-        # 避免污染 tool_turn_messages 持久化历史。
+        # 在请求末尾追加一条静态 user 哨兵即可跳过该校验（实测 200）。
+        # 哨兵文案同时说明「为何再次唤醒」（回合未收口 / 非人类新指令），
+        # 避免模型把旧的 "(continue)" 误读成用户 continue。
+        # 只追加到请求副本，不回写 messages，避免污染持久化历史。
         req_messages = messages
         if req_messages and req_messages[-1].get("role") != "user":
             req_messages = [
@@ -1495,12 +1610,14 @@ class Streamer:
         tool_calls: list[dict],
         on_tool_call: ToolCallCallback,
         on_delta: DeltaCallback | None,
+        poll_turn_counts: dict[tuple[str, str], int] | None = None,
     ) -> tuple[list[dict], set[str]]:
         """执行一批工具调用，返回 (tool result 消息列表, 出错的 tool_call_id 集合)。
 
         并行执行独立的工具调用（对齐 Elixir Task.Supervisor.async_nolink）。
         error_ids 供 doom 检测区分"盲目重复"与"失败后重试"（后者是合法行为）。
         """
+        counts = poll_turn_counts if poll_turn_counts is not None else {}
         # 广播 tool_use 事件
         for tc in tool_calls:
             await self._fire_delta(on_delta, {
@@ -1512,7 +1629,9 @@ class Streamer:
 
         # 并行执行
         tasks = [
-            self._execute_single_tool(agent_id, tc, on_tool_call)
+            self._execute_single_tool(
+                agent_id, tc, on_tool_call, poll_turn_counts=counts
+            )
             for tc in tool_calls
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1533,6 +1652,7 @@ class Streamer:
                 if (
                     result.get("success") is False
                     or content.startswith(("[Tool Timeout]", "[Tool Error]"))
+                    or content.startswith("[poll hard reject]")
                 ):
                     error_ids.add(tc["id"])
             tool_results.append({
@@ -1554,6 +1674,8 @@ class Streamer:
         agent_id: str,
         tool_call: dict,
         on_tool_call: ToolCallCallback,
+        *,
+        poll_turn_counts: dict[tuple[str, str], int] | None = None,
     ) -> dict:
         """执行单个工具调用（带 120s 超时）。"""
         tool_name = tool_call["name"]
@@ -1565,11 +1687,47 @@ class Streamer:
                  tool=tool_name,
                  args_len=len(arguments))
 
+        # Waiting-gate: don't burn rounds on status polls while wait contract active
+        blocked = await _poll_waiting_gate_block_async(agent_id, tool_name)
+        if blocked is not None:
+            return {"content": blocked}
+
+        # Per-turn hard reject for identical get_tasks fingerprints (TEST4)
+        if tool_name in _POLL_HARD_REJECT_TOOLS and poll_turn_counts is not None:
+            key = (tool_name, arguments or "")
+            n = poll_turn_counts.get(key, 0) + 1
+            poll_turn_counts[key] = n
+            if n >= _POLL_HARD_REJECT_LIMIT:
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.poll_hard_reject(agent_id, tool_name)
+                except Exception:
+                    pass
+                return {
+                    "content": (
+                        f"[poll hard reject] {tool_name} called {n} times "
+                        f"with the same arguments this turn. STOP polling — "
+                        f"call commit_turn(phase='waiting') and wait for "
+                        f"event wake (task_transition / ask_reply / timeout)."
+                    ),
+                    "success": False,
+                }
+
+        # Short TTL cache for poll tools (TEST3 storm)
+        cached = _poll_cache_get(agent_id, tool_name, arguments)
+        if cached is not None:
+            return {"content": cached}
+
         try:
             result = await asyncio.wait_for(
                 on_tool_call(tool_name, arguments, tool_call_id),
                 timeout=TOOL_EXECUTION_TIMEOUT_S,
             )
+            if isinstance(result, dict):
+                content = result.get("content")
+                if isinstance(content, str):
+                    _poll_cache_put(agent_id, tool_name, arguments, content)
             return result
         except TimeoutError:
             log.error("tool_timeout",
@@ -1724,12 +1882,20 @@ class Streamer:
         # 合法小窗口模型的兜底：input_budget > 0 但小于 8192 时，
         # 保证输入至少有 8192 可用（此时 max_output 会被 cap 到不超限）。
         usable = max(input_budget, 8_192)
+        # Hard trim near usable ceiling (95%); soft compaction is separate (50%).
+        trim_at = max(int(usable * CONTEXT_TRIM_TRIGGER_RATIO), 8_192)
         total = estimate_tokens_for_messages(messages)
 
-        if total <= usable:
+        if total <= trim_at:
             return messages
 
-        log.info("context_overflow_trim", total=total, usable=usable)
+        log.info(
+            "context_overflow_trim",
+            total=total,
+            usable=usable,
+            trim_at=trim_at,
+            ratio=CONTEXT_TRIM_TRIGGER_RATIO,
+        )
 
         # 保留首 2 条（system prompt）+ 末 N 条（最近上下文）
         if len(messages) <= 4:
@@ -1738,8 +1904,8 @@ class Streamer:
         head = messages[:2]
         tail = messages[2:]
 
-        # 从 tail 前端逐步裁剪直到 token 数达标
-        while len(tail) > 2 and estimate_tokens_for_messages(head + tail) > usable:
+        # 从 tail 前端逐步裁剪直到 token 数回到阈值以下
+        while len(tail) > 2 and estimate_tokens_for_messages(head + tail) > trim_at:
             # R3: 保持 tool_calls + tool_result 对的完整性，避免产生孤儿 tool_result
             # （没有对应 tool_calls 的 tool_result 会导致 API 400 错误）。
             # 原实现只检查相邻 2 条，多 tool_result 批次会留下孤儿。
