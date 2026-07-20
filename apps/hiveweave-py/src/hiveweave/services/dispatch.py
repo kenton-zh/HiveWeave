@@ -5,8 +5,9 @@
 - 写 work_log (type=discussion) 到 per-project DB (日志读取协议)
 - 通过 InboxService 发送 inbox 消息给 subordinate
 - 通过 HandoffService 创建 handoff 记录 (生命周期追踪)
-- approve_work / reject_work 记录审查决策 (coordinator 侧)
-- get_subordinate_logs / get_subordinate_logs_since: 日志读取协议
+
+注意: work_log 读写 / approve / reject 由 WorkLogService + HandoffService 接管
+(dispatch_task 内部仍写 dispatch 日志, get_work_logs_for_task 查询按 task 关联日志).
 
 路由: 所有 work_log 查询通过 project_id 解析到 per-project DB
 (镜像 Elixir ProjectFactory.query, 与 handoff.py 一致)。
@@ -16,10 +17,11 @@ import json
 import time
 import uuid
 
+import aiosqlite
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ensure_project_db
+from hiveweave.db.project import ProjectDbError, ensure_project_db
 from hiveweave.services.handoff import HandoffService
 from hiveweave.services.inbox import InboxService
 from hiveweave.services.task import TaskService
@@ -27,11 +29,11 @@ from hiveweave.services.task import TaskService
 log = structlog.get_logger(__name__)
 
 
-async def _conn(project_id: str):
+async def _conn(project_id: str) -> aiosqlite.Connection:
     """Resolve project_id to per-project DB connection."""
     workspace = await meta_db.get_project_workspace(project_id)
     if not workspace:
-        raise ValueError(f"Workspace not found for project {project_id}")
+        raise ProjectDbError(f"Workspace not found for project {project_id}")
     return await ensure_project_db(workspace)
 
 
@@ -118,6 +120,29 @@ class DispatchService:
         description}``.
         """
         await _ensure_schema(project_id)
+
+        # Hard gates: direct-report span + never assign coordinators code work
+        from hiveweave.services.org_span import (
+            validate_dispatch_span,
+            validate_executor_assignee,
+        )
+
+        span_err = await validate_dispatch_span(from_agent_id, to_agent_id)
+        if span_err:
+            return {
+                "success": False,
+                "message": span_err,
+                "from_agent_id": from_agent_id,
+                "to_agent_id": to_agent_id,
+            }
+        coord_err = await validate_executor_assignee(to_agent_id)
+        if coord_err:
+            return {
+                "success": False,
+                "message": coord_err,
+                "from_agent_id": from_agent_id,
+                "to_agent_id": to_agent_id,
+            }
 
         # 1) Task Ledger: 先创建 task 记录，获得真正的 task_id（全链路主键）。
         #    worktree 分支命名契约 hw/<shortId>/t-<taskid8> 依赖它（P0 分支
@@ -251,67 +276,6 @@ class DispatchService:
 
     # ── WORK LOG ─────────────────────────────────────────────
 
-    async def write_work_log(self, project_id: str, agent_id: str,
-                             session_id: str | None, log_type: str,
-                             summary: str,
-                             details: dict | None = None,
-                             task_id: str | None = None) -> str:
-        """Write a work log entry for an agent.
-
-        Returns the UUID of the newly created log entry.
-        """
-        await _ensure_schema(project_id)
-        log_id = str(uuid.uuid4())
-        now_ms = int(time.time() * 1000)
-        details_json = json.dumps(details) if details else "{}"
-
-        await _execute(
-            project_id,
-            "INSERT INTO work_logs (id, agent_id, project_id, session_id, "
-            "type, summary, details, created_at, task_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [log_id, agent_id, project_id, session_id,
-             log_type or "discussion", summary, details_json, now_ms, task_id],
-        )
-        return log_id
-
-    async def get_subordinate_logs(self, project_id: str,
-                                   subordinate_agent_id: str,
-                                   limit: int = 10) -> list[dict]:
-        """Get subordinate's recent work logs (newest first).
-
-        Implements the 日志读取协议 — coordinator reads subordinate progress
-        before each conversation turn.
-        """
-        await _ensure_schema(project_id)
-        rows = await _query(
-            project_id,
-            "SELECT id, agent_id, type, summary, details, created_at "
-            "FROM work_logs WHERE agent_id = ? "
-            "ORDER BY created_at DESC LIMIT ?",
-            [subordinate_agent_id, limit],
-        )
-        return [self._row(r) for r in rows]
-
-    async def get_agent_logs(self, project_id: str, agent_id: str,
-                             limit: int = 20) -> list[dict]:
-        """Get agent's own work logs (newest first)."""
-        return await self.get_subordinate_logs(project_id, agent_id, limit)
-
-    async def get_subordinate_logs_since(self, project_id: str,
-                                         subordinate_agent_id: str,
-                                         since_timestamp: int) -> list[dict]:
-        """Get logs since a timestamp (oldest first, for incremental reads)."""
-        await _ensure_schema(project_id)
-        rows = await _query(
-            project_id,
-            "SELECT id, agent_id, type, summary, details, created_at "
-            "FROM work_logs WHERE agent_id = ? AND created_at > ? "
-            "ORDER BY created_at ASC",
-            [subordinate_agent_id, since_timestamp],
-        )
-        return [self._row(r) for r in rows]
-
     async def get_work_logs_for_task(self, project_id: str,
                                      task_id: str) -> list[dict]:
         """Get all work logs associated with a task (oldest first).
@@ -327,40 +291,6 @@ class DispatchService:
             [task_id],
         )
         return [self._row(r) for r in rows]
-
-    # ── REVIEW ───────────────────────────────────────────────
-
-    async def approve_work(self, project_id: str, coordinator_id: str,
-                           session_id: str | None, subordinate_id: str,
-                           review: str | None = None) -> str:
-        """Coordinator approves subordinate's completed work.
-
-        Writes a ``completion``-type work log on the coordinator's side.
-        Returns the work log UUID.
-        """
-        summary = f"Approved work from {subordinate_id}"
-        if review:
-            summary = f"{summary}: {review}"
-        return await self.write_work_log(
-            project_id, coordinator_id, session_id, "completion", summary,
-            {"action": "approve", "subordinate_id": subordinate_id,
-             "review": review},
-        )
-
-    async def reject_work(self, project_id: str, coordinator_id: str,
-                          session_id: str | None, subordinate_id: str,
-                          feedback: str) -> str:
-        """Coordinator rejects subordinate's work with feedback.
-
-        Writes an ``error``-type work log on the coordinator's side.
-        Returns the work log UUID.
-        """
-        summary = f"Rejected work from {subordinate_id}: {feedback}"
-        return await self.write_work_log(
-            project_id, coordinator_id, session_id, "error", summary,
-            {"action": "reject", "subordinate_id": subordinate_id,
-             "feedback": feedback},
-        )
 
     # ── HELPERS ──────────────────────────────────────────────
 

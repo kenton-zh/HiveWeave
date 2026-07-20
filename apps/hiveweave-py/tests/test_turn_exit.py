@@ -122,6 +122,7 @@ def test_exit_waiting_user_sets_disposition():
 
 
 def test_exit_open_tasks_parks():
+    """verifying leftover (not submit/review) still parks — no repair spam."""
     clear_pending_turn_result("a1")
     set_pending_turn_result(
         "a1",
@@ -138,12 +139,19 @@ def test_exit_open_tasks_parks():
             agent_id="a1",
             project_id="p1",
             tool_calls=[],
-            open_task_obligations=[{"id": "task-1", "status": "running"}],
+            open_task_obligations=[
+                {
+                    "id": "task-1",
+                    "status": "verifying",
+                    "role_hint": "assignee",
+                }
+            ],
             tasks_advanced=set(),
         )
     )
     assert not d.ok
     assert "OPEN_TASKS_UNDECLARED" in d.violations
+    assert "ASSIGNEE_MUST_SUBMIT" not in d.violations
     assert d.should_park is True
     assert d.should_repair is False
     pop_pending_turn_result("a1")
@@ -167,13 +175,20 @@ def test_exit_blocks_unreplied_asks_and_open_tasks():
             project_id="p1",
             tool_calls=[],
             unreplied_asks=[{"id": "m1", "from_name": "归零", "message": "请回复"}],
-            open_task_obligations=[{"id": "task-1", "status": "running"}],
+            open_task_obligations=[
+                {
+                    "id": "task-1",
+                    "status": "running",
+                    "role_hint": "assignee",
+                }
+            ],
             tasks_advanced=set(),
         )
     )
     assert not d.ok
     assert "UNREPLIED_ASKS" in d.violations
-    assert "OPEN_TASKS_UNDECLARED" in d.violations
+    assert "ASSIGNEE_MUST_SUBMIT" in d.violations
+    assert d.should_repair is True
     pop_pending_turn_result("a1")
 
 

@@ -56,6 +56,7 @@ async def list_communications(
                 [agentId, agentId, limit],
             )
         else:
+            assert projectId is not None  # 上面已确认 projectId or agentId
             workspace = await meta_db.get_project_workspace(projectId)
             if not workspace:
                 return {"communications": []}
@@ -147,6 +148,7 @@ async def list_user_pings(
             rows = await cursor.fetchall()
             await cursor.close()
         else:
+            assert agentId is not None  # 上面已确认 projectId or agentId
             await _ensure_user_pings_table(agentId)
             sql = "SELECT * FROM user_pings WHERE from_agent_id = ?"
             params = [agentId]

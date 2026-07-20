@@ -1,10 +1,11 @@
 """Conversation compaction — summarize old turns when history exceeds budget.
 
 契约 03: 对话历史与压缩
-- 85% 阈值触发压缩
+- 50% 阈值触发压缩（产品策略，非模型能力上限）
 - LLM 生成结构化摘要（Goal/Constraints/Progress/Decisions/Next Steps/Critical Context/Relevant Files）
 - 摘要存入独立 compacted_prefix_cache，不混入 history（RECONCILE A1 修正）
 - LLM 失败时回退到硬截断
+- 与 streamer 硬裁（CONTEXT_TRIM_TRIGGER_RATIO≈95%）正交：压缩早、硬裁晚
 """
 
 from typing import Awaitable, Callable
@@ -23,7 +24,7 @@ from hiveweave.conversation.token_utils import (
 logger = structlog.get_logger()
 
 # ── 常量 ────────────────────────────────────────────────────
-COMPACTION_TRIGGER_RATIO = 0.85
+COMPACTION_TRIGGER_RATIO = 0.50
 SUMMARY_TEMPERATURE = 0.3
 SUMMARY_MAX_TOKENS = 2000
 
@@ -44,7 +45,7 @@ class Compaction:
     def check_overflow(self, total_tokens: int, context_window: int) -> int | None:
         """检查是否需要压缩，返回目标 budget 或 None。
 
-        当 total_tokens > (context_window - COMPACTION_BUFFER) * 0.85 时触发。
+        当 total_tokens > (context_window - COMPACTION_BUFFER) * 0.50 时触发。
         """
         if context_window <= 0:
             return None
@@ -56,7 +57,7 @@ class Compaction:
         return None
 
     def should_compact(self, total_tokens: int, context_window: int) -> bool:
-        """判断是否达到 85% 压缩阈值。"""
+        """判断是否达到 50% 压缩阈值。"""
         return self.check_overflow(total_tokens, context_window) is not None
 
     async def compact(

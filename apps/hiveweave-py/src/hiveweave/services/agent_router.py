@@ -61,8 +61,6 @@ class AgentRouter:
             ws = p["workspace_path"] or ""
             try:
                 conn = await project_db.get_project_db_by_project_id(pid)
-                if conn is None:
-                    continue
                 cursor = await conn.execute(
                     "SELECT id, short_id, name, role, status FROM agents "
                     "WHERE status = 'active'",

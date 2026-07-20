@@ -31,13 +31,14 @@ AGENT_WAKE = "agent.wake"
 AGENT_NO_PROGRESS = "agent.no_progress_fault"
 INBOX_DEDUPED = "inbox.deduped"
 VERIFY_STALE_NUDGE = "verify.stale_nudge"
+AGENT_TURN_EXIT = "agent.turn_exit"
 
 ALL_EVENTS = frozenset({
     LLM_STREAM_START, LLM_STREAM_CHUNK, LLM_STREAM_DONE, LLM_STREAM_FAIL,
     AGENT_CHAT_START, AGENT_CHAT_DONE, AGENT_CRASH,
     CIRCUIT_OPEN, CIRCUIT_CLOSE,
     AGENT_WAKE, AGENT_NO_PROGRESS, INBOX_DEDUPED,
-    VERIFY_STALE_NUDGE,
+    VERIFY_STALE_NUDGE, AGENT_TURN_EXIT,
 })
 
 
@@ -58,8 +59,14 @@ class Telemetry:
             "no_progress_faults": 0,
             "inbox_deduped": 0,
             "verify_stale_nudge": 0,
+            "stream_total_timeout": 0,
+            "doom_loop_detected": 0,
+            "doom_loop_warned": 0,
+            "poll_hard_reject": 0,
         }
         self._wake_reasons: dict[str, int] = {}
+        self._turn_exit_violations: dict[str, int] = {}
+        self._turn_exit_actions: dict[str, int] = {}
 
     def add_handler(self, handler: Callable[[str, dict], None]) -> None:
         """Register a custom event handler."""
@@ -73,6 +80,12 @@ class Telemetry:
             "no_progress_faults": self._counters.get("no_progress_faults", 0),
             "inbox_deduped": self._counters.get("inbox_deduped", 0),
             "verify_stale_nudge": self._counters.get("verify_stale_nudge", 0),
+            "stream_total_timeout": self._counters.get("stream_total_timeout", 0),
+            "doom_loop_detected": self._counters.get("doom_loop_detected", 0),
+            "doom_loop_warned": self._counters.get("doom_loop_warned", 0),
+            "poll_hard_reject": self._counters.get("poll_hard_reject", 0),
+            "turn_exit_by_violation": dict(self._turn_exit_violations),
+            "turn_exit_by_action": dict(self._turn_exit_actions),
         }
 
     def reset_counters_for_tests(self) -> None:
@@ -82,8 +95,14 @@ class Telemetry:
             "no_progress_faults": 0,
             "inbox_deduped": 0,
             "verify_stale_nudge": 0,
+            "stream_total_timeout": 0,
+            "doom_loop_detected": 0,
+            "doom_loop_warned": 0,
+            "poll_hard_reject": 0,
         }
         self._wake_reasons.clear()
+        self._turn_exit_violations.clear()
+        self._turn_exit_actions.clear()
 
     def emit(self, event_name: str, payload: dict | None = None) -> None:
         """Dispatch a telemetry event to all handlers + structlog."""
@@ -106,6 +125,16 @@ class Telemetry:
             self._counters["verify_stale_nudge"] = (
                 self._counters.get("verify_stale_nudge", 0) + 1
             )
+        elif event_name == AGENT_TURN_EXIT:
+            action = str(data.get("action") or "unknown")
+            self._turn_exit_actions[action] = (
+                self._turn_exit_actions.get(action, 0) + 1
+            )
+            for v in data.get("violations") or []:
+                key = str(v)
+                self._turn_exit_violations[key] = (
+                    self._turn_exit_violations.get(key, 0) + 1
+                )
 
         # Default dispatch: structured logging via structlog
         if event_name.startswith("llm"):
@@ -230,6 +259,63 @@ class Telemetry:
             "to_agent_id": to_agent_id, "category": category,
             "system_time": time.time(),
         })
+
+    def turn_exit_gate(
+        self,
+        agent_id: str,
+        violations: list[str] | None,
+        action: str,
+        *,
+        gate_round: int = 0,
+    ) -> None:
+        """Record a turn-exit evaluation (repair|park|exhausted|ok)."""
+        viols = list(violations or [])
+        self.emit(AGENT_TURN_EXIT, {
+            "agent_id": agent_id,
+            "violations": viols,
+            "action": action,
+            "gate_round": gate_round,
+            "primary_violation": viols[0] if viols else None,
+            "system_time": time.time(),
+        })
+
+    def stream_total_timeout(self, agent_id: str) -> None:
+        self._counters["stream_total_timeout"] = (
+            self._counters.get("stream_total_timeout", 0) + 1
+        )
+        logger.warning(
+            "telemetry_stream_total_timeout",
+            agent_id=agent_id,
+            count=self._counters["stream_total_timeout"],
+        )
+
+    def doom_loop(
+        self, agent_id: str, tool: str, *, stage: str = "detected"
+    ) -> None:
+        key = (
+            "doom_loop_detected"
+            if stage == "detected"
+            else "doom_loop_warned"
+        )
+        self._counters[key] = self._counters.get(key, 0) + 1
+        logger.warning(
+            "telemetry_doom_loop",
+            agent_id=agent_id,
+            tool=tool,
+            stage=stage,
+            count=self._counters[key],
+        )
+
+    def poll_hard_reject(self, agent_id: str, tool: str) -> None:
+        self._counters["poll_hard_reject"] = (
+            self._counters.get("poll_hard_reject", 0) + 1
+        )
+        logger.warning(
+            "telemetry_poll_hard_reject",
+            agent_id=agent_id,
+            tool=tool,
+            count=self._counters["poll_hard_reject"],
+        )
 
 
 telemetry = Telemetry()

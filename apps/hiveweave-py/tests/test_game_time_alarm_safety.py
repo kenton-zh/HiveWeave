@@ -6,14 +6,17 @@
 覆盖范围:
   _fire_alarm 在执行 alarm.script_command 前调用 _validate_command_safety，
   对 `cat .env`（敏感路径）和 `rm -rf /`（自毁命令）必须跳过子进程执行，
-  不调用 asyncio.create_subprocess_shell。
+  不调用 asyncio.create_subprocess_exec。
 
 测试策略:
   - 用 unittest.mock.patch 替换 game_time._execute（避免真实 DB 写入）
-  - 用 unittest.mock.patch 监控 asyncio.create_subprocess_shell 是否被调用
+  - 用 unittest.mock.patch 监控 asyncio.create_subprocess_exec 是否被调用
   - alarm.to_agent_id 置空以跳过 inbox 通知（避免依赖 InboxService）
-  - 一个正向控制测试：安全脚本（echo hello）应调用 create_subprocess_shell，
+  - 一个正向控制测试：安全脚本（echo hello）应调用 create_subprocess_exec，
     证明 mock 按预期工作，且危险脚本的"不调用"是真拦截而非测试缺陷
+
+注: 源码已从 create_subprocess_shell 迁移到 create_subprocess_exec + shlex.split
+    （避免 shell=True 的 prompt injection 风险），测试同步更新 mock 目标。
 """
 
 from __future__ import annotations
@@ -69,7 +72,7 @@ class TestFireAlarmScriptSafety:
         mock_subprocess = AsyncMock()
         svc = GameTimeService()
         with patch("hiveweave.services.game_time._execute", mock_execute), \
-             patch("asyncio.create_subprocess_shell", mock_subprocess):
+             patch("asyncio.create_subprocess_exec", mock_subprocess):
             result = await svc._fire_alarm(alarm)
 
         # 危险脚本不应创建子进程
@@ -88,7 +91,7 @@ class TestFireAlarmScriptSafety:
         mock_subprocess = AsyncMock()
         svc = GameTimeService()
         with patch("hiveweave.services.game_time._execute", mock_execute), \
-             patch("asyncio.create_subprocess_shell", mock_subprocess):
+             patch("asyncio.create_subprocess_exec", mock_subprocess):
             result = await svc._fire_alarm(alarm)
 
         mock_subprocess.assert_not_called()
@@ -96,7 +99,7 @@ class TestFireAlarmScriptSafety:
         assert mock_execute.await_count == 1
 
     async def test_safe_script_is_executed(self):
-        """正向控制：安全脚本（echo hello）应调用 create_subprocess_shell.
+        """正向控制：安全脚本（echo hello）应调用 create_subprocess_exec.
 
         证明 mock 按预期工作，且危险脚本的"不调用"是真拦截而非测试缺陷
         （如 _fire_alarm 提前崩溃、或 _validate_command_safety 误拦一切）。
@@ -112,9 +115,12 @@ class TestFireAlarmScriptSafety:
         mock_subprocess = AsyncMock(return_value=mock_proc)
         svc = GameTimeService()
         with patch("hiveweave.services.game_time._execute", mock_execute), \
-             patch("asyncio.create_subprocess_shell", mock_subprocess):
+             patch("asyncio.create_subprocess_exec", mock_subprocess):
             result = await svc._fire_alarm(alarm)
 
-        # 安全脚本应创建子进程
+        # 安全脚本应创建子进程（shlex.split("echo hello") → ["echo", "hello"]）
         mock_subprocess.assert_called_once()
+        # 验证 exec 调用的第一个参数是 "echo"（shlex.split 后的第一项）
+        call_args = mock_subprocess.call_args
+        assert call_args.args[0] == "echo"
         assert result is None

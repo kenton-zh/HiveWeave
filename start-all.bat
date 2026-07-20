@@ -21,9 +21,17 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":4000 " ^| findstr "LISTENIN
     taskkill /F /PID %%a >nul 2>&1
 )
 
-REM --- Kill stale frontend (node.exe - vite dev server) ---
-echo [HiveWeave] Killing stale frontend (node.exe)...
-taskkill /F /IM node.exe >nul 2>&1
+REM --- Kill stale frontend (by PID file, not all node.exe) ---
+REM NOTE: Killing all node.exe would also kill project game servers started via
+REM start_dev_server. Use the PID file maintained by start-frontend.bat instead.
+echo [HiveWeave] Killing stale frontend by PID file...
+set "FRONTEND_PID_FILE=%~dp0apps\web\frontend.pid"
+if exist "%FRONTEND_PID_FILE%" (
+    set /p OLD_FRONTEND_PID=<"%FRONTEND_PID_FILE%"
+    echo   killing frontend PID %OLD_FRONTEND_PID%
+    taskkill /F /PID %OLD_FRONTEND_PID% >nul 2>&1
+    del "%FRONTEND_PID_FILE%" >nul 2>&1
+)
 
 REM Brief pause to let OS release ports
 timeout /t 2 /nobreak >nul

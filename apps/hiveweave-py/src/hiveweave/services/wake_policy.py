@@ -54,6 +54,9 @@ def classify_message(
 
     if is_user_sender(from_agent_id) or mt in ("user", "human"):
         return "command"
+    # notify_agent / FYI — deliver but never start an LLM turn
+    if mt in ("notify", "notification", "fyi"):
+        return "progress"
     if expect_report or mt == "ask":
         return "ask"
     if mt in ("approval", "review", "task") and task_id:
@@ -72,6 +75,12 @@ def classify_message(
         if any(p.search(text) for p in _PROGRESS_PATTERNS):
             return "progress"
         return "command"
+    # Fallback: no reply demanded → progress (avoid FYI wakes). Assignments /
+    # approvals already classified above via message_type / task patterns.
+    from hiveweave.services.reply_policy import message_requests_reply
+
+    if not message_requests_reply(text):
+        return "progress"
     return "command"
 
 
@@ -112,15 +121,25 @@ def should_wake(
             # is waiting_human. Otherwise peer replies that satisfy agent-waits
             # (模块方案/审批请求) land as wake=0 and the org deadlocks.
             return True
-        # No match: timer/external/task waits must not swallow superior commands
-        kinds = {(w.get("kind") or "") for w in (active_waits or [])}
-        pierce_ok = bool(kinds) and kinds <= {"timer", "external", "task"}
-        if not (
-            pierce_ok
-            and category in ("command", "ask", "approval", "task_transition")
-        ):
-            return False
-        # pierced — fall through to waiting_human check
+        # task_transition always pierces unmatched agent/user waits — submit /
+        # review must not deadlock Phase C (TEST3: TASK SUBMITTED wake=0).
+        if category != "task_transition":
+            # No match: timer/external/task waits must not swallow superior cmds
+            kinds = {(w.get("kind") or "") for w in (active_waits or [])}
+            pierce_ok = bool(kinds) and kinds <= {"timer", "external", "task"}
+            if not (
+                pierce_ok
+                and category in ("command", "ask", "approval", "task_transition")
+            ):
+                return False
+        # pierced or task_transition — fall through to disposition checks
+
+    if disposition == "complete":
+        # Complete agents: only user messages or new task transitions wake.
+        # Peer asks/commands/approvals would churn empty done_slice (TEST4 CEO).
+        if is_user_sender(from_agent_id):
+            return True
+        return category == "task_transition"
 
     if disposition == "waiting_human":
         # Only user replies or new task transitions wake a waiting_human agent

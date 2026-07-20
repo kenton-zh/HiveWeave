@@ -17,6 +17,7 @@ import structlog
 from hiveweave.services import dispatch as dispatch_svc
 from hiveweave.services.attestation import (
     attestation_service,
+    has_valid_waiver,
     required_attestation_kinds,
     resolve_task_policy,
 )
@@ -85,6 +86,9 @@ def _raise_from_value_error(e: ValueError) -> None:
 async def _gate_attestation_for_task(
     project_id: str, task: dict, evidence: dict
 ) -> None:
+    # Tool-path waive_attestation must also unlock HTTP/UI approve/submit
+    if await has_valid_waiver(project_id, task.get("id")):
+        return
     tags = task.get("tags") or []
     if isinstance(tags, str):
         import json

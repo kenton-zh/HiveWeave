@@ -1,7 +1,8 @@
 """API Key authentication middleware (contract 19).
 
 契约 19: ApiKeyAuth
-- 凭据来源三选一: ``Authorization: Bearer <key>`` / ``X-API-Key`` header / ``?api_key=`` query
+- 凭据来源二选一: ``Authorization: Bearer <key>`` / ``X-API-Key`` header
+  (不再支持 ``?api_key=`` query 参数 — query 会进浏览器历史和服务器日志)
 - 预期值从 ``settings.api_key`` 读取；未设置（空串）时跳过校验（dev/test 默认全放行）
 - 用 ``secrets.compare_digest`` 防时序攻击
 - 免认证路径: ``GET /``、``GET /api/health``
@@ -12,7 +13,6 @@ from __future__ import annotations
 
 import re
 import secrets
-from urllib.parse import parse_qs
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -32,9 +32,10 @@ _UNAUTHORIZED_BODY = {"error": "Unauthorized — invalid or missing API key"}
 
 
 def _extract_provided_key(request: Request) -> str | None:
-    """从请求中提取调用方提供的 API key（三选一）。
+    """从请求中提取调用方提供的 API key（二选一）。
 
-    优先级: Authorization Bearer → X-API-Key → ?api_key=
+    优先级: Authorization Bearer → X-API-Key。
+    不再支持 ?api_key= query 参数（会进浏览器历史和服务器日志，有泄露风险）。
     """
     # 1. Authorization: Bearer <key>
     auth_header = request.headers.get("authorization") or request.headers.get(
@@ -49,14 +50,6 @@ def _extract_provided_key(request: Request) -> str | None:
         val = request.headers.get(key)
         if val:
             return val.strip()
-    # 3. ?api_key= query param
-    raw_qs = request.url.query
-    if raw_qs:
-        qs = parse_qs(raw_qs, keep_blank_values=False)
-        for k in ("api_key", "apiKey"):
-            vals = qs.get(k)
-            if vals:
-                return vals[0].strip()
     return None
 
 

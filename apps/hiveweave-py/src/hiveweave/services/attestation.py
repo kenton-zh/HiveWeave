@@ -11,9 +11,11 @@ from typing import Any
 
 import structlog
 
+import aiosqlite
+
 from hiveweave.config import settings
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ensure_project_db
+from hiveweave.db.project import ensure_project_db, ProjectDbError
 
 log = structlog.get_logger(__name__)
 
@@ -74,10 +76,16 @@ _TEST_COMMAND_RE = re.compile(
 DEFAULT_MAX_AGE_MS = 24 * 60 * 60 * 1000
 
 
-async def _conn(project_id: str):
+async def _conn(project_id: str) -> aiosqlite.Connection:
+    """Resolve project_id to per-project DB connection.
+
+    失败时 raise ProjectDbError（workspace 不存在或被驱逐）。
+    """
     workspace = await meta_db.get_project_workspace(project_id)
     if not workspace:
-        return None
+        raise ProjectDbError(
+            f"Workspace not found for project {project_id} (project not registered)"
+        )
     return await ensure_project_db(workspace)
 
 
@@ -87,8 +95,11 @@ class AttestationService:
     async def ensure_schema(self, project_id: str) -> None:
         if project_id in _migrated:
             return
-        conn = await _conn(project_id)
-        if conn is None:
+        # project 不存在（ProjectDbError）时静默跳过 schema 创建 —
+        # 调用方可能在 project 尚未完全初始化时调用
+        try:
+            conn = await _conn(project_id)
+        except ProjectDbError:
             return
         await conn.execute(CREATE_SQL)
         try:
@@ -123,8 +134,6 @@ class AttestationService:
     ) -> str:
         await self.ensure_schema(project_id)
         conn = await _conn(project_id)
-        if conn is None:
-            raise ValueError(f"No project DB for {project_id}")
         now = int(time.time() * 1000)
         max_age = ttl_ms or int(
             getattr(settings, "attestation_max_age_ms", None) or DEFAULT_MAX_AGE_MS
@@ -176,8 +185,10 @@ class AttestationService:
 
     async def get(self, project_id: str, attestation_id: str) -> dict | None:
         await self.ensure_schema(project_id)
-        conn = await _conn(project_id)
-        if conn is None:
+        # project 不存在（ProjectDbError）时返回 None（无 attestation）
+        try:
+            conn = await _conn(project_id)
+        except ProjectDbError:
             return None
         cur = await conn.execute(
             "SELECT * FROM tool_attestations WHERE id = ? AND project_id = ?",
@@ -249,6 +260,65 @@ class AttestationService:
             )
         return True, ""
 
+    async def find_recent_for_agent(
+        self,
+        project_id: str,
+        *,
+        agent_id: str,
+        task_id: str | None = None,
+        kinds: list[str] | frozenset[str] | None = None,
+        max_age_ms: int | None = None,
+        limit: int = 8,
+    ) -> list[str]:
+        """Return recent valid attestation ids for auto-attach on submit_task.
+
+        Prefers rows matching task_id; falls back to agent-scoped attestations
+        with null/empty task_id. Excludes waiver kind.
+        """
+        await self.ensure_schema(project_id)
+        try:
+            conn = await _conn(project_id)
+        except ProjectDbError:
+            return []
+        now = int(time.time() * 1000)
+        max_age = max_age_ms or int(
+            getattr(settings, "attestation_max_age_ms", None) or DEFAULT_MAX_AGE_MS
+        )
+        min_created = now - max_age
+        kinds_list = list(kinds) if kinds else None
+        params: list[Any] = [project_id, agent_id, WAIVER_KIND, now, min_created]
+        kind_clause = ""
+        if kinds_list:
+            placeholders = ", ".join("?" * len(kinds_list))
+            kind_clause = f" AND kind IN ({placeholders})"
+            params.extend(kinds_list)
+        params.append(limit)
+        cur = await conn.execute(
+            "SELECT id, task_id, kind, created_at FROM tool_attestations "
+            "WHERE project_id = ? AND agent_id = ? AND kind != ? "
+            "AND (expires_at IS NULL OR expires_at > ?) "
+            f"AND created_at >= ?{kind_clause} "
+            "AND stdout_hash IS NOT NULL AND TRIM(stdout_hash) != '' "
+            "ORDER BY created_at DESC LIMIT ?",
+            params,
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        if not rows:
+            return []
+        matched: list[str] = []
+        fallback: list[str] = []
+        for r in rows:
+            rid = r["id"]
+            tid = r["task_id"] or ""
+            if task_id and tid == task_id:
+                matched.append(rid)
+            elif not tid:
+                fallback.append(rid)
+            elif not task_id:
+                matched.append(rid)
+        return (matched or fallback)[: max(1, min(limit, 4))]
+
 
 def is_test_command(cmd: str) -> bool:
     """True if command looks like a test runner invocation."""
@@ -301,8 +371,10 @@ async def has_valid_waiver(project_id: str, task_id: str | None) -> bool:
     if not task_id:
         return False
     await attestation_service.ensure_schema(project_id)
-    conn = await _conn(project_id)
-    if conn is None:
+    # project 不存在（ProjectDbError）时返回 False（无 waiver）
+    try:
+        conn = await _conn(project_id)
+    except ProjectDbError:
         return False
     now = int(time.time() * 1000)
     cur = await conn.execute(

@@ -13,10 +13,12 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+import aiosqlite
 import structlog
 
 from hiveweave.config import settings
 from hiveweave.db import project as project_db
+from hiveweave.db.project import ProjectDbError
 from hiveweave.services.turn_result import WaitingOnItem
 
 log = structlog.get_logger(__name__)
@@ -69,7 +71,7 @@ def default_ttl_ms(kind: str) -> int:
     return int(settings.wait_ttl_external_ms)
 
 
-async def _conn(project_id: str):
+async def _conn(project_id: str) -> aiosqlite.Connection:
     return await project_db.get_project_db_by_project_id(project_id)
 
 
@@ -178,8 +180,9 @@ class WaitContractService:
     ) -> list[dict]:
         """Clear previous active waits and insert new ones from waiting_on."""
         await _ensure_schema(project_id)
-        conn = await _conn(project_id)
-        if conn is None:
+        try:
+            conn = await _conn(project_id)
+        except project_db.ProjectDbError:
             return []
 
         now = int(time.time() * 1000)
@@ -193,7 +196,7 @@ class WaitContractService:
         created: list[dict] = []
         for item in waiting_on or []:
             if isinstance(item, WaitingOnItem):
-                kind = item.kind
+                kind: str = item.kind
                 ref = item.ref
                 note = item.note
             else:
@@ -370,12 +373,18 @@ class WaitContractService:
         project_id: str,
         resolve_agent_id: Callable[[str], str | None],
     ) -> list[dict]:
-        """Detect agent↔agent wait SCCs and clear breaker (min agent_id) waits.
+        """Detect wait SCCs (agent↔agent and task-mediated) and clear ALL members.
 
         ``resolve_agent_id(ref)`` maps wait.ref (花名/short_id/uuid) → agent_id.
+
+        TEST3: previously only cleared ``min(agent_id)``; partners stayed stuck
+        until TTL. Now clear every agent in the component and return one break
+        record per cycle (``memberIds`` lists everyone to notify).
         """
         active = await self.list_all_active(project_id)
         graph: dict[str, set[str]] = {}
+
+        # agent → agent edges
         for w in active:
             if (w.get("kind") or "").lower() != "agent":
                 continue
@@ -386,38 +395,92 @@ class WaitContractService:
             graph.setdefault(waiter, set()).add(target)
             graph.setdefault(target, set())
 
+        # task → assignee/creator edges (peer-review mutual wait via kind=task)
+        task_parties = await self._task_party_map(project_id)
+        for w in active:
+            if (w.get("kind") or "").lower() != "task":
+                continue
+            waiter = w.get("agentId") or ""
+            ref = str(w.get("ref") or "").strip()
+            if not waiter or not ref:
+                continue
+            parties = task_parties.get(ref.lower()) or task_parties.get(ref[:8].lower())
+            if not parties:
+                continue
+            for other in parties:
+                if other and other != waiter:
+                    graph.setdefault(waiter, set()).add(other)
+                    graph.setdefault(other, set())
+
         breaks: list[dict] = []
         for comp in _scc(graph):
             if len(comp) < 2:
                 continue
-            breaker = min(comp)
+            members = sorted(comp)
             conn = await _conn(project_id)
             if conn is None:
                 continue
             now = int(time.time() * 1000)
+            placeholders = ",".join("?" * len(members))
             cur = await conn.execute(
-                "UPDATE agent_waits SET cleared_at = ? "
-                "WHERE agent_id = ? AND cleared_at IS NULL AND kind = 'agent'",
-                [now, breaker],
+                f"UPDATE agent_waits SET cleared_at = ? "
+                f"WHERE agent_id IN ({placeholders}) AND cleared_at IS NULL",
+                [now, *members],
             )
             await conn.commit()
             n = cur.rowcount or 0
             if n:
                 breaks.append(
                     {
-                        "breakerId": breaker,
-                        "cycle": sorted(comp),
+                        "breakerId": members[0],  # legacy field: first member
+                        "memberIds": members,
+                        "cycle": members,
                         "clearedCount": n,
                     }
                 )
                 log.info(
                     "wait_cycle_broken",
                     project_id=project_id,
-                    breaker=breaker,
-                    cycle=sorted(comp),
+                    members=members,
+                    cycle=members,
                     cleared=n,
                 )
         return breaks
+
+    async def _task_party_map(
+        self, project_id: str
+    ) -> dict[str, set[str]]:
+        """Map task id / 8-char prefix → {assignee_id, creator_id}."""
+        conn = await _conn(project_id)
+        if conn is None:
+            return {}
+        out: dict[str, set[str]] = {}
+        try:
+            cur = await conn.execute(
+                "SELECT id, assignee_id, creator_id FROM tasks "
+                "WHERE COALESCE(is_archived, 0) = 0 "
+                "AND status NOT IN ('closed', 'cancelled', 'archived')"
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            for r in rows:
+                tid = (r["id"] or "").strip()
+                if not tid:
+                    continue
+                parties = {
+                    p for p in (r["assignee_id"], r["creator_id"]) if p
+                }
+                if not parties:
+                    continue
+                out[tid.lower()] = parties
+                out[tid[:8].lower()] = parties
+        except Exception as e:
+            log.warning(
+                "wait_cycle_task_map_failed",
+                project_id=project_id,
+                error=str(e),
+            )
+        return out
 
 
 def _ref_matches_sender(

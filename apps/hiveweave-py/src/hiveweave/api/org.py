@@ -80,8 +80,9 @@ async def _resolve_project_language(project_id: str | None) -> str:
         return "en"
     try:
         pj_conn = await project_db.get_project_db_by_project_id(project_id)
-        if pj_conn is None:
-            return "en"
+    except project_db.ProjectDbError:
+        return "en"
+    try:
         pj_cursor = await pj_conn.execute(
             "SELECT language FROM project_meta WHERE project_id = ?",
             [project_id],
@@ -144,6 +145,8 @@ def _agent_response(a: dict, *, project_language: str = "en") -> dict:
         "createdAt": a.get("created_at"),
         "updated_at": a.get("updated_at"),
         "updatedAt": a.get("updated_at"),
+        "last_active_at": a.get("last_active_at"),
+        "lastActiveAt": a.get("last_active_at"),
     }
 
 

@@ -27,7 +27,6 @@ from hiveweave.tools.patch import apply_patch
 from hiveweave.tools.question import (
     execute_question,
     resolve_question,
-    get_pending_questions,
 )
 from hiveweave.tools.review import (
     execute_review,
@@ -38,13 +37,14 @@ from hiveweave.tools.review import (
     run_full_review,
     ReviewLLMCallback,
 )
-from hiveweave.tools.todowrite import execute_todowrite, get_todos
+from hiveweave.tools.todowrite import execute_todowrite
 from hiveweave.tools.websearch import execute_websearch
 
 # Import tool registration modules to trigger @tool decorators
 import hiveweave.tools.file_mgmt  # noqa: F401 — registers delete_file, move_file, etc.
 import hiveweave.tools.orchestration_tools  # noqa: F401 — registers messaging, charter, memory, alarm
 import hiveweave.tools.org_tools  # noqa: F401 — registers hire_agent, dismiss_agent, skills, etc.
+import hiveweave.tools.task_tools  # noqa: F401 — registers dispatch/submit/waive/cancel/…
 import hiveweave.tools.misc_tools  # noqa: F401 — registers git_worktree, legacy tasks, webfetch, etc.
 import hiveweave.tools.turn_tools  # noqa: F401 — registers commit_turn, ask_agent, notify_agent
 import hiveweave.tools.dev_server_tools  # noqa: F401 — start_dev_server / lookup_dev_server
@@ -82,8 +82,6 @@ __all__ = [
     # Question
     "execute_question",
     "resolve_question",
-    "get_pending_questions",
     # TodoWrite
     "execute_todowrite",
-    "get_todos",
 ]

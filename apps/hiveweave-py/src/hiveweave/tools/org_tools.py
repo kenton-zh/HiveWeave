@@ -267,15 +267,14 @@ async def hire_agent_tool(
     language = "zh"
     try:
         pj_conn = await project_db.get_project_db_by_project_id(project_id)
-        if pj_conn is not None:
-            pj_cursor = await pj_conn.execute(
-                "SELECT language FROM project_meta WHERE project_id = ?",
-                [project_id],
-            )
-            pj_row = await pj_cursor.fetchone()
-            await pj_cursor.close()
-            if pj_row and pj_row["language"]:
-                language = pj_row["language"]
+        pj_cursor = await pj_conn.execute(
+            "SELECT language FROM project_meta WHERE project_id = ?",
+            [project_id],
+        )
+        pj_row = await pj_cursor.fetchone()
+        await pj_cursor.close()
+        if pj_row and pj_row["language"]:
+            language = pj_row["language"]
     except Exception as e:
         log.warning("tool.hire_agent.read_language_failed",
                     project_id=project_id, error=str(e))
@@ -462,6 +461,37 @@ async def hire_agent_tool(
         else:
             wt_info = "  Worktree: (shared project root)\n"
 
+        # QA 到岗后把 blocked 的 VERIFY 重挂（绕过 _TRANSITIONS 的定向纠偏）
+        retry_note = ""
+        try:
+            from hiveweave.tools.task_tools import retry_qa_blocked_verify_tasks
+
+            n = await retry_qa_blocked_verify_tasks(project_id)
+            if n:
+                retry_note = f"\n  Unblocked {n} VERIFY task(s) waiting for independent QA.\n"
+                log.info(
+                    "hire_agent.verify_retry",
+                    project_id=project_id,
+                    reattached=n,
+                )
+        except Exception as retry_err:
+            log.warning(
+                "hire_agent.verify_retry_failed",
+                project_id=project_id,
+                error=str(retry_err),
+            )
+
+        try:
+            from hiveweave.services.task import TaskService
+
+            await TaskService().migrate_orphan_approved(project_id)
+        except Exception as mig_err:
+            log.warning(
+                "hire_agent.orphan_migrate_failed",
+                project_id=project_id,
+                error=str(mig_err),
+            )
+
         return ToolResult.ok(
             f"Agent hired successfully.\n"
             f"  Name: {name}\n"
@@ -474,6 +504,7 @@ async def hire_agent_tool(
             f"{wt_info}"
             f"  Skills: {skills}\n"
             f"  Backstory: {backstory[:100] if backstory else '(none)'}"
+            f"{retry_note}"
         )
     except Exception as e:
         return ToolResult.err(f"Failed to hire agent: {e}")

@@ -218,11 +218,6 @@ def resolve_question(question_id: str, answer: str) -> bool:
     return True
 
 
-def get_pending_questions() -> list[dict[str, Any]]:
-    """Return all currently-pending question IDs (for diagnostics/polling)."""
-    return [{"question_id": qid} for qid in list(_pending.keys())]
-
-
 def drain_expired_questions() -> list[str]:
     """Cancel and remove expired questions (cleanup, best-effort)."""
     expired: list[str] = []

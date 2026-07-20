@@ -19,6 +19,20 @@ from typing import Any
 from hiveweave.db.schema import PROJECT_DB_TABLES, PROJECT_DB_INDEXES
 from hiveweave.db import meta as meta_db
 
+
+class ProjectDbError(RuntimeError):
+    """Per-project DB 不可用。
+
+    触发条件：
+    - workspace 已被驱逐（项目删除中，防重连）
+    - project_id / agent_id 在 Meta DB 中查不到 workspace_path
+
+    继承 RuntimeError 而非 ValueError：
+    - 语义是"运行时状态不可用"而非"参数错误"
+    - 避免被 `except ValueError` 误捕获（调用方应显式捕获或让异常传播）
+    """
+
+
 # ── Connection cache ────────────────────────────────────────
 # key: workspace_path (normalized absolute path)
 # value: aiosqlite.Connection
@@ -45,11 +59,13 @@ def _db_path_for_workspace(workspace_path: str) -> str:
     return str(hw_dir / "data.db")
 
 
-async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection | None:
+async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
     """Get or create the per-project DB for a workspace.
 
     契约 11: ensureProjectDb(workspacePath) lazily creates a per-project DB.
-    返回 None 表示 workspace 已被驱逐（项目删除中），调用方应处理此情况。
+
+    失败时 raise ProjectDbError：
+    - workspace 已被驱逐（项目删除中），拒绝重连
 
     R2: 使用 asyncio.Lock 保护，避免并发调用创建多个连接。
     R3: 缓存上限 MAX_CACHED_CONNECTIONS=50，超限时 evict 最久未用的连接（LRU）。
@@ -57,10 +73,10 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection | None:
     ws = str(Path(workspace_path).resolve())
 
     # 驱逐检查 — 项目删除后拒绝重连，防止 cancel 收尾操作锁住 data.db
-    # 返回 None 而非 raise，与 get_project_db_for_agent 保持一致；
-    # 调用方已有 None 检查，raise 会导致未 try/except 的新端点 500
     if ws in _evicted_workspaces:
-        return None
+        raise ProjectDbError(
+            f"Workspace evicted (project deletion in progress): {ws}"
+        )
 
     # 快速路径：无锁检查缓存（命中时只需 move_to_end，但需加锁保证 OrderedDict 一致）
     async with _ensure_lock:
@@ -107,7 +123,7 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection | None:
         return conn
 
 
-async def get_project_db_for_agent(agent_id: str) -> aiosqlite.Connection | None:
+async def get_project_db_for_agent(agent_id: str) -> aiosqlite.Connection:
     """Get the per-project DB for an agent.
 
     契约 11: lookupAgentWorkspace() → getProjectDbForAgent()
@@ -116,30 +132,43 @@ async def get_project_db_for_agent(agent_id: str) -> aiosqlite.Connection | None
     3. Query Meta DB for project's workspace_path
     4. ensure_project_db(workspace_path)
     5. Cache the mapping
+
+    失败时 raise ProjectDbError：
+    - agent_id 在 Meta DB 中查不到 project_id
+    - project_id 查不到 workspace_path
+    - workspace 已被驱逐（透传 ensure_project_db 的 ProjectDbError）
     """
     # Check cache
     if agent_id in _agent_cache:
         ws = _agent_cache[agent_id]
         if ws in _evicted_workspaces:
-            return None  # 项目已删除，拒绝重连
+            raise ProjectDbError(
+                f"Workspace evicted (project deletion in progress): {ws}"
+            )
         if ws in _cache:
             return _cache[ws]
 
     # Query Meta DB for project_id
     project_id = await meta_db.get_agent_project_id(agent_id)
     if project_id is None:
-        return None
+        raise ProjectDbError(
+            f"No project found for agent_id={agent_id} (agent not registered in Meta DB)"
+        )
 
     # Query Meta DB for workspace_path
     workspace_path = await meta_db.get_project_workspace(project_id)
     if workspace_path is None:
-        return None
+        raise ProjectDbError(
+            f"No workspace_path for project_id={project_id} (project record incomplete)"
+        )
 
     ws_resolved = str(Path(workspace_path).resolve())
     if ws_resolved in _evicted_workspaces:
-        return None  # 项目已删除，拒绝重连
+        raise ProjectDbError(
+            f"Workspace evicted (project deletion in progress): {ws_resolved}"
+        )
 
-    # Ensure DB exists
+    # Ensure DB exists — 可能 raise ProjectDbError，直接传播
     conn = await ensure_project_db(workspace_path)
 
     # Cache the mapping
@@ -148,15 +177,21 @@ async def get_project_db_for_agent(agent_id: str) -> aiosqlite.Connection | None
     return conn
 
 
-async def get_project_db_by_project_id(project_id: str) -> aiosqlite.Connection | None:
+async def get_project_db_by_project_id(project_id: str) -> aiosqlite.Connection:
     """Get the per-project DB connection by project_id.
 
     路由链: project_id → meta_db.projects → workspace_path → ensure_project_db
     Convenience helper for services that have project_id but not agent_id.
+
+    失败时 raise ProjectDbError：
+    - project_id 查不到 workspace_path
+    - workspace 已被驱逐（透传 ensure_project_db 的 ProjectDbError）
     """
     workspace_path = await meta_db.get_project_workspace(project_id)
     if workspace_path is None:
-        return None
+        raise ProjectDbError(
+            f"No workspace_path for project_id={project_id} (project not found in Meta DB)"
+        )
     return await ensure_project_db(workspace_path)
 
 
@@ -228,10 +263,11 @@ def clear_evicted_workspace(workspace_path: str) -> None:
 async def query(
     agent_id: str, sql: str, params: list[Any] | None = None
 ) -> list[aiosqlite.Row]:
-    """Execute a SELECT query on the per-project DB for an agent."""
+    """Execute a SELECT query on the per-project DB for an agent.
+
+    底层 get_project_db_for_agent 失败时 raise ProjectDbError，由调用方处理。
+    """
     conn = await get_project_db_for_agent(agent_id)
-    if conn is None:
-        raise ValueError(f"No project DB found for agent {agent_id}")
     cursor = await conn.execute(sql, params or [])
     rows = await cursor.fetchall()
     await cursor.close()
@@ -241,10 +277,11 @@ async def query(
 async def query_one(
     agent_id: str, sql: str, params: list[Any] | None = None
 ) -> aiosqlite.Row | None:
-    """Execute a SELECT query and return a single row."""
+    """Execute a SELECT query and return a single row.
+
+    底层 get_project_db_for_agent 失败时 raise ProjectDbError，由调用方处理。
+    """
     conn = await get_project_db_for_agent(agent_id)
-    if conn is None:
-        raise ValueError(f"No project DB found for agent {agent_id}")
     cursor = await conn.execute(sql, params or [])
     row = await cursor.fetchone()
     await cursor.close()
@@ -254,9 +291,10 @@ async def query_one(
 async def execute(
     agent_id: str, sql: str, params: list[Any] | None = None
 ) -> None:
-    """Execute an INSERT/UPDATE/DELETE on the per-project DB for an agent."""
+    """Execute an INSERT/UPDATE/DELETE on the per-project DB for an agent.
+
+    底层 get_project_db_for_agent 失败时 raise ProjectDbError，由调用方处理。
+    """
     conn = await get_project_db_for_agent(agent_id)
-    if conn is None:
-        raise ValueError(f"No project DB found for agent {agent_id}")
     await conn.execute(sql, params or [])
     await conn.commit()

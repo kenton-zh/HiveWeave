@@ -56,7 +56,9 @@ cp apps/hiveweave-py/.env.example apps/hiveweave-py/.env
 # 3. Backend (Python/FastAPI, port 4000)
 cd apps/hiveweave-py
 uv sync
-uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000
+uvicorn hiveweave.main:app --host 127.0.0.1 --port 4000
+# NOTE: --host 127.0.0.1 binds to loopback only (safe default).
+# For LAN access, explicitly set --host 0.0.0.0 AND set HIVEWEAVE_API_KEY.
 
 # 4. Frontend (React/Vite, port 5173) — in a new terminal
 cd apps/web
@@ -127,7 +129,7 @@ Four-Layer Review Gate:
 
 | Layer | Stack | Notes |
 |:---|------|------|
-| Backend | Python 3.12 + FastAPI + Uvicorn | Port 4000, 96 routes, 19 API modules |
+| Backend | Python 3.12 + FastAPI + Uvicorn | Port 4000, 122 routes, 16 API modules |
 | Frontend | React 19 + Vite + React Flow + Zustand | Port 5173, Electron desktop support |
 | Database | SQLite + aiosqlite | Dual-DB: Meta DB (WAL) + Per-project DB |
 | AI/LLM | httpx SSE streaming + Provider Factory | OpenAI, Anthropic, DeepSeek, Groq, Google |
@@ -143,10 +145,10 @@ hiveweave/
 │   ├── hiveweave-py/                  # Backend — Python/FastAPI (port 4000)
 │   │   └── src/hiveweave/
 │   │       ├── agents/                # Agent lifecycle + Supervisor + trigger
-│   │       ├── api/                   # 19 FastAPI router modules, 96 routes
+│   │       ├── api/                   # 16 FastAPI router modules, 122 routes
 │   │       ├── llm/                   # Streamer, provider factory, retry, circuit_breaker
 │   │       ├── services/              # 23 services (org, dispatch, memory, handoff, MCP, ...)
-│   │       ├── tools/                 # 11 built-in tools (bash, file, grep, patch, review, ...)
+│   │       ├── tools/                 # 74 built-in tools (bash, file, grep, patch, review, ...)
 │   │       ├── conversation/          # Token budget, compaction, conversation store
 │   │       ├── db/                    # Meta DB + Per-project DB (aiosqlite)
 │   │       ├── realtime/              # phoenix_adapter, channels, pubsub, event_bus
@@ -190,11 +192,11 @@ hiveweave/
 | **Handoff inheritance** | When an agent is dismissed, their memory is summarized and transferred to a successor. No knowledge loss. |
 | **Expert on-demand** | When the team hits a wall, CEO summons an Expert agent (most expensive model). Team-refined questions → better answers per dollar. Only burns expert tokens when truly needed. |
 | **Asyncio task isolation** | Each agent runs in its own asyncio task. Crash doesn't crash the system. Circuit breaker + exponential backoff for LLM outages. |
-| **Game time scheduling** | 15 real minutes = 1 game day. Stalled agents auto-escalate to superiors. Timed alarms on simulated clock. |
-| **Dual-DB pattern** | Meta DB (WAL, global) + Per-project DB (DELETE journal, isolated). Agents never cross-contaminate data. |
+| **Game time scheduling** | 1 real hour = 1 game day. Stalled agents: 10min stall → nudge, ~40min+ → escalate to superiors. Timed alarms on simulated clock. |
+| **Dual-DB pattern** | Meta DB (WAL, global) + Per-project DB (WAL, isolated). Agents never cross-contaminate data. |
 | **MCP protocol** | Tool extension via Model Context Protocol. Bind MCP servers per agent — different agents get different external tools. |
-| **ClawHub marketplace** | Remote skill marketplace. HR searches and binds skills dynamically. No hardcoded skill lists. |
-| **30+ built-in tools** | bash, grep, file ops, patch, websearch, question, todowrite, review (5-axis), security audit, MCP tools. Permission-gated per role type. |
+| **skills.sh marketplace** | Remote skill marketplace. HR searches and binds skills dynamically. No hardcoded skill lists. |
+| **74 built-in tools** | bash, grep, file ops, patch, websearch, question, todowrite, review (5-axis), security audit, MCP tools. Permission-gated per role type. |
 
 ## Documentation
 

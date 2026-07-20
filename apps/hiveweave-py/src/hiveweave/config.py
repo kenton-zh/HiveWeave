@@ -6,7 +6,9 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Server
-    host: str = "0.0.0.0"
+    # Security: 默认仅监听 loopback，避免暴露可执行 bash 的 Agent 平台到局域网。
+    # 需要外部访问时显式设置 HIVEWEAVE_HOST=0.0.0.0 并配合 HIVEWEAVE_API_KEY。
+    host: str = "127.0.0.1"
     port: int = 4000  # 契约 constants.md: 前端兼容性，端口 4000
 
     # Meta DB
@@ -69,7 +71,7 @@ settings = Settings()
 def resolve_browse_bin() -> Path | None:
     """Locate the gstack browse CLI binary.
 
-    Order: HIVEWEAVE_BROWSE_BIN → common Claude skills installs → D:\\PC_AI\\Project\\gstack.
+    Order: HIVEWEAVE_BROWSE_BIN → common Claude skills installs.
     """
     if settings.browse_bin:
         p = Path(settings.browse_bin).expanduser()
@@ -80,8 +82,6 @@ def resolve_browse_bin() -> Path | None:
     candidates = [
         home / ".claude" / "skills" / "gstack" / "browse" / "dist" / "browse.exe",
         home / ".claude" / "skills" / "gstack" / "browse" / "dist" / "browse",
-        Path(r"D:\PC_AI\Project\gstack\browse\dist\browse.exe"),
-        Path(r"D:\PC_AI\Project\gstack\browse\dist\browse"),
         home / ".claude" / "skills" / "browse" / "dist" / "browse.exe",
         home / ".claude" / "skills" / "browse" / "dist" / "browse",
     ]
@@ -89,3 +89,31 @@ def resolve_browse_bin() -> Path | None:
         if c.is_file():
             return c
     return None
+
+
+def warn_if_insecure(host: str, api_key: str) -> None:
+    """启动时检测不安全配置并打醒目警告。
+
+    - 无 API key 且监听非 loopback 接口：高危（任何人可调 bash）→ WARNING
+    - 无 API key 但仅 loopback：dev 友好但生产需 key → 提示性 WARNING
+    """
+    import logging
+
+    log = logging.getLogger("hiveweave.security")
+    # 0.0.0.0 在 Windows 上等价于 127.0.0.1（仅监听 loopback），
+    # 但在 Linux/macOS 上会监听所有接口 — 视为非 loopback 以保守告警。
+    is_loopback = host in ("127.0.0.1", "localhost", "::1")
+    if not api_key and not is_loopback:
+        log.warning(
+            "!! SECURITY WARNING !! "
+            "HIVEWEAVE_API_KEY is empty and host=%s is not loopback. "
+            "Anyone on the network can operate this Agent platform (which can execute bash). "
+            "Set HIVEWEAVE_API_KEY or bind to 127.0.0.1.",
+            host,
+        )
+    elif not api_key:
+        log.warning(
+            "HIVEWEAVE_API_KEY is empty (open access). "
+            "Safe only on loopback host=%s. Set HIVEWEAVE_API_KEY for production.",
+            host,
+        )

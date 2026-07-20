@@ -47,7 +47,7 @@ class TestEvictProjectDb:
     """evict_project_db 标记 workspace 后，后续 DB 访问被拒绝."""
 
     async def test_evict_blocks_ensure_project_db(self, temp_workspace: Path):
-        """evict 后 ensure_project_db 返回 None 而非创建新连接."""
+        """evict 后 ensure_project_db raise ProjectDbError 而非创建新连接."""
         # 先正常创建连接
         conn = await project_db.ensure_project_db(str(temp_workspace))
         assert conn is not None
@@ -55,12 +55,12 @@ class TestEvictProjectDb:
         # 驱逐
         await project_db.evict_project_db(str(temp_workspace))
 
-        # 再次调用返回 None（不重连）
-        result = await project_db.ensure_project_db(str(temp_workspace))
-        assert result is None
+        # 再次调用 raise ProjectDbError（不重连）
+        with pytest.raises(project_db.ProjectDbError):
+            await project_db.ensure_project_db(str(temp_workspace))
 
     async def test_evict_blocks_get_project_db_for_agent(self, temp_workspace: Path):
-        """evict 后 get_project_db_for_agent 返回 None."""
+        """evict 后 get_project_db_for_agent raise ProjectDbError."""
         ws_str = str(temp_workspace.resolve())
 
         # 模拟 agent 已缓存到该 workspace
@@ -70,16 +70,17 @@ class TestEvictProjectDb:
         await project_db.evict_project_db(str(temp_workspace))
 
         # agent 缓存还在（evict 只清 _cache 和 _evicted_workspaces），
-        # 但 get_project_db_for_agent 检查 _evicted_workspaces 返回 None
-        result = await project_db.get_project_db_for_agent("test-agent-001")
-        assert result is None
+        # 但 get_project_db_for_agent 检查 _evicted_workspaces 后 raise ProjectDbError
+        with pytest.raises(project_db.ProjectDbError):
+            await project_db.get_project_db_for_agent("test-agent-001")
 
     async def test_clear_evicted_workspace_restores_access(
         self, temp_workspace: Path
     ):
         """clear_evicted_workspace 清除标记后，DB 访问恢复."""
         await project_db.evict_project_db(str(temp_workspace))
-        assert await project_db.ensure_project_db(str(temp_workspace)) is None
+        with pytest.raises(project_db.ProjectDbError):
+            await project_db.ensure_project_db(str(temp_workspace))
 
         # 清除标记
         project_db.clear_evicted_workspace(str(temp_workspace))
@@ -91,7 +92,6 @@ class TestEvictProjectDb:
     async def test_evict_closes_existing_connection(self, temp_workspace: Path):
         """evict 关闭缓存中的现有连接."""
         conn = await project_db.ensure_project_db(str(temp_workspace))
-        assert conn is not None
         ws_str = str(temp_workspace.resolve())
         assert ws_str in project_db._cache
 

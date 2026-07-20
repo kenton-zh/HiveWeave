@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import random
 from enum import Enum
 from typing import Any, Awaitable, Callable
 
@@ -86,26 +87,26 @@ CONTEXT_WINDOW_DEFAULT = 128_000
 """默认 context window（模型配置缺失时）。"""
 
 # ── 工具描述 ────────────────────────────────────────────────
-# PermissionService 返回工具名列表，_build_tool_definitions 从
-# hiveweave.tools.executor.TOOL_PARAM_SCHEMAS 取参数 schema。
-# 本模块不再维护工具 schema 副本 (历史 _TOOL_SCHEMAS 已删除 — 存在
-# 两份副本导致改一处忘改另一处, hire_agent permissionType 就是因此漏改)。
+# PermissionService 返回工具名列表；_build_tool_definitions 经
+# get_tool_schema_for_llm / get_tool_description 取 schema：
+# 优先 TOOL_PARAM_SCHEMAS，否则回退 @tool 注册表（防空 schema）。
 
 
 def _build_tool_definitions(tool_names: list[str]) -> list[dict]:
     """将工具名列表转为 LLM 工具定义。
 
-    从 hiveweave.tools.executor.TOOL_PARAM_SCHEMAS 取参数 schema（让 LLM
-    看到可用参数，如 hire_agent 的 parentId/permissionType）。未列出的工具
-    用 permissive schema（additionalProperties: true），实际参数校验由
-    ToolExecutor 执行。
+    Schema 来自 executor.get_tool_schema_for_llm：优先手写 TOOL_PARAM_SCHEMAS，
+    否则回退 @tool 注册表的 Pydantic 模型（避免 waive_attestation 等空 schema）。
     """
     tools: list[dict] = []
     for name in tool_names:
-        # Use centralized schema from executor for BOTH description and params
-        from hiveweave.tools.executor import get_tool_schema_for_llm, TOOL_PARAM_SCHEMAS
+        from hiveweave.tools.executor import (
+            get_tool_description,
+            get_tool_schema_for_llm,
+        )
+
         params = get_tool_schema_for_llm(name)
-        desc = TOOL_PARAM_SCHEMAS.get(name, {}).get("description") or f"Execute the {name} tool."
+        desc = get_tool_description(name)
         tools.append(
             {
                 "type": "function",
@@ -197,11 +198,19 @@ class Agent:
         self._resume_cooldown_until: float = 0.0  # monotonic deadline；超时后防 doom loop
         self._consecutive_errors: int = 0  # 连续错误次数，超过阈值后停止 resume
         self._CONSECUTIVE_ERROR_MAX = 3   # 连续错误上限，超过后 ACK inbox 不再 resume
+        # Give-up latch: block non-user wakes until user / task unlock / decay
+        self._resume_suppressed: bool = False
+        self._resume_suppressed_at: float = 0.0  # monotonic when latch armed
+        self._RESUME_SUPPRESS_DECAY_S = 30 * 60  # 30 min auto-unlock
+        # Ephemeral resume hint — injected once into next _build_messages, not history
+        self._pending_resume_hint: str | None = None
         self.disposition: str = "runnable"  # waiting_human|blocked|complete|…
         self._slice_budget: int = 0  # remaining auto-slices for this external wake
         self._SLICE_BUDGET_MAX = 2
         self._progress_fingerprint: str | None = None
         self._no_progress_streak: int = 0
+        self._empty_done_slice_streak: int = 0
+        self._stream_timeout_streak: int = 0
         self.visibility: str = "foreground"  # foreground|background|system
         self._MERGE_WINDOW_MS = 300  # P1: coalesce trigger wakes
 
@@ -267,7 +276,25 @@ class Agent:
         await asyncio.sleep(1.0)
         while not self._stop_watcher:
             try:
+                # 仅当明确 is_started=0 时跳过；查不到项目则 fail-open 继续轮询
+                try:
+                    from hiveweave.services.project_lifecycle import (
+                        project_known_off_duty,
+                    )
+
+                    if await project_known_off_duty(self.project_id):
+                        await asyncio.sleep(INTERVAL_S)
+                        continue
+                except Exception:
+                    pass
                 if self.status == AgentState.IDLE:
+                    if self._resume_suppressed:
+                        log.debug(
+                            "inbox_watcher_suppressed_skip",
+                            agent_id=self.id,
+                        )
+                        await asyncio.sleep(INTERVAL_S)
+                        continue
                     if self._in_resume_cooldown():
                         log.debug(
                             "inbox_watcher_cooldown_skip",
@@ -371,6 +398,61 @@ class Agent:
         )
         log.info("inbox_watcher_started", agent_id=self.id)
 
+    def _arm_resume_suppressed(self) -> None:
+        """Arm give-up latch (blocks non-user/non-task wakes until decay)."""
+        self._resume_suppressed = True
+        self._resume_suppressed_at = time.monotonic()
+
+    def _clear_resume_suppressed(self, *, reason: str = "ok") -> None:
+        if not getattr(self, "_resume_suppressed", False):
+            return
+        self._resume_suppressed = False
+        self._resume_suppressed_at = 0.0
+        log.info(
+            "resume_suppressed_cleared",
+            agent_id=self.id,
+            by=reason,
+        )
+
+    def try_clear_resume_suppressed(self, opts: dict | None = None) -> bool:
+        """Clear latch if user/task wake or 30min decay. Return True if still blocked."""
+        if not getattr(self, "_resume_suppressed", False):
+            return False
+        opts = opts or {}
+        is_user_wake = not bool(opts.get("trigger"))
+        source = opts.get("source") or ""
+        is_task_wake = (
+            source
+            in (
+                "task",
+                "dispatch",
+                "task_transition",
+                "inbox_task",
+                "verify",
+            )
+            or bool(opts.get("task_id"))
+            or opts.get("message_type") == "task"
+        )
+        suppressed_at = float(getattr(self, "_resume_suppressed_at", 0.0) or 0.0)
+        decay_s = float(
+            getattr(self, "_RESUME_SUPPRESS_DECAY_S", 30 * 60) or (30 * 60)
+        )
+        aged = (
+            time.monotonic() - suppressed_at >= decay_s if suppressed_at else False
+        )
+        if is_user_wake or is_task_wake or aged:
+            self._clear_resume_suppressed(
+                reason=(
+                    "user"
+                    if is_user_wake
+                    else "task"
+                    if is_task_wake
+                    else "decay"
+                )
+            )
+            return False
+        return True
+
     # ── 公共 API ─────────────────────────────────────────────
 
     async def chat(self, message: str, opts: dict | None = None) -> dict:
@@ -435,6 +517,44 @@ class Agent:
             )
             if not _proj or not dict(_proj).get("is_started"):
                 return {"error": "project_not_started"}
+
+            # Give-up latch: user / task-class wakes unlock; else 30min decay
+            if self.try_clear_resume_suppressed(opts):
+                log.info(
+                    "wake_suppressed_gave_up",
+                    agent_id=self.id,
+                    source=(opts or {}).get("source") or "trigger",
+                )
+                return {"ok": True, "suppressed": True}
+
+            # Complete + non-user trigger: skip LLM (TEST4 done_slice churn)
+            # User chat uses trigger=False; task wakes set wake_category /
+            # source=task (must match wake_policy.should_wake complete branch).
+            if self.disposition == "complete" and (opts or {}).get("trigger"):
+                o = opts or {}
+                wake_cat = o.get("wake_category") or ""
+                source = o.get("source") or ""
+                is_task_wake = (
+                    wake_cat == "task_transition"
+                    or source
+                    in (
+                        "task",
+                        "dispatch",
+                        "task_transition",
+                        "inbox_task",
+                        "verify",
+                    )
+                    or o.get("message_type") == "task"
+                    or bool(o.get("task_id"))
+                )
+                if not is_task_wake and not o.get("from_user"):
+                    log.info(
+                        "chat_complete_skip_trigger",
+                        agent_id=self.id,
+                        source=source,
+                        wake_category=wake_cat,
+                    )
+                    return {"ok": True, "skipped": "complete"}
 
             # 设置状态
             self.status = AgentState.PROCESSING
@@ -535,12 +655,20 @@ class Agent:
 
             return {"ok": True}
 
-    async def cancel(self) -> None:
+    async def cancel(self, *, reason: str = "cancelled") -> None:
         """取消当前处理。
 
         对齐 Elixir agent.ex:131 handle_cast(:cancel)。
+        reason=off_duty：下班停机 — 不 ACK pending inbox（已由 park 处理），
+        streaming 文案区分于普通中断。
         """
-        self._cancel_reason = "cancelled"
+        from hiveweave.services.project_lifecycle import (
+            OFF_DUTY_CANCEL_REASON,
+            OFF_DUTY_STREAM_CONTENT,
+        )
+
+        self._cancel_reason = reason
+        is_off_duty = reason == OFF_DUTY_CANCEL_REASON
         self._cancel_safety_timer()
 
         if self._llm_task and not self._llm_task.done():
@@ -568,8 +696,9 @@ class Agent:
 
         # 确保状态重置
         if self.status == AgentState.PROCESSING:
-            # BUG-010 修复：cancel 时也标记 inbox 已读，避免 watcher 无限重试
-            if self.pending_inbox_msg_ids:
+            # 普通 cancel：ACK pending，避免 watcher 死循环。
+            # 下班：保留未读（已 park），复工 briefing 会合并唤醒。
+            if self.pending_inbox_msg_ids and not is_off_duty:
                 try:
                     await self._inbox.mark_read_by_ids(
                         self.id, self.pending_inbox_msg_ids
@@ -581,14 +710,24 @@ class Agent:
                     log.warning("cancel_mark_inbox_read_failed",
                                 agent_id=self.id, error=str(e))
                 self.pending_inbox_msg_ids = None
+            elif is_off_duty:
+                self.pending_inbox_msg_ids = None
             # A6(2) 修复：cancel 时清理 streaming 标志，防止僵尸消息
             try:
                 await self._finalize_streaming_turn(
-                    content="[对话被中断]",
+                    content=(
+                        OFF_DUTY_STREAM_CONTENT
+                        if is_off_duty
+                        else "[对话被中断]"
+                    ),
                 )
             except Exception as e:
                 log.warning("cancel_clear_streaming_failed",
                             agent_id=self.id, error=str(e))
+            self._reset_to_idle()
+        elif is_off_duty:
+            # idle：只清悬挂状态，不强行写「被中断」气泡
+            self.pending_inbox_msg_ids = None
             self._reset_to_idle()
 
     async def trigger(self, trigger_type: str = "subordinate") -> dict:
@@ -789,6 +928,12 @@ class Agent:
             )
         messages.append({"role": "user", "content": user_content})
 
+        # 5b. Ephemeral RESUME CHECKPOINT — once per interrupt, not into history
+        hint = self._pending_resume_hint
+        if hint:
+            messages.append({"role": "user", "content": hint})
+            self._pending_resume_hint = None
+
         return messages
 
     def _get_identity_prompt(self) -> str:
@@ -873,7 +1018,7 @@ class Agent:
 
         context = build_context_prompt(
             agent_id=self.id,
-            memories=memory_text or "",
+            memories=None,  # memory_text 单独传（见下），不走 memories list
             handoffs=handoffs,
             goals=goals,
             involvement_level=involvement,
@@ -1266,6 +1411,17 @@ class Agent:
                     violations=exit_decision.violations,
                     disposition=self.disposition,
                 )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.turn_exit_gate(
+                        self.id,
+                        exit_decision.violations,
+                        "park",
+                        gate_round=self._turn_gate_count,
+                    )
+                except Exception:
+                    pass
                 if self.pending_inbox_msg_ids and not unreplied_asks:
                     await self._inbox.mark_read_by_ids(
                         self.id, self.pending_inbox_msg_ids
@@ -1293,6 +1449,17 @@ class Agent:
                     violations=exit_decision.violations,
                     gate_round=self._turn_gate_count,
                 )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.turn_exit_gate(
+                        self.id,
+                        exit_decision.violations,
+                        "repair",
+                        gate_round=self._turn_gate_count,
+                    )
+                except Exception:
+                    pass
                 # Do not clear pending_inbox_msg_ids yet — carried into opts
             else:
                 if unreplied_asks:
@@ -1310,6 +1477,17 @@ class Agent:
                     agent_id=self.id,
                     violations=exit_decision.violations,
                 )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.turn_exit_gate(
+                        self.id,
+                        exit_decision.violations,
+                        "exhausted",
+                        gate_round=self._turn_gate_count,
+                    )
+                except Exception:
+                    pass
                 self.pending_inbox_msg_ids = None
         else:
             if self.pending_inbox_msg_ids:
@@ -1322,6 +1500,19 @@ class Agent:
             self._task_reminder_count = 0
             pop_pending_turn_result(self.id)
             self.disposition = exit_decision.disposition or "runnable"
+
+            # Empty done_slice streak — consecutive hollow exits park hard (TEST4)
+            phase = (
+                exit_decision.turn_result.phase
+                if exit_decision.turn_result
+                else None
+            )
+            if phase == "done_slice" and self._is_empty_done_slice_turn(
+                tool_calls
+            ):
+                self._empty_done_slice_streak += 1
+            else:
+                self._empty_done_slice_streak = 0
 
             # P1: persist / clear Wait Contracts from accepted TurnResult
             try:
@@ -1364,14 +1555,18 @@ class Agent:
                     )
                 except Exception:
                     pass
+            elif self._empty_done_slice_streak >= 2:
+                # Two hollow done_slices → stay complete, no auto-resume
+                self.disposition = "complete"
+                continue_slice = False
+                log.info(
+                    "empty_done_slice_parked",
+                    agent_id=self.id,
+                    streak=self._empty_done_slice_streak,
+                )
             else:
                 # At most one more slice if obligations remain AND fingerprint moved
                 # and phase was in_progress (declaration only — scheduler decides)
-                phase = (
-                    exit_decision.turn_result.phase
-                    if exit_decision.turn_result
-                    else None
-                )
                 if (
                     phase == "in_progress"
                     and open_obligations
@@ -1384,19 +1579,29 @@ class Agent:
             log.info(
                 "turn_exit_ok",
                 agent_id=self.id,
-                phase=(
-                    exit_decision.turn_result.phase
-                    if exit_decision.turn_result
-                    else None
-                ),
+                phase=phase,
                 disposition=self.disposition,
                 continue_slice=continue_slice,
                 slice_budget=self._slice_budget,
+                empty_done_slice_streak=self._empty_done_slice_streak,
             )
+            try:
+                from hiveweave.services.telemetry import telemetry
 
-        # 成功完成 → 清除 resume 冷却 + 重置连续错误计数
+                telemetry.turn_exit_gate(
+                    self.id,
+                    [],
+                    "ok",
+                    gate_round=self._turn_gate_count,
+                )
+            except Exception:
+                pass
+
+        # 成功完成 → 清除 resume 冷却 + 重置连续错误计数 + 解除 give-up latch
         self._resume_cooldown_until = 0.0
         self._consecutive_errors = 0
+        self._stream_timeout_streak = 0
+        self._clear_resume_suppressed(reason="turn_ok")
 
         # 3.5 持久化裁剪旧工具输出（OpenCode prune 模式）
         try:
@@ -1404,9 +1609,9 @@ class Agent:
         except Exception as e:
             log.warning("prune_persisted_failed", agent_id=self.id, error=str(e))
 
-        # 4. 状态 → idle (先取消 safety timer，再 reset)
+        # 4. 状态 → idle (先取消 safety timer，再 reset；残留 streaming 再 finalize 一次)
         self._cancel_safety_timer()
-        self._reset_to_idle()
+        await self._go_idle()
 
         # 5. 发送 done 事件（前端 streamChat 等待此事件停止 loading）
         self._broadcast_stream_event({
@@ -1461,6 +1666,26 @@ class Agent:
         parts.append(f"adv={','.join(sorted(tasks_advanced))}")
         parts.append(f"replied={int(replied)}")
         return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+    @staticmethod
+    def _is_empty_done_slice_turn(tool_calls: list) -> bool:
+        """True when the turn only had commit_turn (or no tools) — hollow exit."""
+        substantive = {
+            "submit_task", "review_task", "claim_task", "create_task",
+            "hire_agent", "write_file", "edit_file", "bash", "apply_patch",
+            "git_worktree_merge", "ask_agent", "send_message", "approve_work",
+            "reject_work", "dispatch_task",
+        }
+        names: set[str] = set()
+        for tc in tool_calls or []:
+            if not isinstance(tc, dict):
+                continue
+            n = (tc.get("function") or {}).get("name") or tc.get("name") or ""
+            if n:
+                names.add(n)
+        if not names:
+            return True
+        return not (names & substantive)
 
     async def _retrigger_for_turn_gate(
         self, hint: str, *, inbox_msg_ids: list[str] | None = None
@@ -1679,7 +1904,27 @@ class Agent:
 
         # 连续错误计数 — 超过阈值后 ACK inbox，不再 resume
         self._consecutive_errors += 1
+        is_total_timeout = (
+            "请求总超时" in error_msg
+            or "total timeout" in error_msg.lower()
+            or "stream_total_timeout" in error_msg.lower()
+        )
+        if is_total_timeout:
+            self._stream_timeout_streak += 1
+        else:
+            self._stream_timeout_streak = 0
+
         inbox_ids = list(self.pending_inbox_msg_ids or [])
+
+        # TEST4: ≥2 consecutive stream total timeouts → park waiting + escalate
+        if is_total_timeout and self._stream_timeout_streak >= 2:
+            await self._park_after_stream_timeouts(
+                inbox_ids=inbox_ids, error_msg=error_msg
+            )
+            self._cancel_safety_timer()
+            await self._go_idle()
+            return
+
         if inbox_ids and self._consecutive_errors <= self._CONSECUTIVE_ERROR_MAX:
             # 未超阈值: 保留未读，冷却后 resume
             await self._write_resume_checkpoint(
@@ -1697,6 +1942,7 @@ class Agent:
             )
         elif inbox_ids and self._consecutive_errors > self._CONSECUTIVE_ERROR_MAX:
             # 超过阈值: ACK inbox，停止 resume 循环 + 升级上级一次
+            self._arm_resume_suppressed()
             try:
                 await self._inbox.mark_read_by_ids(self.id, inbox_ids)
                 log.warning(
@@ -1709,9 +1955,114 @@ class Agent:
                 log.error("inbox_ack_failed", agent_id=self.id, error=str(ack_err))
             self.pending_inbox_msg_ids = None
             await self._escalate_turn_interruption(reason=f"llm_error:{error_type}")
+        elif self._consecutive_errors > self._CONSECUTIVE_ERROR_MAX:
+            self._arm_resume_suppressed()
 
         self._cancel_safety_timer()
-        self._reset_to_idle()
+        await self._go_idle()
+
+    async def _park_after_stream_timeouts(
+        self, *, inbox_ids: list[str], error_msg: str
+    ) -> None:
+        """After consecutive stream total timeouts: park waiting + wake parent.
+
+        Does not auto-approve. Structured escalation lists pending submitted
+        tasks so the superior can review/merge (TEST4 tech-lead SPOF).
+        """
+        from hiveweave.services.turn_result import WaitingOnItem
+        from hiveweave.services.wait_contract import wait_contract_service
+
+        self.disposition = "waiting_agent"
+        self._arm_resume_suppressed()
+        self._stream_timeout_streak = 0
+
+        pending_task_ids: list[str] = []
+        try:
+            from hiveweave.services.task import TaskService
+
+            tasks = await TaskService().list_tasks(self.project_id)
+            for t in tasks or []:
+                if t.get("status") not in ("submitted", "reviewing"):
+                    continue
+                # Creator or any coordinator reviewing — include if we own review
+                if (
+                    t.get("created_by") == self.id
+                    or t.get("creator_id") == self.id
+                    or t.get("reviewer_id") == self.id
+                ):
+                    pending_task_ids.append(str(t.get("id") or "")[:12])
+        except Exception as e:
+            log.warning(
+                "stream_timeout_park_tasks_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+
+        try:
+            await wait_contract_service.replace_waits(
+                self.project_id,
+                self.id,
+                [
+                    WaitingOnItem(
+                        kind="timer",
+                        ref="stream_total_timeout_recovery",
+                        note="Parked after consecutive stream total timeouts",
+                    )
+                ],
+                phase="waiting",
+            )
+        except Exception as e:
+            log.warning(
+                "stream_timeout_wait_persist_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+
+        if inbox_ids:
+            try:
+                await self._inbox.mark_read_by_ids(self.id, inbox_ids)
+            except Exception:
+                pass
+        self.pending_inbox_msg_ids = None
+
+        agent_name = self.config.get("name", self.id)
+        task_blob = ", ".join(pending_task_ids) or "(none listed)"
+        try:
+            superior = await self._org.get_superior(self.id)
+            if superior:
+                await self._inbox.send_message(
+                    from_agent_id=self.id,
+                    to_agent_id=superior["id"],
+                    message=(
+                        f"[tech_lead_incapacitated] {agent_name} hit consecutive "
+                        f"stream total timeouts and is parked waiting. "
+                        f"Pending review taskIds: {task_blob}. "
+                        f"Please review/merge if appropriate (do not assume "
+                        f"auto-approve). Last error: {error_msg[:120]}"
+                    ),
+                    message_type="escalation",
+                    priority="urgent",
+                )
+                from hiveweave.agents.trigger import trigger_coordinator
+
+                await trigger_coordinator(superior["id"])
+                log.warning(
+                    "stream_timeout_parked_escalated",
+                    agent_id=self.id,
+                    superior_id=superior["id"],
+                    pending_tasks=pending_task_ids,
+                )
+            else:
+                log.warning(
+                    "stream_timeout_parked_no_superior",
+                    agent_id=self.id,
+                )
+        except Exception as e:
+            log.error(
+                "stream_timeout_escalate_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
 
     # ── 内部: thinking 心跳 ──────────────────────────────────
 
@@ -1838,6 +2189,7 @@ class Agent:
             self._arm_resume_cooldown(TIMEOUT_RESUME_COOLDOWN_S)
         else:
             # 超阈值放弃: ACK inbox 停止 resume 循环，升级上级一次
+            self._arm_resume_suppressed()
             if inbox_ids:
                 try:
                     await self._inbox.mark_read_by_ids(self.id, inbox_ids)
@@ -1865,7 +2217,7 @@ class Agent:
         self.pending_inbox_msg_ids = None
 
         self._cancel_safety_timer()
-        self._reset_to_idle()
+        await self._go_idle()
 
         # 广播健康事件 — LLM 调用 10 分钟安全超时 → health="error"
         self._broadcast_agent_health(
@@ -2295,6 +2647,14 @@ class Agent:
         """
         await asyncio.sleep(SELF_RETRIGGER_DELAY_MS / 1000.0)
 
+        if self._resume_suppressed:
+            log.info("self_retrigger_suppressed_skip", agent_id=self.id)
+            return
+
+        if self.disposition == "complete":
+            log.info("self_retrigger_complete_skip", agent_id=self.id)
+            return
+
         if self._in_resume_cooldown():
             log.info(
                 "self_retrigger_cooldown_skip",
@@ -2338,16 +2698,26 @@ class Agent:
         return time.monotonic() < self._resume_cooldown_until
 
     def _arm_resume_cooldown(self, seconds: float) -> None:
-        """Arm cooldown so inbox watcher won't immediately re-fire."""
-        self._resume_cooldown_until = time.monotonic() + max(0.0, seconds)
+        """Arm cooldown so inbox watcher won't immediately re-fire.
+
+        Adds ±25% jitter so concurrent agents don't resurrect in lockstep
+        and stampede the LLM semaphore (TEST3 timeout storms).
+        """
+        base = max(0.0, seconds)
+        if base > 0:
+            jitter = base * 0.25
+            base = base + random.uniform(-jitter, jitter)
+            base = max(1.0, base)
+        self._resume_cooldown_until = time.monotonic() + base
 
     async def _write_resume_checkpoint(
         self, *, reason: str, inbox_ids: list[str]
     ) -> None:
-        """Persist a structured resume hint into conversation + work_log.
+        """Store an ephemeral resume hint for the next LLM turn only.
 
-        Next successful trigger loads conversation history, so the agent can
-        continue unfinished work instead of treating the obligation as gone.
+        Does **not** append into conversation history (avoids checkpoint bloat).
+        Next ``_build_messages`` injects the hint once, then clears it.
+        Work_log retains an ops trail.
         """
         now_ms = int(time.time() * 1000)
         ids_preview = ", ".join(inbox_ids[:8]) if inbox_ids else "(none)"
@@ -2364,18 +2734,7 @@ class Agent:
             "claim_task or update_task_status again — just continue coding "
             "and call submit_task when done."
         )
-        try:
-            await self._conversation.append_turn(
-                self.id,
-                self.project_id,
-                [{"role": "user", "content": checkpoint}],
-            )
-        except Exception as e:
-            log.warning(
-                "resume_checkpoint_persist_failed",
-                agent_id=self.id,
-                error=str(e),
-            )
+        self._pending_resume_hint = checkpoint
         try:
             await self._work_log.write_work_log(
                 self.project_id,
@@ -2389,8 +2748,35 @@ class Agent:
                     "resume": True,
                 },
             )
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(
+                "resume_checkpoint_work_log_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+
+    async def _go_idle(self) -> None:
+        """Finalize any leftover streaming placeholder, then reset to idle."""
+        if self._streaming_msg_id:
+            try:
+                await self._finalize_streaming_turn(
+                    allow_agent_wide_fallback=True
+                )
+            except Exception as e:
+                log.warning(
+                    "go_idle_finalize_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
+        try:
+            await self._org.touch_last_active(self.id)
+        except Exception as e:
+            log.warning(
+                "touch_last_active_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+        self._reset_to_idle()
 
     # ── 内部: 状态管理 ────────────────────────────────────────
 
@@ -2399,6 +2785,13 @@ class Agent:
     ) -> dict:
         """Enqueue a wake while busy (P1 single-flight). Does not start LLM."""
         opts = opts or {}
+        if self.try_clear_resume_suppressed(opts) and opts.get("trigger"):
+            log.info(
+                "enqueue_wake_suppressed_gave_up",
+                agent_id=self.id,
+                source=opts.get("source") or "trigger",
+            )
+            return {"ok": True, "suppressed": True}
         async with self._lock:
             # 与 chat() 同理：busy 期间的 trigger wake 也算一次激活信号
             self._ensure_watcher_alive()
@@ -2632,6 +3025,7 @@ class Agent:
             tool_args = {}
 
         workspace = await self._get_workspace_path()
+        project_ws = await meta_db.get_project_workspace(self.project_id) or workspace
 
         # 工具调用开始 → 停止心跳（agent 已进入工具执行阶段）
         self._stop_heartbeat()
@@ -2652,6 +3046,7 @@ class Agent:
             tool_name=tool_name,
             tool_args=tool_args,
             workspace_path=workspace,
+            project_root=project_ws,
         )
 
         # 转换格式

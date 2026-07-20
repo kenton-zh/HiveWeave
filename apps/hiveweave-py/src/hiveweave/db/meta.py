@@ -249,9 +249,10 @@ async def get_agent_by_id(agent_id: str) -> dict | None:
         return None
 
     # Step 3: Open per-project DB and query agents table
-    from hiveweave.db.project import ensure_project_db
-    conn = await ensure_project_db(workspace_path)
-    if conn is None:
+    from hiveweave.db.project import ensure_project_db, ProjectDbError
+    try:
+        conn = await ensure_project_db(workspace_path)
+    except ProjectDbError:
         return None
 
     cursor = await conn.execute(

@@ -42,6 +42,25 @@ CHAT_CALL_TIMEOUT_MS = 30_000
 SELF_RETRIGGER_DELAY_MS = 500
 """自检 retrigger 前的延迟（对齐 Elixir agent.ex:900 Process.sleep(500)）。"""
 
+# Background wake=0 messages that must still fire coordinator review (TEST3).
+_TASK_GATE_PREFIXES = (
+    "[TASK SUBMITTED]",
+    "[REWORK REQUESTED]",
+    "[TASK APPROVED]",
+    "[POST-MERGE VERIFY]",
+)
+
+
+def _has_task_gate_messages(messages: list[dict] | None) -> bool:
+    """True if any message is a task-ledger gate that needs a coordinator turn."""
+    for m in messages or []:
+        text = (m.get("message") or "").lstrip()
+        if any(text.startswith(p) for p in _TASK_GATE_PREFIXES):
+            return True
+        if (m.get("message_type") or "").lower() == "task" and m.get("task_id"):
+            return True
+    return False
+
 # ── 模块级服务实例 ──────────────────────────────────────────
 
 _org_service = OrgService()
@@ -158,14 +177,25 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
             return
 
         # 4. coordinator：检查是否有 pending inbox 消息
+        # Also proceed when undelivered background holds task-gate notices
+        # (historical wake=0 TASK SUBMITTED / REWORK — TEST3 Phase C starve).
         if trigger_type == "coordinator":
             pending = await _inbox_service.get_pending_messages(agent_id)
             if not pending:
-                log.info(
-                    "trigger_coordinator_no_messages",
-                    agent_id=agent_id,
+                background = await _inbox_service.get_undelivered_background(
+                    agent_id
                 )
-                return
+                if not _has_task_gate_messages(background):
+                    log.info(
+                        "trigger_coordinator_no_messages",
+                        agent_id=agent_id,
+                    )
+                    return
+                log.info(
+                    "trigger_coordinator_via_background_task_gate",
+                    agent_id=agent_id,
+                    background_count=len(background),
+                )
 
         # 获取 agent task 实例
         manager = _get_agent_manager()
@@ -206,9 +236,30 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                     error_type=type(e).__name__,
                 )
                 return
-            if agent is None:
+        if agent is None:
                 log.warning("trigger_no_agent_task", agent_id=agent_id)
                 return
+
+        # Give-up latch: task-class inbox / 30min decay unlocks before block
+        latch_opts: dict = {"trigger": True, "source": "trigger"}
+        try:
+            pending_for_latch = await _inbox_service.get_pending_messages(agent_id)
+            if any(
+                (m.get("message_type") or "").lower() == "task"
+                or m.get("task_id")
+                for m in (pending_for_latch or [])
+            ):
+                latch_opts["source"] = "task"
+                latch_opts["message_type"] = "task"
+        except Exception:
+            pass
+        if getattr(agent, "try_clear_resume_suppressed", None):
+            if agent.try_clear_resume_suppressed(latch_opts):
+                log.info("trigger_suppressed_gave_up", agent_id=agent_id)
+                return
+        elif getattr(agent, "_resume_suppressed", False):
+            log.info("trigger_suppressed_gave_up", agent_id=agent_id)
+            return
 
         # BUG-032 修复: 防御性回调补丁。即使 agent 已在 agent_manager 中
         # (manager.get_agent 非空)，回调也可能缺失（例如通过某些冷启动路径）。
@@ -228,16 +279,55 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
             await _handoff_service.accept_pending_handoffs(project_id, agent_id)
             result = await build_trigger_context(agent_record, trigger_type)
             if result is None:
-                log.info("trigger_busy_no_context", agent_id=agent_id)
+                # Triage running / fail-closed: still latch ids so wake is not
+                # dropped under busy (Medium: busy+triage enqueue).
+                pending = await _inbox_service.get_pending_messages(agent_id)
+                background = await _inbox_service.get_undelivered_background(
+                    agent_id
+                )
+                pool = list(pending) + list(background)
+                inbox_msg_ids = [m["id"] for m in pool if m.get("id")]
+                if not inbox_msg_ids:
+                    log.info("trigger_busy_no_context", agent_id=agent_id)
+                    return
+                from hiveweave.services.inbox_triage import derive_wake_category
+
+                wake_cat = derive_wake_category(pool)
+                from_id = next(
+                    (m.get("from_agent_id") for m in pool if m.get("from_agent_id")),
+                    "system",
+                )
+                await agent.enqueue_wake(
+                    "[Inbox triage pending — recheck when idle]",
+                    opts={
+                        "trigger": True,
+                        "from_agent_id": from_id,
+                        "inbox_msg_ids": inbox_msg_ids,
+                        "wake_category": wake_cat,
+                        "source": latch_opts.get("source") or "trigger_busy_queue",
+                        "message_type": latch_opts.get("message_type"),
+                        "task_id": latch_opts.get("task_id"),
+                        "is_background": True,
+                    },
+                )
+                log.info(
+                    "trigger_busy_enqueued_triage_pending",
+                    agent_id=agent_id,
+                    inbox_pending=len(inbox_msg_ids),
+                    wake_category=wake_cat,
+                )
                 return
-            context, inbox_msg_ids, from_agent_id = result
+            context, inbox_msg_ids, from_agent_id, wake_category = result
             await agent.enqueue_wake(
                 context,
                 opts={
                     "trigger": True,
                     "from_agent_id": from_agent_id,
                     "inbox_msg_ids": inbox_msg_ids,
-                    "source": "trigger_busy_queue",
+                    "wake_category": wake_category,
+                    "source": latch_opts.get("source") or "trigger_busy_queue",
+                    "message_type": latch_opts.get("message_type"),
+                    "task_id": latch_opts.get("task_id"),
                     "is_background": True,
                 },
             )
@@ -246,6 +336,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 agent_id=agent_id,
                 name=agent_record.get("name"),
                 inbox_pending=len(inbox_msg_ids or []),
+                wake_category=wake_category,
             )
             return
 
@@ -258,7 +349,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
             log.info("trigger_no_context", agent_id=agent_id)
             return
 
-        context, inbox_msg_ids, from_agent_id = result
+        context, inbox_msg_ids, from_agent_id, wake_category = result
 
         # Do NOT mark inbox read here. ACK happens only after a successful
         # non-empty completion (agent.py). Timeout/error leave messages unread
@@ -309,7 +400,10 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 "trigger": True,
                 "from_agent_id": from_agent_id,
                 "inbox_msg_ids": inbox_msg_ids,
-                "source": "trigger",
+                "wake_category": wake_category,
+                "source": latch_opts.get("source") or "trigger",
+                "message_type": latch_opts.get("message_type"),
+                "task_id": latch_opts.get("task_id"),
             },
         )
 
@@ -347,27 +441,32 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
 async def build_trigger_context(
     agent: dict,
     trigger_type: str,
-) -> tuple[str, list[str], str | None] | None:
+) -> tuple[str, list[str], str | None, str | None] | None:
     """构建触发上下文消息。
 
     对齐 Elixir agent.ex:288 build_trigger_context/2。
 
     构建的 blocks（按顺序）：
+    0. Inbox digest (platform ready) — 类别/优先级/条数/建议顺序
     1. Pending Tasks — 待处理的 handoffs（pending + accepted）
     2. Rework — 被拒绝的工作（inbox 中含 [REWORK REQUESTED] 的消息）
-    3. Messages — 其他 inbox 消息
-    4. Subordinate Logs — coordinator 专属，下属的工作日志
+    3. Messages — 有 digest 时仅展开 ask/task_transition/approval/expect_report；否则全量
+    4. Background updates — wake=0 捎带
     5. Report Required — coordinator 专属，未上报的 handoffs
+
+    Triage: pending+background 先 prepare_ready；若 status=running 则返回 None
+    （不把 raw 洪水喂给主模型）。
 
     Args:
         agent: agent DB 记录 dict（含 id, project_id, name, role, ...）
         trigger_type: "subordinate" 或 "coordinator"
 
     Returns:
-        (context, inbox_msg_ids, from_agent_id) 或 None（无上下文时）
+        (context, inbox_msg_ids, from_agent_id, wake_category) 或 None
         - context: 构建的上下文消息字符串
         - inbox_msg_ids: 待处理的 inbox 消息 ID 列表（在 LLM 非空输出后标记已读）
         - from_agent_id: 第一条消息的发送者 ID（用于 team chat 显示）
+        - wake_category: 最高优先级 inbox 类别（供 complete/waiting 闸门）
     """
     project_id = agent["project_id"]
     agent_id = agent["id"]
@@ -383,6 +482,75 @@ async def build_trigger_context(
     # 触发捎带进上下文 —— BUGFIX: 此前这类消息写入即 read=1，永不进上下文，
     # 导致"验证通过/交付完成"等证据对接收方不可见）
     background_msgs = await _inbox_service.get_undelivered_background(agent_id)
+
+    # complete + no actionable wake=1 / handoffs → skip (don't burn quota on
+    # background-only progress/ACK 捎带)
+    manager = _get_agent_manager()
+    live = manager.get_agent(agent_id) if manager else None
+    if live is not None and getattr(live, "disposition", None) == "complete":
+        if (
+            not inbox_messages
+            and not pending_handoffs
+            and not accepted_handoffs
+        ):
+            log.info(
+                "trigger_complete_skip_background_only",
+                agent_id=agent_id,
+                background=len(background_msgs),
+            )
+            return None
+
+    # ── Inbox triage: staging → ready digest (trigger only reads ready) ──
+    from hiveweave.services.inbox_triage import (
+        MAX_PROGRESS_DETAIL,
+        PREVIEW_CHARS,
+        classify_inbox_row,
+        derive_wake_category,
+        format_digest_block,
+        inbox_triage_service,
+        needs_message_detail,
+    )
+
+    triage_pool = list(inbox_messages) + list(background_msgs)
+    name_by_id: dict[str, str] = {}
+    for m in triage_pool:
+        fid = m.get("from_agent_id") or ""
+        if fid and fid not in name_by_id:
+            name_by_id[fid] = await _agent_name(fid)
+
+    pending_total, bg_total = await _inbox_service.count_pending_and_background(
+        agent_id
+    )
+    pool_n = len(triage_pool)
+    truncated = (pending_total + bg_total) > pool_n
+
+    ready_digest = None
+    triage_batch_id = None
+    wake_category = derive_wake_category(triage_pool) if triage_pool else None
+    if triage_pool:
+        ready_digest = await inbox_triage_service.prepare_ready(
+            agent_id,
+            triage_pool,
+            name_by_id=name_by_id,
+            truncated=truncated,
+            total_unread=pending_total + bg_total,
+        )
+        if ready_digest is None:
+            # Triage running / fail-closed — do not feed raw flood
+            log.info(
+                "trigger_skip_triage_running",
+                agent_id=agent_id,
+                pending=len(inbox_messages),
+                background=len(background_msgs),
+            )
+            return None
+        triage_batch_id = ready_digest.get("_batch_id")
+        ordered = inbox_triage_service.order_messages_by_digest(
+            triage_pool, ready_digest
+        )
+        pending_ids = {m["id"] for m in inbox_messages if m.get("id")}
+        inbox_messages = [m for m in ordered if m.get("id") in pending_ids]
+        background_msgs = [m for m in ordered if m.get("id") not in pending_ids]
 
     # 分离 rework 消息和其他消息
     rework_msgs: list[dict] = []
@@ -401,6 +569,11 @@ async def build_trigger_context(
 
     blocks: list[str] = []
     delivered_handoff_ids: list[str] = []
+
+    # ── 0. Inbox digest (ready) — always first when present ──
+    has_digest = bool(ready_digest and ready_digest.get("total", 0) > 0)
+    if has_digest:
+        blocks.append(format_digest_block(ready_digest))
 
     # ── 1. Pending Tasks block ──
     if pending_handoffs or accepted_handoffs:
@@ -441,42 +614,85 @@ async def build_trigger_context(
         )
 
     # ── 3. Messages block ──
-    # BUG-036: JSON-structured messages — no ambiguity from text formatting.
-    # Each message is one JSON line: {"from": "...", "content": "...", ...}
-    # LLM can parse fields unambiguously, unlike free-text [来自: xxx] format.
+    # With digest: full text only for ask/task_transition/approval (+ expect_report).
+    # progress/command stay digest-only (no double-write). Without digest: all.
     if other_msgs:
         import json as _json
         lines = []
         for m in other_msgs:
+            cat = classify_inbox_row(m)
+            if not needs_message_detail(cat, m, has_digest=has_digest):
+                continue
+            content = m.get("message") or ""
+            if cat == "progress":
+                content = content.replace("\n", " ")
+                if len(content) > PREVIEW_CHARS:
+                    content = content[: PREVIEW_CHARS - 1] + "…"
             entry = {
+                "id": (m.get("id") or "")[:8],
+                "category": cat,
                 "from": await _agent_name(m.get("from_agent_id", "")),
-                "content": m.get("message", ""),
+                "content": content,
             }
             if m.get("expect_report"):
                 entry["reply_required"] = True
             if m.get("priority") == "urgent":
                 entry["priority"] = "urgent"
+            if m.get("task_id"):
+                entry["task_id"] = str(m["task_id"])[:8]
             lines.append(_json.dumps(entry, ensure_ascii=False))
-        msg_text = "\n".join(lines)
-        blocks.append(
-            f"## Messages — JSON: {{\"from\":..., \"content\":..., \"reply_required\":true/false, \"priority\":\"normal\"/\"urgent\"}}\n"
-            f"{msg_text}"
-        )
+        if lines:
+            msg_text = "\n".join(lines)
+            scope = (
+                "full text for ask/task_transition/approval/expect_report only; "
+                "other categories are in Inbox digest above"
+                if has_digest
+                else 'JSON: {"id","category","from","content",...}'
+            )
+            blocks.append(
+                f"## Messages (detail, ordered by digest) — {scope}\n"
+                f"{msg_text}"
+            )
 
     # ── 3b. Background updates（progress/ACK 捎带，无需回复）──
     if background_msgs:
         import json as _json
-        lines = []
-        for m in background_msgs:
-            entry = {
-                "from": await _agent_name(m.get("from_agent_id", "")),
-                "content": m.get("message", ""),
-            }
-            lines.append(_json.dumps(entry, ensure_ascii=False))
-        blocks.append(
-            "## Background updates — 同事进度/回执（仅供参考，无需回复；"
-            "其中可能包含你等待的交付证据）\n" + "\n".join(lines)
-        )
+        if has_digest:
+            # Digest already lists them; avoid pasting summaries twice.
+            blocks.append(
+                f"## Background updates — {len(background_msgs)} item(s) "
+                "summarized in Inbox digest above (no reply needed)."
+            )
+        else:
+            lines = []
+            for i, m in enumerate(background_msgs):
+                if i >= MAX_PROGRESS_DETAIL:
+                    lines.append(
+                        _json.dumps(
+                            {
+                                "note": (
+                                    f"+{len(background_msgs) - MAX_PROGRESS_DETAIL} "
+                                    "more background"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    break
+                content = (m.get("message") or "").replace("\n", " ")
+                if len(content) > PREVIEW_CHARS:
+                    content = content[: PREVIEW_CHARS - 1] + "…"
+                entry = {
+                    "id": (m.get("id") or "")[:8],
+                    "category": classify_inbox_row(m),
+                    "from": await _agent_name(m.get("from_agent_id", "")),
+                    "content": content,
+                }
+                lines.append(_json.dumps(entry, ensure_ascii=False))
+            blocks.append(
+                "## Background updates — 同事进度/回执（仅供参考，无需回复；"
+                "其中可能包含你等待的交付证据）\n" + "\n".join(lines)
+            )
 
     # ── 3.5. Goals workbook update (dirty check) ──
     # Only shown when dirty — doesn't trigger the agent on its own.
@@ -554,8 +770,7 @@ async def build_trigger_context(
         from_agent_id = "system"
 
     context = "\n\n".join(blocks)
-
-    return context, inbox_msg_ids, from_agent_id
+    return context, inbox_msg_ids, from_agent_id, wake_category
 
 
 # ── AgentManager 延迟获取（避免循环导入）────────────────────

@@ -19,14 +19,16 @@ Shutdown sequence:
 4. Close Meta DB
 """
 
+import logging
+import os
 import sys
 from pathlib import Path
 
 # Force UTF-8 for stdout/stderr on Windows — prevents GBK encoding crashes
 # when logging Unicode characters (emoji, CJK names) via structlog.
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
 except Exception:
     pass  # Best-effort; may fail on redirected pipes
 
@@ -39,6 +41,38 @@ import structlog
 
 from hiveweave.config import settings
 
+
+def _configure_logging() -> None:
+    """Configure structlog once at import (JSON when HIVEWEAVE_LOG_JSON=1)."""
+    json_logs = os.getenv("HIVEWEAVE_LOG_JSON", "").lower() in ("1", "true", "yes")
+    level_name = os.getenv("HIVEWEAVE_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    shared = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=False),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
+    if json_logs:
+        renderer: object = structlog.processors.JSONRenderer()
+    else:
+        try:
+            colors = sys.stdout.isatty()
+        except Exception:
+            colors = False
+        renderer = structlog.dev.ConsoleRenderer(colors=colors)
+
+    structlog.configure(
+        processors=[*shared, renderer],
+        wrapper_class=structlog.make_filtering_bound_logger(level),
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        cache_logger_on_first_use=True,
+    )
+    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
+
+
+_configure_logging()
 log = structlog.get_logger(__name__)
 
 
@@ -61,12 +95,16 @@ async def lifespan(app: FastAPI):
     log.info("app_starting", port=settings.port)
 
     # 1. Init Meta DB
-    # R5 fix: 每个步骤独立 try/except — init_meta_db 失败不阻塞后续步骤
+    # Security/Fail-fast: Meta DB 是整个系统的基石 — 路由表、projects、llm_models
+    # 都在这里。初始化失败若继续运行会导致 agent 路由错乱、写入丢失、沉默故障。
+    # 改为 fail-fast：log.critical + stderr 提示 + sys.exit(1)。
     try:
         await init_meta_db()
         log.info("meta_db_initialized")
     except Exception as e:
-        log.error("meta_db_init_failed", error=str(e))
+        log.critical("meta_db_init_failed", error=str(e))
+        print(f"FATAL: Meta DB init failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # 2. Clear zombie streaming messages
     try:
@@ -129,8 +167,9 @@ async def lifespan(app: FastAPI):
             # Prune stale worktree metadata
             await _git(["worktree", "prune"], ws)
             # Find executor agents with missing worktrees (agents 表在 per-project DB)
-            proj_conn = await project_db.get_project_db_by_project_id(p["id"])
-            if proj_conn is None:
+            try:
+                proj_conn = await project_db.get_project_db_by_project_id(p["id"])
+            except project_db.ProjectDbError:
                 continue
             agent_cursor = await proj_conn.execute(
                 "SELECT id, name, role, short_id, workspace_path, permission_type "
@@ -244,6 +283,14 @@ async def lifespan(app: FastAPI):
         log.info("agents_started", started_projects=len(projects))
     except Exception as e:
         log.warning("agent_recovery_failed", error=str(e))
+
+    # Security: 启动序列末尾检测不安全配置（空 API key + 非 loopback host）。
+    # 仅打 WARNING 日志，不阻止启动 — 让运维看到醒目提示后自行加固。
+    try:
+        from hiveweave.config import warn_if_insecure
+        warn_if_insecure(settings.host, settings.api_key)
+    except Exception as e:
+        log.warning("security_warn_failed", error=str(e))
 
     log.info("app_started")
 

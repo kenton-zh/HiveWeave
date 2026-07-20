@@ -660,8 +660,45 @@ coverage/
         ok, head = await _git(["rev-parse", "--short", "HEAD"], workspace_path)
 
         # Auto-remove worktree + branch on success (契约 09 RECONCILE)
-        # 连带删分支走 delete 的 branch -d 安全链 — 已合并必然成功
-        await self.delete(workspace_path, short_id, branch=branch)
+        # TEST3: skip delete when assignee still has other open tasks.
+        cleanup_note = ""
+        try:
+            if await _assignee_has_open_tasks(workspace_path, short_id):
+                log.info(
+                    "git_worktree.merge_cleanup_skipped_open_tasks",
+                    short_id=short_id,
+                    branch=branch,
+                )
+                cleanup_note = (
+                    " NOTE: worktree retained — assignee still has open tasks."
+                )
+            else:
+                cleanup = await self.delete(workspace_path, short_id, branch=branch)
+                preserved = (cleanup or {}).get("preserved_branch")
+                if preserved:
+                    log.warning(
+                        "git_worktree.merge_cleanup_preserved_branch",
+                        short_id=short_id,
+                        branch=preserved.get("branch"),
+                        reason=preserved.get("reason"),
+                    )
+                    cleanup_note = (
+                        f" WARNING: worktree removed but branch "
+                        f"{preserved.get('branch')} preserved "
+                        f"({preserved.get('reason') or 'unmerged'}); "
+                        f"reconcile will retry later."
+                    )
+        except Exception as cleanup_err:
+            log.warning(
+                "git_worktree.merge_cleanup_failed",
+                short_id=short_id,
+                branch=branch,
+                error=str(cleanup_err),
+            )
+            cleanup_note = (
+                f" WARNING: merge succeeded but worktree cleanup failed "
+                f"({cleanup_err}); reconcile will retry later."
+            )
 
         # merge 成功 ≠ main 干净 — 残留冲突标记会随提交一并落地。
         # 扫描目标树并随结果返回, 由调用方 (git_worktree_merge tool) 路由清理。
@@ -689,6 +726,10 @@ coverage/
                 f"Branch {branch} already on {target_branch} "
                 f"(no new commits) — treated as merged."
             )
+        if cleanup_note:
+            result["cleanup_warning"] = cleanup_note.strip()
+            base = result.get("message") or "Worktree merged"
+            result["message"] = f"{base}{cleanup_note}"
         if marker_files:
             result["conflict_markers"] = marker_files
         return result
@@ -901,11 +942,48 @@ coverage/
 
         # Step 5: Auto-remove worktree + branch on success
         # 显式传已合并的分支全名 — delete 走 branch -d 安全链, 必然成功
+        # TEST3: retain worktree when assignee still has open tasks.
+        cleanup_note = ""
         if short_id:
             try:
-                await self.delete(workspace_path, short_id, branch=branch)
-            except Exception:
-                pass  # worktree 可能已不存在
+                if await _assignee_has_open_tasks(workspace_path, short_id):
+                    log.info(
+                        "git_worktree.merge_by_branch_cleanup_skipped_open_tasks",
+                        short_id=short_id,
+                        branch=branch,
+                    )
+                    cleanup_note = (
+                        " NOTE: worktree retained — assignee still has open tasks."
+                    )
+                else:
+                    cleanup = await self.delete(
+                        workspace_path, short_id, branch=branch
+                    )
+                    preserved = (cleanup or {}).get("preserved_branch")
+                    if preserved:
+                        log.warning(
+                            "git_worktree.merge_by_branch_cleanup_preserved",
+                            short_id=short_id,
+                            branch=preserved.get("branch"),
+                            reason=preserved.get("reason"),
+                        )
+                        cleanup_note = (
+                            f" WARNING: worktree removed but branch "
+                            f"{preserved.get('branch')} preserved "
+                            f"({preserved.get('reason') or 'unmerged'}); "
+                            f"reconcile will retry later."
+                        )
+            except Exception as cleanup_err:
+                log.warning(
+                    "git_worktree.merge_by_branch_cleanup_failed",
+                    short_id=short_id,
+                    branch=branch,
+                    error=str(cleanup_err),
+                )
+                cleanup_note = (
+                    f" WARNING: merge succeeded but worktree cleanup failed "
+                    f"({cleanup_err}); reconcile will retry later."
+                )
 
         # merge 成功 ≠ main 干净 — 扫描残留冲突标记, 交给调用方路由清理
         marker_files = scan_conflict_markers(workspace_path)
@@ -932,10 +1010,14 @@ coverage/
                 f"Branch {branch} already on {target_branch} "
                 f"(no new commits) — treated as merged."
             )
-        if verification_errors:
-            result["warnings"] = verification_errors
+        if cleanup_note:
+            result["cleanup_warning"] = cleanup_note.strip()
+            base = result.get("message") or "Worktree merged"
+            result["message"] = f"{base}{cleanup_note}"
         if marker_files:
             result["conflict_markers"] = marker_files
+        if verification_errors:
+            result["verification_warnings"] = verification_errors
         return result
 
     # ── 4. ROLLBACK ─────────────────────────────────────────
@@ -1245,6 +1327,30 @@ async def _project_db_if_exists(workspace_path: str):
         return None
 
 
+async def _open_project_db_raw(workspace_path: str):
+    """Open existing project DB without migrations (protect lookups).
+
+    Used when ensure_project_db fails on partial schemas — still need to
+    read agents/tasks so reconcile does not wipe active worktrees.
+    """
+    db_file = Path(workspace_path) / ".hiveweave" / "data.db"
+    if not db_file.exists():
+        return None
+    try:
+        import aiosqlite
+
+        conn = await aiosqlite.connect(str(db_file))
+        conn.row_factory = aiosqlite.Row
+        return conn
+    except Exception as e:
+        log.warning(
+            "git_worktree.raw_db_open_failed",
+            workspace=workspace_path,
+            error=str(e),
+        )
+        return None
+
+
 async def _task_branch_candidate(conn, prefix: str) -> tuple[bool, str]:
     """t-<taskid8> 分支的回收候选判定 (查项目 DB tasks 表)。
 
@@ -1270,6 +1376,138 @@ async def _task_branch_candidate(conn, prefix: str) -> tuple[bool, str]:
         r["status"] == "closed" or bool(r["is_archived"]) for r in rows
     )
     return (True, "task_closed_unmerged") if done else (False, "")
+
+
+# Protect reconcile from deleting dirs still needed for in-flight / pending-merge work
+_PROTECT_TASK_STATUSES = frozenset({
+    "created", "claimed", "running", "blocked", "submitted",
+    "reviewing", "rework", "verifying", "approved",
+})
+# After a successful merge, approved work is done — retain worktree only if
+# assignee still has truly in-flight tasks (not the just-merged approved ones).
+_IN_FLIGHT_AFTER_MERGE_STATUSES = frozenset({
+    "created", "claimed", "running", "blocked", "submitted",
+    "reviewing", "rework", "verifying",
+})
+
+
+async def _protected_worktree_short_ids(workspace_path: str) -> set[str]:
+    """short_ids reconcile must not rmtree.
+
+    TEST4: protect only assignees with non-terminal / pending-merge tasks.
+    Active executors with all tasks closed must be eligible for cleanup —
+    otherwise worktree dirs linger forever after merge+close.
+    """
+    protected: set[str] = set()
+    conn = await _project_db_if_exists(workspace_path)
+    close_raw = False
+    if conn is None:
+        conn = await _open_project_db_raw(workspace_path)
+        close_raw = conn is not None
+    if conn is None:
+        return protected
+    try:
+        # Assignees with non-terminal tasks — even if agent status drifted
+        placeholders = ", ".join("?" * len(_PROTECT_TASK_STATUSES))
+        cur = await conn.execute(
+            f"SELECT DISTINCT a.short_id FROM tasks t "
+            f"JOIN agents a ON a.id = t.assignee_id "
+            f"WHERE COALESCE(t.is_archived, 0) = 0 "
+            f"AND t.status IN ({placeholders}) "
+            f"AND a.short_id IS NOT NULL AND TRIM(a.short_id) != ''",
+            list(_PROTECT_TASK_STATUSES),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        for r in rows:
+            sid = (r["short_id"] or "").strip()
+            if sid:
+                protected.add(sid)
+    except Exception as e:
+        log.warning(
+            "git_worktree.reconcile_protected_lookup_failed",
+            workspace=workspace_path,
+            error=str(e),
+        )
+    finally:
+        if close_raw and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+    return protected
+
+
+async def _try_reattach_worktree(
+    workspace_path: str, short_id: str, path: str
+) -> bool:
+    """Best-effort: re-register an existing dir into git worktree list."""
+    branch = compute_branch_name(short_id)
+    fwd = path.replace("\\", "/")
+    # Prefer branch already checked out in the dir
+    if _has_git(path):
+        current = await _current_branch(path)
+        if current:
+            branch = current
+    ok, out = await _git(
+        ["worktree", "add", "--force", fwd, branch], workspace_path
+    )
+    if ok:
+        return True
+    # Branch may not exist — try creating from HEAD
+    ok2, out2 = await _git(
+        ["worktree", "add", "-b", branch, fwd, "HEAD"], workspace_path
+    )
+    if ok2:
+        return True
+    log.debug(
+        "git_worktree.reattach_failed",
+        short_id=short_id,
+        path=path,
+        error=f"{out}; {out2}",
+    )
+    return False
+
+
+async def _assignee_has_open_tasks(workspace_path: str, short_id: str) -> bool:
+    """True if agent still has in-flight tasks after a merge (not mere approved).
+
+    ``approved`` is excluded: that is the state of work just merged. Including
+    it would permanently skip worktree cleanup (TEST3 self-check).
+    """
+    conn = await _project_db_if_exists(workspace_path)
+    close_raw = False
+    if conn is None:
+        conn = await _open_project_db_raw(workspace_path)
+        close_raw = conn is not None
+    if conn is None:
+        return False
+    try:
+        placeholders = ", ".join("?" * len(_IN_FLIGHT_AFTER_MERGE_STATUSES))
+        cur = await conn.execute(
+            f"SELECT 1 FROM tasks t "
+            f"JOIN agents a ON a.id = t.assignee_id "
+            f"WHERE a.short_id = ? AND COALESCE(t.is_archived, 0) = 0 "
+            f"AND t.status IN ({placeholders}) LIMIT 1",
+            [short_id, *list(_IN_FLIGHT_AFTER_MERGE_STATUSES)],
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row is not None
+    except Exception as e:
+        log.warning(
+            "git_worktree.open_tasks_lookup_failed",
+            short_id=short_id,
+            error=str(e),
+        )
+        # Fail closed: retain worktree rather than delete mid-flight
+        return True
+    finally:
+        if close_raw and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
 
 
 async def reconcile_worktrees(workspace_path: str) -> dict:
@@ -1324,11 +1562,36 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
             report["errors"].append(f"git worktree prune failed: {out_p}")
 
     # ② 磁盘 → 注册表: 未注册的孤儿目录 → rmtree
+    # TEST3: never rmtree dirs that still belong to active executors / open tasks
+    # (git registry desync must not erase in-flight work). Prefer reattach.
+    protected_sids = await _protected_worktree_short_ids(workspace_path)
     if wt_root.is_dir():
         for child in sorted(wt_root.iterdir()):
             if not child.is_dir():
                 continue
             if os.path.normcase(str(child)) in registered:
+                continue
+            sid = child.name
+            if sid in protected_sids:
+                reattached = await _try_reattach_worktree(
+                    workspace_path, sid, str(child)
+                )
+                if reattached:
+                    report.setdefault("reattached_dirs", []).append(sid)
+                    log.info(
+                        "git_worktree.reconcile_dir_reattached",
+                        workspace=workspace_path,
+                        dir=str(child),
+                        short_id=sid,
+                    )
+                else:
+                    report.setdefault("skipped_active_dirs", []).append(sid)
+                    log.info(
+                        "reconcile_dir_skipped_active_agent",
+                        workspace=workspace_path,
+                        dir=str(child),
+                        short_id=sid,
+                    )
                 continue
             shutil.rmtree(child, ignore_errors=True)
             if child.exists():
@@ -1561,8 +1824,9 @@ async def heal_project_executor_worktrees(project_id: str) -> dict:
         return {"recovered": 0, "failed": 0, "skipped": True}
 
     await _git(["worktree", "prune"], ws)
-    conn = await project_db.get_project_db_by_project_id(project_id)
-    if conn is None:
+    try:
+        conn = await project_db.get_project_db_by_project_id(project_id)
+    except project_db.ProjectDbError:
         return {"recovered": 0, "failed": 0, "skipped": True}
 
     cur = await conn.execute(

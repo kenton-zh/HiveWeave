@@ -638,12 +638,4 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
   );
 }
 
-/**
- * Standalone Live Activity bar — shows ALL agents' activity (no filter).
- * Designed to sit at the bottom of the left panel (Org Tree area).
- */
-export function ActivityLogBar() {
-  return <ActivityLog agentId={null} />;
-}
-
 export default WorkLogPanel;

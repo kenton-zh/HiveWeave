@@ -112,13 +112,6 @@ class ChatMessageService:
         params.extend([agent_id, msg_id])
 
         conn = await project_db.get_project_db_for_agent(agent_id)
-        if conn is None:
-            log.warning(
-                "update_message_no_db",
-                agent_id=agent_id,
-                msg_id=msg_id,
-            )
-            return False
         cursor = await conn.execute(
             f"UPDATE chat_messages SET {', '.join(fields)} "
             f"WHERE agent_id = ? AND id = ?", params)
@@ -242,26 +235,28 @@ class ChatMessageService:
         project_id: str,
         *,
         protect_agent_ids: set[str] | frozenset[str] | None = None,
-        hard_age_ms: int = 11 * 60 * 1000,
+        soft_age_ms: int = 600_000,
+        hard_age_ms: int = 660_000,
     ) -> int:
         """Auto-heal stuck streaming rows for one project (runtime, not only boot).
 
         A message is an orphan when ``is_streaming=1`` and either:
         - its agent is **not** currently PROCESSING (idle / dead / never started), or
-        - it is older than ``hard_age_ms`` (past the 10min safety timeout).
+        - it is older than ``soft_age_ms`` (past the 10min safety timeout) —
+          cleared **even if** the agent is still listed as PROCESSING, or
+        - it is older than ``hard_age_ms`` (hard ceiling; same SQL path as soft).
 
-        Legitimate in-flight streams (agent in ``protect_agent_ids`` and young)
-        are left alone. Returns number of rows cleared.
+        Legitimate in-flight streams (agent in ``protect_agent_ids`` and younger
+        than soft_age) are left alone. Returns number of rows cleared.
         """
         import time as _time
 
         protect = set(protect_agent_ids or ())
         now_ms = int(_time.time() * 1000)
-        cutoff = now_ms - hard_age_ms
+        # Soft age bypasses PROCESSING protect (align with SAFETY_TIMEOUT_MS)
+        cutoff = now_ms - min(soft_age_ms, hard_age_ms)
         try:
             conn = await project_db.get_project_db_by_project_id(project_id)
-            if conn is None:
-                return 0
 
             if protect:
                 placeholders = ", ".join("?" * len(protect))

@@ -59,7 +59,7 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 ## Two-tier SQLite
 
 1. **Meta DB** — `apps/hiveweave-py/data/hiveweave.db` (WAL). Global tables: `projects`, `agent-templates`, `llm-models`, `global-settings`. Override with `HIVEWEAVE_META_DB_PATH`.
-2. **Per-project DB** — one per workspace, **DELETE journal mode**. Project-scoped tables: `agents`, `memories`, `chat-messages`, `handoffs`, `inbox`, `conversation-turns`, etc.
+2. **Per-project DB** — one per workspace, **WAL mode**. Project-scoped tables: `agents`, `memories`, `chat-messages`, `handoffs`, `inbox`, `conversation-turns`, etc.
 
 ## Key modules (`apps/hiveweave-py/src/hiveweave/`)
 
@@ -90,7 +90,7 @@ CEO auto-created per project. HR under CEO. Expert agents on-demand.
 
 ## Game time
 
-`REAL_SECONDS_PER_GAME_DAY = 3600` (1 real hour per game day). Game seconds use 86400/day. 5s tick persists time + fires alarms. Stalled agents (15+ min) escalate.
+`REAL_SECONDS_PER_GAME_DAY = 3600` (1 real hour per game day). Game seconds use 86400/day. 5s tick persists time + fires alarms. Stalled agents: 10min stall → nudge, ~40min+ → escalate.
 
 ## Environment variables
 

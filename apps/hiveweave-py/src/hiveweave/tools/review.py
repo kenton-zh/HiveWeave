@@ -441,13 +441,13 @@ async def run_full_review(
         }],
     }
 
-    code_review = results[0] if not isinstance(results[0], Exception) \
+    code_review: dict = results[0] if not isinstance(results[0], BaseException) \
         else fallback(results[0])
-    security_audit = results[1] if not isinstance(results[1], Exception) \
+    security_audit: dict = results[1] if not isinstance(results[1], BaseException) \
         else fallback(results[1])
-    test_review = results[2] if not isinstance(results[2], Exception) \
+    test_review: dict = results[2] if not isinstance(results[2], BaseException) \
         else fallback(results[2])
-    perf_audit = results[3] if not isinstance(results[3], Exception) \
+    perf_audit: dict = results[3] if not isinstance(results[3], BaseException) \
         else fallback(results[3])
 
     all_results = [code_review, security_audit, test_review, perf_audit]

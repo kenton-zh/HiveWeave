@@ -190,11 +190,17 @@ async def delete_directory_tool(params: DeleteDirectoryParams, agent_id: str, wo
 )
 async def search_files_tool(params: SearchFilesParams, agent_id: str, workspace: str) -> ToolResult:
     """Search files by glob pattern."""
-    from .file import _resolve_safe, _check_hiveweave_dir, _is_sensitive
+    from .file import (
+        _check_hiveweave_dir,
+        _is_sensitive,
+        infer_project_root,
+        resolve_for_read,
+    )
 
+    root = Path(infer_project_root(workspace)).resolve()
     ws = Path(workspace).resolve()
     if params.directory != ".":
-        resolved = _resolve_safe(workspace, params.directory)
+        resolved = resolve_for_read(workspace, params.directory, str(root))
         if resolved is None:
             return ToolResult.err(f"Path traversal denied: {params.directory}")
         search_dir = Path(resolved)
@@ -203,13 +209,20 @@ async def search_files_tool(params: SearchFilesParams, agent_id: str, workspace:
 
     try:
         matches = sorted(search_dir.rglob(params.pattern))
-        # Exclude .hiveweave and sensitive files
+        # Exclude .hiveweave protected areas and sensitive files
         matches = [
             m for m in matches[:200]
-            if not _check_hiveweave_dir(str(m), workspace)
+            if not _check_hiveweave_dir(str(m), str(root))
             and not _is_sensitive(str(m))
         ]
-        paths = [str(m.relative_to(ws)) for m in matches[:50]]
+
+        def _rel(m: Path) -> str:
+            try:
+                return str(m.relative_to(ws))
+            except ValueError:
+                return str(m.relative_to(root))
+
+        paths = [_rel(m) for m in matches[:50]]
 
         if not paths:
             return ToolResult.ok("No files found matching the pattern.")

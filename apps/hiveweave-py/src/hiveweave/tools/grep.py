@@ -3,7 +3,7 @@
 契约 02: 工具执行器 — grep 子模块
 - ripgrep 兼容的正则搜索（优先调用 rg，回退到 Python 内置扫描）
 - 支持 glob 过滤（include 参数）、上下文行（context）、多行模式（multiline）
-- 路径沙箱：search_path 必须在 workspace_path 内
+- 路径沙箱：search_path 相对 agent workspace 解析，但可读整个项目目录
 - 输出按文件分组，前缀 "<file>:<line>: <content>"
 """
 
@@ -35,30 +35,18 @@ IGNORED_DIRS = frozenset({
     ".cache", "coverage", ".idea", ".vscode", ".hiveweave",
 })
 
+# ripgrep 输出行解析: <file>:<line>:<content>
+# 用非贪婪 .+? 配合 \d+ 约束，正确处理 Windows 盘符冒号（C:\...）。
+_RG_LINE_RE = re.compile(r"^(.+?):(\d+):(.*)$", re.DOTALL)
+
 
 def _resolve_safe(workspace_path: str, path: str) -> str | None:
-    """Resolve a search path and ensure it stays inside the workspace."""
+    """Resolve a search path for READ: may land anywhere under the project root."""
+    from hiveweave.tools.file import resolve_for_read
+
     if not path:
         return str(Path(workspace_path).resolve())
-    try:
-        ws = Path(workspace_path).resolve()
-        candidate = Path(path)
-        if candidate.is_absolute():
-            try:
-                rel = candidate.relative_to(ws)
-                full = ws / rel
-            except ValueError:
-                return None
-        else:
-            full = (ws / path).resolve()
-        if full != ws:
-            try:
-                full.relative_to(ws)
-            except ValueError:
-                return None
-        return str(full)
-    except (OSError, ValueError):
-        return None
+    return resolve_for_read(workspace_path, path)
 
 
 def _format_results(matches: list[dict[str, Any]]) -> str:
@@ -128,19 +116,17 @@ async def _try_ripgrep(
             if not line:
                 continue
             # Format: <file>:<line>:<content>
-            idx1 = line.find(":")
-            if idx1 == -1:
+            # 用正则切分而非 find(":") — Windows 绝对路径含盘符冒号（C:\）
+            # 会让 find(":") 命中盘符而非分隔符。正则用 \d+ 约束回溯到正确位置。
+            m = _RG_LINE_RE.match(line)
+            if not m:
                 continue
-            file = line[:idx1]
-            rest = line[idx1 + 1:]
-            idx2 = rest.find(":")
-            if idx2 == -1:
-                continue
+            file, line_num_str, content = m.groups()
             try:
-                line_num = int(rest[:idx2])
+                line_num = int(line_num_str)
             except ValueError:
                 continue
-            content = rest[idx2 + 1:][:MAX_CHARS_PER_LINE]
+            content = content[:MAX_CHARS_PER_LINE]
             # Normalize path separators
             file = file.replace("\\", "/")
             matches.append({"file": file, "line": line_num, "content": content})
@@ -254,6 +240,7 @@ async def execute_grep(
     multiline: bool = False,
     max_results: int = 500,
     include_ignored: bool = False,
+    project_root: str | None = None,
 ) -> dict[str, Any]:
     """Search files for a regex pattern. Returns {success, output, error}.
 
@@ -269,26 +256,30 @@ async def execute_grep(
         return {"success": False, "output": "",
                 "error": "Error: pattern is required"}
 
-    search_path = _resolve_safe(workspace_path, path)
+    from hiveweave.tools.file import infer_project_root, resolve_for_read
+
+    root = project_root or infer_project_root(workspace_path)
+    if not path:
+        search_path = str(Path(workspace_path).resolve())
+    else:
+        search_path = resolve_for_read(workspace_path, path, root)
     if search_path is None:
         return {"success": False, "output": "",
                 "error": "Error: Sandbox violation - "
-                         "path must be within workspace"}
+                         "path must be within project"}
 
     # worktrees 内的搜索自动放开 ignore 过滤（审查场景）
     try:
-        rel_to_ws = Path(search_path).resolve().relative_to(
-            Path(workspace_path).resolve()
-        )
-        if len(rel_to_ws.parts) >= 2 and rel_to_ws.parts[0] == ".hiveweave" \
-           and rel_to_ws.parts[1] == "worktrees":
+        rel_to_root = Path(search_path).resolve().relative_to(Path(root).resolve())
+        if len(rel_to_root.parts) >= 2 and rel_to_root.parts[0] == ".hiveweave" \
+           and rel_to_root.parts[1] == "worktrees":
             include_ignored = True
     except ValueError:
         pass
 
     # .hiveweave 系统目录保护 — 拒绝显式搜索系统目录（data.db 等不应被 grep）
     from hiveweave.tools.file import _check_hiveweave_dir, HIVEWEAVE_DIR
-    if _check_hiveweave_dir(search_path, workspace_path) or \
+    if _check_hiveweave_dir(search_path, root) or \
        Path(search_path).name == HIVEWEAVE_DIR:
         return {"success": False, "output": "",
                 "error": "Error: `.hiveweave` is the HiveWeave system "

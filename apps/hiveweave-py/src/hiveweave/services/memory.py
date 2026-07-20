@@ -12,10 +12,11 @@ import json
 import time
 import uuid
 
+import aiosqlite
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ensure_project_db
+from hiveweave.db.project import ProjectDbError, ensure_project_db
 
 log = structlog.get_logger(__name__)
 
@@ -105,11 +106,11 @@ class MemoryService:
     # ── DB helper ─────────────────────────────────────────────
 
     @staticmethod
-    async def _conn(project_id: str):
+    async def _conn(project_id: str) -> aiosqlite.Connection:
         """Resolve project_id to per-project DB connection."""
         workspace = await meta_db.get_project_workspace(project_id)
         if not workspace:
-            raise ValueError(f"Workspace not found for project {project_id}")
+            raise ProjectDbError(f"Workspace not found for project {project_id}")
         return await ensure_project_db(workspace)
 
     # ── Public API ────────────────────────────────────────────

@@ -672,6 +672,20 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
                     task_id=task_id,
                 )
                 out = f"{out}\n\n[attestation_id={aid} kind=test_run]"
+                if task_id:
+                    try:
+                        await TaskService().emit_task_event(
+                            project_id,
+                            task_id,
+                            "test_attestation",
+                            agent_id=agent_id,
+                            summary=(
+                                f"[test_attestation] task {task_id[:8]} "
+                                f"via shell"
+                            ),
+                        )
+                    except Exception:
+                        pass
         except Exception as _att_err:
             # 此前静默 pass，attestation 签发失败无从排查（submit 被拒时
             # agent 完全不知道原因）。工具主流程不受影响，仅记录。
@@ -732,6 +746,20 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
                     task_id=task_id,
                 )
                 out = f"{out}\n\n[attestation_id={aid} kind=test_run]"
+                if task_id:
+                    try:
+                        await TaskService().emit_task_event(
+                            project_id,
+                            task_id,
+                            "test_attestation",
+                            agent_id=agent_id,
+                            summary=(
+                                f"[test_attestation] task {task_id[:8]} "
+                                f"via shell"
+                            ),
+                        )
+                    except Exception:
+                        pass
         except Exception as _att_err:
             # 此前静默 pass，attestation 签发失败无从排查（submit 被拒时
             # agent 完全不知道原因）。工具主流程不受影响，仅记录。

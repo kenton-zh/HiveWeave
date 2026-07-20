@@ -10,7 +10,7 @@
 |------|------|-----------|
 | **后端** | Python + FastAPI + Uvicorn | Python >=3.12, 端口 4000 |
 | **前端** | React 19 + Vite + React Flow + Electron | 端口 5173 |
-| **数据库** | SQLite + aiosqlite | Meta DB (WAL) + Per-project DB (DELETE journal) |
+| **数据库** | SQLite + aiosqlite | Meta DB (WAL) + Per-project DB (WAL) |
 | **AI/LLM** | httpx 流式 SSE + provider factory | OpenAI 兼容,多 provider |
 | **实时通信** | phoenix.js (前端) + phoenix_adapter (后端) | WebSocket, 3 channel |
 | **包管理** | pnpm 10.31 (前端) + uv (后端) | monorepo |
@@ -26,14 +26,14 @@ hiveweave/
 │   ├── hiveweave-py/              # Python/FastAPI 后端 (port 4000)
 │   │   ├── src/hiveweave/
 │   │   │   ├── agents/            # Agent + Supervisor + trigger
-│   │   │   ├── api/               # FastAPI 路由 (19 模块, 96 路由)
+│   │   │   ├── api/               # FastAPI 路由 (16 模块, 122 路由)
 │   │   │   ├── conversation/      # 对话历史 + 压缩 + token budget
 │   │   │   ├── db/                # Meta DB + per-project DB
 │   │   │   ├── llm/               # streamer, circuit_breaker, provider, retry
 │   │   │   ├── prompts/           # ETHOS 提示词体系
 │   │   │   ├── realtime/          # phoenix_adapter, channels, pubsub, event_bus
 │   │   │   ├── services/          # 23 services (org, dispatch, memory, ...)
-│   │   │   ├── tools/             # executor + 11 工具模块
+│   │   │   ├── tools/             # executor + 16 个工具文件 / 74 个 @tool
 │   │   │   ├── config.py
 │   │   │   └── main.py
 │   │   ├── data/                  # Meta DB (gitignored)
@@ -84,7 +84,7 @@ hiveweave/
 4. **三层记忆与交接继承** — 项目共享记忆 / Agent 私有记忆 / 归档记忆
 5. **asyncio 任务级容错** — 每个 Agent 运行在独立 asyncio task 中,单个 Agent 崩溃不影响整体
 6. **长任务支持** — 多轮工具循环、自重触发、上下文压缩
-7. **30+ 内置工具** — 文件操作、代码搜索、命令执行、网络、代码审查、MCP 集成、协作工具
+7. **74 工具** — 文件操作、代码搜索、命令执行、网络、代码审查、MCP 集成、协作工具
 
 ## 快速开始
 
