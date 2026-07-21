@@ -104,6 +104,21 @@ class HireAgentParams(BaseModel):
     )
 
 
+def _hire_permission_mode(perm_type: str, role: str) -> str:
+    """Pick permission_mode for a freshly hired agent.
+
+    builder coordinator（中层，family=coordinator）须可写 —— 固定 readonly
+    会让 evaluate 的 mode 兜底把写工具变 ask，SOURCE_WRITE 形同虚设；
+    CEO 保持偏只读协调 mode（无 SOURCE_WRITE，docs 白名单够用）。
+    """
+    if perm_type != "coordinator":
+        return "readwrite"
+    from hiveweave.services.policy import infer_role_family
+
+    family = infer_role_family({"role": role, "permission_type": perm_type})
+    return "readonly" if family in ("ceo", "hr") else "readwrite"
+
+
 @tool(
     "hire_agent",
     "Creates and deploys a new agent with a specified name, role, goal, "
@@ -191,7 +206,7 @@ async def hire_agent_tool(
             hint="HR should pass explicit permissionType; role-string "
             "inference is unreliable for non-English/unknown roles",
         )
-    perm_mode = "readonly" if perm_type == "coordinator" else "readwrite"
+    perm_mode = _hire_permission_mode(perm_type, role)
 
     # existing_agents 已在上方 parent_id 解析时获取（all_agents）
     existing_agents = all_agents
@@ -350,10 +365,14 @@ async def hire_agent_tool(
         new_id = new_agent.get("id", "?")
         new_short = new_agent.get("short_id", "?")
 
-        # Create isolated worktree for executor agents
+        # Create isolated worktree for writer agents (executor / builder coordinator)
         worktree_path = ""
         worktree_error = ""
-        if perm_type == "executor":
+        from hiveweave.services.git_worktree import agent_gets_write_worktree
+
+        if agent_gets_write_worktree(
+            {"permission_type": perm_type, "role": role}
+        ):
             try:
                 from hiveweave.services.git_worktree import GitWorktreeService
 

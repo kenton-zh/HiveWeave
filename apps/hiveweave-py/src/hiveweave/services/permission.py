@@ -42,17 +42,42 @@ _BASE_TOOLS = frozenset({
     "claim_task", "update_task_status", "submit_task", "update_progress",
 })
 
-COORDINATOR_TOOLS = _BASE_TOOLS | frozenset({
-    "write_file",  # docs/shared only via policy scope
+CEO_TOOLS = _BASE_TOOLS | frozenset({
+    # CEO: 行政 + 里程碑验收。无写码/bash/test 工具。
+    "write_file",  # docs/shared/charter scope only via policy hard gate
+    "create_task", "dispatch_task", "review_task",
+    "cancel_task", "unclaim_task", "waive_attestation",
+    "save_charter", "update_goals", "dismiss_agent", "transfer_agent",
+    # merge/remove 仅作升级兜底 —— create 仍由系统侧在 dispatch/hire 时建
+    "git_worktree_merge", "git_worktree_remove",
+    # 终验对用户说
+    "message_user",
+    "start_dev_server",
+})
+
+COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
+    # 中层 builder（player-coach）：协调权 + 写码权（与 executor 同契约
+    # 拥有独立 worktree，自己搭骨架/写关键路径）。
+    "write_file",
     "bind_skill", "unbind_skill",
     "create_task", "dispatch_task", "review_task",
     # 台账出口：废弃/释放误绑任务 + 豁免 attestation（policy 已映射 DISPATCH/REVIEW）
     "cancel_task", "unclaim_task", "waive_attestation",
     "save_charter", "update_goals", "dismiss_agent", "transfer_agent",
-    # merge/remove only — create is system-side on dispatch/hire for executors
+    # merge/remove only — create is system-side on dispatch/hire
     "git_worktree_merge", "git_worktree_remove",
     "start_dev_server",
+    # 写码/验证工具
+    "edit_file", "apply_patch", "delete_file", "move_file",
+    "create_directory", "delete_directory", "search_files",
+    "bash", "run_command", "run_tests", "browse",
+    "git_worktree_checkpoint",
+    "run_code_review", "run_security_audit", "run_perf_audit",
+    "run_full_review",
 })
+
+# Legacy alias — builder coordinator 即原 COORDINATOR_TOOLS 语义的超集。
+COORDINATOR_TOOLS = COORDINATOR_BUILDER_TOOLS
 
 HR_TOOLS = _BASE_TOOLS | frozenset({
     "hire_agent", "dismiss_agent", "transfer_agent",
@@ -79,12 +104,13 @@ READWRITE_TOOLS = READONLY_TOOLS | frozenset({
     "run_command",
 })
 
-ALL_TOOLS = READWRITE_TOOLS | COORDINATOR_TOOLS | HR_TOOLS | frozenset({
+ALL_TOOLS = READWRITE_TOOLS | COORDINATOR_BUILDER_TOOLS | HR_TOOLS | frozenset({
     "run_command",
     "git_worktree_create", "git_worktree_merge", "git_worktree_remove",
     "create_task", "dispatch_task", "review_task",
     "hire_agent", "dismiss_agent", "transfer_agent",
     "save_charter", "update_goals",
+    "message_user",
 })
 
 # 工具本体（task_tools）无角色守卫；executor 滥用由两层拦截：
@@ -146,8 +172,13 @@ class PermissionService:
 
         if family == "hr":
             return "allow" if tool_name in HR_TOOLS else "deny"
+        if family == "ceo":
+            return "allow" if tool_name in CEO_TOOLS else "deny"
         if family == "coordinator" or permission_type == "coordinator":
-            if tool_name in COORDINATOR_ONLY_TOOLS or tool_name in COORDINATOR_TOOLS:
+            if (
+                tool_name in COORDINATOR_ONLY_TOOLS
+                or tool_name in COORDINATOR_BUILDER_TOOLS
+            ):
                 return "allow"
             return "deny"
 
@@ -177,12 +208,20 @@ class PermissionService:
         family = infer_role_family(agent)
         if family == "hr":
             return sorted(HR_TOOLS)
+        if family == "ceo":
+            # 显式 ceo 分支 —— 禁止 unknown family 落 READWRITE 兜底泄漏工具。
+            return sorted(CEO_TOOLS)
         if family == "coordinator":
-            return sorted(COORDINATOR_TOOLS | COORDINATOR_ONLY_TOOLS)
+            return sorted(COORDINATOR_BUILDER_TOOLS | COORDINATOR_ONLY_TOOLS)
         mode = agent.get("permission_mode") or "readwrite"
         if family == "qa":
             return sorted(READWRITE_TOOLS)
-        return self.get_tools_for_mode(mode if mode != "readonly" else "readwrite")
+        if family == "executor":
+            return self.get_tools_for_mode(
+                mode if mode != "readonly" else "readwrite"
+            )
+        # Unknown family — 最小暴露，不给 READWRITE 兜底。
+        return sorted(READONLY_TOOLS)
 
     def _parse_list(self, raw: Any) -> list[str]:
         if not raw:

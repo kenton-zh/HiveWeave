@@ -6,7 +6,11 @@ Evaluation order (P0 Hard Gates):
 3. User rules: deny → ask → allow
 4. Mode fallback
 
-Role families: hr | coordinator | executor | qa
+Role families: ceo | hr | coordinator | executor | qa
+
+- ceo: 行政 + 里程碑验收（派/审/合兜底/组织管理），无写码/bash/test。
+- coordinator: 中层 builder（player-coach）— 协调权叠加写码权
+  （SOURCE_WRITE / BASH_SHELL / TEST_RUN / BROWSE）。
 """
 
 from __future__ import annotations
@@ -35,10 +39,18 @@ class Capability(str, Enum):
     BROWSE = "browse"
 
 
-RoleFamily = str  # "hr" | "coordinator" | "executor" | "qa"
+RoleFamily = str  # "ceo" | "hr" | "coordinator" | "executor" | "qa"
 
 # Default capability matrix — hard coded.
 FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
+    "ceo": frozenset({
+        # CEO: 行政 + 里程碑验收。无写码/bash/test/staffing。
+        Capability.DISPATCH,
+        Capability.REVIEW,
+        Capability.MERGE,  # 升级兜底（中层缺席时救场合并）
+        Capability.SOURCE_READ,
+        Capability.MANAGE_ORG,
+    }),
     "hr": frozenset({
         Capability.STAFFING,
         Capability.MANAGE_ORG,
@@ -52,6 +64,12 @@ FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
         Capability.SOURCE_READ,
         Capability.BIND_SKILL,  # bind skills on subordinates via tools
         Capability.MANAGE_ORG,  # dismiss/transfer within span
+        # 中层 builder（player-coach）：协调权叠加写码权 —— 自己搭骨架/写
+        # 关键路径，与 executor 同契约拥有独立 worktree。
+        Capability.SOURCE_WRITE,
+        Capability.BASH_SHELL,
+        Capability.TEST_RUN,
+        Capability.BROWSE,
     }),
     "executor": frozenset({
         Capability.SOURCE_WRITE,
@@ -152,7 +170,11 @@ def infer_role_family(agent: dict[str, Any]) -> RoleFamily:
         return "hr"
     if is_test_engineer_role(role):
         return "qa"
-    if perm == "coordinator" or role_l in ("ceo", "coordinator"):
+    # role==ceo 优先于 permission_type=coordinator —— CEO 是独立行政 family，
+    # 不享受中层 builder 的写码权。
+    if role_l == "ceo":
+        return "ceo"
+    if perm == "coordinator" or role_l == "coordinator":
         return "coordinator"
     return "executor"
 
