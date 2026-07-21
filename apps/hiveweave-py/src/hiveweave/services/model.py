@@ -3,12 +3,15 @@
 契约 18: ModelService
 - Meta DB 中的 llm_models 表 CRUD
 - list_all 对 api_key 脱敏（前 8 字符 + '...'）；get 返回完整 api_key
-- seed_default_model 启动种子（OPENCODE_API_KEY → DeepSeek V4 Flash Free）
+- seed_default_model / ensure_channel_models 启动种子（多渠道混用以摊配额）
 - 补全 E9/E10: create/update 支持 supports_thinking/default_reasoning_effort/temperature
 
 llm_models 表 schema 已完整，无需迁移。
 """
 
+from __future__ import annotations
+
+import itertools
 import os
 import time
 import uuid
@@ -22,6 +25,15 @@ log = structlog.get_logger(__name__)
 # Default values (契约 18)
 _DEFAULT_CONTEXT_WINDOW = 128_000
 _DEFAULT_MAX_OUTPUT = 8_192
+
+# Round-robin counter for active model pool (process-local).
+# 限制说明：计数器只在单进程内单调递增。后端本就按单进程设计
+# （InProcess pubsub / per-agent asyncio 锁 / 内存态 turn_session 均假设
+# 单 worker），多 worker 或进程重启后分摊重新计数——重启后首轮总从
+# pool[0] 开始，多 worker 下各进程独立轮转、全局配额分摊不均匀。
+# 如需跨进程均匀分摊，应改为 DB 持久化游标或按 agent_id 哈希取模；
+# 当前单进程部署下进程内轮询已足够，故保持简单实现。
+_pool_counter = itertools.count()
 
 
 class InvalidModelConfig(ValueError):
@@ -123,6 +135,26 @@ class ModelService:
             return None
         return self._row_to_model(row, mask_key=False)
 
+    async def find_by_name(self, name: str) -> dict | None:
+        row = await meta_db.query_one(
+            "SELECT id, name, model_id, base_url, api_key, provider_type, "
+            "context_window, max_output_tokens, supports_thinking, "
+            "default_reasoning_effort, temperature, is_active, fallback, "
+            "created_at, updated_at FROM llm_models WHERE name = ? LIMIT 1",
+            [name],
+        )
+        return self._row_to_model(row, mask_key=False) if row else None
+
+    async def upsert_by_name(self, attrs: dict) -> dict:
+        """Create or update a channel model keyed by display name."""
+        name = attrs.get("name") or ""
+        existing = await self.find_by_name(name) if name else None
+        if existing:
+            await self.update(existing["id"], attrs)
+            refreshed = await self.get(existing["id"])
+            return refreshed or existing
+        return await self.create(attrs)
+
     async def update(self, model_pk: str, attrs: dict) -> str | None:
         """Update a model. Only non-None fields updated.
 
@@ -207,38 +239,203 @@ class ModelService:
             log.warning("list_active_models_failed", error=str(e))
             return []
 
-    async def seed_default_model(self) -> dict | str:
-        """Seed default model if table is empty.
+    async def list_active_full(self) -> list[dict]:
+        """Active models with full api_key (for pool / streamer)."""
+        try:
+            rows = await meta_db.query(
+                "SELECT id, name, model_id, base_url, api_key, provider_type, "
+                "context_window, max_output_tokens, supports_thinking, "
+                "default_reasoning_effort, temperature, is_active, fallback, "
+                "created_at, updated_at "
+                "FROM llm_models WHERE is_active = 1 ORDER BY created_at ASC"
+            )
+            return [self._row_to_model(r, mask_key=False) for r in rows]
+        except Exception as e:
+            log.warning("list_active_full_failed", error=str(e))
+            return []
 
-        契约 18: seed_default_model (E14: Elixir 未实现，Python 必须实现)
-        - 表已有记录 → 返回 'already_seeded'
-        - STEP_API_KEY 缺失 → 返回 {'error': 'no_api_key'}
-        - 否则种子阶跃星辰 step-3.7-flash 并返回模型 dict
-        """
+    async def pick_from_pool(self, preferred: str | None = None) -> dict | None:
+        """Round-robin among active models to spread provider rate limits."""
+        active = await self.list_active_full()
+        if not active:
+            return await self.get(preferred) if preferred else None
+        if len(active) == 1:
+            return active[0]
+        idx = next(_pool_counter) % len(active)
+        chosen = active[idx]
+        log.debug(
+            "model_pool_pick",
+            chosen=chosen.get("name"),
+            base_url=(chosen.get("base_url") or "")[:48],
+            pool_size=len(active),
+            preferred=preferred,
+        )
+        return chosen
+
+    async def ensure_channel_models(self) -> dict:
+        """Upsert Ark Plan (+ optional Coding) channels for multi-quota pooling."""
+        from hiveweave.config import settings
+
+        ensured: list[str] = []
+
+        plan_key = (
+            (settings.ark_api_key or "").strip()
+            or os.environ.get("HIVEWEAVE_ARK_API_KEY", "").strip()
+            or os.environ.get("ARK_API_KEY", "").strip()
+        )
+        plan_url = (
+            (settings.ark_base_url or "").strip()
+            or os.environ.get(
+                "HIVEWEAVE_ARK_BASE_URL",
+                "https://ark.cn-beijing.volces.com/api/plan/v3",
+            )
+        )
+        plan_model = (
+            (settings.ark_model_id or "").strip()
+            or os.environ.get("HIVEWEAVE_ARK_MODEL_ID", "deepseek-v4-flash")
+        )
+        if plan_key:
+            row = await self.upsert_by_name(
+                {
+                    "name": "DeepSeek V4 Flash (ARK Plan)",
+                    "model_id": plan_model,
+                    "base_url": plan_url.rstrip("/"),
+                    "api_key": plan_key,
+                    "provider_type": "openai-compatible",
+                    "context_window": 1_024_000,
+                    "max_output_tokens": 384_000,
+                    "supports_thinking": True,
+                    "is_active": True,
+                }
+            )
+            ensured.append(str(row.get("id") or "plan"))
+            log.info(
+                "channel_model_ensured",
+                channel="ark_plan",
+                model_id=plan_model,
+                base_url=plan_url[:56],
+            )
+
+        coding_key = (
+            (settings.ark_coding_api_key or "").strip()
+            or os.environ.get("HIVEWEAVE_ARK_CODING_API_KEY", "").strip()
+        )
+        coding_url = (
+            (settings.ark_coding_base_url or "").strip()
+            or os.environ.get(
+                "HIVEWEAVE_ARK_CODING_BASE_URL",
+                "https://ark.cn-beijing.volces.com/api/coding/v3",
+            )
+        )
+        coding_model = (
+            (settings.ark_coding_model_id or "").strip()
+            or os.environ.get("HIVEWEAVE_ARK_CODING_MODEL_ID", "deepseek-v4-flash")
+        )
+        if not coding_key:
+            existing_coding = await self.find_by_name(
+                "DeepSeek V4 Flash (ARK Coding)"
+            )
+            if existing_coding and existing_coding.get("api_key"):
+                coding_key = existing_coding["api_key"]
+                coding_url = existing_coding.get("base_url") or coding_url
+                coding_model = existing_coding.get("model_id") or coding_model
+
+        if coding_key and coding_key != plan_key:
+            row = await self.upsert_by_name(
+                {
+                    "name": "DeepSeek V4 Flash (ARK Coding)",
+                    "model_id": coding_model,
+                    "base_url": coding_url.rstrip("/"),
+                    "api_key": coding_key,
+                    "provider_type": "openai-compatible",
+                    "context_window": 1_024_000,
+                    "max_output_tokens": 384_000,
+                    "supports_thinking": True,
+                    "is_active": True,
+                }
+            )
+            ensured.append(str(row.get("id") or "coding"))
+            log.info(
+                "channel_model_ensured",
+                channel="ark_coding",
+                model_id=coding_model,
+                base_url=coding_url[:56],
+            )
+        elif coding_key and coding_key == plan_key:
+            log.info("channel_model_skip_coding_same_key")
+
+        active = await self.list_active()
+        return {
+            "ensured": ensured,
+            "active_count": len(active),
+            "active": [
+                {
+                    "id": a.get("id"),
+                    "name": a.get("name"),
+                    "model_id": a.get("model_id"),
+                }
+                for a in active
+            ],
+        }
+
+    async def seed_default_model(self) -> dict | str:
+        """Ensure Ark channels; seed first model only if table empty."""
+        try:
+            ensured = await self.ensure_channel_models()
+            if ensured.get("ensured"):
+                return {"ensured_channels": ensured}
+        except Exception as e:
+            log.warning("ensure_channel_models_failed", error=str(e))
+
         count_row = await meta_db.query_one(
             "SELECT COUNT(*) AS cnt FROM llm_models")
         if count_row and count_row["cnt"] > 0:
             return "already_seeded"
 
-        api_key = os.environ.get("STEP_API_KEY", "")
-        if not api_key:
-            log.warning("seed_default_model_no_api_key")
-            return {"error": "no_api_key"}
+        ark_key = (
+            os.environ.get("HIVEWEAVE_ARK_API_KEY", "")
+            or os.environ.get("ARK_API_KEY", "")
+        )
+        if ark_key:
+            attrs = {
+                "name": "DeepSeek V4 Flash (ARK Plan)",
+                "model_id": os.environ.get(
+                    "HIVEWEAVE_ARK_MODEL_ID", "deepseek-v4-flash"
+                ),
+                "base_url": os.environ.get(
+                    "HIVEWEAVE_ARK_BASE_URL",
+                    "https://ark.cn-beijing.volces.com/api/plan/v3",
+                ),
+                "api_key": ark_key,
+                "provider_type": "openai-compatible",
+                "context_window": 1_024_000,
+                "max_output_tokens": 384_000,
+                "supports_thinking": True,
+                "is_active": True,
+            }
+            result = await self.create(attrs)
+            log.info("default_model_seeded_ark", model_id=result["id"])
+            return result
 
-        attrs = {
-            "name": "Step 3.7 Flash",
-            "model_id": "step-3.7-flash",
-            "base_url": "https://api.stepfun.com/step_plan/v1",
-            "api_key": api_key,
-            "provider_type": "anthropic",
-            "context_window": 200_000,
-            "max_output_tokens": _DEFAULT_MAX_OUTPUT,
-            "supports_thinking": False,
-            "is_active": True,
-        }
-        result = await self.create(attrs)
-        log.info("default_model_seeded", model_id=result["id"])
-        return result
+        api_key = os.environ.get("STEP_API_KEY", "")
+        if api_key:
+            attrs = {
+                "name": "Step 3.7 Flash",
+                "model_id": "step-3.7-flash",
+                "base_url": "https://api.stepfun.com/step_plan/v1",
+                "api_key": api_key,
+                "provider_type": "anthropic",
+                "context_window": 200_000,
+                "max_output_tokens": _DEFAULT_MAX_OUTPUT,
+                "supports_thinking": False,
+                "is_active": True,
+            }
+            result = await self.create(attrs)
+            log.info("default_model_seeded", model_id=result["id"])
+            return result
+
+        log.warning("seed_default_model_no_api_key")
+        return {"error": "no_api_key"}
 
     # ── Helpers ───────────────────────────────────────────────
 

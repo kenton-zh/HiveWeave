@@ -27,8 +27,21 @@ class Settings(BaseSettings):
         "http://localhost:4173",
     ]
 
-    # OpenCode API key (契约 18: seedDefaultModel 读此变量)
+    # OpenCode API key (legacy seed path)
     opencode_api_key: str = ""
+
+    # Volcengine Ark — Agent Plan (OpenAI-compatible /api/plan/v3)
+    ark_api_key: str = ""
+    ark_base_url: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
+    ark_model_id: str = "deepseek-v4-flash"
+
+    # Optional second Ark channel (Coding Plan) for quota mixing
+    ark_coding_api_key: str = ""
+    ark_coding_base_url: str = "https://ark.cn-beijing.volces.com/api/coding/v3"
+    ark_coding_model_id: str = "deepseek-v4-flash"
+
+    # Round-robin across active models to spread rate limits (default on)
+    model_pool_enabled: bool = True
 
     # External skills directory (best-effort; 不存在则返回空)
     # 默认为空 — 需通过环境变量 HIVEWEAVE_EXTERNAL_SKILLS_DIR 指定
