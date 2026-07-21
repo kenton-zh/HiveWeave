@@ -5,7 +5,8 @@ LLM 以相同参数重试 → 默认阈值 3 触发 doom → 首条指令即 [ER
 无任何正常输出。
 
 修复：
-1. commit_turn 专属阈值 6（默认 3 对强制出口工具过低）
+1. commit_turn 专属阈值（89a030a 定 6；32597f3 调整为 8 —— 同参指纹
+   才计数，强制出口工具需要更大容忍度，本测试以 8 为准）
 2. 失败重试豁免：上一轮执行失败 → 同参数重试不计 doom
 """
 
@@ -23,17 +24,18 @@ def _tracker() -> dict:
 
 
 class TestCommitTurnThreshold:
-    def test_commit_turn_tolerates_retries_up_to_6(self):
-        """commit_turn 连续 5 次同参数不触发（默认阈值 3 会误杀）。"""
+    def test_commit_turn_tolerates_retries_up_to_8(self):
+        """commit_turn 连续 7 次同参数不触发（默认阈值 3 会误杀）。"""
         tracker = _tracker()
-        for _ in range(5):
+        for _ in range(7):
             hit = Streamer._detect_doom_loop([_tc("commit_turn")], tracker)
             assert hit is None
 
-    def test_commit_turn_trips_at_6(self):
+    def test_commit_turn_trips_at_8(self):
+        """阈值 8 以 32597f3 为准（同参指纹计数，强制出口容忍度上调 6→8）。"""
         tracker = _tracker()
         hit = None
-        for _ in range(6):
+        for _ in range(8):
             hit = Streamer._detect_doom_loop([_tc("commit_turn")], tracker)
         assert hit == "commit_turn"
 
