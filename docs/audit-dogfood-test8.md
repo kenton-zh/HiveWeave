@@ -26,7 +26,7 @@
 
 ### P1-a 记忆链路断裂：write_memory 返回 "Memory saved" 但 read_memory 永远读不回
 
-> **状态：已修复（commit 待提交）** ✅
+> **状态：已修复（814ec5c，已推送）** ✅
 > 修复摘要：服务层 `get_agent_memories` 增加 `module_id` 独立过滤参数（`services/memory.py:135-168`）；工具层 `read_memory_tool` 改为按 `scope='agent'` + `module_id` 列过滤（`tools/orchestration_tools.py:875-887`），渲染键名 `category`→`type`。写入侧 `add_entry`（scope='agent' + module_id 列）本即正确，读写已对称。回归测试：`tests/test_p1_p2_dogfood_fixes.py` 3 条（写读回环、moduleId 过滤、服务层对称）。
 
 **现象**：19:46 由 agent 青鸟（e1534986，记忆与浏览器验证工程师）实测，`write_memory` 返回 `Memory saved.`，随后 `read_memory` 跨 moduleId / tags / 多轮对话均返回 `(no memories)`。
@@ -62,7 +62,7 @@
 
 ### P1-b VERIFY 审批门禁误判：未参与实现的 CEO 被判为 implementer/merger 拒绝
 
-> **状态：已修复（commit 待提交）** ✅
+> **状态：已修复（814ec5c，已推送）** ✅
 > 修复摘要：
 > 1. 审门 forbidden 移除无差别 `creator_id`，仅当 creator 本人即实现者/合并人时才禁止（`tools/task_tools.py:1197-1232`）——CEO 可正常审批 VERIFY，实现者与合并人仍被拒。
 > 2. `merged_by` 持久化：`submit_task` 覆盖 evidence 时自动保留既有 `merged_by`（`services/task.py:573-600`），审门在 submit 后仍能有效排除合并人。
@@ -93,7 +93,7 @@
 
 ### P2 doom loop ×4：commit_turn 同参数连调 8+ 次熔断
 
-> **状态：已修复（低成本缓解，commit 待提交）** ✅
+> **状态：已修复（低成本缓解，814ec5c，已推送）** ✅
 > 修复摘要：根因之一是 `commit_turn` 对同参数重复调用返回逐字相同的 "TurnResult accepted"，模型在相同上下文中做出相同决策形成正反馈。修为：同一 turn 内同参数 commit 已被接受时，返回差异化提示（明确告知"已提交，勿再同参调用，输出收尾文本等出口闸门"），打破重复循环（`tools/turn_tools.py:91-107`）。熔断-警告机制本身按设计工作，保留不动。深层诱因（P1-a 卡住验证、LLM 超时重试）随 P1-a 修复与 Ark 模型池覆盖缓解。
 
 **现象**：云岫 20:10 / 20:18 / 20:53、潮汐 21:09，共 4 次触发 doom loop 熔断（`commit_turn` 同参数连调 8+ 次）。
@@ -106,7 +106,7 @@
 
 ### P2 消息三连发轰炸
 
-> **状态：已修复（commit 待提交）** ✅
+> **状态：已修复（814ec5c，已推送）** ✅
 > 修复摘要：`TeamChatService` 新增 `check_and_mark`（检查+登记原子化去重，与 `record_message` 同 MD5 规则、同 60s 窗口、fail-open，`services/team_chat.py:87-125`）；trigger digest 写库前先过该方法（`agents/trigger.py:433-464`）——窗口内重复只跳过落库（`digest_msg_id=None`），agent 仍正常被唤醒 chat，超时重试语义不变。回归测试：`tests/test_p1_p2_dogfood_fixes.py` 2 条（窗口内去重/不同内容不受影响、record_message 原语义不回归）。
 
 **现象**：同一内容向同一接收人 3 连发："## Goals Workbook (updated)" 20:19:38 向流萤×3、20:54:41 向墨羽×3；"## Pending Tasks" 块 20:05:44 / 20:47:09 向北辰×3、20:56:30 向潮汐×3、21:10:29 向青鸟×3；submit 通知同类连发。`team_chat_dedupe` 表存在（52 行）但没拦住。
