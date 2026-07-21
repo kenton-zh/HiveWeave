@@ -80,6 +80,37 @@ TIMEOUT_RESUME_COOLDOWN_S = 90.0
 ERROR_RESUME_COOLDOWN_S = 30.0
 """可恢复 LLM 错误后的短冷却。"""
 
+RATE_LIMIT_RESUME_COOLDOWN_S = 120.0
+"""429 / AccountRateLimit 耗尽后的独立冷却（不计入放弃计数）。"""
+
+
+def is_rate_limit_error(error: BaseException | None) -> bool:
+    """True when the failure is provider rate-limit (429), not a hard fault.
+
+    Rate limits must not increment consecutive-error give-up — they are
+    temporary quota pressure, not agent failure.
+    """
+    if error is None:
+        return False
+    try:
+        from hiveweave.llm.retry import RetryableError
+
+        if isinstance(error, RetryableError) and getattr(error, "status", None) == 429:
+            return True
+    except Exception:
+        pass
+    msg = str(error).lower()
+    needles = (
+        "429",
+        "accountratelimit",
+        "rate limit",
+        "ratelimitexceeded",
+        "too many requests",
+        "rate_limit",
+    )
+    return any(n in msg for n in needles)
+
+
 DEFAULT_MAX_TOOL_ROUNDS = 600
 """所有角色统一的 tool loop 最大轮次。不再按角色区别对待。"""
 
@@ -1062,11 +1093,20 @@ class Agent:
     # ── 内部: 模型 & 工具 ────────────────────────────────────
 
     async def _get_model_config(self) -> dict | None:
-        """获取模型配置。
+        """获取模型配置；多渠道激活时 round-robin 摊配额。
 
         对齐 Elixir agent.ex:474 get_model_config/1。
         """
         model_id = self.config.get("model_id")
+        try:
+            from hiveweave.config import settings
+
+            if getattr(settings, "model_pool_enabled", True):
+                picked = await self._model_service.pick_from_pool(model_id)
+                if picked:
+                    return picked
+        except Exception as e:
+            log.debug("model_pool_pick_failed", error=str(e))
         if not model_id:
             return None
         return await self._model_service.get(model_id)
@@ -1988,6 +2028,27 @@ class Agent:
                 pass
 
         # 连续错误计数 — 超过阈值后 ACK inbox，不再 resume
+        # 429 / rate-limit: 不计入放弃；独立长冷却后 resume
+        if is_rate_limit_error(error):
+            inbox_ids = list(self.pending_inbox_msg_ids or [])
+            if inbox_ids:
+                await self._write_resume_checkpoint(
+                    reason=f"rate_limit:{error_type}",
+                    inbox_ids=inbox_ids,
+                )
+                self.pending_inbox_msg_ids = None
+            self._arm_resume_cooldown(RATE_LIMIT_RESUME_COOLDOWN_S)
+            log.warning(
+                "llm_rate_limit_deferred",
+                agent_id=self.id,
+                cooldown_s=RATE_LIMIT_RESUME_COOLDOWN_S,
+                consecutive_errors=self._consecutive_errors,
+                inbox_left_unread=len(inbox_ids),
+            )
+            self._cancel_safety_timer()
+            await self._go_idle()
+            return
+
         self._consecutive_errors += 1
         is_total_timeout = (
             "请求总超时" in error_msg
