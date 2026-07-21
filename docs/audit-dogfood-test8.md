@@ -190,3 +190,41 @@
 | 6 | P3 派工错配 / 等待打旋 / 测试质量 | ⏭️ 不修（流程/提示词/策略层问题，随 P1 修复复测，建议单独立项） |
 
 **测试**：新增 `apps/hiveweave-py/tests/test_p1_p2_dogfood_fixes.py` 10 条全绿；后端测试套件除以下**既有失败**（干净 HEAD 上同样失败，与本次改动无关，已逐一核实）外全绿：`test_agent_interruption_counting`、`test_attestation_auto_attach::test_submit_auto_attaches_when_ids_omitted`、`test_doom_loop::test_commit_turn_trips_at_6`、`test_doom_readonly_exemption::test_write_tools_keep_table_limits`、`test_loop_hardening::test_submit_tool_requires_attestation`、`test_model_self_test::test_openrouter_api_query`、`test_open_task_reminder`×3、`test_worktree_stable_branch_callsites`×2。
+
+---
+
+# 附：TEST9 轮追加问题（2026-07-22）
+
+- **背景**：TEST9 项目（workspace `D:\PC_AI\Project\TEST9`）复测，后端经历重启后出现多 agent 永久停摆。
+- **数据来源**：per-project DB 只读核查 `D:\PC_AI\Project\TEST9\.hiveweave\data.db`（`agent_waits` / `inbox` / `scheduled_alarms` 表）。
+
+## P1 reply_required 无硬门：agent 只输出文字不调 send_message 即可退出，对方 wait 永不满足
+
+> **状态：已修复（本轮提交）** ✅
+
+**现象**：inbox 消息 `expect_report=1` / `message_type='ask'` 时，被问 agent 只输出 assistant 文字、不调用任何消息工具就能 `done_slice` 退出；问方 `agent_waits` 永远等不到回复。TEST9 中 CEO 对云澈先后建立 6 次 `ask_reply` wait，全部空等。
+
+**根因**：`agents/agent.py` 旧退出门禁（旧 line 1390 起）的 `pending_msgs` 只来自 `pending_inbox_msg_ids`，闹钟/超时唤醒路径 turn 开始后到达的未读消息不校验却会在成功退出时被 ACK；且 `services/turn_exit.py` 旧 `collect_unreplied_asks` 回复工具名单硬编码不全（缺 message_peer 等）、只看 LLM 工具调用记录、无任何送达证据与豁免边界——既漏判也误判。
+
+**修复摘要**：
+- `agents/agent.py:1384-1460`：pending 集合 = `pending_inbox_msg_ids` ∪ turn 开始后到达的未读消息（`get_pending_ids_since`，`inbox.py:620`）；构建 `exempt_senders`（user/system/不存在/已归档的发送方豁免）；用新方法 `get_sent_recipients_since`（`inbox.py:599`，本 turn 内 inbox 落库的送达证据）补充 replied_to。
+- `services/turn_exit.py:95-165`：`collect_unreplied_asks` 新增 `extra_replied_to` / `exempt_senders` 参数；回复工具判定改为 `_MSG_TOOLS`（turn_exit.py:166，覆盖 send_message/ask_agent/notify_agent/message_superior/message_peer/message_team/message_subordinate/message_user 全部消息工具）。判定全部基于结构化字段（from_agent_id、expect_report、message_type、落库送达记录），无文案猜测。
+- 未回复的 ask 归入既有 UNREPLIED_ASKS → REPAIR_VIOLATIONS → `should_repair=True` 走 [TURN EXIT BLOCKED] 重跑，耗尽后 blocked+escalate（既有机制，未改）。
+
+**回归测试**：`tests/test_reply_required_gate.py` 8 条（无回复被拦、send_message/message_peer 算回复、inbox 送达证据算回复、归档发送方豁免、回别人不算、done_slice 集成拦截、回复后放行）全绿。
+
+## P1 重启后 wait 超时闹钟不重建：parked agent 永久停摆
+
+> **状态：已修复（本轮提交）** ✅
+
+**现象**：后端重启后，TEST9 有 3 条 `agent_waits` 过期未清（星野 00:38:40、明镜 00:39:35、CEO 00:43:06，ref 均为云澈），`scheduled_alarms` 0 行，超时唤醒永不触发，parked agent 全部停摆。
+
+**根因**：超时清除 + [WAIT_TIMEOUT] + 唤醒只在 tick loop 的 `_process_wait_contracts`（`services/game_time.py:425`）中执行；而 `main.py:258` lifespan 启动时把所有项目 `is_started` 置 0（Bug K，一律 off-duty），tick loop 不启动，超时逻辑永不执行。
+
+**修复摘要**：
+- `services/game_time.py:534-623`：新增 `recover_wait_timeouts(project_id)`（幂等）——已到期 wait 立即走 `_process_wait_contracts`（与 tick 路径一致）；未到期 wait 逐个武装一次性 `loop.call_later` 定时器（`_on_wait_timer`，game_time.py:601），到期触发同一处理；`cancel_wait_recovery_timers`（game_time.py:609）在项目 `stop()` 时统一取消。tick loop 与恢复定时器幂等共存（`clear_expired` 只清一次）。
+- `main.py:285-296`：lifespan 新增 4c 步骤，agent_router 重建（4b）之后对所有项目调 `recover_wait_timeouts`，即使项目保持 off-duty 也能在超时点唤醒 parked agent。
+
+**回归测试**：`tests/test_wait_timeout_recovery.py` 3 条（已到期立即处理并唤醒、未到期武装定时器且幂等、武装定时器到期真实触发）全绿。
+
+**测试汇总**：新增 11 条全绿；相关回归套件（turn_exit×3、game_time_alarms×2、wait_cycle_break、p1_p2_dogfood_fixes、reply_policy、wake_policy_complete、inbox×5）86 条全绿。

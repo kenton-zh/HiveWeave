@@ -596,6 +596,27 @@ class InboxService:
             )
             return 0
 
+    async def get_sent_recipients_since(
+        self, agent_id: str, since_ms: int
+    ) -> set[str]:
+        """Recipients (to_agent_id) this agent successfully messaged since ``since_ms``.
+
+        reply_required 硬门用：inbox 落库即 send_message/message 工具成功
+        送达的 DB 证据（工具调用本身可能失败，以落库为准）。
+        """
+        await _ensure_schema(agent_id)
+        try:
+            rows = await project_db.query(
+                agent_id,
+                "SELECT DISTINCT to_agent_id FROM inbox "
+                "WHERE from_agent_id = ? AND created_at >= ?",
+                [agent_id, int(since_ms)],
+            )
+            return {r["to_agent_id"] for r in rows if r.get("to_agent_id")}
+        except Exception as e:
+            log.debug("inbox_sent_since_failed", error=str(e))
+            return set()
+
     async def get_pending_ids_since(
         self, agent_id: str, since_ms: int
     ) -> list[str]:

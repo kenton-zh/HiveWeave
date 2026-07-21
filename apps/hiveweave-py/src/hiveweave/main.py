@@ -282,6 +282,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("agent_router_rebuild_failed", error=str(e))
 
+    # 4c. P1(TEST9): 重启重建 wait 超时"闹钟"。agent_waits 持久化了 parked
+    # wait 的 expires_at，但超时唤醒依赖 tick；重启后项目 off-duty、tick
+    # 不跑，parked agent 会永久停摆。此处对所有项目：已到期 wait 立即
+    # 清除+通知+唤醒，未到期 wait 武装一次性定时器兜底（activate 后 tick
+    # 接管，幂等）。须在 agent_router 重建之后（[WAIT_TIMEOUT] 投递与
+    # 唤醒依赖路由）。
+    try:
+        from hiveweave.db import meta as meta_db
+        projects = await meta_db.query("SELECT id FROM projects WHERE 1=1")
+        for p in projects:
+            try:
+                await GameTimeService(p["id"]).recover_wait_timeouts(p["id"])
+            except Exception as e:
+                log.warning("wait_recovery_failed", project_id=p["id"],
+                            error=str(e))
+        log.info("wait_timeouts_recovered", projects=len(projects))
+    except Exception as e:
+        log.warning("wait_recovery_init_failed", error=str(e))
+
     # 5. Start agents only for started projects
     try:
         projects = await meta_db.query(

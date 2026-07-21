@@ -96,27 +96,40 @@ def collect_unreplied_asks(
     pending_msgs: list[dict],
     tool_calls: list,
     name_by_id: dict[str, str] | None = None,
+    extra_replied_to: set[str] | None = None,
+    exempt_senders: set[str] | None = None,
 ) -> list[dict]:
     """Messages that require a reply and were not answered this turn.
 
     Structural only: expect_report or message_type=ask (language-agnostic).
+
+    - extra_replied_to: 本 turn 内已成功送达的收件人（来自 inbox 落库记录，
+      即"成功调用 send_message/message 工具"的 DB 证据），与工具调用
+      参数提取的 replied_to 合并判定。
+    - exempt_senders: 豁免的发送方（已归档/不存在/user/system）——
+      对归档 agent 的回复义务随其归档消亡；user/system 的回复通道是
+      assistant 输出本身，不适用本门。
     """
     name_by_id = name_by_id or {}
+    exempt_senders = exempt_senders or set()
     expects: list[dict] = []
     for m in pending_msgs:
+        fid = m.get("from_agent_id", "")
+        if fid in exempt_senders:
+            continue
         mt = (m.get("message_type") or "").lower()
         if m.get("expect_report") or mt == "ask":
             expects.append(m)
     if not expects:
         return []
 
-    replied_to: set[str] = set()
+    replied_to: set[str] = set(extra_replied_to or ())
     for tc in tool_calls or []:
         if not isinstance(tc, dict):
             continue
         func = tc.get("function") or {}
         name = func.get("name") if isinstance(func, dict) else None
-        if name not in ("send_message", "ask_agent", "notify_agent", "message_superior"):
+        if name not in _MSG_TOOLS:
             continue
         raw = func.get("arguments", {})
         if isinstance(raw, str):

@@ -193,9 +193,17 @@ class GameTimeService:
         log.info("game_time_start", project_id=project_id,
                  game_seconds=state["current_game_seconds"],
                  duty_session_started_at_ms=state["duty_session_started_at_ms"])
+        # 重启/激活恢复：立即处理已到期 wait 并武装未到期 wait 定时器
+        # （tick 运行时幂等；off-duty 期间也保证超时唤醒可达）
+        try:
+            await self.recover_wait_timeouts(project_id)
+        except Exception as e:
+            log.warning("wait_recovery_on_start_failed",
+                        project_id=project_id, error=str(e))
 
     async def stop(self, project_id: str) -> None:
         state = _states.get(project_id)
+        self.cancel_wait_recovery_timers(project_id)
         if state and state.get("task"):
             state["task"].cancel()
             try:
@@ -522,6 +530,97 @@ class GameTimeService:
                     )
                 except Exception:
                     pass
+
+    async def recover_wait_timeouts(self, project_id: str) -> dict:
+        """重启恢复：重建 wait 超时的"闹钟"语义（P1 — TEST9 停摆）。
+
+        背景：agent_waits 表持久化了 parked wait 及 expires_at，但超时
+        唤醒依赖 tick loop 的 _process_wait_contracts；后端重启后项目
+        一律 off-duty（is_started=0，Bug K），tick 不跑，超时永不触发，
+        parked agent 永久停摆。
+
+        恢复策略（幂等，可在 lifespan / activate 重复调用）：
+        1. 已到期 wait → 立即走 _process_wait_contracts（清除 +
+           [WAIT_TIMEOUT] + 唤醒），与 tick 路径完全一致。
+        2. 未到期 wait → 为每个 wait 武装一次性 asyncio 定时器，到期即
+           触发一次 _process_wait_contracts。tick loop 若已运行，两者
+           幂等共存（clear_expired 只清一次）；项目 stop 时统一取消。
+
+        Returns: {"expired_processed": bool, "armed": int}
+        """
+        from hiveweave.services.wait_contract import wait_contract_service
+
+        now_ms = int(time.time() * 1000)
+        try:
+            active = await wait_contract_service.list_all_active(project_id)
+        except Exception as e:
+            log.warning("wait_recovery_list_failed", project_id=project_id,
+                        error=str(e))
+            return {"expired_processed": False, "armed": 0}
+
+        expired = [
+            w for w in active
+            if w.get("expiresAt") is not None and int(w["expiresAt"]) <= now_ms
+        ]
+        expired_processed = False
+        if expired:
+            # 与 tick 路径一致：clear_expired + [WAIT_TIMEOUT] + 唤醒
+            await self._process_wait_contracts(project_id)
+            expired_processed = True
+            log.info("wait_recovery_expired_processed",
+                     project_id=project_id, count=len(expired))
+
+        state = _states.get(project_id) or await self._load_state(project_id)
+        _states[project_id] = state
+        armed_ids: set[str] = state.setdefault("armed_wait_ids", set())
+        timers: list = state.setdefault("wait_recovery_timers", [])
+        armed = 0
+        loop = asyncio.get_running_loop()
+        for w in active:
+            wid = w.get("id")
+            exp = w.get("expiresAt")
+            if not wid or exp is None or int(exp) <= now_ms or wid in armed_ids:
+                continue
+            delay = max(0.0, (int(exp) - now_ms) / 1000.0)
+
+            def _make_cb(pid: str, wait_id: str):
+                def _cb() -> None:
+                    st = _states.get(pid)
+                    if st is not None:
+                        st.get("armed_wait_ids", set()).discard(wait_id)
+                    asyncio.create_task(self._on_wait_timer(pid, wait_id))
+                return _cb
+
+            timers.append(loop.call_later(delay, _make_cb(project_id, wid)))
+            armed_ids.add(wid)
+            armed += 1
+        if armed:
+            log.info("wait_recovery_armed", project_id=project_id, armed=armed)
+        return {"expired_processed": expired_processed, "armed": armed}
+
+    async def _on_wait_timer(self, project_id: str, wait_id: str) -> None:
+        """一次性 wait 定时器回调：到期处理（幂等，已被 tick 清除则无操作）。"""
+        try:
+            await self._process_wait_contracts(project_id)
+        except Exception as e:
+            log.error("wait_recovery_timer_failed", project_id=project_id,
+                      wait_id=wait_id, error=str(e))
+
+    def cancel_wait_recovery_timers(self, project_id: str) -> int:
+        """取消项目所有 wait 恢复定时器（项目 stop 时调用）。返回取消数。"""
+        state = _states.get(project_id)
+        if not state:
+            return 0
+        n = 0
+        for h in state.get("wait_recovery_timers", []) or []:
+            try:
+                h.cancel()
+                n += 1
+            except Exception:
+                pass
+        state["wait_recovery_timers"] = []
+        state["armed_wait_ids"] = set()
+        return n
 
     async def _break_peer_review_deadlocks(
         self,
