@@ -49,6 +49,31 @@ async def env():
         async def fake_get_agent_project_id(aid: str):
             return PROJECT_ID if aid in (COORDINATOR_ID, EXECUTOR_ID) else None
 
+        # org_span 硬门（3049834 起）要求真实组织关系：dispatch 只能派直属
+        # 下属，且 assignee 须具备 SOURCE_WRITE。夹具插入满足新契约的最小
+        # 组织链：coordinator（无上级）→ executor（parent_id=coordinator）。
+        _FAKE_AGENTS = {
+            COORDINATOR_ID: {
+                "id": COORDINATOR_ID,
+                "name": "Test Coordinator",
+                "parent_id": None,
+                "permission_type": "coordinator",
+                "role": "架构师",
+                "status": "active",
+            },
+            EXECUTOR_ID: {
+                "id": EXECUTOR_ID,
+                "name": "Test Executor",
+                "parent_id": COORDINATOR_ID,
+                "permission_type": "executor",
+                "role": "engineer",
+                "status": "active",
+            },
+        }
+
+        async def fake_get_agent_by_id(aid: str):
+            return _FAKE_AGENTS.get(aid)
+
         # Reset migration tracking + agent cache so the fresh DB is fully set up.
         # (task._migrated gates the due_at ALTER TABLE; without clearing it the
         #  second test would skip migration on a brand-new DB missing due_at.)
@@ -63,7 +88,9 @@ async def env():
         with patch("hiveweave.db.meta.get_project_workspace",
                    fake_get_project_workspace), \
              patch("hiveweave.db.meta.get_agent_project_id",
-                   fake_get_agent_project_id):
+                   fake_get_agent_project_id), \
+             patch("hiveweave.db.meta.get_agent_by_id",
+                   fake_get_agent_by_id):
             yield {
                 "project_id": PROJECT_ID,
                 "workspace_path": workspace_path,
