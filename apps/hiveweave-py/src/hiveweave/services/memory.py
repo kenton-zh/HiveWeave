@@ -133,18 +133,32 @@ class MemoryService:
         return result
 
     async def get_agent_memories(self, agent_id: str, project_id: str,
-                                 scope: str = "agent") -> list[dict]:
-        """Get an agent's memories for a given scope. 5min TTL."""
-        key = (project_id, "agent", agent_id, scope)
+                                 scope: str = "agent",
+                                 module_id: str | None = None) -> list[dict]:
+        """Get an agent's memories for a given scope. 5min TTL.
+
+        module_id: 可选模块过滤（匹配 memories.module_id 列）。BUG-P1a:
+        此前工具层把 moduleId 错当 scope 传入，导致写入 scope='agent'
+        的记忆永远读不回。
+        """
+        key = (project_id, "agent", agent_id, scope, module_id)
         cached = self._cache_get(key)
         if cached is not None:
             return cached
         conn = await self._conn(project_id)
-        cursor = await conn.execute(
-            "SELECT id, agent_id, scope, module_id, type, content, source_agent_id, "
-            "metadata, created_at, updated_at FROM memories "
-            "WHERE scope = ? AND agent_id = ? ORDER BY created_at ASC LIMIT 100",
-            [scope, agent_id])
+        if module_id:
+            cursor = await conn.execute(
+                "SELECT id, agent_id, scope, module_id, type, content, source_agent_id, "
+                "metadata, created_at, updated_at FROM memories "
+                "WHERE scope = ? AND agent_id = ? AND module_id = ? "
+                "ORDER BY created_at ASC LIMIT 100",
+                [scope, agent_id, module_id])
+        else:
+            cursor = await conn.execute(
+                "SELECT id, agent_id, scope, module_id, type, content, source_agent_id, "
+                "metadata, created_at, updated_at FROM memories "
+                "WHERE scope = ? AND agent_id = ? ORDER BY created_at ASC LIMIT 100",
+                [scope, agent_id])
         rows = await cursor.fetchall()
         await cursor.close()
         result = [self._row_to_memory(r) for r in rows]

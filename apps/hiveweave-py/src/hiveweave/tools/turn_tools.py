@@ -14,7 +14,10 @@ from hiveweave.services.turn_result import (
     parse_turn_result,
     validate_phase_fields,
 )
-from hiveweave.services.turn_session import set_pending_turn_result
+from hiveweave.services.turn_session import (
+    get_pending_turn_result,
+    set_pending_turn_result,
+)
 
 
 # ── commit_turn ──────────────────────────────────────────
@@ -89,6 +92,22 @@ async def commit_turn_tool(
         )
 
     payload = tr.to_persist_dict()
+
+    # P2 doom loop 缓解：同一 turn 内同参数 commit_turn 已被接受过时，
+    # 返回差异化提示（而非逐字相同的 "TurnResult accepted"），让模型看到
+    # 新信息，打破"相同工具结果 → 相同决策"的重复调用循环。
+    prev = get_pending_turn_result(agent_id)
+    if isinstance(prev, dict) and prev == payload:
+        return ToolResult.ok(
+            f"TurnResult ALREADY committed (phase={tr.phase}) — this exact "
+            "commit_turn was already accepted this turn. Do NOT call "
+            "commit_turn again with the same arguments; produce your final "
+            "assistant text now and let the exit gates evaluate. If a gate "
+            "rejects the exit, it will tell you what is still outstanding.",
+            turn_result=payload,
+            duplicate=True,
+        )
+
     set_pending_turn_result(agent_id, payload)
 
     # Persist for observability

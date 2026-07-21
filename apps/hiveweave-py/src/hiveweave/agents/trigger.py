@@ -432,20 +432,33 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
 
         from hiveweave.services.chat_message import ChatMessageService
 
-        chat_msg_service = ChatMessageService()
-        saved = await chat_msg_service.save_message(
-            {
-                "agent_id": agent_id,
-                "role": "user",
-                "content": chat_context,
-                "is_background": True,
-                "is_read": False,
-                "is_context": True,
-                "team_from_agent_id": from_agent_id,
-                "team_to_agent_id": agent_id,
-            }
+        # P2 三连发：digest 写库前过 team_chat 去重（与 record_message 同规则）。
+        # 窗口内重复 → 跳过写库（digest_msg_id=None），但仍正常 chat —
+        # 超时重试语义不变：重试唤醒 agent，只是不重复落同一条消息。
+        from hiveweave.services.team_chat import TeamChatService
+
+        is_dup = await TeamChatService().check_and_mark(
+            agent_id, from_agent_id or "system", agent_id, chat_context
         )
-        digest_msg_id = saved.get("id") if isinstance(saved, dict) else None
+        digest_msg_id = None
+        if is_dup:
+            log.info("trigger_digest_deduped", agent_id=agent_id,
+                     name=agent_record.get("name"))
+        else:
+            chat_msg_service = ChatMessageService()
+            saved = await chat_msg_service.save_message(
+                {
+                    "agent_id": agent_id,
+                    "role": "user",
+                    "content": chat_context,
+                    "is_background": True,
+                    "is_read": False,
+                    "is_context": True,
+                    "team_from_agent_id": from_agent_id,
+                    "team_to_agent_id": agent_id,
+                }
+            )
+            digest_msg_id = saved.get("id") if isinstance(saved, dict) else None
 
         # 9. 调用 chat
         # 对齐 Elixir agent.ex:264:

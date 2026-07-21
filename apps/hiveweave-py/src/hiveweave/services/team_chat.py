@@ -84,6 +84,43 @@ class TeamChatService:
 
         return "ok"
 
+    async def check_and_mark(self, agent_id: str, from_agent_id: str,
+                             to_agent_id: str, content: str) -> bool:
+        """原子化"检查+登记"去重（供不写 chat_messages 的调用方使用）。
+
+        背景（P2 三连发）：trigger digest 经 ChatMessageService.save_message
+        直写 chat_messages，绕过 record_message 的去重，导致同一 digest
+        在同一秒内向同一 agent 落库 3 次。调用方（如 agents/trigger.py）
+        在写消息前调用本方法：返回 True 表示窗口内重复，应跳过写库；
+        返回 False 表示已登记 dedupe_key，可正常写库。
+
+        - dedupe_key 与 record_message 同规则：MD5("{from}:{to}:{content}")
+        - fail-open：任何异常返回 False（宁可重复不丢消息）
+
+        Returns: True = duplicate（跳过写库）; False = newly marked（可写库）
+        """
+        dedupe_key = hashlib.md5(
+            f"{from_agent_id}:{to_agent_id}:{content}".encode()
+        ).hexdigest()
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - _DEDUPE_WINDOW_MS
+        try:
+            if await self._is_duplicate(agent_id, dedupe_key, cutoff):
+                log.info("team_chat_dedup_mark", agent_id=agent_id,
+                         from_agent_id=from_agent_id, to_agent_id=to_agent_id)
+                return True
+            dedupe_id = str(uuid.uuid4())
+            await project_db.execute(
+                agent_id,
+                "INSERT INTO team_chat_dedupe (id, agent_id, dedupe_key, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                [dedupe_id, agent_id, dedupe_key, now_ms])
+            return False
+        except Exception as e:
+            log.warning("team_chat_check_mark_failed", agent_id=agent_id,
+                        error=str(e))
+            return False
+
     async def get_history(self, agent_id: str, limit: int = 50) -> list[dict]:
         """Get team chat history (chronological order). Default limit 50.
 
