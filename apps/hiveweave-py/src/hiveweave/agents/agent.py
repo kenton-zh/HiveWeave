@@ -1387,20 +1387,74 @@ class Agent:
         from hiveweave.services.turn_session import pop_pending_turn_result
 
         pending_msgs: list[dict] = []
+        all_pending: list[dict] = []
         if self.pending_inbox_msg_ids:
             all_pending = await self._inbox.get_pending_messages(self.id)
             id_set = set(self.pending_inbox_msg_ids)
             pending_msgs = [m for m in all_pending if m["id"] in id_set]
 
+        # P1(reply_required 硬门): 本 turn 处理的消息 = 触发携带的 inbox
+        # 消息 ∪ turn 开始后到达的未读消息。后者（闹钟/超时唤醒等路径）
+        # 此前不参加未回复校验，却会在成功退出时被一并 ACK ——
+        # reply_required 消息被静默已读，对方 agent_waits 永远不满足。
+        turn_started_ms = int((self.current_job or {}).get("started_at") or 0)
+        if turn_started_ms:
+            try:
+                if not all_pending:
+                    all_pending = await self._inbox.get_pending_messages(
+                        self.id
+                    )
+                extra_ids = set(
+                    await self._inbox.get_pending_ids_since(
+                        self.id, turn_started_ms
+                    )
+                )
+                seen = {m["id"] for m in pending_msgs}
+                for m in all_pending:
+                    if m["id"] in extra_ids and m["id"] not in seen:
+                        pending_msgs.append(m)
+                        seen.add(m["id"])
+            except Exception as e:
+                log.debug("reply_gate_mid_turn_merge_failed", error=str(e))
+
         name_by_id: dict[str, str] = {}
+        exempt_senders: set[str] = set()
+        from hiveweave.services.wake_policy import is_user_sender
+
         for m in pending_msgs:
             fid = m.get("from_agent_id") or ""
-            if fid and fid not in name_by_id:
-                ag = await meta_db.get_agent_by_id(fid)
+            if not fid:
+                continue
+            ag = await meta_db.get_agent_by_id(fid)
+            if fid not in name_by_id:
                 name_by_id[fid] = ag.get("name", fid[:8]) if ag else fid[:8]
+            # 豁免边界（结构化判定，不猜文案）：
+            # - user/system 发送方：回复通道是 assistant 输出本身
+            # - 发送方已归档/不存在：回复义务随其消亡，不得死锁退出门禁
+            if (
+                is_user_sender(fid)
+                or fid == "system"
+                or ag is None
+                or (ag.get("status") or "") == "archived"
+            ):
+                exempt_senders.add(fid)
+
+        # 本 turn 成功送达的收件人（inbox 落库 = send_message 成功的 DB 证据）
+        sent_to: set[str] = set()
+        if turn_started_ms:
+            try:
+                sent_to = await self._inbox.get_sent_recipients_since(
+                    self.id, turn_started_ms
+                )
+            except Exception as e:
+                log.debug("reply_gate_sent_lookup_failed", error=str(e))
 
         unreplied_asks = collect_unreplied_asks(
-            pending_msgs, tool_calls, name_by_id
+            pending_msgs,
+            tool_calls,
+            name_by_id,
+            extra_replied_to=sent_to,
+            exempt_senders=exempt_senders,
         )
 
         open_obligations: list[dict] = []
