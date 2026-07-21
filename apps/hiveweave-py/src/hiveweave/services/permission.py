@@ -32,7 +32,7 @@ _BASE_TOOLS = frozenset({
     "read_memory", "write_memory",
     "send_message", "message_superior", "message_subordinate",
     "message_peer", "message_team",
-    "ask_agent", "notify_agent", "commit_turn",
+    "ask_agent", "notify_agent", "commit_turn", "defer_task_advance",
     "lookup_dev_server",
     "read_roster", "update_roster", "write_work_log",
     "request_review", "list_subordinates", "check_agent_status",

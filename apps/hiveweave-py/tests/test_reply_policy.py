@@ -1,4 +1,4 @@
-"""Tests for reply_policy hard rules + soft expect_report detection."""
+"""Tests for reply_policy — structured expect_report only (language-agnostic)."""
 
 from __future__ import annotations
 
@@ -14,29 +14,21 @@ from hiveweave.services.reply_policy import (
 )
 
 
-@pytest.mark.parametrize(
-    "text,expected",
-    [
-        ("工具可用性验证。请依次执行检查并回复结果。", True),
-        ("回复格式：工具名 + 结果。有任何失败立即报告。", True),
-        ("Please reply with the test results.", True),
-        ("report back when done", True),
-        ("招聘完成，7人全部到位。", False),
-        ("模块划分批准，你直接向天线发送招聘请求。", False),
-        ("", False),
-        (None, False),
-    ],
-)
-def test_message_requests_reply(text, expected):
-    assert message_requests_reply(text) is expected
+def test_message_requests_reply_never_scans_text():
+    """Free-text must never imply reply-need (any language)."""
+    assert message_requests_reply("请依次执行检查并回复结果。") is False
+    assert message_requests_reply("Please reply with the test results.") is False
+    assert message_requests_reply("report back when done") is False
+    assert message_requests_reply("招聘完成") is False
+    assert message_requests_reply("") is False
+    assert message_requests_reply(None) is False
 
 
-def test_resolve_expect_report_explicit_and_heuristic():
-    assert resolve_expect_report(True, "随便看看") is True
-    assert resolve_expect_report(False, "请回复结果") is True
-    assert resolve_expect_report(None, "请回复结果") is True
-    assert resolve_expect_report(False, "FYI 已完成招聘") is False
-    assert resolve_expect_report(None, "FYI 已完成招聘") is False
+def test_resolve_expect_report_explicit_only():
+    assert resolve_expect_report(True, "anything") is True
+    assert resolve_expect_report(False, "请回复结果") is False
+    assert resolve_expect_report(None, "Please reply") is False
+    assert resolve_expect_report(False, "FYI") is False
 
 
 def _make_agent() -> Agent:
@@ -54,8 +46,8 @@ def _make_agent() -> Agent:
 
 
 @pytest.mark.asyncio
-async def test_unreplied_detects_soft_expect_without_flag():
-    """CEO forgot expect_report=1 but text asks for 回复 → still unreplied."""
+async def test_unreplied_ignores_soft_text_without_flag():
+    """Without expect_report / ask type, free-text is not an obligation."""
     ag = _make_agent()
     ag._inbox.get_pending_messages = AsyncMock(
         return_value=[
@@ -64,6 +56,7 @@ async def test_unreplied_detects_soft_expect_without_flag():
                 "from_agent_id": "ceo-id",
                 "message": "工具可用性验证。请依次执行并回复结果。",
                 "expect_report": 0,
+                "message_type": "normal",
             }
         ]
     )
@@ -74,8 +67,7 @@ async def test_unreplied_detects_soft_expect_without_flag():
     ):
         unreplied = await ag._check_unreplied_expect_report(tool_calls=[])
 
-    assert len(unreplied) == 1
-    assert unreplied[0]["from_name"] == "归零"
+    assert unreplied == []
 
 
 @pytest.mark.asyncio
@@ -86,8 +78,9 @@ async def test_unreplied_cleared_when_send_message_to_sender():
             {
                 "id": "msg-1",
                 "from_agent_id": "ceo-id",
-                "message": "请回复结果",
+                "message": "any language body",
                 "expect_report": 1,
+                "message_type": "ask",
             }
         ]
     )
@@ -96,7 +89,7 @@ async def test_unreplied_cleared_when_send_message_to_sender():
             "function": {
                 "name": "send_message",
                 "arguments": json.dumps(
-                    {"recipients": ["归零"], "message": "验证通过"}
+                    {"recipients": ["归零"], "message": "ok"}
                 ),
             }
         }

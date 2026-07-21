@@ -1,4 +1,4 @@
-"""Empty done_slice detection + complete wake policy (TEST4)."""
+"""Empty done_slice detection + complete wake policy (any message wakes)."""
 
 from hiveweave.services.wake_policy import should_wake
 
@@ -39,25 +39,46 @@ def test_empty_done_slice_false_with_substantive():
     )
 
 
-def test_complete_skips_non_user_non_task_wake():
+def test_complete_wakes_on_any_message():
     assert should_wake(
         "command", disposition="complete", from_agent_id="peer"
-    ) is False
+    ) is True
     assert should_wake(
         "task_transition", disposition="complete", from_agent_id="peer"
     ) is True
     assert should_wake(
         "command", disposition="complete", from_agent_id="user"
     ) is True
+    assert should_wake(
+        "ask", disposition="complete", from_agent_id="peer"
+    ) is True
+    assert should_wake(
+        "progress", disposition="complete", from_agent_id="peer"
+    ) is True
 
 
 def _complete_trigger_allowed(opts: dict) -> bool:
-    """Mirror agent.chat complete-skip allow gate (trigger path)."""
-    wake_cat = opts.get("wake_category") or ""
+    """Mirror agent.chat complete-skip allow gate via admit_wake."""
+    from hiveweave.services.wake_policy import admit_wake
+
+    wake_cat = opts.get("wake_category") or "command"
+    if wake_cat not in (
+        "command",
+        "ask",
+        "approval",
+        "task_transition",
+        "progress",
+    ):
+        wake_cat = "command"
+    admit = admit_wake(
+        wake_cat,
+        disposition="complete",
+        from_agent_id=opts.get("from_agent_id"),
+        recipient_parent_id=opts.get("recipient_parent_id"),
+    )
     source = opts.get("source") or ""
     is_task_wake = (
-        wake_cat == "task_transition"
-        or source
+        source
         in (
             "task",
             "dispatch",
@@ -68,12 +89,20 @@ def _complete_trigger_allowed(opts: dict) -> bool:
         or opts.get("message_type") == "task"
         or bool(opts.get("task_id"))
     )
-    return bool(is_task_wake or opts.get("from_user"))
+    return bool(admit.ok or is_task_wake or opts.get("from_user"))
 
 
-def test_complete_chat_opts_allow_task_transition_category():
+def test_complete_chat_opts_allow_any_wake_category():
     assert _complete_trigger_allowed({"wake_category": "task_transition"})
     assert _complete_trigger_allowed({"source": "task"})
     assert _complete_trigger_allowed({"message_type": "task"})
-    assert not _complete_trigger_allowed({"wake_category": "command"})
-    assert not _complete_trigger_allowed({"source": "trigger"})
+    assert _complete_trigger_allowed(
+        {"wake_category": "ask", "from_agent_id": "peer"}
+    )
+    assert _complete_trigger_allowed(
+        {"wake_category": "command", "from_agent_id": "peer"}
+    )
+    assert _complete_trigger_allowed({"source": "trigger"})
+    assert _complete_trigger_allowed(
+        {"wake_category": "progress", "from_agent_id": "peer"}
+    )

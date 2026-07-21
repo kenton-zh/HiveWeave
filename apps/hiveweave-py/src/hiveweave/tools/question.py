@@ -2,9 +2,11 @@
 
 契约 02: 工具执行器 — question 子模块
 - 持久化 question 到 per-project DB (questions 表)
-- 通过 in-memory asyncio.Future 阻塞等待用户回答（120s 超时）
+- 通过 in-memory asyncio.Future 阻塞等待用户回答（QUESTION_TIMEOUT_S）
 - 超时返回友好提示（不阻塞 agent 流程）
 - 前端通过 API 控制器调用 resolve_question() 提交答案
+- streamer 对 question 使用更长工具超时（>_QUESTION_TOOL_TIMEOUT_S），
+  避免 120s 通用工具超时抢先取消本 Future
 """
 
 from __future__ import annotations
@@ -39,9 +41,11 @@ async def execute_question(
     question: str,
     options: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Ask the user a question and block until answered or 120s timeout.
+    """Ask the user a question and block until answered or timeout.
 
     Returns {success, output, error} where output is the user's answer.
+    Waits up to ``QUESTION_TIMEOUT_S`` (180s); streamer must use a longer
+    per-tool timeout so it does not cancel this wait at 120s.
     """
     if not question or not question.strip():
         return {"success": False, "output": "",

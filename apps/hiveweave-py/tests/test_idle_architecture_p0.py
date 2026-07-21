@@ -22,39 +22,52 @@ from hiveweave.services.task import TaskService
 from hiveweave.services.wake_policy import classify_message, should_wake
 
 
-def test_progress_message_no_wake():
+def test_notify_still_wakes():
     cat = classify_message(
-        message="全部完成。290/290 测试通过。三人交付全部批准。",
+        message="任意语言的完成汇报",
+        message_type="notify",
         from_agent_id="arch-1",
     )
-    assert cat == "progress"
-    assert should_wake(cat) is False
+    assert cat == "message"
+    assert should_wake(cat) is True
 
 
 def test_ask_still_wakes():
     cat = classify_message(
-        message="请回复验收结果",
+        message="any language please reply",
         expect_report=True,
+        message_type="ask",
         from_agent_id="ceo",
     )
-    assert cat == "ask"
+    assert cat == "message"
     assert should_wake(cat) is True
 
 
-def test_waiting_human_blocks_peer_progress():
+def test_waiting_human_allows_peer_notify():
     cat = classify_message(
-        message="全部完成。275/275 测试通过。",
+        message="done",
+        message_type="notify",
         from_agent_id="arch-1",
     )
-    assert should_wake(cat, disposition="waiting_human", from_agent_id="arch-1") is False
+    assert should_wake(cat, disposition="waiting_human", from_agent_id="arch-1") is True
 
 
 def test_waiting_human_allows_user():
     cat = classify_message(
-        message="页面空白了",
+        message="page is blank",
         from_agent_id="user",
     )
     assert should_wake(cat, disposition="waiting_human", from_agent_id="user") is True
+
+
+def test_hire_send_message_has_no_category_taxonomy():
+    """Platform no longer classifies hire orders vs progress."""
+    cat = classify_message(
+        message="需招聘 4 人……请报各花名和ID。",
+        message_type="normal",
+        from_agent_id="ceo",
+    )
+    assert cat == "message"
 
 
 def test_reserved_ports():
@@ -114,7 +127,7 @@ async def task_env():
 
 
 @pytest.mark.asyncio
-async def test_actionable_excludes_approved(task_env):
+async def test_actionable_includes_approved_as_creator_merge_duty(task_env):
     ts = TaskService()
     pid = task_env["project_id"]
     tid = await ts.create_task(
@@ -132,8 +145,9 @@ async def test_actionable_excludes_approved(task_env):
     parent = await ts.get_task(pid, tid)
     assert parent["status"] == "approved"
 
+    # CREATOR_MUST_MERGE: approved 任务是 creator 的 merge 义务
     creator_obs = await ts.get_actionable_obligations(pid, COORD)
-    assert all(t["id"] != tid for t in creator_obs)
+    assert any(t["id"] == tid for t in creator_obs)
 
 
 @pytest.mark.asyncio
@@ -176,7 +190,7 @@ async def test_verify_approve_closes_parent(task_env):
 
 
 @pytest.mark.asyncio
-async def test_progress_inbox_should_not_wake(monkeypatch):
+async def test_progress_inbox_should_wake(monkeypatch):
     from hiveweave.services.inbox import InboxService
 
     svc = InboxService()
@@ -212,16 +226,17 @@ async def test_progress_inbox_should_not_wake(monkeypatch):
             "arch",
             "ceo",
             "全部完成。290/290 测试通过。三人交付全部批准。",
+            message_type="notify",
             recipient_disposition="waiting_human",
         )
 
-    assert msg["should_wake"] is False
-    assert msg["category"] == "progress"
-    # wake=0 and read=1 in insert params
+    assert msg["should_wake"] is True
+    assert msg["category"] == "message"
+    # wake=1 and read=0 in insert params
     insert = next(i for i in inserts if "INSERT INTO inbox" in i[0])
     # params: id, from, to, message, read, created, type, expect, priority, task, wake, key
-    assert insert[1][4] == 1  # read
-    assert insert[1][10] == 0  # wake
+    assert insert[1][4] == 0  # read
+    assert insert[1][10] == 1  # wake
 
 
 @pytest.mark.asyncio

@@ -96,7 +96,7 @@ async def test_wait_contract_persist_and_match(wait_env):
             from_agent_id="peer-1",
             active_waits=active,
         )
-        is False
+        is True
     )
 
     n = await svc.clear_waits(pid, AGENT_ID)
@@ -144,7 +144,7 @@ def test_wait_ref_matches_flower_name_not_just_uuid():
         )
         is True
     )
-    # Wrong agent must not wake
+    # Wrong agent still wakes (product: any message wakes)
     assert (
         should_wake(
             "command",
@@ -154,7 +154,7 @@ def test_wait_ref_matches_flower_name_not_just_uuid():
             from_short_id="A003",
             active_waits=waits,
         )
-        is False
+        is True
     )
 
 
@@ -186,7 +186,7 @@ def test_command_pierces_timer_external_waits():
             from_agent_name="归零",
             active_waits=waits,
         )
-        is False
+        is True
     )
 
 def test_category_to_wake_event():
@@ -299,7 +299,7 @@ def test_matched_agent_wait_wakes_even_if_waiting_human():
         )
         is True
     )
-    # Unrelated peer still blocked
+    # Unrelated peer still wakes (product: any message wakes)
     assert (
         should_wake(
             cat,
@@ -309,5 +309,5 @@ def test_matched_agent_wait_wakes_even_if_waiting_human():
             from_short_id="A099",
             active_waits=waits,
         )
-        is False
+        is True
     )

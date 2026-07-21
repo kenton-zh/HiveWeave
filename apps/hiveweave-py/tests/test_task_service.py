@@ -304,6 +304,10 @@ class TestDispatchReturn:
         assert isinstance(result["task_id"], str)
         assert len(result["task_id"]) > 0
         assert result["handoff_id"] is not None
+        task = await TaskService().get_task(env["project_id"], result["task_id"])
+        assert task["status"] == "claimed"
+        assert task["assignee_id"] == env["executor_id"]
+        assert task["claimed_at"] is not None
 
 
 # ── SubTask 8.6: task_id 串联测试 ───────────────────────────

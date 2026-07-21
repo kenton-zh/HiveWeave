@@ -511,6 +511,16 @@ async def hire_agent_tool(
                 error=str(mig_err),
             )
 
+        # Do NOT auto-send inbox — that steals the agent's judgment.
+        # Surface the unfinished chain so the model chooses to advance.
+        next_action = (
+            "\n\n⚠️ NEXT ACTION (required before commit_turn done_slice):\n"
+            "  hire_agent only creates the person — the requester does NOT know yet.\n"
+            "  Call send_message / ask_agent / notify_agent to the requester NOW with:\n"
+            f"    name={name}, shortId={new_short}, role={role}, permission={perm_type}.\n"
+            "  Assistant text / work_log alone is NOT a notification (fabrication).\n"
+        )
+
         return ToolResult.ok(
             f"Agent hired successfully.\n"
             f"  Name: {name}\n"
@@ -524,6 +534,7 @@ async def hire_agent_tool(
             f"  Skills: {skills}\n"
             f"  Backstory: {backstory[:100] if backstory else '(none)'}"
             f"{retry_note}"
+            f"{next_action}"
         )
     except Exception as e:
         return ToolResult.err(f"Failed to hire agent: {e}")
@@ -724,7 +735,12 @@ def _format_live_badge(target_id: str, db_status: str) -> tuple[str, str]:
     return "🟢", "🟢 idle (available)"
 
 
-def _format_agent_status_line(agent: dict, *, detailed: bool = False) -> str:
+def _format_agent_status_line(
+    agent: dict,
+    *,
+    detailed: bool = False,
+    unread_wake: int | None = None,
+) -> str:
     """One-line status for a single agent dict from OrgService."""
     aid = agent["id"]
     name = agent.get("name") or "?"
@@ -734,6 +750,10 @@ def _format_agent_status_line(agent: dict, *, detailed: bool = False) -> str:
     perm = agent.get("permission_type") or ""
     perm_badge = "👔" if perm == "coordinator" else "⚙️"
     short_badge, detail_badge = _format_live_badge(aid, db_status)
+
+    inbox_bit = ""
+    if unread_wake is not None and unread_wake > 0:
+        inbox_bit = f" | unread_wake={unread_wake}"
 
     if detailed:
         live = None
@@ -749,17 +769,33 @@ def _format_agent_status_line(agent: dict, *, detailed: bool = False) -> str:
             if queue_len:
                 extra = f" | queue={queue_len}"
         return (
-            f"{perm_badge} **{name}** ({short}) — {detail_badge} | role: {role}{extra}"
+            f"{perm_badge} **{name}** ({short}) — {detail_badge} | "
+            f"role: {role}{extra}{inbox_bit}"
         )
     return (
-        f"  {short_badge} {perm_badge} {name} ({short}) — {role} | {detail_badge}"
+        f"  {short_badge} {perm_badge} {name} ({short}) — {role} | "
+        f"{detail_badge}{inbox_bit}"
     )
+
+
+async def _unread_wake_count(target_id: str) -> int:
+    """Unread wake=1 inbox count (fail soft → 0)."""
+    try:
+        from hiveweave.services.inbox import InboxService
+
+        pending, _bg = await InboxService().count_pending_and_background(
+            target_id
+        )
+        return int(pending)
+    except Exception:
+        return 0
 
 
 @tool(
     "check_agent_status",
     "Check whether a colleague is busy (processing) or idle, and their "
-    "disposition (waiting_human / blocked / runnable). "
+    "disposition (waiting_human / blocked / runnable). Also shows "
+    "unread_wake count (pending inbox that can wake them). "
     "ALWAYS call this BEFORE claiming someone is busy/idle, and BEFORE "
     "urging/nagging a colleague who has not replied. "
     "Pass agentId=花名/short_id/UUID for one agent; omit agentId to list "
@@ -800,7 +836,12 @@ async def check_agent_status_tool(
             return ToolResult.err(
                 f'Agent "{target_ref}" is not in your project.'
             )
-        return ToolResult.ok(_format_agent_status_line(target, detailed=True))
+        unread = await _unread_wake_count(target["id"])
+        return ToolResult.ok(
+            _format_agent_status_line(
+                target, detailed=True, unread_wake=unread
+            )
+        )
 
     # No target — list all agents in the project
     all_agents = await ctx.org.list_agents(project_id)
@@ -814,7 +855,10 @@ async def check_agent_status_tool(
         return (archived, a.get("short_id") or "", a.get("name") or "")
 
     sorted_agents = sorted(all_agents, key=_sort_key)
-    lines = [_format_agent_status_line(a) for a in sorted_agents]
+    lines = []
+    for a in sorted_agents:
+        unread = await _unread_wake_count(a["id"])
+        lines.append(_format_agent_status_line(a, unread_wake=unread))
     return ToolResult.ok(
         f"## Agent Status ({len(sorted_agents)} agents)\n" + "\n".join(lines)
     )

@@ -635,7 +635,8 @@ class CreateTaskParams(BaseModel):
 
 @tool(
     "create_task",
-    "Ledger-only: draft or queue a task (status=created). Does NOT wake anyone — call dispatch_task to deliver.",
+    "Ledger entry. Unassigned → status=created (draft). With assigneeId → claimed "
+    "(assign=claim; no separate claim_task). Does NOT wake anyone — call dispatch_task to deliver.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -718,9 +719,17 @@ async def create_task_tool(
             tags=params.tags,
             source="agent",
         )
+        task = await ts.get_task(project_id, task_id)
+        st = (task or {}).get("status") or "created"
+        note = (
+            f"status={st} (assign=claim)"
+            if assignee_id and st == "claimed"
+            else f"status={st}"
+        )
         return ToolResult.ok(
-            f"Task created (id={task_id}): {params.title}",
+            f"Task created (id={task_id}, {note}): {params.title}",
             task_id=task_id,
+            status=st,
         )
     except Exception as e:
         return ToolResult.err(f"Failed to create task: {e}")
@@ -742,7 +751,8 @@ class ClaimTaskParams(BaseModel):
 
 @tool(
     "claim_task",
-    "Claim a task (created -> claimed), setting yourself as assignee.",
+    "Pick up an unassigned draft (created → claimed). Not needed when create_task/"
+    "dispatch already set assigneeId — assign is claim.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -1444,6 +1454,13 @@ async def review_task_tool(
                 )
 
             if ahead == 0 and has_claimed_files:
+                await _inject_merge_pending_wake(
+                    project_id=project_id,
+                    reviewer_id=agent_id,
+                    task=task_after or task,
+                    short_id=short,
+                    reason="uncommitted_files_changed",
+                )
                 return ToolResult.ok(
                     f"Task {params.task_id} approved against assignee worktree"
                     f"{f' ({wt})' if wt else ''}, but HEAD is 0 commits ahead "
@@ -1454,6 +1471,13 @@ async def review_task_tool(
                     f"git_worktree_merge(branchName='{short or 'hw/<short_id>/...'}')."
                 )
 
+            await _inject_merge_pending_wake(
+                project_id=project_id,
+                reviewer_id=agent_id,
+                task=task_after or task,
+                short_id=short,
+                reason="approved_needs_merge",
+            )
             return ToolResult.ok(
                 f"Task {params.task_id} approved against assignee worktree"
                 f"{f' ({wt})' if wt else ''}. "
@@ -1467,6 +1491,54 @@ async def review_task_tool(
         return ToolResult.ok(f"Task {params.task_id} sent back for rework.")
     except Exception as e:
         return ToolResult.err(f"Failed to review task: {e}")
+
+
+async def _inject_merge_pending_wake(
+    *,
+    project_id: str,
+    reviewer_id: str,
+    task: dict,
+    short_id: str = "",
+    reason: str = "approved_needs_merge",
+) -> None:
+    """Wake the approving coordinator to git_worktree_merge (same-turn follow-up)."""
+    tid = str(task.get("id") or "")
+    title = (task.get("title") or "(untitled)").split("\n")[0][:60]
+    branch = short_id or "hw/<short_id>/..."
+    body = (
+        f"[MERGE PENDING] Task '{title}' ({tid[:8]}) is approved and needs "
+        f"git_worktree_merge(branchName='{branch}'). "
+        f"YOU (coordinator) must merge — do not ask the executor to merge on main. "
+        f"reason={reason}"
+    )
+    try:
+        from hiveweave.services.inbox import InboxService
+
+        await InboxService().send_message(
+            from_agent_id="system",
+            to_agent_id=reviewer_id,
+            message=body,
+            message_type="task",
+            priority="urgent",
+            task_id=tid or None,
+            wake=True,
+        )
+        from hiveweave.agents.trigger import trigger_coordinator
+
+        await trigger_coordinator(reviewer_id)
+        log.info(
+            "merge_pending_wake_injected",
+            reviewer_id=reviewer_id,
+            task_id=tid,
+            reason=reason,
+        )
+    except Exception as e:
+        log.warning(
+            "merge_pending_wake_failed",
+            reviewer_id=reviewer_id,
+            task_id=tid,
+            error=str(e),
+        )
 
 
 # ── cancel_task / unclaim_task ────────────────────────────────

@@ -1,15 +1,7 @@
-"""Inbox background delivery — BUGFIX: progress/ACK 消息静默丢失。
+"""Inbox delivery — progress messages wake (product rule).
 
-回归场景（井字棋实测事故）：
-- 下属发"穷举验证 PASS / 全部完成"类消息 → 被 classify 为 progress → wake=0
-- 旧行为：插入即 read=1，而 get_pending_messages 只取 read=0 AND wake=1
-  → 消息永远不会进入接收方的任何对话上下文（CEO 看不到交付证据）
-- 新行为：wake=0 消息 delivered=0 落库；下次自然触发时由
-  get_undelivered_background 捎带进上下文；成功输出后随 mark_read_by_ids
-  一并置 delivered=1（不重复捎带）；输出失败不标记 → 下次重试
-
-测试策略与 test_task_service.py 一致：真实 per-project DB（tempfile），
-仅 patch meta 路由 + 接收方状态 + 事件总线。
+Explicit wake=False still parks as background for rare system use.
+Progress idempotency collapses duplicate FYI from the same sender.
 """
 
 from __future__ import annotations
@@ -85,31 +77,60 @@ async def _fetch_one(env, sql, params):
 
 
 @pytest.mark.asyncio
-async def test_progress_message_pending_background_delivery(env):
-    """progress 消息：不唤醒、但 delivered=0 待捎带；处理成功后不再捎带。"""
+async def test_progress_message_wakes_via_pending_channel(env):
+    """notify → message category (no taxonomy), should_wake=True, pending channel."""
     svc = InboxService()
 
     msg = await svc.send_message(
-        DEV_ID, CEO_ID, "穷举验证 1720 节点全部完成，X_win=0"
+        DEV_ID,
+        CEO_ID,
+        "穷举验证 1720 节点全部完成，X_win=0",
+        message_type="notify",
     )
-    assert msg["should_wake"] is False  # progress 不触发 LLM —— 保持不变
+    assert msg["should_wake"] is True
+    assert msg["category"] == "message"
 
     row = await _fetch_one(
         env, "SELECT read, wake, delivered FROM inbox WHERE id = ?",
         [msg["id"]],
     )
-    assert row["read"] == 1      # 已读（watcher 忽略）
-    assert row["wake"] == 0
-    assert row["delivered"] == 0  # 但尚未交付进任何上下文 —— 关键修复点
+    assert row["read"] == 0
+    assert row["wake"] == 1
+    assert row["delivered"] == 1
 
-    # wake 通道看不到它（行为不变）
+    pending = await svc.get_pending_messages(CEO_ID)
+    assert [m["id"] for m in pending] == [msg["id"]]
+    assert await svc.get_undelivered_background(CEO_ID) == []
+
+    await svc.mark_read_by_ids(CEO_ID, [msg["id"]])
     assert await svc.get_pending_messages(CEO_ID) == []
-    # background 通道能看到 —— 修复前这里永远查不到（没有此通道）
+
+
+@pytest.mark.asyncio
+async def test_explicit_wake_false_still_background(env):
+    """Explicit wake=False keeps background piggyback path."""
+    svc = InboxService()
+
+    msg = await svc.send_message(
+        DEV_ID,
+        CEO_ID,
+        "穷举验证 1720 节点全部完成，X_win=0",
+        wake=False,
+    )
+    assert msg["should_wake"] is False
+
+    row = await _fetch_one(
+        env, "SELECT read, wake, delivered FROM inbox WHERE id = ?",
+        [msg["id"]],
+    )
+    assert row["read"] == 1
+    assert row["wake"] == 0
+    assert row["delivered"] == 0
+
+    assert await svc.get_pending_messages(CEO_ID) == []
     bg = await svc.get_undelivered_background(CEO_ID)
     assert [m["id"] for m in bg] == [msg["id"]]
 
-    # 模拟一次成功输出后的 ACK（trigger 把 background id 并入 inbox_msg_ids，
-    # agent 在非空输出后统一 mark_read_by_ids）
     await svc.mark_read_by_ids(CEO_ID, [msg["id"]])
     row = await _fetch_one(
         env, "SELECT delivered FROM inbox WHERE id = ?", [msg["id"]]
@@ -119,31 +140,38 @@ async def test_progress_message_pending_background_delivery(env):
 
 
 @pytest.mark.asyncio
-async def test_progress_collapse_keeps_single_pending_background(env):
-    """同一发送者的 progress 按设计收敛（幂等键 sender+category+task）：
-    无论发多少条，background 通道最多只有一条待捎带，不产生刷屏。"""
+async def test_progress_collapse_dedupes_pending(env):
+    """幂等键按内容哈希：同内容重发收敛，不同内容各自进 pending。"""
     svc = InboxService()
-    m1 = await svc.send_message(DEV_ID, CEO_ID, "全部完成 1/3")
-    m2 = await svc.send_message(DEV_ID, CEO_ID, "全部完成 2/3")
+    m1 = await svc.send_message(
+        DEV_ID, CEO_ID, "全部完成 1/3", message_type="notify"
+    )
+    m2 = await svc.send_message(
+        DEV_ID, CEO_ID, "全部完成 1/3", message_type="notify"
+    )
 
-    bg = await svc.get_undelivered_background(CEO_ID)
-    assert len(bg) == 1
-    # 收敛到同一条（dedupe 返回已存在行的 id）
-    assert bg[0]["id"] == m1["id"] == m2["id"]
+    pending = await svc.get_pending_messages(CEO_ID)
+    assert len(pending) == 1
+    assert pending[0]["id"] == m1["id"] == m2["id"]
     assert m2.get("deduped") is True
 
-    # 处理后清空，不会反复捎带
-    await svc.mark_read_by_ids(CEO_ID, [bg[0]["id"]])
-    assert await svc.get_undelivered_background(CEO_ID) == []
+    m3 = await svc.send_message(
+        DEV_ID, CEO_ID, "全部完成 2/3", message_type="notify"
+    )
+    pending = await svc.get_pending_messages(CEO_ID)
+    assert len(pending) == 2
+    assert m3.get("deduped") is not True
+
+    await svc.mark_read_by_ids(CEO_ID, [m["id"] for m in pending])
+    assert await svc.get_pending_messages(CEO_ID) == []
 
 
 @pytest.mark.asyncio
 async def test_command_message_uses_wake_channel_not_background(env):
-    """command/ask 消息走原 wake 通道，不进 background 通道。"""
+    """command/ask 消息走 wake 通道，不进 background 通道。"""
     svc = InboxService()
     msg = await svc.send_message(DEV_ID, CEO_ID, "请在本轮明确二选一回复")
 
     pending = await svc.get_pending_messages(CEO_ID)
     assert [m["id"] for m in pending] == [msg["id"]]
-    # wake 消息 delivered=1 落库（不需要 background 追踪）
     assert await svc.get_undelivered_background(CEO_ID) == []

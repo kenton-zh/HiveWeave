@@ -393,59 +393,25 @@ def resolve_task_policy(
     tags: list[str] | None = None,
     description: str | None = None,
 ) -> str:
-    """Infer attestation policy_id from task metadata.
+    """Legacy label for telemetry only — no longer drives submit/approve gates.
 
-    Returns: ``ui_browser_e2e`` | ``docs_only`` | ``generic_tests``.
+    Evidence variety is judged by the coordinator on review, not by a
+    scripted policy matrix.
     """
-    import re
-
-    tag_list = [str(t).lower() for t in (tags or [])] if isinstance(tags, list) else []
-    tag_str = " ".join(tag_list)
-    blob = f"{title or ''} {description or ''} {tag_str}".lower()
-
-    def _hit(markers: tuple[str, ...]) -> bool:
-        for m in markers:
-            # Short tokens (ui/ux) must be whole words — avoid "suite" → ui
-            if len(m) <= 2:
-                if re.search(rf"(?<![a-z0-9]){re.escape(m)}(?![a-z0-9])", blob):
-                    return True
-            elif m in blob:
-                return True
-        return False
-
-    ui_markers = ("ui", "frontend", "页面", "browse", "e2e", "浏览器", "ux")
-    docs_markers = ("docs", "explore", "文档", "调研", "readme", "spec only", "探索")
-
-    # Post-merge VERIFY: default generic_tests unless explicitly UI-scoped
-    if "verify" in tag_list:
-        if _hit(("frontend", "页面", "browse", "e2e", "浏览器")) or (
-            "ui" in tag_list or "frontend" in tag_list
-        ):
-            return "ui_browser_e2e"
-        if re.search(r"(?<![a-z0-9])ui(?![a-z0-9])", f"{title or ''} {tag_str}".lower()):
-            return "ui_browser_e2e"
-        return "generic_tests"
-
-    if _hit(ui_markers):
-        return "ui_browser_e2e"
-    # docs/explore only — no code attestation required
-    if _hit(docs_markers):
-        code_markers = ("implement", "fix", "bug", "代码", "实现", "api", "refactor")
-        if not _hit(code_markers):
-            return "docs_only"
-    return "generic_tests"
+    return "coordinator_review"
 
 
 POLICY_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
-    "ui_browser_e2e": frozenset({"browse_e2e"}),
-    "generic_tests": frozenset({"test_run"}),
+    "ui_browser_e2e": None,
+    "generic_tests": None,
     "docs_only": None,
+    "coordinator_review": None,
 }
 
 
 def required_attestation_kinds(policy_id: str) -> frozenset[str] | None:
-    """Kinds required for a policy, or None if attestations not required."""
-    return POLICY_REQUIRED_KINDS.get(policy_id, frozenset({"test_run"}))
+    """Always None — platform no longer hard-gates submit on attestation kinds."""
+    return None
 
 
 async def check_task_attestations(
@@ -455,58 +421,10 @@ async def check_task_attestations(
     *,
     expected_agent_id: str | None = None,
 ) -> str | None:
-    """Return deny reason or None if attestation gate passes.
+    """Attestation hard-gate removed — coordinator judges evidence on review.
 
-    Rejects ui_browser_e2e / generic_tests when only testsPassed=true
-    without valid attestations.
+    Attestation rows may still be recorded for display; this never denies.
     """
-    policy = (
-        task.get("policy_id")
-        or resolve_task_policy(
-            task.get("title"),
-            task.get("tags") if isinstance(task.get("tags"), list) else None,
-            task.get("description"),
-        )
-    )
-    required = POLICY_REQUIRED_KINDS.get(policy)
-    if required is None:
-        return None  # docs_only — no attestations required
-
-    # Waiver 通道：coordinator 显式豁免（CLI/脚本类任务的正式出口）
-    if await has_valid_waiver(project_id, task.get("id")):
-        return None
-
-    ids = [i for i in (attestation_ids or []) if i]
-    evidence = task.get("evidence") or {}
-    if isinstance(evidence, str):
-        try:
-            evidence = json.loads(evidence)
-        except Exception:
-            evidence = {}
-    if not ids and isinstance(evidence, dict):
-        raw = evidence.get("attestation_ids") or evidence.get("attestationIds") or []
-        if isinstance(raw, list):
-            ids = [str(x) for x in raw if x]
-
-    if not ids:
-        return (
-            f"REJECT: policy '{policy}' requires attestation(s) of kind "
-            f"{sorted(required)}. Run real tests/browse first; "
-            f"testsPassed=true alone is insufficient. Pass attestationIds. "
-            f"For CLI-only tasks without a browsable UI, ask your coordinator "
-            f"to waive_attestation(taskId, reason)."
-        )
-
-    svc = attestation_service
-    ok, err = await svc.verify_ids(
-        project_id,
-        ids,
-        expected_agent_id=expected_agent_id,
-        expected_kinds=required,
-        task_id=task.get("id"),
-    )
-    if not ok:
-        return f"REJECT: attestation verify failed — {err}"
     return None
 
 

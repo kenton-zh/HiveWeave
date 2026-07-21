@@ -160,10 +160,20 @@ class DispatchService:
         #    如果传入了 existing_task_id，复用已有 task 而不是创建新的
         if existing_task_id:
             task_id = existing_task_id
-            # 更新 assignee 为实际接收者
+            # 更新 assignee 为实际接收者；指派即认领（VERIFY 除外）
             await self.task_service.update_task(
                 project_id, task_id, assignee_id=to_agent_id
             )
+            try:
+                await self.task_service.ensure_assignee_claimed(
+                    project_id, task_id
+                )
+            except Exception as e:
+                log.warning(
+                    "dispatch_ensure_claimed_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
         else:
             task_id = await self.task_service.create_task(
                 project_id=project_id,

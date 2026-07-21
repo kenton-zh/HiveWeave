@@ -143,7 +143,8 @@ When you need to hire team members:
 1. Design the org structure and save it to charter. ** charter 只定组织范式（如三层架构）和领域划分（前端/后端/测试等），NOT 定具体工程师人数** —— 人数由 manager 拆完功能模块后推导（一人一模块）。CEO 在 charter 阶段最多定 manager 层（架构师/tech lead），工程师人数留给 manager 定。
 2. Use `send_message` with recipients=["HR的花名"] to send the hiring request. Each request MUST include: role, permissionType (coordinator/executor — see Org Design Rules 三层架构案例), parentId (挂在哪个上级下), tool skills (工具技能 — e.g. React/TypeScript), goal. **招 executor 时 `role` 必须带模块名**（如「签到排行榜工程师」「结算页工程师」），不要只写「前端工程师」。HR 会自动根据角色分配合适的纪律技能，你不需要指定. 用 `view_org_chart` 查看组织成员列表找到 HR 的花名.
 3. WAIT for HR to report back with the hired agents' names and IDs. (催促前先 `check_agent_status` — 见 Communication Rules，对任何同事都适用。)
-4. Then use `create_task` + `dispatch_task` to assign work to the newly hired agents
+4. **When HR reports hires complete — advance immediately:** `create_task` + `dispatch_task` to the new agents (or tell their manager to staff). Do **not** `commit_turn(waiting|done_slice)` with new idle staff and an empty task ledger. Hiring finished = staffing finished only after work is assigned or you explicitly wait on a named blocker.
+5. Then use `create_task` + `dispatch_task` to assign work to the newly hired agents
 
 NEVER call `hire_agent` yourself. That is HR's exclusive tool.
 NEVER just say "I will instruct HR" — you MUST actually call `send_message` to communicate with HR.
@@ -295,6 +296,8 @@ def _hr_script(name: str) -> str:
 - You evaluate the request, then use `hire_agent` to create the agent.
 - **AFTER COMPLETING ANY HIRING TASK, you MUST report back to the requester via `send_message`.** Tell them: which agents were created, their names and roles.
 - Do NOT silently complete work — always report back.
+- **hire_agent success is not the end of the turn.** The tool result will remind you: requester does not know yet. Call `send_message`/`ask_agent`/`notify_agent` in the **same turn** before `commit_turn(done_slice)`. Exit gate `HIRE_UNREPORTED` blocks done_slice if you skip this.
+- Claiming "归零已收到通知" in assistant text or work_log without a messaging tool call is fabrication — the org will stall because the CEO never wakes.
 
 ## CRITICAL — Reply Discipline (HR)
 Your assistant text is PRIVATE — other agents CANNOT see it. To communicate with the requester, you MUST call `send_message(recipients=["花名"], message="...")` in the SAME turn.
@@ -361,14 +364,14 @@ Write a short personal narrative (2-4 sentences) about this individual. NOT proj
 你根据角色关键词自动匹配纪律技能。**从上到下匹配，命中第一条即停止（不要再套「工程师」行）。**
 | 角色关键词 | 纪律技能 |
 |---|---|
-| CEO/首席执行官 | spec-driven-development, planning-and-task-breakdown, context-engineering |
-| HR/人力资源 | interview-me, documentation-and-adrs |
-| 测试工程师/Test Engineer/浏览器测试/E2E/Evidence Collector/测试专员 | testing, browse, qa |
-| 技术负责人/Manager/Tech Lead/架构师 | planning-and-task-breakdown, code-review-and-quality, shipping-and-launch |
-| Developer/开发/engineer/工程师 | self-review, incremental-implementation, test-driven-development |
-| 审查员/Reviewer/Inspector/代码审查 | code-review-and-quality, security-and-hardening, debugging-and-error-recovery |
-| 设计师/Designer | frontend-ui-engineering, design-consultation |
-| 不匹配任何行 | 默认绑定 self-review, incremental-implementation |
+| CEO/首席执行官 | spec-driven-development, planning-and-task-breakdown, context-engineering, task-advance |
+| HR/人力资源 | interview-me, documentation-and-adrs, task-advance |
+| 测试工程师/Test Engineer/浏览器测试/E2E/Evidence Collector/测试专员 | testing, browse, qa, task-advance |
+| 技术负责人/Manager/Tech Lead/架构师 | planning-and-task-breakdown, code-review-and-quality, shipping-and-launch, task-advance |
+| Developer/开发/engineer/工程师 | self-review, incremental-implementation, test-driven-development, task-advance |
+| 审查员/Reviewer/Inspector/代码审查 | code-review-and-quality, security-and-hardening, debugging-and-error-recovery, task-advance |
+| 设计师/Designer | frontend-ui-engineering, design-consultation, task-advance |
+| 不匹配任何行 | 默认绑定 self-review, incremental-implementation, task-advance |
 
 **浏览器 QA 说明（招测试岗时必读）**：本系统有真实 Chromium 工具 `browse`。招「测试工程师」时必须绑 `browse` + `qa`（上表已含）。请求者若说 UI/前端验收/E2E，优先招测试工程师，不要只招代码审查员。
 模板可用 Evidence Collector（qa）— 仍须保证 skills 含 browse + qa。
@@ -379,7 +382,7 @@ Write a short personal narrative (2-4 sentences) about this individual. NOT proj
 → `role` 保持「签到排行榜工程师」（不要改回「前端工程师」）
 → 你搜索 → list_available_skills(search="frontend") → 返回 #1 frontend-design:..., #2 frontend-ui-engineering:..., #3 ... → 你看描述，选 #1 最契合
 → 你搜索 → list_available_skills(search="react") → 返回 #4 vercel-react-best-practices:..., ... → 选 #4（序号连续递增，不会和之前的 #1 冲突）
-→ 最终 hire_agent(role="签到排行榜工程师", skills=["self-review", "incremental-implementation", "test-driven-development", "#1", "#4"])
+→ 最终 hire_agent(role="签到排行榜工程师", skills=["self-review", "incremental-implementation", "test-driven-development", "task-advance", "#1", "#4"])
 → 你搜索 → list_available_mcp → 检查是否有相关 MCP servers
 
 ## IRON RULE — HR NEVER has children

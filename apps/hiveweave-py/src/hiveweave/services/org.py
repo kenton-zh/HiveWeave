@@ -426,12 +426,13 @@ class OrgService:
         try:
             conn = await project_db.get_project_db_by_project_id(project_id)
             if parent_id:
+                # Reassign open work to parent; assign = claim (not back to created)
                 await conn.execute(
-                    "UPDATE tasks SET assignee_id = ?, status = 'created', "
-                    "claimed_at = NULL, updated_at = ? "
+                    "UPDATE tasks SET assignee_id = ?, status = 'claimed', "
+                    "claimed_at = ?, updated_at = ? "
                     "WHERE assignee_id = ? AND is_archived = 0 "
                     "AND status NOT IN ('closed', 'approved')",
-                    [parent_id, now_ms, agent_id],
+                    [parent_id, now_ms, now_ms, agent_id],
                 )
             else:
                 await conn.execute(
@@ -634,10 +635,11 @@ class OrgService:
 
     async def transfer_agent(self, project_id: str, agent_id: str,
                              new_parent_id: str | None) -> dict | None:
-        """Transfer agent to a new parent. Verifies no cycle.
+        """Transfer agent to a new parent. Verifies no cycle + org invariants.
 
         Returns the updated agent dict, or ``{success: False, message}`` on
-        cycle detection. ``new_parent_id=None`` makes the agent a root.
+        cycle / invariant failure. ``new_parent_id=None`` makes the agent a root
+        (forbidden for executors).
         """
         if agent_id == new_parent_id:
             return {"success": False,
@@ -649,6 +651,17 @@ class OrgService:
                 return {"success": False,
                         "message": "Cannot transfer: new parent is a descendant "
                                    "(would create a cycle)"}
+
+        from hiveweave.services.org_invariants import validate_transfer
+
+        agents = await self.list_agents(project_id)
+        inv_err = validate_transfer(
+            agents=agents,
+            agent_id=agent_id,
+            new_parent_id=new_parent_id,
+        )
+        if inv_err:
+            return {"success": False, "message": inv_err}
 
         updated = await self.update_agent(agent_id, {"parent_id": new_parent_id})
         if updated:

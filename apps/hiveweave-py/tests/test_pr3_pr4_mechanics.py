@@ -9,23 +9,23 @@ import pytest
 from hiveweave.services.wake_policy import classify_message, should_wake
 
 
-def test_fyi_without_reply_is_progress():
+def test_fyi_notify_still_wakes():
     cat = classify_message(
         message="FYI merge landed on main, no action needed",
-        message_type="normal",
+        message_type="notify",
         from_agent_id="peer-1",
     )
-    assert cat == "progress"
-    assert should_wake(cat) is False
+    assert cat == "message"
+    assert should_wake(cat) is True
 
 
-def test_reply_request_still_command():
+def test_normal_work_order_wakes():
     cat = classify_message(
         message="请依次回复结果",
         message_type="normal",
         from_agent_id="peer-1",
     )
-    assert cat == "command"
+    assert cat == "message"
     assert should_wake(cat) is True
 
 
@@ -36,7 +36,7 @@ def test_task_dispatch_still_wakes():
         from_agent_id="boss",
         task_id="abc-123",
     )
-    assert cat == "task_transition"
+    assert cat == "message"
     assert should_wake(cat) is True
 
 
@@ -47,7 +47,7 @@ def test_approval_message_still_wakes():
         from_agent_id="boss",
         task_id="abc-123",
     )
-    assert cat == "task_transition"
+    assert cat == "message"
     assert should_wake(cat) is True
 
 

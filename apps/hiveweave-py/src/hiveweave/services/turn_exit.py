@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 
 import structlog
 
-from hiveweave.services.reply_policy import message_requests_reply
 from hiveweave.services.turn_result import (
     TurnResult,
     parse_turn_result,
@@ -29,6 +28,8 @@ REPAIR_VIOLATIONS = frozenset({
     "UNREPLIED_ASKS",
     "ASSIGNEE_MUST_SUBMIT",
     "CREATOR_MUST_REVIEW",
+    "CREATOR_MUST_MERGE",
+    "HIRE_UNREPORTED",
 })
 
 # Ledger / obligation mismatches → park, do not immediately re-run LLM
@@ -96,15 +97,15 @@ def collect_unreplied_asks(
     tool_calls: list,
     name_by_id: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Messages that require a reply and were not answered this turn."""
+    """Messages that require a reply and were not answered this turn.
+
+    Structural only: expect_report or message_type=ask (language-agnostic).
+    """
     name_by_id = name_by_id or {}
     expects: list[dict] = []
     for m in pending_msgs:
-        if (
-            m.get("expect_report")
-            or m.get("message_type") == "ask"
-            or message_requests_reply(m.get("message"))
-        ):
+        mt = (m.get("message_type") or "").lower()
+        if m.get("expect_report") or mt == "ask":
             expects.append(m)
     if not expects:
         return []
@@ -147,6 +148,46 @@ def collect_unreplied_asks(
             continue
         unreplied.append(m)
     return unreplied
+
+
+_MSG_TOOLS = frozenset({
+    "send_message",
+    "ask_agent",
+    "notify_agent",
+    "message_superior",
+    "message_peer",
+    "message_team",
+    "message_subordinate",
+    "message_user",
+})
+
+
+def _tool_name(tc: dict) -> str:
+    if not isinstance(tc, dict):
+        return ""
+    func = tc.get("function") or {}
+    if isinstance(func, dict) and func.get("name"):
+        return str(func["name"])
+    return str(tc.get("name") or "")
+
+
+def hire_without_report(tool_calls: list) -> bool:
+    """True if this turn hired someone but never messaged a peer.
+
+    Does not guess intent — only checks whether the obvious next tool
+    after hire_agent was used. The agent still chooses whom/what to say.
+    """
+    hired = False
+    messaged = False
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        name = _tool_name(tc)
+        if name == "hire_agent":
+            hired = True
+        if name in _MSG_TOOLS:
+            messaged = True
+    return hired and not messaged
 
 
 def _disposition_from_result(
@@ -197,6 +238,9 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
     if unreplied:
         violations.append("UNREPLIED_ASKS")
 
+    if hire_without_report(ctx.tool_calls):
+        violations.append("HIRE_UNREPORTED")
+
     remaining_obligations = list(ctx.open_task_obligations)
     if turn_result and turn_result.phase in ("done_slice", "waiting"):
         remaining = []
@@ -218,6 +262,8 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 violations.append("ASSIGNEE_MUST_SUBMIT")
             elif role == "creator" and status in ("submitted", "reviewing"):
                 violations.append("CREATOR_MUST_REVIEW")
+            elif role == "creator" and status == "approved":
+                violations.append("CREATOR_MUST_MERGE")
             remaining.append(t)
         remaining_obligations = remaining
         # Park leftover ledger mismatches not covered by repair (e.g. verifying)
@@ -231,7 +277,9 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                     )
                     or (
                         t.get("role_hint") == "creator"
-                        and t.get("status") in ("submitted", "reviewing")
+                        and t.get("status") in (
+                            "submitted", "reviewing", "approved",
+                        )
                     )
                 )
             ]
@@ -259,6 +307,8 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 or "MISSING_COMMIT_TURN" in uniq
                 or "ASSIGNEE_MUST_SUBMIT" in uniq
                 or "CREATOR_MUST_REVIEW" in uniq
+                or "CREATOR_MUST_MERGE" in uniq
+                or "HIRE_UNREPORTED" in uniq
             )
             park = not repair_only
         if park:
@@ -304,6 +354,10 @@ def _build_gate_hint(
         "WAITING_ON_REQUIRED": "phase=waiting 必须提供 waiting_on",
         "BLOCKED_WAITING_ON_REQUIRED": "phase=blocked 必须提供 waiting_on",
         "UNREPLIED_ASKS": "有人 ask 了你，必须用 ask_agent/notify_agent/send_message 回复后才能收工",
+        "HIRE_UNREPORTED": (
+            "本轮调用了 hire_agent 但没有用 send_message/ask_agent/notify_agent 通知请求方 — "
+            "招人完成≠协作完成；请向请求方汇报花名/shortId/role，再 commit_turn"
+        ),
         "OPEN_TASKS_UNDECLARED": "仍有可行动任务 — 请推进任务，或用 phase=in_progress/waiting/blocked 声明状态（禁止假装 done_slice）",
         "ASSIGNEE_MUST_SUBMIT": (
             "有 running/claimed/rework 任务未 submit_task — "
@@ -313,6 +367,11 @@ def _build_gate_hint(
         "CREATOR_MUST_REVIEW": (
             "有 submitted/reviewing 任务待你 review — "
             "请调用 review_task，或 phase=waiting + waiting_on=[{kind:'task', ref:taskId}]"
+        ),
+        "CREATOR_MUST_MERGE": (
+            "有 approved 任务待你 merge 到 main — "
+            "请立即调用 git_worktree_merge(branchName=assignee shortId 或 hw/...)。"
+            "禁止口头让 executor 自己 merge；冲突则 review_task(rework) 让其在 worktree 对齐 main。"
         ),
     }
     for v in violations:

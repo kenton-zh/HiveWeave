@@ -1,48 +1,25 @@
-"""Reply / expect_report hard rules shared by messaging + watchdog.
+"""Reply / expect_report — structured flags only (language-agnostic).
 
-Scripts cannot cover every stall, but "asked for a reply then everyone went idle"
-is a closed pattern: detect request language, mark expect_report, enforce reply,
-and wake the waiter if silence persists.
+Do NOT scan free-text for "please reply" / 「请回复」 etc. Agents of any
+language must set expect_report via ask_agent or explicit tool args.
+See CLAUDE.md「语言无关：禁止用文案猜意图」。
 """
 
 from __future__ import annotations
 
-import re
-
-# Strict enough to catch tool-verification / "reply with results" asks;
-# avoid matching casual mentions of 回复 in FYI notes.
-_REPLY_REQUEST_RE = re.compile(
-    r"(?:"
-    r"请(?:依次)?[^。\n]{0,30}回复"
-    r"|回复(?:结果|格式|以下|内容)"
-    r"|立即报告"
-    r"|有任何失败立即报告"
-    r"|等待(?:你的)?回复"
-    r"|需要你(?:的)?回复"
-    r"|reply[_\s-]?required"
-    r"|please\s+reply"
-    r"|reply\s+with"
-    r"|report\s+back"
-    r"|respond\s+with"
-    r")",
-    re.IGNORECASE,
-)
-
 
 def message_requests_reply(message: str | None) -> bool:
-    """True if message body clearly asks the recipient to reply."""
-    if not message or not str(message).strip():
-        return False
-    return bool(_REPLY_REQUEST_RE.search(str(message)))
+    """Deprecated no-op — never infer reply-need from body text.
 
-
-def resolve_expect_report(explicit: bool | None, message: str | None) -> bool:
-    """Merge explicit expect_report flag with reply-request heuristics.
-
-    - explicit True → always True
-    - explicit False/None + reply-request language → True (auto-upgrade)
-    - otherwise → False
+    Kept for import compatibility. Always False.
     """
-    if explicit:
-        return True
-    return message_requests_reply(message)
+    return False
+
+
+def resolve_expect_report(explicit: bool | None, message: str | None = None) -> bool:
+    """Whether the recipient must reply — explicit flag only.
+
+    ``message`` is ignored (language-agnostic). Use ask_agent or
+    expect_report=true on send_message.
+    """
+    return bool(explicit)

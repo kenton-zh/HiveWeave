@@ -31,10 +31,10 @@ CATEGORY_RANK: dict[str, int] = {
 
 ORDER_HINT = "ask > task_transition > approval > command > progress"
 
-# When Inbox digest is present, Messages(detail) only expands these categories
-# (plus expect_report). progress/command stay digest-only to avoid double-write.
+# When Inbox digest is present, Messages(detail) expands actionable categories
+# (plus expect_report). progress (notify/FYI) stays digest-only.
 DETAIL_FULL_CATEGORIES: frozenset[str] = frozenset(
-    {"ask", "task_transition", "approval"}
+    {"ask", "task_transition", "approval", "command"}
 )
 
 

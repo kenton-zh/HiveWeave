@@ -97,6 +97,38 @@ def _strip_goals_block(context: str) -> str:
     ).strip()
 
 
+async def _admit_trigger_wake(
+    agent,
+    *,
+    wake_category: str | None,
+    from_agent_id: str | None,
+    inbox_msg_ids: list[str] | None,
+) -> bool:
+    """Always admit — category triage removed; any inbox may wake."""
+    from hiveweave.services.wake_policy import admit_wake
+
+    return admit_wake(
+        disposition=getattr(agent, "disposition", None),
+        from_agent_id=from_agent_id,
+        recipient_parent_id=(getattr(agent, "config", None) or {}).get("parent_id"),
+    ).ok
+
+
+async def _delete_chat_message(agent_id: str, msg_id: str | None) -> None:
+    if not msg_id:
+        return
+    try:
+        from hiveweave.db import project as project_db
+
+        await project_db.execute(
+            agent_id,
+            "DELETE FROM chat_messages WHERE id = ? AND agent_id = ?",
+            [msg_id, agent_id],
+        )
+    except Exception as e:
+        log.debug("trigger_digest_delete_failed", error=str(e))
+
+
 def is_coordinator(role: str | None) -> bool:
     """判断角色是否为 coordinator 类型。
 
@@ -297,6 +329,13 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                     (m.get("from_agent_id") for m in pool if m.get("from_agent_id")),
                     "system",
                 )
+                if not await _admit_trigger_wake(
+                    agent,
+                    wake_category=wake_cat,
+                    from_agent_id=from_id,
+                    inbox_msg_ids=inbox_msg_ids,
+                ):
+                    return
                 await agent.enqueue_wake(
                     "[Inbox triage pending — recheck when idle]",
                     opts={
@@ -318,6 +357,13 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 )
                 return
             context, inbox_msg_ids, from_agent_id, wake_category = result
+            if not await _admit_trigger_wake(
+                agent,
+                wake_category=wake_category,
+                from_agent_id=from_agent_id,
+                inbox_msg_ids=inbox_msg_ids,
+            ):
+                return
             await agent.enqueue_wake(
                 context,
                 opts={
@@ -351,6 +397,15 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
 
         context, inbox_msg_ids, from_agent_id, wake_category = result
 
+        # Admit before writing digest — avoid chat_messages pollution on skip
+        if not await _admit_trigger_wake(
+            agent,
+            wake_category=wake_category,
+            from_agent_id=from_agent_id,
+            inbox_msg_ids=inbox_msg_ids,
+        ):
+            return
+
         # Do NOT mark inbox read here. ACK happens only after a successful
         # non-empty completion (agent.py). Timeout/error leave messages unread
         # so the info chain can resume; doom-loop is prevented by a cooldown
@@ -362,6 +417,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
             trigger_type=trigger_type,
             context_preview=context[:100],
             inbox_pending=len(inbox_msg_ids or []),
+            wake_category=wake_category,
         )
 
         # 8. 保存为 background user 消息（去重 goals workbook block）
@@ -377,7 +433,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
         from hiveweave.services.chat_message import ChatMessageService
 
         chat_msg_service = ChatMessageService()
-        await chat_msg_service.save_message(
+        saved = await chat_msg_service.save_message(
             {
                 "agent_id": agent_id,
                 "role": "user",
@@ -389,6 +445,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 "team_to_agent_id": agent_id,
             }
         )
+        digest_msg_id = saved.get("id") if isinstance(saved, dict) else None
 
         # 9. 调用 chat
         # 对齐 Elixir agent.ex:264:
@@ -406,6 +463,21 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 "task_id": latch_opts.get("task_id"),
             },
         )
+
+        if isinstance(chat_result, dict) and chat_result.get("skipped"):
+            # Race: disposition gate denied after admit — demote + drop digest
+            await _inbox_service.demote_wake(
+                agent_id,
+                list(inbox_msg_ids or []),
+                reason=f"chat_skipped:{chat_result.get('skipped')}",
+            )
+            await _delete_chat_message(agent_id, digest_msg_id)
+            log.info(
+                "trigger_skipped_cleanup",
+                agent_id=agent_id,
+                skipped=chat_result.get("skipped"),
+            )
+            return
 
         if isinstance(chat_result, dict) and chat_result.get("error"):
             err = chat_result["error"]
@@ -447,15 +519,13 @@ async def build_trigger_context(
     对齐 Elixir agent.ex:288 build_trigger_context/2。
 
     构建的 blocks（按顺序）：
-    0. Inbox digest (platform ready) — 类别/优先级/条数/建议顺序
     1. Pending Tasks — 待处理的 handoffs（pending + accepted）
     2. Rework — 被拒绝的工作（inbox 中含 [REWORK REQUESTED] 的消息）
-    3. Messages — 有 digest 时仅展开 ask/task_transition/approval/expect_report；否则全量
+    3. Messages — 全文按时间序；reply_required 来自 expect_report / ask
     4. Background updates — wake=0 捎带
     5. Report Required — coordinator 专属，未上报的 handoffs
 
-    Triage: pending+background 先 prepare_ready；若 status=running 则返回 None
-    （不把 raw 洪水喂给主模型）。
+    不做平台侧类别/优先级 triage（留给未来 per-agent 助理模型）。
 
     Args:
         agent: agent DB 记录 dict（含 id, project_id, name, role, ...）
@@ -500,57 +570,12 @@ async def build_trigger_context(
             )
             return None
 
-    # ── Inbox triage: staging → ready digest (trigger only reads ready) ──
-    from hiveweave.services.inbox_triage import (
-        MAX_PROGRESS_DETAIL,
-        PREVIEW_CHARS,
-        classify_inbox_row,
-        derive_wake_category,
-        format_digest_block,
-        inbox_triage_service,
-        needs_message_detail,
-    )
-
-    triage_pool = list(inbox_messages) + list(background_msgs)
-    name_by_id: dict[str, str] = {}
-    for m in triage_pool:
-        fid = m.get("from_agent_id") or ""
-        if fid and fid not in name_by_id:
-            name_by_id[fid] = await _agent_name(fid)
-
-    pending_total, bg_total = await _inbox_service.count_pending_and_background(
-        agent_id
-    )
-    pool_n = len(triage_pool)
-    truncated = (pending_total + bg_total) > pool_n
-
+    # Chronological inbox — no category ranking / priority digest.
+    # Future: per-agent assistant model may triage; platform stays dumb.
+    wake_category = None
+    has_digest = False
     ready_digest = None
     triage_batch_id = None
-    wake_category = derive_wake_category(triage_pool) if triage_pool else None
-    if triage_pool:
-        ready_digest = await inbox_triage_service.prepare_ready(
-            agent_id,
-            triage_pool,
-            name_by_id=name_by_id,
-            truncated=truncated,
-            total_unread=pending_total + bg_total,
-        )
-        if ready_digest is None:
-            # Triage running / fail-closed — do not feed raw flood
-            log.info(
-                "trigger_skip_triage_running",
-                agent_id=agent_id,
-                pending=len(inbox_messages),
-                background=len(background_msgs),
-            )
-            return None
-        triage_batch_id = ready_digest.get("_batch_id")
-        ordered = inbox_triage_service.order_messages_by_digest(
-            triage_pool, ready_digest
-        )
-        pending_ids = {m["id"] for m in inbox_messages if m.get("id")}
-        inbox_messages = [m for m in ordered if m.get("id") in pending_ids]
-        background_msgs = [m for m in ordered if m.get("id") not in pending_ids]
 
     # 分离 rework 消息和其他消息
     rework_msgs: list[dict] = []
@@ -569,11 +594,6 @@ async def build_trigger_context(
 
     blocks: list[str] = []
     delivered_handoff_ids: list[str] = []
-
-    # ── 0. Inbox digest (ready) — always first when present ──
-    has_digest = bool(ready_digest and ready_digest.get("total", 0) > 0)
-    if has_digest:
-        blocks.append(format_digest_block(ready_digest))
 
     # ── 1. Pending Tasks block ──
     if pending_handoffs or accepted_handoffs:
@@ -613,86 +633,47 @@ async def build_trigger_context(
             "You must fix the issues and call submit_task again after fixing."
         )
 
-    # ── 3. Messages block ──
-    # With digest: full text only for ask/task_transition/approval (+ expect_report).
-    # progress/command stay digest-only (no double-write). Without digest: all.
+    # ── 3. Messages — full text, chronological; reply_required from expect_report ──
     if other_msgs:
         import json as _json
         lines = []
         for m in other_msgs:
-            cat = classify_inbox_row(m)
-            if not needs_message_detail(cat, m, has_digest=has_digest):
-                continue
-            content = m.get("message") or ""
-            if cat == "progress":
-                content = content.replace("\n", " ")
-                if len(content) > PREVIEW_CHARS:
-                    content = content[: PREVIEW_CHARS - 1] + "…"
             entry = {
                 "id": (m.get("id") or "")[:8],
-                "category": cat,
                 "from": await _agent_name(m.get("from_agent_id", "")),
-                "content": content,
+                "content": m.get("message") or "",
             }
-            if m.get("expect_report"):
+            if m.get("expect_report") or (m.get("message_type") or "").lower() == "ask":
                 entry["reply_required"] = True
             if m.get("priority") == "urgent":
                 entry["priority"] = "urgent"
             if m.get("task_id"):
                 entry["task_id"] = str(m["task_id"])[:8]
+            if m.get("message_type"):
+                entry["message_type"] = m["message_type"]
             lines.append(_json.dumps(entry, ensure_ascii=False))
         if lines:
-            msg_text = "\n".join(lines)
-            scope = (
-                "full text for ask/task_transition/approval/expect_report only; "
-                "other categories are in Inbox digest above"
-                if has_digest
-                else 'JSON: {"id","category","from","content",...}'
-            )
             blocks.append(
-                f"## Messages (detail, ordered by digest) — {scope}\n"
-                f"{msg_text}"
+                "## Messages (chronological) — JSON lines; "
+                "reply_required=true means you must message that sender before done_slice\n"
+                + "\n".join(lines)
             )
 
-    # ── 3b. Background updates（progress/ACK 捎带，无需回复）──
+    # ── 3b. Background updates（wake=0 捎带）──
     if background_msgs:
         import json as _json
-        if has_digest:
-            # Digest already lists them; avoid pasting summaries twice.
-            blocks.append(
-                f"## Background updates — {len(background_msgs)} item(s) "
-                "summarized in Inbox digest above (no reply needed)."
-            )
-        else:
-            lines = []
-            for i, m in enumerate(background_msgs):
-                if i >= MAX_PROGRESS_DETAIL:
-                    lines.append(
-                        _json.dumps(
-                            {
-                                "note": (
-                                    f"+{len(background_msgs) - MAX_PROGRESS_DETAIL} "
-                                    "more background"
-                                ),
-                            },
-                            ensure_ascii=False,
-                        )
-                    )
-                    break
-                content = (m.get("message") or "").replace("\n", " ")
-                if len(content) > PREVIEW_CHARS:
-                    content = content[: PREVIEW_CHARS - 1] + "…"
-                entry = {
-                    "id": (m.get("id") or "")[:8],
-                    "category": classify_inbox_row(m),
-                    "from": await _agent_name(m.get("from_agent_id", "")),
-                    "content": content,
-                }
-                lines.append(_json.dumps(entry, ensure_ascii=False))
-            blocks.append(
-                "## Background updates — 同事进度/回执（仅供参考，无需回复；"
-                "其中可能包含你等待的交付证据）\n" + "\n".join(lines)
-            )
+        lines = []
+        for m in background_msgs:
+            entry = {
+                "id": (m.get("id") or "")[:8],
+                "from": await _agent_name(m.get("from_agent_id", "")),
+                "content": m.get("message") or "",
+            }
+            lines.append(_json.dumps(entry, ensure_ascii=False))
+        blocks.append(
+            "## Background updates — 同事进度/回执（仅供参考，无需回复；"
+            "其中可能包含你等待的交付证据）\n" + "\n".join(lines)
+        )
 
     # ── 3.5. Goals workbook update (dirty check) ──
     # Only shown when dirty — doesn't trigger the agent on its own.
