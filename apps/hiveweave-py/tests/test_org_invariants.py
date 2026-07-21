@@ -175,3 +175,49 @@ def test_rejects_archived_parent():
     )
     assert err is not None
     assert "archived" in err
+
+
+def test_rejects_transfer_executor_to_ceo():
+    from hiveweave.services.org_invariants import validate_transfer
+
+    err = validate_transfer(
+        agents=_agents(),
+        agent_id="eng-1",
+        new_parent_id="ceo-1",
+    )
+    assert err is not None
+    assert "cannot report directly to CEO" in err
+
+
+def test_allows_transfer_executor_to_coordinator():
+    from hiveweave.services.org_invariants import validate_transfer
+
+    agents = _agents() + [
+        {
+            "id": "arch-2",
+            "name": "云帆",
+            "role": "游戏技术负责人",
+            "permission_type": "coordinator",
+            "parent_id": "ceo-1",
+            "status": "active",
+            "short_id": "A9",
+        }
+    ]
+    err = validate_transfer(
+        agents=agents,
+        agent_id="eng-1",
+        new_parent_id="arch-2",
+    )
+    assert err is None
+
+
+def test_rejects_transfer_executor_to_root():
+    from hiveweave.services.org_invariants import validate_transfer
+
+    err = validate_transfer(
+        agents=_agents(),
+        agent_id="eng-1",
+        new_parent_id=None,
+    )
+    assert err is not None
+    assert "cannot be root" in err.lower() or "coordinator" in err.lower()

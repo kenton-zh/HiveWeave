@@ -124,6 +124,10 @@ async def test_check_one_agent_by_name(monkeypatch):
             _message_queue=[],
         ),
     )
+    monkeypatch.setattr(
+        "hiveweave.tools.org_tools._unread_wake_count",
+        AsyncMock(return_value=3),
+    )
 
     result = await check_agent_status_tool(
         CheckAgentStatusParams(agentId="天线"),
@@ -134,6 +138,7 @@ async def test_check_one_agent_by_name(monkeypatch):
     assert result.success
     assert "天线" in result.output
     assert "waiting_human" in result.output
+    assert "unread_wake=3" in result.output
 
 
 @pytest.mark.asyncio
@@ -167,6 +172,10 @@ async def test_check_list_all(monkeypatch):
     monkeypatch.setattr(
         "hiveweave.agents.supervisor.agent_manager.get_agent",
         lambda _aid: None,
+    )
+    monkeypatch.setattr(
+        "hiveweave.tools.org_tools._unread_wake_count",
+        AsyncMock(return_value=0),
     )
 
     result = await check_agent_status_tool(

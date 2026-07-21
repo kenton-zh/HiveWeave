@@ -215,30 +215,113 @@ class TaskService:
                           tags: list[str] | None = None,
                           source: str = "agent",
                           evidence: dict | None = None) -> str:
-        """Create a task. JSON-serializes list/dict fields. Returns task_id."""
+        """Create a task. JSON-serializes list/dict fields. Returns task_id.
+
+        Assign = claim: if ``assignee_id`` is set and the task is not VERIFY,
+        insert as ``claimed`` (with ``claimed_at``). Unassigned drafts and
+        VERIFY children stay ``created`` until claimed / post-merge nudge.
+        """
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
         task_id = str(uuid.uuid4())
         policy_id = resolve_task_policy(title, tags, description)
+        # Assign = claim (VERIFY stays created until post-merge / stale nudge)
+        draft = {
+            "title": title,
+            "tags": tags or [],
+        }
+        assign_is_claim = bool(assignee_id) and not self._is_verify_task(draft)
+        status = "claimed" if assign_is_claim else "created"
+        claimed_at = now_ms if assign_is_claim else None
         await _execute(project_id,
             "INSERT INTO tasks (id, project_id, title, description, assignee_id, "
             "creator_id, status, priority, progress, tags, parent_task_id, depends_on, "
             "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
             "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
             "is_archived, due_at, policy_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'created', ?, 0, ?, ?, ?, ?, ?, ?, NULL, ?, "
-            "0, ?, NULL, NULL, NULL, ?, 0, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, NULL, ?, "
+            "0, ?, ?, NULL, NULL, ?, 0, ?, ?)",
             [task_id, project_id, title, description, assignee_id, creator_id,
-             priority, json.dumps(tags) if tags else None, parent_task_id,
+             status, priority, json.dumps(tags) if tags else None, parent_task_id,
              json.dumps(depends_on) if depends_on else None,
              json.dumps(acceptance_criteria) if acceptance_criteria else None,
              json.dumps(evidence) if evidence else None,
              json.dumps(expected_modules) if expected_modules else None,
-             source, now_ms, now_ms, due_at, policy_id])
+             source, now_ms, claimed_at, now_ms, due_at, policy_id])
         log.info("task_created", task_id=task_id, title=title[:60],
                  creator_id=creator_id, assignee_id=assignee_id,
-                 policy_id=policy_id)
+                 status=status, policy_id=policy_id)
+        if assign_is_claim:
+            await self.emit_task_event(
+                project_id,
+                task_id,
+                "claimed",
+                agent_id=assignee_id,
+                summary=f"[claimed] task {task_id[:8]} on assign",
+            )
         return task_id
+
+    async def ensure_assignee_claimed(
+        self, project_id: str, task_id: str
+    ) -> bool:
+        """If task is assigned + created (non-VERIFY), promote to claimed.
+
+        Returns True if a claim transition ran. Idempotent for already-claimed
+        / VERIFY / unassigned rows.
+        """
+        task = await self.get_task(project_id, task_id)
+        if not task:
+            return False
+        if task.get("status") != "created":
+            return False
+        if self._is_verify_task(task):
+            return False
+        assignee = task.get("assignee_id")
+        if not assignee:
+            return False
+        await self.claim_task(project_id, task_id, assignee)
+        return True
+
+    async def promote_assigned_created(
+        self, project_id: str, agent_id: str | None = None
+    ) -> int:
+        """Heal legacy rows: assignee set + status=created → claimed (non-VERIFY).
+
+        Used so task-advance obligations see assign=claim for older data.
+        """
+        await _ensure_schema(project_id)
+        if agent_id:
+            rows = await _query(
+                project_id,
+                f"SELECT {self._COLUMNS} FROM tasks WHERE is_archived = 0 "
+                "AND status = 'created' AND assignee_id = ?",
+                [agent_id],
+            )
+        else:
+            rows = await _query(
+                project_id,
+                f"SELECT {self._COLUMNS} FROM tasks WHERE is_archived = 0 "
+                "AND status = 'created' AND assignee_id IS NOT NULL",
+            )
+        n = 0
+        for r in rows:
+            d = self._row(r)
+            if self._is_verify_task(d):
+                continue
+            tid = d.get("id")
+            aid = d.get("assignee_id")
+            if not tid or not aid:
+                continue
+            try:
+                await self.claim_task(project_id, tid, aid)
+                n += 1
+            except Exception as e:
+                log.warning(
+                    "promote_assigned_created_failed",
+                    task_id=tid,
+                    error=str(e),
+                )
+        return n
 
     async def _transition(self, project_id: str, task_id: str, target: str) -> None:
         """Validate and execute a status transition.
@@ -297,16 +380,19 @@ class TaskService:
     async def claim_task(self, project_id: str, task_id: str, agent_id: str) -> None:
         """Claim a task (created → claimed). Sets assignee_id + claimed_at.
 
-        Only 'created' tasks can be claimed. If the task is already
-        'claimed' or 'running' (e.g. after an LLM timeout + RESUME),
-        raises ValueError with a clear message so the LLM agent knows
-        to continue working instead of re-claiming.
+        Assign = claim: if the task is already claimed/running by this agent
+        (e.g. create_task/dispatch set assignee), this is a no-op. Only
+        'created' tasks transition. Wrong-assignee or illegal states raise.
         """
         rows = await _query(project_id,
-            "SELECT status FROM tasks WHERE id = ?", [task_id])
+            "SELECT status, assignee_id FROM tasks WHERE id = ?", [task_id])
         if not rows:
             raise ValueError(f"Task not found: {task_id}")
         current = rows[0]["status"]
+        existing_assignee = rows[0]["assignee_id"]
+        if current in ("claimed", "running") and existing_assignee == agent_id:
+            # Idempotent: already assigned to this agent (assign=claim path)
+            return
         if current != "created":
             raise ValueError(
                 f"Task {task_id[:8]} is already '{current}'. "
@@ -697,12 +783,14 @@ class TaskService:
     async def mark_verifying(self, project_id: str, task_id: str) -> None:
         """Parent task enters verifying after VERIFY child is spawned."""
         rows = await _query(
-            project_id, "SELECT status FROM tasks WHERE id = ?", [task_id]
+            project_id, "SELECT status, creator_id FROM tasks WHERE id = ?", [task_id]
         )
         if not rows:
             raise ValueError(f"Task not found: {task_id}")
         current = rows[0]["status"]
+        creator_id = rows[0]["creator_id"]
         if current == "verifying":
+            await self._clear_merge_pending_inbox(task_id, creator_id)
             return
         if current == "approved":
             await self._transition(project_id, task_id, "verifying")
@@ -712,10 +800,34 @@ class TaskService:
                 "verifying",
                 summary=f"[verifying] task {task_id[:8]}",
             )
+            await self._clear_merge_pending_inbox(task_id, creator_id)
             return
         if current == "closed":
+            await self._clear_merge_pending_inbox(task_id, creator_id)
             return
         raise ValueError(f"Cannot mark verifying from status={current}")
+
+    async def _clear_merge_pending_inbox(
+        self, task_id: str, creator_id: str | None
+    ) -> None:
+        """Mark stale [MERGE PENDING] for this task as read (merge already done)."""
+        if not creator_id or not task_id:
+            return
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().supersede_watchdog_messages(
+                creator_id,
+                prefixes=["[MERGE PENDING]", "[MERGE PROXY]"],
+                contains=task_id[:8],
+            )
+        except Exception as e:
+            log.warning(
+                "clear_merge_pending_failed",
+                task_id=task_id,
+                creator_id=creator_id,
+                error=str(e),
+            )
 
     @staticmethod
     def _is_verify_task(task: dict) -> bool:
@@ -1001,19 +1113,31 @@ class TaskService:
         """Tasks this agent must act on now (open-task reminder / stall helpers).
 
         - As assignee: claimed | running | rework | verifying (VERIFY assignee)
-          VERIFY stays created until merge/stale nudge claims it — created is
-          NOT an obligation (post-merge work must not thrash pre-merge).
-        - As creator: submitted | reviewing  (NOT approved — that is parked)
-        Excludes blocked / approved / closed / archived.
+          Assign = claim: assigned non-VERIFY tasks are promoted from created
+          before this query. VERIFY stays created until merge/stale nudge.
+        - As creator: submitted | reviewing | approved
+          approved (non-VERIFY) = must git_worktree_merge (CREATOR_MUST_MERGE).
+          VERIFY children never stay as creator merge obligations.
+        Excludes blocked / closed / archived.
         Each dict includes role_hint: 'assignee' | 'creator'.
         """
         await _ensure_schema(project_id)
+        # Heal legacy assign-without-claim rows so obligations stay consistent
+        try:
+            await self.promote_assigned_created(project_id, agent_id)
+        except Exception as e:
+            log.warning(
+                "promote_assigned_created_on_obligations_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
         rows = await _query(
             project_id,
             f"SELECT {self._COLUMNS} FROM tasks WHERE is_archived = 0 AND ("
             "  (assignee_id = ? AND status IN "
             "   ('claimed','running','rework','verifying'))"
-            "  OR (creator_id = ? AND status IN ('submitted','reviewing'))"
+            "  OR (creator_id = ? AND status IN "
+            "   ('submitted','reviewing','approved'))"
             ") ORDER BY updated_at DESC",
             [agent_id, agent_id],
         )
@@ -1029,6 +1153,9 @@ class TaskService:
                     continue
                 d["role_hint"] = "assignee"
             else:
+                # Creator merge obligation: skip VERIFY (closed on approve)
+                if status == "approved" and self._is_verify_task(d):
+                    continue
                 d["role_hint"] = "creator"
             out.append(d)
         return out
@@ -1092,6 +1219,16 @@ class TaskService:
         params.append(task_id)
         await _execute(project_id,
             f"UPDATE tasks SET {', '.join(set_clauses)} WHERE id = ?", params)
+        # Assign = claim when PATCH sets an assignee on a created (non-VERIFY) task
+        if "assignee_id" in updates and updates.get("assignee_id"):
+            try:
+                await self.ensure_assignee_claimed(project_id, task_id)
+            except Exception as e:
+                log.warning(
+                    "update_task_ensure_claimed_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
 
     @staticmethod
     def _row(row) -> dict:

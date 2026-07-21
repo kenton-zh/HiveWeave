@@ -106,6 +106,15 @@ async def lifespan(app: FastAPI):
         print(f"FATAL: Meta DB init failed: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # 1b. Register built-in lifecycle hook handlers (task-advance, …)
+    try:
+        from hiveweave.hooks.handlers import register_builtin_handlers
+
+        register_builtin_handlers()
+        log.info("lifecycle_hooks_registered")
+    except Exception as e:
+        log.warning("lifecycle_hooks_register_failed", error=str(e))
+
     # 2. Clear zombie streaming messages
     try:
         from hiveweave.db import meta as meta_db

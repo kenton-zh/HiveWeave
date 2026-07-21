@@ -42,29 +42,22 @@ def test_is_test_command():
 
 
 def test_resolve_task_policy():
-    assert resolve_task_policy("Fix login UI", ["frontend"]) == "ui_browser_e2e"
-    assert resolve_task_policy("Write README", ["docs"]) == "docs_only"
-    assert resolve_task_policy("Implement API", []) == "generic_tests"
-    # "suite" must not false-positive match "ui"
-    assert resolve_task_policy("Run test suite", []) == "generic_tests"
-    assert (
-        resolve_task_policy("VERIFY: Feature X", ["verify", "post-merge"])
-        == "generic_tests"
-    )
-    assert (
-        resolve_task_policy("VERIFY: Fix login UI", ["verify", "ui"])
-        == "ui_browser_e2e"
-    )
+    # Policy labels no longer drive gates — always coordinator_review
+    assert resolve_task_policy("Fix login UI", ["frontend"]) == "coordinator_review"
+    assert resolve_task_policy("Write README", ["docs"]) == "coordinator_review"
+    assert resolve_task_policy("Implement API", []) == "coordinator_review"
 
 
 def test_required_kinds():
-    assert required_attestation_kinds("ui_browser_e2e") == frozenset({"browse_e2e"})
-    assert required_attestation_kinds("generic_tests") == frozenset({"test_run"})
+    assert required_attestation_kinds("ui_browser_e2e") is None
+    assert required_attestation_kinds("generic_tests") is None
     assert required_attestation_kinds("docs_only") is None
+    assert required_attestation_kinds("coordinator_review") is None
 
 
 @pytest.mark.asyncio
-async def test_check_task_rejects_bare_tests_passed():
+async def test_check_task_never_rejects_bare_tests_passed():
+    """Hard attestation gate removed — coordinator judges on review."""
     task = {
         "id": "t1",
         "title": "UI button",
@@ -73,8 +66,7 @@ async def test_check_task_rejects_bare_tests_passed():
         "evidence": {"tests_passed": True},
     }
     err = await check_task_attestations("p1", task, None)
-    assert err is not None
-    assert "attestation" in err.lower() or "REJECT" in err
+    assert err is None
 
 
 @pytest.mark.asyncio

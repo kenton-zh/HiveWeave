@@ -1,14 +1,11 @@
-"""wake_policy — complete disposition must not wake on progress alone.
-
-TEST3: task_transition must pierce unmatched agent/user Wait Contracts.
-"""
+"""Wake policy — any message wakes (progress is label-only)."""
 
 from hiveweave.agents.trigger import _has_task_gate_messages
 from hiveweave.services.wake_policy import should_wake
 
 
-def test_complete_blocks_progress():
-    assert should_wake("progress", disposition="complete") is False
+def test_complete_still_wakes_on_progress():
+    assert should_wake("progress", disposition="complete") is True
 
 
 def test_complete_allows_user():
@@ -23,23 +20,22 @@ def test_complete_allows_task_transition():
     ) is True
 
 
-def test_complete_blocks_peer_command():
-    # Peer commands must not wake complete agents (TEST4 empty done_slice churn)
+def test_complete_allows_peer_command():
     assert should_wake(
         "command", disposition="complete", from_agent_id="peer-1"
-    ) is False
+    ) is True
 
 
-def test_complete_blocks_peer_ask():
+def test_complete_allows_peer_ask():
     assert should_wake(
         "ask", disposition="complete", from_agent_id="peer-1"
-    ) is False
+    ) is True
 
 
-def test_waiting_human_still_blocks_peer_command():
+def test_waiting_human_allows_peer_command():
     assert should_wake(
         "command", disposition="waiting_human", from_agent_id="peer-1"
-    ) is False
+    ) is True
 
 
 def test_waiting_human_allows_task_transition():
@@ -50,8 +46,7 @@ def test_waiting_human_allows_task_transition():
     ) is True
 
 
-def test_task_transition_pierces_unmatched_agent_wait():
-    """TEST3 root cause: coordinator waiting on agent must still wake on submit."""
+def test_task_transition_wakes_with_agent_wait():
     waits = [
         {
             "kind": "agent",
@@ -72,7 +67,7 @@ def test_task_transition_pierces_unmatched_agent_wait():
     )
 
 
-def test_peer_command_still_blocked_by_unmatched_agent_wait():
+def test_peer_command_wakes_with_unmatched_agent_wait():
     waits = [
         {
             "kind": "agent",
@@ -88,7 +83,7 @@ def test_peer_command_still_blocked_by_unmatched_agent_wait():
             from_agent_name="星野",
             active_waits=waits,
         )
-        is False
+        is True
     )
 
 

@@ -527,32 +527,44 @@ class Agent:
                 )
                 return {"ok": True, "suppressed": True}
 
-            # Complete + non-user trigger: skip LLM (TEST4 done_slice churn)
-            # User chat uses trigger=False; task wakes set wake_category /
-            # source=task (must match wake_policy.should_wake complete branch).
+            # Complete + non-user trigger: skip unless admit_wake pierces
+            # (same gate as inbox wake bits — ask / superior command / task).
             if self.disposition == "complete" and (opts or {}).get("trigger"):
                 o = opts or {}
-                wake_cat = o.get("wake_category") or ""
-                source = o.get("source") or ""
-                is_task_wake = (
-                    wake_cat == "task_transition"
-                    or source
-                    in (
-                        "task",
-                        "dispatch",
-                        "task_transition",
-                        "inbox_task",
-                        "verify",
-                    )
-                    or o.get("message_type") == "task"
-                    or bool(o.get("task_id"))
+                from hiveweave.services.wake_policy import admit_wake
+
+                wake_cat = (o.get("wake_category") or "command") or "command"
+                if wake_cat not in (
+                    "command",
+                    "ask",
+                    "approval",
+                    "task_transition",
+                    "progress",
+                ):
+                    wake_cat = "command"
+                parent_id = self.config.get("parent_id")
+                admit = admit_wake(
+                    wake_cat,  # type: ignore[arg-type]
+                    disposition="complete",
+                    from_agent_id=o.get("from_agent_id"),
+                    recipient_parent_id=parent_id,
                 )
-                if not is_task_wake and not o.get("from_user"):
+                # Task-class sources still pierce even if category missing
+                source = o.get("source") or ""
+                is_task_wake = source in (
+                    "task",
+                    "dispatch",
+                    "task_transition",
+                    "inbox_task",
+                    "verify",
+                ) or o.get("message_type") == "task" or bool(o.get("task_id"))
+                if not admit.ok and not is_task_wake and not o.get("from_user"):
                     log.info(
                         "chat_complete_skip_trigger",
                         agent_id=self.id,
                         source=source,
                         wake_category=wake_cat,
+                        admit_reason=admit.reason,
                     )
                     return {"ok": True, "skipped": "complete"}
 
@@ -561,9 +573,19 @@ class Agent:
             self._cancel_reason = None
             self.empty_retry_count = 0
             source = (opts or {}).get("source") or ""
-            # External wakes refill slice budget; gate repair does not
+            # External wakes refill slice budget; gate/reminder turns do not
             if source not in ("turn_exit_gate", "open_task_reminder"):
                 self._slice_budget = self._SLICE_BUDGET_MAX
+                # New wake: allow [TASK ADVANCE] again; clear explicit 不推进
+                self._task_reminder_count = 0
+                try:
+                    from hiveweave.services.turn_session import (
+                        clear_task_advance_deferred,
+                    )
+
+                    clear_task_advance_deferred(self.id)
+                except Exception:
+                    pass
                 if source in ("user", "chat", "") or not opts.get("trigger"):
                     # User-facing chat clears waiting_human into runnable while processing
                     if self.disposition == "waiting_human" and not opts.get("trigger"):
@@ -1488,14 +1510,29 @@ class Agent:
                     pass
                 self.pending_inbox_msg_ids = None
         else:
-            if self.pending_inbox_msg_ids:
-                await self._inbox.mark_read_by_ids(
-                    self.id, self.pending_inbox_msg_ids
-                )
+            ack_ids: list[str] = list(self.pending_inbox_msg_ids or [])
+            # Mid-turn arrivals: unread wake=1 created after this turn started
+            try:
+                started = int((self.current_job or {}).get("started_at") or 0)
+                if started:
+                    extra = await self._inbox.get_pending_ids_since(
+                        self.id, started
+                    )
+                    if extra:
+                        seen = set(ack_ids)
+                        for mid in extra:
+                            if mid not in seen:
+                                ack_ids.append(mid)
+                                seen.add(mid)
+            except Exception as e:
+                log.debug("mid_turn_ack_lookup_failed", error=str(e))
+            if ack_ids:
+                await self._inbox.mark_read_by_ids(self.id, ack_ids)
             self.pending_inbox_msg_ids = None
             self._turn_gate_count = 0
             self._reply_reminder_count = 0
-            self._task_reminder_count = 0
+            # Do NOT reset _task_reminder_count here — that would defeat the
+            # agent.turn.after nudge cap and allow infinite [TASK ADVANCE] loops.
             pop_pending_turn_result(self.id)
             self.disposition = exit_decision.disposition or "runnable"
 
@@ -1625,7 +1662,54 @@ class Agent:
         # 6. Process queued user messages (sent while agent was busy)
         await self._drain_message_queue()
 
-        # 7–8. Repair once OR one progress slice — never unlimited in_progress
+        # 7. Lifecycle hook agent.turn.after (task-advance nudge, etc.)
+        turn_after_hint: str | None = None
+        try:
+            from hiveweave.hooks import AGENT_TURN_AFTER, hooks
+
+            hook_out: dict = {"hint": None, "skip_reason": None}
+            from hiveweave.services.turn_session import is_task_advance_deferred
+
+            await hooks.run(
+                AGENT_TURN_AFTER,
+                {
+                    "agent_id": self.id,
+                    "project_id": self.project_id,
+                    "tool_calls": tool_calls,
+                    "open_obligations": open_obligations,
+                    "tasks_advanced": list(tasks_advanced),
+                    "phase": (
+                        exit_decision.turn_result.phase
+                        if exit_decision.turn_result
+                        else None
+                    ),
+                    "disposition": self.disposition,
+                    "exit_ok": exit_decision.ok,
+                    "gate_repairing": bool(gate_retrigger_hint),
+                    "continue_slice": continue_slice,
+                    "deferred": is_task_advance_deferred(self.id),
+                    "reminder_count": self._task_reminder_count,
+                    "reminder_max": self._TASK_REMINDER_MAX,
+                },
+                hook_out,
+            )
+            raw_hint = hook_out.get("hint")
+            if isinstance(raw_hint, str) and raw_hint.strip():
+                turn_after_hint = raw_hint.strip()
+            elif hook_out.get("skip_reason") in (
+                "no_obligations",
+                "all_advanced",
+                "deferred",
+            ):
+                self._task_reminder_count = 0
+        except Exception as e:
+            log.warning(
+                "agent_turn_after_hook_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+
+        # 8. Repair once OR one progress slice OR hook nudge — never unlimited
         if gate_retrigger_hint:
             await self._retrigger_for_turn_gate(
                 gate_retrigger_hint, inbox_msg_ids=carry_inbox_ids
@@ -1637,6 +1721,9 @@ class Agent:
                 "(prefer waiting/done_slice when idle on the user).",
                 inbox_msg_ids=None,
             )
+        elif turn_after_hint:
+            self._task_reminder_count += 1
+            await self._retrigger_for_open_tasks(turn_after_hint)
         else:
             await self._maybe_self_retrigger()
 
@@ -1939,22 +2026,21 @@ class Agent:
                 consecutive_errors=self._consecutive_errors,
             )
         elif inbox_ids and self._consecutive_errors > self._CONSECUTIVE_ERROR_MAX:
-            # 超过阈值: ACK inbox，停止 resume 循环 + 升级上级一次
+            # 超过阈值: 选择性 ACK（保留待审/升级类）+ 账本再挂 + 升级上级
             self._arm_resume_suppressed()
             try:
-                await self._inbox.mark_read_by_ids(self.id, inbox_ids)
-                log.warning(
-                    "llm_error_inbox_acked_max_errors",
-                    agent_id=self.id,
-                    inbox_acked=len(inbox_ids),
-                    consecutive_errors=self._consecutive_errors,
-                )
+                await self._ack_inbox_on_give_up(inbox_ids)
             except Exception as ack_err:
                 log.error("inbox_ack_failed", agent_id=self.id, error=str(ack_err))
             self.pending_inbox_msg_ids = None
             await self._escalate_turn_interruption(reason=f"llm_error:{error_type}")
         elif self._consecutive_errors > self._CONSECUTIVE_ERROR_MAX:
             self._arm_resume_suppressed()
+            try:
+                await self._inject_ledger_review_wake()
+            except Exception as e:
+                log.debug("ledger_rewake_on_give_up_failed", error=str(e))
+            await self._escalate_turn_interruption(reason=f"llm_error:{error_type}")
 
         self._cancel_safety_timer()
         await self._go_idle()
@@ -2186,19 +2272,25 @@ class Agent:
             )
             self._arm_resume_cooldown(TIMEOUT_RESUME_COOLDOWN_S)
         else:
-            # 超阈值放弃: ACK inbox 停止 resume 循环，升级上级一次
+            # 超阈值放弃: 选择性 ACK + 账本再挂 + 升级上级
             self._arm_resume_suppressed()
             if inbox_ids:
                 try:
-                    await self._inbox.mark_read_by_ids(self.id, inbox_ids)
+                    await self._ack_inbox_on_give_up(inbox_ids)
                 except Exception as ack_err:
                     log.error("inbox_ack_failed", agent_id=self.id, error=str(ack_err))
+            else:
+                try:
+                    await self._inject_ledger_review_wake()
+                except Exception as e:
+                    log.debug("ledger_rewake_on_timeout_failed", error=str(e))
             try:
                 await self._work_log.write_work_log(
                     self.project_id, self.id, None,
                     "error",
                     f"[safety_timeout] gave up after {self._consecutive_errors} "
-                    "consecutive interrupted turns; inbox ACKed, escalated",
+                    "consecutive interrupted turns; non-critical inbox ACKed, "
+                    "review-critical kept; escalated",
                     details={
                         "reason": "safety_timeout",
                         "inbox_ids": inbox_ids[:20],
@@ -2230,11 +2322,133 @@ class Agent:
             cooldown_s=0.0 if give_up else TIMEOUT_RESUME_COOLDOWN_S,
         )
 
+    async def _ack_inbox_on_give_up(self, inbox_ids: list[str]) -> None:
+        """ACK noisy inbox on give-up but keep review/escalation/ask wakes.
+
+        Also inject a ledger [LEDGER REVIEW] wake when this agent still owns
+        submitted/reviewing tasks as creator — so CREATOR_MUST_REVIEW survives
+        even if the original [TASK SUBMITTED] rows were somehow lost.
+        """
+        to_ack, to_spare = await self._inbox.partition_give_up_ack(
+            self.id, list(inbox_ids or [])
+        )
+        if to_ack:
+            await self._inbox.mark_read_by_ids(self.id, to_ack)
+        if to_spare:
+            await self._inbox.ensure_wake(self.id, to_spare)
+        log.warning(
+            "llm_error_inbox_selective_ack",
+            agent_id=self.id,
+            inbox_acked=len(to_ack),
+            inbox_spared=len(to_spare),
+            consecutive_errors=self._consecutive_errors,
+        )
+        await self._inject_ledger_review_wake()
+
+    async def _inject_ledger_review_wake(self) -> None:
+        """If creator still has review/merge duties, force a task-class wake."""
+        try:
+            from hiveweave.services.task import TaskService
+
+            obl = await TaskService().get_actionable_obligations(
+                self.project_id, self.id
+            )
+        except Exception as e:
+            log.debug("ledger_obligations_lookup_failed", error=str(e))
+            return
+        review = [
+            t
+            for t in (obl or [])
+            if t.get("role_hint") == "creator"
+            and t.get("status") in ("submitted", "reviewing")
+        ]
+        merge = [
+            t
+            for t in (obl or [])
+            if t.get("role_hint") == "creator" and t.get("status") == "approved"
+        ]
+        if not review and not merge:
+            return
+
+        async def _send(body: str, task_id: str | None, kind: str) -> None:
+            try:
+                await self._inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=self.id,
+                    message=body,
+                    message_type="task",
+                    priority="urgent",
+                    task_id=task_id,
+                    wake=True,
+                )
+                log.info(
+                    f"ledger_{kind}_wake_injected",
+                    agent_id=self.id,
+                    count=(
+                        len(review) if kind == "review" else len(merge)
+                    ),
+                )
+            except Exception as e:
+                log.warning(
+                    f"ledger_{kind}_wake_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
+
+        if review:
+            lines = []
+            for t in review[:8]:
+                tid = str(t.get("id") or "")
+                title = (t.get("title") or "(untitled)").split("\n")[0][:50]
+                lines.append(f"  - {tid[:8]} [{t.get('status')}] {title}")
+            extra = len(review) - len(lines)
+            body = (
+                f"[LEDGER REVIEW] You still have {len(review)} task(s) awaiting "
+                f"review_task (status submitted/reviewing). Do not ignore the ledger "
+                f"after an LLM error. Use review_task(taskId, decision):\n"
+                + "\n".join(lines)
+                + (f"\n  - …and {extra} more" if extra > 0 else "")
+            )
+            await _send(body, str(review[0].get("id") or "") or None, "review")
+
+        if merge:
+            lines = []
+            for t in merge[:8]:
+                tid = str(t.get("id") or "")
+                title = (t.get("title") or "(untitled)").split("\n")[0][:50]
+                lines.append(f"  - {tid[:8]} [approved] {title}")
+            extra = len(merge) - len(lines)
+            body = (
+                f"[MERGE PENDING] You still have {len(merge)} approved task(s) "
+                f"awaiting git_worktree_merge. Do not leave worktree-only. "
+                f"Call git_worktree_merge(branchName=shortId or hw/...):\n"
+                + "\n".join(lines)
+                + (f"\n  - …and {extra} more" if extra > 0 else "")
+            )
+            await _send(body, str(merge[0].get("id") or "") or None, "merge")
+            # Give-up + approved: escalate MERGE PROXY to parent with MERGE
+            try:
+                from hiveweave.services.merge_proxy import escalate_merge_proxy
+
+                for t in merge[:5]:
+                    await escalate_merge_proxy(
+                        self.project_id,
+                        t,
+                        reason="creator_give_up",
+                        trigger=True,
+                    )
+            except Exception as e:
+                log.debug(
+                    "merge_proxy_on_give_up_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
+
     async def _escalate_turn_interruption(self, *, reason: str) -> None:
         """连续中断超限，给上级发一次升级消息。
 
         每个失败 streak 只升级一次（计数恰好越限的那次）——后续连续失败仍
-        ACK inbox 止血，但不重复打扰上级，避免「升级 → 上级追问 → 再失败 →
+        选择性 ACK inbox 止血，但不重复打扰上级，避免「升级 → 上级追问 → 再失败 →
         再升级」的跨 agent 振荡。成功后计数归零，新的 streak 会再次升级。
         best-effort：升级失败只记日志，不阻断清理流程。
         """
@@ -2250,12 +2464,13 @@ class Agent:
                     message=(
                         f"[ESCALATION] Subordinate {agent_name} gave up a turn "
                         f"after {self._consecutive_errors} consecutive "
-                        f"interruptions (last: {reason}). Pending inbox "
-                        f"messages were ACKed to break the resume loop. "
-                        f"Please check on them."
+                        f"interruptions (last: {reason}). Non-critical inbox "
+                        f"was ACKed; review-critical / ask messages were kept. "
+                        f"Please check on them and any submitted tasks."
                     ),
                     message_type="escalation",
                     priority="urgent",
+                    wake=True,
                 )
                 # 触发上级
                 from hiveweave.agents.trigger import trigger_coordinator
@@ -2312,13 +2527,12 @@ class Agent:
         msg_ids_set = set(self.pending_inbox_msg_ids)
         target_msgs = [m for m in pending if m["id"] in msg_ids_set]
 
-        from hiveweave.services.reply_policy import message_requests_reply
-
-        # Hard flag OR reply-request language (covers expect_report=0 mistakes)
+        # Structural only: expect_report or message_type=ask (language-agnostic)
         expect_reply_msgs = [
             m
             for m in target_msgs
-            if m.get("expect_report") or message_requests_reply(m.get("message"))
+            if m.get("expect_report")
+            or (m.get("message_type") or "").lower() == "ask"
         ]
         if not expect_reply_msgs:
             return []
@@ -2378,8 +2592,6 @@ class Agent:
         场景: A 收到 B/C/D/E 消息，B/C/D 要求回复，A 只回复了 B。
         提示应明确告诉 A："你已回复 B，但 C/D 仍未回复"。
         """
-        from hiveweave.services.reply_policy import message_requests_reply
-
         # unreplied_msgs 已带有 from_name（由 _check_unreplied_expect_report 解析）
         unreplied_details: list[str] = []
         unreplied_names: list[str] = []
@@ -2401,7 +2613,7 @@ class Agent:
                 and m["id"] not in unreplied_ids
                 and (
                     m.get("expect_report")
-                    or message_requests_reply(m.get("message"))
+                    or (m.get("message_type") or "").lower() == "ask"
                 )
             ]
             # 批量解析
@@ -2511,115 +2723,30 @@ class Agent:
                 advanced.add(tid)
             elif name == "review_task":
                 advanced.add(tid)
+            elif name in ("claim_task", "dispatch_task", "close_task"):
+                advanced.add(tid)
             elif name == "update_task_status":
                 status = str(args.get("status") or "running").lower()
-                if status == "blocked":
+                if status in ("blocked", "running", "claimed"):
                     advanced.add(tid)
-            elif name == "close_task":
+            elif name == "update_progress":
                 advanced.add(tid)
         return advanced
 
     def _build_open_task_hint(self, obligations: list[dict]) -> str:
-        lines = [
-            "[OPEN TASKS]",
-            f"你还有 {len(obligations)} 个未完成的可行动任务。不要只口头说下一步——本轮用工具推进，"
-            "或显式 blocked（dependency:/timer:/user:/external:）并 schedule_alarm。",
-        ]
-        for t in obligations[:8]:
-            tid = str(t.get("id") or "")
-            title = (t.get("title") or "(untitled)").split("\n")[0][:60]
-            status = t.get("status") or "?"
-            role = t.get("role_hint") or "assignee"
-            progress = t.get("progress")
-            prog = f" progress={progress}%" if progress is not None else ""
-            if role == "creator":
-                if status == "approved":
-                    next_step = "合并/VERIFY 完成后 close_task，或确认已关闭"
-                else:
-                    next_step = "用 review_task(taskId, decision, feedback) 审批"
-            elif status == "rework":
-                next_step = "按反馈返工后重新 submit_task"
-            elif status == "claimed":
-                next_step = "update_task_status(running) 后继续执行"
-            else:
-                next_step = "继续执行或 submit_task / update_task_status(blocked)"
-            lines.append(
-                f"- [{status}] {tid[:8]}… ({role}){prog} {title} → {next_step}"
-            )
-        if len(obligations) > 8:
-            lines.append(f"- …还有 {len(obligations) - 8} 条未列出")
-        return "\n".join(lines)
+        """Deprecated wrapper — hint text lives in hooks.handlers.task_advance."""
+        from hiveweave.hooks.handlers.task_advance import build_task_advance_hint
 
-    async def _maybe_open_task_reminder(self, tool_calls: list) -> str | None:
-        """若仍有可行动任务则构造 [OPEN TASKS] hint。
-
-        Returns hint string to chat() after idle, or None to skip.
-        Does not append_turn here — chat() persists the user message.
-        """
-        if self._task_reminder_count >= self._TASK_REMINDER_MAX:
-            log.info(
-                "open_task_reminder_cap",
-                agent_id=self.id,
-                count=self._task_reminder_count,
-            )
-            return None
-
-        try:
-            from hiveweave.services.task import TaskService
-
-            ts = TaskService()
-            obligations = await ts.get_actionable_obligations(
-                self.project_id, self.id
-            )
-        except Exception as e:
-            log.warning(
-                "open_task_reminder_query_failed",
-                agent_id=self.id,
-                error=str(e),
-            )
-            return None
-
-        if not obligations:
-            self._task_reminder_count = 0
-            return None
-
-        advanced = self._task_ids_advanced_this_turn(tool_calls)
-        remaining: list[dict] = []
-        for t in obligations:
-            tid = str(t.get("id") or "")
-            if tid in advanced:
-                continue
-            if any(
-                tid.startswith(a) or a.startswith(tid)
-                for a in advanced
-                if len(a) >= 8
-            ):
-                continue
-            remaining.append(t)
-
-        if not remaining:
-            self._task_reminder_count = 0
-            return None
-
-        hint = self._build_open_task_hint(remaining)
-        self._task_reminder_count += 1
-        log.info(
-            "open_task_reminder_prepared",
-            agent_id=self.id,
-            count=len(remaining),
-            reminder_round=self._task_reminder_count,
-        )
-        return hint
+        return build_task_advance_hint(obligations)
 
     async def _retrigger_for_open_tasks(self, hint: str) -> None:
-        """Chat with [OPEN TASKS] hint — trigger_* skips when inbox is empty."""
+        """Chat with [TASK ADVANCE] hint from agent.turn.after hook."""
         await asyncio.sleep(SELF_RETRIGGER_DELAY_MS / 1000.0)
         if self._in_resume_cooldown():
             return
         if self.status != AgentState.IDLE:
             return
         log.info("open_task_retrigger", agent_id=self.id)
-        # Fire-and-forget like _drain_message_queue — avoid nested completion
         asyncio.create_task(
             self.chat(
                 hint,

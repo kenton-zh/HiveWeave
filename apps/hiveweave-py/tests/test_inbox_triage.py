@@ -181,7 +181,7 @@ def test_derive_wake_category_picks_highest():
 
 def test_needs_message_detail_skips_progress_when_digest():
     assert needs_message_detail("progress", has_digest=True) is False
-    assert needs_message_detail("command", has_digest=True) is False
+    assert needs_message_detail("command", has_digest=True) is True
     assert needs_message_detail("ask", has_digest=True) is True
     assert needs_message_detail("task_transition", has_digest=True) is True
     assert needs_message_detail("approval", has_digest=True) is True

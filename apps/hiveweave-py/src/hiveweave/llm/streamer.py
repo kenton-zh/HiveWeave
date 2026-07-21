@@ -268,6 +268,9 @@ def _get_llm_semaphore() -> asyncio.Semaphore:
 TOOL_EXECUTION_TIMEOUT_S = 120.0
 """单个工具执行超时。对齐 Elixir Task.yield(task, 120_000)。"""
 
+# question waits on human answer (QUESTION_TIMEOUT_S=180) — must outlive that.
+_QUESTION_TOOL_TIMEOUT_S = 200.0
+
 # Status-poll cache / waiting gate (TEST3 — stop check_agent_status storms)
 # get_tasks is intentionally NOT gated while waiting — resume turns need it.
 # Per-turn hard reject (TEST4): same get_tasks fingerprint ≥3 → force waiting.
@@ -1719,10 +1722,15 @@ class Streamer:
         if cached is not None:
             return {"content": cached}
 
+        tool_timeout = (
+            _QUESTION_TOOL_TIMEOUT_S
+            if tool_name == "question"
+            else TOOL_EXECUTION_TIMEOUT_S
+        )
         try:
             result = await asyncio.wait_for(
                 on_tool_call(tool_name, arguments, tool_call_id),
-                timeout=TOOL_EXECUTION_TIMEOUT_S,
+                timeout=tool_timeout,
             )
             if isinstance(result, dict):
                 content = result.get("content")
@@ -1732,7 +1740,12 @@ class Streamer:
         except TimeoutError:
             log.error("tool_timeout",
                       agent_id=agent_id, tool=tool_name)
-            return {"content": f"[Tool Timeout] {tool_name} did not complete within {TOOL_EXECUTION_TIMEOUT_S}s"}
+            return {
+                "content": (
+                    f"[Tool Timeout] {tool_name} did not complete "
+                    f"within {tool_timeout}s"
+                )
+            }
 
     # ── Doom loop 检测 ──────────────────────────────────────
 

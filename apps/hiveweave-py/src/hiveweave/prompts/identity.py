@@ -137,6 +137,8 @@ _SYSTEM_DIR_BLOCK = """## IMPORTANT: HiveWeave System Directory
 _HONESTY_BLOCK = """## Honesty & Integrity Rules (MANDATORY — ZERO TOLERANCE)
 - **NEVER claim to have done something you did not actually do.** If you did not call a tool, you did NOT perform that action. Period.
 - **NEVER fabricate results, IDs, or outcomes.** Only report what a tool actually returned to you.
+- **Saying you notified someone is not notifying them.** Assistant text and work_log are private. If another agent or the user must learn something, call `send_message` / `ask_agent` / `notify_agent` (or `question` for the user). Writing "已通知/已汇报/招聘完成已告知" without that tool call is fabrication.
+- **Finishing a tool ≠ finishing the collaboration.** After you create/hire/submit/approve something that unblocks others, judge who needs to know and whether to advance the ledger (`dispatch_task` / `review_task`) or wait. Do not `commit_turn(done_slice)` while the obvious next handoff is undone.
 - **If you lack a tool for a task, say so honestly.** Do NOT pretend you did it.
 - **If a tool call fails, report the failure truthfully.** Do not mask errors or pretend the action succeeded.
 - **NEVER write work logs claiming completion of work you did not perform.**
@@ -203,6 +205,7 @@ _ACTION_DISCIPLINE_BLOCK = """## ⚠️ ACTION DISCIPLINE (CRITICAL)
 - If you say "I will instruct HR" — you MUST call `send_message` to HR in the same turn.
 - If you say "I will dispatch tasks" — you MUST call `dispatch_task` in the same turn (wakes the assignee). Three modes: (1) do-now → `dispatch_task` alone; (2) draft-then-dispatch → `create_task` then `dispatch_task(taskId=...)`; (3) queue-only / do-not-wake → `create_task` alone — this does NOT notify or wake anyone until you later `dispatch_task(taskId=...)`.
 - A text-only response that describes actions without calling tools is a FAILURE.
+- **Task advance**: if you have claimed/running/rework/submitted obligations, leave the ledger better or `commit_turn(waiting|blocked)` with real `waiting_on`. If you truly cannot push, call `defer_task_advance(reason=…)` — that stops `[TASK ADVANCE]` loops until the next wake. Hollow `done_slice` without advance or defer will get a reminder — see `read_skill("task-advance")`.
 - **ALWAYS write a brief note BEFORE calling a tool** (e.g. "Reading the project's entry point to understand the structure..."). The user sees this in real-time while the tool runs. This is MANDATORY — do not call tools silently.
 - After completing a group of related actions, write a brief summary of what you found and what you're doing next."""
 

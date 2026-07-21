@@ -118,6 +118,72 @@ async def commit_turn_tool(
     )
 
 
+# ── defer_task_advance（不推进）───────────────────────────
+
+
+class DeferTaskAdvanceParams(BaseModel):
+    """Explicitly decline to advance actionable tasks this wake cycle."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    reason: str = Field(
+        description=(
+            "Why you cannot advance now (blocked on whom/what, missing info, "
+            "waiting for human, etc.). Be concrete — not empty filler."
+        ),
+        json_schema_extra={"aliases": ["reason", "why", "note", "summary"]},
+    )
+
+
+@tool(
+    "defer_task_advance",
+    "不推进：本轮无法推动可行动任务时必须调用。声明后平台停止 [TASK ADVANCE] "
+    "循环提醒，直到你被再次唤醒（用户/inbox/任务）。不要用空话收工代替本工具。",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def defer_task_advance_tool(
+    params: DeferTaskAdvanceParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """Mark this wake cycle as intentional no-advance — stops nudge loop."""
+    from hiveweave.services.turn_session import set_task_advance_deferred
+
+    reason = (params.reason or "").strip()
+    if not reason:
+        return ToolResult.err(
+            "defer_task_advance requires a non-empty reason "
+            "(why you cannot advance now)."
+        )
+
+    set_task_advance_deferred(agent_id, True)
+
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.work_log import WorkLogService
+
+        project_id = await meta_db.get_agent_project_id(agent_id)
+        if not project_id and ctx is not None:
+            project_id = getattr(ctx, "project_id", None)
+        if project_id:
+            await WorkLogService().write_work_log(
+                project_id,
+                agent_id,
+                None,
+                "task_advance_deferred",
+                f"[不推进] {reason}"[:140],
+                details={"reason": reason},
+            )
+    except Exception:
+        pass
+
+    return ToolResult.ok(
+        "已声明不推进。平台不会再因「未推动任务」循环提醒你，"
+        "直到你被再次唤醒。请接着 commit_turn"
+        "(通常 phase=waiting 或 blocked，并写清 waiting_on)。"
+        f" reason={reason[:200]}"
+    )
+
+
 # ── ask_agent / notify_agent ─────────────────────────────
 
 

@@ -162,19 +162,14 @@ MCP 集成在 `apps/hiveweave-py/src/hiveweave/services/mcp.py`。
 | 规范 / ADR | [docs/spec/lifecycle-hooks.md](docs/spec/lifecycle-hooks.md)、[005-lifecycle-hooks](docs/adr/005-lifecycle-hooks.md) |
 
 已挂点（见 `points.py` / `CATALOG_VERSION`）：`inbox.triage.enrich`、`agent.turn.before` / `after`、`tool.execute.before` / `after`、`trigger.context.build`、`conversation.compact.before`。  
-首个消费方：inbox triage 在 platform digest 之后跑 `inbox.triage.enrich`（LLM/插件可改 `output["digest"]`，尚未默认接线付费 enricher）。
+首个消费方：inbox triage 在 platform digest 之后跑 `inbox.triage.enrich`（LLM/插件可改 `output["digest"]`，尚未默认接线付费 enricher）。  
+内置 handler：`agent.turn.after` → `task_advance_nudge`（有可行动义务却未推进且非合法 waiting 时注入 `[TASK ADVANCE]`；调用 `defer_task_advance`（不推进）或本 wake 已 defer 则停催，直到外部再次唤醒）。纪律技能 `task-advance`。
 
-### Inbox triage（trigger 前结构化 digest）
+### Inbox（trigger 上下文）
 
-`services/inbox_triage.py` — 唤醒主模型前先 staging→ready，避免 raw inbox 洪水：
-
-1. 平台确定性 digest（类别/优先级/折叠重复 progress/建议处理顺序）
-2. 跑 hook `inbox.triage.enrich`
-3. 仅 `ready` 批次注入 `## Inbox digest`；`## Messages (detail)` 只展开 ask / task_transition / approval / `expect_report`（progress、普通 command 看 digest，避免双写）。无 digest 时仍走全量 detail。Background 有 digest 时只留条数提示
-4. per-agent asyncio 锁；`running` TTL 过期 → `expired` 后重建；fail-closed → batch `failed` + 返回 `None`
-5. busy 且 triage 未就绪：仍 `enqueue_wake`（占位文案 + inbox ids），不丢 wake
-6. `build_trigger_context` 第四返回值 `wake_category`（最高优先级类别）写入 chat opts；`disposition=complete` 时仅任务类 wake（`wake_category=task_transition` / `source=task` 等）放行，防 done_slice 空转
-7. `get_tasks` 等同轮轮询：硬拒 + telemetry `poll_hard_reject`
+平台**不再**做消息类别/优先级 triage（`classify` / digest 排序已停用；`inbox_triage.py` 保留但 trigger 不走）。  
+`build_trigger_context` 按时间序注入全文 Messages；`reply_required` 仅来自结构化 `expect_report` / `message_type=ask`。  
+`admit_wake` **一律放行**；仅显式 `wake=False` 才 background。将来可用 per-agent 助理模型做 triage。
 
 ### Agent 类型与组织
 
@@ -257,7 +252,8 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 - `disposition`（waiting_human / blocked / complete / …）与 `execution`（idle/processing）正交；前端主文案跟 disposition
 - `phase=in_progress` **不再**无限续跑；有义务且有进展时最多再 1 个 slice
 - gate 只校验：缺 commit 最多修 1 次；账本不一致停泊；连续无进展 → blocked
-- inbox 分级：progress/ACK（含「全部完成」）`wake=0` 不触发 LLM；`waiting_human` 时仅用户/新任务可唤醒
+- `hire_agent` 成功后工具回执提醒 NEXT ACTION（向请求方 `send_message`）；回合出口闸门 `HIRE_UNREPORTED` 拦截「招完却未发消息就 done_slice」——**不**替 AI 自动发 inbox
+- `waiting_human` / `complete` 等 disposition 不再拦截 peer 消息唤醒
 - 平台保留端口 `4000/5173/4173`；项目用 `start_dev_server`；禁止裸 `vite`/`npm run dev` 默认撞 5173
 
 **P1**
@@ -272,12 +268,29 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 
 > ADR: [002-idle-architecture](docs/adr/002-idle-architecture.md)
 
+### 语言无关：禁止用文案猜意图（HARD RULE）
+
+**假设用户与 Agent 可用任意自然语言（中/英/法/…）。平台逻辑必须在任何语言下行为一致。**
+
+禁止：
+- 用正则/关键词/「像不像要回复」扫描 **自由文本** 来推断意图（如 `请回复`、`report back`、`全部完成`、标题含「页面」→ UI 策略等）
+- 因文案分类错误导致 digest 截断、错误标 progress、错误催办
+
+必须：
+- **结构化字段写死意图**：`expect_report` / `message_type=ask`（要回复）、工具名、账本 status、平台协议前缀（仅代码发出的英文常量如 `[TASK SUBMITTED]`）
+- **未回复检测（简单）**：A 发 B 且 `expect_report=1` → 查 B 是否有回信指向 A（花名/ID）；turn exit `UNREPLIED_ASKS` 提醒。**不**扫自然语言
+- 需要对方回复 → `ask_agent` 或 `expect_report=true`；FYI → `notify_agent`
+- **不做**平台侧消息分类/优先级；**不做**提交 attestation 硬闸（证据由领导 review 判定）；**不做**周期性 stall/unreplied 催办（推进靠 `agent.turn.after` task-advance hook）
+
+入口：`reply_policy.resolve_expect_report`、`turn_exit.collect_unreplied_asks`。
+
 ### Game time
 
-模拟项目时间,`REAL_SECONDS_PER_GAME_DAY = 3600` (1 真实小时 = 1 游戏天)。5 秒 tick 持久化时间并触发到期告警。每 30s 扫 orphan streaming；每 2min（`STALL_CHECK_TICKS`）查停滞 Agent / 未回复 ask。
+模拟项目时间,`REAL_SECONDS_PER_GAME_DAY = 3600` (1 真实小时 = 1 游戏天)。5 秒 tick 持久化时间并触发到期告警。每 30s 扫 orphan streaming。
 
-- **停滞催办**：`STALL_IDLE_MS = 10min` 无响应 → 催办（`STALL_COOLDOWN_MS = 15min` 防重复）；同一对未回复催满 `STALL_ESCALATION_THRESHOLD = 3` 次（≈40min+）才升级到上级 —— 不是「15 分钟直接升级」
-- **失联观测看门狗**（`_check_silent_agents`，挂在 STALL_CHECK 块内）：agent **10 分钟无任何产出**（`SILENCE_THRESHOLD_MS`）→ 唤醒 + 广播 agent_health error 举红；失联持续 30 分钟（`SILENCE_NOTIFY_MS`）→ 升级通知上级（30min 冷却）；恢复产出后自动广播 ok 解除红框
+- **inbox stall / awaiting-reply 催办已禁用**（`_check_stalled` / `_nudge_awaiting_replies` no-op）
+- **peer-review 死锁拆解已禁用**（互审卡住由领导催，平台不自动拆）
+- **失联观测看门狗**（`_check_silent_agents`）：agent **10 分钟无任何产出** → 唤醒 + 红框；持续 30 分钟 → 通知上级
 
 ### 前端
 

@@ -109,14 +109,13 @@ def _generic_task(task_id: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_waiver_unblocks_cli_task_submit(env):
+async def test_waiver_still_records_but_gate_is_open(env):
+    """Attestation hard-gate removed — submit never blocked; waiver still audit-logs."""
     task = _generic_task("task-cli-1")
 
-    # 豁免前：无 attestation → 拒
     deny = await check_task_attestations(PROJECT_ID, task, None)
-    assert deny is not None and "REJECT" in deny
+    assert deny is None
 
-    # coordinator 豁免 → 通过
     wid = await create_waiver(
         PROJECT_ID, task_id=task["id"], waived_by=COORD_ID,
         reason="纯 CLI 任务无 UI 可 browse，以 bash 验证日志替代",
@@ -127,11 +126,11 @@ async def test_waiver_unblocks_cli_task_submit(env):
     ok = await check_task_attestations(PROJECT_ID, task, None)
     assert ok is None
 
-    # 其他任务不受影响
+    # Other tasks also open (no scripted gate)
     deny2 = await check_task_attestations(
         PROJECT_ID, _generic_task("task-other"), None
     )
-    assert deny2 is not None
+    assert deny2 is None
 
 
 @pytest.mark.asyncio

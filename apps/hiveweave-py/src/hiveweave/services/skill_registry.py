@@ -372,6 +372,37 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
         ),
     },
     {
+        "slug": "task-advance",
+        "name": "task-advance",
+        "description": (
+            "Keep the task ledger moving. Use after every turn that touches "
+            "work: do not exit with open obligations unless you advanced them "
+            "or declared a legal wait."
+        ),
+        "category": "discipline",
+        "instructions": (
+            "# Task Advance Discipline\n\n"
+            "Every turn is a function: leave the ledger better than you found it, "
+            "or explicitly wait.\n\n"
+            "## Rules\n"
+            "1. **Check obligations first**: `get_tasks` / inbox digest — what is "
+            "yours as assignee (claimed/running/rework/verifying) or creator "
+            "(submitted/reviewing)?\n"
+            "2. **Push with tools, not prose**: claim / write / submit / review / "
+            "dispatch / merge. Saying \"下一步我会…\" without a tool call is failure.\n"
+            "3. **Legal idle only via commit_turn**: phase=`waiting` or `blocked` "
+            "with concrete `waiting_on` (agent/task/user/timer). Never fake "
+            "`done_slice` while obligations remain.\n"
+            "4. **Notify when others are unblocked**: after hire / submit / approve, "
+            "message the requester — they cannot read your work_log.\n"
+            "5. If you cannot advance: call `defer_task_advance(reason=…)` (不推进). "
+            "That stops [TASK ADVANCE] reminders until you are woken again.\n"
+            "6. If the platform sends `[TASK ADVANCE]`, you skipped a push — advance "
+            "or defer in that follow-up turn.\n\n"
+            "Principle: Awareness first. The platform reminds; you decide how to advance or defer.\n"
+        ),
+    },
+    {
         "slug": "incremental-implementation",
         "name": "incremental-implementation",
         "description": "Deliver changes incrementally. Use when implementing any feature or change that touches more than one file.",

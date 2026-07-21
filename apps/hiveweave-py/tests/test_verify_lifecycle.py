@@ -52,12 +52,31 @@ async def test_verify_created_not_actionable_pre_merge(task_env):
 
 
 @pytest.mark.asyncio
-async def test_ordinary_created_not_actionable(task_env):
+async def test_assigned_is_claimed_and_actionable(task_env):
+    """Assign = claim: create with assignee → claimed → assignee obligation."""
     ts = TaskService()
     pid = task_env["project_id"]
     tid = await ts.create_task(
         pid, "Feature", "d", creator_id=COORD, assignee_id=EXEC
     )
+    task = await ts.get_task(pid, tid)
+    assert task["status"] == "claimed"
+    assert task["assignee_id"] == EXEC
+    assert task["claimed_at"] is not None
+    obs = await ts.get_actionable_obligations(pid, EXEC)
+    assert tid in [t["id"] for t in obs]
+
+
+@pytest.mark.asyncio
+async def test_unassigned_draft_stays_created(task_env):
+    """No assignee → draft stays created (claim_task still picks these up)."""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    tid = await ts.create_task(
+        pid, "Draft", "d", creator_id=COORD, assignee_id=None
+    )
+    task = await ts.get_task(pid, tid)
+    assert task["status"] == "created"
     obs = await ts.get_actionable_obligations(pid, EXEC)
     assert all(t["id"] != tid for t in obs)
 

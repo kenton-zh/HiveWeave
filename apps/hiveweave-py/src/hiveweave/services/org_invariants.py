@@ -141,14 +141,11 @@ def validate_hire(
             "Set parentId to CEO or a domain coordinator, not HR."
         )
 
-    # Executors must not report to CEO
+    # Executors must not report to CEO (hire + transfer share this rule)
     if perm == "executor" and parent:
-        prole = (parent.get("role") or "").lower()
-        if prole == "ceo":
-            return (
-                "Executors cannot report directly to CEO (span / org design). "
-                "Set parentId to a coordinator (architect / tech lead / manager)."
-            )
+        ceo_err = _executor_under_ceo_error(parent)
+        if ceo_err:
+            return ceo_err
 
     # At most one primary coordinator under the same parent
     # (approximate domain by parent_id; exclude CEO/HR unique roles)
@@ -176,6 +173,87 @@ def validate_hire(
     if parent_id:
         pid = parent.get("id") if parent else parent_id
         kids = [a for a in active if (a.get("parent_id") or "") == pid]
+        if len(kids) >= MAX_DIRECT_REPORTS:
+            return (
+                f"Parent already has {len(kids)} active direct reports "
+                f"(max {MAX_DIRECT_REPORTS}). Add a coordinator layer, or "
+                "transfer/dismiss someone first."
+            )
+
+    return None
+
+
+def _executor_under_ceo_error(parent: dict[str, Any] | None) -> str | None:
+    """Hard rule: executors never report directly to CEO."""
+    if not parent:
+        return None
+    prole = (parent.get("role") or "").strip().lower()
+    if prole == "ceo":
+        return (
+            "Executors cannot report directly to CEO (span / org design). "
+            "Set parentId to a coordinator (architect / tech lead / manager)."
+        )
+    return None
+
+
+def validate_transfer(
+    *,
+    agents: list[dict[str, Any]],
+    agent_id: str,
+    new_parent_id: str | None,
+) -> str | None:
+    """Return error if transfer would break org invariants, else None.
+
+    Mirrors hire gates that apply to re-parenting (executor↛CEO, no HR parent,
+    span max). Does not re-check flower-name uniqueness.
+    """
+    active = _active(agents)
+    target: dict[str, Any] | None = None
+    for a in agents:
+        if a.get("id") == agent_id or a.get("short_id") == agent_id:
+            target = a
+            break
+    if not target:
+        return f"Agent not found: {agent_id}"
+
+    new_parent_id = (new_parent_id or "").strip() or None
+    parent: dict[str, Any] | None = None
+    if new_parent_id:
+        for a in agents:
+            if a.get("id") == new_parent_id or a.get("short_id") == new_parent_id:
+                parent = a
+                break
+        if parent is None:
+            return f"New parent not found: {new_parent_id}"
+        if (parent.get("status") or "") == "archived":
+            return (
+                f"Parent agent is archived ({parent.get('name')}). "
+                "Choose an active coordinator as newParentId."
+            )
+        if _is_hr_agent(parent):
+            return (
+                "HR cannot have subordinates (IRON RULE). "
+                "Set newParentId to CEO or a domain coordinator, not HR."
+            )
+
+    perm = (target.get("permission_type") or "").strip().lower()
+    if perm == "executor":
+        ceo_err = _executor_under_ceo_error(parent)
+        if ceo_err:
+            return ceo_err
+        # Also reject transfer to root (no parent) — that is CEO-equivalent span
+        if parent is None:
+            return (
+                "Executors cannot be root / report to no one. "
+                "Set newParentId to a coordinator (architect / tech lead / manager)."
+            )
+
+    if new_parent_id and parent:
+        pid = parent.get("id") or new_parent_id
+        kids = [
+            a for a in active
+            if (a.get("parent_id") or "") == pid and a.get("id") != agent_id
+        ]
         if len(kids) >= MAX_DIRECT_REPORTS:
             return (
                 f"Parent already has {len(kids)} active direct reports "

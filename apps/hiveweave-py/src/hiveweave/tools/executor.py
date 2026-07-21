@@ -289,6 +289,20 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["phase", "summary"],
     },
+    "defer_task_advance": {
+        "description": (
+            "不推进：本轮无法推动可行动任务时调用。声明后平台停止 [TASK ADVANCE] "
+            "循环提醒，直到再次被唤醒。需要非空 reason。"
+        ),
+        "properties": {
+            "reason": {
+                "type": "string",
+                "aliases": ["why", "note", "summary"],
+                "description": "为何此刻无法推进（具体 blocker）",
+            },
+        },
+        "required": ["reason"],
+    },
     "hire_agent": {
         "description": "Creates and deploys a new agent with a specified name, role, goal, and backstory. Use it to bring new team members into the organization. Returns the new agent ID.",
         "properties": {

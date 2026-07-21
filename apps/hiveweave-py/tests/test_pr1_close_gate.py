@@ -126,14 +126,14 @@ async def test_read_work_logs_uses_type_and_summary():
     assert "No work logs" not in result.output
 
 
-def test_notify_classifies_as_progress_no_wake():
+def test_notify_classifies_as_message_and_wakes():
     cat = classify_message(
         message="FYI: merge done",
         message_type="notify",
         from_agent_id="peer-1",
     )
-    assert cat == "progress"
-    assert should_wake(cat, disposition="runnable") is False
+    assert cat == "message"
+    assert should_wake(cat, disposition="runnable") is True
 
 
 def test_ask_still_wakes():
@@ -143,7 +143,7 @@ def test_ask_still_wakes():
         expect_report=True,
         from_agent_id="peer-1",
     )
-    assert cat == "ask"
+    assert cat == "message"
     assert should_wake(cat, disposition="runnable") is True
 
 

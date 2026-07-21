@@ -14,7 +14,6 @@ import structlog
 
 from hiveweave.db import project as project_db
 from hiveweave.services.wake_policy import (
-    classify_message,
     make_idempotency_key,
     should_wake,
 )
@@ -22,6 +21,47 @@ from hiveweave.services.wake_policy import (
 log = structlog.get_logger(__name__)
 
 _migrated: set[str] = set()
+
+# Give-up ACK / deactivate-park must NOT swallow these — review & escalation
+# obligations live in the inbox wake path (BUGFIX: TEST7 429→ACK killed reviews).
+ACK_SPARE_MESSAGE_TYPES: frozenset[str] = frozenset({"escalation", "ask"})
+ACK_SPARE_PREFIXES: tuple[str, ...] = (
+    "[TASK SUBMITTED]",
+    "[ESCALATION]",
+    "[REWORK REQUESTED]",
+    "[LEDGER REVIEW]",
+    "[MERGE PENDING]",
+    "[MERGE PROXY]",
+    "[PEER_REVIEW_DEADLOCK]",
+    "[POST-MERGE VERIFY]",
+)
+PARK_EXEMPT_MESSAGE_TYPES: frozenset[str] = frozenset({"escalation", "ask"})
+
+
+def should_spare_from_give_up_ack(msg: dict | None) -> bool:
+    """True → keep unread/wake on consecutive-error give-up (do not mark_read)."""
+    if not msg:
+        return False
+    if msg.get("expect_report"):
+        return True
+    mt = (msg.get("message_type") or "").lower()
+    if mt in ACK_SPARE_MESSAGE_TYPES:
+        return True
+    text = (msg.get("message") or "").lstrip()
+    return any(text.startswith(p) for p in ACK_SPARE_PREFIXES)
+
+
+def should_exempt_from_park(msg: dict | None) -> bool:
+    """True → deactivate/activate park must leave this wake=1 message alone."""
+    if not msg:
+        return False
+    mt = (msg.get("message_type") or "").lower()
+    if mt in PARK_EXEMPT_MESSAGE_TYPES:
+        return True
+    if msg.get("expect_report"):
+        return True
+    text = (msg.get("message") or "").lstrip()
+    return any(text.startswith(p) for p in ACK_SPARE_PREFIXES)
 
 _MISSING_COLUMNS = [
     ("priority", "TEXT DEFAULT 'normal'"),
@@ -98,95 +138,18 @@ class InboxService:
         except Exception as e:
             log.warning("inbox_archived_check_failed", error=str(e))
 
-        category = classify_message(
-            message=message,
-            message_type=message_type,
-            expect_report=expect_report,
-            from_agent_id=from_agent_id,
-            priority=priority,
-            task_id=task_id,
-        )
-        if recipient_disposition is None:
-            try:
-                from hiveweave.agents.supervisor import agent_manager
-
-                live = agent_manager.get_agent(to_agent_id)
-                if live is not None:
-                    recipient_disposition = getattr(live, "disposition", None)
-            except Exception:
-                pass
-        if wake is None:
-            active_waits = None
-            from_name = None
-            from_short = None
-            try:
-                from hiveweave.db import meta as meta_db
-                from hiveweave.services.wait_contract import wait_contract_service
-
-                pid = await meta_db.get_agent_project_id(to_agent_id)
-                if pid:
-                    active_waits = await wait_contract_service.list_active(
-                        pid, to_agent_id
-                    )
-                # Resolve sender 花名/short_id — Wait Contract refs use names
-                try:
-                    sender = await meta_db.get_agent_by_id(from_agent_id)
-                    if sender:
-                        from_name = sender.get("name")
-                        from_short = sender.get("short_id")
-                except Exception:
-                    pass
-                if not from_name:
-                    try:
-                        row = await project_db.query_one(
-                            to_agent_id,
-                            "SELECT name, short_id FROM agents WHERE id = ?",
-                            [from_agent_id],
-                        )
-                        if row:
-                            from_name = row["name"] if "name" in row.keys() else None
-                            from_short = (
-                                row["short_id"] if "short_id" in row.keys() else None
-                            )
-                    except Exception:
-                        pass
-            except Exception as e:
-                log.debug("inbox_wait_lookup_failed", error=str(e))
-            wake_flag = should_wake(
-                category,
-                disposition=recipient_disposition,
-                from_agent_id=from_agent_id,
-                from_agent_name=from_name,
-                from_short_id=from_short,
-                active_waits=active_waits or None,
-            )
-        else:
-            wake_flag = bool(wake)
+        # No category taxonomy — wake always (unless caller passes wake=False).
+        category = "message"
+        wake_flag = bool(wake) if wake is not None else should_wake()
 
         key = idempotency_key or make_idempotency_key(
             from_agent_id=from_agent_id,
             to_agent_id=to_agent_id,
-            category=category,
             message=message,
             task_id=task_id,
         )
 
         await _ensure_schema(to_agent_id)
-
-        # Progress: supersede prior unread progress from same sender
-        # 同时 delivered=1：被取代的旧进度不应再作为 background 回灌
-        if category == "progress":
-            try:
-                await project_db.execute(
-                    to_agent_id,
-                    "UPDATE inbox SET read = 1, delivered = 1 WHERE to_agent_id = ? "
-                    "AND read = 0 "
-                    "AND from_agent_id = ? AND COALESCE(wake, 1) = 0",
-                    [to_agent_id, from_agent_id],
-                )
-            except Exception as e:
-                log.debug("progress_supersede_failed", error=str(e))
-
         # Idempotent insert: if key exists, return existing / skip wake
         try:
             existing = await project_db.query_one(
@@ -232,14 +195,9 @@ class InboxService:
         now_ms = int(time.time() * 1000)
         expect = 1 if expect_report else 0
         wake_int = 1 if wake_flag else 0
-        # Non-waking progress: insert as already-read so watcher ignores
+        # Product default: messages wake (wake_flag True → unread pending).
+        # Explicit wake=False still parks as background (delivered=0).
         read_int = 0 if wake_flag else 1
-        # delivered 语义（BUGFIX 消息静默丢失）：
-        # wake=1 的消息走 read=0 正常通道进上下文，无需 delivered 追踪（=1）。
-        # wake=0 的 progress/ACK 不唤醒 LLM，但**必须**在下一次自然触发时
-        # 作为 background updates 捎带进上下文（delivered=0 → 待捎带）。
-        # 此前 wake=0 直接 read=1 了事，导致验证通过/交付完成的证据类消息
-        # 永远不会进入接收方上下文（CEO 看不到下属的成果证据）。
         delivered_int = 1 if wake_flag else 0
 
         try:
@@ -439,7 +397,11 @@ class InboxService:
         )
 
     async def supersede_watchdog_messages(
-        self, agent_id: str, prefixes: list[str] | tuple[str, ...] | None = None
+        self,
+        agent_id: str,
+        prefixes: list[str] | tuple[str, ...] | None = None,
+        *,
+        contains: str | None = None,
     ) -> int:
         await _ensure_schema(agent_id)
         if prefixes is None:
@@ -449,13 +411,17 @@ class InboxService:
                 "[POST-MERGE VERIFY]",
             ]
         clauses = " OR ".join(["message LIKE ?" for _ in prefixes])
-        params = [agent_id] + [f"{p}%" for p in prefixes]
+        params: list = [agent_id] + [f"{p}%" for p in prefixes]
+        extra = ""
+        if contains:
+            extra = " AND message LIKE ?"
+            params.append(f"%{contains}%")
         try:
             await project_db.execute(
                 agent_id,
                 f"UPDATE inbox SET read = 1, delivered = 1 "
                 f"WHERE to_agent_id = ? AND read = 0 "
-                f"AND ({clauses})",
+                f"AND ({clauses}){extra}",
                 params,
             )
             return 1
@@ -474,15 +440,107 @@ class InboxService:
         )
         return row["cnt"] if row else 0
 
-    async def park_pending_wakes(self, agent_id: str) -> int:
-        """Deactivate: demote wake=1 unread → wake=0 + parked=1 (no LLM stampede)."""
+    async def get_messages_by_ids(
+        self, agent_id: str, message_ids: list[str]
+    ) -> list[dict]:
+        """Fetch inbox rows by id (any read/wake state)."""
+        ids = [m for m in (message_ids or []) if m]
+        if not ids:
+            return []
         await _ensure_schema(agent_id)
+        placeholders = ", ".join(["?"] * len(ids))
+        rows = await project_db.query(
+            agent_id,
+            "SELECT id, from_agent_id, to_agent_id, message, read, created_at, "
+            "message_type, expect_report, priority, task_id, "
+            "COALESCE(wake, 1) AS wake, COALESCE(parked, 0) AS parked, "
+            "wake_category, triage_batch_id "
+            f"FROM inbox WHERE to_agent_id = ? AND id IN ({placeholders})",
+            [agent_id, *ids],
+        )
+        return [self._row_to_msg(r) for r in rows]
+
+    async def partition_give_up_ack(
+        self, agent_id: str, message_ids: list[str]
+    ) -> tuple[list[str], list[str]]:
+        """Split ids into (ack_now, spare_review_critical)."""
+        ids = [m for m in (message_ids or []) if m]
+        if not ids:
+            return [], []
+        rows = await self.get_messages_by_ids(agent_id, ids)
+        by_id = {m["id"]: m for m in rows if m.get("id")}
+        to_ack: list[str] = []
+        to_spare: list[str] = []
+        for mid in ids:
+            if should_spare_from_give_up_ack(by_id.get(mid)):
+                to_spare.append(mid)
+            else:
+                to_ack.append(mid)
+        return to_ack, to_spare
+
+    async def ensure_wake(self, agent_id: str, message_ids: list[str]) -> int:
+        """Force wake=1, parked=0 on unread ids (keep review-critical alive)."""
+        ids = [m for m in (message_ids or []) if m]
+        if not ids:
+            return 0
+        await _ensure_schema(agent_id)
+        placeholders = ", ".join(["?"] * len(ids))
         try:
             conn = await project_db.get_project_db_for_agent(agent_id)
             cursor = await conn.execute(
-                "UPDATE inbox SET wake = 0, parked = 1 "
+                f"UPDATE inbox SET wake = 1, parked = 0 "
+                f"WHERE to_agent_id = ? AND read = 0 "
+                f"AND id IN ({placeholders})",
+                [agent_id, *ids],
+            )
+            await conn.commit()
+            n = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            await cursor.close()
+            return int(n)
+        except Exception as e:
+            log.warning("inbox_ensure_wake_failed", agent_id=agent_id, error=str(e))
+            return 0
+
+    async def park_pending_wakes(self, agent_id: str) -> int:
+        """Deactivate: demote wake=1 unread → wake=0 + parked=1 (no LLM stampede).
+
+        Escalation / ask / TASK SUBMITTED / LEDGER REVIEW stay wake=1 so
+        leadership and review obligations are not silenced by off-duty park.
+        """
+        await _ensure_schema(agent_id)
+        try:
+            pending = await project_db.query(
+                agent_id,
+                "SELECT id, message, message_type, expect_report FROM inbox "
                 "WHERE to_agent_id = ? AND read = 0 AND COALESCE(wake, 1) = 1",
                 [agent_id],
+            )
+            park_ids: list[str] = []
+            for r in pending or []:
+                msg = {
+                    "id": r["id"],
+                    "message": r["message"] if "message" in r.keys() else "",
+                    "message_type": (
+                        r["message_type"] if "message_type" in r.keys() else "normal"
+                    ),
+                    "expect_report": (
+                        bool(r["expect_report"])
+                        if "expect_report" in r.keys()
+                        else False
+                    ),
+                }
+                if should_exempt_from_park(msg):
+                    continue
+                if msg.get("id"):
+                    park_ids.append(msg["id"])
+            if not park_ids:
+                return 0
+            placeholders = ", ".join(["?"] * len(park_ids))
+            conn = await project_db.get_project_db_for_agent(agent_id)
+            cursor = await conn.execute(
+                f"UPDATE inbox SET wake = 0, parked = 1 "
+                f"WHERE to_agent_id = ? AND id IN ({placeholders})",
+                [agent_id, *park_ids],
             )
             await conn.commit()
             n = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
@@ -493,6 +551,69 @@ class InboxService:
         except Exception as e:
             log.warning("inbox_park_failed", agent_id=agent_id, error=str(e))
             return 0
+
+    async def demote_wake(
+        self,
+        agent_id: str,
+        msg_ids: list[str],
+        *,
+        reason: str = "",
+    ) -> int:
+        """Set wake=0 for unread ids without ACK (keep read=0).
+
+        Used when trigger/chat skips (e.g. complete gate) so the 5s watcher
+        stops spinning, while leaving messages available for a later real wake.
+        """
+        ids = [m for m in (msg_ids or []) if m]
+        if not ids:
+            return 0
+        await _ensure_schema(agent_id)
+        try:
+            placeholders = ", ".join("?" * len(ids))
+            conn = await project_db.get_project_db_for_agent(agent_id)
+            cursor = await conn.execute(
+                f"UPDATE inbox SET wake = 0 "
+                f"WHERE to_agent_id = ? AND read = 0 "
+                f"AND COALESCE(wake, 1) = 1 AND id IN ({placeholders})",
+                [agent_id, *ids],
+            )
+            await conn.commit()
+            n = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            await cursor.close()
+            if n:
+                log.info(
+                    "inbox_wake_demoted",
+                    agent_id=agent_id,
+                    count=n,
+                    reason=reason or "",
+                )
+            return int(n)
+        except Exception as e:
+            log.warning(
+                "inbox_demote_wake_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
+            return 0
+
+    async def get_pending_ids_since(
+        self, agent_id: str, since_ms: int
+    ) -> list[str]:
+        """Unread wake=1 message ids created at/after ``since_ms`` (mid-turn)."""
+        await _ensure_schema(agent_id)
+        try:
+            rows = await project_db.query(
+                agent_id,
+                "SELECT id FROM inbox "
+                "WHERE to_agent_id = ? AND read = 0 "
+                "AND COALESCE(wake, 1) = 1 AND created_at >= ? "
+                "ORDER BY created_at ASC",
+                [agent_id, int(since_ms)],
+            )
+            return [r["id"] for r in rows if r.get("id")]
+        except Exception as e:
+            log.debug("inbox_pending_since_failed", error=str(e))
+            return []
 
     async def list_parked_messages(self, agent_id: str, limit: int = 50) -> list[dict]:
         await _ensure_schema(agent_id)
