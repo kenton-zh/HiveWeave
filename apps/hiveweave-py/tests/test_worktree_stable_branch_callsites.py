@@ -49,6 +49,38 @@ def _contract_branch(short_id: str, task_id: str | None = None) -> str:
     return f"hw/{short_id}/work"
 
 
+# org_span 硬门（3049834 起）要求真实组织关系：dispatch 只能派直属下属，
+# 且 assignee 须具备 SOURCE_WRITE。参照 b3d0eeb 的修法，注入最小合法
+# 指挥链：boss-agent（coordinator，无上级）→ agent-009（executor）。
+_FAKE_AGENTS = {
+    "boss-agent": {
+        "id": "boss-agent",
+        "name": "Test Boss",
+        "parent_id": None,
+        "permission_type": "coordinator",
+        "role": "架构师",
+        "status": "active",
+    },
+    "agent-009": {
+        "id": "agent-009",
+        "name": "Test Executor",
+        "parent_id": "boss-agent",
+        "permission_type": "executor",
+        "role": "engineer",
+        "status": "active",
+    },
+}
+
+
+async def _fake_get_agent_by_id(aid: str):
+    return _FAKE_AGENTS.get(aid)
+
+
+def _patch_org_span():
+    """patch meta.get_agent_by_id，满足 dispatch 的 org_span 三道硬门。"""
+    return patch("hiveweave.db.meta.get_agent_by_id", _fake_get_agent_by_id)
+
+
 def test_compute_branch_name_contract():
     """锁定命名契约 — git_worktree 实现侧的 guard（共享接口不漂移）。"""
     from hiveweave.services.git_worktree import compute_branch_name
@@ -77,6 +109,7 @@ class TestDispatchPassesTaskId:
 
         update_mock = AsyncMock()
         with (
+            _patch_org_span(),
             patch("hiveweave.services.dispatch._ensure_schema", AsyncMock()),
             patch("hiveweave.services.dispatch._execute", AsyncMock()),
             patch.object(
@@ -128,6 +161,7 @@ class TestDispatchPassesTaskId:
             "success": True, "path": "/tmp/wt-A009", "short_id": "A009",
         })
         with (
+            _patch_org_span(),
             patch("hiveweave.services.dispatch._ensure_schema", AsyncMock()),
             patch("hiveweave.services.dispatch._execute", AsyncMock()),
             patch.object(TaskService, "update_task", AsyncMock()),
