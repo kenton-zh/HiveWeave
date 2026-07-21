@@ -349,6 +349,91 @@ async def _route_conflict_marker_cleanup(
     )
 
 
+async def _check_self_merge_gate(
+    project_id: str,
+    agent_id: str,
+    task_id: str | None,
+    branch: str | None,
+) -> str | None:
+    """自有分支合并门：合并调用者自己 short_id 的分支时，要求对应任务已
+    approved 且批准人 ≠ 调用者（防中层 builder 自写自审自合绕审）。
+
+    Returns error text or None if OK. 任务解析顺序：taskId → 稳定分支名
+    hw/<sid>/t-<id8> → 调用者名下最新任务。
+    """
+    import json as _json
+
+    from hiveweave.services.task import TaskService
+
+    ts = TaskService()
+    task: dict | None = None
+    if task_id:
+        try:
+            task = await ts.get_task(project_id, task_id)
+        except Exception:
+            task = None
+    if task is None and branch:
+        m = re.match(r"^hw/[^/]+/t-([0-9a-fA-F]{8})$", branch)
+        if m:
+            prefix = m.group(1).lower()
+            try:
+                for t in await ts.list_tasks(project_id):
+                    if str(t.get("id") or "").lower().startswith(prefix):
+                        task = t
+                        break
+            except Exception:
+                task = None
+    if task is None:
+        try:
+            cands = [
+                t
+                for t in await ts.list_tasks(project_id)
+                if str(t.get("assignee_id") or "") == str(agent_id)
+            ]
+            cands.sort(
+                key=lambda t: (
+                    t.get("status") != "approved",
+                    -(t.get("updated_at") or 0),
+                )
+            )
+            task = cands[0] if cands else None
+        except Exception:
+            task = None
+
+    if task is None:
+        return (
+            "Refusing to merge your own branch: no corresponding task found. "
+            "Pass taskId for the task this branch implements."
+        )
+    tid = str(task.get("id") or "")[:8]
+    if task.get("status") != "approved":
+        return (
+            f"Refusing to merge your own branch: task {tid} is "
+            f"'{task.get('status')}', not approved. Get your superior to "
+            f"review_task(decision='approve') first."
+        )
+    evidence = task.get("evidence") or {}
+    if isinstance(evidence, str):
+        try:
+            evidence = _json.loads(evidence)
+        except Exception:
+            evidence = {}
+    reviewer = evidence.get("reviewed_by") if isinstance(evidence, dict) else None
+    if not reviewer:
+        return (
+            f"Refusing to merge your own branch: task {tid} has no recorded "
+            "reviewer. Ask your superior to approve it via review_task first "
+            "(approval records reviewed_by)."
+        )
+    if str(reviewer) == str(agent_id):
+        return (
+            f"Refusing to merge your own branch: task {tid} was approved by "
+            "yourself. Own-branch merge requires approval by a DIFFERENT "
+            "reviewer (e.g. the CEO)."
+        )
+    return None
+
+
 @tool(
     "git_worktree_merge",
     "Merge a worktree branch into main and remove the worktree. "
@@ -389,6 +474,7 @@ async def git_worktree_merge_tool(
     target_branch = params.target_branch or "main"
     merged_branch: str | None = None
     merged_short: str | None = None
+    merge_call: Any = None  # 延迟执行 —— 自有分支门通过后才真正 merge
 
     # P0 稳定命名优先：调用方提供 task_id 时按契约 hw/<sid>/t-<taskid8>
     # 精确命中；未命中/解析失败回落下面的 legacy 解析（老 slug 分支照合）。
@@ -403,17 +489,25 @@ async def git_worktree_merge_tool(
     # Bug G fix: 智能解析 branch_name
     if stable:
         merged_branch, merged_short = stable
-        result = await gwt.merge_by_branch(
-            workspace_path, merged_branch, target_branch
-        )
+
+        async def _do_merge() -> dict:
+            return await gwt.merge_by_branch(
+                workspace_path, merged_branch, target_branch
+            )
+
+        merge_call = _do_merge
     elif branch_name.startswith("hw/"):
         merged_branch = branch_name
         from hiveweave.tools.task_tools import parse_short_id_from_branch
 
         merged_short = parse_short_id_from_branch(branch_name)
-        result = await gwt.merge_by_branch(
-            workspace_path, branch_name, target_branch
-        )
+
+        async def _do_merge() -> dict:
+            return await gwt.merge_by_branch(
+                workspace_path, branch_name, target_branch
+            )
+
+        merge_call = _do_merge
     elif _SHORT_ID_RE.fullmatch(branch_name):
         # 严格 short_id 形状（字母+数字，如 "A066"）— 查找该 agent 的分支。
         # 注意：不能用 isalnum() —— CJK 字符也算 alnum，短中文任务名
@@ -433,15 +527,20 @@ async def git_worktree_merge_tool(
             )
         merged_short = branch_name
         merged_branch = branches[0]
-        result = await gwt.merge_by_branch(
-            workspace_path, branches[0], target_branch
-        )
-        if result.get("success") and len(branches) > 1:
-            remaining = branches[1:]
-            result["message"] = (
-                f"Merged {branches[0]}. "
-                f"Remaining branches: {remaining}"
+
+        async def _do_merge() -> dict:
+            result = await gwt.merge_by_branch(
+                workspace_path, branches[0], target_branch
             )
+            if result.get("success") and len(branches) > 1:
+                remaining = branches[1:]
+                result["message"] = (
+                    f"Merged {branches[0]}. "
+                    f"Remaining branches: {remaining}"
+                )
+            return result
+
+        merge_call = _do_merge
     else:
         # task_name — 先按原行为查调用者自己的分支；查不到则全局搜索
         # hw/*/<slug>（coordinator 按名字合并 executor 分支的场景）。
@@ -459,9 +558,14 @@ async def git_worktree_merge_tool(
         if caller_exists:
             merged_short = caller_short_id
             merged_branch = caller_branch
-            result = await gwt.merge(
-                workspace_path, caller_short_id, str(branch_name), target_branch
-            )
+
+            async def _do_merge() -> dict:
+                return await gwt.merge(
+                    workspace_path, caller_short_id, str(branch_name),
+                    target_branch,
+                )
+
+            merge_call = _do_merge
         else:
             ok_g, out_g = await _git(
                 ["branch", "--list", f"hw/*/{slug}"], workspace_path
@@ -474,9 +578,13 @@ async def git_worktree_merge_tool(
                 )
 
                 merged_short = parse_short_id_from_branch(matches[0])
-                result = await gwt.merge_by_branch(
-                    workspace_path, matches[0], target_branch
-                )
+
+                async def _do_merge() -> dict:
+                    return await gwt.merge_by_branch(
+                        workspace_path, matches[0], target_branch
+                    )
+
+                merge_call = _do_merge
             else:
                 ok_all, out_all = await _git(
                     ["branch", "--list", "hw/*/*"], workspace_path
@@ -499,6 +607,20 @@ async def git_worktree_merge_tool(
                     f"No worktree branch found matching '{branch_name}' "
                     f"(tried '{caller_branch}' and 'hw/*/{slug}').\n\n{listing}"
                 )
+
+    # ── 自有分支合并门：合并调用者自己 short_id 的分支须异人 approved ──
+    if (
+        merged_short
+        and caller_short_id
+        and merged_short.upper() == str(caller_short_id).upper()
+    ):
+        gate_err = await _check_self_merge_gate(
+            project_id, agent_id, params.task_id, merged_branch
+        )
+        if gate_err:
+            return ToolResult.err(gate_err)
+
+    result = await merge_call()
 
     short = result.get("short_id") or merged_short or caller_short_id
     branch = result.get("branch") or merged_branch

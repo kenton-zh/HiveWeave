@@ -166,7 +166,8 @@ async def lifespan(app: FastAPI):
                 continue
             # Prune stale worktree metadata
             await _git(["worktree", "prune"], ws)
-            # Find executor agents with missing worktrees (agents 表在 per-project DB)
+            # Find writer agents (executor + builder coordinator) with missing
+            # worktrees (agents 表在 per-project DB)；CEO/HR 强制项目根，跳过
             try:
                 proj_conn = await project_db.get_project_db_by_project_id(p["id"])
             except project_db.ProjectDbError:
@@ -174,11 +175,13 @@ async def lifespan(app: FastAPI):
             agent_cursor = await proj_conn.execute(
                 "SELECT id, name, role, short_id, workspace_path, permission_type "
                 "FROM agents WHERE project_id=? AND status='active' "
-                "AND permission_type='executor'",
+                "AND permission_type IN ('executor', 'coordinator')",
                 [p["id"]],
             )
             agents = await agent_cursor.fetchall()
             await agent_cursor.close()
+            from hiveweave.services.git_worktree import agent_gets_write_worktree
+            agents = [a for a in agents if agent_gets_write_worktree(dict(a))]
             gwt = GitWorktreeService()
             for a in agents:
                 short_id = a["short_id"]

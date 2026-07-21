@@ -104,7 +104,18 @@ async def _validate_span(
 async def validate_executor_assignee(
     to_agent_id: str, org_service: Any = None
 ) -> str | None:
-    """Hard-block dispatch/create when assignee is a coordinator (no source write)."""
+    """Hard-block dispatch/create when assignee cannot write code.
+
+    新契约（CEO 抽离 + 中层 builder）：assignee 须具备 SOURCE_WRITE
+    （executor / qa / builder coordinator 均可）；family=ceo 一律拒绝
+    （CEO 只做行政与里程碑验收，不承接改代码任务）。
+    """
+    from hiveweave.services.policy import (
+        Capability,
+        has_capability,
+        infer_role_family,
+    )
+
     if org_service is None:
         from hiveweave.services.org import OrgService
 
@@ -116,11 +127,53 @@ async def validate_executor_assignee(
         return None
     if not agent:
         return None
-    perm = (agent.get("permission_type") or "").strip().lower()
-    if perm == "coordinator":
-        name = agent.get("name") or to_agent_id[:8]
+    name = agent.get("name") or to_agent_id[:8]
+    family = infer_role_family(agent)
+    if family == "ceo":
         return (
-            f"拒绝派活：「{name}」是 coordinator（只读协调角色），不能承接改代码任务。"
-            "请改派 executor（工程师/QA 等可写角色），或让对方再 dispatch 给下属。"
+            f"拒绝派活：「{name}」是 CEO（行政/里程碑验收角色），不能承接改代码任务。"
+            "请派给直属中层 coordinator 或 executor。"
+        )
+    if not has_capability(agent, Capability.SOURCE_WRITE):
+        return (
+            f"拒绝派活：「{name}」不具备源码写能力（role_family={family}），"
+            "不能承接改代码任务。请改派有写码权的中层 coordinator / executor / QA。"
+        )
+    return None
+
+
+async def validate_ceo_dispatch_target(
+    from_agent_id: str, to_agent_id: str, org_service: Any = None
+) -> str | None:
+    """CEO 派工硬门：assignee 只能是直属中层 coordinator（family=coordinator）。
+
+    修复「现只能派 executor」语义倒挂 —— CEO 不再日常直派叶子 executor/QA，
+    也不向 HR 派开发任务；骨架/里程碑任务交给中层 builder 拆解。
+    非 CEO 发起者不受此门约束（中层可自由派 executor/QA）。
+    """
+    from hiveweave.services.policy import infer_role_family
+
+    if org_service is None:
+        from hiveweave.services.org import OrgService
+
+        org_service = OrgService()
+    try:
+        sender = await org_service.get_agent(from_agent_id)
+        target = await org_service.get_agent(to_agent_id)
+    except Exception as e:
+        log.warning("ceo_dispatch_lookup_failed", error=str(e))
+        return None
+    if not sender or not target:
+        return None
+    if infer_role_family(sender) != "ceo":
+        return None
+    if from_agent_id == to_agent_id:
+        return None
+    if infer_role_family(target) != "coordinator":
+        tname = target.get("name") or to_agent_id[:8]
+        return (
+            f"拒绝派活：CEO 只能把任务派给直属中层 coordinator（技术负责人/架构师等），"
+            f"「{tname}」不是中层 coordinator。"
+            "请把骨架/里程碑任务派给中层，由中层拆解后再派 executor/QA。"
         )
     return None

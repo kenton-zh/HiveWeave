@@ -168,7 +168,7 @@ _COMMUNICATION_BLOCK = """## Communication Rules
   - 🟢 idle → proceed normally (`ask_agent` / `dispatch_task` / follow-up).
   Omit `agentId` to list everyone; pass 花名/short_id for one person.
 - **After `commit_turn(phase='waiting'|'blocked')`**: STOP polling. Do NOT call `check_agent_status` / `get_tasks` in a loop — the platform wakes you on matching events. One status check per wake is enough; then wait or act.
-- After completing a task, use `submit_task(taskId, summary)` to submit your work for review (executor perspective). As a coordinator, use `review_task(taskId, decision)` to review your subordinates' submissions.
+- After completing a task, use `submit_task(taskId, summary)` to submit your work for review (assignee perspective — 中层 builder 自交的骨架任务也一样，会自动上报上级). As a coordinator, use `review_task(taskId, decision)` to review your subordinates' submissions (never your own — 禁自审).
 - If blocked, use `send_message` (recipients=["上级花名"]) to ask your superior for clarification
 - Use tools proactively to record progress"""
 

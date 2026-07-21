@@ -98,13 +98,58 @@ async def test_coordinator_merges_executor_branch_by_name(git_repo: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_caller_own_branch_still_works(git_repo: Path) -> None:
-    """向后兼容：调用者合并自己的分支（原行为保留）。"""
+    """向后兼容：调用者合并自己的分支 —— 新契约下须对应任务已 approved
+    且批准人 ≠ 调用者（自有分支合并门，防中层自写自审自合）。"""
     await _make_executor_branch(git_repo, "A003", "后端工程师", "api.py")
 
-    result = await _call_tool(git_repo, "A003", "后端工程师")
+    approved_task = {
+        "id": "t-own-1",
+        "status": "approved",
+        "assignee_id": "agent-x",
+        "evidence": {"reviewed_by": "ceo-1"},
+    }
+    from hiveweave.services.task import TaskService
+
+    params = GitWorktreeMergeParams(branchName="后端工程师")
+    with patch(
+        "hiveweave.tools.misc_tools._get_worktree_context",
+        new=AsyncMock(return_value=(str(git_repo), "A003", "proj-x")),
+    ), patch(
+        "hiveweave.tools.task_tools.nudge_verify_tasks_after_merge",
+        new=AsyncMock(return_value=0),
+    ), patch.object(
+        TaskService, "list_tasks", AsyncMock(return_value=[approved_task])
+    ):
+        result = await git_worktree_merge_tool(params, "agent-x", str(git_repo))
 
     assert result.success is True, result.error
     assert (git_repo / "api.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_caller_own_branch_without_foreign_approval_denied(
+    git_repo: Path,
+) -> None:
+    """自有分支合并门：任务未 approved（或无任务）→ 拒绝合并。"""
+    await _make_executor_branch(git_repo, "A003", "后端工程师", "api.py")
+
+    from hiveweave.services.task import TaskService
+
+    params = GitWorktreeMergeParams(branchName="后端工程师")
+    with patch(
+        "hiveweave.tools.misc_tools._get_worktree_context",
+        new=AsyncMock(return_value=(str(git_repo), "A003", "proj-x")),
+    ), patch(
+        "hiveweave.tools.task_tools.nudge_verify_tasks_after_merge",
+        new=AsyncMock(return_value=0),
+    ), patch.object(
+        TaskService, "list_tasks", AsyncMock(return_value=[])
+    ):
+        result = await git_worktree_merge_tool(params, "agent-x", str(git_repo))
+
+    assert result.success is False
+    assert "own branch" in (result.error or "")
+    assert not (git_repo / "api.py").exists()
 
 
 @pytest.mark.asyncio

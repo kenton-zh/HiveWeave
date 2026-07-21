@@ -1130,9 +1130,10 @@ class Agent:
         """获取工作区路径（每轮 chat 开始会清空缓存）。
 
         优先使用 agent 专属的 worktree 路径（agents.workspace_path），
-        实现 agent 间工作区隔离。Executor 若未绑定或路径失效，会懒创建
-        worktree 并写回 DB（不依赖仅启动时的 lifespan recovery）。
-        Coordinator / 恢复失败时回退到项目根目录。
+        实现 agent 间工作区隔离。Executor / builder coordinator 若未绑定或
+        路径失效，会懒创建 worktree 并写回 DB（不依赖仅启动时的 lifespan
+        recovery）。CEO/HR 强制项目根（并清掉误绑的 worktree 路径）；
+        恢复失败时回退到项目根目录。
         """
         if self._workspace_path is not None:
             return self._workspace_path
@@ -1144,15 +1145,16 @@ class Agent:
 
         try:
             from hiveweave.services.org import OrgService
+            from hiveweave.services.git_worktree import agent_gets_write_worktree
 
             org = OrgService()
             agent_row = await org.get_agent(self.id)
             if agent_row:
-                perm = (agent_row.get("permission_type") or "").lower()
                 ws = agent_row.get("workspace_path") or ""
 
-                # Coordinators/HR must never work from a write worktree
-                if perm in ("coordinator", "hr"):
+                # CEO/HR must never work from a write worktree；builder
+                # coordinator（family=coordinator 有 SOURCE_WRITE）保留自己的树
+                if not agent_gets_write_worktree(agent_row):
                     if ws and "worktrees" in ws.replace("\\", "/"):
                         try:
                             await org.update_agent(self.id, {"workspace_path": None})
@@ -1165,12 +1167,8 @@ class Agent:
                     self._workspace_path = ws
                     return self._workspace_path
 
-                # Executor without a valid worktree — allocate now
-                if (
-                    perm == "executor"
-                    and project_ws
-                    and (_Path(project_ws) / ".git").exists()
-                ):
+                # Writer without a valid worktree — allocate now
+                if project_ws and (_Path(project_ws) / ".git").exists():
                     from hiveweave.services.git_worktree import ensure_executor_worktree
 
                     # P0: 此处没有当前任务上下文（agent 不跟踪 current task），

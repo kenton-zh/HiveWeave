@@ -213,7 +213,8 @@ class TaskService:
                           depends_on: list[str] | None = None,
                           expected_modules: list[str] | None = None,
                           tags: list[str] | None = None,
-                          source: str = "agent") -> str:
+                          source: str = "agent",
+                          evidence: dict | None = None) -> str:
         """Create a task. JSON-serializes list/dict fields. Returns task_id."""
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
@@ -225,12 +226,13 @@ class TaskService:
             "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
             "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
             "is_archived, due_at, policy_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'created', ?, 0, ?, ?, ?, ?, NULL, ?, NULL, ?, "
+            "VALUES (?, ?, ?, ?, ?, ?, 'created', ?, 0, ?, ?, ?, ?, ?, ?, NULL, ?, "
             "0, ?, NULL, NULL, NULL, ?, 0, ?, ?)",
             [task_id, project_id, title, description, assignee_id, creator_id,
              priority, json.dumps(tags) if tags else None, parent_task_id,
              json.dumps(depends_on) if depends_on else None,
              json.dumps(acceptance_criteria) if acceptance_criteria else None,
+             json.dumps(evidence) if evidence else None,
              json.dumps(expected_modules) if expected_modules else None,
              source, now_ms, now_ms, due_at, policy_id])
         log.info("task_created", task_id=task_id, title=title[:60],
@@ -508,12 +510,14 @@ class TaskService:
         await self._transition(project_id, task_id, "reviewing")
 
     async def review_task(self, project_id: str, task_id: str, decision: str,
-                          feedback: str | None = None) -> None:
+                          feedback: str | None = None,
+                          reviewer_id: str | None = None) -> None:
         """Review a task (reviewing → approved/rework, or approved → rework).
 
         decision='approve': reviewing → approved.
         decision='rework':  reviewing|approved → rework → running (两步合一).
-        feedback stored in evidence.review_feedback.
+        feedback stored in evidence.review_feedback; reviewer_id stored in
+        evidence.reviewed_by (merge 自有分支门 / VERIFY 独立性依赖它).
         """
         await _ensure_schema(project_id)
         decision = decision.lower()
@@ -537,6 +541,8 @@ class TaskService:
                 evidence = {}
         if feedback is not None:
             evidence["review_feedback"] = feedback
+        if reviewer_id:
+            evidence["reviewed_by"] = reviewer_id
 
         now_ms = int(time.time() * 1000)
         if decision == "approve":

@@ -1671,6 +1671,23 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
     return report
 
 
+def agent_gets_write_worktree(agent: dict) -> bool:
+    """Whether this agent owns an independent write worktree.
+
+    契约（CEO 抽离 + 中层 builder）：executor 与 builder coordinator
+    （family=coordinator，含 SOURCE_WRITE）拥有独立 worktree；
+    CEO / HR 强制项目根，永不持有写 worktree。
+    """
+    perm = (agent.get("permission_type") or "").lower()
+    if perm == "executor":
+        return True
+    if perm != "coordinator":
+        return False
+    from hiveweave.services.policy import infer_role_family
+
+    return infer_role_family(agent) == "coordinator"
+
+
 async def ensure_executor_worktree(
     project_id: str,
     agent_id: str,
@@ -1678,9 +1695,9 @@ async def ensure_executor_worktree(
     task_name: str | None = None,
     task_id: str | None = None,
 ) -> dict:
-    """Ensure an executor has a live worktree and ``agents.workspace_path``.
+    """Ensure a writer (executor / builder coordinator) has a live worktree.
 
-    Refuses coordinators/HR — they must not own write worktrees.
+    Refuses CEO/HR — they must not own write worktrees (forced project root).
     Idempotent if a valid worktree is already bound.
 
     task_name: DEPRECATED — 保留兼容旧调用方, 不再参与分支命名;
@@ -1690,20 +1707,23 @@ async def ensure_executor_worktree(
     """
     from hiveweave.db import meta as meta_db
     from hiveweave.services.org import OrgService
+    from hiveweave.services.policy import infer_role_family
 
     org = OrgService()
     agent = await org.resolve_agent(agent_id)
     if not agent:
         return {"success": False, "message": f"Agent not found: {agent_id}"}
 
-    perm = (agent.get("permission_type") or "").lower()
-    if perm != "executor":
+    if not agent_gets_write_worktree(agent):
+        perm = (agent.get("permission_type") or "").lower()
+        family = infer_role_family(agent)
         return {
             "success": False,
             "message": (
                 f"Refusing worktree for {agent.get('short_id')} "
-                f"(permission_type={perm or 'unknown'}). "
-                "Only executors get write worktrees — coordinators review/merge only."
+                f"(role_family={family}, permission_type={perm or 'unknown'}). "
+                "Only executors and builder coordinators get write worktrees — "
+                "CEO/HR work at the project root."
             ),
         }
 
@@ -1812,9 +1832,10 @@ def pin_dispatch_message_to_worktree(
 
 
 async def heal_project_executor_worktrees(project_id: str) -> dict:
-    """Ensure every active executor has a valid worktree before agents start.
+    """Ensure every active writer (executor / builder coordinator) has a worktree.
 
     Prunes stale metadata, recreates missing worktrees, updates agents.workspace_path.
+    CEO/HR rows are excluded — they are pinned to the project root.
     """
     from hiveweave.db import meta as meta_db
     from hiveweave.db import project as project_db
@@ -1832,11 +1853,15 @@ async def heal_project_executor_worktrees(project_id: str) -> dict:
     cur = await conn.execute(
         "SELECT id, name, role, short_id, workspace_path, permission_type "
         "FROM agents WHERE project_id=? AND status='active' "
-        "AND permission_type='executor'",
+        "AND permission_type IN ('executor', 'coordinator')",
         [project_id],
     )
     agents = await cur.fetchall()
     await cur.close()
+
+    # builder coordinator 纳入恢复；CEO/HR（family!=coordinator 的 coordinator
+    # 行）由 agent_gets_write_worktree 过滤掉。
+    agents = [a for a in agents if agent_gets_write_worktree(dict(a))]
 
     recovered = 0
     failed = 0

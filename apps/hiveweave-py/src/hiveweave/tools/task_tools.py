@@ -490,6 +490,7 @@ async def dispatch_task_tool(
     """Dispatch a task to a subordinate."""
     from hiveweave.services.dispatch import DispatchService
     from hiveweave.services.org_span import (
+        validate_ceo_dispatch_target,
         validate_dispatch_span,
         validate_executor_assignee,
     )
@@ -510,6 +511,10 @@ async def dispatch_task_tool(
     span_err = await validate_dispatch_span(agent_id, resolved_id, org_service)
     if span_err:
         return ToolResult.err(span_err)
+
+    ceo_err = await validate_ceo_dispatch_target(agent_id, resolved_id, org_service)
+    if ceo_err:
+        return ToolResult.err(ceo_err)
 
     coord_err = await validate_executor_assignee(resolved_id, org_service)
     if coord_err:
@@ -639,6 +644,7 @@ async def create_task_tool(
 ) -> ToolResult:
     """Create a new task."""
     from hiveweave.services.org_span import (
+        validate_ceo_dispatch_target,
         validate_dispatch_span,
         validate_executor_assignee,
     )
@@ -656,17 +662,34 @@ async def create_task_tool(
             span_err = await validate_dispatch_span(agent_id, assignee_id, org_service)
             if span_err:
                 return ToolResult.err(span_err)
+            ceo_err = await validate_ceo_dispatch_target(
+                agent_id, assignee_id, org_service
+            )
+            if ceo_err:
+                return ToolResult.err(ceo_err)
             coord_err = await validate_executor_assignee(assignee_id, org_service)
             if coord_err:
                 return ToolResult.err(coord_err)
+            # builder coordinator / executor assignee 须真正 ensure 成功；
+            # 失败只降级为告警日志（任务照建），但绝不静默 pass。
             try:
                 from hiveweave.services.git_worktree import ensure_executor_worktree
 
-                await ensure_executor_worktree(
+                ensured = await ensure_executor_worktree(
                     project_id, assignee_id, task_name=params.title
                 )
-            except Exception:
-                pass
+                if not ensured.get("success"):
+                    log.warning(
+                        "create_task_worktree_ensure_failed",
+                        assignee_id=assignee_id,
+                        error=ensured.get("message"),
+                    )
+            except Exception as e:
+                log.warning(
+                    "create_task_worktree_ensure_error",
+                    assignee_id=assignee_id,
+                    error=str(e),
+                )
 
     try:
         ts = TaskService()
@@ -1058,33 +1081,42 @@ async def submit_task_tool(
         except Exception as e:
             log.warning("handoff_mark_reported_failed", error=str(e))
 
-        # ── 通知 creator/coordinator 有 task 待审 ──
-        # Task Ledger 通知链：submit 后必须通知 creator，否则 coordinator
-        # 不知道有 task 待审 → idle → 团队停滞。
+        # ── 通知 reviewer 有 task 待审 ──
+        # 正常路径：wake creator。自交（creator==assignee，如中层自建骨架任务）
+        # 时改 wake org parent（中层→CEO），避免「通知自己 + 禁自审」死锁。
         task_after = await ts.get_task(project_id, task_id)
         if task_after and task_after.get("creator_id"):
             creator_id = task_after["creator_id"]
-            if creator_id != agent_id:  # 不通知自己
-                from hiveweave.services.inbox import InboxService
-                inbox = InboxService()
-                await inbox.send_message(
-                    from_agent_id=agent_id,
-                    to_agent_id=creator_id,
-                    message=(
-                        f"[TASK SUBMITTED] Task '{task_after.get('title', '')[:60]}' "
-                        f"has been submitted for your review. "
-                        f"Use review_task(taskId='{task_id}', decision='approve'/'rework') "
-                        f"to review."
-                    ),
-                    message_type="task",
-                    priority="normal",
-                    task_id=task_id,
-                    # Force wake: Wait Contract must not starve review (TEST3).
-                    wake=True,
-                )
-                # 触发 coordinator 处理
-                from hiveweave.agents.trigger import trigger_coordinator
-                await trigger_coordinator(creator_id)
+            from hiveweave.services.inbox import InboxService
+            inbox = InboxService()
+            self_submit = creator_id == agent_id
+            notify_id = creator_id
+            if self_submit:
+                try:
+                    from hiveweave.services.org import OrgService
+
+                    me = await OrgService().resolve_agent(agent_id)
+                    parent_id = (me or {}).get("parent_id")
+                    if parent_id:
+                        notify_id = parent_id
+                except Exception as e:
+                    log.warning("submit_parent_lookup_failed", error=str(e))
+            await inbox.send_message(
+                from_agent_id=agent_id if not self_submit else "system",
+                to_agent_id=notify_id,
+                message=(
+                    f"[TASK SUBMITTED] Task '{task_after.get('title', '')[:60]}' "
+                    f"has been submitted for your review. "
+                    f"Use review_task(taskId='{task_id}', decision='approve'/'rework') "
+                    f"to review."
+                ),
+                message_type="task",
+                priority="normal",
+                task_id=task_id,
+                wake=True,
+            )
+            from hiveweave.agents.trigger import trigger_coordinator
+            await trigger_coordinator(notify_id)
 
         return ToolResult.ok(f"Task {task_id} submitted for review.")
     except Exception as e:
@@ -1142,6 +1174,42 @@ async def review_task_tool(
         task = await ts.get_task(project_id, params.task_id)
         if not task:
             return ToolResult.err(f"Task not found: {params.task_id}")
+
+        # Hard gate: 禁自审 —— reviewer 不得等于 assignee。
+        assignee_id = task.get("assignee_id")
+        if assignee_id and str(assignee_id) == str(agent_id):
+            return ToolResult.err(
+                "Self-review is forbidden: you are the assignee of this task. "
+                "Your submission goes to your superior (or task creator) for "
+                "review — do not approve your own deliverable."
+            )
+
+        # Hard gate: VERIFY 审权不落回实现者/合并人 —— 须 CEO 或独立非实现者。
+        if ts._is_verify_task(task):
+            forbidden: set[str] = set()
+            evidence_raw = task.get("evidence") or {}
+            if isinstance(evidence_raw, str):
+                try:
+                    evidence_raw = json.loads(evidence_raw)
+                except Exception:
+                    evidence_raw = {}
+            if isinstance(evidence_raw, dict):
+                merged_by = evidence_raw.get("merged_by")
+                if merged_by:
+                    forbidden.add(str(merged_by))
+            if task.get("creator_id"):
+                forbidden.add(str(task["creator_id"]))
+            parent_id = task.get("parent_task_id")
+            if parent_id:
+                parent = await ts.get_task(project_id, parent_id)
+                if parent and parent.get("assignee_id"):
+                    forbidden.add(str(parent["assignee_id"]))
+            if str(agent_id) in forbidden:
+                return ToolResult.err(
+                    "VERIFY approval must come from the CEO or an independent "
+                    "reviewer — the implementer / merger of the parent task "
+                    "cannot approve its verification."
+                )
 
         # Phase 3: approve requires attestation evidence
         if decision == "approve":
@@ -1208,17 +1276,30 @@ async def review_task_tool(
                     "Cannot approve docs_only task without tests_passed=true ack."
                 )
 
-            # (1) Force worktree context — ensure assignee tree exists, then gate
+            # (1) Force worktree context — ensure assignee tree exists, then gate.
+            # builder coordinator / executor assignee 须真正 ensure；失败降级为
+            # 告警日志并交给 review_worktree_gate 判定，绝不静默 pass。
             if task.get("assignee_id"):
                 try:
                     from hiveweave.services.git_worktree import ensure_executor_worktree
 
-                    await ensure_executor_worktree(
+                    ensured = await ensure_executor_worktree(
                         project_id, str(task["assignee_id"]),
                         task_id=params.task_id,  # P0 稳定命名 hw/<sid>/t-<taskid8>
                     )
-                except Exception:
-                    pass
+                    if not ensured.get("success"):
+                        log.warning(
+                            "review_task_worktree_ensure_failed",
+                            task_id=params.task_id,
+                            assignee_id=task["assignee_id"],
+                            error=ensured.get("message"),
+                        )
+                except Exception as e:
+                    log.warning(
+                        "review_task_worktree_ensure_error",
+                        task_id=params.task_id,
+                        error=str(e),
+                    )
             wt_deny, wt_meta = await review_worktree_gate(
                 project_id, task, evidence
             )
@@ -1243,7 +1324,10 @@ async def review_task_tool(
                     f"Task must be 'submitted', 'reviewing', or 'approved' "
                     f"to rework, but is '{current_status}'"
                 )
-        await ts.review_task(project_id, params.task_id, decision, params.feedback)
+        await ts.review_task(
+            project_id, params.task_id, decision, params.feedback,
+            reviewer_id=agent_id,
+        )
 
 
         # ── 通知 assignee/executor 审查结果 ──
@@ -1649,7 +1733,10 @@ async def _spawn_post_approve_verify_task(
     title = parent_task.get("title") or "task"
     original_assignee = parent_task.get("assignee_id")
     qa_assignee = await _find_independent_qa(
-        project_id, original_assignee=original_assignee
+        project_id,
+        original_assignee=original_assignee,
+        # 合并人（通常=中层 builder）也不得自验 VERIFY
+        exclude_ids={str(reviewer_id)} if reviewer_id else None,
     )
     blocked_note = ""
     if not qa_assignee:
@@ -1657,6 +1744,18 @@ async def _spawn_post_approve_verify_task(
             " No independent QA agent found — VERIFY left unassigned/blocked; "
             "notify HR to hire QA."
         )
+
+    # VERIFY 的 creator 落到 CEO（审权不落回 merger=中层）；submit 时
+    # [TASK SUBMITTED] 因此直达 CEO 做里程碑验收。找不到 CEO 时退回 merger。
+    creator_id = reviewer_id
+    try:
+        from hiveweave.services.org import OrgService
+
+        ceo = await OrgService().get_agent_by_role(project_id, "ceo")
+        if ceo and ceo.get("id"):
+            creator_id = ceo["id"]
+    except Exception as e:
+        log.warning("verify_ceo_lookup_failed", error=str(e))
 
     verify_tags = ["verify", "mandatory", "post-merge"]
     from hiveweave.services.attestation import resolve_task_policy
@@ -1683,7 +1782,7 @@ async def _spawn_post_approve_verify_task(
             "If checks fail, report blockers — do not silently pass.\n"
             f"Original implementer must NOT self-verify (was: {original_assignee})."
         ),
-        creator_id=reviewer_id,
+        creator_id=creator_id,
         assignee_id=qa_assignee,
         priority=1,
         acceptance_criteria=[
@@ -1693,6 +1792,8 @@ async def _spawn_post_approve_verify_task(
         parent_task_id=parent_id,
         tags=verify_tags,
         source="system",
+        # merged_by 供 review_task 的 VERIFY 独立审门排除合并人。
+        evidence={"merged_by": str(reviewer_id)} if reviewer_id else None,
     )
     try:
         await ts.mark_verifying(project_id, parent_id)
@@ -1772,9 +1873,12 @@ async def _spawn_post_approve_verify_task(
 
 
 async def _find_independent_qa(
-    project_id: str, *, original_assignee: str | None
+    project_id: str,
+    *,
+    original_assignee: str | None,
+    exclude_ids: set[str] | None = None,
 ) -> str | None:
-    """Pick QA-capability agent ≠ original implementer (prefer same parent)."""
+    """Pick QA-capability agent ≠ original implementer / merger (prefer same parent)."""
     from hiveweave.services.org import OrgService
     from hiveweave.services.policy import (
         Capability,
@@ -1782,13 +1886,17 @@ async def _find_independent_qa(
         infer_role_family,
     )
 
+    excluded = {str(x) for x in (exclude_ids or set()) if x}
+    if original_assignee:
+        excluded.add(str(original_assignee))
+
     agents = await OrgService().list_agents(project_id)
     active = [
         a
         for a in agents
         if (a.get("status") or "active") == "active"
         and a.get("id")
-        and a.get("id") != original_assignee
+        and str(a.get("id")) not in excluded
     ]
     original_parent = None
     if original_assignee:
@@ -1842,11 +1950,16 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
         if not tid:
             continue
         try:
-            # 独立性别名规则：排除父任务实施者，与创建时同一套查找逻辑
+            # 独立性别名规则：排除父任务实施者 + 合并人，与创建时同一套查找逻辑
             parent = by_id.get(t.get("parent_task_id") or "")
             original = (parent or {}).get("assignee_id")
+            ex: set[str] = set()
+            ev = t.get("evidence") or {}
+            if isinstance(ev, dict) and ev.get("merged_by"):
+                ex.add(str(ev["merged_by"]))
             qa = await _find_independent_qa(
-                project_id, original_assignee=original
+                project_id, original_assignee=original,
+                exclude_ids=ex or None,
             )
             if not qa:
                 log.info(

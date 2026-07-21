@@ -121,8 +121,10 @@ class DispatchService:
         """
         await _ensure_schema(project_id)
 
-        # Hard gates: direct-report span + never assign coordinators code work
+        # Hard gates: direct-report span + CEO 只派直属中层 coordinator +
+        # assignee 须具备 SOURCE_WRITE（executor/qa/builder coordinator）
         from hiveweave.services.org_span import (
+            validate_ceo_dispatch_target,
             validate_dispatch_span,
             validate_executor_assignee,
         )
@@ -132,6 +134,14 @@ class DispatchService:
             return {
                 "success": False,
                 "message": span_err,
+                "from_agent_id": from_agent_id,
+                "to_agent_id": to_agent_id,
+            }
+        ceo_err = await validate_ceo_dispatch_target(from_agent_id, to_agent_id)
+        if ceo_err:
+            return {
+                "success": False,
+                "message": ceo_err,
                 "from_agent_id": from_agent_id,
                 "to_agent_id": to_agent_id,
             }
@@ -164,18 +174,19 @@ class DispatchService:
                 source="agent",
             )
 
-        # Ensure executor worktree + pin paths in the delivery message
+        # Ensure executor/builder-coordinator worktree + pin paths in the message
         description_out = description
         wt_meta: dict = {}
         try:
             from hiveweave.services.git_worktree import (
+                agent_gets_write_worktree,
                 ensure_executor_worktree,
                 pin_dispatch_message_to_worktree,
             )
             from hiveweave.services.org import OrgService
 
             assignee = await OrgService().resolve_agent(to_agent_id)
-            if assignee and (assignee.get("permission_type") or "").lower() == "executor":
+            if assignee and agent_gets_write_worktree(assignee):
                 ensured = await ensure_executor_worktree(
                     project_id,
                     to_agent_id,
@@ -208,9 +219,9 @@ class DispatchService:
                         to_agent_id=to_agent_id,
                         error=ensured.get("message"),
                     )
-            elif assignee and (assignee.get("permission_type") or "").lower() != "executor":
+            elif assignee and not agent_gets_write_worktree(assignee):
                 log.warning(
-                    "dispatch_to_non_executor",
+                    "dispatch_to_non_writer",
                     to_agent_id=to_agent_id,
                     permission_type=assignee.get("permission_type"),
                 )

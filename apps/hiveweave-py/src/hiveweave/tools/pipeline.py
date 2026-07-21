@@ -53,17 +53,29 @@ def build_deny_hint(
         ", ".join(COORDINATOR_WRITE_PREFIXES)
         + ", charter.md/goals.md/spec.md"
     )
+    if family == "ceo":
+        if tool_name in _SOURCE_WRITE_TOOLS:
+            return (
+                f"{base} CEO agents may write only to: {scope}. "
+                "CEO 不写业务代码 — 骨架/关键路径派给直属中层 coordinator "
+                "（dispatch_task），模块实现由中层再派 executor。"
+            )
+        return (
+            f"{base} This tool is outside CEO capabilities "
+            "(org design, milestone dispatch/review, final verification). "
+            "Delegate hands-on work to your mid-level coordinators."
+        )
     if family == "coordinator":
         if tool_name in _SOURCE_WRITE_TOOLS:
             return (
-                f"{base} Coordinator agents may write only to: {scope}. "
-                f"For source-code changes, use dispatch_task to assign the "
-                f"work to an executor agent (or send_message to request it)."
+                f"{base} 中层 builder 有 SOURCE_WRITE —— 被拒通常是路径越界："
+                f"请在你自己的 worktree（.hiveweave/worktrees/<你的shortId>）"
+                f"内改代码；协调文档可写 {scope}。"
             )
         return (
             f"{base} This tool is outside coordinator capabilities "
-            f"(dispatch/review/merge tasks, docs writes). Use dispatch_task "
-            f"to assign the work to an executor agent."
+            "(dispatch/review/merge + writing code in your own worktree). "
+            " staffing 走 HR（send_message 提需求）。"
         )
     if family == "hr":
         if tool_name in _SOURCE_WRITE_TOOLS:

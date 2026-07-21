@@ -33,10 +33,14 @@ def _agent(**kwargs) -> dict:
 
 def test_infer_families():
     assert infer_role_family(_agent(role="hr", permission_type="coordinator")) == "hr"
-    assert infer_role_family(_agent(role="ceo", permission_type="coordinator")) == "coordinator"
+    # role==ceo 优先于 permission_type=coordinator —— CEO 是独立行政 family
+    assert infer_role_family(_agent(role="ceo", permission_type="coordinator")) == "ceo"
     assert infer_role_family(
         _agent(role="测试工程师", permission_type="executor")
     ) == "qa"
+    assert infer_role_family(
+        _agent(role="前端架构师", permission_type="coordinator")
+    ) == "coordinator"
     assert infer_role_family(_agent(role="前端模块工程师")) == "executor"
 
 
@@ -52,15 +56,37 @@ def test_hr_caps_no_dispatch_or_bash():
     assert tool_hard_deny(hr, "hire_agent") is None
 
 
-def test_coordinator_no_bash_browse_hire_or_source_write():
+def test_ceo_no_bash_browse_hire_or_source_write():
+    """CEO 行政 family：派审合/org 放行，写码/bash/test/staffing 全拒。"""
     ceo = _agent(role="ceo", permission_type="coordinator", name="归零")
+    assert infer_role_family(ceo) == "ceo"
     assert tool_hard_deny(ceo, "bash")
     assert tool_hard_deny(ceo, "browse")
+    assert tool_hard_deny(ceo, "run_tests")
     assert tool_hard_deny(ceo, "hire_agent")
     assert tool_hard_deny(ceo, "edit_file")
     assert tool_hard_deny(ceo, "dispatch_task") is None
+    assert tool_hard_deny(ceo, "review_task") is None
+    assert tool_hard_deny(ceo, "git_worktree_merge") is None
     assert write_path_allowed(ceo, "src/app.ts")
     assert write_path_allowed(ceo, "docs/plan.md") is None
+
+
+def test_builder_coordinator_has_code_caps():
+    """中层 builder coordinator：协调权 + 写码权（SOURCE_WRITE/bash/test/browse）。"""
+    mid = _agent(role="前端架构师", permission_type="coordinator", name="云岫")
+    assert infer_role_family(mid) == "coordinator"
+    assert tool_hard_deny(mid, "bash") is None
+    assert tool_hard_deny(mid, "browse") is None
+    assert tool_hard_deny(mid, "run_tests") is None
+    assert tool_hard_deny(mid, "edit_file") is None
+    assert tool_hard_deny(mid, "dispatch_task") is None
+    assert tool_hard_deny(mid, "review_task") is None
+    # staffing 仍是 HR 专属
+    assert tool_hard_deny(mid, "hire_agent")
+    # 源码写放开（不再限 docs 白名单）
+    assert write_path_allowed(mid, "src/app.ts") is None
+    assert write_path_allowed(mid, "docs/plan.md") is None
 
 
 def test_executor_no_hire_or_dispatch():
