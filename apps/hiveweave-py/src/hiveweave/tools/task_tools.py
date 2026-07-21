@@ -1197,6 +1197,7 @@ async def review_task_tool(
         # Hard gate: VERIFY 审权不落回实现者/合并人 —— 须 CEO 或独立非实现者。
         if ts._is_verify_task(task):
             forbidden: set[str] = set()
+            merged_by = None
             evidence_raw = task.get("evidence") or {}
             if isinstance(evidence_raw, str):
                 try:
@@ -1207,13 +1208,23 @@ async def review_task_tool(
                 merged_by = evidence_raw.get("merged_by")
                 if merged_by:
                     forbidden.add(str(merged_by))
-            if task.get("creator_id"):
-                forbidden.add(str(task["creator_id"]))
+            parent_assignee = None
             parent_id = task.get("parent_task_id")
             if parent_id:
                 parent = await ts.get_task(project_id, parent_id)
                 if parent and parent.get("assignee_id"):
-                    forbidden.add(str(parent["assignee_id"]))
+                    parent_assignee = parent["assignee_id"]
+                    forbidden.add(str(parent_assignee))
+            # BUG-P1b: creator_id 不得无差别禁止 —— VERIFY spawn 时
+            # creator 恒落到 CEO（见 _spawn_verify_task），无差别加入会让
+            # CEO 永远无法审批 VERIFY。仅当 creator 本身就是实现者/合并人
+            # 时才禁止（保持"实现者不得自审"的初衷）。
+            creator_id = task.get("creator_id")
+            if creator_id and (
+                str(creator_id) == str(merged_by)
+                or str(creator_id) == str(parent_assignee)
+            ):
+                forbidden.add(str(creator_id))
             if str(agent_id) in forbidden:
                 return ToolResult.err(
                     "VERIFY approval must come from the CEO or an independent "

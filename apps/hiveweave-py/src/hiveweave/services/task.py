@@ -572,8 +572,26 @@ class TaskService:
 
     async def submit_task(self, project_id: str, task_id: str,
                           evidence: dict) -> None:
-        """Submit a task (running → submitted). Sets evidence (JSON) + submitted_at."""
+        """Submit a task (running → submitted). Sets evidence (JSON) + submitted_at.
+
+        BUG-P1b: 保留既有 evidence.merged_by —— VERIFY spawn 时写入的
+        合并人标记是 review_task 独立审门排除合并人的唯一依据，submit
+        整体覆盖 evidence 会让该门禁失效。
+        """
         await self._transition(project_id, task_id, "submitted")
+        if isinstance(evidence, dict) and "merged_by" not in evidence:
+            rows0 = await _query(
+                project_id, "SELECT evidence FROM tasks WHERE id = ?", [task_id]
+            )
+            if rows0 and rows0[0]["evidence"]:
+                try:
+                    prev = rows0[0]["evidence"]
+                    prev = json.loads(prev) if isinstance(prev, str) else dict(prev)
+                except (json.JSONDecodeError, TypeError):
+                    prev = {}
+                if isinstance(prev, dict) and prev.get("merged_by"):
+                    evidence = dict(evidence)
+                    evidence["merged_by"] = prev["merged_by"]
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
             "UPDATE tasks SET evidence = ?, submitted_at = ?, updated_at = ? "
