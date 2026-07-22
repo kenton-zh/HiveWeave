@@ -213,10 +213,24 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
         # (historical wake=0 TASK SUBMITTED / REWORK — TEST3 Phase C starve).
         if trigger_type == "coordinator":
             pending = await _inbox_service.get_pending_messages(agent_id)
+            # Filter out task_event notifications — these are FYI-only and
+            # should NOT wake the coordinator (they cause busy-wait loops
+            # where CEO does get_tasks → commit_turn(waiting) → repeat).
+            # Only actionable messages (task submissions, rework, human chat,
+            # agent-to-agent asks) should trigger a coordinator turn.
+            pending = [
+                m for m in (pending or [])
+                if (m.get("message_type") or "").lower() != "task_event"
+            ]
             if not pending:
                 background = await _inbox_service.get_undelivered_background(
                     agent_id
                 )
+                # Also filter task_event from background check
+                background = [
+                    m for m in (background or [])
+                    if (m.get("message_type") or "").lower() != "task_event"
+                ]
                 if not _has_task_gate_messages(background):
                     log.info(
                         "trigger_coordinator_no_messages",

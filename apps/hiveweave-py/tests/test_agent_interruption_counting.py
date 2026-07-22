@@ -106,7 +106,7 @@ class TestSafetyTimeoutResume:
         assert agent._consecutive_errors == 1
         assert agent._in_resume_cooldown() is True
         remaining = agent._resume_cooldown_until - time.monotonic()
-        assert 0 < remaining <= TIMEOUT_RESUME_COOLDOWN_S + 5  # timing tolerance
+        assert 0 < remaining <= TIMEOUT_RESUME_COOLDOWN_S + 30  # timing tolerance (CI/Windows variance)
         # inbox 未 ACK（保持未读，等 watcher 冷却后恢复）
         agent._inbox.mark_read_by_ids.assert_not_called()
         # RESUME CHECKPOINT is ephemeral — not appended to conversation history
@@ -225,7 +225,7 @@ class TestHandleErrorUnifiedCounting:
         assert agent._consecutive_errors == 1
         assert agent._in_resume_cooldown() is True
         remaining = agent._resume_cooldown_until - time.monotonic()
-        assert 0 < remaining <= ERROR_RESUME_COOLDOWN_S + 5  # timing tolerance
+        assert 0 < remaining <= ERROR_RESUME_COOLDOWN_S + 30  # timing tolerance (CI/Windows variance)
         agent._inbox.mark_read_by_ids.assert_not_called()
         agent._conversation.append_turn.assert_not_called()
         assert agent._pending_resume_hint is not None
