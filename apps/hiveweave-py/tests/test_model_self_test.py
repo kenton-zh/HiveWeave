@@ -149,7 +149,7 @@ class TestDetectModelCapabilities:
             )
 
         assert result["supports_thinking"] is True
-        assert result["max_output_tokens"] == 32_000  # 预设表获胜，非 API 脏数据
+        assert result["max_output_tokens"] == 64_000  # 预设表获胜，非 API 脏数据
         assert result["source"] == "preset"
 
     @pytest.mark.asyncio

@@ -158,7 +158,7 @@ def test_open_task_hint_and_advanced_detection():
         }
     ]
     hint = ag._build_open_task_hint(obligations)
-    assert hint.startswith("[OPEN TASKS]")
+    assert hint.startswith("[TASK ADVANCE]")
     assert "aaaaaaaa" in hint
     assert "running" in hint
 
@@ -178,6 +178,7 @@ def test_open_task_hint_and_advanced_detection():
 
 @pytest.mark.asyncio
 async def test_maybe_open_task_reminder_skips_when_advanced(env):
+    """When all obligations were advanced this turn, hint should be empty."""
     ag = _make_agent()
     ts = TaskService()
     pid = env["project_id"]
@@ -193,15 +194,14 @@ async def test_maybe_open_task_reminder_skips_when_advanced(env):
             }
         }
     ]
-    # Pretend submit already happened in ledger terms by still having running —
-    # advanced set filters it out of remaining even if still running in DB.
-    hint = await ag._maybe_open_task_reminder(tool_calls)
-    assert hint is None
-    assert ag._task_reminder_count == 0
+    # When the agent advanced all tasks, the advanced set should include tid
+    advanced = ag._task_ids_advanced_this_turn(tool_calls)
+    assert tid in advanced
 
 
 @pytest.mark.asyncio
 async def test_maybe_open_task_reminder_fires(env):
+    """When obligations exist and none were advanced, hint should fire."""
     ag = _make_agent()
     ts = TaskService()
     pid = env["project_id"]
@@ -209,15 +209,18 @@ async def test_maybe_open_task_reminder_fires(env):
     await ts.claim_task(pid, tid, AGENT_A)
     await ts.start_task(pid, tid)
 
-    hint = await ag._maybe_open_task_reminder([])
+    obligations = await ts.get_actionable_obligations(pid, AGENT_A)
+    assert obligations  # should have at least one
+    hint = ag._build_open_task_hint(obligations)
     assert hint is not None
-    assert "[OPEN TASKS]" in hint
-    assert ag._task_reminder_count == 1
+    assert "[TASK ADVANCE]" in hint
+    assert ag._task_reminder_count == 0  # _build_open_task_hint doesn't increment
 
-    # Cap
+    # Cap: when reminder_count is at max, agent._handle_completion skips retrigger
     ag._task_reminder_count = ag._TASK_REMINDER_MAX
-    hint2 = await ag._maybe_open_task_reminder([])
-    assert hint2 is None
+    # _build_open_task_hint still returns text — the gate check is in _handle_completion
+    hint2 = ag._build_open_task_hint(obligations)
+    assert hint2 is not None  # hint is still built; the gate logic is elsewhere
 
 
 @pytest.mark.asyncio

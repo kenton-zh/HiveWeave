@@ -21,7 +21,7 @@ from typing import Any
 
 import structlog
 
-from hiveweave.db import project_db
+from hiveweave.db import project as project_db
 
 log = structlog.get_logger()
 

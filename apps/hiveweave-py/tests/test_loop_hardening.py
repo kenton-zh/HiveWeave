@@ -186,6 +186,34 @@ class TestVerificationGates:
             patch.object(
                 TaskService, "get_task", AsyncMock(return_value=fake_task)
             ),
+            patch(
+                "hiveweave.services.attestation.required_attestation_kinds",
+                return_value=["bash_test"],
+            ),
+            patch(
+                "hiveweave.services.attestation.has_valid_waiver",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "hiveweave.services.attestation.attestation_service.find_recent_for_agent",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "hiveweave.services.attestation.attestation_service.verify_ids",
+                new_callable=AsyncMock,
+                return_value=(False, "no valid attestation found"),
+            ),
+            patch(
+                "hiveweave.services.inbox.InboxService.send_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "hiveweave.services.handoff.HandoffService.mark_reported",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
         ):
             result = await submit_task_tool(params, EXECUTOR_ID, "/tmp")
         assert result.success is False

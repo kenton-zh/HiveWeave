@@ -143,7 +143,7 @@ class TestDoomLoopLimitMapping:
         assert doom_loop_limit("apply_patch") == 3
         assert doom_loop_limit("write_file") == 8
         assert doom_loop_limit("send_message") == 5
-        assert doom_loop_limit("commit_turn") == 6
+        assert doom_loop_limit("commit_turn") == 8
 
     def test_unlisted_tool_default_3(self):
         assert doom_loop_limit("some_unknown_tool") == 3

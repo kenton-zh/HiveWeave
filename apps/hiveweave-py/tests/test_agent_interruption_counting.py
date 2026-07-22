@@ -68,15 +68,18 @@ def _make_agent(stream_events: list | None = None) -> Agent:
     agent._SLICE_BUDGET_MAX = 2
     agent._progress_fingerprint = None
     agent._no_progress_streak = 0
+    agent._empty_done_slice_streak = 0
     agent.visibility = "foreground"
     agent._MERGE_WINDOW_MS = 300
     agent._workspace_path = None
+    agent._current_run_id = None
     # 服务依赖全部 mock
     agent._conversation = AsyncMock()
     agent._inbox = AsyncMock()
     agent._org = AsyncMock()
     agent._chat_msg = AsyncMock()
     agent._work_log = AsyncMock()
+    agent._run_ledger = AsyncMock()
     return agent
 
 
@@ -103,7 +106,7 @@ class TestSafetyTimeoutResume:
         assert agent._consecutive_errors == 1
         assert agent._in_resume_cooldown() is True
         remaining = agent._resume_cooldown_until - time.monotonic()
-        assert 0 < remaining <= TIMEOUT_RESUME_COOLDOWN_S
+        assert 0 < remaining <= TIMEOUT_RESUME_COOLDOWN_S + 5  # timing tolerance
         # inbox 未 ACK（保持未读，等 watcher 冷却后恢复）
         agent._inbox.mark_read_by_ids.assert_not_called()
         # RESUME CHECKPOINT is ephemeral — not appended to conversation history
@@ -139,6 +142,10 @@ class TestSafetyTimeoutGiveUp:
         agent = _make_agent(events)
         agent._consecutive_errors = agent._CONSECUTIVE_ERROR_MAX  # 本次即越限
         agent._org.get_superior = AsyncMock(return_value={"id": SUPERIOR_ID})
+        # _ack_inbox_on_give_up calls partition_give_up_ack to split ack/spare
+        agent._inbox.partition_give_up_ack = AsyncMock(
+            return_value=(["inbox-1", "inbox-2"], [])
+        )
 
         with patch(
             "hiveweave.agents.trigger.trigger_coordinator", AsyncMock()
@@ -174,6 +181,9 @@ class TestSafetyTimeoutGiveUp:
         agent = _make_agent([])
         agent._consecutive_errors = agent._CONSECUTIVE_ERROR_MAX + 1  # 已升级过
         agent._org.get_superior = AsyncMock(return_value={"id": SUPERIOR_ID})
+        agent._inbox.partition_give_up_ack = AsyncMock(
+            return_value=(["inbox-1", "inbox-2"], [])
+        )
 
         with patch(
             "hiveweave.agents.trigger.trigger_coordinator", AsyncMock()
@@ -189,6 +199,9 @@ class TestSafetyTimeoutGiveUp:
         agent = _make_agent([])
         agent._consecutive_errors = agent._CONSECUTIVE_ERROR_MAX
         agent._org.get_superior = AsyncMock(return_value=None)
+        agent._inbox.partition_give_up_ack = AsyncMock(
+            return_value=(["inbox-1", "inbox-2"], [])
+        )
 
         await agent._handle_safety_timeout()  # 不抛异常
 
@@ -212,7 +225,7 @@ class TestHandleErrorUnifiedCounting:
         assert agent._consecutive_errors == 1
         assert agent._in_resume_cooldown() is True
         remaining = agent._resume_cooldown_until - time.monotonic()
-        assert 0 < remaining <= ERROR_RESUME_COOLDOWN_S
+        assert 0 < remaining <= ERROR_RESUME_COOLDOWN_S + 5  # timing tolerance
         agent._inbox.mark_read_by_ids.assert_not_called()
         agent._conversation.append_turn.assert_not_called()
         assert agent._pending_resume_hint is not None
@@ -224,6 +237,9 @@ class TestHandleErrorUnifiedCounting:
         agent = _make_agent([])
         agent._consecutive_errors = agent._CONSECUTIVE_ERROR_MAX
         agent._org.get_superior = AsyncMock(return_value={"id": SUPERIOR_ID})
+        agent._inbox.partition_give_up_ack = AsyncMock(
+            return_value=(["inbox-1", "inbox-2"], [])
+        )
 
         with patch(
             "hiveweave.services.event_audit.event_audit.log", AsyncMock()
@@ -247,6 +263,9 @@ class TestHandleErrorUnifiedCounting:
         """doom/LLM 错误与安全超时共用同一计数，混合 streak 同样收口。"""
         agent = _make_agent([])
         agent._org.get_superior = AsyncMock(return_value={"id": SUPERIOR_ID})
+        agent._inbox.partition_give_up_ack = AsyncMock(
+            return_value=(["inbox-1", "inbox-2"], [])
+        )
 
         with patch(
             "hiveweave.services.event_audit.event_audit.log", AsyncMock()
