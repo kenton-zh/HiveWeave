@@ -542,12 +542,49 @@ coverage/
         if not ok:
             return {"success": False, "message": "Failed to stage files"}
 
+        # P1 fix(TEST10): 检测被 .gitignore 屏蔽的产物文件
+        # 如果 worktree 中有文件被 ignore，checkpoint 不会包含它们，
+        # merge 后产物会静默丢失。主动警告 agent。
+        ignored_warning = ""
+        try:
+            # 列出所有未跟踪+被忽略的文件
+            ok_ign, ign_out = await _git(
+                ["status", "--porcelain", "--ignored", "-u"], path
+            )
+            if ok_ign and ign_out:
+                ignored_files = [
+                    ln[3:].strip() for ln in ign_out.split("\n")
+                    if ln.startswith("!!")
+                ]
+                # 只关注可能是产物的文件（排除 .pyc/__pycache__/.hiveweave 等）
+                _NOISE = (".pyc", "__pycache__", ".hiveweave/", "node_modules/",
+                          ".venv/", ".git/")
+                product_ignored = [
+                    f for f in ignored_files
+                    if not any(n in f for n in _NOISE)
+                ]
+                if product_ignored:
+                    ignored_warning = (
+                        f" WARNING: {len(product_ignored)} file(s) are "
+                        f".gitignore'd and will NOT be committed: "
+                        f"{', '.join(product_ignored[:5])}"
+                        f"{'...' if len(product_ignored) > 5 else ''}. "
+                        f"Fix .gitignore or use `git add -f` to force-include."
+                    )
+                    log.warning(
+                        "checkpoint_ignored_files",
+                        short_id=short_id,
+                        files=product_ignored[:10],
+                    )
+        except Exception:
+            pass  # best-effort: don't fail checkpoint on ignore check
+
         # No changes → return current HEAD, count=0
         ok, status = await _git(["status", "--porcelain"], path)
         if ok and status == "":
             ok2, head = await _git(["rev-parse", "--short", "HEAD"], path)
             return {"success": True, "hash": head if ok2 else "",
-                    "count": 0, "message": "no changes to commit"}
+                    "count": 0, "message": "no changes to commit" + ignored_warning}
 
         commit_msg = f"{CHECKPOINT_PREFIX} {message}"
         ok, _ = await _git(["commit", "-m", commit_msg], path)
@@ -558,7 +595,8 @@ coverage/
         count = await self._count_checkpoints(path)
         log.info("git_worktree.checkpoint", short_id=short_id,
                  hash=head if ok else "", count=count)
-        return {"success": True, "hash": head if ok else "", "count": count}
+        return {"success": True, "hash": head if ok else "", "count": count,
+                "message": ignored_warning or None}
 
     async def _count_checkpoints(self, path: str) -> int:
         """Count checkpoint commits in the last 7 days."""

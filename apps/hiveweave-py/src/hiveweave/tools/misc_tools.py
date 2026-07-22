@@ -406,10 +406,14 @@ async def _check_self_merge_gate(
             "Pass taskId for the task this branch implements."
         )
     tid = str(task.get("id") or "")[:8]
-    if task.get("status") != "approved":
+    # P1 fix(TEST10): 接受 closed 作为 approved 的等价后继状态。
+    # approve 后系统可能因 worktree==main 自动 close，但 merge 门禁
+    # 不应因此拒绝——只要 evidence.reviewed_by 存在即证明曾经过审批。
+    status = task.get("status")
+    if status not in ("approved", "closed"):
         return (
             f"Refusing to merge your own branch: task {tid} is "
-            f"'{task.get('status')}', not approved. Get your superior to "
+            f"'{status}', not approved. Get your superior to "
             f"review_task(decision='approve') first."
         )
     evidence = task.get("evidence") or {}
@@ -419,6 +423,14 @@ async def _check_self_merge_gate(
         except Exception:
             evidence = {}
     reviewer = evidence.get("reviewed_by") if isinstance(evidence, dict) else None
+    # closed 状态必须有 reviewed_by 证据（证明是 approve 后自动关闭，而非手动关闭）
+    if status == "closed" and not reviewer:
+        return (
+            f"Refusing to merge your own branch: task {tid} is 'closed' "
+            f"without approval evidence (no reviewed_by). It may have been "
+            f"closed manually. Get your superior to re-approve via "
+            f"review_task(decision='approve')."
+        )
     if not reviewer:
         return (
             f"Refusing to merge your own branch: task {tid} has no recorded "

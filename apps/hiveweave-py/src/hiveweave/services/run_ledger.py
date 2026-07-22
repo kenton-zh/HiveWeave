@@ -163,9 +163,17 @@ class RunLedger:
         result_hash: str | None = None,
         result_size: int | None = None,
         error: str | None = None,
+        result_excerpt: str | None = None,
     ) -> None:
-        """Record the end of a step."""
+        """Record the end of a step.
+
+        result_excerpt: TEST10 观测性修复 — 截断 2KB 的结果摘录。
+        此前 run_steps 只存 result_hash/size，conversation 裁剪后
+        约 12% 的工具结果在 DB 中完全不可找回，审计/排障无据可查。
+        """
         now = _now_ms()
+        if result_excerpt and len(result_excerpt) > 2048:
+            result_excerpt = result_excerpt[:2048] + "…[truncated]"
         try:
             # Calculate duration from started_at
             rows = await project_db.query(
@@ -178,9 +186,11 @@ class RunLedger:
             await project_db.execute(
                 agent_id,
                 "UPDATE run_steps SET status = ?, result_hash = ?, "
-                "result_size = ?, error = ?, ended_at = ?, duration_ms = ? "
+                "result_size = ?, result_excerpt = ?, error = ?, "
+                "ended_at = ?, duration_ms = ? "
                 "WHERE id = ?",
-                [status, result_hash, result_size, error, now, duration, step_id],
+                [status, result_hash, result_size, result_excerpt, error,
+                 now, duration, step_id],
             )
         except Exception as e:
             log.warning("run_ledger.record_step_end_failed", agent_id=agent_id, error=str(e))
@@ -289,7 +299,8 @@ class RunLedger:
             rows = await project_db.query(
                 agent_id,
                 "SELECT step_index, step_type, tool_name, tool_call_id, "
-                "tool_args_hash, status, result_hash, result_size, error, "
+                "tool_args_hash, status, result_hash, result_size, "
+                "result_excerpt, error, "
                 "started_at, ended_at, duration_ms "
                 "FROM run_steps WHERE run_id = ? ORDER BY step_index ASC",
                 [run_id],
