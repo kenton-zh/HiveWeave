@@ -138,7 +138,11 @@ def test_select_tasks_intersects_files_not_all_approved():
     assert [t["id"] for t in selected] == ["new"]
 
 
-def test_select_tasks_ambiguous_falls_back_to_newest():
+def test_select_tasks_ambiguous_returns_all_newest_first():
+    # 语义变更（worktree_review.select_tasks_for_merged_work docstring）：
+    # 同 assignee、无文件交集可歧义消解时，返回该 assignee 全部 approved
+    # 任务（updated_at 降序），不再 [:1] 静默丢弃兄弟任务 —— 同一次
+    # worktree merge 覆盖他在分支上的所有已批准工作。
     tasks = [
         {
             "id": "old",
@@ -160,4 +164,4 @@ def test_select_tasks_ambiguous_falls_back_to_newest():
     selected = select_tasks_for_merged_work(
         tasks, assignee_id="e1", merged_files=["x.js"]
     )
-    assert [t["id"] for t in selected] == ["new"]
+    assert [t["id"] for t in selected] == ["new", "old"]

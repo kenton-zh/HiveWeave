@@ -165,6 +165,12 @@ class TestDispatchPassesTaskId:
             patch("hiveweave.services.dispatch._ensure_schema", AsyncMock()),
             patch("hiveweave.services.dispatch._execute", AsyncMock()),
             patch.object(TaskService, "update_task", AsyncMock()),
+            # B3 归档写保护（dispatch.py existing_task_id 路径）会调 get_task
+            # 检查 is_archived — 返回未归档任务放行。
+            patch.object(
+                TaskService, "get_task",
+                AsyncMock(return_value={"id": TASK_ID, "is_archived": 0}),
+            ),
             patch.object(
                 OrgService, "resolve_agent",
                 AsyncMock(return_value={
