@@ -315,6 +315,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("agent_recovery_failed", error=str(e))
 
+    # 6. Start independent health supervisor (not dependent on game_time)
+    try:
+        from hiveweave.services.health_supervisor import health_supervisor
+        health_supervisor.start()
+    except Exception as e:
+        log.warning("health_supervisor_start_failed", error=str(e))
+
     # Security: 启动序列末尾检测不安全配置（空 API key + 非 loopback host）。
     # 仅打 WARNING 日志，不阻止启动 — 让运维看到醒目提示后自行加固。
     try:
@@ -329,6 +336,13 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ─────────────────────────────────────────────
     log.info("app_stopping")
+
+    # Stop health supervisor first (before game_time)
+    try:
+        from hiveweave.services.health_supervisor import health_supervisor
+        health_supervisor.stop()
+    except Exception:
+        pass
 
     # Stop game time tick loops
     for pid in game_time_projects:
