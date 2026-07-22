@@ -915,6 +915,24 @@ class Agent:
             # 空响应重试循环
             current_messages = list(messages)
             while True:
+                # Unified activation budget check — stop before exceeding limits
+                _run_id = getattr(self, "_current_run_id", None)
+                if _run_id:
+                    try:
+                        exceeded, reason = await self._run_ledger.check_budget(
+                            self.id, _run_id
+                        )
+                        if exceeded:
+                            log.warning(
+                                "activation_budget_exceeded",
+                                agent_id=self.id,
+                                reason=reason,
+                            )
+                            await self._handle_safety_timeout()
+                            return
+                    except Exception:
+                        pass  # best-effort
+
                 result = await streamer.stream(
                     agent_id=self.id,
                     messages=current_messages,
@@ -924,6 +942,15 @@ class Agent:
                     on_tool_call=self._on_tool_call,
                     max_tool_rounds=max_rounds,
                 )
+
+                # Increment LLM call counter (each stream call = 1+ LLM requests)
+                if _run_id:
+                    try:
+                        await self._run_ledger.increment_llm_calls(
+                            self.id, _run_id
+                        )
+                    except Exception:
+                        pass  # best-effort
 
                 status = result.get("status", "error")
 
