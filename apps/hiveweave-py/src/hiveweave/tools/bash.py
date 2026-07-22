@@ -293,8 +293,10 @@ def _find_bash_exe() -> str | None:
     import shutil
 
     # 1. PATH 上直接有 bash（Git for Windows 安装后默认加入 PATH）
+    #    排除 WSL 的 bash（C:\Windows\System32\bash.exe）——它在 Linux 子系统
+    #    中执行，路径语义不同（/mnt/c/... vs C:\...），会导致文件操作失败。
     found = shutil.which("bash")
-    if found:
+    if found and "system32" not in found.lower():
         _BASH_EXE_PATH = found
         log.info("git_bash_detected", source="PATH", path=found)
         return found
