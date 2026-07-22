@@ -160,6 +160,18 @@ class DispatchService:
         #    如果传入了 existing_task_id，复用已有 task 而不是创建新的
         if existing_task_id:
             task_id = existing_task_id
+            # B3: 归档任务写保护 —— 不可对已归档任务 dispatch
+            existing = await self.task_service.get_task(project_id, task_id)
+            if existing and existing.get("is_archived"):
+                return {
+                    "success": False,
+                    "message": (
+                        f"Task {task_id[:8]} is archived and cannot be dispatched. "
+                        f"Create a new task instead."
+                    ),
+                    "from_agent_id": from_agent_id,
+                    "to_agent_id": to_agent_id,
+                }
             # 更新 assignee 为实际接收者；指派即认领（VERIFY 除外）
             await self.task_service.update_task(
                 project_id, task_id, assignee_id=to_agent_id

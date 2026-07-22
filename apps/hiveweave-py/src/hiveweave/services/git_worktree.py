@@ -1743,6 +1743,12 @@ async def ensure_executor_worktree(
         if needle in norm or norm.rstrip("/").endswith(f"/worktrees/{short_id}"):
             # 幂等: 透出实际检出的分支, 不按入参重算 (P0 幂等脱钩修复)
             actual = await _current_branch(cur)
+            # B7: worktree 已有效绑定但 worktree_error 残留时清除
+            if agent.get("worktree_error"):
+                try:
+                    await org.update_agent(agent_id, {"worktree_error": None})
+                except Exception:
+                    pass
             return {
                 "success": True,
                 "path": cur,

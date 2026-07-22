@@ -619,8 +619,8 @@ async def build_trigger_context(
                 "task": h.get("summary") or "",
                 "status": h.get("status") or "",
             }
-            if h.get("expect_report"):
-                entry["report_required"] = True
+            # D3: 始终显式输出 report_required 字段
+            entry["report_required"] = bool(h.get("expect_report"))
             lines.append(_json.dumps(entry, ensure_ascii=False))
         blocks.append(
             "## Pending Tasks — each line is a JSON object with 'from', 'task', 'status', optional 'report_required'.\n"
@@ -656,8 +656,12 @@ async def build_trigger_context(
                 "from": await _agent_name(m.get("from_agent_id", "")),
                 "content": m.get("message") or "",
             }
-            if m.get("expect_report") or (m.get("message_type") or "").lower() == "ask":
-                entry["reply_required"] = True
+            # D3: 始终显式输出 reply_required 字段（true/false），
+            # 避免 false 时省略导致模型脑补幽灵义务
+            entry["reply_required"] = bool(
+                m.get("expect_report")
+                or (m.get("message_type") or "").lower() == "ask"
+            )
             if m.get("priority") == "urgent":
                 entry["priority"] = "urgent"
             if m.get("task_id"):
