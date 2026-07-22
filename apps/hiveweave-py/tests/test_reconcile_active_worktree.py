@@ -89,6 +89,10 @@ async def test_reconcile_skips_active_executor_orphan_dir(git_repo: Path) -> Non
         "hiveweave.services.git_worktree._try_reattach_worktree",
         new_callable=AsyncMock,
         return_value=False,
+    ), patch(
+        "hiveweave.services.git_worktree._project_db_if_exists",
+        new_callable=AsyncMock,
+        return_value=None,
     ):
         report = await reconcile_worktrees(str(git_repo))
 
@@ -106,7 +110,12 @@ async def test_reconcile_removes_true_orphan(git_repo: Path) -> None:
     (orphan / "junk.txt").write_text("gone\n", encoding="utf-8")
     _seed_project_db(git_repo, "A004")  # protects A004 only
 
-    report = await reconcile_worktrees(str(git_repo))
+    with patch(
+        "hiveweave.services.git_worktree._project_db_if_exists",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        report = await reconcile_worktrees(str(git_repo))
     assert not orphan.exists()
     assert report.get("removed_dirs", 0) >= 1
 
@@ -157,6 +166,10 @@ async def test_reconcile_removes_active_executor_when_all_closed(
         "hiveweave.services.git_worktree._try_reattach_worktree",
         new_callable=AsyncMock,
         return_value=False,
+    ), patch(
+        "hiveweave.services.git_worktree._project_db_if_exists",
+        new_callable=AsyncMock,
+        return_value=None,
     ):
         report = await reconcile_worktrees(str(git_repo))
 

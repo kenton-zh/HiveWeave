@@ -108,6 +108,15 @@ async def test_submit_auto_attaches_when_ids_omitted():
             new_callable=AsyncMock,
             return_value=(True, ""),
         ) as verify_mock,
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "hiveweave.services.handoff.HandoffService.mark_reported",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
     ):
         ts = TS.return_value
         ts.get_task = AsyncMock(return_value=task)
