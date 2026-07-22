@@ -493,6 +493,22 @@ PROJECT_DB_TABLES = [
         closed_at INTEGER
     )
     """,
+    # ── Demand-driven Staffing ─────────────────────────────
+    # 结构化用人需求：VERIFY blocked → 需 QA；新模块 → 需 executor
+    """
+    CREATE TABLE IF NOT EXISTS staffing_demands (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        role_needed TEXT NOT NULL,
+        reason TEXT,
+        task_id TEXT,
+        priority TEXT DEFAULT 'normal',
+        status TEXT DEFAULT 'open',
+        fulfilled_by TEXT,
+        created_at INTEGER NOT NULL,
+        fulfilled_at INTEGER
+    )
+    """,
 ]
 
 # ── Meta DB 索引 ────────────────────────────────────────────
@@ -533,4 +549,5 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_task_events_undelivered ON task_events(project_id, delivered) WHERE delivered = 0",
     "CREATE INDEX IF NOT EXISTS idx_verification_cases_original ON verification_cases(original_task_id)",
     "CREATE INDEX IF NOT EXISTS idx_verification_cases_verify ON verification_cases(verify_task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_staffing_demands_open ON staffing_demands(project_id, status) WHERE status = 'open'",
 ]

@@ -1959,6 +1959,20 @@ async def _spawn_post_approve_verify_task(
                 )
             except Exception:
                 pass
+        # Create staffing demand — structured signal for HR
+        try:
+            from hiveweave.services.staffing import StaffingDemandService
+
+            sds = StaffingDemandService()
+            await sds.create_demand(
+                project_id=project_id,
+                role_needed="qa_engineer",
+                reason=f"VERIFY task {verify_id[:8]} blocked — no independent QA",
+                task_id=verify_id,
+                priority="high",
+            )
+        except Exception as e:
+            log.warning("staffing_demand_create_failed", error=str(e))
         # Notify HR + reviewer
         try:
             from hiveweave.services.inbox import InboxService

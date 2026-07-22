@@ -493,6 +493,16 @@ async def hire_agent_tool(
                     project_id=project_id,
                     reattached=n,
                 )
+            # Fulfill open QA staffing demands
+            try:
+                from hiveweave.services.staffing import StaffingDemandService
+
+                sds = StaffingDemandService()
+                demands = await sds.get_open_demands(project_id, role_needed="qa_engineer")
+                for d in demands:
+                    await sds.fulfill_demand(project_id, d["id"], fulfilled_by=new_id)
+            except Exception:
+                pass  # best-effort
         except Exception as retry_err:
             log.warning(
                 "hire_agent.verify_retry_failed",
