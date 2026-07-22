@@ -282,6 +282,8 @@ class Agent:
         self._current_activation_id: str | None = None
         self._current_run_id: str | None = None
         self._run_step_counter: int = 0
+        # P1 escape valve(TEST10): 连续被 UNREPLIED_ASKS 阻塞的次数
+        self._unreplied_asks_streak: int = 0
 
         # ── 缓存 ──
         self._identity_prompt: str | None = None
@@ -1557,11 +1559,27 @@ class Agent:
         replied_contracts: set[str] = set()
         if turn_started_ms:
             try:
+                # TEST10 修复: 判定窗口从「本 turn 开始后」扩展到「最老待回复
+                # 消息到达之后」。此前 sent_to / replied_contracts 都只扫本
+                # turn —— agent 在上一 turn 回复了 ask（无论是否带 reply_to）
+                # 都不算数，合约/回复义务跨 turn 永远关闭不了 → gate 死锁。
+                reply_window_ms = turn_started_ms
+                expect_ts = [
+                    m.get("created_at")
+                    for m in pending_msgs
+                    if m.get("expect_report")
+                    or (m.get("message_type") or "").lower() == "ask"
+                ]
+                expect_ts = [
+                    t for t in expect_ts if isinstance(t, (int, float)) and t
+                ]
+                if expect_ts:
+                    reply_window_ms = min(reply_window_ms, min(expect_ts))
                 sent_to = await self._inbox.get_sent_recipients_since(
-                    self.id, turn_started_ms
+                    self.id, reply_window_ms
                 )
                 replied_contracts = await self._inbox.get_replied_contracts_since(
-                    self.id, turn_started_ms
+                    self.id, reply_window_ms
                 )
             except Exception as e:
                 log.debug("reply_gate_sent_lookup_failed", error=str(e))
@@ -1574,6 +1592,37 @@ class Agent:
             exempt_senders=exempt_senders,
             replied_contracts=replied_contracts,
         )
+
+        # ── P1 escape valve(TEST10): 连续 N 次被 UNREPLIED_ASKS 阻塞后强制降级 ──
+        # 防止 ask 合约因 LLM 不理解 reply_to 参数而永久死锁。
+        _ESCAPE_VALVE_THRESHOLD = 5
+        if unreplied_asks:
+            self._unreplied_asks_streak += 1
+            # TEST10 修复: streak 此前只存在内存、随 run 结束清零，跨 run 永远
+            # 到不了阈值。这里叠加 DB 证据（近 30 分钟 commit_turn 被
+            # UNREPLIED_ASKS 拒绝的累计次数），实现跨 run 累计。
+            db_streak = await self._count_recent_ask_gate_rejections()
+            effective_streak = max(self._unreplied_asks_streak, db_streak)
+            if effective_streak >= _ESCAPE_VALVE_THRESHOLD:
+                # 强制标记为已读，解除死锁
+                force_ids = [m["id"] for m in unreplied_asks if m.get("id")]
+                if force_ids:
+                    try:
+                        await self._inbox.mark_read_by_ids(self.id, force_ids)
+                    except Exception:
+                        pass
+                log.warning(
+                    "unreplied_asks_escape_valve",
+                    agent_id=self.id,
+                    streak=effective_streak,
+                    db_streak=db_streak,
+                    force_closed=len(force_ids),
+                    senders=[m.get("from_name", "?") for m in unreplied_asks[:5]],
+                )
+                unreplied_asks = []
+                self._unreplied_asks_streak = 0
+        else:
+            self._unreplied_asks_streak = 0
 
         open_obligations: list[dict] = []
         try:
@@ -2292,6 +2341,35 @@ class Agent:
 
         self._cancel_safety_timer()
         await self._go_idle()
+
+    async def _count_recent_ask_gate_rejections(self, window_ms: int = 30 * 60 * 1000) -> int:
+        """Count recent commit_turn rejections caused by UNREPLIED_ASKS (DB evidence).
+
+        The in-memory ``_unreplied_asks_streak`` resets every run, so the escape
+        valve could never reach its threshold across runs. This queries the
+        durable run ledger for failed commit_turn steps whose error mentions
+        unreplied asks within ``window_ms``, giving a cross-run cumulative
+        streak. Best-effort: returns 0 on any failure.
+        """
+        try:
+            from hiveweave.db import project as project_db
+
+            since_ms = int(time.time() * 1000) - window_ms
+            rows = await project_db.query(
+                self.id,
+                "SELECT COUNT(*) AS c FROM run_steps rs "
+                "JOIN agent_runs ar ON ar.id = rs.run_id "
+                "WHERE ar.agent_id = ? AND rs.tool_name = 'commit_turn' "
+                "AND rs.status = 'failed' "
+                "AND rs.error LIKE '%有未回复的 ask%' "
+                "AND rs.started_at >= ?",
+                [self.id, since_ms],
+            )
+            if rows:
+                return int(rows[0]["c"] or 0)
+        except Exception as e:
+            log.debug("ask_gate_rejection_count_failed", error=str(e))
+        return 0
 
     async def _park_after_stream_timeouts(
         self, *, inbox_ids: list[str], error_msg: str
@@ -3442,17 +3520,20 @@ class Agent:
         _run_id = getattr(self, "_current_run_id", None)
         if _run_id:
             args_hash = _short_hash(arguments) if arguments else None
+            # P2 fix(TEST10): 预分配 index 再 await，避免并行工具调用竞态
+            # （多个并行 call 同时读 counter → 同 index）。先自增再落库。
+            current_index = self._run_step_counter
+            self._run_step_counter += 1
             try:
                 step_id = await self._run_ledger.record_step_start(
                     agent_id=self.id,
                     run_id=_run_id,
-                    step_index=self._run_step_counter,
+                    step_index=current_index,
                     step_type="tool_call",
                     tool_name=tool_name,
                     tool_call_id=tool_call_id,
                     tool_args_hash=args_hash,
                 )
-                self._run_step_counter += 1
             except Exception as e:
                 log.debug("run_ledger.step_start_failed", error=str(e))
 
@@ -3476,6 +3557,7 @@ class Agent:
                     result_hash=_short_hash(result_content[:1000]) if result_content else None,
                     result_size=len(result_content),
                     error=result.get("error"),
+                    result_excerpt=result_content or result.get("error"),
                 )
             except Exception as e:
                 log.debug("run_ledger.step_end_failed", error=str(e))

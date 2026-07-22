@@ -216,6 +216,53 @@ class InboxService:
         # Generate reply_contract_id when this message requires a reply
         contract_id = str(uuid.uuid4()) if expect_report else None
 
+        # ── Auto-close reply contract（TEST10 修复）────────────────────
+        # 背景: LLM 常忽略 how_to_reply 提示、不显式传 reply_to 就直接
+        # send_message 回复对方，导致 reply_to 全为 NULL、合约永远关闭不了，
+        # commit_turn 被 UNREPLIED_ASKS gate 反复死锁。
+        # 这里在发送方未显式传 reply_to 时，自动关联「收件人 → 发送方」方向
+        # 最老一条未关闭合约。系统消息（task/task_event/alarm）不参与，
+        # 避免 [TASK APPROVED] 之类的通知误关合约。
+        if (
+            reply_to is None
+            and from_agent_id
+            and to_agent_id != from_agent_id
+            and message_type in ("normal", "ask", "notify")
+        ):
+            try:
+                open_contracts = await project_db.query(
+                    from_agent_id,
+                    "SELECT reply_contract_id FROM inbox "
+                    "WHERE from_agent_id = ? AND to_agent_id = ? "
+                    "AND reply_contract_id IS NOT NULL "
+                    "ORDER BY created_at ASC",
+                    [to_agent_id, from_agent_id],
+                )
+                if open_contracts:
+                    closed_rows = await project_db.query(
+                        to_agent_id,
+                        "SELECT DISTINCT reply_to FROM inbox "
+                        "WHERE from_agent_id = ? AND to_agent_id = ? "
+                        "AND reply_to IS NOT NULL",
+                        [from_agent_id, to_agent_id],
+                    )
+                    closed_set = {
+                        r["reply_to"] for r in closed_rows if r["reply_to"]
+                    }
+                    for c in open_contracts:
+                        cid = c["reply_contract_id"]
+                        if cid and cid not in closed_set:
+                            reply_to = cid
+                            log.info(
+                                "inbox_auto_close_reply_contract",
+                                from_agent_id=from_agent_id,
+                                to_agent_id=to_agent_id,
+                                contract=cid[:8],
+                            )
+                            break
+            except Exception as e:
+                log.debug("inbox_auto_close_contract_failed", error=str(e))
+
         try:
             await project_db.execute(
                 to_agent_id,

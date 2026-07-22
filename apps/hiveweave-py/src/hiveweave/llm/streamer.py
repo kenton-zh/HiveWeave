@@ -305,6 +305,38 @@ def _poll_cache_put(
     _poll_result_cache[key] = (time.monotonic() + _POLL_CACHE_TTL_S, content)
 
 
+async def _build_obligations_snapshot(agent_id: str) -> str:
+    """TEST10: poll hard-reject 时附带当前待办快照（与 exit-gate 同源）。
+
+    让 agent 被禁止继续轮询时仍拿到可行动信息（任务 id / 状态 / 角色），
+    直接对任务操作，而不是盲目重试 get_tasks。best-effort：失败返回空串。
+    """
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.task import TaskService
+
+        project_id = await meta_db.get_agent_project_id(agent_id)
+        if not project_id:
+            return ""
+        obligations = await TaskService().get_actionable_obligations(
+            project_id, agent_id
+        )
+        if not obligations:
+            return "\nCurrent obligations: none — safe to commit_turn(waiting)."
+        lines = ["\nCurrent obligations (act directly, do NOT re-poll):"]
+        for ob in obligations[:8]:
+            tid = str(ob.get("id") or "")[:8]
+            title = (ob.get("title") or "")[:40].replace("\n", " ")
+            status = ob.get("status") or "?"
+            role = ob.get("role_hint") or "?"
+            lines.append(f"  - [{role}/{status}] taskId={tid} {title}")
+        if len(obligations) > 8:
+            lines.append(f"  ... and {len(obligations) - 8} more")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 async def _poll_waiting_gate_block_async(
     agent_id: str, tool_name: str
 ) -> str | None:
@@ -1707,12 +1739,18 @@ class Streamer:
                     telemetry.poll_hard_reject(agent_id, tool_name)
                 except Exception:
                     pass
+                # TEST10 修复: hard-reject 附带待办快照。此前 CEO 遇到
+                # 「exit-gate 催审查 + poll 防护禁查询」双重夹击时无可行动
+                # 信息。快照来自与 exit-gate 相同的 obligations 数据源。
+                snapshot = await _build_obligations_snapshot(agent_id)
                 return {
                     "content": (
                         f"[poll hard reject] {tool_name} called {n} times "
                         f"with the same arguments this turn. STOP polling — "
-                        f"call commit_turn(phase='waiting') and wait for "
+                        f"act on the obligations below directly, or call "
+                        f"commit_turn(phase='waiting') and wait for "
                         f"event wake (task_transition / ask_reply / timeout)."
+                        + snapshot
                     ),
                     "success": False,
                 }

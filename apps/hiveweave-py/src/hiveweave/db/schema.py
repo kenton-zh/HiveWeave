@@ -452,12 +452,15 @@ PROJECT_DB_TABLES = [
         status TEXT NOT NULL DEFAULT 'pending',
         result_hash TEXT,
         result_size INTEGER,
+        result_excerpt TEXT,
         error TEXT,
         started_at INTEGER NOT NULL,
         ended_at INTEGER,
         duration_ms INTEGER
     )
     """,
+    # TEST10: 既有库迁移 — run_steps 增加结果摘录列（观测性，截断 2KB）
+    """ALTER TABLE run_steps ADD COLUMN result_excerpt TEXT""",
     # ── Task Transactional Outbox ───────────────────────────
     # 每次 task 状态转换原子写入事件；relay 读取未投递事件并通知相关方
     """

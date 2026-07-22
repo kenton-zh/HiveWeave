@@ -278,12 +278,53 @@ def _normalize_command(command: str) -> str:
 
     - python3 → python (Windows: python3.exe doesn't exist; Unix: alias if absent)
     - pip3 → pip
+    - P2 fix(TEST10): Windows 下常见 unix 命令映射到 cmd 等价物
     """
     import re
     # Replace python3/pip3 with python/pip (word-boundary safe)
     cmd = re.sub(r'\bpython3\b', 'python', command)
     cmd = re.sub(r'\bpip3\b', 'pip', command)
+
+    # Windows: map common unix commands to cmd equivalents
+    if sys.platform.startswith("win"):
+        # 仅对简单命令做映射（复合命令/管道不处理，交给 Git Bash 兜底）
+        _UNIX_TO_CMD = {
+            r'\bls\b': 'dir /b',
+            r'\bcat\b': 'type',
+            r'\bhead\b': 'more',  # 近似
+            r'\btail\b': 'more',  # 近似
+            r'\bcp\b': 'copy',
+            r'\bmv\b': 'move',
+            r'\bmkdir\b': 'md',
+            r'\bpwd\b': 'cd',
+            r'\bwhich\b': 'where',
+            r'\bclear\b': 'cls',
+        }
+        for pattern, replacement in _UNIX_TO_CMD.items():
+            cmd = re.sub(pattern, replacement, cmd)
     return cmd
+
+
+def _decode_output(raw: bytes) -> str:
+    """P2 fix(TEST10): 解码子进程输出。
+
+    优先 UTF-8（env 已设 PYTHONIOENCODING=utf-8），失败时回退到系统
+    locale 编码（中文 Windows 为 GBK/CP936）。避免 cmd.exe 原生命令
+    （dir/type/findstr）输出乱码。
+    """
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        pass
+    # Fallback: system locale (GBK on zh-CN Windows)
+    try:
+        import locale
+        enc = locale.getpreferredencoding(False) or "gbk"
+        return raw.decode(enc, errors="replace")
+    except Exception:
+        return raw.decode("utf-8", errors="replace")
 
 
 async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
@@ -336,7 +377,7 @@ async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
             pass
         return {"output": "", "exit_code": None, "timed_out": True, "error": None}
 
-    output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+    output = _decode_output(stdout_bytes) if stdout_bytes else ""
     return {
         "output": output,
         "exit_code": proc.returncode,
@@ -393,7 +434,7 @@ async def _run_docker(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
             pass
         return {"output": "", "exit_code": None, "timed_out": True, "error": None}
 
-    output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+    output = _decode_output(stdout_bytes) if stdout_bytes else ""
     return {
         "output": output,
         "exit_code": proc.returncode,

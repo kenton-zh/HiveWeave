@@ -307,6 +307,41 @@ async def _send_message_core(
         except Exception:
             pass
 
+        # ── P1 fix(TEST10): 自动关闭回复合约 ──
+        # A 向 B 发消息 → 自动标记 A 收件箱中来自 B 的未读 ask 为已读。
+        # 这打破了"gate 阻塞 → 重复回复 → 对方又发 ask → 永远阻塞"的循环。
+        # 同时自动填充 reply_to（若 LLM 未显式传递），让确定性判定生效。
+        try:
+            from hiveweave.db import project as project_db
+            conn = await project_db.get_project_db_for_agent(agent_id)
+            # 找到本 agent 收件箱中来自 target 的未读 ask/expect_report 消息
+            cursor = await conn.execute(
+                "SELECT id, reply_contract_id FROM inbox "
+                "WHERE to_agent_id = ? AND from_agent_id = ? AND read = 0 "
+                "AND (expect_report = 1 OR message_type = 'ask') "
+                "ORDER BY created_at ASC LIMIT 10",
+                [agent_id, target["id"]],
+            )
+            open_asks = await cursor.fetchall()
+            await cursor.close()
+            if open_asks:
+                ask_ids = [r["id"] for r in open_asks]
+                placeholders = ", ".join(["?"] * len(ask_ids))
+                await conn.execute(
+                    f"UPDATE inbox SET read = 1, delivered = 1, wake = 0 "
+                    f"WHERE to_agent_id = ? AND id IN ({placeholders})",
+                    [agent_id, *ask_ids],
+                )
+                await conn.commit()
+                log.info(
+                    "reply_contract_auto_closed",
+                    agent_id=agent_id,
+                    target_id=target["id"],
+                    closed_count=len(ask_ids),
+                )
+        except Exception as e:
+            log.debug("reply_contract_auto_close_failed", error=str(e))
+
     not_found_str = f" (not found: {not_found})" if not_found else ""
     return ToolResult.ok(
         f"Message sent to {len(resolved)} agent(s): "
