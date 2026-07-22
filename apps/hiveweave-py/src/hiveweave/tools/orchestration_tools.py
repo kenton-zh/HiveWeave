@@ -43,6 +43,7 @@ async def _send_message_core(
     message_type: str = "normal",
     *,
     enforce_span: bool = True,
+    reply_to: str | None = None,
 ) -> ToolResult:
     """Core message-sending logic shared by all ``message_*`` tools.
 
@@ -274,6 +275,7 @@ async def _send_message_core(
                 expect_report=expect_report,
                 message_type=message_type,
                 recipient_disposition=recipient_disposition,
+                reply_to=reply_to,
             )
         except ValueError as e:
             return ToolResult.err(str(e))
@@ -352,6 +354,17 @@ class SendMessageParams(BaseModel):
         """Handle JSON-string recipients (LLM sometimes sends '["HR]')."""
         return coerce_to_list(v)
 
+    reply_to: str | None = Field(
+        default=None,
+        alias="replyTo",
+        description=(
+            "Reply contract ID from the original message's reply_contract_id. "
+            "Include this when replying to a message that had reply_required=true "
+            "to explicitly close the reply contract."
+        ),
+        json_schema_extra={"aliases": ["replyTo", "reply_to", "replyContractId"]},
+    )
+
 
 @tool(
     "send_message",
@@ -373,6 +386,7 @@ async def send_message_tool(
         priority=params.priority,
         expect_report=params.expect_report,
         ctx=ctx,
+        reply_to=params.reply_to,
     )
 
 

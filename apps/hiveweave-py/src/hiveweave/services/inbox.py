@@ -81,6 +81,10 @@ _MISSING_COLUMNS = [
     # delivery_state: 正式交付状态机 pending → delivered → acked
     # 存量行按 delivered/read 推导默认值
     ("delivery_state", "TEXT DEFAULT 'delivered'"),
+    # reply_contract_id: 消息要求回复时的合约 ID（expect_report=1 时生成）
+    ("reply_contract_id", "TEXT"),
+    # reply_to: 回复消息引用的原始合约 ID
+    ("reply_to", "TEXT"),
 ]
 
 
@@ -125,8 +129,15 @@ class InboxService:
         wake: bool | None = None,
         idempotency_key: str | None = None,
         recipient_disposition: str | None = None,
+        reply_to: str | None = None,
     ) -> dict:
-        """Send a message. Returns dict including ``should_wake``."""
+        """Send a message. Returns dict including ``should_wake``.
+
+        Args:
+            reply_to: reply_contract_id of the original message being replied to.
+                When set, closes the reply contract — collect_unreplied_asks
+                checks for matching reply_to instead of heuristic recipient scan.
+        """
         try:
             from hiveweave.db import meta as meta_db
 
@@ -202,14 +213,17 @@ class InboxService:
         # Explicit wake=False still parks as background (delivered=0).
         read_int = 0 if wake_flag else 1
         delivered_int = 1 if wake_flag else 0
+        # Generate reply_contract_id when this message requires a reply
+        contract_id = str(uuid.uuid4()) if expect_report else None
 
         try:
             await project_db.execute(
                 to_agent_id,
                 "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, read, "
                 "created_at, message_type, expect_report, priority, task_id, "
-                "wake, idempotency_key, delivered, wake_category) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "wake, idempotency_key, delivered, wake_category, "
+                "reply_contract_id, reply_to) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     msg_id,
                     from_agent_id,
@@ -225,6 +239,8 @@ class InboxService:
                     key,
                     delivered_int,
                     category,
+                    contract_id,
+                    reply_to,
                 ],
             )
         except Exception as e:
@@ -293,6 +309,7 @@ class InboxService:
             "should_wake": wake_flag,
             "category": category,
             "deduped": False,
+            "reply_contract_id": contract_id,
         }
 
     async def get_pending_messages(self, agent_id: str) -> list[dict]:
@@ -302,7 +319,8 @@ class InboxService:
             agent_id,
             "SELECT id, from_agent_id, to_agent_id, message, read, created_at, "
             "message_type, expect_report, priority, task_id, "
-            "COALESCE(wake, 1) AS wake, wake_category, triage_batch_id "
+            "COALESCE(wake, 1) AS wake, wake_category, triage_batch_id, "
+            "reply_contract_id "
             "FROM inbox "
             "WHERE to_agent_id = ? AND read = 0 AND COALESCE(wake, 1) = 1 "
             "ORDER BY created_at ASC LIMIT 80",
@@ -618,6 +636,29 @@ class InboxService:
             return {r["to_agent_id"] for r in rows if r.get("to_agent_id")}
         except Exception as e:
             log.debug("inbox_sent_since_failed", error=str(e))
+            return set()
+
+    async def get_replied_contracts_since(
+        self, agent_id: str, since_ms: int
+    ) -> set[str]:
+        """Reply contract IDs that this agent has closed since ``since_ms``.
+
+        Returns the set of reply_to values from messages sent by this agent.
+        Used by collect_unreplied_asks to deterministically check if a
+        reply contract has been fulfilled.
+        """
+        await _ensure_schema(agent_id)
+        try:
+            rows = await project_db.query(
+                agent_id,
+                "SELECT DISTINCT reply_to FROM inbox "
+                "WHERE from_agent_id = ? AND created_at >= ? "
+                "AND reply_to IS NOT NULL",
+                [agent_id, int(since_ms)],
+            )
+            return {r["reply_to"] for r in rows if r.get("reply_to")}
+        except Exception as e:
+            log.debug("inbox_replied_contracts_failed", error=str(e))
             return set()
 
     async def get_pending_ids_since(
