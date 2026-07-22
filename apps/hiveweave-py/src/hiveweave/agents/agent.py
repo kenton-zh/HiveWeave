@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import random
@@ -52,6 +53,11 @@ from hiveweave.tools.executor import ToolExecutor
 from hiveweave.tools.review import ReviewLLMCallback
 
 log = structlog.get_logger(__name__)
+
+
+def _short_hash(data: str) -> str:
+    """Short SHA256 hash for tool args/results dedup identification."""
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()[:16]
 
 # ── 常量（契约 04）──────────────────────────────────────────
 
@@ -269,6 +275,13 @@ class Agent:
         self._memory = MemoryService()
         self._chat_msg = ChatMessageService()
         self._work_log = WorkLogService()
+
+        # ── Durable Run Ledger ──
+        from hiveweave.services.run_ledger import run_ledger
+        self._run_ledger = run_ledger
+        self._current_activation_id: str | None = None
+        self._current_run_id: str | None = None
+        self._run_step_counter: int = 0
 
         # ── 缓存 ──
         self._identity_prompt: str | None = None
@@ -672,6 +685,56 @@ class Agent:
                 "started_at": int(time.time() * 1000),
             }
 
+            # ── Durable Run Ledger: create activation ──
+            # Check for interrupted run from previous activation
+            interrupted_summary = None
+            interrupted_run_id = None
+            try:
+                prev_interrupted = await self._run_ledger.find_interrupted_run(self.id)
+                if prev_interrupted:
+                    interrupted_run_id = prev_interrupted["run_id"]
+                    interrupted_summary = await self._run_ledger.generate_checkpoint(
+                        self.id, interrupted_run_id
+                    )
+                    log.info(
+                        "run_ledger.found_interrupted",
+                        agent_id=self.id,
+                        interrupted_run_id=interrupted_run_id,
+                        summary_preview=interrupted_summary[:200],
+                    )
+            except Exception as e:
+                log.debug("run_ledger.check_interrupted_failed", error=str(e))
+
+            # Create activation record
+            trigger = opts.get("trigger") or {}
+            trigger_type = (opts.get("source") or "chat")
+            trigger_source = ""
+            if isinstance(trigger, dict):
+                trigger_source = trigger.get("from_agent_id") or trigger.get("source") or ""
+            inbox_ids = opts.get("inbox_msg_ids") or []
+            try:
+                self._current_activation_id = await self._run_ledger.create_activation(
+                    agent_id=self.id,
+                    trigger_type=trigger_type,
+                    trigger_source=trigger_source,
+                    trigger_detail=message[:200],
+                    inbox_msg_ids=inbox_ids,
+                    interrupted_run_id=interrupted_run_id,
+                    checkpoint_summary=interrupted_summary,
+                )
+            except Exception as e:
+                log.debug("run_ledger.create_activation_failed", error=str(e))
+            self._current_run_id = None
+            self._run_step_counter = 0
+
+            # If we have an interrupted run checkpoint, prepend it to the message
+            if interrupted_summary:
+                message = (
+                    f"[RUN RECOVERY] Previous run was interrupted. "
+                    f"Completed steps:\n{interrupted_summary}\n"
+                    f"Please continue from where you left off.\n\n{message}"
+                )
+
             # Drop leftover streaming rows from a prior incomplete turn before
             # inserting a new placeholder (product auto-heal — no manual clear).
             try:
@@ -822,6 +885,16 @@ class Agent:
 
             # 获取工具定义
             tools = await self._get_tool_definitions()
+
+            # ── Durable Run Ledger: create run ──
+            try:
+                self._current_run_id = await self._run_ledger.create_run(
+                    agent_id=self.id,
+                    activation_id=self._current_activation_id or "",
+                )
+            except Exception as e:
+                log.debug("run_ledger.create_run_failed", error=str(e))
+            self._run_step_counter = 0
 
             # 创建 Streamer（统一 max_tool_rounds = 600）
             max_rounds = self._get_max_tool_rounds()
@@ -1272,6 +1345,19 @@ class Agent:
         content = result.get("content", "")
         thinking = result.get("thinking")
         tool_calls = result.get("tool_calls", [])
+
+        # ── Durable Run Ledger: mark run completed ──
+        _run_id = getattr(self, "_current_run_id", None)
+        if _run_id:
+            try:
+                summary = (content or "")[:200]
+                await self._run_ledger.complete_run(
+                    agent_id=self.id,
+                    run_id=_run_id,
+                    result_summary=summary,
+                )
+            except Exception as e:
+                log.debug("run_ledger.complete_run_failed", error=str(e))
         tool_turn_messages = result.get("tool_turn_messages", [])
 
         log.info(
@@ -2014,6 +2100,19 @@ class Agent:
         """
         error_msg = str(error)
         error_type = type(error).__name__
+
+        # ── Durable Run Ledger: mark run errored ──
+        _run_id = getattr(self, "_current_run_id", None)
+        if _run_id:
+            try:
+                await self._run_ledger.error_run(
+                    agent_id=self.id,
+                    run_id=_run_id,
+                    error_reason=f"{error_type}: {error_msg}",
+                )
+            except Exception as e:
+                log.debug("run_ledger.error_run_failed", error=str(e))
+
         log.error(
             "llm_error",
             agent_id=self.id,
@@ -2353,6 +2452,18 @@ class Agent:
         """
         inbox_ids = list(self.pending_inbox_msg_ids or [])
 
+        # ── Durable Run Ledger: mark run interrupted ──
+        _run_id = getattr(self, "_current_run_id", None)
+        if _run_id:
+            try:
+                await self._run_ledger.interrupt_run(
+                    agent_id=self.id,
+                    run_id=_run_id,
+                    reason="safety_timeout",
+                )
+            except Exception as e:
+                log.debug("run_ledger.interrupt_run_failed", error=str(e))
+
         # 连续中断计数 — 与 _handle_error 共用同一阈值
         self._consecutive_errors += 1
         give_up = self._consecutive_errors > self._CONSECUTIVE_ERROR_MAX
@@ -2615,6 +2726,18 @@ class Agent:
 
         对齐 Elixir agent.ex:131 handle_cast(:cancel)。
         """
+        # ── Durable Run Ledger: mark run interrupted ──
+        _run_id = getattr(self, "_current_run_id", None)
+        if _run_id:
+            try:
+                await self._run_ledger.interrupt_run(
+                    agent_id=self.id,
+                    run_id=_run_id,
+                    reason="cancelled_by_user",
+                )
+            except Exception as e:
+                log.debug("run_ledger.interrupt_cancel_failed", error=str(e))
+
         await self._finalize_streaming_turn(content="[对话被中断]")
 
         # 保留 inbox 未读（用户取消不应标记已读）
@@ -3280,6 +3403,25 @@ class Agent:
             }
         )
 
+        # ── Durable Run Ledger: record step start ──
+        step_id = None
+        _run_id = getattr(self, "_current_run_id", None)
+        if _run_id:
+            args_hash = _short_hash(arguments) if arguments else None
+            try:
+                step_id = await self._run_ledger.record_step_start(
+                    agent_id=self.id,
+                    run_id=_run_id,
+                    step_index=self._run_step_counter,
+                    step_type="tool_call",
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    tool_args_hash=args_hash,
+                )
+                self._run_step_counter += 1
+            except Exception as e:
+                log.debug("run_ledger.step_start_failed", error=str(e))
+
         # 执行工具
         result = await self._tool_executor.execute(
             agent_id=self.id,
@@ -3288,6 +3430,21 @@ class Agent:
             workspace_path=workspace,
             project_root=project_ws,
         )
+
+        # ── Durable Run Ledger: record step end ──
+        if step_id:
+            try:
+                result_content = result.get("output") or ""
+                await self._run_ledger.record_step_end(
+                    agent_id=self.id,
+                    step_id=step_id,
+                    status="completed" if result.get("success") else "failed",
+                    result_hash=_short_hash(result_content[:1000]) if result_content else None,
+                    result_size=len(result_content),
+                    error=result.get("error"),
+                )
+            except Exception as e:
+                log.debug("run_ledger.step_end_failed", error=str(e))
 
         # 转换格式
         content = result.get("output") or ""

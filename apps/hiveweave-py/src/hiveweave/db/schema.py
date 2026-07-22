@@ -405,6 +405,59 @@ PROJECT_DB_TABLES = [
     )
     """,
     """ALTER TABLE tasks ADD COLUMN policy_id TEXT""",
+    # ── Durable Run Ledger ──────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS agent_activations (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        run_id TEXT,
+        trigger_type TEXT,
+        trigger_source TEXT,
+        trigger_detail TEXT,
+        inbox_msg_ids TEXT DEFAULT '[]',
+        interrupted_run_id TEXT,
+        checkpoint_summary TEXT,
+        consumed_at INTEGER,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS agent_runs (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        activation_id TEXT,
+        status TEXT NOT NULL DEFAULT 'running',
+        lease_expires_at INTEGER,
+        budget_llm_calls INTEGER DEFAULT 50,
+        budget_tool_calls INTEGER DEFAULT 100,
+        budget_elapsed_ms INTEGER DEFAULT 600000,
+        actual_llm_calls INTEGER DEFAULT 0,
+        actual_tool_calls INTEGER DEFAULT 0,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        result_summary TEXT,
+        error_reason TEXT,
+        checkpoint_data TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS run_steps (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        step_type TEXT NOT NULL,
+        tool_name TEXT,
+        tool_call_id TEXT,
+        tool_args_hash TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        result_hash TEXT,
+        result_size INTEGER,
+        error TEXT,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        duration_ms INTEGER
+    )
+    """,
 ]
 
 # ── Meta DB 索引 ────────────────────────────────────────────
@@ -435,4 +488,9 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_permission_requests_agent ON permission_requests(agent_id)",
     "CREATE INDEX IF NOT EXISTS idx_personnel_records_agent_id ON personnel_records(agent_id)",
     "CREATE INDEX IF NOT EXISTS idx_agent_charters_project_id ON agent_charters(project_id)",
+    # ── Durable Run Ledger indexes ──────────────────────────
+    "CREATE INDEX IF NOT EXISTS idx_agent_activations_agent ON agent_activations(agent_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_runs_agent ON agent_runs(agent_id, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status)",
+    "CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id, step_index)",
 ]
