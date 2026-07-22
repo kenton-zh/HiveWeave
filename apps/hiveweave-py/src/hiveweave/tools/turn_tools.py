@@ -108,6 +108,38 @@ async def commit_turn_tool(
             duplicate=True,
         )
 
+    # Synchronous pre-check: if phase != in_progress, run exit gate pre-check
+    # before accepting. This gives the LLM immediate feedback instead of
+    # accepting and then blocking at _handle_completion.
+    if tr.phase != "in_progress":
+        try:
+            from hiveweave.db import meta as meta_db
+            from hiveweave.services.turn_exit import pre_check_exit_gates
+
+            project_id = await meta_db.get_agent_project_id(agent_id)
+            if not project_id and ctx is not None:
+                project_id = getattr(ctx, "project_id", None)
+            if project_id:
+                violations = await pre_check_exit_gates(
+                    agent_id, project_id, tr.phase
+                )
+                if violations:
+                    labels = {
+                        "UNREPLIED_ASKS": "有未回复的 ask 消息",
+                        "ASSIGNEE_MUST_SUBMIT": "有 claimed/running/rework 任务未提交",
+                        "CREATOR_MUST_REVIEW": "有 submitted/reviewing 任务待审查",
+                        "CREATOR_MUST_MERGE": "有 approved 任务待合并",
+                    }
+                    hints = [labels.get(v, v) for v in violations]
+                    return ToolResult.err(
+                        f"commit_turn REJECTED (synchronous gate): "
+                        + "; ".join(hints)
+                        + ". 请先处理这些义务再 commit_turn，"
+                        "或改用 phase=in_progress 继续工作。"
+                    )
+        except Exception:
+            pass  # best-effort: don't block on pre-check failure
+
     set_pending_turn_result(agent_id, payload)
 
     # Persist for observability

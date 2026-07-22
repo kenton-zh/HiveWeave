@@ -338,6 +338,38 @@ class RunLedger:
         except Exception:
             return 0
 
+    async def check_budget(
+        self, agent_id: str, run_id: str
+    ) -> tuple[bool, str]:
+        """Check if the run has exceeded its budget.
+
+        Returns (exceeded, reason). If exceeded is True, reason explains why.
+        """
+        try:
+            rows = await project_db.query(
+                agent_id,
+                "SELECT actual_llm_calls, actual_tool_calls, started_at, "
+                "budget_llm_calls, budget_tool_calls, budget_elapsed_ms "
+                "FROM agent_runs WHERE id = ?",
+                [run_id],
+            )
+            if not rows:
+                return False, ""
+            r = rows[0]
+            llm = r["actual_llm_calls"]
+            tools = r["actual_tool_calls"]
+            elapsed = _now_ms() - r["started_at"]
+            if llm >= r["budget_llm_calls"]:
+                return True, f"llm_calls {llm} >= {r['budget_llm_calls']}"
+            if tools >= r["budget_tool_calls"]:
+                return True, f"tool_calls {tools} >= {r['budget_tool_calls']}"
+            if elapsed >= r["budget_elapsed_ms"]:
+                return True, f"elapsed {elapsed}ms >= {r['budget_elapsed_ms']}ms"
+            return False, ""
+        except Exception as e:
+            log.debug("run_ledger.check_budget_failed", error=str(e))
+            return False, ""
+
 
 # Singleton
 run_ledger = RunLedger()

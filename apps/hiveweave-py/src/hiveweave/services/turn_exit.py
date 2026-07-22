@@ -410,3 +410,80 @@ def _build_gate_hint(
         )
     lines.append("assistant 文字不是返回值。请立即用工具修正后再次 commit_turn。")
     return "\n".join(lines)
+
+
+# ── Synchronous pre-check for commit_turn ──────────────────
+
+
+async def pre_check_exit_gates(
+    agent_id: str, project_id: str, phase: str
+) -> list[str]:
+    """Lightweight synchronous pre-check of exit gates.
+
+    Called from commit_turn when phase != in_progress. Returns a list of
+    violation names — empty list means exit is likely safe.
+
+    This is best-effort: if queries fail, returns empty (don't block).
+    The full gate check in _handle_completion is the authoritative backstop.
+    """
+    violations: list[str] = []
+    if phase == "in_progress":
+        return violations  # No exit gates apply to in_progress
+
+    try:
+        from hiveweave.db import project as project_db
+
+        conn = await project_db.get_project_db_by_project_id(project_id)
+
+        # 1. Unreplied asks: inbox messages with expect_report=1, read=0
+        cursor = await conn.execute(
+            "SELECT from_agent_id, message FROM inbox "
+            "WHERE to_agent_id = ? AND expect_report = 1 AND read = 0 "
+            "AND from_agent_id NOT IN ('user', 'system') "
+            "ORDER BY created_at DESC LIMIT 10",
+            [agent_id],
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        if rows:
+            violations.append("UNREPLIED_ASKS")
+
+        # 2. Open task obligations: claimed/running/rework as assignee
+        cursor = await conn.execute(
+            "SELECT id, status FROM tasks "
+            "WHERE assignee_id = ? AND is_archived = 0 "
+            "AND status IN ('claimed', 'running', 'rework') "
+            "LIMIT 20",
+            [agent_id],
+        )
+        assignee_tasks = await cursor.fetchall()
+        await cursor.close()
+        if assignee_tasks and phase in ("done_slice", "waiting"):
+            violations.append("ASSIGNEE_MUST_SUBMIT")
+
+        # 3. Open task obligations: submitted/reviewing/approved as creator
+        cursor = await conn.execute(
+            "SELECT id, status FROM tasks "
+            "WHERE creator_id = ? AND is_archived = 0 "
+            "AND status IN ('submitted', 'reviewing', 'approved') "
+            "LIMIT 20",
+            [agent_id],
+        )
+        creator_tasks = await cursor.fetchall()
+        await cursor.close()
+        if creator_tasks and phase in ("done_slice", "waiting"):
+            # Check if waiting_on covers them — we don't have the TurnResult
+            # waiting_on here, so be conservative and flag
+            statuses = {r["status"] for r in creator_tasks}
+            if "submitted" in statuses or "reviewing" in statuses:
+                violations.append("CREATOR_MUST_REVIEW")
+            if "approved" in statuses:
+                violations.append("CREATOR_MUST_MERGE")
+
+    except Exception as e:
+        log.debug("pre_check_exit_gates_failed", error=str(e))
+        # Best-effort: don't block on query failure
+        return []
+
+    return violations
+
