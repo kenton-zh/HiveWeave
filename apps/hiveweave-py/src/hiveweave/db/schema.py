@@ -458,6 +458,23 @@ PROJECT_DB_TABLES = [
         duration_ms INTEGER
     )
     """,
+    # ── Task Transactional Outbox ───────────────────────────
+    # 每次 task 状态转换原子写入事件；relay 读取未投递事件并通知相关方
+    """
+    CREATE TABLE IF NOT EXISTS task_events (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        from_status TEXT,
+        to_status TEXT,
+        actor_id TEXT,
+        payload TEXT DEFAULT '{}',
+        created_at INTEGER NOT NULL,
+        delivered INTEGER DEFAULT 0,
+        delivered_at INTEGER
+    )
+    """,
 ]
 
 # ── Meta DB 索引 ────────────────────────────────────────────
@@ -493,4 +510,7 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_agent_runs_agent ON agent_runs(agent_id, started_at)",
     "CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status)",
     "CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id, step_index)",
+    # ── Task Outbox indexes ─────────────────────────────────
+    "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_task_events_undelivered ON task_events(project_id, delivered) WHERE delivered = 0",
 ]
