@@ -1,7 +1,8 @@
 """Bash tool — shell command execution with sandbox + self-destruct guard.
 
 契约 02: 工具执行器 — bash 子模块
-- 执行 shell 命令（Windows: cmd /c，POSIX: bash -c）
+- 执行 shell 命令（Windows: 优先 Git Bash bash -c，无 Git Bash 时降级 cmd /s /c）
+- POSIX: bash -c
 - 120s 默认超时（max 600s），超时强制终止
 - 路径沙箱：workdir 必须在 workspace_path 内
 - 自毁命令拦截：7 个正则模式（rm -rf /, format, diskpart, shutdown, reboot, poweroff, halt）
@@ -273,36 +274,105 @@ def _truncate_output(output: str) -> str:
     )
 
 
-def _normalize_command(command: str) -> str:
+# ── Git Bash detection (Windows) ────────────────────────────
+# P1 fix(TEST11-R3): Windows 下优先探测 Git Bash，用 bash -c 执行命令，
+# 根治 cmd 不支持管道/变量赋值/&&复合/bash script.sh 的固有限制。
+# cmd 映射降级为无 Git Bash 环境的兜底方案。
+
+_BASH_EXE_PATH: str | None = None
+_BASH_EXE_CHECKED: bool = False
+
+
+def _find_bash_exe() -> str | None:
+    """Detect Git Bash (bash.exe) on Windows. Result cached after first call."""
+    global _BASH_EXE_PATH, _BASH_EXE_CHECKED
+    if _BASH_EXE_CHECKED:
+        return _BASH_EXE_PATH
+    _BASH_EXE_CHECKED = True
+
+    import shutil
+
+    # 1. PATH 上直接有 bash（Git for Windows 安装后默认加入 PATH）
+    found = shutil.which("bash")
+    if found:
+        _BASH_EXE_PATH = found
+        log.info("git_bash_detected", source="PATH", path=found)
+        return found
+
+    # 2. 常见 Git for Windows 安装路径
+    candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\bin\bash.exe"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            _BASH_EXE_PATH = path
+            log.info("git_bash_detected", source="known_path", path=path)
+            return path
+
+    log.debug("git_bash_not_found")
+    return None
+
+
+def _normalize_command(command: str, *, skip_cmd_mapping: bool = False) -> str:
     """Pre-process command for cross-platform compatibility.
 
     - python3 → python (Windows: python3.exe doesn't exist; Unix: alias if absent)
     - pip3 → pip
     - P2 fix(TEST10): Windows 下常见 unix 命令映射到 cmd 等价物
+    - P2 fix(TEST11-R3): 带 unix 风格 flag 的命令不映射，避免参数错乱
     """
     import re
     # Replace python3/pip3 with python/pip (word-boundary safe)
     cmd = re.sub(r'\bpython3\b', 'python', command)
-    cmd = re.sub(r'\bpip3\b', 'pip', command)
+    cmd = re.sub(r'\bpip3\b', 'pip', cmd)
 
-    # Windows: map common unix commands to cmd equivalents
-    if sys.platform.startswith("win"):
-        # 仅对简单命令做映射（复合命令/管道不处理，交给 Git Bash 兜底）
-        _UNIX_TO_CMD = {
-            r'\bls\b': 'dir /b',
-            r'\bcat\b': 'type',
-            r'\bhead\b': 'more',  # 近似
-            r'\btail\b': 'more',  # 近似
-            r'\bcp\b': 'copy',
-            r'\bmv\b': 'move',
-            r'\bmkdir\b': 'md',
-            r'\bpwd\b': 'cd',
-            r'\bwhich\b': 'where',
-            r'\bclear\b': 'cls',
-        }
-        for pattern, replacement in _UNIX_TO_CMD.items():
-            cmd = re.sub(pattern, replacement, cmd)
+    # Windows: map common unix commands to cmd equivalents (fallback path only)
+    if sys.platform.startswith("win") and not skip_cmd_mapping:
+        cmd = _map_unix_to_cmd(cmd)
     return cmd
+
+
+def _map_unix_to_cmd(cmd: str) -> str:
+    """Map unix commands to cmd equivalents with parameter protection.
+
+    P2 fix(TEST11-R3): 带 unix 风格 flag（-x / --xxx / -N）的命令不映射，
+    避免 ls -la → dir /b -la、mkdir -p → md -p、tail -30 → more -30 等错误。
+    仅对无 flag 的简单调用做映射（ls → dir /b, cat f → type f）。
+    """
+    import re
+
+    _UNIX_TO_CMD: dict[str, str] = {
+        'ls': 'dir /b',
+        'cat': 'type',
+        'head': 'more',   # 近似
+        'tail': 'more',   # 近似
+        'cp': 'copy',
+        'mv': 'move',
+        'mkdir': 'md',
+        'pwd': 'cd',
+        'which': 'where',
+        'clear': 'cls',
+    }
+
+    def _replacer(m: re.Match) -> str:
+        unix_cmd = m.group(0)
+        # 扫描当前命令段（到下一个 | / && / || / ; 为止）的参数 token
+        rest = cmd[m.end():]
+        seg_end = len(rest)
+        for sep in ('|', '&&', '||', ';'):
+            idx = rest.find(sep)
+            if 0 <= idx < seg_end:
+                seg_end = idx
+        tokens = rest[:seg_end].split()
+        # 任何 token 以 - 开头 → 有 unix flag → 不映射
+        if any(t.startswith('-') for t in tokens):
+            return unix_cmd
+        return _UNIX_TO_CMD[unix_cmd]
+
+    pattern = r'\b(?:' + '|'.join(re.escape(k) for k in _UNIX_TO_CMD) + r')\b'
+    return re.sub(pattern, _replacer, cmd)
 
 
 def _decode_output(raw: bytes) -> str:
@@ -328,16 +398,25 @@ def _decode_output(raw: bytes) -> str:
 
 
 async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
-    """Execute command via the OS native shell (cmd / bash)."""
-    command = _normalize_command(command)
+    """Execute command via the OS native shell.
+
+    P1 fix(TEST11-R3): Windows 下优先使用 Git Bash（bash -c），
+    根治 cmd 不支持管道/变量赋值/&&复合/bash script.sh 的固有限制。
+    无 Git Bash 时降级为 cmd /s /c + 命令映射兜底。
+    """
     is_windows = sys.platform.startswith("win")
     if is_windows:
-        # 用 /s /c "command" 而非 /c command，让 cmd 按字面执行整条命令。
-        # /s 开关禁用 cmd 的隐式首尾引号剥离规则，避免嵌套引号被吃掉。
-        # 例如 node -e "console.log('hi')" 经 /c 会丢失内层引号，
-        # 经 /s /c "..." 则原样传递。
-        shell_args = ["cmd", "/s", "/c", command]
+        bash_exe = _find_bash_exe()
+        if bash_exe:
+            # Git Bash 可用 — 直接执行，仅做 python3→python 等基础规范化
+            command = _normalize_command(command, skip_cmd_mapping=True)
+            shell_args = [bash_exe, "-c", command]
+        else:
+            # 无 Git Bash — cmd 兜底，启用 unix→cmd 命令映射
+            command = _normalize_command(command)
+            shell_args = ["cmd", "/s", "/c", command]
     else:
+        command = _normalize_command(command)
         shell_args = ["bash", "-c", command]
 
     env = _build_safe_env(cwd)
