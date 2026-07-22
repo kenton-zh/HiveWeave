@@ -99,6 +99,24 @@ async def _execute(project_id: str, sql: str, params: list | None = None) -> Non
     await conn.commit()
 
 
+async def _execute_tx(
+    project_id: str, statements: list[tuple[str, list]]
+) -> None:
+    """Execute multiple SQL statements in a single transaction.
+
+    Used by the Transactional Outbox: the state transition and the event
+    record are written atomically — either both commit or neither does.
+    """
+    conn = await _conn(project_id)
+    try:
+        for sql, params in statements:
+            await conn.execute(sql, params)
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+
+
 async def _ensure_schema(project_id: str) -> None:
     """Add missing columns to tasks table (idempotent)."""
     if project_id in _migrated:
@@ -233,8 +251,16 @@ class TaskService:
         assign_is_claim = bool(assignee_id) and not self._is_verify_task(draft)
         status = "claimed" if assign_is_claim else "created"
         claimed_at = now_ms if assign_is_claim else None
-        await _execute(project_id,
-            "INSERT INTO tasks (id, project_id, title, description, assignee_id, "
+        event_id = str(uuid.uuid4())
+        event_type = "task.claimed" if assign_is_claim else "task.created"
+        payload = json.dumps({
+            "title": title[:200],
+            "creator_id": creator_id,
+            "assignee_id": assignee_id,
+            "priority": priority,
+        })
+        await _execute_tx(project_id, [
+            ("INSERT INTO tasks (id, project_id, title, description, assignee_id, "
             "creator_id, status, priority, progress, tags, parent_task_id, depends_on, "
             "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
             "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
@@ -247,7 +273,13 @@ class TaskService:
              json.dumps(acceptance_criteria) if acceptance_criteria else None,
              json.dumps(evidence) if evidence else None,
              json.dumps(expected_modules) if expected_modules else None,
-             source, now_ms, claimed_at, now_ms, due_at, policy_id])
+             source, now_ms, claimed_at, now_ms, due_at, policy_id]),
+            ("INSERT INTO task_events (id, project_id, task_id, event_type, "
+             "from_status, to_status, actor_id, payload, created_at) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             [event_id, project_id, task_id, event_type,
+              None, status, creator_id, payload, now_ms]),
+        ])
         log.info("task_created", task_id=task_id, title=title[:60],
                  creator_id=creator_id, assignee_id=assignee_id,
                  status=status, policy_id=policy_id)
@@ -327,6 +359,7 @@ class TaskService:
         """Validate and execute a status transition.
 
         Raises ValueError if the task is not found or the transition is illegal.
+        Writes a task_events row in the same transaction (Transactional Outbox).
         """
         await _ensure_schema(project_id)
         rows = await _query(project_id,
@@ -337,9 +370,16 @@ class TaskService:
         if target not in _TRANSITIONS.get(current, set()):
             raise ValueError(f"Illegal transition: {current} → {target}")
         now_ms = int(time.time() * 1000)
-        await _execute(project_id,
-            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-            [target, now_ms, task_id])
+        event_id = str(uuid.uuid4())
+        await _execute_tx(project_id, [
+            ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+             [target, now_ms, task_id]),
+            ("INSERT INTO task_events (id, project_id, task_id, event_type, "
+             "from_status, to_status, created_at) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?)",
+             [event_id, project_id, task_id, f"task.{target}",
+              current, target, now_ms]),
+        ])
         log.info("task_transition", task_id=task_id,
                  from_status=current, to_status=target)
 
@@ -349,7 +389,7 @@ class TaskService:
 
         Validates each step against _TRANSITIONS, then performs a single
         UPDATE to the final state — no intermediate state is ever visible
-        to concurrent readers.
+        to concurrent readers. Writes a task_events row in the same tx.
 
         Example: _transition_multi(pid, tid, "rework", "running")
         validates reviewing → rework → running, then UPDATEs directly
@@ -370,9 +410,16 @@ class TaskService:
         # Single UPDATE to final state — atomic, no intermediate visible
         now_ms = int(time.time() * 1000)
         final = targets[-1]
-        await _execute(project_id,
-            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-            [final, now_ms, task_id])
+        event_id = str(uuid.uuid4())
+        await _execute_tx(project_id, [
+            ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+             [final, now_ms, task_id]),
+            ("INSERT INTO task_events (id, project_id, task_id, event_type, "
+             "from_status, to_status, created_at) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?)",
+             [event_id, project_id, task_id, f"task.{final}",
+              current, final, now_ms]),
+        ])
         log.info("task_transition_multi", task_id=task_id,
                  from_status=current, through=list(targets[:-1]),
                  to_status=final)
@@ -760,13 +807,22 @@ class TaskService:
                 "Closed tasks are the terminal success state."
             )
         now_ms = int(time.time() * 1000)
-        await _execute(
-            project_id,
-            "UPDATE tasks SET is_archived = 1, archived_by = ?, "
+        event_id = str(uuid.uuid4())
+        arch_payload = json.dumps({
+            "archived_by": archived_by,
+            "reason": reason[:500],
+        })
+        await _execute_tx(project_id, [
+            ("UPDATE tasks SET is_archived = 1, archived_by = ?, "
             "archived_reason = ?, archived_at = ?, wake_at = NULL, "
             "updated_at = ? WHERE id = ?",
-            [archived_by, reason[:500], now_ms, now_ms, task_id],
-        )
+            [archived_by, reason[:500], now_ms, now_ms, task_id]),
+            ("INSERT INTO task_events (id, project_id, task_id, event_type, "
+             "from_status, to_status, actor_id, payload, created_at) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             [event_id, project_id, task_id, "task.archived",
+              current, "archived", archived_by, arch_payload, now_ms]),
+        ])
         log.info(
             "task_archived",
             project_id=project_id,
@@ -1296,3 +1352,64 @@ class TaskService:
                 except (json.JSONDecodeError, TypeError):
                     pass
         return d
+
+
+class TaskEventService:
+    """Read task_events outbox — for relay (step 3) and audit queries.
+
+    Event types: task.created, task.claimed, task.running, task.blocked,
+    task.submitted, task.reviewing, task.approved, task.rework, task.closed,
+    task.archived, task.verifying
+    """
+
+    async def get_undelivered(
+        self, project_id: str, limit: int = 50
+    ) -> list[dict]:
+        """Fetch undelivered task events (for relay consumption)."""
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT id, task_id, event_type, from_status, to_status, "
+                "actor_id, payload, created_at "
+                "FROM task_events WHERE project_id = ? AND delivered = 0 "
+                "ORDER BY created_at ASC LIMIT ?",
+                [project_id, limit],
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.warning("task_events_query_failed", error=str(e))
+            return []
+
+    async def mark_delivered(self, project_id: str, event_ids: list[str]) -> None:
+        """Mark events as delivered (idempotent)."""
+        if not event_ids:
+            return
+        now_ms = int(time.time() * 1000)
+        placeholders = ",".join("?" * len(event_ids))
+        try:
+            await _execute(
+                project_id,
+                f"UPDATE task_events SET delivered = 1, delivered_at = ? "
+                f"WHERE id IN ({placeholders})",
+                [now_ms, *event_ids],
+            )
+        except Exception as e:
+            log.warning("task_events_mark_delivered_failed", error=str(e))
+
+    async def get_task_history(
+        self, project_id: str, task_id: str, limit: int = 50
+    ) -> list[dict]:
+        """Get event history for a single task (audit trail)."""
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT id, event_type, from_status, to_status, actor_id, "
+                "payload, created_at, delivered, delivered_at "
+                "FROM task_events WHERE task_id = ? "
+                "ORDER BY created_at ASC LIMIT ?",
+                [task_id, limit],
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.warning("task_events_history_failed", error=str(e))
+            return []
