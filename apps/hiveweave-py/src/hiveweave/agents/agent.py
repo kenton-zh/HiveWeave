@@ -1748,13 +1748,15 @@ class Agent:
             pop_pending_turn_result(self.id)
             self.disposition = exit_decision.disposition or "runnable"
 
-            # Empty done_slice streak — consecutive hollow exits park hard (TEST4)
+            # Empty done_slice/waiting streak — consecutive hollow exits park hard (TEST4)
+            # Also covers phase="waiting": CEO repeatedly get_tasks→commit_turn(waiting)
+            # with no substantive work should be detected as empty, not just done_slice.
             phase = (
                 exit_decision.turn_result.phase
                 if exit_decision.turn_result
                 else None
             )
-            if phase == "done_slice" and self._is_empty_done_slice_turn(
+            if phase in ("done_slice", "waiting") and self._is_empty_done_slice_turn(
                 tool_calls
             ):
                 self._empty_done_slice_streak += 1
