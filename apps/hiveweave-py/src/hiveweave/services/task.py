@@ -779,34 +779,33 @@ class TaskService:
         # B2: VERIFY 归档时级联父任务 —— 如果归档的是 VERIFY 子任务，
         # 其父任务可能卡在 verifying 状态无法前进。回退到 approved，
         # 让 CEO/coordinator 可以重新走 merge+VERIFY 流程或直接 close。
-        if current not in ("closed",):
-            # 重新查询任务详情判断是否 VERIFY
-            archived_task = await self.get_task(project_id, task_id)
-            if archived_task and self._is_verify_task(archived_task):
-                parent_id = archived_task.get("parent_task_id")
-                if parent_id:
-                    parent_rows = await _query(
-                        project_id,
-                        "SELECT status FROM tasks WHERE id = ?",
-                        [parent_id],
-                    )
-                    if parent_rows and parent_rows[0]["status"] == "verifying":
-                        try:
-                            await self._transition(project_id, parent_id, "approved")
-                            log.info(
-                                "verify_archived_parent_reverted",
-                                project_id=project_id,
-                                verify_task_id=task_id,
-                                parent_task_id=parent_id,
-                                from_status="verifying",
-                                to_status="approved",
-                            )
-                        except Exception as e:
-                            log.warning(
-                                "verify_archived_parent_revert_failed",
-                                parent_task_id=parent_id,
-                                error=str(e),
-                            )
+        # （archive_task 在 current=="closed" 时已 raise，此处 current 必非 closed）
+        archived_task = await self.get_task(project_id, task_id)
+        if archived_task and self._is_verify_task(archived_task):
+            parent_id = archived_task.get("parent_task_id")
+            if parent_id:
+                parent_rows = await _query(
+                    project_id,
+                    "SELECT status FROM tasks WHERE id = ?",
+                    [parent_id],
+                )
+                if parent_rows and parent_rows[0]["status"] == "verifying":
+                    try:
+                        await self._transition(project_id, parent_id, "approved")
+                        log.info(
+                            "verify_archived_parent_reverted",
+                            project_id=project_id,
+                            verify_task_id=task_id,
+                            parent_task_id=parent_id,
+                            from_status="verifying",
+                            to_status="approved",
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "verify_archived_parent_revert_failed",
+                            parent_task_id=parent_id,
+                            error=str(e),
+                        )
 
         return current
 
