@@ -662,6 +662,9 @@ async def build_trigger_context(
                 m.get("expect_report")
                 or (m.get("message_type") or "").lower() == "ask"
             )
+            # Include reply_contract_id so the agent can reference it when replying
+            if m.get("reply_contract_id"):
+                entry["reply_contract_id"] = str(m["reply_contract_id"])[:12]
             if m.get("priority") == "urgent":
                 entry["priority"] = "urgent"
             if m.get("task_id"):

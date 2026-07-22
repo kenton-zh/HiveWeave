@@ -1554,9 +1554,13 @@ class Agent:
 
         # 本 turn 成功送达的收件人（inbox 落库 = send_message 成功的 DB 证据）
         sent_to: set[str] = set()
+        replied_contracts: set[str] = set()
         if turn_started_ms:
             try:
                 sent_to = await self._inbox.get_sent_recipients_since(
+                    self.id, turn_started_ms
+                )
+                replied_contracts = await self._inbox.get_replied_contracts_since(
                     self.id, turn_started_ms
                 )
             except Exception as e:
@@ -1568,6 +1572,7 @@ class Agent:
             name_by_id,
             extra_replied_to=sent_to,
             exempt_senders=exempt_senders,
+            replied_contracts=replied_contracts,
         )
 
         open_obligations: list[dict] = []

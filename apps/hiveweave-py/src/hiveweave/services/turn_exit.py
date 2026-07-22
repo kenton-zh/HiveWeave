@@ -98,6 +98,7 @@ def collect_unreplied_asks(
     name_by_id: dict[str, str] | None = None,
     extra_replied_to: set[str] | None = None,
     exempt_senders: set[str] | None = None,
+    replied_contracts: set[str] | None = None,
 ) -> list[dict]:
     """Messages that require a reply and were not answered this turn.
 
@@ -109,9 +110,12 @@ def collect_unreplied_asks(
     - exempt_senders: 豁免的发送方（已归档/不存在/user/system）——
       对归档 agent 的回复义务随其归档消亡；user/system 的回复通道是
       assistant 输出本身，不适用本门。
+    - replied_contracts: 本 turn 内通过 reply_to 关闭的合约 ID 集合。
+      如果消息的 reply_contract_id 在此集合中，视为已回复（确定性判定）。
     """
     name_by_id = name_by_id or {}
     exempt_senders = exempt_senders or set()
+    replied_contracts = replied_contracts or set()
     expects: list[dict] = []
     for m in pending_msgs:
         fid = m.get("from_agent_id", "")
@@ -157,6 +161,11 @@ def collect_unreplied_asks(
         fname = name_by_id.get(fid) or m.get("from_name") or fid[:8]
         m = dict(m)
         m["from_name"] = fname
+        # Deterministic check: if reply_contract_id exists and has been closed
+        contract = m.get("reply_contract_id")
+        if contract and contract in replied_contracts:
+            continue  # Reply contract fulfilled — skip
+        # Fallback heuristic: check if agent sent any message to the sender
         if fid in replied_to or fname in replied_to:
             continue
         unreplied.append(m)
