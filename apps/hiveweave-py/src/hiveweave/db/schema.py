@@ -475,6 +475,24 @@ PROJECT_DB_TABLES = [
         delivered_at INTEGER
     )
     """,
+    # ── Verification Case ───────────────────────────────────
+    # 单一权威实体，关联 original_task → verify_task → merger → QA
+    """
+    CREATE TABLE IF NOT EXISTS verification_cases (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        original_task_id TEXT NOT NULL,
+        verify_task_id TEXT,
+        merger_agent_id TEXT,
+        qa_agent_id TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        merge_commit_hash TEXT,
+        review_notes TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        closed_at INTEGER
+    )
+    """,
 ]
 
 # ── Meta DB 索引 ────────────────────────────────────────────
@@ -513,4 +531,6 @@ PROJECT_DB_INDEXES = [
     # ── Task Outbox indexes ─────────────────────────────────
     "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_task_events_undelivered ON task_events(project_id, delivered) WHERE delivered = 0",
+    "CREATE INDEX IF NOT EXISTS idx_verification_cases_original ON verification_cases(original_task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_verification_cases_verify ON verification_cases(verify_task_id)",
 ]
