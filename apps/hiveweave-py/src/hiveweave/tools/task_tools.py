@@ -984,6 +984,24 @@ async def submit_task_tool(
     if not task:
         return ToolResult.err(f"Task not found: {task_id}")
 
+    # B3: 归档任务写保护 —— 已归档任务不可提交
+    if task.get("is_archived"):
+        return ToolResult.err(
+            f"Task {task_id[:8]} is archived and cannot be submitted. "
+            f"Use create_task or dispatch_task for new work."
+        )
+
+    # B4: 只有 assignee 可以提交任务（creator==assignee 的自交任务除外）
+    task_assignee = task.get("assignee_id")
+    task_creator = task.get("creator_id")
+    if task_assignee and str(task_assignee) != str(agent_id):
+        if not (task_creator and str(task_creator) == str(agent_id)):
+            return ToolResult.err(
+                f"Only the assignee can submit this task. "
+                f"You are not the assignee (assignee={task_assignee[:8]}). "
+                f"If you are the creator, use review_task or dispatch_task instead."
+            )
+
     from hiveweave.services.attestation import (
         attestation_service,
         required_attestation_kinds,
@@ -1185,6 +1203,13 @@ async def review_task_tool(
         if not task:
             return ToolResult.err(f"Task not found: {params.task_id}")
 
+        # B3: 归档任务写保护 —— 已归档任务不可审批
+        if task.get("is_archived"):
+            return ToolResult.err(
+                f"Task {params.task_id[:8]} is archived and cannot be reviewed. "
+                f"It has been cancelled by a coordinator."
+            )
+
         # Hard gate: 禁自审 —— reviewer 不得等于 assignee。
         assignee_id = task.get("assignee_id")
         if assignee_id and str(assignee_id) == str(agent_id):
@@ -1194,8 +1219,15 @@ async def review_task_tool(
                 "review — do not approve your own deliverable."
             )
 
-        # Hard gate: VERIFY 审权不落回实现者/合并人 —— 须 CEO 或独立非实现者。
+        # D1: VERIFY 审门 —— 如果有有效的 waiver，跳过身份门禁。
+        # 小团队可能没有合法的第四方独立审查员。waive_attestation 作为
+        # CEO override 通道，审计痕迹留在 waiver 表中。
+        verify_waived = False
         if ts._is_verify_task(task):
+            from hiveweave.services.attestation import has_valid_waiver
+            verify_waived = await has_valid_waiver(project_id, params.task_id)
+
+        if ts._is_verify_task(task) and not verify_waived:
             forbidden: set[str] = set()
             merged_by = None
             evidence_raw = task.get("evidence") or {}
@@ -1797,8 +1829,10 @@ async def _spawn_post_approve_verify_task(
         )
         return None
     # ────────────────────────────────────────────────────────────────
-    # Avoid spawning duplicate VERIFY children for the same parent
-    existing = await ts.list_tasks(project_id)
+    # Avoid spawning duplicate VERIFY children for the same parent.
+    # B1 fix: 包含已归档任务 —— 否则已归档的 VERIFY 对去重不可见，
+    # 同一父任务会重复 spawn 新 VERIFY。
+    existing = await ts.list_tasks(project_id, include_archived=True)
     for t in existing:
         tags = t.get("tags") or []
         if (
@@ -1806,6 +1840,7 @@ async def _spawn_post_approve_verify_task(
             and isinstance(tags, list)
             and "verify" in tags
             and t.get("status") not in ("closed", "approved")
+            and not t.get("is_archived")  # 已归档的也视为"存在过"，不再重复 spawn
         ):
             try:
                 await ts.mark_verifying(project_id, parent_id)
