@@ -1916,6 +1916,24 @@ async def _spawn_post_approve_verify_task(
         # merged_by 供 review_task 的 VERIFY 独立审门排除合并人。
         evidence={"merged_by": str(reviewer_id)} if reviewer_id else None,
     )
+
+    # Create verification case — single authoritative entity linking
+    # original_task → verify_task → merger → QA
+    if verify_id:
+        try:
+            from hiveweave.services.task import VerificationCaseService
+
+            vcs = VerificationCaseService()
+            await vcs.create_case(
+                project_id=project_id,
+                original_task_id=parent_id,
+                verify_task_id=verify_id,
+                merger_agent_id=str(reviewer_id) if reviewer_id else None,
+            )
+            if qa_assignee:
+                await vcs.set_reviewer(project_id, verify_id, qa_assignee)
+        except Exception as e:
+            log.warning("verification_case_create_at_spawn_failed", error=str(e))
     try:
         await ts.mark_verifying(project_id, parent_id)
     except Exception as e:

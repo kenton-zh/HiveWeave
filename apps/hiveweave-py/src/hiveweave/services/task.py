@@ -967,6 +967,13 @@ class TaskService:
             )
             return
 
+        # Mark verification case as passed
+        try:
+            vcs = VerificationCaseService()
+            await vcs.mark_passed(project_id, verify_id)
+        except Exception:
+            pass  # best-effort
+
         parent_id = verify_task.get("parent_task_id")
         if parent_id:
             await self._close_sibling_verify_tasks(
@@ -1413,3 +1420,133 @@ class TaskEventService:
         except Exception as e:
             log.warning("task_events_history_failed", error=str(e))
             return []
+
+
+class VerificationCaseService:
+    """Single authoritative entity for the VERIFY lifecycle.
+
+    Links original_task → verify_task → merger → QA reviewer.
+    Status: pending → in_review → passed | failed | waived
+    """
+
+    async def create_case(
+        self,
+        project_id: str,
+        original_task_id: str,
+        verify_task_id: str | None = None,
+        merger_agent_id: str | None = None,
+    ) -> str | None:
+        """Create a verification case when VERIFY is spawned."""
+        case_id = str(uuid.uuid4())
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "INSERT INTO verification_cases "
+                "(id, project_id, original_task_id, verify_task_id, "
+                "merger_agent_id, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                [case_id, project_id, original_task_id, verify_task_id,
+                 merger_agent_id, now_ms, now_ms],
+            )
+            log.info("verification_case_created", case_id=case_id,
+                     original_task=original_task_id[:8],
+                     verify_task=(verify_task_id or "")[:8])
+            return case_id
+        except Exception as e:
+            log.warning("verification_case_create_failed", error=str(e))
+            return None
+
+    async def update_verify_task(
+        self, project_id: str, original_task_id: str,
+        verify_task_id: str,
+    ) -> None:
+        """Link the verify task to an existing case."""
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET verify_task_id = ?, "
+                "status = 'in_review', updated_at = ? "
+                "WHERE original_task_id = ? AND status = 'pending'",
+                [verify_task_id, now_ms, original_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_update_verify_failed", error=str(e))
+
+    async def set_reviewer(
+        self, project_id: str, verify_task_id: str,
+        qa_agent_id: str,
+    ) -> None:
+        """Set the QA reviewer for a verification case."""
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET qa_agent_id = ?, "
+                "status = 'in_review', updated_at = ? "
+                "WHERE verify_task_id = ?",
+                [qa_agent_id, now_ms, verify_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_set_reviewer_failed", error=str(e))
+
+    async def mark_passed(
+        self, project_id: str, verify_task_id: str,
+        notes: str = "",
+    ) -> None:
+        """Mark verification as passed (VERIFY approved)."""
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET status = 'passed', "
+                "review_notes = ?, closed_at = ?, updated_at = ? "
+                "WHERE verify_task_id = ?",
+                [notes[:500], now_ms, now_ms, verify_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_mark_passed_failed", error=str(e))
+
+    async def mark_failed(
+        self, project_id: str, verify_task_id: str,
+        notes: str = "",
+    ) -> None:
+        """Mark verification as failed (VERIFY rejected/rework)."""
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET status = 'failed', "
+                "review_notes = ?, updated_at = ? "
+                "WHERE verify_task_id = ?",
+                [notes[:500], now_ms, verify_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_mark_failed_failed", error=str(e))
+
+    async def mark_waived(
+        self, project_id: str, original_task_id: str,
+        reason: str = "",
+    ) -> None:
+        """Mark verification as waived (attestation waiver)."""
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET status = 'waived', "
+                "review_notes = ?, closed_at = ?, updated_at = ? "
+                "WHERE original_task_id = ? AND status NOT IN ('passed', 'waived')",
+                [reason[:500], now_ms, now_ms, original_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_mark_waived_failed", error=str(e))
+
+    async def get_case_for_task(
+        self, project_id: str, task_id: str
+    ) -> dict | None:
+        """Get verification case by original or verify task ID."""
+        try:
+            rows = await _query(project_id,
+                "SELECT * FROM verification_cases "
+                "WHERE original_task_id = ? OR verify_task_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                [task_id, task_id],
+            )
+            return dict(rows[0]) if rows else None
+        except Exception:
+            return None
