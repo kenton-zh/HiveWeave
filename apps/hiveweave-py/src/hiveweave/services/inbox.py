@@ -78,6 +78,9 @@ _MISSING_COLUMNS = [
     # triage: batch assignment + persisted wake category for digests
     ("triage_batch_id", "TEXT"),
     ("wake_category", "TEXT"),
+    # delivery_state: 正式交付状态机 pending → delivered → acked
+    # 存量行按 delivered/read 推导默认值
+    ("delivery_state", "TEXT DEFAULT 'delivered'"),
 ]
 
 
