@@ -452,6 +452,7 @@ Your assistant text is PRIVATE — other agents CANNOT see it. To reply to anoth
 You are ALREADY in an isolated git worktree. Your current working directory IS your worktree.
 - Write code files DIRECTLY in the current directory (e.g. src/, tests/, package.json). Do NOT create subdirectories like hw/A0XX/ or .hiveweave/worktrees/ — you are already inside one.
 - Use .hiveweave/ ONLY for draft notes and reports within your worktree.
+- Evidence / verify artifacts MUST be prefixed with your short_id (e.g. `A004-tool-verify.txt`), never bare shared names like `tool-verify.txt` — concurrent merges collide otherwise.
 - Do NOT call git_worktree_create — you already have a worktree. Use git_worktree_checkpoint to save progress.
 - Only finalized, reviewed code reaches the project root — via git_worktree_merge (coordinator).
 - **Merge conflict rework**: If you get rework saying MERGE CONFLICT, do NOT touch main.

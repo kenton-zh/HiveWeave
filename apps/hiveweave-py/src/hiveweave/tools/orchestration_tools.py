@@ -318,7 +318,7 @@ async def _send_message_core(
             cursor = await conn.execute(
                 "SELECT id, reply_contract_id FROM inbox "
                 "WHERE to_agent_id = ? AND from_agent_id = ? AND read = 0 "
-                "AND (expect_report = 1 OR message_type = 'ask') "
+                "AND expect_report = 1 "
                 "ORDER BY created_at ASC LIMIT 10",
                 [agent_id, target["id"]],
             )
@@ -1054,9 +1054,29 @@ async def read_work_logs_tool(
     # If target specified, resolve it; otherwise list all subordinates'
     # logs
     if params.agent_id:
-        target_agent = await ctx.org.resolve_agent(params.agent_id)
+        target_agent = None
+        ref_fn = getattr(ctx.org, "resolve_agent_ref", None)
+        if callable(ref_fn):
+            try:
+                maybe = ref_fn(project_id, params.agent_id)
+                if hasattr(maybe, "__await__"):
+                    maybe = await maybe
+                if isinstance(maybe, dict) and maybe.get("id"):
+                    target_agent = maybe
+            except TypeError:
+                # MagicMock / sync stub with wrong arity
+                pass
+        if target_agent is None:
+            maybe = ctx.org.resolve_agent(params.agent_id)
+            if hasattr(maybe, "__await__"):
+                maybe = await maybe
+            if isinstance(maybe, dict) and maybe.get("id"):
+                target_agent = maybe
         if not target_agent:
-            return ToolResult.err(f"Agent not found: {params.agent_id}")
+            return ToolResult.err(
+                f"Agent not found: {params.agent_id}. "
+                f"Use 花名 / short_id / full id from view_org_chart."
+            )
         target_ids = [target_agent["id"]]
     else:
         subs = await ctx.org.get_subordinates(agent_id)

@@ -207,14 +207,6 @@ class InboxService:
 
         msg_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
-        expect = 1 if expect_report else 0
-        wake_int = 1 if wake_flag else 0
-        # Product default: messages wake (wake_flag True → unread pending).
-        # Explicit wake=False still parks as background (delivered=0).
-        read_int = 0 if wake_flag else 1
-        delivered_int = 1 if wake_flag else 0
-        # Generate reply_contract_id when this message requires a reply
-        contract_id = str(uuid.uuid4()) if expect_report else None
 
         # ── Auto-close reply contract（TEST10 修复）────────────────────
         # 背景: LLM 常忽略 how_to_reply 提示、不显式传 reply_to 就直接
@@ -262,6 +254,40 @@ class InboxService:
                             break
             except Exception as e:
                 log.debug("inbox_auto_close_contract_failed", error=str(e))
+
+        # 根因修复: ask-reply 链断裂 — auto-close 匹配到 reply_to（或 LLM
+        # 显式传 reply_to）说明本消息是对先前 ask 的回复。回复不应再产生
+        # 新的 reply 义务，否则 A→ask→B→ask→A→ask→B... 无限循环
+        # （TEST11 doom loop 根因）。
+        # 必须在 expect/contract_id 计算之前执行，否则 DB 仍写入
+        # expect_report=1 + 新合约 ID，降级形同虚设。
+        # 结构化判定（基于 reply_contract 匹配），不扫描文案。
+        if reply_to is not None and (
+            expect_report or (message_type or "").lower() == "ask"
+        ):
+            expect_report = False
+        # Also strip message_type=ask — reply_required is expect_report-only;
+        # leaving mt=ask would confuse logs/UI even though gates ignore it.
+            if (message_type or "").lower() == "ask":
+                message_type = "notify"
+            log.info(
+                "ask_chain_downgraded",
+                from_agent_id=from_agent_id,
+                to_agent_id=to_agent_id,
+                reply_to=reply_to[:8],
+                message_type=message_type,
+            )
+
+        # 在降级之后计算 DB 写入值，确保降级生效
+        expect = 1 if expect_report else 0
+        wake_int = 1 if wake_flag else 0
+        # Product default: messages wake (wake_flag True → unread pending).
+        # Explicit wake=False still parks as background (delivered=0).
+        read_int = 0 if wake_flag else 1
+        delivered_int = 1 if wake_flag else 0
+        # Generate reply_contract_id only when this message requires a reply
+        # （降级后 expect_report=False → 不生成新合约，打破循环）
+        contract_id = str(uuid.uuid4()) if expect_report else None
 
         try:
             await project_db.execute(
@@ -663,6 +689,63 @@ class InboxService:
                 error=str(e),
             )
             return 0
+
+    async def get_outstanding_ask_recipients(
+        self, from_agent_id: str
+    ) -> set[str]:
+        """Recipients of unanswered expect_report/ask messages from this agent.
+
+        Used by WAIT_WITHOUT_ASK (TEST11 #1a): waiting on X is legal if an
+        unanswered ask to X already exists (even if sent in a prior turn).
+        An ask is outstanding when its reply_contract_id has not been closed
+        via any reply_to, or (fallback) the message is still unread.
+        """
+        await _ensure_schema(from_agent_id)
+        try:
+            rows = await project_db.query(
+                from_agent_id,
+                "SELECT to_agent_id, reply_contract_id, read FROM inbox "
+                "WHERE from_agent_id = ? AND expect_report = 1 "
+                "ORDER BY created_at DESC LIMIT 100",
+                [from_agent_id],
+            )
+            if not rows:
+                return set()
+            contracts = [
+                r["reply_contract_id"]
+                for r in rows
+                if r.get("reply_contract_id")
+            ]
+            closed: set[str] = set()
+            if contracts:
+                # Find which contracts have been replied to (any agent)
+                placeholders = ",".join("?" * len(contracts))
+                closed_rows = await project_db.query(
+                    from_agent_id,
+                    f"SELECT DISTINCT reply_to FROM inbox "
+                    f"WHERE reply_to IN ({placeholders})",
+                    list(contracts),
+                )
+                closed = {
+                    r["reply_to"] for r in closed_rows if r.get("reply_to")
+                }
+            out: set[str] = set()
+            for r in rows:
+                to_id = r.get("to_agent_id")
+                if not to_id:
+                    continue
+                cid = r.get("reply_contract_id")
+                if cid and cid in closed:
+                    continue
+                if cid and cid not in closed:
+                    out.add(to_id)
+                elif not cid and not r.get("read"):
+                    # Legacy ask without contract: unread counts as outstanding
+                    out.add(to_id)
+            return out
+        except Exception as e:
+            log.debug("inbox_outstanding_asks_failed", error=str(e))
+            return set()
 
     async def get_sent_recipients_since(
         self, agent_id: str, since_ms: int

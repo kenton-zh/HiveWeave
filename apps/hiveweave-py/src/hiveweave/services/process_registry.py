@@ -20,6 +20,18 @@ log = structlog.get_logger(__name__)
 # HiveWeave platform — project apps must never bind these
 RESERVED_PORTS: frozenset[int] = frozenset({4000, 5173, 4173})
 
+# Process image names that host the platform API / web UI.
+# Agents must kill by *project* port (3000+), never wholesale node/python.
+PROTECTED_PROCESS_IMAGES: frozenset[str] = frozenset({
+    "node",
+    "node.exe",
+    "python",
+    "python.exe",
+    "pythonw",
+    "pythonw.exe",
+    "uvicorn",
+})
+
 _PORT_FLAG_RE = re.compile(
     r"(?:--port[= ]|--listen[= ]|-p[= ])(\d{2,5})",
     re.IGNORECASE,
@@ -30,6 +42,44 @@ _PORT_ENV_RE = re.compile(
 )
 _VITE_BARE_RE = re.compile(
     r"\b(npx\s+)?vite\b|\bnpm\s+run\s+dev\b|\bpnpm\s+(?:run\s+)?dev\b",
+    re.IGNORECASE,
+)
+
+# Kill / stop verbs (Windows + POSIX + common helpers)
+_KILL_VERB_RE = re.compile(
+    r"\b(?:"
+    r"kill|killall|pkill|taskkill|stop-process|"
+    r"kill-port|npx\s+kill-port|"
+    r"fuser\b[^;\n|&]{0,40}-k"  # fuser -k …
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Reference to a reserved platform port in kill/lookup context
+_RESERVED_PORT_REF_RE = re.compile(
+    r"(?:"
+    r"(?:^|[\s`'\"(=/:])(?P<p1>4000|5173|4173)\b"  # bare / :4000 / =4000
+    r"|LocalPort\s+(?P<p2>4000|5173|4173)\b"
+    r"|-ti?:(?P<p3>4000|5173|4173)\b"  # lsof -ti:4000
+    r"|(?P<p4>4000|5173|4173)/tcp\b"  # fuser 4000/tcp
+    r")",
+    re.IGNORECASE,
+)
+
+# Wholesale image kill: taskkill /IM node.exe, Stop-Process -Name python, …
+_IMAGE_KILL_RE = re.compile(
+    r"(?:"
+    r"\btaskkill\b[^;\n|&]{0,80}(?:/IM|//IM|-IM)\s+"
+    r"(?P<img1>node|pythonw?|uvicorn)(?:\.exe)?"
+    r"|\bStop-Process\b[^;\n|&]{0,80}-Name\s+"
+    r"(?P<img2>node|pythonw?|uvicorn)\b"
+    r"|\b(?:pkill|killall)\b[^;\n|&]{0,60}\b"
+    r"(?P<img3>node|pythonw?|uvicorn)\b"
+    r"|\bGet-Process\b[^;\n|&]{0,60}\b"
+    r"(?P<img4>node|pythonw?|uvicorn)\b[^;\n|&]{0,80}\bStop-Process\b"
+    r"|\bpkill\b[^;\n|&]{0,40}-f[^;\n|&]{0,80}"
+    r"(?:uvicorn|hiveweave\.main|vite)\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -88,6 +138,41 @@ def check_command_reserved_ports(command: str) -> str | None:
             f"port — default 5173 is reserved for HiveWeave. "
             f"Use start_dev_server or `vite --port <project_port> --strictPort`."
         )
+    return None
+
+
+def check_platform_process_kill(command: str) -> str | None:
+    """Hard-block killing HiveWeave API/UI processes or reserved ports.
+
+    Covers the TEST11 failure mode where an agent ran
+    ``taskkill //F //IM node.exe`` (killed Vite :5173) or
+    ``kill $(lsof -ti:4000)`` (would kill the API).
+
+    Allowed: kill by *project* port (e.g. ``lsof -ti:3001``).
+    """
+    cmd = command or ""
+    if not cmd.strip():
+        return None
+
+    img = _IMAGE_KILL_RE.search(cmd)
+    if img:
+        name = next((g for g in img.groups() if g), "node/python")
+        return (
+            f"Refusing to kill process image '{name}' — that hosts the "
+            f"HiveWeave platform (API :4000 / UI :5173). "
+            f"Stop *project* servers by port only "
+            f"(e.g. `kill $(lsof -ti:3001)` / "
+            f"`npx kill-port 3001`), never taskkill/pkill "
+            f"{'/'.join(sorted({i.removesuffix('.exe') for i in PROTECTED_PROCESS_IMAGES}))}."
+        )
+
+    if _KILL_VERB_RE.search(cmd) and _RESERVED_PORT_REF_RE.search(cmd):
+        ports = ",".join(str(p) for p in sorted(RESERVED_PORTS))
+        return (
+            f"Refusing to kill processes on HiveWeave reserved ports "
+            f"({ports}). Use a project port (3000+) instead."
+        )
+
     return None
 
 

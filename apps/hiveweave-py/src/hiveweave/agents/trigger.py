@@ -672,10 +672,7 @@ async def build_trigger_context(
             }
             # D3: 始终显式输出 reply_required 字段（true/false），
             # 避免 false 时省略导致模型脑补幽灵义务
-            entry["reply_required"] = bool(
-                m.get("expect_report")
-                or (m.get("message_type") or "").lower() == "ask"
-            )
+            entry["reply_required"] = bool(m.get("expect_report"))
             # Include reply_contract_id so the agent can reference it when replying
             if m.get("reply_contract_id"):
                 entry["reply_contract_id"] = str(m["reply_contract_id"])

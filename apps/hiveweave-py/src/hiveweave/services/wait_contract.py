@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS agent_waits (
 """
 
 
-def default_ttl_ms(kind: str) -> int:
+def default_ttl_ms(kind: str, agent_id: str | None = None) -> int:
+    """Default wait TTL. Agent waits get ±20% deterministic jitter (TEST11 #1d)."""
     k = (kind or "external").lower()
     if k == "user":
         return int(settings.wait_ttl_user_ms)
@@ -67,7 +68,14 @@ def default_ttl_ms(kind: str) -> int:
     if k == "timer":
         return int(settings.wait_ttl_timer_ms)
     if k == "agent":
-        return int(settings.wait_ttl_agent_ms)
+        base = int(settings.wait_ttl_agent_ms)
+        if agent_id:
+            # Deterministic ±20% jitter by agent_id hash — desyncs simultaneous
+            # TTL wakes so partners don't re-wait in lockstep.
+            h = int(hashlib.md5(agent_id.encode()).hexdigest()[:8], 16)
+            factor = 0.8 + (h % 401) / 1000.0  # [0.8, 1.2]
+            return max(60_000, int(base * factor))
+        return base
     return int(settings.wait_ttl_external_ms)
 
 
@@ -213,7 +221,7 @@ class WaitContractService:
             if isinstance(item, dict) and item.get("expires_at") is not None:
                 exp = int(item["expires_at"])
             if exp is None:
-                exp = now + default_ttl_ms(kind)
+                exp = now + default_ttl_ms(kind, agent_id)
             await conn.execute(
                 "INSERT INTO agent_waits "
                 "(id, agent_id, project_id, kind, ref, wake_on, expires_at, "
@@ -417,6 +425,20 @@ class WaitContractService:
             if len(comp) < 2:
                 continue
             members = sorted(comp)
+            # TEST11 #1b: pick earliest waiter (by wait created_at) to wake first
+            earliest_by_member: dict[str, int] = {}
+            for w in active:
+                aid = w.get("agentId") or ""
+                if aid not in members:
+                    continue
+                created = int(w.get("createdAt") or 0)
+                prev = earliest_by_member.get(aid)
+                if prev is None or created < prev:
+                    earliest_by_member[aid] = created
+            wake_first = min(
+                members,
+                key=lambda m: (earliest_by_member.get(m, 0), m),
+            )
             conn = await _conn(project_id)
             if conn is None:
                 continue
@@ -432,7 +454,8 @@ class WaitContractService:
             if n:
                 breaks.append(
                     {
-                        "breakerId": members[0],  # legacy field: first member
+                        "breakerId": wake_first,  # asymmetric wake primary
+                        "wakeFirstId": wake_first,
                         "memberIds": members,
                         "cycle": members,
                         "clearedCount": n,
@@ -443,6 +466,7 @@ class WaitContractService:
                     project_id=project_id,
                     members=members,
                     cycle=members,
+                    wake_first=wake_first,
                     cleared=n,
                 )
         return breaks

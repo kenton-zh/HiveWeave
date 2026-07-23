@@ -286,6 +286,8 @@ PROJECT_DB_TABLES = [
     """ALTER TABLE agents ADD COLUMN worktree_error TEXT""",
     # D6: activity timestamp — stall/UI must not treat lifecycle status as busy
     """ALTER TABLE agents ADD COLUMN last_active_at INTEGER""",
+    # 修 #4: activated_at — agent 首个 turn 完成时写入；NULL 表示从未激活
+    """ALTER TABLE agents ADD COLUMN activated_at INTEGER""",
     """
     CREATE TABLE IF NOT EXISTS todos (
         id TEXT PRIMARY KEY,

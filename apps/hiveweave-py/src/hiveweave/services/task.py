@@ -73,6 +73,8 @@ _MISSING_COLUMNS = [
     ("archived_by", "TEXT"),
     ("archived_reason", "TEXT"),
     ("archived_at", "INTEGER"),
+    # reviewer_id: pinned on submit (default creator); start_review may overwrite
+    ("reviewer_id", "TEXT"),
 ]
 _migrated: set[str] = set()
 
@@ -147,13 +149,13 @@ _PROGRESS_FLOORS: dict[str, int] = {
 class TaskService:
     """Task Ledger — task lifecycle from creation to closure with rework support."""
 
-    # 列顺序与 tasks 表一致（含 due_at / wait_kind / wake_at / policy_id）
+    # 列顺序与 tasks 表一致（含 due_at / wait_kind / wake_at / policy_id / reviewer_id）
     _COLUMNS = (
         "id, project_id, title, description, assignee_id, creator_id, "
         "status, priority, progress, tags, parent_task_id, depends_on, "
         "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
         "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
-        "is_archived, due_at, wait_kind, wake_at, policy_id"
+        "is_archived, due_at, wait_kind, wake_at, policy_id, reviewer_id"
     )
 
     async def _raise_progress_floor(
@@ -360,6 +362,11 @@ class TaskService:
 
         Raises ValueError if the task is not found or the transition is illegal.
         Writes a task_events row in the same transaction (Transactional Outbox).
+
+        Leaving ``blocked`` clears wait metadata (blocked_reason / wait_kind /
+        wake_at) in the same transaction — state-machine invariant: not blocked
+        means not waiting. Fixes residual wait_kind on running tasks when
+        ``start_task`` is used instead of ``unblock_task`` (TEST11 #5-L1).
         """
         await _ensure_schema(project_id)
         rows = await _query(project_id,
@@ -371,15 +378,58 @@ class TaskService:
             raise ValueError(f"Illegal transition: {current} → {target}")
         now_ms = int(time.time() * 1000)
         event_id = str(uuid.uuid4())
-        await _execute_tx(project_id, [
-            ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-             [target, now_ms, task_id]),
-            ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-             "from_status, to_status, created_at) "
-             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-             [event_id, project_id, task_id, f"task.{target}",
-              current, target, now_ms]),
-        ])
+        if current == "blocked":
+            # Defensive: any exit from blocked clears wait metadata
+            try:
+                await _execute_tx(project_id, [
+                    ("UPDATE tasks SET status = ?, blocked_reason = NULL, "
+                     "wait_kind = NULL, wake_at = NULL, updated_at = ? WHERE id = ?",
+                     [target, now_ms, task_id]),
+                    ("INSERT INTO task_events (id, project_id, task_id, event_type, "
+                     "from_status, to_status, created_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     [event_id, project_id, task_id, f"task.{target}",
+                      current, target, now_ms]),
+                ])
+            except Exception as e:
+                # Prefer status transition over abort; then best-effort clear
+                log.warning(
+                    "blocked_exit_clear_metadata_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
+                await _execute_tx(project_id, [
+                    ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                     [target, now_ms, task_id]),
+                    ("INSERT INTO task_events (id, project_id, task_id, event_type, "
+                     "from_status, to_status, created_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     [event_id, project_id, task_id, f"task.{target}",
+                      current, target, now_ms]),
+                ])
+                try:
+                    await _execute(
+                        project_id,
+                        "UPDATE tasks SET blocked_reason = NULL, wait_kind = NULL, "
+                        "wake_at = NULL, updated_at = ? WHERE id = ?",
+                        [now_ms, task_id],
+                    )
+                except Exception as e2:
+                    log.warning(
+                        "blocked_exit_metadata_retry_failed",
+                        task_id=task_id,
+                        error=str(e2),
+                    )
+        else:
+            await _execute_tx(project_id, [
+                ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                 [target, now_ms, task_id]),
+                ("INSERT INTO task_events (id, project_id, task_id, event_type, "
+                 "from_status, to_status, created_at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 [event_id, project_id, task_id, f"task.{target}",
+                  current, target, now_ms]),
+            ])
         log.info("task_transition", task_id=task_id,
                  from_status=current, to_status=target)
 
@@ -431,6 +481,7 @@ class TaskService:
         (e.g. create_task/dispatch set assignee), this is a no-op. Only
         'created' tasks transition. Wrong-assignee or illegal states raise.
         """
+        task_id = await self.require_task_id(project_id, task_id)
         rows = await _query(project_id,
             "SELECT status, assignee_id FROM tasks WHERE id = ?", [task_id])
         if not rows:
@@ -460,12 +511,33 @@ class TaskService:
         )
 
     async def start_task(self, project_id: str, task_id: str) -> None:
-        """Start a task (claimed → running)."""
-        await self._transition(project_id, task_id, "running")
+        """Start a task (claimed → running).
+
+        If the task is currently ``blocked``, delegates to ``unblock_task`` so
+        wait metadata is cleared (TEST11 #5-L1). Callers that used to rely on
+        ``blocked → running`` being a legal ``_transition`` must not skip that.
+        """
+        task_id = await self.require_task_id(project_id, task_id)
         rows = await _query(
-            project_id, "SELECT assignee_id FROM tasks WHERE id = ?", [task_id]
+            project_id, "SELECT status, assignee_id FROM tasks WHERE id = ?",
+            [task_id],
         )
-        agent_id = rows[0]["assignee_id"] if rows else None
+        if not rows:
+            raise ValueError(f"Task not found: {task_id}")
+        if rows[0]["status"] == "blocked":
+            # blocked must go through unblock_task to clear wait metadata
+            await self.unblock_task(project_id, task_id)
+            agent_id = rows[0]["assignee_id"]
+            await self.emit_task_event(
+                project_id,
+                task_id,
+                "running",
+                agent_id=agent_id,
+                summary=f"[running] task {task_id[:8]} unblocked via start_task",
+            )
+            return
+        await self._transition(project_id, task_id, "running")
+        agent_id = rows[0]["assignee_id"]
         await self.emit_task_event(
             project_id,
             task_id,
@@ -474,11 +546,25 @@ class TaskService:
             summary=f"[running] task {task_id[:8]} started",
         )
 
-    async def block_task(self, project_id: str, task_id: str, reason: str) -> None:
+    async def block_task(
+        self,
+        project_id: str,
+        task_id: str,
+        reason: str,
+        *,
+        depends_on_task_id: str | None = None,
+    ) -> None:
         """Block a task (running → blocked). Sets blocked_reason.
 
         Prefer typed prefixes in reason: dependency: / timer: / user: / external:
+        When ``depends_on_task_id`` is set, merges it into ``depends_on`` so
+        ``_wake_dependent_tasks`` can auto-unblock (TEST11 #5-L2).
         """
+        task_id = await self.require_task_id(project_id, task_id)
+        if depends_on_task_id:
+            depends_on_task_id = await self.require_task_id(
+                project_id, depends_on_task_id
+            )
         await self._transition(project_id, task_id, "blocked")
         now_ms = int(time.time() * 1000)
         reason = (reason or "Blocked by agent").strip()
@@ -498,9 +584,41 @@ class TaskService:
                 "UPDATE tasks SET blocked_reason = ?, updated_at = ? WHERE id = ?",
                 [reason, now_ms, task_id],
             )
+        # Structured dependency ref → merge into depends_on (auto-wake path)
+        dep = (depends_on_task_id or "").strip()
+        if dep:
+            try:
+                rows = await _query(
+                    project_id,
+                    "SELECT depends_on FROM tasks WHERE id = ?",
+                    [task_id],
+                )
+                deps: list = []
+                if rows and rows[0]["depends_on"]:
+                    raw = rows[0]["depends_on"]
+                    try:
+                        deps = json.loads(raw) if isinstance(raw, str) else list(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        deps = []
+                if not isinstance(deps, list):
+                    deps = []
+                if dep not in deps:
+                    deps.append(dep)
+                    await _execute(
+                        project_id,
+                        "UPDATE tasks SET depends_on = ?, updated_at = ? WHERE id = ?",
+                        [json.dumps(deps), now_ms, task_id],
+                    )
+            except Exception as e:
+                log.warning(
+                    "block_task_depends_on_merge_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
 
     async def unblock_task(self, project_id: str, task_id: str) -> None:
         """Unblock a task (blocked → running). Clears blocked_reason."""
+        task_id = await self.require_task_id(project_id, task_id)
         await self._transition(project_id, task_id, "running")
         now_ms = int(time.time() * 1000)
         try:
@@ -563,6 +681,11 @@ class TaskService:
             reason = (task.get("blocked_reason") or "").strip()
             reason_l = reason.lower()
             mentions = completed_task_id in reason or completed_task_id[:8] in reason
+
+            # Auto-unblock only with structured evidence (task id in depends_on
+            # or dependency: reason mentioning the completed task id).
+            # Agent-name-only weak match removed (TEST11 audit H3) — CEO/HR
+            # and zero-assignment agents were false-positive "all done".
             if completed_task_id not in deps and not (
                 reason_l.startswith("dependency:") and mentions
             ):
@@ -617,6 +740,103 @@ class TaskService:
                     error=str(e),
                 )
 
+    async def reconcile_blocked_tasks(self, project_id: str) -> int:
+        """Sweep blocked tasks: met deps / expired timers → unblock (TEST11 #8).
+
+        Returns number of tasks unblocked. Idempotent.
+        """
+        await _ensure_schema(project_id)
+        now_ms = int(time.time() * 1000)
+        rows = await _query(
+            project_id,
+            f"SELECT {self._COLUMNS} FROM tasks "
+            "WHERE status = 'blocked' AND is_archived = 0",
+            [],
+        )
+        if not rows:
+            return 0
+
+        done_rows = await _query(
+            project_id,
+            "SELECT id FROM tasks WHERE status IN ('approved','closed') "
+            "AND is_archived = 0",
+            [],
+        )
+        completed = {r["id"] for r in done_rows}
+        woken = 0
+        for row in rows:
+            task = self._row(row)
+            tid = task["id"]
+            wait_kind = (task.get("wait_kind") or "").lower()
+            wake_at = task.get("wake_at")
+            deps = task.get("depends_on") or []
+            if isinstance(deps, str):
+                try:
+                    deps = json.loads(deps)
+                except (json.JSONDecodeError, TypeError):
+                    deps = []
+            if not isinstance(deps, list):
+                deps = []
+
+            should_wake = False
+            reason_tag = ""
+            if wait_kind == "timer" and wake_at is not None:
+                try:
+                    if int(wake_at) <= now_ms:
+                        should_wake = True
+                        reason_tag = "timer_expired"
+                except (TypeError, ValueError):
+                    pass
+            if deps and all(d in completed for d in deps):
+                should_wake = True
+                reason_tag = reason_tag or "depends_on_met"
+
+            if not should_wake:
+                continue
+            assignee = task.get("assignee_id")
+            try:
+                await self.unblock_task(project_id, tid)
+                woken += 1
+            except Exception as e:
+                log.warning(
+                    "reconcile_blocked_unblock_failed",
+                    task_id=tid,
+                    error=str(e),
+                )
+                continue
+            log.info(
+                "reconcile_blocked_unblocked",
+                task_id=tid,
+                reason=reason_tag,
+                assignee=assignee,
+            )
+            if not assignee:
+                continue
+            try:
+                from hiveweave.services.inbox import InboxService
+                from hiveweave.agents.trigger import trigger_subordinate
+
+                title = (task.get("title") or "")[:80]
+                await InboxService().send_message(
+                    "system",
+                    assignee,
+                    (
+                        f"[BLOCKED RECONCILED] Task '{title}' ({tid[:8]}) "
+                        f"unblocked ({reason_tag}). Continue or submit_task."
+                    ),
+                    message_type="system",
+                    priority="urgent",
+                    task_id=tid,
+                )
+                await trigger_subordinate(assignee)
+            except Exception as e:
+                log.warning(
+                    "reconcile_blocked_notify_failed",
+                    task_id=tid,
+                    error=str(e),
+                )
+        return woken
+
     async def submit_task(self, project_id: str, task_id: str,
                           evidence: dict) -> None:
         """Submit a task (running → submitted). Sets evidence (JSON) + submitted_at.
@@ -624,7 +844,12 @@ class TaskService:
         BUG-P1b: 保留既有 evidence.merged_by —— VERIFY spawn 时写入的
         合并人标记是 review_task 独立审门排除合并人的唯一依据，submit
         整体覆盖 evidence 会让该门禁失效。
+
+        TEST11 #3: on submit, pin ``reviewer_id`` (default creator_id) so the
+        designated reviewer has obligations from the submitted window onward —
+        not only after they call start_review.
         """
+        task_id = await self.require_task_id(project_id, task_id)
         await self._transition(project_id, task_id, "submitted")
         if isinstance(evidence, dict) and "merged_by" not in evidence:
             rows0 = await _query(
@@ -640,14 +865,45 @@ class TaskService:
                     evidence = dict(evidence)
                     evidence["merged_by"] = prev["merged_by"]
         now_ms = int(time.time() * 1000)
-        await _execute(project_id,
-            "UPDATE tasks SET evidence = ?, submitted_at = ?, updated_at = ? "
-            "WHERE id = ?",
-            [json.dumps(evidence), now_ms, now_ms, task_id])
-        rows = await _query(
-            project_id, "SELECT assignee_id FROM tasks WHERE id = ?", [task_id]
+        # Pin reviewer at submit: existing column wins; evidence.reviewer_id
+        # only fills when column is empty (non-VERIFY). VERIFY always → creator.
+        meta_rows = await _query(
+            project_id,
+            "SELECT assignee_id, creator_id, reviewer_id, tags, title "
+            "FROM tasks WHERE id = ?",
+            [task_id],
         )
-        agent_id = rows[0]["assignee_id"] if rows else None
+        agent_id = meta_rows[0]["assignee_id"] if meta_rows else None
+        reviewer_id = None
+        if meta_rows:
+            creator_id = meta_rows[0]["creator_id"]
+            existing_reviewer = meta_rows[0]["reviewer_id"]
+            draft = {
+                "tags": meta_rows[0]["tags"],
+                "title": meta_rows[0]["title"],
+            }
+            if self._is_verify_task(draft):
+                reviewer_id = creator_id
+            elif existing_reviewer:
+                reviewer_id = existing_reviewer
+            elif isinstance(evidence, dict) and evidence.get("reviewer_id"):
+                reviewer_id = str(evidence["reviewer_id"])
+            else:
+                reviewer_id = creator_id
+        if reviewer_id:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET evidence = ?, submitted_at = ?, "
+                "reviewer_id = ?, updated_at = ? WHERE id = ?",
+                [json.dumps(evidence), now_ms, reviewer_id, now_ms, task_id],
+            )
+        else:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET evidence = ?, submitted_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                [json.dumps(evidence), now_ms, now_ms, task_id],
+            )
         await self.emit_task_event(
             project_id,
             task_id,
@@ -656,9 +912,16 @@ class TaskService:
             summary=f"[submitted] task {task_id[:8]}",
         )
 
-    async def start_review(self, project_id: str, task_id: str) -> None:
-        """Start review (submitted → reviewing)."""
+    async def start_review(self, project_id: str, task_id: str,
+                           reviewer_id: str | None = None) -> None:
+        """Start review (submitted → reviewing). Store reviewer_id for obligations."""
+        task_id = await self.require_task_id(project_id, task_id)
         await self._transition(project_id, task_id, "reviewing")
+        if reviewer_id:
+            now_ms = int(time.time() * 1000)
+            await _execute(project_id,
+                "UPDATE tasks SET reviewer_id = ?, updated_at = ? WHERE id = ?",
+                [reviewer_id, now_ms, task_id])
 
     async def review_task(self, project_id: str, task_id: str, decision: str,
                           feedback: str | None = None,
@@ -670,6 +933,7 @@ class TaskService:
         feedback stored in evidence.review_feedback; reviewer_id stored in
         evidence.reviewed_by (merge 自有分支门 / VERIFY 独立性依赖它).
         """
+        task_id = await self.require_task_id(project_id, task_id)
         await _ensure_schema(project_id)
         decision = decision.lower()
         if decision not in ("approve", "rework"):
@@ -755,6 +1019,7 @@ class TaskService:
 
     async def close_task(self, project_id: str, task_id: str) -> None:
         """Close a task (approved|verifying → closed). Sets closed_at."""
+        task_id = await self.require_task_id(project_id, task_id)
         await self._transition(project_id, task_id, "closed")
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
@@ -791,6 +1056,7 @@ class TaskService:
         reason = (reason or "").strip()
         if not reason:
             raise ValueError("archive_task requires a non-empty reason (audit)")
+        task_id = await self.require_task_id(project_id, task_id)
         await _ensure_schema(project_id)
         rows = await _query(
             project_id,
@@ -813,15 +1079,18 @@ class TaskService:
             "reason": reason[:500],
         })
         await _execute_tx(project_id, [
-            ("UPDATE tasks SET is_archived = 1, archived_by = ?, "
-            "archived_reason = ?, archived_at = ?, wake_at = NULL, "
-            "updated_at = ? WHERE id = ?",
+            # 根因修复：归档时同步置终态 status='cancelled'，避免
+            # archived=1 但 status 停留在 verifying/submitted 等非终态
+            # 导致数据矛盾（直接查 DB / task_events 审计 / 外部脚本困惑）
+            ("UPDATE tasks SET is_archived = 1, status = 'cancelled', "
+            "archived_by = ?, archived_reason = ?, archived_at = ?, "
+            "wake_at = NULL, updated_at = ? WHERE id = ?",
             [archived_by, reason[:500], now_ms, now_ms, task_id]),
             ("INSERT INTO task_events (id, project_id, task_id, event_type, "
              "from_status, to_status, actor_id, payload, created_at) "
              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
              [event_id, project_id, task_id, "task.archived",
-              current, "archived", archived_by, arch_payload, now_ms]),
+              current, "cancelled", archived_by, arch_payload, now_ms]),
         ])
         log.info(
             "task_archived",
@@ -1102,7 +1371,7 @@ class TaskService:
     async def resolve_task_id(self, project_id: str, ref: str) -> str | None:
         """Resolve a task reference to a full UUID.
 
-        Accepts: full UUID, 8-char prefix (UI short id), or unique title substring.
+        Accepts: full UUID, 8-char prefix (UI short id).
         Returns None if not found / ambiguous.
         """
         await _ensure_schema(project_id)
@@ -1144,6 +1413,46 @@ class TaskService:
                     return open_ids[0]
                 return None  # ambiguous
         return None
+
+    async def require_task_id(self, project_id: str, ref: str) -> str:
+        """Resolve task ref or raise ValueError with candidates when ambiguous.
+
+        claim/submit/review/cancel/update must call this — agents often pass
+        the 8-char prefix shown in get_tasks lists.
+        """
+        raw = (ref or "").strip()
+        if not raw:
+            raise ValueError("Task id is required")
+        resolved = await self.resolve_task_id(project_id, raw)
+        if resolved:
+            return resolved
+        # Distinguish ambiguous vs missing for actionable errors
+        if len(raw) >= 8:
+            prefix = raw.lower().replace("-", "")
+            all_rows = await _query(
+                project_id,
+                "SELECT id, title, status FROM tasks WHERE "
+                "lower(id) LIKE ? OR replace(lower(id), '-', '') LIKE ? "
+                "LIMIT 8",
+                [f"{raw.lower()}%", f"{prefix}%"],
+            )
+            if len(all_rows) > 1:
+                bits = []
+                for r in all_rows[:5]:
+                    tid = r["id"] if isinstance(r, dict) else r[0]
+                    title = (
+                        (r["title"] if isinstance(r, dict) else "") or ""
+                    )[:30]
+                    bits.append(f"{tid[:8]}:{title}")
+                raise ValueError(
+                    f"Ambiguous task id prefix '{raw}' — matches "
+                    f"{len(all_rows)} tasks [{', '.join(bits)}]. "
+                    f"Pass the full UUID from get_tasks."
+                )
+        raise ValueError(
+            f"Task not found: {raw}. Copy the full id=… from get_tasks "
+            f"(8-char prefixes work only when unique)."
+        )
 
     async def get_task(self, project_id: str, task_id: str) -> dict | None:
         """Get a single task by id (full UUID or short prefix). Returns all fields or None."""
@@ -1231,11 +1540,14 @@ class TaskService:
         - As assignee: claimed | running | rework | verifying (VERIFY assignee)
           Assign = claim: assigned non-VERIFY tasks are promoted from created
           before this query. VERIFY stays created until merge/stale nudge.
+        - As reviewer: submitted | reviewing (TEST11 #3 — obligation from submit)
         - As creator: submitted | reviewing | approved
+          When reviewer_id is set and ≠ creator, review obligation sits on the
+          reviewer only (creator keeps approved → merge).
           approved (non-VERIFY) = must git_worktree_merge (CREATOR_MUST_MERGE).
           VERIFY children never stay as creator merge obligations.
         Excludes blocked / closed / archived.
-        Each dict includes role_hint: 'assignee' | 'creator'.
+        Each dict includes role_hint: 'assignee' | 'reviewer' | 'creator'.
         """
         await _ensure_schema(project_id)
         # Heal legacy assign-without-claim rows so obligations stay consistent
@@ -1252,10 +1564,11 @@ class TaskService:
             f"SELECT {self._COLUMNS} FROM tasks WHERE is_archived = 0 AND ("
             "  (assignee_id = ? AND status IN "
             "   ('claimed','running','rework','verifying'))"
+            "  OR (reviewer_id = ? AND status IN ('submitted','reviewing'))"
             "  OR (creator_id = ? AND status IN "
             "   ('submitted','reviewing','approved'))"
             ") ORDER BY updated_at DESC",
-            [agent_id, agent_id],
+            [agent_id, agent_id, agent_id],
         )
         out: list[dict] = []
         for r in rows:
@@ -1268,10 +1581,20 @@ class TaskService:
                 if status == "verifying" and not self._is_verify_task(d):
                     continue
                 d["role_hint"] = "assignee"
+            elif d.get("reviewer_id") == agent_id and status in (
+                "submitted", "reviewing",
+            ):
+                # reviewer obligation from submit onward (TEST11 #3)
+                d["role_hint"] = "reviewer"
             else:
                 # Creator merge obligation: skip VERIFY (closed on approve)
                 if status == "approved" and self._is_verify_task(d):
                     continue
+                # Designated reviewer ≠ creator owns the review window
+                if status in ("submitted", "reviewing"):
+                    rid = d.get("reviewer_id")
+                    if rid and rid != agent_id:
+                        continue
                 d["role_hint"] = "creator"
             out.append(d)
         return out

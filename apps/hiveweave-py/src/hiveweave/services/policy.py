@@ -125,15 +125,26 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
 }
 
 # Paths coordinators/HR may write without SOURCE_WRITE
+# Keep in sync with file.py allowed_subdirs + bash.py _ALLOWED_HW_SUBDIRS
+# (shared/reports/drafts; worktrees are agent-owned write sandboxes)
 COORDINATOR_WRITE_PREFIXES = (
     "docs/",
     "doc/",
     ".hiveweave/shared/",
+    ".hiveweave/reports/",
+    ".hiveweave/drafts/",
     "README.md",
     "README",
     "CHANGELOG",
     "AGENTS.md",
     "CLAUDE.md",
+)
+
+# Substrings that mark allowed .hiveweave work dirs even in absolute paths
+_HW_WRITE_MARKERS = (
+    "/.hiveweave/shared/",
+    "/.hiveweave/reports/",
+    "/.hiveweave/drafts/",
 )
 
 
@@ -216,8 +227,19 @@ def write_path_allowed(agent: dict[str, Any], file_path: str) -> str | None:
     if Capability.SOURCE_WRITE in caps:
         return None  # executors may write anywhere in sandbox
 
-    # Coordinators / HR without source_write: docs & shared only
-    norm = (file_path or "").replace("\\", "/").lstrip("./")
+    # Coordinators / HR without source_write: docs & shared/reports/drafts
+    from hiveweave.tools.file import normalize_input_path
+
+    # Do NOT use str.lstrip("./") — that strips every leading '.' and breaks
+    # ".hiveweave/…" into "hiveweave/…" (TEST11 evening P3-2).
+    norm = normalize_input_path(file_path or "").replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    # Absolute MSYS/Windows paths: allow if they land under shared/reports/drafts
+    check = norm if norm.startswith("/") else f"/{norm}"
+    for marker in _HW_WRITE_MARKERS:
+        if marker in check:
+            return None
     for prefix in COORDINATOR_WRITE_PREFIXES:
         if prefix.endswith("/"):
             if norm.startswith(prefix) or norm == prefix.rstrip("/"):
@@ -231,8 +253,8 @@ def write_path_allowed(agent: dict[str, Any], file_path: str) -> str | None:
         return None
     return (
         f"Hard scope deny: write_file path '{file_path}' requires source_write "
-        f"or must be under docs/ / .hiveweave/shared/ (role_family="
-        f"{infer_role_family(agent)})"
+        f"or must be under docs/ / .hiveweave/{{shared,reports,drafts}}/ "
+        f"(role_family={infer_role_family(agent)})"
     )
 
 

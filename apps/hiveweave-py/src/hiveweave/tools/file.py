@@ -72,6 +72,27 @@ READ_PATH_TOOLS: frozenset[str] = frozenset({
     "search_files",
 })
 
+# Git Bash / MSYS2 drive paths: /d/PC_AI/... → D:/PC_AI/...
+# Agents copy these from bash output into read_file/write_file; Path() on
+# Windows does not map them to the real drive, so sandbox checks false-deny.
+_MSYS_DRIVE = re.compile(r"^/([a-zA-Z])(/|$)")
+
+
+def normalize_input_path(p: str) -> str:
+    """Normalize agent-supplied paths (MSYS2 / Git Bash → Windows-friendly).
+
+    ``/d/PC_AI/Project/X`` → ``D:/PC_AI/Project/X``. Backslashes become
+    forward slashes for consistent prefix checks. Relative paths unchanged.
+    """
+    if not p:
+        return p
+    s = p.replace("\\", "/")
+    if _MSYS_DRIVE.match(s):
+        return _MSYS_DRIVE.sub(
+            lambda m: m.group(1).upper() + ":/", s, count=1
+        )
+    return s
+
 
 def infer_project_root(workspace_path: str) -> str:
     """Derive the project root from an agent workspace.
@@ -96,13 +117,16 @@ def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
     """
     if not file_path:
         return None
+    file_path = normalize_input_path(file_path)
     try:
         ws = Path(workspace_path).resolve()
         # Disallow absolute paths that point outside workspace
         candidate = Path(file_path)
         if candidate.is_absolute():
             try:
-                rel = candidate.relative_to(ws)
+                # Resolve absolute first so D:/… and /d/… (normalized) compare
+                abs_cand = candidate.resolve()
+                rel = abs_cand.relative_to(ws)
                 full = ws / rel
             except ValueError:
                 return None
@@ -135,6 +159,7 @@ def resolve_for_read(
     write_ws = Path(write_workspace).resolve()
     if not file_path:
         return str(write_ws)
+    file_path = normalize_input_path(file_path)
     try:
         candidate = Path(file_path)
         if candidate.is_absolute():

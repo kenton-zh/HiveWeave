@@ -189,9 +189,8 @@ class TaskToolsMixin:
     ) -> dict:
         """update_task_status: set task to 'running' (start/unblock) or 'blocked'.
 
-        Simplified: LLM doesn't know the current state, so for 'running' we
-        try start_task (claimed -> running) first, then fall back to
-        unblock_task (blocked -> running).
+        Deterministic by current status (TEST11 #5-L1): blocked → unblock_task
+        (clears wait metadata); otherwise start_task (claimed → running).
         """
         task_id = args.get("taskId") or ""
         status = (args.get("status") or "").lower()
@@ -212,28 +211,44 @@ class TaskToolsMixin:
                     or args.get("blocked_reason")
                     or "Blocked by agent"
                 )
-                await ts.block_task(project_id, task_id, reason)
+                dep = (
+                    args.get("dependsOnTaskId")
+                    or args.get("depends_on_task_id")
+                )
+                await ts.block_task(
+                    project_id, task_id, reason, depends_on_task_id=dep
+                )
+                warn = ""
+                if (reason or "").strip().lower().startswith("dependency:"):
+                    import re as _re
+                    has_id = bool(_re.search(r"[0-9a-fA-F-]{8,}", reason))
+                    if not dep and not has_id:
+                        warn = (
+                            " WARNING: dependency block without task id — "
+                            "cannot auto-wake; pass dependsOnTaskId or include "
+                            "the blocker task id in blockedReason."
+                        )
                 return {
                     "success": True,
-                    "output": f"Task {task_id} blocked: {reason}",
+                    "output": f"Task {task_id} blocked: {reason}{warn}",
                     "error": None,
                 }
-            # status == "running": try start (claimed->running), fallback unblock
-            try:
-                await ts.start_task(project_id, task_id)
-                return {
-                    "success": True,
-                    "output": f"Task {task_id} started (running).",
-                    "error": None,
-                }
-            except ValueError:
-                # Not in 'claimed' state -- try unblock (blocked -> running)
+            # status == "running": dispatch by current state
+            cur = await ts.get_task(project_id, task_id)
+            cur_status = (cur or {}).get("status")
+            if cur_status == "blocked":
                 await ts.unblock_task(project_id, task_id)
                 return {
                     "success": True,
                     "output": f"Task {task_id} unblocked (running).",
                     "error": None,
                 }
+            await ts.start_task(project_id, task_id)
+            return {
+                "success": True,
+                "output": f"Task {task_id} started (running).",
+                "error": None,
+            }
         except Exception as e:
             return self._error(f"Failed to update task status: {e}")
 
@@ -335,13 +350,14 @@ class TaskToolsMixin:
                 return self._error(f"Task not found: {task_id}")
             current_status = task["status"]
             if current_status == "submitted":
-                await ts.start_review(project_id, task_id)  # submitted -> reviewing
+                await ts.start_review(project_id, task_id, reviewer_id=agent_id)  # submitted -> reviewing
             elif current_status != "reviewing":
                 return self._error(
                     f"Task must be 'submitted' or 'reviewing' to review, "
                     f"but is '{current_status}'"
                 )
-            await ts.review_task(project_id, task_id, decision, feedback)
+            await ts.review_task(project_id, task_id, decision, feedback,
+                                reviewer_id=agent_id)
             if decision == "approve":
                 return {
                     "success": True,
@@ -797,11 +813,23 @@ class UpdateTaskStatusParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["blockedReason", "blocked_reason", "reason"]},
     )
+    depends_on_task_id: str | None = Field(
+        default=None,
+        alias="dependsOnTaskId",
+        description=(
+            "When blocking on a dependency, the blocker task id. Enables "
+            "auto-unblock when that task is approved/closed."
+        ),
+        json_schema_extra={
+            "aliases": ["dependsOnTaskId", "depends_on_task_id", "dependsOn"]
+        },
+    )
 
 
 @tool(
     "update_task_status",
-    "Set task to 'running' (start/unblock) or 'blocked'. For 'running', tries start_task first, then falls back to unblock_task.",
+    "Set task to 'running' (start/unblock) or 'blocked'. For 'running', "
+    "unblocks if currently blocked (clears wait metadata), else starts.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -823,16 +851,33 @@ async def update_task_status_tool(
     try:
         if status == "blocked":
             reason = params.blocked_reason or "Blocked by agent"
-            await ts.block_task(project_id, params.task_id, reason)
-            return ToolResult.ok(f"Task {params.task_id} blocked: {reason}")
-        # status == "running": try start (claimed->running), fallback unblock
-        try:
-            await ts.start_task(project_id, params.task_id)
-            return ToolResult.ok(f"Task {params.task_id} started (running).")
-        except ValueError:
-            # Not in 'claimed' state -- try unblock (blocked -> running)
+            dep = params.depends_on_task_id
+            await ts.block_task(
+                project_id, params.task_id, reason, depends_on_task_id=dep
+            )
+            warn = ""
+            if reason.strip().lower().startswith("dependency:"):
+                import re as _re
+                has_id = bool(_re.search(r"[0-9a-fA-F-]{8,}", reason))
+                if not dep and not has_id:
+                    warn = (
+                        " WARNING: dependency block without task id — "
+                        "cannot auto-wake; pass dependsOnTaskId or include "
+                        "the blocker task id in blockedReason."
+                    )
+            return ToolResult.ok(
+                f"Task {params.task_id} blocked: {reason}{warn}"
+            )
+        # status == "running": deterministic by current state (TEST11 #5-L1)
+        cur = await ts.get_task(project_id, params.task_id)
+        cur_status = (cur or {}).get("status")
+        if cur_status == "blocked":
             await ts.unblock_task(project_id, params.task_id)
-            return ToolResult.ok(f"Task {params.task_id} unblocked (running).")
+            return ToolResult.ok(
+                f"Task {params.task_id} unblocked (running)."
+            )
+        await ts.start_task(project_id, params.task_id)
+        return ToolResult.ok(f"Task {params.task_id} started (running).")
     except Exception as e:
         return ToolResult.err(f"Failed to update task status: {e}")
 
@@ -1365,7 +1410,7 @@ async def review_task_tool(
         current_status = task["status"]
         if decision == "approve":
             if current_status == "submitted":
-                await ts.start_review(project_id, params.task_id)
+                await ts.start_review(project_id, params.task_id, reviewer_id=agent_id)
             elif current_status != "reviewing":
                 return ToolResult.err(
                     f"Task must be 'submitted' or 'reviewing' to approve, "
@@ -1374,7 +1419,7 @@ async def review_task_tool(
         else:
             # rework from reviewing (normal) or approved (post-approve merge conflict)
             if current_status == "submitted":
-                await ts.start_review(project_id, params.task_id)
+                await ts.start_review(project_id, params.task_id, reviewer_id=agent_id)
             elif current_status not in ("reviewing", "approved"):
                 return ToolResult.err(
                     f"Task must be 'submitted', 'reviewing', or 'approved' "
@@ -1916,6 +1961,27 @@ async def _spawn_post_approve_verify_task(
         # merged_by 供 review_task 的 VERIFY 独立审门排除合并人。
         evidence={"merged_by": str(reviewer_id)} if reviewer_id else None,
     )
+
+    # Pin reviewer_id = CEO creator at spawn (TEST11 audit H5) so review
+    # obligations are visible before QA submit; QA is assignee, not reviewer.
+    if verify_id and creator_id:
+        try:
+            import time as _time
+
+            now_ms = int(_time.time() * 1000)
+            from hiveweave.services import task as task_module
+
+            await task_module._execute(
+                project_id,
+                "UPDATE tasks SET reviewer_id = ?, updated_at = ? WHERE id = ?",
+                [creator_id, now_ms, verify_id],
+            )
+        except Exception as e:
+            log.warning(
+                "verify_reviewer_pin_failed",
+                verify_id=verify_id,
+                error=str(e),
+            )
 
     # Create verification case — single authoritative entity linking
     # original_task → verify_task → merger → QA
@@ -2587,18 +2653,56 @@ async def get_tasks_tool(
             project_id, status=params.status, assignee_id=params.assignee_id
         )
         if not tasks:
-            return ToolResult.ok("No tasks found matching the filters.", tasks=[])
-        lines = []
+            body = "No tasks found matching the filters."
+            try:
+                from hiveweave.llm.streamer import _build_obligations_snapshot
+                snap = await _build_obligations_snapshot(agent_id)
+                if snap:
+                    body += snap
+            except Exception:
+                pass
+            return ToolResult.ok(body, tasks=[])
+        lines = [
+            "Tip: claim/submit/review/cancel accept full UUID or unique "
+            "8-char prefix — prefer copying the full id= value."
+        ]
         for t in tasks:
+            tid = str(t.get("id") or "")
             lines.append(
                 f"- [{t.get('status', '?')}] {t.get('title', '?')} "
-                f"(id={t.get('id', '?')}, "
+                f"(id={tid}, short={tid[:8]}, "
                 f"progress={t.get('progress', 0)}%, "
                 f"assignee={t.get('assignee_id') or 'unassigned'})"
             )
-        return ToolResult.ok(
-            f"Tasks ({len(tasks)}):\n" + "\n".join(lines),
-            tasks=tasks,
-        )
+        # Informational (TEST11 #7): creator tracking of running work —
+        # not an obligation, just a Lead visibility partition.
+        tracking = [
+            t for t in tasks
+            if t.get("creator_id") == agent_id
+            and t.get("status") == "running"
+            and t.get("assignee_id") != agent_id
+        ]
+        if tracking and not params.assignee_id:
+            lines.append(
+                "\n[tracking] Created by you, currently running "
+                "(informational — not your review obligation):"
+            )
+            for t in tracking[:10]:
+                tid = str(t.get("id") or "")
+                lines.append(
+                    f"  · {t.get('title', '?')[:40]} "
+                    f"(id={tid}, "
+                    f"assignee={str(t.get('assignee_id') or '?')[:12]}, "
+                    f"progress={t.get('progress', 0)}%)"
+                )
+        body = f"Tasks ({len(tasks)}):\n" + "\n".join(lines)
+        try:
+            from hiveweave.llm.streamer import _build_obligations_snapshot
+            snap = await _build_obligations_snapshot(agent_id)
+            if snap:
+                body += snap
+        except Exception:
+            pass
+        return ToolResult.ok(body, tasks=tasks)
     except Exception as e:
         return ToolResult.err(f"Failed to list tasks: {e}")

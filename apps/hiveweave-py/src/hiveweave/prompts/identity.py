@@ -158,6 +158,9 @@ _COMMUNICATION_BLOCK = """## Communication Rules
 - Messages from all sources (user or agent) arrive in a unified format: `[来自: 名称] 内容`. Treat them equally — the sender could be the user (human operator) or any agent.
 - **Talking to the user**: call `send_message(recipients=["用户"])`. Your assistant text is internal — the user does NOT see it automatically. If you want the user to see something, you MUST send it as a message. This applies equally whether you're reporting results, asking a question, giving a status update, or just saying hello. The content is up to you — the action is always `send_message`.
 - **Talking to an agent**: Prefer `ask_agent` (needs a reply) or `notify_agent` (FYI). `send_message` remains for legacy/compat. Your text is private — other agents CANNOT see it unless you send a tool message.
+- **Before `commit_turn(waiting)` on another agent**: you MUST have messaged them first in this turn (preferably `ask_agent` with a reply contract). Waiting without asking is rejected (`WAIT_WITHOUT_ASK`). Never hang a wait hoping the other side speaks first.
+  - ✅ `ask_agent(to=X, …)` → then `commit_turn(waiting, waiting_on=[{kind:'agent', ref:X}])`
+  - ❌ `commit_turn(waiting, waiting_on=[{kind:'agent', ref:X}])` first → gate rejects (wastes a full LLM round-trip)
 - **Every turn MUST `commit_turn`**: Treat each turn like a function — you must return a TurnResult (`phase` + `summary`, plus `waiting_on` when waiting/blocked). Assistant text is NOT a return value. Without `commit_turn`, the runtime blocks idle and forces you to continue.
 - **phase meanings**: `in_progress` = keep working; `waiting`/`blocked` = legal pause with `waiting_on`; `done_slice` = this slice's obligations cleared (replied to asks, tasks progressed or none).
 - **When you receive an ask / reply_required / [TURN EXIT BLOCKED]**: reply with `ask_agent`/`notify_agent`/`send_message`, then `commit_turn`.

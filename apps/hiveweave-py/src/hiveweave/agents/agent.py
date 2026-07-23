@@ -335,12 +335,16 @@ class Agent:
                     pass
                 if self.status == AgentState.IDLE:
                     if self._resume_suppressed:
-                        log.debug(
-                            "inbox_watcher_suppressed_skip",
-                            agent_id=self.id,
-                        )
-                        await asyncio.sleep(INTERVAL_S)
-                        continue
+                        # 被动衰减检查：30min 过期则清除锁存器，落入正常处理
+                        if self.try_clear_resume_suppressed(
+                            opts={"trigger": True}
+                        ):
+                            log.debug(
+                                "inbox_watcher_suppressed_skip",
+                                agent_id=self.id,
+                            )
+                            await asyncio.sleep(INTERVAL_S)
+                            continue
                     if self._in_resume_cooldown():
                         log.debug(
                             "inbox_watcher_cooldown_skip",
@@ -632,21 +636,34 @@ class Agent:
                     clear_task_advance_deferred(self.id)
                 except Exception:
                     pass
+                # Clear wait contracts only on user wakes or wait-satisfaction
+                # wakes — NOT on stall/ledger/watchdog triggers (TEST11 audit C2).
+                # Stall nudges must not wipe a legal waiting_on agent contract.
+                _CLEAR_WAIT_SOURCES = frozenset({
+                    "", "user", "chat",
+                    "wait_timeout", "wait_cycle", "wait_satisfied",
+                    "message_from_ref",
+                })
+                should_clear_waits = (
+                    bool(opts.get("clear_waits"))
+                    or not opts.get("trigger")
+                    or source in _CLEAR_WAIT_SOURCES
+                )
+                if should_clear_waits:
+                    try:
+                        from hiveweave.services.wait_contract import (
+                            wait_contract_service,
+                        )
+
+                        await wait_contract_service.clear_waits(
+                            self.project_id, self.id
+                        )
+                    except Exception as e:
+                        log.debug("clear_waits_on_wake_failed", error=str(e))
                 if source in ("user", "chat", "") or not opts.get("trigger"):
                     # User-facing chat clears waiting_human into runnable while processing
                     if self.disposition == "waiting_human" and not opts.get("trigger"):
                         self.disposition = "runnable"
-                        # Clear wait contracts on user-driven wake
-                        try:
-                            from hiveweave.services.wait_contract import (
-                                wait_contract_service,
-                            )
-
-                            await wait_contract_service.clear_waits(
-                                self.project_id, self.id
-                            )
-                        except Exception as e:
-                            log.debug("clear_waits_on_user_wake_failed", error=str(e))
             self.visibility = (
                 "system" if source in ("turn_exit_gate", "open_task_reminder")
                 else "foreground" if not opts.get("trigger") else "background"
@@ -1568,7 +1585,6 @@ class Agent:
                     m.get("created_at")
                     for m in pending_msgs
                     if m.get("expect_report")
-                    or (m.get("message_type") or "").lower() == "ask"
                 ]
                 expect_ts = [
                     t for t in expect_ts if isinstance(t, (int, float)) and t
@@ -1592,6 +1608,30 @@ class Agent:
             exempt_senders=exempt_senders,
             replied_contracts=replied_contracts,
         )
+
+        # TEST11 #1a: evidence for WAIT_WITHOUT_ASK
+        outbound_ask_refs: set[str] = set()
+        try:
+            outbound_ask_refs = await self._inbox.get_outstanding_ask_recipients(
+                self.id
+            )
+        except Exception as e:
+            log.debug("outbound_ask_refs_failed", error=str(e))
+        # Enrich messaged_refs with display names for ref matching
+        messaged_refs = set(sent_to)
+        for aid in list(sent_to):
+            if aid in name_by_id:
+                messaged_refs.add(name_by_id[aid])
+        for aid in list(outbound_ask_refs):
+            if aid not in name_by_id:
+                try:
+                    ag = await meta_db.get_agent_by_id(aid)
+                    if ag and ag.get("name"):
+                        name_by_id[aid] = ag["name"]
+                except Exception:
+                    pass
+            if aid in name_by_id:
+                outbound_ask_refs.add(name_by_id[aid])
 
         # ── P1 escape valve(TEST10): 连续 N 次被 UNREPLIED_ASKS 阻塞后强制降级 ──
         # 防止 ask 合约因 LLM 不理解 reply_to 参数而永久死锁。
@@ -1648,6 +1688,9 @@ class Agent:
                 unreplied_asks=unreplied_asks,
                 open_task_obligations=open_obligations,
                 tasks_advanced=tasks_advanced,
+                messaged_refs=messaged_refs,
+                outbound_ask_refs=outbound_ask_refs,
+                name_by_id=name_by_id,
             )
         )
 
@@ -2035,6 +2078,28 @@ class Agent:
             return True
         return not (names & substantive)
 
+    async def _enrich_hint_with_inbox(self, hint: str) -> str:
+        """修 #2: 把未读 inbox 消息摘要拼进 hint，避免 retrigger 时遗漏紧急消息。"""
+        try:
+            pending = await self._inbox.get_pending_messages(self.id)
+        except Exception:
+            return hint
+        if not pending:
+            return hint
+        # 构建简洁摘要：发件人 + 消息预览（截断）
+        lines: list[str] = []
+        for msg in pending[:5]:  # 最多 5 条，避免 hint 过长
+            sender = msg.get("from_agent_name") or msg.get("from_agent_id", "?")
+            if isinstance(sender, str) and len(sender) > 12:
+                sender = sender[:12]
+            preview = (msg.get("message") or "")[:80]
+            lines.append(f"  - {sender}: {preview}")
+        summary = "\n".join(lines)
+        return (
+            f"{hint}\n\n"
+            f"[INBOX] 处理上述事项之前，先查看以下未读消息：\n{summary}"
+        )
+
     async def _retrigger_for_turn_gate(
         self, hint: str, *, inbox_msg_ids: list[str] | None = None
     ) -> None:
@@ -2044,6 +2109,8 @@ class Agent:
             return
         if self.status != AgentState.IDLE:
             return
+        # 修 #2: retrigger 前查 inbox，把未读消息摘要拼进 hint
+        hint = await self._enrich_hint_with_inbox(hint)
         log.info("turn_gate_retrigger", agent_id=self.id)
         opts: dict = {
             "trigger": True,
@@ -2877,12 +2944,11 @@ class Agent:
         msg_ids_set = set(self.pending_inbox_msg_ids)
         target_msgs = [m for m in pending if m["id"] in msg_ids_set]
 
-        # Structural only: expect_report or message_type=ask (language-agnostic)
+        # Structural only: expect_report (ask-chain downgrade clears it)
         expect_reply_msgs = [
             m
             for m in target_msgs
             if m.get("expect_report")
-            or (m.get("message_type") or "").lower() == "ask"
         ]
         if not expect_reply_msgs:
             return []
@@ -2963,7 +3029,6 @@ class Agent:
                 and m["id"] not in unreplied_ids
                 and (
                     m.get("expect_report")
-                    or (m.get("message_type") or "").lower() == "ask"
                 )
             ]
             # 批量解析
@@ -3096,6 +3161,8 @@ class Agent:
             return
         if self.status != AgentState.IDLE:
             return
+        # 修 #2: retrigger 前查 inbox，把未读消息摘要拼进 hint
+        hint = await self._enrich_hint_with_inbox(hint)
         log.info("open_task_retrigger", agent_id=self.id)
         asyncio.create_task(
             self.chat(
@@ -3123,8 +3190,10 @@ class Agent:
         await asyncio.sleep(SELF_RETRIGGER_DELAY_MS / 1000.0)
 
         if self._resume_suppressed:
-            log.info("self_retrigger_suppressed_skip", agent_id=self.id)
-            return
+            # 被动衰减检查：30min 过期则清除锁存器，继续自检
+            if self.try_clear_resume_suppressed(opts={"trigger": True}):
+                log.info("self_retrigger_suppressed_skip", agent_id=self.id)
+                return
 
         if self.disposition == "complete":
             log.info("self_retrigger_complete_skip", agent_id=self.id)
@@ -3392,6 +3461,19 @@ class Agent:
             "idle",
             {"disposition": self.disposition},
         )
+        # 根因修复：安全网 — 回到 idle 时若有残留 streaming msg_id，
+        # 异步清除 DB 标志（不阻塞 reset）。_finalize_streaming_turn
+        # 正常路径应已清除，此处仅兜底防漏
+        if self._streaming_msg_id is not None:
+            orphan_id = self._streaming_msg_id
+            self._streaming_msg_id = None
+            asyncio.create_task(
+                self._chat_msg.finalize_streaming_message(
+                    self.id, orphan_id, None,
+                    allow_agent_wide_fallback=False,
+                ),
+                name=f"agent-{self.id}-orphan-streaming-cleanup",
+            )
 
     # ── 内部: 回调 ───────────────────────────────────────────
 
@@ -3581,7 +3663,9 @@ class Agent:
             "role": "tool",
             "content": content,
             "tool_call_id": tool_call_id,
-            # success 透传给 streamer（doom 检测的失败重试豁免需要真实错误信号；
-            # 该键不会进入发给 LLM 的消息体 —— _execute_tools 重新组包）
+            # success / duplicate 透传给 streamer（doom 检测：success 标识失败
+            # 调用，duplicate 标识同参已执行过无新效果）。这两个键不会进入
+            # 发给 LLM 的消息体 —— _execute_tools 重新组包时剥离。
             "success": result.get("success", False),
+            "duplicate": result.get("duplicate", False),
         }

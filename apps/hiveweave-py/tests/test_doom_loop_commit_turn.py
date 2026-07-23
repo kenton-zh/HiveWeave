@@ -1,4 +1,4 @@
-"""Doom loop: same-args fingerprint + gate-retry exemption (TEST4)."""
+"""Doom loop: same-args fingerprint + narrowed exemption (TEST4, 修 #1)."""
 
 from hiveweave.llm.streamer import Streamer, doom_loop_limit
 
@@ -8,7 +8,7 @@ def test_commit_turn_limit_is_eight():
 
 
 def test_detect_doom_same_args_fingerprint():
-    tracker: dict = {"last_key": None, "count": 0, "last_errored": False}
+    tracker: dict = {"last_key": None, "count": 0}
     args = '{"phase":"waiting","summary":"x"}'
     for i in range(7):
         doom = Streamer._detect_doom_loop(
@@ -24,7 +24,7 @@ def test_detect_doom_same_args_fingerprint():
 
 
 def test_detect_doom_resets_on_different_args():
-    tracker: dict = {"last_key": None, "count": 0, "last_errored": False}
+    tracker: dict = {"last_key": None, "count": 0}
     for i in range(5):
         Streamer._detect_doom_loop(
             [
@@ -39,11 +39,11 @@ def test_detect_doom_resets_on_different_args():
     assert tracker["count"] == 1  # each different summary resets
 
 
-def test_detect_doom_exempts_after_error():
+def test_detect_doom_no_exemption_after_error():
+    """修 #1: 失败后同参数重试不再豁免，count 照常增长。"""
     tracker: dict = {
         "last_key": ("commit_turn", '{"phase":"done_slice","summary":"a"}'),
         "count": 7,
-        "last_errored": True,
     }
     doom = Streamer._detect_doom_loop(
         [
@@ -55,7 +55,6 @@ def test_detect_doom_exempts_after_error():
         ],
         tracker,
     )
-    # Failed retry does not increment — still below limit after exemption
-    assert doom is None
-    assert tracker["count"] == 7
-    assert tracker["last_errored"] is False
+    # 同参数重试不再豁免：count 8 → 触发 doom
+    assert doom == "commit_turn"
+    assert tracker["count"] == 8
