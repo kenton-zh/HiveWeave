@@ -43,30 +43,17 @@ async def resolve_agent_id(
 ) -> str | None:
     """Resolve agent name/short_id/UUID to a real agent_id within a project.
 
-    Priority: UUID exact -> short_id -> UUID prefix -> name -> role.
+    Priority: UUID exact -> short_id -> UUID prefix -> 花名 -> role.
     Returns the agent_id (UUID) or None if not found.
     """
     if not name_or_id:
         return None
-    inp = name_or_id.strip()
 
-    # Use OrgService if provided, otherwise create one
     if org_service is None:
         from hiveweave.services.org import OrgService
         org_service = OrgService()
 
-    # 1. Try resolve_agent (handles UUID, short_id, UUID prefix)
-    agent = await org_service.resolve_agent(inp)
-    if agent and agent.get("project_id") == project_id:
+    agent = await org_service.resolve_agent_ref(project_id, name_or_id)
+    if agent:
         return agent["id"]
-
-    # 2. Try name / role match within the project
-    all_agents = await org_service.list_agents(project_id)
-    for a in all_agents:
-        if a.get("name", "").lower() == inp.lower():
-            return a["id"]
-    for a in all_agents:
-        if a.get("role", "").lower() == inp.lower():
-            return a["id"]
-
     return None

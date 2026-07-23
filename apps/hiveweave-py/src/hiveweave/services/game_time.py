@@ -49,6 +49,9 @@ AWAITING_REPLY_MS = 3 * 60 * 1000     # 3 min
 SILENCE_THRESHOLD_MS = 10 * 60 * 1000        # 10 min 无任何产出判定失联
 SILENCE_NOTIFY_MS = 30 * 60 * 1000           # 失联持续 30 min 升级通知上级
 SILENCE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000  # 同一 agent 上级通知 30 min 冷却
+# 修 #4: 未激活 agent 检测 — created_at 超过阈值且 activated_at IS NULL
+DEAD_AGENT_THRESHOLD_MS = 5 * 60 * 1000   # 5 min 未激活 → 重试 start_agent
+DEAD_AGENT_MAX_RETRIES = 3                 # 连续失败 3 次后升级给 CEO
 # 合法等待 disposition（commit_turn 落盘 wait contract 时的内存映射，见 turn_exit）
 _WAITING_DISPOSITIONS = frozenset({
     "waiting_human", "waiting_agent", "waiting_timer", "blocked",
@@ -65,6 +68,9 @@ TASK_STALL_THRESHOLDS = {
     "claimed":    5 * 60 * 1000,   # 5 min: assignee 该开始
 }
 TASK_STALL_COOLDOWN_MS = 15 * 60 * 1000  # 15 min: 同一 task 不重复催
+BLOCKED_STALE_MS = 30 * 60 * 1000        # 30 min: blocked 无法判定依赖时催办
+WAIT_CYCLE_ESCALATION_MS = 30 * 60 * 1000  # 同成员集合 30min 内第 2 次成环升级
+DEAD_AGENT_WAKE_COOLDOWN_MS = 15 * 60 * 1000  # same agent dead-check at most every 15 min
 
 # Ledger re-nudge (replaces disabled stall NL nudges) — structured fields only
 LEDGER_REVIEW_STALE_MS = 10 * 60 * 1000   # submitted|reviewing
@@ -200,6 +206,14 @@ class GameTimeService:
             await self.recover_wait_timeouts(project_id)
         except Exception as e:
             log.warning("wait_recovery_on_start_failed",
+                        project_id=project_id, error=str(e))
+        # 根因修复：game_time 启动时立即扫一次 streaming zombie，
+        # 不等 30s tick。项目未激活期间 game_time 不运行，zombie
+        # 会持续存在；激活后应立即清理而非等待首个扫描周期
+        try:
+            await self._sweep_orphan_streaming(project_id)
+        except Exception as e:
+            log.warning("startup_streaming_sweep_failed",
                         project_id=project_id, error=str(e))
 
     async def stop(self, project_id: str) -> None:
@@ -359,6 +373,21 @@ class GameTimeService:
                     project_id=project_id,
                     error=str(e),
                 )
+            # TEST11 #8: blocked reconciliation (depends_on met / timer expired)
+            try:
+                await self._reconcile_blocked_tasks(project_id)
+            except Exception as e:
+                log.error(
+                    "blocked_reconcile_failed",
+                    project_id=project_id,
+                    error=str(e),
+                )
+            # 修 #4: 未激活 agent reconciliation — start_agent 失败的兜底
+            try:
+                await self._check_dead_agents(project_id)
+            except Exception as e:
+                log.error("dead_agent_check_failed",
+                          project_id=project_id, error=str(e))
             # 沉默观测（失联检测）：独立 try/except，故障不拖累既有看门狗
             try:
                 await self._check_silent_agents(project_id)
@@ -495,52 +524,102 @@ class GameTimeService:
         breaks = await wait_contract_service.break_wait_cycles(
             project_id, resolve_ref
         )
+        now_ms = int(time.time() * 1000)
+        state = _states.get(project_id)
+        cycle_counts: dict[str, list[int]] = {}
+        if state is not None:
+            cycle_counts = state.setdefault("cycle_break_counts", {})
+
         for b in breaks:
             members = list(b.get("memberIds") or b.get("cycle") or [])
             cycle = b.get("cycle") or members
             if not members and b.get("breakerId"):
                 members = [b["breakerId"]]
+            wake_first = (
+                b.get("wakeFirstId") or b.get("breakerId") or (members[0] if members else "")
+            )
+            # TEST11 #1c: same member set broken twice in 30min → escalate
+            key = "|".join(sorted(str(m) for m in members if m))
+            history = [t for t in cycle_counts.get(key, []) if now_ms - t < WAIT_CYCLE_ESCALATION_MS]
+            history.append(now_ms)
+            cycle_counts[key] = history
+            escalate = len(history) >= 2
+
+            # TEST11 #1b: asymmetric wake — only earliest waiter is woken with
+            # instructional message; others stay parked until messaged.
             for member in members:
                 if not member:
                     continue
+                is_primary = member == wake_first
+                others = [m for m in members if m and m != member]
+                other_label = ",".join(o[:8] for o in others[:3]) or "peer"
+                if is_primary:
+                    msg = (
+                        f"[WAIT_CYCLE] Deadlock broken among {cycle}. "
+                        f"**Contact/reply to {other_label} first** — "
+                        f"do not immediately re-wait. Ask with ask_agent."
+                    )
+                else:
+                    msg = (
+                        f"[WAIT_CYCLE] Deadlock broken among {cycle}. "
+                        f"Your waits were cleared. Stay parked — "
+                        f"{(wake_first or '?')[:8]} will contact you first."
+                    )
                 try:
                     await inbox.send_message(
                         from_agent_id="system",
                         to_agent_id=member,
-                        message=(
-                            f"[WAIT_CYCLE] Deadlock broken among {cycle}. "
-                            "Your waits were cleared — resume or re-wait."
-                        ),
+                        message=msg,
                         message_type="system",
                         priority="urgent",
-                        wake=True,
+                        wake=is_primary,
                     )
-                    await self._watchdog_trigger(member)
+                    if is_primary:
+                        await self._watchdog_trigger(member)
                 except Exception as e:
                     log.warning(
                         "wait_cycle_notify_failed",
                         member=member,
                         error=str(e),
                     )
-            # Ping common superior (parent of first member) if outside cycle
-            breaker = members[0] if members else ""
+
+            # Ping common superior (parent of wake_first) if outside cycle
             parent_id = None
             for a in agents:
-                if a.get("id") == breaker:
+                if a.get("id") == wake_first:
                     parent_id = a.get("parent_id")
                     break
             if parent_id and parent_id not in cycle:
                 try:
+                    esc_prefix = (
+                        "[WAIT_CYCLE_ESCALATION] " if escalate else "[WAIT_CYCLE] "
+                    )
+                    body = (
+                        f"{esc_prefix}Subordinate wait deadlock broken "
+                        f"(cycle={cycle}, wake_first={wake_first[:8] if wake_first else '?'})."
+                    )
+                    if escalate:
+                        body += (
+                            " Same members re-deadlocked within 30min — "
+                            "please assign explicit turn order."
+                        )
                     await inbox.send_message(
                         from_agent_id="system",
                         to_agent_id=parent_id,
-                        message=(
-                            f"[WAIT_CYCLE] Subordinate wait deadlock broken "
-                            f"(cycle={cycle})."
-                        ),
+                        message=body,
                         message_type="system",
-                        priority="normal",
+                        priority="urgent" if escalate else "normal",
+                        wake=escalate,
                     )
+                    if escalate:
+                        await self._watchdog_trigger(parent_id)
+                        log.info(
+                            "wait_cycle_escalation",
+                            project_id=project_id,
+                            members=members,
+                            escalated_to=parent_id,
+                            break_count=len(history),
+                        )
                 except Exception:
                     pass
 
@@ -716,10 +795,15 @@ class GameTimeService:
                 return True
             return False
 
-        # ── submitted|reviewing → [LEDGER REVIEW] ──
+        # ── submitted|reviewing → [LEDGER REVIEW] + escalation (修 #5) ──
+        review_nudge_counts: dict[str, int] = state.setdefault(
+            "review_nudge_counts", {}
+        )
         for t in tasks:
             status = t.get("status")
             if status not in ("submitted", "reviewing"):
+                # 任务已离开 submitted/reviewing，重置计数
+                review_nudge_counts.pop(str(t.get("id") or ""), None)
                 continue
             if _effective_age_ms(t) < LEDGER_REVIEW_STALE_MS:
                 continue
@@ -730,29 +814,92 @@ class GameTimeService:
             if not _cooled(f"review:{tid}", LEDGER_NUDGE_COOLDOWN_MS):
                 continue
             title = (t.get("title") or "(untitled)").split("\n")[0][:50]
-            body = (
-                f"[LEDGER REVIEW] Task '{title}' ({tid[:8]}) has been "
-                f"{status} for >{LEDGER_REVIEW_STALE_MS // 60000}min "
-                f"(on-duty). Use review_task(taskId='{tid}', "
-                f"decision='approve'/'rework')."
-            )
+
+            # TEST11 #3: prefer designated reviewer when ≠ creator
+            reviewer = t.get("reviewer_id")
+            nudge_target = str(creator)
+            if reviewer and str(reviewer) != str(creator):
+                nudge_target = str(reviewer)
+
+            # 修 #5: nudge 计数升级 — 超过阈值后 escalate 给 creator 上级
+            nudge_count = review_nudge_counts.get(tid, 0) + 1
+            review_nudge_counts[tid] = nudge_count
+
+            if nudge_count > STALL_ESCALATION_THRESHOLD:
+                # 升级：通知 creator 的上级（参照 merge-proxy 先例）
+                creator_agent = by_id.get(str(creator))
+                parent_id = (
+                    creator_agent.get("parent_id") if creator_agent else None
+                )
+                if parent_id and parent_id != creator:
+                    esc_body = (
+                        f"[REVIEW ESCALATION] Task '{title}' ({tid[:8]}) "
+                        f"has been {status} for "
+                        f">{LEDGER_REVIEW_STALE_MS // 60000}min and received "
+                        f"{nudge_count - 1} review nudges without action. "
+                        f"Reviewer/creator {nudge_target[:12]} has not reviewed. "
+                        f"Please reassign the reviewer or handle the review."
+                    )
+                    try:
+                        await inbox.send_message(
+                            from_agent_id="system",
+                            to_agent_id=parent_id,
+                            message=esc_body,
+                            message_type="task",
+                            priority="urgent",
+                            task_id=tid,
+                            wake=True,
+                        )
+                        await self._watchdog_trigger(parent_id)
+                        log.info(
+                            "review_escalation",
+                            project_id=project_id,
+                            task_id=tid,
+                            creator=creator,
+                            escalated_to=parent_id,
+                            nudge_count=nudge_count,
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "review_escalation_failed",
+                            task_id=tid,
+                            error=str(e),
+                        )
+                # 继续发常规 nudge 给 reviewer/creator（上级介入不替代常规催办）
+                body = (
+                    f"[LEDGER REVIEW] Task '{title}' ({tid[:8]}) has been "
+                    f"{status} for >{LEDGER_REVIEW_STALE_MS // 60000}min "
+                    f"(on-duty, nudge #{nudge_count}). Use "
+                    f"review_task(taskId='{tid}', "
+                    f"decision='approve'/'rework')."
+                )
+            else:
+                body = (
+                    f"[LEDGER REVIEW] Task '{title}' ({tid[:8]}) has been "
+                    f"{status} for >{LEDGER_REVIEW_STALE_MS // 60000}min "
+                    f"(on-duty). Use review_task(taskId='{tid}', "
+                    f"decision='approve'/'rework')."
+                )
             try:
                 await inbox.send_message(
                     from_agent_id="system",
-                    to_agent_id=creator,
+                    to_agent_id=nudge_target,
                     message=body,
                     message_type="task",
                     priority="urgent",
                     task_id=tid,
                     wake=True,
                 )
-                await self._watchdog_trigger(creator)
+                await self._watchdog_trigger(nudge_target)
                 log.info(
                     "ledger_stale_review_nudge",
                     project_id=project_id,
                     task_id=tid,
+                    target=nudge_target,
                     creator=creator,
+                    reviewer=reviewer,
                     status=status,
+                    nudge_count=nudge_count,
                 )
             except Exception as e:
                 log.warning(
@@ -760,6 +907,103 @@ class GameTimeService:
                     task_id=tid,
                     error=str(e),
                 )
+
+        # ── TEST11 #8: activate TASK_STALL_THRESHOLDS (running/claimed/…) ──
+        task_stall_counts: dict[str, int] = state.setdefault(
+            "task_stall_counts", {}
+        )
+        # Skip stall wakes when assignee has a live wait contract (audit C2)
+        live_wait_agents: set[str] = set()
+        try:
+            from hiveweave.services.wait_contract import wait_contract_service
+
+            for w in await wait_contract_service.list_all_active(project_id):
+                aid = w.get("agentId")
+                if aid:
+                    live_wait_agents.add(str(aid))
+        except Exception:
+            pass
+
+        for t in tasks:
+            status = t.get("status")
+            thresh = TASK_STALL_THRESHOLDS.get(status or "")
+            if not thresh:
+                continue
+            # submitted/reviewing already handled above via ledger review
+            if status in ("submitted", "reviewing"):
+                continue
+            tid = str(t.get("id") or "")
+            assignee = t.get("assignee_id")
+            if not tid or not assignee:
+                continue
+            if str(assignee) in live_wait_agents:
+                # Legally waiting — do not stall-wake (would burn quota +
+                # fight WAIT_WITHOUT_ASK if waits were cleared)
+                continue
+            age = _effective_age_ms(t)
+            if age < thresh:
+                task_stall_counts.pop(tid, None)
+                continue
+            if not _cooled(f"stall:{tid}", TASK_STALL_COOLDOWN_MS):
+                continue
+            title = (t.get("title") or "(untitled)").split("\n")[0][:50]
+            progress = t.get("progress")
+            stall_count = task_stall_counts.get(tid, 0) + 1
+            task_stall_counts[tid] = stall_count
+            mins = thresh // 60000
+            body = (
+                f"[TASK STALL] Task '{title}' ({tid[:8]}) has been "
+                f"{status} for >{mins}min (progress={progress}). "
+                f"Update progress, submit_task, or block with a typed reason."
+            )
+            try:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=assignee,
+                    message=body,
+                    message_type="task",
+                    priority="urgent",
+                    task_id=tid,
+                    wake=True,
+                )
+                await self._watchdog_trigger(assignee)
+                log.info(
+                    "task_stall_nudge",
+                    project_id=project_id,
+                    task_id=tid,
+                    status=status,
+                    assignee=assignee,
+                    stall_count=stall_count,
+                )
+            except Exception as e:
+                log.warning("task_stall_nudge_failed", task_id=tid, error=str(e))
+
+            if stall_count > STALL_ESCALATION_THRESHOLD:
+                asg_agent = by_id.get(str(assignee))
+                parent_id = asg_agent.get("parent_id") if asg_agent else None
+                if parent_id and parent_id != assignee:
+                    try:
+                        await inbox.send_message(
+                            from_agent_id="system",
+                            to_agent_id=parent_id,
+                            message=(
+                                f"[TASK STALL ESCALATION] Task '{title}' "
+                                f"({tid[:8]}) stuck in {status} after "
+                                f"{stall_count} nudges. Assignee "
+                                f"{assignee[:12]} not progressing."
+                            ),
+                            message_type="task",
+                            priority="urgent",
+                            task_id=tid,
+                            wake=True,
+                        )
+                        await self._watchdog_trigger(parent_id)
+                    except Exception as e:
+                        log.warning(
+                            "task_stall_escalation_failed",
+                            task_id=tid,
+                            error=str(e),
+                        )
 
         # ── approved (non-VERIFY) → [MERGE PENDING] and/or [MERGE PROXY] ──
         for t in tasks:
@@ -966,11 +1210,137 @@ class GameTimeService:
                 superior=superior,
             )
 
+    async def _reconcile_blocked_tasks(self, project_id: str) -> None:
+        """TEST11 #8: unblock met deps / expired timers; nudge stale blocked."""
+        from hiveweave.services.inbox import InboxService
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.task import TaskService
+
+        proj = await meta_db.query_one(
+            "SELECT is_started FROM projects WHERE id = ?", [project_id]
+        )
+        if not proj or not dict(proj).get("is_started"):
+            return
+        from hiveweave.services.system_state import system_state
+
+        if system_state.paused():
+            return
+
+        ts = TaskService()
+        try:
+            await ts.reconcile_blocked_tasks(project_id)
+        except Exception as e:
+            log.warning("reconcile_blocked_tasks_failed", error=str(e))
+
+        # Stale blocked with no auto-wake path → nudge assignee / escalate creator
+        now_ms = int(time.time() * 1000)
+        state = _states.get(project_id)
+        if not state:
+            return
+        cooldowns: dict[str, int] = state.setdefault("ledger_nudge_cooldowns", {})
+        session_start = int(state.get("duty_session_started_at_ms") or now_ms)
+        blocked_counts: dict[str, int] = state.setdefault(
+            "blocked_stall_counts", {}
+        )
+        tasks = await ts.list_tasks(project_id)
+        inbox = InboxService()
+        agents = await OrgService().list_agents(project_id)
+        by_id = {a.get("id"): a for a in agents if a.get("id")}
+
+        # Batch live waits once (avoid per-task list_active N+1)
+        live_wait_agents: set[str] = set()
+        try:
+            from hiveweave.services.wait_contract import wait_contract_service
+
+            for w in await wait_contract_service.list_all_active(project_id):
+                aid = w.get("agentId")
+                if aid:
+                    live_wait_agents.add(str(aid))
+        except Exception:
+            pass
+
+        for t in tasks:
+            if t.get("status") != "blocked":
+                blocked_counts.pop(str(t.get("id") or ""), None)
+                continue
+            tid = str(t.get("id") or "")
+            assignee = t.get("assignee_id")
+            if not tid or not assignee:
+                continue
+            updated = int(t.get("updated_at") or t.get("created_at") or 0)
+            wall = max(0, now_ms - updated) if updated else 0
+            since_duty = max(0, now_ms - session_start)
+            age = min(wall, since_duty)
+            if age < BLOCKED_STALE_MS:
+                continue
+            if str(assignee) in live_wait_agents:
+                continue
+            last = cooldowns.get(f"blocked:{tid}") or 0
+            if now_ms - last < TASK_STALL_COOLDOWN_MS:
+                continue
+            cooldowns[f"blocked:{tid}"] = now_ms
+            count = blocked_counts.get(tid, 0) + 1
+            blocked_counts[tid] = count
+            title = (t.get("title") or "(untitled)").split("\n")[0][:50]
+            reason = (t.get("blocked_reason") or "")[:80]
+            try:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=assignee,
+                    message=(
+                        f"[BLOCKED STALE] Task '{title}' ({tid[:8]}) blocked "
+                        f">{BLOCKED_STALE_MS // 60000}min "
+                        f"(reason={reason or 'n/a'}). "
+                        f"Unblock, retarget dependsOnTaskId, or escalate."
+                    ),
+                    message_type="task",
+                    priority="urgent",
+                    task_id=tid,
+                    wake=True,
+                )
+                await self._watchdog_trigger(assignee)
+            except Exception as e:
+                log.warning("blocked_stale_nudge_failed", task_id=tid, error=str(e))
+
+            if count > STALL_ESCALATION_THRESHOLD:
+                creator = t.get("creator_id")
+                escalate_to = creator
+                if not escalate_to or escalate_to == assignee:
+                    asg = by_id.get(str(assignee))
+                    escalate_to = asg.get("parent_id") if asg else None
+                if escalate_to and escalate_to != assignee:
+                    try:
+                        await inbox.send_message(
+                            from_agent_id="system",
+                            to_agent_id=escalate_to,
+                            message=(
+                                f"[BLOCKED ESCALATION] Task '{title}' "
+                                f"({tid[:8]}) stuck blocked after {count} "
+                                f"nudges. Please reassign or close."
+                            ),
+                            message_type="task",
+                            priority="urgent",
+                            task_id=tid,
+                            wake=True,
+                        )
+                        await self._watchdog_trigger(escalate_to)
+                    except Exception as e:
+                        log.warning(
+                            "blocked_escalation_failed",
+                            task_id=tid,
+                            error=str(e),
+                        )
+
     async def _sweep_orphan_streaming(self, project_id: str) -> None:
         """Clear is_streaming=1 rows whose agent is not actively PROCESSING.
 
         Users must never need a manual/AI 'zombie clear'. Boot clears crash
         leftovers; this runtime sweep catches mid-session orphans within ~30s.
+
+        Protected (PROCESSING) streams are only cleared by soft_age_ms
+        (≈ safety timeout). Do NOT finalize mid-turn on content-length
+        heartbeat — long tools / thinking phases often don't grow content
+        (TEST11 audit H4).
         """
         try:
             from hiveweave.agents.supervisor import agent_manager
@@ -1158,6 +1528,175 @@ class GameTimeService:
     ) -> None:
         """Awaiting-reply sender nudge — disabled (see ``_check_stalled``)."""
         return
+
+    async def _check_dead_agents(self, project_id: str) -> None:
+        """未激活 agent reconciliation（审计 C1 收紧后）。
+
+        检测 activated_at IS NULL 且超龄的 active agent：
+        - **有活实例**：只补写 activated_at（不 wake）——避免 resume_suppressed /
+          存量 NULL 列导致每 2 分钟全员唤醒风暴
+        - **无活实例**：限流重试 start_agent；失败满 DEAD_AGENT_MAX_RETRIES 升级
+
+        启动时一次性 backfill：``activated_at = last_active_at``（仅对曾经活跃
+        过的存量 agent），避免部署瞬间把全组织当成 dead。
+        """
+        from hiveweave.services.system_state import system_state
+        if system_state.paused():
+            return
+
+        now_ms = int(time.time() * 1000)
+        state = _states.get(project_id)
+        if not state:
+            return
+
+        # One-shot backfill: agents that already produced activity are not "dead"
+        if not state.get("activated_at_backfilled"):
+            try:
+                await _execute(
+                    project_id,
+                    "UPDATE agents SET activated_at = last_active_at "
+                    "WHERE activated_at IS NULL AND last_active_at IS NOT NULL",
+                    [],
+                )
+                state["activated_at_backfilled"] = True
+            except Exception:
+                # Column missing — skip dead-agent checks entirely this tick
+                return
+
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT id, name, role, parent_id, short_id, created_at "
+                "FROM agents WHERE status = 'active' "
+                "AND activated_at IS NULL "
+                "AND created_at IS NOT NULL "
+                "AND (? - created_at) >= ?",
+                [now_ms, DEAD_AGENT_THRESHOLD_MS],
+            )
+        except Exception:
+            return
+
+        if not rows:
+            return
+
+        from hiveweave.agents.supervisor import agent_manager
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.inbox import InboxService
+
+        retry_counts: dict[str, int] = state.setdefault(
+            "dead_agent_retries", {}
+        )
+        wake_cooldowns: dict[str, int] = state.setdefault(
+            "dead_agent_wake_cooldowns", {}
+        )
+        org = OrgService()
+        inbox = InboxService()
+
+        for row in rows:
+            aid = row["id"]
+            name = row.get("name") or aid[:12]
+            parent_id = row.get("parent_id")
+
+            # Live instance: stamp activated_at, never wake-storm
+            inst = agent_manager.get_agent(aid)
+            if inst is not None:
+                try:
+                    await org.touch_last_active(aid)
+                    log.info(
+                        "dead_agent_stamped_live",
+                        agent_id=aid, name=name, project_id=project_id,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "dead_agent_stamp_failed",
+                        agent_id=aid, error=str(e),
+                    )
+                retry_counts.pop(aid, None)
+                continue
+
+            # Per-agent cooldown for restart attempts
+            last_try = wake_cooldowns.get(aid) or 0
+            if now_ms - last_try < DEAD_AGENT_WAKE_COOLDOWN_MS:
+                continue
+
+            retries = retry_counts.get(aid, 0)
+            if retries >= DEAD_AGENT_MAX_RETRIES:
+                escalate_to = parent_id
+                if not escalate_to:
+                    ceo = await _query(
+                        project_id,
+                        "SELECT id FROM agents WHERE role = 'ceo' "
+                        "AND status = 'active' LIMIT 1",
+                        [],
+                    )
+                    escalate_to = ceo[0]["id"] if ceo else None
+
+                if escalate_to:
+                    try:
+                        await inbox.send_message(
+                            from_agent_id="system",
+                            to_agent_id=escalate_to,
+                            message=(
+                                f"[DEAD AGENT] Agent '{name}' ({aid[:12]}) "
+                                f"was created >{DEAD_AGENT_THRESHOLD_MS // 60000}min ago "
+                                f"but never activated after {retries} retry attempts. "
+                                f"Consider dismiss_agent + hire_agent or investigate."
+                            ),
+                            message_type="task",
+                            priority="urgent",
+                            wake=True,
+                        )
+                        log.info(
+                            "dead_agent_escalated",
+                            agent_id=aid, name=name,
+                            escalated_to=escalate_to, retries=retries,
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "dead_agent_escalate_failed",
+                            agent_id=aid, error=str(e),
+                        )
+                # Hold escalated agents: don't reset to infinite retry loops
+                wake_cooldowns[aid] = now_ms
+                continue
+
+            wake_cooldowns[aid] = now_ms
+            try:
+                agent_data = await org.get_agent(aid)
+                if not agent_data:
+                    continue
+
+                from hiveweave.realtime.event_bus import create_agent_callbacks
+                on_status, on_stream = create_agent_callbacks(aid, project_id)
+                await agent_manager.start_agent(
+                    aid, project_id, agent_data,
+                    on_status_change=on_status,
+                    on_stream_event=on_stream,
+                )
+                retry_counts[aid] = retries + 1
+
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=aid,
+                    message=(
+                        f"[ACTIVATION] You are now active. "
+                        f"Review your tasks via get_tasks and begin work."
+                    ),
+                    message_type="task",
+                    wake=True,
+                )
+                log.info(
+                    "dead_agent_restart_attempted",
+                    agent_id=aid, name=name,
+                    retry=retry_counts[aid], project_id=project_id,
+                )
+            except Exception as e:
+                retry_counts[aid] = retries + 1
+                log.warning(
+                    "dead_agent_restart_failed",
+                    agent_id=aid, name=name,
+                    retry=retry_counts[aid], error=str(e),
+                )
 
     async def _check_silent_agents(self, project_id: str) -> None:
         """Watchdog: agent 沉默观测 — 检测"无任何产出"的失联 agent（每 2 分钟）。

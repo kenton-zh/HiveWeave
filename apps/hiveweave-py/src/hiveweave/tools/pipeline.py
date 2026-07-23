@@ -388,8 +388,10 @@ def _check_single_file(
 def _check_shell_security(params: Any) -> str | None:
     """Shell command security check.
 
-    Checks for self-destructive patterns and .hiveweave file operations.
+    Checks self-destructive patterns, .hiveweave ops, and platform kill guards.
     """
+    from hiveweave.services.process_registry import check_platform_process_kill
+
     from .bash import check_self_destructive, _check_hiveweave_command
 
     command = getattr(params, "command", None) or getattr(params, "cmd", None)
@@ -401,6 +403,10 @@ def _check_shell_security(params: Any) -> str | None:
     blocked, _reason = check_self_destructive(command)
     if blocked:
         return "Error: Command blocked - self-destructive pattern detected"
+
+    plat_err = check_platform_process_kill(command)
+    if plat_err:
+        return f"Error: {plat_err}"
 
     if _check_hiveweave_command(command):
         return "Error: Command blocked - cannot access .hiveweave system directory"

@@ -59,7 +59,13 @@ _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "bash": {
-        "description": "Executes a shell command on the local system. Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command.",
+        "description": (
+            "Executes a shell command on the local system (Git Bash on Windows). "
+            "Use it to run CLI tools, scripts, git commands, or any system operation. "
+            "Returns stdout/stderr. cwd is your workspace — on Windows prefer "
+            "Git Bash paths like /d/PC_AI/... or quote Windows paths; never invent "
+            "/workspace or strip backslashes (D:PC_AI... is invalid)."
+        ),
         "properties": {
             "command": {"type": "string", "aliases": ["cmd", "run"]},
             "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"],

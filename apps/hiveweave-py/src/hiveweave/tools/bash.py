@@ -206,7 +206,7 @@ def _extract_file_paths_from_command(command: str) -> list[str]:
 def _validate_command_safety(command: str) -> tuple[bool, str]:
     """统一命令安全校验 — 所有 shell 执行入口必须调用。
 
-    整合三项检查: 自毁命令、敏感路径、.hiveweave 系统目录。
+    整合: 自毁命令、敏感路径、.hiveweave 系统目录、平台端口/进程保护。
     Returns: (blocked, reason) — blocked=True 表示命令应被拦截。
 
     Bug C fix: is_sensitive_path 只检查提取出的文件路径参数，
@@ -216,6 +216,11 @@ def _validate_command_safety(command: str) -> tuple[bool, str]:
     blocked, reason = check_self_destructive(command)
     if blocked:
         return True, f"Command blocked: {reason}"
+    from hiveweave.services.process_registry import check_platform_process_kill
+
+    plat_err = check_platform_process_kill(command)
+    if plat_err:
+        return True, plat_err
     from hiveweave.tools.security import is_sensitive_path
     # Bug C fix: 只检查命令中的文件路径参数，不检查整个命令字符串
     file_paths = _extract_file_paths_from_command(command)
@@ -524,6 +529,24 @@ async def _run_docker(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
     }
 
 
+def _cwd_style_hint(cwd: str) -> str:
+    """Human-readable cwd note for agents (Git Bash style on Windows)."""
+    try:
+        p = Path(cwd).resolve()
+        native = str(p)
+    except (OSError, ValueError):
+        native = cwd
+    posix = native.replace("\\", "/")
+    # D:/foo → /d/foo for Git Bash copy-paste
+    msys = posix
+    if len(posix) >= 2 and posix[1] == ":":
+        msys = "/" + posix[0].lower() + posix[2:]
+    return (
+        f"[cwd={native} | Git Bash style: {msys} — "
+        f"use this or quoted Windows paths; never invent /workspace]"
+    )
+
+
 async def execute_bash(
     command: str,
     workdir: str,
@@ -572,6 +595,8 @@ async def execute_bash(
         return {"success": False, "output": "",
                 "error": f"Error: Working directory does not exist: {cwd}"}
 
+    cwd_hint = _cwd_style_hint(cwd)
+
     # 3. Clamp timeout
     if timeout_ms is None:
         timeout_ms = DEFAULT_TIMEOUT_S * 1000
@@ -593,19 +618,20 @@ async def execute_bash(
 
     if result.get("error"):
         return {"success": False, "output": "",
-                "error": f"Error: {result['error']}"}
+                "error": f"Error: {result['error']}\n{cwd_hint}"}
 
     if result["timed_out"]:
         return {"success": False, "output": "",
                 "error": "Error: Command timed out after "
-                         f"{int(timeout_s)} seconds"}
+                         f"{int(timeout_s)} seconds\n{cwd_hint}"}
 
     output = _truncate_output(result["output"])
     exit_code = result["exit_code"]
 
     if exit_code == 0:
         body = output if output.strip() else "(no output)"
-        return {"success": True, "output": f"{body}\n\nExit code: 0",
+        return {"success": True,
+                "output": f"{body}\n\n{cwd_hint}\nExit code: 0",
                 "error": None}
 
     body = output if output.strip() else "(no output)"
@@ -617,7 +643,7 @@ async def execute_bash(
         error_msg = f"{error_msg}: {first_line}"
     return {
         "success": False,  # non-zero exit is not success
-        "output": f"{body}\n\nExit code: {exit_code}",
+        "output": f"{body}\n\n{cwd_hint}\nExit code: {exit_code}",
         "error": error_msg,
     }
 

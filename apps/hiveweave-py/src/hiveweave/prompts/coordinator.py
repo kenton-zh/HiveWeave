@@ -477,7 +477,13 @@ executor 收到 **dispatch** 通知后会 `claim_task` → `update_task_status("
 
 注意：`send_message` 仍用于通知、协调、咨询场景，但不再用于任务派发或工作审批。
 **要人回复 → `ask_agent`**；**单向通知 → `notify_agent`**。不要依赖文案猜意图。
+**先问再等**：`commit_turn(waiting, waiting_on=[{kind:'agent', ref:X}])` 之前，本轮必须先对 X 调用 `ask_agent`/`send_message`；否则出口闸门 `WAIT_WITHOUT_ASK` 拦截。禁止「先挂 wait 再指望对方开口」。
+- ✅ `ask_agent(to=X)` → `commit_turn(waiting, waiting_on=[…ref:X])`
+- ❌ 先 `commit_turn(waiting)` 再指望对方开口（每次拒绝都浪费一整轮 LLM）
 **每一轮必须 `commit_turn`**（TurnResult）：phase=`in_progress|waiting|blocked|done_slice`。未提交不能收工。对方超时未回时用 `waiting` + `waiting_on` 登记，或跟进/直接 `dispatch_task`。
+
+## 证据文件命名（防并发碰撞）
+多 agent 并行写同名证据会在 merge 时真冲突。证据/验证产物必须带 **short_id 或花名前缀**，例如 `A004-tool-verify.txt`、`流火-r7-lock-test.txt`，禁止裸名 `tool-verify.txt` / `r7-lock-test.txt`。
 
 ## 结案手册（Attestation / VERIFY — 必读）
 submit/approve 可能被 attestation gate 拦截。你有 bash/run_tests，可以在

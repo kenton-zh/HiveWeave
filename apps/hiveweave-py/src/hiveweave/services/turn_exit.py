@@ -26,7 +26,10 @@ REPAIR_VIOLATIONS = frozenset({
     "WAITING_ON_REQUIRED",
     "BLOCKED_WAITING_ON_REQUIRED",
     "UNREPLIED_ASKS",
+    "WAIT_WITHOUT_ASK",
     "ASSIGNEE_MUST_SUBMIT",
+    "REVIEWER_MUST_START_REVIEW",
+    "REVIEWER_MUST_FINISH_REVIEW",
     "CREATOR_MUST_REVIEW",
     "CREATOR_MUST_MERGE",
     "HIRE_UNREPORTED",
@@ -76,6 +79,12 @@ class ExitContext:
     unreplied_asks: list[dict] = field(default_factory=list)
     open_task_obligations: list[dict] = field(default_factory=list)
     tasks_advanced: set[str] = field(default_factory=set)
+    # TEST11 #1a: recipients successfully messaged this turn (id/name/short_id)
+    messaged_refs: set[str] = field(default_factory=set)
+    # Outstanding outbound ask/expect_report recipients (unanswered contracts)
+    outbound_ask_refs: set[str] = field(default_factory=set)
+    # Optional name/short_id → id map for ref matching
+    name_by_id: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,7 +111,9 @@ def collect_unreplied_asks(
 ) -> list[dict]:
     """Messages that require a reply and were not answered this turn.
 
-    Structural only: expect_report or message_type=ask (language-agnostic).
+    Structural only: ``expect_report`` truthy (language-agnostic).
+    ``message_type=ask`` alone is NOT sufficient — ask-chain downgrade
+    writes notify + expect_report=0 so peers don't inherit a new obligation.
 
     - extra_replied_to: 本 turn 内已成功送达的收件人（来自 inbox 落库记录，
       即"成功调用 send_message/message 工具"的 DB 证据），与工具调用
@@ -121,8 +132,10 @@ def collect_unreplied_asks(
         fid = m.get("from_agent_id", "")
         if fid in exempt_senders:
             continue
-        mt = (m.get("message_type") or "").lower()
-        if m.get("expect_report") or mt == "ask":
+        # Structural reply-required = expect_report only.
+        # message_type=ask alone is insufficient: ask-chain downgrade writes
+        # notify + expect_report=0; treating mt==ask would re-open the loop.
+        if m.get("expect_report"):
             expects.append(m)
     if not expects:
         return []
@@ -233,6 +246,43 @@ def _disposition_from_result(
     return "runnable"
 
 
+def _ref_in_set(ref: str, candidates: set[str], name_by_id: dict[str, str] | None = None) -> bool:
+    """True if wait.ref matches any candidate (id / short prefix / display name)."""
+    if not ref or not candidates:
+        return False
+    r = ref.strip().lower()
+    if not r:
+        return False
+    cand_l = {str(c).strip().lower() for c in candidates if c}
+    if r in cand_l:
+        return True
+    for c in cand_l:
+        if len(r) >= 4 and (c.startswith(r) or r.startswith(c)):
+            return True
+    # Resolve names: if ref is a name mapped to an id in candidates
+    name_by_id = name_by_id or {}
+    for aid, name in name_by_id.items():
+        if str(name).strip().lower() == r and (
+            aid.lower() in cand_l or aid in candidates
+        ):
+            return True
+    return False
+
+
+def _agent_wait_has_ask_evidence(ref: str, ctx: ExitContext) -> bool:
+    """WAITING on an agent requires prior ask/message evidence (TEST11 #1a).
+
+    Only DB-backed delivery evidence counts (messaged_refs / outbound asks).
+    Tool-call argument fallback removed (audit M6) — intended recipients of a
+    failed send must not satisfy the gate.
+    """
+    if _ref_in_set(ref, ctx.messaged_refs, ctx.name_by_id):
+        return True
+    if _ref_in_set(ref, ctx.outbound_ask_refs, ctx.name_by_id):
+        return True
+    return False
+
+
 def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
     """Validate turn exit. Never sets continue_work for unlimited re-entry."""
     violations: list[str] = []
@@ -263,6 +313,18 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
     if hire_without_report(ctx.tool_calls):
         violations.append("HIRE_UNREPORTED")
 
+    # TEST11 #1a: waiting on an agent requires having asked/messaged them first
+    if turn_result is not None and turn_result.phase == "waiting":
+        for w in turn_result.waiting_on or []:
+            if (getattr(w, "kind", None) or "").lower() != "agent":
+                continue
+            ref = str(getattr(w, "ref", None) or "")
+            if not ref:
+                continue
+            if not _agent_wait_has_ask_evidence(ref, ctx):
+                violations.append("WAIT_WITHOUT_ASK")
+                break
+
     remaining_obligations = list(ctx.open_task_obligations)
     if turn_result and turn_result.phase in ("done_slice", "waiting"):
         remaining = []
@@ -282,6 +344,10 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 "running", "claimed", "rework",
             ):
                 violations.append("ASSIGNEE_MUST_SUBMIT")
+            elif role == "reviewer" and status == "submitted":
+                violations.append("REVIEWER_MUST_START_REVIEW")
+            elif role == "reviewer" and status == "reviewing":
+                violations.append("REVIEWER_MUST_FINISH_REVIEW")
             elif role == "creator" and status in ("submitted", "reviewing"):
                 violations.append("CREATOR_MUST_REVIEW")
             elif role == "creator" and status == "approved":
@@ -296,6 +362,10 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                     (
                         t.get("role_hint") == "assignee"
                         and t.get("status") in ("running", "claimed", "rework")
+                    )
+                    or (
+                        t.get("role_hint") == "reviewer"
+                        and t.get("status") in ("submitted", "reviewing")
                     )
                     or (
                         t.get("role_hint") == "creator"
@@ -326,8 +396,11 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
         if PARK_VIOLATIONS.intersection(uniq) and REPAIR_VIOLATIONS.intersection(uniq):
             repair_only = (
                 "UNREPLIED_ASKS" in uniq
+                or "WAIT_WITHOUT_ASK" in uniq
                 or "MISSING_COMMIT_TURN" in uniq
                 or "ASSIGNEE_MUST_SUBMIT" in uniq
+                or "REVIEWER_MUST_START_REVIEW" in uniq
+                or "REVIEWER_MUST_FINISH_REVIEW" in uniq
                 or "CREATOR_MUST_REVIEW" in uniq
                 or "CREATOR_MUST_MERGE" in uniq
                 or "HIRE_UNREPORTED" in uniq
@@ -376,6 +449,11 @@ def _build_gate_hint(
         "WAITING_ON_REQUIRED": "phase=waiting 必须提供 waiting_on",
         "BLOCKED_WAITING_ON_REQUIRED": "phase=blocked 必须提供 waiting_on",
         "UNREPLIED_ASKS": "有人 ask 了你，必须用 ask_agent/notify_agent/send_message 回复后才能收工",
+        "WAIT_WITHOUT_ASK": (
+            "phase=waiting 且 waiting_on 含 agent，但未向对方发过消息"
+            "（本轮送达或未完结 ask）— "
+            "请先 ask_agent（带回复契约）或 send_message，再 commit_turn(waiting)"
+        ),
         "HIRE_UNREPORTED": (
             "本轮调用了 hire_agent 但没有用 send_message/ask_agent/notify_agent 通知请求方 — "
             "招人完成≠协作完成；请向请求方汇报花名/shortId/role，再 commit_turn"
@@ -384,6 +462,16 @@ def _build_gate_hint(
         "ASSIGNEE_MUST_SUBMIT": (
             "有 running/claimed/rework 任务未 submit_task — "
             "请调用 submit_task(taskId, summary, testsPassed=true)，"
+            "或 phase=waiting + waiting_on=[{kind:'task', ref:taskId}]"
+        ),
+        "REVIEWER_MUST_START_REVIEW": (
+            "有 submitted 任务待你开始审查 — "
+            "请调用 review_task(taskId, decision='approve'/'rework')，"
+            "或 phase=waiting + waiting_on=[{kind:'task', ref:taskId}]"
+        ),
+        "REVIEWER_MUST_FINISH_REVIEW": (
+            "有 reviewing 任务待你完成审查 — "
+            "请调用 review_task(taskId, decision='approve'/'rework')，"
             "或 phase=waiting + waiting_on=[{kind:'task', ref:taskId}]"
         ),
         "CREATOR_MUST_REVIEW": (
@@ -425,7 +513,10 @@ def _build_gate_hint(
 
 
 async def pre_check_exit_gates(
-    agent_id: str, project_id: str, phase: str
+    agent_id: str,
+    project_id: str,
+    phase: str,
+    waiting_on: list | None = None,
 ) -> list[str]:
     """Lightweight synchronous pre-check of exit gates.
 
@@ -443,6 +534,39 @@ async def pre_check_exit_gates(
         from hiveweave.db import project as project_db
 
         conn = await project_db.get_project_db_by_project_id(project_id)
+
+        # 0. WAIT_WITHOUT_ASK: waiting on agent requires prior message/ask
+        if phase == "waiting" and waiting_on:
+            agent_refs: list[str] = []
+            for w in waiting_on:
+                if isinstance(w, dict):
+                    kind = str(w.get("kind") or "").lower()
+                    ref = str(w.get("ref") or "")
+                else:
+                    kind = str(getattr(w, "kind", "") or "").lower()
+                    ref = str(getattr(w, "ref", "") or "")
+                if kind == "agent" and ref:
+                    agent_refs.append(ref)
+            if agent_refs:
+                try:
+                    from hiveweave.services.inbox import InboxService
+
+                    inbox = InboxService()
+                    # Recent deliveries (30 min) + outstanding outbound asks
+                    import time as _time
+
+                    since = int(_time.time() * 1000) - 30 * 60 * 1000
+                    sent = await inbox.get_sent_recipients_since(agent_id, since)
+                    outstanding = await inbox.get_outstanding_ask_recipients(
+                        agent_id
+                    )
+                    evidence = set(sent) | set(outstanding)
+                    for ref in agent_refs:
+                        if not _ref_in_set(ref, evidence, {}):
+                            violations.append("WAIT_WITHOUT_ASK")
+                            break
+                except Exception as e:
+                    log.debug("pre_check_wait_without_ask_failed", error=str(e))
 
         # 1. Unreplied asks: inbox messages with expect_report=1, read=0
         cursor = await conn.execute(
@@ -470,9 +594,27 @@ async def pre_check_exit_gates(
         if assignee_tasks and phase in ("done_slice", "waiting"):
             violations.append("ASSIGNEE_MUST_SUBMIT")
 
-        # 3. Open task obligations: submitted/reviewing/approved as creator
+        # 3. Open task obligations: submitted|reviewing as reviewer (TEST11 #3)
         cursor = await conn.execute(
             "SELECT id, status FROM tasks "
+            "WHERE reviewer_id = ? AND is_archived = 0 "
+            "AND status IN ('submitted', 'reviewing') "
+            "LIMIT 20",
+            [agent_id],
+        )
+        reviewer_tasks = await cursor.fetchall()
+        await cursor.close()
+        if reviewer_tasks and phase in ("done_slice", "waiting"):
+            statuses = {r["status"] for r in reviewer_tasks}
+            if "submitted" in statuses:
+                violations.append("REVIEWER_MUST_START_REVIEW")
+            if "reviewing" in statuses:
+                violations.append("REVIEWER_MUST_FINISH_REVIEW")
+
+        # 4. Open task obligations: submitted/reviewing/approved as creator
+        #    (skip review when designated reviewer ≠ this creator)
+        cursor = await conn.execute(
+            "SELECT id, status, reviewer_id FROM tasks "
             "WHERE creator_id = ? AND is_archived = 0 "
             "AND status IN ('submitted', 'reviewing', 'approved') "
             "LIMIT 20",
@@ -483,16 +625,24 @@ async def pre_check_exit_gates(
         if creator_tasks and phase in ("done_slice", "waiting"):
             # Check if waiting_on covers them — we don't have the TurnResult
             # waiting_on here, so be conservative and flag
-            statuses = {r["status"] for r in creator_tasks}
-            if "submitted" in statuses or "reviewing" in statuses:
+            need_review = False
+            need_merge = False
+            for r in creator_tasks:
+                st = r["status"]
+                rid = r["reviewer_id"] if "reviewer_id" in r.keys() else None
+                if st in ("submitted", "reviewing"):
+                    if not rid or rid == agent_id:
+                        need_review = True
+                if st == "approved":
+                    need_merge = True
+            if need_review:
                 violations.append("CREATOR_MUST_REVIEW")
-            if "approved" in statuses:
+            if need_merge:
                 violations.append("CREATOR_MUST_MERGE")
 
     except Exception as e:
         log.debug("pre_check_exit_gates_failed", error=str(e))
-        # Best-effort: don't block on query failure
-        return []
+        # Keep violations found before the failure (e.g. WAIT_WITHOUT_ASK)
+        return violations
 
     return violations
-

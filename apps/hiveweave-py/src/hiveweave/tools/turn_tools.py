@@ -121,12 +121,21 @@ async def commit_turn_tool(
                 project_id = getattr(ctx, "project_id", None)
             if project_id:
                 violations = await pre_check_exit_gates(
-                    agent_id, project_id, tr.phase
+                    agent_id,
+                    project_id,
+                    tr.phase,
+                    waiting_on=[
+                        {"kind": w.kind, "ref": w.ref}
+                        for w in (tr.waiting_on or [])
+                    ],
                 )
                 if violations:
                     labels = {
                         "UNREPLIED_ASKS": "有未回复的 ask 消息",
+                        "WAIT_WITHOUT_ASK": "waiting 前须先向对方发消息",
                         "ASSIGNEE_MUST_SUBMIT": "有 claimed/running/rework 任务未提交",
+                        "REVIEWER_MUST_START_REVIEW": "有 submitted 任务待开始审查",
+                        "REVIEWER_MUST_FINISH_REVIEW": "有 reviewing 任务待完成审查",
                         "CREATOR_MUST_REVIEW": "有 submitted/reviewing 任务待审查",
                         "CREATOR_MUST_MERGE": "有 approved 任务待合并",
                     }

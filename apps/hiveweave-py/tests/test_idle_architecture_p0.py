@@ -83,6 +83,42 @@ def test_reserved_ports():
     assert ok is None
 
 
+def test_platform_process_kill_guard():
+    """Agents must not kill HiveWeave API/UI (TEST11 taskkill node.exe)."""
+    from hiveweave.services.process_registry import check_platform_process_kill
+    from hiveweave.tools.bash import _validate_command_safety
+
+    # Wholesale image kill — the real incident
+    assert check_platform_process_kill(
+        'taskkill //F //IM node.exe 2>/dev/null; echo "done"'
+    )
+    assert check_platform_process_kill("taskkill /F /IM python.exe")
+    assert check_platform_process_kill("Stop-Process -Name node -Force")
+    assert check_platform_process_kill("pkill -f uvicorn")
+    assert check_platform_process_kill("killall python")
+
+    # Kill by reserved port
+    assert check_platform_process_kill(
+        'kill -9 $(lsof -ti:4000) 2>/dev/null; echo "killed"'
+    )
+    assert check_platform_process_kill("npx kill-port 5173")
+    assert check_platform_process_kill("fuser -k 4173/tcp")
+
+    # Project ports / unrelated commands still OK
+    assert check_platform_process_kill(
+        'kill -9 $(lsof -ti:3001) 2>/dev/null; echo "killed"'
+    ) is None
+    assert check_platform_process_kill("npx kill-port 3000") is None
+    assert check_platform_process_kill("echo hello") is None
+    assert check_platform_process_kill("lsof -i:3001") is None
+
+    blocked, reason = _validate_command_safety(
+        'taskkill //F //IM node.exe 2>/dev/null'
+    )
+    assert blocked
+    assert "5173" in reason or "node" in reason.lower()
+
+
 def test_process_registry_lookup():
     clear_registry_for_tests()
     register(

@@ -26,7 +26,7 @@ def _tc(name: str, args: str = "{}") -> dict:
 
 
 def _tracker() -> dict:
-    return {"last_key": None, "count": 0, "last_errored": False}
+    return {"last_key": None, "count": 0}
 
 
 class TestReadonlyExemption:

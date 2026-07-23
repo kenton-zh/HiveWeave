@@ -179,6 +179,43 @@ async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT) -> tuple
     return False, output
 
 
+async def _auto_checkpoint_dirty_target(
+    workspace_path: str, target_branch: str
+) -> bool:
+    """If target (usually main) has local changes, commit a pre-merge checkpoint.
+
+    TEST11 evening P3-1: dirty main caused "not a content conflict" merge
+    failures. Previously we only advised; now we checkpoint automatically.
+    Returns True if a checkpoint commit was created.
+    """
+    ok_st, st_out = await _git(["status", "--porcelain"], workspace_path)
+    if not ok_st or not (st_out or "").strip():
+        return False
+    await _git(["add", "-A"], workspace_path)
+    ok_c, out_c = await _git(
+        [
+            "commit",
+            "-m",
+            f"pre-merge-checkpoint: auto-save dirty {target_branch}",
+            "--allow-empty",
+        ],
+        workspace_path,
+    )
+    if ok_c:
+        log.info(
+            "git_worktree.pre_merge_main_checkpoint",
+            target=target_branch,
+            dirty_preview=(st_out or "")[:200],
+        )
+        return True
+    log.warning(
+        "git_worktree.pre_merge_checkpoint_failed",
+        target=target_branch,
+        output=(out_c or "")[:200],
+    )
+    return False
+
+
 async def _current_branch(worktree_path: str) -> str | None:
     """worktree 实际检出的分支 (``git -C <path> rev-parse --abbrev-ref HEAD``)。
 
@@ -463,9 +500,16 @@ coverage/
         # 新算 (新算名与检出分支可能不同: task_id 变化 / legacy slug 分支)。
         if _has_git(path):
             actual = await _current_branch(path)
-            return {"success": True, "path": path,
-                    "branch": actual or branch,
-                    "message": "worktree already exists"}
+            return {
+                "success": True,
+                "path": path,
+                "branch": actual or branch,
+                "message": (
+                    "worktree already exists. "
+                    "Evidence files: prefix with short_id "
+                    f"(e.g. {short_id}-verify.txt), never bare shared names."
+                ),
+            }
 
         # Stale cleanup. Two failure modes we must handle before add:
         # 1) Path exists but is not a valid worktree (partial delete) →
@@ -498,7 +542,15 @@ coverage/
             if ok:
                 log.info("git_worktree.create", short_id=short_id,
                          branch=branch, base="existing-branch")
-                return {"success": True, "path": path, "branch": branch}
+                return {
+                    "success": True,
+                    "path": path,
+                    "branch": branch,
+                    "message": (
+                        f"Worktree ready. Name evidence files with {short_id}- "
+                        f"prefix to avoid merge collisions."
+                    ),
+                }
             last_error = out
             # Fall through: branch may be checked out elsewhere; try -B paths
         else:
@@ -519,7 +571,15 @@ coverage/
             if ok:
                 log.info("git_worktree.create", short_id=short_id,
                          branch=branch, base=base_branch)
-                return {"success": True, "path": path, "branch": branch}
+                return {
+                    "success": True,
+                    "path": path,
+                    "branch": branch,
+                    "message": (
+                        f"Worktree ready. Name evidence files with {short_id}- "
+                        f"prefix to avoid merge collisions."
+                    ),
+                }
             last_error = out
 
         log.error("git_worktree.create_failed", short_id=short_id,
@@ -654,6 +714,10 @@ coverage/
             return {"success": False,
                     "message": f"Failed to checkout {target_branch}",
                     "branch": branch}
+
+        # Dirty main (local edits / untracked) → auto checkpoint so merge
+        # is not blocked by "not a content conflict" hygiene failures.
+        await _auto_checkpoint_dirty_target(workspace_path, target_branch)
 
         # Capture files covered by this branch before merge mutates history
         ok_f, files_out = await _git(
@@ -794,6 +858,8 @@ coverage/
         if not ok:
             return {"success": False,
                     "message": f"Failed to checkout {target_branch}"}
+
+        await _auto_checkpoint_dirty_target(workspace_path, target_branch)
 
         # Step 1: Rebase worktree branch onto target_branch to minimize conflicts
         parts = branch.split("/", 2)

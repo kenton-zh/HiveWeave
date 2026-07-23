@@ -280,6 +280,8 @@ class OrgService:
         """Resolve by short_id (A007), full UUID, or UUID prefix.
 
         Priority: shortId exact → UUID exact → UUID prefix (6-35 chars).
+        For 花名 / display-name resolution within a project, use
+        ``resolve_agent_ref(project_id, ref)``.
         """
         inp = agent_id_or_short_id.strip()
 
@@ -300,6 +302,58 @@ class OrgService:
             matches = agent_router.find_by_uuid_prefix(inp, limit=2)
             if matches:
                 return await self.get_agent(matches[0].agent_id)
+
+        return None
+
+    async def resolve_agent_ref(
+        self, project_id: str, ref: str
+    ) -> dict | None:
+        """Resolve agent within a project: id → short_id → 花名 exact → unique prefix.
+
+        Agents learn 花名 from org chart / check_agent_status; tools must
+        accept the same refs (TEST11 evening review P2-3).
+        """
+        inp = (ref or "").strip()
+        if not inp or not project_id:
+            return None
+
+        # 1. id / short_id / uuid prefix (scoped to project when found)
+        agent = await self.resolve_agent(inp)
+        if agent and agent.get("project_id") == project_id:
+            return agent
+
+        all_agents = await self.list_agents(project_id)
+        active = [
+            a for a in all_agents
+            if (a.get("status") or "").lower() != "archived"
+        ]
+
+        # 2. 花名 / name exact (case-insensitive)
+        name_hits = [
+            a for a in active
+            if (a.get("name") or "").strip().lower() == inp.lower()
+        ]
+        if len(name_hits) == 1:
+            return name_hits[0]
+        if len(name_hits) > 1:
+            return None
+
+        # 3. Unique name prefix (≥2 chars to avoid noise)
+        if len(inp) >= 2:
+            prefix_hits = [
+                a for a in active
+                if (a.get("name") or "").strip().lower().startswith(inp.lower())
+            ]
+            if len(prefix_hits) == 1:
+                return prefix_hits[0]
+
+        # 4. Role exact (legacy helpers.resolve_agent_id compat)
+        role_hits = [
+            a for a in active
+            if (a.get("role") or "").strip().lower() == inp.lower()
+        ]
+        if len(role_hits) == 1:
+            return role_hits[0]
 
         return None
 
@@ -435,11 +489,15 @@ class OrgService:
                     [parent_id, now_ms, now_ms, agent_id],
                 )
             else:
+                # 根因修复: 归档未完成任务用 cancelled（非 closed），与
+                # archive_task 保持一致。closed 语义是"成功完成"，dismiss
+                # 归档的任务并未完成。同时补写审计字段。
                 await conn.execute(
-                    "UPDATE tasks SET is_archived = 1, status = 'closed', "
-                    "closed_at = ?, updated_at = ? "
+                    "UPDATE tasks SET is_archived = 1, status = 'cancelled', "
+                    "archived_by = 'system', archived_reason = 'agent dismissed', "
+                    "archived_at = ?, updated_at = ? "
                     "WHERE assignee_id = ? AND is_archived = 0 "
-                    "AND status NOT IN ('closed')",
+                    "AND status NOT IN ('closed', 'cancelled')",
                     [now_ms, now_ms, agent_id],
                 )
             await conn.commit()
@@ -689,10 +747,21 @@ class OrgService:
         return f"A{str(max_num + 1).zfill(3)}"
 
     async def touch_last_active(self, agent_id: str) -> None:
-        """Persist activity timestamp (stall/silence must not use lifecycle status)."""
+        """Persist activity timestamp (stall/silence must not use lifecycle status).
+
+        Also sets activated_at on first activation (修 #4): COALESCE 幂等写入，
+        NULL → now；已有值不变。
+        """
         now_ms = int(time.time() * 1000)
         try:
             await self.update_agent(agent_id, {"last_active_at": now_ms})
+            # 修 #4: 首次激活时写入 activated_at
+            await project_db.execute(
+                agent_id,
+                "UPDATE agents SET activated_at = COALESCE(activated_at, ?) "
+                "WHERE id = ?",
+                [now_ms, agent_id],
+            )
         except Exception as e:
             log.warning(
                 "touch_last_active_failed",

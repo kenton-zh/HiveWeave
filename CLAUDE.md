@@ -219,6 +219,7 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 
 ### 任务账本、审查与合并门禁
 
+- **progress 语义**：生命周期完成度（非「是否已批准」）——claimed=10 / running=20 / submitted=90 / reviewing=92 / **approved=95** / verifying=97 / **closed=100**。approved 仍须 merge+VERIFY，100 仅属于 closed。
 - **assign = claim**：dispatch/指派即落账 `claimed`（`ensure_assignee_claimed`）；`claim_task` 幂等；`promote_assigned_created` 修存量
 - **CREATOR_MUST_MERGE**：creator 的任务 `approved` 后重新计入其义务（必须 merge 或转交），修「assigned 但 created 不算义务」的账本漏洞
 - **提交契约**：`creator_id == assignee_id`（自交）时 `[TASK SUBMITTED]` + trigger 发给 **org parent**（中层→CEO），不发自己

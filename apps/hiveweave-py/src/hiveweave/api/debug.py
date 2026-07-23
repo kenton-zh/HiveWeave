@@ -6,6 +6,7 @@
 - GET /api/debug/agents/{agentId}/memory        三层记忆 dump
 - GET /api/debug/system                         系统态（paused + 活跃 agent 数）
 - GET /api/debug/traces?agentId=&hours=         事件追踪（同 /api/events/audit）
+- GET /api/debug/workspaces?project_id=         角色感知生效 workspace + 健康检查
 """
 
 from __future__ import annotations
@@ -107,6 +108,71 @@ async def agent_runtime_snapshot(agent_id: str) -> dict:
         "inMemory": agent is not None,
         "name": config.get("name"),
         "role": config.get("role"),
+    }
+
+
+@router.get("/workspaces")
+async def debug_workspaces(
+    project_id: str = Query(..., description="Project id"),
+) -> dict:
+    """Effective workspace per agent (project_root vs worktree) + health.
+
+    Role-aware: CEO/HR (no write worktree) check project root ``.git``;
+    executors / builder coordinators check their worktree path. Prefer this
+    over ad-hoc scripts that treat NULL workspace_path as failure (TEST11 #4).
+    """
+    import os
+    from pathlib import Path
+
+    from hiveweave.services.git_worktree import agent_gets_write_worktree
+    from hiveweave.services.org import OrgService
+
+    ws = await meta_db.get_project_workspace(project_id)
+    if not ws:
+        raise HTTPException(status_code=404, detail="Project workspace not found")
+
+    project_root = str(Path(ws).resolve())
+    root_ok = os.path.isdir(project_root) and (Path(project_root) / ".git").exists()
+    agents = await OrgService().list_agents(project_id)
+    out: list[dict] = []
+    for a in agents:
+        if (a.get("status") or "active") == "archived":
+            continue
+        aid = a.get("id") or ""
+        gets_wt = agent_gets_write_worktree(a)
+        bound = (a.get("workspace_path") or "").strip() or None
+        if gets_wt:
+            effective = bound or None
+            kind = "worktree"
+            healthy = bool(
+                effective
+                and os.path.isdir(effective)
+                and (Path(effective) / ".git").exists()
+            )
+        else:
+            effective = project_root
+            kind = "project_root"
+            healthy = root_ok
+        out.append(
+            {
+                "agentId": aid,
+                "shortId": a.get("short_id"),
+                "name": a.get("name"),
+                "role": a.get("role"),
+                "permissionType": a.get("permission_type"),
+                "getsWriteWorktree": gets_wt,
+                "kind": kind,
+                "boundWorkspacePath": bound,
+                "effectiveWorkspace": effective,
+                "healthy": healthy,
+                "worktreeError": a.get("worktree_error"),
+            }
+        )
+    return {
+        "projectId": project_id,
+        "projectRoot": project_root,
+        "projectRootHealthy": root_ok,
+        "agents": out,
     }
 
 

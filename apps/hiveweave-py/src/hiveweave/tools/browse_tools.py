@@ -36,7 +36,10 @@ class BrowseParams(BaseModel):
     timeout_sec: int = Field(
         default=60,
         alias="timeoutSec",
-        description="Max seconds to wait for the browse command (default 60).",
+        description=(
+            "Max seconds to wait for the browse command "
+            "(default 60; click/wait floored at 30)."
+        ),
     )
     task_id: str | None = Field(
         default=None,
@@ -136,6 +139,11 @@ async def browse_tool(
         )
 
     timeout = max(5, min(int(params.timeout_sec or 60), 300))
+    # click/wait often need >10s for async UI; agents historically passed 10
+    # and timed out (TEST11 evening P3-4). Floor at 30s for those actions.
+    head = (argv[0] or "").lower().replace("-", "_")
+    if head in ("click", "wait", "wait_for", "waitfor", "fill", "press"):
+        timeout = max(30, timeout)
     cmd = [str(bin_path), *argv]
     cwd = workspace if workspace and Path(workspace).is_dir() else None
 
