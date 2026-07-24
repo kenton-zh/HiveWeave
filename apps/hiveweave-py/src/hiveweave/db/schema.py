@@ -514,6 +514,21 @@ PROJECT_DB_TABLES = [
         fulfilled_at INTEGER
     )
     """,
+    # DESIGN-3: dismiss quota + same-role rehire cooldown audit log
+    """
+    CREATE TABLE IF NOT EXISTS org_dismiss_log (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        role TEXT,
+        role_key TEXT,
+        short_id TEXT,
+        name TEXT,
+        game_day INTEGER NOT NULL,
+        dismissed_by TEXT,
+        dismissed_at INTEGER NOT NULL
+    )
+    """,
 ]
 
 # ── Meta DB 索引 ────────────────────────────────────────────
@@ -555,4 +570,6 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_verification_cases_original ON verification_cases(original_task_id)",
     "CREATE INDEX IF NOT EXISTS idx_verification_cases_verify ON verification_cases(verify_task_id)",
     "CREATE INDEX IF NOT EXISTS idx_staffing_demands_open ON staffing_demands(project_id, status) WHERE status = 'open'",
+    "CREATE INDEX IF NOT EXISTS idx_org_dismiss_log_project_day ON org_dismiss_log(project_id, game_day)",
+    "CREATE INDEX IF NOT EXISTS idx_org_dismiss_log_role ON org_dismiss_log(project_id, role_key, game_day)",
 ]

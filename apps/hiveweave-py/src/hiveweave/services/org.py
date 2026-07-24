@@ -163,6 +163,27 @@ class OrgService:
             if err:
                 raise ValueError(err)
 
+        # DESIGN-3: same-role dismiss→hire cooldown
+        role = str(attrs.get("role") or "")
+        if not bootstrap and project_id and role:
+            try:
+                from hiveweave.services.org_guardrails import (
+                    check_same_role_rehire,
+                )
+
+                rehire_err = await check_same_role_rehire(project_id, role)
+                if rehire_err:
+                    raise ValueError(rehire_err)
+            except ValueError:
+                raise
+            except Exception as e:
+                log.warning(
+                    "org.same_role_rehire_check_failed",
+                    project_id=project_id,
+                    role=role,
+                    error=str(e),
+                )
+
         cols: list[str] = ["id", "short_id", "created_at", "updated_at"]
         vals: list = [agent_id, None, now_ms, now_ms]  # short_id filled under lock
 
@@ -452,12 +473,21 @@ class OrgService:
         log.info("org.delete_agent", agent_id=agent_id)
         return {"success": True}
 
-    async def dismiss_agent(self, project_id: str, agent_id: str) -> dict:
+    async def dismiss_agent(
+        self,
+        project_id: str,
+        agent_id: str,
+        *,
+        dismissed_by: str | None = None,
+    ) -> dict:
         """Soft-delete (archive) an agent. Verifies no subordinates.
 
         Closes the lifecycle: open tasks reassigned/archived, inbox ACKed,
         alarms cancelled, worktree cleaned. Returns ``{success, agent}`` or
         ``{success: False, message}``.
+
+        DESIGN-3: enforces per-project per-game-day dismiss quota before
+        archiving; records the event for same-role rehire cooldown.
         """
         children = await self.get_subordinates(agent_id)
         if children:
@@ -469,9 +499,41 @@ class OrgService:
         if not agent_before:
             return {"success": False, "message": "Agent not found"}
 
+        # DESIGN-3: dismiss quota (blast-radius controller)
+        try:
+            from hiveweave.services.org_guardrails import check_dismiss_quota
+
+            quota_err = await check_dismiss_quota(project_id)
+            if quota_err:
+                return {"success": False, "message": quota_err}
+        except Exception as e:
+            log.warning(
+                "dismiss_quota_check_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
+
         updated = await self.update_agent(agent_id, {"status": "archived"})
         if not updated:
             return {"success": False, "message": "Agent not found"}
+
+        try:
+            from hiveweave.services.org_guardrails import record_dismiss
+
+            await record_dismiss(
+                project_id,
+                agent_id=agent_id,
+                role=str(agent_before.get("role") or ""),
+                dismissed_by=dismissed_by,
+                short_id=agent_before.get("short_id"),
+                name=agent_before.get("name"),
+            )
+        except Exception as e:
+            log.warning(
+                "dismiss_record_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
 
         parent_id = agent_before.get("parent_id") or ""
         # Resolve grandparent once — used when reassign would make
