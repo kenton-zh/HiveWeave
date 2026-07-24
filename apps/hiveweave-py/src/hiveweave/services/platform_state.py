@@ -275,6 +275,59 @@ async def build_platform_state(
             )
         )
 
+    # ── Verification cases (verified) ────────────────────
+    try:
+        from hiveweave.services.task import VerificationCaseService
+
+        cases = await VerificationCaseService().list_cases_for_project(
+            project_id, limit=20
+        )
+        verified.append(
+            _entry(
+                "ledger.verification_cases",
+                [
+                    {
+                        "id": (c.get("id") or "")[:8],
+                        "status": c.get("status"),
+                        "original_task_id": (c.get("original_task_id") or "")[:8],
+                        "verify_task_id": (c.get("verify_task_id") or "")[:8],
+                        "merge_commit_hash": (
+                            (c.get("merge_commit_hash") or "")[:12] or None
+                        ),
+                        "review_notes": (c.get("review_notes") or "")[:160],
+                        "qa_agent_id": (
+                            (c.get("qa_agent_id") or "")[:8] or None
+                        ),
+                    }
+                    for c in cases
+                ],
+                epistemic="verified",
+                source="verification_cases",
+            )
+        )
+    except Exception as e:
+        unknown.append(
+            _entry(
+                "ledger.verification_cases",
+                None,
+                epistemic="unknown",
+                source="verification_cases",
+                note=str(e),
+            )
+        )
+
+    # Stale worktree_error on self (verified)
+    if agent_row and agent_row.get("worktree_error"):
+        verified.append(
+            _entry(
+                "agent.worktree_error",
+                str(agent_row.get("worktree_error"))[:200],
+                epistemic="verified",
+                source="agents",
+                note="Clear via ensure worktree / restart heal if tree is healthy.",
+            )
+        )
+
     # ── Org snapshot + dismiss quota (verified) ──────────
     org_summary: dict[str, Any] = {}
     try:

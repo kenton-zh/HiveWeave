@@ -1830,6 +1830,8 @@ async def waive_attestation_tool(
     替代过去的 charter 口头豁免（工具层不读 charter，口头豁免无效）。
     """
     from hiveweave.services.attestation import create_waiver
+    from hiveweave.services.org import OrgService
+    from hiveweave.services.policy import infer_role_family
 
     project_id = await get_project_id(agent_id)
     if not project_id:
@@ -1840,6 +1842,11 @@ async def waive_attestation_tool(
         return ToolResult.err(
             "waive_attestation requires a non-empty 'reason' (auditability)."
         )
+    if len(reason) < 20:
+        return ToolResult.err(
+            "waive_attestation reason too short (min 20 chars). "
+            "State what was checked and why machine attestation cannot apply."
+        )
 
     ts = TaskService()
     try:
@@ -1848,6 +1855,41 @@ async def waive_attestation_tool(
         return ToolResult.err(f"Failed to load task: {e}")
     if not task:
         return ToolResult.err(f"Task not found: {params.task_id}")
+
+    tags = task.get("tags") or []
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            tags = []
+    from hiveweave.services.attestation import resolve_task_policy
+
+    policy_id = task.get("policy_id") or resolve_task_policy(
+        title=task.get("title") or "",
+        tags=tags if isinstance(tags, list) else [],
+        description=task.get("description") or "",
+    )
+    if policy_id == "docs_only" or (
+        isinstance(tags, list) and "docs_only" in tags
+    ):
+        return ToolResult.err(
+            f"Cannot waive docs_only task {params.task_id}: "
+            "use attest_doc_review(taskId, files=[{{path}}]) then "
+            "submit/approve with attestationIds. Waiver is blocked for "
+            "document tasks."
+        )
+
+    is_verify = ts._is_verify_task(task)
+    if is_verify:
+        agent = await OrgService().get_agent(agent_id)
+        family = infer_role_family(agent or {})
+        if family != "ceo":
+            return ToolResult.err(
+                f"VERIFY task {params.task_id}: only CEO may waive_attestation "
+                "(identity / attestation last resort). Coordinators must require "
+                "test_run / browse_e2e attestationIds, or escalate to CEO with "
+                "an auditable reason."
+            )
 
     try:
         waiver_id = await create_waiver(
@@ -1859,14 +1901,23 @@ async def waive_attestation_tool(
     except Exception as e:
         return ToolResult.err(f"Failed to create waiver: {e}")
 
-    # Best-effort: mark verification case waived when this is a VERIFY task
+    # Best-effort: mark / ensure verification case when this is a VERIFY task
     try:
-        if ts._is_verify_task(task):
+        if is_verify:
             from hiveweave.services.task import VerificationCaseService
 
             parent_id = task.get("parent_task_id") or params.task_id
-            await VerificationCaseService().mark_waived(
-                project_id, parent_id, reason=reason
+            vcs = VerificationCaseService()
+            await vcs.ensure_case(
+                project_id,
+                original_task_id=parent_id,
+                verify_task_id=params.task_id,
+            )
+            await vcs.mark_waived(
+                project_id,
+                parent_id,
+                reason=reason,
+                verify_task_id=params.task_id,
             )
     except Exception:
         pass
@@ -1899,11 +1950,18 @@ async def waive_attestation_tool(
         task_id=params.task_id,
         waived_by=agent_id,
         reason=reason[:120],
+        is_verify=is_verify,
     )
     return ToolResult.ok(
         f"Attestation waived for task {params.task_id} "
-        f"(waiver {waiver_id[:8]}, expires in 24h). "
+        f"(waiver {waiver_id[:8]}, expires in 24h).\n"
+        f"Stored reason (quote this in reports): {reason}\n"
         f"Assignee may now submit_task without attestationIds."
+        + (
+            " VERIFY waive is CEO-only and leaves an auditable verification_case."
+            if is_verify
+            else ""
+        )
     )
 
 
@@ -2827,6 +2885,23 @@ async def get_tasks_tool(
             "Tip: claim/submit/review/cancel accept full UUID or unique "
             "8-char prefix — prefer copying the full id= value."
         ]
+        # Prefetch verification cases for VERIFY visibility (TEST12 dogfood)
+        case_by_verify: dict[str, dict] = {}
+        case_by_original: dict[str, dict] = {}
+        try:
+            from hiveweave.services.task import VerificationCaseService
+
+            for case in await VerificationCaseService().list_cases_for_project(
+                project_id, limit=50
+            ):
+                vid = case.get("verify_task_id")
+                oid = case.get("original_task_id")
+                if vid:
+                    case_by_verify[str(vid)] = case
+                if oid:
+                    case_by_original[str(oid)] = case
+        except Exception:
+            pass
         for t in tasks:
             tid = str(t.get("id") or "")
             lines.append(
@@ -2835,6 +2910,28 @@ async def get_tasks_tool(
                 f"progress={t.get('progress', 0)}%, "
                 f"assignee={t.get('assignee_id') or 'unassigned'})"
             )
+            case = case_by_verify.get(tid) or case_by_original.get(tid)
+            if case:
+                notes = (case.get("review_notes") or "").replace("\n", " ")[:120]
+                lines.append(
+                    f"    verification_case: status={case.get('status')}, "
+                    f"merge={str(case.get('merge_commit_hash') or '')[:12] or '—'}, "
+                    f"notes={notes or '—'}"
+                )
+            ev = t.get("evidence") or {}
+            if isinstance(ev, str):
+                try:
+                    ev = json.loads(ev)
+                except Exception:
+                    ev = {}
+            if isinstance(ev, dict) and ev.get("verification_case") and not case:
+                vc = ev["verification_case"]
+                if isinstance(vc, dict):
+                    lines.append(
+                        f"    verification_case(evidence): "
+                        f"status={vc.get('status')}, "
+                        f"notes={str(vc.get('review_notes') or '')[:80]}"
+                    )
         # Informational (TEST11 #7): creator tracking of running work —
         # not an obligation, just a Lead visibility partition.
         tracking = [
