@@ -141,11 +141,22 @@ async def commit_turn_tool(
                         "CREATOR_MUST_REVIEW": "有 submitted/reviewing 任务待审查",
                         "CREATOR_MUST_MERGE": "有 approved 任务待合并",
                     }
-                    # P2-2 soft-warn: first hit per code this turn → warn+allow;
-                    # second hit → hard reject (reduces wasted LLM round-trips).
+                    # Soft-warn (reminder-class only): first hit → warn+allow;
+                    # second → hard. HARD_COMMIT_GATE_CODES (UNREPLIED_ASKS)
+                    # always hard — soft-pass must not end the reply contract
+                    # (TEST14 BUG-1). Soft-pass does not suppress backstop.
                     soft, hard = classify_commit_gate_soft_warn(
                         agent_id, violations
                     )
+                    try:
+                        from hiveweave.services.telemetry import telemetry
+
+                        for code in hard:
+                            telemetry.gate_hard_reject(code)
+                        for code in soft:
+                            telemetry.gate_soft_pass(code)
+                    except Exception:
+                        pass
                     if hard:
                         hints = [labels.get(v, v) for v in hard]
                         soft_note = ""
@@ -164,7 +175,9 @@ async def commit_turn_tool(
                         )
                     if soft:
                         # Soft-pass: accept TurnResult but surface the warning.
-                        # Still end_turn — platform owns the rest of the exit.
+                        # Still end_turn — backstop may still repair if the
+                        # violation is real (name-mismatch false positives
+                        # are fixed in pre_check enrichment).
                         set_pending_turn_result(agent_id, payload)
                         hints = [labels.get(v, v) for v in soft]
                         # Persist observability (best-effort)
@@ -195,8 +208,8 @@ async def commit_turn_tool(
                             f"STOP: TurnResult accepted WITH SOFT WARNING "
                             f"(first offense this turn): {'; '.join(hints)}. "
                             f"gates: {soft}. Do NOT call any more tools. "
-                            f"Same gate will HARD REJECT on repeat. "
-                            f"phase={tr.phase}.",
+                            f"Exit backstop may still require a fix if the "
+                            f"obligation remains open. phase={tr.phase}.",
                             turn_result=payload,
                             soft_pass=soft,
                             end_turn=True,

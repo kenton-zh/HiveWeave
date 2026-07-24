@@ -138,11 +138,12 @@ class GameTimeService:
         self._project_id = project_id
 
     async def _watchdog_trigger(
-        self, agent_id: str, *, role: str | None = None
+        self, agent_id: str, *, role: str | None = None, force: bool = False
     ) -> None:
         """Wake an agent after a watchdog nudge.
 
-        Skips ``complete`` agents with no open obligations (quota burn).
+        Skips ``complete`` agents with no open obligations (quota burn),
+        unless ``force=True`` (e.g. TEST14 ask-outstanding re-nudge).
         Uses ``trigger_coordinator`` for coordinator roles so empty-pending
         backgrounds do not start an LLM turn.
         """
@@ -154,7 +155,11 @@ class GameTimeService:
         )
 
         inst = agent_manager.get_agent(agent_id)
-        if inst is not None and getattr(inst, "disposition", None) == "complete":
+        if (
+            not force
+            and inst is not None
+            and getattr(inst, "disposition", None) == "complete"
+        ):
             try:
                 from hiveweave.services.task import TaskService
 
@@ -513,33 +518,9 @@ class GameTimeService:
         await wait_contract_service.backfill_null_expires(project_id)
         cleared = await wait_contract_service.clear_expired(project_id)
         inbox = InboxService()
-        for w in cleared:
-            aid = w.get("agentId") or ""
-            if not aid:
-                continue
-            kind = w.get("kind") or "?"
-            ref = w.get("ref") or "?"
-            try:
-                await inbox.send_message(
-                    from_agent_id="system",
-                    to_agent_id=aid,
-                    message=(
-                        f"[WAIT_TIMEOUT] Your wait ({kind}:{ref}) expired. "
-                        "Resume work or re-establish a wait."
-                    ),
-                    message_type="system",
-                    priority="urgent",
-                )
-                await self._watchdog_trigger(aid)
-            except Exception as e:
-                log.warning(
-                    "wait_timeout_notify_failed",
-                    agent_id=aid,
-                    error=str(e),
-                )
-
         agents = await OrgService().list_agents(project_id)
         by_key: dict[str, str] = {}
+        name_by_id: dict[str, str] = {}
         for a in agents:
             aid = a.get("id") or ""
             if not aid:
@@ -549,6 +530,7 @@ class GameTimeService:
                 by_key[str(a["short_id"]).lower()] = aid
             if a.get("name"):
                 by_key[str(a["name"]).lower()] = aid
+                name_by_id[aid] = str(a["name"])
 
         def resolve_ref(ref: str) -> str | None:
             r = (ref or "").strip().lower()
@@ -560,6 +542,117 @@ class GameTimeService:
                 if len(r) >= 4 and (k.startswith(r) or r.startswith(k)):
                     return v
             return None
+
+        for w in cleared:
+            aid = w.get("agentId") or ""
+            if not aid:
+                continue
+            kind = w.get("kind") or "?"
+            ref = w.get("ref") or "?"
+            ask_outstanding = False
+            ref_agent_id: str | None = None
+            ref_last_active: str | None = None
+            if str(kind).lower() == "agent":
+                ref_agent_id = resolve_ref(str(ref))
+                if ref_agent_id:
+                    try:
+                        outstanding = await inbox.get_outstanding_ask_recipients(
+                            aid
+                        )
+                        ask_outstanding = ref_agent_id in outstanding
+                    except Exception:
+                        ask_outstanding = False
+                    # Best-effort last activity from agent row / runs
+                    try:
+                        for a in agents:
+                            if a.get("id") == ref_agent_id:
+                                ref_last_active = (
+                                    a.get("updated_at")
+                                    or a.get("last_active_at")
+                                    or a.get("last_seen_at")
+                                )
+                                if ref_last_active is not None:
+                                    ref_last_active = str(ref_last_active)
+                                break
+                    except Exception:
+                        pass
+            try:
+                # Structured payload for the waiter (TEST14 P1b)
+                struct = {
+                    "wait_ref": ref,
+                    "wait_kind": kind,
+                    "ask_outstanding": ask_outstanding,
+                    "ref_agent_id": ref_agent_id,
+                    "ref_last_active": ref_last_active,
+                }
+                body = (
+                    f"[WAIT_TIMEOUT] Your wait ({kind}:{ref}) expired. "
+                    f"ask_outstanding={ask_outstanding}. "
+                    "Resume work or re-establish a wait. "
+                    f"details={struct}"
+                )
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=aid,
+                    message=body,
+                    message_type="system",
+                    priority="urgent",
+                )
+                await self._watchdog_trigger(aid)
+            except Exception as e:
+                log.warning(
+                    "wait_timeout_notify_failed",
+                    agent_id=aid,
+                    error=str(e),
+                )
+
+            # Re-nudge debtor when wait was on an agent and ask still open
+            if ask_outstanding and ref_agent_id and ref_agent_id != aid:
+                waiter_name = name_by_id.get(aid) or aid[:8]
+                try:
+                    # Supersede prior ASK_OUTSTANDING nudges to avoid spam
+                    from hiveweave.db import project as project_db
+
+                    try:
+                        await project_db.execute(
+                            ref_agent_id,
+                            "UPDATE inbox SET read = 1, delivered = 1, wake = 0 "
+                            "WHERE to_agent_id = ? AND from_agent_id = 'system' "
+                            "AND COALESCE(read, 0) = 0 "
+                            "AND message LIKE '[ASK_OUTSTANDING]%'",
+                            [ref_agent_id],
+                        )
+                    except Exception as e:
+                        log.debug("ask_outstanding_supersede_failed", error=str(e))
+
+                    await inbox.send_message(
+                        from_agent_id="system",
+                        to_agent_id=ref_agent_id,
+                        message=(
+                            f"[ASK_OUTSTANDING] {waiter_name} is still waiting "
+                            f"on your reply (wait ref={ref}). "
+                            "An expect_report/ask contract to them is still open — "
+                            "call send_message/ask_agent to them now. "
+                            "Assistant text alone does not close the contract."
+                        ),
+                        message_type="system",
+                        priority="urgent",
+                        wake=True,
+                    )
+                    await self._watchdog_trigger(ref_agent_id, force=True)
+                    log.info(
+                        "wait_timeout_ask_renudge",
+                        waiter=aid,
+                        debtor=ref_agent_id,
+                        ref=ref,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "wait_timeout_renudge_failed",
+                        waiter=aid,
+                        debtor=ref_agent_id,
+                        error=str(e),
+                    )
 
         breaks = await wait_contract_service.break_wait_cycles(
             project_id, resolve_ref

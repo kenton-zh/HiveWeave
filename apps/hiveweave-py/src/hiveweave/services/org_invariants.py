@@ -191,7 +191,11 @@ def _executor_under_ceo_error(parent: dict[str, Any] | None) -> str | None:
     if prole == "ceo":
         return (
             "Executors cannot report directly to CEO (span / org design). "
-            "Set parentId to a coordinator (architect / tech lead / manager)."
+            "Set parentId to a coordinator (architect / tech lead / manager). "
+            "NEXT: if no coordinator exists, hire one first "
+            "(permissionType=coordinator, parentId=CEO), then hire this "
+            "executor with parentId=<that coordinator>. Do not ask CEO to "
+            "confirm — this is the only legal remedy."
         )
     return None
 

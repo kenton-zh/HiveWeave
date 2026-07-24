@@ -22,6 +22,17 @@ log = structlog.get_logger(__name__)
 
 _migrated: set[str] = set()
 
+
+def _row_val(row: object, key: str, default=None):
+    """Read a column from aiosqlite.Row / mapping (Row has no ``.get``)."""
+    try:
+        if hasattr(row, "keys") and key not in row.keys():  # type: ignore[operator]
+            return default
+        return row[key]  # type: ignore[index]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
 # Give-up ACK / deactivate-park must NOT swallow these — review & escalation
 # obligations live in the inbox wake path (BUGFIX: TEST7 429→ACK killed reviews).
 ACK_SPARE_MESSAGE_TYPES: frozenset[str] = frozenset({"escalation", "ask"})
@@ -751,7 +762,7 @@ class InboxService:
             contracts = [
                 r["reply_contract_id"]
                 for r in rows
-                if r.get("reply_contract_id")
+                if _row_val(r, "reply_contract_id")
             ]
             closed: set[str] = set()
             if contracts:
@@ -764,25 +775,166 @@ class InboxService:
                     list(contracts),
                 )
                 closed = {
-                    r["reply_to"] for r in closed_rows if r.get("reply_to")
+                    r["reply_to"]
+                    for r in closed_rows
+                    if _row_val(r, "reply_to")
                 }
             out: set[str] = set()
             for r in rows:
-                to_id = r.get("to_agent_id")
+                to_id = _row_val(r, "to_agent_id")
                 if not to_id:
                     continue
-                cid = r.get("reply_contract_id")
+                cid = _row_val(r, "reply_contract_id")
                 if cid and cid in closed:
                     continue
                 if cid and cid not in closed:
                     out.add(to_id)
-                elif not cid and not r.get("read"):
+                elif not cid and not _row_val(r, "read"):
                     # Legacy ask without contract: unread counts as outstanding
                     out.add(to_id)
             return out
         except Exception as e:
             log.debug("inbox_outstanding_asks_failed", error=str(e))
             return set()
+
+    async def get_outstanding_ask_senders(
+        self, to_agent_id: str
+    ) -> set[str]:
+        """Senders of unanswered expect_report asks *to* this agent.
+
+        Contract-based (TEST14 P1a): an ask is outstanding when its
+        ``reply_contract_id`` has not been closed via any ``reply_to``.
+        Legacy asks without a contract fall back to unread.
+        Used by ``pre_check_exit_gates`` so read≠replied no longer clears
+        the UNREPLIED_ASKS pre-check.
+        """
+        await _ensure_schema(to_agent_id)
+        try:
+            rows = await project_db.query(
+                to_agent_id,
+                "SELECT from_agent_id, reply_contract_id, read FROM inbox "
+                "WHERE to_agent_id = ? AND expect_report = 1 "
+                "AND from_agent_id NOT IN ('user', 'system') "
+                "ORDER BY created_at DESC LIMIT 100",
+                [to_agent_id],
+            )
+            if not rows:
+                return set()
+            contracts = [
+                r["reply_contract_id"]
+                for r in rows
+                if _row_val(r, "reply_contract_id")
+            ]
+            closed: set[str] = set()
+            if contracts:
+                placeholders = ",".join("?" * len(contracts))
+                closed_rows = await project_db.query(
+                    to_agent_id,
+                    f"SELECT DISTINCT reply_to FROM inbox "
+                    f"WHERE reply_to IN ({placeholders})",
+                    list(contracts),
+                )
+                closed = {
+                    r["reply_to"]
+                    for r in closed_rows
+                    if _row_val(r, "reply_to")
+                }
+            out: set[str] = set()
+            for r in rows:
+                from_id = _row_val(r, "from_agent_id")
+                if not from_id:
+                    continue
+                cid = _row_val(r, "reply_contract_id")
+                if cid and cid in closed:
+                    continue
+                if cid and cid not in closed:
+                    out.add(from_id)
+                elif not cid and not _row_val(r, "read"):
+                    out.add(from_id)
+            if not out:
+                return set()
+            # Align with evaluate_turn_exit exempt_senders (TEST14 review):
+            # archived / missing senders must not hard-reject the debtor.
+            placeholders = ",".join("?" * len(out))
+            agent_rows = await project_db.query(
+                to_agent_id,
+                f"SELECT id, status FROM agents WHERE id IN ({placeholders})",
+                list(out),
+            )
+            active_ids = {
+                _row_val(a, "id")
+                for a in agent_rows
+                if _row_val(a, "id")
+                and (_row_val(a, "status") or "active") != "archived"
+            }
+            return {sid for sid in out if sid in active_ids}
+        except Exception as e:
+            log.debug("inbox_outstanding_ask_senders_failed", error=str(e))
+            return set()
+
+    async def waive_reply_contracts(
+        self,
+        agent_id: str,
+        items: list[dict],
+        *,
+        reason: str = "escape_valve",
+    ) -> int:
+        """Close open reply contracts by writing ``reply_to`` rows (TEST14).
+
+        Escape valve previously only ``mark_read`` — after P1a pre_check is
+        contract-based, mark_read alone left ``commit_turn`` hard-rejecting.
+        Each item: ``{"contract_id": str, "to_agent_id": str}`` (to = original asker).
+        Returns number of contracts newly closed.
+        """
+        await _ensure_schema(agent_id)
+        closed_n = 0
+        now_ms = int(time.time() * 1000)
+        for item in items:
+            cid = (item.get("contract_id") or "").strip()
+            to_id = (item.get("to_agent_id") or "").strip()
+            if not cid or not to_id:
+                continue
+            try:
+                existing = await project_db.query(
+                    agent_id,
+                    "SELECT 1 AS ok FROM inbox WHERE reply_to = ? LIMIT 1",
+                    [cid],
+                )
+                if existing:
+                    continue
+                msg_id = str(uuid.uuid4())
+                await project_db.execute(
+                    agent_id,
+                    "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, "
+                    "read, created_at, message_type, expect_report, priority, "
+                    "task_id, wake, idempotency_key, delivered, wake_category, "
+                    "reply_contract_id, reply_to) "
+                    "VALUES (?, ?, ?, ?, 1, ?, 'system', 0, 'normal', NULL, "
+                    "0, NULL, 0, NULL, NULL, ?)",
+                    [
+                        msg_id,
+                        agent_id,
+                        to_id,
+                        f"[CONTRACT_WAIVED:{reason}] reply obligation released",
+                        now_ms,
+                        cid,
+                    ],
+                )
+                closed_n += 1
+            except Exception as e:
+                log.debug(
+                    "inbox_waive_contract_failed",
+                    contract=cid[:8],
+                    error=str(e),
+                )
+        if closed_n:
+            log.info(
+                "inbox_reply_contracts_waived",
+                agent_id=agent_id,
+                count=closed_n,
+                reason=reason,
+            )
+        return closed_n
 
     async def get_sent_recipients_since(
         self, agent_id: str, since_ms: int
@@ -800,7 +952,11 @@ class InboxService:
                 "WHERE from_agent_id = ? AND created_at >= ?",
                 [agent_id, int(since_ms)],
             )
-            return {r["to_agent_id"] for r in rows if r.get("to_agent_id")}
+            return {
+                r["to_agent_id"]
+                for r in rows
+                if _row_val(r, "to_agent_id")
+            }
         except Exception as e:
             log.debug("inbox_sent_since_failed", error=str(e))
             return set()
@@ -823,7 +979,9 @@ class InboxService:
                 "AND reply_to IS NOT NULL",
                 [agent_id, int(since_ms)],
             )
-            return {r["reply_to"] for r in rows if r.get("reply_to")}
+            return {
+                r["reply_to"] for r in rows if _row_val(r, "reply_to")
+            }
         except Exception as e:
             log.debug("inbox_replied_contracts_failed", error=str(e))
             return set()
