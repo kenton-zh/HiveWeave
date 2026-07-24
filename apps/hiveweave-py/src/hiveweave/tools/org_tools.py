@@ -900,6 +900,45 @@ async def check_agent_status_tool(
     )
 
 
+# ── get_platform_state ───────────────────────────────────
+
+
+class GetPlatformStateParams(BaseModel):
+    """Parameters for get_platform_state (no inputs — scoped to caller)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+@tool(
+    "get_platform_state",
+    "Read-only platform ground truth: gates, task ledger, org, runtime — "
+    "split into verified / claimed / unknown (Magentic-One epistemology). "
+    "MUST call this before treating peer chat claims about gates/progress/"
+    "org as facts. When peer text conflicts with verified entries, trust "
+    "the platform and report the conflict.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def get_platform_state_tool(
+    params: GetPlatformStateParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """Aggregate platform state with epistemology tags (DESIGN P0-2)."""
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project_id")
+
+    from hiveweave.services.platform_state import (
+        build_platform_state,
+        format_platform_state,
+    )
+
+    snapshot = await build_platform_state(
+        agent_id=agent_id, project_id=project_id
+    )
+    text = format_platform_state(snapshot)
+    return ToolResult.ok(text, platform_state=snapshot)
+
+
 # ── list_subordinates ────────────────────────────────────
 
 
