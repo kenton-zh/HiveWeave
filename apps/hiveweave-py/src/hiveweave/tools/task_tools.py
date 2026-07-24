@@ -639,6 +639,16 @@ class CreateTaskParams(BaseModel):
         description="Tags for the task (optional).",
         json_schema_extra={"aliases": ["tags", "tag"]},
     )
+    contract_json: dict[str, Any] | None = Field(
+        default=None,
+        alias="contractJson",
+        description=(
+            "Slice contract (optional). When set, this task is a slice: "
+            "ready gate blocks start until upstream verified; submit runs "
+            "machine acceptance (file_exists/content_contains/min_lines)."
+        ),
+        json_schema_extra={"aliases": ["contractJson", "contract_json", "contract"]},
+    )
 
     @field_validator(
         "acceptance_criteria", "depends_on", "expected_modules", "tags",
@@ -734,6 +744,7 @@ async def create_task_tool(
             expected_modules=params.expected_modules,
             tags=params.tags,
             source="agent",
+            contract_json=params.contract_json,
         )
         task = await ts.get_task(project_id, task_id)
         st = (task or {}).get("status") or "created"

@@ -225,6 +225,7 @@ PROJECT_DB_TABLES = [
         acceptance_criteria TEXT,
         evidence TEXT,
         expected_modules TEXT,
+        contract_json TEXT,
         blocked_reason TEXT,
         source TEXT DEFAULT 'agent',
         retry_count INTEGER DEFAULT 0,
@@ -407,6 +408,7 @@ PROJECT_DB_TABLES = [
     )
     """,
     """ALTER TABLE tasks ADD COLUMN policy_id TEXT""",
+    """ALTER TABLE tasks ADD COLUMN contract_json TEXT""",
     # ── Durable Run Ledger ──────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS agent_activations (
