@@ -279,6 +279,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("worktree_recovery_init_failed", error=str(e))
 
+    # 2b. TEST13 P1-3: reconcile orphan verification_cases
+    try:
+        from hiveweave.services.task import VerificationCaseService
+
+        vcs = VerificationCaseService()
+        vc_fixed = 0
+        for p in projects:
+            try:
+                vc_fixed += await vcs.reconcile_orphans(p["id"])
+            except Exception:
+                pass
+        if vc_fixed:
+            log.info("verification_cases_reconcile_done", fixed=vc_fixed)
+    except Exception as e:
+        log.warning("verification_cases_reconcile_failed", error=str(e))
+
     # 3. Seed default model
     try:
         model_svc = ModelService()

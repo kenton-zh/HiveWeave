@@ -1424,6 +1424,19 @@ class TaskService:
         # （archive_task 在 current=="closed" 时已 raise，此处 current 必非 closed）
         archived_task = await self.get_task(project_id, task_id)
         if archived_task and self._is_verify_task(archived_task):
+            # TEST13 P1-3: cascade close verification_case
+            try:
+                await VerificationCaseService().mark_cancelled(
+                    project_id,
+                    task_id,
+                    reason=f"VERIFY archived: {reason[:200]}",
+                )
+            except Exception as e:
+                log.warning(
+                    "verify_case_cancel_on_archive_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
             parent_id = archived_task.get("parent_task_id")
             if parent_id:
                 parent_rows = await _query(
@@ -1450,6 +1463,75 @@ class TaskService:
                         )
 
         return current
+
+    async def reassign_task(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        new_assignee_id: str,
+        reassigned_by: str,
+        reason: str = "",
+    ) -> dict:
+        """Change assignee and ensure the new owner has an actionable status.
+
+        TEST13 P0-2: NL "forward" creates no obligation — this is the
+        structured transfer. Keeps status when already claimed/running;
+        promotes created → claimed; resets submitted/reviewing to claimed
+        so the new assignee can re-submit.
+        """
+        task_id = await self.require_task_id(project_id, task_id)
+        task = await self.get_task(project_id, task_id)
+        if not task:
+            raise ValueError(f"Task not found: {task_id}")
+        if task.get("is_archived"):
+            raise ValueError(f"Task {task_id[:8]} is archived")
+        status = task.get("status") or ""
+        if status in ("closed", "cancelled"):
+            raise ValueError(f"Cannot reassign terminal task ({status})")
+        now_ms = int(time.time() * 1000)
+        old = task.get("assignee_id")
+        new_status = status
+        if status == "created":
+            await self._transition(project_id, task_id, "claimed")
+            new_status = "claimed"
+        elif status == "submitted":
+            await self._transition(project_id, task_id, "running")
+            new_status = "running"
+        elif status == "blocked":
+            await self._transition(project_id, task_id, "running")
+            new_status = "running"
+        elif status == "reviewing":
+            # reviewing has no direct → claimed; force for reassignment
+            await _execute(
+                project_id,
+                "UPDATE tasks SET status = 'claimed', progress = 10, "
+                "updated_at = ? WHERE id = ?",
+                [now_ms, task_id],
+            )
+            new_status = "claimed"
+        await _execute(
+            project_id,
+            "UPDATE tasks SET assignee_id = ?, claimed_at = COALESCE(claimed_at, ?), "
+            "updated_at = ? WHERE id = ?",
+            [new_assignee_id, now_ms, now_ms, task_id],
+        )
+        log.info(
+            "task_reassigned",
+            project_id=project_id,
+            task_id=task_id,
+            from_assignee=(old or "")[:8],
+            to_assignee=new_assignee_id[:8],
+            by=reassigned_by[:8],
+            status=new_status,
+            reason=(reason or "")[:80],
+        )
+        return {
+            "task_id": task_id,
+            "from_assignee": old,
+            "to_assignee": new_assignee_id,
+            "status": new_status,
+        }
 
     async def unclaim_task(self, project_id: str, task_id: str) -> None:
         """释放认领（claimed → created），清空 assignee 供重新分配。
@@ -2250,6 +2332,71 @@ class VerificationCaseService:
             )
         except Exception as e:
             log.warning("verification_case_mark_failed_failed", error=str(e))
+
+    async def mark_cancelled(
+        self, project_id: str, verify_task_id: str,
+        reason: str = "",
+    ) -> None:
+        """Close verification case when VERIFY task is cancelled/archived."""
+        now_ms = int(time.time() * 1000)
+        note = (reason or "VERIFY task cancelled")[:500]
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET status = 'cancelled', "
+                "review_notes = ?, closed_at = ?, updated_at = ? "
+                "WHERE verify_task_id = ? AND status NOT IN "
+                "('passed', 'cancelled', 'waived')",
+                [note, now_ms, now_ms, verify_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_mark_cancelled_failed", error=str(e))
+
+    async def reconcile_orphans(self, project_id: str) -> int:
+        """Close cases whose verify_task is terminal but case still open.
+
+        Returns number of rows fixed.
+        """
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT vc.id, vc.verify_task_id, t.status AS tstatus, "
+                "t.is_archived "
+                "FROM verification_cases vc "
+                "LEFT JOIN tasks t ON t.id = vc.verify_task_id "
+                "WHERE vc.project_id = ? AND vc.status IN "
+                "('pending', 'in_review')",
+                [project_id],
+            )
+        except Exception:
+            return 0
+        fixed = 0
+        now_ms = int(time.time() * 1000)
+        for r in rows:
+            vid = r.get("verify_task_id")
+            tstatus = r.get("tstatus")
+            archived = r.get("is_archived")
+            if not vid:
+                continue
+            if archived or tstatus in ("cancelled", "closed"):
+                try:
+                    await _execute(
+                        project_id,
+                        "UPDATE verification_cases SET status = 'cancelled', "
+                        "review_notes = COALESCE(NULLIF(review_notes,''), "
+                        "'reconcile: verify task terminal'), "
+                        "closed_at = ?, updated_at = ? WHERE id = ?",
+                        [now_ms, now_ms, r["id"]],
+                    )
+                    fixed += 1
+                except Exception:
+                    pass
+        if fixed:
+            log.info(
+                "verification_cases_reconciled",
+                project_id=project_id,
+                fixed=fixed,
+            )
+        return fixed
 
     async def mark_waived(
         self, project_id: str, original_task_id: str,

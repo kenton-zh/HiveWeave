@@ -839,6 +839,25 @@ coverage/
             workspace_path, short_id, task_name, task_id
         )
 
+        # TEST13 P1-2: refuse merging a branch with zero commits ahead of target
+        ok_ahead, ahead_out = await _git(
+            ["rev-list", "--count", f"{target_branch}..{branch}"],
+            workspace_path,
+        )
+        if ok_ahead and (ahead_out or "").strip() == "0":
+            return {
+                "success": False,
+                "message": (
+                    f"Refuse merge: branch {branch} has 0 commits ahead of "
+                    f"{target_branch}. Commit in the agent worktree first "
+                    f"(git_worktree_checkpoint). Do NOT copy files to project "
+                    f"root for attestation — use attest_doc_review "
+                    f"source=worktree / auto."
+                ),
+                "branch": branch,
+                "ahead": 0,
+            }
+
         ok, _ = await _git(["checkout", target_branch], workspace_path)
         if not ok:
             return {"success": False,
@@ -847,7 +866,18 @@ coverage/
 
         # Dirty main (local edits / untracked) → auto checkpoint so merge
         # is not blocked by "not a content conflict" hygiene failures.
-        await _auto_checkpoint_dirty_target(workspace_path, target_branch)
+        # TEST13 P1-2: this is an abnormal path — warn loudly.
+        dirtied = await _auto_checkpoint_dirty_target(workspace_path, target_branch)
+        if dirtied:
+            log.warning(
+                "git_worktree.dirty_main_autosave",
+                short_id=short_id,
+                target=target_branch,
+                note=(
+                    "Project root had uncommitted changes before merge; "
+                    "auto-saved. Prefer writing only in agent worktrees."
+                ),
+            )
 
         # Capture files covered by this branch before merge mutates history
         ok_f, files_out = await _git(

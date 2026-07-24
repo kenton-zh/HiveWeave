@@ -156,6 +156,42 @@ class InboxService:
         category = "message"
         wake_flag = bool(wake) if wake is not None else should_wake()
 
+        # TEST13 P2-2: open task_id + explicit wake=False → force wake.
+        # NL "forward" with wake=0 left executors idle forever.
+        force_wake_note = ""
+        if task_id and wake is False:
+            try:
+                from hiveweave.services.task import TaskService
+
+                # Resolve project via recipient
+                from hiveweave.db import meta as meta_db
+
+                dest_row = await meta_db.get_agent_by_id(to_agent_id)
+                pid = (dest_row or {}).get("project_id")
+                open_task = False
+                if pid:
+                    t = await TaskService().get_task(pid, str(task_id))
+                    if t and not t.get("is_archived"):
+                        st = (t.get("status") or "").lower()
+                        if st not in ("closed", "cancelled"):
+                            open_task = True
+                            assignee = t.get("assignee_id")
+                            if assignee and str(assignee) != str(to_agent_id):
+                                force_wake_note = (
+                                    "warning: recipient is not task assignee — "
+                                    "they have no obligation; use reassign_task"
+                                )
+                if open_task:
+                    wake_flag = True
+                    log.info(
+                        "inbox_force_wake_open_task",
+                        task_id=str(task_id)[:8],
+                        to_agent_id=to_agent_id[:8],
+                        note=force_wake_note or "wake forced",
+                    )
+            except Exception as e:
+                log.warning("inbox_force_wake_check_failed", error=str(e))
+
         key = idempotency_key or make_idempotency_key(
             from_agent_id=from_agent_id,
             to_agent_id=to_agent_id,
@@ -383,6 +419,7 @@ class InboxService:
             "category": category,
             "deduped": False,
             "reply_contract_id": contract_id,
+            **({"warning": force_wake_note} if force_wake_note else {}),
         }
 
     async def get_pending_messages(self, agent_id: str) -> list[dict]:
