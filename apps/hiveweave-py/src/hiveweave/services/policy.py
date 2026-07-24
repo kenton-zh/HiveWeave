@@ -102,6 +102,7 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "dispatch_task": frozenset({Capability.DISPATCH}),
     "cancel_task": frozenset({Capability.DISPATCH}),
     "unclaim_task": frozenset({Capability.DISPATCH}),
+    "reassign_task": frozenset({Capability.DISPATCH}),
     "review_task": frozenset({Capability.REVIEW}),
     "waive_attestation": frozenset({Capability.REVIEW}),
     "git_worktree_create": frozenset({Capability.MERGE}),

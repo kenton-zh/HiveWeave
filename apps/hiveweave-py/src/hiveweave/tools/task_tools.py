@@ -1282,6 +1282,7 @@ async def review_task_tool(
         # 小团队可能没有合法的第四方独立审查员。waive_attestation 作为
         # CEO override 通道，审计痕迹留在 waiver 表中。
         verify_waived = False
+        ceo_merger_override = False
         if ts._is_verify_task(task):
             from hiveweave.services.attestation import has_valid_waiver
             verify_waived = await has_valid_waiver(project_id, params.task_id)
@@ -1327,11 +1328,31 @@ async def review_task_tool(
                 or str(creator_id) == str(parent_assignee)
             ):
                 forbidden.add(str(creator_id))
+            # TEST13 P0-1: CEO may approve even when they are the merger
+            # (small-team escalation). Self-review (assignee==reviewer) still
+            # blocked above. Stamp evidence.override for audit.
+            ceo_merger_override = False
+            try:
+                from hiveweave.services.org import OrgService
+                from hiveweave.services.policy import infer_role_family
+
+                reviewer_row = await OrgService().get_agent(agent_id)
+                if (
+                    infer_role_family(reviewer_row or {}) == "ceo"
+                    and str(agent_id) in forbidden
+                ):
+                    forbidden.discard(str(agent_id))
+                    ceo_merger_override = True
+            except Exception:
+                pass
             if str(agent_id) in forbidden:
                 return ToolResult.err(
                     "VERIFY approval must come from the CEO or an independent "
                     "reviewer — the implementer / merger of the parent task "
-                    "cannot approve its verification."
+                    "cannot approve its verification. If you are CEO and also "
+                    "merged the parent, retry (CEO escalation is allowed); "
+                    "otherwise hire an independent reviewer or "
+                    "reassign_task the VERIFY to a QA then have CEO/reviewer approve."
                 )
 
         # Phase 3: approve requires attestation evidence
@@ -1479,6 +1500,37 @@ async def review_task_tool(
             project_id, params.task_id, decision, params.feedback,
             reviewer_id=agent_id,
         )
+
+        # TEST13 P0-1: audit stamp when CEO approved as merger
+        if decision == "approve" and ceo_merger_override:
+            try:
+                import time as _time
+
+                task_ev = await ts.get_task(project_id, params.task_id)
+                ev = task_ev.get("evidence") if task_ev else {}
+                if isinstance(ev, str):
+                    try:
+                        ev = json.loads(ev)
+                    except Exception:
+                        ev = {}
+                if not isinstance(ev, dict):
+                    ev = {}
+                ev["override"] = "no_independent_reviewer"
+                ev["ceo_merger_override"] = True
+                ev["ceo_merger_override_by"] = agent_id
+                from hiveweave.services import task as task_module
+
+                await task_module._execute(
+                    project_id,
+                    "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+                    [
+                        json.dumps(ev),
+                        int(_time.time() * 1000),
+                        params.task_id,
+                    ],
+                )
+            except Exception as e:
+                log.warning("ceo_merger_override_stamp_failed", error=str(e))
 
 
         # ── 通知 assignee/executor 审查结果 ──
@@ -1793,6 +1845,107 @@ async def unclaim_task_tool(
     )
 
 
+# ── reassign_task ────────────────────────────────────────
+
+
+class ReassignTaskParams(BaseModel):
+    """Parameters for reassign_task tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    task_id: str = Field(
+        alias="taskId",
+        description="Task to transfer to a new assignee.",
+        json_schema_extra={"aliases": ["taskId", "task_id", "id"]},
+    )
+    assignee_id: str = Field(
+        alias="assigneeId",
+        description="New assignee (agent id, short_id, or 花名).",
+        json_schema_extra={"aliases": ["assigneeId", "assignee_id", "to"]},
+    )
+    reason: str = Field(
+        default="",
+        description="Optional audit reason (e.g. 'VERIFY executor must be QA').",
+    )
+
+
+@tool(
+    "reassign_task",
+    "Transfer a task's assignee to another agent and put it on their "
+    "obligation ledger (coordinator/CEO). Use this instead of NL "
+    "'forward' — messages alone create no obligation. New assignee is "
+    "woken with a task message.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def reassign_task_tool(
+    params: ReassignTaskParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """Structured task transfer — TEST13 P0-2 fix for forward deadlock."""
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project")
+
+    from hiveweave.services.org import OrgService
+
+    org = OrgService()
+    target = await org.resolve_agent(params.assignee_id)
+    if not target or target.get("project_id") != project_id:
+        return ToolResult.err(
+            f"Assignee not found in this project: {params.assignee_id}"
+        )
+    if (target.get("status") or "active") == "archived":
+        return ToolResult.err("Cannot reassign to an archived agent")
+
+    ts = TaskService()
+    try:
+        info = await ts.reassign_task(
+            project_id,
+            params.task_id,
+            new_assignee_id=str(target["id"]),
+            reassigned_by=agent_id,
+            reason=params.reason or "",
+        )
+    except ValueError as e:
+        return ToolResult.err(str(e))
+    except Exception as e:
+        return ToolResult.err(f"Failed to reassign: {e}")
+
+    # Wake new assignee with structured facts
+    try:
+        from hiveweave.agents.trigger import trigger_subordinate
+        from hiveweave.services.inbox import InboxService
+
+        tid = info["task_id"]
+        task = await ts.get_task(project_id, tid)
+        title = (task or {}).get("title") or tid[:8]
+        await InboxService().send_message(
+            from_agent_id=agent_id,
+            to_agent_id=str(target["id"]),
+            message=(
+                f"[TASK REASSIGNED] You are now the assignee of "
+                f"'{title[:80]}' (taskId={tid}, status={info.get('status')}). "
+                f"Claim/continue work, then submit_task. "
+                f"Do not wait for a natural-language forward."
+            ),
+            message_type="task",
+            priority="urgent",
+            task_id=tid,
+            wake=True,
+            expect_report=False,
+        )
+        await trigger_subordinate(str(target["id"]))
+    except Exception as e:
+        log.warning("reassign_notify_failed", error=str(e))
+
+    name = target.get("name") or target.get("short_id") or params.assignee_id
+    return ToolResult.ok(
+        f"Task {info['task_id'][:8]} reassigned → {name} "
+        f"({target.get('short_id')}, status={info.get('status')}). "
+        f"They have been woken; NL forward is not required."
+    )
+
+
 # ── waive_attestation ────────────────────────────────────────
 
 
@@ -1981,19 +2134,30 @@ class AttestDocReviewParams(BaseModel):
     )
     files: list[Any] = Field(
         description=(
-            "Files to verify on the project workspace (main), each "
-            "{path, minLines?}. Paths relative to project root."
+            "Files to verify, each {path, minLines?}. Paths relative to the "
+            "chosen workspace root (worktree or project main)."
         ),
+    )
+    source: str = Field(
+        default="auto",
+        description=(
+            "Where to read files: 'worktree' (caller's write worktree), "
+            "'main' (project root), or 'auto' (prefer worktree when all "
+            "files exist there — use for submit before merge; VERIFY on "
+            "main after merge)."
+        ),
+        json_schema_extra={"aliases": ["source", "workspaceSource", "workspace"]},
     )
 
 
 @tool(
     "attest_doc_review",
-    "Machine-check document deliverables on the project root (main): each "
-    "file must exist; optional minLines. Creates a doc_review attestation "
-    "(sha256 per file). Prefer this over waive_attestation for Spec/Plan/"
-    "docs VERIFY. Tag tasks with docs_only so submit/approve require this "
-    "kind. Returns attestationId to pass into submit_task/review evidence.",
+    "Machine-check document deliverables: each file must exist; optional "
+    "minLines. Creates a doc_review attestation (sha256, LF-normalized). "
+    "source=auto prefers the caller's worktree when files are there "
+    "(submit before merge), else project main (post-merge VERIFY). "
+    "Tag tasks with docs_only so submit/approve require this kind. "
+    "Returns attestationId for submit_task/review evidence.",
     requires_workspace=True,
     security_level="standard",
 )
@@ -2001,6 +2165,8 @@ async def attest_doc_review_tool(
     params: AttestDocReviewParams, agent_id: str, workspace: str
 ) -> ToolResult:
     """Issue doc_review attestation after verifying files on disk."""
+    from pathlib import Path
+
     from hiveweave.services.attestation import create_doc_review
 
     project_id = await get_project_id(agent_id)
@@ -2015,14 +2181,72 @@ async def attest_doc_review_tool(
             "attest_doc_review requires files=[{path, minLines?}, ...]"
         )
 
-    # Prefer project root (main) so post-merge docs VERIFY does not need waive
     try:
         from hiveweave.db import meta as meta_db
 
         root = await meta_db.get_project_workspace(project_id)
     except Exception:
         root = None
-    check_ws = root or workspace
+    main_ws = root or workspace
+
+    # Resolve caller's write worktree (if any)
+    wt_ws: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+    try:
+        from hiveweave.services.git_worktree import _current_branch, _git
+        from hiveweave.services.org import OrgService
+
+        agent = await OrgService().get_agent(agent_id)
+        cand = (agent or {}).get("workspace_path") or ""
+        if cand and Path(cand).is_dir() and (Path(cand) / ".git").exists():
+            wt_ws = cand
+            branch = await _current_branch(cand)
+            ok_h, out_h = await _git(["rev-parse", "HEAD"], cand)
+            if ok_h and (out_h or "").strip():
+                commit = out_h.strip()
+    except Exception:
+        wt_ws = None
+
+    def _all_files_exist(base: str) -> bool:
+        for entry in files:
+            if not isinstance(entry, dict):
+                return False
+            rel = (entry.get("path") or entry.get("file") or "").strip().replace(
+                "\\", "/"
+            )
+            if not rel or ".." in rel.split("/"):
+                return False
+            if not (Path(base) / rel).is_file():
+                return False
+        return True
+
+    source = (params.source or "auto").strip().lower()
+    if source in ("worktree", "wt", "agent"):
+        if not wt_ws:
+            return ToolResult.err(
+                "source=worktree but caller has no valid write worktree. "
+                "Use source=main after merge, or ensure worktree exists."
+            )
+        if not _all_files_exist(wt_ws):
+            return ToolResult.err(
+                "source=worktree but not all files exist in your worktree. "
+                "Write them under your worktree first (do NOT copy to project "
+                "root for attestation)."
+            )
+        check_ws = wt_ws
+        ws_kind = "worktree"
+    elif source in ("main", "root", "project"):
+        check_ws = main_ws
+        ws_kind = "main"
+    else:
+        # auto: prefer worktree when complete, else main
+        if wt_ws and _all_files_exist(wt_ws):
+            check_ws = wt_ws
+            ws_kind = "worktree"
+        else:
+            check_ws = main_ws
+            ws_kind = "main"
 
     try:
         att_id, report = await create_doc_review(
@@ -2031,6 +2255,7 @@ async def attest_doc_review_tool(
             task_id=params.task_id,
             files=files,
             workspace=check_ws,
+            commit_hash=commit if ws_kind == "worktree" else None,
         )
     except ValueError as e:
         return ToolResult.err(str(e))
@@ -2038,9 +2263,18 @@ async def attest_doc_review_tool(
         return ToolResult.err(f"doc_review failed: {e}")
 
     paths = ", ".join(f["path"] for f in report.get("files") or [])
+    extra = ""
+    if ws_kind == "worktree":
+        extra = (
+            f" source=worktree branch={branch or '?'} "
+            f"commit={(commit or '')[:12] or '?'}. "
+            "After merge, VERIFY should re-attest on main."
+        )
+    else:
+        extra = " source=main."
     return ToolResult.ok(
         f"doc_review attestation {att_id} recorded for [{paths}] "
-        f"under {check_ws}. Pass attestationIds=[\"{att_id}\"] on "
+        f"under {check_ws}.{extra} Pass attestationIds=[\"{att_id}\"] on "
         f"submit_task / keep in evidence for approve."
     )
 

@@ -392,19 +392,21 @@ async def create_doc_review(
         if not full.is_file():
             raise ValueError(f"File not found on workspace: {rel}")
         raw = full.read_bytes()
-        text = raw.decode("utf-8", errors="replace")
+        # Normalize newlines so CRLF/LF checkouts share the same hash (TEST13 P2-3)
+        raw_norm = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        text = raw_norm.decode("utf-8", errors="replace")
         lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
         min_lines = entry.get("min_lines") or entry.get("minLines")
         if min_lines is not None and lines < int(min_lines):
             raise ValueError(
                 f"{rel}: {lines} lines < min_lines={min_lines}"
             )
-        digest = hashlib.sha256(raw).hexdigest()
+        digest = hashlib.sha256(raw_norm).hexdigest()
         checked.append(
             {
                 "path": rel,
                 "sha256": digest,
-                "bytes": len(raw),
+                "bytes": len(raw_norm),
                 "lines": lines,
             }
         )
