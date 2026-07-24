@@ -106,6 +106,35 @@ def _has_git(path: str) -> bool:
     return (Path(path) / ".git").exists()
 
 
+def _force_clear_path(path: str) -> bool:
+    """Remove a path so ``git worktree add`` can reuse it.
+
+    Windows often leaves a non-git husk (e.g. only ``node_modules``) that
+    ``rmtree(..., ignore_errors=True)`` cannot fully delete while files are
+    locked — then ``worktree add`` fails with "already exists" and we stamp
+    a false ``worktree_error``. Rename-aside lets add proceed.
+    """
+    p = Path(path)
+    if not p.exists():
+        return True
+    shutil.rmtree(path, ignore_errors=True)
+    if not p.exists():
+        return True
+    try:
+        dest = p.parent / f".stale-{p.name}-{int(time.time() * 1000)}"
+        p.rename(dest)
+        shutil.rmtree(dest, ignore_errors=True)
+        log.info(
+            "git_worktree.stale_path_moved_aside",
+            path=path,
+            aside=str(dest),
+            aside_gone=not dest.exists(),
+        )
+    except Exception as e:
+        log.warning("git_worktree.force_clear_failed", path=path, error=str(e))
+    return not Path(path).exists()
+
+
 # ── 冲突标记扫描 (merge 成功后 main 树残留检测) ─────────────
 # 行首锚定 <<<<<<< / >>>>>>> (标准 git conflict marker, 7 字符)。
 # 故意不含 ^={7} — 一行等号同时是 setext 标题下划线, 误报率高。
@@ -536,6 +565,7 @@ coverage/
                     "Evidence files: prefix with short_id "
                     f"(e.g. {short_id}-verify.txt), never bare shared names."
                 ),
+                "cleared_error": True,
             }
 
         # Stale cleanup. Two failure modes we must handle before add:
@@ -545,7 +575,14 @@ coverage/
         #    add fails with "is a missing but registered worktree" until prune.
         # Always prune when the target is not a valid worktree.
         if Path(path).exists():
-            shutil.rmtree(path, ignore_errors=True)
+            if not _force_clear_path(path):
+                return {
+                    "success": False,
+                    "message": (
+                        f"Failed to create worktree: stale path locked "
+                        f"and could not be cleared: {path}"
+                    ),
+                }
         await _git(["worktree", "prune"], workspace_path)
 
         fwd_path = path.replace("\\", "/")
@@ -579,6 +616,30 @@ coverage/
                     ),
                 }
             last_error = out
+            # Path-exists race: clear husk and retry attach once
+            err_l = (out or "").lower()
+            if "already exists" in err_l:
+                _force_clear_path(path)
+                await _git(["worktree", "prune"], workspace_path)
+                ok2, out2 = await _git(
+                    ["worktree", "add", fwd_path, branch], workspace_path
+                )
+                if ok2:
+                    log.info(
+                        "git_worktree.create_retry_after_path_exists",
+                        short_id=short_id,
+                        branch=branch,
+                    )
+                    return {
+                        "success": True,
+                        "path": path,
+                        "branch": branch,
+                        "message": (
+                            f"Worktree ready. Name evidence files with "
+                            f"{short_id}- prefix to avoid merge collisions."
+                        ),
+                    }
+                last_error = out2 or out
             # Fall through: branch may be checked out elsewhere; try -B paths
         else:
             last_error = ""
@@ -608,6 +669,48 @@ coverage/
                     ),
                 }
             last_error = out
+            # branch_exists detection can miss (format/race); -b then fails with
+            # "a branch named X already exists" — or path husk left → clear + attach.
+            err_l = (out or "").lower()
+            if "already exists" in err_l:
+                _force_clear_path(path)
+                await _git(["worktree", "prune"], workspace_path)
+                ok_att, out_att = await _git(
+                    ["worktree", "add", fwd_path, branch], workspace_path
+                )
+                if ok_att:
+                    log.info(
+                        "git_worktree.create_attached_after_exists",
+                        short_id=short_id,
+                        branch=branch,
+                    )
+                    return {
+                        "success": True,
+                        "path": path,
+                        "branch": branch,
+                        "message": (
+                            f"Worktree ready (attached existing branch). "
+                            f"Name evidence files with {short_id}- prefix."
+                        ),
+                    }
+                last_error = out_att or out
+
+        # Final heal: another path may have created a valid tree during races
+        if _has_git(path):
+            actual = await _current_branch(path)
+            log.info(
+                "git_worktree.create_healed_existing",
+                short_id=short_id,
+                branch=actual or branch,
+                prior_error=last_error,
+            )
+            return {
+                "success": True,
+                "path": path,
+                "branch": actual or branch,
+                "message": "worktree healthy after create race",
+                "cleared_error": True,
+            }
 
         log.error("git_worktree.create_failed", short_id=short_id,
                   path=path, branch=branch, error=last_error)
@@ -1936,12 +2039,12 @@ async def ensure_executor_worktree(
         if needle in norm or norm.rstrip("/").endswith(f"/worktrees/{short_id}"):
             # 幂等: 透出实际检出的分支, 不按入参重算 (P0 幂等脱钩修复)
             actual = await _current_branch(cur)
-            # B7: worktree 已有效绑定但 worktree_error 残留时清除
-            if agent.get("worktree_error"):
-                try:
-                    await org.update_agent(agent_id, {"worktree_error": None})
-                except Exception:
-                    pass
+            # B7: always clear stale worktree_error when tree is healthy
+            # (do not gate on agent dict — DB may have error agent cache missed).
+            try:
+                await org.update_agent(agent_id, {"worktree_error": None})
+            except Exception:
+                pass
             return {
                 "success": True,
                 "path": cur,

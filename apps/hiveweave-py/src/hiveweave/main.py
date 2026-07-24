@@ -197,6 +197,29 @@ async def lifespan(app: FastAPI):
                 cur_ws = a["workspace_path"] or ""
                 # Check if worktree directory exists
                 if cur_ws and Path(cur_ws).exists() and (Path(cur_ws) / ".git").exists():
+                    # Clear stale worktree_error left by soft-fail races
+                    # (tree healthy but error string never wiped).
+                    try:
+                        row_err = await proj_conn.execute(
+                            "SELECT worktree_error FROM agents WHERE id=?",
+                            [a["id"]],
+                        )
+                        err_row = await row_err.fetchone()
+                        await row_err.close()
+                        if err_row and err_row[0]:
+                            await proj_conn.execute(
+                                "UPDATE agents SET worktree_error=NULL, "
+                                "updated_at=? WHERE id=?",
+                                [int(_wt_time.time() * 1000), a["id"]],
+                            )
+                            await proj_conn.commit()
+                            log.info(
+                                "worktree_error_cleared_healthy",
+                                agent_id=a["id"],
+                                short_id=short_id,
+                            )
+                    except Exception:
+                        pass
                     continue  # Worktree is fine
                 # Recreate
                 role = a["role"] or "developer"

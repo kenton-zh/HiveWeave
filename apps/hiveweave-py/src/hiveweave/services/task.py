@@ -1595,6 +1595,29 @@ class TaskService:
                 notes=notes,
                 merge_commit_hash=str(merge_hash) if merge_hash else None,
             )
+            # Mirror case onto VERIFY evidence so get_tasks / CEO reports see it
+            try:
+                case = await vcs.get_case_for_task(project_id, verify_id)
+                if case:
+                    ev2 = dict(ev) if isinstance(ev, dict) else {}
+                    ev2["verification_case"] = {
+                        "id": (case.get("id") or "")[:8],
+                        "status": case.get("status"),
+                        "merge_commit_hash": case.get("merge_commit_hash"),
+                        "review_notes": (case.get("review_notes") or "")[:300],
+                        "qa_agent_id": case.get("qa_agent_id"),
+                    }
+                    await _execute(
+                        project_id,
+                        "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+                        [json.dumps(ev2), int(time.time() * 1000), verify_id],
+                    )
+            except Exception as e:
+                log.warning(
+                    "verification_case_mirror_failed",
+                    verify_id=verify_id,
+                    error=str(e),
+                )
         except Exception:
             pass  # best-effort
 
@@ -2231,18 +2254,56 @@ class VerificationCaseService:
     async def mark_waived(
         self, project_id: str, original_task_id: str,
         reason: str = "",
+        *,
+        verify_task_id: str | None = None,
     ) -> None:
-        """Mark verification as waived (attestation waiver)."""
+        """Mark verification as waived (attestation waiver).
+
+        Matches by original_task_id and optionally verify_task_id so a waive
+        on the VERIFY child still stamps the case.
+        """
         now_ms = int(time.time() * 1000)
+        note = (reason or "")[:500]
+        if note and not note.lower().startswith("waived:"):
+            note = f"WAIVED: {note}"
         try:
+            # Prefer verify_task_id match when provided
+            if verify_task_id:
+                await _execute(project_id,
+                    "UPDATE verification_cases SET status = 'waived', "
+                    "review_notes = ?, closed_at = ?, updated_at = ? "
+                    "WHERE verify_task_id = ? AND status NOT IN ('passed')",
+                    [note, now_ms, now_ms, verify_task_id],
+                )
             await _execute(project_id,
                 "UPDATE verification_cases SET status = 'waived', "
                 "review_notes = ?, closed_at = ?, updated_at = ? "
                 "WHERE original_task_id = ? AND status NOT IN ('passed', 'waived')",
-                [reason[:500], now_ms, now_ms, original_task_id],
+                [note, now_ms, now_ms, original_task_id],
             )
         except Exception as e:
             log.warning("verification_case_mark_waived_failed", error=str(e))
+
+    async def ensure_case(
+        self,
+        project_id: str,
+        *,
+        original_task_id: str,
+        verify_task_id: str | None = None,
+        merger_agent_id: str | None = None,
+    ) -> str | None:
+        """Return existing case id or create one (idempotent for waive/approve)."""
+        existing = await self.get_case_for_task(
+            project_id, verify_task_id or original_task_id
+        )
+        if existing:
+            return existing.get("id")
+        return await self.create_case(
+            project_id,
+            original_task_id=original_task_id,
+            verify_task_id=verify_task_id,
+            merger_agent_id=merger_agent_id,
+        )
 
     async def get_case_for_task(
         self, project_id: str, task_id: str
@@ -2258,3 +2319,18 @@ class VerificationCaseService:
             return dict(rows[0]) if rows else None
         except Exception:
             return None
+
+    async def list_cases_for_project(
+        self, project_id: str, limit: int = 30
+    ) -> list[dict]:
+        """Recent verification cases for platform_state / get_tasks."""
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT * FROM verification_cases "
+                "WHERE project_id = ? ORDER BY created_at DESC LIMIT ?",
+                [project_id, limit],
+            )
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
