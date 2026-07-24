@@ -42,22 +42,24 @@ def test_is_test_command():
 
 
 def test_resolve_task_policy():
-    # Policy labels no longer drive gates — always coordinator_review
+    # Structured tags only (not free-text title); loose "docs" is NOT hard-gate
     assert resolve_task_policy("Fix login UI", ["frontend"]) == "coordinator_review"
     assert resolve_task_policy("Write README", ["docs"]) == "coordinator_review"
+    assert resolve_task_policy("Write README", ["docs_only"]) == "docs_only"
     assert resolve_task_policy("Implement API", []) == "coordinator_review"
+    assert resolve_task_policy("UI", ["ui_browser_e2e"]) == "ui_browser_e2e"
 
 
 def test_required_kinds():
     assert required_attestation_kinds("ui_browser_e2e") is None
     assert required_attestation_kinds("generic_tests") is None
-    assert required_attestation_kinds("docs_only") is None
+    assert required_attestation_kinds("docs_only") == frozenset({"doc_review"})
     assert required_attestation_kinds("coordinator_review") is None
 
 
 @pytest.mark.asyncio
 async def test_check_task_never_rejects_bare_tests_passed():
-    """Hard attestation gate removed — coordinator judges on review."""
+    """Soft policies still pass without attestation ids."""
     task = {
         "id": "t1",
         "title": "UI button",
@@ -67,6 +69,29 @@ async def test_check_task_never_rejects_bare_tests_passed():
     }
     err = await check_task_attestations("p1", task, None)
     assert err is None
+
+
+@pytest.mark.asyncio
+async def test_check_task_docs_only_requires_doc_review():
+    task = {
+        "id": "t-docs",
+        "title": "Spec",
+        "tags": ["docs_only"],
+        "policy_id": "docs_only",
+        "evidence": {},
+    }
+    with patch(
+        "hiveweave.services.attestation.has_valid_waiver",
+        new_callable=AsyncMock,
+        return_value=False,
+    ), patch(
+        "hiveweave.services.attestation.attestation_service.verify_ids",
+        new_callable=AsyncMock,
+        return_value=(False, "No attestation_ids provided"),
+    ):
+        err = await check_task_attestations("p1", task, None)
+    assert err is not None
+    assert "doc_review" in err or "docs_only" in err
 
 
 @pytest.mark.asyncio

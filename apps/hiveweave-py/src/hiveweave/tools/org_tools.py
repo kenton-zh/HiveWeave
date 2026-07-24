@@ -438,11 +438,34 @@ async def hire_agent_tool(
                     error=str(wt_err),
                 )
                 worktree_error = str(wt_err)
-                # Bug D fix: persist error to agent record for observability
+                # BUG-4: exception path — re-validate before persisting error
                 try:
-                    await ctx.org.update_agent(new_id, {
-                        "worktree_error": worktree_error,
-                    })
+                    from hiveweave.services.git_worktree import (
+                        _has_git,
+                        _worktree_path,
+                    )
+
+                    ws = locals().get("project_ws")
+                    if not ws:
+                        ws = await meta_db.get_project_workspace(project_id)
+                    if ws and _has_git(_worktree_path(ws, new_short)):
+                        expected = _worktree_path(ws, new_short)
+                        worktree_path = expected
+                        worktree_error = ""
+                        await ctx.org.update_agent(new_id, {
+                            "workspace_path": worktree_path,
+                            "worktree_error": None,
+                        })
+                        log.info(
+                            "tool.hire_agent.worktree_healed_after_exception",
+                            agent_id=new_id,
+                            short_id=new_short,
+                            worktree=worktree_path,
+                        )
+                    elif ws:
+                        await ctx.org.update_agent(new_id, {
+                            "worktree_error": worktree_error,
+                        })
                 except Exception:
                     pass  # don't let logging failure break hire
 

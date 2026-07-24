@@ -341,6 +341,92 @@ def hash_stdout(s: str) -> str:
 # 保留硬闸门的防假装完成功能，同时给 CLI/脚本类任务一个留痕出口。
 
 WAIVER_KIND = "waiver"
+DOC_REVIEW_KIND = "doc_review"
+
+# Tag tokens that hard-select docs_only policy (narrow — avoid loose "docs").
+_DOCS_TAGS = frozenset({"docs_only", "doc_review"})
+_UI_TAGS = frozenset({"ui_browser_e2e", "ui", "e2e", "browser"})
+_TEST_TAGS = frozenset({"generic_tests", "tests", "test_run"})
+
+
+async def create_doc_review(
+    project_id: str,
+    *,
+    agent_id: str,
+    task_id: str | None,
+    files: list[dict[str, Any]],
+    workspace: str,
+    commit_hash: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Create a ``doc_review`` attestation after verifying files on disk.
+
+    Each entry in ``files`` is ``{path, min_lines?}``. Paths are relative to
+    ``workspace`` (usually project root / main). Returns ``(attestation_id,
+    report)`` where report lists checked paths and content hashes.
+
+    Raises ``ValueError`` if any required file is missing or too short.
+    """
+    if not files:
+        raise ValueError("doc_review requires at least one file entry")
+    from pathlib import Path
+
+    root = Path(workspace)
+    if not root.is_dir():
+        raise ValueError(f"Workspace not found: {workspace}")
+
+    checked: list[dict[str, Any]] = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise ValueError(f"Invalid file entry: {entry!r}")
+        rel = (entry.get("path") or entry.get("file") or "").strip().replace(
+            "\\", "/"
+        )
+        if not rel or rel.startswith("/") or ".." in rel.split("/"):
+            raise ValueError(f"Unsafe or empty path: {rel!r}")
+        root_resolved = root.resolve()
+        full = (root / rel).resolve()
+        try:
+            full.relative_to(root_resolved)
+        except ValueError as e:
+            raise ValueError(f"Path escapes workspace: {rel}") from e
+        if not full.is_file():
+            raise ValueError(f"File not found on workspace: {rel}")
+        raw = full.read_bytes()
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+        min_lines = entry.get("min_lines") or entry.get("minLines")
+        if min_lines is not None and lines < int(min_lines):
+            raise ValueError(
+                f"{rel}: {lines} lines < min_lines={min_lines}"
+            )
+        digest = hashlib.sha256(raw).hexdigest()
+        checked.append(
+            {
+                "path": rel,
+                "sha256": digest,
+                "bytes": len(raw),
+                "lines": lines,
+            }
+        )
+
+    stdout_blob = json.dumps(
+        {"kind": DOC_REVIEW_KIND, "files": checked},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    att_id = await attestation_service.create(
+        project_id,
+        agent_id=agent_id,
+        kind=DOC_REVIEW_KIND,
+        task_id=task_id,
+        command_or_url=f"doc_review:{len(checked)} files",
+        workspace=workspace,
+        commit_hash=commit_hash,
+        stdout=stdout_blob,
+        artifact_hashes={c["path"]: c["sha256"] for c in checked},
+        exit_code=0,
+    )
+    return att_id, {"files": checked, "attestation_id": att_id}
 
 
 async def create_waiver(
@@ -393,25 +479,38 @@ def resolve_task_policy(
     tags: list[str] | None = None,
     description: str | None = None,
 ) -> str:
-    """Legacy label for telemetry only — no longer drives submit/approve gates.
+    """Infer attestation policy from **structured tags** (not free-text title).
 
-    Evidence variety is judged by the coordinator on review, not by a
-    scripted policy matrix.
+    Returns: ``ui_browser_e2e`` | ``docs_only`` | ``generic_tests`` |
+    ``coordinator_review``.
+
+    Language-agnostic: only tag tokens select a policy. Free-text title /
+    description are ignored for gating (HARD RULE: no NL intent scrape).
     """
+    del title, description  # unused — keep signature for call-site compat
+    tags_l = {str(t).strip().lower() for t in (tags or []) if t}
+    if tags_l & _DOCS_TAGS:
+        return "docs_only"
+    if tags_l & _UI_TAGS:
+        return "ui_browser_e2e"
+    if tags_l & _TEST_TAGS:
+        return "generic_tests"
     return "coordinator_review"
 
 
 POLICY_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
+    # Document VERIFY/spec tasks: machine-checkable file presence + hash
+    "docs_only": frozenset({DOC_REVIEW_KIND}),
+    # Soft for others — coordinator judges browse/test evidence on review
     "ui_browser_e2e": None,
     "generic_tests": None,
-    "docs_only": None,
     "coordinator_review": None,
 }
 
 
 def required_attestation_kinds(policy_id: str) -> frozenset[str] | None:
-    """Always None — platform no longer hard-gates submit on attestation kinds."""
-    return None
+    """Kinds required at submit/approve for ``policy_id``, or None (soft)."""
+    return POLICY_REQUIRED_KINDS.get(policy_id)
 
 
 async def check_task_attestations(
@@ -421,11 +520,54 @@ async def check_task_attestations(
     *,
     expected_agent_id: str | None = None,
 ) -> str | None:
-    """Attestation hard-gate removed — coordinator judges evidence on review.
+    """Validate attestation_ids against the task policy when kinds are required.
 
-    Attestation rows may still be recorded for display; this never denies.
+    Returns an error string, or None when the gate passes / is soft.
     """
-    return None
+    tags = task.get("tags") or []
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            tags = []
+    evidence = task.get("evidence") or {}
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except Exception:
+            evidence = {}
+    policy_id = (
+        (evidence.get("policy_id") if isinstance(evidence, dict) else None)
+        or task.get("policy_id")
+        or resolve_task_policy(
+            title=task.get("title") or "",
+            tags=tags if isinstance(tags, list) else [],
+            description=task.get("description") or "",
+        )
+    )
+    needed = required_attestation_kinds(policy_id)
+    if not needed:
+        return None
+    if await has_valid_waiver(project_id, task.get("id")):
+        return None
+    aids = list(attestation_ids or [])
+    if isinstance(evidence, dict) and not aids:
+        aids = list(evidence.get("attestation_ids") or [])
+    ok, err = await attestation_service.verify_ids(
+        project_id,
+        [str(x) for x in aids],
+        expected_agent_id=expected_agent_id,
+        expected_kinds=needed,
+        task_id=task.get("id"),
+    )
+    if ok:
+        return None
+    return (
+        f"attestation gate failed ({policy_id}): {err}. "
+        f"For docs_only: call attest_doc_review(taskId, files=[...]) then "
+        f"submit/approve with those attestationIds; or coordinator "
+        f"waive_attestation as last resort."
+    )
 
 
 attestation_service = AttestationService()

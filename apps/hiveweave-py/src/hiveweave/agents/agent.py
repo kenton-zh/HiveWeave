@@ -608,6 +608,20 @@ class Agent:
                     "inbox_task",
                     "verify",
                 ) or o.get("message_type") == "task" or bool(o.get("task_id"))
+                # Reminder / wait-timeout must not burn tokens after complete
+                if source in (
+                    "open_task_reminder",
+                    "wait_timeout",
+                    "turn_exit_gate",
+                ):
+                    log.info(
+                        "chat_complete_skip_trigger",
+                        agent_id=self.id,
+                        source=source,
+                        wake_category=wake_cat,
+                        admit_reason="complete_no_reminder",
+                    )
+                    return {"ok": True, "skipped": "complete"}
                 if not admit.ok and not is_task_wake and not o.get("from_user"):
                     log.info(
                         "chat_complete_skip_trigger",
@@ -3159,6 +3173,14 @@ class Agent:
         if self._in_resume_cooldown():
             return
         if self.status != AgentState.IDLE:
+            return
+        # Dogfood 2026-07-24: complete agents were still woken into
+        # open_task_reminder → stall burn after ledger close.
+        if self.disposition == "complete":
+            log.info(
+                "open_task_retrigger_skip_complete",
+                agent_id=self.id,
+            )
             return
         # 修 #2: retrigger 前查 inbox，把未读消息摘要拼进 hint
         hint = await self._enrich_hint_with_inbox(hint)

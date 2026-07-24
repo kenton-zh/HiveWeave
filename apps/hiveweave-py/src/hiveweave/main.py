@@ -221,14 +221,37 @@ async def lifespan(app: FastAPI):
                              path=result["path"])
                 else:
                     err = result.get("message") or "worktree recover failed"
-                    await proj_conn.execute(
-                        "UPDATE agents SET worktree_error=?, updated_at=? WHERE id=?",
-                        [err, int(_wt_time.time() * 1000), a["id"]],
+                    # BUG-4: create may report failure while tree already exists
+                    from hiveweave.services.git_worktree import (
+                        _has_git,
+                        _worktree_path,
                     )
-                    await proj_conn.commit()
-                    log.warning("worktree_recover_failed",
-                                agent_id=a["id"], short_id=short_id,
-                                error=err)
+
+                    expected = _worktree_path(ws, short_id)
+                    if _has_git(expected):
+                        await proj_conn.execute(
+                            "UPDATE agents SET workspace_path=?, worktree_error=NULL, "
+                            "updated_at=? WHERE id=?",
+                            [expected, int(_wt_time.time() * 1000), a["id"]],
+                        )
+                        await proj_conn.commit()
+                        recovered += 1
+                        log.info(
+                            "worktree_recovered_after_soft_fail",
+                            agent_id=a["id"],
+                            short_id=short_id,
+                            path=expected,
+                            soft_error=err,
+                        )
+                    else:
+                        await proj_conn.execute(
+                            "UPDATE agents SET worktree_error=?, updated_at=? WHERE id=?",
+                            [err, int(_wt_time.time() * 1000), a["id"]],
+                        )
+                        await proj_conn.commit()
+                        log.warning("worktree_recover_failed",
+                                    agent_id=a["id"], short_id=short_id,
+                                    error=err)
         log.info("worktree_recovery_done", recovered=recovered)
     except Exception as e:
         log.warning("worktree_recovery_init_failed", error=str(e))

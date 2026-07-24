@@ -65,6 +65,7 @@ _LEGAL_WAIT_DISPOSITIONS = frozenset({
     "waiting_human",
     "waiting_agent",
     "waiting_timer",
+    "complete",
 })
 
 

@@ -78,6 +78,9 @@ MAX_TOOL_ROUNDS = 1_000_000
 # DESIGN-2 / Magentic-One Progress Ledger: consecutive no-progress rounds
 # force an outer-loop exit (commit / replan) instead of burning tokens.
 TOOL_LOOP_STALL_LIMIT = 2
+# Pure-readonly polling gets a higher runway (dogfood 2026-07-24: 61 stalls
+# were mostly get_tasks/list_files). Failed/empty rounds still use limit=2.
+TOOL_LOOP_READONLY_STALL_LIMIT = 8
 
 MAX_TOOLS_PER_ROUND = 5
 """单轮工具调用数上限。对齐 Elixir streamer.ex:488。"""
@@ -207,6 +210,33 @@ def round_made_progress(
             continue
         return True
     return False
+
+
+def round_was_readonly_only(
+    tool_calls: list[dict],
+    *,
+    error_ids: set[str] | None = None,
+    duplicate_ids: set[str] | None = None,
+) -> bool:
+    """True if the round had only successful readonly tools (or was empty).
+
+    Used to apply TOOL_LOOP_READONLY_STALL_LIMIT instead of the stricter
+    mutating stall limit.
+    """
+    if not tool_calls:
+        return True
+    errs = error_ids or set()
+    dups = duplicate_ids or set()
+    saw_ok_readonly = False
+    for tc in tool_calls:
+        name = tc.get("name") or ""
+        tid = tc.get("id") or ""
+        if tid in errs or tid in dups:
+            return False
+        if name not in DOOM_LOOP_READONLY_TOOLS:
+            return False
+        saw_ok_readonly = True
+    return saw_ok_readonly
 
 
 NO_TEXT_ROUNDS_THRESHOLD = 3
@@ -852,6 +882,7 @@ class Streamer:
 
         # DESIGN-2: Magentic-One stall counter — consecutive no-progress rounds
         stall_count = 0
+        readonly_stall_count = 0
 
         for round_num in range(rounds_cap):
             # 通知回调：新一轮开始（用于重置流式文本累积器）
@@ -1156,26 +1187,42 @@ class Streamer:
                     }
 
                 # DESIGN-2: stall counter — no mutating progress → force outer loop
+                # Pure-readonly polling uses a higher limit (dogfood retune).
                 if round_made_progress(
                     tool_calls,
                     error_ids=error_ids,
                     duplicate_ids=duplicate_ids,
                 ):
                     stall_count = 0
+                    readonly_stall_count = 0
+                elif round_was_readonly_only(
+                    tool_calls,
+                    error_ids=error_ids,
+                    duplicate_ids=duplicate_ids,
+                ):
+                    readonly_stall_count += 1
+                    stall_count = 0
                 else:
                     stall_count += 1
-                if stall_count >= TOOL_LOOP_STALL_LIMIT:
+                    readonly_stall_count = 0
+                stalled = (
+                    stall_count >= TOOL_LOOP_STALL_LIMIT
+                    or readonly_stall_count >= TOOL_LOOP_READONLY_STALL_LIMIT
+                )
+                if stalled:
                     log.warning(
                         "tool_loop_stall",
                         agent_id=agent_id,
                         round=round_num,
                         stall_count=stall_count,
+                        readonly_stall_count=readonly_stall_count,
                     )
                     try:
                         from hiveweave.services.telemetry import telemetry
 
                         telemetry.tool_loop_stall(
-                            agent_id, stall_count=stall_count
+                            agent_id,
+                            stall_count=max(stall_count, readonly_stall_count),
                         )
                     except Exception:
                         pass
