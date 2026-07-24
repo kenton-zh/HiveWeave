@@ -36,6 +36,7 @@ _BASE_TOOLS = frozenset({
     "lookup_dev_server",
     "read_roster", "update_roster", "write_work_log",
     "request_review", "list_subordinates", "check_agent_status",
+    "get_platform_state",
     "read_charter", "read_goals", "view_org_chart", "read_work_logs",
     "git_worktree_list", "git_worktree_status",
     "get_tasks",

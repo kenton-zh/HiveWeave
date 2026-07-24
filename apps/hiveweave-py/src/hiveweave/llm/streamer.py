@@ -115,6 +115,7 @@ DOOM_LOOP_READONLY_TOOLS: frozenset[str] = frozenset({
     "view_org_chart",
     "list_subordinates",
     "check_agent_status",
+    "get_platform_state",
     "list_agent_templates",
     # 日志 / 告警查询
     "read_work_logs",
