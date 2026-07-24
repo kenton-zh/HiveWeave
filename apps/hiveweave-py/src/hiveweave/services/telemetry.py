@@ -312,6 +312,17 @@ class Telemetry:
             count=self._counters[key],
         )
 
+    def tool_loop_stall(self, agent_id: str, *, stall_count: int = 0) -> None:
+        self._counters["tool_loop_stall"] = (
+            self._counters.get("tool_loop_stall", 0) + 1
+        )
+        logger.warning(
+            "telemetry_tool_loop_stall",
+            agent_id=agent_id,
+            stall_count=stall_count,
+            count=self._counters["tool_loop_stall"],
+        )
+
     def poll_hard_reject(self, agent_id: str, tool: str) -> None:
         self._counters["poll_hard_reject"] = (
             self._counters.get("poll_hard_reject", 0) + 1

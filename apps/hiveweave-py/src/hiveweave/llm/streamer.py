@@ -75,6 +75,10 @@ class CircuitBreakerOpenError(Exception):
 MAX_TOOL_ROUNDS = 1_000_000
 """最大 tool loop 轮次 — 仅作极端安全网，实际由 doom loop 按工具分级保护。峰值复现真实死循环(同参数反复调用) 。"""
 
+# DESIGN-2 / Magentic-One Progress Ledger: consecutive no-progress rounds
+# force an outer-loop exit (commit / replan) instead of burning tokens.
+TOOL_LOOP_STALL_LIMIT = 2
+
 MAX_TOOLS_PER_ROUND = 5
 """单轮工具调用数上限。对齐 Elixir streamer.ex:488。"""
 
@@ -178,6 +182,31 @@ def doom_loop_limit(tool_name: str) -> int:
     if tool_name in DOOM_LOOP_READONLY_TOOLS:
         return DOOM_LOOP_READONLY_FUSE
     return DOOM_LOOP_DEFAULT_LIMIT
+
+
+def round_made_progress(
+    tool_calls: list[dict],
+    *,
+    error_ids: set[str] | None = None,
+    duplicate_ids: set[str] | None = None,
+) -> bool:
+    """True if this tool-loop round advanced work (DESIGN-2 stall counter).
+
+    A round counts as progress when at least one non-readonly tool succeeded
+    (not in error_ids / duplicate_ids). Pure readonly polling = no progress.
+    """
+    errs = error_ids or set()
+    dups = duplicate_ids or set()
+    for tc in tool_calls:
+        name = tc.get("name") or ""
+        tid = tc.get("id") or ""
+        if name in DOOM_LOOP_READONLY_TOOLS:
+            continue
+        if tid in errs or tid in dups:
+            continue
+        return True
+    return False
+
 
 NO_TEXT_ROUNDS_THRESHOLD = 3
 """连续无文字轮次阈值: 3 轮后注入系统提示。"""
@@ -820,6 +849,9 @@ class Streamer:
         # Per-turn poll fingerprint counts (TEST4 get_tasks hard reject)
         poll_turn_counts: dict[tuple[str, str], int] = {}
 
+        # DESIGN-2: Magentic-One stall counter — consecutive no-progress rounds
+        stall_count = 0
+
         for round_num in range(rounds_cap):
             # 通知回调：新一轮开始（用于重置流式文本累积器）
             # BUG-7: also fire on round 0 so LLM call counters stay accurate
@@ -1069,6 +1101,8 @@ class Streamer:
 
                 # 执行工具
                 end_turn = False
+                error_ids: set[str] = set()
+                duplicate_ids: set[str] = set()
                 if on_tool_call is None:
                     log.error("no_tool_executor", agent_id=agent_id)
                     tool_results = [
@@ -1076,6 +1110,7 @@ class Streamer:
                          "tool_call_id": tc["id"]}
                         for tc in tool_calls
                     ]
+                    error_ids = {tc["id"] for tc in tool_calls}
                 else:
                     tool_results, error_ids, duplicate_ids, end_turn = (
                         await self._execute_tools(
@@ -1117,6 +1152,63 @@ class Streamer:
                         "rounds": round_num + 1,
                         "usage": last_usage,
                         "end_turn": True,
+                    }
+
+                # DESIGN-2: stall counter — no mutating progress → force outer loop
+                if round_made_progress(
+                    tool_calls,
+                    error_ids=error_ids,
+                    duplicate_ids=duplicate_ids,
+                ):
+                    stall_count = 0
+                else:
+                    stall_count += 1
+                if stall_count >= TOOL_LOOP_STALL_LIMIT:
+                    log.warning(
+                        "tool_loop_stall",
+                        agent_id=agent_id,
+                        round=round_num,
+                        stall_count=stall_count,
+                    )
+                    try:
+                        from hiveweave.services.telemetry import telemetry
+
+                        telemetry.tool_loop_stall(
+                            agent_id, stall_count=stall_count
+                        )
+                    except Exception:
+                        pass
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            f"[STALL BREAK] {stall_count} consecutive tool-loop "
+                            "rounds made no progress (only readonly / failed / "
+                            "duplicate tools). Stop polling. Call commit_turn "
+                            "now (waiting/blocked/done_slice) or change approach "
+                            "— do not repeat the same readonly loop."
+                        ),
+                    })
+                    summary = await self._make_max_rounds_summary(
+                        agent_id, provider, messages, on_delta
+                    )
+                    final_text = self._strip_placeholder(summary)
+                    if not final_text:
+                        final_text = (
+                            "[STALL BREAK] No progress for "
+                            f"{stall_count} rounds — turn ended."
+                        )
+                    tool_turn_acc.append(
+                        {"role": "assistant", "content": final_text}
+                    )
+                    return {
+                        "status": "ok",
+                        "content": final_text,
+                        "thinking": combined_thinking,
+                        "tool_calls": tool_history,
+                        "tool_turn_messages": tool_turn_acc,
+                        "rounds": round_num + 1,
+                        "usage": last_usage,
+                        "stall_break": True,
                     }
 
                 # 连续无文字轮次检测

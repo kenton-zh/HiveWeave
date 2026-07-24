@@ -595,7 +595,8 @@ class DismissAgentParams(BaseModel):
     "dismiss_agent",
     "Archive/remove an agent. PREFER transfer_agent over dismiss+rehire when "
     "the person is fine but reporting line/role is wrong. Dismiss closes their "
-    "open tasks and inbox; cannot undo.",
+    "open tasks and inbox; cannot undo. DESIGN-3: per project per game day "
+    "quota applies; same-role rehire within cooldown is hard-rejected.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -619,7 +620,11 @@ async def dismiss_agent_tool(
     if not target_agent:
         return ToolResult.err(f"Agent not found: {params.agent_id}")
 
-    result = await ctx.org.dismiss_agent(project_id, target_agent["id"])
+    result = await ctx.org.dismiss_agent(
+        project_id,
+        target_agent["id"],
+        dismissed_by=agent_id,
+    )
     if result.get("success"):
         return ToolResult.ok(
             f"Agent {target_agent['name']} "
