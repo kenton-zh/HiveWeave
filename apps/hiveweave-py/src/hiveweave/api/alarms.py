@@ -36,9 +36,22 @@ class AlarmCreate(BaseModel):
 async def list_alarms(projectId: str = Query(...)) -> dict:
     """列出项目闹钟。"""
     try:
+        from hiveweave.services.game_time import is_project_tombstoned
+
+        if is_project_tombstoned(projectId):
+            return {"alarms": []}
         alarms = await _game_time.get_alarms(projectId)
     except Exception as e:
-        log.warning("list_alarms_failed", error=str(e))
+        # BUG-6: missing workspace is expected for deleted projects — debug only
+        if "Workspace not found" in str(e):
+            try:
+                from hiveweave.services.game_time import mark_project_tombstoned
+                mark_project_tombstoned(projectId)
+            except Exception:
+                pass
+            log.debug("list_alarms_tombstone", project_id=projectId)
+        else:
+            log.warning("list_alarms_failed", error=str(e))
         alarms = []
     return {"alarms": alarms}
 
@@ -122,9 +135,31 @@ async def get_game_time_compat(project_id: str) -> dict:
     BUG-020 fix: 优雅降级，避免 project 未初始化时返回 500。
     """
     try:
+        from hiveweave.services.game_time import is_project_tombstoned
+
+        if is_project_tombstoned(project_id):
+            return {
+                "projectId": project_id,
+                "gameSeconds": 0,
+                "formatted": "Day 0 00:00",
+                "realStartedAt": None,
+                "realSecondsPerGameDay": 3600,
+            }
         result = await _game_time.get_current_time(project_id)
     except Exception as e:
-        log.warning("get_game_time_compat_failed", project_id=project_id, error=str(e))
+        if "Workspace not found" in str(e):
+            try:
+                from hiveweave.services.game_time import mark_project_tombstoned
+                mark_project_tombstoned(project_id)
+            except Exception:
+                pass
+            log.debug("get_game_time_compat_tombstone", project_id=project_id)
+        else:
+            log.warning(
+                "get_game_time_compat_failed",
+                project_id=project_id,
+                error=str(e),
+            )
         return {
             "projectId": project_id,
             "gameSeconds": 0,

@@ -474,24 +474,130 @@ class OrgService:
             return {"success": False, "message": "Agent not found"}
 
         parent_id = agent_before.get("parent_id") or ""
+        # Resolve grandparent once — used when reassign would make
+        # assignee==reviewer (common: parent was already pinned reviewer).
+        grandparent_id = ""
+        if parent_id:
+            parent_row = await self.get_agent(parent_id)
+            if parent_row:
+                grandparent_id = parent_row.get("parent_id") or ""
         now_ms = int(time.time() * 1000)
+        # BUG-2: if dismissed agent still has submitted/reviewing deliverables,
+        # delay worktree delete (quarantine) so reviewers can read evidence.
+        defer_worktree_delete = False
+        reassigned_summary: list[dict] = []
 
         # Close Task Ledger obligations — reassign open work to parent, else archive
+        # BUG-1: do NOT flatten submitted/reviewing/verifying → claimed.
         try:
             conn = await project_db.get_project_db_by_project_id(project_id)
+            cur = await conn.execute(
+                "SELECT id, status, reviewer_id, title FROM tasks "
+                "WHERE assignee_id = ? AND is_archived = 0 "
+                "AND status NOT IN ('closed', 'cancelled')",
+                [agent_id],
+            )
+            open_tasks = [dict(r) for r in await cur.fetchall()]
+            await cur.close()
+
+            if any(
+                (t.get("status") or "") in ("submitted", "reviewing")
+                for t in open_tasks
+            ):
+                defer_worktree_delete = True
+
             if parent_id:
-                # Reassign open work to parent; assign = claim (not back to created)
-                await conn.execute(
-                    "UPDATE tasks SET assignee_id = ?, status = 'claimed', "
-                    "claimed_at = ?, updated_at = ? "
-                    "WHERE assignee_id = ? AND is_archived = 0 "
-                    "AND status NOT IN ('closed', 'approved')",
-                    [parent_id, now_ms, now_ms, agent_id],
-                )
+                for t in open_tasks:
+                    tid = t["id"]
+                    status = (t.get("status") or "").lower()
+                    old_reviewer = t.get("reviewer_id") or ""
+                    if status in ("claimed", "running", "rework", "created", "blocked"):
+                        # In-progress work: reassign + reset to claimed
+                        await conn.execute(
+                            "UPDATE tasks SET assignee_id = ?, status = 'claimed', "
+                            "claimed_at = ?, updated_at = ? WHERE id = ?",
+                            [parent_id, now_ms, now_ms, tid],
+                        )
+                        reassigned_summary.append({
+                            "task_id": tid,
+                            "from_status": status,
+                            "to_status": "claimed",
+                            "action": "reassign_reset",
+                        })
+                    elif status in ("submitted", "reviewing"):
+                        # Keep review pipeline. Parent inherits assignee; if
+                        # that would equal reviewer (common: parent already
+                        # pinned at submit), escalate reviewer to grandparent.
+                        # No grandparent → keep dismissed as assignee so the
+                        # active parent can still approve (self-review gate).
+                        new_assignee = parent_id
+                        new_reviewer = old_reviewer
+                        if not new_reviewer or new_reviewer == agent_id:
+                            new_reviewer = parent_id
+                        if new_reviewer == new_assignee:
+                            if (
+                                grandparent_id
+                                and grandparent_id not in (new_assignee, agent_id)
+                            ):
+                                new_reviewer = grandparent_id
+                            else:
+                                new_assignee = agent_id
+                        await conn.execute(
+                            "UPDATE tasks SET assignee_id = ?, reviewer_id = ?, "
+                            "updated_at = ? WHERE id = ?",
+                            [new_assignee, new_reviewer, now_ms, tid],
+                        )
+                        reassigned_summary.append({
+                            "task_id": tid,
+                            "from_status": status,
+                            "to_status": status,
+                            "action": "reassign_keep_status",
+                            "assignee_id": new_assignee,
+                            "reviewer_id": new_reviewer,
+                        })
+                    elif status == "verifying":
+                        # VERIFY in flight — leave status alone; only move
+                        # assignee so the ledger stays owned by an active agent.
+                        await conn.execute(
+                            "UPDATE tasks SET assignee_id = ?, updated_at = ? "
+                            "WHERE id = ?",
+                            [parent_id, now_ms, tid],
+                        )
+                        reassigned_summary.append({
+                            "task_id": tid,
+                            "from_status": status,
+                            "to_status": status,
+                            "action": "reassign_verifying",
+                        })
+                    elif status == "approved":
+                        # CREATOR_MUST_MERGE stays on creator; if dismissed was
+                        # assignee only, leave approved with parent as assignee.
+                        await conn.execute(
+                            "UPDATE tasks SET assignee_id = ?, updated_at = ? "
+                            "WHERE id = ?",
+                            [parent_id, now_ms, tid],
+                        )
+                        reassigned_summary.append({
+                            "task_id": tid,
+                            "from_status": status,
+                            "to_status": status,
+                            "action": "reassign_approved",
+                        })
+                    else:
+                        # Unknown / terminal-ish — reassign without status rewrite
+                        await conn.execute(
+                            "UPDATE tasks SET assignee_id = ?, updated_at = ? "
+                            "WHERE id = ?",
+                            [parent_id, now_ms, tid],
+                        )
+                        reassigned_summary.append({
+                            "task_id": tid,
+                            "from_status": status,
+                            "to_status": status,
+                            "action": "reassign_passthrough",
+                        })
             else:
-                # 根因修复: 归档未完成任务用 cancelled（非 closed），与
-                # archive_task 保持一致。closed 语义是"成功完成"，dismiss
-                # 归档的任务并未完成。同时补写审计字段。
+                # No parent: archive unfinished work as cancelled (not closed).
                 await conn.execute(
                     "UPDATE tasks SET is_archived = 1, status = 'cancelled', "
                     "archived_by = 'system', archived_reason = 'agent dismissed', "
@@ -505,10 +611,59 @@ class OrgService:
                 "org.dismiss_agent.tasks_closed",
                 agent_id=agent_id,
                 reassigned_to=parent_id or None,
+                deferred_worktree=defer_worktree_delete,
+                reassigned=len(reassigned_summary),
             )
         except Exception as e:
             log.warning(
                 "dismiss_close_tasks_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
+
+        # Notify parent about inherited obligations (structured, language-neutral)
+        if parent_id and reassigned_summary:
+            try:
+                from hiveweave.services.inbox import InboxService
+
+                lines = [
+                    "[DISMISS REASSIGN] "
+                    f"Agent {agent_before.get('short_id') or agent_id[:8]} "
+                    f"({agent_before.get('name') or ''}) dismissed; "
+                    f"{len(reassigned_summary)} task(s) transferred to you."
+                ]
+                for item in reassigned_summary[:12]:
+                    lines.append(
+                        f"- task={str(item['task_id'])[:12]} "
+                        f"{item['from_status']}→{item['to_status']} "
+                        f"({item['action']})"
+                    )
+                await InboxService().send_message(
+                    from_agent_id="system",
+                    to_agent_id=parent_id,
+                    message="\n".join(lines),
+                    message_type="system",
+                    priority="urgent",
+                )
+            except Exception as e:
+                log.warning(
+                    "dismiss_notify_parent_failed",
+                    agent_id=agent_id,
+                    error=str(e),
+                )
+
+        # BUG-5: archive personnel_records so position uniqueness stays real
+        try:
+            from hiveweave.services.roster import RosterService
+
+            await RosterService().update(
+                project_id,
+                agent_id,
+                {"status": "archived", "updated_by": "system"},
+            )
+        except Exception as e:
+            log.warning(
+                "dismiss_archive_personnel_failed",
                 agent_id=agent_id,
                 error=str(e),
             )
@@ -535,6 +690,7 @@ class OrgService:
                         agent_id=agent_id, error=str(e))
 
         # 清理该 agent 的隔离 worktree（executor 才有）
+        # BUG-2: submitted/reviewing → quarantine instead of immediate delete
         try:
             short_id = updated.get("short_id", "")
             ws_path = updated.get("workspace_path", "")
@@ -543,9 +699,23 @@ class OrgService:
                 gwt = GitWorktreeService()
                 project_ws = await meta_db.get_project_workspace(project_id)
                 if project_ws:
-                    await gwt.delete(project_ws, short_id)
-                    log.info("org.dismiss_agent.worktree_cleaned",
-                             agent_id=agent_id, short_id=short_id)
+                    if defer_worktree_delete:
+                        q = await gwt.quarantine_for_review(
+                            project_ws, short_id
+                        )
+                        log.info(
+                            "org.dismiss_agent.worktree_quarantined",
+                            agent_id=agent_id,
+                            short_id=short_id,
+                            quarantine=q,
+                        )
+                    else:
+                        await gwt.delete(project_ws, short_id)
+                        log.info(
+                            "org.dismiss_agent.worktree_cleaned",
+                            agent_id=agent_id,
+                            short_id=short_id,
+                        )
         except Exception as e:
             log.warning("dismiss_clean_worktree_failed",
                         agent_id=agent_id, error=str(e))

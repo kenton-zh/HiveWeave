@@ -15,7 +15,10 @@ from hiveweave.services.turn_result import (
     parse_turn_result,
     validate_phase_fields,
 )
-from hiveweave.services.turn_session import get_pending_turn_result
+from hiveweave.services.turn_session import (
+    filter_soft_passed_violations,
+    get_pending_turn_result,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -384,6 +387,8 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
         if v not in seen:
             seen.add(v)
             uniq.append(v)
+    # Soft-pass codes accepted earlier this turn must not re-block exit
+    uniq = filter_soft_passed_violations(ctx.agent_id, uniq)
 
     disposition = _disposition_from_result(turn_result, remaining_obligations)
 

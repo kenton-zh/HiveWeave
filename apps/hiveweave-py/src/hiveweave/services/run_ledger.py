@@ -206,6 +206,18 @@ class RunLedger:
         except Exception as e:
             log.warning("run_ledger.increment_llm_calls_failed", error=str(e))
 
+    async def increment_tool_calls(self, agent_id: str, run_id: str) -> None:
+        """Increment the tool-call counter for a run (BUG-7)."""
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE agent_runs SET actual_tool_calls = actual_tool_calls + 1 "
+                "WHERE id = ?",
+                [run_id],
+            )
+        except Exception as e:
+            log.warning("run_ledger.increment_tool_calls_failed", error=str(e))
+
     async def complete_run(
         self,
         agent_id: str,

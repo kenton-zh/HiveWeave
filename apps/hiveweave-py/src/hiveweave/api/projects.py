@@ -825,6 +825,13 @@ async def delete_project(project_id: str) -> dict:
     except Exception as e:
         log.warning("stop_game_time_before_delete_failed", project_id=project_id, error=str(e))
 
+    # BUG-6: tombstone so any lingering tick/API poll stops error spam
+    try:
+        from hiveweave.services.game_time import mark_project_tombstoned
+        mark_project_tombstoned(project_id)
+    except Exception:
+        pass
+
     # M2 fix: 清理 game_time 内存状态
     try:
         from hiveweave.services.game_time import _states, _alarm_project
@@ -1128,11 +1135,36 @@ async def get_project_game_time(project_id: str) -> dict:
     但 endpoint 原本只在 /api/game-time/{id}。在此补一个 projects 前缀的路由。
     """
     try:
+        from hiveweave.services.game_time import is_project_tombstoned
+
+        if is_project_tombstoned(project_id):
+            return {
+                "projectId": project_id,
+                "gameSeconds": 0,
+                "formatted": "Day 0 00:00",
+                "realStartedAt": None,
+                "realSecondsPerGameDay": 3600,
+            }
         result = await _game_time.get_current_time(project_id)
     except Exception as e:
         # 优雅降级：workspace 不存在或 DB 未初始化时返回 0 而非 500，
         # 避免前端 ProjectTimeBadge 崩溃（BUG-020）
-        log.warning("get_project_game_time_failed", project_id=project_id, error=str(e))
+        if "Workspace not found" in str(e):
+            try:
+                from hiveweave.services.game_time import mark_project_tombstoned
+                mark_project_tombstoned(project_id)
+            except Exception:
+                pass
+            log.debug(
+                "get_project_game_time_tombstone",
+                project_id=project_id,
+            )
+        else:
+            log.warning(
+                "get_project_game_time_failed",
+                project_id=project_id,
+                error=str(e),
+            )
         return {
             "projectId": project_id,
             "gameSeconds": 0,

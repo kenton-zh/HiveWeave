@@ -401,15 +401,36 @@ async def hire_agent_tool(
                             wt_result.get("message")
                             or "worktree create returned success=false"
                         )
-                        await ctx.org.update_agent(new_id, {
-                            "worktree_error": worktree_error,
-                        })
-                        log.warning(
-                            "tool.hire_agent.worktree_soft_fail",
-                            agent_id=new_id,
-                            short_id=new_short,
-                            error=worktree_error,
+                        # BUG-4: hire+lazy-create race — verify before storing error
+                        from hiveweave.services.git_worktree import (
+                            _has_git,
+                            _worktree_path,
                         )
+
+                        expected = _worktree_path(project_ws, new_short)
+                        if _has_git(expected):
+                            worktree_path = expected
+                            worktree_error = ""
+                            await ctx.org.update_agent(new_id, {
+                                "workspace_path": worktree_path,
+                                "worktree_error": None,
+                            })
+                            log.info(
+                                "tool.hire_agent.worktree_healed_after_race",
+                                agent_id=new_id,
+                                short_id=new_short,
+                                worktree=worktree_path,
+                            )
+                        else:
+                            await ctx.org.update_agent(new_id, {
+                                "worktree_error": worktree_error,
+                            })
+                            log.warning(
+                                "tool.hire_agent.worktree_soft_fail",
+                                agent_id=new_id,
+                                short_id=new_short,
+                                error=worktree_error,
+                            )
             except Exception as wt_err:
                 log.warning(
                     "tool.hire_agent.worktree_failed",
