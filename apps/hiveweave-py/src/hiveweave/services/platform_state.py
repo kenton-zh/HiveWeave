@@ -343,19 +343,59 @@ async def build_platform_state(
             )
         )
 
-    # ── Slices (not landed yet → unknown) ────────────────
-    unknown.append(
-        _entry(
-            "slices.chain",
-            None,
-            epistemic="unknown",
-            source="contract_json",
-            note=(
-                "Slice DAG / contract_json not deployed yet. "
-                "Do not invent slice status from peer chat."
-            ),
+    # ── Slices (contract_json) ───────────────────────────
+    try:
+        from hiveweave.services.task import TaskService
+        from hiveweave.services.task_contract import (
+            parse_contract,
+            slice_id_of,
         )
-    )
+
+        slice_rows: list[dict[str, Any]] = []
+        for t in obligations:
+            c = parse_contract(t.get("contract_json"))
+            if not c:
+                continue
+            slice_rows.append(
+                {
+                    "slice_id": slice_id_of(c),
+                    "slice_status": c.get("slice_status"),
+                    "task_id": (t.get("id") or "")[:12],
+                    "task_status": t.get("status"),
+                    "pre_run_passed": (c.get("machine_pre_run") or {}).get(
+                        "passed"
+                    ),
+                }
+            )
+        if slice_rows:
+            verified.append(
+                _entry(
+                    "slices.active_obligations",
+                    slice_rows,
+                    epistemic="verified",
+                    source="tasks.contract_json",
+                )
+            )
+        else:
+            verified.append(
+                _entry(
+                    "slices.active_obligations",
+                    [],
+                    epistemic="verified",
+                    source="tasks.contract_json",
+                    note="No slice contracts on current obligations.",
+                )
+            )
+    except Exception as e:
+        unknown.append(
+            _entry(
+                "slices",
+                None,
+                epistemic="unknown",
+                source="contract_json",
+                note=str(e),
+            )
+        )
 
     return {
         "schema_version": 1,

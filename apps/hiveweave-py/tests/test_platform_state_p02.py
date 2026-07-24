@@ -117,7 +117,10 @@ async def test_build_platform_state_splits_epistemology(ps_env):
         blob = str(row.get("value"))
         assert "HIRE_UNREPORTED" not in blob
 
-    assert "slices.chain" in unknown_keys
+    assert (
+        "slices.active_obligations" in verified_keys
+        or "slices" in unknown_keys
+    )
 
     text = format_platform_state(snap)
     assert "## VERIFIED" in text

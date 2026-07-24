@@ -75,6 +75,8 @@ _MISSING_COLUMNS = [
     ("archived_at", "INTEGER"),
     # reviewer_id: pinned on submit (default creator); start_review may overwrite
     ("reviewer_id", "TEXT"),
+    # Slice-driven work mode P0: declarative acceptance contract
+    ("contract_json", "TEXT"),
 ]
 _migrated: set[str] = set()
 
@@ -155,7 +157,8 @@ class TaskService:
         "status, priority, progress, tags, parent_task_id, depends_on, "
         "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
         "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
-        "is_archived, due_at, wait_kind, wake_at, policy_id, reviewer_id"
+        "is_archived, due_at, wait_kind, wake_at, policy_id, reviewer_id, "
+        "contract_json"
     )
 
     async def _raise_progress_floor(
@@ -234,17 +237,63 @@ class TaskService:
                           expected_modules: list[str] | None = None,
                           tags: list[str] | None = None,
                           source: str = "agent",
-                          evidence: dict | None = None) -> str:
+                          evidence: dict | None = None,
+                          contract_json: dict | None = None) -> str:
         """Create a task. JSON-serializes list/dict fields. Returns task_id.
 
         Assign = claim: if ``assignee_id`` is set and the task is not VERIFY,
         insert as ``claimed`` (with ``claimed_at``). Unassigned drafts and
         VERIFY children stay ``created`` until claimed / post-merge nudge.
+
+        When ``contract_json`` is set the task is a slice: validated, given an
+        initial ``slice_status`` (draft|ready), and subject to ready / pre-run
+        gates on start/submit.
         """
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
         task_id = str(uuid.uuid4())
         policy_id = resolve_task_policy(title, tags, description)
+
+        contract_blob = None
+        if contract_json is not None:
+            from hiveweave.services.task_contract import (
+                ensure_slice_status,
+                parse_contract,
+                validate_contract,
+                compute_initial_slice_status,
+                check_ready_gate,
+            )
+
+            parsed = parse_contract(contract_json)
+            if parsed is None:
+                raise ValueError("contract_json must be a non-empty object")
+            verr = validate_contract(parsed)
+            if verr:
+                raise ValueError(verr)
+
+            async def _lookup_tid(tid: str):
+                return await self.get_task(project_id, tid)
+
+            async def _lookup_sid(sid: str):
+                return await self.find_task_by_slice_id(project_id, sid)
+
+            # Probe upstream for initial status (ignore gate error — just classify)
+            probe_task = {
+                "contract_json": parsed,
+                "depends_on": depends_on or [],
+            }
+            ready_err = await check_ready_gate(
+                project_id,
+                probe_task,
+                lookup_by_slice_id=_lookup_sid,
+                lookup_by_task_id=_lookup_tid,
+            )
+            initial = compute_initial_slice_status(
+                parsed, upstream_all_verified=(ready_err is None)
+            )
+            parsed = ensure_slice_status(parsed, initial)
+            contract_blob = json.dumps(parsed, ensure_ascii=False)
+
         # Assign = claim (VERIFY stays created until post-merge / stale nudge)
         draft = {
             "title": title,
@@ -266,16 +315,16 @@ class TaskService:
             "creator_id, status, priority, progress, tags, parent_task_id, depends_on, "
             "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
             "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
-            "is_archived, due_at, policy_id) "
+            "is_archived, due_at, policy_id, contract_json) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, NULL, ?, "
-            "0, ?, ?, NULL, NULL, ?, 0, ?, ?)",
+            "0, ?, ?, NULL, NULL, ?, 0, ?, ?, ?)",
             [task_id, project_id, title, description, assignee_id, creator_id,
              status, priority, json.dumps(tags) if tags else None, parent_task_id,
              json.dumps(depends_on) if depends_on else None,
              json.dumps(acceptance_criteria) if acceptance_criteria else None,
              json.dumps(evidence) if evidence else None,
              json.dumps(expected_modules) if expected_modules else None,
-             source, now_ms, claimed_at, now_ms, due_at, policy_id]),
+             source, now_ms, claimed_at, now_ms, due_at, policy_id, contract_blob]),
             ("INSERT INTO task_events (id, project_id, task_id, event_type, "
              "from_status, to_status, actor_id, payload, created_at) "
              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -284,7 +333,8 @@ class TaskService:
         ])
         log.info("task_created", task_id=task_id, title=title[:60],
                  creator_id=creator_id, assignee_id=assignee_id,
-                 status=status, policy_id=policy_id)
+                 status=status, policy_id=policy_id,
+                 has_contract=bool(contract_blob))
         if assign_is_claim:
             await self.emit_task_event(
                 project_id,
@@ -510,12 +560,50 @@ class TaskService:
             summary=f"[claimed] task {task_id[:8]} by agent",
         )
 
+    async def find_task_by_slice_id(
+        self, project_id: str, slice_id: str
+    ) -> dict | None:
+        """Find a non-archived task whose contract_json.id/slice_id matches."""
+        await _ensure_schema(project_id)
+        sid = (slice_id or "").strip()
+        if not sid:
+            return None
+        rows = await _query(
+            project_id,
+            f"SELECT {self._COLUMNS} FROM tasks WHERE is_archived = 0 "
+            "AND contract_json IS NOT NULL",
+        )
+        for r in rows:
+            d = self._row(r)
+            from hiveweave.services.task_contract import (
+                parse_contract,
+                slice_id_of,
+            )
+
+            c = parse_contract(d.get("contract_json"))
+            if c and slice_id_of(c) == sid:
+                return d
+        return None
+
+    async def _persist_contract_json(
+        self, project_id: str, task_id: str, contract: dict
+    ) -> None:
+        now_ms = int(time.time() * 1000)
+        await _execute(
+            project_id,
+            "UPDATE tasks SET contract_json = ?, updated_at = ? WHERE id = ?",
+            [json.dumps(contract, ensure_ascii=False), now_ms, task_id],
+        )
+
     async def start_task(self, project_id: str, task_id: str) -> None:
         """Start a task (claimed → running).
 
         If the task is currently ``blocked``, delegates to ``unblock_task`` so
         wait metadata is cleared (TEST11 #5-L1). Callers that used to rely on
         ``blocked → running`` being a legal ``_transition`` must not skip that.
+
+        Slice P0: if ``contract_json`` present, enforce ready gate (upstream
+        verified) before transitioning; then set slice_status=in_progress.
         """
         task_id = await self.require_task_id(project_id, task_id)
         rows = await _query(
@@ -536,8 +624,49 @@ class TaskService:
                 summary=f"[running] task {task_id[:8]} unblocked via start_task",
             )
             return
+
+        # READY GATE (slice-driven)
+        task = await self.get_task(project_id, task_id)
+        if task and task.get("contract_json"):
+            from hiveweave.services.task_contract import (
+                check_ready_gate,
+                ensure_slice_status,
+                parse_contract,
+            )
+
+            async def _lookup_tid(tid: str):
+                return await self.get_task(project_id, tid)
+
+            async def _lookup_sid(sid: str):
+                return await self.find_task_by_slice_id(project_id, sid)
+
+            ready_err = await check_ready_gate(
+                project_id,
+                task,
+                lookup_by_slice_id=_lookup_sid,
+                lookup_by_task_id=_lookup_tid,
+            )
+            if ready_err:
+                raise ValueError(ready_err)
+            contract = parse_contract(task.get("contract_json"))
+            if contract:
+                contract = ensure_slice_status(contract, "ready")
+                # Will flip to in_progress after transition succeeds
+
         await self._transition(project_id, task_id, "running")
         agent_id = rows[0]["assignee_id"]
+
+        if task and task.get("contract_json"):
+            from hiveweave.services.task_contract import (
+                ensure_slice_status,
+                parse_contract,
+            )
+
+            contract = parse_contract(task.get("contract_json"))
+            if contract:
+                contract = ensure_slice_status(contract, "in_progress")
+                await self._persist_contract_json(project_id, task_id, contract)
+
         await self.emit_task_event(
             project_id,
             task_id,
@@ -848,8 +977,49 @@ class TaskService:
         TEST11 #3: on submit, pin ``reviewer_id`` (default creator_id) so the
         designated reviewer has obligations from the submitted window onward —
         not only after they call start_review.
+
+        Slice P0: if ``contract_json`` present, L0 machine clauses must pass
+        against the assignee worktree (or project root) before transition.
         """
         task_id = await self.require_task_id(project_id, task_id)
+        task = await self.get_task(project_id, task_id)
+
+        # SUBMITTED MACHINE PRE-RUN (slice-driven L0)
+        if task and task.get("contract_json"):
+            from hiveweave.services.task_contract import (
+                ensure_slice_status,
+                format_prerun_failure,
+                parse_contract,
+                run_machine_acceptance,
+            )
+
+            contract = parse_contract(task.get("contract_json"))
+            if contract:
+                ws_root = await self._resolve_evidence_workspace(
+                    project_id, task
+                )
+                prerun = run_machine_acceptance(
+                    contract, workspace_root=ws_root
+                )
+                contract = dict(contract)
+                contract["machine_pre_run"] = {
+                    **prerun.to_dict(),
+                    "at_ms": int(time.time() * 1000),
+                    "workspace": str(ws_root),
+                }
+                if not prerun.passed:
+                    await self._persist_contract_json(
+                        project_id, task_id, contract
+                    )
+                    raise ValueError(format_prerun_failure(prerun))
+                contract = ensure_slice_status(contract, "submitted")
+                await self._persist_contract_json(
+                    project_id, task_id, contract
+                )
+                if isinstance(evidence, dict):
+                    evidence = dict(evidence)
+                    evidence["machine_pre_run"] = contract["machine_pre_run"]
+
         await self._transition(project_id, task_id, "submitted")
         if isinstance(evidence, dict) and "merged_by" not in evidence:
             rows0 = await _query(
@@ -912,6 +1082,34 @@ class TaskService:
             summary=f"[submitted] task {task_id[:8]}",
         )
 
+    async def _resolve_evidence_workspace(
+        self, project_id: str, task: dict
+    ) -> str:
+        """Prefer assignee write worktree; fall back to project root."""
+        from hiveweave.db import meta as meta_db
+
+        project_ws = await meta_db.get_project_workspace(project_id) or ""
+        assignee_id = task.get("assignee_id")
+        if not assignee_id:
+            return project_ws
+        try:
+            from hiveweave.services.org import OrgService
+
+            agent = await OrgService().get_agent(str(assignee_id))
+            wt = (agent or {}).get("workspace_path") or ""
+            if wt:
+                from pathlib import Path
+
+                if Path(wt).is_dir():
+                    return wt
+        except Exception as e:
+            log.debug(
+                "evidence_workspace_fallback",
+                task_id=(task.get("id") or "")[:12],
+                error=str(e),
+            )
+        return project_ws
+
     async def start_review(self, project_id: str, task_id: str,
                            reviewer_id: str | None = None) -> None:
         """Start review (submitted → reviewing). Store reviewer_id for obligations."""
@@ -970,6 +1168,24 @@ class TaskService:
             await _execute(project_id,
                 "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
                 [json.dumps(evidence), now_ms, task_id])
+            # Slice P0: mark contract verified so downstream ready gates unlock
+            try:
+                task_row = await self.get_task(project_id, task_id)
+                from hiveweave.services.task_contract import (
+                    ensure_slice_status,
+                    parse_contract,
+                )
+
+                c = parse_contract((task_row or {}).get("contract_json"))
+                if c:
+                    c = ensure_slice_status(c, "verified")
+                    await self._persist_contract_json(project_id, task_id, c)
+            except Exception as e:
+                log.warning(
+                    "slice_mark_verified_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
             log.info("task_reviewed", task_id=task_id, decision=decision,
                      has_feedback=feedback is not None)
             await self._wake_dependent_tasks(project_id, task_id)
@@ -1000,6 +1216,23 @@ class TaskService:
             await _execute(project_id,
                 "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
                 [json.dumps(evidence), now_ms, task_id])
+            try:
+                task_row = await self.get_task(project_id, task_id)
+                from hiveweave.services.task_contract import (
+                    ensure_slice_status,
+                    parse_contract,
+                )
+
+                c = parse_contract((task_row or {}).get("contract_json"))
+                if c:
+                    c = ensure_slice_status(c, "failed")
+                    await self._persist_contract_json(project_id, task_id, c)
+            except Exception as e:
+                log.warning(
+                    "slice_mark_failed_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
             log.info("task_reviewed", task_id=task_id, decision=decision,
                      has_feedback=feedback is not None,
                      from_status=current_status)
@@ -1674,7 +1907,7 @@ class TaskService:
         d = dict(row)
         # JSON 反序列化
         for k in ("tags", "depends_on", "acceptance_criteria", "evidence",
-                  "expected_modules"):
+                  "expected_modules", "contract_json"):
             v = d.get(k)
             if isinstance(v, str):
                 try:
