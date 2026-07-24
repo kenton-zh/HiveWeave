@@ -1218,6 +1218,16 @@ class TaskService:
                 [json.dumps(evidence), now_ms, task_id])
             try:
                 task_row = await self.get_task(project_id, task_id)
+                if task_row and self._is_verify_task(task_row):
+                    await VerificationCaseService().mark_failed(
+                        project_id,
+                        task_id,
+                        notes=str(feedback or "")[:500],
+                    )
+            except Exception:
+                pass
+            try:
+                task_row = await self.get_task(project_id, task_id)
                 from hiveweave.services.task_contract import (
                     ensure_slice_status,
                     parse_contract,
@@ -1265,6 +1275,80 @@ class TaskService:
             summary=f"[closed] task {task_id[:8]}",
         )
         await self._wake_dependent_tasks(project_id, task_id)
+        try:
+            await self._maybe_close_umbrella_parent(project_id, task_id)
+        except Exception as e:
+            log.warning(
+                "umbrella_parent_close_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+
+    async def _maybe_close_umbrella_parent(
+        self, project_id: str, closed_child_id: str
+    ) -> None:
+        """Archive/close non-VERIFY parent when all sibling children are done.
+
+        Dogfood: Phase 3 BUILD umbrella hung ~80min after children closed.
+        VERIFY parents are handled by ``_close_verify_and_parent`` — skip them.
+        """
+        child = await self.get_task(project_id, closed_child_id)
+        if not child:
+            return
+        if self._is_verify_task(child):
+            return
+        parent_id = child.get("parent_task_id")
+        if not parent_id:
+            return
+        parent = await self.get_task(project_id, parent_id)
+        if not parent or parent.get("is_archived"):
+            return
+        if self._is_verify_task(parent):
+            return
+        pst = parent.get("status")
+        if pst in ("closed",):
+            return
+        tasks = await self.list_tasks(project_id)
+        siblings = [
+            t for t in tasks
+            if t.get("parent_task_id") == parent_id
+            and not self._is_verify_task(t)
+            and not t.get("is_archived")
+        ]
+        if not siblings:
+            return
+        if not all(t.get("status") == "closed" for t in siblings):
+            return
+        # Do not close umbrella while a VERIFY child of the same parent is open
+        open_verify = [
+            t for t in tasks
+            if t.get("parent_task_id") == parent_id
+            and self._is_verify_task(t)
+            and not t.get("is_archived")
+            and t.get("status") not in ("closed",)
+        ]
+        if open_verify:
+            return
+        # Children done — archive running umbrella or close if already approved
+        if pst in ("approved", "verifying"):
+            await self.close_task(project_id, parent_id)
+            log.info(
+                "umbrella_parent_closed",
+                parent_id=parent_id,
+                via_child=closed_child_id[:8],
+            )
+        elif pst in ("running", "claimed", "submitted", "reviewing", "created"):
+            await self.archive_task(
+                project_id,
+                parent_id,
+                archived_by="system",
+                reason="all child tasks closed — umbrella auto-archived",
+            )
+            log.info(
+                "umbrella_parent_archived",
+                parent_id=parent_id,
+                via_child=closed_child_id[:8],
+            )
 
     async def archive_task(
         self,
@@ -1469,10 +1553,48 @@ class TaskService:
             )
             return
 
-        # Mark verification case as passed
+        # Mark verification case as passed (carry review feedback + merge hash)
         try:
             vcs = VerificationCaseService()
-            await vcs.mark_passed(project_id, verify_id)
+            notes = ""
+            merge_hash = None
+            ev = verify_task.get("evidence") or {}
+            if isinstance(ev, str):
+                try:
+                    ev = json.loads(ev)
+                except Exception:
+                    ev = {}
+            if isinstance(ev, dict):
+                notes = str(
+                    ev.get("review_feedback") or ev.get("summary") or ""
+                )
+                merge_hash = (
+                    ev.get("merge_commit")
+                    or ev.get("merge_commit_hash")
+                    or ev.get("commit")
+                )
+            # Prefer parent evidence merge hash if child lacks it
+            parent_id = verify_task.get("parent_task_id")
+            if not merge_hash and parent_id:
+                parent = await self.get_task(project_id, parent_id)
+                pev = (parent or {}).get("evidence") or {}
+                if isinstance(pev, str):
+                    try:
+                        pev = json.loads(pev)
+                    except Exception:
+                        pev = {}
+                if isinstance(pev, dict):
+                    merge_hash = (
+                        pev.get("merge_commit")
+                        or pev.get("merge_commit_hash")
+                        or pev.get("commit")
+                    )
+            await vcs.mark_passed(
+                project_id,
+                verify_id,
+                notes=notes,
+                merge_commit_hash=str(merge_hash) if merge_hash else None,
+            )
         except Exception:
             pass  # best-effort
 
@@ -2047,18 +2169,48 @@ class VerificationCaseService:
     async def mark_passed(
         self, project_id: str, verify_task_id: str,
         notes: str = "",
+        merge_commit_hash: str | None = None,
     ) -> None:
         """Mark verification as passed (VERIFY approved)."""
         now_ms = int(time.time() * 1000)
         try:
-            await _execute(project_id,
-                "UPDATE verification_cases SET status = 'passed', "
-                "review_notes = ?, closed_at = ?, updated_at = ? "
-                "WHERE verify_task_id = ?",
-                [notes[:500], now_ms, now_ms, verify_task_id],
-            )
+            if merge_commit_hash:
+                await _execute(project_id,
+                    "UPDATE verification_cases SET status = 'passed', "
+                    "review_notes = ?, merge_commit_hash = ?, "
+                    "closed_at = ?, updated_at = ? "
+                    "WHERE verify_task_id = ?",
+                    [notes[:500], merge_commit_hash[:64], now_ms, now_ms,
+                     verify_task_id],
+                )
+            else:
+                await _execute(project_id,
+                    "UPDATE verification_cases SET status = 'passed', "
+                    "review_notes = ?, closed_at = ?, updated_at = ? "
+                    "WHERE verify_task_id = ?",
+                    [notes[:500], now_ms, now_ms, verify_task_id],
+                )
         except Exception as e:
             log.warning("verification_case_mark_passed_failed", error=str(e))
+
+    async def set_merge_commit(
+        self, project_id: str, original_task_id: str,
+        merge_commit_hash: str,
+    ) -> None:
+        """Persist merge commit on the case when parent is merged."""
+        if not merge_commit_hash:
+            return
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET merge_commit_hash = ?, "
+                "updated_at = ? "
+                "WHERE original_task_id = ? AND "
+                "(merge_commit_hash IS NULL OR merge_commit_hash = '')",
+                [merge_commit_hash[:64], now_ms, original_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_set_merge_failed", error=str(e))
 
     async def mark_failed(
         self, project_id: str, verify_task_id: str,

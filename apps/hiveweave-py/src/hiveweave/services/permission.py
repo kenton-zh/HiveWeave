@@ -41,6 +41,7 @@ _BASE_TOOLS = frozenset({
     "git_worktree_list", "git_worktree_status",
     "get_tasks",
     "claim_task", "update_task_status", "submit_task", "update_progress",
+    "attest_doc_review",
 })
 
 CEO_TOOLS = _BASE_TOOLS | frozenset({

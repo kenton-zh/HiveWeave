@@ -1114,12 +1114,23 @@ async def submit_task_tool(
                     f"submit_task attestation gate failed ({policy_id}): {err}. "
                     f"taskId={task_id} (use this full id).\n"
                     f"Options:\n"
-                    f"1) Run bash/tests as the assignee, then "
-                    f"submit_task(taskId=\"{task_id}\", attestationIds=[...]).\n"
-                    f"2) Coordinator: "
-                    f"waive_attestation(taskId=\"{task_id}\", "
-                    f"reason=\"<why exempt>\").\n"
-                    f"Bare testsPassed is rejected."
+                    + (
+                        f"1) attest_doc_review(taskId=\"{task_id}\", "
+                        f"files=[{{path: \"specs/...\"}}]) then "
+                        f"submit_task(..., attestationIds=[...]).\n"
+                        if policy_id == "docs_only"
+                        else (
+                            f"1) Run bash/tests as the assignee, then "
+                            f"submit_task(taskId=\"{task_id}\", "
+                            f"attestationIds=[...]).\n"
+                        )
+                    )
+                    + (
+                        f"2) Coordinator last resort: "
+                        f"waive_attestation(taskId=\"{task_id}\", "
+                        f"reason=\"<why exempt>\").\n"
+                        f"Bare testsPassed is rejected."
+                    )
                 )
     elif params.tests_passed is not True:
         # docs_only still asks for explicit ack
@@ -1356,37 +1367,53 @@ async def review_task_tool(
                 )
             )
             needed = required_attestation_kinds(policy_id)
-            if needed:
-                from hiveweave.services.attestation import has_valid_waiver
+            from hiveweave.services.attestation import has_valid_waiver
 
-                waived = await has_valid_waiver(project_id, params.task_id)
-                if not waived:
-                    aids = evidence.get("attestation_ids") or []
-                    if not isinstance(aids, list):
-                        aids = []
-                    ok, err = await attestation_service.verify_ids(
+            waived = await has_valid_waiver(project_id, params.task_id)
+            if needed and not waived:
+                aids = evidence.get("attestation_ids") or []
+                if not isinstance(aids, list):
+                    aids = []
+                ok, err = await attestation_service.verify_ids(
+                    project_id,
+                    [str(x) for x in aids],
+                    expected_kinds=needed,
+                    task_id=params.task_id,
+                )
+                if not ok:
+                    tid = task.get("id") or params.task_id
+                    kinds = ", ".join(sorted(needed))
+                    return ToolResult.err(
+                        f"Cannot approve: attestation gate failed ({policy_id}): {err}. "
+                        f"taskId={tid} (use this full id).\n"
+                        f"Required kind(s): {kinds}.\n"
+                        f"Options:\n"
+                        f"1) For docs_only: attest_doc_review(taskId, files=[{{path}}]) "
+                        f"then approve with those attestationIds.\n"
+                        f"2) Send rework; require assignee to attach real "
+                        f"browse/test/doc_review attestationIds on resubmit.\n"
+                        f"3) Last resort: waive_attestation(taskId=\"{tid}\", "
+                        f"reason=\"<why exempt>\") then approve again."
+                    )
+            elif not needed and not waived and evidence.get("tests_passed") is not True:
+                # Soft path: tests_passed ack OR any real attestationIds OR waiver
+                aids = evidence.get("attestation_ids") or []
+                if not isinstance(aids, list):
+                    aids = []
+                soft_ok = False
+                if aids:
+                    soft_ok, _ = await attestation_service.verify_ids(
                         project_id,
                         [str(x) for x in aids],
-                        expected_kinds=needed,
                         task_id=params.task_id,
                     )
-                    if not ok:
-                        tid = task.get("id") or params.task_id
-                        return ToolResult.err(
-                            f"Cannot approve: attestation gate failed ({policy_id}): {err}. "
-                            f"taskId={tid} (use this full id).\n"
-                            f"Options:\n"
-                            f"1) Send rework; require assignee to attach real "
-                            f"browse/test attestationIds on resubmit.\n"
-                            f"2) waive_attestation(taskId=\"{tid}\", "
-                            f"reason=\"<why exempt>\") then approve again.\n"
-                            f"3) Have an executor/QA run tests and submit "
-                            f"attestationIds on this task first."
-                        )
-            elif evidence.get("tests_passed") is not True:
-                return ToolResult.err(
-                    "Cannot approve docs_only task without tests_passed=true ack."
-                )
+                if not soft_ok:
+                    return ToolResult.err(
+                        "Cannot approve without tests_passed=true, "
+                        "attestationIds (browse_e2e / test_run / doc_review), "
+                        "or waive_attestation. Prefer attest_doc_review for "
+                        "document VERIFY instead of waiving."
+                    )
 
             # (1) Force worktree context — ensure assignee tree exists, then gate.
             # builder coordinator / executor assignee 须真正 ensure；失败降级为
@@ -1787,10 +1814,11 @@ class WaiveAttestationParams(BaseModel):
 
 @tool(
     "waive_attestation",
-    "Waive the attestation gate for a task (coordinator only). Use for CLI-only "
-    "tasks with no browsable UI, where bash verification logs replace "
-    "browse/test attestations. The waiver is persisted (auditable) and expires "
-    "in 24h. After waiving, the assignee can submit_task without attestationIds.",
+    "Last-resort waiver of the attestation gate (coordinator only). "
+    "Prefer attest_doc_review for document/spec VERIFY (files on main + hash) "
+    "instead of waiving. Use waive only when no machine attestation kind fits "
+    "(auditable, 24h expiry). After waiving, assignee can submit without "
+    "attestationIds / identity gates may relax for VERIFY.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -1831,6 +1859,18 @@ async def waive_attestation_tool(
     except Exception as e:
         return ToolResult.err(f"Failed to create waiver: {e}")
 
+    # Best-effort: mark verification case waived when this is a VERIFY task
+    try:
+        if ts._is_verify_task(task):
+            from hiveweave.services.task import VerificationCaseService
+
+            parent_id = task.get("parent_task_id") or params.task_id
+            await VerificationCaseService().mark_waived(
+                project_id, parent_id, reason=reason
+            )
+    except Exception:
+        pass
+
     # 通知 assignee 现在可以无 attestationIds 提交（task 通道，wake=1）
     assignee = task.get("assignee_id")
     if assignee and assignee != agent_id:
@@ -1864,6 +1904,86 @@ async def waive_attestation_tool(
         f"Attestation waived for task {params.task_id} "
         f"(waiver {waiver_id[:8]}, expires in 24h). "
         f"Assignee may now submit_task without attestationIds."
+    )
+
+
+# ── attest_doc_review ────────────────────────────────────────
+
+
+class AttestDocReviewParams(BaseModel):
+    """Parameters for attest_doc_review tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    task_id: str | None = Field(
+        default=None,
+        alias="taskId",
+        description="Optional task to bind this attestation to.",
+        json_schema_extra={"aliases": ["taskId", "task_id"]},
+    )
+    files: list[Any] = Field(
+        description=(
+            "Files to verify on the project workspace (main), each "
+            "{path, minLines?}. Paths relative to project root."
+        ),
+    )
+
+
+@tool(
+    "attest_doc_review",
+    "Machine-check document deliverables on the project root (main): each "
+    "file must exist; optional minLines. Creates a doc_review attestation "
+    "(sha256 per file). Prefer this over waive_attestation for Spec/Plan/"
+    "docs VERIFY. Tag tasks with docs_only so submit/approve require this "
+    "kind. Returns attestationId to pass into submit_task/review evidence.",
+    requires_workspace=True,
+    security_level="standard",
+)
+async def attest_doc_review_tool(
+    params: AttestDocReviewParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """Issue doc_review attestation after verifying files on disk."""
+    from hiveweave.services.attestation import create_doc_review
+
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project")
+
+    files = params.files or []
+    if isinstance(files, dict):
+        files = [files]
+    if not isinstance(files, list) or not files:
+        return ToolResult.err(
+            "attest_doc_review requires files=[{path, minLines?}, ...]"
+        )
+
+    # Prefer project root (main) so post-merge docs VERIFY does not need waive
+    try:
+        from hiveweave.db import meta as meta_db
+
+        root = await meta_db.get_project_workspace(project_id)
+    except Exception:
+        root = None
+    check_ws = root or workspace
+
+    try:
+        att_id, report = await create_doc_review(
+            project_id,
+            agent_id=agent_id,
+            task_id=params.task_id,
+            files=files,
+            workspace=check_ws,
+        )
+    except ValueError as e:
+        return ToolResult.err(str(e))
+    except Exception as e:
+        return ToolResult.err(f"doc_review failed: {e}")
+
+    paths = ", ".join(f["path"] for f in report.get("files") or [])
+    return ToolResult.ok(
+        f"doc_review attestation {att_id} recorded for [{paths}] "
+        f"under {check_ws}. Pass attestationIds=[\"{att_id}\"] on "
+        f"submit_task / keep in evidence for approve."
     )
 
 
@@ -1956,6 +2076,8 @@ async def _spawn_post_approve_verify_task(
     )
     if parent_policy == "ui_browser_e2e":
         verify_tags.append("ui")
+    if parent_policy == "docs_only":
+        verify_tags.append("docs_only")
 
     verify_id = await ts.create_task(
         project_id,
@@ -2021,6 +2143,22 @@ async def _spawn_post_approve_verify_task(
             )
             if qa_assignee:
                 await vcs.set_reviewer(project_id, verify_id, qa_assignee)
+            # Persist merge HEAD when available (main after merge)
+            try:
+                from hiveweave.db import meta as meta_db
+                from hiveweave.services.git_worktree import _git
+
+                ws = await meta_db.get_project_workspace(project_id)
+                if ws:
+                    ok, out = await _git(
+                        ["rev-parse", "HEAD"], ws
+                    )
+                    if ok and (out or "").strip():
+                        await vcs.set_merge_commit(
+                            project_id, parent_id, out.strip()
+                        )
+            except Exception as e:
+                log.warning("verification_case_merge_hash_failed", error=str(e))
         except Exception as e:
             log.warning("verification_case_create_at_spawn_failed", error=str(e))
     try:

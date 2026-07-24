@@ -1633,6 +1633,8 @@ class GameTimeService:
         inbox = InboxService()
 
         for row in rows:
+            # aiosqlite.Row has no .get() — coerce to dict once
+            row = dict(row)
             aid = row["id"]
             name = row.get("name") or aid[:12]
             parent_id = row.get("parent_id")
