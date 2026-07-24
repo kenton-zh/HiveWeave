@@ -15,6 +15,7 @@ from hiveweave.services.turn_result import (
     validate_phase_fields,
 )
 from hiveweave.services.turn_session import (
+    classify_commit_gate_soft_warn,
     get_pending_turn_result,
     set_pending_turn_result,
 )
@@ -99,13 +100,14 @@ async def commit_turn_tool(
     prev = get_pending_turn_result(agent_id)
     if isinstance(prev, dict) and prev == payload:
         return ToolResult.ok(
-            f"TurnResult ALREADY committed (phase={tr.phase}) — this exact "
-            "commit_turn was already accepted this turn. Do NOT call "
-            "commit_turn again with the same arguments; produce your final "
-            "assistant text now and let the exit gates evaluate. If a gate "
-            "rejects the exit, it will tell you what is still outstanding.",
+            "STOP: TurnResult ALREADY committed "
+            f"(phase={tr.phase}). Do NOT call any more tools this turn. "
+            "gates: []. Platform will evaluate exit; if blocked you will be "
+            "told what remains — do not re-commit_turn with the same args.",
             turn_result=payload,
             duplicate=True,
+            end_turn=True,
+            gates=[],
         )
 
     # Synchronous pre-check: if phase != in_progress, run exit gate pre-check
@@ -139,13 +141,67 @@ async def commit_turn_tool(
                         "CREATOR_MUST_REVIEW": "有 submitted/reviewing 任务待审查",
                         "CREATOR_MUST_MERGE": "有 approved 任务待合并",
                     }
-                    hints = [labels.get(v, v) for v in violations]
-                    return ToolResult.err(
-                        f"commit_turn REJECTED (synchronous gate): "
-                        + "; ".join(hints)
-                        + ". 请先处理这些义务再 commit_turn，"
-                        "或改用 phase=in_progress 继续工作。"
+                    # P2-2 soft-warn: first hit per code this turn → warn+allow;
+                    # second hit → hard reject (reduces wasted LLM round-trips).
+                    soft, hard = classify_commit_gate_soft_warn(
+                        agent_id, violations
                     )
+                    if hard:
+                        hints = [labels.get(v, v) for v in hard]
+                        soft_note = ""
+                        if soft:
+                            soft_note = (
+                                f" (first soft-pass already used for: "
+                                f"{', '.join(soft)})"
+                            )
+                        return ToolResult.err(
+                            f"commit_turn REJECTED (synchronous gate): "
+                            + "; ".join(hints)
+                            + soft_note
+                            + ". 请先处理这些义务再 commit_turn，"
+                            "或改用 phase=in_progress 继续工作。"
+                            + f" gates: {hard}."
+                        )
+                    if soft:
+                        # Soft-pass: accept TurnResult but surface the warning.
+                        # Still end_turn — platform owns the rest of the exit.
+                        set_pending_turn_result(agent_id, payload)
+                        hints = [labels.get(v, v) for v in soft]
+                        # Persist observability (best-effort)
+                        try:
+                            from hiveweave.db import meta as meta_db
+                            from hiveweave.services.work_log import WorkLogService
+
+                            project_id = await meta_db.get_agent_project_id(
+                                agent_id
+                            )
+                            if not project_id and ctx is not None:
+                                project_id = getattr(ctx, "project_id", None)
+                            if project_id:
+                                await WorkLogService().write_work_log(
+                                    project_id,
+                                    agent_id,
+                                    None,
+                                    "turn_result",
+                                    f"[{tr.phase}/SOFT] {tr.summary}"[:140],
+                                    details={
+                                        **payload,
+                                        "soft_pass": soft,
+                                    },
+                                )
+                        except Exception:
+                            pass
+                        return ToolResult.ok(
+                            f"STOP: TurnResult accepted WITH SOFT WARNING "
+                            f"(first offense this turn): {'; '.join(hints)}. "
+                            f"gates: {soft}. Do NOT call any more tools. "
+                            f"Same gate will HARD REJECT on repeat. "
+                            f"phase={tr.phase}.",
+                            turn_result=payload,
+                            soft_pass=soft,
+                            end_turn=True,
+                            gates=list(soft),
+                        )
         except Exception:
             pass  # best-effort: don't block on pre-check failure
 
@@ -171,10 +227,26 @@ async def commit_turn_tool(
     except Exception:
         pass
 
+    # BUG-3 / DESIGN-1: non-in_progress commit hard-stops the tool loop.
+    # Empty gates: [] means no outstanding synchronous gate failures —
+    # do not invent gate names (e.g. HIRE_UNREPORTED) from memory.
+    if tr.phase == "in_progress":
+        return ToolResult.ok(
+            f"TurnResult accepted: phase=in_progress. Will continue working. "
+            f"gates: [].",
+            turn_result=payload,
+            end_turn=False,
+            gates=[],
+        )
+
     return ToolResult.ok(
-        f"TurnResult accepted: phase={tr.phase}. "
-        f"{'Will continue working.' if tr.phase == 'in_progress' else 'Ready to exit if gates pass.'}",
+        f"STOP: TurnResult committed (phase={tr.phase}). "
+        f"Do NOT call any more tools this turn. gates: []. "
+        f"Platform evaluates exit next; if blocked you will be told "
+        f"exactly which gates remain — do not guess.",
         turn_result=payload,
+        end_turn=True,
+        gates=[],
     )
 
 

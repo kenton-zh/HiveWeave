@@ -822,7 +822,8 @@ class Streamer:
 
         for round_num in range(rounds_cap):
             # 通知回调：新一轮开始（用于重置流式文本累积器）
-            if round_num > 0 and on_delta:
+            # BUG-7: also fire on round 0 so LLM call counters stay accurate
+            if on_delta:
                 await self._fire_delta(on_delta, {
                     "type": "round_start",
                     "round": round_num,
@@ -1067,6 +1068,7 @@ class Streamer:
                     })
 
                 # 执行工具
+                end_turn = False
                 if on_tool_call is None:
                     log.error("no_tool_executor", agent_id=agent_id)
                     tool_results = [
@@ -1075,7 +1077,7 @@ class Streamer:
                         for tc in tool_calls
                     ]
                 else:
-                    tool_results, error_ids, duplicate_ids = (
+                    tool_results, error_ids, duplicate_ids, end_turn = (
                         await self._execute_tools(
                             agent_id=agent_id,
                             tool_calls=tool_calls,
@@ -1095,6 +1097,27 @@ class Streamer:
                 # 追加 assistant + tool_results 到 messages
                 messages = messages + [assistant_msg] + tool_results
                 tool_turn_acc.extend(tool_results)
+
+                # BUG-3: commit_turn accepted → hard-stop tool loop (no next LLM round)
+                if end_turn:
+                    log.info(
+                        "commit_turn_end_turn",
+                        agent_id=agent_id,
+                        round=round_num,
+                    )
+                    final_text = self._strip_placeholder(combined_text)
+                    if not final_text:
+                        final_text = "(turn committed)"
+                    return {
+                        "status": "ok",
+                        "content": final_text,
+                        "thinking": combined_thinking,
+                        "tool_calls": tool_history,
+                        "tool_turn_messages": tool_turn_acc,
+                        "rounds": round_num + 1,
+                        "usage": last_usage,
+                        "end_turn": True,
+                    }
 
                 # 连续无文字轮次检测
                 if not new_text:
@@ -1650,13 +1673,14 @@ class Streamer:
         on_tool_call: ToolCallCallback,
         on_delta: DeltaCallback | None,
         poll_turn_counts: dict[tuple[str, str], int] | None = None,
-    ) -> tuple[list[dict], set[str], set[str]]:
-        """执行一批工具调用，返回 (tool result 消息列表, 出错的 tool_call_id 集合, duplicate tool_call_id 集合)。
+    ) -> tuple[list[dict], set[str], set[str], bool]:
+        """执行一批工具调用，返回 (tool result 消息列表, 出错的 tool_call_id 集合, duplicate tool_call_id 集合, end_turn)。
 
         并行执行独立的工具调用（对齐 Elixir Task.Supervisor.async_nolink）。
         error_ids 保留用于日志/观测（doom 检测已不再使用失败豁免）。
         duplicate_ids 标识"同参数已执行过、本次无新效果"的工具调用，供 doom
         tracker 做强制 +1 计数加速触顶。
+        end_turn=True 表示本批含已接受的 commit_turn，应硬断工具循环（BUG-3）。
         """
         counts = poll_turn_counts if poll_turn_counts is not None else {}
         # 广播 tool_use 事件
@@ -1680,6 +1704,7 @@ class Streamer:
         tool_results: list[dict] = []
         error_ids: set[str] = set()
         duplicate_ids: set[str] = set()
+        end_turn = False
         for i, result in enumerate(results):
             tc = tool_calls[i]
             if isinstance(result, BaseException):
@@ -1702,6 +1727,8 @@ class Streamer:
                 # 强信号，应计入循环检测。
                 if result.get("duplicate"):
                     duplicate_ids.add(tc["id"])
+                if result.get("end_turn"):
+                    end_turn = True
             tool_results.append({
                 "role": "tool",
                 "content": content,
@@ -1714,7 +1741,7 @@ class Streamer:
                 "content": content,
             })
 
-        return tool_results, error_ids, duplicate_ids
+        return tool_results, error_ids, duplicate_ids, end_turn
 
     async def _execute_single_tool(
         self,

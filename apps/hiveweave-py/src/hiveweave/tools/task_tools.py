@@ -1407,6 +1407,18 @@ async def review_task_tool(
             if wt_deny:
                 return ToolResult.err(wt_deny)
 
+            # TEST11 evening: structured evidence verifiability
+            # (files_changed existence + acceptance_criteria path tokens)
+            from hiveweave.services.worktree_review import (
+                check_evidence_verifiable,
+            )
+
+            ev_deny = await check_evidence_verifiable(
+                project_id, task, evidence
+            )
+            if ev_deny:
+                return ToolResult.err(ev_deny)
+
         current_status = task["status"]
         if decision == "approve":
             if current_status == "submitted":

@@ -83,11 +83,26 @@ MERGE_PROXY_COOLDOWN_MS = 30 * 60 * 1000
 
 _states: dict[str, dict] = {}          # project_id → state
 _alarm_project: dict[str, str] = {}    # alarm_id → project_id
+# BUG-6: projects whose workspace vanished (deleted) — stop tick + quiet API spam
+_tombstoned_projects: set[str] = set()
+
+
+def mark_project_tombstoned(project_id: str) -> None:
+    """Mark a project as gone so tick/API stop hammering a missing workspace."""
+    if project_id:
+        _tombstoned_projects.add(project_id)
+
+
+def is_project_tombstoned(project_id: str) -> bool:
+    return bool(project_id) and project_id in _tombstoned_projects
 
 
 async def _conn(project_id: str) -> aiosqlite.Connection:
+    if is_project_tombstoned(project_id):
+        raise ProjectDbError(f"Workspace not found for project {project_id}")
     workspace = await meta_db.get_project_workspace(project_id)
     if not workspace:
+        mark_project_tombstoned(project_id)
         raise ProjectDbError(f"Workspace not found for project {project_id}")
     # BUG-020 修复：切项目后 DB 可能尚未创建/迁移，强制 ensure schema 后再返回连接
     try:
@@ -401,9 +416,34 @@ class GameTimeService:
     async def _tick_loop(self, project_id: str) -> None:
         while True:
             await asyncio.sleep(TICK_INTERVAL)
+            if is_project_tombstoned(project_id):
+                log.info(
+                    "game_time_tick_stopped_tombstone",
+                    project_id=project_id,
+                )
+                break
             try:
                 await self.tick(project_id)
+            except ProjectDbError as e:
+                # BUG-6: missing workspace → tombstone and exit loop
+                if "Workspace not found" in str(e):
+                    mark_project_tombstoned(project_id)
+                    log.warning(
+                        "game_time_tick_tombstone",
+                        project_id=project_id,
+                        error=str(e),
+                    )
+                    break
+                log.error("game_time_tick_error", project_id=project_id, error=str(e))
             except Exception as e:
+                if "Workspace not found" in str(e):
+                    mark_project_tombstoned(project_id)
+                    log.warning(
+                        "game_time_tick_tombstone",
+                        project_id=project_id,
+                        error=str(e),
+                    )
+                    break
                 log.error("game_time_tick_error", project_id=project_id, error=str(e))
 
     async def _nudge_stale_verify(self, project_id: str) -> None:

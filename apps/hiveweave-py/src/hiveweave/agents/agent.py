@@ -962,15 +962,6 @@ class Agent:
                     max_tool_rounds=max_rounds,
                 )
 
-                # Increment LLM call counter (each stream call = 1+ LLM requests)
-                if _run_id:
-                    try:
-                        await self._run_ledger.increment_llm_calls(
-                            self.id, _run_id
-                        )
-                    except Exception:
-                        pass  # best-effort
-
                 status = result.get("status", "error")
 
                 if status == "empty":
@@ -2360,6 +2351,14 @@ class Agent:
         )
         if is_total_timeout:
             self._stream_timeout_streak += 1
+            # BUG-8: per-agent streak (park at >=2). Global telemetry count in
+            # streamer is process-wide and must not be read as this streak.
+            log.warning(
+                "stream_timeout_agent_streak",
+                agent_id=self.id,
+                agent_streak=self._stream_timeout_streak,
+                will_park=self._stream_timeout_streak >= 2,
+            )
         else:
             self._stream_timeout_streak = 0
 
@@ -3548,9 +3547,15 @@ class Agent:
         self._stop_heartbeat()
         self._broadcast_stream_event(event)
 
-        # 工具循环新一轮 → 重置文本累积器
+        # 工具循环新一轮 → 重置文本累积器 + BUG-7 按轮次累加 LLM 调用
         if event.get("type") == "round_start":
             self._streaming_text_acc = ""
+            _run_id = getattr(self, "_current_run_id", None)
+            if _run_id:
+                try:
+                    await self._run_ledger.increment_llm_calls(self.id, _run_id)
+                except Exception:
+                    pass
             return
 
         if event.get("type") == "text_delta" and self._streaming_msg_id:
@@ -3616,6 +3621,8 @@ class Agent:
                     tool_call_id=tool_call_id,
                     tool_args_hash=args_hash,
                 )
+                # BUG-7: increment tool counter at step start (covers interrupt path)
+                await self._run_ledger.increment_tool_calls(self.id, _run_id)
             except Exception as e:
                 log.debug("run_ledger.step_start_failed", error=str(e))
 
@@ -3663,9 +3670,12 @@ class Agent:
             "role": "tool",
             "content": content,
             "tool_call_id": tool_call_id,
-            # success / duplicate 透传给 streamer（doom 检测：success 标识失败
-            # 调用，duplicate 标识同参已执行过无新效果）。这两个键不会进入
-            # 发给 LLM 的消息体 —— _execute_tools 重新组包时剥离。
+            # success / duplicate / end_turn 透传给 streamer：
+            # - success: 失败调用
+            # - duplicate: 同参已执行过无新效果（doom 加速）
+            # - end_turn: commit_turn 已接受 → 硬断本轮工具循环（BUG-3）
+            # 这些键不会进入发给 LLM 的消息体 —— _execute_tools 重新组包时剥离。
             "success": result.get("success", False),
             "duplicate": result.get("duplicate", False),
+            "end_turn": bool(result.get("end_turn")),
         }

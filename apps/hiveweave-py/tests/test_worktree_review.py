@@ -37,7 +37,8 @@ def test_compare_empty_files_blocks(tmp_path: Path):
     assert "files_changed is empty" in deny
 
 
-def test_compare_identical_to_main_blocks(tmp_path: Path):
+def test_compare_identical_to_main_allows_already_merged(tmp_path: Path):
+    """BUG-9: all claimed files already on MAIN → allow approve (close ledger)."""
     main = tmp_path / "main"
     wt = tmp_path / "wt"
     main.mkdir()
@@ -47,8 +48,8 @@ def test_compare_identical_to_main_blocks(tmp_path: Path):
     deny, meta = compare_worktree_to_main(
         main_ws=str(main), worktree_ws=str(wt), files_changed=["a.js"]
     )
-    assert deny is not None
-    assert "identical to MAIN" in deny
+    assert deny is None
+    assert meta.get("alreadyOnMain") is True
     assert meta["identicalToMain"] == ["a.js"]
 
 

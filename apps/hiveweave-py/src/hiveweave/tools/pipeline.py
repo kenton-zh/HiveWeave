@@ -27,6 +27,18 @@ from hiveweave.services.policy import COORDINATOR_WRITE_PREFIXES
 
 log = structlog.get_logger()
 
+# BUG-9: these tools must land in the agent's write worktree, never project root.
+_WRITE_REQUIRE_WORKTREE_TOOLS = frozenset({
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "create_directory",
+    "delete_file",
+    "delete_directory",
+    "move_file",
+})
+
+
 
 # 拒绝时应向 coordinator/HR 展示写白名单的源码写工具
 _SOURCE_WRITE_TOOLS = frozenset({
@@ -109,6 +121,44 @@ class ToolContext:
     permission: Any = None
     approval: Any = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+async def _refuse_project_root_write(
+    agent_id: str,
+    workspace_path: str,
+    tool_name: str,
+    ctx: ToolContext | None,
+) -> str | None:
+    """Return an error if a write-eligible agent is about to write on project root."""
+    from pathlib import Path
+
+    try:
+        from hiveweave.services.git_worktree import agent_gets_write_worktree
+        from hiveweave.tools.file import infer_project_root
+
+        agent = None
+        if ctx is not None and ctx.org is not None:
+            agent = await ctx.org.get_agent(agent_id)
+        if not agent:
+            return None
+        if not agent_gets_write_worktree(agent):
+            return None  # CEO/HR stay on project root by design
+
+        root = Path(infer_project_root(workspace_path)).resolve()
+        ws = Path(workspace_path).resolve()
+        if ws != root:
+            return None
+        short = (agent.get("short_id") or "?").strip()
+        return (
+            f"Refusing {tool_name} on project root for write-worktree agent "
+            f"{short}. Your workspace must be "
+            f".hiveweave/worktrees/{short}/ — worktree missing or unbound. "
+            "Wait for worktree heal / re-hire, or ask coordinator to ensure "
+            "your worktree before writing. Do NOT write to main."
+        )
+    except Exception as e:
+        log.debug("refuse_project_root_write_check_failed", error=str(e))
+        return None
 
 
 async def execute_registered_tool(
@@ -207,6 +257,15 @@ async def execute_registered_tool(
             return ToolResult.err(f"Permission rejected: {exc}").to_dict()
         except Exception as exc:  # noqa: BLE001
             return ToolResult.err(f"Error: Approval request failed: {exc}").to_dict()
+
+    # BUG-9: writers must not silently dump files on project root when their
+    # worktree is missing — refuse and point them at ensure/heal.
+    if tool_name in _WRITE_REQUIRE_WORKTREE_TOOLS:
+        refuse = await _refuse_project_root_write(
+            agent_id, workspace_path, tool_name, ctx
+        )
+        if refuse:
+            return ToolResult.err(refuse).to_dict()
 
     # 4. Security checks (auto-injected based on security_level)
     if tool_def.security_level == "file_op":

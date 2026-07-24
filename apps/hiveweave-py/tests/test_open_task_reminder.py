@@ -89,8 +89,10 @@ async def test_actionable_obligations_assignee_and_creator(env):
     as_creator = await ts.get_actionable_obligations(pid, AGENT_C)
     creator_ids = {t["id"] for t in as_creator}
     assert sub_id in creator_ids
+    # submit pins reviewer_id=creator → role_hint is "reviewer" (TEST11 #3),
+    # not "creator" (creator keeps approved→merge only when reviewer differs).
     assert all(
-        t["role_hint"] == "creator" for t in as_creator if t["id"] == sub_id
+        t["role_hint"] == "reviewer" for t in as_creator if t["id"] == sub_id
     )
 
 

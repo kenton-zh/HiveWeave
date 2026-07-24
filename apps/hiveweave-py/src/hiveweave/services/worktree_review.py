@@ -201,12 +201,20 @@ def compare_worktree_to_main(
             f"Missing: {meta['missingInWorktree'][:8]}",
             meta,
         )
+    # BUG-9: if every claimed file is already identical to MAIN, the work was
+    # already merged (or landed on main another way). Allow approve so the
+    # ledger can close instead of forcing cancel / dead tasks.
+    if meta["identicalToMain"] and not meta["divergedFiles"]:
+        meta["alreadyOnMain"] = True
+        meta["autoCloseReason"] = "content_already_on_main"
+        return None, meta
     if meta["identicalToMain"]:
         return (
             "Approve blocked: some claimed files_changed are identical to MAIN "
             f"in assignee worktree ({worktree_ws}). "
             f"Identical: {meta['identicalToMain'][:8]}. "
-            "Only approve real worktree diffs.",
+            "Only approve real worktree diffs "
+            "(or resubmit after merge so all claimed files match main).",
             meta,
         )
     if not meta["divergedFiles"]:
@@ -418,3 +426,190 @@ def select_tasks_for_merged_work(
     # Same assignee — this worktree merge covers all their approved tasks
     candidates.sort(key=lambda x: int(x.get("updated_at") or 0), reverse=True)
     return candidates
+
+
+# ── Evidence verifiability (TEST11 evening P3 / action #9) ─────
+# Structured only: files_changed existence + acceptance_criteria path tokens.
+# Never scan free-text for intent keywords.
+
+_KNOWN_FILE_EXTS = (
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".json", ".yml", ".yaml",
+    ".toml", ".css", ".html", ".vue", ".go", ".rs", ".java", ".kt", ".sql",
+    ".txt", ".sh", ".bat", ".ps1", ".cjs", ".mjs", ".scss", ".less",
+)
+
+# Path-like token: has a slash, or is a bare filename with a known extension.
+_PATH_TOKEN_RE = re.compile(
+    r"(?:"
+    r"(?:\.?/?[\w.-]+(?:/[\w.-]+)+)"  # a/b or ./a/b
+    r"|"
+    r"(?:[\w.-]+\.(?:" + "|".join(e.lstrip(".") for e in _KNOWN_FILE_EXTS) + r"))"
+    r")"
+)
+
+
+def extract_acceptance_path_refs(criteria: Any) -> list[str]:
+    """Extract filesystem path tokens from acceptance_criteria.
+
+    Only structural path shapes — no natural-language intent guessing.
+    """
+    items: list[Any]
+    if criteria is None:
+        return []
+    if isinstance(criteria, str):
+        try:
+            import json
+
+            parsed = json.loads(criteria)
+            items = parsed if isinstance(parsed, list) else [criteria]
+        except Exception:
+            items = [criteria]
+    elif isinstance(criteria, list):
+        items = criteria
+    else:
+        items = [criteria]
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        text = str(raw or "").replace("\\", "/")
+        if not text.strip():
+            continue
+        # Whole criterion is itself a path
+        cand = text.strip().strip("`\"'")
+        while cand.startswith("./"):
+            cand = cand[2:]
+        if ("/" in cand or cand.lower().endswith(_KNOWN_FILE_EXTS)) and " " not in cand:
+            norm = normalize_evidence_path(cand)
+            if norm and norm not in seen:
+                seen.add(norm)
+                found.append(norm)
+            continue
+        for m in _PATH_TOKEN_RE.finditer(text):
+            token = m.group(0).strip().strip("`\"'")
+            while token.startswith("./"):
+                token = token[2:]
+            norm = normalize_evidence_path(token)
+            if norm and norm not in seen:
+                seen.add(norm)
+                found.append(norm)
+    return found
+
+
+def _resolve_evidence_roots(
+    project_root: str | None,
+    worktree: str | None,
+) -> list[Path]:
+    roots: list[Path] = []
+    for r in (worktree, project_root):
+        if not r:
+            continue
+        p = Path(r)
+        if p.is_dir() and p not in roots:
+            roots.append(p)
+    return roots
+
+
+def _path_exists_under(roots: list[Path], rel: str) -> bool:
+    if not rel or not roots:
+        return False
+    rel_n = rel.replace("\\", "/").lstrip("/")
+    for root in roots:
+        cand = root / rel_n
+        try:
+            if cand.exists():
+                return True
+        except OSError:
+            continue
+        # Also try as absolute if rel somehow absolute after normalize
+    abs_cand = Path(rel_n)
+    if abs_cand.is_absolute():
+        try:
+            return abs_cand.exists()
+        except OSError:
+            return False
+    return False
+
+
+async def check_evidence_verifiable(
+    project_id: str,
+    task: dict[str, Any],
+    evidence: dict[str, Any] | None,
+) -> str | None:
+    """Return deny reason if approve evidence is not structurally verifiable.
+
+    Checks:
+    1. Each ``evidence.files_changed`` path exists under assignee worktree
+       or project root.
+    2. Path tokens extracted from ``acceptance_criteria`` are either in
+       ``files_changed`` or exist on disk.
+
+    Skips VERIFY tasks and empty criteria+files (docs-only / no claims).
+    """
+    from hiveweave.services.task import TaskService
+
+    if TaskService()._is_verify_task(task):
+        return None
+
+    ev = evidence if isinstance(evidence, dict) else {}
+    claimed_raw = ev.get("files_changed") or ev.get("filesChanged") or []
+    if not isinstance(claimed_raw, list):
+        claimed_raw = []
+    claimed = [
+        normalize_evidence_path(p)
+        for p in claimed_raw
+        if normalize_evidence_path(p)
+    ]
+    path_refs = extract_acceptance_path_refs(task.get("acceptance_criteria"))
+
+    if not claimed and not path_refs:
+        return None  # nothing structural to verify
+
+    project_root = await project_main_workspace(project_id)
+    worktree = None
+    assignee = task.get("assignee_id")
+    if assignee:
+        worktree = await agent_worktree_path(str(assignee))
+    roots = _resolve_evidence_roots(project_root, worktree)
+
+    missing_claimed = [
+        p for p in claimed if not _path_exists_under(roots, p)
+    ]
+    uncovered_criteria: list[str] = []
+    claimed_set = set(claimed)
+    for pref in path_refs:
+        if pref in claimed_set:
+            continue
+        # Prefix / basename soft match against claimed
+        if any(
+            c == pref or c.endswith("/" + pref) or pref.endswith("/" + c)
+            for c in claimed_set
+        ):
+            continue
+        if _path_exists_under(roots, pref):
+            continue
+        uncovered_criteria.append(pref)
+
+    if not missing_claimed and not uncovered_criteria:
+        return None
+
+    parts: list[str] = [
+        "Cannot approve: evidence not structurally verifiable."
+    ]
+    if missing_claimed:
+        parts.append(
+            "files_changed missing on disk: "
+            + ", ".join(missing_claimed[:8])
+            + ("…" if len(missing_claimed) > 8 else "")
+        )
+    if uncovered_criteria:
+        parts.append(
+            "acceptance_criteria path refs not in files_changed and not "
+            "found on disk: "
+            + ", ".join(uncovered_criteria[:8])
+            + ("…" if len(uncovered_criteria) > 8 else "")
+        )
+    parts.append(
+        "Ask assignee to resubmit with existing paths, or rework."
+    )
+    return " ".join(parts)

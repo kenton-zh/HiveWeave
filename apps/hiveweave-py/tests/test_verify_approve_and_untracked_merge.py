@@ -225,11 +225,16 @@ async def test_merge_quarantines_untracked_and_succeeds(tmp_path: Path):
     )
 
     assert result.get("success") is True, result
-    # quarantined
-    q = main / ".hiveweave" / "merge-quarantine"
-    assert q.is_dir()
+    # Dirty main is cleared either by pre-merge auto-checkpoint (commits
+    # untracked onto target) or by merge-quarantine fallback. Both must
+    # leave a successful merge with feature.py on main.
     assert (main / "feature.py").is_file()
     assert "feat" in (main / "feature.py").read_text(encoding="utf-8")
+    q = main / ".hiveweave" / "merge-quarantine"
+    tracked = bool(_git(main, "ls-files", "--", "feature.py"))
+    assert q.is_dir() or tracked, (
+        "expected merge-quarantine dir or tracked feature.py after checkpoint"
+    )
 
 
 @pytest.mark.asyncio

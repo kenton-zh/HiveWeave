@@ -279,14 +279,20 @@ class Telemetry:
             "system_time": time.time(),
         })
 
-    def stream_total_timeout(self, agent_id: str) -> None:
+    def stream_total_timeout(
+        self, agent_id: str, *, agent_streak: int | None = None
+    ) -> None:
         self._counters["stream_total_timeout"] = (
             self._counters.get("stream_total_timeout", 0) + 1
         )
+        # BUG-8: log per-agent streak separately from the process-wide counter
+        # (global count alone looked like park should have fired when it was
+        # actually two different agents timing out once each).
         logger.warning(
             "telemetry_stream_total_timeout",
             agent_id=agent_id,
             count=self._counters["stream_total_timeout"],
+            agent_streak=agent_streak,
         )
 
     def doom_loop(

@@ -23,6 +23,7 @@ import asyncio
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import List
 
@@ -31,6 +32,12 @@ import structlog
 log = structlog.get_logger(__name__)
 
 WORKTREE_DIR = ".hiveweave/worktrees"
+QUARANTINE_DIR = ".hiveweave/worktrees/_quarantine"
+
+# BUG-4: serialize create per (workspace, short_id) so hire + lazy-ensure
+# cannot race and leave a false worktree_error while the tree is healthy.
+_create_locks: dict[str, asyncio.Lock] = {}
+_create_locks_guard = asyncio.Lock()
 CHECKPOINT_PREFIX = "checkpoint:"
 GIT_TIMEOUT = 30.0
 SLUG_MAX_LEN = 40
@@ -485,6 +492,26 @@ coverage/
 
         Returns ``{success, path, branch}`` or ``{success: False, message}``.
         """
+        lock_key = f"{Path(workspace_path).resolve()}::{short_id}"
+        async with _create_locks_guard:
+            lock = _create_locks.get(lock_key)
+            if lock is None:
+                lock = asyncio.Lock()
+                _create_locks[lock_key] = lock
+        async with lock:
+            return await self._create_unlocked(
+                workspace_path, short_id, task_name, base_branch, task_id=task_id
+            )
+
+    async def _create_unlocked(
+        self,
+        workspace_path: str,
+        short_id: str,
+        task_name: str | None = None,
+        base_branch: str = "main",
+        *,
+        task_id: str | None = None,
+    ) -> dict:
         repo = await self.ensure_git_repo(workspace_path)
         if not repo["success"]:
             return repo
@@ -1168,6 +1195,68 @@ coverage/
                 "message": msg if ok2 else ""}
 
     # ── 5. DELETE (remove) ──────────────────────────────────
+
+    async def quarantine_for_review(
+        self, workspace_path: str, short_id: str
+    ) -> dict:
+        """Move a worktree aside instead of deleting it (BUG-2).
+
+        Used when dismiss happens while submitted/reviewing tasks still need
+        evidence from this tree. Git registration is pruned; the directory is
+        relocated under ``.hiveweave/worktrees/_quarantine/<sid>-<ts>/``.
+        Branch is preserved (not deleted).
+        """
+        path = _worktree_path(workspace_path, short_id)
+        fwd_path = path.replace("\\", "/")
+        branch = None
+        if _has_git(path):
+            branch = await _current_branch(path)
+        if not branch:
+            branch = compute_branch_name(short_id)
+
+        # Detach from git's worktree list without deleting the branch
+        ok, _ = await _git(["worktree", "remove", fwd_path], workspace_path)
+        if not ok:
+            ok, _ = await _git(
+                ["worktree", "remove", fwd_path, "--force"], workspace_path
+            )
+        if not ok and Path(path).exists():
+            # Still on disk — just prune registration; we'll move the dir
+            await _git(["worktree", "prune"], workspace_path)
+
+        q_root = Path(workspace_path) / QUARANTINE_DIR
+        q_root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = q_root / f"{short_id}-{stamp}"
+        if Path(path).exists():
+            try:
+                shutil.move(str(path), str(dest))
+            except OSError as e:
+                log.warning(
+                    "git_worktree.quarantine_move_failed",
+                    short_id=short_id,
+                    path=path,
+                    dest=str(dest),
+                    error=str(e),
+                )
+                # Fall back to leaving the tree in place (still reviewable)
+                dest = Path(path)
+        else:
+            dest = Path(path)
+
+        log.info(
+            "git_worktree.quarantined_for_review",
+            short_id=short_id,
+            branch=branch,
+            quarantine=str(dest),
+        )
+        return {
+            "success": True,
+            "quarantined": True,
+            "path": str(dest),
+            "branch": branch,
+            "short_id": short_id,
+        }
 
     async def delete(self, workspace_path: str, short_id: str,
                      task_name: str | None = None, *,
@@ -1873,6 +1962,32 @@ async def ensure_executor_worktree(
     result = await gwt.create(ws, short_id, str(name), task_id=task_id)
     if not result.get("success") or not result.get("path"):
         err = result.get("message") or "worktree create failed"
+        # BUG-4: race with concurrent create may report failure while the
+        # tree is already healthy — re-validate before persisting error.
+        expected = _worktree_path(ws, short_id)
+        if _has_git(expected):
+            try:
+                await org.update_agent(
+                    agent_id,
+                    {"workspace_path": expected, "worktree_error": None},
+                )
+            except Exception:
+                pass
+            actual = await _current_branch(expected)
+            log.info(
+                "executor_worktree_healed_after_race",
+                agent_id=agent_id,
+                short_id=short_id,
+                path=expected,
+                prior_error=err,
+            )
+            return {
+                "success": True,
+                "path": expected,
+                "short_id": short_id,
+                "branch": actual,
+                "message": "worktree healthy after create race",
+            }
         try:
             await org.update_agent(agent_id, {"worktree_error": err})
         except Exception:
