@@ -537,8 +537,48 @@ async def pre_check_exit_gates(
 
     try:
         from hiveweave.db import project as project_db
+        from hiveweave.services import task as task_module
+
+        # Ensure task migrations (reviewer_id etc.) before obligation queries
+        try:
+            await task_module._ensure_schema(project_id)
+        except Exception as e:
+            log.debug("pre_check_task_schema_failed", error=str(e))
 
         conn = await project_db.get_project_db_by_project_id(project_id)
+
+        # Resolve agents once for name/short_id enrichment (TEST14 P0b)
+        name_by_id: dict[str, str] = {}
+        short_by_id: dict[str, str] = {}
+        try:
+            cursor = await conn.execute(
+                "SELECT id, name, short_id FROM agents "
+                "WHERE status IS NULL OR status != 'archived'"
+            )
+            agent_rows = await cursor.fetchall()
+            await cursor.close()
+            for a in agent_rows:
+                aid = a["id"] if "id" in a.keys() else None
+                if not aid:
+                    continue
+                if a["name"] if "name" in a.keys() else None:
+                    name_by_id[aid] = str(a["name"])
+                if a["short_id"] if "short_id" in a.keys() else None:
+                    short_by_id[aid] = str(a["short_id"])
+        except Exception as e:
+            log.debug("pre_check_agent_map_failed", error=str(e))
+
+        def enrich_id_set(ids: set[str]) -> set[str]:
+            """UUID set → UUID + flower-name + short_id (for _ref_in_set)."""
+            out = set(ids)
+            for aid in list(ids):
+                n = name_by_id.get(aid)
+                if n:
+                    out.add(n)
+                s = short_by_id.get(aid)
+                if s:
+                    out.add(s)
+            return out
 
         # 0. WAIT_WITHOUT_ASK: waiting on agent requires prior message/ask
         if phase == "waiting" and waiting_on:
@@ -565,26 +605,24 @@ async def pre_check_exit_gates(
                     outstanding = await inbox.get_outstanding_ask_recipients(
                         agent_id
                     )
-                    evidence = set(sent) | set(outstanding)
+                    evidence = enrich_id_set(set(sent) | set(outstanding))
                     for ref in agent_refs:
-                        if not _ref_in_set(ref, evidence, {}):
+                        if not _ref_in_set(ref, evidence, name_by_id):
                             violations.append("WAIT_WITHOUT_ASK")
                             break
                 except Exception as e:
                     log.debug("pre_check_wait_without_ask_failed", error=str(e))
 
-        # 1. Unreplied asks: inbox messages with expect_report=1, read=0
-        cursor = await conn.execute(
-            "SELECT from_agent_id, message FROM inbox "
-            "WHERE to_agent_id = ? AND expect_report = 1 AND read = 0 "
-            "AND from_agent_id NOT IN ('user', 'system') "
-            "ORDER BY created_at DESC LIMIT 10",
-            [agent_id],
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        if rows:
-            violations.append("UNREPLIED_ASKS")
+        # 1. Unreplied asks — contract-based (TEST14 P1a), not read=0.
+        #    read≠replied: marking read must not clear the reply obligation.
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            senders = await InboxService().get_outstanding_ask_senders(agent_id)
+            if senders:
+                violations.append("UNREPLIED_ASKS")
+        except Exception as e:
+            log.debug("pre_check_unreplied_asks_failed", error=str(e))
 
         # 2. Open task obligations: claimed/running/rework as assignee
         cursor = await conn.execute(

@@ -342,7 +342,38 @@ async def hire_agent_tool(
         parent_id=parent_id,
     )
     if hire_err:
-        return ToolResult.err(hire_err)
+        # Enrich executor→CEO rejects with existing coordinator candidates
+        # so HR can fix in one turn without asking CEO (TEST14 P2).
+        remedy = ""
+        if "cannot report directly to CEO" in hire_err.lower():
+            coords = []
+            for a in existing_agents:
+                if (a.get("status") or "") == "archived":
+                    continue
+                pt = (a.get("permission_type") or "").lower()
+                r = (a.get("role") or "").lower()
+                if pt == "coordinator" or (
+                    "架构" in r or "经理" in r or "负责人" in r or "manager" in r
+                    or "architect" in r or "lead" in r
+                ):
+                    if r == "ceo" or pt == "ceo":
+                        continue
+                    coords.append(
+                        f"{a.get('name')} ({a.get('short_id')}, id={a.get('id')})"
+                    )
+            if coords:
+                remedy = (
+                    " Existing coordinators you can use as parentId: "
+                    + "; ".join(coords[:5])
+                    + "."
+                )
+            else:
+                remedy = (
+                    " No coordinator under CEO yet — hire a coordinator "
+                    "first (permissionType=coordinator), notify the requester, "
+                    "then retry this executor hire under that parent."
+                )
+        return ToolResult.err(hire_err + remedy)
 
     attrs = {
         "project_id": project_id,

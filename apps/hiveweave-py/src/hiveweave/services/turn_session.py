@@ -11,10 +11,18 @@ from typing import Any
 _lock = threading.Lock()
 _pending: dict[str, dict[str, Any]] = {}
 
-# TEST11 evening P2-2: per-turn soft-warn ledger for commit_turn gate codes.
-# First hit of a violation code → soft-pass (warn + allow); second → hard reject.
+# Per-turn soft-warn ledger for *reminder-class* commit_turn gate codes.
+# First hit → soft-pass (warn); second → hard reject at pre-check.
+# Soft-pass NEVER suppresses the authoritative evaluate_turn_exit backstop
+# (TEST14 BUG-1/P0c): reply contracts must remain enforceable.
 _soft_warn_counts: dict[str, dict[str, int]] = {}
-_soft_passed: dict[str, set[str]] = {}
+
+# Reply-contract / protocol codes — always hard-reject at pre-check.
+# Soft-warn was designed to cut LLM round-trips; for UNREPLIED_ASKS that
+# traded the whole org for one skipped send_message (TEST14 freeze).
+HARD_COMMIT_GATE_CODES = frozenset({
+    "UNREPLIED_ASKS",
+})
 
 
 def set_pending_turn_result(agent_id: str, payload: dict[str, Any]) -> None:
@@ -38,7 +46,6 @@ def clear_pending_turn_result(agent_id: str) -> None:
     with _lock:
         _pending.pop(agent_id, None)
         _soft_warn_counts.pop(agent_id, None)
-        _soft_passed.pop(agent_id, None)
 
 
 def classify_commit_gate_soft_warn(
@@ -46,21 +53,24 @@ def classify_commit_gate_soft_warn(
 ) -> tuple[list[str], list[str]]:
     """Split gate violations into (soft_pass, hard_reject) for this turn.
 
-    First occurrence of each code soft-passes (count 0→1) and is recorded in
-    ``_soft_passed`` so ``evaluate_turn_exit`` does not immediately re-block.
-    Subsequent occurrences hard-reject.
+    ``HARD_COMMIT_GATE_CODES`` (e.g. UNREPLIED_ASKS) always hard-reject.
+    Other codes: first occurrence soft-passes (count 0→1); subsequent
+    occurrences hard-reject. Soft-pass does **not** suppress
+    ``evaluate_turn_exit`` — the backstop keeps repair/retrigger authority.
     """
     soft: list[str] = []
     hard: list[str] = []
     with _lock:
         bag = _soft_warn_counts.setdefault(agent_id, {})
-        passed = _soft_passed.setdefault(agent_id, set())
         for v in violations:
             code = str(v)
+            if code in HARD_COMMIT_GATE_CODES:
+                bag[code] = bag.get(code, 0) + 1
+                hard.append(code)
+                continue
             n = bag.get(code, 0)
             if n == 0:
                 bag[code] = 1
-                passed.add(code)
                 soft.append(code)
             else:
                 bag[code] = n + 1
@@ -71,12 +81,11 @@ def classify_commit_gate_soft_warn(
 def filter_soft_passed_violations(
     agent_id: str, violations: list[str]
 ) -> list[str]:
-    """Drop violation codes that soft-passed earlier this turn."""
-    with _lock:
-        passed = _soft_passed.get(agent_id) or set()
-        if not passed:
-            return list(violations)
-        return [v for v in violations if v not in passed]
+    """No-op: soft-pass must not strip backstop violations (TEST14 P0c).
+
+    Kept for import compatibility; always returns a copy of ``violations``.
+    """
+    return list(violations)
 
 
 # ── task-advance defer (explicit "不推进") ─────────────────

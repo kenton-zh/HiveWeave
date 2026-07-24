@@ -1649,8 +1649,27 @@ class Agent:
             db_streak = await self._count_recent_ask_gate_rejections()
             effective_streak = max(self._unreplied_asks_streak, db_streak)
             if effective_streak >= _ESCAPE_VALVE_THRESHOLD:
-                # 强制标记为已读，解除死锁
+                # Close reply contracts (not just mark_read) — P1a pre_check
+                # is contract-based; mark_read alone left commit_turn hard-rejecting.
                 force_ids = [m["id"] for m in unreplied_asks if m.get("id")]
+                waive_items = [
+                    {
+                        "contract_id": m.get("reply_contract_id"),
+                        "to_agent_id": m.get("from_agent_id"),
+                    }
+                    for m in unreplied_asks
+                    if m.get("reply_contract_id") and m.get("from_agent_id")
+                ]
+                waived = 0
+                if waive_items:
+                    try:
+                        waived = await self._inbox.waive_reply_contracts(
+                            self.id,
+                            waive_items,
+                            reason="escape_valve",
+                        )
+                    except Exception as e:
+                        log.debug("escape_valve_waive_failed", error=str(e))
                 if force_ids:
                     try:
                         await self._inbox.mark_read_by_ids(self.id, force_ids)
@@ -1662,6 +1681,7 @@ class Agent:
                     streak=effective_streak,
                     db_streak=db_streak,
                     force_closed=len(force_ids),
+                    contracts_waived=waived,
                     senders=[m.get("from_name", "?") for m in unreplied_asks[:5]],
                 )
                 unreplied_asks = []

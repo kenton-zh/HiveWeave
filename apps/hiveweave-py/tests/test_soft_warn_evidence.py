@@ -46,12 +46,15 @@ def test_soft_warn_first_pass_second_hard():
     assert hard2 == ["WAIT_WITHOUT_ASK"]
 
 
-def test_filter_soft_passed_drops_codes():
+def test_filter_soft_passed_noop_after_soft_warn():
+    """TEST14 P0c: soft-pass must not strip backstop violations."""
     classify_commit_gate_soft_warn("agent-soft", ["UNREPLIED_ASKS"])
+    # UNREPLIED always hard — still, filter is a no-op for any code
+    classify_commit_gate_soft_warn("agent-soft", ["WAIT_WITHOUT_ASK"])
     kept = filter_soft_passed_violations(
-        "agent-soft", ["UNREPLIED_ASKS", "ASSIGNEE_MUST_SUBMIT"]
+        "agent-soft", ["WAIT_WITHOUT_ASK", "ASSIGNEE_MUST_SUBMIT"]
     )
-    assert kept == ["ASSIGNEE_MUST_SUBMIT"]
+    assert kept == ["WAIT_WITHOUT_ASK", "ASSIGNEE_MUST_SUBMIT"]
 
 
 @pytest.mark.asyncio
@@ -90,7 +93,8 @@ async def test_commit_turn_soft_pass_then_hard_reject():
 
 
 @pytest.mark.asyncio
-async def test_evaluate_turn_exit_respects_soft_pass():
+async def test_evaluate_turn_exit_soft_pass_does_not_suppress():
+    """TEST14 P0c: soft-pass no longer filters WAIT_WITHOUT_ASK from backstop."""
     classify_commit_gate_soft_warn("agent-soft", ["WAIT_WITHOUT_ASK"])
     set_pending_turn_result(
         "agent-soft",
@@ -117,8 +121,7 @@ async def test_evaluate_turn_exit_respects_soft_pass():
             name_by_id={},
         )
     )
-    assert decision.ok is True
-    assert "WAIT_WITHOUT_ASK" not in decision.violations
+    assert "WAIT_WITHOUT_ASK" in decision.violations
 
 
 # ── Evidence path extraction + verifiability ─────────────────

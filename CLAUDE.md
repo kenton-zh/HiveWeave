@@ -200,7 +200,7 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 实现: `services/turn_result.py`, `turn_session.py`, `turn_exit.py`, `tools/turn_tools.py`。  
 `_handle_completion` 跑 exit gates：未 `commit_turn` / 未回 ask / 有未完成义务 → 拦截并续跑（最多 3 次）。`phase=in_progress` 自动续跑。
 
-- **reply_required 硬门**：本 turn 处理的 inbox 消息带 `reply_required`（`expect_report` / `message_type=ask`）时，agent 必须在本 turn 内对该 sender 成功调用 send_message 类工具（送达证据 `get_sent_recipients_since`）才能退出；纯文字输出不算回复 → UNREPLIED_ASKS 拦截重跑。豁免 user/system/已归档/不存在的 sender（`agent.py:_handle_completion` / `turn_exit.collect_unreplied_asks`）
+- **reply_required 硬门**：本 turn 处理的 inbox 消息带 `reply_required`（`expect_report` / `message_type=ask`）时，agent 必须在本 turn 内对该 sender 成功调用 send_message 类工具（送达证据 `get_sent_recipients_since`）才能退出；纯文字输出不算回复 → `UNREPLIED_ASKS` **永不 soft-pass**（`commit_turn` 预检直接 REJECT，不 `end_turn`；兜底 `evaluate_turn_exit` 也不被 soft-pass 压制）。豁免 user/system/已归档/不存在的 sender（`agent.py:_handle_completion` / `turn_exit.collect_unreplied_asks`）。预检与兜底统一走 reply_contract（已读≠已回）。`WAIT_WITHOUT_ASK` 预检解析花名/short_id/UUID（不得传空 `name_by_id`）
 - **doom loop 正反馈缓解**：同 turn 内同参数 `commit_turn` 已接受时返回差异化提示（"已提交，勿再同参调用"），打破「相同结果→相同决策」循环；熔断阈值 commit_turn=8
 
 ### Git worktree 隔离（executor + builder coordinator）
@@ -318,6 +318,8 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 ### 前端
 
 React 19 + Zustand (`store.ts`)。React Flow 渲染组织架构图。关键面板: ChatPanel, OrgTree, AgentNode, GoalsPanel, QuestionDialog。API 调用通过 `api.ts` → FastAPI 路由 (`/api/*`)。WebSocket 通过 phoenix.js。Electron 桌面端支持 (`apps/web/electron/main.cjs`)。
+
+像素办公室视图（游戏化方向，2026-07-24 定调）: `OfficeView.tsx`（薄 React 宿主）+ `office/OfficeScene.ts` + `OfficeActor.ts`，**PixiJS 8.x**（不用 Godot/游戏引擎；Phaser 3 仅作迁移备选）。架构原则: canvas 层只渲染、订阅 store/WS 事件，不跑模拟逻辑；文本密集 UI（聊天/组织树/任务）用**像素皮肤 DOM 窗口**（九宫格 border-image + 像素字体 + image-rendering: pixelated），不画进 canvas；素材管线 Aseprite（帧动画图集）+ Tiled（等距 tilemap，扩张阶段）。详见 `docs/AI工程组织_MVP蓝图.md` §11。
 
 ### 环境变量
 

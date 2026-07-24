@@ -67,6 +67,8 @@ class Telemetry:
         self._wake_reasons: dict[str, int] = {}
         self._turn_exit_violations: dict[str, int] = {}
         self._turn_exit_actions: dict[str, int] = {}
+        self._gate_soft_pass: dict[str, int] = {}
+        self._gate_hard_reject: dict[str, int] = {}
 
     def add_handler(self, handler: Callable[[str, dict], None]) -> None:
         """Register a custom event handler."""
@@ -86,6 +88,8 @@ class Telemetry:
             "poll_hard_reject": self._counters.get("poll_hard_reject", 0),
             "turn_exit_by_violation": dict(self._turn_exit_violations),
             "turn_exit_by_action": dict(self._turn_exit_actions),
+            "gate_soft_pass_total": dict(self._gate_soft_pass),
+            "gate_hard_reject_total": dict(self._gate_hard_reject),
         }
 
     def reset_counters_for_tests(self) -> None:
@@ -103,6 +107,18 @@ class Telemetry:
         self._wake_reasons.clear()
         self._turn_exit_violations.clear()
         self._turn_exit_actions.clear()
+        self._gate_soft_pass.clear()
+        self._gate_hard_reject.clear()
+
+    def gate_soft_pass(self, code: str) -> None:
+        """TEST14: observe commit_turn soft-pass by gate code."""
+        key = str(code or "unknown")
+        self._gate_soft_pass[key] = self._gate_soft_pass.get(key, 0) + 1
+
+    def gate_hard_reject(self, code: str) -> None:
+        """TEST14: observe commit_turn hard-reject by gate code."""
+        key = str(code or "unknown")
+        self._gate_hard_reject[key] = self._gate_hard_reject.get(key, 0) + 1
 
     def emit(self, event_name: str, payload: dict | None = None) -> None:
         """Dispatch a telemetry event to all handlers + structlog."""
