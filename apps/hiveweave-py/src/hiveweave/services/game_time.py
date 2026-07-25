@@ -39,6 +39,7 @@ STALL_CHECK_TICKS = 24        # 24 * 5s = 120s = 2min
 STREAMING_SWEEP_TICKS = 6     # 6 * 5s = 30s — auto-heal orphan is_streaming=1
 WORKTREE_RECONCILE_TICKS = 72  # 72 * 5s = 6min — retry orphan worktree cleanup
 TASK_EVENT_RELAY_TICKS = 6   # 6 * 5s = 30s — process undelivered task events
+OBLIGATION_SCAN_TICKS = 12   # 12 * 5s = 60s — TEST16 D2: scan overdue obligations
 STALL_IDLE_MS = 10 * 60 * 1000        # 10 min idle threshold
 STALL_COOLDOWN_MS = 15 * 60 * 1000    # 15 min cooldown (避免重复触发)
 STALL_ESCALATION_THRESHOLD = 3        # 同一对未回复触发 3 次后升级到上级
@@ -378,6 +379,18 @@ class GameTimeService:
             except Exception as e:
                 log.error(
                     "task_event_relay_tick_failed",
+                    project_id=project_id,
+                    error=str(e),
+                )
+        # TEST16 D2: Obligation Ledger — scan overdue obligations, escalate
+        if state["tick_count"] % OBLIGATION_SCAN_TICKS == 0:
+            try:
+                from hiveweave.services.obligation import ObligationLedger
+
+                await ObligationLedger().scan_overdue(project_id)
+            except Exception as e:
+                log.error(
+                    "obligation_scan_failed",
                     project_id=project_id,
                     error=str(e),
                 )

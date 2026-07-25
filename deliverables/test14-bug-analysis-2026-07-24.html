@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TEST14 项目复盘:BUG 与设计问题分析</title>
+<style>
+  :root {
+    --ink: #1a2332; --sub: #5a6a7e; --line: #e3e8ef; --bg: #f7f9fc;
+    --p0: #d63031; --p1: #e1701a; --p2: #0984e3; --ok: #00b894;
+    --card: #ffffff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; background: var(--bg); color: var(--ink); line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { margin-bottom: 28px; }
+  h1 { font-size: 26px; letter-spacing: .5px; }
+  .meta { color: var(--sub); font-size: 13px; margin-top: 6px; }
+  .verdict { background: #fff5f5; border: 1px solid #ffd5d5; border-left: 4px solid var(--p0); border-radius: 8px; padding: 14px 18px; margin: 18px 0 26px; font-size: 15px; }
+  h2 { font-size: 19px; margin: 34px 0 12px; padding-left: 10px; border-left: 4px solid var(--p2); }
+  h3 { font-size: 16px; margin: 20px 0 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; margin: 12px 0; }
+  .tag { display: inline-block; font-size: 12px; font-weight: 700; border-radius: 4px; padding: 1px 8px; margin-right: 8px; vertical-align: 2px; }
+  .tag.p0 { background: #ffe3e3; color: var(--p0); }
+  .tag.p1 { background: #ffedd9; color: var(--p1); }
+  .tag.p2 { background: #e1efff; color: var(--p2); }
+  .tag.ok { background: #dff7f0; color: var(--ok); }
+  code { background: #eef1f5; border-radius: 4px; padding: 1px 6px; font-size: 13px; font-family: Consolas, "Courier New", monospace; color: #c0341d; }
+  pre { background: #1e2733; color: #d5e0ea; border-radius: 8px; padding: 14px 16px; font-size: 12.5px; overflow-x: auto; margin: 10px 0; line-height: 1.55; }
+  pre .c { color: #7d8fa3; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 10px 0; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f7; font-weight: 600; }
+  .tl { position: relative; margin: 14px 0 6px 12px; padding-left: 24px; border-left: 2px solid var(--line); }
+  .tl .ev { position: relative; margin-bottom: 12px; font-size: 14px; }
+  .tl .ev::before { content: ""; position: absolute; left: -31px; top: 7px; width: 10px; height: 10px; border-radius: 50%; background: var(--p2); border: 2px solid #fff; box-shadow: 0 0 0 2px var(--line); }
+  .tl .ev.bad::before { background: var(--p0); }
+  .tl .ev.warn::before { background: var(--p1); }
+  .tl .t { color: var(--sub); font-family: Consolas, monospace; font-size: 12.5px; margin-right: 8px; }
+  .fix { background: #f0fbf6; border: 1px solid #c9ecd9; border-radius: 8px; padding: 12px 16px; margin: 10px 0; }
+  .fix b { color: #068a5b; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .small { font-size: 13px; color: var(--sub); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>TEST14 项目复盘:BUG 与设计问题分析</h1>
+  <div class="meta">分析对象 D:\PC_AI\Project\TEST14(.hiveweave/data.db + git + 后端日志 backend-20260724-211548.output)· 2026-07-24</div>
+</header>
+
+<div class="verdict">
+  <b>一句话结论:</b>TEST14 没有任何业务代码——它是 HiveWeave 的一次「签到排行榜 Demo」空转现场。
+  组织在 4 分钟内完成招聘,随后因 <b>回复契约门禁被软放行(BUG-1)</b> 在 21:20:43 冻结:
+  CEO 空等架构师汇报,架构师以为已汇报(实际只输出了纯文本、从未调用 send_message),任务表为空、零代码,
+  工程师潮汐从入职到项目被手动停止从未运行过一次。同类问题在 tasks/ 目录的 <code>_diag_ceo_reply.py</code>、<code>_heal_a004_husk.py</code> 脚本名中已有前科——这是复发,不是偶发。
+</div>
+
+<h2>一、现场还原(全部来自 DB 与日志取证)</h2>
+
+<div class="card">
+<div class="tl">
+  <div class="ev"><span class="t">21:16:45</span>项目创建,目标「最小可用签到排行榜 Demo(Web)」;CEO 归零、HR 天线自动就位</div>
+  <div class="ev"><span class="t">21:17:25</span>CEO 用 <code>send_message</code>(expect_report=0,非 ask)向 HR 提招聘需求 → 随后 commit waiting</div>
+  <div class="ev warn"><span class="t">21:18:42</span>HR <code>hire_agent</code> 被硬拒:「Executors cannot report directly to CEO」→ HR 反问 CEO 确认方案</div>
+  <div class="ev warn"><span class="t">21:19:15</span><b>[WAIT_CYCLE] 死锁</b>:CEO 等天线、天线等归零,互相等待 → 系统检测并清除双方 wait(此机制工作正常 <span class="tag ok">设计正确</span>)</div>
+  <div class="ev"><span class="t">21:19:54</span>HR 招到云岫(A003 前端架构师/coordinator)→ 21:20:03 潮汐(A004 工程师/executor)</div>
+  <div class="ev"><span class="t">21:20:21</span>CEO 用 <code>ask_agent</code>(expect_report=1)派活给云岫:探查工作区、拆模块、定人数、回报</div>
+  <div class="ev bad"><span class="t">21:20:43</span><b>事故点</b>:云岫把完整的模块拆解(M1–M5)写成 <b>assistant 纯文本</b>,从未调用 send_message;commit done_slice 时门禁检出 <code>UNREPLIED_ASKS</code>,但按「首次犯规软放行」策略<b>接受收工</b>,disposition=complete</div>
+  <div class="ev bad"><span class="t">21:21:09</span>CEO 登记 wait(等云岫,21:37:40 超时)——此后全组织再无任何动作;tasks 表为空、两个 worktree 只有 .gitignore、潮汐 0 次运行</div>
+  <div class="ev bad"><span class="t">21:23:50</span>用户手动停止项目(stop_project_cleanly,4 agents),连 wait 超时自愈都没等到</div>
+</div>
+<p class="small">关键讽刺点:云岫 commit 摘要写的是「<b>向归零汇报了结果</b>」——LLM 幻觉了工具效果。平台本应用 DB 证据兜底,而兜底门禁(见 BUG-1)恰好是软的。</p>
+</div>
+
+<h2>二、BUG 清单(按严重度排序)</h2>
+
+<div class="card">
+<h3><span class="tag p0">P0</span>BUG-1:UNREPLIED_ASKS 软放行 → 回复契约失效 → 组织级死锁</h3>
+<p><b>现象:</b>agent 收到 <code>expect_report=1</code> 的 ask,只用文字作答、不调 send_message,也能 <code>done_slice</code> 收工;提问方空等到超时。</p>
+<p><b>机制(四个环节环环相扣,缺一都不会死锁):</b></p>
+<ul>
+  <li>① <code>turn_tools.py:146</code> 预检命中后交 <code>classify_commit_gate_soft_warn</code> 判定——<b>所有门禁码首次犯规一律软放行</b>(接受 TurnResult + <code>end_turn=True</code>),注释写明动机是「减少浪费的 LLM 往返」;</li>
+  <li>② 软放行回执同时说「Do NOT call any more tools」和「Same gate will HARD REJECT on repeat」——<b>两句自相矛盾</b>:工具循环已终止,agent 本回合不可能再犯第二次;<code>clear_pending_turn_result</code> 在新回合清空计数。<b>hard-reject 路径是实际死代码,永不触发</b>;</li>
+  <li>③ <code>turn_session.py:63</code> 软放行码记入 <code>_soft_passed</code> → <code>turn_exit.py:391</code> <code>filter_soft_passed_violations</code> 把它从兜底检查里剔除——<b>权威兜底 evaluate_turn_exit 被自己的预检压制</b>(日志 <code>turn_exit_ok disposition=complete</code> 实证);</li>
+  <li>④ <code>agent.py:1643</code> 的逃逸阀 <code>_ESCAPE_VALVE_THRESHOLD=5</code> 只在兜底看到未回复时累计——软放行绕过兜底,<b>逃逸阀同样永不生效</b>。</li>
+</ul>
+<p><b>与文档的矛盾:</b>CLAUDE.md 写明「未回 ask → 拦截并续跑(最多 3 次)」,实际行为是「首次直接放行」。文档承诺的是硬门,代码实现的是软门。</p>
+<div class="fix"><b>修复(P0a,改一处即可止血):</b>在 <code>turn_tools.py</code> 预检处理中把 <code>UNREPLIED_ASKS</code> 列入硬门集合(如 <code>HARD_GATE_CODES = {"UNREPLIED_ASKS"}</code>),绕过 soft-warn 分类,直接走现有的 <code>ToolResult.err("commit_turn REJECTED (synchronous gate)…请先处理这些义务再 commit_turn")</code> 分支——该分支返回错误<b>不终止回合</b>,LLM 会在本轮 tool loop 内补发 send_message 再重新 commit,正好多花的那一次 LLM 往返就是契约的代价。</div>
+<div class="fix"><b>修复(P0b,语义自洽):</b>soft-pass 的设计对「提醒类」违规(WAIT_WITHOUT_ASK 修好后)可保留,但回执文案必须改:删掉不可达的「HARD REJECT on repeat」承诺;且 soft-pass 不应记入 <code>_soft_passed</code> 去压制兜底——兜底应对同一违规保留一次「拦截续跑」权(与 CLAUDE.md 的 3 次承诺对齐)。</div>
+</div>
+
+<div class="card">
+<h3><span class="tag p0">P0</span>BUG-2:WAIT_WITHOUT_ASK 预检对花名 ref 100% 误报(告警疲劳)</h3>
+<p><b>现象:</b>本次运行 6 次 phase=waiting 提交,6 次全部命中 <code>WAIT_WITHOUT_ASK</code> 软警告——其中至少 5 次 agent 确实已在同回合给对方发过消息/ask。</p>
+<p><b>机制:</b><code>turn_exit.py:570</code> 预检调用 <code>_ref_in_set(ref, evidence, {})</code>:</p>
+<ul>
+  <li><code>evidence</code> 来自 <code>get_sent_recipients_since</code>,是 <b>UUID 集合</b>(如 <code>4c6cbb1e-…</code>);</li>
+  <li>agent 的 <code>waiting_on.ref</code> 是<b>花名</b>(「天线」「云岫」,来自注入的精简通讯录);</li>
+  <li><code>_ref_in_set</code> 的花名解析依赖第三个参数 <code>name_by_id</code>——预检<b>硬编码传了空 dict <code>{}</code></b>;前缀匹配要求 <code>len(ref) ≥ 4</code>,两字花名直接跳过。</li>
+</ul>
+<p>三层全灭 → 必假阳性。而兜底侧(<code>agent.py:1625-1639</code>)明确做了「Enrich messaged_refs with display names」,<b>不缺正确实现,只是预检没复用</b>。</p>
+<p><b>后果:</b>每次 commit 都带一条假警告,真违规(BUG-1 那次)淹没在噪音里——告警疲劳直接削弱软警告通道的存在意义。</p>
+<div class="fix"><b>修复:</b>① <code>pre_check_exit_gates</code> 里按 evidence 中的 UUID 查 agents 表构建 <code>name_by_id</code>(同时收录 short_id,如 A003),传给 <code>_ref_in_set</code>;或更省事——与 backstop 对齐,预检直接把 evidence 集合 enrich 成「UUID + 花名 + short_id」三形态。② 回归测试三例:ref=花名 / ref=short_id / ref=UUID 前 8 位,各发一条消息后 commit waiting,断言无误报。</div>
+</div>
+
+<div class="card">
+<h3><span class="tag p1">P1</span>BUG-3:预检与兜底「未回复」判定口径不一致</h3>
+<p><b>机制:</b>预检(<code>turn_exit.py:577</code>)用 <code>expect_report=1 AND read=0</code> —— 消息一旦被标读,<b>已读≠已回复</b>,预检永远不再触发;兜底用 turn 级 <code>collect_unreplied_asks</code>(本回合处理的消息 + 送达证据 + 合约关闭)。两套口径独立演化:预检可能漏报(已读未回),也可能与兜底结论冲突。</p>
+<div class="fix"><b>修复:</b>预检改用与兜底同源的「未关闭 reply_contract」口径(<code>get_outstanding_ask_recipients</code> 已有现成实现,方向反过来用),或直接让预检复用 <code>collect_unreplied_asks</code>(传入本回合 pending_msgs)。一个契约,一个判定函数,两处调用。</div>
+</div>
+
+<div class="card">
+<h3><span class="tag p1">P1</span>BUG-4:契约泄漏后没有任何恢复通道</h3>
+<p><b>机制:</b>周期性 stall/unreplied 催办按设计禁用;推进依赖 <code>agent.turn.after</code> 的 task-advance hook——但 agent 已 complete 不再运行,<b>没有 turn 就没有 after</b>(日志实证:<code>self_retrigger_complete_skip</code>)。CEO 的 wait 要等 16.5 分钟超时,且超时唤醒不携带「对方始终未回复」的结构化状态;云岫那份 M1–M5 拆解永远锁在它自己的聊天记录里,CEO 不可见。</p>
+<div class="fix"><b>修复:</b>① wait 超时唤醒的 digest 附带结构化字段:<code>{"wait_ref": "云岫", "ask_outstanding": true, "ref_last_active": ...}</code>,让被唤醒方知道「等的东西没来」,而不是空醒;② 超时同时向欠债方重发一条 reply_required nudge(ask 重发,非文案猜测,用的是既有合约字段);③ 可选:game_time tick 扫「expect_report=1 且合约 N 分钟未关闭且目标 idle」的记录,作为 P0a 失效时的最后防线。</div>
+</div>
+
+<h2>三、设计问题(非崩溃级,但持续放血)</h2>
+
+<div class="card">
+<h3><span class="tag p2">P2</span>D-1:组织不变式只能靠「试错」发现,且与「别膨胀」诉求冲突</h3>
+<p>「executor 不得挂 CEO」是硬不变式,但 HR 的招聘技能/系统提示里没有前置说明——只能靠 hire 失败 → 反问 CEO → 再 hire 的试错链发现,本次多花约 2 分钟并触发一次 WAIT_CYCLE 死锁。同时用户明确说了「少量中层/执行者即可,别膨胀」,而 1 人 demo 被迫建成 4 agent 三层组织;<code>project_meta</code> 里 <code>orgPattern: "solo"</code> 与自动创建 CEO+HR+全组织的实际行为也名实不符(值得确认 solo 的语义)。</p>
+<div class="fix"><b>建议:</b>① 把 org 不变式(executor 不挂 CEO、直属 ≤7、岗位唯一等)直接写进 HR 与 CEO 的系统提示——机械规则不该靠工具报错传授;② HR 命中该错误时<b>自动插入 coordinator 并 notify CEO</b> 即可,无需请示(错误信息本身已给出唯一合法解);③ 评估 solo/微项目是否允许 executor 直挂 CEO(显式 override 参数),消除小项目强制三层。</div>
+</div>
+
+<div class="card">
+<h3><span class="tag p2">P2</span>D-2:协议可靠性的重担正被转嫁给 prompt</h3>
+<p>用户给 CEO 的原始指令里带了 6 条「硬规则」(docs_only、reassign_task、approve 后必须 merge、不要用纯文字指望产生义务……)——全部是平台该用结构化门禁保证的事,现在靠用户手写 prompt 打补丁。本次事故正是第 4 条预言的应验。<b>prompt 是建议,门禁才是协议</b>;凡是被用户写进指令补丁的平台行为,都应视为平台缺陷登记在案。</p>
+</div>
+
+<div class="card">
+<h3><span class="tag p2">P2</span>D-3:小观察项</h3>
+<ul>
+  <li>21:22:47 日志出现对 A003 的 <code>org.update_agent fields=["worktree_error"]</code> 写入,随后 worktree_heal_tick 报 recovered=0/failed=0,而磁盘上 worktree 实际存在——建议顺手确认这次写入的内容(是清空还是误报错误)。</li>
+  <li>潮汐(A004)worktree 与分支在 hire 时创建,整个生命周期 0 次运行——招聘即建树的成本在「招而不用」场景下是纯浪费,可考虑懒创建(首次有写任务时建)。</li>
+</ul>
+</div>
+
+<h2>四、修复优先级矩阵</h2>
+
+<table>
+  <tr><th>优先级</th><th>项</th><th>改动点</th><th>预期效果</th></tr>
+  <tr><td><span class="tag p0">P0a</span></td><td>UNREPLIED_ASKS 移出 soft-pass</td><td><code>tools/turn_tools.py</code> 预检分支</td><td>回复契约成为真硬门;TEST14 式冻结在当回合被弹回补发消息</td></tr>
+  <tr><td><span class="tag p0">P0b</span></td><td>预检 name 解析({} → 真映射)</td><td><code>services/turn_exit.py:570</code></td><td>WAIT_WITHOUT_ASK 误报归零,告警通道恢复信噪比</td></tr>
+  <tr><td><span class="tag p0">P0c</span></td><td>soft-pass 不再压制兜底 / 文案去伪承诺</td><td><code>services/turn_session.py</code> + <code>turn_tools.py:195</code></td><td>兜底恢复 CLAUDE.md 承诺的「拦截续跑(最多 3 次)」</td></tr>
+  <tr><td><span class="tag p1">P1a</span></td><td>统一未回复判定口径(contract-based)</td><td><code>services/turn_exit.py:577</code></td><td>预检与兜底不再互相打架</td></tr>
+  <tr><td><span class="tag p1">P1b</span></td><td>wait 超时唤醒带 outstanding 状态 + 重发 nudge</td><td>wait 超时处理路径</td><td>契约万一泄漏也有自愈通道,不再空等 16 分钟</td></tr>
+  <tr><td><span class="tag p2">P2</span></td><td>org 不变式前置到 prompt + HR 自动 remedy</td><td><code>prompts/</code> + HR 流程</td><td>消除试错轮次与 WAIT_CYCLE 诱因</td></tr>
+</table>
+
+<h2>五、验证方式(改完后)</h2>
+<div class="card">
+<ul>
+  <li><b>单测:</b>ref=花名/short_id/UUID 前缀三例 WAIT_WITHOUT_ASK 回归;UNREPLIED_ASKS 首次 commit 断言返回 err 且不 end_turn。</li>
+  <li><b>端到端复现剧本:</b>重开 TEST14 同剧本(CEO ask → 中层纯文本作答 → commit done_slice),期望:commit 被拒 → agent 补发 send_message → CEO wait 在秒级被 ask_reply 唤醒,而非 16 分钟超时。</li>
+  <li><b>指标:</b><code>GET /api/debug/metrics</code> 增加 <code>gate_soft_pass_total{code}</code> 与 <code>gate_hard_reject_total{code}</code> 计数——当前软放行无独立指标,线上根本无法观测此类泄漏。</li>
+</ul>
+</div>
+
+<p class="small">取证来源:TEST14/.hiveweave/data.db(inbox / agent_waits / agent_runs / run_steps / work_logs / chat_messages)、git refs、后端日志 tasks/backend-20260724-211548.output、源码 turn_tools.py / turn_exit.py / turn_session.py / agent.py / inbox.py。</p>
+
+</div>
+</body>
+</html>

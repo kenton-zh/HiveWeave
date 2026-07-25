@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TEST13 项目审查报告 — BUG 与设计问题挖掘</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --ink: #1f2329;
+    --ink2: #4e5562;
+    --ink3: #8a93a3;
+    --line: #e5e8ee;
+    --p0: #d83931;
+    --p0-bg: #fdecea;
+    --p1: #e0710a;
+    --p1-bg: #fdf3e5;
+    --p2: #b58a00;
+    --p2-bg: #fdf8e1;
+    --p3: #5b6b7f;
+    --p3-bg: #eef1f5;
+    --ok: #1a9e54;
+    --ok-bg: #e8f7ee;
+    --accent: #2f6fed;
+    --accent-bg: #eaf1fe;
+    --mono: "Cascadia Code", Consolas, "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 16px 80px;
+    background: var(--bg); color: var(--ink);
+    font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+    line-height: 1.75; font-size: 15px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  header.hero {
+    background: linear-gradient(135deg, #1d2333 0%, #2c3a5e 100%);
+    color: #fff; border-radius: 14px; padding: 34px 38px; margin-bottom: 28px;
+  }
+  header.hero h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: .5px; }
+  header.hero .sub { color: #aeb9d4; font-size: 14px; }
+  header.hero .meta { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 10px; }
+  header.hero .chip {
+    background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.18);
+    border-radius: 999px; padding: 3px 14px; font-size: 12.5px; color: #dbe3f5;
+  }
+  h2 {
+    font-size: 20px; margin: 44px 0 14px; padding-left: 12px;
+    border-left: 4px solid var(--accent);
+  }
+  h3 { font-size: 16.5px; margin: 0 0 10px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 22px 26px; margin-bottom: 16px;
+  }
+  .badge {
+    display: inline-block; font-size: 12px; font-weight: 700;
+    border-radius: 6px; padding: 1px 9px; margin-right: 8px; vertical-align: 2px;
+  }
+  .b-p0 { background: var(--p0-bg); color: var(--p0); border: 1px solid #f2b8b4; }
+  .b-p1 { background: var(--p1-bg); color: var(--p1); border: 1px solid #f2cf9f; }
+  .b-p2 { background: var(--p2-bg); color: var(--p2); border: 1px solid #eadf9a; }
+  .b-p3 { background: var(--p3-bg); color: var(--p3); border: 1px solid #ccd4df; }
+  .b-spec { background: var(--accent-bg); color: var(--accent); border: 1px solid #bcd2fa; }
+  .tag {
+    display: inline-block; font-size: 12px; color: var(--ink3);
+    border: 1px solid var(--line); border-radius: 999px; padding: 0 10px; margin-left: 6px;
+  }
+  .sec-label {
+    font-size: 12px; font-weight: 700; letter-spacing: 1px;
+    color: var(--ink3); text-transform: uppercase; margin: 16px 0 4px;
+  }
+  .evi {
+    background: #f4f6f9; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 14px; font-family: var(--mono); font-size: 12.5px;
+    color: var(--ink2); overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  .fix {
+    background: var(--ok-bg); border-left: 3px solid var(--ok);
+    border-radius: 0 8px 8px 0; padding: 10px 16px; margin-top: 10px;
+  }
+  .fix b { color: var(--ok); }
+  .fix ol, .fix ul { margin: 6px 0 0; padding-left: 22px; }
+  .story {
+    background: #fff8f6; border: 1px solid #f3cfc9;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f8; font-weight: 600; }
+  .timeline { position: relative; margin: 18px 0 4px 10px; padding-left: 26px; border-left: 2px solid var(--line); }
+  .tl-item { position: relative; margin-bottom: 14px; }
+  .tl-item::before {
+    content: ""; position: absolute; left: -34px; top: 6px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--accent); border: 2px solid #fff; box-shadow: 0 0 0 2px var(--line);
+  }
+  .tl-item.bad::before { background: var(--p0); }
+  .tl-item.warn::before { background: var(--p1); }
+  .tl-time { font-family: var(--mono); font-size: 12px; color: var(--ink3); margin-right: 8px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 14px; }
+  .stat {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; text-align: center;
+  }
+  .stat .n { font-size: 26px; font-weight: 800; }
+  .stat .l { font-size: 12.5px; color: var(--ink3); margin-top: 2px; }
+  .n-red { color: var(--p0); } .n-orange { color: var(--p1); } .n-blue { color: var(--accent); }
+  .now {
+    background: #fff; border: 2px solid var(--p0); border-radius: 12px;
+    padding: 18px 24px; margin-top: 14px;
+  }
+  .now h3 { color: var(--p0); }
+  code { font-family: var(--mono); background: #eef1f6; border-radius: 4px; padding: 1px 6px; font-size: 13px; }
+  .small { font-size: 13px; color: var(--ink2); }
+  footer { margin-top: 48px; text-align: center; color: var(--ink3); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>TEST13 项目审查报告</h1>
+  <div class="sub">程序 BUG 与设计问题挖掘 · 基于 git 历史 + .hiveweave/data.db 全量执行记录取证</div>
+  <div class="meta">
+    <span class="chip">审查日期 2026-07-24</span>
+    <span class="chip">项目：每日打卡页 demo</span>
+    <span class="chip">5 agents · 3 tasks · 29 inbox · 57 工作日志</span>
+    <span class="chip">结论：2 个 P0 死锁（1 个仍在进行中）</span>
+  </div>
+</header>
+
+<!-- ============ 概览 ============ -->
+<h2>0. 一句话结论</h2>
+<div class="card">
+  <b>TEST13 唯一交付物（specs/checkin.md）本身合格，但交付过程暴露了 HiveWeave 平台的 9 个程序/设计问题，
+  其中 2 个 P0 级死锁；且第 2 个死锁<i>此时此刻仍在数据库里挂着</i>——任务
+  <code>d5e102bb</code> 状态 <code>running</code>，三个 agent 互相等待，永远不会推进。</b>
+  <div class="summary-grid">
+    <div class="stat"><div class="n n-red">2</div><div class="l">P0 死锁</div></div>
+    <div class="stat"><div class="n n-orange">3</div><div class="l">P1 平台缺陷</div></div>
+    <div class="stat"><div class="n n-blue">4</div><div class="l">P2/P3 问题</div></div>
+    <div class="stat"><div class="n n-blue">4</div><div class="l">spec 文档缺陷</div></div>
+  </div>
+</div>
+
+<!-- ============ 时间线 ============ -->
+<h2>1. 执行时间线（事故链还原）</h2>
+<div class="card">
+  <div class="timeline">
+    <div class="tl-item"><span class="tl-time">20:27</span>项目创建，归零(CEO)、天线(HR) 自动入职。git initial commit（仅 .gitignore）。</div>
+    <div class="tl-item"><span class="tl-time">20:29</span>天线招<b>潮汐</b>（前端架构师/coordinator, A003）、<b>云雀</b>（测试工程师/executor, A004，挂潮汐下）。</div>
+    <div class="tl-item"><span class="tl-time">20:30</span>CEO 派 docs_only 任务 <code>097169be</code>：写 specs/checkin.md，提交前必须 attest_doc_review。</div>
+    <div class="tl-item warn"><span class="tl-time">20:32</span>潮汐在 A003 worktree 写完 spec 并 checkpoint，<b>submit 被 attestation gate 拒：「文件在 worktree 不在 main」</b>，向 CEO 请示。</div>
+    <div class="tl-item warn"><span class="tl-time">20:34</span>CEO 批准「方案1」：<b>临时把 spec 写到项目根</b>用于 attestation —— 直接违反 WORKTREE PIN。main 工作区变 dirty。</div>
+    <div class="tl-item"><span class="tl-time">20:37</span>潮汐 submit，attestation 通过（对象是项目根文件）。</div>
+    <div class="tl-item warn"><span class="tl-time">20:44</span>CEO approve + merge。平台发现 main dirty → <code>92f4fea "pre-merge-checkpoint: auto-save dirty main"</code> 把 spec 直接提交进 main。<b>A003 分支全程零提交。</b></div>
+    <div class="tl-item"><span class="tl-time">20:44</span>VERIFY 任务 <code>0005ab65</code> 自动 spawn 给云雀。</div>
+    <div class="tl-item"><span class="tl-time">20:47</span>云雀验证通过并 submit（attestation <code>835e5bfe</code>）。</div>
+    <div class="tl-item bad"><span class="tl-time">20:48</span><b>P0 死锁①</b>：CEO approve VERIFY 被拒（CEO=merger）；潮汐 review 被拒（=父任务实现者）；全团队无合法 reviewer。</div>
+    <div class="tl-item bad"><span class="tl-time">20:48</span>CEO <b>取消 VERIFY 任务</b>（云雀已完成的工作作废），父任务从 verifying 回退 approved。verification_case 从此悬挂 in_review。</div>
+    <div class="tl-item"><span class="tl-time">20:51</span>CEO 向用户提问，用户选「C. 招独立 reviewer」。</div>
+    <div class="tl-item"><span class="tl-time">20:52</span><b>奥丁</b>（独立代码审查员, A005）入职；父任务 closed。</div>
+    <div class="tl-item bad"><span class="tl-time">20:52</span>CEO 创建新 VERIFY <code>d5e102bb</code>，<b>assignee=潮汐</b>（原实现者），指令：转发给云雀做、奥丁审。潮汐转发消息给云雀：<code>wake=0, expect_report=0</code>。</div>
+    <div class="tl-item bad"><span class="tl-time">20:57</span>云雀回复：<b>「无待办。d5e102bb 非我 assignee」</b> → done_slice。奥丁在等「CEO dispatch 给云雀」（与事实不符）。</div>
+    <div class="tl-item bad"><span class="tl-time">至今</span><b>P0 死锁②（进行中）</b>：任务 running，潮汐等云雀、云雀无罪 idle、奥丁等错误的 dispatch。三方互等，无人推进。</div>
+  </div>
+</div>
+
+<!-- ============ P0 ============ -->
+<h2>2. P0 — 致命死锁（平台级 BUG）</h2>
+
+<div class="card story">
+  <h3><span class="badge b-p0">P0-1</span>VERIFY 审批门禁在小团队必然死锁，只能取消绕过</h3>
+  <div class="sec-label">现象</div>
+  <div class="small">云雀完成 VERIFY 并提交后，没有任何人能 approve：</div>
+  <ul class="small">
+    <li>CEO（归零）approve 被拒 —— 系统是 CEO merge 的父任务，<code>evidence.merged_by</code> 命中「合并人不得自批」；</li>
+    <li>潮汐 review 被拒 —— 父任务 implementer；</li>
+    <li>团队共 3 个可审角色，全部出局。归档原文：<i>「VERIFY 任务被 approval gate 阻塞：CEO 因 merge 父任务被拒，潮汐（implementer）也被拒，全团队无独立 reviewer」</i>。</li>
+  </ul>
+  <div class="sec-label">根因（设计自相矛盾）</div>
+  <div class="small">
+    规则 A：「VERIFY 的 creator 落 CEO（审权不落回 merger）」。规则 B：「VERIFY 禁 merger 自批」。
+    当 merger 恰好是 CEO 本人时（小团队 CEO 亲自动手 merge 是常态），A、B 直接冲突，审批空集。
+    平台有 <code>merge_proxy</code>（merger 失联兜底）和 <code>retry_qa_blocked_verify_tasks</code>（QA 缺席兜底），
+    <b>唯独没有「reviewer 缺席」兜底</b>。门禁把所有人都挡在外面后，系统层面唯一出路就是 CEO 手工取消 —— VERIFY 机制形同虚设。
+  </div>
+  <div class="fix">
+    <b>解决方案（按优先级）：</b>
+    <ol>
+      <li><b>human gate 兜底</b>：沿 parent 链找不到合法 reviewer 时，verification_case 进入 <code>reviewer_absent</code> 状态并自动 <code>message_user</code> 升级给用户一键 approve/waive（复用 merge_proxy 的祖先链逻辑，链顶无人时落 human）。</li>
+      <li><b>小团队降级策略</b>：active 协调者 ≤ 2 时允许 CEO approve，evidence 标注 <code>override: no_independent_reviewer</code>，审计可追溯。</li>
+      <li><b>根治</b>：merge 与 approve 解耦 —— CEO merge 后 VERIFY 的 reviewer 默认落「下一个被 hire 的 QA/审查员」，而非要求当场存在。</li>
+    </ol>
+  </div>
+</div>
+
+<div class="card story">
+  <h3><span class="badge b-p0">P0-2</span>任务「转发」无系统语义 —— 当下正在进行的三方死锁</h3>
+  <div class="sec-label">现象（数据库当前状态）</div>
+  <div class="evi">tasks.d5e102bb:  status=running, progress=20, assignee=潮汐(implementer)
+潮汐 agent_waits: "等待云雀完成 attest_doc_review 并 submit_task" (expires 20:55:59)
+云雀 work_log:     "无待办。VERIFY 0005ab65 已完成归档。task d5e102bb 非我 assignee"
+奥丁 agent_waits:  "等待归零 dispatch → 云雀执行并 submit" (认知与事实不符)</div>
+  <div class="sec-label">根因</div>
+  <div class="small">
+    CEO 的意图是「云雀执行、奥丁审」，但任务系统里 assignee 只能是潮汐（CEO 派工硬门：assignee 只能是直属中层）。
+    「转发给云雀」只存在于自然语言指令里 —— <b>平台没有 delegate/forward 语义，消息里带 task_id 不产生任何义务</b>。
+    云雀的 obligation 账本里没有这个任务，正确判断「非我 assignee，无待办」后合法 idle。
+    三个 agent 各自行为都「合规」，合成结果却是永久死锁。stall 看门狗 10 分钟后会举红框，但红框不解死锁。
+  </div>
+  <div class="fix">
+    <b>解决方案：</b>
+    <ol>
+      <li><b>立即处置（现在就能做）</b>：CEO 执行 <code>cancel_task(d5e102bb)</code> → 重建 VERIFY，<code>assignee=云雀, reviewer=奥丁</code>；或平台提供 <code>transfer_task</code> 把 assignee 改为云雀。</li>
+      <li><b>工具补齐</b>：新增 <code>delegate_task(task_id, executor_id)</code> —— assignee（问责）不变，显式登记执行人，executor 的 obligation 账本同步入账。</li>
+      <li><b>平台护栏</b>：检测到「消息引用 task_id 但接收方非 assignee/executor 且无义务」时，回执警告 sender「对方账本无此任务，不会行动」；消息引用活跃 task_id 时强制 <code>wake=1</code>。</li>
+      <li><b>VERIFY 任务结构化</b>：spawn VERIFY 时直接支持 <code>executor_id + reviewer_id</code> 双字段，不再靠 prompt 路由。</li>
+    </ol>
+  </div>
+</div>
+
+<!-- ============ P1 ============ -->
+<h2>3. P1 — 平台设计缺陷（规则互相打架）</h2>
+
+<div class="card">
+  <h3><span class="badge b-p1">P1-1</span>attestation gate × WORKTREE PIN 冲突，逼 CEO 主动违规</h3>
+  <div class="sec-label">证据链</div>
+  <div class="evi">潮汐 turn_result: "submit 被 attestation gate 拦住（文件在 worktree 不在 main），已发消息给归零请示方案"
+归零 turn_result: "已回复潮汐同意方案1：临时写specs/checkin.md到项目根目录用于attestation"
+tool_attestations:  全部 4 条 workspace = "D:\PC_AI\Project\TEST13"（项目根，非 worktree）</div>
+  <div class="small">
+    docs_only 任务强制 attest_doc_review，但 attestation 只认<b>项目根/main</b> 的文件；
+    WORKTREE PIN 又硬性禁止写项目根。两条硬规则把合规路径封死，CEO 只能指示下属破坏 PIN。
+    <b>这是本次事故链的第一张多米诺骨牌</b> —— 后面 main dirty、auto-save、审计断裂全部由它引发。
+  </div>
+  <div class="fix"><b>解决方案：</b>
+    <ol>
+      <li><code>attest_doc_review</code> 支持 <code>workspace="worktree"</code> 参数：在提交者自己的 worktree 内取证，artifact_hashes 记录 worktree 相对路径 + 分支名 + commit。</li>
+      <li>docs_only 提交契约改为两段式：worktree 内 attest（提交时）+ main 上复核（VERIFY 时），两段都用 attestation，不再出现「必须写 main 才能 attest」的窗口。</li>
+    </ol>
+  </div>
+</div>
+
+<div class="card">
+  <h3><span class="badge b-p1">P1-2</span>worktree 分支零提交，merge 审计链断裂</h3>
+  <div class="sec-label">证据</div>
+  <div class="evi">git log --all:  仅 3 个 commit，全部在 main
+  2a50a36  initial (仅 .gitignore)
+  92f4fea  pre-merge-checkpoint: auto-save dirty main   ← spec 由此进入 main
+  44afce8  pre-merge-checkpoint                         ← 空提交
+hw/A003/work 指向 44afce8 —— 从未有过独立提交</div>
+  <div class="small">
+    项目唯一产出<b>未经任何 agent 分支</b>，通过「dirty main 自动存档」兜底进入 main。
+    <code>git_worktree_merge</code> 对「零提交分支」不警告不拒绝，no-op merge 照样成功。
+    CLAUDE.md 规定的审查口径「审代码读 worktree」在本项目完全落空 —— worktree 里根本没有可审的提交。
+  </div>
+  <div class="fix"><b>解决方案：</b>
+    <ol>
+      <li>merge 前校验分支 ahead count：== 0 时拒绝 merge，提示「分支无提交，请先在 worktree 内 commit」。</li>
+      <li><code>submit_task</code> 时校验 <code>evidence.files_changed</code> 与 worktree 分支 diff 一致，不一致拒收。</li>
+      <li><code>auto-save dirty main</code> 触发即广播 <code>agent_health=error</code> / lobby 告警 —— 这是异常路径，不该静默兜底。</li>
+    </ol>
+  </div>
+</div>
+
+<div class="card">
+  <h3><span class="badge b-p1">P1-3</span>VERIFY 取消后 verification_cases 永久悬挂</h3>
+  <div class="sec-label">证据</div>
+  <div class="evi">verification_cases:  status=in_review, closed_at=NULL
+  (verify_task_id=0005ab65 已 cancelled, merge_commit=44afce8)
+归零 work_log: "VERIFY 任务取消后，父任务已转为 approved。但 verification_case 仍 in_review。需要用户决策。"</div>
+  <div class="small">
+    任务被取消，关联的 verification_case 没有级联关闭，成为孤儿记录。CEO 自己发现了不一致，
+    但平台没有任何工具让它修复 —— 只能「留给用户决策」。状态机出现系统自己都感知却治不了的脏数据。
+  </div>
+  <div class="fix"><b>解决方案：</b>
+    <ol>
+      <li><code>cancel_task</code> 级联：取消 VERIFY 任务时同步关闭关联 verification_case（status=<code>cancelled</code>, closed_at, reason）。</li>
+      <li>启动对账（reconcile）增加一项：scan「任务已终态但 verification_case 未关闭」的记录并修复。</li>
+      <li>父任务状态回退（verifying→approved）应写 task_event 说明原因（当前 payload 为空，审计断点）。</li>
+    </ol>
+  </div>
+</div>
+
+<!-- ============ P2 ============ -->
+<h2>4. P2 / P3 — 效率与一致性问题</h2>
+
+<div class="card">
+  <h3><span class="badge b-p2">P2-1</span>已通过的验证结果作废，无复用机制</h3>
+  <div class="small">
+    云雀对 0005ab65 的 attestation（<code>835e5bfe</code>）至今有效 —— artifact hash 与 main 上文件完全一致。
+    VERIFY 被取消重建后，平台要求从头再做一遍，<b>同一 merge_commit 下已通过的 attestation 无法被引用复用</b>。
+  </div>
+  <div class="fix"><b>解决方案：</b>重建 VERIFY 时检测同 <code>merge_commit_hash</code> 的已通过 attestation，evidence 允许 <code>reuse_attestation_ids</code>，reviewer 确认后直接 approve。</div>
+</div>
+
+<div class="card">
+  <h3><span class="badge b-p2">P2-2</span>关键执行指令以 wake=0 / expect_report=0 发出</h3>
+  <div class="evi">潮汐 → 云雀 inbox:  task_id=d5e102bb, wake=0, expect_report=0
+（内容为 VERIFY 执行指令 —— 对方不被唤醒、不被要求回复）</div>
+  <div class="small">云雀若不是被其他事件恰好唤醒，根本看不到这条指令。指令类消息靠运气投递。</div>
+  <div class="fix"><b>解决方案：</b>消息携带活跃 <code>task_id</code> 且内容含执行指令时，平台强制 <code>wake=1</code>；或至少在 send 回执中提示「对方不会被唤醒，确认？」。</div>
+</div>
+
+<div class="card">
+  <h3><span class="badge b-p2">P2-3</span>CRLF/LF 不一致，artifact hash 跨环境不可复现</h3>
+  <div class="evi">main 根 specs/checkin.md:      LF    sha256=5e533600…
+worktree A003/A005 同文件:   CRLF  sha256=e3af9759…
+（git autocrlf 检出转换所致；attestation 记录的是 main 版本 hash）</div>
+  <div class="small">同一份文档两个 hash，attestation 的 artifact_hashes 在不同 checkout 环境下无法比对验证。</div>
+  <div class="fix"><b>解决方案：</b>仓库根加 <code>.gitattributes</code>（<code>*.md text eol=lf</code>）；attestation 计算 hash 前统一规范化换行符。</div>
+</div>
+
+<div class="card">
+  <h3><span class="badge b-p3">P3-1</span>CEO waiting 泛滥 + agent 间事实认知漂移</h3>
+  <div class="small">
+    15 条 agent_waits 中 CEO 占 11 条，曾在 3 秒内连续两次 ask_agent 催潮汐（20:36:36 / 20:36:39），
+    大量 <code>WAIT_WITHOUT_ASK</code> soft pass。另外奥丁被告知的任务事实（assignee=云雀）与 DB 实际（assignee=潮汐）不符 —
+    事实靠 CEO 手打自然语言传递，必然漂移。
+  </div>
+  <div class="fix"><b>解决方案：</b>
+    <ol>
+      <li>同 ref 同 note 的 wait 自动合并去重；ask 发出后重置 wait 计时而非叠加新 wait。</li>
+      <li>dispatch/交接消息由系统自动附加结构化事实块（task_id / assignee / status / reviewer），agent 不可改写。</li>
+    </ol>
+  </div>
+</div>
+
+<!-- ============ SPEC ============ -->
+<h2>5. specs/checkin.md 文档自身缺陷（唯一交付物）</h2>
+
+<div class="card">
+  <h3><span class="badge b-spec">SPEC-1</span>§5.4 连续打卡规则自相矛盾（实现者会无所适从）</h3>
+  <div class="evi">原文：「如果今天未打卡，连续天数为 0（除非今天尚未打卡但昨天已打卡…
+规则：连续打卡从最近一次打卡开始算，中间不可断）」</div>
+  <div class="small">
+    「为 0」与括号里的「除非」直接冲突；F5/F6/F7 三个验收用例又给出第三种解读。
+    核心歧义：<b>今早打开页面（今天还没打），streak 显示 0 还是显示截至昨天的连续天数？</b>
+    按 §5.4 前半句是 0，按括号例外是昨天的值，按 F7 是「从最近一次延续」。
+  </div>
+  <div class="fix"><b>解决方案：</b>建议明确为「今天未打卡时显示 frozen streak（截至昨天的连续天数），今日打卡后 +1」，并同步改写 F6 的预期（昨天未打卡 → 显示 0，因为 frozen streak 截至昨天已是 0）。</div>
+</div>
+
+<div class="card">
+  <h3><span class="badge b-spec">SPEC-2</span>缺多标签页并发场景</h3>
+  <div class="small">B4 只防单页快速连点。两个标签页同时打开时，A 页打卡后 B 页按钮仍可点、可重复写入 —— localStorage 无跨标签锁。</div>
+  <div class="fix"><b>解决方案：</b>监听 <code>storage</code> 事件同步打卡状态；或打卡前重读 localStorage 做最终判定，而不是只用内存状态。</div>
+</div>
+
+<div class="card">
+  <h3><span class="badge b-spec">SPEC-3</span>日期时区未定义</h3>
+  <div class="small"><code>date: "YYYY-MM-DD"</code> 按设备本地时区还是 UTC？跨时区旅行、夏令时切换时会打错卡或断连续。</div>
+  <div class="fix"><b>解决方案：</b>spec 写明「按设备本地时区取日界」，demo 阶段可接受；正式版建议固定业务时区。</div>
+</div>
+
+<div class="card">
+  <h3><span class="badge b-spec">SPEC-4</span>B3 午夜跨天方案与 F4 不一致</h3>
+  <div class="small">F4 要求「打开页面即显示今天」，B3 对已打开页面跨天却只「提示用户刷新」——同一场景两种自动化标准。</div>
+  <div class="fix"><b>解决方案：</b>每分钟日期检查命中跨天时<b>自动重置今日打卡状态</b>（重读记录、解锁按钮、shift 7 天格子），toast 仅作告知，不要求用户手动刷新。</div>
+</div>
+
+<!-- ============ 立即行动 ============ -->
+<h2>6. 立即行动清单（按序执行）</h2>
+<div class="now">
+  <h3>当前项目止血（5 分钟）</h3>
+  <table>
+    <tr><th>#</th><th>动作</th><th>执行者</th><th>目的</th></tr>
+    <tr><td>1</td><td><code>cancel_task(d5e102bb)</code>，重建 VERIFY：<code>assignee=云雀, reviewer=奥丁</code>，引用复用 attestation <code>835e5bfe</code></td><td>归零(CEO)</td><td>解开三方死锁</td></tr>
+    <tr><td>2</td><td>手工关闭悬挂的 verification_case <code>4b0dfc92</code>（status→cancelled）</td><td>平台/SQL</td><td>清脏数据</td></tr>
+    <tr><td>3</td><td>仓库根提交 <code>.gitattributes</code>（<code>*.md text eol=lf</code>）</td><td>任意</td><td>统一换行符</td></tr>
+  </table>
+</div>
+<div class="card" style="margin-top:16px">
+  <h3>平台修复优先级</h3>
+  <table>
+    <tr><th>优先级</th><th>修复项</th><th>对应问题</th></tr>
+    <tr><td><span class="badge b-p0">P0</span></td><td>VERIFY reviewer 缺席 → human gate 兜底 + 小团队降级 approve</td><td>P0-1</td></tr>
+    <tr><td><span class="badge b-p0">P0</span></td><td><code>delegate_task</code> 工具 + VERIFY 双字段（executor/reviewer）+ 非 assignee 引用警告</td><td>P0-2</td></tr>
+    <tr><td><span class="badge b-p1">P1</span></td><td>attestation 支持 worktree workspace；merge 拒绝零提交分支；auto-save dirty main 告警</td><td>P1-1 / P1-2</td></tr>
+    <tr><td><span class="badge b-p1">P1</span></td><td>cancel_task 级联关闭 verification_case + 启动对账</td><td>P1-3</td></tr>
+    <tr><td><span class="badge b-p2">P2</span></td><td>attestation 复用、指令消息强制 wake、.gitattributes、wait 去重</td><td>P2-1~P3-1</td></tr>
+  </table>
+</div>
+
+<footer>
+  数据来源：D:\PC_AI\Project\TEST13\.hiveweave\data.db（agents/tasks/task_events/work_logs/inbox/agent_waits/tool_attestations/verification_cases/questions 全量）+ git 仓库取证 · 2026-07-24
+</footer>
+
+</div>
+</body>
+</html>

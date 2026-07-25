@@ -29,6 +29,28 @@ log = structlog.get_logger(__name__)
 DEFAULT_TIMEOUT_S = 120          # 2 minutes
 MAX_TIMEOUT_S = 600              # 10 minutes hard cap
 MAX_CAPTURE_BYTES = 1_048_576    # 1MB — bash 专用轻量截断阈值
+# P2-1 fix: 非零退出时返回 stdout/stderr 各自的尾部 4KB（tail 而非 head），
+# 让 agent 看到真正的报错信息（编译错误、堆栈通常在输出末尾），避免盲目重试。
+ERROR_TAIL_BYTES = 4_096
+
+# D4: Per-(agent_id, cwd) consecutive failure counter. When an agent keeps
+# getting non-zero exits in the same directory (even with different flags/args),
+# we append guidance after CWD_FAILURE_STREAK_THRESHOLD consecutive failures.
+_cwd_failure_streak: dict[tuple[str, str], int] = {}
+CWD_FAILURE_STREAK_THRESHOLD = 5
+_CWD_FAILURE_STREAK_MAX_ENTRIES = 200
+
+_CWD_FAILURE_HINT = (
+    "\n\n[HINT: {n} consecutive failures in this directory. "
+    "Read the full error output above carefully — the root cause is likely stated there. "
+    "Consider a fundamentally different approach instead of retrying variations. "
+    "Verify the working directory is correct. "
+    "If stuck, use message_peer to ask a colleague for help.]"
+)
+
+# ANSI 转义序列（颜色 / 光标控制）。Windows 下 Git Bash、cmd 及许多 CLI 会
+# 输出 VT 颜色码，原样回传给 LLM 会污染上下文，需在尾部截断后剥离。
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 DOCKER_SANDBOX_IMAGE = "hiveweave/sandbox:latest"
 
 # 环境变量白名单 — 只传系统必要变量给子进程，绝不传递任何含
@@ -279,6 +301,56 @@ def _truncate_output(output: str) -> str:
     )
 
 
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI escape sequences (color / cursor control).
+
+    P2-1 fix: Windows 下 Git Bash / cmd 及许多 CLI（npm、pytest、tsc）会输出
+    VT 颜色码，原样回传给 LLM 会污染上下文且浪费 token。剥离后再返回。
+    在 POSIX 上调用也无害（无转义序列时原样返回）。
+    """
+    if not text:
+        return text
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def _error_tail(text: str) -> str:
+    """Return the LAST 4KB of a stream (tail, not head) for error reporting.
+
+    P2-1 fix: 命令失败时真正的报错信息（编译错误、堆栈、缺失依赖提示）几乎
+    总在输出末尾。此前只回首行导致 agent 看不到原因而盲目重试。改为返回尾部
+    4KB，并先剥离 ANSI 转义序列。
+    """
+    if not text:
+        return ""
+    cleaned = _strip_ansi(text)
+    encoded = cleaned.encode("utf-8", errors="replace")
+    if len(encoded) <= ERROR_TAIL_BYTES:
+        return cleaned
+    tail = encoded[-ERROR_TAIL_BYTES:].decode("utf-8", errors="replace")
+    dropped = len(encoded) - ERROR_TAIL_BYTES
+    return f"... [{dropped} earlier bytes omitted, showing last {ERROR_TAIL_BYTES} bytes]\n{tail}"
+
+
+def _update_cwd_failure_streak(agent_id: str, cwd: str, success: bool) -> str:
+    """D4: Track consecutive failures per (agent_id, cwd) and return hint text.
+
+    Returns the hint string when the streak reaches CWD_FAILURE_STREAK_THRESHOLD,
+    empty string otherwise. Never blocks execution — purely advisory.
+    """
+    key = (agent_id, cwd)
+    if success:
+        _cwd_failure_streak.pop(key, None)
+        return ""
+    # Simple bounded eviction: clear all if dict grows too large
+    if len(_cwd_failure_streak) > _CWD_FAILURE_STREAK_MAX_ENTRIES:
+        _cwd_failure_streak.clear()
+    count = _cwd_failure_streak.get(key, 0) + 1
+    _cwd_failure_streak[key] = count
+    if count >= CWD_FAILURE_STREAK_THRESHOLD:
+        return _CWD_FAILURE_HINT.format(n=count)
+    return ""
+
+
 # ── Git Bash detection (Windows) ────────────────────────────
 # P1 fix(TEST11-R3): Windows 下优先探测 Git Bash，用 bash -c 执行命令，
 # 根治 cmd 不支持管道/变量赋值/&&复合/bash script.sh 的固有限制。
@@ -436,19 +508,21 @@ async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
             cwd=cwd,
             env=env,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
             **windows_no_window_kwargs(),
         )
     except FileNotFoundError as exc:
-        return {"output": "", "exit_code": None, "timed_out": False,
+        return {"output": "", "stdout": "", "stderr": "",
+                "exit_code": None, "timed_out": False,
                 "error": f"Failed to spawn shell: {exc}"}
     except OSError as exc:
-        return {"output": "", "exit_code": None, "timed_out": False,
+        return {"output": "", "stdout": "", "stderr": "",
+                "exit_code": None, "timed_out": False,
                 "error": f"Failed to spawn shell: {exc}"}
 
     try:
-        stdout_bytes, _ = await asyncio.wait_for(
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_s
         )
     except asyncio.TimeoutError:
@@ -461,11 +535,18 @@ async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
             await proc.wait()
         except Exception:  # noqa: BLE001
             pass
-        return {"output": "", "exit_code": None, "timed_out": True, "error": None}
+        return {"output": "", "stdout": "", "stderr": "",
+                "exit_code": None, "timed_out": True, "error": None}
 
-    output = _decode_output(stdout_bytes) if stdout_bytes else ""
+    stdout = _decode_output(stdout_bytes) if stdout_bytes else ""
+    stderr = _decode_output(stderr_bytes) if stderr_bytes else ""
+    # 成功路径仍返回合并 output（保持原有行为）；失败路径用分离的
+    # stdout/stderr 各自取尾部 4KB（P2-1 fix）。
+    combined = stdout + ("\n" + stderr if stdout and stderr else stderr)
     return {
-        "output": output,
+        "output": combined,
+        "stdout": stdout,
+        "stderr": stderr,
         "exit_code": proc.returncode,
         "timed_out": False,
         "error": None,
@@ -497,7 +578,7 @@ async def _run_docker(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
             *docker_cmd,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
             **windows_no_window_kwargs(),
         )
@@ -506,7 +587,7 @@ async def _run_docker(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
         return await _run_native(command, cwd, timeout_s)
 
     try:
-        stdout_bytes, _ = await asyncio.wait_for(
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_s
         )
     except asyncio.TimeoutError:
@@ -518,11 +599,16 @@ async def _run_docker(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
             await proc.wait()
         except Exception:  # noqa: BLE001
             pass
-        return {"output": "", "exit_code": None, "timed_out": True, "error": None}
+        return {"output": "", "stdout": "", "stderr": "",
+                "exit_code": None, "timed_out": True, "error": None}
 
-    output = _decode_output(stdout_bytes) if stdout_bytes else ""
+    stdout = _decode_output(stdout_bytes) if stdout_bytes else ""
+    stderr = _decode_output(stderr_bytes) if stderr_bytes else ""
+    combined = stdout + ("\n" + stderr if stdout and stderr else stderr)
     return {
-        "output": output,
+        "output": combined,
+        "stdout": stdout,
+        "stderr": stderr,
         "exit_code": proc.returncode,
         "timed_out": False,
         "error": None,
@@ -635,12 +721,20 @@ async def execute_bash(
                 "error": None}
 
     body = output if output.strip() else "(no output)"
-    # 把输出首行摘要放进 error 字段，LLM 即使只读 error 也能快速判断
-    # 失败原因（如 "'ls' is not recognized" → 命令不存在）
-    first_line = output.strip().split("\n", 1)[0][:200] if output.strip() else ""
+    # P2-1 fix: 失败时把 stdout/stderr 各自的尾部 4KB 放进 error 字段。
+    # 真正的报错（编译错误、堆栈、缺失依赖）几乎总在输出末尾，此前只回首行
+    # 导致 agent 看不到原因而盲目重试。_error_tail 同时剥离 ANSI 转义序列。
+    stdout_tail = _error_tail(result.get("stdout", ""))
+    stderr_tail = _error_tail(result.get("stderr", ""))
+    detail_parts: list[str] = []
+    if stdout_tail:
+        detail_parts.append(f"[stdout tail]\n{stdout_tail}")
+    if stderr_tail:
+        detail_parts.append(f"[stderr tail]\n{stderr_tail}")
+    detail = "\n".join(detail_parts)
     error_msg = f"Command exited with code {exit_code}"
-    if first_line:
-        error_msg = f"{error_msg}: {first_line}"
+    if detail:
+        error_msg = f"{error_msg}\n{detail}"
     return {
         "success": False,  # non-zero exit is not success
         "output": f"{body}\n\n{cwd_hint}\nExit code: {exit_code}",
@@ -714,10 +808,22 @@ async def execute_run_command(
                 "error": None}
 
     body = output if output.strip() else "(no output)"
+    # P2-1 fix: 同 execute_bash — 失败时返回 stdout/stderr 各自尾部 4KB。
+    stdout_tail = _error_tail(result.get("stdout", ""))
+    stderr_tail = _error_tail(result.get("stderr", ""))
+    detail_parts: list[str] = []
+    if stdout_tail:
+        detail_parts.append(f"[stdout tail]\n{stdout_tail}")
+    if stderr_tail:
+        detail_parts.append(f"[stderr tail]\n{stderr_tail}")
+    detail = "\n".join(detail_parts)
+    error_msg = f"Command exited with code {exit_code}"
+    if detail:
+        error_msg = f"{error_msg}\n{detail}"
     return {
         "success": False,
         "output": f"{body}\n\nExit code: {exit_code}",
-        "error": f"Command exited with code {exit_code}",
+        "error": error_msg,
     }
 
 
@@ -791,6 +897,10 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
         timeout_ms=params.timeout,
         project_id=project_id,
     )
+    # D4: track consecutive failures per (agent_id, cwd)
+    _streak_hint = _update_cwd_failure_streak(
+        agent_id, workspace, bool(result.get("success"))
+    )
     if result.get("success"):
         out = result["output"]
         # Phase 3: attest test runs
@@ -840,7 +950,10 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
             log.warning("bash_attest_issue_failed", error=str(_att_err))
         return ToolResult.ok(out)
     # For bash, output contains the command output even on failure
-    return ToolResult.err(result.get("error", "Command failed"))
+    err_msg = result.get("error", "Command failed")
+    if _streak_hint:
+        err_msg = f"{err_msg}{_streak_hint}"
+    return ToolResult.err(err_msg)
 
 
 @tool(
@@ -865,6 +978,11 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         cwd=params.cwd,
         timeout_ms=params.timeout,
         workspace_path=workspace,
+    )
+    # D4: track consecutive failures per (agent_id, cwd)
+    _effective_cwd = str(Path(workspace) / params.cwd) if params.cwd else workspace
+    _streak_hint = _update_cwd_failure_streak(
+        agent_id, _effective_cwd, bool(result.get("success"))
     )
     if result.get("success"):
         out = result["output"]
@@ -913,4 +1031,7 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
             # agent 完全不知道原因）。工具主流程不受影响，仅记录。
             log.warning("bash_attest_issue_failed", error=str(_att_err))
         return ToolResult.ok(out)
-    return ToolResult.err(result.get("error", "Command failed"))
+    err_msg = result.get("error", "Command failed")
+    if _streak_hint:
+        err_msg = f"{err_msg}{_streak_hint}"
+    return ToolResult.err(err_msg)

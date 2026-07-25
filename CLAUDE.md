@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Rules
+
+- **遇到问题要反思**：为什么会有这个问题？从宏观、治根的角度修复问题，不要“打地鼠”式地修补表面。
+
 ## Commands
 
 ```bash

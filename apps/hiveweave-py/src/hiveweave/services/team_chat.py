@@ -40,7 +40,9 @@ class TeamChatService:
         - 1 分钟窗口内重复 → 返回 'duplicate'，不写 chat_messages
         - 非重复 → 写 chat_messages + dedupe_key，返回 'ok'
         - save 失败 → 返回 'error'
-        - save_dedupe_key 失败 → 静默（仍返回 'ok'，dedupe 是优化非必需）
+
+        TEST16 P1-2: dedupe 改用 INSERT OR IGNORE + UNIQUE 约束原子化，
+        消除 check-then-act TOCTOU 竞态。
 
         Returns: 'ok' | 'duplicate' | 'error'
         """
@@ -48,13 +50,29 @@ class TeamChatService:
             f"{from_agent_id}:{to_agent_id}:{content}".encode()
         ).hexdigest()
         now_ms = int(time.time() * 1000)
-        cutoff = now_ms - _DEDUPE_WINDOW_MS
+        window_bucket = now_ms // _DEDUPE_WINDOW_MS
 
-        # Check dedup (fail-open: exception → not duplicate,宁可重复不丢消息)
-        if await self._is_duplicate(agent_id, dedupe_key, cutoff):
-            log.info("team_chat_dedup", agent_id=agent_id,
-                     from_agent_id=from_agent_id, to_agent_id=to_agent_id)
-            return "duplicate"
+        # Atomic dedupe claim (fail-open: exception → not duplicate)
+        dedupe_id = str(uuid.uuid4())
+        try:
+            await project_db.execute(
+                agent_id,
+                "INSERT OR IGNORE INTO team_chat_dedupe "
+                "(id, agent_id, dedupe_key, created_at, window_bucket) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [dedupe_id, agent_id, dedupe_key, now_ms, window_bucket])
+            row = await project_db.query_one(
+                agent_id,
+                "SELECT id FROM team_chat_dedupe WHERE id = ?",
+                [dedupe_id])
+            if row is None:
+                log.info("team_chat_dedup", agent_id=agent_id,
+                         from_agent_id=from_agent_id, to_agent_id=to_agent_id)
+                return "duplicate"
+        except Exception as e:
+            log.warning("team_chat_dedupe_claim_failed", agent_id=agent_id,
+                        error=str(e))
+            # fail-open: proceed with message save
 
         # Save message to chat_messages
         msg_id = str(uuid.uuid4())
@@ -70,32 +88,15 @@ class TeamChatService:
             log.error("team_chat_save_failed", agent_id=agent_id, error=str(e))
             return "error"
 
-        # Save dedupe key (failure is silent — dedupe is optimization, not required)
-        try:
-            dedupe_id = str(uuid.uuid4())
-            await project_db.execute(
-                agent_id,
-                "INSERT INTO team_chat_dedupe (id, agent_id, dedupe_key, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                [dedupe_id, agent_id, dedupe_key, now_ms])
-        except Exception as e:
-            log.warning("team_chat_dedupe_save_failed", agent_id=agent_id,
-                        error=str(e))
-
         return "ok"
 
     async def check_and_mark(self, agent_id: str, from_agent_id: str,
                              to_agent_id: str, content: str) -> bool:
         """原子化"检查+登记"去重（供不写 chat_messages 的调用方使用）。
 
-        背景（P2 三连发）：trigger digest 经 ChatMessageService.save_message
-        直写 chat_messages，绕过 record_message 的去重，导致同一 digest
-        在同一秒内向同一 agent 落库 3 次。调用方（如 agents/trigger.py）
-        在写消息前调用本方法：返回 True 表示窗口内重复，应跳过写库；
-        返回 False 表示已登记 dedupe_key，可正常写库。
-
-        - dedupe_key 与 record_message 同规则：MD5("{from}:{to}:{content}")
-        - fail-open：任何异常返回 False（宁可重复不丢消息）
+        TEST16 P1-2: 改用 INSERT OR IGNORE + UNIQUE(agent_id, dedupe_key,
+        window_bucket) 约束兜底并发。不再依赖 check-then-act 的 SELECT+INSERT
+        两步操作（存在 TOCTOU 竞态）。
 
         Returns: True = duplicate（跳过写库）; False = newly marked（可写库）
         """
@@ -103,19 +104,26 @@ class TeamChatService:
             f"{from_agent_id}:{to_agent_id}:{content}".encode()
         ).hexdigest()
         now_ms = int(time.time() * 1000)
-        cutoff = now_ms - _DEDUPE_WINDOW_MS
+        window_bucket = now_ms // _DEDUPE_WINDOW_MS
+        dedupe_id = str(uuid.uuid4())
         try:
-            if await self._is_duplicate(agent_id, dedupe_key, cutoff):
-                log.info("team_chat_dedup_mark", agent_id=agent_id,
-                         from_agent_id=from_agent_id, to_agent_id=to_agent_id)
-                return True
-            dedupe_id = str(uuid.uuid4())
             await project_db.execute(
                 agent_id,
-                "INSERT INTO team_chat_dedupe (id, agent_id, dedupe_key, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                [dedupe_id, agent_id, dedupe_key, now_ms])
-            return False
+                "INSERT OR IGNORE INTO team_chat_dedupe "
+                "(id, agent_id, dedupe_key, created_at, window_bucket) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [dedupe_id, agent_id, dedupe_key, now_ms, window_bucket])
+            # Check if OUR row was inserted (we won the race)
+            row = await project_db.query_one(
+                agent_id,
+                "SELECT id FROM team_chat_dedupe WHERE id = ?",
+                [dedupe_id])
+            if row is not None:
+                return False  # newly marked — caller may proceed
+            # Our INSERT was ignored → duplicate within this window bucket
+            log.info("team_chat_dedup_mark", agent_id=agent_id,
+                     from_agent_id=from_agent_id, to_agent_id=to_agent_id)
+            return True
         except Exception as e:
             log.warning("team_chat_check_mark_failed", agent_id=agent_id,
                         error=str(e))

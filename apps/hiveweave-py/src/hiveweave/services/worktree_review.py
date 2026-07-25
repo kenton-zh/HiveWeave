@@ -52,8 +52,9 @@ async def agent_worktree_path(agent_id: str) -> str | None:
     p = Path(ws)
     if not p.is_dir():
         return None
-    # Prefer a real checkout (worktree or repo)
-    if (p / ".git").exists() or any(p.iterdir()):
+    # TEST16 P0-2: require .git — aligned with agent.py lazy-create check.
+    # Old: `any(p.iterdir())` passed node_modules husks as valid worktrees.
+    if (p / ".git").exists():
         return str(p)
     return None
 
@@ -439,13 +440,39 @@ _KNOWN_FILE_EXTS = (
 )
 
 # Path-like token: has a slash, or is a bare filename with a known extension.
+# ASCII-only character class — \w matches CJK which causes false positives
+# on Chinese acceptance criteria like "签到/排行榜" (TEST16 P0-1).
 _PATH_TOKEN_RE = re.compile(
     r"(?:"
-    r"(?:\.?/?[\w.-]+(?:/[\w.-]+)+)"  # a/b or ./a/b
+    r"(?:\.?/?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)"  # a/b or ./a/b
     r"|"
-    r"(?:[\w.-]+\.(?:" + "|".join(e.lstrip(".") for e in _KNOWN_FILE_EXTS) + r"))"
+    r"(?:[A-Za-z0-9_.-]+\.(?:" + "|".join(e.lstrip(".") for e in _KNOWN_FILE_EXTS) + r"))"
     r")"
 )
+
+
+# Known project root prefixes — a slash-containing token is only treated as
+# a path reference if it starts with one of these, or ends with a known ext.
+_KNOWN_PATH_PREFIXES = (
+    "src/", "apps/", "tests/", "test/", "docs/", "doc/", "lib/", "pkg/",
+    "public/", "static/", "dist/", "build/", "scripts/", "config/",
+    "components/", "pages/", "api/", "services/", "utils/", "data/",
+    "evidence/", "assets/", "internal/", "cmd/", "spec/",
+)
+
+
+def _looks_like_real_path(token: str) -> bool:
+    """Filter: only accept tokens that look like genuine file paths."""
+    low = token.lower()
+    if low.endswith(_KNOWN_FILE_EXTS):
+        return True
+    if any(low.startswith(pfx) for pfx in _KNOWN_PATH_PREFIXES):
+        return True
+    # Contains a dot-segment that looks like an extension in the last part
+    last_seg = low.rsplit("/", 1)[-1] if "/" in low else low
+    if "." in last_seg and len(last_seg.rsplit(".", 1)[-1]) <= 5:
+        return True
+    return False
 
 
 def extract_acceptance_path_refs(criteria: Any) -> list[str]:
@@ -480,15 +507,18 @@ def extract_acceptance_path_refs(criteria: Any) -> list[str]:
         while cand.startswith("./"):
             cand = cand[2:]
         if ("/" in cand or cand.lower().endswith(_KNOWN_FILE_EXTS)) and " " not in cand:
-            norm = normalize_evidence_path(cand)
-            if norm and norm not in seen:
-                seen.add(norm)
-                found.append(norm)
+            if _looks_like_real_path(cand):
+                norm = normalize_evidence_path(cand)
+                if norm and norm not in seen:
+                    seen.add(norm)
+                    found.append(norm)
             continue
         for m in _PATH_TOKEN_RE.finditer(text):
             token = m.group(0).strip().strip("`\"'")
             while token.startswith("./"):
                 token = token[2:]
+            if not _looks_like_real_path(token):
+                continue
             norm = normalize_evidence_path(token)
             if norm and norm not in seen:
                 seen.add(norm)
@@ -593,22 +623,29 @@ async def check_evidence_verifiable(
     if not missing_claimed and not uncovered_criteria:
         return None
 
+    # uncovered_criteria: path-like tokens from acceptance criteria text that
+    # weren't found on disk. Downgraded to warning (TEST16 P0-1) — evidence
+    # sufficiency is the reviewer's judgment call, not a platform hard gate.
+    if uncovered_criteria:
+        log.warning(
+            "evidence.uncovered_criteria_warning",
+            task_id=task.get("id"),
+            refs=uncovered_criteria[:8],
+        )
+
+    # Only missing_claimed (agent explicitly claimed these files in
+    # files_changed but they don't exist) is a hard deny.
+    if not missing_claimed:
+        return None
+
     parts: list[str] = [
         "Cannot approve: evidence not structurally verifiable."
     ]
-    if missing_claimed:
-        parts.append(
-            "files_changed missing on disk: "
-            + ", ".join(missing_claimed[:8])
-            + ("…" if len(missing_claimed) > 8 else "")
-        )
-    if uncovered_criteria:
-        parts.append(
-            "acceptance_criteria path refs not in files_changed and not "
-            "found on disk: "
-            + ", ".join(uncovered_criteria[:8])
-            + ("…" if len(uncovered_criteria) > 8 else "")
-        )
+    parts.append(
+        "files_changed missing on disk: "
+        + ", ".join(missing_claimed[:8])
+        + ("…" if len(missing_claimed) > 8 else "")
+    )
     parts.append(
         "Ask assignee to resubmit with existing paths, or rework."
     )
