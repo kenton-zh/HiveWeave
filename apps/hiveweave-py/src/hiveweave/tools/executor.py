@@ -131,11 +131,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePath", "content"],
     },
     "list_files": {
-        "description": "Lists files and directories at the given path. Use it to explore directory structure, find files by location, or verify file existence. Returns a list of file/directory names.",
+        "description": "Lists files and directories at the given path. Use it to explore directory structure, find files by location, or verify file existence. Returns a list of file/directory names. When recursive=true, maxdepth controls descent depth and is capped at 3 (values above 3 are clamped to 3).",
         "properties": {
             "dirPath": {"type": "string", "aliases": ["path", "directory", "dir"]},
             "recursive": {"type": "boolean", "description": "If true, list recursively. Default: false."},
-            "maxdepth": {"type": "integer", "description": "Max depth when recursive (1-3). Default: 1."},
+            "maxdepth": {"type": "integer", "description": "Max depth when recursive (1-3). Default: 1. Values above 3 are clamped to 3."},
         },
         "required": [],
     },

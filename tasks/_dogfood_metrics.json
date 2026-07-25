@@ -1,0 +1,653 @@
+{
+  "project": "TEST_YLGY",
+  "workspace": "D:\\PC_AI\\Project\\TEST_YLGY",
+  "window": {
+    "first_task": "2026-07-24 16:21:46",
+    "last_task_update": "2026-07-24 18:19:47",
+    "duration_min": 118.0
+  },
+  "agents": [
+    {
+      "short_id": "A001",
+      "name": "归零",
+      "role": "ceo",
+      "status": "active",
+      "permission_type": "coordinator",
+      "wt_ok": false,
+      "worktree_error": null,
+      "created": "2026-07-24 16:13:11"
+    },
+    {
+      "short_id": "A002",
+      "name": "天线",
+      "role": "hr",
+      "status": "active",
+      "permission_type": "coordinator",
+      "wt_ok": false,
+      "worktree_error": null,
+      "created": "2026-07-24 16:13:11"
+    },
+    {
+      "short_id": "A003",
+      "name": "青岚",
+      "role": "游戏Tech Lead",
+      "status": "active",
+      "permission_type": "coordinator",
+      "wt_ok": true,
+      "worktree_error": null,
+      "created": "2026-07-24 16:21:29"
+    },
+    {
+      "short_id": "A004",
+      "name": "潮汐",
+      "role": "核心游戏引擎工程师",
+      "status": "active",
+      "permission_type": "executor",
+      "wt_ok": true,
+      "worktree_error": null,
+      "created": "2026-07-24 16:25:11"
+    },
+    {
+      "short_id": "A005",
+      "name": "AI蛋炒饭",
+      "role": "关卡道具动画工程师",
+      "status": "active",
+      "permission_type": "executor",
+      "wt_ok": true,
+      "worktree_error": null,
+      "created": "2026-07-24 16:25:11"
+    },
+    {
+      "short_id": "A006",
+      "name": "Robert",
+      "role": "前端UI系统工程师",
+      "status": "active",
+      "permission_type": "executor",
+      "wt_ok": true,
+      "worktree_error": null,
+      "created": "2026-07-24 16:25:11"
+    },
+    {
+      "short_id": "A007",
+      "name": "麦麦",
+      "role": "全模块测试工程师",
+      "status": "active",
+      "permission_type": "executor",
+      "wt_ok": true,
+      "worktree_error": null,
+      "created": "2026-07-24 16:25:11"
+    }
+  ],
+  "agent_counts": {
+    "total": 7,
+    "active": 7,
+    "archived": 0
+  },
+  "tasks": {
+    "status_counts": {
+      "closed": 22,
+      "cancelled": 1
+    },
+    "total": 23,
+    "with_contract_json": 0,
+    "summary": [
+      {
+        "id": "595d342f",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A003",
+        "assignee_name": "青岚",
+        "title": "Phase 0.5 - 领域探索与模块拆分",
+        "created": "2026-07-24 16:21:46",
+        "updated": "2026-07-24 16:28:44",
+        "has_contract": false
+      },
+      {
+        "id": "a6c8fc7c",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: Phase 0.5 - 领域探索与模块拆分",
+        "created": "2026-07-24 16:26:24",
+        "updated": "2026-07-24 16:28:44",
+        "has_contract": false
+      },
+      {
+        "id": "e15cdc47",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A003",
+        "assignee_name": "青岚",
+        "title": "Phase 1 DEFINE - 各模块规格定义",
+        "created": "2026-07-24 16:27:15",
+        "updated": "2026-07-24 16:45:03",
+        "has_contract": false
+      },
+      {
+        "id": "31e6c040",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A004",
+        "assignee_name": "潮汐",
+        "title": "【DEFINE阶段】编写模块Spec — 负责M1+M2+M9",
+        "created": "2026-07-24 16:27:59",
+        "updated": "2026-07-24 16:33:23",
+        "has_contract": false
+      },
+      {
+        "id": "70827682",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A005",
+        "assignee_name": "AI蛋炒饭",
+        "title": "【DEFINE阶段】编写模块Spec — 负责M3+M4+M5+M7",
+        "created": "2026-07-24 16:27:59",
+        "updated": "2026-07-24 16:40:36",
+        "has_contract": false
+      },
+      {
+        "id": "18b5455e",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A006",
+        "assignee_name": "Robert",
+        "title": "【DEFINE阶段】编写模块Spec — 负责M6+M8",
+        "created": "2026-07-24 16:27:59",
+        "updated": "2026-07-24 16:36:55",
+        "has_contract": false
+      },
+      {
+        "id": "5ee012d0",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "【DEFINE阶段】编写测试计划Spec — 负责全模块测试规划",
+        "created": "2026-07-24 16:27:59",
+        "updated": "2026-07-24 16:31:08",
+        "has_contract": false
+      },
+      {
+        "id": "f0e65f83",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: 【DEFINE阶段】编写模块Spec — 负责M1+M2+M9",
+        "created": "2026-07-24 16:32:22",
+        "updated": "2026-07-24 16:33:23",
+        "has_contract": false
+      },
+      {
+        "id": "509f2d29",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: 【DEFINE阶段】编写模块Spec — 负责M6+M8",
+        "created": "2026-07-24 16:34:32",
+        "updated": "2026-07-24 16:36:55",
+        "has_contract": false
+      },
+      {
+        "id": "005470f7",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: 【DEFINE阶段】编写模块Spec — 负责M3+M4+M5+M7",
+        "created": "2026-07-24 16:38:04",
+        "updated": "2026-07-24 16:40:36",
+        "has_contract": false
+      },
+      {
+        "id": "161e1ded",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: Phase 1 DEFINE - 各模块规格定义",
+        "created": "2026-07-24 16:44:09",
+        "updated": "2026-07-24 16:45:03",
+        "has_contract": false
+      },
+      {
+        "id": "41d86ff8",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A003",
+        "assignee_name": "青岚",
+        "title": "Phase 2 PLAN - 任务拆解与排期",
+        "created": "2026-07-24 16:45:35",
+        "updated": "2026-07-24 16:49:01",
+        "has_contract": false
+      },
+      {
+        "id": "95215986",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: Phase 2 PLAN - 任务拆解与排期",
+        "created": "2026-07-24 16:47:51",
+        "updated": "2026-07-24 16:49:01",
+        "has_contract": false
+      },
+      {
+        "id": "4a4de821",
+        "status": "cancelled",
+        "progress": 90,
+        "assignee": "A003",
+        "assignee_name": "青岚",
+        "title": "Phase 3 BUILD - 编码实现",
+        "created": "2026-07-24 16:49:40",
+        "updated": "2026-07-24 18:12:28",
+        "has_contract": false
+      },
+      {
+        "id": "e2f77db2",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A004",
+        "assignee_name": "潮汐",
+        "title": "## Phase 1: 工程搭建 + 核心引擎",
+        "created": "2026-07-24 16:51:18",
+        "updated": "2026-07-24 17:08:42",
+        "has_contract": false
+      },
+      {
+        "id": "eae23e54",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: ## Phase 1: 工程搭建 + 核心引擎",
+        "created": "2026-07-24 17:00:53",
+        "updated": "2026-07-24 17:08:42",
+        "has_contract": false
+      },
+      {
+        "id": "22f2d627",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A005",
+        "assignee_name": "AI蛋炒饭",
+        "title": "## Phase 2: 关卡 + 道具 + 动画 + 音效",
+        "created": "2026-07-24 17:01:35",
+        "updated": "2026-07-24 17:16:05",
+        "has_contract": false
+      },
+      {
+        "id": "422a605d",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: ## Phase 2: 关卡 + 道具 + 动画 + 音效",
+        "created": "2026-07-24 17:15:17",
+        "updated": "2026-07-24 17:16:05",
+        "has_contract": false
+      },
+      {
+        "id": "412dc339",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A006",
+        "assignee_name": "Robert",
+        "title": "## Phase 3: UI + 结算 + 排行",
+        "created": "2026-07-24 17:15:28",
+        "updated": "2026-07-24 17:45:34",
+        "has_contract": false
+      },
+      {
+        "id": "8cd4fa41",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: ## Phase 3: UI + 结算 + 排行",
+        "created": "2026-07-24 17:44:06",
+        "updated": "2026-07-24 17:45:34",
+        "has_contract": false
+      },
+      {
+        "id": "d7b17f1f",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A004",
+        "assignee_name": "潮汐",
+        "title": "## Phase 4: 性能优化",
+        "created": "2026-07-24 17:44:25",
+        "updated": "2026-07-24 18:12:07",
+        "has_contract": false
+      },
+      {
+        "id": "54567a7e",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "## Phase 4: 最终集成测试",
+        "created": "2026-07-24 17:44:50",
+        "updated": "2026-07-24 18:19:47",
+        "has_contract": false
+      },
+      {
+        "id": "04c25d1b",
+        "status": "closed",
+        "progress": 100,
+        "assignee": "A007",
+        "assignee_name": "麦麦",
+        "title": "VERIFY: ## Phase 4: 性能优化",
+        "created": "2026-07-24 18:10:47",
+        "updated": "2026-07-24 18:12:07",
+        "has_contract": false
+      }
+    ]
+  },
+  "tools": {
+    "top": [
+      [
+        "bash",
+        143
+      ],
+      [
+        "commit_turn",
+        126
+      ],
+      [
+        "read_file",
+        115
+      ],
+      [
+        "write_file",
+        90
+      ],
+      [
+        "browse",
+        65
+      ],
+      [
+        "get_tasks",
+        59
+      ],
+      [
+        "list_files",
+        42
+      ],
+      [
+        "edit_file",
+        32
+      ],
+      [
+        "update_progress",
+        25
+      ],
+      [
+        "submit_task",
+        25
+      ],
+      [
+        "review_task",
+        24
+      ],
+      [
+        "update_task_status",
+        23
+      ],
+      [
+        "read_work_logs",
+        22
+      ],
+      [
+        "list_available_skills",
+        20
+      ],
+      [
+        "read_skill",
+        17
+      ],
+      [
+        "send_message",
+        16
+      ],
+      [
+        "git_worktree_merge",
+        16
+      ],
+      [
+        "dispatch_task",
+        13
+      ],
+      [
+        "git_worktree_status",
+        13
+      ],
+      [
+        "claim_task",
+        12
+      ],
+      [
+        "start_dev_server",
+        12
+      ],
+      [
+        "waive_attestation",
+        10
+      ],
+      [
+        "git_worktree_checkpoint",
+        9
+      ],
+      [
+        "git_worktree_list",
+        9
+      ],
+      [
+        "view_org_chart",
+        8
+      ],
+      [
+        "create_directory",
+        8
+      ],
+      [
+        "check_agent_status",
+        7
+      ],
+      [
+        "grep",
+        7
+      ],
+      [
+        "apply_patch",
+        7
+      ],
+      [
+        "update_goals",
+        6
+      ],
+      [
+        "hire_agent",
+        5
+      ],
+      [
+        "get_platform_state",
+        5
+      ],
+      [
+        "search_files",
+        5
+      ],
+      [
+        "create_task",
+        4
+      ],
+      [
+        "ask_agent",
+        4
+      ],
+      [
+        "notify_agent",
+        4
+      ],
+      [
+        "read_roster",
+        3
+      ],
+      [
+        "todowrite",
+        3
+      ],
+      [
+        "save_charter",
+        2
+      ],
+      [
+        "list_subordinates",
+        2
+      ]
+    ],
+    "dismiss_agent": 0,
+    "hire_agent": 5,
+    "waive_attestation": 10,
+    "get_platform_state": 5,
+    "commit_turn": 126,
+    "review_task": 24,
+    "git_worktree_merge": 16,
+    "errors_by_tool": [
+      [
+        "bash",
+        19
+      ],
+      [
+        "read_file",
+        11
+      ],
+      [
+        "browse",
+        7
+      ],
+      [
+        "list_files",
+        6
+      ],
+      [
+        "start_dev_server",
+        5
+      ],
+      [
+        "git_worktree_merge",
+        4
+      ],
+      [
+        "write_file",
+        3
+      ],
+      [
+        "create_directory",
+        2
+      ],
+      [
+        "submit_task",
+        2
+      ],
+      [
+        "git_worktree_status",
+        2
+      ],
+      [
+        "review_task",
+        2
+      ],
+      [
+        "edit_file",
+        2
+      ],
+      [
+        "list_available_mcp",
+        1
+      ],
+      [
+        "send_message",
+        1
+      ]
+    ]
+  },
+  "inbox": {
+    "total": 221,
+    "prefixes": [
+      [
+        "TASK SUBMITTED",
+        46
+      ],
+      [
+        "TASK APPROVED",
+        44
+      ],
+      [
+        "TASK CLOSED",
+        44
+      ],
+      [
+        "MERGE PENDING",
+        10
+      ],
+      [
+        "POST-MERGE VERIFY",
+        10
+      ],
+      [
+        "TASK",
+        10
+      ],
+      [
+        "WAIT_CYCLE",
+        9
+      ],
+      [
+        "WAIT_TIMEOUT",
+        6
+      ],
+      [
+        "TASK STALL",
+        2
+      ],
+      [
+        "TASK ARCHIVED",
+        1
+      ]
+    ]
+  },
+  "waits": {
+    "total": 82,
+    "uncleared": 0,
+    "phases": {
+      "waiting": 77,
+      "blocked": 5
+    }
+  },
+  "chat_messages": 312,
+  "streaming_zombies": 0,
+  "work_log_types": {
+    "completion": 185,
+    "turn_result": 126,
+    "task_event": 90,
+    "discussion": 13,
+    "spec": 1,
+    "milestone": 1,
+    "error": 1,
+    "task_advance_deferred": 2
+  },
+  "dismiss_log": [],
+  "runs": {
+    "count": 186,
+    "status": {
+      "completed": 185,
+      "error": 1
+    }
+  },
+  "run_steps": 1030,
+  "review_approved_inbox": 44
+}

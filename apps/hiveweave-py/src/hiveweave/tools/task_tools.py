@@ -537,6 +537,7 @@ async def dispatch_task_tool(
         return ToolResult.err(coord_err)
 
     # Dedup: same assignee + similar title already open → reuse via taskId hint
+    cross_assignee_warning = ""
     if not params.task_id:
         try:
             dup = await TaskService().find_similar_open_task(
@@ -551,6 +552,20 @@ async def dispatch_task_tool(
                 )
         except Exception as e:
             log.warning("dispatch_dedup_check_failed", error=str(e))
+        # L4: cross-assignee duplicate warning (different assignee, similar title)
+        try:
+            cross_dup = await TaskService().find_similar_open_task(
+                project_id, params.task[:100], assignee_id=None
+            )
+            if cross_dup and cross_dup.get("assignee_id") != resolved_id:
+                cross_assignee_warning = (
+                    f" ⚠️ 注意：另一 agent 已有相似任务 "
+                    f"id={cross_dup['id']} assignee={cross_dup.get('assignee_id', '?')[:8]} "
+                    f"title={cross_dup.get('title', '')[:40]!r}。"
+                    f"确认不是重复派发？如需取消旧任务：cancel_task(taskId=\"{cross_dup['id']}\")。"
+                )
+        except Exception:
+            pass
 
     ds = DispatchService()
     result = await ds.dispatch_task(
@@ -577,7 +592,7 @@ async def dispatch_task_tool(
             f"Task dispatched to {result.get('to_agent_id', resolved_id)} "
             f"(task_id={result.get('task_id', '')})"
         )
-        return ToolResult.ok(output, task_id=result.get("task_id"))
+        return ToolResult.ok(output + cross_assignee_warning, task_id=result.get("task_id"))
     return ToolResult.err(result.get("message", "Dispatch failed"))
 
 
@@ -1542,17 +1557,34 @@ async def review_task_tool(
                 inbox = InboxService()
                 if decision == "approve":
                     from hiveweave.services.worktree_review import agent_worktree_path
+                    from hiveweave.services.org import OrgService
+                    from hiveweave.services.policy import infer_role_family
 
                     wt_path = await agent_worktree_path(assignee_id)
-                    msg = (
-                        f"[TASK APPROVED] Task '{task_after.get('title', '')[:60]}' "
-                        f"has been approved. Wait for your coordinator to "
-                        f"git_worktree_merge your worktree"
-                        f"{f' ({wt_path})' if wt_path else ''}. "
-                        f"VERIFY runs only AFTER merge lands on main — do not "
-                        f"self-verify. If merge conflicts, you will get rework "
-                        f"to rebase/merge main in YOUR worktree (not on main)."
-                    )
+                    # TEST16 P1-1: role-aware approve notification
+                    assignee_row = await OrgService().get_agent(assignee_id)
+                    family = infer_role_family(assignee_row or {})
+                    title = task_after.get('title', '')[:60]
+                    if family in ("coordinator", "ceo"):
+                        msg = (
+                            f"[TASK APPROVED] Task '{title}' has been approved. "
+                            f"You are the merge owner — please run "
+                            f"git_worktree_merge on your worktree"
+                            f"{f' ({wt_path})' if wt_path else ''} to land "
+                            f"changes on main. CEO may exercise merge fallback "
+                            f"if you stall. VERIFY runs after merge."
+                        )
+                    else:
+                        msg = (
+                            f"[TASK APPROVED] Task '{title}' has been approved. "
+                            f"Wait for your coordinator to git_worktree_merge "
+                            f"your worktree"
+                            f"{f' ({wt_path})' if wt_path else ''}. "
+                            f"VERIFY runs only AFTER merge lands on main — do "
+                            f"not self-verify. If merge conflicts, you will get "
+                            f"rework to rebase/merge main in YOUR worktree "
+                            f"(not on main)."
+                        )
                     priority = "normal"
                 else:
                     feedback = params.feedback or "No specific feedback provided."
@@ -1728,6 +1760,26 @@ async def _inject_merge_pending_wake(
     except Exception as e:
         log.warning(
             "merge_pending_wake_failed",
+            reviewer_id=reviewer_id,
+            task_id=tid,
+            error=str(e),
+        )
+
+    # TEST16 D2: create structured merge obligation in the ledger.
+    # Game tick will escalate to org parent if deadline passes unfulfilled.
+    try:
+        from hiveweave.services.obligation import ObligationLedger
+
+        await ObligationLedger().create(
+            project_id=project_id,
+            owner_agent_id=reviewer_id,
+            obligation_type="merge",
+            task_id=tid or None,
+            context={"short_id": short_id, "reason": reason},
+        )
+    except Exception as e:
+        log.warning(
+            "merge_obligation_create_failed",
             reviewer_id=reviewer_id,
             task_id=tid,
             error=str(e),
@@ -2377,11 +2429,19 @@ async def _spawn_post_approve_verify_task(
         description=(
             f"Mandatory post-merge verification for parent task {parent_id}.\n"
             "1. Work is already on MAIN (coordinator merged the worktree).\n"
-            "2. On the MAIN workspace only, run the project test suite "
-            "(npm test / pytest / etc.).\n"
-            "3. If the parent task touched user-visible screens, also run visual "
+            "2. SPECS CONSISTENCY (check first): if docs/ contains spec files, "
+            "verify the implementation matches them — dependency list, API "
+            "contract, data model. Mismatch = fail (or escalate if specs were "
+            "formally updated). 'It runs' is not acceptance.\n"
+            "3. On the MAIN workspace only, run the project test suite "
+            "(npm test / pytest / etc.). If the project has NO test framework, "
+            "write a throwaway verification script (bash + curl / node / python) "
+            "driving the code directly: happy path PLUS at least 2 edge/error "
+            "cases (invalid input, duplicate submission, inconsistent state). "
+            "Attach output, then delete the script.\n"
+            "4. If the parent task touched user-visible screens, also run visual "
             "acceptance on main.\n"
-            "4. submit_task with attestationIds from those runs.\n"
+            "5. submit_task with attestationIds from those runs.\n"
             "If checks fail, report blockers — do not silently pass.\n"
             f"Original implementer must NOT self-verify (was: {original_assignee})."
         ),
@@ -2389,7 +2449,8 @@ async def _spawn_post_approve_verify_task(
         assignee_id=qa_assignee,
         priority=1,
         acceptance_criteria=[
-            {"text": "Final version on main passes project tests", "required": True},
+            {"text": "Implementation matches docs/ specs (deps, API, data model)", "required": True},
+            {"text": "Final version on main passes project tests (or throwaway script with edge cases if no framework)", "required": True},
             {"text": "submit_task includes attestationIds", "required": True},
         ],
         parent_task_id=parent_id,

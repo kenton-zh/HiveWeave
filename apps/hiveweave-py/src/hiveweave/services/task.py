@@ -254,6 +254,13 @@ class TaskService:
         task_id = str(uuid.uuid4())
         policy_id = resolve_task_policy(title, tags, description)
 
+        # Normalize parent_task_id: agents may pass 8-char prefixes; always
+        # store the full UUID so downstream queries (siblings, umbrella) match.
+        if parent_task_id:
+            resolved_parent = await self.resolve_task_id(project_id, parent_task_id)
+            if resolved_parent:
+                parent_task_id = resolved_parent
+
         contract_blob = None
         if contract_json is not None:
             from hiveweave.services.task_contract import (
@@ -407,7 +414,8 @@ class TaskService:
                 )
         return n
 
-    async def _transition(self, project_id: str, task_id: str, target: str) -> None:
+    async def _transition(self, project_id: str, task_id: str, target: str,
+                          *, actor_id: str | None = None) -> None:
         """Validate and execute a status transition.
 
         Raises ValueError if the task is not found or the transition is illegal.
@@ -436,10 +444,10 @@ class TaskService:
                      "wait_kind = NULL, wake_at = NULL, updated_at = ? WHERE id = ?",
                      [target, now_ms, task_id]),
                     ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-                     "from_status, to_status, created_at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     "from_status, to_status, actor_id, created_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                      [event_id, project_id, task_id, f"task.{target}",
-                      current, target, now_ms]),
+                      current, target, actor_id, now_ms]),
                 ])
             except Exception as e:
                 # Prefer status transition over abort; then best-effort clear
@@ -452,10 +460,10 @@ class TaskService:
                     ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                      [target, now_ms, task_id]),
                     ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-                     "from_status, to_status, created_at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     "from_status, to_status, actor_id, created_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                      [event_id, project_id, task_id, f"task.{target}",
-                      current, target, now_ms]),
+                      current, target, actor_id, now_ms]),
                 ])
                 try:
                     await _execute(
@@ -475,16 +483,22 @@ class TaskService:
                 ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                  [target, now_ms, task_id]),
                 ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-                 "from_status, to_status, created_at) "
-                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 "from_status, to_status, actor_id, created_at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                  [event_id, project_id, task_id, f"task.{target}",
-                  current, target, now_ms]),
+                  current, target, actor_id, now_ms]),
             ])
         log.info("task_transition", task_id=task_id,
                  from_status=current, to_status=target)
 
+        # TEST17 fix: clear agent_waits referencing this task and wake waiters.
+        # wake_on=["task_transition"] was dead code — no production caller ever
+        # matched it. Wire it up here: any transition clears matching waits.
+        await self._clear_task_wait_contracts(project_id, task_id)
+
     async def _transition_multi(self, project_id: str, task_id: str,
-                               *targets: str) -> None:
+                               *targets: str,
+                               actor_id: str | None = None) -> None:
         """Validate and execute a multi-step transition atomically.
 
         Validates each step against _TRANSITIONS, then performs a single
@@ -515,14 +529,18 @@ class TaskService:
             ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
              [final, now_ms, task_id]),
             ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-             "from_status, to_status, created_at) "
-             "VALUES (?, ?, ?, ?, ?, ?, ?)",
+             "from_status, to_status, actor_id, created_at) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
              [event_id, project_id, task_id, f"task.{final}",
-              current, final, now_ms]),
+              current, final, actor_id, now_ms]),
         ])
         log.info("task_transition_multi", task_id=task_id,
                  from_status=current, through=list(targets[:-1]),
                  to_status=final)
+
+        # L2 fix: clear wait contracts on multi-step transitions too
+        # (rework path uses _transition_multi, waiters need to be woken)
+        await self._clear_task_wait_contracts(project_id, task_id)
 
     async def claim_task(self, project_id: str, task_id: str, agent_id: str) -> None:
         """Claim a task (created → claimed). Sets assignee_id + claimed_at.
@@ -547,7 +565,7 @@ class TaskService:
                 f"Only 'created' tasks can be claimed. "
                 f"If the task is running, continue working and submit_task when done."
             )
-        await self._transition(project_id, task_id, "claimed")
+        await self._transition(project_id, task_id, "claimed", actor_id=agent_id)
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
             "UPDATE tasks SET assignee_id = ?, claimed_at = ?, updated_at = ? "
@@ -653,7 +671,8 @@ class TaskService:
                 contract = ensure_slice_status(contract, "ready")
                 # Will flip to in_progress after transition succeeds
 
-        await self._transition(project_id, task_id, "running")
+        await self._transition(project_id, task_id, "running",
+                               actor_id=rows[0]["assignee_id"])
         agent_id = rows[0]["assignee_id"]
 
         if task and task.get("contract_json"):
@@ -1020,7 +1039,8 @@ class TaskService:
                     evidence = dict(evidence)
                     evidence["machine_pre_run"] = contract["machine_pre_run"]
 
-        await self._transition(project_id, task_id, "submitted")
+        await self._transition(project_id, task_id, "submitted",
+                               actor_id=(task or {}).get("assignee_id"))
         if isinstance(evidence, dict) and "merged_by" not in evidence:
             rows0 = await _query(
                 project_id, "SELECT evidence FROM tasks WHERE id = ?", [task_id]
@@ -1114,7 +1134,8 @@ class TaskService:
                            reviewer_id: str | None = None) -> None:
         """Start review (submitted → reviewing). Store reviewer_id for obligations."""
         task_id = await self.require_task_id(project_id, task_id)
-        await self._transition(project_id, task_id, "reviewing")
+        await self._transition(project_id, task_id, "reviewing",
+                               actor_id=reviewer_id)
         if reviewer_id:
             now_ms = int(time.time() * 1000)
             await _execute(project_id,
@@ -1164,7 +1185,8 @@ class TaskService:
                     f"Illegal transition: {current_status} → approved"
                 )
             # reviewing → approved
-            await self._transition(project_id, task_id, "approved")
+            await self._transition(project_id, task_id, "approved",
+                                   actor_id=reviewer_id)
             await _execute(project_id,
                 "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
                 [json.dumps(evidence), now_ms, task_id])
@@ -1212,7 +1234,8 @@ class TaskService:
                 raise ValueError(
                     f"Illegal transition: {current_status} → rework"
                 )
-            await self._transition_multi(project_id, task_id, "rework", "running")
+            await self._transition_multi(project_id, task_id, "rework", "running",
+                                         actor_id=reviewer_id)
             await _execute(project_id,
                 "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
                 [json.dumps(evidence), now_ms, task_id])
@@ -1263,6 +1286,13 @@ class TaskService:
     async def close_task(self, project_id: str, task_id: str) -> None:
         """Close a task (approved|verifying → closed). Sets closed_at."""
         task_id = await self.require_task_id(project_id, task_id)
+
+        # TEST16 P1-3: merge status check before close — stamp unmerged
+        # branches so project-level GO reports can detect incomplete merges.
+        task = await self.get_task(project_id, task_id)
+        if task and not self._is_verify_task(task):
+            await self._stamp_merge_status_on_close(project_id, task)
+
         await self._transition(project_id, task_id, "closed")
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
@@ -1280,6 +1310,117 @@ class TaskService:
         except Exception as e:
             log.warning(
                 "umbrella_parent_close_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+
+    async def _stamp_merge_status_on_close(
+        self, project_id: str, task: dict
+    ) -> None:
+        """Check if assignee branch is merged; stamp evidence if not."""
+        try:
+            from hiveweave.services.worktree_review import (
+                agent_worktree_path,
+                worktree_commits_ahead,
+                project_main_workspace,
+            )
+
+            assignee = task.get("assignee_id")
+            if not assignee:
+                return
+            wt = await agent_worktree_path(str(assignee))
+            main_ws = await project_main_workspace(project_id)
+            if not wt or not main_ws:
+                return
+            ahead = await worktree_commits_ahead(main_ws, wt)
+            if ahead and ahead > 0:
+                log.warning(
+                    "task.closed_with_unmerged_branch",
+                    task_id=task.get("id"),
+                    assignee_id=assignee,
+                    commits_ahead=ahead,
+                )
+                # Stamp evidence so project-level reports can detect this
+                ev = task.get("evidence")
+                if isinstance(ev, str):
+                    import json as _json
+                    try:
+                        ev = _json.loads(ev)
+                    except Exception:
+                        ev = {}
+                if not isinstance(ev, dict):
+                    ev = {}
+                ev["closed_with_unmerged_branch"] = True
+                ev["unmerged_commits_ahead"] = ahead
+                import json as _json
+                await _execute(
+                    project_id,
+                    "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+                    [_json.dumps(ev), int(time.time() * 1000), task["id"]],
+                )
+        except Exception as e:
+            log.warning(
+                "stamp_merge_status_failed",
+                task_id=task.get("id"),
+                error=str(e),
+            )
+
+    async def _clear_task_wait_contracts(
+        self, project_id: str, task_id: str
+    ) -> None:
+        """TEST17 fix: clear agent_waits referencing a task on any transition.
+
+        wake_on=["task_transition"] on agent_waits was dead code — no
+        production code ever matched it. This method wires it up: when a
+        task transitions, any agent waiting on that task (kind='task',
+        ref=task_id) gets their wait cleared and is triggered to resume.
+
+        Does NOT touch the trigger.py task_event filter (TEST3 busy-wait
+        guard) — this is a targeted wake for explicit waiters only.
+        """
+        try:
+            now_ms = int(time.time() * 1000)
+            rows = await _query(
+                project_id,
+                "SELECT id, agent_id FROM agent_waits "
+                "WHERE kind = 'task' AND ref = ? AND cleared_at IS NULL",
+                [task_id],
+            )
+            if not rows:
+                return
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            await _execute(
+                project_id,
+                f"UPDATE agent_waits SET cleared_at = ? "
+                f"WHERE id IN ({placeholders})",
+                [now_ms] + ids,
+            )
+            log.info(
+                "task_wait_contracts_cleared",
+                project_id=project_id,
+                task_id=task_id,
+                cleared=len(ids),
+                agents=[r["agent_id"] for r in rows],
+            )
+            # Trigger each waiting agent to resume
+            for row in rows:
+                agent_id = row["agent_id"]
+                try:
+                    from hiveweave.agents.trigger import trigger_subordinate
+
+                    await trigger_subordinate(agent_id)
+                except Exception as e:
+                    log.warning(
+                        "task_wait_wake_trigger_failed",
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        error=str(e),
+                    )
+        except Exception as e:
+            log.warning(
+                "clear_task_wait_contracts_failed",
+                project_id=project_id,
                 task_id=task_id,
                 error=str(e),
             )
@@ -1399,7 +1540,10 @@ class TaskService:
             # 根因修复：归档时同步置终态 status='cancelled'，避免
             # archived=1 但 status 停留在 verifying/submitted 等非终态
             # 导致数据矛盾（直接查 DB / task_events 审计 / 外部脚本困惑）
+            # P2-3: reset progress to 0 — cancelled tasks must not retain
+            # stale progress (e.g. 90 from submitted state).
             ("UPDATE tasks SET is_archived = 1, status = 'cancelled', "
+            "progress = 0, "
             "archived_by = ?, archived_reason = ?, archived_at = ?, "
             "wake_at = NULL, updated_at = ? WHERE id = ?",
             [archived_by, reason[:500], now_ms, now_ms, task_id]),
@@ -1462,6 +1606,46 @@ class TaskService:
                             error=str(e),
                         )
 
+        # L3: clear wait contracts referencing this task (waiters must wake)
+        await self._clear_task_wait_contracts(project_id, task_id)
+
+        # L1: detect reverse dependents — tasks whose depends_on contains
+        # this task will have a dangling reference (cancelled ∉ completed).
+        # Log warning + cancel obligations so downstream doesn't silently hang.
+        try:
+            dependents = await _query(
+                project_id,
+                "SELECT id, title, status FROM tasks "
+                "WHERE is_archived = 0 AND status NOT IN ('closed', 'cancelled') "
+                "AND depends_on IS NOT NULL AND depends_on != '[]'",
+            )
+            dangling = []
+            for dep in dependents:
+                deps_raw = dep.get("depends_on") or "[]"
+                try:
+                    deps_list = json.loads(deps_raw) if isinstance(deps_raw, str) else deps_raw
+                except (json.JSONDecodeError, TypeError):
+                    deps_list = []
+                if task_id in (deps_list or []):
+                    dangling.append(dep)
+            if dangling:
+                log.warning(
+                    "task_archived_dangling_dependents",
+                    project_id=project_id,
+                    task_id=task_id,
+                    dependents=[d["id"] for d in dangling],
+                )
+        except Exception as e:
+            log.warning("archive_reverse_dep_check_failed", error=str(e))
+
+        # Cancel pending obligations for this task
+        try:
+            from hiveweave.services.obligation import ObligationLedger
+
+            await ObligationLedger().cancel_for_task(project_id, task_id)
+        except Exception:
+            pass
+
         return current
 
     async def reassign_task(
@@ -1493,13 +1677,16 @@ class TaskService:
         old = task.get("assignee_id")
         new_status = status
         if status == "created":
-            await self._transition(project_id, task_id, "claimed")
+            await self._transition(project_id, task_id, "claimed",
+                                   actor_id=reassigned_by)
             new_status = "claimed"
         elif status == "submitted":
-            await self._transition(project_id, task_id, "running")
+            await self._transition(project_id, task_id, "running",
+                                   actor_id=reassigned_by)
             new_status = "running"
         elif status == "blocked":
-            await self._transition(project_id, task_id, "running")
+            await self._transition(project_id, task_id, "running",
+                                   actor_id=reassigned_by)
             new_status = "running"
         elif status == "reviewing":
             # reviewing has no direct → claimed; force for reassignment

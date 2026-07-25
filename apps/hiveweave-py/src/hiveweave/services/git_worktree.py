@@ -576,13 +576,36 @@ coverage/
         # Always prune when the target is not a valid worktree.
         if Path(path).exists():
             if not _force_clear_path(path):
-                return {
-                    "success": False,
-                    "message": (
-                        f"Failed to create worktree: stale path locked "
-                        f"and could not be cleared: {path}"
-                    ),
-                }
+                # TEST16 P0-2: stale path locked (Windows node_modules etc.)
+                # — try alternate directory name instead of hard-failing.
+                for suffix in ("-b", "-c", "-d"):
+                    alt = path + suffix
+                    # L5: if alt already exists as a valid worktree, reuse it
+                    # (idempotent — prevents -c/-d proliferation when -b is healthy)
+                    if _has_git(alt):
+                        log.info(
+                            "git_worktree.stale_path_reuse_existing",
+                            original=path,
+                            reuse=alt,
+                        )
+                        path = alt
+                        break
+                    if not Path(alt).exists():
+                        log.warning(
+                            "git_worktree.stale_path_fallback",
+                            original=path,
+                            fallback=alt,
+                        )
+                        path = alt
+                        break
+                else:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Failed to create worktree: stale path locked "
+                            f"and could not be cleared: {path}"
+                        ),
+                    }
         await _git(["worktree", "prune"], workspace_path)
 
         fwd_path = path.replace("\\", "/")
@@ -820,6 +843,119 @@ coverage/
             return compute_branch_name(short_id, task_id)
         return _branch_name(short_id, task_name or "task")
 
+    async def _validate_merge_preconditions(
+        self, workspace_path: str, short_id: str, branch: str,
+        target_branch: str = "main",
+    ) -> dict | None:
+        """D3 precondition gate: validate worktree health before merge.
+
+        Prevents the TEST16 D3 scenario where a husk worktree (no branch,
+        no .git) gets "merged" via file copy, producing orphan commits.
+
+        Checks 1-3 only apply when the worktree directory EXISTS on disk.
+        If the directory is absent the branch may still be mergeable from
+        the main repo (e.g. worktree removed but branch preserved).
+
+        Returns None if all preconditions pass (caller should proceed),
+        or a dict result to return early (error or no-op success).
+        """
+        path = _worktree_path(workspace_path, short_id)
+
+        # Checks 1-3: only relevant when the worktree directory exists.
+        # A missing directory is NOT an error — the branch can still be
+        # merged from the main repo (worktree deleted, branch preserved).
+        if Path(path).is_dir():
+            # 1. Source directory must have .git (file or dir)
+            if not _has_git(path):
+                log.warning(
+                    "git_worktree.merge_precondition_no_git",
+                    short_id=short_id, path=path, branch=branch,
+                )
+                return {
+                    "success": False,
+                    "reason": "precondition_failed",
+                    "message": (
+                        f"Merge precondition failed: worktree directory for "
+                        f"{short_id} has no .git (husk detected at {path}). "
+                        f"This worktree is corrupted. Trigger worktree repair "
+                        f"(re-create + reattach) before merging."
+                    ),
+                    "branch": branch,
+                }
+
+            # 2. Source directory must be a registered worktree
+            ok_wl, wl_out = await _git(["worktree", "list"], workspace_path)
+            if ok_wl:
+                norm_path = os.path.normcase(str(Path(path)))
+                registered = any(
+                    os.path.normcase(line.split()[0]) == norm_path
+                    for line in (wl_out or "").splitlines()
+                    if line.strip()
+                )
+                if not registered:
+                    log.warning(
+                        "git_worktree.merge_precondition_not_registered",
+                        short_id=short_id, path=path, branch=branch,
+                    )
+                    return {
+                        "success": False,
+                        "reason": "precondition_failed",
+                        "message": (
+                            f"Merge precondition failed: worktree directory "
+                            f"for {short_id} ({path}) is not registered in "
+                            f"'git worktree list'. The worktree metadata is "
+                            f"missing. Trigger worktree repair (re-create + "
+                            f"reattach) before merging."
+                        ),
+                        "branch": branch,
+                    }
+
+            # 3. Source must have a registered branch (not detached HEAD)
+            actual_branch = await _current_branch(path)
+            if not actual_branch:
+                log.warning(
+                    "git_worktree.merge_precondition_detached_head",
+                    short_id=short_id, path=path, branch=branch,
+                )
+                return {
+                    "success": False,
+                    "reason": "precondition_failed",
+                    "message": (
+                        f"Merge precondition failed: worktree for {short_id} "
+                        f"({path}) is in detached HEAD state (no branch "
+                        f"checked out). Cannot merge without a branch. "
+                        f"Trigger worktree repair (re-create + reattach) "
+                        f"before merging."
+                    ),
+                    "branch": branch,
+                }
+
+        # 4. Source must be ahead of target — ahead == 0 is a no-op success
+        ok_ahead, ahead_out = await _git(
+            ["rev-list", "--count", f"{target_branch}..{branch}"],
+            workspace_path,
+        )
+        if ok_ahead and (ahead_out or "").strip() == "0":
+            log.info(
+                "git_worktree.merge_precondition_noop",
+                short_id=short_id, branch=branch, target=target_branch,
+            )
+            return {
+                "success": True,
+                "merged": False,
+                "already_up_to_date": True,
+                "message": (
+                    f"No-op merge: branch {branch} has 0 commits ahead of "
+                    f"{target_branch} — nothing to merge. The worktree is "
+                    f"already up to date with {target_branch}."
+                ),
+                "branch": branch,
+                "ahead": 0,
+                "short_id": short_id,
+            }
+
+        return None
+
     async def merge(self, workspace_path: str, short_id: str,
                     task_name: str | None = None,
                     target_branch: str = "main", *,
@@ -839,24 +975,12 @@ coverage/
             workspace_path, short_id, task_name, task_id
         )
 
-        # TEST13 P1-2: refuse merging a branch with zero commits ahead of target
-        ok_ahead, ahead_out = await _git(
-            ["rev-list", "--count", f"{target_branch}..{branch}"],
-            workspace_path,
+        # D3 precondition validation: reject husk/corrupted worktrees early
+        precond = await self._validate_merge_preconditions(
+            workspace_path, short_id, branch, target_branch
         )
-        if ok_ahead and (ahead_out or "").strip() == "0":
-            return {
-                "success": False,
-                "message": (
-                    f"Refuse merge: branch {branch} has 0 commits ahead of "
-                    f"{target_branch}. Commit in the agent worktree first "
-                    f"(git_worktree_checkpoint). Do NOT copy files to project "
-                    f"root for attestation — use attest_doc_review "
-                    f"source=worktree / auto."
-                ),
-                "branch": branch,
-                "ahead": 0,
-            }
+        if precond is not None:
+            return precond
 
         ok, _ = await _git(["checkout", target_branch], workspace_path)
         if not ok:
@@ -1013,6 +1137,16 @@ coverage/
         import json as _json
         from pathlib import Path as _Path
 
+        # D3 precondition validation: reject husk/corrupted worktrees early
+        parts = branch.split("/", 2)
+        short_id = parts[1] if len(parts) >= 2 else ""
+        if short_id:
+            precond = await self._validate_merge_preconditions(
+                workspace_path, short_id, branch, target_branch
+            )
+            if precond is not None:
+                return precond
+
         # Step 0: Fetch latest target_branch
         ok, _ = await _git(["checkout", target_branch], workspace_path)
         if not ok:
@@ -1022,8 +1156,6 @@ coverage/
         await _auto_checkpoint_dirty_target(workspace_path, target_branch)
 
         # Step 1: Rebase worktree branch onto target_branch to minimize conflicts
-        parts = branch.split("/", 2)
-        short_id = parts[1] if len(parts) >= 2 else ""
         wt_path = _worktree_path(workspace_path, short_id) if short_id else ""
 
         if wt_path and _Path(wt_path).is_dir():
@@ -1887,6 +2019,27 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
         else:
             report["errors"].append(f"git worktree prune failed: {out_p}")
 
+    # ①.5 TEST16 P0-2: husk detection — registered + dir exists but no .git
+    # (e.g. node_modules-only shell after failed stale cleanup).
+    husks = [
+        e for e in entries
+        if WORKTREE_DIR in e["path"].replace("\\", "/")
+        and Path(e["path"]).is_dir()
+        and not (Path(e["path"]) / ".git").exists()
+    ]
+    if husks:
+        report["husk_dirs"] = [e["path"] for e in husks]
+        log.warning(
+            "git_worktree.reconcile_husks_detected",
+            workspace=workspace_path,
+            husks=[e["path"] for e in husks],
+        )
+        # Prune husks from registry so they don't block future creates
+        ok_h, _ = await _git(["worktree", "prune"], workspace_path)
+        if ok_h:
+            entries = [e for e in entries if e not in husks]
+            report["pruned"] += len(husks)
+
     # ② 磁盘 → 注册表: 未注册的孤儿目录 → rmtree
     # TEST3: never rmtree dirs that still belong to active executors / open tasks
     # (git registry desync must not erase in-flight work). Prefer reattach.
@@ -2122,7 +2275,12 @@ async def ensure_executor_worktree(
                 "message": "worktree healthy after create race",
             }
         try:
-            await org.update_agent(agent_id, {"worktree_error": err})
+            await org.update_agent(agent_id, {
+                "worktree_error": err,
+                "workspace_path": None,  # TEST16 P0-2: clear stale path so
+                # next lazy-create allocates a fresh dir instead of
+                # repeatedly hitting the same locked path.
+            })
         except Exception:
             pass
         return {"success": False, "message": err, "short_id": short_id}

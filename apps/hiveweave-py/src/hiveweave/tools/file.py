@@ -563,7 +563,8 @@ class ListFilesParams(BaseModel):
         default=1,
         ge=1,
         le=3,
-        description="Max depth when recursive (1-3). Default: 1.",
+        description="Max depth when recursive (1-3). Default: 1. Values above 3 "
+        "are clamped to 3 — deeper recursion is not supported.",
     )
     include_ignored: bool = Field(
         default=False,
@@ -617,7 +618,8 @@ async def write_file_tool(params: WriteFileParams, agent_id: str, workspace: str
     "list_files",
     "Lists files and directories. Empty path lists your workspace; other paths "
     "may point anywhere under the project root (e.g. ../ for main, "
-    "../peerId/ for a sibling worktree).",
+    "../peerId/ for a sibling worktree). When recursive=true, maxdepth controls "
+    "how many levels to descend — capped at 3 (values above 3 are clamped to 3).",
     requires_workspace=True,
     security_level="file_op",
 )

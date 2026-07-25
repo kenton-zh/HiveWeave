@@ -294,6 +294,15 @@ async def _send_message_core(
             to_agent_id=target["id"],
             content=message,
         )
+        # BUG-035 fix: Record for recipient so their team comms panel
+        # shows incoming messages with clean content (not just trigger
+        # digest side-effects with raw JSON format).
+        await team_chat.record_message(
+            agent_id=target["id"],
+            from_agent_id=agent_id,
+            to_agent_id=target["id"],
+            content=message,
+        )
         # BUG-022 fix: do NOT trigger here -- the target agent's
         # inbox watcher polls every 5 s and triggers autonomously.
 

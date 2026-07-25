@@ -531,6 +531,29 @@ PROJECT_DB_TABLES = [
         dismissed_at INTEGER NOT NULL
     )
     """,
+    # TEST16 P1-2: atomic dedupe — window_bucket enables UNIQUE constraint
+    # so INSERT OR IGNORE replaces check-then-act (TOCTOU race).
+    """ALTER TABLE team_chat_dedupe ADD COLUMN window_bucket INTEGER""",
+    # TEST16 D2: Obligation Ledger — structured obligations with deadlines
+    # and escalation. Replaces pure message-driven "hope they read inbox"
+    # coordination for merge/review/verify duties.
+    """
+    CREATE TABLE IF NOT EXISTS obligations (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        owner_agent_id TEXT NOT NULL,
+        obligation_type TEXT NOT NULL,
+        task_id TEXT,
+        context_json TEXT DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL,
+        deadline INTEGER NOT NULL,
+        fulfilled_at INTEGER,
+        escalated_to TEXT,
+        escalated_at INTEGER,
+        escalation_count INTEGER DEFAULT 0
+    )
+    """,
 ]
 
 # ── Meta DB 索引 ────────────────────────────────────────────
@@ -574,4 +597,10 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_staffing_demands_open ON staffing_demands(project_id, status) WHERE status = 'open'",
     "CREATE INDEX IF NOT EXISTS idx_org_dismiss_log_project_day ON org_dismiss_log(project_id, game_day)",
     "CREATE INDEX IF NOT EXISTS idx_org_dismiss_log_role ON org_dismiss_log(project_id, role_key, game_day)",
+    # TEST16 P1-2: atomic dedupe — UNIQUE constraint enables INSERT OR IGNORE
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_team_chat_dedupe_atomic ON team_chat_dedupe(agent_id, dedupe_key, window_bucket)",
+    # TEST16 D2: Obligation Ledger indexes
+    "CREATE INDEX IF NOT EXISTS idx_obligations_pending ON obligations(project_id, status, deadline) WHERE status = 'pending'",
+    "CREATE INDEX IF NOT EXISTS idx_obligations_owner ON obligations(owner_agent_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_obligations_task ON obligations(task_id, obligation_type)",
 ]

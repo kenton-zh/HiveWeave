@@ -1014,8 +1014,22 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     // messages and strips out role="team" entries, so filtering it for team
     // messages would always yield an empty list.
     const team = messages.filter((m) => isTeamChannelMessage(m));
+    // BUG-035: Dedup trigger digests that have a corresponding clean
+    // role='team' record (symmetric write). If a role='team' message exists
+    // with the same from/to pair within 60s, hide the raw trigger digest.
+    const teamRoleMsgs = team.filter((m) => m.role === "team");
+    const dedupedTeam = team.filter((m) => {
+      // Only filter trigger digests (isBackground user messages)
+      if (!(m.isBackground && m.role === "user")) return true;
+      // Check if a clean team message covers this digest
+      return !teamRoleMsgs.some((t) =>
+        t.teamFromAgentId === m.teamFromAgentId &&
+        t.teamToAgentId === m.teamToAgentId &&
+        Math.abs(t.timestamp - m.timestamp) < 60_000
+      );
+    });
     const direct = displayMessages.filter((m) => !isTeamChannelMessage(m));
-    return { directMessages: direct, teamMessages: team };
+    return { directMessages: direct, teamMessages: dedupedTeam };
   }, [messages, displayMessages]);
 
   const counterpartIds = useMemo(() => {

@@ -639,6 +639,22 @@ async def git_worktree_merge_tool(
     files = result.get("files") or result.get("conflicts")
 
     if result.get("success"):
+        # TEST16 D2: fulfill merge obligation — merge landed, stop escalation
+        try:
+            from hiveweave.services.obligation import ObligationLedger
+
+            if params.task_id:
+                await ObligationLedger().fulfill(
+                    project_id, params.task_id, "merge"
+                )
+            else:
+                # No task_id — fulfill by owner (the caller did the merge)
+                await ObligationLedger().fulfill_by_owner(
+                    project_id, agent_id, "merge"
+                )
+        except Exception as e:
+            log.warning("merge_obligation_fulfill_failed", error=str(e))
+
         # 残留冲突标记路由: merge 成功 ≠ main 干净 — 命中则给被合并
         # worktree 的 owner 建清理任务。任何失败只降级为警告文本,
         # 绝不影响已完成的 merge。
