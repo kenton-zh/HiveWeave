@@ -27,7 +27,7 @@ jobs:
         run: uv run mypy src/hiveweave/ --ignore-missing-imports
 
       - name: Run pytest
-        run: uv run pytest tests/ -v
+        run: timeout 120 uv run pytest tests/ -q
 
       - name: Verify docs/stats.json is up to date
         working-directory: .
@@ -36,9 +36,6 @@ jobs:
   frontend-build:
     name: Frontend Build
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/web
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,13 +50,13 @@ jobs:
         with:
           node-version: '22'
           cache: pnpm
-          cache-dependency-path: apps/web/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Build
-        run: pnpm build
+        run: pnpm --filter @hiveweave/web build
 
   security-audit:
     name: Security Audit

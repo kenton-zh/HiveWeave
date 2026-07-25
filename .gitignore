@@ -107,7 +107,8 @@ after-select.yaml
 erl_crash.dump
 
 # Design docs (local only)
-docs/
+docs/*
+!docs/stats.json
 
 # Third-party skill sources
 .opencode/skills-sources/
