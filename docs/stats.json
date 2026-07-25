@@ -1,0 +1,14 @@
+{
+  "api_routes": 123,
+  "api_modules": 16,
+  "tools": 79,
+  "real_seconds_per_game_day": 3600,
+  "game_day_description": "1 real hour = 1 game day",
+  "source_loc": {
+    "backend_python": 60080,
+    "frontend_ts": 11219,
+    "tests": 18816,
+    "frontend_tests": 525
+  },
+  "test_to_source_ratio": 0.271
+}
