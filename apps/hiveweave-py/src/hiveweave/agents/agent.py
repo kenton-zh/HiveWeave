@@ -87,7 +87,89 @@ ERROR_RESUME_COOLDOWN_S = 30.0
 """可恢复 LLM 错误后的短冷却。"""
 
 RATE_LIMIT_RESUME_COOLDOWN_S = 120.0
-"""429 / AccountRateLimit 耗尽后的独立冷却（不计入放弃计数）。"""
+"""429 soft cooldown floor（不计入放弃计数）。"""
+
+RATE_LIMIT_SOFT_MAX_S = 600.0
+"""reset ≤ 10min → soft cooldown; beyond → hard quota park."""
+
+RATE_LIMIT_BACKOFF_STEPS_S = (120.0, 600.0, 1800.0)
+"""No reset header: exponential soft cooldown; 3rd → escalate + park."""
+
+RATE_LIMIT_SOFT_STREAK_ESCALATE = 3
+"""Soft 429s without recovery → escalate superior + park."""
+
+# P0-3: Cross-turn stall break ledger — tracks STALL BREAK events per agent
+# across turns. 2nd break within the window → park + escalate to org parent.
+STALL_BREAK_WINDOW_MS = 30 * 60 * 1000  # 30 min window for counting breaks
+STALL_BREAK_PARK_THRESHOLD = 2           # 2nd break → park + escalate
+# TEST21 M6: don't park if a successful run finished within this window
+STALL_BREAK_RECENT_OK_MS = 5 * 60 * 1000
+_stall_break_ledger: dict[str, list[int]] = {}  # agent_id → [timestamp_ms, …]
+
+
+def _turn_has_substantial_progress(
+    tool_calls: list | None,
+    tasks_advanced: set | list | None = None,
+) -> bool:
+    """True when this turn produced mutating work (not pure readonly spin).
+
+    TEST21 M6: "spin 过但最终有产出" must not count toward cross-turn park.
+    """
+    if tasks_advanced:
+        return True
+    if not tool_calls:
+        return False
+    try:
+        from hiveweave.llm.streamer import DOOM_LOOP_READONLY_TOOLS
+    except Exception:
+        DOOM_LOOP_READONLY_TOOLS = frozenset()
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        name = str(tc.get("name") or tc.get("tool") or "").strip()
+        if name and name not in DOOM_LOOP_READONLY_TOOLS:
+            return True
+    return False
+
+
+async def _recent_successful_run_ms(
+    agent_id: str, *, exclude_after_ms: int | None = None
+) -> int | None:
+    """Return ended_at (ms) of the latest completed agent_run, or None."""
+    try:
+        from hiveweave.db import project as project_db
+
+        # project.query_one routes by agent_id → per-project DB
+        row = await project_db.query_one(
+            agent_id,
+            "SELECT ended_at FROM agent_runs "
+            "WHERE agent_id = ? AND status = 'completed' AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT 1",
+            [agent_id],
+        )
+        if not row:
+            return None
+        ended = row["ended_at"]
+        if ended is None:
+            return None
+        ended_i = int(ended)
+        if exclude_after_ms is not None and ended_i >= exclude_after_ms:
+            # Current turn just finishing — look one further back
+            row2 = await project_db.query_one(
+                agent_id,
+                "SELECT ended_at FROM agent_runs "
+                "WHERE agent_id = ? AND status = 'completed' AND ended_at IS NOT NULL "
+                "AND ended_at < ? "
+                "ORDER BY ended_at DESC LIMIT 1",
+                [agent_id, exclude_after_ms],
+            )
+            if not row2:
+                return None
+            ended2 = row2["ended_at"]
+            return int(ended2) if ended2 is not None else None
+        return ended_i
+    except Exception:
+        return None
 
 
 def is_rate_limit_error(error: BaseException | None) -> bool:
@@ -247,7 +329,9 @@ class Agent:
         self._progress_fingerprint: str | None = None
         self._no_progress_streak: int = 0
         self._empty_done_slice_streak: int = 0
+        self._last_stall_break_ms: int = 0  # P0-3: mutual exclusion with task_stall_nudge
         self._stream_timeout_streak: int = 0
+        self._rate_limit_streak: int = 0  # soft 429s before hard park / escalate
         self.visibility: str = "foreground"  # foreground|background|system
         self._MERGE_WINDOW_MS = 300  # P1: coalesce trigger wakes
 
@@ -998,7 +1082,22 @@ class Agent:
                     await self._handle_completion(result, message, opts)
                 else:
                     error_msg = result.get("error") or "Unknown LLM error"
-                    await self._handle_error(ValueError(error_msg))
+                    err_status = result.get("error_status")
+                    err_headers = result.get("error_headers")
+                    if err_status == 429 or (
+                        isinstance(err_headers, dict) and err_headers
+                    ):
+                        from hiveweave.llm.retry import RetryableError
+
+                        await self._handle_error(
+                            RetryableError(
+                                error_msg,
+                                status=err_status if isinstance(err_status, int) else 429,
+                                headers=err_headers if isinstance(err_headers, dict) else {},
+                            )
+                        )
+                    else:
+                        await self._handle_error(ValueError(error_msg))
 
                 break
 
@@ -1599,6 +1698,13 @@ class Agent:
                 sent_to = await self._inbox.get_sent_recipients_since(
                     self.id, reply_window_ms
                 )
+                import time as _time
+
+                since_30min = int(_time.time() * 1000) - 30 * 60 * 1000
+                sent_30min = await self._inbox.get_sent_recipients_since(
+                    self.id, since_30min
+                )
+                sent_to = list(set(sent_to) | set(sent_30min))
                 replied_contracts = await self._inbox.get_replied_contracts_since(
                     self.id, reply_window_ms
                 )
@@ -1704,6 +1810,16 @@ class Agent:
             )
 
         tasks_advanced = self._task_ids_advanced_this_turn(tool_calls)
+        worktree_uncommitted = False
+        try:
+            from hiveweave.services.turn_exit import agent_worktree_has_uncommitted
+
+            worktree_uncommitted = await agent_worktree_has_uncommitted(
+                self.id, self.project_id
+            )
+        except Exception as e:
+            log.debug("turn_exit_worktree_check_failed", error=str(e))
+
         exit_decision = evaluate_turn_exit(
             ExitContext(
                 agent_id=self.id,
@@ -1716,12 +1832,14 @@ class Agent:
                 messaged_refs=messaged_refs,
                 outbound_ask_refs=outbound_ask_refs,
                 name_by_id=name_by_id,
+                worktree_uncommitted=worktree_uncommitted,
             )
         )
 
         gate_retrigger_hint: str | None = None
         continue_slice = False
         carry_inbox_ids: list[str] | None = None
+        budget_exhausted = bool(result.get("budget_exhausted"))
 
         # Progress fingerprint for no-progress circuit breaker
         fp = self._compute_progress_fingerprint(
@@ -1967,7 +2085,17 @@ class Agent:
         self._resume_cooldown_until = 0.0
         self._consecutive_errors = 0
         self._stream_timeout_streak = 0
+        self._rate_limit_streak = 0
         self._clear_resume_suppressed(reason="turn_ok")
+        # TEST21 M5: recovered → resume task-stall nudges
+        try:
+            from hiveweave.services.task import TaskService
+
+            await TaskService().clear_owner_parked_for_agent(
+                self.project_id, self.id
+            )
+        except Exception as e:
+            log.debug("clear_owner_parked_on_ok_failed", error=str(e))
 
         # 3.5 持久化裁剪旧工具输出（OpenCode prune 模式）
         try:
@@ -2040,10 +2168,205 @@ class Agent:
                 error=str(e),
             )
 
-        # 8. Repair once OR one progress slice OR hook nudge — never unlimited
-        if gate_retrigger_hint:
+        # 8. P0-3: Cross-turn stall break ledger — 2nd STALL BREAK parks + escalates
+        # TEST21 M6: forgive breaks on turns with substantial progress; before
+        # parking re-check recent successful run; escalation messages state
+        # facts only (no reassign/dismiss prescription).
+        _stall_parked = False
+        if result.get("stall_break"):
+            import time as _time
+
+            now_ms = int(_time.time() * 1000)
+            self._last_stall_break_ms = now_ms
+            had_progress = _turn_has_substantial_progress(
+                tool_calls, tasks_advanced
+            )
+            if had_progress:
+                log.info(
+                    "stall_break_forgiven",
+                    agent_id=self.id,
+                    reason="substantial_progress",
+                )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.stall_break_forgiven(self.id, reason="progress")
+                except Exception:
+                    pass
+            else:
+                breaks = _stall_break_ledger.setdefault(self.id, [])
+                # Prune old entries outside the window
+                breaks[:] = [
+                    t for t in breaks if now_ms - t < STALL_BREAK_WINDOW_MS
+                ]
+                breaks.append(now_ms)
+                if len(breaks) >= STALL_BREAK_PARK_THRESHOLD:
+                    recent_ok = await _recent_successful_run_ms(
+                        self.id, exclude_after_ms=now_ms
+                    )
+                    recent_ok_alive = (
+                        recent_ok is not None
+                        and now_ms - recent_ok < STALL_BREAK_RECENT_OK_MS
+                    )
+                    if recent_ok_alive:
+                        log.info(
+                            "stall_break_park_deferred",
+                            agent_id=self.id,
+                            reason="recent_successful_run",
+                            recent_ok_ms=recent_ok,
+                            break_count=len(breaks),
+                        )
+                        try:
+                            from hiveweave.services.telemetry import telemetry
+
+                            telemetry.stall_break_forgiven(
+                                self.id, reason="recent_ok_run"
+                            )
+                        except Exception:
+                            pass
+                        # Drop the just-appended break so we don't immediately
+                        # re-trip on the next empty spin after a real run.
+                        if breaks:
+                            breaks.pop()
+                    else:
+                        _stall_parked = True
+                        self.disposition = "blocked"
+                        log.warning(
+                            "stall_break_parked",
+                            agent_id=self.id,
+                            break_count=len(breaks),
+                            window_ms=STALL_BREAK_WINDOW_MS,
+                        )
+                        try:
+                            from hiveweave.services.telemetry import telemetry
+
+                            telemetry.stall_break_parked(self.id)
+                        except Exception:
+                            pass
+                        # TEST21 M5: mute task-stall while parked
+                        try:
+                            from hiveweave.services.task import TaskService
+
+                            ts = TaskService()
+                            open_ids = [
+                                str(t["id"])
+                                for t in (
+                                    await ts.list_tasks(
+                                        self.project_id, assignee_id=self.id
+                                    )
+                                    or []
+                                )
+                                if t.get("status")
+                                in (
+                                    "created",
+                                    "claimed",
+                                    "running",
+                                    "submitted",
+                                    "reviewing",
+                                    "rework",
+                                    "blocked",
+                                    "approved",
+                                )
+                                and t.get("id")
+                            ]
+                            if open_ids:
+                                await ts.set_owner_parked(
+                                    self.project_id, open_ids, parked=True
+                                )
+                        except Exception as e:
+                            log.debug(
+                                "stall_break_owner_parked_failed",
+                                error=str(e),
+                            )
+                        # Escalate to org parent — facts only, no prescription
+                        try:
+                            from hiveweave.db import meta as _meta_db
+                            from hiveweave.services.inbox import InboxService
+
+                            agent_row = await _meta_db.get_agent_by_id(self.id)
+                            parent_id = (agent_row or {}).get("parent_id")
+                            if parent_id:
+                                agent_name = (
+                                    (agent_row or {}).get("name") or self.id[:12]
+                                )
+                                recent_note = (
+                                    f"last successful run at {recent_ok}"
+                                    if recent_ok
+                                    else "no recent successful run on record"
+                                )
+                                pending_ids: list[str] = []
+                                try:
+                                    from hiveweave.services.task import TaskService
+
+                                    for t in (
+                                        await TaskService().list_tasks(
+                                            self.project_id,
+                                            assignee_id=self.id,
+                                        )
+                                        or []
+                                    ):
+                                        if t.get("status") in (
+                                            "created",
+                                            "claimed",
+                                            "running",
+                                            "submitted",
+                                            "reviewing",
+                                            "rework",
+                                            "blocked",
+                                        ):
+                                            pending_ids.append(
+                                                str(t.get("id") or "")[:8]
+                                            )
+                                except Exception:
+                                    pass
+                                task_blob = (
+                                    ", ".join(pending_ids[:12]) or "(none)"
+                                )
+                                await InboxService().send_message(
+                                    from_agent_id="system",
+                                    to_agent_id=parent_id,
+                                    message=(
+                                        f"[AGENT STUCK] {agent_name} "
+                                        f"({self.id[:12]}) hit STALL BREAK "
+                                        f"{len(breaks)} times in "
+                                        f"{STALL_BREAK_WINDOW_MS // 60000}min. "
+                                        f"Agent parked (disposition=blocked). "
+                                        f"{recent_note}. "
+                                        f"Open tasks: {task_blob}. "
+                                        f"Assess activity before acting — "
+                                        f"signal may be stale."
+                                    ),
+                                    message_type="escalation",
+                                    priority="urgent",
+                                    wake=True,
+                                )
+                                from hiveweave.agents.trigger import (
+                                    trigger_subordinate,
+                                )
+
+                                await trigger_subordinate(parent_id)
+                        except Exception as e:
+                            log.warning(
+                                "stall_break_escalate_failed",
+                                agent_id=self.id,
+                                error=str(e),
+                            )
+                        # Clear the ledger after parking
+                        _stall_break_ledger.pop(self.id, None)
+
+        # 9. Repair once OR one progress slice OR hook nudge — never unlimited
+        if _stall_parked:
+            pass  # Parked — do not retrigger
+        elif gate_retrigger_hint:
             await self._retrigger_for_turn_gate(
                 gate_retrigger_hint, inbox_msg_ids=carry_inbox_ids
+            )
+        elif budget_exhausted:
+            await self._retrigger_for_turn_gate(
+                "[TURN BUDGET] Previous slice hit the turn budget after "
+                "productive work. commit_turn(phase='in_progress') if needed, "
+                "then continue from where you left off.",
+                inbox_msg_ids=None,
             )
         elif continue_slice:
             await self._retrigger_for_turn_gate(
@@ -2356,20 +2679,72 @@ class Agent:
                 pass
 
         # 连续错误计数 — 超过阈值后 ACK inbox，不再 resume
-        # 429 / rate-limit: 不计入放弃；独立长冷却后 resume
+        # 429 / rate-limit: 分级 — soft 冷却 / hard 配额 park（TEST20 P0-B）
         if is_rate_limit_error(error):
             inbox_ids = list(self.pending_inbox_msg_ids or [])
+            headers: dict = {}
+            try:
+                from hiveweave.llm.retry import RetryableError, parse_quota_reset
+
+                if isinstance(error, RetryableError):
+                    headers = dict(error.headers or {})
+                quota = parse_quota_reset(headers)
+            except Exception:
+                quota = {
+                    "retry_after_s": None,
+                    "reset_at_epoch": None,
+                    "is_daily_quota": False,
+                }
+
+            retry_after_s = quota.get("retry_after_s")
+            is_daily = bool(quota.get("is_daily_quota"))
+            reset_at = quota.get("reset_at_epoch")
+
+            # No header → count soft streak with backoff ladder
+            if retry_after_s is None:
+                self._rate_limit_streak = getattr(self, "_rate_limit_streak", 0) + 1
+                idx = min(
+                    self._rate_limit_streak - 1,
+                    len(RATE_LIMIT_BACKOFF_STEPS_S) - 1,
+                )
+                cooldown = RATE_LIMIT_BACKOFF_STEPS_S[idx]
+                if self._rate_limit_streak >= RATE_LIMIT_SOFT_STREAK_ESCALATE:
+                    await self._park_after_quota_exhausted(
+                        inbox_ids=inbox_ids,
+                        error_msg=error_msg,
+                        reset_at_epoch=None,
+                        reason="rate_limit_streak",
+                    )
+                    self._cancel_safety_timer()
+                    await self._go_idle()
+                    return
+            else:
+                cooldown = max(float(retry_after_s), RATE_LIMIT_RESUME_COOLDOWN_S)
+                if is_daily or cooldown > RATE_LIMIT_SOFT_MAX_S:
+                    await self._park_after_quota_exhausted(
+                        inbox_ids=inbox_ids,
+                        error_msg=error_msg,
+                        reset_at_epoch=float(reset_at) if reset_at else None,
+                        reason="daily_quota",
+                    )
+                    self._cancel_safety_timer()
+                    await self._go_idle()
+                    return
+                self._rate_limit_streak = getattr(self, "_rate_limit_streak", 0) + 1
+
             if inbox_ids:
                 await self._write_resume_checkpoint(
                     reason=f"rate_limit:{error_type}",
                     inbox_ids=inbox_ids,
                 )
                 self.pending_inbox_msg_ids = None
-            self._arm_resume_cooldown(RATE_LIMIT_RESUME_COOLDOWN_S)
+            self._arm_resume_cooldown(cooldown)
             log.warning(
                 "llm_rate_limit_deferred",
                 agent_id=self.id,
-                cooldown_s=RATE_LIMIT_RESUME_COOLDOWN_S,
+                cooldown_s=cooldown,
+                rate_limit_streak=getattr(self, "_rate_limit_streak", 0),
+                is_daily_quota=is_daily,
                 consecutive_errors=self._consecutive_errors,
                 inbox_left_unread=len(inbox_ids),
             )
@@ -2377,6 +2752,7 @@ class Agent:
             await self._go_idle()
             return
 
+        self._rate_limit_streak = 0
         self._consecutive_errors += 1
         is_total_timeout = (
             "请求总超时" in error_msg
@@ -2442,6 +2818,120 @@ class Agent:
         self._cancel_safety_timer()
         await self._go_idle()
 
+    async def _park_after_quota_exhausted(
+        self,
+        *,
+        inbox_ids: list[str],
+        error_msg: str,
+        reset_at_epoch: float | None,
+        reason: str = "daily_quota",
+    ) -> None:
+        """Park agent until quota reset — stop doomed 429 retry loops (TEST20 P0-B)."""
+        import time as _time
+
+        from hiveweave.services.turn_result import WaitingOnItem
+        from hiveweave.services.wait_contract import wait_contract_service
+
+        self.disposition = "waiting_human"
+        self._arm_resume_suppressed()
+        self._rate_limit_streak = 0
+
+        note = "LLM quota exhausted"
+        if reset_at_epoch:
+            local = _time.strftime(
+                "%H:%M", _time.localtime(float(reset_at_epoch))
+            )
+            note = f"LLM quota exhausted; resume after {local}"
+            # Arm cooldown until reset so early wakes stay blocked
+            delay = max(0.0, float(reset_at_epoch) - _time.time())
+            if delay > 0:
+                self._arm_resume_cooldown(delay)
+
+        try:
+            await wait_contract_service.replace_waits(
+                self.project_id,
+                self.id,
+                [
+                    WaitingOnItem(
+                        kind="timer",
+                        ref="quota_reset",
+                        note=note[:200],
+                    )
+                ],
+                phase="waiting",
+            )
+        except Exception as e:
+            log.warning(
+                "quota_wait_persist_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+
+        if inbox_ids:
+            try:
+                await self._write_resume_checkpoint(
+                    reason=f"quota_exhausted:{reason}",
+                    inbox_ids=inbox_ids,
+                )
+            except Exception:
+                pass
+            # Leave unread so resume after reset reprocesses them
+            self.pending_inbox_msg_ids = None
+
+        agent_name = self.config.get("name", self.id)
+        reset_blob = (
+            _time.strftime("%Y-%m-%d %H:%M", _time.localtime(float(reset_at_epoch)))
+            if reset_at_epoch
+            else "(unknown — check provider dashboard)"
+        )
+        try:
+            await self._broadcast_agent_health(
+                "error",
+                f"quota exhausted until {reset_blob}",
+            )
+        except Exception:
+            pass
+        try:
+            superior = await self._org.get_superior(self.id)
+            if superior:
+                await self._inbox.send_message(
+                    from_agent_id=self.id,
+                    to_agent_id=superior["id"],
+                    message=(
+                        f"[QUOTA EXHAUSTED] {agent_name} parked after rate-limit "
+                        f"({reason}). Resume at {reset_blob}. "
+                        f"Swap to a paid key / Ark pool or wait. "
+                        f"Last error: {error_msg[:120]}"
+                    ),
+                    message_type="system",
+                    priority="urgent",
+                    wake=False,
+                )
+        except Exception as e:
+            log.warning("quota_escalate_failed", agent_id=self.id, error=str(e))
+        try:
+            # Notify user channel when possible
+            await self._inbox.send_message(
+                from_agent_id=self.id,
+                to_agent_id="user",
+                message=(
+                    f"[QUOTA EXHAUSTED] Project LLM quota hit. "
+                    f"Agents parked until {reset_blob}. "
+                    f"Change model key in Settings or wait for reset."
+                ),
+                message_type="system",
+                priority="urgent",
+                wake=False,
+            )
+        except Exception:
+            pass
+        log.warning(
+            "llm_quota_parked",
+            agent_id=self.id,
+            reason=reason,
+            reset_at=reset_blob,
+        )
+
     async def _count_recent_ask_gate_rejections(self, window_ms: int = 30 * 60 * 1000) -> int:
         """Count recent commit_turn rejections caused by UNREPLIED_ASKS (DB evidence).
 
@@ -2476,8 +2966,8 @@ class Agent:
     ) -> None:
         """After consecutive stream total timeouts: park waiting + wake parent.
 
-        Does not auto-approve. Structured escalation lists pending submitted
-        tasks so the superior can review/merge (TEST4 tech-lead SPOF).
+        TEST21 M5: payload lists assignee's open tasks, marks owner_parked,
+        and escalates with ``[PARKED WITH TASKS]`` (facts + suggested actions).
         """
         from hiveweave.services.turn_result import WaitingOnItem
         from hiveweave.services.wait_contract import wait_contract_service
@@ -2486,21 +2976,32 @@ class Agent:
         self._arm_resume_suppressed()
         self._stream_timeout_streak = 0
 
-        pending_task_ids: list[str] = []
+        open_tasks: list[dict] = []
         try:
             from hiveweave.services.task import TaskService
 
-            tasks = await TaskService().list_tasks(self.project_id)
-            for t in tasks or []:
-                if t.get("status") not in ("submitted", "reviewing"):
-                    continue
-                # Creator or any coordinator reviewing — include if we own review
-                if (
-                    t.get("created_by") == self.id
-                    or t.get("creator_id") == self.id
-                    or t.get("reviewer_id") == self.id
+            ts = TaskService()
+            for t in (
+                await ts.list_tasks(self.project_id, assignee_id=self.id) or []
+            ):
+                st = t.get("status")
+                if st in (
+                    "created",
+                    "claimed",
+                    "running",
+                    "submitted",
+                    "reviewing",
+                    "rework",
+                    "blocked",
+                    "approved",
                 ):
-                    pending_task_ids.append(str(t.get("id") or "")[:12])
+                    open_tasks.append(t)
+            if open_tasks:
+                await ts.set_owner_parked(
+                    self.project_id,
+                    [str(t["id"]) for t in open_tasks if t.get("id")],
+                    parked=True,
+                )
         except Exception as e:
             log.warning(
                 "stream_timeout_park_tasks_failed",
@@ -2536,7 +3037,22 @@ class Agent:
         self.pending_inbox_msg_ids = None
 
         agent_name = self.config.get("name", self.id)
-        task_blob = ", ".join(pending_task_ids) or "(none listed)"
+        lines: list[str] = []
+        for t in open_tasks[:12]:
+            tid = str(t.get("id") or "")[:8]
+            st = t.get("status") or "?"
+            title = (t.get("title") or "").split("\n")[0][:40]
+            hint = {
+                "running": "hold / reassign / release claim",
+                "claimed": "hold / reassign / release claim",
+                "submitted": "review or wait for recovery",
+                "reviewing": "review or wait for recovery",
+                "approved": "merge when ready",
+                "rework": "hold / reassign",
+                "blocked": "unblock or reassign",
+            }.get(str(st), "triage")
+            lines.append(f"- {tid} [{st}] {title} → {hint}")
+        task_blob = "\n".join(lines) if lines else "(no open assignee tasks)"
         try:
             superior = await self._org.get_superior(self.id)
             if superior:
@@ -2544,14 +3060,16 @@ class Agent:
                     from_agent_id=self.id,
                     to_agent_id=superior["id"],
                     message=(
-                        f"[tech_lead_incapacitated] {agent_name} hit consecutive "
-                        f"stream total timeouts and is parked waiting. "
-                        f"Pending review taskIds: {task_blob}. "
-                        f"Please review/merge if appropriate (do not assume "
-                        f"auto-approve). Last error: {error_msg[:120]}"
+                        f"[PARKED WITH TASKS] {agent_name} hit consecutive "
+                        f"stream total timeouts and is parked waiting.\n"
+                        f"Open tasks (stall nudges paused via owner_parked):\n"
+                        f"{task_blob}\n"
+                        f"Assess activity before acting. "
+                        f"Last error: {error_msg[:120]}"
                     ),
                     message_type="escalation",
                     priority="urgent",
+                    wake=True,
                 )
                 from hiveweave.agents.trigger import trigger_coordinator
 
@@ -2560,7 +3078,7 @@ class Agent:
                     "stream_timeout_parked_escalated",
                     agent_id=self.id,
                     superior_id=superior["id"],
-                    pending_tasks=pending_task_ids,
+                    pending_tasks=[str(t.get("id") or "")[:8] for t in open_tasks],
                 )
             else:
                 log.warning(

@@ -204,9 +204,11 @@ class DispatchService:
                 agent_gets_write_worktree,
                 ensure_executor_worktree,
                 pin_dispatch_message_to_worktree,
+                worktree_commits_behind_main,
             )
             from hiveweave.services.org import OrgService
 
+            ws = await meta_db.get_project_workspace(project_id) or ""
             assignee = await OrgService().resolve_agent(to_agent_id)
             if assignee and agent_gets_write_worktree(assignee):
                 ensured = await ensure_executor_worktree(
@@ -222,6 +224,25 @@ class DispatchService:
                         short_id=ensured.get("short_id") or assignee.get("short_id") or "",
                         worktree_path=ensured["path"],
                     )
+                    # P0-1: detect worktree behind main and warn in dispatch
+                    try:
+                        behind = await worktree_commits_behind_main(
+                            ws, ensured["path"]
+                        )
+                        if behind > 0:
+                            description_out += (
+                                f"\n\n[WORKTREE BEHIND MAIN] Your worktree is "
+                                f"{behind} commit(s) behind main. "
+                                f"Run `git merge main` (or `git rebase main`) "
+                                f"in your worktree before starting work to "
+                                f"avoid building on stale code."
+                            )
+                    except Exception as e:
+                        log.debug(
+                            "dispatch_behind_main_check_failed",
+                            to_agent_id=to_agent_id,
+                            error=str(e),
+                        )
                     # task 行先行创建时存的是原始 description —— 钉上 worktree
                     # 路径后回写，保持 Task Ledger 里可见路径（与原行为一致）。
                     if description_out != description:
@@ -246,6 +267,35 @@ class DispatchService:
                     "dispatch_to_non_writer",
                     to_agent_id=to_agent_id,
                     permission_type=assignee.get("permission_type"),
+                )
+
+            # P0-1: VERIFY/E2E tasks — guide to project root main checkout
+            try:
+                from hiveweave.services.task import TaskService as _TS
+
+                task_row = await self.task_service.get_task(project_id, task_id)
+                if task_row and _TS._is_verify_task(task_row):
+                    description_out += (
+                        f"\n\n[VERIFY GUIDANCE] This is a verification task. "
+                        f"Validate against the project root (main branch) at "
+                        f"`{ws}`, NOT your personal worktree — the worktree "
+                        f"may be stale. Use `read_file` / `bash` with cwd at "
+                        f"the project root to inspect the merged result."
+                    )
+                    # Re-pin description with VERIFY guidance
+                    if description_out != description:
+                        try:
+                            await self.task_service.update_task(
+                                project_id, task_id,
+                                description=description_out,
+                            )
+                        except Exception:
+                            pass
+            except Exception as e:
+                log.debug(
+                    "dispatch_verify_guidance_failed",
+                    task_id=task_id,
+                    error=str(e),
                 )
         except Exception as e:
             log.warning("dispatch_worktree_pin_failed", error=str(e))

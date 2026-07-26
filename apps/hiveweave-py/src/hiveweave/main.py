@@ -42,8 +42,67 @@ import structlog
 from hiveweave.config import settings
 
 
+class _FlushFile:
+    """Line-buffered-ish file that flushes every write (TEST21 M10)."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # buffering=1 is line-buffered only in text mode for tty; force flush.
+        self._f = open(path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, s: str) -> int:
+        n = self._f.write(s)
+        self._f.flush()
+        return n
+
+    def flush(self) -> None:
+        self._f.flush()
+
+    def fileno(self) -> int:
+        return self._f.fileno()
+
+    def isatty(self) -> bool:
+        return False
+
+
+class _TeeStream:
+    """Write to multiple streams (console + durable log file)."""
+
+    def __init__(self, *streams: object) -> None:
+        self._streams = streams
+
+    def write(self, s: str) -> int:
+        for st in self._streams:
+            write = getattr(st, "write", None)
+            if write is not None:
+                write(s)
+            flush = getattr(st, "flush", None)
+            if flush is not None:
+                flush()
+        return len(s)
+
+    def flush(self) -> None:
+        for st in self._streams:
+            flush = getattr(st, "flush", None)
+            if flush is not None:
+                flush()
+
+    def isatty(self) -> bool:
+        return False
+
+
+_LOG_FILE_STREAM: _FlushFile | None = None
+
+
 def _configure_logging() -> None:
-    """Configure structlog once at import (JSON when HIVEWEAVE_LOG_JSON=1)."""
+    """Configure structlog once at import (JSON when HIVEWEAVE_LOG_JSON=1).
+
+    TEST21 M10: when ``HIVEWEAVE_LOG_FILE`` is set, tee every log line to that
+    path with per-write flush so Ctrl+C / kill cannot evaporate a buffered
+    stdout redirect.
+    """
+    global _LOG_FILE_STREAM
     json_logs = os.getenv("HIVEWEAVE_LOG_JSON", "").lower() in ("1", "true", "yes")
     level_name = os.getenv("HIVEWEAVE_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
@@ -63,17 +122,54 @@ def _configure_logging() -> None:
             colors = False
         renderer = structlog.dev.ConsoleRenderer(colors=colors)
 
+    log_stream: object = sys.stdout
+    log_path = (os.getenv("HIVEWEAVE_LOG_FILE") or "").strip()
+    if log_path:
+        try:
+            _LOG_FILE_STREAM = _FlushFile(Path(log_path))
+            log_stream = _TeeStream(sys.stdout, _LOG_FILE_STREAM)
+        except OSError as e:
+            # Fail closed at lifespan via log_vital_sign; here keep console.
+            print(
+                f"WARNING: cannot open HIVEWEAVE_LOG_FILE={log_path!r}: {e}",
+                file=sys.stderr,
+            )
+            _LOG_FILE_STREAM = None
+
     structlog.configure(
         processors=[*shared, renderer],
         wrapper_class=structlog.make_filtering_bound_logger(level),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        logger_factory=structlog.PrintLoggerFactory(file=log_stream),
         cache_logger_on_first_use=True,
     )
-    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
+    logging.basicConfig(format="%(message)s", stream=log_stream, level=level)
 
 
 _configure_logging()
 log = structlog.get_logger(__name__)
+
+
+def _assert_log_vital_sign() -> None:
+    """TEST21 M10: if a log file was requested, refuse to run without it."""
+    log_path = (os.getenv("HIVEWEAVE_LOG_FILE") or "").strip()
+    if not log_path:
+        return
+    if _LOG_FILE_STREAM is None:
+        print(
+            f"FATAL: HIVEWEAVE_LOG_FILE={log_path!r} is set but not writable. "
+            "Refusing to start (logs would be lost on kill).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        _LOG_FILE_STREAM.write(
+            f'{{"event":"log_vital_sign","path":"{log_path}","ok":true}}\n'
+        )
+        _LOG_FILE_STREAM.flush()
+    except OSError as e:
+        print(f"FATAL: log_vital_sign write failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    log.info("log_vital_sign", path=log_path)
 
 
 @asynccontextmanager
@@ -92,6 +188,7 @@ async def lifespan(app: FastAPI):
     from hiveweave.agents.supervisor import agent_manager
 
     # ── Startup ──────────────────────────────────────────────
+    _assert_log_vital_sign()
     log.info("app_starting", port=settings.port)
 
     # 1. Init Meta DB

@@ -505,6 +505,7 @@ Gate 报错会带回**完整 task UUID** 和可复制的工具调用，照抄即
 4. **每收到一次 executor 的 `submit_task` 通知** → 立即按顺序：
    a. `review_task(taskId, decision, feedback)` 审批（approve / rework）
       — 审查 **executor worktree**（evidence.files_changed 必须在那棵树上），不要用 main 判「没改」
+      — approve 必须读 evidence 机器戳（commits_ahead / close_blocked / unmerged）；字数不是证据
    b. **如果 approve** → **立即**调用 `git_worktree_merge(branchName=shortId 或 hw/...)`
       把该 executor 的 worktree 合并到主分支。**不调用 merge 视为任务未完成**。
       **VERIFY 只在 merge 成功后、且仅针对本次 merge 覆盖的任务创建**。

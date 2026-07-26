@@ -295,21 +295,31 @@ import os as _os
 TOTAL_TIMEOUT_S = float(
     _os.environ.get("HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S", "540") or "540"
 )
-"""整个 stream 调用的总超时（兜底防线）。
+"""软预算切片（秒）。有工具/流式活动时续命，见 ``HARD_TOTAL_TIMEOUT_S``。
 
 可通过 env ``HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S`` 覆盖（默认 540）。
 
-BUG-041: 原 300s 包裹整个 _run_tool_loop，多轮工具调用（每轮含 HTTP +
-工具执行）合法场景也会超时。放大到 540s（9分钟），给 agent safety_timeout
-(600s) 留 60s 余量。同时超时不再报熔断失败——多轮工具调用超时不是 provider
-不稳定的问题。
+TEST21 M4: 不再用这一值对整段 tool loop 做硬杀；活跃长 turn 在硬上限内
+续命，耗尽时优雅收口（保留 tool 产出）而非裸 ValueError。
 """
+
+HARD_TOTAL_TIMEOUT_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_HARD_TIMEOUT_S", "570") or "570"
+)
+"""Turn 绝对硬上限（秒），须 < agent SAFETY_TIMEOUT（600s）。"""
+
+ACTIVITY_EXTEND_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_ACTIVITY_EXTEND_S", "180") or "180"
+)
+"""每次有进展的工具轮后，软预算续命这么多秒（不超过硬上限）。"""
 
 FIRST_CHUNK_TIMEOUT_S = 90.0
 """首 chunk 超时（TS 防线②，thinking 模型首 token 可能 60-90s）。"""
 
-IDLE_TIMEOUT_S = 60.0
-"""后续 chunk idle 超时（TS 防线②）。"""
+IDLE_TIMEOUT_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_IDLE_TIMEOUT_S", "120") or "120"
+)
+"""后续 chunk / 无活动 idle 超时（TEST21 M4：默认 120s，真停滞才杀）。"""
 
 # ── Bug B fix: 全局 LLM 并发控制 ───────────────────────────
 # 防止多 agent 同时打 LLM API 超过 provider 并发限制（默认 8）。
@@ -800,6 +810,9 @@ class Streamer:
         await self._fire_delta(on_delta, {"type": "start"})
 
         try:
+            # TEST21 M4: hard cap is a safety net only. Soft renew + graceful
+            # budget exit live inside _run_tool_loop so partial tool history
+            # is preserved (outer wait_for used to discard mid-turn state).
             result = await asyncio.wait_for(
                 self._run_tool_loop(
                     agent_id=agent_id,
@@ -811,23 +824,26 @@ class Streamer:
                     on_tool_call=on_tool_call,
                     max_tool_rounds=effective_max_rounds,
                 ),
-                timeout=TOTAL_TIMEOUT_S,
+                timeout=HARD_TOTAL_TIMEOUT_S + 30.0,
             )
             # 熔断器成功/失败上报已移至 _stream_single_round 按轮次精确上报（C10）
             result["duration_ms"] = int((time.monotonic() - start_time) * 1000)
             return result
         except TimeoutError:
-            # BUG-041: total timeout 通常是多轮工具调用累计超时，
-            # 不是 provider 不稳定 — 不报熔断失败
-            log.error("stream_total_timeout", agent_id=agent_id,
-                      timeout_s=TOTAL_TIMEOUT_S)
+            # Ultimate safety net — loop should have exited gracefully first.
+            log.error(
+                "stream_hard_timeout",
+                agent_id=agent_id,
+                timeout_s=HARD_TOTAL_TIMEOUT_S,
+            )
             try:
                 from hiveweave.services.telemetry import telemetry
                 telemetry.stream_total_timeout(agent_id)
             except Exception:
                 pass
             await self._fire_delta(on_delta, {
-                "type": "error", "content": f"请求总超时（{TOTAL_TIMEOUT_S}s）"
+                "type": "error",
+                "content": f"请求总超时（{HARD_TOTAL_TIMEOUT_S}s）",
             })
             return self._error_result("请求总超时", start_time)
         except Exception as e:
@@ -884,7 +900,75 @@ class Streamer:
         stall_count = 0
         readonly_stall_count = 0
 
+        # TEST21 M4: soft/hard turn budget (activity renews soft within hard)
+        loop_start = time.monotonic()
+        hard_deadline = loop_start + HARD_TOTAL_TIMEOUT_S
+        soft_deadline = loop_start + TOTAL_TIMEOUT_S
+        budget_hint_injected = False
+
         for round_num in range(rounds_cap):
+            now_mono = time.monotonic()
+            if now_mono >= hard_deadline:
+                log.warning(
+                    "stream_budget_hard_exhausted",
+                    agent_id=agent_id,
+                    round=round_num,
+                    elapsed_s=round(now_mono - loop_start, 1),
+                    tools=len(tool_history),
+                )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.stream_budget_exhausted(agent_id)
+                except Exception:
+                    pass
+                final_text = self._strip_placeholder(text_acc) or (
+                    "[TURN BUDGET] Hard turn budget exhausted. "
+                    "Progress so far is kept — call commit_turn("
+                    "phase='in_progress') and continue in the next wake."
+                )
+                if tool_history:
+                    tool_turn_acc.append(
+                        {"role": "assistant", "content": final_text}
+                    )
+                    return {
+                        "status": "ok",
+                        "content": final_text,
+                        "thinking": thinking_acc,
+                        "tool_calls": tool_history,
+                        "tool_turn_messages": tool_turn_acc,
+                        "rounds": round_num,
+                        "usage": last_usage,
+                        "budget_exhausted": True,
+                    }
+                await self._fire_delta(on_delta, {
+                    "type": "error",
+                    "content": f"请求总超时（{HARD_TOTAL_TIMEOUT_S}s）",
+                })
+                return self._error_result("请求总超时", loop_start)
+            if (
+                now_mono >= soft_deadline
+                and not budget_hint_injected
+                and tool_history
+            ):
+                budget_hint_injected = True
+                remaining = max(0.0, hard_deadline - now_mono)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"[TURN BUDGET] Soft budget reached "
+                        f"(~{int(now_mono - loop_start)}s elapsed, "
+                        f"~{int(remaining)}s hard remaining). "
+                        "You have been productive — call "
+                        "commit_turn(phase='in_progress') now to checkpoint, "
+                        "then continue next wake. Do not start large new work."
+                    ),
+                })
+                # One more soft slice to allow commit_turn
+                soft_deadline = min(
+                    now_mono + ACTIVITY_EXTEND_S, hard_deadline
+                )
+
             # 通知回调：新一轮开始（用于重置流式文本累积器）
             # BUG-7: also fire on round 0 so LLM call counters stay accurate
             if on_delta:
@@ -1195,6 +1279,10 @@ class Streamer:
                 ):
                     stall_count = 0
                     readonly_stall_count = 0
+                    # TEST21 M4: activity renews soft budget within hard cap
+                    soft_deadline = min(
+                        time.monotonic() + ACTIVITY_EXTEND_S, hard_deadline
+                    )
                 elif round_was_readonly_only(
                     tool_calls,
                     error_ids=error_ids,
@@ -1508,6 +1596,9 @@ class Streamer:
                 "tool_calls": [],
                 "finish_reason": None,
                 "error": str(e),
+                # Preserve for agent-level quota park (TEST20 P0-B)
+                "error_status": e.status,
+                "error_headers": dict(e.headers or {}),
             }
         except PermanentError as e:
             # 不可重试错误（401/400 等）→ 不报告熔断器

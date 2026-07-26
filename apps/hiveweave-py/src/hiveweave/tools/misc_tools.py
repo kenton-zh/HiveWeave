@@ -639,6 +639,49 @@ async def git_worktree_merge_tool(
     files = result.get("files") or result.get("conflicts")
 
     if result.get("success"):
+        # Defense in depth: conflict markers must never be treated as success.
+        marker_files = result.get("conflict_markers")
+        if isinstance(marker_files, list) and marker_files:
+            reason = "conflict_markers_landed"
+            reworked = 0
+            try:
+                from hiveweave.tools.task_tools import rework_tasks_after_merge_conflict
+
+                reworked = await rework_tasks_after_merge_conflict(
+                    project_id,
+                    agent_id,
+                    merged_short_id=short,
+                    merged_branch=branch,
+                    conflicts=marker_files,
+                    merged_files=files if isinstance(files, list) else None,
+                )
+            except Exception as e:
+                log.warning("merge_marker_rework_failed", error=str(e))
+            err = result.get("message") or (
+                f"Merge aborted: conflict markers on {target_branch}: "
+                + ", ".join(str(f) for f in marker_files[:12])
+            )
+            if reworked:
+                err = f"{err}\n\nAuto-reworked {reworked} approved task(s) → executor."
+            return ToolResult.err(err)
+
+        # Idempotent noop: already on main with no new files — skip VERIFY spawn.
+        branch_files = (
+            result.get("files") if isinstance(result.get("files"), list) else None
+        )
+        if result.get("already_up_to_date") and not branch_files:
+            try:
+                from hiveweave.services.task import TaskService
+
+                await TaskService().migrate_orphan_approved(project_id)
+            except Exception as mig_err:
+                log.warning("orphan_migrate_after_merge_failed", error=str(mig_err))
+            msg = result.get(
+                "message",
+                "Branch already on main (no new commits) — merge noop.",
+            )
+            return ToolResult.ok(msg)
+
         # TEST16 D2: fulfill merge obligation — merge landed, stop escalation
         try:
             from hiveweave.services.obligation import ObligationLedger
@@ -655,27 +698,6 @@ async def git_worktree_merge_tool(
         except Exception as e:
             log.warning("merge_obligation_fulfill_failed", error=str(e))
 
-        # 残留冲突标记路由: merge 成功 ≠ main 干净 — 命中则给被合并
-        # worktree 的 owner 建清理任务。任何失败只降级为警告文本,
-        # 绝不影响已完成的 merge。
-        marker_warning = ""
-        marker_files = result.get("conflict_markers")
-        if isinstance(marker_files, list) and marker_files:
-            try:
-                marker_warning = await _route_conflict_marker_cleanup(
-                    project_id,
-                    agent_id,
-                    merged_short_id=short,
-                    files=[str(f) for f in marker_files],
-                )
-            except Exception as e:
-                log.warning("conflict_marker_route_failed", error=str(e))
-                marker_warning = (
-                    " WARNING: unresolved git conflict markers remain on "
-                    "main after merge: "
-                    + ", ".join(str(f) for f in marker_files[:20])
-                )
-
         # Post-merge: spawn VERIFY scoped to this merge + nudge on main
         try:
             from hiveweave.tools.task_tools import nudge_verify_tasks_after_merge
@@ -686,6 +708,7 @@ async def git_worktree_merge_tool(
                 merged_short_id=short,
                 merged_branch=branch,
                 merged_files=files if isinstance(files, list) else None,
+                merge_commit=result.get("hash"),
             )
         except Exception as e:
             log.warning("verify_nudge_after_merge_failed", error=str(e))
@@ -699,7 +722,6 @@ async def git_worktree_merge_tool(
                 f"{result.get('message', 'Worktree merged and cleaned up')} "
                 f"WARNING: VERIFY spawn/nudge failed ({e}). "
                 f"Retry merge nudge or spawn VERIFY manually for the merged task."
-                f"{marker_warning}"
             )
         try:
             from hiveweave.services.task import TaskService
@@ -718,13 +740,13 @@ async def git_worktree_merge_tool(
                 f"{msg} No VERIFY spawned (no matching approved task for "
                 f"this merge scope)."
             )
-        return ToolResult.ok(f"{msg}{marker_warning}")
+        return ToolResult.ok(msg)
 
     # Conflict: auto-rework only for real content conflicts.
     # untracked_on_target / merge_failed are MAIN hygiene or unknown — do NOT rework.
     reason = result.get("reason") or ""
     reworked = 0
-    if reason == "merge_conflict" or (
+    if reason in ("merge_conflict", "conflict_markers_landed") or (
         not reason
         and isinstance(result.get("conflicts"), list)
         and result.get("conflicts")

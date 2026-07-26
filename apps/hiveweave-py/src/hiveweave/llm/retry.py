@@ -134,6 +134,92 @@ def _get_header_ci(headers: dict[str, str], name: str) -> str | None:
     return None
 
 
+def parse_quota_reset(
+    headers: dict[str, str] | None,
+) -> dict[str, float | bool | None]:
+    """Parse 429 quota reset timing from response headers.
+
+    Prefers ``X-RateLimit-Reset`` (unix epoch or seconds-until), then
+    ``Retry-After``. Used by agent-level park (not in-request retry cap).
+
+    Returns::
+        {
+          retry_after_s: float | None,
+          reset_at_epoch: float | None,
+          is_daily_quota: bool,  # reset > QUOTA_EXHAUST_THRESHOLD_S
+        }
+    """
+    import time as _time
+
+    QUOTA_EXHAUST_THRESHOLD_S = 600.0  # >10 min → treat as quota exhaustion
+    out: dict[str, float | bool | None] = {
+        "retry_after_s": None,
+        "reset_at_epoch": None,
+        "is_daily_quota": False,
+    }
+    if not headers:
+        return out
+
+    now = _time.time()
+    reset_raw = _get_header_ci(headers, "x-ratelimit-reset") or _get_header_ci(
+        headers, "x-ratelimit-reset-requests"
+    )
+    if reset_raw:
+        try:
+            val = float(str(reset_raw).strip())
+            # Heuristic: values > 1e9 look like unix epoch; else seconds-until
+            if val > 1_000_000_000:
+                out["reset_at_epoch"] = val
+                out["retry_after_s"] = max(0.0, val - now)
+            else:
+                out["retry_after_s"] = max(0.0, val)
+                out["reset_at_epoch"] = now + max(0.0, val)
+        except (ValueError, TypeError):
+            pass
+
+    if out["retry_after_s"] is None:
+        ra_ms = parse_retry_after_ms(headers)
+        if ra_ms is not None:
+            # parse_retry_after_ms is capped at MAX_DELAY_MS for in-request
+            # retry — for quota park, re-parse without the 30s cap.
+            ra_uncapped = _parse_retry_after_uncapped(headers)
+            secs = (ra_uncapped if ra_uncapped is not None else ra_ms) / 1000.0
+            out["retry_after_s"] = secs
+            out["reset_at_epoch"] = now + secs
+
+    ra = out["retry_after_s"]
+    if isinstance(ra, (int, float)) and ra > QUOTA_EXHAUST_THRESHOLD_S:
+        out["is_daily_quota"] = True
+    return out
+
+
+def _parse_retry_after_uncapped(headers: dict[str, str]) -> int | None:
+    """Like parse_retry_after_ms but without MAX_DELAY_MS cap (for quota park)."""
+    ms_val = _get_header_ci(headers, "retry-after-ms")
+    if ms_val is not None:
+        try:
+            return max(0, int(float(ms_val)))
+        except (ValueError, TypeError):
+            pass
+    val = _get_header_ci(headers, "retry-after")
+    if val is None:
+        return None
+    try:
+        return max(0, int(float(val) * 1000))
+    except (ValueError, TypeError):
+        pass
+    try:
+        dt = parsedate_to_datetime(val)
+        if dt is not None:
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc)
+            return max(0, int((dt - now).total_seconds() * 1000))
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return None
+
+
 # ── 退避计算 ────────────────────────────────────────────────
 
 def compute_backoff(attempt: int, retry_after_ms: int | None = None) -> int:

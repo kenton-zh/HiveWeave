@@ -53,7 +53,8 @@ def test_compare_identical_to_main_allows_already_merged(tmp_path: Path):
     assert meta["identicalToMain"] == ["a.js"]
 
 
-def test_compare_partial_identical_blocks(tmp_path: Path):
+def test_compare_partial_identical_strips_and_allows(tmp_path: Path):
+    """TEST21 M1: mixed identical + diverged → strip identical, approve diverged."""
     main = tmp_path / "main"
     wt = tmp_path / "wt"
     main.mkdir()
@@ -67,8 +68,11 @@ def test_compare_partial_identical_blocks(tmp_path: Path):
         worktree_ws=str(wt),
         files_changed=["a.js", "b.js"],
     )
-    assert deny is not None
-    assert "b.js" in meta["identicalToMain"]
+    assert deny is None
+    assert meta["divergedFiles"] == ["a.js"]
+    assert meta["identicalToMain"] == ["b.js"]
+    assert meta.get("confirmedOnMain") == ["b.js"]
+    assert meta.get("strippedIdentical") is True
 
 
 def test_compare_missing_in_worktree_blocks(tmp_path: Path):

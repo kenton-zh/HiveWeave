@@ -60,6 +60,10 @@ class Telemetry:
             "inbox_deduped": 0,
             "verify_stale_nudge": 0,
             "stream_total_timeout": 0,
+            "stream_idle_timeout": 0,
+            "stream_budget_exhausted": 0,
+            "stall_break_parked": 0,
+            "stall_break_forgiven": 0,
             "doom_loop_detected": 0,
             "doom_loop_warned": 0,
             "poll_hard_reject": 0,
@@ -83,6 +87,14 @@ class Telemetry:
             "inbox_deduped": self._counters.get("inbox_deduped", 0),
             "verify_stale_nudge": self._counters.get("verify_stale_nudge", 0),
             "stream_total_timeout": self._counters.get("stream_total_timeout", 0),
+            "stream_idle_timeout": self._counters.get("stream_idle_timeout", 0),
+            "stream_budget_exhausted": self._counters.get(
+                "stream_budget_exhausted", 0
+            ),
+            "stall_break_parked": self._counters.get("stall_break_parked", 0),
+            "stall_break_forgiven": self._counters.get(
+                "stall_break_forgiven", 0
+            ),
             "doom_loop_detected": self._counters.get("doom_loop_detected", 0),
             "doom_loop_warned": self._counters.get("doom_loop_warned", 0),
             "poll_hard_reject": self._counters.get("poll_hard_reject", 0),
@@ -100,6 +112,10 @@ class Telemetry:
             "inbox_deduped": 0,
             "verify_stale_nudge": 0,
             "stream_total_timeout": 0,
+            "stream_idle_timeout": 0,
+            "stream_budget_exhausted": 0,
+            "stall_break_parked": 0,
+            "stall_break_forgiven": 0,
             "doom_loop_detected": 0,
             "doom_loop_warned": 0,
             "poll_hard_reject": 0,
@@ -309,6 +325,47 @@ class Telemetry:
             agent_id=agent_id,
             count=self._counters["stream_total_timeout"],
             agent_streak=agent_streak,
+        )
+
+    def stream_idle_timeout(self, agent_id: str) -> None:
+        self._counters["stream_idle_timeout"] = (
+            self._counters.get("stream_idle_timeout", 0) + 1
+        )
+        logger.warning(
+            "telemetry_stream_idle_timeout",
+            agent_id=agent_id,
+            count=self._counters["stream_idle_timeout"],
+        )
+
+    def stream_budget_exhausted(self, agent_id: str) -> None:
+        self._counters["stream_budget_exhausted"] = (
+            self._counters.get("stream_budget_exhausted", 0) + 1
+        )
+        logger.warning(
+            "telemetry_stream_budget_exhausted",
+            agent_id=agent_id,
+            count=self._counters["stream_budget_exhausted"],
+        )
+
+    def stall_break_parked(self, agent_id: str) -> None:
+        self._counters["stall_break_parked"] = (
+            self._counters.get("stall_break_parked", 0) + 1
+        )
+        logger.warning(
+            "telemetry_stall_break_parked",
+            agent_id=agent_id,
+            count=self._counters["stall_break_parked"],
+        )
+
+    def stall_break_forgiven(self, agent_id: str, *, reason: str = "") -> None:
+        self._counters["stall_break_forgiven"] = (
+            self._counters.get("stall_break_forgiven", 0) + 1
+        )
+        logger.info(
+            "telemetry_stall_break_forgiven",
+            agent_id=agent_id,
+            reason=reason,
+            count=self._counters["stall_break_forgiven"],
         )
 
     def doom_loop(

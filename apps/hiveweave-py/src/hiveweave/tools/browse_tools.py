@@ -101,7 +101,8 @@ async def _maybe_git_commit(workspace: str) -> str | None:
 @tool(
     "browse",
     "Drive a real Chromium browser via gstack browse (goto/click/fill/snapshot/"
-    "screenshot/console/network). Use for UI E2E and visual evidence. "
+    "screenshot/console/network/js/eval). Use js/eval for canvas MouseEvent "
+    "injection when snapshot refs are insufficient. "
     "Prefer lookup_dev_server / start_dev_server for the app URL first. "
     "Example: browse(args=[\"goto\",\"http://127.0.0.1:3000\"]) then "
     "browse(args=[\"snapshot\",\"-i\"]). On success issues a browse_e2e attestation.",
@@ -129,6 +130,10 @@ async def browse_tool(
             'args=["goto","http://127.0.0.1:3000"]'
         )
 
+    # Treat evaluate as alias for js (TEST21 M14)
+    if (argv[0] or "").lower() == "evaluate":
+        argv = ["js", *argv[1:]]
+
     # Soft guard: discourage attaching to the operator's daily profile URLs
     # that look like credential harvesting — still allow localhost / file / http(s).
     joined = " ".join(argv).lower()
@@ -139,10 +144,12 @@ async def browse_tool(
         )
 
     timeout = max(5, min(int(params.timeout_sec or 60), 300))
-    # click/wait often need >10s for async UI; agents historically passed 10
-    # and timed out (TEST11 evening P3-4). Floor at 30s for those actions.
+    # click/wait/js often need >10s for async UI; floor at 30s for those actions.
     head = (argv[0] or "").lower().replace("-", "_")
-    if head in ("click", "wait", "wait_for", "waitfor", "fill", "press"):
+    if head in (
+        "click", "wait", "wait_for", "waitfor", "fill", "press",
+        "js", "eval", "evaluate",
+    ):
         timeout = max(30, timeout)
     cmd = [str(bin_path), *argv]
     cwd = workspace if workspace and Path(workspace).is_dir() else None
@@ -193,6 +200,7 @@ async def browse_tool(
 
     # Issue browse_e2e attestation on success
     attest_note = ""
+    core_interaction = head in ("js", "eval", "evaluate")
     try:
         from hiveweave.services.attestation import (
             attestation_service,
@@ -204,20 +212,24 @@ async def browse_tool(
         if project_id:
             task_id = await _resolve_task_id(project_id, agent_id, params.task_id)
             commit = await _maybe_git_commit(workspace or "")
+            cmd_url = " ".join(argv)[:500]
+            if core_interaction:
+                cmd_url = f"[core_interaction=1] {cmd_url}"
             att_id = await attestation_service.create(
                 project_id,
                 agent_id=agent_id,
                 kind="browse_e2e",
                 tool_call_id=str(uuid.uuid4()),
                 task_id=task_id,
-                command_or_url=" ".join(argv)[:500],
+                command_or_url=cmd_url,
                 exit_code=0,
                 workspace=workspace or None,
                 commit=commit,
                 stdout_hash=hash_stdout(out),
                 console_errors=0,
             )
-            attest_note = f"\n[attestation_id={att_id} kind=browse_e2e]"
+            extra = " core_interaction=1" if core_interaction else ""
+            attest_note = f"\n[attestation_id={att_id} kind=browse_e2e{extra}]"
     except Exception:
         pass
 

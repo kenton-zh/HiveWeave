@@ -552,15 +552,71 @@ class OrgService:
         # Close Task Ledger obligations — reassign open work to parent, else archive
         # BUG-1: do NOT flatten submitted/reviewing/verifying → claimed.
         try:
+            import json as _json
+
+            from hiveweave.services.task import MergeRequiredError, TaskService
+            from hiveweave.services.worktree_review import (
+                effective_delivery,
+                evidence_has_merge_fact,
+                project_main_workspace,
+            )
+
+            ts = TaskService()
             conn = await project_db.get_project_db_by_project_id(project_id)
             cur = await conn.execute(
-                "SELECT id, status, reviewer_id, title FROM tasks "
+                "SELECT id, status, reviewer_id, title, evidence FROM tasks "
                 "WHERE assignee_id = ? AND is_archived = 0 "
                 "AND status NOT IN ('closed', 'cancelled')",
                 [agent_id],
             )
             open_tasks = [dict(r) for r in await cur.fetchall()]
             await cur.close()
+
+            main_ws = await project_main_workspace(project_id)
+            dismissed_wt = (agent_before.get("workspace_path") or "").strip()
+
+            async def _task_should_close_on_dismiss(t: dict) -> bool:
+                status = (t.get("status") or "").lower()
+                if status == "verifying":
+                    return True
+                ev = t.get("evidence")
+                if isinstance(ev, str):
+                    try:
+                        ev = _json.loads(ev)
+                    except Exception:
+                        ev = {}
+                if evidence_has_merge_fact(ev if isinstance(ev, dict) else {}):
+                    return True
+                tid = t.get("id")
+                if not tid:
+                    return False
+                try:
+                    vcur = await conn.execute(
+                        "SELECT merge_commit_hash FROM verification_cases "
+                        "WHERE original_task_id = ? AND merge_commit_hash IS NOT NULL "
+                        "AND merge_commit_hash != '' LIMIT 1",
+                        [tid],
+                    )
+                    vrow = await vcur.fetchone()
+                    await vcur.close()
+                    return bool(vrow)
+                except Exception:
+                    return False
+
+            async def _in_progress_keep_status() -> bool:
+                if not (main_ws and dismissed_wt):
+                    return False
+                try:
+                    delivery = await effective_delivery(main_ws, dismissed_wt)
+                    ahead = delivery.get("commits_ahead")
+                    dirty = int(delivery.get("dirty_count") or 0)
+                    if dirty > 0:
+                        return True
+                    if ahead is not None and int(ahead) > 0:
+                        return True
+                except Exception:
+                    return False
+                return False
 
             if any(
                 (t.get("status") or "") in ("submitted", "reviewing")
@@ -573,8 +629,57 @@ class OrgService:
                     tid = t["id"]
                     status = (t.get("status") or "").lower()
                     old_reviewer = t.get("reviewer_id") or ""
-                    if status in ("claimed", "running", "rework", "created", "blocked"):
-                        # In-progress work: reassign + reset to claimed
+
+                    if await _task_should_close_on_dismiss(t):
+                        try:
+                            await ts.close_task(project_id, tid)
+                            reassigned_summary.append({
+                                "task_id": tid,
+                                "from_status": status,
+                                "to_status": "closed",
+                                "action": "closed_on_dismiss",
+                            })
+                            continue
+                        except MergeRequiredError:
+                            pass
+                        except Exception as close_err:
+                            log.warning(
+                                "dismiss_close_task_failed",
+                                task_id=tid,
+                                error=str(close_err),
+                            )
+
+                    if status in ("claimed", "running", "rework"):
+                        keep_status = await _in_progress_keep_status()
+                        if keep_status:
+                            defer_worktree_delete = True
+                            await conn.execute(
+                                "UPDATE tasks SET assignee_id = ?, updated_at = ? "
+                                "WHERE id = ?",
+                                [parent_id, now_ms, tid],
+                            )
+                            reassigned_summary.append({
+                                "task_id": tid,
+                                "from_status": status,
+                                "to_status": status,
+                                "action": "reassign_keep_status_dirty",
+                            })
+                            continue
+                    if status in ("created", "blocked"):
+                        # In-progress work without dirty/ahead: reassign + reset
+                        await conn.execute(
+                            "UPDATE tasks SET assignee_id = ?, status = 'claimed', "
+                            "claimed_at = ?, updated_at = ? WHERE id = ?",
+                            [parent_id, now_ms, now_ms, tid],
+                        )
+                        reassigned_summary.append({
+                            "task_id": tid,
+                            "from_status": status,
+                            "to_status": "claimed",
+                            "action": "reassign_reset",
+                        })
+                    elif status in ("claimed", "running", "rework"):
+                        # Clean in-progress work: reassign + reset to claimed
                         await conn.execute(
                             "UPDATE tasks SET assignee_id = ?, status = 'claimed', "
                             "claimed_at = ?, updated_at = ? WHERE id = ?",

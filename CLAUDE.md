@@ -315,9 +315,15 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 
 模拟项目时间,`REAL_SECONDS_PER_GAME_DAY = 3600` (1 真实小时 = 1 游戏天)。5 秒 tick 持久化时间并触发到期告警。每 30s 扫 orphan streaming。
 
-- **inbox stall / awaiting-reply 催办已禁用**（`_check_stalled` / `_nudge_awaiting_replies` no-op）
+**Stall 检测三层机制**（区分清楚，不要混淆）：
+
+1. **Inbox stall / awaiting-reply 催办 — 已禁用**（`_check_stalled` / `_nudge_awaiting_replies` no-op）。回复义务由 turn exit 的 `expect_report` / `ask` + 收件人 ID 检查强制执行，不做周期性催办。
+2. **Task stall 催办 — 活跃**（`_nudge_stale_ledger` 内的 `TASK_STALL_THRESHOLDS` 段）。按任务状态停留时间催办：running>20min / submitted>10min / reviewing>10min / rework>10min / created>5min / claimed>5min。超过 `STALL_ESCALATION_THRESHOLD`(3) 次后升级到上级。与 P0-3 stall break 互斥：近 5 分钟内被 STALL BREAK 的 agent 不再收到 task stall nudge。
+3. **沉默观测看门狗 — 活跃**（`_check_silent_agents`）：agent **10 分钟无任何产出**（chat_messages assistant 行 / work_logs）→ 唤醒 + 红框；持续 30 分钟 → 通知上级。覆盖"接活后当场死亡、名下无待回复消息"的盲区。
+
+**P0-3 跨轮 STALL BREAK 账本**（`agents/agent.py`）：streamer 的 `tool_loop_stall` 检测（同轮内连续无进展工具调用）触发 `[STALL BREAK]` 结束当前 turn。跨轮账本 `_stall_break_ledger` 记录每次 stall break 时间戳；30 分钟内第 2 次 → agent disposition=blocked + `[AGENT STUCK]` 升级上级。防止"有产出但无进展"的 agent 无限空转。
+
 - **peer-review 死锁拆解已禁用**（互审卡住由领导催，平台不自动拆）
-- **失联观测看门狗**（`_check_silent_agents`）：agent **10 分钟无任何产出** → 唤醒 + 红框；持续 30 分钟 → 通知上级
 
 ### 前端
 
