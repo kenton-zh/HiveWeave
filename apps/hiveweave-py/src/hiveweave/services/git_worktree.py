@@ -215,6 +215,55 @@ async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT) -> tuple
     return False, output
 
 
+def _porcelain_tracked_dirty(st_out: str) -> bool:
+    """True when porcelain has *tracked* changes outside .hiveweave.
+
+    Untracked (``??``) is NOT treated as main_dirty — those are handled by
+    merge-quarantine when they would be overwritten. Rejecting all porcelain
+    broke untracked quarantine (TEST20 N4 vs existing quarantine contract).
+    """
+    lines = [ln for ln in (st_out or "").splitlines() if ln.strip()]
+    if not lines:
+        return False
+    for ln in lines:
+        # porcelain v1: first two chars are XY status
+        code = ln[:2] if len(ln) >= 2 else ""
+        if code in ("??", "!!"):
+            continue  # untracked / ignored — quarantine path owns overwrite cases
+        path_part = ln[3:].strip() if len(ln) > 3 else ""
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1].strip()
+        norm = path_part.replace("\\", "/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        if norm.startswith("/"):
+            norm = norm[1:]
+        if norm == ".hiveweave" or norm.startswith(".hiveweave/"):
+            continue
+        return True
+    return False
+
+
+# Back-compat alias used by older call sites / tests
+def _porcelain_non_hiveweave_dirty(st_out: str) -> bool:
+    return _porcelain_tracked_dirty(st_out)
+
+
+async def _target_worktree_is_dirty(workspace_path: str) -> bool:
+    """True when target has uncommitted *tracked* changes (not mere untracked)."""
+    ok_st, st_out = await _git(["status", "--porcelain"], workspace_path)
+    return bool(ok_st and _porcelain_tracked_dirty(st_out or ""))
+
+
+async def _abort_landed_merge(workspace_path: str) -> bool:
+    """Undo a bad merge on target — reset to ORIG_HEAD or merge --abort."""
+    ok_reset, _ = await _git(["reset", "--hard", "ORIG_HEAD"], workspace_path)
+    if ok_reset:
+        return True
+    ok_abort, _ = await _git(["merge", "--abort"], workspace_path)
+    return ok_abort
+
+
 async def _auto_checkpoint_dirty_target(
     workspace_path: str, target_branch: str
 ) -> bool:
@@ -578,6 +627,7 @@ coverage/
             if not _force_clear_path(path):
                 # TEST16 P0-2: stale path locked (Windows node_modules etc.)
                 # — try alternate directory name instead of hard-failing.
+                original_path = path
                 for suffix in ("-b", "-c", "-d"):
                     alt = path + suffix
                     # L5: if alt already exists as a valid worktree, reuse it
@@ -589,6 +639,13 @@ coverage/
                             reuse=alt,
                         )
                         path = alt
+                        await _log_worktree_rebuild_event(
+                            workspace_path,
+                            short_id,
+                            reason="stale_path_reuse_existing",
+                            original=original_path,
+                            path=alt,
+                        )
                         break
                     if not Path(alt).exists():
                         log.warning(
@@ -597,6 +654,13 @@ coverage/
                             fallback=alt,
                         )
                         path = alt
+                        await _log_worktree_rebuild_event(
+                            workspace_path,
+                            short_id,
+                            reason="stale_path_fallback",
+                            original=original_path,
+                            path=alt,
+                        )
                         break
                 else:
                     return {
@@ -988,20 +1052,17 @@ coverage/
                     "message": f"Failed to checkout {target_branch}",
                     "branch": branch}
 
-        # Dirty main (local edits / untracked) → auto checkpoint so merge
-        # is not blocked by "not a content conflict" hygiene failures.
-        # TEST13 P1-2: this is an abnormal path — warn loudly.
-        dirtied = await _auto_checkpoint_dirty_target(workspace_path, target_branch)
-        if dirtied:
-            log.warning(
-                "git_worktree.dirty_main_autosave",
-                short_id=short_id,
-                target=target_branch,
-                note=(
-                    "Project root had uncommitted changes before merge; "
-                    "auto-saved. Prefer writing only in agent worktrees."
+        # Dirty main → hard reject (no auto-commit spam on main history).
+        if await _target_worktree_is_dirty(workspace_path):
+            return {
+                "success": False,
+                "reason": "main_dirty",
+                "message": (
+                    "MAIN has uncommitted changes; clean or commit on a side "
+                    "branch first. Auto-save to main history is disabled."
                 ),
-            )
+                "branch": branch,
+            }
 
         # Capture files covered by this branch before merge mutates history
         ok_f, files_out = await _git(
@@ -1086,13 +1147,35 @@ coverage/
                 f"({cleanup_err}); reconcile will retry later."
             )
 
-        # merge 成功 ≠ main 干净 — 残留冲突标记会随提交一并落地。
-        # 扫描目标树并随结果返回, 由调用方 (git_worktree_merge tool) 路由清理。
+        # merge 成功 ≠ main 干净 — 残留冲突标记会随提交一并落地 → abort。
         marker_files = scan_conflict_markers(workspace_path)
         if marker_files:
-            log.warning("git_worktree.merge_markers_found",
-                        short_id=short_id, target=target_branch,
-                        files=marker_files[:10])
+            log.warning(
+                "git_worktree.merge_markers_found",
+                short_id=short_id,
+                target=target_branch,
+                files=marker_files[:10],
+            )
+            aborted = await _abort_landed_merge(workspace_path)
+            if not aborted:
+                log.error(
+                    "git_worktree.merge_marker_abort_failed",
+                    short_id=short_id,
+                    target=target_branch,
+                )
+            return {
+                "success": False,
+                "reason": "conflict_markers_landed",
+                "conflicts": marker_files,
+                "message": (
+                    f"Merge aborted: conflict markers landed on {target_branch}: "
+                    f"{', '.join(marker_files[:8])}. "
+                    f"Remove markers in the worktree branch and retry merge."
+                ),
+                "branch": branch,
+                "files": branch_files,
+                "short_id": short_id,
+            }
 
         already = "already up to date" in (merge_out or "").lower()
         log.info("git_worktree.merge", short_id=short_id,
@@ -1116,8 +1199,6 @@ coverage/
             result["cleanup_warning"] = cleanup_note.strip()
             base = result.get("message") or "Worktree merged"
             result["message"] = f"{base}{cleanup_note}"
-        if marker_files:
-            result["conflict_markers"] = marker_files
         return result
 
     async def merge_by_branch(self, workspace_path: str, branch: str,
@@ -1153,7 +1234,16 @@ coverage/
             return {"success": False,
                     "message": f"Failed to checkout {target_branch}"}
 
-        await _auto_checkpoint_dirty_target(workspace_path, target_branch)
+        if await _target_worktree_is_dirty(workspace_path):
+            return {
+                "success": False,
+                "reason": "main_dirty",
+                "message": (
+                    "MAIN has uncommitted changes; clean or commit on a side "
+                    "branch first. Auto-save to main history is disabled."
+                ),
+                "branch": branch,
+            }
 
         # Step 1: Rebase worktree branch onto target_branch to minimize conflicts
         wt_path = _worktree_path(workspace_path, short_id) if short_id else ""
@@ -1381,12 +1471,34 @@ coverage/
                     f"({cleanup_err}); reconcile will retry later."
                 )
 
-        # merge 成功 ≠ main 干净 — 扫描残留冲突标记, 交给调用方路由清理
         marker_files = scan_conflict_markers(workspace_path)
         if marker_files:
-            log.warning("git_worktree.merge_markers_found",
-                        branch=branch, target=target_branch,
-                        files=marker_files[:10])
+            log.warning(
+                "git_worktree.merge_markers_found",
+                branch=branch,
+                target=target_branch,
+                files=marker_files[:10],
+            )
+            aborted = await _abort_landed_merge(workspace_path)
+            if not aborted:
+                log.error(
+                    "git_worktree.merge_marker_abort_failed",
+                    branch=branch,
+                    target=target_branch,
+                )
+            return {
+                "success": False,
+                "reason": "conflict_markers_landed",
+                "conflicts": marker_files,
+                "message": (
+                    f"Merge aborted: conflict markers landed on {target_branch}: "
+                    f"{', '.join(marker_files[:8])}. "
+                    f"Remove markers in the worktree branch and retry merge."
+                ),
+                "branch": branch,
+                "files": branch_files,
+                "short_id": short_id,
+            }
 
         already = "already up to date" in (merge_out or "").lower()
         log.info("git_worktree.merge_by_branch", branch=branch,
@@ -1410,8 +1522,6 @@ coverage/
             result["cleanup_warning"] = cleanup_note.strip()
             base = result.get("message") or "Worktree merged"
             result["message"] = f"{base}{cleanup_note}"
-        if marker_files:
-            result["conflict_markers"] = marker_files
         if verification_errors:
             result["verification_warnings"] = verification_errors
         return result
@@ -1770,6 +1880,68 @@ async def _resolve_base_branch(workspace_path: str) -> str | None:
     return None
 
 
+async def _agent_id_for_short_id(
+    workspace_path: str, short_id: str
+) -> str | None:
+    """Resolve agent UUID from short_id via project DB (best-effort)."""
+    conn = await _project_db_if_exists(workspace_path)
+    if not conn:
+        return None
+    try:
+        cur = await conn.execute(
+            "SELECT id FROM agents WHERE short_id = ? LIMIT 1",
+            [short_id],
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            return row["id"] if "id" in row.keys() else row[0]
+    except Exception:
+        pass
+    return None
+
+
+async def _log_worktree_rebuild_event(
+    workspace_path: str,
+    short_id: str,
+    *,
+    reason: str,
+    original: str,
+    path: str,
+) -> None:
+    """Fire-and-forget audit when stale path fallback/reuse occurs (TEST21 M11)."""
+    agent_id = await _agent_id_for_short_id(workspace_path, short_id)
+    if not agent_id:
+        return
+    head = ""
+    ok_h, head_out = await _git(["rev-parse", "HEAD"], path if _has_git(path) else workspace_path)
+    if ok_h and head_out:
+        head = head_out.strip()
+    project_id = ""
+    try:
+        from hiveweave.services.agent_router import agent_router
+
+        project_id = agent_router.get_project_id(agent_id) or ""
+    except Exception:
+        pass
+    try:
+        from hiveweave.services.event_audit import event_audit
+
+        await event_audit.log(
+            agent_id,
+            project_id,
+            "worktree_rebuild",
+            {
+                "reason": reason,
+                "original": original,
+                "path": path,
+                "head": head,
+            },
+        )
+    except Exception as e:
+        log.debug("worktree_rebuild_audit_failed", error=str(e))
+
+
 async def _project_db_if_exists(workspace_path: str):
     """项目 DB 存在才连接 — 对账绝不为了查任务表而新建 DB。"""
     db_file = Path(workspace_path) / ".hiveweave" / "data.db"
@@ -1850,11 +2022,17 @@ _IN_FLIGHT_AFTER_MERGE_STATUSES = frozenset({
 
 
 async def _protected_worktree_short_ids(workspace_path: str) -> set[str]:
-    """short_ids reconcile must not rmtree.
+    """Directory basenames reconcile must not rmtree.
 
     TEST4: protect only assignees with non-terminal / pending-merge tasks.
     Active executors with all tasks closed must be eligible for cleanup —
     otherwise worktree dirs linger forever after merge+close.
+
+    P1-5: protect by ``basename(workspace_path)`` (the actual directory the
+    agent uses) rather than ``short_id``. When an agent's worktree is
+    recreated under a new directory (e.g. A024 → A024-b after a stale
+    cleanup), the old orphan directory must NOT be protected by the
+    short_id match — only the live directory is.
     """
     protected: set[str] = set()
     conn = await _project_db_if_exists(workspace_path)
@@ -1865,22 +2043,25 @@ async def _protected_worktree_short_ids(workspace_path: str) -> set[str]:
     if conn is None:
         return protected
     try:
-        # Assignees with non-terminal tasks — even if agent status drifted
+        # Assignees with non-terminal tasks — protect their actual workspace dir
         placeholders = ", ".join("?" * len(_PROTECT_TASK_STATUSES))
         cur = await conn.execute(
-            f"SELECT DISTINCT a.short_id FROM tasks t "
+            f"SELECT DISTINCT a.workspace_path FROM tasks t "
             f"JOIN agents a ON a.id = t.assignee_id "
             f"WHERE COALESCE(t.is_archived, 0) = 0 "
             f"AND t.status IN ({placeholders}) "
-            f"AND a.short_id IS NOT NULL AND TRIM(a.short_id) != ''",
+            f"AND a.workspace_path IS NOT NULL AND TRIM(a.workspace_path) != ''",
             list(_PROTECT_TASK_STATUSES),
         )
         rows = await cur.fetchall()
         await cur.close()
         for r in rows:
-            sid = (r["short_id"] or "").strip()
-            if sid:
-                protected.add(sid)
+            wp = (r["workspace_path"] or "").strip()
+            if wp:
+                # Protect the basename of the actual workspace directory
+                basename = Path(wp).name
+                if basename:
+                    protected.add(basename)
     except Exception as e:
         log.warning(
             "git_worktree.reconcile_protected_lookup_failed",
@@ -1989,6 +2170,7 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
         "removed_dirs": 0,
         "deleted_branches": [],
         "preserved_branches": [],
+        "ttl_deleted_branches": [],
         "errors": [],
     }
     wt_root = Path(workspace_path) / WORKTREE_DIR
@@ -2132,6 +2314,36 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
             else:
                 report["errors"].append(f"branch -d {b} failed: {out_d}")
         else:
+            # TEST21 M11: TTL GC for stale resubmit/hotfix suffix branches (>7d)
+            _TTL_BRANCH_RE = re.compile(
+                r"(?:/resubmit|/hotfix|/-b$|/-c$|/-d$|resubmit|hotfix)",
+                re.IGNORECASE,
+            )
+            ttl_deleted = False
+            if _TTL_BRANCH_RE.search(b):
+                ok_ct, ct_out = await _git(
+                    ["log", "-1", "--format=%ct", b], workspace_path
+                )
+                if ok_ct and (ct_out or "").strip().isdigit():
+                    age_s = time.time() - int(ct_out.strip())
+                    if age_s > 7 * 86400:
+                        ok_d, out_d = await _git(
+                            ["branch", "-D", b], workspace_path
+                        )
+                        if ok_d:
+                            report["ttl_deleted_branches"].append(b)
+                            log.info(
+                                "git_worktree.reconcile_branch_ttl_deleted",
+                                workspace=workspace_path,
+                                branch=b,
+                            )
+                            ttl_deleted = True
+                        else:
+                            report["errors"].append(
+                                f"branch -D {b} (ttl) failed: {out_d}"
+                            )
+            if ttl_deleted:
+                continue
             ok_h, head = await _git(
                 ["rev-parse", "--short", b], workspace_path)
             report["preserved_branches"].append({
@@ -2306,6 +2518,26 @@ async def ensure_executor_worktree(
         "short_id": short_id,
         "branch": result.get("branch"),
     }
+
+
+async def worktree_commits_behind_main(
+    workspace_path: str, worktree_path: str
+) -> int:
+    """Count commits the worktree HEAD is behind main (best-effort, 0 on error).
+
+    Uses ``git rev-list --count HEAD..<base>`` in the worktree directory.
+    Returns 0 if the worktree is up-to-date or the check fails.
+    """
+    base = await _resolve_base_branch(workspace_path)
+    ok, out = await _git(
+        ["rev-list", "--count", f"HEAD..{base}"], worktree_path
+    )
+    if not ok:
+        return 0
+    try:
+        return int(out.strip())
+    except (ValueError, TypeError):
+        return 0
 
 
 def pin_dispatch_message_to_worktree(

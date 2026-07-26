@@ -954,6 +954,144 @@ async def check_agent_status_tool(
     )
 
 
+# ── check_agent_progress ─────────────────────────────────
+
+
+class CheckAgentProgressParams(BaseModel):
+    """Parameters for check_agent_progress tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    agent_id: str = Field(
+        alias="agentId",
+        description=(
+            "Target agent: 花名, short_id (e.g. A002), or UUID. "
+            "CEO read-only cross-level progress check."
+        ),
+        json_schema_extra={"aliases": ["agentId", "agent_id", "name", "target"]},
+    )
+
+
+@tool(
+    "check_agent_progress",
+    "CEO read-only cross-level progress: disposition, open obligations, "
+    "last output time. Does NOT send messages or wake anyone.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def check_agent_progress_tool(
+    params: CheckAgentProgressParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """Structured progress snapshot for one agent (no wake, no messages)."""
+    if not ctx or not getattr(ctx, "org", None):
+        return ToolResult.err("OrgService not available (ctx.org is missing)")
+
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project_id")
+
+    target_ref = (params.agent_id or "").strip()
+    if not target_ref:
+        return ToolResult.err("check_agent_progress requires agentId")
+
+    resolved = await resolve_agent_id(project_id, target_ref, ctx.org)
+    if not resolved:
+        return ToolResult.err(
+            f'No agent found matching "{target_ref}". '
+            "Use 花名, short_id, or UUID."
+        )
+    target = await ctx.org.get_agent(resolved)
+    if not target:
+        return ToolResult.err(f'No agent found matching "{target_ref}".')
+    if target.get("project_id") and target["project_id"] != project_id:
+        return ToolResult.err(f'Agent "{target_ref}" is not in your project.')
+
+    tid = target["id"]
+    name = target.get("name") or "?"
+    short = target.get("short_id") or "?"
+
+    disposition = "unknown"
+    execution = "unknown"
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+
+        live = agent_manager.get_agent(tid)
+        if live is not None:
+            disposition = getattr(live, "disposition", None) or "runnable"
+            execution = live.status.value
+        else:
+            disposition = "not_running"
+            execution = "idle"
+    except Exception:
+        pass
+
+    obligations: list[dict] = []
+    try:
+        from hiveweave.services.task import TaskService
+
+        obligations = await TaskService().get_actionable_obligations(
+            project_id, tid
+        )
+    except Exception:
+        pass
+
+    last_output_ms: int | None = None
+    last_output_kind = ""
+    try:
+        from hiveweave.db import project as project_db
+
+        conn = await project_db.get_project_db_by_project_id(project_id)
+        cur = await conn.execute(
+            "SELECT MAX(created_at) AS ts FROM chat_messages "
+            "WHERE agent_id = ? AND role = 'assistant'",
+            [tid],
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        chat_ts = row["ts"] if row and row["ts"] else None
+        cur2 = await conn.execute(
+            "SELECT MAX(created_at) AS ts FROM work_logs WHERE agent_id = ?",
+            [tid],
+        )
+        row2 = await cur2.fetchone()
+        await cur2.close()
+        log_ts = row2["ts"] if row2 and row2["ts"] else None
+        if chat_ts and (not log_ts or chat_ts >= log_ts):
+            last_output_ms = int(chat_ts)
+            last_output_kind = "chat"
+        elif log_ts:
+            last_output_ms = int(log_ts)
+            last_output_kind = "work_log"
+    except Exception:
+        pass
+
+    import time as _time
+
+    last_line = "never"
+    if last_output_ms:
+        ago_min = max(0, int((_time.time() * 1000 - last_output_ms) / 60000))
+        last_line = f"{ago_min} min ago ({last_output_kind})"
+
+    obl_lines = []
+    for o in obligations[:12]:
+        obl_lines.append(
+            f"  - [{o.get('role_hint', '?')}] "
+            f"{o.get('status', '?')} "
+            f"{(o.get('title') or '')[:50]} "
+            f"(id={str(o.get('id', ''))[:8]})"
+        )
+    obl_block = "\n".join(obl_lines) if obl_lines else "  (none)"
+
+    text = (
+        f"**{name}** ({short})\n"
+        f"- disposition: {disposition}\n"
+        f"- execution: {execution}\n"
+        f"- last output: {last_line}\n"
+        f"- open obligations ({len(obligations)}):\n{obl_block}"
+    )
+    return ToolResult.ok(text)
+
+
 # ── get_platform_state ───────────────────────────────────
 
 

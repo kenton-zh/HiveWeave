@@ -49,7 +49,13 @@ AWAITING_REPLY_MS = 3 * 60 * 1000     # 3 min
 # 潮汐事故: agent 沉默观测 — 无任何产出的失联检测（消息轴/任务轴看门狗的盲区）
 SILENCE_THRESHOLD_MS = 10 * 60 * 1000        # 10 min 无任何产出判定失联
 SILENCE_NOTIFY_MS = 30 * 60 * 1000           # 失联持续 30 min 升级通知上级
-SILENCE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000  # 同一 agent 上级通知 30 min 冷却
+SILENCE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000  # legacy floor; M7 uses backoff below
+# TEST21 M7: exponential notify cooldown 10min → 30min → 2h
+SILENCE_NOTIFY_BACKOFF_MS = (
+    10 * 60 * 1000,
+    30 * 60 * 1000,
+    2 * 60 * 60 * 1000,
+)
 # 修 #4: 未激活 agent 检测 — created_at 超过阈值且 activated_at IS NULL
 DEAD_AGENT_THRESHOLD_MS = 5 * 60 * 1000   # 5 min 未激活 → 重试 start_agent
 DEAD_AGENT_MAX_RETRIES = 3                 # 连续失败 3 次后升级给 CEO
@@ -1082,10 +1088,25 @@ class GameTimeService:
             assignee = t.get("assignee_id")
             if not tid or not assignee:
                 continue
+            # TEST21 M5: owner parked — stall mute until agent recovers
+            if t.get("owner_parked"):
+                continue
             if str(assignee) in live_wait_agents:
                 # Legally waiting — do not stall-wake (would burn quota +
                 # fight WAIT_WITHOUT_ASK if waits were cleared)
                 continue
+            # P0-3: mutual exclusion — skip agents recently stall-broken
+            # (STALL BREAK already parked/escalated; nudge is redundant)
+            try:
+                from hiveweave.agents.supervisor import agent_manager as _am
+
+                _inst = _am.get_agent(str(assignee))
+                if _inst is not None:
+                    _lsb = getattr(_inst, "_last_stall_break_ms", 0) or 0
+                    if _lsb and now_ms - _lsb < 5 * 60 * 1000:
+                        continue
+            except Exception:
+                pass
             age = _effective_age_ms(t)
             if age < thresh:
                 task_stall_counts.pop(tid, None)
@@ -1863,7 +1884,9 @@ class GameTimeService:
         恢复：重新产出后广播 agent_health ok 解除红框。
 
         豁免（复用既有判断）：processing 中 / waiting_*、blocked disposition
-        且有未过期 wait contract / 项目 is_started=0 / 系统 paused。
+        且有未过期 wait contract / 项目 is_started=0 / 系统 paused /
+        **无义务的合法 idle**（TEST21 M7：无 actionable obligations、
+        无入站 unreplied ask、无 wait、或 idle_acknowledged）。
         """
         state = _states.get(project_id)
         if not state:
@@ -1932,10 +1955,13 @@ class GameTimeService:
                 aid = r["agent_id"]
                 last_output[aid] = max(last_output.get(aid, 0), int(r["last_ts"]))
 
-        # {agent_id: {"flagged": bool, "wake_ts": int, "notify_ts": int}}
+        # {agent_id: {"flagged","wake_ts","notify_ts","notify_count","idle_acknowledged"}}
         trackers: dict = state.setdefault("silence_trackers", {})
 
         from hiveweave.realtime.event_bus import status_event_bus
+        from hiveweave.services.task import TaskService
+
+        task_svc = TaskService()
 
         for a in agents:
             aid = a["id"]
@@ -1954,11 +1980,55 @@ class GameTimeService:
                 if disp == "complete":
                     continue
 
+            tracker = trackers.get(aid) or {
+                "flagged": False,
+                "wake_ts": 0,
+                "notify_ts": 0,
+                "notify_count": 0,
+                "idle_acknowledged": False,
+            }
+
+            # TEST21 M7: legal idle — no duty → never red-box / escalate
+            if tracker.get("idle_acknowledged"):
+                trackers[aid] = tracker
+                continue
+            try:
+                obligations = await task_svc.get_actionable_obligations(
+                    project_id, aid
+                )
+            except Exception:
+                obligations = []
+            inbound_ask = False
+            try:
+                ask_rows = await _query(
+                    project_id,
+                    "SELECT COUNT(*) AS c FROM inbox "
+                    "WHERE to_agent_id = ? AND expect_report = 1 "
+                    "AND COALESCE(read, 0) = 0",
+                    [aid],
+                )
+                inbound_ask = bool(ask_rows and int(ask_rows[0]["c"] or 0) > 0)
+            except Exception:
+                inbound_ask = False
+            if not obligations and not inbound_ask and not waits:
+                if tracker["flagged"]:
+                    tracker["flagged"] = False
+                    try:
+                        await status_event_bus.publish_stream_event(aid, {
+                            "type": "agent_health",
+                            "agentId": aid,
+                            "projectId": project_id,
+                            "health": "ok",
+                            "message": "",
+                            "at": now_ms,
+                        })
+                    except Exception:
+                        pass
+                trackers[aid] = tracker
+                continue
+
             baseline = last_output.get(aid) or int(a["created_at"] or now_ms)
             silent_ms = now_ms - baseline
-            tracker = trackers.get(aid) or {
-                "flagged": False, "wake_ts": 0, "notify_ts": 0,
-            }
 
             if silent_ms < SILENCE_THRESHOLD_MS:
                 # 有产出 → 若此前举过红框则广播 ok 解除
@@ -2010,22 +2080,30 @@ class GameTimeService:
                     log.error("silence_wake_failed",
                               agent_id=aid, error=str(e))
 
-            # ③ 失联持续超 30 min → 通知上级（同一 agent 30 min 冷却）
+            # ③ 失联持续超阈值 → 通知上级（指数退避，TEST21 M7）
+            notify_count = int(tracker.get("notify_count") or 0)
+            backoff_idx = min(notify_count, len(SILENCE_NOTIFY_BACKOFF_MS) - 1)
+            notify_cooldown = SILENCE_NOTIFY_BACKOFF_MS[backoff_idx]
             if (silent_ms >= SILENCE_NOTIFY_MS
-                    and now_ms - tracker["notify_ts"] >= SILENCE_NOTIFY_COOLDOWN_MS):
+                    and now_ms - tracker["notify_ts"] >= notify_cooldown):
                 tracker["notify_ts"] = now_ms
+                tracker["notify_count"] = notify_count + 1
                 parent_id = a["parent_id"]
                 if parent_id:
                     log.warning("silence_escalated",
                                 project_id=project_id, agent_id=aid,
-                                parent_id=parent_id, silent_minutes=minutes)
+                                parent_id=parent_id, silent_minutes=minutes,
+                                notify_count=tracker["notify_count"],
+                                cooldown_ms=notify_cooldown)
                     try:
                         from hiveweave.services.inbox import InboxService
                         await InboxService().send_message(
                             "system", parent_id,
                             f"[SILENCE WATCHDOG] 你的下属 {a['name']} 已 "
                             f"{minutes} 分钟无任何产出（chat/work_log），"
-                            "唤醒尝试未恢复，请介入检查。",
+                            "唤醒尝试未恢复，请介入检查。"
+                            f"（第 {tracker['notify_count']} 次上报；"
+                            "若确认为合法 idle，可忽略——平台下次会拉长间隔）",
                             message_type="system", priority="urgent")
                         await self._watchdog_trigger(parent_id)
                     except Exception as e:
@@ -2038,6 +2116,26 @@ class GameTimeService:
                                 agent_id=aid, name=a["name"])
 
             trackers[aid] = tracker
+
+    async def acknowledge_idle(
+        self, project_id: str, agent_id: str, *, acknowledged: bool = True
+    ) -> None:
+        """Mark agent as known-idle so silence watchdog stops escalating (M7)."""
+        state = _states.get(project_id)
+        if not state:
+            return
+        trackers: dict = state.setdefault("silence_trackers", {})
+        tracker = trackers.get(agent_id) or {
+            "flagged": False,
+            "wake_ts": 0,
+            "notify_ts": 0,
+            "notify_count": 0,
+            "idle_acknowledged": False,
+        }
+        tracker["idle_acknowledged"] = bool(acknowledged)
+        if acknowledged:
+            tracker["flagged"] = False
+        trackers[agent_id] = tracker
 
     @staticmethod
     def _format(game_seconds: int) -> str:

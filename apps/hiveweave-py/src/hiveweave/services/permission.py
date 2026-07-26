@@ -46,9 +46,11 @@ _BASE_TOOLS = frozenset({
 
 CEO_TOOLS = _BASE_TOOLS | frozenset({
     # CEO: 行政 + 里程碑验收。无写码/bash/test 工具。
+    "check_agent_progress",
     "write_file",  # docs/shared/charter scope only via policy hard gate
     "create_task", "dispatch_task", "review_task",
     "cancel_task", "unclaim_task", "reassign_task", "waive_attestation",
+    "waive_merge",
     "save_charter", "update_goals", "dismiss_agent", "transfer_agent",
     # merge/remove 仅作升级兜底 —— create 仍由系统侧在 dispatch/hire 时建
     "git_worktree_merge", "git_worktree_remove",
@@ -65,6 +67,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     "create_task", "dispatch_task", "review_task",
     # 台账出口：废弃/释放误绑任务 + 豁免 attestation（policy 已映射 DISPATCH/REVIEW）
     "cancel_task", "unclaim_task", "reassign_task", "waive_attestation",
+    "waive_merge",
     "save_charter", "update_goals", "dismiss_agent", "transfer_agent",
     # merge/remove only — create is system-side on dispatch/hire
     "git_worktree_merge", "git_worktree_remove",
@@ -120,6 +123,7 @@ ALL_TOOLS = READWRITE_TOOLS | COORDINATOR_BUILDER_TOOLS | HR_TOOLS | frozenset({
 COORDINATOR_ONLY_TOOLS = frozenset({
     "create_task", "dispatch_task", "review_task",
     "cancel_task", "unclaim_task", "reassign_task", "waive_attestation",
+    "waive_merge",
     "git_worktree_merge", "git_worktree_remove",
 })
 

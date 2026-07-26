@@ -18,6 +18,7 @@ nudges — otherwise agents can talk-complete forever (assignee_worked removed).
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
@@ -28,6 +29,11 @@ from hiveweave.hooks import AGENT_TURN_AFTER, hooks
 log = structlog.get_logger(__name__)
 
 DEFER_TOOL = "defer_task_advance"
+
+# P2: minimum obligation age before task-advance nudge fires (aligned with
+# the smallest TASK_STALL_THRESHOLDS entry: "created" = 5 min). Prevents
+# nagging a coordinator 22 seconds after dispatching a task.
+_OBLIGATION_MIN_AGE_MS = 5 * 60 * 1000
 
 # Tools that count as advancing a specific task id (ledger movement).
 _LEDGER_ADVANCE_TOOLS = frozenset({
@@ -131,10 +137,19 @@ def remaining_obligations(
     obligations: list[dict],
     advanced: set[str],
 ) -> list[dict]:
+    now_ms = int(time.time() * 1000)
     out: list[dict] = []
     for t in obligations or []:
         tid = str(t.get("id") or "")
         if not tid or _id_match(tid, advanced):
+            continue
+        # P2: skip freshly created/dispatched tasks (age < 5 min)
+        ts = t.get("updated_at") or t.get("created_at") or 0
+        try:
+            age_ms = now_ms - int(ts)
+        except (ValueError, TypeError):
+            age_ms = _OBLIGATION_MIN_AGE_MS  # unknown age → don't filter
+        if age_ms < _OBLIGATION_MIN_AGE_MS:
             continue
         out.append(t)
     return out

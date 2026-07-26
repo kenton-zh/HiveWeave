@@ -2,20 +2,27 @@
 
 P0: refuse reserved binds in agent tools and register start_dev_server.
 P2: spawn_project_process injects reserved-port env and rewrites known CLIs.
+TEST21 M11: persist registry to JSON; hydrate + prune dead PIDs on lookup.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import structlog
 
 log = structlog.get_logger(__name__)
+
+_REGISTRY_PATH = (
+    Path(__file__).resolve().parents[3] / "data" / "process_registry.json"
+)
 
 # HiveWeave platform — project apps must never bind these
 RESERVED_PORTS: frozenset[int] = frozenset({4000, 5173, 4173})
@@ -98,9 +105,99 @@ class ProcessRecord:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ProcessRecord:
+        return cls(
+            project_id=str(data.get("project_id") or ""),
+            port=int(data.get("port") or 0),
+            pid=data.get("pid"),
+            cwd=str(data.get("cwd") or ""),
+            command=str(data.get("command") or ""),
+            worktree=str(data.get("worktree") or ""),
+            commit=str(data.get("commit") or ""),
+            created_at=float(data.get("created_at") or time.time()),
+        )
 
-# In-memory registry (per server process). Persisted DB optional later.
+
+# In-memory registry (per server process), hydrated from disk on lookup.
 _registry: dict[str, ProcessRecord] = {}  # key: f"{project_id}:{port}"
+_hydrated = False
+
+
+def _is_pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            return False
+        except Exception:
+            return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def _persist_registry() -> None:
+    try:
+        _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {k: v.to_dict() for k, v in _registry.items()}
+        _REGISTRY_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("process_registry_persist_failed", error=str(e))
+
+
+def hydrate_registry() -> None:
+    """Load registry from disk once; drop dead PIDs only on disk load (TEST21 M11).
+
+    In-memory entries are kept until explicit unregister / clear — lookup must
+    not wipe freshly registered records whose PID check races or is a test stub.
+    """
+    global _hydrated
+    if _hydrated:
+        return
+    _hydrated = True
+    if not _REGISTRY_PATH.exists():
+        return
+    try:
+        raw = json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return
+        loaded: dict[str, ProcessRecord] = {}
+        for key, val in raw.items():
+            if not isinstance(val, dict):
+                continue
+            rec = ProcessRecord.from_dict(val)
+            if rec.port and _is_pid_alive(rec.pid):
+                loaded[key] = rec
+        # Merge disk into memory (memory wins on key conflict)
+        for key, rec in loaded.items():
+            _registry.setdefault(key, rec)
+        if len(loaded) != len(raw):
+            _persist_registry()
+    except Exception as e:
+        log.warning("process_registry_hydrate_failed", error=str(e))
+
+
+def prune_dead_processes() -> int:
+    """Drop registry entries whose PID is gone. Returns count removed."""
+    hydrate_registry()
+    dead = [k for k, r in _registry.items() if not _is_pid_alive(r.pid)]
+    for k in dead:
+        _registry.pop(k, None)
+    if dead:
+        _persist_registry()
+    return len(dead)
 
 
 def is_reserved_port(port: int) -> bool:
@@ -178,6 +275,7 @@ def check_platform_process_kill(command: str) -> str | None:
 
 def allocate_project_port(project_id: str, preferred: int = 3000) -> int:
     """Pick first free-looking port starting at preferred (skip reserved)."""
+    hydrate_registry()
     used = {r.port for r in _registry.values() if r.project_id == project_id}
     used |= {r.port for r in _registry.values()}
     port = preferred
@@ -309,10 +407,12 @@ def spawn_project_process(
 
 
 def register(record: ProcessRecord) -> ProcessRecord:
+    hydrate_registry()
     if is_reserved_port(record.port):
         raise ValueError(f"Cannot register reserved port {record.port}")
     key = f"{record.project_id}:{record.port}"
     _registry[key] = record
+    _persist_registry()
     log.info(
         "process_registered",
         project_id=record.project_id,
@@ -324,16 +424,27 @@ def register(record: ProcessRecord) -> ProcessRecord:
 
 
 def unregister(project_id: str, port: int) -> None:
+    hydrate_registry()
     _registry.pop(f"{project_id}:{port}", None)
+    _persist_registry()
 
 
 def lookup_by_port(port: int) -> list[ProcessRecord]:
+    hydrate_registry()
     return [r for r in _registry.values() if r.port == port]
 
 
 def lookup_by_project(project_id: str) -> list[ProcessRecord]:
+    hydrate_registry()
     return [r for r in _registry.values() if r.project_id == project_id]
 
 
 def clear_registry_for_tests() -> None:
     _registry.clear()
+    global _hydrated
+    _hydrated = False
+    try:
+        if _REGISTRY_PATH.exists():
+            _REGISTRY_PATH.unlink()
+    except Exception:
+        pass

@@ -140,6 +140,7 @@ async def commit_turn_tool(
                         "REVIEWER_MUST_FINISH_REVIEW": "有 reviewing 任务待完成审查",
                         "CREATOR_MUST_REVIEW": "有 submitted/reviewing 任务待审查",
                         "CREATOR_MUST_MERGE": "有 approved 任务待合并",
+                        "UNCOMMITTED_WORKTREE": "worktree 有未提交改动",
                     }
                     # Soft-warn (reminder-class only): first hit → warn+allow;
                     # second → hard. HARD_COMMIT_GATE_CODES (UNREPLIED_ASKS)

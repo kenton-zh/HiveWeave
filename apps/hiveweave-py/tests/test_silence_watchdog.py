@@ -108,6 +108,33 @@ async def _insert_work_log(env, agent_id, created_at):
     await conn.commit()
 
 
+async def _insert_open_task(env, assignee_id, *, status="running"):
+    """TEST21 M7: silence only fires when agent has duty — seed an open task.
+
+    Raw INSERT (no TaskService.start_task) so we do not write a fresh work_log
+    that would reset the silence baseline to "just now".
+    """
+    from hiveweave.services import task as task_mod
+
+    task_mod._migrated.discard(PROJECT_ID)
+    await task_mod._ensure_schema(PROJECT_ID)
+    tid = str(uuid.uuid4())
+    now = _now_ms()
+    # Use an old updated_at so the task itself does not look like recent activity
+    old = now - 40 * 60 * 1000
+    conn = await ensure_project_db(env["workspace_path"])
+    await conn.execute(
+        "INSERT INTO tasks (id, project_id, title, description, status, "
+        "progress, creator_id, assignee_id, created_at, updated_at, "
+        "is_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        [tid, PROJECT_ID, "Silence duty task", "keep agent on duty",
+         status, 20 if status == "running" else 10,
+         CEO_ID, assignee_id, old, old],
+    )
+    await conn.commit()
+    return tid
+
+
 async def _insert_wait(env, agent_id, expires_at):
     """落盘一条 wait contract（先 list_all_active 确保 schema 已建）."""
     await wait_contract_service.list_all_active(PROJECT_ID)
@@ -158,6 +185,7 @@ async def test_silent_agent_triggers_wake_redbox_and_superior_notify(env, monkey
 
     old = _now_ms() - 40 * 60 * 1000
     await _insert_agent(env, EXECUTOR_ID, "潮汐", parent_id=CEO_ID, created_at=old)
+    await _insert_open_task(env, EXECUTOR_ID)
     _seed_state()
 
     mock_trigger = AsyncMock()
@@ -281,6 +309,7 @@ async def test_expired_contract_does_not_exempt(env, monkeypatch):
     old = _now_ms() - 20 * 60 * 1000
     await _insert_agent(env, EXECUTOR_ID, "潮汐", created_at=old)
     await _insert_wait(env, EXECUTOR_ID, expires_at=_now_ms() - 60_000)
+    await _insert_open_task(env, EXECUTOR_ID)
     _seed_state()
 
     mock_trigger = AsyncMock()
@@ -322,6 +351,7 @@ async def test_user_messages_do_not_count_as_output(env, monkeypatch):
     await _insert_agent(env, EXECUTOR_ID, "潮汐", created_at=now - 3600_000)
     # 1 小时前收到过背景 user 消息（trigger 上下文），但从未自己产出
     await _insert_chat(env, EXECUTOR_ID, "user", created_at=now - 3600_000)
+    await _insert_open_task(env, EXECUTOR_ID)
     _seed_state()
 
     mock_trigger = AsyncMock()
@@ -347,6 +377,7 @@ async def test_recovery_broadcasts_ok_and_clears_flag(env, monkeypatch):
         "hiveweave.agents.supervisor.agent_manager.get_agent", lambda aid: None)
     old = _now_ms() - 40 * 60 * 1000
     await _insert_agent(env, EXECUTOR_ID, "潮汐", created_at=old)
+    await _insert_open_task(env, EXECUTOR_ID)
     _seed_state()
 
     svc = GameTimeService()
@@ -380,7 +411,7 @@ async def test_recovery_broadcasts_ok_and_clears_flag(env, monkeypatch):
 
 
 async def test_cooldown_suppresses_repeat_wake_and_notify(env, monkeypatch):
-    """同一 agent：wake 冷却（15 min）与 notify 冷却（30 min）内不重复动作；
+    """同一 agent：wake 冷却（15 min）与 notify 指数退避内不重复动作；
     手动把 tracker 时间戳拨回过期后可再次触发."""
     monkeypatch.setattr(
         "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
@@ -388,6 +419,7 @@ async def test_cooldown_suppresses_repeat_wake_and_notify(env, monkeypatch):
         "hiveweave.agents.supervisor.agent_manager.get_agent", lambda aid: None)
     old = _now_ms() - 40 * 60 * 1000
     await _insert_agent(env, EXECUTOR_ID, "潮汐", parent_id=CEO_ID, created_at=old)
+    await _insert_open_task(env, EXECUTOR_ID)
     _seed_state()
 
     svc = GameTimeService()
@@ -413,7 +445,22 @@ async def test_cooldown_suppresses_repeat_wake_and_notify(env, monkeypatch):
         # 拨回 tracker 时间戳模拟冷却过期 → 第 3 轮再次 wake + notify
         tracker = _trackers()[EXECUTOR_ID]
         tracker["wake_ts"] -= game_time.STALL_COOLDOWN_MS
-        tracker["notify_ts"] -= game_time.SILENCE_NOTIFY_COOLDOWN_MS
+        # M7: after 1st notify, next cooldown is SILENCE_NOTIFY_BACKOFF_MS[1]
+        # (notify_count==1 → idx 1 → 30min)
+        tracker["notify_ts"] -= game_time.SILENCE_NOTIFY_BACKOFF_MS[1]
         await svc._check_silent_agents(PROJECT_ID)
         assert len(_health_events(mock_bus, "error")) == 2
         assert mock_inbox.await_count == 2
+
+
+async def test_legal_idle_without_duty_skips_silence(env, monkeypatch):
+    """TEST21 M7: no obligations / asks / waits → legal idle, no red-box."""
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent", lambda aid: None)
+    old = _now_ms() - 40 * 60 * 1000
+    await _insert_agent(env, EXECUTOR_ID, "天线", parent_id=CEO_ID, created_at=old)
+    _seed_state()
+    with _started_mock(1):
+        await _assert_no_action(env, GameTimeService())

@@ -47,6 +47,30 @@ def resolve_task_policy(
 
     return _resolve(title, tags, description)
 
+
+class MergeRequiredError(ValueError):
+    """Close blocked: code task still has unmerged / undelivered worktree output.
+
+    Callers (approve auto-close, VERIFY parent close) must surface this as a
+    hard gate — never swallow and close anyway (TEST20 P0-A / N1).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        task_id: str | None = None,
+        commits_ahead: int | None = None,
+        dirty_count: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.task_id = task_id
+        self.commits_ahead = commits_ahead
+        self.dirty_count = dirty_count
+
+
 # 合法状态转换
 _TRANSITIONS: dict[str, set[str]] = {
     "created": {"claimed", "closed", "blocked"},    # blocked: system VERIFY w/o QA
@@ -77,6 +101,11 @@ _MISSING_COLUMNS = [
     ("reviewer_id", "TEXT"),
     # Slice-driven work mode P0: declarative acceptance contract
     ("contract_json", "TEXT"),
+    # TEST21 M2: first-running locks implementer; reassign must not break evidence
+    ("implementer_id", "TEXT"),
+    ("implementer_worktree", "TEXT"),
+    # TEST21 M5: owner parked — pause task-stall nudges while agent is parked
+    ("owner_parked", "INTEGER DEFAULT 0"),
 ]
 _migrated: set[str] = set()
 
@@ -158,7 +187,7 @@ class TaskService:
         "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
         "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
         "is_archived, due_at, wait_kind, wake_at, policy_id, reviewer_id, "
-        "contract_json"
+        "contract_json, implementer_id, implementer_worktree, owner_parked"
     )
 
     async def _raise_progress_floor(
@@ -415,11 +444,16 @@ class TaskService:
         return n
 
     async def _transition(self, project_id: str, task_id: str, target: str,
-                          *, actor_id: str | None = None) -> None:
+                          *, actor_id: str | None = None,
+                          reason_code: str | None = None,
+                          detail: str | None = None) -> None:
         """Validate and execute a status transition.
 
         Raises ValueError if the task is not found or the transition is illegal.
         Writes a task_events row in the same transaction (Transactional Outbox).
+
+        TEST21 M9: system migrations pass ``reason_code`` + ``detail`` into
+        task_events.payload.
 
         Leaving ``blocked`` clears wait metadata (blocked_reason / wait_kind /
         wake_at) in the same transaction — state-machine invariant: not blocked
@@ -436,6 +470,12 @@ class TaskService:
             raise ValueError(f"Illegal transition: {current} → {target}")
         now_ms = int(time.time() * 1000)
         event_id = str(uuid.uuid4())
+        payload_obj: dict = {}
+        if reason_code:
+            payload_obj["reason_code"] = str(reason_code)[:80]
+        if detail:
+            payload_obj["detail"] = str(detail)[:500]
+        payload = json.dumps(payload_obj) if payload_obj else "{}"
         if current == "blocked":
             # Defensive: any exit from blocked clears wait metadata
             try:
@@ -444,10 +484,10 @@ class TaskService:
                      "wait_kind = NULL, wake_at = NULL, updated_at = ? WHERE id = ?",
                      [target, now_ms, task_id]),
                     ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-                     "from_status, to_status, actor_id, created_at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     "from_status, to_status, actor_id, payload, created_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                      [event_id, project_id, task_id, f"task.{target}",
-                      current, target, actor_id, now_ms]),
+                      current, target, actor_id, payload, now_ms]),
                 ])
             except Exception as e:
                 # Prefer status transition over abort; then best-effort clear
@@ -460,10 +500,10 @@ class TaskService:
                     ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                      [target, now_ms, task_id]),
                     ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-                     "from_status, to_status, actor_id, created_at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     "from_status, to_status, actor_id, payload, created_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                      [event_id, project_id, task_id, f"task.{target}",
-                      current, target, actor_id, now_ms]),
+                      current, target, actor_id, payload, now_ms]),
                 ])
                 try:
                     await _execute(
@@ -483,13 +523,14 @@ class TaskService:
                 ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                  [target, now_ms, task_id]),
                 ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-                 "from_status, to_status, actor_id, created_at) "
-                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 "from_status, to_status, actor_id, payload, created_at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                  [event_id, project_id, task_id, f"task.{target}",
-                  current, target, actor_id, now_ms]),
+                  current, target, actor_id, payload, now_ms]),
             ])
         log.info("task_transition", task_id=task_id,
-                 from_status=current, to_status=target)
+                 from_status=current, to_status=target,
+                 reason_code=reason_code)
 
         # TEST17 fix: clear agent_waits referencing this task and wake waiters.
         # wake_on=["task_transition"] was dead code — no production caller ever
@@ -498,7 +539,9 @@ class TaskService:
 
     async def _transition_multi(self, project_id: str, task_id: str,
                                *targets: str,
-                               actor_id: str | None = None) -> None:
+                               actor_id: str | None = None,
+                               reason_code: str | None = None,
+                               detail: str | None = None) -> None:
         """Validate and execute a multi-step transition atomically.
 
         Validates each step against _TRANSITIONS, then performs a single
@@ -525,18 +568,24 @@ class TaskService:
         now_ms = int(time.time() * 1000)
         final = targets[-1]
         event_id = str(uuid.uuid4())
+        payload_obj: dict = {}
+        if reason_code:
+            payload_obj["reason_code"] = str(reason_code)[:80]
+        if detail:
+            payload_obj["detail"] = str(detail)[:500]
+        payload = json.dumps(payload_obj) if payload_obj else "{}"
         await _execute_tx(project_id, [
             ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
              [final, now_ms, task_id]),
             ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-             "from_status, to_status, actor_id, created_at) "
-             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             "from_status, to_status, actor_id, payload, created_at) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
              [event_id, project_id, task_id, f"task.{final}",
-              current, final, actor_id, now_ms]),
+              current, final, actor_id, payload, now_ms]),
         ])
         log.info("task_transition_multi", task_id=task_id,
                  from_status=current, through=list(targets[:-1]),
-                 to_status=final)
+                 to_status=final, reason_code=reason_code)
 
         # L2 fix: clear wait contracts on multi-step transitions too
         # (rework path uses _transition_multi, waiters need to be woken)
@@ -685,6 +734,12 @@ class TaskService:
             if contract:
                 contract = ensure_slice_status(contract, "in_progress")
                 await self._persist_contract_json(project_id, task_id, contract)
+
+        # TEST21 M2: lock implementer on first transition to running
+        if agent_id:
+            await self.lock_implementer_if_needed(
+                project_id, task_id, str(agent_id)
+            )
 
         await self.emit_task_event(
             project_id,
@@ -1144,7 +1199,9 @@ class TaskService:
 
     async def review_task(self, project_id: str, task_id: str, decision: str,
                           feedback: str | None = None,
-                          reviewer_id: str | None = None) -> None:
+                          reviewer_id: str | None = None,
+                          *,
+                          reason_code: str | None = None) -> None:
         """Review a task (reviewing → approved/rework, or approved → rework).
 
         decision='approve': reviewing → approved.
@@ -1235,7 +1292,9 @@ class TaskService:
                     f"Illegal transition: {current_status} → rework"
                 )
             await self._transition_multi(project_id, task_id, "rework", "running",
-                                         actor_id=reviewer_id)
+                                         actor_id=reviewer_id or "system",
+                                         reason_code=reason_code or "review_rework",
+                                         detail=(feedback or "")[:500])
             await _execute(project_id,
                 "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
                 [json.dumps(evidence), now_ms, task_id])
@@ -1283,17 +1342,32 @@ class TaskService:
                 summary=f"[rework] task {task_id[:8]}",
             )
 
-    async def close_task(self, project_id: str, task_id: str) -> None:
-        """Close a task (approved|verifying → closed). Sets closed_at."""
+    async def close_task(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        skip_merge_gate: bool = False,
+        reason_code: str | None = None,
+    ) -> None:
+        """Close a task (approved|verifying → closed). Sets closed_at.
+
+        Non-VERIFY code tasks must pass the merge/delivery hard gate
+        (``_enforce_merge_on_close``). Detection alone used to stamp and
+        still close — that fail-open path is gone (TEST20 P0-A / N1).
+
+        ``skip_merge_gate`` is for ledger hygiene migrations only
+        (e.g. ``migrate_orphan_approved``).
+        """
         task_id = await self.require_task_id(project_id, task_id)
 
-        # TEST16 P1-3: merge status check before close — stamp unmerged
-        # branches so project-level GO reports can detect incomplete merges.
         task = await self.get_task(project_id, task_id)
-        if task and not self._is_verify_task(task):
-            await self._stamp_merge_status_on_close(project_id, task)
+        if task and not self._is_verify_task(task) and not skip_merge_gate:
+            await self._enforce_merge_on_close(project_id, task)
 
-        await self._transition(project_id, task_id, "closed")
+        await self._transition(
+            project_id, task_id, "closed", reason_code=reason_code
+        )
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
             "UPDATE tasks SET closed_at = ?, updated_at = ? WHERE id = ?",
@@ -1314,56 +1388,281 @@ class TaskService:
                 error=str(e),
             )
 
-    async def _stamp_merge_status_on_close(
-        self, project_id: str, task: dict
-    ) -> None:
-        """Check if assignee branch is merged; stamp evidence if not."""
-        try:
+    def _task_skips_merge_gate(self, task: dict) -> bool:
+        """docs/explore / explicit no-code / already verifying after merge."""
+        status = (task.get("status") or "").lower()
+        # verifying ⇒ merge already landed and VERIFY was spawned
+        if status == "verifying":
+            return True
+        tags = task.get("tags") or []
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except Exception:
+                tags = []
+        tag_l = {str(t).lower() for t in tags} if isinstance(tags, list) else set()
+        if tag_l & {"docs_only", "docs", "explore", "no-code", "no_code"}:
+            return True
+        policy = (task.get("policy_id") or "").lower()
+        if policy in ("docs_only", "explore"):
+            return True
+        ev = task.get("evidence") or {}
+        if isinstance(ev, str):
+            try:
+                ev = json.loads(ev)
+            except Exception:
+                ev = {}
+        if isinstance(ev, dict):
             from hiveweave.services.worktree_review import (
-                agent_worktree_path,
-                worktree_commits_ahead,
-                project_main_workspace,
+                evidence_has_merge_fact,
+                evidence_merge_waived,
             )
 
-            assignee = task.get("assignee_id")
-            if not assignee:
-                return
-            wt = await agent_worktree_path(str(assignee))
-            main_ws = await project_main_workspace(project_id)
-            if not wt or not main_ws:
-                return
-            ahead = await worktree_commits_ahead(main_ws, wt)
-            if ahead and ahead > 0:
-                log.warning(
-                    "task.closed_with_unmerged_branch",
-                    task_id=task.get("id"),
-                    assignee_id=assignee,
-                    commits_ahead=ahead,
+            if evidence_merge_waived(ev) or evidence_has_merge_fact(ev):
+                return True
+            for key in (
+                "no_code_change",
+                "noCodeChange",
+                "verification_only",
+                "verificationOnly",
+            ):
+                if ev.get(key) is True:
+                    return True
+        return False
+
+    async def _enforce_merge_on_close(
+        self, project_id: str, task: dict
+    ) -> None:
+        """Hard gate: refuse close when worktree still has effective output.
+
+        On block: restore approved(95), rebuild MERGE obligation, wake
+        merge_proxy. Explicit ``waive_merge`` / merge facts / verifying
+        status / docs-only skip the gate.
+        """
+        from hiveweave.services.worktree_review import (
+            agent_worktree_path,
+            effective_delivery,
+            evidence_has_merge_fact,
+            evidence_merge_waived,
+            project_main_workspace,
+        )
+
+        if self._task_skips_merge_gate(task):
+            return
+
+        ev = task.get("evidence") or {}
+        if isinstance(ev, str):
+            try:
+                ev = json.loads(ev)
+            except Exception:
+                ev = {}
+        if not isinstance(ev, dict):
+            ev = {}
+
+        if evidence_merge_waived(ev) or evidence_has_merge_fact(ev):
+            return
+
+        assignee = task.get("assignee_id")
+        tid = str(task.get("id") or "")
+        main_ws = await project_main_workspace(project_id)
+        wt = await agent_worktree_path(str(assignee)) if assignee else None
+
+        # Worktree already cleaned after a real merge but evidence lacked
+        # merge stamp — allow only when status was verifying (handled above)
+        # or a verification case records the merge hash.
+        if not wt or not main_ws:
+            has_case_merge = False
+            try:
+                rows = await _query(
+                    project_id,
+                    "SELECT merge_commit_hash, status FROM verification_cases "
+                    "WHERE original_task_id = ? ORDER BY created_at DESC LIMIT 1",
+                    [tid],
                 )
-                # Stamp evidence so project-level reports can detect this
-                ev = task.get("evidence")
-                if isinstance(ev, str):
-                    import json as _json
-                    try:
-                        ev = _json.loads(ev)
-                    except Exception:
-                        ev = {}
-                if not isinstance(ev, dict):
-                    ev = {}
-                ev["closed_with_unmerged_branch"] = True
-                ev["unmerged_commits_ahead"] = ahead
-                import json as _json
+                if rows:
+                    case = rows[0]
+                    if case.get("merge_commit_hash") or case.get("status") in (
+                        "passed",
+                        "in_review",
+                        "pending",
+                    ):
+                        # Case exists ⇒ merge path already ran (VERIFY spawned)
+                        has_case_merge = True
+            except Exception:
+                has_case_merge = False
+            if has_case_merge:
+                return
+            # No worktree + no merge fact while still approved = suspicious.
+            if (task.get("status") or "").lower() == "approved":
+                await self._rollback_close_to_approved(
+                    project_id,
+                    task,
+                    reason="no_worktree_no_merge_fact",
+                    commits_ahead=None,
+                    dirty_count=0,
+                )
+                raise MergeRequiredError(
+                    f"Cannot close task {tid[:8]}: assignee worktree gone and "
+                    f"no merge fact on evidence. Merge first "
+                    f"(git_worktree_merge) or waive_merge with audit reason.",
+                    reason="no_worktree_no_merge_fact",
+                    task_id=tid,
+                )
+            return
+
+        delivery = await effective_delivery(main_ws, wt)
+        ahead = delivery.get("commits_ahead")
+        dirty = int(delivery.get("dirty_count") or 0)
+        has_output = bool(delivery.get("has_effective_output"))
+
+        if has_output:
+            reason = (
+                "unmerged_commits"
+                if (ahead is not None and int(ahead) > 0)
+                else "uncommitted_dirty"
+            )
+            log.warning(
+                "task.close_blocked_unmerged",
+                task_id=tid,
+                assignee_id=assignee,
+                commits_ahead=ahead,
+                dirty_count=dirty,
+                reason=reason,
+            )
+            await self._rollback_close_to_approved(
+                project_id,
+                task,
+                reason=reason,
+                commits_ahead=ahead if isinstance(ahead, int) else None,
+                dirty_count=dirty,
+            )
+            raise MergeRequiredError(
+                f"Cannot close task {tid[:8]}: worktree still has delivery "
+                f"(commits_ahead={ahead}, dirty={dirty}). "
+                f"git_worktree_checkpoint if dirty, then git_worktree_merge, "
+                f"or waive_merge(reason=…) as last resort.",
+                reason=reason,
+                task_id=tid,
+                commits_ahead=ahead if isinstance(ahead, int) else None,
+                dirty_count=dirty,
+            )
+
+        # Clean + 0 ahead + no merge fact = zero delivery (Rita escape)
+        log.warning(
+            "task.close_blocked_no_delivery",
+            task_id=tid,
+            assignee_id=assignee,
+        )
+        await self._rollback_close_to_approved(
+            project_id,
+            task,
+            reason="no_delivery",
+            commits_ahead=0,
+            dirty_count=0,
+        )
+        raise MergeRequiredError(
+            f"Cannot close task {tid[:8]}: no effective delivery "
+            f"(0 commits ahead, clean worktree, no merge fact). "
+            f"Implement + checkpoint + merge, mark no_code_change in "
+            f"evidence, or waive_merge with audit reason.",
+            reason="no_delivery",
+            task_id=tid,
+            commits_ahead=0,
+            dirty_count=0,
+        )
+
+    async def _rollback_close_to_approved(
+        self,
+        project_id: str,
+        task: dict,
+        *,
+        reason: str,
+        commits_ahead: int | None,
+        dirty_count: int,
+    ) -> None:
+        """Stamp evidence + ensure approved status + rebuild MERGE obligation."""
+        tid = str(task.get("id") or "")
+        if not tid:
+            return
+        ev = task.get("evidence") or {}
+        if isinstance(ev, str):
+            try:
+                ev = json.loads(ev)
+            except Exception:
+                ev = {}
+        if not isinstance(ev, dict):
+            ev = {}
+        ev["close_blocked"] = True
+        ev["close_blocked_reason"] = reason
+        if commits_ahead is not None:
+            ev["unmerged_commits_ahead"] = commits_ahead
+            if commits_ahead > 0:
+                ev["closed_with_unmerged_branch"] = True  # legacy stamp name
+        if dirty_count:
+            ev["uncommitted_dirty_count"] = dirty_count
+        now_ms = int(time.time() * 1000)
+        status = (task.get("status") or "").lower()
+        # Keep / restore approved so CREATOR_MUST_MERGE stays actionable
+        if status != "approved":
+            try:
                 await _execute(
                     project_id,
-                    "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
-                    [_json.dumps(ev), int(time.time() * 1000), task["id"]],
+                    "UPDATE tasks SET status = 'approved', progress = MAX(progress, 95), "
+                    "evidence = ?, updated_at = ? WHERE id = ?",
+                    [json.dumps(ev), now_ms, tid],
+                )
+            except Exception:
+                await _execute(
+                    project_id,
+                    "UPDATE tasks SET status = 'approved', progress = 95, "
+                    "evidence = ?, updated_at = ? WHERE id = ?",
+                    [json.dumps(ev), now_ms, tid],
+                )
+        else:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+                [json.dumps(ev), now_ms, tid],
+            )
+
+        # Rebuild merge obligation + proxy wake
+        try:
+            from hiveweave.services.obligation import ObligationLedger
+
+            creator = task.get("creator_id") or task.get("reviewer_id")
+            if creator:
+                await ObligationLedger().create(
+                    project_id,
+                    str(creator),
+                    "merge",
+                    task_id=tid,
+                    context={"reason": reason, "source": "close_blocked"},
                 )
         except Exception as e:
             log.warning(
-                "stamp_merge_status_failed",
-                task_id=task.get("id"),
+                "close_blocked_merge_obligation_failed",
+                task_id=tid,
                 error=str(e),
             )
+        try:
+            from hiveweave.services.merge_proxy import escalate_merge_proxy
+
+            await escalate_merge_proxy(
+                project_id, {**task, "id": tid, "status": "approved"},
+                reason=f"close_blocked:{reason}",
+            )
+        except Exception as e:
+            log.warning(
+                "close_blocked_merge_proxy_failed",
+                task_id=tid,
+                error=str(e),
+            )
+
+    # Back-compat alias (tests / callers may still import the old name)
+    async def _stamp_merge_status_on_close(
+        self, project_id: str, task: dict
+    ) -> None:
+        await self._enforce_merge_on_close(project_id, task)
 
     async def _clear_task_wait_contracts(
         self, project_id: str, task_id: str
@@ -1535,6 +1834,8 @@ class TaskService:
         arch_payload = json.dumps({
             "archived_by": archived_by,
             "reason": reason[:500],
+            "reason_code": "agent_cancel",
+            "detail": reason[:500],
         })
         await _execute_tx(project_id, [
             # 根因修复：归档时同步置终态 status='cancelled'，避免
@@ -1648,6 +1949,101 @@ class TaskService:
 
         return current
 
+    async def lock_implementer_if_needed(
+        self,
+        project_id: str,
+        task_id: str,
+        agent_id: str,
+    ) -> None:
+        """Pin implementer_id + worktree on first running (TEST21 M2).
+
+        Reassign must not rewrite these — review evidence follows the
+        implementer worktree, not the current assignee.
+        """
+        await _ensure_schema(project_id)
+        rows = await _query(
+            project_id,
+            "SELECT implementer_id FROM tasks WHERE id = ?",
+            [task_id],
+        )
+        if not rows:
+            return
+        if rows[0]["implementer_id"]:
+            return
+        wt: str | None = None
+        try:
+            from hiveweave.services.worktree_review import agent_worktree_path
+
+            wt = await agent_worktree_path(str(agent_id))
+        except Exception as e:
+            log.debug(
+                "lock_implementer_worktree_lookup_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+        now_ms = int(time.time() * 1000)
+        await _execute(
+            project_id,
+            "UPDATE tasks SET implementer_id = ?, implementer_worktree = ?, "
+            "updated_at = ? WHERE id = ? AND "
+            "(implementer_id IS NULL OR implementer_id = '')",
+            [agent_id, wt, now_ms, task_id],
+        )
+        log.info(
+            "implementer_locked",
+            task_id=task_id[:12],
+            implementer_id=agent_id[:8],
+            worktree=(wt or "")[-40:],
+        )
+
+    async def set_owner_parked(
+        self,
+        project_id: str,
+        task_ids: list[str],
+        *,
+        parked: bool,
+    ) -> None:
+        """Mark/clear owner_parked on tasks (TEST21 M5 stall mute)."""
+        if not task_ids:
+            return
+        await _ensure_schema(project_id)
+        now_ms = int(time.time() * 1000)
+        flag = 1 if parked else 0
+        for tid in task_ids:
+            try:
+                await _execute(
+                    project_id,
+                    "UPDATE tasks SET owner_parked = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    [flag, now_ms, tid],
+                )
+            except Exception as e:
+                log.warning(
+                    "set_owner_parked_failed",
+                    task_id=tid[:12],
+                    error=str(e),
+                )
+
+    async def clear_owner_parked_for_agent(
+        self, project_id: str, agent_id: str
+    ) -> None:
+        """Clear owner_parked on recovery (agent completed a turn)."""
+        await _ensure_schema(project_id)
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET owner_parked = 0, updated_at = ? "
+                "WHERE assignee_id = ? AND owner_parked = 1 AND is_archived = 0",
+                [now_ms, agent_id],
+            )
+        except Exception as e:
+            log.warning(
+                "clear_owner_parked_failed",
+                agent_id=agent_id[:8],
+                error=str(e),
+            )
+
     async def reassign_task(
         self,
         project_id: str,
@@ -1663,6 +2059,9 @@ class TaskService:
         structured transfer. Keeps status when already claimed/running;
         promotes created → claimed; resets submitted/reviewing to claimed
         so the new assignee can re-submit.
+
+        TEST21 M2: always write ``task.reassigned`` event (no silent drift);
+        never clears ``implementer_id`` / ``implementer_worktree``.
         """
         task_id = await self.require_task_id(project_id, task_id)
         task = await self.get_task(project_id, task_id)
@@ -1700,9 +2099,45 @@ class TaskService:
         await _execute(
             project_id,
             "UPDATE tasks SET assignee_id = ?, claimed_at = COALESCE(claimed_at, ?), "
-            "updated_at = ? WHERE id = ?",
+            "owner_parked = 0, updated_at = ? WHERE id = ?",
             [new_assignee_id, now_ms, now_ms, task_id],
         )
+        # Always audit — including running→running assignee swaps (TEST21 M2)
+        event_id = str(uuid.uuid4())
+        payload = json.dumps(
+            {
+                "from_assignee": old,
+                "to_assignee": new_assignee_id,
+                "reason": (reason or "")[:500],
+                "implementer_id": task.get("implementer_id"),
+                "status": new_status,
+            },
+            ensure_ascii=False,
+        )
+        try:
+            await _execute(
+                project_id,
+                "INSERT INTO task_events (id, project_id, task_id, event_type, "
+                "from_status, to_status, actor_id, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    event_id,
+                    project_id,
+                    task_id,
+                    "task.reassigned",
+                    status,
+                    new_status,
+                    reassigned_by,
+                    payload,
+                    now_ms,
+                ],
+            )
+        except Exception as e:
+            log.warning(
+                "task_reassign_event_failed",
+                task_id=task_id[:12],
+                error=str(e),
+            )
         log.info(
             "task_reassigned",
             project_id=project_id,
@@ -1712,12 +2147,14 @@ class TaskService:
             by=reassigned_by[:8],
             status=new_status,
             reason=(reason or "")[:80],
+            implementer=(task.get("implementer_id") or "")[:8],
         )
         return {
             "task_id": task_id,
             "from_assignee": old,
             "to_assignee": new_assignee_id,
             "status": new_status,
+            "implementer_id": task.get("implementer_id"),
         }
 
     async def unclaim_task(self, project_id: str, task_id: str) -> None:
@@ -1741,7 +2178,13 @@ class TaskService:
         )
         log.info("task_unclaimed", project_id=project_id, task_id=task_id)
 
-    async def mark_verifying(self, project_id: str, task_id: str) -> None:
+    async def mark_verifying(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        reason_code: str | None = None,
+    ) -> None:
         """Parent task enters verifying after VERIFY child is spawned."""
         rows = await _query(
             project_id, "SELECT status, creator_id FROM tasks WHERE id = ?", [task_id]
@@ -1754,7 +2197,12 @@ class TaskService:
             await self._clear_merge_pending_inbox(task_id, creator_id)
             return
         if current == "approved":
-            await self._transition(project_id, task_id, "verifying")
+            await self._transition(
+                project_id,
+                task_id,
+                "verifying",
+                reason_code=reason_code,
+            )
             await self.emit_task_event(
                 project_id,
                 task_id,
@@ -2008,10 +2456,21 @@ class TaskService:
                     has_open_verify = True
                     break
             if has_open_verify:
-                await self.mark_verifying(project_id, tid)
+                await self.mark_verifying(
+                    project_id,
+                    tid,
+                    reason_code="orphan_approved_migrate",
+                )
                 to_verifying += 1
             else:
-                await self.close_task(project_id, tid)
+                # Ledger hygiene — no VERIFY child means orphan approved;
+                # skip merge gate (no worktree/merge fact expected).
+                await self.close_task(
+                    project_id,
+                    tid,
+                    skip_merge_gate=True,
+                    reason_code="orphan_approved_migrate",
+                )
                 to_closed += 1
         return {"verifying": to_verifying, "closed": to_closed}
 
@@ -2130,16 +2589,39 @@ class TaskService:
         rows = await _query(project_id, sql, params)
         return [self._row(r) for r in rows]
 
+    @staticmethod
+    def modules_fingerprint(modules: object | None) -> str | None:
+        """Stable hash of expected_modules for language-agnostic dedup (TEST21 M3)."""
+        import hashlib
+
+        raw = modules
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            return None
+        norm = sorted(
+            {str(m).strip().lower() for m in raw if str(m).strip()}
+        )
+        if not norm:
+            return None
+        return hashlib.md5("|".join(norm).encode("utf-8")).hexdigest()[:16]
+
     async def find_similar_open_task(
         self,
         project_id: str,
         title: str,
         assignee_id: str | None = None,
+        *,
+        include_unassigned: bool = False,
     ) -> dict | None:
-        """Find an open (non-terminal) task with same assignee + similar title.
+        """Find an open (non-terminal) task with similar title.
 
-        Used to block duplicate scaffold/module tickets. Similarity = normalized
-        title equality or shared prefix (≥12 chars).
+        Similarity = normalized title equality or shared prefix (≥12 chars).
+        TEST21 M3: ``include_unassigned`` folds assignee IS NULL into the domain
+        so drafts without an owner still block duplicate creates.
         """
         await _ensure_schema(project_id)
         norm = " ".join((title or "").lower().split())
@@ -2152,9 +2634,14 @@ class TaskService:
             "AND status NOT IN ('done','cancelled','archived','completed','closed') "
         )
         params: list = []
-        if assignee_id:
+        if assignee_id and include_unassigned:
+            sql += "AND (assignee_id = ? OR assignee_id IS NULL OR assignee_id = '') "
+            params.append(assignee_id)
+        elif assignee_id:
             sql += "AND assignee_id = ? "
             params.append(assignee_id)
+        elif include_unassigned:
+            sql += "AND (assignee_id IS NULL OR assignee_id = '') "
         sql += "ORDER BY created_at DESC LIMIT 40"
         rows = await _query(project_id, sql, params)
         for r in rows:
@@ -2167,6 +2654,51 @@ class TaskService:
                 and (other.startswith(prefix) or norm.startswith(other[:24]))
             ):
                 return row
+        return None
+
+    async def find_structured_open_dup(
+        self,
+        project_id: str,
+        *,
+        parent_task_id: str | None = None,
+        expected_modules: object | None = None,
+        exclude_task_id: str | None = None,
+    ) -> dict | None:
+        """Language-agnostic dup: same parent_task_id + expected_modules hash.
+
+        TEST21 M3 — title text is NOT used. Includes unassigned open tasks.
+        """
+        await _ensure_schema(project_id)
+        parent = (parent_task_id or "").strip() or None
+        fp = self.modules_fingerprint(expected_modules)
+        if not parent and not fp:
+            return None
+        sql = (
+            f"SELECT {self._COLUMNS} FROM tasks "
+            "WHERE is_archived = 0 "
+            "AND status NOT IN ('done','cancelled','archived','completed','closed') "
+        )
+        params: list = []
+        if parent:
+            sql += "AND parent_task_id = ? "
+            params.append(parent)
+        sql += "ORDER BY created_at DESC LIMIT 80"
+        rows = await _query(project_id, sql, params)
+        for r in rows:
+            row = self._row(r)
+            if exclude_task_id and row.get("id") == exclude_task_id:
+                continue
+            if parent and row.get("parent_task_id") != parent:
+                continue
+            if fp:
+                other_fp = self.modules_fingerprint(row.get("expected_modules"))
+                if other_fp != fp:
+                    continue
+            elif parent:
+                # parent-only match when both lack modules — still a dup signal
+                if self.modules_fingerprint(row.get("expected_modules")):
+                    continue
+            return row
         return None
 
     async def get_tasks_for_agent(self, project_id: str,

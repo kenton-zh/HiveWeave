@@ -36,6 +36,7 @@ REPAIR_VIOLATIONS = frozenset({
     "CREATOR_MUST_REVIEW",
     "CREATOR_MUST_MERGE",
     "HIRE_UNREPORTED",
+    "UNCOMMITTED_WORKTREE",
 })
 
 # Ledger / obligation mismatches → park, do not immediately re-run LLM
@@ -88,6 +89,8 @@ class ExitContext:
     outbound_ask_refs: set[str] = field(default_factory=set)
     # Optional name/short_id → id map for ref matching
     name_by_id: dict[str, str] = field(default_factory=dict)
+    # Builder/executor worktree has uncommitted porcelain at done_slice
+    worktree_uncommitted: bool = False
 
 
 @dataclass
@@ -316,7 +319,15 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
     if hire_without_report(ctx.tool_calls):
         violations.append("HIRE_UNREPORTED")
 
+    if (
+        turn_result is not None
+        and turn_result.phase == "done_slice"
+        and ctx.worktree_uncommitted
+    ):
+        violations.append("UNCOMMITTED_WORKTREE")
+
     # TEST11 #1a: waiting on an agent requires having asked/messaged them first
+    wait_without_ask_refs: list[str] = []
     if turn_result is not None and turn_result.phase == "waiting":
         for w in turn_result.waiting_on or []:
             if (getattr(w, "kind", None) or "").lower() != "agent":
@@ -325,8 +336,9 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
             if not ref:
                 continue
             if not _agent_wait_has_ask_evidence(ref, ctx):
-                violations.append("WAIT_WITHOUT_ASK")
-                break
+                if "WAIT_WITHOUT_ASK" not in violations:
+                    violations.append("WAIT_WITHOUT_ASK")
+                wait_without_ask_refs.append(ref)
 
     remaining_obligations = list(ctx.open_task_obligations)
     if turn_result and turn_result.phase in ("done_slice", "waiting"):
@@ -409,15 +421,39 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 or "CREATOR_MUST_REVIEW" in uniq
                 or "CREATOR_MUST_MERGE" in uniq
                 or "HIRE_UNREPORTED" in uniq
+                or "UNCOMMITTED_WORKTREE" in uniq
             )
             park = not repair_only
         if park:
             disposition = "runnable" if remaining_obligations else disposition
+        try:
+            from hiveweave.services.telemetry import telemetry
+
+            for ref in wait_without_ask_refs:
+                telemetry.gate_hard_reject(f"WAIT_WITHOUT_ASK:{ref}")
+            if "UNREPLIED_ASKS" in uniq and unreplied:
+                for m in unreplied[:8]:
+                    sender = (
+                        m.get("from_name")
+                        or m.get("from_agent_id")
+                        or "?"
+                    )
+                    telemetry.gate_hard_reject(f"UNREPLIED_ASKS:{sender}")
+            for gate in uniq:
+                if gate not in ("WAIT_WITHOUT_ASK", "UNREPLIED_ASKS"):
+                    telemetry.gate_hard_reject(gate)
+        except Exception as e:
+            log.debug("gate_telemetry_failed", error=str(e))
         return ExitDecision(
             ok=False,
             violations=uniq,
             turn_result=turn_result,
-            hint=_build_gate_hint(uniq, unreplied, turn_result),
+            hint=_build_gate_hint(
+                uniq,
+                unreplied,
+                turn_result,
+                wait_without_ask_refs=wait_without_ask_refs,
+            ),
             continue_work=False,
             should_repair=repair_only,
             should_park=park or (bool(PARK_VIOLATIONS.intersection(uniq)) and not repair_only),
@@ -443,11 +479,31 @@ def _build_gate_hint(
     violations: list[str],
     unreplied: list[dict],
     turn_result: TurnResult | None,
+    *,
+    wait_without_ask_refs: list[str] | None = None,
 ) -> str:
     lines = [
         "[TURN EXIT BLOCKED]",
         "每一轮必须像函数一样返回 TurnResult。当前不能结束回合：",
     ]
+    gate_actions = {
+        "MISSING_COMMIT_TURN": (
+            "commit_turn(phase, summary, waiting_on/result as needed)"
+        ),
+        "INVALID_TURN_RESULT": "commit_turn with valid schema",
+        "WAITING_ON_REQUIRED": "commit_turn(waiting, waiting_on=[...])",
+        "BLOCKED_WAITING_ON_REQUIRED": "commit_turn(blocked, waiting_on=[...])",
+        "UNREPLIED_ASKS": "ask_agent or send_message to sender REF",
+        "WAIT_WITHOUT_ASK": "ask_agent or send_message to REF",
+        "HIRE_UNREPORTED": "send_message/ask_agent to hiring requester",
+        "OPEN_TASKS_UNDECLARED": "advance tasks or declare waiting/blocked",
+        "ASSIGNEE_MUST_SUBMIT": "submit_task(taskId, summary, attestationIds)",
+        "REVIEWER_MUST_START_REVIEW": "review_task(taskId, decision=...)",
+        "REVIEWER_MUST_FINISH_REVIEW": "review_task(taskId, decision=...)",
+        "CREATOR_MUST_REVIEW": "review_task(taskId, decision=...)",
+        "CREATOR_MUST_MERGE": "git_worktree_merge(branchName=...)",
+        "UNCOMMITTED_WORKTREE": "git_worktree_checkpoint then commit_turn",
+    }
     labels = {
         "MISSING_COMMIT_TURN": "未调用 commit_turn — 请提交 phase/summary（及必要的 waiting_on/result）",
         "INVALID_TURN_RESULT": "commit_turn 参数无效 — 请按 schema 重试",
@@ -488,11 +544,42 @@ def _build_gate_hint(
             "请立即调用 git_worktree_merge(branchName=assignee shortId 或 hw/...)。"
             "禁止口头让 executor 自己 merge；冲突则 review_task(rework) 让其在 worktree 对齐 main。"
         ),
+        "UNCOMMITTED_WORKTREE": (
+            "你的 worktree 有未提交改动 — 请先 git_worktree_checkpoint，"
+            "再 commit_turn(done_slice)"
+        ),
     }
-    for v in violations:
-        lines.append(f"- {labels.get(v, v)}")
 
-    if "UNREPLIED_ASKS" in violations and unreplied:
+    emitted_unreplied = False
+    for v in violations:
+        if v == "UNREPLIED_ASKS" and unreplied:
+            for m in unreplied[:8]:
+                name = m.get("from_name") or (m.get("from_agent_id") or "?")[:8]
+                lines.append(
+                    f"GATE=UNREPLIED_ASKS REF={name} "
+                    f"MISSING={gate_actions[v]}"
+                )
+                preview = (m.get("message") or "")[:60]
+                lines.append(f"  ❌ {name}：{preview}")
+            emitted_unreplied = True
+            continue
+        if v == "WAIT_WITHOUT_ASK" and wait_without_ask_refs:
+            for ref in wait_without_ask_refs:
+                lines.append(
+                    f"GATE=WAIT_WITHOUT_ASK REF={ref} "
+                    f"MISSING={gate_actions[v]}"
+                )
+            if v in labels:
+                lines.append(f"  {labels[v]}")
+            continue
+        ref = "-"
+        lines.append(
+            f"GATE={v} REF={ref} MISSING={gate_actions.get(v, 'fix and commit_turn')}"
+        )
+        if v in labels:
+            lines.append(f"  {labels[v]}")
+
+    if "UNREPLIED_ASKS" in violations and unreplied and not emitted_unreplied:
         lines.append("未回复：")
         for m in unreplied[:8]:
             name = m.get("from_name") or (m.get("from_agent_id") or "?")[:8]
@@ -515,6 +602,37 @@ def _build_gate_hint(
 
 
 # ── Synchronous pre-check for commit_turn ──────────────────
+
+
+async def agent_worktree_has_uncommitted(
+    agent_id: str, project_id: str
+) -> bool:
+    """True when agent with write worktree has porcelain-dirty tree."""
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.git_worktree import (
+            GitWorktreeService,
+            agent_gets_write_worktree,
+        )
+        from hiveweave.services.org import OrgService
+
+        agent = await OrgService().resolve_agent(agent_id)
+        if not agent or not agent_gets_write_worktree(agent):
+            return False
+        short_id = (agent.get("short_id") or "").strip()
+        if not short_id:
+            return False
+        ws = await meta_db.get_project_workspace(project_id)
+        if not ws:
+            return False
+        info = await GitWorktreeService().info(ws, short_id)
+        status = info.get("status") if isinstance(info, dict) else None
+        return bool(
+            isinstance(status, dict) and status.get("has_uncommitted")
+        )
+    except Exception as e:
+        log.debug("worktree_uncommitted_check_failed", error=str(e))
+        return False
 
 
 async def pre_check_exit_gates(
@@ -636,6 +754,10 @@ async def pre_check_exit_gates(
         await cursor.close()
         if assignee_tasks and phase in ("done_slice", "waiting"):
             violations.append("ASSIGNEE_MUST_SUBMIT")
+
+        if phase == "done_slice":
+            if await agent_worktree_has_uncommitted(agent_id, project_id):
+                violations.append("UNCOMMITTED_WORKTREE")
 
         # 3. Open task obligations: submitted|reviewing as reviewer (TEST11 #3)
         cursor = await conn.execute(

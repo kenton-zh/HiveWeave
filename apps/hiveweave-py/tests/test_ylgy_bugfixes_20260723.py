@@ -47,7 +47,8 @@ def test_compare_worktree_allows_already_on_main(tmp_path: Path) -> None:
     assert meta.get("identicalToMain") == ["docs/ui-spec.md"]
 
 
-def test_compare_worktree_still_blocks_partial_identical(tmp_path: Path) -> None:
+def test_compare_worktree_strips_partial_identical(tmp_path: Path) -> None:
+    """TEST21 M1: mixed identical + diverged strips identical and allows."""
     main = tmp_path / "main"
     wt = tmp_path / "wt"
     main.mkdir()
@@ -62,11 +63,11 @@ def test_compare_worktree_still_blocks_partial_identical(tmp_path: Path) -> None
         worktree_ws=str(wt),
         files_changed=["a.txt", "b.txt"],
     )
-    assert deny is not None
-    assert "identical to MAIN" in deny
+    assert deny is None
+    assert meta.get("strippedIdentical") is True
     assert "a.txt" in meta["identicalToMain"]
     assert "b.txt" in meta["divergedFiles"]
-
+    assert meta.get("confirmedOnMain") == ["a.txt"]
 
 # ── BUG-3: commit_turn end_turn + structured gates ──────────
 

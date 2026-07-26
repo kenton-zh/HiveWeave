@@ -137,6 +137,93 @@ async def worktree_commits_ahead(
         return None
 
 
+async def worktree_dirty_counts(worktree_ws: str) -> dict[str, int]:
+    """Count dirty paths via ``git status --porcelain``.
+
+    Returns ``{dirty_count, untracked_count, modified_count}``.
+    On git error, treats as dirty_count=1 so fail-closed callers stay safe.
+    """
+    empty = {"dirty_count": 0, "untracked_count": 0, "modified_count": 0}
+    try:
+        from hiveweave.services.git_worktree import _git
+
+        ok, st = await _git(["status", "--porcelain"], worktree_ws)
+        if not ok:
+            return {"dirty_count": 1, "untracked_count": 0, "modified_count": 1}
+        lines = [ln for ln in (st or "").splitlines() if ln.strip()]
+        untracked = 0
+        modified = 0
+        for ln in lines:
+            # porcelain v1: XY PATH — ?? = untracked
+            if ln.startswith("??") or ln.startswith("!!"):
+                untracked += 1
+            else:
+                modified += 1
+        return {
+            "dirty_count": len(lines),
+            "untracked_count": untracked,
+            "modified_count": modified,
+        }
+    except Exception as e:
+        log.warning("worktree_dirty_counts_failed", error=str(e))
+        return {"dirty_count": 1, "untracked_count": 0, "modified_count": 1}
+
+
+async def effective_delivery(
+    main_ws: str,
+    worktree_ws: str,
+    *,
+    target_branch: str = "main",
+) -> dict[str, Any]:
+    """Machine delivery fact for close/submit/approve gates (TEST20 N1).
+
+    ``commits_ahead`` alone misses zero-commit + untracked delivery. Combine
+    ahead + porcelain dirty so Rita-style empty closes cannot escape.
+    """
+    ahead = await worktree_commits_ahead(
+        main_ws, worktree_ws, target_branch=target_branch
+    )
+    dirty = await worktree_dirty_counts(worktree_ws)
+    ahead_n = int(ahead) if ahead is not None else 0
+    has_output = (ahead is not None and ahead_n > 0) or dirty["dirty_count"] > 0
+    return {
+        "commits_ahead": ahead,
+        "dirty_count": dirty["dirty_count"],
+        "untracked_count": dirty["untracked_count"],
+        "modified_count": dirty["modified_count"],
+        "has_effective_output": has_output,
+    }
+
+
+def evidence_has_merge_fact(evidence: dict[str, Any] | None) -> bool:
+    """True when evidence already records a real merge or explicit waive."""
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("merge_waived") is True or evidence.get("mergeWaived") is True:
+        return True
+    for key in (
+        "merged_by",
+        "mergedBy",
+        "merge_commit",
+        "merge_commit_hash",
+        "mergeCommit",
+        "mergeCommitHash",
+    ):
+        val = evidence.get(key)
+        if val is not None and str(val).strip():
+            return True
+    return False
+
+
+def evidence_merge_waived(evidence: dict[str, Any] | None) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    return (
+        evidence.get("merge_waived") is True
+        or evidence.get("mergeWaived") is True
+    )
+
+
 def compare_worktree_to_main(
     *,
     main_ws: str,
@@ -150,7 +237,12 @@ def compare_worktree_to_main(
     - files_changed is empty AND allow_empty_files is False
       (no proof of what to review for a code-changing task)
     - any claimed file is missing in worktree
-    - any claimed file is identical to main (when a list was provided)
+    - after stripping identical-to-main claims, nothing diverged remains
+      (unless the whole claim set was already on main — BUG-9 auto-close)
+
+    TEST21 M1: mixed identical + diverged no longer hard-denies the whole
+    approve. Identical paths are stripped as ``confirmedOnMain``; only
+    diverged files are required for review proof (completes BUG-9's other half).
     """
     meta: dict[str, Any] = {
         "mainWorkspace": main_ws,
@@ -159,6 +251,7 @@ def compare_worktree_to_main(
         "divergedFiles": [],
         "identicalToMain": [],
         "missingInWorktree": [],
+        "confirmedOnMain": [],
     }
     rels = _rel_paths(list(files_changed or []))
     if not rels:
@@ -208,16 +301,13 @@ def compare_worktree_to_main(
     if meta["identicalToMain"] and not meta["divergedFiles"]:
         meta["alreadyOnMain"] = True
         meta["autoCloseReason"] = "content_already_on_main"
+        meta["confirmedOnMain"] = list(meta["identicalToMain"])
         return None, meta
-    if meta["identicalToMain"]:
-        return (
-            "Approve blocked: some claimed files_changed are identical to MAIN "
-            f"in assignee worktree ({worktree_ws}). "
-            f"Identical: {meta['identicalToMain'][:8]}. "
-            "Only approve real worktree diffs "
-            "(or resubmit after merge so all claimed files match main).",
-            meta,
-        )
+    # TEST21 M1 / BUG-9 other half: mixed identical + diverged → strip
+    # identical (confirmed already on main), review only diverged.
+    if meta["identicalToMain"] and meta["divergedFiles"]:
+        meta["confirmedOnMain"] = list(meta["identicalToMain"])
+        meta["strippedIdentical"] = True
     if not meta["divergedFiles"]:
         return (
             "Approve blocked: no diverged files vs MAIN in assignee worktree.",
@@ -252,15 +342,19 @@ async def review_worktree_gate(
     from hiveweave.services.task import TaskService
 
     assignee = task.get("assignee_id")
+    # TEST21 M2: evidence follows implementer worktree, not current assignee
+    evidence_agent = task.get("implementer_id") or assignee
     main_ws = await project_main_workspace(project_id)
     if not main_ws:
         return None, {}
-    if not assignee:
+    if not evidence_agent:
         return None, {"mainWorkspace": main_ws}
 
     meta: dict[str, Any] = {
         "mainWorkspace": main_ws,
         "assigneeId": assignee,
+        "implementerId": task.get("implementer_id"),
+        "evidenceAgentId": evidence_agent,
     }
 
     # VERIFY child / tagged verify: delivery is attestation/script, not a diff
@@ -272,13 +366,19 @@ async def review_worktree_gate(
         meta["skipped"] = "no_code_change_flag"
         return None, meta
 
-    wt = await agent_worktree_path(str(assignee))
+    pinned_wt = (task.get("implementer_worktree") or "").strip() or None
+    wt = pinned_wt
+    if wt and not Path(wt).is_dir():
+        wt = None
+    if not wt:
+        wt = await agent_worktree_path(str(evidence_agent))
     meta["worktreeWorkspace"] = wt
     if not wt:
         return (
-            "Approve blocked: assignee has no worktree path. "
+            "Approve blocked: implementer/assignee has no worktree path. "
             "Executor worktrees are created on hire/dispatch — re-dispatch "
-            "or wait for worktree heal, then review that tree (not main).",
+            "or wait for worktree heal, then review that tree (not main). "
+            f"evidenceAgent={str(evidence_agent)[:8]}",
             meta,
         )
 
@@ -597,9 +697,12 @@ async def check_evidence_verifiable(
 
     project_root = await project_main_workspace(project_id)
     worktree = None
-    assignee = task.get("assignee_id")
-    if assignee:
-        worktree = await agent_worktree_path(str(assignee))
+    evidence_agent = task.get("implementer_id") or task.get("assignee_id")
+    pinned = (task.get("implementer_worktree") or "").strip() or None
+    if pinned and Path(pinned).is_dir():
+        worktree = pinned
+    elif evidence_agent:
+        worktree = await agent_worktree_path(str(evidence_agent))
     roots = _resolve_evidence_roots(project_root, worktree)
 
     missing_claimed = [

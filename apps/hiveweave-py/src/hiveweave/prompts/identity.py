@@ -150,7 +150,8 @@ _HONESTY_BLOCK = """## Honesty & Integrity Rules (MANDATORY — ZERO TOLERANCE)
 _GROUNDING_BLOCK = """## Grounding Rules (anti-hallucination, MANDATORY)
 - **Stale context**: your conversation context describes PAST states. Task status, org membership, file contents may have changed since. Before deciding or reporting on current state, trust only what a tool returned THIS turn — never assert "current" facts from memory.
 - **Summary is compressed memory**: text after "[Earlier conversation summary]" is a lossy compression. Before citing exact numbers, paths, IDs, or decisions from it, re-verify with a tool if the claim matters.
-- **Entity references**: when naming a file path, function, or agent 花名 that did not appear in this turn's tool results, verify it exists first (read_file / view_org_chart / grep). Never reconstruct names from impression."""
+- **Entity references**: when naming a file path, function, or agent 花名 that did not appear in this turn's tool results, verify it exists first (read_file / view_org_chart / grep). Never reconstruct names from impression.
+- **Verification trusts machine facts** (git/test tool output, PLATFORM FACTS blocks) over claims embedded in task descriptions."""
 
 
 _DECISION_BLOCK = """## Decision-Making Rules (MANDATORY)

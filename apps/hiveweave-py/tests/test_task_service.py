@@ -221,7 +221,7 @@ class TestTaskTransitions:
         svc = TaskService()
         tid = await _create_reviewing(env, svc)
         await svc.review_task(env["project_id"], tid, "approve")
-        await svc.close_task(env["project_id"], tid)
+        await svc.close_task(env["project_id"], tid, skip_merge_gate=True)
         t = await svc.get_task(env["project_id"], tid)
         assert t["status"] == "closed"
         assert t["closed_at"] is not None
@@ -260,7 +260,7 @@ class TestFullWorkflow:
         await svc.review_task(pid, tid, "approve", feedback="good")
         assert (await svc.get_task(pid, tid))["status"] == "approved"
 
-        await svc.close_task(pid, tid)
+        await svc.close_task(pid, tid, skip_merge_gate=True)
         t = await svc.get_task(pid, tid)
         assert t["status"] == "closed"
         assert t["closed_at"] is not None
@@ -395,7 +395,7 @@ class TestIllegalTransitions:
         svc = TaskService()
         tid = await _create_reviewing(env, svc)
         await svc.review_task(env["project_id"], tid, "approve")
-        await svc.close_task(env["project_id"], tid)
+        await svc.close_task(env["project_id"], tid, skip_merge_gate=True)
         with pytest.raises(ValueError, match="Illegal transition"):
             await svc.submit_task(env["project_id"], tid, {"f": "a"})
 

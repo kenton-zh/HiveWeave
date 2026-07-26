@@ -295,6 +295,18 @@ class TaskToolsMixin:
         project_id = await self._get_project_id(agent_id)
         if not project_id:
             return self._error(f"Agent {agent_id} has no project")
+        ts = TaskService()
+        task = await ts.get_task(project_id, task_id)
+        if not task:
+            return self._error(f"Task not found: {task_id}")
+        # TEST21 M2: close legacy bypass — same B4 gate as pipeline submit_task
+        task_assignee = task.get("assignee_id")
+        if task_assignee and str(task_assignee) != str(agent_id):
+            return self._error(
+                f"Only the assignee can submit this task. "
+                f"You are not the assignee (assignee={str(task_assignee)[:8]}). "
+                f"If you are the creator, use review_task or reassign_task first."
+            )
         evidence: dict = {"summary": summary, "tests_passed": True}
         if args.get("commit"):
             evidence["commit"] = args["commit"]
@@ -309,7 +321,8 @@ class TaskToolsMixin:
         if args.get("testOutput"):
             evidence["test_output"] = str(args["testOutput"])[:4000]
         try:
-            ts = TaskService()
+            # Backfill implementer lock for tasks that entered running before M2
+            await ts.lock_implementer_if_needed(project_id, task_id, agent_id)
             await ts.submit_task(project_id, task_id, evidence)
             return {
                 "success": True,
@@ -491,11 +504,38 @@ class DispatchTaskParams(BaseModel):
         description="Existing task ID to reuse (optional).",
         json_schema_extra={"aliases": ["taskId", "task_id", "existingTaskId", "existing_task_id"]},
     )
+    force: bool = Field(
+        default=False,
+        description=(
+            "Force create despite cross-assignee / structured duplicate "
+            "(same-assignee dup cannot be forced)."
+        ),
+    )
+    parent_task_id: str | None = Field(
+        default=None,
+        alias="parentTaskId",
+        description="Parent task ID for structured dedup (optional).",
+        json_schema_extra={"aliases": ["parentTaskId", "parent_task_id"]},
+    )
+    expected_modules: list[str] | None = Field(
+        default=None,
+        alias="expectedModules",
+        description="Expected modules for structured dedup (optional).",
+        json_schema_extra={"aliases": ["expectedModules", "expected_modules"]},
+    )
+
+    @field_validator("expected_modules", mode="before")
+    @classmethod
+    def _coerce_dispatch_modules(cls, v: Any) -> Any:
+        return _coerce_to_list(v)
 
 
 @tool(
     "dispatch_task",
-    "Deliver work NOW: ledger entry + inbox wake. Pass taskId if create_task already drafted/queued it. "
+    "Deliver work NOW: ledger entry + inbox wake. "
+    "To re-assign/delegate an EXISTING task, pass taskId — this keeps a single "
+    "ledger entry (assignee changes, no duplicate task). "
+    "Only create a NEW task (omit taskId) when the work is genuinely new. "
     "Only direct reports; never assign coordinators code work.",
     requires_workspace=False,
     security_level="standard",
@@ -536,34 +576,71 @@ async def dispatch_task_tool(
     if coord_err:
         return ToolResult.err(coord_err)
 
-    # Dedup: same assignee + similar title already open → reuse via taskId hint
-    cross_assignee_warning = ""
+    # Dedup (TEST21 M3): structured + title similarity + cross-assignee force gate
+    force_note = ""
     if not params.task_id:
+        ts_dedup = TaskService()
         try:
-            dup = await TaskService().find_similar_open_task(
-                project_id, params.task[:100], assignee_id=resolved_id
+            struct_dup = await ts_dedup.find_structured_open_dup(
+                project_id,
+                parent_task_id=params.parent_task_id,
+                expected_modules=params.expected_modules,
             )
-            if dup:
+            if struct_dup and not params.force:
                 return ToolResult.err(
-                    f"已有相似未完成任务 id={dup['id']} status={dup.get('status')} "
-                    f"title={dup.get('title', '')[:60]!r}。"
-                    f"请复用：dispatch_task(..., taskId=\"{dup['id']}\")，"
-                    f"或先 cancel_task(taskId=\"{dup['id']}\", reason=\"...\") 再新建。"
+                    f"结构化重复任务 id={struct_dup['id']} "
+                    f"status={struct_dup.get('status')} "
+                    f"parent={struct_dup.get('parent_task_id', '')[:8]}。"
+                    f"请复用 taskId=\"{struct_dup['id']}\"，"
+                    f"或 force=true 强制新建。"
                 )
         except Exception as e:
-            log.warning("dispatch_dedup_check_failed", error=str(e))
-        # L4: cross-assignee duplicate warning (different assignee, similar title)
+            log.warning("dispatch_structured_dedup_failed", error=str(e))
         try:
-            cross_dup = await TaskService().find_similar_open_task(
+            dup = await ts_dedup.find_similar_open_task(
+                project_id,
+                params.task[:100],
+                assignee_id=resolved_id,
+                include_unassigned=True,
+            )
+            if dup:
+                dup_assignee = dup.get("assignee_id")
+                if dup_assignee == resolved_id:
+                    return ToolResult.err(
+                        f"已有相似未完成任务 id={dup['id']} "
+                        f"status={dup.get('status')} "
+                        f"title={dup.get('title', '')[:60]!r}。"
+                        f"请复用：dispatch_task(..., taskId=\"{dup['id']}\")，"
+                        f"或先 cancel_task(taskId=\"{dup['id']}\", reason=\"...\")。"
+                        f"（同 assignee 重复不可 force。）"
+                    )
+                if not dup_assignee:
+                    if not params.force:
+                        return ToolResult.err(
+                            f"已有相似未分配任务 id={dup['id']} "
+                            f"title={dup.get('title', '')[:60]!r}。"
+                            f"请复用 taskId=\"{dup['id']}\" 或 force=true。"
+                        )
+                    force_note = " (force=true: proceeding despite unassigned dup)"
+        except Exception as e:
+            log.warning("dispatch_dedup_check_failed", error=str(e))
+        try:
+            cross_dup = await ts_dedup.find_similar_open_task(
                 project_id, params.task[:100], assignee_id=None
             )
             if cross_dup and cross_dup.get("assignee_id") != resolved_id:
-                cross_assignee_warning = (
-                    f" ⚠️ 注意：另一 agent 已有相似任务 "
-                    f"id={cross_dup['id']} assignee={cross_dup.get('assignee_id', '?')[:8]} "
-                    f"title={cross_dup.get('title', '')[:40]!r}。"
-                    f"确认不是重复派发？如需取消旧任务：cancel_task(taskId=\"{cross_dup['id']}\")。"
-                )
+                if not params.force:
+                    return ToolResult.err(
+                        f"跨 assignee 相似任务 id={cross_dup['id']} "
+                        f"assignee={cross_dup.get('assignee_id', '?')[:8]} "
+                        f"title={cross_dup.get('title', '')[:40]!r}。"
+                        f"请复用 taskId=\"{cross_dup['id']}\"、"
+                        f"cancel_task 旧任务，或 force=true 强制派发。"
+                    )
+                if not force_note:
+                    force_note = (
+                        " (force=true: proceeding despite cross-assignee dup)"
+                    )
         except Exception:
             pass
 
@@ -592,7 +669,7 @@ async def dispatch_task_tool(
             f"Task dispatched to {result.get('to_agent_id', resolved_id)} "
             f"(task_id={result.get('task_id', '')})"
         )
-        return ToolResult.ok(output + cross_assignee_warning, task_id=result.get("task_id"))
+        return ToolResult.ok(output + force_note, task_id=result.get("task_id"))
     return ToolResult.err(result.get("message", "Dispatch failed"))
 
 
@@ -664,6 +741,13 @@ class CreateTaskParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["contractJson", "contract_json", "contract"]},
     )
+    force: bool = Field(
+        default=False,
+        description=(
+            "Force create despite cross-assignee / structured duplicate "
+            "(same-assignee dup cannot be forced)."
+        ),
+    )
 
     @field_validator(
         "acceptance_criteria", "depends_on", "expected_modules", "tags",
@@ -677,7 +761,10 @@ class CreateTaskParams(BaseModel):
 @tool(
     "create_task",
     "Ledger entry. Unassigned → status=created (draft). With assigneeId → claimed "
-    "(assign=claim; no separate claim_task). Does NOT wake anyone — call dispatch_task to deliver.",
+    "(assign=claim; no separate claim_task). Does NOT wake anyone — call dispatch_task to deliver. "
+    "If you are delegating/transferring an EXISTING task to someone else, prefer "
+    "dispatch_task(taskId=<existing_id>) instead — it re-assigns in a single ledger "
+    "entry and avoids duplicate tasks with untracked free-text dependencies.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -735,16 +822,68 @@ async def create_task_tool(
 
     try:
         ts = TaskService()
+        force_note = ""
+        struct_dup = await ts.find_structured_open_dup(
+            project_id,
+            parent_task_id=params.parent_task_id,
+            expected_modules=params.expected_modules,
+        )
+        if struct_dup and not params.force:
+            return ToolResult.err(
+                f"结构化重复任务 id={struct_dup['id']} "
+                f"status={struct_dup.get('status')}。"
+                f"请复用 taskId=\"{struct_dup['id']}\" 或 force=true。"
+            )
         dup = await ts.find_similar_open_task(
-            project_id, params.title, assignee_id=assignee_id
+            project_id,
+            params.title,
+            assignee_id=assignee_id,
+            include_unassigned=True,
         )
         if dup:
-            return ToolResult.err(
-                f"已有相似未完成任务 id={dup['id']} status={dup.get('status')} "
-                f"title={dup.get('title', '')[:60]!r}。"
-                f"请复用该 taskId 调用 dispatch_task，或先 "
-                f"cancel_task(taskId=\"{dup['id']}\", reason=\"重复\")。"
-            )
+            dup_assignee = dup.get("assignee_id")
+            if assignee_id and dup_assignee == assignee_id:
+                return ToolResult.err(
+                    f"已有相似未完成任务 id={dup['id']} "
+                    f"title={dup.get('title', '')[:60]!r}。"
+                    f"请复用 taskId=\"{dup['id']}\"（同 assignee 不可 force）。"
+                )
+            if not dup_assignee:
+                if not params.force:
+                    return ToolResult.err(
+                        f"已有相似未分配任务 id={dup['id']} "
+                        f"title={dup.get('title', '')[:60]!r}。"
+                        f"请复用 taskId=\"{dup['id']}\" 或 force=true。"
+                    )
+                force_note = " (force=true: proceeding despite unassigned dup)"
+            elif dup_assignee and dup_assignee != assignee_id:
+                if not params.force:
+                    return ToolResult.err(
+                        f"跨 assignee 相似任务 id={dup['id']} "
+                        f"assignee={dup_assignee[:8]}。"
+                        f"请复用、cancel 旧任务，或 force=true。"
+                    )
+                force_note = (
+                    " (force=true: proceeding despite cross-assignee dup)"
+                )
+        cross_dup = await ts.find_similar_open_task(
+            project_id, params.title, assignee_id=None
+        )
+        if (
+            cross_dup
+            and cross_dup.get("assignee_id")
+            and cross_dup.get("assignee_id") != assignee_id
+        ):
+            if not params.force:
+                return ToolResult.err(
+                    f"跨 assignee 相似任务 id={cross_dup['id']} "
+                    f"assignee={cross_dup.get('assignee_id', '?')[:8]}。"
+                    f"请复用 taskId=\"{cross_dup['id']}\" 或 force=true。"
+                )
+            if not force_note:
+                force_note = (
+                    " (force=true: proceeding despite cross-assignee dup)"
+                )
         task_id = await ts.create_task(
             project_id=project_id,
             title=params.title,
@@ -769,7 +908,7 @@ async def create_task_tool(
             else f"status={st}"
         )
         return ToolResult.ok(
-            f"Task created (id={task_id}, {note}): {params.title}",
+            f"Task created (id={task_id}, {note}): {params.title}{force_note}",
             task_id=task_id,
             status=st,
         )
@@ -1002,6 +1141,29 @@ class SubmitTaskParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["attestationIds", "attestation_ids"]},
     )
+    core_interaction_executed: bool | None = Field(
+        default=None,
+        alias="coreInteractionExecuted",
+        description=(
+            "UI VERIFY: true when core canvas/DOM interaction was exercised "
+            "(browse js/eval or manual attestation)."
+        ),
+        json_schema_extra={
+            "aliases": ["coreInteractionExecuted", "core_interaction_executed"]
+        },
+    )
+    commit_hash: str | None = Field(
+        default=None,
+        alias="commitHash",
+        description="Git commit hash on MAIN for VERIFY evidence (optional).",
+        json_schema_extra={"aliases": ["commitHash", "commit_hash"]},
+    )
+    env_snapshot: str | None = Field(
+        default=None,
+        alias="envSnapshot",
+        description="Optional environment snapshot for VERIFY evidence.",
+        json_schema_extra={"aliases": ["envSnapshot", "env_snapshot"]},
+    )
 
     @field_validator("files_changed", mode="before")
     @classmethod
@@ -1074,6 +1236,12 @@ async def submit_task_tool(
             f"If you are the creator, use review_task or dispatch_task instead."
         )
 
+    # TEST21 M2: backfill implementer lock for pre-M2 running tasks
+    try:
+        await ts.lock_implementer_if_needed(project_id, task_id, agent_id)
+    except Exception as e:
+        log.debug("submit_lock_implementer_failed", error=str(e))
+
     from hiveweave.services.attestation import (
         attestation_service,
         required_attestation_kinds,
@@ -1096,6 +1264,41 @@ async def submit_task_tool(
     )
     needed = required_attestation_kinds(policy_id)
     attest_ids = list(params.attestation_ids or [])
+
+    # TEST21 M14: UI VERIFY requires core_interaction evidence
+    is_verify = "verify" in {
+        str(t).strip().lower() for t in (tags if isinstance(tags, list) else [])
+    }
+    parent_policy = policy_id
+    parent_tags: list = []
+    if is_verify and task.get("parent_task_id"):
+        parent = await ts.get_task(project_id, task["parent_task_id"])
+        if parent:
+            parent_tags = parent.get("tags") or []
+            if isinstance(parent_tags, str):
+                try:
+                    parent_tags = json.loads(parent_tags)
+                except Exception:
+                    parent_tags = []
+            parent_policy = (
+                parent.get("policy_id")
+                or resolve_task_policy(
+                    title=parent.get("title") or "",
+                    tags=parent_tags if isinstance(parent_tags, list) else [],
+                    description=parent.get("description") or "",
+                )
+            )
+    ui_verify = is_verify and (
+        "ui" in {str(t).lower() for t in (tags if isinstance(tags, list) else [])}
+        or parent_policy == "ui_browser_e2e"
+        or "ui" in {str(t).lower() for t in (parent_tags if isinstance(parent_tags, list) else [])}
+    )
+    if ui_verify and not getattr(params, "core_interaction_executed", None):
+        return ToolResult.err(
+            "UI VERIFY submit rejected: coreInteractionExecuted=true required. "
+            "Run browse js/eval for canvas interaction or set "
+            "coreInteractionExecuted after verified core_interaction attestation."
+        )
 
     if needed:
         # Waiver 短路：coordinator 已显式豁免（CLI/脚本类任务正式出口）
@@ -1160,14 +1363,67 @@ async def submit_task_tool(
         "policy_id": policy_id,
         "attestation_ids": attest_ids,
     }
-    if params.commit:
-        evidence["commit"] = params.commit
+    if getattr(params, "commit", None) or getattr(params, "commit_hash", None):
+        evidence["commit"] = (
+            getattr(params, "commit", None) or getattr(params, "commit_hash", None)
+        )
+    if getattr(params, "core_interaction_executed", None):
+        evidence["core_interaction_executed"] = True
+    if getattr(params, "env_snapshot", None):
+        evidence["env_snapshot"] = str(params.env_snapshot)[:4000]
     if params.files_changed:
         from hiveweave.services.worktree_review import normalize_files_changed
 
         evidence["files_changed"] = normalize_files_changed(params.files_changed)
     if params.test_output:
         evidence["test_output"] = params.test_output[:4000]
+
+    # P1-C/N5: code tasks require clean worktree + files_changed proof.
+    tag_l = {
+        str(t).strip().lower()
+        for t in (tags if isinstance(tags, list) else [])
+        if t
+    }
+    skip_delivery_gate = policy_id in ("docs_only", "explore") or bool(
+        tag_l & {"docs_only", "docs", "explore", "no-code", "no_code"}
+    )
+    if not skip_delivery_gate:
+        from hiveweave.services.worktree_review import (
+            agent_worktree_path,
+            effective_delivery,
+            normalize_files_changed,
+            project_main_workspace,
+        )
+
+        main_ws = await project_main_workspace(project_id)
+        wt = await agent_worktree_path(agent_id)
+        if wt and main_ws:
+            delivery = await effective_delivery(main_ws, wt)
+            dirty_count = int(delivery.get("dirty_count") or 0)
+            if dirty_count > 0:
+                return ToolResult.err(
+                    "submit_task rejected: worktree has uncommitted changes. "
+                    "Call git_worktree_checkpoint first, then submit_task."
+                )
+            if not evidence.get("files_changed"):
+                from hiveweave.services.git_worktree import _git
+
+                ok_diff, diff_out = await _git(
+                    ["diff", "--name-only", "main...HEAD"], wt
+                )
+                if ok_diff and (diff_out or "").strip():
+                    evidence["files_changed"] = normalize_files_changed(
+                        [
+                            ln.strip()
+                            for ln in diff_out.splitlines()
+                            if ln.strip()
+                        ]
+                    )
+            if not evidence.get("files_changed") and dirty_count > 0:
+                return ToolResult.err(
+                    "submit_task rejected: no files_changed and worktree is dirty. "
+                    "Call git_worktree_checkpoint first."
+                )
 
     try:
         # Auto-transition: if task is in 'created' or 'claimed' status,
@@ -1639,10 +1895,8 @@ async def review_task_tool(
                 except Exception:
                     pass
 
-            # Only auto-close when there is truly nothing to merge: empty
-            # files_changed + 0 commits ahead. Non-empty files_changed with
-            # ahead==0 usually means uncommitted worktree dirt — do NOT close
-            # (merge tip wouldn't pick those up either; executor must checkpoint).
+            # Auto-close only with merge/no-code fact + clean zero-ahead tree.
+            # Clean + 0 ahead + no fact = zero delivery (TEST20 N1) — keep open.
             evidence_after = (task_after or {}).get("evidence") or {}
             if isinstance(evidence_after, str):
                 try:
@@ -1654,31 +1908,63 @@ async def review_task_tool(
             claimed_files = evidence_after.get("files_changed") or evidence_after.get(
                 "filesChanged"
             ) or []
-            from hiveweave.services.worktree_review import _rel_paths
+            from hiveweave.services.worktree_review import (
+                _rel_paths,
+                effective_delivery,
+                evidence_has_merge_fact,
+            )
+            from hiveweave.services.task import MergeRequiredError
 
             has_claimed_files = bool(_rel_paths(list(claimed_files or [])))
-
-            if ahead == 0 and not has_claimed_files:
+            delivery = None
+            if main_ws and wt:
                 try:
-                    await ts.close_task(project_id, params.task_id)
-                except Exception as e:
-                    log.warning(
-                        "approve_no_diff_close_failed",
-                        task_id=params.task_id,
-                        error=str(e),
-                    )
+                    delivery = await effective_delivery(main_ws, wt)
+                except Exception:
+                    delivery = None
+            dirty = int((delivery or {}).get("dirty_count") or 0)
+
+            if ahead == 0 and not has_claimed_files and dirty == 0:
+                if evidence_has_merge_fact(evidence_after) or (
+                    evidence_after.get("no_code_change") is True
+                    or evidence_after.get("noCodeChange") is True
+                ):
+                    try:
+                        await ts.close_task(project_id, params.task_id)
+                    except MergeRequiredError as gate_err:
+                        return ToolResult.err(str(gate_err))
+                    except Exception as e:
+                        log.warning(
+                            "approve_no_diff_close_failed",
+                            task_id=params.task_id,
+                            error=str(e),
+                        )
+                        return ToolResult.ok(
+                            f"Task {params.task_id} approved; worktree already on "
+                            f"main (0 commits ahead, clean). "
+                            f"Close manually if needed ({e}). No merge required."
+                        )
                     return ToolResult.ok(
-                        f"Task {params.task_id} approved; worktree already on "
-                        f"main (0 commits ahead, no files_changed). "
-                        f"Close manually if needed ({e}). No merge required."
+                        f"Task {params.task_id} approved and closed — "
+                        f"already on main (0 commits ahead, clean, merge/no-code "
+                        f"fact present). No git_worktree_merge needed."
                     )
+                await _inject_merge_pending_wake(
+                    project_id=project_id,
+                    reviewer_id=agent_id,
+                    task=task_after or task,
+                    short_id=short,
+                    reason="no_delivery",
+                )
                 return ToolResult.ok(
-                    f"Task {params.task_id} approved; assignee worktree already "
-                    f"matches main (0 commits ahead, no files_changed) — "
-                    f"closed without merge. No git_worktree_merge needed."
+                    f"Task {params.task_id} approved but close blocked: "
+                    f"no effective delivery (0 commits ahead, clean worktree, "
+                    f"no merge fact). Executor must implement + checkpoint, "
+                    f"or stamp evidence.no_code_change=true, or "
+                    f"waive_merge(reason=…). Not treating as done."
                 )
 
-            if ahead == 0 and has_claimed_files:
+            if (ahead == 0 and has_claimed_files) or dirty > 0:
                 await _inject_merge_pending_wake(
                     project_id=project_id,
                     reviewer_id=agent_id,
@@ -1689,8 +1975,8 @@ async def review_task_tool(
                 return ToolResult.ok(
                     f"Task {params.task_id} approved against assignee worktree"
                     f"{f' ({wt})' if wt else ''}, but HEAD is 0 commits ahead "
-                    f"of main while evidence.files_changed is non-empty "
-                    f"(likely uncommitted changes). Executor must "
+                    f"of main while files_changed is non-empty or worktree is "
+                    f"dirty (dirty={dirty}). Executor must "
                     f"git_worktree_checkpoint before you merge; do NOT treat "
                     f"as already-merged. Next: confirm checkpoint, then "
                     f"git_worktree_merge(branchName='{short or 'hw/<short_id>/...'}')."
@@ -2170,6 +2456,119 @@ async def waive_attestation_tool(
     )
 
 
+# ── waive_merge ───────────────────────────────────────────────
+
+
+class WaiveMergeParams(BaseModel):
+    """Parameters for waive_merge tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    task_id: str = Field(
+        alias="taskId",
+        description="ID of the approved task whose merge-before-close gate "
+        "should be waived.",
+        json_schema_extra={"aliases": ["taskId", "task_id", "id"]},
+    )
+    reason: str = Field(
+        description=(
+            "Auditable reason merge is not required (min 20 chars). "
+            "E.g. docs-only delivery already on main via prior commit abc123."
+        ),
+    )
+
+
+@tool(
+    "waive_merge",
+    "Last-resort waiver of the merge-before-close hard gate "
+    "(coordinator/CEO). Prefer git_worktree_merge. After waiving, "
+    "close_task may proceed; evidence records merge_waived for audit.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def waive_merge_tool(
+    params: WaiveMergeParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """Explicit merge exemption — the only escape from close hard gate."""
+    import time as _time
+
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project")
+
+    reason = (params.reason or "").strip()
+    if not reason:
+        return ToolResult.err(
+            "waive_merge requires a non-empty 'reason' (auditability)."
+        )
+    if len(reason) < 20:
+        return ToolResult.err(
+            "waive_merge reason too short (min 20 chars). "
+            "State what was checked and why merge is not required."
+        )
+
+    ts = TaskService()
+    try:
+        task = await ts.get_task(project_id, params.task_id)
+    except Exception as e:
+        return ToolResult.err(f"Failed to load task: {e}")
+    if not task:
+        return ToolResult.err(f"Task not found: {params.task_id}")
+
+    if ts._is_verify_task(task):
+        return ToolResult.err(
+            f"VERIFY task {params.task_id}: waive_merge does not apply "
+            "(VERIFY has no merge step). Use waive_attestation if needed."
+        )
+
+    ev = task.get("evidence") or {}
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except Exception:
+            ev = {}
+    if not isinstance(ev, dict):
+        ev = {}
+    ev["merge_waived"] = True
+    ev["merge_waive_reason"] = reason[:500]
+    ev["merge_waived_by"] = agent_id
+    ev["merge_waived_at"] = int(_time.time() * 1000)
+
+    try:
+        from hiveweave.services import task as task_module
+
+        await task_module._execute(
+            project_id,
+            "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+            [json.dumps(ev), int(_time.time() * 1000), params.task_id],
+        )
+    except Exception as e:
+        return ToolResult.err(f"Failed to stamp merge waiver: {e}")
+
+    # Fulfill pending merge obligation so exit gates clear
+    try:
+        from hiveweave.services.obligation import ObligationLedger
+
+        await ObligationLedger().fulfill(project_id, params.task_id, "merge")
+    except Exception as e:
+        log.warning("waive_merge_fulfill_failed", error=str(e))
+
+    log.info(
+        "merge_waived",
+        project_id=project_id,
+        task_id=params.task_id,
+        waived_by=agent_id,
+        reason=reason[:120],
+    )
+    return ToolResult.ok(
+        f"Merge waived for task {params.task_id}. "
+        f"Stored reason: {reason}\n"
+        f"close_task / approve auto-close may now proceed without "
+        f"git_worktree_merge. Prefer merging next time when there is "
+        f"real code delivery."
+    )
+
+
 # ── attest_doc_review ────────────────────────────────────────
 
 
@@ -2331,6 +2730,15 @@ async def attest_doc_review_tool(
     )
 
 
+def _verify_required_capabilities(parent_policy: str) -> list[str]:
+    """Capabilities an independent QA must have for VERIFY (TEST21 M12)."""
+    if parent_policy == "ui_browser_e2e":
+        return ["browse", "browser_acceptance"]
+    if parent_policy == "docs_only":
+        return ["source_read"]
+    return ["test_run", "source_read"]
+
+
 async def _spawn_post_approve_verify_task(
     ts: TaskService,
     project_id: str,
@@ -2385,17 +2793,27 @@ async def _spawn_post_approve_verify_task(
 
     title = parent_task.get("title") or "task"
     original_assignee = parent_task.get("assignee_id")
+    from hiveweave.services.attestation import resolve_task_policy
+
+    parent_policy = parent_task.get("policy_id") or resolve_task_policy(
+        title=parent_task.get("title") or "",
+        tags=parent_tags if isinstance(parent_tags, list) else [],
+        description=parent_task.get("description") or "",
+    )
+    required_caps = _verify_required_capabilities(parent_policy)
     qa_assignee = await _find_independent_qa(
         project_id,
         original_assignee=original_assignee,
         # 合并人（通常=中层 builder）也不得自验 VERIFY
         exclude_ids={str(reviewer_id)} if reviewer_id else None,
+        required_capabilities=required_caps,
     )
+    caps_label = ", ".join(required_caps)
     blocked_note = ""
     if not qa_assignee:
         blocked_note = (
-            " No independent QA agent found — VERIFY left unassigned/blocked; "
-            "notify HR to hire QA."
+            f" No QA with capabilities [{caps_label}]; "
+            f"hire QA with {required_caps[0]} before VERIFY can run."
         )
 
     # VERIFY 的 creator 落到 CEO（审权不落回 merger=中层）；submit 时
@@ -2410,25 +2828,90 @@ async def _spawn_post_approve_verify_task(
     except Exception as e:
         log.warning("verify_ceo_lookup_failed", error=str(e))
 
-    verify_tags = ["verify", "mandatory", "post-merge"]
-    from hiveweave.services.attestation import resolve_task_policy
+    # Machine facts for QA — never claim "Work is already on MAIN" without proof
+    merge_sha = ""
+    branch_contains = "unknown"
+    try:
+        pev = parent_task.get("evidence") or {}
+        if isinstance(pev, str):
+            try:
+                pev = json.loads(pev)
+            except Exception:
+                pev = {}
+        if isinstance(pev, dict):
+            merge_sha = str(
+                pev.get("merge_commit")
+                or pev.get("merge_commit_hash")
+                or pev.get("commit")
+                or ""
+            ).strip()
+        if not merge_sha:
+            try:
+                from hiveweave.services import task as task_module
 
-    parent_policy = parent_task.get("policy_id") or resolve_task_policy(
-        title=parent_task.get("title") or "",
-        tags=parent_tags if isinstance(parent_tags, list) else [],
-        description=parent_task.get("description") or "",
+                rows = await task_module._query(
+                    project_id,
+                    "SELECT merge_commit_hash FROM verification_cases "
+                    "WHERE original_task_id = ? AND merge_commit_hash IS NOT NULL "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    [parent_id],
+                )
+                if rows and rows[0].get("merge_commit_hash"):
+                    merge_sha = str(rows[0]["merge_commit_hash"]).strip()
+            except Exception:
+                pass
+        try:
+            from hiveweave.services.worktree_review import project_main_workspace
+            from hiveweave.services.git_worktree import _git
+
+            main_ws = await project_main_workspace(project_id)
+            if main_ws and merge_sha:
+                ok_c, contains_out = await _git(
+                    ["branch", "--contains", merge_sha],
+                    main_ws,
+                )
+                if ok_c and contains_out:
+                    lines = [
+                        ln.strip().lstrip("*").strip()
+                        for ln in contains_out.splitlines()
+                        if ln.strip()
+                    ]
+                    branch_contains = (
+                        "yes" if any(ln == "main" or ln.endswith("/main") for ln in lines)
+                        else "no"
+                    )
+        except Exception:
+            branch_contains = "unknown"
+    except Exception:
+        pass
+
+    platform_facts_block = (
+        "[PLATFORM FACTS — do not contradict; re-verify with tools]\n"
+        f"- parent_task_id: {parent_id}\n"
+        f"- merge_commit: {merge_sha or '(not recorded — confirm on MAIN yourself)'}\n"
+        f"- branch_contains_on_main: {branch_contains}\n"
+        f"- merged_by: {reviewer_id or '(unknown)'}\n"
+        "Your job: run tests on MAIN and report against THESE facts.\n\n"
     )
+
+    verify_tags = ["verify", "mandatory", "post-merge"]
     if parent_policy == "ui_browser_e2e":
         verify_tags.append("ui")
     if parent_policy == "docs_only":
         verify_tags.append("docs_only")
+
+    verify_evidence: dict[str, Any] = {"required_capabilities": required_caps}
+    if reviewer_id:
+        verify_evidence["merged_by"] = str(reviewer_id)
 
     verify_id = await ts.create_task(
         project_id,
         title=f"VERIFY: {title}"[:200],
         description=(
             f"Mandatory post-merge verification for parent task {parent_id}.\n"
-            "1. Work is already on MAIN (coordinator merged the worktree).\n"
+            f"{platform_facts_block}"
+            "1. Confirm PLATFORM FACTS above (do not trust free-text claims that "
+            "work is on MAIN — re-check with git log / branch --contains).\n"
             "2. SPECS CONSISTENCY (check first): if docs/ contains spec files, "
             "verify the implementation matches them — dependency list, API "
             "contract, data model. Mismatch = fail (or escalate if specs were "
@@ -2456,8 +2939,7 @@ async def _spawn_post_approve_verify_task(
         parent_task_id=parent_id,
         tags=verify_tags,
         source="system",
-        # merged_by 供 review_task 的 VERIFY 独立审门排除合并人。
-        evidence={"merged_by": str(reviewer_id)} if reviewer_id else None,
+        evidence=verify_evidence,
     )
 
     # Pin reviewer_id = CEO creator at spawn (TEST11 audit H5) so review
@@ -2610,6 +3092,7 @@ async def _find_independent_qa(
     *,
     original_assignee: str | None,
     exclude_ids: set[str] | None = None,
+    required_capabilities: list[str] | None = None,
 ) -> str | None:
     """Pick QA-capability agent ≠ original implementer / merger (prefer same parent)."""
     from hiveweave.services.org import OrgService
@@ -2638,12 +3121,19 @@ async def _find_independent_qa(
                 original_parent = a.get("parent_id")
                 break
 
+    caps = [str(c) for c in (required_capabilities or []) if c]
+
     def is_qa(a: dict) -> bool:
         if infer_role_family(a) == "qa":
             return True
         return has_capability(a, Capability.BROWSER_ACCEPTANCE)
 
-    qa_agents = [a for a in active if is_qa(a)]
+    def matches_caps(a: dict) -> bool:
+        if caps:
+            return all(has_capability(a, Capability(c)) for c in caps)
+        return is_qa(a)
+
+    qa_agents = [a for a in active if matches_caps(a)]
     if not qa_agents:
         return None
     if original_parent:
@@ -2688,17 +3178,29 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
             original = (parent or {}).get("assignee_id")
             ex: set[str] = set()
             ev = t.get("evidence") or {}
+            if isinstance(ev, str):
+                try:
+                    ev = json.loads(ev)
+                except Exception:
+                    ev = {}
             if isinstance(ev, dict) and ev.get("merged_by"):
                 ex.add(str(ev["merged_by"]))
+            req_caps = None
+            if isinstance(ev, dict):
+                req_caps = ev.get("required_capabilities")
             qa = await _find_independent_qa(
-                project_id, original_assignee=original,
+                project_id,
+                original_assignee=original,
                 exclude_ids=ex or None,
+                required_capabilities=req_caps if isinstance(req_caps, list) else None,
             )
             if not qa:
+                missing = req_caps if isinstance(req_caps, list) else None
                 log.info(
                     "verify_retry_no_qa",
                     project_id=project_id,
                     verify_task_id=tid,
+                    required_capabilities=missing,
                 )
                 continue
             await ts.update_task(project_id, tid, assignee_id=qa)
@@ -2723,6 +3225,31 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
                     "blocked_reason = NULL, updated_at = ? WHERE id = ?",
                     [now_ms, tid],
                 )
+            import uuid as _uuid
+
+            event_id = str(_uuid.uuid4())
+            payload = json.dumps({"reason_code": "verify_rehang"})
+            try:
+                await task_module._execute(
+                    project_id,
+                    "INSERT INTO task_events "
+                    "(id, project_id, task_id, event_type, from_status, to_status, "
+                    "actor_id, payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        event_id,
+                        project_id,
+                        tid,
+                        "task.verify_rehang",
+                        "blocked",
+                        "created",
+                        "system",
+                        payload,
+                        now_ms,
+                    ],
+                )
+            except Exception as ev_err:
+                log.debug("verify_rehang_event_failed", error=str(ev_err))
             nudged = await _nudge_one_verify_task(
                 project_id,
                 "system",
@@ -2923,7 +3450,13 @@ async def rework_tasks_after_merge_conflict(
         if not tid:
             continue
         try:
-            await ts.review_task(project_id, tid, "rework", feedback)
+            await ts.review_task(
+                project_id,
+                tid,
+                "rework",
+                feedback,
+                reason_code="merge_conflict_rework",
+            )
         except Exception as e:
             log.warning("merge_conflict_rework_task_failed", task_id=tid, error=str(e))
             continue
@@ -2931,7 +3464,10 @@ async def rework_tasks_after_merge_conflict(
             await inbox.send_message(
                 from_agent_id=from_agent_id,
                 to_agent_id=agent_id,
-                message=f"[REWORK REQUESTED] {feedback}",
+                message=(
+                    f"[REWORK REQUESTED] [reason_code=merge_conflict_rework] "
+                    f"{feedback}"
+                ),
                 message_type="task",
                 priority="urgent",
                 task_id=tid,
@@ -2950,6 +3486,43 @@ async def rework_tasks_after_merge_conflict(
     return count
 
 
+async def _stamp_merge_fact_on_parent_tasks(
+    project_id: str,
+    tasks: list[dict],
+    *,
+    merged_by: str,
+    merge_commit: str | None,
+) -> None:
+    """Persist merge machine facts on parent tasks after a real merge."""
+    import time
+
+    from hiveweave.services.task import _execute
+
+    now_ms = int(time.time() * 1000)
+    for t in tasks:
+        tid = t.get("id")
+        if not tid:
+            continue
+        ev = t.get("evidence") or {}
+        if isinstance(ev, str):
+            try:
+                ev = json.loads(ev)
+            except Exception:
+                ev = {}
+        if not isinstance(ev, dict):
+            ev = {}
+        ev = dict(ev)
+        ev["merged_by"] = merged_by
+        if merge_commit:
+            ev["merge_commit"] = str(merge_commit)
+        ev["merged_at"] = now_ms
+        await _execute(
+            project_id,
+            "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+            [json.dumps(ev), now_ms, tid],
+        )
+
+
 async def nudge_verify_tasks_after_merge(
     project_id: str,
     from_agent_id: str,
@@ -2958,6 +3531,7 @@ async def nudge_verify_tasks_after_merge(
     merged_agent_id: str | None = None,
     merged_branch: str | None = None,
     merged_files: list[str] | None = None,
+    merge_commit: str | None = None,
 ) -> int:
     """After successful merge: spawn VERIFY for scoped tasks, then nudge.
 
@@ -2985,6 +3559,20 @@ async def nudge_verify_tasks_after_merge(
                 statuses=("approved", "verifying"),
             )
             parent_ids = {t["id"] for t in selected if t.get("id")}
+            if selected:
+                try:
+                    await _stamp_merge_fact_on_parent_tasks(
+                        project_id,
+                        selected,
+                        merged_by=from_agent_id,
+                        merge_commit=merge_commit,
+                    )
+                except Exception as stamp_err:
+                    log.warning(
+                        "merge_fact_stamp_failed",
+                        project_id=project_id,
+                        error=str(stamp_err),
+                    )
             spawned = []
             for t in selected:
                 tid = t.get("id")

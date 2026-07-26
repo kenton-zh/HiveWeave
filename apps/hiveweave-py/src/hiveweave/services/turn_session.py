@@ -22,6 +22,7 @@ _soft_warn_counts: dict[str, dict[str, int]] = {}
 # traded the whole org for one skipped send_message (TEST14 freeze).
 HARD_COMMIT_GATE_CODES = frozenset({
     "UNREPLIED_ASKS",
+    "UNCOMMITTED_WORKTREE",
 })
 
 

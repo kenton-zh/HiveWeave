@@ -1,9 +1,8 @@
-"""merge 后 main 残留冲突标记 — 扫描 + 清理任务路由。
+"""merge 后 main 残留冲突标记 — 扫描 + hard-fail abort。
 
 事故背景: git_worktree_merge 显示成功, 但 main 上遗留未解决的
-<<<<<<< / >>>>>>> 标记, 无人认领清理。修复: merge 成功后扫描目标树,
-命中则自动给被合并 worktree 的 owner 创建「清理合并残留冲突标记」任务;
-建账失败只降级为警告, 不回滚 merge。
+<<<<<<< / >>>>>>> 标记。修复: merge 成功后扫描目标树; 命中则 abort
+merge 并返回 failure (conflict_markers_landed), tool 层走 rework。
 """
 
 from __future__ import annotations
@@ -138,14 +137,16 @@ async def _call_merge_tool(repo: Path, caller: str, branch_name: str,
 
 
 async def test_service_merge_reports_conflict_markers(git_repo: Path) -> None:
-    """service 层: merge 成功结果携带 conflict_markers (相对路径)。"""
+    """service 层: merge 命中标记 → abort, success=False."""
     branch = await _make_marked_branch(git_repo, "A004", "feat-x", "marked.py")
 
     gwt = GitWorktreeService()
     res = await gwt.merge_by_branch(str(git_repo), branch, "main")
 
-    assert res["success"] is True, res
-    assert res["conflict_markers"] == ["marked.py"]
+    assert res["success"] is False, res
+    assert res["reason"] == "conflict_markers_landed"
+    assert res["conflicts"] == ["marked.py"]
+    assert not (git_repo / "marked.py").exists()
 
 
 async def test_service_clean_merge_has_no_conflict_markers(
@@ -161,28 +162,32 @@ async def test_service_clean_merge_has_no_conflict_markers(
     assert "conflict_markers" not in res
 
 
-async def test_merge_tool_creates_cleanup_task_for_owner(
-    git_repo: Path,
-) -> None:
-    """tool 层: 命中标记 → 建清理任务给被合并 worktree 的 owner + 警告。"""
+async def test_merge_tool_markers_route_to_rework(git_repo: Path) -> None:
+    """tool 层: 标记落地 → merge 失败 + rework 路径 (非 success 清理任务)。"""
     await _make_marked_branch(git_repo, "A004", "feat-x", "marked.py")
     create_mock = AsyncMock(return_value="task-cleanup-1")
+    rework_mock = AsyncMock(return_value=1)
 
-    result = await _call_merge_tool(git_repo, "A003", "A004", create_mock)
+    params = GitWorktreeMergeParams(branchName="A004")
+    with patch(
+        "hiveweave.tools.misc_tools._get_worktree_context",
+        new=AsyncMock(return_value=(str(git_repo), "A003", "proj-x")),
+    ), patch(
+        "hiveweave.tools.task_tools.nudge_verify_tasks_after_merge",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "hiveweave.tools.task_tools.rework_tasks_after_merge_conflict",
+        rework_mock,
+    ), patch(
+        "hiveweave.services.task.TaskService.create_task", create_mock
+    ):
+        result = await git_worktree_merge_tool(params, "agent-x", str(git_repo))
 
-    assert result.success is True, result.error
-    # merge 本身成功 — 残留标记确实随提交落到 main
-    assert (git_repo / "marked.py").exists()
-    out = result.output
-    assert "WARNING" in out
-    assert "marked.py" in out
-    assert "task-cleanup-1" in out
-    assert "A004" in out  # assignee 提示含 owner short_id
-    create_mock.assert_awaited_once()
-    kwargs = create_mock.await_args.kwargs
-    assert kwargs["title"] == "清理合并残留冲突标记"
-    assert kwargs["assignee_id"] == "agent-owner-1"
-    assert "marked.py" in kwargs["description"]
+    assert result.success is False, result.output
+    assert not (git_repo / "marked.py").exists()
+    assert "marked.py" in (result.error or "")
+    rework_mock.assert_awaited_once()
+    create_mock.assert_not_awaited()
 
 
 async def test_merge_tool_clean_merge_no_warning_no_task(
@@ -199,19 +204,15 @@ async def test_merge_tool_clean_merge_no_warning_no_task(
     create_mock.assert_not_awaited()
 
 
-async def test_merge_tool_task_failure_degrades_to_warning(
+async def test_merge_tool_task_failure_no_success_on_markers(
     git_repo: Path,
 ) -> None:
-    """建账失败不回滚 merge — 结果仍成功, 警告注明 fallback 手动 rework。"""
+    """标记落地时 merge 已 abort — 不再 success=True 降级警告。"""
     await _make_marked_branch(git_repo, "A004", "feat-x", "marked.py")
     create_mock = AsyncMock(side_effect=RuntimeError("db down"))
 
     result = await _call_merge_tool(git_repo, "A003", "A004", create_mock)
 
-    assert result.success is True, result.error
-    assert (git_repo / "marked.py").exists()  # merge 未回滚
-    out = result.output
-    assert "WARNING" in out
-    assert "marked.py" in out
-    assert "db down" in out
-    assert "manually rework A004" in out
+    assert result.success is False, result.output
+    assert not (git_repo / "marked.py").exists()
+    create_mock.assert_not_awaited()

@@ -31,6 +31,7 @@ async def test_handle_error_rate_limit_no_consecutive():
     agent.config = {}
     agent._consecutive_errors = 0
     agent._stream_timeout_streak = 0
+    agent._rate_limit_streak = 0
     agent._CONSECUTIVE_ERROR_MAX = 3
     agent.pending_inbox_msg_ids = ["m1"]
     agent._streaming_msg_id = None
@@ -49,6 +50,7 @@ async def test_handle_error_rate_limit_no_consecutive():
     agent._ack_inbox_on_give_up = AsyncMock()
     agent._escalate_turn_interruption = AsyncMock()
     agent._inject_ledger_review_wake = AsyncMock()
+    agent._park_after_quota_exhausted = AsyncMock()
 
     with patch("hiveweave.services.event_audit.event_audit") as ea:
         ea.log = AsyncMock()
@@ -61,8 +63,9 @@ async def test_handle_error_rate_limit_no_consecutive():
     assert agent._consecutive_errors == 0
     agent._arm_resume_suppressed.assert_not_called()
     agent._ack_inbox_on_give_up.assert_not_called()
-    assert agent._arm_resume_cooldown.call_count == 5
-    agent._arm_resume_cooldown.assert_called_with(RATE_LIMIT_RESUME_COOLDOWN_S)
+    # No headers: first two soft cooldown, 3rd parks (not infinite cooldown)
+    assert agent._arm_resume_cooldown.call_count == 2
+    assert agent._park_after_quota_exhausted.await_count == 3
 
 
 @pytest.mark.asyncio
