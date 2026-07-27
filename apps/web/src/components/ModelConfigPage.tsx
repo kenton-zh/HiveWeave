@@ -50,6 +50,8 @@ export default function ModelConfigPage({ onClose }: Props) {
     managementBackup: null,
     executorPrimary: null,
     executorBackup: null,
+    visionPrimary: null,
+    visionBackup: null,
   });
   const [tierSaving, setTierSaving] = useState(false);
 
@@ -241,6 +243,8 @@ export default function ModelConfigPage({ onClose }: Props) {
       "w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm text-g-fg focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow",
     executor:
       "w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm text-g-fg focus:outline-none focus:border-g-green/50 focus:ring-2 focus:ring-g-green/15 transition-shadow",
+    vision:
+      "w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm text-g-fg focus:outline-none focus:border-amber-500/50 focus:ring-2 focus:ring-amber-500/15 transition-shadow",
   };
 
   return (
@@ -477,10 +481,10 @@ export default function ModelConfigPage({ onClose }: Props) {
               </button>
             </div>
             <p className="text-[13px] text-g-fg-3 mb-4 leading-relaxed">
-              管理层（CEO / Coordinator）与执行层（Executor / QA / HR）各自指定主用与备用模型。主用模型故障（429 / 5xx）时自动切换到备用。
+              管理层（CEO / Coordinator）与执行层（Executor / QA / HR）各自指定主用与备用模型。主用模型故障（429 / 5xx）时自动切换到备用。多模态模型专供「帮你看图片」；识图调用主用失败时同样自动切备用（同 API Key 跳过）。
             </p>
 
-            <div className="grid grid-cols-2 gap-5">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
               {/* Management tier */}
               <div className="border border-g-blue/25 rounded-gmLg p-5 bg-g-blue-bg/15 shadow-gm-sm">
                 <div className="flex items-center gap-2 mb-4">
@@ -536,6 +540,37 @@ export default function ModelConfigPage({ onClose }: Props) {
                       value={tierConfig.executorBackup || ""}
                       onChange={(e) => setTierSlot("executorBackup", e.target.value)}
                       className={SELECT_CLS.executor}
+                    >
+                      {modelOptions}
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Vision / multimodal */}
+              <div className="border border-amber-500/25 rounded-gmLg p-5 bg-g-yellow-bg/40 shadow-gm-sm">
+                <div className="flex items-center gap-2 mb-4">
+                  <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
+                  <span className="text-sm font-semibold text-g-fg">多模态模型配置</span>
+                  <span className="text-[11px] text-g-fg-4">帮你看图片</span>
+                </div>
+                <div className="space-y-4">
+                  <div>
+                    <label className={LABEL_CLS}>主用模型</label>
+                    <select
+                      value={tierConfig.visionPrimary || ""}
+                      onChange={(e) => setTierSlot("visionPrimary", e.target.value)}
+                      className={SELECT_CLS.vision}
+                    >
+                      {modelOptions}
+                    </select>
+                  </div>
+                  <div>
+                    <label className={LABEL_CLS}>备用模型</label>
+                    <select
+                      value={tierConfig.visionBackup || ""}
+                      onChange={(e) => setTierSlot("visionBackup", e.target.value)}
+                      className={SELECT_CLS.vision}
                     >
                       {modelOptions}
                     </select>

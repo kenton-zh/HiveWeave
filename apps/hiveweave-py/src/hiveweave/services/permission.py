@@ -43,6 +43,7 @@ _BASE_TOOLS = frozenset({
     "claim_task", "update_task_status", "submit_task", "update_progress",
     "attest_doc_review",
     "assert_visual",
+    "look_at_image",
 })
 
 CEO_TOOLS = _BASE_TOOLS | frozenset({

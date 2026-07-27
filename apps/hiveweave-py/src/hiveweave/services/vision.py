@@ -218,3 +218,128 @@ def gemini_image_parts(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
             },
         })
     return parts
+
+
+def _text_from_message(msg: dict[str, Any]) -> str:
+    """Prefer visible content; fall back to reasoning/thinking fields."""
+    content = msg.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        bits: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                bits.append(part["text"])
+        joined = "".join(bits)
+        if joined.strip():
+            return joined
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        val = msg.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
+
+
+def extract_nonstream_text(data: dict[str, Any]) -> str:
+    """Pull assistant text from a non-streaming chat completion body.
+
+    Supports OpenAI ``choices``, Anthropic ``content`` blocks, and Gemini
+    ``candidates`` — same providers as ``provider_factory``.
+    When ``message.content`` is empty (common with thinking models), falls
+    back to ``reasoning_content`` / ``thinking``.
+    """
+    if not isinstance(data, dict):
+        return ""
+
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if isinstance(msg, dict):
+            text = _text_from_message(msg)
+            if text:
+                return text
+
+    content = data.get("content")
+    if isinstance(content, list):
+        bits = []
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                bits.append(block["text"])
+        if bits:
+            return "".join(bits)
+    if isinstance(content, str) and content.strip():
+        return content
+
+    candidates = data.get("candidates")
+    if isinstance(candidates, list) and candidates:
+        c0 = candidates[0] if isinstance(candidates[0], dict) else None
+        parts = (c0 or {}).get("content", {}).get("parts") if c0 else None
+        if isinstance(parts, list):
+            bits = [
+                p["text"]
+                for p in parts
+                if isinstance(p, dict) and isinstance(p.get("text"), str)
+            ]
+            return "".join(bits)
+
+    return ""
+
+
+async def analyze_image(
+    *,
+    image: dict[str, str],
+    prompt: str,
+    model_config: dict[str, Any],
+    timeout_s: float = 120.0,
+) -> str:
+    """One-shot non-streaming multimodal call. Stateless — no history.
+
+    ``image`` is ``{media_type, data}`` from :func:`load_image_for_llm`.
+    Returns the full assistant text (never streams to the caller).
+    Thinking/reasoning mode is forced off so answers land in ``content``.
+    """
+    import httpx
+
+    from hiveweave.llm.provider import provider_factory
+
+    # Vision one-shot wants visible content, not a thinking-only body.
+    cfg = dict(model_config)
+    cfg["supports_thinking"] = False
+    cfg["default_reasoning_effort"] = None
+
+    provider = provider_factory.create(cfg)
+    body = provider.build_body(
+        messages=[
+            {
+                "role": "user",
+                "content": prompt.strip(),
+                "images": [image],
+            },
+        ],
+        stream=False,
+        temperature=0.2,
+        tools=None,
+    )
+    headers = provider.build_headers()
+    headers["Accept"] = "application/json"
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=10.0, pool=10.0),
+    ) as client:
+        resp = await client.post(
+            provider.build_url(),
+            json=body,
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    text = extract_nonstream_text(data).strip()
+    if not text:
+        raise RuntimeError("Vision model returned empty content")
+    return text
+

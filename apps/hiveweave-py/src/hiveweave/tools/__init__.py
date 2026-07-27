@@ -49,6 +49,7 @@ import hiveweave.tools.misc_tools  # noqa: F401 — registers git_worktree, lega
 import hiveweave.tools.turn_tools  # noqa: F401 — commit_turn, defer_task_advance, ask/notify
 import hiveweave.tools.dev_server_tools  # noqa: F401 — start_dev_server / lookup_dev_server
 import hiveweave.tools.browse_tools  # noqa: F401 — browse (gstack Chromium CLI)
+import hiveweave.tools.vision_tools  # noqa: F401 — look_at_image (帮你看图片)
 from hiveweave.tools.base import _TOOL_REGISTRY, list_tool_names  # noqa: F401
 from hiveweave.tools.result import ToolResult as ToolResultDataclass  # noqa: F401
 from hiveweave.tools.pipeline import ToolContext  # noqa: F401

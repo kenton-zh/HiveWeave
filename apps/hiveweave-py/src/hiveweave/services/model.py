@@ -383,6 +383,36 @@ class ModelService:
 
         return None
 
+    async def resolve_vision_model(
+        self,
+        skip_model_ids: set[str] | None = None,
+    ) -> dict | None:
+        """Resolve the multimodal model for look_at_image.
+
+        Keys: ``vision_model_primary`` / ``vision_model_backup`` in global_settings.
+        Strict primary → backup; no fallthrough to management/executor tiers.
+        """
+        from hiveweave.services.settings import SettingsService
+
+        skip = skip_model_ids or set()
+        svc = SettingsService()
+        primary = await svc.get("vision_model_primary")
+        backup = await svc.get("vision_model_backup")
+
+        for slot_id in (primary, backup):
+            if not slot_id or slot_id in skip:
+                continue
+            model = await self.get(slot_id)
+            if model and model.get("is_active") and model.get("id") not in skip:
+                if slot_id == backup and primary:
+                    log.info(
+                        "vision_model_resolve_backup",
+                        backup=slot_id,
+                        skipped_primary=primary,
+                    )
+                return model
+        return None
+
     async def ensure_channel_models(self) -> dict:
         """Upsert Ark Plan (+ optional Coding) channels for multi-quota pooling."""
         from hiveweave.config import settings
