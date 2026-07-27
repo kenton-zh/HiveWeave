@@ -153,7 +153,7 @@ def test_echo_family_still_qa_for_verify_discovery():
 
 @pytest.mark.asyncio
 async def test_ceo_write_scope_unchanged(svc, monkeypatch):
-    # 回归保护：CEO 写白名单内放行、写源码仍硬拒（无 SOURCE_WRITE）
+    # CEO: DOC_WRITE 任意文档放行；源码硬拒（无 SOURCE_WRITE）
     _patch_agent(monkeypatch, _ceo())
     assert (
         await svc.evaluate(
@@ -163,8 +163,24 @@ async def test_ceo_write_scope_unchanged(svc, monkeypatch):
     )
     assert (
         await svc.evaluate(
+            "a1", "write_file", {"filePath": "SHIP.md", "content": "x"}
+        )
+        == "allow"
+    )
+    assert (
+        await svc.evaluate(
+            "a1", "edit_file", {"filePath": "notes/retro.md"}
+        )
+        == "allow"
+    )
+    assert (
+        await svc.evaluate(
             "a1", "write_file", {"filePath": "src/app.py", "content": "x"}
         )
+        == "deny"
+    )
+    assert (
+        await svc.evaluate("a1", "edit_file", {"filePath": "src/app.py"})
         == "deny"
     )
 
@@ -189,8 +205,11 @@ async def test_builder_coordinator_write_source_allowed(svc, monkeypatch):
 
 def test_ceo_tool_list_excludes_code_tools(svc):
     tools = svc.get_tools_for_agent(_ceo())
-    for t in ("bash", "edit_file", "apply_patch", "run_tests", "browse"):
+    for t in ("bash", "apply_patch", "run_tests", "browse"):
         assert t not in tools
+    # edit_file 在工具表内，路径硬门拦源码
+    assert "edit_file" in tools
+    assert "write_file" in tools
     for t in ("dispatch_task", "review_task", "git_worktree_merge",
               "save_charter", "update_goals", "message_user"):
         assert t in tools
@@ -205,10 +224,13 @@ def test_message_user_in_all_tools(svc):
 
 def test_deny_hint_ceo_write_points_to_mid_level():
     hint = build_deny_hint("edit_file", "ceo")
-    assert "docs/" in hint
+    assert "DOC_WRITE" in hint
+    assert "documentation" in hint
     assert "dispatch_task" in hint
     assert "CEO" in hint
     assert "read-only" not in hint
+    # 不再枚举文件名白名单
+    assert "README.md" not in hint
 
 
 def test_deny_hint_builder_coordinator_write_points_to_worktree():
@@ -224,6 +246,7 @@ def test_deny_hint_includes_real_hard_reason():
         _ceo(), "write_file", {"filePath": "src/app.py"}
     )
     assert reason
+    assert "kind=source" in reason
     hint = build_deny_hint("write_file", "ceo", reason)
     assert reason in hint
     assert "read-only" not in hint
@@ -236,7 +259,7 @@ def test_deny_hint_generic_for_executor():
 
 @pytest.mark.asyncio
 async def test_pipeline_deny_hint_end_to_end(monkeypatch, tmp_path):
-    """CEO 写源码被拒 → pipeline 返回真实原因 + 白名单/委派指引。"""
+    """CEO 写源码被拒 → pipeline 返回 DOC_WRITE 原则 + 委派指引。"""
     import hiveweave.tools.file  # noqa: F401 — 确保 write_file 完成 @tool 注册
 
     _patch_agent(monkeypatch, _ceo())
@@ -255,6 +278,8 @@ async def test_pipeline_deny_hint_end_to_end(monkeypatch, tmp_path):
     )
     assert result is not None
     assert result["success"] is False
-    assert "docs/" in result["error"]
+    assert "DOC_WRITE" in result["error"]
+    assert "documentation" in result["error"]
     assert "dispatch_task" in result["error"]
     assert "read-only" not in result["error"]
+    assert "README.md" not in result["error"]

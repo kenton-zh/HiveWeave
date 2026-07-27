@@ -131,7 +131,7 @@ def test_hire_permission_mode():
     assert _hire_permission_mode("executor", "签到工程师") == "readwrite"
     # builder coordinator → 可写（勿死锁 readonly）
     assert _hire_permission_mode("coordinator", "前端架构师") == "readwrite"
-    # CEO / HR → 偏只读协调 mode（无 SOURCE_WRITE，docs 白名单够用）
+    # CEO / HR → 偏协调 mode（CEO 有 DOC_WRITE；均无 SOURCE_WRITE）
     assert _hire_permission_mode("coordinator", "ceo") == "readonly"
     assert _hire_permission_mode("coordinator", "hr") == "readonly"
 

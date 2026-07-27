@@ -9,6 +9,7 @@ from hiveweave.services.permission import PermissionService
 from hiveweave.services.policy import (
     Capability,
     capabilities_for,
+    classify_write_kind,
     infer_role_family,
     policy_service,
     tool_hard_deny,
@@ -57,19 +58,40 @@ def test_hr_caps_no_dispatch_or_bash():
 
 
 def test_ceo_no_bash_browse_hire_or_source_write():
-    """CEO 行政 family：派审合/org 放行，写码/bash/test/staffing 全拒。"""
+    """CEO 行政 family：派审合/org + DOC_WRITE；写码/bash/test/staffing 全拒。"""
     ceo = _agent(role="ceo", permission_type="coordinator", name="归零")
     assert infer_role_family(ceo) == "ceo"
+    assert Capability.DOC_WRITE in capabilities_for(ceo)
+    assert Capability.SOURCE_WRITE not in capabilities_for(ceo)
     assert tool_hard_deny(ceo, "bash")
     assert tool_hard_deny(ceo, "browse")
     assert tool_hard_deny(ceo, "run_tests")
     assert tool_hard_deny(ceo, "hire_agent")
-    assert tool_hard_deny(ceo, "edit_file")
+    assert tool_hard_deny(ceo, "apply_patch")
+    # edit_file 能力放行（DOC_WRITE），路径硬门另测
+    assert tool_hard_deny(ceo, "edit_file") is None
     assert tool_hard_deny(ceo, "dispatch_task") is None
     assert tool_hard_deny(ceo, "review_task") is None
     assert tool_hard_deny(ceo, "git_worktree_merge") is None
     assert write_path_allowed(ceo, "src/app.ts")
     assert write_path_allowed(ceo, "docs/plan.md") is None
+    # 任意文档路径（不限 docs/ 前缀）
+    assert write_path_allowed(ceo, "CHANGELOG.md") is None
+    assert write_path_allowed(ceo, "notes/ship-report.md") is None
+    assert write_path_allowed(ceo, "src/components/README.md") is None
+    # 运行时配置 / 无扩展非文档 → other → 拒
+    assert write_path_allowed(ceo, "package.json")
+    assert write_path_allowed(ceo, "docs/hack.py")
+
+
+def test_classify_write_kind():
+    assert classify_write_kind("README.md") == "document"
+    assert classify_write_kind("docs/a.rst") == "document"
+    assert classify_write_kind("LICENSE") == "document"
+    assert classify_write_kind("src/App.tsx") == "source"
+    assert classify_write_kind("styles.css") == "source"
+    assert classify_write_kind("package.json") == "other"
+    assert classify_write_kind("Makefile") == "other"
 
 
 def test_builder_coordinator_has_code_caps():
@@ -126,6 +148,15 @@ def test_policy_hard_check_write_scope():
             ceo, "write_file", {"filePath": "docs/adr/001.md"}
         )
         is None
+    )
+    assert (
+        policy_service.hard_check(
+            ceo, "edit_file", {"filePath": "RELEASE_NOTES.md"}
+        )
+        is None
+    )
+    assert policy_service.hard_check(
+        ceo, "edit_file", {"filePath": "src/main.py"}
     )
 
 

@@ -2,13 +2,13 @@
 
 Evaluation order (P0 Hard Gates):
 1. Hard capability deny (role family matrix)
-2. Parameter scope (path prefixes for write_file, etc.)
+2. Parameter scope (path kind / prefixes for write_file & edit_file)
 3. User rules: deny → ask → allow
 4. Mode fallback
 
 Role families: ceo | hr | coordinator | executor | qa
 
-- ceo: 行政 + 里程碑验收（派/审/合兜底/组织管理），无写码/bash/test。
+- ceo: 行政 + 里程碑验收 + DOC_WRITE（任意文档，禁源码/配置）。无写码/bash/test。
 - coordinator: 中层 builder（player-coach）— 协调权叠加写码权
   （SOURCE_WRITE / BASH_SHELL / TEST_RUN / BROWSE）。
 """
@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
 log = structlog.get_logger(__name__)
+
+WriteKind = Literal["document", "source", "other"]
 
 
 class Capability(str, Enum):
@@ -33,6 +35,8 @@ class Capability(str, Enum):
     MERGE = "merge"
     SOURCE_READ = "source_read"
     SOURCE_WRITE = "source_write"
+    # Prose/markup only — orthogonal to SOURCE_WRITE (CEO document authority)
+    DOC_WRITE = "doc_write"
     TEST_RUN = "test_run"
     BROWSER_ACCEPTANCE = "browser_acceptance"
     BASH_SHELL = "bash_shell"
@@ -44,12 +48,13 @@ RoleFamily = str  # "ceo" | "hr" | "coordinator" | "executor" | "qa"
 # Default capability matrix — hard coded.
 FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
     "ceo": frozenset({
-        # CEO: 行政 + 里程碑验收。无写码/bash/test/staffing。
+        # CEO: 行政 + 里程碑验收 + 文档权。无写码/bash/test/staffing。
         Capability.DISPATCH,
         Capability.REVIEW,
         Capability.MERGE,  # 升级兜底（中层缺席时救场合并）
         Capability.SOURCE_READ,
         Capability.MANAGE_ORG,
+        Capability.DOC_WRITE,
     }),
     "hr": frozenset({
         Capability.STAFFING,
@@ -112,7 +117,8 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "bash": frozenset({Capability.BASH_SHELL}),
     "run_command": frozenset({Capability.BASH_SHELL}),
     "browse": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
-    "edit_file": frozenset({Capability.SOURCE_WRITE}),
+    # DOC_WRITE agents (CEO) may edit docs; SOURCE_WRITE covers all paths
+    "edit_file": frozenset({Capability.SOURCE_WRITE, Capability.DOC_WRITE}),
     "apply_patch": frozenset({Capability.SOURCE_WRITE}),
     "delete_file": frozenset({Capability.SOURCE_WRITE}),
     "move_file": frozenset({Capability.SOURCE_WRITE}),
@@ -126,9 +132,8 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     # write_file: capability depends on path scope (checked separately)
 }
 
-# Paths coordinators/HR may write without SOURCE_WRITE
+# Paths HR (no DOC_WRITE / SOURCE_WRITE) may write — legacy prefix scope.
 # Keep in sync with file.py allowed_subdirs + bash.py _ALLOWED_HW_SUBDIRS
-# (shared/reports/drafts; worktrees are agent-owned write sandboxes)
 COORDINATOR_WRITE_PREFIXES = (
     "docs/",
     "doc/",
@@ -148,6 +153,37 @@ _HW_WRITE_MARKERS = (
     "/.hiveweave/reports/",
     "/.hiveweave/drafts/",
 )
+
+# Human prose / markup — DOC_WRITE may create or edit these anywhere.
+_DOCUMENT_EXTENSIONS = frozenset({
+    ".md", ".mdx", ".markdown",
+    ".txt", ".text",
+    ".rst", ".rest",
+    ".adoc", ".asciidoc",
+    ".org",
+})
+
+# Executable / buildable / stylesheet — never DOC_WRITE.
+_SOURCE_EXTENSIONS = frozenset({
+    ".ts", ".tsx", ".mts", ".cts",
+    ".js", ".jsx", ".mjs", ".cjs",
+    ".py", ".pyi", ".pyw",
+    ".go", ".rs", ".java", ".kt", ".kts",
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx",
+    ".cs", ".fs", ".vb",
+    ".rb", ".php", ".swift", ".m", ".mm",
+    ".vue", ".svelte",
+    ".css", ".scss", ".sass", ".less",
+    ".wasm", ".so", ".dll", ".dylib",
+    ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd",
+    ".sql", ".lua", ".r", ".zig", ".nim",
+})
+
+# Extensionless conventional prose filenames (classifier impl detail, not prompts)
+_DOCUMENT_BASENAMES_NO_EXT = frozenset({
+    "readme", "changelog", "license", "licence", "authors",
+    "contributing", "history", "news", "todo", "copying", "notice",
+})
 
 
 def is_test_engineer_role(role: str) -> bool:
@@ -223,13 +259,8 @@ def tool_hard_deny(agent: dict[str, Any], tool_name: str) -> str | None:
     return None
 
 
-def write_path_allowed(agent: dict[str, Any], file_path: str) -> str | None:
-    """Return deny reason if write_file path is out of scope for this agent."""
-    caps = capabilities_for(agent)
-    if Capability.SOURCE_WRITE in caps:
-        return None  # executors may write anywhere in sandbox
-
-    # Coordinators / HR without source_write: docs & shared/reports/drafts
+def _normalize_write_path(file_path: str) -> str:
+    """Normalize path for write-scope checks (preserve leading '.' segments)."""
     from hiveweave.tools.file import normalize_input_path
 
     # Do NOT use str.lstrip("./") — that strips every leading '.' and breaks
@@ -237,26 +268,93 @@ def write_path_allowed(agent: dict[str, Any], file_path: str) -> str | None:
     norm = normalize_input_path(file_path or "").replace("\\", "/")
     while norm.startswith("./"):
         norm = norm[2:]
-    # Absolute MSYS/Windows paths: allow if they land under shared/reports/drafts
+    return norm
+
+
+def classify_write_kind(file_path: str) -> WriteKind:
+    """Classify a path as document / source / other (extension-based).
+
+    Used by DOC_WRITE hard gates. Implementation detail lives here — prompts
+    must state the principle only ("any documentation, never source code").
+    """
+    norm = _normalize_write_path(file_path)
+    if not norm or norm.endswith("/"):
+        return "other"
+    name = PurePosixPath(norm).name
+    # multi-dot suffixes: take the last suffix (PurePosixPath.suffix)
+    ext = PurePosixPath(name).suffix.lower()
+    if ext in _DOCUMENT_EXTENSIONS:
+        return "document"
+    if ext in _SOURCE_EXTENSIONS:
+        return "source"
+    if not ext and name.lower() in _DOCUMENT_BASENAMES_NO_EXT:
+        return "document"
+    return "other"
+
+
+def _prefix_write_allowed(norm: str) -> bool:
+    """Legacy HR / no-DOC_WRITE scope: docs + .hiveweave shared dirs + root meta."""
     check = norm if norm.startswith("/") else f"/{norm}"
     for marker in _HW_WRITE_MARKERS:
         if marker in check:
-            return None
+            return True
     for prefix in COORDINATOR_WRITE_PREFIXES:
         if prefix.endswith("/"):
             if norm.startswith(prefix) or norm == prefix.rstrip("/"):
-                return None
+                return True
         else:
             if norm == prefix or norm.startswith(prefix + "."):
-                return None
-    # charter-like project meta files at root
+                return True
     base = PurePosixPath(norm).name.lower()
     if base in {"charter.md", "goals.md", "spec.md"}:
+        return True
+    return False
+
+
+def write_path_allowed(agent: dict[str, Any], file_path: str) -> str | None:
+    """Return deny reason if write/edit path is out of scope for this agent.
+
+    Precedence:
+    1. SOURCE_WRITE → anywhere
+    2. DOC_WRITE → document kind only (any path); source/other denied
+    3. else → legacy prefix whitelist (HR)
+    """
+    caps = capabilities_for(agent)
+    if Capability.SOURCE_WRITE in caps:
+        return None  # executors / builder coordinators may write anywhere
+
+    norm = _normalize_write_path(file_path)
+    family = infer_role_family(agent)
+
+    if Capability.DOC_WRITE in caps:
+        kind = classify_write_kind(norm)
+        if kind == "document":
+            return None
+        return (
+            f"Hard scope deny: path '{file_path}' is kind={kind}; "
+            f"role_family={family} has doc_write (documentation only) — "
+            f"source code and runtime config require source_write. "
+            f"Delegate code changes to a mid-level coordinator."
+        )
+
+    if _prefix_write_allowed(norm):
         return None
     return (
-        f"Hard scope deny: write_file path '{file_path}' requires source_write "
-        f"or must be under docs/ / .hiveweave/{{shared,reports,drafts}}/ "
-        f"(role_family={infer_role_family(agent)})"
+        f"Hard scope deny: write path '{file_path}' requires source_write "
+        f"or doc_write, or must be under docs/ / "
+        f".hiveweave/{{shared,reports,drafts}}/ "
+        f"(role_family={family})"
+    )
+
+
+def _extract_file_path(tool_args: dict | None) -> str:
+    if not tool_args:
+        return ""
+    return str(
+        tool_args.get("filePath")
+        or tool_args.get("file_path")
+        or tool_args.get("path")
+        or ""
     )
 
 
@@ -273,16 +371,9 @@ class PolicyService:
         reason = tool_hard_deny(agent, tool_name)
         if reason:
             return reason
-        if tool_name == "write_file":
-            path = ""
-            if tool_args:
-                path = str(
-                    tool_args.get("filePath")
-                    or tool_args.get("file_path")
-                    or tool_args.get("path")
-                    or ""
-                )
-            return write_path_allowed(agent, path)
+        # write_file + edit_file share path-kind / prefix scope
+        if tool_name in ("write_file", "edit_file"):
+            return write_path_allowed(agent, _extract_file_path(tool_args))
         return None
 
 

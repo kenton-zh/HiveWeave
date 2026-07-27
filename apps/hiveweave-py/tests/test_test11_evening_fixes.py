@@ -174,4 +174,4 @@ def test_write_path_allows_reports_and_drafts_for_ceo():
     ) is None
     deny = write_path_allowed(ceo, "src/app.py")
     assert deny is not None
-    assert "source_write" in deny
+    assert "doc_write" in deny or "kind=source" in deny
