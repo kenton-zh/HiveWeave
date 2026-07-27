@@ -68,14 +68,14 @@ def build_deny_hint(
     if family == "ceo":
         if tool_name in _SOURCE_WRITE_TOOLS:
             return (
-                f"{base} CEO agents may write only to: {scope}. "
-                "CEO 不写业务代码 — 骨架/关键路径派给直属中层 coordinator "
-                "（dispatch_task），模块实现由中层再派 executor。"
+                f"{base} CEO has DOC_WRITE: create/edit any documentation "
+                "(prose/markup). Never modify source code or runtime config — "
+                "dispatch_task those to a mid-level coordinator."
             )
         return (
             f"{base} This tool is outside CEO capabilities "
-            "(org design, milestone dispatch/review, final verification). "
-            "Delegate hands-on work to your mid-level coordinators."
+            "(org design, docs, milestone dispatch/review, final verification). "
+            "Delegate hands-on code work to your mid-level coordinators."
         )
     if family == "coordinator":
         if tool_name in _SOURCE_WRITE_TOOLS:

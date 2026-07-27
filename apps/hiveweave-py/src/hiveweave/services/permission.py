@@ -45,9 +45,10 @@ _BASE_TOOLS = frozenset({
 })
 
 CEO_TOOLS = _BASE_TOOLS | frozenset({
-    # CEO: 行政 + 里程碑验收。无写码/bash/test 工具。
+    # CEO: 行政 + 里程碑验收 + 文档权（DOC_WRITE）。无写码/bash/test。
     "check_agent_progress",
-    "write_file",  # docs/shared/charter scope only via policy hard gate
+    # write/edit 任意文档；源码/配置由 policy classify_write_kind 硬拒
+    "write_file", "edit_file",
     "create_task", "dispatch_task", "review_task",
     "cancel_task", "unclaim_task", "reassign_task", "waive_attestation",
     "waive_merge",
