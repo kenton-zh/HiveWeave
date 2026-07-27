@@ -114,7 +114,7 @@ Recommendation: 建议动作（fix/skip/investigate）
 
 ## 验证清单（退出标准）
 - [ ] 单元/集成测试命令已执行（附完整输出）— 若项目有；**项目无测试框架时**：写一次性验证脚本（bash + curl / 临时 node/python 脚本，直接驱动被测代码），覆盖快乐路径 + 至少 2 个异常/边界用例，附输出，验证后删除脚本
-- [ ] 若交付含 UI：browse goto → snapshot/click → screenshot + console 干净
+- [ ] 若交付含 UI：browse goto → snapshot/click → screenshot → **assert_visual(observed, verdict)** + console 干净（仅有 PNG 路径不算证据）
 - [ ] specs 一致性已核对（依赖清单 / API 契约 / 数据模型 vs docs/），不一致已判 fail 或上报
 - [ ] 覆盖率或关键路径清单已说明
 - [ ] 回归已检查
@@ -124,7 +124,7 @@ Recommendation: 建议动作（fix/skip/investigate）
 2. read_skill("browse"); read_skill("qa")
 3. read_file / grep 理解上下文
 4. 有自动化框架 → bash / run_tests 跑单元与集成
-5. 有 UI → lookup_dev_server（或 start_dev_server）→ browse(args=["goto", url]) → snapshot -i → 关键路径 → screenshot + console
+5. 有 UI → lookup_dev_server（或 start_dev_server）→ browse(args=["goto", url]) → snapshot -i → 关键路径 → screenshot → assert_visual(observed=你在图里看到的内容, verdict=pass|fail) + console
 6. 按格式报告并 submit_task
 
 ## 沟通风格
@@ -411,7 +411,7 @@ timer 等待同时 `schedule_alarm`（purpose 写明 taskId 与检查项）。
 
 ## 执行纪律（不可违反）
 - **提交前自审 — self-review（MANDATORY）**：在所有代码改动提交给 QA 或上级之前，先用 `read_skill("self-review")` 加载自审方法论，对代码做五轴自查（正确性/可读性/架构/安全/性能）。发现问题当场修。自审通过后再提交。被 QA 发现的低级问题 = 你没认真自审。
-- **UI 改动的 E2E（MANDATORY）**：凡改了用户可见页面/交互，submit_task 前必须：`lookup_dev_server`（或 `start_dev_server`）→ `browse` goto → 关键路径点通 → screenshot + console。或明确写"已请求测试工程师做 browse/qa 验收，taskId=..."。禁止只报单元测试。
+- **UI 改动的 E2E（MANDATORY）**：凡改了用户可见页面/交互，submit_task 前必须：`lookup_dev_server`（或 `start_dev_server`）→ `browse` goto → 关键路径点通 → screenshot → `assert_visual(observed=图中所见, verdict=pass|fail)` + console。或明确写"已请求测试工程师做 browse/qa 验收，taskId=..."。禁止只报单元测试；禁止只交 PNG 路径。
 - **先调查后修复**：no fixes without investigation。遇到 bug 先 read_file + grep 理解根因，再改代码
 - **完整实现**：边界处理和错误路径不能"以后再说"——Boil the Lake
 - **测试先行**：如果项目有测试框架，写代码前先写会失败的测试（Prove-It 模式）

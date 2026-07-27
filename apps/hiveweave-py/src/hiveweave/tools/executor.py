@@ -79,8 +79,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Use after start_dev_server/lookup_dev_server. Typical flow: "
             "browse(args=[\"goto\",\"http://127.0.0.1:PORT\"]) → "
             "browse(args=[\"snapshot\",\"-i\"]) → browse(args=[\"click\",\"@e3\"]) → "
-            "browse(args=[\"screenshot\",\"evidence/bug.png\"]). "
-            "Also: console, network, fill, text. Prefer this over raw bash $B."
+            "browse(args=[\"screenshot\",\"evidence/bug.png\"]) → "
+            "assert_visual(screenshotPath=..., observed=\"what you SEE\", verdict=\"pass\"). "
+            "Screenshot pixels are injected into the next LLM turn; a PNG path alone "
+            "is NOT UI evidence. Also: console, network, fill, text."
         ),
         "properties": {
             "args": {
@@ -100,6 +102,43 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             },
         },
         "required": [],
+    },
+    "assert_visual": {
+        "description": (
+            "Record a pixel-grounded UI assertion AFTER browse(screenshot). "
+            "Describe what you SEE in the injected image (labels, layout, errors), "
+            "then verdict=pass|fail. Creates visual_check attestation required for "
+            "ui_browser_e2e submit. Path-only / 'looks fine' is rejected."
+        ),
+        "properties": {
+            "screenshotPath": {
+                "type": "string",
+                "aliases": ["screenshot_path", "path"],
+                "description": "PNG/JPEG path from browse screenshot.",
+            },
+            "observed": {
+                "type": "string",
+                "description": (
+                    "What you see in the image pixels (>=40 chars). "
+                    "Not the file path."
+                ),
+            },
+            "verdict": {
+                "type": "string",
+                "enum": ["pass", "fail"],
+                "description": "pass if criterion met; else fail.",
+            },
+            "criteria": {
+                "type": "string",
+                "description": "Optional acceptance criterion this check covers.",
+            },
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id"],
+                "description": "Optional task id to bind attestation.",
+            },
+        },
+        "required": ["screenshotPath", "observed", "verdict"],
     },
     "run_command": {
         "description": "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command.",
@@ -1082,30 +1121,28 @@ class ToolExecutor(TaskToolsMixin):
         tool_args = normalized_args
 
         # 2. Permission evaluation
+        deny_reason: str | None = None
         try:
-            decision = await self.permission.evaluate(
-                agent_id, name, tool_args
-            )
+            if hasattr(self.permission, "evaluate_detailed"):
+                decision, deny_reason = await self.permission.evaluate_detailed(
+                    agent_id, name, tool_args
+                )
+            else:
+                decision = await self.permission.evaluate(
+                    agent_id, name, tool_args
+                )
         except Exception as exc:  # noqa: BLE001
             log.error("permission.evaluate_failed", error=str(exc))
             return self._error(f"Error: Permission check failed: {exc}")
 
         if decision == "deny":
-            # 如实提示：返回 policy 硬门真实原因 + coordinator/HR 写白名单指引
-            from hiveweave.services.policy import (
-                infer_role_family,
-                policy_service,
-            )
+            # 如实提示：硬门 / 用户 deny / 工具表 原因 + 角色指引
+            from hiveweave.services.policy import infer_role_family
             from hiveweave.tools.pipeline import build_deny_hint
 
             agent_info = await meta_db.get_agent_by_id(agent_id)
             family = infer_role_family(agent_info or {})
-            hard_reason = (
-                policy_service.hard_check(agent_info, name, tool_args)
-                if agent_info
-                else None
-            )
-            return self._error(build_deny_hint(name, family, hard_reason))
+            return self._error(build_deny_hint(name, family, deny_reason))
 
         if decision == "ask":
             # Request approval (120s timeout)

@@ -217,7 +217,7 @@ class ConversationStore:
         messages = self._cache.get(key) or await self._load_from_db(agent_id)
         if not messages:
             return False
-        # 对齐读取预算（#4）
+        # 压缩目标压到新窗口的一半，给系统提示/工具/输出留余量
         read_budget = max(new_context_window // 2, 16_000)
         target_budget = min(budget, read_budget)
         logger.info("model_switch_compact", agent_id=agent_id, budget=target_budget)
@@ -233,8 +233,9 @@ class ConversationStore:
         ctx = await self._get_agent_context_window(agent_id)
         budget = self._compaction.check_overflow(total, ctx)
         if budget is not None:
-            # 压缩目标对齐读取预算 — _build_messages 用 ctx//2 读取，
-            # 压缩后 cache 应在此值以下，否则压缩对读取路径无帮助（#4）。
+            # 压缩目标把历史压到约半个上下文：_build_messages 现在不设读预算、
+            # 读取全部压缩后历史，压缩负责把总量控制在此值以下，给系统提示/工具/
+            # 输出留出上半区，超限时再由 streamer 95% 硬裁兜底。
             read_budget = max(ctx // 2, 16_000)
             target_budget = min(budget, read_budget)
             logger.info(

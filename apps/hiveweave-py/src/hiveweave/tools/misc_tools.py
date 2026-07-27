@@ -409,11 +409,12 @@ async def _check_self_merge_gate(
     # P1 fix(TEST10): 接受 closed 作为 approved 的等价后继状态。
     # approve 后系统可能因 worktree==main 自动 close，但 merge 门禁
     # 不应因此拒绝——只要 evidence.reviewed_by 存在即证明曾经过审批。
+    # P2-2 fix: "verifying" 也是 post-approve 合法态（VERIFY spawn 后）。
     status = task.get("status")
-    if status not in ("approved", "closed"):
+    if status not in ("approved", "closed", "verifying"):
         return (
             f"Refusing to merge your own branch: task {tid} is "
-            f"'{status}', not approved. Get your superior to "
+            f"'{status}', not approved/verifying. Get your superior to "
             f"review_task(decision='approve') first."
         )
     evidence = task.get("evidence") or {}
@@ -791,6 +792,70 @@ async def git_worktree_merge_tool(
             )
     if reworked:
         err = f"{err}\n\nAuto-reworked {reworked} approved task(s) → executor."
+
+    # P0-1 fail-closed: precondition failures must not be silent.
+    # Reopen obligation + notify creator + agent_health warning.
+    if reason == "precondition_failed" and params.task_id:
+        try:
+            from hiveweave.services.obligation import ObligationLedger
+
+            task_svc = None
+            try:
+                from hiveweave.services.task import TaskService
+                task_svc = TaskService()
+                task_obj = await task_svc.get_task(project_id, params.task_id)
+            except Exception:
+                task_obj = None
+            creator = (task_obj or {}).get("creator_id")
+            if creator:
+                await ObligationLedger().create(
+                    project_id,
+                    str(creator),
+                    "merge",
+                    task_id=params.task_id,
+                    context={
+                        "reason": "merge_precondition_failed",
+                        "source": "merge_fail_closed",
+                        "detail": (result.get("message") or "")[:200],
+                    },
+                )
+                # Notify creator that merge failed and obligation is open
+                try:
+                    from hiveweave.services.inbox import InboxService
+
+                    await InboxService().send_message(
+                        project_id=project_id,
+                        sender_id="system",
+                        recipient_id=str(creator),
+                        content=(
+                            f"[MERGE FAILED] git_worktree_merge for task "
+                            f"{params.task_id[:8]} hit precondition failure: "
+                            f"{(result.get('message') or 'worktree corrupted')[:200]}\n"
+                            f"Merge obligation reopened. Investigate worktree "
+                            f"health for {short} and retry, or repair the "
+                            f"worktree (delete + recreate) then merge again."
+                        ),
+                        message_type="system",
+                    )
+                except Exception:
+                    pass
+        except Exception as obl_err:
+            log.warning(
+                "merge_fail_closed_obligation_error",
+                task_id=params.task_id,
+                error=str(obl_err),
+            )
+        # agent_health warning (yellow frame)
+        try:
+            from hiveweave.agents.agent import broadcast_agent_health
+
+            await broadcast_agent_health(
+                agent_id, "error",
+                f"merge precondition failed for task {params.task_id[:8]}",
+            )
+        except Exception:
+            pass
+
     return ToolResult.err(err)
 
 

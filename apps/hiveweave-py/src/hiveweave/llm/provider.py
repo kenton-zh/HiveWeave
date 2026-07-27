@@ -190,17 +190,25 @@ class OpenAIHandler(FormatHandler):
     ) -> dict[str, Any]:
         # OpenAI 用隐式 prefix caching，不接受 inline cache_control markers。
         # supports_prompt_cache 参数在此为 no-op，仅为统一接口签名。
+        # Expand internal ``images`` payloads into multimodal content parts —
+        # tool role cannot carry images on OpenAI, so we append a user turn.
+        normalized = self._normalize_messages_with_images(messages)
         body: dict[str, Any] = {
             "model": model_id,
-            "messages": messages,
+            "messages": normalized,
             "stream": stream,
             "temperature": temperature,
         }
 
-        # max_tokens: reasoning models use full cap, others capped at 32k
+        # max_tokens: reasoning models use full cap, others capped at 32k.
+        # P1-3: hard cap at 128K for ALL models — many API endpoints reject
+        # values above this (e.g. "expected <= 128000, but got 384000").
+        # Model configs may store theoretical maximums (384K) that exceed
+        # the actual endpoint limit; we cap here to prevent first-turn 400s.
         global_cap = 32_000
+        _MAX_OUTPUT_HARD_CAP = 128_000
         if supports_thinking and max_tokens > 0:
-            body["max_tokens"] = max_tokens
+            body["max_tokens"] = min(max_tokens, _MAX_OUTPUT_HARD_CAP)
         else:
             body["max_tokens"] = min(max_tokens or global_cap, global_cap)
 
@@ -276,6 +284,97 @@ class OpenAIHandler(FormatHandler):
             chunks.append({"type": "finish", "reason": finish_reason})
 
         return chunks
+
+    @staticmethod
+    def _normalize_messages_with_images(messages: list[dict]) -> list[dict]:
+        """Convert HiveWeave ``images`` fields into OpenAI multimodal parts.
+
+        - user + images → content array (text + image_url)
+        - tool + images → tool text only during the contiguous tool block;
+          **one** trailing user turn with all collected images is appended
+          after the block (never interrupt ``assistant → tool → tool`` pairing —
+          inserting user mid-block causes Ark/OpenAI 400s).
+        """
+        from hiveweave.services.vision import openai_image_parts
+
+        out: list[dict] = []
+        pending_images: list[dict] = []
+
+        def _flush_tool_images() -> None:
+            if not pending_images:
+                return
+            img_parts = openai_image_parts(pending_images)
+            pending_images.clear()
+            if not img_parts:
+                return
+            out.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "[Screenshot pixels attached — inspect the "
+                            "image, then assert_visual before claiming "
+                            "UI pass.]"
+                        ),
+                    },
+                    *img_parts,
+                ],
+            })
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                _flush_tool_images()
+                out.append(msg)
+                continue
+            images = msg.get("images") or []
+            role = msg.get("role", "")
+
+            if role == "tool":
+                cleaned = {k: v for k, v in msg.items() if k != "images"}
+                out.append(cleaned)
+                if isinstance(images, list):
+                    for img in images:
+                        if isinstance(img, dict) and img.get("data"):
+                            pending_images.append(img)
+                continue
+
+            # Non-tool: close any open tool block before emitting
+            _flush_tool_images()
+
+            if not images:
+                if "images" in msg:
+                    cleaned = {k: v for k, v in msg.items() if k != "images"}
+                    out.append(cleaned)
+                else:
+                    out.append(msg)
+                continue
+
+            img_parts = openai_image_parts(
+                images if isinstance(images, list) else []
+            )
+            if role == "user":
+                text = msg.get("content") or ""
+                parts: list[dict] = []
+                if isinstance(text, list):
+                    parts.extend(text)
+                elif text:
+                    parts.append({"type": "text", "text": str(text)})
+                parts.extend(img_parts)
+                if not parts:
+                    parts.append({"type": "text", "text": ""})
+                cleaned = {
+                    k: v for k, v in msg.items()
+                    if k not in ("images", "content")
+                }
+                cleaned["content"] = parts
+                out.append(cleaned)
+            else:
+                cleaned = {k: v for k, v in msg.items() if k != "images"}
+                out.append(cleaned)
+
+        _flush_tool_images()
+        return out
 
     @staticmethod
     def extract_usage(chunk: dict) -> dict | None:
@@ -382,15 +481,31 @@ class AnthropicHandler(FormatHandler):
                 blocks = self._assistant_content_blocks(msg)
                 anthropic_messages.append({"role": "assistant", "content": blocks})
             elif role == "tool":
-                # Tool results → role: "user" with tool_result block
+                # Tool results → role: "user" with tool_result block.
+                # When images are present, put text+image inside tool_result
+                # content (Anthropic multimodal tool_result) so the model
+                # sees screenshot pixels in the same turn.
                 tool_call_id = msg.get("tool_call_id", "")
                 result_content = str(content)
+                images = msg.get("images") or []
+                from hiveweave.services.vision import anthropic_image_blocks
+
+                img_blocks = anthropic_image_blocks(
+                    images if isinstance(images, list) else []
+                )
+                if img_blocks:
+                    tool_content: str | list = [
+                        {"type": "text", "text": result_content},
+                        *img_blocks,
+                    ]
+                else:
+                    tool_content = result_content
                 anthropic_messages.append({
                     "role": "user",
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": tool_call_id,
-                        "content": result_content,
+                        "content": tool_content,
                     }],
                 })
 
@@ -786,18 +901,24 @@ class GoogleHandler(FormatHandler):
                 parts = self._model_parts(msg)
                 contents.append({"role": "model", "parts": parts})
             elif role == "tool":
-                # Tool results → functionResponse in user turn
-                tool_call_id = msg.get("tool_call_id", "")
-                # Find tool name from previous tool calls
+                # Tool results → functionResponse in user turn; attach
+                # screenshot inlineData parts when present.
                 tool_name = "unknown"
+                from hiveweave.services.vision import gemini_image_parts
+
+                parts: list[dict] = [{
+                    "functionResponse": {
+                        "name": tool_name,
+                        "response": {"content": str(content)},
+                    },
+                }]
+                images = msg.get("images") or []
+                parts.extend(
+                    gemini_image_parts(images if isinstance(images, list) else [])
+                )
                 contents.append({
                     "role": "user",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": tool_name,
-                            "response": {"content": str(content)},
-                        },
-                    }],
+                    "parts": parts,
                 })
 
         body: dict[str, Any] = {

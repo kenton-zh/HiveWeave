@@ -135,12 +135,14 @@ async def commit_turn_tool(
                     labels = {
                         "UNREPLIED_ASKS": "有未回复的 ask 消息",
                         "WAIT_WITHOUT_ASK": "waiting 前须先向对方发消息",
+                        "HIRE_UNREPORTED": "本轮 hire_agent 后未通知请求方",
                         "ASSIGNEE_MUST_SUBMIT": "有 claimed/running/rework 任务未提交",
                         "REVIEWER_MUST_START_REVIEW": "有 submitted 任务待开始审查",
                         "REVIEWER_MUST_FINISH_REVIEW": "有 reviewing 任务待完成审查",
                         "CREATOR_MUST_REVIEW": "有 submitted/reviewing 任务待审查",
                         "CREATOR_MUST_MERGE": "有 approved 任务待合并",
                         "UNCOMMITTED_WORKTREE": "worktree 有未提交改动",
+                        "OPEN_TASKS_UNDECLARED": "仍有可行动任务却声明 done_slice",
                     }
                     # Soft-warn (reminder-class only): first hit → warn+allow;
                     # second → hard. HARD_COMMIT_GATE_CODES (UNREPLIED_ASKS)

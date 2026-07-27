@@ -210,33 +210,31 @@ async def execute_registered_tool(
         ).to_dict()
 
     # 3. Permission evaluation
+    deny_reason: str | None = None
     try:
-        decision = await permission.evaluate(agent_id, tool_name, raw_args)
+        if hasattr(permission, "evaluate_detailed"):
+            decision, deny_reason = await permission.evaluate_detailed(
+                agent_id, tool_name, raw_args
+            )
+        else:
+            decision = await permission.evaluate(agent_id, tool_name, raw_args)
     except Exception as exc:  # noqa: BLE001
         log.error("pipeline.permission_failed", error=str(exc))
         return ToolResult.err(f"Error: Permission check failed: {exc}").to_dict()
 
     if decision == "deny":
-        # 如实提示：返回 policy 硬门真实原因 + coordinator/HR 写白名单指引
+        # 如实提示：硬门 / 用户 deny / 工具表 原因 + 角色指引
         try:
             from hiveweave.db import meta as meta_db
-            from hiveweave.services.policy import (
-                infer_role_family,
-                policy_service,
-            )
+            from hiveweave.services.policy import infer_role_family
 
             agent_info = await meta_db.get_agent_by_id(agent_id)
             family = infer_role_family(agent_info or {})
-            hard_reason = (
-                policy_service.hard_check(agent_info, tool_name, raw_args)
-                if agent_info
-                else None
-            )
         except Exception:
-            family, hard_reason = "", None
+            family = ""
 
         return ToolResult.err(
-            build_deny_hint(tool_name, family, hard_reason)
+            build_deny_hint(tool_name, family, deny_reason)
         ).to_dict()
 
     if decision == "ask":

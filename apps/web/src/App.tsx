@@ -14,6 +14,7 @@ const AddAgentDialog = lazy(() => import("./components/AddAgentDialog"));
 const FolderPicker = lazy(() => import("./components/FolderPicker"));
 const OfficeView = lazy(() => import("./components/OfficeView"));
 const ModelSettings = lazy(() => import("./components/ModelSettings"));
+const ModelConfigPage = lazy(() => import("./components/ModelConfigPage"));
 const ApiKeyDialog = lazy(() => import("./components/ApiKeyDialog"));
 const GoalsPanel = lazy(() => import("./components/GoalsPanel"));
 const QuestionDialog = lazy(() => import("./components/QuestionDialog"));
@@ -61,6 +62,7 @@ function App() {
     return params.get("folderPath") ?? undefined;
   });
   const [showModelSettings, setShowModelSettings] = useState(false);
+  const [showModelConfig, setShowModelConfig] = useState(false);
   const [showApiKeyDialog, setShowApiKeyDialog] = useState(false);
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
@@ -491,6 +493,17 @@ function App() {
               </svg>
             </button>
           </div>
+          {/* Model Config page (模型清单 + 层级配置) — 带文字的醒目入口 */}
+          <button
+            onClick={() => setShowModelConfig(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-g-blue bg-g-blue-bg/60 border border-g-blue/30 rounded-gm shadow-gm-sm hover:bg-g-blue-bg hover:border-g-blue/50 hover:shadow-gm transition-all duration-200 active:scale-[0.97]"
+            title="模型配置"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3M1 14h6m2-6h6m2 8h6" />
+            </svg>
+            模型配置
+          </button>
           {/* Model Settings gear icon */}
           <button
             onClick={() => setShowModelSettings(true)}
@@ -746,6 +759,10 @@ function App() {
 
         {showModelSettings && (
           <ModelSettings onClose={() => setShowModelSettings(false)} />
+        )}
+
+        {showModelConfig && (
+          <ModelConfigPage onClose={() => setShowModelConfig(false)} />
         )}
 
         {showApiKeyDialog && (

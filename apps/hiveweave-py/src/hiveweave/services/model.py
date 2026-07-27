@@ -99,6 +99,7 @@ class ModelService:
         is_active = 0 if attrs.get("is_active") is False else 1
         default_reasoning_effort = attrs.get("default_reasoning_effort")
         temperature = attrs.get("temperature")
+        tier = attrs.get("tier") or None  # "management" | "executor" | None（"" 视为未分类）
 
         # 物理不变量：max_output_tokens 必须严格小于 context_window。
         # 治本：非法配置在落库前拒绝，绝不 clamp 后悄悄写入。
@@ -108,12 +109,14 @@ class ModelService:
             "INSERT INTO llm_models (id, name, model_id, base_url, api_key, "
             "provider_type, "
             "context_window, max_output_tokens, supports_thinking, "
-            "default_reasoning_effort, temperature, is_active, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "default_reasoning_effort, temperature, is_active, tier, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [model_pk, name, model_id, base_url, api_key,
              provider_type,
              context_window, max_output, supports_thinking,
-             default_reasoning_effort, temperature, is_active, now_ms, now_ms])
+             default_reasoning_effort, temperature, is_active, tier,
+             now_ms, now_ms])
         log.info("model_created", model_pk=model_pk, name=name, model_id=model_id)
         return {"id": model_pk, "name": name, "model_id": model_id}
 
@@ -128,7 +131,7 @@ class ModelService:
             "SELECT id, name, model_id, base_url, api_key, provider_type, "
             "context_window, "
             "max_output_tokens, supports_thinking, default_reasoning_effort, "
-            "temperature, is_active, fallback, created_at, updated_at "
+            "temperature, is_active, fallback, tier, created_at, updated_at "
             "FROM llm_models WHERE id = ? OR model_id = ? LIMIT 1",
             [model_pk, model_pk])
         if row is None:
@@ -139,7 +142,7 @@ class ModelService:
         row = await meta_db.query_one(
             "SELECT id, name, model_id, base_url, api_key, provider_type, "
             "context_window, max_output_tokens, supports_thinking, "
-            "default_reasoning_effort, temperature, is_active, fallback, "
+            "default_reasoning_effort, temperature, is_active, fallback, tier, "
             "created_at, updated_at FROM llm_models WHERE name = ? LIMIT 1",
             [name],
         )
@@ -169,10 +172,16 @@ class ModelService:
         for key in ("name", "model_id", "base_url", "api_key",
                     "provider_type",
                     "context_window", "max_output_tokens",
-                    "default_reasoning_effort", "temperature"):
+                    "default_reasoning_effort", "temperature",
+                    "fallback"):
             if key in attrs and attrs[key] is not None:
                 fields.append(f"{key} = ?")
                 params.append(attrs[key])
+        # tier 单独处理："" 表示清空（置 NULL），非空字符串正常写入。
+        # 不能放进上面的通用循环——那里 `is not None` 会把 "" 当有效值存成空串。
+        if "tier" in attrs:
+            fields.append("tier = ?")
+            params.append(attrs["tier"] or None)
         if "supports_thinking" in attrs and attrs["supports_thinking"] is not None:
             fields.append("supports_thinking = ?")
             params.append(1 if attrs["supports_thinking"] else 0)
@@ -218,7 +227,7 @@ class ModelService:
                 "SELECT id, name, model_id, base_url, api_key, provider_type, "
                 "context_window, "
                 "max_output_tokens, supports_thinking, default_reasoning_effort, "
-                "temperature, is_active, created_at, updated_at "
+                "temperature, is_active, tier, created_at, updated_at "
                 "FROM llm_models ORDER BY created_at ASC")
             return [self._row_to_model(r, mask_key=True) for r in rows]
         except Exception as e:
@@ -245,7 +254,7 @@ class ModelService:
             rows = await meta_db.query(
                 "SELECT id, name, model_id, base_url, api_key, provider_type, "
                 "context_window, max_output_tokens, supports_thinking, "
-                "default_reasoning_effort, temperature, is_active, fallback, "
+                "default_reasoning_effort, temperature, is_active, fallback, tier, "
                 "created_at, updated_at "
                 "FROM llm_models WHERE is_active = 1 ORDER BY created_at ASC"
             )
@@ -255,7 +264,11 @@ class ModelService:
             return []
 
     async def pick_from_pool(self, preferred: str | None = None) -> dict | None:
-        """Round-robin among active models to spread provider rate limits."""
+        """Round-robin among active models to spread provider rate limits.
+
+        DEPRECATED for tier-aware routing — use resolve_model() instead.
+        Kept for backward compat if model_pool_enabled and no tier configured.
+        """
         active = await self.list_active_full()
         if not active:
             return await self.get(preferred) if preferred else None
@@ -271,6 +284,104 @@ class ModelService:
             preferred=preferred,
         )
         return chosen
+
+    # ── Tier-aware model resolution ─────────────────────────
+
+    async def get_tier_config(self, tier: str) -> dict[str, str | None]:
+        """Read primary/backup model IDs for a tier from global_settings.
+
+        Keys: model_tier_{tier}_primary / model_tier_{tier}_backup
+        Falls back to legacy default_coordinator_model / default_executor_model
+        for primary if the new keys are unset.
+        """
+        from hiveweave.services.settings import SettingsService
+        svc = SettingsService()
+
+        primary = await svc.get(f"model_tier_{tier}_primary")
+        backup = await svc.get(f"model_tier_{tier}_backup")
+
+        # Legacy fallback for primary
+        if not primary:
+            if tier == "management":
+                primary = await svc.get("default_coordinator_model")
+            elif tier == "executor":
+                primary = await svc.get("default_executor_model")
+
+        return {"primary": primary, "backup": backup}
+
+    async def resolve_model(
+        self,
+        tier: str,
+        preferred: str | None = None,
+        skip_model_ids: set[str] | None = None,
+    ) -> dict | None:
+        """Resolve model config by tier: primary → backup (strict, no cross-tier).
+
+        Resolution order:
+        1. Tier primary from global_settings
+        2. Tier backup from global_settings
+        3. Any active model with matching tier column
+        4. Fallback: pick_from_pool (legacy, only if no tier data at all)
+
+        skip_model_ids: DB 主键(UUID)集合，用于 failover 时排除失败的主用模型。
+            仅按主键匹配——主备模型可共用同一 model_id（靠编号/记录区分），
+            若按 model_id 匹配会误伤备用模型。
+        """
+        skip = skip_model_ids or set()
+
+        def _skipped(model: dict) -> bool:
+            """Check if model matches skip set by DB primary key (id) only."""
+            return model.get("id") in skip
+
+        tier_cfg = await self.get_tier_config(tier)
+
+        # Try primary
+        primary_id = tier_cfg["primary"]
+        if primary_id and primary_id not in skip:
+            model = await self.get(primary_id)
+            if model and model.get("is_active") and not _skipped(model):
+                return model
+
+        # Try backup
+        backup_id = tier_cfg["backup"]
+        if backup_id and backup_id not in skip:
+            model = await self.get(backup_id)
+            if model and model.get("is_active") and not _skipped(model):
+                log.info(
+                    "model_resolve_backup",
+                    tier=tier,
+                    backup=backup_id,
+                    skipped_primary=primary_id,
+                )
+                return model
+
+        # Try any active model with matching tier column
+        active = await self.list_active_full()
+        for m in active:
+            if m.get("tier") == tier and not _skipped(m):
+                log.info("model_resolve_tier_column", tier=tier, model=m.get("name"))
+                return m
+
+        # Last resort: if no tier data exists at all, fall back to pool
+        # (backward compat for deployments that haven't configured tiers)
+        if not primary_id and not backup_id:
+            has_any_tier = any(m.get("tier") for m in active)
+            if not has_any_tier:
+                log.debug("model_resolve_no_tier_configured", tier=tier)
+                return await self.pick_from_pool(preferred)
+
+        # Configured models all unresolvable — try pool as emergency fallback
+        if active:
+            for m in active:
+                if not _skipped(m):
+                    log.warning(
+                        "model_resolve_emergency_pool",
+                        tier=tier,
+                        model=m.get("name"),
+                    )
+                    return m
+
+        return None
 
     async def ensure_channel_models(self) -> dict:
         """Upsert Ark Plan (+ optional Coding) channels for multi-quota pooling."""

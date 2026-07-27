@@ -34,6 +34,19 @@ log = structlog.get_logger(__name__)
 WORKTREE_DIR = ".hiveweave/worktrees"
 QUARANTINE_DIR = ".hiveweave/worktrees/_quarantine"
 
+# P1-1: Generated files that cause predictable merge conflicts.
+# Checkpoint strips these from commits; merge auto-regenerates after landing.
+# "生成物不随提交走" — platform-level enforcement, not prompt-level advice.
+GENERATED_FILES: frozenset[str] = frozenset({
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Pipfile.lock",
+    "poetry.lock",
+    "composer.lock",
+    "Gemfile.lock",
+})
+
 # BUG-4: serialize create per (workspace, short_id) so hire + lazy-ensure
 # cannot race and leave a false worktree_error while the tree is healthy.
 _create_locks: dict[str, asyncio.Lock] = {}
@@ -534,6 +547,20 @@ coverage/
 """
             gitignore_path.write_text(gitignore_content, encoding="utf-8")
 
+        # P1-1: .gitattributes — lockfile union merge strategy.
+        # package-lock.json conflicts are 100% predictable (every executor
+        # runs npm install); union + post-merge regenerate eliminates rework.
+        gitattributes_path = Path(workspace_path) / ".gitattributes"
+        if not gitattributes_path.exists():
+            gitattributes_content = """\
+# HiveWeave P1-1: generated files use union merge (no content conflicts).
+# Post-merge regeneration (npm install / pnpm install) fixes semantics.
+package-lock.json merge=union
+pnpm-lock.yaml merge=union
+yarn.lock merge=union
+"""
+            gitattributes_path.write_text(gitattributes_content, encoding="utf-8")
+
         # 把现有项目文件 commit 到 main 分支
         await _git(["add", "-A"], workspace_path)
         ok, out = await _git(
@@ -623,53 +650,70 @@ coverage/
         # 2) Path is gone but git still has a registered worktree entry →
         #    add fails with "is a missing but registered worktree" until prune.
         # Always prune when the target is not a valid worktree.
+        relocated = False  # P0-3: flag for caller to notify agent
         if Path(path).exists():
+            # P0-3: stop dev servers that may lock files (WinError 32 root cause)
+            try:
+                from hiveweave.services.process_registry import (
+                    stop_processes_for_worktree,
+                )
+
+                stop_processes_for_worktree(path)
+            except Exception:
+                pass
+
             if not _force_clear_path(path):
-                # TEST16 P0-2: stale path locked (Windows node_modules etc.)
-                # — try alternate directory name instead of hard-failing.
-                original_path = path
-                for suffix in ("-b", "-c", "-d"):
-                    alt = path + suffix
-                    # L5: if alt already exists as a valid worktree, reuse it
-                    # (idempotent — prevents -c/-d proliferation when -b is healthy)
-                    if _has_git(alt):
-                        log.info(
-                            "git_worktree.stale_path_reuse_existing",
-                            original=path,
-                            reuse=alt,
-                        )
-                        path = alt
-                        await _log_worktree_rebuild_event(
-                            workspace_path,
-                            short_id,
-                            reason="stale_path_reuse_existing",
-                            original=original_path,
-                            path=alt,
-                        )
-                        break
-                    if not Path(alt).exists():
-                        log.warning(
-                            "git_worktree.stale_path_fallback",
-                            original=path,
-                            fallback=alt,
-                        )
-                        path = alt
-                        await _log_worktree_rebuild_event(
-                            workspace_path,
-                            short_id,
-                            reason="stale_path_fallback",
-                            original=original_path,
-                            path=alt,
-                        )
-                        break
-                else:
-                    return {
-                        "success": False,
-                        "message": (
-                            f"Failed to create worktree: stale path locked "
-                            f"and could not be cleared: {path}"
-                        ),
-                    }
+                # P0-3: try git worktree repair + second clear attempt
+                # (correct action for stale metadata, per postmortem §P0-3)
+                await _git(["worktree", "repair", path], workspace_path)
+                if not _force_clear_path(path):
+                    # Last resort: alternate directory name (disk truly corrupted).
+                    # P0-3: this is NOT silent — relocated flag notifies agent.
+                    original_path = path
+                    for suffix in ("-b", "-c", "-d"):
+                        alt = path + suffix
+                        # L5: if alt already exists as a valid worktree, reuse it
+                        # (idempotent — prevents -c/-d proliferation when -b is healthy)
+                        if _has_git(alt):
+                            log.info(
+                                "git_worktree.stale_path_reuse_existing",
+                                original=path,
+                                reuse=alt,
+                            )
+                            path = alt
+                            relocated = True
+                            await _log_worktree_rebuild_event(
+                                workspace_path,
+                                short_id,
+                                reason="stale_path_reuse_existing",
+                                original=original_path,
+                                path=alt,
+                            )
+                            break
+                        if not Path(alt).exists():
+                            log.warning(
+                                "git_worktree.stale_path_fallback",
+                                original=path,
+                                fallback=alt,
+                            )
+                            path = alt
+                            relocated = True
+                            await _log_worktree_rebuild_event(
+                                workspace_path,
+                                short_id,
+                                reason="stale_path_fallback",
+                                original=original_path,
+                                path=alt,
+                            )
+                            break
+                    else:
+                        return {
+                            "success": False,
+                            "message": (
+                                f"Failed to create worktree: stale path locked "
+                                f"and could not be cleared: {path}"
+                            ),
+                        }
         await _git(["worktree", "prune"], workspace_path)
 
         fwd_path = path.replace("\\", "/")
@@ -819,6 +863,34 @@ coverage/
         if not ok:
             return {"success": False, "message": "Failed to stage files"}
 
+        # P1-1: strip GENERATED_FILES from staging (lockfiles cause predictable
+        # merge conflicts; they should be regenerated post-merge, not committed).
+        try:
+            ok_st, staged_out = await _git(
+                ["diff", "--cached", "--name-only"], path
+            )
+            if ok_st and staged_out:
+                gen_stripped: list[str] = []
+                for ln in staged_out.splitlines():
+                    fname = ln.strip()
+                    if not fname:
+                        continue
+                    # Match by basename (lockfile at any depth)
+                    basename = fname.rsplit("/", 1)[-1] if "/" in fname else fname
+                    if basename in GENERATED_FILES:
+                        gen_stripped.append(fname)
+                if gen_stripped:
+                    await _git(
+                        ["reset", "HEAD", "--"] + gen_stripped, path
+                    )
+                    log.info(
+                        "checkpoint_generated_files_stripped",
+                        short_id=short_id,
+                        files=gen_stripped[:10],
+                    )
+        except Exception:
+            pass  # best-effort: don't fail checkpoint on strip
+
         # P1 fix(TEST10): 检测被 .gitignore 屏蔽的产物文件
         # 如果 worktree 中有文件被 ignore，checkpoint 不会包含它们，
         # merge 后产物会静默丢失。主动警告 agent。
@@ -907,6 +979,41 @@ coverage/
             return compute_branch_name(short_id, task_id)
         return _branch_name(short_id, task_name or "task")
 
+    @staticmethod
+    async def _resolve_effective_worktree_path(
+        workspace_path: str, short_id: str
+    ) -> str:
+        """P0-1 single source: resolve the actual worktree dir for merge/checkpoint.
+
+        After P0-3 identity binding, canonical path is correct 99% of the time.
+        Fallback to DB workspace_path covers the rare relocation (-b) case where
+        canonical is a husk but the agent is actually working elsewhere.
+        """
+        canonical = _worktree_path(workspace_path, short_id)
+        if _has_git(canonical):
+            return canonical
+        # Canonical is husk or missing — check DB for relocated path
+        try:
+            from hiveweave.services.org import OrgService
+
+            org = OrgService()
+            agents = await org.list_agents()
+            for a in agents:
+                if (a.get("short_id") or "") == short_id:
+                    db_path = (a.get("workspace_path") or "").strip()
+                    if db_path and db_path != canonical and _has_git(db_path):
+                        log.info(
+                            "git_worktree.resolve_effective_path_db_fallback",
+                            short_id=short_id,
+                            canonical=canonical,
+                            actual=db_path,
+                        )
+                        return db_path
+                    break
+        except Exception:
+            pass
+        return canonical
+
     async def _validate_merge_preconditions(
         self, workspace_path: str, short_id: str, branch: str,
         target_branch: str = "main",
@@ -923,7 +1030,10 @@ coverage/
         Returns None if all preconditions pass (caller should proceed),
         or a dict result to return early (error or no-op success).
         """
-        path = _worktree_path(workspace_path, short_id)
+        # P0-1: resolve effective path (DB fallback for relocated worktrees)
+        path = await self._resolve_effective_worktree_path(
+            workspace_path, short_id
+        )
 
         # Checks 1-3: only relevant when the worktree directory exists.
         # A missing directory is NOT an error — the branch can still be
@@ -1669,6 +1779,33 @@ coverage/
         if not target:
             target = compute_branch_name(short_id)  # 稳定 /work 名兜底
 
+        # ⓪ P0-3: stop registered dev servers locking files in this worktree
+        # (WinError 32 root cause — node holds node_modules open handles)
+        try:
+            from hiveweave.services.process_registry import (
+                stop_processes_for_worktree,
+            )
+
+            kill_report = stop_processes_for_worktree(path)
+            if kill_report.get("stopped"):
+                log.info(
+                    "git_worktree.delete_processes_stopped",
+                    short_id=short_id,
+                    stopped=kill_report["stopped"],
+                )
+            if kill_report.get("failed"):
+                log.warning(
+                    "git_worktree.delete_processes_stop_failed",
+                    short_id=short_id,
+                    failed=kill_report["failed"],
+                )
+        except Exception as proc_err:
+            log.warning(
+                "git_worktree.delete_process_cleanup_error",
+                short_id=short_id,
+                error=str(proc_err),
+            )
+
         # ① worktree 移除链: remove → remove --force → rmtree + prune
         ok, _ = await _git(["worktree", "remove", fwd_path], workspace_path)
         if not ok:
@@ -2263,6 +2400,49 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
                 log.info("git_worktree.reconcile_dir_removed",
                          workspace=workspace_path, dir=str(child))
 
+    # ②.5 P0-3: clean .stale-* rename-aside residue + process-aware husk removal
+    if wt_root.is_dir():
+        for child in sorted(wt_root.iterdir()):
+            if not child.is_dir():
+                continue
+            name = child.name
+            # .stale-* dirs are rename-aside artifacts from _force_clear_path
+            if name.startswith(".stale-"):
+                shutil.rmtree(child, ignore_errors=True)
+                if not child.exists():
+                    report["removed_dirs"] += 1
+                    log.info(
+                        "git_worktree.reconcile_stale_dir_removed",
+                        workspace=workspace_path, dir=str(child),
+                    )
+                continue
+            # Husk: dir exists, no .git, not registered, not protected
+            # → stop processes inside then remove (P0-3 orphan cleanup)
+            if (
+                not (child / ".git").exists()
+                and os.path.normcase(str(child)) not in registered
+                and name not in protected_sids
+                and not name.startswith("_")  # skip _quarantine etc.
+            ):
+                try:
+                    from hiveweave.services.process_registry import (
+                        stop_processes_for_worktree,
+                    )
+
+                    stop_processes_for_worktree(str(child))
+                except Exception:
+                    pass
+                shutil.rmtree(child, ignore_errors=True)
+                if not child.exists():
+                    report["removed_dirs"] += 1
+                    log.info(
+                        "git_worktree.reconcile_husk_removed",
+                        workspace=workspace_path, dir=str(child),
+                    )
+                else:
+                    report["errors"].append(
+                        f"failed to remove husk dir: {child}")
+
     # ③ 分支对账: t-<taskid8> 查任务表, legacy slug 直接候选;
     #    merged → -d 删除, 未合并 → preserved 报告
     # (--format 输出不带 * / + 检出前缀, 可精确匹配)
@@ -2354,6 +2534,109 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
             log.warning("git_worktree.reconcile_branch_preserved",
                         workspace=workspace_path, branch=b, reason=reason)
 
+    # ④ P0-1 startup reconciliation: closed tasks with branch tip ∉ main
+    # → reopen merge obligation (catches stranded commits like 5510049)
+    if conn is not None and base:
+        try:
+            import json as _json
+
+            # Resolve project_id from workspace (needed for ObligationLedger)
+            _recon_project_id: str | None = None
+            try:
+                from hiveweave.db import meta as _meta
+
+                _all_projects = await _meta.list_projects()
+                for _p in _all_projects:
+                    _pw = (_p.get("workspace_path") or "").replace("\\", "/")
+                    if _pw and os.path.normcase(_pw) == os.path.normcase(workspace_path):
+                        _recon_project_id = str(_p.get("id") or "")
+                        break
+            except Exception:
+                pass
+
+            rows = await conn.execute_fetchall(
+                "SELECT id, assignee_id, evidence, creator_id FROM tasks "
+                "WHERE status = 'closed' AND closed_at IS NOT NULL "
+                "ORDER BY closed_at DESC LIMIT 30"
+            )
+            stranded: list[str] = []
+            for row in rows:
+                ev_raw = row.get("evidence") or "{}"
+                try:
+                    ev = _json.loads(ev_raw) if isinstance(ev_raw, str) else ev_raw
+                except Exception:
+                    ev = {}
+                if not isinstance(ev, dict):
+                    continue
+                # Only check tasks that claim a merge happened
+                has_merge = any(
+                    ev.get(k) for k in (
+                        "merged_by", "mergedBy", "merge_commit",
+                        "merge_commit_hash", "mergeCommit",
+                    )
+                )
+                if not has_merge:
+                    continue
+                # Resolve branch for this task's assignee
+                assignee = row.get("assignee_id") or ""
+                tid = str(row.get("id") or "")
+                if not assignee or not tid:
+                    continue
+                # Try to find a branch matching this task
+                task_branch = f"hw/%/t-{tid[:8]}"
+                ok_tb, tb_out = await _git(
+                    ["branch", "--list", task_branch, "--format=%(refname:short)"],
+                    workspace_path,
+                )
+                candidate_branches = (
+                    [ln.strip() for ln in (tb_out or "").splitlines() if ln.strip()]
+                    if ok_tb else []
+                )
+                # Also check hw/<sid>/work fallback
+                for cb in candidate_branches:
+                    if cb in merged_set:
+                        continue  # already in main — fine
+                    ok_anc, _ = await _git(
+                        ["merge-base", "--is-ancestor", cb, base],
+                        workspace_path,
+                    )
+                    if not ok_anc:
+                        stranded.append(tid)
+                        log.warning(
+                            "git_worktree.reconcile_stranded_closed_task",
+                            workspace=workspace_path,
+                            task_id=tid,
+                            branch=cb,
+                        )
+                        # Reopen merge obligation
+                        try:
+                            from hiveweave.services.obligation import (
+                                ObligationLedger,
+                            )
+
+                            creator = row.get("creator_id") or assignee
+                            if _recon_project_id:
+                                await ObligationLedger().create(
+                                    _recon_project_id,
+                                    str(creator),
+                                    "merge",
+                                    task_id=tid,
+                                    context={
+                                        "reason": "reconcile_stranded_tip",
+                                        "source": "startup_reconcile",
+                                        "branch": cb,
+                                    },
+                                )
+                        except Exception:
+                            pass
+                        break
+            if stranded:
+                report["stranded_closed_tasks"] = stranded
+        except Exception as recon_err:
+            report["errors"].append(
+                f"stranded task reconciliation failed: {recon_err}"
+            )
+
     log.info("git_worktree.reconcile", workspace=workspace_path,
              pruned=report["pruned"], removed_dirs=report["removed_dirs"],
              deleted=len(report["deleted_branches"]),
@@ -2428,10 +2711,12 @@ async def ensure_executor_worktree(
 
     cur = (agent.get("workspace_path") or "").strip()
     if cur and Path(cur).is_dir() and (Path(cur) / ".git").exists():
-        # Accept only if path is under this agent's short_id worktree dir
-        norm = cur.replace("\\", "/")
-        needle = f"/worktrees/{short_id}"
-        if needle in norm or norm.rstrip("/").endswith(f"/worktrees/{short_id}"):
+        # P0-3 identity binding: accept ONLY if the directory basename is
+        # exactly short_id (e.g. "A003"). Substring matching is banned —
+        # it let A003-b pass as A003, causing path split (merge stares at
+        # canonical path while agent writes to -b).
+        dir_basename = Path(cur).name
+        if dir_basename == short_id:
             # 幂等: 透出实际检出的分支, 不按入参重算 (P0 幂等脱钩修复)
             actual = await _current_branch(cur)
             # B7: always clear stale worktree_error when tree is healthy
@@ -2506,17 +2791,55 @@ async def ensure_executor_worktree(
     except Exception as e:
         log.warning("worktree_bind_failed", agent_id=agent_id, error=str(e))
 
+    # P0-3: detect relocation (path basename != short_id means -b/-c/-d fallback)
+    # and notify agent — silent relocation is banned.
+    relocated = Path(path).name != short_id
+    if relocated:
+        log.warning(
+            "executor_worktree_relocated",
+            agent_id=agent_id,
+            short_id=short_id,
+            canonical=_worktree_path(ws, short_id),
+            actual=path,
+        )
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().send_message(
+                project_id=project_id,
+                sender_id="system",
+                recipient_id=agent_id,
+                content=(
+                    f"[WORKTREE RELOCATED] Your workspace has been moved from "
+                    f"the canonical path (.hiveweave/worktrees/{short_id}) to "
+                    f"{Path(path).name} due to a locked/corrupted directory. "
+                    f"Your new working directory is: {path}\n"
+                    f"All merge/checkpoint operations will use this path. "
+                    f"If you encounter merge_precondition_no_git errors, "
+                    f"report to your coordinator."
+                ),
+                message_type="system",
+            )
+        except Exception as notify_err:
+            log.warning(
+                "executor_worktree_relocation_notify_failed",
+                agent_id=agent_id,
+                error=str(notify_err),
+            )
+
     log.info(
         "executor_worktree_ensured",
         agent_id=agent_id,
         short_id=short_id,
         path=path,
+        relocated=relocated,
     )
     return {
         "success": True,
         "path": path,
         "short_id": short_id,
         "branch": result.get("branch"),
+        "relocated": relocated,
     }
 
 

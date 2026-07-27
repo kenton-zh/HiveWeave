@@ -7,12 +7,46 @@ import os
 import shlex
 import uuid
 from pathlib import Path
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from hiveweave.config import resolve_browse_bin, settings
 from hiveweave.tools.base import tool
 from hiveweave.tools.result import ToolResult
+
+# Minimum structured observation length for assert_visual (not free-text scrape —
+# the field itself is the structured assertion evidence).
+_VISUAL_OBSERVED_MIN = 40
+
+
+def _is_path_stub_observed(observed: str, screenshot_path: str) -> bool:
+    """True when ``observed`` is basically the path/basename (language-agnostic).
+
+    No NL keyword lists — only structured equality / path-token dominance.
+    """
+    import re as _re
+
+    o = (observed or "").strip()
+    if len(o) < _VISUAL_OBSERVED_MIN:
+        return True
+    path_norm = screenshot_path.replace("\\", "/").strip().lower()
+    o_norm = o.replace("\\", "/").strip().lower()
+    basename = Path(screenshot_path).name.lower() if screenshot_path else ""
+    if path_norm and (
+        o_norm == path_norm or o_norm.rstrip("/") == path_norm.rstrip("/")
+    ):
+        return True
+    if basename and o_norm == basename:
+        return True
+    if basename and basename in o_norm:
+        remainder = o_norm.replace(basename, "")
+        if path_norm:
+            remainder = remainder.replace(path_norm, "")
+        remainder = _re.sub(r"[\s./\\:_\-]+", "", remainder)
+        if len(remainder) < 16:
+            return True
+    return False
 
 
 class BrowseParams(BaseModel):
@@ -98,12 +132,26 @@ async def _maybe_git_commit(workspace: str) -> str | None:
     return None
 
 
+def _screenshot_path_from_argv(argv: list[str]) -> str | None:
+    """Extract output path from ``screenshot [path]`` argv."""
+    if not argv:
+        return None
+    if (argv[0] or "").lower().replace("-", "_") != "screenshot":
+        return None
+    if len(argv) >= 2 and str(argv[1]).strip():
+        return str(argv[1]).strip()
+    return "screenshot.png"
+
+
 @tool(
     "browse",
     "Drive a real Chromium browser via gstack browse (goto/click/fill/snapshot/"
     "screenshot/console/network/js/eval). Use js/eval for canvas MouseEvent "
     "injection when snapshot refs are insufficient. "
     "Prefer lookup_dev_server / start_dev_server for the app URL first. "
+    "After screenshot the PNG pixels are injected into your next LLM turn — "
+    "you MUST call assert_visual(observed, verdict) based on what you SEE "
+    "(path-only evidence is rejected for UI submit). "
     "Example: browse(args=[\"goto\",\"http://127.0.0.1:3000\"]) then "
     "browse(args=[\"snapshot\",\"-i\"]). On success issues a browse_e2e attestation.",
     requires_workspace=True,
@@ -233,4 +281,183 @@ async def browse_tool(
     except Exception:
         pass
 
+    extra_fields: dict[str, Any] = {}
+    shot_rel = _screenshot_path_from_argv(argv)
+    if shot_rel:
+        from hiveweave.services.vision import (
+            load_image_for_llm,
+            resolve_screenshot_path,
+        )
+
+        shot_path = resolve_screenshot_path(workspace, shot_rel)
+        img = load_image_for_llm(shot_path) if shot_path else None
+        if img:
+            extra_fields["images"] = [img]
+            extra_fields["screenshot_path"] = img.get("path") or str(shot_path)
+            out = (
+                f"{out}{attest_note}\n"
+                "[VISION] Screenshot pixels are attached to this tool result "
+                "for your next turn. Inspect the image (not the path). Then call "
+                "assert_visual(screenshotPath=..., observed=\"what you see\", "
+                "verdict=\"pass\"|\"fail\") — UI submit requires visual_check; "
+                "a bare screenshot file path is NOT enough."
+            )
+            return ToolResult.ok(out, **extra_fields)
+
+        out = (
+            f"{out}{attest_note}\n"
+            "[VISION] Screenshot file could not be loaded into multimodal "
+            f"context (path={shot_path}). Re-take screenshot or check path; "
+            "assert_visual still required for UI evidence."
+        )
+        return ToolResult.ok(out)
+
     return ToolResult.ok(out + attest_note)
+
+
+class AssertVisualParams(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    screenshot_path: str = Field(
+        ...,
+        alias="screenshotPath",
+        description="Path to the PNG/JPEG produced by browse screenshot.",
+        json_schema_extra={"aliases": ["screenshotPath", "screenshot_path", "path"]},
+    )
+    observed: str = Field(
+        ...,
+        description=(
+            "What you SEE in the image pixels (UI state, text, layout, errors). "
+            f"Min {_VISUAL_OBSERVED_MIN} chars. Path-only or 'looks fine' is rejected."
+        ),
+    )
+    verdict: Literal["pass", "fail"] = Field(
+        ...,
+        description="pass if the screenshot satisfies the criterion; else fail.",
+    )
+    criteria: str | None = Field(
+        default=None,
+        description="Optional acceptance criterion / expected UI state this check covers.",
+    )
+    task_id: str | None = Field(
+        default=None,
+        alias="taskId",
+        description="Optional task id to bind visual_check attestation.",
+        json_schema_extra={"aliases": ["taskId", "task_id"]},
+    )
+
+
+@tool(
+    "assert_visual",
+    "Record a visual assertion AFTER browse(screenshot). The screenshot pixels "
+    "were injected into context — describe what you actually see, then "
+    "verdict=pass|fail. Creates a visual_check attestation required for "
+    "ui_browser_e2e submit. File existence alone is not evidence.",
+    requires_workspace=True,
+    security_level="standard",
+)
+async def assert_visual_tool(
+    params: AssertVisualParams, agent_id: str, workspace: str
+) -> ToolResult:
+    from hiveweave.services.vision import load_image_for_llm, resolve_screenshot_path
+
+    observed = (params.observed or "").strip()
+    if len(observed) < _VISUAL_OBSERVED_MIN:
+        return ToolResult.err(
+            f"assert_visual.observed must be >= {_VISUAL_OBSERVED_MIN} chars "
+            "describing what you SEE in the image (not the file path). "
+            "Example: 'Level select shows 3 cards; Start button bottom-right; "
+            "no console-error overlay.'"
+        )
+
+    shot = resolve_screenshot_path(workspace, params.screenshot_path)
+    if shot is None:
+        return ToolResult.err(
+            f"Screenshot path rejected or outside workspace: "
+            f"{params.screenshot_path!r}. Use a path under your worktree "
+            f"(e.g. evidence/flow.png)."
+        )
+    if not shot.is_file():
+        return ToolResult.err(
+            f"Screenshot not found: {params.screenshot_path!r}. "
+            "Re-run browse(args=[\"screenshot\", \"evidence/...png\"]) first."
+        )
+
+    if _is_path_stub_observed(observed, str(shot)) or _is_path_stub_observed(
+        observed, params.screenshot_path
+    ):
+        return ToolResult.err(
+            "assert_visual.observed looks like a path stub. Describe "
+            "visible UI content (labels, layout, errors) from the image pixels — "
+            "not the file path."
+        )
+
+    img = load_image_for_llm(shot)
+    if img is None:
+        return ToolResult.err(
+            f"Could not load screenshot for vision context: {shot}. "
+            "File missing, not an image, or exceeds size cap."
+        )
+
+    attest_note = ""
+    att_id = None
+    try:
+        from hiveweave.services.attestation import (
+            VISUAL_CHECK_KIND,
+            attestation_service,
+            hash_stdout,
+        )
+        from hiveweave.tools.helpers import get_project_id
+
+        project_id = await get_project_id(agent_id)
+        if project_id:
+            task_id = await _resolve_task_id(project_id, agent_id, params.task_id)
+            commit = await _maybe_git_commit(workspace or "")
+            payload = {
+                "kind": VISUAL_CHECK_KIND,
+                "screenshot_path": str(shot),
+                "observed": observed,
+                "verdict": params.verdict,
+                "criteria": (params.criteria or "").strip() or None,
+            }
+            import json as _json
+
+            blob = _json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            att_id = await attestation_service.create(
+                project_id,
+                agent_id=agent_id,
+                kind=VISUAL_CHECK_KIND,
+                tool_call_id=str(uuid.uuid4()),
+                task_id=task_id,
+                command_or_url=(
+                    f"assert_visual:{params.verdict}:{shot.name}"
+                )[:500],
+                exit_code=0 if params.verdict == "pass" else 1,
+                workspace=workspace or None,
+                commit=commit,
+                stdout_hash=hash_stdout(blob),
+                stdout=blob,
+                console_errors=0,
+            )
+            attest_note = (
+                f"\n[attestation_id={att_id} kind={VISUAL_CHECK_KIND} "
+                f"verdict={params.verdict}]"
+            )
+    except Exception as e:
+        return ToolResult.err(f"assert_visual attestation failed: {e}")
+
+    out = (
+        f"Visual check recorded: verdict={params.verdict}.\n"
+        f"screenshot={shot}\n"
+        f"observed={observed[:500]}"
+        f"{attest_note}\n"
+        "[VISION] Image re-attached — confirm your observation still matches "
+        "the pixels before submit_task."
+    )
+    return ToolResult.ok(
+        out,
+        images=[img],
+        screenshot_path=str(shot),
+        attestation_id=att_id,
+        verdict=params.verdict,
+    )

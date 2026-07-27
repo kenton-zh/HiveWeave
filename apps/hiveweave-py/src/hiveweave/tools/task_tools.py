@@ -523,10 +523,25 @@ class DispatchTaskParams(BaseModel):
         description="Expected modules for structured dedup (optional).",
         json_schema_extra={"aliases": ["expectedModules", "expected_modules"]},
     )
+    artifact_refs: list[str] | None = Field(
+        default=None,
+        alias="artifactRefs",
+        description=(
+            "Structured file paths the assignee must be able to read "
+            "(e.g. specs, contracts). Validated at dispatch time in the "
+            "assignee's worktree — missing paths are reported immediately."
+        ),
+        json_schema_extra={"aliases": ["artifactRefs", "artifact_refs", "required_paths"]},
+    )
 
     @field_validator("expected_modules", mode="before")
     @classmethod
     def _coerce_dispatch_modules(cls, v: Any) -> Any:
+        return _coerce_to_list(v)
+
+    @field_validator("artifact_refs", mode="before")
+    @classmethod
+    def _coerce_artifact_refs(cls, v: Any) -> Any:
         return _coerce_to_list(v)
 
 
@@ -644,6 +659,48 @@ async def dispatch_task_tool(
         except Exception:
             pass
 
+    # P1-2: artifact_refs existence validation at dispatch time.
+    # Catches "spec file not visible" bugs immediately (creator-side check).
+    artifact_warnings: list[str] = []
+    if params.artifact_refs:
+        from pathlib import Path as _P
+
+        from hiveweave.db import meta as meta_db
+
+        main_ws = await meta_db.get_project_workspace(project_id)
+        # Resolve assignee worktree (best-effort)
+        assignee_wt: str | None = None
+        try:
+            from hiveweave.services.worktree_review import agent_worktree_path
+
+            assignee_wt = await agent_worktree_path(resolved_id)
+        except Exception:
+            pass
+        for ref in params.artifact_refs:
+            ref_clean = str(ref).strip().lstrip("./")
+            if not ref_clean:
+                continue
+            # .hiveweave/ paths are gitignored → invisible cross-worktree
+            if ".hiveweave/" in ref_clean or ref_clean.startswith(".hiveweave"):
+                artifact_warnings.append(
+                    f"PATH INVISIBLE: '{ref_clean}' is under .hiveweave/ "
+                    f"(gitignored, not visible to other agents). "
+                    f"Move shared specs to docs/ or a git-tracked path."
+                )
+                continue
+            # Check existence in main workspace and/or assignee worktree
+            found = False
+            if main_ws and (_P(main_ws) / ref_clean).exists():
+                found = True
+            if not found and assignee_wt and (_P(assignee_wt) / ref_clean).exists():
+                found = True
+            if not found:
+                artifact_warnings.append(
+                    f"NOT FOUND: '{ref_clean}' does not exist in main "
+                    f"workspace or assignee worktree. Ensure it is committed "
+                    f"to main before the assignee starts."
+                )
+
     ds = DispatchService()
     result = await ds.dispatch_task(
         project_id=project_id,
@@ -669,6 +726,11 @@ async def dispatch_task_tool(
             f"Task dispatched to {result.get('to_agent_id', resolved_id)} "
             f"(task_id={result.get('task_id', '')})"
         )
+        if artifact_warnings:
+            output += (
+                "\n\n⚠ ARTIFACT_REF WARNINGS:\n"
+                + "\n".join(f"- {w}" for w in artifact_warnings)
+            )
         return ToolResult.ok(output + force_note, task_id=result.get("task_id"))
     return ToolResult.err(result.get("message", "Dispatch failed"))
 
@@ -1328,21 +1390,34 @@ async def submit_task_tool(
                 task_id=task_id,
             )
             if not ok:
+                if policy_id == "docs_only":
+                    opt1 = (
+                        f"1) attest_doc_review(taskId=\"{task_id}\", "
+                        f"files=[{{path: \"specs/...\"}}]) then "
+                        f"submit_task(..., attestationIds=[...]).\n"
+                    )
+                elif policy_id == "ui_browser_e2e":
+                    opt1 = (
+                        f"1) browse(...) then browse(screenshot) then "
+                        f"assert_visual(screenshotPath=..., "
+                        f"observed=\"what you SEE in the image\", "
+                        f"verdict=\"pass\") then "
+                        f"submit_task(taskId=\"{task_id}\", "
+                        f"attestationIds=[browse_e2e id, visual_check id]). "
+                        f"Need BOTH kinds; verdict=fail does not unlock submit; "
+                        f"a PNG path alone is rejected.\n"
+                    )
+                else:
+                    opt1 = (
+                        f"1) Run bash/tests as the assignee, then "
+                        f"submit_task(taskId=\"{task_id}\", "
+                        f"attestationIds=[...]).\n"
+                    )
                 return ToolResult.err(
                     f"submit_task attestation gate failed ({policy_id}): {err}. "
                     f"taskId={task_id} (use this full id).\n"
                     f"Options:\n"
-                    + (
-                        f"1) attest_doc_review(taskId=\"{task_id}\", "
-                        f"files=[{{path: \"specs/...\"}}]) then "
-                        f"submit_task(..., attestationIds=[...]).\n"
-                        if policy_id == "docs_only"
-                        else (
-                            f"1) Run bash/tests as the assignee, then "
-                            f"submit_task(taskId=\"{task_id}\", "
-                            f"attestationIds=[...]).\n"
-                        )
-                    )
+                    + opt1
                     + (
                         f"2) Coordinator last resort: "
                         f"waive_attestation(taskId=\"{task_id}\", "
@@ -1424,6 +1499,52 @@ async def submit_task_tool(
                     "submit_task rejected: no files_changed and worktree is dirty. "
                     "Call git_worktree_checkpoint first."
                 )
+
+    # P1-2: submit-time symmetric existence gate (mirrors approve-time
+    # missing_claimed check). Catches "submit with no actual deliverable"
+    # and ".hiveweave/ invisible files" at submit rather than at approve.
+    fc_list = evidence.get("files_changed") or []
+    if fc_list and not skip_delivery_gate:
+        from pathlib import Path as _PSub
+
+        from hiveweave.services.worktree_review import (
+            agent_worktree_path as _awt,
+            project_main_workspace as _pmw,
+        )
+
+        _sub_ws = await _pmw(project_id)
+        _sub_wt = await _awt(agent_id)
+        _roots = [r for r in (_sub_wt, _sub_ws) if r]
+        if _roots:
+            missing_at_submit: list[str] = []
+            invisible_at_submit: list[str] = []
+            for fc in fc_list[:30]:  # cap to avoid perf issues
+                fc_clean = str(fc).strip().lstrip("./")
+                if not fc_clean:
+                    continue
+                if ".hiveweave/" in fc_clean:
+                    invisible_at_submit.append(fc_clean)
+                    continue
+                if not any((_PSub(r) / fc_clean).exists() for r in _roots):
+                    missing_at_submit.append(fc_clean)
+            if missing_at_submit:
+                return ToolResult.err(
+                    "submit_task rejected: files_changed references paths "
+                    "that do not exist on disk: "
+                    + ", ".join(missing_at_submit[:8])
+                    + ("…" if len(missing_at_submit) > 8 else "")
+                    + ". Ensure all deliverables are committed in your "
+                    "worktree before submitting."
+                )
+            if invisible_at_submit:
+                log.warning(
+                    "submit_files_under_hiveweave",
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    paths=invisible_at_submit[:5],
+                )
+                # Warning only — don't block, but inform the agent
+                evidence["_hiveweave_invisible_warning"] = invisible_at_submit[:5]
 
     try:
         # Auto-transition: if task is in 'created' or 'claimed' status,
@@ -1705,6 +1826,39 @@ async def review_task_tool(
                         "attestationIds (browse_e2e / test_run / doc_review), "
                         "or waive_attestation. Prefer attest_doc_review for "
                         "document VERIFY instead of waiving."
+                    )
+
+            # P0-2: Reviewer-side execution evidence gate.
+            # The submitter's attestation proves THEY ran tests. The reviewer
+            # must ALSO have executed independently (run_tests / bash test cmd)
+            # before approving. "12-second approve" with zero reviewer commands
+            # is the root cause of P0-1's CHANGELOG loss going undetected.
+            from hiveweave.services.attestation import (
+                find_reviewer_attestation,
+                reviewer_required_kinds,
+            )
+
+            rev_needed = reviewer_required_kinds(policy_id)
+            if rev_needed and not waived:
+                has_rev = await find_reviewer_attestation(
+                    project_id, params.task_id, agent_id, rev_needed
+                )
+                if not has_rev:
+                    tid = task.get("id") or params.task_id
+                    kinds_str = ", ".join(sorted(rev_needed))
+                    return ToolResult.err(
+                        f"Cannot approve: YOU (the reviewer) have no fresh "
+                        f"execution evidence on this task.\n"
+                        f"Required reviewer kind(s): {kinds_str}.\n"
+                        f"Before approving, run the project's tests yourself "
+                        f"(e.g. `run_tests` or `bash` with a test command) "
+                        f"so the platform records your attestation.\n"
+                        f"taskId={tid}. Options:\n"
+                        f"1) Run tests in the assignee's worktree or on main "
+                        f"(after merge), then approve again.\n"
+                        f"2) waive_attestation(taskId=\"{tid}\", "
+                        f"reason=\"<why reviewer execution exempt>\") "
+                        f"as last resort (CEO/coordinator only)."
                     )
 
             # (1) Force worktree context — ensure assignee tree exists, then gate.

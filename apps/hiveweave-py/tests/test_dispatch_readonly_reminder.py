@@ -5,7 +5,7 @@
 - 派发给 CEO（family=ceo，无 SOURCE_WRITE）：硬拒绝，不调用 DispatchService
 - 派发给非直属下属：硬拒绝跨级
 - 派发给直属 executor：成功
-- 角色查询失败：fail-open（不因 infra 砖死派活）
+- 角色查询失败：fail-closed，返回「组织查询失败」原因给 AI（不再静默放行）
 """
 
 from __future__ import annotations
@@ -216,9 +216,11 @@ class TestDispatchHardGates:
         assert "dup-task" in text
         assert "相似" in text
 
-    async def test_lookup_failure_fail_open_allows_dispatch(self):
-        """角色查询抛异常：fail-open，不阻断。"""
+    async def test_lookup_failure_fail_closed_blocks_dispatch(self):
+        """角色查询抛异常：fail-closed，把原因回传给 AI，不静默放行。"""
         p = _run_patches(lookup_error=True)
         with p[0], p[1], p[2], p[3], p[4]:
             result = await dispatch_task_tool(_params(), COORDINATOR_ID, "/tmp")
-        assert result.success is True
+        assert result.success is False
+        text = (result.output or "") + (getattr(result, "error", None) or "")
+        assert "组织查询失败" in text

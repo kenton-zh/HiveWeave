@@ -1459,7 +1459,85 @@ class TaskService:
         if not isinstance(ev, dict):
             ev = {}
 
-        if evidence_merge_waived(ev) or evidence_has_merge_fact(ev):
+        if evidence_merge_waived(ev):
+            return
+
+        if evidence_has_merge_fact(ev):
+            # P0-1 is-ancestor companion: merge fact exists, but verify the
+            # branch tip is actually in main. Catches "new commits added after
+            # merge" (like 5510049 stranded on hw/A003/work post-close).
+            assignee = task.get("assignee_id")
+            tid = str(task.get("id") or "")
+            main_ws = await project_main_workspace(project_id)
+            if main_ws and assignee:
+                try:
+                    from hiveweave.services.git_worktree import (
+                        GitWorktreeService,
+                        _git,
+                        _has_git,
+                        _resolve_base_branch,
+                        _worktree_path,
+                    )
+                    from hiveweave.services.org import OrgService
+
+                    org = OrgService()
+                    agent_rec = await org.resolve_agent(str(assignee))
+                    sid = (agent_rec or {}).get("short_id", "")
+                    if sid:
+                        # Resolve effective path (P0-1 single source)
+                        eff_path = await GitWorktreeService._resolve_effective_worktree_path(
+                            main_ws, sid
+                        )
+                        branch = None
+                        if _has_git(eff_path):
+                            from hiveweave.services.git_worktree import (
+                                _current_branch,
+                            )
+                            branch = await _current_branch(eff_path)
+                        if not branch:
+                            branch = f"hw/{sid}/work"
+                        # Resolve base branch (W2: don't hardcode "main")
+                        base_br = await _resolve_base_branch(main_ws) or "main"
+                        # Check if branch still exists and is NOT ancestor of base
+                        ok_exists, _ = await _git(
+                            ["rev-parse", "--verify", branch], main_ws
+                        )
+                        if ok_exists:
+                            ok_anc, _ = await _git(
+                                ["merge-base", "--is-ancestor", branch, base_br],
+                                main_ws,
+                            )
+                            if not ok_anc:
+                                # Branch has commits not in main — block close
+                                log.warning(
+                                    "task.close_blocked_tip_not_ancestor",
+                                    task_id=tid,
+                                    branch=branch,
+                                    assignee=assignee,
+                                )
+                                await self._rollback_close_to_approved(
+                                    project_id,
+                                    task,
+                                    reason="branch_tip_not_in_main",
+                                    commits_ahead=None,
+                                    dirty_count=0,
+                                )
+                                raise MergeRequiredError(
+                                    f"Cannot close task {tid[:8]}: branch "
+                                    f"{branch} has commits not in main "
+                                    f"(merge-base --is-ancestor failed). "
+                                    f"Merge the branch first.",
+                                    reason="branch_tip_not_in_main",
+                                    task_id=tid,
+                                )
+                except MergeRequiredError:
+                    raise
+                except Exception as anc_err:
+                    log.warning(
+                        "task.is_ancestor_check_failed",
+                        task_id=str(task.get("id") or ""),
+                        error=str(anc_err),
+                    )
             return
 
         assignee = task.get("assignee_id")

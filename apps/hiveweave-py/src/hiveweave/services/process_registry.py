@@ -439,6 +439,59 @@ def lookup_by_project(project_id: str) -> list[ProcessRecord]:
     return [r for r in _registry.values() if r.project_id == project_id]
 
 
+def stop_processes_for_worktree(worktree_path: str) -> dict:
+    """Stop all registered processes whose cwd is under *worktree_path*.
+
+    Called before worktree teardown to release file locks (WinError 32).
+    Returns ``{stopped: [...], failed: [...]}``.
+    """
+    hydrate_registry()
+    norm_wt = os.path.normcase(os.path.normpath(worktree_path))
+    norm_wt_sep = norm_wt + os.sep  # prefix with separator to avoid A003 matching A0031
+    stopped: list[dict] = []
+    failed: list[dict] = []
+
+    to_check = [
+        (key, rec)
+        for key, rec in _registry.items()
+        if rec.cwd and (
+            os.path.normcase(os.path.normpath(rec.cwd)) == norm_wt
+            or os.path.normcase(os.path.normpath(rec.cwd)).startswith(norm_wt_sep)
+        )
+    ]
+    for key, rec in to_check:
+        if not rec.pid or not _is_pid_alive(rec.pid):
+            # Already dead — just unregister
+            _registry.pop(key, None)
+            stopped.append({"port": rec.port, "pid": rec.pid, "status": "already_dead"})
+            continue
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(rec.pid)],
+                    capture_output=True, timeout=10,
+                )
+            else:
+                import signal
+                os.kill(rec.pid, signal.SIGTERM)
+            _registry.pop(key, None)
+            stopped.append({"port": rec.port, "pid": rec.pid, "status": "killed"})
+            log.info(
+                "process_stopped_for_worktree",
+                port=rec.port, pid=rec.pid, worktree=worktree_path[:120],
+            )
+        except Exception as e:
+            failed.append({"port": rec.port, "pid": rec.pid, "error": str(e)})
+            log.warning(
+                "process_stop_failed_for_worktree",
+                port=rec.port, pid=rec.pid, error=str(e),
+            )
+
+    if stopped or failed:
+        _persist_registry()
+    return {"stopped": stopped, "failed": failed}
+
+
 def clear_registry_for_tests() -> None:
     _registry.clear()
     global _hydrated

@@ -42,6 +42,7 @@ _BASE_TOOLS = frozenset({
     "get_tasks",
     "claim_task", "update_task_status", "submit_task", "update_progress",
     "attest_doc_review",
+    "assert_visual",
 })
 
 CEO_TOOLS = _BASE_TOOLS | frozenset({
@@ -96,7 +97,7 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
 # Do NOT include hire/dispatch/bash elevation here for "readonly" meaning;
 # PolicyService still hard-denies based on role family.
 READONLY_TOOLS = _BASE_TOOLS | frozenset({
-    "bash", "write_file", "browse", "edit_file",
+    "bash", "write_file", "browse", "assert_visual", "edit_file",
     "bind_skill", "unbind_skill",
     "start_dev_server",
     "run_tests", "apply_patch",
@@ -143,14 +144,24 @@ class PermissionService:
     async def evaluate(
         self, agent_id: str, tool_name: str, tool_args: dict | None = None
     ) -> str:
-        """Evaluate whether a tool is allowed. Returns 'allow'/'deny'/'ask'.
+        """Evaluate whether a tool is allowed. Returns 'allow'/'deny'/'ask'."""
+        decision, _reason = await self.evaluate_detailed(
+            agent_id, tool_name, tool_args
+        )
+        return decision
 
-        Order: hard capability → user deny → ask → allow → family/mode fallback.
+    async def evaluate_detailed(
+        self, agent_id: str, tool_name: str, tool_args: dict | None = None
+    ) -> tuple[str, str | None]:
+        """Like evaluate, but also returns a deny reason for the model.
+
+        Order: hard capability → user deny → ask → allow → role/mode fallback.
         ``allowed_tools`` cannot override hard capability deny.
+        Returns ``(action, reason)`` — reason is set only on deny.
         """
         agent = await meta_db.get_agent_by_id(agent_id)
         if agent is None:
-            return "ask"
+            return "ask", None
 
         hard = policy_service.hard_check(agent, tool_name, tool_args)
         if hard:
@@ -160,7 +171,7 @@ class PermissionService:
                 tool=tool_name,
                 reason=hard[:200],
             )
-            return "deny"
+            return "deny", hard
 
         mode = agent.get("permission_mode") or "readonly"
         denied = self._parse_list(agent.get("denied_tools"))
@@ -168,39 +179,64 @@ class PermissionService:
         allowed = self._parse_list(agent.get("allowed_tools"))
 
         if self._matches_pattern(tool_name, denied, tool_args):
-            return "deny"
+            return (
+                "deny",
+                f"User denied_tools rule blocks '{tool_name}' "
+                "(operator configured deny — not a role-capability gap)",
+            )
         if self._matches_pattern(tool_name, ask, tool_args):
-            return "ask"
+            return "ask", None
         if self._matches_pattern(tool_name, allowed, tool_args):
-            return "allow"
+            return "allow", None
 
         family = infer_role_family(agent)
         permission_type = (agent.get("permission_type") or "").lower()
 
         if family == "hr":
-            return "allow" if tool_name in HR_TOOLS else "deny"
+            if tool_name in HR_TOOLS:
+                return "allow", None
+            return (
+                "deny",
+                f"Tool '{tool_name}' is not in the HR tool allowlist",
+            )
         if family == "ceo":
-            return "allow" if tool_name in CEO_TOOLS else "deny"
+            if tool_name in CEO_TOOLS:
+                return "allow", None
+            return (
+                "deny",
+                f"Tool '{tool_name}' is not in the CEO tool allowlist",
+            )
         if family == "coordinator" or permission_type == "coordinator":
             if (
                 tool_name in COORDINATOR_ONLY_TOOLS
                 or tool_name in COORDINATOR_BUILDER_TOOLS
             ):
-                return "allow"
-            return "deny"
+                return "allow", None
+            return (
+                "deny",
+                f"Tool '{tool_name}' is not in the coordinator tool allowlist",
+            )
 
         if tool_name in COORDINATOR_ONLY_TOOLS:
-            return "deny"
+            return (
+                "deny",
+                f"Tool '{tool_name}' is coordinator-only "
+                f"(role_family={family or 'unknown'})",
+            )
 
         if mode == "full":
-            return "allow"
+            return "allow", None
         if mode == "readwrite":
-            return "allow" if tool_name in READWRITE_TOOLS else "ask"
+            if tool_name in READWRITE_TOOLS:
+                return "allow", None
+            return "ask", None
         if mode == "readonly":
-            return "allow" if tool_name in READONLY_TOOLS else "ask"
+            if tool_name in READONLY_TOOLS:
+                return "allow", None
+            return "ask", None
         if mode == "custom":
-            return "ask"
-        return "ask"
+            return "ask", None
+        return "ask", None
 
     def get_tools_for_mode(self, mode: str) -> list[str]:
         if mode == "readonly":

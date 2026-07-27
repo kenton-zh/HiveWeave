@@ -594,6 +594,7 @@ class ModelCreate(BaseModel):
     defaultReasoningEffort: str | None = None
     temperature: float | None = None
     isActive: bool | None = None
+    tier: str | None = None  # management | executor (None = 未分类)
 
 
 class ModelUpdate(BaseModel):
@@ -610,6 +611,7 @@ class ModelUpdate(BaseModel):
     defaultReasoningEffort: str | None = None
     temperature: float | None = None
     isActive: bool | None = None
+    tier: str | None = None  # management | executor (None = 未分类)
 
 
 def _normalize_attrs(body: BaseModel) -> dict:
@@ -656,6 +658,7 @@ def _model_response(model: dict) -> dict:
         "temperature": model.get("temperature"),
         "is_active": model.get("is_active"),
         "isActive": model.get("is_active"),
+        "tier": model.get("tier"),
         "created_at": model.get("created_at"),
         "createdAt": model.get("created_at"),
         "updated_at": model.get("updated_at"),
@@ -801,3 +804,45 @@ async def test_model(model_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Model not found")
 
     return await _do_self_test(model)
+
+
+class DetectCapabilitiesRequest(BaseModel):
+    """能力探测请求体 — 仅需连接信息，不要求已落库。"""
+
+    baseUrl: str
+    apiKey: str | None = None
+    modelId: str
+
+
+@router.post("/detect-capabilities")
+async def detect_capabilities(body: DetectCapabilitiesRequest) -> dict:
+    """探测模型能力（上下文窗口 / 推理支持 / 最大输出），不发真实对话、不落库。
+
+    与 /{id}/test 的区别：
+    - test 会发起一次真实 chat completion 并自动修正 DB 配置；
+    - 本端点仅查询 provider 的模型元数据（OpenRouter /models 或预设表），
+      用于前端在保存模型前「一键探测」填充字段，用户仍可手动调整。
+
+    返回:
+    - contextWindow: int | None
+    - supportsThinking: bool | None
+    - maxOutputTokens: int | None
+    - source: str (preset / external-api / openrouter / unknown)
+    """
+    base_url = (body.baseUrl or "").strip()
+    model_id = (body.modelId or "").strip()
+    if not base_url or not model_id:
+        raise HTTPException(status_code=400, detail="baseUrl and modelId are required")
+
+    api_key = (body.apiKey or "").strip()
+    detected_ctx = await _detect_context_window(base_url, api_key, model_id)
+    caps = await _detect_model_capabilities(
+        base_url, api_key, model_id, context_window=detected_ctx
+    )
+
+    return {
+        "contextWindow": detected_ctx,
+        "supportsThinking": caps.get("supports_thinking"),
+        "maxOutputTokens": caps.get("max_output_tokens"),
+        "source": caps.get("source", "unknown"),
+    }

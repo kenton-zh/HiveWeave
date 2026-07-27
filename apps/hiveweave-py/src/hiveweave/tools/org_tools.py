@@ -109,7 +109,7 @@ def _hire_permission_mode(perm_type: str, role: str) -> str:
 
     builder coordinator（中层，family=coordinator）须可写 —— 固定 readonly
     会让 evaluate 的 mode 兜底把写工具变 ask，SOURCE_WRITE 形同虚设；
-    CEO 保持偏只读协调 mode（无 SOURCE_WRITE，docs 白名单够用）。
+    CEO 保持偏只读协调 mode（有 DOC_WRITE，无 SOURCE_WRITE）。
     """
     if perm_type != "coordinator":
         return "readwrite"
@@ -211,64 +211,36 @@ async def hire_agent_tool(
     # existing_agents 已在上方 parent_id 解析时获取（all_agents）
     existing_agents = all_agents
 
-    # ── 默认模型分配 ──
-    # 优先从 global_settings 读取 default_coordinator_model / default_executor_model
-    # 未配置时回退到旧逻辑（继承现有 coordinator 模型 / 挑不同的活跃模型）
-    from hiveweave.services.settings import SettingsService
+    # ── 默认模型分配（tier 主备） ──
+    # 按角色等级解析: coordinator → management tier; else → executor tier
+    # 解析链: tier primary → backup → tier column match → legacy pool
+    from hiveweave.services.model import ModelService
 
-    settings = SettingsService()
+    ms = ModelService()
+    tier = "management" if perm_type == "coordinator" else "executor"
     model_id = None
 
-    if perm_type == "coordinator":
-        # 1. 全局设置: default_coordinator_model
-        configured = await settings.get("default_coordinator_model")
-        if configured:
-            model_id = configured
-            log.info("hire_agent.model_from_setting", role=role, setting="default_coordinator_model", model_id=model_id)
+    try:
+        resolved = await ms.resolve_model(tier=tier)
+        if resolved:
+            model_id = resolved.get("model_id") or resolved.get("id")
+            log.info(
+                "hire_agent.model_tier_resolved",
+                role=role,
+                tier=tier,
+                model_id=model_id,
+                model_name=resolved.get("name"),
+            )
+    except Exception as e:
+        log.warning("hire_agent.tier_resolve_failed", error=str(e), tier=tier)
 
-        # 2. 回退: 继承现有 coordinator 的模型
-        if not model_id:
-            for a in existing_agents:
-                if a.get("model_id"):
-                    model_id = a["model_id"]
-                    log.info("hire_agent.model_inherited", role=role, from_agent=a.get("name"), model_id=model_id)
-                    break
-    else:
-        # 1. 全局设置: default_executor_model
-        configured = await settings.get("default_executor_model")
-        if configured:
-            model_id = configured
-            log.info("hire_agent.model_from_setting", role=role, setting="default_executor_model", model_id=model_id)
-
-        # 2. 回退: 挑一个与 coordinator 不同的活跃模型
-        if not model_id:
-            coordinator_model = None
-            for a in existing_agents:
-                if a.get("model_id"):
-                    coordinator_model = a["model_id"]
-                    break
-
-            try:
-                from hiveweave.services.model import ModelService
-
-                ms = ModelService()
-                active = await ms.list_active()
-                if active:
-                    for m in active:
-                        mid = m.get("model_id") or m.get("id")
-                        if mid != coordinator_model:
-                            model_id = mid
-                            log.info(
-                                "tool.hire_agent.executor_model_routed",
-                                model_id=model_id,
-                                coordinator_model=coordinator_model,
-                            )
-                            break
-                    if not model_id:
-                        chosen = active[-1]
-                        model_id = chosen.get("model_id") or chosen.get("id")
-            except Exception as e:
-                log.warning("tool.hire_agent.model_service_failed", error=str(e))
+    # Legacy fallback: inherit from existing agents
+    if not model_id:
+        for a in existing_agents:
+            if a.get("model_id"):
+                model_id = a["model_id"]
+                log.info("hire_agent.model_inherited", role=role, from_agent=a.get("name"), model_id=model_id)
+                break
 
     # Final fallback
     if not model_id:
@@ -318,7 +290,9 @@ async def hire_agent_tool(
             if ctx.skills._get_builtin_skill(sk) is not None:
                 valid_skills.append(sk)
             else:
-                detail = await ctx.skills._fetch_skills_sh_detail(sk)
+                # 市场校验与 list_available_skills 同路由：skills.sh 优先，
+                # 不可达时降级 SkillHub 国内——避免国内商店技能「搜得到却绑不上」。
+                detail, _source = await ctx.skills._resolve_marketplace_skill(sk)
                 if detail is not None:
                     valid_skills.append(sk)
                 else:

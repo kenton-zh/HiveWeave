@@ -727,14 +727,49 @@ async def check_evidence_verifiable(
         return None
 
     # uncovered_criteria: path-like tokens from acceptance criteria text that
-    # weren't found on disk. Downgraded to warning (TEST16 P0-1) — evidence
-    # sufficiency is the reviewer's judgment call, not a platform hard gate.
+    # weren't found on disk.
+    # P0-2 tiered enforcement (replaces TEST16 P0-1 blanket soft-pass):
+    # - Milestone/SHIP tasks: HARD REJECT (this is the first root cause of
+    #   CHANGELOG loss — approve with missing deliverables must be blocked).
+    # - Other tasks: warning only (reviewer's judgment call, original intent).
+    # Milestone detection uses STRUCTURED TAGS ONLY (no NL title/description
+    # scraping — respects "language-agnostic, no text-guessing" hard rule).
+    _MILESTONE_TAGS = frozenset({
+        "milestone", "ship", "release", "e2e", "integration",
+    })
+    task_tags = task.get("tags") or []
+    if isinstance(task_tags, str):
+        try:
+            import json as _json_mod
+            task_tags = _json_mod.loads(task_tags)
+        except Exception:
+            task_tags = []
+    tag_set = {str(t).lower() for t in task_tags} if isinstance(task_tags, list) else set()
+    is_milestone = bool(tag_set & _MILESTONE_TAGS)
+
     if uncovered_criteria:
-        log.warning(
-            "evidence.uncovered_criteria_warning",
-            task_id=task.get("id"),
-            refs=uncovered_criteria[:8],
-        )
+        if is_milestone:
+            log.warning(
+                "evidence.uncovered_criteria_hard_reject",
+                task_id=task.get("id"),
+                refs=uncovered_criteria[:8],
+                tags=sorted(tag_set & _MILESTONE_TAGS),
+            )
+            return (
+                "Cannot approve milestone task: acceptance criteria reference "
+                "paths not found on disk or in files_changed: "
+                + ", ".join(uncovered_criteria[:8])
+                + ("…" if len(uncovered_criteria) > 8 else "")
+                + ". Deliverables must exist before SHIP approve. "
+                "Ask assignee to create the missing files and resubmit, "
+                "or waive_attestation with CEO-level audit reason."
+            )
+        else:
+            log.warning(
+                "evidence.uncovered_criteria_warning",
+                task_id=task.get("id"),
+                refs=uncovered_criteria[:8],
+            )
 
     # Only missing_claimed (agent explicitly claimed these files in
     # files_changed but they don't exist) is a hard deny.

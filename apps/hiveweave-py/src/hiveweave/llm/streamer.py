@@ -790,16 +790,27 @@ class Streamer:
                     fallback_config = await model_svc.get(
                         cb_result.fallback)
                     if fallback_config and fallback_config.get("is_active"):
-                        # 用 fallback model config 递归调用 stream
-                        return await self.stream(
-                            agent_id=agent_id,
-                            messages=messages,
-                            model_config=fallback_config,
-                            tools=tools,
-                            on_delta=on_delta,
-                            on_tool_call=on_tool_call,
-                            max_tool_rounds=max_tool_rounds,
-                        )
+                        # Tier guard: refuse cross-tier fallback
+                        orig_tier = model_config.get("tier")
+                        fb_tier = fallback_config.get("tier")
+                        if orig_tier and fb_tier and orig_tier != fb_tier:
+                            log.warning(
+                                "circuit_fallback_tier_mismatch",
+                                from_provider=provider_name,
+                                orig_tier=orig_tier,
+                                fallback_tier=fb_tier,
+                            )
+                        else:
+                            # 用 fallback model config 递归调用 stream
+                            return await self.stream(
+                                agent_id=agent_id,
+                                messages=messages,
+                                model_config=fallback_config,
+                                tools=tools,
+                                on_delta=on_delta,
+                                on_tool_call=on_tool_call,
+                                max_tool_rounds=max_tool_rounds,
+                            )
                 except Exception as fb_err:
                     log.warning("circuit_fallback_failed",
                                 fallback=cb_result.fallback,
@@ -1960,11 +1971,16 @@ class Streamer:
                     duplicate_ids.add(tc["id"])
                 if result.get("end_turn"):
                     end_turn = True
-            tool_results.append({
+            tool_msg: dict = {
                 "role": "tool",
                 "content": content,
                 "tool_call_id": tc["id"],
-            })
+            }
+            # Multimodal: preserve screenshot pixels for the next LLM round.
+            images = None if isinstance(result, BaseException) else result.get("images")
+            if images:
+                tool_msg["images"] = images
+            tool_results.append(tool_msg)
             # 广播 tool_result
             await self._fire_delta(on_delta, {
                 "type": "tool_result",
@@ -2154,7 +2170,14 @@ class Streamer:
 
         result = list(messages)
         for i in to_prune_indices:
-            result[i] = {**result[i], "content": self._PRUNE_PLACEHOLDER}
+            pruned = {
+                **result[i],
+                "content": self._PRUNE_PLACEHOLDER,
+            }
+            # Drop multimodal payloads with pruned text — pixels are useless
+            # once the observation text is gone, and they blow the context.
+            pruned.pop("images", None)
+            result[i] = pruned
 
         log.info(
             "tool_loop_prune",
@@ -2175,6 +2198,10 @@ class Streamer:
         """
         # Step 1: Prune 旧工具输出（替换为占位符，不丢弃消息）
         messages = self._prune_old_tool_outputs(messages)
+        # Step 1b: Keep only the newest screenshot payloads (base64 is huge)
+        from hiveweave.services.vision import strip_images_from_messages
+
+        messages = strip_images_from_messages(messages)
 
         max_output = provider.max_output_tokens
         if provider.supports_thinking:

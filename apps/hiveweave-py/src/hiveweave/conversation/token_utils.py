@@ -52,23 +52,57 @@ def estimate_tokens(text) -> int:
 
 
 def estimate_tokens_for_messages(messages: list) -> int:
-    """估算消息列表的总 token 数（含 tool_calls arguments）。"""
+    """估算消息列表的总 token 数（含 tool_calls arguments + images）。
+
+    Images are counted so tool-loop trim/prune cannot ignore multi-MB
+    screenshot payloads (vision inject). Heuristic: ~1 token / 512 decoded
+    bytes, floor 256 per image (overestimate preferred to under-trim).
+    """
     if not messages:
         return 0
     total = 0
     for msg in messages:
+        if not isinstance(msg, dict):
+            continue
         content = msg.get("content") or ""
         if isinstance(content, list):
-            # 多模态 content — 拼接 text 部分
-            content = "".join(
-                p.get("text", "") if isinstance(p, dict) else str(p)
-                for p in content
-            )
+            # 多模态 content — 拼接 text 部分 + image_url data URIs
+            text_bits: list[str] = []
+            for p in content:
+                if not isinstance(p, dict):
+                    text_bits.append(str(p))
+                    continue
+                if p.get("type") == "text":
+                    text_bits.append(str(p.get("text") or ""))
+                elif p.get("type") == "image_url":
+                    url = ""
+                    iu = p.get("image_url")
+                    if isinstance(iu, dict):
+                        url = str(iu.get("url") or "")
+                    elif isinstance(iu, str):
+                        url = iu
+                    # data:image/...;base64,XXXX
+                    if "base64," in url:
+                        b64 = url.split("base64,", 1)[1]
+                        nbytes = len(b64) * 3 // 4
+                        total += max(256, nbytes // 512)
+                    else:
+                        total += 256
+            content = "".join(text_bits)
         total += estimate_tokens(content)
         tool_calls = msg.get("tool_calls") or []
         for tc in tool_calls:
             fn = tc.get("function") or {}
             total += estimate_tokens(fn.get("arguments") or "")
+        # Internal HiveWeave image payloads on tool/user messages
+        for img in msg.get("images") or []:
+            if not isinstance(img, dict):
+                continue
+            data = img.get("data") or ""
+            if not data:
+                continue
+            nbytes = len(data) * 3 // 4
+            total += max(256, nbytes // 512)
     return total
 
 
