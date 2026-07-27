@@ -43,6 +43,8 @@ _META_MIGRATIONS: list[tuple[str, str, str]] = [
     ("llm_models", "provider_type", "TEXT DEFAULT ''"),
     # Bug J fix: add fallback column for circuit breaker fallback
     ("llm_models", "fallback", "TEXT"),
+    # Model tiering: management | executor (NULL = unclassified legacy)
+    ("llm_models", "tier", "TEXT"),
     # Bug K fix: per-project is_started flag (上班/下班)
     ("projects", "is_started", "INTEGER DEFAULT 0"),
     # 注: 不再添加 projects.language — 该列的真相源在 per-project DB

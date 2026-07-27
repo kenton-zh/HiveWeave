@@ -45,6 +45,18 @@ export interface AgentHealthInfo {
   projectId?: string;
 }
 
+/**
+ * Live model actually being used by an agent, driven by "model_resolved"
+ * stream events. Updates on every turn start and on failover.
+ */
+export interface AgentActiveModelInfo {
+  modelName: string;
+  modelId: string;
+  source: string; // "tier_resolved" | "failover"
+  failedModel?: string;
+  at: number;
+}
+
 interface AppState {
   selectedAgentId: string | null;
   setSelectedAgent: (id: string | null) => void;
@@ -104,6 +116,9 @@ interface AppState {
   agentHealth: Record<string, AgentHealthInfo>;
   setAgentHealth: (agentId: string, info: AgentHealthInfo | null) => void;
   clearAgentHealth: () => void;
+  // Agent active model — live "model_resolved" events track actual model in use
+  agentActiveModel: Record<string, AgentActiveModelInfo>;
+  setAgentActiveModel: (agentId: string, info: AgentActiveModelInfo | null) => void;
   // Pending initial message — set by NewProjectDialog, consumed by ChatPanel on mount
   pendingInitialMessage: { agentId: string; message: string } | null;
   setPendingInitialMessage: (msg: { agentId: string; message: string } | null) => void;
@@ -315,6 +330,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((state) =>
       Object.keys(state.agentHealth).length ? { agentHealth: {} } : state
     ),
+  // Agent active model (live model_resolved events)
+  agentActiveModel: {},
+  setAgentActiveModel: (agentId, info) =>
+    set((state) => {
+      const next = { ...state.agentActiveModel };
+      if (!info) {
+        if (!(agentId in next)) return state;
+        delete next[agentId];
+      } else {
+        next[agentId] = info;
+      }
+      return { agentActiveModel: next };
+    }),
   // Pending initial message
   pendingInitialMessage: null,
   setPendingInitialMessage: (msg) => set({ pendingInitialMessage: msg }),
@@ -352,6 +380,22 @@ export const useAppStore = create<AppState>((set, get) => ({
               typeof rawEvent.projectId === "string" ? rawEvent.projectId : undefined,
           });
         }
+      }
+      return;
+    }
+
+    // Intercept "model_resolved" events — track actual model in use per agent
+    if (rawEvent?.type === "model_resolved") {
+      const ev = rawEvent as any;
+      const agentId = ev.agentId;
+      if (typeof agentId === "string" && agentId && ev.modelName) {
+        get().setAgentActiveModel(agentId, {
+          modelName: String(ev.modelName),
+          modelId: String(ev.modelId ?? ""),
+          source: String(ev.source ?? "tier_resolved"),
+          failedModel: ev.failedModel ? String(ev.failedModel) : undefined,
+          at: Date.now(),
+        });
       }
       return;
     }

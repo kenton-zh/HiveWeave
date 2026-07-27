@@ -337,7 +337,6 @@ class TestResumeHintEphemeral:
         agent._conversation.get_compacted_prefix = lambda *_a, **_k: None
         agent._conversation.get_history = AsyncMock(return_value=[])
         agent._get_identity_prompt = lambda: "identity"
-        agent._get_context_window = lambda: 32_000
         agent._build_context_prompt = AsyncMock(return_value="")
 
         msgs = await agent._build_messages("hello", {})

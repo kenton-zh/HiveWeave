@@ -235,11 +235,19 @@ class AttestationService:
             if created and (now - int(created)) > max_age:
                 return False, f"Attestation too old: {aid}"
             if expected_agent_id and row.get("agent_id") != expected_agent_id:
-                return (
-                    False,
-                    f"Attestation agent mismatch: {aid} "
-                    f"(expected {expected_agent_id[:8]})",
-                )
+                # P2-4 task-level pooling: accept attestations from ANY agent
+                # on the same task (delegated/wrapped tasks need this — the
+                # executor may differ from the original attestation creator).
+                # Only enforce agent match for agent-scoped attestations
+                # (no task_id on the row).
+                row_task = row.get("task_id") or ""
+                if not (task_id and row_task and row_task == task_id):
+                    return (
+                        False,
+                        f"Attestation agent mismatch: {aid} "
+                        f"(expected {expected_agent_id[:8]}, "
+                        f"got {str(row.get('agent_id') or '')[:8]})",
+                    )
             kind = row.get("kind") or ""
             if kinds_ok is not None and kind not in kinds_ok:
                 return (
@@ -250,12 +258,24 @@ class AttestationService:
                 return False, f"Attestation task_id mismatch: {aid}"
             if not row.get("stdout_hash"):
                 return False, f"Attestation missing stdout_hash: {aid}"
+            # visual_check with verdict=fail stores exit_code=1 — must NOT
+            # unlock UI submit (audit row stays, gate requires pass).
+            if kind == VISUAL_CHECK_KIND:
+                ec = row.get("exit_code")
+                if ec is not None and int(ec) != 0:
+                    return (
+                        False,
+                        f"visual_check {aid} has verdict=fail "
+                        f"(exit_code={ec}); only pass unlocks UI submit",
+                    )
             seen_kinds.add(kind)
 
-        if kinds_ok is not None and not (seen_kinds & kinds_ok):
+        # ALL required kinds must be present (AND), not just any one (OR).
+        if kinds_ok is not None and not kinds_ok.issubset(seen_kinds):
+            missing = sorted(kinds_ok - seen_kinds)
             return (
                 False,
-                f"No attestation of required kind(s) {sorted(kinds_ok)}; "
+                f"Missing required attestation kind(s) {missing}; "
                 f"got {sorted(seen_kinds) or 'none'}",
             )
         return True, ""
@@ -342,6 +362,10 @@ def hash_stdout(s: str) -> str:
 
 WAIVER_KIND = "waiver"
 DOC_REVIEW_KIND = "doc_review"
+# Pixel-grounded UI assertion (assert_visual). Path-only screenshots do not count.
+VISUAL_CHECK_KIND = "visual_check"
+# Issued by browse tool on successful CLI runs (including screenshot).
+BROWSE_E2E_KIND = "browse_e2e"
 
 # Tag tokens that hard-select docs_only policy (narrow — avoid loose "docs").
 _DOCS_TAGS = frozenset({"docs_only", "doc_review"})
@@ -503,8 +527,10 @@ def resolve_task_policy(
 POLICY_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
     # Document VERIFY/spec tasks: machine-checkable file presence + hash
     "docs_only": frozenset({DOC_REVIEW_KIND}),
+    # UI: live browse evidence AND pixel-grounded assert_visual (AND).
+    # Path-only PNG or prose-without-browse is rejected.
+    "ui_browser_e2e": frozenset({VISUAL_CHECK_KIND, BROWSE_E2E_KIND}),
     # Soft for others — coordinator judges browse/test evidence on review
-    "ui_browser_e2e": None,
     "generic_tests": None,
     "coordinator_review": None,
 }
@@ -513,6 +539,64 @@ POLICY_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
 def required_attestation_kinds(policy_id: str) -> frozenset[str] | None:
     """Kinds required at submit/approve for ``policy_id``, or None (soft)."""
     return POLICY_REQUIRED_KINDS.get(policy_id)
+
+
+# ── P0-2: Reviewer-side execution evidence ──────────────────────────────
+# The submitter's attestation proves THEY ran tests. The reviewer must
+# ALSO execute independently — "12-second approve" without running a single
+# command is the root cause of P0-1's CHANGELOG loss going undetected.
+REVIEWER_KIND = "test_run"
+
+REVIEWER_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
+    # Code tasks: reviewer must have their own fresh test_run attestation
+    "ui_browser_e2e": frozenset({REVIEWER_KIND}),
+    "generic_tests": frozenset({REVIEWER_KIND}),
+    "coordinator_review": frozenset({REVIEWER_KIND}),
+    # Docs: doc_review by reviewer is sufficient (or waiver)
+    "docs_only": None,
+}
+
+
+def reviewer_required_kinds(policy_id: str) -> frozenset[str] | None:
+    """Kinds the REVIEWER must personally hold to approve, or None (exempt)."""
+    return REVIEWER_REQUIRED_KINDS.get(policy_id)
+
+
+async def find_reviewer_attestation(
+    project_id: str,
+    task_id: str,
+    reviewer_id: str,
+    kinds: frozenset[str],
+) -> bool:
+    """Check if reviewer has a fresh (non-expired) attestation on this task.
+
+    P0-2: mirrors the submitter gate but for the approving agent.
+    Returns True if at least one valid attestation exists.
+    """
+    from hiveweave.db import meta as meta_db
+    from hiveweave.db.project import ensure_project_db
+
+    ws = await meta_db.get_project_workspace(project_id)
+    if not ws:
+        return False
+    db = await ensure_project_db(ws)
+    if not db:
+        return False
+    now_ms = int(time.time() * 1000)
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT kind FROM tool_attestations "
+            "WHERE task_id = ? AND agent_id = ? "
+            "AND (expires_at IS NULL OR expires_at > ?) "
+            "AND kind != 'waiver'",
+            [task_id, reviewer_id, now_ms],
+        )
+        for row in rows:
+            if (row.get("kind") or "") in kinds:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 async def check_task_attestations(

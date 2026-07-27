@@ -202,9 +202,6 @@ def is_rate_limit_error(error: BaseException | None) -> bool:
 DEFAULT_MAX_TOOL_ROUNDS = 600
 """所有角色统一的 tool loop 最大轮次。不再按角色区别对待。"""
 
-CONTEXT_WINDOW_DEFAULT = 128_000
-"""默认 context window（模型配置缺失时）。"""
-
 # ── 工具描述 ────────────────────────────────────────────────
 # PermissionService 返回工具名列表；_build_tool_definitions 经
 # get_tool_schema_for_llm / get_tool_description 取 schema：
@@ -986,7 +983,7 @@ class Agent:
         # finally never clears a newer turn's streaming row.
         owned_streaming_id = self._streaming_msg_id
         try:
-            # 构建 messages
+            # 构建 messages（读取全部压缩后历史，无读预算）
             messages = await self._build_messages(message, opts)
 
             # 获取模型配置
@@ -1026,11 +1023,21 @@ class Agent:
                 msg_count=len(messages),
             )
 
+            # 通知前端本轮实际使用的模型（tier 解析结果）
+            self._broadcast_stream_event({
+                "type": "model_resolved",
+                "agentId": self.id,
+                "modelName": model_config.get("name"),
+                "modelId": model_config.get("model_id"),
+                "source": "tier_resolved",
+            })
+
             # 启动 thinking 心跳 — 让前端知道 agent 在工作
             self._start_heartbeat()
 
             # 空响应重试循环
             current_messages = list(messages)
+            failover_attempted = False  # 同 turn 只切一次 backup
             while True:
                 # Unified activation budget check — stop before exceeding limits
                 _run_id = getattr(self, "_current_run_id", None)
@@ -1084,6 +1091,38 @@ class Agent:
                     error_msg = result.get("error") or "Unknown LLM error"
                     err_status = result.get("error_status")
                     err_headers = result.get("error_headers")
+                    is_retryable = (
+                        err_status in (429, 500, 502, 503, 504, 529)
+                        or (isinstance(err_headers, dict) and err_headers)
+                    )
+
+                    # ── Same-tier failover: try backup once before error park ──
+                    if is_retryable and not failover_attempted:
+                        failover_attempted = True
+                        backup = await self._resolve_failover_backup(model_config)
+                        if backup:
+                            failed_model_id = model_config.get("model_id")
+                            log.warning(
+                                "model_failover",
+                                agent_id=self.id,
+                                failed_model=failed_model_id,
+                                backup_model=backup.get("model_id"),
+                                error_status=err_status,
+                            )
+                            model_config = backup
+                            self._streaming_text_acc = ""
+                            # 通知前端模型已因故障切换
+                            self._broadcast_stream_event({
+                                "type": "model_resolved",
+                                "agentId": self.id,
+                                "modelName": backup.get("name"),
+                                "modelId": backup.get("model_id"),
+                                "source": "failover",
+                                "failedModel": failed_model_id,
+                            })
+                            continue  # retry stream with backup
+
+                    # ── Existing error handling ──
                     if err_status == 429 or (
                         isinstance(err_headers, dict) and err_headers
                     ):
@@ -1180,12 +1219,12 @@ class Agent:
         if compacted:
             messages.append({"role": "system", "content": compacted})
 
-        # 3. History
-        context_window = self._get_context_window()
-        token_budget = max(context_window // 2, 16_000)
-        history = await self._conversation.get_history(
-            self.id, self.project_id, token_budget
-        )
+        # 3. History — 读取全部压缩后历史，不设读预算。
+        # 设计分工：压缩(compaction)负责把库中历史瘦身——旧轮次被总结成摘要存入
+        # compacted_prefix（上面第 2 步已加入），原文从缓存和 DB 中删除。因此
+        # get_history 只返回压缩后的对话，与摘要相加即为完整上下文，不会把压缩前
+        # 的原文重复计入。历史总量由压缩控制，超限时由 streamer 95% 硬裁兜底。
+        history = await self._conversation.get_history(self.id, self.project_id)
         messages.extend(history)
 
         # 4. Context prompt (System 2 — 动态)
@@ -1316,23 +1355,73 @@ class Agent:
     # ── 内部: 模型 & 工具 ────────────────────────────────────
 
     async def _get_model_config(self) -> dict | None:
-        """获取模型配置；多渠道激活时 round-robin 摊配额。
+        """获取模型配置；按 tier 主备解析，不再全池 round-robin。
 
-        对齐 Elixir agent.ex:474 get_model_config/1。
+        解析链: role_family → tier → resolve_model(primary→backup)
+        向后兼容: 若 tier 未配置任何主备，退化为旧 pick_from_pool。
         """
         model_id = self.config.get("model_id")
         try:
-            from hiveweave.config import settings
+            from hiveweave.services.policy import model_tier_for_agent
 
-            if getattr(settings, "model_pool_enabled", True):
-                picked = await self._model_service.pick_from_pool(model_id)
-                if picked:
-                    return picked
+            tier = model_tier_for_agent(self.config)
+            resolved = await self._model_service.resolve_model(
+                tier=tier,
+                preferred=model_id,
+            )
+            if resolved:
+                return resolved
         except Exception as e:
-            log.debug("model_pool_pick_failed", error=str(e))
+            log.debug("model_tier_resolve_failed", error=str(e))
+
+        # Fallback: direct lookup by model_id
         if not model_id:
             return None
         return await self._model_service.get(model_id)
+
+    async def _resolve_failover_backup(self, failed_config: dict) -> dict | None:
+        """Resolve same-tier backup after a model fault.
+
+        Returns backup config if:
+        - A backup exists in the same tier
+        - Backup has a DIFFERENT api_key (same key = shared quota, skip)
+        - Backup is active
+
+        Returns None otherwise (caller falls through to error park).
+        """
+        try:
+            from hiveweave.services.policy import model_tier_for_agent
+
+            tier = model_tier_for_agent(self.config)
+            failed_id = failed_config.get("id") or ""
+            failed_key = (failed_config.get("api_key") or "")[:16]
+
+            # 仅按 DB 主键(UUID)跳过失败模型。主备允许共用同一 model_id
+            # （靠编号/记录与 API Key 区分），若按 model_id 跳过会误伤备用模型。
+            skip_ids = {failed_id} if failed_id else set()
+
+            backup = await self._model_service.resolve_model(
+                tier=tier,
+                skip_model_ids=skip_ids or None,
+            )
+            if not backup:
+                return None
+
+            # Same api_key fingerprint → shared quota, failover pointless
+            backup_key = (backup.get("api_key") or "")[:16]
+            if failed_key and backup_key == failed_key:
+                log.info(
+                    "model_failover_skip_same_key",
+                    agent_id=self.id,
+                    tier=tier,
+                    failed_model=failed_config.get("model_id"),
+                )
+                return None
+
+            return backup
+        except Exception as e:
+            log.debug("model_failover_resolve_failed", error=str(e))
+            return None
 
     async def _review_llm_callback(self, system_prompt: str, user_prompt: str) -> str:
         """LLM callback for review tools — makes a non-streaming LLM call.
@@ -1402,14 +1491,6 @@ class Agent:
     def _get_max_tool_rounds(self) -> int:
         """获取 tool loop 最大轮次。所有角色统一 600 次。"""
         return DEFAULT_MAX_TOOL_ROUNDS
-
-    def _get_context_window(self) -> int:
-        """获取 context window 大小。"""
-        # 从 agent config 的 model 配置中获取，或用默认值
-        # ModelService.get() 返回的 dict 有 context_window 字段
-        # 但在构建 messages 时 model_config 可能还没获取
-        # 这里用 config 中缓存的值或默认值
-        return self.config.get("_context_window", CONTEXT_WINDOW_DEFAULT)
 
     async def _get_workspace_path(self) -> str:
         """获取工作区路径（每轮 chat 开始会清空缓存）。
@@ -1609,8 +1690,12 @@ class Agent:
                 ),
             })
         turn_messages.extend(tool_turn_messages)
+        # Do not persist base64 screenshots into conversation history —
+        # they are for the in-flight tool loop only; next turn can re-screenshot.
+        from hiveweave.services.vision import messages_without_images
+
         await self._conversation.append_turn(
-            self.id, self.project_id, turn_messages
+            self.id, self.project_id, messages_without_images(turn_messages)
         )
 
         # 3. Turn exit gates — validate only; scheduler decides continue/park
@@ -1790,6 +1875,24 @@ class Agent:
                     contracts_waived=waived,
                     senders=[m.get("from_name", "?") for m in unreplied_asks[:5]],
                 )
+                senders = [
+                    m.get("from_name") or m.get("from_agent_id", "?")[:12]
+                    for m in unreplied_asks[:5]
+                ]
+                await self._persist_gate_notice(
+                    "REPLY CONTRACT ESCAPE VALVE",
+                    (
+                        f"连续 {effective_streak} 次被 UNREPLIED_ASKS 阻塞后，"
+                        f"平台已强制关闭 {waived} 个 reply contract / "
+                        f"{len(force_ids)} 条消息。"
+                        f"发件人: {', '.join(senders) or '(none)'}。"
+                    ),
+                    footer=(
+                        "这不是你成功回复了——是平台防止死锁的降级。"
+                        "下次收到 ask/expect_report 请用 send_message/ask_agent "
+                        "正确指向发件人后再 commit_turn。"
+                    ),
+                )
                 unreplied_asks = []
                 self._unreplied_asks_streak = 0
         else:
@@ -1872,6 +1975,17 @@ class Agent:
                 self.disposition = exit_decision.disposition or "runnable"
                 if open_obligations:
                     self.disposition = "runnable"
+                # Persist WHY for next wake (no auto-retrigger)
+                await self._persist_gate_notice(
+                    "TURN EXIT PARKED",
+                    exit_decision.hint
+                    or f"gates={exit_decision.violations}",
+                    footer=(
+                        "系统已按真实账本停泊，本轮不再自动续跑。"
+                        "下一外部事件到来时请按上述 GATE 推进，"
+                        "或用 phase=waiting/blocked/in_progress 正确声明状态。"
+                    ),
+                )
                 log.warning(
                     "turn_exit_parked",
                     agent_id=self.id,
@@ -1939,6 +2053,16 @@ class Agent:
                 self._turn_gate_count = 0
                 self._reply_reminder_count = 0
                 self.disposition = "blocked"
+                await self._persist_gate_notice(
+                    "TURN EXIT BLOCKED — GATE EXHAUSTED",
+                    exit_decision.hint
+                    or f"gates={exit_decision.violations}",
+                    footer=(
+                        "修复次数已用尽，disposition=blocked。"
+                        "上级可能已收到升级。下次唤醒时请先处理上述 GATE，"
+                        "再 commit_turn。"
+                    ),
+                )
                 log.warning(
                     "turn_exit_gate_exhausted",
                     agent_id=self.id,
@@ -2447,6 +2571,40 @@ class Agent:
             f"{hint}\n\n"
             f"[INBOX] 处理上述事项之前，先查看以下未读消息：\n{summary}"
         )
+
+    async def _persist_gate_notice(
+        self,
+        title: str,
+        body: str,
+        *,
+        footer: str = "",
+    ) -> None:
+        """Write a gate/park/escape notice into conversation for the next wake.
+
+        Does **not** re-enter chat (no auto LLM). Persists via append_turn so
+        the reason survives process restart and appears once in history.
+        """
+        parts = [f"[{title}]", (body or "").strip()]
+        if footer:
+            parts.append(footer.strip())
+        notice = "\n".join(p for p in parts if p)
+        if not notice.strip():
+            return
+        try:
+            await self._conversation.append_turn(
+                self.id,
+                self.project_id,
+                [{"role": "user", "content": notice}],
+            )
+        except Exception as e:
+            # Fallback: ephemeral inject on next build if persist failed
+            self._pending_resume_hint = notice
+            log.warning(
+                "persist_gate_notice_failed",
+                agent_id=self.id,
+                title=title,
+                error=str(e),
+            )
 
     async def _retrigger_for_turn_gate(
         self, hint: str, *, inbox_msg_ids: list[str] | None = None
@@ -4238,4 +4396,6 @@ class Agent:
             "success": result.get("success", False),
             "duplicate": result.get("duplicate", False),
             "end_turn": bool(result.get("end_turn")),
+            # Multimodal screenshot pixels (browse / assert_visual)
+            "images": result.get("images"),
         }

@@ -94,7 +94,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 - **Doom-loop 防护**：同一工具连续重复调用触发熔断。只读轮询工具豁免 —— `DOOM_LOOP_READONLY_TOOLS`（17 个：get_tasks/read_file/list_subordinates 等）走 `DOOM_LOOP_READONLY_FUSE=15` 保险丝而非默认 3 次；唯一入口 `doom_loop_limit(tool_name)`，容忍度表 `DOOM_LOOP_TOOL_LIMITS`
 - 全局 LLM 并发上限 `_LLM_MAX_CONCURRENT`（env `HIVEWEAVE_LLM_MAX_CONCURRENT`，默认 8）；`TOTAL_TIMEOUT_S=540`（env `HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S`；给 agent safety_timeout 600s 留 60s 余量）
 - **连续流式总超时**：同 agent `_stream_timeout_streak ≥ 2` → `_park_after_stream_timeouts`（disposition waiting + wait `stream_total_timeout_recovery` + 升级上级，不自动 approve）
-- **Ark 双通道模型池**（`services/model.py`）：火山引擎 Ark Plan/Coding 双 key（`HIVEWEAVE_ARK_API_KEY` / `HIVEWEAVE_ARK_CODING_API_KEY`），`ensure_channel_models` 按名 upsert 双渠道（同 key 跳过 Coding）；`pick_from_pool` 进程内 round-robin 分摊限流（单进程假设，重启从头计数）；`is_rate_limit_error` 命中的 429 不计入放弃、独立冷却 `RATE_LIMIT_RESUME_COOLDOWN_S=120` 后 resume（`agents/agent.py`）
+- **模型分级 + 同级故障切换**（`services/model.py` + `services/policy.py`）：两级 tier — `management`（CEO/Coordinator，好模型）/ `executor`（Executor/QA/HR，便宜模型）。每级两槽位：primary + backup，`global_settings` 四键配置（`model_tier_{management|executor}_{primary|backup}`，值存 model_id 或 UUID）。`resolve_model(tier, skip_model_ids)` 严格按 primary→backup→tier列→legacy pool 解析，**禁跨级**。`model_tier_for_agent(agent)` 由 `infer_role_family` 映射。首次 429/5xx 同 turn 自动切同级 backup（`_resolve_failover_backup`，同 api_key 跳过）；streamer circuit fallback 校验 tier 一致性。`pick_from_pool` 全池 RR 已降级为无 tier 配置时的兼容回退。`ensure_channel_models` 仍按名 upsert Ark Plan/Coding 双渠道；`is_rate_limit_error` 命中的 429 不计入放弃、独立冷却 `RATE_LIMIT_RESUME_COOLDOWN_S=120` 后 resume（`agents/agent.py`）
 
 ### 对话管理
 
@@ -307,7 +307,8 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 - **结构化字段写死意图**：`expect_report` / `message_type=ask`（要回复）、工具名、账本 status、平台协议前缀（仅代码发出的英文常量如 `[TASK SUBMITTED]`）
 - **未回复检测（简单）**：A 发 B 且 `expect_report=1` → 查 B 是否有回信指向 A（花名/ID）；turn exit `UNREPLIED_ASKS` 提醒。**不**扫自然语言
 - 需要对方回复 → `ask_agent` 或 `expect_report=true`；FYI → `notify_agent`
-- **不做**平台侧消息分类/优先级；**不做**提交 attestation 硬闸（证据由领导 review 判定）；**不做**周期性 stall/unreplied 催办（推进靠 `agent.turn.after` task-advance hook）
+- **不做**平台侧消息分类/优先级；**不做**提交方 attestation 硬闸（提交方证据充分性由审查方判定，平台不替代审查方做"够不够"的裁决）；**不做**周期性 stall/unreplied 催办（推进靠 `agent.turn.after` task-advance hook）
+- **做**审查方执行证据硬闸（P0-2）：approve 代码类任务时，审查方本人必须持有本任务的新鲜 `test_run` attestation（至少跑过测试），否则拒绝 approve。这与"提交方硬闸"是两条不同的线——前者保证执行下限（审查方不能 12 秒空批），后者维持不做（证据够不够仍是审查方的判断权）
 
 入口：`reply_policy.resolve_expect_report`、`turn_exit.collect_unreplied_asks`。
 
@@ -339,7 +340,8 @@ React 19 + Zustand (`store.ts`)。React Flow 渲染组织架构图。关键面�
 - `HIVEWEAVE_EXTERNAL_SKILLS_DIR` — 外部技能目录 (SKILL.md 格式)
 - `HIVEWEAVE_ARK_API_KEY` / `HIVEWEAVE_ARK_BASE_URL` / `HIVEWEAVE_ARK_MODEL_ID` — 火山引擎 Ark 主通道（Plan）
 - `HIVEWEAVE_ARK_CODING_API_KEY` / `HIVEWEAVE_ARK_CODING_BASE_URL` / `HIVEWEAVE_ARK_CODING_MODEL_ID` — Ark Coding 第二通道（模型池轮询分摊限流；与主 key 相同则跳过）
-- `HIVEWEAVE_MODEL_POOL_ENABLED` — 模型池开关
+- `HIVEWEAVE_MODEL_POOL_ENABLED` — 模型池开关（tier 配置就绪后自动降级为兼容回退）
+- **global_settings 模型分级键**（DB 级，Settings API 或 UI 配置）：`model_tier_management_primary` / `model_tier_management_backup` / `model_tier_executor_primary` / `model_tier_executor_backup` — 值存 `llm_models.id` 或 `model_id`；未配置时回退到旧 `default_coordinator_model` / `default_executor_model`
 - 其他 provider keys: `HIVEWEAVE_OPENAI_API_KEY`, `HIVEWEAVE_ANTHROPIC_API_KEY` 等
 
 ### 网络代理

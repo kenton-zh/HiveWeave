@@ -90,6 +90,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
   const processingAgents = useAppStore((s) => s.processingAgents);
   const orgTreeVersion = useAppStore((s) => s.orgTreeVersion);
+  const agentActiveModel = useAppStore((s) => s.agentActiveModel);
 
   // Fetch agent details
   const fetchAgent = useCallback(async () => {
@@ -408,6 +409,23 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                     const m = models.find((x) => x.id === agent.modelId);
                     return m ? `上下文 ${m.contextWindow.toLocaleString()} tokens · 最大输出 ${m.maxOutputTokens.toLocaleString()} tokens${m.supportsThinking ? " · 支持思考" : ""}` : "";
                   })()}
+                </div>
+              )}
+              {/* Live model indicator — reflects actual model in use (updates on turn start / failover) */}
+              {agentActiveModel[agentId] && (
+                <div className={`mt-2 px-2.5 py-1.5 rounded-md text-[11px] flex items-center gap-1.5 ${
+                  agentActiveModel[agentId].source === "failover"
+                    ? "bg-amber-500/10 text-amber-600 border border-amber-500/20"
+                    : "bg-g-blue/5 text-g-fg-3 border border-g-border/50"
+                }`}>
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                    agentActiveModel[agentId].source === "failover" ? "bg-amber-500 animate-pulse" : "bg-green-500"
+                  }`} />
+                  {agentActiveModel[agentId].source === "failover" ? (
+                    <span>故障切换: {agentActiveModel[agentId].failedModel} → <b>{agentActiveModel[agentId].modelName}</b></span>
+                  ) : (
+                    <span>当前使用: <b>{agentActiveModel[agentId].modelName}</b></span>
+                  )}
                 </div>
               )}
             </div>

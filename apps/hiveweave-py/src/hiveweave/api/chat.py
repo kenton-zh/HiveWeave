@@ -421,23 +421,40 @@ async def reset_processing(agent_id: str) -> dict:
 
 @router.get("/resolved-model/{agent_id}")
 async def resolved_model(agent_id: str) -> dict:
-    """查 agent 解析后的实际模型。"""
+    """查 agent 解析后的实际模型（与运行时 _get_model_config 同逻辑）。"""
     validate_id(agent_id, "agent_id")
     config = await meta_db.get_agent_by_id(agent_id)
     if config is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+
     model_id = config.get("model_id")
-    if not model_id:
-        return {"agentId": agent_id, "modelName": None, "modelId": None, "source": "none"}
-    model = await _model.get(model_id)
-    if model is None:
-        return {"agentId": agent_id, "modelName": None, "modelId": model_id, "source": "none"}
-    return {
-        "agentId": agent_id,
-        "modelName": model.get("name"),
-        "modelId": model.get("model_id"),
-        "source": "auto",
-    }
+
+    # 显式配置了模型 → 直接查
+    if model_id:
+        model = await _model.get(model_id)
+        if model is None:
+            return {"agentId": agent_id, "modelName": None, "modelId": model_id, "source": "explicit_missing"}
+        return {
+            "agentId": agent_id,
+            "modelName": model.get("name"),
+            "modelId": model.get("model_id"),
+            "source": "explicit",
+        }
+
+    # 无显式配置 → 走 tier 解析（与 agent._get_model_config 一致）
+    from hiveweave.services.policy import model_tier_for_agent
+
+    tier = model_tier_for_agent(config)
+    resolved = await _model.resolve_model(tier=tier)
+    if resolved:
+        return {
+            "agentId": agent_id,
+            "modelName": resolved.get("name"),
+            "modelId": resolved.get("model_id"),
+            "source": f"tier_{tier}",
+        }
+
+    return {"agentId": agent_id, "modelName": None, "modelId": None, "source": "none"}
 
 
 @router.get("/messages/{agent_id}")

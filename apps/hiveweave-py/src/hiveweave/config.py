@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     # 默认为空 — 需通过环境变量 HIVEWEAVE_EXTERNAL_SKILLS_DIR 指定
     external_skills_dir: str = ""
 
+    # SkillHub 国内技能商店 (https://skillhub.cn)
+    # 当国外商店 (skills.sh) 不可达时自动路由到 SkillHub 搜索。
+    # HIVEWEAVE_SKILLHUB_ENABLED=false 可关闭此降级路径。
+    skillhub_enabled: bool = True
+    # SkillHub 搜索 API（默认 lightmake.site）
+    skillhub_search_url: str = "https://lightmake.site/api/v1/search"
+
     # gstack browse CLI binary (optional). Empty = auto-detect common install paths.
     # Example Windows: C:\Users\...\ .claude\skills\gstack\browse\dist\browse.exe
     browse_bin: str = ""

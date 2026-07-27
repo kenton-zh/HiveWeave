@@ -586,6 +586,13 @@ export function subscribeAgentStatus(
     }
   });
 
+  // Live model resolution events — routed to onActivity for store interception
+  channel.on("model_resolved", (payload: Record<string, unknown>) => {
+    if (onActivity && typeof payload.agentId === "string") {
+      onActivity(payload as any);
+    }
+  });
+
   channel.join().receive("ok", () => {
     // Initial snapshot is pushed via "init" event
   }).receive("error", () => {
@@ -820,6 +827,7 @@ export interface LlmModel {
   defaultReasoningEffort?: string | null;
   temperature?: string | null;
   isActive: boolean;
+  tier?: string | null; // "management" | "executor" | null
 }
 
 export async function getModels(): Promise<LlmModel[]> {
@@ -850,6 +858,74 @@ export async function deleteModel(id: string) {
 
 export async function testModel(id: string) {
   return fetchJSON(`${BASE}/llm-models/${id}/test`, { method: "POST" });
+}
+
+export interface DetectedCapabilities {
+  contextWindow: number | null;
+  supportsThinking: boolean | null;
+  maxOutputTokens: number | null;
+  source: string;
+}
+
+/** Probe a model's capabilities from connection info only (no save, no real chat). */
+export async function detectCapabilities(payload: {
+  baseUrl: string;
+  apiKey?: string;
+  modelId: string;
+}): Promise<DetectedCapabilities> {
+  return fetchJSON(`${BASE}/llm-models/detect-capabilities`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Model Tier Configuration (management / executor primary+backup)
+// ---------------------------------------------------------------------------
+
+export type ModelTier = "management" | "executor";
+
+export interface TierConfig {
+  managementPrimary: string | null;
+  managementBackup: string | null;
+  executorPrimary: string | null;
+  executorBackup: string | null;
+}
+
+const TIER_KEYS = {
+  managementPrimary: "model_tier_management_primary",
+  managementBackup: "model_tier_management_backup",
+  executorPrimary: "model_tier_executor_primary",
+  executorBackup: "model_tier_executor_backup",
+} as const;
+
+/** Read the four tier-config keys from global settings. */
+export async function getTierConfig(): Promise<TierConfig> {
+  const data = await getSettings();
+  const list: Array<{ key: string; value: string }> = Array.isArray(data)
+    ? data
+    : (data?.settings ?? []);
+  const map: Record<string, string> = {};
+  for (const item of list) {
+    if (item && typeof item.key === "string") map[item.key] = item.value;
+  }
+  return {
+    managementPrimary: map[TIER_KEYS.managementPrimary] || null,
+    managementBackup: map[TIER_KEYS.managementBackup] || null,
+    executorPrimary: map[TIER_KEYS.executorPrimary] || null,
+    executorBackup: map[TIER_KEYS.executorBackup] || null,
+  };
+}
+
+/** Write the four tier-config keys. Empty string clears a slot. */
+export async function saveTierConfig(config: TierConfig): Promise<void> {
+  await updateSettings({
+    [TIER_KEYS.managementPrimary]: config.managementPrimary || "",
+    [TIER_KEYS.managementBackup]: config.managementBackup || "",
+    [TIER_KEYS.executorPrimary]: config.executorPrimary || "",
+    [TIER_KEYS.executorBackup]: config.executorBackup || "",
+  });
 }
 
 // ---------------------------------------------------------------------------

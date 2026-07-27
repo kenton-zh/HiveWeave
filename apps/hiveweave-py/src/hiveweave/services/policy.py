@@ -117,6 +117,7 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "bash": frozenset({Capability.BASH_SHELL}),
     "run_command": frozenset({Capability.BASH_SHELL}),
     "browse": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
+    "assert_visual": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     # DOC_WRITE agents (CEO) may edit docs; SOURCE_WRITE covers all paths
     "edit_file": frozenset({Capability.SOURCE_WRITE, Capability.DOC_WRITE}),
     "apply_patch": frozenset({Capability.SOURCE_WRITE}),
@@ -225,6 +226,25 @@ def infer_role_family(agent: dict[str, Any]) -> RoleFamily:
         return "ceo"
     if perm == "coordinator" or role_l == "coordinator":
         return "coordinator"
+    return "executor"
+
+
+# ── Model tier mapping ─────────────────────────────────────
+
+ModelTier = str  # "management" | "executor"
+
+_MANAGEMENT_FAMILIES = frozenset({"ceo", "coordinator"})
+
+
+def model_tier_for_agent(agent: dict[str, Any]) -> ModelTier:
+    """Map agent to model tier: management (good models) or executor (cheap).
+
+    management: CEO + Coordinator — 决策层用质量更好的模型
+    executor: Executor + QA + HR — 执行层用性价比更高的模型
+    """
+    family = infer_role_family(agent)
+    if family in _MANAGEMENT_FAMILIES:
+        return "management"
     return "executor"
 
 

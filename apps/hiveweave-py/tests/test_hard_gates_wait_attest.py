@@ -51,20 +51,42 @@ def test_resolve_task_policy():
 
 
 def test_required_kinds():
-    assert required_attestation_kinds("ui_browser_e2e") is None
+    assert required_attestation_kinds("ui_browser_e2e") == frozenset(
+        {"visual_check", "browse_e2e"}
+    )
     assert required_attestation_kinds("generic_tests") is None
     assert required_attestation_kinds("docs_only") == frozenset({"doc_review"})
     assert required_attestation_kinds("coordinator_review") is None
 
 
 @pytest.mark.asyncio
-async def test_check_task_never_rejects_bare_tests_passed():
-    """Soft policies still pass without attestation ids."""
+async def test_check_task_ui_requires_visual_check():
+    """UI policy hard-requires visual_check — bare tests_passed is not enough."""
     task = {
         "id": "t1",
         "title": "UI button",
         "tags": ["ui"],
         "policy_id": "ui_browser_e2e",
+        "evidence": {"tests_passed": True},
+    }
+    with patch(
+        "hiveweave.services.attestation.has_valid_waiver",
+        new_callable=AsyncMock,
+        return_value=False,
+    ):
+        err = await check_task_attestations("p1", task, None)
+    assert err is not None
+    assert "visual_check" in err or "attestation" in err.lower()
+
+
+@pytest.mark.asyncio
+async def test_check_task_soft_policy_allows_bare_tests_passed():
+    """Non-UI soft policies still pass without attestation ids."""
+    task = {
+        "id": "t1",
+        "title": "API work",
+        "tags": ["backend"],
+        "policy_id": "coordinator_review",
         "evidence": {"tests_passed": True},
     }
     err = await check_task_attestations("p1", task, None)

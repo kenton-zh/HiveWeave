@@ -296,32 +296,41 @@ async def _seed_default_agents(project_id: str) -> list[str]:
     existing = await org.list_agents(project_id)
     log.info("seed_existing_agents", project_id=project_id, count=len(existing))
 
-    # 获取默认模型 ID — 与 org_tools.hire_agent 保持一致:
-    # 1. 优先读 global_settings.default_coordinator_model (管理员显式配置)
-    # 2. 回退:选最新添加的 active 模型 (不再硬编码 step- 前缀偏好)
-    default_model_id = None
-    try:
-        from hiveweave.services.settings import SettingsService
-        configured = await SettingsService().get("default_coordinator_model")
-        if configured:
-            default_model_id = configured
-            log.info("seed_default_model_from_setting", default_model_id=default_model_id)
-    except Exception as e:
-        log.warning("seed_default_model_setting_read_failed", error=str(e))
+    # 获取默认模型 ID — 按 tier 主备解析:
+    # CEO → management tier; HR → executor tier
+    # 回退: 选最新添加的 active 模型
+    from hiveweave.services.model import ModelService
+    ms = ModelService()
 
-    if not default_model_id:
+    mgmt_model_id = None
+    exec_model_id = None
+    try:
+        mgmt = await ms.resolve_model(tier="management")
+        if mgmt:
+            mgmt_model_id = mgmt.get("model_id") or mgmt.get("id")
+            log.info("seed_model_tier_resolved", tier="management", model_id=mgmt_model_id)
+        exec_m = await ms.resolve_model(tier="executor")
+        if exec_m:
+            exec_model_id = exec_m.get("model_id") or exec_m.get("id")
+            log.info("seed_model_tier_resolved", tier="executor", model_id=exec_model_id)
+    except Exception as e:
+        log.warning("seed_tier_resolve_failed", error=str(e))
+
+    # Fallback: pick latest active model for any unresolved tier
+    if not mgmt_model_id or not exec_model_id:
         try:
-            from hiveweave.services.model import ModelService
-            ms = ModelService()
             active_models = await ms.list_active()
             if active_models:
-                chosen = active_models[-1]
-                default_model_id = chosen.get("model_id") or chosen.get("id")
-                log.info("seed_default_model_fallback", default_model_id=default_model_id, total_models=len(active_models))
+                fallback_id = (active_models[-1].get("model_id") or active_models[-1].get("id"))
+                mgmt_model_id = mgmt_model_id or fallback_id
+                exec_model_id = exec_model_id or fallback_id
+                log.info("seed_default_model_fallback", default_model_id=fallback_id, total_models=len(active_models))
             else:
                 log.warning("seed_no_active_models")
         except Exception as e:
             log.warning("seed_default_model_failed", error=str(e))
+
+    default_model_id = mgmt_model_id  # backward compat variable
 
     # 如果已有 agent，更新它们的 model_id（可能来自旧项目残留）
     if any(a.get("role") == "ceo" for a in existing):
@@ -368,7 +377,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "permission_type": "coordinator",
                 "status": "active",
                 "parent_id": ceo_id,
-                "model_id": default_model_id,
+                "model_id": exec_model_id,
                 "skills": ["interview-me", "documentation-and-adrs"],
             },
             bootstrap=True,

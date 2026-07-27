@@ -66,7 +66,11 @@ async def _validate_span(
         target = await org_service.get_agent(to_agent_id)
     except Exception as e:
         log.warning("org_span_lookup_failed", error=str(e))
-        return None  # fail-open on infra errors — do not brick messaging
+        # Fail-closed with reason so the model knows WHY (not silent allow).
+        return (
+            f"拒绝{action}：组织查询失败，无法校验指挥链（{e}）。"
+            "请稍后重试；不要假设跨级已放行。"
+        )
 
     if not target or target.get("status") == "archived":
         return f"拒绝{action}：目标不存在或已归档"
@@ -124,9 +128,15 @@ async def validate_executor_assignee(
         agent = await org_service.get_agent(to_agent_id)
     except Exception as e:
         log.warning("executor_assignee_lookup_failed", error=str(e))
-        return None
+        return (
+            f"拒绝派活：组织查询失败，无法校验 assignee 写码能力（{e}）。"
+            "请稍后重试。"
+        )
     if not agent:
-        return None
+        return (
+            f"拒绝派活：assignee `{to_agent_id[:12]}` 不存在或无法加载，"
+            "请用 list_subordinates / view_org_chart 确认目标后再派。"
+        )
     name = agent.get("name") or to_agent_id[:8]
     family = infer_role_family(agent)
     if family == "ceo":
@@ -162,13 +172,21 @@ async def validate_ceo_dispatch_target(
         target = await org_service.get_agent(to_agent_id)
     except Exception as e:
         log.warning("ceo_dispatch_lookup_failed", error=str(e))
-        return None
-    if not sender or not target:
-        return None
+        return (
+            f"拒绝派活：组织查询失败，无法校验 CEO 派工目标（{e}）。"
+            "请稍后重试。"
+        )
+    if not sender:
+        return None  # cannot classify sender → skip CEO-only gate
     if infer_role_family(sender) != "ceo":
         return None
     if from_agent_id == to_agent_id:
         return None
+    if not target:
+        return (
+            f"拒绝派活：目标 `{to_agent_id[:12]}` 不存在或无法加载，"
+            "请用 view_org_chart 确认直属中层后再派。"
+        )
     if infer_role_family(target) != "coordinator":
         tname = target.get("name") or to_agent_id[:8]
         return (
