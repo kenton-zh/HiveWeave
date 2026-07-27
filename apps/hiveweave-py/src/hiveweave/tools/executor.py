@@ -140,6 +140,30 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["screenshotPath", "observed", "verdict"],
     },
+    "look_at_image": {
+        "description": (
+            "帮你看图片 — Ask the configured multimodal model to analyze an image. "
+            "Pass image_path (under workspace) + prompt (focus / output format). "
+            "Stateless one-shot: waits for the full answer (non-streaming), returns "
+            "text only. Does not inject pixels into chat history. Configure the "
+            "model in Settings → 多模态模型配置."
+        ),
+        "properties": {
+            "image_path": {
+                "type": "string",
+                "aliases": ["path", "file", "screenshot", "image"],
+                "description": "Image path relative to workspace or absolute under it.",
+            },
+            "prompt": {
+                "type": "string",
+                "aliases": ["question", "query", "instruction"],
+                "description": (
+                    "What the vision model should look for and how to answer."
+                ),
+            },
+        },
+        "required": ["image_path", "prompt"],
+    },
     "run_command": {
         "description": "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command.",
         "properties": {
