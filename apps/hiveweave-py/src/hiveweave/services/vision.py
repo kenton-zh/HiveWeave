@@ -310,6 +310,9 @@ async def analyze_image(
     cfg = dict(model_config)
     cfg["supports_thinking"] = False
     cfg["default_reasoning_effort"] = None
+    # vision 槽位语义即多模态：强制放行图像注入，防止模型行 supports_images=0
+    # （出厂默认值）把图片静默剥掉，导致 look_at_image 只发文字提示词。
+    cfg["supports_images"] = True
 
     provider = provider_factory.create(cfg)
     body = provider.build_body(

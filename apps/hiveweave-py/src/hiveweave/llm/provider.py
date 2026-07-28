@@ -106,6 +106,7 @@ class FormatHandler(ABC):
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
         supports_prompt_cache: bool = False,
+        supports_images: bool = True,
     ) -> dict[str, Any]:
         """Build the provider-native request body.
 
@@ -153,6 +154,18 @@ class FormatHandler(ABC):
         return build_timeout()
 
 
+# supports_images=False（text-only 模型）时替换图像注入的说明文案。
+# 背景（TEST_YLGY 潮汐事故）：截图无条件注入主对话模型，模型只支持文本时
+# 网关 400「Model only support text input」→ 连续 LLM 错误 → agent 死亡螺旋。
+# 改为文字指引：截图没注入、文件路径去哪找、视觉判断走 look_at_image。
+_IMAGES_OMITTED_NOTE = (
+    "[平台提示] 本回合有 {n} 张截图未注入：当前对话模型不支持图像输入"
+    "（模型配置 supports_images=false）。截图文件路径见相关工具结果文本；"
+    "如需视觉判断请改用 look_at_image 工具（需先在 Settings 配置 vision 模型），"
+    "在未实际看到图像前不得声称视觉验证通过。"
+)
+
+
 # ── OpenAI Chat Handler ────────────────────────────────────────
 
 
@@ -187,12 +200,16 @@ class OpenAIHandler(FormatHandler):
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
         supports_prompt_cache: bool = False,
+        supports_images: bool = True,
     ) -> dict[str, Any]:
         # OpenAI 用隐式 prefix caching，不接受 inline cache_control markers。
         # supports_prompt_cache 参数在此为 no-op，仅为统一接口签名。
         # Expand internal ``images`` payloads into multimodal content parts —
         # tool role cannot carry images on OpenAI, so we append a user turn.
-        normalized = self._normalize_messages_with_images(messages)
+        # supports_images=False 时改为文字占位（见 _IMAGES_OMITTED_NOTE）。
+        normalized = self._normalize_messages_with_images(
+            messages, supports_images=supports_images
+        )
         body: dict[str, Any] = {
             "model": model_id,
             "messages": normalized,
@@ -286,7 +303,9 @@ class OpenAIHandler(FormatHandler):
         return chunks
 
     @staticmethod
-    def _normalize_messages_with_images(messages: list[dict]) -> list[dict]:
+    def _normalize_messages_with_images(
+        messages: list[dict], *, supports_images: bool = True
+    ) -> list[dict]:
         """Convert HiveWeave ``images`` fields into OpenAI multimodal parts.
 
         - user + images → content array (text + image_url)
@@ -294,6 +313,8 @@ class OpenAIHandler(FormatHandler):
           **one** trailing user turn with all collected images is appended
           after the block (never interrupt ``assistant → tool → tool`` pairing —
           inserting user mid-block causes Ark/OpenAI 400s).
+        - ``supports_images=False``（text-only 模型）：剥离全部图像，
+          改写为 _IMAGES_OMITTED_NOTE 文字指引，避免网关 400 死亡螺旋。
         """
         from hiveweave.services.vision import openai_image_parts
 
@@ -302,6 +323,14 @@ class OpenAIHandler(FormatHandler):
 
         def _flush_tool_images() -> None:
             if not pending_images:
+                return
+            if not supports_images:
+                dropped = len(pending_images)
+                pending_images.clear()
+                out.append({
+                    "role": "user",
+                    "content": _IMAGES_OMITTED_NOTE.format(n=dropped),
+                })
                 return
             img_parts = openai_image_parts(pending_images)
             pending_images.clear()
@@ -348,6 +377,16 @@ class OpenAIHandler(FormatHandler):
                     out.append(cleaned)
                 else:
                     out.append(msg)
+                continue
+
+            if role == "user" and not supports_images:
+                # text-only 模型：剥图留文 + 指引（非 user 角色走下方静默剥图）。
+                cleaned = {k: v for k, v in msg.items() if k != "images"}
+                note = _IMAGES_OMITTED_NOTE.format(n=len(images))
+                text = msg.get("content") or ""
+                if isinstance(text, str):
+                    cleaned["content"] = (text + "\n\n" + note) if text else note
+                out.append(cleaned)
                 continue
 
             img_parts = openai_image_parts(
@@ -446,6 +485,7 @@ class AnthropicHandler(FormatHandler):
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
         supports_prompt_cache: bool = False,
+        supports_images: bool = True,
     ) -> dict[str, Any]:
         """Build Anthropic-format request body.
 
@@ -475,7 +515,7 @@ class AnthropicHandler(FormatHandler):
             if role == "system":
                 system_blocks.append({"type": "text", "text": str(content)})
             elif role == "user":
-                blocks = self._user_content_blocks(msg)
+                blocks = self._user_content_blocks(msg, supports_images=supports_images)
                 anthropic_messages.append({"role": "user", "content": blocks})
             elif role == "assistant":
                 blocks = self._assistant_content_blocks(msg)
@@ -488,11 +528,16 @@ class AnthropicHandler(FormatHandler):
                 tool_call_id = msg.get("tool_call_id", "")
                 result_content = str(content)
                 images = msg.get("images") or []
-                from hiveweave.services.vision import anthropic_image_blocks
+                img_blocks: list[dict] = []
+                if supports_images:
+                    from hiveweave.services.vision import anthropic_image_blocks
 
-                img_blocks = anthropic_image_blocks(
-                    images if isinstance(images, list) else []
-                )
+                    img_blocks = anthropic_image_blocks(
+                        images if isinstance(images, list) else []
+                    )
+                elif images:
+                    # text-only 模型：剥图，tool_result 文本中补指引。
+                    result_content += "\n\n" + _IMAGES_OMITTED_NOTE.format(n=len(images))
                 if img_blocks:
                     tool_content: str | list = [
                         {"type": "text", "text": result_content},
@@ -543,13 +588,21 @@ class AnthropicHandler(FormatHandler):
 
         return body
 
-    def _user_content_blocks(self, msg: dict) -> list[dict]:
+    def _user_content_blocks(
+        self, msg: dict, *, supports_images: bool = True
+    ) -> list[dict]:
         """Build Anthropic content blocks for a user message."""
         content = msg.get("content", "")
         blocks: list[dict] = []
 
-        # Images (if present)
-        images = msg.get("images") or []
+        # Images (if present; text-only 模型剥图并补文字指引)
+        raw_images = msg.get("images") or []
+        images = raw_images if supports_images else []
+        if raw_images and not supports_images:
+            blocks.append({
+                "type": "text",
+                "text": _IMAGES_OMITTED_NOTE.format(n=len(raw_images)),
+            })
         for img in images:
             if isinstance(img, dict):
                 blocks.append({
@@ -876,6 +929,7 @@ class GoogleHandler(FormatHandler):
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
         supports_prompt_cache: bool = False,
+        supports_images: bool = True,
     ) -> dict[str, Any]:
         """Build Google Gemini-format request body.
 
@@ -895,7 +949,7 @@ class GoogleHandler(FormatHandler):
                     "parts": [{"text": str(content)}],
                 }
             elif role == "user":
-                parts = self._user_parts(msg)
+                parts = self._user_parts(msg, supports_images=supports_images)
                 contents.append({"role": "user", "parts": parts})
             elif role == "assistant":
                 parts = self._model_parts(msg)
@@ -906,16 +960,20 @@ class GoogleHandler(FormatHandler):
                 tool_name = "unknown"
                 from hiveweave.services.vision import gemini_image_parts
 
-                parts: list[dict] = [{
+                parts = [{
                     "functionResponse": {
                         "name": tool_name,
                         "response": {"content": str(content)},
                     },
                 }]
                 images = msg.get("images") or []
-                parts.extend(
-                    gemini_image_parts(images if isinstance(images, list) else [])
-                )
+                if supports_images:
+                    parts.extend(
+                        gemini_image_parts(images if isinstance(images, list) else [])
+                    )
+                elif images:
+                    # text-only 模型：剥图，补文字指引。
+                    parts.append({"text": _IMAGES_OMITTED_NOTE.format(n=len(images))})
                 contents.append({
                     "role": "user",
                     "parts": parts,
@@ -944,13 +1002,18 @@ class GoogleHandler(FormatHandler):
 
         return body
 
-    def _user_parts(self, msg: dict) -> list[dict]:
+    def _user_parts(
+        self, msg: dict, *, supports_images: bool = True
+    ) -> list[dict]:
         """Build Gemini parts for a user message."""
         content = msg.get("content", "")
         parts: list[dict] = []
 
-        # Images
-        images = msg.get("images") or []
+        # Images（text-only 模型剥图并补文字指引）
+        raw_images = msg.get("images") or []
+        images = raw_images if supports_images else []
+        if raw_images and not supports_images:
+            parts.append({"text": _IMAGES_OMITTED_NOTE.format(n=len(raw_images))})
         for img in images:
             if isinstance(img, dict):
                 parts.append({
@@ -1152,6 +1215,7 @@ class ProviderConfig:
         handler: FormatHandler | None = None,
         extra_headers: dict[str, str] | None = None,
         supports_prompt_cache: bool = False,
+        supports_images: bool = True,
     ) -> None:
         self.api_format = api_format
         self.base_url = base_url.rstrip("/")
@@ -1181,6 +1245,9 @@ class ProviderConfig:
         # Prompt cache 支持：仅 Anthropic 格式有效（OpenAI/Gemini 用隐式缓存）
         # 参考 opencode RESPECTS_INLINE_HINTS = {"anthropic-messages", "bedrock-converse"}
         self.supports_prompt_cache = supports_prompt_cache and api_format == ApiFormat.ANTHROPIC
+        # text-only 模型（supports_images=False）→ 请求构建时剥离截图注入，
+        # 避免网关 400「Model only support text input」死亡螺旋。
+        self.supports_images = supports_images
 
     @property
     def provider_type(self) -> str:
@@ -1229,6 +1296,7 @@ class ProviderConfig:
             supports_thinking=self.supports_thinking,
             reasoning_effort=self.reasoning_effort,
             supports_prompt_cache=self.supports_prompt_cache,
+            supports_images=self.supports_images,
         )
 
     def parse_stream_chunk(self, raw_json: dict) -> list[dict]:
@@ -1310,6 +1378,9 @@ class ProviderFactory:
             temperature=float(model_config.get("temperature") or 0.7),
             fallback=model_config.get("fallback"),
             supports_prompt_cache=supports_cache,
+            # DB 缺列/NULL → 保守按 text-only 处理（不注入图像）；
+            # 视觉模型需在 Settings 显式勾选 supports_images。
+            supports_images=bool(model_config.get("supports_images") or False),
         )
 
     def _detect_format(self, model_config: dict) -> ApiFormat:
