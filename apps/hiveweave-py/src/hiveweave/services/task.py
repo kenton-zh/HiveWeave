@@ -1538,6 +1538,32 @@ class TaskService:
                         task_id=str(task.get("id") or ""),
                         error=str(anc_err),
                     )
+            # P0-1 variant safety net (audit 2026-07-28): merge landed in git
+            # but the merge obligation was not cleared (merge via merge_proxy /
+            # service-direct / fulfill failed silently). The merge tool's
+            # fulfill (misc_tools.py) is the primary path; this is the backstop
+            # so a closed task can never leave a pending merge obligation that
+            # keeps escalating (CEO had to cancel_task to clear 81b43baa).
+            if tid:
+                try:
+                    from hiveweave.services.obligation import ObligationLedger
+
+                    fulfilled = await ObligationLedger().fulfill(
+                        project_id, tid, "merge"
+                    )
+                    if fulfilled:
+                        log.info(
+                            "task.close_merge_obligation_cleared",
+                            task_id=tid,
+                            count=fulfilled,
+                            source="close_safety_net",
+                        )
+                except Exception as ob_err:
+                    log.warning(
+                        "task.close_merge_obligation_clear_failed",
+                        task_id=tid,
+                        error=str(ob_err),
+                    )
             return
 
         assignee = task.get("assignee_id")
