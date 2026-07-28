@@ -584,15 +584,21 @@ async def find_reviewer_attestation(
         return False
     now_ms = int(time.time() * 1000)
     try:
-        rows = await db.execute_fetchall(
+        # aiosqlite.Row (sqlite3.Row) has no .get() — use cursor + dict.
+        # Bug: row.get("kind") crashed → except swallowed → always returned
+        # False → P0-2 reviewer gate blocked ALL code-task approvals.
+        cur = await db.execute(
             "SELECT kind FROM tool_attestations "
             "WHERE task_id = ? AND agent_id = ? "
             "AND (expires_at IS NULL OR expires_at > ?) "
             "AND kind != 'waiver'",
             [task_id, reviewer_id, now_ms],
         )
-        for row in rows:
-            if (row.get("kind") or "") in kinds:
+        _rows = await cur.fetchall()
+        await cur.close()
+        for row in _rows:
+            kind = row["kind"] if "kind" in row.keys() else ""
+            if kind in kinds:
                 return True
     except Exception:
         pass

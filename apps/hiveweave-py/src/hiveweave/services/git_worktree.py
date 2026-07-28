@@ -2617,11 +2617,16 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
             except Exception:
                 pass
 
-            rows = await conn.execute_fetchall(
+            # aiosqlite.Row (sqlite3.Row) has no .get() — convert to dict.
+            # Bug: 'sqlite3.Row' object has no attribute 'get' (audit 2026-07-28).
+            cur = await conn.execute(
                 "SELECT id, assignee_id, evidence, creator_id FROM tasks "
                 "WHERE status = 'closed' AND closed_at IS NOT NULL "
                 "ORDER BY closed_at DESC LIMIT 30"
             )
+            _raw_rows = await cur.fetchall()
+            await cur.close()
+            rows = [dict(r) for r in _raw_rows]
             stranded: list[str] = []
             for row in rows:
                 ev_raw = row.get("evidence") or "{}"
@@ -2631,15 +2636,19 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
                     ev = {}
                 if not isinstance(ev, dict):
                     continue
-                # Only check tasks that claim a merge happened
+                # Tasks that claim a merge happened → reopen merge obligation
+                # if the tip is stranded. Tasks WITHOUT merge facts (e.g. VERIFY
+                # reports committed to a branch) are still scanned for visibility
+                # — their deliverables can strand invisibly (audit 2026-07-28:
+                # Sage W1 VERIFY report 21d1697 stranded on hw/A015/work while
+                # task was closed). We report those but don't reopen a merge
+                # obligation (VERIFY reports aren't always meant to merge).
                 has_merge = any(
                     ev.get(k) for k in (
                         "merged_by", "mergedBy", "merge_commit",
                         "merge_commit_hash", "mergeCommit",
                     )
                 )
-                if not has_merge:
-                    continue
                 # Resolve branch for this task's assignee
                 assignee = row.get("assignee_id") or ""
                 tid = str(row.get("id") or "")
@@ -2670,28 +2679,32 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
                             workspace=workspace_path,
                             task_id=tid,
                             branch=cb,
+                            has_merge_fact=has_merge,
                         )
-                        # Reopen merge obligation
-                        try:
-                            from hiveweave.services.obligation import (
-                                ObligationLedger,
-                            )
-
-                            creator = row.get("creator_id") or assignee
-                            if _recon_project_id:
-                                await ObligationLedger().create(
-                                    _recon_project_id,
-                                    str(creator),
-                                    "merge",
-                                    task_id=tid,
-                                    context={
-                                        "reason": "reconcile_stranded_tip",
-                                        "source": "startup_reconcile",
-                                        "branch": cb,
-                                    },
+                        # Reopen merge obligation ONLY when the task claimed a
+                        # merge (avoids spurious obligations for docs-only or
+                        # pure-VERIFY tasks).
+                        if has_merge:
+                            try:
+                                from hiveweave.services.obligation import (
+                                    ObligationLedger,
                                 )
-                        except Exception:
-                            pass
+
+                                creator = row.get("creator_id") or assignee
+                                if _recon_project_id:
+                                    await ObligationLedger().create(
+                                        _recon_project_id,
+                                        str(creator),
+                                        "merge",
+                                        task_id=tid,
+                                        context={
+                                            "reason": "reconcile_stranded_tip",
+                                            "source": "startup_reconcile",
+                                            "branch": cb,
+                                        },
+                                    )
+                            except Exception:
+                                pass
                         break
             if stranded:
                 report["stranded_closed_tasks"] = stranded

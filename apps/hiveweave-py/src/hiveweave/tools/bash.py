@@ -53,6 +53,166 @@ _CWD_FAILURE_HINT = (
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 DOCKER_SANDBOX_IMAGE = "hiveweave/sandbox:latest"
 
+# P0-3 增量2 (audit 2026-07-28): long-running dev-server commands run forever
+# and lock node_modules. When spawned via bash they were never registered, so
+# stop_processes_for_worktree couldn't kill them → WinError 32 on worktree
+# teardown. Detect such commands and route them to the registered spawn path
+# (same mechanism start_dev_server uses) so the process is trackable/killable.
+_DEV_SERVER_TRIGGER_RE = re.compile(
+    r"(?:^|\s|;|&|\|)`?(?:"
+    r"(?:npx\s+)?vite(?:\s|$)"               # vite / npx vite (bare = dev server)
+    r"|(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|start)(?:\s|$)"
+    r"|bun\s+(?:run\s+)?(?:dev|start)(?:\s|$)"
+    r"|next\s+dev(?:\s|$)"
+    r"|nuxt\s+dev(?:\s|$)"
+    r"|nodemon\b"
+    r")",
+    re.IGNORECASE,
+)
+# Blocking verbs that produce finite output — NOT dev servers (vite build,
+# npm run build, npm test, etc.). Their presence disqualifies auto-routing.
+_BLOCKING_VERB_RE = re.compile(
+    r"\b(?:build|test|lint|install|ci|audit|eject|deploy)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_dev_server_command(command: str) -> int | None:
+    """Return port (0 = allocate) if *command* is a long-running dev server,
+    or ``None`` if it should run through the normal blocking path.
+
+    Dev servers never produce finite output — blocking on them just times out
+    and orphans the process. Routing them to the registered spawn path makes
+    them killable by ``stop_processes_for_worktree`` (fixes WinError 32).
+    """
+    if not command or not command.strip():
+        return None
+    # Strip trailing background operators — the registered spawn already
+    # detaches; a literal `&` would background inside the shell and orphan.
+    cmd = re.sub(r"\s*&+\s*$", "", command.strip()).strip()
+    if not cmd:
+        return None
+    if not _DEV_SERVER_TRIGGER_RE.search(cmd):
+        return None
+    # Disqualify blocking verbs (vite build, npm run build:test, …).
+    if _BLOCKING_VERB_RE.search(cmd):
+        return None
+    # Disqualify commands that pipe/redirect into a finite sink, e.g.
+    # `vite --port 3000 > log.txt 2>&1 & echo done` — the agent intended a
+    # background spawn with a captured log, not an interactive server. We
+    # still register those, but only when there's no `echo`/`cat` tail that
+    # implies the agent wants the shell to return with other output.
+    from hiveweave.services.process_registry import extract_ports_from_command
+
+    ports = extract_ports_from_command(cmd)
+    return ports[0] if ports else 0
+
+
+async def _run_registered_dev_server(
+    command: str,
+    cwd: str,
+    workspace_path: str,
+    project_id: str | None,
+    port_hint: int,
+) -> dict[str, Any] | None:
+    """Spawn a dev server via the registered path (non-blocking, tracked).
+
+    Mirrors ``start_dev_server``: allocate port, spawn via
+    ``spawn_project_process``, register to ``process_registry`` with the
+    worktree cwd, return immediately. Returns ``None`` to fall through to the
+    normal blocking path if spawning fails to start.
+    """
+    from hiveweave.services.process_registry import (
+        ProcessRecord,
+        allocate_project_port,
+        is_reserved_port,
+        register,
+        spawn_project_process,
+    )
+
+    pid = project_id or "default"
+    port = port_hint if (port_hint and not is_reserved_port(port_hint)) else (
+        allocate_project_port(pid, 3000)
+    )
+    if is_reserved_port(port):
+        return {
+            "success": False, "output": "",
+            "error": (
+                f"Refusing to start dev server on reserved platform port "
+                f"{port}. Use start_dev_server or a project port (3000+)."
+            ),
+        }
+
+    try:
+        proc, spawn_err, meta = spawn_project_process(
+            command,
+            cwd=cwd,
+            project_id=project_id,
+            preferred_port=port,
+        )
+    except Exception as e:
+        log.warning(
+            "bash.dev_server_spawn_failed",
+            error=str(e), command=command[:120], cwd=cwd[:120],
+        )
+        return None  # fall through to normal path
+    if spawn_err or proc is None:
+        log.warning(
+            "bash.dev_server_spawn_error",
+            error=spawn_err, command=command[:120], cwd=cwd[:120],
+        )
+        return None  # fall through — let normal path surface the error
+
+    commit = ""
+    try:
+        import subprocess as _sp
+
+        r = _sp.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=5,
+        )
+        if r.returncode == 0:
+            commit = (r.stdout or "").strip()
+    except Exception:
+        pass
+
+    try:
+        register(ProcessRecord(
+            project_id=project_id or "",
+            port=port,
+            pid=proc.pid,
+            cwd=cwd,
+            command=meta.get("command") or command,
+            commit=commit,
+        ))
+    except Exception as e:
+        log.warning(
+            "bash.dev_server_register_failed",
+            error=str(e), pid=proc.pid, port=port, cwd=cwd[:120],
+        )
+
+    log.info(
+        "bash.dev_server_auto_registered",
+        pid=proc.pid, port=port, cwd=cwd[:120],
+        command=(meta.get("command") or command)[:120],
+    )
+    return {
+        "success": True,
+        "output": (
+            f"[hiveweave] Dev server auto-registered from bash.\n"
+            f"  pid={proc.pid} port={port} cwd={cwd}\n"
+            f"  command: {meta.get('command') or command}\n"
+            f"  URL: http://localhost:{port}/\n"
+            f"  This process is tracked — stop_processes_for_worktree will "
+            f"kill it on worktree teardown. Use lookup_dev_server to inspect.\n"
+            f"  (Routed from bash because the command is a long-running dev "
+            f"server; blocking on it would time out and orphan the process.)\n"
+            f"\nExit code: 0"
+        ),
+        "error": None,
+    }
+
 # 环境变量白名单 — 只传系统必要变量给子进程，绝不传递任何含
 # KEY/SECRET/TOKEN/PASSWORD 的变量（C5: 防止 API 密钥泄露）。
 _SAFE_ENV_KEYS: frozenset[str] = frozenset({
@@ -682,6 +842,19 @@ async def execute_bash(
                 "error": f"Error: Working directory does not exist: {cwd}"}
 
     cwd_hint = _cwd_style_hint(cwd)
+
+    # P0-3 增量2 (audit 2026-07-28): route long-running dev-server commands to
+    # the registered spawn path so stop_processes_for_worktree can kill them.
+    # Bash-spawned dev servers were unregistered → WinError 32 on teardown.
+    port_hint = _detect_dev_server_command(command)
+    if port_hint is not None and not use_docker:
+        routed = await _run_registered_dev_server(
+            command, cwd, workspace_path, project_id, port_hint
+        )
+        if routed is not None:
+            return routed
+        # None = spawn failed to start; fall through to normal blocking path
+        # so the agent sees the real error instead of a silent no-op.
 
     # 3. Clamp timeout
     if timeout_ms is None:
