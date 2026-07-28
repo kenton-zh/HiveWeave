@@ -115,6 +115,40 @@ def _worktree_path(workspace_path: str, short_id: str) -> str:
     return str(Path(workspace_path) / WORKTREE_DIR / short_id)
 
 
+# create() last-resort suffixes when canonical path is locked (WinError 32).
+_RELOCATION_SUFFIXES = ("-b", "-c", "-d")
+
+
+def _is_bound_worktree_basename(basename: str, short_id: str) -> bool:
+    """True if dirname is this agent's canonical tree or an explicit -b/-c/-d relocate.
+
+    Exact short_id OR ``short_id + '-b'|'-c'|'-d'`` only — never substring
+    matching (that revived the A003-b-masquerades-as-A003 split).
+    """
+    if not basename or not short_id:
+        return False
+    if basename == short_id:
+        return True
+    return basename in {f"{short_id}{s}" for s in _RELOCATION_SUFFIXES}
+
+
+def _worktree_binding_under_project(db_path: str, workspace_path: str) -> bool:
+    """True if ``db_path`` resolves under this project's ``.hiveweave/worktrees/``.
+
+    Hard sandbox for prefer-DB / heal: rejects cross-project short_id collisions
+    and hand-edited absolute paths that escape the project worktree root.
+    """
+    if not db_path or not workspace_path:
+        return False
+    try:
+        root = (Path(workspace_path) / WORKTREE_DIR).resolve()
+        resolved = Path(db_path).resolve()
+        resolved.relative_to(root)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def _has_git(path: str) -> bool:
     return (Path(path) / ".git").exists()
 
@@ -670,7 +704,7 @@ yarn.lock merge=union
                     # Last resort: alternate directory name (disk truly corrupted).
                     # P0-3: this is NOT silent — relocated flag notifies agent.
                     original_path = path
-                    for suffix in ("-b", "-c", "-d"):
+                    for suffix in _RELOCATION_SUFFIXES:
                         alt = path + suffix
                         # L5: if alt already exists as a valid worktree, reuse it
                         # (idempotent — prevents -c/-d proliferation when -b is healthy)
@@ -854,7 +888,9 @@ yarn.lock merge=union
 
         Returns ``{success, hash, count}`` or ``{success: False, message}``.
         """
-        path = _worktree_path(workspace_path, short_id)
+        path = await self._resolve_effective_worktree_path(
+            workspace_path, short_id
+        )
         if not Path(path).is_dir():
             return {"success": False,
                     "message": f"Worktree for {short_id} does not exist."}
@@ -970,7 +1006,9 @@ yarn.lock merge=union
         2. 有 task_id → 稳定命名 t-<id8>
         3. 只有 task_name → legacy slug 命名 (向后兼容旧调用方)
         """
-        path = _worktree_path(workspace_path, short_id)
+        path = await self._resolve_effective_worktree_path(
+            workspace_path, short_id
+        )
         if _has_git(path):
             actual = await _current_branch(path)
             if actual:
@@ -983,33 +1021,46 @@ yarn.lock merge=union
     async def _resolve_effective_worktree_path(
         workspace_path: str, short_id: str
     ) -> str:
-        """P0-1 single source: resolve the actual worktree dir for merge/checkpoint.
+        """Single source: actual worktree dir for merge/checkpoint/rollback/…
 
-        After P0-3 identity binding, canonical path is correct 99% of the time.
-        Fallback to DB workspace_path covers the rare relocation (-b) case where
-        canonical is a husk but the agent is actually working elsewhere.
+        Prefer DB ``workspace_path`` when it is a legal binding for this
+        short_id (canonical **or** ``-b/-c/-d`` relocate), has ``.git``,
+        and resolves under this project's ``.hiveweave/worktrees/``.
+        Only then fall back to the canonical path. Preferring canonical when
+        both exist re-created the TEST_YLGY A015 split: heal wrote to
+        ``A015-b`` while checkpoint/merge stared at locked ``A015``.
         """
         canonical = _worktree_path(workspace_path, short_id)
-        if _has_git(canonical):
-            return canonical
-        # Canonical is husk or missing — check DB for relocated path
         try:
             from hiveweave.services.org import OrgService
 
             org = OrgService()
             agents = await org.list_agents()
             for a in agents:
-                if (a.get("short_id") or "") == short_id:
-                    db_path = (a.get("workspace_path") or "").strip()
-                    if db_path and db_path != canonical and _has_git(db_path):
-                        log.info(
-                            "git_worktree.resolve_effective_path_db_fallback",
-                            short_id=short_id,
-                            canonical=canonical,
-                            actual=db_path,
-                        )
-                        return db_path
+                if (a.get("short_id") or "") != short_id:
+                    continue
+                db_path = (a.get("workspace_path") or "").strip()
+                if not db_path or not _has_git(db_path):
                     break
+                basename = Path(db_path).name
+                if not _is_bound_worktree_basename(basename, short_id):
+                    break
+                if not _worktree_binding_under_project(db_path, workspace_path):
+                    log.warning(
+                        "git_worktree.resolve_effective_path_outside_project",
+                        short_id=short_id,
+                        workspace=workspace_path,
+                        db_path=db_path,
+                    )
+                    break
+                if db_path != canonical:
+                    log.info(
+                        "git_worktree.resolve_effective_path_db",
+                        short_id=short_id,
+                        canonical=canonical,
+                        actual=db_path,
+                    )
+                return db_path
         except Exception:
             pass
         return canonical
@@ -1356,7 +1407,11 @@ yarn.lock merge=union
             }
 
         # Step 1: Rebase worktree branch onto target_branch to minimize conflicts
-        wt_path = _worktree_path(workspace_path, short_id) if short_id else ""
+        wt_path = ""
+        if short_id:
+            wt_path = await self._resolve_effective_worktree_path(
+                workspace_path, short_id
+            )
 
         if wt_path and _Path(wt_path).is_dir():
             # Checkpoint worktree state before rebase
@@ -1646,7 +1701,9 @@ yarn.lock merge=union
 
         Returns ``{success, hash, message}`` or ``{success: False, message}``.
         """
-        path = _worktree_path(workspace_path, short_id)
+        path = await self._resolve_effective_worktree_path(
+            workspace_path, short_id
+        )
         if not Path(path).is_dir():
             return {"success": False,
                     "message": f"Worktree for {short_id} does not exist."}
@@ -1691,7 +1748,9 @@ yarn.lock merge=union
         relocated under ``.hiveweave/worktrees/_quarantine/<sid>-<ts>/``.
         Branch is preserved (not deleted).
         """
-        path = _worktree_path(workspace_path, short_id)
+        path = await self._resolve_effective_worktree_path(
+            workspace_path, short_id
+        )
         fwd_path = path.replace("\\", "/")
         branch = None
         if _has_git(path):
@@ -1765,7 +1824,9 @@ yarn.lock merge=union
         Always returns ``{success: True, removed: True, branch,
         preserved_branch}`` (best-effort).
         """
-        path = _worktree_path(workspace_path, short_id)
+        path = await self._resolve_effective_worktree_path(
+            workspace_path, short_id
+        )
         fwd_path = path.replace("\\", "/")
 
         # 分支解析必须在 worktree 删除之前 — 检出分支信息随目录一起消失
@@ -1935,7 +1996,9 @@ yarn.lock merge=union
 
         Returns ``{success, status: {...} | None}``.
         """
-        path = _worktree_path(workspace_path, short_id)
+        path = await self._resolve_effective_worktree_path(
+            workspace_path, short_id
+        )
         if not Path(path).is_dir():
             return {"success": True, "status": None}
 
@@ -2711,12 +2774,14 @@ async def ensure_executor_worktree(
 
     cur = (agent.get("workspace_path") or "").strip()
     if cur and Path(cur).is_dir() and (Path(cur) / ".git").exists():
-        # P0-3 identity binding: accept ONLY if the directory basename is
-        # exactly short_id (e.g. "A003"). Substring matching is banned —
-        # it let A003-b pass as A003, causing path split (merge stares at
-        # canonical path while agent writes to -b).
+        # Accept canonical short_id OR explicit -b/-c/-d relocate already
+        # bound in DB. Substring matching is still banned (A003-b ≠ A003).
+        # Path must also sit under THIS project's worktree root.
         dir_basename = Path(cur).name
-        if dir_basename == short_id:
+        if (
+            _is_bound_worktree_basename(dir_basename, short_id)
+            and _worktree_binding_under_project(cur, ws)
+        ):
             # 幂等: 透出实际检出的分支, 不按入参重算 (P0 幂等脱钩修复)
             actual = await _current_branch(cur)
             # B7: always clear stale worktree_error when tree is healthy
@@ -2730,7 +2795,11 @@ async def ensure_executor_worktree(
                 "path": cur,
                 "short_id": short_id,
                 "branch": actual,
-                "message": "worktree already bound",
+                "message": (
+                    "worktree already bound (relocated)"
+                    if dir_basename != short_id
+                    else "worktree already bound"
+                ),
             }
         # Path exists but not this agent's tree — recreate under correct short_id
         log.warning(
@@ -2747,26 +2816,32 @@ async def ensure_executor_worktree(
         err = result.get("message") or "worktree create failed"
         # BUG-4: race with concurrent create may report failure while the
         # tree is already healthy — re-validate before persisting error.
+        # Prefer canonical, then -b/-c/-d (same suffixes create() uses).
         expected = _worktree_path(ws, short_id)
-        if _has_git(expected):
+        race_candidates = [expected] + [
+            expected + s for s in _RELOCATION_SUFFIXES
+        ]
+        for cand in race_candidates:
+            if not _has_git(cand):
+                continue
             try:
                 await org.update_agent(
                     agent_id,
-                    {"workspace_path": expected, "worktree_error": None},
+                    {"workspace_path": cand, "worktree_error": None},
                 )
             except Exception:
                 pass
-            actual = await _current_branch(expected)
+            actual = await _current_branch(cand)
             log.info(
                 "executor_worktree_healed_after_race",
                 agent_id=agent_id,
                 short_id=short_id,
-                path=expected,
+                path=cand,
                 prior_error=err,
             )
             return {
                 "success": True,
-                "path": expected,
+                "path": cand,
                 "short_id": short_id,
                 "branch": actual,
                 "message": "worktree healthy after create race",
@@ -2806,10 +2881,9 @@ async def ensure_executor_worktree(
             from hiveweave.services.inbox import InboxService
 
             await InboxService().send_message(
-                project_id=project_id,
-                sender_id="system",
-                recipient_id=agent_id,
-                content=(
+                from_agent_id="system",
+                to_agent_id=agent_id,
+                message=(
                     f"[WORKTREE RELOCATED] Your workspace has been moved from "
                     f"the canonical path (.hiveweave/worktrees/{short_id}) to "
                     f"{Path(path).name} due to a locked/corrupted directory. "

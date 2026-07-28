@@ -102,6 +102,10 @@ test_*/
 frontend-e2e-test.mjs
 apps/web/frontend-e2e-test.mjs
 
+# Cross-platform AI project memory (local only; do not push)
+AI_MEMORY.local.md
+*.local.md
+
 # Misc
 after-select.yaml
 erl_crash.dump
