@@ -92,6 +92,7 @@ def _test_engineer_script(name: str) -> str:
 - 每个 pass/fail 必须有实际输出佐证
 - **UI/前端交付：必须用 `browse` 工具开真实浏览器** — 单元测试通过 ≠ UI 通过
 - 先 `read_skill("browse")` 与 `read_skill("qa")`，再开始 UI 验收
+- Canvas / H5 小游戏：再 `read_skill("h5-game-qa")`，用 `game_run_case` + assert_visual；禁止指望 AI 实时操作动作游戏
 - **Beyoncé Rule**：关键路径必须有测试覆盖
 - **异常路径不可为零**：快乐路径全绿不代表可交付。每个核心功能至少覆盖 2 个异常/边界用例（无效输入、重复提交、空状态、状态不一致），附实际输出
 - **specs 一致性（MANDATORY）**：验收前先读 `docs/` 规格（如有）。实现的依赖清单、API 契约、数据模型与 specs 不符 → 直接判 fail（或上报上级确认 specs 已变更），不得"能跑就过"
@@ -121,10 +122,11 @@ Recommendation: 建议动作（fix/skip/investigate）
 
 ## 工作流
 1. 收到测试请求（哪些模块、什么范围）
-2. read_skill("browse"); read_skill("qa")
+2. read_skill("browse"); read_skill("qa"); 若是 canvas/H5 游戏再 read_skill("h5-game-qa")
 3. read_file / grep 理解上下文
 4. 有自动化框架 → bash / run_tests 跑单元与集成
 5. 有 UI → lookup_dev_server（或 start_dev_server）→ browse(args=["goto", url]) → snapshot -i → 关键路径 → screenshot → assert_visual(observed=你在图里看到的内容, verdict=pass|fail) + console
+5b. H5 游戏 → `game_run_case(probe|list|run)` → 双门（codePass + assert_visual）；无 harness（observe-only）不宣称玩法通过
 6. 按格式报告并 submit_task
 
 ## 沟通风格

@@ -133,14 +133,146 @@ async def _maybe_git_commit(workspace: str) -> str | None:
 
 
 def _screenshot_path_from_argv(argv: list[str]) -> str | None:
-    """Extract output path from ``screenshot [path]`` argv."""
+    """Extract output path from ``screenshot [path]`` argv.
+
+    Supports both ``screenshot path.png`` and
+    ``screenshot --selector canvas path.png``.
+    """
     if not argv:
         return None
     if (argv[0] or "").lower().replace("-", "_") != "screenshot":
         return None
-    if len(argv) >= 2 and str(argv[1]).strip():
-        return str(argv[1]).strip()
+    # Last non-flag positional that looks like a path wins.
+    candidates: list[str] = []
+    i = 1
+    while i < len(argv):
+        tok = str(argv[i]).strip()
+        if tok in ("--selector", "-s") and i + 1 < len(argv):
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        if tok:
+            candidates.append(tok)
+        i += 1
+    if candidates:
+        return candidates[-1]
     return "screenshot.png"
+
+
+async def browse_exec(
+    argv: list[str],
+    workspace: str,
+    *,
+    timeout_sec: int = 60,
+) -> tuple[int, str, str]:
+    """Run gstack browse CLI. Returns ``(exit_code, stdout, stderr)``.
+
+    Raises ``FileNotFoundError`` / ``OSError`` on spawn failure.
+    On timeout returns exit_code=-1 and an error message in stderr.
+    """
+    bin_path = resolve_browse_bin()
+    if not bin_path:
+        raise FileNotFoundError("gstack browse binary not found")
+
+    argv = [str(a) for a in argv]
+    if argv and (argv[0] or "").lower() == "evaluate":
+        argv = ["js", *argv[1:]]
+
+    timeout = max(5, min(int(timeout_sec or 60), 300))
+    head = (argv[0] or "").lower().replace("-", "_") if argv else ""
+    if head in (
+        "click", "wait", "wait_for", "waitfor", "fill", "press",
+        "js", "eval", "evaluate",
+    ):
+        timeout = max(30, timeout)
+
+    cmd = [str(bin_path), *argv]
+    cwd = workspace if workspace and Path(workspace).is_dir() else None
+    from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env={**os.environ, "GSTACK_HEADLESS": os.environ.get("GSTACK_HEADLESS", "1")},
+        **windows_no_window_kwargs(),
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return -1, "", f"browse timed out after {timeout}s: {' '.join(argv)}"
+
+    stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
+    stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
+    code = proc.returncode if proc.returncode is not None else -1
+    return code, stdout, stderr
+
+
+def browse_missing_bin_hint() -> str:
+    hint = (
+        "gstack browse binary not found. Build it once:\n"
+        "  cd %USERPROFILE%\\.claude\\skills\\gstack && bun install && bun run build\n"
+        "Or set HIVEWEAVE_BROWSE_BIN to the browse.exe path."
+    )
+    if settings.browse_bin:
+        hint = (
+            f"HIVEWEAVE_BROWSE_BIN={settings.browse_bin!r} is missing or not a file.\n"
+            + hint
+        )
+    return hint
+
+
+async def issue_browse_e2e_attestation(
+    *,
+    agent_id: str,
+    workspace: str,
+    argv: list[str],
+    stdout: str,
+    task_id: str | None = None,
+    core_interaction: bool = False,
+) -> str:
+    """Create browse_e2e attestation; return note fragment (may be empty)."""
+    try:
+        from hiveweave.services.attestation import (
+            attestation_service,
+            hash_stdout,
+        )
+        from hiveweave.tools.helpers import get_project_id
+
+        project_id = await get_project_id(agent_id)
+        if not project_id:
+            return ""
+        resolved_task = await _resolve_task_id(project_id, agent_id, task_id)
+        commit = await _maybe_git_commit(workspace or "")
+        cmd_url = " ".join(argv)[:500]
+        if core_interaction:
+            cmd_url = f"[core_interaction=1] {cmd_url}"
+        att_id = await attestation_service.create(
+            project_id,
+            agent_id=agent_id,
+            kind="browse_e2e",
+            tool_call_id=str(uuid.uuid4()),
+            task_id=resolved_task,
+            command_or_url=cmd_url,
+            exit_code=0,
+            workspace=workspace or None,
+            commit=commit,
+            stdout_hash=hash_stdout(stdout),
+            console_errors=0,
+        )
+        extra = " core_interaction=1" if core_interaction else ""
+        return f"\n[attestation_id={att_id} kind=browse_e2e{extra}]"
+    except Exception:
+        return ""
 
 
 @tool(
@@ -152,6 +284,7 @@ def _screenshot_path_from_argv(argv: list[str]) -> str | None:
     "After screenshot the PNG pixels are injected into your next LLM turn — "
     "you MUST call assert_visual(observed, verdict) based on what you SEE "
     "(path-only evidence is rejected for UI submit). "
+    "For H5/canvas games prefer game_run_case after goto. "
     "Example: browse(args=[\"goto\",\"http://127.0.0.1:3000\"]) then "
     "browse(args=[\"snapshot\",\"-i\"]). On success issues a browse_e2e attestation.",
     requires_workspace=True,
@@ -160,16 +293,8 @@ def _screenshot_path_from_argv(argv: list[str]) -> str | None:
 async def browse_tool(
     params: BrowseParams, agent_id: str, workspace: str
 ) -> ToolResult:
-    bin_path = resolve_browse_bin()
-    if not bin_path:
-        hint = (
-            "gstack browse binary not found. Build it once:\n"
-            "  cd %USERPROFILE%\\.claude\\skills\\gstack && bun install && bun run build\n"
-            "Or set HIVEWEAVE_BROWSE_BIN to the browse.exe path."
-        )
-        if settings.browse_bin:
-            hint = f"HIVEWEAVE_BROWSE_BIN={settings.browse_bin!r} is missing or not a file.\n" + hint
-        return ToolResult.err(hint)
+    if not resolve_browse_bin():
+        return ToolResult.err(browse_missing_bin_hint())
 
     argv = _parse_argv(params)
     if not argv:
@@ -177,10 +302,6 @@ async def browse_tool(
             'browse requires args or command. Example: '
             'args=["goto","http://127.0.0.1:3000"]'
         )
-
-    # Treat evaluate as alias for js (TEST21 M14)
-    if (argv[0] or "").lower() == "evaluate":
-        argv = ["js", *argv[1:]]
 
     # Soft guard: discourage attaching to the operator's daily profile URLs
     # that look like credential harvesting — still allow localhost / file / http(s).
@@ -191,48 +312,15 @@ async def browse_tool(
             "Use setup-browser-cookies skill manually, or pass an explicit --domain."
         )
 
-    timeout = max(5, min(int(params.timeout_sec or 60), 300))
-    # click/wait/js often need >10s for async UI; floor at 30s for those actions.
     head = (argv[0] or "").lower().replace("-", "_")
-    if head in (
-        "click", "wait", "wait_for", "waitfor", "fill", "press",
-        "js", "eval", "evaluate",
-    ):
-        timeout = max(30, timeout)
-    cmd = [str(bin_path), *argv]
-    cwd = workspace if workspace and Path(workspace).is_dir() else None
-
     try:
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env={**os.environ, "GSTACK_HEADLESS": os.environ.get("GSTACK_HEADLESS", "1")},
-            **windows_no_window_kwargs(),
+        code, stdout, stderr = await browse_exec(
+            argv, workspace, timeout_sec=params.timeout_sec or 60
         )
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            return ToolResult.err(
-                f"browse timed out after {timeout}s: {' '.join(argv)}"
-            )
     except FileNotFoundError:
-        return ToolResult.err(f"browse binary not executable: {bin_path}")
+        return ToolResult.err(browse_missing_bin_hint())
     except OSError as e:
         return ToolResult.err(f"browse spawn failed: {e}")
-
-    stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
-    stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
-    code = proc.returncode if proc.returncode is not None else -1
 
     if code != 0:
         parts = [f"browse exit={code}: {' '.join(argv)}"]
@@ -246,40 +334,15 @@ async def browse_tool(
     if stderr:
         out = f"{out}\n--- stderr ---\n{stderr}"
 
-    # Issue browse_e2e attestation on success
-    attest_note = ""
     core_interaction = head in ("js", "eval", "evaluate")
-    try:
-        from hiveweave.services.attestation import (
-            attestation_service,
-            hash_stdout,
-        )
-        from hiveweave.tools.helpers import get_project_id
-
-        project_id = await get_project_id(agent_id)
-        if project_id:
-            task_id = await _resolve_task_id(project_id, agent_id, params.task_id)
-            commit = await _maybe_git_commit(workspace or "")
-            cmd_url = " ".join(argv)[:500]
-            if core_interaction:
-                cmd_url = f"[core_interaction=1] {cmd_url}"
-            att_id = await attestation_service.create(
-                project_id,
-                agent_id=agent_id,
-                kind="browse_e2e",
-                tool_call_id=str(uuid.uuid4()),
-                task_id=task_id,
-                command_or_url=cmd_url,
-                exit_code=0,
-                workspace=workspace or None,
-                commit=commit,
-                stdout_hash=hash_stdout(out),
-                console_errors=0,
-            )
-            extra = " core_interaction=1" if core_interaction else ""
-            attest_note = f"\n[attestation_id={att_id} kind=browse_e2e{extra}]"
-    except Exception:
-        pass
+    attest_note = await issue_browse_e2e_attestation(
+        agent_id=agent_id,
+        workspace=workspace,
+        argv=argv,
+        stdout=out,
+        task_id=params.task_id,
+        core_interaction=core_interaction,
+    )
 
     extra_fields: dict[str, Any] = {}
     shot_rel = _screenshot_path_from_argv(argv)

@@ -140,6 +140,71 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["screenshotPath", "observed", "verdict"],
     },
+    "look_at_image": {
+        "description": (
+            "帮你看图片 — Ask the configured multimodal model to analyze an image. "
+            "Pass image_path (under workspace) + prompt (focus / output format). "
+            "Stateless one-shot: waits for the full answer (non-streaming), returns "
+            "text only. Does not inject pixels into chat history. Configure the "
+            "model in Settings → 多模态模型配置."
+        ),
+        "properties": {
+            "image_path": {
+                "type": "string",
+                "aliases": ["path", "file", "screenshot", "image"],
+                "description": "Image path relative to workspace or absolute under it.",
+            },
+            "prompt": {
+                "type": "string",
+                "aliases": ["question", "query", "instruction"],
+                "description": (
+                    "What the vision model should look for and how to answer."
+                ),
+            },
+        },
+        "required": ["image_path", "prompt"],
+    },
+    "game_run_case": {
+        "description": (
+            "H5/canvas game harness runner. After browse(goto) to the game: "
+            "probe → list → run(caseId). run() executes window.__HW_TEST__, "
+            "screenshots canvas, returns codePass + visionCriteria; then "
+            "assert_visual. No harness → observe-only (no gameplay pass)."
+        ),
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["probe", "list", "run"],
+                "description": "probe | list | run",
+            },
+            "caseId": {
+                "type": "string",
+                "aliases": ["case_id", "id"],
+                "description": "Required for action=run.",
+            },
+            "screenshotPath": {
+                "type": "string",
+                "aliases": ["screenshot_path"],
+                "description": "Screenshot output path after run.",
+            },
+            "screenshotSelector": {
+                "type": "string",
+                "aliases": ["selector"],
+                "description": "CSS selector (default canvas).",
+            },
+            "timeoutSec": {
+                "type": "integer",
+                "aliases": ["timeout_sec", "timeout"],
+                "description": "Per-step timeout seconds (default 90).",
+            },
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id"],
+                "description": "Optional task id for attestation.",
+            },
+        },
+        "required": ["action"],
+    },
     "run_command": {
         "description": "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command.",
         "properties": {

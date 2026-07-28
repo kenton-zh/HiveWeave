@@ -2,6 +2,8 @@
 
 Guidance for AI coding sessions working in this repo. Keep it terse; every line should answer "would an agent miss this without help?".
 
+**Project memory (all platforms):** write/read `AI_MEMORY.local.md` at repo root — do not use platform-default memory paths. See `CLAUDE.md` §跨平台 AI 项目记忆.
+
 ## Architecture
 
 **Single Python backend + React frontend**:
