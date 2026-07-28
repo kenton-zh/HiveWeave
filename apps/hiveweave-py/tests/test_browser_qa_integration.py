@@ -19,15 +19,21 @@ def test_browse_and_qa_are_builtin_skills():
     slugs = {s["slug"] for s in BUILTIN_SKILLS}
     assert "browse" in slugs
     assert "qa" in slugs
+    assert "h5-game-qa" in slugs
     browse = next(s for s in BUILTIN_SKILLS if s["slug"] == "browse")
     assert "browse" in browse["instructions"].lower()
     assert browse["category"] == "tool"
+    h5 = next(s for s in BUILTIN_SKILLS if s["slug"] == "h5-game-qa")
+    assert "__HW_TEST__" in h5["instructions"]
+    assert h5["category"] == "tool"
 
 
 def test_browse_tool_registered_and_permitted():
     assert "browse" in READONLY_TOOLS
     assert "browse" in TOOL_PARAM_SCHEMAS
     assert get_tool_def("browse") is not None
+    assert "game_run_case" in READONLY_TOOLS
+    assert get_tool_def("game_run_case") is not None
 
 
 def test_resolve_browse_bin_finds_gstack_install():

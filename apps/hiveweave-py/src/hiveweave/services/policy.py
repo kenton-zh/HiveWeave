@@ -118,6 +118,7 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "run_command": frozenset({Capability.BASH_SHELL}),
     "browse": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     "assert_visual": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
+    "game_run_case": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     # DOC_WRITE agents (CEO) may edit docs; SOURCE_WRITE covers all paths
     "edit_file": frozenset({Capability.SOURCE_WRITE, Capability.DOC_WRITE}),
     "apply_patch": frozenset({Capability.SOURCE_WRITE}),

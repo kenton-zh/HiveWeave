@@ -146,6 +146,8 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
     "run_tests": 6,
     "run_perf_audit": 6,
     "run_full_review": 6,
+    # H5 harness — one case may need retries; mid tolerance
+    "game_run_case": 6,
     # 每轮强制出口 — 被出口闸门拒收后必须重试；同参指纹才计数
     # （井字棋实测：CEO 首条指令即撞 doom，无任何正常输出）
     "commit_turn": 8,
