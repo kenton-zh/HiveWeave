@@ -891,6 +891,9 @@ export interface TierConfig {
   managementBackup: string | null;
   executorPrimary: string | null;
   executorBackup: string | null;
+  /** Multimodal model for look_at_image (帮你看图片) */
+  visionPrimary: string | null;
+  visionBackup: string | null;
 }
 
 const TIER_KEYS = {
@@ -898,9 +901,11 @@ const TIER_KEYS = {
   managementBackup: "model_tier_management_backup",
   executorPrimary: "model_tier_executor_primary",
   executorBackup: "model_tier_executor_backup",
+  visionPrimary: "vision_model_primary",
+  visionBackup: "vision_model_backup",
 } as const;
 
-/** Read the four tier-config keys from global settings. */
+/** Read tier + vision-model keys from global settings. */
 export async function getTierConfig(): Promise<TierConfig> {
   const data = await getSettings();
   const list: Array<{ key: string; value: string }> = Array.isArray(data)
@@ -915,16 +920,20 @@ export async function getTierConfig(): Promise<TierConfig> {
     managementBackup: map[TIER_KEYS.managementBackup] || null,
     executorPrimary: map[TIER_KEYS.executorPrimary] || null,
     executorBackup: map[TIER_KEYS.executorBackup] || null,
+    visionPrimary: map[TIER_KEYS.visionPrimary] || null,
+    visionBackup: map[TIER_KEYS.visionBackup] || null,
   };
 }
 
-/** Write the four tier-config keys. Empty string clears a slot. */
+/** Write tier + vision-model keys. Empty string clears a slot. */
 export async function saveTierConfig(config: TierConfig): Promise<void> {
   await updateSettings({
     [TIER_KEYS.managementPrimary]: config.managementPrimary || "",
     [TIER_KEYS.managementBackup]: config.managementBackup || "",
     [TIER_KEYS.executorPrimary]: config.executorPrimary || "",
     [TIER_KEYS.executorBackup]: config.executorBackup || "",
+    [TIER_KEYS.visionPrimary]: config.visionPrimary || "",
+    [TIER_KEYS.visionBackup]: config.visionBackup || "",
   });
 }
 

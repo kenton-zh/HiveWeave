@@ -6,6 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **遇到问题要反思**：为什么会有这个问题？从宏观、治根的角度修复问题，不要“打地鼠”式地修补表面。
 
+### 跨平台 AI 项目记忆（本地，不进远程）
+
+路径：**仓库根目录 [`AI_MEMORY.local.md`](AI_MEMORY.local.md)**（已 gitignore）。
+
+凡参与本项目的编程 Agent（Claude Code / Cursor / Codex / OpenCode / Trae / 其他平台），在写入「项目记忆 / memory」时：
+- **不必遵守**各平台自带的记忆路径或存储规则
+- **统一读写本文件**；跨会话、跨平台复用同一份记忆
+- 个人环境配置仍写 [`CLAUDE.local.md`](CLAUDE.local.md)；本文件只放可复用的项目事实（决策、坑、根因、未完成上下文），禁止密钥
+
 ## Commands
 
 ```bash
