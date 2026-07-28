@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HW Jump Demo — __HW_TEST__ harness</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #1a1f2a; color: #e8eef7;
+      font-family: ui-sans-serif, system-ui, sans-serif; display: flex;
+      flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
+    canvas { background: #0d1118; border: 2px solid #3d4a63; image-rendering: pixelated; }
+    #hud { font-size: 14px; opacity: 0.85; }
+    button { padding: 8px 14px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="hud">HiveWeave H5 harness demo — Space=jump, Arrows=move (manual). Cases via __HW_TEST__.</div>
+  <canvas id="game" width="480" height="270"></canvas>
+  <button id="reset" type="button">Reset</button>
+  <script>
+(() => {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const GROUND_Y = 220;
+  const GRAVITY = 0.55;
+  const JUMP_V = -9.2;
+  const MOVE = 2.4;
+
+  const platforms = [
+    { x: 0, y: GROUND_Y, w: 140, h: 50 },
+    { x: 280, y: GROUND_Y, w: 200, h: 50 }, // right landing
+  ];
+  // gap between 140 and 280
+
+  let player = { x: 40, y: GROUND_Y - 24, w: 18, h: 24, vx: 0, vy: 0, onGround: true, dead: false };
+  let mode = "playing";
+  let keys = Object.create(null);
+
+  function resetPlayer() {
+    player = { x: 40, y: GROUND_Y - 24, w: 18, h: 24, vx: 0, vy: 0, onGround: true, dead: false };
+    mode = "playing";
+    keys = Object.create(null);
+  }
+
+  function aabb(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  function applyInput(buttons) {
+    const set = new Set(buttons || []);
+    keys.left = set.has("left") || set.has("a");
+    keys.right = set.has("right") || set.has("d");
+    keys.jump = set.has("space") || set.has("up") || set.has("w");
+  }
+
+  function update(dtFrames = 1) {
+    for (let i = 0; i < dtFrames; i++) {
+      if (mode !== "playing" || player.dead) continue;
+      player.vx = 0;
+      if (keys.left) player.vx -= MOVE;
+      if (keys.right) player.vx += MOVE;
+      if (keys.jump && player.onGround) {
+        player.vy = JUMP_V;
+        player.onGround = false;
+      }
+      player.vy += GRAVITY;
+      player.x += player.vx;
+      player.y += player.vy;
+
+      player.onGround = false;
+      for (const p of platforms) {
+        const body = { x: player.x, y: player.y, w: player.w, h: player.h };
+        if (!aabb(body, p)) continue;
+        // land on top
+        if (player.vy >= 0 && player.y + player.h - player.vy <= p.y + 2) {
+          player.y = p.y - player.h;
+          player.vy = 0;
+          player.onGround = true;
+        }
+      }
+      if (player.y > H + 40) {
+        player.dead = true;
+        mode = "dead";
+      }
+      if (player.x + player.w > W) player.x = W - player.w;
+      if (player.x < 0) player.x = 0;
+    }
+  }
+
+  function render() {
+    ctx.fillStyle = "#0d1118";
+    ctx.fillRect(0, 0, W, H);
+    // pit highlight
+    ctx.fillStyle = "#2a1520";
+    ctx.fillRect(140, GROUND_Y, 140, 50);
+    ctx.fillStyle = "#3a8f5c";
+    for (const p of platforms) ctx.fillRect(p.x, p.y, p.w, p.h);
+    ctx.fillStyle = player.dead ? "#c44" : "#6ec1ff";
+    ctx.fillRect(player.x, player.y, player.w, player.h);
+    ctx.fillStyle = "#e8eef7";
+    ctx.font = "12px sans-serif";
+    ctx.fillText(mode + (player.dead ? " (fell)" : ""), 8, 16);
+    ctx.fillText(`x=${Math.round(player.x)} y=${Math.round(player.y)}`, 8, 32);
+  }
+
+  function getState() {
+    return {
+      coords: "origin:top-left x:right y:down",
+      mode,
+      player: {
+        x: Math.round(player.x),
+        y: Math.round(player.y),
+        vx: Math.round(player.vx),
+        vy: Math.round(player.vy),
+        onGround: !!player.onGround,
+        dead: !!player.dead,
+      },
+      platforms: platforms.map((p) => ({ x: p.x, y: p.y, w: p.w })),
+      gap: { from: 140, to: 280 },
+    };
+  }
+
+  windowGameToText = () => JSON.stringify(getState());
+  window.render_game_to_text = renderGameToText;
+
+  window.advanceTime = (ms) => {
+    const frames = Math.max(1, Math.round(ms / (1000 / 60)));
+    update(frames);
+    render();
+  };
+
+  const cases = [
+    {
+      id: "jump_cross_gap",
+      setup: () => { resetPlayer(); render(); },
+      drive: [
+        { buttons: ["right"], frames: 22 },
+        { buttons: ["right", "space"], frames: 3 },
+        { buttons: ["right"], frames: 40 },
+      ],
+      assertCode: () =>
+        !player.dead && player.onGround && player.x > 280,
+      visionCriteria:
+        "Blue player standing on the right green platform; not in the dark pit; not fallen.",
+    },
+    {
+      id: "fall_in_pit",
+      setup: () => { resetPlayer(); render(); },
+      drive: [
+        { buttons: ["right"], frames: 80 }, // walk into gap without jump
+      ],
+      assertCode: () => player.dead === true || player.y > GROUND_Y,
+      visionCriteria:
+        "Player has fallen into or past the pit (dead / below platforms).",
+    },
+  ];
+
+  const byId = new Map(cases.map((c) => [c.id, c]));
+
+  function applyFrame(step) {
+    applyInput(step.buttons || []);
+    update(1);
+    render();
+  }
+
+  window.__HW_TEST__ = {
+    version: "1.0",
+    ready: true,
+    list: () => cases.map((c) => c.id),
+    getState: renderGameToText,
+    async run(caseId) {
+      window.__HW_TEST__._frozen = true;
+      try {
+      const c = byId.get(caseId);
+      if (!c) {
+        return {
+          id: caseId,
+          codePass: false,
+          codeErrors: [`unknown case: ${caseId}`],
+          visionCriteria: "",
+          simulatedMs: 0,
+        };
+      }
+      c.setup();
+      let frames = 0;
+      for (const step of c.drive) {
+        for (let i = 0; i < step.frames; i++) {
+          applyFrame(step);
+          frames += 1;
+        }
+      }
+      // clear held keys after drive
+      applyInput([]);
+      let codePass = false;
+      const codeErrors = [];
+      try {
+        codePass = !!c.assertCode();
+        if (!codePass) codeErrors.push("assertCode returned false");
+      } catch (e) {
+        codeErrors.push(String(e && e.message || e));
+      }
+      return {
+        id: c.id,
+        codePass,
+        codeErrors,
+        visionCriteria: c.visionCriteria,
+        screenshotHint: "canvas",
+        simulatedMs: Math.round((frames * 1000) / 60),
+      };
+      } finally {
+        window.__HW_TEST__._frozen = false;
+      }
+    },
+  };
+
+  // Manual play
+  window.addEventListener("keydown", (e) => {
+    if (["ArrowLeft", "a", "A"].includes(e.key)) keys.left = true;
+    if (["ArrowRight", "d", "D"].includes(e.key)) keys.right = true;
+    if ([" ", "ArrowUp", "w", "W"].includes(e.key)) keys.jump = true;
+  });
+  window.addEventListener("keyup", (e) => {
+    if (["ArrowLeft", "a", "A"].includes(e.key)) keys.left = false;
+    if (["ArrowRight", "d", "D"].includes(e.key)) keys.right = false;
+    if ([" ", "ArrowUp", "w", "W"].includes(e.key)) keys.jump = false;
+  });
+  document.getElementById("reset").onclick = () => { resetPlayer(); render(); };
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(2, (now - last) / (1000 / 60));
+    last = now;
+    if (!window.__HW_TEST__._frozen) {
+      update(dt);
+      render();
+    }
+    requestAnimationFrame(loop);
+  }
+  resetPlayer();
+  render();
+  requestAnimationFrame(loop);
+})();
+  </script>
+</body>
+</html>
