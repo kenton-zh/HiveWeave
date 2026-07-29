@@ -73,10 +73,10 @@ async def test_cancel_tool_refuses_review_deadlock():
     }
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="p1"),
         ),
-        patch("hiveweave.tools.task_tools.TaskService") as TS,
+        patch("hiveweave.services.task.TaskService") as TS,
         patch(
             "hiveweave.services.attestation.get_valid_waiver",
             AsyncMock(return_value=None),

@@ -221,7 +221,7 @@ class TestReviewPassesTaskId:
             "tags": [],
         }
         with (
-            patch("hiveweave.tools.task_tools.get_project_id",
+            patch("hiveweave.tools.helpers.get_project_id",
                   AsyncMock(return_value=PROJECT_ID)),
             patch.object(TaskService, "get_task",
                          AsyncMock(return_value=dict(task_row))),

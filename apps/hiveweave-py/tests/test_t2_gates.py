@@ -109,10 +109,10 @@ async def test_review_self_forbidden_even_with_waiver():
     }
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="p1"),
         ),
-        patch("hiveweave.tools.task_tools.TaskService") as TS,
+        patch("hiveweave.services.task.TaskService") as TS,
         patch(
             "hiveweave.services.attestation.get_valid_waiver",
             AsyncMock(return_value={"id": "w1", "waived_by": "ceo1"}),
@@ -145,10 +145,10 @@ async def test_non_verify_self_review_still_gets_soft_reminder_with_waiver():
     }
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="p1"),
         ),
-        patch("hiveweave.tools.task_tools.TaskService") as TS,
+        patch("hiveweave.services.task.TaskService") as TS,
         patch(
             "hiveweave.services.attestation.get_valid_waiver",
             AsyncMock(return_value={"id": "w1", "waived_by": "ceo1"}),

@@ -180,7 +180,7 @@ class TestVerificationGates:
         }
         with (
             patch(
-                "hiveweave.tools.task_tools.get_project_id",
+                "hiveweave.tools.helpers.get_project_id",
                 AsyncMock(return_value=PROJECT_ID),
             ),
             patch.object(
@@ -240,7 +240,7 @@ class TestVerificationGates:
 
         parent = await ts.get_task(pid, parent_id)
         with patch(
-            "hiveweave.tools.task_tools._find_independent_qa",
+            "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
             AsyncMock(return_value=qa_id),
         ):
             verify_id = await _spawn_post_approve_verify_task(
@@ -257,7 +257,7 @@ class TestVerificationGates:
 
         # idempotent — second spawn returns existing
         with patch(
-            "hiveweave.tools.task_tools._find_independent_qa",
+            "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
             AsyncMock(return_value=qa_id),
         ):
             again = await _spawn_post_approve_verify_task(
@@ -315,7 +315,7 @@ class TestVerificationGates:
                 new=fake_get_agent_project_id,
             ),
             patch(
-                "hiveweave.tools.task_tools._find_independent_qa",
+                "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
                 AsyncMock(return_value=qa_id),
             ),
             patch(
@@ -359,7 +359,7 @@ class TestVerificationGates:
         )
         parent = await ts.get_task(pid, parent_id)
         with patch(
-            "hiveweave.tools.task_tools._find_independent_qa",
+            "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
             AsyncMock(return_value=qa_id),
         ):
             verify_id = await _spawn_post_approve_verify_task(

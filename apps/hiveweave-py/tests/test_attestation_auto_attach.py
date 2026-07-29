@@ -84,11 +84,11 @@ async def test_submit_auto_attaches_when_ids_omitted():
 
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             new_callable=AsyncMock,
             return_value="proj",
         ),
-        patch("hiveweave.tools.task_tools.TaskService") as TS,
+        patch("hiveweave.services.task.TaskService") as TS,
         patch(
             "hiveweave.services.attestation.required_attestation_kinds",
             return_value=["bash_test"],

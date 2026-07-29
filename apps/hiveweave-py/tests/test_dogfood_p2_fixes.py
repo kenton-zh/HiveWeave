@@ -49,10 +49,10 @@ async def test_waive_rejects_docs_only():
     }
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="p1"),
         ),
-        patch("hiveweave.tools.task_tools.TaskService") as TS,
+        patch("hiveweave.services.task.TaskService") as TS,
         patch(
             "hiveweave.services.attestation.count_waivers",
             AsyncMock(return_value=0),
@@ -88,10 +88,10 @@ async def test_waive_verify_rejects_non_ceo():
     }
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="p1"),
         ),
-        patch("hiveweave.tools.task_tools.TaskService") as TS,
+        patch("hiveweave.services.task.TaskService") as TS,
         patch("hiveweave.services.org.OrgService") as Org,
         patch(
             "hiveweave.services.policy.infer_role_family",
@@ -128,7 +128,7 @@ async def test_waive_verify_rejects_non_ceo():
 async def test_waive_reason_min_length():
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="p1"),
         ),
     ):
@@ -153,10 +153,10 @@ async def test_waive_verify_ceo_ok_echoes_reason():
     reason = "本小项目没有独立 QA，CEO 已人工抽查并通过 10 条用例。"
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="p1"),
         ),
-        patch("hiveweave.tools.task_tools.TaskService") as TS,
+        patch("hiveweave.services.task.TaskService") as TS,
         patch("hiveweave.services.org.OrgService") as Org,
         patch(
             "hiveweave.services.policy.infer_role_family",

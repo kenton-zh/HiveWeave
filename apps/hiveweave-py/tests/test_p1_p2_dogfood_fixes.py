@@ -157,7 +157,7 @@ async def test_verify_gate_ceo_not_blocked_as_creator(task_env):
         return pid
 
     with patch(
-        "hiveweave.tools.task_tools.get_project_id", return_value=pid
+        "hiveweave.tools.helpers.get_project_id", return_value=pid
     ), patch(
         "hiveweave.db.meta.get_agent_project_id", fake_agent_project
     ):
@@ -179,7 +179,7 @@ async def test_verify_gate_ceo_rework_succeeds(task_env):
         return pid
 
     with patch(
-        "hiveweave.tools.task_tools.get_project_id", return_value=pid
+        "hiveweave.tools.helpers.get_project_id", return_value=pid
     ), patch(
         "hiveweave.db.meta.get_agent_project_id", fake_agent_project
     ):
@@ -200,7 +200,7 @@ async def test_verify_gate_implementer_still_blocked(task_env):
         return pid
 
     with patch(
-        "hiveweave.tools.task_tools.get_project_id", return_value=pid
+        "hiveweave.tools.helpers.get_project_id", return_value=pid
     ), patch(
         "hiveweave.db.meta.get_agent_project_id", fake_agent_project
     ):
@@ -221,7 +221,7 @@ async def test_verify_gate_merger_still_blocked(task_env):
         return pid
 
     with patch(
-        "hiveweave.tools.task_tools.get_project_id", return_value=pid
+        "hiveweave.tools.helpers.get_project_id", return_value=pid
     ), patch(
         "hiveweave.db.meta.get_agent_project_id", fake_agent_project
     ):

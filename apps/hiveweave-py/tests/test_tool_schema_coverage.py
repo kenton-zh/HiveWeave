@@ -93,26 +93,49 @@ def test_waive_validate_accepts_taskId_alias():
         {
             "taskId": "37cc32a7-ec39-4ce5-a498-b24b4dca7afd",
             "reason": "docs_only coordinator task; code already on main",
+            "evidenceAttestationId": "att-evidence-1",
         }
     )
     assert err is None, err
     assert params is not None
     assert params.task_id.startswith("37cc32a7")
     assert "docs_only" in params.reason
+    assert params.evidence_attestation_id == "att-evidence-1"
 
 
 def test_validate_tool_args_fallback_for_waive():
     normalized, err = validate_tool_args(
         "waive_attestation",
-        {"taskId": "abc", "reason": "x" * 8},
+        {
+            "taskId": "abc",
+            "reason": "x" * 8,
+            "evidenceAttestationId": "att-1",
+        },
     )
     assert err is None, err
     # Canonical public names from registry schema
     assert "taskId" in normalized or "task_id" in normalized
     assert "reason" in normalized
+    assert (
+        "evidenceAttestationId" in normalized
+        or "evidence_attestation_id" in normalized
+    )
 
 
 def test_validate_tool_args_reports_missing_required():
     normalized, err = validate_tool_args("waive_attestation", {})
     assert err is not None
     assert "taskId" in err or "task_id" in err or "Missing" in err
+
+
+def test_validate_tool_args_reports_missing_evidence():
+    normalized, err = validate_tool_args(
+        "waive_attestation",
+        {"taskId": "abc", "reason": "x" * 8},
+    )
+    assert err is not None
+    assert (
+        "evidenceAttestationId" in err
+        or "evidence_attestation_id" in err
+        or "Missing" in err
+    )

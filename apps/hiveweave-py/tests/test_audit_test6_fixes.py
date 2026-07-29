@@ -231,11 +231,22 @@ class TestFuseDoesNotAckActionable:
             / "src"
             / "hiveweave"
             / "agents"
-            / "agent.py"
+            / "watcher.py"
         )
         text = src.read_text(encoding="utf-8")
         idx = text.find("inbox_watcher_trigger_fuse_escalated")
         assert idx > 0
         window = text[idx : idx + 900]
         assert "mark_read_by_ids" not in window
-        assert "Inbox was NOT auto-acked" in text
+        # Escalation contract text lives on Agent._escalate_trigger_fuse
+        agent_src = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "hiveweave"
+            / "agents"
+            / "recovery.py"
+        )
+        agent_text = agent_src.read_text(encoding="utf-8")
+        assert "Inbox was NOT auto-acked" in agent_text or (
+            "Inbox was NOT auto-acked" in text
+        )
