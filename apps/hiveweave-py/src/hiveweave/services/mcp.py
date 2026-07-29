@@ -173,8 +173,10 @@ class _StdioTransport:
         """获取活跃子进程；已退出则重启。"""
         if self._proc is not None and self._proc.returncode is None:
             return self._proc
-        # 合并环境变量（子进程需要 PATH 等）
-        env = {**os.environ, **(self.env or {})}
+        # 合并环境变量 — 仅白名单系统键 + server 显式 env（禁止透传 API keys）
+        from hiveweave.util.safe_env import filtered_environ
+
+        env = filtered_environ(self.env)
         from hiveweave.util.win_subprocess import windows_no_window_kwargs
 
         self._proc = await asyncio.create_subprocess_exec(

@@ -891,7 +891,8 @@ async def execute_bash(
         body = output if output.strip() else "(no output)"
         return {"success": True,
                 "output": f"{body}\n\n{cwd_hint}\nExit code: 0",
-                "error": None}
+                "error": None,
+                "exit_code": 0}
 
     body = output if output.strip() else "(no output)"
     # P2-1 fix: 失败时把 stdout/stderr 各自的尾部 4KB 放进 error 字段。
@@ -912,6 +913,7 @@ async def execute_bash(
         "success": False,  # non-zero exit is not success
         "output": f"{body}\n\n{cwd_hint}\nExit code: {exit_code}",
         "error": error_msg,
+        "exit_code": exit_code,
     }
 
 
@@ -978,7 +980,7 @@ async def execute_run_command(
     if exit_code == 0:
         body = output if output.strip() else "(no output)"
         return {"success": True, "output": f"{body}\n\nExit code: 0",
-                "error": None}
+                "error": None, "exit_code": 0}
 
     body = output if output.strip() else "(no output)"
     # P2-1 fix: 同 execute_bash — 失败时返回 stdout/stderr 各自尾部 4KB。
@@ -997,6 +999,7 @@ async def execute_run_command(
         "success": False,
         "output": f"{body}\n\nExit code: {exit_code}",
         "error": error_msg,
+        "exit_code": exit_code,
     }
 
 
@@ -1023,6 +1026,15 @@ class BashParams(BaseModel):
         description="Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds (e.g. 30 = 30s). Use 120000 for npm install.",
         json_schema_extra={"aliases": ["timeout_ms", "timeoutMs"]},
     )
+    task_id: str | None = Field(
+        default=None,
+        alias="taskId",
+        description=(
+            "Optional task id to bind test_run attestation "
+            "(reviewers: pass the task under review)."
+        ),
+        json_schema_extra={"aliases": ["taskId", "task_id"]},
+    )
 
 
 class RunCommandParams(BaseModel):
@@ -1044,11 +1056,99 @@ class RunCommandParams(BaseModel):
         description="Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds.",
         json_schema_extra={"aliases": ["timeout_ms", "timeoutMs"]},
     )
+    task_id: str | None = Field(
+        default=None,
+        alias="taskId",
+        description=(
+            "Optional task id to bind test_run attestation "
+            "(reviewers: pass the task under review)."
+        ),
+        json_schema_extra={"aliases": ["taskId", "task_id"]},
+    )
+
+
+async def _resolve_test_attestation_task_id(
+    project_id: str,
+    agent_id: str,
+    explicit: str | None = None,
+) -> str | None:
+    """Bind test_run to a task: explicit → sole assignee active → sole creator review."""
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    from hiveweave.services.task import TaskService
+
+    ts = TaskService()
+    tasks = await ts.list_tasks(project_id, assignee_id=agent_id)
+    active = [t for t in tasks if t.get("status") in ("running", "claimed")]
+    if len(active) == 1:
+        return active[0].get("id")
+    # Reviewer path: submitted/reviewing where this agent is creator
+    try:
+        all_tasks = await ts.list_tasks(project_id)
+    except Exception:
+        return None
+    reviewing = [
+        t for t in (all_tasks or [])
+        if t.get("status") in ("submitted", "reviewing")
+        and str(t.get("creator_id") or "") == str(agent_id)
+    ]
+    if len(reviewing) == 1:
+        return reviewing[0].get("id")
+    return None
+
+
+async def _issue_test_run_attestation(
+    *,
+    project_id: str,
+    agent_id: str,
+    command: str,
+    workspace: str,
+    stdout: str,
+    exit_code: int,
+    task_id: str | None,
+) -> str:
+    """Create test_run attestation (success or failure). Return note fragment."""
+    from hiveweave.services.attestation import (
+        attestation_service,
+        is_test_command,
+    )
+    from hiveweave.services.task import TaskService
+
+    if not is_test_command(command or ""):
+        return ""
+    resolved = await _resolve_test_attestation_task_id(
+        project_id, agent_id, task_id
+    )
+    aid = await attestation_service.create(
+        project_id,
+        agent_id=agent_id,
+        kind="test_run",
+        command_or_url=(command or "")[:500],
+        exit_code=int(exit_code) if exit_code is not None else 1,
+        workspace=workspace or "",
+        stdout=str(stdout)[-8000:],
+        task_id=resolved,
+    )
+    note = f"\n\n[attestation_id={aid} kind=test_run exit={exit_code}]"
+    if resolved and int(exit_code or 1) == 0:
+        try:
+            await TaskService().emit_task_event(
+                project_id,
+                resolved,
+                "test_attestation",
+                agent_id=agent_id,
+                summary=(
+                    f"[test_attestation] task {resolved[:8]} via shell"
+                ),
+            )
+        except Exception:
+            pass
+    return note
 
 
 @tool(
     "bash",
-    "Executes a shell command on the local system. Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command.",
+    "Executes a shell command on the local system. Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command. For reviewer test_run binding pass taskId.",
     requires_workspace=True,
     security_level="shell",
 )
@@ -1074,64 +1174,38 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
     _streak_hint = _update_cwd_failure_streak(
         agent_id, workspace, bool(result.get("success"))
     )
-    if result.get("success"):
-        out = result["output"]
-        # Phase 3: attest test runs
-        try:
-            from hiveweave.services.attestation import (
-                attestation_service,
-                is_test_command,
+    out = result.get("output") or ""
+    exit_code = result.get("exit_code")
+    if exit_code is None:
+        exit_code = 0 if result.get("success") else 1
+    # TEST6 P0-3: record failed test runs too (exit≠0); P0-2: bind reviewer taskId
+    attest_note = ""
+    try:
+        if project_id:
+            attest_note = await _issue_test_run_attestation(
+                project_id=project_id,
+                agent_id=agent_id,
+                command=params.command or "",
+                workspace=workspace or "",
+                stdout=str(out),
+                exit_code=int(exit_code),
+                task_id=getattr(params, "task_id", None),
             )
-            from hiveweave.services.task import TaskService
-
-            if project_id and is_test_command(params.command or ""):
-                tasks = await TaskService().list_tasks(
-                    project_id, assignee_id=agent_id
-                )
-                active = [
-                    t for t in tasks if t.get("status") in ("running", "claimed")
-                ]
-                task_id = active[0].get("id") if len(active) == 1 else None
-                aid = await attestation_service.create(
-                    project_id,
-                    agent_id=agent_id,
-                    kind="test_run",
-                    command_or_url=(params.command or "")[:500],
-                    exit_code=0,
-                    workspace=workspace or "",
-                    stdout=str(out)[-8000:],
-                    task_id=task_id,
-                )
-                out = f"{out}\n\n[attestation_id={aid} kind=test_run]"
-                if task_id:
-                    try:
-                        await TaskService().emit_task_event(
-                            project_id,
-                            task_id,
-                            "test_attestation",
-                            agent_id=agent_id,
-                            summary=(
-                                f"[test_attestation] task {task_id[:8]} "
-                                f"via shell"
-                            ),
-                        )
-                    except Exception:
-                        pass
-        except Exception as _att_err:
-            # 此前静默 pass，attestation 签发失败无从排查（submit 被拒时
-            # agent 完全不知道原因）。工具主流程不受影响，仅记录。
-            log.warning("bash_attest_issue_failed", error=str(_att_err))
-        return ToolResult.ok(out)
-    # For bash, output contains the command output even on failure
+    except Exception as _att_err:
+        log.warning("bash_attest_issue_failed", error=str(_att_err))
+    if result.get("success"):
+        return ToolResult.ok(f"{out}{attest_note}")
     err_msg = result.get("error", "Command failed")
     if _streak_hint:
         err_msg = f"{err_msg}{_streak_hint}"
+    if attest_note:
+        err_msg = f"{err_msg}{attest_note}"
     return ToolResult.err(err_msg)
 
 
 @tool(
     "run_command",
-    "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command.",
+    "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command. For reviewer test_run binding pass taskId.",
     requires_workspace=True,
     security_level="shell",
 )
@@ -1157,54 +1231,29 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
     _streak_hint = _update_cwd_failure_streak(
         agent_id, _effective_cwd, bool(result.get("success"))
     )
-    if result.get("success"):
-        out = result["output"]
-        try:
-            from hiveweave.services.attestation import (
-                attestation_service,
-                is_test_command,
+    out = result.get("output") or ""
+    exit_code = result.get("exit_code")
+    if exit_code is None:
+        exit_code = 0 if result.get("success") else 1
+    attest_note = ""
+    try:
+        if project_id:
+            attest_note = await _issue_test_run_attestation(
+                project_id=project_id,
+                agent_id=agent_id,
+                command=params.command or "",
+                workspace=workspace or "",
+                stdout=str(out),
+                exit_code=int(exit_code),
+                task_id=getattr(params, "task_id", None),
             )
-            from hiveweave.services.task import TaskService
-
-            if project_id and is_test_command(params.command or ""):
-                tasks = await TaskService().list_tasks(
-                    project_id, assignee_id=agent_id
-                )
-                active = [
-                    t for t in tasks if t.get("status") in ("running", "claimed")
-                ]
-                task_id = active[0].get("id") if len(active) == 1 else None
-                aid = await attestation_service.create(
-                    project_id,
-                    agent_id=agent_id,
-                    kind="test_run",
-                    command_or_url=(params.command or "")[:500],
-                    exit_code=0,
-                    workspace=workspace or "",
-                    stdout=str(out)[-8000:],
-                    task_id=task_id,
-                )
-                out = f"{out}\n\n[attestation_id={aid} kind=test_run]"
-                if task_id:
-                    try:
-                        await TaskService().emit_task_event(
-                            project_id,
-                            task_id,
-                            "test_attestation",
-                            agent_id=agent_id,
-                            summary=(
-                                f"[test_attestation] task {task_id[:8]} "
-                                f"via shell"
-                            ),
-                        )
-                    except Exception:
-                        pass
-        except Exception as _att_err:
-            # 此前静默 pass，attestation 签发失败无从排查（submit 被拒时
-            # agent 完全不知道原因）。工具主流程不受影响，仅记录。
-            log.warning("bash_attest_issue_failed", error=str(_att_err))
-        return ToolResult.ok(out)
+    except Exception as _att_err:
+        log.warning("bash_attest_issue_failed", error=str(_att_err))
+    if result.get("success"):
+        return ToolResult.ok(f"{out}{attest_note}")
     err_msg = result.get("error", "Command failed")
     if _streak_hint:
         err_msg = f"{err_msg}{_streak_hint}"
+    if attest_note:
+        err_msg = f"{err_msg}{attest_note}"
     return ToolResult.err(err_msg)

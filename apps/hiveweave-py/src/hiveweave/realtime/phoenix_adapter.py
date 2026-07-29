@@ -511,13 +511,14 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
     if agent.status.value == "processing":
         # Agent busy — queue via inbox. Save to chat so user sees it,
         # send to inbox so agent picks it up when idle.
-        import json as _json
-        queued = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)
+        # Store PLAIN text only: from_agent_id + message_type already identify
+        # the sender. Pre-wrapping {"from","content"} caused trigger digests to
+        # double-encode the body (nested JSON → apparent amnesia).
         await _save_user_and_ack()
         # Queue to inbox for processing when agent becomes idle
         from hiveweave.services.inbox import InboxService
         await InboxService().send_message(
-            from_agent_id="用户", to_agent_id=agent_id, message=queued,
+            from_agent_id="用户", to_agent_id=agent_id, message=message,
             message_type="user_message", priority="normal",
         )
         await send_fn(

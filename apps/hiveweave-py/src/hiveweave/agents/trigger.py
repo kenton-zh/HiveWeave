@@ -212,25 +212,45 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
         # Also proceed when undelivered background holds task-gate notices
         # (historical wake=0 TASK SUBMITTED / REWORK — TEST3 Phase C starve).
         if trigger_type == "coordinator":
-            pending = await _inbox_service.get_pending_messages(agent_id)
+            from hiveweave.services.inbox import (
+                filter_actionable_pending,
+                is_fyi_task_event,
+            )
+
+            pending_raw = await _inbox_service.get_pending_messages(agent_id)
             # Filter out task_event notifications — these are FYI-only and
             # should NOT wake the coordinator (they cause busy-wait loops
             # where CEO does get_tasks → commit_turn(waiting) → repeat).
             # Only actionable messages (task submissions, rework, human chat,
             # agent-to-agent asks) should trigger a coordinator turn.
-            pending = [
-                m for m in (pending or [])
-                if (m.get("message_type") or "").lower() != "task_event"
+            pending = filter_actionable_pending(pending_raw)
+            fyi_pending = [
+                m for m in (pending_raw or []) if is_fyi_task_event(m)
             ]
             if not pending:
+                # TEST6 P1-1: ACK scanned FYI so watcher stops re-triggering
+                if fyi_pending:
+                    try:
+                        await _inbox_service.mark_read_by_ids(
+                            agent_id,
+                            [str(m["id"]) for m in fyi_pending if m.get("id")],
+                        )
+                        log.info(
+                            "trigger_coordinator_acked_fyi_task_events",
+                            agent_id=agent_id,
+                            count=len(fyi_pending),
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "trigger_coordinator_ack_fyi_failed",
+                            agent_id=agent_id,
+                            error=str(e),
+                        )
                 background = await _inbox_service.get_undelivered_background(
                     agent_id
                 )
                 # Also filter task_event from background check
-                background = [
-                    m for m in (background or [])
-                    if (m.get("message_type") or "").lower() != "task_event"
-                ]
+                background = filter_actionable_pending(background)
                 if not _has_task_gate_messages(background):
                     log.info(
                         "trigger_coordinator_no_messages",
@@ -663,12 +683,14 @@ async def build_trigger_context(
     # ── 3. Messages — full text, chronological; reply_required from expect_report ──
     if other_msgs:
         import json as _json
+        from hiveweave.services.inbox import inbox_digest_content
         lines = []
         for m in other_msgs:
             entry = {
                 "id": (m.get("id") or "")[:8],
                 "from": await _agent_name(m.get("from_agent_id", "")),
-                "content": m.get("message") or "",
+                # Unwrap legacy busy-queue envelopes so digests stay single-layer
+                "content": inbox_digest_content(m),
             }
             # D3: 始终显式输出 reply_required 字段（true/false），
             # 避免 false 时省略导致模型脑补幽灵义务

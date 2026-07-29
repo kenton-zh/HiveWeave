@@ -20,15 +20,9 @@ from hiveweave.db.project import ProjectDbError, ensure_project_db
 
 # Minimal environment variable whitelist for alarm script execution.
 # Filters out API keys, DB credentials, and other sensitive env vars.
-_SAFE_ENV_KEYS = frozenset({
-    "PATH", "HOME", "USER", "USERNAME", "USERPROFILE",
-    "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
-    "LANG", "LC_ALL", "LC_CTYPE",
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-    "VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME", "PYTHONIOENCODING",
-    "NODE_PATH", "NODE_OPTIONS",
-    "PROJECT_NAME", "PROJECT_ID",
-})
+# Canonical definition: hiveweave.util.safe_env (shared with MCP stdio).
+from hiveweave.util.safe_env import SAFE_ENV_KEYS as _SAFE_ENV_KEYS  # noqa: F401
+from hiveweave.util.safe_env import filtered_environ
 
 log = structlog.get_logger(__name__)
 
@@ -1086,7 +1080,63 @@ class GameTimeService:
                 continue
             tid = str(t.get("id") or "")
             assignee = t.get("assignee_id")
-            if not tid or not assignee:
+            if not tid:
+                continue
+            # TEST6 P1-4: unassigned created orphans — nudge creator to
+            # dispatch_task / claim / archive (stall previously skipped them).
+            if not assignee:
+                if status != "created":
+                    continue
+                creator = t.get("creator_id")
+                if not creator:
+                    continue
+                if t.get("owner_parked"):
+                    continue
+                age = _effective_age_ms(t)
+                if age < thresh:
+                    task_stall_counts.pop(tid, None)
+                    continue
+                if not _cooled(f"orphan:{tid}", TASK_STALL_COOLDOWN_MS):
+                    continue
+                title = (t.get("title") or "(untitled)").split("\n")[0][:50]
+                stall_count = task_stall_counts.get(tid, 0) + 1
+                task_stall_counts[tid] = stall_count
+                mins = thresh // 60000
+                body = (
+                    f"[ORPHAN TASK] Task '{title}' ({tid[:8]}) is still "
+                    f"created with no assignee after >{mins}min. "
+                    f"Call dispatch_task(taskId=\"{tid}\", ...) to assign, "
+                    f"or cancel_task if obsolete. send_message alone does "
+                    f"NOT enter the ledger."
+                )
+                try:
+                    await inbox.send_message(
+                        from_agent_id="system",
+                        to_agent_id=str(creator),
+                        message=body,
+                        message_type="task",
+                        priority="urgent",
+                        task_id=tid,
+                        wake=True,
+                        idempotency_key=(
+                            f"orphan_task:{tid}:"
+                            f"{int(time.time() * 1000) // TASK_STALL_COOLDOWN_MS}"
+                        ),
+                    )
+                    await self._watchdog_trigger(str(creator))
+                    log.info(
+                        "orphan_task_stall_nudge",
+                        project_id=project_id,
+                        task_id=tid,
+                        creator=creator,
+                        stall_count=stall_count,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "orphan_task_stall_nudge_failed",
+                        task_id=tid,
+                        error=str(e),
+                    )
                 continue
             # TEST21 M5: owner parked — stall mute until agent recovers
             if t.get("owner_parked"):
@@ -1173,6 +1223,7 @@ class GameTimeService:
                         )
 
         # ── approved (non-VERIFY) → [MERGE PENDING] and/or [MERGE PROXY] ──
+        # NOTE: the orphan/assignee stall loop ends above; do not duplicate.
         for t in tasks:
             if t.get("status") != "approved":
                 continue
@@ -1581,10 +1632,7 @@ class GameTimeService:
                     log.warning("alarm_script_blocked", alarm_id=alarm["id"], reason=reason)
                     # 跳过脚本执行，继续后续 inbox 通知
                 else:
-                    safe_env = {
-                        k: v for k, v in os.environ.items()
-                        if k.upper() in _SAFE_ENV_KEYS
-                    }
+                    safe_env = filtered_environ()
                     from hiveweave.util.win_subprocess import windows_no_window_kwargs
 
                     # Security: 用 create_subprocess_exec + shlex.split 取代

@@ -179,6 +179,12 @@ async def browse_exec(
     argv = [str(a) for a in argv]
     if argv and (argv[0] or "").lower() == "evaluate":
         argv = ["js", *argv[1:]]
+    if argv and (argv[0] or "").lower() == "eval":
+        argv = ["js", *argv[1:]]
+
+    # TEST6 P0-1: gstack ``js`` treats arg as a file path. Inline expressions
+    # (what agents write after gate hints) must be materialised to a tempfile.
+    argv = _materialize_inline_js(argv, workspace)
 
     timeout = max(5, min(int(timeout_sec or 60), 300))
     head = (argv[0] or "").lower().replace("-", "_") if argv else ""
@@ -215,6 +221,42 @@ async def browse_exec(
     stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
     code = proc.returncode if proc.returncode is not None else -1
     return code, stdout, stderr
+
+
+def _materialize_inline_js(argv: list[str], workspace: str) -> list[str]:
+    """If ``js <src>`` is not an existing file, write inline JS to a tempfile."""
+    import tempfile
+
+    if len(argv) < 2:
+        return argv
+    head = (argv[0] or "").lower()
+    if head not in ("js", "eval", "evaluate"):
+        return argv
+    src = argv[1] or ""
+    # Already a real file (absolute or workspace-relative)
+    candidates = [Path(src)]
+    if workspace:
+        candidates.append(Path(workspace) / src)
+    for p in candidates:
+        try:
+            if p.is_file():
+                out = list(argv)
+                out[0] = "js"
+                out[1] = str(p.resolve())
+                return out
+        except OSError:
+            continue
+    # Inline expression / snippet → tempfile
+    try:
+        fd, path = tempfile.mkstemp(prefix="hw_browse_", suffix=".js")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(src)
+        out = list(argv)
+        out[0] = "js"
+        out[1] = path
+        return out
+    except OSError:
+        return argv
 
 
 def browse_missing_bin_hint() -> str:

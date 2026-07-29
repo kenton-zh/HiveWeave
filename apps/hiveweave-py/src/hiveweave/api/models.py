@@ -634,8 +634,20 @@ def _normalize_attrs(body: BaseModel) -> dict:
     return out
 
 
+def _mask_api_key(key: str | None) -> str | None:
+    """HTTP 出口统一脱敏：有值则只露末 4 位，避免 list/get 行为不一致泄密。"""
+    if key is None:
+        return None
+    if key == "":
+        return ""
+    if len(key) <= 4:
+        return "****"
+    return ("*" * (len(key) - 4)) + key[-4:]
+
+
 def _model_response(model: dict) -> dict:
-    """同时输出 snake_case 与 camelCase 字段。"""
+    """同时输出 snake_case 与 camelCase 字段（api_key 一律脱敏）。"""
+    masked = _mask_api_key(model.get("api_key"))
     return {
         "id": model.get("id"),
         "name": model.get("name"),
@@ -643,8 +655,8 @@ def _model_response(model: dict) -> dict:
         "modelId": model.get("model_id"),
         "base_url": model.get("base_url"),
         "baseUrl": model.get("base_url"),
-        "api_key": model.get("api_key"),
-        "apiKey": model.get("api_key"),
+        "api_key": masked,
+        "apiKey": masked,
         "provider_type": model.get("provider_type"),
         "providerType": model.get("provider_type"),
         "context_window": model.get("context_window"),

@@ -256,8 +256,26 @@ class ConversationStore:
             return
         async with lock:
             try:
+                # 治根（audit T1#2）：持锁后重读 cache，不用 enqueue 时的快照。
+                # 前次压缩会缩短 cache，len(cache)>original_len 启发式必然失效。
+                live = self._clean_messages(list(self._cache.get(key, []) or []))
+                if not live:
+                    return
+
+                def _msg_fp(m: dict) -> tuple:
+                    tc = m.get("tool_calls")
+                    return (
+                        m.get("role"),
+                        m.get("content") or "",
+                        json.dumps(tc, sort_keys=True, ensure_ascii=False)
+                        if tc
+                        else None,
+                    )
+
+                anchor_fp = _msg_fp(live[-1]) if live else None
+
                 callback = await resolve_compactor_callback(agent_id)
-                compacted = await self._compaction.compact(messages, budget, callback)
+                compacted = await self._compaction.compact(live, budget, callback)
 
                 # 提取摘要到 prefix_cache，history 不含 summary（RECONCILE A1）
                 summary_text = None
@@ -269,16 +287,24 @@ class ConversationStore:
                     else:
                         history.append(m)
 
-                # C3 fix: merge 而非覆盖 — _do_compaction 是 fire-and-forget task，
-                # 耗时数秒，期间 append_turn 可能在 self._cache[key] 追加了新消息。
-                # 直接覆盖会丢失这些新消息。这里读取当前缓存尾部（压缩期间新增的）
-                # 追加到压缩结果后面再写回缓存。
-                original_len = len(messages)
-                current_cache = self._cache.get(key, [])
-                if len(current_cache) > original_len:
-                    # 压缩期间新增的消息 = 当前缓存中超出原始 messages 数量的尾部
-                    new_messages = current_cache[original_len:]
-                    history = history + new_messages
+                # Merge messages appended while compact awaited (identity via
+                # last live message fingerprint — not length arithmetic).
+                post = self._cache.get(key, []) or []
+                if anchor_fp is not None and post:
+                    last_i = -1
+                    for i, m in enumerate(post):
+                        if isinstance(m, dict) and _msg_fp(m) == anchor_fp:
+                            last_i = i
+                    if last_i >= 0 and last_i + 1 < len(post):
+                        history = history + list(post[last_i + 1 :])
+                    elif last_i < 0:
+                        # Anchor vanished (concurrent rewrite) — keep live cache,
+                        # do not overwrite with compacted history (silent loss).
+                        logger.warning(
+                            "compaction_anchor_miss_keep_live",
+                            agent_id=agent_id,
+                        )
+                        return
 
                 self._cache[key] = history
                 if summary_text is not None:

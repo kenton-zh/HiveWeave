@@ -13,6 +13,7 @@ The host class (ToolExecutor) must provide:
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Protocol
 
 import structlog
@@ -1208,10 +1209,28 @@ class SubmitTaskParams(BaseModel):
         alias="coreInteractionExecuted",
         description=(
             "UI VERIFY: true when core canvas/DOM interaction was exercised "
-            "(browse js/eval or manual attestation)."
+            "(browse js/eval or manual attestation). Prefer leaving unset — "
+            "platform auto-accepts when a core_interaction browse_e2e "
+            "attestation exists for this task."
         ),
         json_schema_extra={
             "aliases": ["coreInteractionExecuted", "core_interaction_executed"]
+        },
+    )
+    failures_acknowledged: list[dict[str, Any]] | None = Field(
+        default=None,
+        alias="failuresAcknowledged",
+        description=(
+            "VERIFY only: when testOutput reports N>0 failures, provide a "
+            "structured list of {test, reason} entries (one per failing case "
+            "or group). Free-text excuses are rejected."
+        ),
+        json_schema_extra={
+            "aliases": [
+                "failuresAcknowledged",
+                "failures_acknowledged",
+                "acknowledgedFailures",
+            ]
         },
     )
     commit_hash: str | None = Field(
@@ -1355,12 +1374,68 @@ async def submit_task_tool(
         or parent_policy == "ui_browser_e2e"
         or "ui" in {str(t).lower() for t in (parent_tags if isinstance(parent_tags, list) else [])}
     )
-    if ui_verify and not getattr(params, "core_interaction_executed", None):
-        return ToolResult.err(
-            "UI VERIFY submit rejected: coreInteractionExecuted=true required. "
-            "Run browse js/eval for canvas interaction or set "
-            "coreInteractionExecuted after verified core_interaction attestation."
+    if ui_verify:
+        from hiveweave.services.attestation import find_core_interaction_attestation
+
+        core_att = await find_core_interaction_attestation(
+            project_id, task_id, agent_id
         )
+        # Also accept any-agent attestation on this task (delegated VERIFY)
+        if not core_att:
+            core_att = await find_core_interaction_attestation(
+                project_id, task_id, None
+            )
+        has_flag = bool(getattr(params, "core_interaction_executed", None))
+        if not core_att:
+            return ToolResult.err(
+                "UI VERIFY submit rejected: need a browse_e2e attestation "
+                "with [core_interaction=1] (boolean flags alone do not unlock).\n"
+                "Do:\n"
+                f"1) browse(args=[\"js\",\"() => document.querySelector("
+                f"'canvas')?.dispatchEvent(new MouseEvent('click'))\"], "
+                f"taskId=\"{task_id}\")\n"
+                f"2) Then submit_task(..., taskId=\"{task_id}\") — platform "
+                f"auto-attaches the core_interaction attestation.\n"
+                + (
+                    "Note: coreInteractionExecuted=true was set but no matching "
+                    "attestation exists — inventing the flag is rejected."
+                    if has_flag
+                    else ""
+                )
+            )
+        if core_att and core_att not in attest_ids:
+            attest_ids.append(core_att)
+
+    # TEST6 P0-3: VERIFY with reported failures must acknowledge structurally
+    if is_verify:
+        from hiveweave.services.attestation import count_reported_test_failures
+
+        fail_n = count_reported_test_failures(params.test_output)
+        if fail_n is not None and fail_n > 0:
+            from hiveweave.services.attestation import required_failure_acks
+
+            required = required_failure_acks(fail_n)
+            acks = getattr(params, "failures_acknowledged", None) or []
+            if not isinstance(acks, list) or len(acks) < required:
+                return ToolResult.err(
+                    f"VERIFY submit rejected: testOutput reports {fail_n} "
+                    f"failed test(s); need failuresAcknowledged with at least "
+                    f"{required} {{test, reason}} entries "
+                    f"(got {len(acks) if isinstance(acks, list) else 0}). "
+                    f"Either rework until green, or acknowledge structurally "
+                    f"(free-text excuses alone are not accepted)."
+                )
+            bad = [
+                a for a in acks
+                if not isinstance(a, dict)
+                or not str(a.get("test") or a.get("name") or "").strip()
+                or not str(a.get("reason") or a.get("why") or "").strip()
+            ]
+            if bad:
+                return ToolResult.err(
+                    "VERIFY submit rejected: each failuresAcknowledged entry "
+                    "must be {test, reason} with non-empty fields."
+                )
 
     if needed:
         # Waiver 短路：coordinator 已显式豁免（CLI/脚本类任务正式出口）
@@ -1444,6 +1519,8 @@ async def submit_task_tool(
         )
     if getattr(params, "core_interaction_executed", None):
         evidence["core_interaction_executed"] = True
+    if getattr(params, "failures_acknowledged", None):
+        evidence["failures_acknowledged"] = params.failures_acknowledged
     if getattr(params, "env_snapshot", None):
         evidence["env_snapshot"] = str(params.env_snapshot)[:4000]
     if params.files_changed:
@@ -1673,22 +1750,37 @@ async def review_task_tool(
         # D1: VERIFY 审门 —— 如果有有效的 waiver，跳过所有身份门禁。
         # 小团队可能没有合法的第四方独立审查员。waive_attestation 作为
         # CEO override 通道，审计痕迹留在 waiver 表中。
+        # TEST6 P0-2: 豁免人不得与批准人相同（waive→approve 需第三人）。
         verify_waived = False
+        waiver_row = None
         ceo_merger_override = False
         if ts._is_verify_task(task):
-            from hiveweave.services.attestation import has_valid_waiver
-            verify_waived = await has_valid_waiver(project_id, params.task_id)
+            from hiveweave.services.attestation import get_valid_waiver
+
+            waiver_row = await get_valid_waiver(project_id, params.task_id)
+            verify_waived = waiver_row is not None
+
+        # Also load waiver for non-VERIFY approve path (P0-2 isolation)
+        if waiver_row is None:
+            from hiveweave.services.attestation import get_valid_waiver
+
+            waiver_row = await get_valid_waiver(project_id, params.task_id)
 
         # Hard gate: 禁自审 —— reviewer 不得等于 assignee。
         # 有 waiver 时跳过（D1: CEO override 通道）
-        if not verify_waived:
-            assignee_id = task.get("assignee_id")
-            if assignee_id and str(assignee_id) == str(agent_id):
-                return ToolResult.err(
-                    "Self-review is forbidden: you are the assignee of this task. "
-                    "Your submission goes to your superior (or task creator) for "
-                    "review — do not approve your own deliverable."
-                )
+        # Hard gate: assignee == reviewer is NEVER waived (third-party isolation).
+        # Waiver only unlocks attestation / VERIFY independent-reviewer set.
+        assignee_id = task.get("assignee_id")
+        if assignee_id and str(assignee_id) == str(agent_id):
+            from hiveweave.services.unblock_soft import soft_reminder_after_self_review_deny
+
+            extra = soft_reminder_after_self_review_deny(has_waiver=bool(waiver_row))
+            return ToolResult.err(
+                "Self-review is forbidden: you are the assignee of this task. "
+                "Your submission goes to your superior (or task creator) for "
+                "review — do not approve your own deliverable."
+                + extra
+            )
 
         if ts._is_verify_task(task) and not verify_waived:
             forbidden: set[str] = set()
@@ -1783,6 +1875,18 @@ async def review_task_tool(
             from hiveweave.services.attestation import has_valid_waiver
 
             waived = await has_valid_waiver(project_id, params.task_id)
+            # TEST6 P0-2: waived_by must not be the approver
+            if waived and waiver_row:
+                waived_by = str(waiver_row.get("agent_id") or "")
+                if waived_by and waived_by == str(agent_id):
+                    return ToolResult.err(
+                        "Cannot approve: you issued the waiver for this task. "
+                        "waive→approve requires a third party "
+                        f"(waived_by={waived_by[:8]}…). "
+                        "Ask another coordinator/CEO to approve, or obtain "
+                        "real reviewer test_run attestation and approve "
+                        "without relying on your own waiver."
+                    )
             if needed and not waived:
                 aids = evidence.get("attestation_ids") or []
                 if not isinstance(aids, list):
@@ -1806,7 +1910,9 @@ async def review_task_tool(
                         f"2) Send rework; require assignee to attach real "
                         f"browse/test/doc_review attestationIds on resubmit.\n"
                         f"3) Last resort: waive_attestation(taskId=\"{tid}\", "
-                        f"reason=\"<why exempt>\") then approve again."
+                        f"evidenceAttestationId=\"<test_run|browse_e2e id>\", "
+                        f"reason=\"<why exempt>\") then a *different* agent "
+                        f"approves (waived_by cannot approve)."
                     )
             elif not needed and not waived and evidence.get("tests_passed") is not True:
                 # Soft path: tests_passed ack OR any real attestationIds OR waiver
@@ -1824,7 +1930,8 @@ async def review_task_tool(
                     return ToolResult.err(
                         "Cannot approve without tests_passed=true, "
                         "attestationIds (browse_e2e / test_run / doc_review), "
-                        "or waive_attestation. Prefer attest_doc_review for "
+                        "or waive_attestation(+evidenceAttestationId). "
+                        "Prefer attest_doc_review for "
                         "document VERIFY instead of waiving."
                     )
 
@@ -1840,8 +1947,18 @@ async def review_task_tool(
 
             rev_needed = reviewer_required_kinds(policy_id)
             if rev_needed and not waived:
+                # Soft unblock (facts): CEO/reviewer may consume same-task
+                # assignee fresh test_run — not a structured next-action command.
+                consume_ids: list[str] = []
+                asg = task.get("assignee_id")
+                if asg and str(asg) != str(agent_id):
+                    consume_ids.append(str(asg))
                 has_rev = await find_reviewer_attestation(
-                    project_id, params.task_id, agent_id, rev_needed
+                    project_id,
+                    params.task_id,
+                    agent_id,
+                    rev_needed,
+                    consume_agent_ids=consume_ids or None,
                 )
                 if not has_rev:
                     tid = task.get("id") or params.task_id
@@ -1851,14 +1968,15 @@ async def review_task_tool(
                         f"execution evidence on this task.\n"
                         f"Required reviewer kind(s): {kinds_str}.\n"
                         f"Before approving, run the project's tests yourself "
-                        f"(e.g. `run_tests` or `bash` with a test command) "
+                        f"(e.g. `bash`/`run_command` with taskId=\"{tid}\") "
                         f"so the platform records your attestation.\n"
                         f"taskId={tid}. Options:\n"
                         f"1) Run tests in the assignee's worktree or on main "
                         f"(after merge), then approve again.\n"
                         f"2) waive_attestation(taskId=\"{tid}\", "
-                        f"reason=\"<why reviewer execution exempt>\") "
-                        f"as last resort (CEO/coordinator only)."
+                        f"evidenceAttestationId=\"<id>\", "
+                        f"reason=\"...\") as last resort — then a *different* "
+                        f"agent must approve (you cannot approve your own waiver)."
                     )
 
             # (1) Force worktree context — ensure assignee tree exists, then gate.
@@ -2282,6 +2400,18 @@ async def cancel_task_tool(
         return ToolResult.err("cancel_task requires a non-empty 'reason'.")
 
     ts = TaskService()
+    # Soft unblock forbid: do not cancel merely to escape a review deadlock.
+    try:
+        task_row = await ts.get_task(project_id, params.task_id)
+    except Exception:
+        task_row = None
+    if task_row:
+        from hiveweave.services.unblock_soft import review_deadlock_blocks_cancel
+
+        forbid = await review_deadlock_blocks_cancel(project_id, task_row)
+        if forbid:
+            return ToolResult.err(forbid)
+
     try:
         from_status = await ts.archive_task(
             project_id, params.task_id, archived_by=agent_id, reason=reason
@@ -2455,15 +2585,31 @@ class WaiveAttestationParams(BaseModel):
         description="Why this task is exempt (e.g. 'CLI 任务无 UI 可 browse，"
         "以 bash 验证日志替代'). Required for auditability.",
     )
+    evidence_attestation_id: str = Field(
+        alias="evidenceAttestationId",
+        description=(
+            "REQUIRED: id of an execution attestation (test_run / browse_e2e / "
+            "visual_check / doc_review) that backs this waiver. Pure read_file "
+            "review is not accepted — the escape hatch must cite machine evidence."
+        ),
+        json_schema_extra={
+            "aliases": [
+                "evidenceAttestationId",
+                "evidence_attestation_id",
+                "attestationId",
+                "attestation_id",
+            ]
+        },
+    )
 
 
 @tool(
     "waive_attestation",
-    "Last-resort waiver of the attestation gate (coordinator only). "
-    "Prefer attest_doc_review for document/spec VERIFY (files on main + hash) "
-    "instead of waiving. Use waive only when no machine attestation kind fits "
-    "(auditable, 24h expiry). After waiving, assignee can submit without "
-    "attestationIds / identity gates may relax for VERIFY.",
+    "Last-resort waiver of the attestation gate (coordinator/CEO). "
+    "Requires evidenceAttestationId citing a real test_run/browse_e2e/"
+    "visual_check/doc_review row. Max 2 waivers per task. The waiving agent "
+    "CANNOT later approve the same task (third-party isolation). "
+    "Prefer attest_doc_review for document/spec VERIFY instead of waiving.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -2474,7 +2620,16 @@ async def waive_attestation_tool(
 
     替代过去的 charter 口头豁免（工具层不读 charter，口头豁免无效）。
     """
-    from hiveweave.services.attestation import create_waiver
+    from hiveweave.services.attestation import (
+        BROWSE_E2E_KIND,
+        MAX_WAIVERS_PER_TASK,
+        VISUAL_CHECK_KIND,
+        WAIVER_EVIDENCE_KINDS,
+        attestation_service,
+        count_waivers,
+        create_waiver,
+        has_valid_waiver,
+    )
     from hiveweave.services.org import OrgService
     from hiveweave.services.policy import infer_role_family
 
@@ -2493,6 +2648,14 @@ async def waive_attestation_tool(
             "State what was checked and why machine attestation cannot apply."
         )
 
+    evidence_id = (params.evidence_attestation_id or "").strip()
+    if not evidence_id:
+        return ToolResult.err(
+            "waive_attestation requires evidenceAttestationId — cite a "
+            "test_run / browse_e2e / visual_check / doc_review attestation. "
+            "read_file-only review is not accepted (TEST6 P0-2)."
+        )
+
     ts = TaskService()
     try:
         task = await ts.get_task(project_id, params.task_id)
@@ -2500,6 +2663,55 @@ async def waive_attestation_tool(
         return ToolResult.err(f"Failed to load task: {e}")
     if not task:
         return ToolResult.err(f"Task not found: {params.task_id}")
+
+    # Lifetime cap — escape hatch must stay narrower than the front door
+    prior = await count_waivers(project_id, params.task_id)
+    if prior >= MAX_WAIVERS_PER_TASK:
+        return ToolResult.err(
+            f"waive_attestation rejected: task {params.task_id} already has "
+            f"{prior} waiver(s) (max {MAX_WAIVERS_PER_TASK}). "
+            "Obtain real attestation evidence instead."
+        )
+    if await has_valid_waiver(project_id, params.task_id):
+        return ToolResult.err(
+            f"waive_attestation rejected: task {params.task_id} already has "
+            "an unexpired waiver. Wait for expiry or approve via a different "
+            "agent (waived_by cannot approve)."
+        )
+
+    # Evidence attestation must be a real execution kind (not another waiver)
+    try:
+        await attestation_service.ensure_schema(project_id)
+        ev = await attestation_service.get(project_id, evidence_id)
+    except Exception as e:
+        return ToolResult.err(f"Failed to load evidence attestation: {e}")
+    if not ev:
+        return ToolResult.err(
+            f"evidenceAttestationId not found: {evidence_id}"
+        )
+    ev_kind = (ev.get("kind") or "").strip()
+    if ev_kind not in WAIVER_EVIDENCE_KINDS:
+        return ToolResult.err(
+            f"evidenceAttestationId kind '{ev_kind}' is not execution evidence. "
+            f"Allowed: {sorted(WAIVER_EVIDENCE_KINDS)}."
+        )
+    ev_task = ev.get("task_id")
+    if not ev_task or str(ev_task) != str(params.task_id):
+        return ToolResult.err(
+            f"evidenceAttestationId must be bound to this task "
+            f"(attestation task_id={ev_task!r}, waive for {params.task_id}). "
+            "Null/mismatched evidence cannot unlock an arbitrary task."
+        )
+    ev_exit = ev.get("exit_code")
+    if (
+        ev_exit is not None
+        and int(ev_exit) != 0
+        and ev_kind in ("test_run", VISUAL_CHECK_KIND, BROWSE_E2E_KIND)
+    ):
+        return ToolResult.err(
+            f"evidenceAttestationId {evidence_id} is a failed {ev_kind} "
+            f"(exit_code={ev_exit}); cannot unlock waiver."
+        )
 
     tags = task.get("tags") or []
     if isinstance(tags, str):
@@ -2541,7 +2753,7 @@ async def waive_attestation_tool(
             project_id,
             task_id=params.task_id,
             waived_by=agent_id,
-            reason=reason,
+            reason=f"[evidence={evidence_id}] {reason}",
         )
     except Exception as e:
         return ToolResult.err(f"Failed to create waiver: {e}")
@@ -3494,6 +3706,10 @@ async def _nudge_one_verify_task(
             f"submit_task(testsPassed=true, testOutput=...)."
         )
     try:
+        # TEST6 P1-2: time-bucketed idempotency so stale re-nudges can land
+        # after VERIFY_STALE_COOLDOWN (content-hash alone permanently deduped).
+        bucket = int(time.time() * 1000) // VERIFY_STALE_COOLDOWN_MS
+        idem_key = f"verify_stale:{tid}:{bucket}" if reason == "stale" else None
         await inbox.send_message(
             from_agent_id=from_agent_id,
             to_agent_id=assignee,
@@ -3501,6 +3717,7 @@ async def _nudge_one_verify_task(
             message_type="task",
             priority="urgent",
             task_id=tid,
+            idempotency_key=idem_key,
         )
     except ValueError:
         return False

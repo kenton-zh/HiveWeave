@@ -258,15 +258,15 @@ class AttestationService:
                 return False, f"Attestation task_id mismatch: {aid}"
             if not row.get("stdout_hash"):
                 return False, f"Attestation missing stdout_hash: {aid}"
-            # visual_check with verdict=fail stores exit_code=1 — must NOT
-            # unlock UI submit (audit row stays, gate requires pass).
-            if kind == VISUAL_CHECK_KIND:
+            # visual_check / test_run / browse_e2e with exit≠0 must NOT unlock
+            # gates (failed runs are still recorded for audit — TEST6 P0-3).
+            if kind in (VISUAL_CHECK_KIND, "test_run", BROWSE_E2E_KIND):
                 ec = row.get("exit_code")
                 if ec is not None and int(ec) != 0:
                     return (
                         False,
-                        f"visual_check {aid} has verdict=fail "
-                        f"(exit_code={ec}); only pass unlocks UI submit",
+                        f"{kind} {aid} has exit_code={ec}; "
+                        f"only pass (exit_code=0) unlocks submit/approve",
                     )
             seen_kinds.add(kind)
 
@@ -314,11 +314,12 @@ class AttestationService:
             params.extend(kinds_list)
         params.append(limit)
         cur = await conn.execute(
-            "SELECT id, task_id, kind, created_at FROM tool_attestations "
+            "SELECT id, task_id, kind, created_at, exit_code FROM tool_attestations "
             "WHERE project_id = ? AND agent_id = ? AND kind != ? "
             "AND (expires_at IS NULL OR expires_at > ?) "
             f"AND created_at >= ?{kind_clause} "
             "AND stdout_hash IS NOT NULL AND TRIM(stdout_hash) != '' "
+            "AND (exit_code IS NULL OR exit_code = 0) "
             "ORDER BY created_at DESC LIMIT ?",
             params,
         )
@@ -480,24 +481,159 @@ async def create_waiver(
 
 async def has_valid_waiver(project_id: str, task_id: str | None) -> bool:
     """任务是否有未过期的 waiver。"""
+    return (await get_valid_waiver(project_id, task_id)) is not None
+
+
+async def get_valid_waiver(
+    project_id: str, task_id: str | None
+) -> dict[str, Any] | None:
+    """Return the latest unexpired waiver row (incl. agent_id), or None."""
     if not task_id:
-        return False
+        return None
     await attestation_service.ensure_schema(project_id)
-    # project 不存在（ProjectDbError）时返回 False（无 waiver）
     try:
         conn = await _conn(project_id)
     except ProjectDbError:
-        return False
+        return None
     now = int(time.time() * 1000)
     cur = await conn.execute(
-        "SELECT 1 FROM tool_attestations "
+        "SELECT id, agent_id, task_id, kind, created_at, expires_at, "
+        "command_or_url, stdout_hash "
+        "FROM tool_attestations "
         "WHERE project_id = ? AND task_id = ? AND kind = ? "
-        "AND (expires_at IS NULL OR expires_at > ?) LIMIT 1",
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "ORDER BY created_at DESC LIMIT 1",
         [project_id, task_id, WAIVER_KIND, now],
     )
     row = await cur.fetchone()
     await cur.close()
-    return row is not None
+    if not row:
+        return None
+    keys = row.keys() if hasattr(row, "keys") else []
+    return {k: row[k] for k in keys}
+
+
+async def count_waivers(project_id: str, task_id: str | None) -> int:
+    """Total waiver rows ever issued for a task (including expired)."""
+    if not task_id:
+        return 0
+    await attestation_service.ensure_schema(project_id)
+    try:
+        conn = await _conn(project_id)
+    except ProjectDbError:
+        return 0
+    cur = await conn.execute(
+        "SELECT COUNT(*) AS c FROM tool_attestations "
+        "WHERE project_id = ? AND task_id = ? AND kind = ?",
+        [project_id, task_id, WAIVER_KIND],
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row:
+        return 0
+    try:
+        return int(row["c"] if "c" in row.keys() else 0)
+    except Exception:
+        return 0
+
+
+# Max waiver rows per task (lifetime). Escape hatch must stay narrower than
+# the front door (TEST6 P0-2: 9/9 approves via waive).
+MAX_WAIVERS_PER_TASK = 2
+
+# Execution evidence kinds that may unlock a waiver (not read_file / free text).
+WAIVER_EVIDENCE_KINDS = frozenset(
+    {"test_run", BROWSE_E2E_KIND, VISUAL_CHECK_KIND, DOC_REVIEW_KIND}
+)
+
+
+async def find_core_interaction_attestation(
+    project_id: str,
+    task_id: str,
+    agent_id: str | None = None,
+    *,
+    max_age_ms: int | None = None,
+) -> str | None:
+    """Return a fresh browse_e2e attestation id tagged core_interaction=1.
+
+    TEST6 P0-1: UI VERIFY gate must consume attestation, not only a boolean.
+    Marker lives in command_or_url as ``[core_interaction=1]`` (see browse_tools).
+    """
+    if not task_id:
+        return None
+    await attestation_service.ensure_schema(project_id)
+    try:
+        conn = await _conn(project_id)
+    except ProjectDbError:
+        return None
+    now = int(time.time() * 1000)
+    max_age = max_age_ms or int(
+        getattr(settings, "attestation_max_age_ms", None) or DEFAULT_MAX_AGE_MS
+    )
+    min_created = now - max_age
+    params: list[Any] = [
+        project_id,
+        task_id,
+        BROWSE_E2E_KIND,
+        now,
+        min_created,
+        "%[core_interaction=1]%",
+    ]
+    agent_clause = ""
+    if agent_id:
+        agent_clause = "AND agent_id = ? "
+        params.append(agent_id)
+    cur = await conn.execute(
+        "SELECT id FROM tool_attestations "
+        "WHERE project_id = ? AND task_id = ? AND kind = ? "
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "AND created_at >= ? "
+        "AND command_or_url LIKE ? "
+        f"{agent_clause}"
+        "ORDER BY created_at DESC LIMIT 1",
+        params,
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row:
+        return None
+    return str(row["id"] if "id" in row.keys() else "") or None
+
+
+def count_reported_test_failures(test_output: str | None) -> int | None:
+    """Parse machine test-runner failure counts from stdout (not NL intent).
+
+    Recognizes vitest/jest/pytest common ``N failed`` / ``failed=N`` forms.
+    Returns None when no failure counter is present.
+
+    When multiple counters appear (e.g. ``Suites: 0 failed`` then
+    ``Tests: 3 failed``), take the **max** — first-match would under-count
+    and skip the VERIFY failuresAcknowledged gate.
+    """
+    import re
+
+    text = test_output or ""
+    if not text.strip():
+        return None
+    counts: list[int] = []
+    for pat in (
+        r"\b(\d+)\s+failed\b",
+        r"=+\s*(\d+)\s+failed\b",
+        r"\b(?:failed|failures)\s*[:=]\s*(\d+)\b",
+    ):
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            counts.append(int(m.group(1)))
+    if not counts:
+        return None
+    return max(counts)
+
+
+MAX_FAILURE_ACKS_REQUIRED = 20
+
+
+def required_failure_acks(fail_n: int) -> int:
+    """How many failuresAcknowledged entries VERIFY submit must supply."""
+    return min(max(0, int(fail_n)), MAX_FAILURE_ACKS_REQUIRED)
 
 
 def resolve_task_policy(
@@ -567,10 +703,15 @@ async def find_reviewer_attestation(
     task_id: str,
     reviewer_id: str,
     kinds: frozenset[str],
+    *,
+    consume_agent_ids: list[str] | None = None,
 ) -> bool:
-    """Check if reviewer has a fresh (non-expired) attestation on this task.
+    """Check if reviewer (or allowed consume agents) has fresh attestation.
 
     P0-2: mirrors the submitter gate but for the approving agent.
+    Soft unblock (facts): ``consume_agent_ids`` lets CEO/reviewer accept a
+    same-task subordinate (typically assignee) fresh successful test_run —
+    not a structured next-action command.
     Returns True if at least one valid attestation exists.
     """
     from hiveweave.db import meta as meta_db
@@ -583,23 +724,31 @@ async def find_reviewer_attestation(
     if not db:
         return False
     now_ms = int(time.time() * 1000)
+    agent_ids: list[str] = [reviewer_id]
+    for aid in consume_agent_ids or []:
+        a = str(aid or "").strip()
+        if a and a not in agent_ids:
+            agent_ids.append(a)
     try:
-        # aiosqlite.Row (sqlite3.Row) has no .get() — use cursor + dict.
-        # Bug: row.get("kind") crashed → except swallowed → always returned
-        # False → P0-2 reviewer gate blocked ALL code-task approvals.
+        placeholders = ",".join("?" for _ in agent_ids)
         cur = await db.execute(
-            "SELECT kind FROM tool_attestations "
-            "WHERE task_id = ? AND agent_id = ? "
+            "SELECT kind, exit_code, agent_id FROM tool_attestations "
+            f"WHERE task_id = ? AND agent_id IN ({placeholders}) "
             "AND (expires_at IS NULL OR expires_at > ?) "
             "AND kind != 'waiver'",
-            [task_id, reviewer_id, now_ms],
+            [task_id, *agent_ids, now_ms],
         )
         _rows = await cur.fetchall()
         await cur.close()
         for row in _rows:
             kind = row["kind"] if "kind" in row.keys() else ""
-            if kind in kinds:
-                return True
+            if kind not in kinds:
+                continue
+            if "exit_code" in row.keys():
+                ec = row["exit_code"]
+                if ec is not None and int(ec) != 0:
+                    continue
+            return True
     except Exception:
         pass
     return False
