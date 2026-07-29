@@ -136,7 +136,7 @@ async def test_r4_get_tasks_tool_appends_live_obligations():
             with (
                 patch("hiveweave.db.meta.get_project_workspace", fake_ws),
                 patch(
-                    "hiveweave.tools.task_tools.get_project_id",
+                    "hiveweave.tools.helpers.get_project_id",
                     new_callable=AsyncMock,
                     return_value=pid,
                 ),

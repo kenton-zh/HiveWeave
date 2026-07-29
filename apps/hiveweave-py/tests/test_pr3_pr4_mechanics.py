@@ -117,11 +117,11 @@ async def test_dispatch_triggers_assignee():
     trigger = AsyncMock()
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="pid"),
         ),
         patch(
-            "hiveweave.tools.task_tools.resolve_agent_id",
+            "hiveweave.tools.helpers.resolve_agent_id",
             AsyncMock(return_value="assignee-1"),
         ),
         patch(

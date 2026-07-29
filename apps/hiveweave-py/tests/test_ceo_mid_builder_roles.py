@@ -158,7 +158,7 @@ async def test_review_task_ensure_failure_not_silently_skipped():
     }
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="proj-1"),
         ),
         patch.object(
@@ -227,7 +227,7 @@ async def test_submit_self_submit_wakes_parent_not_self():
 
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="proj-1"),
         ),
         patch.object(

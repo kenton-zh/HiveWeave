@@ -39,7 +39,7 @@ async def test_doc_review_prefers_worktree(tmp_path: Path):
 
     with (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value="p1"),
         ),
         patch(

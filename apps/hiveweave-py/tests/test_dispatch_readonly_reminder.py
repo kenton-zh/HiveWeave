@@ -60,11 +60,11 @@ def _run_patches(assignee: dict | None = None, lookup_error: bool = False):
     get_agent = _get_agent_side_effect(assignee, lookup_error=lookup_error)
     return (
         patch(
-            "hiveweave.tools.task_tools.get_project_id",
+            "hiveweave.tools.helpers.get_project_id",
             AsyncMock(return_value=PROJECT_ID),
         ),
         patch(
-            "hiveweave.tools.task_tools.resolve_agent_id",
+            "hiveweave.tools.helpers.resolve_agent_id",
             AsyncMock(return_value=ASSIGNEE_ID),
         ),
         patch.object(
@@ -155,11 +155,11 @@ class TestDispatchHardGates:
         )
         with (
             patch(
-                "hiveweave.tools.task_tools.get_project_id",
+                "hiveweave.tools.helpers.get_project_id",
                 AsyncMock(return_value=PROJECT_ID),
             ),
             patch(
-                "hiveweave.tools.task_tools.resolve_agent_id",
+                "hiveweave.tools.helpers.resolve_agent_id",
                 AsyncMock(return_value=ASSIGNEE_ID),
             ),
             patch.object(DispatchService, "dispatch_task", dispatch_mock),
@@ -178,11 +178,11 @@ class TestDispatchHardGates:
         """相似未完成任务 → 拒绝新建，提示复用 taskId。"""
         with (
             patch(
-                "hiveweave.tools.task_tools.get_project_id",
+                "hiveweave.tools.helpers.get_project_id",
                 AsyncMock(return_value=PROJECT_ID),
             ),
             patch(
-                "hiveweave.tools.task_tools.resolve_agent_id",
+                "hiveweave.tools.helpers.resolve_agent_id",
                 AsyncMock(return_value=ASSIGNEE_ID),
             ),
             patch.object(DispatchService, "dispatch_task", AsyncMock()),

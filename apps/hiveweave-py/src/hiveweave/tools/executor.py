@@ -31,7 +31,6 @@ from hiveweave.services.roster import RosterService
 from hiveweave.services.skill_registry import SkillRegistryService
 from hiveweave.services.template import TemplateService
 from hiveweave.tools.review import execute_review, ReviewLLMCallback
-from hiveweave.tools.task_tools import TaskToolsMixin
 
 log = structlog.get_logger(__name__)
 
@@ -1083,7 +1082,7 @@ class ToolResult(dict):
 
 # ── ToolExecutor ───────────────────────────────────────────
 
-class ToolExecutor(TaskToolsMixin):
+class ToolExecutor:
     """Routes tool calls to implementations with permission gating +
     sandbox checks + output truncation.
 

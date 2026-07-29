@@ -101,9 +101,13 @@ CEO auto-created per project. HR under CEO. Expert agents on-demand.
 - `HIVEWEAVE_API_KEY` — API key auth (unset = open)
 - `HIVEWEAVE_CORS_ORIGINS` — CORS whitelist
 
+## File size / split discipline
+
+Prefer domain modules (~200–800 lines). **Do not** pile new logic into shell/shim files: `agents/agent.py`, `tools/task_tools.py` (shim), `components/ChatPanel.tsx`, or `api.ts` (barrel) — put it in `agents/{completion,recovery,streaming,watcher,helpers}/`, `tools/tasks/*`, `chat/*`, or `api/{ws,rest}.ts`. Next optional split wave (P3): `services/git_worktree.py` → `services/task.py` → `llm/streamer.py`.
+
 ## Frontend
 
-React 19 + Zustand (`store.ts`). React Flow org chart. Key panels: ChatPanel, OrgTree, AgentNode. API via `api.ts` → `/api/*`. WebSocket via `phoenix.js`. Electron entry: `apps/web/electron/main.cjs`.
+React 19 + Zustand (`store.ts`). React Flow org chart. Key panels: ChatPanel (shell; logic in `chat/`), OrgTree, AgentNode. API via `api.ts` barrel → `api/rest.ts` + `api/ws.ts`. WebSocket via `phoenix.js`. Electron entry: `apps/web/electron/main.cjs`.
 
 ## Cursor Cloud specific instructions
 

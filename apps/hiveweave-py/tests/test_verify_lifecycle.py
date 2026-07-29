@@ -100,7 +100,7 @@ async def test_spawn_verify_stays_created(task_env):
 
     qa_id = "qa-verify-1"
     with patch(
-        "hiveweave.tools.task_tools._find_independent_qa",
+        "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
         AsyncMock(return_value=qa_id),
     ):
         verify_id = await _spawn_post_approve_verify_task(ts, pid, COORD, parent)
@@ -317,7 +317,7 @@ async def test_stale_verify_not_nudged_when_fresh(task_env):
     )
 
     with patch(
-        "hiveweave.tools.task_tools._nudge_one_verify_task",
+        "hiveweave.tools.tasks.verify_merge._nudge_one_verify_task",
         new=AsyncMock(return_value=True),
     ) as nudge:
         n = await nudge_stale_verify_tasks(pid)
