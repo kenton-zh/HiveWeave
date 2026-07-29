@@ -199,35 +199,134 @@ _MARKER_SCAN_MAX_BYTES = 1_000_000  # 大文件跳过 (大概率是产物/压缩
 _MARKER_SCAN_MAX_HITS = 50          # 报告上限, 防止异常输出刷屏
 
 
-def scan_conflict_markers(root: str) -> list[str]:
-    """Scan *root* for unresolved git conflict markers (merge 后残留检测).
+def scan_conflict_markers(
+    root: str, paths: list[str] | None = None
+) -> list[str]:
+    """Scan for unresolved git conflict markers (merge 后残留检测).
 
     行首锚定 ``<<<<<<<`` / ``>>>>>>>``。只扫文本文件 — 跳过
     .git/.hiveweave/node_modules/dist/build 等目录、含 NUL 字节的二进制
     文件、以及 >1MB 的大文件。返回 POSIX 风格相对路径的排序列表。
+
+    If *paths* is provided, only those relative paths are checked (the files
+    touched by this merge). Full-tree walks mis-fire on docs/fixtures that
+    contain marker samples and are unrelated to the landed merge.
     """
     root_path = Path(root)
     if not root_path.is_dir():
         return []
+
+    def _check_file(fpath: Path) -> bool:
+        try:
+            if fpath.stat().st_size > _MARKER_SCAN_MAX_BYTES:
+                return False
+            raw = fpath.read_bytes()
+        except OSError:
+            return False
+        if b"\x00" in raw[:8192]:
+            return False
+        return bool(
+            _CONFLICT_MARKER_RE.search(raw.decode("utf-8", errors="replace"))
+        )
+
     hits: list[str] = []
+    if paths is not None:
+        for rel in paths:
+            if len(hits) >= _MARKER_SCAN_MAX_HITS:
+                break
+            norm = (rel or "").strip().replace("\\", "/")
+            if not norm or norm.startswith(".hiveweave/"):
+                continue
+            fpath = root_path / norm
+            if not fpath.is_file():
+                continue
+            if _check_file(fpath):
+                hits.append(Path(norm).as_posix())
+        return sorted(hits)
+
     for dirpath, dirnames, filenames in os.walk(root_path):
         dirnames[:] = [d for d in dirnames if d not in _MARKER_SCAN_SKIP_DIRS]
         for name in filenames:
             if len(hits) >= _MARKER_SCAN_MAX_HITS:
                 return sorted(hits)
             fpath = Path(dirpath) / name
-            try:
-                if fpath.stat().st_size > _MARKER_SCAN_MAX_BYTES:
-                    continue
-                raw = fpath.read_bytes()
-            except OSError:
-                continue
-            if b"\x00" in raw[:8192]:
-                continue  # 二进制文件不扫
-            if _CONFLICT_MARKER_RE.search(raw.decode("utf-8", errors="replace")):
+            if _check_file(fpath):
                 hits.append(fpath.relative_to(root_path).as_posix())
     return sorted(hits)
 
+
+async def _reject_if_markers_landed(
+    workspace_path: str,
+    *,
+    short_id: str,
+    branch: str,
+    target_branch: str,
+    branch_files: list[str],
+) -> dict | None:
+    """After a successful git merge, abort if conflict markers landed.
+
+    Must run BEFORE worktree/branch cleanup — otherwise abort leaves the
+    delivery branch deleted (audit T1#1). Scopes scan to *branch_files*
+    when non-empty so pre-existing marker samples elsewhere on main do not
+    false-trigger.
+    """
+    scan_paths: list[str] | None = list(branch_files) if branch_files else None
+    if not scan_paths:
+        # Prefer recovering merge-touched files over full-tree walk (fixtures
+        # with marker samples false-abort). Fail closed if still empty.
+        ok_dt, out_dt = await _git(
+            ["diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "HEAD"],
+            workspace_path,
+        )
+        if ok_dt and (out_dt or "").strip():
+            scan_paths = [
+                ln.strip().replace("\\", "/")
+                for ln in out_dt.splitlines()
+                if ln.strip()
+            ]
+        else:
+            return {
+                "success": False,
+                "reason": "conflict_scan_unscoped",
+                "conflicts": [],
+                "message": (
+                    f"Merge aborted: cannot scope conflict-marker scan "
+                    f"(empty file list for {branch} → {target_branch}). "
+                    "Retry merge after ensuring git diff-tree works."
+                ),
+                "branch": branch,
+                "files": branch_files,
+                "short_id": short_id,
+            }
+    marker_files = scan_conflict_markers(workspace_path, paths=scan_paths)
+    if not marker_files:
+        return None
+    log.warning(
+        "git_worktree.merge_markers_found",
+        short_id=short_id,
+        target=target_branch,
+        files=marker_files[:10],
+    )
+    aborted = await _abort_landed_merge(workspace_path)
+    if not aborted:
+        log.error(
+            "git_worktree.merge_marker_abort_failed",
+            short_id=short_id,
+            target=target_branch,
+        )
+    return {
+        "success": False,
+        "reason": "conflict_markers_landed",
+        "conflicts": marker_files,
+        "message": (
+            f"Merge aborted: conflict markers landed on {target_branch}: "
+            f"{', '.join(marker_files[:8])}. "
+            f"Remove markers in the worktree branch and retry merge."
+        ),
+        "branch": branch,
+        "files": branch_files,
+        "short_id": short_id,
+    }
 
 async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT) -> tuple[bool, str]:
     """Run a git command, return (success, output).
@@ -1267,6 +1366,18 @@ yarn.lock merge=union
 
         ok, head = await _git(["rev-parse", "--short", "HEAD"], workspace_path)
 
+        # Marker gate BEFORE cleanup — abort must keep the source branch
+        # (audit T1#1: delete-then-scan left delivery only in reflog).
+        marker_reject = await _reject_if_markers_landed(
+            workspace_path,
+            short_id=short_id,
+            branch=branch,
+            target_branch=target_branch,
+            branch_files=branch_files,
+        )
+        if marker_reject is not None:
+            return marker_reject
+
         # Auto-remove worktree + branch on success (契约 09 RECONCILE)
         # TEST3: skip delete when assignee still has other open tasks.
         cleanup_note = ""
@@ -1308,36 +1419,6 @@ yarn.lock merge=union
                 f"({cleanup_err}); reconcile will retry later."
             )
 
-        # merge 成功 ≠ main 干净 — 残留冲突标记会随提交一并落地 → abort。
-        marker_files = scan_conflict_markers(workspace_path)
-        if marker_files:
-            log.warning(
-                "git_worktree.merge_markers_found",
-                short_id=short_id,
-                target=target_branch,
-                files=marker_files[:10],
-            )
-            aborted = await _abort_landed_merge(workspace_path)
-            if not aborted:
-                log.error(
-                    "git_worktree.merge_marker_abort_failed",
-                    short_id=short_id,
-                    target=target_branch,
-                )
-            return {
-                "success": False,
-                "reason": "conflict_markers_landed",
-                "conflicts": marker_files,
-                "message": (
-                    f"Merge aborted: conflict markers landed on {target_branch}: "
-                    f"{', '.join(marker_files[:8])}. "
-                    f"Remove markers in the worktree branch and retry merge."
-                ),
-                "branch": branch,
-                "files": branch_files,
-                "short_id": short_id,
-            }
-
         already = "already up to date" in (merge_out or "").lower()
         log.info("git_worktree.merge", short_id=short_id,
                  target=target_branch, hash=head if ok else "",
@@ -1361,7 +1442,6 @@ yarn.lock merge=union
             base = result.get("message") or "Worktree merged"
             result["message"] = f"{base}{cleanup_note}"
         return result
-
     async def merge_by_branch(self, workspace_path: str, branch: str,
                               target_branch: str = "main") -> dict:
         """Merge a specific branch by full name (Bug G fix + Bug L enhancement).
@@ -1591,6 +1671,17 @@ yarn.lock merge=union
             ["rev-parse", "--short", "HEAD"], workspace_path
         )
 
+        # Marker gate BEFORE cleanup (same as merge — audit T1#1)
+        marker_reject = await _reject_if_markers_landed(
+            workspace_path,
+            short_id=short_id or "",
+            branch=branch,
+            target_branch=target_branch,
+            branch_files=branch_files,
+        )
+        if marker_reject is not None:
+            return marker_reject
+
         # Step 5: Auto-remove worktree + branch on success
         # 显式传已合并的分支全名 — delete 走 branch -d 安全链, 必然成功
         # TEST3: retain worktree when assignee still has open tasks.
@@ -1636,35 +1727,6 @@ yarn.lock merge=union
                     f"({cleanup_err}); reconcile will retry later."
                 )
 
-        marker_files = scan_conflict_markers(workspace_path)
-        if marker_files:
-            log.warning(
-                "git_worktree.merge_markers_found",
-                branch=branch,
-                target=target_branch,
-                files=marker_files[:10],
-            )
-            aborted = await _abort_landed_merge(workspace_path)
-            if not aborted:
-                log.error(
-                    "git_worktree.merge_marker_abort_failed",
-                    branch=branch,
-                    target=target_branch,
-                )
-            return {
-                "success": False,
-                "reason": "conflict_markers_landed",
-                "conflicts": marker_files,
-                "message": (
-                    f"Merge aborted: conflict markers landed on {target_branch}: "
-                    f"{', '.join(marker_files[:8])}. "
-                    f"Remove markers in the worktree branch and retry merge."
-                ),
-                "branch": branch,
-                "files": branch_files,
-                "short_id": short_id,
-            }
-
         already = "already up to date" in (merge_out or "").lower()
         log.info("git_worktree.merge_by_branch", branch=branch,
                  target=target_branch, hash=head if ok_head else "",
@@ -1692,7 +1754,6 @@ yarn.lock merge=union
         return result
 
     # ── 4. ROLLBACK ─────────────────────────────────────────
-
     async def rollback(self, workspace_path: str, short_id: str,
                        commit_hash: str | None = None) -> dict:
         """Reset worktree to a previous checkpoint (or latest checkpoint).
@@ -2608,11 +2669,15 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
             try:
                 from hiveweave.db import meta as _meta
 
-                _all_projects = await _meta.list_projects()
-                for _p in _all_projects:
-                    _pw = (_p.get("workspace_path") or "").replace("\\", "/")
-                    if _pw and os.path.normcase(_pw) == os.path.normcase(workspace_path):
-                        _recon_project_id = str(_p.get("id") or "")
+                _rows = await _meta.query(
+                    "SELECT id, workspace_path FROM projects"
+                )
+                for _p in _rows or []:
+                    _pw = (_p["workspace_path"] or "").replace("\\", "/")
+                    if _pw and os.path.normcase(_pw) == os.path.normcase(
+                        workspace_path
+                    ):
+                        _recon_project_id = str(_p["id"] or "")
                         break
             except Exception:
                 pass

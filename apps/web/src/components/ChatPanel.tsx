@@ -521,6 +521,8 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const abortControllerRef = useRef<AbortController | null>(null);
+  /** streamChat's cancel handle — AbortController alone does not push WS cancel. */
+  const streamAbortRef = useRef<(() => void) | null>(null);
   const responseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeAgentIdRef = useRef<string | null>(agentId);
   activeAgentIdRef.current = agentId;
@@ -634,7 +636,18 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       return;
     }
     try {
-      await deleteAgent(agentId);
+      // REST dismiss/delete requires actor with MANAGE_ORG|STAFFING — walk to org root (CEO).
+      let actorId: string | undefined;
+      let cur: any = agentInfo;
+      if (!cur || cur.id !== agentId) {
+        cur = await getAgent(agentId);
+      }
+      let guard = 0;
+      while (cur?.parentId && guard++ < 24) {
+        cur = await getAgent(cur.parentId);
+      }
+      actorId = cur?.id || agentInfo?.parentId || undefined;
+      await deleteAgent(agentId, actorId);
       setConfirmingDelete(false);
       setAgentInfo(null);
       setMessages([]);
@@ -645,7 +658,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       useAppStore.getState().showToast(err.message || "Failed to delete agent", "error");
       setConfirmingDelete(false);
     }
-  }, [agentId, confirmingDelete, refreshOrgTree]);
+  }, [agentId, agentInfo, confirmingDelete, refreshOrgTree]);
 
   // Per-agent streamDraft cache — preserves streaming state when switching
   // between agents, so the bubble doesn't disappear mid-reply.
@@ -834,6 +847,8 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
   useEffect(() => {
     return () => {
       if (agentId) {
+        streamAbortRef.current?.();
+        streamAbortRef.current = null;
         abortControllerRef.current?.abort();
         if (responseTimeoutRef.current) {
           clearTimeout(responseTimeoutRef.current);
@@ -1216,7 +1231,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       }];
     });
 
-    streamChat(sendingForAgentId, messageText, sendingImages, (event) => {
+    const { abort: abortStream } = streamChat(sendingForAgentId, messageText, sendingImages, (event) => {
       if (!isActiveSession()) return;
       if (event.type === "message_id") {
         try {
@@ -1447,6 +1462,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         releaseLockAndFinish();
       }
     });
+    streamAbortRef.current = abortStream;
   }, [agentId, input, isStreaming, isAgentProcessing, hasUnansweredUser, refreshOrgTree, loadMessagesFromDb]);
 
   // Keep handleSendRef in sync so setTimeout/effect can always call the latest version
@@ -1468,6 +1484,8 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
   };
 
   const handleStop = useCallback(() => {
+    streamAbortRef.current?.();
+    streamAbortRef.current = null;
     abortControllerRef.current?.abort();
     setIsStreaming(false);
     updateStreamDraft(null);
@@ -1479,6 +1497,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       setQueuedCount(0);
     }
   }, [agentId]);
+
+  const agentDispositions = useAppStore((s) => s.agentDispositions);
+  const disposition = agentId ? agentDispositions[agentId] : undefined;
 
   if (!agentId) {
     return (
@@ -1500,8 +1521,6 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     );
   }
 
-  const agentDispositions = useAppStore((s) => s.agentDispositions);
-  const disposition = agentId ? agentDispositions[agentId] : undefined;
   const statusInfo = statusLabels[agentInfo?.status || "idle"] || { text: agentInfo?.status || "Unknown", color: "text-g-fg-3" };
   const runtimeStatusInfo =
     disposition && statusLabels[disposition]

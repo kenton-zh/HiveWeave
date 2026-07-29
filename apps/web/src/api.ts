@@ -35,6 +35,78 @@ const _agentChannels: Map<string, any> = (globalThis as any).__hw_agentChannels 
 (globalThis as any).__hw_agentChannels = _agentChannels;
 const _agentHandlers: Map<string, (event: ChatEvent) => void> = (globalThis as any).__hw_agentHandlers ?? new Map();
 (globalThis as any).__hw_agentHandlers = _agentHandlers;
+/** Cache in-flight channel.join() promises — phoenix.js throws on second join() while joining. */
+const _agentJoinPromises: Map<string, Promise<void>> =
+  (globalThis as any).__hw_agentJoinPromises ?? new Map();
+(globalThis as any).__hw_agentJoinPromises = _agentJoinPromises;
+
+/**
+ * Join once and reuse the same Promise while state === "joining".
+ * Never call channel.join() twice on the same Channel instance.
+ * Clear the cached promise on ok/error so a later reconnect recreates cleanly.
+ */
+function joinChannelOnce(agentId: string, channel: any): Promise<void> {
+  if (channel.state === "joined") {
+    _agentJoinPromises.delete(agentId);
+    return Promise.resolve();
+  }
+  const inflight = _agentJoinPromises.get(agentId);
+  if (inflight && channel.state === "joining") {
+    return inflight;
+  }
+  // Joining without our promise (e.g. HMR) — attach to existing JoinPush, never re-join().
+  if (channel.state === "joining") {
+    const p = new Promise<void>((resolve, reject) => {
+      const push = channel.joinPush;
+      if (push?.receive) {
+        push
+          .receive("ok", () => {
+            _agentJoinPromises.delete(agentId);
+            resolve();
+          })
+          .receive("error", (resp: any) => {
+            _agentJoinPromises.delete(agentId);
+            reject(resp);
+          });
+      } else {
+        const t = window.setInterval(() => {
+          if (channel.state === "joined") {
+            window.clearInterval(t);
+            _agentJoinPromises.delete(agentId);
+            resolve();
+          } else if (channel.state !== "joining") {
+            window.clearInterval(t);
+            _agentJoinPromises.delete(agentId);
+            reject(new Error("channel join aborted"));
+          }
+        }, 50);
+      }
+    });
+    _agentJoinPromises.set(agentId, p);
+    return p;
+  }
+  // Stale promise from a prior successful join — drop and start fresh join.
+  _agentJoinPromises.delete(agentId);
+  const p = new Promise<void>((resolve, reject) => {
+    try {
+      channel
+        .join()
+        .receive("ok", () => {
+          _agentJoinPromises.delete(agentId);
+          resolve();
+        })
+        .receive("error", (resp: any) => {
+          _agentJoinPromises.delete(agentId);
+          reject(resp);
+        });
+    } catch (err) {
+      _agentJoinPromises.delete(agentId);
+      reject(err);
+    }
+  });
+  _agentJoinPromises.set(agentId, p);
+  return p;
+}
 
 export function getSocket(): Socket {
   // Use globalThis to survive Vite HMR — without this, HMR resets _socket
@@ -274,8 +346,11 @@ export async function updateAgent(id: string, data: any) {
   });
 }
 
-export async function deleteAgent(id: string) {
-  return fetchJSON(`${BASE}/org/agents/${id}`, { method: "DELETE" });
+export async function deleteAgent(id: string, actorAgentId?: string) {
+  const q = actorAgentId
+    ? `?actorAgentId=${encodeURIComponent(actorAgentId)}`
+    : "";
+  return fetchJSON(`${BASE}/org/agents/${id}${q}`, { method: "DELETE" });
 }
 
 // ---------------------------------------------------------------------------
@@ -313,23 +388,24 @@ export function streamChat(
     dbg("ws", `push chat (channel already joined) for ${agentId}`);
     pushChat(channel);
   } else if (channel && channel.state === "joining") {
-    // Channel is still joining — wait for join to complete, then push.
-    // This fixes the bug where NewProjectDialog sends a message before
-    // the WebSocket channel has finished joining.
+    // Reuse in-flight JoinPush — never call channel.join() again (phoenix joinedOnce).
     dbg("ws", `channel still joining for ${agentId}, waiting for join`);
-    channel.join().receive("ok", () => {
-      dbg("ws", `channel joined (deferred) for ${agentId}, pushing chat`);
-      pushChat(channel);
-    }).receive("error", (resp: any) => {
-      dbg("error", `deferred channel join FAILED for ${agentId}`, resp);
-      const handler = _agentHandlers.get(agentId);
-      handler?.({ type: "error", data: JSON.stringify(resp) });
-    });
+    joinChannelOnce(agentId, channel)
+      .then(() => {
+        dbg("ws", `channel joined (deferred) for ${agentId}, pushing chat`);
+        pushChat(channel);
+      })
+      .catch((resp: any) => {
+        dbg("error", `deferred channel join FAILED for ${agentId}`, resp);
+        const handler = _agentHandlers.get(agentId);
+        handler?.({ type: "error", data: JSON.stringify(resp) });
+      });
   } else {
     if (channel) {
       dbg("ws", `channel state=${channel.state}, leaving old channel for ${agentId}`);
       try { channel.leave(); } catch {}
       _agentChannels.delete(agentId);
+      _agentJoinPromises.delete(agentId);
     }
 
     channel = socket.channel(`agent:${agentId}`);
@@ -338,14 +414,16 @@ export function streamChat(
 
     bindAgentChannelEvents(channel, agentId);
 
-    channel.join().receive("ok", () => {
-      dbg("ws", `channel joined for ${agentId}, pushing chat`);
-      pushChat(channel);
-    }).receive("error", (resp: any) => {
-      dbg("error", `channel join FAILED for ${agentId}`, resp);
-      const handler = _agentHandlers.get(agentId);
-      handler?.({ type: "error", data: JSON.stringify(resp) });
-    });
+    joinChannelOnce(agentId, channel)
+      .then(() => {
+        dbg("ws", `channel joined for ${agentId}, pushing chat`);
+        pushChat(channel);
+      })
+      .catch((resp: any) => {
+        dbg("error", `channel join FAILED for ${agentId}`, resp);
+        const handler = _agentHandlers.get(agentId);
+        handler?.({ type: "error", data: JSON.stringify(resp) });
+      });
   }
 
   return {
@@ -445,15 +523,14 @@ export function joinAgentChannel(agentId: string): Promise<void> {
   if (existing?.state === "joined") {
     return Promise.resolve();
   }
-  if (existing?.state === "joining") {
-    return new Promise((resolve, reject) => {
-      existing.join().receive("ok", () => resolve()).receive("error", (resp: any) => reject(resp));
-    });
+  if (existing && existing.state === "joining") {
+    return joinChannelOnce(agentId, existing);
   }
 
   if (existing) {
     try { existing.leave(); } catch {}
     _agentChannels.delete(agentId);
+    _agentJoinPromises.delete(agentId);
   }
 
   const channel = socket.channel(`agent:${agentId}`);
@@ -461,14 +538,8 @@ export function joinAgentChannel(agentId: string): Promise<void> {
   bindAgentChannelEvents(channel, agentId);
   dbg("ws", `joinAgentChannel creating channel agent:${agentId}`);
 
-  return new Promise((resolve, reject) => {
-    channel.join().receive("ok", () => {
-      dbg("ws", `joinAgentChannel joined for ${agentId}`);
-      resolve();
-    }).receive("error", (resp: any) => {
-      dbg("error", `joinAgentChannel FAILED for ${agentId}`, resp);
-      reject(resp);
-    });
+  return joinChannelOnce(agentId, channel).then(() => {
+    dbg("ws", `joinAgentChannel joined for ${agentId}`);
   });
 }
 
@@ -484,6 +555,7 @@ export function leaveAgentChannel(agentId: string) {
     try { channel.leave(); } catch {}
     _agentChannels.delete(agentId);
   }
+  _agentJoinPromises.delete(agentId);
   _agentHandlers.delete(agentId);
 }
 

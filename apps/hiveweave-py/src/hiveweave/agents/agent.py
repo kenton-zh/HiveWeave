@@ -398,6 +398,9 @@ class Agent:
         """
         INTERVAL_S = 5.0
         RETRY_DELAYS = [5.0, 15.0, 45.0]  # 指数退避（秒）
+        # TEST6 P1-1: after N ineffective triggers, ACK remaining pending
+        # instead of infinite 45s busy-wait (watcher/trigger口径分裂时必触)。
+        TRIGGER_FAIL_FUSE = 5
         trigger_fail_count = 0
         # 启动后等 1s 再开始（避开与 trigger.py 的 100ms 起步冲突）
         await asyncio.sleep(1.0)
@@ -436,7 +439,35 @@ class Agent:
                         )
                         await asyncio.sleep(INTERVAL_S)
                         continue
-                    pending = await self._inbox.get_pending_messages(self.id)
+                    from hiveweave.services.inbox import filter_actionable_pending
+
+                    pending_raw = await self._inbox.get_pending_messages(self.id)
+                    pending = filter_actionable_pending(pending_raw)
+                    fyi_only = [
+                        m for m in (pending_raw or [])
+                        if m.get("id")
+                        and m["id"] not in {p.get("id") for p in pending}
+                    ]
+                    # Only FYI task_event left → ACK and skip (match trigger口径)
+                    if fyi_only and not pending:
+                        try:
+                            await self._inbox.mark_read_by_ids(
+                                self.id,
+                                [str(m["id"]) for m in fyi_only],
+                            )
+                            log.info(
+                                "inbox_watcher_acked_fyi_task_events",
+                                agent_id=self.id,
+                                count=len(fyi_only),
+                            )
+                        except Exception as e:
+                            log.warning(
+                                "inbox_watcher_ack_fyi_failed",
+                                agent_id=self.id,
+                                error=str(e),
+                            )
+                        await asyncio.sleep(INTERVAL_S)
+                        continue
                     if pending:
                         log.info(
                             "inbox_watcher_found_pending",
@@ -460,9 +491,60 @@ class Agent:
                         # 启动了处理。如果 idle 且仍有 pending，说明 trigger
                         # 静默跳过（e.g. agent 不在 manager 中且 auto-start 失败）。
                         await asyncio.sleep(2.0)
-                        still_pending = await self._inbox.get_pending_messages(self.id)
-                        if still_pending and self.status == AgentState.IDLE:
+                        still_raw = await self._inbox.get_pending_messages(self.id)
+                        still_pending = filter_actionable_pending(still_raw)
+                        still_fyi = [
+                            m for m in (still_raw or [])
+                            if m.get("id")
+                            and m["id"] not in {p.get("id") for p in still_pending}
+                        ]
+                        if still_fyi and not still_pending:
+                            try:
+                                await self._inbox.mark_read_by_ids(
+                                    self.id,
+                                    [str(m["id"]) for m in still_fyi],
+                                )
+                            except Exception:
+                                pass
+                            trigger_fail_count = 0
+                        elif still_pending and self.status == AgentState.IDLE:
                             trigger_fail_count += 1
+                            if trigger_fail_count >= TRIGGER_FAIL_FUSE:
+                                # NEVER ACK actionable pending (user_message /
+                                # ask / expect_report / review). Silent mark_read
+                                # was starving obligations worse than busy-wait.
+                                # Escalate + red-box; keep unread; long backoff.
+                                log.error(
+                                    "inbox_watcher_trigger_fuse_escalated",
+                                    agent_id=self.id,
+                                    pending_count=len(still_pending),
+                                    trigger_fail_count=trigger_fail_count,
+                                    pending_types=[
+                                        (m.get("message_type") or "?")
+                                        for m in still_pending[:8]
+                                    ],
+                                )
+                                try:
+                                    self._broadcast_agent_health(
+                                        "error",
+                                        "trigger_fuse: pending inbox not "
+                                        "consumed after repeated wake failures",
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    await self._escalate_trigger_fuse(
+                                        still_pending
+                                    )
+                                except Exception as e:
+                                    log.warning(
+                                        "inbox_watcher_fuse_escalate_failed",
+                                        agent_id=self.id,
+                                        error=str(e),
+                                    )
+                                trigger_fail_count = 0
+                                await asyncio.sleep(INTERVAL_S * 6)
+                                continue
                             delay = (
                                 RETRY_DELAYS[min(trigger_fail_count - 1, len(RETRY_DELAYS) - 1)]
                                 if trigger_fail_count <= len(RETRY_DELAYS)
@@ -886,35 +968,81 @@ class Agent:
             return {"ok": True}
 
     async def cancel(self, *, reason: str = "cancelled") -> None:
-        """取消当前处理。
+        """取消当前对话。
 
-        对齐 Elixir agent.ex:131 handle_cast(:cancel)。
-        reason=off_duty：下班停机 — 不 ACK pending inbox（已由 park 处理），
-        streaming 文案区分于普通中断。
+        对应 Elixir agent.ex:131 handle_cast(:cancel)。
+        reason=off_duty（下班停机）：不 ACK pending inbox，避免 park 后丢消息；
+        streaming 文案走下班专用中断。
+
+        必须持 self._lock：与 chat() setup 窗口串行，消灭
+        「cancel 见 IDLE/无 task → 复位；随后 chat 仍 create_task」竞态。
+        await 已取消的 task/watcher 在锁外，避免 task finally 间接触锁死锁。
         """
         from hiveweave.services.project_lifecycle import (
             OFF_DUTY_CANCEL_REASON,
             OFF_DUTY_STREAM_CONTENT,
         )
 
-        self._cancel_reason = reason
-        is_off_duty = reason == OFF_DUTY_CANCEL_REASON
-        self._cancel_safety_timer()
+        task_to_await: asyncio.Task | None = None
+        watcher_to_await: asyncio.Task | None = None
 
-        if self._llm_task and not self._llm_task.done():
-            self._llm_task.cancel()
-            try:
-                await self._llm_task
-            except asyncio.CancelledError:
-                pass
+        async with self._lock:
+            self._cancel_reason = reason
+            is_off_duty = reason == OFF_DUTY_CANCEL_REASON
+            self._cancel_safety_timer()
 
-        # BUG-010 修复：停 inbox watcher（下次激活时由
-        # _ensure_watcher_alive() 复活 — 见 chat()/enqueue_wake()）
-        self._stop_watcher = True
-        if self._inbox_watcher_task and not self._inbox_watcher_task.done():
-            self._inbox_watcher_task.cancel()
+            if self._llm_task and not self._llm_task.done():
+                self._llm_task.cancel()
+                task_to_await = self._llm_task
+
+            # BUG-010 修复：停 inbox watcher；下次激活时由
+            # _ensure_watcher_alive() 复活（见 chat()/enqueue_wake()）。
+            self._stop_watcher = True
+            if self._inbox_watcher_task and not self._inbox_watcher_task.done():
+                self._inbox_watcher_task.cancel()
+                watcher_to_await = self._inbox_watcher_task
+
+            # 确保状态干净
+            if self.status == AgentState.PROCESSING:
+                # 普通 cancel：ACK pending，避免 watcher 死循环；
+                # 下班：保留未读，等 park 后 briefing 合并消费。
+                if self.pending_inbox_msg_ids and not is_off_duty:
+                    try:
+                        await self._inbox.mark_read_by_ids(
+                            self.id, self.pending_inbox_msg_ids
+                        )
+                        log.info("cancel_marked_inbox_read",
+                                 agent_id=self.id,
+                                 msg_count=len(self.pending_inbox_msg_ids))
+                    except Exception as e:
+                        log.warning("cancel_mark_inbox_read_failed",
+                                    agent_id=self.id, error=str(e))
+                    self.pending_inbox_msg_ids = None
+                elif is_off_duty:
+                    self.pending_inbox_msg_ids = None
+                # A6(2) 修复：cancel 时清除 streaming 标志，防止僵尸消息
+                try:
+                    await self._finalize_streaming_turn(
+                        content=(
+                            OFF_DUTY_STREAM_CONTENT
+                            if is_off_duty
+                            else "[对话被中断]"
+                        ),
+                    )
+                except Exception as e:
+                    log.warning("cancel_clear_streaming_failed",
+                                agent_id=self.id, error=str(e))
+                self._reset_to_idle()
+            elif is_off_duty:
+                # idle：只清下班状态，不强制写「被中断」文案
+                self.pending_inbox_msg_ids = None
+                self._reset_to_idle()
+
+        for t in (task_to_await, watcher_to_await):
+            if t is None:
+                continue
             try:
-                await self._inbox_watcher_task
+                await t
             except asyncio.CancelledError:
                 pass
             except RuntimeError as e:
@@ -923,42 +1051,6 @@ class Agent:
                     pass
                 else:
                     raise
-
-        # 确保状态重置
-        if self.status == AgentState.PROCESSING:
-            # 普通 cancel：ACK pending，避免 watcher 死循环。
-            # 下班：保留未读（已 park），复工 briefing 会合并唤醒。
-            if self.pending_inbox_msg_ids and not is_off_duty:
-                try:
-                    await self._inbox.mark_read_by_ids(
-                        self.id, self.pending_inbox_msg_ids
-                    )
-                    log.info("cancel_marked_inbox_read",
-                             agent_id=self.id,
-                             msg_count=len(self.pending_inbox_msg_ids))
-                except Exception as e:
-                    log.warning("cancel_mark_inbox_read_failed",
-                                agent_id=self.id, error=str(e))
-                self.pending_inbox_msg_ids = None
-            elif is_off_duty:
-                self.pending_inbox_msg_ids = None
-            # A6(2) 修复：cancel 时清理 streaming 标志，防止僵尸消息
-            try:
-                await self._finalize_streaming_turn(
-                    content=(
-                        OFF_DUTY_STREAM_CONTENT
-                        if is_off_duty
-                        else "[对话被中断]"
-                    ),
-                )
-            except Exception as e:
-                log.warning("cancel_clear_streaming_failed",
-                            agent_id=self.id, error=str(e))
-            self._reset_to_idle()
-        elif is_off_duty:
-            # idle：只清悬挂状态，不强行写「被中断」气泡
-            self.pending_inbox_msg_ids = None
-            self._reset_to_idle()
 
     async def trigger(self, trigger_type: str = "subordinate") -> dict:
         """触发 agent 处理待处理内容。
@@ -3805,6 +3897,45 @@ class Agent:
                         unreplied_count=len(unreplied_msgs))
         except Exception as e:
             log.error("escalate_failed", agent_id=self.id, error=str(e))
+
+    async def _escalate_trigger_fuse(self, pending: list[dict]) -> None:
+        """Fuse tripped: notify parent, keep actionable inbox unread."""
+        me = await meta_db.get_agent_by_id(self.id)
+        my_name = me.get("name", self.id[:8]) if me else self.id[:8]
+        parent_id = me.get("parent_id") if me else None
+        if not parent_id:
+            return
+        types = [
+            (m.get("message_type") or "?") for m in (pending or [])[:8]
+        ]
+        msg = (
+            f"[TRIGGER FUSE] {my_name} has {len(pending)} actionable inbox "
+            f"message(s) that repeated wakes failed to consume "
+            f"(types={types}). Inbox was NOT auto-acked — intervene."
+        )
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().send_message(
+                "system",
+                parent_id,
+                msg,
+                message_type="escalation",
+                priority="urgent",
+                wake=True,
+                idempotency_key=(
+                    f"trigger_fuse:{self.id}:{int(time.time()) // 600}"
+                ),
+            )
+            from hiveweave.agents.trigger import trigger_subordinate
+
+            await trigger_subordinate(parent_id)
+        except Exception as e:
+            log.warning(
+                "trigger_fuse_escalate_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
 
     # ── 内部: open-task 收工提醒 ─────────────────────────────
 

@@ -65,10 +65,46 @@ class AgentUpdate(BaseModel):
     permissionType: str | None = None
     permissionMode: str | None = None
     moduleId: str | None = None
+    # 提权相关字段变更必须带 actor；软字段（name/modelId 等）本地开放模式可省略
+    actorAgentId: str | None = None
 
 
 class TransferBody(BaseModel):
     newParentId: str | None = None
+    actorAgentId: str | None = None
+
+
+class DismissBody(BaseModel):
+    actorAgentId: str | None = None
+
+
+# 变更这些字段即可提权 / 改树 — 必须过 MANAGE_ORG|STAFFING
+_PRIVILEGE_UPDATE_KEYS = frozenset({
+    "permission_type",
+    "permission_mode",
+    "parent_id",
+    "status",
+})
+
+
+async def _require_org_actor(actor_id: str | None, tool_name: str) -> dict:
+    """REST org 变更统一 actor capability 门（与 hire 同姿态）。"""
+    aid = (actor_id or "").strip()
+    if not aid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"actorAgentId is required ({tool_name} gate)",
+        )
+    actor = await _org.resolve_agent(aid)
+    if actor is None:
+        raise HTTPException(status_code=404, detail=f"Actor agent not found: {aid}")
+
+    from hiveweave.services.policy import policy_service
+
+    hard = policy_service.hard_check(actor, tool_name, {})
+    if hard:
+        raise HTTPException(status_code=403, detail=hard)
+    return actor
 
 
 async def _resolve_project_language(project_id: str | None) -> str:
@@ -257,6 +293,17 @@ async def _do_update_agent(agent_id: str, body: AgentUpdate) -> dict:
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     attrs = _normalize_agent_attrs(body)
+    attrs.pop("actorAgentId", None)
+    attrs.pop("actor_agent_id", None)
+    # 去掉未设置字段，避免 None 误判为「要改」
+    pending = {k: v for k, v in attrs.items() if v is not None}
+    privilege = bool(_PRIVILEGE_UPDATE_KEYS.intersection(pending))
+    actor_id = (body.actorAgentId or "").strip()
+    if privilege:
+        await _require_org_actor(actor_id, "transfer_agent")
+    elif actor_id:
+        # 显式带了 actor 也校验（防伪造 HR id 却无权限）
+        await _require_org_actor(actor_id, "transfer_agent")
     try:
         updated = await _org.update_agent(agent["id"], attrs)
     except Exception as e:
@@ -279,9 +326,13 @@ async def put_agent(agent_id: str, body: AgentUpdate) -> dict:
 
 
 @router.delete("/agents/{agent_id}")
-async def delete_agent(agent_id: str) -> dict:
+async def delete_agent(
+    agent_id: str,
+    actorAgentId: str | None = Query(default=None),
+) -> dict:
     """删除 agent（硬删除，拒绝有下属的 agent）。"""
     validate_id(agent_id, "agent_id")
+    await _require_org_actor(actorAgentId, "dismiss_agent")
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -292,9 +343,11 @@ async def delete_agent(agent_id: str) -> dict:
 
 
 @router.post("/agents/{agent_id}/dismiss")
-async def dismiss_agent(agent_id: str) -> dict:
+async def dismiss_agent(agent_id: str, body: DismissBody | None = None) -> dict:
     """软删除（归档）agent。"""
     validate_id(agent_id, "agent_id")
+    actor_id = (body.actorAgentId if body else None)
+    await _require_org_actor(actor_id, "dismiss_agent")
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -312,6 +365,7 @@ async def dismiss_agent(agent_id: str) -> dict:
 async def transfer_agent(agent_id: str, body: TransferBody) -> dict:
     """转移 agent 到新上级（带环检测）。"""
     validate_id(agent_id, "agent_id")
+    await _require_org_actor(body.actorAgentId, "transfer_agent")
     agent = await _org.resolve_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")

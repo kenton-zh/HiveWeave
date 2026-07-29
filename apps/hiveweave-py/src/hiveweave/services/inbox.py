@@ -22,6 +22,64 @@ log = structlog.get_logger(__name__)
 
 _migrated: set[str] = set()
 
+# FYI-only outbox relay notifications — must NOT wake / keep watcher looping.
+# Watcher + trigger_coordinator must use the same filter (TEST6 P1-1).
+TASK_EVENT_MESSAGE_TYPE = "task_event"
+
+
+def is_fyi_task_event(msg: dict | None) -> bool:
+    """True when inbox row is a task_event FYI (not actionable wake work)."""
+    if not msg:
+        return False
+    return (msg.get("message_type") or "").lower() == TASK_EVENT_MESSAGE_TYPE
+
+
+def filter_actionable_pending(messages: list[dict] | None) -> list[dict]:
+    """Drop task_event FYI rows so watcher/trigger share one pending口径."""
+    return [m for m in (messages or []) if not is_fyi_task_event(m)]
+
+
+def unwrap_user_message_envelope(raw: str | None, *, from_agent_id: str = "", message_type: str = "") -> str:
+    """Unwrap busy-queue / BUG-036 body ``{"from":…,"content":…}`` to plain text.
+
+    Trigger digests already serialize inbox rows as JSON lines with ``from`` +
+    ``content``. If the body itself is that envelope (legacy phoenix busy path),
+    leaving it intact produces double-encoded user text and looks like amnesia.
+
+    Only unwraps human user_message / from=用户 rows — peer JSON stays intact.
+    """
+    text = raw if isinstance(raw, str) else ""
+    mt = (message_type or "").lower()
+    from_id = (from_agent_id or "").strip()
+    if mt not in ("user_message", "user") and from_id not in ("用户", "user", "User"):
+        return text
+    s = text.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return text
+    try:
+        import json
+
+        obj = json.loads(s)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return text
+    if not isinstance(obj, dict):
+        return text
+    inner = obj.get("content")
+    if "from" not in obj or not isinstance(inner, str):
+        return text
+    return inner
+
+
+def inbox_digest_content(msg: dict | None) -> str:
+    """Content for trigger digests — unwrap user envelopes when present."""
+    if not msg:
+        return ""
+    return unwrap_user_message_envelope(
+        msg.get("message"),
+        from_agent_id=str(msg.get("from_agent_id") or ""),
+        message_type=str(msg.get("message_type") or ""),
+    )
+
 
 def _row_val(row: object, key: str, default=None):
     """Read a column from aiosqlite.Row / mapping (Row has no ``.get``)."""
@@ -1092,4 +1150,8 @@ class InboxService:
             "triage_batch_id": (
                 r["triage_batch_id"] if "triage_batch_id" in keys else None
             ),
+            "reply_contract_id": (
+                r["reply_contract_id"] if "reply_contract_id" in keys else None
+            ),
+            "reply_to": r["reply_to"] if "reply_to" in keys else None,
         }

@@ -78,6 +78,18 @@ def test_scan_missing_root_returns_empty(tmp_path: Path) -> None:
     assert scan_conflict_markers(str(tmp_path / "nope")) == []
 
 
+def test_scan_paths_scopes_to_merge_files(tmp_path: Path) -> None:
+    """Unrelated marker samples on main must not fail a clean merge file set."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "howto.md").write_text(MARKED, encoding="utf-8")
+    (tmp_path / "clean.py").write_text("print('ok')\n", encoding="utf-8")
+
+    assert scan_conflict_markers(str(tmp_path), paths=["clean.py"]) == []
+    assert scan_conflict_markers(str(tmp_path), paths=["docs/howto.md"]) == [
+        "docs/howto.md"
+    ]
+
+
 # ── merge 结果 conflict_markers 字段 + tool 警告路由 ─────────
 
 

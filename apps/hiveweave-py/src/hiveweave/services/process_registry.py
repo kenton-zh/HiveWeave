@@ -287,6 +287,35 @@ def allocate_project_port(project_id: str, preferred: int = 3000) -> int:
     return port
 
 
+# TEST6 P0-3: worktrees live under .hiveweave/worktrees/ — glob runners
+# (vitest/jest/pytest) must not pick up sibling agent WIP as "main" failures.
+_HIVEWEAVE_EXCLUDE_GLOB = "**/.hiveweave/**"
+_VITEST_RE = re.compile(r"\b(?:npx\s+)?vitest\b", re.IGNORECASE)
+_JEST_RE = re.compile(r"\b(?:npx\s+)?jest\b", re.IGNORECASE)
+_PYTEST_RE = re.compile(
+    r"\b(?:python3?\s+-m\s+)?pytest\b|\buv\s+run\s+pytest\b",
+    re.IGNORECASE,
+)
+
+
+def _inject_hiveweave_test_exclude(command: str) -> str:
+    """Append runner-specific excludes so .hiveweave/ worktrees don't pollute."""
+    cmd = command or ""
+    if ".hiveweave" in cmd.lower() and (
+        "--exclude" in cmd or "--ignore" in cmd or "testPathIgnore" in cmd
+    ):
+        return cmd
+    if _VITEST_RE.search(cmd) and "--exclude" not in cmd:
+        return f"{cmd.rstrip()} --exclude {_HIVEWEAVE_EXCLUDE_GLOB}"
+    if _JEST_RE.search(cmd) and "testPathIgnorePatterns" not in cmd:
+        return (
+            f"{cmd.rstrip()} --testPathIgnorePatterns=\\.hiveweave"
+        )
+    if _PYTEST_RE.search(cmd) and "--ignore" not in cmd and "--ignore-glob" not in cmd:
+        return f"{cmd.rstrip()} --ignore=.hiveweave --ignore-glob=**/.hiveweave/**"
+    return cmd
+
+
 def prepare_spawn_command(
     command: str,
     *,
@@ -318,6 +347,9 @@ def prepare_spawn_command(
                     f"start_dev_server, not --port {port}."
                 ),
             )
+
+    # TEST6 P0-3: exclude in-tree worktrees from glob test runners
+    command = _inject_hiveweave_test_exclude(command)
 
     ports = extract_ports_from_command(command)
     if ports:

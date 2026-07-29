@@ -405,6 +405,23 @@ async def _check_self_merge_gate(
             "Refusing to merge your own branch: no corresponding task found. "
             "Pass taskId for the task this branch implements."
         )
+    # Explicit taskId must endorse THIS agent's work — not a foreign approved task.
+    # Bypass was: merge(own-branch, taskId=<other's approved>) to skip self-review gate.
+    if task_id:
+        assignee = str(task.get("assignee_id") or "")
+        tid8 = str(task.get("id") or "")[:8].lower()
+        # Explicit taskId must belong to caller — empty assignee is not a free pass.
+        if not assignee:
+            return (
+                f"Refusing to merge your own branch: taskId {tid8} has no "
+                f"assignee; cannot use it as self-merge endorsement."
+            )
+        if assignee != str(agent_id):
+            return (
+                f"Refusing to merge your own branch: taskId {tid8} is not "
+                f"assigned to you (assignee≠caller). Pass the task you "
+                f"implemented, not another agent's approval."
+            )
     tid = str(task.get("id") or "")[:8]
     # P1 fix(TEST10): 接受 closed 作为 approved 的等价后继状态。
     # approve 后系统可能因 worktree==main 自动 close，但 merge 门禁
