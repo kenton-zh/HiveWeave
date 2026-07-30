@@ -2,6 +2,8 @@
 
 Guidance for AI coding sessions working in this repo. Keep it terse; every line should answer "would an agent miss this without help?".
 
+**Canonical detail:** prefer [`CLAUDE.md`](CLAUDE.md) for architecture, commands, and pitfalls; keep this file as a short agent-facing digest and sync when those change.
+
 **Project memory (all platforms):** write/read `AI_MEMORY.local.md` at repo root — do not use platform-default memory paths. See `CLAUDE.md` §跨平台 AI 项目记忆.
 
 ## Architecture
@@ -45,9 +47,21 @@ pnpm build                  # Build
 
 Required: Node `>=22.0.0 <24.0.0`. System has Node 24 (global) and Node 22 (portable at `%LOCALAPPDATA%\Programs\node-v22.20.0-win-x64`). Prepend Node 22 to PATH:
 
+**PowerShell (default on this machine; paste as-is):**
+
+```powershell
+$env:PATH = "$env:LOCALAPPDATA\Programs\node-v22.20.0-win-x64;$env:PATH"
+node -v   # expect v22.x
+```
+
+**bash / Git Bash / POSIX:**
+
 ```bash
 export PATH="$LOCALAPPDATA/Programs/node-v22.20.0-win-x64:$PATH"
+node -v
 ```
+
+Or use `start-frontend.bat` / `start-all.bat` when those scripts already set up the env.
 
 ## Repo shape
 
@@ -106,9 +120,11 @@ CEO auto-created per project. HR under CEO. Expert agents on-demand.
 
 Prefer domain modules (~200–800 lines). **Do not** pile new logic into shell/shim files:
 - `agents/agent.py`, `tools/task_tools.py` (shim), `components/ChatPanel.tsx`, `api.ts` (barrel)
-- `services/task.py` (shim), `services/git_worktree/` package `__init__.py`, `llm/streamer/` package `__init__.py`
+- `services/task.py` (shim → `services/tasks/*`), `services/git_worktree/` package `__init__.py`, `llm/streamer/` package `__init__.py`
 
 Put new logic in domain modules: `agents/{completion,recovery,streaming,watcher,helpers}/`, `tools/tasks/*`, `services/tasks/*`, `services/git_worktree/{service_*,reconcile,ensure,…}`, `llm/streamer/{core,tool_loop,http_stream,…}`, `chat/*`, `api/{ws,rest}.ts`.
+
+**Atomic reviewable splits:** when turning a monolith into a package, stage/commit the deleted old module together with every replacement file in one reviewable boundary; keep compatible re-exports on `__init__`. Do not treat import-only smoke (e.g. `test_p3_split_import_smoke.py`) as the sole acceptance for a core split — map or add focused happy-path + one failure/timeout/recovery check on the public entrypoints.
 
 ## Frontend
 
