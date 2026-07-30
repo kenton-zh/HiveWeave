@@ -96,3 +96,20 @@ def test_skill_registry_can_read_browse():
         assert "Built-in" in detail
 
     asyncio.run(_run())
+
+
+def test_browse_child_env_disables_terminal_agent(monkeypatch):
+    """Agents must not spawn gstack sidebar PTY (bun console popups on Windows)."""
+    from hiveweave.tools.browse_tools import _browse_child_env
+
+    monkeypatch.delenv("GSTACK_HEADLESS", raising=False)
+    monkeypatch.delenv("GSTACK_TERMINAL_AGENT", raising=False)
+    env = _browse_child_env()
+    assert env["GSTACK_HEADLESS"] == "1"
+    assert env["GSTACK_TERMINAL_AGENT"] == "0"
+
+    monkeypatch.setenv("GSTACK_TERMINAL_AGENT", "1")
+    monkeypatch.setenv("GSTACK_HEADLESS", "0")
+    env2 = _browse_child_env()
+    assert env2["GSTACK_TERMINAL_AGENT"] == "1"
+    assert env2["GSTACK_HEADLESS"] == "0"

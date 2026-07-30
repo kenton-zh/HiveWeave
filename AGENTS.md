@@ -69,7 +69,7 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 |------|---------|
 | `config.py` | pydantic-settings, env prefix `HIVEWEAVE_` |
 | `main.py` | FastAPI app + lifespan (startup/shutdown) |
-| `llm/streamer.py` | httpx 流式 SSE, tool loop |
+| `llm/streamer/` | httpx 流式 SSE, tool loop（包；`__init__` 再导出） |
 | `llm/provider.py` | Provider factory (openai/anthropic/google/fallback) |
 | `llm/retry.py` | 429/503/504/529 retry, exponential backoff |
 | `llm/circuit_breaker.py` | 熔断器 + probe lock |
@@ -81,7 +81,8 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 | `services/org.py` | Agent CRUD, tree traversal |
 | `services/dispatch.py` | Task dispatch between agents |
 | `services/memory.py` | Three-layer memory |
-| `services/git_worktree.py` | Per-agent worktree, checkpoint/merge/rollback |
+| `services/git_worktree/` | Per-agent worktree, checkpoint/merge/rollback（包） |
+| `services/task.py` | TaskService shim → `services/tasks/*` |
 
 ## Agent types & org
 
@@ -103,7 +104,11 @@ CEO auto-created per project. HR under CEO. Expert agents on-demand.
 
 ## File size / split discipline
 
-Prefer domain modules (~200–800 lines). **Do not** pile new logic into shell/shim files: `agents/agent.py`, `tools/task_tools.py` (shim), `components/ChatPanel.tsx`, or `api.ts` (barrel) — put it in `agents/{completion,recovery,streaming,watcher,helpers}/`, `tools/tasks/*`, `chat/*`, or `api/{ws,rest}.ts`. Next optional split wave (P3): `services/git_worktree.py` → `services/task.py` → `llm/streamer.py`.
+Prefer domain modules (~200–800 lines). **Do not** pile new logic into shell/shim files:
+- `agents/agent.py`, `tools/task_tools.py` (shim), `components/ChatPanel.tsx`, `api.ts` (barrel)
+- `services/task.py` (shim), `services/git_worktree/` package `__init__.py`, `llm/streamer/` package `__init__.py`
+
+Put new logic in domain modules: `agents/{completion,recovery,streaming,watcher,helpers}/`, `tools/tasks/*`, `services/tasks/*`, `services/git_worktree/{service_*,reconcile,ensure,…}`, `llm/streamer/{core,tool_loop,http_stream,…}`, `chat/*`, `api/{ws,rest}.ts`.
 
 ## Frontend
 

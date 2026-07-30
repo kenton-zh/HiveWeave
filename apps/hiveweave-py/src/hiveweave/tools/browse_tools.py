@@ -9,11 +9,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from hiveweave.config import resolve_browse_bin, settings
 from hiveweave.tools.base import tool
 from hiveweave.tools.result import ToolResult
+
+log = structlog.get_logger(__name__)
 
 # Minimum structured observation length for assert_visual (not free-text scrape —
 # the field itself is the structured assertion evidence).
@@ -161,6 +164,115 @@ def _screenshot_path_from_argv(argv: list[str]) -> str | None:
     return "screenshot.png"
 
 
+def _browse_child_env() -> dict[str, str]:
+    """Env for gstack browse — headless, no sidebar PTY (no bun console popups).
+
+    gstack's terminal-agent (``bun run .../terminal-agent.ts``) owns the
+    interactive sidebar Terminal pane. Agents never use that pane; leaving it
+    enabled on Windows repeatedly pops visible Terminal/bun windows, and the
+    detached browse daemon keeps respawning them after the agent turn ends.
+
+    ``GSTACK_TERMINAL_AGENT=0`` is the upstream-supported embedder switch
+    (see gstack browse cli.ts / server.ts). Default both flags to on/disabled
+    unless the operator already set them in the process environment.
+    """
+    env = {**os.environ}
+    env.setdefault("GSTACK_HEADLESS", "1")
+    env.setdefault("GSTACK_TERMINAL_AGENT", "0")
+    return env
+
+
+_reaped_browse_orphans = False
+
+
+def _reap_orphan_browse_daemons_once() -> int:
+    """Kill leftover gstack browse daemons that still spawn terminal-agent.
+
+    Idempotent per process: first browse call on Windows reaps orphans from
+    prior runs that were started *without* ``GSTACK_TERMINAL_AGENT=0`` (their
+    watchdog would keep popping bun windows even after we set the env for
+    new children). Returns number of processes signaled.
+
+    Only acts when a ``terminal-agent`` process is present — a healthy
+    headless ``server-node`` (no PTY agent) is left alone.
+    """
+    global _reaped_browse_orphans
+    if _reaped_browse_orphans or os.name != "nt":
+        return 0
+    _reaped_browse_orphans = True
+
+    try:
+        import subprocess
+        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
+        # Only reap when the popup culprit (terminal-agent) is alive.
+        ps_agents = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.CommandLine -and ("
+            "$_.CommandLine -match 'gstack[\\\\/]browse[\\\\/]src[\\\\/]terminal-agent\\.ts' "
+            "-or ($_.Name -eq 'bun.exe' -and $_.CommandLine -match 'terminal-agent')"
+            ") } | Select-Object -ExpandProperty ProcessId"
+        )
+        listed_agents = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_agents],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            **windows_no_window_kwargs(),
+        )
+        agent_pids = [
+            int(line.strip())
+            for line in (listed_agents.stdout or "").splitlines()
+            if line.strip().isdigit()
+        ]
+        if not agent_pids:
+            return 0
+
+        # Also take down server-node parents — otherwise their watchdog
+        # respawns terminal-agent under the old ownsTerminalAgent=true boot.
+        ps_all = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.CommandLine -and ("
+            "$_.CommandLine -match 'gstack[\\\\/]browse[\\\\/](dist[\\\\/]server-node\\.mjs|src[\\\\/]terminal-agent\\.ts)' "
+            "-or ($_.Name -eq 'bun.exe' -and $_.CommandLine -match 'terminal-agent')"
+            ") } | Select-Object -ExpandProperty ProcessId"
+        )
+        listed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_all],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            **windows_no_window_kwargs(),
+        )
+        pids: list[int] = []
+        for line in (listed.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        if not pids:
+            return 0
+
+        # taskkill /T to sweep chrome-headless children of server-node.
+        killed = 0
+        for pid in pids:
+            try:
+                r = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=10,
+                    **windows_no_window_kwargs(),
+                )
+                if r.returncode == 0:
+                    killed += 1
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if killed:
+            log.info("browse_orphan_daemons_reaped", count=killed, pids=pids[:20])
+        return killed
+    except Exception:
+        return 0
+
+
 async def browse_exec(
     argv: list[str],
     workspace: str,
@@ -175,6 +287,9 @@ async def browse_exec(
     bin_path = resolve_browse_bin()
     if not bin_path:
         raise FileNotFoundError("gstack browse binary not found")
+
+    # Drop prior-run daemons that still pop bun Terminal windows.
+    await asyncio.to_thread(_reap_orphan_browse_daemons_once)
 
     argv = [str(a) for a in argv]
     if argv and (argv[0] or "").lower() == "evaluate":
@@ -203,7 +318,7 @@ async def browse_exec(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env={**os.environ, "GSTACK_HEADLESS": os.environ.get("GSTACK_HEADLESS", "1")},
+        env=_browse_child_env(),
         **windows_no_window_kwargs(),
     )
     try:

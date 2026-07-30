@@ -1,0 +1,590 @@
+"""VERIFY lifecycle + VerificationCaseService."""
+from __future__ import annotations
+
+import json
+import time
+import uuid
+
+import structlog
+
+from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
+
+log = structlog.get_logger(__name__)
+
+
+class VerifyMixin:
+    """mark_verifying / close verify parent / migrate orphan approved."""
+
+    async def mark_verifying(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        reason_code: str | None = None,
+    ) -> None:
+        """Parent task enters verifying after VERIFY child is spawned."""
+        rows = await _query(
+            project_id, "SELECT status, creator_id FROM tasks WHERE id = ?", [task_id]
+        )
+        if not rows:
+            raise ValueError(f"Task not found: {task_id}")
+        current = rows[0]["status"]
+        creator_id = rows[0]["creator_id"]
+        if current == "verifying":
+            await self._clear_merge_pending_inbox(task_id, creator_id)
+            return
+        if current == "approved":
+            await self._transition(
+                project_id,
+                task_id,
+                "verifying",
+                reason_code=reason_code,
+            )
+            await self.emit_task_event(
+                project_id,
+                task_id,
+                "verifying",
+                summary=f"[verifying] task {task_id[:8]}",
+            )
+            await self._clear_merge_pending_inbox(task_id, creator_id)
+            return
+        if current == "closed":
+            await self._clear_merge_pending_inbox(task_id, creator_id)
+            return
+        raise ValueError(f"Cannot mark verifying from status={current}")
+
+    async def _clear_merge_pending_inbox(
+        self, task_id: str, creator_id: str | None
+    ) -> None:
+        """Mark stale [MERGE PENDING] for this task as read (merge already done)."""
+        if not creator_id or not task_id:
+            return
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().supersede_watchdog_messages(
+                creator_id,
+                prefixes=["[MERGE PENDING]", "[MERGE PROXY]"],
+                contains=task_id[:8],
+            )
+        except Exception as e:
+            log.warning(
+                "clear_merge_pending_failed",
+                task_id=task_id,
+                creator_id=creator_id,
+                error=str(e),
+            )
+
+    @staticmethod
+    def _is_verify_task(task: dict) -> bool:
+        title = task.get("title") or ""
+        tags = task.get("tags") or []
+        if isinstance(title, str) and title.startswith("VERIFY:"):
+            return True
+        if isinstance(tags, list) and "verify" in [str(x).lower() for x in tags]:
+            return True
+        return False
+
+    async def _close_verify_and_parent(
+        self, project_id: str, verify_task: dict
+    ) -> None:
+        """Close VERIFY child and its parent (approved|verifying → closed).
+
+        Also archives/closes sibling open VERIFY tasks for the same parent
+        (system + manual duplicates left behind after one VERIFY succeeds).
+        """
+        verify_id = verify_task.get("id")
+        if not verify_id:
+            return
+        # Close VERIFY itself (approved → closed)
+        try:
+            await self.close_task(project_id, verify_id)
+        except Exception as e:
+            log.warning(
+                "verify_child_close_failed",
+                task_id=verify_id,
+                error=str(e),
+            )
+            return
+
+        # Mark verification case as passed (carry review feedback + merge hash)
+        try:
+            vcs = VerificationCaseService()
+            notes = ""
+            merge_hash = None
+            ev = verify_task.get("evidence") or {}
+            if isinstance(ev, str):
+                try:
+                    ev = json.loads(ev)
+                except Exception:
+                    ev = {}
+            if isinstance(ev, dict):
+                notes = str(
+                    ev.get("review_feedback") or ev.get("summary") or ""
+                )
+                merge_hash = (
+                    ev.get("merge_commit")
+                    or ev.get("merge_commit_hash")
+                    or ev.get("commit")
+                )
+            # Prefer parent evidence merge hash if child lacks it
+            parent_id = verify_task.get("parent_task_id")
+            if not merge_hash and parent_id:
+                parent = await self.get_task(project_id, parent_id)
+                pev = (parent or {}).get("evidence") or {}
+                if isinstance(pev, str):
+                    try:
+                        pev = json.loads(pev)
+                    except Exception:
+                        pev = {}
+                if isinstance(pev, dict):
+                    merge_hash = (
+                        pev.get("merge_commit")
+                        or pev.get("merge_commit_hash")
+                        or pev.get("commit")
+                    )
+            await vcs.mark_passed(
+                project_id,
+                verify_id,
+                notes=notes,
+                merge_commit_hash=str(merge_hash) if merge_hash else None,
+            )
+            # Mirror case onto VERIFY evidence so get_tasks / CEO reports see it
+            try:
+                case = await vcs.get_case_for_task(project_id, verify_id)
+                if case:
+                    ev2 = dict(ev) if isinstance(ev, dict) else {}
+                    ev2["verification_case"] = {
+                        "id": (case.get("id") or "")[:8],
+                        "status": case.get("status"),
+                        "merge_commit_hash": case.get("merge_commit_hash"),
+                        "review_notes": (case.get("review_notes") or "")[:300],
+                        "qa_agent_id": case.get("qa_agent_id"),
+                    }
+                    await _execute(
+                        project_id,
+                        "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+                        [json.dumps(ev2), int(time.time() * 1000), verify_id],
+                    )
+            except Exception as e:
+                log.warning(
+                    "verification_case_mirror_failed",
+                    verify_id=verify_id,
+                    error=str(e),
+                )
+        except Exception:
+            pass  # best-effort
+
+        parent_id = verify_task.get("parent_task_id")
+        if parent_id:
+            await self._close_sibling_verify_tasks(
+                project_id, parent_id, except_id=verify_id
+            )
+
+        if not parent_id:
+            # Infer: title "VERIFY: <parent title>" + same assignee
+            return
+        parent = await self.get_task(project_id, parent_id)
+        if not parent:
+            return
+        status = parent.get("status")
+        if status in ("approved", "verifying"):
+            try:
+                await self.close_task(project_id, parent_id)
+                log.info(
+                    "verify_parent_closed",
+                    verify_id=verify_id,
+                    parent_id=parent_id,
+                )
+            except Exception as e:
+                log.warning(
+                    "verify_parent_close_failed",
+                    parent_id=parent_id,
+                    error=str(e),
+                )
+
+    async def _close_sibling_verify_tasks(
+        self,
+        project_id: str,
+        parent_id: str,
+        *,
+        except_id: str | None = None,
+    ) -> int:
+        """Close/archive other open VERIFY children of the same parent."""
+        await _ensure_schema(project_id)
+        tasks = await self.list_tasks(project_id)
+        closed = 0
+        for t in tasks:
+            tid = t.get("id")
+            if not tid or tid == except_id:
+                continue
+            if t.get("parent_task_id") != parent_id:
+                continue
+            if not self._is_verify_task(t):
+                continue
+            if t.get("status") in ("closed",):
+                continue
+            try:
+                # Prefer close when legal; else archive so they leave the ledger
+                st = t.get("status")
+                if st in ("approved", "verifying", "submitted", "reviewing"):
+                    # Force closed via archive path for non-closable states
+                    await self.archive_task(
+                        project_id,
+                        tid,
+                        archived_by="system",
+                        reason="sibling VERIFY closed; duplicate cleaned up",
+                    )
+                elif st in ("created", "claimed", "running", "blocked"):
+                    await self.archive_task(
+                        project_id,
+                        tid,
+                        archived_by="system",
+                        reason="sibling VERIFY closed; duplicate cleaned up",
+                    )
+                else:
+                    await self.close_task(project_id, tid)
+                closed += 1
+            except Exception as e:
+                log.warning(
+                    "verify_sibling_cleanup_failed",
+                    task_id=tid,
+                    parent_id=parent_id,
+                    error=str(e),
+                )
+        if closed:
+            log.info(
+                "verify_siblings_cleaned",
+                parent_id=parent_id,
+                closed=closed,
+            )
+        return closed
+
+    async def migrate_orphan_approved(self, project_id: str) -> dict:
+        """One-shot: approved with open VERIFY → verifying; else → closed."""
+        await _ensure_schema(project_id)
+        rows = await _query(
+            project_id,
+            f"SELECT {self._COLUMNS} FROM tasks "
+            "WHERE is_archived = 0 AND status = 'approved'",
+        )
+        to_verifying = 0
+        to_closed = 0
+        for r in rows:
+            task = self._row(r)
+            if self._is_verify_task(task):
+                # Orphan approved VERIFY → close (and parent if any)
+                await self._close_verify_and_parent(project_id, task)
+                to_closed += 1
+                continue
+            tid = task["id"]
+            children = await _query(
+                project_id,
+                f"SELECT {self._COLUMNS} FROM tasks "
+                "WHERE parent_task_id = ? AND is_archived = 0",
+                [tid],
+            )
+            has_open_verify = False
+            for ch in children:
+                child = self._row(ch)
+                if self._is_verify_task(child) and child.get("status") not in (
+                    "closed",
+                ):
+                    has_open_verify = True
+                    break
+            if has_open_verify:
+                await self.mark_verifying(
+                    project_id,
+                    tid,
+                    reason_code="orphan_approved_migrate",
+                )
+                to_verifying += 1
+            else:
+                # Ledger hygiene — no VERIFY child means orphan approved;
+                # skip merge gate (no worktree/merge fact expected).
+                await self.close_task(
+                    project_id,
+                    tid,
+                    skip_merge_gate=True,
+                    reason_code="orphan_approved_migrate",
+                )
+                to_closed += 1
+        return {"verifying": to_verifying, "closed": to_closed}
+
+
+class VerificationCaseService:
+    """Single authoritative entity for the VERIFY lifecycle.
+
+    Links original_task → verify_task → merger → QA reviewer.
+    Status: pending → in_review → passed | failed | waived
+    """
+
+    async def create_case(
+        self,
+        project_id: str,
+        original_task_id: str,
+        verify_task_id: str | None = None,
+        merger_agent_id: str | None = None,
+    ) -> str | None:
+        """Create a verification case when VERIFY is spawned."""
+        case_id = str(uuid.uuid4())
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "INSERT INTO verification_cases "
+                "(id, project_id, original_task_id, verify_task_id, "
+                "merger_agent_id, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                [case_id, project_id, original_task_id, verify_task_id,
+                 merger_agent_id, now_ms, now_ms],
+            )
+            log.info("verification_case_created", case_id=case_id,
+                     original_task=original_task_id[:8],
+                     verify_task=(verify_task_id or "")[:8])
+            return case_id
+        except Exception as e:
+            log.warning("verification_case_create_failed", error=str(e))
+            return None
+
+    async def update_verify_task(
+        self, project_id: str, original_task_id: str,
+        verify_task_id: str,
+    ) -> None:
+        """Link the verify task to an existing case."""
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET verify_task_id = ?, "
+                "status = 'in_review', updated_at = ? "
+                "WHERE original_task_id = ? AND status = 'pending'",
+                [verify_task_id, now_ms, original_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_update_verify_failed", error=str(e))
+
+    async def set_reviewer(
+        self, project_id: str, verify_task_id: str,
+        qa_agent_id: str,
+    ) -> None:
+        """Set the QA reviewer for a verification case."""
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET qa_agent_id = ?, "
+                "status = 'in_review', updated_at = ? "
+                "WHERE verify_task_id = ?",
+                [qa_agent_id, now_ms, verify_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_set_reviewer_failed", error=str(e))
+
+    async def mark_passed(
+        self, project_id: str, verify_task_id: str,
+        notes: str = "",
+        merge_commit_hash: str | None = None,
+    ) -> None:
+        """Mark verification as passed (VERIFY approved)."""
+        now_ms = int(time.time() * 1000)
+        try:
+            if merge_commit_hash:
+                await _execute(project_id,
+                    "UPDATE verification_cases SET status = 'passed', "
+                    "review_notes = ?, merge_commit_hash = ?, "
+                    "closed_at = ?, updated_at = ? "
+                    "WHERE verify_task_id = ?",
+                    [notes[:500], merge_commit_hash[:64], now_ms, now_ms,
+                     verify_task_id],
+                )
+            else:
+                await _execute(project_id,
+                    "UPDATE verification_cases SET status = 'passed', "
+                    "review_notes = ?, closed_at = ?, updated_at = ? "
+                    "WHERE verify_task_id = ?",
+                    [notes[:500], now_ms, now_ms, verify_task_id],
+                )
+        except Exception as e:
+            log.warning("verification_case_mark_passed_failed", error=str(e))
+
+    async def set_merge_commit(
+        self, project_id: str, original_task_id: str,
+        merge_commit_hash: str,
+    ) -> None:
+        """Persist merge commit on the case when parent is merged."""
+        if not merge_commit_hash:
+            return
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET merge_commit_hash = ?, "
+                "updated_at = ? "
+                "WHERE original_task_id = ? AND "
+                "(merge_commit_hash IS NULL OR merge_commit_hash = '')",
+                [merge_commit_hash[:64], now_ms, original_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_set_merge_failed", error=str(e))
+
+    async def mark_failed(
+        self, project_id: str, verify_task_id: str,
+        notes: str = "",
+    ) -> None:
+        """Mark verification as failed (VERIFY rejected/rework)."""
+        now_ms = int(time.time() * 1000)
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET status = 'failed', "
+                "review_notes = ?, updated_at = ? "
+                "WHERE verify_task_id = ?",
+                [notes[:500], now_ms, verify_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_mark_failed_failed", error=str(e))
+
+    async def mark_cancelled(
+        self, project_id: str, verify_task_id: str,
+        reason: str = "",
+    ) -> None:
+        """Close verification case when VERIFY task is cancelled/archived."""
+        now_ms = int(time.time() * 1000)
+        note = (reason or "VERIFY task cancelled")[:500]
+        try:
+            await _execute(project_id,
+                "UPDATE verification_cases SET status = 'cancelled', "
+                "review_notes = ?, closed_at = ?, updated_at = ? "
+                "WHERE verify_task_id = ? AND status NOT IN "
+                "('passed', 'cancelled', 'waived')",
+                [note, now_ms, now_ms, verify_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_mark_cancelled_failed", error=str(e))
+
+    async def reconcile_orphans(self, project_id: str) -> int:
+        """Close cases whose verify_task is terminal but case still open.
+
+        Returns number of rows fixed.
+        """
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT vc.id, vc.verify_task_id, t.status AS tstatus, "
+                "t.is_archived "
+                "FROM verification_cases vc "
+                "LEFT JOIN tasks t ON t.id = vc.verify_task_id "
+                "WHERE vc.project_id = ? AND vc.status IN "
+                "('pending', 'in_review')",
+                [project_id],
+            )
+        except Exception:
+            return 0
+        fixed = 0
+        now_ms = int(time.time() * 1000)
+        for r in rows:
+            vid = r.get("verify_task_id")
+            tstatus = r.get("tstatus")
+            archived = r.get("is_archived")
+            if not vid:
+                continue
+            if archived or tstatus in ("cancelled", "closed"):
+                try:
+                    await _execute(
+                        project_id,
+                        "UPDATE verification_cases SET status = 'cancelled', "
+                        "review_notes = COALESCE(NULLIF(review_notes,''), "
+                        "'reconcile: verify task terminal'), "
+                        "closed_at = ?, updated_at = ? WHERE id = ?",
+                        [now_ms, now_ms, r["id"]],
+                    )
+                    fixed += 1
+                except Exception:
+                    pass
+        if fixed:
+            log.info(
+                "verification_cases_reconciled",
+                project_id=project_id,
+                fixed=fixed,
+            )
+        return fixed
+
+    async def mark_waived(
+        self, project_id: str, original_task_id: str,
+        reason: str = "",
+        *,
+        verify_task_id: str | None = None,
+    ) -> None:
+        """Mark verification as waived (attestation waiver).
+
+        Matches by original_task_id and optionally verify_task_id so a waive
+        on the VERIFY child still stamps the case.
+        """
+        now_ms = int(time.time() * 1000)
+        note = (reason or "")[:500]
+        if note and not note.lower().startswith("waived:"):
+            note = f"WAIVED: {note}"
+        try:
+            # Prefer verify_task_id match when provided
+            if verify_task_id:
+                await _execute(project_id,
+                    "UPDATE verification_cases SET status = 'waived', "
+                    "review_notes = ?, closed_at = ?, updated_at = ? "
+                    "WHERE verify_task_id = ? AND status NOT IN ('passed')",
+                    [note, now_ms, now_ms, verify_task_id],
+                )
+            await _execute(project_id,
+                "UPDATE verification_cases SET status = 'waived', "
+                "review_notes = ?, closed_at = ?, updated_at = ? "
+                "WHERE original_task_id = ? AND status NOT IN ('passed', 'waived')",
+                [note, now_ms, now_ms, original_task_id],
+            )
+        except Exception as e:
+            log.warning("verification_case_mark_waived_failed", error=str(e))
+
+    async def ensure_case(
+        self,
+        project_id: str,
+        *,
+        original_task_id: str,
+        verify_task_id: str | None = None,
+        merger_agent_id: str | None = None,
+    ) -> str | None:
+        """Return existing case id or create one (idempotent for waive/approve)."""
+        existing = await self.get_case_for_task(
+            project_id, verify_task_id or original_task_id
+        )
+        if existing:
+            return existing.get("id")
+        return await self.create_case(
+            project_id,
+            original_task_id=original_task_id,
+            verify_task_id=verify_task_id,
+            merger_agent_id=merger_agent_id,
+        )
+
+    async def get_case_for_task(
+        self, project_id: str, task_id: str
+    ) -> dict | None:
+        """Get verification case by original or verify task ID."""
+        try:
+            rows = await _query(project_id,
+                "SELECT * FROM verification_cases "
+                "WHERE original_task_id = ? OR verify_task_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                [task_id, task_id],
+            )
+            return dict(rows[0]) if rows else None
+        except Exception:
+            return None
+
+    async def list_cases_for_project(
+        self, project_id: str, limit: int = 30
+    ) -> list[dict]:
+        """Recent verification cases for platform_state / get_tasks."""
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT * FROM verification_cases "
+                "WHERE project_id = ? ORDER BY created_at DESC LIMIT ?",
+                [project_id, limit],
+            )
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
