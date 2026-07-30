@@ -42,11 +42,23 @@ cd apps/hiveweave-py && uv run pytest tests/ -v
 
 ### Node version
 
-前端需要 Node `>=22.0.0 <24.0.0`。系统同时装有 Node 24 (全局) 和 Node 22 (便携版, `%LOCALAPPDATA%\Programs\node-v22.20.0-win-x64`)。运行 pnpm/node 命令前,将 Node 22 加入 PATH:
+前端需要 Node `>=22.0.0 <24.0.0`。系统同时装有 Node 24 (全局) 和 Node 22 (便携版, `%LOCALAPPDATA%\Programs\node-v22.20.0-win-x64`)。运行 pnpm/node 命令前，将 Node 22 置于 PATH 最前：
+
+**PowerShell（本机默认；可直接粘贴）：**
+
+```powershell
+$env:PATH = "$env:LOCALAPPDATA\Programs\node-v22.20.0-win-x64;$env:PATH"
+node -v   # 应落在 v22.x
+```
+
+**bash / Git Bash / POSIX：**
 
 ```bash
 export PATH="$LOCALAPPDATA/Programs/node-v22.20.0-win-x64:$PATH"
+node -v
 ```
+
+Windows 也可用 `start-frontend.bat` / `start-all.bat`（脚本内已处理环境时不必手改 PATH）。
 
 ## Architecture
 
@@ -67,9 +79,9 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 |------|------|
 | `src/hiveweave/api/` | FastAPI 路由 (16 个模块, 122 路由) |
 | `src/hiveweave/agents/` | Agent + Supervisor + trigger |
-| `src/hiveweave/llm/` | LLM 流式调用 (streamer, provider, retry, circuit_breaker) |
+| `src/hiveweave/llm/` | LLM 流式调用 (`streamer/` 包, provider, retry, circuit_breaker) |
 | `src/hiveweave/tools/` | 工具执行器 + 74 个注册工具（+5 个 legacy 评审套件） |
-| `src/hiveweave/services/` | 业务服务 (org, dispatch, memory, handoff, skill_registry, turn_*, git_worktree, game_time, chat_message, inbox_triage, ...) |
+| `src/hiveweave/services/` | 业务服务 (org, dispatch, memory, handoff, skill_registry, turn_*, `git_worktree/` 包, `tasks/` 包 + `task.py` shim, game_time, chat_message, inbox_triage, ...) |
 | `src/hiveweave/hooks/` | Lifecycle hooks（OpenCode 风格 registry + points） |
 | `src/hiveweave/conversation/` | 对话历史 + token budget + compaction |
 | `src/hiveweave/db/` | Meta DB + per-project DB (aiosqlite) |
@@ -93,7 +105,8 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 
 ### LLM 流式调用
 
-`apps/hiveweave-py/src/hiveweave/llm/streamer.py` — httpx 流式 SSE,支持多 provider。同步 httpx 在线程池解析 SSE 后经 queue **边收边推** `_fire_delta`（真流式，避免整包收完才刷新导致 UI 冻住假象）:
+`apps/hiveweave-py/src/hiveweave/llm/streamer/` — 包（`__init__.py` 再导出；旧单体 `streamer.py` 已拆）。httpx 流式 SSE，支持多 provider。同步 httpx 在线程池解析 SSE 后经 queue **边收边推** `_fire_delta`（真流式，避免整包收完才刷新导致 UI 冻住假象）:
+- 包内域模块：`core.py` / `http_stream.py` / `tool_loop.py` / `sse.py` / `doom_loop.py` / `constants.py` 等；外部仍 `from hiveweave.llm.streamer import …`
 - `provider.py`: provider 工厂,映射 `openai`/`anthropic`/`google` 到对应 API
 - `retry.py`: 429/503/504/529 重试,指数退避 + jitter,解析 `Retry-After`
 - `circuit_breaker.py`: 熔断器,探针锁防止多 Agent 同时冲击不稳定 API
@@ -104,6 +117,14 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 - 全局 LLM 并发上限 `_LLM_MAX_CONCURRENT`（env `HIVEWEAVE_LLM_MAX_CONCURRENT`，默认 8）；`TOTAL_TIMEOUT_S=540`（env `HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S`；给 agent safety_timeout 600s 留 60s 余量）
 - **连续流式总超时**：同 agent `_stream_timeout_streak ≥ 2` → `_park_after_stream_timeouts`（disposition waiting + wait `stream_total_timeout_recovery` + 升级上级，不自动 approve）
 - **模型分级 + 同级故障切换**（`services/model.py` + `services/policy.py`）：两级 tier — `management`（CEO/Coordinator，好模型）/ `executor`（Executor/QA/HR，便宜模型）。每级两槽位：primary + backup，`global_settings` 四键配置（`model_tier_{management|executor}_{primary|backup}`，值存 model_id 或 UUID）。`resolve_model(tier, skip_model_ids)` 严格按 primary→backup→tier列→legacy pool 解析，**禁跨级**。`model_tier_for_agent(agent)` 由 `infer_role_family` 映射。首次 429/5xx 同 turn 自动切同级 backup（`_resolve_failover_backup`，同 api_key 跳过）；streamer circuit fallback 校验 tier 一致性。`pick_from_pool` 全池 RR 已降级为无 tier 配置时的兼容回退。`ensure_channel_models` 仍按名 upsert Ark Plan/Coding 双渠道；`is_rate_limit_error` 命中的 429 不计入放弃、独立冷却 `RATE_LIMIT_RESUME_COOLDOWN_S=120` 后 resume（`agents/agent.py`）
+
+### 文件拆分纪律（包化）
+
+偏好域模块（约 200–800 行）。**不要**往壳/shim 堆新逻辑：
+- shim / 桶：`services/task.py` → `services/tasks/*`；`services/git_worktree/` 与 `llm/streamer/` 的 `__init__.py` 只做再导出；`agents/agent.py`、`tools/task_tools.py`、前端 `ChatPanel.tsx` / `api.ts` 同理
+- 新逻辑进域模块：`services/tasks/*`、`services/git_worktree/{service_*,reconcile,ensure,…}`、`llm/streamer/{core,tool_loop,http_stream,…}` 等
+
+**原子可评审**：单体 → 包时，旧文件删除与全部替代文件必须同一提交边界（可评审 diff / CI 能同时看到删除与替代）；`__init__` 保留兼容导出。验收不能只靠 import smoke（如 `test_p3_split_import_smoke.py`）——至少映射或补公共入口的正向 + 一条失败/超时/恢复用例。
 
 ### 对话管理
 

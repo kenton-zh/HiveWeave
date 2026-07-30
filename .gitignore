@@ -46,9 +46,16 @@ coverage/
 # Temp
 tmp/
 temp/
+tmp_*.py
+tmp_*.txt
 _research/
 .research/
 .uploads/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
 
 # Temp patch/fix scripts
 _fix*.mjs
@@ -66,6 +73,8 @@ apply-app-patch.mjs
 _ceo_*.txt
 _t.txt
 _inspect*.js
+_inspect*.py
+tasks/_diag_*
 
 # Chat history exports (other projects)
 *_chat_history.json
@@ -129,6 +138,7 @@ apps/web/scripts/refactor-*
 .trae/
 .gstack/
 .e2e-sandbox/
+.cursor/better-harness/
 
 # Agent test playgrounds (nested git repos used by agent teams during tests —
 # committing them creates broken gitlinks without .gitmodules)
