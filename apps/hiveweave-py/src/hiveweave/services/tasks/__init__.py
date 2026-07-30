@@ -1,38 +1,35 @@
-"""Compatibility shim for task service — implementation in services.tasks.
+"""Task ledger package — public API + patch-compatible re-exports.
 
-External callers keep::
+Behavior-preserving mechanical split of the former monolithic
+``task.py``. External callers keep using the shim::
 
     from hiveweave.services.task import TaskService
-    import hiveweave.services.task as _task_svc
+    patch("hiveweave.services.task._query", ...)
 
-Patch targets like ``hiveweave.services.task._query`` / ``TaskService``
-propagate into the ``tasks`` package submodules (LOAD_GLOBAL).
-``TaskService`` is the same class object as ``tasks.service.TaskService``.
+This package module also supports direct imports and propagates
+setattr on patched symbols into consumer submodule globals.
 """
 from __future__ import annotations
 
 import sys
 import types
 
-from hiveweave.services.tasks import (  # noqa: F401
-    MergeRequiredError,
-    TaskEventService,
-    TaskService,
-    VerificationCaseService,
-    _MISSING_COLUMNS,
-    _PROGRESS_FLOORS,
-    _TRANSITIONS,
+from .constants import _MISSING_COLUMNS, _PROGRESS_FLOORS, _TRANSITIONS
+from .db import (
     _conn,
     _ensure_schema,
     _execute,
     _execute_tx,
     _migrated,
     _query,
-    resolve_task_policy,
 )
+from .errors import MergeRequiredError
+from .events import TaskEventService
+from .policy import resolve_task_policy
+from .service import TaskService
+from .verify import VerificationCaseService
 
 _PATCH_CONSUMERS = (
-    "hiveweave.services.tasks",
     "hiveweave.services.tasks.db",
     "hiveweave.services.tasks.progress",
     "hiveweave.services.tasks.transitions",
@@ -46,6 +43,8 @@ _PATCH_CONSUMERS = (
     "hiveweave.services.tasks.obligations",
     "hiveweave.services.tasks.events",
     "hiveweave.services.tasks.service",
+    # Shim module — keep in sync when package attrs are patched
+    "hiveweave.services.task",
 )
 
 _PATCH_NAMES = frozenset({
@@ -66,8 +65,8 @@ _PATCH_NAMES = frozenset({
 })
 
 
-class _TaskShim(types.ModuleType):
-    """Propagate setattr on patched symbols into tasks.* globals."""
+class _TasksPackage(types.ModuleType):
+    """Propagate setattr on patched symbols into consumer globals."""
 
     def __setattr__(self, name: str, value: object) -> None:
         super().__setattr__(name, value)
@@ -75,14 +74,12 @@ class _TaskShim(types.ModuleType):
             return
         for modname in _PATCH_CONSUMERS:
             mod = sys.modules.get(modname)
-            if mod is not None and (
-                name in mod.__dict__ or modname == "hiveweave.services.tasks"
-            ):
+            if mod is not None and name in mod.__dict__:
                 object.__setattr__(mod, name, value)
 
 
 _mod = sys.modules[__name__]
-_mod.__class__ = _TaskShim
+_mod.__class__ = _TasksPackage
 
 __all__ = [
     "TaskService",

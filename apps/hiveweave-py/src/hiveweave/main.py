@@ -172,6 +172,34 @@ def _assert_log_vital_sign() -> None:
     log.info("log_vital_sign", path=log_path)
 
 
+def _code_version() -> str:
+    """TEST6 P3: surface the running code's git short hash in startup logs.
+
+    TEST6 ran gates against fixes committed hours earlier that the (stale)
+    backend process had never loaded — invisible until behavior was audited.
+    Resolve ``.git/HEAD`` → ref → short hash; any failure returns "unknown".
+    """
+    try:
+        # main.py → hiveweave/ → src/ → hiveweave-py/ → apps/ → repo root
+        git_dir = Path(__file__).resolve().parents[4] / ".git"
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split(":", 1)[1].strip()
+            ref_file = git_dir / ref
+            if ref_file.exists():
+                return ref_file.read_text(encoding="utf-8").strip()[:12]
+            packed = (git_dir / "packed-refs").read_text(
+                encoding="utf-8", errors="replace"
+            )
+            for ln in packed.splitlines():
+                if ln.endswith(f" {ref}"):
+                    return ln.split(" ", 1)[0][:12]
+            return "unknown"
+        return head[:12]  # detached HEAD
+    except Exception:
+        return "unknown"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — startup and shutdown.
@@ -189,7 +217,7 @@ async def lifespan(app: FastAPI):
 
     # ── Startup ──────────────────────────────────────────────
     _assert_log_vital_sign()
-    log.info("app_starting", port=settings.port)
+    log.info("app_starting", port=settings.port, code_version=_code_version())
 
     # 1. Init Meta DB
     # Security/Fail-fast: Meta DB 是整个系统的基石 — 路由表、projects、llm_models
