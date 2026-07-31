@@ -87,7 +87,7 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 | `llm/provider.py` | Provider factory (openai/anthropic/google/fallback) |
 | `llm/retry.py` | 429/503/504/529 retry, exponential backoff |
 | `llm/circuit_breaker.py` | 熔断器 + probe lock |
-| `tools/executor.py` | ToolExecutor, 85 个注册工具（+5 个 legacy 评审套件）, permission matrix |
+| `tools/executor.py` | ToolExecutor, 注册工具（数量易变，勿硬编码；5 个 legacy 评审套件）, permission matrix |
 | `conversation/store.py` | Token-budget trimming, turn-level, lazy-loaded |
 | `conversation/compaction.py` | LLM summary of evicted turns |
 | `conversation/token_utils.py` | Char-ratio token estimation |
