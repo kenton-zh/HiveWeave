@@ -79,6 +79,8 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
     "apply_patch": 3,
     "websearch": 3,
     "execute_code": 3,
+    # Paid Ark media — keep tight; retries burn quota
+    "generate_image": 3,
 }
 """Per-tool doom loop thresholds（写类/副作用工具）。不同工具不同限制：
 

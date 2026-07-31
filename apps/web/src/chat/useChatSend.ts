@@ -158,8 +158,14 @@ export function useChatSend(opts: {
 
     const sendingForAgentId = agentId;
     const isActiveSession = () => activeAgentIdRef.current === sendingForAgentId;
+    const clearStreamAbort = () => {
+      // Stream finished (or abandoned): drop cancel handle so agent switch /
+      // remount cannot push a stale WS "cancel" into a later turn (TEST6).
+      streamAbortRef.current = null;
+    };
     const releaseLockAndFinish = () => {
       sendingLockRef.current = false;
+      clearStreamAbort();
       if (pendingQueueRef.current.length > 0) {
         autoSendRef.current = true;
         setTimeout(() => handleSend(), 300);
@@ -178,7 +184,7 @@ export function useChatSend(opts: {
       updateStreamDraft(null);
       updateProcessingAgent(sendingForAgentId, false);
       loadMessagesFromDb(sendingForAgentId);
-      releaseLockAndFinish();
+      releaseLockAndFinish(); // also clears streamAbortRef
     }, 300_000);
     const allToolsUsed = new Set<string>();
     let _dbgTextCount = 0;
@@ -471,6 +477,7 @@ export function useChatSend(opts: {
           setQueuedCount(0);
           autoSendRef.current = false;
           sendingLockRef.current = false;
+          clearStreamAbort();
         } else if (event.type === "error") {
           setThinkingElapsed(null);
           if (responseTimeoutRef.current) {

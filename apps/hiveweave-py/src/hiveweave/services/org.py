@@ -17,6 +17,7 @@ import json
 import re
 import time
 import uuid
+from pathlib import Path
 
 import structlog
 
@@ -858,6 +859,10 @@ class OrgService:
 
         # 清理该 agent 的隔离 worktree（executor 才有）
         # BUG-2: submitted/reviewing → quarantine instead of immediate delete
+        # TEST6 S10: unmerged tip (not ancestor of main) → force quarantine
+        # + notify parent — never silently discard recoverable work.
+        # Tip check ALWAYS runs (even when already deferring for review-pipe)
+        # so the parent still gets [DISMISS QUARANTINE] for stranded tips.
         try:
             short_id = updated.get("short_id", "")
             ws_path = updated.get("workspace_path", "")
@@ -866,6 +871,40 @@ class OrgService:
                 gwt = GitWorktreeService()
                 project_ws = await meta_db.get_project_workspace(project_id)
                 if project_ws:
+                    unmerged_tip = False
+                    try:
+                        from hiveweave.services.git_worktree.git_cmd import (
+                            _git,
+                            _resolve_base_branch,
+                        )
+                        from hiveweave.services.worktree_review import (
+                            worktree_commits_ahead,
+                        )
+
+                        base = await _resolve_base_branch(project_ws)
+                        ahead = await worktree_commits_ahead(
+                            project_ws, ws_path,
+                            target_branch=base or "main",
+                        )
+                        tip_anc = True
+                        if base and Path(ws_path).is_dir():
+                            ok_anc, _ = await _git(
+                                ["merge-base", "--is-ancestor", "HEAD", base],
+                                ws_path,
+                            )
+                            tip_anc = bool(ok_anc)
+                        if (ahead is not None and int(ahead) > 0) or (
+                            tip_anc is False
+                        ):
+                            defer_worktree_delete = True
+                            unmerged_tip = True
+                    except Exception as tip_err:
+                        log.warning(
+                            "dismiss_unmerged_tip_check_failed",
+                            agent_id=agent_id,
+                            error=str(tip_err),
+                        )
+
                     if defer_worktree_delete:
                         q = await gwt.quarantine_for_review(
                             project_ws, short_id
@@ -875,7 +914,46 @@ class OrgService:
                             agent_id=agent_id,
                             short_id=short_id,
                             quarantine=q,
+                            unmerged_tip=unmerged_tip,
                         )
+                        # Notify parent on every quarantine — tip check may
+                        # have set unmerged_tip, or review-pipe already deferred.
+                        if parent_id:
+                            try:
+                                from hiveweave.services.inbox import InboxService
+
+                                tip_note = (
+                                    "unmerged tip (not on main)"
+                                    if unmerged_tip
+                                    else "review-pipe quarantine"
+                                )
+                                await InboxService().send_message(
+                                    from_agent_id="system",
+                                    to_agent_id=parent_id,
+                                    message=(
+                                        f"[DISMISS QUARANTINE] Agent "
+                                        f"{agent_before.get('name') or short_id} "
+                                        f"({short_id}) dismissed with "
+                                        f"{tip_note}. Worktree quarantined at "
+                                        f"{(q or {}).get('path', '?')}; "
+                                        f"branch={(q or {}).get('branch', '?')}. "
+                                        f"Recover via quarantine path or "
+                                        f"explicit discard — do not assume "
+                                        f"work is on main."
+                                    ),
+                                    message_type="system",
+                                    priority="urgent",
+                                    wake=True,
+                                    idempotency_key=(
+                                        f"dismiss-quarantine-{agent_id}"
+                                    ),
+                                )
+                            except Exception as nerr:
+                                log.warning(
+                                    "dismiss_quarantine_notify_failed",
+                                    agent_id=agent_id,
+                                    error=str(nerr),
+                                )
                     else:
                         await gwt.delete(project_ws, short_id)
                         log.info(

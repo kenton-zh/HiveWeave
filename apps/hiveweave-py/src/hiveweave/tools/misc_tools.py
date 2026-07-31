@@ -553,6 +553,11 @@ async def git_worktree_merge_tool(
 
             return ToolResult.err(
                 f"No worktree branch found for agent {branch_name}\n\n"
+                f"Hint: the branch may already have been merged by another "
+                f"merge owner, and the worktree torn down (contract 09). "
+                f"Check git log / task evidence for a merge commit before "
+                f"retrying. If merge already landed, fulfill/cancel the "
+                f"merge obligation instead of re-merging.\n\n"
                 f"{MERGE_CONFLICT_HINT}"
             )
         merged_short = branch_name
@@ -944,8 +949,10 @@ class GitWorktreeStatusParams(BaseModel):
 
 @tool(
     "git_worktree_status",
-    "Show branch, dirty flag, and HEAD for an agent worktree. "
-    "Pass shortId to inspect a subordinate's worktree.",
+    "Show branch, dirty flag, HEAD, and whether tip is already on main "
+    "(tip_is_ancestor_of_main / commits_ahead). "
+    "Pass shortId to inspect a subordinate's worktree. "
+    "Use tip_is_ancestor_of_main=true before claiming work is delivered.",
     requires_workspace=True,
     security_level="standard",
 )
@@ -987,9 +994,17 @@ async def git_worktree_status_tool(
     branch = info.get("branch") or "?"
     dirty = bool(info.get("has_uncommitted"))
     head = info.get("head") or "?"
+    base = info.get("base_branch") or "main"
+    tip_anc = info.get("tip_is_ancestor_of_main")
+    ahead = info.get("commits_ahead")
+    tip_s = (
+        "unknown" if tip_anc is None else ("true" if tip_anc else "false")
+    )
+    ahead_s = "unknown" if ahead is None else str(ahead)
     return ToolResult.ok(
         f"short_id={target_sid}, Branch: {branch}, "
-        f"dirty={dirty}, head={head}"
+        f"dirty={dirty}, head={head}, base={base}, "
+        f"tip_is_ancestor_of_main={tip_s}, commits_ahead={ahead_s}"
     )
 
 

@@ -189,6 +189,10 @@ async def _spawn_post_approve_verify_task(
     verify_evidence: dict[str, Any] = {"required_capabilities": required_caps}
     if reviewer_id:
         verify_evidence["merged_by"] = str(reviewer_id)
+    # TEST6 evening P1-3: machine-readable verify baseline (not prose-only)
+    if merge_sha:
+        verify_evidence["target_merge_commit"] = merge_sha
+        verify_evidence["merge_commit"] = merge_sha
 
     verify_id = await ts.create_task(
         project_id,
@@ -274,10 +278,60 @@ async def _spawn_post_approve_verify_task(
                     ok, out = await _git(
                         ["rev-parse", "HEAD"], ws
                     )
-                    if ok and (out or "").strip():
+                    head = (out or "").strip() if ok else ""
+                    if head:
                         await vcs.set_merge_commit(
-                            project_id, parent_id, out.strip()
+                            project_id, parent_id, head
                         )
+                        # Backfill structured baseline when parent evidence
+                        # lacked merge_commit at spawn time.
+                        if not merge_sha and verify_id:
+                            try:
+                                from hiveweave.services import task as task_module
+
+                                await task_module._execute(
+                                    project_id,
+                                    "UPDATE tasks SET evidence = json_set("
+                                    "COALESCE(evidence, '{}'), '$.target_merge_commit', ?, "
+                                    "'$.merge_commit', ?), updated_at = ? WHERE id = ?",
+                                    [
+                                        head,
+                                        head,
+                                        int(time.time() * 1000),
+                                        verify_id,
+                                    ],
+                                )
+                            except Exception as bf_err:
+                                # json_set may be unavailable — best-effort merge dict
+                                log.debug(
+                                    "verify_baseline_backfill_json_set_failed",
+                                    error=str(bf_err),
+                                )
+                                try:
+                                    row = await ts.get_task(project_id, verify_id)
+                                    ev = (row or {}).get("evidence") or {}
+                                    if isinstance(ev, str):
+                                        ev = json.loads(ev)
+                                    if not isinstance(ev, dict):
+                                        ev = {}
+                                    ev["target_merge_commit"] = head
+                                    ev["merge_commit"] = head
+                                    await task_module._execute(
+                                        project_id,
+                                        "UPDATE tasks SET evidence = ?, updated_at = ? "
+                                        "WHERE id = ?",
+                                        [
+                                            json.dumps(ev),
+                                            int(time.time() * 1000),
+                                            verify_id,
+                                        ],
+                                    )
+                                except Exception as e2:
+                                    log.warning(
+                                        "verify_baseline_backfill_failed",
+                                        verify_id=verify_id,
+                                        error=str(e2),
+                                    )
             except Exception as e:
                 log.warning("verification_case_merge_hash_failed", error=str(e))
         except Exception as e:
@@ -380,7 +434,12 @@ async def _find_independent_qa(
     exclude_ids: set[str] | None = None,
     required_capabilities: list[str] | None = None,
 ) -> str | None:
-    """Pick QA-capability agent ≠ original implementer / merger (prefer same parent)."""
+    """Pick independent QA ≠ original implementer / merger.
+
+    Prefer fam=qa over same-parent executors that merely match caps.
+    Among QA peers, prefer a *different* parent (independence); same-parent
+    is only a last-resort tie-break (TEST18 P0-2).
+    """
     from hiveweave.services.org import OrgService
     from hiveweave.services.policy import (
         Capability,
@@ -422,11 +481,27 @@ async def _find_independent_qa(
     qa_agents = [a for a in active if matches_caps(a)]
     if not qa_agents:
         return None
+
+    # TEST18 P0-2: when caps match both executor and QA, prefer fam=qa.
+    # Same-parent is only a tie-break among QA peers — never prefer a
+    # same-parent implementer teammate over an independent QA.
+    qa_family = [a for a in qa_agents if is_qa(a)]
+    pool = qa_family if qa_family else qa_agents
+
     if original_parent:
-        same = [a for a in qa_agents if a.get("parent_id") == original_parent]
-        if same:
+        same = [a for a in pool if a.get("parent_id") == original_parent]
+        # Prefer SAME parent only when both candidates are fam=qa (tie-break).
+        # Prefer DIFFERENT parent when pool still has non-same options among QA —
+        # independence > same-team familiarity for VERIFY.
+        if qa_family:
+            other = [a for a in qa_family if a.get("parent_id") != original_parent]
+            if other:
+                return other[0]["id"]
+            if same:
+                return same[0]["id"]
+        elif same:
             return same[0]["id"]
-    return qa_agents[0]["id"]
+    return pool[0]["id"]
 
 
 async def retry_qa_blocked_verify_tasks(project_id: str) -> int:

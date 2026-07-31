@@ -79,6 +79,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     "edit_file", "apply_patch", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
     "bash", "run_command", "run_tests", "browse", "game_run_case",
+    "generate_image",
     "git_worktree_checkpoint",
     "run_code_review", "run_security_audit", "run_perf_audit",
     "run_full_review",
@@ -99,6 +100,7 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
 # PolicyService still hard-denies based on role family.
 READONLY_TOOLS = _BASE_TOOLS | frozenset({
     "bash", "write_file", "browse", "assert_visual", "game_run_case", "edit_file",
+    "generate_image",
     "bind_skill", "unbind_skill",
     "start_dev_server",
     "run_tests", "apply_patch",

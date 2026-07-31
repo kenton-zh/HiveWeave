@@ -82,23 +82,72 @@ async def cancel_task_tool(
     except Exception:
         task_row = None
     if task_row:
-        from hiveweave.services.unblock_soft import review_deadlock_blocks_cancel
+        from hiveweave.services.unblock_soft import (
+            cancel_allowed_due_to_approve_deadlock,
+            review_deadlock_blocks_cancel,
+        )
 
-        forbid = await review_deadlock_blocks_cancel(project_id, task_row)
+        forbid = await review_deadlock_blocks_cancel(
+            project_id, task_row, cancel_reason=reason
+        )
         if forbid:
             return ToolResult.err(forbid)
+        deadlock_escape = await cancel_allowed_due_to_approve_deadlock(
+            project_id, task_row
+        )
+    else:
+        deadlock_escape = False
 
     try:
         from_status = await ts.archive_task(
-            project_id, params.task_id, archived_by=agent_id, reason=reason
+            project_id,
+            params.task_id,
+            archived_by=agent_id,
+            reason=reason,
+            reason_code=(
+                "cancelled_in_deadlock" if deadlock_escape else "agent_cancel"
+            ),
         )
     except ValueError as e:
         return ToolResult.err(str(e))
     except Exception as e:
         return ToolResult.err(f"Failed to cancel task: {e}")
+
+    # Stamp evidence when escaping an approve-path deadlock (TEST6 S7).
+    if deadlock_escape:
+        try:
+            import json as _json
+
+            after = await ts.get_task(project_id, params.task_id)
+            ev = (after or {}).get("evidence") or {}
+            if isinstance(ev, str):
+                try:
+                    ev = _json.loads(ev)
+                except Exception:
+                    ev = {}
+            if not isinstance(ev, dict):
+                ev = {}
+            ev["cancelled_in_deadlock"] = True
+            ev["cancelled_in_deadlock_by"] = agent_id
+            ev["cancelled_in_deadlock_reason"] = reason[:500]
+            from hiveweave.services import task as task_module
+
+            await task_module._execute(
+                project_id,
+                "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+                [_json.dumps(ev), int(time.time() * 1000), params.task_id],
+            )
+        except Exception as e:
+            log.warning("cancel_deadlock_stamp_failed", error=str(e))
+
+    suffix = (
+        " [cancelled_in_deadlock — no lawful approver existed]"
+        if deadlock_escape
+        else ""
+    )
     return ToolResult.ok(
         f"Task {params.task_id} archived (was '{from_status}'). "
-        f"It no longer appears in task lists or obligations."
+        f"It no longer appears in task lists or obligations.{suffix}"
     )
 
 

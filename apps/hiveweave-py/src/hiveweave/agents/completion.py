@@ -414,6 +414,9 @@ async def handle_completion(
     continue_slice = False
     carry_inbox_ids: list[str] | None = None
     budget_exhausted = bool(result.get("budget_exhausted"))
+    # NEW-1 / TEST18: phase is only set on exit_decision.ok; public tail
+    # elif (phase == "in_progress") must not UnboundLocalError on park/exhaust.
+    phase: str | None = None
 
     # Progress fingerprint for no-progress circuit breaker
     fp = agent._compute_progress_fingerprint(
@@ -970,6 +973,15 @@ async def handle_completion(
             "(prefer waiting/done_slice when idle on the user).",
             inbox_msg_ids=None,
         )
+    elif (
+        phase == "in_progress"
+        and open_obligations
+        and agent._no_progress_streak == 0
+        and bool(tool_calls)
+    ):
+        # TEST6 evening P2-5: slice budget spent but still productive —
+        # arm deferred wake (scheduler), do not burn same-turn slices.
+        agent._arm_productive_continue()
     elif turn_after_hint:
         agent._task_reminder_count += 1
         await agent._retrigger_for_open_tasks(turn_after_hint)

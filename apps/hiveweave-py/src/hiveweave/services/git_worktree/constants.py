@@ -44,6 +44,7 @@ GITIGNORE_GENERATED_ENTRIES: tuple[str, ...] = (
     "test_output*.json",
     "test-results/",
     "playwright-report/",
+    ".gstack/",
 )
 
 # BUG-4: serialize create per (workspace, short_id) so hire + lazy-ensure

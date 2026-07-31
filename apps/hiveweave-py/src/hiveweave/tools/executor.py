@@ -163,6 +163,38 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["image_path", "prompt"],
     },
+    "generate_image": {
+        "description": (
+            "Generate an image via Ark Agent Plan Seedream (text-to-image). "
+            "Pass prompt (+ optional size / output_path / watermark). Saves PNG "
+            "under the workspace. Configure Settings → 模型配置 → 生图模型配置. "
+            "Requires source-write capability."
+        ),
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "aliases": ["text", "description"],
+                "description": "Text prompt describing the image to generate.",
+            },
+            "size": {
+                "type": "string",
+                "description": 'Output size: "2K", "4K", or WxH. Default 2K.',
+            },
+            "output_path": {
+                "type": "string",
+                "aliases": ["path", "file", "save_as"],
+                "description": (
+                    "Optional workspace-relative save path "
+                    "(default .hiveweave/generated/...)."
+                ),
+            },
+            "watermark": {
+                "type": "boolean",
+                "description": "Add AI watermark (default false).",
+            },
+        },
+        "required": ["prompt"],
+    },
     "game_run_case": {
         "description": (
             "H5/canvas game harness runner. After browse(goto) to the game: "

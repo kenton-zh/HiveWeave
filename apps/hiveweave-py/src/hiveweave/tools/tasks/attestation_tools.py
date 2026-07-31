@@ -141,6 +141,14 @@ async def attest_doc_review_tool(
     elif source in ("main", "root", "project"):
         check_ws = main_ws
         ws_kind = "main"
+        # Stamp main HEAD for VERIFY baseline (TEST6 evening E3)
+        if main_ws and not commit:
+            try:
+                ok_h, out_h = await _git(["rev-parse", "HEAD"], main_ws)
+                if ok_h and (out_h or "").strip():
+                    commit = out_h.strip()
+            except Exception:
+                pass
     else:
         # auto: prefer worktree when complete, else main
         if wt_ws and _all_files_exist(wt_ws):
@@ -149,6 +157,13 @@ async def attest_doc_review_tool(
         else:
             check_ws = main_ws
             ws_kind = "main"
+            if main_ws and not commit:
+                try:
+                    ok_h, out_h = await _git(["rev-parse", "HEAD"], main_ws)
+                    if ok_h and (out_h or "").strip():
+                        commit = out_h.strip()
+                except Exception:
+                    pass
 
     try:
         att_id, report = await create_doc_review(
@@ -157,7 +172,7 @@ async def attest_doc_review_tool(
             task_id=params.task_id,
             files=files,
             workspace=check_ws,
-            commit_hash=commit if ws_kind == "worktree" else None,
+            commit_hash=commit,
         )
     except ValueError as e:
         return ToolResult.err(str(e))
@@ -173,7 +188,9 @@ async def attest_doc_review_tool(
             "After merge, VERIFY should re-attest on main."
         )
     else:
-        extra = " source=main."
+        extra = (
+            f" source=main commit={(commit or '')[:12] or '?'}."
+        )
     return ToolResult.ok(
         f"doc_review attestation {att_id} recorded for [{paths}] "
         f"under {check_ws}.{extra} Pass attestationIds=[\"{att_id}\"] on "

@@ -7,6 +7,8 @@ import {
   detectCapabilities,
   getTierConfig,
   saveTierConfig,
+  getImageGenConfig,
+  saveImageGenConfig,
 } from "../api";
 import type { LlmModel, TierConfig } from "../api";
 import { useAppStore } from "../store";
@@ -25,6 +27,14 @@ const EMPTY_FORM = {
   maxOutputTokens: 8192,
   supportsThinking: false,
 };
+
+const EMPTY_IMAGE_GEN = {
+  modelId: "",
+  baseUrl: "https://ark.cn-beijing.volces.com/api/plan/v3",
+  apiKey: "",
+};
+
+const DEFAULT_PLAN_ROOT = "https://ark.cn-beijing.volces.com/api/plan/v3";
 
 // 统一输入框样式，保证整页一致
 const INPUT_CLS =
@@ -55,6 +65,12 @@ export default function ModelConfigPage({ onClose }: Props) {
   });
   const [tierSaving, setTierSaving] = useState(false);
 
+  // ── Part 3: dedicated image-gen (Seedream) ──
+  const [imageGenForm, setImageGenForm] = useState({ ...EMPTY_IMAGE_GEN });
+  const [imageGenKeySet, setImageGenKeySet] = useState(false);
+  const [imageGenKeyMasked, setImageGenKeyMasked] = useState("");
+  const [imageGenSaving, setImageGenSaving] = useState(false);
+
   // 入场动效
   const [entered, setEntered] = useState(false);
   useEffect(() => {
@@ -81,10 +97,26 @@ export default function ModelConfigPage({ onClose }: Props) {
     }
   }, []);
 
+  const loadImageGenConfig = useCallback(async () => {
+    try {
+      const cfg = await getImageGenConfig();
+      setImageGenForm({
+        modelId: cfg.modelId || "",
+        baseUrl: cfg.baseUrl || DEFAULT_PLAN_ROOT,
+        apiKey: "",
+      });
+      setImageGenKeySet(cfg.apiKeySet);
+      setImageGenKeyMasked(cfg.apiKeyMasked || "");
+    } catch (err) {
+      console.error("Failed to load image-gen config:", err);
+    }
+  }, []);
+
   useEffect(() => {
     loadModels();
     loadTierConfig();
-  }, [loadModels, loadTierConfig]);
+    loadImageGenConfig();
+  }, [loadModels, loadTierConfig, loadImageGenConfig]);
 
   const maskApiKey = (key: string) => {
     if (!key) return "—";
@@ -227,6 +259,36 @@ export default function ModelConfigPage({ onClose }: Props) {
     }
   };
 
+  const setImageGenField = <K extends keyof typeof imageGenForm>(
+    key: K,
+    value: (typeof imageGenForm)[K],
+  ) => setImageGenForm((f) => ({ ...f, [key]: value }));
+
+  const handleSaveImageGen = async () => {
+    if (!imageGenForm.modelId.trim() || !imageGenForm.baseUrl.trim()) {
+      showToast("生图模型 ID 与 Base URL 为必填项", "warning");
+      return;
+    }
+    if (!imageGenForm.apiKey.trim() && !imageGenKeySet) {
+      showToast("请填写 API Key", "warning");
+      return;
+    }
+    setImageGenSaving(true);
+    try {
+      await saveImageGenConfig({
+        modelId: imageGenForm.modelId.trim(),
+        baseUrl: imageGenForm.baseUrl.trim(),
+        apiKey: imageGenForm.apiKey.trim() || undefined,
+      });
+      showToast("生图模型配置已保存", "success");
+      await loadImageGenConfig();
+    } catch (err: any) {
+      showToast(err.message || "保存失败", "error");
+    } finally {
+      setImageGenSaving(false);
+    }
+  };
+
   const modelOptions = (
     <>
       <option value="">（未设置）</option>
@@ -260,7 +322,9 @@ export default function ModelConfigPage({ onClose }: Props) {
         <div className="flex items-center justify-between px-7 py-5 border-b border-g-border shrink-0">
           <div>
             <h2 className="text-xl font-semibold text-g-fg tracking-tight">模型配置</h2>
-            <p className="text-[13px] text-g-fg-3 mt-1">管理模型清单，并为各层级指定主用与备用模型</p>
+            <p className="text-[13px] text-g-fg-3 mt-1">
+              管理对话模型清单、层级槽位，以及独立的生图（Seedream）配置
+            </p>
           </div>
           <button
             onClick={onClose}
@@ -481,7 +545,7 @@ export default function ModelConfigPage({ onClose }: Props) {
               </button>
             </div>
             <p className="text-[13px] text-g-fg-3 mb-4 leading-relaxed">
-              管理层（CEO / Coordinator）与执行层（Executor / QA / HR）各自指定主用与备用模型。主用模型故障（429 / 5xx）时自动切换到备用。多模态模型专供「帮你看图片」；识图调用主用失败时同样自动切备用（同 API Key 跳过）。
+              管理层（CEO / Coordinator）与执行层（Executor / QA / HR）各自指定主用与备用模型。主用模型故障（429 / 5xx）时自动切换到备用。多模态模型专供「帮你看图片」；识图主用失败时自动切备用（同 API Key 跳过）。生图请用下方独立「生图模型设置」面板。
             </p>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
@@ -576,6 +640,71 @@ export default function ModelConfigPage({ onClose }: Props) {
                     </select>
                   </div>
                 </div>
+              </div>
+            </div>
+          </section>
+
+          {/* ─── Part 3: Image generation (Seedream) ─── */}
+          <section>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-[13px] font-semibold text-g-fg-2 uppercase tracking-wider flex items-center gap-2">
+                <span className="w-1 h-4 rounded-full bg-violet-500 shrink-0" />
+                生图模型设置
+                <span className="text-g-fg-4 font-normal normal-case tracking-normal">
+                  generate_image · Seedream
+                </span>
+              </h3>
+              <button
+                onClick={handleSaveImageGen}
+                disabled={imageGenSaving}
+                className="px-3.5 py-1.5 text-sm font-medium bg-violet-600 text-white rounded-gm shadow-gm-sm hover:shadow-gm hover:brightness-105 active:scale-[0.97] transition-all disabled:opacity-50"
+              >
+                {imageGenSaving ? "保存中..." : "保存生图配置"}
+              </button>
+            </div>
+            <p className="text-[13px] text-g-fg-3 mb-4 leading-relaxed">
+              专用于 Agent 工具 generate_image。Base URL 填 Agent Plan 根地址（须含{" "}
+              <code className="text-[11px]">/api/plan/</code>
+              ，勿混用普通 v3 / Coding）。Model ID 填控制台 Seedream id。仅写码角色可用。
+            </p>
+            <div className="border border-violet-500/25 rounded-gmLg p-5 bg-violet-500/5 shadow-gm-sm space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className={LABEL_CLS}>模型 ID</label>
+                  <input
+                    value={imageGenForm.modelId}
+                    onChange={(e) => setImageGenField("modelId", e.target.value)}
+                    placeholder="例如 doubao-seedream-5.0-lite"
+                    className={INPUT_CLS}
+                  />
+                </div>
+                <div>
+                  <label className={LABEL_CLS}>Base URL</label>
+                  <input
+                    value={imageGenForm.baseUrl}
+                    onChange={(e) => setImageGenField("baseUrl", e.target.value)}
+                    placeholder={DEFAULT_PLAN_ROOT}
+                    className={INPUT_CLS}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className={LABEL_CLS}>
+                  API Key
+                  {imageGenKeySet && !imageGenForm.apiKey && (
+                    <span className="ml-2 font-normal text-g-fg-4">
+                      已保存 {imageGenKeyMasked}（留空则保持不变）
+                    </span>
+                  )}
+                </label>
+                <input
+                  type="password"
+                  value={imageGenForm.apiKey}
+                  onChange={(e) => setImageGenField("apiKey", e.target.value)}
+                  placeholder={imageGenKeySet ? "留空保持原 Key" : "ark-…"}
+                  className={INPUT_CLS}
+                  autoComplete="off"
+                />
               </div>
             </div>
           </section>

@@ -129,11 +129,20 @@ async def _refuse_project_root_write(
     tool_name: str,
     ctx: ToolContext | None,
 ) -> str | None:
-    """Return an error if a write-eligible agent is about to write on project root."""
+    """Return an error if a write-eligible agent is about to write on project root.
+
+    TEST6 evening audit P0-2: VERIFY-only / idle writers are intentionally
+    routed to MAIN (no personal tree). They must be allowed to write
+    throwaway verify scripts on project root — the refuse gate only applies
+    when the agent still *needs* a write worktree for code tasks.
+    """
     from pathlib import Path
 
     try:
-        from hiveweave.services.git_worktree import agent_gets_write_worktree
+        from hiveweave.services.git_worktree import (
+            agent_gets_write_worktree,
+            _assignee_needs_write_worktree,
+        )
         from hiveweave.tools.file import infer_project_root
 
         agent = None
@@ -148,7 +157,27 @@ async def _refuse_project_root_write(
         ws = Path(workspace_path).resolve()
         if ws != root:
             return None
+
         short = (agent.get("short_id") or "?").strip()
+        # VERIFY-only / no in-flight write tasks → main writes allowed
+        project_id = (agent.get("project_id") or "").strip()
+        if not project_id and ctx is not None:
+            project_id = str(getattr(ctx, "project_id", "") or "")
+        if short and project_id:
+            try:
+                from hiveweave.db import meta as meta_db
+
+                proj_ws = await meta_db.get_project_workspace(project_id) or ""
+                if proj_ws and not await _assignee_needs_write_worktree(
+                    proj_ws, short
+                ):
+                    return None
+            except Exception as e:
+                log.debug(
+                    "refuse_root_write_verify_check_failed",
+                    error=str(e),
+                )
+
         return (
             f"Refusing {tool_name} on project root for write-worktree agent "
             f"{short}. Your workspace must be "

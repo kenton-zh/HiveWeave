@@ -387,7 +387,10 @@ class GameTimeService:
             try:
                 from hiveweave.services.obligation import ObligationLedger
 
-                await ObligationLedger().scan_overdue(project_id)
+                ledger = ObligationLedger()
+                await ledger.scan_overdue(project_id)
+                # TEST6 S11: backfill missing review obligations for review-pipe
+                await ledger.audit_missing_review_obligations(project_id)
             except Exception as e:
                 log.error(
                     "obligation_scan_failed",
@@ -1995,6 +1998,25 @@ class GameTimeService:
             if r["last_ts"]:
                 aid = r["agent_id"]
                 last_output[aid] = max(last_output.get(aid, 0), int(r["last_ts"]))
+        # TEST6 evening P2-5: tool_calls-only turns also count as output
+        # (long browse sessions may leave empty assistant text).
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT agent_id, MAX(created_at) AS last_ts FROM chat_messages "
+                "WHERE role = 'assistant' "
+                "AND tool_calls IS NOT NULL AND TRIM(tool_calls) NOT IN ('', '[]', 'null') "
+                "GROUP BY agent_id",
+                [],
+            )
+            for r in rows:
+                if r["last_ts"]:
+                    aid = r["agent_id"]
+                    last_output[aid] = max(
+                        last_output.get(aid, 0), int(r["last_ts"])
+                    )
+        except Exception:
+            pass
         rows = await _query(project_id,
             "SELECT agent_id, MAX(created_at) AS last_ts FROM work_logs "
             "GROUP BY agent_id", [])

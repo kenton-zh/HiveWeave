@@ -443,10 +443,24 @@ class MergeMixin:
             )
 
         if wt_path and _Path(wt_path).is_dir():
-            # Checkpoint worktree state before rebase
+            # Checkpoint worktree state before rebase — skip vacuum empty commits
+            # (TEST6 evening P3-7: empty pre-merge-checkpoint polluted main tip).
             await _git(["add", "-A"], wt_path)
-            await _git(["commit", "-m", "pre-merge-checkpoint", "--allow-empty"],
-                       wt_path)
+            ok_diff, diff_out = await _git(
+                ["diff", "--cached", "--quiet"], wt_path
+            )
+            # diff --quiet: exit 0 = no staged changes; exit 1 = dirty
+            has_staged = not ok_diff
+            if has_staged:
+                await _git(
+                    ["commit", "-m", "pre-merge-checkpoint"],
+                    wt_path,
+                )
+            else:
+                log.info(
+                    "git_worktree.pre_merge_checkpoint_skipped_empty",
+                    branch=branch,
+                )
             # Rebase onto target_branch
             ok_reb, reb_out = await _git(
                 ["rebase", target_branch], wt_path)

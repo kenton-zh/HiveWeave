@@ -22,11 +22,30 @@ def test_soft_reminder_only_when_waiver():
 
 @pytest.mark.asyncio
 async def test_cancel_forbid_when_waiver_in_review_pipe():
-    task = {"id": "t-deadlock", "status": "submitted", "evidence": {}}
-    with patch(
-        "hiveweave.services.attestation.get_valid_waiver",
-        AsyncMock(return_value={"id": "w1"}),
+    task = {
+        "id": "t-deadlock",
+        "status": "submitted",
+        "assignee_id": "exec1",
+        "evidence": {},
+    }
+    # Lawful approver exists (ceo) → still forbid cancel
+    agents = [
+        {"id": "ceo1", "role": "ceo", "status": "active"},
+        {
+            "id": "exec1",
+            "role": "board engineer",
+            "permission_type": "executor",
+            "status": "active",
+        },
+    ]
+    with (
+        patch(
+            "hiveweave.services.attestation.get_valid_waiver",
+            AsyncMock(return_value={"id": "w1", "agent_id": "other"}),
+        ),
+        patch("hiveweave.services.org.OrgService") as Org,
     ):
+        Org.return_value.list_agents = AsyncMock(return_value=agents)
         msg = await review_deadlock_blocks_cancel("p1", task)
     assert msg is not None
     assert "cancel_task refused" in msg
@@ -41,12 +60,26 @@ async def test_cancel_forbid_when_evidence_attestations():
     task = {
         "id": "t2",
         "status": "reviewing",
+        "assignee_id": "exec1",
         "evidence": {"attestation_ids": ["att-1"], "tests_passed": False},
     }
-    with patch(
-        "hiveweave.services.attestation.get_valid_waiver",
-        AsyncMock(return_value=None),
+    agents = [
+        {"id": "ceo1", "role": "ceo", "status": "active"},
+        {
+            "id": "exec1",
+            "role": "board engineer",
+            "permission_type": "executor",
+            "status": "active",
+        },
+    ]
+    with (
+        patch(
+            "hiveweave.services.attestation.get_valid_waiver",
+            AsyncMock(return_value=None),
+        ),
+        patch("hiveweave.services.org.OrgService") as Org,
     ):
+        Org.return_value.list_agents = AsyncMock(return_value=agents)
         msg = await review_deadlock_blocks_cancel("p1", task)
     assert msg is not None
     assert REVIEW_PATH_BLOCKED_REMINDER in msg
@@ -69,8 +102,18 @@ async def test_cancel_tool_refuses_review_deadlock():
     task = {
         "id": "t-dead",
         "status": "submitted",
+        "assignee_id": "exec1",
         "evidence": {"tests_passed": True},
     }
+    agents = [
+        {"id": "ceo1", "role": "ceo", "status": "active"},
+        {
+            "id": "exec1",
+            "role": "board engineer",
+            "permission_type": "executor",
+            "status": "active",
+        },
+    ]
     with (
         patch(
             "hiveweave.tools.helpers.get_project_id",
@@ -81,7 +124,9 @@ async def test_cancel_tool_refuses_review_deadlock():
             "hiveweave.services.attestation.get_valid_waiver",
             AsyncMock(return_value=None),
         ),
+        patch("hiveweave.services.org.OrgService") as Org,
     ):
+        Org.return_value.list_agents = AsyncMock(return_value=agents)
         TS.return_value.get_task = AsyncMock(return_value=task)
         TS.return_value.archive_task = AsyncMock(return_value="submitted")
         result = await cancel_task_tool(

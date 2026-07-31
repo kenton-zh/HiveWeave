@@ -25,7 +25,11 @@ from hiveweave.agents.constants import (
     RATE_LIMIT_BACKOFF_STEPS_S,
     RATE_LIMIT_SOFT_STREAK_ESCALATE,
 )
-from hiveweave.agents.helpers.rate_limit import is_rate_limit_error
+from hiveweave.agents.helpers.rate_limit import (
+    broadcast_project_rate_limit,
+    is_account_rate_limit,
+    is_rate_limit_error,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -297,12 +301,27 @@ async def handle_error(agent: Any, error: Exception) -> None:
             )
             agent.pending_inbox_msg_ids = None
         agent._arm_resume_cooldown(cooldown)
+        # TEST18 P0-5: AccountRateLimitExceeded is account-wide — cool the
+        # whole project so peers don't keep stampeding the same key.
+        if is_account_rate_limit(error):
+            try:
+                broadcast_project_rate_limit(
+                    agent.project_id,
+                    cooldown,
+                    source_agent_id=agent.id,
+                )
+            except Exception as e:
+                log.debug(
+                    "project_rate_limit_broadcast_error",
+                    error=str(e),
+                )
         log.warning(
             "llm_rate_limit_deferred",
             agent_id=agent.id,
             cooldown_s=cooldown,
             rate_limit_streak=getattr(agent, "_rate_limit_streak", 0),
             is_daily_quota=is_daily,
+            is_account_limit=is_account_rate_limit(error),
             consecutive_errors=agent._consecutive_errors,
             inbox_left_unread=len(inbox_ids),
         )
@@ -799,8 +818,9 @@ async def handle_cancel(agent: Any) -> None:
 
     await agent._finalize_streaming_turn(content="[对话被中断]")
 
-    # 保留 inbox 未读（用户取消不应标记已读）
-    # pending_inbox_msg_ids 保持不变，下次 trigger 可重新处理
+    # DB inbox 未读保留（用户取消不应 mark_read）。内存 claim
+    # （pending_inbox_msg_ids）由 Agent.cancel() 在 await task 前释放；
+    # 若当时 claim 非空，cancel 会 revive watcher 让未读再被 claim。
 
     agent._cancel_safety_timer()
     agent._reset_to_idle()

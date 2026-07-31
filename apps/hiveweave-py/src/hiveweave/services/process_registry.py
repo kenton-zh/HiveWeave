@@ -524,6 +524,65 @@ def stop_processes_for_worktree(worktree_path: str) -> dict:
     return {"stopped": stopped, "failed": failed}
 
 
+def stop_processes_for_project(project_id: str) -> dict:
+    """Stop all registered processes for a project (any cwd, incl. main).
+
+    TEST6 evening P2-6: main-checkout dev servers are not bound to a
+    worktree, so worktree teardown never kills them. Call on deactivate
+    / project stop.
+    """
+    hydrate_registry()
+    stopped: list[dict] = []
+    failed: list[dict] = []
+    to_check = [
+        (key, rec)
+        for key, rec in list(_registry.items())
+        if rec.project_id == project_id
+    ]
+    for key, rec in to_check:
+        if not rec.pid or not _is_pid_alive(rec.pid):
+            _registry.pop(key, None)
+            stopped.append(
+                {"port": rec.port, "pid": rec.pid, "status": "already_dead"}
+            )
+            continue
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(rec.pid)],
+                    capture_output=True,
+                    timeout=10,
+                )
+            else:
+                import signal
+
+                os.kill(rec.pid, signal.SIGTERM)
+            _registry.pop(key, None)
+            stopped.append(
+                {"port": rec.port, "pid": rec.pid, "status": "killed"}
+            )
+            log.info(
+                "process_stopped_for_project",
+                project_id=project_id,
+                port=rec.port,
+                pid=rec.pid,
+            )
+        except Exception as e:
+            failed.append(
+                {"port": rec.port, "pid": rec.pid, "error": str(e)}
+            )
+            log.warning(
+                "process_stop_failed_for_project",
+                project_id=project_id,
+                port=rec.port,
+                pid=rec.pid,
+                error=str(e),
+            )
+    if stopped or failed:
+        _persist_registry()
+    return {"stopped": stopped, "failed": failed}
+
+
 def clear_registry_for_tests() -> None:
     _registry.clear()
     global _hydrated

@@ -40,11 +40,17 @@ async def ensure_executor_worktree(
     *,
     task_name: str | None = None,
     task_id: str | None = None,
+    force: bool = False,
 ) -> dict:
     """Ensure a writer (executor / builder coordinator) has a live worktree.
 
     Refuses CEO/HR — they must not own write worktrees (forced project root).
     Idempotent if a valid worktree is already bound.
+
+    TEST6 evening P1-2 invariant: recreate only when the agent has in-flight
+    write tasks (or ``force=True`` for explicit hire/dispatch override).
+    Without open tasks, missing trees stay missing — close-GC / heal must
+    not fight each other.
 
     task_name: DEPRECATED — 保留兼容旧调用方, 不再参与分支命名;
     task_id 驱动 P0 稳定命名 (hw/<sid>/t-<id8>)。
@@ -117,6 +123,49 @@ async def ensure_executor_worktree(
             short_id=short_id,
             workspace_path=cur,
         )
+
+    # TEST6 evening P1-2 / audit P0-1: recreate only for real write intent.
+    # force=True → explicit override (rare).
+    # task_id bypasses the open-tasks gate ONLY for non-VERIFY tasks
+    # (dispatch/create/rework). VERIFY also has a task_id but must NOT
+    # rebuild a personal write tree — that undoes close-GC and stale-tip
+    # verification.
+    if not force:
+        bypass_open_gate = False
+        if task_id:
+            try:
+                from hiveweave.services.task import TaskService
+
+                trow = await TaskService().get_task(project_id, str(task_id))
+                if trow and not TaskService._is_verify_task(trow):
+                    bypass_open_gate = True
+            except Exception as e:
+                log.debug(
+                    "worktree_ensure_task_lookup_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
+                bypass_open_gate = False
+        if not bypass_open_gate:
+            from .reconcile import _assignee_needs_write_worktree
+
+            if not await _assignee_needs_write_worktree(ws, short_id):
+                log.info(
+                    "worktree_recreate_skipped_no_open_tasks",
+                    agent_id=agent_id,
+                    short_id=short_id,
+                    project_id=project_id,
+                    task_id=task_id,
+                )
+                return {
+                    "success": False,
+                    "skipped": True,
+                    "short_id": short_id,
+                    "message": (
+                        "worktree recreate skipped: no in-flight write tasks "
+                        f"for {short_id}"
+                    ),
+                }
 
     gwt = GitWorktreeService()
     name = task_name or agent.get("role") or "task"
@@ -246,13 +295,18 @@ async def worktree_commits_behind_main(
         return 0
 
 async def heal_project_executor_worktrees(project_id: str) -> dict:
-    """Ensure every active writer (executor / builder coordinator) has a worktree.
+    """Ensure every active writer with in-flight tasks has a worktree.
 
     Prunes stale metadata, recreates missing worktrees, updates agents.workspace_path.
     CEO/HR rows are excluded — they are pinned to the project root.
+
+    TEST6 evening P1-2: idle writers (no in-flight tasks) are not healed —
+    otherwise heal undoes close-GC / merge teardown.
     """
     from hiveweave.db import meta as meta_db
     from hiveweave.db import project as project_db
+
+    from .reconcile import _assignee_needs_write_worktree
 
     ws = await meta_db.get_project_workspace(project_id)
     if not ws or not (Path(ws) / ".git").exists():
@@ -279,15 +333,34 @@ async def heal_project_executor_worktrees(project_id: str) -> dict:
 
     recovered = 0
     failed = 0
+    skipped_idle = 0
     for a in agents:
+        sid = (a["short_id"] or "").strip()
+        if sid and not await _assignee_needs_write_worktree(ws, sid):
+            skipped_idle += 1
+            log.debug(
+                "worktree_heal_skipped_no_open_tasks",
+                agent_id=a["id"],
+                short_id=sid,
+                project_id=project_id,
+            )
+            continue
         result = await ensure_executor_worktree(
             project_id,
             a["id"],
             task_name=a["role"] or "developer",
         )
+        if result.get("skipped"):
+            skipped_idle += 1
+            continue
         if result.get("success"):
             if result.get("message") != "worktree already bound":
                 recovered += 1
         else:
             failed += 1
-    return {"recovered": recovered, "failed": failed, "skipped": False}
+    return {
+        "recovered": recovered,
+        "failed": failed,
+        "skipped_idle": skipped_idle,
+        "skipped": False,
+    }

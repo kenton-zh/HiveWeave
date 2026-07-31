@@ -698,6 +698,35 @@ def reviewer_required_kinds(policy_id: str) -> frozenset[str] | None:
     return REVIEWER_REQUIRED_KINDS.get(policy_id)
 
 
+async def ancestor_task_ids(
+    project_id: str, task_id: str, *, max_depth: int = 8
+) -> list[str]:
+    """Walk parent_task_id chain (excluding ``task_id`` itself). Fail-open → []."""
+    out: list[str] = []
+    seen: set[str] = {str(task_id)}
+    cur_id: str | None = str(task_id)
+    try:
+        from hiveweave.services.task import TaskService
+
+        ts = TaskService()
+        for _ in range(max_depth):
+            row = await ts.get_task(project_id, cur_id)
+            if not row:
+                break
+            parent = row.get("parent_task_id")
+            if not parent:
+                break
+            pid = str(parent)
+            if pid in seen:
+                break
+            seen.add(pid)
+            out.append(pid)
+            cur_id = pid
+    except Exception:
+        return out
+    return out
+
+
 async def find_reviewer_attestation(
     project_id: str,
     task_id: str,
@@ -705,6 +734,8 @@ async def find_reviewer_attestation(
     kinds: frozenset[str],
     *,
     consume_agent_ids: list[str] | None = None,
+    extra_task_ids: list[str] | None = None,
+    reviewer_must_hold: bool = True,
 ) -> bool:
     """Check if reviewer (or allowed consume agents) has fresh attestation.
 
@@ -712,6 +743,13 @@ async def find_reviewer_attestation(
     Soft unblock (facts): ``consume_agent_ids`` lets CEO/reviewer accept a
     same-task subordinate (typically assignee) fresh successful test_run —
     not a structured next-action command.
+
+    TEST6 audit S1: ``extra_task_ids`` (ancestor chain) expands the match
+    set so CEO can consume subordinate evidence bound to a parent task.
+    ``reviewer_must_hold=False`` (CEO without TEST_RUN) skips the reviewer's
+    own row and only accepts consume agents — CEO's lawful path is review
+    of subordinate evidence, not self-produced tests.
+
     Returns True if at least one valid attestation exists.
     """
     from hiveweave.db import meta as meta_db
@@ -724,19 +762,29 @@ async def find_reviewer_attestation(
     if not db:
         return False
     now_ms = int(time.time() * 1000)
-    agent_ids: list[str] = [reviewer_id]
+    agent_ids: list[str] = []
+    if reviewer_must_hold:
+        agent_ids.append(reviewer_id)
     for aid in consume_agent_ids or []:
         a = str(aid or "").strip()
         if a and a not in agent_ids:
             agent_ids.append(a)
+    if not agent_ids:
+        return False
+    task_ids: list[str] = [str(task_id)]
+    for tid in extra_task_ids or []:
+        t = str(tid or "").strip()
+        if t and t not in task_ids:
+            task_ids.append(t)
     try:
-        placeholders = ",".join("?" for _ in agent_ids)
+        agent_ph = ",".join("?" for _ in agent_ids)
+        task_ph = ",".join("?" for _ in task_ids)
         cur = await db.execute(
             "SELECT kind, exit_code, agent_id FROM tool_attestations "
-            f"WHERE task_id = ? AND agent_id IN ({placeholders}) "
+            f"WHERE task_id IN ({task_ph}) AND agent_id IN ({agent_ph}) "
             "AND (expires_at IS NULL OR expires_at > ?) "
             "AND kind != 'waiver'",
-            [task_id, *agent_ids, now_ms],
+            [*task_ids, *agent_ids, now_ms],
         )
         _rows = await cur.fetchall()
         await cur.close()
@@ -752,6 +800,84 @@ async def find_reviewer_attestation(
     except Exception:
         pass
     return False
+
+
+async def list_reviewer_attestations_diag(
+    project_id: str,
+    reviewer_id: str,
+    *,
+    kinds: frozenset[str] | None = None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Fresh attestations held by reviewer (any task_id) for reject diagnostics.
+
+    TEST6 audit S6: when approve fails on task binding, surface what the
+    reviewer actually holds so the mismatch is discoverable in one message.
+    """
+    from hiveweave.db import meta as meta_db
+    from hiveweave.db.project import ensure_project_db
+
+    ws = await meta_db.get_project_workspace(project_id)
+    if not ws:
+        return []
+    db = await ensure_project_db(ws)
+    if not db:
+        return []
+    now_ms = int(time.time() * 1000)
+    try:
+        cur = await db.execute(
+            "SELECT id, kind, task_id, exit_code, created_at FROM tool_attestations "
+            "WHERE agent_id = ? "
+            "AND (expires_at IS NULL OR expires_at > ?) "
+            "AND kind != 'waiver' "
+            "ORDER BY created_at DESC LIMIT ?",
+            [reviewer_id, now_ms, max(1, int(limit))],
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        kind = row["kind"] if "kind" in row.keys() else ""
+        if kinds is not None and kind not in kinds:
+            continue
+        ec = row["exit_code"] if "exit_code" in row.keys() else None
+        if ec is not None and int(ec) != 0:
+            continue
+        out.append({
+            "id": row["id"] if "id" in row.keys() else "",
+            "kind": kind,
+            "task_id": row["task_id"] if "task_id" in row.keys() else None,
+        })
+    return out
+
+
+def format_attestation_mismatch_hint(
+    held: list[dict[str, Any]], *, target_task_id: str
+) -> str:
+    """Human-readable mismatch list for approve reject messages."""
+    if not held:
+        return (
+            "You hold no fresh successful attestation (any task). "
+            "Run tests with taskId set to the task under review."
+        )
+    lines = [
+        "You hold fresh attestation(s) that do not match this task:"
+    ]
+    for h in held[:6]:
+        bound = h.get("task_id") or "(unbound)"
+        hid = str(h.get("id") or "")[:8]
+        kind = h.get("kind") or "?"
+        match = "MATCH" if str(bound) == str(target_task_id) else "mismatch"
+        lines.append(
+            f"  - {kind} id={hid}… bound_task={str(bound)[:8]} ({match})"
+        )
+    lines.append(
+        f"Target task={str(target_task_id)[:8]}… — re-run tests with "
+        f'taskId="{target_task_id}" or consume assignee evidence on this task.'
+    )
+    return "\n".join(lines)
 
 
 async def check_task_attestations(
@@ -808,6 +934,149 @@ async def check_task_attestations(
         f"For docs_only: call attest_doc_review(taskId, files=[...]) then "
         f"submit/approve with those attestationIds; or coordinator "
         f"waive_attestation as last resort."
+    )
+
+
+async def check_verify_baseline(
+    project_id: str,
+    task: dict,
+    *,
+    max_behind: int = 0,
+) -> str | None:
+    """Hard gate: VERIFY attestations must be on target/main tip.
+
+    TEST6 evening P1-3: reject approve when all fresh attestations for this
+    VERIFY task are pinned to a stale commit (personal worktree baseline).
+
+    Returns error string or None if OK / not applicable.
+    """
+    title = task.get("title") or ""
+    tags = task.get("tags") or []
+    is_verify = (
+        (isinstance(title, str) and title.startswith("VERIFY:"))
+        or (
+            isinstance(tags, list)
+            and "verify" in [str(x).lower() for x in tags]
+        )
+    )
+    if not is_verify:
+        return None
+
+    ev = task.get("evidence") or {}
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except Exception:
+            ev = {}
+    if not isinstance(ev, dict):
+        ev = {}
+
+    target = str(
+        ev.get("target_merge_commit")
+        or ev.get("merge_commit")
+        or ev.get("merge_commit_hash")
+        or ""
+    ).strip()
+
+    from hiveweave.services.worktree_review import project_main_workspace
+    from hiveweave.services.git_worktree import _git
+
+    main_ws = await project_main_workspace(project_id)
+    main_tip = ""
+    if main_ws:
+        ok, out = await _git(["rev-parse", "HEAD"], main_ws)
+        if ok:
+            main_tip = (out or "").strip()
+
+    if not target and main_tip:
+        target = main_tip
+    if not target:
+        return None  # no baseline recorded — cannot hard-fail
+
+    tid = str(task.get("id") or "")
+    if not tid:
+        return None
+
+    await attestation_service.ensure_schema(project_id)
+    try:
+        conn = await _conn(project_id)
+    except ProjectDbError:
+        return None
+    now = int(time.time() * 1000)
+    cur = await conn.execute(
+        "SELECT id, kind, commit_hash, exit_code FROM tool_attestations "
+        "WHERE project_id = ? AND task_id = ? "
+        "AND kind IN ('test_run', 'browse_e2e', 'visual_check', 'doc_review') "
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "AND (exit_code IS NULL OR exit_code = 0) "
+        "ORDER BY created_at DESC LIMIT 20",
+        [project_id, tid, now],
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    if not rows:
+        return None  # other gates handle missing attestations
+
+    def _short(h: str) -> str:
+        return (h or "")[:12]
+
+    accepted: list[str] = []
+    stale: list[str] = []
+    allowed = {target.lower()}
+    if main_tip:
+        allowed.add(main_tip.lower())
+        # Also accept short prefixes
+        allowed.add(main_tip[:12].lower())
+    allowed.add(target[:12].lower())
+
+    for row in rows:
+        ch = ""
+        if hasattr(row, "keys"):
+            ch = str(row["commit_hash"] or "").strip()
+        else:
+            ch = str(row[2] or "").strip()
+        if not ch:
+            stale.append("(missing commit_hash)")
+            continue
+        ch_l = ch.lower()
+        ok_match = ch_l in allowed or any(
+            a.startswith(ch_l) or ch_l.startswith(a) for a in allowed if len(a) >= 7
+        )
+        # Ancestor window: attestation commit is ancestor of main tip
+        # (verified on an older tip that fast-forwarded) — allow if
+        # max_behind permits and merge-base says ancestor.
+        if not ok_match and main_ws and main_tip and max_behind >= 0:
+            try:
+                ok_anc, _ = await _git(
+                    ["merge-base", "--is-ancestor", ch, main_tip],
+                    main_ws,
+                )
+                if ok_anc:
+                    # Count how far behind
+                    ok_cnt, cnt_out = await _git(
+                        ["rev-list", "--count", f"{ch}..{main_tip}"],
+                        main_ws,
+                    )
+                    behind = int((cnt_out or "0").strip() or "0") if ok_cnt else 999
+                    if behind <= max_behind:
+                        ok_match = True
+                    elif behind <= 0:
+                        ok_match = True
+            except Exception:
+                pass
+        if ok_match:
+            accepted.append(_short(ch))
+        else:
+            stale.append(_short(ch))
+
+    if accepted:
+        return None
+
+    return (
+        f"Cannot approve VERIFY: attestation baseline stale. "
+        f"target_merge_commit={_short(target)} main_tip={_short(main_tip)}; "
+        f"attestation commits={stale or ['(none)']}. "
+        f"Re-run tests on MAIN (project root) at the current tip, then approve."
     )
 
 

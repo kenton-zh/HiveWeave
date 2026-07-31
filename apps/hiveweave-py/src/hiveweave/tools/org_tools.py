@@ -383,7 +383,19 @@ async def hire_agent_tool(
 
                 gwt = GitWorktreeService()
                 project_ws = await meta_db.get_project_workspace(project_id)
-                if project_ws:
+                if not project_ws:
+                    # TEST18 NEW-6: soft-fail must record worktree_error
+                    worktree_error = "no project workspace for worktree create"
+                    await ctx.org.update_agent(new_id, {
+                        "worktree_error": worktree_error,
+                    })
+                    log.warning(
+                        "tool.hire_agent.worktree_soft_fail",
+                        agent_id=new_id,
+                        short_id=new_short,
+                        error=worktree_error,
+                    )
+                else:
                     wt_result = await gwt.create(
                         workspace_path=project_ws,
                         short_id=new_short,
@@ -467,12 +479,19 @@ async def hire_agent_tool(
                             short_id=new_short,
                             worktree=worktree_path,
                         )
-                    elif ws:
+                    else:
+                        # Always persist soft-fail (TEST18 NEW-6) — even when
+                        # workspace lookup itself fails.
                         await ctx.org.update_agent(new_id, {
                             "worktree_error": worktree_error,
                         })
                 except Exception:
-                    pass  # don't let logging failure break hire
+                    try:
+                        await ctx.org.update_agent(new_id, {
+                            "worktree_error": worktree_error or "worktree create failed",
+                        })
+                    except Exception:
+                        pass  # don't let logging failure break hire
 
         # Start the agent so it can process inbox messages
         try:
