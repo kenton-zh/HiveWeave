@@ -430,6 +430,23 @@ class OrgService:
             if project_id:
                 self.touch_org_version(project_id)
 
+        # 运行中 Agent 的内存 config 同步（否则 UI 改 model_id 等字段要重启后端才生效）
+        try:
+            from hiveweave.agents.supervisor import agent_manager
+            live = agent_manager.get_agent(agent_id)
+            if live is not None:
+                for k, v in attrs.items():
+                    if k in ("id", "created_at", "short_id"):
+                        continue
+                    if k in _JSON_COLS and isinstance(v, list):
+                        v = json.dumps(v)
+                    live.config[k] = v
+                log.info("live_agent_config_synced", agent_id=agent_id,
+                         fields=list(attrs.keys()))
+        except Exception as e:
+            log.warning("live_agent_config_sync_failed", agent_id=agent_id,
+                        error=str(e))
+
         return await self.get_agent(agent_id)
 
     async def update_status(self, agent_id: str, status: str) -> None:

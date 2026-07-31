@@ -318,6 +318,7 @@ class ModelService:
         """Resolve model config by tier: primary → backup (strict, no cross-tier).
 
         Resolution order:
+        0. Agent 显式指定的模型（preferred，如 UI「使用模型」切换）— 最高优先
         1. Tier primary from global_settings
         2. Tier backup from global_settings
         3. Any active model with matching tier column
@@ -332,6 +333,18 @@ class ModelService:
         def _skipped(model: dict) -> bool:
             """Check if model matches skip set by DB primary key (id) only."""
             return model.get("id") in skip
+
+        # 0. 显式指定的模型优先（UI「使用模型」切换立即生效）
+        if preferred:
+            model = await self.get(preferred)
+            if model and model.get("is_active") and not _skipped(model):
+                log.debug(
+                    "model_resolve_explicit",
+                    tier=tier,
+                    model=model.get("name"),
+                    preferred=preferred,
+                )
+                return model
 
         tier_cfg = await self.get_tier_config(tier)
 
