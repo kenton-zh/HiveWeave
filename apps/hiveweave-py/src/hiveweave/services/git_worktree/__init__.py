@@ -65,6 +65,7 @@ from .service import GitWorktreeService
 from .reconcile import (
     _agent_id_for_short_id,
     _assignee_has_open_tasks,
+    _assignee_needs_write_worktree,
     _log_worktree_rebuild_event,
     _open_project_db_raw,
     _parse_worktree_porcelain,
@@ -72,6 +73,7 @@ from .reconcile import (
     _protected_worktree_short_ids,
     _task_branch_candidate,
     _try_reattach_worktree,
+    quarantine_orphan_branch,
     reconcile_worktrees,
 )
 from .ensure import (
@@ -114,6 +116,7 @@ _PATCH_NAMES = frozenset({
     "agent_gets_write_worktree",
     "GitWorktreeService",
     "reconcile_worktrees",
+    "quarantine_orphan_branch",
     "scan_conflict_markers",
     "parse_untracked_overwrite",
     "quarantine_untracked_on_target",
@@ -127,6 +130,7 @@ _PATCH_NAMES = frozenset({
     "_porcelain_tracked_dirty",
     "_abort_landed_merge",
     "_assignee_has_open_tasks",
+    "_assignee_needs_write_worktree",
 })
 
 
@@ -157,6 +161,7 @@ __all__ = [
     "SLUG_MAX_LEN",
     "compute_branch_name",
     "reconcile_worktrees",
+    "quarantine_orphan_branch",
     "ensure_executor_worktree",
     "heal_project_executor_worktrees",
     "agent_gets_write_worktree",
@@ -184,6 +189,7 @@ __all__ = [
     "_task_branch_candidate",
     "_protected_worktree_short_ids",
     "_assignee_has_open_tasks",
+    "_assignee_needs_write_worktree",
     "_reject_if_markers_landed",
     "_merge_failure_result",
     "_abort_landed_merge",

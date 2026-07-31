@@ -70,6 +70,17 @@ class CloseMixin:
                 task_id=task_id,
                 error=str(e),
             )
+        # TEST6 evening P1-1: closed ⇒ no pending obligations (fail-open)
+        try:
+            from hiveweave.services.obligation import ObligationLedger
+
+            await ObligationLedger().reconcile_closed_task(project_id, task_id)
+        except Exception as e:
+            log.warning(
+                "obligation.reconcile_closed_failed",
+                task_id=task_id,
+                error=str(e),
+            )
 
     async def _gc_assignee_worktree_if_idle(
         self, project_id: str, task: dict | None
@@ -644,6 +655,7 @@ class CloseMixin:
         *,
         archived_by: str,
         reason: str,
+        reason_code: str = "agent_cancel",
     ) -> str:
         """废弃任务（任意非 closed 状态 → archived）。coordinator 纠错通道。
 
@@ -678,10 +690,11 @@ class CloseMixin:
             )
         now_ms = int(time.time() * 1000)
         event_id = str(uuid.uuid4())
+        code = (reason_code or "agent_cancel").strip() or "agent_cancel"
         arch_payload = json.dumps({
             "archived_by": archived_by,
             "reason": reason[:500],
-            "reason_code": "agent_cancel",
+            "reason_code": code,
             "detail": reason[:500],
         })
         await _execute_tx(project_id, [
@@ -708,6 +721,7 @@ class CloseMixin:
             from_status=current,
             archived_by=archived_by,
             reason=reason[:120],
+            reason_code=code,
         )
 
         # B2: VERIFY 归档时级联父任务 —— 如果归档的是 VERIFY 子任务，

@@ -8,10 +8,12 @@ type UpdateStreamDraft = (
 ) => void;
 
 /**
- * WebSocket channel + stream lifecycle.
+ * WebSocket channel + local stream-UI lifecycle.
  *
- * CRITICAL: abort / leave / clear timeout run ONLY on `[agentId]` cleanup.
- * Mount / orgTreeVersion re-runs of other effects must NOT kill the stream.
+ * CRITICAL: leave / clear timeout / drop abort handles run ONLY on `[agentId]`
+ * cleanup. Do NOT push WS "cancel" on agent switch (BUG-034 / TEST6) — that
+ * killed background trigger resumes. Explicit Stop uses handleStop instead.
+ * Mount / orgTreeVersion re-runs of other effects must NOT tear down the channel.
  */
 export function useAgentChannelLifecycle(opts: {
   agentId: string | null;
@@ -44,18 +46,17 @@ export function useAgentChannelLifecycle(opts: {
     joinAgentChannel(agentId).catch(() => {});
   }, [agentId]);
 
-  // Manage WebSocket channel + stream lifecycle — abort stream, clear timeout,
-  // and leave channel ONLY when agentId actually changes, not when
-  // loadMessagesFromDb or orgTreeVersion triggers a re-run of the main mount
-  // effect. This prevents the "stops after one sentence" bug where the stream
-  // gets killed mid-response because lobby:status or org tree refresh causes
-  // the mount effect to re-run.
+  // Manage WebSocket channel + local UI lifecycle when agentId changes.
+  // BUG-034 / TEST6: do NOT call streamAbortRef (pushes WS "cancel") on switch —
+  // leaveAgentChannel also skips cancel. Switching agents must not kill a
+  // background / trigger resume turn. Explicit Stop still goes through handleStop.
   useEffect(() => {
     return () => {
       if (agentId) {
-        streamAbortRef.current?.();
+        // Drop stale abort handle so a later remount cannot cancel a new turn.
         streamAbortRef.current = null;
         abortControllerRef.current?.abort();
+        abortControllerRef.current = null;
         if (responseTimeoutRef.current) {
           clearTimeout(responseTimeoutRef.current);
           responseTimeoutRef.current = null;

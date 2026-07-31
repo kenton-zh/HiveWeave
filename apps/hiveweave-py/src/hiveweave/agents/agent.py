@@ -177,6 +177,8 @@ class Agent:
         self.disposition: str = "runnable"  # waiting_human|blocked|complete|…
         self._slice_budget: int = 0  # remaining auto-slices for this external wake
         self._SLICE_BUDGET_MAX = 2
+        self._productive_continue_timer: asyncio.TimerHandle | None = None
+        self._PRODUCTIVE_CONTINUE_DELAY_S = 30.0
         self._progress_fingerprint: str | None = None
         self._no_progress_streak: int = 0
         self._empty_done_slice_streak: int = 0
@@ -454,9 +456,15 @@ class Agent:
             self.status = AgentState.PROCESSING
             self._cancel_reason = None
             self.empty_retry_count = 0
+            self._cancel_productive_continue()
             source = (opts or {}).get("source") or ""
-            # External wakes refill slice budget; gate/reminder turns do not
-            if source not in ("turn_exit_gate", "open_task_reminder"):
+            # External wakes refill slice budget; gate/reminder/productive
+            # continue turns do not (ADR-002 + audit P1-3).
+            if source not in (
+                "turn_exit_gate",
+                "open_task_reminder",
+                "productive_continue",
+            ):
                 self._slice_budget = self._SLICE_BUDGET_MAX
                 # New wake: allow [TASK ADVANCE] again; clear explicit 不推进
                 self._task_reminder_count = 0
@@ -629,6 +637,12 @@ class Agent:
         reason=off_duty（下班停机）：不 ACK pending inbox，避免 park 后丢消息；
         streaming 文案走下班专用中断。
 
+        普通用户/WS cancel：同样**不** ACK pending inbox（与 recovery.handle_cancel
+        一致）。切 Agent 误发 cancel（TEST6）时若 ACK，HR 回信会被吃掉且不再
+        自动唤醒。仅当本轮持有非空 pending claim 时才复活 watcher，让未读
+        再 trigger；无 pending / stop_agent / IDLE 保持「watcher 死到下次
+        chat()/enqueue_wake()」契约，避免 Stop 不停与孤儿 watcher。
+
         必须持 self._lock：与 chat() setup 窗口串行，消灭
         「cancel 见 IDLE/无 task → 复位；随后 chat 仍 create_task」竞态。
         await 已取消的 task/watcher 在锁外，避免 task finally 间接触锁死锁。
@@ -640,11 +654,16 @@ class Agent:
 
         task_to_await: asyncio.Task | None = None
         watcher_to_await: asyncio.Task | None = None
+        was_processing = False
+        # Revive only when we dropped a non-empty in-memory claim while
+        # preserving DB unread (TEST6 mistaken cancel recovery).
+        revive_watcher_for_pending = False
 
         async with self._lock:
             self._cancel_reason = reason
             is_off_duty = reason == OFF_DUTY_CANCEL_REASON
             self._cancel_safety_timer()
+            self._cancel_productive_continue()
 
             if self._llm_task and not self._llm_task.done():
                 self._llm_task.cancel()
@@ -652,6 +671,7 @@ class Agent:
 
             # BUG-010 修复：停 inbox watcher；下次激活时由
             # _ensure_watcher_alive() 复活（见 chat()/enqueue_wake()）。
+            # 例外：下方非空 pending + 非 off_duty 时主动 revive 一次。
             self._stop_watcher = True
             if self._inbox_watcher_task and not self._inbox_watcher_task.done():
                 self._inbox_watcher_task.cancel()
@@ -659,21 +679,23 @@ class Agent:
 
             # 确保状态干净
             if self.status == AgentState.PROCESSING:
-                # 普通 cancel：ACK pending，避免 watcher 死循环；
-                # 下班：保留未读，等 park 后 briefing 合并消费。
-                if self.pending_inbox_msg_ids and not is_off_duty:
-                    try:
-                        await self._inbox.mark_read_by_ids(
-                            self.id, self.pending_inbox_msg_ids
-                        )
-                        log.info("cancel_marked_inbox_read",
-                                 agent_id=self.id,
-                                 msg_count=len(self.pending_inbox_msg_ids))
-                    except Exception as e:
-                        log.warning("cancel_mark_inbox_read_failed",
-                                    agent_id=self.id, error=str(e))
+                was_processing = True
+                # User/WS cancel: keep inbox unread so a mistaken cancel
+                # (e.g. agent switch) can re-wake. Off-duty already preserves
+                # unread; clear only the in-memory claim so a revived watcher
+                # re-claims from DB.
+                pending = self.pending_inbox_msg_ids
+                if pending:
+                    log.info(
+                        "cancel_preserved_inbox_unread",
+                        agent_id=self.id,
+                        msg_count=len(pending),
+                        reason=reason,
+                    )
+                    if not is_off_duty:
+                        revive_watcher_for_pending = True
                     self.pending_inbox_msg_ids = None
-                elif is_off_duty:
+                elif pending is not None:
                     self.pending_inbox_msg_ids = None
                 # A6(2) 修复：cancel 时清除 streaming 标志，防止僵尸消息
                 try:
@@ -687,7 +709,9 @@ class Agent:
                 except Exception as e:
                     log.warning("cancel_clear_streaming_failed",
                                 agent_id=self.id, error=str(e))
-                self._reset_to_idle()
+                # Defer _reset_to_idle until after awaiting the cancelled task
+                # so CancelledError handler still sees _cancel_reason (not
+                # "unknown"). handle_cancel / safety_timeout also reset.
             elif is_off_duty:
                 # idle：只清下班状态，不强制写「被中断」文案
                 self.pending_inbox_msg_ids = None
@@ -706,6 +730,23 @@ class Agent:
                     pass
                 else:
                     raise
+
+        # If CancelledError path did not reset (e.g. task already done), idle now.
+        if was_processing and self.status == AgentState.PROCESSING:
+            self._reset_to_idle()
+
+        # TEST6: re-arm watcher only when unread claim was preserved.
+        # stop_agent / intentional Stop without pending / off_duty: stay dead
+        # until chat()/enqueue_wake() (avoids orphan watcher + Stop 不停).
+        if revive_watcher_for_pending:
+            try:
+                self._ensure_watcher_alive()
+            except Exception as e:
+                log.warning(
+                    "cancel_revive_watcher_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
 
     async def trigger(self, trigger_type: str = "subordinate") -> dict:
         """触发 agent 处理待处理内容。
@@ -1247,6 +1288,9 @@ class Agent:
         路径失效，会懒创建 worktree 并写回 DB（不依赖仅启动时的 lifespan
         recovery）。CEO/HR 强制项目根（并清掉误绑的 worktree 路径）；
         恢复失败时回退到项目根目录。
+
+        TEST6 evening P1-3: 名下只有 VERIFY（或无在途写任务）时强制项目根 —
+        VERIFY 必须在 MAIN 取证，不能落到个人 worktree 的过期 tip。
         """
         if self._workspace_path is not None:
             return self._workspace_path
@@ -1275,6 +1319,30 @@ class Agent:
                             pass
                     self._workspace_path = project_ws
                     return self._workspace_path
+
+                # VERIFY-only / idle writers → MAIN (no personal tree)
+                short_id = (agent_row.get("short_id") or "").strip()
+                if project_ws and short_id:
+                    try:
+                        from hiveweave.services.git_worktree import (
+                            _assignee_needs_write_worktree,
+                        )
+
+                        if not await _assignee_needs_write_worktree(
+                            project_ws, short_id
+                        ):
+                            # P1-5: clear stale DB binding so state matches runtime
+                            if ws and "worktrees" in ws.replace("\\", "/"):
+                                try:
+                                    await org.update_agent(
+                                        self.id, {"workspace_path": None}
+                                    )
+                                except Exception:
+                                    pass
+                            self._workspace_path = project_ws
+                            return self._workspace_path
+                    except Exception:
+                        pass
 
                 if ws and _os.path.isdir(ws) and (_Path(ws) / ".git").exists():
                     self._workspace_path = ws
@@ -1445,6 +1513,66 @@ class Agent:
         asyncio.create_task(
             self.chat(hint, opts=opts),
             name=f"agent-{self.id}-turn-gate-retrigger",
+        )
+
+    def _cancel_productive_continue(self) -> None:
+        t = getattr(self, "_productive_continue_timer", None)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+            self._productive_continue_timer = None
+
+    def _arm_productive_continue(self) -> None:
+        """TEST6 evening P2-5: schedule a short deferred wake after productive
+        in_progress when same-turn slice budget is exhausted.
+
+        Scheduler-layer (not unlimited slices). no-progress breaker still parks.
+        Source ``productive_continue`` refills slice budget on next chat().
+        """
+        if not hasattr(self, "_productive_continue_timer"):
+            self._productive_continue_timer = None
+        if not hasattr(self, "_PRODUCTIVE_CONTINUE_DELAY_S"):
+            self._PRODUCTIVE_CONTINUE_DELAY_S = 30.0
+        self._cancel_productive_continue()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        delay = float(self._PRODUCTIVE_CONTINUE_DELAY_S)
+
+        def _fire() -> None:
+            self._productive_continue_timer = None
+            if self.status != AgentState.IDLE:
+                return
+            hint = (
+                "[PRODUCTIVE CONTINUE] Previous slice ended in_progress after "
+                "tool activity. Resume work; commit_turn(waiting/done_slice) "
+                "when blocked on an external party or finished."
+            )
+            log.info(
+                "productive_continue_wake",
+                agent_id=self.id,
+                delay_s=delay,
+            )
+            asyncio.create_task(
+                self.chat(
+                    hint,
+                    opts={
+                        "trigger": True,
+                        "is_background": True,
+                        "source": "productive_continue",
+                    },
+                ),
+                name=f"agent-{self.id}-productive-continue",
+            )
+
+        self._productive_continue_timer = loop.call_later(delay, _fire)
+        log.info(
+            "productive_continue_armed",
+            agent_id=self.id,
+            delay_s=delay,
         )
 
     async def _handle_empty_response(
@@ -2058,8 +2186,25 @@ class Agent:
     # ── 内部: 超时/错误恢复 ──────────────────────────────────
 
     def _in_resume_cooldown(self) -> bool:
-        """Whether this agent is inside a post-timeout/error resume cooldown."""
-        return time.monotonic() < self._resume_cooldown_until
+        """Whether this agent is inside a post-timeout/error resume cooldown.
+
+        Also honors project-wide account rate-limit throttle (TEST18 P0-5).
+        Do NOT peek circuit OPEN here — HALF_OPEN only advances inside
+        ``circuit_breaker.check()``; blocking resume on raw OPEN permanently
+        prevents the probe that would clear the breaker.
+        """
+        if time.monotonic() < self._resume_cooldown_until:
+            return True
+        try:
+            from hiveweave.agents.helpers.rate_limit import (
+                project_rate_limit_remaining,
+            )
+
+            if project_rate_limit_remaining(self.project_id) > 0:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _arm_resume_cooldown(self, seconds: float) -> None:
         """Arm cooldown so inbox watcher won't immediately re-fire.

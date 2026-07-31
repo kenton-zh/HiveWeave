@@ -114,6 +114,19 @@ async def stop_project_cleanly(project_id: str) -> dict:
         "agent_ids": ids,
         "leftover_cleared": len(leftover),
     }
+    # TEST6 evening P2-6: kill main-checkout + all registered project processes
+    try:
+        from hiveweave.services.process_registry import stop_processes_for_project
+
+        proc = stop_processes_for_project(project_id)
+        result["processes"] = proc
+    except Exception as e:
+        log.warning(
+            "stop_project_processes_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+        result["processes"] = {"error": str(e)}
     log.info("stop_project_cleanly_done", project_id=project_id, **result)
     return result
 

@@ -132,6 +132,31 @@ class SubmitMixin:
             summary=f"[submitted] task {task_id[:8]}",
         )
 
+        # TEST6 S11: activate/ensure review obligation on submit
+        # (owner = pinned reviewer; idempotent with dispatch-time create).
+        try:
+            owner = reviewer_id or (meta_rows[0]["creator_id"] if meta_rows else None)
+            if owner:
+                from hiveweave.services.obligation import ObligationLedger
+
+                await ObligationLedger().create(
+                    project_id,
+                    str(owner),
+                    "review",
+                    task_id=task_id,
+                    context={
+                        "source": "submit",
+                        "assignee_id": agent_id,
+                        "activated": True,
+                    },
+                )
+        except Exception as e:
+            log.warning(
+                "submit_review_obligation_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+
     async def _resolve_evidence_workspace(
         self, project_id: str, task: dict
     ) -> str:

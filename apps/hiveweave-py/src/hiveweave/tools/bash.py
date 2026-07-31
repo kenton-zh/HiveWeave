@@ -1071,30 +1071,232 @@ async def _resolve_test_attestation_task_id(
     project_id: str,
     agent_id: str,
     explicit: str | None = None,
-) -> str | None:
-    """Bind test_run to a task: explicit → sole assignee active → sole creator review."""
+) -> tuple[str | None, str]:
+    """Bind test_run to a task.
+
+    Priority (TEST6 audit S4/S5 + TEST18 P0-3/P0-4):
+      1. explicit taskId
+      2. reviewer path — sole submitted/reviewing where creator=self
+         OR reviewer_id=self
+      3. VERIFY assignee path — sole open VERIFY (created|claimed|running)
+         where assignee=self (VERIFY skips assign=claim, so include created)
+      4. assignee path — sole running/claimed where assignee=self
+      5. reviewing >1 / VERIFY >1 → refuse silent bind + candidate note
+      6. 0 match but REVIEW-capable → candidate tip (do NOT auto-bind)
+
+    Returns ``(task_id | None, tool_note)``.
+    """
     if explicit and str(explicit).strip():
-        return str(explicit).strip()
+        return str(explicit).strip(), ""
     from hiveweave.services.task import TaskService
 
     ts = TaskService()
-    tasks = await ts.list_tasks(project_id, assignee_id=agent_id)
-    active = [t for t in tasks if t.get("status") in ("running", "claimed")]
-    if len(active) == 1:
-        return active[0].get("id")
-    # Reviewer path: submitted/reviewing where this agent is creator
+    # Reviewer path FIRST (S4): intent to approve is more likely than
+    # self-execution when the agent is also an assignee of a parent task.
     try:
         all_tasks = await ts.list_tasks(project_id)
     except Exception:
-        return None
-    reviewing = [
+        all_tasks = []
+
+    def _is_my_review(t: dict) -> bool:
+        if t.get("status") not in ("submitted", "reviewing"):
+            return False
+        if str(t.get("creator_id") or "") == str(agent_id):
+            return True
+        # TEST18 P0-4: pinned reviewer_id also counts
+        if str(t.get("reviewer_id") or "") == str(agent_id):
+            return True
+        return False
+
+    reviewing = [t for t in (all_tasks or []) if _is_my_review(t)]
+    if len(reviewing) == 1:
+        return reviewing[0].get("id"), ""
+    if len(reviewing) > 1:
+        # S5: refuse silent bind — listing candidates is discoverable;
+        # binding the "wrong" task creates false evidence that never matches.
+        lines = [
+            "\n\n[attestation_bind] test_run left UNBOUND: multiple tasks "
+            "awaiting your review. Pass taskId explicitly, e.g.:",
+        ]
+        for t in reviewing[:6]:
+            tid = str(t.get("id") or "")
+            title = (t.get("title") or "")[:40]
+            st = t.get("status") or "?"
+            lines.append(f"  - taskId={tid} status={st} title={title!r}")
+        lines.append(
+            "Re-run the test command with taskId=<id> to bind evidence "
+            "for approve."
+        )
+        return None, "\n".join(lines)
+
+    try:
+        mine = await ts.list_tasks(project_id, assignee_id=agent_id)
+    except Exception:
+        mine = []
+
+    # TEST18 P0-3 re-audit: VERIFY is often still `created` (skips
+    # assign=claim). Prefer sole open VERIFY over generic running tasks so
+    # force-cwd=main and stamp can fire without an explicit taskId.
+    _VERIFY_OPEN = frozenset({"created", "claimed", "running"})
+    verify_open = [
+        t for t in (mine or [])
+        if (t.get("status") or "") in _VERIFY_OPEN
+        and TaskService._is_verify_task(t)
+    ]
+    if len(verify_open) == 1:
+        return verify_open[0].get("id"), ""
+    if len(verify_open) > 1:
+        lines = [
+            "\n\n[attestation_bind] test_run left UNBOUND: multiple open "
+            "VERIFY tasks assigned to you. Pass taskId explicitly:",
+        ]
+        for t in verify_open[:6]:
+            tid = str(t.get("id") or "")
+            title = (t.get("title") or "")[:40]
+            st = t.get("status") or "?"
+            lines.append(f"  - taskId={tid} status={st} title={title!r}")
+        lines.append(
+            "VERIFY tests must run on MAIN — re-run with taskId=<id>."
+        )
+        return None, "\n".join(lines)
+
+    active = [
+        t for t in (mine or [])
+        if t.get("status") in ("running", "claimed")
+    ]
+    if len(active) == 1:
+        return active[0].get("id"), ""
+    if len(active) > 1:
+        lines = [
+            "\n\n[attestation_bind] test_run left UNBOUND: multiple active "
+            "tasks assigned to you. Pass taskId explicitly:",
+        ]
+        for t in active[:6]:
+            tid = str(t.get("id") or "")
+            title = (t.get("title") or "")[:40]
+            st = t.get("status") or "?"
+            lines.append(f"  - taskId={tid} status={st} title={title!r}")
+        return None, "\n".join(lines)
+
+    # TEST18 P0-4: REVIEW-capable helper (not creator/assignee/pinned) gets
+    # an actionable tip listing open review candidates — never silent None.
+    open_review = [
         t for t in (all_tasks or [])
         if t.get("status") in ("submitted", "reviewing")
-        and str(t.get("creator_id") or "") == str(agent_id)
     ]
-    if len(reviewing) == 1:
-        return reviewing[0].get("id")
-    return None
+    if open_review:
+        has_review_cap = False
+        try:
+            from hiveweave.services.org import OrgService
+            from hiveweave.services.policy import Capability, has_capability
+
+            agent_row = await OrgService().get_agent(agent_id)
+            has_review_cap = bool(
+                agent_row and has_capability(agent_row, Capability.REVIEW)
+            )
+        except Exception:
+            has_review_cap = False
+        if has_review_cap:
+            lines = [
+                "\n\n[attestation_bind] test_run left UNBOUND: you hold REVIEW "
+                "but are not the task creator/pinned reviewer/assignee. "
+                "Pass taskId explicitly to bind evidence for approve/waive:",
+            ]
+            for t in open_review[:6]:
+                tid = str(t.get("id") or "")
+                title = (t.get("title") or "")[:40]
+                st = t.get("status") or "?"
+                lines.append(f"  - taskId={tid} status={st} title={title!r}")
+            lines.append(
+                "Example: bash(command='npm test', taskId=<id>)"
+            )
+            return None, "\n".join(lines)
+
+    return None, ""
+
+
+def _norm_ws(path: str) -> str:
+    """Normalize workspace path for equality checks (Windows-safe)."""
+    if not path:
+        return ""
+    try:
+        return str(Path(path).resolve())
+    except Exception:
+        return os.path.normcase(os.path.normpath(path))
+
+
+def _is_under_or_same(child: str, parent: str) -> bool:
+    """True when child path equals parent or is nested under it."""
+    if not child or not parent:
+        return False
+    try:
+        c = Path(child).resolve()
+        p = Path(parent).resolve()
+        return c == p or p in c.parents
+    except Exception:
+        cn = _norm_ws(child)
+        pn = _norm_ws(parent)
+        return cn == pn or cn.startswith(pn.rstrip("\\/") + os.sep) or cn.startswith(
+            pn.rstrip("\\/") + "/"
+        )
+
+
+async def _resolve_verify_test_workspace(
+    project_id: str,
+    agent_id: str,
+    explicit_task_id: str | None,
+    command: str,
+    default_workspace: str,
+) -> tuple[str, str, str | None]:
+    """Force VERIFY test runs onto project main (TEST18 P0-3 review).
+
+    Returns ``(exec_workspace, note, verify_task_id | None)``.
+    Non-test / non-VERIFY → unchanged default workspace.
+    """
+    from hiveweave.services.attestation import is_test_command
+    from hiveweave.services.task import TaskService
+
+    if not project_id or not is_test_command(command or ""):
+        return default_workspace or "", "", None
+
+    resolved, bind_note = await _resolve_test_attestation_task_id(
+        project_id, agent_id, explicit_task_id
+    )
+    if not resolved:
+        # Keep existing bind tip (multi VERIFY / multi active / REVIEW helper);
+        # do not spam a generic VERIFY tip on every unbound test run.
+        return default_workspace or "", bind_note, None
+
+    try:
+        task = await TaskService().get_task(project_id, resolved)
+    except Exception:
+        task = None
+    if not task or not TaskService._is_verify_task(task):
+        return default_workspace or "", bind_note, resolved
+
+    try:
+        from hiveweave.services.worktree_review import project_main_workspace
+
+        main_ws = await project_main_workspace(project_id)
+    except Exception:
+        main_ws = None
+
+    if not main_ws:
+        note = (
+            "\n\n[VERIFY EXEC] cannot resolve project main workspace — "
+            "refusing to run/attest tests from a write-worktree. Fix project "
+            "workspace binding, then re-run on main."
+        )
+        return "", note + bind_note, resolved
+
+    if _norm_ws(main_ws) == _norm_ws(default_workspace or ""):
+        return main_ws, bind_note, resolved
+
+    note = (
+        f"\n\n[VERIFY EXEC] forced cwd=main ({main_ws}) — VERIFY tests must "
+        f"run at project root so attestation commit matches main tip."
+    )
+    return main_ws, note + bind_note, resolved
 
 
 async def _issue_test_run_attestation(
@@ -1106,8 +1308,14 @@ async def _issue_test_run_attestation(
     stdout: str,
     exit_code: int,
     task_id: str | None,
+    exec_cwd: str | None = None,
 ) -> str:
-    """Create test_run attestation (success or failure). Return note fragment."""
+    """Create test_run attestation (success or failure). Return note fragment.
+
+    ``workspace`` is the stamp/root workspace. ``exec_cwd`` (optional) is the
+    actual directory the command ran in (e.g. workspace/params.cwd) — used for
+    VERIFY under-main checks.
+    """
     from hiveweave.services.attestation import (
         attestation_service,
         is_test_command,
@@ -1116,20 +1324,124 @@ async def _issue_test_run_attestation(
 
     if not is_test_command(command or ""):
         return ""
-    resolved = await _resolve_test_attestation_task_id(
+    resolved, bind_note = await _resolve_test_attestation_task_id(
         project_id, agent_id, task_id
     )
+
+    # TEST18 P0-3 / NEW-3: VERIFY attestation must stamp MAIN workspace HEAD,
+    # and the test must have executed there (not stamp-only while running in
+    # a worktree descendant).
+    stamp_workspace = workspace
+    is_verify = False
+    if resolved:
+        try:
+            task = await TaskService().get_task(project_id, resolved)
+            if task and TaskService._is_verify_task(task):
+                is_verify = True
+                from hiveweave.services.worktree_review import (
+                    project_main_workspace,
+                )
+
+                main_ws = await project_main_workspace(project_id)
+                if not main_ws:
+                    return (
+                        "\n\n[VERIFY ATTEST REJECTED] cannot resolve project "
+                        "main workspace — no attestation issued. Re-run tests "
+                        "after project workspace is bound."
+                        + bind_note
+                    )
+                stamp_workspace = main_ws
+                check_path = exec_cwd or workspace or ""
+                if not _is_under_or_same(check_path, main_ws):
+                    return (
+                        "\n\n[VERIFY ATTEST REJECTED] tests ran outside main "
+                        f"(exec={check_path!r} main={main_ws!r}). Re-run with "
+                        "cwd at project root (platform forces this for VERIFY "
+                        "via bash/run_command when taskId binds a VERIFY task)."
+                        + bind_note
+                    )
+        except Exception as e:
+            if is_verify:
+                return (
+                    f"\n\n[VERIFY ATTEST REJECTED] main stamp failed: {e}"
+                    + bind_note
+                )
+
+    # TEST6 evening E3: always stamp HEAD so VERIFY baseline gate can fire
+    commit_hash: str | None = None
+    if stamp_workspace:
+        try:
+            from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "rev-parse",
+                "HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                cwd=stamp_workspace,
+                **windows_no_window_kwargs(),
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            if proc.returncode == 0 and out:
+                commit_hash = (
+                    out.decode("utf-8", errors="replace").strip()[:40] or None
+                )
+        except Exception:
+            commit_hash = None
     aid = await attestation_service.create(
         project_id,
         agent_id=agent_id,
         kind="test_run",
         command_or_url=(command or "")[:500],
         exit_code=int(exit_code) if exit_code is not None else 1,
-        workspace=workspace or "",
+        workspace=stamp_workspace or workspace or "",
+        commit_hash=commit_hash,
         stdout=str(stdout)[-8000:],
         task_id=resolved,
     )
     note = f"\n\n[attestation_id={aid} kind=test_run exit={exit_code}]"
+    if resolved:
+        note += f" taskId={resolved}"
+    else:
+        note += " taskId=(unbound)"
+    if commit_hash:
+        note += f" commit={commit_hash[:12]}"
+    if is_verify and stamp_workspace:
+        note += " stamped_from=main"
+    note += bind_note
+    # Soft warn when VERIFY task baseline mismatches (approve hard-gates later)
+    if resolved and commit_hash and is_verify:
+        try:
+            task = await TaskService().get_task(project_id, resolved)
+            if task:
+                ev = task.get("evidence") or {}
+                if isinstance(ev, str):
+                    import json as _json
+
+                    try:
+                        ev = _json.loads(ev)
+                    except Exception:
+                        ev = {}
+                target = ""
+                if isinstance(ev, dict):
+                    target = str(
+                        ev.get("target_merge_commit")
+                        or ev.get("merge_commit")
+                        or ""
+                    ).strip()
+                if target and not (
+                    commit_hash.lower().startswith(target[:12].lower())
+                    or target.lower().startswith(commit_hash[:12].lower())
+                ):
+                    note += (
+                        f"\n[VERIFY BASELINE WARN] attestation commit="
+                        f"{commit_hash[:12]} ≠ target_merge_commit="
+                        f"{target[:12]}. Re-run tests on MAIN (project root) "
+                        f"at the current tip before approve."
+                    )
+        except Exception:
+            pass
     if resolved and int(exit_code or 1) == 0:
         try:
             await TaskService().emit_task_event(
@@ -1163,16 +1475,35 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
     )
     if reserved_err:
         return ToolResult.err(reserved_err)
+
+    exec_ws = workspace or ""
+    verify_note = ""
+    verify_tid: str | None = None
+    try:
+        if project_id:
+            exec_ws, verify_note, verify_tid = await _resolve_verify_test_workspace(
+                project_id,
+                agent_id,
+                getattr(params, "task_id", None),
+                params.command or "",
+                workspace or "",
+            )
+            if verify_note and not exec_ws:
+                return ToolResult.err(verify_note.strip())
+    except Exception as e:
+        log.debug("verify_exec_workspace_resolve_failed", error=str(e))
+        exec_ws = workspace or ""
+
     result = await execute_bash(
         command=cmd,
         workdir="",
-        workspace_path=workspace,
+        workspace_path=exec_ws,
         timeout_ms=params.timeout,
         project_id=project_id,
     )
     # D4: track consecutive failures per (agent_id, cwd)
     _streak_hint = _update_cwd_failure_streak(
-        agent_id, workspace, bool(result.get("success"))
+        agent_id, exec_ws, bool(result.get("success"))
     )
     out = result.get("output") or ""
     exit_code = result.get("exit_code")
@@ -1180,26 +1511,29 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
         exit_code = 0 if result.get("success") else 1
     # TEST6 P0-3: record failed test runs too (exit≠0); P0-2: bind reviewer taskId
     attest_note = ""
+    attest_task = getattr(params, "task_id", None) or verify_tid
     try:
         if project_id:
             attest_note = await _issue_test_run_attestation(
                 project_id=project_id,
                 agent_id=agent_id,
                 command=params.command or "",
-                workspace=workspace or "",
+                workspace=exec_ws or "",
                 stdout=str(out),
                 exit_code=int(exit_code),
-                task_id=getattr(params, "task_id", None),
+                task_id=attest_task,
+                exec_cwd=exec_ws or "",
             )
     except Exception as _att_err:
         log.warning("bash_attest_issue_failed", error=str(_att_err))
+    suffix = f"{verify_note}{attest_note}"
     if result.get("success"):
-        return ToolResult.ok(f"{out}{attest_note}")
+        return ToolResult.ok(f"{out}{suffix}")
     err_msg = result.get("error", "Command failed")
     if _streak_hint:
         err_msg = f"{err_msg}{_streak_hint}"
-    if attest_note:
-        err_msg = f"{err_msg}{attest_note}"
+    if suffix:
+        err_msg = f"{err_msg}{suffix}"
     return ToolResult.err(err_msg)
 
 
@@ -1220,14 +1554,33 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
     )
     if reserved_err:
         return ToolResult.err(reserved_err)
+
+    exec_ws = workspace or ""
+    verify_note = ""
+    verify_tid: str | None = None
+    try:
+        if project_id:
+            exec_ws, verify_note, verify_tid = await _resolve_verify_test_workspace(
+                project_id,
+                agent_id,
+                getattr(params, "task_id", None),
+                params.command or "",
+                workspace or "",
+            )
+            if verify_note and not exec_ws:
+                return ToolResult.err(verify_note.strip())
+    except Exception as e:
+        log.debug("verify_exec_workspace_resolve_failed", error=str(e))
+        exec_ws = workspace or ""
+
     result = await execute_run_command(
         command=cmd,
         cwd=params.cwd,
         timeout_ms=params.timeout,
-        workspace_path=workspace,
+        workspace_path=exec_ws,
     )
     # D4: track consecutive failures per (agent_id, cwd)
-    _effective_cwd = str(Path(workspace) / params.cwd) if params.cwd else workspace
+    _effective_cwd = str(Path(exec_ws) / params.cwd) if params.cwd else exec_ws
     _streak_hint = _update_cwd_failure_streak(
         agent_id, _effective_cwd, bool(result.get("success"))
     )
@@ -1236,24 +1589,28 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
     if exit_code is None:
         exit_code = 0 if result.get("success") else 1
     attest_note = ""
+    attest_task = getattr(params, "task_id", None) or verify_tid
     try:
         if project_id:
             attest_note = await _issue_test_run_attestation(
                 project_id=project_id,
                 agent_id=agent_id,
                 command=params.command or "",
-                workspace=workspace or "",
+                workspace=exec_ws or "",
                 stdout=str(out),
                 exit_code=int(exit_code),
-                task_id=getattr(params, "task_id", None),
+                task_id=attest_task,
+                exec_cwd=_effective_cwd or exec_ws or "",
             )
     except Exception as _att_err:
         log.warning("bash_attest_issue_failed", error=str(_att_err))
+    suffix = f"{verify_note}{attest_note}"
     if result.get("success"):
-        return ToolResult.ok(f"{out}{attest_note}")
+        return ToolResult.ok(f"{out}{suffix}")
     err_msg = result.get("error", "Command failed")
     if _streak_hint:
         err_msg = f"{err_msg}{_streak_hint}"
-    if attest_note:
-        err_msg = f"{err_msg}{attest_note}"
+    if suffix:
+        err_msg = f"{err_msg}{suffix}"
     return ToolResult.err(err_msg)
+

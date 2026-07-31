@@ -86,6 +86,7 @@ async def review_task_tool(
         verify_waived = False
         waiver_row = None
         ceo_merger_override = False
+        waive_self_approve_small_team = False
         if ts._is_verify_task(task):
             from hiveweave.services.attestation import get_valid_waiver
 
@@ -208,17 +209,41 @@ async def review_task_tool(
 
             waived = await has_valid_waiver(project_id, params.task_id)
             # TEST6 P0-2: waived_by must not be the approver
+            # TEST6 audit S2: small-team sole REVIEW holder may self-approve
+            # after their own waiver (stamp override=waive_self_approve_small_team).
+            waive_self_approve_small_team = False
             if waived and waiver_row:
                 waived_by = str(waiver_row.get("agent_id") or "")
                 if waived_by and waived_by == str(agent_id):
-                    return ToolResult.err(
-                        "Cannot approve: you issued the waiver for this task. "
-                        "waive→approve requires a third party "
-                        f"(waived_by={waived_by[:8]}…). "
-                        "Ask another coordinator/CEO to approve, or obtain "
-                        "real reviewer test_run attestation and approve "
-                        "without relying on your own waiver."
+                    from hiveweave.services.unblock_soft import (
+                        is_org_lookup_failed,
+                        is_small_team_sole_reviewer,
+                        no_lawful_approver,
                     )
+
+                    sole = await is_small_team_sole_reviewer(
+                        project_id,
+                        assignee_id=str(task.get("assignee_id") or "") or None,
+                        reviewer_id=str(agent_id),
+                    )
+                    if sole:
+                        waive_self_approve_small_team = True
+                    else:
+                        deadlock = await no_lawful_approver(
+                            project_id, task, waiver_row=waiver_row
+                        )
+                        extra = ""
+                        if deadlock and not is_org_lookup_failed(deadlock):
+                            extra = f"\nDEADLOCK: {deadlock}"
+                        return ToolResult.err(
+                            "Cannot approve: you issued the waiver for this task. "
+                            "waive→approve requires a third party "
+                            f"(waived_by={waived_by[:8]}…). "
+                            "Ask another coordinator/CEO to approve, or obtain "
+                            "real reviewer test_run attestation and approve "
+                            "without relying on your own waiver."
+                            + extra
+                        )
             if needed and not waived:
                 aids = evidence.get("attestation_ids") or []
                 if not isinstance(aids, list):
@@ -272,33 +297,140 @@ async def review_task_tool(
             # must ALSO have executed independently (run_tests / bash test cmd)
             # before approving. "12-second approve" with zero reviewer commands
             # is the root cause of P0-1's CHANGELOG loss going undetected.
+            #
+            # TEST6 audit S1: CEO has no TEST_RUN — primary path is consume
+            # of assignee/subordinate evidence (incl. ancestor task binding),
+            # not "run tests yourself".
             from hiveweave.services.attestation import (
+                ancestor_task_ids,
                 find_reviewer_attestation,
+                format_attestation_mismatch_hint,
+                list_reviewer_attestations_diag,
                 reviewer_required_kinds,
+            )
+            from hiveweave.services.policy import (
+                Capability,
+                has_capability,
             )
 
             rev_needed = reviewer_required_kinds(policy_id)
             if rev_needed and not waived:
-                # Soft unblock (facts): CEO/reviewer may consume same-task
-                # assignee fresh test_run — not a structured next-action command.
                 consume_ids: list[str] = []
                 asg = task.get("assignee_id")
                 if asg and str(asg) != str(agent_id):
                     consume_ids.append(str(asg))
+                # S1 audit: also consume QA agents (evidence may sit on an
+                # independent tester, not only the assignee).
+                try:
+                    from hiveweave.services.org import OrgService
+                    from hiveweave.services.policy import infer_role_family
+
+                    for a in (await OrgService().list_agents(project_id)) or []:
+                        if (a.get("status") or "").lower() == "archived":
+                            continue
+                        aid = str(a.get("id") or "")
+                        if not aid or aid == str(agent_id) or aid in consume_ids:
+                            continue
+                        if infer_role_family(a) == "qa":
+                            consume_ids.append(aid)
+                except Exception:
+                    pass
+
+                reviewer_row = None
+                try:
+                    from hiveweave.services.org import OrgService
+
+                    reviewer_row = await OrgService().get_agent(agent_id)
+                except Exception:
+                    reviewer_row = None
+                can_test = bool(
+                    reviewer_row and has_capability(reviewer_row, Capability.TEST_RUN)
+                )
+                # CEO / no-TEST_RUN: consume-only (do not count own attestation).
+                reviewer_must_hold = can_test
+                extra_tids = await ancestor_task_ids(project_id, params.task_id)
+
                 has_rev = await find_reviewer_attestation(
                     project_id,
                     params.task_id,
                     agent_id,
                     rev_needed,
                     consume_agent_ids=consume_ids or None,
+                    extra_task_ids=extra_tids or None,
+                    reviewer_must_hold=reviewer_must_hold,
                 )
                 if not has_rev:
                     tid = task.get("id") or params.task_id
                     kinds_str = ", ".join(sorted(rev_needed))
+                    held = await list_reviewer_attestations_diag(
+                        project_id, agent_id, kinds=rev_needed
+                    )
+                    # S6+: for CEO path, also surface consume-side holdings
+                    consume_held: list[dict] = []
+                    if not can_test:
+                        for cid in consume_ids[:6]:
+                            rows = await list_reviewer_attestations_diag(
+                                project_id, cid, kinds=rev_needed, limit=4
+                            )
+                            for r in rows:
+                                r = dict(r)
+                                r["holder"] = cid[:8]
+                                consume_held.append(r)
+                    mismatch = format_attestation_mismatch_hint(
+                        held, target_task_id=str(tid)
+                    )
+                    if consume_held:
+                        mismatch += (
+                            "\nConsume-side fresh attestation(s) "
+                            "(assignee/QA — check task binding):"
+                        )
+                        for h in consume_held[:6]:
+                            bound = h.get("task_id") or "(unbound)"
+                            mismatch += (
+                                f"\n  - holder={h.get('holder')} "
+                                f"{h.get('kind')} id={str(h.get('id') or '')[:8]}… "
+                                f"bound_task={str(bound)[:8]}"
+                            )
+                    from hiveweave.services.unblock_soft import (
+                        is_org_lookup_failed,
+                        no_lawful_approver,
+                    )
+
+                    deadlock = await no_lawful_approver(
+                        project_id, task, waiver_row=waiver_row
+                    )
+                    deadlock_line = ""
+                    if deadlock and not is_org_lookup_failed(deadlock):
+                        deadlock_line = (
+                            f"\nDEADLOCK: {deadlock} "
+                            "Escape: cancel_task with reason≥20 chars "
+                            "(stamps cancelled_in_deadlock), or hire another "
+                            "REVIEW holder, or obtain assignee/QA test_run "
+                            "on this task."
+                        )
+                    if not can_test:
+                        return ToolResult.err(
+                            f"Cannot approve: you lack TEST_RUN capability "
+                            f"(role cannot self-produce test evidence). "
+                            f"CEO/management path is to consume assignee/QA "
+                            f"fresh test_run on this task (or its ancestors).\n"
+                            f"Required kind(s): {kinds_str}. taskId={tid}.\n"
+                            f"{mismatch}\n"
+                            f"Options:\n"
+                            f"1) Require assignee/QA to run tests with "
+                            f'taskId="{tid}", then approve again '
+                            f"(consume path).\n"
+                            f"2) waive_attestation(taskId=\"{tid}\", …) — "
+                            f"then a *different* agent must approve, unless "
+                            f"you are the sole REVIEW holder beside assignee "
+                            f"(small-team exemption)."
+                            + deadlock_line
+                        )
                     return ToolResult.err(
                         f"Cannot approve: YOU (the reviewer) have no fresh "
                         f"execution evidence on this task.\n"
                         f"Required reviewer kind(s): {kinds_str}.\n"
+                        f"{mismatch}\n"
                         f"Before approving, run the project's tests yourself "
                         f"(e.g. `bash`/`run_command` with taskId=\"{tid}\") "
                         f"so the platform records your attestation.\n"
@@ -309,12 +441,12 @@ async def review_task_tool(
                         f"evidenceAttestationId=\"<id>\", "
                         f"reason=\"...\") as last resort — then a *different* "
                         f"agent must approve (you cannot approve your own waiver)."
+                        + deadlock_line
                     )
 
-            # (1) Force worktree context — ensure assignee tree exists, then gate.
-            # builder coordinator / executor assignee 须真正 ensure；失败降级为
-            # 告警日志并交给 review_worktree_gate 判定，绝不静默 pass。
-            if task.get("assignee_id"):
+            # (1) Force worktree context for code tasks — VERIFY stays on MAIN
+            # (audit P0-1: do not ensure personal write tree for VERIFY).
+            if task.get("assignee_id") and not ts._is_verify_task(task):
                 try:
                     from hiveweave.services.git_worktree import ensure_executor_worktree
 
@@ -353,6 +485,15 @@ async def review_task_tool(
             if ev_deny:
                 return ToolResult.err(ev_deny)
 
+        # TEST6 evening P1-3: VERIFY approve requires attestation on
+        # target_merge_commit / current main tip (not a stale personal tip).
+        if decision == "approve" and ts._is_verify_task(task):
+            from hiveweave.services.attestation import check_verify_baseline
+
+            baseline_err = await check_verify_baseline(project_id, task)
+            if baseline_err:
+                return ToolResult.err(baseline_err)
+
         current_status = task["status"]
         if decision == "approve":
             if current_status == "submitted":
@@ -376,8 +517,26 @@ async def review_task_tool(
             reviewer_id=agent_id,
         )
 
-        # TEST13 P0-1: audit stamp when CEO approved as merger
-        if decision == "approve" and ceo_merger_override:
+        # TEST6 S11 / TEST18 NEW-7: fulfill review obligation on approve OR
+        # rework — either decision completes the review act; rework starts a
+        # fresh clock when the assignee resubmits.
+        if decision in ("approve", "rework"):
+            try:
+                from hiveweave.services.obligation import ObligationLedger
+
+                await ObligationLedger().fulfill(
+                    project_id, params.task_id, "review"
+                )
+            except Exception as e:
+                log.warning(
+                    "review_obligation_fulfill_failed",
+                    task_id=params.task_id,
+                    decision=decision,
+                    error=str(e),
+                )
+
+        # TEST13 P0-1 / TEST6 S2: audit stamp for escalation overrides
+        if decision == "approve" and (ceo_merger_override or waive_self_approve_small_team):
             try:
                 import time as _time
 
@@ -390,9 +549,14 @@ async def review_task_tool(
                         ev = {}
                 if not isinstance(ev, dict):
                     ev = {}
-                ev["override"] = "no_independent_reviewer"
-                ev["ceo_merger_override"] = True
-                ev["ceo_merger_override_by"] = agent_id
+                if ceo_merger_override:
+                    ev["override"] = "no_independent_reviewer"
+                    ev["ceo_merger_override"] = True
+                    ev["ceo_merger_override_by"] = agent_id
+                if waive_self_approve_small_team:
+                    ev["override"] = "waive_self_approve_small_team"
+                    ev["waive_self_approve_small_team"] = True
+                    ev["waive_self_approve_by"] = agent_id
                 from hiveweave.services import task as task_module
 
                 await task_module._execute(
@@ -405,7 +569,7 @@ async def review_task_tool(
                     ],
                 )
             except Exception as e:
-                log.warning("ceo_merger_override_stamp_failed", error=str(e))
+                log.warning("review_override_stamp_failed", error=str(e))
 
 
         # ── 通知 assignee/executor 审查结果 ──
@@ -426,13 +590,16 @@ async def review_task_tool(
                     family = infer_role_family(assignee_row or {})
                     title = task_after.get('title', '')[:60]
                     if family in ("coordinator", "ceo"):
+                        # TEST18 NEW-2: single merge owner = reviewer (MERGE
+                        # PENDING). Assignee waits — do not dual-assign.
                         msg = (
                             f"[TASK APPROVED] Task '{title}' has been approved. "
-                            f"You are the merge owner — please run "
-                            f"git_worktree_merge on your worktree"
-                            f"{f' ({wt_path})' if wt_path else ''} to land "
-                            f"changes on main. CEO may exercise merge fallback "
-                            f"if you stall. VERIFY runs after merge."
+                            f"Wait for the reviewer/coordinator to "
+                            f"git_worktree_merge your worktree"
+                            f"{f' ({wt_path})' if wt_path else ''}. "
+                            f"Do NOT merge yourself — dual merge owners cause "
+                            f"the second merge to fail after the tree is torn "
+                            f"down. VERIFY runs after merge."
                         )
                     else:
                         msg = (

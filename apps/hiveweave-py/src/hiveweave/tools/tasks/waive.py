@@ -125,10 +125,25 @@ async def waive_attestation_tool(
             "Obtain real attestation evidence instead."
         )
     if await has_valid_waiver(project_id, params.task_id):
+        waived_by = agent_id
+        try:
+            from hiveweave.services.attestation import get_valid_waiver
+
+            wr = await get_valid_waiver(project_id, params.task_id)
+            if wr and wr.get("agent_id"):
+                waived_by = str(wr["agent_id"])
+        except Exception:
+            pass
+        tip = await _format_post_waive_approve_tip(
+            project_id,
+            waived_by=waived_by,
+            assignee_id=str(task.get("assignee_id") or "") or None,
+        )
         return ToolResult.err(
             f"waive_attestation rejected: task {params.task_id} already has "
             "an unexpired waiver. Wait for expiry or approve via a different "
             "agent (waived_by cannot approve)."
+            + tip
         )
 
     # Evidence attestation must be a real execution kind (not another waiver)
@@ -261,6 +276,14 @@ async def waive_attestation_tool(
         reason=reason[:120],
         is_verify=is_verify,
     )
+
+    # TEST18 NEW-9: do not make the AI guess who can approve — list them.
+    next_tip = await _format_post_waive_approve_tip(
+        project_id,
+        waived_by=agent_id,
+        assignee_id=str(assignee) if assignee else None,
+    )
+
     return ToolResult.ok(
         f"Attestation waived for task {params.task_id} "
         f"(waiver {waiver_id[:8]}, expires in 24h).\n"
@@ -271,7 +294,85 @@ async def waive_attestation_tool(
             if is_verify
             else ""
         )
+        + next_tip
     )
+
+
+async def _format_post_waive_approve_tip(
+    project_id: str,
+    *,
+    waived_by: str,
+    assignee_id: str | None,
+) -> str:
+    """Concrete NEXT ACTION after waive — name people, do not say '找人'."""
+    from hiveweave.services.org import OrgService
+    from hiveweave.services.unblock_soft import (
+        is_small_team_sole_reviewer,
+        list_review_capable_agent_ids,
+    )
+
+    # Small-team sole REVIEW holder may self-approve their own waiver.
+    try:
+        sole = await is_small_team_sole_reviewer(
+            project_id,
+            assignee_id=assignee_id,
+            reviewer_id=waived_by,
+        )
+    except Exception:
+        sole = False
+    if sole:
+        return (
+            "\n\nNEXT ACTION: You are the sole REVIEW holder besides the "
+            "assignee — you MAY review_task(approve) yourself "
+            "(small-team exemption; will stamp waive_self_approve_small_team). "
+            "Do NOT invent a fake rework to escape."
+        )
+
+    excl: set[str] = {str(waived_by)}
+    if assignee_id:
+        excl.add(str(assignee_id))
+    holders = await list_review_capable_agent_ids(
+        project_id, exclude_ids=excl
+    )
+    if holders is None:
+        return (
+            "\n\nNEXT ACTION: You CANNOT approve this task yourself "
+            "(waived_by third-party rule). Org roster unreadable right now — "
+            "retry, then ask another REVIEW holder to approve. "
+            "Do NOT invent a fake rework."
+        )
+    if not holders:
+        return (
+            "\n\nNEXT ACTION: You CANNOT approve this task yourself "
+            "(waived_by third-party rule), and no other active REVIEW holder "
+            "exists beside the assignee. Approve path is deadlocked — escalate "
+            "to CEO or cancel_task with an audited deadlock reason "
+            "(≥20 chars). Do NOT invent a fake rework."
+        )
+
+    org = OrgService()
+    lines: list[str] = [
+        "\n\nNEXT ACTION: You CANNOT approve this task yourself "
+        "(waived_by third-party rule). Ask ONE of these REVIEW holders "
+        "to review_task(approve) — do NOT invent a fake rework:",
+    ]
+    for hid in holders[:8]:
+        row = None
+        try:
+            row = await org.get_agent(hid)
+        except Exception:
+            row = None
+        name = (row or {}).get("name") or hid[:8]
+        short = (row or {}).get("short_id") or "?"
+        role = ((row or {}).get("role") or "")[:40]
+        lines.append(
+            f"  - {name} ({short}) id={hid}"
+            + (f" role={role}" if role else "")
+        )
+    lines.append(
+        "Use ask_agent / send_message to one of the above with the taskId."
+    )
+    return "\n".join(lines)
 
 
 # ── waive_merge ───────────────────────────────────────────────

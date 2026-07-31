@@ -514,6 +514,70 @@ export async function saveTierConfig(config: TierConfig): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Image generation (Seedream) — dedicated Settings panel
+// ---------------------------------------------------------------------------
+
+const IMAGE_GEN_KEYS = {
+  modelId: "image_gen_model_id",
+  baseUrl: "image_gen_base_url",
+  apiKey: "image_gen_api_key",
+} as const;
+
+export interface ImageGenConfig {
+  modelId: string;
+  baseUrl: string;
+  /** True when a key is stored (value never returned in full). */
+  apiKeySet: boolean;
+  apiKeyMasked: string;
+}
+
+function _maskKey(key: string): string {
+  if (!key) return "";
+  if (key.length <= 12) return "••••••••";
+  return key.slice(0, 8) + "••••" + key.slice(-4);
+}
+
+/** Read dedicated 生图模型 settings (API key masked). */
+export async function getImageGenConfig(): Promise<ImageGenConfig> {
+  const data = await getSettings();
+  const list: Array<{ key: string; value: string }> = Array.isArray(data)
+    ? data
+    : (data?.settings ?? []);
+  const map: Record<string, string> = {};
+  for (const item of list) {
+    if (item && typeof item.key === "string") map[item.key] = item.value ?? "";
+  }
+  const apiKey = map[IMAGE_GEN_KEYS.apiKey] || "";
+  return {
+    modelId: map[IMAGE_GEN_KEYS.modelId] || "",
+    baseUrl: map[IMAGE_GEN_KEYS.baseUrl] || "",
+    apiKeySet: Boolean(apiKey.trim()),
+    apiKeyMasked: apiKey ? _maskKey(apiKey) : "",
+  };
+}
+
+/**
+ * Save 生图模型 settings.
+ * Pass ``apiKey`` only when the user typed a new key; omit/empty keeps the
+ * existing stored key.
+ */
+export async function saveImageGenConfig(input: {
+  modelId: string;
+  baseUrl: string;
+  apiKey?: string;
+}): Promise<void> {
+  const payload: Record<string, string> = {
+    [IMAGE_GEN_KEYS.modelId]: input.modelId.trim(),
+    [IMAGE_GEN_KEYS.baseUrl]: input.baseUrl.trim(),
+  };
+  const nextKey = (input.apiKey || "").trim();
+  if (nextKey) {
+    payload[IMAGE_GEN_KEYS.apiKey] = nextKey;
+  }
+  await updateSettings(payload);
+}
+
+// ---------------------------------------------------------------------------
 // Agent Templates
 // ---------------------------------------------------------------------------
 

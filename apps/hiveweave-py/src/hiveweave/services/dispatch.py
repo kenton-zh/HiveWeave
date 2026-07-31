@@ -210,7 +210,24 @@ class DispatchService:
 
             ws = await meta_db.get_project_workspace(project_id) or ""
             assignee = await OrgService().resolve_agent(to_agent_id)
-            if assignee and agent_gets_write_worktree(assignee):
+            # Resolve task early so VERIFY skips write-worktree ensure (P0-1)
+            task_row_early = None
+            try:
+                task_row_early = await self.task_service.get_task(
+                    project_id, task_id
+                )
+            except Exception:
+                task_row_early = None
+            from hiveweave.services.task import TaskService as _TS
+
+            is_verify_dispatch = bool(
+                task_row_early and _TS._is_verify_task(task_row_early)
+            )
+            if (
+                assignee
+                and agent_gets_write_worktree(assignee)
+                and not is_verify_dispatch
+            ):
                 ensured = await ensure_executor_worktree(
                     project_id,
                     to_agent_id,
@@ -345,6 +362,27 @@ class DispatchService:
                  log_id=log_id, handoff_id=handoff_id,
                  worktree=wt_meta.get("path"),
                  preview=description_out[:80])
+
+        # TEST6 S11: review obligation from birth (owner = dispatcher/creator)
+        try:
+            from hiveweave.services.obligation import ObligationLedger
+
+            await ObligationLedger().create(
+                project_id,
+                from_agent_id,
+                "review",
+                task_id=task_id,
+                context={
+                    "source": "dispatch",
+                    "assignee_id": to_agent_id,
+                },
+            )
+        except Exception as e:
+            log.warning(
+                "dispatch_review_obligation_failed",
+                task_id=task_id,
+                error=str(e),
+            )
 
         return {
             "success": True,

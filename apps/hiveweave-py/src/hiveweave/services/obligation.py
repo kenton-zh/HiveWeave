@@ -30,10 +30,16 @@ log = structlog.get_logger(__name__)
 MERGE_DEADLINE_MS = 10 * 60 * 1000  # 10 minutes
 REVIEW_DEADLINE_MS = 15 * 60 * 1000  # 15 minutes
 VERIFY_DEADLINE_MS = 20 * 60 * 1000  # 20 minutes
+# Dispatch registers review obligation but does not start the clock
+# (TEST18 P0-1). Submit activates by resetting to REVIEW_DEADLINE_MS.
+_REVIEW_PARKED_DEADLINE_MS = 365 * 24 * 60 * 60 * 1000  # 1 year
 
 # Escalation: after deadline passes, escalate every N ms
 ESCALATION_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes between escalations
 MAX_ESCALATIONS = 3  # stop escalating after 3 levels
+
+# Review escalate only when the task is actually awaiting review
+_REVIEW_ESCALATABLE_STATUSES = frozenset({"submitted", "reviewing"})
 
 
 # ── DB helpers (Pattern B: keyed by project_id) ──────────────
@@ -63,6 +69,44 @@ async def _execute(project_id: str, sql: str, params: list[Any] | None = None):
 # ── Service ──────────────────────────────────────────────────
 
 
+async def _normalize_task_id(
+    project_id: str, task_id: str | None
+) -> str | None:
+    """Canonicalize task_id (full UUID or unique prefix) for ledger keys.
+
+    TEST6 evening P1-1: agents often pass 8-char prefixes that get_task
+    resolves, but obligations stored full UUIDs — exact-match fulfill
+    silently hit 0 rows. Normalize at the ledger boundary so every
+    create/fulfill/cancel shares one hygiene standard.
+    """
+    if not task_id:
+        return None
+    raw = str(task_id).strip()
+    if not raw:
+        return None
+    try:
+        from hiveweave.services.task import TaskService
+
+        resolved = await TaskService().resolve_task_id(project_id, raw)
+        if resolved:
+            if resolved != raw:
+                log.debug(
+                    "obligation.task_id_normalized",
+                    project_id=project_id,
+                    raw=raw,
+                    resolved=resolved,
+                )
+            return resolved
+    except Exception as e:
+        log.warning(
+            "obligation.task_id_normalize_failed",
+            project_id=project_id,
+            raw=raw,
+            error=str(e),
+        )
+    return raw
+
+
 class ObligationLedger:
     """Platform-level obligation tracking with deadline enforcement."""
 
@@ -88,17 +132,80 @@ class ObligationLedger:
                 "verify": VERIFY_DEADLINE_MS,
             }.get(obligation_type, REVIEW_DEADLINE_MS)
 
-        # Idempotency: same owner + type + task → reuse existing pending
+        task_id = await _normalize_task_id(project_id, task_id)
+
+        # TEST18 P0-1: dispatch only registers; clock starts on submit.
+        # Far-future deadline until submit activates/resets it.
+        ctx = context or {}
+        if obligation_type == "review" and ctx.get("source") == "dispatch":
+            deadline_ms = _REVIEW_PARKED_DEADLINE_MS
+
+        # Idempotency:
+        # - review: one pending per task (any owner) — avoid dispatch+submit dual owners
+        # - other types: same owner + type + task
         if task_id:
-            existing = await _query(
-                project_id,
-                "SELECT id FROM obligations WHERE owner_agent_id = ? "
-                "AND obligation_type = ? AND task_id = ? AND status = 'pending' "
-                "LIMIT 1",
-                [owner_agent_id, obligation_type, task_id],
-            )
-            if existing:
-                return existing[0]["id"]
+            if obligation_type == "review":
+                existing = await _query(
+                    project_id,
+                    "SELECT id, owner_agent_id FROM obligations "
+                    "WHERE obligation_type = 'review' AND task_id = ? "
+                    "AND status = 'pending' LIMIT 1",
+                    [task_id],
+                )
+                if existing:
+                    ob_id = existing[0]["id"]
+                    prev_owner = str(existing[0].get("owner_agent_id") or "")
+                    # Submit activates the clock: reset deadline + clear escalations.
+                    # Also retarget owner when pinned reviewer differs from dispatch.
+                    if ctx.get("source") == "submit":
+                        new_deadline = now + (
+                            REVIEW_DEADLINE_MS
+                            if deadline_ms == _REVIEW_PARKED_DEADLINE_MS
+                            else deadline_ms
+                        )
+                        new_owner = (
+                            owner_agent_id
+                            if owner_agent_id
+                            else prev_owner
+                        )
+                        await _execute(
+                            project_id,
+                            "UPDATE obligations SET owner_agent_id = ?, "
+                            "context_json = ?, deadline = ?, "
+                            "escalation_count = 0, escalated_at = NULL, "
+                            "escalated_to = NULL WHERE id = ?",
+                            [
+                                new_owner,
+                                json.dumps(ctx),
+                                new_deadline,
+                                ob_id,
+                            ],
+                        )
+                        if prev_owner and new_owner and prev_owner != str(new_owner):
+                            log.info(
+                                "obligation.review_owner_retargeted",
+                                obligation_id=ob_id,
+                                from_owner=prev_owner,
+                                to_owner=new_owner,
+                                task_id=task_id,
+                            )
+                        log.info(
+                            "obligation.review_deadline_activated",
+                            obligation_id=ob_id,
+                            task_id=task_id,
+                            deadline=new_deadline,
+                        )
+                    return ob_id
+            else:
+                existing = await _query(
+                    project_id,
+                    "SELECT id FROM obligations WHERE owner_agent_id = ? "
+                    "AND obligation_type = ? AND task_id = ? AND status = 'pending' "
+                    "LIMIT 1",
+                    [owner_agent_id, obligation_type, task_id],
+                )
+                if existing:
+                    return existing[0]["id"]
 
         ob_id = str(uuid.uuid4())
         await _execute(
@@ -109,7 +216,7 @@ class ObligationLedger:
             "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0)",
             [
                 ob_id, project_id, owner_agent_id, obligation_type,
-                task_id, json.dumps(context or {}),
+                task_id, json.dumps(ctx),
                 now, now + deadline_ms,
             ],
         )
@@ -131,14 +238,28 @@ class ObligationLedger:
 
         Returns count of obligations fulfilled.
         """
+        raw_ref = (task_id or "").strip()
+        task_id = await _normalize_task_id(project_id, task_id) or raw_ref
         now = int(time.time() * 1000)
+        # Match canonical UUID and any legacy prefix rows (audit P1-6)
+        id_candidates = [task_id]
+        if raw_ref and raw_ref != task_id:
+            id_candidates.append(raw_ref)
+        placeholders = ",".join("?" * len(id_candidates))
         rows = await _query(
             project_id,
-            "SELECT id FROM obligations WHERE task_id = ? "
+            f"SELECT id FROM obligations WHERE task_id IN ({placeholders}) "
             "AND obligation_type = ? AND status = 'pending'",
-            [task_id, obligation_type],
+            [*id_candidates, obligation_type],
         )
         if not rows:
+            log.warning(
+                "obligation.fulfill_miss",
+                project_id=project_id,
+                task_id=task_id,
+                raw_ref=raw_ref if raw_ref != task_id else None,
+                type=obligation_type,
+            )
             return 0
         ids = [r["id"] for r in rows]
         placeholders = ",".join("?" * len(ids))
@@ -212,6 +333,22 @@ class ObligationLedger:
             if (ob.get("escalation_count") or 0) >= MAX_ESCALATIONS:
                 continue
 
+            # TEST18 P0-1: review obligations only escalate when the task is
+            # actually awaiting review — never while running/claimed/created.
+            task_status: str | None = None
+            if ob.get("obligation_type") == "review" and ob.get("task_id"):
+                task_status = await self._task_status(
+                    project_id, str(ob["task_id"])
+                )
+                if task_status not in _REVIEW_ESCALATABLE_STATUSES:
+                    log.debug(
+                        "obligation.review_escalate_skipped",
+                        obligation_id=ob["id"],
+                        task_id=ob.get("task_id"),
+                        task_status=task_status,
+                    )
+                    continue
+
             parent_id = await self._find_escalation_target(
                 project_id, ob["owner_agent_id"]
             )
@@ -228,7 +365,9 @@ class ObligationLedger:
             )
 
             # Send inbox notification to the escalation target
-            await self._notify_escalation(project_id, ob, parent_id, esc_count)
+            await self._notify_escalation(
+                project_id, ob, parent_id, esc_count, task_status=task_status
+            )
             escalated.append(ob)
             log.warning(
                 "obligation.escalated",
@@ -239,6 +378,7 @@ class ObligationLedger:
                 escalation_count=esc_count,
                 type=ob["obligation_type"],
                 task_id=ob.get("task_id"),
+                task_status=task_status,
             )
 
         return escalated
@@ -256,6 +396,8 @@ class ObligationLedger:
 
     async def cancel_for_task(self, project_id: str, task_id: str) -> int:
         """Cancel all pending obligations for a task (e.g., task cancelled)."""
+        raw_ref = (task_id or "").strip()
+        task_id = await _normalize_task_id(project_id, task_id) or raw_ref
         rows = await _query(
             project_id,
             "SELECT id FROM obligations WHERE task_id = ? AND status = 'pending'",
@@ -272,6 +414,115 @@ class ObligationLedger:
             ids,
         )
         return len(ids)
+
+    async def reconcile_closed_task(
+        self, project_id: str, task_id: str
+    ) -> int:
+        """Fail-open: closed tasks must not leave pending obligations.
+
+        TEST6 evening P1-1 backstop — prefix-miss or missed fulfill paths
+        leave pending rows that keep escalating. Fulfill all pending for
+        the task and warn.
+        """
+        raw_ref = (task_id or "").strip()
+        task_id = await _normalize_task_id(project_id, task_id) or raw_ref
+        if not task_id:
+            return 0
+        id_candidates = [task_id]
+        if raw_ref and raw_ref != task_id:
+            id_candidates.append(raw_ref)
+        # Also match legacy 8-char prefix stored as task_id
+        if len(task_id) >= 8:
+            id_candidates.append(task_id[:8])
+        # Dedupe while preserving order
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for c in id_candidates:
+            if c and c not in seen:
+                seen.add(c)
+                uniq.append(c)
+        placeholders = ",".join("?" * len(uniq))
+        rows = await _query(
+            project_id,
+            f"SELECT id, obligation_type FROM obligations "
+            f"WHERE task_id IN ({placeholders}) AND status = 'pending'",
+            uniq,
+        )
+        if not rows:
+            return 0
+        now = int(time.time() * 1000)
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        await _execute(
+            project_id,
+            f"UPDATE obligations SET status = 'fulfilled', fulfilled_at = ? "
+            f"WHERE id IN ({placeholders})",
+            [now] + ids,
+        )
+        types = sorted({str(r.get("obligation_type") or "") for r in rows})
+        log.warning(
+            "obligation.reconcile_closed_fulfilled",
+            project_id=project_id,
+            task_id=task_id,
+            count=len(ids),
+            types=types,
+        )
+        return len(ids)
+
+    async def audit_missing_review_obligations(
+        self, project_id: str, *, limit: int = 40
+    ) -> list[str]:
+        """Backfill review obligations for open submitted/reviewing tasks.
+
+        TEST6 S11: status≠closed tasks in the review pipe should have a
+        pending review obligation. Creates missing ones (fail-open).
+        Returns task ids that were backfilled.
+        """
+        rows = await _query(
+            project_id,
+            "SELECT id, creator_id, reviewer_id, assignee_id, status "
+            "FROM tasks WHERE is_archived = 0 "
+            "AND status IN ('submitted', 'reviewing') "
+            "ORDER BY updated_at DESC LIMIT ?",
+            [max(1, int(limit))],
+        )
+        fixed: list[str] = []
+        for row in rows or []:
+            tid = str(row.get("id") or "")
+            if not tid:
+                continue
+            existing = await _query(
+                project_id,
+                "SELECT id FROM obligations WHERE task_id = ? "
+                "AND obligation_type = 'review' AND status = 'pending' "
+                "LIMIT 1",
+                [tid],
+            )
+            if existing:
+                continue
+            owner = (
+                row.get("reviewer_id")
+                or row.get("creator_id")
+                or row.get("assignee_id")
+            )
+            if not owner:
+                continue
+            try:
+                await self.create(
+                    project_id,
+                    str(owner),
+                    "review",
+                    task_id=tid,
+                    context={"source": "audit_backfill"},
+                )
+                fixed.append(tid)
+            except Exception as e:
+                log.warning(
+                    "obligation.audit_backfill_failed",
+                    task_id=tid,
+                    error=str(e),
+                )
+        return fixed
 
     # ── Internal helpers ─────────────────────────────────────
 
@@ -366,6 +617,35 @@ class ObligationLedger:
         )
         return len(rows) >= len(deps)
 
+    async def _task_status(
+        self, project_id: str, task_id: str
+    ) -> str | None:
+        """Lookup task status for escalate gating (fail-open → None)."""
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT status FROM tasks WHERE id = ? LIMIT 1",
+                [task_id],
+            )
+            if rows:
+                return str(rows[0].get("status") or "") or None
+            # Prefix fallback for legacy short refs
+            if len(task_id) >= 8:
+                rows = await _query(
+                    project_id,
+                    "SELECT status FROM tasks WHERE id LIKE ? LIMIT 1",
+                    [task_id[:8] + "%"],
+                )
+                if rows:
+                    return str(rows[0].get("status") or "") or None
+        except Exception as e:
+            log.warning(
+                "obligation.task_status_lookup_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+        return None
+
     async def _find_escalation_target(
         self, project_id: str, owner_agent_id: str
     ) -> str | None:
@@ -386,7 +666,13 @@ class ObligationLedger:
         return parent_id
 
     async def _notify_escalation(
-        self, project_id: str, ob: dict, parent_id: str, esc_count: int
+        self,
+        project_id: str,
+        ob: dict,
+        parent_id: str,
+        esc_count: int,
+        *,
+        task_status: str | None = None,
     ) -> None:
         """Send inbox notification about an escalated obligation."""
         from hiveweave.services.inbox import InboxService
@@ -394,17 +680,27 @@ class ObligationLedger:
         ob_type = ob.get("obligation_type", "unknown")
         task_id = ob.get("task_id", "?")
         owner = ob.get("owner_agent_id", "?")
+        status_note = f" status={task_status}" if task_status else ""
 
         msg = (
             f"[OBLIGATION ESCALATION #{esc_count}] "
             f"Agent {owner[:8]} has an overdue {ob_type} obligation "
-            f"(task {task_id[:8] if task_id else '?'}). "
+            f"(task {task_id[:8] if task_id else '?'}{status_note}). "
             f"Deadline passed. Please intervene: "
         )
         if ob_type == "merge":
             msg += "run git_worktree_merge on the assignee's worktree, or reassign the merge duty."
         elif ob_type == "review":
-            msg += "review the submitted task or reassign the reviewer."
+            # TEST18 P0-1: never claim "submitted" unless status confirms it
+            if task_status in _REVIEW_ESCALATABLE_STATUSES:
+                msg += (
+                    f"review the {task_status} task or reassign the reviewer."
+                )
+            else:
+                msg += (
+                    f"task status is {task_status or 'unknown'} — "
+                    f"confirm it is awaiting review, or reassign."
+                )
         else:
             msg += "ensure the obligation is fulfilled or reassign."
 

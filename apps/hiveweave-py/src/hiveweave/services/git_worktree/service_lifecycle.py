@@ -351,6 +351,10 @@ class LifecycleMixin:
         """Detailed status of one agent's worktree.
 
         Returns ``{success, status: {...} | None}``.
+
+        TEST6 audit S9: includes mechanical merge facts
+        (``tip_is_ancestor_of_main``, ``commits_ahead``, ``base_branch``)
+        so agents never claim "delivered to main" from memory.
         """
         path = await self._resolve_effective_worktree_path(
             workspace_path, short_id
@@ -368,6 +372,25 @@ class LifecycleMixin:
 
         checkpoints = await self._checkpoint_list(path)
 
+        base = await _resolve_base_branch(workspace_path)
+        tip_is_ancestor: bool | None = None
+        commits_ahead: int | None = None
+        if base:
+            ok_anc, _ = await _git(
+                ["merge-base", "--is-ancestor", "HEAD", base], path
+            )
+            tip_is_ancestor = bool(ok_anc)
+            try:
+                from hiveweave.services.worktree_review import (
+                    worktree_commits_ahead,
+                )
+
+                commits_ahead = await worktree_commits_ahead(
+                    workspace_path, path, target_branch=base
+                )
+            except Exception:
+                commits_ahead = None
+
         return {"success": True, "status": {
             "short_id": short_id,
             "branch": branch if ok2 else "",
@@ -375,6 +398,9 @@ class LifecycleMixin:
             "has_uncommitted": has_uncommitted,
             "head": head,
             "checkpoints": checkpoints,
+            "base_branch": base or None,
+            "tip_is_ancestor_of_main": tip_is_ancestor,
+            "commits_ahead": commits_ahead,
         }}
 
     async def _checkpoint_list(self, path: str) -> List[dict]:

@@ -413,6 +413,44 @@ class ModelService:
                 return model
         return None
 
+    async def resolve_image_gen_model(
+        self,
+        skip_model_ids: set[str] | None = None,
+    ) -> dict | None:
+        """Resolve the Seedream / image-generation model for generate_image.
+
+        Prefer dedicated Settings keys (生图模型设置面板):
+        ``image_gen_model_id`` / ``image_gen_base_url`` / ``image_gen_api_key``.
+
+        Fallback: ``image_gen_model_primary`` → ``llm_models`` row (legacy).
+        No fallthrough to chat tiers or vision slots.
+        """
+        from hiveweave.services.settings import SettingsService
+
+        skip = skip_model_ids or set()
+        svc = SettingsService()
+
+        model_id = (await svc.get("image_gen_model_id") or "").strip()
+        base_url = (await svc.get("image_gen_base_url") or "").strip()
+        api_key = (await svc.get("image_gen_api_key") or "").strip()
+        if model_id and base_url and api_key:
+            return {
+                "id": "image_gen_direct",
+                "name": "生图模型",
+                "model_id": model_id,
+                "base_url": base_url,
+                "api_key": api_key,
+                "is_active": True,
+            }
+
+        primary = await svc.get("image_gen_model_primary")
+        if not primary or primary in skip:
+            return None
+        model = await self.get(primary)
+        if model and model.get("is_active") and model.get("id") not in skip:
+            return model
+        return None
+
     async def ensure_channel_models(self) -> dict:
         """Upsert Ark Plan (+ optional Coding) channels for multi-quota pooling."""
         from hiveweave.config import settings

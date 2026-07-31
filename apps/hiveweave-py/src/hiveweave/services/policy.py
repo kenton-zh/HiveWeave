@@ -119,6 +119,8 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "browse": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     "assert_visual": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     "game_run_case": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
+    # Seedream text-to-image — source-writing roles only (not CEO/HR)
+    "generate_image": frozenset({Capability.SOURCE_WRITE}),
     # DOC_WRITE agents (CEO) may edit docs; SOURCE_WRITE covers all paths
     "edit_file": frozenset({Capability.SOURCE_WRITE, Capability.DOC_WRITE}),
     "apply_patch": frozenset({Capability.SOURCE_WRITE}),
