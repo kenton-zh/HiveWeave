@@ -1362,6 +1362,15 @@ class Agent:
                     )
                     if ensured.get("success") and ensured.get("path"):
                         self._workspace_path = ensured["path"]
+                        # P2: clear stale worktree_error on successful ensure
+                        # — otherwise a prior failure's breadcrumb sticks on
+                        # the agent forever even after recovery.
+                        try:
+                            await org.update_agent(
+                                self.id, {"worktree_error": None}
+                            )
+                        except Exception:
+                            pass
                         return self._workspace_path
                     # P2: persist worktree_error for non-skipped failures so
                     # ws=None+err=None inconsistency is diagnosable. A skipped
