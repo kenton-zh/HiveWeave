@@ -89,6 +89,59 @@ async def get_tasks_tool(
                     case_by_original[str(oid)] = case
         except Exception:
             pass
+        # P0-1: prefetch active waivers so agents can SEE who waived a task
+        # (waived_by third-party isolation is otherwise invisible — agents
+        # guessed wrong in TEST18 and deadlocked approve for hours).
+        waiver_by_task: dict[str, dict] = {}
+        try:
+            from hiveweave.services.attestation import (
+                WAIVER_KIND,
+                _conn as _attestation_conn,
+                attestation_service,
+            )
+            import time as _time
+
+            await attestation_service.ensure_schema(project_id)
+            tids = [str(t.get("id") or "") for t in tasks if t.get("id")]
+            if tids:
+                placeholders = ",".join(["?"] * len(tids))
+                now_ms = int(_time.time() * 1000)
+                # _conn returns a cached LRU connection — do NOT close it
+                conn = await _attestation_conn(project_id)
+                cur = await conn.execute(
+                    "SELECT task_id, agent_id, expires_at "
+                    "FROM tool_attestations "
+                    "WHERE project_id = ? AND kind = ? "
+                    f"AND task_id IN ({placeholders}) "
+                    "AND (expires_at IS NULL OR expires_at > ?) "
+                    "ORDER BY created_at DESC",
+                    [project_id, WAIVER_KIND, *tids, now_ms],
+                )
+                rows = await cur.fetchall()
+                await cur.close()
+                for r in rows:
+                    tid = str(r["task_id"]) if "task_id" in r.keys() else None
+                    if tid and tid not in waiver_by_task:
+                        waiver_by_task[tid] = {
+                            "waived_by": str(r["agent_id"]) if "agent_id" in r.keys() else None,
+                            "waiver_expires_at": r["expires_at"] if "expires_at" in r.keys() else None,
+                        }
+        except Exception as e:
+            log.debug("get_tasks_waiver_prefetch_failed", error=str(e))
+        # Map waived_by id -> short_id/name for display
+        waver_names: dict[str, str] = {}
+        try:
+            from hiveweave.services.org import OrgService
+
+            org = OrgService()
+            for w in waiver_by_task.values():
+                wid = w.get("waived_by")
+                if wid and wid not in waver_names:
+                    a = await org.get_agent(wid)
+                    if a:
+                        waver_names[wid] = f"{a.get('name','?')} ({a.get('short_id','?')})"
+        except Exception:
+            pass
         for t in tasks:
             tid = str(t.get("id") or "")
             lines.append(
@@ -97,6 +150,14 @@ async def get_tasks_tool(
                 f"progress={t.get('progress', 0)}%, "
                 f"assignee={t.get('assignee_id') or 'unassigned'})"
             )
+            wv = waiver_by_task.get(tid)
+            if wv:
+                wname = waver_names.get(wv.get("waived_by"), str(wv.get("waived_by") or "?")[:8])
+                lines.append(
+                    f"    waiver: waived_by={wname} "
+                    f"expires_at={wv.get('waiver_expires_at')} "
+                    f"(waived_by CANNOT approve; rework clears waiver)"
+                )
             case = case_by_verify.get(tid) or case_by_original.get(tid)
             if case:
                 notes = (case.get("review_notes") or "").replace("\n", " ")[:120]

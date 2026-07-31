@@ -257,10 +257,18 @@ async def review_task_tool(
                 if not ok:
                     tid = task.get("id") or params.task_id
                     kinds = ", ".join(sorted(needed))
+                    # P0-3: be explicit about current state so the reviewer
+                    # does not mis-think they are waived_by. No active waiver
+                    # exists here (this branch is `not waived`); the blocker
+                    # is missing/stale attestation evidence, NOT third-party
+                    # isolation from a waiver they issued.
                     return ToolResult.err(
                         f"Cannot approve: attestation gate failed ({policy_id}): {err}. "
                         f"taskId={tid} (use this full id).\n"
                         f"Required kind(s): {kinds}.\n"
+                        f"Current state: NO active waiver on this task — "
+                        f"you are NOT blocked by waived_by third-party rule. "
+                        f"The blocker is missing/stale attestation evidence.\n"
                         f"Options:\n"
                         f"1) For docs_only: attest_doc_review(taskId, files=[{{path}}]) "
                         f"then approve with those attestationIds.\n"
@@ -268,8 +276,10 @@ async def review_task_tool(
                         f"browse/test/doc_review attestationIds on resubmit.\n"
                         f"3) Last resort: waive_attestation(taskId=\"{tid}\", "
                         f"evidenceAttestationId=\"<test_run|browse_e2e id>\", "
-                        f"reason=\"<why exempt>\") then a *different* agent "
-                        f"approves (waived_by cannot approve)."
+                        f"reason=\"<why exempt>\") — after waiving YOU cannot "
+                        f"approve (waived_by cannot approve); a *different* "
+                        f"REVIEW holder must approve. Use get_tasks to see "
+                        f"current waiver state before deciding."
                     )
             elif not needed and not waived and evidence.get("tests_passed") is not True:
                 # Soft path: tests_passed ack OR any real attestationIds OR waiver
@@ -321,9 +331,13 @@ async def review_task_tool(
                     consume_ids.append(str(asg))
                 # S1 audit: also consume QA agents (evidence may sit on an
                 # independent tester, not only the assignee).
+                # P1: extend to ANY active agent holding TEST_RUN capability
+                # (incl. builder coordinator). In small teams the coordinator
+                # often runs tests freshest, but their attestation could not
+                # be consumed by a TEST_RUN-less CEO — narrowing the escape
+                # path and causing deadlocks (TEST18 3-VERIFY stall).
                 try:
                     from hiveweave.services.org import OrgService
-                    from hiveweave.services.policy import infer_role_family
 
                     for a in (await OrgService().list_agents(project_id)) or []:
                         if (a.get("status") or "").lower() == "archived":
@@ -331,7 +345,7 @@ async def review_task_tool(
                         aid = str(a.get("id") or "")
                         if not aid or aid == str(agent_id) or aid in consume_ids:
                             continue
-                        if infer_role_family(a) == "qa":
+                        if has_capability(a, Capability.TEST_RUN):
                             consume_ids.append(aid)
                 except Exception:
                     pass

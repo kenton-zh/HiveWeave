@@ -151,3 +151,96 @@ async def test_waiver_expires(env):
     await attestation_service.ensure_schema(PROJECT_ID)
     # 刚创建就过期
     assert await has_valid_waiver(PROJECT_ID, "t-exp") is False
+
+
+# ── P0-2: rework 时 invalidate valid waiver ─────────────────
+# TEST18 死锁根因：rework 不清 waiver，waived_by 第三人隔离 24h 内
+# 不可恢复。修复后 rework 立即退役 active waiver，新 submit/review
+# 周期从干净状态开始，但 lifetime count 保留（MAX_WAIVERS_PER_TASK cap）。
+
+
+@pytest.mark.asyncio
+async def test_invalidate_valid_waivers_retires_active(env):
+    """invalidate_valid_waivers 把 active waiver 的 expires_at 设为 now。"""
+    from hiveweave.services.attestation import (
+        count_waivers,
+        get_valid_waiver,
+        invalidate_valid_waivers,
+    )
+
+    tid = "t-invalidate-1"
+    await create_waiver(
+        PROJECT_ID, task_id=tid, waived_by=COORD_ID,
+        reason="active waiver to be retired on rework",
+    )
+    assert await has_valid_waiver(PROJECT_ID, tid) is True
+    prior_count = await count_waivers(PROJECT_ID, tid)
+    assert prior_count == 1
+
+    retired = await invalidate_valid_waivers(PROJECT_ID, tid)
+    assert retired == 1
+
+    # Active waiver gone — approve path no longer sees waived_by isolation
+    assert await has_valid_waiver(PROJECT_ID, tid) is False
+    assert await get_valid_waiver(PROJECT_ID, tid) is None
+    # Lifetime count preserved (row kept for audit, MAX_WAIVERS_PER_TASK cap)
+    assert await count_waivers(PROJECT_ID, tid) == prior_count
+
+
+@pytest.mark.asyncio
+async def test_invalidate_valid_waivers_idempotent(env):
+    """重复调用安全 — 无 active waiver 时返回 0，不报错。"""
+    from hiveweave.services.attestation import invalidate_valid_waivers
+
+    tid = "t-invalidate-2"
+    # No waiver exists
+    assert await invalidate_valid_waivers(PROJECT_ID, tid) == 0
+    # After creating + retiring once, second call returns 0
+    await create_waiver(
+        PROJECT_ID, task_id=tid, waived_by=COORD_ID,
+        reason="waiver for idempotency test",
+    )
+    assert await invalidate_valid_waivers(PROJECT_ID, tid) == 1
+    assert await invalidate_valid_waivers(PROJECT_ID, tid) == 0
+
+
+@pytest.mark.asyncio
+async def test_invalidate_valid_waivers_handles_empty_task_id(env):
+    """空 task_id 早返回 0，不查 DB。"""
+    from hiveweave.services.attestation import invalidate_valid_waivers
+
+    assert await invalidate_valid_waivers(PROJECT_ID, "") == 0
+    assert await invalidate_valid_waivers(PROJECT_ID, None) == 0
+
+
+@pytest.mark.asyncio
+async def test_invalidate_preserves_expired_waivers_audit_rows(env):
+    """退役的 waiver 行仍保留（UPDATE expires_at，非 DELETE）。"""
+    from hiveweave.services.attestation import (
+        WAIVER_KIND,
+        _conn as _att_conn,
+        invalidate_valid_waivers,
+    )
+
+    tid = "t-invalidate-3"
+    await create_waiver(
+        PROJECT_ID, task_id=tid, waived_by=COORD_ID,
+        reason="audit row preservation test",
+    )
+    await invalidate_valid_waivers(PROJECT_ID, tid)
+
+    # Direct SQL: row still exists, now expired
+    conn = await _att_conn(PROJECT_ID)
+    cur = await conn.execute(
+        "SELECT COUNT(*) AS c, expires_at FROM tool_attestations "
+        "WHERE project_id = ? AND task_id = ? AND kind = ?",
+        [PROJECT_ID, tid, WAIVER_KIND],
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert int(row["c"]) == 1
+    # expires_at is set (not NULL) and <= now
+    import time as _time
+    assert row["expires_at"] is not None
+    assert int(row["expires_at"]) <= int(_time.time() * 1000)
+
