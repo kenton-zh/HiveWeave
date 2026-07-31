@@ -4,7 +4,7 @@ Guidance for AI coding sessions working in this repo. Keep it terse; every line 
 
 **Canonical detail:** prefer [`CLAUDE.md`](CLAUDE.md) for architecture, commands, and pitfalls; keep this file as a short agent-facing digest and sync when those change.
 
-**Project memory (all platforms):** write/read `AI_MEMORY.local.md` at repo root — do not use platform-default memory paths. See `CLAUDE.md` §跨平台 AI 项目记忆.
+**跨平台 AI 项目记忆（本地，不进远程）：** 读写仓库根目录 [`AI_MEMORY.local.md`](AI_MEMORY.local.md)（已 gitignore）——**不**使用各平台自带记忆路径或存储规则，跨会话/跨平台复用同一份。个人环境配置写 [`CLAUDE.local.md`](CLAUDE.local.md)；本文件只放可复用的项目事实（决策、坑、根因、未完成上下文），禁止密钥。详见 `CLAUDE.md` §跨平台 AI 项目记忆。
 
 ## Architecture
 
@@ -74,8 +74,8 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 
 ## Two-tier SQLite
 
-1. **Meta DB** — `apps/hiveweave-py/data/hiveweave.db` (WAL). Global tables: `projects`, `agent-templates`, `llm-models`, `global-settings`. Override with `HIVEWEAVE_META_DB_PATH`.
-2. **Per-project DB** — one per workspace, **WAL mode**. Project-scoped tables: `agents`, `memories`, `chat-messages`, `handoffs`, `inbox`, `conversation-turns`, etc.
+1. **Meta DB** — `apps/hiveweave-py/data/hiveweave.db` (WAL). Global tables: `projects`, `agent_templates`, `llm_models`, `global_settings`, `mcp_servers`, `meta_index`. Override with `HIVEWEAVE_META_DB_PATH`.（旧 `agent_index`/`permission_rules` 等已废弃，迁移时 DROP）
+2. **Per-project DB** — one per workspace, **WAL mode**. Project-scoped tables: `agents`, `memories`, `chat_messages`, `handoffs`, `inbox`, `work_logs` 等。按工作区隔离。
 
 ## Key modules (`apps/hiveweave-py/src/hiveweave/`)
 
@@ -87,7 +87,7 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 | `llm/provider.py` | Provider factory (openai/anthropic/google/fallback) |
 | `llm/retry.py` | 429/503/504/529 retry, exponential backoff |
 | `llm/circuit_breaker.py` | 熔断器 + probe lock |
-| `tools/executor.py` | ToolExecutor, 11 built-in tools, permission matrix |
+| `tools/executor.py` | ToolExecutor, 85 个注册工具（+5 个 legacy 评审套件）, permission matrix |
 | `conversation/store.py` | Token-budget trimming, turn-level, lazy-loaded |
 | `conversation/compaction.py` | LLM summary of evicted turns |
 | `conversation/token_utils.py` | Char-ratio token estimation |
@@ -100,14 +100,22 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 
 ## Agent types & org
 
-- **Coordinator**: read subordinate logs/code, approve/reject, spawn/dismiss. Cannot write code.
-- **Executor**: read/write code, run tests, write work logs. Cannot spawn sub-agents.
+- **CEO** (root): 行政五权 `DISPATCH`/`REVIEW`/`MERGE`/`SOURCE_READ`/`MANAGE_ORG` + `DOC_WRITE`；**无 SOURCE_WRITE/bash/test/staffing**（硬门）。定组织、审中层里程碑、终验对用户（`message_user`），不写业务代码、不日常直派叶子。
+- **Coordinator / 中层 (player-coach)**: 协调权 + `SOURCE_WRITE`/`BASH_SHELL`/`TEST_RUN`/`BROWSE` —— 自己搭骨架/写关键路径（有独立 worktree，同 executor 契约）；hire/dismiss/transfer。受限写白名单（`COORDINATOR_WRITE_PREFIXES`）适用于项目根。
+- **Executor** (叶子): 可读写代码、运行测试、写工作日志。不能 spawn 下级。
+- **QA** (`test_engineer`/`qa_engineer`): 含 SOURCE_WRITE（缺它 write_file 被硬门死 —— Echo 事故）。
+- **HR**: 同受限写白名单，无源码写。
 
-CEO auto-created per project. HR under CEO. Expert agents on-demand.
+未知 family 兜底 READONLY。CEO/HR 强制项目根（无 worktree）；executor + builder coordinator 由 `agent_gets_write_worktree()` 判定有 worktree。CEO（root）+ HR（CEO 下级）项目创建时自动创建，HR 招 expert agents。
 
 ## Game time
 
-`REAL_SECONDS_PER_GAME_DAY = 3600` (1 real hour per game day). Game seconds use 86400/day. 5s tick persists time + fires alarms. Stalled agents: 10min stall → nudge, ~40min+ → escalate.
+`REAL_SECONDS_PER_GAME_DAY = 3600` (1 real hour per game day). 5s tick persists time + fires alarms. 每 30s 扫 orphan streaming.
+
+**Stall 检测三层机制**（不要混淆）：
+1. **Inbox stall / awaiting-reply 催办 — 已禁用**（`_check_stalled` / `_nudge_awaiting_replies` no-op）。回复义务由 turn exit 的 `expect_report` / `ask` + 收件人 ID 检查强制执行。
+2. **Task stall 催办 — 活跃**（`_nudge_stale_ledger` 内 `TASK_STALL_THRESHOLDS` 段）：running>20min / submitted>10min / reviewing>10min / rework>10min / created>5min / claimed>5min。超 `STALL_ESCALATION_THRESHOLD`(3) 次升级上级。
+3. **沉默观测看门狗 — 活跃**（`_check_silent_agents`）：`SILENCE_THRESHOLD_MS = 10min` 无产出 → 唤醒 + agent_health 红框；`SILENCE_NOTIFY_MS = 30min` 持续失联 → 通知上级。
 
 ## Environment variables
 

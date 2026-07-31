@@ -80,7 +80,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 | `src/hiveweave/api/` | FastAPI 路由 (16 个模块, 122 路由) |
 | `src/hiveweave/agents/` | Agent + Supervisor + trigger |
 | `src/hiveweave/llm/` | LLM 流式调用 (`streamer/` 包, provider, retry, circuit_breaker) |
-| `src/hiveweave/tools/` | 工具执行器 + 74 个注册工具（+5 个 legacy 评审套件） |
+| `src/hiveweave/tools/` | 工具执行器 + 85 个注册工具（+5 个 legacy 评审套件） |
 | `src/hiveweave/services/` | 业务服务 (org, dispatch, memory, handoff, skill_registry, turn_*, `git_worktree/` 包, `tasks/` 包 + `task.py` shim, game_time, chat_message, inbox_triage, ...) |
 | `src/hiveweave/hooks/` | Lifecycle hooks（OpenCode 风格 registry + points） |
 | `src/hiveweave/conversation/` | 对话历史 + token budget + compaction |
@@ -136,7 +136,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 
 ### 工具系统
 
-`apps/hiveweave-py/src/hiveweave/tools/executor.py` — 74 个注册工具（pipeline）+ 5 个 legacy 评审套件（`run_tests`/`run_code_review`/`run_security_audit`/`run_perf_audit`/`run_full_review`，走 review.py），按类别:
+`apps/hiveweave-py/src/hiveweave/tools/executor.py` — 85 个注册工具（pipeline）+ 5 个 legacy 评审套件（`run_tests`/`run_code_review`/`run_security_audit`/`run_perf_audit`/`run_full_review`，走 review.py），按类别:
 
 | 类别 | 工具 |
 |------|------|
