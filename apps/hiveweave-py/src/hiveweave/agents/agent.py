@@ -1363,6 +1363,20 @@ class Agent:
                     if ensured.get("success") and ensured.get("path"):
                         self._workspace_path = ensured["path"]
                         return self._workspace_path
+                    # P2: persist worktree_error for non-skipped failures so
+                    # ws=None+err=None inconsistency is diagnosable. A skipped
+                    # result (no in-flight write tasks) is expected and must
+                    # NOT set an error — agents doing VERIFY-only / idle stay
+                    # clean. Real failures (git error, disk, etc.) leave a
+                    # breadcrumb so reconcile / debug surfaces the cause.
+                    if not ensured.get("skipped"):
+                        err_msg = ensured.get("message") or "worktree ensure failed"
+                        try:
+                            await org.update_agent(
+                                self.id, {"worktree_error": err_msg}
+                            )
+                        except Exception:
+                            pass
         except Exception:
             pass  # 回退到项目根
 

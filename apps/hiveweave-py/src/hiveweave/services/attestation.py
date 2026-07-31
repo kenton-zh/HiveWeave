@@ -537,6 +537,43 @@ async def count_waivers(project_id: str, task_id: str | None) -> int:
         return 0
 
 
+async def invalidate_valid_waivers(project_id: str, task_id: str | None) -> int:
+    """Invalidate all unexpired waivers for a task (set expires_at=now).
+
+    Called on rework so waived_by third-party isolation does not persist
+    across review rounds — a new submit/review cycle starts fresh.
+    Lifetime count (count_waivers) is preserved for the MAX_WAIVERS_PER_TASK
+    cap; only the active waiver is retired. Rows are kept for audit.
+
+    Returns the number of waivers retired.
+    """
+    if not task_id:
+        return 0
+    await attestation_service.ensure_schema(project_id)
+    try:
+        conn = await _conn(project_id)
+    except ProjectDbError:
+        return 0
+    now = int(time.time() * 1000)
+    cur = await conn.execute(
+        "UPDATE tool_attestations SET expires_at = ? "
+        "WHERE project_id = ? AND task_id = ? AND kind = ? "
+        "AND (expires_at IS NULL OR expires_at > ?)",
+        [now, project_id, task_id, WAIVER_KIND, now],
+    )
+    retired = cur.rowcount or 0
+    await conn.commit()
+    await cur.close()
+    if retired > 0:
+        log.info(
+            "waiver_invalidated_on_rework",
+            project_id=project_id,
+            task_id=task_id,
+            retired=retired,
+        )
+    return retired
+
+
 # Max waiver rows per task (lifetime). Escape hatch must stay narrower than
 # the front door (TEST6 P0-2: 9/9 approves via waive).
 MAX_WAIVERS_PER_TASK = 2

@@ -122,6 +122,23 @@ class ReviewMixin:
                 raise ValueError(
                     f"Illegal transition: {current_status} → rework"
                 )
+            # P0-2: invalidate unexpired waivers on rework so waived_by
+            # third-party isolation does not persist across review rounds.
+            # A rework starts a fresh submit/review cycle; the prior waiver
+            # was tied to the now-rejected submission. Lifetime count is
+            # preserved for the MAX_WAIVERS_PER_TASK cap.
+            try:
+                from hiveweave.services.attestation import (
+                    invalidate_valid_waivers,
+                )
+
+                await invalidate_valid_waivers(project_id, task_id)
+            except Exception as e:
+                log.warning(
+                    "rework_waiver_invalidate_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
             await self._transition_multi(project_id, task_id, "rework", "running",
                                          actor_id=reviewer_id or "system",
                                          reason_code=reason_code or "review_rework",
