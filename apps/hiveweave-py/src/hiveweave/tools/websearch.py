@@ -6,11 +6,16 @@
 - 返回最多 8 条结果，每条带 title/url/snippet/source
 - 支持 HTTPS_PROXY 代理（自动从环境变量读取）
 - 超时 15s
+- 后端失败熔断：某后端 ConnectTimeout/HTTP 失败后冷却 5 分钟，
+  避免每次搜索都空等 15s（如本环境 Brave/DDG 直连不可达，级联
+  每次固定多等 30s 才轮到 Bing）
 """
 
 from __future__ import annotations
 
+import html
 import re
+import time
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -24,6 +29,9 @@ log = structlog.get_logger(__name__)
 MAX_RESULTS = 8
 MAX_SNIPPET_CHARS = 160
 REQUEST_TIMEOUT_S = 15.0
+
+# 后端失败冷却：一次失败后跳过该后端一段时间（进程内）
+BACKEND_COOLDOWN_S = 300.0
 
 BROWSER_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -40,6 +48,20 @@ class SearchResult(dict):
     """A search result dict with title/url/snippet/source keys."""
 
 
+# 后端失败冷却状态：{backend_name: monotonic 冷却截止时间}
+# 模块级而非实例级：同一进程内所有 agent 共享，避免每个 agent
+# 第一次搜索都各自空等一遍超时。
+_backend_cooldown_until: dict[str, float] = {}
+
+
+def _backend_in_cooldown(backend: str) -> bool:
+    return time.monotonic() < _backend_cooldown_until.get(backend, 0.0)
+
+
+def _mark_backend_down(backend: str) -> None:
+    _backend_cooldown_until[backend] = time.monotonic() + BACKEND_COOLDOWN_S
+
+
 # ── Snippet helper ─────────────────────────────────────────
 
 def _extract_snippet(raw: str, title: str) -> str:
@@ -48,6 +70,7 @@ def _extract_snippet(raw: str, title: str) -> str:
         return ""
     if text.startswith(title):
         text = text[len(title):].strip()
+    text = html.unescape(text)
     return text[:MAX_SNIPPET_CHARS]
 
 
@@ -61,7 +84,7 @@ async def _brave_search(
     res = await client.get(url, headers=BROWSER_HEADERS)
     if res.status_code != 200:
         raise RuntimeError(f"Brave: {res.status_code}")
-    html = res.text
+    page = res.text
 
     results: list[SearchResult] = []
     seen: set[str] = set()
@@ -69,10 +92,10 @@ async def _brave_search(
     # Brave result anchors
     for m in re.finditer(
         r'<a[^>]*data-testid="result-title-a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-        html, re.S | re.I,
+        page, re.S | re.I,
     ):
         href = m.group(1).strip()
-        title = re.sub(r"<[^>]+>", "", m.group(2))
+        title = html.unescape(re.sub(r"<[^>]+>", "", m.group(2)))
         title = re.sub(r"\s+", " ", title).strip()
         if not href or not title:
             continue
@@ -83,7 +106,7 @@ async def _brave_search(
         if href in seen:
             continue
         # Try to extract snippet from surrounding context
-        snippet = _extract_snippet(html[max(0, m.end() - 500):m.end() + 1000],
+        snippet = _extract_snippet(page[max(0, m.end() - 500):m.end() + 1000],
                                    title)
         seen.add(href)
         results.append(SearchResult(title=title, url=href,
@@ -100,7 +123,7 @@ async def _duckduckgo_search(
     res = await client.get(url, headers=BROWSER_HEADERS)
     if res.status_code != 200:
         raise RuntimeError(f"DuckDuckGo: {res.status_code}")
-    html = res.text
+    page = res.text
 
     results: list[SearchResult] = []
     seen: set[str] = set()
@@ -108,10 +131,10 @@ async def _duckduckgo_search(
     # DDG result anchors: <a class="result__a" href="...">
     for m in re.finditer(
         r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-        html, re.S | re.I,
+        page, re.S | re.I,
     ):
         href = m.group(1).strip()
-        title = re.sub(r"<[^>]+>", "", m.group(2))
+        title = html.unescape(re.sub(r"<[^>]+>", "", m.group(2)))
         title = re.sub(r"\s+", " ", title).strip()
         if not href or not title:
             continue
@@ -128,7 +151,7 @@ async def _duckduckgo_search(
         snippet = ""
         snippet_match = re.search(
             r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
-            html[m.end():m.end() + 2000], re.S | re.I,
+            page[m.end():m.end() + 2000], re.S | re.I,
         )
         if snippet_match:
             snippet = _extract_snippet(
@@ -151,7 +174,7 @@ async def _bing_search(
                            follow_redirects=True)
     if res.status_code != 200:
         raise RuntimeError(f"Bing: {res.status_code}")
-    html = res.text
+    page = res.text
 
     results: list[SearchResult] = []
     seen: set[str] = set()
@@ -159,7 +182,7 @@ async def _bing_search(
     # Bing: <li class="b_algo">...<h2><a href="...">title</a></h2>...
     for m in re.finditer(
         r'<li[^>]*class="b_algo"[^>]*>(.*?)</li>',
-        html, re.S | re.I,
+        page, re.S | re.I,
     ):
         block = m.group(1)
         anchor = re.search(
@@ -169,7 +192,7 @@ async def _bing_search(
         if not anchor:
             continue
         href = anchor.group(1).strip()
-        title = re.sub(r"<[^>]+>", "", anchor.group(2))
+        title = html.unescape(re.sub(r"<[^>]+>", "", anchor.group(2)))
         title = re.sub(r"\s+", " ", title).strip()
         if not href or not title:
             continue
@@ -197,8 +220,14 @@ async def _bing_search(
 async def _search_keyless(
     query: str, limit: int
 ) -> list[SearchResult]:
-    """Try Brave → DuckDuckGo → Bing, returning the first non-empty result."""
-    timeout = httpx.Timeout(REQUEST_TIMEOUT_S)
+    """Try Brave → DuckDuckGo → Bing, returning the first non-empty result.
+
+    失败的后端进入冷却（BACKEND_COOLDOWN_S 内跳过），避免本环境
+    Brave/DDG 直连不可达时每次搜索都各空等 15s 超时。
+    """
+    # connect 单独短超时（5s）：本环境 Brave/DDG 直连不可达（TCP 丢包），
+    # connect 等满 15s 太慢；Bing 连接 <1s 不受影响。read 保持 15s。
+    timeout = httpx.Timeout(REQUEST_TIMEOUT_S, connect=5.0)
     # Respect HTTPS_PROXY env var if set
     proxy_url = None
     import os
@@ -212,28 +241,32 @@ async def _search_keyless(
         errors: list[str] = []
 
         # 1. Brave
-        try:
-            r = await _brave_search(client, query, limit)
-            if r:
-                return r
-        except Exception as exc:  # noqa: BLE001
-            log.debug("websearch.brave_failed", error=str(exc))
-            errors.append(f"Brave: {type(exc).__name__}: {exc}")
+        if not _backend_in_cooldown("brave"):
+            try:
+                r = await _brave_search(client, query, limit)
+                if r:
+                    return r
+            except Exception as exc:  # noqa: BLE001
+                log.debug("websearch.brave_failed", error=repr(exc))
+                errors.append(f"Brave: {type(exc).__name__}: {exc}")
+                _mark_backend_down("brave")
 
         # 2. DuckDuckGo
-        try:
-            r = await _duckduckgo_search(client, query, limit)
-            if r:
-                return r
-        except Exception as exc:  # noqa: BLE001
-            log.debug("websearch.duckduckgo_failed", error=str(exc))
-            errors.append(f"DuckDuckGo: {type(exc).__name__}: {exc}")
+        if not _backend_in_cooldown("duckduckgo"):
+            try:
+                r = await _duckduckgo_search(client, query, limit)
+                if r:
+                    return r
+            except Exception as exc:  # noqa: BLE001
+                log.debug("websearch.duckduckgo_failed", error=repr(exc))
+                errors.append(f"DuckDuckGo: {type(exc).__name__}: {exc}")
+                _mark_backend_down("duckduckgo")
 
         # 3. Bing (works in China without proxy)
         try:
             return await _bing_search(client, query, limit)
         except Exception as exc:  # noqa: BLE001
-            log.warning("websearch.all_backends_failed", error=str(exc))
+            log.warning("websearch.all_backends_failed", error=repr(exc))
             errors.append(f"Bing: {type(exc).__name__}: {exc}")
 
         # 所有后端全挂 → 显式失败，不要伪装成"无结果"
