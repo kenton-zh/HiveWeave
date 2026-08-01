@@ -255,7 +255,8 @@ async def hire_agent_tool(
     try:
         resolved = await ms.resolve_model(tier=tier)
         if resolved:
-            model_id = resolved.get("model_id") or resolved.get("id")
+            # 唯一 ID 优先：model_id 名称可重复（同名多渠道），存 UUID 避免运行时漂移
+            model_id = resolved.get("id") or resolved.get("model_id")
             log.info(
                 "hire_agent.model_tier_resolved",
                 role=role,
