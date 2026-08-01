@@ -335,6 +335,13 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["query"],
     },
+    "calculate": {
+        "description": "Evaluate a math expression exactly (scientific calculator). Use it for ANY non-trivial arithmetic (large numbers, floats, percentages, multiplications, trigonometry, logarithms) — never compute by hand. Supports + - * / // % **, parentheses, functions (sqrt cbrt sin cos tan asin acos atan atan2 sinh cosh tanh log log10 log2 exp pow hypot fmod floor ceil trunc round gcd lcm factorial degrees radians) and constants (pi e tau inf). '^' is power.",
+        "properties": {
+            "expression": {"type": "string", "aliases": ["expr", "formula", "math", "calc"]},
+        },
+        "required": ["expression"],
+    },
     "question": {
         "description": "Asks the user a question and optionally presents a list of choices. Use it to request clarification, get input on decisions, or present options when human guidance is needed. Returns the user response.",
         "properties": {

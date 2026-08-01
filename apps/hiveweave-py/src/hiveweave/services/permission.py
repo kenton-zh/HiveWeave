@@ -27,6 +27,7 @@ logger = structlog.get_logger()
 
 _BASE_TOOLS = frozenset({
     "grep", "question", "todowrite", "websearch", "webfetch",
+    "calculate",
     "schedule_alarm", "list_alarms", "cancel_alarm",
     "review", "read_file", "list_files", "read_skill", "list_available_skills",
     "read_memory", "write_memory",

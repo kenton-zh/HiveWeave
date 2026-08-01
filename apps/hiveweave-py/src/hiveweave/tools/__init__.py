@@ -39,6 +39,7 @@ from hiveweave.tools.review import (
 )
 from hiveweave.tools.todowrite import execute_todowrite
 from hiveweave.tools.websearch import execute_websearch
+from hiveweave.tools.calculator import execute_calculate
 
 # Import tool registration modules to trigger @tool decorators
 import hiveweave.tools.file_mgmt  # noqa: F401 — registers delete_file, move_file, etc.
@@ -74,6 +75,8 @@ __all__ = [
     "execute_grep",
     # Websearch
     "execute_websearch",
+    # Calculator
+    "execute_calculate",
     # Review
     "execute_review",
     "run_code_review",
