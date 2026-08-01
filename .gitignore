@@ -139,6 +139,7 @@ apps/web/scripts/refactor-*
 .gstack/
 .e2e-sandbox/
 .cursor/better-harness/
+.superpowers/
 
 # Agent test playgrounds (nested git repos used by agent teams during tests —
 # committing them creates broken gitlinks without .gitmodules)
