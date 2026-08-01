@@ -87,6 +87,24 @@ def test_identity_requires_browse_for_ui_e2e():
     assert "E2E" in text or "端到端" in text
 
 
+def test_identity_grounds_all_roles_in_real_platform():
+    from hiveweave.prompts.identity import build_identity_prompt
+
+    for role_type in ("executor", "coordinator"):
+        text = build_identity_prompt(
+            role="前端工程师" if role_type == "executor" else "ceo",
+            role_type=role_type,
+            backstory="x",
+            name="潮汐",
+            goal="做游戏",
+            model_id="gpt-4o",
+        )
+        assert "REAL DEVELOPMENT PLATFORM" in text
+        assert "不是戏服" in text
+        assert "结果导向" in text
+        assert "不是表演导向" in text
+
+
 def test_skill_registry_can_read_browse():
     async def _run():
         svc = SkillRegistryService()
