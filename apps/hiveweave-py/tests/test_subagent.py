@@ -1,7 +1,7 @@
 """子代理（spawn_subagent）回归测试。"""
 from __future__ import annotations
 
-from hiveweave.llm.streamer.doom_loop import doom_loop_limit
+from hiveweave.llm.streamer.doom_loop import DOOM_LOOP_TOOL_LIMITS, doom_loop_limit
 from hiveweave.services.permission import (
     CEO_TOOLS,
     COORDINATOR_BUILDER_TOOLS,
@@ -18,6 +18,7 @@ def test_spawn_subagent_in_all_family_lists():
 
 
 def test_spawn_subagent_doom_bucket_tight():
+    assert DOOM_LOOP_TOOL_LIMITS["spawn_subagent"] == 3
     assert doom_loop_limit("spawn_subagent") == 3
 
 
