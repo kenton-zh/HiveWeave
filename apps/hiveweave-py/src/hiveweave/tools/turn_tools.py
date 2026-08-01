@@ -21,6 +21,44 @@ from hiveweave.services.turn_session import (
 )
 
 
+async def _archive_turn_lessons(agent_id: str, tr: Any, ctx: Any) -> None:
+    """Co-learning: done_slice + extensions.lessons → archive experiential
+    lessons (ChatDev Experiential Co-Learning). Quality gate inside
+    LessonService rejects empty/fluff lessons. Fail-open — never blocks
+    turn exit. Called on both soft-pass and normal commit paths.
+    """
+    if tr.phase != "done_slice" or not (tr.extensions or {}).get("lessons"):
+        return
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.lessons import LessonService
+
+        project_id = await meta_db.get_agent_project_id(agent_id)
+        if not project_id and ctx is not None:
+            project_id = getattr(ctx, "project_id", None)
+        if project_id:
+            lessons = tr.extensions.get("lessons")
+            if isinstance(lessons, list):
+                svc = LessonService()
+                for item in lessons:
+                    if not isinstance(item, dict):
+                        continue
+                    lesson_text = item.get("lesson")
+                    if not isinstance(lesson_text, str) or not lesson_text.strip():
+                        continue
+                    await svc.save_lesson(
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        lesson=lesson_text,
+                        tags=item.get("tags") or item.get("keywords"),
+                        root_cause=item.get("root_cause"),
+                        fix=item.get("fix"),
+                        source_summary=tr.summary,
+                    )
+    except Exception:
+        pass  # fail-open: lesson archiving never blocks turn exit
+
+
 # ── commit_turn ──────────────────────────────────────────
 
 
@@ -54,7 +92,12 @@ class CommitTurnParams(BaseModel):
     )
     extensions: dict[str, Any] | None = Field(
         default=None,
-        description="Forward-compatible extensions. May be {}",
+        description=(
+            "Forward-compatible extensions. May be {}. "
+            "Co-learning: on phase=done_slice, submit lessons learned as "
+            "extensions.lessons=[{lesson, root_cause?, fix?, tags?}] — they are "
+            "archived and recalled for future tasks."
+        ),
     )
 
 
@@ -207,6 +250,7 @@ async def commit_turn_tool(
                                 )
                         except Exception:
                             pass
+                        await _archive_turn_lessons(agent_id, tr, ctx)
                         return ToolResult.ok(
                             f"STOP: TurnResult accepted WITH SOFT WARNING "
                             f"(first offense this turn): {'; '.join(hints)}. "
@@ -242,6 +286,11 @@ async def commit_turn_tool(
             )
     except Exception:
         pass
+
+    # Co-learning: done_slice + extensions.lessons → archive experiential lessons
+    # (ChatDev Experiential Co-Learning). Quality gate inside LessonService:
+    # rejects empty/fluff lessons. Fail-open — never block turn exit on this.
+    await _archive_turn_lessons(agent_id, tr, ctx)
 
     # BUG-3 / DESIGN-1: non-in_progress commit hard-stops the tool loop.
     # Empty gates: [] means no outstanding synchronous gate failures —

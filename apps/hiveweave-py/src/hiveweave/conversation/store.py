@@ -29,6 +29,7 @@ from hiveweave.conversation.token_utils import (
 )
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
+from hiveweave.services.memory import MemoryService
 
 logger = structlog.get_logger()
 
@@ -307,12 +308,40 @@ class ConversationStore:
                         return
 
                 self._cache[key] = history
-                if summary_text is not None:
-                    self._prefix_cache[key] = summary_text
+
+                # 记忆快照 + 记忆压缩同步（2026-08-01 用户钦定）：
+                # 1) 压缩对话的同时检查 agent 私有记忆 — ≥_COMPACT_TRIGGER 条
+                #    才压缩一次（合并最老 8 条 + 旧摘要 → LLM 新摘要；
+                #    LLM 失败硬裁剪保最新 10 条）。只在压缩时触发，不随写入。
+                # 2) 把 agent 记忆快照（最新 10 条未压缩 + 压缩摘要）追加到
+                #    压缩摘要末尾 — 历史被压缩掉后，记忆需要补一次快照，
+                #    随 compacted_prefix 持久化注入（重启后仍生效）。
+                # 记忆相关失败不阻断对话压缩。
+                prefix_text = summary_text
+                try:
+                    mem = MemoryService()
+                    await mem.maybe_compact_agent_memories(agent_id, project_id)
+                    snapshot = await mem.build_agent_context(agent_id, project_id)
+                    if snapshot:
+                        block = f"## Current Memory Snapshot\n{snapshot}"
+                        if summary_text is not None:
+                            prefix_text = f"{summary_text}\n\n{block}"
+                        else:
+                            # LLM 压缩失败（硬裁剪）路径：快照追加到已有前缀，
+                            # 绝不覆盖旧摘要 — 否则每次无 key 压缩都会丢失上文
+                            existing = self._prefix_cache.get(key) or summary_text
+                            prefix_text = f"{existing}\n\n{block}" if existing else block
+                except Exception as e:
+                    logger.warning(
+                        "memory_snapshot_failed", agent_id=agent_id, error=str(e)
+                    )
+
+                if prefix_text is not None:
+                    self._prefix_cache[key] = prefix_text
 
                 # 持久化压缩结果到 DB — 删除旧 turn 行，写入压缩后的 turn
                 # 防止重启后从 DB 加载到已压缩的旧消息（CRITICAL #1）
-                await self._persist_compaction(agent_id, history, summary_text)
+                await self._persist_compaction(agent_id, history, prefix_text)
 
                 logger.info(
                     "compaction_applied",

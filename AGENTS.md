@@ -6,6 +6,10 @@ Guidance for AI coding sessions working in this repo. Keep it terse; every line 
 
 **跨平台 AI 项目记忆（本地，不进远程）：** 读写仓库根目录 [`AI_MEMORY.local.md`](AI_MEMORY.local.md)（已 gitignore）——**不**使用各平台自带记忆路径或存储规则，跨会话/跨平台复用同一份。个人环境配置写 [`CLAUDE.local.md`](CLAUDE.local.md)；本文件只放可复用的项目事实（决策、坑、根因、未完成上下文），禁止密钥。详见 `CLAUDE.md` §跨平台 AI 项目记忆。
 
+## Workflow rules
+
+**代码超 20 行必须子代理审计**（用户 2026-08-01 钦定）：任何一次代码编写/修改，若新增或修改的代码**合计超过 20 行**（单文件或多文件累计），必须在交付/声明完成前派子代理（code-review / general）审计，修复其发现的问题后再汇报。≤20 行的小改动可自审后直接汇报。测试代码同样适用。
+
 ## Architecture
 
 **Single Python backend + React frontend**:
