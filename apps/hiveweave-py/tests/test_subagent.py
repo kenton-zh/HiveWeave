@@ -41,13 +41,10 @@ def test_extend_elapsed_budget_shifts_started_at():
 
 import json
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from hiveweave.services import turn_session
 from hiveweave.tools.subagent import (
-    SUBAGENT_MAX_TIMEOUT_S,
-    SUBAGENT_TIMEOUT_S,
     _run_subagent,
     _subagent_on_tool_call,
 )
@@ -145,6 +142,9 @@ def test_run_subagent_timeout_returns_error():
     parent = _fake_parent()
 
     class SlowStreamer:
+        def __init__(self, **kw):
+            pass
+
         async def stream(self, **kw):
             await __import__("asyncio").sleep(5)
             return {"status": "ok", "content": "late"}
@@ -166,3 +166,33 @@ def test_subagent_commit_rejects_empty_summary():
         "tc-3"))
     assert result["end_turn"] is not True
     assert "summary required" in result["content"]
+
+
+def test_run_subagent_commit_summary_isolated_per_spawn():
+    """审计修复：commit 摘要按 spawn 隔离 —— 未提交的子代理不带 [commit] 标注。"""
+    parent = _fake_parent()
+    state = {"do_commit": False}
+
+    class FakeStreamer:
+        def __init__(self, **kw):
+            pass
+
+        async def stream(self, **kw):
+            if state["do_commit"]:
+                await kw["on_tool_call"](
+                    "commit_turn",
+                    json.dumps({"phase": "done_slice", "summary": "refactored X"}),
+                    "tc-x",
+                )
+            return {"status": "ok", "content": "done the job",
+                    "rounds": 1, "usage": {}, "end_turn": True}
+
+    import asyncio
+    with patch("hiveweave.tools.subagent.Streamer", FakeStreamer):
+        state["do_commit"] = True
+        committed = asyncio.run(_run_subagent(parent, "task A", "a", 240))
+        state["do_commit"] = False
+        plain = asyncio.run(_run_subagent(parent, "task B", "b", 240))
+
+    assert "[commit] done_slice: refactored X" in committed["content"]
+    assert "[commit]" not in plain["content"]
