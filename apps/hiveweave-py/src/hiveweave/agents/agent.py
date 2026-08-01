@@ -1065,9 +1065,12 @@ class Agent:
         skip_handoffs: trigger 调用时为 True — trigger 上下文的 Pending Tasks
         block 已包含 handoff 信息，context prompt 不再重复。
         """
-        # Memories
-        memory_text = await self._memory.build_agent_context(
-            self.id, self.project_id, module_id=None
+        # Memories — 2026-08-01 注入模型：每轮只注入 project 共享层
+        # （宪章类，团队对齐必需）。agent 私有记忆不每轮注入——对话历史
+        # 已含 agent 写过的内容；压缩后由 store._do_compaction 把快照追加
+        # 到 compacted_prefix 一次性注入（见 conversation/store.py）。
+        memory_text = await self._memory.build_project_context(
+            self.project_id
         )
 
         # Goals — only inject when dirty (CEO/user modified since last read).

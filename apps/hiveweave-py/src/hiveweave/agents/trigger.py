@@ -808,6 +808,36 @@ async def build_trigger_context(
         from_agent_id = "system"
 
     context = "\n\n".join(blocks)
+
+    # 4.5 Lifecycle hook trigger.context.build — per-task recall injection
+    # (ChatDev co-learning: recall past lessons matching this task's keywords).
+    # Fail-open: hook failure must not break triggering. Output key: lessons_block.
+    try:
+        from typing import Any
+
+        from hiveweave.hooks import TRIGGER_CONTEXT_BUILD, hooks
+
+        hook_out: dict[str, Any] = {"lessons_block": None}
+        await hooks.run(
+            TRIGGER_CONTEXT_BUILD,
+            {
+                "agent_id": agent_id,
+                "project_id": project_id,
+                "trigger_type": trigger_type,
+                "context": context,
+            },
+            hook_out,
+        )
+        lessons_block = hook_out.get("lessons_block")
+        if isinstance(lessons_block, str) and lessons_block.strip():
+            context = f"{context}\n\n{lessons_block}"
+    except Exception as e:
+        log.warning(
+            "trigger_context_build_hook_failed",
+            agent_id=agent_id,
+            error=str(e),
+        )
+
     return context, inbox_msg_ids, from_agent_id, wake_category
 
 

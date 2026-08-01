@@ -905,7 +905,8 @@ class ReadMemoryParams(BaseModel):
 
 @tool(
     "read_memory",
-    "Reads previously stored memory for an agent. Use agentId to read "
+    "Reads previously stored memory for an agent (including older entries "
+    "that were compressed out of the live context). Use agentId to read "
     "another agent's memories; omit to read your own.",
     requires_workspace=False,
     security_level="standard",
@@ -913,7 +914,7 @@ class ReadMemoryParams(BaseModel):
 async def read_memory_tool(
     params: ReadMemoryParams, agent_id: str, workspace: str, ctx=None
 ) -> ToolResult:
-    """Read agent memories."""
+    """Read agent memories (full set, including compressed/old entries)."""
     from hiveweave.services.memory import MemoryService
 
     project_id = await get_project_id(agent_id)
@@ -933,16 +934,16 @@ async def read_memory_tool(
     mem = MemoryService()
     try:
         # BUG-P1a: moduleId 是 module_id 列过滤条件，不是 scope。
-        # 写入侧 add_entry 恒以 scope='agent' 落库（memory.py），
-        # 读取侧必须按 scope='agent' + module_id 列过滤才能读写对称。
-        entries = await mem.get_agent_memories(
-            target_agent_id, project_id, "agent", module_id=params.module_id
+        # 窗口压缩后注入只显示最新未压缩条目；本工具读全量
+        # （含 compressed=true 的旧条目），保证历史可主动召回。
+        entries = await mem.get_all_agent_memories(
+            target_agent_id, project_id, module_id=params.module_id
         )
         if not entries:
             return ToolResult.ok("(no memories)")
         lines = [
             f"- [{e.get('type', '?')}] {e.get('content', '')}"
-            for e in entries[:20]
+            for e in entries[:50]
         ]
         return ToolResult.ok("\n".join(lines))
     except Exception as e:
