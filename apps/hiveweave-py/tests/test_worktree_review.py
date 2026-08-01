@@ -7,6 +7,7 @@ from pathlib import Path
 from hiveweave.services.worktree_review import (
     MERGE_CONFLICT_HINT,
     compare_worktree_to_main,
+    hint_missing_file_locations,
     select_tasks_for_merged_work,
 )
 
@@ -92,6 +93,65 @@ def test_merge_conflict_hint_is_executor_owned():
     assert "EXECUTOR FIXES IN WORKTREE" in MERGE_CONFLICT_HINT
     assert "aborted" in MERGE_CONFLICT_HINT.lower()
     assert "edit_file" not in MERGE_CONFLICT_HINT.lower()
+
+
+def test_hint_missing_file_locations_finds_leaf(tmp_path: Path):
+    root = tmp_path / "main"
+    (root / ".hiveweave" / "reports").mkdir(parents=True)
+    (root / ".hiveweave" / "reports" / "A018-moduleC-verification.md").write_text(
+        "x", encoding="utf-8"
+    )
+    hints = hint_missing_file_locations(
+        [str(root)], ["A018-moduleC-verification.md"]
+    )
+    assert len(hints) == 1
+    assert "A018-moduleC-verification.md" in hints[0]
+    assert ".hiveweave" in hints[0]
+
+
+def test_hint_missing_file_locations_no_match_empty(tmp_path: Path):
+    root = tmp_path / "main"
+    root.mkdir()
+    assert hint_missing_file_locations([str(root)], ["nope.txt"]) == []
+
+
+def test_hint_missing_file_locations_multi_root_no_overwrite(tmp_path: Path):
+    wtree = tmp_path / "wtree"
+    main = tmp_path / "main"
+    (wtree / "src").mkdir(parents=True)
+    (main / "src").mkdir(parents=True)
+    (main / "src" / "target.md").write_text("x", encoding="utf-8")
+    hints = hint_missing_file_locations(
+        [str(wtree), str(main)], ["target.md"]
+    )
+    assert len(hints) == 1
+    assert "target.md" in hints[0]
+    assert str(wtree) not in hints[0]
+
+
+def test_hint_missing_file_locations_prunes_big_dirs(tmp_path: Path):
+    root = tmp_path / "main"
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "src").mkdir(parents=True)
+    (root / "node_modules" / "pkg" / "wanted.md").write_text(
+        "x", encoding="utf-8"
+    )
+    (root / "src" / "wanted.md").write_text("x", encoding="utf-8")
+    hints = hint_missing_file_locations([str(root)], ["wanted.md"])
+    assert len(hints) == 1
+    assert "src" in hints[0]
+    assert "node_modules" not in hints[0]
+
+
+def test_hint_missing_file_locations_caps_hints(tmp_path: Path):
+    root = tmp_path / "main"
+    root.mkdir()
+    for i in range(6):
+        (root / f"f{i}.md").write_text("x", encoding="utf-8")
+    hints = hint_missing_file_locations(
+        [str(root)], [f"f{i}.md" for i in range(6)]
+    )
+    assert len(hints) <= 4
 
 
 def test_select_tasks_single_approved():

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 
@@ -84,6 +85,20 @@ class VerifyMixin:
         if isinstance(tags, list) and "verify" in [str(x).lower() for x in tags]:
             return True
         return False
+
+    @staticmethod
+    def _verify_title_key(title: str | None) -> str:
+        """归一化 VERIFY 标题用于判重：去前缀/括号块/空白。
+
+        'VERIFY: 项9 演练（归零 CEO 配合）' 与
+        'VERIFY: 项9 演练（重建）' 归一到 '项9 演练' —— 同目标。
+        """
+        t = (title or "").strip()
+        if t.startswith("VERIFY:"):
+            t = t[len("VERIFY:"):].strip()
+        # 去括号块（中文/英文）
+        t = re.sub(r"[（(][^（）()]*[）)]", "", t)
+        return re.sub(r"\s+", " ", t).strip()
 
     async def _close_verify_and_parent(
         self, project_id: str, verify_task: dict
@@ -210,8 +225,25 @@ class VerifyMixin:
         *,
         except_id: str | None = None,
     ) -> int:
-        """Close/archive other open VERIFY children of the same parent."""
+        """Close/archive duplicate VERIFY children of the same parent.
+
+        只清理「真重复」：同为 *系统 spawn* 的 VERIFY: 任务（title 前缀
+        VERIFY:，tags 含 verify 的普通验证实施任务 **不是**）且标题归一化后
+        与本次收口的 VERIFY 相同。执行中/已提交/审查中（running/submitted/
+        reviewing/verifying/approved/blocked）一律跳过——TEST19 教训：
+        归零 approve 模块A 时把正在跑模块D 的普通验证任务（tags=verify）
+        当重复清扫，导致验证工作被系统重建 2 轮。
+        """
         await _ensure_schema(project_id)
+        except_task = (
+            await self.get_task(project_id, except_id) if except_id else None
+        )
+        except_title = (except_task or {}).get("title") or ""
+        # 只有「系统 spawn 的 VERIFY: 任务」收口才触发清扫——普通
+        # tags=verify 实施任务 approve 不派生清扫权（TEST19 教训）
+        if not (isinstance(except_title, str) and except_title.startswith("VERIFY:")):
+            return 0
+        except_key = self._verify_title_key(except_title)
         tasks = await self.list_tasks(project_id)
         closed = 0
         for t in tasks:
@@ -220,30 +252,43 @@ class VerifyMixin:
                 continue
             if t.get("parent_task_id") != parent_id:
                 continue
-            if not self._is_verify_task(t):
+            title = t.get("title") or ""
+            # 只认系统 VERIFY: 前缀（tags 含 verify 的普通任务不是重复）
+            if not (isinstance(title, str) and title.startswith("VERIFY:")):
                 continue
-            if t.get("status") in ("closed",):
+            if self._verify_title_key(title) != except_key:
+                log.info(
+                    "verify_sibling_skipped_different_target",
+                    task_id=tid,
+                    parent_id=parent_id,
+                    title=title[:60],
+                )
+                continue
+            st = t.get("status")
+            if st == "closed":
+                continue
+            if st in ("running", "submitted", "reviewing", "verifying",
+                      "approved", "blocked", "rework"):
+                # 执行中/审查中的重复 VERIFY 不自动杀——留给协调者裁决
+                log.warning(
+                    "verify_sibling_skipped_in_flight",
+                    task_id=tid,
+                    parent_id=parent_id,
+                    status=st,
+                    title=title[:60],
+                )
                 continue
             try:
-                # Prefer close when legal; else archive so they leave the ledger
-                st = t.get("status")
-                if st in ("approved", "verifying", "submitted", "reviewing"):
-                    # Force closed via archive path for non-closable states
-                    await self.archive_task(
-                        project_id,
-                        tid,
-                        archived_by="system",
-                        reason="sibling VERIFY closed; duplicate cleaned up",
-                    )
-                elif st in ("created", "claimed", "running", "blocked"):
-                    await self.archive_task(
-                        project_id,
-                        tid,
-                        archived_by="system",
-                        reason="sibling VERIFY closed; duplicate cleaned up",
-                    )
-                else:
-                    await self.close_task(project_id, tid)
+                # 仅剩 created/claimed 等未开始状态：确认重复后归档
+                await self.archive_task(
+                    project_id,
+                    tid,
+                    archived_by="system",
+                    reason=(
+                        f"duplicate VERIFY closed; sibling {except_id[:8]} "
+                        "succeeded, inactive duplicate cleaned up"
+                    ),
+                )
                 closed += 1
             except Exception as e:
                 log.warning(
