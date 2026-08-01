@@ -271,8 +271,10 @@ async def _search_keyless(
 
         # 所有后端全挂 → 显式失败，不要伪装成"无结果"
         # 否则 LLM 会误以为查询太冷门而反复换词搜索
+        cooled = [b for b in ("brave", "duckduckgo") if _backend_in_cooldown(b)]
+        suffix = f" (in cooldown: {', '.join(cooled)})" if cooled else ""
         raise RuntimeError(
-            f"All search backends failed: {'; '.join(errors)}"
+            f"All search backends failed: {'; '.join(errors)}{suffix}"
         )
 
 
