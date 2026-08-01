@@ -120,7 +120,8 @@ def test_format_results_empty_and_filled():
 # ── 后端 HTML 解析（Bing 为当前环境主路径）─────────────────
 
 
-def test_bing_parse_unescapes_title(monkeypatch):
+@pytest.mark.asyncio
+async def test_bing_parse_unescapes_title(monkeypatch):
     """Bing 页面解析：标题实体解码、snippet 提取、非 http 链接过滤。"""
     html = """
     <ol id="b_results">
@@ -147,9 +148,7 @@ def test_bing_parse_unescapes_title(monkeypatch):
         async def get(self, url, **kw):
             return _FakeResp()
 
-    results = __import__("asyncio").get_event_loop().run_until_complete(
-        ws._bing_search(_FakeClient(), "q", 5)
-    )
+    results = await ws._bing_search(_FakeClient(), "q", 5)
     assert [r["title"] for r in results] == ["FastAPI & Co", "Another Result"]
     assert results[0]["snippet"] == "The best <framework> ever."
     assert results[0]["url"] == "https://example.com/a"
