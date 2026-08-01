@@ -6,7 +6,7 @@ from typing import Any
 
 import structlog
 
-from .constants import TOOL_EXECUTION_TIMEOUT_S, _QUESTION_TOOL_TIMEOUT_S
+from .constants import TOOL_EXECUTION_TIMEOUT_S, _QUESTION_TOOL_TIMEOUT_S, _SUBAGENT_TOOL_TIMEOUT_S
 from .doom_loop import doom_loop_limit
 from .poll import (
     _POLL_HARD_REJECT_LIMIT,
@@ -165,6 +165,8 @@ class ToolExecMixin:
         tool_timeout = (
             _QUESTION_TOOL_TIMEOUT_S
             if tool_name == "question"
+            else _SUBAGENT_TOOL_TIMEOUT_S
+            if tool_name == "spawn_subagent"
             else TOOL_EXECUTION_TIMEOUT_S
         )
         try:

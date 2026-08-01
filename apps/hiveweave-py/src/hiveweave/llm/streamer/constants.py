@@ -123,3 +123,6 @@ TOOL_EXECUTION_TIMEOUT_S = 120.0
 # question waits on human answer (QUESTION_TIMEOUT_S=180) — must outlive that.
 _QUESTION_TOOL_TIMEOUT_S = 200.0
 
+# spawn_subagent 外层工具超时必须 > 子代理最大硬限(480s) + 余量
+_SUBAGENT_TOOL_TIMEOUT_S = 500
+

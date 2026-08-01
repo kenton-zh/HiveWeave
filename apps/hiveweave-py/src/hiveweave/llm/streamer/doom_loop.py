@@ -79,6 +79,7 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
     # 副作用工具 — 最低容忍，防止真实损害
     "bash": 3,
     "apply_patch": 3,
+    "spawn_subagent": 3,
     "websearch": 3,
     "execute_code": 3,
     # Paid Ark media — keep tight; retries burn quota
