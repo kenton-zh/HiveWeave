@@ -24,9 +24,12 @@ _COLS = (
 )
 
 
-def _mk_row(uid: str, model_id: str, active: int, updated_at: int) -> tuple:
+def _mk_row(
+    uid: str, model_id: str, active: int, updated_at: int, name: str | None = None
+) -> tuple:
+    name = name or f"name-{uid}"
     return (
-        uid, f"name-{uid}", model_id, "https://example.test/v3", f"key-{uid}",
+        uid, name, model_id, "https://example.test/v3", f"key-{uid}",
         "openai-compatible", 1000, 500, 0, None, None, active, None, None,
         1, updated_at,
     )
@@ -65,6 +68,49 @@ async def test_get_by_name_deterministic_latest_active():
             exact = await ms.get("uuid-old-active")
         assert exact is not None
         assert exact["id"] == "uuid-old-active"
+
+        with patch("hiveweave.services.model.meta_db") as meta:
+            meta.query_one = AsyncMock(side_effect=_run)
+            by_name = await ms.find_by_name("name-uuid-new-active")
+        assert by_name is not None
+        assert by_name["id"] == "uuid-new-active"
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_get_by_name_tie_breaks_by_id():
+    """is_active + updated_at 平局时按 id 倒序兜底，保证完全确定性。"""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(f"CREATE TABLE llm_models ({_COLS})")
+        conn.executemany(
+            f"INSERT INTO llm_models ({_COLS}) VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                _mk_row("uuid-a", "deepseek-v4-flash", 1, 100, name="平局名称"),
+                _mk_row("uuid-b", "deepseek-v4-flash", 1, 100, name="平局名称"),
+            ],
+        )
+        conn.commit()
+
+        ms = ModelService()
+        with patch("hiveweave.services.model.meta_db") as meta:
+            meta.query_one = AsyncMock(
+                side_effect=lambda sql, params: conn.execute(sql, params).fetchone()
+            )
+            row = await ms.get("deepseek-v4-flash")
+        assert row is not None
+        assert row["id"] == "uuid-b"
+
+        with patch("hiveweave.services.model.meta_db") as meta:
+            meta.query_one = AsyncMock(
+                side_effect=lambda sql, params: conn.execute(sql, params).fetchone()
+            )
+            by_name = await ms.find_by_name("平局名称")
+        assert by_name is not None
+        assert by_name["id"] == "uuid-b"
     finally:
         conn.close()
 
