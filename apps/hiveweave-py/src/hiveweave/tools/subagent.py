@@ -266,7 +266,7 @@ def _subagent_on_tool_call(
         except Exception as e:
             return {
                 "role": "tool",
-                "content": f"[tool error] {tool_name}: {type(e).__name__}: {e}",
+                "content": f"[Tool Error] {tool_name}: {type(e).__name__}: {e}",
                 "tool_call_id": tool_call_id,
             }
         content = result.get("output") or result.get("error") or "(empty)"
