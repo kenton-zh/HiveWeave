@@ -96,6 +96,58 @@ def normalize_files_changed(files: list[Any] | None) -> list[str]:
     return out
 
 
+def hint_missing_file_locations(
+    roots: list[str], missing_paths: list[str], max_hints: int = 4
+) -> list[str]:
+    """Leaf-name search under *roots* for *missing_paths*; return location hints.
+
+    submit_task 的 files_changed 存在性校验拒绝时，agent 常因前缀/目录传错
+    （TEST19：文件实际在 .hiveweave/reports/ 下，传了裸文件名）而困惑。
+    按叶子名搜索找回真实位置，错误消息给出「found at …」提示。
+    限量搜索（前 max_hints 个缺失路径、每路径最多 2 个命中）防性能问题；
+    os.walk 原地剪掉 node_modules/.venv/.git/dist 等大目录（.hiveweave
+    不剪——交付物常在其中）。
+    """
+    import os
+    from pathlib import Path as _PH
+
+    _SKIP_DIRS = {"node_modules", ".venv", "venv", ".git", "dist", "build"}
+
+    def _walk(root: _PH, name: str) -> list[str]:
+        hits: list[str] = []
+        try:
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [
+                    d for d in dirnames if d not in _SKIP_DIRS
+                ]
+                if name in filenames:
+                    hits.append(str(_PH(dirpath) / name))
+                    if len(hits) >= 2:
+                        break
+        except Exception:
+            pass
+        return hits
+
+    hints: list[str] = []
+    for fc in missing_paths[:max_hints]:
+        found: list[str] = []
+        for r in roots:
+            found.extend(_walk(_PH(r), fc))
+            if len(found) >= 2:
+                break
+        if found:
+            # 显示相对对应 root 的路径（agent 提交时用的是相对路径）
+            rel = found[0]
+            for r in roots:
+                try:
+                    rel = str(_PH(rel).relative_to(_PH(r)))
+                    break
+                except Exception:
+                    continue
+            hints.append(f"'{fc}' found at {rel} — use that relative path")
+    return hints
+
+
 def _rel_paths(files: list[Any]) -> list[str]:
     return normalize_files_changed(list(files or []))
 

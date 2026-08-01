@@ -406,6 +406,24 @@ curl http://localhost:4000/api/projects/<id>/activate
 
 > 个人开发环境配置见 CLAUDE.local.md（已 gitignore，不进仓库）
 
+### 行为数据导出（分析 agent 实际做了什么，首选）
+
+`GET /api/debug/project-export` 把项目运行时行为表导出为 JSON——**比直读 sqlite 安全**（SQL 白名单 + 截断），是行为审计（如「这个 agent 为什么失败/卡住」）的第一步：
+
+```bash
+# 项目 id 从 GET /api/projects 查（UUID，不是名字！TEST19 = 1a0b0ab5-696e-4f79-9159-e7783eec6512）
+curl "http://localhost:4000/api/debug/project-export?project_id=<UUID>&truncate=0" > all.json
+```
+
+- **默认导出 12 个核心行为表**：agents / tasks / task_events / agent_runs / run_steps / tool_attestations / chat_messages / work_logs / handoffs / inbox / memories / verification_cases
+- `tables=a,b,c` 过滤；`truncate=N` 长文本截断（0=不截断）；`max_rows=N` 每表行数上限（默认 20000）
+- `run_steps` 已 LEFT JOIN agent_runs 附带 `agent_id`（孤儿行 agent_id 为 null）
+- **task.archived 的 reason 在事件 `payload` JSON 里**（导出列无独立 reason 字段，脚本需解析 payload）
+- inbox 回复契约：ask 的 `reply_contract_id`，回复行的 `reply_to` 指向它（**不是** ask 的 id）；`message_type=ask` + `expect_report=1` 表示有回复义务
+- `chat_messages.role=user` 行是系统注入（Messages/Goals），不是真人消息；`role=team` 是 agent 间消息
+- 示例聚合脚本：`%LOCALAPPDATA%\Temp\opencode\test19_export\analyze*.py`（Counter 统计工具错误分布、task_events 时间线、ask 契约闭合率）
+- 注意：此端点无鉴权（同其他 debug 端点）；`uv run python -c` 内联会挂，分析脚本要落成文件跑
+
 ### 查看后端日志
 ```bash
 # 日志文件: tasks/ 目录下最新的 .output 文件

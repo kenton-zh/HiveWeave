@@ -474,12 +474,20 @@ async def submit_task_tool(
                 if not any((_PSub(r) / fc_clean).exists() for r in _roots):
                     missing_at_submit.append(fc_clean)
             if missing_at_submit:
+                from hiveweave.services.worktree_review import (
+                    hint_missing_file_locations as _hint,
+                )
+
+                hints = _hint(_roots, missing_at_submit)
+                root_note = " | ".join(f"root: {r}" for r in _roots)
                 return ToolResult.err(
                     "submit_task rejected: files_changed references paths "
                     "that do not exist on disk: "
                     + ", ".join(missing_at_submit[:8])
                     + ("…" if len(missing_at_submit) > 8 else "")
-                    + ". Ensure all deliverables are committed in your "
+                    + f". Checked: {root_note}. "
+                    + (" ".join(hints) + " " if hints else "")
+                    + "Ensure all deliverables are committed in your "
                     "worktree before submitting."
                 )
             if invisible_at_submit:

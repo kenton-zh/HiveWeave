@@ -1460,7 +1460,8 @@ async def _issue_test_run_attestation(
 
 @tool(
     "bash",
-    "Executes a shell command on the local system. Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command. For reviewer test_run binding pass taskId.",
+    "Executes a shell command on the local system (Git Bash on Windows). Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command. For reviewer test_run binding pass taskId.\n"
+    "Windows/Git Bash notes (TEST19): run Python via 'uv run python' (project has uv) or '.venv/Scripts/python.exe' — bare 'python' may not be on PATH. Do NOT use BSD-only flags like 'tail --ignore=' or 'head --ignore=' (GNU coreutils rejects them). Wildcards only expand if the path exists — 'hiveweav*-py' does not match. Prefer Windows paths for tools under D:/ and Git Bash paths (/d/...) for shell built-ins.",
     requires_workspace=True,
     security_level="shell",
 )
