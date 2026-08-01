@@ -53,6 +53,7 @@ import hiveweave.tools.browse_tools  # noqa: F401 — browse (gstack Chromium CL
 import hiveweave.tools.game_qa_tools  # noqa: F401 — game_run_case (H5 harness)
 import hiveweave.tools.vision_tools  # noqa: F401 — look_at_image (帮你看图片)
 import hiveweave.tools.image_gen_tools  # noqa: F401 — generate_image (Seedream)
+import hiveweave.tools.subagent  # noqa: F401 — registers spawn_subagent
 from hiveweave.tools.base import _TOOL_REGISTRY, list_tool_names  # noqa: F401
 from hiveweave.tools.result import ToolResult as ToolResultDataclass  # noqa: F401
 from hiveweave.tools.pipeline import ToolContext  # noqa: F401

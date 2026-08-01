@@ -357,6 +357,18 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["todos"],
     },
+    "spawn_subagent": {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string",
+                       "description": "具体任务：文件、目标、验收标准。"},
+            "description": {"type": "string",
+                            "description": "一句话任务描述。"},
+            "timeout_s": {"type": "integer", "minimum": 1, "maximum": 480,
+                          "description": "硬截止秒数（默认 240，上限 480）。"},
+        },
+        "required": ["prompt"],
+    },
     "send_message": {
         "description": (
             "Sends a message to agents. Prefer ask_agent (needs reply) or "
