@@ -33,6 +33,8 @@ DOOM_LOOP_READONLY_TOOLS: frozenset[str] = frozenset({
     # 日志 / 告警查询
     "read_work_logs",
     "list_alarms",
+    # 科学计算 — 纯函数幂等，心算错误代价高于重复计算
+    "calculate",
     # worktree 只读查询
     "git_worktree_list",
     "git_worktree_status",
