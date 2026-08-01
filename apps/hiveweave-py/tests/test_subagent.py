@@ -19,3 +19,21 @@ def test_spawn_subagent_in_all_family_lists():
 
 def test_spawn_subagent_doom_bucket_tight():
     assert doom_loop_limit("spawn_subagent") == 3
+
+
+from unittest.mock import AsyncMock, patch
+
+
+def test_extend_elapsed_budget_shifts_started_at():
+    from hiveweave.services.run_ledger import RunLedger
+
+    ledger = RunLedger()
+    execute = AsyncMock()
+    with patch("hiveweave.services.run_ledger.project_db.execute", execute):
+        # 不 await：execute 是 AsyncMock，直接调用返回 coroutine
+        import asyncio
+        asyncio.run(ledger.extend_elapsed_budget("a1", "r1", 240_000))
+
+    sql = execute.await_args.args[1]
+    assert "started_at = started_at - ?" in sql
+    assert execute.await_args.args[2] == [240_000, "r1"]
