@@ -81,9 +81,11 @@ class HireAgentParams(BaseModel):
     skills: list[str] | None = Field(
         default=None,
         description=(
-            'Skills to bind. Tool skills: use "#N" to reference skills '
-            "from list_available_skills by number. Discipline skills: "
-            "use full slug."
+            'Skills to bind. REQUIRED: at least one marketplace skill (from '
+            'list_available_skills market results, via "#N" or full slug) — '
+            'hiring with only built-in discipline skills is rejected. Tool '
+            'skills: use "#N" to reference skills from list_available_skills '
+            "by number. Discipline skills: use full slug."
         ),
     )
 
@@ -117,6 +119,36 @@ def _hire_permission_mode(perm_type: str, role: str) -> str:
 
     family = infer_role_family({"role": role, "permission_type": perm_type})
     return "readonly" if family in ("ceo", "hr") else "readwrite"
+
+
+def _hire_market_skill_gate(
+    skills: list[str],
+    seen_slugs: list[str],
+    builtin_lookup: Any,
+) -> str | None:
+    """市场技能强制门槛：HR 见过市场技能却全绑内置 → 返回错误消息，否则 None。
+
+    - skills 为空 → 放行（招人不强制技能）
+    - seen_slugs 里没有市场技能（市场不可达 / HR 没搜到）→ 放行，不卡死招聘
+    - skills 里含至少一个市场技能 → 放行
+    """
+    if not skills:
+        return None
+    seen_market = [s for s in seen_slugs if builtin_lookup(s) is None]
+    if not seen_market:
+        return None
+    if any(builtin_lookup(s) is None for s in skills):
+        return None
+    sample = ", ".join(seen_market[:3])
+    return (
+        "All requested skills are built-in, but marketplace skills "
+        f"were available in your search results (e.g. {sample}). "
+        "hire_agent requires at least one marketplace skill: "
+        're-run list_available_skills (try keywords like the '
+        'specialty itself, e.g. "frontend" / "testing" / "game") '
+        'and pass one of the market results via "#N" or its full '
+        "slug in skills."
+    )
 
 
 @tool(
@@ -304,6 +336,19 @@ async def hire_agent_tool(
                 "Raw tech names like 'React 18' are NOT valid slugs."
             )
         skills = valid_skills
+
+        # 市场技能强制：HR 本次会话已在 list_available_skills 结果里见过
+        # 市场技能（per-agent 搜索缓存含非内置 slug），却全部只绑内置技能 →
+        # 拒绝并要求至少选一个市场技能（避免"只绑纪律技能"导致市场白接）。
+        # 市场不可达时 list_available_skills 会从缓存清掉市场 slug，本检查
+        # 自动放行，不会卡死招聘（也不会与"bind built-in"提示自相矛盾）。
+        market_gate = _hire_market_skill_gate(
+            skills=skills,
+            seen_slugs=ctx.skills._skill_search_cache.get(agent_id, []),
+            builtin_lookup=ctx.skills._get_builtin_skill,
+        )
+        if market_gate:
+            return ToolResult.err(market_gate)
 
     # Hard org invariants (name / role / parent / span)
     from hiveweave.services.org_invariants import validate_hire
