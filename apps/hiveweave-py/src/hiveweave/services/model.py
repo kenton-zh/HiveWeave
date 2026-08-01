@@ -124,15 +124,17 @@ class ModelService:
         """Get a model by ID or model_id. Returns full api_key (not masked).
 
         契约 18: get_model — api_key 完整返回（Streamer 需完整 key 调 LLM）。
-        支持按 id（UUID）或 model_id（如 step-3.7-flash）查询，因为 agent.config
-        中存储的是 model_id 字段而非数据库主键。
+        支持按 id（UUID）或 model_id（如 step-3.7-flash）查询。
+        agents.model_id 优先存 UUID；存量数据可能为名称，此时同名多渠道
+        返回最近更新的活跃行（确定性兜底，而非物理顺序第一行）。
         """
         row = await meta_db.query_one(
             "SELECT id, name, model_id, base_url, api_key, provider_type, "
             "context_window, "
             "max_output_tokens, supports_thinking, default_reasoning_effort, "
             "temperature, is_active, fallback, tier, created_at, updated_at "
-            "FROM llm_models WHERE id = ? OR model_id = ? LIMIT 1",
+            "FROM llm_models WHERE id = ? OR model_id = ? "
+            "ORDER BY is_active DESC, updated_at DESC LIMIT 1",
             [model_pk, model_pk])
         if row is None:
             return None
@@ -143,7 +145,8 @@ class ModelService:
             "SELECT id, name, model_id, base_url, api_key, provider_type, "
             "context_window, max_output_tokens, supports_thinking, "
             "default_reasoning_effort, temperature, is_active, fallback, tier, "
-            "created_at, updated_at FROM llm_models WHERE name = ? LIMIT 1",
+            "created_at, updated_at FROM llm_models WHERE name = ? "
+            "ORDER BY is_active DESC, updated_at DESC LIMIT 1",
             [name],
         )
         return self._row_to_model(row, mask_key=False) if row else None

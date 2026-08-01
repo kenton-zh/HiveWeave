@@ -307,11 +307,12 @@ async def _seed_default_agents(project_id: str) -> list[str]:
     try:
         mgmt = await ms.resolve_model(tier="management")
         if mgmt:
-            mgmt_model_id = mgmt.get("model_id") or mgmt.get("id")
+            # 唯一 ID 优先：model_id 名称可重复（同名多渠道），存 UUID 避免运行时漂移
+            mgmt_model_id = mgmt.get("id") or mgmt.get("model_id")
             log.info("seed_model_tier_resolved", tier="management", model_id=mgmt_model_id)
         exec_m = await ms.resolve_model(tier="executor")
         if exec_m:
-            exec_model_id = exec_m.get("model_id") or exec_m.get("id")
+            exec_model_id = exec_m.get("id") or exec_m.get("model_id")
             log.info("seed_model_tier_resolved", tier="executor", model_id=exec_model_id)
     except Exception as e:
         log.warning("seed_tier_resolve_failed", error=str(e))
@@ -321,7 +322,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
         try:
             active_models = await ms.list_active()
             if active_models:
-                fallback_id = (active_models[-1].get("model_id") or active_models[-1].get("id"))
+                fallback_id = (active_models[-1].get("id") or active_models[-1].get("model_id"))
                 mgmt_model_id = mgmt_model_id or fallback_id
                 exec_model_id = exec_model_id or fallback_id
                 log.info("seed_default_model_fallback", default_model_id=fallback_id, total_models=len(active_models))
