@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 import uuid
 from typing import Any
 
@@ -30,9 +29,6 @@ from hiveweave.tools.result import ToolResult
 SUBAGENT_TIMEOUT_S = 240
 SUBAGENT_MAX_TIMEOUT_S = 480
 SUBAGENT_MAX_TOOL_ROUNDS = 100  # 与 run_ledger 默认 budget_tool_calls 一致
-
-# 子代理 commit_turn 本地结果：tool_call_id → {phase, summary}
-_subagent_results: dict[str, dict[str, str]] = {}
 
 
 class SpawnSubagentParams(BaseModel):
@@ -104,7 +100,10 @@ async def spawn_subagent_tool(
             )
         except Exception:
             pass
-    parent._extend_safety_timer(timeout_s)
+    try:
+        parent._extend_safety_timer(timeout_s)
+    except Exception:
+        pass
 
     try:
         result = await _run_subagent(
@@ -195,14 +194,12 @@ async def _run_subagent(
     #    但工具执行始终转发父的 agent_id（权限/硬门按父身份评估）。
     executor = parent._tool_executor
     sub_id = f"sub-{parent.id}-{uuid.uuid4().hex[:8]}"
+    holder: dict[str, dict[str, str]] = {}
     on_tool_call = _subagent_on_tool_call(
-        parent, executor, workspace, project_root
+        parent, executor, workspace, project_root, holder
     )
 
-    try:
-        streamer = Streamer(max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS)
-    except TypeError:  # 测试替身兼容：无 __init__ 的假 Streamer 也照常跑
-        streamer = Streamer()
+    streamer = Streamer(max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS)
     try:
         result = await asyncio.wait_for(
             streamer.stream(
@@ -226,8 +223,8 @@ async def _run_subagent(
     if result.get("status") != "ok":
         return result
     text = (result.get("content") or "").strip()
-    # 附加 commit 摘要（若有）— 父拿到的结果更完整
-    for tid, tr in _subagent_results.items():
+    # 附加 commit 摘要（若有）— 只读本子代理自己的 holder，与其他 spawn 隔离
+    for tr in holder.values():
         if tr.get("phase") != "in_progress":
             text = f"{text}\n\n[commit] {tr.get('phase')}: {tr.get('summary')}"
             break
@@ -235,17 +232,24 @@ async def _run_subagent(
 
 
 def _subagent_on_tool_call(
-    parent: Any, executor: Any, workspace: str, project_root: str | None
+    parent: Any,
+    executor: Any,
+    workspace: str,
+    project_root: str | None,
+    holder: dict[str, dict[str, str]] | None = None,
 ):
     """Build the subagent's tool-call callback.
 
-    commit_turn 被本地拦截：写入 _subagent_results（按 tool_call_id），
-    返回 end_turn=True —— 绝不碰父的 turn_session / work_log / 门禁。
-    其余工具转发给 ToolExecutor，agent_id 用父的（权限继承）。
+    commit_turn 被本地拦截：写入本回调独用的 holder（未传则自建，与任何
+    其他 spawn 隔离），返回 end_turn=True —— 绝不碰父的 turn_session /
+    work_log / 门禁。其余工具转发给 ToolExecutor，agent_id 用父的（权限继承）。
     """
+    if holder is None:
+        holder = {}
+
     async def callback(tool_name: str, arguments: str, tool_call_id: str) -> dict:
         if tool_name == "commit_turn":
-            return await _subagent_commit(arguments, tool_call_id)
+            return await _subagent_commit(arguments, tool_call_id, holder)
 
         try:
             tool_args = json.loads(arguments) if arguments else {}
@@ -275,7 +279,9 @@ def _subagent_on_tool_call(
     return callback
 
 
-async def _subagent_commit(arguments: str, tool_call_id: str) -> dict:
+async def _subagent_commit(
+    arguments: str, tool_call_id: str, holder: dict[str, dict[str, str]]
+) -> dict:
     """Minimal local commit for the subagent (no gates, no persistence)."""
     try:
         args = json.loads(arguments) if arguments else {}
@@ -293,7 +299,7 @@ async def _subagent_commit(arguments: str, tool_call_id: str) -> dict:
             "tool_call_id": tool_call_id,
             "end_turn": False,
         }
-    _subagent_results[tool_call_id] = {
+    holder[tool_call_id] = {
         "phase": phase,
         "summary": summary[:2000],
     }
