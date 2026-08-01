@@ -11,6 +11,9 @@
 
 from __future__ import annotations
 
+import re
+import time
+
 from fastapi import APIRouter, HTTPException, Query
 
 import structlog
@@ -394,4 +397,99 @@ def _build_turn(turn_index: int, messages: list[dict]) -> dict:
         "summary": summary,
         "message_count": len(raw_messages),
         "raw_messages": raw_messages,
+    }
+
+
+# ── 项目行为数据导出（行为审计 / BUG 分析用）──────────────────
+
+_EXPORT_TABLES = [
+    "agents", "tasks", "task_events", "agent_runs", "run_steps",
+    "tool_attestations", "chat_messages", "work_logs", "handoffs",
+    "inbox", "memories", "verification_cases",
+]
+
+# run_steps 无 agent_id 列，需 join agent_runs 补上（LEFT：孤儿行保留，agent_id 为 NULL）
+_STEP_JOIN_SQL = (
+    "SELECT rs.*, ar.agent_id FROM run_steps rs "
+    "LEFT JOIN agent_runs ar ON ar.id = rs.run_id"
+)
+
+_TABLE_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def _truncate_value(v, limit: int):
+    """长文本截断（保留前缀 + 截断标记），保护响应体积。"""
+    if isinstance(v, str) and limit and len(v) > limit:
+        return v[:limit] + f"...[truncated {len(v) - limit} chars]"
+    return v
+
+
+@router.get("/project-export")
+async def project_export(
+    project_id: str = Query(...),
+    tables: str | None = Query(default=None),
+    truncate: int = Query(default=2000, ge=0),
+    max_rows: int = Query(default=20000, ge=0),
+) -> dict:
+    """导出项目运行时行为数据（调试 / 行为审计用）。
+
+    返回各表行（每表最多 max_rows 行）；run_steps 附 agent_id
+    （LEFT JOIN agent_runs，孤儿行 agent_id 为 null）。
+    - tables: 逗号分隔表名过滤（默认核心表集合，仅接受合法表名）
+    - truncate: 长文本截断长度（0 = 不截断）
+    - max_rows: 每表最大行数（0 = 不限）
+    """
+    from hiveweave.db import project as project_db
+
+    # 直接调用（绕过 FastAPI 注入）时参数是 Query 对象，兜底为默认值
+    if not isinstance(truncate, int):
+        truncate = 2000
+    if not isinstance(max_rows, int):
+        max_rows = 20000
+
+    try:
+        conn = await project_db.get_project_db_by_project_id(project_id)
+    except project_db.ProjectDbError:
+        raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+
+    wanted = []
+    for t in (tables or ",".join(_EXPORT_TABLES)).split(","):
+        t = t.strip()
+        if t and t not in wanted and _TABLE_NAME_RE.match(t):
+            wanted.append(t)
+    cursor = await conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    )
+    existing = {r["name"] for r in await cursor.fetchall()}
+    await cursor.close()
+
+    out: dict[str, list] = {}
+    counts: dict[str, int] = {}
+    for t in wanted:
+        if t not in existing:
+            counts[t] = -1
+            continue
+        sql = _STEP_JOIN_SQL if t == "run_steps" else f"SELECT * FROM {t}"
+        if max_rows:
+            sql += " LIMIT ?"
+            cursor = await conn.execute(sql, [max_rows])
+        else:
+            cursor = await conn.execute(sql)
+        rows = await cursor.fetchall()
+        await cursor.close()
+        if truncate:
+            rows = [
+                {k: _truncate_value(v, truncate) for k, v in dict(r).items()}
+                for r in rows
+            ]
+        else:
+            rows = [dict(r) for r in rows]
+        out[t] = rows
+        counts[t] = len(rows)
+
+    return {
+        "projectId": project_id,
+        "generatedAt": int(time.time() * 1000),
+        "counts": counts,
+        "tables": out,
     }
