@@ -134,7 +134,7 @@ class ModelService:
             "max_output_tokens, supports_thinking, default_reasoning_effort, "
             "temperature, is_active, fallback, tier, created_at, updated_at "
             "FROM llm_models WHERE id = ? OR model_id = ? "
-            "ORDER BY is_active DESC, updated_at DESC LIMIT 1",
+            "ORDER BY is_active DESC, updated_at DESC, id DESC LIMIT 1",
             [model_pk, model_pk])
         if row is None:
             return None
@@ -146,7 +146,7 @@ class ModelService:
             "context_window, max_output_tokens, supports_thinking, "
             "default_reasoning_effort, temperature, is_active, fallback, tier, "
             "created_at, updated_at FROM llm_models WHERE name = ? "
-            "ORDER BY is_active DESC, updated_at DESC LIMIT 1",
+            "ORDER BY is_active DESC, updated_at DESC, id DESC LIMIT 1",
             [name],
         )
         return self._row_to_model(row, mask_key=False) if row else None
