@@ -45,15 +45,22 @@ CLAWHUB_TIMEOUT = 5.0  # 契约 10: 5s 超时，失败静默降级
 # skills.sh — Open Agent Skills Ecosystem (https://www.skills.sh)
 # 技能格式: owner/repo/skill-name (e.g. anthropics/skills/frontend-design)
 # SKILL.md 内容在详情页服务端渲染，可直接 httpx 抓取。
+# 搜索源：sitemap 全量索引（约 2 万技能）优先，首页抓取兜底。
 SKILLS_SH_BASE_URL = "https://www.skills.sh"
 SKILLS_SH_TIMEOUT = 8.0  # skills.sh 页面较大，给 8s
+SKILLS_SH_MAX_RESULTS = 10  # 搜索结果上限（HR 选择空间，不过多占用上下文）
+SKILLS_SH_SITEMAP_URLS = (
+    "https://www.skills.sh/sitemap-skills-1.xml",
+    "https://www.skills.sh/sitemap-skills-2.xml",
+)
+SKILLS_SH_INDEX_TTL = 3600.0  # sitemap 全量索引缓存 1 小时
 
 # SkillHub — 国内技能商店 (https://skillhub.cn)
 # 当 skills.sh 不可达时自动降级到 SkillHub HTTP API 搜索。
 # 仅返回 labels.requires_api_key == "false" 的技能（商店标注，非自行判断）。
 SKILLHUB_SEARCH_URL = settings.skillhub_search_url  # https://lightmake.site/api/v1/search
 SKILLHUB_TIMEOUT = 8.0
-SKILLHUB_MAX_RESULTS = 3  # 与 skills.sh 一致，给 HR 选择空间但不过多占用上下文
+SKILLHUB_MAX_RESULTS = 10  # 与 skills.sh 一致，给 HR 选择空间但不过多占用上下文
 SKILLHUB_SOURCE_LABEL = "SkillHub (国内)"
 
 
@@ -678,6 +685,160 @@ def _filter_skills(skills: list[dict], search: str | None) -> list[dict]:
     ]
 
 
+# 非技能路径：导航 / 分类 / 内部页，抓取时排除。
+# 用「/」分隔的路径段匹配（而非裸词 startswith）：裸词 "hot" 会误杀
+# hotcoffeeshake/... 这类真实技能 owner。单段导航页（/hot、/search）由
+# _slug_from_sitemap_url 的 len(parts) < 3 规则过滤，这里只需管多段路径。
+_NON_SKILL_PATH_SEGMENTS = frozenset({
+    "topic",
+    "agent",
+    "agents",
+    "docs",
+    "site",
+    "search",
+    "trending",
+    "hot",
+    "internal",
+    "api",
+    "tags",
+})
+
+# 资源文件扩展名白名单（_slug_from_sitemap_url 用）：含点技能名
+# （monday.com-automation / veo-3.2-prompter / dotnet-framework-4.8-expert）
+# 不是资源文件，不能用「任意点号」判定。
+_SKILL_RESOURCE_EXTENSIONS = frozenset({
+    "ico", "svg", "png", "jpg", "jpeg", "gif", "webp", "css", "js", "map",
+})
+
+
+def _slug_from_sitemap_url(url: str) -> str | None:
+    """从 skills.sh sitemap URL 提取技能 slug（owner/repo/skill-name）。
+
+    排除非技能页面（topic/agent/docs 等导航）和资源文件（svg/png 等）。
+    """
+    base = SKILLS_SH_BASE_URL.rstrip("/") + "/"
+    if url.startswith(base):
+        path = url[len(base):]
+    else:
+        # 兜底：按 // 切出路径
+        path = url.split("//", 1)[-1].split("/", 1)[-1] if "//" in url else url
+    path = path.split("#")[0].split("?")[0].rstrip("/")
+    if not path:
+        return None
+    parts = path.split("/")
+    if parts[0] in _NON_SKILL_PATH_SEGMENTS:
+        return None
+    # 资源文件：按扩展名白名单判定，含点技能名不受影响
+    last = parts[-1]
+    if "." in last and last.rsplit(".", 1)[-1].lower() in _SKILL_RESOURCE_EXTENSIONS:
+        return None
+    if len(parts) < 3:  # 技能 slug 至少 owner/repo/skill-name
+        return None
+    return "/".join(parts)
+
+
+def _filter_skill_slugs(slugs: list[str], search: str | None) -> list[str]:
+    """在技能 slug 列表上做关键词过滤（大小写不敏感，忽略非字母数字）。
+
+    多词搜索取交集（AND）："three js" → 需同时含 three 与 js。
+    "Three.js" → 归一化为 "threejs" 匹配 cloudai-x/threejs-skills/*。
+    """
+    if not search:
+        return list(slugs)
+    tokens = [t for t in re.split(r"[^a-zA-Z0-9]+", search.lower()) if t]
+    if not tokens:
+        return list(slugs)
+    return [
+        s for s in slugs
+        if all(t in re.sub(r"[^a-zA-Z0-9]", "", s.lower()) for t in tokens)
+    ]
+
+
+def _collect_skills_sh_results(
+    candidates: list[str], details: list[Any]
+) -> list[dict]:
+    """将 (candidate, detail) 组装为搜索结果，过滤需 API key 的技能。
+
+    供 sitemap 与 homepage 两条搜索路径共用（避免两份循环漂移）：
+    - detail 为 dict 且 requires_api_key → 跳过（SkillsHub 标签等价语义）
+    - detail 为 None（抓取失败）→ 保留（未判定需 key，不丢召回）
+    - 截断到 SKILLS_SH_MAX_RESULTS
+    """
+    skills: list[dict] = []
+    for slug, detail in zip(candidates, details):
+        parts = slug.split("/")
+        skill_name = parts[-1] if parts else slug
+        if isinstance(detail, dict) and detail:
+            if detail.get("requires_api_key"):
+                continue
+            summary = detail.get("summary") or detail.get("description") or ""
+            skills.append({
+                "slug": slug,
+                "summary": f"{skill_name}: {summary}" if summary else f"{skill_name} — from {parts[0]}/{parts[1]}",
+                "description": summary or "",
+                "displayName": skill_name,
+            })
+        else:
+            skills.append({
+                "slug": slug,
+                "summary": f"{skill_name} — from {parts[0]}/{parts[1]}",
+                "description": "",
+                "displayName": skill_name,
+            })
+        if len(skills) >= SKILLS_SH_MAX_RESULTS:
+            break
+    return skills
+
+
+# ── API key 启发式检测（skills.sh 无商店标注，从 SKILL.md 内容推断）──
+# 1. 环境变量名：如 OPENAI_API_KEY / ANTHROPIC_API_KEY / GITHUB_TOKEN / AZURE_OPENAI_KEY
+#    前缀至少 4 字符（排除 API_KEY / JWT_TOKEN 等通用占位符——安全审计类
+#    技能描述里 "hardcoded API_KEY values" 不应判为要求自备 key）
+# 2. 语境短语："requires an API key" / "you'll need an API key" / "set the API key" 等
+# 3. 否定语境（"optional" / "if … not set" / "if you don't have"）不判为要求
+_API_KEY_ENV_RE = re.compile(
+    r"\b[A-Z][A-Z0-9_]{4,}_(?:API_)?(?:KEY|TOKEN|SECRET)\b"
+)
+_API_KEY_OPTIONAL_CONTEXT_RE = re.compile(
+    r"(?i)\b(?:optional(?:ly)?|if you don'?t have|if .{0,40}not set|"
+    r"not required|no api key needed)\b"
+)
+_API_KEY_PHRASE_RE = re.compile(
+    r"(?i)\b(?:requires?|need[s]?|must|you'?ll need|you will need|"
+    r"you need to (?:set|configure|provide|create|get)|"
+    r"must use (?:the )?|set (?:the )?(?:an )?|"
+    r"configure (?:the )?(?:an )?|"
+    r"provide (?:the )?(?:an )?|get (?:the )?(?:an )?|"
+    r"request (?:the )?(?:an )?|sign up for (?:the )?(?:an )?)\s*"
+    r"(?:an? )?\s*api\s*(?:key|token)\b"
+)
+
+
+def _skill_md_requires_api_key(md: str) -> bool:
+    """启发式判断 SKILL.md 是否要求用户自备 API key。
+
+    skills.sh 详情页没有 SkillHub 那样的 requires_api_key 标签，
+    只能从内容推断：出现环境变量名（*_API_KEY / *_TOKEN / *_SECRET）
+    或「requires/need/set … API key」类短语即视为需要 API key。
+
+    避免误报：
+    - 环境变量名要求前缀 ≥4 字符，排除 API_KEY / JWT_TOKEN 占位符
+    - 否定语境（optional / if … not set / not required）内出现的
+      环境变量名不判为要求（如 "if OPENAI_API_KEY is not set, the
+      skill still works with local models"）
+    - 单纯 "API key" 名词出现（"how to use your API key"）不算要求
+    """
+    if not md:
+        return False
+    for m in _API_KEY_ENV_RE.finditer(md):
+        # 环境变量名前后窗口内出现否定语境（"if … not set" 可横跨命中）→ 跳过
+        window = md[max(0, m.start() - 80): m.end() + 60]
+        if _API_KEY_OPTIONAL_CONTEXT_RE.search(window):
+            continue
+        return True
+    return bool(_API_KEY_PHRASE_RE.search(md))
+
+
 def _parse_frontmatter(path: Path) -> dict[str, str] | None:
     """解析 SKILL.md 的 YAML frontmatter（name, description）。
 
@@ -829,9 +990,88 @@ class SkillRegistryService:
         - []    → 商店可达但无匹配结果
         - [...] → 正常搜索结果
 
-        抓取 leaderboard 页面，正则提取技能 slug（owner/repo/skill-name）。
+        搜索源：sitemap 全量索引（约 2 万技能 URL）优先，客户端做关键词过滤；
+        sitemap 不可达时降级为首页抓取（老逻辑）；两者都失败返回 None。
         为每个候选并发抓取详情页 summary，让 HR 有描述可看。
-        如果有 search 参数，在客户端做关键词过滤。
+        """
+        try:
+            slugs = await self._fetch_skills_sh_sitemap()
+            if slugs:
+                return await self._search_skills_sh_slugs(slugs, search)
+            return await self._search_skills_sh_homepage(search)
+        except Exception as e:
+            log.debug("skills_sh_unreachable", error=str(e))
+            return None
+
+    async def _search_skills_sh_slugs(
+        self, slugs: list[str], search: str | None
+    ) -> list[dict]:
+        """在给定技能 slug 集合中做客户端关键词过滤，返回前 N 个带 summary 的结果。
+
+        与 SkillHub 一致，过滤掉需要 API key 的技能（skills.sh 无商店标注，
+        用 _skill_md_requires_api_key 启发式检测）；多取候选（3x）以补足数量。
+        """
+        matches = _filter_skill_slugs(slugs, search)
+        if not matches:
+            return []
+        # 3x 候选窗口：过滤需 API key 的技能后仍可补足 SKILLS_SH_MAX_RESULTS。
+        # 注意：sitemap 顺序非热度排序，无关键词时返回前 30 个的过滤结果；
+        # 若前 30 里需 key 的过多，结果可能 <10 甚至 []——[] 表示"商店可达
+        # 但无匹配"，不会触发 SkillHub 降级（与 SkillHub 搜索的 [] 语义一致）。
+        candidates = matches[: SKILLS_SH_MAX_RESULTS * 3]
+
+        # 并发抓取每个候选的详情页 summary（让 HR 有描述可看）
+        details = await asyncio.gather(
+            *[self._fetch_skills_sh_detail(s) for s in candidates],
+            return_exceptions=True,
+        )
+
+        return _collect_skills_sh_results(candidates, details)
+
+    # Sitemap 全量索引缓存：slug 列表 + 抓取时间戳
+    _sitemap_slugs: list[str] | None = None
+    _sitemap_fetched_at: float = 0.0
+
+    async def _fetch_skills_sh_sitemap(self) -> list[str]:
+        """抓取 skills.sh sitemap 全量技能 URL 列表（约 2 万），带 1h 内存缓存。
+
+        失败（任一 sitemap 均不可达）返回 []，调用方降级到首页抓取。
+        """
+        now = time.monotonic()
+        if (
+            SkillRegistryService._sitemap_slugs is not None
+            and now - SkillRegistryService._sitemap_fetched_at < SKILLS_SH_INDEX_TTL
+        ):
+            return SkillRegistryService._sitemap_slugs
+
+        all_slugs: list[str] = []
+        seen: set[str] = set()
+        try:
+            async with httpx.AsyncClient(timeout=SKILLS_SH_TIMEOUT) as client:
+                for url in SKILLS_SH_SITEMAP_URLS:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+                    for loc in re.findall(r"<loc>(.*?)</loc>", resp.text):
+                        slug = _slug_from_sitemap_url(loc)
+                        if slug and slug not in seen:
+                            seen.add(slug)
+                            all_slugs.append(slug)
+        except Exception as e:
+            log.debug("skills_sh_sitemap_failed", error=str(e))
+            return []
+
+        if all_slugs:
+            SkillRegistryService._sitemap_slugs = all_slugs
+            SkillRegistryService._sitemap_fetched_at = now
+            log.debug("skills_sh_sitemap_index", count=len(all_slugs))
+        return all_slugs
+
+    async def _search_skills_sh_homepage(self, search: str | None = None) -> list[dict] | None:
+        """降级路径：抓取 leaderboard 首页 HTML，正则提取技能 slug，客户端过滤。
+
+        与 _search_skills_sh_slugs 语义一致；首页只有热门技能（约 200 个），
+        覆盖不全 —— sitemap 不可达时才走此路径。
         """
         try:
             async with httpx.AsyncClient(timeout=SKILLS_SH_TIMEOUT) as client:
@@ -847,11 +1087,10 @@ class SkillRegistryService:
             raw_matches = re.findall(pattern, html)
 
             # 去重 + 过滤非技能路径，按热度排序（leaderboard 本身按安装量降序）
-            # 只取前 3 个匹配的，给 HR 选择空间但不过多占用上下文
             seen: set[str] = set()
             candidates: list[str] = []
             for slug in raw_matches:
-                # 排除导航路径
+                # 排除导航路径 / 资源文件（svg 等）
                 if slug in ("trending", "hot"):
                     continue
                 if slug.startswith(("topic/", "site/")):
@@ -860,17 +1099,13 @@ class SkillRegistryService:
                     continue
                 seen.add(slug)
 
-                # 从 slug 提取 skill-name 作为显示名
-                parts = slug.split("/")
-                skill_name = parts[-1] if parts else slug
-
                 # 如果有 search，做客户端过滤
                 if search:
-                    if search.lower() not in slug.lower() and search.lower() not in skill_name.lower():
+                    if search.lower() not in slug.lower():
                         continue
 
                 candidates.append(slug)
-                if len(candidates) >= 3:
+                if len(candidates) >= SKILLS_SH_MAX_RESULTS * 3:
                     break
 
             if not candidates:
@@ -882,27 +1117,7 @@ class SkillRegistryService:
                 return_exceptions=True,
             )
 
-            skills: list[dict] = []
-            for slug, detail in zip(candidates, details):
-                parts = slug.split("/")
-                skill_name = parts[-1] if parts else slug
-                if isinstance(detail, dict) and detail:
-                    summary = detail.get("summary") or detail.get("description") or ""
-                    skills.append({
-                        "slug": slug,
-                        "summary": f"{skill_name}: {summary}" if summary else f"{skill_name} — from {parts[0]}/{parts[1]}",
-                        "description": summary or "",
-                        "displayName": skill_name,
-                    })
-                else:
-                    skills.append({
-                        "slug": slug,
-                        "summary": f"{skill_name} — from {parts[0]}/{parts[1]}",
-                        "description": "",
-                        "displayName": skill_name,
-                    })
-
-            return skills
+            return _collect_skills_sh_results(candidates, details)
         except Exception as e:
             log.debug("skills_sh_unreachable", error=str(e))
             return None
@@ -912,6 +1127,11 @@ class SkillRegistryService:
 
         抓取 https://www.skills.sh/{slug} 页面，提取 SKILL.md 段落内容。
         结果缓存在内存中避免重复抓取。
+
+        返回的 dict 含 `requires_api_key: bool` —— skills.sh 无显式
+        requires_api_key 标签（SkillHub 才有），这里用启发式检测
+        SKILL.md / summary 中的环境变量与短语线索（等价于 SkillHub 的
+        labels.requires_api_key=="true"，即「商店标注需要 API key」）。
         """
         # 检查缓存
         if slug in self._skills_sh_cache:
@@ -933,11 +1153,16 @@ class SkillRegistryService:
             # 提取 summary（页面上 Summary 段落的描述）
             summary = self._extract_summary(html)
 
+            requires_key = _skill_md_requires_api_key(
+                (skill_md or "") + " " + (summary or "")
+            )
+
             result = {
                 "slug": slug,
                 "summary": summary or slug,
                 "description": summary or "",
                 "skill_md": skill_md or f"# {slug.split('/')[-1]}\n\nNo SKILL.md content available.",
+                "requires_api_key": requires_key,
             }
 
             # 缓存
@@ -1161,9 +1386,13 @@ class SkillRegistryService:
         read_skill / get_skill_detail 复用，避免「搜得到却绑不上 / 加载不到」。
 
         返回 (detail, source_label)；两者皆不可用 → (None, "")。
+
+        与 SkillHub 一致：需要 API key 的技能视为不可用（skills.sh 用
+        启发式检测 _skill_md_requires_api_key，SkillHub 用商店标签），
+        保证「搜不到」与「绑不上」行为统一。
         """
         detail = await self._fetch_skills_sh_detail(slug)
-        if detail is not None:
+        if detail is not None and not detail.get("requires_api_key"):
             return detail, "skills.sh Marketplace"
         detail = await self._fetch_skillhub_detail(slug)
         if detail is not None:
@@ -1212,6 +1441,17 @@ class SkillRegistryService:
         # 所有结果统一编号，存入 per-agent 缓存
         # 序号从缓存已有数量 +1 开始，确保多次搜索序号连续且唯一
         existing_cache = self._skill_search_cache.get(agent_id, []) if agent_id else []
+        if not remote_skills and existing_cache:
+            # 市场不可达（或本次搜索无市场结果）：旧的市场 slug 已不可绑。
+            # 清掉避免 hire 门槛误伤——否则 tail 提示 "bind built-in skills"
+            # 但 gate 仍因缓存里的过期市场 slug 拒绝，会话内死锁。
+            # 内置 slug 保留，序号仍连续。
+            existing_cache = [
+                s for s in existing_cache
+                if SkillRegistryService._get_builtin_skill(s) is not None
+            ]
+            if agent_id:
+                self._skill_search_cache[agent_id] = existing_cache
         all_slugs: list[str] = []
         lines: list[str] = []
         idx = len(existing_cache)  # 续编号
@@ -1250,11 +1490,26 @@ class SkillRegistryService:
 
         q = chr(34)
         header = f'Available Skills{f" (search: {q}{search}{q})" if search else ""}:\n\n'
+        tail = (
+            "\n\nIMPORTANT: hire_agent REQUIRES at least one marketplace skill "
+            "when marketplace results are available. Pass market skills via "
+            '"#N" or their full slug in hire_agent skills.'
+        )
+        if remote_skills:
+            tail += (
+                " To find more, re-run list_available_skills with a keyword "
+                "describing the specialty (e.g. \"frontend\", \"testing\", "
+                '"game", "three") — the marketplace index covers ~20k skills.'
+            )
+        else:
+            tail += (
+                " Marketplace is currently unreachable — search again later "
+                "or bind built-in skills for now."
+            )
         return (
             header
             + "\n".join(lines)
-            + "\n\nTo bind a skill in hire_agent, use \"#N\" (e.g. \"#1\") to reference by number, "
-            "or use the full slug. Discipline skills from the matching table use full slug."
+            + tail
         )
 
     def resolve_skill_ref(self, agent_id: str, ref: str) -> str | None:

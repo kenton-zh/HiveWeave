@@ -14,15 +14,23 @@ import pytest
 
 from hiveweave.services.skill_registry import (
     SKILLHUB_SOURCE_LABEL,
+    SKILLS_SH_MAX_RESULTS,
     SkillRegistryService,
+    _filter_skill_slugs,
+    _skill_md_requires_api_key,
+    _slug_from_sitemap_url,
 )
 
 
 @pytest.fixture(autouse=True)
 def _clear_skillhub_cache():
     SkillRegistryService._skillhub_detail_cache.clear()
+    SkillRegistryService._sitemap_slugs = None
+    SkillRegistryService._sitemap_fetched_at = 0.0
     yield
     SkillRegistryService._skillhub_detail_cache.clear()
+    SkillRegistryService._sitemap_slugs = None
+    SkillRegistryService._sitemap_fetched_at = 0.0
 
 
 def _sh_detail(slug: str) -> dict:
@@ -209,3 +217,313 @@ def _async(value):
     async def _coro(*args, **kwargs):
         return value
     return _coro
+
+
+# ── sitemap 全量索引搜索（修复"只能搜首页"的覆盖瓶颈）────────
+
+
+def test_slug_from_sitemap_url_filters_non_skills():
+    """sitemap URL 解析：只留 owner/repo/skill-name，排除导航/资源文件。"""
+    assert _slug_from_sitemap_url("https://www.skills.sh/anthropics/skills/frontend-design") == "anthropics/skills/frontend-design"
+    assert _slug_from_sitemap_url("https://www.skills.sh/topic/react") is None
+    assert _slug_from_sitemap_url("https://www.skills.sh/docs/cli") is None
+    assert _slug_from_sitemap_url("https://www.skills.sh/agent/claude-code") is None
+    assert _slug_from_sitemap_url("https://www.skills.sh/trending") is None
+    assert _slug_from_sitemap_url("https://www.skills.sh/favicon.ico") is None
+    assert _slug_from_sitemap_url("https://www.skills.sh/a/b/c.svg") is None
+    # 裸词前缀不误杀：owner 以 hot/search 开头的真实技能保留
+    assert _slug_from_sitemap_url("https://www.skills.sh/hotcoffeeshake/tong-jincheng-skill/tong-jincheng-perspective") == "hotcoffeeshake/tong-jincheng-skill/tong-jincheng-perspective"
+    # 含点技能名不是资源文件：按扩展名白名单判定
+    assert _slug_from_sitemap_url("https://www.skills.sh/claude-office-skills/skills/monday.com-automation") == "claude-office-skills/skills/monday.com-automation"
+    assert _slug_from_sitemap_url("https://www.skills.sh/pexoai/pexo-skills/veo-3.2-prompter") == "pexoai/pexo-skills/veo-3.2-prompter"
+    assert _slug_from_sitemap_url("https://www.skills.sh/404kidwiz/claude-supercode-skills/dotnet-framework-4.8-expert") == "404kidwiz/claude-supercode-skills/dotnet-framework-4.8-expert"
+
+
+def test_filter_skill_slugs_multiword_and_normalized():
+    """关键词过滤：忽略非字母数字，多词取交集，支持 Three.js → threejs。"""
+    slugs = [
+        "cloudai-x/threejs-skills/threejs-animation",
+        "cloudai-x/threejs-skills/threejs-shaders",
+        "wshobson/agents/typescript-advanced-types",
+        "anthropics/skills/frontend-design",
+    ]
+    assert _filter_skill_slugs(slugs, "Three.js") == [
+        "cloudai-x/threejs-skills/threejs-animation",
+        "cloudai-x/threejs-skills/threejs-shaders",
+    ]
+    assert _filter_skill_slugs(slugs, "three animation") == [
+        "cloudai-x/threejs-skills/threejs-animation",
+    ]
+    assert _filter_skill_slugs(slugs, "frontend") == [
+        "anthropics/skills/frontend-design",
+    ]
+    assert _filter_skill_slugs(slugs, None) == slugs
+    assert _filter_skill_slugs(slugs, "zzz") == []
+
+
+@pytest.mark.asyncio
+async def test_search_skills_sh_slugs_caps_at_max_results(monkeypatch):
+    """搜索命中数超过 SKILLS_SH_MAX_RESULTS 时截断。"""
+    svc = SkillRegistryService()
+    slugs = [f"owner/repo/skill-{i}" for i in range(20)]
+    # 全部命中"skill"
+    detail = {"slug": "x", "summary": "s", "skill_md": "# x\n\nbody"}
+    monkeypatch.setattr(svc, "_fetch_skills_sh_detail", _async(detail))
+    out = await svc._search_skills_sh_slugs(slugs, "skill")
+    assert len(out) == SKILLS_SH_MAX_RESULTS
+
+
+@pytest.mark.asyncio
+async def test_fetch_sitemap_index_parses_urls(monkeypatch):
+    """sitemap 抓取：解析 <loc>，过滤非技能路径，缓存命中。"""
+    import hiveweave.services.skill_registry as reg
+
+    xml_1 = """<?xml version="1.0"?><urlset>
+      <url><loc>https://www.skills.sh/anthropics/skills/frontend-design</loc></url>
+      <url><loc>https://www.skills.sh/topic/react</loc></url>
+      <url><loc>https://www.skills.sh/wshobson/agents/typescript-advanced-types</loc></url>
+      <url><loc>https://www.skills.sh/docs/cli</loc></url>
+    </urlset>"""
+    xml_2 = """<?xml version="1.0"?><urlset>
+      <url><loc>https://www.skills.sh/cloudai-x/threejs-skills/threejs-animation</loc></url>
+      <url><loc>https://www.skills.sh/favicon.ico</loc></url>
+    </urlset>"""
+
+    class _FakeResp:
+        def __init__(self, body):
+            self.status_code = 200
+            self.text = body
+
+    class _FakeClient:
+        def __init__(self):
+            self._calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            if "sitemap-skills-1" in url:
+                return _FakeResp(xml_1)
+            return _FakeResp(xml_2)
+
+    monkeypatch.setattr(reg.httpx, "AsyncClient", lambda **kw: _FakeClient())
+
+    svc = SkillRegistryService()
+    slugs = await svc._fetch_skills_sh_sitemap()
+    assert slugs == [
+        "anthropics/skills/frontend-design",
+        "wshobson/agents/typescript-advanced-types",
+        "cloudai-x/threejs-skills/threejs-animation",
+    ]
+    # 缓存命中：再调用不触发网络
+    assert await svc._fetch_skills_sh_sitemap() == slugs
+
+
+@pytest.mark.asyncio
+async def test_search_skills_sh_prefers_sitemap(monkeypatch):
+    """sitemap 索引可用时走全量搜索；sitemap 失败时降级首页。"""
+    import hiveweave.services.skill_registry as reg
+
+    svc = SkillRegistryService()
+
+    async def fake_sitemap():
+        return ["cloudai-x/threejs-skills/threejs-animation",
+                "wshobson/agents/typescript-advanced-types"]
+
+    monkeypatch.setattr(svc, "_fetch_skills_sh_sitemap", fake_sitemap)
+    home_called = {"v": False}
+
+    async def fake_home(search=None):
+        home_called["v"] = True
+        return []
+
+    monkeypatch.setattr(svc, "_search_skills_sh_homepage", fake_home)
+
+    detail = {"slug": "x", "summary": "s", "skill_md": "# x\n\nbody"}
+    monkeypatch.setattr(svc, "_fetch_skills_sh_detail", _async(detail))
+
+    out = await svc._search_skills_sh("typescript")
+    assert [s["slug"] for s in out] == ["wshobson/agents/typescript-advanced-types"]
+    assert home_called["v"] is False, "sitemap 可用时不应走首页降级"
+
+    # sitemap 失败 → 首页兜底
+    async def fake_sitemap_empty():
+        return []
+
+    monkeypatch.setattr(svc, "_fetch_skills_sh_sitemap", fake_sitemap_empty)
+    await svc._search_skills_sh("x")
+    assert home_called["v"] is True
+
+
+# ── API key 技能过滤（skills.sh 无商店标签，启发式检测）──────
+
+
+def test_skill_md_requires_api_key_heuristic():
+    """启发式：环境变量名或「requires/need/set … API key」类短语判需要。"""
+    assert _skill_md_requires_api_key("Set ANTHROPIC_API_KEY before running.")
+    assert _skill_md_requires_api_key("You must set the ELEVENLABS_API_KEY first")
+    assert _skill_md_requires_api_key("requires an API key to call the service")
+    assert _skill_md_requires_api_key("you will need to sign up for an API key")
+    assert _skill_md_requires_api_key("must use the API key")
+    # 不误报：仅文档提及、无要求语境
+    assert not _skill_md_requires_api_key("how to use your API key with the SDK")
+    assert not _skill_md_requires_api_key("MCP tools mcp_azure_mcp_eventhubs")
+    assert not _skill_md_requires_api_key("")
+    assert not _skill_md_requires_api_key(None)
+    # 占位符不误报：前缀 <4 字符的通用名（API_KEY / JWT_TOKEN）
+    assert not _skill_md_requires_api_key("Scan for hardcoded API_KEY values")
+    assert not _skill_md_requires_api_key("Check for leaked JWT_TOKEN in logs")
+    # 否定语境不误报：optional / if … not set
+    assert not _skill_md_requires_api_key(
+        "If OPENAI_API_KEY is not set, the skill still works with local models"
+    )
+    assert not _skill_md_requires_api_key(
+        "The ANTHROPIC_API_KEY is optional; works without it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_skills_sh_slugs_filters_api_key_skills(monkeypatch):
+    """搜索过滤 requires_api_key 的技能，并从 3x 候选补足上限。"""
+    svc = SkillRegistryService()
+    slugs = [f"owner/repo/skill-{i}" for i in range(15)]
+    api_key_slugs = {f"owner/repo/skill-{i}" for i in (1, 4, 8, 13)}
+
+    async def fake_detail(slug):
+        return {"slug": slug, "summary": "s", "skill_md": "# x",
+                "requires_api_key": slug in api_key_slugs}
+
+    monkeypatch.setattr(svc, "_fetch_skills_sh_detail", fake_detail)
+
+    out = await svc._search_skills_sh_slugs(slugs, "skill")
+    # 15 个候选全命中，4 个需 API key → 11 个可用 → 截断 10
+    assert len(out) == SKILLS_SH_MAX_RESULTS
+    assert all(s["slug"] not in api_key_slugs for s in out)
+
+
+@pytest.mark.asyncio
+async def test_search_skills_sh_slugs_keeps_no_key_skills(monkeypatch):
+    """不需要 API key 的技能全部保留（默认 requires_api_key=False）。"""
+    svc = SkillRegistryService()
+    slugs = [f"owner/repo/skill-{i}" for i in range(5)]
+    detail = {"slug": "x", "summary": "s", "skill_md": "# x\n\nbody"}
+    monkeypatch.setattr(svc, "_fetch_skills_sh_detail", _async(detail))
+    out = await svc._search_skills_sh_slugs(slugs, "skill")
+    assert len(out) == 5
+
+
+@pytest.mark.asyncio
+async def test_resolve_falls_back_to_skillhub_when_sh_requires_api_key(monkeypatch):
+    """skills.sh 详情启发式判定需要 API key → 降级 SkillHub（与不可达同语义）。"""
+    svc = SkillRegistryService()
+    monkeypatch.setattr(
+        svc, "_fetch_skills_sh_detail",
+        _async({**_sh_detail("frontend"), "requires_api_key": True}),
+    )
+    monkeypatch.setattr(svc, "_fetch_skillhub_detail", _async(_hub_detail("frontend")))
+    detail, label = await svc._resolve_marketplace_skill("frontend")
+    assert detail is not None and detail["summary"] == "from skillhub"
+    assert label == SKILLHUB_SOURCE_LABEL
+
+
+# ── hire_agent 市场技能强制（市场可见时必须选至少一个）────────
+
+
+def _builtin_lookup(builtin: set[str]):
+    def lookup(slug: str) -> dict | None:
+        return {"slug": slug} if slug in builtin else None
+    return lookup
+
+
+def test_hire_market_gate_rejects_all_builtin_when_market_seen():
+    """HR 搜索时见过市场技能却全绑内置 → 拒绝并提示。"""
+    from hiveweave.tools.org_tools import _hire_market_skill_gate
+
+    seen = ["self-review", "anthropics/skills/webapp-testing", "anthropics/skills/frontend-design"]
+    err = _hire_market_skill_gate(
+        skills=["self-review"],
+        seen_slugs=seen,
+        builtin_lookup=_builtin_lookup({"self-review"}),
+    )
+    assert err is not None
+    assert "marketplace" in err.lower()
+    assert "webapp-testing" in err
+
+
+def test_hire_market_gate_passes_when_market_skill_included():
+    """skills 里含至少一个市场技能 → 放行。"""
+    from hiveweave.tools.org_tools import _hire_market_skill_gate
+
+    seen = ["self-review", "anthropics/skills/webapp-testing"]
+    assert _hire_market_skill_gate(
+        skills=["self-review", "anthropics/skills/webapp-testing"],
+        seen_slugs=seen,
+        builtin_lookup=_builtin_lookup({"self-review"}),
+    ) is None
+
+
+def test_hire_market_gate_passes_when_no_market_seen():
+    """HR 没见过市场技能（市场不可达/没搜到）→ 全内置放行，不卡死招聘。"""
+    from hiveweave.tools.org_tools import _hire_market_skill_gate
+
+    assert _hire_market_skill_gate(
+        skills=["self-review"],
+        seen_slugs=["self-review"],
+        builtin_lookup=_builtin_lookup({"self-review"}),
+    ) is None
+
+
+def test_hire_market_gate_passes_when_empty_skills():
+    """不传技能 → 放行（招人不强制技能）。"""
+    from hiveweave.tools.org_tools import _hire_market_skill_gate
+
+    assert _hire_market_skill_gate(
+        skills=[],
+        seen_slugs=["anthropics/skills/webapp-testing"],
+        builtin_lookup=_builtin_lookup(set()),
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_list_available_prunes_stale_market_slugs_when_market_down(monkeypatch):
+    """市场不可达时清掉 per-agent 缓存里的过期市场 slug，避免 hire 门槛死锁。
+
+    回归场景：会话早期市场可达（缓存留下市场 slug）→ 市场中途不可达 →
+    HR 按 tail 提示全绑内置 → gate 不应再因过期市场 slug 拒绝。
+    """
+    svc = SkillRegistryService()
+    # 缓存里混着内置 slug + 早期见过的市场 slug
+    svc._skill_search_cache["hr-1"] = [
+        "self-review",
+        "anthropics/skills/webapp-testing",
+        "anthropics/skills/frontend-design",
+    ]
+
+    async def fake_sh(search=None):
+        return None  # skills.sh 不可达
+
+    async def fake_hub(search=None):
+        return []  # SkillHub 也无结果 → 市场整体不可达
+
+    monkeypatch.setattr(svc, "_search_skills_sh", fake_sh)
+    monkeypatch.setattr(svc, "_search_skillhub", fake_hub)
+
+    out = await svc.list_available_skills(search="x", agent_id="hr-1")
+    assert "self-review" in out
+    assert "webapp-testing" not in out
+    assert "frontend-design" not in out
+    cached = svc._skill_search_cache["hr-1"]
+    assert "webapp-testing" not in cached and "frontend-design" not in cached
+    assert "self-review" in cached  # 内置 slug 保留
+
+    # gate 对清过后的缓存放行
+    from hiveweave.tools.org_tools import _hire_market_skill_gate
+
+    assert _hire_market_skill_gate(
+        skills=["self-review"],
+        seen_slugs=svc._skill_search_cache["hr-1"],
+        builtin_lookup=SkillRegistryService._get_builtin_skill,
+    ) is None
