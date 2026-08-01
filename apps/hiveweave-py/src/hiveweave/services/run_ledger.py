@@ -393,6 +393,27 @@ class RunLedger:
             log.debug("run_ledger.check_budget_failed", error=str(e))
             return False, ""
 
+    async def extend_elapsed_budget(
+        self, agent_id: str, run_id: str, extra_ms: int
+    ) -> None:
+        """Credit back elapsed budget for a subagent spawn.
+
+        Subagent runs synchronously inside the parent's turn; its wall-clock
+        time must not starve the parent's own budget. Shifting started_at
+        earlier by extra_ms gives the parent back that window.
+        """
+        if extra_ms <= 0:
+            return
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE agent_runs SET started_at = started_at - ? WHERE id = ?",
+                [extra_ms, run_id],
+            )
+        except Exception as e:
+            log.warning("run_ledger.extend_budget_failed",
+                        agent_id=agent_id, error=str(e))
+
 
 # Singleton
 run_ledger = RunLedger()

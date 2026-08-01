@@ -1751,6 +1751,22 @@ class Agent:
             self._on_safety_timeout_sync,
         )
 
+    def _extend_safety_timer(self, extra_s: float) -> None:
+        """顺延父回合 safety timer：子代理 spawn 期间不挤兑父的窗口。
+
+        重新武装为 SAFETY_TIMEOUT_MS + extra_s（从当前时刻起算）。
+        真实兜底是 run_ledger 的 elapsed 预算（Task 2 的 credit）；
+        timer 只是最后一道保险，多给 extra_s 的余量。
+        """
+        if self._safety_timer is not None:
+            self._safety_timer.cancel()
+            self._safety_timer = None
+        loop = asyncio.get_event_loop()
+        self._safety_timer = loop.call_later(
+            SAFETY_TIMEOUT_MS / 1000.0 + extra_s,
+            self._on_safety_timeout_sync,
+        )
+
     def _cancel_safety_timer(self) -> None:
         """取消安全定时器。"""
         if self._safety_timer is not None:
