@@ -45,6 +45,7 @@ _BASE_TOOLS = frozenset({
     "attest_doc_review",
     "assert_visual",
     "look_at_image",
+    "spawn_subagent",
 })
 
 CEO_TOOLS = _BASE_TOOLS | frozenset({
