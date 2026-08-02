@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import time
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -32,232 +34,217 @@ _model = ModelService()
 #: 契约 19: LLM 探测超时 15s
 _PROBE_TIMEOUT = 15.0
 
-#: OpenRouter 模型列表 API（公开，无需认证）
-_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+#: 通用 /models 元数据探测超时
+_MODELS_API_TIMEOUT = 10.0
 
-#: 常见模型 context_window 预设（按 model_id 子串匹配）
-#  按 token 数降序排列，第一个匹配的生效。
-_KNOWN_CONTEXT_WINDOWS: list[tuple[str, int]] = [
-    # ── Anthropic / Claude ──
-    ("claude-3-5-sonnet", 200_000),
-    ("claude-3-5-haiku", 200_000),
-    ("claude-3-opus", 200_000),
-    ("claude-3-sonnet", 200_000),
-    ("claude-3-haiku", 200_000),
-    ("claude-2", 100_000),
-    ("longcat", 200_000),        # LongCat-2.0
-    # ── OpenAI ──
-    ("gpt-4o", 128_000),
-    ("gpt-4-turbo", 128_000),
-    ("gpt-4", 8_192),
-    ("gpt-3.5", 16_385),
-    ("o1", 200_000),
-    ("o3", 200_000),
-    # ── Google / Gemini ──
-    ("gemini-1.5-pro", 2_000_000),
-    ("gemini-1.5-flash", 1_000_000),
-    ("gemini-2.0", 1_000_000),
-    # ── Meta / Llama ──
-    ("llama-3.1-405b", 128_000),
-    ("llama-3.1-70b", 128_000),
-    ("llama-3.1-8b", 128_000),
-    ("llama-3-70b", 8_192),
-    ("llama-3-8b", 8_192),
-    # ── Mistral ──
-    ("mistral-large", 128_000),
-    ("mistral-medium", 32_000),
-    ("mistral-small", 32_000),
-    ("mixtral", 32_000),
-    # ── DeepSeek ──
-    # free 必须写在付费子串前面，否则 "deepseek-v4-flash" 会误匹配 free
-    ("deepseek-v4-flash-free", 200_000),  # OpenCode Zen free-tier cap
-    ("deepseek-v4-flash", 1_024_000),
-    ("deepseek-v4", 1_024_000),
-    ("deepseek-v3", 64_000),
-    ("deepseek-r1", 64_000),
-    ("deepseek-coder", 64_000),
-    # ── Qwen / 通义千问 ──
-    ("qwen2.5-72b", 128_000),
-    ("qwen2.5-32b", 128_000),
-    ("qwen2.5-14b", 128_000),
-    ("qwen2.5-7b", 128_000),
-    ("qwen2-72b", 128_000),
-    # ── Tencent / Hunyuan ──
-    ("hy3-free", 190_000),       # OpenCode Zen free-tier (models.dev)
-    ("hy3:free", 262_144),       # OpenRouter tencent/hy3:free
-    ("hunyuan", 32_000),         # 混元标准版 32K
-    ("hy3", 262_144),            # Hunyuan 3 (OpenRouter 实测 256K+)
-    # ── 其他 ──
-    ("yi-34b", 4_000),
-    ("yi-large", 16_000),
-    ("glm-5.2", 1_024_000),
-    ("glm-4", 128_000),
-    ("glm-4-plus", 128_000),
-    ("baichuan", 4_096),
-    ("spark", 8_192),
-    ("ernie-4", 8_192),
-    ("ernie-bot", 8_192),
-]
+#: Cloud metadata / internal hosts — never probe (SSRF).
+_BLOCKED_PROBE_HOSTS = frozenset({
+    "metadata.google.internal",
+    "metadata.goog",
+    "kubernetes.default",
+    "kubernetes.default.svc",
+})
 
 
-async def _detect_context_window(
-    base_url: str, api_key: str, model_id: str
-) -> int | None:
-    """自动检测模型的 context_window。
+def _normalize_models_probe_base(base_url: str) -> str:
+    """Strip accidental chat-completions suffixes before appending /models.
 
-    策略（按优先级）：
-    1. OpenRouter: 调用 /api/v1/models 获取精确的 context_length
-    2. 内置预设表: 按 model_id 子串匹配常见模型
-    3. 返回 None（无法检测）
+    Mirrors OpenAIHandler.build_url idempotency (TEST19 UI paste of full
+    endpoint into baseUrl).
     """
-    base_lower = (base_url or "").lower()
+    base = (base_url or "").strip().rstrip("/")
+    while True:
+        lower = base.lower()
+        if lower.endswith("/chat/completions"):
+            base = base[: -len("/chat/completions")].rstrip("/")
+            continue
+        if lower.endswith("/completions"):
+            base = base[: -len("/completions")].rstrip("/")
+            continue
+        break
+    return base
 
-    # ── 策略 1: OpenRouter API ──
-    if "openrouter.ai" in base_lower:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(_OPENROUTER_MODELS_URL)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    models_list = data.get("data") or data.get("models") or []
-                    for m in models_list:
-                        m_id = m.get("id", "")
-                        # OpenRouter model_id 格式: "tencent/hy3:free"
-                        if m_id == model_id or m_id.lower() == model_id.lower():
-                            ctx = m.get("context_length")
-                            if ctx and isinstance(ctx, int) and ctx > 0:
-                                log.info(
-                                    "context_window_detected",
-                                    source="openrouter",
-                                    model_id=model_id,
-                                    context_window=ctx,
-                                )
-                                return ctx
-                    log.warning(
-                        "openrouter_model_not_found",
-                        model_id=model_id,
-                        total_models=len(models_list),
-                    )
-        except Exception as e:
-            log.warning("openrouter_detection_failed", error=str(e))
 
-    # ── 策略 2: 内置预设表 ──
-    mid_lower = (model_id or "").lower()
-    for pattern, ctx in _KNOWN_CONTEXT_WINDOWS:
-        if pattern in mid_lower:
-            log.info(
-                "context_window_detected",
-                source="preset",
-                model_id=model_id,
-                pattern=pattern,
-                context_window=ctx,
-            )
-            return ctx
+def _probe_url_blocked_reason(base_url: str) -> str | None:
+    """Return a human reason if ``base_url`` must not be probed, else None.
 
+    Local-first: private/loopback hosts stay allowed (Ollama / LAN gateways).
+    Blocks cloud metadata, link-local, credentialed URLs, and non-http(s).
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        return "missing baseUrl"
+    try:
+        parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    except Exception:
+        return "invalid URL"
+    if parsed.scheme not in ("http", "https"):
+        return f"unsupported scheme {parsed.scheme!r} (http/https only)"
+    if parsed.username or parsed.password:
+        return "URL must not embed credentials"
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return "missing host"
+    if host in _BLOCKED_PROBE_HOSTS or host.endswith(".internal"):
+        return f"blocked host {host}"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    # Literal IP: allow private/loopback for local gateways; block link-local
+    # and the classic cloud-metadata address.
+    if ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+        return f"blocked address {host}"
+    if str(ip) == "169.254.169.254":
+        return "blocked metadata address"
     return None
 
 
-#: 推理模型预设表（按 model_id 子串匹配）
-#  这些模型会产生 thinking/reasoning tokens，需要 supports_thinking=1
-_REASONING_MODEL_PATTERNS: list[str] = [
-    "o1", "o3", "o4",               # OpenAI reasoning 系列
-    "claude-3-5-sonnet",            # Claude extended thinking
-    "deepseek-v4-flash",            # V4 Flash (含 -free) 支持 reasoning
-    "deepseek-r1",                  # DeepSeek reasoning
-    "hy3",                          # Hunyuan 3 (推理模型)
-    "qwen3",                        # Qwen 3 (推理模型)
-    "gemini-2.5",                   # Gemini 2.5 (推理模型)
-    "step-3",                       # Step 3.x (推理模型)
-    "longcat",                      # LongCat (推理模型, Anthropic 格式 thinking block)
-]
+async def _fetch_models_metadata(
+    base_url: str, api_key: str, model_id: str
+) -> dict | None:
+    """通用能力探测：GET {base_url}/models 拉取 provider 模型元数据。
 
-
-async def _detect_model_capabilities(
-    base_url: str, api_key: str, model_id: str,
-    context_window: int | None = None,
-) -> dict:
-    """自动检测模型的推理能力和最大输出 token 数。
-
-    返回 dict:
-    - supports_thinking: bool | None
-    - max_output_tokens: int | None
-    - source: str (preset / external-api / unknown)
-
-    通用性设计：本函数对所有 provider 通用，不写死任何特定平台。
-    - 预设表（人类已验证真值）优先于任何 API 返回值
-    - 外部 API（OpenRouter 及未来其他 /models 端点）的返回值作为候选，
-      必须通过 _sanitize_max_output 通用校验后才能采纳
-    - 脏数据判据是物理不变量（max_output < context_window），不是魔数
-
-    Args:
-        context_window: 已检测到的上下文窗口（若有）。传入后用于脏数据校验，
-            判据为 max_output >= context_window → 脏数据丢弃。若为 None，
-            用合理上界兜底（见 _MAX_OUTPUT_SANITY_UPPER_BOUND 注释）。
+    对任意 OpenAI 兼容网关生效（OpenRouter / opencode.ai / ARK / 自建等），
+    不做域名特判、不依赖任何预制数据。端点可达且 id 匹配时返回：
+    {context_window, supports_thinking, max_output_tokens}（缺失字段为 None）；
+    端点不可达 / 非 200 / 无匹配条目 → None（调用方把失败原因透传给用户）。
     """
-    result: dict = {"supports_thinking": None, "max_output_tokens": None, "source": "unknown"}
-    base_lower = (base_url or "").lower()
-    mid_lower = (model_id or "").lower()
-
-    # ── 策略 1: 预设表（人类已验证真值，最高优先级）──
-    # 预设值本身已合理，无需再过 sanitize（它是真值源，不是待校验候选）。
-    # 为什么预设优先：外部 /models API 对部分模型（尤其免费模型）会返回
-    # 不可靠的 max_completion_tokens（如把 context_length 串成它），
-    # 盲信会产出物理不可能的配置。预设表是经过验证的真值，应先采纳。
-    _PRESET_MAX_OUTPUT: list[tuple[str, int]] = [
-        ("o1", 100_000), ("o3", 100_000),
-        ("claude-3-5-sonnet", 8_192),
-        ("deepseek-v4-flash-free", 128_000),  # OpenCode Zen free (models.dev)
-        ("deepseek-r1", 32_768),
-        ("hy3-free", 64_000),                 # OpenCode Zen free (models.dev)
-        ("hy3:free", 64_000),                 # OpenRouter tencent/hy3:free
-        ("hy3", 32_000),
-        ("qwen3", 32_000),
-        ("gemini-2.5", 8_192),
-        ("gpt-4o", 16_384),
-        ("gpt-4-turbo", 4_096),
-        ("longcat", 8_192),
-    ]
-    for pattern, max_tok in _PRESET_MAX_OUTPUT:
-        if pattern in mid_lower:
-            result["max_output_tokens"] = max_tok
-            result["source"] = "preset"
-            break
-
-    # supports_thinking 预设兜底
-    for pattern in _REASONING_MODEL_PATTERNS:
-        if pattern in mid_lower:
-            result["supports_thinking"] = True
-            if result["source"] == "unknown":
-                result["source"] = "preset"
-            break
-
-    # ── 策略 2: 外部 /models API（补充检测，不覆盖预设真值）──
-    # 通用：任何提供 /models 端点的 provider 都可在此补充。
-    # 当前实现 OpenRouter，未来接其他平台时在此扩展。
-    # 所有外部值都是「候选」，必须通过 _sanitize_max_output 校验才能采纳。
-    external_caps = await _fetch_caps_from_models_api(base_url, model_id)
-    if external_caps is not None:
-        # supports_thinking：architecture 信号可信，补充检测（不覆盖预设）
-        if result["supports_thinking"] is None and external_caps.get("supports_thinking"):
-            result["supports_thinking"] = external_caps["supports_thinking"]
-        # max_output_tokens：仅预设未命中时采纳候选，且过通用 sanitize
-        if result["max_output_tokens"] is None and external_caps.get("max_output_tokens") is not None:
-            candidate = external_caps["max_output_tokens"]
-            sanitized = _sanitize_max_output(candidate, context_window, model_id)
-            if sanitized is not None:
-                result["max_output_tokens"] = sanitized
-                if result["source"] in ("unknown", "preset"):
-                    result["source"] = "external-api"
-
-        log.info(
-            "model_capabilities_detected",
-            source=result["source"],
+    base = _normalize_models_probe_base(base_url)
+    if not base or not model_id:
+        return None
+    blocked = _probe_url_blocked_reason(base)
+    if blocked:
+        log.warning(
+            "models_metadata_probe_blocked",
+            base=base,
             model_id=model_id,
-            supports_thinking=result["supports_thinking"],
-            max_output_tokens=result["max_output_tokens"],
+            reason=blocked,
         )
+        return None
+    url = f"{base}/models"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=_MODELS_API_TIMEOUT, follow_redirects=False
+        ) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            log.warning(
+                "models_metadata_probe_http_status",
+                url=url,
+                model_id=model_id,
+                status=resp.status_code,
+            )
+            return None
+        data = resp.json()
+        if not isinstance(data, dict):
+            log.warning(
+                "models_metadata_probe_non_object",
+                url=url,
+                model_id=model_id,
+            )
+            return None
+        models_list = data.get("data") or data.get("models") or []
+    except Exception as e:
+        log.warning(
+            "models_metadata_probe_failed",
+            url=url,
+            model_id=model_id,
+            error=str(e),
+        )
+        return None
 
-    return result
+    for m in models_list:
+        if not isinstance(m, dict):
+            continue
+        m_id = str(m.get("id") or "")
+        if m_id.lower() != model_id.lower():
+            continue
+        caps: dict = {
+            "context_window": None,
+            "supports_thinking": None,
+            "max_output_tokens": None,
+        }
+        ctx = m.get("context_length") or m.get("context_window")
+        if isinstance(ctx, int) and ctx > 0:
+            caps["context_window"] = ctx
+        arch = m.get("architecture") or {}
+        if isinstance(arch, dict):
+            modalities = list(arch.get("input_modalities") or []) + list(
+                arch.get("output_modalities") or []
+            )
+            if any(str(x).lower() == "reasoning" for x in modalities):
+                caps["supports_thinking"] = True
+        # max_output 候选：顶层字段，或 OpenRouter 的 top_provider 子对象
+        # （真实 schema 里 max_completion_tokens 只在 top_provider 下）。
+        # 都是真实元数据（非预制），最终过 _sanitize_max_output 物理校验。
+        max_tok = m.get("max_completion_tokens") or m.get("max_output_tokens")
+        if max_tok is None:
+            top_provider = m.get("top_provider") or {}
+            if isinstance(top_provider, dict):
+                max_tok = top_provider.get("max_completion_tokens")
+        if isinstance(max_tok, int) and max_tok > 0:
+            caps["max_output_tokens"] = max_tok
+        return caps
+    log.warning(
+        "models_metadata_probe_model_missing",
+        url=url,
+        model_id=model_id,
+    )
+    return None
+
+
+async def _detect_model_metadata(
+    base_url: str, api_key: str, model_id: str
+) -> dict:
+    """通用能力探测入口：只做真实探测，无预制数据。
+
+    成功（网关 /models 可达且模型条目命中）→ 真实元数据 + source="external-api"
+    + error=None；失败 → 三项全 None + source="unknown" + error 说明原因，
+    由前端/调用方明确告知用户，不静默填任何猜测值。
+    """
+    base = _normalize_models_probe_base(base_url)
+    if not base or not model_id:
+        return {
+            "context_window": None,
+            "supports_thinking": None,
+            "max_output_tokens": None,
+            "source": "unknown",
+            "error": "baseUrl 与 modelId 必填",
+        }
+    blocked = _probe_url_blocked_reason(base)
+    if blocked:
+        return {
+            "context_window": None,
+            "supports_thinking": None,
+            "max_output_tokens": None,
+            "source": "unknown",
+            "error": f"探测被拒绝：{blocked}。请使用合法的 http(s) 网关地址。",
+        }
+    caps = await _fetch_models_metadata(base, api_key, model_id)
+    if caps is None:
+        return {
+            "context_window": None,
+            "supports_thinking": None,
+            "max_output_tokens": None,
+            "source": "unknown",
+            "error": (
+                f"探测失败：GET {base}/models 不可达（非 200/超时/网络错误），"
+                f"或未找到 id={model_id} 的条目。请手动填写能力字段，"
+                "或用「测试」按钮做真实连通性验证。"
+            ),
+        }
+    # 物理不变量校验（非预制数据）：max_output >= context_window → 脏数据丢弃
+    if caps["max_output_tokens"] is not None:
+        caps["max_output_tokens"] = _sanitize_max_output(
+            caps["max_output_tokens"], caps["context_window"], model_id
+        )
+    caps["source"] = "external-api"
+    caps["error"] = None
+    return caps
 
 
 #: max_output_tokens 合理性上界。语义：真实模型的 max_output 极少超过此值。
@@ -306,57 +293,6 @@ def _sanitize_max_output(
         return None
 
     return candidate
-
-
-async def _fetch_caps_from_models_api(
-    base_url: str, model_id: str
-) -> dict | None:
-    """从 provider 的 /models 端点获取能力信息（supports_thinking, max_output）。
-
-    通用性：当前实现 OpenRouter，未来接其他平台时在此扩展（如 OpenAI /v1/models、
-    Anthropic /v1/models 等）。所有平台的返回值都是「候选」，由调用方过 sanitize。
-    """
-    base_lower = (base_url or "").lower()
-
-    if "openrouter.ai" in base_lower:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(_OPENROUTER_MODELS_URL)
-                if resp.status_code != 200:
-                    return None
-                data = resp.json()
-                models_list = data.get("data") or data.get("models") or []
-                for m in models_list:
-                    m_id = m.get("id", "")
-                    if m_id == model_id or m_id.lower() == model_id.lower():
-                        caps: dict = {}
-                        # supports_thinking：architecture.modality 含 "reasoning"
-                        arch = m.get("architecture") or {}
-                        if isinstance(arch, dict):
-                            input_modal = arch.get("input_modalities") or []
-                            output_modal = arch.get("output_modalities") or []
-                            if isinstance(input_modal, list) and "reasoning" in [str(x).lower() for x in input_modal]:
-                                caps["supports_thinking"] = True
-                            elif isinstance(output_modal, list) and "reasoning" in [str(x).lower() for x in output_modal]:
-                                caps["supports_thinking"] = True
-                        # max_output_tokens 候选值（待 sanitize）
-                        max_tokens = None
-                        top_provider = m.get("top_provider") or {}
-                        if top_provider and isinstance(top_provider, dict):
-                            max_tokens = top_provider.get("max_completion_tokens")
-                        if max_tokens is None:
-                            max_tokens = m.get("max_completion_tokens")
-                        if max_tokens and isinstance(max_tokens, int) and max_tokens > 0:
-                            caps["max_output_tokens"] = max_tokens
-                        return caps
-        except Exception as e:
-            log.warning("models_api_capability_detection_failed", provider="openrouter", error=str(e))
-
-    # 未来扩展：其他 provider 的 /models 端点在此添加
-    # if "api.openai.com" in base_lower: ...
-    # if "api.anthropic.com" in base_lower: ...
-
-    return None
 
 
 def _extract_usage_from_response(data: dict) -> dict:
@@ -412,6 +348,17 @@ async def _do_self_test(model: dict) -> dict:
     except ValueError as e:
         return {"ok": False, "latencyMs": 0, "error": str(e)}
 
+    # SSRF: same gate as metadata probe — refuse link-local / metadata /
+    # credentialed URLs before POSTing with the API key.
+    probe_base = _normalize_models_probe_base(base_url)
+    blocked = _probe_url_blocked_reason(probe_base or base_url)
+    if blocked:
+        return {
+            "ok": False,
+            "latencyMs": 0,
+            "error": f"自检被拒绝：{blocked}。请使用合法的 http(s) 网关地址。",
+        }
+
     url = config.build_url()
     headers = config.build_headers()
     body = config.build_body(
@@ -423,14 +370,17 @@ async def _do_self_test(model: dict) -> dict:
 
     start = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
+        async with httpx.AsyncClient(
+            timeout=_PROBE_TIMEOUT, follow_redirects=False
+        ) as client:
             resp = await client.post(url, json=body, headers=headers)
         latency_ms = int((time.perf_counter() - start) * 1000)
     except httpx.TimeoutException:
         latency_ms = int((time.perf_counter() - start) * 1000)
         # 即使超时也检测 context_window 和 capabilities
-        detected_ctx = await _detect_context_window(base_url, api_key, model_name)
-        caps = await _detect_model_capabilities(base_url, api_key, model_name, context_window=detected_ctx)
+        meta = await _detect_model_metadata(base_url, api_key, model_name)
+        detected_ctx = meta.get("context_window")
+        caps = meta
         result = {"ok": False, "latencyMs": latency_ms, "error": "request timed out"}
         if detected_ctx is not None:
             result["detectedContextWindow"] = detected_ctx
@@ -439,8 +389,9 @@ async def _do_self_test(model: dict) -> dict:
         return result
     except Exception as e:
         latency_ms = int((time.perf_counter() - start) * 1000)
-        detected_ctx = await _detect_context_window(base_url, api_key, model_name)
-        caps = await _detect_model_capabilities(base_url, api_key, model_name, context_window=detected_ctx)
+        meta = await _detect_model_metadata(base_url, api_key, model_name)
+        detected_ctx = meta.get("context_window")
+        caps = meta
         result = {"ok": False, "latencyMs": latency_ms, "error": str(e)}
         if detected_ctx is not None:
             result["detectedContextWindow"] = detected_ctx
@@ -448,9 +399,10 @@ async def _do_self_test(model: dict) -> dict:
         result["detectedMaxOutputTokens"] = caps.get("max_output_tokens")
         return result
 
-    # ── 顺序检测：先 context_window，再 capabilities（用 ctx 真值做脏数据校验）──
-    detected_ctx = await _detect_context_window(base_url, api_key, model_name)
-    caps = await _detect_model_capabilities(base_url, api_key, model_name, context_window=detected_ctx)
+    # ── 顺序探测：真实 /models 元数据（context + caps 一次获取）──
+    meta = await _detect_model_metadata(base_url, api_key, model_name)
+    detected_ctx = meta.get("context_window")
+    caps = meta
 
     result = {"ok": False, "latencyMs": latency_ms}
 
@@ -689,43 +641,36 @@ async def list_models() -> dict:
 async def create_model(body: ModelCreate) -> dict:
     """创建模型。
 
-    自动检测并填充：
-    - context_window（OpenRouter API / 预设表）
-    - supports_thinking（推理模型预设表 / OpenRouter API）
-    - max_output_tokens（OpenRouter API / 预设表）
+    自动探测（仅真实探测，无预制数据）：能力字段有缺失时才探测 /models
+    元数据，成功则填充；失败不报错，缺失字段由存储层落默认值
+    （_DEFAULT_CONTEXT_WINDOW / _DEFAULT_MAX_OUTPUT，可后续手动修正）。
 
     创建后自动触发自检，一次请求完成连通性测试 + 自动修正配置。
     """
     try:
         attrs = _normalize_attrs(body)
 
-        # ── 自动检测 context_window ──
-        if not attrs.get("context_window"):
-            detected = await _detect_context_window(
+        # ── 能力字段有缺失时才探测（真实 /models 元数据，无预制数据）──
+        need_ctx = not attrs.get("context_window")
+        need_thinking = "supports_thinking" not in attrs
+        need_max_output = "max_output_tokens" not in attrs
+        if need_ctx or need_thinking or need_max_output:
+            meta = await _detect_model_metadata(
                 attrs.get("base_url", ""),
                 attrs.get("api_key", ""),
                 attrs.get("model_id", ""),
             )
-            if detected:
-                attrs["context_window"] = detected
+            if need_ctx and meta.get("context_window"):
+                attrs["context_window"] = meta["context_window"]
                 log.info(
                     "create_model_auto_detected",
                     model_id=attrs.get("model_id"),
-                    context_window=detected,
+                    context_window=meta["context_window"],
                 )
-
-        # ── 自动检测 supports_thinking 和 max_output_tokens ──
-        # 用 "key not in attrs" 而非 "not attrs.get(key)"，避免覆盖用户显式设的 False / 0
-        if "supports_thinking" not in attrs or "max_output_tokens" not in attrs:
-            caps = await _detect_model_capabilities(
-                attrs.get("base_url", ""),
-                attrs.get("api_key", ""),
-                attrs.get("model_id", ""),
-            )
-            if "supports_thinking" not in attrs and caps.get("supports_thinking") is not None:
-                attrs["supports_thinking"] = caps["supports_thinking"]
-            if "max_output_tokens" not in attrs and caps.get("max_output_tokens") is not None:
-                attrs["max_output_tokens"] = caps["max_output_tokens"]
+            if need_thinking and meta.get("supports_thinking") is not None:
+                attrs["supports_thinking"] = meta["supports_thinking"]
+            if need_max_output and meta.get("max_output_tokens") is not None:
+                attrs["max_output_tokens"] = meta["max_output_tokens"]
 
         result = await _model.create(attrs)
 
@@ -830,16 +775,19 @@ class DetectCapabilitiesRequest(BaseModel):
 async def detect_capabilities(body: DetectCapabilitiesRequest) -> dict:
     """探测模型能力（上下文窗口 / 推理支持 / 最大输出），不发真实对话、不落库。
 
-    与 /{id}/test 的区别：
-    - test 会发起一次真实 chat completion 并自动修正 DB 配置；
-    - 本端点仅查询 provider 的模型元数据（OpenRouter /models 或预设表），
-      用于前端在保存模型前「一键探测」填充字段，用户仍可手动调整。
+    只做真实探测：GET {base_url}/models 拉取网关模型元数据，无预制数据。
+    成功 → 真实值 + source="external-api"；失败 → 全 None + source="unknown"
+    + error 说明原因（前端明确提示用户，不静默填充猜测值）。
+
+    与 /{id}/test 的区别：test 会发起一次真实 chat completion 并自动修正
+    DB 配置（含运行时推理 token 检测）；本端点仅查询元数据供前端「一键探测」。
 
     返回:
     - contextWindow: int | None
     - supportsThinking: bool | None
     - maxOutputTokens: int | None
-    - source: str (preset / external-api / openrouter / unknown)
+    - source: str (external-api / unknown)
+    - error: str | None（探测失败原因）
     """
     base_url = (body.baseUrl or "").strip()
     model_id = (body.modelId or "").strip()
@@ -847,14 +795,12 @@ async def detect_capabilities(body: DetectCapabilitiesRequest) -> dict:
         raise HTTPException(status_code=400, detail="baseUrl and modelId are required")
 
     api_key = (body.apiKey or "").strip()
-    detected_ctx = await _detect_context_window(base_url, api_key, model_id)
-    caps = await _detect_model_capabilities(
-        base_url, api_key, model_id, context_window=detected_ctx
-    )
+    meta = await _detect_model_metadata(base_url, api_key, model_id)
 
     return {
-        "contextWindow": detected_ctx,
-        "supportsThinking": caps.get("supports_thinking"),
-        "maxOutputTokens": caps.get("max_output_tokens"),
-        "source": caps.get("source", "unknown"),
+        "contextWindow": meta.get("context_window"),
+        "supportsThinking": meta.get("supports_thinking"),
+        "maxOutputTokens": meta.get("max_output_tokens"),
+        "source": meta.get("source", "unknown"),
+        "error": meta.get("error"),
     }

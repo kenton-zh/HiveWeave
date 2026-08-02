@@ -251,7 +251,11 @@ async def test_ensure_relocation_notify_uses_inbox_send_message_kwargs(
             return_value=inbox_inst,
         ),
     ):
-        result = await ensure_executor_worktree("proj-1", "agent-015")
+        # force=True: mock 环境无 in-flight 任务，绕过 TEST6 P1-2
+        # 的 idle-skip（否则命中 worktree_recreate_skipped_no_open_tasks）。
+        result = await ensure_executor_worktree(
+            "proj-1", "agent-015", force=True
+        )
 
     assert result["success"] is True
     assert result.get("relocated") is True or Path(result["path"]).name == "A015-b"

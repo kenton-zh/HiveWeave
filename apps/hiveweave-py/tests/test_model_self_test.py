@@ -2,7 +2,7 @@
 
 Covers:
 - _extract_usage_from_response: 各种 provider 格式的 usage 解析
-- _detect_model_capabilities: 推理模型预设表匹配
+- _detect_model_metadata: 通用 /models 元数据探测（无预制数据，真实探测）
 - _do_self_test: 自动修正 DB 配置（mocked HTTP）
 - create_model: supports_thinking=False 不被覆盖
 - coordinator tool visibility: COORDINATOR_ONLY_TOOLS 对 coordinator 可见
@@ -15,10 +15,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hiveweave.api.models import (
-    _detect_model_capabilities,
+    _detect_model_metadata,
+    _do_self_test,
     _extract_usage_from_response,
-    _KNOWN_CONTEXT_WINDOWS,
-    _REASONING_MODEL_PATTERNS,
+    _normalize_models_probe_base,
+    _probe_url_blocked_reason,
 )
 from hiveweave.services.permission import (
     COORDINATOR_ONLY_TOOLS,
@@ -69,62 +70,129 @@ class TestExtractUsage:
         assert result["total_tokens"] == 0
 
 
-# ── _detect_model_capabilities ────────────────────────────────
+# ── _detect_model_metadata（通用 /models 探测，无预制数据）─────
 
 
-class TestDetectModelCapabilities:
-    @pytest.mark.asyncio
-    async def test_preset_reasoning_model_hy3(self):
-        """hy3 应匹配推理模型预设。"""
-        result = await _detect_model_capabilities(
-            base_url="https://api.example.com",
-            api_key="",
-            model_id="tencent/hy3:free",
+def _mock_models_endpoint(payload: dict | None, status: int = 200):
+    """Patch httpx.AsyncClient so GET {base}/models returns ``payload``."""
+    mock_response = MagicMock()
+    mock_response.status_code = status
+    mock_response.json.return_value = payload or {}
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    return patch("httpx.AsyncClient", return_value=mock_client)
+
+
+class TestProbeUrlGuards:
+    def test_normalize_strips_chat_completions_suffix(self):
+        assert (
+            _normalize_models_probe_base(
+                "https://opencode.ai/zen/go/v1/chat/completions"
+            )
+            == "https://opencode.ai/zen/go/v1"
         )
+        assert (
+            _normalize_models_probe_base("https://api.openai.com/v1/")
+            == "https://api.openai.com/v1"
+        )
+
+    def test_block_metadata_and_link_local(self):
+        assert _probe_url_blocked_reason("http://169.254.169.254/") is not None
+        assert _probe_url_blocked_reason(
+            "http://metadata.google.internal/computeMetadata/v1"
+        ) is not None
+        assert _probe_url_blocked_reason("http://user:pass@evil.com/v1") is not None
+        assert _probe_url_blocked_reason("ftp://example.com/v1") is not None
+
+    def test_allow_public_and_private_gateways(self):
+        # Local-first: LAN / loopback gateways stay allowed.
+        assert _probe_url_blocked_reason("http://127.0.0.1:11434/v1") is None
+        assert _probe_url_blocked_reason("http://192.168.1.10:8000/v1") is None
+        assert _probe_url_blocked_reason("https://openrouter.ai/api/v1") is None
+
+    @pytest.mark.asyncio
+    async def test_detect_rejects_metadata_without_http(self):
+        result = await _detect_model_metadata(
+            base_url="http://169.254.169.254/",
+            api_key="sk-victim",
+            model_id="any",
+        )
+        assert result["source"] == "unknown"
+        assert "拒绝" in (result["error"] or "")
+
+    @pytest.mark.asyncio
+    async def test_self_test_rejects_metadata_base_url(self):
+        """_do_self_test must refuse IMDS/link-local before POSTing."""
+        result = await _do_self_test({
+            "id": "m1",
+            "provider": "openai",
+            "base_url": "http://169.254.169.254/",
+            "api_key": "sk-victim",
+            "model_id": "gpt-test",
+            "context_window": 0,
+            "supports_thinking": False,
+            "max_output_tokens": 0,
+        })
+        assert result["ok"] is False
+        assert "拒绝" in (result.get("error") or "")
+
+
+class TestDetectModelMetadata:
+    @pytest.mark.asyncio
+    async def test_real_probe_success_full_caps(self):
+        """网关 /models 可达且 id 命中 → 返回真实元数据，source=external-api。"""
+        with _mock_models_endpoint({
+            "data": [
+                {
+                    "id": "deepseek-v4-flash",
+                    "context_length": 1024000,
+                    "max_completion_tokens": 8192,
+                    "architecture": {"input_modalities": ["text", "reasoning"]},
+                }
+            ]
+        }):
+            result = await _detect_model_metadata(
+                base_url="https://opencode.ai/zen/go/v1",
+                api_key="sk-x",
+                model_id="deepseek-v4-flash",
+            )
+        assert result["context_window"] == 1024000
         assert result["supports_thinking"] is True
+        assert result["max_output_tokens"] == 8192
+        assert result["source"] == "external-api"
+        assert result["error"] is None
 
     @pytest.mark.asyncio
-    async def test_preset_reasoning_model_deepseek_r1(self):
-        result = await _detect_model_capabilities(
-            base_url="https://api.example.com",
-            api_key="",
-            model_id="deepseek/deepseek-r1",
-        )
+    async def test_openrouter_real_schema_top_provider(self):
+        """OpenRouter 真实 schema：max_completion_tokens 在 top_provider 下。"""
+        with _mock_models_endpoint({
+            "data": [
+                {
+                    "id": "tencent/hy3:free",
+                    "context_length": 262144,
+                    "top_provider": {"max_completion_tokens": 32768},
+                    "architecture": {"input_modalities": ["text", "reasoning"]},
+                }
+            ]
+        }):
+            result = await _detect_model_metadata(
+                base_url="https://openrouter.ai/api/v1",
+                api_key="",
+                model_id="tencent/hy3:free",
+            )
+        assert result["context_window"] == 262144
         assert result["supports_thinking"] is True
+        assert result["max_output_tokens"] == 32768  # top_provider 候选
+        assert result["source"] == "external-api"
 
     @pytest.mark.asyncio
-    async def test_non_reasoning_model(self):
-        """普通模型不应匹配推理预设。"""
-        result = await _detect_model_capabilities(
-            base_url="https://api.example.com",
-            api_key="",
-            model_id="meta-llama/llama-3-8b",
-        )
-        assert result["supports_thinking"] is None or result["supports_thinking"] is not True
-
-    @pytest.mark.asyncio
-    async def test_preset_max_output_tokens(self):
-        """预设表应返回 max_output_tokens。"""
-        result = await _detect_model_capabilities(
-            base_url="https://api.example.com",
-            api_key="",
-            model_id="tencent/hy3:free",
-        )
-        assert result["max_output_tokens"] is not None
-        assert result["max_output_tokens"] > 0
-
-    @pytest.mark.asyncio
-    async def test_openrouter_api_query(self):
-        """OpenRouter 返回脏数据时，预设真值表必须压过 API（三层防御检测层）。
-
-        mock 的 max_completion_tokens=262144 正是线上事故数据：hy3:free 的
-        API 把 context_length 串线成 max_output（输出预算=整个窗口，物理不可能）。
-        旧行为盲信 API 值；防御层引入后，预设表 hy3→32000 必须获胜。
-        API 仅补充 supports_thinking（architecture 信号可信）。
-        """
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
+    async def test_openrouter_dirty_top_provider_discarded(self):
+        """OpenRouter top_provider 脏数据（= context_length 串线）→ 物理校验丢弃。"""
+        with _mock_models_endpoint({
             "data": [
                 {
                     "id": "tencent/hy3:free",
@@ -133,78 +201,125 @@ class TestDetectModelCapabilities:
                     "architecture": {"input_modalities": ["text", "reasoning"]},
                 }
             ]
-        }
-
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.get = AsyncMock(return_value=mock_response)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
-
-            result = await _detect_model_capabilities(
+        }):
+            result = await _detect_model_metadata(
                 base_url="https://openrouter.ai/api/v1",
                 api_key="",
                 model_id="tencent/hy3:free",
             )
-
-        assert result["supports_thinking"] is True
-        assert result["max_output_tokens"] == 64_000  # 预设表获胜，非 API 脏数据
-        assert result["source"] == "preset"
-
-    @pytest.mark.asyncio
-    async def test_openrouter_api_query_no_preset_hit(self):
-        """预设表未命中时，才采纳 OpenRouter API 的 max_output 候选（且需过 sanitize）。"""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "data": [
-                {
-                    "id": "somevendor/future-model-9000",
-                    "context_length": 262144,
-                    "top_provider": {"max_completion_tokens": 65536},
-                    "architecture": {"input_modalities": ["text", "reasoning"]},
-                }
-            ]
-        }
-
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.get = AsyncMock(return_value=mock_response)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
-
-            result = await _detect_model_capabilities(
-                base_url="https://openrouter.ai/api/v1",
-                api_key="",
-                model_id="somevendor/future-model-9000",
-            )
-
-        assert result["supports_thinking"] is True
-        assert result["max_output_tokens"] == 65536
+        assert result["context_window"] == 262144
+        assert result["max_output_tokens"] is None  # 物理不可能，丢弃
         assert result["source"] == "external-api"
 
+    @pytest.mark.asyncio
+    async def test_real_probe_success_minimal_caps(self):
+        """网关只回 id（如 opencode.ai 实测），缺失字段为 None 但 source=external-api。"""
+        with _mock_models_endpoint({
+            "data": [{"id": "deepseek-v4-flash"}]
+        }):
+            result = await _detect_model_metadata(
+                base_url="https://opencode.ai/zen/go/v1",
+                api_key="",
+                model_id="deepseek-v4-flash",
+            )
+        assert result["context_window"] is None
+        assert result["supports_thinking"] is None
+        assert result["max_output_tokens"] is None
+        assert result["source"] == "external-api"
+        assert result["error"] is None
 
-# ── 预设表完整性 ──────────────────────────────────────────────
+    @pytest.mark.asyncio
+    async def test_real_probe_model_not_listed(self):
+        """id 不在网关 /models 里 → 探测失败，error 说明原因。"""
+        with _mock_models_endpoint({
+            "data": [{"id": "other-model"}]
+        }):
+            result = await _detect_model_metadata(
+                base_url="https://api.example.com/v1",
+                api_key="",
+                model_id="ghost-model",
+            )
+        assert result["context_window"] is None
+        assert result["supports_thinking"] is None
+        assert result["max_output_tokens"] is None
+        assert result["source"] == "unknown"
+        assert result["error"] is not None
+        assert "ghost-model" in result["error"]
 
+    @pytest.mark.asyncio
+    async def test_real_probe_endpoint_unreachable(self):
+        """/models 非 200 → 探测失败（不返回任何猜测值）。"""
+        with _mock_models_endpoint(None, status=404):
+            result = await _detect_model_metadata(
+                base_url="https://api.example.com/v1",
+                api_key="",
+                model_id="m",
+            )
+        assert result["source"] == "unknown"
+        assert result["error"] is not None
+        assert all(
+            v is None for v in (
+                result["context_window"],
+                result["supports_thinking"],
+                result["max_output_tokens"],
+            )
+        )
 
-class TestPresetTables:
-    def test_hy3_context_window_updated(self):
-        """hy3 预设值应为 262144，不是旧的 32000。"""
-        for pattern, ctx in _KNOWN_CONTEXT_WINDOWS:
-            if pattern == "hy3":
-                assert ctx == 262_144, f"hy3 preset should be 262144, got {ctx}"
-                return
-        pytest.fail("hy3 not found in _KNOWN_CONTEXT_WINDOWS")
+    @pytest.mark.asyncio
+    async def test_real_probe_http_error(self):
+        """/models 抛网络异常 → 探测失败。"""
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=Exception("conn refused"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    def test_reasoning_patterns_non_empty(self):
-        assert len(_REASONING_MODEL_PATTERNS) > 0
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await _detect_model_metadata(
+                base_url="https://api.example.com/v1",
+                api_key="",
+                model_id="m",
+            )
+        assert result["source"] == "unknown"
+        assert result["error"] is not None
 
-    def test_reasoning_patterns_cover_common_models(self):
-        patterns_str = " ".join(_REASONING_MODEL_PATTERNS)
-        for expected in ["hy3", "deepseek-r1", "o1", "o3"]:
-            assert expected in patterns_str, f"{expected} missing from reasoning patterns"
+    @pytest.mark.asyncio
+    async def test_sanitize_discards_impossible_max_output(self):
+        """max_output >= context_window（脏数据）→ 丢弃，保持 None。"""
+        with _mock_models_endpoint({
+            "data": [
+                {
+                    "id": "m",
+                    "context_length": 262144,
+                    "max_completion_tokens": 262144,  # context_length 串线
+                }
+            ]
+        }):
+            result = await _detect_model_metadata(
+                base_url="https://openrouter.ai/api/v1",
+                api_key="",
+                model_id="m",
+            )
+        assert result["context_window"] == 262144
+        assert result["max_output_tokens"] is None  # 物理不可能，丢弃
+        assert result["source"] == "external-api"
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_id_match(self):
+        with _mock_models_endpoint({
+            "data": [{"id": "DeepSeek-V4-Flash", "context_length": 128000}]
+        }):
+            result = await _detect_model_metadata(
+                base_url="https://api.example.com/v1",
+                api_key="",
+                model_id="deepseek-v4-flash",
+            )
+        assert result["context_window"] == 128000
+
+    @pytest.mark.asyncio
+    async def test_missing_base_url_or_model(self):
+        result = await _detect_model_metadata("", "", "")
+        assert result["source"] == "unknown"
+        assert result["error"] is not None
 
 
 # ── Coordinator 工具可见性 ────────────────────────────────────
@@ -286,14 +401,21 @@ class TestCreateModelRespectsUserConfig:
             supportsThinking=False,
         )
         attrs = _normalize_attrs(body)
-        # 模拟自动检测返回 True
+        # 模拟通用探测返回 True
         with patch(
-            "hiveweave.api.models._detect_model_capabilities",
-            return_value={"supports_thinking": True, "max_output_tokens": 32000, "source": "preset"},
+            "hiveweave.api.models._detect_model_metadata",
+            return_value={
+                "context_window": 128000,
+                "supports_thinking": True,
+                "max_output_tokens": 32000,
+                "source": "external-api",
+                "error": None,
+            },
         ):
-            if "supports_thinking" not in attrs or "max_output_tokens" not in attrs:
-                caps = await _detect_model_capabilities("", "", "")
-                if "supports_thinking" not in attrs and caps.get("supports_thinking") is not None:
-                    attrs["supports_thinking"] = caps["supports_thinking"]
+            meta = await _detect_model_metadata("", "", "")
+            if "supports_thinking" not in attrs and meta.get("supports_thinking") is not None:
+                attrs["supports_thinking"] = meta["supports_thinking"]
+            if "max_output_tokens" not in attrs and meta.get("max_output_tokens") is not None:
+                attrs["max_output_tokens"] = meta["max_output_tokens"]
 
         assert attrs["supports_thinking"] is False, "User's explicit False should not be overwritten"

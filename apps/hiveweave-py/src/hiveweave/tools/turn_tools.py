@@ -187,6 +187,11 @@ async def commit_turn_tool(
                         "UNCOMMITTED_WORKTREE": "worktree 有未提交改动",
                         "OPEN_TASKS_UNDECLARED": "仍有可行动任务却声明 done_slice",
                     }
+                    # TEST19 ④: 每条 gate 附带可执行动作（单一来源
+                    # GATE_ACTIONS，与 turn_exit backstop 共用防漂移），
+                    # 拒绝消息变成编号步骤清单，而不是一行只报问题的提示。
+                    from hiveweave.services.turn_exit import GATE_ACTIONS
+                    gate_actions = GATE_ACTIONS
                     # Soft-warn (reminder-class only): first hit → warn+allow;
                     # second → hard. HARD_COMMIT_GATE_CODES (UNREPLIED_ASKS)
                     # always hard — soft-pass must not end the reply contract
@@ -204,20 +209,29 @@ async def commit_turn_tool(
                     except Exception:
                         pass
                     if hard:
-                        hints = [labels.get(v, v) for v in hard]
                         soft_note = ""
                         if soft:
                             soft_note = (
                                 f" (first soft-pass already used for: "
                                 f"{', '.join(soft)})"
                             )
+                        steps = " ".join(
+                            f"{i}) [{code}] {labels.get(code, code)} — "
+                            f"动作: {gate_actions.get(code, '先处理该义务再重试')}."
+                            for i, code in enumerate(hard, 1)
+                        )
                         return ToolResult.err(
                             f"commit_turn REJECTED (synchronous gate): "
-                            + "; ".join(hints)
+                            + steps
                             + soft_note
-                            + ". 请先处理这些义务再 commit_turn，"
+                            + ". 请按上述步骤处理这些义务再 commit_turn，"
                             "或改用 phase=in_progress 继续工作。"
-                            + f" gates: {hard}."
+                            + f" gates: {hard}.",
+                            gates=list(hard),
+                            actions={
+                                c: gate_actions.get(c, "")
+                                for c in hard
+                            },
                         )
                     if soft:
                         # Soft-pass: accept TurnResult but surface the warning.

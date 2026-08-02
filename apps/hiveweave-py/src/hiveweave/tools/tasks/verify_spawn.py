@@ -41,15 +41,13 @@ async def _spawn_post_approve_verify_task(
         return None
     # ── Prevent infinite VERIFY chain ──────────────────────────────
     # If the parent task itself is already a VERIFY task (identified by
-    # its tags or a "VERIFY:" title prefix), do NOT spawn another VERIFY.
+    # its title "VERIFY:" prefix), do NOT spawn another VERIFY.
     # The original engineering task already has its VERIFY; allowing a
     # VERIFY-of-VERIFY-of-VERIFY… chain wastes architect/CEO review
     # cycles indefinitely.
-    parent_tags = parent_task.get("tags") or []
+    # TEST19 教训: 只认前缀 —— agent 自由 tag "verify" 不构成 VERIFY。
     parent_title = parent_task.get("title") or ""
-    if (isinstance(parent_tags, list) and "verify" in parent_tags) or (
-        isinstance(parent_title, str) and parent_title.startswith("VERIFY:")
-    ):
+    if isinstance(parent_title, str) and parent_title.startswith("VERIFY:"):
         log.info(
             "verify_chain_stopped",
             parent_task_id=parent_id,
@@ -64,11 +62,11 @@ async def _spawn_post_approve_verify_task(
     # 仍非 closed/approved，应阻止重复 spawn（它被取消了不代表可以无限重建）。
     existing = await ts.list_tasks(project_id, include_archived=True)
     for t in existing:
-        tags = t.get("tags") or []
+        # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不算）
         if (
             t.get("parent_task_id") == parent_id
-            and isinstance(tags, list)
-            and "verify" in tags
+            and isinstance(t.get("title") or "", str)
+            and (t.get("title") or "").startswith("VERIFY:")
             and t.get("status") not in ("closed", "approved")
         ):
             try:
@@ -81,6 +79,7 @@ async def _spawn_post_approve_verify_task(
     original_assignee = parent_task.get("assignee_id")
     from hiveweave.services.attestation import resolve_task_policy
 
+    parent_tags = parent_task.get("tags") or []
     parent_policy = parent_task.get("policy_id") or resolve_task_policy(
         title=parent_task.get("title") or "",
         tags=parent_tags if isinstance(parent_tags, list) else [],

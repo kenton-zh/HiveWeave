@@ -117,7 +117,10 @@ async def test_ensure_worktree_allows_builder_coordinator(tmp_path):
             Mock(return_value=Mock(create=create_mock)),
         ),
     ):
-        result = await ensure_executor_worktree("proj-1", "mid-1")
+        # force=True: 本测试验证"builder coordinator 允许建树"的授权语义，
+        # mock 环境无 in-flight 任务 —— 不绕过 open-gate 会命中
+        # TEST6 P1-2 的 idle-skip（worktree_recreate_skipped_no_open_tasks）。
+        result = await ensure_executor_worktree("proj-1", "mid-1", force=True)
     assert result["success"] is True, result.get("message")
     assert result["short_id"] == "A003"
     create_mock.assert_awaited_once()

@@ -78,13 +78,16 @@ class VerifyMixin:
 
     @staticmethod
     def _is_verify_task(task: dict) -> bool:
+        """True only for system VERIFY tasks (title ``VERIFY:`` prefix).
+
+        TEST19 教训: agent 自由 tag ``verify`` 不再参与判定 —— 它曾被
+        磐石用来标记普通模块验证任务, 使 14+ 处 VERIFY 特殊逻辑（隔离门/
+        强制 main/sibling 清扫/claim 行为等）误伤普通实施任务。系统
+        spawn（verify_spawn.py）创建的 VERIFY 任务标题始终带 ``VERIFY:``
+        前缀, 收敛为单通道不丢失系统任务。
+        """
         title = task.get("title") or ""
-        tags = task.get("tags") or []
-        if isinstance(title, str) and title.startswith("VERIFY:"):
-            return True
-        if isinstance(tags, list) and "verify" in [str(x).lower() for x in tags]:
-            return True
-        return False
+        return isinstance(title, str) and title.startswith("VERIFY:")
 
     @staticmethod
     def _verify_title_key(title: str | None) -> str:
@@ -288,6 +291,7 @@ class VerifyMixin:
                         f"duplicate VERIFY closed; sibling {except_id[:8]} "
                         "succeeded, inactive duplicate cleaned up"
                     ),
+                    reason_code="duplicate_cleanup",
                 )
                 closed += 1
             except Exception as e:

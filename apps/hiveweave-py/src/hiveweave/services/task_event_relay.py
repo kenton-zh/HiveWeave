@@ -80,15 +80,29 @@ class TaskEventRelay:
         except (json.JSONDecodeError, TypeError):
             payload = {}
 
+        # Fetch task once — recipients + message title both need it
+        task = await self._get_task(project_id, task_id)
+        if not task:
+            return
+
+        # archive_task 同步推送带 reason_code 的恢复指引（同 idempotency key）。
+        # 若 relay 在同步推送前抢跑，短 FYI 会占坑、详指引被幂等丢掉。
+        # 因此 task.archived 只由 close.py 直推，relay 跳过。
+        if event_type == "task.archived":
+            return
+
         # Determine recipients based on event type
         recipients = await self._determine_recipients(
-            project_id, event_type, task_id, actor_id, payload
+            project_id, event_type, task_id, actor_id, payload, task=task
         )
         if not recipients:
             return
 
-        # Build message content
-        message = self._build_message(event_type, task_id, payload)
+        # Build message content (title from task row — event payload is "{}"
+        # for transition events, so falling back to payload would be empty)
+        message = self._build_message(
+            event_type, task_id, payload, title=task.get("title") or ""
+        )
 
         # Send to each recipient (idempotent via event-based key)
         inbox = InboxService()
@@ -121,6 +135,7 @@ class TaskEventRelay:
         task_id: str,
         actor_id: str | None,
         payload: dict,
+        task: dict | None = None,
     ) -> list[str]:
         """Determine who should be notified for this event.
 
@@ -130,12 +145,16 @@ class TaskEventRelay:
         - task.rework → assignee (needs rework)
         - task.closed → creator + assignee
         - task.archived → assignee + creator
-        - Other events → no relay notification (handled by direct path)
+        - task.claimed / task.running → creator (work started)
+        - task.blocked → creator (may need to unblock)
+        - task.verifying → creator (verification began)
+        - task.created → no relay (dispatch already delivers the description)
         """
         recipients: list[str] = []
 
         # Fetch task to get creator_id + assignee_id
-        task = await self._get_task(project_id, task_id)
+        if task is None:
+            task = await self._get_task(project_id, task_id)
         if not task:
             return []
 
@@ -165,9 +184,21 @@ class TaskEventRelay:
                 recipients.append(assignee)
             if creator and creator not in recipients:
                 recipients.append(creator)
-        # task.created, task.claimed, task.running, task.blocked:
-        # These are handled by the direct notification path in task tools.
-        # The relay doesn't duplicate them.
+        elif event_type == "task.claimed":
+            # Creator knows work started (direct path was missing)
+            if creator and creator != assignee:
+                recipients.append(creator)
+        elif event_type == "task.running":
+            if creator and creator != assignee:
+                recipients.append(creator)
+        elif event_type == "task.blocked":
+            # Creator may need to unblock (deps / waiting contracts)
+            if creator:
+                recipients.append(creator)
+        elif event_type == "task.verifying":
+            # Creator knows verification began
+            if creator:
+                recipients.append(creator)
 
         # Don't notify the actor themselves
         if actor_id and actor_id in recipients:
@@ -175,9 +206,16 @@ class TaskEventRelay:
 
         return recipients
 
-    def _build_message(self, event_type: str, task_id: str, payload: dict) -> str:
-        """Build inbox message text for the event."""
-        title = (payload.get("title") or "")[:80]
+    def _build_message(
+        self, event_type: str, task_id: str, payload: dict, *, title: str = ""
+    ) -> str:
+        """Build inbox message text for the event.
+
+        Title comes from the task row (``_get_task``), not the event payload —
+        transition events store ``{}`` payload and archived events store only
+        the archive meta (no title).
+        """
+        title = (title or payload.get("title") or "")[:80]
         short_id = task_id[:8]
 
         messages = {
@@ -185,7 +223,18 @@ class TaskEventRelay:
             "task.approved": f"[TASK APPROVED] {title} ({short_id}) has been approved.",
             "task.rework": f"[REWORK REQUESTED] {title} ({short_id}) needs rework. Check review feedback.",
             "task.closed": f"[TASK CLOSED] {title} ({short_id}) is closed.",
-            "task.archived": f"[TASK ARCHIVED] {title} ({short_id}) was archived.",
+            "task.archived": (
+                f"[TASK ARCHIVED] {title} ({short_id}) was archived. "
+                "恢复指引：若工作仍需继续，用 create_task 重新创建并注明原任务 "
+                f"{short_id} 与归档原因。"
+            ),
+            "task.claimed": f"[TASK CLAIMED] {title} ({short_id}) was claimed.",
+            "task.running": f"[TASK RUNNING] {title} ({short_id}) is now in progress.",
+            "task.blocked": (
+                f"[TASK BLOCKED] {title} ({short_id}) is blocked — check "
+                "dependencies / waiting contracts to unblock."
+            ),
+            "task.verifying": f"[TASK VERIFYING] {title} ({short_id}) verification started.",
         }
         return messages.get(event_type, f"[{event_type}] task {short_id}")
 

@@ -173,7 +173,7 @@ export default function ModelConfigPage({ onClose }: Props) {
       if (filled.length > 0) {
         showToast(`已探测: ${filled.join(" / ")}（来源 ${caps.source}），可手动调整`, "success");
       } else {
-        showToast("未能探测到能力信息，请手动填写", "warning");
+        showToast(caps.error || "未能探测到能力信息，请手动填写", "warning");
       }
     } catch (err: any) {
       showToast(err.message || "探测失败", "error");

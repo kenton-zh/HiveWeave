@@ -177,7 +177,13 @@ class OpenAIHandler(FormatHandler):
     """
 
     def build_url(self, base_url: str, model_id: str) -> str:
-        return f"{base_url.rstrip('/')}/chat/completions"
+        base = base_url.rstrip("/")
+        # 幂等兜底（TEST19 教训）：UI 里用户可能把完整端点
+        # （…/chat/completions）填进 base_url——再拼一次会变成
+        # …/chat/completions/chat/completions → 网关 404 HTML 页。
+        if base.endswith("/chat/completions"):
+            return base
+        return f"{base}/chat/completions"
 
     def build_headers(self, api_key: str, model_config: dict | None = None) -> dict[str, str]:
         return {

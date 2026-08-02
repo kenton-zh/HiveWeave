@@ -255,8 +255,8 @@ async def nudge_verify_tasks_after_merge(
     tasks = await ts.list_tasks(project_id)
     nudged = 0
     for t in tasks:
-        tags = t.get("tags") or []
-        if not (isinstance(tags, list) and "verify" in tags):
+        # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不触发）
+        if not (t.get("title") or "").startswith("VERIFY:"):
             continue
         if t.get("status") not in ("created", "claimed", "running"):
             continue

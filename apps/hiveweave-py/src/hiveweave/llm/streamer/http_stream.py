@@ -174,6 +174,8 @@ class HttpStreamMixin:
         except PermanentError as e:
             # 不可重试错误（401/400 等）→ 不报告熔断器
             # （客户端配置问题，非 provider 故障，不应触发熔断）
+            # error_status 必须保留: agent 层靠它区分 402 余额耗尽
+            # （触发全局停唤醒）与普通客户端错误（TEST19 教训）。
             return {
                 "status": "error",
                 "text": "",
@@ -181,6 +183,7 @@ class HttpStreamMixin:
                 "tool_calls": [],
                 "finish_reason": None,
                 "error": str(e),
+                "error_status": e.status,
             }
 
     # ── 实际流式 HTTP 请求（线程池 + 同步 httpx）────────────────
