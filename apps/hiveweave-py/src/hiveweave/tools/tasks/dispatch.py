@@ -254,8 +254,12 @@ async def dispatch_task_tool(
             assignee_wt = await agent_worktree_path(resolved_id)
         except Exception:
             pass
+        from hiveweave.services.worktree_review import normalize_evidence_path
+
         for ref in params.artifact_refs:
-            ref_clean = str(ref).strip().lstrip("./")
+            # Do NOT use str.lstrip("./") — strips every leading '.' and breaks
+            # ".hiveweave/…" into "hiveweave/…" (TEST11/TEST19).
+            ref_clean = normalize_evidence_path(ref)
             if not ref_clean:
                 continue
             # .hiveweave/ paths are gitignored → invisible cross-worktree

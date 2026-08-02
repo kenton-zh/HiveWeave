@@ -28,6 +28,54 @@ from .helpers import coerce_to_list, get_project_id, resolve_agent_id
 log = structlog.get_logger(__name__)
 
 
+def match_agent_recipient(
+    ref: str,
+    active_agents: list[dict[str, Any]],
+    all_agents: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Resolve a recipient ref to an active agent.
+
+    Order: short_id → full UUID → name → role.
+    Returns ``(match, archived_hit)``. ``archived_hit`` is True when the only
+    match is an archived agent (caller should surface a ghost-mailbox error).
+    """
+    r_stripped = (ref or "").strip()
+    if not r_stripped:
+        return None, False
+    match: dict[str, Any] | None = None
+    for a in active_agents:
+        if a.get("short_id", "").upper() == r_stripped.upper():
+            match = a
+            break
+    if not match:
+        for a in active_agents:
+            if (a.get("id") or "").lower() == r_stripped.lower():
+                match = a
+                break
+    if not match:
+        for a in active_agents:
+            if a.get("name", "").lower() == r_stripped.lower():
+                match = a
+                break
+    if not match:
+        for a in active_agents:
+            if a.get("role", "").lower() == r_stripped.lower():
+                match = a
+                break
+    if match:
+        return match, False
+    for a in all_agents or []:
+        if (a.get("status") or "") != "archived":
+            continue
+        if (
+            a.get("short_id", "").upper() == r_stripped.upper()
+            or a.get("name", "").lower() == r_stripped.lower()
+            or (a.get("id") or "").lower() == r_stripped.lower()
+        ):
+            return None, True
+    return None, False
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Section 1: Messaging tools
 # ═══════════════════════════════════════════════════════════════════════
@@ -51,8 +99,9 @@ async def _send_message_core(
     - JSON-string recipients (LLM sometimes sends ``'["HR"]'`` as a string).
     - User aliases (``user``, ``用户``, ``boss``, ``老板``) -- writes to
       ``chat_messages`` so the message appears in the user's Chat window.
-    - Agent resolution: short_id -> name -> role (with warning on role
-      fallback).
+    - Agent resolution: short_id -> UUID -> name -> role (with warning on role
+      fallback). UUID matching is required — platform messages embed full ids
+      and the tool schema advertises UUID recipients (TEST19 evening P1).
     - Self-skip (sending to yourself is a no-op).
     - TeamChat recording for the sender (BUG-034 fix).
     - message_type: ``ask`` forces expect_report; ``notify`` forces no expect.
@@ -151,42 +200,24 @@ async def _send_message_core(
     archived_hits: list[str] = []
     for r in recipients:
         r_stripped = r.strip()
-        match = None
-        # Try short_id match (active first)
-        for a in active_agents:
-            if a.get("short_id", "").upper() == r_stripped.upper():
-                match = a
-                break
-        # Try name match (case-insensitive)
+        match, archived_hit = match_agent_recipient(
+            r_stripped, active_agents, all_agents
+        )
+        if match and match.get("role", "").lower() == r_stripped.lower() and (
+            match.get("short_id", "").upper() != r_stripped.upper()
+            and (match.get("id") or "").lower() != r_stripped.lower()
+            and match.get("name", "").lower() != r_stripped.lower()
+        ):
+            log.warning(
+                "send_message_role_fallback",
+                agent_id=agent_id,
+                recipient=r,
+                matched_name=match.get("name"),
+                hint="use 花名 or short_id instead of role",
+            )
         if not match:
-            for a in active_agents:
-                if a.get("name", "").lower() == r_stripped.lower():
-                    match = a
-                    break
-        # Try role match (e.g. "HR") -- last resort, warn to use 花名
-        if not match:
-            for a in active_agents:
-                if a.get("role", "").lower() == r_stripped.lower():
-                    match = a
-                    log.warning(
-                        "send_message_role_fallback",
-                        agent_id=agent_id,
-                        recipient=r,
-                        matched_name=match.get("name"),
-                        hint="use 花名 or short_id instead of role",
-                    )
-                    break
-        if not match:
-            # Detect archived-only hits for a clear error
-            for a in all_agents:
-                if (a.get("status") or "") != "archived":
-                    continue
-                if (
-                    a.get("short_id", "").upper() == r_stripped.upper()
-                    or a.get("name", "").lower() == r_stripped.lower()
-                ):
-                    archived_hits.append(r_stripped)
-                    break
+            if archived_hit:
+                archived_hits.append(r_stripped)
             not_found.append(r)
             continue
         # Skip self -- sending to yourself is a no-op

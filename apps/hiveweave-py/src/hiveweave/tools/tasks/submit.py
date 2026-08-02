@@ -216,9 +216,8 @@ async def submit_task_tool(
     attest_ids = list(params.attestation_ids or [])
 
     # TEST21 M14: UI VERIFY requires core_interaction evidence
-    is_verify = "verify" in {
-        str(t).strip().lower() for t in (tags if isinstance(tags, list) else [])
-    }
+    # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不触发）
+    is_verify = (task.get("title") or "").startswith("VERIFY:")
     parent_policy = policy_id
     parent_tags: list = []
     if is_verify and task.get("parent_task_id"):
@@ -455,6 +454,7 @@ async def submit_task_tool(
 
         from hiveweave.services.worktree_review import (
             agent_worktree_path as _awt,
+            normalize_evidence_path,
             project_main_workspace as _pmw,
         )
 
@@ -465,7 +465,9 @@ async def submit_task_tool(
             missing_at_submit: list[str] = []
             invisible_at_submit: list[str] = []
             for fc in fc_list[:30]:  # cap to avoid perf issues
-                fc_clean = str(fc).strip().lstrip("./")
+                # Do NOT use str.lstrip("./") — strips every leading '.' and
+                # turns ".hiveweave/…" into "hiveweave/…" (TEST11/TEST19).
+                fc_clean = normalize_evidence_path(fc)
                 if not fc_clean:
                     continue
                 if ".hiveweave/" in fc_clean:
