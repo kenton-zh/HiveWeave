@@ -40,7 +40,7 @@ TOOL_OUTPUT_MAX_LINES = 2000
 TOOL_OUTPUT_MAX_BYTES = 50_000
 TOOL_OUTPUT_RETENTION_DAYS = 7
 TOOL_OUTPUT_FILE_MAX_BYTES = 10 * 1024 * 1024  # 10MB
-PREVIEW_HEAD_LINES = 20
+PREVIEW_HEAD_LINES = 20  # kept for callers/tests; preview built via token_utils
 PREVIEW_TAIL_LINES = 5
 PREVIEW_TAIL_THRESHOLD = 25  # only include tail if total > 25 lines
 
@@ -1384,7 +1384,8 @@ class ToolExecutor:
           - threshold: > 2000 lines OR > 50KB
           - file: .hiveweave/tool_outputs/<agent_id>_<ts>_<safe_tool>.txt
           - cap: 10MB per file
-          - preview: head 20 lines + marker + tail 5 lines (tail only if > 25)
+          - preview: head/tail with per-line + total char dual-cap
+            (truncation is last-resort; tools must shrink upstream)
         """
         if not output:
             return output
@@ -1400,17 +1401,9 @@ class ToolExecutor:
             output, agent_id, tool_name, workspace_path
         )
 
-        head = lines[:PREVIEW_HEAD_LINES]
-        tail = lines[-PREVIEW_TAIL_LINES:] if len(lines) > PREVIEW_TAIL_THRESHOLD \
-            else []
+        from hiveweave.conversation.token_utils import build_tool_output_preview
 
-        marker = (
-            f"\n\n... [output truncated: {len(lines)} lines, "
-            f"{byte_len} bytes. Full output saved to {file_path}] ...\n\n"
-        )
-
-        parts = head + [marker] + tail
-        return "\n".join(parts)
+        return build_tool_output_preview(output, file_path)
 
     @staticmethod
     def _save_tool_output_file(

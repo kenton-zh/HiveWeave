@@ -19,6 +19,7 @@
 """
 
 import asyncio
+import html
 import json
 import re
 import time
@@ -54,6 +55,9 @@ SKILLS_SH_SITEMAP_URLS = (
     "https://www.skills.sh/sitemap-skills-2.xml",
 )
 SKILLS_SH_INDEX_TTL = 3600.0  # sitemap 全量索引缓存 1 小时
+# list_available_skills 输出契约：每条描述短摘要，禁止把详情页 HTML 残片灌进对话
+# （TEST19 晚轮：单行 73KB summary 击穿行截断 → 天线 turn ≈20k tokens）
+SKILL_LIST_DESC_MAX_CHARS = 160
 
 # SkillHub — 国内技能商店 (https://skillhub.cn)
 # 当 skills.sh 不可达时自动降级到 SkillHub HTTP API 搜索。
@@ -754,6 +758,35 @@ def _filter_skill_slugs(slugs: list[str], search: str | None) -> list[str]:
     ]
 
 
+def _sanitize_skill_list_desc(
+    text: str, *, max_chars: int = SKILL_LIST_DESC_MAX_CHARS
+) -> str:
+    """Collapse skill summaries into a single short line for list output.
+
+    Upstream contract: list_available_skills must never emit multi-KB / HTML
+    debris descriptions. Truncation downstream is only a last resort.
+    """
+    if not text:
+        return "No description"
+    s = html.unescape(str(text))
+    # Mangled scrapes often keep literal \\u003c / \\n sequences
+    s = (
+        s.replace("\\u003c", "<")
+        .replace("\\u003e", ">")
+        .replace("\\u003C", "<")
+        .replace("\\u003E", ">")
+        .replace("\\n", " ")
+        .replace("\\t", " ")
+    )
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return "No description"
+    if len(s) > max_chars:
+        return s[: max_chars - 1].rstrip() + "…"
+    return s
+
+
 def _collect_skills_sh_results(
     candidates: list[str], details: list[Any]
 ) -> list[dict]:
@@ -771,11 +804,17 @@ def _collect_skills_sh_results(
         if isinstance(detail, dict) and detail:
             if detail.get("requires_api_key"):
                 continue
-            summary = detail.get("summary") or detail.get("description") or ""
+            summary = _sanitize_skill_list_desc(
+                detail.get("summary") or detail.get("description") or ""
+            )
             skills.append({
                 "slug": slug,
-                "summary": f"{skill_name}: {summary}" if summary else f"{skill_name} — from {parts[0]}/{parts[1]}",
-                "description": summary or "",
+                "summary": (
+                    f"{skill_name}: {summary}"
+                    if summary != "No description"
+                    else f"{skill_name} — from {parts[0]}/{parts[1]}"
+                ),
+                "description": summary if summary != "No description" else "",
                 "displayName": skill_name,
             })
         else:
@@ -1236,7 +1275,17 @@ class SkillRegistryService:
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         if text.startswith("Summary"):
             text = text[7:].strip()
-        return text if text else None
+        if not text:
+            return None
+        # Reject page dumps / markup debris (TEST19: 73KB HTML leftovers as "summary")
+        cleaned = _sanitize_skill_list_desc(text, max_chars=500)
+        if cleaned == "No description":
+            return None
+        # Only fail-closed on residual *tag-shaped* markup — plain "<" in
+        # prose (e.g. "use a < b") must survive.
+        if re.search(r"<[A-Za-z/!?]", cleaned):
+            return None
+        return cleaned
 
     # ── SkillHub 国内商店搜索（skills.sh 不可达时自动降级）────
 
@@ -1460,21 +1509,24 @@ class SkillRegistryService:
             lines.append("## Built-in Skills")
             for s in builtin:
                 slug = s["slug"]
+                desc = _sanitize_skill_list_desc(s.get("description", ""))
                 if slug in existing_cache:
                     # 已在缓存中，用已有的序号
                     existing_idx = existing_cache.index(slug) + 1
-                    lines.append(f"- **#{existing_idx}** {slug}: {s.get('description', '')} [built-in]")
+                    lines.append(f"- **#{existing_idx}** {slug}: {desc} [built-in]")
                 else:
                     idx += 1
                     all_slugs.append(slug)
-                    lines.append(f"- **#{idx}** {slug}: {s.get('description', '')} [built-in]")
+                    lines.append(f"- **#{idx}** {slug}: {desc} [built-in]")
 
         if remote_skills:
             lines.append("")
             lines.append(f"## {remote_source_label}")
             for s in remote_skills:
                 slug = s["slug"]
-                desc = s.get("summary") or s.get("description") or "No description"
+                desc = _sanitize_skill_list_desc(
+                    s.get("summary") or s.get("description") or "No description"
+                )
                 if slug in existing_cache:
                     existing_idx = existing_cache.index(slug) + 1
                     lines.append(f"- **#{existing_idx}** {slug}: {desc}")

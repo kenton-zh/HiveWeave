@@ -6,6 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **遇到问题要反思**：为什么会有这个问题？从宏观、治根的角度修复问题，不要“打地鼠”式地修补表面。
 
+### 工具输出：截断前化解，截断只是最后兜底
+
+**触发截断本身就说明上游已经漏了**——正常路径不该产出需要截断的东西。分层（不可颠倒）：
+
+1. **上游（治本）**：工具/服务在返回前就把结果收成可读短契约——限条数、限每条描述长度、按行结构化、禁单行 JSON dump / HTML 残片进对话。Agent 需要细节时再按需 `read_skill` / `read_file`，不要一次灌全文。
+2. **中游**：大结果落盘（`.hiveweave/tool_outputs/`），回传短摘要 + 文件句柄；不要把 50KB+ 正文塞进 chat / `conversation_turns`。
+3. **下游（兜底）**：`_maybe_save_large_output` / `truncate_tool_output` 是安全带，不是主药方。预览必须**按行 + 按字符双封顶**（单行超长输出不能击穿 head/tail 行截断；阈值触发仍按字节，预览预算按字符）。修截断阈值 ≠ 修根因；发现截断被打穿时，先查是哪个工具产出了病态大输出。
+
+反例（TEST19 晚轮）：`list_available_skills` 把 skills.sh 详情页 HTML 残片当 summary → 单行 73KB → 行截断形同虚设 → 天线 turn ≈20k tokens。药方顺序：先收缩技能列表输出契约，再硬化截断兜底。
+
 ### 跨平台 AI 项目记忆（本地，不进远程）
 
 路径：**仓库根目录 [`AI_MEMORY.local.md`](AI_MEMORY.local.md)**（已 gitignore）。
@@ -14,6 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **不必遵守**各平台自带的记忆路径或存储规则
 - **统一读写本文件**；跨会话、跨平台复用同一份记忆
 - 个人环境配置仍写 [`CLAUDE.local.md`](CLAUDE.local.md)；本文件只放可复用的项目事实（决策、坑、根因、未完成上下文），禁止密钥
+- **写入规范**：只记根因 / 仍在生效的决策 / 可预见的坑 / 未完成上下文；不记测试通过数、提交哈希、过程流水（提交记录可查）。修复完成的事务就地更新原条目，不追加；同主题条目 ≥3 或文件膨胀时按主题压缩合并（沿用文件内「速览 / 关键决策 / 高频踩坑 / 未完成」结构）
 
 ## Commands
 

@@ -27,8 +27,14 @@ PRUNE_MINIMUM_TOKENS = 20_000
 TOOL_OUTPUT_MAX_CHARS = 2_000
 
 # 工具输出智能截断限制（镜像 OpenCode ToolOutputStore）
+# 分层：工具侧先收成短契约；此处只是最后兜底（须按行+字节双封顶）
 TOOL_OUTPUT_MAX_LINES = 2_000
 TOOL_OUTPUT_MAX_BYTES = 51_200  # 50 KB
+PREVIEW_HEAD_LINES = 20
+PREVIEW_TAIL_LINES = 5
+PREVIEW_TAIL_THRESHOLD = 25  # only include tail if total > 25 lines
+PREVIEW_LINE_MAX_CHARS = 500  # single-line dumps must not defeat line truncation
+PREVIEW_MAX_CHARS = 4_000  # total preview budget returned to the model
 
 # CJK 检测范围（对齐 TS token-utils.ts）
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
@@ -124,6 +130,10 @@ def truncate_tool_output(
 
     镜像 OpenCode ToolOutputStore 模式：保留头部（结构/上下文）和尾部（结果/结论），
     中间用省略标记替换，附带完整输出的临时文件路径。
+
+    预览按行 + 按字符双封顶——单行超长 JSON/HTML 残片不能击穿行截断
+    （TEST19: list_available_skills 单行 73KB → 行截断形同虚设）。
+    阈值仍按字节（TOOL_OUTPUT_MAX_BYTES）；预览预算按字符（PREVIEW_*_CHARS）。
     """
     if not isinstance(output, str):
         output = str(output)
@@ -137,14 +147,51 @@ def truncate_tool_output(
         return output
 
     file_path = _save_tool_output(output)
-    head_lines = lines[:20]
-    tail_lines = lines[-5:] if len(lines) > 20 else []
+    return build_tool_output_preview(output, file_path)
+
+
+def build_tool_output_preview(output: str, file_path: str) -> str:
+    """Build a line+char dual-capped preview for an already-saved large output.
+
+    Always keeps the ``Full output saved to …`` marker so the mid-layer
+    contract (disk + handle) survives the total preview budget.
+    """
+    lines = output.split("\n")
+    byte_size = len(output.encode("utf-8", errors="replace"))
+
+    def _cap_line(line: str) -> str:
+        if len(line) <= PREVIEW_LINE_MAX_CHARS:
+            return line
+        return line[: PREVIEW_LINE_MAX_CHARS - 1] + "…"
 
     marker = (
         f"\n\n... [output truncated: {len(lines)} lines, {byte_size} bytes. "
         f"Full output saved to {file_path}] ...\n\n"
     )
-    return "\n".join(head_lines + [marker] + tail_lines)
+    # Reserve marker (+ small tail budget) so total-cap never drops the handle
+    tail_budget = PREVIEW_LINE_MAX_CHARS * PREVIEW_TAIL_LINES + 64
+    head_budget = max(512, PREVIEW_MAX_CHARS - len(marker) - tail_budget)
+
+    head_lines = [_cap_line(l) for l in lines[:PREVIEW_HEAD_LINES]]
+    head = "\n".join(head_lines)
+    if len(head) > head_budget:
+        head = head[: head_budget - 1].rstrip() + "…"
+
+    tail = ""
+    if len(lines) > PREVIEW_TAIL_THRESHOLD:
+        tail_lines = [_cap_line(l) for l in lines[-PREVIEW_TAIL_LINES:]]
+        tail = "\n".join(tail_lines)
+        if len(tail) > tail_budget:
+            tail = tail[: tail_budget - 1].rstrip() + "…"
+
+    preview = head + marker + tail
+    if len(preview) > PREVIEW_MAX_CHARS:
+        # Last resort: keep marker + as much head as fits; drop tail
+        keep = PREVIEW_MAX_CHARS - len(marker) - 24
+        if keep < 64:
+            return marker.strip() + "\n... [preview capped] ..."
+        preview = head[:keep].rstrip() + marker + "... [preview capped] ..."
+    return preview
 
 
 def _save_tool_output(output: str) -> str:
