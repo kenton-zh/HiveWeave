@@ -641,6 +641,7 @@ class CloseMixin:
                 parent_id,
                 archived_by="system",
                 reason="all child tasks closed — umbrella auto-archived",
+                reason_code="umbrella_closed",
             )
             log.info(
                 "umbrella_parent_archived",
@@ -808,5 +809,109 @@ class CloseMixin:
         except Exception:
             pass
 
+        # TEST19 ③: 归档后立即向 assignee + creator 推送恢复指引。
+        # task_event_relay 对 task.archived 跳过（避免 tick 抢跑占
+        # idempotency key，把详指引挤掉）。key 仍用 task_event:… 以便
+        # 旧 relay 路径若曾投递过仍幂等。
+        try:
+            await self._notify_archived_with_guidance(
+                project_id,
+                task_id,
+                event_id=event_id,
+                archived_by=archived_by,
+                reason=reason,
+                reason_code=code,
+            )
+        except Exception as e:
+            log.warning(
+                "archive_notify_guidance_failed",
+                task_id=task_id[:12],
+                error=str(e),
+            )
+
         return current
+
+    async def _notify_archived_with_guidance(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        event_id: str,
+        archived_by: str,
+        reason: str,
+        reason_code: str,
+    ) -> None:
+        """TEST19 ③: push recovery guidance to assignee + creator on archive.
+
+        The task is already archived when this runs — inbox force-wake does
+        not apply to archived tasks, so recipients see it next time they
+        wake naturally (FYI semantics, same as the relay).
+        """
+        rows = await _query(
+            project_id,
+            "SELECT assignee_id, creator_id, title FROM tasks WHERE id = ?",
+            [task_id],
+        )
+        if not rows:
+            return
+        row = rows[0]
+        assignee = row["assignee_id"] if "assignee_id" in row.keys() else None
+        creator = row["creator_id"] if "creator_id" in row.keys() else None
+        title = (row["title"] or "")[:80] if "title" in row.keys() else ""
+        short_id = task_id[:8]
+
+        recipients = []
+        for r in (assignee, creator):
+            if r and r != archived_by and r not in recipients:
+                recipients.append(r)
+        if not recipients:
+            return
+
+        reason_short = (reason or "")[:200] or "no reason given"
+        guidance_by_code = {
+            "duplicate_cleanup": (
+                "此任务与已成功的验证任务重复，被系统自动清扫归档。"
+                "无需恢复；如仍有未覆盖的验证面，请重新创建任务并说明差异。"
+            ),
+            "umbrella_closed": (
+                "所有子任务已完成，汇总（umbrella）任务自动归档收口。"
+                "无需恢复；如需新的汇总层，请另行创建任务。"
+            ),
+            "agent_cancel": (
+                "任务被取消归档。若工作仍需继续：用 create_task 重新创建，"
+                "并在描述中注明原任务 shortId 与归档原因，以便 context 延续。"
+            ),
+        }
+        guidance = guidance_by_code.get(
+            reason_code,
+            "若工作仍需继续：用 create_task 重新创建，并在描述中注明原任务 "
+            f"shortId（{short_id}）与归档原因。",
+        )
+        message = (
+            f"[TASK ARCHIVED] {title} ({short_id}) was archived by "
+            f"{archived_by}. Reason: {reason_short}。"
+            f" 恢复指引：任务已废弃（不会进入义务/看门狗/统计）。{guidance}"
+        )
+
+        from hiveweave.services.inbox import InboxService
+
+        inbox = InboxService()
+        for recipient_id in recipients:
+            try:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=recipient_id,
+                    message=message,
+                    message_type="task_event",
+                    priority="normal",
+                    task_id=task_id,
+                    idempotency_key=f"task_event:{event_id}:{recipient_id}",
+                    wake=False,
+                )
+            except Exception as e:
+                log.debug(
+                    "archive_guidance_send_skipped",
+                    recipient=recipient_id[:12],
+                    error=str(e),
+                )
 

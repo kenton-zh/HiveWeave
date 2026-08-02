@@ -8,6 +8,7 @@ keep stampeding the same key and every resume immediately re-429s.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -17,6 +18,132 @@ log = structlog.get_logger(__name__)
 
 # project_id -> monotonic deadline for coordinated slowdown
 _project_rate_limit_until: dict[str, float] = {}
+
+# 全局余额耗尽熔断（HTTP 402）。账号级：与 429 不同，402 重试必败
+# （TEST19 教训：10 个 error run 全部 402，每个 agent 各自撞满 4 次
+# give up，watchdog 还把 escalation 投给同样已死的收件人）。
+# monotonic deadline，0 = 未触发。
+_balance_exhausted_until: float = 0.0
+
+# 402 熔断持续时间：余额耗尽需要人工充值，给足时间（默认 1 小时）。
+BALANCE_EXHAUSTED_COOLDOWN_S = 3_600.0
+
+
+def is_balance_error(error: BaseException | None) -> bool:
+    """True when the failure is account balance exhaustion (HTTP 402).
+
+    Distinct from rate limits: 402 will NOT recover by retrying — only
+    a human topping up the account fixes it. Triggers the global wake-stop.
+
+    Prefer structured ``PermanentError(status=402)``. Message fallback uses
+    phrase needles + word-bounded ``402`` compounds — bare ``"402"`` alone
+    must not arm a 1h global kill (ports / codes like 1402 / HTML crumbs).
+    """
+    if error is None:
+        return False
+    try:
+        from hiveweave.llm.retry import PermanentError
+
+        if isinstance(error, PermanentError) and getattr(error, "status", None) == 402:
+            return True
+    except Exception:
+        pass
+    msg = str(error).lower()
+    phrases = (
+        "insufficient balance",
+        "insufficient_balance",
+        "balance exhausted",
+        "payment required",
+    )
+    if any(p in msg for p in phrases):
+        return True
+    # Word-boundary compounds: "http 402" / "error 402" — not "error 4021"
+    return bool(
+        re.search(r"(?:http|status|error|code)\s*402\b", msg)
+    )
+
+
+def balance_exhausted_remaining() -> float:
+    """Seconds left on the global 402 wake-stop (0 if clear)."""
+    global _balance_exhausted_until
+    left = _balance_exhausted_until - time.monotonic()
+    if left <= 0:
+        _balance_exhausted_until = 0.0
+        return 0.0
+    return left
+
+
+def clear_balance_exhausted() -> int:
+    """Clear the global 402 wake-stop and peer resume cooldowns (after top-up).
+
+    ``broadcast_balance_exhausted`` arms both the process flag and each peer's
+    ``_resume_cooldown_until``; clearing only the flag would leave peers parked.
+    Returns number of peers whose resume cooldown was reset.
+    """
+    global _balance_exhausted_until
+    _balance_exhausted_until = 0.0
+    cleared = 0
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+
+        for peer in list(agent_manager.list_all()):
+            try:
+                until = float(getattr(peer, "_resume_cooldown_until", 0.0) or 0.0)
+                if until > 0:
+                    peer._resume_cooldown_until = 0.0
+                    cleared += 1
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug("balance_exhausted_clear_peers_failed", error=str(e))
+    return cleared
+
+
+def arm_balance_exhausted(
+    duration_s: float = BALANCE_EXHAUSTED_COOLDOWN_S,
+) -> float:
+    """Arm the global 402 wake-stop. Returns effective remaining seconds."""
+    global _balance_exhausted_until
+    until = time.monotonic() + max(duration_s, 0.0)
+    if until > _balance_exhausted_until:
+        _balance_exhausted_until = until
+    return balance_exhausted_remaining()
+
+
+def broadcast_balance_exhausted(
+    duration_s: float = BALANCE_EXHAUSTED_COOLDOWN_S,
+    *,
+    source_agent_id: str | None = None,
+) -> int:
+    """Stop ALL live agents in the process from waking (global 402 breaker).
+
+    TEST19 教训: 402 是账号级余额问题，不是某个 agent 的配置错误。
+    一个 agent 撞到 402 后，其他 agent 的唤醒请求同样必败 —— 立即停掉
+    所有唤醒，避免连环 give up + escalation 投给已死收件人。
+    Returns number of agents whose resume was suppressed.
+    """
+    remaining = arm_balance_exhausted(duration_s)
+    cooled = 0
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+
+        for peer in list(agent_manager.list_all()):
+            if source_agent_id and getattr(peer, "id", None) == source_agent_id:
+                continue
+            try:
+                peer._arm_resume_cooldown(max(remaining, 60.0))
+                cooled += 1
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug("balance_exhausted_broadcast_failed", error=str(e))
+    log.error(
+        "account_balance_exhausted",
+        source_agent_id=source_agent_id,
+        cooldown_s=remaining,
+        peers_cooled=cooled,
+    )
+    return cooled
 
 
 def is_rate_limit_error(error: BaseException | None) -> bool:

@@ -76,7 +76,10 @@ from hiveweave.agents.types import (  # noqa: F401
     StatusCallback,
     StreamEventCallback,
 )
-from hiveweave.agents.helpers.rate_limit import is_rate_limit_error  # noqa: F401
+from hiveweave.agents.helpers.rate_limit import (  # noqa: F401
+    is_balance_error,
+    is_rate_limit_error,
+)
 from hiveweave.agents.helpers.stall import (  # noqa: F401
     _stall_break_ledger,
     _turn_has_substantial_progress,
@@ -378,6 +381,18 @@ class Agent:
             # 检查暂停
             if system_state.paused():
                 return {"error": "paused"}
+
+            # 全局余额耗尽熔断（HTTP 402，TEST19）——立即拒绝所有新 LLM 回合，
+            # 避免连环 give up；余额恢复由用户充值后自然解冻（cooldown 到期）。
+            try:
+                from hiveweave.agents.helpers.rate_limit import (
+                    balance_exhausted_remaining,
+                )
+
+                if balance_exhausted_remaining() > 0:
+                    return {"error": "balance_exhausted"}
+            except Exception:
+                pass
 
             # Bug K fix: 检查项目是否"上班"状态
             from hiveweave.db import meta as _meta_db
@@ -911,7 +926,23 @@ class Agent:
                             continue  # retry stream with backup
 
                     # ── Existing error handling ──
-                    if err_status == 429 or (
+                    # 402 余额耗尽优先判断：账号级、重试必败、全局熔断。
+                    # is_balance_error 兜底消息 needle —— 部分错误面
+                    # （tool_exec 异常、core.py 通用 except）不带 error_status。
+                    if err_status == 402 or is_balance_error(
+                        ValueError(error_msg)
+                    ):
+                        # TEST19 P0-2: 余额耗尽 → 立即全局停唤醒 + 通知用户。
+                        # 402 重试必败，且是账号级问题 —— 所有 agent 的唤醒
+                        # 同样必败。广播熔断 + 保留未读 inbox（恢复后重试）。
+                        from hiveweave.agents.helpers.rate_limit import (
+                            broadcast_balance_exhausted,
+                        )
+
+                        broadcast_balance_exhausted(source_agent_id=self.id)
+                        await self._notify_user_balance_exhausted(error_msg)
+                        await self._handle_error(ValueError(error_msg))
+                    elif err_status == 429 or (
                         isinstance(err_headers, dict) and err_headers
                     ):
                         from hiveweave.llm.retry import RetryableError
@@ -2230,7 +2261,8 @@ class Agent:
     def _in_resume_cooldown(self) -> bool:
         """Whether this agent is inside a post-timeout/error resume cooldown.
 
-        Also honors project-wide account rate-limit throttle (TEST18 P0-5).
+        Also honors project-wide account rate-limit throttle (TEST18 P0-5)
+        and the global 402 balance-exhaustion wake-stop (TEST19).
         Do NOT peek circuit OPEN here — HALF_OPEN only advances inside
         ``circuit_breaker.check()``; blocking resume on raw OPEN permanently
         prevents the probe that would clear the breaker.
@@ -2239,9 +2271,12 @@ class Agent:
             return True
         try:
             from hiveweave.agents.helpers.rate_limit import (
+                balance_exhausted_remaining,
                 project_rate_limit_remaining,
             )
 
+            if balance_exhausted_remaining() > 0:
+                return True
             if project_rate_limit_remaining(self.project_id) > 0:
                 return True
         except Exception:
@@ -2478,6 +2513,48 @@ class Agent:
         广播失败静默吞掉 —— 绝不能因广播异常搞挂 agent。
         """
         return _agent_streaming.broadcast_agent_health(self, health, message)
+
+    async def _notify_user_balance_exhausted(self, error_msg: str) -> None:
+        """通知用户：账号余额耗尽，所有 agent 已暂停唤醒（TEST19 P0-2）。
+
+        走 message_user 同款通道（ChatMessageService + status_event_bus），
+        消息落在触发 agent 的聊天窗口。失败静默吞掉 —— 通知是尽力而为，
+        熔断本身已由 broadcast_balance_exhausted 保证。
+        """
+        try:
+            from hiveweave.services.chat_message import ChatMessageService
+
+            chat_service = ChatMessageService()
+            await chat_service.save_message({
+                "agent_id": self.id,
+                "role": "assistant",
+                "content": (
+                    "[PLATFORM] 账号余额耗尽（HTTP 402），已全局暂停唤醒所有 "
+                    f"agent 约 1 小时。请充值后等待熔断自动解除：{error_msg[:200]}"
+                ),
+                "thinking": None,
+                "tool_calls": "[]",
+                "is_streaming": False,
+                "is_background": False,
+            })
+            from hiveweave.realtime.event_bus import status_event_bus
+
+            await status_event_bus.publish_chat_message(
+                agent_id=self.id,
+                message={
+                    "role": "assistant",
+                    "content": (
+                        "[PLATFORM] 账号余额耗尽（HTTP 402），已全局暂停唤醒 "
+                        f"所有 agent。请充值后等待熔断自动解除：{error_msg[:200]}"
+                    ),
+                },
+            )
+        except Exception as e:
+            log.warning(
+                "notify_user_balance_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
 
     # ── Streamer 回调 ────────────────────────────────────────
 

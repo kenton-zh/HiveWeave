@@ -12,6 +12,46 @@ from .policy import resolve_task_policy
 
 log = structlog.get_logger(__name__)
 
+# 平台保留 tag：仅系统 spawn（verify_spawn.py）可打。agent/user 提交时剥离，
+# 防止普通任务被误判为 VERIFY 系统任务（TEST19 教训：tags=verify 污染
+# 触发 review 隔离门 / 强制 main / sibling 清扫等 14+ 处特殊逻辑）。
+_PLATFORM_RESERVED_TAGS = frozenset({"verify", "mandatory", "post-merge"})
+
+
+def _strip_platform_reserved_tags(
+    tags: list[str] | None, *, source: str, title: str = ""
+) -> list[str] | None:
+    """Strip reserved tags for non-system writers. Returns cleaned list or None."""
+    if source == "system" or not tags:
+        return tags
+    stripped: list[str] = []
+    clean: list[str] = []
+    for t in tags:
+        if str(t).strip().lower() in _PLATFORM_RESERVED_TAGS:
+            stripped.append(t)
+        else:
+            clean.append(t)
+    if stripped:
+        log.warning(
+            "reserved_tag_stripped",
+            task_title=(title or "")[:60],
+            stripped=stripped,
+            source=source,
+        )
+    return clean if clean else None
+
+
+def _reject_forged_verify_title(title: str | None, *, source: str) -> None:
+    """VERIFY: prefix is system-only (verify_spawn). Agents must not mint it."""
+    if source == "system":
+        return
+    raw = (title or "").lstrip()
+    if raw.upper().startswith("VERIFY:"):
+        raise ValueError(
+            "title prefix 'VERIFY:' is reserved for system-spawned verification "
+            "tasks; use a normal title (verify_spawn mints VERIFY: tasks)"
+        )
+
 
 class CrudMixin:
     """create / get / list / resolve / update / dedup helpers."""
@@ -50,6 +90,11 @@ class CrudMixin:
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
         task_id = str(uuid.uuid4())
+
+        # VERIFY: 前缀 + 保留 tag 均为系统专属。agent/user 不得伪造。
+        _reject_forged_verify_title(title, source=source)
+        tags = _strip_platform_reserved_tags(tags, source=source, title=title)
+
         policy_id = resolve_task_policy(title, tags, description)
 
         # Normalize parent_task_id: agents may pass 8-char prefixes; always
@@ -427,12 +472,24 @@ class CrudMixin:
 
         Supports: title, description, priority, due_at, assignee_id, tags,
         expected_modules. JSON-serializes list fields. Updates updated_at.
+
+        Non-system writers cannot mint ``VERIFY:`` titles or reserved tags
+        via PATCH (mirrors create_task hardening).
         """
         allowed = {"title", "description", "priority", "due_at", "assignee_id",
                    "tags", "expected_modules"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
+        # update_task has no source kw — treat as agent/user path.
+        if "title" in updates:
+            _reject_forged_verify_title(updates.get("title"), source="agent")
+        if "tags" in updates:
+            updates["tags"] = _strip_platform_reserved_tags(
+                updates.get("tags"),
+                source="agent",
+                title=str(updates.get("title") or ""),
+            )
         await _ensure_schema(project_id)
         set_clauses: list[str] = []
         params: list = []

@@ -180,6 +180,8 @@ class ToolLoopMixin:
                     "rounds": round_num + 1,
                     "usage": last_usage,
                     "error": round_result.get("error"),
+                    "error_status": round_result.get("error_status"),
+                    "error_headers": round_result.get("error_headers"),
                 }
 
             new_text = round_result["text"] or ""

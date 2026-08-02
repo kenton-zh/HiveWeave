@@ -144,7 +144,12 @@ _SYSTEM_DIR_BLOCK = """## IMPORTANT: HiveWeave System Directory
   All team members can read and write here — documents, plans, temp files, scripts, anything.
   Use it to collaborate: drop notes, share drafts, coordinate via files.
 - **Work files (ALLOWED)**: `.hiveweave/reports/`, `.hiveweave/drafts/`, `.hiveweave/worktrees/`
-  are for your individual drafts, reports, and test outputs."""
+  are for your individual drafts, reports, and test outputs.
+- **Official evidence location (TEST19 ⑥)**: task evidence goes to
+  `.hiveweave/reports/<task-shortId>/` (`evidence*.md`, `test*.log`).
+  Submit attestations with relative paths under that dir. Never put
+  evidence in `tool_outputs/` (system-managed) or anywhere else under
+  `.hiveweave/`."""
 
 
 _HONESTY_BLOCK = """## Honesty & Integrity Rules (MANDATORY — ZERO TOLERANCE)

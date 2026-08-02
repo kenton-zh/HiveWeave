@@ -292,12 +292,17 @@ class DispatchService:
 
                 task_row = await self.task_service.get_task(project_id, task_id)
                 if task_row and _TS._is_verify_task(task_row):
+                    short = str(task_id)[:8]
                     description_out += (
                         f"\n\n[VERIFY GUIDANCE] This is a verification task. "
                         f"Validate against the project root (main branch) at "
                         f"`{ws}`, NOT your personal worktree — the worktree "
                         f"may be stale. Use `read_file` / `bash` with cwd at "
                         f"the project root to inspect the merged result."
+                        f"\n[EVIDENCE LOCATION] 官方证据落点（唯一约定）："
+                        f"`.hiveweave/reports/{short}/`（evidence*.md / "
+                        f"test*.log）。禁止把证据写到 `.hiveweave/` 其他位置、"
+                        f"`tool_outputs/` 或工作区外。提交时附相对路径。"
                     )
                     # Re-pin description with VERIFY guidance
                     if description_out != description:

@@ -988,14 +988,8 @@ async def check_verify_baseline(
     Returns error string or None if OK / not applicable.
     """
     title = task.get("title") or ""
-    tags = task.get("tags") or []
-    is_verify = (
-        (isinstance(title, str) and title.startswith("VERIFY:"))
-        or (
-            isinstance(tags, list)
-            and "verify" in [str(x).lower() for x in tags]
-        )
-    )
+    # TEST19 教训: 只认系统 VERIFY: 前缀, 不认 agent 自由 tag "verify"
+    is_verify = isinstance(title, str) and title.startswith("VERIFY:")
     if not is_verify:
         return None
 

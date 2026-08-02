@@ -37,9 +37,14 @@ class ToolResult:
         return cls(success=True, output=output, error=None, extra=extra)
 
     @classmethod
-    def err(cls, message: str) -> "ToolResult":
-        """Build an error result. ``success`` is always ``False``."""
-        return cls(success=False, output="", error=message)
+    def err(cls, message: str, **extra: Any) -> "ToolResult":
+        """Build an error result. ``success`` is always ``False``.
+
+        Optional structured fields (e.g. ``gates``, ``actions``) go in
+        ``extra`` and are merged into the dict by :meth:`to_dict` — they
+        are observable for telemetry/future consumers (TEST19 ④).
+        """
+        return cls(success=False, output="", error=message, extra=extra)
 
     # ── serialization ────────────────────────────────────
 

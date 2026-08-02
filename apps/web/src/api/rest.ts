@@ -441,6 +441,7 @@ export interface DetectedCapabilities {
   supportsThinking: boolean | null;
   maxOutputTokens: number | null;
   source: string;
+  error?: string | null;
 }
 
 /** Probe a model's capabilities from connection info only (no save, no real chat). */

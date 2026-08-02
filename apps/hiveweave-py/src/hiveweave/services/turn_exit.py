@@ -475,6 +475,28 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
     )
 
 
+# TEST19 ④: 单一来源的 gate→action 映射。commit_turn 同步 pre-check
+# （tools/turn_tools.py）与 turn-exit backstop 共用，防漂移。
+GATE_ACTIONS: dict[str, str] = {
+    "MISSING_COMMIT_TURN": (
+        "commit_turn(phase, summary, waiting_on/result as needed)"
+    ),
+    "INVALID_TURN_RESULT": "commit_turn with valid schema",
+    "WAITING_ON_REQUIRED": "commit_turn(waiting, waiting_on=[...])",
+    "BLOCKED_WAITING_ON_REQUIRED": "commit_turn(blocked, waiting_on=[...])",
+    "UNREPLIED_ASKS": "ask_agent or send_message to sender REF",
+    "WAIT_WITHOUT_ASK": "ask_agent or send_message to REF",
+    "HIRE_UNREPORTED": "send_message/ask_agent to hiring requester",
+    "OPEN_TASKS_UNDECLARED": "advance tasks or declare waiting/blocked",
+    "ASSIGNEE_MUST_SUBMIT": "submit_task(taskId, summary, attestationIds)",
+    "REVIEWER_MUST_START_REVIEW": "review_task(taskId, decision=...)",
+    "REVIEWER_MUST_FINISH_REVIEW": "review_task(taskId, decision=...)",
+    "CREATOR_MUST_REVIEW": "review_task(taskId, decision=...)",
+    "CREATOR_MUST_MERGE": "git_worktree_merge(branchName=...)",
+    "UNCOMMITTED_WORKTREE": "git_worktree_checkpoint then commit_turn",
+}
+
+
 def _build_gate_hint(
     violations: list[str],
     unreplied: list[dict],
@@ -486,24 +508,7 @@ def _build_gate_hint(
         "[TURN EXIT BLOCKED]",
         "每一轮必须像函数一样返回 TurnResult。当前不能结束回合：",
     ]
-    gate_actions = {
-        "MISSING_COMMIT_TURN": (
-            "commit_turn(phase, summary, waiting_on/result as needed)"
-        ),
-        "INVALID_TURN_RESULT": "commit_turn with valid schema",
-        "WAITING_ON_REQUIRED": "commit_turn(waiting, waiting_on=[...])",
-        "BLOCKED_WAITING_ON_REQUIRED": "commit_turn(blocked, waiting_on=[...])",
-        "UNREPLIED_ASKS": "ask_agent or send_message to sender REF",
-        "WAIT_WITHOUT_ASK": "ask_agent or send_message to REF",
-        "HIRE_UNREPORTED": "send_message/ask_agent to hiring requester",
-        "OPEN_TASKS_UNDECLARED": "advance tasks or declare waiting/blocked",
-        "ASSIGNEE_MUST_SUBMIT": "submit_task(taskId, summary, attestationIds)",
-        "REVIEWER_MUST_START_REVIEW": "review_task(taskId, decision=...)",
-        "REVIEWER_MUST_FINISH_REVIEW": "review_task(taskId, decision=...)",
-        "CREATOR_MUST_REVIEW": "review_task(taskId, decision=...)",
-        "CREATOR_MUST_MERGE": "git_worktree_merge(branchName=...)",
-        "UNCOMMITTED_WORKTREE": "git_worktree_checkpoint then commit_turn",
-    }
+    gate_actions = GATE_ACTIONS
     labels = {
         "MISSING_COMMIT_TURN": "未调用 commit_turn — 请提交 phase/summary（及必要的 waiting_on/result）",
         "INVALID_TURN_RESULT": "commit_turn 参数无效 — 请按 schema 重试",

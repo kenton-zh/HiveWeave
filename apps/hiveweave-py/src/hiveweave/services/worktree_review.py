@@ -388,7 +388,7 @@ async def review_worktree_gate(
 ) -> tuple[str | None, dict[str, Any]]:
     """Hard gate for approve: code tasks need worktree proof; verify/no-diff do not.
 
-    Pure verification (VERIFY: title/tag, or 0 commits ahead of main with empty
+    Pure verification (VERIFY: title prefix, or 0 commits ahead of main with empty
     files_changed) must be approvable — otherwise CEO can only cancel.
     """
     from hiveweave.services.task import TaskService

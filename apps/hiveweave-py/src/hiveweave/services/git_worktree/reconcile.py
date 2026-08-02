@@ -389,18 +389,10 @@ async def _assignee_has_open_tasks(workspace_path: str, short_id: str) -> bool:
 
 
 def _row_is_verify_task(title: str | None, tags_raw: Any) -> bool:
-    """True for VERIFY children (tag or title prefix)."""
-    if isinstance(title, str) and title.startswith("VERIFY:"):
-        return True
-    tags = tags_raw
-    if isinstance(tags, str):
-        try:
-            tags = json.loads(tags)
-        except Exception:
-            tags = []
-    if isinstance(tags, list) and "verify" in [str(x).lower() for x in tags]:
-        return True
-    return False
+    """True for VERIFY children (title prefix only — TEST19 教训: agent 自由
+    tag "verify" 不得触发 VERIFY 特殊路径)."""
+    del tags_raw
+    return isinstance(title, str) and title.startswith("VERIFY:")
 
 
 async def _assignee_needs_write_worktree(
