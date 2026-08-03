@@ -497,7 +497,8 @@ class ToolLoopMixin:
                         ),
                     })
                     summary = await self._make_max_rounds_summary(
-                        agent_id, provider, messages, on_delta
+                        agent_id, provider, messages, on_delta,
+                        reason="stall_break",
                     )
                     final_text = self._strip_placeholder(summary)
                     if not final_text:
@@ -531,7 +532,8 @@ class ToolLoopMixin:
                                         round=round_num,
                                         hint_count=no_text_hint_count)
                             summary = await self._make_max_rounds_summary(
-                                agent_id, provider, messages, on_delta
+                                agent_id, provider, messages, on_delta,
+                                reason="no_text",
                             )
                             # FIX(text-acc): 同 max_rounds 路径，只用 summary
                             final_text = self._strip_placeholder(summary)
@@ -611,7 +613,8 @@ class ToolLoopMixin:
                     agent_id=agent_id,
                     max_rounds=rounds_cap)
         summary = await self._make_max_rounds_summary(
-            agent_id, provider, messages, on_delta
+            agent_id, provider, messages, on_delta,
+            reason="max_rounds",
         )
         # FIX(text-acc): 只用 summary，不拼接 text_acc。
         # summary 是专门的 LLM 调用，已概括全部进展。拼接 text_acc 会引入

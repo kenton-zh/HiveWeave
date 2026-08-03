@@ -267,24 +267,68 @@ class ContextMixin:
 
     # ── 最大轮次总结 ────────────────────────────────────────
 
+    # 总结请求失败时的如实 fallback（不冒充"达到轮数上限"）。
+    # 未知 reason 兜底显示原文（与 prompt 分支的 else 风格一致）。
+    _SUMMARY_FALLBACK_BY_REASON = {
+        "max_rounds": "limit reached",
+        "stall_break": "stalled",
+        "no_text": "no text output",
+    }
+
+    def _summary_fallback(self, reason: str) -> str:
+        label = self._SUMMARY_FALLBACK_BY_REASON.get(reason, reason)
+        return (
+            f"⚠️ Turn ended early: tool-loop {label}. "
+            "Some tasks may be incomplete."
+        )
+
     async def _make_max_rounds_summary(
         self,
         agent_id: str,
         provider: ProviderConfig,
         messages: list[dict],
         on_delta: DeltaCallback | None,
+        reason: str = "max_rounds",
     ) -> str:
-        """达到最大轮次后，做一次无工具的总结调用。"""
-        summary_prompt = (
-            "CRITICAL — MAXIMUM TOOL ROUNDS REACHED\n\n"
-            "You have reached the maximum number of tool calls for this turn. "
-            "Tools are now disabled.\n\n"
-            "You MUST respond with a text summary. Include:\n"
-            "1. What you have accomplished so far\n"
-            "2. What tasks remain incomplete\n"
-            "3. Recommended next steps\n\n"
-            "Respond with text ONLY. Do NOT attempt any tool calls."
-        )
+        """回合强制收尾的总结调用（真实原因由 ``reason`` 说明）。
+
+        三种场景共用：max_rounds（达到工具轮数上限）/ stall_break（tool
+        loop 停滞，只调只读工具无进展）/ no_text（连续只调工具不说话）。
+        fallback 文案必须如实反映 ``reason`` —— 不要冒充"达到轮数上限"。
+        """
+        if reason == "max_rounds":
+            summary_prompt = (
+                "CRITICAL — MAXIMUM TOOL ROUNDS REACHED\n\n"
+                "You have reached the maximum number of tool calls for this turn. "
+                "Tools are now disabled.\n\n"
+                "You MUST respond with a text summary. Include:\n"
+                "1. What you have accomplished so far\n"
+                "2. What tasks remain incomplete\n"
+                "3. Recommended next steps\n\n"
+                "Respond with text ONLY. Do NOT attempt any tool calls."
+            )
+        elif reason == "stall_break":
+            summary_prompt = (
+                "CRITICAL — TOOL LOOP STALLED\n\n"
+                "Your last several tool calls made no progress (only readonly / "
+                "failed / duplicate calls). Tools are now disabled.\n\n"
+                "You MUST respond with a text summary. Include:\n"
+                "1. What you have accomplished so far\n"
+                "2. What is blocking progress\n"
+                "3. Recommended next steps\n\n"
+                "Respond with text ONLY. Do NOT attempt any tool calls."
+            )
+        else:  # no_text
+            summary_prompt = (
+                "CRITICAL — NO TEXT OUTPUT\n\n"
+                "You have called tools repeatedly without producing any text. "
+                "Tools are now disabled.\n\n"
+                "You MUST respond with a text summary. Include:\n"
+                "1. What you have accomplished so far\n"
+                "2. What tasks remain incomplete\n"
+                "3. Recommended next steps\n\n"
+                "Respond with text ONLY. Do NOT attempt any tool calls."
+            )
         summary_messages = messages + [{"role": "user", "content": summary_prompt}]
 
         url = provider.build_url()
@@ -314,11 +358,11 @@ class ContextMixin:
                             "delta_id": "summary",
                         })
                         return content
-            log.warning("summary_request_failed", status=resp.status_code)
-            return "⚠️ Reached max tool rounds. Some tasks may be incomplete."
+            log.warning("summary_request_failed", status=resp.status_code, reason=reason)
+            return self._summary_fallback(reason)
         except Exception as e:
-            log.warning("summary_request_error", error=str(e))
-            return "⚠️ Reached max tool rounds. Some tasks may be incomplete."
+            log.warning("summary_request_error", error=str(e), reason=reason)
+            return self._summary_fallback(reason)
         finally:
             await client.aclose()
 
