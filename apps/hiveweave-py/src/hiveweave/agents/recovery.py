@@ -111,11 +111,9 @@ async def escalate_empty_response(agent: Any) -> None:
                     agent_id=agent.id, error=str(e))
     agent._streaming_text_acc = ""
 
-    # 标记 inbox 已读
+    # Selective ACK — spare ask/escalation/review-critical (same as give-up).
     if agent.pending_inbox_msg_ids:
-        await agent._inbox.mark_read_by_ids(
-            agent.id, agent.pending_inbox_msg_ids
-        )
+        await agent._ack_inbox_on_give_up(list(agent.pending_inbox_msg_ids))
         agent.pending_inbox_msg_ids = None
 
     # 通知上级
@@ -579,7 +577,7 @@ async def park_after_stream_timeouts(
 
     if inbox_ids:
         try:
-            await agent._inbox.mark_read_by_ids(agent.id, inbox_ids)
+            await agent._ack_inbox_on_give_up(list(inbox_ids))
         except Exception:
             pass
     agent.pending_inbox_msg_ids = None

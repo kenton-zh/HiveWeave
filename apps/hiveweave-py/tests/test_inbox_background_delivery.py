@@ -78,14 +78,13 @@ async def _fetch_one(env, sql, params):
 
 @pytest.mark.asyncio
 async def test_progress_message_wakes_via_pending_channel(env):
-    """notify → message category (no taxonomy), should_wake=True, pending channel."""
+    """normal → message category (no taxonomy), should_wake=True, pending channel."""
     svc = InboxService()
 
     msg = await svc.send_message(
         DEV_ID,
         CEO_ID,
         "穷举验证 1720 节点全部完成，X_win=0",
-        message_type="notify",
     )
     assert msg["should_wake"] is True
     assert msg["category"] == "message"
@@ -141,7 +140,7 @@ async def test_explicit_wake_false_still_background(env):
 
 @pytest.mark.asyncio
 async def test_progress_collapse_dedupes_pending(env):
-    """幂等键按内容哈希：同内容重发收敛，不同内容各自进 pending。"""
+    """幂等键按内容哈希：同内容 notify 重发收敛到 background 一条。"""
     svc = InboxService()
     m1 = await svc.send_message(
         DEV_ID, CEO_ID, "全部完成 1/3", message_type="notify"
@@ -150,20 +149,21 @@ async def test_progress_collapse_dedupes_pending(env):
         DEV_ID, CEO_ID, "全部完成 1/3", message_type="notify"
     )
 
-    pending = await svc.get_pending_messages(CEO_ID)
-    assert len(pending) == 1
-    assert pending[0]["id"] == m1["id"] == m2["id"]
+    bg = await svc.get_undelivered_background(CEO_ID)
+    assert len(bg) == 1
+    assert bg[0]["id"] == m1["id"] == m2["id"]
     assert m2.get("deduped") is True
+    assert await svc.get_pending_messages(CEO_ID) == []
 
     m3 = await svc.send_message(
         DEV_ID, CEO_ID, "全部完成 2/3", message_type="notify"
     )
-    pending = await svc.get_pending_messages(CEO_ID)
-    assert len(pending) == 2
+    bg = await svc.get_undelivered_background(CEO_ID)
+    assert len(bg) == 2
     assert m3.get("deduped") is not True
 
-    await svc.mark_read_by_ids(CEO_ID, [m["id"] for m in pending])
-    assert await svc.get_pending_messages(CEO_ID) == []
+    await svc.mark_read_by_ids(CEO_ID, [m["id"] for m in bg])
+    assert await svc.get_undelivered_background(CEO_ID) == []
 
 
 @pytest.mark.asyncio

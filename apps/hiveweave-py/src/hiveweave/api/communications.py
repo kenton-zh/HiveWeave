@@ -77,7 +77,13 @@ async def list_communications(
 
 @router.post("/api/communications")
 async def create_communication(body: CommunicationCreate) -> dict:
-    """发送 agent 间消息（写 inbox 表）。"""
+    """发送 agent 间消息（写 inbox 表）。
+
+    Security: not trusted for human identity — send_message raises ValueError
+    for from="用户"/"user"/type=user_message without trusted_platform=True.
+    Real human speech must go through the phoenix WebSocket. The ValueError
+    → 400 here is the anti-spoofing gate.
+    """
     try:
         msg = await _inbox.send_message(
             from_agent_id=body.fromAgentId,
@@ -86,6 +92,14 @@ async def create_communication(body: CommunicationCreate) -> dict:
             message_type=body.type or "normal",
             priority=body.priority or "normal",
         )
+    except ValueError as e:
+        log.warning(
+            "create_communication_rejected",
+            error=str(e),
+            from_agent_id=body.fromAgentId,
+            message_type=body.type,
+        )
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         log.error("create_communication_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to create communication")

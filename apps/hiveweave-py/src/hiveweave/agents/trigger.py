@@ -345,15 +345,15 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
             await _handoff_service.accept_pending_handoffs(project_id, agent_id)
             result = await build_trigger_context(agent_record, trigger_type)
             if result is None:
-                # Triage running / fail-closed: still latch ids so wake is not
-                # dropped under busy (Medium: busy+triage enqueue).
+                # Placeholder wake only — do NOT latch real inbox ids.
+                # Hard invariant: never ACK messages the model did not see.
+                # Unread rows stay for watcher / next real build_trigger_context.
                 pending = await _inbox_service.get_pending_messages(agent_id)
                 background = await _inbox_service.get_undelivered_background(
                     agent_id
                 )
                 pool = list(pending) + list(background)
-                inbox_msg_ids = [m["id"] for m in pool if m.get("id")]
-                if not inbox_msg_ids:
+                if not any(m.get("id") for m in pool):
                     log.info("trigger_busy_no_context", agent_id=agent_id)
                     return
                 from hiveweave.services.inbox_triage import derive_wake_category
@@ -367,7 +367,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                     agent,
                     wake_category=wake_cat,
                     from_agent_id=from_id,
-                    inbox_msg_ids=inbox_msg_ids,
+                    inbox_msg_ids=[],
                 ):
                     return
                 await agent.enqueue_wake(
@@ -375,7 +375,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                     opts={
                         "trigger": True,
                         "from_agent_id": from_id,
-                        "inbox_msg_ids": inbox_msg_ids,
+                        "inbox_msg_ids": [],
                         "wake_category": wake_cat,
                         "source": latch_opts.get("source") or "trigger_busy_queue",
                         "message_type": latch_opts.get("message_type"),
@@ -386,7 +386,8 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 log.info(
                     "trigger_busy_enqueued_triage_pending",
                     agent_id=agent_id,
-                    inbox_pending=len(inbox_msg_ids),
+                    inbox_pending=0,
+                    pool_unread=len(pool),
                     wake_category=wake_cat,
                 )
                 return

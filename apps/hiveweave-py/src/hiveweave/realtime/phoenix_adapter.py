@@ -520,6 +520,7 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
         await InboxService().send_message(
             from_agent_id="用户", to_agent_id=agent_id, message=message,
             message_type="user_message", priority="normal",
+            trusted_platform=True,
         )
         await send_fn(
             [None, None, topic, "queued_message",
