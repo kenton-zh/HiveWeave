@@ -136,7 +136,8 @@ class ContextMixin:
         total = estimate_tokens_for_messages(messages)
 
         if total <= trim_at:
-            return messages
+            # Still scrub broken pairs (e.g. short lists that never enter hard trim).
+            return self._drop_orphan_tool_artifacts(messages)
 
         log.info(
             "context_overflow_trim",
@@ -146,12 +147,17 @@ class ContextMixin:
             ratio=CONTEXT_TRIM_TRIGGER_RATIO,
         )
 
-        # 保留首 2 条（system prompt）+ 末 N 条（最近上下文）
+        # 只钉住开头连续的 system（identity / compacted_prefix）。
+        # TEST18 根因：旧逻辑 head=messages[:2] 在无 compacted 时把历史首条
+        # assistant(tool_calls) 钉进 head，随后从 tail 裁掉其 tool 回执 →
+        # 网关 400「tool_calls must be followed by tool messages」。
         if len(messages) <= 4:
-            return messages
+            return self._drop_orphan_tool_artifacts(messages)
 
-        head = messages[:2]
-        tail = messages[2:]
+        head_end = self._leading_system_count(messages)
+        # 无 leading system 时仍要能裁；head 可为空。
+        head = messages[:head_end]
+        tail = messages[head_end:]
 
         # 从 tail 前端逐步裁剪直到 token 数回到阈值以下
         while len(tail) > 2 and estimate_tokens_for_messages(head + tail) > trim_at:
@@ -160,28 +166,80 @@ class ContextMixin:
             # 原实现只检查相邻 2 条，多 tool_result 批次会留下孤儿。
             first = tail[0]
             drop = 1
-            if "tool_calls" in first:
+            tcs = first.get("tool_calls")
+            if isinstance(tcs, list) and tcs:
                 # assistant(tool_calls) — 连同其后所有同批 tool_result 一起裁剪
                 drop = 1
-                while drop < len(tail) and "tool_call_id" in tail[drop]:
+                while drop < len(tail) and (
+                    "tool_call_id" in tail[drop] or tail[drop].get("role") == "tool"
+                ):
                     drop += 1
-            elif "tool_call_id" in first:
+            elif first.get("tool_call_id") or first.get("role") == "tool":
                 # 孤儿 tool_result（其 tool_calls 已被裁剪）— 裁剪它及后续同批 tool_result
                 drop = 0
-                while drop < len(tail) and "tool_call_id" in tail[drop]:
+                while drop < len(tail) and (
+                    "tool_call_id" in tail[drop] or tail[drop].get("role") == "tool"
+                ):
                     drop += 1
+            if drop <= 0:
+                drop = 1
             tail = tail[drop:]
 
-        # R3: 最终清理 — 移除裁剪后可能残留在 tail 头部的孤儿 tool_result
-        # （循环可能因 len(tail)<=2 提前退出而留下孤儿）
-        while tail and "tool_call_id" in tail[0]:
-            tail = tail[1:]
-
-        trimmed = head + tail
+        trimmed = self._drop_orphan_tool_artifacts(head + tail)
         log.info("context_trimmed",
                  original=len(messages), trimmed=len(trimmed),
                  tokens=estimate_tokens_for_messages(trimmed))
         return trimmed
+
+    @staticmethod
+    def _leading_system_count(messages: list[dict]) -> int:
+        """Count consecutive role=system messages at the front."""
+        n = 0
+        while n < len(messages) and messages[n].get("role") == "system":
+            n += 1
+        return n
+
+    @staticmethod
+    def _drop_orphan_tool_artifacts(messages: list[dict]) -> list[dict]:
+        """Drop broken tool pairs left after hard trim.
+
+        Keeps assistant(tool_calls) only when every tool_call_id has a following
+        tool result in the immediate tool batch; drops orphan tool results.
+        """
+        out: list[dict] = []
+        i = 0
+        n = len(messages)
+        while i < n:
+            m = messages[i]
+            tcs = m.get("tool_calls")
+            if m.get("role") == "assistant" and isinstance(tcs, list) and tcs:
+                needed = {
+                    tc.get("id")
+                    for tc in tcs
+                    if isinstance(tc, dict) and tc.get("id")
+                }
+                j = i + 1
+                found: set[str] = set()
+                while j < n and (
+                    messages[j].get("role") == "tool"
+                    or messages[j].get("tool_call_id")
+                ):
+                    tid = messages[j].get("tool_call_id")
+                    if tid:
+                        found.add(tid)
+                    j += 1
+                if needed and needed <= found:
+                    out.extend(messages[i:j])
+                # else: skip broken assistant + any partial tools
+                i = j
+                continue
+            if m.get("role") == "tool" or m.get("tool_call_id"):
+                # Orphan tool result (no kept assistant ahead)
+                i += 1
+                continue
+            out.append(m)
+            i += 1
+        return out
 
     # ── 中轮提醒 ────────────────────────────────────────────
 
