@@ -501,10 +501,16 @@ async def review_task_tool(
 
         # TEST6 evening P1-3: VERIFY approve requires attestation on
         # target_merge_commit / current main tip (not a stale personal tip).
+        # TEST18 P0-2: max_behind=5 ancestor window — merge 后 worktree 祖先
+        # commit（含 merge 代码、落后 ≤5）的 attestation 也接受，消除
+        # "worktree 跑测必拒"误伤；方向由 check_verify_baseline 的
+        # target-is-ancestor 收紧把关（pre-merge base 不放行）。
         if decision == "approve" and ts._is_verify_task(task):
             from hiveweave.services.attestation import check_verify_baseline
 
-            baseline_err = await check_verify_baseline(project_id, task)
+            baseline_err = await check_verify_baseline(
+                project_id, task, max_behind=5
+            )
             if baseline_err:
                 return ToolResult.err(baseline_err)
 

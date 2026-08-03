@@ -180,10 +180,18 @@ def collect_unreplied_asks(
         fname = name_by_id.get(fid) or m.get("from_name") or fid[:8]
         m = dict(m)
         m["from_name"] = fname
-        # Deterministic check: if reply_contract_id exists and has been closed
+        # Deterministic check: if reply_contract_id exists and has been closed.
+        # 前缀容忍（TEST18 P0-3）：gate 提示展示 contract=<前 12 位>，LLM 用
+        # 前缀传 replyTo 也能闭合 — 与 inbox.py 的软警告同款匹配语义。
         contract = m.get("reply_contract_id")
-        if contract and contract in replied_contracts:
-            continue  # Reply contract fulfilled — skip
+        if contract:
+            cid = str(contract)
+            if cid in replied_contracts or any(
+                cid.startswith(rc) or rc.startswith(cid[:12])
+                for rc in replied_contracts
+                if rc
+            ):
+                continue  # Reply contract fulfilled — skip
         # Fallback heuristic: check if agent sent any message to the sender
         if fid in replied_to or fname in replied_to:
             continue
@@ -565,7 +573,16 @@ def _build_gate_hint(
                     f"MISSING={gate_actions[v]}"
                 )
                 preview = (m.get("message") or "")[:60]
-                lines.append(f"  ❌ {name}：{preview}")
+                cid = (m.get("reply_contract_id") or "")[:12]
+                # TEST18 P0-3: 附合同 ID — 用 send_message/ask_agent 的
+                # replyTo 参数原样传回即闭合；已回执过则不再重复回执。
+                cid_hint = f" contract={cid}" if cid else ""
+                lines.append(f"  ❌ {name}：{preview}{cid_hint}")
+            lines.append(
+                "  回复方式：send_message/ask_agent/notify_agent 传 "
+                "replyTo=<上方 contract 值>（原消息的 reply_contract_id，"
+                "不是工具返回的 message_id）。已回执过则直接 commit_turn。"
+            )
             emitted_unreplied = True
             continue
         if v == "WAIT_WITHOUT_ASK" and wait_without_ask_refs:

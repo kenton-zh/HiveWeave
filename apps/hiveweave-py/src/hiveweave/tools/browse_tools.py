@@ -97,19 +97,28 @@ def _parse_argv(params: BrowseParams) -> list[str] | None:
     return None
 
 
-async def _resolve_task_id(project_id: str, agent_id: str, explicit: str | None) -> str | None:
-    if explicit:
-        return explicit
-    try:
-        from hiveweave.services.task import TaskService
+async def _resolve_task_id(
+    project_id: str,
+    agent_id: str,
+    explicit: str | None,
+    command: str | None = None,
+) -> tuple[str | None, str]:
+    """Bind browse evidence to a task.
 
-        tasks = await TaskService().list_tasks(project_id, assignee_id=agent_id)
-        active = [t for t in tasks if t.get("status") in ("running", "claimed")]
-        if active:
-            return active[0].get("id")
+    TEST18 P0-2: 与 bash 的 _resolve_test_attestation_task_id 同源 —
+    多 open VERIFY 时 refuse 并列出候选（而非错绑第一个 active），
+    避免 worktree 上的 browse_e2e 绑定到错误任务。返回 (task_id, note)。
+    """
+    if explicit:
+        return explicit, ""
+    try:
+        from hiveweave.tools.bash import _resolve_test_attestation_task_id
+
+        return await _resolve_test_attestation_task_id(
+            project_id, agent_id, None, command=command
+        )
     except Exception:
-        pass
-    return None
+        return None, ""
 
 
 async def _maybe_git_commit(workspace: str) -> str | None:
@@ -408,7 +417,33 @@ async def issue_browse_e2e_attestation(
         project_id = await get_project_id(agent_id)
         if not project_id:
             return ""
-        resolved_task = await _resolve_task_id(project_id, agent_id, task_id)
+        from hiveweave.tools.bash import _is_under_or_same
+
+        resolved_task, bind_note = await _resolve_task_id(
+            project_id, agent_id, task_id, command=" ".join(argv)
+        )
+        if not resolved_task:
+            return bind_note or ""
+        # TEST18 P0-2: VERIFY 任务的 browse 证据必须在 main 工作区执行 —
+        # dev server 起在哪是运行期事实，这里事后拒发并给出替代路径，
+        # 而不是在 approve 时静默拒绝。
+        try:
+            from hiveweave.services.task import TaskService
+            from hiveweave.services.worktree_review import project_main_workspace
+
+            task = await TaskService().get_task(project_id, resolved_task)
+            if task and TaskService._is_verify_task(task):
+                main_ws = await project_main_workspace(project_id)
+                if workspace and main_ws and not _is_under_or_same(workspace, main_ws):
+                    return (
+                        "\n\n[browse_e2e REJECTED] VERIFY 任务的 UI 证据必须在主"
+                        f"工作区执行（当前 workspace={workspace!r} 非 main="
+                        f"{main_ws!r}）。请让 coordinator/CEO（项目根==main）"
+                        "执行 UI 验收，或由负责人 waive_attestation。"
+                        + bind_note
+                    )
+        except Exception:
+            pass
         commit = await _maybe_git_commit(workspace or "")
         cmd_url = " ".join(argv)[:500]
         if core_interaction:
@@ -427,7 +462,7 @@ async def issue_browse_e2e_attestation(
             console_errors=0,
         )
         extra = " core_interaction=1" if core_interaction else ""
-        return f"\n[attestation_id={att_id} kind=browse_e2e{extra}]"
+        return f"\n[attestation_id={att_id} kind=browse_e2e{extra}]{bind_note}"
     except Exception:
         return ""
 
@@ -631,7 +666,42 @@ async def assert_visual_tool(
 
         project_id = await get_project_id(agent_id)
         if project_id:
-            task_id = await _resolve_task_id(project_id, agent_id, params.task_id)
+            task_id, bind_note = await _resolve_task_id(
+                project_id, agent_id, params.task_id
+            )
+            # TEST18 P0-2: 绑定失败（多 open VERIFY 等）时拼 note 且不创建
+            # 未绑定 attestation — 否则 LLM 看到 [attestation_id=...] 以为
+            # 证据已录，approve 时 baseline gate 按 task_id 查不到，白浪费一轮。
+            if not task_id and bind_note:
+                return ToolResult.ok(
+                    f"\n[visual_check NOT ISSUED] 未绑定任务，不生成证据。{bind_note}",
+                    att_id=None,
+                )
+            # TEST18 P0-2: VERIFY 任务的 visual_check 证据同 browse_e2e —
+            # 必须在 main 工作区执行，否则拒发（baseline gate 的 kind 查询
+            # 含 visual_check，留这个旁路等于白堵）。
+            if task_id:
+                try:
+                    from hiveweave.services.task import TaskService
+                    from hiveweave.services.worktree_review import (
+                        project_main_workspace,
+                    )
+
+                    _task = await TaskService().get_task(project_id, task_id)
+                    if _task and TaskService._is_verify_task(_task):
+                        _main_ws = await project_main_workspace(project_id)
+                        if workspace and _main_ws and not _is_under_or_same(
+                            workspace, _main_ws
+                        ):
+                            return ToolResult.ok(
+                                "\n[visual_check REJECTED] VERIFY 任务的 UI 证据"
+                                "必须在主工作区执行（当前非 main）。请让 "
+                                "coordinator/CEO 执行 UI 验收，或由负责人 "
+                                "waive_attestation。",
+                                att_id=None,
+                            )
+                except Exception:
+                    pass
             commit = await _maybe_git_commit(workspace or "")
             payload = {
                 "kind": VISUAL_CHECK_KIND,

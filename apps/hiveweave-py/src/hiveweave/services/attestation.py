@@ -1073,15 +1073,30 @@ async def check_verify_baseline(
         ok_match = ch_l in allowed or any(
             a.startswith(ch_l) or ch_l.startswith(a) for a in allowed if len(a) >= 7
         )
-        # Ancestor window: attestation commit is ancestor of main tip
+        # Ancestor window: attestation commit is an ancestor of main tip
         # (verified on an older tip that fast-forwarded) — allow if
-        # max_behind permits and merge-base says ancestor.
+        # max_behind permits AND the merge commit is itself an ancestor of
+        # the attestation commit (i.e. the test actually ran on code that
+        # includes the merge — TEST18 P0-2). Without the target-side check,
+        # a pre-merge worktree base (ancestor of main, behind ≤ max_behind)
+        # would pass while never having run the merged code.
         if not ok_match and main_ws and main_tip and max_behind >= 0:
             try:
                 ok_anc, _ = await _git(
                     ["merge-base", "--is-ancestor", ch, main_tip],
                     main_ws,
                 )
+                if ok_anc and target:
+                    # Tightening: merge commit must be an ancestor of (or
+                    # equal to) the attestation commit — attestation ran on
+                    # code containing the merge.
+                    ok_target_anc, _ = await _git(
+                        ["merge-base", "--is-ancestor", target, ch],
+                        main_ws,
+                    )
+                    if not ok_target_anc:
+                        stale.append(_short(ch))
+                        continue
                 if ok_anc:
                     # Count how far behind
                     ok_cnt, cnt_out = await _git(
@@ -1090,8 +1105,6 @@ async def check_verify_baseline(
                     )
                     behind = int((cnt_out or "0").strip() or "0") if ok_cnt else 999
                     if behind <= max_behind:
-                        ok_match = True
-                    elif behind <= 0:
                         ok_match = True
             except Exception:
                 pass
