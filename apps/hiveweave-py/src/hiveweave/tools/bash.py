@@ -1067,10 +1067,20 @@ class RunCommandParams(BaseModel):
     )
 
 
+# LLM 常把 taskId 写进命令文本而非工具参数（TEST18 第二轮实锤：Vera 写
+# `npx vitest run taskId=xxx` 和 `HW_TASK_ID=xxx npx vitest run`）——
+# 提取后必须校验 ∈ open VERIFY 候选集，防命令里无关 taskId= 误绑。
+_COMMAND_TASK_ID_RE = re.compile(
+    r"\b(?:taskId|task_id|TASK_ID|HW_TASK_ID)=([0-9a-fA-F]{8,40})\b"
+)
+
+
 async def _resolve_test_attestation_task_id(
     project_id: str,
     agent_id: str,
     explicit: str | None = None,
+    *,
+    command: str | None = None,
 ) -> tuple[str | None, str]:
     """Bind test_run to a task.
 
@@ -1083,6 +1093,12 @@ async def _resolve_test_attestation_task_id(
       4. assignee path — sole running/claimed where assignee=self
       5. reviewing >1 / VERIFY >1 → refuse silent bind + candidate note
       6. 0 match but REVIEW-capable → candidate tip (do NOT auto-bind)
+
+    Fallback (TEST18 P0-2): when multiple open VERIFY exist, extract
+    taskId=/TASK_ID=/HW_TASK_ID= from the command text and bind only if the
+    extracted value uniquely matches an open VERIFY id (prefix match
+    allowed). This rescues agents who wrote the taskId into the command
+    instead of the tool parameter.
 
     Returns ``(task_id | None, tool_note)``.
     """
@@ -1146,9 +1162,27 @@ async def _resolve_test_attestation_task_id(
     if len(verify_open) == 1:
         return verify_open[0].get("id"), ""
     if len(verify_open) > 1:
+        # Fallback: extract taskId from command text (LLM often writes it
+        # into the command instead of the tool param — TEST18 P0-2).
+        if command and str(command).strip():
+            for val in _COMMAND_TASK_ID_RE.findall(str(command)):
+                cand = [
+                    t for t in verify_open
+                    if str(t.get("id") or "") == val
+                    or (len(val) >= 8 and str(t.get("id") or "").startswith(val))
+                ]
+                if len(cand) == 1:
+                    return (
+                        cand[0].get("id"),
+                        "\n\n[attestation_bind] bound taskId from command text "
+                        f"({val[:12]}…); prefer the bash taskId parameter next time.",
+                    )
+                if len(cand) > 1:
+                    break  # ambiguous prefix — fall through to refuse
         lines = [
             "\n\n[attestation_bind] test_run left UNBOUND: multiple open "
-            "VERIFY tasks assigned to you. Pass taskId explicitly:",
+            "VERIFY tasks assigned to you. Pass taskId as the bash TOOL "
+            "PARAMETER (not written into the command text):",
         ]
         for t in verify_open[:6]:
             tid = str(t.get("id") or "")
@@ -1260,7 +1294,7 @@ async def _resolve_verify_test_workspace(
         return default_workspace or "", "", None
 
     resolved, bind_note = await _resolve_test_attestation_task_id(
-        project_id, agent_id, explicit_task_id
+        project_id, agent_id, explicit_task_id, command=command
     )
     if not resolved:
         # Keep existing bind tip (multi VERIFY / multi active / REVIEW helper);
@@ -1325,7 +1359,7 @@ async def _issue_test_run_attestation(
     if not is_test_command(command or ""):
         return ""
     resolved, bind_note = await _resolve_test_attestation_task_id(
-        project_id, agent_id, task_id
+        project_id, agent_id, task_id, command=command
     )
 
     # TEST18 P0-3 / NEW-3: VERIFY attestation must stamp MAIN workspace HEAD,

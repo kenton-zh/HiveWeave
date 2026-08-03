@@ -339,6 +339,9 @@ async def _send_message_core(
             "message_id": msg["id"],
             "should_wake": msg.get("should_wake", True),
             "category": msg.get("category"),
+            # 回复义务合同 ID — 后续回复对方时必须作为 replyTo 原样传回，
+            # 否则会生成新的回复义务链（TEST18 柚子回执风暴教训）。
+            "reply_contract_id": msg.get("reply_contract_id") or "",
         })
         # Record for sender so team comms panel shows outgoing
         # messages (BUG-034 fix).

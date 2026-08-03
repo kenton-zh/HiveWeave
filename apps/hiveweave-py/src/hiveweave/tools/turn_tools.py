@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -60,6 +62,14 @@ async def _archive_turn_lessons(agent_id: str, tr: Any, ctx: Any) -> None:
 
 
 # ── commit_turn ──────────────────────────────────────────
+
+
+# TEST18 P0-4: in_progress 圈数止损 — commit_turn(in_progress) 不触发 exit
+# gate，LLM 可在同一工具循环里无限"commit+工具"（柚子 20 次循环实锤）。
+# ctx 无 turn id，用时间窗近似：90s 内第 6 次 in_progress → 强制提示收尾。
+_IN_PROGRESS_LIMIT = 5
+_IN_PROGRESS_WINDOW_MS = 90_000
+_in_progress_counts: dict[str, list[float]] = {}
 
 
 class CommitTurnParams(BaseModel):
@@ -126,6 +136,24 @@ async def commit_turn_tool(
         tr = parse_turn_result(raw)
     except Exception as e:
         return ToolResult.err(f"Invalid TurnResult: {e}")
+
+    if tr.phase == "in_progress":
+        now = time.time() * 1000
+        stamps = _in_progress_counts.setdefault(agent_id, [])
+        stamps = [t for t in stamps if now - t < _IN_PROGRESS_WINDOW_MS]
+        stamps.append(now)
+        _in_progress_counts[agent_id] = stamps
+        if len(stamps) > _IN_PROGRESS_LIMIT:
+            # 不重置计数 — 窗口内每次 in_progress 都拦，直到 LLM 转
+            # waiting/blocked/done_slice（90s 窗口自然过期后才放行）。
+            return ToolResult.err(
+                "STOP: commit_turn(in_progress) called too many times in this "
+                "tool loop — the turn is not making exit progress. Either "
+                "commit_turn(phase='waiting'/'blocked', waiting_on=[...]) to "
+                "park legally, or commit_turn(phase='done_slice') when this "
+                "slice's obligations are cleared. Do NOT call commit_turn("
+                "in_progress) again this turn."
+            )
 
     field_violations = validate_phase_fields(tr)
     if field_violations:
@@ -414,6 +442,17 @@ class AskNotifyParams(BaseModel):
         description="'normal' or 'urgent'",
         json_schema_extra={"aliases": ["level"]},
     )
+    reply_to: str | None = Field(
+        default=None,
+        alias="replyTo",
+        description=(
+            "Reply contract ID from the original message's reply_contract_id. "
+            "Include this when replying to a message that had reply_required=true "
+            "to explicitly close the reply contract — otherwise a NEW reply "
+            "obligation is created and the original asker stays blocked."
+        ),
+        json_schema_extra={"aliases": ["replyTo", "reply_to", "replyContractId"]},
+    )
 
     @field_validator("recipients", mode="before")
     @classmethod
@@ -424,7 +463,9 @@ class AskNotifyParams(BaseModel):
 @tool(
     "ask_agent",
     "Ask one or more agents and REQUIRE a reply via send_message/ask_agent/notify_agent. "
-    "Use for tool checks, opinions, reports. Prefer this over send_message(expectReport=true).",
+    "Use for tool checks, opinions, reports. Prefer this over send_message(expectReport=true). "
+    "When replying to an existing ask, pass replyTo=<the original message's "
+    "reply_contract_id> to close the contract (not the message_id from a tool result).",
     requires_workspace=False,
     security_level="standard",
 )
@@ -440,6 +481,7 @@ async def ask_agent_tool(
         priority=params.priority,
         expect_report=True,
         ctx=ctx,
+        reply_to=params.reply_to,
         message_type="ask",
     )
 
@@ -447,7 +489,9 @@ async def ask_agent_tool(
 @tool(
     "notify_agent",
     "Notify agents (FYI) — does NOT require a reply. "
-    "Use for status broadcasts. Prefer this over send_message for one-way updates.",
+    "Use for status broadcasts. Prefer this over send_message for one-way updates. "
+    "When replying to an existing ask, pass replyTo=<the original message's "
+    "reply_contract_id> to close the contract without creating a new one.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -463,5 +507,6 @@ async def notify_agent_tool(
         priority=params.priority,
         expect_report=False,
         ctx=ctx,
+        reply_to=params.reply_to,
         message_type="notify",
     )

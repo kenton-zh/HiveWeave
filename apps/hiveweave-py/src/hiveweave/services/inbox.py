@@ -396,6 +396,49 @@ class InboxService:
                 reply_to=reply_to[:8],
                 message_type=message_type,
             )
+            # 垃圾 reply_to 软警告（TEST18 P0-1 顺手项）：显式 reply_to 不在
+            # 「收件人→发送方」方向的合同集合内（幻觉 ID）时，新 ask 会被
+            # 静默降级为 notify → 义务丢失且收件人不必然回复。只警告不硬拦：
+            # 方向型 auto-close 大多能自愈，硬拦会制造新往返。
+            if from_agent_id and to_agent_id != from_agent_id:
+                try:
+                    known = await project_db.query(
+                        from_agent_id,
+                        "SELECT reply_contract_id FROM inbox "
+                        "WHERE from_agent_id = ? AND to_agent_id = ? "
+                        "AND reply_contract_id IS NOT NULL",
+                        [to_agent_id, from_agent_id],
+                    )
+                    known_set = {
+                        r["reply_contract_id"]
+                        for r in known or []
+                        if r.get("reply_contract_id")
+                    }
+                    rt = (reply_to or "").strip()
+                    match = any(
+                        cid == rt or cid.startswith(rt) or rt.startswith(cid[:12])
+                        for cid in known_set
+                        if cid
+                    )
+                    if not match:
+                        log.warning(
+                            "inbox_reply_to_unknown_contract",
+                            from_agent_id=from_agent_id,
+                            to_agent_id=to_agent_id,
+                            reply_to=rt[:16],
+                        )
+                        warn = (
+                            f"⚠️ replyTo={rt[:16]}... 不是 {to_agent_id[:8]} 发给你的"
+                            "合同 ID — 已按回复处理但不会闭合任何合同；"
+                            "请用对方消息里的 reply_contract_id 重发。"
+                        )
+                        force_wake_note = (
+                            force_wake_note + " " + warn
+                            if force_wake_note
+                            else warn
+                        )
+                except Exception:
+                    pass
 
         # Wake economics (TEST18): a notify (FYI, no reply needed) must not
         # wake the recipient — it goes to background (delivered=0) and is

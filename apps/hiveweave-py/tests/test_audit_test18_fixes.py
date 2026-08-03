@@ -540,6 +540,83 @@ async def test_bind_multi_verify_tips_task_ids():
 
 
 @pytest.mark.asyncio
+async def test_multi_verify_binds_from_command_text():
+    """TEST18 P0-2: command-text taskId extraction rescues multi-open VERIFY."""
+    from hiveweave.tools.bash import _resolve_test_attestation_task_id
+
+    v1 = {
+        "id": "69e1d14a-498e-44b5-962f-3374da5fd401",
+        "title": "VERIFY: a",
+        "status": "created",
+        "tags": ["verify"],
+    }
+    v2 = {
+        "id": "a85959bd-aa21-4256-b81b-ad0b8c4a484a",
+        "title": "VERIFY: b",
+        "status": "running",
+        "tags": ["verify"],
+    }
+    with (
+        patch(
+            "hiveweave.services.task.TaskService.list_tasks",
+            AsyncMock(side_effect=[[], [v1, v2]]),
+        ),
+        patch(
+            "hiveweave.services.task.TaskService._is_verify_task",
+            return_value=True,
+        ),
+    ):
+        tid, note = await _resolve_test_attestation_task_id(
+            "p1",
+            "qa-1",
+            None,
+            command="cd /w && npx vitest run taskId=69e1d14a-498e-44b5-962f-3374da5fd401",
+        )
+
+    assert tid == v1["id"]
+    assert "command text" in note
+
+
+@pytest.mark.asyncio
+async def test_multi_verify_command_text_ignores_unknown():
+    """Extracted taskId not in open VERIFY candidates → still refuse."""
+    from hiveweave.tools.bash import _resolve_test_attestation_task_id
+
+    v1 = {
+        "id": "69e1d14a-498e-44b5-962f-3374da5fd401",
+        "title": "VERIFY: a",
+        "status": "created",
+        "tags": ["verify"],
+    }
+    v2 = {
+        "id": "a85959bd-aa21-4256-b81b-ad0b8c4a484a",
+        "title": "VERIFY: b",
+        "status": "running",
+        "tags": ["verify"],
+    }
+    with (
+        patch(
+            "hiveweave.services.task.TaskService.list_tasks",
+            AsyncMock(side_effect=[[], [v1, v2]]),
+        ),
+        patch(
+            "hiveweave.services.task.TaskService._is_verify_task",
+            return_value=True,
+        ),
+    ):
+        tid, note = await _resolve_test_attestation_task_id(
+            "p1",
+            "qa-1",
+            None,
+            command="npx vitest run taskId=deadbeef-dead-beef-dead-beefdeadbeef",
+        )
+
+    assert tid is None
+    assert "UNBOUND" in note
+    assert "deadbeef" not in note  # candidates listed, not the garbage value
+
+
+@pytest.mark.asyncio
 async def test_force_main_via_real_bind_created_verify():
     """End-to-end: created VERIFY + no taskId → force main (no bind mock)."""
     from hiveweave.tools.bash import _resolve_verify_test_workspace
