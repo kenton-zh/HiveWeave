@@ -147,6 +147,28 @@ async def _send_message_core(
 
         expect_report = resolve_expect_report(expect_report, message)
 
+    # Wake economics (TEST18 finding): FYI broadcasts must not start LLM turns.
+    # notify_agent declares "no reply needed" — the decision (absorb vs wake)
+    # lives in inbox.send_message (after auto-close reply_to resolution):
+    # plain notify → wake=False (background, bundled on next natural wake);
+    # notify replying to an ask contract → wake=True (asker is waiting);
+    # urgent notify → wake=True (incident broadcasts must not wait).
+    # ask carries a reply contract — must wake. normal keeps the product
+    # default (wake=True) so any-message-wakes semantics survive for generic
+    # peer chat. TEST13 P2-2 open-task force-wake still applies downstream
+    # (task_id + wake=False → force wake), unchanged.
+    #
+    # Delivery caveat: an absorbed notify is NOT guaranteed to reach a
+    # complete/idle recipient until their next natural wake (trigger skips
+    # background-only for complete agents). Obligation-bearing communication
+    # must use ask_agent (wake=True), never notify_agent.
+    if message_type == "notify":
+        wake = None
+    elif message_type == "ask":
+        wake = True
+    else:
+        wake = None
+
     project_id = await get_project_id(agent_id)
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project_id")
@@ -307,6 +329,7 @@ async def _send_message_core(
                 message_type=message_type,
                 recipient_disposition=recipient_disposition,
                 reply_to=reply_to,
+                wake=wake,
             )
         except ValueError as e:
             return ToolResult.err(str(e))

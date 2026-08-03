@@ -16,14 +16,30 @@ from typing import Literal
 # Kept for DB column / call-site compatibility. Always "message".
 WakeCategory = Literal["message"]
 
-# Well-known human sender ids (system aliases — not NL parsing)
-_USER_IDS = frozenset({"user", "human", "operator"})
+# Well-known human sender ids (system aliases — not NL parsing).
+# Includes Chinese UI marker 「用户」 used by phoenix/chat paths.
+_USER_IDS = frozenset({"user", "human", "operator", "用户"})
+
+HUMAN_MESSAGE_TYPES = frozenset({"user_message", "user"})
 
 
 def is_user_sender(from_agent_id: str | None) -> bool:
     if not from_agent_id:
         return False
-    return from_agent_id.lower() in _USER_IDS
+    fid = from_agent_id.strip()
+    if fid in _USER_IDS:
+        return True
+    return fid.lower() in _USER_IDS
+
+
+def is_human_inbox_identity(
+    *, from_agent_id: str | None = None, message_type: str | None = None
+) -> bool:
+    """True when inbox row claims to be human speech (spoof-sensitive)."""
+    mt = (message_type or "").strip().lower()
+    if mt in HUMAN_MESSAGE_TYPES:
+        return True
+    return is_user_sender(from_agent_id)
 
 
 def classify_message(

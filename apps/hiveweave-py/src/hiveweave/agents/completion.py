@@ -178,36 +178,14 @@ async def handle_completion(
     )
     from hiveweave.services.turn_session import pop_pending_turn_result
 
+    # UNREPLIED / ACK scope = ids shown this turn only (pending_inbox_msg_ids).
+    # Mid-turn arrivals are NOT injected into the live streamer — merging them
+    # into obligations or ACK would silently drop messages the model never saw.
     pending_msgs: list[dict] = []
-    all_pending: list[dict] = []
     if agent.pending_inbox_msg_ids:
         all_pending = await agent._inbox.get_pending_messages(agent.id)
         id_set = set(agent.pending_inbox_msg_ids)
         pending_msgs = [m for m in all_pending if m["id"] in id_set]
-
-    # P1(reply_required 硬门): 本 turn 处理的消息 = 触发携带的 inbox
-    # 消息 ∪ turn 开始后到达的未读消息。后者（闹钟/超时唤醒等路径）
-    # 此前不参加未回复校验，却会在成功退出时被一并 ACK ——
-    # reply_required 消息被静默已读，对方 agent_waits 永远不满足。
-    turn_started_ms = int((agent.current_job or {}).get("started_at") or 0)
-    if turn_started_ms:
-        try:
-            if not all_pending:
-                all_pending = await agent._inbox.get_pending_messages(
-                    agent.id
-                )
-            extra_ids = set(
-                await agent._inbox.get_pending_ids_since(
-                    agent.id, turn_started_ms
-                )
-            )
-            seen = {m["id"] for m in pending_msgs}
-            for m in all_pending:
-                if m["id"] in extra_ids and m["id"] not in seen:
-                    pending_msgs.append(m)
-                    seen.add(m["id"])
-        except Exception as e:
-            log.debug("reply_gate_mid_turn_merge_failed", error=str(e))
 
     name_by_id: dict[str, str] = {}
     exempt_senders: set[str] = set()
@@ -232,8 +210,11 @@ async def handle_completion(
             exempt_senders.add(fid)
 
     # 本 turn 成功送达的收件人（inbox 落库 = send_message 成功的 DB 证据）
+    # turn_started_ms 只用于 reply 窗口扫描，不用于 mid-turn 并入/ACK
+    # （mid-turn 到达本 turn 未展示，不得进义务或 ACK —— 见上方 pending_msgs 范围）。
     sent_to: set[str] = set()
     replied_contracts: set[str] = set()
+    turn_started_ms = int((agent.current_job or {}).get("started_at") or 0)
     if turn_started_ms:
         try:
             # TEST10 修复: 判定窗口从「本 turn 开始后」扩展到「最老待回复
@@ -555,22 +536,8 @@ async def handle_completion(
                 pass
             agent.pending_inbox_msg_ids = None
     else:
+        # ACK only what this turn latched/showed — never mid-turn arrivals.
         ack_ids: list[str] = list(agent.pending_inbox_msg_ids or [])
-        # Mid-turn arrivals: unread wake=1 created after this turn started
-        try:
-            started = int((agent.current_job or {}).get("started_at") or 0)
-            if started:
-                extra = await agent._inbox.get_pending_ids_since(
-                    agent.id, started
-                )
-                if extra:
-                    seen = set(ack_ids)
-                    for mid in extra:
-                        if mid not in seen:
-                            ack_ids.append(mid)
-                            seen.add(mid)
-        except Exception as e:
-            log.debug("mid_turn_ack_lookup_failed", error=str(e))
         if ack_ids:
             await agent._inbox.mark_read_by_ids(agent.id, ack_ids)
         agent.pending_inbox_msg_ids = None

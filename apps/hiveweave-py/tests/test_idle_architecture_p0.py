@@ -266,13 +266,13 @@ async def test_progress_inbox_should_wake(monkeypatch):
             recipient_disposition="waiting_human",
         )
 
-    assert msg["should_wake"] is True
+    assert msg["should_wake"] is False
     assert msg["category"] == "message"
-    # wake=1 and read=0 in insert params
+    # wake=0 and read=1 in insert params (notify FYI → background)
     insert = next(i for i in inserts if "INSERT INTO inbox" in i[0])
     # params: id, from, to, message, read, created, type, expect, priority, task, wake, key
-    assert insert[1][4] == 0  # read
-    assert insert[1][10] == 1  # wake
+    assert insert[1][4] == 1  # read
+    assert insert[1][10] == 0  # wake
 
 
 @pytest.mark.asyncio

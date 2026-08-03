@@ -266,7 +266,7 @@ async def test_merge_window_coalesces_triggers():
     msg, opts = chats[0]
     assert msg == "wake2"
     assert opts.get("merged_wakes") == 2
-    assert opts.get("inbox_msg_ids") == ["m1", "m2"]
+    assert opts.get("inbox_msg_ids") == ["m2", "m1"]  # last wake only (ACK=seen)
     # user still queued
     assert len(agent._message_queue) == 1
     assert agent._message_queue[0][0] == "user hi"

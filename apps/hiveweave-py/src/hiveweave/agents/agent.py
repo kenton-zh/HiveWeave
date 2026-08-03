@@ -2412,13 +2412,12 @@ class Agent:
         users = [(m, o, t) for m, o, t in batch if not (o or {}).get("trigger")]
 
         if triggers:
-            inbox_ids: list[str] = []
-            for _m, o, _t in triggers:
-                for mid in (o or {}).get("inbox_msg_ids") or []:
-                    if mid not in inbox_ids:
-                        inbox_ids.append(mid)
+            # Last digest text wins — latch ONLY that wake's ids (ACK=seen).
+            # Union would mark earlier digests' ids read while the model only
+            # saw the last message body.
             message = triggers[-1][0]
             opts = dict(triggers[-1][1] or {})
+            inbox_ids = list((opts.get("inbox_msg_ids") or []))
             opts["inbox_msg_ids"] = inbox_ids
             opts["merged_wakes"] = len(triggers)
             opts.setdefault("source", "merged_trigger")

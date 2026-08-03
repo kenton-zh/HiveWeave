@@ -368,6 +368,12 @@ async def chat_send_inbox(body: InboxSendBody) -> dict:
     BUG-010 修复：写入 inbox 后显式触发目标 agent（比后台 watcher
     5s 延迟更及时）。watcher 仍然兜底——如果 agent 实例不存在，
     等后续 start_agent 时 inbox 仍在那里，下次轮询触发。
+
+    Security: this REST endpoint is NOT trusted for human identity —
+    send_message raises ValueError for from="用户"/"user"/type=user_message
+    without trusted_platform=True. Real human speech must go through the
+    phoenix WebSocket (session-authenticated, trusted_platform=True).
+    The ValueError → 400 here is the anti-spoofing gate, not a gap.
     """
     try:
         msg = await _inbox.send_message(
@@ -377,6 +383,14 @@ async def chat_send_inbox(body: InboxSendBody) -> dict:
             message_type=body.type or "normal",
             priority=body.priority or "normal",
         )
+    except ValueError as e:
+        log.warning(
+            "send_inbox_rejected",
+            error=str(e),
+            from_agent_id=body.fromAgentId,
+            message_type=body.type,
+        )
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         log.error("send_inbox_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to create communication")

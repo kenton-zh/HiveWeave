@@ -199,6 +199,7 @@ class InboxService:
         idempotency_key: str | None = None,
         recipient_disposition: str | None = None,
         reply_to: str | None = None,
+        trusted_platform: bool = False,
     ) -> dict:
         """Send a message. Returns dict including ``should_wake``.
 
@@ -206,7 +207,20 @@ class InboxService:
             reply_to: reply_contract_id of the original message being replied to.
                 When set, closes the reply contract — collect_unreplied_asks
                 checks for matching reply_to instead of heuristic recipient scan.
+            trusted_platform: Required to write human-identity rows
+                (``user_message`` / from=用户). REST/tools must leave False;
+                phoenix busy-queue passes True.
         """
+        from hiveweave.services.wake_policy import is_human_inbox_identity
+
+        if is_human_inbox_identity(
+            from_agent_id=from_agent_id, message_type=message_type
+        ) and not trusted_platform:
+            raise ValueError(
+                "Human inbox identity requires trusted_platform sender "
+                f"(from={from_agent_id!r}, type={message_type!r})"
+            )
+
         try:
             from hiveweave.db import meta as meta_db
 
@@ -382,6 +396,18 @@ class InboxService:
                 reply_to=reply_to[:8],
                 message_type=message_type,
             )
+
+        # Wake economics (TEST18): a notify (FYI, no reply needed) must not
+        # wake the recipient — it goes to background (delivered=0) and is
+        # bundled into the next natural wake (trigger block 3b). Exception: a
+        # notify that REPLIES to an ask contract must wake — the asker is
+        # waiting on it (UNREPLIED_ASKS gate); absorbing would delay the reply
+        # until wait-contract expiry / next unrelated wake. Placement AFTER
+        # auto-close so the carve-out sees the resolved reply_to (auto-filled),
+        # not only the caller's explicit value. urgent priority notifies also
+        # wake — "production incident, FYI" must not wait for a natural wake.
+        if wake is None and (message_type or "").lower() == "notify":
+            wake_flag = reply_to is not None or (priority or "").lower() == "urgent"
 
         # 在降级之后计算 DB 写入值，确保降级生效
         expect = 1 if expect_report else 0
