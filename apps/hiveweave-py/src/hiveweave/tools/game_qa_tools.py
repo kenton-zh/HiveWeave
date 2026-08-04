@@ -92,8 +92,12 @@ def _parse_json_blob(text: str) -> dict[str, Any] | None:
         return None
 
 
-async def _js(workspace: str, expr: str, timeout_sec: int) -> tuple[int, str, str]:
-    return await browse_exec(["js", expr], workspace, timeout_sec=timeout_sec)
+async def _js(
+    workspace: str, expr: str, timeout_sec: int, agent_id: str | None = None
+) -> tuple[int, str, str]:
+    return await browse_exec(
+        ["js", expr], workspace, timeout_sec=timeout_sec, agent_id=agent_id
+    )
 
 
 class GameRunCaseParams(BaseModel):
@@ -195,7 +199,7 @@ async def game_run_case_tool(
 async def _action_probe(
     agent_id: str, workspace: str, timeout: int, task_id: str | None
 ) -> ToolResult:
-    code, stdout, stderr = await _js(workspace, _PROBE_JS, timeout)
+    code, stdout, stderr = await _js(workspace, _PROBE_JS, timeout, agent_id)
     if code != 0:
         return ToolResult.err(
             f"probe failed exit={code}\n{stdout[-2000:]}\n{stderr[-1000:]}"
@@ -249,7 +253,7 @@ async def _action_probe(
 async def _action_list(
     agent_id: str, workspace: str, timeout: int, task_id: str | None
 ) -> ToolResult:
-    code, stdout, stderr = await _js(workspace, _LIST_JS, timeout)
+    code, stdout, stderr = await _js(workspace, _LIST_JS, timeout, agent_id)
     if code != 0:
         return ToolResult.err(
             f"list failed exit={code}\n{stdout[-2000:]}\n{stderr[-1000:]}"
@@ -286,7 +290,9 @@ async def _action_run(
     selector: str,
     task_id: str | None,
 ) -> ToolResult:
-    code, stdout, stderr = await _js(workspace, _run_case_js(case_id), timeout)
+    code, stdout, stderr = await _js(
+        workspace, _run_case_js(case_id), timeout, agent_id
+    )
     if code != 0:
         return ToolResult.err(
             f"run({case_id!r}) js failed exit={code}\n"
@@ -320,6 +326,7 @@ async def _action_run(
         ["screenshot", "--selector", hint_sel, shot_rel],
         workspace,
         timeout_sec=timeout,
+        agent_id=agent_id,
     )
     shot_ok = scode == 0
     shot_note = sout if shot_ok else f"screenshot failed exit={scode}: {serr or sout}"

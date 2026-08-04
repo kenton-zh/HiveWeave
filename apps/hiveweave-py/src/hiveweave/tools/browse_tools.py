@@ -173,7 +173,30 @@ def _screenshot_path_from_argv(argv: list[str]) -> str | None:
     return "screenshot.png"
 
 
-def _browse_child_env() -> dict[str, str]:
+def _browse_state_dir(agent_id: str | None) -> str | None:
+    """Return an agent-scoped gstack state dir, or None if no agent_id.
+
+    gstack keys its long-lived browser daemon (server-node) off
+    ``BROWSE_STATE_FILE``: the same state file reuses the same Chromium
+    instance, a different one starts a separate daemon. By pinning each
+    agent to its own state dir under the Meta DB data path, every browser
+    call from one agent hits the *same* server-node — instead of spawning a
+    fresh Chromium per call (which leaked processes and caused OOM on the
+    small 3.9GB test host).
+    """
+    if not agent_id:
+        return None
+    try:
+        data_dir = Path(settings.get_meta_db_path()).parent
+        state_dir = data_dir / "browse" / agent_id
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return str(state_dir)
+    except Exception as e:
+        log.warning("browse_state_dir_failed", agent_id=agent_id, error=str(e))
+        return None
+
+
+def _browse_child_env(agent_id: str | None = None) -> dict[str, str]:
     """Env for gstack browse — headless, no sidebar PTY (no bun console popups).
 
     gstack's terminal-agent (``bun run .../terminal-agent.ts``) owns the
@@ -184,10 +207,22 @@ def _browse_child_env() -> dict[str, str]:
     ``GSTACK_TERMINAL_AGENT=0`` is the upstream-supported embedder switch
     (see gstack browse cli.ts / server.ts). Default both flags to on/disabled
     unless the operator already set them in the process environment.
+
+    Per-agent reuse (fix OOM): when ``agent_id`` is given, pin ``BROWSE_STATE_FILE``
+    to an agent-scoped state dir and set ``BROWSE_PARENT_PID=0`` so the server-node
+    survives CLI exit (default watchdog would kill it per call). gstack then
+    auto-recycles the daemon after ``BROWSE_IDLE_TIMEOUT`` of inactivity.
     """
     env = {**os.environ}
     env.setdefault("GSTACK_HEADLESS", "1")
     env.setdefault("GSTACK_TERMINAL_AGENT", "0")
+    state_dir = _browse_state_dir(agent_id)
+    if state_dir:
+        env["BROWSE_STATE_FILE"] = str(Path(state_dir) / "browse.json")
+        env["BROWSE_PARENT_PID"] = "0"
+        # Keep the daemon alive across an agent's work session; idle after
+        # this window auto-shuts it down (prevents indefinite Chromium leak).
+        env.setdefault("BROWSE_IDLE_TIMEOUT", str(2 * 60 * 60 * 1000))
     return env
 
 
@@ -287,11 +322,16 @@ async def browse_exec(
     workspace: str,
     *,
     timeout_sec: int = 60,
+    agent_id: str | None = None,
 ) -> tuple[int, str, str]:
     """Run gstack browse CLI. Returns ``(exit_code, stdout, stderr)``.
 
     Raises ``FileNotFoundError`` / ``OSError`` on spawn failure.
     On timeout returns exit_code=-1 and an error message in stderr.
+
+    ``agent_id`` pins the gstack daemon to an agent-scoped state dir so the
+    agent reuses one browser instance across calls instead of spawning a
+    fresh Chromium per call (see _browse_child_env).
     """
     bin_path = resolve_browse_bin()
     if not bin_path:
@@ -327,7 +367,7 @@ async def browse_exec(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env=_browse_child_env(),
+        env=_browse_child_env(agent_id),
         **windows_no_window_kwargs(),
     )
     try:
@@ -507,7 +547,7 @@ async def browse_tool(
     head = (argv[0] or "").lower().replace("-", "_")
     try:
         code, stdout, stderr = await browse_exec(
-            argv, workspace, timeout_sec=params.timeout_sec or 60
+            argv, workspace, timeout_sec=params.timeout_sec or 60, agent_id=agent_id
         )
     except FileNotFoundError:
         return ToolResult.err(browse_missing_bin_hint())

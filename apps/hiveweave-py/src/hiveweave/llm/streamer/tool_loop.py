@@ -19,7 +19,7 @@ from .constants import (
     TOOL_LOOP_STALL_LIMIT,
     TOTAL_TIMEOUT_S,
 )
-from .doom_loop import round_made_progress, round_was_readonly_only
+from .doom_loop import doom_loop_limit, round_made_progress, round_was_readonly_only
 from .types import DeltaCallback, ToolCallCallback
 
 log = structlog.get_logger(__name__)
