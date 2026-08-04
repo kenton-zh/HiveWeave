@@ -20,6 +20,8 @@ const GoalsPanel = lazy(() => import("./components/GoalsPanel"));
 const QuestionDialog = lazy(() => import("./components/QuestionDialog"));
 const NewProjectDialog = lazy(() => import("./components/NewProjectDialog"));
 const ConfirmDialog = lazy(() => import("./components/ConfirmDialog"));
+const TimelineView = lazy(() => import("./components/timeline/TimelineView"));
+const TaskTimelinePanel = lazy(() => import("./components/timeline/TaskTimelinePanel"));
 import { useAppStore } from "./store";
 import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend } from "./api";
 import type { DeleteProjectResponse, Project } from "./api";
@@ -44,6 +46,7 @@ function App() {
   const setActiveView = useAppStore((s) => s.setActiveView);
   const rightPanelTab = useAppStore((s) => s.rightPanelTab);
   const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
+  const selectedTaskId = useAppStore((s) => s.selectedTaskId);
 
   const setProcessingAgents = useAppStore((s) => s.setProcessingAgents);
   const updateProcessingAgent = useAppStore((s) => s.updateProcessingAgent);
@@ -162,6 +165,7 @@ function App() {
       () => refreshOrgTree(),
       (projectId: string) => useAppStore.getState().bumpGoalsVersion(projectId),
       () => useAppStore.getState().bumpQuestionVersion(),
+      (signal) => useAppStore.getState().notifyTaskEvent(signal.project_id, signal.task_id),
     );
     return () => controller.abort();
   }, []);
@@ -207,6 +211,7 @@ function App() {
     useAppStore.setState({
       selectedProjectId: id,
       selectedAgentId: null,
+      selectedTaskId: null,
       chatSessions: {},
       processingAgents: [],
       orgTreeVersion: st.orgTreeVersion + 1,
@@ -263,9 +268,11 @@ function App() {
     useAppStore.setState({
       selectedProjectId: next,
       selectedAgentId: null,
+      selectedTaskId: null,
       chatSessions: {},
       processingAgents: [],
       orgTreeVersion: st.orgTreeVersion + 1,
+      ...(st.rightPanelTab === "task" ? { rightPanelTab: "chat" as const } : {}),
     });
     setShowNewProjectDialog(false);
     setNewProjectCEO(null);
@@ -577,6 +584,16 @@ function App() {
               >
                 Office
               </button>
+              <button
+                onClick={() => setActiveView("timeline")}
+                className={`px-3 py-1 text-xs rounded-full transition-all duration-200 active:scale-95 ${
+                  activeView === "timeline"
+                    ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                    : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
+                }`}
+              >
+                Timeline
+              </button>
             </div>
 
             {/* Project-level start/stop button */}
@@ -615,7 +632,11 @@ function App() {
             )}
           </div>
           <div className="flex-1 overflow-hidden">
-            {activeView === "tree" ? <OrgTree /> : (
+            {activeView === "tree" ? <OrgTree /> : activeView === "timeline" ? (
+              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                <TimelineView />
+              </Suspense>
+            ) : (
               <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
                 <OfficeView />
               </Suspense>
@@ -682,9 +703,9 @@ function App() {
                 </button>
                 {selectedAgentId && (
                   <button
-                    onClick={() => setRightPanelTab("debug" as any)}
+                    onClick={() => setRightPanelTab("debug")}
                     className={
-                      (rightPanelTab === ("debug" as any))
+                      rightPanelTab === "debug"
                         ? "bg-white text-g-blue shadow-gm-sm font-medium px-3 py-1.5 text-xs rounded-full"
                         : "text-g-fg-3 hover:text-g-fg px-3 py-1.5 text-xs rounded-full"
                     }
@@ -694,12 +715,28 @@ function App() {
                 )}
               </>
             )}
+            {selectedTaskId && (
+              <button
+                onClick={() => setRightPanelTab("task")}
+                className={`px-3 py-1.5 text-xs rounded-full transition-all ${
+                  rightPanelTab === "task"
+                    ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                    : "text-g-fg-3 hover:text-g-fg"
+                }`}
+              >
+                任务
+              </button>
+            )}
             </div>
           </div>
 
           {/* Tab content */}
           <div className="flex-1 overflow-hidden">
-            {!selectedAgentId ? (
+            {rightPanelTab === "task" && selectedTaskId ? (
+              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                <TaskTimelinePanel key="panel-task" />
+              </Suspense>
+            ) : !selectedAgentId ? (
               <div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-fade-in">
                 <div className="text-center">
                   <div className="w-16 h-16 rounded-full bg-gradient-to-br from-g-bg-soft to-g-bg-muted border border-g-border flex items-center justify-center mx-auto mb-4 shadow-gm-sm ring-4 ring-g-bg-muted/50">
@@ -723,7 +760,7 @@ function App() {
                   )}
                   {rightPanelTab === "agent" && <AgentDetailPanel key="panel-agent" agentId={selectedAgentId} />}
                   {rightPanelTab === "monitor" && <MonitorPanel key="panel-monitor" agentId={selectedAgentId} />}
-                  {rightPanelTab === ("debug" as any) && <DebugPanel key="panel-debug" />}
+                  {rightPanelTab === "debug" && <DebugPanel key="panel-debug" />}
                   {rightPanelTab === "logs" && <WorkLogPanel key="panel-logs" agentId={selectedAgentId} />}
                 </Suspense>
               </>

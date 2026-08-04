@@ -11,6 +11,7 @@
 
 import asyncio
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 
 import aiosqlite
 from pathlib import Path
@@ -201,6 +202,134 @@ async def get_project_db_by_project_id(project_id: str) -> aiosqlite.Connection:
     return await ensure_project_db(workspace_path)
 
 
+# ── Read-only connection pool (Timeline v4 §4.4) ────────────
+# 聚合只读查询（timeline 端点）与写路径物理隔离：WAL 天然支持并发读。
+# - 每 workspace 独立池（2 条连接），每条连接绑一把 asyncio.Lock：
+#   aiosqlite 只串行化单条 execute、不串行化事务块，两个并发请求共用
+#   一条连接会 BEGIN 交错（"cannot start a transaction within a transaction"），
+#   所以请求获取连接 = 持锁直到 COMMIT 释放。
+# - 驱逐联动：evict_project_db 同关只读池；打开前检查 _evicted_workspaces；
+#   打开失败降级回共享连接（只覆盖打开失败，陈旧靠驱逐联动兜底）。
+_READONLY_POOL_SIZE = 2
+
+
+class _ReadonlySlot:
+    """一条只读连接 + 它的事务锁。"""
+
+    __slots__ = ("conn", "lock")
+
+    def __init__(self, conn: aiosqlite.Connection) -> None:
+        self.conn = conn
+        self.lock = asyncio.Lock()
+
+
+# workspace -> slots；round-robin 计数独立存放
+_readonly_pools: dict[str, list[_ReadonlySlot]] = {}
+_readonly_rr: dict[str, int] = {}
+_readonly_pool_guard = asyncio.Lock()
+
+
+def _sqlite_readonly_uri(db_path: str) -> str:
+    """把绝对路径转成 sqlite URI（mode=ro）。
+
+    Windows 绝对路径必须是 ``file:///C:/...``（三斜杠 + 正斜杠），
+    POSIX 是 ``file:///home/...``——直接 f"file:{path}" 在 Windows 会
+    被 URI 解析器当成不透明路径而打开失败。路径做百分号编码，
+    兼容空格 / CJK 字符的 workspace。
+    """
+    from urllib.parse import quote
+
+    posix = Path(db_path).resolve().as_posix()
+    encoded = quote(posix, safe="/:")
+    if encoded.startswith("/"):
+        return f"file://{encoded}?mode=ro"   # POSIX: file:///home/...
+    return f"file:///{encoded}?mode=ro"      # Windows: file:///C:/...
+
+
+async def _acquire_readonly_slot(ws: str) -> _ReadonlySlot | None:
+    """取（或惰性创建）workspace 的只读池 slot；打开失败返回 None。"""
+    async with _readonly_pool_guard:
+        if ws in _evicted_workspaces:
+            return None
+        pool = _readonly_pools.get(ws)
+        if pool is None:
+            db_path = _db_path_for_workspace(ws)
+            uri = _sqlite_readonly_uri(db_path)
+            building: list[_ReadonlySlot] = []
+            try:
+                for _ in range(_READONLY_POOL_SIZE):
+                    conn = await aiosqlite.connect(uri, uri=True)
+                    slot = _ReadonlySlot(conn)
+                    building.append(slot)  # 先入列：PRAGMA 失败也能被清理
+                    conn.row_factory = aiosqlite.Row
+                    await conn.execute("PRAGMA busy_timeout=5000")
+            except Exception:
+                # DB 文件尚不存在 / 权限问题 → 调用方降级共享连接
+                for slot in building:
+                    try:
+                        await slot.conn.close()
+                    except Exception:
+                        pass
+                return None
+            _readonly_pools[ws] = building
+            _readonly_rr[ws] = 0
+            pool = building
+        idx = _readonly_rr.get(ws, 0) % len(pool)
+        _readonly_rr[ws] = (idx + 1) % len(pool)
+        return pool[idx]
+
+
+async def _close_readonly_pool(ws: str) -> None:
+    """关闭并移除 workspace 的只读池（evict / shutdown 用）。"""
+    async with _readonly_pool_guard:
+        pool = _readonly_pools.pop(ws, None)
+        _readonly_rr.pop(ws, None)
+    if pool:
+        for slot in pool:
+            try:
+                await slot.conn.close()
+            except Exception:
+                pass
+
+
+@asynccontextmanager
+async def readonly_project_conn(project_id: str):
+    """只读连接 context manager（timeline 聚合查询专用，Timeline v4 §4.4）。
+
+    用法::
+
+        async with readonly_project_conn(project_id) as conn:
+            await conn.execute("BEGIN")
+            ... SELECTs ...
+            await conn.execute("COMMIT")
+
+    请求应持连接完成整个读事务——slot 锁在 context 退出时释放。
+    打开只读池失败时降级为共享连接（此时持 workspace 写锁防事务交错）。
+    失败时 raise ProjectDbError（项目不存在 / 已驱逐）。
+    """
+    workspace_path = await meta_db.get_project_workspace(project_id)
+    if workspace_path is None:
+        raise ProjectDbError(
+            f"No workspace_path for project_id={project_id} (project not found in Meta DB)"
+        )
+    ws = str(Path(workspace_path).resolve())
+    if ws in _evicted_workspaces:
+        raise ProjectDbError(
+            f"Workspace evicted (project deletion in progress): {ws}"
+        )
+
+    slot = await _acquire_readonly_slot(ws)
+    if slot is not None:
+        async with slot.lock:
+            yield slot.conn
+        return
+
+    # 降级：共享连接 + workspace 写锁（只覆盖打开失败场景）
+    lock = await get_workspace_write_lock(ws)
+    async with lock:
+        yield await ensure_project_db(workspace_path)
+
+
 async def evict_project_db(workspace_path: str) -> None:
     """Close and remove a per-project DB from cache.
 
@@ -217,6 +346,7 @@ async def evict_project_db(workspace_path: str) -> None:
     # 回退键（f"agent:{aid}"，见 _get_write_lock）一并清理，防键泄漏
     for aid in [a for a, w in _agent_cache.items() if w == ws]:
         _write_locks.pop(f"agent:{aid}", None)
+    await _close_readonly_pool(ws)  # Timeline v4 §4.4: 驱逐同关只读池
     if conn is not None:
         try:
             await conn.close()
@@ -240,6 +370,7 @@ async def evict_project_db_for_agent(agent_id: str) -> None:
         return
     async with _ensure_lock:
         conn = _cache.pop(ws, None)
+    await _close_readonly_pool(ws)  # 与共享连接同进退（可惰性重开）
     if conn is not None:
         try:
             await conn.close()
@@ -260,6 +391,9 @@ async def close_all() -> None:
     _agent_cache.clear()
     _evicted_workspaces.clear()
     _write_locks.clear()
+    # Timeline v4 §4.4: 关停只读池
+    for ws in list(_readonly_pools.keys()):
+        await _close_readonly_pool(ws)
 
 
 def clear_evicted_workspace(workspace_path: str) -> None:

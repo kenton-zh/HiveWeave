@@ -1,13 +1,18 @@
 """Claim / unclaim / reassign / promote helpers."""
 from __future__ import annotations
 
-import json
 import time
-import uuid
 
 import structlog
 
-from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
+from .db import (
+    _ensure_schema,
+    _execute,
+    _execute_tx,
+    _query,
+    build_task_event_insert,
+    publish_task_event,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -158,55 +163,40 @@ class ClaimMixin:
             new_status = "running"
         elif status == "reviewing":
             # reviewing has no direct → claimed; force for reassignment
-            await _execute(
-                project_id,
+            new_status = "claimed"
+        # Always audit — including running→running assignee swaps (TEST21 M2)
+        payload = {
+            "from_assignee": old,
+            "to_assignee": new_assignee_id,
+            "reason": (reason or "")[:500],
+            "implementer_id": task.get("implementer_id"),
+            "status": new_status,
+        }
+        # Outbox 纪律：改派 UPDATE 与事件 INSERT 同事务原子落库。
+        # 旧实现两次 commit + 吞 INSERT 异常 → assignee 已换但
+        # task.reassigned 静默缺失，§4.5 assignee 游标丢段。失败上抛。
+        (ev_sql, ev_params), _ev_ts, _ev_id = build_task_event_insert(
+            project_id, task_id, "task.reassigned", status, new_status,
+            actor_id=reassigned_by, payload=payload, now_ms=now_ms,
+        )
+        stmts: list[tuple[str, list]] = []
+        if status == "reviewing":
+            stmts.append((
                 "UPDATE tasks SET status = 'claimed', progress = 10, "
                 "updated_at = ? WHERE id = ?",
                 [now_ms, task_id],
-            )
-            new_status = "claimed"
-        await _execute(
-            project_id,
-            "UPDATE tasks SET assignee_id = ?, claimed_at = COALESCE(claimed_at, ?), "
+            ))
+        stmts.append((
+            "UPDATE tasks SET assignee_id = ?, "
+            "claimed_at = COALESCE(claimed_at, ?), "
             "owner_parked = 0, updated_at = ? WHERE id = ?",
             [new_assignee_id, now_ms, now_ms, task_id],
+        ))
+        stmts.append((ev_sql, ev_params))
+        await _execute_tx(project_id, stmts)
+        await publish_task_event(
+            project_id, task_id, "task.reassigned", new_status, now_ms,
         )
-        # Always audit — including running→running assignee swaps (TEST21 M2)
-        event_id = str(uuid.uuid4())
-        payload = json.dumps(
-            {
-                "from_assignee": old,
-                "to_assignee": new_assignee_id,
-                "reason": (reason or "")[:500],
-                "implementer_id": task.get("implementer_id"),
-                "status": new_status,
-            },
-            ensure_ascii=False,
-        )
-        try:
-            await _execute(
-                project_id,
-                "INSERT INTO task_events (id, project_id, task_id, event_type, "
-                "from_status, to_status, actor_id, payload, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    event_id,
-                    project_id,
-                    task_id,
-                    "task.reassigned",
-                    status,
-                    new_status,
-                    reassigned_by,
-                    payload,
-                    now_ms,
-                ],
-            )
-        except Exception as e:
-            log.warning(
-                "task_reassign_event_failed",
-                task_id=task_id[:12],
-                error=str(e),
-            )
         log.info(
             "task_reassigned",
             project_id=project_id,

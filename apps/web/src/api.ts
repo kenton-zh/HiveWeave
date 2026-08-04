@@ -84,6 +84,9 @@ export {
   answerQuestion,
   browseDirectory,
   getAgentTraces,
+  getTaskTimeline,
+  getTeamActivity,
+  listTasks,
 } from "./api/rest";
 
 export type {
@@ -110,4 +113,5 @@ export type {
   RawTraceMessage,
   TraceEvent,
   AgentTraces,
+  TeamActivityQuery,
 } from "./api/rest";

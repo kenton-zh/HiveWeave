@@ -563,13 +563,28 @@ class ObligationLedger:
                 if not all_met:
                     continue
                 # Unblock and trigger
+                # Timeline v4 §4.6: 走 _transition 而非裸 UPDATE ——
+                # blocked→running 在 _TRANSITIONS 合法，_transition 顺带
+                # 清 blocked_reason/wait_kind/wake_at 并写 task_events。
                 tid = row["id"]
-                await _execute(
-                    project_id,
-                    "UPDATE tasks SET status = 'running', wait_kind = NULL, "
-                    "wake_at = NULL, updated_at = ? WHERE id = ?",
-                    [int(time.time() * 1000), tid],
-                )
+                try:
+                    await ts._transition(
+                        project_id,
+                        tid,
+                        "running",
+                        reason_code="dependency_fulfilled",
+                        detail=f"deps fulfilled by {fulfilled_task_id[:8]}",
+                    )
+                except Exception as e:
+                    # 并发漂移可能使该任务状态已变（IllegalTransition 等）：
+                    # 单任务失败不得中断整批唤醒（原裸 UPDATE 无此风险）。
+                    log.warning(
+                        "obligation.merge_dependent_wake_failed",
+                        project_id=project_id,
+                        task_id=tid[:12],
+                        error=str(e),
+                    )
+                    continue
                 assignee = row.get("assignee_id")
                 if assignee:
                     try:

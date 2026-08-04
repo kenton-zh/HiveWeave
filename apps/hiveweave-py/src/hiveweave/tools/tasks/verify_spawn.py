@@ -585,28 +585,18 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
                     "blocked_reason = NULL, updated_at = ? WHERE id = ?",
                     [now_ms, tid],
                 )
-            import uuid as _uuid
+            from hiveweave.services.tasks.db import insert_task_event
 
-            event_id = str(_uuid.uuid4())
-            payload = json.dumps({"reason_code": "verify_rehang"})
             try:
-                await task_module._execute(
+                await insert_task_event(
                     project_id,
-                    "INSERT INTO task_events "
-                    "(id, project_id, task_id, event_type, from_status, to_status, "
-                    "actor_id, payload, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        event_id,
-                        project_id,
-                        tid,
-                        "task.verify_rehang",
-                        "blocked",
-                        "created",
-                        "system",
-                        payload,
-                        now_ms,
-                    ],
+                    tid,
+                    "task.verify_rehang",
+                    "blocked",
+                    "created",
+                    actor_id="system",
+                    payload={"reason_code": "verify_rehang"},
+                    now_ms=now_ms,
                 )
             except Exception as ev_err:
                 log.debug("verify_rehang_event_failed", error=str(ev_err))
