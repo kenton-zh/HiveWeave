@@ -22,7 +22,11 @@ import aiosqlite
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ProjectDbError, ensure_project_db
+from hiveweave.db.project import (
+    ProjectDbError,
+    ensure_project_db,
+    get_workspace_write_lock,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -123,38 +127,47 @@ class LessonService:
         now_ms = int(time.time() * 1000)
         conn = await self._conn(project_id)
 
+        # 写事务互斥（TEST18 审计 S1 补漏）：count+delete+insert 显式事务
+        # 必须整段持 per-workspace 锁，否则与 execute_transaction 并发时
+        # 会被他人 BEGIN/rollback 击穿。
+        workspace = await meta_db.get_project_workspace(project_id)
+        if not workspace:
+            raise ProjectDbError(f"workspace not found for project {project_id}")
+        write_lock = await get_workspace_write_lock(workspace)
+
         # 计数防膨胀：超出上限则删除最旧一条（FIFO）。
         # count+delete+insert 放同一事务，避免并发归档时双双通过计数检查
         # 导致行数越界；DELETE 用 LIMIT 1 只删一条，避免同毫秒多条
         # 被 MIN(created_at) 一起误删。
-        await conn.execute("BEGIN IMMEDIATE")
-        try:
-            cursor = await conn.execute(
-                "SELECT COUNT(*) AS n FROM memories WHERE scope = 'lesson'"
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            if row and int(row["n"] or 0) >= _LESSON_LIMIT:
-                # 只删最旧一条（ORDER BY created_at ASC LIMIT 1），
-                # 避免同毫秒多条被 MIN(created_at) 一起误删。
-                await conn.execute(
-                    "DELETE FROM memories WHERE id IN ("
-                    "SELECT id FROM memories WHERE scope = 'lesson' "
-                    "ORDER BY created_at ASC LIMIT 1)"
+        async with write_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) AS n FROM memories WHERE scope = 'lesson'"
                 )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if row and int(row["n"] or 0) >= _LESSON_LIMIT:
+                    # 只删最旧一条（ORDER BY created_at ASC LIMIT 1），
+                    # 避免同毫秒多条被 MIN(created_at) 一起误删。
+                    await conn.execute(
+                        "DELETE FROM memories WHERE id IN ("
+                        "SELECT id FROM memories WHERE scope = 'lesson' "
+                        "ORDER BY created_at ASC LIMIT 1)"
+                    )
 
-            mem_id = str(uuid.uuid4())
-            await conn.execute(
-                "INSERT INTO memories (id, agent_id, scope, module_id, type, content, "
-                "source_agent_id, metadata, created_at, updated_at) "
-                "VALUES (?, ?, 'lesson', NULL, 'lesson', ?, ?, ?, ?, ?)",
-                [mem_id, agent_id, content, agent_id,
-                 json.dumps(metadata, ensure_ascii=False), now_ms, now_ms],
-            )
-            await conn.commit()
-        except Exception:
-            await conn.rollback()
-            raise
+                mem_id = str(uuid.uuid4())
+                await conn.execute(
+                    "INSERT INTO memories (id, agent_id, scope, module_id, type, content, "
+                    "source_agent_id, metadata, created_at, updated_at) "
+                    "VALUES (?, ?, 'lesson', NULL, 'lesson', ?, ?, ?, ?, ?)",
+                    [mem_id, agent_id, content, agent_id,
+                     json.dumps(metadata, ensure_ascii=False), now_ms, now_ms],
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
         _cache_invalidate(project_id)
         log.info(
             "lesson_saved",

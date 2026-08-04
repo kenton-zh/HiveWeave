@@ -46,6 +46,12 @@ _agent_cache: dict[str, str] = {}
 # R2: 保护 ensure_project_db 的懒初始化，避免并发创建多个连接到同一 DB
 _ensure_lock = asyncio.Lock()
 
+# 写操作事务级互斥（TEST18 审计 S1）：单连接 + 多协程（同项目多 agent 的
+# 写队列 worker 并发）下，BEGIN IMMEDIATE..COMMIT 必须整段持锁——
+# aiosqlite 只保证语句级 FIFO，不保证事务内无他人语句插入（他人 COMMIT/
+# rollback 会提前终止或回滚本事务）。key = workspace 绝对路径。
+_write_locks: dict[str, asyncio.Lock] = {}
+
 # 已驱逐的工作区集合 — delete_project 调用 evict 后标记，
 # 防止 cancel 路径的收尾 DB 操作通过 get_project_db_for_agent 重连锁住 data.db
 _evicted_workspaces: set[str] = set()
@@ -207,6 +213,10 @@ async def evict_project_db(workspace_path: str) -> None:
     _evicted_workspaces.add(ws)  # 标记 — 拒绝后续重连
     async with _ensure_lock:
         conn = _cache.pop(ws, None)
+    _write_locks.pop(ws, None)
+    # 回退键（f"agent:{aid}"，见 _get_write_lock）一并清理，防键泄漏
+    for aid in [a for a, w in _agent_cache.items() if w == ws]:
+        _write_locks.pop(f"agent:{aid}", None)
     if conn is not None:
         try:
             await conn.close()
@@ -249,6 +259,7 @@ async def close_all() -> None:
     _cache.clear()
     _agent_cache.clear()
     _evicted_workspaces.clear()
+    _write_locks.clear()
 
 
 def clear_evicted_workspace(workspace_path: str) -> None:
@@ -288,13 +299,69 @@ async def query_one(
     return row
 
 
+async def get_workspace_write_lock(workspace_path: str) -> asyncio.Lock:
+    """Get (or create) the per-workspace write lock（供按 workspace 解析连接的调用方）。"""
+    ws = str(Path(workspace_path).resolve())
+    lock = _write_locks.get(ws)
+    if lock is None:
+        lock = asyncio.Lock()
+        _write_locks[ws] = lock
+    return lock
+
+
+async def _get_write_lock(agent_id: str) -> asyncio.Lock:
+    """Get (or create) the per-workspace write lock for an agent.
+
+    所有写操作（execute / execute_transaction）共用同一把锁串行化，
+    保证单连接上事务不会被其他协程击穿。
+    """
+    conn = await get_project_db_for_agent(agent_id)  # 填充 _agent_cache 映射
+    ws = _agent_cache.get(agent_id)
+    if ws is None:
+        # 仅测试/异常路径（真实运行 get_project_db_for_agent 必填充映射）：
+        # 回退 agent 级锁（不串行化同 ws 多 agent，但无锁安全）
+        ws = f"agent:{agent_id}"
+    return await get_workspace_write_lock(ws)
+
+
 async def execute(
     agent_id: str, sql: str, params: list[Any] | None = None
 ) -> None:
     """Execute an INSERT/UPDATE/DELETE on the per-project DB for an agent.
 
     底层 get_project_db_for_agent 失败时 raise ProjectDbError，由调用方处理。
+    写操作经 per-workspace 锁串行化（见 _get_write_lock）。
     """
-    conn = await get_project_db_for_agent(agent_id)
-    await conn.execute(sql, params or [])
-    await conn.commit()
+    lock = await _get_write_lock(agent_id)
+    async with lock:
+        conn = await get_project_db_for_agent(agent_id)
+        await conn.execute(sql, params or [])
+        await conn.commit()
+
+
+async def execute_transaction(
+    agent_id: str, statements: list[tuple[str, list[Any] | None]]
+) -> None:
+    """Execute multiple statements in ONE transaction (BEGIN IMMEDIATE).
+
+    多语句写必须单事务（契约 11 纪律）——例如压缩持久化的
+    "DELETE 旧 turn + INSERT 新 turn"：分两条 execute 会在中间暴露
+    空历史窗口，且 INSERT 失败时 DELETE 已提交 = 历史永久丢失
+    （TEST18 巡检 P1）。异常时回滚并上抛（调用方负责告警/计数）。
+    整段事务持 per-workspace 写锁（TEST18 审计 S1）：否则同一连接上
+    其他协程的 COMMIT/rollback 会提前终止或回滚本事务。
+    """
+    lock = await _get_write_lock(agent_id)
+    async with lock:
+        conn = await get_project_db_for_agent(agent_id)
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            for sql, params in statements:
+                await conn.execute(sql, params or [])
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise

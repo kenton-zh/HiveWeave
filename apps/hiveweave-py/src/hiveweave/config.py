@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     ark_coding_base_url: str = "https://ark.cn-beijing.volces.com/api/coding/v3"
     ark_coding_model_id: str = "deepseek-v4-flash"
 
+    # 专用压缩（compactor）模型 — llm_models 表 id（HIVEWEAVE_COMPACTOR_MODEL_ID）。
+    # 空 = 用 agent 自己的模型。建议配一个便宜的 non-reasoning 模型：
+    # reasoning 模型会把 max_tokens 预算花在思考链上导致摘要 content 空
+    # （TEST18 巡检 P0），且解耦 agent 主模型故障与压缩故障。
+    compactor_model_id: str = ""
+
     # Round-robin across active models to spread rate limits (default on)
     model_pool_enabled: bool = True
 

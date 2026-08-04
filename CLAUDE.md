@@ -114,7 +114,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 
 `ensureProjectDb(workspace_path)` 懒创建 per-project DB。
 
-> ADR: [004-dual-db-pattern](docs/adr/004-dual-db-pattern.md)
+> ADR: [004-dual-db-pattern](docs/adr/004-dual-db-pattern.md)（路由机制部分已被 [006-agent-router-routing](docs/adr/006-agent-router-routing.md) supersede）
 
 ### LLM 流式调用
 
@@ -130,6 +130,8 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 - 全局 LLM 并发上限 `_LLM_MAX_CONCURRENT`（env `HIVEWEAVE_LLM_MAX_CONCURRENT`，默认 8）；`TOTAL_TIMEOUT_S=540`（env `HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S`；给 agent safety_timeout 600s 留 60s 余量）
 - **连续流式总超时**：同 agent `_stream_timeout_streak ≥ 2` → `_park_after_stream_timeouts`（disposition waiting + wait `stream_total_timeout_recovery` + 升级上级，不自动 approve）
 - **模型分级 + 同级故障切换**（`services/model.py` + `services/policy.py`）：两级 tier — `management`（CEO/Coordinator，好模型）/ `executor`（Executor/QA/HR，便宜模型）。每级两槽位：primary + backup，`global_settings` 四键配置（`model_tier_{management|executor}_{primary|backup}`，值存 model_id 或 UUID）。`resolve_model(tier, skip_model_ids)` 严格按 primary→backup→tier列→legacy pool 解析，**禁跨级**。`model_tier_for_agent(agent)` 由 `infer_role_family` 映射。首次 429/5xx 同 turn 自动切同级 backup（`_resolve_failover_backup`，同 api_key 跳过）；streamer circuit fallback 校验 tier 一致性。`pick_from_pool` 全池 RR 已降级为无 tier 配置时的兼容回退。`ensure_channel_models` 仍按名 upsert Ark Plan/Coding 双渠道；`is_rate_limit_error` 命中的 429 不计入放弃、独立冷却 `RATE_LIMIT_RESUME_COOLDOWN_S=120` 后 resume（`agents/agent.py`）
+
+> ADR: [008-model-tiering-failover](docs/adr/008-model-tiering-failover.md)
 
 ### 文件拆分纪律（包化）
 
@@ -234,6 +236,8 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 
 **Naming**: executor 的 `role` 必须是「模块短名 + 工种」（如「签到排行榜工程师」），禁止一排裸「前端工程师」。Coordinator 用领域职称（如「游戏逻辑架构师」）。
 
+> ADR: [007-agent-role-permission-matrix](docs/adr/007-agent-role-permission-matrix.md)
+
 ### TurnResult 出口闸门（回合必须有返回值）
 
 每轮对话视为一次函数调用，不能空转收工：
@@ -274,6 +278,8 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 - **merge 门禁**：`git_worktree_merge` 合调用者**自己 short_id 的分支**时，要求对应任务已 `approved` 且批准人 ≠ 调用者（`_check_self_merge_gate`）；合下级分支按原逻辑
 - **merge 代理**：merger 失联/逾期时 `services/merge_proxy.py` 沿 parent 链找有 MERGE capability 的祖先发 `[MERGE PROXY]` 并触发；`task.mark_verifying` 清理陈旧 MERGE PENDING inbox
 - **VERIFY spawn**：approve+merge 后 spawn 独立 QA 验证任务（`_find_independent_qa` 排除原实现者与 merger）；QA 缺席 → VERIFY blocked → hire 后 `retry_qa_blocked_verify_tasks` 重挂
+
+> ADR: [009-task-ledger-review-merge-gates](docs/adr/009-task-ledger-review-merge-gates.md)
 
 ### 中断恢复与自主唤醒（agent 生命周期）
 

@@ -409,10 +409,14 @@ class InboxService:
                         "AND reply_contract_id IS NOT NULL",
                         [to_agent_id, from_agent_id],
                     )
+                    # aiosqlite.Row 没有 .get() —— 直接 r["col"]（SQL 已过滤
+                    # NOT NULL；列在 SELECT 里，bracket 访问不会 raise）。
+                    # 旧代码 r.get() 在非空方向上必抛 AttributeError 被下方
+                    # except 吞掉 → 警告在真实风暴场景是死代码（P0，三次复现）。
                     known_set = {
                         r["reply_contract_id"]
                         for r in known or []
-                        if r.get("reply_contract_id")
+                        if r["reply_contract_id"]
                     }
                     rt = (reply_to or "").strip()
                     match = any(
@@ -437,8 +441,15 @@ class InboxService:
                             if force_wake_note
                             else warn
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    # 不静默：上一次裸 except 把 Row.get() 的 AttributeError
+                    # 吞了三轮。警告失败不阻塞发送，但必须留痕。
+                    log.debug(
+                        "inbox_reply_to_warning_failed",
+                        from_agent_id=from_agent_id,
+                        to_agent_id=to_agent_id,
+                        error=str(e),
+                    )
 
         # Wake economics (TEST18): a notify (FYI, no reply needed) must not
         # wake the recipient — it goes to background (delivered=0) and is
@@ -1127,7 +1138,9 @@ class InboxService:
                 "ORDER BY created_at ASC",
                 [agent_id, int(since_ms)],
             )
-            return [r["id"] for r in rows if r.get("id")]
+            # Row 没有 .get()——旧写法在有未读行时必抛 AttributeError，
+            # 被下方 except 吞成恒空列表（潜伏雷，同 415 已知坑）。
+            return [r["id"] for r in rows if r["id"]]
         except Exception as e:
             log.debug("inbox_pending_since_failed", error=str(e))
             return []
