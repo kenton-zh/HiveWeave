@@ -37,7 +37,11 @@ import aiosqlite
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ProjectDbError, ensure_project_db
+from hiveweave.db.project import (
+    ProjectDbError,
+    ensure_project_db,
+    get_workspace_write_lock,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -315,39 +319,47 @@ class MemoryService:
         meta_json = json.dumps(metadata) if metadata else "{}"
         conn = await self._conn(project_id)
 
-        # Upsert: module_id 非空时先查已有记录
-        existing_id = None
-        if module_id:
-            cursor = await conn.execute(
-                "SELECT id FROM memories "
-                "WHERE agent_id = ? AND scope = ? AND module_id = ? "
-                "ORDER BY updated_at DESC LIMIT 1",
-                [agent_id, scope, module_id],
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            if row:
-                existing_id = row["id"]
+        # 写事务互斥（TEST18 审计 S1）：多语句写 + commit 必须整段持
+        # per-workspace 锁，否则他人 BEGIN IMMEDIATE/rollback 会击穿本事务。
+        # Upsert 的查已有记录也放锁内，避免并发双写同 (agent,scope,module_id)
+        # 时双双走 INSERT 造成重复行（该三元组无唯一索引）。
+        workspace = await meta_db.get_project_workspace(project_id)
+        if not workspace:
+            raise ProjectDbError(f"workspace not found for project {project_id}")
+        write_lock = await get_workspace_write_lock(workspace)
+        async with write_lock:
+            existing_id = None
+            if module_id:
+                cursor = await conn.execute(
+                    "SELECT id FROM memories "
+                    "WHERE agent_id = ? AND scope = ? AND module_id = ? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    [agent_id, scope, module_id],
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if row:
+                    existing_id = row["id"]
 
-        if existing_id:
-            # UPDATE 已有记录
-            await conn.execute(
-                "UPDATE memories SET content = ?, type = ?, "
-                "source_agent_id = ?, metadata = ?, updated_at = ? "
-                "WHERE id = ?",
-                [content, type, source_agent_id, meta_json, now_ms, existing_id],
-            )
-            mem_id = existing_id
-        else:
-            # INSERT 新记录
-            mem_id = str(uuid.uuid4())
-            await conn.execute(
-                "INSERT INTO memories (id, agent_id, scope, module_id, type, content, "
-                "source_agent_id, metadata, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [mem_id, agent_id, scope, module_id, type, content,
-                 source_agent_id, meta_json, now_ms, now_ms])
-        await conn.commit()
+            if existing_id:
+                # UPDATE 已有记录
+                await conn.execute(
+                    "UPDATE memories SET content = ?, type = ?, "
+                    "source_agent_id = ?, metadata = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    [content, type, source_agent_id, meta_json, now_ms, existing_id],
+                )
+                mem_id = existing_id
+            else:
+                # INSERT 新记录
+                mem_id = str(uuid.uuid4())
+                await conn.execute(
+                    "INSERT INTO memories (id, agent_id, scope, module_id, type, content, "
+                    "source_agent_id, metadata, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [mem_id, agent_id, scope, module_id, type, content,
+                     source_agent_id, meta_json, now_ms, now_ms])
+            await conn.commit()
         # R5: 定向失效 — 只清受影响的缓存层，而非全项目
         self.invalidate(project_id, agent_id=agent_id, scope=scope,
                         module_id=module_id)
@@ -405,6 +417,12 @@ class MemoryService:
         连接来自共享连接池，只关 cursor，绝不 conn.close()。
         """
         conn = await self._conn(project_id)
+        # 写事务互斥（TEST18 审计 S1）：单连接多协程下 BEGIN..COMMIT
+        # 必须整段持 per-workspace 锁，否则他人 commit/rollback 会击穿本事务。
+        workspace = await meta_db.get_project_workspace(project_id)
+        if not workspace:
+            raise ProjectDbError(f"workspace not found for project {project_id}")
+        write_lock = await get_workspace_write_lock(workspace)
 
         # 1. 取最老的 _ARCHIVE_KEYS_INPUT 条未压缩记忆（ASC）
         cursor = await conn.execute(
@@ -452,52 +470,53 @@ class MemoryService:
         if summary_text and summary_text.strip():
             # 4a. LLM 成功：旧条目打 compressed 标记（不删），upsert 摘要条目。
             # 共享连接池（契约 11）：多语句写必须显式事务 + 异常回滚，
-            # 否则遗留打开事务可能被其他协程意外 commit/rollback。
+            # 且整段持 per-workspace 写锁（TEST18 审计 S1），否则遗留打开
+            # 事务可能被其他协程意外 commit/rollback。
             now_ms = int(time.time() * 1000)
             old_ids = [e["id"] for e in old_entries]
-            try:
-                await conn.execute("BEGIN IMMEDIATE")
-                if old_ids:
-                    # 逐条标记 — SQLite 无批量 JSON 更新，逐条 UPDATE 安全
-                    for oid in old_ids:
-                        await conn.execute(
-                            "UPDATE memories SET metadata = json_set(metadata, "
-                            "'$.compressed', true), updated_at = ? WHERE id = ?",
-                            [now_ms, oid],
-                        )
-                # 摘要条目 upsert：存在则 UPDATE，否则 INSERT。
-                # 注意：摘要条目不标 compressed=true（该标记专指"被并入摘要的旧条目"；
-                # 摘要自身靠 type=compressed_summary 排除出注入窗口）。
-                meta_json = json.dumps({
-                    "compressed_summary": True,
-                    "source_agent_id": agent_id,
-                    "archived_at_ms": now_ms,
-                })
-                summary_id = old_summary.get("id") if old_summary else None
-                if summary_id:
-                    await conn.execute(
-                        "UPDATE memories SET content = ?, metadata = ?, "
-                        "updated_at = ? WHERE id = ?",
-                        [summary_text.strip()[:2000], meta_json, now_ms,
-                         summary_id],
-                    )
-                else:
-                    summary_id = str(uuid.uuid4())
-                    await conn.execute(
-                        "INSERT INTO memories (id, agent_id, scope, module_id, "
-                        "type, content, source_agent_id, metadata, created_at, "
-                        "updated_at) VALUES (?, ?, 'agent', NULL, ?, ?, ?, ?, ?, ?)",
-                        [summary_id, agent_id, _COMPRESSED_SUMMARY_TYPE,
-                         summary_text.strip()[:2000], agent_id, meta_json,
-                         now_ms, now_ms],
-                    )
-                await conn.commit()
-            except Exception:
+            meta_json = json.dumps({
+                "compressed_summary": True,
+                "source_agent_id": agent_id,
+                "archived_at_ms": now_ms,
+            })
+            summary_id = old_summary.get("id") if old_summary else None
+            async with write_lock:
                 try:
-                    await conn.rollback()
+                    await conn.execute("BEGIN IMMEDIATE")
+                    if old_ids:
+                        # 逐条标记 — SQLite 无批量 JSON 更新，逐条 UPDATE 安全
+                        for oid in old_ids:
+                            await conn.execute(
+                                "UPDATE memories SET metadata = json_set(metadata, "
+                                "'$.compressed', true), updated_at = ? WHERE id = ?",
+                                [now_ms, oid],
+                            )
+                    # 摘要条目 upsert：存在则 UPDATE，否则 INSERT。
+                    # 注意：摘要条目不标 compressed=true（该标记专指"被并入摘要的旧条目"；
+                    # 摘要自身靠 type=compressed_summary 排除出注入窗口）。
+                    if summary_id:
+                        await conn.execute(
+                            "UPDATE memories SET content = ?, metadata = ?, "
+                            "updated_at = ? WHERE id = ?",
+                            [summary_text.strip()[:2000], meta_json, now_ms,
+                             summary_id],
+                        )
+                    else:
+                        await conn.execute(
+                            "INSERT INTO memories (id, agent_id, scope, module_id, "
+                            "type, content, source_agent_id, metadata, created_at, "
+                            "updated_at) VALUES (?, ?, 'agent', NULL, ?, ?, ?, ?, ?, ?)",
+                            [str(uuid.uuid4()), agent_id, _COMPRESSED_SUMMARY_TYPE,
+                             summary_text.strip()[:2000], agent_id, meta_json,
+                             now_ms, now_ms],
+                        )
+                    await conn.commit()
                 except Exception:
-                    pass
-                raise
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        pass
+                    raise
             self.invalidate(project_id, agent_id=agent_id, scope="agent")
             log.info(
                 "memory_compacted",
@@ -522,25 +541,26 @@ class MemoryService:
         excess = max(0, total - _FRESH_MEMORY_MAX)
         if excess:
             # 删最老 excess 条（保最新 _FRESH_MEMORY_MAX 条原文）
-            try:
-                await conn.execute("BEGIN IMMEDIATE")
-                await conn.execute(
-                    "DELETE FROM memories WHERE id IN ("
-                    "SELECT id FROM memories WHERE scope = 'agent' "
-                    "AND agent_id = ? "
-                    "AND (json_extract(COALESCE(metadata, '{}'), '$.compressed') "
-                    "IS NOT 1) "
-                    "AND type != ? "
-                    "ORDER BY created_at ASC, rowid ASC LIMIT ?)",
-                    [agent_id, _COMPRESSED_SUMMARY_TYPE, excess],
-                )
-                await conn.commit()
-            except Exception:
+            async with write_lock:
                 try:
-                    await conn.rollback()
+                    await conn.execute("BEGIN IMMEDIATE")
+                    await conn.execute(
+                        "DELETE FROM memories WHERE id IN ("
+                        "SELECT id FROM memories WHERE scope = 'agent' "
+                        "AND agent_id = ? "
+                        "AND (json_extract(COALESCE(metadata, '{}'), '$.compressed') "
+                        "IS NOT 1) "
+                        "AND type != ? "
+                        "ORDER BY created_at ASC, rowid ASC LIMIT ?)",
+                        [agent_id, _COMPRESSED_SUMMARY_TYPE, excess],
+                    )
+                    await conn.commit()
                 except Exception:
-                    pass
-                raise
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        pass
+                    raise
             self.invalidate(project_id, agent_id=agent_id, scope="agent")
             log.info(
                 "memory_compacted_fallback_trim",
@@ -553,10 +573,16 @@ class MemoryService:
         """Archive an agent's private memories (scope: agent → archive)."""
         now_ms = int(time.time() * 1000)
         conn = await self._conn(project_id)
-        cursor = await conn.execute(
-            "UPDATE memories SET scope = 'archive', updated_at = ? "
-            "WHERE agent_id = ? AND scope = 'agent'", [now_ms, agent_id])
-        await conn.commit()
+        # 写事务互斥（TEST18 审计 S1）：整段持 per-workspace 锁，同 save_memory。
+        workspace = await meta_db.get_project_workspace(project_id)
+        if not workspace:
+            raise ProjectDbError(f"workspace not found for project {project_id}")
+        write_lock = await get_workspace_write_lock(workspace)
+        async with write_lock:
+            cursor = await conn.execute(
+                "UPDATE memories SET scope = 'archive', updated_at = ? "
+                "WHERE agent_id = ? AND scope = 'agent'", [now_ms, agent_id])
+            await conn.commit()
         count = max(cursor.rowcount, 0)
         await cursor.close()
         # R5: 只清该 agent 的私有缓存（archive 层由 TTL 自然过期）

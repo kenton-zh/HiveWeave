@@ -37,7 +37,7 @@ HiveWeave replaces the single-AI-agent model with a **multi-agent engineering or
 | **Parallelism** | One task at a time | Parallel agents, each on its own `git worktree` |
 | **Quality gate** | You review everything yourself | 4-layer review: Executor → QA → Manager → CEO → you |
 | **Cost model** | Same model for every task | Premium models for decisions, cheap models for execution |
-| **Memory** | Reset or manually re-primed each session | Three-tier memory with handoff inheritance between agents |
+| **Memory** | Reset or manually re-primed each session | Three-tier memory (agent-private layer active; see ADR-010) |
 
 ## Quick Start
 
@@ -111,8 +111,8 @@ Four-Layer Review Gate:
 - **Review → Merge gate** — Executor reports completion → QA reviews → Manager approves → CEO signs off → Merge to main. Four gates before code reaches you.
 
 ### Memory & Handoff
-- **Three-tier memory** — Project memory (shared), Agent memory (private), Archived memory (former agents). Knowledge persists across sessions.
-- **Handoff inheritance** — When an agent is dismissed, their memory is summarized and transferred to a successor. No knowledge loss.
+- **Three-tier memory** — Designed as project (shared) / agent (private) / archive (former agents). The agent-private layer is active (persisted across sessions, compacted + snapshot into prompts). The project & archive layers are design blueprints, not yet wired (see ADR-010).
+- **Handoff inheritance** — Design goal, not yet implemented: dismissing an agent currently does not archive its memory (see ADR-010).
 - **Continuous learning** — Agents can `skillify` successful workflows and `learn` from failures. Cross-project patterns captured for reuse.
 
 ### Model Budget Layering
@@ -188,8 +188,8 @@ hiveweave/
 | **6 org paradigms** | Solo, Flat Squad, Tech Lead, PM+Architect, Pod, Pipeline. CEO picks the structure that fits the project. |
 | **Phase 0.5 manager mobilization** | Managers explore their domain and break down tasks BEFORE hiring subordinates. No over-hiring, no idle agents. |
 | **CAVEMAN comms** | Agent-to-agent messages are terse and technical. "模块已拆分. 3人已招. 等待优先级." No pleasantries, zero token waste. |
-| **Three-tier memory** | Project memory (shared), Agent private memory, Archived memory (former agents). Knowledge persists across sessions and handoffs. |
-| **Handoff inheritance** | When an agent is dismissed, their memory is summarized and transferred to a successor. No knowledge loss. |
+| **Three-tier memory** | Designed as project (shared) / agent (private) / archive (former agents). Agent-private layer active; project & archive layers are blueprints (ADR-010). |
+| **Handoff inheritance** | Design goal, not yet implemented — dismiss does not archive memory (ADR-010). |
 | **Expert on-demand** | When the team hits a wall, CEO summons an Expert agent (most expensive model). Team-refined questions → better answers per dollar. Only burns expert tokens when truly needed. |
 | **Asyncio task isolation** | Each agent runs in its own asyncio task. Crash doesn't crash the system. Circuit breaker + exponential backoff for LLM outages. |
 | **Game time scheduling** | 1 real hour = 1 game day. Stalled agents: 10min stall → nudge, ~40min+ → escalate to superiors. Timed alarms on simulated clock. |
@@ -201,6 +201,7 @@ hiveweave/
 ## Documentation
 
 - [CLAUDE.md](./CLAUDE.md) — AI tooling instructions & full architecture reference
+- [CHANGELOG.md](./CHANGELOG.md) — versioned change log
 
 ## Acknowledgments
 

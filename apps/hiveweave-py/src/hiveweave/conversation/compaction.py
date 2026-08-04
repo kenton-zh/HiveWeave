@@ -26,7 +26,12 @@ logger = structlog.get_logger()
 # ── 常量 ────────────────────────────────────────────────────
 COMPACTION_TRIGGER_RATIO = 0.50
 SUMMARY_TEMPERATURE = 0.3
-SUMMARY_MAX_TOKENS = 2000
+# 摘要预算回退值：模型行没有 max_output_tokens（旧数据/未探测）时使用。
+# 对齐 opencode：压缩调用不设小 max_tokens，直接用模型配置的输出上限
+# （TEST18 巡检 P0：曾用 2000 首试，reasoning 模型把预算花在思考链上
+# 导致 content 空，成功率仅 7/24）。首试 = 模型上限；命中
+# finish_reason=length + content 空时用相同预算幂等重试一次兜偶发失败。
+SUMMARY_MAX_TOKENS_ESCALATED = 8000
 
 # 摘要消息特殊标记 — store 据此识别并提取到 compacted_prefix_cache
 # R10: 已验证与 Elixir streamer.ex:2260 完全一致 ——
@@ -237,42 +242,82 @@ def _safe_content(content) -> str:
 async def resolve_compactor_callback(agent_id: str) -> LLMCallback | None:
     """解析 agent 的 compactor LLM 回调。
 
-    查询 Meta DB 获取 agent 的模型（或首个活跃模型），构建 OpenAI 兼容回调。
+    优先使用专用压缩模型（HIVEWEAVE_COMPACTOR_MODEL_ID，llm_models 表 id）；
+    未配置或该模型不可用时回退到 agent 自己的模型（或首个活跃模型）。
+    专用模型解耦 agent 主模型故障与压缩故障（TEST18 巡检 P0④：原实现
+    compactor 硬绑 agent 同款模型，错误完全相关）。
     无可用模型时返回 None（compact 将回退到硬截断）。
     """
+    from hiveweave.config import settings
     from hiveweave.db import meta as meta_db
     from hiveweave.db import project as project_db
 
-    try:
-        # 1. 取 agent 的 model_id（agents 表在 per-project DB）
+    async def _pick_model() -> tuple[dict | None, str | None]:
+        # 1. 专用压缩模型（配置优先；须 active 且带 key）
+        if settings.compactor_model_id:
+            model = await meta_db.query_one(
+                "SELECT model_id, base_url, api_key, max_output_tokens "
+                "FROM llm_models "
+                "WHERE id = ? AND is_active = 1 LIMIT 1",
+                [settings.compactor_model_id],
+            )
+            if model and model["base_url"] and model["api_key"]:
+                return dict(model), "dedicated"
+        # 2. agent 的 model_id
         agent_row = await project_db.query_one(
             agent_id,
             "SELECT model_id FROM agents WHERE id = ? LIMIT 1", [agent_id]
         )
         model_id = agent_row["model_id"] if agent_row else None
-
-        # 2. 按 model_id 取模型，否则取首个活跃模型
-        model = None
         if model_id:
             model = await meta_db.query_one(
-                "SELECT model_id, base_url, api_key FROM llm_models WHERE id = ? LIMIT 1",
+                "SELECT model_id, base_url, api_key, max_output_tokens "
+                "FROM llm_models WHERE id = ? LIMIT 1",
                 [model_id],
             )
+            if model and model["base_url"] and model["api_key"]:
+                return dict(model), "agent"
+        # 3. 首个活跃模型
+        model = await meta_db.query_one(
+            "SELECT model_id, base_url, api_key, max_output_tokens "
+            "FROM llm_models "
+            "WHERE is_active = 1 ORDER BY created_at ASC LIMIT 1",
+            [],
+        )
+        if model and model["base_url"] and model["api_key"]:
+            return dict(model), "active"
+        return None, None
+
+    try:
+        model, source = await _pick_model()
         if model is None:
-            model = await meta_db.query_one(
-                "SELECT model_id, base_url, api_key FROM llm_models "
-                "WHERE is_active = 1 ORDER BY created_at ASC LIMIT 1",
-                [],
+            logger.warning(
+                "compactor_model_unavailable",
+                agent_id=agent_id,
+                hint="no usable model (base_url/api_key empty, dedicated id invalid, "
+                "or none active) - compaction will hard-trim",
             )
-        if model is None or not model["base_url"]:
             return None
 
         base_url = str(model["base_url"]).rstrip("/")
         api_key = str(model["api_key"] or "")
         model_name = str(model["model_id"])
+        # 对齐 opencode：max_tokens 用模型配置的输出上限（无该列/为 0 时
+        # 由 _call_compactor_llm 回退 SUMMARY_MAX_TOKENS_ESCALATED）
+        max_output = int(model.get("max_output_tokens") or 0)
+        logger.info(
+            "compactor_model_resolved",
+            agent_id=agent_id,
+            source=source,
+            model=model_name,
+            max_output_tokens=max_output or SUMMARY_MAX_TOKENS_ESCALATED,
+        )
 
         async def callback(prompt: str) -> str | None:
-            return await _call_compactor_llm(base_url, api_key, model_name, prompt)
+            return await _call_compactor_llm(
+                base_url, api_key, model_name, prompt,
+                max_tokens=max_output or None,
+            )
 
         return callback
     except Exception as e:
@@ -281,34 +326,64 @@ async def resolve_compactor_callback(agent_id: str) -> LLMCallback | None:
 
 
 async def _call_compactor_llm(
-    base_url: str, api_key: str, model: str, prompt: str
+    base_url: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    max_tokens: int | None = None,
 ) -> str | None:
-    """调用 OpenAI 兼容 API 生成摘要。"""
+    """调用 OpenAI 兼容 API 生成摘要。
+
+    预算 = 模型配置的输出上限（resolve_compactor_callback 传入）；
+    未传时回退 SUMMARY_MAX_TOKENS_ESCALATED。命中 finish_reason=length +
+    content 空（预算被 reasoning 吃光/偶发截断）时用相同预算幂等重试
+    一次兜偶发失败——预算已是模型上限，升级无意义（TEST18 巡检 P0 修复）。
+    """
     import httpx
 
     url = f"{base_url}/chat/completions"
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": SUMMARY_TEMPERATURE,
-        "max_tokens": SUMMARY_MAX_TOKENS,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, json=body, headers=headers)
+    budget = max_tokens if max_tokens is not None else SUMMARY_MAX_TOKENS_ESCALATED
+
+    for attempt in (1, 2):
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": SUMMARY_TEMPERATURE,
+            "max_tokens": budget,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, json=body, headers=headers)
+        except Exception as e:
+            logger.warning("compactor_llm_call_failed", error=str(e))
+            return None
         if resp.status_code != 200:
             logger.warning("compactor_llm_http_error", status=resp.status_code)
             return None
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.warning("compactor_llm_bad_json", error=str(e))
+            return None
         choices = data.get("choices") or []
         if not choices:
             return None
-        content = choices[0].get("message", {}).get("content")
-        return content if content else None
-    except Exception as e:
-        logger.warning("compactor_llm_call_failed", error=str(e))
+        choice = choices[0]
+        content = (choice.get("message") or {}).get("content")
+        if content:
+            return content
+        # content 空：仅当 reasoning 吃光预算（finish_reason=length）才重试
+        if choice.get("finish_reason") == "length" and attempt == 1:
+            logger.info(
+                "compactor_llm_retry",
+                model=model,
+                max_tokens=budget,
+                reason="finish_reason=length with empty content",
+            )
+            continue
         return None
+    return None

@@ -67,12 +67,19 @@ class Telemetry:
             "doom_loop_detected": 0,
             "doom_loop_warned": 0,
             "poll_hard_reject": 0,
+            "compaction_persist_failed": 0,
+            "persist_turn_failed": 0,
+            "persist_pruned_failed": 0,
         }
         self._wake_reasons: dict[str, int] = {}
         self._turn_exit_violations: dict[str, int] = {}
         self._turn_exit_actions: dict[str, int] = {}
         self._gate_soft_pass: dict[str, int] = {}
         self._gate_hard_reject: dict[str, int] = {}
+
+    def bump(self, key: str) -> None:
+        """Increment an arbitrary in-process counter (visible in /api/debug/metrics)."""
+        self._counters[key] = self._counters.get(key, 0) + 1
 
     def add_handler(self, handler: Callable[[str, dict], None]) -> None:
         """Register a custom event handler."""
@@ -98,6 +105,13 @@ class Telemetry:
             "doom_loop_detected": self._counters.get("doom_loop_detected", 0),
             "doom_loop_warned": self._counters.get("doom_loop_warned", 0),
             "poll_hard_reject": self._counters.get("poll_hard_reject", 0),
+            "compaction_persist_failed": self._counters.get(
+                "compaction_persist_failed", 0
+            ),
+            "persist_turn_failed": self._counters.get("persist_turn_failed", 0),
+            "persist_pruned_failed": self._counters.get(
+                "persist_pruned_failed", 0
+            ),
             "turn_exit_by_violation": dict(self._turn_exit_violations),
             "turn_exit_by_action": dict(self._turn_exit_actions),
             "gate_soft_pass_total": dict(self._gate_soft_pass),
@@ -119,6 +133,9 @@ class Telemetry:
             "doom_loop_detected": 0,
             "doom_loop_warned": 0,
             "poll_hard_reject": 0,
+            "compaction_persist_failed": 0,
+            "persist_turn_failed": 0,
+            "persist_pruned_failed": 0,
         }
         self._wake_reasons.clear()
         self._turn_exit_violations.clear()

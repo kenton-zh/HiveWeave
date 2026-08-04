@@ -35,6 +35,18 @@ logger = structlog.get_logger()
 
 DEFAULT_CONTEXT_WINDOW = 128_000
 
+# 压缩失败冷却（TEST18 巡检 P1）：LLM 摘要失败后 N 秒内不重新触发——
+# 否则超阈值 agent 每次 append 都空耗一次 ~20s 失败调用（16 次回退实证）。
+COMPACTION_COOLDOWN_S = 300
+
+# 单条 turn 原子写入（C2 fix 保留）：INSERT...SELECT 原子计算 turn_index。
+_INSERT_TURN_SQL = (
+    "INSERT INTO conversation_turns "
+    "(id, agent_id, turn_index, raw_messages, approx_tokens, created_at) "
+    "SELECT ?, ?, COALESCE(MAX(turn_index), -1) + 1, ?, ?, ? "
+    "FROM conversation_turns WHERE agent_id = ?"
+)
+
 
 class ConversationStore:
     """Per-agent 对话历史管理（内存缓存 + DB 持久化）。"""
@@ -52,6 +64,10 @@ class ConversationStore:
         self._write_workers: dict[tuple[str, str], asyncio.Task] = {}
         # 标记已被 clear 的 agent，使排队中的 persist 任务被丢弃
         self._cleared_agents: set[tuple[str, str]] = set()
+        # 已入队待执行的压缩（防连续两次 append 双入队 — TEST18 02:42:06/08 实证）
+        self._compaction_pending: set[tuple[str, str]] = set()
+        # 最近一次压缩实际执行时间（失败冷却，防失败循环空耗）
+        self._last_compaction_ts: dict[tuple[str, str], float] = {}
 
     def _get_compaction_lock(self, key: tuple[str, str]) -> asyncio.Lock:
         """获取或创建 per-agent 压缩锁。"""
@@ -154,6 +170,8 @@ class ConversationStore:
         self._cache.pop(key, None)
         self._prefix_cache.pop(key, None)
         self._compaction_locks.pop(key, None)
+        self._compaction_pending.discard(key)
+        self._last_compaction_ts.pop(key, None)
         self._cleared_agents.add(key)  # 标记已清除，排队中的 persist 将被丢弃
         try:
             await project_db.execute(
@@ -172,6 +190,8 @@ class ConversationStore:
         self._prefix_cache.clear()
         self._compaction_locks.clear()
         self._cleared_agents.clear()
+        self._compaction_pending.clear()
+        self._last_compaction_ts.clear()
         # 停止所有 worker
         for key, queue in self._write_queues.items():
             queue.put_nowait(None)  # 哨兵值停止 worker
@@ -194,6 +214,8 @@ class ConversationStore:
             self._cache.pop(key, None)
             self._prefix_cache.pop(key, None)
             self._compaction_locks.pop(key, None)
+            self._compaction_pending.discard(key)
+            self._last_compaction_ts.pop(key, None)
             self._cleared_agents.add(key)
 
     def get_compacted_prefix(self, project_id: str, agent_id: str) -> str | None:
@@ -234,6 +256,26 @@ class ConversationStore:
         ctx = await self._get_agent_context_window(agent_id)
         budget = self._compaction.check_overflow(total, ctx)
         if budget is not None:
+            # 去重：已入队待执行的压缩不再重复入队（连续两次 append 双入队实证）
+            if key in self._compaction_pending:
+                logger.debug(
+                    "compaction_skip_pending", agent_id=agent_id, total=total
+                )
+                return
+            # 失败冷却：上次压缩【实际发起】后 N 秒内不重触发——LLM 摘要失败期间
+            # 每次 append 都重试 = 每轮空耗 ~20s（TEST18 巡检 P1）。
+            # 时间戳在 _do_compaction 压缩实际发起时写入
+            # （M2：锁被占早退不消耗冷却；缓存为空不发请求也不消耗）。
+            now = time.time()
+            if now - self._last_compaction_ts.get(key, 0.0) < COMPACTION_COOLDOWN_S:
+                logger.debug(
+                    "compaction_skip_cooldown",
+                    agent_id=agent_id,
+                    total=total,
+                    cooldown_s=COMPACTION_COOLDOWN_S,
+                )
+                return
+            self._compaction_pending.add(key)
             # 压缩目标把历史压到约半个上下文：_build_messages 现在不设读预算、
             # 读取全部压缩后历史，压缩负责把总量控制在此值以下，给系统提示/工具/
             # 输出留出上半区，超限时再由 streamer 95% 硬裁兜底。
@@ -245,9 +287,14 @@ class ConversationStore:
                 total=total,
                 target=target_budget,
             )
-            await self._enqueue_write(
-                key, self._do_compaction, agent_id, project_id, key, messages, target_budget
-            )
+            try:
+                await self._enqueue_write(
+                    key, self._do_compaction, agent_id, project_id, key, messages, target_budget
+                )
+            except Exception:
+                # 入队失败（loop 关闭等罕见）→ 清 pending，避免该 agent 永久不再压缩
+                self._compaction_pending.discard(key)
+                raise
 
     async def _do_compaction(self, agent_id, project_id, key, messages, budget) -> None:
         lock = self._get_compaction_lock(key)
@@ -277,6 +324,11 @@ class ConversationStore:
 
                 callback = await resolve_compactor_callback(agent_id)
                 compacted = await self._compaction.compact(live, budget, callback)
+                # 压缩实际发起后写入冷却时间戳（M2：锁被占早退不消耗冷却；
+                # 缓存为空不发请求也不消耗）。成功/失败/无变化都写——成功
+                # 后历史必在预算内（成功=摘要替换旧段，失败=硬裁），故只防
+                # 失败循环；锚点丢失等已消耗 LLM 请求的路径同样受冷却保护。
+                self._last_compaction_ts[key] = time.time()
 
                 # 提取摘要到 prefix_cache，history 不含 summary（RECONCILE A1）
                 summary_text = None
@@ -306,6 +358,18 @@ class ConversationStore:
                             agent_id=agent_id,
                         )
                         return
+
+                # 无变化压缩（LLM 失败 + 未超预算 + 无新消息）：跳过全部写操作。
+                # TEST18 巡检 P1/P2：空回退不再无条件 DELETE+INSERT 重写整段历史
+                # （16 次回退 = 16 次非原子窗口 + 写队列阻塞 ~20s），也不追加
+                # 记忆快照到前缀（否则 compacted_prefix 无界增长）。
+                if summary_text is None and history == live:
+                    logger.info(
+                        "compaction_noop_skip_persist",
+                        agent_id=agent_id,
+                        kept=len(history),
+                    )
+                    return
 
                 self._cache[key] = history
 
@@ -351,27 +415,37 @@ class ConversationStore:
                 )
             except Exception as e:
                 logger.warning("compaction_error", agent_id=agent_id, error=str(e))
+            finally:
+                # 无论成败都清除入队标记，允许下次 append 重新触发
+                self._compaction_pending.discard(key)
 
     async def _persist_compaction(
         self, agent_id: str, history: list[dict], summary: str | None
     ) -> None:
-        """持久化压缩结果：删除旧 turn 行，写入压缩后的 turn + summary。
+        """持久化压缩结果：单事务删除旧 turn 行 + 写入压缩后的 turn。
 
         防止重启后 _load_from_db 加载到已压缩的旧消息（CRITICAL #1）。
-        summary 存入 agents 表的 compacted_prefix 列（如果存在），
-        或作为特殊 turn 行写入 conversation_turns 表。
+        summary 存入 agents 表的 compacted_prefix 列（如果存在）。
+
+        TEST18 巡检 P1 修复：DELETE + INSERT 原为两个独立事务（各自 commit）
+        ——中间暴露空历史读取窗口；INSERT 失败时 DELETE 已提交 = 历史永久
+        丢失且 _persist_turn 吞异常近乎静默。现用 execute_transaction 单事务，
+        失败整体回滚 + error 级日志 + telemetry 计数 + 上抛。
         """
         try:
-            # 删除所有旧 turn
-            await project_db.execute(
-                agent_id,
-                "DELETE FROM conversation_turns WHERE agent_id = ?",
-                [agent_id],
-            )
-            # 写入压缩后的 history 为单个 turn
+            statements: list[tuple[str, list]] = [
+                ("DELETE FROM conversation_turns WHERE agent_id = ?", [agent_id])
+            ]
             if history:
-                await self._persist_turn(agent_id, history)
-            # summary 持久化到 agent 配置（通过 per-project DB）
+                turn_id = str(uuid.uuid4())
+                now = int(time.time() * 1000)
+                raw = json.dumps(history, ensure_ascii=False)
+                tokens = estimate_tokens_for_messages(history)
+                statements.append(
+                    (_INSERT_TURN_SQL, [turn_id, agent_id, raw, tokens, now, agent_id])
+                )
+            await project_db.execute_transaction(agent_id, statements)
+            # summary 持久化到 agent 配置（独立于历史重写，旧 schema 无该列时容错）
             if summary is not None:
                 try:
                     await project_db.execute(
@@ -383,7 +457,11 @@ class ConversationStore:
                     # compacted_prefix 列可能不存在（旧 schema）— 忽略
                     pass
         except Exception as e:
-            logger.warning("persist_compaction_failed", agent_id=agent_id, error=str(e))
+            from hiveweave.services.telemetry import telemetry
+
+            logger.error("persist_compaction_failed", agent_id=agent_id, error=str(e))
+            telemetry.bump("compaction_persist_failed")
+            raise
 
     async def _get_agent_context_window(self, agent_id: str) -> int:
         try:
@@ -523,23 +601,35 @@ class ConversationStore:
         )
 
     async def _persist_pruned(self, agent_id: str, key: tuple[str, str]) -> None:
-        """持久化裁剪后的历史到 DB — 删除所有旧 turn，写入当前 cache 为单个 turn。
+        """持久化裁剪后的历史到 DB — 单事务删除所有旧 turn + 写入当前 cache。
 
         在写队列中执行，读取执行时的最新 cache（可能包含 prune 后新追加的消息）。
+        TEST18 巡检 P1：DELETE+INSERT 单事务，失败整体回滚不丢历史。
         """
         messages = self._cache.get(key)
         if not messages:
             return
         try:
-            await project_db.execute(
-                agent_id,
-                "DELETE FROM conversation_turns WHERE agent_id = ?",
-                [agent_id],
-            )
+            statements: list[tuple[str, list]] = [
+                ("DELETE FROM conversation_turns WHERE agent_id = ?", [agent_id])
+            ]
             if messages:
-                await self._persist_turn(agent_id, list(messages))
+                turn_id = str(uuid.uuid4())
+                now = int(time.time() * 1000)
+                raw = json.dumps(list(messages), ensure_ascii=False)
+                tokens = estimate_tokens_for_messages(messages)
+                statements.append(
+                    (_INSERT_TURN_SQL, [turn_id, agent_id, raw, tokens, now, agent_id])
+                )
+            await project_db.execute_transaction(agent_id, statements)
         except Exception as e:
+            # 与 _persist_compaction 对齐：计数 + 上抛（写队列 worker 兜住），
+            # 失败不再静默（TEST18 巡检 P1）
+            from hiveweave.services.telemetry import telemetry
+
             logger.warning("persist_pruned_failed", agent_id=agent_id, error=str(e))
+            telemetry.bump("persist_pruned_failed")
+            raise
 
     # ── Token 预算裁剪 ───────────────────────────────────────
 
@@ -665,14 +755,16 @@ class ConversationStore:
             # SQLite 的语句级原子性保证并发不会产生重复 turn_index
             await project_db.execute(
                 agent_id,
-                "INSERT INTO conversation_turns "
-                "(id, agent_id, turn_index, raw_messages, approx_tokens, created_at) "
-                "SELECT ?, ?, COALESCE(MAX(turn_index), -1) + 1, ?, ?, ? "
-                "FROM conversation_turns WHERE agent_id = ?",
+                _INSERT_TURN_SQL,
                 [turn_id, agent_id, raw, tokens, now, agent_id],
             )
         except Exception as e:
+            # 异常不吞——计数上抛给写队列 worker 记录（TEST18 巡检 P1 静默失败修复）
+            from hiveweave.services.telemetry import telemetry
+
             logger.warning("persist_turn_failed", agent_id=agent_id, error=str(e))
+            telemetry.bump("persist_turn_failed")
+            raise
 
 
 # 模块级单例

@@ -147,6 +147,51 @@ async def test_garbage_reply_to_warns_and_downgrades(env):
     assert row["expect_report"] == 0
 
 
+@pytest.mark.asyncio
+async def test_garbage_reply_to_warns_with_direction_history(env):
+    """Warning must fire even when the direction has contract history.
+
+    Regression (P0, third recurrence of the Row.get() trap): the known-set
+    comprehension used ``r.get("reply_contract_id")`` — aiosqlite.Row has no
+    ``.get()``, so on any NON-empty direction the first row raised
+    AttributeError, silently swallowed → warning was dead code exactly in
+    the receipt-storm scenario. The original garbage test seeds no history,
+    so the comprehension never iterated and stayed green. This test seeds a
+    DEV→CEO contract-bearing ask first, forcing iteration.
+    """
+    svc = InboxService()
+
+    seed = await svc.send_message(
+        DEV_ID, CEO_ID, "progress report", message_type="ask",
+        expect_report=True,
+    )
+    assert seed["reply_contract_id"]  # direction now non-empty
+
+    msg = await svc.send_message(
+        CEO_ID, DEV_ID, "回复内容", message_type="ask",
+        expect_report=True,
+        reply_to="deadbeef-dead-beef-dead-beefdeadbeef",
+    )
+    assert msg["expect_report"] is False
+    assert "replyTo" in (msg.get("warning") or "")
+    assert "deadbeef" in (msg.get("warning") or "")
+
+
+@pytest.mark.asyncio
+async def test_get_pending_ids_since_returns_unread(env):
+    """get_pending_ids_since must return unread wake ids, not [].
+
+    Regression: the comprehension used ``r.get("id")`` on aiosqlite.Row →
+    AttributeError whenever any unread row existed, swallowed into ``[]``.
+    """
+    svc = InboxService()
+
+    msg = await svc.send_message(CEO_ID, DEV_ID, "ping", message_type="normal")
+
+    ids = await svc.get_pending_ids_since(DEV_ID, 0)
+    assert msg["id"] in ids
+
+
 # ── P0-1: AskNotifyParams schema ─────────────────────────
 
 
