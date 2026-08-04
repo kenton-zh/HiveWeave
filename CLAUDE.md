@@ -425,9 +425,24 @@ curl http://localhost:4000/api/projects/<id>/activate
 
 > 个人开发环境配置见 CLAUDE.local.md（已 gitignore，不进仓库）
 
-### 行为数据导出（分析 agent 实际做了什么，首选）
+### 行为数据导出（分析 agent 实际做了什么）
 
-`GET /api/debug/project-export` 把项目运行时行为表导出为 JSON——**比直读 sqlite 安全**（SQL 白名单 + 截断），是行为审计（如「这个 agent 为什么失败/卡住」）的第一步：
+**任务链路/卡点诊断首选 Timeline 端点**（2026-08-04 落地，只读、返回已归并好的事件流，不用自己拼表）：
+
+```bash
+# 团队活动段：谁忙谁闲、哪个任务段异常长/多次改派/反复返工（先扫异常）
+curl "http://localhost:4000/api/projects/<UUID>/timeline/activity?since_ms=0&until_ms=<now_ms>&limit=2000"
+
+# 单任务全链路：打回(review_rework)/改派(reassigned)/催办/交接全在里面（再精确诊断）
+curl "http://localhost:4000/api/projects/<UUID>/timeline/tasks/<task_id>?limit=500"
+```
+
+- 两阶段侦察：先 activity 找异常段，再拉单任务链——比全表 dump 省一个数量级 token
+- 响应带 `truncated` 标记（超 limit 截最旧，不静默）；`if_changed_since=<max_event_ts>` 可无变化短路
+- 覆盖边界：work_logs 任务关联有洞（turn_result 引用埋在 `waiting_on[].ref`，未进时间轴）；「agent 当时为什么这么决策」在 chat_messages，不在任务链——任务链是骨架不是全部
+- 前端「任务」tab 的「复制 MD」按钮可一键导出同一份链路为 Markdown（人→AI 通道）；深链 `#view=timeline&task=<id>&since=&until=` 人 AI 同视角
+
+**需要原始表/对话内容时用 project-export**（比直读 sqlite 安全——SQL 白名单 + 截断）：
 
 ```bash
 # 项目 id 从 GET /api/projects 查（UUID，不是名字！TEST19 = 1a0b0ab5-696e-4f79-9159-e7783eec6512）
