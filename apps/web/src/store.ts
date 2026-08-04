@@ -1,6 +1,10 @@
 import { create } from "zustand";
 import { mergeDeltaContent } from "./utils/mergeDelta";
 import type { Project } from "./api";
+import { parseDeepLink } from "./components/timeline/useDeepLink";
+
+// 深链恢复：#view=timeline&task=<id> 直接同视角打开（v4 §5.5.1）
+const _deepLink = parseDeepLink();
 
 interface ActiveCommunication {
   id: string;
@@ -60,10 +64,16 @@ export interface AgentActiveModelInfo {
 interface AppState {
   selectedAgentId: string | null;
   setSelectedAgent: (id: string | null) => void;
-  activeView: "tree" | "office";
-  setActiveView: (view: "tree" | "office") => void;
-  rightPanelTab: "chat" | "agent" | "logs" | "goals" | "monitor";
-  setRightPanelTab: (tab: "chat" | "agent" | "logs" | "goals" | "monitor") => void;
+  activeView: "tree" | "office" | "timeline";
+  setActiveView: (view: "tree" | "office" | "timeline") => void;
+  rightPanelTab: "chat" | "agent" | "logs" | "goals" | "monitor" | "task" | "debug";
+  setRightPanelTab: (tab: "chat" | "agent" | "logs" | "goals" | "monitor" | "task" | "debug") => void;
+  // Timeline — 团队活动可视化（v4）
+  selectedTaskId: string | null;
+  setSelectedTask: (id: string | null) => void;
+  /** WS task_event 失效信号合并后的版本号；面板监听它触发 REST 重新拉取 */
+  timelineVersion: number;
+  notifyTaskEvent: (projectId: string, taskId: string) => void;
   chatSessions: Record<string, ChatMessage[]>;
   addMessage: (agentId: string, msg: ChatMessage) => void;
   replaceMessage: (agentId: string, oldId: string, newMsg: ChatMessage) => void;
@@ -186,13 +196,37 @@ interface ChatMessage {
   isStreaming?: boolean;
 }
 
+// WS task_event 合并计时器（模块级，避免进 state 引起渲染抖动）
+let _taskEventCoalesceTimer: ReturnType<typeof setTimeout> | null = null;
+
 export const useAppStore = create<AppState>((set, get) => ({
   selectedAgentId: null,
   setSelectedAgent: (id) => set({ selectedAgentId: id }),
-  activeView: "tree",
+  activeView: _deepLink.view ?? "tree",
   setActiveView: (view) => set({ activeView: view }),
-  rightPanelTab: "chat",
+  rightPanelTab: _deepLink.taskId ? "task" : "chat",
   setRightPanelTab: (tab) => set({ rightPanelTab: tab }),
+  // Timeline — 选中任务时右栏自动切到"任务"页签；清除时若停留在该页签则回落聊天
+  selectedTaskId: _deepLink.taskId,
+  setSelectedTask: (id) =>
+    set((s) =>
+      id
+        ? { selectedTaskId: id, rightPanelTab: "task" }
+        : {
+            selectedTaskId: null,
+            ...(s.rightPanelTab === "task" ? { rightPanelTab: "chat" as const } : {}),
+          },
+    ),
+  timelineVersion: 0,
+  notifyTaskEvent: (projectId, _taskId) => {
+    // 只关心当前项目的信号；WS 只是失效信号，真正数据走 REST。
+    if (get().selectedProjectId !== projectId) return;
+    if (_taskEventCoalesceTimer) return; // 1s 内的突发信号合并成一次刷新
+    _taskEventCoalesceTimer = setTimeout(() => {
+      _taskEventCoalesceTimer = null;
+      set((s) => ({ timelineVersion: s.timelineVersion + 1 }));
+    }, 1000);
+  },
   chatSessions: {},
   addMessage: (agentId, msg) =>
     set((state) => ({

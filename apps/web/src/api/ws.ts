@@ -370,6 +370,13 @@ export function subscribeAgentStatus(
   onOrgChanged?: () => void,
   onGoalsUpdated?: (projectId: string) => void,
   onQuestionAsked?: () => void,
+  onTaskEvent?: (signal: {
+    project_id: string;
+    task_id: string;
+    event_type?: string;
+    to_status?: string | null;
+    ts?: number;
+  }) => void,
 ): { abort: () => void } {
   const socket = getSocket();
   const channel = socket.channel("lobby:status");
@@ -427,6 +434,24 @@ export function subscribeAgentStatus(
   channel.on("model_resolved", (payload: Record<string, unknown>) => {
     if (onActivity && typeof payload.agentId === "string") {
       onActivity(payload as any);
+    }
+  });
+
+  // task_event — 任务失效信号（不走 onActivity；前端只做"该刷新了"的标记，
+  // 真正的数据走 REST 聚合端点）。载荷为 snake_case（后端原样透传）。
+  channel.on("task_event", (payload: Record<string, unknown>) => {
+    if (
+      onTaskEvent &&
+      typeof payload.project_id === "string" &&
+      typeof payload.task_id === "string"
+    ) {
+      onTaskEvent({
+        project_id: payload.project_id as string,
+        task_id: payload.task_id as string,
+        event_type: (payload.event_type as string | undefined) || undefined,
+        to_status: (payload.to_status as string | null | undefined) ?? null,
+        ts: (payload.ts as number | undefined) || undefined,
+      });
     }
   });
 

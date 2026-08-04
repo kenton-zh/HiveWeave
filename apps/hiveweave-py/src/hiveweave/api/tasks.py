@@ -206,6 +206,33 @@ async def update_task(project_id: str, task_id: str, body: TaskUpdate) -> dict:
         "expectedModules": "expected_modules",
     }
     fields = {camel_to_snake.get(k, k): v for k, v in raw.items()}
+    # Timeline v4 §4.6: assignee 变更在端点层改道 reassign_task ——
+    # 产生 task.reassigned 事件（含 WS 失效信号）。仅端点层改道，
+    # crud.update_task 不动（dispatch/verify_spawn 内部直调不受影响）。
+    # 语义变化（仅外部 API 调用方可见）：reviewing 任务会被强制打回
+    # claimed 且 progress 重置 10；archived/终态任务抛错（现状为静默成功）。
+    # 规格要求检测"变更"：同值重放是幂等 no-op，不得触发状态副作用，
+    # 也不得伪造 from==to 的 reassigned 事件污染时间轴。
+    if "assignee_id" in fields:
+        new_assignee = fields.pop("assignee_id")
+        if not new_assignee:
+            # 清空 assignee（""）不是换人——reassign_task 语义不适用，
+            # 放回 fields 走原 update_task 路径，保持旧语义。
+            fields["assignee_id"] = new_assignee
+        else:
+            current = await _tasks.get_task(project_id, task_id)
+            cur_assignee = (current or {}).get("assignee_id") or ""
+            if str(cur_assignee) != str(new_assignee):
+                try:
+                    await _tasks.reassign_task(
+                        project_id,
+                        task_id,
+                        new_assignee_id=str(new_assignee),
+                        reassigned_by="user",
+                        reason="PATCH assignee via API",
+                    )
+                except ValueError as e:
+                    _raise_from_value_error(e)
     if fields:
         await _tasks.update_task(project_id, task_id, **fields)
     return {"success": True}

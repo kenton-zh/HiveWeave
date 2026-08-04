@@ -3,6 +3,7 @@ import { getWorkLogs } from "../api";
 import { useAppStore } from "../store";
 import type { ActivityEntry } from "../store";
 import { mergeContentChunks } from "../utils/mergeDelta";
+import { formatTime, formatClock } from "../utils/format";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -48,23 +49,6 @@ function tryPrettyJson(raw: string): string | null {
   } catch {
     return null;
   }
-}
-
-function formatTime(timestamp: number): string {
-  const date = new Date(timestamp);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-
-  if (diffMins < 1) return "刚刚";
-  if (diffMins < 60) return `${diffMins} 分钟前`;
-  const diffHours = Math.floor(diffMins / 60);
-  if (diffHours < 24) return `${diffHours} 小时前`;
-  return date.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
-}
-
-function formatClock(timestamp: number): string {
-  return new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 // ── Conversation Aggregation ───────────────────────────────────

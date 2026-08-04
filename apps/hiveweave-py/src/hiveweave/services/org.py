@@ -643,6 +643,13 @@ class OrgService:
                 defer_worktree_delete = True
 
             if parent_id:
+                # Timeline v4 §4.6: dismiss 批量改派不经 _TRANSITIONS。
+                # 每任务的「UPDATE + 事件 INSERT」先收集，循环后经 _execute_tx
+                # 逐任务原子提交——共享 conn 上不残留未提交 UPDATE（close_task
+                # 内部 commit/rollback 会提前提交/回滚他人改动，审计 P1-1），
+                # 事件失败则该任务改派整体回滚且跳过 summary，父级通知不撒谎
+                # （无幻影事件，P1-2）。
+                pending_batches: list[dict] = []
                 for t in open_tasks:
                     tid = t["id"]
                     status = (t.get("status") or "").lower()
@@ -671,43 +678,70 @@ class OrgService:
                         keep_status = await _in_progress_keep_status()
                         if keep_status:
                             defer_worktree_delete = True
-                            await conn.execute(
-                                "UPDATE tasks SET assignee_id = ?, updated_at = ? "
-                                "WHERE id = ?",
-                                [parent_id, now_ms, tid],
-                            )
-                            reassigned_summary.append({
-                                "task_id": tid,
-                                "from_status": status,
-                                "to_status": status,
-                                "action": "reassign_keep_status_dirty",
+                            pending_batches.append({
+                                "update": (
+                                    "UPDATE tasks SET assignee_id = ?, updated_at = ? "
+                                    "WHERE id = ?",
+                                    [parent_id, now_ms, tid],
+                                ),
+                                "event": (
+                                    tid, "task.reassigned", status, status,
+                                    {"from_assignee": agent_id,
+                                     "to_assignee": parent_id,
+                                     "reason": "agent dismissed",
+                                     "action": "reassign_keep_status_dirty"},
+                                ),
+                                "summary": {
+                                    "task_id": tid,
+                                    "from_status": status,
+                                    "to_status": status,
+                                    "action": "reassign_keep_status_dirty",
+                                },
                             })
                             continue
                     if status in ("created", "blocked"):
                         # In-progress work without dirty/ahead: reassign + reset
-                        await conn.execute(
-                            "UPDATE tasks SET assignee_id = ?, status = 'claimed', "
-                            "claimed_at = ?, updated_at = ? WHERE id = ?",
-                            [parent_id, now_ms, now_ms, tid],
-                        )
-                        reassigned_summary.append({
-                            "task_id": tid,
-                            "from_status": status,
-                            "to_status": "claimed",
-                            "action": "reassign_reset",
+                        pending_batches.append({
+                            "update": (
+                                "UPDATE tasks SET assignee_id = ?, status = 'claimed', "
+                                "claimed_at = ?, updated_at = ? WHERE id = ?",
+                                [parent_id, now_ms, now_ms, tid],
+                            ),
+                            "event": (
+                                tid, "task.reassigned", status, "claimed",
+                                {"from_assignee": agent_id,
+                                 "to_assignee": parent_id,
+                                 "reason": "agent dismissed",
+                                 "action": "reassign_reset"},
+                            ),
+                            "summary": {
+                                "task_id": tid,
+                                "from_status": status,
+                                "to_status": "claimed",
+                                "action": "reassign_reset",
+                            },
                         })
                     elif status in ("claimed", "running", "rework"):
                         # Clean in-progress work: reassign + reset to claimed
-                        await conn.execute(
-                            "UPDATE tasks SET assignee_id = ?, status = 'claimed', "
-                            "claimed_at = ?, updated_at = ? WHERE id = ?",
-                            [parent_id, now_ms, now_ms, tid],
-                        )
-                        reassigned_summary.append({
-                            "task_id": tid,
-                            "from_status": status,
-                            "to_status": "claimed",
-                            "action": "reassign_reset",
+                        pending_batches.append({
+                            "update": (
+                                "UPDATE tasks SET assignee_id = ?, status = 'claimed', "
+                                "claimed_at = ?, updated_at = ? WHERE id = ?",
+                                [parent_id, now_ms, now_ms, tid],
+                            ),
+                            "event": (
+                                tid, "task.reassigned", status, "claimed",
+                                {"from_assignee": agent_id,
+                                 "to_assignee": parent_id,
+                                 "reason": "agent dismissed",
+                                 "action": "reassign_reset"},
+                            ),
+                            "summary": {
+                                "task_id": tid,
+                                "from_status": status,
+                                "to_status": "claimed",
+                                "action": "reassign_reset",
+                            },
                         })
                     elif status in ("submitted", "reviewing"):
                         # Keep review pipeline. Parent inherits assignee; if
@@ -727,71 +761,168 @@ class OrgService:
                                 new_reviewer = grandparent_id
                             else:
                                 new_assignee = agent_id
-                        await conn.execute(
-                            "UPDATE tasks SET assignee_id = ?, reviewer_id = ?, "
-                            "updated_at = ? WHERE id = ?",
-                            [new_assignee, new_reviewer, now_ms, tid],
-                        )
-                        reassigned_summary.append({
-                            "task_id": tid,
-                            "from_status": status,
-                            "to_status": status,
-                            "action": "reassign_keep_status",
-                            "assignee_id": new_assignee,
-                            "reviewer_id": new_reviewer,
+                        pending_batches.append({
+                            "update": (
+                                "UPDATE tasks SET assignee_id = ?, reviewer_id = ?, "
+                                "updated_at = ? WHERE id = ?",
+                                [new_assignee, new_reviewer, now_ms, tid],
+                            ),
+                            "event": (
+                                tid, "task.reassigned", status, status,
+                                {"from_assignee": agent_id,
+                                 "to_assignee": new_assignee,
+                                 "reason": "agent dismissed",
+                                 "action": "reassign_keep_status",
+                                 "reviewer_id": new_reviewer},
+                            ),
+                            "summary": {
+                                "task_id": tid,
+                                "from_status": status,
+                                "to_status": status,
+                                "action": "reassign_keep_status",
+                                "assignee_id": new_assignee,
+                                "reviewer_id": new_reviewer,
+                            },
                         })
                     elif status == "verifying":
                         # VERIFY in flight — leave status alone; only move
                         # assignee so the ledger stays owned by an active agent.
-                        await conn.execute(
-                            "UPDATE tasks SET assignee_id = ?, updated_at = ? "
-                            "WHERE id = ?",
-                            [parent_id, now_ms, tid],
-                        )
-                        reassigned_summary.append({
-                            "task_id": tid,
-                            "from_status": status,
-                            "to_status": status,
-                            "action": "reassign_verifying",
+                        pending_batches.append({
+                            "update": (
+                                "UPDATE tasks SET assignee_id = ?, updated_at = ? "
+                                "WHERE id = ?",
+                                [parent_id, now_ms, tid],
+                            ),
+                            "event": (
+                                tid, "task.reassigned", status, status,
+                                {"from_assignee": agent_id,
+                                 "to_assignee": parent_id,
+                                 "reason": "agent dismissed",
+                                 "action": "reassign_verifying"},
+                            ),
+                            "summary": {
+                                "task_id": tid,
+                                "from_status": status,
+                                "to_status": status,
+                                "action": "reassign_verifying",
+                            },
                         })
                     elif status == "approved":
                         # CREATOR_MUST_MERGE stays on creator; if dismissed was
                         # assignee only, leave approved with parent as assignee.
-                        await conn.execute(
-                            "UPDATE tasks SET assignee_id = ?, updated_at = ? "
-                            "WHERE id = ?",
-                            [parent_id, now_ms, tid],
-                        )
-                        reassigned_summary.append({
-                            "task_id": tid,
-                            "from_status": status,
-                            "to_status": status,
-                            "action": "reassign_approved",
+                        pending_batches.append({
+                            "update": (
+                                "UPDATE tasks SET assignee_id = ?, updated_at = ? "
+                                "WHERE id = ?",
+                                [parent_id, now_ms, tid],
+                            ),
+                            "event": (
+                                tid, "task.reassigned", status, status,
+                                {"from_assignee": agent_id,
+                                 "to_assignee": parent_id,
+                                 "reason": "agent dismissed",
+                                 "action": "reassign_approved"},
+                            ),
+                            "summary": {
+                                "task_id": tid,
+                                "from_status": status,
+                                "to_status": status,
+                                "action": "reassign_approved",
+                            },
                         })
                     else:
                         # Unknown / terminal-ish — reassign without status rewrite
-                        await conn.execute(
-                            "UPDATE tasks SET assignee_id = ?, updated_at = ? "
-                            "WHERE id = ?",
-                            [parent_id, now_ms, tid],
-                        )
-                        reassigned_summary.append({
-                            "task_id": tid,
-                            "from_status": status,
-                            "to_status": status,
-                            "action": "reassign_passthrough",
+                        pending_batches.append({
+                            "update": (
+                                "UPDATE tasks SET assignee_id = ?, updated_at = ? "
+                                "WHERE id = ?",
+                                [parent_id, now_ms, tid],
+                            ),
+                            "event": (
+                                tid, "task.reassigned", status, status,
+                                {"from_assignee": agent_id,
+                                 "to_assignee": parent_id,
+                                 "reason": "agent dismissed",
+                                 "action": "reassign_passthrough"},
+                            ),
+                            "summary": {
+                                "task_id": tid,
+                                "from_status": status,
+                                "to_status": status,
+                                "action": "reassign_passthrough",
+                            },
                         })
+            # 状态变更 + 事件落库（outbox 纪律）——dismiss 不走 _TRANSITIONS。
+            # 共享 conn 上不留未提交状态：逐任务 UPDATE+INSERT 经 _execute_tx
+            # 独立原子事务，失败只回滚该任务且跳过 summary（无幻影事件、
+            # 父级通知与库一致，审计 P1-1/P1-2）。
+            from hiveweave.services.tasks.db import (
+                _execute_tx,
+                build_task_event_insert,
+                publish_task_event,
+            )
+
+            dismissed_event_ts: list[tuple[str, str, str, int]] = []
+            if parent_id:
+                for item in pending_batches:
+                    up_sql, up_params = item["update"]
+                    ev_tid, ev_type, ev_from, ev_to, ev_payload = item["event"]
+                    (ev_sql, ev_params), ev_ts, _ev_id = build_task_event_insert(
+                        project_id, ev_tid, ev_type, ev_from, ev_to,
+                        actor_id="system", payload=ev_payload, now_ms=now_ms,
+                    )
+                    try:
+                        await _execute_tx(
+                            project_id,
+                            [(up_sql, up_params), (ev_sql, ev_params)],
+                        )
+                    except Exception as batch_err:
+                        # 该任务改派整体回滚；跳过 summary → 通知不撒谎
+                        log.warning(
+                            "dismiss_reassign_batch_failed",
+                            task_id=ev_tid,
+                            error=str(batch_err),
+                        )
+                        continue
+                    reassigned_summary.append(item["summary"])
+                    dismissed_event_ts.append((ev_tid, ev_type, ev_to, ev_ts))
             else:
                 # No parent: archive unfinished work as cancelled (not closed).
-                await conn.execute(
+                # 批量 UPDATE + 全部 task.archived 事件同一事务（同生共死）。
+                archive_stmts: list[tuple[str, list]] = [(
                     "UPDATE tasks SET is_archived = 1, status = 'cancelled', "
                     "archived_by = 'system', archived_reason = 'agent dismissed', "
                     "archived_at = ?, updated_at = ? "
                     "WHERE assignee_id = ? AND is_archived = 0 "
                     "AND status NOT IN ('closed', 'cancelled')",
                     [now_ms, now_ms, agent_id],
-                )
-            await conn.commit()
+                )]
+                for t in open_tasks:
+                    (ev_sql, ev_params), ev_ts, _ev_id = build_task_event_insert(
+                        project_id, t["id"], "task.archived",
+                        (t.get("status") or "").lower(), "cancelled",
+                        actor_id="system",
+                        payload={"archived_by": "system",
+                                 "reason": "agent dismissed",
+                                 "reason_code": "agent_dismiss"},
+                        now_ms=now_ms,
+                    )
+                    archive_stmts.append((ev_sql, ev_params))
+                    dismissed_event_ts.append(
+                        (t["id"], "task.archived", "cancelled", ev_ts)
+                    )
+                try:
+                    await _execute_tx(project_id, archive_stmts)
+                except Exception as arch_err:
+                    log.warning(
+                        "dismiss_archive_batch_failed",
+                        agent_id=agent_id,
+                        error=str(arch_err),
+                    )
+                    dismissed_event_ts.clear()
+            # 全部 commit 后逐条发 lobby 失效信号（best-effort，不影响 dismiss 主流程）
+            for ev_tid, ev_type, ev_to, ev_ts in dismissed_event_ts:
+                await publish_task_event(project_id, ev_tid, ev_type, ev_to, ev_ts)
             log.info(
                 "org.dismiss_agent.tasks_closed",
                 agent_id=agent_id,

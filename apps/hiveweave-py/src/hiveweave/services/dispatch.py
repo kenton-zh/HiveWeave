@@ -403,20 +403,54 @@ class DispatchService:
     # ── WORK LOG ─────────────────────────────────────────────
 
     async def get_work_logs_for_task(self, project_id: str,
-                                     task_id: str) -> list[dict]:
+                                     task_id: str,
+                                     include_details_fallback: bool = False,
+                                     conn=None,
+                                     limit: int | None = None) -> list[dict]:
         """Get all work logs associated with a task (oldest first).
 
         Public API for querying work_logs by task_id — used by the Task Ledger
         API to include related logs in task detail responses.
+
+        ``include_details_fallback``（Timeline v4 §4.3）：兜底捞
+        ``type='task_event'`` 且 details JSON 里带该 task_id 的行
+        （json_valid 防御畸形 JSON）。``conn``：可选外部连接
+        （timeline 只读事务复用）；None 时走共享连接。
+        ``limit``：仅保留最新 limit 条（取 DESC 后反转，返回仍升序）——
+        timeline 回放预算对齐，防 work_logs 挤掉状态事件。
         """
-        await _ensure_schema(project_id)
-        rows = await _query(
-            project_id,
+        if conn is None:
+            # 外部连接路径由调用方（timeline）先迁移 schema；在只读事务
+            # 内走共享连接做 DDL 会破坏降级路径的显式 BEGIN。
+            await _ensure_schema(project_id)
+        if include_details_fallback:
+            where = (
+                "WHERE task_id = ? "
+                "OR (type = 'task_event' AND json_valid(details) "
+                "    AND json_extract(details, '$.task_id') = ?)"
+            )
+            params: list = [task_id, task_id]
+        else:
+            where = "WHERE task_id = ?"
+            params = [task_id]
+        order = "DESC" if limit is not None else "ASC"
+        sql = (
             "SELECT id, agent_id, type, summary, details, created_at, task_id "
-            "FROM work_logs WHERE task_id = ? ORDER BY created_at ASC",
-            [task_id],
+            f"FROM work_logs {where} ORDER BY created_at {order}"
         )
-        return [self._row(r) for r in rows]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = [*params, limit]
+        if conn is not None:
+            cursor = await conn.execute(sql, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
+        else:
+            rows = await _query(project_id, sql, params)
+        out = [self._row(r) for r in rows]
+        if limit is not None:
+            out.reverse()
+        return out
 
     # ── HELPERS ──────────────────────────────────────────────
 

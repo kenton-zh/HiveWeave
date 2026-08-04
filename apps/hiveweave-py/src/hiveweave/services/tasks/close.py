@@ -3,11 +3,17 @@ from __future__ import annotations
 
 import json
 import time
-import uuid
 
 import structlog
 
-from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
+from .db import (
+    _ensure_schema,
+    _execute,
+    _execute_tx,
+    _query,
+    build_task_event_insert,
+    publish_task_event,
+)
 from .errors import MergeRequiredError
 from .verify import VerificationCaseService  # noqa: F401
 
@@ -690,7 +696,6 @@ class CloseMixin:
                 "Closed tasks are the terminal success state."
             )
         now_ms = int(time.time() * 1000)
-        event_id = str(uuid.uuid4())
         code = (reason_code or "agent_cancel").strip() or "agent_cancel"
         arch_payload = json.dumps({
             "archived_by": archived_by,
@@ -698,6 +703,10 @@ class CloseMixin:
             "reason_code": code,
             "detail": reason[:500],
         })
+        (event_sql, event_params), event_ts, event_id = build_task_event_insert(
+            project_id, task_id, "task.archived", current, "cancelled",
+            actor_id=archived_by, payload=arch_payload, now_ms=now_ms,
+        )
         await _execute_tx(project_id, [
             # 根因修复：归档时同步置终态 status='cancelled'，避免
             # archived=1 但 status 停留在 verifying/submitted 等非终态
@@ -709,12 +718,11 @@ class CloseMixin:
             "archived_by = ?, archived_reason = ?, archived_at = ?, "
             "wake_at = NULL, updated_at = ? WHERE id = ?",
             [archived_by, reason[:500], now_ms, now_ms, task_id]),
-            ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-             "from_status, to_status, actor_id, payload, created_at) "
-             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-             [event_id, project_id, task_id, "task.archived",
-              current, "cancelled", archived_by, arch_payload, now_ms]),
+            (event_sql, event_params),
         ])
+        await publish_task_event(
+            project_id, task_id, "task.archived", "cancelled", event_ts
+        )
         log.info(
             "task_archived",
             project_id=project_id,

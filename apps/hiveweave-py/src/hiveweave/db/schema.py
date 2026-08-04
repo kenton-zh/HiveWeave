@@ -603,4 +603,11 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_obligations_pending ON obligations(project_id, status, deadline) WHERE status = 'pending'",
     "CREATE INDEX IF NOT EXISTS idx_obligations_owner ON obligations(owner_agent_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_obligations_task ON obligations(task_id, obligation_type)",
+    # ── Timeline v4 §4.7: 单任务聚合 + 时间窗聚合 ─────────────
+    "CREATE INDEX IF NOT EXISTS idx_work_logs_task ON work_logs(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_inbox_task ON inbox(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_task_events_created ON task_events(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_created ON handoffs(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_work_logs_created ON work_logs(created_at)",
 ]

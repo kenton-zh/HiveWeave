@@ -1,4 +1,10 @@
 import { dbg, getApiKey, getBaseUrl, setApiKey, initApiKeyFromStorage } from "./shared";
+import type {
+  TaskTimelineResponse,
+  TeamActivityResponse,
+  TeamActivityUnchanged,
+  TaskSummary,
+} from "../components/timeline/types";
 
 export { setApiKey, initApiKeyFromStorage };
 
@@ -881,4 +887,68 @@ export interface AgentTraces {
 
 export async function getAgentTraces(agentId: string): Promise<AgentTraces> {
   return fetchJSON(`${BASE}/debug/agents/${agentId}/traces`);
+}
+
+// ---------------------------------------------------------------------------
+// Timeline — 团队活动可视化（v4 §4 两个聚合端点 + 任务列表）
+// ---------------------------------------------------------------------------
+
+/** 端点 1：单任务全链路事件流（含归档任务）。 */
+export async function getTaskTimeline(
+  projectId: string,
+  taskId: string,
+  limit: number = 500,
+): Promise<TaskTimelineResponse> {
+  return fetchJSON(
+    `${BASE}/projects/${projectId}/timeline/tasks/${encodeURIComponent(taskId)}?limit=${limit}`,
+  );
+}
+
+export interface TeamActivityQuery {
+  /** 窗口起点（现实毫秒，必填） */
+  since_ms: number;
+  /** 窗口终点（现实毫秒，必填） */
+  until_ms: number;
+  /** 全局事件预算，默认 2000（上限 5000） */
+  limit?: number;
+  /** 向前翻页游标：只取 created_at < cursor_ts 的事件 */
+  cursor_ts?: number;
+  /** 上次响应里的 max_event_ts；无变化时后端短路返回 changed:false */
+  if_changed_since?: number;
+}
+
+/**
+ * 端点 2：团队活动聚合（泳道数据源）。
+ * if_changed_since 短路时返回最小响应（无 agents/task_segments）。
+ */
+export async function getTeamActivity(
+  projectId: string,
+  query: TeamActivityQuery,
+): Promise<TeamActivityResponse | TeamActivityUnchanged> {
+  const params = new URLSearchParams();
+  params.set("since_ms", String(query.since_ms));
+  params.set("until_ms", String(query.until_ms));
+  if (query.limit != null) params.set("limit", String(query.limit));
+  if (query.cursor_ts != null) params.set("cursor_ts", String(query.cursor_ts));
+  if (query.if_changed_since != null) {
+    params.set("if_changed_since", String(query.if_changed_since));
+  }
+  return fetchJSON(
+    `${BASE}/projects/${projectId}/timeline/activity?${params.toString()}`,
+  );
+}
+
+/** 任务列表（TaskPicker 用；后端排除已归档，归档任务走 task_id 直达）。 */
+export async function listTasks(
+  projectId: string,
+  opts?: { status?: string; assignee?: string },
+): Promise<TaskSummary[]> {
+  const params = new URLSearchParams();
+  if (opts?.status) params.set("status", opts.status);
+  if (opts?.assignee) params.set("assignee", opts.assignee);
+  const qs = params.toString();
+  const data = await fetchJSON<{ tasks: TaskSummary[] }>(
+    `${BASE}/projects/${projectId}/tasks${qs ? "?" + qs : ""}`,
+  );
+  return data?.tasks ?? [];
 }

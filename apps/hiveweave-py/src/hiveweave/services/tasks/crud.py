@@ -7,7 +7,15 @@ import uuid
 
 import structlog
 
-from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
+from .db import (
+    _conn,
+    _ensure_schema,
+    _execute,
+    _execute_tx,
+    _query,
+    build_task_event_insert,
+    publish_task_event,
+)
 from .policy import resolve_task_policy
 
 log = structlog.get_logger(__name__)
@@ -152,7 +160,6 @@ class CrudMixin:
         assign_is_claim = bool(assignee_id) and not self._is_verify_task(draft)
         status = "claimed" if assign_is_claim else "created"
         claimed_at = now_ms if assign_is_claim else None
-        event_id = str(uuid.uuid4())
         event_type = "task.claimed" if assign_is_claim else "task.created"
         payload = json.dumps({
             "title": title[:200],
@@ -160,6 +167,10 @@ class CrudMixin:
             "assignee_id": assignee_id,
             "priority": priority,
         })
+        (event_sql, event_params), event_ts, _event_id = build_task_event_insert(
+            project_id, task_id, event_type, None, status,
+            actor_id=creator_id, payload=payload, now_ms=now_ms,
+        )
         await _execute_tx(project_id, [
             ("INSERT INTO tasks (id, project_id, title, description, assignee_id, "
             "creator_id, status, priority, progress, tags, parent_task_id, depends_on, "
@@ -175,12 +186,9 @@ class CrudMixin:
              json.dumps(evidence) if evidence else None,
              json.dumps(expected_modules) if expected_modules else None,
              source, now_ms, claimed_at, now_ms, due_at, policy_id, contract_blob]),
-            ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-             "from_status, to_status, actor_id, payload, created_at) "
-             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-             [event_id, project_id, task_id, event_type,
-              None, status, creator_id, payload, now_ms]),
+            (event_sql, event_params),
         ])
+        await publish_task_event(project_id, task_id, event_type, status, event_ts)
         log.info("task_created", task_id=task_id, title=title[:60],
                  creator_id=creator_id, assignee_id=assignee_id,
                  status=status, policy_id=policy_id,

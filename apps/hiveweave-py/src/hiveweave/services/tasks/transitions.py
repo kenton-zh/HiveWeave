@@ -3,11 +3,18 @@ from __future__ import annotations
 
 import json
 import time
-import uuid
 
 import structlog
 
-from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
+from .db import (
+    _conn,
+    _ensure_schema,
+    _execute,
+    _execute_tx,
+    _query,
+    build_task_event_insert,
+    publish_task_event,
+)
 from .constants import _TRANSITIONS
 
 log = structlog.get_logger(__name__)
@@ -42,13 +49,16 @@ class TransitionsMixin:
         if target not in _TRANSITIONS.get(current, set()):
             raise ValueError(f"Illegal transition: {current} → {target}")
         now_ms = int(time.time() * 1000)
-        event_id = str(uuid.uuid4())
         payload_obj: dict = {}
         if reason_code:
             payload_obj["reason_code"] = str(reason_code)[:80]
         if detail:
             payload_obj["detail"] = str(detail)[:500]
         payload = json.dumps(payload_obj) if payload_obj else "{}"
+        (event_sql, event_params), event_ts, _event_id = build_task_event_insert(
+            project_id, task_id, f"task.{target}", current, target,
+            actor_id=actor_id, payload=payload, now_ms=now_ms,
+        )
         if current == "blocked":
             # Defensive: any exit from blocked clears wait metadata
             try:
@@ -56,11 +66,7 @@ class TransitionsMixin:
                     ("UPDATE tasks SET status = ?, blocked_reason = NULL, "
                      "wait_kind = NULL, wake_at = NULL, updated_at = ? WHERE id = ?",
                      [target, now_ms, task_id]),
-                    ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-                     "from_status, to_status, actor_id, payload, created_at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                     [event_id, project_id, task_id, f"task.{target}",
-                      current, target, actor_id, payload, now_ms]),
+                    (event_sql, event_params),
                 ])
             except Exception as e:
                 # Prefer status transition over abort; then best-effort clear
@@ -72,11 +78,7 @@ class TransitionsMixin:
                 await _execute_tx(project_id, [
                     ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                      [target, now_ms, task_id]),
-                    ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-                     "from_status, to_status, actor_id, payload, created_at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                     [event_id, project_id, task_id, f"task.{target}",
-                      current, target, actor_id, payload, now_ms]),
+                    (event_sql, event_params),
                 ])
                 try:
                     await _execute(
@@ -95,12 +97,11 @@ class TransitionsMixin:
             await _execute_tx(project_id, [
                 ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                  [target, now_ms, task_id]),
-                ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-                 "from_status, to_status, actor_id, payload, created_at) "
-                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                 [event_id, project_id, task_id, f"task.{target}",
-                  current, target, actor_id, payload, now_ms]),
+                (event_sql, event_params),
             ])
+        await publish_task_event(
+            project_id, task_id, f"task.{target}", target, event_ts
+        )
         log.info("task_transition", task_id=task_id,
                  from_status=current, to_status=target,
                  reason_code=reason_code)
@@ -140,22 +141,24 @@ class TransitionsMixin:
         # Single UPDATE to final state — atomic, no intermediate visible
         now_ms = int(time.time() * 1000)
         final = targets[-1]
-        event_id = str(uuid.uuid4())
         payload_obj: dict = {}
         if reason_code:
             payload_obj["reason_code"] = str(reason_code)[:80]
         if detail:
             payload_obj["detail"] = str(detail)[:500]
         payload = json.dumps(payload_obj) if payload_obj else "{}"
+        (event_sql, event_params), event_ts, _event_id = build_task_event_insert(
+            project_id, task_id, f"task.{final}", current, final,
+            actor_id=actor_id, payload=payload, now_ms=now_ms,
+        )
         await _execute_tx(project_id, [
             ("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
              [final, now_ms, task_id]),
-            ("INSERT INTO task_events (id, project_id, task_id, event_type, "
-             "from_status, to_status, actor_id, payload, created_at) "
-             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-             [event_id, project_id, task_id, f"task.{final}",
-              current, final, actor_id, payload, now_ms]),
+            (event_sql, event_params),
         ])
+        await publish_task_event(
+            project_id, task_id, f"task.{final}", final, event_ts
+        )
         log.info("task_transition_multi", task_id=task_id,
                  from_status=current, through=list(targets[:-1]),
                  to_status=final, reason_code=reason_code)
