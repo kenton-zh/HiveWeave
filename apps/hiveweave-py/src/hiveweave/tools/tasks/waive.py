@@ -138,6 +138,7 @@ async def waive_attestation_tool(
             project_id,
             waived_by=waived_by,
             assignee_id=str(task.get("assignee_id") or "") or None,
+            caller_id=agent_id,
         )
         return ToolResult.err(
             f"waive_attestation rejected: task {params.task_id} already has "
@@ -303,8 +304,18 @@ async def _format_post_waive_approve_tip(
     *,
     waived_by: str,
     assignee_id: str | None,
+    caller_id: str | None = None,
 ) -> str:
-    """Concrete NEXT ACTION after waive — name people, do not say '找人'."""
+    """Concrete NEXT ACTION after waive — name people, do not say '找人'.
+
+    BUG-WAIVE-TIP（2026-08-05 DevBlog 死锁根因）：幂等拒绝分支里，调用者
+    本人常在合法 approver 名单内（典型：waiver 已由 CEO 签发，协调者误判
+    「我也得签一次 waiver / 我得自己跑出 test_run」而重复调用本工具）。
+    旧提示一律让他「去 ask 名单里的人」——当名单里的人就是他自己时，
+    等于让他 ask 自己，死锁于此。现在 caller 在名单内时直接告知：
+    你就是合法第三方 approver，立即 review_task(approve)，无需新 waiver、
+    无需自跑测试（waived 路径跳过审查方 attestation 校验）。
+    """
     from hiveweave.services.org import OrgService
     from hiveweave.services.unblock_soft import (
         is_small_team_sole_reviewer,
@@ -348,6 +359,18 @@ async def _format_post_waive_approve_tip(
             "exists beside the assignee. Approve path is deadlocked — escalate "
             "to CEO or cancel_task with an audited deadlock reason "
             "(≥20 chars). Do NOT invent a fake rework."
+        )
+
+    # BUG-WAIVE-TIP: caller 本人在合法 approver 名单里 → 别再让他「去找人」，
+    # 直接告诉他现在就能 approve（幂等拒绝分支的典型死锁破解）。
+    if caller_id and str(caller_id) in {str(h) for h in holders}:
+        return (
+            "\n\nNEXT ACTION: A valid waiver already exists and YOU are a "
+            "lawful third-party approver (you are neither waived_by nor the "
+            "assignee). Do NOT request another waiver and do NOT re-run "
+            "tests — the waived path skips reviewer-attestation checks. "
+            "Approve NOW via review_task(decision=\"approve\", feedback=...), "
+            "then git_worktree_merge the assignee's branch."
         )
 
     org = OrgService()
@@ -479,11 +502,50 @@ async def waive_merge_tool(
         waived_by=agent_id,
         reason=reason[:120],
     )
-    return ToolResult.ok(
+
+    # BUG-MERGE-WAIVE-CLOSE（2026-08-05 feature-test 停滞根因）：旧回执让
+    # agent 去「close_task / approve auto-close」——但 agent 工具表里没有
+    # close_task，approve auto-close 也只发生在 approve 当下。若 waive_merge
+    # 发生在 approve 之后（典型顺序：approve 时 worktree 仍有 ahead → 未
+    # auto-close → CEO 随后 waive merge），任务永远停在 approved 95%，
+    # 无任何在册义务触发后续动作。waive_merge 是最后一个能一致化账本的
+    # 位置：任务已 approved 时直接代闭环（close_task 内部 merge gate 会因
+    # merge_waived 放行；VERIFY spawn 本来就不属于 waive 语义）。
+    auto_closed = False
+    close_err: str | None = None
+    try:
+        cur = await ts.get_task(project_id, params.task_id)
+        if cur and cur.get("status") == "approved":
+            await ts.close_task(
+                project_id, params.task_id, reason_code="merge_waived"
+            )
+            auto_closed = True
+    except Exception as e:
+        close_err = str(e)
+        log.warning(
+            "waive_merge_auto_close_failed",
+            task_id=params.task_id,
+            error=close_err,
+        )
+
+    msg = (
         f"Merge waived for task {params.task_id}. "
         f"Stored reason: {reason}\n"
-        f"close_task / approve auto-close may now proceed without "
-        f"git_worktree_merge. Prefer merging next time when there is "
-        f"real code delivery."
     )
+    if auto_closed:
+        msg += (
+            "Task was approved — auto-closed now (ledger complete). "
+            "No further action needed."
+        )
+    elif close_err:
+        msg += (
+            f"Auto-close failed ({close_err}); task remains approved. "
+            "Escalate to operator if it stays stuck."
+        )
+    else:
+        msg += (
+            "Task is not yet approved — after approval the ledger can "
+            "close without git_worktree_merge."
+        )
+    return ToolResult.ok(msg)
 
