@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">HiveWeave</h1>
 </p>
-<p align="center"><strong>AI 工程组织</strong> — 多 Agent 层级协作编程平台</p>
-<p align="center"><em>不是 AI 编程工具，而是一个会自我演化的 AI 工程组织</em></p>
+<p align="center"><strong>AI 工程组织</strong> — 把一个需求变成一支会自我审查、自我运行的 AI 工程师团队。</p>
+<p align="center"><em>不是 AI 编程工具，也不是框架——而是一个会自我演化的 AI 工程组织</em></p>
 
 <p align="center">
   <a href="https://github.com/kenton-zh/HiveWeave"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kenton-zh/HiveWeave?style=flat-square" /></a>
@@ -25,11 +25,25 @@
 
 ---
 
+**一览** —— 交付给你的是一个能跑起来的工程组织，而不是一堆零件：
+
+| 组织 | 工具与服务 | 质量与控制 |
+|:---|:---|:---|
+| 开箱即得 CEO、HR、经理、QA 与 Executor | **85+ 内置工具**、50+ 服务、18 个 API 模块 · 133 路由 | 交付到你面前前，先过 **四层把关** |
+| 按角色配模型：决策用顶级，执行用便宜 | 每个 Agent 可单独覆盖模型，可混用任意供应商 | 按 Agent 隔离上下文——永不交叉污染 |
+| 并行 Agent，各自独立 `git worktree` | 内置任务系统 + 客观真值账本 | 直接与任意模块的 Agent 对话 |
+
+---
+
 ## 这是什么
 
-HiveWeave 把单 AI Agent 模式替换为**多 Agent 工程组织**。CEO、技术经理、开发工程师、QA、HR——每个角色有自己的职责、记忆、工具和独立工作区。他们招聘、分配任务、审查代码、合并分支、汇报进度。你像管理真实团队一样管理他们。
+软件开发的本质是团队协作——HiveWeave 就按这个来。它把单 AI Agent 模式替换为**多 Agent 工程组织**：CEO、技术经理、开发工程师、QA、HR——**每个角色有自己的职责、记忆、工具和独立工作区**。他们**招聘、分配任务、审查代码、合并分支、汇报进度**。你像管理真实团队一样管理他们。
 
-> **为什么**：单 Agent 工具（Claude Code、Codex、Cursor）跨模块丢上下文、无法并行开发、没有质量闸门。HiveWeave 把工作拆分给专业 Agent，每个拥有独立的上下文和工作区，经过四层把关后才到你眼前。
+> **工作模式**：你描述需求，**CEO 规划组织**——需要哪些中层角色（比如前端负责人和后端负责人，以及各自必须具备的技能），**HR Agent 再到技能市场搜索并绑定对应技能，把每个角色招聘到位**。最终得到一支为你的项目量身定制的团队——而且**你可以直接跟负责任意模块的 Agent 对话，不必事事通过 CEO 中转**。
+
+> **内置任务管理系统**：每个任务都走完完整生命周期——**创建、调度给对应角色、认领、带可见进度地执行、提交审查、验证、合并**（当某个关卡被有意跳过时也有豁免路径）。**Task Ledger 为每一项任务记录客观真值**，实时时间线展示整个团队的动态，绝不黑箱。更重要的是，**这份账本是一条单一、客观的真相线，把整个团队锚定在现实之上**——Agent 不能只是互相附和就说"完成了"，每一项声明都要对照实际产出的东西来核验，**从而避免整个团队陷入集体幻觉**。
+
+> **为什么**：单 Agent 工具（Claude Code、Codex、Cursor）**跨模块丢上下文、无法并行开发、没有质量闸门**。HiveWeave 把工作拆分给专业 Agent，**每个拥有独立的上下文和工作区，经过四层把关后才到你眼前**。
 
 |  | 单 Agent 工具（Claude Code、Cursor、Codex） | HiveWeave |
 |:---|:---|:---|
@@ -129,12 +143,13 @@ pnpm dev
 
 | 层 | 技术 | 备注 |
 |:---|------|------|
-| 后端 | Python 3.12 + FastAPI + Uvicorn | 端口 4000，122 路由，16 API 模块 |
+| 后端 | Python 3.12 + FastAPI + Uvicorn | 端口 4000，133 路由，18 API 模块 |
 | 前端 | React 19 + Vite + React Flow + Zustand | 端口 5173，支持 Electron 桌面端 |
 | 数据库 | SQLite + aiosqlite | 双 DB：Meta DB（WAL）+ Per-project DB |
 | AI/LLM | httpx SSE 流式 + Provider Factory | OpenAI、Anthropic、DeepSeek、Groq、Google |
 | 实时通信 | phoenix.js + phoenix_adapter（WebSocket） | 3 频道：lobby、project、agent |
 | 沙箱 | Docker（可选） | `BASH_SANDBOX=docker` |
+| 构建 | Turbo | Monorepo 任务编排 |
 | 包管理 | pnpm 10 + uv | Monorepo + Python 包 |
 
 ## 项目结构
@@ -145,19 +160,24 @@ hiveweave/
 │   ├── hiveweave-py/                  # 后端 — Python/FastAPI（端口 4000）
 │   │   └── src/hiveweave/
 │   │       ├── agents/                # Agent 生命周期 + Supervisor + trigger
-│   │       ├── api/                   # 16 个 FastAPI 路由模块，122 路由
-│   │       ├── llm/                   # Streamer、provider factory、retry、circuit_breaker
-│   │       ├── services/              # 23 个服务（org、dispatch、memory、handoff、MCP 等）
-│   │       ├── tools/                 # 74 个内置工具（bash、file、grep、patch、review 等）
+│   │       ├── api/                   # 18 个 FastAPI 路由模块，133 路由
 │   │       ├── conversation/          # Token budget、compaction、conversation store
 │   │       ├── db/                    # Meta DB + Per-project DB（aiosqlite）
+│   │       ├── hooks/                 # 生命周期钩子
+│   │       ├── llm/                   # Streamer、provider factory、retry、circuit_breaker
+│   │       ├── prompts/               # ETHOS 提示词体系（identity + context）
 │   │       ├── realtime/              # phoenix_adapter、channels、pubsub、event_bus
-│   │       └── prompts/               # ETHOS 提示词体系（identity + context）
+│   │       ├── services/              # 50+ 个服务（org、dispatch、memory、handoff 等）
+│   │       ├── tools/                 # 85+ 个内置工具（含 tasks/ 子包）
+│   │       └── util/                  # 通用工具
 │   └── web/                           # 前端 — React 19 + Vite + Electron（端口 5173）
 ├── assets/
 │   └── screenshots/                   # README 截图
-├── start-all.bat                      # Windows 启动脚本
-└── CLAUDE.md                          # AI 工具指令
+├── docs/                              # 架构与迁移文档
+├── scripts/                           # 构建 / 工具脚本
+├── tasks/                             # 任务规格
+├── start-*.bat / *.sh                 # 跨平台启动脚本
+└── CLAUDE.md / AGENTS.md              # AI 工具指令
 ```
 
 ## 工作流程
@@ -173,6 +193,8 @@ hiveweave/
 ```
 
 ## 特性
+
+下面每一行都是以"一个运行中的组织"交付的，不是零散的库。真正的差异化不在某个单一功能——而在于它们被预接成一支会自我管理的团队。
 
 | 特性 | 说明 |
 |:---|------|
@@ -196,7 +218,7 @@ hiveweave/
 | **双 DB 模式** | Meta DB（WAL，全局）+ Per-project DB（WAL，隔离）。Agent 间数据永不交叉污染。 |
 | **MCP 协议** | 通过 Model Context Protocol 扩展工具。按 Agent 绑定 MCP 服务器——不同角色获得不同外部工具。 |
 | **skills.sh 市场** | 远程技能市场。HR 动态搜索和绑定技能。无硬编码技能列表。 |
-| **74 内置工具** | bash、grep、文件操作、patch、websearch、question、todowrite、review（五轴）、security audit、MCP 工具。按角色类型权限门控。 |
+| **85+ 内置工具** | bash、文件操作、grep、patch、review（五轴）、security audit、websearch、question、todowrite、编排、org、视觉、图像生成、MCP 工具。按角色类型权限门控。 |
 
 ## 文档
 
@@ -225,5 +247,5 @@ HiveWeave 正在活跃开发中，主要由它自己的 AI Agent 团队（CEO + 
 ---
 
 <p align="center">
-  由 HiveWeave 构建 — 一个会自我演化的 AI 工程组织。
+  <strong>由 HiveWeave 构建</strong> —— 一个会自己规划、招聘、开发、审查并发布产品的 AI 工程组织。真正构建软件的，不是工具，而是团队。<a href="https://github.com/kenton-zh/HiveWeave">给我们 Star</a>，看这个组织如何自行运转。
 </p>
