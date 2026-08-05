@@ -82,8 +82,8 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 
 ## Two-tier SQLite
 
-1. **Meta DB** — `apps/hiveweave-py/data/hiveweave.db` (WAL). Global tables: `projects`, `agent_templates`, `llm_models`, `global_settings`, `mcp_servers`, `meta_index`. Override with `HIVEWEAVE_META_DB_PATH`.（旧 `agent_index`/`permission_rules` 等已废弃，迁移时 DROP）
-2. **Per-project DB** — one per workspace, **WAL mode**. Project-scoped tables: `agents`, `memories`, `chat_messages`, `handoffs`, `inbox`, `work_logs` 等。按工作区隔离。
+1. **Meta DB** — `apps/hiveweave-py/data/hiveweave.db` (DELETE). Global tables: `projects`, `agent_templates`, `llm_models`, `global_settings`, `mcp_servers`, `meta_index`. Override with `HIVEWEAVE_META_DB_PATH`.（旧 `agent_index`/`permission_rules` 等已废弃，迁移时 DROP）
+2. **Per-project DB** — one per workspace, **DELETE journal mode**（避免 Windows WAL 孤儿化/代际分叉损坏，TEST18 2026-08-05）。Project-scoped tables: `agents`, `memories`, `chat_messages`, `handoffs`, `inbox`, `work_logs` 等。按工作区隔离。
 
 ## Key modules (`apps/hiveweave-py/src/hiveweave/`)
 

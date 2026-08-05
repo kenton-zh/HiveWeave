@@ -5,7 +5,7 @@
 契约 12: Realtime — WebSocket route registration.
 
 Startup sequence (对齐 Elixir Application.start/2):
-1. init Meta DB (tables, indexes, WAL mode)
+1. init Meta DB (tables, indexes, DELETE journal mode)
 2. Clear zombie streaming messages (is_streaming=true from prior crashes)
 3. Seed default LLM model (OPENCODE_API_KEY → DeepSeek V4 Flash Free)
 4. Start game time tick loop (5s interval)

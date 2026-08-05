@@ -107,8 +107,8 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 
 两层 SQLite:
 
-1. **Meta DB** (`apps/hiveweave-py/data/hiveweave.db`, WAL mode) — 全局表: `projects`, `agent_templates`, `llm_models`, `global_settings`, `mcp_servers`, `meta_index`。每个服务器进程一个。（旧 `agent_index`/`permission_rules` 等表已移除/废弃，迁移时 DROP — 见 `db/meta.py:_LEGACY_TABLES_TO_DROP`）
-2. **Per-project DB** (每个工作区 `.hiveweave/data.db`, WAL mode) — 项目级表: `agents`, `memories`, `chat_messages`, `handoffs`, `inbox`, `work_logs` 等。按工作区隔离。
+1. **Meta DB** (`apps/hiveweave-py/data/hiveweave.db`, DELETE journal mode) — 全局表: `projects`, `agent_templates`, `llm_models`, `global_settings`, `mcp_servers`, `meta_index`。每个服务器进程一个。（旧 `agent_index`/`permission_rules` 等表已移除/废弃，迁移时 DROP — 见 `db/meta.py:_LEGACY_TABLES_TO_DROP`）
+2. **Per-project DB** (每个工作区 `.hiveweave/data.db`, DELETE journal mode) — 项目级表: `agents`, `memories`, `chat_messages`, `handoffs`, `inbox`, `work_logs` 等。按工作区隔离。DELETE 模式为避免 Windows WAL 孤儿化/代际分叉损坏（TEST18 2026-08-05 根因）；单后端 + per-workspace 写锁 + busy_timeout 串行化并发访问。
 
 `agent_id → project_id` 路由由 `AgentRouter`（`services/agent_router.py`）内存映射完成，启动时遍历所有 per-project DB 重建路由表；`create_agent`/`delete_agent` 时同步更新。完整 agent 数据（name, role, skills 等）在 per-project DB 的 `agents` 表中。
 
