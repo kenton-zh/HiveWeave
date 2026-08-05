@@ -67,7 +67,7 @@ def test_probe_and_run_with_mocked_browse(tmp_path: Path):
             }
         )
 
-        async def fake_exec(argv, workspace, timeout_sec=60):
+        async def fake_exec(argv, workspace, timeout_sec=60, agent_id=None):
             head = argv[0] if argv else ""
             if head == "js":
                 expr = argv[1] if len(argv) > 1 else ""

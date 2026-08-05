@@ -47,15 +47,35 @@ async def agent_worktree_path(agent_id: str) -> str | None:
     if not row:
         return None
     ws = (row.get("workspace_path") or "").strip()
-    if not ws:
-        return None
-    p = Path(ws)
-    if not p.is_dir():
-        return None
-    # TEST16 P0-2: require .git — aligned with agent.py lazy-create check.
-    # Old: `any(p.iterdir())` passed node_modules husks as valid worktrees.
-    if (p / ".git").exists():
-        return str(p)
+    if ws:
+        p = Path(ws)
+        # TEST16 P0-2: require .git — aligned with agent.py lazy-create check.
+        # Old: `any(p.iterdir())` passed node_modules husks as valid worktrees.
+        if p.is_dir() and (p / ".git").exists():
+            return str(p)
+    # BUG-ORGWT（2026-08-05 feature-test 死锁根因）：DB workspace_path 为空/
+    # 失效但规范位置 `.hiveweave/worktrees/<short_id>` 真实存在且 git 在册
+    # 时，读路径兜底挂回。典型现场：HR 把 qa-family 角色（如 org测试工程师）
+    # 误配 permission_type=coordinator —— hire 期建过树，但
+    # `agent_gets_write_worktree`（coordinator 须 family==coordinator）不认，
+    # heal/reconcile 跳过 → 树成孤儿，review 门禁 "no worktree path" 硬拒且
+    # agent 侧无解法。此函数只用于 review/submit/dispatch 的只读审查定位，
+    # 物理存在 + git 在册的树就是该 agent 的树，挂回严格优于硬拒。
+    # 不授权任何写路径（写资格仍由 agent_gets_write_worktree 判定）。
+    short_id = str(row.get("short_id") or "").strip()
+    project_id = row.get("project_id")
+    if short_id and project_id:
+        main_ws = await project_main_workspace(str(project_id))
+        if main_ws:
+            canon = Path(main_ws) / ".hiveweave" / "worktrees" / short_id
+            if canon.is_dir() and (canon / ".git").exists():
+                log.info(
+                    "worktree_review.orphan_worktree_rebound",
+                    agent_id=agent_id,
+                    short_id=short_id,
+                    path=str(canon),
+                )
+                return str(canon)
     return None
 
 

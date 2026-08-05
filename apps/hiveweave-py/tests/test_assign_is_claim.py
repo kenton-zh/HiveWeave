@@ -66,6 +66,7 @@ async def test_verify_with_assignee_stays_created(env):
         COORD,
         assignee_id=EXEC,
         tags=["verify", "mandatory"],
+        source="system",
     )
     t = await ts.get_task(pid, tid)
     assert t["status"] == "created"

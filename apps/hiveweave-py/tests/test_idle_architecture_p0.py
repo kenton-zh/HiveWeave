@@ -210,6 +210,7 @@ async def test_verify_approve_closes_parent(task_env):
         assignee_id=EXEC,
         parent_task_id=parent_id,
         tags=["verify"],
+        source="system",
     )
     await ts.claim_task(pid, verify_id, EXEC)
     await ts.start_task(pid, verify_id)

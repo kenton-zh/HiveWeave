@@ -236,6 +236,7 @@ async def test_verify_approve_auto_closes(env):
         AGENT_C,
         assignee_id=AGENT_A,
         tags=["verify", "mandatory"],
+        source="system",
     )
     await ts.claim_task(pid, tid, AGENT_A)
     await ts.start_task(pid, tid)
