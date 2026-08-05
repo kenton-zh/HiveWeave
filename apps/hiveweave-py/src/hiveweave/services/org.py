@@ -235,6 +235,30 @@ class OrgService:
 
         self.touch_org_version(project_id)
 
+        # BUG-ORG-01：入职即预置人事档案（best-effort，不阻塞招聘）。
+        # 此前只有 HR 手工 update_roster 才写 personnel_records，导致
+        # read_roster 对全员回落 "(no roster record yet)" 标注（P1），
+        # 且 dismiss 的档案归档（BUG-5）无行可更新。此处预置一行
+        # （position=role, responsibilities=goal, hire_date=今天），
+        # HR 后续 update_roster 仍按 upsert（DELETE+INSERT）覆盖，语义不变。
+        if project_id:
+            try:
+                from hiveweave.services.roster import RosterService
+
+                _rs = RosterService()
+                if not await _rs.get(project_id, agent_id):
+                    await _rs.create(project_id, agent_id, {
+                        "position": str(attrs.get("role") or ""),
+                        "department": str(attrs.get("department") or ""),
+                        "responsibilities": str(attrs.get("goal") or ""),
+                        "status": str(attrs.get("status") or "active"),
+                        "hire_date": time.strftime("%Y-%m-%d"),
+                        "updated_by": "system",
+                    })
+            except Exception as e:
+                log.warning("org.seed_roster_failed",
+                            agent_id=agent_id, error=str(e))
+
         agent = await self.get_agent(agent_id)
         return agent or {"id": agent_id, "short_id": short_id}
 

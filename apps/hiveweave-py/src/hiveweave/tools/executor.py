@@ -509,14 +509,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "read_memory": {
-        "description": "Reads previously stored memory or state for a specific module ID. Use it to retrieve saved information or context that was stored via write_memory. Returns the stored content.",
+        "description": "Reads previously stored memory or state. moduleId is a filter: pass it to read only that module's entry, omit to list all. Each moduleId holds a single entry (latest write wins).",
         "properties": {
             "moduleId": {"type": "string", "aliases": ["module_id", "id", "key"]},
         },
         "required": ["moduleId"],
     },
     "write_memory": {
-        "description": "Writes content to the agent memory system under a given module ID, with optional tags. Use it to store information, context, or state for later retrieval by read_memory.",
+        "description": "Writes content to the agent memory system under a given module ID, with optional tags. One entry per moduleId: re-writing the same moduleId OVERWRITES the previous entry (upsert by design). To accumulate history, use a distinct moduleId per entry (e.g. suffix with date).",
         "properties": {
             "content": {"type": "string", "aliases": ["data", "body", "text", "memory"]},
             "moduleId": {"type": "string", "aliases": ["module_id", "id", "key"]},
