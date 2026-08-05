@@ -44,6 +44,7 @@ async def test_verify_created_not_actionable_pre_merge(task_env):
         assignee_id=EXEC,
         parent_task_id=parent_id,
         tags=["verify", "mandatory"],
+        source="system",
     )
     obs = await ts.get_actionable_obligations(pid, EXEC)
     ids = [t["id"] for t in obs]
@@ -137,6 +138,7 @@ async def test_nudge_claims_then_obligation(task_env):
         assignee_id=EXEC,
         parent_task_id=parent_id,
         tags=["verify"],
+        source="system",
     )
     verify = await ts.get_task(pid, verify_id)
 
@@ -193,6 +195,7 @@ async def test_stale_verify_nudge_claims_and_triggers(task_env):
         assignee_id=EXEC,
         parent_task_id=parent_id,
         tags=["verify"],
+        source="system",
     )
     from hiveweave.services import task as task_module
     from hiveweave.tools import task_tools as tt
@@ -259,6 +262,7 @@ async def test_stale_verify_respects_cooldown(task_env):
         assignee_id=EXEC,
         parent_task_id=parent_id,
         tags=["verify"],
+        source="system",
     )
     old_ms = int(time.time() * 1000) - VERIFY_STALE_MS - 60_000
     await task_module._execute(
@@ -314,6 +318,7 @@ async def test_stale_verify_not_nudged_when_fresh(task_env):
         assignee_id=EXEC,
         parent_task_id=parent_id,
         tags=["verify"],
+        source="system",
     )
 
     with patch(

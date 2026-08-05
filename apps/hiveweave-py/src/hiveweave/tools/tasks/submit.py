@@ -445,6 +445,29 @@ async def submit_task_tool(
                     "Call git_worktree_checkpoint first."
                 )
 
+    # BUG-ORGWT 疏通（2026-08-05 feature-test 死锁）：attestation 背书但
+    # 无任何代码变更的提交 = verification-only 交付（平台功能测试/纯验证类
+    # 任务，交付物是 .hiveweave/reports/ 下的报告 + 真实 test_run 凭证，
+    # 按规则 .hiveweave/ 文件对 files_changed 不可见）。此前这类提交在
+    # submit 被放行，到 approve 却被 review_worktree_gate 以
+    # "no worktree path / no diverged files" 硬拒，agent 侧无解法
+    # （不知道要显式打 no_code_change 旗标）。submit 是最后能一致化
+    # evidence 的位置——此处自动补旗标，与上方自动回填 files_changed
+    # 对称。安全边界：仅当 attestations 存在（平台签发、非 agent 自述）
+    # 且自动 diff 确实挖不到文件时触发；approve 侧审查方 fresh
+    # test_run 硬闸（P0-2）不受影响，仍独立生效。
+    if not skip_delivery_gate and not evidence.get("files_changed"):
+        _aids = evidence.get("attestation_ids") or []
+        if _aids and evidence.get("no_code_change") is not True:
+            evidence["no_code_change"] = True
+            evidence["_auto_no_code_change"] = "attestation_only_delivery"
+            log.info(
+                "submit_auto_no_code_change",
+                task_id=task_id,
+                agent_id=agent_id,
+                attestations=len(_aids),
+            )
+
     # P1-2: submit-time symmetric existence gate (mirrors approve-time
     # missing_claimed check). Catches "submit with no actual deliverable"
     # and ".hiveweave/ invisible files" at submit rather than at approve.

@@ -138,6 +138,7 @@ async def _make_verify_task(pid: str) -> str:
         parent_task_id=parent_id,
         tags=["verify", "mandatory", "post-merge"],
         evidence={"merged_by": MERGER},
+        source="system",
     )
     await ts.claim_task(pid, verify_id, QA)
     await ts.start_task(pid, verify_id)
@@ -246,6 +247,7 @@ async def test_submit_task_preserves_merged_by(task_env):
         assignee_id=QA,
         tags=["verify"],
         evidence={"merged_by": MERGER},
+        source="system",
     )
     await ts.claim_task(pid, tid, QA)
     await ts.start_task(pid, tid)

@@ -257,6 +257,7 @@ async def test_verify_submit_forces_creator_as_reviewer(task_env):
         creator_id=COORD,
         assignee_id=QA,
         tags=["verify"],
+        source="system",
     )
     await ts.claim_task(pid, tid, QA)
     await ts.start_task(pid, tid)

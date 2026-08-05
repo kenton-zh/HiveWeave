@@ -39,6 +39,7 @@ async def _mk_blocked_verify(ts: TaskService, pid: str) -> tuple[str, str]:
         assignee_id=None,
         parent_task_id=parent_id,
         tags=VERIFY_TAGS,
+        source="system",
     )
     await ts.block_task(pid, verify_id, BLOCK_REASON)
     return parent_id, verify_id
@@ -186,6 +187,7 @@ async def test_retry_ignores_assigned_or_non_blocked(task_env):
         assignee_id=EXEC,
         parent_task_id=parent_id,
         tags=VERIFY_TAGS,
+        source="system",
     )
     await ts.claim_task(pid, other_id, EXEC)
     await ts.start_task(pid, other_id)
