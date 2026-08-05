@@ -71,13 +71,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     stickToBottomRef,
   });
 
-  // Clear send queue when leaving an agent (was part of the mount effect).
-  useEffect(() => {
-    if (!agentId) {
-      sendApi.pendingQueueRef.current = [];
-      sendApi.setQueuedCount(0);
-    }
-  }, [agentId, sendApi.pendingQueueRef, sendApi.setQueuedCount]);
+  // Send queue is per-agent (entries tagged in useChatSend): switching chats
+  // parks the previous agent's queued messages instead of clearing or draining
+  // them into the newly viewed agent. queuedCount syncs inside useChatSend.
 
   useAgentChannelLifecycle({
     agentId,
