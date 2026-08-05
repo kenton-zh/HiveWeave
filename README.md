@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">HiveWeave</h1>
 </p>
-<p align="center"><strong>AI Engineering Organization</strong> — Multi-Agent Hierarchical Collaborative Platform</p>
-<p align="center"><em>Not an AI coding tool. A self-evolving AI engineering organization.</em></p>
+<p align="center"><strong>AI Engineering Organization</strong> — turn a prompt into a running, self-reviewing team of AI engineers.</p>
+<p align="center"><em>Not an AI coding tool. Not a framework. A self-evolving AI engineering organization.</em></p>
 
 <p align="center">
   <a href="https://github.com/kenton-zh/HiveWeave"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kenton-zh/HiveWeave?style=flat-square" /></a>
@@ -25,11 +25,25 @@
 
 ---
 
+**At a glance** — a working engineering organization, delivered rather than assembled:
+
+| Organization | Tools & services | Quality & control |
+|:---|:---|:---|
+| CEO, HR, managers, QA & executors out of the box | **85+ built-in tools**, 50+ services, 18 API modules · 133 routes | **4-layer review gate** before anything reaches you |
+| Role-based models: premium for decisions, cheap for execution | Per-agent model override, mix any provider | Per-agent context isolation — no cross-contamination |
+| Parallel agents on isolated `git worktrees` | Built-in task system with a ground-truth ledger | Direct chat with the agent behind any module |
+
+---
+
 ## What is HiveWeave
 
-HiveWeave replaces the single-AI-agent model with a **multi-agent engineering organization**. Instead of one AI doing everything, you get a CEO, managers, engineers, QA, and HR — each with their own role, memory, tools, and worktree. They hire, delegate, review, merge, and report. You manage them like a real team.
+HiveWeave treats software development the way it should be treated: **like a team effort**. Instead of one AI doing everything, you get a **multi-agent engineering organization** — CEO, managers, engineers, QA, and HR — **each with their own role, memory, tools, and worktree**. They **hire, delegate, review, merge, and report**. You manage them like a real team.
 
-> **Why**: Single-agent tools (Claude Code, Codex, Cursor) lose context across modules, can't parallelize, and have no quality gate. HiveWeave splits the work across specialized agents with isolated contexts, independent worktrees, and a four-layer review chain before anything reaches you.
+> **How it works**: You describe the requirement. The **CEO plans the org** — which mid-level roles are needed (say, a frontend lead and a backend lead, and the exact skills each one must have). **The HR agent then searches the skill marketplace to find and bind those skills, hiring each role into place.** The result is a working team tailored to your project — and **you can talk directly to the agent responsible for any module, without routing everything through the CEO**.
+
+> **A built-in task management system**: Every task runs through a full lifecycle — **created, dispatched to the right role, claimed, worked on with visible progress, submitted for review, verified, and merged** (with waive paths when a gate is intentionally skipped). **A Task Ledger records ground truth for every task**, and a live timeline shows the whole team's activity in real time. There's no black box — and, more importantly, **the ledger is a single objective string of truth that keeps the whole team anchored to reality**. Agents can't just agree with each other and call it done; every claim is checked against what was actually created, **so the team can't drift into collective hallucination**.
+
+> **Why**: Single-agent tools (Claude Code, Codex, Cursor) **lose context across modules, can't parallelize, and have no quality gate**. HiveWeave splits the work across specialized agents **with isolated contexts, independent worktrees, and a four-layer review chain before anything reaches you**.
 
 |  | Single-agent tools (Claude Code, Cursor, Codex) | HiveWeave |
 |:---|:---|:---|
@@ -129,12 +143,13 @@ Four-Layer Review Gate:
 
 | Layer | Stack | Notes |
 |:---|------|------|
-| Backend | Python 3.12 + FastAPI + Uvicorn | Port 4000, 122 routes, 16 API modules |
+| Backend | Python 3.12 + FastAPI + Uvicorn | Port 4000, 133 routes, 18 API modules |
 | Frontend | React 19 + Vite + React Flow + Zustand | Port 5173, Electron desktop support |
 | Database | SQLite + aiosqlite | Dual-DB: Meta DB (WAL) + Per-project DB |
 | AI/LLM | httpx SSE streaming + Provider Factory | OpenAI, Anthropic, DeepSeek, Groq, Google |
 | Realtime | phoenix.js + phoenix_adapter (WebSocket) | 3 channels: lobby, project, agent |
 | Sandbox | Docker (optional) | `BASH_SANDBOX=docker` |
+| Build | Turbo | Monorepo task orchestration |
 | Package | pnpm 10 + uv | Monorepo + Python packages |
 
 ## Project Structure
@@ -145,19 +160,24 @@ hiveweave/
 │   ├── hiveweave-py/                  # Backend — Python/FastAPI (port 4000)
 │   │   └── src/hiveweave/
 │   │       ├── agents/                # Agent lifecycle + Supervisor + trigger
-│   │       ├── api/                   # 16 FastAPI router modules, 122 routes
-│   │       ├── llm/                   # Streamer, provider factory, retry, circuit_breaker
-│   │       ├── services/              # 23 services (org, dispatch, memory, handoff, MCP, ...)
-│   │       ├── tools/                 # 74 built-in tools (bash, file, grep, patch, review, ...)
+│   │       ├── api/                   # 18 FastAPI router modules, 133 routes
 │   │       ├── conversation/          # Token budget, compaction, conversation store
 │   │       ├── db/                    # Meta DB + Per-project DB (aiosqlite)
+│   │       ├── hooks/                 # Lifecycle hooks
+│   │       ├── llm/                   # Streamer, provider factory, retry, circuit_breaker
+│   │       ├── prompts/               # ETHOS prompt system (identity + context)
 │   │       ├── realtime/              # phoenix_adapter, channels, pubsub, event_bus
-│   │       └── prompts/               # ETHOS prompt system (identity + context)
+│   │       ├── services/              # 50+ services (org, dispatch, memory, handoff, ...)
+│   │       ├── tools/                 # 85+ built-in tools (incl. tasks/ subpackage)
+│   │       └── util/                  # Shared utilities
 │   └── web/                           # Frontend — React 19 + Vite + Electron (port 5173)
 ├── assets/
 │   └── screenshots/                   # Screenshots for README
-├── start-all.bat                      # Windows startup script
-└── CLAUDE.md                          # AI tooling instructions
+├── docs/                              # Architecture & migration docs
+├── scripts/                           # Build / utility scripts
+├── tasks/                             # Task specs
+├── start-*.bat / *.sh                 # Platform startup scripts
+└── CLAUDE.md / AGENTS.md              # AI tooling instructions
 ```
 
 ## How It Works
@@ -173,6 +193,8 @@ hiveweave/
 ```
 
 ## Features
+
+Everything below is delivered as a running organization, not a library. The differentiator isn't any single feature — it's that they come pre-wired into a team that manages itself.
 
 | Feature | Description |
 |:---|------|
@@ -196,7 +218,7 @@ hiveweave/
 | **Dual-DB pattern** | Meta DB (WAL, global) + Per-project DB (WAL, isolated). Agents never cross-contaminate data. |
 | **MCP protocol** | Tool extension via Model Context Protocol. Bind MCP servers per agent — different agents get different external tools. |
 | **skills.sh marketplace** | Remote skill marketplace. HR searches and binds skills dynamically. No hardcoded skill lists. |
-| **74 built-in tools** | bash, grep, file ops, patch, websearch, question, todowrite, review (5-axis), security audit, MCP tools. Permission-gated per role type. |
+| **85+ built-in tools** | bash, file ops, grep, patch, review (5-axis), security audit, websearch, question, todowrite, orchestration, org, vision, image generation, MCP tools. Permission-gated per role type. |
 
 ## Documentation
 
@@ -225,5 +247,5 @@ Human contributions are just as welcome: open an issue for bugs or ideas, or for
 ---
 
 <p align="center">
-  Built with HiveWeave — an AI engineering organization that builds itself.
+  <strong>Built with HiveWeave</strong> — an AI engineering organization that plans, hires, develops, reviews, and ships its own product. It's not the tool that builds the software; it's the team. <a href="https://github.com/kenton-zh/HiveWeave">Star us</a> and watch the org run.
 </p>
