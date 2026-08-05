@@ -1,7 +1,7 @@
 """Meta DB — global SQLite database for projects + global config.
 
 契约 11: Meta DB
-- 全局单例，WAL 模式
+- 全局单例，DELETE journal mode（避免 Windows WAL 孤儿化损坏，TEST18 2026-08-05）
 - 表: projects (id, name, workspace_path, created_at), agent_templates, llm_models, global_settings, meta_index
 - 不再存储 agent_index 或任何 per-project 业务数据
 - agent_id → project_id 路由由 AgentRouter 内存映射完成
@@ -156,9 +156,10 @@ async def init_meta_db() -> None:
         _db = await aiosqlite.connect(db_path)
         _db.row_factory = aiosqlite.Row
 
-        # WAL mode for Meta DB (global, concurrent reads)
+        # DELETE journal mode for Meta DB（与 per-project DB 一致，避免 Windows
+        # WAL 孤儿化/代际分叉损坏 —— TEST18 事故根因 2026-08-05）
         await _db.execute("PRAGMA encoding = 'UTF-8'")
-        await _db.execute("PRAGMA journal_mode=WAL")
+        await _db.execute("PRAGMA journal_mode=DELETE")
         await _db.execute("PRAGMA busy_timeout=5000")
         await _db.execute("PRAGMA foreign_keys=ON")
 

@@ -95,10 +95,16 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
         conn = await aiosqlite.connect(db_path)
         conn.row_factory = aiosqlite.Row
 
-        # Bug F fix: WAL 模式支持多进程并发读写，外部只读进程不会损坏数据
+        # 契约 11: DELETE journal mode（避免 Windows WAL 孤儿化/代际分叉损坏）
+        #   WAL 依赖 -shm 文件做跨进程协调，Windows 下多连接打开同一库时
+        #   主库与 WAL 易分叉成不同代际（salt 不匹配）→ B-tree 损坏。
+        #   TEST18 事故根因（2026-08-05）：WAL 回归 + 双后端进程并发打开
+        #   同一库，旧 WAL 成孤儿，后续写入绕过 WAL 直接落主库 →
+        #   "invalid page number" 损坏。单后端架构靠 asyncio 锁串行化访问，
+        #   DELETE 模式完全安全（busy_timeout 兜底并发）。
         # BUG-009/012/013 fix: explicitly set UTF-8 encoding to prevent CJK mojibake
         await conn.execute("PRAGMA encoding = 'UTF-8'")
-        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA journal_mode=DELETE")
         await conn.execute("PRAGMA busy_timeout=5000")
         await conn.execute("PRAGMA foreign_keys=ON")
 
@@ -203,7 +209,13 @@ async def get_project_db_by_project_id(project_id: str) -> aiosqlite.Connection:
 
 
 # ── Read-only connection pool (Timeline v4 §4.4) ────────────
-# 聚合只读查询（timeline 端点）与写路径物理隔离：WAL 天然支持并发读。
+# 聚合只读查询（timeline 端点）与写路径物理隔离：独立只读池 + slot 锁。
+# 注意：DELETE 模式下跨"读写"的互斥来自 SQLite 文件锁 + busy_timeout（5s），
+# 而非 asyncio 锁——只读池 slot.lock 与写路径 workspace 写锁是两把独立的锁，
+# 互不协调。因此长读事务可能阻塞写方 COMMIT 最多 5s 后抛 "database is locked"
+# （timeline 查询 limit 上限小，通常毫秒级，实际触发概率低）。这是相对 WAL
+# "读者不阻塞写者"的刻意取舍——换取规避 Windows WAL 孤儿化/代际分叉，
+# 若后续出现写方锁超时，优先收紧 timeline 查询时长而非改回 WAL。
 # - 每 workspace 独立池（2 条连接），每条连接绑一把 asyncio.Lock：
 #   aiosqlite 只串行化单条 execute、不串行化事务块，两个并发请求共用
 #   一条连接会 BEGIN 交错（"cannot start a transaction within a transaction"），
