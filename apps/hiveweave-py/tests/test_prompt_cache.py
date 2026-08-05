@@ -16,6 +16,7 @@ from hiveweave.llm.provider import (
     ProviderConfig,
     ProviderFactory,
 )
+from hiveweave.llm.util import normalize_usage
 
 
 def _cache_count(body: dict) -> int:
@@ -293,3 +294,108 @@ class TestExtractUsageCache:
         usage = AnthropicHandler.extract_usage(chunk)
         assert usage["cache_creation"] == 800
         assert usage["input"] == 200
+
+
+# ── OpenAIHandler.extract_usage DeepSeek 缓存字段 ───────────
+
+
+class TestOpenAIDeepSeekCacheExtraction:
+    """测试 OpenAIHandler.extract_usage 提取 DeepSeek 的 prompt cache 字段。"""
+
+    def test_extract_deepseek_cache_fields(self):
+        """DeepSeek（openai 兼容）的 hit/miss 字段应被提取。"""
+        chunk = {
+            "usage": {
+                "prompt_tokens": 2500,
+                "completion_tokens": 120,
+                "total_tokens": 2620,
+                "prompt_cache_hit_tokens": 2000,
+                "prompt_cache_miss_tokens": 500,
+            }
+        }
+        usage = OpenAIHandler.extract_usage(chunk)
+        assert usage["cache_read"] == 2000
+        assert usage["prompt_cache_miss_tokens"] == 500
+        assert usage["input"] == 2500
+        assert usage["output"] == 120
+
+    def test_extract_openai_no_cache_fields(self):
+        """普通 OpenAI 响应无缓存字段时 cache_read 为 0。"""
+        chunk = {
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+            }
+        }
+        usage = OpenAIHandler.extract_usage(chunk)
+        assert usage["cache_read"] == 0
+        assert usage["prompt_cache_miss_tokens"] is None
+
+    def test_extract_openai_compat_gateway_cached_tokens(self):
+        """OpenAI 兼容网关（Volcengine ARK）用 prompt_tokens_details.cached_tokens。"""
+        chunk = {
+            "usage": {
+                "prompt_tokens": 123761,
+                "completion_tokens": 68,
+                "total_tokens": 123829,
+                "prompt_tokens_details": {"cached_tokens": 123392},
+            }
+        }
+        usage = OpenAIHandler.extract_usage(chunk)
+        assert usage["cache_read"] == 123392
+        assert usage["input"] == 123761
+
+
+# ── normalize_usage DeepSeek 缓存拆解 ───────────────────────
+
+
+class TestNormalizeUsageDeepSeek:
+    """测试 normalize_usage 对 DeepSeek 缓存 token 的拆解。"""
+
+    def test_deepseek_hit_subtracted_from_input(self):
+        """命中部分从 input 中剥出，避免虚高。"""
+        usage = {
+            # OpenAIHandler.extract_usage 产出的映射 + 原始字段
+            "input": 2500,
+            "output": 120,
+            "total": 2620,
+            "cache_read": 2000,
+            "prompt_cache_miss_tokens": 500,
+            "prompt_cache_hit_tokens": 2000,
+        }
+        norm = normalize_usage(usage, "openai")
+        assert norm["input"] == 500, "input 应为未命中部分（新计费）"
+        assert norm["output"] == 120
+        assert norm["cache_read"] == 2000
+        assert norm["total"] == 500 + 120
+
+    def test_deepseek_without_hit_fields_fallback(self):
+        """无 DeepSeek 缓存字段时回退到 prompt_tokens 口径。"""
+        usage = {"input": 100, "output": 50, "total": 150}
+        norm = normalize_usage(usage, "openai")
+        assert norm["input"] == 100
+        assert norm["cache_read"] == 0
+        assert norm["total"] == 150
+
+    def test_openai_compat_gateway_cached_subtracted(self):
+        """ARK 网关的 cached_tokens 应从 input 中剥出并计入 cache_read。"""
+        usage = {
+            "input": 123761,
+            "output": 68,
+            "total": 123829,
+            "cache_read": 123392,
+            "prompt_cache_miss_tokens": None,
+            "prompt_tokens_details": {"cached_tokens": 123392},
+        }
+        norm = normalize_usage(usage, "openai")
+        assert norm["cache_read"] == 123392
+        assert norm["input"] == 123761 - 123392
+        assert norm["total"] == (123761 - 123392) + 68
+
+    def test_anthropic_not_double_subtracted(self):
+        """Anthropic input 已排除 cache，不应重复剥（cache_read 时不减 input）。"""
+        usage = {"input": 100, "output": 50, "total": 150, "cache_read": 0}
+        norm = normalize_usage(usage, "anthropic")
+        assert norm["input"] == 100
+        assert norm["total"] == 150

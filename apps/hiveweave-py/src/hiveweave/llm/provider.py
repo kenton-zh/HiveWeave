@@ -426,6 +426,14 @@ class OpenAIHandler(FormatHandler):
         u = chunk.get("usage")
         if not u:
             return None
+        # 提取缓存命中字段，兼容两种网关表达：
+        # 1) DeepSeek 原生: prompt_cache_hit_tokens
+        # 2) OpenAI 兼容网关(如 Volcengine ARK): prompt_tokens_details.cached_tokens
+        cache_hit_native = u.get("prompt_cache_hit_tokens", 0) or 0
+        details = u.get("prompt_tokens_details") or {}
+        openai_cached = (details.get("cached_tokens") or 0) or 0
+        cache_read = cache_hit_native or openai_cached
+        cache_miss = u.get("prompt_cache_miss_tokens", None)
         return {
             "input": u.get("prompt_tokens", 0),
             "output": u.get("completion_tokens", 0),
@@ -433,6 +441,9 @@ class OpenAIHandler(FormatHandler):
                 "total_tokens",
                 u.get("prompt_tokens", 0) + u.get("completion_tokens", 0),
             ),
+            "cache_read": cache_read,
+            "prompt_cache_hit_tokens": cache_read,
+            "prompt_cache_miss_tokens": cache_miss,
         }
 
 

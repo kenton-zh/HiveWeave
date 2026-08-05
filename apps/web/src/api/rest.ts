@@ -952,3 +952,80 @@ export async function listTasks(
   );
   return data?.tasks ?? [];
 }
+
+// ---------------------------------------------------------------------------
+// Token usage — LLM token 计量（F5）
+// ---------------------------------------------------------------------------
+
+/** 单条 token 用量（按 agent × request_type 拆分）。 */
+export interface TokenUsageEntry {
+  agent_id: string;
+  request_type: string;
+  llm_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  total_tokens: number;
+  duration_ms: number;
+}
+
+/** 单 agent 汇总口径。 */
+export interface TokenUsageSummary {
+  llm_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  total_tokens: number;
+  duration_ms: number;
+}
+
+/** 按天然日分组的汇总行。 */
+export interface TokenDailyEntry {
+  day: string;
+  llm_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  total_tokens: number;
+}
+
+const REQUEST_TYPE_LABEL: Record<string, string> = {
+  main: "主对话",
+  subagent: "子代理",
+  compaction_conversation: "对话压缩",
+  compaction_memory: "记忆压缩",
+};
+
+/** 展示用标签；未知类型原样返回。 */
+export function tokenRequestTypeLabel(t: string): string {
+  return REQUEST_TYPE_LABEL[t] ?? t;
+}
+
+/** 项目内按 agent × request_type 的 token 汇总。 */
+export async function getProjectTokenUsage(
+  projectId: string,
+): Promise<{ entries: TokenUsageEntry[] }> {
+  return fetchJSON(
+    `${BASE}/projects/${projectId}/token-usage`,
+  );
+}
+
+/** 项目内按天然日的 token 汇总（近 N 天）。 */
+export async function getProjectTokenDaily(
+  projectId: string,
+  days: number = 30,
+): Promise<{ entries: TokenDailyEntry[] }> {
+  return fetchJSON(
+    `${BASE}/projects/${projectId}/token-usage/daily?days=${days}`,
+  );
+}
+
+/** 平台级跨项目聚合（按 agent）。 */
+export async function getPlatformTokenUsage(): Promise<{
+  entries: Array<TokenUsageEntry & { project_id: string; project_name?: string }>;
+}> {
+  return fetchJSON(`${BASE}/token-usage/platform`);
+}

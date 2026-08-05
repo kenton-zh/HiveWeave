@@ -28,6 +28,15 @@ log = structlog.get_logger(__name__)
 class ToolLoopMixin:
     """Tool loop main cycle for Streamer."""
 
+    @staticmethod
+    def _normalize_usage(
+        usage: dict | None, provider: str | None = None
+    ) -> dict | None:
+        """归一化一轮 usage（provider 差异 + total 口径），供 token metering 使用。"""
+        from hiveweave.llm.util import normalize_usage
+
+        return normalize_usage(usage, provider)
+
     async def _run_tool_loop(
         self,
         agent_id: str,
@@ -76,6 +85,10 @@ class ToolLoopMixin:
         soft_deadline = loop_start + TOTAL_TIMEOUT_S
         budget_hint_injected = False
 
+        # Token metering: 累加每轮归一化 usage（供 agent 层落库）。
+        # 每轮只保留末轮 usage 在 last_usage，中间轮在这里累积。
+        usage_rounds: list[dict] = []
+
         for round_num in range(rounds_cap):
             now_mono = time.monotonic()
             if now_mono >= hard_deadline:
@@ -109,6 +122,7 @@ class ToolLoopMixin:
                         "tool_turn_messages": tool_turn_acc,
                         "rounds": round_num,
                         "usage": last_usage,
+                        "usage_rounds": usage_rounds,
                         "budget_exhausted": True,
                     }
                 await self._fire_delta(on_delta, {
@@ -179,6 +193,7 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
+                    "usage_rounds": usage_rounds,
                     "error": round_result.get("error"),
                     "error_status": round_result.get("error_status"),
                     "error_headers": round_result.get("error_headers"),
@@ -189,6 +204,19 @@ class ToolLoopMixin:
             tool_calls = round_result["tool_calls"]
             finish_reason = round_result["finish_reason"]
             last_usage = round_result.get("usage")
+
+            # Token metering: 归一化本轮 usage 并累加（错误轮无 usage 则跳过）
+            # best-effort：畸形 provider 数据不得中断主流程，异常时跳过该轮计费
+            try:
+                usage = self._normalize_usage(
+                    round_result.get("usage"), provider.provider_type
+                )
+            except Exception:
+                log.warning("usage_normalize_skipped",
+                            agent_id=agent_id, round=round_num)
+                usage = None
+            if usage:
+                usage_rounds.append(usage)
 
             combined_text = text_acc + new_text
             combined_thinking = thinking_acc + new_thinking
@@ -215,6 +243,7 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
+                    "usage_rounds": usage_rounds,
                 }
 
             if finish_reason == "length":
@@ -230,6 +259,7 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
+                    "usage_rounds": usage_rounds,
                 }
 
             if finish_reason == "content_filter":
@@ -245,6 +275,7 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
+                    "usage_rounds": usage_rounds,
                 }
 
             # 有 tool_calls → 执行工具，继续循环
@@ -350,6 +381,7 @@ class ToolLoopMixin:
                             "tool_turn_messages": tool_turn_acc,
                             "rounds": round_num + 1,
                             "usage": last_usage,
+                            "usage_rounds": usage_rounds,
                             "error": f"Doom loop detected: tool '{doom}' called "
                                      f"{limit}+ times with same args (after warning)",
                         }
@@ -439,6 +471,7 @@ class ToolLoopMixin:
                         "tool_turn_messages": tool_turn_acc,
                         "rounds": round_num + 1,
                         "usage": last_usage,
+                        "usage_rounds": usage_rounds,
                         "end_turn": True,
                     }
 
@@ -517,6 +550,7 @@ class ToolLoopMixin:
                         "tool_turn_messages": tool_turn_acc,
                         "rounds": round_num + 1,
                         "usage": last_usage,
+                        "usage_rounds": usage_rounds,
                         "stall_break": True,
                     }
 
@@ -548,6 +582,7 @@ class ToolLoopMixin:
                                 "tool_turn_messages": tool_turn_acc,
                                 "rounds": round_num + 1,
                                 "usage": last_usage,
+                                "usage_rounds": usage_rounds,
                             }
                         log.info("inject_no_text_hint", round=round_num,
                                  no_text_rounds=no_text_rounds,
@@ -581,6 +616,7 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
+                    "usage_rounds": usage_rounds,
                 }
 
             # 有真实文本 — 剥离占位符，结束
@@ -606,6 +642,7 @@ class ToolLoopMixin:
                 "tool_turn_messages": tool_turn_acc,
                 "rounds": round_num + 1,
                 "usage": last_usage,
+                "usage_rounds": usage_rounds,
             }
 
         # 达到最大轮次 — 做一次无工具的总结调用
@@ -631,5 +668,6 @@ class ToolLoopMixin:
             "tool_turn_messages": tool_turn_acc,
             "rounds": rounds_cap,
             "usage": last_usage,
+            "usage_rounds": usage_rounds,
         }
 

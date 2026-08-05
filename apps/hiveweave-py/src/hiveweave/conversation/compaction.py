@@ -239,7 +239,9 @@ def _safe_content(content) -> str:
     return str(content)
 
 
-async def resolve_compactor_callback(agent_id: str) -> LLMCallback | None:
+async def resolve_compactor_callback(
+    agent_id: str, kind: str = "conversation"
+) -> LLMCallback | None:
     """解析 agent 的 compactor LLM 回调。
 
     优先使用专用压缩模型（HIVEWEAVE_COMPACTOR_MODEL_ID，llm_models 表 id）；
@@ -247,6 +249,8 @@ async def resolve_compactor_callback(agent_id: str) -> LLMCallback | None:
     专用模型解耦 agent 主模型故障与压缩故障（TEST18 巡检 P0④：原实现
     compactor 硬绑 agent 同款模型，错误完全相关）。
     无可用模型时返回 None（compact 将回退到硬截断）。
+
+    kind: 压缩类型（conversation | memory），用于 token metering 归类。
     """
     from hiveweave.config import settings
     from hiveweave.db import meta as meta_db
@@ -317,6 +321,9 @@ async def resolve_compactor_callback(agent_id: str) -> LLMCallback | None:
             return await _call_compactor_llm(
                 base_url, api_key, model_name, prompt,
                 max_tokens=max_output or None,
+                agent_id=agent_id,
+                provider=provider_type_from_model(model),
+                kind=kind,
             )
 
         return callback
@@ -331,6 +338,9 @@ async def _call_compactor_llm(
     model: str,
     prompt: str,
     max_tokens: int | None = None,
+    agent_id: str | None = None,
+    provider: str | None = None,
+    kind: str = "conversation",
 ) -> str | None:
     """调用 OpenAI 兼容 API 生成摘要。
 
@@ -338,8 +348,12 @@ async def _call_compactor_llm(
     未传时回退 SUMMARY_MAX_TOKENS_ESCALATED。命中 finish_reason=length +
     content 空（预算被 reasoning 吃光/偶发截断）时用相同预算幂等重试
     一次兜偶发失败——预算已是模型上限，升级无意义（TEST18 巡检 P0 修复）。
+
+    agent_id 非空时做 token metering（F3：压缩绕过 Streamer，需单独打点）。
     """
     import httpx
+
+    from hiveweave.services.token_meter import token_meter
 
     url = f"{base_url}/chat/completions"
     budget = max_tokens if max_tokens is not None else SUMMARY_MAX_TOKENS_ESCALATED
@@ -374,6 +388,38 @@ async def _call_compactor_llm(
             return None
         choice = choices[0]
         content = (choice.get("message") or {}).get("content")
+        # Token metering: 压缩调用落库（best-effort，不阻塞）。
+        # 只要用了 usage 就记录（content 为空可能因 finish_reason=length 吃光预算，
+        # 此时仍消耗了 token），并走 normalize_usage 拆解缓存命中，与主/子代理口径一致。
+        if agent_id and data.get("usage"):
+            u = data["usage"]
+            try:
+                from hiveweave.llm.util import normalize_usage
+
+                norm = normalize_usage(
+                    {
+                        "input": u.get("prompt_tokens", 0),
+                        "output": u.get("completion_tokens", 0),
+                        "prompt_tokens_details": u.get("prompt_tokens_details"),
+                        "prompt_cache_hit_tokens": u.get("prompt_cache_hit_tokens"),
+                        "prompt_cache_miss_tokens": u.get("prompt_cache_miss_tokens"),
+                    },
+                    provider,
+                )
+                if norm:
+                    await token_meter.record_compaction(
+                        agent_id=agent_id,
+                        model_id=model,
+                        input_tokens=norm["input"],
+                        output_tokens=norm["output"],
+                        cache_read_tokens=norm["cache_read"],
+                        cache_creation_tokens=norm["cache_creation"],
+                        kind=kind,
+                        provider=provider,
+                    )
+            except Exception as meter_err:
+                logger.warning("compactor_token_meter_failed",
+                               agent_id=agent_id, error=str(meter_err))
         if content:
             return content
         # content 空：仅当 reasoning 吃光预算（finish_reason=length）才重试
@@ -387,3 +433,11 @@ async def _call_compactor_llm(
             continue
         return None
     return None
+
+
+def provider_type_from_model(model: dict) -> str | None:
+    """从模型行推断 provider_type（best-effort，token metering 用）。"""
+    try:
+        return str(model.get("provider_type") or "") or None
+    except Exception:
+        return None

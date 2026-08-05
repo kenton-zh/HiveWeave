@@ -433,6 +433,21 @@ async def query_one(
     return row
 
 
+async def query_by_project(
+    project_id: str, sql: str, params: list[Any] | None = None
+) -> list[aiosqlite.Row]:
+    """Execute a SELECT query on the per-project DB for a project_id.
+
+    供聚合只读查询（token metering / timeline）使用，通过 project_id 路由。
+    底层 get_project_db_by_project_id 失败时 raise ProjectDbError，由调用方处理。
+    """
+    conn = await get_project_db_by_project_id(project_id)
+    cursor = await conn.execute(sql, params or [])
+    rows = await cursor.fetchall()
+    await cursor.close()
+    return rows
+
+
 async def get_workspace_write_lock(workspace_path: str) -> asyncio.Lock:
     """Get (or create) the per-workspace write lock（供按 workspace 解析连接的调用方）。"""
     ws = str(Path(workspace_path).resolve())

@@ -554,6 +554,28 @@ PROJECT_DB_TABLES = [
         escalation_count INTEGER DEFAULT 0
     )
     """,
+    # ── LLM Token Metering ───────────────────────────────────
+    # 每行 = 一次 LLM 请求。归属 agent/run/task/project 四级，
+    # 覆盖主对话 / 压缩 / 子代理三条调用路径。best-effort 写入。
+    """
+    CREATE TABLE IF NOT EXISTS llm_usage (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        project_id TEXT,
+        run_id TEXT,
+        task_id TEXT,
+        model_id TEXT,
+        request_type TEXT DEFAULT 'main',   -- main | compaction_dialog | compaction_memory | subagent
+        provider TEXT,
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        cache_read_tokens INTEGER DEFAULT 0,
+        cache_creation_tokens INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        duration_ms INTEGER DEFAULT 0,
+        created_at INTEGER NOT NULL
+    )
+    """,
 ]
 
 # ── Meta DB 索引 ────────────────────────────────────────────
@@ -610,4 +632,9 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_task_events_created ON task_events(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_handoffs_created ON handoffs(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_work_logs_created ON work_logs(created_at)",
+    # ── LLM Token Metering indexes ───────────────────────────
+    "CREATE INDEX IF NOT EXISTS idx_llm_usage_agent ON llm_usage(agent_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_usage_project ON llm_usage(project_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_usage_run ON llm_usage(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_usage_task ON llm_usage(task_id)",
 ]

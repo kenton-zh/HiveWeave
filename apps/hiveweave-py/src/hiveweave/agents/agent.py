@@ -46,6 +46,7 @@ from hiveweave.services.org import OrgService
 from hiveweave.services.permission import permission_service, PermissionService
 from hiveweave.services.skill_registry import SkillRegistryService
 from hiveweave.services.system_state import system_state
+from hiveweave.services.token_meter import token_meter
 from hiveweave.services.work_log import WorkLogService
 from hiveweave.tools.executor import ToolExecutor
 from hiveweave.tools.review import ReviewLLMCallback
@@ -868,6 +869,19 @@ class Agent:
                     on_delta=self._on_delta,
                     on_tool_call=self._on_tool_call,
                     max_tool_rounds=max_rounds,
+                )
+
+                # Token metering: 主对话路径落库（best-effort，不阻塞主流程）。
+                # usage_rounds 由 streamer 在全部 return 分支携带。
+                await token_meter.record_rounds(
+                    agent_id=self.id,
+                    project_id=self.project_id,
+                    run_id=self._current_run_id,
+                    task_id=getattr(self, "_current_task_id", None),
+                    rounds=result.get("usage_rounds", []),
+                    model_id=model_config.get("model_id"),
+                    provider=model_config.get("provider_type"),
+                    request_type="main",
                 )
 
                 status = result.get("status", "error")
