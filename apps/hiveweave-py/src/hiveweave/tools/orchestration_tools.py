@@ -964,7 +964,9 @@ class ReadMemoryParams(BaseModel):
     "read_memory",
     "Reads previously stored memory for an agent (including older entries "
     "that were compressed out of the live context). Use agentId to read "
-    "another agent's memories; omit to read your own.",
+    "another agent's memories; omit to read your own. moduleId is a filter: "
+    "pass it to read only that module's entry; omit it to list all. "
+    "Note: each moduleId holds a single entry (latest write wins).",
     requires_workspace=False,
     security_level="standard",
 )
@@ -1039,7 +1041,11 @@ class WriteMemoryParams(BaseModel):
 @tool(
     "write_memory",
     "Writes content to the agent memory system. Use it to store "
-    "information, context, or state for later retrieval by read_memory.",
+    "information, context, or state for later retrieval by read_memory. "
+    "Semantics: one entry per moduleId — writing again with the same "
+    "moduleId OVERWRITES the previous entry (upsert, BUG-040 by design). "
+    "To accumulate history, use a distinct moduleId per entry "
+    "(e.g. suffix with date or sequence).",
     requires_workspace=False,
     security_level="standard",
 )

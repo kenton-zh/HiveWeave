@@ -75,6 +75,11 @@ class TaskClaim(BaseModel):
     agentId: str
 
 
+class TaskForceApprove(BaseModel):
+    reason: str
+    note: str | None = None
+
+
 def _raise_from_value_error(e: ValueError) -> None:
     """Map ValueError to 404 (not found) or 400 (illegal transition)."""
     msg = str(e)
@@ -279,6 +284,64 @@ async def unclaim_task(project_id: str, task_id: str) -> dict:
     except ValueError as e:
         _raise_from_value_error(e)
     return {"success": True}
+
+
+@router.post("/{task_id}/force-approve")
+async def force_approve_task(
+    project_id: str, task_id: str, body: TaskForceApprove
+) -> dict:
+    """Operator 强制批准（human-operator 通道）——审批死锁逃生门。
+
+    E2E 实测发现（2026-08-05 feature-test 项目）：waive→approve 需第三方
+    REVIEW 持有者，但当 waiver 发起人是唯一 REVIEW 持有者且小团队豁免
+    不成立时（如 HR 无 review 能力、CEO 与测试负责人均已 waive），任务
+    永远卡在 submitted/reviewing——agent 工具路径无任何解法，团队实测
+    陷入"rework 清 waiver"空转。
+
+    operator 是最终权威。本端点跳过 agent 能力检查与 waived_by 第三方
+    隔离（人类操作者不受 agent 权限约束），强制批准并在 evidence 落
+    审计戳：reviewed_by=human-operator，feedback 含 reason + 死锁诊断。
+    仅限 submitted/reviewing 状态；其他状态走正常 review 或 archive。
+    """
+    if not (body.reason or "").strip():
+        raise HTTPException(status_code=400, detail="reason is required")
+    task = await _tasks.get_task(project_id, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    status = task.get("status")
+    if status not in ("submitted", "reviewing"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only submitted/reviewing tasks can be force-approved, "
+                   f"but is '{status}'",
+        )
+    # 死锁诊断（best-effort，写入审计 feedback）
+    deadlock = None
+    try:
+        from hiveweave.services.unblock_soft import no_lawful_approver
+
+        deadlock = await no_lawful_approver(project_id, task)
+    except Exception as e:
+        log.debug("force_approve_deadlock_probe_failed", error=str(e))
+    feedback = f"[operator-force-approve] {body.reason.strip()}"
+    if body.note:
+        feedback += f" — {body.note.strip()}"
+    if deadlock:
+        feedback += f" | deadlock: {deadlock}"
+    try:
+        if status == "submitted":
+            await _tasks.start_review(
+                project_id, task_id, reviewer_id="human-operator"
+            )
+        await _tasks.review_task(
+            project_id, task_id, "approve", feedback,
+            reviewer_id="human-operator",
+        )
+    except ValueError as e:
+        _raise_from_value_error(e)
+    log.warning("task_force_approved", project_id=project_id, task_id=task_id,
+                reason=body.reason.strip(), deadlock=deadlock)
+    return {"success": True, "deadlock": deadlock}
 
 
 @router.post("/{task_id}/submit")
