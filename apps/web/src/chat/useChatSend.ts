@@ -17,6 +17,13 @@ type UpdateStreamDraft = (
 ) => void;
 
 /**
+ * Queue entries are tagged with their intended recipient. ChatPanel is NOT
+ * remounted on agent switch (stable key), so an untagged queue would drain
+ * agent A's parked messages into agent B's chat the moment B is viewed idle.
+ */
+type QueuedMessage = { agentId: string; text: string };
+
+/**
  * Send / queue / stop — preserves streamChat's abort handle on streamAbortRef.
  */
 export function useChatSend(opts: {
@@ -60,7 +67,7 @@ export function useChatSend(opts: {
   const [showApprovalDialog, setShowApprovalDialog] = useState(false);
   const [pendingApprovalTool, setPendingApprovalTool] = useState<string | null>(null);
 
-  const pendingQueueRef = useRef<string[]>([]);
+  const pendingQueueRef = useRef<QueuedMessage[]>([]);
   const autoSendRef = useRef(false);
   const handleSendRef = useRef<() => void>(() => {});
   const sendingLockRef = useRef(false);
@@ -72,6 +79,21 @@ export function useChatSend(opts: {
 
   const updateProcessingAgent = useAppStore((s) => s.updateProcessingAgent);
   const pendingInitialMessage = useAppStore((s) => s.pendingInitialMessage);
+
+  /** Queued-count banner reflects the VIEWED agent only. */
+  const syncQueuedCount = useCallback(() => {
+    const current = activeAgentIdRef.current;
+    setQueuedCount(
+      current ? pendingQueueRef.current.filter((e) => e.agentId === current).length : 0
+    );
+  }, [activeAgentIdRef]);
+
+  /** Remove and return the first queued entry for `id` (entries may be interleaved). */
+  const shiftQueuedFor = useCallback((id: string): QueuedMessage | undefined => {
+    const idx = pendingQueueRef.current.findIndex((e) => e.agentId === id);
+    if (idx < 0) return undefined;
+    return pendingQueueRef.current.splice(idx, 1)[0];
+  }, []);
 
   const addImages = useCallback((files: FileList | File[]) => {
     const readers: Promise<string>[] = [];
@@ -126,9 +148,9 @@ export function useChatSend(opts: {
 
     if (!autoSendRef.current && sendingLockRef.current) {
       if (input.trim()) {
-        pendingQueueRef.current.push(input.trim());
+        pendingQueueRef.current.push({ agentId, text: input.trim() });
         setInput("");
-        setQueuedCount(pendingQueueRef.current.length);
+        syncQueuedCount();
       }
       return;
     }
@@ -136,15 +158,15 @@ export function useChatSend(opts: {
     let messageText: string;
     if (autoSendRef.current) {
       autoSendRef.current = false;
-      messageText = pendingQueueRef.current.shift() || "";
-      setQueuedCount(pendingQueueRef.current.length);
+      messageText = shiftQueuedFor(agentId)?.text || "";
+      syncQueuedCount();
     } else {
       if (!input.trim()) return;
       messageText = input.trim();
       setInput("");
       if (isStreaming || isAgentProcessing) {
-        pendingQueueRef.current.push(messageText);
-        setQueuedCount(pendingQueueRef.current.length);
+        pendingQueueRef.current.push({ agentId, text: messageText });
+        syncQueuedCount();
         return;
       }
     }
@@ -166,9 +188,17 @@ export function useChatSend(opts: {
     const releaseLockAndFinish = () => {
       sendingLockRef.current = false;
       clearStreamAbort();
-      if (pendingQueueRef.current.length > 0) {
-        autoSendRef.current = true;
-        setTimeout(() => handleSend(), 300);
+      if (pendingQueueRef.current.some((e) => e.agentId === sendingForAgentId)) {
+        // If the user switched chats within the 300ms window, leave the entry
+        // parked — the drain effect will send it when its own chat is viewed.
+        setTimeout(() => {
+          if (activeAgentIdRef.current !== sendingForAgentId) return;
+          // A manual send may have started a stream within the window — never
+          // run a second concurrent stream; its own completion re-arms this.
+          if (sendingLockRef.current) return;
+          autoSendRef.current = true;
+          handleSend();
+        }, 300);
       }
     };
 
@@ -194,6 +224,9 @@ export function useChatSend(opts: {
 
     const optimisticUserId = `pending-user-${sendingForAgentId}-${Date.now()}`;
     setMessages((prev) => {
+      // Delayed auto-send may fire after the user switched chats — never leak
+      // another agent's bubble into the currently viewed message list.
+      if (!isActiveSession()) return prev;
       if (prev.some((m) => m.id === optimisticUserId)) return prev;
       return [
         ...prev,
@@ -473,8 +506,10 @@ export function useChatSend(opts: {
           updateStreamDraft(null);
           setIsStreaming(false);
           setRetryInfo(null);
-          pendingQueueRef.current = [];
-          setQueuedCount(0);
+          pendingQueueRef.current = pendingQueueRef.current.filter(
+            (e) => e.agentId !== sendingForAgentId
+          );
+          syncQueuedCount();
           autoSendRef.current = false;
           sendingLockRef.current = false;
           clearStreamAbort();
@@ -515,6 +550,8 @@ export function useChatSend(opts: {
     setThinkingElapsed,
     updateProcessingAgent,
     stickToBottomRef,
+    syncQueuedCount,
+    shiftQueuedFor,
   ]);
 
   handleSendRef.current = handleSend;
@@ -531,16 +568,22 @@ export function useChatSend(opts: {
     void joinAgentChannel(sendingForAgentId).finally(() => {
       if (activeAgentIdRef.current !== sendingForAgentId) return;
       autoSendRef.current = true;
-      pendingQueueRef.current = [message];
-      setQueuedCount(0);
+      pendingQueueRef.current.push({ agentId: sendingForAgentId, text: message });
       handleSendRef.current();
     });
   }, [pendingInitialMessage, agentId, activeAgentIdRef]);
 
-  // Drain queued messages when agent becomes idle
+  // Queued-count banner is per-agent — recompute when switching chats.
+  useEffect(() => {
+    syncQueuedCount();
+  }, [agentId, syncQueuedCount]);
+
+  // Drain queued messages when the VIEWED agent becomes idle. Entries for
+  // other agents stay parked until their own chat is viewed and idle —
+  // a message queued for agent A must never auto-send to agent B on switch.
   useEffect(() => {
     if (!agentId || isStreaming || isAgentProcessing) return;
-    if (pendingQueueRef.current.length === 0) return;
+    if (!pendingQueueRef.current.some((e) => e.agentId === agentId)) return;
     autoSendRef.current = true;
     handleSend();
   }, [agentId, isStreaming, isAgentProcessing, handleSend]);
@@ -561,19 +604,17 @@ export function useChatSend(opts: {
     setRetryInfo(null);
     if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
     if (agentId) updateProcessingAgent(agentId, false);
-    if (pendingQueueRef.current.length > 0) {
-      pendingQueueRef.current = [];
-      setQueuedCount(0);
+    if (pendingQueueRef.current.some((e) => e.agentId === agentId)) {
+      pendingQueueRef.current = pendingQueueRef.current.filter((e) => e.agentId !== agentId);
+      syncQueuedCount();
     }
-  }, [agentId, setIsStreaming, updateStreamDraft, updateProcessingAgent]);
+  }, [agentId, setIsStreaming, updateStreamDraft, updateProcessingAgent, syncQueuedCount]);
 
   return {
     input,
     setInput,
     images,
     queuedCount,
-    setQueuedCount,
-    pendingQueueRef,
     retryInfo,
     setRetryInfo,
     showApprovalDialog,
