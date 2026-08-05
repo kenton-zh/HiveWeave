@@ -244,6 +244,14 @@ class TestCheckHiveweaveDir:
             str(tmp_path / ".hiveweave" / "drafts" / "plan.md"), str(tmp_path)
         ) is False
 
+    def test_allows_handoffs(self, tmp_path: Path):
+        """handoffs/ 是解散交接文档目录，上级须能 read_file 读取（P0 回归守卫）。"""
+        from hiveweave.tools.file import _check_hiveweave_dir
+        assert _check_hiveweave_dir(
+            str(tmp_path / ".hiveweave" / "handoffs" / "a001-dismissal.md"),
+            str(tmp_path),
+        ) is False
+
     def test_allows_outside_hiveweave(self, tmp_path: Path):
         from hiveweave.tools.file import _check_hiveweave_dir
         assert _check_hiveweave_dir(

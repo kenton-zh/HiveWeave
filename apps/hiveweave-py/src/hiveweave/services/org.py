@@ -968,6 +968,58 @@ class OrgService:
                     error=str(e),
                 )
 
+        # Dismissal handoff: 私有记忆 → 文档 + 归档 + 建 handoff 记录（引用文档）。
+        # 只把文档路径交给上级，不灌内容——是否 read_file 读文档由上级决定。
+        try:
+            from hiveweave.services.handoff import HandoffService
+
+            ho = HandoffService()
+            dismissal = await ho.create_dismissal_handoff(
+                project_id,
+                agent_id,
+                agent_name=str(agent_before.get("name") or ""),
+                short_id=str(agent_before.get("short_id") or ""),
+                role=str(agent_before.get("role") or ""),
+                parent_id=parent_id or None,
+            )
+            if parent_id and dismissal.get("document_path"):
+                try:
+                    from hiveweave.services.inbox import InboxService
+
+                    await InboxService().send_message(
+                        from_agent_id="system",
+                        to_agent_id=parent_id,
+                        message=(
+                            f"[DISMISS HANDOFF] Agent "
+                            f"{agent_before.get('name') or agent_before.get('short_id')} "
+                            f"dismissed; {dismissal.get('memory_count') or 0} private memory "
+                            f"note(s) archived as a handoff document:\n"
+                            f"{dismissal['document_path']}\n"
+                            f"Read it via read_file if you need the context — "
+                            f"content was intentionally not injected."
+                        ),
+                        message_type="system",
+                        priority="normal",
+                        # O1 (审计 2026-08-05)：wake=True 确保上级被唤醒看到交接
+                        # 引用——wake=False 会立即标读且仅在下次自然唤醒出现，
+                        # 交接目的（让上级知道有文档可读）会落空。是否 read_file
+                        # 读内容仍由上级决定，wake 只负责把引用浮到眼前。
+                        wake=True,
+                        idempotency_key=f"dismiss-handoff-{agent_id}",
+                    )
+                except Exception as e:
+                    log.warning(
+                        "dismiss_handoff_notify_failed",
+                        agent_id=agent_id,
+                        error=str(e),
+                    )
+        except Exception as e:
+            log.warning(
+                "dismiss_handoff_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
+
         # BUG-5: archive personnel_records so position uniqueness stays real
         try:
             from hiveweave.services.roster import RosterService

@@ -226,11 +226,13 @@ class MemoryService:
         return result
 
     async def get_all_agent_memories(self, agent_id: str, project_id: str,
-                                     module_id: str | None = None) -> list[dict]:
-        """Get ALL of an agent's memories, including compressed/old ones.
+                                     module_id: str | None = None,
+                                     limit: int = 100) -> list[dict]:
+        """Get an agent's memories, including compressed/old ones.
 
         read_memory 工具全量查询用（窗口压缩后历史不丢，可主动召回）。
-        排序：新记忆优先（DESC），上限 100。
+        排序：新记忆优先（DESC）。``limit`` 默认 100；交接文档生成时传
+        更大的值以保证归档前文档覆盖全部记忆（审计 2026-08-05）。
         """
         conn = await self._conn(project_id)
         if module_id:
@@ -238,15 +240,15 @@ class MemoryService:
                 "SELECT id, agent_id, scope, module_id, type, content, source_agent_id, "
                 "metadata, created_at, updated_at FROM memories "
                 "WHERE scope = 'agent' AND agent_id = ? AND module_id = ? "
-                "ORDER BY created_at DESC, rowid DESC LIMIT 100",
-                [agent_id, module_id])
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                [agent_id, module_id, limit])
         else:
             cursor = await conn.execute(
                 "SELECT id, agent_id, scope, module_id, type, content, source_agent_id, "
                 "metadata, created_at, updated_at FROM memories "
                 "WHERE scope = 'agent' AND agent_id = ? "
-                "ORDER BY created_at DESC, rowid DESC LIMIT 100",
-                [agent_id])
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                [agent_id, limit])
         rows = await cursor.fetchall()
         await cursor.close()
         return [self._row_to_memory(r) for r in rows]
@@ -569,20 +571,40 @@ class MemoryService:
             )
         return False
 
-    async def archive_agent_memories(self, agent_id: str, project_id: str) -> int:
-        """Archive an agent's private memories (scope: agent → archive)."""
+    async def archive_agent_memories(self, agent_id: str, project_id: str,
+                                     _write_lock: asyncio.Lock | None = None) -> int:
+        """Archive an agent's private memories (scope: agent → archive).
+
+        ``_write_lock``：可选，调用方已持有的 per-workspace 写锁（解散交接时
+        读快照→归档需在同一次锁内原子完成，审计 2026-08-05 H2）。未传则自行获取。
+
+        M3 (审计 2026-08-05)：工具写入的记忆多为 NULL module_id，归档时兜底
+        记为 agent_id，使继任者可经 get_archived_memories(project_id, agent_id)
+        按前任检索，不依赖文档为唯一存续载体。
+        """
         now_ms = int(time.time() * 1000)
         conn = await self._conn(project_id)
         # 写事务互斥（TEST18 审计 S1）：整段持 per-workspace 锁，同 save_memory。
         workspace = await meta_db.get_project_workspace(project_id)
         if not workspace:
             raise ProjectDbError(f"workspace not found for project {project_id}")
-        write_lock = await get_workspace_write_lock(workspace)
-        async with write_lock:
+        write_lock = _write_lock or await get_workspace_write_lock(workspace)
+        if write_lock.locked():
+            # 调用方已持有（解散交接在锁内），直接执行，避免 async with 二次获取死锁。
             cursor = await conn.execute(
-                "UPDATE memories SET scope = 'archive', updated_at = ? "
-                "WHERE agent_id = ? AND scope = 'agent'", [now_ms, agent_id])
+                "UPDATE memories SET scope = 'archive', "
+                "module_id = CASE WHEN module_id IS NULL THEN ? ELSE module_id END, "
+                "updated_at = ? WHERE agent_id = ? AND scope = 'agent'",
+                [agent_id, now_ms, agent_id])
             await conn.commit()
+        else:
+            async with write_lock:
+                cursor = await conn.execute(
+                    "UPDATE memories SET scope = 'archive', "
+                    "module_id = CASE WHEN module_id IS NULL THEN ? ELSE module_id END, "
+                    "updated_at = ? WHERE agent_id = ? AND scope = 'agent'",
+                    [agent_id, now_ms, agent_id])
+                await conn.commit()
         count = max(cursor.rowcount, 0)
         await cursor.close()
         # R5: 只清该 agent 的私有缓存（archive 层由 TTL 自然过期）
