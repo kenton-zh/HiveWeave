@@ -4,7 +4,7 @@ import {
 import ApprovalDialog from "./ApprovalDialog";
 import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings, getProjectAlarms } from "../api";
 import { useAppStore, type AgentAlarmInfo } from "../store";
-import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
+import { getPositionLabel } from "../utils/role-styles";
 import { realMsToGameSeconds, gameSecondsToRealMs, decomposeGameSeconds } from "../utils/game-time";
 
 // ── Types ──────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ function computeLayoutParams(roots: OrgNodeData[]): LayoutParams {
   const maxBreadth = Math.max(0, ...roots.map(getMaxBreadth));
 
   let nodeH = 54, hGap = 20, vGap = 36;
-  let minW = 100, maxW = 220;
+  let minW = 116, maxW = 230;
   let strokeWidth = 1.5;
 
   if (total > 30 || maxBreadth > 8) {
@@ -98,14 +98,14 @@ function computeLayoutParams(roots: OrgNodeData[]): LayoutParams {
     nodeH = 44;
     hGap = Math.max(8, 20 - (maxBreadth - 8) * 2);
     vGap = Math.max(18, 36 - (maxDepth - 3) * 3);
-    minW = 90; maxW = 170;
+    minW = 104; maxW = 180;
     strokeWidth = 1;
   } else if (total > 15 || maxBreadth > 5) {
     // Medium tree — slightly compressed
     nodeH = 48;
     hGap = 14;
     vGap = 28;
-    minW = 90; maxW = 190;
+    minW = 104; maxW = 200;
     strokeWidth = 1.2;
   }
 
@@ -117,7 +117,9 @@ function estimateWidth(node: OrgNodeData, minW: number, maxW: number): number {
   let w = 0;
   for (const ch of node.name) w += /[一-鿿]/.test(ch) ? 13 : 7.5;
   if (node.position) w += 48;
-  return Math.max(minW, Math.min(maxW, Math.ceil(w + 36)));
+  if (node.children?.length) w += 20; // expand/collapse chevron
+  // +62: role avatar (18) + gaps (12) + status dot (8) + horizontal padding (16) + slack
+  return Math.max(minW, Math.min(maxW, Math.ceil(w + 62)));
 }
 
 function layoutTree(
@@ -232,7 +234,7 @@ function Connectors({
         <svg className="absolute inset-0 pointer-events-none" style={{ overflow: "visible" }}>
           <line
             x1={px} y1={py} x2={cx} y2={childY}
-            stroke="#bdc1c6" strokeWidth={strokeWidth} strokeLinecap="round"
+            stroke="#ccd2de" strokeWidth={strokeWidth} strokeLinecap="round"
           />
         </svg>
       );
@@ -251,7 +253,7 @@ function Connectors({
     return (
       <svg className="absolute inset-0 pointer-events-none" style={{ overflow: "visible" }}>
         <path
-          d={d} fill="none" stroke="#bdc1c6" strokeWidth={strokeWidth}
+          d={d} fill="none" stroke="#ccd2de" strokeWidth={strokeWidth}
           strokeLinejoin="round" strokeLinecap="round"
         />
       </svg>
@@ -293,7 +295,7 @@ function Connectors({
       <line
         key={c.id}
         x1={cx} y1={midY} x2={cx} y2={childY}
-        stroke="#cbc0aa" strokeWidth={strokeWidth}
+        stroke="#ccd2de" strokeWidth={strokeWidth}
       />
     );
   });
@@ -301,11 +303,11 @@ function Connectors({
   return (
     <svg className="absolute inset-0 pointer-events-none" style={{ overflow: "visible" }}>
       <path
-        d={trunk} fill="none" stroke="#bdc1c6"
+        d={trunk} fill="none" stroke="#ccd2de"
         strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round"
       />
       <path
-        d={branch} fill="none" stroke="#cbc0aa"
+        d={branch} fill="none" stroke="#ccd2de"
         strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round"
       />
       {drops}
@@ -316,11 +318,11 @@ function Connectors({
 // ── Node card ──────────────────────────────────────────────────
 
 const ROLE_COLORS: Record<string, string> = {
-  ceo: "#f59e0b", hr: "#f43f5e", architect: "#a855f7",
-  manager: "#3b82f6", developer: "#22c55e", module_dev: "#22c55e",
-  test_engineer: "#eab308", qa: "#eab308", code_reviewer: "#6366f1",
-  security_auditor: "#ef4444", web_perf_auditor: "#06b6d4",
-  devops: "#06b6d4",
+  ceo: "#d97706", hr: "#e11d48", architect: "#9333ea",
+  manager: "#4f46e5", developer: "#189a52", module_dev: "#189a52",
+  test_engineer: "#c77400", qa: "#c77400", code_reviewer: "#7c3aed",
+  security_auditor: "#e5484d", web_perf_auditor: "#0891b2",
+  devops: "#0d9488",
 };
 
 /** Format a real-time millisecond countdown into a compact label, e.g. "30秒", "5分12秒", "2时15分". */
@@ -339,7 +341,7 @@ function formatAlarmCountdown(realMs: number): string {
 
 function TreeNodeCard({
   node, isSelected, onSelect, onAddChild, onApproval, onToggle,
-  expanded, pendingCount, hasUserPing, isProcessing, isActive, nodeH, alarm,
+  expanded, pendingCount, hasUserPing, isProcessing, nodeH, alarm,
   healthError,
 }: {
   node: LayoutNode;
@@ -352,16 +354,14 @@ function TreeNodeCard({
   pendingCount: number;
   hasUserPing: boolean;
   isProcessing: boolean;
-  isActive: boolean;
   nodeH: number;
   alarm?: AgentAlarmInfo;
   /** Health-error message (LLM/model call failure); null/undefined = healthy. */
   healthError?: string | null;
 }) {
-  const compact = nodeH < 42;
+  const compact = nodeH < 50;
   const hasError = !!healthError;
   const hasChildren = !!node.children?.length;
-  const roleStyle = getRoleStyle(node.role);
   const positionLabel = getPositionLabel(node.position, node.role);
   const accentColor = ROLE_COLORS[node.role] || "#6b7280";
 
@@ -392,71 +392,52 @@ function TreeNodeCard({
     <div
       onClick={(e) => { e.stopPropagation(); onSelect(node.id); }}
       data-interactive="true"
-      className={[
-        "absolute cursor-pointer rounded-gm overflow-hidden",
-        "transition-colors duration-150 ease-out group",
-        isSelected
-          ? "ring-1 ring-g-blue/50"
-          : node.role === "ceo"
-            ? "ring-1 ring-g-blue/30 hover:border-g-blue/40"
-            : "hover:border-g-blue/40",
-      ].join(" ")}
+      className="absolute cursor-pointer rounded-[10px] overflow-hidden hw-org-node group"
       style={{
         left: node.x,
         top: node.y,
         width: node.w,
         minHeight: nodeH,
-        borderLeft: `3px solid ${accentColor}`,
-        borderTopWidth: "1px",
-        borderTopStyle: "solid",
-        borderTopColor: hasError ? "rgba(239,68,68,.55)" : isProcessing ? "rgba(52,168,83,.30)" : "#ebebeb",
-        borderRightWidth: "1px",
-        borderRightStyle: "solid",
-        borderRightColor: hasError ? "rgba(239,68,68,.55)" : isProcessing ? "rgba(52,168,83,.30)" : "#ebebeb",
-        borderBottomWidth: "1px",
-        borderBottomStyle: "solid",
-        borderBottomColor: hasError ? "rgba(239,68,68,.55)" : isProcessing ? "rgba(52,168,83,.30)" : "#ebebeb",
+        border: `1px solid ${
+          hasError
+            ? "rgba(229,72,77,.55)"
+            : isSelected
+              ? "rgba(79,70,229,.55)"
+              : isProcessing
+                ? "rgba(24,154,82,.30)"
+                : "#e4e6ed"
+        }`,
         background: isSelected
-          ? "rgba(66,133,244,0.08)"
+          ? "rgba(79,70,229,0.05)"
           : "rgba(255,255,255,1)",
         boxShadow: hasError
-          ? "0 0 0 1px rgba(239,68,68,.35), 0 0 12px rgba(239,68,68,.28)"
+          ? "0 0 0 3px rgba(229,72,77,.12), 0 2px 10px rgba(229,72,77,.20)"
           : isSelected
-            ? "0 0 0 1px rgba(66,133,244,.25), 0 2px 8px rgba(60,64,67,.18)"
-            : node.role === "ceo"
-              ? "0 1px 4px rgba(66,133,244,.15)"
-              : isActive && isProcessing
-                ? "0 1px 3px rgba(60,64,67,.20)"
-                : "0 1px 1px rgba(60,64,67,.10)",
+            ? "0 0 0 3px rgba(79,70,229,.12), 0 4px 14px -2px rgba(23,25,35,.16)"
+            : "0 1px 2px rgba(23,25,35,.05)",
         // Re-rasterize text crisply at any CSS scale level
         textRendering: "optimizeLegibility",
         WebkitFontSmoothing: "antialiased",
       }}
     >
-      {/* Row 1: status dot + name + expand + ping */}
-      <div className={`flex items-center ${compact ? "gap-0.5 px-1 py-0.5" : "gap-1 px-1.5 py-0.5"}`}>
+      {/* Row 1: role avatar + name + expand + status dot */}
+      <div className={`flex items-center ${compact ? "gap-1 px-1.5 pt-1" : "gap-1.5 px-2 pt-1.5"}`}>
         <span
-          className={`rounded-full shrink-0 ${compact ? "w-1 h-1" : "w-1.5 h-1.5"} ${
-            node.status === "active"
-              ? isProcessing ? "bg-emerald-400 animate-pulse" : "bg-g-fg-4"
-              : node.status === "idle" || node.status === "inactive" ? "bg-g-fg-4"
-              : node.status === "promoted" ? "bg-blue-400"
-              : node.status === "receiving" ? "bg-amber-400 animate-pulse"
-              : node.status === "merging" ? "bg-purple-400 animate-pulse"
-              : node.status === "dissolving" || node.status === "archived" ? "bg-red-600"
-              : "bg-gray-500"
+          className={`shrink-0 rounded-md flex items-center justify-center font-semibold ${
+            compact ? "w-3.5 h-3.5 text-[8px]" : "w-[18px] h-[18px] text-[10px]"
           }`}
-        />
+          style={{ background: `${accentColor}16`, color: accentColor }}
+        >
+          {node.name.charAt(0)}
+        </span>
         <span
-          className={`font-medium truncate ${compact ? "text-[10px]" : "text-xs"} ${
-            isSelected ? "text-g-fg" : "text-g-fg"
-          }`}
+          className={`font-medium truncate ${compact ? "text-[10px]" : "text-xs"} text-g-fg`}
         >
           {node.name}
         </span>
         {hasError && (
           <span
-            className="shrink-0 text-red-500 flex items-center"
+            className="shrink-0 text-g-red flex items-center"
             title={`模型/LLM 调用出错：${healthError}`}
           >
             <svg className={compact ? "w-2.5 h-2.5" : "w-3 h-3"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -467,7 +448,7 @@ function TreeNodeCard({
         {hasChildren && (
           <span
             onClick={(e) => { e.stopPropagation(); onToggle(); }}
-            className="text-g-fg-3 hover:text-g-fg cursor-pointer shrink-0 ml-0.5 flex items-center"
+            className="text-g-fg-4 hover:text-g-fg cursor-pointer shrink-0 ml-0.5 flex items-center"
           >
             <svg className={compact ? "w-2.5 h-2.5" : "w-3 h-3"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
               <path strokeLinecap="round" strokeLinejoin="round" d={expanded ? "M19 9l-7 7-7-7" : "M9 5l7 7-7 7"} />
@@ -476,17 +457,29 @@ function TreeNodeCard({
         )}
         <span className="flex-1" />
         {hasUserPing && (
-          <span className={`${compact ? "w-1 h-1" : "w-1.5 h-1.5"} bg-red-500 rounded-full animate-pulse shrink-0`} />
+          <span className={`${compact ? "w-1 h-1" : "w-1.5 h-1.5"} bg-g-red rounded-full animate-pulse shrink-0`} />
         )}
+        <span
+          className={`rounded-full shrink-0 ${compact ? "w-1.5 h-1.5" : "w-2 h-2"} ${
+            node.status === "active"
+              ? isProcessing ? "bg-emerald-500 animate-pulse" : "bg-g-fg-4/70"
+              : node.status === "idle" || node.status === "inactive" ? "bg-g-fg-4/70"
+              : node.status === "promoted" ? "bg-g-blue"
+              : node.status === "receiving" ? "bg-amber-400 animate-pulse"
+              : node.status === "merging" ? "bg-purple-400 animate-pulse"
+              : node.status === "dissolving" || node.status === "archived" ? "bg-g-red"
+              : "bg-gray-500"
+          }`}
+        />
       </div>
 
-      {/* Row 2: position badge + pending */}
-      <div className={`flex items-center ${compact ? "gap-0.5 px-1 pb-0.5" : "gap-1 px-1.5 pb-0.5"}`}>
+      {/* Row 2: position badge + alarm + pending */}
+      <div className={`flex items-center ${compact ? "gap-0.5 px-1.5 pb-1 pt-0.5" : "gap-1 px-2 pb-1.5 pt-1"}`}>
         {positionLabel ? (
           <span
-            className={`font-medium rounded truncate ${compact ? "text-[8px] px-1" : "text-[10px] px-1.5 py-px"}`}
+            className={`font-medium rounded-md truncate ${compact ? "text-[8px] px-1" : "text-[10px] px-1.5 py-px"}`}
             style={{
-              background: `${accentColor}18`,
+              background: `${accentColor}14`,
               color: accentColor,
             }}
           >
@@ -497,7 +490,7 @@ function TreeNodeCard({
         {alarmLabel && (
           <span
             title={alarmTitle}
-            className={`shrink-0 font-medium bg-g-blue-bg text-g-blue rounded leading-none flex items-center gap-0.5 ${
+            className={`shrink-0 font-medium bg-g-blue-bg text-g-blue rounded-md leading-none flex items-center gap-0.5 ${
               compact ? "text-[8px] px-0.5 py-px" : "text-[10px] px-1 py-0.5"
             }`}
           >
@@ -510,7 +503,7 @@ function TreeNodeCard({
         {pendingCount > 0 && (
           <span
             onClick={(e) => { e.stopPropagation(); onApproval(node.id); }}
-            className={`shrink-0 font-medium bg-g-yellow-bg text-amber-700 rounded cursor-pointer hover:bg-amber-500/30 leading-none ${
+            className={`shrink-0 font-medium bg-g-yellow-bg text-g-yellow rounded-md cursor-pointer hover:bg-g-yellow/20 leading-none ${
               compact ? "text-[8px] px-0.5 py-px" : "text-[10px] px-1 py-0.5"
             }`}
           >
@@ -522,7 +515,7 @@ function TreeNodeCard({
       {/* Add child — absolutely positioned, does NOT affect row layout */}
       <span
         onClick={(e) => { e.stopPropagation(); onAddChild(node.id); }}
-        className="absolute bottom-0.5 right-0.5 rounded hidden group-hover:flex items-center justify-center text-g-fg-3 hover:text-g-blue hover:bg-g-blue/10"
+        className="absolute bottom-1 right-1 rounded-md hidden group-hover:flex items-center justify-center text-g-fg-4 hover:text-g-blue hover:bg-g-blue/10 transition-colors"
         style={{ width: compact ? 14 : 16, height: compact ? 14 : 16 }}
       >
         <svg
@@ -550,7 +543,7 @@ function ZoomControls({
     <div
       data-interactive="true"
       onPointerDown={(e) => e.stopPropagation()}
-      className="absolute bottom-3 right-3 flex items-center gap-0.5 bg-white/90 backdrop-blur-sm rounded-lg border border-g-border p-0.5 z-20"
+      className="absolute bottom-3 right-3 flex items-center gap-0.5 glass rounded-lg border border-g-border p-0.5 z-20 shadow-gm-md"
     >
       {[
         { label: "−", onClick: onZoomOut, title: "缩小" },
@@ -1062,7 +1055,6 @@ function OrgTree() {
                       Array.isArray(userPingAgentIds) && userPingAgentIds.includes(n.id)
                     }
                     isProcessing={processingAgents.includes(n.id)}
-                    isActive={n.status === "active"}
                     nodeH={params.nodeH}
                     alarm={agentAlarms[n.id]}
                     healthError={healthError}

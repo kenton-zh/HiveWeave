@@ -16,7 +16,7 @@ export default function TimelineView() {
   return (
     <div className="h-full flex flex-col overflow-hidden bg-g-bg-soft">
       {/* 顶栏：标题 + 任务选择器 */}
-      <div className="px-4 py-3 border-b border-g-border bg-white/80 backdrop-blur-sm shrink-0">
+      <div className="px-4 py-3 border-b border-g-border bg-white shrink-0">
         <div className="flex items-center gap-2 mb-2">
           <svg className="w-4 h-4 text-g-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path

@@ -126,7 +126,7 @@ export function MessageBubble({ msg, isStreaming, thinkingElapsed }: { msg: Chat
           ? "max-w-[78%] rounded-2xl rounded-br-md px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-gm-sm"
           : "w-full max-w-full text-[15px] leading-relaxed text-g-fg"
         }
-        style={isUser ? { background: "linear-gradient(135deg, #4a8bff 0%, #4285f4 55%, #3574e2 100%)" } : undefined}
+        style={isUser ? { background: "linear-gradient(135deg, #5b54e8 0%, #4f46e5 55%, #4338ca 100%)" } : undefined}
       >
         {msg.images && msg.images.length > 0 && (
           <div className="flex gap-1.5 flex-wrap mb-3">

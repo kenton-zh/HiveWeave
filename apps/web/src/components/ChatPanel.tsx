@@ -197,8 +197,8 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         <ChatMotionStyles />
         <div className="text-center hw-msg-in">
           <div
-            className="w-16 h-16 mx-auto mb-4 rounded-full flex items-center justify-center shadow-gm-md"
-            style={{ background: "linear-gradient(135deg, #e8f0fe 0%, #dbeafe 100%)" }}
+            className="w-16 h-16 mx-auto mb-4 rounded-2xl flex items-center justify-center shadow-gm-sm border border-g-blue/15"
+            style={{ background: "linear-gradient(135deg, #eceefb 0%, #e0e3f8 100%)" }}
           >
             <svg className="w-8 h-8 text-g-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path
@@ -277,13 +277,10 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     <div className="h-full flex flex-col bg-white" style={hidden ? { display: "none" } : undefined}>
       <ChatMotionStyles />
       {agentInfo && (
-        <div
-          className="px-4 py-3 border-b border-g-border shrink-0"
-          style={{ background: "linear-gradient(180deg, #fbfbfc 0%, #f5f6f8 100%)" }}
-        >
+        <div className="px-4 py-3 border-b border-g-border shrink-0 bg-white">
           <div className="flex items-center gap-3">
             <div
-              className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 text-sm font-bold text-white ring-2 ring-white shadow-gm-sm ${
+              className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 text-sm font-bold text-white shadow-gm-sm ${
                 agentInfo.role === "ceo"
                   ? "bg-amber-500"
                   : agentInfo.role === "hr"
@@ -291,9 +288,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                     : agentInfo.role === "architect"
                       ? "bg-purple-500"
                       : agentInfo.role === "manager" || agentInfo.role === "pm"
-                        ? "bg-blue-500"
+                        ? "bg-g-blue"
                         : agentInfo.role === "developer" || agentInfo.role === "module_dev"
-                          ? "bg-green-500"
+                          ? "bg-g-green"
                           : "bg-g-fg-3"
               }`}
             >
@@ -389,13 +386,13 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       </div>
 
       {hasTeamComms && (
-        <div className="shrink-0 border-t border-g-border-strong bg-[#f4f6f9] overflow-hidden">
+        <div className="shrink-0 border-t border-g-border bg-g-bg-soft overflow-hidden">
           <button
             onClick={() => {
               setTeamCommsExpanded(!teamCommsExpanded);
               if (teamCommsExpanded) setExpandedMessageId(null);
             }}
-            className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-[#eef0f4] transition-colors"
+            className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-g-bg-muted transition-colors"
           >
             <div className="flex items-center gap-2">
               <svg className="w-3.5 h-3.5 text-g-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -491,7 +488,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                       onClick={() => setExpandedMessageId(isExpanded ? null : msg.id)}
                       className={
                         "w-full px-4 py-2 text-left hover:bg-g-bg-muted transition-colors " +
-                        (!msg.isRead ? "bg-g-blue/5 shadow-[inset_2px_0_0_0_#4285f4] " : "")
+                        (!msg.isRead ? "bg-g-blue/5 shadow-[inset_2px_0_0_0_#4f46e5] " : "")
                       }
                     >
                       <div className="flex items-center gap-2 mb-0.5 min-w-0">
@@ -560,7 +557,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         </div>
       )}
 
-      <div className="px-6 py-4 border-t border-g-border bg-g-bg-soft/70 shrink-0">
+      <div className="px-4 py-3 border-t border-g-border bg-white shrink-0">
         {images.length > 0 && (
           <div className="flex gap-2 mb-2 flex-wrap">
             {images.map((url, i) => (
@@ -600,7 +597,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           <button
             onClick={() => fileInputRef.current?.click()}
             disabled={images.length >= 5 || isStreaming}
-            className="px-3 py-3 rounded-gm text-g-fg-3 hover:text-g-blue hover:bg-g-bg-muted disabled:opacity-30 transition-colors"
+            className="px-2.5 py-2.5 rounded-gm text-g-fg-3 hover:text-g-blue hover:bg-g-bg-muted disabled:opacity-30 transition-colors"
             title="添加图片 (支持粘贴/拖拽)"
           >
             <svg
@@ -624,22 +621,21 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
             placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 支持粘贴图片)"
-            className="flex-1 bg-g-bg border border-g-border rounded-gm px-4 py-3 text-sm text-g-fg resize-none transition-shadow focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/25 focus:shadow-gm-sm"
+            className="flex-1 bg-g-bg-soft border border-g-border rounded-gm px-3.5 py-2.5 text-sm text-g-fg resize-none transition-all focus:outline-none focus:bg-g-bg focus:border-g-blue focus:ring-2 focus:ring-g-blue/20"
             rows={1}
             disabled={isStreaming}
           />
           <button
             onClick={handleSend}
             disabled={(!input.trim() && images.length === 0) || isStreaming}
-            className="px-6 py-3 text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm-md hover:brightness-105 active:scale-95 disabled:opacity-50 disabled:shadow-none disabled:hover:brightness-100"
-            style={{ background: "linear-gradient(135deg, #4a8bff 0%, #4285f4 55%, #3574e2 100%)" }}
+            className="px-5 py-2.5 bg-g-blue hover:bg-indigo-700 text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm active:scale-95 disabled:opacity-40 disabled:shadow-none"
           >
             发送
           </button>
           <button
             onClick={handleStop}
             disabled={!isStreaming}
-            className="px-6 py-3 bg-red-500 hover:bg-red-600 text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm-md active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed disabled:shadow-none"
+            className="px-5 py-2.5 bg-white border border-g-border text-g-fg-2 hover:text-g-red hover:border-g-red/40 hover:bg-g-red-bg/50 rounded-gm text-sm font-medium shadow-gm-sm transition-all active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed disabled:shadow-none"
           >
             停止
           </button>

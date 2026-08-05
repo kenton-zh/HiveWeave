@@ -2,7 +2,7 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ── Google Material Base Styles ── */
+/* ── Base ── */
 @layer base {
   * {
     @apply border-g-border;
@@ -13,11 +13,14 @@
   }
 
   body {
-    font-family: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "PingFang SC",
+      "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    font-feature-settings: "cv11", "ss01";
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
-    background-color: #ffffff;
+    background-color: #f6f7f9;
+    color: #181b23;
   }
 
   /* Refined scrollbar — floating thumb with soft hover */
@@ -29,19 +32,19 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: rgba(60, 64, 67, 0.22);
+    background: rgba(23, 25, 35, 0.18);
     border-radius: 8px;
     border: 2px solid transparent;
     background-clip: padding-box;
     transition: background-color 0.2s ease;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: rgba(60, 64, 67, 0.4);
+    background: rgba(23, 25, 35, 0.34);
     border: 2px solid transparent;
     background-clip: padding-box;
   }
   ::-webkit-scrollbar-thumb:active {
-    background: rgba(66, 133, 244, 0.55);
+    background: rgba(79, 70, 229, 0.5);
     border: 2px solid transparent;
     background-clip: padding-box;
   }
@@ -52,18 +55,18 @@
   /* Firefox scrollbar */
   * {
     scrollbar-width: thin;
-    scrollbar-color: rgba(60, 64, 67, 0.28) transparent;
+    scrollbar-color: rgba(23, 25, 35, 0.24) transparent;
   }
 
   ::selection {
-    background: rgba(66, 133, 244, 0.18);
-    color: #0e1115;
+    background: rgba(79, 70, 229, 0.16);
+    color: #181b23;
     text-shadow: none;
   }
 
   /* Unified keyboard focus ring */
   :focus-visible {
-    outline: 2px solid rgba(66, 133, 244, 0.55);
+    outline: 2px solid rgba(79, 70, 229, 0.5);
     outline-offset: 2px;
     border-radius: 4px;
   }
@@ -81,83 +84,108 @@
   }
 }
 
-/* ── React Flow overrides ── */
+/* ── React Flow overrides (legacy, kept harmless) ── */
 .react-flow__background {
-  background: #f4f6f9 !important;
+  background: #f4f5f9 !important;
 }
 .react-flow__minimap {
-  background: rgba(255,255,255,0.85) !important;
+  background: rgba(255, 255, 255, 0.85) !important;
   border-radius: 8px;
-  border: 1px solid #ebebeb !important;
+  border: 1px solid #e4e6ed !important;
   backdrop-filter: blur(6px);
-  box-shadow: 0 2px 6px 2px rgba(60,64,67,.10);
+  box-shadow: 0 2px 8px rgba(23, 25, 35, 0.08);
 }
 
-/* ── Focus ring (Google blue) ── */
+/* ── Focus ring (brand indigo) ── */
 @layer utilities {
   .focus-g {
     @apply outline-none ring-2 ring-g-blue/40 ring-offset-2 ring-offset-g-bg;
   }
 }
 
-/* ── Google Material Components ── */
+/* ── Components ── */
 @layer components {
   .gm-card {
-    @apply bg-g-bg border border-g-border rounded-gm shadow-gm-sm transition-shadow duration-200;
+    @apply bg-g-bg border border-g-border rounded-gmLg shadow-gm-sm transition-shadow duration-200;
   }
 
   .gm-btn-primary {
     @apply bg-g-blue text-white px-4 py-2 rounded-gm font-medium text-sm
-           hover:bg-blue-600 hover:shadow-gm-md transition-all duration-150 shadow-gm-sm
+           hover:bg-indigo-700 hover:shadow-gm-md transition-all duration-150 shadow-gm-sm
            active:scale-[0.97] active:shadow-gm-sm;
   }
 
   .gm-btn-secondary {
-    @apply bg-g-bg-soft text-g-fg-2 px-4 py-2 rounded-gm font-medium text-sm
-           hover:bg-g-bg-muted hover:shadow-gm-sm transition-all duration-150 border border-g-border
-           active:scale-[0.98];
+    @apply bg-g-bg text-g-fg-2 px-4 py-2 rounded-gm font-medium text-sm
+           hover:bg-g-bg-soft hover:text-g-fg transition-all duration-150 border border-g-border
+           shadow-gm-sm active:scale-[0.98];
   }
 
   .gm-input {
     @apply w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm
            text-g-fg placeholder-g-fg-4
-           focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/25
+           focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/20
            transition-all duration-150;
   }
 
   .gm-badge {
     @apply inline-flex items-center text-[10px] font-medium px-2 py-0.5 rounded-full;
   }
+
+  /* Segmented tab control — container + item + active item */
+  .hw-segment {
+    @apply flex gap-0.5 bg-g-bg-muted/70 rounded-lg p-0.5 border border-g-border/60;
+  }
+  .hw-segment-item {
+    @apply px-3 py-1 text-xs rounded-md text-g-fg-3 transition-all duration-150
+           hover:text-g-fg active:scale-[0.97] select-none;
+  }
+  .hw-segment-item-active {
+    @apply bg-white text-g-fg font-medium shadow-gm-sm border border-g-border/70;
+  }
+
+  .section-header {
+    @apply px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wider text-g-fg-3 border-b border-g-border bg-g-bg-soft;
+  }
+
+  /* Org-tree node card hover elevation (state styles are inline in the component) */
+  .hw-org-node {
+    transition: box-shadow 0.18s ease, border-color 0.18s ease, transform 0.18s ease,
+      background-color 0.18s ease;
+  }
+  .hw-org-node:hover {
+    box-shadow: 0 2px 4px -1px rgba(23, 25, 35, 0.08), 0 8px 20px -4px rgba(23, 25, 35, 0.14);
+    transform: translateY(-1px);
+  }
 }
 
-/* ── Material Design hover elevation ── */
+/* ── Utilities ── */
 @layer utilities {
   .hover-lift {
-    @apply transition-shadow duration-200;
+    @apply transition-all duration-200;
   }
   .hover-lift:hover {
-    box-shadow: 0 2px 6px 2px rgba(60,64,67,.15), 0 1px 2px 0 rgba(60,64,67,.30);
+    box-shadow: 0 2px 4px -1px rgba(23, 25, 35, 0.06), 0 6px 14px -3px rgba(23, 25, 35, 0.1);
+    transform: translateY(-1px);
+  }
+
+  /* Tabular numerals for metrics */
+  .num {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
   }
 
   /* Frosted glass surface for floating chrome */
   .glass {
-    background: rgba(255, 255, 255, 0.78);
-    backdrop-filter: blur(10px) saturate(1.4);
-    -webkit-backdrop-filter: blur(10px) saturate(1.4);
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(12px) saturate(1.5);
+    -webkit-backdrop-filter: blur(12px) saturate(1.5);
   }
 
-  /* Soft branded tint wash */
+  /* Canvas: neutral wash + subtle dot grid (org tree / diagram surfaces) */
   .bg-app-tint {
-    background:
-      radial-gradient(1200px 500px at 15% -10%, rgba(66, 133, 244, 0.05), transparent 60%),
-      radial-gradient(900px 420px at 90% -20%, rgba(52, 168, 83, 0.04), transparent 55%),
-      #f4f6f9;
-  }
-}
-
-/* ── Section divider accent ── */
-@layer components {
-  .section-header {
-    @apply px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-g-fg-3 border-b border-g-border bg-g-bg-soft;
+    background-color: #f4f5f9;
+    background-image: radial-gradient(circle, #dde0e9 1px, transparent 1px);
+    background-size: 22px 22px;
   }
 }
