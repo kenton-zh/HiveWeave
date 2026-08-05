@@ -31,6 +31,7 @@ from hiveweave.api.debug import router as debug_router
 from hiveweave.api.tasks import router as tasks_router
 from hiveweave.api.timeline import router as timeline_router
 from hiveweave.api.system import router as system_router
+from hiveweave.api.token_usage import router as token_usage_router
 
 log = structlog.get_logger(__name__)
 
@@ -53,6 +54,7 @@ _SUB_ROUTERS = [
     tasks_router,  # /api/projects/{project_id}/tasks — Task Ledger
     timeline_router,  # /api/projects/{project_id}/timeline — 团队活动可视化
     system_router,  # /api/system/restart-backend | restart-frontend
+    token_usage_router,  # /api/projects/{project_id}/token-usage — LLM token 计量
 ]
 
 

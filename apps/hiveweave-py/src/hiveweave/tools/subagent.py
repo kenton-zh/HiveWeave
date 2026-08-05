@@ -371,6 +371,27 @@ async def _run_subagent(
     except Exception as e:  # 网络/熔断等 — 转 err，不炸父
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
+    # Token metering (F4): 子代理的 LLM usage 归属到父代理
+    # （token 由父的模型配置/账户消耗），request_type="subagent" 标记来源，
+    # run/task 沿用父的当前上下文，便于成本归因。best-effort 不阻塞。
+    rounds = result.get("usage_rounds") or []
+    if rounds:
+        try:
+            from hiveweave.services.token_meter import token_meter
+            await token_meter.record_rounds(
+                agent_id=parent.id,
+                project_id=parent.project_id,
+                run_id=getattr(parent, "_current_run_id", None),
+                task_id=getattr(parent, "_current_task_id", None),
+                rounds=rounds,
+                model_id=model_config.get("model_id"),
+                provider=model_config.get("provider_type"),
+                request_type="subagent",
+            )
+        except Exception as meter_err:
+            log.warning("subagent_token_meter_failed",
+                        parent_id=parent.id, error=str(meter_err))
+
     if result.get("status") != "ok":
         return result
     text = (result.get("content") or "").strip()

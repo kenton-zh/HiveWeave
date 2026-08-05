@@ -22,6 +22,7 @@ const NewProjectDialog = lazy(() => import("./components/NewProjectDialog"));
 const ConfirmDialog = lazy(() => import("./components/ConfirmDialog"));
 const TimelineView = lazy(() => import("./components/timeline/TimelineView"));
 const TaskTimelinePanel = lazy(() => import("./components/timeline/TaskTimelinePanel"));
+const TokenUsagePanel = lazy(() => import("./components/TokenUsagePanel"));
 import { useAppStore } from "./store";
 import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend } from "./api";
 import type { DeleteProjectResponse, Project } from "./api";
@@ -594,6 +595,18 @@ function App() {
               >
                 Timeline
               </button>
+              {selectedProjectId && (
+                <button
+                  onClick={() => setActiveView("token")}
+                  className={`px-3 py-1 text-xs rounded-full transition-all duration-200 active:scale-95 ${
+                    activeView === "token"
+                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
+                      : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
+                  }`}
+                >
+                  Token
+                </button>
+              )}
             </div>
 
             {/* Project-level start/stop button */}
@@ -635,6 +648,10 @@ function App() {
             {activeView === "tree" ? <OrgTree /> : activeView === "timeline" ? (
               <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
                 <TimelineView />
+              </Suspense>
+            ) : activeView === "token" && selectedProjectId ? (
+              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                <TokenUsagePanel key={selectedProjectId} projectId={selectedProjectId} />
               </Suspense>
             ) : (
               <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>

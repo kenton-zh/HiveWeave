@@ -64,8 +64,8 @@ export interface AgentActiveModelInfo {
 interface AppState {
   selectedAgentId: string | null;
   setSelectedAgent: (id: string | null) => void;
-  activeView: "tree" | "office" | "timeline";
-  setActiveView: (view: "tree" | "office" | "timeline") => void;
+  activeView: "tree" | "office" | "timeline" | "token";
+  setActiveView: (view: "tree" | "office" | "timeline" | "token") => void;
   rightPanelTab: "chat" | "agent" | "logs" | "goals" | "monitor" | "task" | "debug";
   setRightPanelTab: (tab: "chat" | "agent" | "logs" | "goals" | "monitor" | "task" | "debug") => void;
   // Timeline — 团队活动可视化（v4）

@@ -250,6 +250,7 @@ class Streamer(
             "tool_turn_messages": [],
             "rounds": 0,
             "usage": None,
+            "usage_rounds": [],  # token metering: 错误路径无成功轮次数据
             "error": message,
             "duration_ms": int((time.monotonic() - start_time) * 1000),
         }

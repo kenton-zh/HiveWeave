@@ -87,6 +87,10 @@ export {
   getTaskTimeline,
   getTeamActivity,
   listTasks,
+  getProjectTokenUsage,
+  getProjectTokenDaily,
+  getPlatformTokenUsage,
+  tokenRequestTypeLabel,
 } from "./api/rest";
 
 export type {
@@ -114,4 +118,7 @@ export type {
   TraceEvent,
   AgentTraces,
   TeamActivityQuery,
+  TokenUsageEntry,
+  TokenUsageSummary,
+  TokenDailyEntry,
 } from "./api/rest";
