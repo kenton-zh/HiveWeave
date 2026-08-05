@@ -187,6 +187,8 @@ PROJECT_DB_TABLES = [
         expect_report INTEGER DEFAULT 0,
         reported_up INTEGER DEFAULT 0,
         context_delivered INTEGER DEFAULT 0,
+        artifact_path TEXT,
+        context_refs TEXT,
         created_at INTEGER,
         updated_at INTEGER,
         task_id TEXT
