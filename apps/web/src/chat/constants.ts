@@ -34,7 +34,7 @@ export const CHAT_MOTION_CSS = `
 .hw-stream-cursor { animation: hw-cursor-blink 1s ease-in-out infinite; }
 .hw-status-live { animation: hw-glow-pulse 1.8s ease-out infinite; }
 .hw-thinking-shimmer {
-  background: linear-gradient(90deg, #7f8d9f 25%, #4285f4 50%, #7f8d9f 75%);
+  background: linear-gradient(90deg, #6d7482 25%, #4f46e5 50%, #6d7482 75%);
   background-size: 200% 100%;
   -webkit-background-clip: text;
   background-clip: text;

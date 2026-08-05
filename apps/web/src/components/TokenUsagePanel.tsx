@@ -32,9 +32,9 @@ function StatCard({
   accent: string;
 }) {
   return (
-    <div className="flex-1 min-w-[120px] bg-white border border-g-border rounded-gm px-4 py-3 shadow-gm-sm">
-      <div className="text-[11px] text-g-fg-3">{label}</div>
-      <div className={`text-xl font-semibold mt-0.5 font-mono ${accent}`}>{value}</div>
+    <div className="flex-1 min-w-[120px] bg-white border border-g-border rounded-gmLg px-4 py-3 shadow-gm-sm hover-lift">
+      <div className="text-[10px] font-medium uppercase tracking-wider text-g-fg-3">{label}</div>
+      <div className={`text-xl font-semibold mt-1 font-mono num ${accent}`}>{value}</div>
     </div>
   );
 }
@@ -43,20 +43,20 @@ function DailyBarChart({ entries }: { entries: TokenDailyEntry[] }) {
   if (!entries.length) return null;
   const max = Math.max(...entries.map((e) => e.total_tokens), 1);
   return (
-    <div className="flex items-end gap-1 h-24">
+    <div className="flex items-end gap-1.5 h-28 border-b border-g-border">
       {entries.map((e) => {
-        const h = Math.max(4, (e.total_tokens / max) * 100);
+        const h = Math.max(4, (e.total_tokens / max) * 96);
         return (
           <div
             key={e.day}
-            className="flex-1 flex flex-col items-center gap-1 group"
+            className="flex-1 flex flex-col items-center justify-end gap-1.5 group h-full"
             title={`${e.day}: ${fmtNum(e.total_tokens)} tokens / ${e.llm_calls} calls`}
           >
             <div
-              className="w-full rounded-t-sm bg-gradient-to-b from-g-blue to-blue-600/70 group-hover:from-violet-500 transition-all"
+              className="w-full max-w-[36px] rounded-t-[4px] bg-gradient-to-b from-indigo-400 to-g-blue group-hover:from-violet-400 group-hover:to-violet-600 transition-all"
               style={{ height: `${h}px` }}
             />
-            <span className="text-[9px] text-g-fg-4 font-mono truncate w-full text-center">
+            <span className="text-[9px] text-g-fg-4 font-mono num truncate w-full text-center">
               {e.day.slice(5)}
             </span>
           </div>
@@ -190,13 +190,13 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
           </div>
 
           {/* 每日趋势 */}
-          <div className="bg-white border border-g-border rounded-gm p-4 shadow-gm-sm">
+          <div className="bg-white border border-g-border rounded-gmLg p-4 shadow-gm-sm">
             <div className="text-xs font-medium text-g-fg mb-3">每日 token 趋势（近 30 天）</div>
             <DailyBarChart entries={daily} />
           </div>
 
           {/* 按 Agent 汇总 */}
-          <div className="bg-white border border-g-border rounded-gm shadow-gm-sm overflow-hidden">
+          <div className="bg-white border border-g-border rounded-gmLg shadow-gm-sm overflow-hidden">
             <div className="px-4 py-2.5 text-xs font-medium text-g-fg border-b border-g-border">
               按 Agent 汇总
             </div>
@@ -229,7 +229,7 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
           </div>
 
           {/* 按 agent × request_type 明细 */}
-          <div className="bg-white border border-g-border rounded-gm shadow-gm-sm overflow-hidden">
+          <div className="bg-white border border-g-border rounded-gmLg shadow-gm-sm overflow-hidden">
             <div className="px-4 py-2.5 text-xs font-medium text-g-fg border-b border-g-border">
               调用来源明细（主对话 / 压缩 / 子代理）
             </div>

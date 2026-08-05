@@ -382,14 +382,14 @@ function App() {
   };
 
   return (
-    <div className="h-screen flex flex-col bg-g-bg">
-      {/* Top Bar — Google Material header */}
-      <header className="h-14 border-b border-g-border flex items-center px-6 bg-white/90 backdrop-blur-md shadow-gm-sm shrink-0 relative z-30">
+    <div className="h-screen flex flex-col bg-g-bg-soft">
+      {/* Top Bar */}
+      <header className="h-14 border-b border-g-border flex items-center px-5 bg-white shrink-0 relative z-30">
         <div className="flex items-center gap-3 min-w-0">
-          <div className="w-8 h-8 rounded-gm bg-gradient-to-br from-g-blue to-blue-600 flex items-center justify-center shrink-0 shadow-gm-sm ring-1 ring-white/40 transition-transform duration-200 hover:scale-105">
-            <span className="text-white font-bold text-sm drop-shadow-sm">H</span>
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-g-blue to-violet-600 flex items-center justify-center shrink-0 shadow-gm-sm transition-transform duration-200 hover:scale-105">
+            <span className="text-white font-bold text-sm">H</span>
           </div>
-          <h1 className="text-lg font-semibold text-g-fg tracking-tight shrink-0 select-none">
+          <h1 className="text-[15px] font-semibold text-g-fg tracking-tight shrink-0 select-none">
             HiveWeave
           </h1>
           <ProjectTimeBadge projectId={selectedProjectId} />
@@ -399,8 +399,8 @@ function App() {
         <div className="ml-6 relative" ref={projectMenuRef}>
           <button
             onClick={() => setShowProjectMenu(!showProjectMenu)}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-gm bg-white border transition-all duration-200 text-sm text-g-fg shadow-gm-sm hover:shadow-gm-md active:scale-[0.98] ${
-              showProjectMenu ? "border-g-blue/60 ring-2 ring-g-blue/20" : "border-g-border hover:border-g-blue/40"
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-gm bg-white border transition-all duration-200 text-[13px] text-g-fg shadow-gm-sm hover:shadow-gm active:scale-[0.98] ${
+              showProjectMenu ? "border-g-blue/50 ring-2 ring-g-blue/15" : "border-g-border hover:border-g-border-strong"
             }`}
           >
             <svg className="w-4 h-4 text-g-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -462,9 +462,9 @@ function App() {
           )}
         </div>
 
-        <div className="ml-auto flex items-center gap-3">
+        <div className="ml-auto flex items-center gap-1.5">
           {/* Restart buttons */}
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-0.5 bg-g-bg-soft border border-g-border rounded-gm p-0.5">
             <button
               onClick={async () => {
                 if (!confirm("Restart backend? This will kill and relaunch the uvicorn server.")) return;
@@ -475,14 +475,13 @@ function App() {
                   showToast("Failed to trigger backend restart", "error");
                 }
               }}
-              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-full p-1.5 transition-all active:scale-90"
+              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-md p-1.5 transition-all active:scale-90"
               title="Restart Backend"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
             </button>
-            <span className="text-g-fg-4 text-xs select-none">|</span>
             <button
               onClick={async () => {
                 if (!confirm("Restart frontend? This will kill and relaunch the Vite dev server.")) return;
@@ -493,7 +492,7 @@ function App() {
                   showToast("Failed to trigger frontend restart", "error");
                 }
               }}
-              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-full p-1.5 transition-all active:scale-90"
+              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-md p-1.5 transition-all active:scale-90"
               title="Restart Frontend"
             >
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -504,7 +503,7 @@ function App() {
           {/* Model Config page (模型清单 + 层级配置) — 带文字的醒目入口 */}
           <button
             onClick={() => setShowModelConfig(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-g-blue bg-g-blue-bg/60 border border-g-blue/30 rounded-gm shadow-gm-sm hover:bg-g-blue-bg hover:border-g-blue/50 hover:shadow-gm transition-all duration-200 active:scale-[0.97]"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] font-medium text-g-fg-2 bg-white border border-g-border rounded-gm shadow-gm-sm hover:text-g-blue hover:border-g-blue/40 hover:shadow-gm transition-all duration-200 active:scale-[0.97]"
             title="模型配置"
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -558,51 +557,35 @@ function App() {
         </div>
       </header>
 
-      {/* Main Content */}
-      <div className="flex flex-1 overflow-hidden">
-        {/* Left Panel - Org Tree / Office — tinted background for visual depth */}
-        <div className="flex-1 border-r border-g-border flex flex-col bg-app-tint">
-          <div className="px-4 py-3 border-b border-g-border bg-white/80 backdrop-blur-sm flex items-center gap-3">
+      {/* Main Content — floating panels on a gray workbench */}
+      <div className="flex flex-1 overflow-hidden gap-3 p-3">
+        {/* Left Panel - Org Tree / Office */}
+        <div className="flex-1 flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden">
+          <div className="px-3 py-2.5 border-b border-g-border bg-white flex items-center gap-3">
             {/* View tabs */}
-            <div className="flex gap-1 bg-g-bg-muted rounded-full p-0.5 shadow-inner">
+            <div className="hw-segment">
               <button
                 onClick={() => setActiveView("tree")}
-                className={`px-3 py-1 text-xs rounded-full transition-all duration-200 active:scale-95 ${
-                  activeView === "tree"
-                    ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                    : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
-                }`}
+                className={`hw-segment-item ${activeView === "tree" ? "hw-segment-item-active" : ""}`}
               >
                 Org Tree
               </button>
               <button
                 onClick={() => setActiveView("office")}
-                className={`px-3 py-1 text-xs rounded-full transition-all duration-200 active:scale-95 ${
-                  activeView === "office"
-                    ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                    : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
-                }`}
+                className={`hw-segment-item ${activeView === "office" ? "hw-segment-item-active" : ""}`}
               >
                 Office
               </button>
               <button
                 onClick={() => setActiveView("timeline")}
-                className={`px-3 py-1 text-xs rounded-full transition-all duration-200 active:scale-95 ${
-                  activeView === "timeline"
-                    ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                    : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
-                }`}
+                className={`hw-segment-item ${activeView === "timeline" ? "hw-segment-item-active" : ""}`}
               >
                 Timeline
               </button>
               {selectedProjectId && (
                 <button
                   onClick={() => setActiveView("token")}
-                  className={`px-3 py-1 text-xs rounded-full transition-all duration-200 active:scale-95 ${
-                    activeView === "token"
-                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                      : "text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted"
-                  }`}
+                  className={`hw-segment-item ${activeView === "token" ? "hw-segment-item-active" : ""}`}
                 >
                   Token
                 </button>
@@ -614,10 +597,10 @@ function App() {
               <button
                 onClick={handleToggleProjectStart}
                 disabled={projectStarting}
-                className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-gm transition-all duration-200 shadow-gm-sm ml-auto hover:shadow-gm-md active:scale-[0.97] ${
+                className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full transition-all duration-200 ml-auto active:scale-[0.97] ${
                   currentProject?.isStarted
-                    ? "bg-g-green-bg text-g-green hover:bg-green-100 border border-green-200"
-                    : "bg-g-red-bg text-g-red hover:bg-red-100 border border-red-200"
+                    ? "bg-g-green-bg text-g-green border border-g-green/20 hover:border-g-green/40"
+                    : "bg-g-bg-soft text-g-fg-3 border border-g-border hover:text-g-fg hover:border-g-border-strong"
                 } disabled:opacity-50 disabled:cursor-not-allowed`}
                 title={currentProject?.isStarted ? "点击下班，暂停该项目所有 Agent" : "点击上班，启动该项目所有 Agent"}
               >
@@ -625,7 +608,7 @@ function App() {
                   {currentProject?.isStarted && (
                     <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 animate-ping-ring" />
                   )}
-                  <span className={`relative inline-flex w-2 h-2 rounded-full ${currentProject?.isStarted ? "bg-emerald-500" : "bg-red-500"}`} />
+                  <span className={`relative inline-flex w-2 h-2 rounded-full ${currentProject?.isStarted ? "bg-emerald-500" : "bg-g-fg-4"}`} />
                 </span>
                 <span>{projectStarting ? "处理中..." : currentProject?.isStarted ? "上班中" : "已下班"}</span>
               </button>
@@ -644,7 +627,7 @@ function App() {
               </button>
             )}
           </div>
-          <div className="flex-1 overflow-hidden">
+          <div className="flex-1 overflow-hidden bg-app-tint">
             {activeView === "tree" ? <OrgTree /> : activeView === "timeline" ? (
               <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
                 <TimelineView />
@@ -662,17 +645,13 @@ function App() {
         </div>
 
         {/* Right Panel - Chat / Agent / Logs */}
-        <div className="w-2/5 flex flex-col bg-white">
+        <div className="w-2/5 flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden">
           {/* Tab bar */}
-          <div className="px-4 py-2 border-b border-g-border bg-white flex items-center gap-1">
-            <div className="flex gap-1 bg-[#f4f6f9] rounded-full p-0.5 mr-2 shadow-inner">
+          <div className="px-3 py-2.5 border-b border-g-border bg-white flex items-center gap-1">
+            <div className="hw-segment mr-2">
             <button
               onClick={() => setRightPanelTab("goals")}
-              className={`px-3 py-1.5 text-xs rounded-full transition-all ${
-                rightPanelTab === "goals"
-                  ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                  : "text-g-fg-3 hover:text-g-fg"
-              }`}
+              className={`hw-segment-item ${rightPanelTab === "goals" ? "hw-segment-item-active" : ""}`}
             >
               Goals
             </button>
@@ -680,52 +659,32 @@ function App() {
               <>
                 <button
                   onClick={() => setRightPanelTab("chat")}
-                  className={`px-3 py-1.5 text-xs rounded-full transition-all ${
-                    rightPanelTab === "chat"
-                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                      : "text-g-fg-3 hover:text-g-fg"
-                  }`}
+                  className={`hw-segment-item ${rightPanelTab === "chat" ? "hw-segment-item-active" : ""}`}
                 >
                   Chat
                 </button>
                 <button
                   onClick={() => setRightPanelTab("agent")}
-                  className={`px-3 py-1.5 text-xs rounded-full transition-all ${
-                    rightPanelTab === "agent"
-                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                      : "text-g-fg-3 hover:text-g-fg"
-                  }`}
+                  className={`hw-segment-item ${rightPanelTab === "agent" ? "hw-segment-item-active" : ""}`}
                 >
                   Agent
                 </button>
                 <button
                   onClick={() => setRightPanelTab("logs")}
-                  className={`px-3 py-1.5 text-xs rounded-full transition-all ${
-                    rightPanelTab === "logs"
-                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                      : "text-g-fg-3 hover:text-g-fg"
-                  }`}
+                  className={`hw-segment-item ${rightPanelTab === "logs" ? "hw-segment-item-active" : ""}`}
                 >
                   Logs
                 </button>
                 <button
                   onClick={() => setRightPanelTab("monitor")}
-                  className={`px-3 py-1.5 text-xs rounded-full transition-all ${
-                    rightPanelTab === "monitor"
-                      ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                      : "text-g-fg-3 hover:text-g-fg"
-                  }`}
+                  className={`hw-segment-item ${rightPanelTab === "monitor" ? "hw-segment-item-active" : ""}`}
                 >
                   监控
                 </button>
                 {selectedAgentId && (
                   <button
                     onClick={() => setRightPanelTab("debug")}
-                    className={
-                      rightPanelTab === "debug"
-                        ? "bg-white text-g-blue shadow-gm-sm font-medium px-3 py-1.5 text-xs rounded-full"
-                        : "text-g-fg-3 hover:text-g-fg px-3 py-1.5 text-xs rounded-full"
-                    }
+                    className={`hw-segment-item ${rightPanelTab === "debug" ? "hw-segment-item-active" : ""}`}
                   >
                     调试
                   </button>
@@ -735,11 +694,7 @@ function App() {
             {selectedTaskId && (
               <button
                 onClick={() => setRightPanelTab("task")}
-                className={`px-3 py-1.5 text-xs rounded-full transition-all ${
-                  rightPanelTab === "task"
-                    ? "bg-white text-g-blue shadow-gm-sm font-medium"
-                    : "text-g-fg-3 hover:text-g-fg"
-                }`}
+                className={`hw-segment-item ${rightPanelTab === "task" ? "hw-segment-item-active" : ""}`}
               >
                 任务
               </button>
