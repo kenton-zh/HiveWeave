@@ -1,6 +1,7 @@
 """Close, merge gate, archive, wait-contract clear."""
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -18,6 +19,10 @@ from .errors import MergeRequiredError
 from .verify import VerificationCaseService  # noqa: F401
 
 log = structlog.get_logger(__name__)
+
+# 持有 fire-and-forget 记忆任务引用，防止 GC/loop 关闭时静默取消
+# （P2-1：async 生命周期卫生，对齐孤儿 streaming 纪律）。
+_task_memory_pending: set["asyncio.Task"] = set()
 
 
 class CloseMixin:
@@ -84,6 +89,25 @@ class CloseMixin:
         except Exception as e:
             log.warning(
                 "obligation.reconcile_closed_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+
+        # 任务完成记忆：异步 best-effort 为 assignee LLM 总结并写一条记忆。
+        # 绝不影响 close 主流程与账本；失败只记日志（内含幂等与降级）。
+        try:
+            from hiveweave.services.task_memory import (
+                maybe_write_task_completion_memory,
+            )
+
+            task_handle = asyncio.create_task(
+                maybe_write_task_completion_memory(project_id, task_id)
+            )
+            _task_memory_pending.add(task_handle)
+            task_handle.add_done_callback(_task_memory_pending.discard)
+        except Exception as e:
+            log.warning(
+                "task_memory_schedule_failed",
                 task_id=task_id,
                 error=str(e),
             )
