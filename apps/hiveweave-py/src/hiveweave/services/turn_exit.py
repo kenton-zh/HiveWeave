@@ -755,12 +755,26 @@ async def pre_check_exit_gates(
 
         # 1. Unreplied asks — contract-based (TEST14 P1a), not read=0.
         #    read≠replied: marking read must not clear the reply obligation.
+        #    口径需与 backstop (collect_unreplied_asks) 对齐：backstop 允许
+        #    "已向 sender 发过消息" 即放行（:196 fallback）。预检若纯合约口径
+        #    会误拒走普通 send_message 回复的 agent → 撞门循环（二审 R1）。
+        #    这里补充近 30 分钟已送达收件人豁免，与 backstop fallback 同款。
         try:
             from hiveweave.services.inbox import InboxService
 
-            senders = await InboxService().get_outstanding_ask_senders(agent_id)
+            inbox = InboxService()
+            senders = await inbox.get_outstanding_ask_senders(agent_id)
             if senders:
-                violations.append("UNREPLIED_ASKS")
+                import time as _ts
+
+                _sent = await inbox.get_sent_recipients_since(
+                    agent_id, int(_ts.time() * 1000) - 30 * 60 * 1000
+                )
+                # 已向 outstanding sender 发过消息即视为已回复（与 backstop
+                # 的 replied_to fallback 语义一致），从违规集合中剔除。
+                outstanding = senders - _sent
+                if outstanding:
+                    violations.append("UNREPLIED_ASKS")
         except Exception as e:
             log.debug("pre_check_unreplied_asks_failed", error=str(e))
 

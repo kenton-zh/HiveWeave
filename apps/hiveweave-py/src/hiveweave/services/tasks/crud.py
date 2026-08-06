@@ -112,6 +112,22 @@ class CrudMixin:
             if resolved_parent:
                 parent_task_id = resolved_parent
 
+        # P0-4: normalize depends_on the same way. obligation.py uses exact
+        # membership (`fulfilled_task_id not in deps` / `WHERE id IN (...)`),
+        # so a short prefix stored verbatim would never match the full UUID
+        # fulfilled_task_id → blocked tasks never unblock. resolve each entry;
+        # unresolvable refs keep their raw value (fail-open, matches
+        # canonical_task_id semantics).
+        if depends_on:
+            _resolved_deps: list[str] = []
+            for dep in depends_on:
+                dep = str(dep or "").strip()
+                if not dep:
+                    continue
+                _r = await self.resolve_task_id(project_id, dep)
+                _resolved_deps.append(_r or dep)
+            depends_on = _resolved_deps
+
         contract_blob = None
         if contract_json is not None:
             from hiveweave.services.task_contract import (

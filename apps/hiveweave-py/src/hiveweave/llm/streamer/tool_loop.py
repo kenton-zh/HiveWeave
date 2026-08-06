@@ -522,7 +522,8 @@ class ToolLoopMixin:
                     messages.append({
                         "role": "system",
                         "content": (
-                            f"[STALL BREAK] {stall_count} consecutive tool-loop "
+                            f"[STALL BREAK] {max(stall_count, readonly_stall_count)} "
+                            "consecutive tool-loop "
                             "rounds made no progress (only readonly / failed / "
                             "duplicate tools). Stop polling. Call commit_turn "
                             "now (waiting/blocked/done_slice) or change approach "
@@ -537,7 +538,8 @@ class ToolLoopMixin:
                     if not final_text:
                         final_text = (
                             "[STALL BREAK] No progress for "
-                            f"{stall_count} rounds — turn ended."
+                            f"{max(stall_count, readonly_stall_count)} rounds — "
+                            "turn ended."
                         )
                     tool_turn_acc.append(
                         {"role": "assistant", "content": final_text}

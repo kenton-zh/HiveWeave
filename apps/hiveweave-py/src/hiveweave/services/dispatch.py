@@ -159,6 +159,14 @@ class DispatchService:
         #    命名稳定化），所以建账必须先于 ensure_executor_worktree。
         #    如果传入了 existing_task_id，复用已有 task 而不是创建新的
         if existing_task_id:
+            # P0-3: resolve short prefix / dashed id first. get_task tolerates
+            # prefixes (archive check passes) but update_task below does a raw
+            # `WHERE id = ?` — a short prefix would silently match 0 rows and
+            # the assignee would never change. require_task_id raises on
+            # unknown/ambiguous refs.
+            existing_task_id = await self.task_service.require_task_id(
+                project_id, existing_task_id
+            )
             task_id = existing_task_id
             # B3: 归档任务写保护 —— 不可对已归档任务 dispatch
             existing = await self.task_service.get_task(project_id, task_id)
