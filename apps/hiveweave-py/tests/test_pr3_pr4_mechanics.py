@@ -103,6 +103,13 @@ async def test_update_progress_never_decreases():
         patch("hiveweave.services.task._ensure_schema", AsyncMock()),
         patch("hiveweave.services.task._query", side_effect=fake_query),
         patch("hiveweave.services.task._execute", side_effect=fake_execute),
+        # P0-2: update_progress now resolves short/raw refs via require_task_id
+        # before the SELECT+UPDATE; mock it so the test keeps asserting the
+        # "never decrease" floor against a resolved id.
+        patch.object(
+            ts, "require_task_id",
+            AsyncMock(side_effect=lambda pid, ref: ref),
+        ),
     ):
         await ts.update_progress("pid", "tid", 50)
 
