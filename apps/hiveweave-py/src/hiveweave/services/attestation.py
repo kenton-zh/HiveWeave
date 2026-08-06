@@ -75,6 +75,73 @@ _TEST_COMMAND_RE = re.compile(
 
 DEFAULT_MAX_AGE_MS = 24 * 60 * 60 * 1000
 
+# ── Task-id normalization (root cause: short-id prefixes stored verbatim) ──
+# Agents routinely pass the 8-char prefix shown in get_tasks instead of the
+# full UUID. Attestations wrote that value straight into tool_attestations.task_id,
+# so every later exact-match against the full UUID failed (submit gate 49%
+# failure, review evidence gate, MATCH-but-mismatch hints). All write + compare
+# paths now normalize to the canonical full UUID.
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
+)
+
+# A plausible short-id / dotted UUID reference: 8-32 hex chars (short prefix
+# or full UUID with dashes stripped). Anything else is NOT a task id — skip
+# the DB round-trip entirely (avoids hangs on non-task refs like "task-1").
+_HEX_REF_RE = re.compile(r"^[0-9a-fA-F]{8,32}$")
+
+
+def _norm_task_ref(s: str | None) -> str:
+    """Lowercase + dash-strip a task id string (dash-insensitive equality)."""
+    return (str(s or "").strip().lower()).replace("-", "")
+
+
+def _is_full_uuid(s: str) -> bool:
+    return bool(_UUID_RE.fullmatch(str(s or "").strip()))
+
+
+async def canonical_task_id(project_id: str, task_id: str | None) -> str | None:
+    """Resolve a task id (full UUID or 8-char short prefix) to the canonical
+    full UUID (dash-stripped, lowercase).
+
+    Fail-open: only canonicalize when the value is a real resolvable UUID
+    (full or short-prefix). When it cannot be resolved to a UUID (task gone,
+    ambiguous, or a non-UUID synthetic id), return the raw value unchanged —
+    never dash-strip it (that would corrupt ids like "t-invalidate-3" into
+    "tinvalidate3"). Never raises — attestation logic must not break on a
+    weird reference.
+    """
+    if not task_id:
+        return None
+    raw = str(task_id).strip()
+    if not raw:
+        return None
+    if _is_full_uuid(raw):
+        return _norm_task_ref(raw)
+    # Not a UUID-shaped reference (short prefix or full UUID) — return the raw
+    # value unchanged WITHOUT a DB round-trip. Guard prevents hangs when a
+    # non-task ref (e.g. "task-1") flows through a canonicalization call.
+    if not _HEX_REF_RE.fullmatch(raw):
+        return raw
+    try:
+        from hiveweave.services.task import TaskService
+
+        resolved = await TaskService().require_task_id(project_id, raw)
+        if resolved:
+            return _norm_task_ref(resolved)
+    except Exception:
+        pass
+    return raw
+
+
+async def _task_ids_equal(project_id: str, a: str | None, b: str | None) -> bool:
+    """Equality that treats short-id prefixes and full UUIDs as the same task."""
+    ca = await canonical_task_id(project_id, a)
+    cb = await canonical_task_id(project_id, b)
+    if ca is not None and cb is not None:
+        return ca == cb
+    return _norm_task_ref(a) == _norm_task_ref(b)
+
 
 async def _conn(project_id: str) -> aiosqlite.Connection:
     """Resolve project_id to per-project DB connection.
@@ -149,6 +216,11 @@ class AttestationService:
                 else artifact_hashes
             )
         ch = commit_hash if commit_hash is not None else commit
+        # Root cause: store the canonical full UUID so later exact-match gates
+        # (submit verify, review evidence, core-interaction) never fail on a
+        # short-id prefix the agent passed at creation time.
+        if task_id:
+            task_id = await canonical_task_id(project_id, task_id)
         await conn.execute(
             "INSERT INTO tool_attestations "
             "(id, tool_call_id, task_id, agent_id, kind, command_or_url, "
@@ -241,7 +313,11 @@ class AttestationService:
                 # Only enforce agent match for agent-scoped attestations
                 # (no task_id on the row).
                 row_task = row.get("task_id") or ""
-                if not (task_id and row_task and row_task == task_id):
+                if not (
+                    task_id
+                    and row_task
+                    and await _task_ids_equal(project_id, task_id, row_task)
+                ):
                     return (
                         False,
                         f"Attestation agent mismatch: {aid} "
@@ -254,7 +330,9 @@ class AttestationService:
                     False,
                     f"Attestation kind '{kind}' not in expected {sorted(kinds_ok)}",
                 )
-            if task_id and row.get("task_id") and row.get("task_id") != task_id:
+            if task_id and row.get("task_id") and not await _task_ids_equal(
+                project_id, task_id, row.get("task_id")
+            ):
                 return False, f"Attestation task_id mismatch: {aid}"
             if not row.get("stdout_hash"):
                 return False, f"Attestation missing stdout_hash: {aid}"
@@ -327,12 +405,24 @@ class AttestationService:
         await cur.close()
         if not rows:
             return []
+        # Normalize task_id so legacy short-id rows and canonical storage both
+        # match the (possibly dotted/short) caller reference. canonical_task_id
+        # returns the raw ref unchanged for non-UUID ids (e.g. "task-1"), so we
+        # always dash-strip/lowercase the result — otherwise a dashed non-UUID
+        # ref would never equal its own normalized row task_id.
+        canonical_tid = (
+            _norm_task_ref(
+                (await canonical_task_id(project_id, task_id)) or task_id
+            )
+            if task_id
+            else None
+        )
         matched: list[str] = []
         fallback: list[str] = []
         for r in rows:
             rid = r["id"]
             tid = r["task_id"] or ""
-            if task_id and tid == task_id:
+            if canonical_tid and _norm_task_ref(tid) == canonical_tid:
                 matched.append(rid)
             elif not tid:
                 fallback.append(rid)
@@ -495,6 +585,9 @@ async def get_valid_waiver(
         conn = await _conn(project_id)
     except ProjectDbError:
         return None
+    # Normalize the lookup key to the same canonical form `create()` stored
+    # (full UUID, dash-stripped) so lookups never miss on dotted vs short ids.
+    tid = await canonical_task_id(project_id, task_id) or str(task_id)
     now = int(time.time() * 1000)
     cur = await conn.execute(
         "SELECT id, agent_id, task_id, kind, created_at, expires_at, "
@@ -503,7 +596,7 @@ async def get_valid_waiver(
         "WHERE project_id = ? AND task_id = ? AND kind = ? "
         "AND (expires_at IS NULL OR expires_at > ?) "
         "ORDER BY created_at DESC LIMIT 1",
-        [project_id, task_id, WAIVER_KIND, now],
+        [project_id, tid, WAIVER_KIND, now],
     )
     row = await cur.fetchone()
     await cur.close()
@@ -522,10 +615,11 @@ async def count_waivers(project_id: str, task_id: str | None) -> int:
         conn = await _conn(project_id)
     except ProjectDbError:
         return 0
+    tid = await canonical_task_id(project_id, task_id) or str(task_id)
     cur = await conn.execute(
         "SELECT COUNT(*) AS c FROM tool_attestations "
         "WHERE project_id = ? AND task_id = ? AND kind = ?",
-        [project_id, task_id, WAIVER_KIND],
+        [project_id, tid, WAIVER_KIND],
     )
     row = await cur.fetchone()
     await cur.close()
@@ -554,12 +648,13 @@ async def invalidate_valid_waivers(project_id: str, task_id: str | None) -> int:
         conn = await _conn(project_id)
     except ProjectDbError:
         return 0
+    tid = await canonical_task_id(project_id, task_id) or str(task_id)
     now = int(time.time() * 1000)
     cur = await conn.execute(
         "UPDATE tool_attestations SET expires_at = ? "
         "WHERE project_id = ? AND task_id = ? AND kind = ? "
         "AND (expires_at IS NULL OR expires_at > ?)",
-        [now, project_id, task_id, WAIVER_KIND, now],
+        [now, project_id, tid, WAIVER_KIND, now],
     )
     retired = cur.rowcount or 0
     await conn.commit()
@@ -608,21 +703,30 @@ async def find_core_interaction_attestation(
         getattr(settings, "attestation_max_age_ms", None) or DEFAULT_MAX_AGE_MS
     )
     min_created = now - max_age
+    # Canonicalize so we match the (now canonical) stored task_id; also try the
+    # raw reference for legacy short-id rows.
+    canonical_tid = await canonical_task_id(project_id, task_id) or task_id
+    refs = [canonical_tid, _norm_task_ref(task_id)]
+    agent_clause = ""
     params: list[Any] = [
         project_id,
-        task_id,
+        *refs,
         BROWSE_E2E_KIND,
         now,
         min_created,
         "%[core_interaction=1]%",
     ]
-    agent_clause = ""
     if agent_id:
         agent_clause = "AND agent_id = ? "
         params.append(agent_id)
+    task_clause = " AND task_id IN ({}) ".format(
+        ",".join("?" for _ in refs)
+    )
     cur = await conn.execute(
         "SELECT id FROM tool_attestations "
-        "WHERE project_id = ? AND task_id = ? AND kind = ? "
+        "WHERE project_id = ? "
+        f"{task_clause}"
+        "AND kind = ? "
         "AND (expires_at IS NULL OR expires_at > ?) "
         "AND created_at >= ? "
         "AND command_or_url LIKE ? "
@@ -815,16 +919,22 @@ async def find_reviewer_attestation(
             task_ids.append(t)
     try:
         agent_ph = ",".join("?" for _ in agent_ids)
-        task_ph = ",".join("?" for _ in task_ids)
         cur = await db.execute(
-            "SELECT kind, exit_code, agent_id FROM tool_attestations "
-            f"WHERE task_id IN ({task_ph}) AND agent_id IN ({agent_ph}) "
+            "SELECT kind, exit_code, agent_id, task_id FROM tool_attestations "
+            f"WHERE agent_id IN ({agent_ph}) "
             "AND (expires_at IS NULL OR expires_at > ?) "
             "AND kind != 'waiver'",
-            [*task_ids, *agent_ids, now_ms],
+            [*agent_ids, now_ms],
         )
         _rows = await cur.fetchall()
         await cur.close()
+        # Normalize task binding: match by canonical id so legacy rows whose
+        # task_id was stored as a short-id prefix still satisfy the gate.
+        canonical_task_set: set[str] = set()
+        for tid in task_ids:
+            c = await canonical_task_id(project_id, tid)
+            if c:
+                canonical_task_set.add(c)
         for row in _rows:
             kind = row["kind"] if "kind" in row.keys() else ""
             if kind not in kinds:
@@ -833,6 +943,14 @@ async def find_reviewer_attestation(
                 ec = row["exit_code"]
                 if ec is not None and int(ec) != 0:
                     continue
+            row_task = row["task_id"] if "task_id" in row.keys() else None
+            if row_task:
+                rc = await canonical_task_id(project_id, row_task)
+                if rc and rc not in canonical_task_set:
+                    continue
+            elif task_ids:
+                # Unbound attestation does not satisfy a task-scoped gate.
+                continue
             return True
     except Exception:
         pass
@@ -885,9 +1003,36 @@ async def list_reviewer_attestations_diag(
         out.append({
             "id": row["id"] if "id" in row.keys() else "",
             "kind": kind,
-            "task_id": row["task_id"] if "task_id" in row.keys() else None,
+            "task_id": (
+                await canonical_task_id(
+                    project_id, row["task_id"] if "task_id" in row.keys() else None
+                )
+                if "task_id" in row.keys() and row["task_id"]
+                else None
+            ),
         })
     return out
+
+
+def _task_refs_match(a: str, b: str) -> bool:
+    """Dash/case-insensitive equals OR short-id prefix relationship.
+
+    The platform's short id is the 8-char UUID prefix agents copy from
+    get_tasks. A legacy attestation row stores exactly that prefix, so a
+    naive `_norm_task_ref` equality (full-UUID only) would label a genuinely
+    same-task row as ``mismatch`` — the self-contradictory hint the audit
+    found. Match when equal or when one is a prefix of the other.
+    """
+    na = _norm_task_ref(a)
+    nb = _norm_task_ref(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    # short-id prefix relationship (8+ chars each)
+    if len(na) >= 8 and len(nb) >= 8:
+        return na.startswith(nb) or nb.startswith(na)
+    return False
 
 
 def format_attestation_mismatch_hint(
@@ -906,7 +1051,11 @@ def format_attestation_mismatch_hint(
         bound = h.get("task_id") or "(unbound)"
         hid = str(h.get("id") or "")[:8]
         kind = h.get("kind") or "?"
-        match = "MATCH" if str(bound) == str(target_task_id) else "mismatch"
+        match = (
+            "MATCH"
+            if _task_refs_match(bound, target_task_id)
+            else "mismatch"
+        )
         lines.append(
             f"  - {kind} id={hid}… bound_task={str(bound)[:8]} ({match})"
         )
@@ -1034,6 +1183,11 @@ async def check_verify_baseline(
     except ProjectDbError:
         return None
     now = int(time.time() * 1000)
+    # `create()` stores task_id in canonical (dash-stripped, lowercase) form;
+    # query with the same canonical key so the VERIFY baseline gate never
+    # misses on the dotted id the task ledger carries (attestation short-id
+    # normalization audit — otherwise this gate is silently disabled).
+    canonical_tid = (await canonical_task_id(project_id, tid)) or tid
     cur = await conn.execute(
         "SELECT id, kind, commit_hash, exit_code FROM tool_attestations "
         "WHERE project_id = ? AND task_id = ? "
@@ -1041,7 +1195,7 @@ async def check_verify_baseline(
         "AND (expires_at IS NULL OR expires_at > ?) "
         "AND (exit_code IS NULL OR exit_code = 0) "
         "ORDER BY created_at DESC LIMIT 20",
-        [project_id, tid, now],
+        [project_id, canonical_tid, now],
     )
     rows = await cur.fetchall()
     await cur.close()

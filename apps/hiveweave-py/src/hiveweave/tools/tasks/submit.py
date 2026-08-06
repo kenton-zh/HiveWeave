@@ -356,9 +356,10 @@ async def submit_task_tool(
                         f"submit_task(taskId=\"{task_id}\", "
                         f"attestationIds=[...]).\n"
                     )
+                full_tid = task.get("id") or task_id
                 return ToolResult.err(
                     f"submit_task attestation gate failed ({policy_id}): {err}. "
-                    f"taskId={task_id} (use this full id).\n"
+                    f"taskId={full_tid} (use this full id).\n"
                     f"Options:\n"
                     + opt1
                     + (

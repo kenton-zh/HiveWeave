@@ -419,10 +419,34 @@ class InboxService:
                         if r["reply_contract_id"]
                     }
                     rt = (reply_to or "").strip()
-                    match = any(
-                        cid == rt or cid.startswith(rt) or rt.startswith(cid[:12])
-                        for cid in known_set
-                        if cid
+                    # P0-5 治本：reply_to 前缀归一化。agent 常传 gate 提示里的
+                    # contract 前 12 位前缀；若原样落库，查询侧
+                    # get_outstanding_ask_senders 用 `reply_to IN (full_uuid)`
+                    # 精确匹配会 miss → 假 UNREPLIED_ASKS → commit_turn 死锁。
+                    # 这里在 known_set（收件人→发送方方向的全部合同）里唯一前缀
+                    # 命中则替换为完整 contract id——一处归一化，所有读取侧受益。
+                    if rt and known_set and rt not in known_set:
+                        _prefix_matches = [
+                            c for c in known_set if c and c.startswith(rt)
+                        ]
+                        if len(_prefix_matches) == 1:
+                            reply_to = _prefix_matches[0]
+                            rt = reply_to
+                            log.info(
+                                "inbox_reply_to_prefix_resolved",
+                                from_agent_id=from_agent_id,
+                                to_agent_id=to_agent_id,
+                                contract=rt[:8],
+                            )
+                    match = bool(
+                        rt
+                        and any(
+                            cid == rt
+                            or cid.startswith(rt)
+                            or rt.startswith(cid[:12])
+                            for cid in known_set
+                            if cid
+                        )
                     )
                     if not match:
                         log.warning(

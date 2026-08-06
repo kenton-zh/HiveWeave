@@ -275,6 +275,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("tool_output_cleanup_init_failed", error=str(e))
 
+    # R4: token_utils 的 %TEMP%/hiveweave_tool_output/ 存盘点此前无任何清理
+    # 调用方（同一平台两套存盘点，一套有 GC 一套没有）。与 executor 版一起
+    # 在启动时清理 7 天前文件。
+    try:
+        from hiveweave.conversation.token_utils import cleanup_tool_outputs
+        cleanup_tool_outputs()
+        log.info("token_tool_outputs_cleaned")
+    except Exception as e:
+        log.warning("token_tool_output_cleanup_failed", error=str(e))
+
     # 2b-migration: Legacy agent migration from meta_db to per-project DB
     # has been removed. The old 'agents' table and 'agent_index' table are
     # cleaned up by _migrate_meta_schema() in meta.py (DROP TABLE IF EXISTS).

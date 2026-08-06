@@ -98,11 +98,21 @@ async def get_tasks_tool(
                 WAIVER_KIND,
                 _conn as _attestation_conn,
                 attestation_service,
+                canonical_task_id,
             )
             import time as _time
 
             await attestation_service.ensure_schema(project_id)
-            tids = [str(t.get("id") or "") for t in tasks if t.get("id")]
+            # Normalize task ids to the same canonical form `create()` stored
+            # (full UUID, dash-stripped) so the IN-match never misses on the
+            # dashed form agents/tasks table carry.
+            tids: list[str] = []
+            for t in tasks:
+                tid = str(t.get("id") or "")
+                if not tid:
+                    continue
+                ctid = await canonical_task_id(project_id, tid) or tid
+                tids.append(ctid)
             if tids:
                 placeholders = ",".join(["?"] * len(tids))
                 now_ms = int(_time.time() * 1000)
@@ -120,9 +130,9 @@ async def get_tasks_tool(
                 rows = await cur.fetchall()
                 await cur.close()
                 for r in rows:
-                    tid = str(r["task_id"]) if "task_id" in r.keys() else None
-                    if tid and tid not in waiver_by_task:
-                        waiver_by_task[tid] = {
+                    stored_tid = str(r["task_id"]) if "task_id" in r.keys() else None
+                    if stored_tid and stored_tid not in waiver_by_task:
+                        waiver_by_task[stored_tid] = {
                             "waived_by": str(r["agent_id"]) if "agent_id" in r.keys() else None,
                             "waiver_expires_at": r["expires_at"] if "expires_at" in r.keys() else None,
                         }
@@ -143,22 +153,29 @@ async def get_tasks_tool(
         except Exception:
             pass
         for t in tasks:
-            tid = str(t.get("id") or "")
+            tk = str(t.get("id") or "")
             lines.append(
                 f"- [{t.get('status', '?')}] {t.get('title', '?')} "
-                f"(id={tid}, short={tid[:8]}, "
+                f"(id={tk}, short={tk[:8]}, "
                 f"progress={t.get('progress', 0)}%, "
                 f"assignee={t.get('assignee_id') or 'unassigned'})"
             )
-            wv = waiver_by_task.get(tid)
+            # waiver_by_task is keyed by the canonical (dash-stripped) form that
+            # `create_waiver` stored — look up with the same canonical key so the
+            # dotted task id never misses (P0-1 waiver visibility regression).
+            wv = waiver_by_task.get(
+                (await canonical_task_id(project_id, tk)) or tk
+            )
             if wv:
-                wname = waver_names.get(wv.get("waived_by"), str(wv.get("waived_by") or "?")[:8])
+                wname = waver_names.get(
+                    str(wv.get("waived_by")), str(wv.get("waived_by") or "?")[:8]
+                )
                 lines.append(
                     f"    waiver: waived_by={wname} "
                     f"expires_at={wv.get('waiver_expires_at')} "
                     f"(waived_by CANNOT approve; rework clears waiver)"
                 )
-            case = case_by_verify.get(tid) or case_by_original.get(tid)
+            case = case_by_verify.get(tk) or case_by_original.get(tk)
             if case:
                 notes = (case.get("review_notes") or "").replace("\n", " ")[:120]
                 lines.append(

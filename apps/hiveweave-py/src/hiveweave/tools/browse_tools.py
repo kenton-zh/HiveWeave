@@ -22,6 +22,11 @@ log = structlog.get_logger(__name__)
 # the field itself is the structured assertion evidence).
 _VISUAL_OBSERVED_MIN = 40
 
+# gstack `js` evaluates its arg as an inline expression. Expressions up to this
+# length are passed directly; larger ones are materialised to a tempfile and run
+# via `eval` to stay clear of Windows argv limits.
+_INLINE_JS_DIRECT_MAX = 4000
+
 
 def _is_path_stub_observed(observed: str, screenshot_path: str) -> bool:
     """True when ``observed`` is basically the path/basename (language-agnostic).
@@ -341,14 +346,23 @@ async def browse_exec(
     await asyncio.to_thread(_reap_orphan_browse_daemons_once)
 
     argv = [str(a) for a in argv]
+    # gstack contract: `js`/`evaluate` = inline expression, `eval` = file path.
+    # Map `evaluate` → `js`; leave `eval` as-is (file semantics). Do NOT collapse
+    # `eval` to `js` — `_materialize_inline_js` routes inline snippets to the
+    # correct subcommand, and mapping `eval`→`js` fed a tempfile path to `js`,
+    # which evaluated the *path string* instead of the code (evaluate 1+1 crash).
     if argv and (argv[0] or "").lower() == "evaluate":
         argv = ["js", *argv[1:]]
-    if argv and (argv[0] or "").lower() == "eval":
-        argv = ["js", *argv[1:]]
 
-    # TEST6 P0-1: gstack ``js`` treats arg as a file path. Inline expressions
-    # (what agents write after gate hints) must be materialised to a tempfile.
-    argv = _materialize_inline_js(argv, workspace)
+    # TEST6 P0-1: gstack ``js`` evaluates its arg as an inline expression.
+    # Materialise only for `eval` (which reads a file), never for `js`.
+    # P0/R3: _materialize_inline_js may spawn a tempfile (hw_browse_*.js) for
+    # very large inline snippets; track it so browse_exec can unlink it after
+    # the subprocess exits — otherwise %TEMP% accumulates one file per large
+    # browse call (no GC anywhere in the repo).
+    _tmp_path = _materialize_with_tmp(argv, workspace)
+    argv = _tmp_path[0]
+    _tmp_file = _tmp_path[1]
 
     timeout = max(5, min(int(timeout_sec or 60), 300))
     head = (argv[0] or "").lower().replace("-", "_") if argv else ""
@@ -362,65 +376,97 @@ async def browse_exec(
     cwd = workspace if workspace and Path(workspace).is_dir() else None
     from hiveweave.util.win_subprocess import windows_no_window_kwargs
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-        env=_browse_child_env(agent_id),
-        **windows_no_window_kwargs(),
-    )
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=_browse_child_env(agent_id),
+            **windows_no_window_kwargs(),
         )
-    except asyncio.TimeoutError:
         try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        return -1, "", f"browse timed out after {timeout}s: {' '.join(argv)}"
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return -1, "", f"browse timed out after {timeout}s: {' '.join(argv)}"
 
-    stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
-    stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
-    code = proc.returncode if proc.returncode is not None else -1
-    return code, stdout, stderr
+        stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
+        stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
+        code = proc.returncode if proc.returncode is not None else -1
+        return code, stdout, stderr
+    finally:
+        if _tmp_file:
+            try:
+                os.unlink(_tmp_file)
+            except OSError:
+                pass
 
 
 def _materialize_inline_js(argv: list[str], workspace: str) -> list[str]:
-    """If ``js <src>`` is not an existing file, write inline JS to a tempfile."""
+    """Route `js`/`eval`/`evaluate` args to the correct gstack subcommand.
+
+    gstack contract (read-commands.ts):
+      js <expr>   -> evaluates the arg as an inline expression
+      eval <file> -> reads a file path, then evaluates its contents
+
+    The old code materialised every inline snippet to a tempfile and passed
+    `js <tempfile>` — gstack then evaluated the *tempfile path string* instead
+    of the code, so `evaluate 1+1` returned the path (and game_run_case's probe
+    JS was never executed). Now:
+      - js/evaluate: pass the inline expression straight through.
+      - eval: keep a real file, or materialise an inline snippet to a tempfile.
+    A `js/evaluate` arg that happens to be an existing file is rerouted to
+    `eval` so file-based usage still works with the correct semantics.
+    """
+    return _materialize_with_tmp(argv, workspace)[0]
+
+
+def _materialize_with_tmp(argv: list[str], workspace: str) -> tuple[list[str], str | None]:
+    """Like :func:`_materialize_inline_js` but also returns the tempfile path
+    created by ``mkstemp`` (or ``None``), so the caller can unlink it after the
+    subprocess exits (fixes the %TEMP% hw_browse_*.js leak — no GC elsewhere).
+    """
     import tempfile
 
     if len(argv) < 2:
-        return argv
+        return argv, None
     head = (argv[0] or "").lower()
     if head not in ("js", "eval", "evaluate"):
-        return argv
+        return argv, None
     src = argv[1] or ""
-    # Already a real file (absolute or workspace-relative)
+    is_inline = head in ("js", "evaluate")
+
+    # Real file (absolute or workspace-relative).
     candidates = [Path(src)]
     if workspace:
         candidates.append(Path(workspace) / src)
     for p in candidates:
         try:
             if p.is_file():
-                out = list(argv)
-                out[0] = "js"
-                out[1] = str(p.resolve())
-                return out
+                return ["eval", str(p.resolve())], None
         except OSError:
             continue
-    # Inline expression / snippet → tempfile
+
+    if is_inline:
+        # Small expressions go straight through (gstack `js` evaluates them).
+        # Very large / multi-line snippets risk Windows argv limits — route
+        # them through a tempfile with `eval` (which reads the file).
+        if len(src) <= _INLINE_JS_DIRECT_MAX:
+            return ["js", src], None
+    # `eval` expects a file path — materialise the inline snippet to a tempfile.
     try:
         fd, path = tempfile.mkstemp(prefix="hw_browse_", suffix=".js")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(src)
-        out = list(argv)
-        out[0] = "js"
-        out[1] = path
-        return out
+        return ["eval", path], path
     except OSError:
-        return argv
+        return ["js", src], None
 
 
 def browse_missing_bin_hint() -> str:
@@ -726,6 +772,7 @@ async def assert_visual_tool(
                     from hiveweave.services.worktree_review import (
                         project_main_workspace,
                     )
+                    from hiveweave.tools.bash import _is_under_or_same
 
                     _task = await TaskService().get_task(project_id, task_id)
                     if _task and TaskService._is_verify_task(_task):

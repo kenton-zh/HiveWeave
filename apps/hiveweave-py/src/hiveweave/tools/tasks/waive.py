@@ -164,7 +164,16 @@ async def waive_attestation_tool(
             f"Allowed: {sorted(WAIVER_EVIDENCE_KINDS)}."
         )
     ev_task = ev.get("task_id")
-    if not ev_task or str(ev_task) != str(params.task_id):
+    # Evidence rows created after the short-id normalization fix store the
+    # canonical dash-stripped task id; agents pass the dashed UUID or 8-char
+    # prefix shown by get_tasks. Raw string equality would REJECT both normal
+    # forms (2nd-audit C1: escape hatch sealed shut) — compare via the
+    # normalizing helper instead.
+    from hiveweave.services.attestation import _task_ids_equal
+
+    if not ev_task or not await _task_ids_equal(
+        project_id, params.task_id, str(ev_task)
+    ):
         return ToolResult.err(
             f"evidenceAttestationId must be bound to this task "
             f"(attestation task_id={ev_task!r}, waive for {params.task_id}). "
@@ -482,7 +491,10 @@ async def waive_merge_tool(
         await task_module._execute(
             project_id,
             "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
-            [json.dumps(ev), int(_time.time() * 1000), params.task_id],
+            # task["id"] is the resolved stored id (get_task resolves short
+            # prefixes); params.task_id may be an 8-char prefix that would
+            # silently match 0 rows here.
+            [json.dumps(ev), int(_time.time() * 1000), str(task["id"])],
         )
     except Exception as e:
         return ToolResult.err(f"Failed to stamp merge waiver: {e}")

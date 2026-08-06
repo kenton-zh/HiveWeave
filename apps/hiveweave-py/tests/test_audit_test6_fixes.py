@@ -85,21 +85,19 @@ class TestSpawnExclude:
 
 
 class TestBrowseInlineJs:
-    def test_inline_becomes_tempfile(self):
+    def test_inline_passes_through_as_expression(self):
+        # Regression (shoulabridge audit bug #3): inline JS must be passed to
+        # `js` as an expression, NOT materialised to a tempfile whose *path*
+        # gstack then evaluated (evaluate 1+1 returned the path string).
         argv = _materialize_inline_js(
             ["js", "() => document.body.click()"],
             workspace="",
         )
-        assert argv[0] == "js"
-        assert Path(argv[1]).is_file()
-        text = Path(argv[1]).read_text(encoding="utf-8")
-        assert "document.body.click" in text
-        try:
-            os.unlink(argv[1])
-        except OSError:
-            pass
+        assert argv == ["js", "() => document.body.click()"]
 
-    def test_existing_file_preserved(self):
+    def test_existing_file_preserved_as_eval(self):
+        # `eval` reads a file path — a real file must stay `eval <path>`, not
+        # be rewritten to `js` (old behavior evaluated the path string).
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".js", delete=False, encoding="utf-8"
         ) as f:
@@ -107,7 +105,7 @@ class TestBrowseInlineJs:
             path = f.name
         try:
             argv = _materialize_inline_js(["eval", path], workspace="")
-            assert argv[0] == "js"
+            assert argv[0] == "eval"
             assert Path(argv[1]).resolve() == Path(path).resolve()
         finally:
             os.unlink(path)

@@ -92,6 +92,12 @@ class ProgressMixin:
         """
         if not 0 <= progress <= 100:
             raise ValueError(f"progress must be 0-100, got {progress}")
+        # P0-2: resolve short prefix / dashed id before the SELECT+UPDATE.
+        # Without this, an 8-char prefix matches 0 rows → current=0 fallback →
+        # UPDATE matches 0 rows silently → tool reports "progress set" but the
+        # ledger never moved. require_task_id raises ValueError on unknown/
+        # ambiguous refs (tool layer converts to an error receipt).
+        task_id = await self.require_task_id(project_id, task_id)
         await _ensure_schema(project_id)
         rows = await _query(
             project_id, "SELECT progress FROM tasks WHERE id = ?", [task_id]
