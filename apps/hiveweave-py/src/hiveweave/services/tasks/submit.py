@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -14,6 +15,14 @@ log = structlog.get_logger(__name__)
 
 class SubmitMixin:
     """submit_task / _resolve_evidence_workspace."""
+
+    if TYPE_CHECKING:
+        require_task_id: Any
+        get_task: Any
+        _persist_contract_json: Any
+        _transition: Any
+        _is_verify_task: Any
+        emit_task_event: Any
 
     async def submit_task(self, project_id: str, task_id: str,
                           evidence: dict) -> None:

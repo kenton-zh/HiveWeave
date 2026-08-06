@@ -681,7 +681,7 @@ async def review_task_tool(
             if asg:
                 try:
                     from hiveweave.services.org import OrgService
-                    a = await OrgService().resolve_agent(asg)
+                    a = await OrgService().resolve_agent(asg)  # type: ignore[assignment]
                     short = (a or {}).get("short_id") or ""
                 except Exception:
                     pass

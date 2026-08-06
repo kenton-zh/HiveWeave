@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 # Force UTF-8 for stdout/stderr on Windows — prevents GBK encoding crashes
 # when logging Unicode characters (emoji, CJK names) via structlog.
@@ -142,7 +143,11 @@ def _configure_logging() -> None:
         logger_factory=structlog.PrintLoggerFactory(file=log_stream),
         cache_logger_on_first_use=True,
     )
-    logging.basicConfig(format="%(message)s", stream=log_stream, level=level)
+    logging.basicConfig(
+        format="%(message)s",
+        stream=cast(Any, log_stream),
+        level=cast(int, level),
+    )
 
 
 _configure_logging()

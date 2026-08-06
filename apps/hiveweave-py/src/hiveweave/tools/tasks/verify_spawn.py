@@ -26,7 +26,7 @@ def _verify_required_capabilities(parent_policy: str) -> list[str]:
 
 
 async def _spawn_post_approve_verify_task(
-    ts: TaskService,
+    ts: _task_svc.TaskService,
     project_id: str,
     reviewer_id: str,
     parent_task: dict,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -22,6 +23,9 @@ log = structlog.get_logger(__name__)
 
 class TransitionsMixin:
     """_transition / _transition_multi."""
+
+    if TYPE_CHECKING:
+        _clear_task_wait_contracts: Any
 
     async def _transition(self, project_id: str, task_id: str, target: str,
                           *, actor_id: str | None = None,

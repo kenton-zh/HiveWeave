@@ -1288,7 +1288,7 @@ class GameTimeService:
                         project_id,
                         t,
                         reason=reason,
-                        agents_by_id=by_id,
+                        agents_by_id=by_id,  # type: ignore[arg-type]
                         trigger=True,
                     )
                 except Exception as e:

@@ -6,7 +6,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import List
+from typing import Any, List, TYPE_CHECKING
 
 import structlog
 
@@ -49,6 +49,11 @@ log = structlog.get_logger(__name__)
 
 class MergeMixin:
     """merge / merge_by_branch / branch resolution."""
+
+    if TYPE_CHECKING:
+        # Provided by the LifecycleMixin composed into GitWorktreeService.
+        # Declared here so mypy can resolve the cross-mixin reference.
+        delete: Any
 
     async def _resolve_agent_branch(self, workspace_path: str, short_id: str,
                                     task_name: str | None,

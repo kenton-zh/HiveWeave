@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -27,6 +28,15 @@ _task_memory_pending: set["asyncio.Task"] = set()
 
 class CloseMixin:
     """close / merge gate / archive / umbrella / wait contracts."""
+
+    if TYPE_CHECKING:
+        require_task_id: Any
+        get_task: Any
+        _is_verify_task: Any
+        _transition: Any
+        emit_task_event: Any
+        _wake_dependent_tasks: Any
+        list_tasks: Any
 
     async def close_task(
         self,

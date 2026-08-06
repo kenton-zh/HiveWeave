@@ -17,7 +17,7 @@ from .constants import (
     _PROTECT_TASK_STATUSES,
     _TASK_BRANCH_RE,
 )
-from .git_cmd import _git, _resolve_base_branch
+from .git_cmd import _current_branch, _git, _resolve_base_branch
 from .naming import compute_branch_name
 from .paths import _has_git, _worktree_path
 

@@ -6,7 +6,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import List
+from typing import Any, List, TYPE_CHECKING
 
 import structlog
 
@@ -48,6 +48,13 @@ log = structlog.get_logger(__name__)
 
 class LifecycleMixin:
     """rollback / quarantine / delete / list / info."""
+
+    if TYPE_CHECKING:
+        # Provided by the CreateMixin / MergeMixin composed into
+        # GitWorktreeService. Declared here so mypy can resolve the
+        # cross-mixin references.
+        _resolve_effective_worktree_path: Any
+        checkpoint: Any
 
     async def rollback(self, workspace_path: str, short_id: str,
                        commit_hash: str | None = None) -> dict:

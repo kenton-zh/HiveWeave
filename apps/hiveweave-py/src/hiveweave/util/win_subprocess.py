@@ -22,8 +22,8 @@ from typing import Any
 
 def _hidden_startupinfo() -> Any:
     """STARTUPINFO with a hidden console window (Windows only)."""
-    si = subprocess.STARTUPINFO()
-    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
     si.wShowWindow = 0  # SW_HIDE
     return si
 

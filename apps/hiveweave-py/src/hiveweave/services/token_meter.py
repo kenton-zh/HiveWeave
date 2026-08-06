@@ -86,7 +86,7 @@ class TokenMeter:
         if not statements:
             return
         try:
-            await project_db.execute_transaction(agent_id, statements)
+            await project_db.execute_transaction(agent_id, statements)  # type: ignore[arg-type]
         except Exception as e:
             log.warning(
                 "token_meter.record_rounds_failed",

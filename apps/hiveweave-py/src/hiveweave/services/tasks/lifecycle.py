@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -14,6 +15,16 @@ log = structlog.get_logger(__name__)
 
 class LifecycleMixin:
     """start/block/unblock/reconcile + implementer lock / park."""
+
+    if TYPE_CHECKING:
+        require_task_id: Any
+        emit_task_event: Any
+        get_task: Any
+        find_task_by_slice_id: Any
+        _transition: Any
+        _persist_contract_json: Any
+        _COLUMNS: Any
+        _row: Any
 
     async def start_task(self, project_id: str, task_id: str) -> None:
         """Start a task (claimed → running).

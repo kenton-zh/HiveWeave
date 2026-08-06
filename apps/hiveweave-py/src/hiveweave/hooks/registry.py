@@ -10,7 +10,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import structlog
 
@@ -79,7 +79,7 @@ class HookRegistry:
         reg = _Registration(
             priority=priority,
             seq=self._seq,
-            name=name or getattr(handler, "__name__", "handler"),
+            name=cast(str, name or getattr(handler, "__name__", "handler")),
             handler=handler,
             fail=fail,
             timeout_s=timeout_s,

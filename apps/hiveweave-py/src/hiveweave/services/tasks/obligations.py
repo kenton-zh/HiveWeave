@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -14,6 +15,12 @@ log = structlog.get_logger(__name__)
 
 class ObligationsMixin:
     """get_actionable_obligations."""
+
+    if TYPE_CHECKING:
+        promote_assigned_created: Any
+        _COLUMNS: Any
+        _row: Any
+        _is_verify_task: Any
 
     async def get_actionable_obligations(
         self, project_id: str, agent_id: str

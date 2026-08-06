@@ -281,7 +281,7 @@ class HealthSupervisor:
                 project_id, agent_id
             )
         except Exception:
-            obligations = ["?"]  # fail closed: don't skip if unknown
+            obligations = ["?"]  # type: ignore[list-item]  # fail closed: don't skip if unknown
 
         inbound_ask = False
         try:

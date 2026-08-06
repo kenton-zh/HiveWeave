@@ -5,6 +5,7 @@ import json
 import re
 import time
 import uuid
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -15,6 +16,16 @@ log = structlog.get_logger(__name__)
 
 class VerifyMixin:
     """mark_verifying / close verify parent / migrate orphan approved."""
+
+    if TYPE_CHECKING:
+        _transition: Any
+        emit_task_event: Any
+        close_task: Any
+        get_task: Any
+        list_tasks: Any
+        archive_task: Any
+        _COLUMNS: Any
+        _row: Any
 
     async def mark_verifying(
         self,
@@ -288,7 +299,7 @@ class VerifyMixin:
                     tid,
                     archived_by="system",
                     reason=(
-                        f"duplicate VERIFY closed; sibling {except_id[:8]} "
+                        f"duplicate VERIFY closed; sibling {except_id[:8]} "  # type: ignore[index]
                         "succeeded, inactive duplicate cleaned up"
                     ),
                     reason_code="duplicate_cleanup",

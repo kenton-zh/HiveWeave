@@ -22,7 +22,7 @@ async def find_merge_capable_parent(
 
     if agents_by_id is None:
         agents = await OrgService().list_agents(project_id)
-        agents_by_id = {a.get("id"): a for a in agents if a.get("id")}
+        agents_by_id = {a.get("id"): a for a in agents if a.get("id")}  # type: ignore[misc]
 
     cur = agents_by_id.get(agent_id) or {}
     parent_id = cur.get("parent_id")
@@ -56,7 +56,7 @@ async def escalate_merge_proxy(
 
     if agents_by_id is None:
         agents = await OrgService().list_agents(project_id)
-        agents_by_id = {a.get("id"): a for a in agents if a.get("id")}
+        agents_by_id = {a.get("id"): a for a in agents if a.get("id")}  # type: ignore[misc]
 
     parent = await find_merge_capable_parent(
         project_id, str(creator_id), agents_by_id=agents_by_id

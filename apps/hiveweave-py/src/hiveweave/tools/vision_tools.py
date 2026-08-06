@@ -96,7 +96,7 @@ async def look_at_image_tool(
             model_config=model,
         )
     except Exception as primary_err:
-        text, model, failover_err = await _try_vision_backup(
+        text, model, failover_err = await _try_vision_backup(  # type: ignore[assignment]
             svc,
             primary=model,
             image=image,
