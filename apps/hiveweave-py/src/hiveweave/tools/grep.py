@@ -262,7 +262,7 @@ async def execute_grep(
     if not path:
         search_path = str(Path(workspace_path).resolve())
     else:
-        search_path = resolve_for_read(workspace_path, path, root)
+        search_path = resolve_for_read(workspace_path, path, root)  # type: ignore[assignment]
     if search_path is None:
         return {"success": False, "output": "",
                 "error": "Error: Sandbox violation - "

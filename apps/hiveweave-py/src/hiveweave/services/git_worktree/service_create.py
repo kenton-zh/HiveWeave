@@ -6,7 +6,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import List
+from typing import Any, List, TYPE_CHECKING
 
 import structlog
 
@@ -51,6 +51,11 @@ from .reconcile import _log_worktree_rebuild_event
 
 class CreateMixin:
     """ensure_git_repo / create / checkpoint."""
+
+    if TYPE_CHECKING:
+        # Provided by the MergeMixin composed into GitWorktreeService.
+        # Declared here so mypy can resolve the cross-mixin reference.
+        _resolve_effective_worktree_path: Any
 
     async def ensure_git_repo(self, workspace_path: str) -> dict:
         """Ensure workspace is a git repo. Auto-init + master→main if needed.

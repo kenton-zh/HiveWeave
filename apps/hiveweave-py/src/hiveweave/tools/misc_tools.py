@@ -522,7 +522,7 @@ async def git_worktree_merge_tool(
 
         async def _do_merge() -> dict:
             return await gwt.merge_by_branch(
-                workspace_path, merged_branch, target_branch
+                workspace_path, merged_branch, target_branch  # type: ignore[arg-type]
             )
 
         merge_call = _do_merge
@@ -846,10 +846,9 @@ async def git_worktree_merge_tool(
                     from hiveweave.services.inbox import InboxService
 
                     await InboxService().send_message(
-                        project_id=project_id,
-                        sender_id="system",
-                        recipient_id=str(creator),
-                        content=(
+                        from_agent_id="system",
+                        to_agent_id=str(creator),
+                        message=(
                             f"[MERGE FAILED] git_worktree_merge for task "
                             f"{params.task_id[:8]} hit precondition failure: "
                             f"{(result.get('message') or 'worktree corrupted')[:200]}\n"

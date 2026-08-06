@@ -6,7 +6,7 @@ import codecs
 import json
 import time
 import uuid
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import httpx
 import structlog
@@ -30,6 +30,11 @@ log = structlog.get_logger(__name__)
 
 class HttpStreamMixin:
     """HTTP / SSE streaming methods for Streamer."""
+
+    if TYPE_CHECKING:
+        _fire_delta: Any
+        _retry_handler: Any
+        _circuit_breaker: Any
 
     async def _stream_with_empty_retry(
         self,

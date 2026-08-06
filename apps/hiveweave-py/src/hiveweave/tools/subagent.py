@@ -20,11 +20,14 @@ import json
 import uuid
 from typing import Any
 
+import structlog
 from pydantic import BaseModel, Field
 
 from hiveweave.llm.streamer import Streamer
 from hiveweave.tools.base import tool
 from hiveweave.tools.result import ToolResult
+
+log = structlog.get_logger(__name__)
 
 SUBAGENT_TIMEOUT_S = 240
 SUBAGENT_MAX_TIMEOUT_S = 480

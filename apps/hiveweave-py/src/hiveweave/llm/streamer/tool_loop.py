@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -27,6 +27,18 @@ log = structlog.get_logger(__name__)
 
 class ToolLoopMixin:
     """Tool loop main cycle for Streamer."""
+
+    if TYPE_CHECKING:
+        max_tool_rounds: Any
+        _strip_placeholder: Any
+        _fire_delta: Any
+        _error_result: Any
+        _trim_context_if_needed: Any
+        _maybe_inject_mid_round_reminder: Any
+        _stream_with_empty_retry: Any
+        _detect_doom_loop: Any
+        _execute_tools: Any
+        _make_max_rounds_summary: Any
 
     @staticmethod
     def _normalize_usage(

@@ -9,7 +9,7 @@ MUST NOT top-level import hiveweave.agents.trigger — lazy import inside functi
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -231,7 +231,10 @@ async def handle_completion(
                 t for t in expect_ts if isinstance(t, (int, float)) and t
             ]
             if expect_ts:
-                reply_window_ms = min(reply_window_ms, min(expect_ts))
+                reply_window_ms = min(
+                    reply_window_ms,
+                    cast(int, min([cast(int, t) for t in expect_ts])),
+                )
             sent_to = await agent._inbox.get_sent_recipients_since(
                 agent.id, reply_window_ms
             )
@@ -241,7 +244,7 @@ async def handle_completion(
             sent_30min = await agent._inbox.get_sent_recipients_since(
                 agent.id, since_30min
             )
-            sent_to = list(set(sent_to) | set(sent_30min))
+            sent_to = set(sent_to) | set(sent_30min)
             replied_contracts = await agent._inbox.get_replied_contracts_since(
                 agent.id, reply_window_ms
             )

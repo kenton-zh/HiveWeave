@@ -213,7 +213,7 @@ def _list_windows_drives() -> list[str]:
         return drives
     try:
         import ctypes
-        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()  # type: ignore[attr-defined]
         for i in range(26):
             if bitmask & (1 << i):
                 letter = chr(ord("A") + i)

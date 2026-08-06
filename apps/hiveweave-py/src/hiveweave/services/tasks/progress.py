@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -15,6 +16,9 @@ log = structlog.get_logger(__name__)
 
 class ProgressMixin:
     """Progress floor + emit_task_event + update_progress."""
+
+    if TYPE_CHECKING:
+        require_task_id: Any
 
     async def _raise_progress_floor(
         self, project_id: str, task_id: str, floor: int

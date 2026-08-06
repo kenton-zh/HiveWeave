@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -15,6 +16,17 @@ log = structlog.get_logger(__name__)
 
 class ReviewMixin:
     """start_review / review_task."""
+
+    if TYPE_CHECKING:
+        require_task_id: Any
+        _transition: Any
+        get_task: Any
+        _persist_contract_json: Any
+        _wake_dependent_tasks: Any
+        _is_verify_task: Any
+        _close_verify_and_parent: Any
+        emit_task_event: Any
+        _transition_multi: Any
 
     async def start_review(self, project_id: str, task_id: str,
                            reviewer_id: str | None = None) -> None:

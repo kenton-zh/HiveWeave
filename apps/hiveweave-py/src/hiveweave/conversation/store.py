@@ -444,7 +444,7 @@ class ConversationStore:
                 statements.append(
                     (_INSERT_TURN_SQL, [turn_id, agent_id, raw, tokens, now, agent_id])
                 )
-            await project_db.execute_transaction(agent_id, statements)
+            await project_db.execute_transaction(agent_id, statements)  # type: ignore[arg-type]
             # summary 持久化到 agent 配置（独立于历史重写，旧 schema 无该列时容错）
             if summary is not None:
                 try:
@@ -621,7 +621,7 @@ class ConversationStore:
                 statements.append(
                     (_INSERT_TURN_SQL, [turn_id, agent_id, raw, tokens, now, agent_id])
                 )
-            await project_db.execute_transaction(agent_id, statements)
+            await project_db.execute_transaction(agent_id, statements)  # type: ignore[arg-type]
         except Exception as e:
             # 与 _persist_compaction 对齐：计数 + 上抛（写队列 worker 兜住），
             # 失败不再静默（TEST18 巡检 P1）

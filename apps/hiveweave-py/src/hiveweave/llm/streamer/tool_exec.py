@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -23,6 +23,9 @@ log = structlog.get_logger(__name__)
 
 class ToolExecMixin:
     """Tool execution methods for Streamer."""
+
+    if TYPE_CHECKING:
+        _fire_delta: Any
 
     async def _execute_tools(
         self,

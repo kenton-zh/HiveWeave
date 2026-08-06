@@ -851,7 +851,7 @@ async def ancestor_task_ids(
 
         ts = TaskService()
         for _ in range(max_depth):
-            row = await ts.get_task(project_id, cur_id)
+            row = await ts.get_task(project_id, cur_id)  # type: ignore[arg-type]
             if not row:
                 break
             parent = row.get("parent_task_id")

@@ -175,7 +175,7 @@ async def get_tasks_tool(
                     f"expires_at={wv.get('waiver_expires_at')} "
                     f"(waived_by CANNOT approve; rework clears waiver)"
                 )
-            case = case_by_verify.get(tk) or case_by_original.get(tk)
+            case = case_by_verify.get(tk) or case_by_original.get(tk)  # type: ignore[assignment]
             if case:
                 notes = (case.get("review_notes") or "").replace("\n", " ")[:120]
                 lines.append(

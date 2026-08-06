@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -63,6 +64,11 @@ def _reject_forged_verify_title(title: str | None, *, source: str) -> None:
 
 class CrudMixin:
     """create / get / list / resolve / update / dedup helpers."""
+
+    if TYPE_CHECKING:
+        _is_verify_task: Any
+        emit_task_event: Any
+        ensure_assignee_claimed: Any
 
     # 列顺序与 tasks 表一致（含 due_at / wait_kind / wake_at / policy_id / reviewer_id）
     _COLUMNS = (

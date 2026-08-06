@@ -132,11 +132,11 @@ def _is_pid_alive(pid: int | None) -> bool:
             import ctypes
 
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
+            handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
                 PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
             )
             if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
                 return True
             return False
         except Exception:

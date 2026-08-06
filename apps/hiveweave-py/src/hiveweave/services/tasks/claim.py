@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -14,11 +15,25 @@ from .db import (
     publish_task_event,
 )
 
+if TYPE_CHECKING:
+    # Methods/attrs provided by sibling mixins composed into TaskService.
+    # Declared here so mypy can resolve cross-mixin references.
+    pass
+
 log = structlog.get_logger(__name__)
 
 
 class ClaimMixin:
     """ensure/promote claim, claim_task, reassign, unclaim."""
+
+    if TYPE_CHECKING:
+        get_task: Any
+        _is_verify_task: Any
+        _COLUMNS: Any
+        _row: Any
+        require_task_id: Any
+        _transition: Any
+        emit_task_event: Any
 
     async def ensure_assignee_claimed(
         self, project_id: str, task_id: str

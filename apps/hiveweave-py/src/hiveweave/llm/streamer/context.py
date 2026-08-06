@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -21,6 +22,10 @@ log = structlog.get_logger(__name__)
 
 class ContextMixin:
     """Context management methods for Streamer."""
+
+    if TYPE_CHECKING:
+        max_tool_rounds: Any
+        _fire_delta: Any
 
     #: Prune 保护窗口（token）— 最近工具输出保留原文
     _PRUNE_PROTECT_TOKENS = 40_000
