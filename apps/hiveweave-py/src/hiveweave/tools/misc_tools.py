@@ -501,7 +501,17 @@ async def git_worktree_merge_tool(
     await gwt.ensure_git_repo(workspace_path)
 
     branch_name = params.branch_name or "task"
-    target_branch = params.target_branch or "main"
+    # 未显式指定 targetBranch 时，动态解析仓库实际默认基分支（main → master
+    # 二级回退），避免硬编码 "main" 在 master 默认分支仓库上
+    # `git checkout main` 失败（tiny-tool 实测 Bug）。
+    from hiveweave.services.git_worktree import _resolve_base_branch
+
+    if params.target_branch:
+        target_branch = params.target_branch
+    else:
+        target_branch = (
+            await _resolve_base_branch(workspace_path) or "main"
+        )
     merged_branch: str | None = None
     merged_short: str | None = None
     merge_call: Any = None  # 延迟执行 —— 自有分支门通过后才真正 merge
