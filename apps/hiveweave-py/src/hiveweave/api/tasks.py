@@ -78,6 +78,8 @@ class TaskClaim(BaseModel):
 class TaskForceApprove(BaseModel):
     reason: str
     note: str | None = None
+    operator: str | None = None
+    confirm: bool = False
 
 
 def _raise_from_value_error(e: ValueError) -> None:
@@ -300,8 +302,10 @@ async def force_approve_task(
 
     operator 是最终权威。本端点跳过 agent 能力检查与 waived_by 第三方
     隔离（人类操作者不受 agent 权限约束），强制批准并在 evidence 落
-    审计戳：reviewed_by=human-operator，feedback 含 reason + 死锁诊断。
-    仅限 submitted/reviewing 状态；其他状态走正常 review 或 archive。
+    审计戳：reviewed_by=human-operator[:operator]，feedback 含 reason +
+    死锁诊断。仅限 submitted/reviewing 状态；其他状态走正常 review 或
+    archive。死锁探针未确认死锁时须显式 confirm=true 才放行（防把
+    逃生门当常规审批捷径）。
     """
     if not (body.reason or "").strip():
         raise HTTPException(status_code=400, detail="reason is required")
@@ -322,24 +326,36 @@ async def force_approve_task(
 
         deadlock = await no_lawful_approver(project_id, task)
     except Exception as e:
-        log.debug("force_approve_deadlock_probe_failed", error=str(e))
+        log.warning("force_approve_deadlock_probe_failed", error=str(e))
+    # 审计 P2-3（2026-08-05）：探针确认存在合法 approver（非死锁）时，
+    # 逃生门须多一道人为确认——防止把 force-approve 当常规审批捷径。
+    if not deadlock and not body.confirm:
+        raise HTTPException(
+            status_code=409,
+            detail="Deadlock probe did NOT confirm an approval deadlock "
+                   "(a lawful approver appears to exist). If you still "
+                   "intend to override, re-send with confirm=true.",
+        )
+    operator = (body.operator or "").strip()
+    reviewer_id = f"human-operator:{operator}" if operator else "human-operator"
     feedback = f"[operator-force-approve] {body.reason.strip()}"
-    if body.note:
+    if body.note and body.note.strip():
         feedback += f" — {body.note.strip()}"
     if deadlock:
         feedback += f" | deadlock: {deadlock}"
     try:
         if status == "submitted":
             await _tasks.start_review(
-                project_id, task_id, reviewer_id="human-operator"
+                project_id, task_id, reviewer_id=reviewer_id
             )
         await _tasks.review_task(
             project_id, task_id, "approve", feedback,
-            reviewer_id="human-operator",
+            reviewer_id=reviewer_id,
         )
     except ValueError as e:
         _raise_from_value_error(e)
     log.warning("task_force_approved", project_id=project_id, task_id=task_id,
+                operator=operator or None,
                 reason=body.reason.strip(), deadlock=deadlock)
     return {"success": True, "deadlock": deadlock}
 

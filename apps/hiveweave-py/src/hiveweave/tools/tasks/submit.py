@@ -453,20 +453,43 @@ async def submit_task_tool(
     # "no worktree path / no diverged files" 硬拒，agent 侧无解法
     # （不知道要显式打 no_code_change 旗标）。submit 是最后能一致化
     # evidence 的位置——此处自动补旗标，与上方自动回填 files_changed
-    # 对称。安全边界：仅当 attestations 存在（平台签发、非 agent 自述）
-    # 且自动 diff 确实挖不到文件时触发；approve 侧审查方 fresh
-    # test_run 硬闸（P0-2）不受影响，仍独立生效。
+    # 对称。安全边界：仅当 attestations 经平台验真（存在、未过期、
+    # 归属本 agent/本任务、stdout_hash 齐备）且自动 diff 确实挖不到
+    # 文件时触发；approve 侧审查方 fresh test_run 硬闸（P0-2）不受
+    # 影响，仍独立生效。
+    # 审计 P1（2026-08-05）：软策略（generic_tests/coordinator_review）
+    # 下 attestation_ids 是 agent 自述、上方 strict 门不校验——必须先
+    # verify_ids 再信，否则伪造 ID + 空交付即可借自动旗标绕过
+    # review/close 双侧 merge gate（TEST20 N1 "Rita escape" 复活）。
     if not skip_delivery_gate and not evidence.get("files_changed"):
-        _aids = evidence.get("attestation_ids") or []
+        _aids = [str(x) for x in (evidence.get("attestation_ids") or []) if x]
         if _aids and evidence.get("no_code_change") is not True:
-            evidence["no_code_change"] = True
-            evidence["_auto_no_code_change"] = "attestation_only_delivery"
-            log.info(
-                "submit_auto_no_code_change",
-                task_id=task_id,
-                agent_id=agent_id,
-                attestations=len(_aids),
-            )
+            try:
+                _aok, _aerr = await attestation_service.verify_ids(
+                    project_id,
+                    _aids,
+                    expected_agent_id=agent_id,
+                    task_id=task_id,
+                )
+            except Exception as _ve:
+                _aok, _aerr = False, f"verify_error: {_ve}"
+            if _aok:
+                evidence["no_code_change"] = True
+                evidence["_auto_no_code_change"] = "attestation_only_delivery"
+                log.info(
+                    "submit_auto_no_code_change",
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    attestations=len(_aids),
+                )
+            else:
+                log.warning(
+                    "submit_auto_no_code_change_rejected_unverified",
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    attestations=len(_aids),
+                    error=_aerr,
+                )
 
     # P1-2: submit-time symmetric existence gate (mirrors approve-time
     # missing_claimed check). Catches "submit with no actual deliverable"

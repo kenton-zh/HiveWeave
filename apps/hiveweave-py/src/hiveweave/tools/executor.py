@@ -513,7 +513,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "properties": {
             "moduleId": {"type": "string", "aliases": ["module_id", "id", "key"]},
         },
-        "required": ["moduleId"],
+        "required": [],
     },
     "write_memory": {
         "description": "Writes content to the agent memory system under a given module ID, with optional tags. One entry per moduleId: re-writing the same moduleId OVERWRITES the previous entry (upsert by design). To accumulate history, use a distinct moduleId per entry (e.g. suffix with date).",
