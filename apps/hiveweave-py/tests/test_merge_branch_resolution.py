@@ -177,3 +177,49 @@ async def test_ambiguous_branch_errors_with_matches(git_repo: Path) -> None:
     assert "Ambiguous" in (result.error or "")
     assert "hw/A004/feat-x" in (result.error or "")
     assert "hw/A005/feat-x" in (result.error or "")
+
+
+@pytest.fixture
+def master_repo(tmp_path: Path) -> Path:
+    """master-only 默认分支仓库（如手动 git init 的存量仓库）。"""
+    repo = tmp_path / "master-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "master")
+    _git(repo, "config", "user.email", "test@hiveweave.local")
+    _git(repo, "config", "user.name", "HiveWeave Test")
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "init")
+    return repo
+
+
+@pytest.mark.asyncio
+async def test_merge_on_master_default_branch(master_repo: Path) -> None:
+    """BUGFIX: 默认分支为 master（非 main）时，git_worktree_merge 动态
+    解析目标分支为 master，不再硬编码 main 导致 checkout main 失败。
+
+    tiny-tool 实测：手动 git init 的存量仓库默认 master，旧代码
+    `target_branch = params.target_branch or "main"` 固定 checkout main
+    报 "Failed to checkout main"，需 bash 手动 merge 绕过。
+    """
+    await _make_executor_branch(master_repo, "A004", "feat/master-fix", "fix.py")
+
+    result = await _call_tool(master_repo, "A003", "feat-master-fix")
+
+    assert result.success is True, result.error
+    # 文件已合入主树（master 分支）
+    assert (master_repo / "fix.py").exists()
+    # 主树当前应检出 master（非不存在 main）
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=master_repo, capture_output=True, text=True, check=True,
+        encoding="utf-8", errors="replace",
+    ).stdout.strip()
+    assert head == "master"
+    # 分支已清理
+    branches = subprocess.run(
+        ["git", "branch", "--list", "hw/*/*"],
+        cwd=master_repo, capture_output=True, text=True, check=True,
+        encoding="utf-8", errors="replace",
+    ).stdout
+    assert "feat-master-fix" not in branches
