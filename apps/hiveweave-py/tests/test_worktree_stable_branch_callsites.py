@@ -171,6 +171,13 @@ class TestDispatchPassesTaskId:
                 TaskService, "get_task",
                 AsyncMock(return_value={"id": TASK_ID, "is_archived": 0}),
             ),
+            # P0-3: dispatch_task resolves short/dashed refs first via
+            # require_task_id before the raw `WHERE id = ?` update on the
+            # existing task. Mock it so the test focuses on worktree wiring.
+            patch.object(
+                TaskService, "require_task_id",
+                AsyncMock(return_value=TASK_ID),
+            ),
             patch.object(
                 OrgService, "resolve_agent",
                 AsyncMock(return_value={
