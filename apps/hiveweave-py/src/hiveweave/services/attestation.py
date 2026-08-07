@@ -22,6 +22,90 @@ log = structlog.get_logger(__name__)
 _migrated: set[str] = set()
 
 
+# ── Issue #5 (P2, audit): per-workspace git scope state cache ────────────
+# `_diff_touches_scope` runs once per stale attestation row; probing
+# `git ls-files` (and, for the directory heuristic, `git status --ignored`)
+# every time is wasteful. Cache the normalized sets per workspace under a
+# short TTL. A miss only costs one extra subprocess before the cache fills.
+_scope_state_cache: dict[
+    str, tuple[float, tuple[frozenset[str], frozenset[str]]]
+] = {}
+_SCOPE_STATE_TTL = 30.0
+
+# Regenerable build/cache dirs. A directory-level scope entry that only
+# contains these (e.g. `frontend/` with `node_modules/`) is still verifiable —
+# ordinary build output must not force fail-closed rework on every module
+# directory. Only *substantive* (non-build) untracked/ignored content under a
+# directory makes that directory scope unverifiable.
+_SCOPE_IGNORABLE_DIRS: frozenset[str] = frozenset({
+    "node_modules", "__pycache__", ".git", "dist", "build", ".next",
+    ".nuxt", ".turbo", ".venv", "venv", ".cache", "coverage",
+    ".idea", ".vscode", "test-results", "playwright-report",
+})
+
+
+def _is_ignorable_path(path: str) -> bool:
+    """True when *path* is under a build/cache dir that adds no verify scope.
+
+    A path is ignorable if any of its segments is a known build/cache dir
+    (e.g. ``frontend/node_modules/...``). ``git status --ignored`` collapses
+    ignored dirs to ``DIR/`` and lists individual untracked files, so checking
+    every "/"-separated segment covers both forms.
+    """
+    return any(seg in _SCOPE_IGNORABLE_DIRS for seg in path.split("/") if seg)
+
+
+async def _scope_state(
+    main_ws: str,
+) -> tuple[frozenset[str], frozenset[str]] | None:
+    """Return ``(tracked, substantive_unverifiable)`` for *main_ws*, cached.
+
+    ``tracked``: normalized + casefolded tracked paths (``git ls-files``), which
+    git can reflect in a diff.
+    ``substantive_unverifiable``: normalized + casefolded paths git cannot
+    reflect in a diff (untracked or ignored, via ``git status --ignored``),
+    minus regenerable build/cache paths. Returns None when a git probe fails
+    (caller must fail-closed).
+    """
+    now = time.monotonic()
+    cached = _scope_state_cache.get(main_ws)
+    if cached and now - cached[0] < _SCOPE_STATE_TTL:
+        return cached[1]
+    from hiveweave.services.git_worktree import _git
+    from hiveweave.services.worktree_review import normalize_evidence_path
+
+    ok, tracked_out = await _git(["ls-files"], main_ws)
+    if not ok:
+        return None
+    tracked = frozenset(
+        normalize_evidence_path(p).casefold().rstrip("/")
+        for p in tracked_out.splitlines()
+        if p.strip()
+    )
+    unverifiable: set[str] = set()
+    ok2, ignored_out = await _git(
+        ["status", "--ignored", "--porcelain"], main_ws
+    )
+    if not ok2:
+        return None
+    for line in ignored_out.splitlines():
+        if len(line) < 4:
+            continue
+        code = line[:2]
+        if code not in ("??", "!!"):
+            continue
+        p = line[3:].strip().strip('"')
+        if not p:
+            continue
+        norm = normalize_evidence_path(p).casefold().rstrip("/")
+        if not norm or _is_ignorable_path(norm):
+            continue
+        unverifiable.add(norm)
+    result = (tracked, frozenset(unverifiable))
+    _scope_state_cache[main_ws] = (now, result)
+    return result
+
+
 async def _diff_touches_scope(
     main_ws: str, ch: str, main_tip: str, scope_files: set[str]
 ) -> bool | None:
@@ -34,14 +118,16 @@ async def _diff_touches_scope(
     touched.
 
     A scope entry that lives in an area git cannot reflect in a diff —
-    gitignored/untracked paths (e.g. ``.hiveweave/``, ``node_modules/``,
-    worktree-scoped evidence files whose prefix was normalized away) — can
-    never match a ``git diff --name-only`` output. Treating such an entry as
-    "untouched" would silently approve on a scope git cannot verify. We
-    decide per-entry: an entry is *verifiable* iff it correspond to a tracked
-    path (probed with ``git ls-files``, which is case-insensitive-safe); any
-    unverifiable entry left in play makes the whole result undecidable (None)
-    unless a verifiable entry provably touches the diff.
+    gitignored/untracked paths (e.g. ``.hiveweave/``, worktree-scoped evidence
+    files whose prefix was normalized away) — can never match a
+    ``git diff --name-only`` output. Treating such an entry as "untouched"
+    would silently approve on a scope git cannot verify. We decide per-entry:
+    an entry is *verifiable* iff it corresponds to a tracked path (probed with
+    ``git ls-files``, case-insensitive-safe); a directory entry is additionally
+    verifiable only if it has no *substantive* untracked/ignored content under
+    it (build/cache dirs excluded). Any unverifiable entry left in play makes
+    the whole result undecidable (None) unless a verifiable entry provably
+    touches the diff.
     """
     if not scope_files or not main_tip or not ch:
         return None
@@ -49,35 +135,35 @@ async def _diff_touches_scope(
         from hiveweave.services.git_worktree import _git
         from hiveweave.services.worktree_review import normalize_evidence_path
 
-        if not scope_files:
-            return None
-
-        # A scope entry is verifiable only if it matches a tracked path.
-        # ``git ls-files`` is case-insensitive-safe (a case-mismatched
-        # ``.Hiveweave/...`` simply matches no tracked path → unverifiable),
-        # and naturally covers every gitignored/untracked prefix, so this is
-        # more robust than a hardcoded ``.hiveweave/`` prefix check.
-        ok, tracked_out = await _git(["ls-files"], main_ws)
-        if not ok:
+        state = await _scope_state(main_ws)
+        if state is None:
             return None  # can't tell what's verifiable → fail-closed
-        tracked = {
-            normalize_evidence_path(p).casefold().rstrip("/")
-            for p in tracked_out.splitlines()
-            if p.strip()
-        }
+        tracked, unverifiable_state = state
+
         verifiable: set[str] = set()
         unverifiable: set[str] = set()
         for s in scope_files:
             s_norm = s.casefold().rstrip("/")
             if not s_norm:
                 continue
-            if any(
+            is_tracked = any(
                 t == s_norm or t.startswith(s_norm + "/")
                 for t in tracked
-            ):
-                verifiable.add(s_norm)
-            else:
+            )
+            if not is_tracked:
                 unverifiable.add(s_norm)
+                continue
+            # Directory-level scope with substantive untracked/ignored content
+            # under it cannot be fully validated by `git diff` (the parent may
+            # have changed git-invisible files there) — keep it conservative
+            # (undecidable) rather than risk a silent approve.
+            if any(
+                u == s_norm or u.startswith(s_norm + "/")
+                for u in unverifiable_state
+            ):
+                unverifiable.add(s_norm)
+            else:
+                verifiable.add(s_norm)
 
         ok, out = await _git(
             ["diff", "--name-only", ch, main_tip],

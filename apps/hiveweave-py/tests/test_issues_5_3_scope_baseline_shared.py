@@ -16,6 +16,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_scope_state_cache():
+    """Each test gets a pristine git-scope cache (it is module-level and
+    TTL-cached by workspace, so it would otherwise leak mock state across
+    tests that share the "/proj" workspace key)."""
+    from hiveweave.services import attestation
+
+    attestation._scope_state_cache.clear()
+    yield
+    attestation._scope_state_cache.clear()
+
+
 # ── #5: scope-aware VERIFY baseline ──────────────────────────────────────
 
 
@@ -74,6 +86,8 @@ async def test_verify_baseline_accepts_behind_but_unrelated_scope():
             return (True, "7\n")
         if args[0] == "ls-files":
             return (True, "backend/main.py\nbackend/api.py\n")
+        if args[0] == "status":
+            return (True, "")  # no untracked/ignored content
         if args[0:2] == ["diff", "--name-only"]:
             return (True, "frontend/app.js\nfrontend/styles.css\n")
         return (False, "")
@@ -141,6 +155,8 @@ async def test_verify_baseline_rejects_behind_touching_scope():
             return (True, "7\n")
         if args[0] == "ls-files":
             return (True, "backend/main.py\n")
+        if args[0] == "status":
+            return (True, "")  # no untracked/ignored content
         if args[0:2] == ["diff", "--name-only"]:
             return (True, "backend/main.py\n")
         return (False, "")
@@ -213,6 +229,8 @@ async def test_verify_baseline_rejects_directory_scope_touched():
             return (True, "7\n")
         if args[0] == "ls-files":
             return (True, "backend/main.py\n")
+        if args[0] == "status":
+            return (True, "")  # no untracked/ignored content
         if args[0:2] == ["diff", "--name-only"]:
             return (True, "backend/main.py\n")
         return (False, "")
@@ -281,6 +299,8 @@ async def test_verify_baseline_rejects_hiveweave_scope_undecidable():
         # .hiveweave is gitignored → never tracked; ls-files returns only code.
         if args[0] == "ls-files":
             return (True, "backend/main.py\nfrontend/app.js\n")
+        if args[0] == "status":
+            return (True, "!! .hiveweave/\n")
         # diff never returns .hiveweave paths (gitignored) — but we must not
         # treat that as "untouched"; the guard returns None → reject.
         if args[0:2] == ["diff", "--name-only"]:
@@ -316,7 +336,7 @@ async def test_verify_baseline_rejects_hiveweave_scope_undecidable():
 
 @pytest.mark.asyncio
 async def test_diff_touches_scope_none_on_fail_closed():
-    """git diff failure → None (fail-closed); caller must not approve."""
+    """git ls-files failure → None (fail-closed); caller must not approve."""
     from hiveweave.services.attestation import _diff_touches_scope
 
     with patch(
@@ -333,6 +353,10 @@ async def test_diff_touches_scope_casefold_and_prefix():
     from hiveweave.services.attestation import _diff_touches_scope
 
     async def fake_git(args, cwd, timeout=30.0):
+        if args[0] == "ls-files":
+            return (True, "Frontend/Button.TSX\nFrontend/Styles.css\n")
+        if args[0] == "status":
+            return (True, "")
         return (True, "Frontend/Button.TSX\nFrontend/Styles.css\n")
 
     with patch(
@@ -355,6 +379,8 @@ async def test_diff_touches_scope_rejects_case_mismatch_hiveweave():
     async def fake_git(args, cwd, timeout=30.0):
         if args[0] == "ls-files":
             return (True, "backend/main.py\nfrontend/app.js\n")
+        if args[0] == "status":
+            return (True, "!! .hiveweave/\n")
         if args[0:2] == ["diff", "--name-only"]:
             return (True, "frontend/app.js\n")
         return (False, "")
@@ -377,6 +403,8 @@ async def test_diff_touches_scope_accepts_untouched_code_scope():
     async def fake_git(args, cwd, timeout=30.0):
         if args[0] == "ls-files":
             return (True, "backend/main.py\nbackend/api.py\n")
+        if args[0] == "status":
+            return (True, "")
         if args[0:2] == ["diff", "--name-only"]:
             return (True, "frontend/app.js\n")
         return (False, "")
@@ -397,6 +425,8 @@ async def test_diff_touches_scope_empty_diff_returns_false():
     async def fake_git(args, cwd, timeout=30.0):
         if args[0] == "ls-files":
             return (True, "backend/main.py\n")
+        if args[0] == "status":
+            return (True, "")
         if args[0:2] == ["diff", "--name-only"]:
             return (True, "")
         return (False, "")
@@ -418,6 +448,8 @@ async def test_diff_touches_scope_empty_diff_unverifiable_fail_closed():
     async def fake_git(args, cwd, timeout=30.0):
         if args[0] == "ls-files":
             return (True, "backend/main.py\n")
+        if args[0] == "status":
+            return (True, "!! .hiveweave/\n")
         if args[0:2] == ["diff", "--name-only"]:
             return (True, "")
         return (False, "")
@@ -441,6 +473,8 @@ async def test_diff_touches_scope_mixed_unverifiable_fail_closed():
     async def fake_git(args, cwd, timeout=30.0):
         if args[0] == "ls-files":
             return (True, "backend/main.py\n")
+        if args[0] == "status":
+            return (True, "!! .hiveweave/\n")
         if args[0:2] == ["diff", "--name-only"]:
             return (True, "frontend/app.js\n")
         return (False, "")
@@ -466,6 +500,98 @@ async def test_diff_touches_scope_empty_scope_returns_none():
     ):
         r = await _diff_touches_scope("/proj", "a", "b", set())
     assert r is None
+
+
+# ── #5 P2 (audit): directory heuristic + git-scope cache ─────────────────
+
+
+def test_is_ignorable_path():
+    """Build/cache dirs are ignorable; real paths are not."""
+    from hiveweave.services.attestation import _is_ignorable_path
+
+    assert _is_ignorable_path("frontend/node_modules/lodash/index.js")
+    assert _is_ignorable_path("backend/__pycache__/x.pyc")
+    assert _is_ignorable_path("node_modules")
+    assert not _is_ignorable_path("backend/main.py")
+    assert not _is_ignorable_path(".hiveweave/reports/evidence.md")
+    assert not _is_ignorable_path("backend/.env")
+
+
+@pytest.mark.asyncio
+async def test_diff_touches_scope_dir_with_only_build_ignored_verifiable():
+    """A directory scope that only hides build/cache output is still
+    verifiable and accepts when the diff is unrelated."""
+    from hiveweave.services.attestation import _diff_touches_scope
+
+    async def fake_git(args, cwd, timeout=30.0):
+        if args[0] == "ls-files":
+            return (True, "backend/main.py\nbackend/api.py\n")
+        if args[0] == "status":
+            return (True, "!! backend/node_modules/\n!! backend/__pycache__/\n")
+        if args[0:2] == ["diff", "--name-only"]:
+            return (True, "frontend/app.js\n")
+        return (False, "")
+
+    with patch(
+        "hiveweave.services.git_worktree._git",
+        side_effect=fake_git,
+    ):
+        r = await _diff_touches_scope("/proj", "a", "b", {"backend/"})
+    assert r is False, "build-only ignored content must not force fail-closed"
+
+
+@pytest.mark.asyncio
+async def test_diff_touches_scope_dir_with_substantive_unverifiable():
+    """A directory scope with substantive (non-build) untracked/ignored content
+    under it → cannot be fully validated → unverifiable → fail-closed."""
+    from hiveweave.services.attestation import _diff_touches_scope
+
+    async def fake_git(args, cwd, timeout=30.0):
+        if args[0] == "ls-files":
+            return (True, "backend/main.py\nbackend/api.py\n")
+        if args[0] == "status":
+            return (True, "?? backend/.env\n")
+        if args[0:2] == ["diff", "--name-only"]:
+            return (True, "frontend/app.js\n")
+        return (False, "")
+
+    with patch(
+        "hiveweave.services.git_worktree._git",
+        side_effect=fake_git,
+    ):
+        r = await _diff_touches_scope("/proj", "a", "b", {"backend/"})
+    assert r is None, "substantive unverifiable content under dir → fail-closed"
+
+
+@pytest.mark.asyncio
+async def test_scope_state_cache_reuses_probe():
+    """`_scope_state` result is cached: two _diff_touches_scope calls trigger
+    only one ls-files/status probe each."""
+    from hiveweave.services.attestation import _diff_touches_scope
+
+    ls_files_calls = 0
+    status_calls = 0
+
+    async def fake_git(args, cwd, timeout=30.0):
+        nonlocal ls_files_calls, status_calls
+        if args[0] == "ls-files":
+            ls_files_calls += 1
+            return (True, "backend/main.py\n")
+        if args[0] == "status":
+            status_calls += 1
+            return (True, "")
+        return (True, "")  # empty diff for both calls
+
+    with patch(
+        "hiveweave.services.git_worktree._git",
+        side_effect=fake_git,
+    ):
+        r1 = await _diff_touches_scope("/proj", "a", "b", {"backend/"})
+        r2 = await _diff_touches_scope("/proj", "c", "d", {"backend/"})
+
+    assert r1 is False and r2 is False
+    assert ls_files_calls == 1, "ls-files must be probed once, then cached"
+    assert status_calls == 1, "status must be probed once, then cached"
 
 
 # ── #3: contract sharing into worktrees ──────────────────────────────────
@@ -563,6 +689,73 @@ def test_sync_shared_propagates_root_update(tmp_path):
     svc._sync_shared_contracts(str(ws), str(wt))
 
     assert dst.read_text(encoding="utf-8") == "v2"
+
+
+def test_sync_shared_same_ns_different_size_copies(tmp_path):
+    """#3 P2: same mtime_ns but different content (root update) → copy.
+
+    Two writes within the same nanosecond collapse to the same stamp; the
+    size tie-break must still propagate a root update whose content changed.
+    """
+    import os
+
+    from hiveweave.services.git_worktree.service_create import CreateMixin
+
+    svc = CreateMixin()
+    ws = tmp_path / "proj"
+    wt = ws / ".hiveweave" / "worktrees" / "A"
+    src = ws / ".hiveweave" / "shared"
+    src.mkdir(parents=True)
+    root_file = src / "contract.md"
+    root_file.write_text("v1", encoding="utf-8")
+
+    svc._sync_shared_contracts(str(ws), str(wt))
+    dst = wt / ".hiveweave" / "shared" / "contract.md"
+    assert dst.read_text(encoding="utf-8") == "v1"
+
+    # Root content changes but the mtime_ns is forced to be IDENTICAL to the
+    # dst copy (same ns stamp). Only size differs → must still copy.
+    root_file.write_text("a much longer v2 body", encoding="utf-8")
+    dst_ns = os.stat(dst).st_mtime_ns
+    os.utime(root_file, ns=(dst_ns, dst_ns))
+    svc._sync_shared_contracts(str(ws), str(wt))
+
+    assert (
+        dst.read_text(encoding="utf-8") == "a much longer v2 body"
+    ), "same-ns root update with different size must still propagate"
+
+
+def test_sync_shared_same_ns_same_size_preserves_local(tmp_path):
+    """#3 P2: dst with identical mtime_ns AND size to src → skip (no clobber).
+
+    An unchanged prior copy (or an agent edit that happens to match size) must
+    not be overwritten when the stamps are indistinguishable.
+    """
+    import os
+
+    from hiveweave.services.git_worktree.service_create import (
+        CreateMixin,
+        _copy_if_newer,
+    )
+
+    svc = CreateMixin()
+    ws = tmp_path / "proj"
+    wt = ws / ".hiveweave" / "worktrees" / "A"
+    src = ws / ".hiveweave" / "shared"
+    src.mkdir(parents=True)
+    root_file = src / "contract.md"
+    root_file.write_text("same-size", encoding="utf-8")
+
+    svc._sync_shared_contracts(str(ws), str(wt))
+    dst = wt / ".hiveweave" / "shared" / "contract.md"
+
+    # Force src and dst to the exact same ns + size run of _copy_if_newer.
+    src_ns = os.stat(root_file).st_mtime_ns
+    os.utime(dst, ns=(src_ns, src_ns))
+    os.utime(root_file, ns=(src_ns, src_ns))
+    did_copy = _copy_if_newer(str(root_file), str(dst))
+
+    assert did_copy is False, "indistinguishable stamps must be skipped"
 
 
 def test_sync_shared_preserves_local_added_file(tmp_path):
