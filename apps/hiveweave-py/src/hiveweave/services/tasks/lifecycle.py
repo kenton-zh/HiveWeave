@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
+from .verify import VerifyMixin
 
 log = structlog.get_logger(__name__)
 
@@ -361,6 +362,11 @@ class LifecycleMixin:
             if not should_wake:
                 continue
             assignee = task.get("assignee_id")
+            # 审计 O3：无 assignee 的 VERIFY 是 QA 死区（等待 hire），即使
+            # wait 已满足也不能 unblock —— 顶成 running 却没有 QA 真正执行，
+            # 反被 _project_has_in_flight 视为占用 MAIN 运行时，拖死整个队列。
+            if not assignee and VerifyMixin._is_verify_task(task):
+                continue
             try:
                 await self.unblock_task(project_id, tid)
                 woken += 1

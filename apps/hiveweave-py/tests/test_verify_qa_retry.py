@@ -211,7 +211,10 @@ async def test_retry_ignores_assigned_or_non_blocked(task_env):
     ):
         n = await retry_qa_blocked_verify_tasks(pid)
 
-    assert n == 1  # 只有 verify_id 被重挂
+    assert n == 0  # verify_id 重挂回 created，但 other（blocked+有 assignee）占串行锁 → nudged=False
+    rehooked = await ts.get_task(pid, verify_id)
+    assert rehooked["assignee_id"] == QA
+    assert rehooked["status"] == "created"
     other = await ts.get_task(pid, other_id)
     assert other["status"] == "blocked"
     assert other["assignee_id"] == EXEC

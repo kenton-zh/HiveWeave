@@ -221,7 +221,8 @@ class ReassignTaskParams(BaseModel):
     "Transfer a task's assignee to another agent and put it on their "
     "obligation ledger (coordinator/CEO). Use this instead of NL "
     "'forward' — messages alone create no obligation. New assignee is "
-    "woken with a task message.",
+    "woken with a task message. Note: reassigning a queued VERIFY keeps "
+    "it queued (serialized verification) — nudge wakes it when MAIN is free.",
     requires_workspace=False,
     security_level="standard",
 )

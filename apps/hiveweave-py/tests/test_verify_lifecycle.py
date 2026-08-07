@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, patch
 
@@ -13,6 +14,7 @@ from hiveweave.tools.task_tools import (
     VERIFY_STALE_MS,
     _nudge_one_verify_task,
     _spawn_post_approve_verify_task,
+    nudge_pending_verify_tasks,
     nudge_stale_verify_tasks,
 )
 
@@ -328,3 +330,577 @@ async def test_stale_verify_not_nudged_when_fresh(task_env):
         n = await nudge_stale_verify_tasks(pid)
     assert n == 0
     nudge.assert_not_awaited()
+
+
+async def _make_verify(pid, ts, title="UI"):
+    """Parent approved + VERIFY child created (post-merge state)."""
+    parent_id = await ts.create_task(
+        pid, title, "d", creator_id=COORD, assignee_id=EXEC
+    )
+    await ts.claim_task(pid, parent_id, EXEC)
+    await ts.start_task(pid, parent_id)
+    await ts.submit_task(
+        pid, parent_id, evidence={"tests_passed": True, "test_output": "ok"}
+    )
+    await ts.start_review(pid, parent_id)
+    await ts.review_task(pid, parent_id, "approve")
+    await ts.mark_verifying(pid, parent_id)
+    verify_id = await ts.create_task(
+        pid,
+        f"VERIFY: {title}",
+        "verify",
+        creator_id=COORD,
+        assignee_id=EXEC,
+        parent_task_id=parent_id,
+        tags=["verify", "mandatory"],
+        source="system",
+    )
+    return verify_id
+
+
+async def _nudge_with_mocks(pid, task):
+    return await _nudge_one_verify_task(pid, "system", task, reason="merge")
+
+
+@pytest.mark.asyncio
+async def test_verify_nudge_serialized_while_another_in_flight(task_env):
+    """并发验收串行化（issue #6）+ TOCTOU（审计 M1/S2）：并发 nudge 两个 VERIFY，恰一个成功。
+
+    用 asyncio.gather 真实并发唤醒 A、B —— per-project 锁必须保证 check+claim
+    原子：锁被取走前进入的第二个协程在锁释放后再检查，看到 A 已 claimed
+    （in-flight）即被拒。断言恰有 1 个成功、恰 1 个保持 created，防 TOCTOU 回归。
+    """
+    ts = TaskService()
+    pid = task_env["project_id"]
+    first_id = await _make_verify(pid, ts, title="UI A")
+    second_id = await _make_verify(pid, ts, title="UI B")
+
+    first = await ts.get_task(pid, first_id)
+    second = await ts.get_task(pid, second_id)
+    assert second["status"] == "created"
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        (r1, r2) = await asyncio.gather(
+            _nudge_with_mocks(pid, first),
+            _nudge_with_mocks(pid, second),
+        )
+    # 恰一个唤醒成功，另一个被锁拒
+    assert sorted([bool(r1), bool(r2)]) == [False, True]
+    claimed_ids = [
+        (await ts.get_task(pid, i))["status"] == "claimed"
+        for i in (first_id, second_id)
+    ]
+    assert sum(claimed_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_nudge_blocked_with_assignee_holds_lock(task_env):
+    """必改（审计#1）：blocked 且有 assignee 的 VERIFY 算 in-flight。
+
+    运行中被阻塞（game_time 可自动 unblock 恢复）仍占用 MAIN 运行时，
+    泵/下一个 nudge 不得唤醒第二个 VERIFY 造成双并发（issue #6）。
+    """
+    from hiveweave.services import task as task_module
+
+    ts = TaskService()
+    pid = task_env["project_id"]
+    first_id = await _make_verify(pid, ts, title="UI A")
+    second_id = await _make_verify(pid, ts, title="UI B")
+
+    first = await ts.get_task(pid, first_id)
+    second = await ts.get_task(pid, second_id)
+    # 第一 VERIFY 唤醒后进入 running（再被阻塞，assignee 保留）
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await _nudge_with_mocks(pid, first) is True
+    await ts.start_task(pid, first_id)
+    await ts.block_task(pid, first_id, "external: waiting browser")
+
+    blocked = await ts.get_task(pid, first_id)
+    assert blocked["status"] == "blocked"
+    assert blocked["assignee_id"] == EXEC
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await _nudge_with_mocks(pid, second) is False
+    assert (await ts.get_task(pid, second_id))["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_verify_nudge_blocked_without_assignee_does_not_hold_lock(task_env):
+    """必改（审计#1）：blocked 且无 assignee 的 VERIFY 是 QA 死区，不占锁。"""
+    from hiveweave.services import task as task_module
+
+    ts = TaskService()
+    pid = task_env["project_id"]
+    first_id = await _make_verify(pid, ts, title="UI A")
+    second_id = await _make_verify(pid, ts, title="UI B")
+
+    second = await ts.get_task(pid, second_id)
+    # 模拟 spawn 时无独立 QA：blocked + assignee=NULL 的死区状态
+    await task_module._execute(
+        pid,
+        "UPDATE tasks SET status = 'blocked', assignee_id = NULL, "
+        "blocked_reason = 'verify_no_qa', updated_at = ? WHERE id = ?",
+        [int(time.time() * 1000), first_id],
+    )
+    first = await ts.get_task(pid, first_id)
+    assert first["status"] == "blocked"
+    assert first["assignee_id"] is None
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await _nudge_with_mocks(pid, second) is True
+    assert (await ts.get_task(pid, second_id))["status"] == "claimed"
+
+
+@pytest.mark.asyncio
+async def test_verify_nudge_rework_holds_lock(task_env):
+    """必改（审计#1）：rework（VR 复审通过后回退重验）仍算 in-flight。"""
+    from hiveweave.services import task as task_module
+
+    ts = TaskService()
+    pid = task_env["project_id"]
+    first_id = await _make_verify(pid, ts, title="UI A")
+    second_id = await _make_verify(pid, ts, title="UI B")
+
+    first = await ts.get_task(pid, first_id)
+    second = await ts.get_task(pid, second_id)
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await _nudge_with_mocks(pid, first) is True
+    # claimed → running → blocked... rework 直接构造：行名走状态机外纠偏
+    await task_module._execute(
+        pid,
+        "UPDATE tasks SET status = 'rework', updated_at = ? WHERE id = ?",
+        [int(time.time() * 1000), first_id],
+    )
+    rework = await ts.get_task(pid, first_id)
+    assert rework["status"] == "rework"
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await _nudge_with_mocks(pid, second) is False
+    assert (await ts.get_task(pid, second_id))["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_verify_pump_no_candidate_idempotent(task_env):
+    """审计：泵在无候选（无 created+assignee VERIFY）时幂等返回 0，不抛错。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    assert await nudge_pending_verify_tasks(pid) == 0
+
+
+@pytest.mark.asyncio
+async def test_verify_pump_wakes_next_after_first_closes(task_env):
+    """验收串行化泵：前置 VERIFY 收口后，队列中最老的 created VERIFY 被唤醒。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    first_id = await _make_verify(pid, ts, title="UI A")
+    second_id = await _make_verify(pid, ts, title="UI B")
+
+    first = await ts.get_task(pid, first_id)
+    second = await ts.get_task(pid, second_id)
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        # 唤醒首个 → claimed（in-flight）
+        assert await _nudge_with_mocks(pid, first) is True
+        # 前置 in-flight 期间泵不推进
+        assert await nudge_pending_verify_tasks(pid) == 0
+        # 前置收口：VERIFY 走完 submit → review approve → 自动 close（真实路径）
+        await ts.start_task(pid, first_id)
+        await ts.submit_task(
+            pid, first_id, evidence={"tests_passed": True, "test_output": "ok"}
+        )
+        await ts.start_review(pid, first_id)
+        await ts.review_task(pid, first_id, "approve")
+        assert (await ts.get_task(pid, first_id))["status"] == "closed"
+        # 锁释放 → 收口路径内嵌泵已唤醒第二个；再手动泵无可推进（幂等）
+        assert await nudge_pending_verify_tasks(pid) == 0
+    assert (await ts.get_task(pid, second_id))["status"] == "claimed"
+
+
+def _nudge_mock_patch():
+    """与既有 nudge 测试同一套 mock：QA active + inbox + trigger。返回 4 个 patch。"""
+    return (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_reassign_created_goes_through_serialize_lock(task_env):
+    """审计 M1：created VERIFY 改派必须走锁，不得旁路直接 claimed。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    first_id = await _make_verify(pid, ts, title="UI A")
+    second_id = await _make_verify(pid, ts, title="UI B")
+    OTHER = "exec-other"
+    p1, p2, p3, p4 = _nudge_mock_patch()
+
+    with (
+        patch("hiveweave.services.org.OrgService.list_agents", new=AsyncMock()),
+        p1, p2, p3, p4,
+    ):
+        # 先唤醒第一个 → claimed（in-flight）
+        first = await ts.get_task(pid, first_id)
+        assert await _nudge_with_mocks(pid, first) is True
+        second = await ts.get_task(pid, second_id)
+        # reassign 一个 created VERIFY：锁内检查发现有 in-flight → 保持 created
+        await ts.reassign_task(
+            pid, second_id, new_assignee_id=OTHER, reassigned_by="coord-1",
+        )
+    after = await ts.get_task(pid, second_id)
+    assert after["status"] == "created"
+    assert after["assignee_id"] == OTHER
+
+
+@pytest.mark.asyncio
+async def test_pump_skips_old_bad_candidate_wakes_newer_good(task_env):
+    """审计 M2：候选不可唤醒时泵换下一个，不永久堵死队列。"""
+    from hiveweave.tools import task_tools as tt
+
+    ts = TaskService()
+    pid = task_env["project_id"]
+    # A 最老但 QA 停用（不可唤醒）；B 较新但 QA 活跃
+    bad_id = await _make_verify(pid, ts, title="UI A")
+    good_id = await _make_verify(pid, ts, title="UI B")
+    # A 的 assignee 改成一个非 active 的 agent —— 与 get_agent_by_id mock 冲突，
+    # 直接用 inactive 返回区分：
+    # 用 patch get_agent_by_id 返回 active 给特定 agent? 简化：B 指派 EXEC（active），
+    # A 指派到 inactive 的幽灵 agent。
+    GHOST = "ghost-qa"
+    from hiveweave.services import task as task_module
+    from hiveweave.tools.tasks import verify_spawn as vs
+
+    await task_module._execute(
+        pid, "UPDATE tasks SET assignee_id = ? WHERE id = ?", [GHOST, bad_id]
+    )
+    vs._pump_failed_cooldowns.clear()
+
+    def fake_get(agent_id):
+        if agent_id == GHOST:
+            return {"id": agent_id, "name": agent_id, "status": "suspended"}
+        return {"id": agent_id, "name": agent_id, "status": "active"}
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(side_effect=lambda aid: fake_get(aid)),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        n = await nudge_pending_verify_tasks(pid)
+    assert n == 1
+    good = await ts.get_task(pid, good_id)
+    assert good["status"] == "claimed"
+    assert (await ts.get_task(pid, bad_id))["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_archive_verify_triggers_pump_to_next(task_env):
+    """审计 S3：VERIFY 归档（cancel）后立即泵队列，不等 tick。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    first_id = await _make_verify(pid, ts, title="UI A")
+    second_id = await _make_verify(pid, ts, title="UI B")
+    p1, p2, p3, p4 = _nudge_mock_patch()
+
+    with p1, p2, p3, p4:
+        # 唤醒 A → claimed（in-flight）
+        first = await ts.get_task(pid, first_id)
+        assert await _nudge_with_mocks(pid, first) is True
+        # 归档 A → 锁释放 + 内嵌泵唤醒 B
+        await ts.archive_task(
+            pid, first_id, archived_by="coord-1", reason="cancel wrong"
+        )
+    # B 被泵唤醒 → claimed（若无泵则需等 tick，此处断言即时推进）
+    # 注意：归档在 archive_task 内联泵已唤醒 B
+    after = await ts.get_task(pid, second_id)
+    assert after["status"] == "claimed"
+
+
+@pytest.mark.asyncio
+async def test_unclaim_verify_triggers_pump(task_env):
+    """审计 S3：VERIFY unclaim（释放认领）后立即释放泵，不等 tick。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    first_id = await _make_verify(pid, ts, title="UI A")
+    second_id = await _make_verify(pid, ts, title="UI B")
+    p1, p2, p3, p4 = _nudge_mock_patch()
+
+    with p1, p2, p3, p4:
+        first = await ts.get_task(pid, first_id)
+        assert await _nudge_with_mocks(pid, first) is True
+        await ts.unclaim_task(pid, first_id)
+    after = await ts.get_task(pid, second_id)
+    assert after["status"] == "claimed"
+
+
+@pytest.mark.asyncio
+async def test_verify_serialize_lock_reentrant_no_deadlock(task_env):
+    """审计 SUGGESTED：锁必须可重入，避免锁内 agent.chat 回合再调 claim_task 死锁。
+
+    _VerifySerializeLock 持锁期间（claim → _transition → wait-contract 触发
+    → agent.chat 的 LLM 回合）与触发方是同一 asyncio task。若该 LLM 回合再调
+    claim_task（默认非 bypass）会重入同一把锁 —— 不可重入锁将永久死锁。
+    此处直接验证重入 acquire / release 语义：同 task 重入放行、深度计数正确、
+    异 task 仍互斥排队。
+    """
+    from hiveweave.tools.tasks.verify_spawn import _verify_serialize_lock
+
+    lk = _verify_serialize_lock("proj-reentrant")
+    entered = 0
+    released = 0
+
+    # 同 task：最内层持锁中再 acquire（模拟 LLM 回合内 claim_task 重入）
+    async with lk:
+        entered += 1
+        async with lk:
+            entered += 1
+        released += 1
+    released += 1
+
+    assert entered == 2
+    assert released == 2
+    assert not lk.locked()
+
+    # 异 task 互斥：第二个协程必须等第一个释放后才拿到锁
+    order: list[str] = []
+
+    async def holder(name: str, delay: float) -> None:
+        async with _verify_serialize_lock("proj-reentrant"):
+            order.append(f"{name}:in")
+            await asyncio.sleep(delay)
+            order.append(f"{name}:out")
+
+    await asyncio.gather(
+        holder("a", 0.05),
+        holder("b", 0.0),
+    )
+    assert order == ["a:in", "a:out", "b:in", "b:out"]
+
+
+@pytest.mark.asyncio
+async def test_verify_serialize_lock_release_skips_cancelled_waiter():
+    """回归：release 必须跳过已取消的队首 waiter，唤醒下一个存活等待者。
+
+    审计发现：Task.cancel() 会同步取消 waiter 的 fut，但其 finally 出队
+    清理要等事件循环下一轮才执行。owner 若恰在此窗口内 release，旧实现
+    只弹出这个已死 fut 便不再唤醒任何人 —— 剩余 waiter 的 fut 永不
+    resolve，该项目 VERIFY 队列永久假死（agent cancel / safety timeout
+    都会制造此窗口）。
+    """
+    from hiveweave.tools.tasks.verify_spawn import _verify_serialize_lock
+
+    lk = _verify_serialize_lock("proj-cancel-skip")
+    acquired: list[str] = []
+
+    async def waiter(name: str) -> None:
+        async with lk:
+            acquired.append(name)
+
+    await lk.acquire()
+    dead = asyncio.create_task(waiter("dead"))
+    live = asyncio.create_task(waiter("live"))
+    await asyncio.sleep(0.01)  # 两个 waiter 均已入队等锁
+    assert dead.cancel() is True  # fut 同步取消；其 finally 出队清理尚未执行
+    lk.release()  # 队首已死：旧实现不再唤醒任何人，修复后须唤醒 live
+    await asyncio.wait_for(live, timeout=2)
+    assert acquired == ["live"]
+    try:
+        await dead
+    except asyncio.CancelledError:
+        pass
+    assert not lk.locked()
+
+
+@pytest.mark.asyncio
+async def test_verify_serialize_lock_woken_waiter_cancelled_hands_off():
+    """回归：被唤醒的 waiter 死在恢复运行前，必须把唤醒权交接给下一个。
+
+    镜像窗口（子代理审计 R1）：release() 的 set_result 与 waiter 的 __step
+    之间隔一轮事件循环；此窗口内 Task.cancel() 走 _must_cancel 路径，waiter
+    恢复时 await fut 抛 CancelledError、从未成为 owner，owner 已是 None。
+    不做交接则后续 waiter 的 fut 永不 resolve → 队列假死（同 CPython
+    asyncio.Lock 的 CancelledError 交接模式）。release 与 cancel 均为同步
+    调用、中间无 await，时序确定性成立。
+    """
+    from hiveweave.tools.tasks.verify_spawn import _verify_serialize_lock
+
+    lk = _verify_serialize_lock("proj-woken-cancel")
+    acquired: list[str] = []
+
+    async def waiter(name: str) -> None:
+        async with lk:
+            acquired.append(name)
+
+    await lk.acquire()
+    w1 = asyncio.create_task(waiter("w1"))
+    w2 = asyncio.create_task(waiter("w2"))
+    await asyncio.sleep(0.01)  # w1/w2 均入队等锁
+    lk.release()  # 唤醒 w1（set_result），但 w1 尚未恢复运行
+    assert w1.cancel() is True  # fut 已 done → _must_cancel：恢复时抛 CancelledError
+    await asyncio.wait_for(w2, timeout=2)  # w1 必须交接唤醒 w2
+    assert acquired == ["w2"]
+    try:
+        await w1
+    except asyncio.CancelledError:
+        pass
+    assert not lk.locked()

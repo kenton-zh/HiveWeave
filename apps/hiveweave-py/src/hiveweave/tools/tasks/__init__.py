@@ -17,6 +17,7 @@ from . import (  # noqa: F401
 
 # Re-export helpers used outside this package
 from .verify import (  # noqa: F401
+    nudge_pending_verify_tasks,
     nudge_stale_verify_tasks,
     nudge_verify_tasks_after_merge,
     parse_short_id_from_branch,
@@ -27,6 +28,7 @@ from .verify import (  # noqa: F401
 )
 
 __all__ = [
+    "nudge_pending_verify_tasks",
     "nudge_stale_verify_tasks",
     "nudge_verify_tasks_after_merge",
     "parse_short_id_from_branch",

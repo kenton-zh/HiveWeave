@@ -18,6 +18,7 @@ from hiveweave.tools.tasks.verify_spawn import (
     _nudge_one_verify_task,
     _spawn_post_approve_verify_task,
     _stale_verify_cooldowns,
+    nudge_pending_verify_tasks,
 )
 
 log = structlog.get_logger(__name__)
@@ -254,11 +255,17 @@ async def nudge_verify_tasks_after_merge(
 
     tasks = await ts.list_tasks(project_id)
     nudged = 0
-    for t in tasks:
+    # 公平性（审计可选）：验收串行化下至多唤醒一个，按 created_at 最老优先。
+    for t in sorted(
+        tasks,
+        key=lambda x: (x.get("created_at") or 0, x.get("id") or ""),
+    ):
         # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不触发）
         if not (t.get("title") or "").startswith("VERIFY:"):
             continue
-        if t.get("status") not in ("created", "claimed", "running"):
+        # 审计 O2：只剩 created/claimed —— running 的 VERIFY 已在跑，merge
+        # nudge 不得再骚扰（它会被 except_id 自豁免而重复 send+trigger）。
+        if t.get("status") not in ("created", "claimed"):
             continue
         # Only VERIFY children of parents covered by this merge
         if parent_ids:

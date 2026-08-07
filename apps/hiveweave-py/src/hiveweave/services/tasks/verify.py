@@ -209,6 +209,26 @@ class VerifyMixin:
             await self._close_sibling_verify_tasks(
                 project_id, parent_id, except_id=verify_id
             )
+        # 验收串行化（issue #6）：前置 VERIFY 收口即释放 MAIN 运行时独占，唤醒
+        # 队列中下一个 created VERIFY。best-effort；game_time tick 兜底。
+        try:
+            from hiveweave.tools.tasks.verify_spawn import (
+                nudge_pending_verify_tasks,
+            )
+
+            pumped = await nudge_pending_verify_tasks(project_id)
+            if pumped:
+                log.info(
+                    "verify_pending_pumped_after_close",
+                    verify_id=verify_id,
+                    pumped=pumped,
+                )
+        except Exception as e:
+            log.warning(
+                "verify_pending_pump_failed",
+                verify_id=verify_id,
+                error=str(e),
+            )
 
         if not parent_id:
             # Infer: title "VERIFY: <parent title>" + same assignee

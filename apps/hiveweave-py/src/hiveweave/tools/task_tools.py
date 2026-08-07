@@ -9,6 +9,7 @@ from __future__ import annotations
 import hiveweave.tools.tasks  # noqa: F401
 
 from hiveweave.tools.tasks.verify import (  # noqa: F401
+    nudge_pending_verify_tasks,
     nudge_stale_verify_tasks,
     nudge_verify_tasks_after_merge,
     parse_short_id_from_branch,
@@ -70,6 +71,7 @@ __all__ = [
     "ReviewTaskParams",
     "review_task_tool",
     "retry_qa_blocked_verify_tasks",
+    "nudge_pending_verify_tasks",
     "nudge_stale_verify_tasks",
     "nudge_verify_tasks_after_merge",
     "parse_short_id_from_branch",
