@@ -29,9 +29,12 @@ async def _diff_touches_scope(
 
     Issue #5: baseline staleness should be judged by whether the newer
     commits actually touch the verification scope, not by raw tip distance.
-    Returns None when the scope is empty (can't judge — caller falls back to
-    the distance-only rule) or when git diff fails (fail-closed → caller
-    treats as "touched" to stay conservative).
+    Returns None when the scope is empty or undecidable (caller keeps the
+    stale reject — fail-closed), False when provably untouched, True when
+    touched. A scope entry that points into an untracked area (e.g.
+    ``.hiveweave/``, which is gitignored) can never appear in a git diff —
+    we treat that as undecidable (None) instead of "untouched", so we never
+    silently approve on a scope that git cannot verify.
     """
     if not scope_files or not main_tip or not ch:
         return None
@@ -39,16 +42,39 @@ async def _diff_touches_scope(
         from hiveweave.services.git_worktree import _git
         from hiveweave.services.worktree_review import normalize_evidence_path
 
+        # Untracked verification scope cannot be validated by git diff — be
+        # conservative (undecidable) rather than risk a silent approve.
+        if any(
+            s.startswith(".hiveweave/") or s == ".hiveweave"
+            for s in scope_files
+        ):
+            return None
+
         ok, out = await _git(
             ["diff", "--name-only", ch, main_tip],
             main_ws,
         )
         if not ok:
             return None
-        changed = {normalize_evidence_path(p) for p in out.splitlines() if p.strip()}
+        changed = [normalize_evidence_path(p) for p in out.splitlines() if p.strip()]
         if not changed:
             return False  # no changed files — nothing to re-run
-        return bool(changed & scope_files)
+        # Match with casefold (Windows-tolerant) and treat a scope entry as
+        # touching when it is a file OR a directory prefix of a changed path.
+        # Exact set intersection would miss directory-level scope entries
+        # (e.g. scope="frontend/" vs changed="frontend/Button.tsx") and
+        # wrongly report "untouched", silently approving a real scope hit.
+        changed_folded = {p.casefold().rstrip("/") for p in changed}
+        for s in scope_files:
+            s_norm = s.casefold().rstrip("/")
+            if not s_norm:
+                continue
+            if any(
+                c == s_norm or c.startswith(s_norm + "/")
+                for c in changed_folded
+            ):
+                return True
+        return False
     except Exception:
         return None
 
@@ -1250,7 +1276,8 @@ async def check_verify_baseline(
     # while this VERIFY targets backend). If the diff between the attestation
     # commit and main tip does NOT touch the verification scope (the files the
     # parent task changed), the baseline is still valid — forcing rework would
-    # be pure waste. Compute the scope up-front (best-effort, fail-open → []).
+    # be pure waste. Compute the scope up-front. Extraction failure → empty
+    # scope → _diff_touches_scope returns None → caller keeps stale (fail-closed).
     scope_files: set[str] = set()
     parent_id = str(task.get("parent_task_id") or "").strip()
     if parent_id:
@@ -1268,7 +1295,12 @@ async def check_verify_baseline(
                         pev = {}
                 if isinstance(pev, dict):
                     raw = pev.get("files_changed") or pev.get("filesChanged") or []
-                    scope_files = set(normalize_files_changed(raw))
+                    # Guard against a non-list (e.g. a bare str) leaking in —
+                    # normalize_files_changed would iterate a str char-by-char
+                    # and produce junk single-char scope entries that never
+                    # match a diff path → wrongly "untouched". Treat as empty.
+                    if isinstance(raw, list):
+                        scope_files = set(normalize_files_changed(raw))
         except Exception:
             scope_files = set()
 

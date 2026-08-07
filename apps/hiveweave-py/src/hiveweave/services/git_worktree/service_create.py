@@ -15,8 +15,8 @@ from .constants import (
     GENERATED_FILES,
     GIT_TIMEOUT,
     GITIGNORE_GENERATED_ENTRIES,
-    HIVEWEAVE_DIR,
     QUARANTINE_DIR,
+    SHARED_DIR,
     WORKTREE_DIR,
     _RELOCATION_SUFFIXES,
     _WT_LIST_RE,
@@ -227,27 +227,35 @@ yarn.lock merge=union
         the project root via an absolute path or peek into another owner's
         worktree. Mirroring the shared dir into each worktree makes contracts
         locally readable by every agent. Idempotent; missing source → no-op.
+
+        Merge semantics: files are copied (overwrite), directories are merged
+        with ``dirs_exist_ok`` — we never ``rmtree`` a worktree-local shared
+        subdir, so a repeated create cannot wipe files the agent added locally.
+        Symlinks are skipped (we don't dereference project-external targets).
         """
         if not worktree_path:
             return
-        src = Path(workspace_path) / HIVEWEAVE_DIR / "shared"
-        dst = Path(worktree_path) / HIVEWEAVE_DIR / "shared"
+        src = Path(workspace_path) / SHARED_DIR
+        dst = Path(worktree_path) / SHARED_DIR
         if not src.exists():
             return
         dst.mkdir(parents=True, exist_ok=True)
+        copied = 0
         for item in src.iterdir():
             s = src / item.name
+            if s.is_symlink():
+                continue  # don't dereference external targets into worktrees
             d = dst / item.name
-            if s.is_file():
+            if s.is_dir():
+                shutil.copytree(s, d, dirs_exist_ok=True)
+                copied += 1
+            elif s.is_file():
                 shutil.copy2(s, d)
-            elif s.is_dir():
-                if d.exists():
-                    shutil.rmtree(d, ignore_errors=True)
-                shutil.copytree(s, d)
+                copied += 1
         log.info(
             "git_worktree.shared_synced",
             worktree=worktree_path,
-            shared=len(list(src.iterdir())),
+            copied=copied,
         )
 
     # ── 1. CREATE ────────────────────────────────────────────
@@ -273,24 +281,27 @@ yarn.lock merge=union
             result = await self._create_unlocked(
                 workspace_path, short_id, task_name, base_branch, task_id=task_id
             )
-            # Issue #3: contract sharing — .hiveweave/ is gitignored so shared
-            # contract files never reach a fresh worktree, leaving cross-end
-            # agents (e.g. frontend needing the backend API) able to read the
-            # contract only by peeking into the project root. Sync the project's
-            # .hiveweave/shared/ into the worktree so contracts are locally
-            # visible to every agent. Best-effort; never fail the create.
-            if result.get("success"):
-                try:
-                    self._sync_shared_contracts(
-                        workspace_path, result.get("path") or ""
-                    )
-                except Exception as e:
-                    log.warning(
-                        "git_worktree.shared_sync_failed",
-                        short_id=short_id,
-                        error=str(e),
-                    )
-            return result
+        # Issue #3: contract sharing — .hiveweave/ is gitignored so shared
+        # contract files never reach a fresh worktree, leaving cross-end agents
+        # (e.g. frontend needing the backend API) able to read the contract only
+        # by peeking into the project root. Sync the project's .hiveweave/shared/
+        # into the worktree so contracts are locally visible to every agent.
+        # Deliberately OUTSIDE the create lock and run in a thread executor: the
+        # copy is blocking file I/O that must not hold the lock or stall the event
+        # loop. Best-effort; never fails the create.
+        if result.get("success"):
+            wt_path = result.get("path") or ""
+            try:
+                await asyncio.to_thread(
+                    self._sync_shared_contracts, workspace_path, wt_path
+                )
+            except Exception as e:
+                log.warning(
+                    "git_worktree.shared_sync_failed",
+                    short_id=short_id,
+                    error=str(e),
+                )
+        return result
 
     async def _create_unlocked(
         self,
