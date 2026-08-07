@@ -15,6 +15,7 @@ from .constants import (
     GENERATED_FILES,
     GIT_TIMEOUT,
     GITIGNORE_GENERATED_ENTRIES,
+    HIVEWEAVE_DIR,
     QUARANTINE_DIR,
     WORKTREE_DIR,
     _RELOCATION_SUFFIXES,
@@ -217,6 +218,38 @@ yarn.lock merge=union
         path = _worktree_path(workspace_path, short_id)
         return path if _has_git(path) else None
 
+    def _sync_shared_contracts(self, workspace_path: str, worktree_path: str) -> None:
+        """Issue #3: copy the project's ``.hiveweave/shared/`` into a worktree.
+
+        ``.hiveweave/`` is gitignored, so a freshly created worktree has no
+        shared contracts (``taskflow-contract.md`` etc.). Cross-end agents
+        (frontend aligning to the backend API) previously had to either read
+        the project root via an absolute path or peek into another owner's
+        worktree. Mirroring the shared dir into each worktree makes contracts
+        locally readable by every agent. Idempotent; missing source → no-op.
+        """
+        if not worktree_path:
+            return
+        src = Path(workspace_path) / HIVEWEAVE_DIR / "shared"
+        dst = Path(worktree_path) / HIVEWEAVE_DIR / "shared"
+        if not src.exists():
+            return
+        dst.mkdir(parents=True, exist_ok=True)
+        for item in src.iterdir():
+            s = src / item.name
+            d = dst / item.name
+            if s.is_file():
+                shutil.copy2(s, d)
+            elif s.is_dir():
+                if d.exists():
+                    shutil.rmtree(d, ignore_errors=True)
+                shutil.copytree(s, d)
+        log.info(
+            "git_worktree.shared_synced",
+            worktree=worktree_path,
+            shared=len(list(src.iterdir())),
+        )
+
     # ── 1. CREATE ────────────────────────────────────────────
 
     async def create(self, workspace_path: str, short_id: str,
@@ -237,9 +270,27 @@ yarn.lock merge=union
                 lock = asyncio.Lock()
                 _create_locks[lock_key] = lock
         async with lock:
-            return await self._create_unlocked(
+            result = await self._create_unlocked(
                 workspace_path, short_id, task_name, base_branch, task_id=task_id
             )
+            # Issue #3: contract sharing — .hiveweave/ is gitignored so shared
+            # contract files never reach a fresh worktree, leaving cross-end
+            # agents (e.g. frontend needing the backend API) able to read the
+            # contract only by peeking into the project root. Sync the project's
+            # .hiveweave/shared/ into the worktree so contracts are locally
+            # visible to every agent. Best-effort; never fail the create.
+            if result.get("success"):
+                try:
+                    self._sync_shared_contracts(
+                        workspace_path, result.get("path") or ""
+                    )
+                except Exception as e:
+                    log.warning(
+                        "git_worktree.shared_sync_failed",
+                        short_id=short_id,
+                        error=str(e),
+                    )
+            return result
 
     async def _create_unlocked(
         self,

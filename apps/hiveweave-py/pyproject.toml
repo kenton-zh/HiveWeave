@@ -50,5 +50,7 @@ exclude = [
 
 [dependency-groups]
 dev = [
+    "mypy>=2.2.0",
     "pytest>=9.1.1",
+    "pytest-asyncio>=0.23",
 ]
