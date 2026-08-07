@@ -31,10 +31,17 @@ async def _diff_touches_scope(
     commits actually touch the verification scope, not by raw tip distance.
     Returns None when the scope is empty or undecidable (caller keeps the
     stale reject — fail-closed), False when provably untouched, True when
-    touched. A scope entry that points into an untracked area (e.g.
-    ``.hiveweave/``, which is gitignored) can never appear in a git diff —
-    we treat that as undecidable (None) instead of "untouched", so we never
-    silently approve on a scope that git cannot verify.
+    touched.
+
+    A scope entry that lives in an area git cannot reflect in a diff —
+    gitignored/untracked paths (e.g. ``.hiveweave/``, ``node_modules/``,
+    worktree-scoped evidence files whose prefix was normalized away) — can
+    never match a ``git diff --name-only`` output. Treating such an entry as
+    "untouched" would silently approve on a scope git cannot verify. We
+    decide per-entry: an entry is *verifiable* iff it correspond to a tracked
+    path (probed with ``git ls-files``, which is case-insensitive-safe); any
+    unverifiable entry left in play makes the whole result undecidable (None)
+    unless a verifiable entry provably touches the diff.
     """
     if not scope_files or not main_tip or not ch:
         return None
@@ -42,13 +49,35 @@ async def _diff_touches_scope(
         from hiveweave.services.git_worktree import _git
         from hiveweave.services.worktree_review import normalize_evidence_path
 
-        # Untracked verification scope cannot be validated by git diff — be
-        # conservative (undecidable) rather than risk a silent approve.
-        if any(
-            s.startswith(".hiveweave/") or s == ".hiveweave"
-            for s in scope_files
-        ):
+        if not scope_files:
             return None
+
+        # A scope entry is verifiable only if it matches a tracked path.
+        # ``git ls-files`` is case-insensitive-safe (a case-mismatched
+        # ``.Hiveweave/...`` simply matches no tracked path → unverifiable),
+        # and naturally covers every gitignored/untracked prefix, so this is
+        # more robust than a hardcoded ``.hiveweave/`` prefix check.
+        ok, tracked_out = await _git(["ls-files"], main_ws)
+        if not ok:
+            return None  # can't tell what's verifiable → fail-closed
+        tracked = {
+            normalize_evidence_path(p).casefold().rstrip("/")
+            for p in tracked_out.splitlines()
+            if p.strip()
+        }
+        verifiable: set[str] = set()
+        unverifiable: set[str] = set()
+        for s in scope_files:
+            s_norm = s.casefold().rstrip("/")
+            if not s_norm:
+                continue
+            if any(
+                t == s_norm or t.startswith(s_norm + "/")
+                for t in tracked
+            ):
+                verifiable.add(s_norm)
+            else:
+                unverifiable.add(s_norm)
 
         ok, out = await _git(
             ["diff", "--name-only", ch, main_tip],
@@ -59,21 +88,22 @@ async def _diff_touches_scope(
         changed = [normalize_evidence_path(p) for p in out.splitlines() if p.strip()]
         if not changed:
             return False  # no changed files — nothing to re-run
-        # Match with casefold (Windows-tolerant) and treat a scope entry as
-        # touching when it is a file OR a directory prefix of a changed path.
-        # Exact set intersection would miss directory-level scope entries
-        # (e.g. scope="frontend/" vs changed="frontend/Button.tsx") and
-        # wrongly report "untouched", silently approving a real scope hit.
+        # Match (casefold already applied) treating a scope entry as touching
+        # when it is a file OR a directory prefix of a changed path. Exact set
+        # intersection would miss directory-level scope entries (e.g.
+        # scope="frontend/" vs changed="frontend/Button.tsx") and wrongly
+        # report "untouched", silently approving a real scope hit.
         changed_folded = {p.casefold().rstrip("/") for p in changed}
-        for s in scope_files:
-            s_norm = s.casefold().rstrip("/")
-            if not s_norm:
-                continue
+        for s_norm in verifiable:
             if any(
                 c == s_norm or c.startswith(s_norm + "/")
                 for c in changed_folded
             ):
                 return True
+        # No verifiable entry touched. If any unverifiable entry remains in
+        # play we cannot prove the scope was untouched → fail-closed.
+        if unverifiable:
+            return None
         return False
     except Exception:
         return None
