@@ -169,6 +169,172 @@ async def test_verify_baseline_rejects_behind_touching_scope():
     assert "stale" in err.lower() or "baseline" in err.lower()
 
 
+# ── #5 edge cases (audit fixes) ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verify_baseline_rejects_directory_scope_touched():
+    """Directory-level scope entry must match files under it (prefix match)."""
+    from hiveweave.services.attestation import check_verify_baseline
+
+    tip = "8992c22abcdef0123456789"
+    att = "797ff6dbeef0123456789ab"
+    task = {
+        "id": "verify-1",
+        "title": "VERIFY: backend",
+        "parent_task_id": "parent-1",
+        "evidence": {"target_merge_commit": "62164ddc111122223333444"},
+    }
+    rows = [
+        {
+            "id": "att1",
+            "kind": "test_run",
+            "commit_hash": att,
+            "exit_code": 0,
+        }
+    ]
+    conn = _mock_conn(rows)
+    # Scope is a directory prefix; diff touches a file under it.
+    parent = {
+        "id": "parent-1",
+        "evidence": {"files_changed": ["backend/"]},
+    }
+
+    async def fake_git(args, cwd, timeout=30.0):
+        if args[0:2] == ["rev-parse", "HEAD"]:
+            return (True, tip + "\n")
+        if args[0:2] == ["merge-base", "--is-ancestor"]:
+            return (True, "")
+        if args[0] == "rev-list":
+            return (True, "7\n")
+        if args[0:2] == ["diff", "--name-only"]:
+            return (True, "backend/main.py\n")
+        return (False, "")
+
+    with (
+        patch(
+            "hiveweave.services.attestation.attestation_service.ensure_schema",
+            AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.attestation._conn",
+            AsyncMock(return_value=conn),
+        ),
+        patch(
+            "hiveweave.services.worktree_review.project_main_workspace",
+            AsyncMock(return_value="/proj"),
+        ),
+        patch(
+            "hiveweave.services.git_worktree._git",
+            side_effect=fake_git,
+        ),
+        patch(
+            "hiveweave.services.task.TaskService",
+        ) as TS,
+    ):
+        TS.return_value.get_task = AsyncMock(return_value=parent)
+        err = await check_verify_baseline("p1", task, max_behind=5)
+
+    assert err is not None, "directory scope + file under it must be a scope hit"
+
+
+@pytest.mark.asyncio
+async def test_verify_baseline_rejects_hiveweave_scope_undecidable():
+    """Scope under untracked .hiveweave/ → undecidable → keep stale (reject)."""
+    from hiveweave.services.attestation import check_verify_baseline
+
+    tip = "8992c22abcdef0123456789"
+    att = "797ff6dbeef0123456789ab"
+    task = {
+        "id": "verify-1",
+        "title": "VERIFY: backend",
+        "parent_task_id": "parent-1",
+        "evidence": {"target_merge_commit": "62164ddc111122223333444"},
+    }
+    rows = [
+        {
+            "id": "att1",
+            "kind": "test_run",
+            "commit_hash": att,
+            "exit_code": 0,
+        }
+    ]
+    conn = _mock_conn(rows)
+    parent = {
+        "id": "parent-1",
+        "evidence": {"files_changed": [".hiveweave/reports/evidence.md"]},
+    }
+
+    async def fake_git(args, cwd, timeout=30.0):
+        if args[0:2] == ["rev-parse", "HEAD"]:
+            return (True, tip + "\n")
+        if args[0:2] == ["merge-base", "--is-ancestor"]:
+            return (True, "")
+        if args[0] == "rev-list":
+            return (True, "7\n")
+        # diff never returns .hiveweave paths (gitignored) — but we must not
+        # treat that as "untouched"; the guard returns None → reject.
+        if args[0:2] == ["diff", "--name-only"]:
+            return (True, "frontend/app.js\n")
+        return (False, "")
+
+    with (
+        patch(
+            "hiveweave.services.attestation.attestation_service.ensure_schema",
+            AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.attestation._conn",
+            AsyncMock(return_value=conn),
+        ),
+        patch(
+            "hiveweave.services.worktree_review.project_main_workspace",
+            AsyncMock(return_value="/proj"),
+        ),
+        patch(
+            "hiveweave.services.git_worktree._git",
+            side_effect=fake_git,
+        ),
+        patch(
+            "hiveweave.services.task.TaskService",
+        ) as TS,
+    ):
+        TS.return_value.get_task = AsyncMock(return_value=parent)
+        err = await check_verify_baseline("p1", task, max_behind=5)
+
+    assert err is not None, ".hiveweave scope is undecidable → must stay stale"
+
+
+@pytest.mark.asyncio
+async def test_diff_touches_scope_none_on_fail_closed():
+    """git diff failure → None (fail-closed); caller must not approve."""
+    from hiveweave.services.attestation import _diff_touches_scope
+
+    with patch(
+        "hiveweave.services.git_worktree._git",
+        AsyncMock(return_value=(False, "git error")),
+    ):
+        r = await _diff_touches_scope("/proj", "a", "b", {"backend/main.py"})
+    assert r is None
+
+
+@pytest.mark.asyncio
+async def test_diff_touches_scope_casefold_and_prefix():
+    """casefold + directory-prefix matching works."""
+    from hiveweave.services.attestation import _diff_touches_scope
+
+    async def fake_git(args, cwd, timeout=30.0):
+        return (True, "Frontend/Button.TSX\nFrontend/Styles.css\n")
+
+    with patch(
+        "hiveweave.services.git_worktree._git",
+        side_effect=fake_git,
+    ):
+        # scope lowercase "frontend/" must match casefold'd "frontend/...".
+        r = await _diff_touches_scope("/proj", "a", "b", {"frontend/"})
+    assert r is True
+
+
 # ── #3: contract sharing into worktrees ──────────────────────────────────
 
 
