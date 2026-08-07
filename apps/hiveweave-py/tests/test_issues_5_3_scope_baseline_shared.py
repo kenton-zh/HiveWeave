@@ -410,6 +410,29 @@ async def test_diff_touches_scope_empty_diff_returns_false():
 
 
 @pytest.mark.asyncio
+async def test_diff_touches_scope_empty_diff_unverifiable_fail_closed():
+    """Empty tracked diff with an unverifiable scope entry → None (fail-closed),
+    not False: we cannot prove the gitignored entry was unaffected."""
+    from hiveweave.services.attestation import _diff_touches_scope
+
+    async def fake_git(args, cwd, timeout=30.0):
+        if args[0] == "ls-files":
+            return (True, "backend/main.py\n")
+        if args[0:2] == ["diff", "--name-only"]:
+            return (True, "")
+        return (False, "")
+
+    with patch(
+        "hiveweave.services.git_worktree._git",
+        side_effect=fake_git,
+    ):
+        r = await _diff_touches_scope(
+            "/proj", "a", "b", {".hiveweave/reports/evidence.md"}
+        )
+    assert r is None, "unverifiable scope must stay undecidable on empty diff"
+
+
+@pytest.mark.asyncio
 async def test_diff_touches_scope_mixed_unverifiable_fail_closed():
     """Mixed scope with an unverifiable entry and untouched code → None
     (cannot prove the gitignored entry was unaffected)."""
@@ -582,6 +605,31 @@ def test_sync_shared_skips_symlink(tmp_path):
 
     dst_link = wt / ".hiveweave" / "shared" / "link.md"
     assert not dst_link.exists(), "symlink must not be dereferenced into worktree"
+
+
+def test_sync_shared_skips_nested_symlink(tmp_path):
+    """A symlink nested inside a copied directory is also not dereferenced."""
+    import os
+
+    from hiveweave.services.git_worktree.service_create import CreateMixin
+
+    svc = CreateMixin()
+    ws = tmp_path / "proj"
+    wt = ws / ".hiveweave" / "worktrees" / "A"
+    src_dir = ws / ".hiveweave" / "shared" / "bundle"
+    src_dir.mkdir(parents=True)
+    (src_dir / "real.txt").write_text("ok", encoding="utf-8")
+    target = tmp_path / "outside.txt"
+    target.write_text("secret", encoding="utf-8")
+    os.symlink(str(target), src_dir / "leak.md")
+
+    svc._sync_shared_contracts(str(ws), str(wt))
+
+    dst_bundle = wt / ".hiveweave" / "shared" / "bundle"
+    assert (dst_bundle / "real.txt").read_text(encoding="utf-8") == "ok"
+    assert not (
+        dst_bundle / "leak.md"
+    ).exists(), "nested symlink must not be dereferenced into worktree"
 
 
 @pytest.mark.asyncio
