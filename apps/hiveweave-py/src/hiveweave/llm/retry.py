@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from email.utils import parsedate_to_datetime
 from typing import Awaitable, Callable, TypeVar
 
@@ -29,13 +30,50 @@ MAX_RETRIES = 2
 """最大重试次数（不含首次请求）。契约 01。"""
 
 BASE_DELAY_MS = 1_000
-"""指数退避基础延迟（1 秒）。用户指定 base=1s。"""
+"""基础退避延迟（1 秒）。用户指定 base=1s。"""
 
 MAX_DELAY_MS = 30_000
 """单次退避上限（30 秒），防止 Retry-After 返回过大值。"""
 
-RETRYABLE_STATUSES: frozenset[int] = frozenset({429, 503, 504, 529})
-"""可重试的 HTTP 状态码。对齐 Elixir/TS。"""
+RETRYABLE_STATUSES: frozenset[int] = frozenset(range(500, 600)) | frozenset({429})
+"""可重试的 HTTP 状态码：429 + 全量 5xx。
+
+历史实现只认 {429, 503, 504, 529}，但多厂商网关（ARK / DeepSeek / OpenAI /
+任何 OpenAI-compatible）抽风时常用 500 / 502 / 524。漏掉这些会把瞬态故障
+误判为 PermanentError，直接炸掉 agent。对齐 opencode retry.ts 的
+`status >= 500` 一律可重试策略。
+"""
+
+# 消息内容级可重试模式（厂商无关，移植自 opencode retry.ts RETRYABLE_MESSAGE_PATTERNS）。
+# 适用场景：网关在 HTTP 200 / 非标准 4xx body 里包瞬态错误文本（如
+# "upstream server error"、"rate limit reached"），仅靠状态码无法识别。
+# 注意：这里匹配的是错误 body / 错误消息文本，不是正常响应流。
+#
+# 状态码单条用 (?<![\d])…(?![\d]) 锚定为独立数字，避免误命中真实业务数字
+# （"requested 100500 tokens"→500 / 日期→429 / "524288"→524）。real 事故见
+# tests/test_retry_message_classify.py::test_non_retryable。
+_RETRYABLE_MESSAGE_PATTERNS: tuple[str, ...] = (
+    r"(?<![\d])(?:429|5\d{2})(?![\d])",
+    r"rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests|too_many_requests",
+    r"overloaded|service unavailable|service_unavailable|service-unavailable|"
+    r"internal error|internal_error|internal server error|server error|server_error|server-error|"
+    r"provider returned error|provider_returned_error|provider-returned-error",
+    r"terminated|fetch failed|failed to fetch|network error|upstream connect|"
+    r"connection error|connection refused|connection lost|"
+    r"socket connection was closed|socket hang up|reset by peer|getaddrinfo|gai_error|"
+    r"enotfound|eai_again|econnrefused|econnreset|etimedout",
+    r"^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b",
+    r"try your request|retry your request|resource exhausted|resource_exhausted",
+    # 中文厂商文案（ARK / 火山引擎 / 字节豆包 / 通义等常见 on-line 网关）：
+    # 英文模式对中文错误文本 miss，导致瞬态错误被误判为永久错误。
+    r"限流|请求过于频繁|访问频率过高|触发(?:了)?限流",
+    r"过载|服务器(?:内部|异常|不可用|繁忙)|服务(?:繁忙|不可用)|上游|暂时无法|暂不可用|"
+    r"连接(?:失败|中断|重置|超时)|网络连接|读超时|(?:请求|响应|读)超时",
+    r"请(?:稍后|重新)重试|请(?:您)?重试|稍后重试|临时(?:故障|问题)",
+)
+_COMPILED_RETRYABLE_PATTERNS = tuple(
+    re.compile(p, re.IGNORECASE) for p in _RETRYABLE_MESSAGE_PATTERNS
+)
 
 T = TypeVar("T")
 
@@ -43,8 +81,39 @@ T = TypeVar("T")
 # ── 状态码判定 ──────────────────────────────────────────────
 
 def is_retryable_status(status: int) -> bool:
-    """判断 HTTP 状态码是否可重试。"""
+    """判断 HTTP 状态码是否可重试（429 + 全量 5xx）。"""
     return status in RETRYABLE_STATUSES
+
+
+def matches_retryable_message(value: str) -> bool:
+    """判断错误文本是否命中可重试内容模式（厂商无关）。
+
+    移植 opencode retry.ts：错误消息即使状态码正常（如 HTTP 200 / 非标准
+    4xx），只要文本命中速率限制 / 过载 / 网络问题 / 明确要求重试等模式，
+    就应视为瞬态故障重试。厂商无关，写死的只是通用英文错误文本。
+    """
+    return any(pattern.search(value) for pattern in _COMPILED_RETRYABLE_PATTERNS)
+
+
+def classify_http_error(
+    status: int | None,
+    body: str,
+    headers: dict[str, str] | None = None,
+) -> RetryableError | PermanentError:
+    """把一次 HTTP/流错误分类为可重试或永久错误。
+
+    优先级：状态码（429 + 5xx）或 body 内容命中可重试模式 → RetryableError；
+    否则 PermanentError。用于 ``streamer/http_stream.py`` 的非 200 分支
+    和流中 error chunk —— 兜住多厂商「状态码正常但 body 包瞬态错误」的情况。
+    """
+    snippet = body[:500]
+    if status is not None:
+        message = f"HTTP {status}: {snippet}"
+    else:
+        message = snippet
+    if (status is not None and is_retryable_status(status)) or matches_retryable_message(body):
+        return RetryableError(message, status=status, headers=headers or {})
+    return PermanentError(message, status=status)
 
 
 def should_retry_exception(exc: BaseException) -> bool:

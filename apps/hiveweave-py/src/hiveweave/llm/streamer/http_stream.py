@@ -12,7 +12,11 @@ import httpx
 import structlog
 
 from hiveweave.llm.provider import ProviderConfig, READ_TIMEOUT_S
-from hiveweave.llm.retry import PermanentError, RetryableError, is_retryable_status
+from hiveweave.llm.retry import (
+    PermanentError,
+    RetryableError,
+    classify_http_error,
+)
 
 from .constants import (
     CONTINUE_SENTINEL,
@@ -318,16 +322,10 @@ class HttpStreamMixin:
                             f"Connection error: {raw['connect_error']}"
                         )
                     if raw.get("http_status"):
-                        if is_retryable_status(raw["http_status"]):
-                            raise RetryableError(
-                                f"HTTP {raw['http_status']}: "
-                                f"{raw['body'][:500]}",
-                                status=raw["http_status"],
-                                headers=raw.get("headers", {}),
-                            )
-                        raise PermanentError(
-                            f"HTTP {raw['http_status']}: {raw['body'][:500]}",
-                            status=raw["http_status"],
+                        raise classify_http_error(
+                            raw["http_status"],
+                            raw.get("body", ""),
+                            headers=raw.get("headers", {}),
                         )
                     raise RetryableError(
                         raw.get("error", "Unknown HTTP error")
@@ -376,11 +374,19 @@ class HttpStreamMixin:
                             or finish_reason
                         )
                     elif ctype == "error":
+                        # 流中错误 chunk（HTTP 200 但 body 内包 error）不能吞掉：
+                        # 旧实现只打日志继续跑，最终返回 status:"ok" 空文本，
+                        # 被拖进空响应重试循环甚至误判为成功空回合
+                        # （对齐 opencode preserve compatible stream errors）。
+                        # 交给 classify_http_error 按内容判定重试/永久，
+                        # 与 HTTP 非 200 分支走同一套多厂商瞬态错误识别。
+                        error_content = str(c.get("content", ""))
                         log.warning(
                             "sse_error_chunk",
                             agent_id=agent_id,
-                            error=c.get("content"),
+                            error=error_content,
                         )
+                        raise classify_http_error(None, error_content)
         finally:
             try:
                 await executor_task

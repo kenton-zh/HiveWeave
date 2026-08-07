@@ -38,8 +38,10 @@ from hiveweave.llm.retry import (
     RetryHandler,
     RetryableError,
     RETRYABLE_STATUSES,
+    classify_http_error,
     compute_backoff,
     is_retryable_status,
+    matches_retryable_message,
     parse_retry_after_ms,
     should_retry_exception,
 )
@@ -81,6 +83,8 @@ __all__ = [
     "compute_backoff",
     "MAX_RETRIES",
     "RETRYABLE_STATUSES",
+    "matches_retryable_message",
+    "classify_http_error",
     # circuit_breaker
     "CircuitBreaker",
     "CircuitState",
