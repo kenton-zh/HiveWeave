@@ -5,7 +5,6 @@ import asyncio
 import os
 import shutil
 import threading
-import time
 from pathlib import Path
 from typing import Any, List, TYPE_CHECKING
 
@@ -51,30 +50,76 @@ log = structlog.get_logger(__name__)
 from .reconcile import _log_worktree_rebuild_event
 
 # Issue #3: serializes shared-dir sync per workspace. The sync runs in a
-# thread executor (to_thread) — a threading.Lock is the right primitive — and
+# thread executor (to_thread) — threading.Lock is the right primitive — and
 # protects against a torn read when the root .hiveweave/shared is being
 # written concurrently while we copy it into a worktree.
 _shared_sync_locks: dict[str, threading.Lock] = {}
+_shared_sync_locks_guard = threading.Lock()
 
 
-def _copy_if_newer(src: str, dst: str) -> None:
-    """Copy *src* to *dst* only when *dst* is missing or older than *src*.
+def _workspace_sync_lock(workspace_path: str) -> threading.Lock:
+    """Return the per-workspace sync lock, creating it under a guard.
+
+    The guard makes the get-or-create atomic so two threads racing on the
+    *first* sync of a workspace cannot each build a separate lock (which would
+    bypass the serialization the lock exists to provide).
+    """
+    lock_key = str(Path(workspace_path).resolve())
+    with _shared_sync_locks_guard:
+        lock = _shared_sync_locks.get(lock_key)
+        if lock is None:
+            lock = threading.Lock()
+            _shared_sync_locks[lock_key] = lock
+        return lock
+
+
+def _copy_if_newer(src: str, dst: str) -> bool:
+    """Copy *src* to *dst* only when *dst* is missing or stale.
 
     ``shutil.copy2`` preserves mtime, so a dst whose mtime is at-or-newer than
     src is either an unchanged prior copy or a worktree-local edit — never
     silently clobber it (Issue #3 review: top-level files were unconditionally
     overwritten, wiping agent edits). Root-updated contracts (src newer) still
-    propagate. Recursive copytree uses this so dirs get the same protection.
+    propagate. A same-second update is detected via size when mtimes tie.
+    Returns True when a copy was performed, False when skipped.
     """
     s = Path(src)
     d = Path(dst)
     if d.exists():
         try:
-            if s.stat().st_mtime <= d.stat().st_mtime:
-                return
+            sm = s.stat()
+            dm = d.stat()
+            if sm.st_mtime < dm.st_mtime:
+                return False
+            if sm.st_mtime == dm.st_mtime and sm.st_size == dm.st_size:
+                return False
         except OSError:
-            return
+            return False
     shutil.copy2(s, d)
+    return True
+
+
+def _copy_tree_skip_symlinks(src: Path, dst: Path) -> int:
+    """Merge *src* into *dst*, skipping symlinks at every level.
+
+    ``shutil.copytree`` cannot skip symlinks nested inside a directory (with
+    ``symlinks=False`` it dereferences them via the copy function; with
+    ``symlinks=True`` it recreates them). We walk manually so a symlink never
+    has its target content pulled into a worktree — consistent with the
+    top-level symlink handling. Returns the number of directories copied.
+    """
+    dst.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for item in src.iterdir():
+        s = src / item.name
+        if s.is_symlink():
+            continue  # never dereference, at any depth
+        d = dst / item.name
+        if s.is_dir():
+            copied += _copy_tree_skip_symlinks(s, d)
+        elif s.is_file():
+            _copy_if_newer(str(s), str(d))
+    return copied + 1
 
 
 class CreateMixin:
@@ -255,13 +300,14 @@ yarn.lock merge=union
         worktree. Mirroring the shared dir into each worktree makes contracts
         locally readable by every agent. Idempotent; missing source → no-op.
 
-        Merge semantics: directories are merged (``dirs_exist_ok``) — we never
-        ``rmtree`` a worktree-local shared subdir, so a repeated create cannot
+        Merge semantics: directories are merged by a manual walk that never
+        ``rmtree``s a worktree-local shared subdir, so a repeated create cannot
         wipe files the agent added locally. Files (top-level and inside dirs)
         are copied incrementally via ``_copy_if_newer``: an unchanged dst is
         skipped, and a dst newer than src (a worktree-local edit) is preserved
-        rather than clobbered. Symlinks are skipped (no external dereference).
-        A per-workspace lock serializes concurrent syncs to avoid torn reads.
+        rather than clobbered. Symlinks are skipped at every level (we never
+        dereference an external target into a worktree). A per-workspace lock
+        serializes concurrent syncs to avoid torn reads.
         """
         if not worktree_path:
             return
@@ -269,12 +315,7 @@ yarn.lock merge=union
         dst = Path(worktree_path) / SHARED_DIR
         if not src.exists():
             return
-        lock_key = str(Path(workspace_path).resolve())
-        lock = _shared_sync_locks.get(lock_key)
-        if lock is None:
-            lock = threading.Lock()
-            _shared_sync_locks[lock_key] = lock
-        with lock:
+        with _workspace_sync_lock(workspace_path):
             dst.mkdir(parents=True, exist_ok=True)
             copied = 0
             skipped = 0
@@ -284,14 +325,12 @@ yarn.lock merge=union
                     continue  # don't dereference external targets into worktrees
                 d = dst / item.name
                 if s.is_dir():
-                    shutil.copytree(s, d, dirs_exist_ok=True, copy_function=_copy_if_newer)
-                    copied += 1
+                    copied += _copy_tree_skip_symlinks(s, d)
                 elif s.is_file():
-                    if d.exists() and d.stat().st_mtime >= s.stat().st_mtime:
-                        skipped += 1
-                    else:
-                        _copy_if_newer(s, d)
+                    if _copy_if_newer(s, d):
                         copied += 1
+                    else:
+                        skipped += 1
                 else:
                     skipped += 1
             log.info(

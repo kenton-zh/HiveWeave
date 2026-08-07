@@ -86,8 +86,6 @@ async def _diff_touches_scope(
         if not ok:
             return None
         changed = [normalize_evidence_path(p) for p in out.splitlines() if p.strip()]
-        if not changed:
-            return False  # no changed files — nothing to re-run
         # Match (casefold already applied) treating a scope entry as touching
         # when it is a file OR a directory prefix of a changed path. Exact set
         # intersection would miss directory-level scope entries (e.g.
@@ -101,9 +99,13 @@ async def _diff_touches_scope(
             ):
                 return True
         # No verifiable entry touched. If any unverifiable entry remains in
-        # play we cannot prove the scope was untouched → fail-closed.
+        # play we cannot prove the scope was untouched → fail-closed (checked
+        # before the empty-diff shortcut, so an unverifiable scope stays
+        # undecidable even when the tracked diff is empty).
         if unverifiable:
             return None
+        if not changed:
+            return False  # no changed files — nothing to re-run
         return False
     except Exception:
         return None
