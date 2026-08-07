@@ -485,9 +485,63 @@ class ConversationStore:
     # ── 消息清理 ─────────────────────────────────────────────
 
     @staticmethod
-    def _clean_messages(messages: list[dict]) -> list[dict]:
-        """移除 system 消息 + 孤立 tool 消息（无匹配 tool_call_id）。"""
+    def _sanitize_tool_call_arguments(messages: list[dict]) -> None:
+        """修复 assistant tool_calls 中非法的 function.arguments（就地修复）。
+
+        BUGFIX(taskflow CEO A044 砖化): 流式中断(stall_break)时 tool_call 的
+        arguments 可能被截断成非法 JSON 并随轮次持久化。后续每次请求都携带
+        这条历史 → ARK 网关校验请求体直接 400「Invalid request body」→
+        确定性死循环, agent 永久砖化。
+
+        策略: 读时修复 — 非法 arguments 替换为合法占位 JSON(保留 preview
+        供调试), 对应 tool 结果(执行期已容错为 Parameter error)保持不变,
+        语义自洽。None/非字符串一并归一化为合法 JSON 字符串。
+        """
+        for m in messages:
+            if m.get("role") != "assistant":
+                continue
+            tcs = m.get("tool_calls")
+            if not isinstance(tcs, list):
+                continue
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                args = fn.get("arguments")
+                if args is None:
+                    fn["arguments"] = "{}"
+                    continue
+                if not isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.dumps(args, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        fn["arguments"] = "{}"
+                    continue
+                try:
+                    json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    fn["arguments"] = json.dumps(
+                        {
+                            "_repaired_truncated_arguments": True,
+                            "preview": args[:200],
+                        },
+                        ensure_ascii=False,
+                    )
+                    logger.warning(
+                        "tool_call_arguments_repaired",
+                        tool_call_id=tc.get("id"),
+                        tool_name=fn.get("name"),
+                        preview=args[:80],
+                    )
+
+    @classmethod
+    def _clean_messages(cls, messages: list[dict]) -> list[dict]:
+        """移除 system + 孤立 tool 消息 + 修复非法 tool_call arguments。"""
         no_system = [m for m in messages if m.get("role") != "system"]
+        # 先就地修复截断/非法的 tool_call arguments（防 ARK 400 砖化）
+        cls._sanitize_tool_call_arguments(no_system)
         # 收集所有 tool_call_id
         tool_call_ids: set[str] = set()
         for m in no_system:
