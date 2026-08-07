@@ -74,14 +74,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "browse": {
         "description": (
-            "Drive a real Chromium browser via gstack browse CLI for UI E2E / visual QA. "
+            "Drive a real Chromium browser via agent-browser CLI for UI E2E / visual QA. "
             "Use after start_dev_server/lookup_dev_server. Typical flow: "
             "browse(args=[\"goto\",\"http://127.0.0.1:PORT\"]) → "
             "browse(args=[\"snapshot\",\"-i\"]) → browse(args=[\"click\",\"@e3\"]) → "
             "browse(args=[\"screenshot\",\"evidence/bug.png\"]) → "
             "assert_visual(screenshotPath=..., observed=\"what you SEE\", verdict=\"pass\"). "
             "Screenshot pixels are injected into the next LLM turn; a PNG path alone "
-            "is NOT UI evidence. Also: console, network, fill, text."
+            "is NOT UI evidence. Also: console, network requests, fill, get text @eN."
         ),
         "properties": {
             "args": {

@@ -49,7 +49,7 @@ import hiveweave.tools.task_tools  # noqa: F401 — registers dispatch/submit/wa
 import hiveweave.tools.misc_tools  # noqa: F401 — registers git_worktree, legacy tasks, webfetch, etc.
 import hiveweave.tools.turn_tools  # noqa: F401 — commit_turn, defer_task_advance, ask/notify
 import hiveweave.tools.dev_server_tools  # noqa: F401 — start_dev_server / lookup_dev_server
-import hiveweave.tools.browse_tools  # noqa: F401 — browse (gstack Chromium CLI)
+import hiveweave.tools.browse_tools  # noqa: F401 — browse (agent-browser Chromium CLI)
 import hiveweave.tools.game_qa_tools  # noqa: F401 — game_run_case (H5 harness)
 import hiveweave.tools.vision_tools  # noqa: F401 — look_at_image (帮你看图片)
 import hiveweave.tools.image_gen_tools  # noqa: F401 — generate_image (Seedream)

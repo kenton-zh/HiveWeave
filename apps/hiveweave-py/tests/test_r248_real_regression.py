@@ -82,40 +82,45 @@ async def test_r2_self_merge_gate_rejects_running():
 @pytest.mark.asyncio
 async def test_r4_poll_hard_reject_includes_obligations_snapshot():
     """aacdd0f: 3rd identical get_tasks → hard reject WITH obligations lines."""
+    cache_snapshot = dict(streamer_mod._poll_result_cache)
     streamer_mod._poll_result_cache.clear()
-    streamer = Streamer(max_tool_rounds=5)
-    counts: dict[tuple[str, str], int] = {}
-    calls = {"n": 0}
+    try:
+        streamer = Streamer(max_tool_rounds=5)
+        counts: dict[tuple[str, str], int] = {}
+        calls = {"n": 0}
 
-    async def on_tool(_name: str, _args: str, _id: str) -> dict:
-        calls["n"] += 1
-        return {"content": "Tasks (0): none"}
+        async def on_tool(_name: str, _args: str, _id: str) -> dict:
+            calls["n"] += 1
+            return {"content": "Tasks (0): none"}
 
-    with patch(
-        "hiveweave.llm.streamer._build_obligations_snapshot",
-        new_callable=AsyncMock,
-        return_value=(
-            "\nCurrent obligations (act directly, do NOT re-poll):\n"
-            "  - [reviewer/submitted] taskId=deadbeef Review milestone"
-        ),
-    ):
-        tc = {"id": "t1", "name": "get_tasks", "arguments": "{}"}
-        await streamer._execute_single_tool(
-            "agent-r4", tc, on_tool, poll_turn_counts=counts
-        )
-        await streamer._execute_single_tool(
-            "agent-r4", {**tc, "id": "t2"}, on_tool, poll_turn_counts=counts
-        )
-        r3 = await streamer._execute_single_tool(
-            "agent-r4", {**tc, "id": "t3"}, on_tool, poll_turn_counts=counts
-        )
+        with patch(
+            "hiveweave.llm.streamer._build_obligations_snapshot",
+            new_callable=AsyncMock,
+            return_value=(
+                "\nCurrent obligations (act directly, do NOT re-poll):\n"
+                "  - [reviewer/submitted] taskId=deadbeef Review milestone"
+            ),
+        ):
+            tc = {"id": "t1", "name": "get_tasks", "arguments": "{}"}
+            await streamer._execute_single_tool(
+                "agent-r4", tc, on_tool, poll_turn_counts=counts
+            )
+            await streamer._execute_single_tool(
+                "agent-r4", {**tc, "id": "t2"}, on_tool, poll_turn_counts=counts
+            )
+            r3 = await streamer._execute_single_tool(
+                "agent-r4", {**tc, "id": "t3"}, on_tool, poll_turn_counts=counts
+            )
 
-    assert "poll hard reject" in r3["content"]
-    assert "Current obligations" in r3["content"], (
-        "hard reject must attach obligations snapshot — previous R4 was invalid"
-    )
-    assert "deadbeef" in r3["content"]
-    assert calls["n"] <= 2
+        assert "poll hard reject" in r3["content"]
+        assert "Current obligations" in r3["content"], (
+            "hard reject must attach obligations snapshot — previous R4 was invalid"
+        )
+        assert "deadbeef" in r3["content"]
+        assert calls["n"] <= 2
+    finally:
+        streamer_mod._poll_result_cache.clear()
+        streamer_mod._poll_result_cache.update(cache_snapshot)
 
 
 @pytest.mark.asyncio
@@ -177,58 +182,48 @@ async def test_r4_get_tasks_tool_appends_live_obligations():
 
 
 @pytest.mark.asyncio
-async def test_r7_browse_click_floors_timeout_to_30s(tmp_path: Path):
+async def test_r7_browse_click_floors_timeout_to_30s(browse_fake_proc, tmp_path: Path):
     """Evening P3-4: timeoutSec=10 on click must not kill at 10s."""
     captured: dict = {}
     real_wait_for = asyncio.wait_for
 
     async def fake_wait_for(coro, timeout=None):
-        # Only record the outer browse timeout (skip tiny drains)
-        if timeout is not None and timeout >= 5:
+        # Only the outer browse timeout — skip tiny drains (stdin/grace) and
+        # record exactly once so a future ≥30s wait_for elsewhere can't
+        # silently rewrite the capture and keep the test green on the wrong
+        # object.
+        if timeout is not None and timeout >= 30 and "timeout" not in captured:
             captured["timeout"] = timeout
-            # Don't run the long communicate — just time out
+            captured["n"] = captured.get("n", 0) + 1
+            # Don't run the long wait — just time out
             if hasattr(coro, "close"):
                 coro.close()
             raise asyncio.TimeoutError()
+        if timeout is not None and timeout >= 30:
+            captured["n"] = captured.get("n", 0) + 1
         return await real_wait_for(coro, timeout=timeout)
 
-    class FakeProc:
-        returncode = -1
-
-        async def communicate(self):
-            await asyncio.sleep(100)
-            return b"", b""
-
-        def kill(self):
-            pass
-
-    async def fake_exec(*_a, **_k):
-        return FakeProc()
-
-    with (
-        patch(
-            "hiveweave.tools.browse_tools.resolve_browse_bin",
-            return_value="browse-fake.exe",
-        ),
-        patch(
-            "hiveweave.util.win_subprocess.windows_no_window_kwargs",
-            return_value={},
-        ),
-        patch("asyncio.create_subprocess_exec", new=fake_exec),
-        patch("asyncio.wait_for", new=fake_wait_for),
-    ):
-        result = await browse_tool(
-            BrowseParams(
-                args=["click", "runAll"],
-                timeout_sec=10,
-            ),
-            "agent-r7",
-            str(tmp_path),
-        )
+    with browse_fake_proc as ctx:
+        ctx.returncode = -1
+        ctx.hang_pipes = True  # daemon holds inherited pipe handles (EOF never arrives)
+        ctx.wait_sleep = 100   # keep the outer wait_for pending so it times out
+        with patch("asyncio.wait_for", new=fake_wait_for):
+            result = await browse_tool(
+                BrowseParams(
+                    args=["click", "runAll"],
+                    timeout_sec=10,
+                ),
+                "agent-r7",
+                str(tmp_path),
+            )
 
     assert captured.get("timeout") is not None
     assert captured["timeout"] >= 30, (
         f"click with timeoutSec=10 must floor to ≥30, got {captured['timeout']}"
+    )
+    assert captured.get("n") == 1, (
+        "exactly one ≥30s wait_for expected (the browse timeout); "
+        f"got {captured.get('n')}"
     )
     assert result.success is False
     text = (result.output or "") + (result.error or "")

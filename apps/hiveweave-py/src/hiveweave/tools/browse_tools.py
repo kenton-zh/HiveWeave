@@ -1,8 +1,15 @@
-"""browse — gstack Chromium CLI wrapper for agent UI/E2E testing."""
+"""browse — agent-browser (Vercel Labs) Chromium CLI adapter for agent UI/E2E testing.
+
+The tool-facing contract is "browse subcommand argv" (goto/snapshot/click/…).
+``_map_ab_argv`` translates that gstack-style surface onto the agent-browser
+CLI; only the subcommand layer changes, so both the dev (node_modules) and
+packaged (Electron resources) states share one code path.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import shlex
 import uuid
@@ -22,10 +29,13 @@ log = structlog.get_logger(__name__)
 # the field itself is the structured assertion evidence).
 _VISUAL_OBSERVED_MIN = 40
 
-# gstack `js` evaluates its arg as an inline expression. Expressions up to this
-# length are passed directly; larger ones are materialised to a tempfile and run
-# via `eval` to stay clear of Windows argv limits.
-_INLINE_JS_DIRECT_MAX = 4000
+# agent-browser `eval <js>` is a direct argv expression. Direct form is used
+# for short snippets; base64 (-b) avoids shell/argv escaping for the rest;
+# --stdin carries scripts too large for the Windows argv limit (32767).
+# The size guards compare UTF-8 byte length: base64 inflates by 4/3, and
+# multibyte sources would otherwise blow the argv cap unnoticed.
+_EVAL_DIRECT_MAX = 1024
+_EVAL_B64_MAX = 24000  # 24k UTF-8 bytes → ~32k base64, clear of the argv cap
 
 
 def _is_path_stub_observed(observed: str, screenshot_path: str) -> bool:
@@ -63,7 +73,7 @@ class BrowseParams(BaseModel):
     args: list[str] | None = Field(
         default=None,
         description=(
-            "gstack browse CLI argv, e.g. [\"goto\", \"http://127.0.0.1:3000\"] "
+            "browse CLI argv, e.g. [\"goto\", \"http://127.0.0.1:3000\"] "
             "or [\"snapshot\", \"-i\"] or [\"screenshot\", \"evidence/bug.png\"]. "
             "Prefer this over free-form shell."
         ),
@@ -152,12 +162,13 @@ async def _maybe_git_commit(workspace: str) -> str | None:
 def _screenshot_path_from_argv(argv: list[str]) -> str | None:
     """Extract output path from ``screenshot [path]`` argv.
 
-    Supports both ``screenshot path.png`` and
-    ``screenshot --selector canvas path.png``.
+    Supports both ``screenshot path.png``, ``screenshot --selector canvas path.png``
+    and the agent-browser positional form ``screenshot canvas path.png``
+    (also under the ``shoot`` alias).
     """
     if not argv:
         return None
-    if (argv[0] or "").lower().replace("-", "_") != "screenshot":
+    if (argv[0] or "").lower().replace("-", "_") not in ("screenshot", "shoot"):
         return None
     # Last non-flag positional that looks like a path wins.
     candidates: list[str] = []
@@ -178,148 +189,191 @@ def _screenshot_path_from_argv(argv: list[str]) -> str | None:
     return "screenshot.png"
 
 
-def _browse_state_dir(agent_id: str | None) -> str | None:
-    """Return an agent-scoped gstack state dir, or None if no agent_id.
+# gstack-style head → agent-browser head. Commands absent from this table
+# pass through unchanged (agent-browser is a superset: click/fill/press/wait/
+# snapshot/console/network/get/read/tab/frame/close/…).
+_HEAD_ALIASES = {
+    "goto": "open",
+    "navigate": "open",
+    "evaluate": "eval",
+    "wait_for": "wait",
+    "waitfor": "wait",
+    "quit": "close",
+    "exit": "close",
+    "shoot": "screenshot",
+}
 
-    gstack keys its long-lived browser daemon (server-node) off
-    ``BROWSE_STATE_FILE``: the same state file reuses the same Chromium
-    instance, a different one starts a separate daemon. By pinning each
-    agent to its own state dir under the Meta DB data path, every browser
-    call from one agent hits the *same* server-node — instead of spawning a
-    fresh Chromium per call (which leaked processes and caused OOM on the
-    small 3.9GB test host).
+
+def _map_ab_argv(argv: list[str], workspace: str) -> tuple[list[str], str | None]:
+    """Translate browse (gstack-style) argv to agent-browser argv.
+
+    Returns ``(mapped_argv, stdin_payload)`` — ``stdin_payload`` is set only
+    for ``eval --stdin`` (script too large for argv). The tool-facing
+    contract is unchanged: ``BrowseParams.args`` still carries browse
+    subcommand argv; only the CLI underneath is swapped.
     """
-    if not agent_id:
-        return None
-    try:
-        data_dir = Path(settings.get_meta_db_path()).parent
-        state_dir = data_dir / "browse" / agent_id
-        state_dir.mkdir(parents=True, exist_ok=True)
-        return str(state_dir)
-    except Exception as e:
-        log.warning("browse_state_dir_failed", agent_id=agent_id, error=str(e))
-        return None
+    if not argv:
+        return [], None
+    head = (argv[0] or "").lower().replace("-", "_")
+    rest = [str(a) for a in argv[1:]]
+
+    if head in ("js", "eval", "evaluate"):
+        return _eval_argv(head, rest, workspace)
+    if head in ("screenshot", "shoot"):
+        return _screenshot_argv(rest), None
+
+    head = _HEAD_ALIASES.get(head, head)
+    return [head, *rest], None
+
+
+def _eval_argv(head: str, rest: list[str], workspace: str) -> tuple[list[str], str | None]:
+    """agent-browser eval semantics: inline JS only (direct / -b / --stdin).
+
+    gstack split js (inline) vs eval (file path). agent-browser evaluates
+    expressions; file-based usage keeps working by reading the file content
+    here. Small snippets go direct, medium ones base64-encoded, oversized
+    ones via stdin.
+    """
+    if not rest:
+        return ["eval"], None
+    src = rest[0]
+    if head in ("js", "eval", "evaluate"):
+        candidates = [Path(src)]
+        if workspace:
+            candidates.append(Path(workspace) / src)
+        for p in candidates:
+            try:
+                if p.is_file():
+                    src = p.read_text(encoding="utf-8", errors="replace")
+                    break
+            except OSError:
+                continue
+    src = src or ""
+    if len(src.encode("utf-8")) <= _EVAL_DIRECT_MAX and not src.lstrip().startswith("-"):
+        return ["eval", src], None
+    if len(src.encode("utf-8")) <= _EVAL_B64_MAX:
+        b64 = base64.b64encode(src.encode("utf-8")).decode("ascii")
+        return ["eval", "-b", b64], None
+    return ["eval", "--stdin"], src
+
+
+def _screenshot_argv(rest: list[str]) -> list[str]:
+    """screenshot — agent-browser takes ``[selector] [path]`` positionals.
+
+    gstack used ``--selector <sel>``; translate the flag into the first
+    positional (``screenshot canvas evidence/x.png``). Other flags
+    (--full/-f, --annotate) pass through unchanged.
+    """
+    out: list[str] = ["screenshot"]
+    selector: str | None = None
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ("--selector", "-s") and i + 1 < len(rest):
+            selector = rest[i + 1]
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    if selector is not None:
+        # Insert the selector right after the subcommand; the path remains
+        # the last positional (flags may appear in between).
+        out.insert(1, selector)
+    return out
 
 
 def _browse_child_env(agent_id: str | None = None) -> dict[str, str]:
-    """Env for gstack browse — headless, no sidebar PTY (no bun console popups).
+    """Env for agent-browser — per-agent headless daemon session.
 
-    gstack's terminal-agent (``bun run .../terminal-agent.ts``) owns the
-    interactive sidebar Terminal pane. Agents never use that pane; leaving it
-    enabled on Windows repeatedly pops visible Terminal/bun windows, and the
-    detached browse daemon keeps respawning them after the agent turn ends.
-
-    ``GSTACK_TERMINAL_AGENT=0`` is the upstream-supported embedder switch
-    (see gstack browse cli.ts / server.ts). Default both flags to on/disabled
-    unless the operator already set them in the process environment.
-
-    Per-agent reuse (fix OOM): when ``agent_id`` is given, pin ``BROWSE_STATE_FILE``
-    to an agent-scoped state dir and set ``BROWSE_PARENT_PID=0`` so the server-node
-    survives CLI exit (default watchdog would kill it per call). gstack then
-    auto-recycles the daemon after ``BROWSE_IDLE_TIMEOUT`` of inactivity.
+    agent-browser keeps one Chromium daemon per ``--session``; pinning each
+    agent to its own session reuses the same browser instance across calls
+    (the gstack BROWSE_STATE_FILE equivalent). The daemon idles out after
+    ``AGENT_BROWSER_IDLE_TIMEOUT_MS`` so Chromium does not leak. Chrome
+    itself is agent-browser's own concern: it auto-detects system
+    Chrome/Brave/Playwright/Puppeteer, and `agent-browser install` fetches
+    Chrome for Testing when none exists (no HIVE-side download logic).
     """
     env = {**os.environ}
-    env.setdefault("GSTACK_HEADLESS", "1")
-    env.setdefault("GSTACK_TERMINAL_AGENT", "0")
-    state_dir = _browse_state_dir(agent_id)
-    if state_dir:
-        env["BROWSE_STATE_FILE"] = str(Path(state_dir) / "browse.json")
-        env["BROWSE_PARENT_PID"] = "0"
-        # Keep the daemon alive across an agent's work session; idle after
-        # this window auto-shuts it down (prevents indefinite Chromium leak).
-        env.setdefault("BROWSE_IDLE_TIMEOUT", str(2 * 60 * 60 * 1000))
+    if agent_id:
+        env["AGENT_BROWSER_SESSION"] = f"hiveweave-{agent_id[:40]}"
+        env.setdefault("AGENT_BROWSER_IDLE_TIMEOUT_MS", str(2 * 60 * 60 * 1000))
     return env
 
 
-_reaped_browse_orphans = False
+async def _drain_pipe(stream: Any, buf: bytearray) -> None:
+    """Read chunks from a subprocess pipe until EOF or cancellation."""
+    try:
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                return
+            buf.extend(chunk)
+    except asyncio.CancelledError:
+        raise
+    except (OSError, ValueError):
+        pass
 
 
-def _reap_orphan_browse_daemons_once() -> int:
-    """Kill leftover gstack browse daemons that still spawn terminal-agent.
+async def _run_and_drain(
+    proc: asyncio.subprocess.Process,
+    stdin_payload: str | None,
+    timeout: int,
+) -> tuple[int, bytes, bytes]:
+    """Wait for CLI exit, then grace-drain buffered stdout/stderr.
 
-    Idempotent per process: first browse call on Windows reaps orphans from
-    prior runs that were started *without* ``GSTACK_TERMINAL_AGENT=0`` (their
-    watchdog would keep popping bun windows even after we set the env for
-    new children). Returns number of processes signaled.
-
-    Only acts when a ``terminal-agent`` process is present — a healthy
-    headless ``server-node`` (no PTY agent) is left alone.
+    agent-browser's daemon inherits the CLI's stdout/stderr pipe handles and
+    stays alive after the CLI exits, so EOF never arrives — waiting for EOF
+    (``communicate``) hangs until the outer timeout. Instead: wait for the
+    CLI process to exit, then drain whatever the daemon-hold pipe still
+    buffers (bounded by a short grace period). The outer timeout still
+    guards genuinely hung commands.
     """
-    global _reaped_browse_orphans
-    if _reaped_browse_orphans or os.name != "nt":
-        return 0
-    _reaped_browse_orphans = True
+    out, err = bytearray(), bytearray()
+    rt = asyncio.create_task(_drain_pipe(proc.stdout, out))
+    rt_err = asyncio.create_task(_drain_pipe(proc.stderr, err))
+
+    if stdin_payload is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_payload.encode("utf-8"))
+            await asyncio.wait_for(proc.stdin.drain(), timeout=10)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        except asyncio.TimeoutError:
+            pass
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
 
     try:
-        import subprocess
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
-
-        # Only reap when the popup culprit (terminal-agent) is alive.
-        ps_agents = (
-            "Get-CimInstance Win32_Process | "
-            "Where-Object { $_.CommandLine -and ("
-            "$_.CommandLine -match 'gstack[\\\\/]browse[\\\\/]src[\\\\/]terminal-agent\\.ts' "
-            "-or ($_.Name -eq 'bun.exe' -and $_.CommandLine -match 'terminal-agent')"
-            ") } | Select-Object -ExpandProperty ProcessId"
-        )
-        listed_agents = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_agents],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            **windows_no_window_kwargs(),
-        )
-        agent_pids = [
-            int(line.strip())
-            for line in (listed_agents.stdout or "").splitlines()
-            if line.strip().isdigit()
-        ]
-        if not agent_pids:
-            return 0
-
-        # Also take down server-node parents — otherwise their watchdog
-        # respawns terminal-agent under the old ownsTerminalAgent=true boot.
-        ps_all = (
-            "Get-CimInstance Win32_Process | "
-            "Where-Object { $_.CommandLine -and ("
-            "$_.CommandLine -match 'gstack[\\\\/]browse[\\\\/](dist[\\\\/]server-node\\.mjs|src[\\\\/]terminal-agent\\.ts)' "
-            "-or ($_.Name -eq 'bun.exe' -and $_.CommandLine -match 'terminal-agent')"
-            ") } | Select-Object -ExpandProperty ProcessId"
-        )
-        listed = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_all],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            **windows_no_window_kwargs(),
-        )
-        pids: list[int] = []
-        for line in (listed.stdout or "").splitlines():
-            line = line.strip()
-            if line.isdigit():
-                pids.append(int(line))
-        if not pids:
-            return 0
-
-        # taskkill /T to sweep chrome-headless children of server-node.
-        killed = 0
-        for pid in pids:
+        try:
+            rc = await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
             try:
-                r = subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    timeout=10,
-                    **windows_no_window_kwargs(),
-                )
-                if r.returncode == 0:
-                    killed += 1
-            except (OSError, subprocess.TimeoutExpired):
+                proc.kill()
+            except ProcessLookupError:
                 pass
-        if killed:
-            log.info("browse_orphan_daemons_reaped", count=killed, pids=pids[:20])
-        return killed
-    except Exception:
-        return 0
+            return -1, b"", b""
+
+        # CLI exited; drain the tail concurrently (daemon may keep the pipes
+        # open forever) under a single 2s grace cap.
+        try:
+            await asyncio.wait_for(asyncio.gather(rt, rt_err), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        return rc, bytes(out), bytes(err)
+    finally:
+        # Cleanup also on outer-task cancellation: kill a still-running CLI
+        # and cancel any drain tasks still blocked on the daemon-held pipes.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        for t in (rt, rt_err):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(rt, rt_err, return_exceptions=True)
 
 
 async def browse_exec(
@@ -329,50 +383,55 @@ async def browse_exec(
     timeout_sec: int = 60,
     agent_id: str | None = None,
 ) -> tuple[int, str, str]:
-    """Run gstack browse CLI. Returns ``(exit_code, stdout, stderr)``.
+    """Run agent-browser CLI. Returns ``(exit_code, stdout, stderr)``.
 
     Raises ``FileNotFoundError`` / ``OSError`` on spawn failure.
     On timeout returns exit_code=-1 and an error message in stderr.
 
-    ``agent_id`` pins the gstack daemon to an agent-scoped state dir so the
-    agent reuses one browser instance across calls instead of spawning a
+    ``agent_id`` pins the agent-browser daemon to an agent-scoped session so
+    the agent reuses one browser instance across calls instead of spawning a
     fresh Chromium per call (see _browse_child_env).
     """
     bin_path = resolve_browse_bin()
     if not bin_path:
-        raise FileNotFoundError("gstack browse binary not found")
+        raise FileNotFoundError("agent-browser binary not found")
 
-    # Drop prior-run daemons that still pop bun Terminal windows.
-    await asyncio.to_thread(_reap_orphan_browse_daemons_once)
+    # Native binaries ship without the exec bit on some unix installs.
+    if os.name != "nt":
+        try:
+            bin_path.chmod(bin_path.stat().st_mode | 0o111)
+        except OSError:
+            pass
 
     argv = [str(a) for a in argv]
-    # gstack contract: `js`/`evaluate` = inline expression, `eval` = file path.
-    # Map `evaluate` → `js`; leave `eval` as-is (file semantics). Do NOT collapse
-    # `eval` to `js` — `_materialize_inline_js` routes inline snippets to the
-    # correct subcommand, and mapping `eval`→`js` fed a tempfile path to `js`,
-    # which evaluated the *path string* instead of the code (evaluate 1+1 crash).
-    if argv and (argv[0] or "").lower() == "evaluate":
-        argv = ["js", *argv[1:]]
-
-    # TEST6 P0-1: gstack ``js`` evaluates its arg as an inline expression.
-    # Materialise only for `eval` (which reads a file), never for `js`.
-    # P0/R3: _materialize_inline_js may spawn a tempfile (hw_browse_*.js) for
-    # very large inline snippets; track it so browse_exec can unlink it after
-    # the subprocess exits — otherwise %TEMP% accumulates one file per large
-    # browse call (no GC anywhere in the repo).
-    _tmp_path = _materialize_with_tmp(argv, workspace)
-    argv = _tmp_path[0]
-    _tmp_file = _tmp_path[1]
+    mapped, stdin_payload = _map_ab_argv(argv, workspace)
 
     timeout = max(5, min(int(timeout_sec or 60), 300))
-    head = (argv[0] or "").lower().replace("-", "_") if argv else ""
+    head = (mapped[0] or "").lower().replace("-", "_") if mapped else ""
     if head in (
-        "click", "wait", "wait_for", "waitfor", "fill", "press",
-        "js", "eval", "evaluate",
+        "click", "wait", "fill", "press", "type", "select", "eval",
+        "close", "reload",
     ):
         timeout = max(30, timeout)
 
-    cmd = [str(bin_path), *argv]
+    # Screenshot paths land under the workspace; make sure the parent dir
+    # exists (agents write to evidence/… which may not exist yet).
+    if head == "screenshot":
+        shot_rel = _screenshot_path_from_argv(argv)
+        if shot_rel:
+            parent = Path(shot_rel).parent
+            if workspace and parent and not parent.is_absolute():
+                try:
+                    (Path(workspace) / parent).mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+            elif parent:
+                try:
+                    parent.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+
+    cmd = [str(bin_path), *mapped]
     cwd = workspace if workspace and Path(workspace).is_dir() else None
     from hiveweave.util.win_subprocess import windows_no_window_kwargs
 
@@ -381,99 +440,29 @@ async def browse_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if stdin_payload is not None else None,
             cwd=cwd,
             env=_browse_child_env(agent_id),
             **windows_no_window_kwargs(),
         )
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            return -1, "", f"browse timed out after {timeout}s: {' '.join(argv)}"
-
-        stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
-        stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
-        code = proc.returncode if proc.returncode is not None else -1
-        return code, stdout, stderr
-    finally:
-        if _tmp_file:
-            try:
-                os.unlink(_tmp_file)
-            except OSError:
-                pass
-
-
-def _materialize_inline_js(argv: list[str], workspace: str) -> list[str]:
-    """Route `js`/`eval`/`evaluate` args to the correct gstack subcommand.
-
-    gstack contract (read-commands.ts):
-      js <expr>   -> evaluates the arg as an inline expression
-      eval <file> -> reads a file path, then evaluates its contents
-
-    The old code materialised every inline snippet to a tempfile and passed
-    `js <tempfile>` — gstack then evaluated the *tempfile path string* instead
-    of the code, so `evaluate 1+1` returned the path (and game_run_case's probe
-    JS was never executed). Now:
-      - js/evaluate: pass the inline expression straight through.
-      - eval: keep a real file, or materialise an inline snippet to a tempfile.
-    A `js/evaluate` arg that happens to be an existing file is rerouted to
-    `eval` so file-based usage still works with the correct semantics.
-    """
-    return _materialize_with_tmp(argv, workspace)[0]
-
-
-def _materialize_with_tmp(argv: list[str], workspace: str) -> tuple[list[str], str | None]:
-    """Like :func:`_materialize_inline_js` but also returns the tempfile path
-    created by ``mkstemp`` (or ``None``), so the caller can unlink it after the
-    subprocess exits (fixes the %TEMP% hw_browse_*.js leak — no GC elsewhere).
-    """
-    import tempfile
-
-    if len(argv) < 2:
-        return argv, None
-    head = (argv[0] or "").lower()
-    if head not in ("js", "eval", "evaluate"):
-        return argv, None
-    src = argv[1] or ""
-    is_inline = head in ("js", "evaluate")
-
-    # Real file (absolute or workspace-relative).
-    candidates = [Path(src)]
-    if workspace:
-        candidates.append(Path(workspace) / src)
-    for p in candidates:
-        try:
-            if p.is_file():
-                return ["eval", str(p.resolve())], None
-        except OSError:
-            continue
-
-    if is_inline:
-        # Small expressions go straight through (gstack `js` evaluates them).
-        # Very large / multi-line snippets risk Windows argv limits — route
-        # them through a tempfile with `eval` (which reads the file).
-        if len(src) <= _INLINE_JS_DIRECT_MAX:
-            return ["js", src], None
-    # `eval` expects a file path — materialise the inline snippet to a tempfile.
-    try:
-        fd, path = tempfile.mkstemp(prefix="hw_browse_", suffix=".js")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(src)
-        return ["eval", path], path
     except OSError:
-        return ["js", src], None
+        raise
+
+    rc, stdout_b, stderr_b = await _run_and_drain(proc, stdin_payload, timeout)
+    if rc == -1:
+        return -1, "", f"browse timed out after {timeout}s: {' '.join(argv)}"
+
+    stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
+    stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
+    return rc, stdout, stderr
 
 
 def browse_missing_bin_hint() -> str:
     hint = (
-        "gstack browse binary not found. Build it once:\n"
-        "  cd %USERPROFILE%\\.claude\\skills\\gstack && bun install && bun run build\n"
-        "Or set HIVEWEAVE_BROWSE_BIN to the browse.exe path."
+        "agent-browser CLI binary not found. Install it once:\n"
+        "  cd apps/web && pnpm add agent-browser\n"
+        "(or `npm i -g agent-browser` for a global install)\n"
+        "Or set HIVEWEAVE_BROWSE_BIN to the agent-browser binary path."
     )
     if settings.browse_bin:
         hint = (
@@ -555,7 +544,7 @@ async def issue_browse_e2e_attestation(
 
 @tool(
     "browse",
-    "Drive a real Chromium browser via gstack browse (goto/click/fill/snapshot/"
+    "Drive a real Chromium browser via agent-browser (goto/click/fill/snapshot/"
     "screenshot/console/network/js/eval). Use js/eval for canvas MouseEvent "
     "injection when snapshot refs are insufficient. "
     "Prefer lookup_dev_server / start_dev_server for the app URL first. "
@@ -584,10 +573,12 @@ async def browse_tool(
     # Soft guard: discourage attaching to the operator's daily profile URLs
     # that look like credential harvesting — still allow localhost / file / http(s).
     joined = " ".join(argv).lower()
-    if "cookie-import-browser" in joined and "--domain" not in joined:
+    cred_tokens = ("cookies set", "cookies import", "--restore", "--profile", "--state")
+    if any(tok in joined for tok in cred_tokens) and "--domain" not in joined:
         return ToolResult.err(
-            "cookie-import-browser without --domain is blocked for agents. "
-            "Use setup-browser-cookies skill manually, or pass an explicit --domain."
+            "Cookie/profile attach commands (cookies set/import, --restore, "
+            "--profile, --state) are blocked for agents without an explicit "
+            "--domain. Import cookies manually, or pass an explicit --domain."
         )
 
     head = (argv[0] or "").lower().replace("-", "_")

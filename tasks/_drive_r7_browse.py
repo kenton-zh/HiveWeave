@@ -1,4 +1,4 @@
-"""Live R7 browse drive against TEST11 HTML (real gstack browse if present)."""
+"""Live R7 browse drive against TEST11 HTML (real agent-browser if present)."""
 from __future__ import annotations
 
 import asyncio

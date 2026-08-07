@@ -15,7 +15,8 @@
   "packageManager": "pnpm@10.31.0",
   "pnpm": {
     "onlyBuiltDependencies": [
-      "esbuild"
+      "esbuild",
+      "agent-browser"
     ]
   }
 }

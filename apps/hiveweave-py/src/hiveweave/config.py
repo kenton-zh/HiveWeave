@@ -60,8 +60,9 @@ class Settings(BaseSettings):
     # SkillHub 搜索 API（默认 lightmake.site）
     skillhub_search_url: str = "https://lightmake.site/api/v1/search"
 
-    # gstack browse CLI binary (optional). Empty = auto-detect common install paths.
-    # Example Windows: C:\Users\...\ .claude\skills\gstack\browse\dist\browse.exe
+    # agent-browser CLI binary (optional). Empty = auto-detect:
+    # packaged Electron resources → node_modules/agent-browser (dev).
+    # Example Windows: C:\...\apps\web\node_modules\agent-browser\bin\agent-browser-win32-x64.exe
     browse_bin: str = ""
 
     # Wait Contract default TTLs (ms) — P0 Hard Gates Phase 2
@@ -94,26 +95,102 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
-def resolve_browse_bin() -> Path | None:
-    """Locate the gstack browse CLI binary.
+def agent_browser_bin_name() -> str:
+    """Platform-specific agent-browser native binary filename (bin/*)."""
+    import platform as _platform
 
-    Order: HIVEWEAVE_BROWSE_BIN → common Claude skills installs.
+    system = _platform.system().lower()
+    machine = _platform.machine().lower()
+    if system == "windows":
+        # Windows ARM64 runs the x64 binary via emulation (upstream choice).
+        return "agent-browser-win32-x64.exe"
+    if system == "darwin":
+        arch = "arm64" if machine in ("aarch64", "arm64") else "x64"
+        return f"agent-browser-darwin-{arch}"
+    arch = "arm64" if machine in ("aarch64", "arm64") else "x64"
+    return f"agent-browser-linux-{arch}"
+
+
+def _repo_root() -> Path:
+    # config.py 位于 apps/hiveweave-py/src/hiveweave/config.py → parents[4] = 仓库根
+    return Path(__file__).resolve().parents[4]
+
+
+def resolve_browse_bin() -> Path | None:
+    """Locate the agent-browser CLI binary.
+
+    Order: HIVEWEAVE_BROWSE_BIN (explicit) → packaged Electron resources
+    (desktop; the Electron main process injects HIVEWEAVE_BROWSE_BIN for
+    backends it spawns, this bounded ancestor-walk covers standalone
+    backends inside the resources tree) → node_modules/agent-browser
+    (source/dev install, pnpm hoists to the repo root or per-workspace).
     """
     if settings.browse_bin:
         p = Path(settings.browse_bin).expanduser()
         if p.is_file():
             return p
 
-    home = Path.home()
-    candidates = [
-        home / ".claude" / "skills" / "gstack" / "browse" / "dist" / "browse.exe",
-        home / ".claude" / "skills" / "gstack" / "browse" / "dist" / "browse",
-        home / ".claude" / "skills" / "browse" / "dist" / "browse.exe",
-        home / ".claude" / "skills" / "browse" / "dist" / "browse",
-    ]
+    import platform as _platform
+
+    system = _platform.system().lower()
+    machine = _platform.machine().lower()
+    arch = "arm64" if machine in ("aarch64", "arm64") else "x64"
+    bin_name = agent_browser_bin_name()
+    candidates: list[Path] = []
+    # Packaged state: resources/<something>/agent-browser/<bin>.
+    # Python 后端常位于 resources 目录内（Electron 解包布局），向上找。
+    for anc in Path(__file__).resolve().parents:
+        candidates.append(anc / "resources" / "agent-browser" / bin_name)
+        if len(candidates) >= 6:
+            break
+    # Dev state: node_modules/agent-browser/bin/<bin>.
+    repo_root = _repo_root()
+    for nm in (
+        repo_root / "node_modules",
+        repo_root / "apps" / "web" / "node_modules",
+        Path(__file__).resolve().parents[2] / "node_modules",
+    ):
+        candidates.append(nm / "agent-browser" / "bin" / bin_name)
+
     for c in candidates:
-        if c.is_file():
-            return c
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+
+    # Fallback: any same-platform binary inside a found agent-browser package
+    # (covers musl-linux and arm64/emulation mismatches). Skip the Node
+    # wrapper (agent-browser.js) — we spawn the native binary directly.
+    # Filtered by platform prefix so a partial install never yields a binary
+    # for another OS/arch (sorted alphabetically would pick darwin/arm first).
+    fallback_prefixes: list[str] = []
+    if system == "windows":
+        fallback_prefixes = ["agent-browser-win32-"]
+    elif system == "darwin":
+        fallback_prefixes = [f"agent-browser-darwin-{arch}"]
+    else:
+        # musl precedes glibc: sorted() puts musl names first.
+        fallback_prefixes = [
+            f"agent-browser-linux-musl-{arch}",
+            f"agent-browser-linux-{arch}",
+        ]
+    for nm in (
+        repo_root / "node_modules",
+        repo_root / "apps" / "web" / "node_modules",
+        Path(__file__).resolve().parents[2] / "node_modules",
+    ):
+        try:
+            bin_dir = nm / "agent-browser" / "bin"
+            if not bin_dir.is_dir():
+                continue
+            for prefix in fallback_prefixes:
+                for cand in sorted(bin_dir.glob(f"{prefix}*")):
+                    if cand.suffix == ".js" or not cand.is_file():
+                        continue
+                    return cand
+        except OSError:
+            continue
     return None
 
 

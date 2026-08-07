@@ -36,13 +36,25 @@ def test_browse_tool_registered_and_permitted():
     assert get_tool_def("game_run_case") is not None
 
 
-def test_resolve_browse_bin_finds_gstack_install():
+def test_resolve_browse_bin_finds_agent_browser_install():
+    from hiveweave.config import agent_browser_bin_name
+
     path = resolve_browse_bin()
-    # Soft-skip if gstack not installed on this machine / CI
+    # Soft-skip if no agent-browser install exists on this machine / CI.
     if path is None:
         return
+    key = agent_browser_bin_name()  # e.g. agent-browser-win32-x64.exe
+    prefixes = {key.split(".")[0]}  # e.g. agent-browser-win32-x64
+    if key.startswith("agent-browser-linux-"):
+        # Fallback also accepts the musl variant (sorted() picks it first).
+        prefixes.add(
+            "agent-browser-linux-musl-" + key.removeprefix("agent-browser-linux-")
+        )
+    # Whatever is found must be a real file of this platform's agent-browser
+    # binary — never a legacy gstack binary or a foreign-OS artifact.
     assert path.is_file()
-    assert path.name in {"browse", "browse.exe"}
+    assert path.name.startswith("agent-browser")
+    assert any(path.name.startswith(p) for p in prefixes)
 
 
 def test_test_engineer_role_routing_chinese():
@@ -116,18 +128,16 @@ def test_skill_registry_can_read_browse():
     asyncio.run(_run())
 
 
-def test_browse_child_env_disables_terminal_agent(monkeypatch):
-    """Agents must not spawn gstack sidebar PTY (bun console popups on Windows)."""
+def test_browse_child_env_sets_agent_session(monkeypatch):
+    """Each agent gets its own agent-browser daemon session (per-agent reuse)."""
     from hiveweave.tools.browse_tools import _browse_child_env
 
-    monkeypatch.delenv("GSTACK_HEADLESS", raising=False)
-    monkeypatch.delenv("GSTACK_TERMINAL_AGENT", raising=False)
-    env = _browse_child_env()
-    assert env["GSTACK_HEADLESS"] == "1"
-    assert env["GSTACK_TERMINAL_AGENT"] == "0"
+    monkeypatch.delenv("AGENT_BROWSER_SESSION", raising=False)
+    monkeypatch.delenv("AGENT_BROWSER_IDLE_TIMEOUT_MS", raising=False)
 
-    monkeypatch.setenv("GSTACK_TERMINAL_AGENT", "1")
-    monkeypatch.setenv("GSTACK_HEADLESS", "0")
-    env2 = _browse_child_env()
-    assert env2["GSTACK_TERMINAL_AGENT"] == "1"
-    assert env2["GSTACK_HEADLESS"] == "0"
+    env = _browse_child_env("a1")
+    assert env["AGENT_BROWSER_SESSION"] == "hiveweave-a1"
+    assert env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] == str(2 * 60 * 60 * 1000)
+
+    env2 = _browse_child_env(None)
+    assert "AGENT_BROWSER_SESSION" not in env2
