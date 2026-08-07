@@ -1,7 +1,7 @@
 """Conversation compaction — summarize old turns when history exceeds budget.
 
 契约 03: 对话历史与压缩
-- 50% 阈值触发压缩（产品策略，非模型能力上限）
+- 70% 阈值触发压缩（产品策略，非模型能力上限；可用 HIVEWEAVE_COMPACTION_TRIGGER_RATIO 覆盖）
 - LLM 生成结构化摘要（Goal/Constraints/Progress/Decisions/Next Steps/Critical Context/Relevant Files）
 - 摘要存入独立 compacted_prefix_cache，不混入 history（RECONCILE A1 修正）
 - LLM 失败时回退到硬截断
@@ -10,6 +10,7 @@
 
 from typing import Awaitable, Callable
 
+import os
 import structlog
 
 from hiveweave.conversation.token_utils import (
@@ -24,7 +25,24 @@ from hiveweave.conversation.token_utils import (
 logger = structlog.get_logger()
 
 # ── 常量 ────────────────────────────────────────────────────
-COMPACTION_TRIGGER_RATIO = 0.50
+# 压缩触发比例（产品策略，非模型能力上限）。可用环境变量
+# HIVEWEAVE_COMPACTION_TRIGGER_RATIO 覆盖（如 0.70 = 70%）。
+# 现代大窗口模型（512K）下 50% 过早触发压缩会频繁丢弃历史；调高到
+# 70% 让 agent 在更大占用下才压缩，减少不必要的历史浓缩。
+COMPACTION_TRIGGER_RATIO = float(
+    os.environ.get("HIVEWEAVE_COMPACTION_TRIGGER_RATIO", "0.70")
+)
+
+
+def _compaction_ratio() -> float:
+    """Clamp the configured ratio into (0, 1) so a bad env value cannot
+    trigger-everything (>=1) or never-compact (<=0)."""
+    r = COMPACTION_TRIGGER_RATIO
+    if r <= 0:
+        return 0.50
+    if r >= 1:
+        return 0.99
+    return r
 SUMMARY_TEMPERATURE = 0.3
 # 摘要预算回退值：模型行没有 max_output_tokens（旧数据/未探测）时使用。
 # 对齐 opencode：压缩调用不设小 max_tokens，直接用模型配置的输出上限
@@ -50,19 +68,20 @@ class Compaction:
     def check_overflow(self, total_tokens: int, context_window: int) -> int | None:
         """检查是否需要压缩，返回目标 budget 或 None。
 
-        当 total_tokens > (context_window - COMPACTION_BUFFER) * 0.50 时触发。
+        当 total_tokens > (context_window - COMPACTION_BUFFER) * ratio 时触发，
+        ratio 默认 0.70（可用 HIVEWEAVE_COMPACTION_TRIGGER_RATIO 覆盖）。
         """
         if context_window <= 0:
             return None
         budget = context_window - COMPACTION_BUFFER
         if budget <= 0:
             return None
-        if total_tokens > budget * COMPACTION_TRIGGER_RATIO:
+        if total_tokens > budget * _compaction_ratio():
             return budget
         return None
 
     def should_compact(self, total_tokens: int, context_window: int) -> bool:
-        """判断是否达到 50% 压缩阈值。"""
+        """判断是否达到压缩阈值（默认 70%）。"""
         return self.check_overflow(total_tokens, context_window) is not None
 
     async def compact(
