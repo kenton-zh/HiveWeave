@@ -426,7 +426,8 @@ async def test_double_trigger_dedup_and_cooldown(task_env):
     """连续两次触发只入队一次；冷却期内不重触发；冷却后恢复。"""
     pid = task_env["project_id"]
     store = ConversationStore()
-    big = [{"role": "user", "content": "a" * 250_000}]  # ~62k tokens > 54k 阈值
+    # 128K 窗口：budget=108000，70% 阈值≈75600 → 需 >75.6K tokens 才触发。
+    big = [{"role": "user", "content": "a" * 700_000}]  # ~175k tokens > 75.6k 阈值
 
     async def fake_ctx(_agent_id: str) -> int:
         return 128_000
@@ -591,3 +592,65 @@ async def test_concurrent_execute_transaction_serialized(task_env):
     project_db._agent_cache.pop("agent-a", None)
     project_db._agent_cache.pop("agent-b", None)
     project_db._write_locks.pop(ws, None)
+
+
+# ── COMPACTION_TRIGGER_RATIO：默认 70%（可经 env 覆盖） ───────────────
+
+
+def test_compaction_trigger_ratio_default_070():
+    """默认压缩阈值 = 70%（512K 窗口：budget≈504288，70%≈353K）。
+
+    300K（<70%）不触发；360K（>70%）触发。回归 50%→70% 的调高。
+    """
+    from hiveweave.conversation import compaction as comp
+
+    assert comp.COMPACTION_TRIGGER_RATIO == 0.70
+    c = comp.Compaction()
+    # <70% → 不压缩
+    assert c.check_overflow(300_000, 524_288) is None
+    assert c.should_compact(300_000, 524_288) is False
+    # >70% → 压缩，返回 budget
+    budget = c.check_overflow(360_000, 524_288)
+    assert budget == 524_288 - comp.COMPACTION_BUFFER
+    assert c.should_compact(360_000, 524_288) is True
+
+
+def test_compaction_trigger_ratio_env_override():
+    """HIVEWEAVE_COMPACTION_TRIGGER_RATIO 覆盖默认值。"""
+    import importlib
+
+    with patch.dict(
+        "os.environ", {"HIVEWEAVE_COMPACTION_TRIGGER_RATIO": "0.85"}
+    ):
+        comp = importlib.import_module("hiveweave.conversation.compaction")
+        importlib.reload(comp)
+        c = comp.Compaction()
+        # budget≈504288, 85%≈428K
+        assert c.check_overflow(400_000, 524_288) is None
+        assert c.should_compact(450_000, 524_288) is True
+    # 恢复默认（重载）
+    comp = importlib.import_module("hiveweave.conversation.compaction")
+    importlib.reload(comp)
+    assert comp.COMPACTION_TRIGGER_RATIO == 0.70
+
+
+def test_compaction_trigger_ratio_env_clamped():
+    """非法 env 值被 clamp 到 (0,1)：>=1 → 0.99，<=0 → 0.50。"""
+    import importlib
+
+    with patch.dict(
+        "os.environ", {"HIVEWEAVE_COMPACTION_TRIGGER_RATIO": "5"}
+    ):
+        comp = importlib.import_module("hiveweave.conversation.compaction")
+        importlib.reload(comp)
+        assert comp._compaction_ratio() == 0.99
+    with patch.dict(
+        "os.environ", {"HIVEWEAVE_COMPACTION_TRIGGER_RATIO": "-1"}
+    ):
+        comp = importlib.import_module("hiveweave.conversation.compaction")
+        importlib.reload(comp)
+        assert comp._compaction_ratio() == 0.50
+    # 恢复默认
+    comp = importlib.import_module("hiveweave.conversation.compaction")
+    importlib.reload(comp)
+    assert comp.COMPACTION_TRIGGER_RATIO == 0.70
