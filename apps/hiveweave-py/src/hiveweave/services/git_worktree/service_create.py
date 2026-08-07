@@ -80,8 +80,15 @@ def _copy_if_newer(src: str, dst: str) -> bool:
     src is either an unchanged prior copy or a worktree-local edit — never
     silently clobber it (Issue #3 review: top-level files were unconditionally
     overwritten, wiping agent edits). Root-updated contracts (src newer) still
-    propagate. A same-second update is detected via size when mtimes tie.
-    Returns True when a copy was performed, False when skipped.
+    propagate.
+
+    P2 (audit): same-second ambiguity. ``st_mtime`` is float seconds, so two
+    writes within the same second collapse to the same resolution and a
+    root update could be mistaken for a stale copy (or vice-versa). We compare
+    ``st_mtime_ns`` (nanosecond precision) and tie-break on size when the ns
+    stamps match — a genuine root update with different content is reflected
+    in size even if the filesystem clock did not advance. Returns True when a
+    copy was performed, False when skipped.
     """
     s = Path(src)
     d = Path(dst)
@@ -89,9 +96,9 @@ def _copy_if_newer(src: str, dst: str) -> bool:
         try:
             sm = s.stat()
             dm = d.stat()
-            if sm.st_mtime < dm.st_mtime:
+            if sm.st_mtime_ns < dm.st_mtime_ns:
                 return False
-            if sm.st_mtime == dm.st_mtime and sm.st_size == dm.st_size:
+            if sm.st_mtime_ns == dm.st_mtime_ns and sm.st_size == dm.st_size:
                 return False
         except OSError:
             return False
