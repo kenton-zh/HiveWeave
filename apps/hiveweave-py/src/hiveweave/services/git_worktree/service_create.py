@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any, List, TYPE_CHECKING
@@ -48,6 +49,32 @@ from .porcelain import (
 
 log = structlog.get_logger(__name__)
 from .reconcile import _log_worktree_rebuild_event
+
+# Issue #3: serializes shared-dir sync per workspace. The sync runs in a
+# thread executor (to_thread) — a threading.Lock is the right primitive — and
+# protects against a torn read when the root .hiveweave/shared is being
+# written concurrently while we copy it into a worktree.
+_shared_sync_locks: dict[str, threading.Lock] = {}
+
+
+def _copy_if_newer(src: str, dst: str) -> None:
+    """Copy *src* to *dst* only when *dst* is missing or older than *src*.
+
+    ``shutil.copy2`` preserves mtime, so a dst whose mtime is at-or-newer than
+    src is either an unchanged prior copy or a worktree-local edit — never
+    silently clobber it (Issue #3 review: top-level files were unconditionally
+    overwritten, wiping agent edits). Root-updated contracts (src newer) still
+    propagate. Recursive copytree uses this so dirs get the same protection.
+    """
+    s = Path(src)
+    d = Path(dst)
+    if d.exists():
+        try:
+            if s.stat().st_mtime <= d.stat().st_mtime:
+                return
+        except OSError:
+            return
+    shutil.copy2(s, d)
 
 
 class CreateMixin:
@@ -228,10 +255,13 @@ yarn.lock merge=union
         worktree. Mirroring the shared dir into each worktree makes contracts
         locally readable by every agent. Idempotent; missing source → no-op.
 
-        Merge semantics: files are copied (overwrite), directories are merged
-        with ``dirs_exist_ok`` — we never ``rmtree`` a worktree-local shared
-        subdir, so a repeated create cannot wipe files the agent added locally.
-        Symlinks are skipped (we don't dereference project-external targets).
+        Merge semantics: directories are merged (``dirs_exist_ok``) — we never
+        ``rmtree`` a worktree-local shared subdir, so a repeated create cannot
+        wipe files the agent added locally. Files (top-level and inside dirs)
+        are copied incrementally via ``_copy_if_newer``: an unchanged dst is
+        skipped, and a dst newer than src (a worktree-local edit) is preserved
+        rather than clobbered. Symlinks are skipped (no external dereference).
+        A per-workspace lock serializes concurrent syncs to avoid torn reads.
         """
         if not worktree_path:
             return
@@ -239,24 +269,37 @@ yarn.lock merge=union
         dst = Path(worktree_path) / SHARED_DIR
         if not src.exists():
             return
-        dst.mkdir(parents=True, exist_ok=True)
-        copied = 0
-        for item in src.iterdir():
-            s = src / item.name
-            if s.is_symlink():
-                continue  # don't dereference external targets into worktrees
-            d = dst / item.name
-            if s.is_dir():
-                shutil.copytree(s, d, dirs_exist_ok=True)
-                copied += 1
-            elif s.is_file():
-                shutil.copy2(s, d)
-                copied += 1
-        log.info(
-            "git_worktree.shared_synced",
-            worktree=worktree_path,
-            copied=copied,
-        )
+        lock_key = str(Path(workspace_path).resolve())
+        lock = _shared_sync_locks.get(lock_key)
+        if lock is None:
+            lock = threading.Lock()
+            _shared_sync_locks[lock_key] = lock
+        with lock:
+            dst.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            skipped = 0
+            for item in src.iterdir():
+                s = src / item.name
+                if s.is_symlink():
+                    continue  # don't dereference external targets into worktrees
+                d = dst / item.name
+                if s.is_dir():
+                    shutil.copytree(s, d, dirs_exist_ok=True, copy_function=_copy_if_newer)
+                    copied += 1
+                elif s.is_file():
+                    if d.exists() and d.stat().st_mtime >= s.stat().st_mtime:
+                        skipped += 1
+                    else:
+                        _copy_if_newer(s, d)
+                        copied += 1
+                else:
+                    skipped += 1
+            log.info(
+                "git_worktree.shared_synced",
+                worktree=worktree_path,
+                copied=copied,
+                skipped=skipped,
+            )
 
     # ── 1. CREATE ────────────────────────────────────────────
 
