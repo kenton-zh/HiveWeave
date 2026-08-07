@@ -21,6 +21,37 @@ log = structlog.get_logger(__name__)
 
 _migrated: set[str] = set()
 
+
+async def _diff_touches_scope(
+    main_ws: str, ch: str, main_tip: str, scope_files: set[str]
+) -> bool | None:
+    """Return True if ``ch..main_tip`` touches any path in *scope_files*.
+
+    Issue #5: baseline staleness should be judged by whether the newer
+    commits actually touch the verification scope, not by raw tip distance.
+    Returns None when the scope is empty (can't judge — caller falls back to
+    the distance-only rule) or when git diff fails (fail-closed → caller
+    treats as "touched" to stay conservative).
+    """
+    if not scope_files or not main_tip or not ch:
+        return None
+    try:
+        from hiveweave.services.git_worktree import _git
+        from hiveweave.services.worktree_review import normalize_evidence_path
+
+        ok, out = await _git(
+            ["diff", "--name-only", ch, main_tip],
+            main_ws,
+        )
+        if not ok:
+            return None
+        changed = {normalize_evidence_path(p) for p in out.splitlines() if p.strip()}
+        if not changed:
+            return False  # no changed files — nothing to re-run
+        return bool(changed & scope_files)
+    except Exception:
+        return None
+
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS tool_attestations (
     id TEXT PRIMARY KEY,
@@ -1214,6 +1245,33 @@ async def check_verify_baseline(
         allowed.add(main_tip[:12].lower())
     allowed.add(target[:12].lower())
 
+    # Issue #5: scope-aware baseline — the attestation commit may be behind
+    # main tip because *unrelated* merges landed (e.g. a frontend merge landed
+    # while this VERIFY targets backend). If the diff between the attestation
+    # commit and main tip does NOT touch the verification scope (the files the
+    # parent task changed), the baseline is still valid — forcing rework would
+    # be pure waste. Compute the scope up-front (best-effort, fail-open → []).
+    scope_files: set[str] = set()
+    parent_id = str(task.get("parent_task_id") or "").strip()
+    if parent_id:
+        try:
+            from hiveweave.services.task import TaskService
+            from hiveweave.services.worktree_review import normalize_files_changed
+
+            parent = await TaskService().get_task(project_id, parent_id)
+            if parent:
+                pev = parent.get("evidence") or {}
+                if isinstance(pev, str):
+                    try:
+                        pev = json.loads(pev)
+                    except Exception:
+                        pev = {}
+                if isinstance(pev, dict):
+                    raw = pev.get("files_changed") or pev.get("filesChanged") or []
+                    scope_files = set(normalize_files_changed(raw))
+        except Exception:
+            scope_files = set()
+
     for row in rows:
         ch = ""
         if hasattr(row, "keys"):
@@ -1260,6 +1318,16 @@ async def check_verify_baseline(
                     behind = int((cnt_out or "0").strip() or "0") if ok_cnt else 999
                     if behind <= max_behind:
                         ok_match = True
+                    elif max_behind >= 0:
+                        # Issue #5: beyond the distance window — accept only if
+                        # the attestation commit → main tip diff does NOT touch
+                        # the verification scope (unrelated merges don't force
+                        # rework). Fail-open judge → conservative (keep stale).
+                        touched = await _diff_touches_scope(
+                            main_ws, ch, main_tip, scope_files
+                        )
+                        if touched is False:
+                            ok_match = True
             except Exception:
                 pass
         if ok_match:

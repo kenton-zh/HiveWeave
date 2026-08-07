@@ -6,6 +6,8 @@ import re
 
 WORKTREE_DIR = ".hiveweave/worktrees"
 QUARANTINE_DIR = ".hiveweave/worktrees/_quarantine"
+HIVEWEAVE_DIR = ".hiveweave"
+SHARED_DIR = ".hiveweave/shared"
 
 # P1-1: Generated files that cause predictable merge conflicts.
 # Checkpoint strips these from commits; merge auto-regenerates after landing.
