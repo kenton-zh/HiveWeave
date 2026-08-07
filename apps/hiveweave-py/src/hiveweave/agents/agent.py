@@ -908,8 +908,12 @@ class Agent:
                     error_msg = result.get("error") or "Unknown LLM error"
                     err_status = result.get("error_status")
                     err_headers = result.get("error_headers")
+                    # 与 llm.retry.RETRYABLE_STATUSES 对齐（429 + 全量 5xx），
+                    # 不再硬编码旧 tuple (429,500,502,503,504,529)。
+                    from hiveweave.llm.retry import is_retryable_status
+
                     is_retryable = (
-                        err_status in (429, 500, 502, 503, 504, 529)
+                        (isinstance(err_status, int) and is_retryable_status(err_status))
                         or (isinstance(err_headers, dict) and err_headers)
                     )
 
