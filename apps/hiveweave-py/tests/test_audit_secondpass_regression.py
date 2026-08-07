@@ -63,19 +63,104 @@ async def test_update_progress_unknown_ref_raises_value_error():
 
 # ── P0-3 dispatch_task reuses existing task with resolved id ─────────────
 @pytest.mark.asyncio
-async def test_dispatch_resolves_existing_task_id():
+async def test_dispatch_existing_task_resolves_prefix_and_reassigns():
+    """Existing-task branch: prefix → full id, assignee updated, task reused."""
     from hiveweave.services.dispatch import DispatchService
 
     d = DispatchService.__new__(DispatchService)
     d.task_service = type("TS", (), {})()
     d.task_service.require_task_id = AsyncMock(return_value=FULL_UUID)
-    # Just verify the wiring: require_task_id exists on TaskService and
-    # the dispatch existing_task_id branch calls it (verified by code
-    # inspection). The unit-level contract is that resolve_task_id returns
-    # the full UUID for a short prefix — already covered by
-    # test_canonical_task_id_resolves_short_prefix_to_full_uuid.
-    resolved = await d.task_service.require_task_id("proj", SHORT_PREFIX)
-    assert resolved == FULL_UUID
+    d.task_service.get_task = AsyncMock(return_value={})
+    d.task_service.update_task = AsyncMock()
+    d.task_service.ensure_assignee_claimed = AsyncMock()
+    d.inbox = type("INBOX", (), {})()
+    d.inbox.send_message = AsyncMock()
+    d.handoff = type("HO", (), {})()
+    d.handoff.create_handoff = AsyncMock()
+    with patch(
+        "hiveweave.services.dispatch._ensure_schema", new=AsyncMock()
+    ), patch(
+        "hiveweave.services.dispatch._execute", new=AsyncMock()
+    ), patch(
+        "hiveweave.services.org_span.validate_dispatch_span",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "hiveweave.services.org_span.validate_ceo_dispatch_target",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "hiveweave.services.org_span.validate_executor_assignee",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "hiveweave.db.meta.get_project_workspace",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "hiveweave.services.org.OrgService.resolve_agent",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "hiveweave.services.obligation.ObligationLedger.create",
+        new=AsyncMock(),
+    ):
+        result = await d.dispatch_task(
+            project_id="proj",
+            from_agent_id="from-a",
+            to_agent_id="to-b",
+            description="rework the landing page",
+            existing_task_id=SHORT_PREFIX,
+            create_handoff=False,
+        )
+    # The fix's contract: short prefix resolved via require_task_id, then the
+    # update targets the canonical id so the assignee actually changes.
+    d.task_service.require_task_id.assert_awaited_once_with("proj", SHORT_PREFIX)
+    update_args, update_kw = d.task_service.update_task.await_args
+    assert update_args[1] == FULL_UUID
+    assert update_kw["assignee_id"] == "to-b"
+    assert result["success"] is True
+    assert result["task_id"] == FULL_UUID
+
+
+@pytest.mark.asyncio
+async def test_dispatch_existing_archived_task_is_blocked():
+    """B3: archived tasks are write-protected — dispatch must refuse."""
+    from hiveweave.services.dispatch import DispatchService
+
+    d = DispatchService.__new__(DispatchService)
+    d.task_service = type("TS", (), {})()
+    d.task_service.require_task_id = AsyncMock(return_value=FULL_UUID)
+    d.task_service.get_task = AsyncMock(return_value={"is_archived": True})
+    d.task_service.update_task = AsyncMock()
+    d.task_service.ensure_assignee_claimed = AsyncMock()
+    d.inbox = type("INBOX", (), {})()
+    d.inbox.send_message = AsyncMock()
+    d.handoff = type("HO", (), {})()
+    d.handoff.create_handoff = AsyncMock()
+    with patch(
+        "hiveweave.services.dispatch._ensure_schema", new=AsyncMock()
+    ), patch(
+        "hiveweave.services.dispatch._execute", new=AsyncMock()
+    ), patch(
+        "hiveweave.services.org_span.validate_dispatch_span",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "hiveweave.services.org_span.validate_ceo_dispatch_target",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "hiveweave.services.org_span.validate_executor_assignee",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "hiveweave.services.obligation.ObligationLedger.create",
+        new=AsyncMock(),
+    ):
+        result = await d.dispatch_task(
+            project_id="proj",
+            from_agent_id="from-a",
+            to_agent_id="to-b",
+            description="touching an archived task",
+            existing_task_id=FULL_UUID,
+            create_handoff=False,
+        )
+    assert result["success"] is False
+    assert "archived" in result["message"].lower()
+    d.task_service.update_task.assert_not_awaited()
 
 
 # ── P0-4 create_task normalizes depends_on ───────────────────────────────
@@ -113,31 +198,51 @@ async def test_create_task_normalizes_depends_on():
 # ── P0-5 reply_to prefix normalized before storage ───────────────────────
 @pytest.mark.asyncio
 async def test_reply_to_short_prefix_resolved_to_full_contract():
+    """P0-5: explicit reply_to short prefix is normalized to the full UUID
+    before the inbox INSERT — otherwise the query side's exact ``IN`` match
+    misses → false UNREPLIED_ASKS → commit_turn deadlock."""
     from hiveweave.services.inbox import InboxService
 
-    svc = InboxService.__new__(InboxService)
     contract = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     prefix = contract[:12]
-    # known_set = the contracts the recipient sent to me (direction B→A).
     with patch(
         "hiveweave.services.inbox._ensure_schema", new=AsyncMock()
     ), patch(
+        "hiveweave.db.meta.get_agent_by_id", new=AsyncMock(return_value=None)
+    ), patch(
+        "hiveweave.services.inbox.project_db.query_one",
+        new=AsyncMock(return_value=None),
+    ), patch(
         "hiveweave.services.inbox.project_db.query",
+        # known_set = contracts the recipient (a) sent to me (b).
         new=AsyncMock(return_value=[{"reply_contract_id": contract}]),
-    ) as q, patch(
-        "hiveweave.services.inbox.project_db.execute", new=AsyncMock()
+    ), patch(
+        "hiveweave.services.inbox.project_db.execute",
+        new=AsyncMock(),
+    ) as ex, patch(
+        "hiveweave.realtime.event_bus.status_event_bus.publish_chat_message",
+        new=AsyncMock(),
     ):
-        # Reuse the exact send_message path by calling the private helper is
-        # not possible; instead verify the resolver logic inline via the
-        # normalization that now lives in send_message. We fetch the same
-        # rows send_message uses and assert prefix→full resolution.
-        known_rows = await q("proj", "SELECT reply_contract_id ...", ["a", "b"])
-        known_set = {r["reply_contract_id"] for r in known_rows}
-        rt = prefix
-        if rt not in known_set:
-            matches = [c for c in known_set if c and c.startswith(rt)]
-            assert len(matches) == 1
-            assert matches[0] == contract
+        result = await InboxService().send_message(
+            "b", "a", "rework it", message_type="ask",
+            reply_to=prefix, wake=True,
+        )
+    inserts = [
+        (a.args[1], a.args[2])
+        for a in ex.await_args_list
+        if isinstance(a.args[1], str) and "INSERT INTO inbox" in a.args[1]
+    ]
+    assert len(inserts) == 1
+    sql, params = inserts[0]
+    # Column order: (…, reply_contract_id, reply_to) → last param is reply_to.
+    # The ask is downgraded to notify (reply chain ends) but its reply_to is
+    # normalized to the full UUID — the gate's exact IN match then hits.
+    assert params[-1] == contract
+    # Downgrade contract (P0-5's doom-loop fix): no expect_report, no new
+    # contract id, message_type no longer "ask".
+    assert params[6] == "notify"
+    assert params[7] == 0
+    assert params[14] is None
 
 
 # ── Audit-1 R1 pre_check honfs the sent-fallback like backstop ───────────
@@ -211,33 +316,30 @@ def test_stall_break_message_uses_max_counter():
     assert "f\"[STALL BREAK] {max(stall_count, readonly_stall_count)}" in src
 
 
-# ── Audit-1 R3 browse tempfile unlinked after exec ───────────────────────
-def test_materialize_with_tmp_returns_path_and_inline_js_kept():
-    from hiveweave.tools.browse_tools import _materialize_with_tmp
+# ── Audit-1 R3 browse oversized inline JS routed via stdin ───────────────
+def test_map_ab_argv_huge_js_uses_stdin_payload():
+    from hiveweave.tools.browse_tools import _map_ab_argv
 
-    argv, tmp = _materialize_with_tmp(["js", "1+1"], "")
-    assert argv == ["js", "1+1"]
-    assert tmp is None
+    huge = "(" + "window;" * 8000 + ")"
+    argv, stdin = _map_ab_argv(["js", huge], "")
+    assert argv == ["eval", "--stdin"]
+    assert stdin == huge
 
 
-def test_materialize_with_tmp_large_inline_returns_tempfile(monkeypatch, tmp_path):
-    import tempfile
+def test_browse_exec_forwards_stdin_payload(browse_fake_proc, tmp_path):
+    """browse_exec must pipe the huge snippet to the child via stdin=PIPE."""
+    import asyncio
 
-    from hiveweave.tools import browse_tools
+    from hiveweave.tools.browse_tools import browse_exec
 
-    # Direct tempfile.mkstemp patching doesn't work when the function
-    # re-imports it locally (still the same module object, but fd=0 from
-    # our stub breaks os.fdopen → OSError → fallback returns "js").
-    # Instead, lower the inline limit so a tiny snippet triggers mkstemp,
-    # and let the real tempfile module create a real file — we can verify
-    # both the return shape and that the file actually exists on disk.
-    monkeypatch.setattr(browse_tools, "_INLINE_JS_DIRECT_MAX", 5)
-    snippet = "abcdef"  # longer than 5 → must materialize to tempfile
-    argv, tmp = browse_tools._materialize_with_tmp(["js", snippet], "")
-    assert argv[0] == "eval"
-    assert tmp is not None
-    assert tmp.endswith(".js")
-    import os
-    assert os.path.isfile(tmp)
-    # Clean up (the real fix unlinks in browse_exec; here we clean manually).
-    os.unlink(tmp)
+    payload = "x" * 30000
+    with browse_fake_proc as ctx:
+        ctx.out = b"ok"
+        code, _out, _err = asyncio.run(
+            browse_exec(["js", payload], str(tmp_path))
+        )
+
+    assert code == 0
+    assert ctx.stdin_is_pipe
+    # The fake child's stdin received the exact huge payload.
+    assert ctx.stdin_written == payload.encode("utf-8")

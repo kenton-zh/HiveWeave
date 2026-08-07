@@ -136,7 +136,7 @@ apps/web/scripts/refactor-*
 
 # IDE / tool local state
 .trae/
-.gstack/
+.agent-browser/
 .e2e-sandbox/
 .cursor/better-harness/
 .superpowers/

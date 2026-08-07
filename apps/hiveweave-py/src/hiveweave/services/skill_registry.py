@@ -213,7 +213,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
             "7. Document your methodology — others should be able to reproduce.\n"
         ),
     },
-    # ── gstack Discipline Skills ─────────────────────────────
+    # ── Discipline Skills ─────────────────────────────
     {
         "slug": "self-review",
         "name": "self-review",
@@ -240,7 +240,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "slug": "code-review-and-quality",
         "name": "code-review-and-quality",
-        "description": "Structured five-axis code review with severity tagging and actionable feedback. Equivalent to gstack /review discipline.",
+        "description": "Structured five-axis code review with severity tagging and actionable feedback. Discipline equivalent: /review.",
         "category": "discipline",
         "instructions": (
             "# Code Review & Quality Discipline\n\n"
@@ -263,7 +263,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "slug": "security-and-hardening",
         "name": "security-and-hardening",
-        "description": "OWASP Top 10 + STRIDE threat modeling + exploit scenario construction. Equivalent to gstack /cso discipline.",
+        "description": "OWASP Top 10 + STRIDE threat modeling + exploit scenario construction. Discipline equivalent: /cso.",
         "category": "discipline",
         "instructions": (
             "# Security & Hardening Discipline\n\n"
@@ -281,7 +281,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "slug": "debugging-and-error-recovery",
         "name": "debugging-and-error-recovery",
-        "description": "Systematic root-cause investigation — reproduce, isolate, fix, verify. Equivalent to gstack /investigate discipline.",
+        "description": "Systematic root-cause investigation — reproduce, isolate, fix, verify. Discipline equivalent: /investigate.",
         "category": "discipline",
         "instructions": (
             "# Debugging & Error Recovery Discipline\n\n"
@@ -312,7 +312,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "slug": "design-consultation",
         "name": "design-consultation",
-        "description": "Research competitors, extract design language, propose complete design system. Equivalent to gstack /design-consultation.",
+        "description": "Research competitors, extract design language, propose complete design system. Discipline equivalent: /design-consultation.",
         "category": "discipline",
         "instructions": (
             "# Design Consultation Discipline\n\n"
@@ -329,7 +329,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "slug": "design-review",
         "name": "design-review",
-        "description": "Pixel-level visual quality audit: spacing, hierarchy, AI slop patterns, interaction states. Equivalent to gstack /design-review.",
+        "description": "Pixel-level visual quality audit: spacing, hierarchy, AI slop patterns, interaction states. Discipline equivalent: /design-review.",
         "category": "discipline",
         "instructions": (
             "# Design Review Discipline\n\n"
@@ -347,7 +347,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "slug": "planning-and-task-breakdown",
         "name": "planning-and-task-breakdown",
-        "description": "Decompose specs into atomic verifiable tasks with dependency ordering. Equivalent to gstack /plan-eng-review.",
+        "description": "Decompose specs into atomic verifiable tasks with dependency ordering. Discipline equivalent: /plan-eng-review.",
         "category": "discipline",
         "instructions": (
             "# Planning & Task Breakdown Discipline\n\n"
@@ -365,7 +365,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "slug": "shipping-and-launch",
         "name": "shipping-and-launch",
-        "description": "Pre-launch checklist: tests, changelog, version bump, regression check, deployment verification. Equivalent to gstack /ship.",
+        "description": "Pre-launch checklist: tests, changelog, version bump, regression check, deployment verification. Discipline equivalent: /ship.",
         "category": "discipline",
         "instructions": (
             "# Shipping & Launch Discipline\n\n"
@@ -384,7 +384,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "slug": "spec-driven-development",
         "name": "spec-driven-development",
-        "description": "Turn vague intent into precise executable specification before coding. Equivalent to gstack /spec.",
+        "description": "Turn vague intent into precise executable specification before coding. Discipline equivalent: /spec.",
         "category": "discipline",
         "instructions": (
             "# Spec-Driven Development Discipline\n\n"
@@ -404,7 +404,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "slug": "context-engineering",
         "name": "context-engineering",
-        "description": "Save and restore working context across sessions. Equivalent to gstack /context-save and /context-restore.",
+        "description": "Save and restore working context across sessions. Discipline equivalent: /context-save and /context-restore.",
         "category": "discipline",
         "instructions": (
             "# Context Engineering Discipline\n\n"
@@ -495,17 +495,17 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
             "Principle: The UI must look and feel production-quality, not AI-generated.\n"
         ),
     },
-    # ── Browser QA (gstack browse / qa) ──────────────────────
+    # ── Browser QA (agent-browser browse / qa) ──────────────────────
     {
         "slug": "browse",
         "name": "browse",
         "description": (
-            "Drive a real Chromium browser via the `browse` tool (gstack). "
+            "Drive a real Chromium browser via the `browse` tool (agent-browser). "
             "Use for UI E2E: goto, snapshot, click, fill, screenshot, console, network."
         ),
         "category": "tool",
         "instructions": (
-            "# Browser Testing (gstack browse)\n\n"
+            "# Browser Testing (agent-browser browse)\n\n"
             "You have a real Chromium browser. Prefer the **`browse` tool** "
             "(not raw bash `$B`).\n\n"
             "## Setup\n"
@@ -519,7 +519,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
             "## Core patterns\n"
             "```\n"
             "browse(args=[\"goto\", \"http://127.0.0.1:3000\"])\n"
-            "browse(args=[\"text\"])\n"
+            "browse(args=[\"get\", \"text\", \"@e1\"])\n"
             "browse(args=[\"console\"])\n"
             "browse(args=[\"snapshot\", \"-i\"])\n"
             "browse(args=[\"click\", \"@e3\"])\n"
@@ -528,7 +528,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
             "assert_visual(screenshotPath=\"evidence/flow.png\", "
             "observed=\"Start button visible bottom-right; no error overlay\", "
             "verdict=\"pass\")\n"
-            "browse(args=[\"snapshot\", \"-D\"])  # diff vs previous\n"
+            "browse(args=[\"diff\", \"snapshot\"])  # diff vs previous\n"
             "```\n\n"
             "## Rules\n"
             "- UI pass/fail requires **assert_visual** (what you SEE in the "
@@ -547,12 +547,12 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
         "slug": "qa",
         "name": "qa",
         "description": (
-            "Systematic browser QA methodology (gstack /qa): find UI bugs with "
+            "Systematic browser QA methodology (agent-browser /qa): find UI bugs with "
             "real Chromium evidence, report severity, re-verify after fixes."
         ),
         "category": "discipline",
         "instructions": (
-            "# Browser QA Methodology (gstack /qa)\n\n"
+            "# Browser QA Methodology (agent-browser /qa)\n\n"
             "Load this when you are the project's browser QA owner.\n\n"
             "## Mission\n"
             "Test the running app in a real browser. Find bugs. Report with evidence. "

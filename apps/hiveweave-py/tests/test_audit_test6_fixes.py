@@ -27,7 +27,7 @@ from hiveweave.services.process_registry import (
     _inject_hiveweave_test_exclude,
     prepare_spawn_command,
 )
-from hiveweave.tools.browse_tools import _materialize_inline_js
+from hiveweave.tools.browse_tools import _map_ab_argv
 
 
 class TestPendingFilter:
@@ -86,27 +86,30 @@ class TestSpawnExclude:
 
 class TestBrowseInlineJs:
     def test_inline_passes_through_as_expression(self):
-        # Regression (shoulabridge audit bug #3): inline JS must be passed to
-        # `js` as an expression, NOT materialised to a tempfile whose *path*
-        # gstack then evaluated (evaluate 1+1 returned the path string).
-        argv = _materialize_inline_js(
+        # Regression (shoulabridge audit bug #3): inline JS must be passed as
+        # an expression to agent-browser `eval`, NOT materialised to a
+        # tempfile whose *path* the old CLI evaluated (evaluate 1+1 returned
+        # the path string).
+        argv, stdin = _map_ab_argv(
             ["js", "() => document.body.click()"],
             workspace="",
         )
-        assert argv == ["js", "() => document.body.click()"]
+        assert argv == ["eval", "() => document.body.click()"]
+        assert stdin is None
 
     def test_existing_file_preserved_as_eval(self):
-        # `eval` reads a file path — a real file must stay `eval <path>`, not
-        # be rewritten to `js` (old behavior evaluated the path string).
+        # `eval <path>` to an existing file reads its content in — the file
+        # must not be evaluated as a literal path string.
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".js", delete=False, encoding="utf-8"
         ) as f:
             f.write("1+1")
             path = f.name
         try:
-            argv = _materialize_inline_js(["eval", path], workspace="")
+            argv, stdin = _map_ab_argv(["eval", path], workspace="")
             assert argv[0] == "eval"
-            assert Path(argv[1]).resolve() == Path(path).resolve()
+            assert argv[1] == "1+1"
+            assert stdin is None
         finally:
             os.unlink(path)
 

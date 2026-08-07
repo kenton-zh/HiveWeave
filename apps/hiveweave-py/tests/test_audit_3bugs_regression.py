@@ -7,6 +7,9 @@
    while the same row was MATCH, and short-id rows never satisfied the gate.
 3. browse `evaluate`/`js` expression wrapping crash — the old code fed a
    tempfile *path string* to `js`, so `evaluate 1+1` returned the path.
+   Now gstack-style argv is mapped to agent-browser (`_map_ab_argv`):
+   inline expressions become `eval <src>`, existing files get their
+   content read, oversized snippets go base64 / stdin.
 """
 
 from __future__ import annotations
@@ -86,56 +89,96 @@ def test_format_mismatch_hint_labels_unrelated_task_as_mismatch():
 
 
 # ── 3. browse evaluate/js inline expression routing ──────────────────────
-def test_browse_inline_js_passes_expression_straight_through(tmp_path):
-    """`js`/`evaluate` must evaluate the expression, not a tempfile path.
+# New contract (agent-browser): _map_ab_argv translates gstack-style browse
+# argv to the agent-browser CLI. js/eval/evaluate become `eval <src>` — a
+# path arg that names an existing file has its content read in, small
+# snippets go direct, medium ones base64 (-b), oversized ones via --stdin.
+def test_browse_inline_js_maps_to_eval():
+    from hiveweave.tools.browse_tools import _map_ab_argv
 
-    Regression: evaluate 1+1 used to return the tempfile path string.
-    """
-    from hiveweave.tools.browse_tools import _materialize_inline_js
-
-    argv = _materialize_inline_js(
-        ["js", "1+1"], str(tmp_path)
-    )
-    assert argv == ["js", "1+1"]
-
-
-def test_browse_evaluate_maps_to_js_for_inline_expression(tmp_path):
-    from hiveweave.tools.browse_tools import _materialize_inline_js
-
-    argv = _materialize_inline_js(
-        ["evaluate", "document.title"], str(tmp_path)
-    )
-    assert argv == ["js", "document.title"]
+    argv, stdin = _map_ab_argv(["js", "1+1"], "")
+    assert argv == ["eval", "1+1"]
+    assert stdin is None
 
 
-def test_browse_existing_file_rerouted_to_eval(tmp_path):
-    """A `js` arg that is an existing file must run file semantics (eval)."""
-    from hiveweave.tools.browse_tools import _materialize_inline_js
+def test_browse_evaluate_maps_to_eval():
+    from hiveweave.tools.browse_tools import _map_ab_argv
+
+    argv, stdin = _map_ab_argv(["evaluate", "document.title"], "")
+    assert argv == ["eval", "document.title"]
+    assert stdin is None
+
+
+def test_browse_eval_file_content_loaded(tmp_path):
+    """`eval <path>` to an existing file must run its content, not the path."""
+    from hiveweave.tools.browse_tools import _map_ab_argv
 
     f = tmp_path / "snippet.js"
     f.write_text("42", encoding="utf-8")
-    argv = _materialize_inline_js(["js", str(f)], str(tmp_path))
+    argv, stdin = _map_ab_argv(["eval", str(f)], str(tmp_path))
+    assert argv == ["eval", "42"]
+    assert stdin is None
+
+
+def test_browse_js_existing_file_reads_content(tmp_path):
+    """Same file-content semantics under the `js` head."""
+    from hiveweave.tools.browse_tools import _map_ab_argv
+
+    f = tmp_path / "snippet.js"
+    f.write_text("42", encoding="utf-8")
+    argv, stdin = _map_ab_argv(["js", str(f)], str(tmp_path))
+    assert argv == ["eval", "42"]
+    assert stdin is None
+
+
+def test_browse_large_js_uses_base64():
+    """>1024 chars avoids shell/argv escaping via base64 (-b)."""
+    import base64
+
+    from hiveweave.tools.browse_tools import _map_ab_argv
+
+    big = "(" + "1;" * 3000 + ")"  # > _EVAL_DIRECT_MAX, <= _EVAL_B64_MAX
+    argv, stdin = _map_ab_argv(["js", big], "")
     assert argv[0] == "eval"
-    assert argv[1].endswith("snippet.js")
+    assert argv[1] == "-b"
+    assert base64.b64decode(argv[2]).decode("utf-8") == big
+    assert stdin is None
 
 
-def test_browse_large_inline_js_materialised_to_tempfile(tmp_path):
-    """Oversized inline snippets avoid Windows argv limits via a tempfile."""
-    from hiveweave.tools.browse_tools import _materialize_inline_js
+def test_browse_huge_js_uses_stdin():
+    """Oversized snippets (>24000) avoid Windows argv limits via --stdin."""
+    from hiveweave.tools.browse_tools import _map_ab_argv
 
-    big = "(" + "1;" * 3000 + ")"  # clearly over _INLINE_JS_DIRECT_MAX
-    argv = _materialize_inline_js(["js", big], str(tmp_path))
-    assert argv[0] == "eval"
-    assert argv[1] != big
+    huge = "x" * 30000
+    argv, stdin = _map_ab_argv(["js", huge], "")
+    assert argv == ["eval", "--stdin"]
+    assert stdin == huge
 
 
-def test_browse_non_js_command_untouched(tmp_path):
-    from hiveweave.tools.browse_tools import _materialize_inline_js
+def test_browse_goto_maps_to_open():
+    from hiveweave.tools.browse_tools import _map_ab_argv
 
-    argv = _materialize_inline_js(
-        ["goto", "http://127.0.0.1:3000"], str(tmp_path)
+    argv, stdin = _map_ab_argv(["goto", "http://127.0.0.1:3000"], "")
+    assert argv == ["open", "http://127.0.0.1:3000"]
+    assert stdin is None
+
+
+def test_browse_screenshot_selector_to_positional():
+    from hiveweave.tools.browse_tools import _map_ab_argv
+
+    argv, stdin = _map_ab_argv(
+        ["screenshot", "--selector", "canvas", "evidence/x.png"], ""
     )
-    assert argv == ["goto", "http://127.0.0.1:3000"]
+    assert argv == ["screenshot", "canvas", "evidence/x.png"]
+    assert stdin is None
+
+
+def test_browse_passthrough_command_untouched():
+    from hiveweave.tools.browse_tools import _map_ab_argv
+
+    argv, stdin = _map_ab_argv(["console"], "")
+    assert argv == ["console"]
+    assert stdin is None
 
 
 # ── check_verify_baseline canonical query key ─────────────────────────────

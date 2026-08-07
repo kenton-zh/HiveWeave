@@ -541,7 +541,7 @@ def test_stop_processes_for_project_kills_registered():
     pr.clear_registry_for_tests()
 
 
-# ── P3: gitignore includes .gstack ─────────────────────────────────────────
+# ── P3: gitignore includes .agent-browser ──
 
 
 # ── E3 follow-up: test_run stamps commit_hash ──────────────────────────────
@@ -615,9 +615,9 @@ async def test_issue_test_run_attestation_records_commit_hash(tmp_path: Path):
     assert kwargs["commit_hash"].startswith(head[:12])
 
 
-def test_gitignore_generated_includes_gstack():
+def test_gitignore_generated_includes_agent_browser():
     from hiveweave.services.git_worktree.constants import (
         GITIGNORE_GENERATED_ENTRIES,
     )
 
-    assert ".gstack/" in GITIGNORE_GENERATED_ENTRIES
+    assert ".agent-browser/" in GITIGNORE_GENERATED_ENTRIES

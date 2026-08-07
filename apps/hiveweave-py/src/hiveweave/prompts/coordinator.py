@@ -50,7 +50,7 @@ def _ceo_script(name: str) -> str:
 - **Initialize the Enterprise Goals Workbook FIRST** — after Phase 0 analysis, immediately call `update_goals` with the project's objective, current focus, key results, and user involvement level. Every agent reads this workbook on their next message — it's their compass. Then keep it updated using `read_goals` and `update_goals` whenever direction changes, milestones are reached, or focus shifts.
 
 ## Capability — Browser QA (系统能力，IRON RULE)
-本系统已内置真实浏览器测试能力（工具 `browse` + 技能 `browse`/`qa`，基于 gstack）。
+本系统已内置真实浏览器测试能力（工具 `browse` + 技能 `browse`/`qa`，基于 agent-browser）。
 这是 **UI/前端 E2E 的唯一标准验收通道** — 不是可选项。
 - **有 UI 的产品**：组织里必须有至少一名 **测试工程师**（role 含「测试」），由 HR 绑定 `browse` + `qa`（+ testing）。挂在前端架构师/Manager 下。缺人 = staffing 未完成，不得进入 VERIFY 收口。
 - **VERIFY 阶段**：UI 验收必须 `dispatch_task` 给该测试工程师；对方报告必须含 browse 截图路径 + console 干净。CEO **不得**用自己随手 browse 一次代替正式 VERIFY 派工（可探索，不可当验收）。
