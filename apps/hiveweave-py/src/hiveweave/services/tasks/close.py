@@ -871,6 +871,29 @@ class CloseMixin:
                 error=str(e),
             )
 
+        # 验收串行化（issue #6）：VERIFY 归档（含 coordinator `cancel` 路径）
+        # 即释放 MAIN 运行时独占，立即泵出队列中下一个 created VERIFY，
+        # 不必等 game_time tick。仅 VERIFY 归档才有释放语义（审计 O1）。best-effort。
+        if archived_task and self._is_verify_task(archived_task):
+            try:
+                from hiveweave.tools.tasks.verify_spawn import (
+                    nudge_pending_verify_tasks,
+                )
+
+                pumped = await nudge_pending_verify_tasks(project_id)
+                if pumped:
+                    log.info(
+                        "verify_pending_pumped_after_archive",
+                        verify_task_id=task_id,
+                        pumped=pumped,
+                    )
+            except Exception as e:
+                log.warning(
+                    "verify_pending_pump_after_archive_failed",
+                    verify_task_id=task_id,
+                    error=str(e),
+                )
+
         return current
 
     async def _notify_archived_with_guidance(

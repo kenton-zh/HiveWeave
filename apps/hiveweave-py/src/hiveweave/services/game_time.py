@@ -468,11 +468,19 @@ class GameTimeService:
                 log.error("game_time_tick_error", project_id=project_id, error=str(e))
 
     async def _nudge_stale_verify(self, project_id: str) -> None:
-        """Wake assignees of VERIFY children stuck under verifying parents."""
+        """Wake assignees of VERIFY children stuck under verifying parents.
+
+        验收串行化（issue #6）：每 2 分钟 tick 同时推进排队队列 —— 若当前
+        无 in-flight VERIFY 而队列里有 created VERIFY，则唤醒最老的一个。
+        """
         try:
-            from hiveweave.tools.task_tools import nudge_stale_verify_tasks
+            from hiveweave.tools.task_tools import (
+                nudge_pending_verify_tasks,
+                nudge_stale_verify_tasks,
+            )
 
             await nudge_stale_verify_tasks(project_id)
+            await nudge_pending_verify_tasks(project_id)
         except Exception as e:
             log.error(
                 "stale_verify_nudge_failed",

@@ -278,6 +278,7 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 - **merge 门禁**：`git_worktree_merge` 合调用者**自己 short_id 的分支**时，要求对应任务已 `approved` 且批准人 ≠ 调用者（`_check_self_merge_gate`）；合下级分支按原逻辑
 - **merge 代理**：merger 失联/逾期时 `services/merge_proxy.py` 沿 parent 链找有 MERGE capability 的祖先发 `[MERGE PROXY]` 并触发；`task.mark_verifying` 清理陈旧 MERGE PENDING inbox
 - **VERIFY spawn**：approve+merge 后 spawn 独立 QA 验证任务（`_find_independent_qa` 排除原实现者与 merger）；QA 缺席 → VERIFY blocked → hire 后 `retry_qa_blocked_verify_tasks` 重挂
+- **验收串行化（HARD RULE）**：同项目同一时刻**只允许一个 VERIFY 在 MAIN 上跑集成/E2E**（共享端口 + DB 不可并发独占）。`_nudge_one_verify_task` 串行锁：已有 in-flight VERIFY（claimed/running/submitted/reviewing/verifying/rework）时新 VERIFY 保持 created 排队，前置收口后由泵（`nudge_pending_verify_tasks`，`_close_verify_and_parent` + game_time tick 双触发）续推。**worktree 内禁跑 E2E/集成验收**——只许单测/静态检查，验证一律在 MAIN + 系统 VERIFY 内做
 
 > ADR: [009-task-ledger-review-merge-gates](docs/adr/009-task-ledger-review-merge-gates.md)
 

@@ -97,20 +97,35 @@ class ClaimMixin:
                 )
         return n
 
-    async def claim_task(self, project_id: str, task_id: str, agent_id: str) -> None:
+    async def claim_task(
+        self,
+        project_id: str,
+        task_id: str,
+        agent_id: str,
+        *,
+        bypass_verify_serialize: bool = False,
+    ) -> None:
         """Claim a task (created → claimed). Sets assignee_id + claimed_at.
 
         Assign = claim: if the task is already claimed/running by this agent
         (e.g. create_task/dispatch set assignee), this is a no-op. Only
         'created' tasks transition. Wrong-assignee or illegal states raise.
+
+        验收串行化（issue #6，终审 M1）：外部直调 claim 一个 created VERIFY
+        是「第二道没有锁的门」—— QA 工具 / API / submit 自动 claim 都可能
+        绕过 _nudge_one_verify_task 制造双 in-flight。故 VERIFY created 的
+        claim 也走同一 per-project 锁 + in-flight 检查；被挡 raise。
+        ``bypass_verify_serialize`` 仅供 _nudge_one_verify_task 持锁内调用
+        （锁已持有、检查已做，直接 claim）。
         """
         task_id = await self.require_task_id(project_id, task_id)
         rows = await _query(project_id,
-            "SELECT status, assignee_id FROM tasks WHERE id = ?", [task_id])
+            "SELECT status, assignee_id, title FROM tasks WHERE id = ?", [task_id])
         if not rows:
             raise ValueError(f"Task not found: {task_id}")
-        current = rows[0]["status"]
-        existing_assignee = rows[0]["assignee_id"]
+        row = dict(rows[0])
+        current = row["status"]
+        existing_assignee = row["assignee_id"]
         if current in ("claimed", "running") and existing_assignee == agent_id:
             # Idempotent: already assigned to this agent (assign=claim path)
             return
@@ -120,6 +135,34 @@ class ClaimMixin:
                 f"Only 'created' tasks can be claimed. "
                 f"If the task is running, continue working and submit_task when done."
             )
+        is_verify = self._is_verify_task(row)
+        if is_verify and not bypass_verify_serialize:
+            from hiveweave.tools.tasks.verify_spawn import (
+                _project_has_in_flight_verify,
+                _verify_serialize_lock,
+            )
+
+            async with _verify_serialize_lock(project_id):
+                if await _project_has_in_flight_verify(
+                    project_id, except_id=task_id
+                ):
+                    raise ValueError(
+                        f"Task {task_id[:8]} is a VERIFY task and another "
+                        "VERIFY is in flight on the shared MAIN runtime "
+                        "(verification is serialized: one at a time). This "
+                        "task stays queued as 'created' — the platform will "
+                        "wake you via inbox when MAIN is free. Do NOT retry "
+                        "claim_task on it; commit_turn(waiting) or work on "
+                        "your other tasks meanwhile."
+                    )
+                await self._claim_created(project_id, task_id, agent_id)
+            return
+        await self._claim_created(project_id, task_id, agent_id)
+
+    async def _claim_created(
+        self, project_id: str, task_id: str, agent_id: str
+    ) -> None:
+        """created → claimed 转移主体（claim_task 内部复用）。"""
         await self._transition(project_id, task_id, "claimed", actor_id=agent_id)
         now_ms = int(time.time() * 1000)
         await _execute(project_id,
@@ -165,9 +208,16 @@ class ClaimMixin:
         old = task.get("assignee_id")
         new_status = status
         if status == "created":
-            await self._transition(project_id, task_id, "claimed",
-                                   actor_id=reassigned_by)
-            new_status = "claimed"
+            if self._is_verify_task(task):
+                # 验收串行化（issue #6，审计 M1）：VERIFY created 改派不能直接
+                # 转 claimed —— 那会绕过 _nudge_one_verify_task 的串行锁，
+                # 在已有 in-flight VERIFY 时制造双并发 E2E。只换 assignee、
+                # 保持 created 排队，随后走锁内 nudge 决策（空闲即唤醒）。
+                new_status = "created"
+            else:
+                await self._transition(project_id, task_id, "claimed",
+                                       actor_id=reassigned_by)
+                new_status = "claimed"
         elif status == "submitted":
             await self._transition(project_id, task_id, "running",
                                    actor_id=reassigned_by)
@@ -212,6 +262,24 @@ class ClaimMixin:
         await publish_task_event(
             project_id, task_id, "task.reassigned", new_status, now_ms,
         )
+        # VERIFY created 改派：锁内 nudge 决策是否唤醒（空闲即 claim+send）。
+        # created 路径下 assignee 刚更新，重读一次拿新 assignee。best-effort。
+        if status == "created" and self._is_verify_task(task):
+            try:
+                from hiveweave.tools.tasks.verify_spawn import (
+                    _nudge_one_verify_task,
+                )
+
+                fresh = await self.get_task(project_id, task_id)
+                await _nudge_one_verify_task(
+                    project_id, reassigned_by, fresh, reason="merge"
+                )
+            except Exception as e:
+                log.warning(
+                    "verify_reassign_nudge_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
         log.info(
             "task_reassigned",
             project_id=project_id,
@@ -251,4 +319,20 @@ class ClaimMixin:
             [now_ms, task_id],
         )
         log.info("task_unclaimed", project_id=project_id, task_id=task_id)
+
+        # 验收串行化（issue #6）：VERIFY unclaim（claimed → created 清 assignee）
+        # 即释放 MAIN 运行时独占，立即泵出队列中下一个 created VERIFY，
+        # 不必等 game_time tick。best-effort。
+        try:
+            from hiveweave.tools.tasks.verify_spawn import (
+                nudge_pending_verify_tasks,
+            )
+
+            await nudge_pending_verify_tasks(project_id)
+        except Exception as e:
+            log.warning(
+                "verify_pending_pump_after_unclaim_failed",
+                task_id=task_id,
+                error=str(e),
+            )
 

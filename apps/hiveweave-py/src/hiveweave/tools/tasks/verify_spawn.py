@@ -4,8 +4,10 @@ Split from tools/tasks/verify.py. Behavior unchanged.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
+from collections import deque
 from typing import Any
 
 import structlog
@@ -14,6 +16,102 @@ from hiveweave.services import task as _task_svc
 from hiveweave.tools import helpers as _helpers
 
 log = structlog.get_logger(__name__)
+
+
+class _VerifySerializeLock:
+    """Per-project 验收串行化锁（同 task 可重入、跨 task 互斥）。
+
+    asyncio.Lock 不可重入 —— 锁内 claim → _transition → wait-contract 唤醒
+    （trigger_subordinate → agent.chat 的 LLM 回合）是**同一个 asyncio task**；
+    该回合若再次调 claim_task（默认非 bypass）会重入本锁 → 死锁（审计 SUGGESTED）。
+    本实现记录 owner task + 深度：owner 重入直接放行，其它 task 排队等 owner
+    释放。串行化语义不变（同一项目同一时刻仍只有一个「外人」持锁做 check+claim）。
+    非公平锁（同 asyncio.Lock）：release 唤醒与新 acquire 之间允许 barging
+    插队，while 复检保证互斥；VERIFY 场景只需互斥、不依赖唤醒顺序。
+    """
+
+    __slots__ = ("_owner", "_depth", "_waiters")
+
+    def __init__(self) -> None:
+        self._owner: asyncio.Task | None = None
+        self._depth = 0
+        self._waiters: deque[asyncio.Future[None]] = deque()
+
+    def locked(self) -> bool:
+        return self._owner is not None
+
+    async def acquire(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("_VerifySerializeLock requires a task context")
+        if task is self._owner:
+            self._depth += 1
+            return
+        while self._owner is not None:
+            fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._waiters.append(fut)
+            try:
+                await fut
+            except asyncio.CancelledError:
+                # 丢唤醒交接（对齐 CPython asyncio.Lock 的 CancelledError 处理，
+                # 但 _wake_next_alive 比其 _wake_up_first 更强：跳过已死 fut）：
+                # release 已 set_result 但本 waiter 恢复运行前被取消（_must_cancel
+                # 路径）时，本 waiter 从未成为 owner、owner 已是 None —— 必须把
+                # 唤醒权交接给下一个存活 waiter，否则队列假死。owner=None 也可能
+                # 是「孤儿唤醒在飞」的误唤醒，由 while 复检兜底重新排队，互斥不破。
+                if self._owner is None:
+                    self._wake_next_alive()
+                raise
+            finally:
+                if fut in self._waiters:
+                    self._waiters.remove(fut)
+        self._owner = task
+        self._depth = 1
+
+    def release(self) -> None:
+        if self._owner is not asyncio.current_task():
+            raise RuntimeError("_VerifySerializeLock released by non-owner")
+        self._depth -= 1
+        if self._depth > 0:
+            return
+        self._owner = None
+        self._wake_next_alive()
+
+    def _wake_next_alive(self) -> None:
+        """唤醒队列中下一个存活 waiter，跳过已取消的（fut 已 done 但其
+        finally 尚未把自己移出队列）。只弹一个且恰好已取消时，剩余 waiter
+        的 fut 永不 resolve → 该项目 VERIFY 队列永久假死（agent cancel /
+        safety timeout 都会制造此窗口）。"""
+        while self._waiters:
+            fut = self._waiters.popleft()
+            if not fut.done():
+                fut.set_result(None)
+                break
+
+    async def __aenter__(self) -> "_VerifySerializeLock":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self.release()
+
+
+# 验收串行化（issue #6）：per-project 可重入锁消除 check+claim 之间的 TOCTOU ——
+# 同项目两个 merge nudge / ticker 泵并发时，锁保证「检查 in-flight → claim」原子，
+# 杜绝两协程同时通过检查、各自 claim 不同 VERIFY 的双 in-flight。
+# 单进程事件循环内有效；跨进程由 git worktree 合并门 + DB 状态兜底。
+# 锁字典按 project_id 增长（项目数级，量小）。不做淘汰：并发下删除一把
+# 「已引用未持有」的锁会让另一协程建新锁 → 同一项目两把锁，串行化失效
+# （终审 S5 竞态）。进程占用量可忽略。
+_verify_serialize_locks: dict[str, _VerifySerializeLock] = {}
+
+
+def _verify_serialize_lock(project_id: str) -> _VerifySerializeLock:
+    lock = _verify_serialize_locks.get(project_id)
+    if lock is None:
+        lock = _VerifySerializeLock()
+        _verify_serialize_locks[project_id] = lock
+    return lock
 
 
 def _verify_required_capabilities(parent_policy: str) -> list[str]:
@@ -514,7 +612,9 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
     VERIFY，复用 `_find_independent_qa` 重新挑人，挂回 created 并唤醒。
 
     单个任务失败不影响其余；找不到 QA 的任务保持 blocked 不动。
-    Returns: 成功重挂（assign + unblock）的 VERIFY 数量。
+    Returns: 成功重挂并被唤醒（assign + unblock + nudge）的 VERIFY 数量。
+    被串行化锁挡下而未唤醒的重挂（另有 in-flight VERIFY）仅入 pending 队列，
+    不计入返回值 —— 由泵/下一个收口续推。
     """
     import time as _time
 
@@ -524,7 +624,12 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
     tasks = await ts.list_tasks(project_id)
     by_id = {t.get("id"): t for t in tasks if t.get("id")}
     reattached = 0
-    for t in tasks:
+    pending = 0
+    # 审计 S4：按 created_at 最老优先处理（与泵/merge nudge 公平性一致）。
+    for t in sorted(
+        tasks,
+        key=lambda x: ((x.get("created_at") or 0), (x.get("id") or "")),
+    ):
         if not ts._is_verify_task(t):
             continue
         if t.get("status") != "blocked" or t.get("assignee_id"):
@@ -606,7 +711,12 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
                 {**t, "assignee_id": qa, "status": "created"},
                 reason="merge",
             )
-            reattached += 1
+            if nudged:
+                reattached += 1
+            else:
+                # 串行化锁挡住（另有 in-flight VERIFY）：已重挂回 created，
+                # 队列由泵/下一个收口续推 —— 记 pending，不计入已唤醒。
+                pending += 1
             log.info(
                 "verify_retry_reattached",
                 project_id=project_id,
@@ -627,6 +737,7 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
             "verify_retry_done",
             project_id=project_id,
             reattached=reattached,
+            pending_serialized=pending,
         )
     return reattached
 
@@ -635,6 +746,108 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
 VERIFY_STALE_MS = 15 * 60 * 1000
 VERIFY_STALE_COOLDOWN_MS = 15 * 60 * 1000  # don't re-nudge same VERIFY every tick
 _stale_verify_cooldowns: dict[str, int] = {}  # verify_task_id → last_nudge_ms
+
+# 泵失败候选冷却（审计 M2）：dest QA 停用等原因使某候选不可唤醒时，跳过一段时间，
+# 让泵换下一个候选推进队列，而非每 tick 反复试同一个堵死全队列。
+PUMP_FAILED_COOLDOWN_MS = 30 * 60 * 1000
+_pump_failed_cooldowns: dict[str, int] = {}  # verify_task_id → last_fail_ms
+
+
+def _prune_pump_failed_cooldowns(now_ms: int) -> None:
+    """修剪过期冷却条目（审计 S5）：避免项目/任务累积无界增长。"""
+    if len(_pump_failed_cooldowns) > 2048:
+        cutoff = now_ms - PUMP_FAILED_COOLDOWN_MS
+        kept = {tid: ts for tid, ts in _pump_failed_cooldowns.items() if ts >= cutoff}
+        _pump_failed_cooldowns.clear()
+        _pump_failed_cooldowns.update(kept)
+
+
+async def _project_has_in_flight_verify(
+    project_id: str,
+    *,
+    except_id: str | None = None,
+) -> bool:
+    """项目内是否存在其它 in-flight 的座席验收 VERIFY（串行化锁）。
+
+    验收串行化（issue #6）：同项目同一时刻只允许一个 VERIFY 独占 MAIN
+    运行时（端口 + taskflow.db）。in-flight = claimed/running/submitted/
+    reviewing/verifying/rework —— 即已开始跑或正被审查的 VERIFY。
+    status=created（未唤醒）/ approved（VR 已 approve，随即 close，不再
+    占运行时）/ closed / cancelled / archived 不视为 in-flight。blocked
+    特殊处理：**有 assignee 的 blocked 算 in-flight**（运行中被阻塞、
+    game_time 可自动 unblock 恢复，占运行时）；无 assignee 的 blocked
+    是 QA 死区（等待 hire），不占锁（审计 #1）。
+    """
+    ts = _task_svc.TaskService()
+    tasks = await ts.list_tasks(project_id)
+    for t in tasks:
+        if not ts._is_verify_task(t):
+            continue
+        if except_id and t.get("id") == except_id:
+            continue
+        if t.get("is_archived"):
+            continue
+        status = t.get("status")
+        if status in ("created", "approved", "closed", "cancelled"):
+            continue
+        if status == "blocked" and not t.get("assignee_id"):
+            # QA 死区：无 assignee 的 blocked 不占运行时
+            continue
+        return True
+    return False
+
+
+async def nudge_pending_verify_tasks(project_id: str) -> int:
+    """验收串行化泵：无 in-flight VERIFY 时唤醒队列中最老的 created VERIFY。
+
+    spawn 照常（不产生孤儿 parent），但唤醒动作只发给「当前没有被独占」
+    的项目 —— 保证同一时刻 MAIN 上至多一个 E2E 运行时在跑。
+    锁（_project_has_in_flight_verify）在 _nudge_one_verify_task 内二次把关，
+    泵本身只作为「前置 VERIFY 收口后继继队列」的推手。
+    审计 M2：候选按 created_at 最老优先排序，逐个尝试 —— 单个候选不可唤醒
+    （QA 停用/send 失败等）不堵死队列，换下一个；仅「串行被挡」才整体停。
+    失败候选记 cooldown，避免每 tick 反复骚扰。Returns: nudged count（0/1）。
+    """
+    ts = _task_svc.TaskService()
+    tasks = await ts.list_tasks(project_id)
+    now = int(time.time() * 1000)
+    _prune_pump_failed_cooldowns(now)
+    if await _project_has_in_flight_verify(project_id):
+        return 0
+    cands = sorted(
+        (
+            t
+            for t in tasks
+            if ts._is_verify_task(t)
+            and t.get("status") == "created"
+            and t.get("assignee_id")
+        ),
+        key=lambda t: ((t.get("created_at") or 0), (t.get("id") or "")),
+    )
+    for cand in cands:
+        tid = cand.get("id") or ""
+        last_fail = _pump_failed_cooldowns.get(tid, 0)
+        # 失败候选冷却期内跳过（QA 停用等原因导致不可唤醒）
+        if now - last_fail < PUMP_FAILED_COOLDOWN_MS:
+            continue
+        ok = await _nudge_one_verify_task(
+            project_id, "system", cand, reason="merge"
+        )
+        if not ok:
+            # 区分「被串行锁挡」与「不可唤醒」（审计终审 #1）：若 False 此刻
+            # 已有另一 VERIFY in-flight（并发窗口被抢先 claim），整体停、不记冷却；
+            # 否则是不可唤醒（QA 停用/send 失败）→ 冷却并换下一个候选。
+            if await _project_has_in_flight_verify(project_id):
+                return 0
+            _pump_failed_cooldowns[tid] = now
+            continue
+        log.info(
+            "verify_pending_nudged",
+            project_id=project_id,
+            verify_task_id=tid,
+        )
+        return 1
+    return 0
 
 
 async def _nudge_one_verify_task(
@@ -645,29 +858,50 @@ async def _nudge_one_verify_task(
     reason: str = "merge",
 ) -> bool:
     """Claim (if created) + send [POST-MERGE VERIFY] + trigger. Returns True if sent."""
+    # 验收串行化锁（issue #6）：check+claim 在同一 per-project 锁内原子执行，
+    # 消除 TOCTOU —— 两个并发 nudge 无法同时通过检查后各自 claim 不同 VERIFY。
+    # 目标 QA 活跃检查也在此前置：审计 M2 —— 若 QA 停用，先 claim 会让坏任务
+    # 变 in-flight 反而堵死队列；应在 claim 前就用 active 门拦住（非串行失败，
+    # 泵会换下一个候选）。
+    from hiveweave.db import meta as meta_db
+
     assignee = task.get("assignee_id")
     if not assignee:
         return False
+    async with _verify_serialize_lock(project_id):
+        if await _project_has_in_flight_verify(
+            project_id, except_id=task.get("id")
+        ):
+            log.info(
+                "verify_nudge_skipped_serialized",
+                project_id=project_id,
+                verify_task_id=task.get("id"),
+                reason="another verify in flight on shared MAIN runtime",
+            )
+            return False
+        dest = await meta_db.get_agent_by_id(assignee)
+        if not dest or (dest.get("status") or "") != "active":
+            return False
+        # Claim on nudge — this is when VERIFY becomes actionable (post-merge / stale)
+        tid = task.get("id")
+        if tid and task.get("status") == "created":
+            try:
+                await _task_svc.TaskService().claim_task(
+                    project_id,
+                    tid,
+                    assignee,
+                    bypass_verify_serialize=True,
+                )
+                task = {**task, "status": "claimed"}
+            except Exception as e:
+                log.warning(
+                    "verify_nudge_claim_failed",
+                    verify_task_id=tid,
+                    error=str(e),
+                )
+    # ── 锁外：收件箱 + 触发（不参与 in-flight 判定）──
     from hiveweave.services.inbox import InboxService
     from hiveweave.agents.trigger import trigger_subordinate
-    from hiveweave.db import meta as meta_db
-
-    dest = await meta_db.get_agent_by_id(assignee)
-    if not dest or (dest.get("status") or "") != "active":
-        return False
-
-    # Claim on nudge — this is when VERIFY becomes actionable (post-merge / stale)
-    tid = task.get("id")
-    if tid and task.get("status") == "created":
-        try:
-            await _task_svc.TaskService().claim_task(project_id, tid, assignee)
-            task = {**task, "status": "claimed"}
-        except Exception as e:
-            log.warning(
-                "verify_nudge_claim_failed",
-                verify_task_id=tid,
-                error=str(e),
-            )
 
     inbox = InboxService()
     await inbox.supersede_watchdog_messages(
