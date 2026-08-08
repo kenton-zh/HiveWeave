@@ -437,6 +437,161 @@ async def test_break_wait_cycles_wakes_earliest_waiter(task_env):
 
 
 @pytest.mark.asyncio
+async def test_break_wait_cycles_skips_superior_subordinate_chain(task_env):
+    """Bug: supervisor↔subordinate mutual waits are lawful deps, NOT deadlock.
+
+    A superior can adjudicate its subordinate, so a wait chain up and down one
+    org line must not be treated as a stuck SCC cycle. When the caller passes
+    ``parent_map``, hierarchy edges are excluded and no break is produced.
+    """
+    import time
+    import uuid
+
+    from hiveweave.db.project import ensure_project_db
+    from hiveweave.services import wait_contract as wc_mod
+    from hiveweave.services.wait_contract import wait_contract_service
+
+    pid = task_env["project_id"]
+    ws = task_env["workspace"]
+    wc_mod._migrated.discard(pid)
+    await wait_contract_service.list_all_active(pid)
+    conn = await ensure_project_db(ws)
+    now = int(time.time() * 1000)
+    sup, sub = COORD, EXEC  # COORD is EXEC's superior (parent_id=COORD)
+    for aid, ref, created in (
+        (sup, sub, now - 60_000),
+        (sub, sup, now - 10_000),
+    ):
+        await conn.execute(
+            "INSERT INTO agent_waits "
+            "(id, agent_id, project_id, kind, ref, wake_on, expires_at, "
+            "created_at, cleared_at) VALUES (?, ?, ?, 'agent', ?, '[]', ?, ?, NULL)",
+            [str(uuid.uuid4()), aid, pid, ref, now + 3_600_000, created],
+        )
+    await conn.commit()
+
+    resolve = lambda r: r if r in (sup, sub) else None
+    parent_map = {COORD: None, EXEC: COORD}
+    breaks = await wait_contract_service.break_wait_cycles(
+        pid, resolve, parent_map=parent_map
+    )
+    # Hierarchy mutual wait is NOT a deadlock → no break, waits preserved.
+    assert breaks == []
+    active = await wait_contract_service.list_all_active(pid)
+    assert len(active) == 2
+
+
+@pytest.mark.asyncio
+async def test_break_wait_cycles_sibling_deadlock_still_detected(task_env):
+    """Regression guard: passing parent_map must NOT suppress real sibling SCC.
+
+    Two non-ancestor siblings waiting on each other form a genuine deadlock
+    (no shared superior inside the cycle can be adjudicated by either). Even
+    with ``parent_map`` set, the cycle must still be broken.
+    """
+    import time
+    import uuid
+
+    from hiveweave.db.project import ensure_project_db
+    from hiveweave.services import wait_contract as wc_mod
+    from hiveweave.services.wait_contract import wait_contract_service
+
+    pid = task_env["project_id"]
+    ws = task_env["workspace"]
+    wc_mod._migrated.discard(pid)
+    await wait_contract_service.list_all_active(pid)
+    conn = await ensure_project_db(ws)
+    now = int(time.time() * 1000)
+    a, b = EXEC, QA  # both children of COORD (siblings, not ancestors)
+    for aid, ref, created in (
+        (a, b, now - 60_000),
+        (b, a, now - 10_000),
+    ):
+        await conn.execute(
+            "INSERT INTO agent_waits "
+            "(id, agent_id, project_id, kind, ref, wake_on, expires_at, "
+            "created_at, cleared_at) VALUES (?, ?, ?, 'agent', ?, '[]', ?, ?, NULL)",
+            [str(uuid.uuid4()), aid, pid, ref, now + 3_600_000, created],
+        )
+    await conn.commit()
+
+    resolve = lambda r: r if r in (a, b) else None
+    parent_map = {COORD: None, EXEC: COORD, QA: COORD}
+    breaks = await wait_contract_service.break_wait_cycles(
+        pid, resolve, parent_map=parent_map
+    )
+    # Sibling mutual wait IS a deadlock → still broken despite parent_map.
+    assert len(breaks) == 1
+    active = await wait_contract_service.list_all_active(pid)
+    assert active == []
+
+
+@pytest.mark.asyncio
+async def test_break_wait_cycles_task_edge_hierarchy_suppressed(task_env):
+    """Regression guard: task-kind waits up/down one org line are not deadlock.
+
+    Mirrors the real micro-ctrl incident: superior waits on a task whose
+    assignee is the subordinate (and the subordinate waits on a task whose
+    creator is the superior). The task-mediated edges must be excluded from the
+    SCC graph when ``parent_map`` marks the pair as hierarchy.
+    """
+    import time
+    import uuid
+
+    from hiveweave.db.project import ensure_project_db
+    from hiveweave.services import wait_contract as wc_mod
+    from hiveweave.services.wait_contract import wait_contract_service
+
+    pid = task_env["project_id"]
+    ws = task_env["workspace"]
+    wc_mod._migrated.discard(pid)
+    await wait_contract_service.list_all_active(pid)
+    conn = await ensure_project_db(ws)
+    now = int(time.time() * 1000)
+    sup, sub = COORD, EXEC  # COORD is EXEC's superior
+
+    # Two tasks: sup's task assigned to sub; sub's task created by sup.
+    # (Necessary so _task_party_map resolves both wait refs to parties.)
+    t_sup = str(uuid.uuid4())
+    t_sub = str(uuid.uuid4())
+    await conn.execute(
+        "INSERT INTO tasks (id, project_id, title, status, creator_id, "
+        "assignee_id, created_at, updated_at, is_archived) "
+        "VALUES (?, ?, 't', 'running', ?, ?, ?, ?, 0)",
+        [t_sup, pid, sub, sup, now, now],
+    )
+    await conn.execute(
+        "INSERT INTO tasks (id, project_id, title, status, creator_id, "
+        "assignee_id, created_at, updated_at, is_archived) "
+        "VALUES (?, ?, 't', 'running', ?, ?, ?, ?, 0)",
+        [t_sub, pid, sup, sub, now, now],
+    )
+    await conn.commit()
+
+    for aid, ref, created in (
+        (sup, t_sup, now - 60_000),
+        (sub, t_sub, now - 10_000),
+    ):
+        await conn.execute(
+            "INSERT INTO agent_waits "
+            "(id, agent_id, project_id, kind, ref, wake_on, expires_at, "
+            "created_at, cleared_at) VALUES (?, ?, ?, 'task', ?, '[]', ?, ?, NULL)",
+            [str(uuid.uuid4()), aid, pid, ref, now + 3_600_000, created],
+        )
+    await conn.commit()
+
+    resolve = lambda r: r if r in (sup, sub) else None
+    parent_map = {COORD: None, EXEC: COORD}
+    breaks = await wait_contract_service.break_wait_cycles(
+        pid, resolve, parent_map=parent_map
+    )
+    # Hierarchy task-mediated mutual wait is NOT a deadlock → no break.
+    assert breaks == []
+    active = await wait_contract_service.list_all_active(pid)
+    assert len(active) == 2
+
+
+@pytest.mark.asyncio
 async def test_task_stall_skips_assignee_with_live_wait(task_env):
     """Medium: TASK STALL must not wake assignees holding a live wait contract."""
     import time
