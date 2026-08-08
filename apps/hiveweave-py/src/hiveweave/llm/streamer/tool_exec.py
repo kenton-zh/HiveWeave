@@ -34,6 +34,7 @@ class ToolExecMixin:
         on_tool_call: ToolCallCallback,
         on_delta: DeltaCallback | None,
         poll_turn_counts: dict[tuple[str, str], int] | None = None,
+        budget_s: float | None = None,
     ) -> tuple[list[dict], set[str], set[str], bool]:
         """执行一批工具调用，返回 (tool result 消息列表, 出错的 tool_call_id 集合, duplicate tool_call_id 集合, end_turn)。
 
@@ -42,6 +43,9 @@ class ToolExecMixin:
         duplicate_ids 标识"同参数已执行过、本次无新效果"的工具调用，供 doom
         tracker 做强制 +1 计数加速触顶。
         end_turn=True 表示本批含已接受的 commit_turn，应硬断工具循环（BUG-3）。
+        budget_s 为 turn 硬预算下本批可用的秒数上限：每个工具的实际超时取
+        min(自身超时, max(3.0, budget_s))（3s 地板防负/零预算产生立即超时
+        语义），防止工具批冲过 agent SAFETY_TIMEOUT。
         """
         counts = poll_turn_counts if poll_turn_counts is not None else {}
         # 广播 tool_use 事件
@@ -56,7 +60,8 @@ class ToolExecMixin:
         # 并行执行
         tasks = [
             self._execute_single_tool(
-                agent_id, tc, on_tool_call, poll_turn_counts=counts
+                agent_id, tc, on_tool_call, poll_turn_counts=counts,
+                budget_s=budget_s,
             )
             for tc in tool_calls
         ]
@@ -116,8 +121,9 @@ class ToolExecMixin:
         on_tool_call: ToolCallCallback,
         *,
         poll_turn_counts: dict[tuple[str, str], int] | None = None,
+        budget_s: float | None = None,
     ) -> dict:
-        """执行单个工具调用（带 120s 超时）。"""
+        """执行单个工具调用（带 120s 超时；budget_s 给出时按预算收紧）。"""
         tool_name = tool_call["name"]
         arguments = tool_call["arguments"]
         tool_call_id = tool_call["id"]
@@ -172,6 +178,14 @@ class ToolExecMixin:
             if tool_name == "spawn_subagent"
             else TOOL_EXECUTION_TIMEOUT_S
         )
+        budget_capped = False
+        if budget_s is not None:
+            # Turn 硬预算帽：临近硬截止时收紧工具超时，保证工具批在
+            # hard_deadline 前返回（agent SAFETY_TIMEOUT 是最后的墙，
+            # 不该由它动手）。min 在外：地板值不得反超工具自身超时。
+            capped = min(tool_timeout, max(3.0, budget_s))
+            budget_capped = capped < tool_timeout
+            tool_timeout = capped
         try:
             result = await asyncio.wait_for(
                 on_tool_call(tool_name, arguments, tool_call_id),
@@ -185,10 +199,48 @@ class ToolExecMixin:
         except TimeoutError:
             log.error("tool_timeout",
                       agent_id=agent_id, tool=tool_name)
+            # 疏通引导（2026-08-07 压测：Aria 全量 pytest 反复撞 120s 超时
+            # → 失败轮堆出 stall break；改用后台+轮询后一次通过）。超时文案
+            # 直接给出可执行的替代路径，而不是只报"超时了"。
+            hint = ""
+            if tool_name in ("bash", "run_command"):
+                hint = (
+                    " If the command legitimately needs longer, run it in the "
+                    "background instead (append `&`, redirect output to a "
+                    "file), then poll the output file in later calls — or "
+                    "narrow the scope (e.g. a focused test subset instead of "
+                    "the full suite)."
+                )
+            if budget_capped:
+                # 疏通：区分「命令本身慢」与「turn 预算耗尽」—— 后者下轮
+                # wake 重试同款长调用只会再撞预算帽。文案按工具类型分流
+                # （审计 2026-08-08）：bash 类引导切片/后台轮询；question
+                # 引导 waiting；spawn 引导本 turn 勿再 spawn。
+                if tool_name == "question":
+                    hint += (
+                        " NOTE: cut short by the remaining turn budget, "
+                        "not by the human — do NOT re-ask this turn; call "
+                        "commit_turn(phase='waiting') and let the answer "
+                        "wake you."
+                    )
+                elif tool_name == "spawn_subagent":
+                    hint += (
+                        " NOTE: cut short by the remaining turn budget — "
+                        "do NOT spawn subagents this late in the turn; "
+                        "checkpoint with commit_turn(phase='in_progress') "
+                        "and spawn next wake."
+                    )
+                else:
+                    hint += (
+                        " NOTE: the cap was tightened by the remaining turn "
+                        "budget, not by this tool's own limit — do NOT retry "
+                        "the same long call next wake; split the work or use "
+                        "background + polling."
+                    )
             return {
                 "content": (
                     f"[Tool Timeout] {tool_name} did not complete "
-                    f"within {tool_timeout}s"
+                    f"within {tool_timeout:g}s" + hint
                 )
             }
 

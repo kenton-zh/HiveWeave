@@ -49,8 +49,14 @@ class HttpStreamMixin:
         tools: list[dict] | None,
         on_delta: DeltaCallback | None,
         round_num: int,
+        budget_deadline: float | None = None,
     ) -> dict:
-        """单轮流式请求，空响应时退避重试（最多 3 次）。"""
+        """单轮流式请求，空响应时退避重试（最多 3 次）。
+
+        ``budget_deadline``（time.monotonic 刻度）是本轮可使用的绝对截止：
+        到点即中途切断（budget_cut），由 tool_loop 优雅收口 —— 不允许为了
+        重试越过 turn 硬预算（否则 agent SAFETY_TIMEOUT 会强杀整轮）。
+        """
         last_result: dict | None = None
 
         for attempt in range(EMPTY_RESPONSE_MAX_RETRIES + 1):
@@ -63,9 +69,14 @@ class HttpStreamMixin:
                 on_delta=on_delta,
                 round_num=round_num,
                 delta_id=f"r{round_num}_{attempt}_{uuid.uuid4().hex[:6]}",
+                budget_deadline=budget_deadline,
             )
 
             if result["status"] == "error":
+                return result
+
+            # 预算切断不是空响应，禁止退避重试（重试必然再次越预算）
+            if result.get("budget_cut"):
                 return result
 
             # 检查空响应: 无文本 + 无 tool_calls
@@ -79,6 +90,19 @@ class HttpStreamMixin:
             last_result = result
             if attempt < EMPTY_RESPONSE_MAX_RETRIES:
                 backoff_ms = EMPTY_RESPONSE_BACKOFF_MS[attempt]
+                # 退避睡眠不得越过预算截止
+                if budget_deadline is not None:
+                    remain_s = budget_deadline - time.monotonic()
+                    if remain_s <= backoff_ms / 1000.0:
+                        log.info("empty_response_retry_skipped_budget",
+                                 agent_id=agent_id, round=round_num,
+                                 remain_s=round(remain_s, 1))
+                        # 打 budget_cut 标记走优雅收口（审计 2026-08-08）：
+                        # 裸 empty 会让 agent 层同 turn 整轮重试 —— 重试
+                        # 拿全新 570s 预算，但 SAFETY 窗口从 chat 开始计时
+                        # 不重置，必然被强杀，正是预算闸口要消灭的模式。
+                        last_result["budget_cut"] = True
+                        return last_result
                 log.info("empty_response_retry",
                          agent_id=agent_id, round=round_num,
                          attempt=attempt + 1, backoff_ms=backoff_ms)
@@ -112,10 +136,13 @@ class HttpStreamMixin:
         on_delta: DeltaCallback | None,
         round_num: int,
         delta_id: str,
+        budget_deadline: float | None = None,
     ) -> dict:
         """发起单轮流式 HTTP 请求，解析 SSE，返回本轮结果。
 
         带 HTTP 重试（429/503/504/529 + 网络错误），首 chunk 超时检测。
+        ``budget_deadline`` 为 turn 硬预算截止（monotonic 刻度），透传到
+        SSE 消费循环做中途预算切断。
         """
         url = provider.build_url()
         headers = provider.build_headers()
@@ -159,6 +186,7 @@ class HttpStreamMixin:
                     on_delta=on_delta,
                     delta_id=delta_id,
                     round_num=round_num,
+                    budget_deadline=budget_deadline,
                 )
 
         try:
@@ -207,6 +235,7 @@ class HttpStreamMixin:
         on_delta: DeltaCallback | None,
         delta_id: str,
         round_num: int,
+        budget_deadline: float | None = None,
     ) -> dict:
         """执行 HTTP 流式请求（同步 httpx 跑在线程池里，事件边收边推）。
 
@@ -224,10 +253,29 @@ class HttpStreamMixin:
         event_q: asyncio.Queue = asyncio.Queue()
         _DONE = object()
         _ERR = object()
+        # 客户端引用透出到事件循环侧：budget_cut 时主动断流（关闭客户端让
+        # 线程内 iter_bytes 立即出错退出）。否则思考模型会继续流数分钟 —
+        # provider 持续计费 token、事件推入无界队列无人消费、线程池线程
+        # 被占，多次 budget_cut 累积孤儿线程（审计 2026-08-08）。
+        client_holder: dict[str, httpx.Client] = {}
+
+        def _budget_cut_close() -> None:
+            """主动断流：关客户端让线程内 iter_bytes 立即出错退出。
+
+            best-effort —— 线程 finally 里还会再关一次（幂等），失败也无妨
+            （线程终会自然结束，最长 httpx read timeout 95s）。
+            """
+            orphan_client = client_holder.get("client")
+            if orphan_client is not None:
+                try:
+                    orphan_client.close()
+                except Exception:
+                    pass
 
         def _run_sync() -> None:
             """在线程中执行：HTTP 请求 + SSE 解析，事件即时入队。"""
             http_client = httpx.Client(timeout=read_to)
+            client_holder["client"] = http_client
             try:
                 with http_client.stream(
                     "POST", url, headers=headers, content=body_bytes,
@@ -297,14 +345,39 @@ class HttpStreamMixin:
         tool_call_deltas: list[dict] = []
         finish_reason: str | None = None
         usage: dict | None = None
+        budget_cut = False
 
         try:
             while True:
+                # Turn 硬预算切断：单次 wait 取「读超时」与「预算截止」的较早者。
+                # 没有这道切断，单轮流式可无限续命（事件每 <195s 到达即重置），
+                # 冲过 tool_loop 轮间硬检查直至 agent SAFETY_TIMEOUT 强杀整轮。
+                wait_s = deadline
+                if budget_deadline is not None:
+                    wait_s = min(
+                        wait_s,
+                        max(0.1, budget_deadline - time.monotonic()),
+                    )
                 try:
                     kind, payload = await asyncio.wait_for(
-                        event_q.get(), timeout=deadline
+                        event_q.get(), timeout=wait_s
                     )
                 except asyncio.TimeoutError:
+                    if budget_deadline is not None and (
+                        time.monotonic() >= budget_deadline - 0.5
+                    ):
+                        # 预算切断：保留已累积文本；不完整 tool_calls 丢弃
+                        # （截断的 JSON args 不可执行，同 length 截断语义）。
+                        budget_cut = True
+                        log.warning(
+                            "stream_budget_cut",
+                            agent_id=agent_id,
+                            round=round_num,
+                            text_len=len(text_acc),
+                            discarded_tool_deltas=len(tool_call_deltas),
+                        )
+                        _budget_cut_close()
+                        break
                     raise RetryableError(
                         f"HTTP request timed out after {deadline}s"
                     )
@@ -330,6 +403,25 @@ class HttpStreamMixin:
                     raise RetryableError(
                         raw.get("error", "Unknown HTTP error")
                     )
+
+                # 逐事件预算检查（审计 2026-08-08 P1）：上面的切断只在 wait
+                # 超时分支判定 —— 连续事件流（间隔 <0.1s）会让 wait 永不超时，
+                # 整个闸口被绕过。「过预算」必须是逐事件判定的结构属性，不能
+                # 依赖流出现空隙的统计属性。放在 _DONE/_ERR 之后：控制消息
+                # （正常结束/错误分类）优先走完原路径。
+                if budget_deadline is not None and (
+                    time.monotonic() >= budget_deadline
+                ):
+                    budget_cut = True
+                    log.warning(
+                        "stream_budget_cut",
+                        agent_id=agent_id,
+                        round=round_num,
+                        text_len=len(text_acc),
+                        discarded_tool_deltas=len(tool_call_deltas),
+                    )
+                    _budget_cut_close()
+                    break
 
                 event = payload
                 if not isinstance(event, dict):
@@ -388,10 +480,29 @@ class HttpStreamMixin:
                         )
                         raise classify_http_error(None, error_content)
         finally:
-            try:
-                await executor_task
-            except Exception:
+            if budget_cut:
+                # 预算切断时【不能】await executor 线程 —— 它正阻塞在 socket
+                # read 上，要等 httpx read timeout(≤95s) 才自然退出；await 它
+                # 会把切断省下的时间又耗光，违背切断本意。线程体内部已捕获
+                # 全部异常并在 finally 关闭 http_client，不 await 不会泄漏
+                # 未取异常告警；残留事件入队无人消费，随 GC 回收。
                 pass
+            else:
+                try:
+                    await executor_task
+                except Exception:
+                    pass
+
+        if budget_cut:
+            return {
+                "status": "ok",
+                "text": text_acc,
+                "thinking": thinking_acc,
+                "tool_calls": [],
+                "finish_reason": "budget_cut",
+                "usage": usage,
+                "budget_cut": True,
+            }
 
         tool_calls = merge_tool_calls([], tool_call_deltas)
         cache_read = (usage or {}).get("cache_read", 0)

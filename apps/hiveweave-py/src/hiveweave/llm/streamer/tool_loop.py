@@ -10,14 +10,19 @@ from hiveweave.llm.provider import ProviderConfig
 
 from .constants import (
     ACTIVITY_EXTEND_S,
+    BUDGET_PACING_HINT_S,
     DEFAULT_PLACEHOLDER,
     HARD_TOTAL_TIMEOUT_S,
     MAX_TOOLS_PER_ROUND,
+    MIN_ROUND_BUDGET_S,
+    MIN_TOOL_BUDGET_S,
     NO_TEXT_HINT_MAX,
     NO_TEXT_ROUNDS_THRESHOLD,
+    TOOL_BUDGET_GRACE_S,
     TOOL_LOOP_READONLY_STALL_LIMIT,
     TOOL_LOOP_STALL_LIMIT,
     TOTAL_TIMEOUT_S,
+    TURN_STREAM_CUT_GRACE_S,
 )
 from .doom_loop import doom_loop_limit, round_made_progress, round_was_readonly_only
 from .types import DeltaCallback, ToolCallCallback
@@ -48,6 +53,50 @@ class ToolLoopMixin:
         from hiveweave.llm.util import normalize_usage
 
         return normalize_usage(usage, provider)
+
+    def _budget_exhausted_result(
+        self,
+        *,
+        text_acc: str,
+        thinking_acc: str,
+        tool_history: list[dict],
+        tool_turn_acc: list[dict],
+        round_num: int,
+        last_usage: dict | None,
+        usage_rounds: list[dict],
+    ) -> dict:
+        """硬预算耗尽的优雅收口（所有预算闸口共用）。
+
+        保留全部 tool 产出与已累积文本，明确指引 commit_turn 续跑 ——
+        与「agent SAFETY_TIMEOUT 强杀 → run interrupted + 90s 冷却 +
+        上下文重建」相比，这条路径零损失：下一轮 wake 直接继续。
+
+        疏通（2026-08-08）：无论是否有累积文本都附收口说明 —— 下轮
+        wake 的 agent 能从历史中读懂「上轮为何结束、如何继续」；否则
+        它面对一截突兀的半截文本，不知预算耗尽，容易重试同款重型
+        操作再次撞闸。
+        """
+        base = self._strip_placeholder(text_acc)
+        note = (
+            "[TURN BUDGET] Hard turn budget exhausted — all progress so "
+            "far is kept. Call commit_turn(phase='in_progress') to "
+            "checkpoint, then continue next wake with smaller slices "
+            "(split large operations; prefer background + polling over "
+            "long blocking calls)."
+        )
+        final_text = f"{base}\n\n{note}" if base else note
+        tool_turn_acc.append({"role": "assistant", "content": final_text})
+        return {
+            "status": "ok",
+            "content": final_text,
+            "thinking": thinking_acc,
+            "tool_calls": tool_history,
+            "tool_turn_messages": tool_turn_acc,
+            "rounds": round_num,
+            "usage": last_usage,
+            "usage_rounds": usage_rounds,
+            "budget_exhausted": True,
+        }
 
     async def _run_tool_loop(
         self,
@@ -96,6 +145,12 @@ class ToolLoopMixin:
         hard_deadline = loop_start + HARD_TOTAL_TIMEOUT_S
         soft_deadline = loop_start + TOTAL_TIMEOUT_S
         budget_hint_injected = False
+        # pacing 提示一次性；记录注入轮次供 soft 提示做【同轮】去重 ——
+        # 永久性压制会让 soft（临近硬截止的最后通牒）在默认常量下成死代码：
+        # pacing（剩余<300s）恒早于 soft（剩余≤30s）触发，凡走到 soft 的
+        # turn 必然已注入 pacing（审计 2026-08-08 P1）。
+        pacing_hint_injected = False
+        pacing_hint_round = -1
 
         # Token metering: 累加每轮归一化 usage（供 agent 层落库）。
         # 每轮只保留末轮 usage 在 last_usage，中间轮在这里累积。
@@ -117,34 +172,86 @@ class ToolLoopMixin:
                     telemetry.stream_budget_exhausted(agent_id)
                 except Exception:
                     pass
-                final_text = self._strip_placeholder(text_acc) or (
-                    "[TURN BUDGET] Hard turn budget exhausted. "
-                    "Progress so far is kept — call commit_turn("
-                    "phase='in_progress') and continue in the next wake."
-                )
                 if tool_history:
-                    tool_turn_acc.append(
-                        {"role": "assistant", "content": final_text}
+                    return self._budget_exhausted_result(
+                        text_acc=text_acc,
+                        thinking_acc=thinking_acc,
+                        tool_history=tool_history,
+                        tool_turn_acc=tool_turn_acc,
+                        round_num=round_num,
+                        last_usage=last_usage,
+                        usage_rounds=usage_rounds,
                     )
-                    return {
-                        "status": "ok",
-                        "content": final_text,
-                        "thinking": thinking_acc,
-                        "tool_calls": tool_history,
-                        "tool_turn_messages": tool_turn_acc,
-                        "rounds": round_num,
-                        "usage": last_usage,
-                        "usage_rounds": usage_rounds,
-                        "budget_exhausted": True,
-                    }
                 await self._fire_delta(on_delta, {
                     "type": "error",
                     "content": f"请求总超时（{HARD_TOTAL_TIMEOUT_S}s）",
                 })
                 return self._error_result("请求总超时", loop_start)
+            # 新轮预算闸门（结构性修复 2026-08-07）：硬截止只在轮间检查
+            # 不够 —— 单轮（流式 + 工具批）时长无界，可冲过 HARD 直至 agent
+            # SAFETY_TIMEOUT 强杀。剩余预算买不起一轮有意义的 LLM 请求时
+            # （思考模型首 chunk 即可达 90s），不开新轮，直接优雅收口。
+            # 首轮（无 tool_history）不受此闸门限制 —— 预算刚起始必充足。
+            if (
+                tool_history
+                and hard_deadline - now_mono < MIN_ROUND_BUDGET_S
+            ):
+                log.warning(
+                    "stream_budget_round_gate",
+                    agent_id=agent_id,
+                    round=round_num,
+                    remaining_s=round(hard_deadline - now_mono, 1),
+                    tools=len(tool_history),
+                )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.stream_budget_exhausted(agent_id)
+                except Exception:
+                    pass
+                return self._budget_exhausted_result(
+                    text_acc=text_acc,
+                    thinking_acc=thinking_acc,
+                    tool_history=tool_history,
+                    tool_turn_acc=tool_turn_acc,
+                    round_num=round_num,
+                    last_usage=last_usage,
+                    usage_rounds=usage_rounds,
+                )
+            # 预算 pacing 提示（疏通层 2026-08-08）：在撞任何闸口【之前】
+            # 把预算状态告诉 agent —— 剩余硬预算首次低于阈值（默认 300s，
+            # 约半程）时注入一次温和提示，让它主动规划收口、避免启动
+            # 全量测试/大重构/长阻塞轮询等重型操作。一次性、不打断当前轮；
+            # agent 不收口才轮到闸口（堵截兜底）动手。
+            if (
+                not pacing_hint_injected
+                and tool_history
+                and hard_deadline - now_mono < BUDGET_PACING_HINT_S
+            ):
+                pacing_hint_injected = True
+                pacing_hint_round = round_num
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"[TURN BUDGET] ~{int(now_mono - loop_start)}s "
+                        f"elapsed, ~{int(hard_deadline - now_mono)}s of "
+                        "hard turn budget left. Plan "
+                        "your exit: finish the current slice and checkpoint "
+                        "with commit_turn(phase='in_progress'). Avoid "
+                        "launching new heavy operations (full test suites, "
+                        "large refactors, long blocking polls) — they will "
+                        "be cut off when the budget runs out."
+                    ),
+                })
+            # soft 提示与 pacing 提示职责重叠（都是催收口）：同轮不重复
+            # 注入（两条措辞相似的 [TURN BUDGET] 浪费 token）；但 pacing 在
+            # 更早轮次注入过【不】压制 soft —— soft 是临近硬截止的最后通牒
+            # （附 soft 续命给 commit_turn 留窗），强度不同，缺了它 agent
+            # 在半程温和提示之后直到撞闸再无警告（审计 2026-08-08 P1）。
             if (
                 now_mono >= soft_deadline
                 and not budget_hint_injected
+                and pacing_hint_round != round_num
                 and tool_history
             ):
                 budget_hint_injected = True
@@ -185,7 +292,9 @@ class ToolLoopMixin:
                      agent_id=agent_id, round=round_num,
                      msg_count=len(messages))
 
-            # 单轮流式请求（带空响应重试）
+            # 单轮流式请求（带空响应重试）。预算截止提前
+            # TURN_STREAM_CUT_GRACE_S —— 给 merge/记账/返回留出时间，
+            # 保证 streamer 总在 agent SAFETY_TIMEOUT 之前返回。
             round_result = await self._stream_with_empty_retry(
                 agent_id=agent_id,
                 provider=provider,
@@ -194,6 +303,7 @@ class ToolLoopMixin:
                 tools=tools,
                 on_delta=on_delta,
                 round_num=round_num,
+                budget_deadline=hard_deadline - TURN_STREAM_CUT_GRACE_S,
             )
 
             if round_result["status"] == "error":
@@ -215,7 +325,9 @@ class ToolLoopMixin:
             new_thinking = round_result["thinking"] or ""
             tool_calls = round_result["tool_calls"]
             finish_reason = round_result["finish_reason"]
-            last_usage = round_result.get("usage")
+            # budget_cut 的流几乎必无 usage 事件（usage 在流末尾 chunk），
+            # 无条件覆盖会把上一轮的记账抹成 None（审计 2026-08-08）。
+            last_usage = round_result.get("usage") or last_usage
 
             # Token metering: 归一化本轮 usage 并累加（错误轮无 usage 则跳过）
             # best-effort：畸形 provider 数据不得中断主流程，异常时跳过该轮计费
@@ -237,6 +349,33 @@ class ToolLoopMixin:
                      agent_id=agent_id, round=round_num,
                      text_len=len(new_text), tool_count=len(tool_calls),
                      finish=finish_reason)
+
+            # 流式被硬预算中途切断：已累积文本保留（usage 已在上方记账），
+            # 不完整 tool_calls 已在流内丢弃 —— 直接优雅收口，本轮产出
+            # 全部保留，下轮 wake 续跑。先于 finish_reason 分支判断：
+            # budget_cut 与 length/content_filter 语义不同，不走截断告警。
+            if round_result.get("budget_cut"):
+                log.warning(
+                    "stream_budget_cut_return",
+                    agent_id=agent_id,
+                    round=round_num,
+                    tools=len(tool_history),
+                )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.stream_budget_exhausted(agent_id)
+                except Exception:
+                    pass
+                return self._budget_exhausted_result(
+                    text_acc=combined_text,
+                    thinking_acc=combined_thinking,
+                    tool_history=tool_history,
+                    tool_turn_acc=tool_turn_acc,
+                    round_num=round_num + 1,
+                    last_usage=last_usage,
+                    usage_rounds=usage_rounds,
+                )
 
             # 处理截断的响应
             if finish_reason in ("length", "content_filter") and tool_calls:
@@ -398,6 +537,40 @@ class ToolLoopMixin:
                                      f"{limit}+ times with same args (after warning)",
                         }
 
+                # 工具批预算闸门（结构性修复 2026-08-07）：剩余预算不足以
+                # 执行工具批时（一批最长 spawn 500s / question 200s /
+                # bash 120s，可轻松冲过 HARD → 被 agent SAFETY_TIMEOUT
+                # 强杀），丢弃本批 tool_calls 优雅收口。闸口必须在
+                # assistant(tool_calls) 落账【之前】——否则持久化的
+                # assistant(tool_calls) 缺对应 tool 回执，下次请求 400。
+                # 丢弃无副作用：未执行的工具由下次唤醒重新发起。
+                tool_budget_s = (
+                    hard_deadline - TOOL_BUDGET_GRACE_S - time.monotonic()
+                )
+                if tool_budget_s < MIN_TOOL_BUDGET_S:
+                    log.warning(
+                        "stream_budget_tool_gate",
+                        agent_id=agent_id,
+                        round=round_num,
+                        tool_budget_s=round(tool_budget_s, 1),
+                        discarded_tools=len(tool_calls),
+                    )
+                    try:
+                        from hiveweave.services.telemetry import telemetry
+
+                        telemetry.stream_budget_exhausted(agent_id)
+                    except Exception:
+                        pass
+                    return self._budget_exhausted_result(
+                        text_acc=combined_text,
+                        thinking_acc=combined_thinking,
+                        tool_history=tool_history,
+                        tool_turn_acc=tool_turn_acc,
+                        round_num=round_num + 1,
+                        last_usage=last_usage,
+                        usage_rounds=usage_rounds,
+                    )
+
                 # 构建 assistant 消息（含 tool_calls）
                 assistant_msg: dict[str, Any] = {
                     "role": "assistant",
@@ -451,6 +624,7 @@ class ToolLoopMixin:
                             on_tool_call=on_tool_call,
                             on_delta=on_delta,
                             poll_turn_counts=poll_turn_counts,
+                            budget_s=tool_budget_s,
                         )
                     )
                     # duplicate 信号：工具返回 duplicate=True 表示本次调用无新
@@ -545,6 +719,7 @@ class ToolLoopMixin:
                     summary = await self._make_max_rounds_summary(
                         agent_id, provider, messages, on_delta,
                         reason="stall_break",
+                        budget_deadline=hard_deadline,
                     )
                     final_text = self._strip_placeholder(summary)
                     if not final_text:
@@ -582,6 +757,7 @@ class ToolLoopMixin:
                             summary = await self._make_max_rounds_summary(
                                 agent_id, provider, messages, on_delta,
                                 reason="no_text",
+                                budget_deadline=hard_deadline,
                             )
                             # FIX(text-acc): 同 max_rounds 路径，只用 summary
                             final_text = self._strip_placeholder(summary)
@@ -666,6 +842,7 @@ class ToolLoopMixin:
         summary = await self._make_max_rounds_summary(
             agent_id, provider, messages, on_delta,
             reason="max_rounds",
+            budget_deadline=hard_deadline,
         )
         # FIX(text-acc): 只用 summary，不拼接 text_acc。
         # summary 是专门的 LLM 调用，已概括全部进展。拼接 text_acc 会引入
