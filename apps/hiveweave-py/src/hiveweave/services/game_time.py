@@ -679,7 +679,9 @@ class GameTimeService:
                     )
 
         breaks = await wait_contract_service.break_wait_cycles(
-            project_id, resolve_ref
+            project_id,
+            resolve_ref,
+            parent_map={a.get("id"): a.get("parent_id") for a in agents if a.get("id")},
         )
         now_ms = int(time.time() * 1000)
         state = _states.get(project_id)

@@ -380,10 +380,16 @@ class WaitContractService:
         self,
         project_id: str,
         resolve_agent_id: Callable[[str], str | None],
+        *,
+        parent_map: dict[str, str] | None = None,
     ) -> list[dict]:
         """Detect wait SCCs (agent↔agent and task-mediated) and clear ALL members.
 
         ``resolve_agent_id(ref)`` maps wait.ref (花名/short_id/uuid) → agent_id.
+        ``parent_map`` (agent_id → parent_id) lets the caller declare the org
+        hierarchy. Edges between a superior and its subordinate are NOT deadlock
+        cycles — the superior can adjudicate the subordinate, so mutual waits up
+        and down one chain are lawful task dependencies, not a stuck cycle.
 
         TEST3: previously only cleared ``min(agent_id)``; partners stayed stuck
         until TTL. Now clear every agent in the component and return one break
@@ -392,6 +398,23 @@ class WaitContractService:
         active = await self.list_all_active(project_id)
         graph: dict[str, set[str]] = {}
 
+        def _is_hierarchy(a: str, b: str) -> bool:
+            """True if a and b are in a direct ancestor/descendant relation."""
+            if not parent_map:
+                return False
+
+            def _is_ancestor(anc: str, desc: str) -> bool:
+                cur = parent_map.get(desc)
+                seen: set[str] = set()
+                while cur and cur not in seen:
+                    if cur == anc:
+                        return True
+                    seen.add(cur)
+                    cur = parent_map.get(cur)
+                return False
+
+            return _is_ancestor(a, b) or _is_ancestor(b, a)
+
         # agent → agent edges
         for w in active:
             if (w.get("kind") or "").lower() != "agent":
@@ -399,6 +422,8 @@ class WaitContractService:
             waiter = w.get("agentId") or ""
             target = resolve_agent_id(str(w.get("ref") or ""))
             if not waiter or not target or waiter == target:
+                continue
+            if _is_hierarchy(waiter, target):
                 continue
             graph.setdefault(waiter, set()).add(target)
             graph.setdefault(target, set())
@@ -416,7 +441,9 @@ class WaitContractService:
             if not parties:
                 continue
             for other in parties:
-                if other and other != waiter:
+                if other == waiter or (other and _is_hierarchy(waiter, other)):
+                    continue
+                if other:
                     graph.setdefault(waiter, set()).add(other)
                     graph.setdefault(other, set())
 
