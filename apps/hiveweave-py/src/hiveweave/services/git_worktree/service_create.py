@@ -334,7 +334,7 @@ yarn.lock merge=union
                 if s.is_dir():
                     copied += _copy_tree_skip_symlinks(s, d)
                 elif s.is_file():
-                    if _copy_if_newer(s, d):
+                    if _copy_if_newer(str(s), str(d)):
                         copied += 1
                     else:
                         skipped += 1

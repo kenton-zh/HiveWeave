@@ -95,6 +95,93 @@ ACTIVITY_EXTEND_S = float(
 )
 """每次有进展的工具轮后，软预算续命这么多秒（不超过硬上限）。"""
 
+# ── 硬截止结构性执行（2026-08-07 slack-clone 压测根因修复）────────
+# 根因：HARD_TOTAL_TIMEOUT_S 此前只在 tool_loop 轮次【之间】检查，而单轮
+# 时长无界 —— 一次 LLM 流式（有事件就续命，思考模型可流数分钟）+ 一批并行
+# 工具（bash 120s / question 200s / spawn 500s）。在 t≈560s 进入一轮可冲到
+# 700s+，越过 agent SAFETY_TIMEOUT(600s) 被整体 cancel（run interrupted →
+# 90s 冷却 → resume 重建上下文）。实测 Aria 两次 run 在恰好 600s 被杀，
+# 且所有长 turn 都贴着 570~600s 边缘运行。HARD↔SAFETY 仅 30s 余量，远小于
+# 单轮最坏时长 —— 只靠轮间检查，「HARD < SAFETY」是统计成立而非结构成立。
+# 以下三个闸口把硬截止变成结构保证：streamer 承诺在 HARD 之前返回。
+MIN_ROUND_BUDGET_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_MIN_ROUND_BUDGET_S", "120") or "120"
+)
+"""开启新一轮 LLM 请求所需的最低剩余硬预算（秒）。
+
+剩余预算低于此值不再开新轮，直接走预算耗尽优雅收口（产出保留）。
+依据：思考模型首 chunk 可达 FIRST_CHUNK_TIMEOUT_S(90s)，剩余预算买不起
+一轮有意义产出时开新轮只会被中途切断，白烧 token。"""
+
+TURN_STREAM_CUT_GRACE_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_CUT_GRACE_S", "20") or "20"
+)
+"""流式中途预算切断提前量（秒）：读到 hard_deadline − 本值即收口。
+
+保留已累积文本、丢弃不完整 tool_calls（同 finish_reason=length 语义），
+留出 merge/记账/返回时间。必须 < HARD↔SAFETY 的 30s 余量。"""
+
+MIN_TOOL_BUDGET_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_MIN_TOOL_BUDGET_S", "15") or "15"
+)
+"""执行工具批所需的最低剩余预算（秒）。低于此值跳过执行直接优雅收口 —
+即便执行也会被预算帽压到近乎立即超时，产出的错误结果只会再烧一轮 LLM。
+被丢弃的本批 tool_calls 由下次唤醒重新发起，无副作用。"""
+
+TOOL_BUDGET_GRACE_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_TOOL_GRACE_S", "15") or "15"
+)
+"""工具批执行后的记账/返回预留（秒）。工具实际超时帽 = 剩余硬预算 − 本值。"""
+
+SUMMARY_MIN_BUDGET_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_SUMMARY_MIN_BUDGET_S", "45") or "45"
+)
+"""强制收尾总结调用（stall/no_text/max_rounds 的非流式总结）所需的最低
+剩余预算（秒）。低于此值跳过总结 LLM 调用直接走 fallback 文案 —— 总结
+调用 read 超时 95s，无帽可在 t≈560s 触发时冲过 HARD 直至 SAFETY 强杀，
+把三道闸口建立的结构保证打穿（2026-08-08 多子代审计发现）。"""
+
+# ── 结构约束断言：env 误配直接 import 失败，不许静默破坏 ──────────
+# 「HARD < SAFETY」「切断提前量 < HARD↔SAFETY 余量」是本文件的结构性承诺；
+# 只靠注释约束会被 env 覆盖静默击穿（审计 2026-08-08）。
+# 注意：余量不是常量 30s，而是 600 − HARD_TOTAL_TIMEOUT_S（HARD 本身 env
+# 可调）——断言必须引用实际余量，否则 HARD=590 时 grace=20 落在 SAFETY
+# 之后，assert 全绿但结构保证已击穿（审计 2026-08-08 P2）。
+assert HARD_TOTAL_TIMEOUT_S < 600.0, (
+    "HARD_TOTAL_TIMEOUT_S 必须 < agent SAFETY_TIMEOUT(600s)，"
+    "否则轮间硬检查失去意义"
+)
+assert 0 < TURN_STREAM_CUT_GRACE_S < 600.0 - HARD_TOTAL_TIMEOUT_S, (
+    "TURN_STREAM_CUT_GRACE_S 必须为正且 < HARD↔SAFETY 的实际余量 "
+    "(600 - HARD_TOTAL_TIMEOUT_S)"
+)
+assert 0 < MIN_ROUND_BUDGET_S < HARD_TOTAL_TIMEOUT_S, (
+    "MIN_ROUND_BUDGET_S 必须在 (0, HARD) 内 —— ≥HARD 轮闸门恒关、"
+    "<=0 闸门失效"
+)
+assert MIN_TOOL_BUDGET_S > 0 and TOOL_BUDGET_GRACE_S > 0
+# context.py wait_s = max(5.0, remain − 5.0) 要求总结闸口 ≥10s，
+# 否则 floor 5s 与「截止前留 5s 记账」无法同时成立（审计 2026-08-08 P2）。
+assert SUMMARY_MIN_BUDGET_S >= 10.0, (
+    "SUMMARY_MIN_BUDGET_S 必须 >= 10s（总结等待钳制的双 5s 预留）"
+)
+
+# ── 疏通层：预算可见性（2026-08-08）────────────────────────────────
+# 三道闸口是堵截兜底；疏通层的职责是让 agent 在撞闸【之前】就能自我
+# pacing。此前 agent 对 turn 预算完全盲视，直到软截止（~95% 处）才收到
+# 唯一一次提示 —— 长 turn 里启动全量测试/大重构等重型操作纯属不知情。
+# 剩余硬预算首次低于本阈值时注入一次温和提示，把「规划收口」的决策权
+# 提前交还给 agent（疏通），闸口只在它不收口时才动手（堵截兜底）。
+BUDGET_PACING_HINT_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_PACING_HINT_S", "300") or "300"
+)
+"""预算 pacing 提示的剩余阈值（秒）。默认 300 ≈ 硬预算一半，一次性注入。"""
+
+assert 0 < BUDGET_PACING_HINT_S < HARD_TOTAL_TIMEOUT_S, (
+    "BUDGET_PACING_HINT_S 必须在 (0, HARD) 内 —— >=HARD 每个 turn 第 2 轮"
+    "起就注入提示，纯白烧 token"
+)
+
 FIRST_CHUNK_TIMEOUT_S = 90.0
 """首 chunk 超时（TS 防线②，thinking 模型首 token 可能 60-90s）。"""
 

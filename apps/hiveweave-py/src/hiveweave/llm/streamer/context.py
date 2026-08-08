@@ -1,7 +1,9 @@
 """Context prune / trim / mid-round reminder / max-rounds summary."""
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -14,6 +16,7 @@ from .constants import (
     MID_ROUND_REMINDER_RATIO,
     OUTPUT_TOKEN_GLOBAL_CAP,
     SAFETY_BUFFER_TOKENS,
+    SUMMARY_MIN_BUDGET_S,
 )
 from .types import DeltaCallback
 
@@ -294,13 +297,30 @@ class ContextMixin:
         messages: list[dict],
         on_delta: DeltaCallback | None,
         reason: str = "max_rounds",
+        budget_deadline: float | None = None,
     ) -> str:
         """回合强制收尾的总结调用（真实原因由 ``reason`` 说明）。
 
         三种场景共用：max_rounds（达到工具轮数上限）/ stall_break（tool
         loop 停滞，只调只读工具无进展）/ no_text（连续只调工具不说话）。
         fallback 文案必须如实反映 ``reason`` —— 不要冒充"达到轮数上限"。
+
+        ``budget_deadline``（monotonic 刻度）是 turn 硬预算截止：总结也是
+        LLM 调用（非流式 read=95s），无帽可在 t≈560s 触发时冲过 HARD 直至
+        agent SAFETY_TIMEOUT 强杀（2026-08-08 审计发现——三道预算闸口的
+        结构保证会被这条收尾路径打穿）。剩余不足时跳过总结走 fallback；
+        允许时等待时长也钳在预算内。
         """
+        if budget_deadline is not None:
+            remain_s = budget_deadline - time.monotonic()
+            if remain_s < SUMMARY_MIN_BUDGET_S:
+                log.warning(
+                    "summary_skipped_budget",
+                    agent_id=agent_id,
+                    reason=reason,
+                    remain_s=round(remain_s, 1),
+                )
+                return self._summary_fallback(reason)
         if reason == "max_rounds":
             summary_prompt = (
                 "CRITICAL — MAXIMUM TOOL ROUNDS REACHED\n\n"
@@ -347,10 +367,17 @@ class ContextMixin:
 
         client = provider.build_client()
         try:
-            resp = await client.post(
+            post_coro = client.post(
                 url, headers=headers,
                 content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             )
+            if budget_deadline is not None:
+                # 等待时长钳在预算内（留 5s 记账/返回），超时走 fallback —
+                # 不让收尾路径成为预算结构保证的漏洞。
+                wait_s = max(5.0, budget_deadline - time.monotonic() - 5.0)
+                resp = await asyncio.wait_for(post_coro, timeout=wait_s)
+            else:
+                resp = await post_coro
             if resp.status_code == 200:
                 data = resp.json()
                 choices = data.get("choices") or []
