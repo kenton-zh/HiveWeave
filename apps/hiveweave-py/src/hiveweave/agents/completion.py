@@ -401,6 +401,9 @@ async def handle_completion(
     # NEW-1 / TEST18: phase is only set on exit_decision.ok; public tail
     # elif (phase == "in_progress") must not UnboundLocalError on park/exhaust.
     phase: str | None = None
+    # M4 (slack-clone_01): turn-exit gate 已判定停泊（不自动续跑语义）。
+    # 供 8b stall 补偿唤醒排除——两套机制互不知情会削弱 gate-park 保证。
+    _gate_parked = False
 
     # Progress fingerprint for no-progress circuit breaker
     fp = agent._compute_progress_fingerprint(
@@ -428,6 +431,7 @@ async def handle_completion(
             and not exit_decision.should_repair
         ):
             # Ledger mismatch → park on real books, do not re-run LLM
+            _gate_parked = True
             pop_pending_turn_result(agent.id)
             agent._turn_gate_count = 0
             agent.disposition = exit_decision.disposition or "runnable"
@@ -741,6 +745,7 @@ async def handle_completion(
     # parking re-check recent successful run; escalation messages state
     # facts only (no reassign/dismiss prescription).
     _stall_parked = False
+    _stall_resume_refs: list[str] = []  # P1-3: stall 补偿唤醒候选（running 任务）
     if result.get("stall_break"):
         import time as _time
 
@@ -922,9 +927,39 @@ async def handle_completion(
                     # Clear the ledger after parking
                     _stall_break_ledger.pop(agent.id, None)
 
+    # 8b. P1-3 (slack-clone_01): stall_break 未停泊 → 收集 running 任务短号，
+    # 交给 section 9 补偿唤醒。缺口：首轮 stall 后 agent 直接 idle，running
+    # 任务冻结到 20min task-stall 催办（A020 M6 卡 30min）。
+    # M4: gate 已停泊（_gate_parked，不自动续跑语义）时不补偿唤醒——
+    # 两套安全机制互不知情会削弱 gate-park 的「不自动续跑」保证。
+    if result.get("stall_break") and not _stall_parked and not _gate_parked:
+        try:
+            from hiveweave.services.task import TaskService
+
+            _stall_resume_refs = [
+                str(t.get("id") or "")[:8]
+                for t in (
+                    await TaskService().list_tasks(
+                        agent.project_id, assignee_id=agent.id
+                    )
+                    or []
+                )
+                if t.get("status") == "running" and t.get("id")
+            ]
+        except Exception as e:
+            log.debug(
+                "interrupted_resume_scan_failed",
+                agent_id=agent.id,
+                error=str(e),
+            )
+
     # 9. Repair once OR one progress slice OR hook nudge — never unlimited
     if _stall_parked:
         pass  # Parked — do not retrigger
+    elif _stall_resume_refs:
+        # P1-3: 补偿唤醒优先于通用 retrigger 分支 —— 用卡死的同一上下文立刻
+        # 重入只会再 stall；延迟唤醒 + 引导先核实状态再续跑/收口。
+        agent._arm_interrupted_resume(_stall_resume_refs)
     elif gate_retrigger_hint:
         await agent._retrigger_for_turn_gate(
             gate_retrigger_hint, inbox_msg_ids=carry_inbox_ids

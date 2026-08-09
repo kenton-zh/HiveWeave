@@ -8,6 +8,15 @@ send_message call.
 
 Runs on each game_time tick. Idempotent: uses event_id in the
 idempotency_key to prevent duplicate messages across relay runs.
+
+收敛（slack-clone_01 P2-4，治 coordinator 25+ 双写洪泛）：
+1. **直推去重**：submitted/approved/rework 三类，工具层已有 wake=True 直推
+   （submit.py/review.py/verify_merge.py）。relay 发送前按
+   (task_id, recipient, 协议前缀, 事件时间窗) 查 inbox，已有直推则跳过；
+   查不到（REST 逃生门等无直推路径）仍由 relay 兜底。
+2. **同批合并**：同一任务同批事件里，claimed/running 中间态 FYI 若被更晚
+   事件取代（如 submit 自动 claim→start→submit 一串），只留最新事件发声。
+   事件本身照常落 task_events（timeline 数据源），只收敛通知。
 """
 
 from __future__ import annotations
@@ -26,6 +35,27 @@ log = structlog.get_logger(__name__)
 # Relay tick interval (game_time ticks). Runs every ~30s (6 ticks * 5s).
 RELAY_TICK_INTERVAL = 6
 
+# 工具层有 wake=True 直推的事件 → 直推消息的协议前缀（平台常量）。
+# relay 对这三类只做兜底：直推已送达则跳过。
+_DIRECT_COVERED_PREFIX = {
+    "task.submitted": "[TASK SUBMITTED]",
+    "task.approved": "[TASK APPROVED]",
+    "task.rework": "[REWORK REQUESTED]",
+}
+
+# 直推与事件落库的时间差容忍（直推在事件之后毫秒级；留窗口防时钟偏斜）
+_DIRECT_DEDUPE_SKEW_MS = 60_000
+
+# 审计 F9：去重窗口下界——直推在事件落库之后发送（submit.py/review.py 同一
+# 工具调用内），故本轮直推 created_at 必 >= 本轮事件 ev_ts。下界只留极小
+# 容差容忍同轮内"直推落在事件落库毫秒前"的抖动，绝不向前扫 60s——否则
+# rework 后 60s 内再 submit 会命中**上一轮**残留下的 [TASK SUBMITTED] 直推，
+# 静默吞掉本轮"待审查"通知（任务卡 submitted 无人审查的有机 stall）。
+_DIRECT_DEDUPE_BACKWARD_MS = 5_000
+
+# 同批内可被更晚事件取代的中间态 FYI
+_SUPERSEDABLE_FYI = frozenset({"task.claimed", "task.running"})
+
 
 class TaskEventRelay:
     """Reads undelivered task_events and creates inbox messages."""
@@ -42,8 +72,20 @@ class TaskEventRelay:
         if not events:
             return 0
 
+        # P2-4 同批合并：claimed/running 中间态被同任务更晚事件取代时跳过
+        # （如 submit 自动 claim→start→submit 一串只让最终态发声）。
+        last_idx: dict[str, int] = {}
+        for idx, ev in enumerate(events):
+            last_idx[ev.get("task_id") or ""] = idx
+        sendable = [
+            ev
+            for idx, ev in enumerate(events)
+            if (ev.get("event_type") or "") not in _SUPERSEDABLE_FYI
+            or last_idx.get(ev.get("task_id") or "", idx) == idx
+        ]
+
         processed = 0
-        for ev in events:
+        for ev in sendable:
             try:
                 await self._process_one(project_id, ev)
                 processed += 1
@@ -103,6 +145,24 @@ class TaskEventRelay:
         message = self._build_message(
             event_type, task_id, payload, title=task.get("title") or ""
         )
+
+        # P2-4 直推去重：工具层已 wake=True 直推的事件（submit/review 工具
+        # 路径），relay 不再重复 FYI；查不到直推（REST 逃生门等）照常兜底。
+        direct_prefix = _DIRECT_COVERED_PREFIX.get(event_type)
+        if direct_prefix:
+            try:
+                ev_ts = int(event.get("created_at") or 0)
+            except (TypeError, ValueError):
+                ev_ts = 0
+            recipients = [
+                r
+                for r in recipients
+                if not await self._direct_already_sent(
+                    project_id, r, task_id, direct_prefix, ev_ts
+                )
+            ]
+            if not recipients:
+                return
 
         # Send to each recipient (idempotent via event-based key)
         inbox = InboxService()
@@ -237,6 +297,46 @@ class TaskEventRelay:
             "task.verifying": f"[TASK VERIFYING] {title} ({short_id}) verification started.",
         }
         return messages.get(event_type, f"[{event_type}] task {short_id}")
+
+    async def _direct_already_sent(
+        self,
+        project_id: str,
+        recipient_id: str,
+        task_id: str,
+        prefix: str,
+        event_created_at: int,
+    ) -> bool:
+        """True when a direct-path notification already covers this event.
+
+        直推在事件落库之后发送（submit.py/review.py 同一工具调用内），
+        故本轮直推 created_at 必 >= 本轮事件 ev_ts。去重窗口绑定本轮事件：
+        ``created_at >= ev_ts - BACKWARD``（容忍同轮毫秒级抖动）且
+        ``created_at <= ev_ts + SKEW``（容忍直推落库稍晚）。绝不向前扫 60s
+        ——否则 rework 后快速再 submit 会命中上一轮残留直推，静默吞通知。
+        前缀是平台协议常量（代码发出的英文常量），非自然语言意图猜测。
+        """
+        try:
+            from hiveweave.services.task import _query
+
+            rows = await _query(
+                project_id,
+                "SELECT 1 FROM inbox WHERE to_agent_id = ? AND task_id = ? "
+                "AND substr(message, 1, ?) = ? "
+                "AND created_at >= ? AND created_at <= ? LIMIT 1",
+                [
+                    recipient_id,
+                    task_id,
+                    len(prefix),
+                    prefix,
+                    max(0, event_created_at - _DIRECT_DEDUPE_BACKWARD_MS),
+                    event_created_at + _DIRECT_DEDUPE_SKEW_MS,
+                ],
+            )
+            return bool(rows)
+        except Exception as e:
+            # 查询失败时保守放行（兜底语义优先：宁重勿丢）
+            log.debug("relay_direct_dedupe_check_failed", error=str(e))
+            return False
 
     async def _get_task(self, project_id: str, task_id: str) -> dict | None:
         """Fetch task from per-project DB."""

@@ -497,4 +497,12 @@ def _check_shell_security(params: Any) -> str | None:
     if _check_hiveweave_command(command):
         return "Error: Command blocked - cannot access .hiveweave system directory"
 
+    # slack-clone_01 P0: 与 bash.py 同一套命令模式护栏，预检早失败
+    # （排在 .hiveweave 目标型护栏之后：多重命中时报更具体的原因，同 bash.py）
+    from hiveweave.services.command_guard import evaluate_command
+
+    verdict = evaluate_command(command)
+    if verdict.blocked:
+        return f"Error: Command blocked: {verdict.reason}"
+
     return None
