@@ -2,8 +2,10 @@ import { useState, useEffect, useMemo } from "react";
 import {
   getProjectTokenUsage,
   getProjectTokenDaily,
+  getOrgTree,
   tokenRequestTypeLabel,
 } from "../api";
+import { roleLabels } from "../chat/constants";
 import type { TokenUsageEntry, TokenDailyEntry } from "../api";
 
 // ── Formatters ──────────────────────────────────────────────
@@ -18,6 +20,38 @@ function fmtNum(n: number | undefined | null): string {
 function fmtCalls(n: number | undefined | null): string {
   if (n == null) return "-";
   return String(n);
+}
+
+type AgentMeta = { name: string; role: string };
+
+type OrgNode = { id: string; name: string; role?: string; children?: OrgNode[] | null };
+type OrgTreeResponse = { tree: OrgNode[] };
+
+function flattenAgentMeta(tree: unknown): Map<string, AgentMeta> {
+  const meta = new Map<string, AgentMeta>();
+  const roots = Array.isArray(tree)
+    ? (tree as OrgNode[])
+    : ((tree as OrgTreeResponse)?.tree ?? []);
+  const visit = (n: OrgNode) => {
+    meta.set(n.id, { name: n.name, role: n.role || "" });
+    if (Array.isArray(n.children)) n.children.forEach(visit);
+  };
+  roots.forEach(visit);
+  return meta;
+}
+
+function agentLabel(id: string, meta: AgentMeta | undefined): string {
+  return meta?.name || id.slice(0, 8);
+}
+
+function AgentCell({ id, meta }: { id: string; meta: AgentMeta | undefined }) {
+  const role = meta ? (roleLabels[meta.role] || meta.role || "—") : "—";
+  return (
+    <div className="min-w-[110px]" title={id}>
+      <div className="text-g-fg">{agentLabel(id, meta)}</div>
+      <div className="text-[10px] text-g-fg-4">{role}</div>
+    </div>
+  );
 }
 
 // ── Sub-components ──────────────────────────────────────────
@@ -71,6 +105,7 @@ function DailyBarChart({ entries }: { entries: TokenDailyEntry[] }) {
 export default function TokenUsagePanel({ projectId }: { projectId: string }) {
   const [entries, setEntries] = useState<TokenUsageEntry[]>([]);
   const [daily, setDaily] = useState<TokenDailyEntry[]>([]);
+  const [agentMeta, setAgentMeta] = useState<Map<string, AgentMeta>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -81,11 +116,13 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
     Promise.all([
       getProjectTokenUsage(projectId),
       getProjectTokenDaily(projectId, 30),
+      getOrgTree(projectId).catch(() => null),
     ])
-      .then(([u, d]) => {
+      .then(([u, d, tree]) => {
         if (!alive) return;
         setEntries(u.entries ?? []);
         setDaily(d.entries ?? []);
+        setAgentMeta(flattenAgentMeta(tree));
       })
       .catch((e) => {
         if (!alive) return;
@@ -146,10 +183,12 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
             Promise.all([
               getProjectTokenUsage(projectId),
               getProjectTokenDaily(projectId, 30),
+              getOrgTree(projectId).catch(() => null),
             ])
-              .then(([u, d]) => {
+              .then(([u, d, tree]) => {
                 setEntries(u.entries ?? []);
                 setDaily(d.entries ?? []);
+                setAgentMeta(flattenAgentMeta(tree));
               })
               .catch((e) => setError(e?.message ?? "刷新失败"))
               .finally(() => setLoading(false));
@@ -214,7 +253,9 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
               <tbody>
                 {byAgent.map((a) => (
                   <tr key={a.agent_id} className="border-b border-g-border/60 hover:bg-g-bg-muted/50">
-                    <td className="px-4 py-2 font-mono text-g-fg">{a.agent_id}</td>
+                    <td className="px-4 py-1.5">
+                      <AgentCell id={a.agent_id} meta={agentMeta.get(a.agent_id)} />
+                    </td>
                     <td className="px-2 py-2 text-right font-mono">{fmtCalls(a.llm_calls)}</td>
                     <td className="px-2 py-2 text-right font-mono">{fmtNum(a.input_tokens)}</td>
                     <td className="px-2 py-2 text-right font-mono">{fmtNum(a.output_tokens)}</td>
@@ -247,7 +288,9 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
               <tbody>
                 {entries.map((e, i) => (
                   <tr key={`${e.agent_id}-${e.request_type}-${i}`} className="border-b border-g-border/60 hover:bg-g-bg-muted/50">
-                    <td className="px-4 py-1.5 font-mono text-g-fg">{e.agent_id}</td>
+                    <td className="px-4 py-1.5">
+                      <AgentCell id={e.agent_id} meta={agentMeta.get(e.agent_id)} />
+                    </td>
                     <td className="px-2 py-1.5">
                       <span className="inline-block text-[10px] text-g-fg-2 bg-g-bg-muted px-1.5 py-0.5 rounded">
                         {tokenRequestTypeLabel(e.request_type)}

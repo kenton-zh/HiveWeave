@@ -52,6 +52,7 @@ export const CHAT_MOTION_CSS = `
 `;
 
 export const roleLabels: Record<string, string> = {
+  ceo: "CEO",
   hr: "HR",
   architect: "Architect",
   manager: "Manager",
