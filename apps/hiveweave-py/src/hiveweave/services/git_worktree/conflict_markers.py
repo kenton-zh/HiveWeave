@@ -7,6 +7,9 @@ from pathlib import Path
 import structlog
 
 from .constants import (
+    HIVEWEAVE_DIR,
+    PRIVATE_WS_DIRS,
+    TRACKED_WS_DIRS,
     _CONFLICT_MARKER_RE,
     _MARKER_SCAN_MAX_BYTES,
     _MARKER_SCAN_MAX_HITS,
@@ -23,8 +26,9 @@ def scan_conflict_markers(
     """Scan for unresolved git conflict markers (merge 后残留检测).
 
     行首锚定 ``<<<<<<<`` / ``>>>>>>>``。只扫文本文件 — 跳过
-    .git/.hiveweave/node_modules/dist/build 等目录、含 NUL 字节的二进制
-    文件、以及 >1MB 的大文件。返回 POSIX 风格相对路径的排序列表。
+    .git/.hiveweave 私有子目录(worktrees/tool_outputs/db, but NOT the
+    tracked workspace dirs)/node_modules/dist/build 等目录、含 NUL 字节的
+    二进制文件、以及 >1MB 的大文件。返回 POSIX 风格相对路径的排序列表。
 
     If *paths* is provided, only those relative paths are checked (the files
     touched by this merge). Full-tree walks mis-fire on docs/fixtures that
@@ -33,6 +37,17 @@ def scan_conflict_markers(
     root_path = Path(root)
     if not root_path.is_dir():
         return []
+
+    # Tracked workspace dirs (shared/reports/drafts/handoffs) are scannable;
+    # private dirs (worktrees/tool_outputs/logs/db) keep being skipped even
+    # though they live under .hiveweave.
+    def _is_private_dir(dirname: str, parent_rel: Path) -> bool:
+        if dirname in _MARKER_SCAN_SKIP_DIRS and dirname != HIVEWEAVE_DIR:
+            return True
+        if parent_rel.as_posix() == HIVEWEAVE_DIR:
+            tracked_basenames = {d.rsplit("/", 1)[-1] for d in TRACKED_WS_DIRS}
+            return dirname not in tracked_basenames
+        return False
 
     def _check_file(fpath: Path) -> bool:
         try:
@@ -53,7 +68,7 @@ def scan_conflict_markers(
             if len(hits) >= _MARKER_SCAN_MAX_HITS:
                 break
             norm = (rel or "").strip().replace("\\", "/")
-            if not norm or norm.startswith(".hiveweave/"):
+            if not norm:
                 continue
             fpath = root_path / norm
             if not fpath.is_file():
@@ -63,7 +78,11 @@ def scan_conflict_markers(
         return sorted(hits)
 
     for dirpath, dirnames, filenames in os.walk(root_path):
-        dirnames[:] = [d for d in dirnames if d not in _MARKER_SCAN_SKIP_DIRS]
+        parent_rel = (Path(dirpath).relative_to(root_path)
+                      if dirpath != str(root_path) else Path("."))
+        dirnames[:] = [
+            d for d in dirnames if not _is_private_dir(d, parent_rel)
+        ]
         for name in filenames:
             if len(hits) >= _MARKER_SCAN_MAX_HITS:
                 return sorted(hits)

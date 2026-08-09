@@ -306,9 +306,10 @@ _HIVEWEAVE_FILE_OPS = re.compile(
 _HIVEWEAVE_REF = re.compile(r"\.hiveweave\b", re.IGNORECASE)
 
 # 放行的 .hiveweave 子目录 — agent 可在这些子目录内执行文件操作
-# 与 file.py 的 allowed_subdirs 保持一致
+# 与 file.py 的 allowed_subdirs（_check_hiveweave_dir）保持一致:
+# shared=团队共享 / reports, drafts, worktrees=工作文件 / handoffs=交接文档
 _ALLOWED_HW_SUBDIRS = re.compile(
-    r"\.hiveweave[\\/]+(?:shared|reports|drafts|worktrees)[\\/]",
+    r"\.hiveweave[\\/]+(?:shared|reports|drafts|worktrees|handoffs)[\\/]",
     re.IGNORECASE,
 )
 
@@ -318,7 +319,7 @@ def _check_hiveweave_command(command: str) -> bool:
 
     拦截 agent 通过 bash 读写/删除/复制 .hiveweave 内系统文件（data.db 等）。
     `cd .hiveweave` 和 `ls .hiveweave` 这类无害命令不拦。
-    放行指向 shared/reports/drafts/worktrees 子目录的文件操作（团队共享空间）。
+    放行指向 shared/reports/drafts/worktrees/handoffs 子目录的文件操作（团队共享/工作文件）。
     """
     if not _HIVEWEAVE_REF.search(command):
         return False

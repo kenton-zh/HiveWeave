@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
-import threading
+import time
 from pathlib import Path
 from typing import Any, List, TYPE_CHECKING
 
@@ -16,7 +16,7 @@ from .constants import (
     GIT_TIMEOUT,
     GITIGNORE_GENERATED_ENTRIES,
     QUARANTINE_DIR,
-    SHARED_DIR,
+    TRACKED_WS_DIRS,
     WORKTREE_DIR,
     _RELOCATION_SUFFIXES,
     _WT_LIST_RE,
@@ -49,85 +49,6 @@ from .porcelain import (
 log = structlog.get_logger(__name__)
 from .reconcile import _log_worktree_rebuild_event
 
-# Issue #3: serializes shared-dir sync per workspace. The sync runs in a
-# thread executor (to_thread) — threading.Lock is the right primitive — and
-# protects against a torn read when the root .hiveweave/shared is being
-# written concurrently while we copy it into a worktree.
-_shared_sync_locks: dict[str, threading.Lock] = {}
-_shared_sync_locks_guard = threading.Lock()
-
-
-def _workspace_sync_lock(workspace_path: str) -> threading.Lock:
-    """Return the per-workspace sync lock, creating it under a guard.
-
-    The guard makes the get-or-create atomic so two threads racing on the
-    *first* sync of a workspace cannot each build a separate lock (which would
-    bypass the serialization the lock exists to provide).
-    """
-    lock_key = str(Path(workspace_path).resolve())
-    with _shared_sync_locks_guard:
-        lock = _shared_sync_locks.get(lock_key)
-        if lock is None:
-            lock = threading.Lock()
-            _shared_sync_locks[lock_key] = lock
-        return lock
-
-
-def _copy_if_newer(src: str, dst: str) -> bool:
-    """Copy *src* to *dst* only when *dst* is missing or stale.
-
-    ``shutil.copy2`` preserves mtime, so a dst whose mtime is at-or-newer than
-    src is either an unchanged prior copy or a worktree-local edit — never
-    silently clobber it (Issue #3 review: top-level files were unconditionally
-    overwritten, wiping agent edits). Root-updated contracts (src newer) still
-    propagate.
-
-    P2 (audit): same-second ambiguity. ``st_mtime`` is float seconds, so two
-    writes within the same second collapse to the same resolution and a
-    root update could be mistaken for a stale copy (or vice-versa). We compare
-    ``st_mtime_ns`` (nanosecond precision) and tie-break on size when the ns
-    stamps match — a genuine root update with different content is reflected
-    in size even if the filesystem clock did not advance. Returns True when a
-    copy was performed, False when skipped.
-    """
-    s = Path(src)
-    d = Path(dst)
-    if d.exists():
-        try:
-            sm = s.stat()
-            dm = d.stat()
-            if sm.st_mtime_ns < dm.st_mtime_ns:
-                return False
-            if sm.st_mtime_ns == dm.st_mtime_ns and sm.st_size == dm.st_size:
-                return False
-        except OSError:
-            return False
-    shutil.copy2(s, d)
-    return True
-
-
-def _copy_tree_skip_symlinks(src: Path, dst: Path) -> int:
-    """Merge *src* into *dst*, skipping symlinks at every level.
-
-    ``shutil.copytree`` cannot skip symlinks nested inside a directory (with
-    ``symlinks=False`` it dereferences them via the copy function; with
-    ``symlinks=True`` it recreates them). We walk manually so a symlink never
-    has its target content pulled into a worktree — consistent with the
-    top-level symlink handling. Returns the number of directories copied.
-    """
-    dst.mkdir(parents=True, exist_ok=True)
-    copied = 0
-    for item in src.iterdir():
-        s = src / item.name
-        if s.is_symlink():
-            continue  # never dereference, at any depth
-        d = dst / item.name
-        if s.is_dir():
-            copied += _copy_tree_skip_symlinks(s, d)
-        elif s.is_file():
-            _copy_if_newer(str(s), str(d))
-    return copied + 1
-
 
 class CreateMixin:
     """ensure_git_repo / create / checkpoint."""
@@ -141,12 +62,14 @@ class CreateMixin:
         """Ensure workspace is a git repo. Auto-init + master→main if needed.
 
         初始化时自动 commit 现有项目文件到 main 分支，这样 worktree
-        创建时能继承完整代码。.gitignore 排除 node_modules/.hiveweave 等。
+        创建时能继承完整代码。.gitignore 排除 node_modules/.hiveweave 私有区。
 
         Returns ``{success, initialized}`` or ``{success: False, message}``.
         """
         if _has_git(workspace_path):
-            # Existing repo — still patch .gitignore idempotently (TEST6 P1-A).
+            # Existing repo — still patch .gitignore idempotently (TEST6 P1-A),
+            # and migrate legacy ignore rules (workspace tracking) if found.
+            await self._migrate_legacy_hiveweave_ignore(workspace_path)
             await self._ensure_gitignore_entries(workspace_path)
             return {"success": True, "initialized": False}
 
@@ -166,13 +89,19 @@ class CreateMixin:
         await _git(["config", "user.name", "HiveWeave Agent"], workspace_path)
 
         # 创建 .gitignore — 排除不应进入 worktree 的文件
-        # (node_modules 每个 worktree 独立安装; .hiveweave 是系统目录;
+        # (node_modules 每个 worktree 独立安装; .hiveweave 是平台私有目录;
         #  *.db 是数据库; dist/build 是构建产物; .env 是密钥)
         gitignore_path = Path(workspace_path) / ".gitignore"
         if not gitignore_path.exists():
             gitignore_content = """\
-# HiveWeave 系统目录 (worktree 不继承)
-.hiveweave/
+# HiveWeave 平台目录: 私有资产不入库 (worktrees/tool_outputs/logs/data.db 等)。
+# shared/reports/drafts/handoffs 四目录为 agent 共享工作区, 反选入库 —
+# 契约跨 worktree 可见可合并 (merge 可见冲突, 见 .gitattributes)。
+.hiveweave/*
+!.hiveweave/shared/
+!.hiveweave/reports/
+!.hiveweave/drafts/
+!.hiveweave/handoffs/
 
 # 依赖 (每个 worktree 独立安装)
 node_modules/
@@ -216,7 +145,7 @@ playwright-report/
         else:
             await self._ensure_gitignore_entries(workspace_path)
 
-        # P1-1: .gitattributes — lockfile union merge strategy.
+# P1-1: .gitattributes — lockfile union merge strategy.
         # package-lock.json conflicts are 100% predictable (every executor
         # runs npm install); union + post-merge regenerate eliminates rework.
         gitattributes_path = Path(workspace_path) / ".gitattributes"
@@ -227,6 +156,14 @@ playwright-report/
 package-lock.json merge=union
 pnpm-lock.yaml merge=union
 yarn.lock merge=union
+
+# HiveWeave workspace shared docs: shared/ 契约用 binary (双方改动即冲突,
+# 拒绝静默拼接成自相矛盾的规格); drafts/handoffs 是 append-only 日志,
+# union 合并. reports/ 是 agent 产物, 走默认文本合并.
+# `**` 让嵌套子目录 (shared/sub/contract.md) 也命中 — 单 `*` 只匹配直接子级.
+.hiveweave/shared/**/*.md merge=binary
+.hiveweave/drafts/**/*.md merge=union
+.hiveweave/handoffs/**/*.md merge=union
 """
             gitattributes_path.write_text(gitattributes_content, encoding="utf-8")
 
@@ -248,6 +185,300 @@ yarn.lock merge=union
         log.info("git_worktree.init_repo", workspace=workspace_path)
         return {"success": True, "initialized": True}
 
+    async def _migrate_legacy_hiveweave_ignore(self, workspace_path: str) -> None:
+        """Upgrade legacy ignore rules so shared workspace dirs become tracked.
+
+        旧模板忽略整个 ``.hiveweave/`` (审计前), 新模板反选 shared/reports/
+        drafts/handoffs 四目录入库。存量仓库的 `.gitignore` 是 tracked 文件,
+        直接改会 dirty main 且触发 merge dirty gate; 所以迁移必须落成一次
+        git 提交: 检查 → 重写 → ``git add`` + ``git commit`` (维护提交)。
+        幂等: 无旧规则时 no-op。失败不致命 — 只记日志, 下次启动重试。
+        """
+        if not _has_git(workspace_path):
+            return
+        gi_path = Path(workspace_path) / ".gitignore"
+        if not gi_path.exists():
+            gi_path = Path(workspace_path) / ".git" / "info" / "exclude"
+            if not gi_path.exists():
+                return
+        try:
+            content = gi_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            log.warning("git_worktree.ignore_migrate_read_failed",
+                        workspace=workspace_path, error=str(e))
+            return
+        lines = content.splitlines()
+        has_legacy = any(ln.strip() == ".hiveweave/" for ln in lines)
+        has_new = any(ln.strip() == ".hiveweave/*" for ln in lines) and any(
+            ln.strip().startswith("!.hiveweave/") for ln in lines
+        )
+        if not has_legacy or has_new:
+            return
+        # Step 1: check nothing under .hiveweave is already tracked (lifting
+        # the ignore must not silently fold pre-existing tracked helper files).
+        ok_ls, ls_out = await _git(
+            ["ls-files", ".hiveweave"], workspace_path
+        )
+        if ok_ls and (ls_out or "").strip():
+            log.warning(
+                "git_worktree.ignore_migrate_aborted_tracked_files",
+                workspace=workspace_path,
+                count=len([l for l in ls_out.splitlines() if l.strip()]),
+            )
+            return
+        new_block = (
+            "# HiveWeave 平台目录: 私有资产不入库 (worktrees/tool_outputs/)\n"
+            "# logs/data.db 等)。shared/reports/drafts/handoffs 四目录为 agent\n"
+            "# 共享工作区, 反选入库 — 契约跨 worktree 可见可合并。\n"
+            ".hiveweave/*\n"
+            "!.hiveweave/shared/\n"
+            "!.hiveweave/reports/\n"
+            "!.hiveweave/drafts/\n"
+            "!.hiveweave/handoffs/\n"
+        )
+        out: list[str] = []
+        for ln in lines:
+            if ln.strip() == ".hiveweave/":
+                out.extend(new_block.rstrip("\n").splitlines())
+            else:
+                out.append(ln)
+        # .gitattributes may be absent in legacy repos — build the shared-docs
+        # merge block and fold it into the same maintenance commit. Originals
+        # are captured up front: the failed-add/failed-commit rollback must
+        # restore them from memory (see _rollback_migration_files).
+        attr_path = Path(workspace_path) / ".gitattributes"
+        attr_block = (
+            "\n# HiveWeave workspace shared docs: contracts use binary merge "
+            "(conflicts visible, no silent splicing).\n"
+            ".hiveweave/shared/**/*.md merge=binary\n"
+            ".hiveweave/drafts/**/*.md merge=union\n"
+            ".hiveweave/handoffs/**/*.md merge=union\n"
+        )
+        attr_existed = attr_path.exists()
+        attr_original: str | None = None
+        patched_attr = False
+        attr_lines: list[str] = []
+        try:
+            if attr_existed:
+                attr_original = attr_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                attr_lines = attr_original.splitlines()
+                if not any(
+                    ".hiveweave/shared" in ln and "merge=binary" in ln
+                    for ln in attr_lines
+                ):
+                    attr_lines.extend(attr_block.rstrip("\n").splitlines())
+                    patched_attr = True
+            else:
+                attr_lines = attr_block.rstrip("\n").splitlines()
+                patched_attr = True
+        except OSError as e:
+            log.warning("git_worktree.ignore_migrate_attr_read_failed",
+                        workspace=workspace_path, error=str(e))
+        try:
+            gi_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+            if patched_attr:
+                attr_path.write_text("\n".join(attr_lines) + "\n", encoding="utf-8")
+            # Identity first: legacy repos may lack user.name/email — the
+            # commit must not fail on that (audit P1: failure left .gitignore
+            # rewritten-but-uncommitted and migration permanently stuck).
+            id_args = ["-c", "user.name=HiveWeave Agent",
+                       "-c", "user.email=hiveweave@agent.local"]
+            # Pathspec commit: only the files we actually touched go into the
+            # maintenance commit — never sweep unrelated dirty working files.
+            # (.git/info/exclude fallback is untracked and needs no commit.)
+            add_paths: list[str] = []
+            if gi_path.name == ".gitignore":
+                add_paths.append(".gitignore")
+            if patched_attr:
+                add_paths.append(".gitattributes")
+            if not add_paths:
+                log.info("git_worktree.ignore_migrate_nothing_committable",
+                         workspace=workspace_path)
+                return
+            ok_add, add_out = await _git(
+                id_args + ["add", "--"] + add_paths, workspace_path,
+            )
+            if not ok_add:
+                await self._rollback_migration_files(
+                    workspace_path, gi_path, content, attr_path,
+                    attr_existed, attr_original,
+                )
+                log.warning(
+                    "git_worktree.ignore_migrate_add_failed_rolled_back",
+                    workspace=workspace_path, out=(add_out or "")[:200])
+                return
+            commit_ok, commit_out = await _git(
+                id_args + ["commit", "-m",
+                           "maintenance: track hiveweave shared workspace dirs"],
+                workspace_path,
+            )
+            if commit_ok:
+                log.info("git_worktree.ignore_migrated",
+                         workspace=workspace_path)
+                await self._quarantine_legacy_shared_wt_copies(workspace_path)
+            elif "nothing to commit" in (commit_out or ""):
+                pass
+            else:
+                # Roll back disk + index so the next startup retries —
+                # otherwise the rewritten .gitignore is never committed and
+                # main becomes permanently dirty (audit P1: the old single
+                # `checkout HEAD -- <both>` pathspec failed wholesale when
+                # .gitattributes was brand-new, restoring nothing).
+                await self._rollback_migration_files(
+                    workspace_path, gi_path, content, attr_path,
+                    attr_existed, attr_original,
+                )
+                log.warning(
+                    "git_worktree.ignore_migrate_commit_failed_rolled_back",
+                    workspace=workspace_path, out=commit_out[:200])
+        except OSError as e:
+            log.warning("git_worktree.ignore_migrate_failed",
+                        workspace=workspace_path, error=str(e))
+
+    async def _rollback_migration_files(
+        self,
+        workspace_path: str,
+        gi_path: Path,
+        gi_original: str,
+        attr_path: Path,
+        attr_existed: bool,
+        attr_original: str | None,
+    ) -> None:
+        """Restore .gitignore/.gitattributes (+ index) after a failed migration.
+
+        P1-2 (audit): a single ``checkout HEAD -- <both>`` fails wholesale
+        when .gitattributes is new (not in HEAD) — pathspec error, NOTHING
+        restored, main left permanently dirty, and the migration no-ops on
+        every future startup (the rewritten rules no longer contain the
+        legacy ``.hiveweave/`` marker). Restore each file from the
+        pre-migration in-memory original instead: files absent from HEAD are
+        simply deleted; the ``.git/info/exclude`` fallback is rewritten (it
+        is not a git path at all). Anything the failed add/commit staged is
+        un-staged per path so the index does not linger dirty.
+        """
+        for rel in (".gitignore", ".gitattributes"):
+            if not (Path(workspace_path) / rel).exists():
+                continue
+            ok_ls, ls_out = await _git(["ls-files", "--", rel], workspace_path)
+            if ok_ls and (ls_out or "").strip():
+                await _git(["reset", "--quiet", "HEAD", "--", rel],
+                           workspace_path)
+        try:
+            gi_path.write_text(gi_original, encoding="utf-8")
+        except OSError as e:
+            log.warning("git_worktree.ignore_migrate_rollback_gi_failed",
+                        workspace=workspace_path, error=str(e))
+        try:
+            if attr_existed and attr_original is not None:
+                attr_path.write_text(attr_original, encoding="utf-8")
+            elif attr_existed:
+                # Original unreadable (OSError earlier) — fall back to HEAD.
+                ok_e, _ = await _git(
+                    ["cat-file", "-e", "HEAD:.gitattributes"], workspace_path
+                )
+                if ok_e:
+                    await _git(
+                        ["checkout", "HEAD", "--", ".gitattributes"],
+                        workspace_path,
+                    )
+            else:
+                attr_path.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("git_worktree.ignore_migrate_rollback_attr_failed",
+                        workspace=workspace_path, error=str(e))
+
+    async def _quarantine_legacy_shared_wt_copies(self, workspace_path: str) -> None:
+        """Move pre-migration `.hiveweave/shared` copies inside EXISTING
+        worktrees into the merge-quarantine dir.
+
+        Before PR-A, every worktree got a plain file copy of shared/ (the old
+        sync — untracked, never committed). After migration these untracked
+        copies would make ``git merge main`` fail on the agent side*
+        (untracked working tree files would be overwritten) with no
+        quarantine path — deadlock. Preserve them, don't delete: content may
+        be an agent's uncommitted contract edit.
+        """
+        if not _has_git(workspace_path):
+            return
+        ok_wt, wt_out = await _git(
+            ["worktree", "list", "--porcelain"], workspace_path
+        )
+        if not ok_wt:
+            return  # fall back to graceful no-op; merge-side gate still safe
+        main_resolved = str(Path(workspace_path).resolve())
+        wt_paths: list[str] = []
+        for fld in (wt_out or "").split("\n\n"):
+            lines = fld.splitlines()
+            path_line = next((ln for ln in lines if ln.startswith("worktree ")),
+                             None)
+            if not path_line:
+                continue
+            wt = path_line[len("worktree "):].strip()
+            if str(Path(wt).resolve()).lower() == main_resolved.lower():
+                continue  # main checkout, not a linked worktree
+            wt_paths.append(wt)
+        for wt in wt_paths:
+            await self._quarantine_legacy_shared_in_one(wt)
+
+    async def _quarantine_legacy_shared_in_one(self, wt: str) -> None:
+        """Move untracked legacy shared copies out of a single worktree.
+
+        Only files that are NOT tracked in the worktree branch move — a
+        tracked file is either the checkout of the real contract or the
+        agent's committed edit; both are fine where they are. Untracked
+        copies are moved (preserved, not deleted) under
+        ``.hiveweave/merge-quarantine/legacy-sync-<stamp>/`` so the next
+        ``git merge main`` does not fail with untracked overwrite.
+
+        Detection uses ``git ls-files --others`` WITHOUT ``--exclude-standard``:
+        legacy worktree branches still carry the OLD ``.gitignore`` that
+        ignores all of ``.hiveweave/``, so the sync copies are IGNORED files
+        — ``status --porcelain`` never lists them and the scan was a silent
+        no-op (audit P1: the copies survived, then ``git merge main``
+        silently overwrote them on fast-forward AND 3-way merge, losing the
+        very agent contract edits this guard exists to preserve).
+        ``ls-files --others`` lists ignored untracked files too, and never
+        emits directory records.
+        """
+        hw = Path(wt) / ".hiveweave"
+        if not hw.is_dir():
+            return
+        for tracked in TRACKED_WS_DIRS:
+            if not (Path(wt) / tracked).is_dir():
+                continue
+            ok_ls, ls_out = await _git(
+                ["ls-files", "-z", "--others", "--", tracked], wt,
+            )
+            if not ok_ls:
+                continue
+            untracked = [p for p in (ls_out or "").split("\x00") if p.strip()]
+            if not untracked:
+                continue
+            stamp = f"legacy-sync-{int(time.time())}"
+            qroot = Path(wt) / ".hiveweave" / "merge-quarantine" / stamp
+            moved = 0
+            for rel in untracked:
+                src = Path(wt) / rel.replace("\\", "/")
+                if not src.is_file():
+                    continue
+                dst = qroot / rel
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+                    moved += 1
+                except OSError as e:
+                    log.warning(
+                        "git_worktree.legacy_shared_quarantine_failed",
+                        wt=wt, rel=rel, error=str(e))
+            if moved:
+                log.info(
+                    "git_worktree.legacy_shared_quarantined",
+                    wt=wt, sub=tracked, moved=moved, stamp=stamp,
+                    files=[p for p in untracked if p.strip()][:10],
+                )
+
     async def _ensure_gitignore_entries(self, workspace_path: str) -> None:
         """TEST6 P1-A: add GITIGNORE_GENERATED_ENTRIES to the repo-local
         exclude file (``.git/info/exclude``), idempotently.
@@ -257,8 +488,6 @@ yarn.lock merge=union
         is untracked, shared by all worktrees, and has identical semantics.
         """
         exclude = Path(workspace_path) / ".git" / "info" / "exclude"
-        if not exclude.parent.exists():
-            return
         try:
             existing = ""
             if exclude.exists():
@@ -297,56 +526,6 @@ yarn.lock merge=union
         path = _worktree_path(workspace_path, short_id)
         return path if _has_git(path) else None
 
-    def _sync_shared_contracts(self, workspace_path: str, worktree_path: str) -> None:
-        """Issue #3: copy the project's ``.hiveweave/shared/`` into a worktree.
-
-        ``.hiveweave/`` is gitignored, so a freshly created worktree has no
-        shared contracts (``taskflow-contract.md`` etc.). Cross-end agents
-        (frontend aligning to the backend API) previously had to either read
-        the project root via an absolute path or peek into another owner's
-        worktree. Mirroring the shared dir into each worktree makes contracts
-        locally readable by every agent. Idempotent; missing source → no-op.
-
-        Merge semantics: directories are merged by a manual walk that never
-        ``rmtree``s a worktree-local shared subdir, so a repeated create cannot
-        wipe files the agent added locally. Files (top-level and inside dirs)
-        are copied incrementally via ``_copy_if_newer``: an unchanged dst is
-        skipped, and a dst newer than src (a worktree-local edit) is preserved
-        rather than clobbered. Symlinks are skipped at every level (we never
-        dereference an external target into a worktree). A per-workspace lock
-        serializes concurrent syncs to avoid torn reads.
-        """
-        if not worktree_path:
-            return
-        src = Path(workspace_path) / SHARED_DIR
-        dst = Path(worktree_path) / SHARED_DIR
-        if not src.exists():
-            return
-        with _workspace_sync_lock(workspace_path):
-            dst.mkdir(parents=True, exist_ok=True)
-            copied = 0
-            skipped = 0
-            for item in src.iterdir():
-                s = src / item.name
-                if s.is_symlink():
-                    continue  # don't dereference external targets into worktrees
-                d = dst / item.name
-                if s.is_dir():
-                    copied += _copy_tree_skip_symlinks(s, d)
-                elif s.is_file():
-                    if _copy_if_newer(str(s), str(d)):
-                        copied += 1
-                    else:
-                        skipped += 1
-                else:
-                    skipped += 1
-            log.info(
-                "git_worktree.shared_synced",
-                worktree=worktree_path,
-                copied=copied,
-                skipped=skipped,
-            )
-
     # ── 1. CREATE ────────────────────────────────────────────
 
     async def create(self, workspace_path: str, short_id: str,
@@ -370,26 +549,6 @@ yarn.lock merge=union
             result = await self._create_unlocked(
                 workspace_path, short_id, task_name, base_branch, task_id=task_id
             )
-        # Issue #3: contract sharing — .hiveweave/ is gitignored so shared
-        # contract files never reach a fresh worktree, leaving cross-end agents
-        # (e.g. frontend needing the backend API) able to read the contract only
-        # by peeking into the project root. Sync the project's .hiveweave/shared/
-        # into the worktree so contracts are locally visible to every agent.
-        # Deliberately OUTSIDE the create lock and run in a thread executor: the
-        # copy is blocking file I/O that must not hold the lock or stall the event
-        # loop. Best-effort; never fails the create.
-        if result.get("success"):
-            wt_path = result.get("path") or ""
-            try:
-                await asyncio.to_thread(
-                    self._sync_shared_contracts, workspace_path, wt_path
-                )
-            except Exception as e:
-                log.warning(
-                    "git_worktree.shared_sync_failed",
-                    short_id=short_id,
-                    error=str(e),
-                )
         return result
 
     async def _create_unlocked(

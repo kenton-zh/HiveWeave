@@ -7,12 +7,13 @@ from pathlib import Path
 import structlog
 
 from .constants import (
+    TRACKED_WS_DIRS,
     _UNTRACKED_FILE_LINE_RE,
     _UNTRACKED_OVERWRITE_RE,
     is_regenerable_path,
 )
 from .git_cmd import _git
-from .porcelain import _porcelain_tracked_dirty_paths
+from .porcelain import _in_tracked_ws_dir, _porcelain_tracked_dirty_paths
 
 log = structlog.get_logger(__name__)
 
@@ -39,12 +40,15 @@ async def restore_regenerable_dirt_or_reject(
     Returns a rejection dict the caller returns verbatim, or None when the
     target is clean / was cleaned and the merge may proceed.
     """
-    ok_st, st_out = await _git(["status", "--porcelain"], workspace_path)
+    ok_st, st_out = await _git(
+        ["-c", "core.quotepath=false", "status", "--porcelain", "-z"],
+        workspace_path,
+    )
     dirty_paths = _porcelain_tracked_dirty_paths(st_out) if ok_st else []
     if not dirty_paths:
         return None
     non_regen = [p for p in dirty_paths if not is_regenerable_path(p)]
-    if non_regen:
+    if non_regen and not all(_in_tracked_ws_dir(p) for p in non_regen):
         return {
             "success": False,
             "reason": "main_dirty",
@@ -62,8 +66,11 @@ async def restore_regenerable_dirt_or_reject(
     in_head = {ln.strip() for ln in (lt_out or "").splitlines() if ln.strip()}
     if not ok_lt:
         in_head = set()
-    in_head_paths = [p for p in dirty_paths if p in in_head]
-    staged_new = [p for p in dirty_paths if p not in in_head]
+    # Workspace docs never get auto-restored or de-staged here — those are
+    # the agent's live contract edits and are committed atomically below.
+    non_ws = [p for p in dirty_paths if not _in_tracked_ws_dir(p)]
+    in_head_paths = [p for p in non_ws if p in in_head]
+    staged_new = [p for p in non_ws if p not in in_head]
     if staged_new:
         ok_rm, rm_out = await _git(
             ["rm", "--cached", "--quiet", "--"] + staged_new, workspace_path
@@ -98,6 +105,56 @@ async def restore_regenerable_dirt_or_reject(
         restored=in_head_paths[:10],
         destaged=staged_new[:10],
     )
+    # Tracked workspace docs (shared/reports/drafts/handoffs) edited directly
+    # on main are legitimate contract updates — auto-commit them before
+    # merging when they are the ONLY non-regenerable dirt (audit P-R: legacy
+    # sync-copy is gone; main-side doc edits must not hard-reject). Any
+    # unrelated staged content is un-staged first so the commit is strictly
+    # the workspace docs.
+    if any(_in_tracked_ws_dir(p) for p in dirty_paths):
+        await _git(["reset", "--quiet"], workspace_path)
+        # Codespell: pathspec for a missing dir errors out — stage only dirs
+        # that exist (tracked ws dirs are created lazily by agents).
+        ws_dirs = [
+            d for d in TRACKED_WS_DIRS
+            if (Path(workspace_path) / d).exists()
+        ]
+        ok_add, add_out = await _git(
+            ["add", "--"] + ws_dirs, workspace_path
+        )
+        if not ok_add:
+            return {
+                "success": False,
+                "reason": "main_dirty",
+                "message": (
+                    "MAIN has workspace-doc dirt but auto-staging failed: "
+                    f"{(add_out or '')[:300]}"
+                ),
+                "branch": branch,
+            }
+        ok_ci, ci_out = await _git(
+            # Identity via -c: adopted legacy repos may lack user.name/email
+            # (audit P2: same口径 as the ignore-migration maintenance commit).
+            ["-c", "user.name=HiveWeave Agent",
+             "-c", "user.email=hiveweave@agent.local",
+             "commit", "-m", "checkpoint: shared workspace docs (main)"],
+            workspace_path,
+        )
+        if not ok_ci:
+            return {
+                "success": False,
+                "reason": "main_dirty",
+                "message": (
+                    "MAIN has workspace-doc dirt but auto-commit failed: "
+                    f"{(ci_out or '')[:300]}"
+                ),
+                "branch": branch,
+            }
+        log.info(
+            "git_worktree.workspace_docs_autocommitted",
+            short_id=short_id,
+            committed=[p for p in dirty_paths if _in_tracked_ws_dir(p)][:10],
+        )
     return None
 
 
