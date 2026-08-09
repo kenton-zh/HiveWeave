@@ -1439,13 +1439,24 @@ class SkillRegistryService:
         与 SkillHub 一致：需要 API key 的技能视为不可用（skills.sh 用
         启发式检测 _skill_md_requires_api_key，SkillHub 用商店标签），
         保证「搜不到」与「绑不上」行为统一。
+
+        双商店 slug 命名空间冲突（「搜得到却绑不上」根因）：sitemap 给
+        全路径 slug（owner/repo/skill），而 SkillHub 只认短名。skills.sh
+        实时 fetch 抖动时全路径首查即败 —— 因此全路径 slug 在两个商店都
+        失败后，用短名（slug.split('/')[-1]）二次 fallback，命中 SkillHub。
         """
-        detail = await self._fetch_skills_sh_detail(slug)
-        if detail is not None and not detail.get("requires_api_key"):
-            return detail, "skills.sh Marketplace"
-        detail = await self._fetch_skillhub_detail(slug)
-        if detail is not None:
-            return detail, SKILLHUB_SOURCE_LABEL
+        candidates = [slug]
+        if "/" in slug:
+            short = slug.split("/")[-1].strip()
+            if short and short != slug:
+                candidates.append(short)
+        for cand in candidates:
+            detail = await self._fetch_skills_sh_detail(cand)
+            if detail is not None and not detail.get("requires_api_key"):
+                return detail, "skills.sh Marketplace"
+            detail = await self._fetch_skillhub_detail(cand)
+            if detail is not None:
+                return detail, SKILLHUB_SOURCE_LABEL
         return None, ""
 
     # ── 公共 API：技能发现 ───────────────────────────────────

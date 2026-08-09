@@ -334,7 +334,10 @@ async def hire_agent_tool(
             return ToolResult.err(
                 f"Invalid skill slugs: {invalid_skills}. "
                 "Use list_available_skills to find valid slugs. "
-                "Raw tech names like 'React 18' are NOT valid slugs."
+                "Raw tech names like 'React 18' are NOT valid slugs. "
+                "If a full path slug (owner/repo/skill) failed, try its "
+                "short name (skill) — the marketplace may resolve it "
+                "via the alternate store."
             )
         skills = valid_skills
 

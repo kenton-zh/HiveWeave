@@ -90,6 +90,101 @@ async def test_resolve_none_when_both_unavailable(monkeypatch):
     assert label == ""
 
 
+# ── 双商店 slug 命名空间冲突：全路径 slug 短名二次 fallback ──
+# 根因（「搜得到却绑不上」现场）：sitemap 缓存存全路径 owner/repo/skill，
+# skills.sh 实时 fetch 抖动时降级 SkillHub，而 SkillHub 只认短名。
+
+
+def _recording_fetch(result_by_slug: dict):
+    """返回 (fake, called) — fake 按 slug 查表返回，called 记录收到的参数。"""
+    calls: list[str] = []
+
+    async def fake(slug):
+        calls.append(slug)
+        return result_by_slug.get(slug)
+
+    return fake, calls
+
+
+@pytest.mark.asyncio
+async def test_resolve_full_path_short_name_fallback_to_skillhub(monkeypatch):
+    """核心回归：skills.sh 全路径失败（抖动）→ 短名 fallback 命中 SkillHub。"""
+    svc = SkillRegistryService()
+    monkeypatch.setattr(svc, "_fetch_skills_sh_detail", _async(None))
+    hub, hub_calls = _recording_fetch({"async-python-patterns": _hub_detail("async-python-patterns")})
+    monkeypatch.setattr(svc, "_fetch_skillhub_detail", hub)
+
+    detail, label = await svc._resolve_marketplace_skill(
+        "wshobson/agents/async-python-patterns"
+    )
+    assert detail is not None and detail["summary"] == "from skillhub"
+    assert label == SKILLHUB_SOURCE_LABEL
+    assert hub_calls == ["wshobson/agents/async-python-patterns", "async-python-patterns"], (
+        "全路径首查失败后必须用短名二次 fallback"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_full_path_short_name_fallback_skips_slashless(monkeypatch):
+    """无 '/' 的 slug 只查一次，不重复。"""
+    svc = SkillRegistryService()
+    sh, sh_calls = _recording_fetch({"frontend": _sh_detail("frontend")})
+    hub, hub_calls = _recording_fetch({})
+    monkeypatch.setattr(svc, "_fetch_skills_sh_detail", sh)
+    monkeypatch.setattr(svc, "_fetch_skillhub_detail", hub)
+
+    detail, label = await svc._resolve_marketplace_skill("frontend")
+    assert detail is not None and label == "skills.sh Marketplace"
+    assert sh_calls == ["frontend"]
+    assert hub_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_full_path_keeps_short_name_hit_before_skillhub(monkeypatch):
+    """短名在 skills.sh 也可达时（技能名=唯一段），仍 skills.sh 优先。"""
+    svc = SkillRegistryService()
+    sh, sh_calls = _recording_fetch({
+        "frontend-design": _sh_detail("frontend-design"),
+    })
+    hub, hub_calls = _recording_fetch({})
+    monkeypatch.setattr(svc, "_fetch_skills_sh_detail", sh)
+    monkeypatch.setattr(svc, "_fetch_skillhub_detail", hub)
+
+    detail, label = await svc._resolve_marketplace_skill("anthropics/skills/frontend-design")
+    assert detail is not None and detail["summary"] == "from skills.sh"
+    assert label == "skills.sh Marketplace"
+    assert hub_calls == ["anthropics/skills/frontend-design"]
+
+
+@pytest.mark.asyncio
+async def test_hire_validation_accepts_full_path_via_short_name(monkeypatch):
+    """现场复刻：list 给全路径 #N，hire 时 skills.sh 抖动 → 不再 invalid。"""
+    svc = SkillRegistryService()
+    monkeypatch.setattr(svc, "_fetch_skills_sh_detail", _async(None))
+    monkeypatch.setattr(
+        svc, "_fetch_skillhub_detail",
+        _async(_hub_detail("async-python-patterns")),
+    )
+
+    assert await _hire_validation_accepts(
+        svc, "wshobson/agents/async-python-patterns"
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_read_skill_full_path_via_short_name(monkeypatch):
+    svc = SkillRegistryService()
+    monkeypatch.setattr(svc, "_fetch_skills_sh_detail", _async(None))
+    monkeypatch.setattr(
+        svc, "_fetch_skillhub_detail",
+        _async(_hub_detail("monday.com-automation")),
+    )
+
+    text = await svc.read_skill("claude-office-skills/skills/monday.com-automation")
+    assert "hub body" in text
+    assert "not found" not in text
+
+
 # ── read_skill 运行时加载（绑定后必须能读到）─────────────────
 
 
