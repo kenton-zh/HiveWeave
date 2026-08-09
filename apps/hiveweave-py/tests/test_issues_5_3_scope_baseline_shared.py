@@ -594,266 +594,45 @@ async def test_scope_state_cache_reuses_probe():
     assert status_calls == 1, "status must be probed once, then cached"
 
 
-# ── #3: contract sharing into worktrees ──────────────────────────────────
+# ── #3: contract sharing into worktrees (tracked semantics, PR-A) ────────
+#
+# Issue #3 was orginally solved by `_sync_shared_contracts` (per-create copy
+# of .hiveweave/shared into each worktree). Since the audit, shared/reports/
+# drafts/handoffs are git-tracked — `git worktree add` carries them natively,
+# so the copy-based sync is gone. These tests pin the replacement contract.
+
+
+def _git(cwd: Path, *args: str) -> None:
+    import subprocess as sp
+    sp.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+           text=True, encoding="utf-8", errors="replace")
 
 
 def test_create_syncs_shared_contracts(tmp_path):
-    """Worktree creation mirrors .hiveweave/shared/ into the worktree."""
-    from hiveweave.services.git_worktree.service_create import CreateMixin
+    """Worktree creation carries tracked .hiveweave/shared/ natively."""
+    from hiveweave.services.git_worktree import GitWorktreeService
+    import asyncio
 
-    svc = CreateMixin()
     ws = tmp_path / "proj"
-    wt = tmp_path / "proj" / ".hiveweave" / "worktrees" / "A001"
+    ws.mkdir()
+    _git(ws, "init", "-b", "main")
+    _git(ws, "config", "user.email", "t@h.l")
+    _git(ws, "config", "user.name", "t")
     src = ws / ".hiveweave" / "shared"
     src.mkdir(parents=True)
     (src / "taskflow-contract.md").write_text("# contract\n", encoding="utf-8")
     (src / "nested").mkdir()
     (src / "nested" / "api.json").write_text("{}", encoding="utf-8")
+    _git(ws, "add", ".hiveweave/shared")
+    _git(ws, "commit", "-m", "contract")
 
-    svc._sync_shared_contracts(str(ws), str(wt))
-
+    gwt = GitWorktreeService()
+    res = asyncio.run(gwt.create(str(ws), "A001", "feat-x"))
+    assert res["success"] is True, res
+    wt = tmp_path / "proj" / ".hiveweave" / "worktrees" / "A001"
     assert (wt / ".hiveweave" / "shared" / "taskflow-contract.md").exists()
     assert (
         wt / ".hiveweave" / "shared" / "nested" / "api.json"
     ).read_text(encoding="utf-8") == "{}"
 
 
-def test_create_sync_shared_noop_when_missing(tmp_path):
-    """No shared dir → no-op, no error, no worktree dir created."""
-    from hiveweave.services.git_worktree.service_create import CreateMixin
-
-    svc = CreateMixin()
-    ws = tmp_path / "proj"
-    wt = tmp_path / "proj" / ".hiveweave" / "worktrees" / "A002"
-
-    svc._sync_shared_contracts(str(ws), str(wt))
-
-    assert not (wt / ".hiveweave" / "shared").exists()
-
-
-# ── #3 edge cases (audit fixes) ─────────────────────────────────────────
-
-
-def _bump_mtime(p: str, seconds_into_future: float) -> None:
-    """Force *p*'s mtime strictly after a prior copy (mtime-granularity-safe)."""
-    import os
-
-    old = os.stat(p).st_mtime
-    os.utime(p, (old, old + seconds_into_future))
-
-
-def test_sync_shared_preserves_newer_local_file(tmp_path):
-    """A worktree-local edit (dst newer than src) must NOT be clobbered."""
-    from hiveweave.services.git_worktree.service_create import CreateMixin
-
-    svc = CreateMixin()
-    ws = tmp_path / "proj"
-    wt = ws / ".hiveweave" / "worktrees" / "A"
-    src = ws / ".hiveweave" / "shared"
-    src.mkdir(parents=True)
-    root_file = src / "contract.md"
-    root_file.write_text("v1", encoding="utf-8")
-
-    svc._sync_shared_contracts(str(ws), str(wt))
-    dst = wt / ".hiveweave" / "shared" / "contract.md"
-    assert dst.read_text(encoding="utf-8") == "v1"
-
-    # Agent edits the copied file locally, then we re-sync.
-    dst.write_text("agent-edit", encoding="utf-8")
-    _bump_mtime(str(dst), 10)  # dst strictly newer than src
-    svc._sync_shared_contracts(str(ws), str(wt))
-
-    assert (
-        dst.read_text(encoding="utf-8") == "agent-edit"
-    ), "worktree-local edit must be preserved, not overwritten"
-
-
-def test_sync_shared_propagates_root_update(tmp_path):
-    """A root-side contract update (src newer) still reaches the worktree."""
-    from hiveweave.services.git_worktree.service_create import CreateMixin
-
-    svc = CreateMixin()
-    ws = tmp_path / "proj"
-    wt = ws / ".hiveweave" / "worktrees" / "A"
-    src = ws / ".hiveweave" / "shared"
-    src.mkdir(parents=True)
-    root_file = src / "contract.md"
-    root_file.write_text("v1", encoding="utf-8")
-
-    svc._sync_shared_contracts(str(ws), str(wt))
-    dst = wt / ".hiveweave" / "shared" / "contract.md"
-    assert dst.read_text(encoding="utf-8") == "v1"
-
-    root_file.write_text("v2", encoding="utf-8")
-    _bump_mtime(str(root_file), 20)  # src strictly newer than dst
-    svc._sync_shared_contracts(str(ws), str(wt))
-
-    assert dst.read_text(encoding="utf-8") == "v2"
-
-
-def test_sync_shared_same_ns_different_size_copies(tmp_path):
-    """#3 P2: same mtime_ns but different content (root update) → copy.
-
-    Two writes within the same nanosecond collapse to the same stamp; the
-    size tie-break must still propagate a root update whose content changed.
-    """
-    import os
-
-    from hiveweave.services.git_worktree.service_create import CreateMixin
-
-    svc = CreateMixin()
-    ws = tmp_path / "proj"
-    wt = ws / ".hiveweave" / "worktrees" / "A"
-    src = ws / ".hiveweave" / "shared"
-    src.mkdir(parents=True)
-    root_file = src / "contract.md"
-    root_file.write_text("v1", encoding="utf-8")
-
-    svc._sync_shared_contracts(str(ws), str(wt))
-    dst = wt / ".hiveweave" / "shared" / "contract.md"
-    assert dst.read_text(encoding="utf-8") == "v1"
-
-    # Root content changes but the mtime_ns is forced to be IDENTICAL to the
-    # dst copy (same ns stamp). Only size differs → must still copy.
-    root_file.write_text("a much longer v2 body", encoding="utf-8")
-    dst_ns = os.stat(dst).st_mtime_ns
-    os.utime(root_file, ns=(dst_ns, dst_ns))
-    svc._sync_shared_contracts(str(ws), str(wt))
-
-    assert (
-        dst.read_text(encoding="utf-8") == "a much longer v2 body"
-    ), "same-ns root update with different size must still propagate"
-
-
-def test_sync_shared_same_ns_same_size_preserves_local(tmp_path):
-    """#3 P2: dst with identical mtime_ns AND size to src → skip (no clobber).
-
-    An unchanged prior copy (or an agent edit that happens to match size) must
-    not be overwritten when the stamps are indistinguishable.
-    """
-    import os
-
-    from hiveweave.services.git_worktree.service_create import (
-        CreateMixin,
-        _copy_if_newer,
-    )
-
-    svc = CreateMixin()
-    ws = tmp_path / "proj"
-    wt = ws / ".hiveweave" / "worktrees" / "A"
-    src = ws / ".hiveweave" / "shared"
-    src.mkdir(parents=True)
-    root_file = src / "contract.md"
-    root_file.write_text("same-size", encoding="utf-8")
-
-    svc._sync_shared_contracts(str(ws), str(wt))
-    dst = wt / ".hiveweave" / "shared" / "contract.md"
-
-    # Force src and dst to the exact same ns + size run of _copy_if_newer.
-    src_ns = os.stat(root_file).st_mtime_ns
-    os.utime(dst, ns=(src_ns, src_ns))
-    os.utime(root_file, ns=(src_ns, src_ns))
-    did_copy = _copy_if_newer(str(root_file), str(dst))
-
-    assert did_copy is False, "indistinguishable stamps must be skipped"
-
-
-def test_sync_shared_preserves_local_added_file(tmp_path):
-    """Repeated sync keeps a worktree-local file that has no root counterpart."""
-    from hiveweave.services.git_worktree.service_create import CreateMixin
-
-    svc = CreateMixin()
-    ws = tmp_path / "proj"
-    wt = ws / ".hiveweave" / "worktrees" / "A"
-    src = ws / ".hiveweave" / "shared"
-    src.mkdir(parents=True)
-    (src / "a.md").write_text("a", encoding="utf-8")
-
-    svc._sync_shared_contracts(str(ws), str(wt))
-    local = wt / ".hiveweave" / "shared" / "agent-notes.md"
-    local.write_text("agent local", encoding="utf-8")
-
-    svc._sync_shared_contracts(str(ws), str(wt))
-
-    assert local.exists(), "worktree-local added file must survive repeat"
-    assert (wt / ".hiveweave" / "shared" / "a.md").exists()
-
-
-def test_sync_shared_skips_symlink(tmp_path):
-    """Symlinks are skipped — external targets are not dereferenced."""
-    import os
-
-    from hiveweave.services.git_worktree.service_create import CreateMixin
-
-    svc = CreateMixin()
-    ws = tmp_path / "proj"
-    wt = ws / ".hiveweave" / "worktrees" / "A"
-    src = ws / ".hiveweave" / "shared"
-    src.mkdir(parents=True)
-    target = tmp_path / "outside.txt"
-    target.write_text("secret", encoding="utf-8")
-    os.symlink(str(target), src / "link.md")
-
-    svc._sync_shared_contracts(str(ws), str(wt))
-
-    dst_link = wt / ".hiveweave" / "shared" / "link.md"
-    assert not dst_link.exists(), "symlink must not be dereferenced into worktree"
-
-
-def test_sync_shared_skips_nested_symlink(tmp_path):
-    """A symlink nested inside a copied directory is also not dereferenced."""
-    import os
-
-    from hiveweave.services.git_worktree.service_create import CreateMixin
-
-    svc = CreateMixin()
-    ws = tmp_path / "proj"
-    wt = ws / ".hiveweave" / "worktrees" / "A"
-    src_dir = ws / ".hiveweave" / "shared" / "bundle"
-    src_dir.mkdir(parents=True)
-    (src_dir / "real.txt").write_text("ok", encoding="utf-8")
-    target = tmp_path / "outside.txt"
-    target.write_text("secret", encoding="utf-8")
-    os.symlink(str(target), src_dir / "leak.md")
-
-    svc._sync_shared_contracts(str(ws), str(wt))
-
-    dst_bundle = wt / ".hiveweave" / "shared" / "bundle"
-    assert (dst_bundle / "real.txt").read_text(encoding="utf-8") == "ok"
-    assert not (
-        dst_bundle / "leak.md"
-    ).exists(), "nested symlink must not be dereferenced into worktree"
-
-
-@pytest.mark.asyncio
-async def test_create_syncs_best_effort_and_calls_shared(tmp_path):
-    """create() wires _sync_shared_contracts and never fails when it throws."""
-    from hiveweave.services.git_worktree.service_create import CreateMixin
-
-    svc = CreateMixin()
-    wt_path = str(tmp_path / "proj" / ".hiveweave" / "worktrees" / "A001")
-    with (
-        patch.object(
-            svc,
-            "_create_unlocked",
-            AsyncMock(
-                return_value={
-                    "success": True,
-                    "path": wt_path,
-                    "branch": "hw/a001",
-                }
-            ),
-        ),
-        patch.object(
-            svc,
-            "_sync_shared_contracts",
-            side_effect=RuntimeError("boom"),
-        ) as sync,
-    ):
-        result = await svc.create(str(tmp_path / "proj"), "a001")
-
-    assert result["success"] is True, "sync failure must not fail the create"
-    sync.assert_called_once()
-    # sync was invoked (via asyncio.to_thread) with workspace + worktree paths.
-    args = sync.call_args.args
-    assert args[1] == wt_path

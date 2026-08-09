@@ -9,6 +9,28 @@ QUARANTINE_DIR = ".hiveweave/worktrees/_quarantine"
 HIVEWEAVE_DIR = ".hiveweave"
 SHARED_DIR = ".hiveweave/shared"
 
+# Agent-visible workspace dirs tracked in git (跨 worktree 可见的共享区).
+# These are NOT gitignored: contracts/reports/drafts/handoffs must survive
+# checkpoints and merges. Everything else under .hiveweave stays private.
+TRACKED_WS_DIRS: tuple[str, ...] = (
+    ".hiveweave/shared",
+    ".hiveweave/reports",
+    ".hiveweave/drafts",
+    ".hiveweave/handoffs",
+)
+
+# .hiveweave dirs that remain platform-private (never tracked, never merged):
+# worktree checkouts, tool outputs, logs. Porcelain dirty-scan and
+# conflict-marker scans must keep ignoring these even though *shared* is now
+# tracked — otherwise merge-gate and marker checks start failing on
+# .hiveweave/worktrees/... (TEST? P-R audit).
+PRIVATE_WS_DIRS: tuple[str, ...] = (
+    ".hiveweave/worktrees",
+    ".hiveweave/tool_outputs",
+    ".hiveweave/logs",
+    ".hiveweave/db",
+)
+
 # P1-1: Generated files that cause predictable merge conflicts.
 # Checkpoint strips these from commits; merge auto-regenerates after landing.
 # "生成物不随提交走" — platform-level enforcement, not prompt-level advice.
