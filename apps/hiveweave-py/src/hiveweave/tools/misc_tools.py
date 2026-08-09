@@ -464,6 +464,40 @@ async def _check_self_merge_gate(
     return None
 
 
+async def _auto_submit_merged_running_tasks(
+    project_id: str,
+    workspace_path: str,
+    *,
+    branch: str,
+    short_id: str | None,
+    merged_by: str,
+    merge_commit: str | None,
+) -> list[str]:
+    """merge 成功后同分支 running 任务自动结转（里程碑主任务死锁治愈）。
+
+    merge 已确认成功（含 noop 已合入），无需再跑 git branch --merged。
+    失败只记日志，绝不中断 merge。
+    """
+    try:
+        from hiveweave.services.git_worktree.service_merge import (
+            auto_submit_running_task_after_merge,
+        )
+
+        _n, titles = await auto_submit_running_task_after_merge(
+            project_id,
+            workspace_path,
+            branch=branch,
+            short_id=short_id,
+            merged_by=merged_by,
+            merge_commit=merge_commit,
+            already_on_main=True,
+        )
+        return titles
+    except Exception as e:
+        log.warning("merge_auto_submit_failed", error=str(e))
+        return []
+
+
 @tool(
     "git_worktree_merge",
     "Merge a worktree branch into main and remove the worktree. "
@@ -703,6 +737,11 @@ async def git_worktree_merge_tool(
             result.get("files") if isinstance(result.get("files"), list) else None
         )
         if result.get("already_up_to_date") and not branch_files:
+            auto_titles = await _auto_submit_merged_running_tasks(
+                project_id, workspace_path,
+                branch=branch or branch_name, short_id=short,
+                merged_by=agent_id, merge_commit=result.get("hash"),
+            )
             try:
                 from hiveweave.services.task import TaskService
 
@@ -713,6 +752,11 @@ async def git_worktree_merge_tool(
                 "message",
                 "Branch already on main (no new commits) — merge noop.",
             )
+            if auto_titles:
+                msg = (
+                    f"{msg} Auto-submitted running task(s): "
+                    f"{', '.join(str(t)[:60] for t in auto_titles)}"
+                )
             return ToolResult.ok(msg)
 
         # TEST16 D2: fulfill merge obligation — merge landed, stop escalation
@@ -730,6 +774,13 @@ async def git_worktree_merge_tool(
                 )
         except Exception as e:
             log.warning("merge_obligation_fulfill_failed", error=str(e))
+
+        # 里程碑主任务结转：同分支 running 任务 merge 后自动 submit
+        auto_titles = await _auto_submit_merged_running_tasks(
+            project_id, workspace_path,
+            branch=branch or branch_name, short_id=short,
+            merged_by=agent_id, merge_commit=result.get("hash"),
+        )
 
         # Post-merge: spawn VERIFY scoped to this merge + nudge on main
         try:
@@ -763,6 +814,11 @@ async def git_worktree_merge_tool(
         except Exception as mig_err:
             log.warning("orphan_migrate_after_merge_failed", error=str(mig_err))
         msg = result.get("message", "Worktree merged and cleaned up")
+        if auto_titles:
+            msg = (
+                f"{msg} Auto-submitted {len(auto_titles)} running task(s): "
+                f"{', '.join(str(t)[:60] for t in auto_titles)}"
+            )
         if nudged:
             msg = (
                 f"{msg} Spawned/nudged {nudged} VERIFY task(s) for this merge "
