@@ -632,19 +632,21 @@ function App() {
             )}
           </div>
           <div className="flex-1 overflow-hidden bg-app-tint">
-            {activeView === "tree" ? <OrgTree /> : activeView === "timeline" ? (
-              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                <TimelineView />
-              </Suspense>
-            ) : activeView === "token" && selectedProjectId ? (
-              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                <TokenUsagePanel key={selectedProjectId} projectId={selectedProjectId} />
-              </Suspense>
-            ) : (
-              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                <OfficeView />
-              </Suspense>
-            )}
+            <div key={activeView} className="hw-tab-in h-full">
+              {activeView === "tree" ? <OrgTree /> : activeView === "timeline" ? (
+                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                  <TimelineView />
+                </Suspense>
+              ) : activeView === "token" && selectedProjectId ? (
+                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                  <TokenUsagePanel key={selectedProjectId} projectId={selectedProjectId} />
+                </Suspense>
+              ) : (
+                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                  <OfficeView />
+                </Suspense>
+              )}
+            </div>
           </div>
         </div>
 
@@ -710,7 +712,9 @@ function App() {
           <div className="flex-1 overflow-hidden">
             {rightPanelTab === "task" && selectedTaskId ? (
               <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                <TaskTimelinePanel key="panel-task" />
+                <div key="panel-task" className="hw-tab-in h-full">
+                  <TaskTimelinePanel />
+                </div>
               </Suspense>
             ) : !selectedAgentId ? (
               <div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-fade-in">
@@ -728,16 +732,36 @@ function App() {
               <>
                 <ChatPanel key="panel-chat" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
                 <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                  {rightPanelTab === "goals" && selectedProjectId && <GoalsPanel key="panel-goals" projectId={selectedProjectId} />}
+                  {rightPanelTab === "goals" && selectedProjectId && (
+                    <div key="panel-goals" className="hw-tab-in h-full">
+                      <GoalsPanel projectId={selectedProjectId} />
+                    </div>
+                  )}
                   {rightPanelTab === "goals" && !selectedProjectId && (
-                    <div key="panel-goals-empty" className="h-full flex items-center justify-center text-g-fg-3 text-sm">
+                    <div key="panel-goals-empty" className="hw-tab-in h-full flex items-center justify-center text-g-fg-3 text-sm">
                       请先选择一个项目
                     </div>
                   )}
-                  {rightPanelTab === "agent" && <AgentDetailPanel key="panel-agent" agentId={selectedAgentId} />}
-                  {rightPanelTab === "monitor" && <MonitorPanel key="panel-monitor" agentId={selectedAgentId} />}
-                  {rightPanelTab === "debug" && <DebugPanel key="panel-debug" />}
-                  {rightPanelTab === "logs" && <WorkLogPanel key="panel-logs" agentId={selectedAgentId} />}
+                  {rightPanelTab === "agent" && (
+                    <div key="panel-agent" className="hw-tab-in h-full">
+                      <AgentDetailPanel agentId={selectedAgentId} />
+                    </div>
+                  )}
+                  {rightPanelTab === "monitor" && (
+                    <div key="panel-monitor" className="hw-tab-in h-full">
+                      <MonitorPanel agentId={selectedAgentId} />
+                    </div>
+                  )}
+                  {rightPanelTab === "debug" && (
+                    <div key="panel-debug" className="hw-tab-in h-full">
+                      <DebugPanel />
+                    </div>
+                  )}
+                  {rightPanelTab === "logs" && (
+                    <div key="panel-logs" className="hw-tab-in h-full">
+                      <WorkLogPanel agentId={selectedAgentId} />
+                    </div>
+                  )}
                 </Suspense>
               </>
             )}

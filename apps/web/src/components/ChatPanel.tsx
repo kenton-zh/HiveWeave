@@ -417,7 +417,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             </svg>
           </button>
           {teamCommsExpanded && (
-            <div className="max-h-[35vh] overflow-y-auto overflow-x-hidden py-1">
+            <div className="hw-sec-in max-h-[35vh] overflow-y-auto overflow-x-hidden py-1">
               {[...teamMessages]
                 .sort((a, b) => b.timestamp - a.timestamp)
                 .map((msg) => {
