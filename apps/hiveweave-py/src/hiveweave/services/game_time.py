@@ -1218,6 +1218,19 @@ class GameTimeService:
                 continue
             if not _cooled(f"stall:{tid}", TASK_STALL_COOLDOWN_MS):
                 continue
+            # 里程碑主任务死锁治愈：running 任务的分支已合入 main → 自动
+            # submit，不再发 [TASK STALL]（submitted 后 review 义务接管）。
+            if status == "running":
+                if _cooled(f"auto-submit-merged:{tid}", TASK_STALL_COOLDOWN_MS):
+                    if await _auto_submit_stalled_running_task_if_merged(
+                        project_id, t, by_id
+                    ):
+                        task_stall_counts.pop(tid, None)
+                        log.info(
+                            "task_stall_auto_submitted_merged",
+                            project_id=project_id, task_id=tid,
+                        )
+                        continue
             title = (t.get("title") or "(untitled)").split("\n")[0][:50]
             progress = t.get("progress")
             stall_count = task_stall_counts.get(tid, 0) + 1
@@ -2269,3 +2282,44 @@ class GameTimeService:
         day = game_seconds // GAME_SECONDS_PER_DAY
         rem = game_seconds % GAME_SECONDS_PER_DAY
         return f"Day {day} {rem // 3600:02d}:{(rem % 3600) // 60:02d}"
+
+
+async def _auto_submit_stalled_running_task_if_merged(
+    project_id: str,
+    task: dict,
+    by_id: dict[str, dict],
+) -> bool:
+    """running 滞留任务的分支已合入 main → 自动 submit（里程碑结转治愈）。
+
+    只处理稳定命名分支 hw/<sid>/t-<taskid8>；分支不存在 / 未合入 /
+    任务非 running → False，维持原 [TASK STALL] 催办。失败仅记日志。
+    """
+    tid = str(task.get("id") or "")
+    assignee = task.get("assignee_id")
+    agent = by_id.get(str(assignee or "")) or {}
+    short_id = (agent.get("short_id") or "").strip()
+    if not tid or not short_id:
+        return False
+    try:
+        workspace = await meta_db.get_project_workspace(project_id)
+        if not workspace:
+            return False
+        from hiveweave.services.git_worktree import compute_branch_name
+        from hiveweave.services.git_worktree.service_merge import (
+            auto_submit_running_task_after_merge,
+        )
+
+        branch = compute_branch_name(short_id, tid)
+        n, _titles = await auto_submit_running_task_after_merge(
+            project_id,
+            workspace,
+            branch=branch,
+            short_id=short_id,
+            merged_by="system",
+            merge_commit=None,
+            already_on_main=False,
+        )
+        return n > 0
+    except Exception as e:
+        log.warning("task_stall_auto_submit_failed", task_id=tid, error=str(e))
+        return False

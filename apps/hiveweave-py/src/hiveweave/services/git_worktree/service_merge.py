@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -720,3 +721,132 @@ class MergeMixin:
         if verification_errors:
             result["verification_warnings"] = verification_errors
         return result
+
+
+# ── merge → 任务结转：同分支 running 任务自动置 submitted ─────
+# 里程碑主任务死锁（owner 自营任务 merge 完成但永不 submit）根因：
+# merge 成功路径只处理 approved/verifying（VERIFY spawn），running 任务
+# 无结转钩子。分支↔任务可精确反查（稳定命名 hw/<sid>/t-<taskid8>），
+# 且 running → submitted 是唯一合法转换（tasks/constants.py），天然保守。
+
+_TASK_BRANCH_RE = re.compile(r"^hw/([^/]+)/t-([0-9a-fA-F]{8})$")
+
+
+async def auto_submit_running_task_after_merge(
+    project_id: str,
+    workspace_path: str,
+    *,
+    branch: str,
+    short_id: str | None = None,
+    merged_by: str,
+    merge_commit: str | None = None,
+    already_on_main: bool = False,
+) -> tuple[int, list[str]]:
+    """merge 成功（或分支已合入 main）后，同分支的 running 任务自动 submit。
+
+    - 仅处理稳定命名分支 ``hw/<sid>/t-<taskid8>``（legacy slug 分支无法
+      可靠反查任务，跳过）。
+    - 候选任务：id 前 8 位 == 分支前缀 + status == "running" + assignee ==
+      分支 owner。非 running 不动（created/claimed 无合法 → submitted 转换）。
+    - ``already_on_main=False`` 时先跑 ``git branch --merged`` 确认分支已
+      合入 main，避免未合入误提交。
+    - submit 走 TaskService.submit_task（自带 reviewer pinning + review
+      obligation 激活），任何失败只记日志，绝不回滚/中断 merge。
+
+    Returns ``(submitted 数, 任务标题列表)``。
+    """
+    m = _TASK_BRANCH_RE.match(branch or "")
+    if not m:
+        return 0, []
+    branch_sid = m.group(1)
+    prefix8 = m.group(2).lower()
+    if short_id and short_id.upper() != branch_sid.upper():
+        log.info(
+            "git_worktree.auto_submit_branch_sid_wins",
+            branch=branch, short_id=short_id, branch_sid=branch_sid,
+        )
+
+    if not already_on_main:
+        base = await _resolve_base_branch(workspace_path) or "main"
+        ok, out = await _git(
+            ["branch", "--merged", base, "--list", branch], workspace_path
+        )
+        merged = ok and any(
+            line.strip() == branch
+            for line in (out or "").splitlines()
+            if line.strip()
+        )
+        if not merged:
+            return 0, []
+
+    try:
+        from hiveweave.services.org import OrgService
+
+        agents = await OrgService().list_agents(project_id)
+        owner_id = next(
+            (
+                a.get("id")
+                for a in agents
+                if (a.get("short_id") or "").upper() == branch_sid.upper()
+            ),
+            None,
+        )
+    except Exception as e:
+        log.warning("git_worktree.auto_submit_owner_resolve_failed",
+                    branch=branch, error=str(e))
+        return 0, []
+    if not owner_id:
+        log.info("git_worktree.auto_submit_owner_missing",
+                 branch=branch, short_id=branch_sid)
+        return 0, []
+
+    try:
+        from hiveweave.services.task import TaskService
+
+        ts = TaskService()
+        tasks = await ts.list_tasks(project_id)
+    except Exception as e:
+        log.warning("git_worktree.auto_submit_task_query_failed",
+                    branch=branch, error=str(e))
+        return 0, []
+
+    candidates = [
+        t
+        for t in tasks
+        if str(t.get("id") or "").lower().startswith(prefix8)
+        and t.get("status") == "running"
+        and str(t.get("assignee_id") or "") == str(owner_id)
+    ]
+    if not candidates:
+        return 0, []
+
+    now_ms = int(time.time() * 1000)
+    submitted: list[str] = []
+    submitted_ids: list[str] = []
+    for t in candidates:
+        tid = t.get("id")
+        if not tid:
+            continue
+        evidence = {
+            "merged_by": merged_by,
+            "merge_commit": merge_commit,
+            "merged_at": now_ms,
+            "auto_submitted_by_merge": True,
+        }
+        try:
+            await ts.submit_task(project_id, tid, evidence)
+        except Exception as e:
+            log.warning(
+                "git_worktree.auto_submit_task_failed",
+                task_id=tid, branch=branch, error=str(e),
+            )
+            continue
+        submitted.append(str(t.get("title") or tid))
+        submitted_ids.append(str(tid)[:8])
+    if submitted:
+        log.info(
+            "git_worktree.auto_submitted_running_tasks",
+            project_id=project_id, branch=branch, count=len(submitted),
+            task_ids=submitted_ids,
+        )
+    return len(submitted), submitted
