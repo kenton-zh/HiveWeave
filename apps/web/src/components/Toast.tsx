@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAppStore } from "../store";
 import type { ToastType } from "../store";
 
@@ -36,21 +37,81 @@ const STYLES: Record<ToastType, { bg: string; border: string; icon: string; icon
   },
 };
 
+const AUTO_DISMISS_MS: Record<ToastType, number> = {
+  info: 4000,
+  success: 4000,
+  warning: 4000,
+  error: 6000,
+};
+
+const EXIT_MS = 180;
+
 export default function ToastContainer() {
   const toasts = useAppStore((s) => s.toasts);
   const dismissToast = useAppStore((s) => s.dismissToast);
+  const [leaving, setLeaving] = useState<ReadonlySet<string>>(new Set());
+  const timersRef = useRef<Map<string, number>>(new Map());
 
-  if (toasts.length === 0) return null;
+  const exit = useCallback(
+    (id: string) => {
+      setLeaving((prev) => {
+        if (prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+      window.setTimeout(() => {
+        dismissToast(id);
+        setLeaving((prev) => {
+          if (!prev.has(id)) return prev;
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }, EXIT_MS);
+    },
+    [dismissToast],
+  );
+
+  useEffect(() => {
+    for (const t of toasts) {
+      if (!timersRef.current.has(t.id)) {
+        timersRef.current.set(
+          t.id,
+          window.setTimeout(() => exit(t.id), AUTO_DISMISS_MS[t.type] ?? 4000),
+        );
+      }
+    }
+    for (const id of [...timersRef.current.keys()]) {
+      if (!toasts.some((t) => t.id === id)) {
+        window.clearTimeout(timersRef.current.get(id));
+        timersRef.current.delete(id);
+      }
+    }
+  }, [toasts, exit]);
+
+  useEffect(
+    () => () => {
+      for (const timer of timersRef.current.values()) window.clearTimeout(timer);
+      timersRef.current.clear();
+    },
+    [],
+  );
+
+  if (toasts.length === 0 && leaving.size === 0) return null;
 
   return (
     <div className="fixed top-4 right-4 z-[100] flex flex-col gap-2.5 max-w-sm w-full pointer-events-none">
       {toasts.map((t, i) => {
         const s = STYLES[t.type] ?? STYLES.info;
+        const isLeaving = leaving.has(t.id);
         return (
           <div
             key={t.id}
-            className={`pointer-events-auto relative overflow-hidden flex items-start gap-3 pl-4 pr-3 py-3 rounded-gmLg border ${s.bg} ${s.border} shadow-gm-pop backdrop-blur-md animate-slide-in-right`}
-            style={{ animationDelay: `${Math.min(i, 4) * 40}ms` }}
+            className={`pointer-events-auto relative overflow-hidden flex items-start gap-3 pl-4 pr-3 py-3 rounded-gmLg border ${s.bg} ${s.border} shadow-gm-pop backdrop-blur-md ${
+              isLeaving ? "hw-toast-leave pointer-events-none" : "animate-slide-in-right"
+            }`}
+            style={{ animationDelay: isLeaving ? "0ms" : `${Math.min(i, 4) * 40}ms` }}
             role="alert"
             data-testid="toast"
             data-toast-type={t.type}
@@ -67,7 +128,7 @@ export default function ToastContainer() {
               {t.message}
             </p>
             <button
-              onClick={() => dismissToast(t.id)}
+              onClick={() => exit(t.id)}
               className="text-g-fg-4 hover:text-g-fg hover:bg-g-bg-muted rounded-full w-6 h-6 flex items-center justify-center transition-all text-base leading-none shrink-0 active:scale-90"
               aria-label="关闭"
             >

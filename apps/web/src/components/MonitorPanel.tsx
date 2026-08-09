@@ -83,7 +83,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
             💭 思考过程 ({thinking.length} chars)
           </summary>
           {showThinking && (
-            <div className="mt-1 ml-4 pl-2 border-l-2 border-purple-200 text-[10px] text-purple-500 whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed">
+            <div className="hw-sec-in mt-1 ml-4 pl-2 border-l-2 border-purple-200 text-[10px] text-purple-500 whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed">
               {thinking}
             </div>
           )}

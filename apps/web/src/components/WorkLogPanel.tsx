@@ -593,7 +593,7 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
 
       {/* Log Content */}
       {isOpen && (
-        <div className="max-h-80 overflow-y-auto border-t border-g-border">
+        <div className="hw-sec-in max-h-80 overflow-y-auto border-t border-g-border">
           {loading ? (
             <div className="px-6 py-4 flex justify-center">
               <div className="flex gap-1">

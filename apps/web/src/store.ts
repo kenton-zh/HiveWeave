@@ -505,13 +505,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const toast: ToastItem = { id, message, type, createdAt: Date.now() };
     set({ toasts: [...get().toasts, toast] });
-    // Auto-dismiss after 4s for non-error, 6s for error
-    const ttl = type === "error" ? 6000 : 4000;
-    setTimeout(() => {
-      const cur = get().toasts;
-      const next = cur.filter((t) => t.id !== id);
-      if (next.length !== cur.length) set({ toasts: next });
-    }, ttl);
+    // Auto-dismiss TTL + exit animation are owned by ToastContainer (store stays pure).
   },
   dismissToast: (id) => set({ toasts: get().toasts.filter((t) => t.id !== id) }),
   // Debug logs
