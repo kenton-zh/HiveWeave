@@ -5,6 +5,7 @@ fire alarms, detect stalls. Absolute time model. Cooldown in-memory (A5).
 """
 
 import asyncio
+import json
 import os
 import shlex
 import time
@@ -86,6 +87,47 @@ _states: dict[str, dict] = {}          # project_id → state
 _alarm_project: dict[str, str] = {}    # alarm_id → project_id
 # BUG-6: projects whose workspace vanished (deleted) — stop tick + quiet API spam
 _tombstoned_projects: set[str] = set()
+
+
+# P2-5 (slack-clone_01)：BLOCKED STALE 的 upstream 状态分组。
+# 已交付进审查管线 / 终态 —— blocked 方无可行动，催办是纯噪声
+# （毛糙点：upstream 已 submit 却仍收到 stale 催办）。
+_UPSTREAM_DELIVERED_OR_DONE = frozenset(
+    {"submitted", "reviewing", "approved", "verifying", "closed"}
+)
+
+
+def upstream_nudge_relevant(task: dict, by_id: dict[str, dict]) -> bool:
+    """P2-5: BLOCKED STALE 是否值得发 —— 只看 structured upstream 引用。
+
+    - 无 upstream 引用（手动 blocked / wait contract）→ True（维持现状催办）；
+    - 任一 upstream 处于交付前状态（created/claimed/running/rework/blocked），
+      或已 archived，或行缺失（需重新定向/升级）→ True；
+    - 全部 upstream 已交付（submitted…closed，复审管线在走）→ False。
+    """
+    deps = task.get("depends_on") or []
+    if isinstance(deps, str):
+        try:
+            deps = json.loads(deps)
+        except (json.JSONDecodeError, TypeError):
+            deps = []
+    if not isinstance(deps, list):
+        deps = []
+    refs = {str(d) for d in deps if d}
+    reason = (task.get("blocked_reason") or "").strip()
+    if reason.lower().startswith("dependency:"):
+        reason_l = reason.lower()
+        for uid in by_id:
+            uid_l = uid.lower()
+            if uid_l in reason_l or uid_l[:8] in reason_l:
+                refs.add(uid)
+    if not refs:
+        return True
+    for ref in refs:
+        status = ((by_id.get(ref) or {}).get("status") or "").lower()
+        if status not in _UPSTREAM_DELIVERED_OR_DONE:
+            return True
+    return False
 
 
 def mark_project_tombstoned(project_id: str) -> None:
@@ -1477,6 +1519,7 @@ class GameTimeService:
         inbox = InboxService()
         agents = await OrgService().list_agents(project_id)
         by_id = {a.get("id"): a for a in agents if a.get("id")}
+        by_task_id = {str(t.get("id")): t for t in tasks if t.get("id")}
 
         # Batch live waits once (avoid per-task list_active N+1)
         live_wait_agents: set[str] = set()
@@ -1503,6 +1546,10 @@ class GameTimeService:
             since_duty = max(0, now_ms - session_start)
             age = min(wall, since_duty)
             if age < BLOCKED_STALE_MS:
+                continue
+            # P2-5: upstream 全部已交付（submitted…closed）时 blocked 方无可
+            # 行动，跳过 stale 催办；仍有交付前/失联 upstream 或无引用时才催。
+            if not upstream_nudge_relevant(t, by_task_id):
                 continue
             if str(assignee) in live_wait_agents:
                 continue

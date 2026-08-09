@@ -405,6 +405,8 @@ def _validate_command_safety(command: str) -> tuple[bool, str]:
         return True, plat_err
     from hiveweave.tools.security import is_sensitive_path
     # Bug C fix: 只检查命令中的文件路径参数，不检查整个命令字符串
+    # 目标型护栏（敏感文件 / .hiveweave）先于命令模式护栏：同一命令多重命中时
+    # 报更具体、更可行动的原因（如 rm -rf .hiveweave 报系统目录而非 rm-rf 提示）。
     file_paths = _extract_file_paths_from_command(command)
     for fp in file_paths:
         if is_sensitive_path(fp):
@@ -415,6 +417,13 @@ def _validate_command_safety(command: str) -> tuple[bool, str]:
         return True, ("Command targets `.hiveweave` system directory. "
                       "System files (data.db, tool_outputs/) are managed by "
                       "HiveWeave internals.")
+    # slack-clone_01 P0: 命令模式护栏（taskkill //IM / rm -rf / pkill …）
+    # + 受保护 PID 硬层。ask 无在线审批 → 降级 deny + 疏通提示。
+    from hiveweave.services.command_guard import evaluate_command
+
+    verdict = evaluate_command(command)
+    if verdict.blocked:
+        return True, f"Command blocked: {verdict.reason}"
     return False, ""
 
 

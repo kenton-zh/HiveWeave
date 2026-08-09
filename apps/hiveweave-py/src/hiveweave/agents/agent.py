@@ -473,6 +473,7 @@ class Agent:
             self._cancel_reason = None
             self.empty_retry_count = 0
             self._cancel_productive_continue()
+            self._cancel_interrupted_resume()
             source = (opts or {}).get("source") or ""
             # External wakes refill slice budget; gate/reminder/productive
             # continue turns do not (ADR-002 + audit P1-3).
@@ -480,6 +481,7 @@ class Agent:
                 "turn_exit_gate",
                 "open_task_reminder",
                 "productive_continue",
+                "interrupted_resume",
             ):
                 self._slice_budget = self._SLICE_BUDGET_MAX
                 # New wake: allow [TASK ADVANCE] again; clear explicit 不推进
@@ -680,6 +682,7 @@ class Agent:
             is_off_duty = reason == OFF_DUTY_CANCEL_REASON
             self._cancel_safety_timer()
             self._cancel_productive_continue()
+            self._cancel_interrupted_resume()
 
             if self._llm_task and not self._llm_task.done():
                 self._llm_task.cancel()
@@ -1647,6 +1650,78 @@ class Agent:
         log.info(
             "productive_continue_armed",
             agent_id=self.id,
+            delay_s=delay,
+        )
+
+    def _cancel_interrupted_resume(self) -> None:
+        t = getattr(self, "_interrupted_resume_timer", None)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+            self._interrupted_resume_timer = None
+
+    def _arm_interrupted_resume(self, task_refs: list[str]) -> None:
+        """slack-clone_01 P1-3: STALL BREAK 未停泊且名下有 running 任务时，
+        延迟补偿唤醒一次。
+
+        缺口：首轮 stall break 后 agent 直接 idle，running 任务冻结到 20min
+        task-stall 催办才动（A020 M6 卡 30min）。这里 ~45s 后唤醒，引导
+        agent 先核实磁盘/账本状态再续跑或收口。已停泊（parked）不进入此路径。
+        """
+        if not task_refs:
+            return
+        if not hasattr(self, "_interrupted_resume_timer"):
+            self._interrupted_resume_timer = None
+        if not hasattr(self, "_INTERRUPTED_RESUME_DELAY_S"):
+            self._INTERRUPTED_RESUME_DELAY_S = 45.0
+        self._cancel_interrupted_resume()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        delay = float(self._INTERRUPTED_RESUME_DELAY_S)
+        refs_blob = ", ".join(task_refs[:8])
+
+        def _fire() -> None:
+            self._interrupted_resume_timer = None
+            if self.status != AgentState.IDLE:
+                return
+            if self.disposition == "blocked":
+                # 补偿期内被停泊/升级 —— 不唤醒，避免与 park 语义打架
+                return
+            hint = (
+                f"[TASK INTERRUPTED] Previous turn ended early (tool-loop "
+                f"stall). Tasks still running under you: {refs_blob}. "
+                f"Verify current state from disk/ledger first, then resume "
+                f"with smaller steps; commit_turn(in_progress) to keep "
+                f"working, or commit_turn(waiting/blocked) with a ref if "
+                f"external input is needed."
+            )
+            log.info(
+                "interrupted_resume_wake",
+                agent_id=self.id,
+                task_refs=task_refs[:8],
+                delay_s=delay,
+            )
+            asyncio.create_task(
+                self.chat(
+                    hint,
+                    opts={
+                        "trigger": True,
+                        "is_background": True,
+                        "source": "interrupted_resume",
+                    },
+                ),
+                name=f"agent-{self.id}-interrupted-resume",
+            )
+
+        self._interrupted_resume_timer = loop.call_later(delay, _fire)
+        log.info(
+            "interrupted_resume_armed",
+            agent_id=self.id,
+            task_refs=task_refs[:8],
             delay_s=delay,
         )
 

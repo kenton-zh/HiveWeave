@@ -224,6 +224,16 @@ async def lifespan(app: FastAPI):
     _assert_log_vital_sign()
     log.info("app_starting", port=settings.port, code_version=_code_version())
 
+    # 0. slack-clone_01 P0-2: 登记平台宿主进程保护集（自身 + 祖先链 +
+    #    HIVEWEAVE_PROTECTED_PIDS）。kill 族命令命中受保护 PID 一律 deny，
+    #    不受规则开关影响（底线层，防 taskkill //PID 误杀后端）。
+    try:
+        from hiveweave.services.command_guard import init_process_protection
+
+        init_process_protection()
+    except Exception as e:
+        log.warning("command_guard_init_failed", error=str(e))
+
     # 1. Init Meta DB
     # Security/Fail-fast: Meta DB 是整个系统的基石 — 路由表、projects、llm_models
     # 都在这里。初始化失败若继续运行会导致 agent 路由错乱、写入丢失、沉默故障。
