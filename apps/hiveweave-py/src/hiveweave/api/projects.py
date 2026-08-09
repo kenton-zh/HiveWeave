@@ -107,6 +107,101 @@ def _build_charter_dict(body: ProjectCreate) -> dict:
     }
 
 
+def _probe_existing_project_id(ws: Path) -> str | None:
+    """探测 workspace 是否已含可收养的 per-project 数据（跨机搬迁场景）。
+
+    ``.hiveweave/data.db`` 存在且带 ``agents`` 表时，说明该工作区是
+    "从别的机器复制/迁移过来的已有项目"：返回其记录的 project_id，
+    后续以该 id 收养整个数据（团队/聊天/记忆/任务）而不是删库重建。
+
+    不可收养的情况返回 None（保持原"残留清理 + 全新初始化"行为）：
+    - 无 ``.hiveweave/data.db``（全新目录）
+    - 文件是合法 sqlite 但非 HiveWeave 库（无 agents 表或 project_id 全空）
+
+    读取失败（文件锁/损坏/权限）则**抛出异常**——调用方应中止创建而不是
+    误走清理删除路径（收养语义下"测不出 = 不删"）。
+    """
+    db_file = ws / ".hiveweave" / "data.db"
+    if not db_file.exists():
+        return None
+    from hiveweave.db.project import _sqlite_readonly_uri
+
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(_sqlite_readonly_uri(str(db_file)), uri=True)
+    except Exception:
+        log.warning("probe_existing_project_open_failed",
+                    workspace=str(ws), db_file=str(db_file))
+        raise
+    try:
+        tables = {
+            r[0]
+            for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        if "agents" not in tables:
+            return None
+        if "project_meta" in tables:
+            row = con.execute(
+                "SELECT project_id FROM project_meta LIMIT 1"
+            ).fetchone()
+            if row and row[0]:
+                return str(row[0])
+        row = con.execute(
+            "SELECT project_id FROM agents "
+            "WHERE project_id IS NOT NULL AND project_id != '' LIMIT 1"
+        ).fetchone()
+        return str(row[0]) if row and row[0] else None
+    finally:
+        con.close()
+
+
+async def _sync_project_id_in_workspace(ws: Path, old_id: str, new_id: str) -> None:
+    """把 workspace 内散落各表的旧 project_id 全部改写为新 id。
+
+    仅在收养的 project_id 与本机 Meta 已有项目 id 撞车（UUID 碰撞，概率可忽略）
+    时的兜底：此时不能沿用 old_id，需把 agents/project_meta/tasks 等
+    所有带 project_id 列的表统一迁移到新 id，保证数据归属一致。
+
+    整段迁移包在 BEGIN IMMEDIATE 单事务里，任一步失败即全量回滚，
+    避免"部分表已改、部分未改"的半迁移状态落盘。
+    """
+    # 审计 F5：共享连接上必须持 per-workspace 写锁再 BEGIN IMMEDIATE——
+    # 否则同连接其他协程的 COMMIT/rollback 会提前终止/回滚本事务
+    # （"cannot start a transaction within a transaction" 实证），
+    # 半迁移状态可能落盘。与 project_db.execute_transaction 同一不变式。
+    lock = await project_db.get_workspace_write_lock(str(ws))
+    async with lock:
+        conn = await project_db.ensure_project_db(str(ws))
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+            tables = [r[0] for r in await cursor.fetchall()]
+            await cursor.close()
+            for t in tables:
+                # 表名白名单校验（来自 sqlite_master，防引号表名注入）
+                if not t or not all(c.isalnum() or c == "_" for c in t):
+                    continue
+                cols = await conn.execute(f'PRAGMA table_info("{t}")')
+                col_names = [r[1] for r in await cols.fetchall()]
+                await cols.close()
+                if "project_id" in col_names:
+                    await conn.execute(
+                        f'UPDATE "{t}" SET project_id = ? WHERE project_id = ?',
+                        [new_id, old_id],
+                    )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
+
 def _expand_windows_env_vars(path: str) -> str:
     """Expand only %VAR% patterns (Windows cmd.exe syntax).
 
@@ -415,6 +510,8 @@ async def create_project(body: ProjectCreate) -> dict:
     - 确保工作空间目录存在（含 .hiveweave/）
     - 初始化 per-project DB（schema）
     - 自动创建 CEO 归零 + HR 天线两个初始角色
+    - 收养路径：workspace 已含 .hiveweave/data.db（搬迁/拷贝来的项目）时，
+      沿用其 project_id 与全部数据，不删除不重建，响应带 adopted=true。
     """
     workspace = body.workspacePath
     # R2 fix: 校验 workspace_path 安全性（绝对路径 + 无 .. 穿越段）
@@ -441,11 +538,44 @@ async def create_project(body: ProjectCreate) -> dict:
     # 清除可能的旧驱逐标记 — 同路径重建项目时恢复 DB 访问
     project_db.clear_evicted_workspace(str(ws))
 
+    # ── 收养已存在的平台数据（跨机器搬迁/整目录拷贝）────────────
+    # 若 workspace 已含 .hiveweave/data.db（老机器上跑过的项目），
+    # 收养其整个状态：沿用原 project_id、不移除任何数据文件，
+    # 相当于"搬过来之后直接恢复"（agents/聊天/记忆/任务全部保留）。
+    # 只有 _probe 确认无可收养数据时才走下面的"残留清理 + 全新初始化"。
+    # 墓碑：本机删除过该 workspace 的项目且曾残留数据 → 同路径重建应为
+    # 全新项目，不收养（避免"已删除的项目被复活"）。
+    adopted_project_id = None
+    tombstone_key = f"purged_ws:{ws_normalized}"
+    tomb = await meta_db.query_one(
+        "SELECT value FROM meta_index WHERE key = ?", [tombstone_key]
+    )
+    if tomb is None:
+        try:
+            adopted_project_id = _probe_existing_project_id(ws)
+        except Exception as e:
+            log.error(
+                "probe_existing_project_failed",
+                workspace=str(ws),
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="检测到工作区已有 .hiveweave/data.db 但无法读取"
+                       f"（可能被占用或损坏），已中止以避免误删原数据: {e}",
+            )
+    else:
+        log.info(
+            "adoption_skipped_purged_workspace",
+            workspace=str(ws),
+            tombstone=tombstone_key,
+        )
+
     # 修复：如果旧 .hiveweave 目录残留（删除项目时 rmtree 可能因 Windows 文件锁失败），
     # 先 evict 旧 aiosqlite 连接再 rmtree，防止旧 data.db 污染新项目。
     # 症状：旧 agents/chat_messages 残留，新 agent 数据写入 aiosqlite 内存但 commit 不落盘。
     hw_old = ws / ".hiveweave"
-    if hw_old.exists():
+    if hw_old.exists() and adopted_project_id is None:
         try:
             await project_db.evict_project_db(str(ws))
         except Exception:
@@ -532,7 +662,35 @@ async def create_project(body: ProjectCreate) -> dict:
         # 非致命 — 项目仍可正常工作，只是 worktree 功能不可用
 
     charter = _build_charter_dict(body)
+    # ── 收养路径的 id 决策 ─────────────────────────────────────
+    # 正常收养：沿用旧 project_id（数据表全部无需迁移）。
+    # 兜底：若该 id 竟与本机已有项目冲突（UUID 碰撞，概率可忽略），
+    # 生成新 id，并把工作区内所有表的 project_id 同步迁移过去。
     project_id = str(uuid.uuid4())
+    if adopted_project_id:
+        conflict = await meta_db.query_one(
+            "SELECT id FROM projects WHERE id = ?", [adopted_project_id]
+        )
+        if conflict:
+            log.warning(
+                "adopt_project_id_conflict",
+                workspace=str(ws),
+                adopted_id=adopted_project_id,
+            )
+            try:
+                await _sync_project_id_in_workspace(
+                    ws, adopted_project_id, project_id
+                )
+            except Exception as e:
+                log.error(
+                    "adopt_sync_project_id_failed", workspace=str(ws), error=str(e)
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"收养项目数据迁移失败: {e}",
+                )
+        else:
+            project_id = adopted_project_id
     now_ms = int(time.time() * 1000)
 
     try:
@@ -550,6 +708,14 @@ async def create_project(body: ProjectCreate) -> dict:
         log.error("create_project_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to create project")
 
+    # 清除旧墓碑 — 该 workspace 已重新登记为项目
+    try:
+        await meta_db.execute(
+            "DELETE FROM meta_index WHERE key = ?", [tombstone_key]
+        )
+    except Exception:
+        pass
+
     # 自动创建默认 agent
     import sys
     sys.stderr.write(f"[CREATE] calling _seed_default_agents for project={project_id}\n")
@@ -560,10 +726,12 @@ async def create_project(body: ProjectCreate) -> dict:
 
     # 写入 per-project 元数据到 project_meta 表
     # (description, org_paradigm, charter_json, language 等字段从 Meta DB 迁移到 per-project DB)
+    # 收养路径：project_meta 已存在（含旧 charter/language/game_time 进度）— INSERT OR IGNORE 保留原样
     try:
         conn = await project_db.ensure_project_db(str(ws))
         await conn.execute(
-            "INSERT INTO project_meta (project_id, description, org_paradigm, "
+            "INSERT " + ("OR IGNORE " if adopted_project_id else "") +
+            "INTO project_meta (project_id, description, org_paradigm, "
             "charter_json, goals_json, language, game_time_accumulated_seconds, "
             "updated_at) VALUES (?, ?, ?, ?, '[]', ?, 0, ?)",
             [
@@ -608,10 +776,22 @@ async def create_project(body: ProjectCreate) -> dict:
     if meta:
         # project_meta 的字段覆盖 row 中的同名字段 (description, charter_json 等)
         row_dict.update({k: v for k, v in meta.items() if k != "project_id"})
-    log.info("project_created", project_id=project_id, name=body.name, workspace=str(ws))
+    if adopted_project_id:
+        log.info(
+            "project_adopted",
+            project_id=project_id,
+            name=body.name,
+            workspace=str(ws),
+            adopted_from=adopted_project_id,
+            # P2: 请求体中的 description/charter/language 等字段在收养路径被保留旧值忽略
+            ignored_fields=["charter", "description", "language", "orgParadigm"],
+        )
+    else:
+        log.info("project_created", project_id=project_id, name=body.name, workspace=str(ws))
     return {
         "project": _project_response(row_dict),
         "mainAgentId": agent_ids[0] if agent_ids else None,
+        "adopted": adopted_project_id is not None,
     }
 
 
@@ -795,6 +975,26 @@ async def _deferred_cleanup_hiveweave(hw_dir: str, project_id: str) -> None:
             log.info("deferred_cleanup_success",
                      hw_dir=hw_dir, project_id=project_id, attempts=i + 1)
             return
+        # 收养保护：该 workspace 若已被重新登记为项目（用户删除后立刻重建/
+        # 收养了同目录数据），立即中止清理 — 否则会二次销毁刚收养的全部数据。
+        # 审计 F6：与墓碑键/唯一性检查同一归一化口径（小写 + 统一分隔符），
+        # 防 Windows 大小写不敏感下路径大小写不同导致精确匹配失效 → 误删。
+        try:
+            parent = str(_Path(hw).parent).replace("\\", "/").lower()
+            row = await meta_db.query_one(
+                "SELECT id FROM projects WHERE workspace_path = ? "
+                "OR workspace_path = ?",
+                [str(_Path(hw).parent), parent],
+            )
+            if row:
+                log.info(
+                    "deferred_cleanup_aborted_project_recreated",
+                    hw_dir=hw_dir, old_project_id=project_id,
+                    recreated_project_id=row["id"],
+                )
+                return
+        except Exception:
+            pass
         try:
             _shutil.rmtree(hw, ignore_errors=True)
             if not hw.exists():
@@ -914,6 +1114,19 @@ async def delete_project(project_id: str) -> dict:
     except Exception as e:
         log.error("delete_project_failed", project_id=project_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to delete project")
+
+    # 墓碑：该 workspace 已在本机删除过项目。若 rmtree 残留了 .hiveweave，
+    # 同路径再次创建时走"全新初始化"而不是收养，防止"已删除的项目被复活"。
+    try:
+        norm_ws = workspace.replace("\\", "/").lower()
+        await meta_db.execute(
+            "INSERT OR REPLACE INTO meta_index (key, value, updated_at) "
+            "VALUES (?, ?, ?)",
+            [f"purged_ws:{norm_ws}", "1", int(time.time() * 1000)],
+        )
+    except Exception as e:
+        log.warning("set_purge_tombstone_failed",
+                    workspace=workspace, error=str(e))
 
     # 清理 agent_router 内存路由（替代旧 agent_index 表删除）
     try:

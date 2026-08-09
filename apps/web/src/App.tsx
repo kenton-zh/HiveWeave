@@ -238,14 +238,18 @@ function App() {
 
     const name = folderPath.split(/[\\/]/).filter(Boolean).pop() || "New Project";
     try {
-      const { project, mainAgentId } = await createProject(name, folderPath, undefined, undefined, "zh");
+      const { project, mainAgentId, adopted } = await createProject(name, folderPath, undefined, undefined, "zh");
       const updated = await getProjects();
       setProjects(updated);
       setSelectedProjectId(project.id);
       clearChatSessions();
       refreshOrgTree();
       setShowProjectMenu(false);
-      if (mainAgentId) {
+      if (adopted) {
+        showToast("该目录已含平台数据，已导入项目（团队与历史保留）", "success");
+        setSelectedAgent(null);
+        setNewProjectCEO(null);
+      } else if (mainAgentId) {
         setNewProjectCEO(mainAgentId);
         setSelectedAgent(mainAgentId);
         setTimeout(() => {
