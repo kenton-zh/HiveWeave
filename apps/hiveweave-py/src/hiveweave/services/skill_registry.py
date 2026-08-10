@@ -19,6 +19,7 @@
 """
 
 import asyncio
+import hashlib
 import html
 import json
 import re
@@ -46,7 +47,9 @@ CLAWHUB_TIMEOUT = 5.0  # 契约 10: 5s 超时，失败静默降级
 # skills.sh — Open Agent Skills Ecosystem (https://www.skills.sh)
 # 技能格式: owner/repo/skill-name (e.g. anthropics/skills/frontend-design)
 # SKILL.md 内容在详情页服务端渲染，可直接 httpx 抓取。
-# 搜索源：sitemap 全量索引（约 2 万技能）优先，首页抓取兜底。
+# 搜索源：官方 /api/search 轻量接口（服务端 fuzzy + 安装量排序）优先，
+# sitemap 全量索引（约 2 万技能）客户端过滤兜底，首页抓取再兜底。
+# 搜索只返回元数据；详情页（SKILL.md 全文）在绑定/读取时按需抓取并落盘缓存。
 SKILLS_SH_BASE_URL = "https://www.skills.sh"
 SKILLS_SH_TIMEOUT = 8.0  # skills.sh 页面较大，给 8s
 SKILLS_SH_MAX_RESULTS = 10  # 搜索结果上限（HR 选择空间，不过多占用上下文）
@@ -58,6 +61,12 @@ SKILLS_SH_INDEX_TTL = 3600.0  # sitemap 全量索引缓存 1 小时
 # list_available_skills 输出契约：每条描述短摘要，禁止把详情页 HTML 残片灌进对话
 # （TEST19 晚轮：单行 73KB summary 击穿行截断 → 天线 turn ≈20k tokens）
 SKILL_LIST_DESC_MAX_CHARS = 160
+# 详情磁盘缓存 TTL：绑定/读取时抓取的内容落盘（data/skill_cache/），
+# 进程重启后 read_skill 不再重抓。超期后重新抓取（技能内容会更新）。
+SKILL_DETAIL_DISK_TTL = 7 * 24 * 3600.0
+# 商店可达性探测缓存 TTL：resolve 链路内商店探测结果短时复用，
+# 避免 hire 校验多个 slug 时对同一商店反复发起网络请求。
+SKILL_STORE_PROBE_TTL = 60.0
 
 # SkillHub — 国内技能商店 (https://skillhub.cn)
 # 当 skills.sh 不可达时自动降级到 SkillHub HTTP API 搜索。
@@ -787,45 +796,27 @@ def _sanitize_skill_list_desc(
     return s
 
 
-def _collect_skills_sh_results(
-    candidates: list[str], details: list[Any]
-) -> list[dict]:
-    """将 (candidate, detail) 组装为搜索结果，过滤需 API key 的技能。
+def _collect_skills_sh_bare(candidates: list[str]) -> list[dict]:
+    """将 slug 列表组装为搜索结果（仅元数据，无详情抓取）。
 
-    供 sitemap 与 homepage 两条搜索路径共用（避免两份循环漂移）：
-    - detail 为 dict 且 requires_api_key → 跳过（SkillsHub 标签等价语义）
-    - detail 为 None（抓取失败）→ 保留（未判定需 key，不丢召回）
-    - 截断到 SKILLS_SH_MAX_RESULTS
+    搜索阶段只列「名字 — from owner/repo」：详情页（SKILL.md 全文）在
+    绑定/读取时按需抓取。这样搜索不会并发抓详情页（限流根源），也不会
+    广告「详情抓取失败却绑不上」的技能——列表展示的不再是已验证内容。
     """
     skills: list[dict] = []
-    for slug, detail in zip(candidates, details):
+    for slug in candidates:
         parts = slug.split("/")
         skill_name = parts[-1] if parts else slug
-        if isinstance(detail, dict) and detail:
-            if detail.get("requires_api_key"):
-                continue
-            summary = _sanitize_skill_list_desc(
-                detail.get("summary") or detail.get("description") or ""
-            )
-            skills.append({
-                "slug": slug,
-                "summary": (
-                    f"{skill_name}: {summary}"
-                    if summary != "No description"
-                    else f"{skill_name} — from {parts[0]}/{parts[1]}"
-                ),
-                "description": summary if summary != "No description" else "",
-                "displayName": skill_name,
-            })
-        else:
-            skills.append({
-                "slug": slug,
-                "summary": f"{skill_name} — from {parts[0]}/{parts[1]}",
-                "description": "",
-                "displayName": skill_name,
-            })
-        if len(skills) >= SKILLS_SH_MAX_RESULTS:
-            break
+        owner_repo = f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else ""
+        summary = (
+            f"{skill_name} — from {owner_repo}" if owner_repo else skill_name
+        )
+        skills.append({
+            "slug": slug,
+            "summary": summary,
+            "description": "",
+            "displayName": skill_name,
+        })
     return skills
 
 
@@ -851,6 +842,15 @@ _API_KEY_PHRASE_RE = re.compile(
     r"request (?:the )?(?:an )?|sign up for (?:the )?(?:an )?)\s*"
     r"(?:an? )?\s*api\s*(?:key|token)\b"
 )
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """网络类异常判定：连接失败/超时/读错误（商店整体不可达），
+    区别于 404/内容解析失败（仅该 slug 不可用，不标记商店）。"""
+    return isinstance(
+        exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+              httpx.ReadError, httpx.TransportError)
+    )
 
 
 def _skill_md_requires_api_key(md: str) -> bool:
@@ -1015,6 +1015,9 @@ class SkillRegistryService:
 
     # 简单内存缓存：避免同一 skill 重复抓取（slug → detail dict）
     _skills_sh_cache: dict[str, dict] = {}
+    # 内存缓存写入时间戳（slug → fetched_at），读时校验 TTL：
+    # 磁盘 TTL 承诺「超期重新抓取」，内存层同样遵守，避免长驻进程内容陈旧。
+    _skills_sh_cache_ts: dict[str, float] = {}
 
     # Per-agent 搜索结果缓存：agent_id → [slug1, slug2, ...]
     # HR 调 list_available_skills 后，结果按序号存入此缓存。
@@ -1025,47 +1028,111 @@ class SkillRegistryService:
         """搜索 skills.sh marketplace（8s 超时）。
 
         返回值语义：
-        - None  → 商店不可达（网络异常/超时/非200），调用方应触发国内降级
+        - None  → 商店不可达（网络异常/超时/非200/接口不可用），调用方应触发国内降级
         - []    → 商店可达但无匹配结果
         - [...] → 正常搜索结果
 
-        搜索源：sitemap 全量索引（约 2 万技能 URL）优先，客户端做关键词过滤；
-        sitemap 不可达时降级为首页抓取（老逻辑）；两者都失败返回 None。
-        为每个候选并发抓取详情页 summary，让 HR 有描述可看。
+        搜索源：官方 /api/search 轻量接口优先（服务端 fuzzy 搜索 + 安装量排序，
+        单次调用返回元数据，零详情页抓取）；接口不可用（400/超时/解析失败）时
+        降级为 sitemap 全量索引客户端过滤（也不抓详情页）；sitemap 不可达时
+        降级为首页抓取。SKILL.md 全文（详情页）一律在绑定/读取时按需抓取。
+        商店在探测 TTL 内已知不可达（网络异常标记）时直接返回 None 走国内降级，
+        不再串行吃满 API+sitemap+homepage 三层超时。
         """
+        if self._store_is_unreachable("skills.sh"):
+            return None
+        api_results = await self._search_skills_sh_api(search)
+        if api_results is not None:
+            return api_results
+        # API 网络异常已标记商店不可达 → 短路，不再串行吃 sitemap/homepage
+        # 超时；非网络失败（400/解析错误）不标记，继续 sitemap 兜底。
+        if self._store_is_unreachable("skills.sh"):
+            return None
         try:
             slugs = await self._fetch_skills_sh_sitemap()
             if slugs:
                 return await self._search_skills_sh_slugs(slugs, search)
+            # sitemap 网络异常已标记 → 跳过 homepage（同样避免串行吃超时）
+            if self._store_is_unreachable("skills.sh"):
+                return None
             return await self._search_skills_sh_homepage(search)
         except Exception as e:
             log.debug("skills_sh_unreachable", error=str(e))
             return None
 
+    async def _search_skills_sh_api(self, search: str | None = None) -> list[dict] | None:
+        """官方轻量搜索接口：GET /api/search?q=<kw>。
+
+        单次调用返回候选元数据（id / skillId / name / installs / source），
+        服务端按安装量排序——比 sitemap 客户端过滤更准，且不抓任何详情页。
+        q 为空时接口返回 400 → 返回 None（调用方走 sitemap 兜底）。
+        失败（网络/非200/格式异常）→ None。
+        """
+        query = (search or "").strip()
+        if not query:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=SKILLS_SH_TIMEOUT) as client:
+                resp = await client.get(
+                    f"{SKILLS_SH_BASE_URL}/api/search", params={"q": query}
+                )
+                if resp.status_code != 200:
+                    log.debug("skills_sh_api_search_failed", status=resp.status_code)
+                    return None
+                data = resp.json()
+        except Exception as e:
+            log.debug("skills_sh_api_search_failed", error=str(e))
+            if _is_network_error(e):
+                self._store_mark_unreachable("skills.sh")
+            return None
+
+        items = data.get("skills") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return None
+
+        skills: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            slug = str(item.get("id") or "").strip()
+            if not slug:
+                continue
+            name = str(
+                item.get("name") or item.get("skillId") or slug.split("/")[-1]
+            ).strip() or slug
+            parts = slug.split("/")
+            source = str(item.get("source") or "").strip() or (
+                f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else ""
+            )
+            installs = item.get("installs")
+            summary = name
+            if isinstance(installs, int) and installs > 0:
+                summary += f" ({installs} installs)"
+            if source:
+                summary += f" — from {source}"
+            skills.append({
+                "slug": slug,
+                "summary": summary,
+                "description": "",
+                "displayName": name,
+            })
+            if len(skills) >= SKILLS_SH_MAX_RESULTS:
+                break
+        return skills
+
     async def _search_skills_sh_slugs(
         self, slugs: list[str], search: str | None
     ) -> list[dict]:
-        """在给定技能 slug 集合中做客户端关键词过滤，返回前 N 个带 summary 的结果。
+        """在给定技能 slug 集合中做客户端关键词过滤，返回前 N 个。
 
-        与 SkillHub 一致，过滤掉需要 API key 的技能（skills.sh 无商店标注，
-        用 _skill_md_requires_api_key 启发式检测）；多取候选（3x）以补足数量。
+        只列元数据（slug + 名字 + owner），不抓详情页——详情在绑定/读取时
+        按需抓取（避免搜索期并发抓取触发限流，也避免广告「搜得到绑不上」
+        的技能：列表展示的只是候选，绑定成功才算验证过）。
         """
         matches = _filter_skill_slugs(slugs, search)
         if not matches:
             return []
-        # 3x 候选窗口：过滤需 API key 的技能后仍可补足 SKILLS_SH_MAX_RESULTS。
-        # 注意：sitemap 顺序非热度排序，无关键词时返回前 30 个的过滤结果；
-        # 若前 30 里需 key 的过多，结果可能 <10 甚至 []——[] 表示"商店可达
-        # 但无匹配"，不会触发 SkillHub 降级（与 SkillHub 搜索的 [] 语义一致）。
-        candidates = matches[: SKILLS_SH_MAX_RESULTS * 3]
-
-        # 并发抓取每个候选的详情页 summary（让 HR 有描述可看）
-        details = await asyncio.gather(
-            *[self._fetch_skills_sh_detail(s) for s in candidates],
-            return_exceptions=True,
-        )
-
-        return _collect_skills_sh_results(candidates, details)
+        return _collect_skills_sh_bare(matches[: SKILLS_SH_MAX_RESULTS])
 
     # Sitemap 全量索引缓存：slug 列表 + 抓取时间戳
     _sitemap_slugs: list[str] | None = None
@@ -1098,6 +1165,8 @@ class SkillRegistryService:
                             all_slugs.append(slug)
         except Exception as e:
             log.debug("skills_sh_sitemap_failed", error=str(e))
+            if _is_network_error(e):
+                self._store_mark_unreachable("skills.sh")
             return []
 
         if all_slugs:
@@ -1110,7 +1179,7 @@ class SkillRegistryService:
         """降级路径：抓取 leaderboard 首页 HTML，正则提取技能 slug，客户端过滤。
 
         与 _search_skills_sh_slugs 语义一致；首页只有热门技能（约 200 个），
-        覆盖不全 —— sitemap 不可达时才走此路径。
+        覆盖不全 —— sitemap 不可达时才走此路径。不抓详情页。
         """
         try:
             async with httpx.AsyncClient(timeout=SKILLS_SH_TIMEOUT) as client:
@@ -1144,37 +1213,103 @@ class SkillRegistryService:
                         continue
 
                 candidates.append(slug)
-                if len(candidates) >= SKILLS_SH_MAX_RESULTS * 3:
+                if len(candidates) >= SKILLS_SH_MAX_RESULTS:
                     break
 
             if not candidates:
                 return []
 
-            # 并发抓取每个候选的详情页 summary（让 HR 有描述可看）
-            details = await asyncio.gather(
-                *[self._fetch_skills_sh_detail(s) for s in candidates],
-                return_exceptions=True,
-            )
-
-            return _collect_skills_sh_results(candidates, details)
+            return _collect_skills_sh_bare(candidates)
         except Exception as e:
             log.debug("skills_sh_unreachable", error=str(e))
+            if _is_network_error(e):
+                self._store_mark_unreachable("skills.sh")
             return None
+
+    # ── 详情磁盘缓存（绑定/读取时抓取 → 落盘复用）──────────────────
+    # 搜索阶段不再抓详情；详情在 hire 校验 / bind / read_skill 时按需抓取，
+    # 抓到的内容写入 data/skill_cache/<sha256(source:slug)>.json，进程重启后
+    # read_skill 直接命中，不重复抓详情页（超 TTL 后重新抓取）。
+    # 缓存 key 含来源前缀：skills.sh 与 SkillHub 可能共享同一 slug（短名），
+    # 两家详情内容不同，必须分 key 存储，避免互相覆盖。
+    _skills_sh_disk_cache_dir: str | None = None
+
+    @classmethod
+    def _get_skills_sh_cache_dir(cls) -> str | None:
+        if cls._skills_sh_disk_cache_dir is None:
+            d = Path(settings.get_meta_db_path()).parent / "skill_cache"
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                log.debug("skill_cache_dir_unavailable", path=str(d))
+                cls._skills_sh_disk_cache_dir = ""
+            else:
+                cls._skills_sh_disk_cache_dir = str(d)
+        return cls._skills_sh_disk_cache_dir or None
+
+    @staticmethod
+    def _skill_cache_key(slug: str, source: str) -> str:
+        """磁盘缓存文件名 key：sha256(source:slug) 前 32 位，来源隔离。"""
+        return hashlib.sha256(f"{source}:{slug}".encode("utf-8")).hexdigest()[:32]
+
+    def _load_skill_disk_cache(self, slug: str, source: str) -> dict | None:
+        d = SkillRegistryService._get_skills_sh_cache_dir()
+        if d is None:
+            return None
+        key = SkillRegistryService._skill_cache_key(slug, source)
+        try:
+            data = json.loads((Path(d) / f"{key}.json").read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("slug") != slug:
+                return None
+            fetched_at = float(data.get("fetched_at") or 0)
+        except (OSError, ValueError, TypeError):
+            return None
+        if time.time() - fetched_at > SKILL_DETAIL_DISK_TTL:
+            return None
+        return data
+
+    def _save_skill_disk_cache(self, slug: str, source: str, detail: dict) -> None:
+        d = SkillRegistryService._get_skills_sh_cache_dir()
+        if d is None:
+            return
+        key = SkillRegistryService._skill_cache_key(slug, source)
+        try:
+            (Path(d) / f"{key}.json").write_text(
+                json.dumps(
+                    {**detail, "slug": slug, "source": source, "fetched_at": time.time()},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except (OSError, TypeError, ValueError):
+            log.debug("skill_cache_write_failed", slug=slug)
 
     async def _fetch_skills_sh_detail(self, slug: str) -> dict | None:
         """取 skills.sh 单个技能详情（8s 超时，失败返回 None）。
 
         抓取 https://www.skills.sh/{slug} 页面，提取 SKILL.md 段落内容。
-        结果缓存在内存中避免重复抓取。
+        结果缓存在内存 + 磁盘（data/skill_cache/）中避免重复抓取。
 
         返回的 dict 含 `requires_api_key: bool` —— skills.sh 无显式
         requires_api_key 标签（SkillHub 才有），这里用启发式检测
         SKILL.md / summary 中的环境变量与短语线索（等价于 SkillHub 的
         labels.requires_api_key=="true"，即「商店标注需要 API key」）。
         """
-        # 检查缓存
+        slug = slug.strip()
+        if not slug:
+            return None
+        # 检查缓存（内存 → 磁盘）；内存条目带写入时间戳，超 TTL 视为失效
+        mem_ts = self._skills_sh_cache_ts.get(slug, 0.0)
         if slug in self._skills_sh_cache:
-            return self._skills_sh_cache[slug]
+            if time.time() - mem_ts <= SKILL_DETAIL_DISK_TTL:
+                return self._skills_sh_cache[slug]
+            self._skills_sh_cache.pop(slug, None)
+            self._skills_sh_cache_ts.pop(slug, None)
+        disk = self._load_skill_disk_cache(slug, "skills.sh")
+        if disk is not None:
+            self._skills_sh_cache[slug] = disk
+            self._skills_sh_cache_ts[slug] = float(disk.get("fetched_at") or time.time())
+            return disk
 
         try:
             url = f"{SKILLS_SH_BASE_URL}/{slug}"
@@ -1204,11 +1339,16 @@ class SkillRegistryService:
                 "requires_api_key": requires_key,
             }
 
-            # 缓存
+            # 缓存（内存 + 磁盘）
             self._skills_sh_cache[slug] = result
+            self._skills_sh_cache_ts[slug] = time.time()
+            self._save_skill_disk_cache(slug, "skills.sh", result)
             return result
         except Exception as e:
             log.debug("skills_sh_detail_failed", slug=slug, error=str(e))
+            # 网络类异常 → 商店整体不可达（探测缓存）；404/内容缺失不算
+            if _is_network_error(e):
+                self._store_mark_unreachable("skills.sh")
             return None
 
     @staticmethod
@@ -1300,6 +1440,10 @@ class SkillRegistryService:
         """
         if not settings.skillhub_enabled:
             return []
+        # 商店在探测 TTL 内已知不可达（网络异常标记）→ 直接返回空（与 skills.sh
+        # 链路的 _store_is_unreachable 短路一致，避免每次搜索吃满 8s 超时）。
+        if self._store_is_unreachable("skillhub"):
+            return []
 
         query = (search or "").strip()
         if not query:
@@ -1355,12 +1499,16 @@ class SkillRegistryService:
             return skills
         except Exception as e:
             log.debug("skillhub_search_failed", error=str(e))
+            if _is_network_error(e):
+                self._store_mark_unreachable("skillhub")
             return []
 
     # ── SkillHub 单个技能详情（供 hire 校验 / read_skill 复用）────
 
     # slug → detail dict 缓存，避免重复抓取
     _skillhub_detail_cache: dict[str, dict] = {}
+    # 内存缓存写入时间戳（同 _skills_sh_cache_ts，读时校验 TTL）
+    _skillhub_detail_cache_ts: dict[str, float] = {}
 
     async def _fetch_skillhub_detail(self, slug: str) -> dict | None:
         """取 SkillHub 单个技能详情（metadata + summary，8s 超时，失败返回 None）。
@@ -1378,7 +1526,16 @@ class SkillRegistryService:
         if not settings.skillhub_enabled:
             return None
         if slug in self._skillhub_detail_cache:
-            return self._skillhub_detail_cache[slug]
+            mem_ts = self._skillhub_detail_cache_ts.get(slug, 0.0)
+            if time.time() - mem_ts <= SKILL_DETAIL_DISK_TTL:
+                return self._skillhub_detail_cache[slug]
+            self._skillhub_detail_cache.pop(slug, None)
+            self._skillhub_detail_cache_ts.pop(slug, None)
+        disk = self._load_skill_disk_cache(slug, "skillhub")
+        if disk is not None:
+            self._skillhub_detail_cache[slug] = disk
+            self._skillhub_detail_cache_ts[slug] = float(disk.get("fetched_at") or time.time())
+            return disk
 
         base = SKILLHUB_SEARCH_URL
         detail_url = (
@@ -1395,6 +1552,8 @@ class SkillRegistryService:
                 data = resp.json()
         except Exception as e:
             log.debug("skillhub_detail_failed", slug=slug, error=str(e))
+            if _is_network_error(e):
+                self._store_mark_unreachable("skillhub")
             return None
 
         skill = data.get("skill") if isinstance(data, dict) else None
@@ -1426,7 +1585,64 @@ class SkillRegistryService:
             "skill_md": header + body,
         }
         self._skillhub_detail_cache[slug] = result
+        self._skillhub_detail_cache_ts[slug] = time.time()
+        self._save_skill_disk_cache(slug, "skillhub", result)
         return result
+
+    # resolve 结果缓存：slug → (expires_at, detail, source_label)
+    # hire 校验多个 slug 时，同一 slug 可能被 bind/read 重复解析；
+    # 正结果 TTL 与磁盘缓存一致（SKILL_DETAIL_DISK_TTL），负结果
+    # 只短时缓存（SKILL_STORE_PROBE_TTL）——商店/网络状态恢复后
+    # 负缓存快速过期，避免会话内永久死锁「解析不到」。
+    _resolve_cache: dict[str, tuple[float, dict | None, str]] = {}
+
+    # 商店可达性探测缓存：resolve 链路内（_fetch_*_detail 抛网络异常）
+    # 记录商店不可用状态，TTL 内跳过该商店，避免对同一商店反复超时等待。
+    _store_unreachable: dict[str, float] = {}
+
+    def _store_mark_unreachable(self, store: str) -> None:
+        SkillRegistryService._store_unreachable[store] = time.monotonic()
+
+    def _store_is_unreachable(self, store: str) -> bool:
+        ts = SkillRegistryService._store_unreachable.get(store)
+        if ts is None:
+            return False
+        if time.monotonic() - ts > SKILL_STORE_PROBE_TTL:
+            SkillRegistryService._store_unreachable.pop(store, None)
+            return False
+        return True
+
+    async def _fetch_store_detail(
+        self, store: str, slug: str
+    ) -> dict | None:
+        """按商店名取详情；商店在探测 TTL 内已知不可达时直接返回 None。
+
+        商店不可达标记在 fetch 内部完成（网络异常 vs 404 技能不存在
+        有区分：只有网络异常标记商店，404 只是该 slug 不在商店里）。
+        """
+        if self._store_is_unreachable(store):
+            return None
+        if store == "skills.sh":
+            return await self._fetch_skills_sh_detail(slug)
+        return await self._fetch_skillhub_detail(slug)
+
+    @staticmethod
+    def _slug_candidates(slug: str) -> list[str]:
+        """slug 候选列表：全路径 → 短名（去重）。
+
+        双商店 slug 命名空间冲突根因：sitemap 存全路径 owner/repo/skill，
+        而 SkillHub 只认短名。统一在此展开候选，hire/bind/read 共用。
+        空串/尾斜杠归一化：strip + rstrip('/')，归一后为空则返回 []。
+        """
+        normalized = (slug or "").strip().rstrip("/")
+        if not normalized:
+            return []
+        candidates = [normalized]
+        if "/" in normalized:
+            short = normalized.split("/")[-1].strip()
+            if short and short != normalized:
+                candidates.append(short)
+        return candidates
 
     async def _resolve_marketplace_skill(self, slug: str) -> tuple[dict | None, str]:
         """统一市场详情解析：skills.sh（国外）优先，不可达时降级 SkillHub（国内）。
@@ -1440,24 +1656,41 @@ class SkillRegistryService:
         启发式检测 _skill_md_requires_api_key，SkillHub 用商店标签），
         保证「搜不到」与「绑不上」行为统一。
 
-        双商店 slug 命名空间冲突（「搜得到却绑不上」根因）：sitemap 给
-        全路径 slug（owner/repo/skill），而 SkillHub 只认短名。skills.sh
-        实时 fetch 抖动时全路径首查即败 —— 因此全路径 slug 在两个商店都
-        失败后，用短名（slug.split('/')[-1]）二次 fallback，命中 SkillHub。
+        slug 候选按 _slug_candidates 展开（全路径 → 短名），每个候选
+        依次尝试 skills.sh → SkillHub；商店在探测 TTL 内已知不可达时跳过。
+        成功结果写入 _resolve_cache，会话内重复解析不重复发网络请求。
         """
-        candidates = [slug]
-        if "/" in slug:
-            short = slug.split("/")[-1].strip()
-            if short and short != slug:
-                candidates.append(short)
-        for cand in candidates:
-            detail = await self._fetch_skills_sh_detail(cand)
+        if slug in SkillRegistryService._resolve_cache:
+            expires_at, cached_detail, cached_label = SkillRegistryService._resolve_cache[slug]
+            if time.monotonic() < expires_at:
+                return cached_detail, cached_label
+            SkillRegistryService._resolve_cache.pop(slug, None)
+
+        result: tuple[dict | None, str] = (None, "")
+        for cand in self._slug_candidates(slug):
+            detail = await self._fetch_store_detail("skills.sh", cand)
             if detail is not None and not detail.get("requires_api_key"):
-                return detail, "skills.sh Marketplace"
-            detail = await self._fetch_skillhub_detail(cand)
+                result = (detail, "skills.sh Marketplace")
+                break
+            detail = await self._fetch_store_detail("skillhub", cand)
             if detail is not None:
-                return detail, SKILLHUB_SOURCE_LABEL
-        return None, ""
+                result = (detail, SKILLHUB_SOURCE_LABEL)
+                break
+
+        # 正结果 TTL 按来源区分：skills.sh 全文内容 7 天（与磁盘一致）；
+        # SkillHub 只有 summary 级元数据（劣质占位），短缓存——skills.sh
+        # 恢复后会话内能立刻换回全文，不被降级内容锁死整个会话。
+        # 负结果（解析不到）只短时缓存，商店/网络状态恢复后快速过期。
+        if result[0] is None:
+            ttl = SKILL_STORE_PROBE_TTL
+        elif result[1] == "skills.sh Marketplace":
+            ttl = SKILL_DETAIL_DISK_TTL
+        else:
+            ttl = SKILL_STORE_PROBE_TTL
+        SkillRegistryService._resolve_cache[slug] = (
+            time.monotonic() + ttl, result[0], result[1]
+        )
+        return result
 
     # ── 公共 API：技能发现 ───────────────────────────────────
 
