@@ -47,6 +47,44 @@ def test_screenshot_path_from_argv():
     assert _screenshot_path_from_argv(["goto", "http://x"]) is None
 
 
+@pytest.mark.asyncio
+async def test_browse_screenshot_success_text_includes_abs_path(tmp_path: Path, monkeypatch):
+    """Regression: screenshot_path extra field is dropped by tool_exec — the
+    injected-text note MUST carry the resolved absolute path so the agent can
+    call assert_visual(screenshotPath=...) next round."""
+    from hiveweave.tools.browse_tools import browse_tool
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    png = ws / "evidence" / "flow.png"
+    png.parent.mkdir()
+    _tiny_png(png)
+
+    args = ["screenshot", "evidence/flow.png"]
+
+    async def fake_browse_exec(argv, workspace, timeout_sec=60, agent_id=None):
+        return 0, "saved " + argv[-1], ""
+
+    async def fake_attest(**kwargs):
+        return ""
+
+    import hiveweave.tools.browse_tools as bt
+    from hiveweave.tools.browse_tools import BrowseParams
+
+    monkeypatch.setattr(bt, "browse_exec", fake_browse_exec)
+    monkeypatch.setattr(bt, "issue_browse_e2e_attestation", fake_attest)
+
+    result = await browse_tool(
+        BrowseParams(args=args), agent_id="agent-1", workspace=str(ws)
+    )
+    assert result.success is True
+    text = result.output
+    abs_win = str(png.resolve()).replace("\\", "/")
+    assert abs_win in text, text
+    assert f"assert_visual(screenshotPath=\"{abs_win}\"" in text
+    assert result.extra.get("images")
+
+
 def test_load_image_for_llm(tmp_path: Path):
     png = tmp_path / "shot.png"
     _tiny_png(png)
