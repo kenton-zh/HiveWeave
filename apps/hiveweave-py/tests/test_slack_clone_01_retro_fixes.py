@@ -255,8 +255,8 @@ class TestEvaluateCommandRules:
         assert v.rule == "__indirect_pid__"
 
     def test_taskkill_indirect_variable_via_assignment_denied(self):
-        """M1：P=4000; taskkill //PID $P //F 变量穿透受保护 PID → deny."""
-        v = evaluate_command("P=4000; taskkill //PID $P //F", protected={4000})
+        """M1：P=424242; taskkill //PID $P //F 变量穿透受保护 PID → deny."""
+        v = evaluate_command("P=424242; taskkill //PID $P //F", protected={424242})
         assert v.blocked is True
 
     def test_compound_any_deny_blocks_all(self):
@@ -302,28 +302,28 @@ class TestProtectedPidHardLayer:
 
     def test_taskkill_protected_pid_denied(self):
         """精确 PID 豁免挡不住受保护 PID —— PID 硬层先于规则."""
-        v = evaluate_command("taskkill //PID 4000 //F", protected={4000})
+        v = evaluate_command("taskkill //PID 424242 //F", protected={424242})
         assert v.blocked is True
         assert v.rule == "__protected_pid__"
         assert "平台宿主" in v.reason
 
     def test_taskkill_single_slash_pid_denied(self):
-        v = evaluate_command("taskkill /PID 4000 /F", protected={4000})
+        v = evaluate_command("taskkill /PID 424242 /F", protected={424242})
         assert v.blocked is True
 
     def test_kill_protected_pid_denied(self):
-        v = evaluate_command("kill 4000", protected={4000})
+        v = evaluate_command("kill 424242", protected={424242})
         assert v.blocked is True
         assert v.rule == "__protected_pid__"
 
     def test_stop_process_id_denied(self):
-        v = evaluate_command("Stop-Process -Id 4000", protected={4000})
+        v = evaluate_command("Stop-Process -Id 424242", protected={424242})
         assert v.blocked is True
         assert v.rule == "__protected_pid__"
 
     def test_wmic_processid_denied(self):
         v = evaluate_command(
-            "wmic process where processid=4000 call terminate", protected={4000}
+            "wmic process where processid=424242 call terminate", protected={424242}
         )
         assert v.blocked is True
         assert v.rule == "__protected_pid__"
@@ -331,12 +331,12 @@ class TestProtectedPidHardLayer:
     def test_protected_layer_survives_guard_off(self, monkeypatch):
         """规则开关关闭时 PID 硬保护仍生效（底线永不关闭）."""
         monkeypatch.setenv("HIVEWEAVE_BASH_COMMAND_GUARD", "off")
-        v = evaluate_command("taskkill //PID 4000 //F", protected={4000})
+        v = evaluate_command("taskkill //PID 424242 //F", protected={424242})
         assert v.blocked is True
         assert v.rule == "__protected_pid__"
 
     def test_unprotected_pid_not_blocked_by_hard_layer(self):
-        v = evaluate_command("taskkill //PID 9999 //F", protected={4000})
+        v = evaluate_command("taskkill //PID 9999 //F", protected={424242})
         assert v.blocked is False
 
     def test_register_protected_pid_global(self):
@@ -365,6 +365,34 @@ class TestProtectedPidHardLayer:
         src = Path(main_mod.__file__).read_text(encoding="utf-8")
         assert "init_process_protection" in src
 
+    def test_protection_is_pid_based_not_port_based(self):
+        """平台端口可配置（HIVEWEAVE_PORT/--port），保护必须跟 PID 不跟端口.
+
+        护栏保护的是「平台进程 PID 集合」，与监听端口无关——后端改端口后
+        受保护 PID 依然生效（同 PID 集合），杀平台进程的命令依旧被拦。
+        本测试用任意 PID 验证保护语义与端口号解耦。
+        """
+        # 平台进程的 PID（无论端口是多少）→ 必须拦
+        platform_pid = 987654
+        v = evaluate_command(f"kill {platform_pid}", protected={platform_pid})
+        assert v.blocked is True
+        assert v.rule == "__protected_pid__"
+        # 改端口后：平台 PID 不变，保护依旧（模拟 4000→5000 换端口场景）
+        v2 = evaluate_command(f"taskkill //PID {platform_pid} //F", protected={platform_pid})
+        assert v2.blocked is True
+        assert v2.rule == "__protected_pid__"
+        # 非平台 PID（agent 自己的进程）不受影响
+        v3 = evaluate_command(f"kill {platform_pid + 1}", protected={platform_pid})
+        assert v3.blocked is False
+
+    def test_protected_pid_via_env_survives_port_change(self, monkeypatch):
+        """env 注入的保护 PID 与端口无关——换端口后依然受保护."""
+        monkeypatch.setenv("HIVEWEAVE_PROTECTED_PIDS", "999991")
+        register_protected_pid(999991)
+        v = evaluate_command("kill 999991")
+        assert v.blocked is True
+        assert v.rule == "__protected_pid__"
+
 
 # ════════════════════════════════════════════════════════════════════
 # P0-1: shell 包装解包
@@ -389,7 +417,7 @@ class TestShellWrapperUnwrap:
         assert v.blocked is True
 
     def test_wrapper_inner_pid_protected(self):
-        v = evaluate_command("cmd /c taskkill /pid 4000 /f", protected={4000})
+        v = evaluate_command("cmd /c taskkill /PID 424242 /f", protected={424242})
         assert v.blocked is True
         assert v.rule == "__protected_pid__"
 
@@ -429,6 +457,257 @@ class TestShellWrapperUnwrap:
 
     def test_wrapper_safe_inner_allowed(self):
         v = evaluate_command("cmd /c echo hello")
+        assert v.blocked is False
+
+
+# ════════════════════════════════════════════════════════════════════
+# P1-6: 控制结构绕过（while/for/if/$( )/子shell/反引号）
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestControlStructureBypass:
+    """bash 控制结构体内的 kill 族命令必须被审计（P1-6，宁可误杀不漏杀）."""
+
+    def test_while_loop_kill_variable_denied(self):
+        """事故命令形态：while read pid; do kill $pid → 间接引用拦截."""
+        v = evaluate_command("while read pid; do kill $pid; done")
+        assert v.blocked is True
+        assert v.rule == "__indirect_pid__"
+
+    def test_while_loop_taskkill_variable_denied(self):
+        v = evaluate_command("while read pid; do taskkill //PID $pid //F; done")
+        assert v.blocked is True
+        assert v.rule == "__indirect_pid__"
+
+    def test_pipe_while_accident_command_denied(self):
+        """完整事故命令：netstat | ... | while read pid; do kill $pid."""
+        cmd = (
+            'netstat -ano | grep -E ":(8000|8001|8002|6667)" | grep LISTENING '
+            "| awk '{print $5}' | sort -u | while read pid; do kill $pid; done"
+        )
+        v = evaluate_command(cmd)
+        assert v.blocked is True
+        # 修复后优先命中 __kill_non_first__（循环体展开后 kill 非首 token），
+        # 或 __indirect_pid__（kill $pid 变量引用）——两者都是 deny，都接受
+        assert v.rule in ("__indirect_pid__", "__kill_non_first__")
+
+    def test_for_loop_kill_variable_denied(self):
+        v = evaluate_command(
+            "for p in $(netstat -ano | awk '{print $5}'); do kill $p; done"
+        )
+        assert v.blocked is True
+        assert v.rule == "__indirect_pid__"
+
+    def test_if_branch_kill_variable_denied(self):
+        v = evaluate_command("if [ -f /tmp/x ]; then kill $pid; fi")
+        assert v.blocked is True
+        assert v.rule == "__indirect_pid__"
+
+    def test_command_substitution_protected_pid_denied(self):
+        v = evaluate_command("x=$(kill 424242); echo $x", protected={424242})
+        assert v.blocked is True
+        assert v.rule == "__protected_pid__"
+
+    def test_command_substitution_kill_variable_denied(self):
+        v = evaluate_command("x=$(kill $pid); echo $x")
+        assert v.blocked is True
+        assert v.rule == "__indirect_pid__"
+
+    def test_backtick_protected_pid_denied(self):
+        v = evaluate_command("x=`kill 424242`", protected={424242})
+        assert v.blocked is True
+        assert v.rule == "__protected_pid__"
+
+    def test_subshell_protected_pid_denied(self):
+        v = evaluate_command("(kill 424242)", protected={424242})
+        assert v.blocked is True
+        assert v.rule == "__protected_pid__"
+
+    def test_subshell_kill_variable_denied(self):
+        v = evaluate_command("(kill $pid)")
+        assert v.blocked is True
+        assert v.rule == "__indirect_pid__"
+
+    def test_for_loop_taskkill_variable_denied(self):
+        v = evaluate_command("for p in $(pgrep python); do taskkill //PID $p //F; done")
+        assert v.blocked is True
+        assert v.rule == "__indirect_pid__"
+
+    def test_nested_while_inside_subshell_denied(self):
+        v = evaluate_command("(while read pid; do kill $pid; done)")
+        assert v.blocked is True
+
+    # ── 合法命令不受影响 ──
+
+    def test_safe_while_read_file_allowed(self):
+        v = evaluate_command("while read line; do echo $line; done < file.txt")
+        assert v.blocked is False
+
+    def test_safe_for_echo_allowed(self):
+        v = evaluate_command("for i in 1 2 3; do echo $i; done")
+        assert v.blocked is False
+
+    def test_safe_command_substitution_allowed(self):
+        v = evaluate_command("echo $(date)")
+        assert v.blocked is False
+
+    def test_safe_subshell_echo_allowed(self):
+        v = evaluate_command("(echo hi)")
+        assert v.blocked is False
+
+    def test_safe_for_git_status_allowed(self):
+        v = evaluate_command("for d in a b; do git -C $d status; done")
+        assert v.blocked is False
+
+
+class TestAuditSecondPassBypass:
+    """子代理审计第二轮发现的绕过面（Critical/High 级）——全部必须 deny."""
+
+    def test_while_condition_kill_denied(self):
+        """审计 Critical-1：while 条件部分的 kill 也要拦."""
+        v = evaluate_command("while kill 424242; do sleep 1; done", protected={424242})
+        assert v.blocked is True
+        assert v.rule in ("__protected_pid__", "__kill_non_first__")
+
+    def test_if_condition_kill_denied(self):
+        v = evaluate_command(
+            "if taskkill //PID 424242 //F; then echo hi; fi", protected={424242}
+        )
+        assert v.blocked is True
+
+    def test_double_quote_substitution_kill_denied(self):
+        """审计 Critical-2：双引号内 $() 会执行，必须拦."""
+        v = evaluate_command('echo "$(kill 424242)"', protected={424242})
+        assert v.blocked is True
+        assert v.rule == "__protected_pid__"
+
+    def test_double_quote_backtick_kill_denied(self):
+        v = evaluate_command('echo "`kill 424242`"', protected={424242})
+        assert v.blocked is True
+
+    def test_else_branch_kill_denied(self):
+        """审计 High-3：else 分支内的 kill 必须拦."""
+        v = evaluate_command(
+            'if [ -n "$x" ]; then echo ok; else taskkill //PID 424242 //F; fi',
+            protected={424242},
+        )
+        assert v.blocked is True
+
+    def test_case_branch_kill_denied(self):
+        """审计 Medium-6：case 分支体（pattern) cmd）必须拦."""
+        v = evaluate_command("case $x in p) kill $pid;; esac")
+        assert v.blocked is True
+
+    def test_case_branch_protected_pid_denied(self):
+        v = evaluate_command("case $x in a) taskkill //PID 424242 //F;; esac", protected={424242})
+        assert v.blocked is True
+
+    def test_backslash_pid_denied(self):
+        """审计严重#1：kill \\424242 反斜杠混淆 PID 必须拦."""
+        v = evaluate_command("kill \\424242", protected={424242})
+        assert v.blocked is True
+
+    def test_backslash_command_name_denied(self):
+        """审计严重#3：ki\\ll 424242 命令名混淆必须拦."""
+        v = evaluate_command("ki\\ll 424242", protected={424242})
+        assert v.blocked is True
+
+    def test_var_command_name_protected_denied(self):
+        """审计严重#6：x=kill; $x 424242 变量命令名 + 受保护 PID 必须拦."""
+        v = evaluate_command("x=kill; $x 424242", protected={424242})
+        assert v.blocked is True
+
+    def test_eval_kill_denied(self):
+        v = evaluate_command('eval "kill 424242"', protected={424242})
+        assert v.blocked is True
+        assert v.rule == "eval *"
+
+    def test_brace_group_kill_denied(self):
+        """审计严重#4：花括号组 { kill 424242; } 必须拦."""
+        v = evaluate_command("{ kill 424242; }", protected={424242})
+        assert v.blocked is True
+
+    def test_function_body_kill_denied(self):
+        """审计严重#5：函数体 f() { kill 424242; } 必须拦."""
+        v = evaluate_command("f() { kill 424242; }; f", protected={424242})
+        assert v.blocked is True
+
+    def test_herestring_kill_denied(self):
+        """审计高#8：sh <<< 'kill 424242' herestring 必须拦."""
+        v = evaluate_command("sh <<< 'kill 424242'", protected={424242})
+        assert v.blocked is True
+
+    def test_pipe_to_sh_denied(self):
+        """审计高#9：printf 'kill 424242' | sh 必须拦."""
+        v = evaluate_command("printf 'kill 424242' | sh", protected={424242})
+        assert v.blocked is True
+
+    def test_xargs_kill_denied(self):
+        v = evaluate_command("echo 4000 | xargs kill", protected={424242})
+        assert v.blocked is True
+        # 可能被 xargs 规则或 __kill_non_first__（xargs 段的 kill 非首 token）拦
+        assert v.rule in ("xargs *", "__kill_non_first__")
+
+    def test_kill_ampersand_denied(self):
+        """审计高#15：kill 424242& 后台杀必须拦."""
+        v = evaluate_command("kill 424242&", protected={424242})
+        assert v.blocked is True
+
+    def test_prefix_wrappers_denied(self):
+        """审计中：nohup/exec/command/builtin/env/timeout 前缀包装必须拦."""
+        for cmd in (
+            "nohup kill 424242",
+            "exec kill 424242",
+            "command kill 424242",
+            "builtin kill 424242",
+            'env sh -c "kill 424242"',
+            "timeout 5 kill 424242",
+        ):
+            v = evaluate_command(cmd, protected={424242})
+            assert v.blocked is True, cmd
+
+    def test_keyword_data_word_steals_denied(self):
+        """审计 High-4/5：条件/列表里的数据词 do/done/fi 不能逃过提取."""
+        for cmd in (
+            "while echo done; do kill $pid; done",
+            "for f in do; do kill $p; done",
+            "while grep -q done f; do kill $p; done",
+        ):
+            v = evaluate_command(cmd)
+            assert v.blocked is True, cmd
+
+    def test_nested_deep_blocks_denied(self):
+        v = evaluate_command(
+            "while a; do while b; do while c; do kill 424242; done; done; done",
+            protected={424242},
+        )
+        assert v.blocked is True
+
+    # ── 防误杀（合法命令必须放行） ──
+
+    def test_echo_pseudo_kill_allowed(self):
+        """引号内的伪 kill 是文本不是命令 → 放行."""
+        v = evaluate_command('echo "kill 424242"', protected={424242})
+        assert v.blocked is False
+
+    def test_git_commit_done_word_allowed(self):
+        v = evaluate_command('git commit -m "done"', protected={424242})
+        assert v.blocked is False
+
+    def test_sh_c_safe_allowed(self):
+        v = evaluate_command("sh -c 'echo hi'", protected={424242})
+        assert v.blocked is False
+
+    def test_sh_script_file_allowed(self):
+        v = evaluate_command("sh setup.sh", protected={424242})
+        assert v.blocked is False
+
+    def test_kill_unprotected_pid_allowed(self):
+        v = evaluate_command("kill 55555", protected={424242})
+        assert v.blocked is False
+
+    def test_taskkill_unprotected_pid_allowed(self):
+        v = evaluate_command("taskkill //PID 55555 //F", protected={424242})
         assert v.blocked is False
 
 
