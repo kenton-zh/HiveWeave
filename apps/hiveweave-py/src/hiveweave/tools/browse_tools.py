@@ -625,12 +625,20 @@ async def browse_tool(
         img = load_image_for_llm(shot_path) if shot_path else None
         if img:
             extra_fields["images"] = [img]
-            extra_fields["screenshot_path"] = img.get("path") or str(shot_path)
+            shot_abs = str(shot_path)
+            extra_fields["screenshot_path"] = shot_abs
+            # NOTE: tool_exec drops extra fields before the next LLM round —
+            # the path MUST be in the text for assert_visual(screenshotPath=...).
+            shot_display = shot_abs.replace("\\", "/")
             out = (
                 f"{out}{attest_note}\n"
                 "[VISION] Screenshot pixels are attached to this tool result "
-                "for your next turn. Inspect the image (not the path). Then call "
-                "assert_visual(screenshotPath=..., observed=\"what you see\", "
+                "for your next turn. Inspect the image (not the path). "
+                f"Screenshot saved at: {shot_display}\n"
+                "Then call "
+                f"assert_visual(screenshotPath=\"{shot_display}\", "
+                "observed=\"describe what you see: labels/layout/errors, "
+                "40+ chars\", "
                 "verdict=\"pass\"|\"fail\") — UI submit requires visual_check; "
                 "a bare screenshot file path is NOT enough."
             )
@@ -653,7 +661,11 @@ class AssertVisualParams(BaseModel):
     screenshot_path: str = Field(
         ...,
         alias="screenshotPath",
-        description="Path to the PNG/JPEG produced by browse screenshot.",
+        description=(
+            "Path to the PNG/JPEG produced by browse screenshot. Copy it from "
+            "the browse tool result text after 'Screenshot saved at:' — do not "
+            "guess the path."
+        ),
         json_schema_extra={"aliases": ["screenshotPath", "screenshot_path", "path"]},
     )
     observed: str = Field(
