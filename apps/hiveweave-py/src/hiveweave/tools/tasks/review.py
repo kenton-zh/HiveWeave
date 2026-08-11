@@ -497,7 +497,25 @@ async def review_task_tool(
                 project_id, task, evidence
             )
             if ev_deny:
-                return ToolResult.err(ev_deny)
+                # 2026-08-11 slack-clone_01 复盘：files_changed 校验失败后
+                # 任务停留在 submitted，assignee 无法重交（状态机拒
+                # submitted→submitted），只能等 reviewer 手动 rework。
+                # 证据可修（修正 filesChanged / 补 checkpoint），自动转
+                # rework，assignee 立即能重交 —— 不自动循环（只转一次）。
+                post = await _auto_rework_on_evidence_gate(
+                    project_id, params, agent_id, task, ev_deny
+                )
+                if post == "reworked":
+                    return ToolResult.err(
+                        f"{ev_deny}\n\n[auto-rework] Task 已自动转回 running："
+                        f"修正 filesChanged（只列 worktree 中真实存在的文件）"
+                        f"后重新 submit_task。"
+                    )
+                return ToolResult.err(
+                    f"{ev_deny}\n\n[auto-rework failed] 任务未能自动转回 "
+                    f"running（当前状态 {post}）。请按上面的选项处理，或"
+                    f"手动 review_task(decision='rework')。"
+                )
 
         # TEST6 evening P1-3: VERIFY approve requires attestation on
         # target_merge_commit / current main tip (not a stale personal tip).
@@ -881,4 +899,73 @@ async def _inject_merge_pending_wake(
             task_id=tid,
             error=str(e),
         )
+
+
+async def _auto_rework_on_evidence_gate(
+    project_id: str,
+    params: Any,
+    agent_id: str,
+    task: dict | None,
+    deny_msg: str,
+) -> str:
+    """Approval evidence gate（files_changed 校验）失败 → 自动转 rework。
+
+    2026-08-11 slack-clone_01 复盘：gate 拒绝后任务停留 submitted，
+    assignee 无法重交（状态机拒 submitted→submitted），只能等 reviewer
+    手动 rework —— 团队在 B3 上死等 20 分钟。证据可修，自动转回 running，
+    assignee 立即能重交。失败静默（不阻断 approve 的错误返回）。
+
+    Returns the task's post-state ("reworked" when both transitions ran,
+    otherwise the actual status string).
+    """
+    try:
+        from hiveweave.agents.trigger import trigger_subordinate
+        from hiveweave.services.inbox import InboxService
+
+        ts = _task_svc.TaskService()
+        tid = params.task_id
+        cur = (await ts.get_task(project_id, tid) or {}).get("status")
+        if cur == "submitted":
+            await ts.start_review(project_id, tid, reviewer_id=agent_id)
+            cur = (await ts.get_task(project_id, tid) or {}).get("status")
+        if cur in ("submitted", "reviewing"):
+            await ts.review_task(
+                project_id,
+                tid,
+                "rework",
+                params.feedback or deny_msg[:500],
+                reviewer_id=agent_id,
+            )
+            try:
+                from hiveweave.services.obligation import ObligationLedger
+
+                await ObligationLedger().fulfill(project_id, tid, "review")
+            except Exception:
+                pass
+        assignee_id = (task or {}).get("assignee_id")
+        if assignee_id:
+            await InboxService().send_message(
+                from_agent_id=agent_id,
+                to_agent_id=assignee_id,
+                message=(
+                    f"[REWORK REQUESTED] Task '{str(tid)[:8]}' auto-reworked "
+                    f"by approval evidence gate: {deny_msg[:200]}"
+                ),
+                message_type="task",
+                priority="urgent",
+                task_id=tid,
+                wake=True,
+            )
+            await trigger_subordinate(assignee_id)
+        return (await ts.get_task(project_id, tid) or {}).get("status") or "unknown"
+    except Exception as e:
+        log.warning(
+            "review_auto_rework_evidence_gate_failed",
+            task_id=str(getattr(params, "task_id", "")),
+            error=str(e),
+        )
+        try:
+            return (await _task_svc.TaskService().get_task(project_id, params.task_id) or {}).get("status") or "unknown"
+        except Exception:
+            return "unknown"
 

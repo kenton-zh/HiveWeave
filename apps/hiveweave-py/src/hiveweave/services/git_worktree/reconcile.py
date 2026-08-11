@@ -26,6 +26,73 @@ log = structlog.get_logger(__name__)
 # hw/<short_id>/<rest> — used to detect agent-gone orphan branches (S8).
 _HW_SID_BRANCH_RE = re.compile(r"^hw/([^/]+)/")
 
+# 2026-08-11 A023 事故：husk rmtree 失败（Windows 文件锁 Device busy）静默
+# 吞掉 → 损坏目录永久残留。跨 reconcile 轮次计数，连续失败告警（可观测）。
+_husk_remove_failures: dict[str, int] = {}
+_HUSK_RETRY_MAX = 3
+
+
+def _rmtree_husk(
+    child: Path,
+    report: dict,
+    workspace_path: str,
+    *,
+    source: str,
+    recheck_git: bool = True,
+) -> None:
+    """Husk 目录删除：先停内部进程 → rmtree → 失败计数重试 + 告警。
+
+    ``shutil.rmtree(ignore_errors=True)`` 在 Windows 文件锁下静默失败；
+    失败目录跨轮次重试（下次 reconcile 再试），连续 ``_HUSK_RETRY_MAX``
+    次仍失败则 log.error（持久 husk 需要人工介入）。
+
+    ``recheck_git``（并发审计 F1）：仅对**调用时无 .git 的 husk**场景开启
+    —— stop 进程的窗口里另一协程可能已完成 git worktree add（.git 刚写
+    入），二次 stat 避免把刚复活的活树当 husk 删。orphan 目录（调用时
+    有 .git 的未注册树）不适用（本来就有 .git，无复活误判窗口）。
+    """
+    try:
+        from hiveweave.services.process_registry import (
+            stop_processes_for_worktree,
+        )
+
+        stop_processes_for_worktree(str(child))
+    except Exception:
+        pass
+    if recheck_git and (child / ".git").exists():
+        log.info(
+            "git_worktree.reconcile_husk_revived_skip",
+            workspace=workspace_path,
+            dir=str(child),
+        )
+        return
+    shutil.rmtree(child, ignore_errors=True)
+    key = os.path.normcase(str(child))
+    if not child.exists():
+        _husk_remove_failures.pop(key, None)
+        report["removed_dirs"] = report.get("removed_dirs", 0) + 1
+        log.info(
+            "git_worktree.reconcile_husk_removed",
+            workspace=workspace_path,
+            dir=str(child),
+            source=source,
+        )
+    else:
+        n = _husk_remove_failures.get(key, 0) + 1
+        _husk_remove_failures[key] = n
+        report.setdefault("errors", []).append(
+            f"failed to remove husk dir: {child} (attempt {n}/{_HUSK_RETRY_MAX})"
+        )
+        if n == _HUSK_RETRY_MAX:
+            log.error(
+                "git_worktree.reconcile_husk_persistent",
+                workspace=workspace_path,
+                dir=str(child),
+                attempts=n,
+                hint="Directory locked by a process (Device busy). Kill the "
+                "holding process or move the directory aside manually.",
+            )
+
 def _parse_worktree_porcelain(raw: str) -> list[dict]:
     """解析 ``git worktree list --porcelain`` → [{path, head, branch}]"""
     entries: list[dict] = []
@@ -522,6 +589,9 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
     # ② 磁盘 → 注册表: 未注册的孤儿目录 → rmtree
     # TEST3: never rmtree dirs that still belong to active executors / open tasks
     # (git registry desync must not erase in-flight work). Prefer reattach.
+    # 2026-08-11 A023 事故：active agent 的 **husk**（无 .git，非活树）此前被
+    # protected 保护跳过 → 永久残留 → merge/checkpoint 反复解析到损坏目录。
+    # husk 直接清（不丢任何工作：工作要么已提交要么在 .git 里）；活树仍保护。
     protected_sids = await _protected_worktree_short_ids(workspace_path)
     if wt_root.is_dir():
         for child in sorted(wt_root.iterdir()):
@@ -531,6 +601,26 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
                 continue
             sid = child.name
             if sid in protected_sids:
+                if not (child / ".git").exists():
+                    # 2026-08-11 A023 事故 + 并发审计 F1：active agent 的 husk
+                    # 不能直接杀进程+rmtree —— 快照陈旧 + .git stat 瞬时失败
+                    # 的窗口下可能误杀刚并发 add 出来的活树。repair-first：
+                    # 先 _try_reattach_worktree（git worktree add --force 会把
+                    # 空目录修复成活树，不丢任何东西），失败才删除。
+                    reattached = await _try_reattach_worktree(
+                        workspace_path, sid, str(child)
+                    )
+                    if reattached:
+                        report.setdefault("reattached_dirs", []).append(sid)
+                        log.info(
+                            "git_worktree.reconcile_protected_husk_reattached",
+                            workspace=workspace_path,
+                            dir=str(child),
+                            short_id=sid,
+                        )
+                        continue
+                    _rmtree_husk(child, report, workspace_path, source="protected_husk")
+                    continue
                 reattached = await _try_reattach_worktree(
                     workspace_path, sid, str(child)
                 )
@@ -551,14 +641,10 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
                         short_id=sid,
                     )
                 continue
-            shutil.rmtree(child, ignore_errors=True)
-            if child.exists():
-                report["errors"].append(
-                    f"failed to remove orphan dir: {child}")
-            else:
-                report["removed_dirs"] += 1
-                log.info("git_worktree.reconcile_dir_removed",
-                         workspace=workspace_path, dir=str(child))
+            _rmtree_husk(
+                child, report, workspace_path, source="orphan_dir",
+                recheck_git=False,  # 有 .git 的未注册目录：无 husk 复活误判窗口
+            )
 
     # ②.5 P0-3: clean .stale-* rename-aside residue + process-aware husk removal
     if wt_root.is_dir():
@@ -576,32 +662,17 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
                         workspace=workspace_path, dir=str(child),
                     )
                 continue
-            # Husk: dir exists, no .git, not registered, not protected
+            # Husk: dir exists, no .git, not registered
             # → stop processes inside then remove (P0-3 orphan cleanup)
+            # 2026-08-11 A023 事故：此前 `name not in protected_sids` 排除
+            # active agent 的 husk —— 无 .git 的目录不是活树，保护反而让
+            # 损坏目录永久残留。husk 一律清。
             if (
                 not (child / ".git").exists()
                 and os.path.normcase(str(child)) not in registered
-                and name not in protected_sids
                 and not name.startswith("_")  # skip _quarantine etc.
             ):
-                try:
-                    from hiveweave.services.process_registry import (
-                        stop_processes_for_worktree,
-                    )
-
-                    stop_processes_for_worktree(str(child))
-                except Exception:
-                    pass
-                shutil.rmtree(child, ignore_errors=True)
-                if not child.exists():
-                    report["removed_dirs"] += 1
-                    log.info(
-                        "git_worktree.reconcile_husk_removed",
-                        workspace=workspace_path, dir=str(child),
-                    )
-                else:
-                    report["errors"].append(
-                        f"failed to remove husk dir: {child}")
+                _rmtree_husk(child, report, workspace_path, source="husk")
 
     # ③ 分支对账: t-<taskid8> 查任务表, legacy slug 直接候选;
     #    merged → -d 删除, 未合并 → preserved 报告

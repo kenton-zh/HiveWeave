@@ -231,6 +231,7 @@ class LifecycleMixin:
             )
 
         # ① worktree 移除链: remove → remove --force → rmtree + prune
+        removed = True
         ok, _ = await _git(["worktree", "remove", fwd_path], workspace_path)
         if not ok:
             ok, _ = await _git(
@@ -240,6 +241,18 @@ class LifecycleMixin:
             # Worktree may not be registered — delete directory manually
             shutil.rmtree(path, ignore_errors=True)
             await _git(["worktree", "prune"], workspace_path)
+            # 2026-08-11 A023 事故：Windows 文件锁下 rmtree 静默失败 →
+            # husk 永久残留。失败必须透出（removed=False），由调用方/reconcile
+            # 重试，而不是假装删除成功。
+            if Path(path).exists():
+                log.error(
+                    "git_worktree.delete_dir_remove_failed",
+                    short_id=short_id,
+                    path=str(path),
+                    hint="Directory locked (Device busy). Reconcile will retry; "
+                    "kill the holding process or move it aside if persistent.",
+                )
+                removed = False
 
         # ②/③ 分支处置 (分支不存在时 _dispose_branch 直接返回 None)
         preserved = await self._dispose_branch(workspace_path, target, discard)
@@ -248,7 +261,7 @@ class LifecycleMixin:
                  preserved=preserved is not None, discard=discard)
         return {
             "success": True,
-            "removed": True,
+            "removed": removed,
             "branch": target,
             "preserved_branch": preserved,
         }
