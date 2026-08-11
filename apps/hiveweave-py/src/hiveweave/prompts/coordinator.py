@@ -508,6 +508,10 @@ Gate 报错会带回**完整 task UUID** 和可复制的工具调用，照抄即
       — approve 必须读 evidence 机器戳（commits_ahead / close_blocked / unmerged）；字数不是证据
    b. **如果 approve** → **立即**调用 `git_worktree_merge(branchName=shortId 或 hw/...)`
       把该 executor 的 worktree 合并到主分支。**不调用 merge 视为任务未完成**。
+      **例外（代审）**：若你**不是该任务的 creator**（如被 CEO/上级委托审批他人
+      创建的任务），merge 由任务 **creator（merge owner）** 负责 —— 系统会发
+      [MERGE PENDING] 给 creator；你在 approve 回执里提醒 creator merge 即可，
+      不要自己 merge 你不拥有分支的任务。
       **VERIFY 只在 merge 成功后、且仅针对本次 merge 覆盖的任务创建**。
    c. 然后 `send_message` 通知上级（汇报，不是派活）。
 5. Report results to your superior via `send_message`
@@ -515,7 +519,9 @@ IMPORTANT: Do NOT endlessly list files. After 2-3 file reads, immediately design
 
 ### 强约束：worktree 合并（人类模型）
 - **每个**经你审批通过（review_task decision="approve"）的子任务，**必须**在
-  review_task 的同一次工具调用链中**之后**调用 `git_worktree_merge`。
+  review_task 的同一次工具调用链中**之后**调用 `git_worktree_merge` ——
+  **除非你是代审**（不是任务 creator）：此时 merge 是 creator（merge owner）
+  的义务，你只在回执中提醒 creator。
 - 合并失败（conflict）→ main 上的 merge **已 abort**（没有 conflict marker）：
   1. 系统/你应 `review_task(decision='rework')`，把冲突文件列表交给 **原 executor**
   2. Executor 在 **自己的 worktree** 里 `merge`/`rebase` main、解冲突、checkpoint、再提交
@@ -523,7 +529,8 @@ IMPORTANT: Do NOT endlessly list files. After 2-3 file reads, immediately design
 - **集成收尾约定**: merge 成功后若 main 上检出残留冲突标记，系统会自动创建
   「清理合并残留冲突标记」任务并指派给被合并 worktree 的 owner —— main 上的
   集成收尾/冲突清理由相关模块的 owner 在其 worktree 内修复后重新合并；
-  你负责 review + merge（你自己实现的部分除外 —— 那走 CEO 审）。
+  你负责 review；你创建的任务（你是 merge owner）你负责 merge
+  （你自己实现的部分除外 —— 那走 CEO 审）。
 - **自检**：每轮结束前用 `git_worktree_list` 确认已 approve 的 worktree 已 merge。
   未 merge 前不要派/催 VERIFY。
 - **反合理化表**：

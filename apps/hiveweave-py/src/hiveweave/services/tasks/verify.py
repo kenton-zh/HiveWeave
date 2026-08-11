@@ -13,6 +13,27 @@ from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
 
 log = structlog.get_logger(__name__)
 
+# API 人类创建任务的 creator 哨兵（api/tasks.py）—— 不是 agent，发给它
+# inbox/义务无意义，必须 fallback 到真实 agent。
+_HUMAN_CREATOR_SENTINELS = frozenset({"user", "用户", "human"})
+
+
+def resolve_merge_owner(task: dict, fallback: str | None) -> str | None:
+    """Merge 职责方：任务 creator（排除 API 人类哨兵）→ fallback（同排除）。
+
+    2026-08-11 slack-clone_01 复盘：merge 义务/提醒/清理三处接收者曾分别
+    写死（reviewer/creator/creator），代审场景互相打错。统一入口：wake
+    接收者、obligation owner、merge 后清理目标都用本函数取同一人。
+    fallback 同样排除哨兵（API 任务 submit 时 reviewer 默认 = creator，
+    可能也是 "user"）—— 全哨兵链返回 None，调用方兜底到真实 agent。
+    """
+    creator = task.get("creator_id")
+    if creator and creator not in _HUMAN_CREATOR_SENTINELS:
+        return creator
+    if fallback and fallback not in _HUMAN_CREATOR_SENTINELS:
+        return fallback
+    return None
+
 
 class VerifyMixin:
     """mark_verifying / close verify parent / migrate orphan approved."""
@@ -36,14 +57,18 @@ class VerifyMixin:
     ) -> None:
         """Parent task enters verifying after VERIFY child is spawned."""
         rows = await _query(
-            project_id, "SELECT status, creator_id FROM tasks WHERE id = ?", [task_id]
+            project_id,
+            "SELECT status, creator_id, reviewer_id FROM tasks WHERE id = ?",
+            [task_id],
         )
         if not rows:
             raise ValueError(f"Task not found: {task_id}")
         current = rows[0]["status"]
-        creator_id = rows[0]["creator_id"]
+        owner = resolve_merge_owner(
+            {"creator_id": rows[0]["creator_id"]}, rows[0]["reviewer_id"]
+        )
         if current == "verifying":
-            await self._clear_merge_pending_inbox(task_id, creator_id)
+            await self._clear_merge_pending_inbox(task_id, owner)
             return
         if current == "approved":
             await self._transition(
@@ -58,24 +83,24 @@ class VerifyMixin:
                 "verifying",
                 summary=f"[verifying] task {task_id[:8]}",
             )
-            await self._clear_merge_pending_inbox(task_id, creator_id)
+            await self._clear_merge_pending_inbox(task_id, owner)
             return
         if current == "closed":
-            await self._clear_merge_pending_inbox(task_id, creator_id)
+            await self._clear_merge_pending_inbox(task_id, owner)
             return
         raise ValueError(f"Cannot mark verifying from status={current}")
 
     async def _clear_merge_pending_inbox(
-        self, task_id: str, creator_id: str | None
+        self, task_id: str, owner_id: str | None
     ) -> None:
         """Mark stale [MERGE PENDING] for this task as read (merge already done)."""
-        if not creator_id or not task_id:
+        if not owner_id or not task_id:
             return
         try:
             from hiveweave.services.inbox import InboxService
 
             await InboxService().supersede_watchdog_messages(
-                creator_id,
+                owner_id,
                 prefixes=["[MERGE PENDING]", "[MERGE PROXY]"],
                 contains=task_id[:8],
             )
@@ -83,7 +108,7 @@ class VerifyMixin:
             log.warning(
                 "clear_merge_pending_failed",
                 task_id=task_id,
-                creator_id=creator_id,
+                owner_id=owner_id,
                 error=str(e),
             )
 

@@ -540,6 +540,32 @@ async def waive_merge_tool(
             error=close_err,
         )
 
+    # 2026-08-11 slack-clone_01 复盘：waive 后残留的 [MERGE PENDING] 消息
+    # 无人清理（merge 路径靠 verify._clear_merge_pending_inbox，waive 不走
+    # 那条路）——审批人/creator inbox 永远挂着一条"已读未完成"的 merge
+    # 指令。auto-close 成功后按 verify.py 同款清理 creator 的残留。
+    if auto_closed:
+        try:
+            from hiveweave.services.inbox import InboxService
+            from hiveweave.services.tasks.verify import resolve_merge_owner
+
+            # 清理目标与 _inject_merge_pending_wake 的接收者一致（共享
+            # resolve_merge_owner）：creator → reviewer → 执行 waive 的 agent。
+            await InboxService().supersede_watchdog_messages(
+                resolve_merge_owner(
+                    task, task.get("reviewer_id") or agent_id
+                )
+                or agent_id,
+                prefixes=["[MERGE PENDING]", "[MERGE PROXY]"],
+                contains=str(task["id"])[:8],
+            )
+        except Exception as e:
+            log.warning(
+                "waive_merge_clear_pending_failed",
+                task_id=task.get("id"),
+                error=str(e),
+            )
+
     msg = (
         f"Merge waived for task {params.task_id}. "
         f"Stored reason: {reason}\n"
