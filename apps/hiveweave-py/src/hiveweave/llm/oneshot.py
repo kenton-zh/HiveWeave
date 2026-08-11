@@ -18,18 +18,22 @@ async def llm_oneshot(
     tier: str,
     system_prompt: str,
     user_prompt: str,
-    timeout_s: int = 90,
+    timeout_s: int = 60,
     temperature: float = 0.3,
-    max_attempts: int = 2,
+    max_attempts: int = 1,
 ) -> str | None:
     """Single non-streaming LLM call resolved by tier; return raw text or None.
 
     - Model resolved via ``ModelService.resolve_model(tier=...)`` (primary →
       backup, strict, no cross-tier); ``None`` when unavailable.
     - Retryable HTTP failures (429 + 5xx, network errors) retried through
-      ``llm/retry.py`` (``max_attempts`` total attempts).
+      ``llm/retry.py`` (``max_attempts`` total attempts; default 1 = no retry).
+    - Holds the global LLM semaphore during the request — same concurrency
+      cap as streaming calls (``HIVEWEAVE_LLM_MAX_CONCURRENT``), so parallel
+      audits cannot bypass it.
     - Read timeout ``timeout_s`` — the upstream tool pipeline caps the whole
-      call at 120s, so the default 90s leaves headroom.
+      call at 120s, so the defaults (60s read + 10s connect, no retry) keep
+      the worst case well under that.
     - Any exception is logged and converted to ``None`` (soft-fail contract).
     """
     from hiveweave.llm.provider import provider_factory
@@ -47,6 +51,8 @@ async def llm_oneshot(
         return None
 
     import httpx
+
+    from hiveweave.llm.streamer.constants import _get_llm_semaphore
 
     from hiveweave.llm.retry import (
         PermanentError,
@@ -73,22 +79,24 @@ async def llm_oneshot(
     headers["Accept"] = "application/json"
 
     async def _do_request() -> str:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=10.0, read=timeout_s, write=10.0, pool=10.0
-            )
-        ) as client:
-            resp = await client.post(url, json=body, headers=headers)
-            if resp.status_code >= 400:
-                raise classify_http_error(
-                    resp.status_code, resp.text[:500], dict(resp.headers)
+        sem = _get_llm_semaphore()
+        async with sem:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=10.0, read=timeout_s, write=10.0, pool=10.0
                 )
-            data = resp.json()
-            choices = data.get("choices") or []
-            if not choices:
-                return ""
-            content = choices[0].get("message", {}).get("content")
-            return content if isinstance(content, str) else ""
+            ) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                if resp.status_code >= 400:
+                    raise classify_http_error(
+                        resp.status_code, resp.text[:500], dict(resp.headers)
+                    )
+                data = resp.json()
+                choices = data.get("choices") or []
+                if not choices:
+                    return ""
+                content = choices[0].get("message", {}).get("content")
+                return content if isinstance(content, str) else ""
 
     handler = RetryHandler(max_retries=max(0, max_attempts - 1))
     try:

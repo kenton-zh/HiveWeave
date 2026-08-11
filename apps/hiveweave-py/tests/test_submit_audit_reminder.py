@@ -1,23 +1,24 @@
 """submit_task code_audit 软提醒 + 账本重置 + attestationIds 过滤 + hook 台账。
 
+直接使用真实的 services/code_audit 模块（不再 sys.modules 注入副本 stub）。
 覆盖：
-(a) 账本 >20 且近期无审计凭证 → 提交成功但文本带 CODE_AUDIT_REMINDER，状态仍流转
-(b) 近期已有 code_audit 审计凭证 → 无提醒
+(a) 账本 >20 且无审计凭证 → 提交成功但文本带 CODE_AUDIT_REMINDER，状态仍流转
+(b) 审计凭证晚于最后一次编辑 → 无提醒
+(b2) 审计凭证早于最后一次编辑 → 提醒仍触发（B2 回归钉）
 (c) ≤20 行 → 无提醒
 (d) dry_run=True → 无提醒、不重置
 (e) 真实提交成功 → reset_ledger 被调用
 (f) attestationIds 含 code_audit kind → 被过滤，其余保留
-(g) TOOL_EXECUTE_AFTER hook handler 单测（成功记账 / 失败与无关工具忽略 / 坏输入不抛）
+(g) TOOL_EXECUTE_AFTER hook handler 单测（成功记账 / 失败与无关工具忽略 / 坏输入不抛 / 账本异常吞掉）
 (h) ToolExecutor.execute 发射 hook 触发 handler
 """
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from contextlib import ExitStack
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -25,72 +26,25 @@ import pytest
 _PROJ = "proj"
 _AGENT = "agent-1"
 
-_REMINDER = (
-    "[CODE AUDIT REMINDER] 本次代码变更超过 20 行且近期未执行代码审计，"
-    "请执行 request_code_audit 后再重新提交。"
-)
-
-
-class _Ledger:
-    def __init__(self) -> None:
-        self.lines = 0
-        self.reset_count = 0
-
-
-def _install_code_audit_stub(ledger: _Ledger) -> None:
-    """services/code_audit 由并行 agent 实现 —— 测试用同契约 stub 占位。"""
-    mod = ModuleType("hiveweave.services.code_audit")
-    mod.CODE_AUDIT_LINE_THRESHOLD = 20  # type: ignore[attr-defined]
-    mod.CODE_AUDIT_KIND = "code_audit"  # type: ignore[attr-defined]
-    mod.CODE_AUDIT_REMINDER = _REMINDER  # type: ignore[attr-defined]
-
-    def count_change_lines(tool_name: str, params: dict) -> int:
-        if not isinstance(params, dict):
-            return 0
-        if tool_name == "write_file":
-            return len((params.get("content") or "").splitlines())
-        if tool_name == "edit_file":
-            return len((params.get("new_string") or "").splitlines())
-        if tool_name == "apply_patch":
-            total = 0
-            for p in params.get("patches") or []:
-                txt = p.get("newString") or p.get("content") or ""
-                total += len(txt.splitlines())
-            return total
-        return 0
-
-    def record_change(agent_id: str, lines: int) -> None:
-        ledger.lines += int(lines or 0)
-
-    def get_unaudited_lines(agent_id: str) -> int:
-        return ledger.lines
-
-    def reset_ledger(agent_id: str) -> None:
-        ledger.reset_count += 1
-        ledger.lines = 0
-
-    def ledger_snapshot() -> dict:
-        return {"lines": ledger.lines}
-
-    mod.count_change_lines = count_change_lines  # type: ignore[attr-defined]
-    mod.record_change = record_change  # type: ignore[attr-defined]
-    mod.get_unaudited_lines = get_unaudited_lines  # type: ignore[attr-defined]
-    mod.reset_ledger = reset_ledger  # type: ignore[attr-defined]
-    mod.ledger_snapshot = ledger_snapshot  # type: ignore[attr-defined]
-    sys.modules["hiveweave.services.code_audit"] = mod  # type: ignore[assignment]
+_REMINDER_MARKER = "[CODE AUDIT REMINDER]"
 
 
 @pytest.fixture(autouse=True)
-def code_audit_env():
-    """Stub services.code_audit（并行 agent 拥有真实模块）+ 账本。"""
-    ledger = _Ledger()
-    prev = sys.modules.get("hiveweave.services.code_audit")
-    _install_code_audit_stub(ledger)
-    yield ledger
-    if prev is None:
-        sys.modules.pop("hiveweave.services.code_audit", None)
-    else:
-        sys.modules["hiveweave.services.code_audit"] = prev
+def code_audit_env(monkeypatch):
+    """真实 services/code_audit 模块 + 按 agent 隔离账本 + reset_ledger 调用计数。"""
+    from hiveweave.services import code_audit
+
+    code_audit.reset_ledger(_AGENT)
+    state = {"reset_count": 0}
+    real_reset = code_audit.reset_ledger
+
+    def _spy_reset(agent_id: str) -> None:
+        state["reset_count"] += 1
+        real_reset(agent_id)
+
+    monkeypatch.setattr(code_audit, "reset_ledger", _spy_reset)
+    yield state
+    real_reset(_AGENT)
 
 
 def _params(attestation_ids=None, dry_run=False, summary="done"):
@@ -123,7 +77,7 @@ def _task():
     }
 
 
-async def _run(params, ledger, extra_patches=None):
+async def _run(params, extra_patches=None):
     """驱动 submit_task_tool，返回 (result, evidence)。"""
     captured: dict = {}
 
@@ -173,35 +127,70 @@ async def _run(params, ledger, extra_patches=None):
     return result, captured.get("evidence") or {}
 
 
+def _record_over_threshold() -> None:
+    from hiveweave.services.code_audit import record_change
+
+    record_change(_AGENT, 25)
+
+
+def _last_change_ts_ms() -> int:
+    from hiveweave.services.code_audit import get_last_change_ts
+
+    return int(get_last_change_ts(_AGENT) * 1000)
+
+
 # ── (a) 超阈 + 无审计 → 提醒但不阻断 ─────────────────────
 
 
 @pytest.mark.asyncio
 async def test_reminder_when_over_threshold_without_audit(code_audit_env):
-    ledger = code_audit_env
-    ledger.lines = 25
-    result, _ = await _run(_params(), ledger)
+    _record_over_threshold()
+    result, _ = await _run(_params())
     assert result.success is True
-    assert "[CODE AUDIT REMINDER]" in result.output
-    assert ledger.reset_count == 1
+    assert _REMINDER_MARKER in result.output
+    assert code_audit_env["reset_count"] == 1
 
 
-# ── (b) 近期已有审计凭证 → 无提醒 ─────────────────────────
+# ── (b) 审计凭证晚于最后一次编辑 → 无提醒 ─────────────────
 
 
 @pytest.mark.asyncio
-async def test_no_reminder_with_fresh_audit_attestation(code_audit_env):
-    ledger = code_audit_env
-    ledger.lines = 25
+async def test_no_reminder_with_audit_after_last_edit(code_audit_env):
+    _record_over_threshold()
     fresh_audit = patch(
         "hiveweave.services.attestation.find_latest_attestation_by_kind",
         new_callable=AsyncMock,
-        return_value={"id": "audit-1", "kind": "code_audit"},
+        return_value={
+            "id": "audit-1",
+            "kind": "code_audit",
+            "created_at": _last_change_ts_ms() + 1000,
+        },
     )
-    result, _ = await _run(_params(), ledger, extra_patches=[fresh_audit])
+    result, _ = await _run(_params(), extra_patches=[fresh_audit])
     assert result.success is True
-    assert "[CODE AUDIT REMINDER]" not in result.output
-    assert ledger.reset_count == 1
+    assert _REMINDER_MARKER not in result.output
+    assert code_audit_env["reset_count"] == 1
+
+
+# ── (b2) 审计凭证早于最后一次编辑 → 提醒仍触发（B2 回归钉）─────
+
+
+@pytest.mark.asyncio
+async def test_reminder_when_audit_predates_last_edit(code_audit_env):
+    _record_over_threshold()
+    stale_audit = patch(
+        "hiveweave.services.attestation.find_latest_attestation_by_kind",
+        new_callable=AsyncMock,
+        return_value={
+            "id": "audit-1",
+            "kind": "code_audit",
+            "created_at": _last_change_ts_ms() - 1000,
+        },
+    )
+    result, _ = await _run(_params(), extra_patches=[stale_audit])
+    assert result.success is True
+    assert _REMINDER_MARKER in result.output
+    assert code_audit_env["reset_count"] == 1
 
 
 # ── (c) ≤20 行 → 无提醒 ──────────────────────────────────
@@ -209,12 +198,13 @@ async def test_no_reminder_with_fresh_audit_attestation(code_audit_env):
 
 @pytest.mark.asyncio
 async def test_no_reminder_within_threshold(code_audit_env):
-    ledger = code_audit_env
-    ledger.lines = 5
-    result, _ = await _run(_params(), ledger)
+    from hiveweave.services.code_audit import record_change
+
+    record_change(_AGENT, 5)
+    result, _ = await _run(_params())
     assert result.success is True
-    assert "[CODE AUDIT REMINDER]" not in result.output
-    assert ledger.reset_count == 1
+    assert _REMINDER_MARKER not in result.output
+    assert code_audit_env["reset_count"] == 1
 
 
 # ── (d) dry_run → 无提醒、不重置 ──────────────────────────
@@ -222,12 +212,11 @@ async def test_no_reminder_within_threshold(code_audit_env):
 
 @pytest.mark.asyncio
 async def test_dry_run_no_reminder_no_reset(code_audit_env):
-    ledger = code_audit_env
-    ledger.lines = 25
-    result, _ = await _run(_params(dry_run=True), ledger)
+    _record_over_threshold()
+    result, _ = await _run(_params(dry_run=True))
     assert result.success is True
-    assert "[CODE AUDIT REMINDER]" not in result.output
-    assert ledger.reset_count == 0
+    assert _REMINDER_MARKER not in result.output
+    assert code_audit_env["reset_count"] == 0
     assert "dry-run" in result.output
 
 
@@ -237,8 +226,7 @@ async def test_dry_run_no_reminder_no_reset(code_audit_env):
 
 @pytest.mark.asyncio
 async def test_reset_only_on_real_submit_success(code_audit_env):
-    ledger = code_audit_env
-    ledger.lines = 30
+    _record_over_threshold()
     stack = ExitStack()
     TS = stack.enter_context(patch("hiveweave.services.task.TaskService"))
     stack.enter_context(
@@ -271,7 +259,7 @@ async def test_reset_only_on_real_submit_success(code_audit_env):
 
         result = await submit_task_tool(_params(), _AGENT, "/tmp/ws")
     assert result.success is False
-    assert ledger.reset_count == 0
+    assert code_audit_env["reset_count"] == 0
 
 
 # ── (f) attestationIds 含 code_audit kind → 过滤，其余保留 ──
@@ -279,7 +267,6 @@ async def test_reset_only_on_real_submit_success(code_audit_env):
 
 @pytest.mark.asyncio
 async def test_code_audit_attestation_ids_filtered(code_audit_env):
-    ledger = code_audit_env
     kinds = {"att-audit": "code_audit", "att-test": "test_run"}
 
     async def _fake_get(project_id, attestation_id):
@@ -295,7 +282,6 @@ async def test_code_audit_attestation_ids_filtered(code_audit_env):
     )
     result, evidence = await _run(
         _params(attestation_ids=["att-audit", "att-test"]),
-        ledger,
         extra_patches=[get_patch],
     )
     assert result.success is True
@@ -307,8 +293,8 @@ async def test_code_audit_attestation_ids_filtered(code_audit_env):
 
 @pytest.mark.asyncio
 async def test_hook_records_write_file_success(code_audit_env):
-    ledger = code_audit_env
     from hiveweave.hooks.handlers.code_audit_ledger import on_tool_execute_after
+    from hiveweave.services.code_audit import get_unaudited_lines
 
     await on_tool_execute_after(
         {
@@ -320,13 +306,13 @@ async def test_hook_records_write_file_success(code_audit_env):
         },
         {},
     )
-    assert ledger.lines == 3
+    assert get_unaudited_lines(_AGENT) == 3
 
 
 @pytest.mark.asyncio
 async def test_hook_ignores_failure_and_non_write_tools(code_audit_env):
-    ledger = code_audit_env
     from hiveweave.hooks.handlers.code_audit_ledger import on_tool_execute_after
+    from hiveweave.services.code_audit import get_unaudited_lines
 
     await on_tool_execute_after(
         {
@@ -348,13 +334,13 @@ async def test_hook_ignores_failure_and_non_write_tools(code_audit_env):
         },
         {},
     )
-    assert ledger.lines == 0
+    assert get_unaudited_lines(_AGENT) == 0
 
 
 @pytest.mark.asyncio
 async def test_hook_never_raises_on_bad_input(code_audit_env):
-    ledger = code_audit_env
     from hiveweave.hooks.handlers.code_audit_ledger import on_tool_execute_after
+    from hiveweave.services.code_audit import get_unaudited_lines
 
     for bad in (
         {},
@@ -374,15 +360,19 @@ async def test_hook_never_raises_on_bad_input(code_audit_env):
         },
     ):
         await on_tool_execute_after(bad, {})
-    assert ledger.lines == 0
+    assert get_unaudited_lines(_AGENT) == 0
 
 
 @pytest.mark.asyncio
-async def test_hook_swallows_module_failure(code_audit_env):
-    ledger = code_audit_env
-    sys.modules.pop("hiveweave.services.code_audit", None)
+async def test_hook_swallows_ledger_failure(code_audit_env, monkeypatch):
     from hiveweave.hooks.handlers.code_audit_ledger import on_tool_execute_after
+    from hiveweave.services import code_audit
+    from hiveweave.services.code_audit import get_unaudited_lines
 
+    def _boom(*args, **kwargs) -> None:
+        raise RuntimeError("ledger boom")
+
+    monkeypatch.setattr(code_audit, "record_change", _boom)
     await on_tool_execute_after(
         {
             "agent_id": _AGENT,
@@ -393,7 +383,7 @@ async def test_hook_swallows_module_failure(code_audit_env):
         },
         {},
     )
-    assert ledger.lines == 0
+    assert get_unaudited_lines(_AGENT) == 0
 
 
 # ── (h) ToolExecutor.execute 发射 hook 触发 handler ──────
@@ -401,10 +391,10 @@ async def test_hook_swallows_module_failure(code_audit_env):
 
 @pytest.mark.asyncio
 async def test_executor_emission_fires_ledger_handler(code_audit_env):
-    ledger = code_audit_env
     from hiveweave.hooks import TOOL_EXECUTE_AFTER, hooks
     from hiveweave.hooks.handlers import register_builtin_handlers
     from hiveweave.hooks.handlers.code_audit_ledger import register as register_ledger
+    from hiveweave.services.code_audit import get_unaudited_lines
 
     register_builtin_handlers()
     hooks.clear(TOOL_EXECUTE_AFTER)
@@ -437,6 +427,6 @@ async def test_executor_emission_fires_ledger_handler(code_audit_env):
                 ws,
             )
         assert result.get("success") is True
-        assert ledger.lines == 4
+        assert get_unaudited_lines(_AGENT) == 4
     finally:
         hooks.clear(TOOL_EXECUTE_AFTER)

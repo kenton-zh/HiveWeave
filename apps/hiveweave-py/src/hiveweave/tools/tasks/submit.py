@@ -695,14 +695,20 @@ async def submit_task_tool(
                 CODE_AUDIT_KIND,
                 CODE_AUDIT_LINE_THRESHOLD,
                 CODE_AUDIT_REMINDER,
+                get_last_change_ts,
                 get_unaudited_lines,
                 reset_ledger,
             )
 
             if get_unaudited_lines(agent_id) > CODE_AUDIT_LINE_THRESHOLD:
-                if not await find_latest_attestation_by_kind(
+                latest = await find_latest_attestation_by_kind(
                     project_id, agent_id=agent_id, kind=CODE_AUDIT_KIND
-                ):
+                )
+                audited_after_changes = (
+                    latest is not None
+                    and latest.get("created_at", 0) >= get_last_change_ts(agent_id) * 1000
+                )
+                if not audited_after_changes:
                     audit_reminder = f"\n{CODE_AUDIT_REMINDER}"
             reset_ledger(agent_id)
         except Exception as e:  # noqa: BLE001
