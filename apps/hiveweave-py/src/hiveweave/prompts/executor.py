@@ -369,10 +369,12 @@ NEVER just write your report as assistant text and expect it to reach anyone. Te
 
 **合法等待（MANDATORY）**：若必须等别人完成、等脚本结果、等用户决策——
 **禁止**保持 `running` 空转。必须：
-- 等待另一个任务完成：`update_task_status(taskId, "blocked", dependsOnTaskId="<目标任务ID>", blockedReason="dependency: 简述原因")`
-  **必须用 dependsOnTaskId**（结构化），系统会在目标任务 approve/close 后自动 unblock 并叫醒你。blockedReason 仅作人类可读备注。
-- 等待定时/用户/外部：`update_task_status(taskId, "blocked", blockedReason="timer:…|user:…|external:…")`
-timer 等待同时 `schedule_alarm`（purpose 写明 taskId 与检查项）。
+- 等待其他任务完成：`update_task_status(taskId, "blocked", dependsOnTaskIds=["<目标任务ID>"], blockedReason="简述原因")`
+  **必须用 dependsOnTaskIds**（结构化），系统会在目标任务 approve/close 后自动 unblock 并叫醒你。blockedReason 仅作人类可读备注。
+- 等待定时：`update_task_status(taskId, "blocked", wakeAt="<ISO-8601 或 epoch 毫秒>", blockedReason="简述原因")`（可选 waitKind="timer"），到期自动 unblock。
+- 等待用户/外部：同样需要 dependsOnTaskIds 或 wakeAt 之一（否则工具硬拒）——没有明确依赖就用 wakeAt 设定复查截止。
+**block 必须带 dependsOnTaskIds 或 wakeAt 之一**，否则系统拒绝（无解封路径的任务会永久卡住整个队列）。
+timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检查项）——但 **schedule_alarm 不解封任务**，解封只靠 wakeAt 到期。
 
 注意：`send_message` 仍用于向上级咨询问题或与同事协调，但不再用于报告任务完成。
 

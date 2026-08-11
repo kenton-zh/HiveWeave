@@ -1564,7 +1564,17 @@ class GameTimeService:
             # 行动，跳过 stale 催办；仍有交付前/失联 upstream 或无引用时才催。
             if not upstream_nudge_relevant(t, by_task_id):
                 continue
-            if str(assignee) in live_wait_agents:
+            # 2026-08-11 slack-clone_01 死锁复盘：live_wait_agents 跳过只对
+            # 「有自动解封路径」的任务生效（reconcile 会接管）；无路径的
+            # parked 任务若 assignee 恰好被 claim 门禁指示 commit_turn
+            # (waiting) 而持有 wait contract，跳过会让看门狗永久沉默 ——
+            # 死等必须催。
+            from hiveweave.services.tasks.lifecycle import (
+                blocked_task_has_wake_path,
+            )
+
+            has_wake = blocked_task_has_wake_path(t, now_ms)
+            if has_wake and str(assignee) in live_wait_agents:
                 continue
             last = cooldowns.get(f"blocked:{tid}") or 0
             if now_ms - last < TASK_STALL_COOLDOWN_MS:
@@ -1574,28 +1584,43 @@ class GameTimeService:
             blocked_counts[tid] = count
             title = (t.get("title") or "(untitled)").split("\n")[0][:50]
             reason = (t.get("blocked_reason") or "")[:80]
+            # 能解卡的是设卡/建任务的人（creator），不是被 park 的 assignee
+            # （assignee 往往已被门禁指示 commit_turn(waiting)，无能为力）。
+            # creator 缺失或等于 assignee 时回退 assignee。
+            recipient = t.get("creator_id") or assignee
+            parked_note = ""
+            if not has_wake:
+                parked_note = (
+                    f" NO auto-unblock path (no dependsOnTaskIds, no wakeAt) "
+                    f"— it will never wake itself; give it dependsOnTaskIds/"
+                    f"wakeAt first, or unblock it (update_task_status running) "
+                    f"when no other VERIFY is running."
+                )
             try:
                 await inbox.send_message(
                     from_agent_id="system",
-                    to_agent_id=assignee,
+                    to_agent_id=recipient,
                     message=(
                         f"[BLOCKED STALE] Task '{title}' ({tid[:8]}) blocked "
                         f">{BLOCKED_STALE_MS // 60000}min "
-                        f"(reason={reason or 'n/a'}). "
-                        f"Unblock, retarget dependsOnTaskId, or escalate."
+                        f"(reason={reason or 'n/a'}).{parked_note} "
+                        f"Unblock, retarget dependsOnTaskIds, or escalate."
                     ),
                     message_type="task",
                     priority="urgent",
                     task_id=tid,
                     wake=True,
                 )
-                await self._watchdog_trigger(assignee)
+                await self._watchdog_trigger(recipient)
             except Exception as e:
                 log.warning("blocked_stale_nudge_failed", task_id=tid, error=str(e))
 
             if count > STALL_ESCALATION_THRESHOLD:
-                creator = t.get("creator_id")
-                escalate_to = creator
+                # 催办已发 recipient（通常是 creator）；再未行动则向其上级升级
+                escalate_to = None
+                sup = by_id.get(str(recipient))
+                if sup:
+                    escalate_to = sup.get("parent_id") or recipient
                 if not escalate_to or escalate_to == assignee:
                     asg = by_id.get(str(assignee))
                     escalate_to = asg.get("parent_id") if asg else None

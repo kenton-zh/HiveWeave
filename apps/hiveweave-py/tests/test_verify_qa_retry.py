@@ -191,7 +191,13 @@ async def test_retry_ignores_assigned_or_non_blocked(task_env):
     )
     await ts.claim_task(pid, other_id, EXEC)
     await ts.start_task(pid, other_id)
-    await ts.block_task(pid, other_id, "external: waiting browser")
+    # 有 assignee 且有解封路径（depends_on）的 blocked VERIFY 占串行锁
+    # （2026-08-11 起：无解封路径的 parked blocked 不占锁，见
+    #  test_blocked_wake_path_hardening.py）
+    await ts.block_task(
+        pid, other_id, "external: waiting browser",
+        depends_on_task_id=parent_id,
+    )
     # 非 VERIFY 的 blocked 任务，同样不动
     plain_id = await ts.create_task(
         pid, "Plain task", "d", creator_id=COORD, assignee_id=None
@@ -211,7 +217,7 @@ async def test_retry_ignores_assigned_or_non_blocked(task_env):
     ):
         n = await retry_qa_blocked_verify_tasks(pid)
 
-    assert n == 0  # verify_id 重挂回 created，但 other（blocked+有 assignee）占串行锁 → nudged=False
+    assert n == 0  # verify_id 重挂回 created，但 other（blocked+有 assignee+有解封路径）占串行锁 → nudged=False
     rehooked = await ts.get_task(pid, verify_id)
     assert rehooked["assignee_id"] == QA
     assert rehooked["status"] == "created"
