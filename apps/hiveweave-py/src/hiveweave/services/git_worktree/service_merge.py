@@ -27,6 +27,7 @@ from .git_cmd import _current_branch, _git, _resolve_base_branch
 from .merge_support import (
     _auto_checkpoint_dirty_target,
     _merge_failure_result,
+    classify_main_dirt,
     parse_untracked_overwrite,
     quarantine_untracked_on_target,
     restore_regenerable_dirt_or_reject,
@@ -324,6 +325,137 @@ class MergeMixin:
 
         return None
 
+    async def preflight_merge(
+        self,
+        workspace_path: str,
+        short_id: str,
+        branch: str,
+        target_branch: str = "main",
+    ) -> dict:
+        """只读 merge 预检（dry-run）— 列出全部缺失前置条件，零改动。
+
+        与 ``_validate_merge_preconditions`` 的区别：不自动修复 husk、
+        不清理 regenerable 脏文件、不提交 —— 纯检查。merge() 失败时
+        ``_aggregate_merge_blockers`` 复用同一份检查聚合补报。
+
+        Returns ``{"success": bool, "dry_run": True, "missing": [{code,
+        message}], "already_up_to_date": bool, "branch": str}``。
+        """
+        missing: list[dict] = []
+        path = await self._resolve_effective_worktree_path(
+            workspace_path, short_id
+        )
+        if Path(path).is_dir():
+            if not _has_git(path):
+                missing.append({
+                    "code": "worktree_husk",
+                    "message": (
+                        f"worktree 目录 {path} 无 .git（husk）— 需触发 "
+                        f"worktree repair 后再 merge"
+                    ),
+                })
+            else:
+                ok_wl, wl_out = await _git(["worktree", "list"], workspace_path)
+                if ok_wl:
+                    norm_path = os.path.normcase(str(Path(path)))
+                    registered = any(
+                        os.path.normcase(line.split()[0]) == norm_path
+                        for line in (wl_out or "").splitlines()
+                        if line.strip()
+                    )
+                    if not registered:
+                        missing.append({
+                            "code": "worktree_unregistered",
+                            "message": (
+                                f"worktree 目录 {path} 未在 'git worktree "
+                                f"list' 注册 — 需 repair（重建 + 重新挂接）"
+                            ),
+                        })
+                    else:
+                        actual = await _current_branch(path)
+                        if not actual:
+                            missing.append({
+                                "code": "worktree_detached",
+                                "message": (
+                                    f"worktree {path} 处于 detached HEAD "
+                                    f"— 无分支可合并，需 repair 后重试"
+                                ),
+                            })
+        dirt = await classify_main_dirt(workspace_path)
+        if dirt["hard_blockers"]:
+            missing.append({
+                "code": "main_dirty",
+                "message": (
+                    "MAIN 有未提交变更（merge 会硬拒）："
+                    + ", ".join(dirt["hard_blockers"][:8])
+                ),
+            })
+        ok_b, b_out = await _git(["branch", "--list", branch], workspace_path)
+        branch_exists = bool(ok_b) and any(
+            (ln.strip()[2:].strip() if ln.strip().startswith(("* ", "+ "))
+             else ln.strip()) == branch
+            for ln in (b_out or "").splitlines()
+            if ln.strip()
+        )
+        if not branch_exists:
+            missing.append({
+                "code": "branch_missing",
+                "message": f"分支 {branch} 不存在（可能已合并拆除）",
+            })
+        ahead = 0
+        ok_ahead, ahead_out = await _git(
+            ["rev-list", "--count", f"{target_branch}..{branch}"],
+            workspace_path,
+        )
+        if ok_ahead:
+            try:
+                ahead = int((ahead_out or "0").strip() or "0")
+            except ValueError:
+                ahead = 0
+        return {
+            "success": not missing,
+            "dry_run": True,
+            "missing": missing,
+            "already_up_to_date": ahead == 0 and not missing,
+            "branch": branch,
+        }
+
+    async def _aggregate_merge_blockers(
+        self,
+        workspace_path: str,
+        short_id: str,
+        branch: str,
+        target_branch: str,
+        base: dict,
+        *,
+        skip_codes: set[str],
+    ) -> dict:
+        """merge 失败时聚合补报其余缺失前置条件（撞门前一次性可见）。
+
+        ``base`` 是已命中的失败 dict（首个错误文案原样保留）；缺失项里
+        与 base 同源（已被首错覆盖）的 code 经 ``skip_codes`` 过滤。
+        """
+        try:
+            report = await self.preflight_merge(
+                workspace_path, short_id, branch, target_branch
+            )
+            extras = [
+                i for i in report.get("missing", []) if i["code"] not in skip_codes
+            ]
+            if extras:
+                base = dict(base)
+                msg = str(base.get("message") or "")
+                base["message"] = (
+                    msg
+                    + "\n\n[additional blockers]\n"
+                    + "\n".join(
+                        f"- [{i['code']}] {i['message']}" for i in extras
+                    )
+                )
+        except Exception as e:
+            log.debug("merge_aggregate_blockers_failed", error=str(e))
+        return base
+
     async def merge(self, workspace_path: str, short_id: str,
                     task_name: str | None = None,
                     target_branch: str = "main", *,
@@ -348,7 +480,12 @@ class MergeMixin:
             workspace_path, short_id, branch, target_branch
         )
         if precond is not None:
-            return precond
+            return await self._aggregate_merge_blockers(
+                workspace_path, short_id, branch, target_branch, precond,
+                skip_codes={
+                    "worktree_husk", "worktree_unregistered", "worktree_detached",
+                },
+            )
 
         ok, _ = await _git(["checkout", target_branch], workspace_path)
         if not ok:
@@ -362,7 +499,10 @@ class MergeMixin:
             workspace_path, branch=branch, short_id=short_id
         )
         if reject is not None:
-            return reject
+            return await self._aggregate_merge_blockers(
+                workspace_path, short_id, branch, target_branch, reject,
+                skip_codes={"main_dirty"},
+            )
 
         # Capture files covered by this branch before merge mutates history
         ok_f, files_out = await _git(
@@ -507,7 +647,13 @@ class MergeMixin:
                 workspace_path, short_id, branch, target_branch
             )
             if precond is not None:
-                return precond
+                return await self._aggregate_merge_blockers(
+                    workspace_path, short_id, branch, target_branch, precond,
+                    skip_codes={
+                        "worktree_husk", "worktree_unregistered",
+                        "worktree_detached",
+                    },
+                )
 
         # Step 0: Fetch latest target_branch
         ok, _ = await _git(["checkout", target_branch], workspace_path)
@@ -522,6 +668,11 @@ class MergeMixin:
             workspace_path, branch=branch, short_id=short_id
         )
         if reject is not None:
+            if short_id:
+                return await self._aggregate_merge_blockers(
+                    workspace_path, short_id, branch, target_branch, reject,
+                    skip_codes={"main_dirty"},
+                )
             return reject
 
         # Step 1: Rebase worktree branch onto target_branch to minimize conflicts

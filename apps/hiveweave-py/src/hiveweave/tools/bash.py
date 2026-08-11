@@ -1505,6 +1505,7 @@ async def _issue_test_run_attestation(
 @tool(
     "bash",
     "Executes a shell command on the local system (Git Bash on Windows). Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command. For reviewer test_run binding pass taskId.\n"
+    "环境声明: Windows 宿主下优先 Git Bash（bash -c）执行，无 Git Bash 时降级 cmd /s /c（unix→cmd 近似映射），POSIX 用 bash -c；非 PowerShell，pwsh 语义（Get-Content -Tail N 等）不适用。GNU coreutils 子集可用但不保证 GNU 长选项：如 `tail --lines` 不可靠（cmd 降级路径下 tail/head 仅近似映射为 more，参数支持弱）；推荐兼容写法 `tail -n N`（GNU/BSD 均支持）。\n"
     "Windows/Git Bash notes (TEST19): run Python via 'uv run python' (project has uv) or '.venv/Scripts/python.exe' — bare 'python' may not be on PATH. Do NOT use BSD-only flags like 'tail --ignore=' or 'head --ignore=' (GNU coreutils rejects them). Wildcards only expand if the path exists — 'hiveweav*-py' does not match. Prefer Windows paths for tools under D:/ and Git Bash paths (/d/...) for shell built-ins.",
     requires_workspace=True,
     security_level="shell",

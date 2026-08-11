@@ -1081,6 +1081,20 @@ class Agent:
                 f"{message}\n\n"
                 "[系统提示] 上一轮响应为空。请确保输出有效内容或调用工具。"
             )
+        # 5a. 回合出口条件前置注入 — 收工决策前可见本轮 gate 要求。
+        # best-effort：任何失败静默跳过，不阻塞回合开始。
+        try:
+            from hiveweave.services.turn_exit import build_exit_contract_hint
+
+            exit_hint = await build_exit_contract_hint(self.id, self.project_id)
+            if exit_hint:
+                user_content = f"{user_content}\n\n{exit_hint}"
+        except Exception as e:
+            log.debug(
+                "exit_contract_hint_inject_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
         messages.append({"role": "user", "content": user_content})
 
         # 5b. Ephemeral RESUME CHECKPOINT — once per interrupt, not into history

@@ -18,6 +18,26 @@ from .porcelain import _in_tracked_ws_dir, _porcelain_tracked_dirty_paths
 log = structlog.get_logger(__name__)
 
 
+async def classify_main_dirt(workspace_path: str) -> dict:
+    """只读判定 main 脏状态（不清理、不提交）。
+
+    Returns ``{"dirty_paths": [...], "hard_blockers": [...]}`` —
+    ``hard_blockers`` = tracked 脏路径中「非可再生且不在 tracked ws 目录」
+    的集合（merge 会硬拒的集合）。供 merge 预检（dry-run）与
+    ``restore_regenerable_dirt_or_reject`` 共享同一判定。
+    """
+    ok_st, st_out = await _git(
+        ["-c", "core.quotepath=false", "status", "--porcelain", "-z"],
+        workspace_path,
+    )
+    dirty_paths = _porcelain_tracked_dirty_paths(st_out) if ok_st else []
+    hard = [
+        p for p in dirty_paths
+        if not is_regenerable_path(p) and not _in_tracked_ws_dir(p)
+    ]
+    return {"dirty_paths": dirty_paths, "hard_blockers": hard}
+
+
 async def restore_regenerable_dirt_or_reject(
     workspace_path: str, *, branch: str = "", short_id: str = ""
 ) -> dict | None:
@@ -40,11 +60,8 @@ async def restore_regenerable_dirt_or_reject(
     Returns a rejection dict the caller returns verbatim, or None when the
     target is clean / was cleaned and the merge may proceed.
     """
-    ok_st, st_out = await _git(
-        ["-c", "core.quotepath=false", "status", "--porcelain", "-z"],
-        workspace_path,
-    )
-    dirty_paths = _porcelain_tracked_dirty_paths(st_out) if ok_st else []
+    dirt = await classify_main_dirt(workspace_path)
+    dirty_paths = dirt["dirty_paths"]
     if not dirty_paths:
         return None
     non_regen = [p for p in dirty_paths if not is_regenerable_path(p)]
