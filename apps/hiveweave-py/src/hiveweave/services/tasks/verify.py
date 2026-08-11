@@ -17,6 +17,10 @@ log = structlog.get_logger(__name__)
 # inbox/义务无意义，必须 fallback 到真实 agent。
 _HUMAN_CREATOR_SENTINELS = frozenset({"user", "用户", "human"})
 
+# 2026-08-11 B4 事故：approved→merge 是正常窗口（VERIFY 只在 merge 后
+# spawn），migrate_orphan_approved 在此窗口内不得判定孤儿。
+ORPHAN_APPROVED_GRACE_MS = 10 * 60 * 1000
+
 
 def resolve_merge_owner(task: dict, fallback: str | None) -> str | None:
     """Merge 职责方：任务 creator（排除 API 人类哨兵）→ fallback（同排除）。
@@ -271,11 +275,56 @@ class VerifyMixin:
                     parent_id=parent_id,
                 )
             except Exception as e:
+                # 2026-08-11 意见核实：此前双重吞没（此处 + 上游 review.py
+                # try/except），父任务可能永挂 approved/verifying 且无人知晓
+                # （migrate 只扫 approved，verifying 无自动重试）。至少：
+                # 事件落账 + 通知父任务 creator（能解卡的人）。
                 log.warning(
                     "verify_parent_close_failed",
+                    verify_id=verify_id,
                     parent_id=parent_id,
                     error=str(e),
                 )
+                try:
+                    from hiveweave.services.tasks.db import insert_task_event
+
+                    await insert_task_event(
+                        project_id,
+                        parent_id,
+                        "verify_parent_close_failed",
+                        "verifying",
+                        "verifying",
+                        actor_id="system",
+                        payload={
+                            "verify_id": str(verify_id)[:8],
+                            "error": str(e)[:200],
+                        },
+                    )
+                except Exception:
+                    pass
+                try:
+                    from hiveweave.agents.trigger import trigger_coordinator
+                    from hiveweave.services.inbox import InboxService
+
+                    creator = parent.get("creator_id")
+                    if creator:
+                        await InboxService().send_message(
+                            from_agent_id="system",
+                            to_agent_id=creator,
+                            message=(
+                                f"[VERIFY PARENT CLOSE FAILED] Task "
+                                f"'{str(parent_id)[:8]}' VERIFY passed but "
+                                f"close blocked: {str(e)[:200]} — merge the "
+                                f"branch or waive_merge, then resolve."
+                            ),
+                            message_type="task",
+                            priority="urgent",
+                            task_id=parent_id,
+                            wake=True,
+                        )
+                        await trigger_coordinator(creator)
+                except Exception:
+                    pass
 
     async def _close_sibling_verify_tasks(
         self,
@@ -366,8 +415,19 @@ class VerifyMixin:
         return closed
 
     async def migrate_orphan_approved(self, project_id: str) -> dict:
-        """One-shot: approved with open VERIFY → verifying; else → closed."""
+        """One-shot: approved with open VERIFY → verifying; else → closed.
+
+        2026-08-11 slack-clone_01 B4 事故：approved 无 VERIFY 子是
+        approve→merge 的**正常窗口**（VERIFY 只在 merge 后 spawn，
+        verify_spawn docstring），不是孤儿态。migrate 曾无门槛地在
+        merge/hire/启动热路径上把刚 approved 的任务直接 close
+        （skip_merge_gate=True，不检查分支）→ B4 被 husk 阻塞 merge 时
+        被静默关闭，代码后续合入 main 但独立验收永久缺失。门槛：
+        - 宽限期 ``ORPHAN_APPROVED_GRACE_MS`` 内不判定（merger 响应时间）；
+        - 有 pending merge obligation 不 close（merge 流程进行中）。
+        """
         await _ensure_schema(project_id)
+        now_ms = int(time.time() * 1000)
         rows = await _query(
             project_id,
             f"SELECT {self._COLUMNS} FROM tasks "
@@ -383,6 +443,23 @@ class VerifyMixin:
                 to_closed += 1
                 continue
             tid = task["id"]
+            updated = int(task.get("updated_at") or task.get("created_at") or 0)
+            if now_ms - updated < ORPHAN_APPROVED_GRACE_MS:
+                # approve→merge 正常窗口内：不判定孤儿（B4 事故修复）
+                continue
+            try:
+                pending = await _query(
+                    project_id,
+                    "SELECT count(*) AS c FROM obligations "
+                    "WHERE task_id = ? AND obligation_type = 'merge' "
+                    "AND status = 'pending'",
+                    [tid],
+                )
+                if pending and int(pending[0]["c"] or 0) > 0:
+                    # merge 流程进行中（obligation 未 fulfill）——不 close
+                    continue
+            except Exception:
+                pass  # 表缺失等：不阻塞判定（保守继续）
             children = await _query(
                 project_id,
                 f"SELECT {self._COLUMNS} FROM tasks "

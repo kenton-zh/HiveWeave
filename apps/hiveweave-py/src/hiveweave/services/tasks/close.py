@@ -208,12 +208,15 @@ class CloseMixin:
                 ev = {}
         if isinstance(ev, dict):
             from hiveweave.services.worktree_review import (
-                evidence_has_merge_fact,
                 evidence_merge_waived,
             )
 
-            if evidence_merge_waived(ev) or evidence_has_merge_fact(ev):
+            if evidence_merge_waived(ev):
                 return True
+            # 2026-08-11 意见核实：merge_fact 不再在此跳过 —— 有 merge fact
+            # 仍须验 tip 是否真在 main（_enforce_merge_on_close 顶部校验，
+            # 防「merge 后又新增 commit」静默通过）。跳过仅限无 merge 需求
+            # 的场景（verifying/docs/no_code/waived）。
             for key in (
                 "no_code_change",
                 "noCodeChange",
@@ -260,6 +263,9 @@ class CloseMixin:
             # P0-1 is-ancestor companion: merge fact exists, but verify the
             # branch tip is actually in main. Catches "new commits added after
             # merge" (like 5510049 stranded on hw/A003/work post-close).
+            # 2026-08-11 意见核实：此分支此前是死代码 —— _task_skips_merge_gate
+            # 在 evidence_has_merge_fact 时已提前 return True，永远到不了这里。
+            # 已把 merge_fact 从 _task_skips_merge_gate 移除，本校验恢复生效。
             assignee = task.get("assignee_id")
             tid = str(task.get("id") or "")
             main_ws = await project_main_workspace(project_id)
