@@ -293,7 +293,22 @@ async def test_migrate_orphan_approved(task_env):
     parent = await ts.get_task(pid, parent_id)
     assert parent["status"] == "approved"
 
-    # No VERIFY child → migrate closes
+    # 2026-08-11 B4 事故修复：宽限期内（approve→merge 正常窗口）不判定孤儿
+    from hiveweave.services.tasks.verify import ORPHAN_APPROVED_GRACE_MS
+
+    result = await ts.migrate_orphan_approved(pid)
+    assert result["closed"] == 0
+    parent = await ts.get_task(pid, parent_id)
+    assert parent["status"] == "approved"
+
+    # 超宽限期 + 无 VERIFY 子 → 才关闭
+    import time
+
+    now = int(time.time() * 1000)
+    await task_module._execute(
+        pid, "UPDATE tasks SET updated_at = ? WHERE id = ?",
+        [now - ORPHAN_APPROVED_GRACE_MS - 60_000, parent_id],
+    )
     result = await ts.migrate_orphan_approved(pid)
     assert result["closed"] >= 1
     parent = await ts.get_task(pid, parent_id)

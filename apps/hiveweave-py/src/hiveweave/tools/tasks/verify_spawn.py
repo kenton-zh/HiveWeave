@@ -436,11 +436,27 @@ async def _spawn_post_approve_verify_task(
     try:
         await ts.mark_verifying(project_id, parent_id)
     except Exception as e:
+        # 2026-08-11 意见核实：失败被吞 → 父任务滞留 approved，VERIFY 被
+        # approve 时关父触发 merge gate 且无人知晓。至少落事件（账本可见）。
         log.warning(
             "parent_mark_verifying_failed",
             parent_id=parent_id,
             error=str(e),
         )
+        try:
+            from hiveweave.services.tasks.db import insert_task_event
+
+            await insert_task_event(
+                project_id,
+                parent_id,
+                "parent_mark_verifying_failed",
+                "approved",
+                "approved",
+                actor_id="system",
+                payload={"error": str(e)[:200]},
+            )
+        except Exception:
+            pass
 
     if not qa_assignee:
         try:
