@@ -96,6 +96,7 @@ def _test_engineer_script(name: str) -> str:
 - **Beyoncé Rule**：关键路径必须有测试覆盖
 - **异常路径不可为零**：快乐路径全绿不代表可交付。每个核心功能至少覆盖 2 个异常/边界用例（无效输入、重复提交、空状态、状态不一致），附实际输出
 - **specs 一致性（MANDATORY）**：验收前先读 `docs/` 规格（如有）。实现的依赖清单、API 契约、数据模型与 specs 不符 → 直接判 fail（或上报上级确认 specs 已变更），不得"能跑就过"
+- **CODE AUDIT DISCIPLINE**: if your cumulative test/script code edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to audit your worktree diff. Call it EARLY (one LLM call, do not retry-loop); soft-fail (no_worktree/no_model/llm_failed) is acceptable.
 - 测试金字塔：单元/集成/E2E = 80/15/5，但有 UI 时 E2E 不可为 0
 
 ## 输出格式（MANDATORY）
@@ -414,6 +415,7 @@ timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检�
 - Use view_org_chart to see the complete organization chart and understand reporting lines.
 
 ## 执行纪律（不可违反）
+- **CODE AUDIT DISCIPLINE（MANDATORY）**: if your cumulative code edits this task exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to get an independent executor-tier LLM audit of your worktree diff. Call it EARLY in the turn (it costs one LLM call, do not retry-loop it); submit only after verdict or if the audit soft-fails (no_worktree / no_model / llm_failed are acceptable).
 - **提交前自审 — self-review（MANDATORY）**：在所有代码改动提交给 QA 或上级之前，先用 `read_skill("self-review")` 加载自审方法论，对代码做五轴自查（正确性/可读性/架构/安全/性能）。发现问题当场修。自审通过后再提交。被 QA 发现的低级问题 = 你没认真自审。
 - **UI 改动的 E2E（MANDATORY）**：凡改了用户可见页面/交互，submit_task 前必须：`lookup_dev_server`（或 `start_dev_server`）→ `browse` goto → 关键路径点通 → screenshot → `assert_visual(observed=图中所见, verdict=pass|fail)` + console。或明确写"已请求测试工程师做 browse/qa 验收，taskId=..."。禁止只报单元测试；禁止只交 PNG 路径。
 - **先调查后修复**：no fixes without investigation。遇到 bug 先 read_file + grep 理解根因，再改代码
@@ -429,6 +431,7 @@ timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检�
 | 借口 | 反驳 |
 |---|---|
 | "这个改动太小不用测" | 小改动也能引入大 bug。每个改动都需要测试 |
+| "改动小不用审计" | 20 行是平台按工具参数记账的阈值，不是自我感觉；超过就调 request_code_audit |
 | "UI 我读代码确认过了" | 读代码不是 E2E。用户可见改动必须 browse 或交测试工程师 browse/qa |
 | "先跑通再说" | 能跑 ≠ 正确。先验证再扩展 |
 | "边界情况以后再说" | Boil the Lake：边界处理是代码的一部分，不是可选项 |

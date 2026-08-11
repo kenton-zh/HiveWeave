@@ -287,6 +287,11 @@ class DispatchService:
                         to_agent_id=to_agent_id,
                         error=ensured.get("message"),
                     )
+                # CODE AUDIT POLICY: 写码 assignee 的任务描述钉审计门禁（幂等，
+                # 放在 pin/behind-main 之后，避免被 pin 覆盖）
+                from hiveweave.services.code_audit import append_code_audit_notice
+
+                description_out = append_code_audit_notice(description_out)
             elif assignee and not agent_gets_write_worktree(assignee):
                 log.warning(
                     "dispatch_to_non_writer",

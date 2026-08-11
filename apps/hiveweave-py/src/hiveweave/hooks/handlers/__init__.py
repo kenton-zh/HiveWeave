@@ -10,9 +10,11 @@ def register_builtin_handlers() -> None:
     global _registered
     if _registered:
         return
+    from hiveweave.hooks.handlers import code_audit_ledger as _code_audit_ledger
     from hiveweave.hooks.handlers import lessons as _lessons
     from hiveweave.hooks.handlers import task_advance as _task_advance
 
     _task_advance.register()
     _lessons.register()
+    _code_audit_ledger.register()
     _registered = True

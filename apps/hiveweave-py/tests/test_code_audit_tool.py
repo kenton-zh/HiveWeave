@@ -1,0 +1,259 @@
+"""request_code_audit domain core — run_code_audit soft-fail paths + helpers.
+
+Mock style mirrors test_attestation_auto_attach.py (AsyncMock patches of
+module-level singletons + lazy-imported package attrs).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+HEAD_SHA = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0"
+
+
+def _fake_git(*pairs: tuple[tuple[str, ...], tuple[bool, str]]):
+    """Async fake for ``hiveweave.services.git_worktree._git``."""
+    table = {key: value for key, value in pairs}
+
+    async def fake_git(args: list[str], cwd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        return table.get(tuple(args), (False, ""))
+
+    return fake_git
+
+
+class _FakeModelService:
+    """Stand-in for ModelService with a resolvable executor model."""
+
+    async def resolve_model(
+        self,
+        tier: str | None = None,
+        preferred: str | None = None,
+        skip_model_ids: set[str] | None = None,
+    ) -> dict:
+        return {"base_url": "https://fake.local", "api_key": "k", "model_id": "m"}
+
+
+def _attestation_service(att_id: str = "att-1"):
+    svc = MagicMock()
+    svc.create = AsyncMock(return_value=att_id)
+    return svc
+
+
+@pytest.mark.asyncio
+async def test_no_worktree_soft_fail():
+    from hiveweave.services.code_audit import run_code_audit
+
+    with patch(
+        "hiveweave.services.worktree_review.agent_worktree_path",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        result = await run_code_audit("proj", "agent-1")
+    assert result == {"audited": False, "reason": "no_worktree"}
+
+
+@pytest.mark.asyncio
+async def test_empty_diff_auto_pass_no_llm():
+    from hiveweave.services.code_audit import (
+        CODE_AUDIT_KIND,
+        get_unaudited_lines,
+        record_change,
+        reset_ledger,
+        run_code_audit,
+    )
+
+    reset_ledger("agent-1")
+    record_change("agent-1", 5)  # within threshold
+
+    git = _fake_git(
+        (("diff", "main...HEAD"), (True, "")),
+        (("diff", "HEAD"), (True, "")),
+        (("ls-files", "--others", "--exclude-standard"), (True, "")),
+        (("rev-parse", "HEAD"), (True, HEAD_SHA)),
+    )
+    att_svc = _attestation_service()
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=git),
+        patch("hiveweave.llm.oneshot.llm_oneshot", new_callable=AsyncMock) as llm_mock,
+        patch("hiveweave.services.attestation.attestation_service", att_svc),
+    ):
+        result = await run_code_audit("proj", "agent-1")
+
+    assert result["audited"] is True
+    assert result["verdict"] == "PASS"
+    assert result["lines_audited"] == 0
+    assert result["attestation_id"] == "att-1"
+    llm_mock.assert_not_awaited()
+
+    kw = att_svc.create.await_args.kwargs
+    assert kw["kind"] == CODE_AUDIT_KIND
+    assert kw["exit_code"] == 0
+    assert kw["workspace"] == r"C:\fake\wt"
+    assert kw["commit_hash"] == HEAD_SHA
+    assert kw["stdout_hash"]  # sha256 of "no changes to audit"
+    reset_ledger("agent-1")
+
+
+@pytest.mark.asyncio
+async def test_normal_path_issues_verdict_and_reset():
+    from hiveweave.services.code_audit import (
+        CODE_AUDIT_KIND,
+        get_unaudited_lines,
+        record_change,
+        reset_ledger,
+        run_code_audit,
+    )
+
+    reset_ledger("agent-1")
+    record_change("agent-1", 25)
+
+    git = _fake_git(
+        (
+            ("diff", "main...HEAD"),
+            (True, "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n"),
+        ),
+        (("diff", "HEAD"), (True, "")),
+        (("ls-files", "--others", "--exclude-standard"), (True, "")),
+        (("rev-parse", "HEAD"), (True, HEAD_SHA)),
+    )
+    att_svc = _attestation_service()
+    llm_text = "VERDICT: ISSUES\n- x.py:12 [high] crash risk on empty input\n- y.py:3 [low] style nit\n"
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=git),
+        patch("hiveweave.services.model.ModelService", new=_FakeModelService),
+        patch(
+            "hiveweave.llm.oneshot.llm_oneshot",
+            new_callable=AsyncMock,
+            return_value=llm_text,
+        ),
+        patch("hiveweave.services.attestation.attestation_service", att_svc),
+        patch(
+            "hiveweave.tools.executor.ToolExecutor._save_tool_output_file",
+            return_value=r"C:\fake\wt\.hiveweave\tool_outputs\code_audit_1.txt",
+        ) as save_mock,
+    ):
+        result = await run_code_audit("proj", "agent-1", task_id="task-9")
+
+    assert result["audited"] is True
+    assert result["verdict"] == "ISSUES"
+    assert result["issues_count"] == 2
+    assert result["top_issues"][0].startswith("x.py:12")
+    assert result["top_issues"][1] == "y.py:3 [low] style nit"
+    assert result["report_path"] == r"C:\fake\wt\.hiveweave\tool_outputs\code_audit_1.txt"
+    assert result["attestation_id"] == "att-1"
+    assert result["lines_audited"] == 25  # ledger value before reset
+    assert get_unaudited_lines("agent-1") == 0  # reset_ledger called
+
+    kw = att_svc.create.await_args.kwargs
+    assert kw["kind"] == CODE_AUDIT_KIND
+    assert kw["exit_code"] == 1
+    assert kw["task_id"] == "task-9"
+    assert kw["workspace"] == r"C:\fake\wt"
+    assert kw["commit_hash"] == HEAD_SHA
+
+    save_args = save_mock.call_args.args
+    assert save_args[0] == llm_text
+    assert save_args[1] == "agent-1"
+    assert save_args[2] == CODE_AUDIT_KIND
+    assert save_args[3] == r"C:\fake\wt"
+    reset_ledger("agent-1")
+
+
+@pytest.mark.asyncio
+async def test_llm_failed_soft_fail():
+    from hiveweave.services.code_audit import (
+        get_unaudited_lines,
+        record_change,
+        reset_ledger,
+        run_code_audit,
+    )
+
+    reset_ledger("agent-1")
+    record_change("agent-1", 25)
+
+    git = _fake_git(
+        (("diff", "main...HEAD"), (True, "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n")),
+        (("diff", "HEAD"), (True, "")),
+        (("ls-files", "--others", "--exclude-standard"), (True, "")),
+        (("rev-parse", "HEAD"), (True, HEAD_SHA)),
+    )
+    att_svc = _attestation_service()
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=git),
+        patch("hiveweave.services.model.ModelService", new=_FakeModelService),
+        patch(
+            "hiveweave.llm.oneshot.llm_oneshot",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch("hiveweave.services.attestation.attestation_service", att_svc),
+    ):
+        result = await run_code_audit("proj", "agent-1")
+
+    assert result == {"audited": False, "reason": "llm_failed"}
+    att_svc.create.assert_not_awaited()
+    assert get_unaudited_lines("agent-1") == 25  # ledger untouched on failure
+    reset_ledger("agent-1")
+
+
+def test_count_change_lines_unit():
+    from hiveweave.services.code_audit import count_change_lines
+
+    assert count_change_lines("write_file", {"content": "a\nb\nc"}) == 3
+    assert count_change_lines("write_file", {}) == 0
+    assert count_change_lines("edit_file", {"oldString": "x\n", "newString": "y\nz\nw"}) == 3
+    assert count_change_lines("edit_file", {"oldString": "x"}) == 1
+    assert count_change_lines("apply_patch", {"patches": [
+        {"op": "add", "content": "1\n2\n3\n4"},
+        {"op": "update", "oldString": "a\n", "newString": "b\nc\nd\ne"},
+        {"op": "delete", "content": "x\ny\nz"},
+        {"op": "rename", "content": "1\n2"},
+        {"op": "add"},
+    ]}) == 8  # 4 + 4 + 0 + 0 + 0
+    assert count_change_lines("apply_patch", {}) == 0
+    assert count_change_lines("unknown_tool", {"content": "x\ny"}) == 0
+
+
+def test_ledger_basic():
+    from hiveweave.services.code_audit import (
+        get_unaudited_lines,
+        ledger_snapshot,
+        record_change,
+        reset_ledger,
+    )
+
+    reset_ledger("agent-x")
+    record_change("agent-x", 10)
+    record_change("agent-x", 3)
+    record_change("agent-x", -5)  # clamped away
+    assert get_unaudited_lines("agent-x") == 13
+    assert get_unaudited_lines("nobody") == 0
+    assert ledger_snapshot().get("agent-x") == 13
+    reset_ledger("agent-x")
+    assert get_unaudited_lines("agent-x") == 0
+
+
+def test_append_notice_idempotent():
+    from hiveweave.services.code_audit import CODE_AUDIT_POLICY, append_code_audit_notice
+
+    once = append_code_audit_notice("do the thing")
+    assert once == f"do the thing\n{CODE_AUDIT_POLICY}"
+    assert append_code_audit_notice(once) == once
+    assert append_code_audit_notice("") == CODE_AUDIT_POLICY

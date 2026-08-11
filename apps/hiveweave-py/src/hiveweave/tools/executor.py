@@ -1157,6 +1157,39 @@ class ToolResult(dict):
     """Dict with success/output/error keys (returned by all tools)."""
 
 
+async def _emit_tool_execute_after(
+    agent_id: str,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    """Fire TOOL_EXECUTE_AFTER lifecycle hooks — fail-open, never affects result.
+
+    Emitted here (the single funnel both the registered pipeline and the
+    legacy dispatch results flow through) because agent_id is in scope on
+    both paths. Pre-execution failures (args/permission/ask) never emit —
+    no tool actually ran.
+    """
+    try:
+        from hiveweave.hooks import TOOL_EXECUTE_AFTER, hooks
+        from hiveweave.hooks.handlers import register_builtin_handlers
+
+        register_builtin_handlers()
+        await hooks.run(
+            TOOL_EXECUTE_AFTER,
+            {
+                "agent_id": agent_id,
+                "tool_name": tool_name,
+                "params": tool_args,
+                "success": bool(result.get("success")),
+                "output": str(result.get("output") or "")[:4000],
+            },
+            {},
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("tool_execute_after_hook_failed", error=str(e))
+
+
 # ── ToolExecutor ───────────────────────────────────────────
 
 class ToolExecutor:
@@ -1249,6 +1282,9 @@ class ToolExecutor:
                 registered_result["output"] = self._maybe_save_large_output(
                     registered_result["output"], agent_id, name, workspace_path
                 )
+            await _emit_tool_execute_after(
+                agent_id, name, tool_args, registered_result
+            )
             return registered_result
 
         # ── Legacy path (unregistered tools) ───────────────
@@ -1331,6 +1367,8 @@ class ToolExecutor:
                 result["output"], agent_id, name, workspace_path
             )
             result["output"] = truncated
+
+        await _emit_tool_execute_after(agent_id, name, tool_args, result)
 
         return result
 
