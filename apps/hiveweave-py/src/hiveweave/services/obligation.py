@@ -5,7 +5,9 @@ with platform-enforced obligations. The game tick scans for overdue obligations
 and escalates to the org parent automatically.
 
 Obligation types:
-- merge: reviewer (or MERGE-capable ancestor) must merge assignee worktree
+- merge: task creator / merge owner (or MERGE-capable ancestor) must merge
+  assignee worktree — 不是审批人（2026-08-11 复盘：代审场景 merge 义务
+  曾错误记在 reviewer 名下）
 - review: reviewer must review a submitted task
 - verify: QA must verify post-merge evidence
 

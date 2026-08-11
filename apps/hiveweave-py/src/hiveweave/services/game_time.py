@@ -1298,12 +1298,18 @@ class GameTimeService:
             if TaskService._is_verify_task(t):
                 continue
             age = _effective_age_ms(t)
-            creator = t.get("creator_id")
             tid = str(t.get("id") or "")
-            if not creator or not tid:
+            # 2026-08-11 复盘：与即时 wake / 义务 / 清理一致，stale nudge 也
+            # 发 merge owner（resolve_merge_owner，排除 API 人类哨兵）——
+            # 哨兵任务由即时 wake 的 fallback（reviewer）及其义务通道覆盖，
+            # 不再把 [MERGE PENDING] 发进 "user" 这类非 agent inbox。
+            from hiveweave.services.tasks.verify import resolve_merge_owner
+
+            owner = resolve_merge_owner(t, None)
+            if not owner or not tid:
                 continue
 
-            unavailable = _creator_unavailable(str(creator))
+            unavailable = _creator_unavailable(str(owner))
             need_proxy = age >= MERGE_PROXY_STALE_MS or unavailable
             need_pending = age >= MERGE_PENDING_STALE_MS
 
@@ -1323,19 +1329,19 @@ class GameTimeService:
                     try:
                         await inbox.send_message(
                             from_agent_id="system",
-                            to_agent_id=creator,
+                            to_agent_id=owner,
                             message=body,
                             message_type="task",
                             priority="urgent",
                             task_id=tid,
                             wake=True,
                         )
-                        await self._watchdog_trigger(creator)
+                        await self._watchdog_trigger(owner)
                         log.info(
                             "ledger_stale_merge_nudge",
                             project_id=project_id,
                             task_id=tid,
-                            creator=creator,
+                            owner=owner,
                         )
                     except Exception as e:
                         log.warning(

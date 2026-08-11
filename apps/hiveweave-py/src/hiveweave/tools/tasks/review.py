@@ -768,8 +768,9 @@ async def review_task_tool(
                     f"{f' ({wt})' if wt else ''}, but HEAD is 0 commits ahead "
                     f"of main while files_changed is non-empty or worktree is "
                     f"dirty (dirty={dirty}). Executor must "
-                    f"git_worktree_checkpoint before you merge; do NOT treat "
-                    f"as already-merged. Next: confirm checkpoint, then "
+                    f"git_worktree_checkpoint before merge; do NOT treat "
+                    f"as already-merged. Next: confirm checkpoint, then the "
+                    f"merge owner (task creator/coordinator) runs "
                     f"git_worktree_merge(branchName='{short or 'hw/<short_id>/...'}')."
                 )
 
@@ -784,8 +785,9 @@ async def review_task_tool(
                 f"Task {params.task_id} approved against assignee worktree"
                 f"{f' ({wt})' if wt else ''}. "
                 f"VERIFY is NOT created yet. "
-                f"Next (YOU, coordinator): git_worktree_merge("
-                f"branchName='{short or 'hw/<short_id>/...'}'). "
+                f"Next (merge owner = task creator/coordinator): "
+                f"git_worktree_merge(branchName='{short or 'hw/<short_id>/...'}'). "
+                f"If you are NOT the task creator, relay this to the creator. "
                 f"On real content conflict: rework executor to rebase/merge "
                 f"main in their worktree. On untracked-on-main: that is MAIN "
                 f"hygiene — retry merge (auto-quarantine), do NOT rework."
@@ -803,14 +805,29 @@ async def _inject_merge_pending_wake(
     short_id: str = "",
     reason: str = "approved_needs_merge",
 ) -> None:
-    """Wake the approving coordinator to git_worktree_merge (same-turn follow-up)."""
+    """Wake the merge owner to git_worktree_merge (same-turn follow-up).
+
+    2026-08-11 slack-clone_01 复盘：即时 wake 曾发给 reviewer（审批人），
+    但 merge 职责与后续清理（verify.py ``_clear_merge_pending_inbox`` 只清
+    creator 的 inbox）都在 creator —— 第三方代审场景（reviewer ≠ creator
+    ≠ implementer）下审批人既不该也做不了 merge，消息成纯噪音且 merge
+    完成后永不清理。与 game_time stale nudge（发 creator）一致化：
+    接收者 = creator，fallback reviewer。
+    """
     tid = str(task.get("id") or "")
     title = (task.get("title") or "(untitled)").split("\n")[0][:60]
     branch = short_id or "hw/<short_id>/..."
+    # 2026-08-11 slack-clone_01 复盘：merge 职责在 creator（与 stale nudge /
+    # 清理逻辑一致），审批人（尤其第三方代审）不应背 merge 义务。统一走
+    # resolve_merge_owner（排除 API 人类 creator 哨兵，fallback 审批人）。
+    from hiveweave.services.tasks.verify import resolve_merge_owner
+
+    recipient = resolve_merge_owner(task, reviewer_id) or reviewer_id
     body = (
         f"[MERGE PENDING] Task '{title}' ({tid[:8]}) is approved and needs "
         f"git_worktree_merge(branchName='{branch}'). "
-        f"YOU (coordinator) must merge — do not ask the executor to merge on main. "
+        f"YOU (task creator/coordinator, merge owner) must merge — do not "
+        f"ask the executor to merge on main. "
         f"reason={reason}"
     )
     try:
@@ -818,7 +835,7 @@ async def _inject_merge_pending_wake(
 
         await InboxService().send_message(
             from_agent_id="system",
-            to_agent_id=reviewer_id,
+            to_agent_id=recipient,
             message=body,
             message_type="task",
             priority="urgent",
@@ -827,10 +844,11 @@ async def _inject_merge_pending_wake(
         )
         from hiveweave.agents.trigger import trigger_coordinator
 
-        await trigger_coordinator(reviewer_id)
+        await trigger_coordinator(recipient)
         log.info(
             "merge_pending_wake_injected",
             reviewer_id=reviewer_id,
+            recipient=recipient,
             task_id=tid,
             reason=reason,
         )
@@ -844,12 +862,13 @@ async def _inject_merge_pending_wake(
 
     # TEST16 D2: create structured merge obligation in the ledger.
     # Game tick will escalate to org parent if deadline passes unfulfilled.
+    # Owner = merge 职责方（recipient，与即时 wake 同一人），不是审批人。
     try:
         from hiveweave.services.obligation import ObligationLedger
 
         await ObligationLedger().create(
             project_id=project_id,
-            owner_agent_id=reviewer_id,
+            owner_agent_id=recipient,
             obligation_type="merge",
             task_id=tid or None,
             context={"short_id": short_id, "reason": reason},
@@ -858,6 +877,7 @@ async def _inject_merge_pending_wake(
         log.warning(
             "merge_obligation_create_failed",
             reviewer_id=reviewer_id,
+            recipient=recipient,
             task_id=tid,
             error=str(e),
         )
