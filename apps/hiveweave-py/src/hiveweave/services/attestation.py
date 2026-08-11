@@ -1496,4 +1496,72 @@ async def check_verify_baseline(
     )
 
 
+# ── code_audit ledger support ────────────────────────────────────────────
+# code_audit freshness = "an audit ran recently"（PASS 或 ISSUES 都算已审计）。
+# find_recent_for_agent 会过滤 exit_code=0 + 要求 stdout_hash，不适用于
+# 审计凭证（ISSUES 审计可能 exit_code!=0）——这里提供按 kind 的专用查询。
+
+_AUDIT_VERDICT_RE = re.compile(
+    r"\bverdict\s*[=:]\s*(?:[\"'])?(pass|ok|clean|issues|fail|failed)"
+    r"(?:[\"'])?",
+    re.IGNORECASE,
+)
+
+
+async def find_latest_attestation_by_kind(
+    project_id: str,
+    *,
+    agent_id: str,
+    kind: str,
+    max_age_ms: int | None = None,
+) -> dict[str, Any] | None:
+    """Most recent attestation row of *kind* for *agent_id* (any verdict).
+
+    Unlike ``find_recent_for_agent``, does NOT require exit_code=0 or a
+    stdout_hash — audit freshness means "an audit ran recently", and both
+    PASS and ISSUES verdicts count as audited. Default freshness window 1h.
+    Fail-open: returns None on any lookup failure.
+    """
+    if not agent_id or not kind:
+        return None
+    await attestation_service.ensure_schema(project_id)
+    try:
+        conn = await _conn(project_id)
+    except ProjectDbError:
+        return None
+    now = int(time.time() * 1000)
+    max_age = max_age_ms or 60 * 60 * 1000
+    cur = await conn.execute(
+        "SELECT * FROM tool_attestations "
+        "WHERE project_id = ? AND agent_id = ? AND kind = ? "
+        "AND created_at >= ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        [project_id, agent_id, kind, now - max_age],
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return dict(row) if row else None
+
+
+def parse_audit_verdict(row: dict[str, Any] | None) -> str | None:
+    """'PASS' | 'ISSUES' | None from a code_audit attestation row.
+
+    Verdict marker lives in ``command_or_url`` as ``[verdict=PASS|ISSUES]``
+    (same marker convention as ``[core_interaction=1]``); falls back to
+    ``exit_code`` (0 → PASS, else → ISSUES). None when undeterminable.
+    """
+    if not row:
+        return None
+    m = _AUDIT_VERDICT_RE.search(str(row.get("command_or_url") or ""))
+    if m:
+        return "PASS" if m.group(1).lower() in ("pass", "ok", "clean") else "ISSUES"
+    ec = row.get("exit_code")
+    if ec is not None:
+        try:
+            return "PASS" if int(ec) == 0 else "ISSUES"
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 attestation_service = AttestationService()

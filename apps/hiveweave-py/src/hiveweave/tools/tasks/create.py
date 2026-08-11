@@ -131,6 +131,7 @@ async def create_task_tool(
 
     assignee_id = params.assignee_id
     org_service = ctx.org if ctx else None
+    description = params.description
     if assignee_id:
         resolved = await _helpers.resolve_agent_id(project_id, assignee_id, org_service)
         if resolved:
@@ -146,6 +147,22 @@ async def create_task_tool(
             coord_err = await validate_executor_assignee(assignee_id, org_service)
             if coord_err:
                 return ToolResult.err(coord_err)
+            # CODE AUDIT POLICY: 写码 assignee 创建即钉审计门禁（幂等，
+            # create→dispatch 双钉无害；无 worktree 能力（CEO/HR）不钉）
+            try:
+                from hiveweave.services.code_audit import append_code_audit_notice
+                from hiveweave.services.git_worktree import agent_gets_write_worktree
+                from hiveweave.services.org import OrgService
+
+                assignee_agent = await OrgService().resolve_agent(assignee_id)
+                if assignee_agent and agent_gets_write_worktree(assignee_agent):
+                    description = append_code_audit_notice(description)
+            except Exception as e:
+                log.warning(
+                    "create_task_audit_notice_failed",
+                    assignee_id=assignee_id,
+                    error=str(e),
+                )
             # builder coordinator / executor assignee 须真正 ensure 成功；
             # 失败只降级为告警日志（任务照建），但绝不静默 pass。
             try:
@@ -234,7 +251,7 @@ async def create_task_tool(
         task_id = await ts.create_task(
             project_id=project_id,
             title=params.title,
-            description=params.description,
+            description=description,
             creator_id=agent_id,
             assignee_id=assignee_id,
             priority=params.priority,

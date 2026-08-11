@@ -133,6 +133,8 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "run_security_audit": frozenset({Capability.SOURCE_READ}),
     "run_perf_audit": frozenset({Capability.SOURCE_READ}),
     "run_full_review": frozenset({Capability.SOURCE_READ}),
+    # 出口合同前置审计 — 只对可写码角色开放（executor/qa/builder coordinator）
+    "request_code_audit": frozenset({Capability.SOURCE_WRITE}),
     # write_file: capability depends on path scope (checked separately)
 }
 

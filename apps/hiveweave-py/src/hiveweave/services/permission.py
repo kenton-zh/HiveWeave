@@ -85,6 +85,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     "git_worktree_checkpoint",
     "run_code_review", "run_security_audit", "run_perf_audit",
     "run_full_review",
+    "request_code_audit",
 })
 
 # Legacy alias — builder coordinator 即原 COORDINATOR_TOOLS 语义的超集。
@@ -114,6 +115,7 @@ READONLY_TOOLS = _BASE_TOOLS | frozenset({
 
 READWRITE_TOOLS = READONLY_TOOLS | frozenset({
     "run_command",
+    "request_code_audit",
 })
 
 ALL_TOOLS = READWRITE_TOOLS | COORDINATOR_BUILDER_TOOLS | HR_TOOLS | frozenset({

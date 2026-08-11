@@ -153,6 +153,52 @@ async def get_tasks_tool(
         except Exception:
             pass
 
+        # code_audit 视角：每任务透出其 assignee 最近一次审计结论（只读）。
+        # 与 waiver 预取同模式 —— 一次 IN 查询取最新行，按 agent 分组，无 N+1。
+        latest_audit_by_agent: dict[str, str] = {}
+        try:
+            from hiveweave.services.attestation import (
+                _conn as _attestation_conn_audit,
+                attestation_service,
+                parse_audit_verdict,
+            )
+            from hiveweave.services.code_audit import CODE_AUDIT_KIND
+
+            await attestation_service.ensure_schema(project_id)
+            agent_ids = sorted(
+                {
+                    str(t.get("assignee_id") or "")
+                    for t in tasks
+                    if t.get("assignee_id")
+                }
+            )
+            if agent_ids:
+                _placeholders = ",".join(["?"] * len(agent_ids))
+                _now_ms = int(time.time() * 1000)
+                conn = await _attestation_conn_audit(project_id)
+                cur = await conn.execute(
+                    "SELECT agent_id, command_or_url, exit_code "
+                    "FROM tool_attestations "
+                    "WHERE project_id = ? AND kind = ? "
+                    f"AND agent_id IN ({_placeholders}) "
+                    "AND created_at >= ? "
+                    "ORDER BY created_at DESC",
+                    [project_id, CODE_AUDIT_KIND, *agent_ids, _now_ms - 3600_000],
+                )
+                rows = await cur.fetchall()
+                await cur.close()
+                seen: set[str] = set()
+                for r in rows:
+                    aid = str(r["agent_id"]) if "agent_id" in r.keys() else ""
+                    if not aid or aid in seen:
+                        continue
+                    seen.add(aid)
+                    verdict = parse_audit_verdict(dict(r))
+                    if verdict:
+                        latest_audit_by_agent[aid] = verdict
+        except Exception as e:
+            log.debug("get_tasks_latest_audit_prefetch_failed", error=str(e))
+
         # 撞门前透出 VERIFY 串行锁 + attestation 基线状态（claim/review
         # 前置）。slack-clone_01 成本审计根因二：claim 54% 撞门 —— get_tasks
         # 不透锁状态，QA 反复 claim 被挡；review 23% —— attestation 基线过期
@@ -215,6 +261,9 @@ async def get_tasks_tool(
                     t["attestation_baseline_ok"] = _baseline_err is None
                 except Exception:
                     t["attestation_baseline_ok"] = None
+            t["latest_audit_verdict"] = latest_audit_by_agent.get(
+                str(t.get("assignee_id") or "")
+            )
         if _f2_holder is not None:
             _h = _f2_holder
             lines.append(
@@ -254,6 +303,9 @@ async def get_tasks_tool(
                     "    attestation_baseline: STALE — 需在 MAIN 当前 tip "
                     "重跑测试后再 approve"
                 )
+            _av = t.get("latest_audit_verdict")
+            if _av:
+                lines.append(f"    latest_audit_verdict: {_av}")
             # waiver_by_task is keyed by the canonical (dash-stripped) form that
             # `create_waiver` stored — look up with the same canonical key so the
             # dotted task id never misses (P0-1 waiver visibility regression).

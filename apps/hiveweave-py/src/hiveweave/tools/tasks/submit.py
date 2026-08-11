@@ -179,6 +179,32 @@ async def _submit_preflight(
     needed = required_attestation_kinds(policy_id)
     attest_ids = list(params.attestation_ids or [])
 
+    # 审计结论：agent 把 code_audit 凭证塞进 attestationIds 时，strict 策略
+    # 会以 "kind not in expected" 硬拒 —— 审计凭证不是交付证据，先剔除，
+    # 其它 kind 行为不变（查不到 kind 时 fail-open 保持原样）。
+    if attest_ids:
+        try:
+            try:
+                from hiveweave.services.code_audit import CODE_AUDIT_KIND
+            except Exception:  # noqa: BLE001
+                CODE_AUDIT_KIND = "code_audit"
+            kept = []
+            for _aid in attest_ids:
+                _row = await attestation_service.get(project_id, str(_aid))
+                if _row and str(_row.get("kind") or "") == CODE_AUDIT_KIND:
+                    continue
+                kept.append(_aid)
+            if len(kept) != len(attest_ids):
+                log.info(
+                    "submit_filtered_code_audit_attestations",
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    removed=len(attest_ids) - len(kept),
+                )
+            attest_ids = kept
+        except Exception as _fe:  # noqa: BLE001
+            log.debug("submit_code_audit_filter_failed", error=str(_fe))
+
     is_verify = (task.get("title") or "").startswith("VERIFY:")
     parent_policy = policy_id
     parent_tags: list = []
@@ -660,6 +686,28 @@ async def submit_task_tool(
                 await ts.start_task(project_id, task_id)
         await ts.submit_task(project_id, task_id, evidence)
 
+        # ── code_audit：账本超阈且近期无审计凭证 → 软提醒（不阻断、不改
+        #    状态流）；无论是否提醒，真实提交成功即重置账本 ──
+        audit_reminder = ""
+        try:
+            from hiveweave.services.attestation import find_latest_attestation_by_kind
+            from hiveweave.services.code_audit import (
+                CODE_AUDIT_KIND,
+                CODE_AUDIT_LINE_THRESHOLD,
+                CODE_AUDIT_REMINDER,
+                get_unaudited_lines,
+                reset_ledger,
+            )
+
+            if get_unaudited_lines(agent_id) > CODE_AUDIT_LINE_THRESHOLD:
+                if not await find_latest_attestation_by_kind(
+                    project_id, agent_id=agent_id, kind=CODE_AUDIT_KIND
+                ):
+                    audit_reminder = f"\n{CODE_AUDIT_REMINDER}"
+            reset_ledger(agent_id)
+        except Exception as e:  # noqa: BLE001
+            log.debug("submit_code_audit_reminder_failed", error=str(e))
+
         # ── 标记 handoff 为已汇报 ──
         # submit_task 即"向上汇报"，清除 expect_report 义务
         try:
@@ -708,7 +756,7 @@ async def submit_task_tool(
             from hiveweave.agents.trigger import trigger_coordinator
             await trigger_coordinator(notify_id)
 
-        return ToolResult.ok(f"Task {task_id} submitted for review.")
+        return ToolResult.ok(f"Task {task_id} submitted for review.{audit_reminder}")
     except Exception as e:
         return ToolResult.err(f"Failed to submit task: {e}")
 
