@@ -413,22 +413,24 @@ async def test_verify_nudge_serialized_while_another_in_flight(task_env):
 
 
 @pytest.mark.asyncio
-async def test_verify_nudge_blocked_with_assignee_holds_lock(task_env):
-    """必改（审计#1）：blocked 且有 assignee 的 VERIFY 算 in-flight。
+async def test_verify_nudge_blocked_with_wake_path_holds_lock(task_env):
+    """验收串行化（审计#1 + 2026-08-11 死锁复盘）：blocked 且有 assignee 且
+    **有自动解封路径**（depends_on 非空）的 VERIFY 算 in-flight。
 
     运行中被阻塞（game_time 可自动 unblock 恢复）仍占用 MAIN 运行时，
     泵/下一个 nudge 不得唤醒第二个 VERIFY 造成双并发（issue #6）。
     """
-    from hiveweave.services import task as task_module
-
     ts = TaskService()
     pid = task_env["project_id"]
     first_id = await _make_verify(pid, ts, title="UI A")
     second_id = await _make_verify(pid, ts, title="UI B")
+    blocker_id = await ts.create_task(
+        pid, "Blocker", "d", creator_id=COORD, assignee_id=EXEC
+    )
 
     first = await ts.get_task(pid, first_id)
     second = await ts.get_task(pid, second_id)
-    # 第一 VERIFY 唤醒后进入 running（再被阻塞，assignee 保留）
+    # 第一 VERIFY 唤醒后进入 running（再被阻塞，assignee 保留 + 有依赖路径）
     with (
         patch(
             "hiveweave.db.meta.get_agent_by_id",
@@ -451,11 +453,15 @@ async def test_verify_nudge_blocked_with_assignee_holds_lock(task_env):
     ):
         assert await _nudge_with_mocks(pid, first) is True
     await ts.start_task(pid, first_id)
-    await ts.block_task(pid, first_id, "external: waiting browser")
+    await ts.block_task(
+        pid, first_id, "外部依赖：等 blocker", depends_on_task_id=blocker_id
+    )
 
     blocked = await ts.get_task(pid, first_id)
     assert blocked["status"] == "blocked"
     assert blocked["assignee_id"] == EXEC
+    assert blocked["wait_kind"] == "dependency"  # deps 存在 → 结构化推断
+    assert blocker_id in (blocked.get("depends_on") or [])
 
     with (
         patch(
@@ -479,6 +485,76 @@ async def test_verify_nudge_blocked_with_assignee_holds_lock(task_env):
     ):
         assert await _nudge_with_mocks(pid, second) is False
     assert (await ts.get_task(pid, second_id))["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_verify_nudge_blocked_parked_does_not_hold_lock(task_env):
+    """2026-08-11 slack-clone_01 死锁回归：blocked + assignee 但**无自动解封
+    路径**（depends_on 空、非 timer）的 VERIFY 是 parked 死区 —— 不占锁。
+
+    曾导致：reconcile 永不 unblock、泵不敢放行、QA 被 claim 门禁指示
+    commit_turn(waiting) 后永久等待 —— 全队 VERIFY 队列冻结 1h40m。
+    """
+    ts = TaskService()
+    pid = task_env["project_id"]
+    first_id = await _make_verify(pid, ts, title="UI A")
+    second_id = await _make_verify(pid, ts, title="UI B")
+
+    first = await ts.get_task(pid, first_id)
+    second = await ts.get_task(pid, second_id)
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await _nudge_with_mocks(pid, first) is True
+    await ts.start_task(pid, first_id)
+    await ts.block_task(
+        pid, first_id, "归零策略：等全部 ROUND2 合并后在最新 tip 批量验收"
+    )
+
+    blocked = await ts.get_task(pid, first_id)
+    assert blocked["status"] == "blocked"
+    assert blocked["assignee_id"] == EXEC
+    assert not (blocked.get("depends_on") or [])
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_agent_by_id",
+            new=AsyncMock(
+                return_value={"id": EXEC, "name": "exec", "status": "active"}
+            ),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.supersede_watchdog_messages",
+            new=AsyncMock(return_value=1),
+        ),
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await _nudge_with_mocks(pid, second) is True
+    assert (await ts.get_task(pid, second_id))["status"] == "claimed"
 
 
 @pytest.mark.asyncio

@@ -4,9 +4,10 @@ Split from tools/task_tools.py (AI-friendly package layout). Behavior unchanged.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import time
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -19,6 +20,38 @@ _coerce_to_list = _helpers.coerce_to_list
 from hiveweave.tools.result import ToolResult
 
 log = structlog.get_logger(__name__)
+
+
+def _parse_wake_at_ms(value: str | int | None) -> int | None:
+    """Parse wakeAt (ISO-8601 or epoch ms) → epoch ms. None on unparseable.
+
+    Epoch **seconds** are auto-detected: any positive value < 10^11 ms is
+    older than 1973 as ms — realistically seconds — so it is scaled to ms
+    (otherwise it would silently parse as an already-expired deadline).
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        v_int = value
+        if 0 < v_int < 10**11:
+            v_int *= 1000
+        return v_int
+    text = str(value).strip()
+    try:
+        v_int = int(text)
+        if 0 < v_int < 10**11:
+            v_int *= 1000
+        return v_int
+    except ValueError:
+        pass
+    try:
+        dt = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # naive ISO 按 UTC 解析（agent 通常发 UTC 时间）
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        return None
 
 # ── claim_task ──────────────────────────────────────────
 
@@ -77,22 +110,60 @@ class UpdateTaskStatusParams(BaseModel):
         default=None,
         alias="blockedReason",
         description=(
-            "Required when blocked. Prefer typed prefixes: "
-            "dependency:<taskId|why>, timer:<why>, user:<why>, external:<why>."
+            "Required when blocked. Human-readable note only — auto-unblock "
+            "is declared via dependsOnTaskIds / wakeAt, never inferred from "
+            "this text."
         ),
         json_schema_extra={"aliases": ["blockedReason", "blocked_reason", "reason"]},
     )
-    depends_on_task_id: str | None = Field(
+    depends_on_task_ids: list[str] | None = Field(
         default=None,
-        alias="dependsOnTaskId",
+        alias="dependsOnTaskIds",
         description=(
-            "When blocking on a dependency, the blocker task id. Enables "
-            "auto-unblock when that task is approved/closed."
+            "When blocking on dependencies: the blocker task ids (list). "
+            "Auto-unblocks when all of them are approved/closed. A block "
+            "needs dependsOnTaskIds or wakeAt — a block with neither can "
+            "never auto-unblock."
         ),
         json_schema_extra={
-            "aliases": ["dependsOnTaskId", "depends_on_task_id", "dependsOn"]
+            "aliases": [
+                "dependsOnTaskIds",
+                "depends_on_task_ids",
+                "dependsOnTaskId",
+                "depends_on_task_id",
+                "dependsOn",
+            ]
         },
     )
+    wait_kind: Literal["dependency", "timer", "user", "external"] | None = Field(
+        default=None,
+        alias="waitKind",
+        description=(
+            "Structured wait kind when blocking. Inferred from dependsOnTaskIds "
+            "(dependency) or wakeAt (timer) when omitted. Never inferred from "
+            "blockedReason text."
+        ),
+        json_schema_extra={"aliases": ["waitKind", "wait_kind"]},
+    )
+    wake_at: str | int | None = Field(
+        default=None,
+        alias="wakeAt",
+        description=(
+            "Deadline for timer waits: ISO-8601 datetime (naive = UTC) or "
+            "epoch milliseconds. Auto-unblocks at this time."
+        ),
+        json_schema_extra={"aliases": ["wakeAt", "wake_at"]},
+    )
+
+    @field_validator("depends_on_task_ids", mode="before")
+    @classmethod
+    def _coerce_dep_ids(cls, v: Any) -> Any:
+        """Accept a single id string or comma-separated list for convenience."""
+        if v is None or isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [s for s in (x.strip() for x in v.split(",")) if s]
+        return v
 
 
 @tool(
@@ -120,22 +191,45 @@ async def update_task_status_tool(
     try:
         if status == "blocked":
             reason = params.blocked_reason or "Blocked by agent"
-            dep = params.depends_on_task_id
+            deps = params.depends_on_task_ids or []
+            wake_ms = _parse_wake_at_ms(params.wake_at)
+            if params.wake_at is not None and wake_ms is None:
+                return ToolResult.err(
+                    f"update_task_status: wakeAt={params.wake_at!r} is not a "
+                    f"parseable ISO-8601 datetime or epoch-milliseconds value. "
+                    f"Pass a valid wakeAt or dependsOnTaskIds for the "
+                    f"auto-unblock path."
+                )
+            if params.wait_kind and params.wait_kind != "timer" and wake_ms is not None:
+                return ToolResult.err(
+                    f"update_task_status: wakeAt only applies to timer waits, "
+                    f"but waitKind={params.wait_kind!r} was given. Drop one of "
+                    f"them (wakeAt implies waitKind=timer)."
+                )
+            if not deps and wake_ms is None:
+                return ToolResult.err(
+                    "update_task_status: blocking requires an auto-unblock "
+                    "path — pass dependsOnTaskIds (blocker task ids) or "
+                    "wakeAt (ISO-8601 or epoch-ms deadline). A block with "
+                    "neither can never auto-unblock and parks the task for "
+                    "everyone waiting on it."
+                )
+            if params.wait_kind:
+                kind = params.wait_kind
+            elif deps:
+                kind = "dependency"
+            else:
+                kind = "timer"
             await ts.block_task(
-                project_id, params.task_id, reason, depends_on_task_id=dep
+                project_id,
+                params.task_id,
+                reason,
+                depends_on_task_ids=deps,
+                wait_kind=kind,
+                wake_at=wake_ms,
             )
-            warn = ""
-            if reason.strip().lower().startswith("dependency:"):
-                import re as _re
-                has_id = bool(_re.search(r"[0-9a-fA-F-]{8,}", reason))
-                if not dep and not has_id:
-                    warn = (
-                        " WARNING: dependency block without task id — "
-                        "cannot auto-wake; pass dependsOnTaskId or include "
-                        "the blocker task id in blockedReason."
-                    )
             return ToolResult.ok(
-                f"Task {params.task_id} blocked: {reason}{warn}"
+                f"Task {params.task_id} blocked: {reason} (wait_kind={kind})"
             )
         # status == "running": deterministic by current state (TEST11 #5-L1)
         cur = await ts.get_task(project_id, params.task_id)

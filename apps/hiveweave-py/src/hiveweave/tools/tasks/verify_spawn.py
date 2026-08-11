@@ -762,23 +762,32 @@ def _prune_pump_failed_cooldowns(now_ms: int) -> None:
         _pump_failed_cooldowns.update(kept)
 
 
-async def _project_has_in_flight_verify(
+async def _in_flight_verify_task(
     project_id: str,
     *,
     except_id: str | None = None,
-) -> bool:
-    """项目内是否存在其它 in-flight 的座席验收 VERIFY（串行化锁）。
+) -> dict | None:
+    """First in-flight VERIFY task (串行化锁占有者), or None.
 
     验收串行化（issue #6）：同项目同一时刻只允许一个 VERIFY 独占 MAIN
     运行时（端口 + taskflow.db）。in-flight = claimed/running/submitted/
     reviewing/verifying/rework —— 即已开始跑或正被审查的 VERIFY。
     status=created（未唤醒）/ approved（VR 已 approve，随即 close，不再
     占运行时）/ closed / cancelled / archived 不视为 in-flight。blocked
-    特殊处理：**有 assignee 的 blocked 算 in-flight**（运行中被阻塞、
-    game_time 可自动 unblock 恢复，占运行时）；无 assignee 的 blocked
-    是 QA 死区（等待 hire），不占锁（审计 #1）。
+    分三种（2026-08-11 slack-clone_01 死锁复盘）：
+    - **有 assignee 且有自动解封路径**（depends_on 非空 / timer 的 wake_at
+      非空——不判过期，泵先于 reconcile 运行，判过期会放行第二个 VERIFY）
+      → 运行中被阻塞，game_time 可自动 unblock 恢复，占运行时；
+    - **有 assignee 但无解封路径**（parked：手工 block，如「归零批量验收」
+      策略）→ 永远不会自愈，视为死区，**不占锁** —— 否则它会像僵尸一样
+      永久冻结整个 VERIFY 队列（reconcile 不碰它、泵不敢放行、QA 等不到
+      inbox 唤醒）；
+    - 无 assignee → QA 死区（等待 hire），不占锁。
     """
+    from hiveweave.services.tasks.lifecycle import blocked_task_has_wake_path
+
     ts = _task_svc.TaskService()
+    now_ms = int(time.time() * 1000)
     tasks = await ts.list_tasks(project_id)
     for t in tasks:
         if not ts._is_verify_task(t):
@@ -790,11 +799,31 @@ async def _project_has_in_flight_verify(
         status = t.get("status")
         if status in ("created", "approved", "closed", "cancelled"):
             continue
-        if status == "blocked" and not t.get("assignee_id"):
-            # QA 死区：无 assignee 的 blocked 不占运行时
-            continue
-        return True
-    return False
+        if status == "blocked":
+            if not t.get("assignee_id"):
+                # QA 死区：无 assignee 的 blocked 不占运行时
+                continue
+            if not blocked_task_has_wake_path(t, now_ms):
+                # parked：无自动解封路径的 blocked 不占运行时
+                continue
+            return t
+        return t
+    return None
+
+
+async def _project_has_in_flight_verify(
+    project_id: str,
+    *,
+    except_id: str | None = None,
+) -> bool:
+    """项目内是否存在其它 in-flight 的座席验收 VERIFY（串行化锁）。
+
+    验收串行化（issue #6）：同项目同一时刻只允许一个 VERIFY 独占 MAIN
+    运行时（端口 + taskflow.db）。语义见 ``_in_flight_verify_task``：
+    blocked 仅在有自动解封路径（depends_on 非空 / 未过期 timer）时占锁，
+    parked（无路径）与 QA 死区（无 assignee）不占锁。
+    """
+    return await _in_flight_verify_task(project_id, except_id=except_id) is not None
 
 
 async def nudge_pending_verify_tasks(project_id: str) -> int:

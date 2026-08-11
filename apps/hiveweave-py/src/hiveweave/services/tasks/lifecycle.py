@@ -14,6 +14,34 @@ from .verify import VerifyMixin
 log = structlog.get_logger(__name__)
 
 
+def blocked_task_has_wake_path(task: dict, now_ms: int | None = None) -> bool:
+    """A blocked task has a live auto-unblock path iff its wait metadata says so.
+
+    2026-08-11 slack-clone_01 死锁复盘：手工 block（wait_kind 非 timer 且
+    depends_on 为空）没有任何自动解封路径，reconcile 永远不会碰它 —— 这类
+    parked 任务若被当成「占用 MAIN 运行时」会让整个 VERIFY 队列永久冻结。
+    只认结构化字段（HARD RULE：禁止用文案猜意图）：
+    - ``depends_on`` 非空 → reconcile 在全部依赖 approved/closed 后自动解封；
+    - ``wait_kind == "timer"`` 且 ``wake_at`` 非空 → reconcile 到期自动解封。
+      **不判过期**：game_time 同一 STALL_CHECK 内泵（nudge_pending_verify）
+      先于 reconcile 运行，若把已过期 timer 判为 parked，泵会放行第二个
+      VERIFY，reconcile 紧接着把第一个解封成 running → 双 VERIFY 上 MAIN。
+    """
+    deps = task.get("depends_on") or []
+    if isinstance(deps, str):
+        try:
+            deps = json.loads(deps) if deps else []
+        except (json.JSONDecodeError, TypeError):
+            deps = []
+    if isinstance(deps, list) and deps:
+        return True
+    kind = (task.get("wait_kind") or "").lower()
+    wake_at = task.get("wake_at")
+    if kind == "timer" and wake_at is not None:
+        return True
+    return False
+
+
 class LifecycleMixin:
     """start/block/unblock/reconcile + implementer lock / park."""
 
@@ -121,30 +149,47 @@ class LifecycleMixin:
         reason: str,
         *,
         depends_on_task_id: str | None = None,
+        depends_on_task_ids: list[str] | None = None,
+        wait_kind: str | None = None,
+        wake_at: int | None = None,
     ) -> None:
-        """Block a task (running → blocked). Sets blocked_reason.
+        """Block a task (running → blocked). Sets blocked_reason + wait metadata.
 
-        Prefer typed prefixes in reason: dependency: / timer: / user: / external:
-        When ``depends_on_task_id`` is set, merges it into ``depends_on`` so
-        ``_wake_dependent_tasks`` can auto-unblock (TEST11 #5-L2).
+        Auto-unblock paths are structured only:
+        - ``depends_on_task_ids``: blocker task ids merged into ``depends_on``
+          (``reconcile_blocked_tasks`` unblocks when all are approved/closed);
+        - ``wait_kind="timer"`` + ``wake_at`` (epoch ms): deadline for
+          ``reconcile_blocked_tasks``.
+        ``wait_kind`` is explicit; inferring it from an English prefix in
+        ``reason`` is legacy-only and violates the HARD RULE (禁止用文案猜
+        意图) — new callers must pass it explicitly. A block with no deps and
+        no timer has no auto-unblock path and parks the task forever; callers
+        that need that (QA dead zone) must use the dedicated system paths.
         """
         task_id = await self.require_task_id(project_id, task_id)
+        dep_ids: list[str] = []
+        for d in (depends_on_task_ids or []):
+            dep_ids.append(await self.require_task_id(project_id, d))
         if depends_on_task_id:
-            depends_on_task_id = await self.require_task_id(
-                project_id, depends_on_task_id
-            )
+            dep_ids.append(await self.require_task_id(project_id, depends_on_task_id))
         await self._transition(project_id, task_id, "blocked")
         now_ms = int(time.time() * 1000)
         reason = (reason or "Blocked by agent").strip()
-        wait_kind = self._infer_wait_kind(reason)
-        # Best-effort: set wait_kind / clear wake_at when columns exist
+        if not wait_kind:
+            wait_kind = self._infer_wait_kind(reason)  # legacy callers only
+        if not wait_kind and dep_ids:
+            wait_kind = "dependency"  # structured: deps present → dependency
+        if not wait_kind and wake_at is not None:
+            wait_kind = "timer"  # structured: deadline present → timer
+            # 否则 wake_at 存了但 wait_kind 非 timer → 被当 parked（并发审计 F3）
         try:
             await _execute(
                 project_id,
                 "UPDATE tasks SET blocked_reason = ?, wait_kind = ?, "
-                "wake_at = CASE WHEN ? = 'timer' THEN wake_at ELSE NULL END, "
+                "wake_at = CASE WHEN ? IS NOT NULL THEN ? "
+                "WHEN ? = 'timer' THEN wake_at ELSE NULL END, "
                 "updated_at = ? WHERE id = ?",
-                [reason, wait_kind, wait_kind, now_ms, task_id],
+                [reason, wait_kind, wake_at, wake_at, wait_kind, now_ms, task_id],
             )
         except Exception:
             await _execute(
@@ -152,9 +197,8 @@ class LifecycleMixin:
                 "UPDATE tasks SET blocked_reason = ?, updated_at = ? WHERE id = ?",
                 [reason, now_ms, task_id],
             )
-        # Structured dependency ref → merge into depends_on (auto-wake path)
-        dep = (depends_on_task_id or "").strip()
-        if dep:
+        # Structured dependency refs → merge into depends_on (auto-wake path)
+        if dep_ids:
             try:
                 rows = await _query(
                     project_id,
@@ -170,8 +214,12 @@ class LifecycleMixin:
                         deps = []
                 if not isinstance(deps, list):
                     deps = []
-                if dep not in deps:
-                    deps.append(dep)
+                added = False
+                for d in dep_ids:
+                    if d not in deps:
+                        deps.append(d)
+                        added = True
+                if added:
                     await _execute(
                         project_id,
                         "UPDATE tasks SET depends_on = ?, updated_at = ? WHERE id = ?",
@@ -185,8 +233,38 @@ class LifecycleMixin:
                 )
 
     async def unblock_task(self, project_id: str, task_id: str) -> None:
-        """Unblock a task (blocked → running). Clears blocked_reason."""
+        """Unblock a task (blocked → running). Clears blocked_reason.
+
+        验收串行化（2026-08-11 并发审计 F1）：手动解封一个 VERIFY 任务必须
+        走串行化门 —— parked VERIFY 不占锁，若另一个 VERIFY 正在 MAIN 上跑，
+        直接解封会制造双 VERIFY 并发（issue #6）。自动路径（reconcile /
+        _wake_dependent_tasks）只触达 has-wake 任务（它们自身占锁），
+        except_id 排除自身后门禁必然放行，不受影响。
+        """
         task_id = await self.require_task_id(project_id, task_id)
+        row = await self.get_task(project_id, task_id)
+        if row and VerifyMixin._is_verify_task(row):
+            from hiveweave.tools.tasks.verify_spawn import (
+                _in_flight_verify_task,
+                _verify_serialize_lock,
+            )
+
+            async with _verify_serialize_lock(project_id):
+                blocker = await _in_flight_verify_task(
+                    project_id, except_id=task_id
+                )
+                if blocker:
+                    raise ValueError(
+                        f"Task {task_id[:8]} is a VERIFY task and another "
+                        f"VERIFY ({str(blocker.get('id'))[:8]}, "
+                        f"{blocker.get('status')}) is in flight on the shared "
+                        f"MAIN runtime (verification is serialized: one at a "
+                        f"time). Unblocking now would run two VERIFYs "
+                        f"concurrently. Wait for the in-flight VERIFY to "
+                        f"close, or if the blocker is parked (no "
+                        f"auto-unblock path), give it dependsOnTaskIds / "
+                        f"wakeAt first."
+                    )
         await self._transition(project_id, task_id, "running")
         now_ms = int(time.time() * 1000)
         try:
