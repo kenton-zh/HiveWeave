@@ -246,6 +246,17 @@ class GitWorktreeMergeParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["taskId", "task_id"]},
     )
+    dry_run: bool = Field(
+        default=False,
+        alias="dryRun",
+        description=(
+            "Preflight (dry-run): when true, run ONLY the precondition checks "
+            "(worktree health / dirty main / branch exists) and return the "
+            "complete missing-items list. NO mutations: no merge, no "
+            "worktree teardown, no auto-repair. Default false = real merge."
+        ),
+        json_schema_extra={"aliases": ["dryRun", "dry_run", "preflight", "check"]},
+    )
 
 
 async def _resolve_stable_task_branch(
@@ -688,6 +699,7 @@ async def git_worktree_merge_tool(
                 )
 
     # ── 自有分支合并门：合并调用者自己 short_id 的分支须异人 approved ──
+    gate_err = None
     if (
         merged_short
         and caller_short_id
@@ -696,8 +708,35 @@ async def git_worktree_merge_tool(
         gate_err = await _check_self_merge_gate(
             project_id, agent_id, params.task_id, merged_branch
         )
+
+    # ── dry-run：只读预检，列出全部缺失项，零改动 ──
+    if params.dry_run:
+        issues: list[dict] = []
         if gate_err:
-            return ToolResult.err(gate_err)
+            issues.append({"code": "self_merge_gate", "message": gate_err})
+        report = await gwt.preflight_merge(
+            workspace_path,
+            merged_short or caller_short_id,
+            merged_branch,
+            target_branch,
+        )
+        issues += report.get("missing", [])
+        if report.get("already_up_to_date"):
+            msg = (
+                f"dry-run: 分支 {merged_branch} 已合入 {target_branch}，"
+                f"无需 merge。"
+            )
+        elif not issues:
+            msg = "dry-run: 所有 merge 前置条件已满足，可以执行 merge。"
+        else:
+            msg = (
+                "dry-run: 以下前置条件未满足，merge 将被拒绝：\n"
+                + "\n".join(f"- [{i['code']}] {i['message']}" for i in issues)
+            )
+        return ToolResult.ok(msg, dry_run=True, missing=issues)
+
+    if gate_err:
+        return ToolResult.err(gate_err)
 
     result = await merge_call()
 

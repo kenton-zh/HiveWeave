@@ -847,3 +847,130 @@ async def pre_check_exit_gates(
         return violations
 
     return violations
+
+
+# ── 回合开始前置注入（F1）─────────────────────────────────
+# 数据源与 gate 同口径；best-effort，任何失败静默降级，
+# 绝不阻塞回合开始。
+
+
+def _fmt_ids(ids: list[str], limit: int = 4) -> str:
+    """ID 列表 → "#a、#b、#c 等N个"（超限截断，防上下文膨胀）。"""
+    shown = [f"#{i}" for i in ids[:limit]]
+    if len(ids) > limit:
+        return f"{'、'.join(shown)} 等{len(ids)}个"
+    return "、".join(shown)
+
+
+async def _unreplied_ask_contracts(agent_id: str) -> list[str]:
+    """未完结 ask 的合约 ID 前缀（与 get_outstanding_ask_senders 同口径）。
+
+    单查询：expect_report=1 且 reply_contract_id 未通过任何 reply_to 闭合
+    （legacy 无合约则按未读）。返回合约前 12 位（与 gate hint 同款
+    contract 值，agent 可直接 replyTo），无合约回退发送方 ID 前缀。
+    """
+    from hiveweave.db import project as project_db
+    from hiveweave.services.inbox import _ensure_schema
+
+    await _ensure_schema(agent_id)
+    rows = await project_db.query(
+        agent_id,
+        "SELECT from_agent_id, reply_contract_id FROM inbox AS i "
+        "WHERE i.to_agent_id = ? AND i.expect_report = 1 "
+        "AND i.from_agent_id NOT IN ('user', 'system') "
+        "AND ("
+        "  (i.reply_contract_id IS NOT NULL AND i.reply_contract_id NOT IN ("
+        "    SELECT DISTINCT reply_to FROM inbox WHERE reply_to IS NOT NULL))"
+        "  OR (i.reply_contract_id IS NULL AND i.read = 0)"
+        ") ORDER BY i.created_at DESC LIMIT 20",
+        [agent_id],
+    )
+    out: list[str] = []
+    for r in rows:
+        cid = r["reply_contract_id"] if "reply_contract_id" in r.keys() else None
+        if cid:
+            out.append(str(cid)[:12])
+        else:
+            fid = r["from_agent_id"] if "from_agent_id" in r.keys() else ""
+            out.append((str(fid) or "?")[:8])
+    return out
+
+
+async def _worktree_dirty_flag(agent_id: str, project_id: str) -> bool:
+    """Worktree 未提交标记 — 仅 porcelain，不跑 info() 重命令。
+
+    用 agent_router 内存路由取规范路径（0 DB 查询），只有真实存在
+    .git 的写 worktree 才跑一次 `git status --porcelain`。CEO/HR 无
+    worktree 直接跳过。标记是 advisory：gate 的
+    agent_worktree_has_uncommitted 才是权威判定。
+    """
+    from pathlib import Path
+
+    from hiveweave.services.agent_router import agent_router
+    from hiveweave.services.git_worktree.constants import WORKTREE_DIR
+    from hiveweave.services.git_worktree.git_cmd import _git
+    from hiveweave.services.git_worktree.porcelain import _porcelain_tracked_dirty
+
+    try:
+        route = agent_router.get_route(agent_id)
+        if not route or not route.workspace_path or not route.short_id:
+            return False
+        wt = str(Path(route.workspace_path) / WORKTREE_DIR / route.short_id)
+        if not (Path(wt) / ".git").exists():
+            return False
+        ok_st, st_out = await _git(
+            ["-c", "core.quotepath=false", "status", "--porcelain", "-z"], wt
+        )
+        return bool(ok_st and _porcelain_tracked_dirty(st_out or ""))
+    except Exception as e:
+        log.debug(
+            "exit_contract_worktree_flag_failed",
+            agent_id=agent_id,
+            error=str(e),
+        )
+        return False
+
+
+async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
+    """回合开始时的出口条件提示（F1）— agent 收工决策前可见本轮 gate 要求。
+
+    数据源与 gate 一致（ask 合约 / actionable obligations / worktree
+    dirty flag）。任一源失败则忽略该项；全部失败返回空串（不注入）。
+    无待办时返回单行「仅需提交 commit_turn」，不膨胀上下文。
+    """
+    asks: list[str] = []
+    obligations: list[dict] = []
+    checked = 0
+    try:
+        asks = await _unreplied_ask_contracts(agent_id)
+        checked += 1
+    except Exception as e:
+        log.debug("exit_contract_asks_failed", agent_id=agent_id, error=str(e))
+    try:
+        from hiveweave.services.task import TaskService
+
+        obligations = await TaskService().get_actionable_obligations(
+            project_id, agent_id
+        )
+        checked += 1
+    except Exception as e:
+        log.debug(
+            "exit_contract_obligations_failed",
+            agent_id=agent_id,
+            error=str(e),
+        )
+    if not checked:
+        return ""
+    wt_dirty = await _worktree_dirty_flag(agent_id, project_id)
+    if not asks and not obligations and not wt_dirty:
+        return "【本轮出口条件】仅需提交 commit_turn"
+    items: list[str] = ["必须提交 commit_turn"]
+    if asks:
+        items.append(f"未回复 ask: {len(asks)} 个（{_fmt_ids(asks)}）")
+    if obligations:
+        tids = [str(o.get("id") or "")[:8] for o in obligations if o.get("id")]
+        items.append(f"未完成义务: {len(obligations)} 个（{_fmt_ids(tids)}）")
+    if wt_dirty:
+        items.append("worktree 有未提交改动（done_slice 前需 checkpoint）")
+    body = "；".join(f"{i}) {it}" for i, it in enumerate(items, 1))
+    return f"【本轮出口条件】{body}"

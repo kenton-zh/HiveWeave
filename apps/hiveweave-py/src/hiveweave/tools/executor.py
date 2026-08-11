@@ -63,7 +63,17 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Use it to run CLI tools, scripts, git commands, or any system operation. "
             "Returns stdout/stderr. cwd is your workspace — on Windows prefer "
             "Git Bash paths like /d/PC_AI/... or quote Windows paths; never invent "
-            "/workspace or strip backslashes (D:PC_AI... is invalid)."
+            "/workspace or strip backslashes (D:PC_AI... is invalid).\n"
+            "环境声明: Windows 宿主下优先 Git Bash（bash -c）执行，无 Git Bash 时"
+            "降级 cmd /s /c（unix→cmd 近似映射），POSIX 用 bash -c；非 PowerShell，"
+            "pwsh 语义（Get-Content -Tail N 等）不适用。\n"
+            "GNU coreutils 子集可用但不保证 GNU 长选项：如 `tail --lines` 不可靠"
+            "（cmd 降级路径下 tail/head 仅近似映射为 more，参数支持弱）；推荐兼容写法"
+            " `tail -n N`（GNU/BSD 均支持），避免 BSD 专属 flag 如 `tail --ignore=`"
+            "（GNU coreutils 拒绝）。\n"
+            "python 用 `uv run python` 或 .venv/Scripts/python.exe（裸 python 可能"
+            "不在 PATH）；命令前自动 source 项目 .hiveweave/env.sh（若存在）；"
+            "通配符仅在路径存在时展开。"
         ),
         "properties": {
             "command": {"type": "string", "aliases": ["cmd", "run"]},
@@ -816,6 +826,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": "Merge a worktree branch into main and remove the worktree. On conflict: abort + rework executor to rebase/merge main in their worktree. On success: spawn VERIFY only for tasks covered by this merge.",
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
+            "dryRun": {"type": "boolean", "aliases": ["dry_run", "preflight"],
+                "description": "Preflight (dry-run): only check preconditions (worktree health / dirty main / branch exists) and list ALL missing items. No merge, no teardown. Default false."},
         },
         "required": ["branchName"],
     },
@@ -948,6 +960,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "Required for UI/code tasks."
                 ),
             },
+            "dryRun": {"type": "boolean", "aliases": ["dry_run", "preflight"],
+                "description": "Preflight (dry-run): only check preconditions (attestation ids / core interaction / delivery gate / files_changed existence) and list ALL missing items. No submit, no notifications. Default false."},
         },
         "required": ["summary", "testsPassed"],
     },

@@ -152,6 +152,77 @@ async def get_tasks_tool(
                         waver_names[wid] = f"{a.get('name','?')} ({a.get('short_id','?')})"
         except Exception:
             pass
+
+        # 撞门前透出 VERIFY 串行锁 + attestation 基线状态（claim/review
+        # 前置）。slack-clone_01 成本审计根因二：claim 54% 撞门 —— get_tasks
+        # 不透锁状态，QA 反复 claim 被挡；review 23% —— attestation 基线过期
+        # 只在 review_task 才暴露。此处每行只读透出，_in_flight_verify_task /
+        # check_verify_baseline 原样复用（不重写逻辑）。
+        _f2_ts = _task_svc.TaskService()
+        _f2_holder = None
+        try:
+            from hiveweave.tools.tasks.verify_spawn import _in_flight_verify_task
+
+            _f2_holder = await _in_flight_verify_task(project_id)
+        except Exception:
+            _f2_holder = None
+        _f2_queued = sorted(
+            (
+                t
+                for t in tasks
+                if _f2_ts._is_verify_task(t)
+                and t.get("status") == "created"
+                and t.get("assignee_id")
+            ),
+            key=lambda t: ((t.get("created_at") or 0), (t.get("id") or "")),
+        )
+        _f2_queue_pos = {
+            str(t.get("id") or ""): i for i, t in enumerate(_f2_queued)
+        }
+        for t in tasks:
+            tk = str(t.get("id") or "")
+            t["verify_in_flight"] = False
+            t["verify_in_flight_id"] = None
+            t["verify_queue_position"] = None
+            t["attestation_baseline_ok"] = None
+            if _f2_ts._is_verify_task(t):
+                # claim 门按 except_id 自豁免 —— 持有者自己不被挡，其余
+                # VERIFY 被当前持有者挡（与 claim.py 同一判定）。
+                blocker = None
+                if _f2_holder is not None:
+                    if str(_f2_holder.get("id")) != tk:
+                        blocker = _f2_holder
+                    else:
+                        try:
+                            from hiveweave.tools.tasks.verify_spawn import (
+                                _in_flight_verify_task as _ift,
+                            )
+
+                            blocker = await _ift(project_id, except_id=tk)
+                        except Exception:
+                            blocker = None
+                t["verify_in_flight"] = blocker is not None
+                if blocker:
+                    t["verify_in_flight_id"] = str(blocker.get("id") or "")
+                t["verify_queue_position"] = _f2_queue_pos.get(tk)
+            if t.get("status") == "reviewing":
+                try:
+                    from hiveweave.services.attestation import check_verify_baseline
+
+                    _baseline_err = await check_verify_baseline(
+                        project_id, t, max_behind=5
+                    )
+                    t["attestation_baseline_ok"] = _baseline_err is None
+                except Exception:
+                    t["attestation_baseline_ok"] = None
+        if _f2_holder is not None:
+            _h = _f2_holder
+            lines.append(
+                f"verify_serial_lock: held by {str(_h.get('id') or '')[:8]} "
+                f"({_h.get('status')}, "
+                f"assignee={str(_h.get('assignee_id') or '?')[:12]}) — created "
+                f"VERIFY 的 claim 会被挡，直到它收口"
+            )
         for t in tasks:
             tk = str(t.get("id") or "")
             lines.append(
@@ -160,6 +231,29 @@ async def get_tasks_tool(
                 f"progress={t.get('progress', 0)}%, "
                 f"assignee={t.get('assignee_id') or 'unassigned'})"
             )
+            if t.get("verify_in_flight"):
+                _blk = str(t.get("verify_in_flight_id") or "")[:8]
+                lines.append(
+                    f"    verify_lock: blocked by in-flight VERIFY "
+                    f"({_blk}) — claim waits until MAIN frees"
+                )
+            _qp = t.get("verify_queue_position")
+            if _qp is not None:
+                lines.append(
+                    "    verify_queue_position: "
+                    + (
+                        "0 — next in line"
+                        if _qp == 0
+                        else f"{_qp} ({_qp} VERIFY ahead)"
+                    )
+                )
+            if t.get("attestation_baseline_ok") is True:
+                lines.append("    attestation_baseline: ok")
+            elif t.get("attestation_baseline_ok") is False:
+                lines.append(
+                    "    attestation_baseline: STALE — 需在 MAIN 当前 tip "
+                    "重跑测试后再 approve"
+                )
             # waiver_by_task is keyed by the canonical (dash-stripped) form that
             # `create_waiver` stored — look up with the same canonical key so the
             # dotted task id never misses (P0-1 waiver visibility regression).

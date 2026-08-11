@@ -20,6 +20,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from hiveweave.config import resolve_browse_bin, settings
+from hiveweave.conversation.token_utils import TOOL_OUTPUT_MAX_BYTES
 from hiveweave.tools.base import tool
 from hiveweave.tools.result import ToolResult
 
@@ -36,6 +37,11 @@ _VISUAL_OBSERVED_MIN = 40
 # multibyte sources would otherwise blow the argv cap unnoticed.
 _EVAL_DIRECT_MAX = 1024
 _EVAL_B64_MAX = 24000  # 24k UTF-8 bytes → ~32k base64, clear of the argv cap
+
+# 快照短契约 —— snapshot ≥50KB 时只把结构化摘要返回给 agent，
+# 完整快照落盘（镜像 executor 的 .hiveweave/tool_outputs/ 约定）并回传句柄。
+_SNAPSHOT_CONTRACT_TEXT_CHARS = 1_500  # 可见内容摘要预算（1-2K 字符内）
+_SNAPSHOT_LINE_MAX_CHARS = 500  # 单行超长（JSON 等）不能击穿摘要预算
 
 
 def _is_path_stub_observed(observed: str, screenshot_path: str) -> bool:
@@ -542,6 +548,71 @@ async def issue_browse_e2e_attestation(
         return ""
 
 
+def _contract_snapshot_output(
+    output: str, agent_id: str, workspace: str
+) -> str:
+    """大 snapshot 输出收成短契约返回。
+
+    阈值复用 TOOL_OUTPUT_MAX_BYTES（50KB）：未超限原样返回。超限时返回
+    标题/URL/元素数 + 可见内容摘要，完整快照落盘（executor 同款
+    .hiveweave/tool_outputs/ 约定，7 天保留）并回传句柄。agent-browser
+    snapshot 是 a11y 树（Page:/URL: 头 + @eN refs），树本身即结构化文本，
+    无需 HTML 剥离；--json 模式按 "role" 字段计数兜底。
+    """
+    byte_len = len(output.encode("utf-8", errors="replace"))
+    if byte_len <= TOOL_OUTPUT_MAX_BYTES:
+        return output
+
+    import re as _re
+
+    title = ""
+    url = ""
+    for line in output.splitlines():
+        if not title and line.startswith("Page: "):
+            title = line[len("Page: "):].strip()
+        elif not url and line.startswith("URL: "):
+            url = line[len("URL: "):].strip()
+        if title and url:
+            break
+
+    element_count = len(_re.findall(r"@e\d+", output))
+    if not element_count:
+        element_count = len(_re.findall(r'"role"\s*:', output))
+
+    lines = output.splitlines()
+    drop = 0
+    while drop < min(2, len(lines)) and (
+        lines[drop].startswith("Page: ") or lines[drop].startswith("URL: ")
+    ):
+        drop += 1
+    summary_bits: list[str] = []
+    used = 0
+    for line in lines[drop:]:
+        capped = line if len(line) <= _SNAPSHOT_LINE_MAX_CHARS else (
+            f"{line[:_SNAPSHOT_LINE_MAX_CHARS - 1]}…"
+        )
+        if used + len(capped) + 1 > _SNAPSHOT_CONTRACT_TEXT_CHARS:
+            break
+        summary_bits.append(capped)
+        used += len(capped) + 1
+    if len(summary_bits) < len(lines[drop:]):
+        summary_bits.append("…")
+    summary = "\n".join(summary_bits)
+
+    from hiveweave.tools.executor import ToolExecutor
+
+    file_path = ToolExecutor._save_tool_output_file(
+        output, agent_id, "browse", workspace
+    )
+    return (
+        f"[snapshot 已落盘: {file_path}]（{len(lines)} 行，{byte_len} 字节）\n"
+        f"页面标题: {title or '(未提取)'}\n"
+        f"URL: {url or '(未提取)'}\n"
+        f"元素数: {element_count}\n"
+        f"可见内容摘要（已截断，完整快照见落盘文件）:\n{summary}"
+    )
+
+
 @tool(
     "browse",
     "Drive a real Chromium browser via agent-browser (goto/click/fill/snapshot/"
@@ -612,6 +683,11 @@ async def browse_tool(
         task_id=params.task_id,
         core_interaction=core_interaction,
     )
+
+    # 大快照短契约化 —— attestation 先按全量 stdout 出证（stdout_hash
+    # 完整性），返回文本再收短契约；<50KB 的快照原样返回。
+    if head == "snapshot":
+        out = _contract_snapshot_output(out, agent_id, workspace)
 
     extra_fields: dict[str, Any] = {}
     shot_rel = _screenshot_path_from_argv(argv)
