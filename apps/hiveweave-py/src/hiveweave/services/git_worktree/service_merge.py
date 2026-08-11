@@ -125,6 +125,74 @@ class MergeMixin:
             pass
         return canonical
 
+    async def _auto_repair_husk(
+        self,
+        workspace_path: str,
+        short_id: str,
+        path: str,
+        branch: str,
+    ) -> str | None:
+        """Husk（目录无 .git）自动修复：停进程 → 删空壳 → 重新注册 worktree。
+
+        2026-08-11 A023 事故：D3 预条件检测到 husk 只报 "Trigger worktree
+        repair"，但 agent 侧无 repair 工具，团队只能手动 ``git worktree
+        add`` 绕圈（CEO 反复撞 husk 40 分钟）。分支存在时这里直接重建到
+        规范路径 —— 与磐石手动做的事等价，但平台自动完成。
+
+        Returns None on success, or an error message on failure.
+        """
+        # 文件系统审计 F2：repair 会 rmtree —— path 必须是本项目
+        # .hiveweave/worktrees/ 下的绑定目录（DB workspace_path 损坏时
+        # _resolve_effective_worktree_path 可能返回任意路径；husk 无 .git
+        # 绕过了 DB 分支的 binding 校验，这里必须兜底）。
+        if not _worktree_binding_under_project(path, workspace_path):
+            return (
+                f"auto-repair refused: {path} is not a binding under this "
+                f"project's .hiveweave/worktrees/ — refusing to delete it. "
+                f"Fix the agent's workspace_path first."
+            )
+        try:
+            from hiveweave.services.process_registry import (
+                stop_processes_for_worktree,
+            )
+
+            stop_processes_for_worktree(path)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+        # 并发窗口二次 stat：stop 进程期间可能已有并发 add 复活该目录
+        if Path(path).exists() and _has_git(path):
+            return (
+                f"auto-repair skipped: {path} regained .git during repair "
+                f"(concurrent worktree add) — it is a live tree now, "
+                f"retry the merge."
+            )
+        if Path(path).exists():
+            return (
+                f"auto-repair failed: could not remove husk directory {path} "
+                f"(locked by a process — Device busy). Move it aside or kill "
+                f"the holding process, then retry."
+            )
+        ok, out = await _git(
+            ["worktree", "add", path.replace("\\", "/"), branch],
+            workspace_path,
+        )
+        if not ok:
+            return (
+                f"auto-repair failed: git worktree add {path} {branch} "
+                f"failed: {out.strip()[:200]}"
+            )
+        log.info(
+            "git_worktree.merge_husk_auto_repaired",
+            short_id=short_id,
+            path=path,
+            branch=branch,
+        )
+        return None
+
     async def _validate_merge_preconditions(
         self, workspace_path: str, short_id: str, branch: str,
         target_branch: str = "main",
@@ -156,14 +224,29 @@ class MergeMixin:
                     "git_worktree.merge_precondition_no_git",
                     short_id=short_id, path=path, branch=branch,
                 )
+                # 2026-08-11 A023 事故：husk 自动修复（分支存在时重建到规范
+                # 路径），修复成功重跑本函数继续校验；失败返回可操作错误。
+                repair_err = await self._auto_repair_husk(
+                    workspace_path, short_id, path, branch
+                )
+                if repair_err is None:
+                    log.info(
+                        "git_worktree.merge_precondition_husk_repaired",
+                        short_id=short_id, path=path, branch=branch,
+                    )
+                    return await self._validate_merge_preconditions(
+                        workspace_path, short_id, branch, target_branch
+                    )
                 return {
                     "success": False,
                     "reason": "precondition_failed",
                     "message": (
                         f"Merge precondition failed: worktree directory for "
                         f"{short_id} has no .git (husk detected at {path}). "
-                        f"This worktree is corrupted. Trigger worktree repair "
-                        f"(re-create + reattach) before merging."
+                        f"Auto-repair attempted but {repair_err} The worktree "
+                        f"is corrupted; reconcile will also retry husk "
+                        f"cleanup. Move the directory aside or kill the "
+                        f"holding process, then retry."
                     ),
                     "branch": branch,
                 }
