@@ -118,6 +118,29 @@ def test_reset_ledger_zeroes(isolated_ledger):
     reset_ledger("agent-unknown")  # 无该 agent 行也不抛
 
 
+def test_last_change_ts_tracks_edits(isolated_ledger):
+    from hiveweave.services.code_audit import (
+        get_last_change_ts,
+        record_change,
+        reset_ledger,
+    )
+
+    assert get_last_change_ts("agent-a") == 0.0  # 缺席 → 0
+    record_change("agent-a", 3)
+    ts = get_last_change_ts("agent-a")
+    assert ts > 0  # 有编辑 → ts 被记录
+    reset_ledger("agent-a")
+    assert get_last_change_ts("agent-a") == 0.0  # 重置 → 0
+
+
+def test_last_change_ts_ignores_nonpositive_lines(isolated_ledger):
+    from hiveweave.services.code_audit import get_last_change_ts, record_change
+
+    record_change("agent-a", 0)
+    record_change("agent-a", -5)
+    assert get_last_change_ts("agent-a") == 0.0  # lines<=0 不更新 ts
+
+
 def test_ledger_snapshot_copy_semantics(isolated_ledger):
     from hiveweave.services.code_audit import (
         ledger_snapshot,

@@ -68,6 +68,7 @@ async def test_empty_diff_auto_pass_no_llm():
     record_change("agent-1", 5)  # within threshold
 
     git = _fake_git(
+        (("rev-parse", "--verify", "refs/heads/main"), (True, "")),
         (("diff", "main...HEAD"), (True, "")),
         (("diff", "HEAD"), (True, "")),
         (("ls-files", "--others", "--exclude-standard"), (True, "")),
@@ -115,6 +116,7 @@ async def test_normal_path_issues_verdict_and_reset():
     record_change("agent-1", 25)
 
     git = _fake_git(
+        (("rev-parse", "--verify", "refs/heads/main"), (True, "")),
         (
             ("diff", "main...HEAD"),
             (True, "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n"),
@@ -184,6 +186,7 @@ async def test_llm_failed_soft_fail():
     record_change("agent-1", 25)
 
     git = _fake_git(
+        (("rev-parse", "--verify", "refs/heads/main"), (True, "")),
         (("diff", "main...HEAD"), (True, "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n")),
         (("diff", "HEAD"), (True, "")),
         (("ls-files", "--others", "--exclude-standard"), (True, "")),
@@ -257,3 +260,75 @@ def test_append_notice_idempotent():
     assert once == f"do the thing\n{CODE_AUDIT_POLICY}"
     assert append_code_audit_notice(once) == once
     assert append_code_audit_notice("") == CODE_AUDIT_POLICY
+
+
+# ── collect_worktree_diff 基分支解析（B1）──────────────────
+
+
+@pytest.mark.asyncio
+async def test_collect_worktree_diff_resolves_master_base():
+    """默认分支为 master 的仓库：分支段 diff 用 master...HEAD，不硬编码 main。"""
+    from hiveweave.services.code_audit import collect_worktree_diff
+
+    calls: list[tuple] = []
+
+    async def fake_git(args, cwd, timeout=30.0):
+        calls.append(tuple(args))
+        table = {
+            ("rev-parse", "--verify", "refs/heads/main"): (False, ""),
+            ("rev-parse", "--verify", "refs/heads/master"): (True, ""),
+            ("diff", "master...HEAD"): (True, "--- a/x.py\n+++ b/x.py\n-old\n+new"),
+            ("diff", "HEAD"): (True, ""),
+            ("ls-files", "--others", "--exclude-standard"): (True, ""),
+        }
+        return table.get(tuple(args), (False, ""))
+
+    with patch("hiveweave.services.git_worktree._git", new=fake_git):
+        diff = await collect_worktree_diff(r"C:\fake\wt")
+
+    assert ("diff", "master...HEAD") in calls
+    assert ("diff", "main...HEAD") not in calls
+    assert "== diff master...HEAD ==" in diff
+
+
+@pytest.mark.asyncio
+async def test_collect_worktree_diff_no_base_keeps_head_and_untracked():
+    """无 main/master 的仓库：跳过分支段，保留 HEAD diff + untracked。"""
+    from hiveweave.services.code_audit import collect_worktree_diff
+
+    git = _fake_git(
+        (("diff", "HEAD"), (True, "--- a/y.py\n+++ b/y.py\n-old\n+new")),
+        (("ls-files", "--others", "--exclude-standard"), (True, "fresh.py")),
+        (("diff", "main...HEAD"), (True, "SHOULD NOT BE USED")),
+        (("diff", "master...HEAD"), (True, "SHOULD NOT BE USED")),
+    )
+    with patch("hiveweave.services.git_worktree._git", new=git):
+        diff = await collect_worktree_diff(r"C:\fake\wt")
+
+    assert "== diff HEAD (uncommitted) ==" in diff
+    assert "== untracked fresh.py" in diff  # 文件不存在 → unreadable 标记兜底
+    assert "main...HEAD" not in diff
+    assert "master...HEAD" not in diff
+
+
+@pytest.mark.asyncio
+async def test_collect_worktree_diff_base_resolve_failure_fails_open():
+    """基分支解析抛异常 → 视为 None，不阻断 diff 收集。"""
+    from hiveweave.services.code_audit import collect_worktree_diff
+
+    git = _fake_git(
+        (("diff", "HEAD"), (True, "--- a/y.py\n+++ b/y.py\n-old\n+new")),
+        (("ls-files", "--others", "--exclude-standard"), (True, "")),
+    )
+    with (
+        patch("hiveweave.services.git_worktree._git", new=git),
+        patch(
+            "hiveweave.services.git_worktree._resolve_base_branch",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        diff = await collect_worktree_diff(r"C:\fake\wt")
+
+    assert "== diff HEAD (uncommitted) ==" in diff
+    assert "main...HEAD" not in diff

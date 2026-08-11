@@ -9,6 +9,7 @@ to a soft-fail dict with a machine-readable ``reason``.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import structlog
@@ -37,6 +38,7 @@ _ISSUE_PARSE_CAP = 100
 # ── Agent-level in-memory ledger ─────────────────────────────
 
 _ledger: dict[str, int] = {}
+_ledger_ts: dict[str, float] = {}
 
 
 def record_change(agent_id: str, lines: int) -> None:
@@ -44,6 +46,7 @@ def record_change(agent_id: str, lines: int) -> None:
     if lines <= 0:
         return
     _ledger[agent_id] = max(0, _ledger.get(agent_id, 0)) + lines
+    _ledger_ts[agent_id] = time.time()
 
 
 def get_unaudited_lines(agent_id: str) -> int:
@@ -51,9 +54,15 @@ def get_unaudited_lines(agent_id: str) -> int:
     return max(0, _ledger.get(agent_id, 0))
 
 
+def get_last_change_ts(agent_id: str) -> float:
+    """Epoch-seconds timestamp of the last recorded edit (0 when absent)."""
+    return _ledger_ts.get(agent_id, 0.0)
+
+
 def reset_ledger(agent_id: str) -> None:
     """Clear the ledger entry for an agent."""
     _ledger.pop(agent_id, None)
+    _ledger_ts.pop(agent_id, None)
 
 
 def ledger_snapshot() -> dict[str, int]:
@@ -122,21 +131,37 @@ async def _run_git(args: list[str], worktree_path: str) -> tuple[bool, str]:
         return False, ""
 
 
-async def collect_worktree_diff(worktree_path: str) -> str:
-    """Collect the worktree diff: main...HEAD, HEAD (uncommitted), untracked.
+async def _resolve_base_branch_lazy(worktree_path: str) -> str | None:
+    """Resolve the default base branch (main → master). Fail-open → None."""
+    try:
+        from hiveweave.services.git_worktree import _resolve_base_branch
 
-    Untracked files are listed via ``git ls-files --others --exclude-standard``
-    and their content read directly — otherwise brand-new files would render
-    an empty diff and get auto-PASSed. Total output capped at ~50KB with a
-    truncation marker. Empty-safe; never raises.
+        return await _resolve_base_branch(worktree_path)
+    except Exception as exc:  # noqa: BLE001 — soft-fail contract
+        log.warning("code_audit.base_branch_failed", error=str(exc))
+        return None
+
+
+async def collect_worktree_diff(worktree_path: str) -> str:
+    """Collect the worktree diff: <base>...HEAD, HEAD (uncommitted), untracked.
+
+    Base branch is resolved at runtime (main → master fallback) so repos
+    whose default branch is not ``main`` still get their committed branch
+    changes audited. Untracked files are listed via
+    ``git ls-files --others --exclude-standard`` and their content read
+    directly — otherwise brand-new files would render an empty diff and get
+    auto-PASSed. Total output capped at ~50KB with a truncation marker.
+    Empty-safe; never raises.
     """
     parts: list[str] = []
     budget = _DIFF_CAP_BYTES
 
-    ok, out = await _run_git(["diff", "main...HEAD"], worktree_path)
-    if ok and out:
-        parts.append("== diff main...HEAD ==")
-        parts.append(out)
+    base = await _resolve_base_branch_lazy(worktree_path)
+    if base:
+        ok, out = await _run_git(["diff", f"{base}...HEAD"], worktree_path)
+        if ok and out:
+            parts.append(f"== diff {base}...HEAD ==")
+            parts.append(out)
     ok, out = await _run_git(["diff", "HEAD"], worktree_path)
     if ok and out:
         parts.append("== diff HEAD (uncommitted) ==")
