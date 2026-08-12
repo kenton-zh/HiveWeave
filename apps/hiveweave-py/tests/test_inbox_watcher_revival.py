@@ -14,6 +14,7 @@ _ensure_watcher_alive() —— watcher 已死则重置 _stop_watcher=False 并
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, patch
 
 from hiveweave.agents.agent import Agent, AgentState
@@ -171,6 +172,142 @@ async def test_busy_chat_queues_and_revives_without_db_writes():
         assert agent._inbox_watcher_task is not None
         assert not agent._inbox_watcher_task.done()
         assert len(agent._message_queue) == 1
+    finally:
+        agent.status = AgentState.IDLE  # 让 cancel 走轻量路径
+        await agent.cancel()
+
+
+async def test_busy_chat_trigger_digest_saved_as_background():
+    """busy 分支落库 trigger digest 必须带 background/context/team 标志。
+
+    回归：修复前 busy 分支硬编码 is_background=False，平台注入的 trigger
+    digest（role=user）被前端渲染成主聊天流的用户蓝泡。
+    """
+    agent = _make_agent()
+    try:
+        agent.status = AgentState.PROCESSING
+        agent._chat_msg.get_messages = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        agent._chat_msg.save_message = AsyncMock(return_value={"id": "m1"})  # type: ignore[method-assign]
+
+        result = await agent.chat(
+            "## Messages (chronological) — digest",
+            {"trigger": True, "from_agent_id": "sender-1"},
+        )
+
+        assert result == {"ok": True, "queued": True}
+        assert len(agent._message_queue) == 1
+        agent._chat_msg.save_message.assert_awaited_once()  # type: ignore[union-attr]
+        saved = agent._chat_msg.save_message.await_args.args[0]  # type: ignore[union-attr]
+        assert saved["role"] == "user"
+        assert saved["is_background"] is True
+        assert saved["is_context"] is True
+        assert saved["team_from_agent_id"] == "sender-1"
+        assert saved["team_to_agent_id"] == agent.id
+    finally:
+        agent.status = AgentState.IDLE  # 让 cancel 走轻量路径
+        await agent.cancel()
+
+
+async def test_busy_chat_user_message_stays_foreground():
+    """busy 分支落库真人消息必须保持前景，且不写 trigger 专属字段。"""
+    agent = _make_agent()
+    try:
+        agent.status = AgentState.PROCESSING
+        agent._chat_msg.get_messages = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        agent._chat_msg.save_message = AsyncMock(return_value={"id": "m1"})  # type: ignore[method-assign]
+
+        result = await agent.chat("hello from user")
+
+        assert result == {"ok": True, "queued": True}
+        assert len(agent._message_queue) == 1
+        agent._chat_msg.save_message.assert_awaited_once()  # type: ignore[union-attr]
+        saved = agent._chat_msg.save_message.await_args.args[0]  # type: ignore[union-attr]
+        assert saved["role"] == "user"
+        assert saved["is_background"] is False
+        assert "is_context" not in saved
+        assert "team_from_agent_id" not in saved
+        assert "team_to_agent_id" not in saved
+    finally:
+        agent.status = AgentState.IDLE  # 让 cancel 走轻量路径
+        await agent.cancel()
+
+
+async def test_busy_chat_json_user_message_saved_as_plain():
+    """busy 分支收到的 BUG-036 JSON 信封用户消息，落库必须存纯文本 content。
+
+    回归：api/chat.py、phoenix_adapter.py 落库纯文本但传 JSON
+    {"from":"用户","content":...} 给 chat()；busy 分支若把 JSON 外壳存给前端，
+    会显示 JSON 串且去重永远失配。
+    """
+    agent = _make_agent()
+    try:
+        agent.status = AgentState.PROCESSING
+        agent._chat_msg.get_messages = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        agent._chat_msg.save_message = AsyncMock(return_value={"id": "m1"})  # type: ignore[method-assign]
+
+        import json as _json
+        result = await agent.chat(_json.dumps({"from": "用户", "content": "hello"}))
+
+        assert result == {"ok": True, "queued": True}
+        assert len(agent._message_queue) == 1
+        agent._chat_msg.save_message.assert_awaited_once()  # type: ignore[union-attr]
+        saved = agent._chat_msg.save_message.await_args.args[0]  # type: ignore[union-attr]
+        assert saved["content"] == "hello"
+        assert saved["is_background"] is False
+    finally:
+        agent.status = AgentState.IDLE  # 让 cancel 走轻量路径
+        await agent.cancel()
+
+
+async def test_busy_chat_json_user_message_deduped_by_plain_content():
+    """JSON 信封用户消息在 3 秒窗口内命中已存纯文本时，避免重复落库。
+
+    回归：调用方（api/chat.py 等）已落库纯文本 content，但传给 chat() 的是
+    JSON 信封；busy 分支去重须按纯文本比对，否则重复落一条 JSON 前景消息。
+    """
+    agent = _make_agent()
+    try:
+        agent.status = AgentState.PROCESSING
+        agent._chat_msg.get_messages = AsyncMock(  # type: ignore[method-assign]
+            return_value=[{"role": "user", "content": "hello", "created_at": int(time.time() * 1000)}]
+        )
+        agent._chat_msg.save_message = AsyncMock(return_value={"id": "m1"})  # type: ignore[method-assign]
+
+        import json as _json
+        result = await agent.chat(_json.dumps({"from": "用户", "content": "hello"}))
+
+        assert result == {"ok": True, "queued": True}
+        assert len(agent._message_queue) == 1
+        agent._chat_msg.save_message.assert_not_awaited()  # type: ignore[union-attr]
+    finally:
+        agent.status = AgentState.IDLE  # 让 cancel 走轻量路径
+        await agent.cancel()
+
+
+async def test_busy_chat_trigger_digest_deduped_by_dedup_content():
+    """trigger digest 在 busy 竞态下按 opts.dedup_content 命中已存 digest 去重。
+
+    回归：trigger.py 用 strip 后的 chat_context 落库，但传全量 context 给 chat()
+    （经 opts.dedup_content 携带 strip 文本）；busy 分支须按 dedup_content 比对
+    才能命中已存 digest，避免重复落库。
+    """
+    agent = _make_agent()
+    try:
+        agent.status = AgentState.PROCESSING
+        stripped = "## Messages (chronological) — stripped digest"
+        agent._chat_msg.get_messages = AsyncMock(  # type: ignore[method-assign]
+            return_value=[{"role": "user", "content": stripped, "created_at": int(time.time() * 1000)}]
+        )
+        agent._chat_msg.save_message = AsyncMock(return_value={"id": "m1"})  # type: ignore[method-assign]
+
+        result = await agent.chat(
+            "## Messages (chronological) — full digest with goals block",
+            {"trigger": True, "dedup_content": stripped},
+        )
+
+        assert result == {"ok": True, "queued": True}
+        assert len(agent._message_queue) == 1
+        agent._chat_msg.save_message.assert_not_awaited()  # type: ignore[union-attr]
     finally:
         agent.status = AgentState.IDLE  # 让 cancel 走轻量路径
         await agent.cancel()
