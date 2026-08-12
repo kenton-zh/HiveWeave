@@ -2145,11 +2145,23 @@ class GameTimeService:
                 if disp is None or disp in _WAITING_DISPOSITIONS:
                     continue
             else:
-                # No active wait contracts — still skip complete (idle-by-design)
+                # No active wait contracts — check project completeness before skipping complete
                 inst = agent_manager.get_agent(aid)
                 disp = getattr(inst, "disposition", None) if inst else None
                 if disp == "complete":
-                    continue
+                    # P0-1：项目仍有未推进工作（submitted/verifying 任务、待命叶子）
+                    # → 不豁免，纳入沉默检测，防止 CEO 收工后项目卡死
+                    try:
+                        has_pending = await self._project_has_pending_work(
+                            project_id)
+                    except Exception as e:
+                        # 查询失败不静默豁免（fail-closed）——落入后续义务检查
+                        log.warning("pending_work_check_failed",
+                                    project_id=project_id, agent_id=aid,
+                                    error=str(e))
+                        has_pending = True
+                    if not has_pending:
+                        continue   # 项目无待推进工作 → 合法 idle 豁免
 
             tracker = trackers.get(aid) or {
                 "flagged": False,
@@ -2287,6 +2299,57 @@ class GameTimeService:
                                 agent_id=aid, name=a["name"])
 
             trackers[aid] = tracker
+
+    async def _project_has_pending_work(self, project_id: str) -> bool:
+        """检查项目是否有未推进的工作（complete 态协调者的豁免判断）。
+
+        返回 True 表示有 pending work，不应豁免 complete 态协调者。
+        """
+        # 1. 检查是否有 submitted 任务（待审查）
+        rows = await _query(project_id,
+            "SELECT COUNT(*) AS c FROM tasks WHERE is_archived=0 AND status='submitted'", [])
+        if rows and int(rows[0]["c"] or 0) > 0:
+            return True
+
+        # 2. 检查是否有 verifying 任务（待 VERIFY 收口）
+        rows = await _query(project_id,
+            "SELECT COUNT(*) AS c FROM tasks WHERE is_archived=0 AND status='verifying'", [])
+        if rows and int(rows[0]["c"] or 0) > 0:
+            return True
+
+        # 3. 检查是否有"待命叶子"（active 执行层但名下零任务）
+        #    招聘后 10 分钟冷却期内不算（给 CEO 派活时间）。
+        #    N2: 与 turn_exit.ceo_project_pending_obligations 同构 ——
+        #    role 存的是中文职称（如 HR 是「人力资源」），SQL 字符串排除
+        #    不可靠且会把零任务 coordinator 误计为叶子；统一拉候选行后
+        #    Python 侧用 infer_role_family 过滤 executor/qa family。
+        #    R2: LIMIT 10 → 50 —— 前 10 行全是 coordinator/HR 时待命叶子
+        #    漏判（与 turn_exit 版对齐，无 ORDER BY，保持一致）。
+        from hiveweave.services.policy import infer_role_family
+
+        ten_min_ago = int(time.time() * 1000) - 10 * 60 * 1000
+        rows = await _query(project_id, """
+            SELECT a.id, a.role, a.permission_type FROM agents a
+            WHERE a.status='active'
+              AND a.created_at IS NOT NULL AND a.created_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM tasks t
+                  WHERE t.assignee_id=a.id AND t.is_archived=0
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM tasks t
+                  WHERE t.creator_id=a.id AND t.is_archived=0
+              )
+            LIMIT 50
+        """, [ten_min_ago])
+        for r in rows:
+            if infer_role_family({
+                "role": r["role"],
+                "permission_type": r["permission_type"],
+            }) in ("executor", "qa"):
+                return True
+
+        return False
 
     async def acknowledge_idle(
         self, project_id: str, agent_id: str, *, acknowledged: bool = True

@@ -214,6 +214,7 @@ async def commit_turn_tool(
                         "CREATOR_MUST_MERGE": "有 approved 任务待合并",
                         "UNCOMMITTED_WORKTREE": "worktree 有未提交改动",
                         "OPEN_TASKS_UNDECLARED": "仍有可行动任务却声明 done_slice",
+                        "CEO_PROJECT_PENDING": "项目仍有未推进工作（CEO 项目级义务）",
                     }
                     # TEST19 ④: 每条 gate 附带可执行动作（单一来源
                     # GATE_ACTIONS，与 turn_exit backstop 共用防漂移），
@@ -248,6 +249,17 @@ async def commit_turn_tool(
                             f"动作: {gate_actions.get(code, '先处理该义务再重试')}."
                             for i, code in enumerate(hard, 1)
                         )
+                        # P0-2: 附带项目级待办明细，让 CEO 直接看到什么 pending
+                        if "CEO_PROJECT_PENDING" in hard:
+                            from hiveweave.services.turn_exit import (
+                                pop_ceo_project_pending_details,
+                            )
+
+                            details = pop_ceo_project_pending_details(agent_id)
+                            if details:
+                                steps += " 项目级待办: " + "；".join(
+                                    details[:6]
+                                )
                         return ToolResult.err(
                             f"commit_turn REJECTED (synchronous gate): "
                             + steps
@@ -267,6 +279,13 @@ async def commit_turn_tool(
                         # violation is real (name-mismatch false positives
                         # are fixed in pre_check enrichment).
                         set_pending_turn_result(agent_id, payload)
+                        # N3: 预检未硬拒（soft-pass）→ 清理 CEO 项目级
+                        # 待办明细残留（上次 done_slice 被拒留下的 advisory）。
+                        from hiveweave.services.turn_exit import (
+                            pop_ceo_project_pending_details,
+                        )
+
+                        pop_ceo_project_pending_details(agent_id)
                         hints = [labels.get(v, v) for v in soft]
                         # Persist observability (best-effort)
                         try:
@@ -306,6 +325,12 @@ async def commit_turn_tool(
                         )
         except Exception:
             pass  # best-effort: don't block on pre-check failure
+
+    # N3: 同步预检完成且未硬拒（无违规 / 预检未运行 / 预检异常）→ 统一
+    # 清理 CEO 项目级待办明细残留。hard 拒绝分支已先 pop 拼消息（见上）。
+    from hiveweave.services.turn_exit import pop_ceo_project_pending_details
+
+    pop_ceo_project_pending_details(agent_id)
 
     set_pending_turn_result(agent_id, payload)
 
