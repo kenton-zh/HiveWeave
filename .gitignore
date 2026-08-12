@@ -129,6 +129,9 @@ docs/*
 # Third-party skill sources
 .opencode/skills-sources/
 
+# Local .opencode skills (user/local-only, not shared upstream)
+.opencode/skills/
+
 # Generated assets
 image/
 apps/web/public/sprites/
