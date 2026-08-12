@@ -10,6 +10,7 @@ import os
 import shlex
 import time
 import uuid
+from typing import Any
 
 import aiosqlite
 import structlog
@@ -32,6 +33,13 @@ GAME_SECONDS_PER_DAY = 86400
 TICK_INTERVAL = 5
 STALL_CHECK_TICKS = 24        # 24 * 5s = 120s = 2min
 STREAMING_SWEEP_TICKS = 6     # 6 * 5s = 30s — auto-heal orphan is_streaming=1
+# P0-3: 「卡住中的流」判定阈值 — PROCESSING 但流式超此时长无任何事件
+# （delta/round/tool 起止）即视为 streaming 僵尸。健康长流的静默上限为
+# max(READ_TIMEOUT 95s, 工具超时 ≤500s)，5min 默认高于除 spawn_subagent
+# 外的一切正常间隔（执行中工具按其超时+60s 单独放宽，见 _streaming_stuck_ms）。
+STREAMING_ZOMBIE_TIMEOUT_MS = int(
+    os.environ.get("HIVEWEAVE_STREAMING_ZOMBIE_TIMEOUT_MS", "300000") or "300000"
+)
 WORKTREE_RECONCILE_TICKS = 72  # 72 * 5s = 6min — retry orphan worktree cleanup
 TASK_EVENT_RELAY_TICKS = 6   # 6 * 5s = 30s — process undelivered task events
 OBLIGATION_SCAN_TICKS = 12   # 12 * 5s = 60s — TEST16 D2: scan overdue obligations
@@ -168,6 +176,64 @@ async def _execute(project_id, sql, params=None):
     conn = await _conn(project_id)
     await conn.execute(sql, params or [])
     await conn.commit()
+
+
+def _tool_quiet_cap_ms(tool_name: str) -> int:
+    """执行中工具允许的最大静默间隔（工具超时 + 60s 余量）。
+
+    与 streamer tool_exec 的 asyncio.wait_for 超时同源：工具超此时长无
+    tool_call_end 即异常（正常路径工具必在自身超时内返回）。
+    """
+    from hiveweave.llm.streamer.constants import (
+        TOOL_EXECUTION_TIMEOUT_S,
+        _QUESTION_TOOL_TIMEOUT_S,
+        _SUBAGENT_TOOL_TIMEOUT_S,
+    )
+
+    cap_s = (
+        _SUBAGENT_TOOL_TIMEOUT_S
+        if tool_name == "spawn_subagent"
+        else _QUESTION_TOOL_TIMEOUT_S
+        if tool_name == "question"
+        else TOOL_EXECUTION_TIMEOUT_S
+    )
+    return int((cap_s + 60.0) * 1000)
+
+
+def _streaming_allowed_quiet_ms(agent: object) -> int:
+    """P0-3: PROCESSING agent 允许的最大流式静默间隔（毫秒）。
+
+    默认 STREAMING_ZOMBIE_TIMEOUT_MS；执行中有工具时放宽为
+    max(阈值, 各活跃工具超时+60s)—— spawn_subagent（500s）等长工具不冤杀。
+    与 _streaming_stuck_ms 同源；O2 的 stuck 时刻（清行/守卫的
+    created_at 界限）复用此值。
+    """
+    allowed = STREAMING_ZOMBIE_TIMEOUT_MS
+    active = getattr(agent, "_active_tools", None) or {}
+    for tool_name, _start_ms in active.values():
+        allowed = max(allowed, _tool_quiet_cap_ms(str(tool_name)))
+    return allowed
+
+
+def _streaming_stuck_ms(agent: object, now_ms: int) -> int | None:
+    """P0-3: PROCESSING agent 的「卡住中的流」判定 — 返回卡住毫秒数或 None。
+
+    信号为内存态 ``agent._last_stream_activity_at``（streamer 事件时间戳，
+    见 agents/streaming.py on_delta / agent.py _on_tool_call）。chat_messages
+    无 updated_at 列且长工具期 content 不增长（TEST11 H4），DB 侧无法可靠
+    判活；PROCESSING 保护集合 list_processing() 同为内存态，语义一致。
+
+    - 执行中有工具：静默上限放宽为 max(阈值, 各活跃工具超时+60s)——
+      spawn_subagent（500s）等长工具不冤杀。
+    - 无活动时间戳（老实例/属性缺失）：返回 None fail-open，
+      由 sweep 的 soft_age（10min）硬龄路径兜底。
+    """
+    last = float(getattr(agent, "_last_stream_activity_at", 0.0) or 0.0)
+    if last <= 0:
+        return None
+    quiet_ms = now_ms - int(last)
+    allowed = _streaming_allowed_quiet_ms(agent)
+    return quiet_ms if quiet_ms > allowed else None
 
 
 class GameTimeService:
@@ -1663,17 +1729,53 @@ class GameTimeService:
         (≈ safety timeout). Do NOT finalize mid-turn on content-length
         heartbeat — long tools / thinking phases often don't grow content
         (TEST11 audit H4).
+
+        P0-3 增补：PROCESSING 但流式超 STREAMING_ZOMBIE_TIMEOUT_MS 无任何
+        事件的「卡住中的流」（safety timer 单点失效时 zombie 永不清理、
+        看门狗因 PROCESSING 豁免永不唤醒 —— A037 事故）——逐 agent 判活，
+        卡住则清僵尸行 + 强制中断回合（复用 safety_timeout 恢复账）。
+
+        C1：stuck 检测/中断必须先于孤儿清理 —— 僵尸行年龄 > 软龄（软龄≈
+        SAFETY_TIMEOUT_MS，A037 实况 11 分钟）时若先被 clear_orphan_streaming
+        摘掉，中断路径的 DB COUNT 守卫查不到行 → 提前 return，不中断、
+        不发红框，agent 永久 PROCESSING。protect 快照仍在 sweep 开头按
+        processing 列表计算：stuck 中断可能让 agent 变 idle，但孤儿清理只
+        摘 created_at < cutoff 的旧行，新回合占位行（时间戳新鲜）不受影响。
         """
         try:
             from hiveweave.agents.supervisor import agent_manager
             from hiveweave.agents.agent import SAFETY_TIMEOUT_MS
             from hiveweave.services.chat_message import ChatMessageService
 
-            protect = {
-                aid
+            processing = [
+                (aid, pid)
                 for aid, pid in agent_manager.list_processing()
                 if pid == project_id
-            }
+            ]
+            protect = {aid for aid, _pid in processing}
+
+            # P0-3: stuck-stream 检测（区别于真孤儿：agent 仍在 PROCESSING）
+            # C1: 必须在孤儿清理之前跑 —— DB 行仍在，COUNT 守卫有效。
+            now_ms = int(time.time() * 1000)
+            for aid, _pid in processing:
+                inst = agent_manager.get_agent(aid)
+                if inst is None:
+                    continue
+                stuck_ms = _streaming_stuck_ms(inst, now_ms)
+                if stuck_ms is None:
+                    continue
+                try:
+                    await self._handle_stuck_streaming(
+                        project_id, inst, stuck_ms
+                    )
+                except Exception as e:
+                    log.warning(
+                        "streaming_zombie_handle_failed",
+                        project_id=project_id,
+                        agent_id=aid,
+                        error=str(e),
+                    )
+
             await ChatMessageService().clear_orphan_streaming(
                 project_id,
                 protect_agent_ids=protect,
@@ -1686,6 +1788,114 @@ class GameTimeService:
                 project_id=project_id,
                 error=str(e),
             )
+
+    async def _handle_stuck_streaming(
+        self, project_id: str, agent: Any, stuck_ms: int
+    ) -> None:
+        """P0-3: 处置「卡住中的流」— 强制中断回合 + 时间限定清僵尸行 + 红框。
+
+        仅当 DB 确有 stuck 时刻之前就存在的 streaming 行才动手（判活信号
+        失效时 fail-open，不动健康回合）。中断走 safety_timeout 恢复账
+        （统一错误计数 + 冷却 resume / 超限放弃 + 升级上级）。
+
+        O2（动手窗口回合更替误杀）：
+        - stuck 时刻 = now - 允许静默上限；DB 守卫 COUNT 与清行 UPDATE 都加
+          ``created_at <= ?`` —— 判活（内存时间戳）与动手之间有 DB await，
+          窗口内旧回合完成 + 新回合写入新 placeholder（is_streaming=1、
+          created_at 新鲜）时，新占位行时间戳新鲜不会被清；
+        - ③ 中断前复查 _streaming_stuck_ms —— 已变 None（回合更替、有新
+          活动）则跳过中断，避免 cancel 新任务。
+
+        O3（中断失败不可重试）：
+        - ③ 中断先行，成功后再 ① 时间限定清行（幂等，兜底 finalize 延迟
+          窗口）；中断失败（抛异常 / 返回 False / 无 callable）时不清行，
+          保留僵尸行供下一轮 sweep 重试；② 红框广播仍发。
+        """
+        from hiveweave.realtime.event_bus import status_event_bus
+
+        aid = agent.id
+        now_ms = int(time.time() * 1000)
+        stuck_epoch = now_ms - _streaming_allowed_quiet_ms(agent)
+        rows = await _query(
+            project_id,
+            "SELECT COUNT(*) AS c FROM chat_messages "
+            "WHERE agent_id = ? AND is_streaming = 1 AND created_at <= ?",
+            [aid, stuck_epoch],
+        )
+        if not rows or int(rows[0]["c"] or 0) <= 0:
+            return
+        minutes = stuck_ms // 60000
+        log.warning(
+            "streaming_zombie_stuck",
+            project_id=project_id,
+            agent_id=aid,
+            stuck_minutes=minutes,
+        )
+        # ③ O3: 中断先行 —— 失败则不清行（保留僵尸行供下轮 sweep 重试）
+        force = getattr(agent, "force_interrupt_stuck_stream", None)
+        interrupt_failed = False
+        if callable(force):
+            # O2: 中断前复查 —— 回合已更替/有新活动 → 跳过中断（避免
+            #    cancel 新任务）；旧僵尸行仍由下方时间限定清行兜底。
+            if _streaming_stuck_ms(agent, int(time.time() * 1000)) is None:
+                log.info(
+                    "streaming_zombie_interrupt_skipped_recovered",
+                    project_id=project_id,
+                    agent_id=aid,
+                )
+            else:
+                try:
+                    ok = await force(
+                        reason_detail=f"streaming quiet {minutes}min (zombie sweep)"
+                    )
+                    interrupt_failed = not bool(ok)
+                except Exception as e:
+                    interrupt_failed = True
+                    log.error(
+                        "streaming_zombie_force_interrupt_failed",
+                        project_id=project_id,
+                        agent_id=aid,
+                        error=str(e),
+                    )
+        else:
+            interrupt_failed = True
+        # ② 红框广播（同构 agent.py _broadcast_agent_health 事件结构）——
+        #    无论中断成败都发（O3：失败时红框仍发，供人工发现）。
+        try:
+            await status_event_bus.publish_stream_event(aid, {
+                "type": "agent_health",
+                "agentId": aid,
+                "projectId": project_id,
+                "health": "error",
+                "message": (
+                    f"[STREAMING ZOMBIE] 流式响应已 {minutes} 分钟无活动，"
+                    "判定卡死并强制中断"
+                )[:200],
+                "at": now_ms,
+            })
+        except Exception as e:
+            log.warning("streaming_zombie_health_broadcast_failed",
+                        agent_id=aid, error=str(e))
+        # ① 时间限定清僵尸标志（UI 立即解锁；空内容回填中断文案，兜底
+        #    finalize 延迟窗口——成功路径下 handle_safety_timeout 的 finalize
+        #    会以 [TIMEOUT] 文案覆盖 content，此路径的排查证据在
+        #    streaming_zombie_stuck / streaming_zombie_force_interrupt 日志）
+        if interrupt_failed:
+            log.info(
+                "streaming_zombie_row_preserved_for_retry",
+                project_id=project_id,
+                agent_id=aid,
+            )
+            return
+        await _execute(
+            project_id,
+            "UPDATE chat_messages SET is_streaming = 0, "
+            "content = CASE "
+            "  WHEN content IS NULL OR TRIM(content) = '' "
+            "  THEN '[流式响应被中断]' ELSE content END "
+            "WHERE agent_id = ? AND is_streaming = 1 AND created_at <= ?",
+            [aid, stuck_epoch],
+        )
 
     async def _load_state(self, project_id: str) -> dict:
         rows = await _query(project_id,
@@ -2035,10 +2245,11 @@ class GameTimeService:
               ③ 失联持续超 SILENCE_NOTIFY_MS 通知上级（30 min 冷却）
         恢复：重新产出后广播 agent_health ok 解除红框。
 
-        豁免（复用既有判断）：processing 中 / waiting_*、blocked disposition
-        且有未过期 wait contract / 项目 is_started=0 / 系统 paused /
-        **无义务的合法 idle**（TEST21 M7：无 actionable obligations、
-        无入站 unreplied ask、无 wait、或 idle_acknowledged）。
+        豁免（复用既有判断）：processing 中（P0-3：streaming 僵尸除外——
+        PROCESSING 但流式超时无事件者不豁免，纳入沉默检测）/ waiting_*、
+        blocked disposition 且有未过期 wait contract / 项目 is_started=0 /
+        系统 paused / **无义务的合法 idle**（TEST21 M7：无 actionable
+        obligations、无入站 unreplied ask、无 wait、或 idle_acknowledged）。
         """
         state = _states.get(project_id)
         if not state:
@@ -2137,7 +2348,21 @@ class GameTimeService:
         for a in agents:
             aid = a["id"]
             if aid in processing_ids:
-                continue
+                # P0-3: streaming 僵尸（PROCESSING 但流式超时无事件）不豁免，
+                # 落入沉默检测（唤醒 + 红框 + 失联升级）；健康流式仍豁免。
+                inst = agent_manager.get_agent(aid)
+                stuck_ms = (
+                    _streaming_stuck_ms(inst, now_ms)
+                    if inst is not None
+                    else None
+                )
+                if stuck_ms is None:
+                    continue
+                log.warning(
+                    "silence_watchdog_streaming_zombie",
+                    project_id=project_id, agent_id=aid,
+                    name=a["name"], stuck_minutes=stuck_ms // 60000,
+                )
             waits = live_waits.get(aid) or []
             if waits:
                 inst = agent_manager.get_agent(aid)
