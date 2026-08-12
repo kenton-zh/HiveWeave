@@ -96,6 +96,22 @@ from hiveweave.agents import completion as _agent_completion
 from hiveweave.agents import recovery as _agent_recovery
 
 
+def _unwrap_user_envelope(message: str) -> str:
+    """BUG-036 用户消息以 JSON 信封 {"from":"用户","content":...} 传入 chat()，
+    但调用方落库的是纯文本 content。取出 content 供 busy 分支去重与兜底落库。
+    仅当结构精确匹配信封时解包，普通文本 / trigger digest（非合法 JSON 或
+    无该结构）原样返回，不误伤。"""
+    if not isinstance(message, str):
+        return message
+    try:
+        parsed = json.loads(message)
+    except (ValueError, TypeError):
+        return message
+    if isinstance(parsed, dict) and parsed.get("from") == "用户" and "content" in parsed:
+        return str(parsed["content"] or "")
+    return message
+
+
 async def broadcast_agent_health(
     agent_id: str, health: str, message: str = ""
 ) -> None:
@@ -348,9 +364,14 @@ class Agent:
             # 检查 busy → queue the message instead of dropping it
             if self.status == AgentState.PROCESSING:
                 self._message_queue.append((message, opts, int(time.time() * 1000)))
-                # FIX(dup-user-msg): API 层在调 chat() 前已保存了 user 消息，
-                # 但如果 API 的 busy 预检和 chat() 的锁之间发生竞态（agent 刚变
-                # busy），这里会再存一份。用 3 秒窗口去重。
+                # 去重/兜底落库用的文本，优先级：
+                #  1) opts.dedup_content（trigger.py 传入的 strip 后 chat_context，
+                #     与 trigger.py 自己落库的 digest 文本一致 → 去重命中，避免重复）；
+                #  2) 否则解包 BUG-036 JSON 信封（api/chat.py、phoenix_adapter.py
+                #     落库纯文本 content 但传 {"from":"用户","content":...} 给 chat()），
+                #     取纯文本用于去重比对与兜底落库，避免 JSON 外壳存给前端。
+                # 队列仍存原始 message，LLM 保留完整输入（含 sender 信息）。
+                display_message = opts.get("dedup_content") or _unwrap_user_envelope(message)
                 already_saved = False
                 try:
                     recent = await self._chat_msg.get_messages(
@@ -360,7 +381,7 @@ class Agent:
                     for m in (recent or []):
                         if (
                             m.get("role") == "user"
-                            and m.get("content") == message
+                            and m.get("content") == display_message
                             and (now_ms - (m.get("created_at") or 0)) < 3000
                         ):
                             already_saved = True
@@ -368,10 +389,20 @@ class Agent:
                 except Exception:
                     pass  # 去重失败不阻断，宁可多存一条
                 if not already_saved:
+                    # Trigger digest 在 busy 期间入队（enqueue_wake 路径不落库），
+                    # drain 后仍 busy 时才走到这里。必须与 trigger.py 的 digest
+                    # 落库标志一致（background + context + team 归属），否则
+                    # 前端会把它渲染成主聊用户气泡（蓝泡泄漏）。
+                    is_trigger_wake = bool(opts.get("trigger"))
                     await self._chat_msg.save_message({
                         "agent_id": self.id, "role": "user",
-                        "content": message,
-                        "is_background": False, "is_read": False,
+                        "content": display_message,
+                        "is_background": is_trigger_wake, "is_read": False,
+                        **({
+                            "is_context": True,
+                            "team_from_agent_id": opts.get("from_agent_id"),
+                            "team_to_agent_id": self.id,
+                        } if is_trigger_wake else {}),
                     })
                 log.info("chat_queued", agent_id=self.id,
                          queue_len=len(self._message_queue),

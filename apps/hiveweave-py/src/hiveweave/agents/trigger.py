@@ -499,6 +499,10 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
         # 对齐 Elixir agent.ex:264:
         #   GenServer.call(name, {:chat, context, [trigger: true, ...]}, 30_000)
         # inbox_msg_ids 传递给 agent，在 LLM 产出非空输出后才标记已读
+        # 传全量 context 给 LLM（goals 块保留）；同时把 strip 后的 chat_context
+        # 作为 dedup_content 传给 busy 分支——若与 chat() 锁之间发生 busy 竞态，
+        # busy 分支 3 秒去重按 dedup_content 命中上方已存的 digest，避免重复落库，
+        # 且不至于改变 LLM 看到的输入。
         chat_result = await agent.chat(
             context,
             opts={
@@ -509,6 +513,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 "source": latch_opts.get("source") or "trigger",
                 "message_type": latch_opts.get("message_type"),
                 "task_id": latch_opts.get("task_id"),
+                "dedup_content": chat_context,
             },
         )
 
