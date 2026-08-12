@@ -46,6 +46,14 @@ class InvalidModelConfig(ValueError):
     """
 
 
+class NoModelConfiguredError(RuntimeError):
+    """Agent/tier 无可解析模型（未配置或解析失败）——「缺失」而非「非法」。
+
+    一次性子调用（review/audit 回调）依赖它把「无模型」与网络/HTTP 故障
+    分成不同的软失败 reason。调用方按类型捕获，禁止子串嗅探异常文案。
+    """
+
+
 def _validate_invariant(context_window: int, max_output_tokens: int) -> None:
     """强制物理不变量：max_output_tokens 必须严格小于 context_window。
 

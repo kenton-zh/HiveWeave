@@ -1,8 +1,17 @@
 """Code-audit domain core behind the ``request_code_audit`` tool.
 
 Agent-level (key=agent_id) in-memory change ledger + worktree diff
-collection (incl. untracked files) + fixed-executor-tier one-shot LLM
-audit + attestation + report file.
+collection (incl. untracked files) + one-shot LLM audit + attestation +
+report file.
+
+The audit LLM call goes through the caller's ``call_llm`` callback — the
+same one-shot sub-call path as the legacy review suites
+(``agents/agent.py:_review_llm_callback``), so the audit sub-call uses the
+**parent agent's own model config**, never a separate fixed tier.
+
+成本取舍（2026-08-12 用户钦定，有意决策）：builder coordinator 的审计会烧
+management 档模型——不再做旧的固定 executor 档成本隔离，换取与 legacy
+review 路径完全一致的行为（同一回调、同一模型、同一思考模式参数）。
 
 Soft-gate by design: nothing here raises or blocks — every step degrades
 to a soft-fail dict with a machine-readable ``reason``.
@@ -10,11 +19,20 @@ to a soft-fail dict with a machine-readable ``reason``.
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import structlog
 
+from hiveweave.services.model import NoModelConfiguredError
+
 log = structlog.get_logger(__name__)
+
+# One-shot review callback contract — same shape as
+# ``agents/agent.py:_review_llm_callback`` / tools/review.py ReviewLLMCallback.
+# Declared locally (not imported from tools.review) to avoid a tools↔services
+# package import cycle.
+ReviewLLMCallback = Callable[[str, str], Awaitable[str]]
 
 CODE_AUDIT_LINE_THRESHOLD = 20
 CODE_AUDIT_KIND = "code_audit"
@@ -25,7 +43,7 @@ CODE_AUDIT_POLICY = (
 CODE_AUDIT_REMINDER = (
     "[CODE AUDIT REMINDER] Your code edits exceed 20 lines and no fresh "
     "code audit attestation exists. Call request_code_audit(taskId=...) "
-    "before submit_task to get an independent LLM audit of your worktree diff."
+    "before submit_task to get a second-pass LLM audit of your worktree diff."
 )
 
 _DIFF_CAP_BYTES = 50 * 1024
@@ -206,7 +224,7 @@ def build_audit_prompt(diff: str, task_id: str | None) -> tuple[str, str]:
     model's reply MUST start with ``VERDICT: PASS`` or ``VERDICT: ISSUES``.
     """
     system = (
-        "You are an independent code reviewer auditing an agent's worktree "
+        "You are a second-pass code reviewer auditing an agent's worktree "
         "diff. Assess correctness, security, and obvious defects. "
         "Your reply MUST start with exactly one line: 'VERDICT: PASS' or "
         "'VERDICT: ISSUES'. When the verdict is ISSUES, follow with one "
@@ -244,12 +262,21 @@ def _parse_issues(text: str) -> list[str]:
 # ── Audit runner ─────────────────────────────────────────────
 
 async def run_code_audit(
-    project_id: str, agent_id: str, task_id: str | None = None
+    project_id: str,
+    agent_id: str,
+    task_id: str | None = None,
+    call_llm: ReviewLLMCallback | None = None,
 ) -> dict:
     """Run a code audit for an agent's worktree. Never raises.
 
+    ``call_llm`` is the parent agent's one-shot review callback
+    (``Agent._review_llm_callback``: ``async (system, user) -> str``) —
+    the audit sub-call therefore runs on the agent's own model. ``None``
+    (no callback wired) soft-fails with ``no_callback`` once an LLM verdict
+    is actually needed; the auto-PASS path never touches it.
+
     Return contract (soft-fail dicts):
-      - ``{"audited": False, "reason": "no_worktree" | "no_model" | "llm_failed" | "error"}``
+      - ``{"audited": False, "reason": "no_worktree" | "no_callback" | "no_model" | "llm_failed" | "error"}``
       - ``{"audited": True, "verdict": "PASS" | "ISSUES", ...}``
     """
     try:
@@ -294,17 +321,22 @@ async def run_code_audit(
                 "attestation_id": attestation_id,
             }
 
-        # Fixed executor tier — audit calls must never burn management models.
-        from hiveweave.services.model import ModelService
-
-        if not await ModelService().resolve_model(tier="executor"):
-            return {"audited": False, "reason": "no_model"}
-
-        from hiveweave.llm.oneshot import llm_oneshot
+        # One-shot sub-call on the parent agent's own model — same path as
+        # the legacy review suites (review_llm_callback). No separate tier.
+        if call_llm is None:
+            return {"audited": False, "reason": "no_callback"}
 
         system, user = build_audit_prompt(diff, task_id)
-        text = await llm_oneshot(project_id, "executor", system, user)
-        if text is None:
+        try:
+            text = await call_llm(system, user)
+        except NoModelConfiguredError as exc:
+            # Agent has no resolvable model — distinct from wiring/HTTP faults.
+            log.warning("code_audit.no_model", agent_id=agent_id, error=str(exc))
+            return {"audited": False, "reason": "no_model"}
+        except Exception as exc:  # noqa: BLE001 — soft-fail contract
+            log.warning("code_audit.llm_failed", agent_id=agent_id, error=str(exc))
+            return {"audited": False, "reason": "llm_failed"}
+        if not text:
             return {"audited": False, "reason": "llm_failed"}
 
         verdict = _parse_verdict(text)

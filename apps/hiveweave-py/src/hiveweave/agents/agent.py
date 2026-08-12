@@ -41,7 +41,7 @@ from hiveweave.services.charter import charter_service
 from hiveweave.services.chat_message import ChatMessageService
 from hiveweave.services.inbox import InboxService
 from hiveweave.services.memory import MemoryService
-from hiveweave.services.model import ModelService
+from hiveweave.services.model import ModelService, NoModelConfiguredError
 from hiveweave.services.org import OrgService
 from hiveweave.services.permission import permission_service, PermissionService
 from hiveweave.services.skill_registry import SkillRegistryService
@@ -1285,11 +1285,15 @@ class Agent:
 
         Uses the agent's model config + provider to call the LLM with
         system_prompt + user_prompt and return the text response.
-        This is used by run_code_review / run_tests / etc.
+        This is used by run_code_review / run_tests / request_code_audit / etc.
+
+        持全局 LLM 信号量（与流式调用同帽；信号量只在 HTTP 请求级占槽，
+        tool 执行期间父 stream 已释放，无自死锁）。read 90s 留余量给
+        TOOL_EXECUTION_TIMEOUT_S(120s)，慢响应不会吃掉整个工具预算。
         """
         model_config = await self._get_model_config()
         if model_config is None:
-            raise RuntimeError("No model configured for review LLM callback")
+            raise NoModelConfiguredError("No model configured for review LLM callback")
 
         from hiveweave.llm.provider import provider_factory
         provider = provider_factory.create(model_config)
@@ -1307,17 +1311,21 @@ class Agent:
         # Non-streaming: override Accept header
         headers["Accept"] = "application/json"
 
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
-        ) as client:
-            resp = await client.post(
-                provider.build_url(), json=body, headers=headers
-            )
+        from hiveweave.llm.streamer.constants import _get_llm_semaphore
+
+        sem = _get_llm_semaphore()
+        async with sem:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0)
+            ) as client:
+                resp = await client.post(
+                    provider.build_url(), json=body, headers=headers
+                )
             resp.raise_for_status()
             data = resp.json()
             choices = data.get("choices", [])
             if choices:
-                return choices[0].get("message", {}).get("content", "")
+                return (choices[0].get("message") or {}).get("content") or ""
             return ""
 
     async def _get_tool_definitions(self) -> list[dict]:
