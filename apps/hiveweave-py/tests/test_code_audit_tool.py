@@ -23,18 +23,6 @@ def _fake_git(*pairs: tuple[tuple[str, ...], tuple[bool, str]]):
     return fake_git
 
 
-class _FakeModelService:
-    """Stand-in for ModelService with a resolvable executor model."""
-
-    async def resolve_model(
-        self,
-        tier: str | None = None,
-        preferred: str | None = None,
-        skip_model_ids: set[str] | None = None,
-    ) -> dict:
-        return {"base_url": "https://fake.local", "api_key": "k", "model_id": "m"}
-
-
 def _attestation_service(att_id: str = "att-1"):
     svc = MagicMock()
     svc.create = AsyncMock(return_value=att_id)
@@ -75,6 +63,7 @@ async def test_empty_diff_auto_pass_no_llm():
         (("rev-parse", "HEAD"), (True, HEAD_SHA)),
     )
     att_svc = _attestation_service()
+    llm_mock = AsyncMock()
     with (
         patch(
             "hiveweave.services.worktree_review.agent_worktree_path",
@@ -82,10 +71,9 @@ async def test_empty_diff_auto_pass_no_llm():
             return_value=r"C:\fake\wt",
         ),
         patch("hiveweave.services.git_worktree._git", new=git),
-        patch("hiveweave.llm.oneshot.llm_oneshot", new_callable=AsyncMock) as llm_mock,
         patch("hiveweave.services.attestation.attestation_service", att_svc),
     ):
-        result = await run_code_audit("proj", "agent-1")
+        result = await run_code_audit("proj", "agent-1", call_llm=llm_mock)
 
     assert result["audited"] is True
     assert result["verdict"] == "PASS"
@@ -134,19 +122,16 @@ async def test_normal_path_issues_verdict_and_reset():
             return_value=r"C:\fake\wt",
         ),
         patch("hiveweave.services.git_worktree._git", new=git),
-        patch("hiveweave.services.model.ModelService", new=_FakeModelService),
-        patch(
-            "hiveweave.llm.oneshot.llm_oneshot",
-            new_callable=AsyncMock,
-            return_value=llm_text,
-        ),
         patch("hiveweave.services.attestation.attestation_service", att_svc),
         patch(
             "hiveweave.tools.executor.ToolExecutor._save_tool_output_file",
             return_value=r"C:\fake\wt\.hiveweave\tool_outputs\code_audit_1.txt",
         ) as save_mock,
     ):
-        result = await run_code_audit("proj", "agent-1", task_id="task-9")
+        result = await run_code_audit(
+            "proj", "agent-1", task_id="task-9",
+            call_llm=AsyncMock(return_value=llm_text),
+        )
 
     assert result["audited"] is True
     assert result["verdict"] == "ISSUES"
@@ -200,20 +185,264 @@ async def test_llm_failed_soft_fail():
             return_value=r"C:\fake\wt",
         ),
         patch("hiveweave.services.git_worktree._git", new=git),
-        patch("hiveweave.services.model.ModelService", new=_FakeModelService),
-        patch(
-            "hiveweave.llm.oneshot.llm_oneshot",
-            new_callable=AsyncMock,
-            return_value=None,
-        ),
         patch("hiveweave.services.attestation.attestation_service", att_svc),
     ):
-        result = await run_code_audit("proj", "agent-1")
+        result = await run_code_audit(
+            "proj", "agent-1", call_llm=AsyncMock(return_value=None)
+        )
 
     assert result == {"audited": False, "reason": "llm_failed"}
     att_svc.create.assert_not_awaited()
     assert get_unaudited_lines("agent-1") == 25  # ledger untouched on failure
     reset_ledger("agent-1")
+
+
+def _diff_git():
+    """Fake git serving a non-empty committed diff (LLM path reached)."""
+    return _fake_git(
+        (("rev-parse", "--verify", "refs/heads/main"), (True, "")),
+        (("diff", "main...HEAD"), (True, "--- a/x.py\n+++ b/x.py\n-old\n+new")),
+        (("diff", "HEAD"), (True, "")),
+        (("ls-files", "--others", "--exclude-standard"), (True, "")),
+        (("rev-parse", "HEAD"), (True, HEAD_SHA)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_callback_soft_fail():
+    """call_llm=None（工具壳外调用 / ctx 未接线）→ no_callback，不动账本。"""
+    from hiveweave.services.code_audit import (
+        get_unaudited_lines,
+        record_change,
+        reset_ledger,
+        run_code_audit,
+    )
+
+    reset_ledger("agent-1")
+    record_change("agent-1", 25)
+
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=_diff_git()),
+    ):
+        result = await run_code_audit("proj", "agent-1")  # no call_llm
+
+    assert result == {"audited": False, "reason": "no_callback"}
+    assert get_unaudited_lines("agent-1") == 25
+    reset_ledger("agent-1")
+
+
+@pytest.mark.asyncio
+async def test_callback_no_model_error_maps_no_model():
+    """_review_llm_callback 的 NoModelConfiguredError → no_model（按类型捕获）。"""
+    from hiveweave.services.code_audit import reset_ledger, run_code_audit
+    from hiveweave.services.model import NoModelConfiguredError
+
+    reset_ledger("agent-1")
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=_diff_git()),
+    ):
+        result = await run_code_audit(
+            "proj", "agent-1",
+            call_llm=AsyncMock(
+                side_effect=NoModelConfiguredError(
+                    "No model configured for review LLM callback"
+                )
+            ),
+        )
+    assert result == {"audited": False, "reason": "no_model"}
+
+
+@pytest.mark.asyncio
+async def test_callback_generic_error_maps_llm_failed():
+    """其他异常（网络/HTTP）→ llm_failed。"""
+    from hiveweave.services.code_audit import reset_ledger, run_code_audit
+
+    reset_ledger("agent-1")
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=_diff_git()),
+    ):
+        result = await run_code_audit(
+            "proj", "agent-1",
+            call_llm=AsyncMock(side_effect=RuntimeError("HTTP 500 boom")),
+        )
+    assert result == {"audited": False, "reason": "llm_failed"}
+
+
+@pytest.mark.asyncio
+async def test_callback_empty_text_maps_llm_failed():
+    """callback 返回 ""（_review_llm_callback 空 choices 的真实行为）→ llm_failed。"""
+    from hiveweave.services.code_audit import reset_ledger, run_code_audit
+
+    reset_ledger("agent-1")
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=_diff_git()),
+    ):
+        result = await run_code_audit(
+            "proj", "agent-1", call_llm=AsyncMock(return_value="")
+        )
+    assert result == {"audited": False, "reason": "llm_failed"}
+
+
+@pytest.mark.asyncio
+async def test_auto_pass_without_callback():
+    """call_llm=None + 空 diff + 账本未超阈 → auto-PASS（不需要 LLM）。"""
+    from hiveweave.services.code_audit import reset_ledger, run_code_audit
+
+    reset_ledger("agent-1")
+    git = _fake_git(
+        (("rev-parse", "--verify", "refs/heads/main"), (True, "")),
+        (("diff", "main...HEAD"), (True, "")),
+        (("diff", "HEAD"), (True, "")),
+        (("ls-files", "--others", "--exclude-standard"), (True, "")),
+        (("rev-parse", "HEAD"), (True, HEAD_SHA)),
+    )
+    att_svc = _attestation_service()
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=git),
+        patch("hiveweave.services.attestation.attestation_service", att_svc),
+    ):
+        result = await run_code_audit("proj", "agent-1")  # no call_llm
+
+    assert result["audited"] is True
+    assert result["verdict"] == "PASS"
+    assert result["attestation_id"] == "att-1"
+
+
+# ── 工具壳层：ctx.review_llm_callback 接线 ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_tool_shell_passes_ctx_callback():
+    """ctx.review_llm_callback 原样传给 run_code_audit 的 call_llm。"""
+    from types import SimpleNamespace
+
+    from hiveweave.tools.code_audit import RequestCodeAuditParams, request_code_audit_tool
+
+    callback = AsyncMock(return_value="VERDICT: PASS")
+    run_mock = AsyncMock(return_value={"audited": True, "verdict": "PASS",
+                                       "lines_audited": 0, "attestation_id": "att-1"})
+    with (
+        patch(
+            "hiveweave.tools.helpers.get_project_id",
+            new_callable=AsyncMock,
+            return_value="proj",
+        ),
+        patch("hiveweave.services.code_audit.run_code_audit", new=run_mock),
+    ):
+        result = await request_code_audit_tool(
+            RequestCodeAuditParams(task_id="task-1"),
+            "agent-1",
+            r"C:\fake\wt",
+            ctx=SimpleNamespace(review_llm_callback=callback),
+        )
+
+    assert result.success is True
+    assert run_mock.await_args.kwargs["call_llm"] is callback
+
+
+@pytest.mark.asyncio
+async def test_tool_shell_ctx_none_soft_fails():
+    """ctx=None（无回调可接）→ call_llm=None 透传，工具仍软失败契约。"""
+    from hiveweave.tools.code_audit import RequestCodeAuditParams, request_code_audit_tool
+
+    run_mock = AsyncMock(return_value={"audited": False, "reason": "no_callback"})
+    with (
+        patch(
+            "hiveweave.tools.helpers.get_project_id",
+            new_callable=AsyncMock,
+            return_value="proj",
+        ),
+        patch("hiveweave.services.code_audit.run_code_audit", new=run_mock),
+    ):
+        result = await request_code_audit_tool(
+            RequestCodeAuditParams(task_id="task-1"), "agent-1", r"C:\fake\wt"
+        )
+
+    assert result.success is True  # soft-fail: ok 带 reason，不是 err
+    assert "no_callback" in (result.output or "")
+    assert run_mock.await_args.kwargs["call_llm"] is None
+
+
+@pytest.mark.asyncio
+async def test_tool_shell_no_project_err():
+    """agent 无项目 → ToolResult.err（唯一硬失败分支）。"""
+    from hiveweave.tools.code_audit import RequestCodeAuditParams, request_code_audit_tool
+
+    with patch(
+        "hiveweave.tools.helpers.get_project_id",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        result = await request_code_audit_tool(
+            RequestCodeAuditParams(task_id="task-1"), "agent-1", r"C:\fake\wt"
+        )
+    assert result.success is False
+    assert "no project" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_tool_shell_auto_detects_running_task():
+    """taskId 缺省时从唯一活动任务自动解析。"""
+    from hiveweave.tools.code_audit import RequestCodeAuditParams, request_code_audit_tool
+
+    run_mock = AsyncMock(return_value={"audited": True, "verdict": "PASS",
+                                       "lines_audited": 0, "attestation_id": "att-1"})
+    ts_instance = AsyncMock()
+    ts_instance.list_tasks = AsyncMock(return_value=[
+        {"id": "task-auto", "status": "running", "assignee_id": "agent-1"},
+    ])
+    with (
+        patch(
+            "hiveweave.tools.helpers.get_project_id",
+            new_callable=AsyncMock,
+            return_value="proj",
+        ),
+        patch("hiveweave.services.task.TaskService", return_value=ts_instance),
+        patch("hiveweave.services.code_audit.run_code_audit", new=run_mock),
+    ):
+        result = await request_code_audit_tool(
+            RequestCodeAuditParams(), "agent-1", r"C:\fake\wt"
+        )
+
+    assert result.success is True
+    assert run_mock.await_args.args[2] == "task-auto"
+
+
+def test_build_audit_prompt_contract():
+    """系统提示锁定 verdict 协议；user 提示携带任务上下文与 diff。"""
+    from hiveweave.services.code_audit import build_audit_prompt
+
+    system, user = build_audit_prompt("DIFF_BODY", "task-9")
+    assert "VERDICT: PASS" in system
+    assert "VERDICT: ISSUES" in system
+    assert "second-pass" in system
+    assert "task-9" in user
+    assert "DIFF_BODY" in user
 
 
 def test_count_change_lines_unit():

@@ -1,11 +1,14 @@
-"""request_code_audit tool — one-shot independent LLM audit of the worktree diff.
+"""request_code_audit tool — one-shot second-pass LLM audit of the worktree diff.
 
 出口合同前置：累计代码变更超过 CODE_AUDIT_LINE_THRESHOLD(20) 行时必须先
 request_code_audit 再 submit_task。审计实现/台账在 services/code_audit.py
 （并行拆分，独立模块）——此处只做工具壳：参数解析、agent 身份/任务解析、
-结果短契约格式化。审计是只读分析 + 有成本 LLM 调用，软失败（无 worktree /
-无模型 / LLM 失败 / 内部错误）一律回 ToolResult.ok 带 reason，仅意外异常
-回 err。
+结果短契约格式化。审计 LLM 走 ctx.review_llm_callback（与 review 套件同一条
+一次性子调用路径），用的是调用 agent 自己的模型配置——builder coordinator
+的审计因此烧 management 档模型（2026-08-12 用户钦定的有意取舍，不做固定
+executor 档隔离）。审计是只读分析 + 有成本 LLM 调用，软失败（无 worktree /
+无回调 / 无模型 / LLM 失败 / 内部错误）一律回 ToolResult.ok 带 reason，
+仅意外异常回 err。
 """
 
 from __future__ import annotations
@@ -79,15 +82,16 @@ def _format_verdict(result: dict) -> ToolResult:
 
 @tool(
     "request_code_audit",
-    "One-shot independent LLM audit of your worktree git diff. "
+    "One-shot second-pass LLM audit of your worktree git diff. "
     "REQUIRED before submit_task when your cumulative code edits exceed 20 lines. "
     "Returns VERDICT PASS/ISSUES + top issues; full report persisted to disk. "
-    "Costs one executor-tier LLM call.",
+    "The audit runs as a one-shot sub-call on YOUR OWN model (same path as "
+    "the review tool), costing one extra LLM call.",
     requires_workspace=False,
     security_level="standard",
 )
 async def request_code_audit_tool(
-    params: RequestCodeAuditParams, agent_id: str, workspace: str
+    params: RequestCodeAuditParams, agent_id: str, workspace: str, ctx=None
 ) -> ToolResult:
     """Run one-shot code audit on the agent's worktree diff (short contract)."""
     from hiveweave.services import code_audit as _code_audit
@@ -96,10 +100,19 @@ async def request_code_audit_tool(
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project")
 
-    task_id = params.task_id or await _resolve_task_id(project_id, agent_id)
+    task_id = params.task_id
+    if not task_id:
+        try:
+            task_id = await _resolve_task_id(project_id, agent_id)
+        except Exception as e:  # noqa: BLE001 — 解析失败降级为 worktree 级审计
+            log.info("request_code_audit.task_resolve_failed", agent_id=agent_id, error=str(e))
+            task_id = None
+    call_llm = getattr(ctx, "review_llm_callback", None) if ctx else None
 
     try:
-        result = await _code_audit.run_code_audit(project_id, agent_id, task_id)
+        result = await _code_audit.run_code_audit(
+            project_id, agent_id, task_id, call_llm=call_llm
+        )
     except Exception as e:
         log.warning("request_code_audit.crashed", agent_id=agent_id, error=repr(e))
         return ToolResult.err(f"code audit failed: {e}")
