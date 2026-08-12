@@ -378,6 +378,24 @@ async def handle_completion(
     except Exception as e:
         log.debug("turn_exit_worktree_check_failed", error=str(e))
 
+    # P0-2: CEO done_slice 项目级义务（backstop 与 commit_turn 预检同口径）。
+    # 仅在 pending TurnResult 为 done_slice 时查询；非 CEO 在函数内短路。
+    ceo_project_pending: list[str] = []
+    try:
+        from hiveweave.services.turn_session import get_pending_turn_result
+
+        _pending_raw = get_pending_turn_result(agent.id)
+        if _pending_raw and _pending_raw.get("phase") == "done_slice":
+            from hiveweave.services.turn_exit import (
+                ceo_project_pending_obligations,
+            )
+
+            ceo_project_pending = await ceo_project_pending_obligations(
+                agent.project_id, agent.id
+            )
+    except Exception as e:
+        log.debug("turn_exit_ceo_project_pending_failed", error=str(e))
+
     exit_decision = evaluate_turn_exit(
         ExitContext(
             agent_id=agent.id,
@@ -391,6 +409,7 @@ async def handle_completion(
             outbound_ask_refs=outbound_ask_refs,
             name_by_id=name_by_id,
             worktree_uncommitted=worktree_uncommitted,
+            ceo_project_pending=ceo_project_pending,
         )
     )
 

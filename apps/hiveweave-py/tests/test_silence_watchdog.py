@@ -80,13 +80,22 @@ def _now_ms() -> int:
 
 
 async def _insert_agent(env, agent_id, name, parent_id=None,
-                        created_at=None, status="active"):
+                        created_at=None, status="active", role="executor",
+                        permission_type=None):
     conn = await ensure_project_db(env["workspace_path"])
     ts = created_at if created_at is not None else _now_ms()
-    await conn.execute(
-        "INSERT INTO agents (id, project_id, name, role, parent_id, status, "
-        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [agent_id, PROJECT_ID, name, "executor", parent_id, status, ts, ts])
+    if permission_type is None:
+        await conn.execute(
+            "INSERT INTO agents (id, project_id, name, role, parent_id, status, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [agent_id, PROJECT_ID, name, role, parent_id, status, ts, ts])
+    else:
+        await conn.execute(
+            "INSERT INTO agents (id, project_id, name, role, parent_id, "
+            "status, permission_type, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [agent_id, PROJECT_ID, name, role, parent_id, status,
+             permission_type, ts, ts])
     await conn.commit()
 
 
@@ -464,3 +473,171 @@ async def test_legal_idle_without_duty_skips_silence(env, monkeypatch):
     _seed_state()
     with _started_mock(1):
         await _assert_no_action(env, GameTimeService())
+
+
+# ── P0-1: complete 豁免前的项目完整性闸门 ─────────────────────
+
+
+async def _insert_task(env, *, status, creator_id=CEO_ID, assignee_id=None):
+    """P0-1 场景用：最小任务行（raw INSERT，无工作日志副作用）."""
+    from hiveweave.services import task as task_mod
+
+    task_mod._migrated.discard(PROJECT_ID)
+    await task_mod._ensure_schema(PROJECT_ID)
+    tid = str(uuid.uuid4())
+    # 老时间戳，避免任务行本身被当成近期产出
+    old = _now_ms() - 40 * 60 * 1000
+    conn = await ensure_project_db(env["workspace_path"])
+    await conn.execute(
+        "INSERT INTO tasks (id, project_id, title, status, progress, "
+        "creator_id, assignee_id, created_at, updated_at, is_archived) "
+        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 0)",
+        [tid, PROJECT_ID, "P0-1 probe task", status, creator_id, assignee_id,
+         old, old])
+    await conn.commit()
+    return tid
+
+
+async def test_pending_work_submitted_and_verifying(env):
+    """_project_has_pending_work：submitted / verifying 任务各自独立判为 pending."""
+    svc = GameTimeService()
+    # 空项目（无任务、无执行层 agent）→ 无 pending work
+    assert await svc._project_has_pending_work(PROJECT_ID) is False
+
+    tid = await _insert_task(env, status="submitted", assignee_id=EXECUTOR_ID)
+    assert await svc._project_has_pending_work(PROJECT_ID) is True
+
+    # submitted 消失、仅剩 verifying → 仍 pending
+    conn = await ensure_project_db(env["workspace_path"])
+    await conn.execute(
+        "UPDATE tasks SET status = 'verifying' WHERE id = ?", [tid])
+    await conn.commit()
+    assert await svc._project_has_pending_work(PROJECT_ID) is True
+
+
+async def test_pending_work_idle_leaf_with_cooldown(env):
+    """待命叶子：active 执行层零任务且创建超 10 min → pending；冷却期内不算."""
+    svc = GameTimeService()
+    now = _now_ms()
+    # 冷却期内（5 min）的零任务叶子 → 不算 pending（给 CEO 派活时间）
+    await _insert_agent(env, EXECUTOR_ID, "柚子", role="executor",
+                        created_at=now - 5 * 60 * 1000)
+    assert await svc._project_has_pending_work(PROJECT_ID) is False
+
+    # 叶子创建超过 10 min 仍零任务 → pending
+    conn = await ensure_project_db(env["workspace_path"])
+    await conn.execute("UPDATE agents SET created_at = ? WHERE id = ?",
+                       [now - 20 * 60 * 1000, EXECUTOR_ID])
+    await conn.commit()
+    assert await svc._project_has_pending_work(PROJECT_ID) is True
+
+    # 叶子名下有过任务（含 closed，NOT EXISTS 不按状态过滤）→ 非待命
+    await _insert_task(env, status="closed", assignee_id=EXECUTOR_ID)
+    assert await svc._project_has_pending_work(PROJECT_ID) is False
+
+
+async def test_pending_work_coordinator_not_counted_as_leaf(env):
+    """N2: active 中层（中文 role + permission_type='coordinator'）零任务
+    超宽限期 → 不算待命叶子（修复前 role 粗筛会误计）."""
+    svc = GameTimeService()
+    now = _now_ms()
+    await _insert_agent(env, "coord-1", "协调", role="技术协调员",
+                        permission_type="coordinator",
+                        created_at=now - 20 * 60 * 1000)
+    assert await svc._project_has_pending_work(PROJECT_ID) is False
+
+
+async def test_pending_work_hr_chinese_role_not_counted_as_leaf(env):
+    """N2: active 中文「人力资源」role agent 零任务超宽限期 →
+    不判 pending（修复前 SQL 的 role NOT IN ('ceo','hr') 排除不掉中文职称）."""
+    svc = GameTimeService()
+    now = _now_ms()
+    await _insert_agent(env, "hr-1", "人事", role="人力资源",
+                        created_at=now - 20 * 60 * 1000)
+    assert await svc._project_has_pending_work(PROJECT_ID) is False
+
+
+async def test_pending_work_leaf_beyond_ten_coordinators(env):
+    """R2 回归：候选查询 LIMIT 10 时前 10 行全是 coordinator/HR → 待命叶子
+    漏判。12 个 coordinator + 1 个 executor（均零任务、超宽限期）→
+    pending True（修复前 LIMIT 10 漏掉第 13 行叶子，返回 False）."""
+    svc = GameTimeService()
+    now = _now_ms()
+    old = now - 20 * 60 * 1000
+    for i in range(12):
+        await _insert_agent(env, f"coord-r2-{i}", f"协调{i}",
+                            role="技术协调员", permission_type="coordinator",
+                            created_at=old)
+    await _insert_agent(env, "leaf-r2", "叶子", role="executor", created_at=old)
+    assert await svc._project_has_pending_work(PROJECT_ID) is True
+
+
+async def test_complete_ceo_not_exempt_when_submitted_pending(env, monkeypatch):
+    """P0-1 核心回归：CEO disposition=complete 但项目有 submitted 任务
+    （CEO 是 creator → 有审查义务）→ 不豁免，沉默超阈值举红框 + 唤醒."""
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent",
+        lambda aid: SimpleNamespace(disposition="complete",
+                                    project_id=PROJECT_ID,
+                                    config={"role": "ceo"}))
+    old = _now_ms() - 40 * 60 * 1000
+    await _insert_agent(env, CEO_ID, "知远", role="ceo", created_at=old)
+    await _insert_task(env, status="submitted", creator_id=CEO_ID,
+                       assignee_id=EXECUTOR_ID)
+    _seed_state()
+
+    mock_trigger_coord = AsyncMock()
+    mock_trigger_sub = AsyncMock()
+    mock_bus = AsyncMock()
+    with _started_mock(1), \
+         patch("hiveweave.agents.trigger.trigger_coordinator",
+               mock_trigger_coord), \
+         patch("hiveweave.agents.trigger.trigger_subordinate",
+               mock_trigger_sub), \
+         patch.object(status_event_bus, "publish_stream_event", mock_bus), \
+         patch("hiveweave.services.inbox.InboxService.send_message",
+               AsyncMock()):
+        await GameTimeService()._check_silent_agents(PROJECT_ID)
+
+    # 红框 1 次，指向 CEO（修复前：complete 无条件豁免，无任何动作）
+    errors = _health_events(mock_bus, "error")
+    assert len(errors) == 1
+    assert errors[0]["agentId"] == CEO_ID
+    # 唤醒落到 coordinator / subordinate 其中一条 trigger 路径
+    triggered = ([c.args[0] for c in mock_trigger_coord.await_args_list]
+                 + [c.args[0] for c in mock_trigger_sub.await_args_list])
+    assert CEO_ID in triggered
+
+
+async def test_complete_ceo_exempt_when_no_pending_work(env, monkeypatch):
+    """complete + 项目无 pending work → 维持合法 idle 豁免（不举红框不唤醒）."""
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent",
+        lambda aid: SimpleNamespace(disposition="complete",
+                                    project_id=PROJECT_ID,
+                                    config={"role": "ceo"}))
+    old = _now_ms() - 40 * 60 * 1000
+    await _insert_agent(env, CEO_ID, "知远", role="ceo", created_at=old)
+    _seed_state()
+
+    mock_trigger_coord = AsyncMock()
+    mock_trigger_sub = AsyncMock()
+    mock_bus = AsyncMock()
+    mock_inbox = AsyncMock()
+    with _started_mock(1), \
+         patch("hiveweave.agents.trigger.trigger_coordinator",
+               mock_trigger_coord), \
+         patch("hiveweave.agents.trigger.trigger_subordinate",
+               mock_trigger_sub), \
+         patch.object(status_event_bus, "publish_stream_event", mock_bus), \
+         patch("hiveweave.services.inbox.InboxService.send_message",
+               mock_inbox):
+        await GameTimeService()._check_silent_agents(PROJECT_ID)
+    assert mock_trigger_coord.await_count == 0
+    assert mock_trigger_sub.await_count == 0
+    assert _health_events(mock_bus) == []
+    assert mock_inbox.await_count == 0

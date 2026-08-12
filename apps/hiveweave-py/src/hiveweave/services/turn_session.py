@@ -23,6 +23,9 @@ _soft_warn_counts: dict[str, dict[str, int]] = {}
 HARD_COMMIT_GATE_CODES = frozenset({
     "UNREPLIED_ASKS",
     "UNCOMMITTED_WORKTREE",
+    # P0-2: CEO 项目级待办首次命中即硬拒（带明细），避免 soft-pass 后
+    # CEO 仍收工导致项目卡死；backstop 同口径兜底。
+    "CEO_PROJECT_PENDING",
 })
 
 

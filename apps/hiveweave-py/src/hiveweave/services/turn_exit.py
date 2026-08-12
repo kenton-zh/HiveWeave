@@ -37,6 +37,7 @@ REPAIR_VIOLATIONS = frozenset({
     "CREATOR_MUST_MERGE",
     "HIRE_UNREPORTED",
     "UNCOMMITTED_WORKTREE",
+    "CEO_PROJECT_PENDING",
 })
 
 # Ledger / obligation mismatches → park, do not immediately re-run LLM
@@ -91,6 +92,9 @@ class ExitContext:
     name_by_id: dict[str, str] = field(default_factory=dict)
     # Builder/executor worktree has uncommitted porcelain at done_slice
     worktree_uncommitted: bool = False
+    # P0-2: CEO done_slice 项目级未推进工作（人可读条目；空 = 项目层面可收工）。
+    # 仅 CEO 需要；由 completion 层在 done_slice 时计算注入。
+    ceo_project_pending: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -334,6 +338,16 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
     ):
         violations.append("UNCOMMITTED_WORKTREE")
 
+    # P0-2: CEO done_slice 还要求项目级无待推进工作（submitted 待审 /
+    # verifying 待收口 / 待命叶子未派活）——只看 CEO 自己名下任务会漏判，
+    # CEO 收工后这些工作无人推进，项目卡死。
+    if (
+        turn_result is not None
+        and turn_result.phase == "done_slice"
+        and ctx.ceo_project_pending
+    ):
+        violations.append("CEO_PROJECT_PENDING")
+
     # TEST11 #1a: waiting on an agent requires having asked/messaged them first
     wait_without_ask_refs: list[str] = []
     if turn_result is not None and turn_result.phase == "waiting":
@@ -430,6 +444,7 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 or "CREATOR_MUST_MERGE" in uniq
                 or "HIRE_UNREPORTED" in uniq
                 or "UNCOMMITTED_WORKTREE" in uniq
+                or "CEO_PROJECT_PENDING" in uniq
             )
             park = not repair_only
         if park:
@@ -461,6 +476,7 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 unreplied,
                 turn_result,
                 wait_without_ask_refs=wait_without_ask_refs,
+                ceo_project_pending=ctx.ceo_project_pending,
             ),
             continue_work=False,
             should_repair=repair_only,
@@ -502,6 +518,9 @@ GATE_ACTIONS: dict[str, str] = {
     "CREATOR_MUST_REVIEW": "review_task(taskId, decision=...)",
     "CREATOR_MUST_MERGE": "git_worktree_merge(branchName=...)",
     "UNCOMMITTED_WORKTREE": "git_worktree_checkpoint then commit_turn",
+    "CEO_PROJECT_PENDING": (
+        "review_task 审查 submitted / 推进 VERIFY 收口 / dispatch_task 派活待命叶子"
+    ),
 }
 
 
@@ -511,6 +530,7 @@ def _build_gate_hint(
     turn_result: TurnResult | None,
     *,
     wait_without_ask_refs: list[str] | None = None,
+    ceo_project_pending: list[str] | None = None,
 ) -> str:
     lines = [
         "[TURN EXIT BLOCKED]",
@@ -561,6 +581,11 @@ def _build_gate_hint(
             "你的 worktree 有未提交改动 — 请先 git_worktree_checkpoint，"
             "再 commit_turn(done_slice)"
         ),
+        "CEO_PROJECT_PENDING": (
+            "项目仍有未推进工作，CEO 不能收工 — 请逐项推进："
+            "审查 submitted 任务 / 推进 VERIFY 收口 / 给待命叶子派活；"
+            "如确需等待他人推进，改用 phase=waiting + waiting_on 声明等待对象"
+        ),
     }
 
     emitted_unreplied = False
@@ -591,6 +616,15 @@ def _build_gate_hint(
                     f"GATE=WAIT_WITHOUT_ASK REF={ref} "
                     f"MISSING={gate_actions[v]}"
                 )
+            if v in labels:
+                lines.append(f"  {labels[v]}")
+            continue
+        if v == "CEO_PROJECT_PENDING" and ceo_project_pending:
+            lines.append(
+                f"GATE=CEO_PROJECT_PENDING REF=- MISSING={gate_actions[v]}"
+            )
+            for item in ceo_project_pending[:6]:
+                lines.append(f"  ❌ {item}")
             if v in labels:
                 lines.append(f"  {labels[v]}")
             continue
@@ -655,6 +689,126 @@ async def agent_worktree_has_uncommitted(
     except Exception as e:
         log.debug("worktree_uncommitted_check_failed", error=str(e))
         return False
+
+
+# ── P0-2: CEO 项目级义务检查 ─────────────────────────────
+
+# 最近一次预检算出的项目级待办明细（agent_id → 人可读条目），供
+# commit_turn 同步拒绝时拼进提示。覆写式更新，仅 advisory。
+_ceo_project_pending_details: dict[str, list[str]] = {}
+
+# 叶子「待命未派活」宽限期：招聘后 10 分钟内零任务不算待派活（onboarding 抖动）
+_CEO_IDLE_LEAF_GRACE_MS = 10 * 60 * 1000
+
+
+def pop_ceo_project_pending_details(agent_id: str) -> list[str]:
+    """Pop the most recent CEO project-level pending details (advisory)."""
+    return _ceo_project_pending_details.pop(agent_id, [])
+
+
+async def ceo_project_pending_obligations(
+    project_id: str, agent_id: str
+) -> list[str]:
+    """P0-2: 项目级义务（仅 CEO 在 done_slice 收工前检查）。
+
+    CEO 的「无待办」不能只看自己名下任务 —— 以下项目级状态只有 CEO
+    层级能推进，CEO 收工会把项目卡死：
+    1. submitted 任务待审查（审查链终点在 CEO）
+    2. verifying 任务待收口（VERIFY 串行泵需要管理层推进）
+    3. 待命叶子未派活（active 叶子超过宽限期仍零未归档任务）
+
+    非 CEO 一律返回 []（仅一次角色查询，零任务 SQL）。任一子查询失败
+    fail-open（跳过该项），绝不阻塞收工。返回人可读条目列表；
+    空列表 = 项目层面可以收工。
+    """
+    try:
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.policy import infer_role_family
+
+        agent = await OrgService().get_agent(agent_id)
+        if not agent or infer_role_family(agent) != "ceo":
+            return []
+    except Exception as e:
+        log.debug("ceo_project_pending_role_check_failed", error=str(e))
+        return []
+
+    pending: list[str] = []
+    try:
+        from hiveweave.db import project as project_db
+
+        conn = await project_db.get_project_db_by_project_id(project_id)
+    except Exception as e:
+        log.debug("ceo_project_pending_db_failed", error=str(e))
+        return pending
+
+    # 1. submitted 任务（待审查 — 审查链终点在 CEO）
+    try:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks "
+            "WHERE is_archived = 0 AND status = 'submitted'"
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        count = int(row["c"] or 0) if row else 0
+        if count > 0:
+            pending.append(f"项目有 {count} 个 submitted 任务待审查")
+    except Exception as e:
+        log.debug("ceo_project_pending_submitted_failed", error=str(e))
+
+    # 2. verifying 任务（待收口）
+    try:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks "
+            "WHERE is_archived = 0 AND status = 'verifying'"
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        count = int(row["c"] or 0) if row else 0
+        if count > 0:
+            pending.append(f"项目有 {count} 个 verifying 任务待收口")
+    except Exception as e:
+        log.debug("ceo_project_pending_verifying_failed", error=str(e))
+
+    # 3. 待命叶子未派活（active + 超过宽限期 + 名下零未归档任务）。
+    #    叶子 = executor/qa family（role 是中文职称，不能靠 SQL 字符串
+    #    排除 CEO/HR/中层，统一走 infer_role_family 判定）。
+    try:
+        import time as _time
+
+        grace_cutoff = int(_time.time() * 1000) - _CEO_IDLE_LEAF_GRACE_MS
+        cursor = await conn.execute(
+            "SELECT id, name, short_id, role, permission_type FROM agents a "
+            "WHERE a.status = 'active' "
+            "AND a.created_at IS NOT NULL AND a.created_at < ? "
+            "AND NOT EXISTS (SELECT 1 FROM tasks t "
+            "  WHERE t.assignee_id = a.id AND t.is_archived = 0) "
+            "AND NOT EXISTS (SELECT 1 FROM tasks t "
+            "  WHERE t.creator_id = a.id AND t.is_archived = 0) "
+            "LIMIT 50",
+            [grace_cutoff],
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        idle_leaves = [
+            r
+            for r in rows
+            if infer_role_family(
+                {
+                    "role": r["role"],
+                    "permission_type": r["permission_type"],
+                }
+            )
+            in ("executor", "qa")
+        ][:3]
+        if idle_leaves:
+            names = ", ".join(
+                f"{r['name']}({r['short_id'] or '?'})" for r in idle_leaves
+            )
+            pending.append(f"项目有待命叶子未派活: {names}")
+    except Exception as e:
+        log.debug("ceo_project_pending_idle_leaves_failed", error=str(e))
+
+    return pending
 
 
 async def pre_check_exit_gates(
@@ -841,6 +995,20 @@ async def pre_check_exit_gates(
             if need_merge:
                 violations.append("CREATOR_MUST_MERGE")
 
+        # 5. P0-2: CEO done_slice 项目级义务 —— 只看 CEO 名下任务会漏掉
+        #    项目整体待推进工作（submitted 待审 / verifying 待收口 /
+        #    待命叶子未派活），导致 CEO 收工后项目卡死。非 CEO 零开销。
+        if phase == "done_slice":
+            try:
+                project_pending = await ceo_project_pending_obligations(
+                    project_id, agent_id
+                )
+                if project_pending:
+                    violations.append("CEO_PROJECT_PENDING")
+                    _ceo_project_pending_details[agent_id] = project_pending
+            except Exception as e:
+                log.debug("pre_check_ceo_project_pending_failed", error=str(e))
+
     except Exception as e:
         log.debug("pre_check_exit_gates_failed", error=str(e))
         # Keep violations found before the failure (e.g. WAIT_WITHOUT_ASK)
@@ -962,7 +1130,18 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
     if not checked:
         return ""
     wt_dirty = await _worktree_dirty_flag(agent_id, project_id)
-    if not asks and not obligations and not wt_dirty:
+    # P0-2 疏通层：CEO 在收工决策前就可见项目级待办（与 done_slice 门禁
+    # 同口径），避免撞门后才知道项目还有未推进工作。非 CEO 返回 []。
+    ceo_pending: list[str] = []
+    try:
+        ceo_pending = await ceo_project_pending_obligations(
+            project_id, agent_id
+        )
+    except Exception as e:
+        log.debug(
+            "exit_contract_ceo_pending_failed", agent_id=agent_id, error=str(e)
+        )
+    if not asks and not obligations and not wt_dirty and not ceo_pending:
         return "【本轮出口条件】仅需提交 commit_turn"
     items: list[str] = ["必须提交 commit_turn"]
     if asks:
@@ -972,5 +1151,10 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
         items.append(f"未完成义务: {len(obligations)} 个（{_fmt_ids(tids)}）")
     if wt_dirty:
         items.append("worktree 有未提交改动（done_slice 前需 checkpoint）")
+    if ceo_pending:
+        items.append(
+            f"项目级待办（done_slice 前须推进）: {len(ceo_pending)} 项"
+            f"（{'；'.join(ceo_pending[:3])}）"
+        )
     body = "；".join(f"{i}) {it}" for i, it in enumerate(items, 1))
     return f"【本轮出口条件】{body}"
