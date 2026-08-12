@@ -15,6 +15,7 @@ from typing import Any
 import structlog
 
 from hiveweave.db import meta as meta_db
+from hiveweave.agents.types import AgentState
 from hiveweave.agents.constants import (
     EMPTY_RETRY_DELAYS,
     MAX_EMPTY_RETRIES,
@@ -745,6 +746,44 @@ async def handle_safety_timeout(agent: Any) -> None:
         consecutive_errors=agent._consecutive_errors,
         cooldown_s=0.0 if give_up else TIMEOUT_RESUME_COOLDOWN_S,
     )
+
+async def force_interrupt_stuck_stream(
+    agent: Any, *, reason_detail: str = ""
+) -> bool:
+    """P0-3 streaming 僵尸强制中断（game_time sweep 的外部兜底）。
+
+    「卡住中的流」= agent PROCESSING 但流式超阈值无任何事件（safety timer
+    单点失效时的第二道保险）。语义等同 safety timeout，复用其恢复账：
+    统一错误计数 + 冷却 resume / 超限放弃 + 升级上级（handle_safety_timeout）。
+    返回是否实际执行了中断（非 PROCESSING 时 fail-open 返回 False）。
+    """
+    if agent.status != AgentState.PROCESSING:
+        return False
+    task = agent._llm_task
+    log.warning(
+        "streaming_zombie_force_interrupt",
+        agent_id=agent.id,
+        detail=reason_detail,
+        has_live_llm_task=bool(task is not None and not task.done()),
+    )
+    if agent._cancel_reason is None:
+        agent._cancel_reason = "safety_timeout"
+    elif agent._cancel_reason != "safety_timeout":
+        # 已有在途取消（用户 cancel / off_duty）——让既有恢复路径主导，不劫持
+        return False
+    if task is not None and not task.done():
+        # 正常路径：CancelledError handler 见 safety_timeout →
+        # handle_safety_timeout（收尾 + 复位 idle + 冷却/升级）。
+        # 已取消在途（safety timer / 上一轮 sweep 已发）时勿二次 cancel：
+        # handler 内有 await 点，二次 cancel 会在 except 块内再抛
+        # CancelledError，中途打断 handle_safety_timeout。
+        if not task.cancelling():
+            task.cancel()
+        return True
+    # 状态脱钩（PROCESSING 但无活 LLM task —— CancelledError handler
+    # 不会跑）：直接走 safety_timeout 恢复，内部 _go_idle 复位。
+    await handle_safety_timeout(agent)
+    return True
 
 async def escalate_turn_interruption(agent: Any, *, reason: str) -> None:
     """连续中断超限，给上级发一次升级消息。

@@ -298,7 +298,8 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 - `ChatMessageService.finalize_streaming_message` — `update_message` 返回 False 时 agent-wide 兜底
 - Agent `_finalize_streaming_turn` — completion/error/cancel/timeout/finally 统一走这里；确认成功后才清 `_streaming_msg_id`
 - 新一轮 chat 开始前清该 agent 残留 streaming
-- game_time 每 30s（`STREAMING_SWEEP_TICKS`）扫孤儿：非 PROCESSING 的 `is_streaming=1` 清掉；PROCESSING 的保留（避免误杀）
+- game_time 每 30s（`STREAMING_SWEEP_TICKS`）扫孤儿：非 PROCESSING 的 `is_streaming=1` 清掉；PROCESSING 且行龄 <10min（soft_age）的保留（避免误杀）
+- **P0-3「卡住中的流」兜底**（safety timer 单点失效时的第二道保险）：PROCESSING 但超 `STREAMING_ZOMBIE_TIMEOUT_MS`（默认 5min，env `HIVEWEAVE_STREAMING_ZOMBIE_TIMEOUT_MS`）无任何 streamer 事件 → 清僵尸行 + 红框 + `force_interrupt_stuck_stream` 强制中断（复用 safety_timeout 恢复账）。判活信号是内存态 `agent._last_stream_activity_at`（`streaming.py on_delta` / `agent.py _on_tool_call` 打点；chat_messages 无 updated_at 列且长工具期 content 不增长，DB 侧无法判活）；执行中工具按其超时+60s 放宽（spawn_subagent 560s 不冤杀）；无信号 fail-open 由 soft_age 硬龄路径兜底。看门狗 `_check_silent_agents` 对 streaming 僵尸不豁免 PROCESSING
 - 启动时仍全量清崩溃残留
 
 **不要**把「手动 SQL 清僵尸」当成常规运维；那是自愈失效时的最后手段。
@@ -370,7 +371,7 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 
 1. **Inbox stall / awaiting-reply 催办 — 已禁用**（`_check_stalled` / `_nudge_awaiting_replies` no-op）。回复义务由 turn exit 的 `expect_report` / `ask` + 收件人 ID 检查强制执行，不做周期性催办。
 2. **Task stall 催办 — 活跃**（`_nudge_stale_ledger` 内的 `TASK_STALL_THRESHOLDS` 段）。按任务状态停留时间催办：running>20min / submitted>10min / reviewing>10min / rework>10min / created>5min / claimed>5min。超过 `STALL_ESCALATION_THRESHOLD`(3) 次后升级到上级。与 P0-3 stall break 互斥：近 5 分钟内被 STALL BREAK 的 agent 不再收到 task stall nudge。
-3. **沉默观测看门狗 — 活跃**（`_check_silent_agents`）：agent **10 分钟无任何产出**（chat_messages assistant 行 / work_logs）→ 唤醒 + 红框；持续 30 分钟 → 通知上级。覆盖"接活后当场死亡、名下无待回复消息"的盲区。
+3. **沉默观测看门狗 — 活跃**（`_check_silent_agents`）：agent **10 分钟无任何产出**（chat_messages assistant 行 / work_logs）→ 唤醒 + 红框；持续 30 分钟 → 通知上级。覆盖"接活后当场死亡、名下无待回复消息"的盲区。PROCESSING 豁免**不覆盖 streaming 僵尸**（P0-3：流式超阈值无事件者纳入沉默检测）。
 
 **P0-3 跨轮 STALL BREAK 账本**（`agents/agent.py`）：streamer 的 `tool_loop_stall` 检测（同轮内连续无进展工具调用）触发 `[STALL BREAK]` 结束当前 turn。跨轮账本 `_stall_break_ledger` 记录每次 stall break 时间戳；30 分钟内第 2 次 → agent disposition=blocked + `[AGENT STUCK]` 升级上级。防止"有产出但无进展"的 agent 无限空转。
 

@@ -139,6 +139,10 @@ async def on_delta(agent: Any, event: dict) -> None:
     FIX(text-acc): 收到 round_start 事件时重置累积器，
     避免工具循环中间轮的文本在前端实时显示中重复堆叠。
     """
+    # P0-3: 任何 streamer 事件都算流式活动（僵尸判定信号）。
+    # 本地 thinking 心跳不经此回调（agent._heartbeat 直接广播），
+    # 不会掩盖「HTTP 挂死零事件」的真卡死。
+    agent._last_stream_activity_at = time.time() * 1000
     # 第一个 delta 到达 → 停止心跳（LLM 开始产出内容了）
     agent._stop_heartbeat()
     broadcast_stream_event(agent, event)

@@ -179,6 +179,16 @@ class Agent:
         self._cancel_reason: str | None = None
         self._message_queue: list[tuple[str, dict, int]] = []
         self._streaming_msg_id: str | None = None
+        # P0-3 streaming 僵尸检测信号：streamer 事件（delta/round/tool 起止）
+        # 时间戳（ms epoch；0 = 本回合尚无活动）。健康长流的静默间隔上限为
+        # max(READ_TIMEOUT 95s, 工具超时 ≤500s)——超阈值即「卡住中的流」。
+        # chat_messages 无 updated_at 列，且长工具期 content 不增长
+        # （TEST11 H4），DB 侧无法可靠判活，故用内存信号（PROCESSING 保护
+        # 集合 list_processing() 同为内存态，语义一致）。
+        self._last_stream_activity_at: float = 0.0
+        # 执行中的工具：{tool_call_id: (tool_name, start_ms)}——僵尸判定按
+        # 当前工具超时 + 余量放宽（spawn_subagent 500s 不冤杀长工具）。
+        self._active_tools: dict[str, tuple[str, float]] = {}
         self._reply_reminder_count = 0  # expect_reply 提示次数，3 次后升级到上级
         self._REPLY_REMINDER_MAX = 3   # 即时提醒上限
         self._task_reminder_count = 0  # open-task 收工续跑次数
@@ -667,6 +677,10 @@ class Agent:
                 "is_background": True if is_trigger else False,
             })
             self._streaming_msg_id = saved["id"]
+            # P0-3: 回合流式活动起点（placeholder 落库时刻）——之后由
+            # on_delta / _on_tool_call 持续刷新，供 streaming 僵尸判定。
+            self._last_stream_activity_at = time.time() * 1000
+            self._active_tools = {}
 
             # 启动 LLM task
             self._llm_task = asyncio.create_task(
@@ -1977,6 +1991,15 @@ class Agent:
         """
         return await _agent_recovery.handle_safety_timeout(self)
 
+    async def force_interrupt_stuck_stream(self, *, reason_detail: str = "") -> bool:
+        """P0-3 streaming 僵尸强制中断（game_time sweep 调用）。
+
+        safety timer 单点失效时的外部兜底；复用 safety_timeout 恢复账。
+        """
+        return await _agent_recovery.force_interrupt_stuck_stream(
+            self, reason_detail=reason_detail
+        )
+
     async def _ack_inbox_on_give_up(self, inbox_ids: list[str]) -> None:
         """ACK noisy inbox on give-up but keep review/escalation/ask wakes.
 
@@ -2724,4 +2747,13 @@ class Agent:
         Streamer 期望返回: {"role": "tool", "content": "...", "tool_call_id": "..."}
         ToolExecutor 返回: {"success": bool, "output": str, "error": str | None}
         """
-        return await _agent_streaming.on_tool_call(self, tool_name, arguments, tool_call_id)
+        # P0-3: 登记执行中工具（streaming 僵尸判定按工具超时放宽静默上限）。
+        # wait_for 超时/异常均走 finally 注销，不会残留。
+        now_ms = time.time() * 1000
+        self._last_stream_activity_at = now_ms
+        self._active_tools[tool_call_id] = (tool_name, now_ms)
+        try:
+            return await _agent_streaming.on_tool_call(self, tool_name, arguments, tool_call_id)
+        finally:
+            self._active_tools.pop(tool_call_id, None)
+            self._last_stream_activity_at = time.time() * 1000
