@@ -13,8 +13,10 @@ Key design:
   run_steps is the audit trail
 """
 
+import asyncio
 import hashlib
 import json
+import sqlite3
 import time
 import uuid
 from typing import Any
@@ -53,6 +55,25 @@ class RunLedger:
         checkpoint_summary: str | None = None,
     ) -> str:
         """Create an activation record when an agent is woken."""
+        # M3 孤儿步骤清扫：run 已结束（status != 'running'）却仍 status='running'
+        # 的 run_steps 是 record_step_end 写回丢失的孤儿（slack-clone_03 实测
+        # 6 行跨 17h 残留），统一标 error 收尾。安全边界：仍 running 的 run
+        # 被排除——其工具循环可能正在执行，步骤仍会被补 end；已结束 run 的
+        # 工具循环已死，不可能再补写。选 error 而非 interrupted：
+        # interrupted 保留恢复语义（generate_checkpoint 会为中断 run 生成
+        # 摘要），孤儿步骤是永不收尾的悬挂项，标 error 使其被如实计入
+        # 失败分支而非误报为进行中。best-effort，失败不影响激活创建。
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE run_steps SET status = 'error', ended_at = ?, error = ? "
+                "WHERE run_id IN (SELECT id FROM agent_runs "
+                "WHERE agent_id = ? AND status != 'running') "
+                "AND status = 'running'",
+                [_now_ms(), "orphan step swept: run ended while step running", agent_id],
+            )
+        except Exception as e:
+            log.warning("run_ledger.orphan_step_sweep_failed", agent_id=agent_id, error=str(e))
         activation_id = str(uuid.uuid4())
         now = _now_ms()
         try:
@@ -175,23 +196,45 @@ class RunLedger:
         if result_excerpt and len(result_excerpt) > 2048:
             result_excerpt = result_excerpt[:2048] + "…[truncated]"
         try:
-            # Calculate duration from started_at
-            rows = await project_db.query(
-                agent_id,
-                "SELECT started_at FROM run_steps WHERE id = ?",
-                [step_id],
-            )
-            started_at = rows[0]["started_at"] if rows else now
+            # Calculate duration from started_at — SELECT 失败只影响 duration，
+            # 降级 now 不重试
+            try:
+                rows = await project_db.query(
+                    agent_id,
+                    "SELECT started_at FROM run_steps WHERE id = ?",
+                    [step_id],
+                )
+                started_at = rows[0]["started_at"] if rows else now
+            except Exception:
+                started_at = now
             duration = now - started_at if started_at else 0
-            await project_db.execute(
-                agent_id,
+            sql = (
                 "UPDATE run_steps SET status = ?, result_hash = ?, "
                 "result_size = ?, result_excerpt = ?, error = ?, "
                 "ended_at = ?, duration_ms = ? "
-                "WHERE id = ?",
-                [status, result_hash, result_size, result_excerpt, error,
-                 now, duration, step_id],
+                "WHERE id = ?"
             )
+            params = [status, result_hash, result_size, result_excerpt, error,
+                      now, duration, step_id]
+            # M3 有界重试：仅对 sqlite3.OperationalError（锁竞争/瞬断，db 层
+            # busy_timeout=5s 之后的第二道保险）重试 2 次，50/100ms 退避。
+            # ProjectDbError（workspace 驱逐等）重试无意义，直接交给外层
+            # 统一告警（绝不外抛）。耗尽后抛给外层统一告警。
+            last_error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    await project_db.execute(agent_id, sql, params)
+                    last_error = None
+                    break
+                except sqlite3.OperationalError as e:
+                    last_error = e
+                    if attempt < 2:
+                        await asyncio.sleep(0.05 * (2 ** attempt))
+                except Exception as e:
+                    last_error = e
+                    break
+            if last_error is not None:
+                raise last_error
         except Exception as e:
             log.warning("run_ledger.record_step_end_failed", agent_id=agent_id, error=str(e))
 
@@ -339,7 +382,10 @@ class RunLedger:
             dur = s.get("duration_ms") or 0
             lines.append(f"  - {tn} ({dur}ms) result_hash={s.get('result_hash', 'n/a')}")
 
-        failed = [s for s in steps if s["status"] == "failed"]
+        # 清扫写入的孤儿步骤状态为 'error'（区别于失败 'failed' 与恢复
+        # 语义 'interrupted'），checkpoint 统计必须同样纳入，否则孤儿步骤
+        # 在摘要里静默缺失（审计 P2）。
+        failed = [s for s in steps if s["status"] in ("failed", "error")]
         if failed:
             lines.append(f"Failed steps: {len(failed)}")
             for s in failed:
