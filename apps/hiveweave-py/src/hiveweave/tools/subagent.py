@@ -464,6 +464,12 @@ def _subagent_on_tool_call(
             "role": "tool",
             "content": str(content),
             "tool_call_id": tool_call_id,
+            # H3 透传：子代理路径的工具结果同样要带 success + blocked 标记。
+            # 缺 success 时 tool_exec 的 error_ids 恒空 → `error_ids and
+            # blocked_ids >= error_ids` 短路，blocked 分流在此路径完全不生效
+            # （审计 P1）——与 agents/streaming.py 的透传键对齐。
+            "success": bool(result.get("success", True)),
+            "blocked": bool(result.get("blocked")),
         }
 
     return callback

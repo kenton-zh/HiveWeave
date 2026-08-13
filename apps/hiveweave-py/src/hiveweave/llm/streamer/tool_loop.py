@@ -24,7 +24,12 @@ from .constants import (
     TOTAL_TIMEOUT_S,
     TURN_STREAM_CUT_GRACE_S,
 )
-from .doom_loop import doom_loop_limit, round_made_progress, round_was_readonly_only
+from .doom_loop import (
+    BLOCKED_STALL_LIMIT,
+    doom_loop_limit,
+    round_made_progress,
+    round_was_readonly_only,
+)
 from .types import DeltaCallback, ToolCallCallback
 
 log = structlog.get_logger(__name__)
@@ -139,6 +144,10 @@ class ToolLoopMixin:
         # DESIGN-2: Magentic-One stall counter — consecutive no-progress rounds
         stall_count = 0
         readonly_stall_count = 0
+        # H3: 平台护栏拒绝轮（blocked）独立计数 —— 护栏拒绝是平台拒环境，
+        # 不是模型空转，不累计普通 stall_count；超过 BLOCKED_STALL_LIMIT
+        # 仍收口兜底。
+        blocked_stall_count = 0
 
         # TEST21 M4: soft/hard turn budget (activity renews soft within hard)
         loop_start = time.monotonic()
@@ -607,6 +616,7 @@ class ToolLoopMixin:
                 # 执行工具
                 end_turn = False
                 error_ids: set[str] = set()
+                blocked_ids: set[str] = set()
                 duplicate_ids: set[str] = set()
                 if on_tool_call is None:
                     log.error("no_tool_executor", agent_id=agent_id)
@@ -617,7 +627,7 @@ class ToolLoopMixin:
                     ]
                     error_ids = {tc["id"] for tc in tool_calls}
                 else:
-                    tool_results, error_ids, duplicate_ids, end_turn = (
+                    tool_results, error_ids, blocked_ids, duplicate_ids, end_turn = (
                         await self._execute_tools(
                             agent_id=agent_id,
                             tool_calls=tool_calls,
@@ -663,6 +673,9 @@ class ToolLoopMixin:
 
                 # DESIGN-2: stall counter — no mutating progress → force outer loop
                 # Pure-readonly polling uses a higher limit (dogfood retune).
+                # H3: 护栏拒绝（blocked）≠ 模型空转 —— 全 blocked 轮走独立
+                # blocked_stall_count，不累计普通 stall_count；混有非 blocked
+                # 错误仍按原 stall 逻辑。
                 if round_made_progress(
                     tool_calls,
                     error_ids=error_ids,
@@ -670,6 +683,7 @@ class ToolLoopMixin:
                 ):
                     stall_count = 0
                     readonly_stall_count = 0
+                    blocked_stall_count = 0
                     # TEST21 M4: activity renews soft budget within hard cap
                     soft_deadline = min(
                         time.monotonic() + ACTIVITY_EXTEND_S, hard_deadline
@@ -681,12 +695,21 @@ class ToolLoopMixin:
                 ):
                     readonly_stall_count += 1
                     stall_count = 0
+                    blocked_stall_count = 0
+                elif error_ids and blocked_ids >= error_ids:
+                    # 全部失败都是平台护栏拒绝（blocked）→ 独立计数，
+                    # 不给模型判空转（H3）。不清零普通 stall_count：
+                    # [error, blocked] 交替轮必须仍能累计到 STALL BREAK
+                    # （2026-08-13 审计：清零会让交替序列永不触顶）。
+                    blocked_stall_count += 1
                 else:
                     stall_count += 1
                     readonly_stall_count = 0
+                    blocked_stall_count = 0
                 stalled = (
                     stall_count >= TOOL_LOOP_STALL_LIMIT
                     or readonly_stall_count >= TOOL_LOOP_READONLY_STALL_LIMIT
+                    or blocked_stall_count >= BLOCKED_STALL_LIMIT
                 )
                 if stalled:
                     log.warning(
@@ -695,26 +718,47 @@ class ToolLoopMixin:
                         round=round_num,
                         stall_count=stall_count,
                         readonly_stall_count=readonly_stall_count,
+                        blocked_stall_count=blocked_stall_count,
                     )
                     try:
                         from hiveweave.services.telemetry import telemetry
 
                         telemetry.tool_loop_stall(
                             agent_id,
-                            stall_count=max(stall_count, readonly_stall_count),
+                            stall_count=max(
+                                stall_count,
+                                readonly_stall_count,
+                                blocked_stall_count,
+                            ),
                         )
                     except Exception:
                         pass
-                    messages.append({
-                        "role": "system",
-                        "content": (
+                    if (
+                        blocked_stall_count >= BLOCKED_STALL_LIMIT
+                        and stall_count < TOOL_LOOP_STALL_LIMIT
+                        and readonly_stall_count < TOOL_LOOP_READONLY_STALL_LIMIT
+                    ):
+                        break_text = (
+                            f"[STALL BREAK] {blocked_stall_count} consecutive "
+                            "tool-loop rounds were refused by platform guards "
+                            "(permission / sandbox / security rules) — not "
+                            "model errors. Stop repeating blocked calls: "
+                            "change approach, commit partial work with "
+                            "commit_turn, or ask your superior for the missing "
+                            "permission."
+                        )
+                    else:
+                        break_text = (
                             f"[STALL BREAK] {max(stall_count, readonly_stall_count)} "
                             "consecutive tool-loop "
                             "rounds made no progress (only readonly / failed / "
                             "duplicate tools). Stop polling. Call commit_turn "
                             "now (waiting/blocked/done_slice) or change approach "
                             "— do not repeat the same readonly loop."
-                        ),
+                        )
+                    messages.append({
+                        "role": "system",
+                        "content": break_text,
                     })
                     summary = await self._make_max_rounds_summary(
                         agent_id, provider, messages, on_delta,
@@ -725,7 +769,7 @@ class ToolLoopMixin:
                     if not final_text:
                         final_text = (
                             "[STALL BREAK] No progress for "
-                            f"{max(stall_count, readonly_stall_count)} rounds — "
+                            f"{max(stall_count, readonly_stall_count, blocked_stall_count)} rounds — "
                             "turn ended."
                         )
                     tool_turn_acc.append(

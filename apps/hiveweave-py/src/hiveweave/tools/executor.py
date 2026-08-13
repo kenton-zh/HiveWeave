@@ -1319,7 +1319,10 @@ class ToolExecutor:
 
             agent_info = await meta_db.get_agent_by_id(agent_id)
             family = infer_role_family(agent_info or {})
-            return self._error(build_deny_hint(name, family, deny_reason))
+            deny_result = self._error(build_deny_hint(name, family, deny_reason))
+            # H3: 权限拒绝是平台护栏，不是模型空转 —— 标记 blocked 供 stall 分流
+            deny_result["blocked"] = True
+            return deny_result
 
         if decision == "ask":
             # Request approval (120s timeout)
@@ -1331,12 +1334,18 @@ class ToolExecutor:
                     description=f"Agent {agent_id} wants to use {name}",
                 )
             except PermissionTimeout:
-                return self._error(
+                # H3: 平台拒绝（审批超时）≠ 模型空转 —— 与注册路径（pipeline）
+                # 对齐标记 blocked 供 stall 分流。
+                deny_result = self._error(
                     "Permission request timed out (120s). "
                     "The user may be away."
                 )
+                deny_result["blocked"] = True
+                return deny_result
             except PermissionRejected as exc:
-                return self._error(f"Permission rejected: {exc}")
+                deny_result = self._error(f"Permission rejected: {exc}")
+                deny_result["blocked"] = True
+                return deny_result
             except Exception as exc:  # noqa: BLE001
                 return self._error(
                     f"Error: Approval request failed: {exc}"

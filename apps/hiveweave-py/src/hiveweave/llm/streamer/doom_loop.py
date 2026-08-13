@@ -4,6 +4,16 @@ from __future__ import annotations
 DOOM_LOOP_DEFAULT_LIMIT = 3
 """默认 doom loop 阈值 — 同一工具+同一参数连续 N 次中断。"""
 
+BLOCKED_STALL_LIMIT = 3
+"""平台护栏拒绝轮（blocked）的独立 stall 上限（H3）。
+
+护栏拒绝（permission/sandbox/security "Command blocked" 等）是平台拒绝
+执行，不是模型空转 —— 全 blocked 轮不累计普通 stall_count。但连续
+BLOCKED_STALL_LIMIT 轮全被拒说明当前方案不可执行，仍应收口兜底。
+取值对齐 DOOM_LOOP_DEFAULT_LIMIT=3 的容忍度（同参 blocked 会先被
+doom loop 同参阈值拦住；此处兜底"换着参数试、全被拒"的情形）。
+"""
+
 # ── 只读/幂等轮询工具豁免集合 ──────────────────────────────
 # 实锤事故（生产日志）：归零/拾光/潮汐各被 doom 杀过一次 ——
 # 「Doom loop detected: tool get_tasks called 3+ times with same args」。

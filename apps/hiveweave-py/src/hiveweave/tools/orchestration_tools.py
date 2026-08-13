@@ -291,7 +291,9 @@ async def _send_message_core(
                 return ToolResult.ok(
                     f"Messages sent (user only). Cross-level blocked: {span_blocked}",
                     results=results,
-                    blocked=span_blocked,
+                    # extra 键名避开 H3 平台护栏标记 `blocked`（ToolResult 字段
+                    # 恒胜 extra，同名会静默抹掉名单）——审计 P1。
+                    span_blocked=span_blocked,
                 )
             return ToolResult.err(
                 "全部收件人被指挥链拒绝（禁止跨级沟通）。" + "; ".join(span_blocked)

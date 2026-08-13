@@ -35,11 +35,13 @@ class ToolExecMixin:
         on_delta: DeltaCallback | None,
         poll_turn_counts: dict[tuple[str, str], int] | None = None,
         budget_s: float | None = None,
-    ) -> tuple[list[dict], set[str], set[str], bool]:
-        """执行一批工具调用，返回 (tool result 消息列表, 出错的 tool_call_id 集合, duplicate tool_call_id 集合, end_turn)。
+    ) -> tuple[list[dict], set[str], set[str], set[str], bool]:
+        """执行一批工具调用，返回 (tool result 消息列表, error_ids, blocked_ids, duplicate_ids, end_turn)。
 
         并行执行独立的工具调用（对齐 Elixir Task.Supervisor.async_nolink）。
         error_ids 保留用于日志/观测（doom 检测已不再使用失败豁免）。
+        blocked_ids = error_ids 中标记 blocked 的子集 —— 平台护栏/沙箱/
+        权限拒绝（H3），供 stall 检测区分「平台拒环境」与「模型空转」。
         duplicate_ids 标识"同参数已执行过、本次无新效果"的工具调用，供 doom
         tracker 做强制 +1 计数加速触顶。
         end_turn=True 表示本批含已接受的 commit_turn，应硬断工具循环（BUG-3）。
@@ -69,6 +71,7 @@ class ToolExecMixin:
 
         tool_results: list[dict] = []
         error_ids: set[str] = set()
+        blocked_ids: set[str] = set()
         duplicate_ids: set[str] = set()
         end_turn = False
         for i, result in enumerate(results):
@@ -88,6 +91,11 @@ class ToolExecMixin:
                     or content.startswith("[poll hard reject]")
                 ):
                     error_ids.add(tc["id"])
+                # H3: 平台护栏/沙箱/权限拒绝 —— 失败且带 blocked 标记。
+                # 既入 error_ids（保持既有失败语义）也独立收 blocked_ids
+                # （stall 检测分流用）。
+                if result.get("blocked"):
+                    blocked_ids.add(tc["id"])
                 # duplicate 信号：工具返回 duplicate=True 表示本次调用不会产生
                 # 任何新效果（如 commit_turn 同参已接受过）。这是 doom loop 的
                 # 强信号，应计入循环检测。
@@ -112,7 +120,7 @@ class ToolExecMixin:
                 "content": content,
             })
 
-        return tool_results, error_ids, duplicate_ids, end_turn
+        return tool_results, error_ids, blocked_ids, duplicate_ids, end_turn
 
     async def _execute_single_tool(
         self,
