@@ -457,9 +457,11 @@ async def _assignee_has_open_tasks(workspace_path: str, short_id: str) -> bool:
 
 def _row_is_verify_task(title: str | None, tags_raw: Any) -> bool:
     """True for VERIFY children (title prefix only — TEST19 教训: agent 自由
-    tag "verify" 不得触发 VERIFY 特殊路径)."""
+    tag "verify" 不得触发 VERIFY 特殊路径；H1 收口走 is_verify_title)."""
     del tags_raw
-    return isinstance(title, str) and title.startswith("VERIFY:")
+    from hiveweave.services.tasks.verify import is_verify_title
+
+    return is_verify_title(title)
 
 
 async def _assignee_needs_write_worktree(

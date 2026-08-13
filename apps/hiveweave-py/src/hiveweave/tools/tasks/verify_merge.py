@@ -11,6 +11,7 @@ from typing import Any
 import structlog
 
 from hiveweave.services import task as _task_svc
+from hiveweave.services.tasks.verify import is_verify_title
 from hiveweave.tools import helpers as _helpers
 from hiveweave.tools.tasks.verify_spawn import (
     VERIFY_STALE_COOLDOWN_MS,
@@ -260,8 +261,9 @@ async def nudge_verify_tasks_after_merge(
         tasks,
         key=lambda x: (x.get("created_at") or 0, x.get("id") or ""),
     ):
-        # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不触发）
-        if not (t.get("title") or "").startswith("VERIFY:"):
+        # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不触发）；
+        # H1 收口: 判定统一走 is_verify_title（覆盖 【】/[]/全角冒号形态）。
+        if not is_verify_title(t.get("title")):
             continue
         # 审计 O2：只剩 created/claimed —— running 的 VERIFY 已在跑，merge
         # nudge 不得再骚扰（它会被 except_id 自豁免而重复 send+trigger）。
