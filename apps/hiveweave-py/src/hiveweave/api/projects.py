@@ -456,7 +456,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "permission_type": "coordinator",
                 "status": "active",
                 "model_id": default_model_id,
-                "skills": ["spec-driven-development", "planning-and-task-breakdown", "context-engineering"],
+                "skills": ["spec-driven-development", "planning-and-task-breakdown", "context-engineering", "task-advance"],
             },
             bootstrap=True,
         )
@@ -474,7 +474,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "status": "active",
                 "parent_id": ceo_id,
                 "model_id": exec_model_id,
-                "skills": ["interview-me", "documentation-and-adrs"],
+                "skills": ["interview-me", "documentation-and-adrs", "task-advance"],
             },
             bootstrap=True,
         )
