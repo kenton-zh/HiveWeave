@@ -262,7 +262,7 @@ async def execute_registered_tool(
         except Exception:
             family = ""
 
-        return ToolResult.err(
+        return ToolResult.blocked_err(
             build_deny_hint(tool_name, family, deny_reason)
         ).to_dict()
 
@@ -277,22 +277,23 @@ async def execute_registered_tool(
                 description=f"Agent {agent_id} wants to use {tool_name}",
             )
         except PermissionTimeout:
-            return ToolResult.err(
+            return ToolResult.blocked_err(
                 "Permission request timed out (120s). The user may be away."
             ).to_dict()
         except PermissionRejected as exc:
-            return ToolResult.err(f"Permission rejected: {exc}").to_dict()
+            return ToolResult.blocked_err(f"Permission rejected: {exc}").to_dict()
         except Exception as exc:  # noqa: BLE001
             return ToolResult.err(f"Error: Approval request failed: {exc}").to_dict()
 
     # BUG-9: writers must not silently dump files on project root when their
     # worktree is missing — refuse and point them at ensure/heal.
+    # 平台路由护栏拒绝 → blocked_err（H3 分流），与权限/沙箱拒绝一致。
     if tool_name in _WRITE_REQUIRE_WORKTREE_TOOLS:
         refuse = await _refuse_project_root_write(
             agent_id, workspace_path, tool_name, ctx
         )
         if refuse:
-            return ToolResult.err(refuse).to_dict()
+            return ToolResult.blocked_err(refuse).to_dict()
 
     # 4. Security checks (auto-injected based on security_level)
     if tool_def.security_level == "file_op":
@@ -303,11 +304,11 @@ async def execute_registered_tool(
             params, workspace_path, tool_name=tool_name, project_root=project_root
         )
         if security_error:
-            return ToolResult.err(security_error).to_dict()
+            return ToolResult.blocked_err(security_error).to_dict()
     elif tool_def.security_level == "shell":
         security_error = _check_shell_security(params)
         if security_error:
-            return ToolResult.err(security_error).to_dict()
+            return ToolResult.blocked_err(security_error).to_dict()
 
     # 5. Execute tool
     try:
@@ -326,15 +327,18 @@ async def execute_registered_tool(
     if isinstance(result, ToolResult):
         return result.to_dict()
     elif isinstance(result, dict):
-        # Forward compat: wrap legacy dict returns
+        # Forward compat: wrap legacy dict returns.
+        # blocked 必须显式透传：进 extra 会被 ToolResult 字段恒胜覆盖抹掉
+        # （审计 P2，潜伏陷阱）。
         return ToolResult(
             success=result.get("success", True),
             output=result.get("output", ""),
             error=result.get("error"),
+            blocked=bool(result.get("blocked")),
             extra={
                 k: v
                 for k, v in result.items()
-                if k not in ("success", "output", "error")
+                if k not in ("success", "output", "error", "blocked")
             },
         ).to_dict()
     else:
@@ -362,18 +366,18 @@ def _check_file_security(
         READ_PATH_TOOLS,
         _check_hiveweave_dir,
         _is_sensitive,
-        _resolve_safe,
+        _resolve_for_read_detail,
+        _resolve_safe_detail,
         infer_project_root,
-        resolve_for_read,
     )
 
     allow_project_read = tool_name in READ_PATH_TOOLS
     root = project_root or infer_project_root(workspace_path)
 
-    def _resolve(path: str) -> str | None:
+    def _resolve_detail(path: str) -> tuple[str | None, str | None]:
         if allow_project_read:
-            return resolve_for_read(workspace_path, path, root)
-        return _resolve_safe(workspace_path, path)
+            return _resolve_for_read_detail(workspace_path, path, root)
+        return _resolve_safe_detail(workspace_path, path)
 
     # Extract file path from params — try common field names
     file_path = (
@@ -399,7 +403,7 @@ def _check_file_security(
                 err = _check_single_file(
                     patch_path,
                     workspace_path,
-                    _resolve,
+                    _resolve_detail,
                     _check_hiveweave_dir,
                     _is_sensitive,
                     hiveweave_root=root if allow_project_read else workspace_path,
@@ -417,7 +421,7 @@ def _check_file_security(
             err = _check_single_file(
                 p,
                 workspace_path,
-                _resolve,
+                _resolve_detail,
                 _check_hiveweave_dir,
                 _is_sensitive,
                 hiveweave_root=workspace_path,
@@ -433,7 +437,7 @@ def _check_file_security(
     return _check_single_file(
         file_path,
         workspace_path,
-        _resolve,
+        _resolve_detail,
         _check_hiveweave_dir,
         _is_sensitive,
         hiveweave_root=root if allow_project_read else workspace_path,
@@ -451,7 +455,9 @@ def _check_single_file(
     allow_project_read: bool = False,
 ) -> str | None:
     """Check a single file path for security violations."""
-    resolved = _resolve(file_path)
+    resolved, hint = _resolve(file_path)
+    if hint is not None:
+        return f"Error: {hint}"
     if resolved is None:
         scope = "project" if allow_project_read else "workspace"
         return f"Error: Sandbox violation - path must be within {scope}: {file_path}"
