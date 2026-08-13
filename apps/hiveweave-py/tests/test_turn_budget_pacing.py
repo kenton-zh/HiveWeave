@@ -119,6 +119,7 @@ async def test_pacing_hint_injected_when_budget_half_used(monkeypatch):
             [{"role": "tool", "content": "ok", "tool_call_id": "tc-1"}],
             set(),
             set(),
+            set(),
             False,
         )
     )
@@ -166,6 +167,7 @@ async def test_pacing_hint_not_injected_on_short_turn(monkeypatch):
     streamer._execute_tools = AsyncMock(  # type: ignore[method-assign]
         return_value=(
             [{"role": "tool", "content": "ok", "tool_call_id": "tc-1"}],
+            set(),
             set(),
             set(),
             False,
@@ -362,6 +364,7 @@ async def test_round_gate_blocks_new_round_when_budget_low(monkeypatch):
         clock.advance(360)  # 工具批耗到剩余 ~110s（< MIN_ROUND_BUDGET 120）
         return (
             [{"role": "tool", "content": "ok", "tool_call_id": "tc-1"}],
+            set(),
             set(),
             set(),
             False,

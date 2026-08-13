@@ -141,6 +141,9 @@ async def _run_registered_dev_server(
                 f"Refusing to start dev server on reserved platform port "
                 f"{port}. Use start_dev_server or a project port (3000+)."
             ),
+            # H3: 平台护栏拒绝 —— 与 start_dev_server_tool 的保留端口
+            # blocked_err 口径一致（复审 P2-1）
+            "blocked": True,
         }
 
     try:
@@ -213,24 +216,6 @@ async def _run_registered_dev_server(
         "error": None,
     }
 
-# 环境变量白名单 — 只传系统必要变量给子进程，绝不传递任何含
-# KEY/SECRET/TOKEN/PASSWORD 的变量（C5: 防止 API 密钥泄露）。
-_SAFE_ENV_KEYS: frozenset[str] = frozenset({
-    "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
-    "TEMP", "TMP", "SystemRoot", "COMSPEC", "LANG", "LC_ALL",
-    "LC_CTYPE", "TERM", "SHELL", "USERNAME", "USERDOMAIN",
-    "COMPUTERNAME", "OS", "PATHEXT", "HOMEDRIVE", "HOMEPATH",
-    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
-    # Python runtime support — not secrets, needed for venv/pip to work
-    "VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME", "PYTHONIOENCODING",
-    "PYTHONUTF8",
-    # Node.js runtime support
-    "NODE_PATH", "NODE_OPTIONS",
-    # Proxy settings (needed for network access in tools)
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
-})
-
-
 def _source_env_sh(command: str, hw_dir: str) -> str:
     """Prepend .hiveweave/env.sh sourcing if the file exists.
 
@@ -251,23 +236,10 @@ def _source_env_sh(command: str, hw_dir: str) -> str:
 
 
 def _build_safe_env(cwd: str) -> dict[str, str]:
-    """构建白名单环境变量，仅传递系统必要变量 + HiveWeave 标记。
+    """Bash 子进程环境：白名单 + HIVEWEAVE_BASH 标记。"""
+    from hiveweave.util.safe_env import build_child_env
 
-    绝不传递 OPENAI_API_KEY / OPENCODE_API_KEY / DEEPSEEK_API_KEY 等密钥。
-    Windows 环境变量大小写不敏感（Path 与 PATH 等价），白名单匹配也必须
-    大小写不敏感，否则可能漏传 PATH（系统常存为 'Path'）。
-    """
-    safe_keys_upper = {k.upper() for k in _SAFE_ENV_KEYS}
-    safe_env = {k: v for k, v in os.environ.items() if k.upper() in safe_keys_upper}
-    safe_env["HIVEWEAVE_BASH"] = "1"
-    safe_env["HIVEWEAVE_WORKSPACE"] = cwd
-    # Force UTF-8 everywhere — prevents GBK encoding crashes on Windows
-    # when agent output contains emoji or CJK extension chars (✅, 🚀, etc.)
-    safe_env["PYTHONIOENCODING"] = "utf-8"
-    safe_env["PYTHONUTF8"] = "1"
-    safe_env["LANG"] = "en_US.UTF-8"
-    safe_env["LC_ALL"] = "en_US.UTF-8"
-    return safe_env
+    return build_child_env(cwd, bash_markers=True)
 
 # Self-destructive command patterns (契约 02 — 7 patterns)
 # Match semantics mirror Elixir check_self_destructive/1:
@@ -829,7 +801,7 @@ async def execute_bash(
     if blocked:
         log.warning("bash.blocked", reason=reason, command_preview=command[:120])
         return {"success": False, "output": "",
-                "error": f"Error: {reason}"}
+                "error": f"Error: {reason}", "blocked": True}
 
     # 1.5. Auto-source .hiveweave/env.sh if the project has one.
     # The project declares its own environment setup.
@@ -845,11 +817,13 @@ async def execute_bash(
 
     if not _is_within_workspace(cwd, ws):
         return {"success": False, "output": "",
-                "error": "Error: Sandbox violation - workdir must be within workspace"}
+                "error": "Error: Sandbox violation - workdir must be within workspace",
+                "blocked": True}
 
     if not Path(cwd).exists():
         return {"success": False, "output": "",
-                "error": f"Error: Working directory does not exist: {cwd}"}
+                "error": f"Error: Working directory does not exist: {cwd}",
+                "blocked": True}
 
     cwd_hint = _cwd_style_hint(cwd)
 
@@ -949,7 +923,7 @@ async def execute_run_command(
         log.warning("run_command.blocked", reason=reason,
                     command_preview=command[:120])
         return {"success": False, "output": "",
-                "error": f"Error: {reason}"}
+                "error": f"Error: {reason}", "blocked": True}
 
     ws = workspace_path or os.getcwd()
     if cwd:
@@ -959,11 +933,13 @@ async def execute_run_command(
 
     if not _is_within_workspace(full_cwd, ws):
         return {"success": False, "output": "",
-                "error": "Error: Sandbox violation - cwd must be within workspace"}
+                "error": "Error: Sandbox violation - cwd must be within workspace",
+                "blocked": True}
 
     if not Path(full_cwd).exists():
         return {"success": False, "output": "",
-                "error": f"Error: Working directory does not exist: {full_cwd}"}
+                "error": f"Error: Working directory does not exist: {full_cwd}",
+                "blocked": True}
 
     safe_timeout = int(timeout_ms or 120_000)
     if 1 <= safe_timeout <= 600:
@@ -1520,7 +1496,8 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
         params.command, project_id=project_id
     )
     if reserved_err:
-        return ToolResult.err(reserved_err)
+        # H3: 保留端口是平台护栏拒绝（复审 P2-1）
+        return ToolResult.blocked_err(reserved_err)
 
     exec_ws = workspace or ""
     verify_note = ""
@@ -1580,6 +1557,10 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
         err_msg = f"{err_msg}{_streak_hint}"
     if suffix:
         err_msg = f"{err_msg}{suffix}"
+    if result.get("blocked"):
+        # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
+        # stall 检测分流，文本/exit code 语义与 err 一致。
+        return ToolResult.blocked_err(err_msg)
     return ToolResult.err(err_msg)
 
 
@@ -1599,7 +1580,8 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         params.command, project_id=project_id
     )
     if reserved_err:
-        return ToolResult.err(reserved_err)
+        # H3: 保留端口是平台护栏拒绝（复审 P2-1）
+        return ToolResult.blocked_err(reserved_err)
 
     exec_ws = workspace or ""
     verify_note = ""
@@ -1658,5 +1640,9 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         err_msg = f"{err_msg}{_streak_hint}"
     if suffix:
         err_msg = f"{err_msg}{suffix}"
+    if result.get("blocked"):
+        # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
+        # stall 检测分流，文本/exit code 语义与 err 一致。
+        return ToolResult.blocked_err(err_msg)
     return ToolResult.err(err_msg)
 

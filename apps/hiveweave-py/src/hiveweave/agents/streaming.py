@@ -277,10 +277,13 @@ async def on_tool_call(
         # - success: 失败调用
         # - duplicate: 同参已执行过无新效果（doom 加速）
         # - end_turn: commit_turn 已接受 → 硬断本轮工具循环（BUG-3）
+        # - blocked: 平台护栏/沙箱/权限拒绝（H3 stall 分流）——必须透传，
+        #   否则 tool_exec 的 blocked_ids 永远为空（2026-08-13 审计 P0）。
         # 这些键不会进入发给 LLM 的消息体 —— _execute_tools 重新组包时剥离。
         "success": result.get("success", False),
         "duplicate": result.get("duplicate", False),
         "end_turn": bool(result.get("end_turn")),
+        "blocked": bool(result.get("blocked")),
         # Multimodal screenshot pixels (browse / assert_visual)
         "images": result.get("images"),
     }
