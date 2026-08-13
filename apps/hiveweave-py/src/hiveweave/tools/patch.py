@@ -14,34 +14,10 @@ from typing import Any
 
 import structlog
 
+from hiveweave.tools.file import _resolve_safe_detail
 from hiveweave.tools.security import check_sensitive_access
 
 log = structlog.get_logger(__name__)
-
-
-def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
-    """Resolve file_path against workspace; return None if escapes sandbox."""
-    if not file_path:
-        return None
-    try:
-        ws = Path(workspace_path).resolve()
-        candidate = Path(file_path)
-        if candidate.is_absolute():
-            try:
-                rel = candidate.relative_to(ws)
-                full = ws / rel
-            except ValueError:
-                return None
-        else:
-            full = (ws / file_path).resolve()
-        if full != ws:
-            try:
-                full.relative_to(ws)
-            except ValueError:
-                return None
-        return str(full)
-    except (OSError, ValueError):
-        return None
 
 
 # ── P1 容错匹配 — 参考 OpenCode edit.ts 的多策略匹配 ──
@@ -162,7 +138,9 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
     # 敏感文件保护（C6）— 在路径解析前检查，阻止对 .env / *.pem / credentials 等的写入/删除
     check_sensitive_access(file_path, op=op or "write")
 
-    full = _resolve_safe(workspace_path, file_path)
+    full, hint = _resolve_safe_detail(workspace_path, file_path)
+    if hint is not None:
+        return f"ERROR: {hint}"
     if full is None:
         return f"ERROR: Sandbox violation: {file_path}"
 

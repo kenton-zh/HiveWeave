@@ -110,13 +110,79 @@ def infer_project_root(workspace_path: str) -> str:
     return str(p)
 
 
-def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
-    """Resolve file_path against workspace and ensure it stays inside (WRITE sandbox).
+def _double_worktree_prefix(workspace_path: str, full_path: str) -> str | None:
+    """Detect a self-nested worktree prefix (ghost tree) in ``full_path``.
 
-    Returns the absolute path string, or None if the path escapes the sandbox.
+    When the agent's workspace IS a worktree — ``<project>/.hiveweave/
+    worktrees/<id>`` — a path that repeats the worktree prefix, e.g. the
+    relative path ``.hiveweave/worktrees/<id>/src/x.py``, resolves to
+    ``<project>/.hiveweave/worktrees/<id>/.hiveweave/worktrees/<id>/src/x.py``.
+    ``_check_hiveweave_dir`` allow-lists ``.hiveweave/worktrees/``, so without
+    this check the write path would silently ``mkdir(parents=True)`` a ghost
+    nested tree (M4 — slack-clone_03 A044 start_dev_server failure).
+
+    幽灵判定（2026-08-13 审计 P1 收紧，同日复审放宽）：以 **workspace 自身**
+    为基准——相对路径中出现的 ``.hiveweave`` 段**仅当后随 ``worktrees`` 段**
+    且（workspace 自身已在 worktree 内，或项目根 workspace 已见过首个合法
+    ``worktrees`` 段）才算幽灵：
+    - 同 id 重复：``…/worktrees/<id>/.hiveweave/worktrees/<id>/…``
+    - 跨 id：``…/worktrees/A044/.hiveweave/worktrees/A045/…``（不同 id 各
+      一次，同 id 计数法漏判，实测可无限交替加深幽灵树）
+    ``.hiveweave/shared|tool_outputs|reports|…`` 段**不判幽灵**：worktree
+    workspace 内的 agent 必须能读写平台自管目录——executor 把大工具输出落盘
+    ``<ws>/.hiveweave/tool_outputs/`` 并回传句柄，见 .hiveweave 就拒会切断
+    该契约（复审 P1）。返回触发幽灵的段名或 None。
+    """
+    try:
+        ws = Path(workspace_path).resolve()
+        full = Path(full_path).resolve()
+    except (OSError, ValueError):
+        return None
+    try:
+        rel_parts = full.relative_to(ws).parts
+    except ValueError:
+        return None
+    # workspace 自身是否已在 worktree 内（<project>/.hiveweave/worktrees/<id>）
+    ws_cf = [p.casefold() for p in ws.parts]
+    ws_in_worktree = any(
+        ws_cf[i] == ".hiveweave" and ws_cf[i + 1] == "worktrees"
+        for i in range(len(ws_cf) - 1)
+    )
+    cf = [p.casefold() for p in rel_parts]
+    seen_wt = False  # 已见过 .hiveweave/worktrees 段（项目根 workspace 首个合法）
+    i = 0
+    while i < len(cf):
+        if cf[i] != ".hiveweave":
+            i += 1
+            continue
+        if i + 1 < len(cf) and cf[i + 1] == "worktrees":
+            # .hiveweave/worktrees/<id> 段：
+            # - workspace 自身已在 worktree 内 → 相对路径再现 worktrees
+            #   前缀 = 幽灵嵌套（同 id / 跨 id / 多层交替全拦）
+            # - 项目根 workspace → 首个合法（单次出现），再现 = 幽灵
+            if ws_in_worktree or seen_wt:
+                return rel_parts[i]
+            seen_wt = True
+            i += 2
+            continue
+        # .hiveweave/shared|tool_outputs|reports|… 段：合法（平台自管目录，
+        # worktree 内 agent 也必须能读 tool_outputs 落盘句柄）——不判幽灵
+        i += 1
+        continue
+    return None
+
+
+def _resolve_safe_detail(
+    workspace_path: str, file_path: str
+) -> tuple[str | None, str | None]:
+    """Like _resolve_safe, but reports *why* resolution failed.
+
+    hint is non-None only when the path repeats the worktree prefix (ghost
+    nest) — callers surface it as a clear error instead of a generic sandbox
+    violation.
     """
     if not file_path:
-        return None
+        return None, None
     file_path = normalize_input_path(file_path)
     try:
         ws = Path(workspace_path).resolve()
@@ -129,7 +195,7 @@ def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
                 rel = abs_cand.relative_to(ws)
                 full = ws / rel
             except ValueError:
-                return None
+                return None, None
         else:
             full = (ws / file_path).resolve()
         # Re-check via relative_to
@@ -137,10 +203,63 @@ def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
             try:
                 full.relative_to(ws)
             except ValueError:
-                return None
-        return str(full)
+                return None, None
+        # 报错优先于 _check_hiveweave_dir 放行：双重 worktree 前缀 → 拒绝（M4）
+        if _double_worktree_prefix(str(ws), str(full)) is not None:
+            return None, (
+                f"疑似重复 worktree 前缀路径：{file_path}"
+                "（应为相对 worktree 或项目根的路径）"
+            )
+        return str(full), None
     except (OSError, ValueError):
+        return None, None
+
+
+def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
+    """Resolve file_path against workspace and ensure it stays inside (WRITE sandbox).
+
+    Returns the absolute path string, or None if the path escapes the sandbox
+    or repeats the worktree prefix (ghost-nest path, M4).
+    """
+    full, hint = _resolve_safe_detail(workspace_path, file_path)
+    if hint is not None:
         return None
+    return full
+
+
+def _resolve_for_read_detail(
+    write_workspace: str,
+    file_path: str,
+    project_root: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Like resolve_for_read, but reports *why* resolution failed.
+
+    hint is non-None only when the path repeats the worktree prefix (ghost
+    nest) — callers surface it as a clear error instead of a generic sandbox
+    violation.
+    """
+    root = Path(project_root or infer_project_root(write_workspace)).resolve()
+    write_ws = Path(write_workspace).resolve()
+    if not file_path:
+        return str(write_ws), None
+    file_path = normalize_input_path(file_path)
+    try:
+        candidate = Path(file_path)
+        if candidate.is_absolute():
+            full = candidate.resolve()
+        else:
+            full = (write_ws / file_path).resolve()
+        if full != root:
+            full.relative_to(root)
+        # 报错优先于 _check_hiveweave_dir 放行：双重 worktree 前缀 → 拒绝（M4）
+        if _double_worktree_prefix(str(write_ws), str(full)) is not None:
+            return None, (
+                f"疑似重复 worktree 前缀路径：{file_path}"
+                "（应为相对 worktree 或项目根的路径）"
+            )
+        return str(full), None
+    except (OSError, ValueError):
+        return None, None
 
 
 def resolve_for_read(
@@ -154,23 +273,14 @@ def resolve_for_read(
     but the final path may land anywhere under the project root — so an
     executor can read main / sibling worktrees via ``../…`` while keeping
     ``src/foo`` pointing at their own worktree copy.
+
+    Returns None if the path escapes the project or repeats the worktree
+    prefix (ghost-nest path, M4).
     """
-    root = Path(project_root or infer_project_root(write_workspace)).resolve()
-    write_ws = Path(write_workspace).resolve()
-    if not file_path:
-        return str(write_ws)
-    file_path = normalize_input_path(file_path)
-    try:
-        candidate = Path(file_path)
-        if candidate.is_absolute():
-            full = candidate.resolve()
-        else:
-            full = (write_ws / file_path).resolve()
-        if full != root:
-            full.relative_to(root)
-        return str(full)
-    except (OSError, ValueError):
+    full, hint = _resolve_for_read_detail(write_workspace, file_path, project_root)
+    if hint is not None:
         return None
+    return full
 
 
 def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
@@ -268,7 +378,10 @@ async def read_file(
                 "error": "Error: filePath is required"}
 
     root = project_root or infer_project_root(workspace_path)
-    full = resolve_for_read(workspace_path, file_path, root)
+    full, hint = _resolve_for_read_detail(workspace_path, file_path, root)
+    if hint is not None:
+        return {"success": False, "output": "", "error": f"Error: {hint}",
+                "blocked": True}
     if full is None:
         return {"success": False, "output": "",
                 "error": f'Error: Sandbox violation — "{file_path}" '
@@ -355,7 +468,10 @@ async def write_file(
         return {"success": False, "output": "",
                 "error": "Error: content is required"}
 
-    full = _resolve_safe(workspace_path, file_path)
+    full, hint = _resolve_safe_detail(workspace_path, file_path)
+    if hint is not None:
+        return {"success": False, "output": "", "error": f"Error: {hint}",
+                "blocked": True}
     if full is None:
         return {"success": False, "output": "",
                 "error": f'Error: Sandbox violation — "{file_path}" '
@@ -411,7 +527,10 @@ async def list_files(
     depth = max(1, min(maxdepth, 3)) if recursive else 1
 
     if path:
-        full = resolve_for_read(workspace_path, path, root)
+        full, hint = _resolve_for_read_detail(workspace_path, path, root)
+        if hint is not None:
+            return {"success": False, "output": "", "error": f"Error: {hint}",
+                    "blocked": True}
         if full is None:
             return {"success": False, "output": "",
                     "error": "Error: Sandbox violation - "
@@ -593,6 +712,9 @@ async def read_file_tool(params: ReadFileParams, agent_id: str, workspace: str) 
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])
+    # 复审 P2-2：包装器必须透传 blocked（护栏拒绝语义），与 bash_tool 对齐
+    if result.get("blocked"):
+        return ToolResult.blocked_err(result.get("error", "Unknown error"))
     return ToolResult.err(result.get("error", "Unknown error"))
 
 
@@ -612,6 +734,9 @@ async def write_file_tool(params: WriteFileParams, agent_id: str, workspace: str
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])
+    # 复审 P2-2：包装器必须透传 blocked（护栏拒绝语义），与 bash_tool 对齐
+    if result.get("blocked"):
+        return ToolResult.blocked_err(result.get("error", "Unknown error"))
     return ToolResult.err(result.get("error", "Unknown error"))
 
 
@@ -635,4 +760,7 @@ async def list_files_tool(params: ListFilesParams, agent_id: str, workspace: str
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])
+    # 复审 P2-2：包装器必须透传 blocked（护栏拒绝语义），与 bash_tool 对齐
+    if result.get("blocked"):
+        return ToolResult.blocked_err(result.get("error", "Unknown error"))
     return ToolResult.err(result.get("error", "Unknown error"))
