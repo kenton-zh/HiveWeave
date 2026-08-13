@@ -22,6 +22,9 @@ from hiveweave.db import project as project_db
 
 log = structlog.get_logger(__name__)
 
+# ── Locked writes（per-workspace 写锁纪律，TEST18 审计 S1）─────────────
+from hiveweave.db.project import execute_by_project
+
 
 async def _conn(project_id: str) -> aiosqlite.Connection:
     """Resolve project_id to per-project DB connection."""
@@ -54,13 +57,12 @@ class WorkLogService:
         else:
             details_json = json.dumps(details, ensure_ascii=False)
 
-        conn = await _conn(project_id)
-        await conn.execute(
+        await execute_by_project(
+            project_id,
             "INSERT INTO work_logs (id, agent_id, project_id, session_id, type, "
             "summary, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [log_id, agent_id, project_id, session_id, log_type,
              summary, details_json, now_ms])
-        await conn.commit()
         log.info("work_log_written", agent_id=agent_id, log_type=log_type,
                  summary=summary[:80])
         return log_id

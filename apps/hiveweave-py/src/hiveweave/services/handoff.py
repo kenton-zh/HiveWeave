@@ -26,6 +26,7 @@ from hiveweave.db import meta as meta_db
 from hiveweave.db.project import (
     ProjectDbError,
     ensure_project_db,
+    execute_by_project,
     get_workspace_write_lock,
 )
 
@@ -62,9 +63,31 @@ async def _query(project_id: str, sql: str, params: list | None = None) -> list:
 
 
 async def _execute(project_id: str, sql: str, params: list | None = None) -> None:
-    conn = await _conn(project_id)
-    await conn.execute(sql, params or [])
-    await conn.commit()
+    await execute_by_project(project_id, sql, params)
+
+
+async def _execute_rowcount(
+    project_id: str, sql: str, params: list | None = None
+) -> int:
+    """同纪律单语句写 + 返回 rowcount（execute_by_project 不返回 rowcount）。"""
+    workspace = await meta_db.get_project_workspace(project_id)
+    if not workspace:
+        raise ProjectDbError(f"Workspace not found for project {project_id}")
+    lock = await get_workspace_write_lock(workspace)
+    async with lock:
+        conn = await ensure_project_db(workspace)
+        try:
+            cur = await conn.execute(sql, params or [])
+            n = cur.rowcount or 0
+            await conn.commit()
+            await cur.close()
+            return n
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
 
 
 async def _ensure_schema(project_id: str) -> None:
@@ -129,26 +152,20 @@ class HandoffService:
         """Accept all pending handoffs for an agent (pending → accepted). Returns count."""
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
-        conn = await _conn(project_id)
-        cursor = await conn.execute(
+        count = await _execute_rowcount(
+            project_id,
             "UPDATE handoffs SET status = 'accepted', updated_at = ? "
             "WHERE to_agent_id = ? AND status = 'pending'", [now_ms, agent_id])
-        await conn.commit()
-        count = max(cursor.rowcount, 0)
-        await cursor.close()
-        return count
+        return max(count, 0)
 
     async def complete_handoff(self, project_id: str, handoff_id: str) -> bool:
         """Complete a handoff (accepted → completed). Only accepted can be completed."""
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
-        conn = await _conn(project_id)
-        cursor = await conn.execute(
+        ok = await _execute_rowcount(
+            project_id,
             "UPDATE handoffs SET status = 'completed', updated_at = ? "
-            "WHERE id = ? AND status = 'accepted'", [now_ms, handoff_id])
-        await conn.commit()
-        ok = cursor.rowcount > 0
-        await cursor.close()
+            "WHERE id = ? AND status = 'accepted'", [now_ms, handoff_id]) > 0
         log.info("handoff_complete", handoff_id=handoff_id, completed=ok)
         return ok
 
@@ -190,13 +207,10 @@ class HandoffService:
         """Approve a handoff (completed → approved, terminal state)."""
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
-        conn = await _conn(project_id)
-        cursor = await conn.execute(
+        ok = await _execute_rowcount(
+            project_id,
             "UPDATE handoffs SET status = 'approved', updated_at = ? "
-            "WHERE id = ? AND status = 'completed'", [now_ms, handoff_id])
-        await conn.commit()
-        ok = cursor.rowcount > 0
-        await cursor.close()
+            "WHERE id = ? AND status = 'completed'", [now_ms, handoff_id]) > 0
         log.info("handoff_approve", handoff_id=handoff_id, approved=ok)
         return ok
 
@@ -204,14 +218,11 @@ class HandoffService:
         """Reopen a handoff (completed → accepted, resets context_delivered=0)."""
         await _ensure_schema(project_id)
         now_ms = int(time.time() * 1000)
-        conn = await _conn(project_id)
-        cursor = await conn.execute(
+        ok = await _execute_rowcount(
+            project_id,
             "UPDATE handoffs SET status = 'accepted', context_delivered = 0, "
             "updated_at = ? WHERE id = ? AND status = 'completed'",
-            [now_ms, handoff_id])
-        await conn.commit()
-        ok = cursor.rowcount > 0
-        await cursor.close()
+            [now_ms, handoff_id]) > 0
         log.info("handoff_reopen", handoff_id=handoff_id, reopened=ok)
         return ok
 

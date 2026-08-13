@@ -15,9 +15,42 @@ import aiosqlite
 
 from hiveweave.config import settings
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ensure_project_db, ProjectDbError
+from hiveweave.db.project import (
+    ProjectDbError,
+    ensure_project_db,
+    get_workspace_write_lock,
+)
+from hiveweave.services.tasks.verify import is_verify_title
 
 log = structlog.get_logger(__name__)
+
+# ── Locked writes（per-workspace 写锁纪律，TEST18 审计 S1）─────────────
+from hiveweave.db.project import execute_by_project
+
+
+async def _execute_rowcount(
+    project_id: str, sql: str, params: list[Any] | None = None
+) -> int:
+    """同纪律单语句写 + 返回 rowcount（execute_by_project 不返回 rowcount）。"""
+    workspace = await meta_db.get_project_workspace(project_id)
+    if not workspace:
+        raise ProjectDbError(f"Workspace not found for project {project_id}")
+    lock = await get_workspace_write_lock(workspace)
+    async with lock:
+        conn = await ensure_project_db(workspace)
+        try:
+            cur = await conn.execute(sql, params or [])
+            n = cur.rowcount or 0
+            await conn.commit()
+            await cur.close()
+            return n
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
 
 _migrated: set[str] = set()
 
@@ -340,18 +373,17 @@ class AttestationService:
         # project 不存在（ProjectDbError）时静默跳过 schema 创建 —
         # 调用方可能在 project 尚未完全初始化时调用
         try:
-            conn = await _conn(project_id)
+            await execute_by_project(project_id, CREATE_SQL)
         except ProjectDbError:
             return
-        await conn.execute(CREATE_SQL)
         try:
-            await conn.execute(
+            await execute_by_project(
+                project_id,
                 "CREATE INDEX IF NOT EXISTS idx_tool_attestations_task "
-                "ON tool_attestations(task_id, kind)"
+                "ON tool_attestations(task_id, kind)",
             )
         except Exception:
             pass
-        await conn.commit()
         _migrated.add(project_id)
 
     async def create(
@@ -375,7 +407,6 @@ class AttestationService:
         commit: str | None = None,
     ) -> str:
         await self.ensure_schema(project_id)
-        conn = await _conn(project_id)
         now = int(time.time() * 1000)
         max_age = ttl_ms or int(
             getattr(settings, "attestation_max_age_ms", None) or DEFAULT_MAX_AGE_MS
@@ -396,7 +427,8 @@ class AttestationService:
         # short-id prefix the agent passed at creation time.
         if task_id:
             task_id = await canonical_task_id(project_id, task_id)
-        await conn.execute(
+        await execute_by_project(
+            project_id,
             "INSERT INTO tool_attestations "
             "(id, tool_call_id, task_id, agent_id, kind, command_or_url, "
             "exit_code, workspace, commit_hash, stdout_hash, artifact_hashes, "
@@ -420,7 +452,6 @@ class AttestationService:
                 project_id,
             ],
         )
-        await conn.commit()
         log.info(
             "attestation_created",
             id=att_id,
@@ -819,21 +850,18 @@ async def invalidate_valid_waivers(project_id: str, task_id: str | None) -> int:
     if not task_id:
         return 0
     await attestation_service.ensure_schema(project_id)
-    try:
-        conn = await _conn(project_id)
-    except ProjectDbError:
-        return 0
     tid = await canonical_task_id(project_id, task_id) or str(task_id)
     now = int(time.time() * 1000)
-    cur = await conn.execute(
-        "UPDATE tool_attestations SET expires_at = ? "
-        "WHERE project_id = ? AND task_id = ? AND kind = ? "
-        "AND (expires_at IS NULL OR expires_at > ?)",
-        [now, project_id, tid, WAIVER_KIND, now],
-    )
-    retired = cur.rowcount or 0
-    await conn.commit()
-    await cur.close()
+    try:
+        retired = await _execute_rowcount(
+            project_id,
+            "UPDATE tool_attestations SET expires_at = ? "
+            "WHERE project_id = ? AND task_id = ? AND kind = ? "
+            "AND (expires_at IS NULL OR expires_at > ?)",
+            [now, project_id, tid, WAIVER_KIND, now],
+        )
+    except ProjectDbError:
+        return 0
     if retired > 0:
         log.info(
             "waiver_invalidated_on_rework",
@@ -1312,8 +1340,9 @@ async def check_verify_baseline(
     Returns error string or None if OK / not applicable.
     """
     title = task.get("title") or ""
-    # TEST19 教训: 只认系统 VERIFY: 前缀, 不认 agent 自由 tag "verify"
-    is_verify = isinstance(title, str) and title.startswith("VERIFY:")
+    # TEST19 教训: 只认系统 VERIFY: 前缀, 不认 agent 自由 tag "verify"。
+    # H1 收口: 判定统一走 is_verify_title（覆盖 【】/[]/全角冒号形态）。
+    is_verify = is_verify_title(title)
     if not is_verify:
         return None
 

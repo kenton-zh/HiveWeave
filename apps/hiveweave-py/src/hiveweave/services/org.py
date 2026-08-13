@@ -27,6 +27,9 @@ from hiveweave.services.agent_router import AgentRoute, agent_router
 
 log = structlog.get_logger(__name__)
 
+# ── Locked writes（per-workspace 写锁纪律，TEST18 审计 S1）─────────────
+from hiveweave.db.project import execute_by_project
+
 
 def _fix_mojibake(s: str) -> str:
     """尝试修复双重编码的 UTF-8 字符串。
@@ -209,12 +212,12 @@ class OrgService:
             short_id = attrs.get("short_id") or await self.generate_short_id()
             vals[1] = short_id  # Fill short_id into vals list
 
-            # Write to per-project DB
-            conn = await project_db.get_project_db_by_project_id(project_id)
-            await conn.execute(
-                f"INSERT INTO agents ({col_list}) VALUES ({placeholders})", vals
+            # Write to per-project DB（per-workspace 写锁纪律）
+            await execute_by_project(
+                project_id,
+                f"INSERT INTO agents ({col_list}) VALUES ({placeholders})",
+                vals,
             )
-            await conn.commit()
 
             # Register in agent_router for routing
             workspace_path = attrs.get("workspace_path", "")

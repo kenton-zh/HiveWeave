@@ -16,7 +16,11 @@ import aiosqlite
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ProjectDbError, ensure_project_db
+from hiveweave.db.project import (
+    ProjectDbError,
+    ensure_project_db,
+    execute_by_project,
+)
 
 # ── Constants ────────────────────────────────────────────────
 
@@ -173,9 +177,22 @@ async def _query(project_id, sql, params=None):
 
 
 async def _execute(project_id, sql, params=None):
-    conn = await _conn(project_id)
-    await conn.execute(sql, params or [])
-    await conn.commit()
+    """单语句写 — 走公共 per-workspace 写锁 helper（execute_by_project）。
+
+    保留 BUG-6 tombstone 语义：workspace 缺失时先标记 tombstone 再抛
+    "Workspace not found"（tick loop 依此停摆），与旧 _conn 路径一致。
+    """
+    if is_project_tombstoned(project_id):
+        raise ProjectDbError(f"Workspace not found for project {project_id}")
+    try:
+        await execute_by_project(project_id, sql, params)
+    except ProjectDbError as e:
+        if "No workspace_path" in str(e):
+            mark_project_tombstoned(project_id)
+            raise ProjectDbError(
+                f"Workspace not found for project {project_id}"
+            ) from e
+        raise
 
 
 def _tool_quiet_cap_ms(tool_name: str) -> int:

@@ -121,19 +121,10 @@ async def test_replace_waits_sets_default_ttl(tmp_path, monkeypatch):
     """replace_waits applies default expires_at when none given."""
     svc = WaitContractService()
     now = int(time.time() * 1000)
-    created_rows: list = []
+    tx_statements: list = []
 
-    class FakeConn:
-        async def execute(self, sql, params=None):
-            if sql.strip().upper().startswith("INSERT"):
-                created_rows.append(list(params))
-            return MagicMock(rowcount=0)
-
-        async def commit(self):
-            pass
-
-    async def fake_conn(_pid):
-        return FakeConn()
+    async def fake_tx(_pid, statements):
+        tx_statements.extend(statements)
 
     async def fake_ensure(_pid):
         return None
@@ -142,7 +133,8 @@ async def test_replace_waits_sets_default_ttl(tmp_path, monkeypatch):
         "hiveweave.services.wait_contract._ensure_schema", fake_ensure
     )
     monkeypatch.setattr(
-        "hiveweave.services.wait_contract._conn", fake_conn
+        "hiveweave.services.wait_contract.execute_transaction_by_project",
+        fake_tx,
     )
 
     out = await svc.replace_waits(
@@ -154,6 +146,10 @@ async def test_replace_waits_sets_default_ttl(tmp_path, monkeypatch):
     assert len(out) == 1
     assert out[0]["expiresAt"] is not None
     assert out[0]["expiresAt"] >= now + 14 * 60 * 1000
+    # 写路径经公共 tx helper：INSERT 语句携带默认 TTL（expires_at 列）
+    inserts = [st for st in tx_statements if st[0].strip().upper().startswith("INSERT")]
+    assert inserts
+    assert inserts[0][1][6] >= now + 14 * 60 * 1000
 
 
 @pytest.mark.asyncio
@@ -183,25 +179,19 @@ async def test_clear_expired_returns_rows(monkeypatch):
             pass
 
     class FakeConn:
-        def __init__(self):
-            self.updated = False
-
         async def execute(self, sql, params=None):
-            if sql.strip().upper().startswith("SELECT"):
-                return FakeCursor()
-            self.updated = True
-            return MagicMock(rowcount=1)
+            return FakeCursor()
 
-        async def commit(self):
-            pass
-
-    conn = FakeConn()
+    updated: list = []
 
     async def fake_conn(_pid):
-        return conn
+        return FakeConn()
 
     async def fake_ensure(_pid):
         return None
+
+    async def fake_execute_by_project(_pid, sql, params=None):
+        updated.append((sql, params))
 
     monkeypatch.setattr(
         "hiveweave.services.wait_contract._ensure_schema", fake_ensure
@@ -209,11 +199,16 @@ async def test_clear_expired_returns_rows(monkeypatch):
     monkeypatch.setattr(
         "hiveweave.services.wait_contract._conn", fake_conn
     )
+    monkeypatch.setattr(
+        "hiveweave.services.wait_contract.execute_by_project",
+        fake_execute_by_project,
+    )
 
     cleared = await svc.clear_expired("p1")
     assert len(cleared) == 1
     assert cleared[0]["agentId"] == "a1"
-    assert conn.updated
+    assert updated
+    assert updated[0][1][1:] == ["w1"]
 
 
 @pytest.mark.asyncio
@@ -257,19 +252,23 @@ async def test_break_wait_cycles_clears_min_id(monkeypatch):
 
     class FakeConn:
         async def execute(self, sql, params=None):
-            if "UPDATE" in sql.upper():
-                cleared_for.append(params[1])
             return MagicMock(rowcount=1)
-
-        async def commit(self):
-            pass
 
     async def fake_conn(_pid):
         return FakeConn()
 
+    async def fake_rowcount(_pid, sql, params=None):
+        if "UPDATE" in sql.upper():
+            cleared_for.extend(params[1:])
+        return len(params[1:])
+
     monkeypatch.setattr(svc, "list_all_active", fake_list)
     monkeypatch.setattr(
         "hiveweave.services.wait_contract._conn", fake_conn
+    )
+    monkeypatch.setattr(
+        "hiveweave.services.wait_contract._execute_rowcount",
+        fake_rowcount,
     )
 
     breaks = await svc.break_wait_cycles(

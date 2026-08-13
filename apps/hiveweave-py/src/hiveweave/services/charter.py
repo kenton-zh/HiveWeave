@@ -17,7 +17,11 @@ from typing import Any
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ensure_project_db, get_project_db_by_project_id
+from hiveweave.db.project import (
+    execute_by_project,
+    execute_transaction_by_project,
+    get_project_db_by_project_id,
+)
 from hiveweave.services.agent_router import agent_router
 
 logger = structlog.get_logger()
@@ -69,27 +73,27 @@ class CharterService:
             raise ValueError(
                 f"Workspace not found for project {routed_pid}"
             )
-        conn = await ensure_project_db(workspace)
 
-        # Use per-project DB connection for transaction (DELETE + INSERT atomically)
+        # DELETE + INSERT 单事务原子写（公共 tx helper 自带写锁 + 异常回滚）
         try:
-            await conn.execute(
-                "DELETE FROM agent_charters WHERE project_id = ?",
-                [routed_pid],
+            await execute_transaction_by_project(
+                routed_pid,
+                [
+                    (
+                        "DELETE FROM agent_charters WHERE project_id = ?",
+                        [routed_pid],
+                    ),
+                    (
+                        """INSERT INTO agent_charters
+                           (id, project_id, agent_id, title, content, status,
+                            project_rules, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [charter_id, routed_pid, agent_id, title, body,
+                         status, project_rules, now, now],
+                    ),
+                ],
             )
-            await conn.execute(
-                """INSERT INTO agent_charters
-                   (id, project_id, agent_id, title, content, status,
-                    project_rules, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [charter_id, routed_pid, agent_id, title, body,
-                 status, project_rules, now, now],
-            )
-            await conn.commit()
         except Exception as e:
-            # C1 fix: 事务失败必须 rollback，否则失败的 DELETE 残留在连接上
-            # 会被后续操作的 commit 误提交，导致 charter 数据丢失
-            await conn.rollback()
             logger.error("charter.save_failed", project_id=routed_pid,
                          error=str(e))
             raise
@@ -195,9 +199,9 @@ class CharterService:
 
         # Write to project_meta.goals_json in per-project DB (agent-facing).
         # Uses UPSERT to handle the case where the project_meta row doesn't exist yet.
-        conn = await get_project_db_by_project_id(project_id)
         now = int(time.time() * 1000)
-        await conn.execute(
+        await execute_by_project(
+            project_id,
             """INSERT INTO project_meta (project_id, goals_json, updated_at)
                VALUES (?, ?, ?)
                ON CONFLICT(project_id) DO UPDATE SET
@@ -205,7 +209,6 @@ class CharterService:
                    updated_at = excluded.updated_at""",
             [project_id, goals_json, now],
         )
-        await conn.commit()
         self.touch_goals_version(project_id)
         logger.info("charter.goals_updated", project_id=project_id)
 

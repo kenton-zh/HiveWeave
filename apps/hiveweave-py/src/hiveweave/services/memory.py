@@ -330,38 +330,48 @@ class MemoryService:
             raise ProjectDbError(f"workspace not found for project {project_id}")
         write_lock = await get_workspace_write_lock(workspace)
         async with write_lock:
-            existing_id = None
-            if module_id:
-                cursor = await conn.execute(
-                    "SELECT id FROM memories "
-                    "WHERE agent_id = ? AND scope = ? AND module_id = ? "
-                    "ORDER BY updated_at DESC LIMIT 1",
-                    [agent_id, scope, module_id],
-                )
-                row = await cursor.fetchone()
-                await cursor.close()
-                if row:
-                    existing_id = row["id"]
+            try:
+                existing_id = None
+                if module_id:
+                    cursor = await conn.execute(
+                        "SELECT id FROM memories "
+                        "WHERE agent_id = ? AND scope = ? AND module_id = ? "
+                        "ORDER BY updated_at DESC LIMIT 1",
+                        [agent_id, scope, module_id],
+                    )
+                    row = await cursor.fetchone()
+                    await cursor.close()
+                    if row:
+                        existing_id = row["id"]
 
-            if existing_id:
-                # UPDATE 已有记录
-                await conn.execute(
-                    "UPDATE memories SET content = ?, type = ?, "
-                    "source_agent_id = ?, metadata = ?, updated_at = ? "
-                    "WHERE id = ?",
-                    [content, type, source_agent_id, meta_json, now_ms, existing_id],
-                )
-                mem_id = existing_id
-            else:
-                # INSERT 新记录
-                mem_id = str(uuid.uuid4())
-                await conn.execute(
-                    "INSERT INTO memories (id, agent_id, scope, module_id, type, content, "
-                    "source_agent_id, metadata, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [mem_id, agent_id, scope, module_id, type, content,
-                     source_agent_id, meta_json, now_ms, now_ms])
-            await conn.commit()
+                if existing_id:
+                    # UPDATE 已有记录
+                    await conn.execute(
+                        "UPDATE memories SET content = ?, type = ?, "
+                        "source_agent_id = ?, metadata = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        [content, type, source_agent_id, meta_json, now_ms, existing_id],
+                    )
+                    mem_id = existing_id
+                else:
+                    # INSERT 新记录
+                    mem_id = str(uuid.uuid4())
+                    await conn.execute(
+                        "INSERT INTO memories (id, agent_id, scope, module_id, type, content, "
+                        "source_agent_id, metadata, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [mem_id, agent_id, scope, module_id, type, content,
+                         source_agent_id, meta_json, now_ms, now_ms])
+                await conn.commit()
+            except Exception:
+                # 语句失败时隐式事务残留在共享连接 → 后续 BEGIN IMMEDIATE 报
+                # "cannot start a transaction within a transaction"。
+                # 回滚释放后 re-raise（同 execute_by_project 纪律）。
+                try:
+                    await conn.rollback()
+                except Exception:
+                    pass
+                raise
         # R5: 定向失效 — 只清受影响的缓存层，而非全项目
         self.invalidate(project_id, agent_id=agent_id, scope=scope,
                         module_id=module_id)
@@ -591,20 +601,34 @@ class MemoryService:
         write_lock = _write_lock or await get_workspace_write_lock(workspace)
         if write_lock.locked():
             # 调用方已持有（解散交接在锁内），直接执行，避免 async with 二次获取死锁。
-            cursor = await conn.execute(
-                "UPDATE memories SET scope = 'archive', "
-                "module_id = CASE WHEN module_id IS NULL THEN ? ELSE module_id END, "
-                "updated_at = ? WHERE agent_id = ? AND scope = 'agent'",
-                [agent_id, now_ms, agent_id])
-            await conn.commit()
-        else:
-            async with write_lock:
+            try:
                 cursor = await conn.execute(
                     "UPDATE memories SET scope = 'archive', "
                     "module_id = CASE WHEN module_id IS NULL THEN ? ELSE module_id END, "
                     "updated_at = ? WHERE agent_id = ? AND scope = 'agent'",
                     [agent_id, now_ms, agent_id])
                 await conn.commit()
+            except Exception:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    pass
+                raise
+        else:
+            async with write_lock:
+                try:
+                    cursor = await conn.execute(
+                        "UPDATE memories SET scope = 'archive', "
+                        "module_id = CASE WHEN module_id IS NULL THEN ? ELSE module_id END, "
+                        "updated_at = ? WHERE agent_id = ? AND scope = 'agent'",
+                        [agent_id, now_ms, agent_id])
+                    await conn.commit()
+                except Exception:
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        pass
+                    raise
         count = max(cursor.rowcount, 0)
         await cursor.close()
         # R5: 只清该 agent 的私有缓存（archive 层由 TTL 自然过期）
