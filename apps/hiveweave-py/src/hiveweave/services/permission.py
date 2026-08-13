@@ -16,6 +16,7 @@ from hiveweave.db import meta as meta_db
 from hiveweave.services.policy import (
     infer_role_family,
     policy_service,
+    tool_hard_deny,
 )
 
 logger = structlog.get_logger()
@@ -61,7 +62,6 @@ CEO_TOOLS = _BASE_TOOLS | frozenset({
     "git_worktree_merge", "git_worktree_remove",
     # 终验对用户说
     "message_user",
-    "start_dev_server",
 })
 
 COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
@@ -257,21 +257,24 @@ class PermissionService:
     def get_tools_for_agent(self, agent: dict[str, Any]) -> list[str]:
         family = infer_role_family(agent)
         if family == "hr":
-            return sorted(HR_TOOLS)
-        if family == "ceo":
+            names = HR_TOOLS
+        elif family == "ceo":
             # 显式 ceo 分支 —— 禁止 unknown family 落 READWRITE 兜底泄漏工具。
-            return sorted(CEO_TOOLS)
-        if family == "coordinator":
-            return sorted(COORDINATOR_BUILDER_TOOLS | COORDINATOR_ONLY_TOOLS)
-        mode = agent.get("permission_mode") or "readwrite"
-        if family == "qa":
-            return sorted(READWRITE_TOOLS)
-        if family == "executor":
-            return self.get_tools_for_mode(
+            names = CEO_TOOLS
+        elif family == "coordinator":
+            names = COORDINATOR_BUILDER_TOOLS | COORDINATOR_ONLY_TOOLS
+        elif family == "qa":
+            names = READWRITE_TOOLS
+        elif family == "executor":
+            mode = agent.get("permission_mode") or "readwrite"
+            names = set(self.get_tools_for_mode(
                 mode if mode != "readonly" else "readwrite"
-            )
-        # Unknown family — 最小暴露，不给 READWRITE 兜底。
-        return sorted(READONLY_TOOLS)
+            ))
+        else:
+            # Unknown family — 最小暴露，不给 READWRITE 兜底。
+            names = READONLY_TOOLS
+        # 工具表可见性跟硬门对齐：列在表里但 capability 不够的不要发给模型（撞门）。
+        return sorted(n for n in names if tool_hard_deny(agent, n) is None)
 
     def _parse_list(self, raw: Any) -> list[str]:
         if not raw:

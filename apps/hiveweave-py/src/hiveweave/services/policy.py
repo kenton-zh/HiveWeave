@@ -116,6 +116,12 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "git_worktree_remove": frozenset({Capability.MERGE}),
     "bash": frozenset({Capability.BASH_SHELL}),
     "run_command": frozenset({Capability.BASH_SHELL}),
+    # dev server 可执行任意命令 → 与 bash 同硬门（2026-08-13 审计：此前
+    # 无 TOOL_CAPABILITY 映射，CEO 无 bash 硬门被绕过）
+    "start_dev_server": frozenset({Capability.BASH_SHELL}),
+    "stop_processes_for_worktree": frozenset({Capability.BASH_SHELL}),
+    # 只读查注册表，不是 spawn —— 用 SOURCE_READ，避免 CEO/HR 看见工具却撞 BASH 门
+    "lookup_dev_server": frozenset({Capability.SOURCE_READ}),
     "browse": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     "assert_visual": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     "game_run_case": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
