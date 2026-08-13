@@ -36,6 +36,20 @@ def _dev_server_log_path(workspace: str, port: int) -> Path:
     return log_dir / f"dev-server-{port}.log"
 
 
+def _with_stale(records: list[ProcessRecord]) -> list[dict]:
+    """Attach ``stale: true`` to records whose cwd no longer exists.
+
+    Mark only — entries are kept in the registry (a process may still be
+    alive or the dir may come back).
+    """
+    out: list[dict] = []
+    for r in records:
+        d = r.to_dict()
+        d["stale"] = bool(r.cwd) and not Path(r.cwd).is_dir()
+        out.append(d)
+    return out
+
+
 def _read_log_tail(log_path: Path, max_bytes: int = _LOG_TAIL_BYTES) -> str:
     """Read the last ``max_bytes`` of a log file (best-effort)."""
     try:
@@ -72,7 +86,9 @@ class StartDevServerParams(BaseModel):
 @tool(
     "start_dev_server",
     "Start the project's Vite/dev server on a non-reserved port (never 5173/4000). "
-    "Registers pid/cwd/port for URL lookup. Prefer this over bare `npm run dev` / `vite`.",
+    "Registers pid/cwd/port for URL lookup. Prefer this over bare `npm run dev` / `vite`. "
+    "The spawned child process inherits only a whitelisted environment — project-specific "
+    "variables must come from `.hiveweave/env.sh` or an inline `VAR=x cmd` command prefix.",
     requires_workspace=True,
     security_level="shell",
 )
@@ -84,7 +100,7 @@ async def start_dev_server_tool(
         return ToolResult.err(f"Agent {agent_id} has no project")
 
     if is_reserved_port(params.preferred_port):
-        return ToolResult.err(
+        return ToolResult.blocked_err(
             f"Port {params.preferred_port} is reserved for HiveWeave. "
             "Use preferredPort=3000 (or another free project port)."
         )
@@ -92,14 +108,23 @@ async def start_dev_server_tool(
     port = allocate_project_port(project_id, params.preferred_port)
     work_cwd = workspace
     if params.cwd:
-        work_cwd = str((Path(workspace) / params.cwd).resolve())
-        if not work_cwd.startswith(str(Path(workspace).resolve())):
-            return ToolResult.err("cwd must stay inside workspace")
+        from hiveweave.tools.file import _resolve_safe_detail
+
+        full, hint = _resolve_safe_detail(workspace, params.cwd)
+        if hint is not None:
+            return ToolResult.blocked_err(f"Error: {hint}")
+        if full is None:
+            return ToolResult.blocked_err("cwd must stay inside workspace")
+        work_cwd = full
+    if not Path(work_cwd).is_dir():
+        return ToolResult.blocked_err(
+            f"Working directory does not exist: {work_cwd}"
+        )
 
     if params.command:
         err = check_command_reserved_ports(params.command)
         if err:
-            return ToolResult.err(err)
+            return ToolResult.blocked_err(err)
         # Inject allocated port if command has placeholder
         cmd = params.command.replace("{port}", str(port))
     else:
@@ -257,7 +282,7 @@ async def lookup_dev_server_tool(
         if hits:
             return ToolResult.ok(
                 f"Found {len(hits)} registration(s) on port {params.preferred_port}",
-                servers=[h.to_dict() for h in hits],
+                servers=_with_stale(hits),
             )
         return ToolResult.ok(
             f"No registry entry for port {params.preferred_port}",
@@ -268,5 +293,5 @@ async def lookup_dev_server_tool(
     servers = lookup_by_project(project_id)
     return ToolResult.ok(
         f"{len(servers)} registered server(s) for this project",
-        servers=[s.to_dict() for s in servers],
+        servers=_with_stale(servers),
     )
