@@ -496,8 +496,19 @@ async def execute(
     lock = await _get_write_lock(agent_id)
     async with lock:
         conn = await get_project_db_for_agent(agent_id)
-        await conn.execute(sql, params or [])
-        await conn.commit()
+        try:
+            await conn.execute(sql, params or [])
+            await conn.commit()
+        except Exception:
+            # 语句失败时隐式事务（legacy isolation_level="" 的 DML 隐式 BEGIN）
+            # 残留在共享连接 → 后续 BEGIN IMMEDIATE 报
+            # "cannot start a transaction within a transaction"（slack-clone_03 事故）。
+            # 回滚释放（rollback 自身异常吞掉）后 re-raise，同 execute_transaction。
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
 
 
 async def execute_transaction(
@@ -515,6 +526,66 @@ async def execute_transaction(
     lock = await _get_write_lock(agent_id)
     async with lock:
         conn = await get_project_db_for_agent(agent_id)
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            for sql, params in statements:
+                await conn.execute(sql, params or [])
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
+
+# ── project_id 键控的写 helpers（2026-08-13 并发审计收编）─────
+# 共享连接纪律：同一 workspace 连接上的**每个写者**，execute→commit
+# 整段必须持 per-workspace 写锁——无锁写者与锁内事务会互相击穿
+# （他人 commit 提前提交半成品 / 他人 rollback 静默丢写）。以下两个
+# 函数把该纪律封装为 project_id 键控的公共入口，供无 agent_id 上下文
+# 的服务（game_time/wait_contract/chat_message/inbox/handoff/charter/
+# roster/obligation/dispatch/org/attestation/work_log/staffing 等）复用。
+
+
+async def execute_by_project(
+    project_id: str, sql: str, params: list[Any] | None = None
+) -> None:
+    """单语句写：per-workspace 写锁 + try/rollback/re-raise（同 execute()）。
+
+    project_id → workspace 经 meta_db.get_project_workspace 解析
+    （同 services/tasks/db._execute）。workspace 缺失 raise ProjectDbError。
+    """
+    workspace_path = await meta_db.get_project_workspace(project_id)
+    if not workspace_path:
+        raise ProjectDbError(f"No workspace_path for project_id={project_id}")
+    ws = str(Path(workspace_path).resolve())
+    lock = await get_workspace_write_lock(ws)
+    async with lock:
+        conn = await ensure_project_db(ws)
+        try:
+            await conn.execute(sql, params or [])
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
+
+async def execute_transaction_by_project(
+    project_id: str, statements: list[tuple[str, list[Any] | None]]
+) -> None:
+    """多语句单事务写：写锁 + BEGIN IMMEDIATE + rollback/re-raise
+    （同 execute_transaction，按 project_id 解析 workspace）。"""
+    workspace_path = await meta_db.get_project_workspace(project_id)
+    if not workspace_path:
+        raise ProjectDbError(f"No workspace_path for project_id={project_id}")
+    ws = str(Path(workspace_path).resolve())
+    lock = await get_workspace_write_lock(ws)
+    async with lock:
+        conn = await ensure_project_db(ws)
         try:
             await conn.execute("BEGIN IMMEDIATE")
             for sql, params in statements:
