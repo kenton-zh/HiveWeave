@@ -22,6 +22,34 @@ log = structlog.get_logger(__name__)
 
 _migrated: set[str] = set()
 
+
+async def _execute_rowcount_by_agent(
+    agent_id: str, sql: str, params: list | None = None
+) -> int:
+    """同纪律单语句写（agent 键控）+ 返回 rowcount。
+
+    与 db/project.execute 同纪律：per-workspace 写锁 + 异常 rollback/re-raise。
+    锁解析镜像 _get_write_lock（get_project_db_for_agent 填充映射；
+    miss 时回退 agent 级锁，仅异常/测试路径）。
+    """
+    conn = await project_db.get_project_db_for_agent(agent_id)
+    ws = project_db._agent_cache.get(agent_id) or f"agent:{agent_id}"
+    lock = await project_db.get_workspace_write_lock(ws)
+    async with lock:
+        conn = await project_db.get_project_db_for_agent(agent_id)
+        try:
+            cursor = await conn.execute(sql, params or [])
+            n = cursor.rowcount or 0
+            await conn.commit()
+            await cursor.close()
+            return int(n)
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
 # FYI-only outbox relay notifications — must NOT wake / keep watcher looping.
 # Watcher + trigger_coordinator must use the same filter (TEST6 P1-1).
 TASK_EVENT_MESSAGE_TYPE = "task_event"
@@ -790,17 +818,14 @@ class InboxService:
         await _ensure_schema(agent_id)
         placeholders = ", ".join(["?"] * len(ids))
         try:
-            conn = await project_db.get_project_db_for_agent(agent_id)
-            cursor = await conn.execute(
+            n = await _execute_rowcount_by_agent(
+                agent_id,
                 f"UPDATE inbox SET wake = 1, parked = 0 "
                 f"WHERE to_agent_id = ? AND read = 0 "
                 f"AND id IN ({placeholders})",
                 [agent_id, *ids],
             )
-            await conn.commit()
-            n = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-            await cursor.close()
-            return int(n)
+            return n
         except Exception as e:
             log.warning("inbox_ensure_wake_failed", agent_id=agent_id, error=str(e))
             return 0
@@ -840,15 +865,12 @@ class InboxService:
             if not park_ids:
                 return 0
             placeholders = ", ".join(["?"] * len(park_ids))
-            conn = await project_db.get_project_db_for_agent(agent_id)
-            cursor = await conn.execute(
+            n = await _execute_rowcount_by_agent(
+                agent_id,
                 f"UPDATE inbox SET wake = 0, parked = 1 "
                 f"WHERE to_agent_id = ? AND id IN ({placeholders})",
                 [agent_id, *park_ids],
             )
-            await conn.commit()
-            n = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-            await cursor.close()
             if n:
                 log.info("inbox_parked", agent_id=agent_id, count=n)
             return int(n)
@@ -874,16 +896,13 @@ class InboxService:
         await _ensure_schema(agent_id)
         try:
             placeholders = ", ".join("?" * len(ids))
-            conn = await project_db.get_project_db_for_agent(agent_id)
-            cursor = await conn.execute(
+            n = await _execute_rowcount_by_agent(
+                agent_id,
                 f"UPDATE inbox SET wake = 0 "
                 f"WHERE to_agent_id = ? AND read = 0 "
                 f"AND COALESCE(wake, 1) = 1 AND id IN ({placeholders})",
                 [agent_id, *ids],
             )
-            await conn.commit()
-            n = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-            await cursor.close()
             if n:
                 log.info(
                     "inbox_wake_demoted",

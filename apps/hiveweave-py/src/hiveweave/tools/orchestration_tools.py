@@ -393,12 +393,12 @@ async def _send_message_core(
             if open_asks:
                 ask_ids = [r["id"] for r in open_asks]
                 placeholders = ", ".join(["?"] * len(ask_ids))
-                await conn.execute(
+                await project_db.execute(
+                    agent_id,
                     f"UPDATE inbox SET read = 1, delivered = 1, wake = 0 "
                     f"WHERE to_agent_id = ? AND id IN ({placeholders})",
                     [agent_id, *ask_ids],
                 )
-                await conn.commit()
                 log.info(
                     "reply_contract_auto_closed",
                     agent_id=agent_id,

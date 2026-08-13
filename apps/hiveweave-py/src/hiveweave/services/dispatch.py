@@ -21,7 +21,10 @@ import aiosqlite
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.db.project import ProjectDbError, ensure_project_db
+from hiveweave.db.project import (
+    ProjectDbError,
+    ensure_project_db,
+)
 from hiveweave.services.handoff import HandoffService
 from hiveweave.services.inbox import InboxService
 from hiveweave.services.task import TaskService
@@ -49,10 +52,12 @@ async def _query(project_id: str, sql: str,
 
 async def _execute(project_id: str, sql: str,
                    params: list | None = None) -> None:
-    """Execute an INSERT/UPDATE/DELETE on the per-project DB."""
-    conn = await _conn(project_id)
-    await conn.execute(sql, params or [])
-    await conn.commit()
+    """Execute an INSERT/UPDATE/DELETE on the per-project DB（写锁纪律）。"""
+    await execute_by_project(project_id, sql, params)
+
+
+# ── Locked writes（per-workspace 写锁纪律，TEST18 审计 S1）─────────────
+from hiveweave.db.project import execute_by_project
 
 
 # Columns missing from older work_logs tables

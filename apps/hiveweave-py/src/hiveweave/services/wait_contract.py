@@ -17,11 +17,44 @@ import aiosqlite
 import structlog
 
 from hiveweave.config import settings
+from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
-from hiveweave.db.project import ProjectDbError
+from hiveweave.db.project import (
+    ProjectDbError,
+    ensure_project_db,
+    get_workspace_write_lock,
+)
 from hiveweave.services.turn_result import WaitingOnItem
 
 log = structlog.get_logger(__name__)
+
+# ── Locked writes（per-workspace 写锁纪律，TEST18 审计 S1）─────────────
+from hiveweave.db.project import execute_by_project, execute_transaction_by_project
+
+
+async def _execute_rowcount(
+    project_id: str, sql: str, params: list[Any] | None = None
+) -> int:
+    """同纪律单语句写 + 返回 rowcount（execute_by_project 不返回 rowcount）。"""
+    workspace = await meta_db.get_project_workspace(project_id)
+    if not workspace:
+        raise ProjectDbError(f"Workspace not found for project {project_id}")
+    lock = await get_workspace_write_lock(workspace)
+    async with lock:
+        conn = await ensure_project_db(workspace)
+        try:
+            cur = await conn.execute(sql, params or [])
+            n = cur.rowcount or 0
+            await conn.commit()
+            await cur.close()
+            return n
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
 
 _migrated: set[str] = set()
 
@@ -86,18 +119,18 @@ async def _conn(project_id: str) -> aiosqlite.Connection:
 async def _ensure_schema(project_id: str) -> None:
     if project_id in _migrated:
         return
-    conn = await _conn(project_id)
-    if conn is None:
-        return
-    await conn.execute(CREATE_SQL)
     try:
-        await conn.execute(
+        await execute_by_project(project_id, CREATE_SQL)
+    except ProjectDbError:
+        return
+    try:
+        await execute_by_project(
+            project_id,
             "CREATE INDEX IF NOT EXISTS idx_agent_waits_agent "
-            "ON agent_waits(agent_id, cleared_at)"
+            "ON agent_waits(agent_id, cleared_at)",
         )
     except Exception:
         pass
-    await conn.commit()
     _migrated.add(project_id)
 
 
@@ -188,17 +221,18 @@ class WaitContractService:
     ) -> list[dict]:
         """Clear previous active waits and insert new ones from waiting_on."""
         await _ensure_schema(project_id)
-        try:
-            conn = await _conn(project_id)
-        except project_db.ProjectDbError:
-            return []
 
         now = int(time.time() * 1000)
-        await conn.execute(
-            "UPDATE agent_waits SET cleared_at = ? "
-            "WHERE agent_id = ? AND cleared_at IS NULL",
-            [now, agent_id],
-        )
+        # 全有或全无：先收集语句列表（纯计算、无 await），再一次 BEGIN
+        # IMMEDIATE 事务提交 — 循环内 await 会暴露"旧 wait 已清除、新 wait
+        # 半插入"的窗口（TEST18 审计 S1）。
+        statements: list[tuple[str, list[Any] | None]] = [
+            (
+                "UPDATE agent_waits SET cleared_at = ? "
+                "WHERE agent_id = ? AND cleared_at IS NULL",
+                [now, agent_id],
+            )
+        ]
 
         ver = obligation_version(obligations or [])
         created: list[dict] = []
@@ -222,24 +256,26 @@ class WaitContractService:
                 exp = int(item["expires_at"])
             if exp is None:
                 exp = now + default_ttl_ms(kind, agent_id)
-            await conn.execute(
-                "INSERT INTO agent_waits "
-                "(id, agent_id, project_id, kind, ref, wake_on, expires_at, "
-                "obligation_version, phase, note, created_at, cleared_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-                [
-                    wid,
-                    agent_id,
-                    project_id,
-                    kind,
-                    ref,
-                    json.dumps(wake_on),
-                    exp,
-                    ver,
-                    phase,
-                    note,
-                    now,
-                ],
+            statements.append(
+                (
+                    "INSERT INTO agent_waits "
+                    "(id, agent_id, project_id, kind, ref, wake_on, expires_at, "
+                    "obligation_version, phase, note, created_at, cleared_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                    [
+                        wid,
+                        agent_id,
+                        project_id,
+                        kind,
+                        ref,
+                        json.dumps(wake_on),
+                        exp,
+                        ver,
+                        phase,
+                        note,
+                        now,
+                    ],
+                )
             )
             created.append(
                 {
@@ -257,7 +293,11 @@ class WaitContractService:
                     "clearedAt": None,
                 }
             )
-        await conn.commit()
+
+        try:
+            await execute_transaction_by_project(project_id, statements)
+        except ProjectDbError:
+            return []
         log.info(
             "wait_contracts_replaced",
             agent_id=agent_id,
@@ -269,17 +309,16 @@ class WaitContractService:
 
     async def clear_waits(self, project_id: str, agent_id: str) -> int:
         await _ensure_schema(project_id)
-        conn = await _conn(project_id)
-        if conn is None:
-            return 0
         now = int(time.time() * 1000)
-        cur = await conn.execute(
-            "UPDATE agent_waits SET cleared_at = ? "
-            "WHERE agent_id = ? AND cleared_at IS NULL",
-            [now, agent_id],
-        )
-        await conn.commit()
-        return cur.rowcount or 0
+        try:
+            return await _execute_rowcount(
+                project_id,
+                "UPDATE agent_waits SET cleared_at = ? "
+                "WHERE agent_id = ? AND cleared_at IS NULL",
+                [now, agent_id],
+            )
+        except ProjectDbError:
+            return 0
 
     async def list_active(self, project_id: str, agent_id: str) -> list[dict]:
         await _ensure_schema(project_id)
@@ -322,20 +361,24 @@ class WaitContractService:
         rows = await cur.fetchall()
         await cur.close()
         now = int(time.time() * 1000)
+        statements: list[tuple[str, list[Any] | None]] = []
         n = 0
         for r in rows:
             created = int(r["created_at"] or now)
-            exp = created + default_ttl_ms(str(r["kind"] or "external"))
+            ttl = default_ttl_ms(str(r["kind"] or "external"))
+            exp = created + ttl
             # Already past → expire on next clear_expired
-            if exp > now + default_ttl_ms(str(r["kind"] or "external")):
-                exp = now + default_ttl_ms(str(r["kind"] or "external"))
-            await conn.execute(
-                "UPDATE agent_waits SET expires_at = ? WHERE id = ?",
-                [exp, r["id"]],
+            if exp > now + ttl:
+                exp = now + ttl
+            statements.append(
+                (
+                    "UPDATE agent_waits SET expires_at = ? WHERE id = ?",
+                    [exp, r["id"]],
+                )
             )
             n += 1
         if n:
-            await conn.commit()
+            await execute_transaction_by_project(project_id, statements)
         return n
 
     async def clear_expired(
@@ -368,12 +411,12 @@ class WaitContractService:
             return []
         ids = [c["id"] for c in cleared]
         placeholders = ",".join("?" * len(ids))
-        await conn.execute(
+        await execute_by_project(
+            project_id,
             f"UPDATE agent_waits SET cleared_at = ? "
             f"WHERE id IN ({placeholders})",
             [now, *ids],
         )
-        await conn.commit()
         return cleared
 
     async def break_wait_cycles(
@@ -466,18 +509,17 @@ class WaitContractService:
                 members,
                 key=lambda m: (earliest_by_member.get(m, 0), m),
             )
-            conn = await _conn(project_id)
-            if conn is None:
-                continue
             now = int(time.time() * 1000)
             placeholders = ",".join("?" * len(members))
-            cur = await conn.execute(
-                f"UPDATE agent_waits SET cleared_at = ? "
-                f"WHERE agent_id IN ({placeholders}) AND cleared_at IS NULL",
-                [now, *members],
-            )
-            await conn.commit()
-            n = cur.rowcount or 0
+            try:
+                n = await _execute_rowcount(
+                    project_id,
+                    f"UPDATE agent_waits SET cleared_at = ? "
+                    f"WHERE agent_id IN ({placeholders}) AND cleared_at IS NULL",
+                    [now, *members],
+                )
+            except ProjectDbError:
+                continue
             if n:
                 breaks.append(
                     {

@@ -20,6 +20,35 @@ from hiveweave.services.org import PERMISSION_LABEL_LEGEND, PERMISSION_TYPE_LABE
 
 log = structlog.get_logger(__name__)
 
+# ── Locked writes（per-workspace 写锁纪律，TEST18 审计 S1）─────────────
+from hiveweave.db.project import execute_by_project, execute_transaction_by_project
+
+
+async def _execute_rowcount(
+    project_id: str, sql: str, params: list | None = None
+) -> int:
+    """同纪律单语句写 + 返回 rowcount（execute_by_project 不返回 rowcount）。"""
+    workspace = await meta_db.get_project_workspace(project_id)
+    if not workspace:
+        raise project_db.ProjectDbError(
+            f"Workspace not found for project {project_id}")
+    lock = await project_db.get_workspace_write_lock(workspace)
+    async with lock:
+        conn = await project_db.ensure_project_db(workspace)
+        try:
+            cur = await conn.execute(sql, params or [])
+            n = cur.rowcount or 0
+            await conn.commit()
+            await cur.close()
+            return n
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
+
 # Idempotent migration tracking: project_ids whose schema has been checked
 _migrated: set[str] = set()
 
@@ -36,10 +65,11 @@ async def _ensure_schema(project_id: str) -> None:
     """Add missing hire_date column to personnel_records table (idempotent)."""
     if project_id in _migrated:
         return
-    conn = await _conn(project_id)
     try:
-        await conn.execute("ALTER TABLE personnel_records ADD COLUMN hire_date TEXT")
-        await conn.commit()
+        await execute_by_project(
+            project_id,
+            "ALTER TABLE personnel_records ADD COLUMN hire_date TEXT",
+        )
     except Exception:
         pass  # Column already exists — safe to ignore
     _migrated.add(project_id)
@@ -66,14 +96,13 @@ class RosterService:
         hire_date = attrs.get("hire_date", "")
         updated_by = attrs.get("updated_by", agent_id)
 
-        conn = await _conn(project_id)
-        await conn.execute(
+        await execute_by_project(
+            project_id,
             "INSERT INTO personnel_records (id, project_id, agent_id, position, "
             "department, responsibilities, status, hire_date, updated_by, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [record_id, project_id, agent_id, position, department,
              responsibilities, status, hire_date, updated_by, now_ms])
-        await conn.commit()
         log.info("roster_created", project_id=project_id, agent_id=agent_id,
                  position=position, department=department)
         return {
@@ -116,25 +145,19 @@ class RosterService:
         params.append(now_ms)
         params.extend([project_id, agent_id])
 
-        conn = await _conn(project_id)
-        cursor = await conn.execute(
+        ok = await _execute_rowcount(
+            project_id,
             f"UPDATE personnel_records SET {', '.join(fields)} "
-            f"WHERE project_id = ? AND agent_id = ?", params)
-        await conn.commit()
-        ok = cursor.rowcount > 0
-        await cursor.close()
+            f"WHERE project_id = ? AND agent_id = ?", params) > 0
         return ok
 
     async def delete(self, project_id: str, agent_id: str) -> bool:
         """Delete a personnel record by (project_id, agent_id). Returns True if deleted."""
         await _ensure_schema(project_id)
-        conn = await _conn(project_id)
-        cursor = await conn.execute(
+        ok = await _execute_rowcount(
+            project_id,
             "DELETE FROM personnel_records WHERE project_id = ? AND agent_id = ?",
-            [project_id, agent_id])
-        await conn.commit()
-        ok = cursor.rowcount > 0
-        await cursor.close()
+            [project_id, agent_id]) > 0
         return ok
 
     async def list_by_project(self, project_id: str) -> list[dict]:
@@ -168,17 +191,24 @@ class RosterService:
         hire_date = attrs.get("hire_date", "")
         updated_by = attrs.get("updated_by", agent_id)
 
-        conn = await _conn(project_id)
-        await conn.execute(
-            "DELETE FROM personnel_records WHERE project_id = ? AND agent_id = ?",
-            [project_id, agent_id])
-        await conn.execute(
-            "INSERT INTO personnel_records (id, project_id, agent_id, position, "
-            "department, responsibilities, status, hire_date, updated_by, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [record_id, project_id, agent_id, position, department,
-             responsibilities, status, hire_date, updated_by, now_ms])
-        await conn.commit()
+        # 契约 17: DELETE + INSERT 等效原子 upsert。两条语句必须单事务
+        # （TEST18 审计 S1）— INSERT 失败时 DELETE 已提交会丢人事记录。
+        await execute_transaction_by_project(
+            project_id,
+            [
+                (
+                    "DELETE FROM personnel_records WHERE project_id = ? AND agent_id = ?",
+                    [project_id, agent_id],
+                ),
+                (
+                    "INSERT INTO personnel_records (id, project_id, agent_id, position, "
+                    "department, responsibilities, status, hire_date, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [record_id, project_id, agent_id, position, department,
+                     responsibilities, status, hire_date, updated_by, now_ms],
+                ),
+            ],
+        )
         log.info("roster_upserted", project_id=project_id, agent_id=agent_id,
                  position=position, department=department)
         return "Roster updated"

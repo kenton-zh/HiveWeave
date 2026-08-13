@@ -17,8 +17,63 @@ import structlog
 
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
+from hiveweave.db.project import ProjectDbError, execute_by_project
 
 log = structlog.get_logger(__name__)
+
+
+async def _execute_rowcount_by_agent(
+    agent_id: str, sql: str, params: list | None = None
+) -> int:
+    """同纪律单语句写（agent 键控）+ 返回 rowcount。
+
+    与 db/project.execute 同纪律：per-workspace 写锁 + 异常 rollback/re-raise。
+    锁解析镜像 _get_write_lock（get_project_db_for_agent 填充映射；
+    miss 时回退 agent 级锁，仅异常/测试路径）。
+    """
+    conn = await project_db.get_project_db_for_agent(agent_id)
+    ws = project_db._agent_cache.get(agent_id) or f"agent:{agent_id}"
+    lock = await project_db.get_workspace_write_lock(ws)
+    async with lock:
+        conn = await project_db.get_project_db_for_agent(agent_id)
+        try:
+            cursor = await conn.execute(sql, params or [])
+            n = cursor.rowcount or 0
+            await conn.commit()
+            await cursor.close()
+            return int(n)
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
+
+async def _execute_rowcount(
+    project_id: str, sql: str, params: list | None = None
+) -> int:
+    """同纪律单语句写（project 键控）+ 返回 rowcount（同 execute_by_project）。"""
+    conn = await project_db.get_project_db_by_project_id(project_id)
+    # 写者必持 per-workspace 写锁（硬不变量，无降级路径）——workspace 解析
+    # 失败直接抛（与 wait_contract/roster/attestation/handoff 同款 helper 一致）。
+    workspace = await meta_db.get_project_workspace(project_id)
+    if not workspace:
+        raise ProjectDbError(f"No workspace_path for project_id={project_id}")
+    lock = await project_db.get_workspace_write_lock(workspace)
+    async with lock:
+        try:
+            cursor = await conn.execute(sql, params or [])
+            n = cursor.rowcount or 0
+            await conn.commit()
+            await cursor.close()
+            return int(n)
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
 
 
 class ChatMessageService:
@@ -111,13 +166,12 @@ class ChatMessageService:
             return False
         params.extend([agent_id, msg_id])
 
-        conn = await project_db.get_project_db_for_agent(agent_id)
-        cursor = await conn.execute(
+        ok = await _execute_rowcount_by_agent(
+            agent_id,
             f"UPDATE chat_messages SET {', '.join(fields)} "
-            f"WHERE agent_id = ? AND id = ?", params)
-        await conn.commit()
-        ok = cursor.rowcount > 0
-        await cursor.close()
+            f"WHERE agent_id = ? AND id = ?",
+            params,
+        ) > 0
         if not ok:
             log.warning(
                 "update_message_no_row",
@@ -256,8 +310,6 @@ class ChatMessageService:
         # Soft age bypasses PROCESSING protect (align with SAFETY_TIMEOUT_MS)
         cutoff = now_ms - min(soft_age_ms, hard_age_ms)
         try:
-            conn = await project_db.get_project_db_by_project_id(project_id)
-
             if protect:
                 placeholders = ", ".join("?" * len(protect))
                 sql = (
@@ -281,10 +333,7 @@ class ChatMessageService:
                 )
                 params = []
 
-            cursor = await conn.execute(sql, params)
-            cleared = cursor.rowcount or 0
-            await conn.commit()
-            await cursor.close()
+            cleared = await _execute_rowcount(project_id, sql, params)
             if cleared:
                 log.info(
                     "orphan_streaming_cleared",
@@ -382,14 +431,14 @@ class ChatMessageService:
                 if not workspace:
                     continue
                 try:
-                    conn = await project_db.ensure_project_db(workspace)
-                    await conn.execute(
+                    await execute_by_project(
+                        row["id"],
                         "UPDATE chat_messages SET is_streaming = 0, "
                         "content = CASE "
                         "  WHEN content IS NULL OR TRIM(content) = '' "
                         "  THEN '[对话被中断]' ELSE content END "
-                        "WHERE is_streaming = 1")
-                    await conn.commit()
+                        "WHERE is_streaming = 1",
+                    )
                 except Exception as e:
                     log.warning("clear_stuck_streaming_project_failed",
                                 project_id=row["id"], error=str(e))

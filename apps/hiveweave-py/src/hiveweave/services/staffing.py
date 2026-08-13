@@ -18,6 +18,9 @@ from hiveweave.db import project as project_db
 
 log = structlog.get_logger(__name__)
 
+# ── Locked writes（per-workspace 写锁纪律，TEST18 审计 S1）─────────────
+from hiveweave.db.project import execute_by_project
+
 
 class StaffingDemandService:
     """Manages staffing demands — structured hiring signals."""
@@ -34,15 +37,14 @@ class StaffingDemandService:
         demand_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
         try:
-            conn = await project_db.get_project_db_by_project_id(project_id)
-            await conn.execute(
+            await execute_by_project(
+                project_id,
                 "INSERT INTO staffing_demands "
                 "(id, project_id, role_needed, reason, task_id, priority, "
                 "status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)",
                 [demand_id, project_id, role_needed, reason[:500],
                  task_id, priority, now_ms],
             )
-            await conn.commit()
             log.info(
                 "staffing_demand_created",
                 demand_id=demand_id,
@@ -88,13 +90,12 @@ class StaffingDemandService:
         """Mark a staffing demand as fulfilled."""
         now_ms = int(time.time() * 1000)
         try:
-            conn = await project_db.get_project_db_by_project_id(project_id)
-            await conn.execute(
+            await execute_by_project(
+                project_id,
                 "UPDATE staffing_demands SET status = 'fulfilled', "
                 "fulfilled_by = ?, fulfilled_at = ? WHERE id = ?",
                 [fulfilled_by, now_ms, demand_id],
             )
-            await conn.commit()
             log.info(
                 "staffing_demand_fulfilled",
                 demand_id=demand_id,
@@ -110,13 +111,12 @@ class StaffingDemandService:
         """Cancel a staffing demand (e.g., task was abandoned)."""
         now_ms = int(time.time() * 1000)
         try:
-            conn = await project_db.get_project_db_by_project_id(project_id)
-            await conn.execute(
+            await execute_by_project(
+                project_id,
                 "UPDATE staffing_demands SET status = 'cancelled', "
                 "fulfilled_at = ? WHERE id = ?",
                 [now_ms, demand_id],
             )
-            await conn.commit()
         except Exception as e:
             log.warning("staffing_demand_cancel_failed", error=str(e))
 

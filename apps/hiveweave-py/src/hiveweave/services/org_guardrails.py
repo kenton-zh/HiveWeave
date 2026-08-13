@@ -27,6 +27,9 @@ from hiveweave.services.game_time import (
 
 log = structlog.get_logger(__name__)
 
+# ── Locked writes（per-workspace 写锁纪律，TEST18 审计 S1）─────────────
+from hiveweave.db.project import execute_by_project
+
 # Magentic-One-sized levers: small N, big radius control.
 DISMISS_QUOTA_PER_GAME_DAY = 3
 SAME_ROLE_REHIRE_COOLDOWN_GAME_DAYS = 1
@@ -105,8 +108,8 @@ async def record_dismiss(
     now_ms = int(time.time() * 1000)
     role_key = _normalize_role_key(role)
     try:
-        conn = await project_db.get_project_db_by_project_id(project_id)
-        await conn.execute(
+        await execute_by_project(
+            project_id,
             "INSERT INTO org_dismiss_log "
             "(id, project_id, agent_id, role, role_key, short_id, name, "
             " game_day, dismissed_by, dismissed_at) "
@@ -124,7 +127,6 @@ async def record_dismiss(
                 now_ms,
             ],
         )
-        await conn.commit()
         log.info(
             "org_guardrails.dismiss_recorded",
             project_id=project_id,

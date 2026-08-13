@@ -41,6 +41,13 @@ async def test_clear_orphan_streaming_spares_processing_agents(monkeypatch):
         "hiveweave.db.project.get_project_db_by_project_id",
         fake_get_db,
     )
+    async def fake_workspace(project_id: str):
+        return "C:/fake/workspace" if project_id == "proj-1" else None
+
+    monkeypatch.setattr(
+        "hiveweave.db.meta.get_project_workspace",
+        fake_workspace,
+    )
 
     cleared = await svc.clear_orphan_streaming(
         "proj-1",
@@ -89,6 +96,13 @@ async def test_clear_orphan_streaming_soft_age_bypasses_protect(monkeypatch):
         "hiveweave.db.project.get_project_db_by_project_id",
         fake_get_db,
     )
+    async def fake_workspace(project_id: str):
+        return "C:/fake/workspace" if project_id == "proj-1" else None
+
+    monkeypatch.setattr(
+        "hiveweave.db.meta.get_project_workspace",
+        fake_workspace,
+    )
 
     await svc.clear_orphan_streaming(
         "proj-1",
@@ -128,6 +142,13 @@ async def test_clear_orphan_streaming_clears_all_when_none_processing(monkeypatc
     monkeypatch.setattr(
         "hiveweave.db.project.get_project_db_by_project_id",
         fake_get_db,
+    )
+    async def fake_workspace(project_id: str):
+        return "C:/fake/workspace" if project_id == "proj-1" else None
+
+    monkeypatch.setattr(
+        "hiveweave.db.meta.get_project_workspace",
+        fake_workspace,
     )
 
     cleared = await svc.clear_orphan_streaming("proj-1", protect_agent_ids=set())
