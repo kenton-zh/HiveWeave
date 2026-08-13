@@ -37,7 +37,11 @@ REVIEW_DEADLINE_MS = 15 * 60 * 1000  # 15 minutes
 VERIFY_DEADLINE_MS = 20 * 60 * 1000  # 20 minutes
 # Dispatch registers review obligation but does not start the clock
 # (TEST18 P0-1). Submit activates by resetting to REVIEW_DEADLINE_MS.
-_REVIEW_PARKED_DEADLINE_MS = 365 * 24 * 60 * 60 * 1000  # 1 year
+# Inert placeholder (M7/H4 sweep): submit activation unconditionally resets
+# the deadline, scan_overdue skips escalation until the task is actually
+# submitted/reviewing, and claimed/running periods are covered by task-stall
+# nudges — shortening this value is a pure hygiene no-op.
+_REVIEW_PARKED_DEADLINE_MS = 2 * 60 * 60 * 1000  # 2 hours
 
 # Escalation: after deadline passes, escalate every N ms
 ESCALATION_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes between escalations
@@ -347,6 +351,14 @@ class ObligationLedger:
                 task_status = await self._task_status(
                     project_id, str(ob["task_id"])
                 )
+                if task_status is None:
+                    # Fail-open lookup miss — observable so ops can spot
+                    # ledger/task drift; skip behavior unchanged.
+                    log.warning(
+                        "obligation.review_escalate_task_missing",
+                        obligation_id=ob["id"],
+                        task_id=ob.get("task_id"),
+                    )
                 if task_status not in _REVIEW_ESCALATABLE_STATUSES:
                     log.debug(
                         "obligation.review_escalate_skipped",

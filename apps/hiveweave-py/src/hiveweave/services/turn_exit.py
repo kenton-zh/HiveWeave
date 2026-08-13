@@ -293,6 +293,13 @@ def _agent_wait_has_ask_evidence(ref: str, ctx: ExitContext) -> bool:
     Only DB-backed delivery evidence counts (messaged_refs / outbound asks).
     Tool-call argument fallback removed (audit M6) — intended recipients of a
     failed send must not satisfy the gate.
+
+    Evidence windows are NOT this-turn-only (审计 H2 更正):
+    - messaged_refs: 近 30 分钟内的送达（completion 预检窗口已并入，
+      completion.py）——跨 turn 的消息同样算证据。
+    - outbound_ask_refs: DB 全量未完结 ask。
+    与异步预检口径一致；build_exit_contract_hint 会把 30 分钟窗口规则
+    提前写进出口提示。
     """
     if _ref_in_set(ref, ctx.messaged_refs, ctx.name_by_id):
         return True
@@ -1142,7 +1149,15 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
             "exit_contract_ceo_pending_failed", agent_id=agent_id, error=str(e)
         )
     if not asks and not obligations and not wt_dirty and not ceo_pending:
-        return "【本轮出口条件】仅需提交 commit_turn"
+        return (
+            "【本轮出口条件】无未回复 ask / 未完成义务 / 未提交 worktree："
+            "仅需提交 commit_turn 收尾。\n"
+            "commit_turn 用法：commit_turn(phase='done_slice'|'waiting'|'blocked', "
+            "summary='…')——assistant 纯文本不是返回值，遗漏会触发 TURN EXIT BLOCKED。\n"
+            "⚠️ 若要用 phase='waiting' 等待某个 agent（waiting_on 声明 agent），"
+            "必须先在本轮或近 30 分钟内向该 agent 发过消息/ask，否则被 "
+            "WAIT_WITHOUT_ASK 拒绝；等待任务完成请用 commit_turn(waiting, waiting_on=[task 引用])"
+        )
     items: list[str] = ["必须提交 commit_turn"]
     if asks:
         items.append(f"未回复 ask: {len(asks)} 个（{_fmt_ids(asks)}）")
@@ -1156,5 +1171,12 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
             f"项目级待办（done_slice 前须推进）: {len(ceo_pending)} 项"
             f"（{'；'.join(ceo_pending[:3])}）"
         )
+    # 与空分支共用同一条 waiting 规则（审计 P2：此前有 ask/义务的 agent
+    # 拿不到 WAIT_WITHOUT_ASK 预告）
+    items.append(
+        "若用 phase='waiting' 等待 agent：须先在本轮或近 30 分钟向该 agent "
+        "发过消息/ask，否则 WAIT_WITHOUT_ASK 拒绝；等待任务用 "
+        "waiting_on=[task 引用]"
+    )
     body = "；".join(f"{i}) {it}" for i, it in enumerate(items, 1))
     return f"【本轮出口条件】{body}"
