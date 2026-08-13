@@ -966,7 +966,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["summary", "testsPassed"],
     },
     "review_task": {
-        "description": "Review a submitted task (reviewing → approved/rework). approve requires attestation evidence + assignee worktree context; does NOT spawn VERIFY — next call git_worktree_merge; VERIFY is created only after merge succeeds.",
+        "description": "Review a submitted task (reviewing → approved/rework). approve requires FRESH execution evidence bound to this taskId (or an ancestor task) — not bare testsPassed. BEFORE approving: run tests yourself via bash(command='<test cmd>', taskId='<this task id>') and pass them (exit=0; failed tests do not unlock the gate) — VERIFY tasks on MAIN, code tasks in the assignee's (or your own) worktree. Alternative: consume assignee/QA test_run evidence, or waive_attestation and let a DIFFERENT agent approve (sole-reviewer small team may self-approve; VERIFY waive is CEO-only). docs_only tasks: use attest_doc_review instead — no test_run needed and waive is rejected. If rejected for missing evidence, do NOT retry approve — run tests with taskId first. Does NOT spawn VERIFY — next call git_worktree_merge; VERIFY is created only after merge succeeds.",
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
             "decision": {"type": "string",
