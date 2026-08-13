@@ -21,6 +21,26 @@ _HUMAN_CREATOR_SENTINELS = frozenset({"user", "用户", "human"})
 # spawn），migrate_orphan_approved 在此窗口内不得判定孤儿。
 ORPHAN_APPROVED_GRACE_MS = 10 * 60 * 1000
 
+# H1（2026-08-13 审计）：VERIFY 单飞串行锁被标题前缀绕过 —— 实测存在
+# 「【VERIFY: M4 后端消息与互动 API】验收对象：…」形态的 VERIFY 任务
+# （LLM agent 经 create_task 伪造；crud 伪造门只拦行首 "VERIFY:"，括号
+# 包裹可穿透）。startswith("VERIFY:") 判定对括号标题失效 → claim 串行化
+# 检查（claim.py）与 _in_flight_verify_task 锁持有者识别（verify_spawn.py）
+# 双向穿透，出现双 VERIFY in-flight。所有 VERIFY 判定必须收口到 is_verify_title。
+_VERIFY_TITLE_RE = re.compile(r"^[【\[]?\s*VERIFY\s*[:：]")
+
+
+def is_verify_title(title: str | None) -> bool:
+    """True if *title* denotes a VERIFY task —— 唯一权威判定入口。
+
+    锚定行首：``VERIFY`` 前最多一个全/半角开括号，后接全/半角冒号。
+    支持 ``VERIFY: …``、``【VERIFY: …】``、``[VERIFY: …]``、``VERIFY：…``。
+    不误伤「收到 VERIFY 通知 / 关于 VERIFY 的讨论」等普通标题。
+    TEST19 教训保留：tags 不参与判定（source-gated 不可靠），标题前缀是
+    唯一可靠信号。
+    """
+    return isinstance(title, str) and bool(_VERIFY_TITLE_RE.match(title))
+
 
 def resolve_merge_owner(task: dict, fallback: str | None) -> str | None:
     """Merge 职责方：任务 creator（排除 API 人类哨兵）→ fallback（同排除）。
@@ -118,16 +138,17 @@ class VerifyMixin:
 
     @staticmethod
     def _is_verify_task(task: dict) -> bool:
-        """True only for system VERIFY tasks (title ``VERIFY:`` prefix).
+        """True only for system VERIFY tasks (title 锚定行首，走共享判定).
 
         TEST19 教训: agent 自由 tag ``verify`` 不再参与判定 —— 它曾被
         磐石用来标记普通模块验证任务, 使 14+ 处 VERIFY 特殊逻辑（隔离门/
         强制 main/sibling 清扫/claim 行为等）误伤普通实施任务。系统
         spawn（verify_spawn.py）创建的 VERIFY 任务标题始终带 ``VERIFY:``
         前缀, 收敛为单通道不丢失系统任务。
+        H1：判定收口到 ``is_verify_title``（同 claim.py 串行化检查与
+        verify_spawn.py 锁持有者识别共用），括号包裹形态不再穿透。
         """
-        title = task.get("title") or ""
-        return isinstance(title, str) and title.startswith("VERIFY:")
+        return is_verify_title(task.get("title"))
 
     @staticmethod
     def _verify_title_key(title: str | None) -> str:
@@ -135,10 +156,14 @@ class VerifyMixin:
 
         'VERIFY: 项9 演练（归零 CEO 配合）' 与
         'VERIFY: 项9 演练（重建）' 归一到 '项9 演练' —— 同目标。
+        H1：括号包裹形态（【VERIFY: x】验收对象：…）同样剥前缀与闭合括号，
+        与纯 VERIFY: 形态归一到同一 key。
         """
         t = (title or "").strip()
-        if t.startswith("VERIFY:"):
-            t = t[len("VERIFY:"):].strip()
+        m = _VERIFY_TITLE_RE.match(t)
+        if m:
+            t = t[m.end():].strip()
+        t = re.sub(r"[】\]]", " ", t)
         # 去括号块（中文/英文）
         t = re.sub(r"[（(][^（）()]*[）)]", "", t)
         return re.sub(r"\s+", " ", t).strip()
@@ -349,7 +374,7 @@ class VerifyMixin:
         except_title = (except_task or {}).get("title") or ""
         # 只有「系统 spawn 的 VERIFY: 任务」收口才触发清扫——普通
         # tags=verify 实施任务 approve 不派生清扫权（TEST19 教训）
-        if not (isinstance(except_title, str) and except_title.startswith("VERIFY:")):
+        if not is_verify_title(except_title):
             return 0
         except_key = self._verify_title_key(except_title)
         tasks = await self.list_tasks(project_id)
@@ -362,7 +387,7 @@ class VerifyMixin:
                 continue
             title = t.get("title") or ""
             # 只认系统 VERIFY: 前缀（tags 含 verify 的普通任务不是重复）
-            if not (isinstance(title, str) and title.startswith("VERIFY:")):
+            if not is_verify_title(title):
                 continue
             if self._verify_title_key(title) != except_key:
                 log.info(

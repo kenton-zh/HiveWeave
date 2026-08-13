@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -50,12 +51,21 @@ def _strip_platform_reserved_tags(
     return clean if clean else None
 
 
+# 伪造标题拒绝（H1 收口，2026-08-13）：大小写不敏感 + 括号/全角冒号形态，
+# 与 is_verify_title 的判定面一致再放宽一层（小写伪造也拦）。
+_FORGED_VERIFY_RE = re.compile(r"^[【\[]?\s*VERIFY\s*[:：]", re.IGNORECASE)
+
+
 def _reject_forged_verify_title(title: str | None, *, source: str) -> None:
-    """VERIFY: prefix is system-only (verify_spawn). Agents must not mint it."""
+    """VERIFY: prefix is system-only (verify_spawn). Agents must not mint it.
+
+    H1 收口：括号/全角冒号形态经 is_verify_title 同样拒绝；
+    大小写不敏感拒绝保留（旧行为——防小写伪造在判定收紧后成为隐形 VERIFY）。
+    """
     if source == "system":
         return
     raw = (title or "").lstrip()
-    if raw.upper().startswith("VERIFY:"):
+    if _FORGED_VERIFY_RE.match(raw):
         raise ValueError(
             "title prefix 'VERIFY:' is reserved for system-spawned verification "
             "tasks; use a normal title (verify_spawn mints VERIFY: tasks)"

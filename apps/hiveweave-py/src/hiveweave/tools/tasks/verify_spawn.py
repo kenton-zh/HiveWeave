@@ -13,6 +13,7 @@ from typing import Any
 import structlog
 
 from hiveweave.services import task as _task_svc
+from hiveweave.services.tasks.verify import is_verify_title
 from hiveweave.tools import helpers as _helpers
 
 log = structlog.get_logger(__name__)
@@ -145,7 +146,7 @@ async def _spawn_post_approve_verify_task(
     # cycles indefinitely.
     # TEST19 教训: 只认前缀 —— agent 自由 tag "verify" 不构成 VERIFY。
     parent_title = parent_task.get("title") or ""
-    if isinstance(parent_title, str) and parent_title.startswith("VERIFY:"):
+    if is_verify_title(parent_title):
         log.info(
             "verify_chain_stopped",
             parent_task_id=parent_id,
@@ -163,8 +164,7 @@ async def _spawn_post_approve_verify_task(
         # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不算）
         if (
             t.get("parent_task_id") == parent_id
-            and isinstance(t.get("title") or "", str)
-            and (t.get("title") or "").startswith("VERIFY:")
+            and is_verify_title(t.get("title"))
             and t.get("status") not in ("closed", "approved")
         ):
             try:

@@ -22,6 +22,7 @@ from pathlib import Path
 import aiosqlite
 
 from hiveweave.config import settings as app_settings
+from hiveweave.services.tasks.verify import is_verify_title
 
 RESERVED = frozenset({"verify", "mandatory", "post-merge"})
 
@@ -66,7 +67,8 @@ async def _migrate_project(ws_path: str, dry_run: bool) -> dict:
         affected = 0
         for row in rows or []:
             title = row["title"] or ""
-            if isinstance(title, str) and title.startswith("VERIFY:"):
+            # H1 收口：与运行时判定一致（覆盖 【】/[]/全角冒号形态）。
+            if is_verify_title(title):
                 continue  # 系统 VERIFY 任务保留 tag 是合法的
             new_tags, stripped = _strip(row["tags"])
             if not stripped:

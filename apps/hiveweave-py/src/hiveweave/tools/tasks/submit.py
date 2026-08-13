@@ -12,6 +12,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from hiveweave.services import task as _task_svc
+from hiveweave.services.tasks.verify import is_verify_title
 from hiveweave.tools.base import tool
 from hiveweave.tools import helpers as _helpers
 
@@ -205,7 +206,7 @@ async def _submit_preflight(
         except Exception as _fe:  # noqa: BLE001
             log.debug("submit_code_audit_filter_failed", error=str(_fe))
 
-    is_verify = (task.get("title") or "").startswith("VERIFY:")
+    is_verify = is_verify_title(task.get("title"))
     parent_policy = policy_id
     parent_tags: list = []
     if is_verify and task.get("parent_task_id"):
