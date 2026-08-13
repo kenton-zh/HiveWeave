@@ -46,8 +46,14 @@ class ReviewTaskParams(BaseModel):
 @tool(
     "review_task",
     "Review a submitted task (reviewing -> approved/rework). If task is 'submitted', starts review automatically. "
-    "approve requires valid attestation_ids in evidence (not bare testsPassed) and "
-    "assignee worktree context; does NOT spawn VERIFY — call git_worktree_merge next; "
+    "approve requires FRESH execution evidence bound to this taskId (or an ancestor task) — not bare testsPassed. "
+    "BEFORE approving: run the tests yourself via bash(command='<test cmd>', taskId='<this task id>') and pass them "
+    "(exit=0; failed tests do not unlock the gate) — VERIFY tasks: run on MAIN; code tasks: run in the assignee's "
+    "(or your own) worktree. Alternative: consume assignee/QA test_run evidence, or waive_attestation("
+    "taskId, evidenceAttestationId, reason) and let a DIFFERENT agent approve (sole-reviewer small team may "
+    "self-approve; VERIFY waive is CEO-only). docs_only tasks: use attest_doc_review instead — no test_run "
+    "needed and waive is rejected. If approve is rejected for missing evidence, do NOT retry approve — "
+    "run tests with taskId first. Does NOT spawn VERIFY — call git_worktree_merge next; "
     "VERIFY is created only after merge succeeds.",
     requires_workspace=False,
     security_level="standard",
@@ -298,6 +304,7 @@ async def review_task_tool(
                         "Cannot approve without tests_passed=true, "
                         "attestationIds (browse_e2e / test_run / doc_review), "
                         "or waive_attestation(+evidenceAttestationId). "
+                        "Do NOT retry approve without new evidence. "
                         "Prefer attest_doc_review for "
                         "document VERIFY instead of waiving."
                     )
@@ -426,6 +433,8 @@ async def review_task_tool(
                         return ToolResult.err(
                             f"Cannot approve: you lack TEST_RUN capability "
                             f"(role cannot self-produce test evidence). "
+                            f"Do NOT retry approve without new evidence — "
+                            f"use option 1 (consume) or 2 (waive) below.\n"
                             f"CEO/management path is to consume assignee/QA "
                             f"fresh test_run on this task (or its ancestors).\n"
                             f"Required kind(s): {kinds_str}. taskId={tid}.\n"
@@ -443,6 +452,8 @@ async def review_task_tool(
                     return ToolResult.err(
                         f"Cannot approve: YOU (the reviewer) have no fresh "
                         f"execution evidence on this task.\n"
+                        f"Do NOT retry approve without new evidence — run "
+                        f"the tests with taskId first (option 1 below).\n"
                         f"Required reviewer kind(s): {kinds_str}.\n"
                         f"{mismatch}\n"
                         f"Before approving, run the project's tests yourself "

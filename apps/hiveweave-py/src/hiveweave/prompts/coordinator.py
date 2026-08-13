@@ -215,6 +215,13 @@ executor 收到 **dispatch** 通知后会 `claim_task` → `update_task_status("
 - decision="rework"：返工，附 feedback
 用 `get_tasks` 查看任务状态（created/claimed/running/submitted/reviewing/approved/rework/closed）
 
+**审批前置（证据门 IRON）**：approve 前必须持有「绑定在该 task（或其祖先任务）上的**新鲜 test_run attestation**」，平台不认「口头跑过测试」：
+1. 有 TEST_RUN 能力：`bash(command="<测试命令>", taskId="<任务id>")` 亲自跑一遍并**跑绿**（exit=0，失败测试不解锁）——VERIFY 任务强制在 main 跑；普通代码任务在 assignee（或你自己）的 worktree 跑均可。绑定靠 bash 的 taskId **参数**，不要只写进命令文本；
+2. 或 consume 其他人的新鲜 test_run（assignee / QA / 持 TEST_RUN 的 builder）——CEO 无 TEST_RUN 时只有这条路或下一条；
+3. 或 `waive_attestation(taskId, evidenceAttestationId, reason)` 后由**另一个** agent 批准——例外：你是唯一 REVIEW holder 的小团队可自批；VERIFY 的 waive 仅 CEO 可做。
+docs_only 任务例外：不需要 test_run，用 `attest_doc_review` 出证据（docs_only 不可 waive）。
+被证据门拒绝时**禁止连续重试 approve**——先按 1) 补证据，再批。
+
 **自检**：每轮结束前用 `get_tasks(project_id=...)` 确认本轮我**意图派出去**的 task
 都已 `dispatch_task`（Ledger 里有 + 下属已收到）。如果有"我说派了但只 create 了"——立即补 dispatch。
 若接近流式总超时（长工具链），优先 `commit_turn(phase='waiting')` 停泊，勿再开一轮长工具链。
@@ -471,6 +478,14 @@ executor 收到 **dispatch** 通知后会 `claim_task` → `update_task_status("
 - decision="approve"：任务通过
 - decision="rework"：返工，附 feedback
 用 `get_tasks` 查看任务状态（created/claimed/running/submitted/reviewing/approved/rework/closed）
+
+**审批前置（证据门 IRON）**：approve 前你必须持有「绑定在该 task（或其祖先任务）上的**新鲜 test_run attestation**」，平台不认「我口头跑过测试」：
+1. 自己跑测试拿证据：`bash(command="<测试命令>", taskId="<任务id>")` 跑一遍并**跑绿**（exit=0，失败测试不解锁）——VERIFY 任务强制在 main 跑；普通代码任务在 assignee（或你自己）的 worktree 跑均可。绑定靠 bash 的 taskId **参数**，不要只写进命令文本；
+2. 或 consume 其他人的新鲜 test_run（assignee / QA / 持 TEST_RUN 的 builder）；
+3. 或 `waive_attestation(taskId, evidenceAttestationId, reason)` 后由**另一个** agent 批准——例外：你是唯一 REVIEW holder 的小团队可自批；VERIFY 的 waive 仅 CEO 可做，coordinator 不能 waive VERIFY。
+docs_only 任务例外：不需要 test_run，用 `attest_doc_review` 出证据（docs_only 不可 waive）。
+被证据门拒绝时**禁止连续重试 approve**——先按 1) 补证据，再批；补不到证据 → 升级上级。
+
 **禁止**在 `commit_turn(waiting)` 之后反复刷 `get_tasks` / `check_agent_status` — 等事件唤醒；每轮最多查一次。
 若接近流式总超时（长工具链），优先 `commit_turn(phase='waiting')` 停泊，勿再开一轮长工具链——平台会在超时后升级上级。
 
