@@ -392,15 +392,14 @@ def spawn_project_process(
     if err:
         return None, err, {}
 
-    child_env = os.environ.copy()
-    for key in ("PORT", "VITE_PORT"):
-        val = child_env.get(key)
-        if val and val.isdigit() and is_reserved_port(int(val)):
-            child_env.pop(key, None)
+    # 白名单 env：不 copy 父进程（会把 API 密钥带进 dev server）。
+    # 不用 bash 的 HIVEWEAVE_BASH 标记 —— spawn 不是 bash 工具。
+    from hiveweave.util.safe_env import build_child_env
+
+    child_env = build_child_env(cwd or "", bash_markers=False)
     if env:
         child_env.update(env)
     child_env.update(extra_env)
-
     creationflags = popen_kwargs.pop("creationflags", 0)
     if os.name == "nt":
         from hiveweave.util.win_subprocess import (
@@ -427,6 +426,17 @@ def spawn_project_process(
             **popen_kwargs,
         )
     except Exception as e:
+        cwd_path = Path(cwd) if cwd else None
+        log.warning(
+            "process_spawn_failed",
+            error=str(e),
+            cwd=cwd,
+            cwd_exists=str(cwd_path.exists()) if cwd_path else "n/a",
+            cwd_is_dir=str(cwd_path.is_dir()) if cwd_path else "n/a",
+            cwd_parent_exists=(
+                str(cwd_path.parent.exists()) if cwd_path else "n/a"
+            ),
+        )
         return None, f"Failed to spawn: {e}", {}
 
     meta = {
