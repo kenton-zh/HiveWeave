@@ -161,6 +161,9 @@ async def create_task(project_id: str, body: TaskCreate) -> dict:
         creator = actor.get("id") or creator
 
     try:
+        # 服务端强制 source 白名单：客户端不可传 "system"（否则穿透 VERIFY
+        # 伪造门与平台保留 tag 剥离，可铸全权 VERIFY 任务——2026-08-13 审计）。
+        source = body.source if body.source in ("agent", "user") else "user"
         task_id = await _tasks.create_task(
             project_id,
             title=body.title,
@@ -174,7 +177,7 @@ async def create_task(project_id: str, body: TaskCreate) -> dict:
             depends_on=body.dependsOn,
             expected_modules=body.expectedModules,
             tags=body.tags,
-            source=body.source,
+            source=source,
         )
     except ValueError as e:
         _raise_from_value_error(e)
