@@ -33,6 +33,13 @@ import structlog
 
 from hiveweave.conversation.store import ConversationStore, conversation_store
 from hiveweave.db import meta as meta_db
+from hiveweave.llm.retry import (
+    MAX_DELAY_MS,
+    RetryableError,
+    classify_http_error,
+    parse_retry_after_ms,
+    should_retry_exception,
+)
 from hiveweave.llm.streamer import Streamer
 from hiveweave.prompts.context import build_context_prompt
 from hiveweave.prompts.identity import build_identity_prompt
@@ -129,6 +136,154 @@ async def broadcast_agent_health(
         _agent_streaming.broadcast_agent_health(agent, health, message)
     except Exception:
         pass
+
+
+# ── review LLM 回调：受限重试（预算帽） ──────────────────────
+# review 工具整体超时 TOOL_EXECUTION_TIMEOUT_S = 120s。原实现单发无重试，
+# 上游瞬时断连（RemoteProtocolError "Server disconnected without sending a
+# response"）直接炸掉 review/run_tests。重试必须带预算帽：无脑 2 次重试最坏
+# 2×90s read + 退避 → 远超 120s，必被 asyncio.wait_for 强取消。
+# 预算决策：
+# - 首次尝试 read 固定 90s（与原单发行为一致——慢响应供应商不回退，
+#   ReadTimeout 后重试窗口必已耗尽 → 不会重试，等价于旧的 90s 单发）。
+# - 总重试窗口 45s：重试尝试 read = min(90, max(10, remaining))，随剩余
+#   预算收缩，地板 10s 保证重试尝试仍有最小可用窗口；最坏 ≈ 首读 90s +
+#   重试读 10s ≈ 100s < 120s 工具预算（ReadTimeout 触发时窗口已耗尽、
+#   直接上抛，所以 90s 首读不会叠加第二次长读）。
+# - 429/503 尊重 Retry-After（帽 MAX_DELAY_MS=30s），退避超预算则放弃重试；
+#   其余可重试错误小退避 0.5-1s。
+
+_REVIEW_LLM_RETRY_WINDOW_S = 45.0
+_REVIEW_LLM_MAX_RETRIES = 1
+_REVIEW_LLM_READ_TIMEOUT_MAX_S = 90.0
+_REVIEW_LLM_READ_TIMEOUT_MIN_S = 10.0
+_REVIEW_LLM_BACKOFF_RANGE_S = (0.5, 1.0)
+
+
+async def _review_llm_post_with_retry(
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    sem: asyncio.Semaphore,
+    *,
+    retry_window_s: float = _REVIEW_LLM_RETRY_WINDOW_S,
+    max_retries: int = _REVIEW_LLM_MAX_RETRIES,
+) -> str:
+    """带预算帽的非流式 LLM POST（首次 + 最多额外 max_retries 次重试）。
+
+    可重试：连接类异常（ConnectError/PoolTimeout/RemoteProtocolError/ReadError/
+    asyncio.TimeoutError）+ HTTP 429/5xx（读 resp 后 classify_http_error 判定，
+    raise_for_status 在 with 块内）。不可重试：其他 4xx、内容层错误（JSON 解析
+    失败等）直接上抛。每次尝试内持全局 LLM 信号量，重试之间释放。
+    """
+    import httpx
+
+    start = time.monotonic()
+    last_exc: BaseException | None = None
+    for attempt in range(max_retries + 1):
+        if attempt == 0:
+            # 首读保持 90s 原语义（慢响应供应商不回退）；预算帽只管重试窗口。
+            read_timeout = _REVIEW_LLM_READ_TIMEOUT_MAX_S
+        else:
+            remaining = retry_window_s - (time.monotonic() - start)
+            if remaining <= 0:
+                assert last_exc is not None
+                raise last_exc
+            read_timeout = min(
+                _REVIEW_LLM_READ_TIMEOUT_MAX_S,
+                max(_REVIEW_LLM_READ_TIMEOUT_MIN_S, remaining),
+            )
+        try:
+            async with sem:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(
+                        connect=10.0, read=read_timeout, write=10.0, pool=10.0
+                    )
+                ) as client:
+                    resp = await client.post(url, json=body, headers=headers)
+                    try:
+                        resp.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        classified = classify_http_error(
+                            exc.response.status_code,
+                            exc.response.text,
+                            headers=exc.response.headers,
+                        )
+                        if isinstance(classified, RetryableError):
+                            raise classified from exc
+                        raise
+            data = resp.json()
+            choices = data.get("choices", [])
+            if choices:
+                return (choices[0].get("message") or {}).get("content") or ""
+            return ""
+        except RetryableError as exc:
+            last_exc = exc
+            if attempt >= max_retries:
+                log.warning(
+                    "review_llm_retry_exhausted",
+                    attempt=attempt,
+                    status=exc.status,
+                    error=str(exc),
+                )
+                raise
+            # 现算剩余预算（首次尝试也会走到这里，循环头的 remaining 只在
+            # attempt>=1 赋值；现算同时扣掉刚失败的请求耗时，预算更准）。
+            remaining = retry_window_s - (time.monotonic() - start)
+            delay_s = _review_llm_retry_delay(exc, remaining)
+            if delay_s is None:
+                log.warning(
+                    "review_llm_retry_abandon_over_budget",
+                    attempt=attempt,
+                    remaining_s=round(remaining, 3),
+                    status=exc.status,
+                )
+                raise
+            log.info(
+                "review_llm_retry_scheduled",
+                attempt=attempt + 1,
+                delay_s=round(delay_s, 3),
+                status=exc.status,
+            )
+            await asyncio.sleep(delay_s)
+        except Exception as exc:
+            if not should_retry_exception(exc):
+                raise
+            last_exc = exc
+            if attempt >= max_retries:
+                log.warning(
+                    "review_llm_retry_exhausted_network",
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                raise
+            delay_s = random.uniform(*_REVIEW_LLM_BACKOFF_RANGE_S)
+            log.info(
+                "review_llm_retry_scheduled_network",
+                attempt=attempt + 1,
+                delay_s=round(delay_s, 3),
+                reason=type(exc).__name__,
+            )
+            await asyncio.sleep(delay_s)
+
+    assert last_exc is not None  # 循环内必返回或抛出，防御性兜底
+    raise last_exc
+
+
+def _review_llm_retry_delay(exc: RetryableError, remaining_s: float) -> float | None:
+    """计算重试退避延迟（秒）；返回 None 表示退避会耗尽预算 → 放弃重试。
+
+    429/503 尊重 Retry-After（帽 MAX_DELAY_MS=30s）；其余小退避 0.5-1s。
+    预算检查预留 read 地板（10s），保证重试尝试仍有最小可用窗口。
+    """
+    if exc.status in (429, 503):
+        retry_after_ms = parse_retry_after_ms(exc.headers)
+        if retry_after_ms is not None:
+            delay_s = min(retry_after_ms / 1000.0, MAX_DELAY_MS / 1000.0)
+            if delay_s >= remaining_s - _REVIEW_LLM_READ_TIMEOUT_MIN_S:
+                return None
+            return delay_s
+    return random.uniform(*_REVIEW_LLM_BACKOFF_RANGE_S)
 
 
 # ── Agent 类 ────────────────────────────────────────────────
@@ -1333,8 +1488,12 @@ class Agent:
         This is used by run_code_review / run_tests / request_code_audit / etc.
 
         持全局 LLM 信号量（与流式调用同帽；信号量只在 HTTP 请求级占槽，
-        tool 执行期间父 stream 已释放，无自死锁）。read 90s 留余量给
-        TOOL_EXECUTION_TIMEOUT_S(120s)，慢响应不会吃掉整个工具预算。
+        tool 执行期间父 stream 已释放，无自死锁）。
+
+        重试（_review_llm_post_with_retry）：首读固定 90s（原单发语义），
+        重试窗口 45s + 最多额外 1 次。连接类异常 / 429+5xx 可重试；其他
+        4xx 与内容层错误直接上抛。最坏 ≈ 首读 90s + 重试读 10s ≈ 100s <
+        120s 工具预算，不会被 asyncio.wait_for 强取消。
         """
         model_config = await self._get_model_config()
         if model_config is None:
@@ -1343,7 +1502,6 @@ class Agent:
         from hiveweave.llm.provider import provider_factory
         provider = provider_factory.create(model_config)
 
-        import httpx
         body = provider.build_body(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -1358,20 +1516,9 @@ class Agent:
 
         from hiveweave.llm.streamer.constants import _get_llm_semaphore
 
-        sem = _get_llm_semaphore()
-        async with sem:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0)
-            ) as client:
-                resp = await client.post(
-                    provider.build_url(), json=body, headers=headers
-                )
-            resp.raise_for_status()
-            data = resp.json()
-            choices = data.get("choices", [])
-            if choices:
-                return (choices[0].get("message") or {}).get("content") or ""
-            return ""
+        return await _review_llm_post_with_retry(
+            provider.build_url(), body, headers, _get_llm_semaphore()
+        )
 
     async def _get_tool_definitions(self) -> list[dict]:
         """获取工具定义列表（family-aware；硬能力由 PolicyService 在 evaluate 时再挡）。"""
