@@ -238,11 +238,12 @@ def _parse_review_result(raw: str) -> dict[str, Any]:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # Fallback: treat the raw text as the review summary
+    # Fallback: treat the raw text as the review summary — no automated verdict
     return {
-        "passed": True,  # Assume best — actual issues would be in text
+        "passed": None,
         "score": None,
-        "summary": f"Review completed (unstructured output):\n{raw[:2000]}",
+        "summary": ("Review completed (unstructured output — "
+                    f"no automated verdict):\n{raw[:2000]}"),
         "issues": [],
     }
 
@@ -278,7 +279,15 @@ def _format_result(result: dict[str, Any]) -> str:
     lines: list[str] = []
     score = result.get("score")
     score_str = f"{score}/100" if score is not None else "N/A"
-    lines.append(f"Passed: {result.get('passed')}")
+    passed = result.get("passed")
+    if passed is None:
+        if result.get("no_files"):
+            passed_str = "N/A — no files reviewed (no verdict)"
+        else:
+            passed_str = "N/A — no automated verdict"
+    else:
+        passed_str = str(passed)
+    lines.append(f"Passed: {passed_str}")
     lines.append(f"Score: {score_str}")
     lines.append(f"Summary: {result.get('summary', '')}")
     issues = result.get("issues") or []
@@ -324,8 +333,9 @@ async def _execute_single_review(
 
     if not files:
         return {
-            "passed": True,
+            "passed": None,
             "score": 0,
+            "no_files": True,
             "summary": (f"No files found to review. Checked: "
                         f"{_build_file_list(source_files)}"
                         + (f"\nNot found: {_build_file_list(not_found)}"
@@ -460,10 +470,11 @@ async def run_full_review(
         round(sum(scores) / len(scores)) if scores else 0
     )
     # BUG-039: overall_passed 应基于 all_results 而非 scored，
-    # 否则 passed=True 但 score=None 的子结果会被误判为 FAIL
-    overall_passed = (
-        all(r.get("passed") for r in all_results) if all_results else False
-    )
+    # 否则 passed=True 但 score=None 的子结果会被误判为 FAIL。
+    # passed is None（无文件/非结构化输出）属中性态，不参与判定。
+    verdicts = [r.get("passed") for r in all_results
+                if r.get("passed") is not None]
+    overall_passed = all(verdicts) if verdicts else None
 
     return {
         "codeReview": code_review,
@@ -514,6 +525,9 @@ async def execute_review(
         elif review_type == "full_review":
             full = await run_full_review(workspace_path, file_paths,
                                          test_files, call_llm)
+            overall_verdict = ("PASS" if full["overallPassed"] is True
+                               else "FAIL" if full["overallPassed"] is False
+                               else "N/A — no automated verdict")
             # Format the full review as a combined report
             parts = [
                 "## Code Review",
@@ -530,7 +544,7 @@ async def execute_review(
                 "",
                 "---",
                 (f'Overall Score: {full["overallScore"]}/100 — '
-                 f'{"PASS" if full["overallPassed"] else "FAIL"}'),
+                 f'{overall_verdict}'),
             ]
             return {"success": True, "output": "\n".join(parts),
                     "error": None}
