@@ -44,7 +44,7 @@ from .porcelain import (
     _porcelain_non_hiveweave_dirty,
     _porcelain_tracked_dirty,
 )
-from .reconcile import _assignee_has_open_tasks
+from .reconcile import _assignee_has_open_tasks, _try_reattach_worktree
 
 log = structlog.get_logger(__name__)
 
@@ -262,22 +262,31 @@ class MergeMixin:
                     if line.strip()
                 )
                 if not registered:
-                    log.warning(
-                        "git_worktree.merge_precondition_not_registered",
-                        short_id=short_id, path=path, branch=branch,
+                    reattached = await _try_reattach_worktree(
+                        workspace_path, short_id, path
                     )
-                    return {
-                        "success": False,
-                        "reason": "precondition_failed",
-                        "message": (
-                            f"Merge precondition failed: worktree directory "
-                            f"for {short_id} ({path}) is not registered in "
-                            f"'git worktree list'. The worktree metadata is "
-                            f"missing. Trigger worktree repair (re-create + "
-                            f"reattach) before merging."
-                        ),
-                        "branch": branch,
-                    }
+                    if reattached:
+                        log.info(
+                            "git_worktree.merge_precondition_reattached",
+                            short_id=short_id, path=path, branch=branch,
+                        )
+                    else:
+                        log.warning(
+                            "git_worktree.merge_precondition_not_registered",
+                            short_id=short_id, path=path, branch=branch,
+                        )
+                        return {
+                            "success": False,
+                            "reason": "precondition_failed",
+                            "message": (
+                                f"Merge precondition failed: worktree directory "
+                                f"for {short_id} ({path}) is not registered in "
+                                f"'git worktree list' and auto-reattach failed. "
+                                f"The directory exists; retry git_worktree_merge "
+                                f"after `git worktree repair` from the project root."
+                            ),
+                            "branch": branch,
+                        }
 
             # 3. Source must have a registered branch (not detached HEAD)
             actual_branch = await _current_branch(path)

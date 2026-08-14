@@ -349,25 +349,33 @@ async def _protected_worktree_short_ids(workspace_path: str) -> set[str]:
     if conn is None:
         return protected
     try:
-        # Assignees with non-terminal tasks — protect their actual workspace dir
+        # Assignees with non-terminal / pending-merge tasks.
+        # Protect live workspace basename when bound; if the DB path was
+        # wiped, still protect short_id so reconcile cannot rmtree the
+        # delivery tree (疏通: missing binding ≠ orphan).
         placeholders = ", ".join("?" * len(_PROTECT_TASK_STATUSES))
         cur = await conn.execute(
-            f"SELECT DISTINCT a.workspace_path FROM tasks t "
+            f"SELECT DISTINCT a.workspace_path, a.short_id FROM tasks t "
             f"JOIN agents a ON a.id = t.assignee_id "
             f"WHERE COALESCE(t.is_archived, 0) = 0 "
-            f"AND t.status IN ({placeholders}) "
-            f"AND a.workspace_path IS NOT NULL AND TRIM(a.workspace_path) != ''",
+            f"AND t.status IN ({placeholders})",
             list(_PROTECT_TASK_STATUSES),
         )
         rows = await cur.fetchall()
         await cur.close()
         for r in rows:
-            wp = (r["workspace_path"] or "").strip()
+            if hasattr(r, "keys"):
+                wp = (r["workspace_path"] or "").strip()
+                sid = (r["short_id"] or "").strip()
+            else:
+                wp = (r[0] or "").strip() if r else ""
+                sid = (r[1] or "").strip() if r and len(r) > 1 else ""
             if wp:
-                # Protect the basename of the actual workspace directory
                 basename = Path(wp).name
                 if basename:
                     protected.add(basename)
+            elif sid:
+                protected.add(sid)
     except Exception as e:
         log.warning(
             "git_worktree.reconcile_protected_lookup_failed",
@@ -505,6 +513,56 @@ async def _assignee_needs_write_worktree(
         )
         # Fail closed: allow recreate rather than block real write work
         return True
+    finally:
+        if close_raw and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _assignee_is_verify_only(
+    workspace_path: str, short_id: str
+) -> bool:
+    """True when the only in-flight work is VERIFY (cwd must be MAIN).
+
+    Idle / approved-unmerged return False — those still need the personal
+    tree if it exists. Do not use this as a signal to wipe workspace_path.
+    """
+    conn = await _project_db_if_exists(workspace_path)
+    close_raw = False
+    if conn is None:
+        conn = await _open_project_db_raw(workspace_path)
+        close_raw = conn is not None
+    if conn is None:
+        return False
+    try:
+        placeholders = ", ".join("?" * len(_IN_FLIGHT_AFTER_MERGE_STATUSES))
+        cur = await conn.execute(
+            f"SELECT t.title, t.tags FROM tasks t "
+            f"JOIN agents a ON a.id = t.assignee_id "
+            f"WHERE a.short_id = ? AND COALESCE(t.is_archived, 0) = 0 "
+            f"AND t.status IN ({placeholders})",
+            [short_id, *list(_IN_FLIGHT_AFTER_MERGE_STATUSES)],
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        saw_verify = False
+        for row in rows or []:
+            title = row[0] if not hasattr(row, "keys") else row["title"]
+            tags = row[1] if not hasattr(row, "keys") else row["tags"]
+            if _row_is_verify_task(title, tags):
+                saw_verify = True
+            else:
+                return False
+        return saw_verify
+    except Exception as e:
+        log.warning(
+            "git_worktree.verify_only_lookup_failed",
+            short_id=short_id,
+            error=str(e),
+        )
+        return False
     finally:
         if close_raw and conn is not None:
             try:

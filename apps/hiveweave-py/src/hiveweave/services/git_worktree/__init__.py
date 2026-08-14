@@ -65,6 +65,7 @@ from .service import GitWorktreeService
 from .reconcile import (
     _agent_id_for_short_id,
     _assignee_has_open_tasks,
+    _assignee_is_verify_only,
     _assignee_needs_write_worktree,
     _log_worktree_rebuild_event,
     _open_project_db_raw,
@@ -80,6 +81,7 @@ from .ensure import (
     agent_gets_write_worktree,
     ensure_executor_worktree,
     heal_project_executor_worktrees,
+    heal_workspace_binding_from_disk,
     worktree_commits_behind_main,
 )
 from .dispatch_pin import pin_dispatch_message_to_worktree
@@ -130,7 +132,9 @@ _PATCH_NAMES = frozenset({
     "_porcelain_tracked_dirty",
     "_abort_landed_merge",
     "_assignee_has_open_tasks",
+    "_assignee_is_verify_only",
     "_assignee_needs_write_worktree",
+    "heal_workspace_binding_from_disk",
 })
 
 
@@ -164,6 +168,7 @@ __all__ = [
     "quarantine_orphan_branch",
     "ensure_executor_worktree",
     "heal_project_executor_worktrees",
+    "heal_workspace_binding_from_disk",
     "agent_gets_write_worktree",
     "pin_dispatch_message_to_worktree",
     "worktree_commits_behind_main",
@@ -189,6 +194,7 @@ __all__ = [
     "_task_branch_candidate",
     "_protected_worktree_short_ids",
     "_assignee_has_open_tasks",
+    "_assignee_is_verify_only",
     "_assignee_needs_write_worktree",
     "_reject_if_markers_landed",
     "_merge_failure_result",
