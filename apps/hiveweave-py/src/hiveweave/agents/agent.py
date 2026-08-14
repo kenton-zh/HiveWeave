@@ -1558,8 +1558,10 @@ class Agent:
         recovery）。CEO/HR 强制项目根（并清掉误绑的 worktree 路径）；
         恢复失败时回退到项目根目录。
 
-        TEST6 evening P1-3: 名下只有 VERIFY（或无在途写任务）时强制项目根 —
-        VERIFY 必须在 MAIN 取证，不能落到个人 worktree 的过期 tip。
+        TEST6 evening P1-3: 名下只有 VERIFY 时本轮 cwd 走项目根（VERIFY 必须
+        在 MAIN 取证）。**不要**因此清掉 agents.workspace_path：绑定是 merge/
+        reconcile 的路标；P1-5 把「本轮走 MAIN」写成「抹掉绑定」后，approved
+        未 merge 的树会从账本消失，团队只能反复撞 merge 门。
         """
         if self._workspace_path is not None:
             return self._workspace_path
@@ -1589,27 +1591,44 @@ class Agent:
                     self._workspace_path = project_ws
                     return self._workspace_path
 
-                # VERIFY-only / idle writers → MAIN (no personal tree)
                 short_id = (agent_row.get("short_id") or "").strip()
                 if project_ws and short_id:
                     try:
                         from hiveweave.services.git_worktree import (
+                            _assignee_is_verify_only,
                             _assignee_needs_write_worktree,
+                            heal_workspace_binding_from_disk,
                         )
 
-                        if not await _assignee_needs_write_worktree(
+                        live = await heal_workspace_binding_from_disk(
+                            org, self.id, project_ws, short_id, current_ws=ws,
+                        )
+                        if live:
+                            ws = live
+                        needs_write = await _assignee_needs_write_worktree(
                             project_ws, short_id
-                        ):
-                            # P1-5: clear stale DB binding so state matches runtime
-                            if ws and "worktrees" in ws.replace("\\", "/"):
-                                try:
-                                    await org.update_agent(
-                                        self.id, {"workspace_path": None}
-                                    )
-                                except Exception:
-                                    pass
+                        )
+                        verify_only = (
+                            not needs_write
+                            and await _assignee_is_verify_only(
+                                project_ws, short_id
+                            )
+                        )
+                        if verify_only:
+                            # MAIN cwd this turn; keep durable binding
                             self._workspace_path = project_ws
                             return self._workspace_path
+                        if not needs_write:
+                            live_ok = (
+                                bool(ws)
+                                and _os.path.isdir(ws)
+                                and (_Path(ws) / ".git").exists()
+                            )
+                            if not live_ok:
+                                self._workspace_path = project_ws
+                                return self._workspace_path
+                            # idle / approved-unmerged with a live tree:
+                            # stay on the tree so merge can still find it
                     except Exception:
                         pass
 

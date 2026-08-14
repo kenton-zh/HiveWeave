@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -32,6 +33,55 @@ def agent_gets_write_worktree(agent: dict) -> bool:
     from hiveweave.services.policy import infer_role_family
 
     return infer_role_family(agent) == "coordinator"
+
+
+async def heal_workspace_binding_from_disk(
+    org: Any,
+    agent_id: str,
+    project_ws: str,
+    short_id: str,
+    current_ws: str = "",
+) -> str | None:
+    """Write ``agents.workspace_path`` back when the tree still exists.
+
+    Empty DB + live tree is a recoverable inconsistency (P1-5 used to wipe
+    the binding when routing cwd to MAIN). Merge/reconcile need the path;
+    wiping it is 堵截. Returns the live path, or None if nothing on disk.
+    """
+    sid = (short_id or "").strip()
+    if not project_ws or not sid:
+        return None
+
+    def _live(path: str) -> bool:
+        p = (path or "").strip()
+        if not p or not _has_git(p):
+            return False
+        if not _is_bound_worktree_basename(Path(p).name, sid):
+            return False
+        return _worktree_binding_under_project(p, project_ws)
+
+    if _live(current_ws):
+        return current_ws.strip()
+
+    canonical = _worktree_path(project_ws, sid)
+    for cand in [canonical, *[canonical + s for s in _RELOCATION_SUFFIXES]]:
+        if not _live(cand):
+            continue
+        try:
+            await org.update_agent(
+                agent_id,
+                {"workspace_path": cand, "worktree_error": None},
+            )
+        except Exception:
+            pass
+        log.info(
+            "worktree_binding_healed_from_disk",
+            agent_id=agent_id,
+            short_id=sid,
+            path=cand,
+        )
+        return cand
+    return None
 
 
 async def ensure_executor_worktree(
@@ -300,13 +350,18 @@ async def heal_project_executor_worktrees(project_id: str) -> dict:
     Prunes stale metadata, recreates missing worktrees, updates agents.workspace_path.
     CEO/HR rows are excluded — they are pinned to the project root.
 
-    TEST6 evening P1-2: idle writers (no in-flight tasks) are not healed —
-    otherwise heal undoes close-GC / merge teardown.
+    TEST6 evening P1-2: idle writers with no live tree are not recreated —
+    otherwise heal undoes close-GC / merge teardown. Empty DB + existing
+    tree is healed (binding write-back) without create.
     """
     from hiveweave.db import meta as meta_db
     from hiveweave.db import project as project_db
+    from hiveweave.services.org import OrgService
 
-    from .reconcile import _assignee_needs_write_worktree
+    from .reconcile import (
+        _assignee_is_verify_only,
+        _assignee_needs_write_worktree,
+    )
 
     ws = await meta_db.get_project_workspace(project_id)
     if not ws or not (Path(ws) / ".git").exists():
@@ -334,17 +389,30 @@ async def heal_project_executor_worktrees(project_id: str) -> dict:
     recovered = 0
     failed = 0
     skipped_idle = 0
+    org = OrgService()
     for a in agents:
         sid = (a["short_id"] or "").strip()
-        if sid and not await _assignee_needs_write_worktree(ws, sid):
-            skipped_idle += 1
-            log.debug(
-                "worktree_heal_skipped_no_open_tasks",
-                agent_id=a["id"],
-                short_id=sid,
-                project_id=project_id,
+        bound = (a["workspace_path"] or "").strip()
+        # 疏通: DB 空但树还在 → 写回绑定，不要当成 idle 跳过
+        if sid:
+            live = await heal_workspace_binding_from_disk(
+                org, a["id"], ws, sid, current_ws=bound,
             )
-            continue
+            if live and not bound:
+                recovered += 1
+                bound = live
+        if sid and not await _assignee_needs_write_worktree(ws, sid):
+            if await _assignee_is_verify_only(ws, sid) or not (
+                bound and _has_git(bound)
+            ):
+                skipped_idle += 1
+                log.debug(
+                    "worktree_heal_skipped_no_open_tasks",
+                    agent_id=a["id"],
+                    short_id=sid,
+                    project_id=project_id,
+                )
+                continue
         result = await ensure_executor_worktree(
             project_id,
             a["id"],

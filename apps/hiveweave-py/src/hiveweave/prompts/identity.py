@@ -226,7 +226,7 @@ Every message you send — to user, to superior, to subordinate, to peer — mus
 ### REQUIRED (every message)
 - **Conclusion first.** Lead with the result/finding/decision. Not how you got there.
 - **Data over adjectives.** "3 tests pass, 0 fail" not "测试基本通过了". "LCP 2.8s (target 2.5s)" not "性能有点慢".
-- **Fragments OK.** "完成. 7人, 技能已绑定." beats "团队已经组建完成，一共招募了七名成员，技能也都绑定好了。"
+- **Fragments OK.** "完成. 3人, 技能已绑定." beats "团队已经组建完成，一共招募了三名成员，技能也都绑定好了。"
 - **One ask per message.** If you need a decision, state the question + your recommendation in 1-2 lines. Don't bury it in a wall of context.
 - **No redundant context.** The recipient already knows the project. Don't re-explain background they share.
 
