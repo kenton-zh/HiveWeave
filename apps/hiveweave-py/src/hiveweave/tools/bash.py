@@ -618,7 +618,43 @@ def _decode_output(raw: bytes) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
-async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
+async def _kill_subprocess(proc) -> None:
+    """Kill the shell and its children (Windows process tree when possible)."""
+    pid = getattr(proc, "pid", None)
+    try:
+        if pid and sys.platform.startswith("win"):
+            from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/F",
+                "/T",
+                "/PID",
+                str(pid),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                **windows_no_window_kwargs(),
+            )
+            try:
+                await asyncio.wait_for(killer.wait(), timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2.0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _run_native(command: str, cwd: str, timeout_s: int | None) -> dict[str, Any]:
     """Execute command via the OS native shell.
 
     P1 fix(TEST11-R3): Windows 下优先使用 Git Bash（bash -c），
@@ -664,21 +700,19 @@ async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
                 "error": f"Failed to spawn shell: {exc}"}
 
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_s
-        )
+        if timeout_s is None or timeout_s <= 0:
+            stdout_bytes, stderr_bytes = await proc.communicate()
+        else:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_s
+            )
     except asyncio.TimeoutError:
-        # Force-kill the process tree
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            await proc.wait()
-        except Exception:  # noqa: BLE001
-            pass
+        await _kill_subprocess(proc)
         return {"output": "", "stdout": "", "stderr": "",
                 "exit_code": None, "timed_out": True, "error": None}
+    except asyncio.CancelledError:
+        await _kill_subprocess(proc)
+        raise
 
     stdout = _decode_output(stdout_bytes) if stdout_bytes else ""
     stderr = _decode_output(stderr_bytes) if stderr_bytes else ""
@@ -695,7 +729,7 @@ async def _run_native(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
     }
 
 
-async def _run_docker(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
+async def _run_docker(command: str, cwd: str, timeout_s: int | None) -> dict[str, Any]:
     """Execute command inside a Docker sandbox container.
 
     BASH_SANDBOX=docker enables this path. Mounts the workspace read-write
@@ -729,20 +763,19 @@ async def _run_docker(command: str, cwd: str, timeout_s: int) -> dict[str, Any]:
         return await _run_native(command, cwd, timeout_s)
 
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_s
-        )
+        if timeout_s is None or timeout_s <= 0:
+            stdout_bytes, stderr_bytes = await proc.communicate()
+        else:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_s
+            )
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            await proc.wait()
-        except Exception:  # noqa: BLE001
-            pass
+        await _kill_subprocess(proc)
         return {"output": "", "stdout": "", "stderr": "",
                 "exit_code": None, "timed_out": True, "error": None}
+    except asyncio.CancelledError:
+        await _kill_subprocess(proc)
+        raise
 
     stdout = _decode_output(stdout_bytes) if stdout_bytes else ""
     stderr = _decode_output(stderr_bytes) if stderr_bytes else ""
@@ -782,13 +815,15 @@ async def execute_bash(
     timeout_ms: int | None = None,
     use_docker: bool | None = None,
     project_id: str | None = None,
+    unbounded: bool = False,
 ) -> dict[str, Any]:
     """Execute a bash command and return {success, output, error}.
 
     Performs:
       1. Self-destructive command check (7 patterns)
       2. Sandbox validation (workdir must be within workspace)
-      3. Timeout clamping (1s..600s)
+      3. Timeout: foreground clamped 5s..600s; unbounded/timeout_ms=0 waits
+         until the process exits (background bash / job_kill).
       4. Execute (persistent sandbox > one-shot docker > native)
       5. Truncate output at 1MB (layer 2, bash-specific)
     """
@@ -840,24 +875,27 @@ async def execute_bash(
         # None = spawn failed to start; fall through to normal blocking path
         # so the agent sees the real error instead of a silent no-op.
 
-    # 3. Clamp timeout
-    if timeout_ms is None:
-        timeout_ms = DEFAULT_TIMEOUT_S * 1000
-    timeout_ms = int(timeout_ms)
-    # Heuristic: values 1-600 are likely seconds, not milliseconds
-    if 1 <= timeout_ms <= 600:
-        timeout_ms = timeout_ms * 1000
-    timeout_ms = max(5000, min(timeout_ms, MAX_TIMEOUT_S * 1000))
-    timeout_s = timeout_ms / 1000
+    # 3. Timeout: 0 / unbounded = no local deadline (background start()).
+    if unbounded or timeout_ms == 0:
+        timeout_s: float | None = 0
+    else:
+        if timeout_ms is None:
+            timeout_ms = DEFAULT_TIMEOUT_S * 1000
+        timeout_ms = int(timeout_ms)
+        # Heuristic: values 1-600 are likely seconds, not milliseconds
+        if 1 <= timeout_ms <= 600:
+            timeout_ms = timeout_ms * 1000
+        timeout_ms = max(5000, min(timeout_ms, MAX_TIMEOUT_S * 1000))
+        timeout_s = timeout_ms / 1000
 
     # 4. Choose execution backend (priority: persistent sandbox > one-shot docker > native)
     result = None
 
     # 4. Choose execution backend
     if use_docker:
-        result = await _run_docker(command, cwd, int(timeout_s))
+        result = await _run_docker(command, cwd, int(timeout_s or 0))
     else:
-        result = await _run_native(command, cwd, int(timeout_s))
+        result = await _run_native(command, cwd, int(timeout_s or 0))
 
     if result.get("error"):
         return {"success": False, "output": "",
@@ -991,10 +1029,23 @@ async def execute_run_command(
 
 # ── Pydantic models + @tool registration (Phase 2 migration) ──────
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from .base import tool
 from .result import ToolResult
+
+
+def _coerce_timeout_ms(v: Any) -> Any:
+    """LLM often passes seconds (1-600). Scale before ge=5000, matching execute_bash."""
+    if v is None or isinstance(v, bool):
+        return v
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return v
+    if 1 <= n <= 600:
+        return n * 1000
+    return n
 
 
 class BashParams(BaseModel):
@@ -1002,15 +1053,31 @@ class BashParams(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     command: str = Field(
-        description="Shell command to execute.",
+        description="The bash command to execute.",
         json_schema_extra={"aliases": ["cmd", "run"]},
     )
     timeout: int = Field(
         default=120000,
         ge=5000,
         le=600000,
-        description="Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds (e.g. 30 = 30s). Use 120000 for npm install.",
+        description=(
+            "Foreground only (5s–10min). Ignored when background=true. "
+            "Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 "
+            "are treated as seconds (e.g. 30 = 30s). The executor kills "
+            "the command on expiry."
+        ),
         json_schema_extra={"aliases": ["timeout_ms", "timeoutMs"]},
+    )
+    background: bool = Field(
+        default=False,
+        description=(
+            "Run off the org turn and return a job id immediately. "
+            "No timeout. Then commit_turn(waiting) with waiting_on; "
+            "do not poll. Woken with [BASH DONE]/[BASH FAILED]. "
+            "Stop with job_kill. Default false keeps stdout in this turn. "
+            "Do not use for vite / npm run dev."
+        ),
+        json_schema_extra={"aliases": ["bg"]},
     )
     task_id: str | None = Field(
         default=None,
@@ -1021,6 +1088,24 @@ class BashParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["taskId", "task_id"]},
     )
+
+    @field_validator("timeout", mode="before")
+    @classmethod
+    def _coerce_timeout(cls, v: Any) -> Any:
+        return _coerce_timeout_ms(v)
+
+    @field_validator("background", mode="before")
+    @classmethod
+    def _coerce_background(cls, v: Any) -> bool:
+        if v is None or v is False:
+            return False
+        if v is True:
+            return True
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return bool(v)
 
 
 class RunCommandParams(BaseModel):
@@ -1042,6 +1127,12 @@ class RunCommandParams(BaseModel):
         description="Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds.",
         json_schema_extra={"aliases": ["timeout_ms", "timeoutMs"]},
     )
+
+    @field_validator("timeout", mode="before")
+    @classmethod
+    def _coerce_timeout(cls, v: Any) -> Any:
+        return _coerce_timeout_ms(v)
+
     task_id: str | None = Field(
         default=None,
         alias="taskId",
@@ -1478,11 +1569,114 @@ async def _issue_test_run_attestation(
     return note
 
 
+async def _bash_background(
+    *,
+    params: BashParams,
+    agent_id: str,
+    cmd: str,
+    exec_ws: str,
+    project_id: str | None,
+    verify_note: str,
+    verify_tid: str | None,
+) -> ToolResult:
+    """Run bash off the org turn; attestations still issue when the job finishes."""
+    from hiveweave.services.offturn import (
+        build_waiting_on,
+        next_action_waiting,
+        resolve_assignee_task_id,
+        start_offturn_job,
+    )
+
+    blocked, reason = _validate_command_safety(cmd)
+    if blocked:
+        log.warning("bash.blocked", reason=reason, command_preview=cmd[:120])
+        return ToolResult.blocked_err(f"Error: {reason}")
+
+    port_hint = _detect_dev_server_command(cmd)
+    if port_hint is not None:
+        routed = await _run_registered_dev_server(
+            cmd, exec_ws, exec_ws, project_id, port_hint
+        )
+        if routed is not None:
+            if routed.get("success"):
+                return ToolResult.ok(routed.get("output") or "")
+            err_msg = routed.get("error") or "Dev server spawn failed"
+            if routed.get("blocked"):
+                return ToolResult.blocked_err(err_msg)
+            return ToolResult.err(err_msg)
+
+    attest_task = getattr(params, "task_id", None) or verify_tid
+    orig_command = params.command or ""
+    task_id = await resolve_assignee_task_id(
+        project_id or "", agent_id, attest_task
+    )
+
+    async def _work() -> tuple[bool, str]:
+        result = await execute_bash(
+            command=cmd,
+            workdir="",
+            workspace_path=exec_ws,
+            timeout_ms=0,
+            project_id=project_id,
+            unbounded=True,
+        )
+        _update_cwd_failure_streak(
+            agent_id, exec_ws, bool(result.get("success"))
+        )
+        out = result.get("output") or ""
+        exit_code = result.get("exit_code")
+        if exit_code is None:
+            exit_code = 0 if result.get("success") else 1
+        attest_note = ""
+        try:
+            if project_id:
+                attest_note = await _issue_test_run_attestation(
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    command=orig_command,
+                    workspace=exec_ws or "",
+                    stdout=str(out),
+                    exit_code=int(exit_code),
+                    task_id=attest_task,
+                    exec_cwd=exec_ws or "",
+                )
+        except Exception as att_err:
+            log.warning("bash_attest_issue_failed", error=str(att_err))
+        suffix = f"{verify_note}{attest_note}"
+        if result.get("success"):
+            return True, f"{out}{suffix}".strip()
+        err_msg = result.get("error") or "Command failed"
+        if suffix:
+            err_msg = f"{err_msg}{suffix}"
+        return False, err_msg
+
+    job_id = start_offturn_job(
+        kind="bash",
+        agent_id=agent_id,
+        project_id=project_id or "",
+        worktree=exec_ws or "",
+        work=_work,
+        task_id=task_id,
+    )
+    waiting_on = build_waiting_on(job_id, task_id, agent_id=agent_id)
+    return ToolResult.ok(
+        f"Bash started off the org turn (job={job_id}). "
+        f"{next_action_waiting(waiting_on)} "
+        "You will be woken with [BASH DONE] or [BASH FAILED]. "
+        "Do not nest this command inside the current LLM call.",
+        job_id=job_id,
+        waiting_on=waiting_on,
+        task_id=task_id,
+    )
+
+
 @tool(
     "bash",
-    "Executes a shell command on the local system (Git Bash on Windows). Use it to run CLI tools, scripts, git commands, or any system operation. Returns stdout and stderr of the command. For reviewer test_run binding pass taskId.\n"
-    "环境声明: Windows 宿主下优先 Git Bash（bash -c）执行，无 Git Bash 时降级 cmd /s /c（unix→cmd 近似映射），POSIX 用 bash -c；非 PowerShell，pwsh 语义（Get-Content -Tail N 等）不适用。GNU coreutils 子集可用但不保证 GNU 长选项：如 `tail --lines` 不可靠（cmd 降级路径下 tail/head 仅近似映射为 more，参数支持弱）；推荐兼容写法 `tail -n N`（GNU/BSD 均支持）。\n"
-    "Windows/Git Bash notes (TEST19): run Python via 'uv run python' (project has uv) or '.venv/Scripts/python.exe' — bare 'python' may not be on PATH. Do NOT use BSD-only flags like 'tail --ignore=' or 'head --ignore=' (GNU coreutils rejects them). Wildcards only expand if the path exists — 'hiveweav*-py' does not match. Prefer Windows paths for tools under D:/ and Git Bash paths (/d/...) for shell built-ins.",
+    "Execute a shell command and return stdout/stderr. Fresh shell each call "
+    "(cwd does not persist). Check Exit code: N. Long scripts: background=true "
+    "returns waiting_on — then commit_turn(waiting); woken with [BASH DONE] / "
+    "[BASH FAILED]. Stop with job_kill. Not PowerShell; prefer Git Bash, "
+    "tail -n N, uv run python.",
     requires_workspace=True,
     security_level="shell",
 )
@@ -1516,6 +1710,17 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
     except Exception as e:
         log.debug("verify_exec_workspace_resolve_failed", error=str(e))
         exec_ws = workspace or ""
+
+    if getattr(params, "background", False):
+        return await _bash_background(
+            params=params,
+            agent_id=agent_id,
+            cmd=cmd,
+            exec_ws=exec_ws,
+            project_id=project_id,
+            verify_note=verify_note,
+            verify_tid=verify_tid,
+        )
 
     result = await execute_bash(
         command=cmd,

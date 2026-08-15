@@ -153,6 +153,41 @@ async def test_replace_waits_sets_default_ttl(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_replace_waits_unbounded_external_has_no_ttl(monkeypatch):
+    svc = WaitContractService()
+    tx_statements: list = []
+
+    async def fake_tx(_pid, statements):
+        tx_statements.extend(statements)
+
+    async def fake_ensure(_pid):
+        return None
+
+    monkeypatch.setattr(
+        "hiveweave.services.wait_contract._ensure_schema", fake_ensure
+    )
+    monkeypatch.setattr(
+        "hiveweave.services.wait_contract.execute_transaction_by_project",
+        fake_tx,
+    )
+
+    out = await svc.replace_waits(
+        "proj",
+        "agent-a",
+        [
+            {"kind": "external", "ref": "bg-bash-abc123"},
+            {"kind": "task", "ref": "tid-1"},
+        ],
+        phase="waiting",
+    )
+    assert len(out) == 2
+    assert out[0]["expiresAt"] is None
+    assert out[1]["expiresAt"] is None
+    assert "timeout" not in out[0]["wakeOn"]
+    assert "timeout" not in out[1]["wakeOn"]
+
+
+@pytest.mark.asyncio
 async def test_clear_expired_returns_rows(monkeypatch):
     svc = WaitContractService()
     past = int(time.time() * 1000) - 1000

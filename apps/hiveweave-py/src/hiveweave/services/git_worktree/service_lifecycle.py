@@ -203,6 +203,19 @@ class LifecycleMixin:
         if not target:
             target = compute_branch_name(short_id)  # 稳定 /work 名兜底
 
+        # ⓪ Off-turn bash/subagent jobs writing this tree — join then cancel
+        # so [BASH FAILED]/[SUBAGENT FAILED] still lands.
+        try:
+            from hiveweave.services.offturn import reap_offturn_for_worktree
+
+            await reap_offturn_for_worktree(path)
+        except Exception as off_err:
+            log.warning(
+                "git_worktree.delete_offturn_reap_failed",
+                short_id=short_id,
+                error=str(off_err),
+            )
+
         # ⓪ P0-3: stop registered dev servers locking files in this worktree
         # (WinError 32 root cause — node holds node_modules open handles)
         try:

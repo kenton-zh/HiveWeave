@@ -3,12 +3,11 @@
 核心状态机: idle → processing → idle
 
 关键流程:
-1. chat(): 检查 busy/paused → 构建 messages → 启动 LLM task → 设置安全超时
+1. chat(): 检查 busy/paused → 构建 messages → 启动 LLM task（无整轮墙钟）
 2. _run_llm(): LLM 调用 + tool loop + 空响应重试
 3. _handle_completion(): 保存消息 + 标记 inbox 已读 + 自检 re-trigger
 4. _handle_empty_response(): 退避重试 [5s, 15s, 45s]，超限升级上级
-5. _handle_safety_timeout(): 10 分钟安全超时 → 清理 zombie → 与 _handle_error 统一计数；
-   未超限: inbox 保持未读 + RESUME CHECKPOINT + 冷却后恢复；超限: ACK 放弃 + 升级上级
+5. _handle_safety_timeout(): 卡住中的流 / 调用预算耗尽时的恢复账（不是 10 分钟墙钟）
 6. cancel(): 取消当前 LLM task → 清理 → 重置 idle
 
 消息布局（DeepSeek 前缀缓存友好）:
@@ -336,13 +335,13 @@ class Agent:
         self._streaming_msg_id: str | None = None
         # P0-3 streaming 僵尸检测信号：streamer 事件（delta/round/tool 起止）
         # 时间戳（ms epoch；0 = 本回合尚无活动）。健康长流的静默间隔上限为
-        # max(READ_TIMEOUT 95s, 工具超时 ≤500s)——超阈值即「卡住中的流」。
+        # max(READ_TIMEOUT 95s, 工具超时 ≤200s)——超阈值即「卡住中的流」。
         # chat_messages 无 updated_at 列，且长工具期 content 不增长
         # （TEST11 H4），DB 侧无法可靠判活，故用内存信号（PROCESSING 保护
         # 集合 list_processing() 同为内存态，语义一致）。
         self._last_stream_activity_at: float = 0.0
         # 执行中的工具：{tool_call_id: (tool_name, start_ms)}——僵尸判定按
-        # 当前工具超时 + 余量放宽（spawn_subagent 500s 不冤杀长工具）。
+        # 当前工具超时 + 余量放宽（question 200s 不冤杀长工具）。
         self._active_tools: dict[str, tuple[str, float]] = {}
         self._reply_reminder_count = 0  # expect_reply 提示次数，3 次后升级到上级
         self._REPLY_REMINDER_MAX = 3   # 即时提醒上限
@@ -484,6 +483,7 @@ class Agent:
                 "task_transition",
                 "inbox_task",
                 "verify",
+                "wait_satisfied",
             )
             or bool(opts.get("task_id"))
             or opts.get("message_type") == "task"
@@ -698,11 +698,16 @@ class Agent:
                     "wait_timeout", "wait_cycle", "wait_satisfied",
                     "message_from_ref",
                 })
-                should_clear_waits = (
-                    bool(opts.get("clear_waits"))
-                    or not opts.get("trigger")
-                    or source in _CLEAR_WAIT_SOURCES
-                )
+                # Explicit False: sibling off-turn jobs keep their waits.
+                # wait_satisfied otherwise still clears (last job).
+                if opts.get("clear_waits") is False:
+                    should_clear_waits = False
+                else:
+                    should_clear_waits = (
+                        bool(opts.get("clear_waits"))
+                        or not opts.get("trigger")
+                        or source in _CLEAR_WAIT_SOURCES
+                    )
                 if should_clear_waits:
                     try:
                         from hiveweave.services.wait_contract import (
@@ -949,6 +954,21 @@ class Agent:
                     pass
                 else:
                     raise
+
+        try:
+            from hiveweave.services.offturn import (
+                cancel_should_reap_offturn,
+                reap_offturn_for_agent,
+            )
+
+            if cancel_should_reap_offturn(reason):
+                await reap_offturn_for_agent(self.id)
+        except Exception as e:
+            log.warning(
+                "cancel_offturn_reap_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
 
         # If CancelledError path did not reset (e.g. task already done), idle now.
         if was_processing and self.status == AgentState.PROCESSING:
@@ -1719,6 +1739,7 @@ class Agent:
             and ((tc.get("function") or {}).get("name") in (
                 "send_message", "ask_agent", "notify_agent", "submit_task",
                 "review_task", "claim_task", "write_file", "edit_file", "bash",
+                "spawn_subagent",
             ))
             for tc in (tool_calls or [])
         )
@@ -1733,7 +1754,7 @@ class Agent:
             "submit_task", "review_task", "claim_task", "create_task",
             "hire_agent", "write_file", "edit_file", "bash", "apply_patch",
             "git_worktree_merge", "ask_agent", "send_message", "approve_work",
-            "reject_work", "dispatch_task",
+            "reject_work", "dispatch_task", "spawn_subagent",
         }
         names: set[str] = set()
         for tc in tool_calls or []:
@@ -2097,32 +2118,17 @@ class Agent:
     # ── 内部: 安全超时 ────────────────────────────────────────
 
     def _start_safety_timer(self) -> None:
-        """启动 10 分钟安全超时。
+        """No session wall clock.
 
-        对齐 Elixir agent.ex:664 schedule_safety_timer/1。
+        Hung LLM is the stream idle watchdog; hung tools are declared
+        timeouts or bash's own kill; stuck agents are stall/silence.
+        Do not cancel a live turn at 10 minutes.
         """
         self._cancel_safety_timer()
-        loop = asyncio.get_event_loop()
-        self._safety_timer = loop.call_later(
-            SAFETY_TIMEOUT_MS / 1000.0,
-            self._on_safety_timeout_sync,
-        )
 
     def _extend_safety_timer(self, extra_s: float) -> None:
-        """顺延父回合 safety timer：子代理 spawn 期间不挤兑父的窗口。
-
-        重新武装为 SAFETY_TIMEOUT_MS + extra_s（从当前时刻起算）。
-        真实兜底是 run_ledger 的 elapsed 预算（Task 2 的 credit）；
-        timer 只是最后一道保险，多给 extra_s 的余量。
-        """
-        if self._safety_timer is not None:
-            self._safety_timer.cancel()
-            self._safety_timer = None
-        loop = asyncio.get_event_loop()
-        self._safety_timer = loop.call_later(
-            SAFETY_TIMEOUT_MS / 1000.0 + extra_s,
-            self._on_safety_timeout_sync,
-        )
+        """No-op: session wall clock is off; spawn is already off-turn."""
+        return
 
     def _cancel_safety_timer(self) -> None:
         """取消安全定时器。"""
@@ -2139,7 +2145,7 @@ class Agent:
         log.warning(
             "safety_timeout",
             agent_id=self.id,
-            msg="10min safety timeout reached, force cancelling LLM task",
+            msg="safety timeout callback cancelling LLM task",
         )
         self._cancel_reason = "safety_timeout"
         if self._llm_task and not self._llm_task.done():
@@ -2151,7 +2157,7 @@ class Agent:
         与 _handle_error 统一的非致命中断策略（计数 + 冷却 resume + 超限放弃）:
         - 未超限: 不 ACK inbox（消息保持未读）+ RESUME CHECKPOINT + 冷却 resume
         - 连续超限: ACK inbox 放弃本轮 + 升级上级一次 —— 堵住
-          「10min 超时 → 90s 冷却 → 再超时」的无限死循环，且不再注入
+          「卡住中断 → 90s 冷却 → 再卡住」的无限死循环，且不再注入
           CHECKPOINT 撑大上下文让下一轮更易超时
         - 记录 work_log，便于监控/stall watchdog 关联
         """
@@ -2747,15 +2753,13 @@ class Agent:
         users = [(m, o, t) for m, o, t in batch if not (o or {}).get("trigger")]
 
         if triggers:
-            # Last digest text wins — latch ONLY that wake's ids (ACK=seen).
-            # Union would mark earlier digests' ids read while the model only
-            # saw the last message body.
-            message = triggers[-1][0]
-            opts = dict(triggers[-1][1] or {})
+            from hiveweave.agents.trigger import merge_queued_triggers
+
+            # Completions (wait_satisfied) concatenate — wake=0 while
+            # PROCESSING so the watcher cannot re-fetch dropped siblings.
+            # Other trigger sources stay last-wins (ACK=seen).
+            message, opts = merge_queued_triggers(triggers)
             inbox_ids = list((opts.get("inbox_msg_ids") or []))
-            opts["inbox_msg_ids"] = inbox_ids
-            opts["merged_wakes"] = len(triggers)
-            opts.setdefault("source", "merged_trigger")
             # User messages wait behind the coalesced trigger
             self._message_queue.extend(users)
             log.info(
@@ -2763,6 +2767,7 @@ class Agent:
                 agent_id=self.id,
                 merged=len(triggers),
                 inbox_ids=len(inbox_ids),
+                source=opts.get("source"),
                 users_queued=len(users),
             )
             await self.chat(message, opts)

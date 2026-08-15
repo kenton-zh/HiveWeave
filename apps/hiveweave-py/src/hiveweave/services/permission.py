@@ -46,7 +46,6 @@ _BASE_TOOLS = frozenset({
     "attest_doc_review",
     "assert_visual",
     "look_at_image",
-    "spawn_subagent",
 })
 
 CEO_TOOLS = _BASE_TOOLS | frozenset({
@@ -81,6 +80,8 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     "edit_file", "apply_patch", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
     "bash", "run_command", "run_tests", "browse", "game_run_case",
+    "job_kill",
+    "spawn_subagent",
     "generate_image",
     "git_worktree_checkpoint",
     "run_code_review", "run_security_audit", "run_perf_audit",
@@ -103,6 +104,8 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
 # PolicyService still hard-denies based on role family.
 READONLY_TOOLS = _BASE_TOOLS | frozenset({
     "bash", "write_file", "browse", "assert_visual", "game_run_case", "edit_file",
+    "job_kill",
+    "spawn_subagent",
     "generate_image",
     "bind_skill", "unbind_skill",
     "start_dev_server",
@@ -274,7 +277,8 @@ class PermissionService:
             # Unknown family — 最小暴露，不给 READWRITE 兜底。
             names = READONLY_TOOLS
         # 工具表可见性跟硬门对齐：列在表里但 capability 不够的不要发给模型（撞门）。
-        return sorted(n for n in names if tool_hard_deny(agent, n) is None)
+        visible = {n for n in names if tool_hard_deny(agent, n) is None}
+        return sorted(visible)
 
     def _parse_list(self, raw: Any) -> list[str]:
         if not raw:

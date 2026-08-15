@@ -59,9 +59,111 @@ def _task_ref_matches(ref: str, tid: str) -> bool:
 def _waiting_on_task(turn_result: TurnResult | None, tid: str) -> bool:
     if turn_result is None:
         return False
-    for w in turn_result.waiting_on or []:
-        if w.kind == "task" and _task_ref_matches(str(w.ref or ""), tid):
+    return waiting_covers_task(turn_result.waiting_on, tid)
+
+
+def _iter_waiting_refs(waiting_on: list | None) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for w in waiting_on or []:
+        if isinstance(w, dict):
+            kind = str(w.get("kind") or "").lower()
+            ref = str(w.get("ref") or "")
+        else:
+            kind = str(getattr(w, "kind", "") or "").lower()
+            ref = str(getattr(w, "ref", "") or "")
+        if kind and ref:
+            items.append((kind, ref))
+    return items
+
+
+def waiting_covers_task(waiting_on: list | None, tid: str) -> bool:
+    for kind, ref in _iter_waiting_refs(waiting_on):
+        if kind == "task" and _task_ref_matches(ref, tid):
             return True
+    return False
+
+
+def waiting_on_live_external(
+    waiting_on: list | None, *, agent_id: str | None = None
+) -> bool:
+    """True when waiting_on names a live off-turn job.
+
+    Fake ``kind=external`` refs must not park forever — only in-flight
+    native bg jobs (``is_live_job``) owned by *agent_id* when given.
+    """
+    refs = [ref for kind, ref in _iter_waiting_refs(waiting_on) if kind == "external"]
+    if not refs:
+        return False
+    try:
+        from hiveweave.services.offturn import is_live_job
+
+        if any(is_live_job(ref, agent_id=agent_id) for ref in refs):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _live_offturn_covers_task(
+    tid: str,
+    waiting_on: list | None,
+    agent_id: str | None,
+) -> bool:
+    """True when a live off-turn job bound to *tid* parks that obligation.
+
+    Unbound jobs (empty task_id) never cover. Fake ``kind=external`` never
+    covers. With *agent_id*, the registry is authoritative (the model may
+    omit waiting_on). Without *agent_id*, only live external refs whose
+    bound task_id equals *tid*.
+    """
+    if not tid:
+        return False
+    try:
+        from hiveweave.services.offturn import (
+            agent_has_live_job_for_task,
+            is_live_job,
+            job_bound_task_id,
+        )
+
+        if agent_id:
+            return bool(agent_has_live_job_for_task(agent_id, tid))
+        for kind, ref in _iter_waiting_refs(waiting_on):
+            if kind != "external":
+                continue
+            if not is_live_job(ref):
+                continue
+            if job_bound_task_id(ref) == tid:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def assignee_must_submit(
+    phase: str,
+    assignee_task_ids: list[str],
+    waiting_on: list | None,
+    *,
+    agent_id: str | None = None,
+) -> bool:
+    """ASSIGNEE_MUST_SUBMIT should fire for this exit.
+
+    Legal park: waiting on each assignee task, or a live off-turn job
+    bound to that task. Unbound / fake external waits do not park.
+    """
+    ids = [str(t) for t in assignee_task_ids if t]
+    if not ids:
+        return False
+    if phase == "done_slice":
+        return True
+    if phase != "waiting":
+        return False
+    for tid in ids:
+        if waiting_covers_task(waiting_on, tid):
+            continue
+        if _live_offturn_covers_task(tid, waiting_on, agent_id):
+            continue
+        return True
     return False
 
 
@@ -376,7 +478,7 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
             tid = str(t.get("id") or "")
             if _task_advanced(tid, ctx.tasks_advanced):
                 continue
-            # Explicit wait on this task is a legal idle exit
+            # Explicit wait on this task is a legal idle exit for that task.
             if turn_result.phase == "waiting" and _waiting_on_task(
                 turn_result, tid
             ):
@@ -384,6 +486,19 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 continue
             role = t.get("role_hint")
             status = t.get("status")
+            # Live off-turn job bound to this task parks assignee
+            # coding work only — not review/merge. Unbound jobs
+            # and jobs bound to another task do not park this one.
+            if (
+                turn_result.phase == "waiting"
+                and role == "assignee"
+                and status in ("running", "claimed", "rework")
+                and _live_offturn_covers_task(
+                    tid, turn_result.waiting_on, ctx.agent_id
+                )
+            ):
+                remaining.append(t)
+                continue
             if role == "assignee" and status in (
                 "running", "claimed", "rework",
             ):
@@ -563,7 +678,9 @@ def _build_gate_hint(
         "ASSIGNEE_MUST_SUBMIT": (
             "有 running/claimed/rework 任务未 submit_task — "
             "请调用 submit_task(taskId, summary, testsPassed=true)，"
-            "或 phase=waiting + waiting_on=[{kind:'task', ref:taskId}]"
+            "或 phase=waiting + waiting_on=[{kind:'task', ref:taskId}]，"
+            "或 off-turn 进行中：waiting_on 含 "
+            "[{kind:'external', ref:'bg-sub-|bg-bash-…'}]"
         ),
         "REVIEWER_MUST_START_REVIEW": (
             "有 submitted 任务待你开始审查 — "
@@ -949,7 +1066,15 @@ async def pre_check_exit_gates(
         )
         assignee_tasks = await cursor.fetchall()
         await cursor.close()
-        if assignee_tasks and phase in ("done_slice", "waiting"):
+        assignee_ids: list[str] = []
+        for row in assignee_tasks:
+            if hasattr(row, "keys") and "id" in row.keys():
+                assignee_ids.append(str(row["id"]))
+            else:
+                assignee_ids.append(str(row[0]))
+        if assignee_must_submit(
+            phase, assignee_ids, waiting_on, agent_id=agent_id
+        ):
             violations.append("ASSIGNEE_MUST_SUBMIT")
 
         if phase == "done_slice":

@@ -1093,6 +1093,16 @@ class OrgService:
         try:
             short_id = updated.get("short_id", "")
             ws_path = updated.get("workspace_path", "")
+            try:
+                from hiveweave.services.offturn import reap_offturn_for_agent
+
+                await reap_offturn_for_agent(agent_id)
+            except Exception as off_err:
+                log.warning(
+                    "dismiss_offturn_reap_failed",
+                    agent_id=agent_id,
+                    error=str(off_err),
+                )
             if short_id and ws_path:
                 from hiveweave.services.git_worktree import GitWorktreeService
                 gwt = GitWorktreeService()

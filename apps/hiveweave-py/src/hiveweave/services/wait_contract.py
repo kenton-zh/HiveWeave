@@ -32,6 +32,42 @@ log = structlog.get_logger(__name__)
 from hiveweave.db.project import execute_by_project, execute_transaction_by_project
 
 
+def _item_kind_ref(item: Any) -> tuple[str, str]:
+    if isinstance(item, WaitingOnItem):
+        return str(item.kind or "external"), str(item.ref or "")
+    if isinstance(item, dict):
+        return str(item.get("kind") or "external"), str(item.get("ref") or "")
+    return "external", ""
+
+
+def looks_unbounded_external(kind: str, ref: str) -> bool:
+    """Native bg job refs — no 30-minute wait TTL."""
+    if str(kind or "").lower() != "external":
+        return False
+    r = (ref or "").strip()
+    return r.startswith(("bg-bash-", "bg-sub-"))
+
+
+def _should_hold_live_offturn_wait(row: dict) -> bool:
+    """True when this wait still names a live bg job."""
+    kind = str(row.get("kind") or "").lower()
+    ref = str(row.get("ref") or "")
+    aid = str(row.get("agentId") or row.get("agent_id") or "")
+    try:
+        from hiveweave.services.offturn import (
+            has_live_jobs_for_agent,
+            is_live_job,
+        )
+
+        if kind == "external" and is_live_job(ref, agent_id=aid or None):
+            return True
+        if kind == "task" and aid and has_live_jobs_for_agent(aid):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def _execute_rowcount(
     project_id: str, sql: str, params: list[Any] | None = None
 ) -> int:
@@ -226,16 +262,59 @@ class WaitContractService:
         # 全有或全无：先收集语句列表（纯计算、无 await），再一次 BEGIN
         # IMMEDIATE 事务提交 — 循环内 await 会暴露"旧 wait 已清除、新 wait
         # 半插入"的窗口（TEST18 审计 S1）。
-        statements: list[tuple[str, list[Any] | None]] = [
-            (
-                "UPDATE agent_waits SET cleared_at = ? "
-                "WHERE agent_id = ? AND cleared_at IS NULL",
-                [now, agent_id],
-            )
-        ]
+        new_external_refs: set[str] = set()
+        for it in waiting_on or []:
+            kind, ref = _item_kind_ref(it)
+            if str(kind).lower() == "external" and ref:
+                new_external_refs.add(ref)
+        preserved: list[str] = []
+        live_lookup_ok = False
+        try:
+            from hiveweave.services.offturn import live_job_ids_for_agent
+
+            preserved = [
+                jid
+                for jid in live_job_ids_for_agent(agent_id)
+                if jid not in new_external_refs
+            ]
+            live_lookup_ok = True
+        except Exception:
+            live_lookup_ok = False
+        if not live_lookup_ok:
+            # Cannot prove which external waits are dead — do not wipe them.
+            statements: list[tuple[str, list[Any] | None]] = [
+                (
+                    "UPDATE agent_waits SET cleared_at = ? "
+                    "WHERE agent_id = ? AND cleared_at IS NULL "
+                    "AND kind != 'external'",
+                    [now, agent_id],
+                )
+            ]
+        elif preserved:
+            placeholders = ",".join("?" * len(preserved))
+            statements = [
+                (
+                    "UPDATE agent_waits SET cleared_at = ? "
+                    "WHERE agent_id = ? AND cleared_at IS NULL "
+                    f"AND NOT (kind = 'external' AND ref IN ({placeholders}))",
+                    [now, agent_id, *preserved],
+                )
+            ]
+        else:
+            statements = [
+                (
+                    "UPDATE agent_waits SET cleared_at = ? "
+                    "WHERE agent_id = ? AND cleared_at IS NULL",
+                    [now, agent_id],
+                )
+            ]
 
         ver = obligation_version(obligations or [])
         created: list[dict] = []
+        batch_unbounded = any(
+            looks_unbounded_external(*_item_kind_ref(it))
+            for it in (waiting_on or [])
+        )
         for item in waiting_on or []:
             if isinstance(item, WaitingOnItem):
                 kind: str = item.kind
@@ -254,7 +333,21 @@ class WaitContractService:
             exp = expires_at
             if isinstance(item, dict) and item.get("expires_at") is not None:
                 exp = int(item["expires_at"])
-            if exp is None:
+            unbounded = looks_unbounded_external(kind, ref) or (
+                str(kind).lower() == "task" and batch_unbounded
+            )
+            if unbounded:
+                exp = None
+                wake_on = [
+                    w for w in wake_on if str(w).lower() != "timeout"
+                ]
+                if not wake_on:
+                    wake_on = (
+                        ["external"]
+                        if str(kind).lower() == "external"
+                        else ["task_transition"]
+                    )
+            elif exp is None:
                 exp = now + default_ttl_ms(kind, agent_id)
             statements.append(
                 (
@@ -320,6 +413,28 @@ class WaitContractService:
         except ProjectDbError:
             return 0
 
+    async def clear_waits_matching_ref(
+        self, project_id: str, agent_id: str, ref: str
+    ) -> int:
+        """Clear active waits whose ref matches an off-turn / external job id.
+
+        Sibling jobs keep their waits. Empty ref is a no-op.
+        """
+        needle = (ref or "").strip()
+        if not needle:
+            return 0
+        await _ensure_schema(project_id)
+        now = int(time.time() * 1000)
+        try:
+            return await _execute_rowcount(
+                project_id,
+                "UPDATE agent_waits SET cleared_at = ? "
+                "WHERE agent_id = ? AND cleared_at IS NULL AND ref = ?",
+                [now, agent_id, needle],
+            )
+        except ProjectDbError:
+            return 0
+
     async def list_active(self, project_id: str, agent_id: str) -> list[dict]:
         await _ensure_schema(project_id)
         conn = await _conn(project_id)
@@ -355,7 +470,7 @@ class WaitContractService:
         if conn is None:
             return 0
         cur = await conn.execute(
-            "SELECT id, kind, created_at FROM agent_waits "
+            "SELECT id, kind, ref, agent_id, created_at FROM agent_waits "
             "WHERE cleared_at IS NULL AND expires_at IS NULL"
         )
         rows = await cur.fetchall()
@@ -364,12 +479,19 @@ class WaitContractService:
         statements: list[tuple[str, list[Any] | None]] = []
         n = 0
         for r in rows:
-            created = int(r["created_at"] or now)
-            ttl = default_ttl_ms(str(r["kind"] or "external"))
-            exp = created + ttl
-            # Already past → expire on next clear_expired
-            if exp > now + ttl:
-                exp = now + ttl
+            kind = str(r["kind"] or "external")
+            ref = str(r["ref"] or "")
+            aid = str(r["agent_id"] or "")
+            if looks_unbounded_external(kind, ref):
+                continue
+            if str(kind).lower() == "task" and _should_hold_live_offturn_wait(
+                {"kind": kind, "ref": ref, "agentId": aid}
+            ):
+                continue
+            ttl = default_ttl_ms(kind)
+            # Fresh TTL from *now* — created_at + ttl would instantly expire
+            # companion task waits after a long off-turn job.
+            exp = now + ttl
             statements.append(
                 (
                     "UPDATE agent_waits SET expires_at = ? WHERE id = ?",
@@ -406,7 +528,37 @@ class WaitContractService:
             )
         rows = await cur.fetchall()
         await cur.close()
-        cleared = [_row_to_dict(r) for r in rows]
+        candidates = [_row_to_dict(r) for r in rows]
+        if agent_id:
+            cur2 = await conn.execute(
+                "SELECT * FROM agent_waits "
+                "WHERE agent_id = ? AND cleared_at IS NULL "
+                "AND expires_at IS NULL",
+                [agent_id],
+            )
+        else:
+            cur2 = await conn.execute(
+                "SELECT * FROM agent_waits "
+                "WHERE cleared_at IS NULL AND expires_at IS NULL"
+            )
+        null_rows = await cur2.fetchall()
+        await cur2.close()
+        for r in null_rows:
+            d = _row_to_dict(r)
+            kind = str(d.get("kind") or "")
+            ref = str(d.get("ref") or "")
+            if looks_unbounded_external(kind, ref):
+                candidates.append(d)
+        cleared: list[dict] = []
+        seen: set[str] = set()
+        for c in candidates:
+            cid = str(c.get("id") or "")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            if _should_hold_live_offturn_wait(c):
+                continue
+            cleared.append(c)
         if not cleared:
             return []
         ids = [c["id"] for c in cleared]

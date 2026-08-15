@@ -71,6 +71,26 @@ async def stop_project_cleanly(project_id: str) -> dict:
     from hiveweave.agents.supervisor import agent_manager
 
     ids = await _project_agent_ids(project_id)
+    result = {
+        "stopped": 0,
+        "errors": 0,
+        "agent_ids": ids,
+        "leftover_cleared": 0,
+        "offturn_reaped": 0,
+    }
+
+    # Reap before cancel so finishing jobs cannot wake=1 after agents die.
+    try:
+        from hiveweave.services.offturn import reap_offturn_for_project
+
+        result["offturn_reaped"] = await reap_offturn_for_project(project_id)
+    except Exception as e:
+        log.warning(
+            "stop_project_offturn_reap_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+
     stopped = 0
     errors = 0
     for aid in ids:
@@ -108,12 +128,10 @@ async def stop_project_cleanly(project_id: str) -> dict:
             agent_manager._agents.pop(aid, None)
             errors += 1
 
-    result = {
-        "stopped": stopped,
-        "errors": errors,
-        "agent_ids": ids,
-        "leftover_cleared": len(leftover),
-    }
+    result["stopped"] = stopped
+    result["errors"] = errors
+    result["leftover_cleared"] = len(leftover)
+
     # TEST6 evening P2-6: kill main-checkout + all registered project processes
     try:
         from hiveweave.services.process_registry import stop_processes_for_project

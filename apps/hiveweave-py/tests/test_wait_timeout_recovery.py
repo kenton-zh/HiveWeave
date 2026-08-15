@@ -123,3 +123,28 @@ async def test_armed_timer_fires_timeout(task_env, monkeypatch):
     assert await wc.list_all_active(pid) == []
     send.assert_awaited_once()
     trigger.assert_awaited_once()
+
+
+async def test_companion_task_wait_not_timeout_after_job_gone(task_env):
+    """Long off-turn companion kind=task must not become WAIT_TIMEOUT."""
+    pid = task_env["project_id"]
+    wc = WaitContractService()
+    job_ref = "bg-bash-deadbeef12"
+    await wc.replace_waits(
+        pid,
+        EXEC,
+        [
+            {"kind": "external", "ref": job_ref},
+            {"kind": "task", "ref": "aaaaaaaa-1111-2222-3333-444444444444"},
+        ],
+        phase="waiting",
+    )
+    await wc.clear_waits_matching_ref(pid, EXEC, job_ref)
+    await wc.backfill_null_expires(pid)
+    cleared = await wc.clear_expired(pid)
+    assert cleared == []
+    still = await wc.list_all_active(pid)
+    assert len(still) == 1
+    assert still[0]["kind"] == "task"
+    exp = still[0].get("expiresAt")
+    assert exp is None or int(exp) > _now_ms()
