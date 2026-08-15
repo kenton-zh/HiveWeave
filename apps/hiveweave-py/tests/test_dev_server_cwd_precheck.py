@@ -22,6 +22,7 @@ from hiveweave.services.process_registry import (
     register,
 )
 from hiveweave.tools.dev_server_tools import (
+    LookupDevServerParams,
     StartDevServerParams,
     lookup_dev_server_tool,
     start_dev_server_tool,
@@ -184,7 +185,7 @@ async def test_lookup_marks_stale_cwd(monkeypatch, tmp_path):
 
     # By-port branch
     result = await lookup_dev_server_tool(
-        StartDevServerParams(preferred_port=3002),
+        LookupDevServerParams(preferred_port=3002),
         agent_id=TEST_AGENT,
         workspace="",
     )
@@ -195,7 +196,7 @@ async def test_lookup_marks_stale_cwd(monkeypatch, tmp_path):
     assert servers[0]["stale"] is True
 
     result = await lookup_dev_server_tool(
-        StartDevServerParams(preferred_port=3001),
+        LookupDevServerParams(preferred_port=3001),
         agent_id=TEST_AGENT,
         workspace="",
     )
@@ -203,9 +204,9 @@ async def test_lookup_marks_stale_cwd(monkeypatch, tmp_path):
     assert len(servers) == 1
     assert servers[0]["stale"] is False
 
-    # By-project branch (reserved port forces project lookup)
+    # Omit port → list this project (must not silently filter default 3000)
     result = await lookup_dev_server_tool(
-        StartDevServerParams(preferred_port=5173),
+        LookupDevServerParams(),
         agent_id=TEST_AGENT,
         workspace="",
     )

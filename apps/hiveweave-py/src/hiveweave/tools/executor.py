@@ -55,43 +55,68 @@ _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 # 1. Sending to LLM (so it knows correct parameter names — no more guessing)
 # 2. Validating LLM args before execution (auto-generate helpful errors)
 # 3. Accepting multiple parameter name aliases (Python arg_name in "aliases")
+#
+# Description style (DSH contract, not a lecture): what it does; invariants;
+# failure markers; output shape; next action on the long path; what not to do.
+# Cross-call workflow lives in role prompts. Hive wakes via
+# [BASH|SUBAGENT DONE/FAILED] — do not document job_output.
 
 TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "bash": {
         "description": (
-            "Executes a shell command on the local system (Git Bash on Windows). "
-            "Use it to run CLI tools, scripts, git commands, or any system operation. "
-            "Returns stdout/stderr. cwd is your workspace — on Windows prefer "
-            "Git Bash paths like /d/PC_AI/... or quote Windows paths; never invent "
-            "/workspace or strip backslashes (D:PC_AI... is invalid).\n"
-            "环境声明: Windows 宿主下优先 Git Bash（bash -c）执行，无 Git Bash 时"
-            "降级 cmd /s /c（unix→cmd 近似映射），POSIX 用 bash -c；非 PowerShell，"
-            "pwsh 语义（Get-Content -Tail N 等）不适用。\n"
-            "GNU coreutils 子集可用但不保证 GNU 长选项：如 `tail --lines` 不可靠"
-            "（cmd 降级路径下 tail/head 仅近似映射为 more，参数支持弱）；推荐兼容写法"
-            " `tail -n N`（GNU/BSD 均支持），避免 BSD 专属 flag 如 `tail --ignore=`"
-            "（GNU coreutils 拒绝）。\n"
-            "python 用 `uv run python` 或 .venv/Scripts/python.exe（裸 python 可能"
-            "不在 PATH）；命令前自动 source 项目 .hiveweave/env.sh（若存在）；"
-            "通配符仅在路径存在时展开。"
+            "Execute a shell command and return stdout/stderr. Each call runs "
+            "in a fresh shell: cwd, variables, and functions do not persist — "
+            "do not `cd` expecting the next call to stay there (cwd is your "
+            "workspace). Check `Exit code: N` on every result before moving "
+            "on. Long output is truncated to head+tail; the full text is "
+            "saved and the path is reported. Windows: Git Bash (`bash -c`) "
+            "first, else cmd — not PowerShell. Prefer `tail -n N`, "
+            "`uv run python` (bare `python` may be missing). Never invent "
+            "`/workspace` or strip backslashes (`D:PC_AI...` is invalid). "
+            "Set `background=true` for long scripts/tests: the call returns "
+            "immediately with `waiting_on` (job id `bg-bash-…`). Then "
+            "`commit_turn(phase=waiting)` using that list; do not poll. "
+            "Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout "
+            "until done, `job_kill`, or project stop. Do not use "
+            "`background=true` for `vite` / `npm run dev`. Default false "
+            "keeps stdout in this turn."
         ),
         "properties": {
-            "command": {"type": "string", "aliases": ["cmd", "run"]},
+            "command": {
+                "type": "string",
+                "aliases": ["cmd", "run"],
+                "description": "The bash command to execute.",
+            },
             "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"],
-                        "description": "Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds (e.g. 30 = 30s). Use 120000 for npm install."},
+                        "description": "Foreground only (5s–10min). Ignored when background=true. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds (e.g. 30 = 30s). The executor kills the command on expiry."},
+            "background": {
+                "type": "boolean",
+                "aliases": ["bg"],
+                "description": (
+                    "Run off the org turn and return a job id immediately. "
+                    "No timeout. Then commit_turn(waiting) with waiting_on; "
+                    "woken with [BASH DONE]/[BASH FAILED]. Stop with "
+                    "job_kill. Default false."
+                ),
+            },
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id"],
+                "description": (
+                    "Optional task id to bind test_run attestation "
+                    "(reviewers: pass the task under review)."
+                ),
+            },
         },
         "required": ["command"],
     },
     "browse": {
         "description": (
-            "Drive a real Chromium browser via agent-browser CLI for UI E2E / visual QA. "
-            "Use after start_dev_server/lookup_dev_server. Typical flow: "
-            "browse(args=[\"goto\",\"http://127.0.0.1:PORT\"]) → "
-            "browse(args=[\"snapshot\",\"-i\"]) → browse(args=[\"click\",\"@e3\"]) → "
-            "browse(args=[\"screenshot\",\"evidence/bug.png\"]) → "
-            "assert_visual(screenshotPath=..., observed=\"what you SEE\", verdict=\"pass\"). "
-            "Screenshot pixels are injected into the next LLM turn; a PNG path alone "
-            "is NOT UI evidence. Also: console, network requests, fill, get text @eN."
+            "Drive Chromium via agent-browser CLI. Typical: "
+            "goto URL → snapshot -i → click @eN → screenshot path → "
+            "assert_visual. Screenshot pixels inject into the next turn; "
+            "a PNG path is not UI evidence. Prefer after "
+            "start_dev_server / lookup_dev_server."
         ),
         "properties": {
             "args": {
@@ -151,11 +176,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "look_at_image": {
         "description": (
-            "帮你看图片 — Ask the configured multimodal model to analyze an image. "
-            "Pass image_path (under workspace) + prompt (focus / output format). "
-            "Stateless one-shot: waits for the full answer (non-streaming), returns "
-            "text only. Does not inject pixels into chat history. Configure the "
-            "model in Settings → 多模态模型配置."
+            "Ask the configured vision model about a workspace image. "
+            "One-shot text answer; does not inject pixels into chat."
         ),
         "properties": {
             "image_path": {
@@ -175,10 +197,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "generate_image": {
         "description": (
-            "Generate an image via Ark Agent Plan Seedream (text-to-image). "
-            "Pass prompt (+ optional size / output_path / watermark). Saves PNG "
-            "under the workspace. Configure Settings → 模型配置 → 生图模型配置. "
-            "Requires source-write capability."
+            "Generate a PNG via Seedream (text-to-image) under the workspace. "
+            "Requires SOURCE_WRITE."
         ),
         "properties": {
             "prompt": {
@@ -247,7 +267,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["action"],
     },
     "run_command": {
-        "description": "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command.",
+        "description": (
+            "Execute a command and return stdout/stderr, like bash but with "
+            "an explicit cwd. Check `Exit code: N`. Prefer bash unless you "
+            "need a working directory other than the workspace root."
+        ),
         "properties": {
             "command": {"type": "string", "aliases": ["cmd", "run"]},
             "cwd": {"type": "string", "description": "Working directory (relative to workspace). Default: workspace root."},
@@ -257,26 +281,48 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["command"],
     },
     "read_file": {
-        "description": "Reads the contents of a file from the filesystem. Use it to view source code, config files, logs, or any text file. Returns the file content with line numbers.",
+        "description": (
+            "Read a UTF-8 text file and return line-numbered content. "
+            "Use offset/limit for a slice; do not dump a huge file in one call."
+        ),
         "properties": {
-            "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
+            "filePath": {
+                "type": "string",
+                "aliases": ["path", "file_path", "file"],
+                "description": "Path to read (relative to workspace).",
+            },
             "offset": {"type": "integer", "aliases": ["startLine"],
                 "description": "Starting line number (0-based, default: 0)."},
             "limit": {"type": "integer", "aliases": ["maxLines", "lineLimit"],
-                "description": "Max lines to read (default: 2000)."},
+                "description": "Max lines to return (default: 2000)."},
         },
         "required": ["filePath"],
     },
     "write_file": {
-        "description": "Creates a new file or overwrites an existing file with the given content. Use it to write source code, configs, or data files. No explicit return value on success.",
+        "description": (
+            "Create or fully replace a UTF-8 text file. Prefer edit_file / "
+            "apply_patch for a small change to an existing file."
+        ),
         "properties": {
-            "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
-            "content": {"type": "string", "aliases": ["data", "text", "body"]},
+            "filePath": {
+                "type": "string",
+                "aliases": ["path", "file_path", "file"],
+                "description": "Path to write (relative to workspace).",
+            },
+            "content": {
+                "type": "string",
+                "aliases": ["data", "text", "body"],
+                "description": "Full UTF-8 text to write.",
+            },
         },
         "required": ["filePath", "content"],
     },
     "list_files": {
-        "description": "Lists files and directories at the given path. Use it to explore directory structure, find files by location, or verify file existence. Returns a list of file/directory names. When recursive=true, maxdepth controls descent depth and is capped at 3 (values above 3 are clamped to 3).",
+        "description": (
+            "List file and directory names at a path. recursive=true walks "
+            "up to maxdepth 3 (clamped). Does not search contents — use "
+            "grep; for a filename glob use search_files."
+        ),
         "properties": {
             "dirPath": {"type": "string", "aliases": ["path", "directory", "dir"]},
             "recursive": {"type": "boolean", "description": "If true, list recursively. Default: false."},
@@ -285,7 +331,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "grep": {
-        "description": "Searches file CONTENTS using a regex pattern. Use it to find occurrences of text, code, or string matches inside files. Returns matching file paths and lines. For filename/glob-based search, use search_files instead.",
+        "description": (
+            "Search file contents with a regex. Returns matching paths and "
+            "lines. Use read_file on a match for surrounding context. For "
+            "filename/glob search use search_files — not bash grep."
+        ),
         "properties": {
             "pattern": {"type": "string", "aliases": ["regex", "query", "search"]},
             "path": {"type": "string", "aliases": ["filePath", "file", "directory", "dir"]},
@@ -299,7 +349,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["pattern"],
     },
     "search_files": {
-        "description": "Searches for files by FILENAME or GLOB pattern. Use it to find files by name, extension, or glob expression. Returns matching file paths. For content search inside files, use grep instead.",
+        "description": (
+            "Find files whose names match a glob. Returns matching paths. "
+            "For content search use grep."
+        ),
         "properties": {
             "pattern": {"type": "string", "aliases": ["glob", "query", "search", "name"]},
             "directory": {"type": "string", "aliases": ["path", "dir"]},
@@ -307,17 +360,42 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["pattern"],
     },
     "edit_file": {
-        "description": "Applies a targeted text replacement in a file. Use it to make surgical edits by locating a unique old_string and replacing it with new_string. Returns success or an error message if the old_string is not found.",
+        "description": (
+            "Edit an existing UTF-8 text file by replacing literal text. "
+            "old_string must match exactly (whitespace included). When "
+            "replace_all is false (default), it must appear exactly once — "
+            "include enough context to make it unique. Empty new_string "
+            "deletes the match. Read the file first."
+        ),
         "properties": {
-            "filePath": {"type": "string", "aliases": ["path", "file_path", "file"]},
-            "old_string": {"type": "string", "aliases": ["oldString", "old_str", "search", "find"]},
-            "new_string": {"type": "string", "aliases": ["newString", "new_str", "replace", "replacement"]},
-            "replace_all": {"type": "boolean", "aliases": ["replaceAll"]},
+            "filePath": {
+                "type": "string",
+                "aliases": ["path", "file_path", "file"],
+                "description": "Path to edit (relative to workspace).",
+            },
+            "old_string": {
+                "type": "string",
+                "aliases": ["oldString", "old_str", "search", "find"],
+                "description": "Literal text to replace. Must match exactly.",
+            },
+            "new_string": {
+                "type": "string",
+                "aliases": ["newString", "new_str", "replace", "replacement"],
+                "description": "Literal replacement. Empty string deletes the match.",
+            },
+            "replace_all": {
+                "type": "boolean",
+                "aliases": ["replaceAll"],
+                "description": "Replace all matches. Default false: old_string must appear exactly once.",
+            },
         },
         "required": ["filePath", "old_string", "new_string"],
     },
     "apply_patch": {
-        "description": "Apply file patch operations (create/update/delete files). Each patch specifies a file path, operation type, and content.",
+        "description": (
+            "Apply file patch operations (add/update/delete). Prefer this "
+            "or edit_file for a small change; write_file fully replaces a file."
+        ),
         "properties": {
             "patches": {
                 "type": "array",
@@ -326,8 +404,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "properties": {
                         "op": {"type": "string", "description": "Operation: 'add' (create), 'update' (replace), or 'delete'"},
                         "filePath": {"type": "string", "description": "Path to the file (relative to workspace)"},
-                        "oldString": {"type": "string", "description": "For update: text to find in the file"},
-                        "newString": {"type": "string", "description": "For update: replacement text"},
+                        "oldString": {"type": "string", "description": "For update: literal text to find. Must match exactly."},
+                        "newString": {"type": "string", "description": "For update: literal replacement. Empty string deletes the match."},
                         "content": {"type": "string", "description": "For add: full file content"},
                     },
                 },
@@ -337,7 +415,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "websearch": {
-        "description": "Searches the public internet using a text query. Use it to find current information, research topics, look up documentation, or answer questions. Returns search result snippets with URLs.",
+        "description": (
+            "Search the public web. Returns title, URL, and snippet."
+        ),
         "properties": {
             "query": {"type": "string", "aliases": ["search", "q", "term"]},
             "numResults": {"type": "integer", "aliases": ["num_results", "limit", "count"],
@@ -346,14 +426,21 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["query"],
     },
     "calculate": {
-        "description": "Evaluate a math expression exactly (scientific calculator). Use it for ANY non-trivial arithmetic (large numbers, floats, percentages, multiplications, trigonometry, logarithms) — never compute by hand. Supports + - * / // % **, parentheses, functions (sqrt cbrt sin cos tan asin acos atan atan2 sinh cosh tanh log log10 log2 exp pow hypot fmod floor ceil trunc round gcd lcm factorial degrees radians) and constants (pi e tau inf). '^' is power.",
+        "description": (
+            "Evaluate a math expression exactly. Do not compute non-trivial "
+            "arithmetic by hand. '^' is power. Functions: sqrt sin cos tan "
+            "log exp …; constants: pi e tau inf."
+        ),
         "properties": {
             "expression": {"type": "string", "aliases": ["expr", "formula", "math", "calc"]},
         },
         "required": ["expression"],
     },
     "question": {
-        "description": "Asks the user a question and optionally presents a list of choices. Use it to request clarification, get input on decisions, or present options when human guidance is needed. Returns the user response.",
+        "description": (
+            "Ask the human a question; optional choices. Blocks until they "
+            "answer. Assistant text is not delivered — only this tool is."
+        ),
         "properties": {
             "question": {"type": "string", "aliases": ["message", "content", "query", "text"]},
             "options": {"type": "array", "aliases": ["choices"]},
@@ -361,29 +448,93 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["question"],
     },
     "todowrite": {
-        "description": "Manages the agent's task list. Use it to plan tasks and track progress. When a task is completed, update its status to 'completed'. Use write_work_log for detailed work records.",
+        "description": (
+            "Update this turn's personal todo list; mark items completed "
+            "when done. Not the Task Ledger — durable notes go in "
+            "write_work_log."
+        ),
         "properties": {
             "todos": {"type": "array", "aliases": ["tasks", "items", "list"]},
         },
         "required": ["todos"],
     },
     "spawn_subagent": {
+        "description": (
+            "Delegate a self-contained task to a subagent in its own context "
+            "(it does not see this conversation). It works in YOUR worktree "
+            "with YOUR permissions and returns its result, not intermediate "
+            "steps. This call returns immediately with waiting_on — then "
+            "commit_turn(phase=waiting) using that list; do not poll. Woken "
+            "with [SUBAGENT DONE] / [SUBAGENT FAILED]. Give a complete "
+            "standalone prompt. subagent_type is REQUIRED: readonly | audit "
+            "| write. Concurrent writes to the same files will collide. "
+            "Do not nest this work inside the current LLM turn."
+        ),
         "type": "object",
         "properties": {
-            "prompt": {"type": "string",
-                       "description": "具体任务：文件、目标、验收标准。"},
-            "description": {"type": "string",
-                            "description": "一句话任务描述。"},
-            "timeout_s": {"type": "integer", "minimum": 1, "maximum": 480,
-                          "description": "硬截止秒数（默认 240，上限 480）。"},
+            "subagent_type": {
+                "type": "string",
+                "enum": ["readonly", "audit", "write"],
+                "aliases": ["type", "kind"],
+                "description": (
+                    "REQUIRED. readonly = read-only scout; audit = run "
+                    "tests/browse + submit (no attestation); write = edit "
+                    "code + git_worktree (parent must have SOURCE_WRITE)."
+                ),
+            },
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "The complete, self-contained task. The child does not "
+                    "share this conversation, so include files, goals, and "
+                    "acceptance criteria."
+                ),
+                "aliases": ["task", "instructions", "work"],
+            },
+            "description": {
+                "type": "string",
+                "description": "Short (3-5 word) label for the waiting context.",
+                "aliases": ["desc", "title"],
+            },
+            "timeout_s": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 480,
+                "description": (
+                    "Optional hard deadline in seconds. Omit or 0: no wall "
+                    "clock (job_kill / stream idle / commit_turn). Does not "
+                    "extend the parent turn."
+                ),
+            },
         },
-        "required": ["prompt"],
+        "required": ["subagent_type", "prompt"],
+    },
+    "job_kill": {
+        "description": (
+            "Request cancellation of a live background bash or "
+            "spawn_subagent job by job id (bg-bash-… / bg-sub-…). Returns "
+            "immediately; the job settles as killed once its work actually "
+            "stops. Woken with [BASH FAILED] / [SUBAGENT FAILED] if a wait "
+            "was armed."
+        ),
+        "type": "object",
+        "properties": {
+            "jobId": {
+                "type": "string",
+                "aliases": ["job_id", "id"],
+                "description": (
+                    "Job id returned when the background work started."
+                ),
+            },
+        },
+        "required": ["jobId"],
     },
     "send_message": {
         "description": (
-            "Sends a message to agents. Prefer ask_agent (needs reply) or "
-            "notify_agent (FYI). Assistant text is private — recipients only see "
-            "tool-sent messages. Every turn must end with commit_turn."
+            "Send a tool-visible message to agents (or recipient 'user'). "
+            "Assistant text is private. Prefer ask_agent (needs reply) or "
+            "notify_agent (FYI). To close an ask, pass replyTo=the original "
+            "reply_contract_id. End the turn with commit_turn."
         ),
         "properties": {
             "recipients": {"type": "array", "aliases": ["recipient", "to", "targets"]},
@@ -392,34 +543,62 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "type": "boolean",
                 "aliases": ["expect_report"],
                 "description": (
-                    "Prefer ask_agent instead. True when recipient must reply. "
-                    "Also auto-set when message text clearly requests a reply."
+                    "True when the recipient must reply. Not inferred from "
+                    "message wording — set this or use ask_agent."
                 ),
             },
             "priority": {"type": "string", "aliases": ["level"]},
+            "replyTo": {
+                "type": "string",
+                "aliases": ["reply_to", "replyContractId"],
+                "description": (
+                    "Original message's reply_contract_id. Required to close "
+                    "an ask; do not pass a tool-result message id."
+                ),
+            },
         },
         "required": ["recipients", "message"],
     },
     "ask_agent": {
         "description": (
-            "Ask agents and REQUIRE a reply. Use for verification, opinions, "
-            "reports. Prefer over send_message(expectReport=true)."
+            "Ask agents and require a reply. Prefer over "
+            "send_message(expectReport=true). When answering an existing ask, "
+            "pass replyTo=that message's reply_contract_id (not the "
+            "tool-result message id) or a new obligation is created."
         ),
         "properties": {
             "recipients": {"type": "array", "aliases": ["recipient", "to", "targets", "target"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
             "priority": {"type": "string", "aliases": ["level"]},
+            "replyTo": {
+                "type": "string",
+                "aliases": ["reply_to", "replyContractId"],
+                "description": (
+                    "Original message's reply_contract_id. Required to close "
+                    "an ask; do not pass a tool-result message id."
+                ),
+            },
         },
         "required": ["recipients", "message"],
     },
     "notify_agent": {
         "description": (
-            "FYI notify — does NOT require a reply. Prefer for status broadcasts."
+            "FYI notify — does not require a reply. When answering an "
+            "existing ask, pass replyTo=that reply_contract_id to close it "
+            "without opening a new one."
         ),
         "properties": {
             "recipients": {"type": "array", "aliases": ["recipient", "to", "targets", "target"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
             "priority": {"type": "string", "aliases": ["level"]},
+            "replyTo": {
+                "type": "string",
+                "aliases": ["reply_to", "replyContractId"],
+                "description": (
+                    "Original message's reply_contract_id. Closes an ask "
+                    "without creating a new reply obligation."
+                ),
+            },
         },
         "required": ["recipients", "message"],
     },
@@ -461,8 +640,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "defer_task_advance": {
         "description": (
-            "不推进：本轮无法推动可行动任务时调用。声明后平台停止 [TASK ADVANCE] "
-            "循环提醒，直到再次被唤醒。需要非空 reason。"
+            "Declare this turn cannot advance actionable tasks. Stops "
+            "[TASK ADVANCE] nudges until the next wake. Requires a concrete "
+            "reason. Does not replace commit_turn."
         ),
         "properties": {
             "reason": {
@@ -474,29 +654,40 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["reason"],
     },
     "hire_agent": {
-        "description": "Creates and deploys a new agent with a specified name, role, goal, and backstory. Use it to bring new team members into the organization. Returns the new agent ID.",
+        "description": (
+            "Hire and deploy an agent. Returns the new agent id. role is a "
+            "display title (executors: module+job, not bare 前端工程师). "
+            "permissionType=coordinator|executor sets authority. Skills: "
+            "\"#N\" from list_available_skills or a full slug — not raw "
+            "tech names."
+        ),
         "properties": {
             "name": {"type": "string"},
             "role": {"type": "string", "description": "Chinese job title (display label — does NOT set permission; use permissionType). For executors MUST include owned module, e.g. 签到排行榜工程师 / 认证API工程师 — NOT bare 前端工程师."},
             "permissionType": {
                 "type": "string",
                 "enum": ["coordinator", "executor"],
-                "description": "MANDATORY. coordinator = manages subordinates (dispatch_task/review_task); executor = hands-on work (claim_task/submit_task). CEO's hiring request specifies this — pass it through verbatim.",
+                "description": "coordinator = manages subordinates (dispatch_task/review_task); executor = hands-on work (claim_task/submit_task). Pass through the requester's value.",
             },
             "goal": {"type": "string"},
-            "backstory": {"type": "string"},
-            "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills to bind. Tool skills: use \"#N\" to reference skills from list_available_skills by number (e.g. \"#1\"). Discipline skills: use full slug from matching table (e.g. \"self-review\", \"incremental-implementation\"). NOT raw tech names like 'React 18'."},
-            "parentId": {"type": "string", "aliases": ["parent_id", "parent"]},
+            "systemPrompt": {
+                "type": "string",
+                "aliases": ["system_prompt", "backstory"],
+                "description": "2-4 sentence character narrative (also accepted as backstory).",
+            },
+            "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills to bind. Tool skills: use \"#N\" to reference skills from list_available_skills by number (e.g. \"#1\"). Discipline skills: use full slug from matching table (e.g. \"self-review\"). NOT raw tech names like 'React 18'."},
+            "parentId": {"type": "string", "aliases": ["parent_id", "parent", "parentAgentId", "parent_agent_id"]},
+            "templateId": {"type": "string", "aliases": ["template_id"]},
         },
         "required": ["name", "role"],
     },
     "read_charter": {
-        "description": "Reads the organization charter document. Use it to review the mission, purpose, rules, and operating principles that govern the agent organization. Returns the charter text.",
+        "description": "Read the organization charter (mission, rules).",
         "properties": {},
         "required": [],
     },
     "save_charter": {
-        "description": "Creates or updates the organization charter document. Use it to define or amend the mission, purpose, rules, and operating principles. Takes the charter content as input.",
+        "description": "Create or replace the organization charter.",
         "properties": {
             "content": {"type": "string", "aliases": ["charter", "body", "text"]},
             "title": {"type": "string", "aliases": ["name"]},
@@ -504,12 +695,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["content"],
     },
     "read_goals": {
-        "description": "Reads the current organizational goals and objectives. Use it to review what the organization is working toward. Returns the goals document.",
+        "description": "Read current organization goals.",
         "properties": {},
         "required": [],
     },
     "update_goals": {
-        "description": "Updates the organizational goals, objectives, focus areas, and key results. Use it to set or revise what the organization and its agents are working toward.",
+        "description": "Update organization goals. At least one field must be set.",
         "properties": {
             "objective": {"type": "string"},
             "focus": {"type": "string"},
@@ -519,14 +710,20 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "read_memory": {
-        "description": "Reads previously stored memory or state. moduleId is a filter: pass it to read only that module's entry, omit to list all. Each moduleId holds a single entry (latest write wins).",
+        "description": (
+            "Read stored memory. Pass moduleId for one entry; omit to list "
+            "all. One entry per moduleId (latest write wins)."
+        ),
         "properties": {
             "moduleId": {"type": "string", "aliases": ["module_id", "id", "key"]},
         },
         "required": [],
     },
     "write_memory": {
-        "description": "Writes content to the agent memory system under a given module ID, with optional tags. One entry per moduleId: re-writing the same moduleId OVERWRITES the previous entry (upsert by design). To accumulate history, use a distinct moduleId per entry (e.g. suffix with date).",
+        "description": (
+            "Upsert memory under moduleId (same id overwrites). To keep "
+            "history, use a distinct moduleId per entry."
+        ),
         "properties": {
             "content": {"type": "string", "aliases": ["data", "body", "text", "memory"]},
             "moduleId": {"type": "string", "aliases": ["module_id", "id", "key"]},
@@ -535,26 +732,30 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["content"],
     },
     "list_available_skills": {
-        "description": "Lists all skills available in the marketplace (built-in + external + skills.sh). Pass 'search' to filter by keyword. Returns numbered skills (e.g. #1, #2). Use \"#N\" in hire_agent's skills parameter to reference by number, or use full slug.",
+        "description": (
+            "List marketplace skills (built-in + external + skills.sh). "
+            "Pass search to filter. Returns numbered rows (#1, #2); pass "
+            "\"#N\" or the full slug to hire_agent."
+        ),
         "properties": {
             "search": {"type": "string", "description": "Optional keyword to filter skills (e.g. 'react', 'testing', 'planning'). Case-insensitive."},
         },
         "required": [],
     },
     "read_skill": {
-        "description": "Reads the documentation and definition of a specific skill by name or slug. Use it to understand what a skill does, how to use it, and how to invoke it.",
+        "description": "Read a skill's SKILL.md by name or slug.",
         "properties": {
             "skill": {"type": "string", "aliases": ["name", "slug", "id"]},
         },
         "required": ["skill"],
     },
     "read_roster": {
-        "description": "Read the team roster listing all agents and their roles/departments.",
+        "description": "List agents with role and department.",
         "properties": {},
         "required": [],
     },
     "update_roster": {
-        "description": "Update an agent's position, department, responsibilities, or status in the roster.",
+        "description": "Update one agent's roster fields (position, department, status).",
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "target", "id"]},
             "position": {"type": "string"},
@@ -566,12 +767,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["agentId"],
     },
     "view_org_chart": {
-        "description": "View the full organizational hierarchy tree showing reporting lines.",
+        "description": "Show the reporting tree.",
         "properties": {},
         "required": [],
     },
     "list_subordinates": {
-        "description": "List your direct reports (subordinates).",
+        "description": "List your direct reports.",
         "properties": {},
         "required": [],
     },
@@ -588,7 +789,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["alarmId"],
     },
     "schedule_alarm": {
-        "description": "Schedule an alarm to fire after a game-time delay, optionally repeating.",
+        "description": (
+            "Schedule a game-time alarm (optional repeat). Does not unblock "
+            "a blocked task — that needs wakeAt on update_task_status."
+        ),
         "properties": {
             "toAgentId": {"type": "string", "aliases": ["to_agent_id", "target"]},
             "purpose": {"type": "string", "aliases": ["message", "description"]},
@@ -600,7 +804,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["toAgentId", "purpose", "fireInGameSeconds"],
     },
     "read_work_logs": {
-        "description": "Read work logs. Can read any agent's logs (including your own, subordinates, or peers). Use agentId to specify whose logs to read; omit it to read all subordinates' logs. Each log entry shows what the agent did (type) and a summary.",
+        "description": (
+            "Read work logs. Pass agentId for one agent; omit to read your "
+            "subordinates. Each row is type + summary."
+        ),
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "target"]},
             "limit": {"type": "integer", "aliases": ["count", "max"]},
@@ -608,7 +815,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "run_code_review": {
-        "description": "Analyze files for code quality, correctness, and style issues. Returns findings.",
+        "description": "LLM review of files for quality, correctness, and style. Returns findings — not a test_run attestation.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -618,7 +825,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "run_security_audit": {
-        "description": "Analyze files for security vulnerabilities. Returns findings.",
+        "description": "LLM review of files for security issues. Returns findings — not a test_run attestation.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -628,7 +835,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "run_tests": {
-        "description": "Run tests for specified files and return results.",
+        "description": "Run the project's tests for the given files. For review evidence prefer bash(..., taskId=...).",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module", "testPath"]},
@@ -638,7 +845,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "run_perf_audit": {
-        "description": "Analyze files for performance bottlenecks. Returns optimization suggestions.",
+        "description": "LLM review of files for performance issues. Returns suggestions — not a test_run attestation.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -648,7 +855,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "run_full_review": {
-        "description": "Run all review types (code, security, tests, performance) combined.",
+        "description": "Run code, security, test, and performance reviews together. Returns findings — not a test_run attestation.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -680,7 +887,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Agent management —
     "dismiss_agent": {
-        "description": "Permanently remove/fire an agent from the organization. Cannot be undone.",
+        "description": "Archive/fire an agent. Cannot be undone. Prefer transfer_agent or bind_skill first.",
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "id", "target"]},
         },
@@ -700,7 +907,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "bind_skill": {
-        "description": "Attach a skill to an agent, granting them that capability.",
+        "description": "Bind a skill slug (or \"#N\" from list_available_skills) to an agent.",
         "properties": {
             "agentId": {"type": "string", "aliases": ["agent_id", "id"]},
             "skill": {"type": "string", "aliases": ["slug", "name", "skillSlug"]},
@@ -717,24 +924,33 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Messaging —
     "message_subordinate": {
-        "description": "Send a message to ALL your direct subordinates at once. Use dispatch_task to delegate specific work.",
+        "description": (
+            "Message ALL direct reports at once (recipient is ignored). "
+            "FYI only — for a reply use ask_agent; for assigned work use "
+            "dispatch_task."
+        ),
         "properties": {
-            "recipient": {"type": "string", "aliases": ["to", "target", "agentId", "agent_id"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
-            "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
+            "recipient": {
+                "type": "string",
+                "aliases": ["to", "target", "agentId", "agent_id"],
+                "description": "Ignored. Always broadcasts to every direct report.",
+            },
         },
-        "required": ["recipient", "message"],
+        "required": ["message"],
     },
     "message_superior": {
-        "description": "Send a message to your parent/superior. Use submit_task when finishing a delegated task. DEPRECATED: message_superior is only for questions, not task completion.",
+        "description": (
+            "Message your parent (FYI). For finishing assigned work use "
+            "submit_task. For a required reply use ask_agent."
+        ),
         "properties": {
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
-            "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
         },
         "required": ["message"],
     },
     "message_peer": {
-        "description": "Send a direct message to a single peer agent at the same level.",
+        "description": "Message one same-level peer (FYI). For a required reply use ask_agent.",
         "properties": {
             "recipient": {"type": "string", "aliases": ["to", "target", "agentId", "agent_id"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
@@ -742,27 +958,45 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["recipient", "message"],
     },
     "message_team": {
-        "description": "Broadcast a message to every agent in a specified team.",
+        "description": "Broadcast to every agent in the project except you (FYI).",
         "properties": {
-            "teamId": {"type": "string", "aliases": ["team_id", "team"]},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
         },
-        "required": ["teamId", "message"],
+        "required": ["message"],
     },
-    # — Dispatch + review —
     "dispatch_task": {
-        "description": "Deliver work to a subordinate NOW: creates/reuses a Task Ledger entry AND sends inbox (wakes them). Default for immediate work. If you already called create_task (draft or queue), pass taskId to avoid a duplicate. create_task alone does NOT wake anyone.",
+        "description": (
+            "Assign work now: ledger entry AND inbox wake. Pass taskId to "
+            "reuse a create_task draft. create_task alone does not wake anyone. "
+            "Same-assignee duplicates cannot be forced."
+        ),
         "properties": {
-            "target": {"type": "string", "aliases": ["toAgentId", "to_agent_id", "recipient", "agentId"]},
-            "task": {"type": "string", "aliases": ["description", "message", "content", "summary"]},
+            "target": {"type": "string", "aliases": ["toAgentId", "to_agent_id", "recipient", "agentId", "subordinate", "agent_id"]},
+            "task": {"type": "string", "aliases": ["description", "message", "content", "summary", "desc"]},
             "expectReport": {"type": "boolean", "aliases": ["expect_report"]},
-            "taskId": {"type": "string", "aliases": ["task_id", "existing_task_id"],
+            "taskId": {"type": "string", "aliases": ["task_id", "existing_task_id", "existingTaskId"],
                 "description": "Optional: reuse an existing task instead of creating a new one"},
+            "force": {
+                "type": "boolean",
+                "description": "Create despite a cross-assignee/structured dup. Same-assignee dup cannot be forced.",
+            },
+            "parentTaskId": {"type": "string", "aliases": ["parent_task_id"]},
+            "expectedModules": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["expected_modules"],
+            },
+            "artifactRefs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["artifact_refs", "required_paths"],
+                "description": "Paths the assignee must be able to read (checked in their worktree).",
+            },
         },
         "required": ["target", "task"],
     },
     "review": {
-        "description": "Review code, design, or deliverables for quality. Specify reviewType (code_review/security_audit/test_review/perf_audit).",
+        "description": "Run a local review suite (code_review|security_audit|test_review|perf_audit) on filePaths. Returns findings — not a test_run attestation.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -773,7 +1007,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "request_review": {
-        "description": "Ask a specific reviewer to review code, design, or deliverables.",
+        "description": "DEPRECATED. Use review_task(taskId, decision=...).",
         "properties": {
             "reviewerId": {"type": "string", "aliases": ["reviewer_id", "reviewer", "target", "agentId"]},
             "target": {"type": "string", "aliases": ["file", "path", "module", "description"]},
@@ -804,7 +1038,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["subordinate", "reason"],
     },
     "write_work_log": {
-        "description": "Record what you just did in your work log. Use todowrite for planning future tasks.",
+        "description": "Append a durable record of work just done. todowrite is only this-turn planning.",
         "properties": {
             "summary": {"type": "string", "aliases": ["message", "content", "description"]},
             "details": {"type": "string", "aliases": ["data", "extra"]},
@@ -823,11 +1057,22 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "git_worktree_merge": {
-        "description": "Merge a worktree branch into main and remove the worktree. On conflict: abort + rework executor to rebase/merge main in their worktree. On success: spawn VERIFY only for tasks covered by this merge.",
+        "description": (
+            "Merge a worktree branch into main and remove the worktree. "
+            "Pass taskId to hit hw/<shortId>/t-<taskId[:8]>. On conflict: "
+            "abort — rework the executor to rebase main in their worktree. "
+            "On success: spawn VERIFY only for tasks this merge covers."
+        ),
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
+            "targetBranch": {"type": "string", "aliases": ["target_branch", "target"]},
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id"],
+                "description": "Optional. Tries hw/<shortId>/t-<taskId[:8]> first.",
+            },
             "dryRun": {"type": "boolean", "aliases": ["dry_run", "preflight"],
-                "description": "Preflight (dry-run): only check preconditions (worktree health / dirty main / branch exists) and list ALL missing items. No merge, no teardown. Default false."},
+                "description": "Preflight only: list missing items. No merge, no teardown. Default false."},
         },
         "required": ["branchName"],
     },
@@ -860,7 +1105,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Network + file ops —
     "webfetch": {
-        "description": "Fetch a URL, extract readable text, and optionally answer a question about the page. Has SSRF protection.",
+        "description": (
+            "Fetch a URL and extract readable text. Optional prompt to "
+            "answer from the page. SSRF-blocked."
+        ),
         "properties": {
             "url": {"type": "string", "aliases": ["link", "href", "address"]},
             "prompt": {"type": "string", "aliases": ["query", "question", "instruction"]},
@@ -877,14 +1125,20 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Task Ledger tools (Task 4) —
     "create_task": {
-        "description": "Write a task into the Task Ledger only (status=created). Does NOT send inbox or wake anyone — even with assigneeId. Use for (1) drafting with acceptance criteria before dispatch_task(taskId=...), or (2) queue-only parking until ready. To actually assign and wake a subordinate, you MUST call dispatch_task.",
+        "description": (
+            "Write a Task Ledger row. Does not inbox/wake anyone. Unassigned "
+            "→ created; with assigneeId → claimed (assign=claim), except "
+            "VERIFY stays created until the serial lock is free. To wake, "
+            "call dispatch_task (pass taskId to reuse). Prefer "
+            "dispatch_task(taskId=…) to transfer an existing task."
+        ),
         "properties": {
             "title": {"type": "string", "aliases": ["name", "summary"]},
             "description": {"type": "string", "aliases": ["detail", "body"]},
             "priority": {"type": "integer", "aliases": ["level"],
-                "description": "Priority level (0-5, default: 2). Higher = more urgent."},
+                "description": "1=high, 2=normal (default), 3=low."},
             "dueAt": {"type": "integer", "aliases": ["due_at", "deadline"],
-                "description": "Due time in game-time seconds (epoch). Use 0 or omit for no deadline."},
+                "description": "Optional due time as epoch milliseconds."},
             "assigneeId": {"type": "string", "aliases": ["assignee_id", "assignee"]},
             "acceptanceCriteria": {"type": "array", "items": {"type": "string"},
                 "aliases": ["acceptance_criteria"]},
@@ -894,18 +1148,32 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "expectedModules": {"type": "array", "items": {"type": "string"},
                 "aliases": ["expected_modules"]},
             "tags": {"type": "array", "items": {"type": "string"}},
+            "contractJson": {
+                "type": "object",
+                "aliases": ["contract_json", "contract"],
+                "description": "Optional slice contract (ready gate + machine acceptance).",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "Create despite a cross-assignee/structured dup. Same-assignee dup cannot be forced.",
+            },
         },
         "required": ["title", "description"],
     },
     "claim_task": {
-        "description": "Claim a task in 'created' status (created → claimed). Sets you as the assignee. Only unassigned or created tasks can be claimed.",
+        "description": "Claim a created/unassigned task (created → claimed). Sets you as assignee.",
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
         },
         "required": ["taskId"],
     },
     "update_task_status": {
-        "description": "Update task status to 'running' (start or unblock work) or 'blocked'. For 'running', tries start first then unblock. For 'blocked', declare an auto-unblock path: pass dependsOnTaskIds (blocker task ids) and/or wakeAt (deadline) — a block with neither is rejected. If status omitted, defaults to 'running'.",
+        "description": (
+            "Set status to running (start or unblock) or blocked. "
+            "blocked requires dependsOnTaskIds and/or wakeAt — a block "
+            "with neither is rejected. Status omitted defaults to running. "
+            "blockedReason is a note only, never an unblock path."
+        ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
             "status": {"type": "string",
@@ -930,7 +1198,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["taskId"],
     },
     "update_progress": {
-        "description": "Update task progress as a percentage (0-100). Does not change task status. Use while a task is running.",
+        "description": "Set task progress 0-100. Does not change status.",
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
             "progress": {"type": "integer", "aliases": ["percent"],
@@ -939,7 +1207,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["taskId", "progress"],
     },
     "submit_task": {
-        "description": "Submit a task for review. REQUIRES testsPassed=true after running real tests. Auto claim+start if needed. Optional testOutput strengthens evidence.",
+        "description": (
+            "Submit for review (running → submitted). testsPassed must be "
+            "true after real tests. Pass attestationIds from bash/browse. "
+            "dryRun=true lists missing items without submitting."
+        ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
             "summary": {"type": "string", "aliases": ["report", "description"]},
@@ -961,12 +1233,40 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 ),
             },
             "dryRun": {"type": "boolean", "aliases": ["dry_run", "preflight"],
-                "description": "Preflight (dry-run): only check preconditions (attestation ids / core interaction / delivery gate / files_changed existence) and list ALL missing items. No submit, no notifications. Default false."},
+                "description": "Preflight only: list missing items. No submit. Default false."},
+            "failuresAcknowledged": {
+                "type": "array",
+                "aliases": ["failures_acknowledged", "acknowledgedFailures"],
+                "description": "VERIFY only: when tests report failures, list {test, reason} per case. Free-text excuses are rejected.",
+            },
+            "coreInteractionExecuted": {
+                "type": "boolean",
+                "aliases": ["core_interaction_executed"],
+                "description": "UI VERIFY: true if core canvas/DOM interaction ran. Prefer unset — platform accepts a core_interaction browse_e2e attestation.",
+            },
+            "commitHash": {
+                "type": "string",
+                "aliases": ["commit_hash"],
+                "description": "Optional MAIN commit hash for VERIFY evidence.",
+            },
+            "envSnapshot": {
+                "type": "string",
+                "aliases": ["env_snapshot"],
+                "description": "Optional environment snapshot for VERIFY evidence.",
+            },
         },
         "required": ["summary", "testsPassed"],
     },
     "review_task": {
-        "description": "Review a submitted task (reviewing → approved/rework). approve requires FRESH execution evidence bound to this taskId (or an ancestor task) — not bare testsPassed. BEFORE approving: run tests yourself via bash(command='<test cmd>', taskId='<this task id>') and pass them (exit=0; failed tests do not unlock the gate) — VERIFY tasks on MAIN, code tasks in the assignee's (or your own) worktree. Alternative: consume assignee/QA test_run evidence, or waive_attestation and let a DIFFERENT agent approve (sole-reviewer small team may self-approve; VERIFY waive is CEO-only). docs_only tasks: use attest_doc_review instead — no test_run needed and waive is rejected. If rejected for missing evidence, do NOT retry approve — run tests with taskId first. Does NOT spawn VERIFY — next call git_worktree_merge; VERIFY is created only after merge succeeds.",
+        "description": (
+            "Review a submitted task: decision=approve|rework. approve needs "
+            "fresh test_run (or docs_only attest_doc_review) bound to this "
+            "taskId — not bare testsPassed. Run tests yourself with "
+            "bash(..., taskId=this) first; if rejected for missing evidence, "
+            "do not retry approve. Does not spawn VERIFY — call "
+            "git_worktree_merge next. waive_attestation: another agent must "
+            "approve (VERIFY waive is CEO-only)."
+        ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
             "decision": {"type": "string",
@@ -978,11 +1278,229 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["taskId", "decision"],
     },
     "get_tasks": {
-        "description": "List tasks in the Task Ledger. Optional filters by status (e.g. 'created', 'claimed', 'running', 'blocked', 'submitted', 'reviewing', 'approved', 'rework', 'closed') or assignee. Excludes archived tasks.",
+        "description": (
+            "List Task Ledger rows. Optional status or assigneeId. "
+            "Excludes archived."
+        ),
         "properties": {
             "status": {"type": "string"},
             "assigneeId": {"type": "string",
                 "aliases": ["assignee_id", "assignee"]},
+        },
+        "required": [],
+    },
+    "attest_doc_review": {
+        "description": (
+            "Machine-check document files (exist; optional minLines). "
+            "Creates a doc_review attestation. source=auto prefers your "
+            "worktree, else project main. Returns attestationId for "
+            "submit_task / review_task. Tag docs_only so approve needs this "
+            "kind, not test_run."
+        ),
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id"]},
+            "files": {
+                "type": "array",
+                "description": "Each {path, minLines?}. Paths relative to the chosen root.",
+            },
+            "source": {
+                "type": "string",
+                "enum": ["auto", "worktree", "main"],
+                "aliases": ["workspaceSource", "workspace"],
+                "description": "Where to read files. Default auto.",
+            },
+        },
+        "required": ["files"],
+    },
+    "cancel_task": {
+        "description": (
+            "Archive a mistaken or obsolete task (coordinator). It leaves "
+            "lists and obligations. Prefer unclaim+dispatch when the task "
+            "is still needed."
+        ),
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "reason": {
+                "type": "string",
+                "aliases": ["feedback", "comment", "description", "message", "why", "note"],
+                "description": "Why this task is cancelled (audit).",
+            },
+        },
+        "required": ["taskId", "reason"],
+    },
+    "unclaim_task": {
+        "description": (
+            "Release a claimed task back to created and clear assignee "
+            "(coordinator). Then dispatch_task to the right agent."
+        ),
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+        },
+        "required": ["taskId"],
+    },
+    "reassign_task": {
+        "description": (
+            "Transfer assignee and obligation (coordinator/CEO). Messages "
+            "alone create no obligation. Wakes the new assignee. A queued "
+            "VERIFY stays queued until MAIN is free."
+        ),
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "assigneeId": {
+                "type": "string",
+                "aliases": ["assignee_id", "to"],
+                "description": "New assignee (id, short_id, or 花名).",
+            },
+            "reason": {"type": "string"},
+        },
+        "required": ["taskId", "assigneeId"],
+    },
+    "waive_attestation": {
+        "description": (
+            "Last-resort waiver of the attestation gate (coordinator/CEO). "
+            "Requires evidenceAttestationId of a real test_run / browse_e2e / "
+            "visual_check / doc_review. Max 2 per task. The waiving agent "
+            "cannot later approve. Prefer attest_doc_review for docs_only."
+        ),
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "reason": {"type": "string"},
+            "evidenceAttestationId": {
+                "type": "string",
+                "aliases": ["evidence_attestation_id"],
+                "description": "Id of a real execution attestation. Pure read_file is not enough.",
+            },
+        },
+        "required": ["taskId", "reason", "evidenceAttestationId"],
+    },
+    "waive_merge": {
+        "description": (
+            "Last-resort waiver of merge-before-close (coordinator/CEO). "
+            "Prefer git_worktree_merge. After this, close may proceed; "
+            "evidence records merge_waived."
+        ),
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "reason": {"type": "string", "description": "Auditable reason (min 20 chars)."},
+        },
+        "required": ["taskId", "reason"],
+    },
+    "check_agent_status": {
+        "description": (
+            "Read-only: busy/idle, disposition, unread_wake. Call this "
+            "before claiming someone is busy or nagging a silence. "
+            "Pass agentId (花名/short_id/UUID); omit to list the project."
+        ),
+        "properties": {
+            "agentId": {
+                "type": "string",
+                "aliases": ["agent_id", "name", "target"],
+                "description": "花名, short_id, or UUID. Not a role title. Omit to list all.",
+            },
+        },
+        "required": [],
+    },
+    "check_agent_progress": {
+        "description": (
+            "CEO read-only snapshot: disposition, open obligations, last "
+            "output. Does not send messages or wake anyone."
+        ),
+        "properties": {
+            "agentId": {
+                "type": "string",
+                "aliases": ["agent_id", "name", "target"],
+                "description": "花名, short_id, or UUID.",
+            },
+        },
+        "required": ["agentId"],
+    },
+    "get_platform_state": {
+        "description": (
+            "Read-only platform ground truth (gates, ledger, org, runtime) "
+            "tagged verified/claimed/unknown. Trust this over peer chat "
+            "when they conflict."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    "git_worktree_create": {
+        "description": (
+            "Always rejected for agents. Worktrees are created on "
+            "hire/dispatch. After approve, git_worktree_merge."
+        ),
+        "properties": {
+            "branchName": {
+                "type": "string",
+                "aliases": ["branch_name", "branch", "name", "taskName", "task_name", "task"],
+            },
+            "baseBranch": {
+                "type": "string",
+                "aliases": ["base_branch", "base"],
+            },
+        },
+        "required": ["branchName"],
+    },
+    "start_dev_server": {
+        "description": (
+            "Start the project Vite/dev server on a non-reserved port "
+            "(never 4000/5173/4173). Registers pid/cwd/port. Prefer this "
+            "over bare npm run dev / vite. Extra env belongs in "
+            ".hiveweave/env.sh or an inline VAR=x prefix."
+        ),
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Optional override. Default: npx vite --host 0.0.0.0 --port <P> --strictPort.",
+            },
+            "preferredPort": {
+                "type": "integer",
+                "aliases": ["preferred_port"],
+                "description": "Preferred project port. Must not be 4000/5173/4173.",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Working directory relative to workspace. Default: workspace root.",
+            },
+        },
+        "required": [],
+    },
+    "lookup_dev_server": {
+        "description": (
+            "List this project's registered dev servers. Pass preferredPort "
+            "to filter one port; omit to list all."
+        ),
+        "properties": {
+            "preferredPort": {
+                "type": "integer",
+                "aliases": ["preferred_port", "port"],
+            },
+        },
+        "required": [],
+    },
+    "message_user": {
+        "description": (
+            "Send a message to the human operator. Assistant text is not "
+            "delivered — only this tool is. CEO终验 uses this."
+        ),
+        "properties": {
+            "message": {"type": "string", "aliases": ["content", "body", "text"]},
+            "priority": {"type": "string", "aliases": ["level"]},
+        },
+        "required": ["message"],
+    },
+    "request_code_audit": {
+        "description": (
+            "One-shot LLM audit of your worktree diff. Required before "
+            "submit_task when cumulative code edits exceed 20 lines. "
+            "Returns VERDICT PASS/ISSUES; ISSUES do not block submit. "
+            "Runs on YOUR model (one extra LLM call)."
+        ),
+        "properties": {
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id", "id"],
+                "description": "Optional. Omit to audit the current running task / whole worktree.",
+            },
         },
         "required": [],
     },

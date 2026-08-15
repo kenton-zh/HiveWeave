@@ -439,24 +439,25 @@ class EditFileParams(BaseModel):
     )
     old_string: str = Field(
         alias="oldString",
-        description="Text to find in the file.",
+        description="Literal text to replace. Must match exactly.",
         json_schema_extra={"aliases": ["old_string", "old_str", "oldText", "search"]},
     )
     new_string: str = Field(
         alias="newString",
-        description="Replacement text.",
+        description="Literal replacement. Empty string deletes the match.",
         json_schema_extra={"aliases": ["new_string", "new_str", "newText", "replace"]},
     )
     replace_all: bool = Field(
         default=False,
-        description="If true, replace all occurrences.",
+        description="Replace all matches. Default false: old_string must appear exactly once.",
         json_schema_extra={"aliases": ["replaceAll"]},
     )
 
 
 @tool(
     "apply_patch",
-    "Apply file patch operations (create/update/delete files). Each patch specifies a file path, operation type, and content.",
+    "Apply file patch operations (add/update/delete). Prefer this or "
+    "edit_file for a small change; write_file fully replaces a file.",
     requires_workspace=True,
     security_level="file_op",
 )
@@ -481,7 +482,9 @@ async def apply_patch_tool(params: ApplyPatchParams, agent_id: str, workspace: s
 
 @tool(
     "edit_file",
-    "Targeted text replacement in a file. Finds old_string and replaces with new_string. Use apply_patch for multi-file operations.",
+    "Edit an existing UTF-8 text file by replacing literal text. "
+    "old_string must match exactly. Default: it must appear exactly once. "
+    "Empty new_string deletes the match. Prefer apply_patch for multi-file.",
     requires_workspace=True,
     security_level="file_op",
 )

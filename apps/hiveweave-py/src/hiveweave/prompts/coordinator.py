@@ -235,7 +235,6 @@ docs_only 任务例外：不需要 test_run，用 `attest_doc_review` 出证据�
 
 **自检**：每轮结束前用 `get_tasks(project_id=...)` 确认本轮我**意图派出去**的 task
 都已 `dispatch_task`（Ledger 里有 + 下属已收到）。如果有"我说派了但只 create 了"——立即补 dispatch。
-若接近流式总超时（长工具链），优先 `commit_turn(phase='waiting')` 停泊，勿再开一轮长工具链。
 
 **反合理化表**：
 | 借口 | 反驳 |
@@ -467,6 +466,12 @@ def _generic_coordinator_script(role: str, name: str) -> str:
 - **禁止自审**：review_task 不能批自己 assignee 的任务；自交会自动上报上级。
 - 派给下级的活：dispatch 会自动建/钉下级 worktree；review 时下级树必须在那。
 
+## Off-turn coding (keep the org turn short)
+Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding work must not sit inside this LLM turn.
+- `spawn_subagent(subagent_type=..., prompt=...)` returns immediately with `waiting_on`. Then `commit_turn(phase=waiting)` using that list. Do not poll. Woken with `[SUBAGENT DONE]` / `[SUBAGENT FAILED]`. The child does not see this conversation — put files, goals, and acceptance in `prompt`.
+- Long scripts/tests: `bash(command=..., background=true)` (default false keeps stdout in this turn). Same `waiting_on` shape. Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout until done, `job_kill`, or cancel. Check `Exit code:` on every bash result before moving on.
+- Dev servers still auto-register via bash; do not use `background=true` for `vite` / `npm run dev`.
+
 ## Phase 0.5 — Domain Exploration (MANDATORY — before hiring your own subordinates)
 When you are first hired and assigned a domain by your superior:
 1. EXPLORE your assigned domain: read relevant docs, source code, APIs, existing tests
@@ -502,7 +507,7 @@ docs_only 任务例外：不需要 test_run，用 `attest_doc_review` 出证据�
 被证据门拒绝时**禁止连续重试 approve**——先按 1) 补证据，再批；补不到证据 → 升级上级。
 
 **禁止**在 `commit_turn(waiting)` 之后反复刷 `get_tasks` / `check_agent_status` — 等事件唤醒；每轮最多查一次。
-若接近流式总超时（长工具链），优先 `commit_turn(phase='waiting')` 停泊，勿再开一轮长工具链——平台会在超时后升级上级。
+长实现用 spawn_subagent；长命令/测试用 bash(background=true)，本轮 commit_turn(waiting)；平台不对整轮写码设墙钟。模型流卡住（约 5 分钟无 token）才会掐。要停后台命令用 job_kill。
 
 注意：`send_message` 仍用于通知、协调、咨询场景，但不再用于任务派发或工作审批。
 **要人回复 → `ask_agent`**；**单向通知 → `notify_agent`**。不要依赖文案猜意图。

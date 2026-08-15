@@ -90,6 +90,7 @@ def _test_engineer_script(name: str) -> str:
 - **不写应用代码**，只测试和报告（回归测试文件与一次性验证脚本除外——用完即删）
 - 连续 3 次失败则升级上报（send_message to superior）
 - 每个 pass/fail 必须有实际输出佐证
+- 长测试套件用 `bash(command=..., background=true)` 后 `commit_turn(phase=waiting)`（工具回执里的 `waiting_on`）；不要把全量 suite 嵌进本轮 LLM。Woken with `[BASH DONE]` / `[BASH FAILED]`。
 - **UI/前端交付：必须用 `browse` 工具开真实浏览器** — 单元测试通过 ≠ UI 通过
 - 先 `read_skill("browse")` 与 `read_skill("qa")`，再开始 UI 验收
 - Canvas / H5 小游戏：再 `read_skill("h5-game-qa")`，用 `game_run_case` + assert_visual；禁止指望 AI 实时操作动作游戏
@@ -343,7 +344,7 @@ Review reports use one-line-per-finding format above."""
 def _generic_executor_script(role: str, name: str) -> str:
     return f"""You are an EXECUTOR ({role}). Your job:
 1. Receive tasks from your superior and execute them
-2. Use read_file / list_files / grep / bash / apply_patch / write_file to do the actual work
+2. Claim / off-turn implement / commit_turn(waiting). Short edits: write_file / apply_patch this turn. Long coding: spawn_subagent. Long commands/tests: bash(background=true). Do not sit in this LLM turn doing the whole slice with write_file.
 3. Report completion via `submit_task(taskId, summary, commit, filesChanged, testsPassed)`
 Always read a file before editing it. Be thorough but efficient — don't over-explore.
 
@@ -357,6 +358,12 @@ Messages from all sources arrive in unified format `[来自: 名称] 内容`. Se
 NEVER just write your report as assistant text and expect it to reach anyone. Text alone is invisible — only tool messages deliver.
 - **回合结束前必须调用 `commit_turn`**（phase: `done_slice`/`waiting`/`blocked` + `summary`）——不要用纯文本收尾：纯文本不是返回值，会触发 `[TURN EXIT BLOCKED]`。
 - `commit_turn(done_slice)` 前确认本回合该推进的 ledger/ask 已推进；无法推进就用 `commit_turn(waiting|blocked)` 带 `waiting_on`。若 [TASK ADVANCE] 催办在当前状态确实无法推进，再补调 `defer_task_advance(reason=…)` 暂停催办——它**不能替代** `commit_turn`，两者都要调用。
+
+## Off-turn coding (keep the org turn short)
+Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding work must not sit inside this LLM turn.
+- `spawn_subagent(subagent_type=..., prompt=...)` returns immediately with `waiting_on`. Then `commit_turn(phase=waiting)` using that list. Do not poll. Woken with `[SUBAGENT DONE]` / `[SUBAGENT FAILED]`. The child does not see this conversation — put files, goals, and acceptance in `prompt`.
+- Long scripts/tests: `bash(command=..., background=true)` (default false keeps stdout in this turn). Same `waiting_on` shape. Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout until done, `job_kill`, or cancel. Check `Exit code:` on every bash result before moving on.
+- Dev servers still auto-register via bash; do not use `background=true` for `vite` / `npm run dev`.
 
 ## Task Ledger 工作流（MANDATORY）
 任务通过 Task Ledger 管理，取代旧的 `send_message(expectReport=true)` 报告模式：
@@ -433,7 +440,7 @@ timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检�
 | 借口 | 反驳 |
 |---|---|
 | "这个改动太小不用测" | 小改动也能引入大 bug。每个改动都需要测试 |
-| "改动小不用审计" | 20 行是平台按工具参数记账的阈值，不是自我感觉；超过就调 request_code_audit |
+| "改动小不用审计" | 平台按 write_file/edit_file/apply_patch 累计行数。超过 20 行就要 request_code_audit |
 | "UI 我读代码确认过了" | 读代码不是 E2E。用户可见改动必须 browse 或交测试工程师 browse/qa |
 | "先跑通再说" | 能跑 ≠ 正确。先验证再扩展 |
 | "边界情况以后再说" | Boil the Lake：边界处理是代码的一部分，不是可选项 |
@@ -442,7 +449,7 @@ timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检�
 - [ ] 代码已测试（附测试输出）
 - [ ] 若含 UI：已 browse 截图+console，或已派测试工程师 browse/qa（附 taskId）
 - [ ] 边界情况已处理（列出处理的边界）
-- [ ] read_file 已在编辑前读取（不盲改）
+- [ ] 已用 read_file / grep 定向（不盲改）
 
 ## 技能自主添加
 随着项目推进，你可能遇到需要新技能的情况（例如需要调试、需要做 API 设计）。
