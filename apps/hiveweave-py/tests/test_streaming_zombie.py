@@ -131,30 +131,42 @@ def test_stuck_ms_fires_after_threshold():
     assert stuck is not None and stuck >= 6 * 60_000
 
 
-def test_stuck_ms_spawns_subagent_tool_relaxed():
-    """spawn_subagent 执行中（超时 500s + 60s 余量）→ 6min 静默不冤杀."""
+def test_stuck_ms_spawn_subagent_uses_default_tool_cap():
+    """spawn_subagent is off-turn; 6min quiet while 'executing' is a zombie."""
     now = _now_ms()
     agent = SimpleNamespace(
         _last_stream_activity_at=now - 6 * 60_000,
         _active_tools={"tc-1": ("spawn_subagent", now - 6 * 60_000)},
     )
-    assert _streaming_stuck_ms(agent, now) is None
-    # 超过工具 cap（560s）仍判死
-    agent2 = SimpleNamespace(
-        _last_stream_activity_at=now - 10 * 60_000,
-        _active_tools={"tc-1": ("spawn_subagent", now - 10 * 60_000)},
-    )
-    assert _streaming_stuck_ms(agent2, now) is not None
+    assert _streaming_stuck_ms(agent, now) is not None
 
 
-def test_stuck_ms_normal_tool_not_relaxed_beyond_threshold():
-    """普通工具（超时 120s）执行中 → 6min 静默仍判死（工具本应早已返回）."""
+def test_stuck_ms_bash_within_max_timeout_not_zombie():
+    """Foreground bash may run up to 600s; 6min quiet is still inside cap+60s."""
     now = _now_ms()
     agent = SimpleNamespace(
         _last_stream_activity_at=now - 6 * 60_000,
         _active_tools={"tc-1": ("bash", now - 6 * 60_000)},
     )
+    assert _streaming_stuck_ms(agent, now) is None
+
+
+def test_stuck_ms_bash_fires_after_max_timeout():
+    now = _now_ms()
+    agent = SimpleNamespace(
+        _last_stream_activity_at=now - 12 * 60_000,
+        _active_tools={"tc-1": ("bash", now - 12 * 60_000)},
+    )
     assert _streaming_stuck_ms(agent, now) is not None
+
+
+def test_stuck_ms_write_file_not_killed_at_six_minutes():
+    now = _now_ms()
+    agent = SimpleNamespace(
+        _last_stream_activity_at=now - 6 * 60_000,
+        _active_tools={"tc-1": ("write_file", now - 6 * 60_000)},
+    )
+    assert _streaming_stuck_ms(agent, now) is None
 
 
 # ── sweep：卡住中的流被清 + 强制中断；健康流式不动 ──────────
@@ -381,9 +393,11 @@ async def test_sweep_interrupts_stuck_agent_with_row_older_than_soft_age(env, mo
 
 
 @pytest.mark.asyncio
-async def test_sweep_healthy_long_round_row_cleared_no_interrupt(env, monkeypatch):
-    """C1 回归：健康长回合（30s 前有事件）+ 行 11min 前 → 行被孤儿清理
-    摘掉（既有软龄语义），但 force 不被调用（健康长回合非中断对象）."""
+async def test_sweep_healthy_long_round_row_kept_no_interrupt(env, monkeypatch):
+    """Healthy long round (event 30s ago, row 11min old) stays streaming.
+
+    PROCESSING rows are not age-finalized; stuck detection uses quiet cap.
+    """
     now = _now_ms()
     agent = SimpleNamespace(
         id=HEALTHY_ID,
@@ -403,11 +417,9 @@ async def test_sweep_healthy_long_round_row_cleared_no_interrupt(env, monkeypatc
     with patch.object(status_event_bus, "publish_stream_event", AsyncMock()):
         await GameTimeService()._sweep_orphan_streaming(PROJECT_ID)
 
-    # 行被孤儿清理摘掉（is_streaming=0）、内容保留（非空不回填文案）
     rows = await _streaming_rows(env, HEALTHY_ID)
-    assert rows and all(r[0] == 0 for r in rows)
+    assert rows and all(r[0] == 1 for r in rows)
     assert rows[0][1] == "partial"
-    # 健康长回合超软龄清行是既有语义，不是中断对象
     agent.force_interrupt_stuck_stream.assert_not_awaited()
 
 

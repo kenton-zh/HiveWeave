@@ -19,9 +19,17 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 import hiveweave.llm.streamer.tool_loop as tool_loop_module
 from hiveweave.llm.streamer.core import Streamer
 from hiveweave.llm.streamer.tool_exec import ToolExecMixin
+
+
+@pytest.fixture(autouse=True)
+def _enable_session_wall_clock(monkeypatch):
+    """These tests exercise the opt-in TOTAL/HARD gates."""
+    monkeypatch.setenv("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "1")
 
 
 class _FakeClock:
@@ -262,7 +270,8 @@ def test_budget_exhausted_result_explains_even_without_text():
 # ── 3. 预算帽收紧的工具超时：文案区分「预算耗尽」 ────────────────
 
 
-async def test_budget_capped_timeout_message_explains_budget():
+async def test_budget_capped_timeout_message_explains_budget(monkeypatch):
+    monkeypatch.setenv("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "1")
     te = ToolExecMixin()
 
     async def slow_tool(name, arguments, tool_call_id):
@@ -271,9 +280,9 @@ async def test_budget_capped_timeout_message_explains_budget():
 
     result = await te._execute_single_tool(
         "a1",
-        {"id": "tc-1", "name": "bash", "arguments": "pytest"},
+        {"id": "tc-1", "name": "webfetch", "arguments": "{}"},
         slow_tool,
-        budget_s=3.0,  # 预算帽压到 3s 地板 << bash 自身 120s
+        budget_s=3.0,
     )
     content = result["content"]
     assert "[Tool Timeout]" in content
@@ -281,41 +290,35 @@ async def test_budget_capped_timeout_message_explains_budget():
     assert "do NOT retry the same long call" in content
 
 
-async def test_natural_timeout_message_has_no_budget_note():
+async def test_natural_timeout_message_has_no_budget_note(monkeypatch):
+    monkeypatch.setenv("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "1")
     te = ToolExecMixin()
 
     async def slow_tool(name, arguments, tool_call_id):
         await asyncio.sleep(30)
         return {"content": "never"}
 
-    # 预算充足（500s >> bash 120s）→ 不触发预算帽，用 monkeypatch 把
-    # 自然超时压小以免测试真的等 120s
-    import hiveweave.llm.streamer.tool_exec as te_module
+    import hiveweave.tools.timeout_policy as tp
 
-    original = te_module.TOOL_EXECUTION_TIMEOUT_S
-    te_module.TOOL_EXECUTION_TIMEOUT_S = 0.5
+    original = dict(tp.DECLARED_TIMEOUT_S)
+    tp.DECLARED_TIMEOUT_S["webfetch"] = 0.5
     try:
         result = await te._execute_single_tool(
             "a1",
-            {"id": "tc-1", "name": "bash", "arguments": "pytest"},
+            {"id": "tc-1", "name": "webfetch", "arguments": "{}"},
             slow_tool,
             budget_s=500.0,
         )
     finally:
-        te_module.TOOL_EXECUTION_TIMEOUT_S = original
+        tp.DECLARED_TIMEOUT_S.clear()
+        tp.DECLARED_TIMEOUT_S.update(original)
     content = result["content"]
     assert "[Tool Timeout]" in content
     assert "remaining turn budget" not in content
-    # 自然超时仍带后台+轮询的疏通引导
-    assert "background" in content
 
 
-async def test_budget_capped_timeout_message_question_and_spawn():
-    """question / spawn_subagent 的预算帽文案按工具语义分流（审计补覆盖）：
-
-    question → 引导 commit_turn(waiting) 等答案唤醒，本 turn 勿重问；
-    spawn    → 本 turn 勿再 spawn，checkpoint 后下轮 wake 再 spawn。
-    """
+async def test_budget_capped_timeout_message_question(monkeypatch):
+    monkeypatch.setenv("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "1")
     te = ToolExecMixin()
 
     async def slow_tool(name, arguments, tool_call_id):
@@ -329,18 +332,22 @@ async def test_budget_capped_timeout_message_question_and_spawn():
         budget_s=3.0,
     )
     assert "remaining turn budget" in q["content"]
-    assert "do NOT re-ask this turn" in q["content"]
-    assert "phase='waiting'" in q["content"]
+    assert "do NOT retry the same long call" in q["content"]
 
-    s = await te._execute_single_tool(
+
+async def test_undeclared_bash_not_wrapped_by_streamer_timeout():
+    te = ToolExecMixin()
+
+    async def ok_tool(name, arguments, tool_call_id):
+        return {"content": "ran"}
+
+    result = await te._execute_single_tool(
         "a1",
-        {"id": "tc-s", "name": "spawn_subagent", "arguments": "{}"},
-        slow_tool,
+        {"id": "tc-1", "name": "bash", "arguments": "pytest"},
+        ok_tool,
         budget_s=3.0,
     )
-    assert "remaining turn budget" in s["content"]
-    assert "do NOT spawn subagents this late" in s["content"]
-    assert "phase='in_progress'" in s["content"]
+    assert result["content"] == "ran"
 
 
 # ── 4. 轮闸门：剩余预算不足不开新轮（审计补覆盖） ─────────────────

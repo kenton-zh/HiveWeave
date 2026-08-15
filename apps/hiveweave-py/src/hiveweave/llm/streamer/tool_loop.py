@@ -149,10 +149,17 @@ class ToolLoopMixin:
         # 仍收口兜底。
         blocked_stall_count = 0
 
-        # TEST21 M4: soft/hard turn budget (activity renews soft within hard)
+        # TEST21 M4: soft/hard turn budget is opt-in (session wall clock).
+        # Default off — no session budget; long coding may run long.
         loop_start = time.monotonic()
-        hard_deadline = loop_start + HARD_TOTAL_TIMEOUT_S
-        soft_deadline = loop_start + TOTAL_TIMEOUT_S
+        from .constants import session_wall_clock_enabled
+
+        if session_wall_clock_enabled():
+            hard_deadline = loop_start + HARD_TOTAL_TIMEOUT_S
+            soft_deadline = loop_start + TOTAL_TIMEOUT_S
+        else:
+            hard_deadline = float("inf")
+            soft_deadline = float("inf")
         budget_hint_injected = False
         # pacing 提示一次性；记录注入轮次供 soft 提示做【同轮】去重 ——
         # 永久性压制会让 soft（临近硬截止的最后通牒）在默认常量下成死代码：
@@ -547,9 +554,9 @@ class ToolLoopMixin:
                         }
 
                 # 工具批预算闸门（结构性修复 2026-08-07）：剩余预算不足以
-                # 执行工具批时（一批最长 spawn 500s / question 200s /
-                # bash 120s，可轻松冲过 HARD → 被 agent SAFETY_TIMEOUT
-                # 强杀），丢弃本批 tool_calls 优雅收口。闸口必须在
+                # 执行工具批时（一批最长 question 200s / bash 120s；
+                # spawn_subagent 已改为 off-turn 立即返回），丢弃本批
+                # tool_calls 优雅收口。闸口必须在
                 # assistant(tool_calls) 落账【之前】——否则持久化的
                 # assistant(tool_calls) 缺对应 tool 回执，下次请求 400。
                 # 丢弃无副作用：未执行的工具由下次唤醒重新发起。

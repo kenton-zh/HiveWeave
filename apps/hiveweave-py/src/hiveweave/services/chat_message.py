@@ -294,21 +294,18 @@ class ChatMessageService:
     ) -> int:
         """Auto-heal stuck streaming rows for one project (runtime, not only boot).
 
-        A message is an orphan when ``is_streaming=1`` and either:
-        - its agent is **not** currently PROCESSING (idle / dead / never started), or
-        - it is older than ``soft_age_ms`` (past the 10min safety timeout) —
-          cleared **even if** the agent is still listed as PROCESSING, or
-        - it is older than ``hard_age_ms`` (hard ceiling; same SQL path as soft).
+        A message is an orphan when ``is_streaming=1`` and its agent is
+        **not** currently PROCESSING (idle / dead / never started).
 
-        Legitimate in-flight streams (agent in ``protect_agent_ids`` and younger
-        than soft_age) are left alone. Returns number of rows cleared.
+        PROCESSING agents are left alone here — stuck live streams are
+        handled by ``_streaming_stuck_ms`` / quiet cap, not by a 10-minute
+        age cutoff (that cutoff was the old SAFETY wall clock on the row).
+        ``soft_age_ms`` / ``hard_age_ms`` remain on the signature for call-site
+        compat and are ignored when any agent is protected.
+
+        Returns number of rows cleared.
         """
-        import time as _time
-
         protect = set(protect_agent_ids or ())
-        now_ms = int(_time.time() * 1000)
-        # Soft age bypasses PROCESSING protect (align with SAFETY_TIMEOUT_MS)
-        cutoff = now_ms - min(soft_age_ms, hard_age_ms)
         try:
             if protect:
                 placeholders = ", ".join("?" * len(protect))
@@ -317,11 +314,10 @@ class ChatMessageService:
                     "content = CASE "
                     "  WHEN content IS NULL OR TRIM(content) = '' "
                     "  THEN '[对话被中断]' ELSE content END "
-                    f"WHERE is_streaming = 1 AND ("
-                    f"  agent_id NOT IN ({placeholders}) OR created_at < ?"
-                    f")"
+                    f"WHERE is_streaming = 1 AND "
+                    f"agent_id NOT IN ({placeholders})"
                 )
-                params: list = [*protect, cutoff]
+                params: list = [*protect]
             else:
                 # No agent processing — every streaming row is a zombie
                 sql = (

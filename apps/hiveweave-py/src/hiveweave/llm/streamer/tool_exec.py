@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from .constants import TOOL_EXECUTION_TIMEOUT_S, _QUESTION_TOOL_TIMEOUT_S, _SUBAGENT_TOOL_TIMEOUT_S
+from .constants import session_wall_clock_enabled
 from .doom_loop import doom_loop_limit
 from .poll import (
     _POLL_HARD_REJECT_LIMIT,
@@ -45,9 +45,8 @@ class ToolExecMixin:
         duplicate_ids 标识"同参数已执行过、本次无新效果"的工具调用，供 doom
         tracker 做强制 +1 计数加速触顶。
         end_turn=True 表示本批含已接受的 commit_turn，应硬断工具循环（BUG-3）。
-        budget_s 为 turn 硬预算下本批可用的秒数上限：每个工具的实际超时取
-        min(自身超时, max(3.0, budget_s))（3s 地板防负/零预算产生立即超时
-        语义），防止工具批冲过 agent SAFETY_TIMEOUT。
+        budget_s 只在 session wall clock 开启且工具声明了超时时收紧预算。
+        bash/read/write/edit 不声明，不被 wait_for 包裹。
         """
         counts = poll_turn_counts if poll_turn_counts is not None else {}
         # 广播 tool_use 事件
@@ -131,7 +130,7 @@ class ToolExecMixin:
         poll_turn_counts: dict[tuple[str, str], int] | None = None,
         budget_s: float | None = None,
     ) -> dict:
-        """执行单个工具调用（带 120s 超时；budget_s 给出时按预算收紧）。"""
+        """执行单个工具。仅声明了 timeout 的工具走协作式 wait_for。"""
         tool_name = tool_call["name"]
         arguments = tool_call["arguments"]
         tool_call_id = tool_call["id"]
@@ -179,26 +178,29 @@ class ToolExecMixin:
         if cached is not None:
             return {"content": cached}
 
-        tool_timeout = (
-            _QUESTION_TOOL_TIMEOUT_S
-            if tool_name == "question"
-            else _SUBAGENT_TOOL_TIMEOUT_S
-            if tool_name == "spawn_subagent"
-            else TOOL_EXECUTION_TIMEOUT_S
-        )
+        from hiveweave.tools.timeout_policy import declared_timeout_s
+
+        tool_timeout = declared_timeout_s(tool_name)
         budget_capped = False
-        if budget_s is not None:
-            # Turn 硬预算帽：临近硬截止时收紧工具超时，保证工具批在
-            # hard_deadline 前返回（agent SAFETY_TIMEOUT 是最后的墙，
-            # 不该由它动手）。min 在外：地板值不得反超工具自身超时。
+        if (
+            tool_timeout is not None
+            and budget_s is not None
+            and budget_s != float("inf")
+            and session_wall_clock_enabled()
+        ):
             capped = min(tool_timeout, max(3.0, budget_s))
             budget_capped = capped < tool_timeout
             tool_timeout = capped
         try:
-            result = await asyncio.wait_for(
-                on_tool_call(tool_name, arguments, tool_call_id),
-                timeout=tool_timeout,
-            )
+            if tool_timeout is None:
+                result = await on_tool_call(
+                    tool_name, arguments, tool_call_id
+                )
+            else:
+                result = await asyncio.wait_for(
+                    on_tool_call(tool_name, arguments, tool_call_id),
+                    timeout=tool_timeout,
+                )
             if isinstance(result, dict):
                 content = result.get("content")
                 if isinstance(content, str):
@@ -207,49 +209,19 @@ class ToolExecMixin:
         except TimeoutError:
             log.error("tool_timeout",
                       agent_id=agent_id, tool=tool_name)
-            # 疏通引导（2026-08-07 压测：Aria 全量 pytest 反复撞 120s 超时
-            # → 失败轮堆出 stall break；改用后台+轮询后一次通过）。超时文案
-            # 直接给出可执行的替代路径，而不是只报"超时了"。
-            hint = ""
-            if tool_name in ("bash", "run_command"):
-                hint = (
-                    " If the command legitimately needs longer, run it in the "
-                    "background instead (append `&`, redirect output to a "
-                    "file), then poll the output file in later calls — or "
-                    "narrow the scope (e.g. a focused test subset instead of "
-                    "the full suite)."
-                )
+            ms = int((tool_timeout or 0) * 1000)
+            hint = f" Error: tool call timed out after {ms}ms"
             if budget_capped:
-                # 疏通：区分「命令本身慢」与「turn 预算耗尽」—— 后者下轮
-                # wake 重试同款长调用只会再撞预算帽。文案按工具类型分流
-                # （审计 2026-08-08）：bash 类引导切片/后台轮询；question
-                # 引导 waiting；spawn 引导本 turn 勿再 spawn。
-                if tool_name == "question":
-                    hint += (
-                        " NOTE: cut short by the remaining turn budget, "
-                        "not by the human — do NOT re-ask this turn; call "
-                        "commit_turn(phase='waiting') and let the answer "
-                        "wake you."
-                    )
-                elif tool_name == "spawn_subagent":
-                    hint += (
-                        " NOTE: cut short by the remaining turn budget — "
-                        "do NOT spawn subagents this late in the turn; "
-                        "checkpoint with commit_turn(phase='in_progress') "
-                        "and spawn next wake."
-                    )
-                else:
-                    hint += (
-                        " NOTE: the cap was tightened by the remaining turn "
-                        "budget, not by this tool's own limit — do NOT retry "
-                        "the same long call next wake; split the work or use "
-                        "background + polling."
-                    )
+                hint += (
+                    " NOTE: the cap was tightened by the remaining turn "
+                    "budget — do NOT retry the same long call this wake."
+                )
             return {
                 "content": (
                     f"[Tool Timeout] {tool_name} did not complete "
                     f"within {tool_timeout:g}s" + hint
-                )
+                ),
+                "success": False,
             }
 
     # ── Doom loop 检测 ──────────────────────────────────────

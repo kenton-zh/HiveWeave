@@ -8,7 +8,12 @@ from __future__ import annotations
 # ── 常量（契约 04）──────────────────────────────────────────
 
 SAFETY_TIMEOUT_MS = 600_000
-"""10 分钟安全超时。对齐 Elixir agent.ex:32 @safety_timeout_ms。"""
+"""Legacy 10-minute constant (Elixir ``@safety_timeout_ms``).
+
+Not a live-turn kill: ``_start_safety_timer`` is a no-op. Call sites may
+still pass this as an unused orphan-sweep argument. Do not treat it as
+a session wall clock.
+"""
 
 EMPTY_RETRY_DELAYS = [5_000, 15_000, 45_000]
 """空响应退避序列（5s/15s/45s）。契约 04。"""

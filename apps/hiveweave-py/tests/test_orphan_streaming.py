@@ -61,17 +61,14 @@ async def test_clear_orphan_streaming_spares_processing_agents(monkeypatch):
     assert "is_streaming = 1" in sql
     assert "NOT IN" in sql
     assert busy_id in params
-    # Soft age (10min) wins over hard (11min) — protect bypass after SAFETY_TIMEOUT
-    cutoff = params[-1]
-    assert cutoff < now
-    assert abs((now - cutoff) - 600_000) < 5_000
+    assert "created_at" not in sql
+    assert params == [busy_id]
 
 
 @pytest.mark.asyncio
-async def test_clear_orphan_streaming_soft_age_bypasses_protect(monkeypatch):
-    """Streams older than soft_age clear even when agent is still PROCESSING."""
+async def test_clear_orphan_streaming_protect_ignores_age(monkeypatch):
+    """PROCESSING agents are not age-finalized; stuck streams use quiet cap."""
     svc = ChatMessageService()
-    now = int(time.time() * 1000)
     busy_id = "agent-busy"
     executed: list[tuple[str, list]] = []
 
@@ -112,9 +109,9 @@ async def test_clear_orphan_streaming_soft_age_bypasses_protect(monkeypatch):
     )
     sql, params = executed[0]
     assert busy_id in params
-    # SQL: NOT IN protect OR created_at < soft_cutoff
-    assert "OR created_at < ?" in sql.replace("\n", " ")
-    assert abs((now - params[-1]) - 600_000) < 5_000
+    assert "OR created_at < ?" not in sql.replace("\n", " ")
+    assert "created_at" not in sql
+    assert params == [busy_id]
 
 
 @pytest.mark.asyncio
