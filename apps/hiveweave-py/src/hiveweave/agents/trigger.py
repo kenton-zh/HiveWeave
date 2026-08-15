@@ -142,6 +142,104 @@ def is_coordinator(role: str | None) -> bool:
 # ── 公共 API ────────────────────────────────────────────────
 
 
+def merge_queued_triggers(
+    triggers: list[tuple[str, dict, int]],
+) -> tuple[str, dict]:
+    """Coalesce trigger wakes. Completions concatenate; others last-wins.
+
+    ``wait_satisfied`` wakes use ``wake=0`` while PROCESSING, so the
+    watcher never re-fetches. Last-wins would ACK the first
+    ``[BASH|SUBAGENT DONE]`` unread. Union bodies + ``inbox_msg_ids``
+    for those; keep last-wins for other trigger sources (ACK=seen).
+    """
+    if not triggers:
+        return "", {}
+    wait_sat = [
+        item
+        for item in triggers
+        if (item[1] or {}).get("source") == "wait_satisfied"
+    ]
+    rest = [
+        item
+        for item in triggers
+        if (item[1] or {}).get("source") != "wait_satisfied"
+    ]
+    if wait_sat:
+        parts: list[str] = []
+        ids: list[str] = []
+        seen_ids: set[str] = set()
+        opts = dict(wait_sat[-1][1] or {})
+        for msg, extra, _ts in wait_sat:
+            if msg:
+                parts.append(str(msg))
+            for raw in (extra or {}).get("inbox_msg_ids") or []:
+                sid = str(raw)
+                if sid and sid not in seen_ids:
+                    seen_ids.add(sid)
+                    ids.append(sid)
+        if rest:
+            last_m, last_o, _ts = rest[-1]
+            if last_m:
+                parts.append(str(last_m))
+            for raw in (last_o or {}).get("inbox_msg_ids") or []:
+                sid = str(raw)
+                if sid and sid not in seen_ids:
+                    seen_ids.add(sid)
+                    ids.append(sid)
+        opts["inbox_msg_ids"] = ids
+        opts["source"] = "wait_satisfied"
+        opts["clear_waits"] = False
+        opts["merged_wakes"] = len(triggers)
+        opts["trigger"] = True
+        return "\n\n".join(parts), opts
+    message = triggers[-1][0]
+    opts = dict(triggers[-1][1] or {})
+    opts["inbox_msg_ids"] = list(opts.get("inbox_msg_ids") or [])
+    opts["merged_wakes"] = len(triggers)
+    opts.setdefault("source", "merged_trigger")
+    return message, opts
+
+
+def wake_source_for_pending(pending: list | None) -> str:
+    """Latch-exempt source for pending inbox, or ``trigger`` if none.
+
+    ``message_type=offturn_completion`` is the trust gate for
+    ``wait_satisfied``. Protocol prefixes
+    ``[SUBAGENT DONE|FAILED]`` / ``[BASH DONE|FAILED]`` are the body
+    contract, not a substitute for type. ``from=system`` plus prefix
+    with type=system/normal is a normal ``trigger`` (or ``task`` if
+    ``task_id`` is set). Peer + prefix without that type stays
+    ``trigger``.
+    """
+    from hiveweave.services.offturn import is_offturn_completion_text
+    from hiveweave.services.wake_policy import OFFTURN_COMPLETION_MESSAGE_TYPE
+
+    wait_ok = False
+    task = False
+    for msg in pending or []:
+        if not isinstance(msg, dict):
+            continue
+        mt = (msg.get("message_type") or "").strip().lower()
+        if mt == "task" or msg.get("task_id"):
+            task = True
+        text = msg.get("message")
+        if mt == OFFTURN_COMPLETION_MESSAGE_TYPE and is_offturn_completion_text(
+            text
+        ):
+            wait_ok = True
+    if wait_ok:
+        return "wait_satisfied"
+    if task:
+        return "task"
+    return "trigger"
+
+
+def _guard_sibling_offturn_waits(agent_id: str, latch_opts: dict) -> None:
+    """Completions already cleared the matching wait ref — never wipe the rest."""
+    if latch_opts.get("source") == "wait_satisfied":
+        latch_opts["clear_waits"] = False
+
+
 async def trigger_subordinate(agent_id: str) -> None:
     """触发下属 executor 处理待处理内容。
 
@@ -306,17 +404,16 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 log.warning("trigger_no_agent_task", agent_id=agent_id)
                 return
 
-        # Give-up latch: task-class inbox / 30min decay unlocks before block
+        # Give-up latch: task-class inbox / off-turn completion / 30min decay unlocks
         latch_opts: dict = {"trigger": True, "source": "trigger"}
         try:
             pending_for_latch = await _inbox_service.get_pending_messages(agent_id)
-            if any(
-                (m.get("message_type") or "").lower() == "task"
-                or m.get("task_id")
-                for m in (pending_for_latch or [])
-            ):
-                latch_opts["source"] = "task"
-                latch_opts["message_type"] = "task"
+            src = wake_source_for_pending(pending_for_latch)
+            if src != "trigger":
+                latch_opts["source"] = src
+                if src == "task":
+                    latch_opts["message_type"] = "task"
+            _guard_sibling_offturn_waits(agent_id, latch_opts)
         except Exception:
             pass
         if getattr(agent, "try_clear_resume_suppressed", None):
@@ -380,6 +477,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                         "source": latch_opts.get("source") or "trigger_busy_queue",
                         "message_type": latch_opts.get("message_type"),
                         "task_id": latch_opts.get("task_id"),
+                        "clear_waits": latch_opts.get("clear_waits"),
                         "is_background": True,
                     },
                 )
@@ -409,6 +507,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                     "source": latch_opts.get("source") or "trigger_busy_queue",
                     "message_type": latch_opts.get("message_type"),
                     "task_id": latch_opts.get("task_id"),
+                    "clear_waits": latch_opts.get("clear_waits"),
                     "is_background": True,
                 },
             )
@@ -513,6 +612,7 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 "source": latch_opts.get("source") or "trigger",
                 "message_type": latch_opts.get("message_type"),
                 "task_id": latch_opts.get("task_id"),
+                "clear_waits": latch_opts.get("clear_waits"),
                 "dedup_content": chat_context,
             },
         )

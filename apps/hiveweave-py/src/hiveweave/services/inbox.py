@@ -121,7 +121,9 @@ def _row_val(row: object, key: str, default=None):
 
 # Give-up ACK / deactivate-park must NOT swallow these — review & escalation
 # obligations live in the inbox wake path (BUGFIX: TEST7 429→ACK killed reviews).
-ACK_SPARE_MESSAGE_TYPES: frozenset[str] = frozenset({"escalation", "ask"})
+ACK_SPARE_MESSAGE_TYPES: frozenset[str] = frozenset(
+    {"escalation", "ask", "offturn_completion"}
+)
 ACK_SPARE_PREFIXES: tuple[str, ...] = (
     "[TASK SUBMITTED]",
     "[ESCALATION]",
@@ -131,8 +133,25 @@ ACK_SPARE_PREFIXES: tuple[str, ...] = (
     "[MERGE PROXY]",
     "[PEER_REVIEW_DEADLOCK]",
     "[POST-MERGE VERIFY]",
+    "[SUBAGENT DONE]",
+    "[SUBAGENT FAILED]",
+    "[BASH DONE]",
+    "[BASH FAILED]",
 )
 PARK_EXEMPT_MESSAGE_TYPES: frozenset[str] = frozenset({"escalation", "ask"})
+# Review / escalation obligations stay wake=1 across 下班. Completion
+# prefixes are ACK-spare (don't swallow on give-up) but MUST park —
+# leftover [BASH DONE] would stampede on 上班.
+PARK_EXEMPT_PREFIXES: tuple[str, ...] = (
+    "[TASK SUBMITTED]",
+    "[ESCALATION]",
+    "[REWORK REQUESTED]",
+    "[LEDGER REVIEW]",
+    "[MERGE PENDING]",
+    "[MERGE PROXY]",
+    "[PEER_REVIEW_DEADLOCK]",
+    "[POST-MERGE VERIFY]",
+)
 
 
 def should_spare_from_give_up_ack(msg: dict | None) -> bool:
@@ -158,7 +177,7 @@ def should_exempt_from_park(msg: dict | None) -> bool:
     if msg.get("expect_report"):
         return True
     text = (msg.get("message") or "").lstrip()
-    return any(text.startswith(p) for p in ACK_SPARE_PREFIXES)
+    return any(text.startswith(p) for p in PARK_EXEMPT_PREFIXES)
 
 _MISSING_COLUMNS = [
     ("priority", "TEXT DEFAULT 'normal'"),
@@ -236,16 +255,27 @@ class InboxService:
                 When set, closes the reply contract — collect_unreplied_asks
                 checks for matching reply_to instead of heuristic recipient scan.
             trusted_platform: Required to write human-identity rows
-                (``user_message`` / from=用户). REST/tools must leave False;
-                phoenix busy-queue passes True.
+                (``user_message`` / from=用户) and platform-reserved types
+                (``offturn_completion``). REST/tools must leave False;
+                phoenix busy-queue / notify_completion pass True.
         """
-        from hiveweave.services.wake_policy import is_human_inbox_identity
+        from hiveweave.services.wake_policy import (
+            is_human_inbox_identity,
+            is_platform_reserved_inbox_identity,
+        )
 
         if is_human_inbox_identity(
             from_agent_id=from_agent_id, message_type=message_type
         ) and not trusted_platform:
             raise ValueError(
                 "Human inbox identity requires trusted_platform sender "
+                f"(from={from_agent_id!r}, type={message_type!r})"
+            )
+        if is_platform_reserved_inbox_identity(
+            message_type=message_type, from_agent_id=from_agent_id
+        ) and not trusted_platform:
+            raise ValueError(
+                "offturn_completion requires trusted_platform sender "
                 f"(from={from_agent_id!r}, type={message_type!r})"
             )
 

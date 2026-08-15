@@ -565,6 +565,15 @@ async def lifespan(app: FastAPI):
             log.warning("game_time_stop_failed", project_id=pid, error=str(e))
     log.info("game_time_stopped")
 
+    # Reap native off-turn jobs before stopping agents so completion
+    # cannot trigger_subordinate and revive a stopped agent.
+    try:
+        from hiveweave.services.offturn import reap_all_offturn_jobs
+
+        await reap_all_offturn_jobs()
+    except Exception as e:
+        log.warning("offturn_shutdown_reap_failed", error=str(e))
+
     # Stop all agents
     try:
         all_agents = agent_manager.list_all()

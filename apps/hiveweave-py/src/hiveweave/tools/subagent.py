@@ -1,4 +1,4 @@
-"""spawn_subagent 工具 — 同步嵌套子代理（opencode 模型，2026-08-01 设计）。
+"""spawn_subagent 工具 — off-turn 子代理。
 
 子代理：
 - 全新上下文：身份提示 + 项目共享层（build_project_context）+ 任务描述（用户消息）。
@@ -7,9 +7,10 @@
 - 独立预算：max_tool_rounds = SUBAGENT_MAX_TOOL_ROUNDS（父默认 budget_tool_calls），
   rounds 80% 警告按 streamer 既有机制触发；不扣父 run ledger 计数。
 - commit_turn 被本地拦截（不写父的 turn_session / work_log / 门禁 / lessons），
-  返回 end_turn=True 结束子代理工具循环；最终文本作为 ToolResult 返回父。
-- 硬限 timeout_s（默认 240s，上限 480s）：asyncio.wait_for 外部套超时；
-  spawn 时父的 elapsed 预算与 safety timer 顺延（Task 2）。
+  返回 end_turn=True 结束子代理工具循环。
+- 默认无墙钟。可选 ``timeout_s`` 才套在子代理
+  自己的 Streamer 上；**不**顺延父 safety timer / 不嵌进 streamer HARD 570。
+- 本工具立即返回 waiting_on；完成后 inbox ``[SUBAGENT DONE|FAILED]`` 叫醒父。
 - 只记结果：子代理过程不落库。
 """
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -29,7 +31,7 @@ from hiveweave.tools.result import ToolResult
 
 log = structlog.get_logger(__name__)
 
-SUBAGENT_TIMEOUT_S = 240
+SUBAGENT_TIMEOUT_S = 240  # opt-in only; default spawn has no wall clock
 SUBAGENT_MAX_TIMEOUT_S = 480
 SUBAGENT_MAX_TOOL_ROUNDS = 100  # 与 run_ledger 默认 budget_tool_calls 一致
 
@@ -112,22 +114,24 @@ class SpawnSubagentParams(BaseModel):
     )
     prompt: str = Field(
         description=(
-            "What you need this subagent to do, in its own fresh context. "
-            "Be concrete: files, goals, acceptance criteria."
+            "The complete, self-contained task. The child does not "
+            "share this conversation, so include files, goals, and "
+            "acceptance criteria."
         ),
         json_schema_extra={"aliases": ["task", "instructions", "work"]},
     )
     description: str | None = Field(
         default=None,
-        description="One-line description shown in the waiting context.",
+        description="Short (3-5 word) label for the waiting context.",
         json_schema_extra={"aliases": ["desc", "title"]},
     )
     timeout_s: int | None = Field(
         default=None,
         description=(
-            f"Hard deadline in seconds (default {SUBAGENT_TIMEOUT_S}, "
-            f"max {SUBAGENT_MAX_TIMEOUT_S}). Larger bounded jobs only; "
-            "work expected to exceed this should be dispatched async via "
+            "Optional hard deadline in seconds (max "
+            f"{SUBAGENT_MAX_TIMEOUT_S}). Omit or 0: no session wall clock "
+            "(stop on commit_turn, job_kill, or stream idle). "
+            "Work expected to outlive a deadline should be dispatched via "
             "dispatch_task instead."
         ),
         json_schema_extra={"aliases": ["timeout", "timeoutSeconds"]},
@@ -136,26 +140,30 @@ class SpawnSubagentParams(BaseModel):
 
 @tool(
     "spawn_subagent",
-    "Spawn a synchronous nested subagent in this turn. The subagent works in "
-    "YOUR worktree with YOUR permissions (no more privilege than you), sees "
-    "only the project shared memory + your prompt (not your conversation), "
-    "and must commit_turn before returning its final text. Multiple spawns "
-    "in one round run in parallel — but they share your worktree, so do not "
-    "spawn two that write the same files. Jobs bigger than a few minutes "
-    "should go through dispatch_task instead of this tool. "
+    "Delegate a self-contained task to a subagent in its own context "
+    "(it does not see this conversation). Returns immediately with waiting_on — "
+    "then commit_turn(phase=waiting) using that list. Woken with "
+    "[SUBAGENT DONE] / [SUBAGENT FAILED]. The subagent works in YOUR worktree "
+    "with YOUR permissions, returns its result not intermediate steps, and "
+    "must commit_turn before finishing. Give a complete standalone prompt. "
     "subagent_type is REQUIRED: 'readonly' (read-only scout), 'audit' (run "
-    "tests/browse + submit task — no attestation), or 'write' (edit code + "
-    "git_worktree; requires parent SOURCE_WRITE). The subagent never produces "
-    "attestations itself — pass its findings back and decide evidence "
-    "yourself.",
+    "tests/browse + submit — no attestation), or 'write' (edit code + "
+    "git_worktree; requires parent SOURCE_WRITE). Concurrent writes to the "
+    "same files will collide. Do not nest this work inside the current LLM turn.",
     requires_workspace=False,
     security_level="standard",
 )
 async def spawn_subagent_tool(
     params: SpawnSubagentParams, agent_id: str, workspace: str, ctx=None
 ) -> ToolResult:
-    """Spawn a synchronous nested subagent and return its final text."""
+    """Start a subagent off-turn and return waiting_on immediately."""
     from hiveweave.agents.supervisor import agent_manager
+    from hiveweave.services.offturn import (
+        build_waiting_on,
+        next_action_waiting,
+        resolve_assignee_task_id,
+        start_offturn_job,
+    )
 
     parent = agent_manager.get_agent(agent_id)
     if parent is None:
@@ -174,50 +182,88 @@ async def spawn_subagent_tool(
             f"without changing the parent's turn."
         )
 
-    # write 可用性：父必须具备 SOURCE_WRITE（executor/coordinator/qa 家族）。
-    # CEO/HR 无 SOURCE_WRITE → err。复用 FAMILY_CAPABILITIES，不另写一套。
+    # write 可用性：父必须具备写 worktree（executor / builder coordinator）。
+    # AgentManager 重启后 config 只有 role_type（SQL alias），须 remap。
     if subagent_type == "write" and not _parent_has_source_write(parent):
         return ToolResult.err(
-            "subagent_type='write' requires a code-writing parent "
-            "(SOURCE_WRITE); CEO/HR may only use readonly/audit"
+            "subagent_type='write' requires a code-writing parent with a "
+            "write worktree (SOURCE_WRITE + executor/builder coordinator); "
+            "CEO/HR may only use readonly/audit"
         )
 
     prompt = (params.prompt or "").strip()
     if not prompt:
         return ToolResult.err("spawn_subagent requires a non-empty prompt")
-    timeout_s = params.timeout_s or SUBAGENT_TIMEOUT_S
-    timeout_s = max(1, min(int(timeout_s), SUBAGENT_MAX_TIMEOUT_S))
+    raw_timeout = params.timeout_s
+    if raw_timeout is None or int(raw_timeout) <= 0:
+        timeout_s: float | None = None
+    else:
+        timeout_s = max(1, min(int(raw_timeout), SUBAGENT_MAX_TIMEOUT_S))
 
-    # 预算与 timer 顺延（不扣父计数，只回拨墙钟窗口）
-    run_id = getattr(parent, "_current_run_id", None)
-    if run_id:
-        try:
-            await parent._run_ledger.extend_elapsed_budget(
-                agent_id, run_id, timeout_s * 1000
-            )
-        except Exception:
-            pass
+    resolved_ws = workspace or ""
     try:
-        parent._extend_safety_timer(timeout_s)
+        got = await parent._get_workspace_path()
+        if got:
+            resolved_ws = str(got)
     except Exception:
         pass
 
-    try:
-        result = await _run_subagent(
-            parent, prompt, params.description, timeout_s, subagent_type
-        )
-    except Exception as e:  # 兜底：任何异常都不炸父回合
-        return ToolResult.err(f"spawn_subagent failed: {type(e).__name__}: {e}")
+    if subagent_type == "write":
+        deny_main = await _write_spawn_main_deny(parent, resolved_ws)
+        if deny_main:
+            return ToolResult.err(deny_main)
 
-    if result.get("status") != "ok":
-        return ToolResult.err(
-            f"subagent failed: {result.get('error') or 'unknown error'}"
+    async def _work() -> tuple[bool, str]:
+        result = await _run_subagent(
+            parent,
+            prompt,
+            params.description,
+            timeout_s,
+            subagent_type,
+            workspace=resolved_ws,
         )
-    text = result.get("content") or "(subagent returned no text)"
-    return ToolResult.ok(
-        f"[subagent result]\n{text}",
-        extra={"subagent": {"timeout_s": timeout_s, "type": subagent_type}},
+        if result.get("status") != "ok":
+            return False, str(result.get("error") or "unknown error")
+        return True, str(result.get("content") or "(subagent returned no text)")
+
+    project_id = str(getattr(parent, "project_id", "") or "")
+    task_id = await resolve_assignee_task_id(project_id, agent_id)
+    job_id = start_offturn_job(
+        kind="subagent",
+        agent_id=agent_id,
+        project_id=project_id,
+        worktree=resolved_ws,
+        work=_work,
+        task_id=task_id,
     )
+    waiting_on = build_waiting_on(job_id, task_id, agent_id=agent_id)
+    return ToolResult.ok(
+        "Subagent started off the org turn "
+        f"(job={job_id}, type={subagent_type}). "
+        f"{next_action_waiting(waiting_on)} "
+        "You will be woken with [SUBAGENT DONE] or [SUBAGENT FAILED]. "
+        "Continue the org turn; do not nest this work in the current LLM call.",
+        job_id=job_id,
+        waiting_on=waiting_on,
+        task_id=task_id,
+        subagent={"timeout_s": timeout_s, "type": subagent_type},
+    )
+
+
+def _parent_config_for_write_gate(parent: Any) -> dict:
+    """Config for write-worktree gate.
+
+    After restart, AgentManager SQL aliases ``permission_type AS role_type``
+    so live agents often lack ``permission_type``. Copy the alias rather
+    than inventing executor/coordinator — CEO stored as ``ceo`` must stay
+    fail-closed.
+    """
+    config = dict(getattr(parent, "config", None) or {})
+    if not str(config.get("permission_type") or "").strip():
+        role_type = str(config.get("role_type") or "").strip()
+        if role_type:
+            config["permission_type"] = role_type
+    return config
 
 
 def _parent_has_source_write(parent: Any) -> bool:
@@ -235,14 +281,63 @@ def _parent_has_source_write(parent: Any) -> bool:
     """
     from hiveweave.services.git_worktree.ensure import agent_gets_write_worktree
 
-    config = getattr(parent, "config", None) or {}
-    return agent_gets_write_worktree(config)
+    return agent_gets_write_worktree(_parent_config_for_write_gate(parent))
+
+
+async def _write_spawn_main_deny(parent: Any, workspace: str) -> str | None:
+    """Fail closed: write spawn must run in the agent's write worktree.
+
+    Same fail-closed shape as other write-worktree gates: missing/unresolvable
+    or a MAIN / MAIN-subdirectory path is denied. Do not fail open.
+    """
+    ws = (workspace or "").strip()
+    if not ws:
+        return (
+            "subagent_type='write' requires the parent's write worktree, "
+            "not an empty/MAIN workspace"
+        )
+    try:
+        from hiveweave.db import meta as meta_db
+
+        root = await meta_db.get_project_workspace(parent.project_id)
+    except Exception:
+        return (
+            "subagent_type='write' requires a project root so MAIN can be "
+            "refused (missing project workspace)"
+        )
+    if not root:
+        return (
+            "subagent_type='write' requires a project root so MAIN can be "
+            "refused (missing project workspace)"
+        )
+    try:
+        ws_res = Path(ws).resolve()
+        root_res = Path(root).resolve()
+    except OSError:
+        return "subagent_type='write' worktree path is not resolvable"
+    if ws_res == root_res:
+        return (
+            "subagent_type='write' requires the parent's write worktree, "
+            "not project MAIN"
+        )
+    trees = (root_res / ".hiveweave" / "worktrees").resolve()
+    try:
+        ws_res.relative_to(trees)
+        under_trees = ws_res != trees
+    except ValueError:
+        under_trees = False
+    if not under_trees:
+        return (
+            "subagent_type='write' must run in the agent's write worktree "
+            f"({trees}), not a MAIN subdirectory"
+        )
+    return None
 
 
 def _subagent_identity(
     parent: Any,
     description: str | None,
-    timeout_s: int,
+    timeout_s: float | None,
     subagent_type: str,
     workspace: str | None,
 ) -> str:
@@ -261,19 +356,26 @@ def _subagent_identity(
             )
     lines = [
         f"You are a {subagent_type} subagent of {name} ({role}). You are "
-        "helping your parent get work done during its turn — you are a "
-        "hands, not a planner.",
-        f"The parent is waiting for you. Task: {description or '(see user message)'}",
+        "helping your parent get work done — you are a hands, not a planner.",
+        f"The parent continues its org turn. Task: {description or '(see user message)'}",
+        "Your result is delivered off-turn via [SUBAGENT DONE] / "
+        "[SUBAGENT FAILED]; the parent is not blocked waiting inside its LLM call.",
         "You have exactly the same permissions as your parent (no more). "
-        "You work inside the parent's workspace. You CANNOT spawn subagents.",
+        "You work inside the parent's workspace. You CANNOT spawn subagents. "
+        "bash(background=true) is parent-only — run bash in the foreground here.",
         (
-            f"You MUST finish and call commit_turn within {timeout_s}s "
+            f"You MUST finish and call commit_turn within {int(timeout_s)}s "
             "(the platform enforces this deadline — it will kill you). "
             "Budget your tool calls: watch the 'remaining calls' warning."
+            if timeout_s
+            else
+            "No session wall clock. Finish with commit_turn; the parent can "
+            "job_kill you. Budget your tool calls: watch the 'remaining calls' "
+            "warning."
         ),
-        "If the work would clearly exceed this deadline, do not overreach: "
-        "stop, commit_turn with phase=blocked and waiting_on the parent, and "
-        "tell the parent to use dispatch_task for async delegation instead.",
+        "If the slice is too large, stop, commit_turn with phase=blocked "
+        "and waiting_on the parent, and tell the parent to dispatch_task "
+        "for async delegation instead.",
         "commit_turn is REQUIRED to finish. Never end without it.",
         "You do NOT produce attestations (attest_doc_review / waive_attestation) "
         "yourself — pass findings back to the parent, who decides whether to "
@@ -294,12 +396,14 @@ async def _run_subagent(
     parent: Any,
     prompt: str,
     description: str | None,
-    timeout_s: int,
+    timeout_s: float | None,
     subagent_type: str,
+    workspace: str | None = None,
 ) -> dict[str, Any]:
     """Run the subagent's own Streamer loop. Returns Streamer result dict."""
-    # 1. 工作区：先取（身份提示要用）
-    workspace = await parent._get_workspace_path()
+    # 1. 工作区：优先用 spawn 时已校验的路径（write 已拒绝 MAIN）
+    if not (workspace or "").strip():
+        workspace = await parent._get_workspace_path()
 
     # 2. 消息：身份 + 项目共享层 + 任务（全新上下文，无父私有记忆/历史）
     identity = _subagent_identity(
@@ -354,22 +458,23 @@ async def _run_subagent(
     )
 
     streamer = Streamer(max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS)
+    stream_coro = streamer.stream(
+        agent_id=sub_id,
+        messages=messages,
+        model_config=model_config,
+        tools=tools,
+        on_tool_call=on_tool_call,
+        max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS,
+    )
     try:
-        result = await asyncio.wait_for(
-            streamer.stream(
-                agent_id=sub_id,
-                messages=messages,
-                model_config=model_config,
-                tools=tools,
-                on_tool_call=on_tool_call,
-                max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS,
-            ),
-            timeout=timeout_s,
-        )
+        if timeout_s is None or timeout_s <= 0:
+            result = await stream_coro
+        else:
+            result = await asyncio.wait_for(stream_coro, timeout=timeout_s)
     except asyncio.TimeoutError:
         return {
             "status": "error",
-            "error": f"subagent timed out after {timeout_s}s",
+            "error": f"subagent timed out after {timeout_s:g}s",
         }
     except Exception as e:  # 网络/熔断等 — 转 err，不炸父
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
@@ -445,6 +550,16 @@ def _subagent_on_tool_call(
             tool_args = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError:
             tool_args = {}
+        if tool_name == "bash" and _args_want_background(tool_args):
+            return {
+                "role": "tool",
+                "content": (
+                    "bash(background=true) is not available inside a subagent. "
+                    "Run bash in the foreground here, or let the parent use "
+                    "background=true off the org turn."
+                ),
+                "tool_call_id": tool_call_id,
+            }
         try:
             result = await executor.execute(
                 parent.id,
@@ -473,6 +588,20 @@ def _subagent_on_tool_call(
         }
 
     return callback
+
+
+def _args_want_background(tool_args: dict) -> bool:
+    """True when bash args request off-turn background (explicit param)."""
+    v = tool_args.get("background", tool_args.get("bg"))
+    if v is None or v is False:
+        return False
+    if v is True:
+        return True
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
 
 
 async def _subagent_commit(

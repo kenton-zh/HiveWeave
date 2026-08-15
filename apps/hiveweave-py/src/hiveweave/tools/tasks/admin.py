@@ -113,6 +113,19 @@ async def cancel_task_tool(
     except Exception as e:
         return ToolResult.err(f"Failed to cancel task: {e}")
 
+    assignee = str((task_row or {}).get("assignee_id") or "").strip()
+    if assignee:
+        try:
+            from hiveweave.services.offturn import reap_offturn_for_task
+
+            await reap_offturn_for_task(assignee, params.task_id)
+        except Exception as e:
+            log.warning(
+                "cancel_task_offturn_reap_failed",
+                task_id=params.task_id,
+                error=str(e),
+            )
+
     # Stamp evidence when escaping an approve-path deadlock (TEST6 S7).
     if deadlock_escape:
         try:

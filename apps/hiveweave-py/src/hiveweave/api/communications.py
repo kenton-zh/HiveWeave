@@ -81,6 +81,7 @@ async def create_communication(body: CommunicationCreate) -> dict:
 
     Security: not trusted for human identity — send_message raises ValueError
     for from="用户"/"user"/type=user_message without trusted_platform=True.
+    type=offturn_completion is platform-only (same trusted_platform gate).
     Real human speech must go through the phoenix WebSocket. The ValueError
     → 400 here is the anti-spoofing gate.
     """

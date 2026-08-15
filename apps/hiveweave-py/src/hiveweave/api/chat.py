@@ -257,7 +257,7 @@ async def send_chat(body: ChatSendBody) -> dict:
     result = await agent.chat(user_msg_str)
     if result.get("error") == "busy":
         # force_reset + sleep + 重试
-        await agent.cancel()
+        await agent.cancel(reason="busy_reset")
         await asyncio.sleep(_BUSY_RESET_SLEEP)
         result = await agent.chat(user_msg_str)
         if result.get("error") == "busy":
@@ -429,7 +429,7 @@ async def reset_processing(agent_id: str) -> dict:
     agent = agent_manager.get_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
-    await agent.cancel()
+    await agent.cancel(reason="reset_processing")
     return {"ok": True, "agentId": agent_id, "processing": False}
 
 

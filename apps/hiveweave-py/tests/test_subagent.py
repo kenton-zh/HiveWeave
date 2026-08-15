@@ -11,9 +11,10 @@ from hiveweave.services.permission import (
 )
 
 
-def test_spawn_subagent_in_all_family_lists():
-    for tools in (CEO_TOOLS, COORDINATOR_BUILDER_TOOLS, HR_TOOLS,
-                  READONLY_TOOLS, READWRITE_TOOLS):
+def test_spawn_subagent_in_builder_lists_not_ceo_hr():
+    assert "spawn_subagent" not in CEO_TOOLS
+    assert "spawn_subagent" not in HR_TOOLS
+    for tools in (COORDINATOR_BUILDER_TOOLS, READONLY_TOOLS, READWRITE_TOOLS):
         assert "spawn_subagent" in tools, tools
 
 
@@ -204,6 +205,24 @@ def test_run_subagent_timeout_returns_error():
         result = asyncio.run(_run_subagent(parent, "x", "y", 0.05, "readonly"))
     assert result["status"] == "error"
     assert "timed out" in result["error"]
+
+
+def test_run_subagent_unbounded_has_no_wall_clock():
+    parent = _fake_parent()
+
+    class OkStreamer:
+        def __init__(self, **kw):
+            pass
+
+        async def stream(self, **kw):
+            await __import__("asyncio").sleep(0.05)
+            return {"status": "ok", "content": "done"}
+
+    with patch("hiveweave.tools.subagent.Streamer", OkStreamer):
+        import asyncio
+        result = asyncio.run(_run_subagent(parent, "x", "y", None, "readonly"))
+    assert result["status"] == "ok"
+    assert result["content"] == "done"
 
 
 def test_subagent_commit_rejects_empty_summary():
@@ -438,28 +457,171 @@ def test_spawn_subagent_rejects_write_for_hr_parent():
     assert "SOURCE_WRITE" in (result.error or "")
 
 
+_WRITE_ROOT = "/proj"
+_WRITE_TREE = "/proj/.hiveweave/worktrees/exec-1"
+
+
+def _patch_write_tree_root():
+    return patch(
+        "hiveweave.db.meta.get_project_workspace",
+        AsyncMock(return_value=_WRITE_ROOT),
+    )
+
+
 def test_spawn_subagent_allows_write_for_executor_parent():
-    """§6.3 executor 父选 write → 进入 _run_subagent（FakeStreamer 拦截）。"""
+    """§6.3 executor 父选 write → 立即返回 waiting_on（off-turn，不嵌套等待）。"""
     parent = _fake_parent()
+    parent._get_workspace_path = AsyncMock(return_value=_WRITE_TREE)
     params = SpawnSubagentParams(
         subagent_type="write", prompt="refactor X", description="refactor")
 
-    class FakeStreamer:
-        def __init__(self, **kw):
-            pass
-
-        async def stream(self, **kw):
-            return {"status": "ok", "content": "done",
-                    "rounds": 1, "usage": {}, "end_turn": True}
+    async def fake_run(*_a, **_k):
+        return {"status": "ok", "content": "done",
+                "rounds": 1, "usage": {}, "end_turn": True}
 
     import asyncio
-    with patch("hiveweave.agents.supervisor.agent_manager") as am:
-        am.get_agent.return_value = parent
-        with patch("hiveweave.tools.subagent.Streamer", FakeStreamer):
-            result = asyncio.run(spawn_subagent_tool(
-                params, agent_id="exec-1", workspace="/ws"))
+    from hiveweave.services.offturn import is_live_job, reset_offturn_for_tests
+
+    async def _go():
+        await reset_offturn_for_tests()
+        with patch("hiveweave.agents.supervisor.agent_manager") as am:
+            am.get_agent.return_value = parent
+            with _patch_write_tree_root():
+                with patch("hiveweave.tools.subagent._run_subagent", fake_run):
+                    result = await spawn_subagent_tool(
+                        params, agent_id="exec-1", workspace=_WRITE_TREE)
+        assert result.success is True
+        assert "waiting" in (result.output or "").lower()
+        job_id = result.extra["job_id"]
+        assert job_id.startswith("bg-sub-")
+        assert result.extra["waiting_on"][0]["ref"] == job_id
+        parent._run_ledger.extend_elapsed_budget.assert_not_called()
+        for _ in range(50):
+            if not is_live_job(job_id):
+                break
+            await asyncio.sleep(0.02)
+        await reset_offturn_for_tests()
+        return result
+
+    asyncio.run(_go())
+
+
+def test_spawn_write_succeeds_with_only_role_type():
+    """Restart remap: AgentManager 只有 role_type=executor 时 write spawn 仍放行。"""
+    parent = _fake_parent()
+    parent.config = {
+        "name": "Exec1",
+        "role": "签到排行榜工程师",
+        "role_type": "executor",
+    }
+    parent._get_workspace_path = AsyncMock(return_value=_WRITE_TREE)
+    params = SpawnSubagentParams(
+        subagent_type="write", prompt="refactor X")
+
+    async def fake_run(*_a, **_k):
+        return {"status": "ok", "content": "done"}
+
+    import asyncio
+    from hiveweave.services.offturn import reset_offturn_for_tests
+
+    async def _go():
+        await reset_offturn_for_tests()
+        with patch("hiveweave.agents.supervisor.agent_manager") as am:
+            am.get_agent.return_value = parent
+            with _patch_write_tree_root():
+                with patch("hiveweave.tools.subagent._run_subagent", fake_run):
+                    result = await spawn_subagent_tool(
+                        params, agent_id="exec-1", workspace=_WRITE_TREE)
+        await reset_offturn_for_tests()
+        return result
+
+    result = asyncio.run(_go())
     assert result.success is True
-    assert "done" in (result.output or "")
+    assert result.extra["job_id"].startswith("bg-sub-")
+
+
+def test_spawn_write_rejects_project_main():
+    """write spawn on MAIN is fail-closed (must stay on the write worktree)."""
+    parent = _fake_parent()
+    parent._get_workspace_path = AsyncMock(return_value=_WRITE_ROOT)
+    params = SpawnSubagentParams(subagent_type="write", prompt="refactor X")
+    import asyncio
+
+    async def _go():
+        with patch("hiveweave.agents.supervisor.agent_manager") as am:
+            am.get_agent.return_value = parent
+            with _patch_write_tree_root():
+                with patch("hiveweave.tools.subagent._run_subagent") as run:
+                    result = await spawn_subagent_tool(
+                        params, agent_id="exec-1", workspace=_WRITE_ROOT)
+                    run.assert_not_called()
+        return result
+
+    result = asyncio.run(_go())
+    assert result.success is False
+    err = result.error or ""
+    assert "MAIN" in err or "write worktree" in err
+
+
+def test_spawn_write_rejects_missing_project_root():
+    """Missing project root must not fail open onto MAIN."""
+    parent = _fake_parent()
+    parent._get_workspace_path = AsyncMock(return_value=_WRITE_TREE)
+    params = SpawnSubagentParams(subagent_type="write", prompt="refactor X")
+    import asyncio
+
+    async def _go():
+        with patch("hiveweave.agents.supervisor.agent_manager") as am:
+            am.get_agent.return_value = parent
+            with patch(
+                "hiveweave.db.meta.get_project_workspace",
+                AsyncMock(return_value=None),
+            ):
+                with patch("hiveweave.tools.subagent._run_subagent") as run:
+                    result = await spawn_subagent_tool(
+                        params, agent_id="exec-1", workspace=_WRITE_TREE)
+                    run.assert_not_called()
+        return result
+
+    result = asyncio.run(_go())
+    assert result.success is False
+    assert "project root" in (result.error or "")
+
+
+def test_spawn_write_rejects_main_subdirectory():
+    """MAIN subdirectory is not a write worktree."""
+    parent = _fake_parent()
+    sub = "/proj/src"
+    parent._get_workspace_path = AsyncMock(return_value=sub)
+    params = SpawnSubagentParams(subagent_type="write", prompt="refactor X")
+    import asyncio
+
+    async def _go():
+        with patch("hiveweave.agents.supervisor.agent_manager") as am:
+            am.get_agent.return_value = parent
+            with _patch_write_tree_root():
+                with patch("hiveweave.tools.subagent._run_subagent") as run:
+                    result = await spawn_subagent_tool(
+                        params, agent_id="exec-1", workspace=sub)
+                    run.assert_not_called()
+        return result
+
+    result = asyncio.run(_go())
+    assert result.success is False
+    assert "write worktree" in (result.error or "")
+
+
+def test_parent_has_source_write_role_type_alias():
+    """Restart 后 config 仅有 role_type 时与 permission_type 同口径。"""
+    parent = _fake_parent_rich(role="executor", permission_type="executor")
+    parent.config.pop("permission_type", None)
+    parent.config["role_type"] = "executor"
+    assert _parent_has_source_write(parent) is True
+
+    ceo = _fake_parent_rich(role="ceo", permission_type="ceo")
+    ceo.config.pop("permission_type", None)
+    ceo.config["role_type"] = "ceo"
+    assert _parent_has_source_write(ceo) is False
 
 
 def test_identity_includes_workspace_path():
@@ -470,6 +632,19 @@ def test_identity_includes_workspace_path():
         subagent_type="write", workspace="/ws/exec-1")
     assert "/ws/exec-1" in identity
     assert "write" in identity  # 类型出现在身份首行
+    assert "continues its org turn" in identity
+    assert "not blocked waiting" in identity
+    assert "The parent is waiting for you" not in identity
+    assert "will kill you" in identity
+
+
+def test_identity_unbounded_has_no_kill_deadline():
+    parent = _fake_parent()
+    identity = _subagent_identity(
+        parent, description="refactor", timeout_s=None,
+        subagent_type="write", workspace="/ws/exec-1")
+    assert "will kill you" not in identity
+    assert "No session wall clock" in identity
 
 
 def test_identity_includes_workspace_for_all_types():
@@ -532,6 +707,20 @@ def test_subagent_callback_allows_whitelisted_tool():
         "bash", json.dumps({"command": "ls"}), "tc-y"))
     assert result["content"] == "ok"
     executor.execute.assert_awaited_once()
+
+
+def test_subagent_callback_rejects_background_bash():
+    """Off-turn bash 归父；子代理内 background=true 必须拒绝，避免 [BASH DONE] 误叫醒。"""
+    parent = _fake_parent()
+    executor = AsyncMock()
+    audit_wl = _SUBAGENT_TYPE_TOOLS["audit"]
+    callback = _subagent_on_tool_call(
+        parent, executor, "/ws", "/root", None, audit_wl)
+    import asyncio
+    result = asyncio.run(callback(
+        "bash", json.dumps({"command": "pytest", "background": True}), "tc-bg"))
+    assert "background=true" in result["content"]
+    executor.execute.assert_not_called()
 
 
 def test_subagent_callback_commit_turn_bypasses_whitelist():

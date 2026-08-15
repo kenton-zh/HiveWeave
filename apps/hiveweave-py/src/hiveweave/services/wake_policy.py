@@ -22,6 +22,9 @@ _USER_IDS = frozenset({"user", "human", "operator", "用户"})
 
 HUMAN_MESSAGE_TYPES = frozenset({"user_message", "user"})
 
+OFFTURN_COMPLETION_MESSAGE_TYPE = "offturn_completion"
+PLATFORM_RESERVED_MESSAGE_TYPES = frozenset({OFFTURN_COMPLETION_MESSAGE_TYPE})
+
 
 def is_user_sender(from_agent_id: str | None) -> bool:
     if not from_agent_id:
@@ -40,6 +43,16 @@ def is_human_inbox_identity(
     if mt in HUMAN_MESSAGE_TYPES:
         return True
     return is_user_sender(from_agent_id)
+
+
+def is_platform_reserved_inbox_identity(
+    *, message_type: str | None = None, from_agent_id: str | None = None
+) -> bool:
+    """True when the row claims a platform-only type (spoof-sensitive).
+    Do NOT treat all from=system as reserved — many real platform rows use type=system/task.
+    """
+    mt = (message_type or "").strip().lower()
+    return mt in PLATFORM_RESERVED_MESSAGE_TYPES
 
 
 def classify_message(

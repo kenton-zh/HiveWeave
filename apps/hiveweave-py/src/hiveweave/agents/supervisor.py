@@ -119,7 +119,7 @@ class AgentManager:
 
         # 取消正在运行的任务
         try:
-            await agent.cancel()
+            await agent.cancel(reason="stop_agent")
         except Exception as e:
             log.error(
                 "stop_agent_cancel_failed",

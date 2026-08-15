@@ -52,10 +52,22 @@ async def inbox_watcher_loop(agent: Any) -> None:
                 pass
             if agent.status == AgentState.IDLE:
                 if agent._resume_suppressed:
+                    latch_opts: dict = {"trigger": True}
+                    try:
+                        from hiveweave.agents.trigger import wake_source_for_pending
+
+                        peek = await agent._inbox.get_pending_messages(agent.id)
+                        src = wake_source_for_pending(peek)
+                        if src != "trigger":
+                            latch_opts["source"] = src
+                            if src == "task":
+                                latch_opts["message_type"] = "task"
+                            if src == "wait_satisfied":
+                                latch_opts["clear_waits"] = False
+                    except Exception:
+                        pass
                     # 被动衰减检查：30min 过期则清除锁存器，落入正常处理
-                    if agent.try_clear_resume_suppressed(
-                        opts={"trigger": True}
-                    ):
+                    if agent.try_clear_resume_suppressed(opts=latch_opts):
                         log.debug(
                             "inbox_watcher_suppressed_skip",
                             agent_id=agent.id,

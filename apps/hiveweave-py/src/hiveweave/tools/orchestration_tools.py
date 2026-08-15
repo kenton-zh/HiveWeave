@@ -138,6 +138,14 @@ async def _send_message_core(
     if not message:
         return ToolResult.err("send_message requires 'message' (body text)")
 
+    from hiveweave.services.wake_policy import is_platform_reserved_inbox_identity
+
+    if is_platform_reserved_inbox_identity(message_type=message_type):
+        return ToolResult.err(
+            "offturn_completion requires trusted_platform; "
+            "agents cannot send platform-reserved message types"
+        )
+
     if message_type == "ask":
         expect_report = True
     elif message_type == "notify":
@@ -445,8 +453,8 @@ class SendMessageParams(BaseModel):
         default=False,
         alias="expectReport",
         description=(
-            "True when recipient must reply via send_message. "
-            "Also auto-set when message text asks for 回复/report back."
+            "True when the recipient must reply. Not inferred from "
+            "message wording — set this or use ask_agent."
         ),
         json_schema_extra={"aliases": ["expectReport", "expect_report"]},
     )

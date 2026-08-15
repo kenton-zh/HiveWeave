@@ -5,7 +5,7 @@
 - POST   /api/projects              创建项目（含 charter 三段 + CEO 归零 + HR 天线）
 - GET    /api/projects/{id}         查单个项目（汇总 agents/roster）
 - PATCH  /api/projects/{id}         更新项目（workspacePath 变化时迁移 + 失效缓存）
-- DELETE /api/projects/{id}         删除项目（删库文件 + meta 删行）
+- DELETE /api/projects/{id}         删除项目（先 stop_project_cleanly 再删库文件 + meta 删行）
 - GET    /api/projects/{id}/activate    激活项目
 - GET    /api/projects/{id}/deactivate  取消激活
 - POST   /api/projects/{id}/goals   更新 charter goals 段
@@ -1012,7 +1012,14 @@ async def _deferred_cleanup_hiveweave(hw_dir: str, project_id: str) -> None:
 
 @router.delete("/{project_id}")
 async def delete_project(project_id: str) -> dict:
-    """删除项目（停 agent + 停 game time + 删库文件 + meta 删行 + 清内存）。"""
+    """删除项目（先干净停机，再删库文件 + meta 删行 + 清内存）。
+
+    Must go through ``stop_project_cleanly`` *before* evict/rmtree: that
+    reaps off-turn jobs and registered project processes. Otherwise an
+    in-flight coding slice keeps writing the worktree and Windows-locks
+    ``.hiveweave`` so rmtree leaves residue. Same contract as 下班; this
+    path used to skip it.
+    """
     row = await meta_db.query_one(
         "SELECT workspace_path FROM projects WHERE id = ?", [project_id]
     )
@@ -1021,12 +1028,28 @@ async def delete_project(project_id: str) -> dict:
 
     workspace = row["workspace_path"] or ""
 
-    # C1 fix: 先停止该项目所有 agent（取消 LLM task + 清理内存对象）
+    # Block new triggers before teardown (same first step as deactivate).
     try:
-        from hiveweave.agents.supervisor import agent_manager
-        await agent_manager.stop_project_agents(project_id)
+        await meta_db.execute(
+            "UPDATE projects SET is_started = 0 WHERE id = ?", [project_id]
+        )
     except Exception as e:
-        log.warning("stop_agents_before_delete_failed", project_id=project_id, error=str(e))
+        log.warning(
+            "delete_mark_stopped_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+
+    try:
+        from hiveweave.services.project_lifecycle import stop_project_cleanly
+
+        await stop_project_cleanly(project_id)
+    except Exception as e:
+        log.warning(
+            "stop_project_before_delete_failed",
+            project_id=project_id,
+            error=str(e),
+        )
 
     # C2 fix: 停止 game time tick loop
     try:

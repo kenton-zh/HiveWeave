@@ -115,6 +115,7 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "git_worktree_merge": frozenset({Capability.MERGE}),
     "git_worktree_remove": frozenset({Capability.MERGE}),
     "bash": frozenset({Capability.BASH_SHELL}),
+    "job_kill": frozenset({Capability.BASH_SHELL}),
     "run_command": frozenset({Capability.BASH_SHELL}),
     # dev server 可执行任意命令 → 与 bash 同硬门（2026-08-13 审计：此前
     # 无 TOOL_CAPABILITY 映射，CEO 无 bash 硬门被绕过）
@@ -127,6 +128,7 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "game_run_case": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     # Seedream text-to-image — source-writing roles only (not CEO/HR)
     "generate_image": frozenset({Capability.SOURCE_WRITE}),
+    "spawn_subagent": frozenset({Capability.SOURCE_WRITE}),
     # DOC_WRITE agents (CEO) may edit docs; SOURCE_WRITE covers all paths
     "edit_file": frozenset({Capability.SOURCE_WRITE, Capability.DOC_WRITE}),
     "apply_patch": frozenset({Capability.SOURCE_WRITE}),
