@@ -11,7 +11,12 @@ from hiveweave.llm.circuit_breaker import CircuitBreaker, circuit_breaker
 from hiveweave.llm.provider import ProviderFactory, provider_factory
 from hiveweave.llm.retry import RetryHandler
 
-from .constants import DEFAULT_PLACEHOLDER, HARD_TOTAL_TIMEOUT_S, MAX_TOOL_ROUNDS
+from .constants import (
+    DEFAULT_PLACEHOLDER,
+    HARD_TOTAL_TIMEOUT_S,
+    MAX_TOOL_ROUNDS,
+    session_wall_clock_enabled,
+)
 from .context import ContextMixin
 from .errors import CircuitBreakerOpenError
 from .http_stream import HttpStreamMixin
@@ -162,22 +167,25 @@ class Streamer(
         await self._fire_delta(on_delta, {"type": "start"})
 
         try:
-            # TEST21 M4: hard cap is a safety net only. Soft renew + graceful
-            # budget exit live inside _run_tool_loop so partial tool history
-            # is preserved (outer wait_for used to discard mid-turn state).
-            result = await asyncio.wait_for(
-                self._run_tool_loop(
-                    agent_id=agent_id,
-                    provider=provider,
-                    provider_name=provider_name,
-                    messages=list(messages),
-                    tools=tools,
-                    on_delta=on_delta,
-                    on_tool_call=on_tool_call,
-                    max_tool_rounds=effective_max_rounds,
-                ),
-                timeout=HARD_TOTAL_TIMEOUT_S + 30.0,
+            # Session wall clock is opt-in. Default: no outer wait_for —
+            # stream idle + declared tool timeouts stop hung work.
+            loop_coro = self._run_tool_loop(
+                agent_id=agent_id,
+                provider=provider,
+                provider_name=provider_name,
+                messages=list(messages),
+                tools=tools,
+                on_delta=on_delta,
+                on_tool_call=on_tool_call,
+                max_tool_rounds=effective_max_rounds,
             )
+            if session_wall_clock_enabled():
+                result = await asyncio.wait_for(
+                    loop_coro,
+                    timeout=HARD_TOTAL_TIMEOUT_S + 30.0,
+                )
+            else:
+                result = await loop_coro
             # 熔断器成功/失败上报已移至 _stream_single_round 按轮次精确上报（C10）
             result["duration_ms"] = int((time.monotonic() - start_time) * 1000)
             return result

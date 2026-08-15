@@ -645,7 +645,7 @@ async def handle_safety_timeout(agent: Any) -> None:
     与 _handle_error 统一的非致命中断策略（计数 + 冷却 resume + 超限放弃）:
     - 未超限: 不 ACK inbox（消息保持未读）+ RESUME CHECKPOINT + 冷却 resume
     - 连续超限: ACK inbox 放弃本轮 + 升级上级一次 —— 堵住
-      「10min 超时 → 90s 冷却 → 再超时」的无限死循环，且不再注入
+      「卡住中断 → 90s 冷却 → 再卡住」的无限死循环，且不再注入
       CHECKPOINT 撑大上下文让下一轮更易超时
     - 记录 work_log，便于监控/stall watchdog 关联
     """
@@ -668,7 +668,7 @@ async def handle_safety_timeout(agent: Any) -> None:
     give_up = agent._consecutive_errors > agent._CONSECUTIVE_ERROR_MAX
 
     timeout_msg = (
-        "[TIMEOUT] LLM call exceeded 10 minute safety limit. "
+        "[TIMEOUT] Run interrupted (stuck stream or call budget). "
         + (
             f"Gave up after {agent._consecutive_errors} consecutive "
             "interrupted turns; escalated to superior."
@@ -734,9 +734,9 @@ async def handle_safety_timeout(agent: Any) -> None:
     agent._cancel_safety_timer()
     await agent._go_idle()
 
-    # 广播健康事件 — LLM 调用 10 分钟安全超时 → health="error"
+    # 广播健康事件 — 卡住中的流 / 调用预算 → health="error"
     agent._broadcast_agent_health(
-        "error", "LLM call exceeded 10 minute safety limit"
+        "error", "Run interrupted (stuck stream or call budget)"
     )
     log.warning(
         "safety_timeout_gave_up" if give_up else "safety_timeout_resume_armed",

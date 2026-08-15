@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 import httpx
 import structlog
 
-from hiveweave.llm.provider import ProviderConfig, READ_TIMEOUT_S
+from hiveweave.llm.provider import ProviderConfig
 from hiveweave.llm.retry import (
     PermanentError,
     RetryableError,
@@ -24,12 +24,25 @@ from .constants import (
     EMPTY_RESPONSE_MAX_RETRIES,
     FIRST_CHUNK_TIMEOUT_S,
     IDLE_TIMEOUT_S,
+    LLM_QUEUE_PING_S,
+    STREAM_SOCKET_READ_TIMEOUT_S,
+    stream_chunk_wait_s,
     _get_llm_semaphore,
 )
 from .sse import merge_tool_calls, parse_sse
 from .types import DeltaCallback
 
 log = structlog.get_logger(__name__)
+
+
+def classify_stream_socket_timeout(
+    *, got_event: bool
+) -> RetryableError | PermanentError:
+    """httpx socket ReadTimeout: retry only before the first token."""
+    msg = f"HTTP read timeout ({STREAM_SOCKET_READ_TIMEOUT_S}s)"
+    if got_event:
+        return PermanentError(f"{msg} after tokens")
+    return RetryableError(msg)
 
 
 class HttpStreamMixin:
@@ -176,7 +189,22 @@ class HttpStreamMixin:
         async def do_request() -> dict:
             # Bug B fix: 全局并发控制 — 在 HTTP 请求级别限流
             sem = _get_llm_semaphore()
-            async with sem:
+            wait_started = time.monotonic()
+            while True:
+                try:
+                    await asyncio.wait_for(
+                        sem.acquire(), timeout=LLM_QUEUE_PING_S
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    # Keep zombie sweep alive; do not use round_start
+                    # (that resets the streaming text accumulator).
+                    await self._fire_delta(on_delta, {
+                        "type": "llm_queue",
+                        "round": round_num,
+                        "wait_s": int(time.monotonic() - wait_started),
+                    })
+            try:
                 return await self._do_streaming_request(
                     agent_id=agent_id,
                     provider=provider,
@@ -188,6 +216,8 @@ class HttpStreamMixin:
                     round_num=round_num,
                     budget_deadline=budget_deadline,
                 )
+            finally:
+                sem.release()
 
         try:
             result = await self._retry_handler.with_retry(do_request)
@@ -247,23 +277,25 @@ class HttpStreamMixin:
         避免整包收完才刷新（否则 UI 长时间冻住，误判为 streaming 僵尸）。
         """
         body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        read_to = httpx.Timeout(read=READ_TIMEOUT_S, connect=10, write=10, pool=10)
+        read_to = httpx.Timeout(
+            read=STREAM_SOCKET_READ_TIMEOUT_S, connect=10, write=10, pool=10
+        )
 
         loop = asyncio.get_running_loop()
         event_q: asyncio.Queue = asyncio.Queue()
         _DONE = object()
         _ERR = object()
-        # 客户端引用透出到事件循环侧：budget_cut 时主动断流（关闭客户端让
-        # 线程内 iter_bytes 立即出错退出）。否则思考模型会继续流数分钟 —
-        # provider 持续计费 token、事件推入无界队列无人消费、线程池线程
-        # 被占，多次 budget_cut 累积孤儿线程（审计 2026-08-08）。
+        # 客户端引用透出到事件循环侧：budget_cut / 首包 / 空闲超时都要主动
+        # 断流（关闭客户端让线程内 iter_bytes 立即出错退出）。只 raise 不关
+        # 的话 finally 会 await 线程，等到 socket 读超时（idle+30）才返回，
+        # 看门狗形同虚设，且占着 LLM semaphore。
         client_holder: dict[str, httpx.Client] = {}
 
-        def _budget_cut_close() -> None:
+        def _close_http_client() -> None:
             """主动断流：关客户端让线程内 iter_bytes 立即出错退出。
 
             best-effort —— 线程 finally 里还会再关一次（幂等），失败也无妨
-            （线程终会自然结束，最长 httpx read timeout 95s）。
+            （线程终会自然结束，最长 httpx read = stream idle + 30s）。
             """
             orphan_client = client_holder.get("client")
             if orphan_client is not None:
@@ -337,7 +369,6 @@ class HttpStreamMixin:
             finally:
                 http_client.close()
 
-        deadline = FIRST_CHUNK_TIMEOUT_S + READ_TIMEOUT_S + 10
         executor_task = loop.run_in_executor(None, _run_sync)
 
         text_acc = ""
@@ -346,13 +377,14 @@ class HttpStreamMixin:
         finish_reason: str | None = None
         usage: dict | None = None
         budget_cut = False
-
+        abandon_executor = False
+        got_event = False
         try:
             while True:
-                # Turn 硬预算切断：单次 wait 取「读超时」与「预算截止」的较早者。
-                # 没有这道切断，单轮流式可无限续命（事件每 <195s 到达即重置），
-                # 冲过 tool_loop 轮间硬检查直至 agent SAFETY_TIMEOUT 强杀整轮。
-                wait_s = deadline
+                # Idle watchdog: wait only for the next SSE event. First
+                # token uses FIRST_CHUNK; afterwards IDLE (default 5 min).
+                # Opt-in session wall clock can still cut earlier.
+                wait_s = stream_chunk_wait_s(got_event=got_event)
                 if budget_deadline is not None:
                     wait_s = min(
                         wait_s,
@@ -369,6 +401,7 @@ class HttpStreamMixin:
                         # 预算切断：保留已累积文本；不完整 tool_calls 丢弃
                         # （截断的 JSON args 不可执行，同 length 截断语义）。
                         budget_cut = True
+                        abandon_executor = True
                         log.warning(
                             "stream_budget_cut",
                             agent_id=agent_id,
@@ -376,10 +409,16 @@ class HttpStreamMixin:
                             text_len=len(text_acc),
                             discarded_tool_deltas=len(tool_call_deltas),
                         )
-                        _budget_cut_close()
+                        _close_http_client()
                         break
-                    raise RetryableError(
-                        f"HTTP request timed out after {deadline}s"
+                    abandon_executor = True
+                    _close_http_client()
+                    if not got_event:
+                        raise RetryableError(
+                            f"First chunk timeout ({FIRST_CHUNK_TIMEOUT_S}s)"
+                        )
+                    raise PermanentError(
+                        f"Stream idle timeout ({IDLE_TIMEOUT_S}s)"
                     )
 
                 if kind is _DONE:
@@ -387,8 +426,8 @@ class HttpStreamMixin:
                 if kind is _ERR:
                     raw = payload
                     if raw.get("timeout"):
-                        raise RetryableError(
-                            f"HTTP read timeout ({READ_TIMEOUT_S}s)"
+                        raise classify_stream_socket_timeout(
+                            got_event=got_event
                         )
                     if raw.get("connect_error"):
                         raise RetryableError(
@@ -404,6 +443,8 @@ class HttpStreamMixin:
                         raw.get("error", "Unknown HTTP error")
                     )
 
+                got_event = True
+
                 # 逐事件预算检查（审计 2026-08-08 P1）：上面的切断只在 wait
                 # 超时分支判定 —— 连续事件流（间隔 <0.1s）会让 wait 永不超时，
                 # 整个闸口被绕过。「过预算」必须是逐事件判定的结构属性，不能
@@ -413,6 +454,7 @@ class HttpStreamMixin:
                     time.monotonic() >= budget_deadline
                 ):
                     budget_cut = True
+                    abandon_executor = True
                     log.warning(
                         "stream_budget_cut",
                         agent_id=agent_id,
@@ -420,7 +462,7 @@ class HttpStreamMixin:
                         text_len=len(text_acc),
                         discarded_tool_deltas=len(tool_call_deltas),
                     )
-                    _budget_cut_close()
+                    _close_http_client()
                     break
 
                 event = payload
@@ -479,14 +521,20 @@ class HttpStreamMixin:
                             error=error_content,
                         )
                         raise classify_http_error(None, error_content)
+        except BaseException:
+            if not abandon_executor:
+                abandon_executor = True
+                _close_http_client()
+            raise
         finally:
-            if budget_cut:
-                # 预算切断时【不能】await executor 线程 —— 它正阻塞在 socket
-                # read 上，要等 httpx read timeout(≤95s) 才自然退出；await 它
-                # 会把切断省下的时间又耗光，违背切断本意。线程体内部已捕获
-                # 全部异常并在 finally 关闭 http_client，不 await 不会泄漏
-                # 未取异常告警；残留事件入队无人消费，随 GC 回收。
-                pass
+            if abandon_executor:
+                # 预算切断 / 首包 / 空闲超时都【不能】await executor 线程 ——
+                # 它正阻塞在 socket read 上；await 会把看门狗省下的时间耗光
+                # （httpx read = idle + 30s），并占着 LLM semaphore。
+                # 已 close 客户端。cancel() 拦住尚未开工的默认线程池任务，
+                # 避免幽灵 HTTP 稍后占满 streamer 共用的 default executor。
+                if not executor_task.done():
+                    executor_task.cancel()
             else:
                 try:
                     await executor_task
@@ -532,8 +580,8 @@ class HttpStreamMixin:
         """带超时的 SSE 事件迭代器。
 
         双超时机制：
-        1. httpx 原生 read timeout (95s) — socket 级，Windows 可靠
-        2. time.monotonic() 跟踪 — 应用级，在收到数据后检查 deadline
+        1. httpx 原生 read timeout（stream idle + 30s）— socket 级
+        2. time.monotonic() 跟踪 — 应用级 first-chunk / idle
 
         不再依赖 asyncio.wait_for 取消 __anext__() —— Windows 上 CancelledError
         可能无法中断 httpx 的底层 socket read。

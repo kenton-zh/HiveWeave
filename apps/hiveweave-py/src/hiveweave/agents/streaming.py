@@ -143,6 +143,10 @@ async def on_delta(agent: Any, event: dict) -> None:
     # 本地 thinking 心跳不经此回调（agent._heartbeat 直接广播），
     # 不会掩盖「HTTP 挂死零事件」的真卡死。
     agent._last_stream_activity_at = time.time() * 1000
+    if event.get("type") == "llm_queue":
+        # Semaphore wait ping: keep zombie sweep alive, do not feed or
+        # stop the thinking heartbeat (tokens have not started).
+        return
     # 第一个 delta 到达 → 停止心跳（LLM 开始产出内容了）
     agent._stop_heartbeat()
     broadcast_stream_event(agent, event)

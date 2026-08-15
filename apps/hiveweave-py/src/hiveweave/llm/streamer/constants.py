@@ -4,6 +4,19 @@ from __future__ import annotations
 import asyncio
 import os as _os
 
+
+def session_wall_clock_enabled() -> bool:
+    """Opt-in session TOTAL/HARD wrap. Default off (no turn budget).
+
+    Product: long work may run a long time. Stop on stream-idle, per-tool
+    declared timeout, job_kill / cancel — not 540/570/600. Tests that still
+    exercise the old gates set ``HIVEWEAVE_STREAM_SESSION_WALL_CLOCK=1``.
+    """
+    raw = (
+        _os.environ.get("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "0") or "0"
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
 MAX_TOOL_ROUNDS = 1_000_000
 """最大 tool loop 轮次 — 仅作极端安全网，实际由 doom loop 按工具分级保护。峰值复现真实死循环(同参数反复调用) 。"""
 
@@ -98,7 +111,7 @@ ACTIVITY_EXTEND_S = float(
 # ── 硬截止结构性执行（2026-08-07 slack-clone 压测根因修复）────────
 # 根因：HARD_TOTAL_TIMEOUT_S 此前只在 tool_loop 轮次【之间】检查，而单轮
 # 时长无界 —— 一次 LLM 流式（有事件就续命，思考模型可流数分钟）+ 一批并行
-# 工具（bash 120s / question 200s / spawn 500s）。在 t≈560s 进入一轮可冲到
+# 工具（bash 120s / question 200s；spawn_subagent 已改为 off-turn 立即返回）。在 t≈560s 进入一轮可冲到
 # 700s+，越过 agent SAFETY_TIMEOUT(600s) 被整体 cancel（run interrupted →
 # 90s 冷却 → resume 重建上下文）。实测 Aria 两次 run 在恰好 600s 被杀，
 # 且所有长 turn 都贴着 570~600s 边缘运行。HARD↔SAFETY 仅 30s 余量，远小于
@@ -186,9 +199,23 @@ FIRST_CHUNK_TIMEOUT_S = 90.0
 """首 chunk 超时（TS 防线②，thinking 模型首 token 可能 60-90s）。"""
 
 IDLE_TIMEOUT_S = float(
-    _os.environ.get("HIVEWEAVE_STREAM_IDLE_TIMEOUT_S", "120") or "120"
+    _os.environ.get("HIVEWEAVE_STREAM_IDLE_TIMEOUT_S", "300") or "300"
 )
-"""后续 chunk / 无活动 idle 超时（TEST21 M4：默认 120s，真停滞才杀）。"""
+"""后续 chunk 空闲看门狗（默认 5min）。真停滞才杀，不是整轮写码到点必杀。"""
+
+# Socket read must outlive the idle watchdog so httpx does not kill first.
+STREAM_SOCKET_READ_TIMEOUT_S = IDLE_TIMEOUT_S + 30.0
+
+LLM_QUEUE_PING_S = 15.0
+"""While waiting for the global LLM semaphore, fire ``llm_queue`` this often
+so zombie sweep does not treat a healthy waiter as a silent stream.
+Must stay well below ``STREAMING_ZOMBIE_TIMEOUT_MS`` (default 5 min).
+"""
+
+
+def stream_chunk_wait_s(*, got_event: bool) -> float:
+    """Seconds to wait for the next SSE event (first chunk vs idle)."""
+    return FIRST_CHUNK_TIMEOUT_S if not got_event else IDLE_TIMEOUT_S
 
 # ── Bug B fix: 全局 LLM 并发控制 ───────────────────────────
 # 防止多 agent 同时打 LLM API 超过 provider 并发限制（默认 8）。
@@ -205,11 +232,13 @@ def _get_llm_semaphore() -> asyncio.Semaphore:
     return _LLM_SEMAPHORE
 
 TOOL_EXECUTION_TIMEOUT_S = 120.0
-"""单个工具执行超时。对齐 Elixir Task.yield(task, 120_000)。"""
+"""Legacy default. Streamer no longer wraps undeclared tools in this wait_for.
+Declared budgets live in ``hiveweave.tools.timeout_policy.DECLARED_TIMEOUT_S``.
+"""
 
 # question waits on human answer (QUESTION_TIMEOUT_S=180) — must outlive that.
 _QUESTION_TOOL_TIMEOUT_S = 200.0
 
-# spawn_subagent 外层工具超时必须 > 子代理最大硬限(480s) + 余量
-_SUBAGENT_TOOL_TIMEOUT_S = 500
+# spawn_subagent returns immediately (off-turn job).
+_SUBAGENT_TOOL_TIMEOUT_S = TOOL_EXECUTION_TIMEOUT_S
 

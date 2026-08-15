@@ -39,7 +39,7 @@ STALL_CHECK_TICKS = 24        # 24 * 5s = 120s = 2min
 STREAMING_SWEEP_TICKS = 6     # 6 * 5s = 30s — auto-heal orphan is_streaming=1
 # P0-3: 「卡住中的流」判定阈值 — PROCESSING 但流式超此时长无任何事件
 # （delta/round/tool 起止）即视为 streaming 僵尸。健康长流的静默上限为
-# max(READ_TIMEOUT 95s, 工具超时 ≤500s)，5min 默认高于除 spawn_subagent
+# max(READ_TIMEOUT 95s, 工具超时 ≤200s)，5min 默认高于除 question
 # 外的一切正常间隔（执行中工具按其超时+60s 单独放宽，见 _streaming_stuck_ms）。
 STREAMING_ZOMBIE_TIMEOUT_MS = int(
     os.environ.get("HIVEWEAVE_STREAMING_ZOMBIE_TIMEOUT_MS", "300000") or "300000"
@@ -196,32 +196,34 @@ async def _execute(project_id, sql, params=None):
 
 
 def _tool_quiet_cap_ms(tool_name: str) -> int:
-    """执行中工具允许的最大静默间隔（工具超时 + 60s 余量）。
+    """执行中工具允许的最大静默间隔。
 
-    与 streamer tool_exec 的 asyncio.wait_for 超时同源：工具超此时长无
-    tool_call_end 即异常（正常路径工具必在自身超时内返回）。
+    Declared tools: their budget + 60s. Foreground bash: MAX_TIMEOUT + 60s.
+    Undeclared read/write/edit: long hang net (not the 5 min stream-idle /
+    zombie default) so a live coding tool is not treated as a dead stream.
     """
-    from hiveweave.llm.streamer.constants import (
-        TOOL_EXECUTION_TIMEOUT_S,
-        _QUESTION_TOOL_TIMEOUT_S,
-        _SUBAGENT_TOOL_TIMEOUT_S,
+    from hiveweave.tools.timeout_policy import (
+        UNDECLARED_ACTIVE_QUIET_S,
+        declared_timeout_s,
     )
 
-    cap_s = (
-        _SUBAGENT_TOOL_TIMEOUT_S
-        if tool_name == "spawn_subagent"
-        else _QUESTION_TOOL_TIMEOUT_S
-        if tool_name == "question"
-        else TOOL_EXECUTION_TIMEOUT_S
-    )
-    return int((cap_s + 60.0) * 1000)
+    declared = declared_timeout_s(tool_name)
+    if declared is not None:
+        return int((declared + 60.0) * 1000)
+    if tool_name in ("bash", "run_command"):
+        from hiveweave.tools.bash import MAX_TIMEOUT_S
+
+        return int((MAX_TIMEOUT_S + 60.0) * 1000)
+    if tool_name in ("read_file", "write_file", "edit_file", "apply_patch"):
+        return int(UNDECLARED_ACTIVE_QUIET_S * 1000)
+    return STREAMING_ZOMBIE_TIMEOUT_MS
 
 
 def _streaming_allowed_quiet_ms(agent: object) -> int:
     """P0-3: PROCESSING agent 允许的最大流式静默间隔（毫秒）。
 
     默认 STREAMING_ZOMBIE_TIMEOUT_MS；执行中有工具时放宽为
-    max(阈值, 各活跃工具超时+60s)—— spawn_subagent（500s）等长工具不冤杀。
+    max(阈值, 各活跃工具超时+60s)—— question 等长工具不冤杀。
     与 _streaming_stuck_ms 同源；O2 的 stuck 时刻（清行/守卫的
     created_at 界限）复用此值。
     """
@@ -241,7 +243,7 @@ def _streaming_stuck_ms(agent: object, now_ms: int) -> int | None:
     判活；PROCESSING 保护集合 list_processing() 同为内存态，语义一致。
 
     - 执行中有工具：静默上限放宽为 max(阈值, 各活跃工具超时+60s)——
-      spawn_subagent（500s）等长工具不冤杀。
+      question 等长工具不冤杀。
     - 无活动时间戳（老实例/属性缺失）：返回 None fail-open，
       由 sweep 的 soft_age（10min）硬龄路径兜底。
     """
@@ -1742,10 +1744,8 @@ class GameTimeService:
         Users must never need a manual/AI 'zombie clear'. Boot clears crash
         leftovers; this runtime sweep catches mid-session orphans within ~30s.
 
-        Protected (PROCESSING) streams are only cleared by soft_age_ms
-        (≈ safety timeout). Do NOT finalize mid-turn on content-length
-        heartbeat — long tools / thinking phases often don't grow content
-        (TEST11 audit H4).
+        Protected (PROCESSING) streams are never age-finalized here.
+        Stuck live streams use ``_streaming_stuck_ms`` / quiet cap.
 
         P0-3 增补：PROCESSING 但流式超 STREAMING_ZOMBIE_TIMEOUT_MS 无任何
         事件的「卡住中的流」（safety timer 单点失效时 zombie 永不清理、
