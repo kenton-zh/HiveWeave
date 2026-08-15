@@ -83,6 +83,19 @@ class StartDevServerParams(BaseModel):
     )
 
 
+class LookupDevServerParams(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    preferred_port: int | None = Field(
+        default=None,
+        alias="preferredPort",
+        description=(
+            "Optional port filter. Omit to list this project's servers."
+        ),
+        json_schema_extra={"aliases": ["preferredPort", "preferred_port", "port"]},
+    )
+
+
 @tool(
     "start_dev_server",
     "Start the project's Vite/dev server on a non-reserved port (never 5173/4000). "
@@ -268,12 +281,13 @@ async def start_dev_server_tool(
 
 @tool(
     "lookup_dev_server",
-    "Look up registered project dev servers by port or list this project's servers.",
+    "List this project's registered dev servers. Pass preferredPort to "
+    "filter one port; omit to list all.",
     requires_workspace=False,
     security_level="read",
 )
 async def lookup_dev_server_tool(
-    params: StartDevServerParams, agent_id: str, workspace: str
+    params: LookupDevServerParams, agent_id: str, workspace: str
 ) -> ToolResult:
     hydrate_registry()
     project_id = await get_project_id(agent_id)
