@@ -1,8 +1,17 @@
 import { useState, useRef, useEffect, useCallback, useMemo, type MutableRefObject } from "react";
 import { getAgent, getChatMessages, markMessagesRead, subscribeAgentStream } from "../api";
+import type { ChatEvent } from "../api";
 import { useAppStore } from "../store";
 import type { AgentInfo, ChatMessage, MsgSegment, StreamDraft } from "./types";
-import { beginStreamRound, isInjectedContext, isTeamChannelMessage, mapDbToChatMessages } from "./messageUtils";
+import {
+  appendToolCallSegment,
+  beginStreamRound,
+  draftFromStreamingMessage,
+  isInjectedContext,
+  isTeamChannelMessage,
+  mapDbToChatMessages,
+  parseToolUsePayload,
+} from "./messageUtils";
 
 type UpdateStreamDraft = (
   updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)
@@ -50,6 +59,8 @@ export function useChatMessages(opts: {
   const stickToBottomRef = useRef(true);
   const savedDraftsRef = useRef<Record<string, StreamDraft | null>>({});
   const prevAgentIdRef = useRef<string | null>(null);
+  const passiveSubRef = useRef<string | null>(null);
+  const passiveUnsubRef = useRef<(() => void) | null>(null);
 
   const handleMessagesScroll = useCallback(() => {
     const el = scrollContainerRef.current;
@@ -116,6 +127,172 @@ export function useChatMessages(opts: {
     [activeAgentIdRef, refreshOrgTree, streamDraftRef]
   );
 
+  const releasePassiveStream = useCallback((id?: string) => {
+    if (passiveSubRef.current == null) return;
+    if (id && passiveSubRef.current !== id) return;
+    passiveUnsubRef.current?.();
+    passiveUnsubRef.current = null;
+    passiveSubRef.current = null;
+  }, []);
+
+  const applyStreamEvent = useCallback(
+    (event: ChatEvent, forAgentId: string) => {
+      if (activeAgentIdRef.current !== forAgentId) return;
+      if (event.type === "round_start") {
+        updateStreamDraft((prev) => (prev ? beginStreamRound(prev) : prev));
+        return;
+      }
+      if (event.type === "message_id") {
+        try {
+          const parsed = JSON.parse(event.data);
+          if (parsed.role === "assistant" && parsed.id) {
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === parsed.id)) return prev;
+              return [
+                ...prev,
+                {
+                  id: parsed.id,
+                  role: "assistant" as const,
+                  content: "",
+                  timestamp: Date.now(),
+                  isBackground: false,
+                  isRead: true,
+                  isStreaming: true,
+                },
+              ];
+            });
+            if (!streamDraftRef.current) {
+              updateStreamDraft({ assistantId: parsed.id, segments: [] });
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "text") {
+        setThinkingElapsed(null);
+        const segType: MsgSegment["type"] = event.type === "thinking_delta" ? "thinking" : "text";
+        if (!streamDraftRef.current) {
+          const placeholderId = `draft-${forAgentId}-${Date.now()}`;
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === placeholderId)) return prev;
+            return [
+              ...prev,
+              {
+                id: placeholderId,
+                role: "assistant" as const,
+                content: "",
+                timestamp: Date.now(),
+                isBackground: false,
+                isRead: true,
+                isStreaming: true,
+              },
+            ];
+          });
+          updateStreamDraft({
+            assistantId: placeholderId,
+            segments: [{ type: segType, content: event.data }],
+          });
+          return;
+        }
+        updateStreamDraft((prev) => {
+          if (!prev) return prev;
+          const last = prev.segments[prev.segments.length - 1];
+          if (last && last.type === segType) {
+            const merged = (last.content || "") + event.data;
+            return {
+              ...prev,
+              segments: [...prev.segments.slice(0, -1), { ...last, content: merged }],
+            };
+          }
+          return { ...prev, segments: [...prev.segments, { type: segType, content: event.data }] };
+        });
+        return;
+      }
+      if (event.type === "thinking") {
+        setThinkingElapsed(event.elapsed_s ?? null);
+        return;
+      }
+      if (event.type === "tool_use") {
+        setThinkingElapsed(null);
+        const parsed = parseToolUsePayload(event.data);
+        if (!parsed) return;
+        if (!streamDraftRef.current) {
+          const placeholderId = `draft-${forAgentId}-${Date.now()}`;
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === placeholderId)) return prev;
+            return [
+              ...prev,
+              {
+                id: placeholderId,
+                role: "assistant" as const,
+                content: "",
+                timestamp: Date.now(),
+                isBackground: false,
+                isRead: true,
+                isStreaming: true,
+              },
+            ];
+          });
+          updateStreamDraft(
+            appendToolCallSegment(
+              { assistantId: placeholderId, segments: [] },
+              parsed.toolCall,
+              parsed.toolCallId,
+            ),
+          );
+          return;
+        }
+        updateStreamDraft((prev) =>
+          prev ? appendToolCallSegment(prev, parsed.toolCall, parsed.toolCallId) : prev,
+        );
+        return;
+      }
+      if (event.type === "done") {
+        setThinkingElapsed(null);
+        loadMessagesFromDb(forAgentId).then((ok) => {
+          if (ok) updateStreamDraft(null);
+        });
+        setIsStreaming(false);
+        updateProcessingAgent(forAgentId, false);
+        delete savedDraftsRef.current[forAgentId];
+        releasePassiveStream(forAgentId);
+        return;
+      }
+      if (event.type === "error") {
+        setThinkingElapsed(null);
+        setIsStreaming(false);
+        updateProcessingAgent(forAgentId, false);
+        delete savedDraftsRef.current[forAgentId];
+        releasePassiveStream(forAgentId);
+      }
+    },
+    [
+      activeAgentIdRef,
+      loadMessagesFromDb,
+      releasePassiveStream,
+      setIsStreaming,
+      setThinkingElapsed,
+      streamDraftRef,
+      updateProcessingAgent,
+      updateStreamDraft,
+    ],
+  );
+  const applyStreamEventRef = useRef(applyStreamEvent);
+  applyStreamEventRef.current = applyStreamEvent;
+
+  const attachPassiveStream = useCallback(
+    (id: string) => {
+      if (passiveSubRef.current === id) return;
+      releasePassiveStream();
+      const unsub = subscribeAgentStream(id, (event) => applyStreamEventRef.current(event, id));
+      passiveSubRef.current = id;
+      passiveUnsubRef.current = unsub;
+    },
+    [releasePassiveStream],
+  );
+
   // Mount / agent / orgTreeVersion effect — MUST NOT abort stream on cleanup.
   useEffect(() => {
     const switchingFrom = prevAgentIdRef.current;
@@ -145,68 +322,7 @@ export function useChatMessages(opts: {
     if (isAgentSwitch && savedDraft && isStillProcessing) {
       updateStreamDraft(savedDraft);
       setIsStreaming(true);
-      subscribeAgentStream(agentId, (event) => {
-        if (activeAgentIdRef.current !== agentId) return;
-        if (event.type === "round_start") {
-          updateStreamDraft((prev) => (prev ? beginStreamRound(prev) : prev));
-          return;
-        }
-        if (event.type === "text_delta" || event.type === "thinking_delta") {
-          setThinkingElapsed(null);
-          const segType = event.type === "thinking_delta" ? "thinking" : "text";
-          updateStreamDraft((prev) => {
-            if (!prev) return prev;
-            const last = prev.segments[prev.segments.length - 1];
-            if (last && last.type === segType) {
-              const merged = (last.content || "") + event.data;
-              return {
-                ...prev,
-                segments: [...prev.segments.slice(0, -1), { ...last, content: merged }],
-              };
-            }
-            return { ...prev, segments: [...prev.segments, { type: segType, content: event.data }] };
-          });
-        } else if (event.type === "thinking") {
-          setThinkingElapsed(event.elapsed_s ?? null);
-        } else if (event.type === "tool_use") {
-          setThinkingElapsed(null);
-          try {
-            const toolData = JSON.parse(event.data);
-            const rawName: string = toolData.toolName || toolData.tool_name || toolData.tool || "";
-            const toolName = rawName.replace(/^hiveweave__/, "");
-            const argsRaw = toolData.arguments || toolData.input || {};
-            const args =
-              typeof argsRaw === "string"
-                ? (() => {
-                    try {
-                      return JSON.parse(argsRaw);
-                    } catch {
-                      return {};
-                    }
-                  })()
-                : argsRaw;
-            const toolCallSeg = { type: "tool_call" as const, tool: { tool: toolName, input: args } };
-            updateStreamDraft((prev) =>
-              prev ? { ...prev, segments: [...prev.segments, toolCallSeg] as MsgSegment[] } : prev
-            );
-          } catch {
-            /* ignore */
-          }
-        } else if (event.type === "done") {
-          setThinkingElapsed(null);
-          loadMessagesFromDb(agentId).then((ok) => {
-            if (ok) updateStreamDraft(null);
-          });
-          setIsStreaming(false);
-          updateProcessingAgent(agentId, false);
-          delete savedDraftsRef.current[agentId];
-        } else if (event.type === "error") {
-          setThinkingElapsed(null);
-          setIsStreaming(false);
-          updateProcessingAgent(agentId, false);
-          delete savedDraftsRef.current[agentId];
-        }
-      });
+      attachPassiveStream(agentId);
     } else if (isAgentSwitch) {
       setIsStreaming(false);
       updateStreamDraft(null);
@@ -249,6 +365,7 @@ export function useChatMessages(opts: {
     };
   }, [
     agentId,
+    attachPassiveStream,
     loadMessagesFromDb,
     orgTreeVersion,
     activeAgentIdRef,
@@ -258,6 +375,50 @@ export function useChatMessages(opts: {
     updateStreamDraft,
     updateProcessingAgent,
   ]);
+
+  // Passive live stream while parked on this agent (trigger/wake — not user streamChat).
+  // subscribeAgentStream replaces _agentHandlers: skip when streamChat owns it (isStreaming).
+  // Do NOT return an unsubscribe tied to isStreaming — going false→true would steal the handler.
+  useEffect(() => {
+    if (!agentId) {
+      releasePassiveStream();
+      return;
+    }
+    if (!processingAgents.includes(agentId)) {
+      const wasPassive = passiveSubRef.current === agentId;
+      releasePassiveStream(agentId);
+      if (wasPassive) setIsStreaming(false);
+      return;
+    }
+    if (isStreaming) return;
+    attachPassiveStream(agentId);
+    if (!streamDraftRef.current) {
+      const cached = useAppStore.getState().chatSessions[agentId] as ChatMessage[] | undefined;
+      const streaming = cached?.find((m) => m.isStreaming && m.role === "assistant");
+      if (streaming) {
+        updateStreamDraft(
+          draftFromStreamingMessage(streaming, { includeTools: false }),
+        );
+      }
+    }
+    setIsStreaming(true);
+  }, [
+    agentId,
+    isStreaming,
+    processingAgents,
+    attachPassiveStream,
+    releasePassiveStream,
+    streamDraftRef,
+    updateStreamDraft,
+    setIsStreaming,
+  ]);
+
+  // Drop the passive handler on agent switch. Never push WS cancel (BUG-034).
+  useEffect(() => {
+    return () => {
+      releasePassiveStream();
+    };
+  }, [agentId, releasePassiveStream]);
 
   // BUG-036: event-driven load only
   useEffect(() => {

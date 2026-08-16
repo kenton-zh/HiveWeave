@@ -59,6 +59,7 @@ DOCKER_SANDBOX_IMAGE = "hiveweave/sandbox:latest"
 # teardown. Detect such commands and route them to the registered spawn path
 # (same mechanism start_dev_server uses) so the process is trackable/killable.
 _DEV_SERVER_TRIGGER_RE = re.compile(
+    r"(?:"
     r"(?:^|\s|;|&|\|)`?(?:"
     r"(?:npx\s+)?vite(?:\s|$)"               # vite / npx vite (bare = dev server)
     r"|(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|start)(?:\s|$)"
@@ -66,6 +67,11 @@ _DEV_SERVER_TRIGGER_RE = re.compile(
     r"|next\s+dev(?:\s|$)"
     r"|nuxt\s+dev(?:\s|$)"
     r"|nodemon\b"
+    r"|(?:pythonw?|python3)\s+-m\s+uvicorn(?:\s|$)"
+    r"|uv\s+run\b(?:\s+\S+)*?\s+(?<!\s--with\s)(?<!\s--extra\s)(?<!\s--group\s)(?<!\s--package\s)uvicorn(?:\s+\S|$)"
+    r")"
+    # 裸 uvicorn：仅段首（含 VAR=val 前缀），避免 --with uvicorn / pip show uvicorn
+    r"|(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*`?uvicorn(?:\s+\S)"
     r")",
     re.IGNORECASE,
 )
@@ -75,6 +81,28 @@ _BLOCKING_VERB_RE = re.compile(
     r"\b(?:build|test|lint|install|ci|audit|eject|deploy)\b",
     re.IGNORECASE,
 )
+# 尾部后台符：注册 spawn / offturn job 已脱离前台，字面 & 会在 shell 里 orphan。
+_TRAILING_AMP_RE = re.compile(r"\s*&+\s*$")
+_UVICORN_HELP_RE = re.compile(
+    r"(?:^|\s)(?:--help|-h|--version)(?:\s|$)",
+    re.IGNORECASE,
+)
+_UVICORN_TOKEN_RE = re.compile(r"\buvicorn\b", re.IGNORECASE)
+
+
+def _strip_trailing_ampersand(command: str) -> str:
+    return _TRAILING_AMP_RE.sub("", (command or "").strip()).strip()
+
+
+def _has_trailing_ampersand(command: str) -> bool:
+    return bool(_TRAILING_AMP_RE.search((command or "").strip()))
+
+
+def _should_offturn_trailing_amp(command: str) -> bool:
+    """前台 `cmd &` 且不是已识别的长驻服务 → 走 offturn job，禁止 shell 脱管。"""
+    if not _has_trailing_ampersand(command):
+        return False
+    return _detect_dev_server_command(command) is None
 
 
 def _detect_dev_server_command(command: str) -> int | None:
@@ -89,13 +117,16 @@ def _detect_dev_server_command(command: str) -> int | None:
         return None
     # Strip trailing background operators — the registered spawn already
     # detaches; a literal `&` would background inside the shell and orphan.
-    cmd = re.sub(r"\s*&+\s*$", "", command.strip()).strip()
+    cmd = _strip_trailing_ampersand(command)
     if not cmd:
         return None
     if not _DEV_SERVER_TRIGGER_RE.search(cmd):
         return None
     # Disqualify blocking verbs (vite build, npm run build:test, …).
     if _BLOCKING_VERB_RE.search(cmd):
+        return None
+    # uvicorn --help / --version 会立刻退出，不当成长驻服务。
+    if _UVICORN_TOKEN_RE.search(cmd) and _UVICORN_HELP_RE.search(cmd):
         return None
     # Disqualify commands that pipe/redirect into a finite sink, e.g.
     # `vite --port 3000 > log.txt 2>&1 & echo done` — the agent intended a
@@ -130,6 +161,7 @@ async def _run_registered_dev_server(
         spawn_project_process,
     )
 
+    command = _strip_trailing_ampersand(command)
     pid = project_id or "default"
     port = port_hint if (port_hint and not is_reserved_port(port_hint)) else (
         allocate_project_port(pid, 3000)
@@ -1053,7 +1085,11 @@ class BashParams(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     command: str = Field(
-        description="The bash command to execute.",
+        description=(
+            "The bash command to execute. Long-running uvicorn/vite: prefer "
+            "start_dev_server (bash auto-registers them). Do not "
+            "`uvicorn … &` in the foreground."
+        ),
         json_schema_extra={"aliases": ["cmd", "run"]},
     )
     timeout: int = Field(
@@ -1075,7 +1111,7 @@ class BashParams(BaseModel):
             "No timeout. Then commit_turn(waiting) with waiting_on; "
             "do not poll. Woken with [BASH DONE]/[BASH FAILED]. "
             "Stop with job_kill. Default false keeps stdout in this turn. "
-            "Do not use for vite / npm run dev."
+            "Do not use for vite / npm run dev / uvicorn."
         ),
         json_schema_extra={"aliases": ["bg"]},
     )
@@ -1383,6 +1419,18 @@ def _norm_ws(path: str) -> str:
         return os.path.normcase(os.path.normpath(path))
 
 
+def _is_same_workspace(a: str, b: str) -> bool:
+    """True when *a* and *b* are the same directory after resolve.
+
+    Worktrees live under ``<project>/.hiveweave/worktrees/<sid>/``, so
+    "nested under project root" is not "on main". VERIFY UI evidence
+    must use this, not :func:`_is_under_or_same`.
+    """
+    if not a or not b:
+        return False
+    return _norm_ws(a) == _norm_ws(b)
+
+
 def _is_under_or_same(child: str, parent: str) -> bool:
     """True when child path equals parent or is nested under it."""
     if not child or not parent:
@@ -1634,6 +1682,7 @@ async def _bash_background(
         start_offturn_job,
     )
 
+    cmd = _strip_trailing_ampersand(cmd)
     blocked, reason = _validate_command_safety(cmd)
     if blocked:
         log.warning("bash.blocked", reason=reason, command_preview=cmd[:120])
@@ -1723,7 +1772,9 @@ async def _bash_background(
     "(cwd does not persist). Check Exit code: N. Long scripts: background=true "
     "returns waiting_on — then commit_turn(waiting); woken with [BASH DONE] / "
     "[BASH FAILED]. Stop with job_kill. Not PowerShell; prefer Git Bash, "
-    "tail -n N, uv run python.",
+    "tail -n N, uv run python. Do not background=true for vite / npm run dev / "
+    "uvicorn — long-running servers are auto-registered; prefer "
+    "start_dev_server. Do not append & on a foreground command.",
     requires_workspace=True,
     security_level="shell",
 )
@@ -1733,12 +1784,14 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
     from hiveweave.tools.helpers import get_project_id
 
     project_id = await get_project_id(agent_id)
+    raw_cmd = params.command or ""
     cmd, _env, reserved_err = prepare_spawn_command(
-        params.command, project_id=project_id
+        raw_cmd, project_id=project_id
     )
     if reserved_err:
         # H3: 保留端口是平台护栏拒绝（复审 P2-1）
         return ToolResult.blocked_err(reserved_err)
+    cmd = _strip_trailing_ampersand(cmd)
 
     exec_ws = workspace or ""
     verify_note = ""
@@ -1759,6 +1812,18 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
         exec_ws = workspace or ""
 
     if getattr(params, "background", False):
+        return await _bash_background(
+            params=params,
+            agent_id=agent_id,
+            cmd=cmd,
+            exec_ws=exec_ws,
+            project_id=project_id,
+            verify_note=verify_note,
+            verify_tid=verify_tid,
+        )
+
+    # 前台尾部 &：长驻服务走注册 spawn；其余必须 offturn job，禁止 shell 脱管。
+    if _should_offturn_trailing_amp(raw_cmd):
         return await _bash_background(
             params=params,
             agent_id=agent_id,

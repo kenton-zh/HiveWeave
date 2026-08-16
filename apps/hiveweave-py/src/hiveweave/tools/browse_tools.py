@@ -486,8 +486,13 @@ async def issue_browse_e2e_attestation(
     stdout: str,
     task_id: str | None = None,
     core_interaction: bool = False,
+    screenshot_path: str | None = None,
 ) -> str:
-    """Create browse_e2e attestation; return note fragment (may be empty)."""
+    """Create browse_e2e attestation; return note fragment (may be empty).
+
+    ``screenshot_path`` (abs) is merged into ``artifact_hashes`` so a
+    reviewer can load the PNG via ``look_at_image(attestation_id=...)``.
+    """
     try:
         from hiveweave.services.attestation import (
             attestation_service,
@@ -498,7 +503,7 @@ async def issue_browse_e2e_attestation(
         project_id = await get_project_id(agent_id)
         if not project_id:
             return ""
-        from hiveweave.tools.bash import _is_under_or_same
+        from hiveweave.tools.bash import _is_same_workspace
 
         resolved_task, bind_note = await _resolve_task_id(
             project_id, agent_id, task_id, command=" ".join(argv)
@@ -506,8 +511,7 @@ async def issue_browse_e2e_attestation(
         if not resolved_task:
             return bind_note or ""
         # TEST18 P0-2: VERIFY 任务的 browse 证据必须在 main 工作区执行 —
-        # dev server 起在哪是运行期事实，这里事后拒发并给出替代路径，
-        # 而不是在 approve 时静默拒绝。
+        # worktree 嵌在项目根下，「在根下面」会放行，必须目录等值（同 bash）。
         try:
             from hiveweave.services.task import TaskService
             from hiveweave.services.worktree_review import project_main_workspace
@@ -515,7 +519,7 @@ async def issue_browse_e2e_attestation(
             task = await TaskService().get_task(project_id, resolved_task)
             if task and TaskService._is_verify_task(task):
                 main_ws = await project_main_workspace(project_id)
-                if workspace and main_ws and not _is_under_or_same(workspace, main_ws):
+                if workspace and main_ws and not _is_same_workspace(workspace, main_ws):
                     return (
                         "\n\n[browse_e2e REJECTED] VERIFY 任务的 UI 证据必须在主"
                         f"工作区执行（当前 workspace={workspace!r} 非 main="
@@ -529,6 +533,10 @@ async def issue_browse_e2e_attestation(
         cmd_url = " ".join(argv)[:500]
         if core_interaction:
             cmd_url = f"[core_interaction=1] {cmd_url}"
+        artifact_hashes: dict[str, str] | None = None
+        shot = (screenshot_path or "").strip()
+        if shot:
+            artifact_hashes = {"screenshot_path": shot}
         att_id = await attestation_service.create(
             project_id,
             agent_id=agent_id,
@@ -540,6 +548,7 @@ async def issue_browse_e2e_attestation(
             workspace=workspace or None,
             commit=commit,
             stdout_hash=hash_stdout(stdout),
+            artifact_hashes=artifact_hashes,
             console_errors=0,
         )
         extra = " core_interaction=1" if core_interaction else ""
@@ -674,22 +683,10 @@ async def browse_tool(
     if stderr:
         out = f"{out}\n--- stderr ---\n{stderr}"
 
-    core_interaction = head in ("js", "eval", "evaluate")
-    attest_note = await issue_browse_e2e_attestation(
-        agent_id=agent_id,
-        workspace=workspace,
-        argv=argv,
-        stdout=out,
-        task_id=params.task_id,
-        core_interaction=core_interaction,
-    )
-
-    # 大快照短契约化 —— attestation 先按全量 stdout 出证（stdout_hash
-    # 完整性），返回文本再收短契约；<50KB 的快照原样返回。
-    if head == "snapshot":
-        out = _contract_snapshot_output(out, agent_id, workspace)
-
     extra_fields: dict[str, Any] = {}
+    screenshot_abs: str | None = None
+    img = None
+    shot_path = None
     shot_rel = _screenshot_path_from_argv(argv)
     if shot_rel:
         from hiveweave.services.vision import (
@@ -699,13 +696,34 @@ async def browse_tool(
 
         shot_path = resolve_screenshot_path(workspace, shot_rel)
         img = load_image_for_llm(shot_path) if shot_path else None
-        if img:
+        # Persist path even when pixels fail to load (size/suffix) so
+        # look_at_image(attestation_id) can still resolve the file.
+        if shot_path:
+            screenshot_abs = str(shot_path)
+
+    core_interaction = head in ("js", "eval", "evaluate")
+    attest_note = await issue_browse_e2e_attestation(
+        agent_id=agent_id,
+        workspace=workspace,
+        argv=argv,
+        stdout=out,
+        task_id=params.task_id,
+        core_interaction=core_interaction,
+        screenshot_path=screenshot_abs,
+    )
+
+    # 大快照短契约化 —— attestation 先按全量 stdout 出证（stdout_hash
+    # 完整性），返回文本再收短契约；<50KB 的快照原样返回。
+    if head == "snapshot":
+        out = _contract_snapshot_output(out, agent_id, workspace)
+
+    if shot_rel:
+        if img and screenshot_abs:
             extra_fields["images"] = [img]
-            shot_abs = str(shot_path)
-            extra_fields["screenshot_path"] = shot_abs
+            extra_fields["screenshot_path"] = screenshot_abs
             # NOTE: tool_exec drops extra fields before the next LLM round —
             # the path MUST be in the text for assert_visual(screenshotPath=...).
-            shot_display = shot_abs.replace("\\", "/")
+            shot_display = screenshot_abs.replace("\\", "/")
             out = (
                 f"{out}{attest_note}\n"
                 "[VISION] Screenshot pixels are attached to this tool result "
@@ -851,12 +869,12 @@ async def assert_visual_tool(
                     from hiveweave.services.worktree_review import (
                         project_main_workspace,
                     )
-                    from hiveweave.tools.bash import _is_under_or_same
+                    from hiveweave.tools.bash import _is_same_workspace
 
                     _task = await TaskService().get_task(project_id, task_id)
                     if _task and TaskService._is_verify_task(_task):
                         _main_ws = await project_main_workspace(project_id)
-                        if workspace and _main_ws and not _is_under_or_same(
+                        if workspace and _main_ws and not _is_same_workspace(
                             workspace, _main_ws
                         ):
                             return ToolResult.ok(
@@ -893,6 +911,7 @@ async def assert_visual_tool(
                 commit=commit,
                 stdout_hash=hash_stdout(blob),
                 stdout=blob,
+                artifact_hashes={"screenshot_path": str(shot)},
                 console_errors=0,
             )
             attest_note = (

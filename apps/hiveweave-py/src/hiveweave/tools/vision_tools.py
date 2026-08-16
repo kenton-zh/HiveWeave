@@ -7,6 +7,8 @@ Settings 里配置的多模态模型，把完整文本结果返回给调用方�
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,6 +17,7 @@ from hiveweave.services.vision import (
     analyze_image,
     load_image_for_llm,
     resolve_screenshot_path,
+    resolve_screenshot_under_project,
 )
 from hiveweave.tools.base import tool
 from hiveweave.tools.result import ToolResult
@@ -27,12 +30,24 @@ class LookAtImageParams(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    image_path: str = Field(
+    image_path: str | None = Field(
+        default=None,
         description=(
             "Path to the image file (PNG/JPEG/GIF/WebP/BMP). "
-            "Relative to the agent workspace, or absolute under the workspace."
+            "Relative to the agent workspace, or absolute under the workspace. "
+            "Optional if attestation_id is set."
         ),
         json_schema_extra={"aliases": ["path", "file", "screenshot", "image"]},
+    )
+    attestation_id: str | None = Field(
+        default=None,
+        alias="attestationId",
+        description=(
+            "tool_attestations id whose artifact_hashes.screenshot_path "
+            "points at the PNG (cross-worktree). Prefer this over copying "
+            "another agent's absolute path."
+        ),
+        json_schema_extra={"aliases": ["attestationId", "att_id"]},
     )
     prompt: str = Field(
         description=(
@@ -47,9 +62,10 @@ class LookAtImageParams(BaseModel):
     "look_at_image",
     "帮你看图片 — Load an image and ask the configured multimodal model to "
     "describe or analyze it. Stateless one-shot: waits for the full answer "
-    "(non-streaming) then returns text only. Pass image_path + prompt "
-    "(focus areas / output format). Does NOT inject pixels into your chat "
-    "history. Configure the vision model in Settings → 多模态模型配置.",
+    "(non-streaming) then returns text only. Pass image_path + prompt, or "
+    "attestation_id to inspect another agent's screenshot (project root / "
+    "worktree sandbox). Does NOT inject pixels into your chat history. "
+    "Configure the vision model in Settings → 多模态模型配置.",
     requires_workspace=True,
     security_level="standard",
 )
@@ -59,7 +75,6 @@ async def look_at_image_tool(
     workspace: str,
 ) -> ToolResult:
     """帮你看图片 — one-shot vision analyze with primary→backup failover."""
-    del agent_id  # required by @tool signature; unused
     prompt = (params.prompt or "").strip()
     if not prompt:
         return ToolResult.err(
@@ -67,12 +82,9 @@ async def look_at_image_tool(
             "(what should the vision model look for / how to answer)."
         )
 
-    resolved = resolve_screenshot_path(workspace, params.image_path)
-    if resolved is None:
-        return ToolResult.err(
-            f"Invalid or out-of-workspace image_path: {params.image_path!r}. "
-            "Path must exist under the agent workspace (no .. escape)."
-        )
+    resolved = await _resolve_look_at_image_path(params, agent_id, workspace)
+    if isinstance(resolved, str):
+        return ToolResult.err(resolved)
 
     image = load_image_for_llm(resolved)
     if image is None:
@@ -113,6 +125,64 @@ async def look_at_image_tool(
         model_id=model.get("model_id"),
         image_path=str(resolved),
     )
+
+
+async def _resolve_look_at_image_path(
+    params: LookAtImageParams,
+    agent_id: str,
+    workspace: str,
+) -> Path | str:
+    """Return a sandboxed Path, or an error string.
+
+    ``attestation_id`` loads screenshot_path from artifact_hashes and
+    sandboxes under the project root (incl. ``.hiveweave/worktrees/``).
+    Bare ``image_path`` stays sandboxed to this agent's workspace.
+    """
+    att_id = (params.attestation_id or "").strip()
+    if att_id:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.attestation import (
+            attestation_service,
+            screenshot_path_from_artifact_hashes,
+        )
+        from hiveweave.tools.helpers import get_project_id
+
+        project_id = await get_project_id(agent_id)
+        if not project_id:
+            return "Cannot resolve project for this agent."
+        row = await attestation_service.get(project_id, att_id)
+        if not row:
+            return f"Attestation not found: {att_id}"
+        shot = screenshot_path_from_artifact_hashes(row.get("artifact_hashes"))
+        if not shot:
+            return (
+                f"Attestation {att_id} has no screenshot_path in "
+                "artifact_hashes. Re-run browse screenshot / assert_visual "
+                "so the path is stored."
+            )
+        project_root = await meta_db.get_project_workspace(project_id)
+        resolved = resolve_screenshot_under_project(project_root, shot)
+        if resolved is None:
+            return (
+                "Screenshot path from attestation is outside the project "
+                f"(no .. escape): {shot!r}."
+            )
+        return resolved
+
+    raw_path = (params.image_path or "").strip()
+    if not raw_path:
+        return (
+            "look_at_image requires image_path, or attestation_id "
+            "to load another agent's screenshot."
+        )
+    resolved = resolve_screenshot_path(workspace, raw_path)
+    if resolved is None:
+        return (
+            f"Invalid or out-of-workspace image_path: {raw_path!r}. "
+            "Path must be under the agent workspace (no .. escape). "
+            "To inspect another agent's screenshot, pass attestation_id."
+        )
+    return resolved
 
 
 async def _try_vision_backup(

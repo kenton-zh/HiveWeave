@@ -78,8 +78,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "`commit_turn(phase=waiting)` using that list; do not poll. "
             "Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout "
             "until done, `job_kill`, or project stop. Do not use "
-            "`background=true` for `vite` / `npm run dev`. Default false "
-            "keeps stdout in this turn."
+            "`background=true` for `vite` / `npm run dev` / `uvicorn`. "
+            "Long-running servers are auto-registered (tracked, killable); "
+            "prefer `start_dev_server`. Do not append `&` on a foreground "
+            "command. Default false keeps stdout in this turn."
         ),
         "properties": {
             "command": {
@@ -177,13 +179,28 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "look_at_image": {
         "description": (
             "Ask the configured vision model about a workspace image. "
-            "One-shot text answer; does not inject pixels into chat."
+            "One-shot text answer; does not inject pixels into chat. "
+            "To inspect another agent's screenshot, pass attestation_id "
+            "from their browse_e2e / visual_check row instead of a path "
+            "under your own worktree."
         ),
         "properties": {
             "image_path": {
                 "type": "string",
                 "aliases": ["path", "file", "screenshot", "image"],
-                "description": "Image path relative to workspace or absolute under it.",
+                "description": (
+                    "Image path relative to workspace or absolute under it. "
+                    "Optional if attestation_id is set."
+                ),
+            },
+            "attestation_id": {
+                "type": "string",
+                "aliases": ["attestationId", "att_id"],
+                "description": (
+                    "tool_attestations id whose artifact_hashes.screenshot_path "
+                    "points at the PNG (cross-worktree). Prefer this over "
+                    "copying another agent's absolute path."
+                ),
             },
             "prompt": {
                 "type": "string",
@@ -193,7 +210,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 ),
             },
         },
-        "required": ["image_path", "prompt"],
+        "required": ["prompt"],
     },
     "generate_image": {
         "description": (

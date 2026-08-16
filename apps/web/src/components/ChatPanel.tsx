@@ -5,7 +5,7 @@ import ApprovalDialog from "./ApprovalDialog";
 import TodoBar from "./TodoBar";
 import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
 import { roleLabels, statusLabels, toolCategories } from "../chat/constants";
-import { formatToolInputHint, getDirectedAgentId } from "../chat/messageUtils";
+import { formatToolInputHint, getDirectedAgentId, nextBadgePopToken } from "../chat/messageUtils";
 import { MessageBubble, ChatMotionStyles } from "../chat/MessageBubble";
 import { useStreamDraft } from "../chat/useStreamDraft";
 import { useChatMessages } from "../chat/useChatMessages";
@@ -54,6 +54,21 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     setThinkingElapsed,
     activeAgentIdRef,
   });
+
+  const lastTeamCountRef = useRef<number | null>(null);
+  const lastBadgeAgentRef = useRef<string | null>(null);
+  const [badgePopToken, setBadgePopToken] = useState(0);
+  useEffect(() => {
+    let token = badgePopToken;
+    if (lastBadgeAgentRef.current !== agentId) {
+      lastBadgeAgentRef.current = agentId;
+      lastTeamCountRef.current = null;
+      token = 0;
+    }
+    const next = nextBadgePopToken(lastTeamCountRef.current, teamMessages.length, token);
+    lastTeamCountRef.current = next.lastSeen;
+    if (next.token !== badgePopToken) setBadgePopToken(next.token);
+  }, [agentId, teamMessages.length, badgePopToken]);
 
   const sendApi = useChatSend({
     agentId,
@@ -400,8 +415,8 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
               </svg>
               <span className="text-xs font-semibold text-g-fg-2 uppercase tracking-wide">团队沟通</span>
               <span
-                className="bg-g-blue text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none shadow-gm-sm hw-badge-pop"
-                key={teamMessages.length}
+                className={`bg-g-blue text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none shadow-gm-sm${badgePopToken > 0 ? " hw-badge-pop" : ""}`}
+                key={badgePopToken}
               >
                 {teamMessages.length}
               </span>
