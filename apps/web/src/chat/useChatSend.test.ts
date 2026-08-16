@@ -136,3 +136,63 @@ describe("useChatSend — per-agent send queue", () => {
     expect(vi.mocked(streamChat).mock.calls[1][1]).toBe("second");
   });
 });
+
+describe("useChatSend — round_start", () => {
+  beforeEach(() => {
+    vi.mocked(streamChat).mockClear();
+  });
+
+  it("drops prior narration and keeps tool chips", () => {
+    let onEvent: (event: ChatEvent) => void = () => {};
+    vi.mocked(streamChat).mockImplementation((_id, _msg, _imgs, cb) => {
+      onEvent = cb;
+      return { abort: vi.fn() };
+    });
+
+    let draft: StreamDraft | null = null;
+    function useRoundHarness() {
+      const activeAgentIdRef = useRef<string | null>("A");
+      const streamDraftRef = useRef<StreamDraft | null>(null);
+      const stickToBottomRef = useRef(true);
+      const updateStreamDraft = (
+        updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)
+      ) => {
+        draft = typeof updater === "function" ? updater(draft) : updater;
+        streamDraftRef.current = draft;
+      };
+      return useChatSend({
+        agentId: "A",
+        activeAgentIdRef,
+        streamDraftRef,
+        updateStreamDraft,
+        isStreaming: false,
+        setIsStreaming: () => {},
+        isAgentProcessing: false,
+        loadMessagesFromDb: vi.fn(async () => true),
+        setMessages: () => {},
+        refreshOrgTree: () => {},
+        thinkingElapsed: null,
+        setThinkingElapsed: () => {},
+        stickToBottomRef,
+      });
+    }
+
+    const { result } = renderHook(() => useRoundHarness());
+    act(() => result.current.setInput("go"));
+    act(() => result.current.handleSend());
+    expect(streamChat).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      draft = {
+        assistantId: "m1",
+        segments: [
+          { type: "thinking", content: "plan" },
+          { type: "text", content: "用户选了方案2" },
+          { type: "tool_call", tool: { tool: "get_tasks", input: {} } },
+        ],
+      };
+    });
+    act(() => onEvent({ type: "round_start", data: "1" }));
+    expect(draft?.segments).toEqual([{ type: "tool_call", tool: { tool: "get_tasks", input: {} } }]);
+  });
+});

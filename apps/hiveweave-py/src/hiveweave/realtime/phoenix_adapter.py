@@ -82,6 +82,7 @@ _EVENT_NAME_MAP: dict[str, str] = {
     "thinking_delta": "stream_chunk",
     "tool_call_start": "stream_tool",
     "tool_call_end": "stream_tool",
+    "round_start": "round_start",
     "agent_created": "org_changed",
     "agent_dismissed": "org_changed",
     "system_paused": "system_paused",
@@ -148,7 +149,7 @@ def _map_event(event: dict) -> tuple[str, dict]:
     if raw_type == "activity":
         return event_name, event
 
-    # done / error / org_changed / system_paused / resumed 等 — 直接透传
+    # done / error / org_changed / system_paused / resumed / round_start 等 — 直接透传
     return event_name, event
 
 

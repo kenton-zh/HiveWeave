@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback, useMemo, type MutableRefObjec
 import { getAgent, getChatMessages, markMessagesRead, subscribeAgentStream } from "../api";
 import { useAppStore } from "../store";
 import type { AgentInfo, ChatMessage, MsgSegment, StreamDraft } from "./types";
-import { isInjectedContext, isTeamChannelMessage, mapDbToChatMessages } from "./messageUtils";
+import { beginStreamRound, isInjectedContext, isTeamChannelMessage, mapDbToChatMessages } from "./messageUtils";
 
 type UpdateStreamDraft = (
   updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)
@@ -147,6 +147,10 @@ export function useChatMessages(opts: {
       setIsStreaming(true);
       subscribeAgentStream(agentId, (event) => {
         if (activeAgentIdRef.current !== agentId) return;
+        if (event.type === "round_start") {
+          updateStreamDraft((prev) => (prev ? beginStreamRound(prev) : prev));
+          return;
+        }
         if (event.type === "text_delta" || event.type === "thinking_delta") {
           setThinkingElapsed(null);
           const segType = event.type === "thinking_delta" ? "thinking" : "text";

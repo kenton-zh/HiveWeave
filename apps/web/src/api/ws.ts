@@ -123,7 +123,7 @@ export function getSocket(): Socket {
 }
 
 export interface ChatEvent {
-  type: "text" | "text_delta" | "thinking_delta" | "tool_use" | "tool_result" | "message_id" | "error" | "done" | "busy" | "approval_request" | "retry" | "queued_message" | "thinking";
+  type: "text" | "text_delta" | "thinking_delta" | "tool_use" | "tool_result" | "message_id" | "error" | "done" | "busy" | "approval_request" | "retry" | "queued_message" | "thinking" | "round_start";
   data: string;
   deltaId?: string;
   elapsed_s?: number;
@@ -256,6 +256,17 @@ function bindAgentChannelEvents(channel: any, agentId: string) {
     if (!handler) return;
     const elapsed = typeof payload === "object" ? payload.elapsed_s : undefined;
     handler({ type: "thinking", data: "", elapsed_s: elapsed });
+  });
+
+  // Tool-loop new LLM round: backend resets _streaming_text_acc. Seq is per
+  // HTTP stream so round 2 would otherwise be dropped as stale (seq <= last).
+  channel.on("round_start", (payload: any) => {
+    const handler = _agentHandlers.get(agentId);
+    if (!handler) return;
+    const lastSeq = (globalThis as any).__hw_lastSeq ?? {};
+    lastSeq[agentId] = 0;
+    (globalThis as any).__hw_lastSeq = lastSeq;
+    handler({ type: "round_start", data: String(payload?.round ?? "") });
   });
 
   channel.on("done", () => {

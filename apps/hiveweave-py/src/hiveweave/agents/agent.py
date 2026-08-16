@@ -2905,8 +2905,8 @@ class Agent:
            placeholder 一直空），不会误判为 [对话被中断]
         2. 后端崩溃/重启时，部分输出已持久化
 
-        FIX(text-acc): 收到 round_start 事件时重置累积器，
-        避免工具循环中间轮的文本在前端实时显示中重复堆叠。
+        FIX(text-acc): 收到 round_start 时重置累积器并清空 streaming 占位正文。
+        前端 stream draft 必须同步丢掉上一轮 text/thinking 段。
         """
         return await _agent_streaming.on_delta(self, event)
 

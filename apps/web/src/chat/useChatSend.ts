@@ -11,6 +11,7 @@ import { streamChat, joinAgentChannel } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
 import { useAppStore } from "../store";
 import type { ChatMessage, StreamDraft, ToolCall } from "./types";
+import { beginStreamRound } from "./messageUtils";
 
 type UpdateStreamDraft = (
   updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)
@@ -247,6 +248,10 @@ export function useChatSend(opts: {
       sendingImages,
       (event) => {
         if (!isActiveSession()) return;
+        if (event.type === "round_start") {
+          updateStreamDraft((prev) => (prev ? beginStreamRound(prev) : prev));
+          return;
+        }
         if (event.type === "message_id") {
           try {
             const parsed = JSON.parse(event.data);

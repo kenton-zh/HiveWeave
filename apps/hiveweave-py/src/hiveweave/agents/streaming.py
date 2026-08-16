@@ -136,8 +136,9 @@ async def on_delta(agent: Any, event: dict) -> None:
        placeholder 一直空），不会误判为 [对话被中断]
     2. 后端崩溃/重启时，部分输出已持久化
 
-    FIX(text-acc): 收到 round_start 事件时重置累积器，
-    避免工具循环中间轮的文本在前端实时显示中重复堆叠。
+    FIX(text-acc): 收到 round_start 时重置 DB 文本累积器。前端 stream
+    draft 必须同步丢掉上一轮 text/thinking 段（保留 tool_call），否则
+    工具循环会把每轮复述叠在同一气泡里。
     """
     # P0-3: 任何 streamer 事件都算流式活动（僵尸判定信号）。
     # 本地 thinking 心跳不经此回调（agent._heartbeat 直接广播），
@@ -154,6 +155,14 @@ async def on_delta(agent: Any, event: dict) -> None:
     # 工具循环新一轮 → 重置文本累积器 + BUG-7 按轮次累加 LLM 调用
     if event.get("type") == "round_start":
         agent._streaming_text_acc = ""
+        if agent._streaming_msg_id:
+            try:
+                await agent._chat_msg.update_message(
+                    agent.id, agent._streaming_msg_id,
+                    {"content": ""},
+                )
+            except Exception:
+                pass
         _run_id = getattr(agent, "_current_run_id", None)
         if _run_id:
             try:
