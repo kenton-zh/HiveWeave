@@ -92,14 +92,75 @@ export function draftFromStreamingMessage(
     }
   }
   if (msg.content) segments.push({ type: "text", content: msg.content });
-  return { assistantId: msg.id, segments };
+  return {
+    assistantId: msg.id,
+    segments,
+    isBackground: msg.isBackground === true,
+  };
+}
+
+/** Passive/trigger stream defaults to background; honor payload when present. */
+function coerceBoolFlag(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (value === 0 || value === 1) return value === 1;
+  return undefined;
+}
+
+export function streamEventBackgroundFlag(payload: unknown): boolean | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const rec = payload as Record<string, unknown>;
+  const fromSnake = coerceBoolFlag(rec.is_background);
+  if (fromSnake !== undefined) return fromSnake;
+  return coerceBoolFlag(rec.isBackground);
+}
+
+export function streamEventIsBackground(payload: unknown, fallback = true): boolean {
+  const flag = streamEventBackgroundFlag(payload);
+  return flag === undefined ? fallback : flag;
 }
 
 export function isTeamChannelMessage(msg: ChatMessage): boolean {
   return (
     msg.role === "team" ||
     (msg.isBackground === true && msg.role === "user")
-  ) as boolean;
+  );
+}
+
+export function mergeStreamDraftIntoMessages(
+  messages: ChatMessage[],
+  streamDraft: StreamDraft | null,
+  opts: { isStreaming: boolean },
+): ChatMessage[] {
+  if (!streamDraft) {
+    return messages.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m));
+  }
+  const hasPersistedDraft = !!streamDraft.persisted;
+  if (!opts.isStreaming && !hasPersistedDraft) {
+    return messages.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m));
+  }
+  return messages.map((m) => {
+    const isTarget = m.id === streamDraft.assistantId;
+    if (!isTarget && hasPersistedDraft) return m;
+    if (!isTarget) {
+      return m.isStreaming ? { ...m, isStreaming: false } : m;
+    }
+    const textParts = streamDraft.segments.filter((s) => s.type === "text").map((s) => s.content || "");
+    const thinkingParts = streamDraft.segments
+      .filter((s) => s.type === "thinking")
+      .map((s) => s.content || "");
+    const newTools = streamDraft.segments.filter((s) => s.type === "tool_call").map((s) => s.tool!);
+    return {
+      ...m,
+      content: textParts.join(""),
+      toolCalls: newTools.length > 0 ? newTools : m.toolCalls || [],
+      _segments: streamDraft.segments,
+      _thinking: thinkingParts.join(""),
+      isStreaming: hasPersistedDraft ? false : true,
+      isBackground: typeof streamDraft.isBackground === "boolean"
+        ? streamDraft.isBackground
+        : m.isBackground,
+    };
+  });
 }
 
 export function tryParseToolCalls(raw: string): ToolCall[] {
@@ -161,10 +222,10 @@ export function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
     images: typeof m.images === "string" ? tryParseImages(m.images) : m.images,
     timestamp: m.createdAt ?? m.created_at ?? Date.now(),
     toolCalls: m.toolCalls ? tryParseToolCalls(m.toolCalls) : undefined,
-    isBackground: !!m.isBackground,
-    isRead: !!m.isRead,
-    isStreaming: !!m.isStreaming,
-    isContext: !!m.isContext,
+    isBackground: !!(m.isBackground ?? m.is_background),
+    isRead: !!(m.isRead ?? m.is_read),
+    isStreaming: !!(m.isStreaming ?? m.is_streaming),
+    isContext: !!(m.isContext ?? m.is_context),
     teamFromAgentId: m.teamFromAgentId ?? m.team_from_agent_id ?? undefined,
     teamToAgentId: m.teamToAgentId ?? m.team_to_agent_id ?? undefined,
   }));
@@ -182,6 +243,47 @@ export function getDirectedAgentId(msg: ChatMessage, agentParentId?: string | nu
 
 export function isInjectedContext(msg: ChatMessage): boolean {
   return msg.isContext === true;
+}
+
+/** Strip live-stream flags before writing the per-agent chat cache. */
+export function sanitizeMessagesForCache(messages: ChatMessage[]): ChatMessage[] {
+  return messages
+    .map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m))
+    .filter(
+      (m) =>
+        !(
+          m.role === "assistant" &&
+          !m.isStreaming &&
+          !m.content &&
+          (!m.toolCalls || m.toolCalls.length === 0)
+        ),
+    );
+}
+
+/**
+ * ChatPanel is not remounted on agent switch, so `messages` can still belong
+ * to the previous person while `agentId` has already changed. Never write that
+ * snapshot into the new agent's cache, and never persist a loading-empty list
+ * over a populated session (refresh would be the only way to see 团队沟通 again).
+ */
+export function shouldWriteChatCache(opts: {
+  agentId: string;
+  messagesOwnerId: string | null;
+  persistReady: boolean;
+  next: ChatMessage[];
+  existing: ChatMessage[] | undefined;
+}): boolean {
+  if (!opts.persistReady) return false;
+  if (opts.messagesOwnerId !== opts.agentId) return false;
+  if (opts.next.length === 0 && opts.existing && opts.existing.length > 0) return false;
+  if (
+    opts.existing &&
+    opts.existing.length === opts.next.length &&
+    opts.existing.every((c, i) => c === opts.next[i])
+  ) {
+    return false;
+  }
+  return true;
 }
 
 

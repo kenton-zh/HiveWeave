@@ -113,7 +113,17 @@ function DailyBarChart({ entries }: { entries: TokenDailyEntry[] }) {
   );
 }
 
-// ── Main panel ──────────────────────────────────────────────
+function fetchTokenData(projectId: string) {
+  return Promise.all([
+    getProjectTokenUsage(projectId),
+    getProjectTokenDaily(projectId, 30),
+    getOrgTree(projectId).catch(() => null),
+  ]).then(([u, d, tree]) => ({
+    entries: u.entries ?? [],
+    daily: d.entries ?? [],
+    meta: flattenAgentMeta(tree),
+  }));
+}
 
 export default function TokenUsagePanel({ projectId }: { projectId: string }) {
   const [entries, setEntries] = useState<TokenUsageEntry[]>([]);
@@ -123,30 +133,24 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let alive = true;
+    const ac = new AbortController();
     setLoading(true);
     setError(null);
-    Promise.all([
-      getProjectTokenUsage(projectId),
-      getProjectTokenDaily(projectId, 30),
-      getOrgTree(projectId).catch(() => null),
-    ])
-      .then(([u, d, tree]) => {
-        if (!alive) return;
-        setEntries(u.entries ?? []);
-        setDaily(d.entries ?? []);
-        setAgentMeta(flattenAgentMeta(tree));
+    fetchTokenData(projectId)
+      .then((data) => {
+        if (ac.signal.aborted) return;
+        setEntries(data.entries);
+        setDaily(data.daily);
+        setAgentMeta(data.meta);
       })
       .catch((e) => {
-        if (!alive) return;
+        if (ac.signal.aborted || e?.name === "AbortError") return;
         setError(e?.message ?? "加载失败");
       })
       .finally(() => {
-        if (alive) setLoading(false);
+        if (!ac.signal.aborted) setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
+    return () => ac.abort();
   }, [projectId]);
 
   const totals = useMemo(() => {
@@ -198,15 +202,12 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
         <button
           onClick={() => {
             setLoading(true);
-            Promise.all([
-              getProjectTokenUsage(projectId),
-              getProjectTokenDaily(projectId, 30),
-              getOrgTree(projectId).catch(() => null),
-            ])
-              .then(([u, d, tree]) => {
-                setEntries(u.entries ?? []);
-                setDaily(d.entries ?? []);
-                setAgentMeta(flattenAgentMeta(tree));
+            setError(null);
+            fetchTokenData(projectId)
+              .then((data) => {
+                setEntries(data.entries);
+                setDaily(data.daily);
+                setAgentMeta(data.meta);
               })
               .catch((e) => setError(e?.message ?? "刷新失败"))
               .finally(() => setLoading(false));

@@ -4,8 +4,8 @@ import { useAppStore } from "../store";
 import ApprovalDialog from "./ApprovalDialog";
 import TodoBar from "./TodoBar";
 import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
-import { roleLabels, statusLabels, toolCategories } from "../chat/constants";
-import { formatToolInputHint, getDirectedAgentId, nextBadgePopToken } from "../chat/messageUtils";
+import { roleLabels, statusLabels } from "../chat/constants";
+import { getDirectedAgentId, nextBadgePopToken } from "../chat/messageUtils";
 import { MessageBubble, ChatMotionStyles } from "../chat/MessageBubble";
 import { useStreamDraft } from "../chat/useStreamDraft";
 import { useChatMessages } from "../chat/useChatMessages";
@@ -439,7 +439,6 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                   const isTeamMsg = msg.role === "team";
                   const isUserMsg = msg.role === "user" && !msg.isBackground;
                   const isBgIncoming = msg.isBackground && msg.role === "user";
-                  const isBgOutgoing = msg.isBackground && msg.role === "assistant";
 
                   let isIncoming: boolean;
                   let counterpartId: string | null;
@@ -460,9 +459,6 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                   } else if (isBgIncoming) {
                     isIncoming = true;
                     counterpartId = msg.teamFromAgentId ?? null;
-                  } else if (isBgOutgoing) {
-                    isIncoming = false;
-                    counterpartId = msg.teamToAgentId ?? null;
                   } else {
                     isIncoming = true;
                     counterpartId = null;
@@ -489,9 +485,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                   const positionLabel = getPositionLabel(info.position, info.role);
                   const dotColor = roleDots[info.role || ""] || "bg-gray-400";
                   const directionTag = isIncoming ? "收到" : "发送";
-                  const preview =
-                    msg.content ||
-                    (msg.toolCalls?.length ? msg.toolCalls.map((tc) => tc.tool).join(", ") : "(empty)");
+                  const preview = (msg.content || "").trim() || "（无正文）";
                   const isExpanded = expandedMessageId === msg.id;
                   return (
                     <button
@@ -532,34 +526,6 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                       >
                         {preview}
                       </p>
-                      {isExpanded && msg.toolCalls && msg.toolCalls.length > 0 && (
-                        <div className="mt-2 space-y-1">
-                          {msg.toolCalls
-                            .filter((tc) => tc.tool)
-                            .map((tc, i) => {
-                              const cat = toolCategories[tc.tool] || {
-                                color: "text-g-fg",
-                                bg: "bg-gray-500/15",
-                                label: tc.tool,
-                              };
-                              const hint = formatToolInputHint(tc.tool, tc.input);
-                              return (
-                                <div
-                                  key={i}
-                                  className={
-                                    "text-xs px-2 py-1 rounded flex items-center gap-1.5 " +
-                                    cat.bg +
-                                    " " +
-                                    cat.color
-                                  }
-                                >
-                                  <span>{cat.label}</span>
-                                  {hint && <span className="text-g-fg-4 truncate">— {hint}</span>}
-                                </div>
-                              );
-                            })}
-                        </div>
-                      )}
                     </button>
                   );
                 })}

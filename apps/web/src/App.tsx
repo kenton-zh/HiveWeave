@@ -1,28 +1,31 @@
-import { useState, useRef, useEffect, lazy, Suspense } from "react";
+import { useState, useRef, useEffect, Suspense } from "react";
 import OrgTree from "./components/OrgTree";
 import ChatPanel from "./components/ChatPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import ToastContainer from "./components/Toast";
+import TokenUsagePanel from "./components/TokenUsagePanel";
+import { lazyRetry, resolveLeftPanel } from "./mainPanel";
 
 // Lazy-loaded: only fetched when the user navigates to them.
 // OfficeView alone pulls in pixi.js (~1MB); dialogs are interaction-only.
-const WorkLogPanel = lazy(() => import("./components/WorkLogPanel"));
-const AgentDetailPanel = lazy(() => import("./components/AgentDetailPanel"));
-const MonitorPanel = lazy(() => import("./components/MonitorPanel"));
-const DebugPanel = lazy(() => import("./components/DebugPanel"));
-const AddAgentDialog = lazy(() => import("./components/AddAgentDialog"));
-const FolderPicker = lazy(() => import("./components/FolderPicker"));
-const OfficeView = lazy(() => import("./components/OfficeView"));
-const ModelSettings = lazy(() => import("./components/ModelSettings"));
-const ModelConfigPage = lazy(() => import("./components/ModelConfigPage"));
-const ApiKeyDialog = lazy(() => import("./components/ApiKeyDialog"));
-const GoalsPanel = lazy(() => import("./components/GoalsPanel"));
-const QuestionDialog = lazy(() => import("./components/QuestionDialog"));
-const NewProjectDialog = lazy(() => import("./components/NewProjectDialog"));
-const ConfirmDialog = lazy(() => import("./components/ConfirmDialog"));
-const TimelineView = lazy(() => import("./components/timeline/TimelineView"));
-const TaskTimelinePanel = lazy(() => import("./components/timeline/TaskTimelinePanel"));
-const TokenUsagePanel = lazy(() => import("./components/TokenUsagePanel"));
+// TokenUsagePanel is small — static import. A rejected React.lazy() promise
+// stays rejected for the session, which is the stuck English "Loading..." on Token.
+const WorkLogPanel = lazyRetry(() => import("./components/WorkLogPanel"));
+const AgentDetailPanel = lazyRetry(() => import("./components/AgentDetailPanel"));
+const MonitorPanel = lazyRetry(() => import("./components/MonitorPanel"));
+const DebugPanel = lazyRetry(() => import("./components/DebugPanel"));
+const AddAgentDialog = lazyRetry(() => import("./components/AddAgentDialog"));
+const FolderPicker = lazyRetry(() => import("./components/FolderPicker"));
+const OfficeView = lazyRetry(() => import("./components/OfficeView"));
+const ModelSettings = lazyRetry(() => import("./components/ModelSettings"));
+const ModelConfigPage = lazyRetry(() => import("./components/ModelConfigPage"));
+const ApiKeyDialog = lazyRetry(() => import("./components/ApiKeyDialog"));
+const GoalsPanel = lazyRetry(() => import("./components/GoalsPanel"));
+const QuestionDialog = lazyRetry(() => import("./components/QuestionDialog"));
+const NewProjectDialog = lazyRetry(() => import("./components/NewProjectDialog"));
+const ConfirmDialog = lazyRetry(() => import("./components/ConfirmDialog"));
+const TimelineView = lazyRetry(() => import("./components/timeline/TimelineView"));
+const TaskTimelinePanel = lazyRetry(() => import("./components/timeline/TaskTimelinePanel"));
 import { useAppStore } from "./store";
 import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend } from "./api";
 import type { DeleteProjectResponse, Project } from "./api";
@@ -385,6 +388,8 @@ function App() {
     setEditingName(false);
   };
 
+  const leftPanel = resolveLeftPanel(activeView, selectedProjectId);
+
   return (
     <div className="h-screen flex flex-col bg-g-bg-soft">
       {/* Top Bar */}
@@ -633,14 +638,18 @@ function App() {
           </div>
           <div className="flex-1 overflow-hidden bg-app-tint">
             <div key={activeView} className="hw-tab-in h-full">
-              {activeView === "tree" ? <OrgTree /> : activeView === "timeline" ? (
+              {leftPanel === "tree" ? (
+                <OrgTree />
+              ) : leftPanel === "timeline" ? (
                 <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
                   <TimelineView />
                 </Suspense>
-              ) : activeView === "token" && selectedProjectId ? (
-                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                  <TokenUsagePanel key={selectedProjectId} projectId={selectedProjectId} />
-                </Suspense>
+              ) : leftPanel === "token" && selectedProjectId ? (
+                <TokenUsagePanel key={selectedProjectId} projectId={selectedProjectId} />
+              ) : leftPanel === "token-empty" ? (
+                <div className="h-full flex items-center justify-center text-g-fg-3 text-sm">
+                  请先选择一个项目
+                </div>
               ) : (
                 <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
                   <OfficeView />

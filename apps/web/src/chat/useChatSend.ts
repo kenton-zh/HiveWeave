@@ -288,7 +288,7 @@ export function useChatSend(opts: {
                   },
                 ];
               });
-              updateStreamDraft({ assistantId: parsed.id, segments: [] });
+              updateStreamDraft({ assistantId: parsed.id, segments: [], isBackground: false });
               console.log(`[SSE] streamDraft initialized: assistantId=${parsed.id}`);
             }
           } catch {
@@ -315,7 +315,7 @@ export function useChatSend(opts: {
               },
             ];
           });
-          updateStreamDraft({ assistantId: placeholderId, segments: [] });
+          updateStreamDraft({ assistantId: placeholderId, segments: [], isBackground: false });
           console.log(`[SSE] streamDraft lazy-initialized: assistantId=${placeholderId}`);
         } else if (event.type === "thinking") {
           setThinkingElapsed(event.elapsed_s ?? null);
@@ -348,6 +348,7 @@ export function useChatSend(opts: {
             updateStreamDraft({
               assistantId: placeholderId,
               segments: [{ type: "text", content: event.data }],
+              isBackground: false,
             });
             console.log(`[SSE] streamDraft lazy-initialized: assistantId=${placeholderId}`);
             return;
@@ -389,6 +390,7 @@ export function useChatSend(opts: {
             updateStreamDraft({
               assistantId: placeholderId,
               segments: [{ type: "thinking", content: event.data }],
+              isBackground: false,
             });
             return;
           }
