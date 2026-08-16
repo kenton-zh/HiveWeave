@@ -39,7 +39,11 @@ RECENT_ACTIVITY_BUFFER = 100
 AGENT_REPLAY_BUFFER = 50
 """单 agent 事件重放缓冲区大小。参考 DeepTutor StreamBus replay 模式：
 新订阅者加入 agent 频道时，立即重放缓冲的最近事件，避免因 WebSocket
-join 延迟而丢失 stream_chunk / tool_call 等关键事件。"""
+join 延迟而丢失 tool_call / round_start / done 等关键事件。
+
+不缓冲 text_delta / thinking_delta / thinking：一轮流式即可写满 50 条，
+会把 round_start 挤出队列，切回 agent 时前端在已有 tool 段后追加新正文
+→ 同一气泡叠三遍复述。正文以 live 流 + DB 累积器为准。"""
 
 MAX_SUBSCRIBERS = 100
 """最大订阅者总数（跨所有频道）。R3 fix: 防止恶意客户端创建大量订阅耗尽内存。"""
@@ -48,7 +52,12 @@ MAX_SUBSCRIBERS = 100
 # 契约 12: text_delta / thinking_delta 不转发到 lobby（避免重复渲染）。
 # start 同理 — 流式生命周期事件，仅 agent 频道关心。
 _DELTA_ONLY_TYPES: frozenset[str] = frozenset(
-    {"text_delta", "thinking_delta", "start", "thinking"}
+    {"text_delta", "thinking_delta", "start", "thinking", "round_start"}
+)
+
+# Token/heartbeat spam must not occupy the 50-slot replay ring (evicts round_start).
+_REPLAY_SKIP_TYPES: frozenset[str] = frozenset(
+    {"text_delta", "thinking_delta", "thinking"}
 )
 
 
@@ -310,15 +319,20 @@ class StatusEventBus:
             # agent + lobby 频道（通过 agent_id 参数，set 去重）
             await self.publish("lobby", event, agent_id=agent_id)
 
-        # 缓冲活动事件
-        self.emit_activity(event)
+        # 活动环与 agent replay 同跳过 token 洪水，避免 100 槽被 text_delta 挤光。
+        if event_type not in _REPLAY_SKIP_TYPES:
+            self.emit_activity(event)
 
-        # Per-agent replay buffer（参考 DeepTutor StreamBus.subscribe() replay）
-        buf = self._agent_buffers.get(agent_id)
-        if buf is None:
-            buf = deque(maxlen=AGENT_REPLAY_BUFFER)
-            self._agent_buffers[agent_id] = buf
-        buf.append(event)
+        # 新一轮 stream start 丢掉上一 turn 的 done/tools，切回时才不会
+        # 把过期 done 重放到还在飞的 draft 上（跳过 delta 后 done 不再被挤出）。
+        if event_type == "start":
+            self._agent_buffers.pop(agent_id, None)
+        if event_type not in _REPLAY_SKIP_TYPES:
+            buf = self._agent_buffers.get(agent_id)
+            if buf is None:
+                buf = deque(maxlen=AGENT_REPLAY_BUFFER)
+                self._agent_buffers[agent_id] = buf
+            buf.append(event)
 
     def get_agent_replay(self, agent_id: str) -> list[dict]:
         """获取 agent 的缓冲事件用于重放，并清空缓冲区。

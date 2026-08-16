@@ -1,4 +1,12 @@
-import type { ChatMessage, ToolCall } from "./types";
+import type { ChatMessage, StreamDraft, ToolCall } from "./types";
+
+/** Drop prior-round narration; keep tool chips. Matches backend round_start text-acc reset. */
+export function beginStreamRound(draft: StreamDraft): StreamDraft {
+  return {
+    ...draft,
+    segments: draft.segments.filter((s) => s.type === "tool_call"),
+  };
+}
 
 export function isTeamChannelMessage(msg: ChatMessage): boolean {
   return (

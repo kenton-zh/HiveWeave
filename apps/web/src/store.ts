@@ -440,8 +440,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Deduplicate non-delta events: SSE reconnects replay recent events from the
     // server's recentActivity buffer. Skip an incoming event if an entry with the
     // same (agentId, timestamp, type, toolName) already exists in the feed.
-    // Delta events (text_delta/thinking_delta) are never replayed (server only
-    // buffers non-delta events), so they don't need this check.
+    // Delta events (text_delta/thinking_delta) are never replayed (server skips
+    // them in agent replay and recent_activity), so they don't need this check.
     if (entry.type !== "text_delta" && entry.type !== "thinking_delta") {
       const dedupKey = `${entry.agentId}|${entry.timestamp}|${entry.type}|${entry.toolName || ""}`;
       for (let i = feed.length - 1; i >= 0; i--) {
