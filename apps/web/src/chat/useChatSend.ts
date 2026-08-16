@@ -10,8 +10,8 @@ import {
 import { streamChat, joinAgentChannel } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
 import { useAppStore } from "../store";
-import type { ChatMessage, StreamDraft, ToolCall } from "./types";
-import { beginStreamRound } from "./messageUtils";
+import type { ChatMessage, StreamDraft } from "./types";
+import { appendToolCallSegment, beginStreamRound, parseToolUsePayload } from "./messageUtils";
 
 type UpdateStreamDraft = (
   updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)
@@ -411,20 +411,12 @@ export function useChatSend(opts: {
           });
         } else if (event.type === "tool_use") {
           setThinkingElapsed(null);
-          try {
-            const toolData = JSON.parse(event.data);
-            const rawName: string = toolData.toolName || toolData.tool_name || toolData.tool || "";
-            const toolName = rawName.replace(/^hiveweave__/, "");
-            const argsRaw = toolData.arguments || toolData.input || {};
-            const args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : argsRaw;
-            const toolCall: ToolCall = { tool: toolName, input: args };
-            allToolsUsed.add(toolCall.tool);
-            updateStreamDraft((prev) =>
-              prev ? { ...prev, segments: [...prev.segments, { type: "tool_call", tool: toolCall }] } : prev
-            );
-          } catch {
-            /* ignore */
-          }
+          const parsed = parseToolUsePayload(event.data);
+          if (!parsed) return;
+          allToolsUsed.add(parsed.toolCall.tool);
+          updateStreamDraft((prev) =>
+            prev ? appendToolCallSegment(prev, parsed.toolCall, parsed.toolCallId) : prev
+          );
         } else if (event.type === "approval_request") {
           try {
             const data = JSON.parse(event.data);

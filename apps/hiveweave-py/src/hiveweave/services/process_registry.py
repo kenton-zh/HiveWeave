@@ -51,6 +51,26 @@ _VITE_BARE_RE = re.compile(
     r"\b(npx\s+)?vite\b|\bnpm\s+run\s+dev\b|\bpnpm\s+(?:run\s+)?dev\b",
     re.IGNORECASE,
 )
+# uvicorn / python -m uvicorn / uv run … uvicorn
+# 裸 uvicorn 仅段首（含 VAR=val），避免 --with uvicorn / pip show uvicorn。
+_UVICORN_FAMILY_RE = re.compile(
+    r"(?:"
+    r"(?:^|\s|;|&|\|)`?(?:"
+    r"(?:pythonw?|python3)\s+-m\s+uvicorn\b"
+    r"|uv\s+run\b(?:\s+\S+)*?\s+(?<!\s--with\s)(?<!\s--extra\s)(?<!\s--group\s)(?<!\s--package\s)uvicorn(?:\s+\S|$)"
+    r")"
+    r"|(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*`?uvicorn(?:\s+\S)"
+    r")",
+    re.IGNORECASE,
+)
+_UVICORN_HELP_RE = re.compile(
+    r"(?:^|\s)(?:--help|-h|--version)(?:\s|$)",
+    re.IGNORECASE,
+)
+_SPAWN_BLOCKING_VERB_RE = re.compile(
+    r"\b(?:build|test|lint|install|ci|audit|eject|deploy)\b",
+    re.IGNORECASE,
+)
 
 # Kill / stop verbs (Windows + POSIX + common helpers)
 _KILL_VERB_RE = re.compile(
@@ -335,6 +355,9 @@ def prepare_spawn_command(
         ),
     }
 
+    # 尾部 & 会让后续注入的 --port 落到后台作业之外；spawn 路径已脱离前台。
+    command = re.sub(r"\s*&+\s*$", "", (command or "").strip()).strip()
+
     # Explicit reserved port → hard reject
     for port in extract_ports_from_command(command):
         if is_reserved_port(port):
@@ -367,6 +390,25 @@ def prepare_spawn_command(
             rewritten = f"PORT={port} {command}"
         log.info(
             "spawn_proxy_rewrote_vite",
+            project_id=project_id,
+            port=port,
+            original=(command or "")[:80],
+        )
+        return rewritten, extra_env, None
+
+    # 裸 uvicorn 默认 8000，不在 reserved 内，但仍分配 3000+ 并注入 --port
+    # （与 vite 一样走 allocate_project_port；已有 --port/-p/PORT= 的上面已 return）。
+    if (
+        _UVICORN_FAMILY_RE.search(command or "")
+        and not _SPAWN_BLOCKING_VERB_RE.search(command or "")
+        and not _UVICORN_HELP_RE.search(command or "")
+    ):
+        pid = project_id or "default"
+        port = allocate_project_port(pid, preferred_port)
+        extra_env["PORT"] = str(port)
+        rewritten = f"{command.rstrip()} --port {port}"
+        log.info(
+            "spawn_proxy_rewrote_uvicorn",
             project_id=project_id,
             port=port,
             original=(command or "")[:80],

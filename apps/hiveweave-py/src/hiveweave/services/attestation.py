@@ -649,6 +649,37 @@ def hash_stdout(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8")).hexdigest()[:16]
 
 
+def screenshot_path_from_artifact_hashes(
+    raw: str | dict | list | None,
+) -> str | None:
+    """Extract ``screenshot_path`` from ``tool_attestations.artifact_hashes``.
+
+    The column is existing JSON (file-hash dicts, lists, or a string dump).
+    Screenshot abs paths are stored as a sibling ``screenshot_path`` key —
+    no extra column. Returns None when missing or unparseable.
+    """
+    data: Any = raw
+    if data is None or data == "":
+        return None
+    if isinstance(data, (bytes, bytearray)):
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(data, dict):
+        return None
+    path = data.get("screenshot_path") or data.get("screenshotPath")
+    if path is None:
+        return None
+    s = str(path).strip()
+    return s or None
+
+
 # ── Attestation waiver（coordinator 豁免通道）────────────────────
 #
 # 背景（井字棋实测 #2）：attestation 门禁为 UI/browse 任务设计，纯 CLI 任务
@@ -1028,8 +1059,14 @@ def required_attestation_kinds(policy_id: str) -> frozenset[str] | None:
 REVIEWER_KIND = "test_run"
 
 REVIEWER_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
-    # Code tasks: reviewer must have their own fresh test_run attestation
-    "ui_browser_e2e": frozenset({REVIEWER_KIND}),
+    # UI: reviewer (or consume agent) unlocks with ANY one of these —
+    # find_reviewer_attestation is OR. Submit-side POLICY_REQUIRED_KINDS
+    # stays AND (visual_check + browse_e2e).
+    "ui_browser_e2e": frozenset(
+        {REVIEWER_KIND, BROWSE_E2E_KIND, VISUAL_CHECK_KIND}
+    ),
+    # Code review: reviewer must personally hold a fresh test_run
+    # (P0-1 anti rubber-stamp). Not browse/visual.
     "generic_tests": frozenset({REVIEWER_KIND}),
     "coordinator_review": frozenset({REVIEWER_KIND}),
     # Docs: doc_review by reviewer is sufficient (or waiver)

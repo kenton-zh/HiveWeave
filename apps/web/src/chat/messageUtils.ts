@@ -1,4 +1,4 @@
-import type { ChatMessage, StreamDraft, ToolCall } from "./types";
+import type { ChatMessage, MsgSegment, StreamDraft, ToolCall } from "./types";
 
 /** Drop prior-round narration; keep tool chips. Matches backend round_start text-acc reset. */
 export function beginStreamRound(draft: StreamDraft): StreamDraft {
@@ -6,6 +6,93 @@ export function beginStreamRound(draft: StreamDraft): StreamDraft {
     ...draft,
     segments: draft.segments.filter((s) => s.type === "tool_call"),
   };
+}
+
+/**
+ * Append a tool chip. If `toolCallId` is present and a segment already has
+ * that id (replay / re-subscribe), no-op. Missing id always appends so
+ * legitimate repeat calls of the same tool name are kept.
+ */
+export function appendToolCallSegment(
+  draft: StreamDraft,
+  toolCall: ToolCall,
+  toolCallId?: string,
+): StreamDraft {
+  const id = toolCallId || undefined;
+  if (id) {
+    const exists = draft.segments.some(
+      (s) => s.type === "tool_call" && s.tool?.id === id,
+    );
+    if (exists) return draft;
+    return {
+      ...draft,
+      segments: [...draft.segments, { type: "tool_call", tool: { ...toolCall, id } }],
+    };
+  }
+  return {
+    ...draft,
+    segments: [...draft.segments, { type: "tool_call", tool: toolCall }],
+  };
+}
+
+/** Parse a stream_tool / tool_use event payload. Empty ids are treated as missing. */
+export function parseToolUsePayload(
+  raw: string,
+): { toolCall: ToolCall; toolCallId?: string } | null {
+  try {
+    const toolData = JSON.parse(raw);
+    const rawName: string = toolData.toolName || toolData.tool_name || toolData.tool || "";
+    const toolName = String(rawName).replace(/^hiveweave__/, "");
+    const argsRaw = toolData.arguments || toolData.input || {};
+    let args: Record<string, any> = {};
+    if (typeof argsRaw === "string") {
+      try {
+        args = JSON.parse(argsRaw);
+      } catch {
+        args = {};
+      }
+    } else if (argsRaw && typeof argsRaw === "object") {
+      args = argsRaw;
+    }
+    const idRaw = toolData.toolCallId || toolData.tool_call_id || "";
+    const toolCallId =
+      typeof idRaw === "string" && idRaw.trim() ? idRaw.trim() : undefined;
+    return { toolCall: { tool: toolName || "unknown", input: args }, toolCallId };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Increment-only badge pop token. First observation (lastSeen null), remount,
+ * and non-increases keep the token so CSS pop does not replay.
+ */
+export function nextBadgePopToken(
+  lastSeenCount: number | null,
+  currentCount: number,
+  prevToken: number,
+): { token: number; lastSeen: number } {
+  if (lastSeenCount === null || currentCount <= lastSeenCount) {
+    return { token: prevToken, lastSeen: currentCount };
+  }
+  return { token: prevToken + 1, lastSeen: currentCount };
+}
+
+export function draftFromStreamingMessage(
+  msg: ChatMessage,
+  opts?: { includeTools?: boolean },
+): StreamDraft {
+  const segments: MsgSegment[] = [];
+  if (msg._thinking) segments.push({ type: "thinking", content: msg._thinking });
+  // Live subscribe replays tool_use with ids. Hydrating DB chips (often
+  // without id) then replaying the same calls duplicates the row.
+  if (opts?.includeTools !== false) {
+    for (const t of msg.toolCalls ?? []) {
+      segments.push({ type: "tool_call", tool: t });
+    }
+  }
+  if (msg.content) segments.push({ type: "text", content: msg.content });
+  return { assistantId: msg.id, segments };
 }
 
 export function isTeamChannelMessage(msg: ChatMessage): boolean {
@@ -23,9 +110,10 @@ export function tryParseToolCalls(raw: string): ToolCall[] {
     // Backend stores: [{"function": {"name": "list_files", "arguments": "{\"path\": \".\"}"}, "id": "...", "type": "function"}]
     // Frontend expects: [{tool: "list_files", input: {path: "."}}]
     return parsed.map((tc: any): ToolCall => {
+      const id = typeof tc.id === "string" && tc.id.trim() ? tc.id.trim() : undefined;
       // Already in our format
       if (tc.tool && tc.input) {
-        return { tool: tc.tool, input: tc.input };
+        return id ? { tool: tc.tool, input: tc.input, id } : { tool: tc.tool, input: tc.input };
       }
       // OpenAI format: {function: {name, arguments}}
       if (tc.function) {
@@ -39,10 +127,14 @@ export function tryParseToolCalls(raw: string): ToolCall[] {
         } else if (typeof tc.function.arguments === "object" && tc.function.arguments) {
           input = tc.function.arguments;
         }
-        return { tool: tc.function.name || "unknown", input };
+        return id
+          ? { tool: tc.function.name || "unknown", input, id }
+          : { tool: tc.function.name || "unknown", input };
       }
       // Unknown format — best effort
-      return { tool: tc.name || tc.tool || "unknown", input: tc.input || tc.arguments || {} };
+      return id
+        ? { tool: tc.name || tc.tool || "unknown", input: tc.input || tc.arguments || {}, id }
+        : { tool: tc.name || tc.tool || "unknown", input: tc.input || tc.arguments || {} };
     });
   } catch {
     return [];

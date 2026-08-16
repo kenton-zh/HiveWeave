@@ -10,6 +10,8 @@ export interface AgentInfo {
 export interface ToolCall {
   tool: string;
   input: Record<string, any>;
+  /** Stream tool_call_id — used to dedup replayed chips. */
+  id?: string;
 }
 
 export interface ChatMessage {

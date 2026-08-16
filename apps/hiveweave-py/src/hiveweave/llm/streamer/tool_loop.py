@@ -360,7 +360,11 @@ class ToolLoopMixin:
                 usage_rounds.append(usage)
 
             combined_text = text_acc + new_text
-            combined_thinking = thinking_acc + new_thinking
+            combined_thinking = (
+                f"{thinking_acc}\n\n---\n\n{new_thinking}"
+                if thinking_acc and new_thinking
+                else thinking_acc + new_thinking
+            )
 
             log.info("round_result",
                      agent_id=agent_id, round=round_num,

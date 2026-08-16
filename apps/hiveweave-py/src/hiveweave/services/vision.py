@@ -39,6 +39,19 @@ def guess_media_type(path: Path) -> str:
     }.get(suffix, "image/png")
 
 
+def resolve_screenshot_under_project(
+    project_root: str | None, raw: str | None
+) -> Path | None:
+    """Resolve a screenshot under the project root (incl. agent worktrees).
+
+    Unlike :func:`resolve_screenshot_path` (agent-workspace sandbox), this
+    allows ``<project>/.hiveweave/worktrees/<sid>/...`` so a reviewer can
+    inspect an assignee screenshot stored on an attestation. ``..`` that
+    escapes the project root is rejected.
+    """
+    return resolve_screenshot_path(project_root, raw)
+
+
 def resolve_screenshot_path(workspace: str | None, raw: str | None) -> Path | None:
     """Resolve a screenshot path and sandbox it under ``workspace``.
 
