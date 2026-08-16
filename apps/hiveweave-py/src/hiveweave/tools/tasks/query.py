@@ -212,6 +212,18 @@ async def get_tasks_tool(
             _f2_holder = await _in_flight_verify_task(project_id)
         except Exception:
             _f2_holder = None
+        _VERIFY_UNLOCK = (
+            "unlocks when that VERIFY reaches closed/cancelled "
+            "(not when claimed); no estimated duration"
+        )
+        _resolve_holder_label = None
+        try:
+            from hiveweave.tools.tasks.verify_spawn import (
+                VERIFY_LOCK_UNLOCK_HINT as _VERIFY_UNLOCK,
+                resolve_verify_holder_assignee_label as _resolve_holder_label,
+            )
+        except Exception:
+            pass
         _f2_queued = sorted(
             (
                 t
@@ -264,13 +276,21 @@ async def get_tasks_tool(
             t["latest_audit_verdict"] = latest_audit_by_agent.get(
                 str(t.get("assignee_id") or "")
             )
+        _f2_holder_label = "?"
         if _f2_holder is not None:
             _h = _f2_holder
+            if _resolve_holder_label is not None:
+                try:
+                    _f2_holder_label = await _resolve_holder_label(_h)
+                except Exception:
+                    _f2_holder_label = str(_h.get("assignee_id") or "?")[:12]
+            else:
+                _f2_holder_label = str(_h.get("assignee_id") or "?")[:12]
             lines.append(
                 f"verify_serial_lock: held by {str(_h.get('id') or '')[:8]} "
                 f"({_h.get('status')}, "
-                f"assignee={str(_h.get('assignee_id') or '?')[:12]}) — created "
-                f"VERIFY 的 claim 会被挡，直到它收口"
+                f"assignee={_f2_holder_label}) — created "
+                f"VERIFY 的 claim 会被挡，{_VERIFY_UNLOCK}"
             )
         for t in tasks:
             tk = str(t.get("id") or "")
@@ -284,7 +304,9 @@ async def get_tasks_tool(
                 _blk = str(t.get("verify_in_flight_id") or "")[:8]
                 lines.append(
                     f"    verify_lock: blocked by in-flight VERIFY "
-                    f"({_blk}) — claim waits until MAIN frees"
+                    f"({_blk}, assignee={_f2_holder_label}) — claim waits "
+                    f"until MAIN frees (unlocks when that VERIFY reaches "
+                    f"closed/cancelled, not when claimed)"
                 )
             _qp = t.get("verify_queue_position")
             if _qp is not None:

@@ -590,14 +590,12 @@ def test_hire_market_gate_passes_when_empty_skills():
 
 
 @pytest.mark.asyncio
-async def test_list_available_prunes_stale_market_slugs_when_market_down(monkeypatch):
-    """市场不可达时清掉 per-agent 缓存里的过期市场 slug，避免 hire 门槛死锁。
+async def test_list_available_last_search_not_accumulated_cache(monkeypatch):
+    """市场不可达时 last-search 清空，累计 #N 缓存仍保留旧市场 slug。
 
-    回归场景：会话早期市场可达（缓存留下市场 slug）→ 市场中途不可达 →
-    HR 按 tail 提示全绑内置 → gate 不应再因过期市场 slug 拒绝。
+    hire 门槛改看 last-search，不再靠清累计缓存防死锁。
     """
     svc = SkillRegistryService()
-    # 缓存里混着内置 slug + 早期见过的市场 slug
     svc._skill_search_cache["hr-1"] = [
         "self-review",
         "anthropics/skills/webapp-testing",
@@ -608,25 +606,25 @@ async def test_list_available_prunes_stale_market_slugs_when_market_down(monkeyp
         return None  # skills.sh 不可达
 
     async def fake_hub(search=None):
-        return []  # SkillHub 也无结果 → 市场整体不可达
+        return []  # SkillHub 也无结果 → 本次市场零命中
 
     monkeypatch.setattr(svc, "_search_skills_sh", fake_sh)
     monkeypatch.setattr(svc, "_search_skillhub", fake_hub)
 
     out = await svc.list_available_skills(search="x", agent_id="hr-1")
     assert "self-review" in out
+    # this listing does not re-print stale market hits
     assert "webapp-testing" not in out
-    assert "frontend-design" not in out
     cached = svc._skill_search_cache["hr-1"]
-    assert "webapp-testing" not in cached and "frontend-design" not in cached
-    assert "self-review" in cached  # 内置 slug 保留
+    assert "anthropics/skills/webapp-testing" in cached
+    assert "self-review" in cached
+    assert svc._skill_search_last.get("hr-1") == []
 
-    # gate 对清过后的缓存放行
     from hiveweave.tools.org_tools import _hire_market_skill_gate
 
     assert _hire_market_skill_gate(
         skills=["self-review"],
-        seen_slugs=svc._skill_search_cache["hr-1"],
+        seen_slugs=svc._skill_search_last.get("hr-1", []),
         builtin_lookup=SkillRegistryService._get_builtin_skill,
     ) is None
 

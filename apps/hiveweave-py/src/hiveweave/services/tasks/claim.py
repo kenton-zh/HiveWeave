@@ -140,6 +140,7 @@ class ClaimMixin:
             from hiveweave.tools.tasks.verify_spawn import (
                 _in_flight_verify_task,
                 _verify_serialize_lock,
+                verify_serialize_claim_blocked_message,
             )
 
             async with _verify_serialize_lock(project_id):
@@ -147,30 +148,10 @@ class ClaimMixin:
                     project_id, except_id=task_id
                 )
                 if blocker:
-                    bstatus = blocker.get("status")
-                    bid = str(blocker.get("id"))[:8]
-                    if bstatus == "blocked":
-                        # 有自动解封路径的 blocked：MAIN 会自愈释放，但必须
-                        # 诚实告知 —— 不承诺「平台一定会叫醒」（2026-08-11
-                        # 死锁复盘：parked blocked 曾让这条承诺永远落空）。
-                        raise ValueError(
-                            f"Task {task_id[:8]} is a VERIFY task and blocked "
-                            f"VERIFY {bid} currently holds the shared MAIN "
-                            f"runtime (it has an auto-unblock path: "
-                            f"depends_on/timer). This task stays queued as "
-                            f"'created' — the platform wakes you via inbox "
-                            f"when MAIN frees. Do NOT retry claim_task; "
-                            f"commit_turn(waiting) or work other tasks."
-                        )
                     raise ValueError(
-                        f"Task {task_id[:8]} is a VERIFY task and another "
-                        f"VERIFY ({bid}, {bstatus}) is in flight on the "
-                        f"shared MAIN runtime (verification is serialized: "
-                        f"one at a time). This task stays queued as 'created' "
-                        f"— the platform will wake you via inbox when MAIN "
-                        f"is free. Do NOT retry claim_task on it; "
-                        f"commit_turn(waiting) or work on your other tasks "
-                        f"meanwhile."
+                        await verify_serialize_claim_blocked_message(
+                            task_id=task_id, blocker=blocker
+                        )
                     )
                 await self._claim_created(project_id, task_id, agent_id)
             return

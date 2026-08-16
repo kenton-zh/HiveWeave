@@ -148,6 +148,51 @@ async def test_reminder_when_over_threshold_without_audit(code_audit_env):
     result, _ = await _run(_params())
     assert result.success is True
     assert _REMINDER_MARKER in result.output
+    assert "no fresh" in result.output
+    assert code_audit_env["reset_count"] == 1
+
+
+# ── (a2) llm_failed 之后提交：诚实措辞，不说从未审计 ──────────
+
+
+@pytest.mark.asyncio
+async def test_reminder_after_llm_failed_says_attempted(code_audit_env):
+    from hiveweave.services.code_audit import (
+        CODE_AUDIT_REMINDER_LLM_FAILED,
+        record_audit_attempt,
+    )
+
+    _record_over_threshold()
+    record_audit_attempt(_AGENT, "llm_failed", task_id="task-1")
+    result, _ = await _run(_params())
+    assert result.success is True
+    assert _REMINDER_MARKER in result.output
+    assert "attempted" in result.output
+    assert "llm_failed" in result.output
+    assert "no fresh" not in result.output
+    assert CODE_AUDIT_REMINDER_LLM_FAILED in result.output
+    assert code_audit_env["reset_count"] == 1
+
+
+# ── (a3) ISSUES 凭证仍是软门：提交成功、不阻断 ──────────────
+
+
+@pytest.mark.asyncio
+async def test_issues_attestation_does_not_block_submit(code_audit_env):
+    _record_over_threshold()
+    issues_audit = patch(
+        "hiveweave.services.attestation.find_latest_attestation_by_kind",
+        new_callable=AsyncMock,
+        return_value={
+            "id": "audit-issues",
+            "kind": "code_audit",
+            "exit_code": 1,
+            "created_at": _last_change_ts_ms() + 1000,
+        },
+    )
+    result, _ = await _run(_params(), extra_patches=[issues_audit])
+    assert result.success is True
+    assert _REMINDER_MARKER not in result.output
     assert code_audit_env["reset_count"] == 1
 
 

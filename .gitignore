@@ -118,6 +118,12 @@ AI_MEMORY.local.md
 # Local experiment/observation snapshots (复盘用，不入库)
 observations/
 
+# Local self-contained HTML analysis reports (bundle vendored echarts/mermaid/fonts)
+reports/
+
+# One-off per-project DB audit scripts (external absolute paths, snapshot-bound)
+tasks/_tmp_*
+
 # Misc
 after-select.yaml
 erl_crash.dump

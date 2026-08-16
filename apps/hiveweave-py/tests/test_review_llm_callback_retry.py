@@ -211,3 +211,23 @@ async def test_content_layer_json_error_no_retry():
             )
     assert len(client.posts) == 1
     fake_sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_extracts_reasoning_content_when_message_content_empty():
+    """Thinking models often return empty content; parse reasoning_content."""
+    client = FakeClient([
+        FakeResponse(200, {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "reasoning_content": "VERDICT: PASS\n",
+                },
+            }],
+        }),
+    ])
+    with patch("httpx.AsyncClient", return_value=client):
+        result = await agent_mod._review_llm_post_with_retry(
+            URL, BODY, HEADERS, asyncio.Semaphore(1)
+        )
+    assert result == "VERDICT: PASS\n"

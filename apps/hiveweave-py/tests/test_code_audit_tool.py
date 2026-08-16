@@ -40,6 +40,10 @@ async def test_no_worktree_soft_fail():
     ):
         result = await run_code_audit("proj", "agent-1")
     assert result == {"audited": False, "reason": "no_worktree"}
+    from hiveweave.services.code_audit import get_last_audit_attempt, reset_ledger
+
+    assert get_last_audit_attempt("agent-1") is None
+    reset_ledger("agent-1")
 
 
 @pytest.mark.asyncio
@@ -161,6 +165,7 @@ async def test_normal_path_issues_verdict_and_reset():
 @pytest.mark.asyncio
 async def test_llm_failed_soft_fail():
     from hiveweave.services.code_audit import (
+        get_last_audit_attempt,
         get_unaudited_lines,
         record_change,
         reset_ledger,
@@ -194,7 +199,11 @@ async def test_llm_failed_soft_fail():
     assert result == {"audited": False, "reason": "llm_failed"}
     att_svc.create.assert_not_awaited()
     assert get_unaudited_lines("agent-1") == 25  # ledger untouched on failure
+    attempt = get_last_audit_attempt("agent-1")
+    assert attempt is not None
+    assert attempt["reason"] == "llm_failed"
     reset_ledger("agent-1")
+    assert get_last_audit_attempt("agent-1") is None
 
 
 def _diff_git():
@@ -212,6 +221,7 @@ def _diff_git():
 async def test_no_callback_soft_fail():
     """call_llm=None（工具壳外调用 / ctx 未接线）→ no_callback，不动账本。"""
     from hiveweave.services.code_audit import (
+        get_last_audit_attempt,
         get_unaudited_lines,
         record_change,
         reset_ledger,
@@ -233,13 +243,20 @@ async def test_no_callback_soft_fail():
 
     assert result == {"audited": False, "reason": "no_callback"}
     assert get_unaudited_lines("agent-1") == 25
+    attempt = get_last_audit_attempt("agent-1")
+    assert attempt is not None
+    assert attempt["reason"] == "no_callback"
     reset_ledger("agent-1")
 
 
 @pytest.mark.asyncio
 async def test_callback_no_model_error_maps_no_model():
     """_review_llm_callback 的 NoModelConfiguredError → no_model（按类型捕获）。"""
-    from hiveweave.services.code_audit import reset_ledger, run_code_audit
+    from hiveweave.services.code_audit import (
+        get_last_audit_attempt,
+        reset_ledger,
+        run_code_audit,
+    )
     from hiveweave.services.model import NoModelConfiguredError
 
     reset_ledger("agent-1")
@@ -260,6 +277,10 @@ async def test_callback_no_model_error_maps_no_model():
             ),
         )
     assert result == {"audited": False, "reason": "no_model"}
+    attempt = get_last_audit_attempt("agent-1")
+    assert attempt is not None
+    assert attempt["reason"] == "no_model"
+    reset_ledger("agent-1")
 
 
 @pytest.mark.asyncio
@@ -338,12 +359,13 @@ async def test_auto_pass_without_callback():
 
 @pytest.mark.asyncio
 async def test_tool_shell_passes_ctx_callback():
-    """ctx.review_llm_callback 原样传给 run_code_audit 的 call_llm。"""
+    """ctx.review_llm_callback / oneshot_llm_callback 原样传给 run_code_audit。"""
     from types import SimpleNamespace
 
     from hiveweave.tools.code_audit import RequestCodeAuditParams, request_code_audit_tool
 
     callback = AsyncMock(return_value="VERDICT: PASS")
+    oneshot = AsyncMock(return_value="VERDICT: PASS")
     run_mock = AsyncMock(return_value={"audited": True, "verdict": "PASS",
                                        "lines_audited": 0, "attestation_id": "att-1"})
     with (
@@ -358,11 +380,15 @@ async def test_tool_shell_passes_ctx_callback():
             RequestCodeAuditParams(task_id="task-1"),
             "agent-1",
             r"C:\fake\wt",
-            ctx=SimpleNamespace(review_llm_callback=callback),
+            ctx=SimpleNamespace(
+                review_llm_callback=callback,
+                oneshot_llm_callback=oneshot,
+            ),
         )
 
     assert result.success is True
     assert run_mock.await_args.kwargs["call_llm"] is callback
+    assert run_mock.await_args.kwargs["oneshot_llm"] is oneshot
 
 
 @pytest.mark.asyncio
@@ -385,7 +411,36 @@ async def test_tool_shell_ctx_none_soft_fails():
 
     assert result.success is True  # soft-fail: ok 带 reason，不是 err
     assert "no_callback" in (result.output or "")
+    assert "retry" in (result.output or "").lower()
+    assert "submit_task" in (result.output or "")
     assert run_mock.await_args.kwargs["call_llm"] is None
+    assert run_mock.await_args.kwargs["oneshot_llm"] is None
+
+
+@pytest.mark.asyncio
+async def test_tool_shell_llm_failed_next_action_is_soft():
+    """llm_failed 工具回执提示可重试一次或直接 submit（软门）。"""
+    from hiveweave.tools.code_audit import RequestCodeAuditParams, request_code_audit_tool
+
+    run_mock = AsyncMock(return_value={"audited": False, "reason": "llm_failed"})
+    with (
+        patch(
+            "hiveweave.tools.helpers.get_project_id",
+            new_callable=AsyncMock,
+            return_value="proj",
+        ),
+        patch("hiveweave.services.code_audit.run_code_audit", new=run_mock),
+    ):
+        result = await request_code_audit_tool(
+            RequestCodeAuditParams(task_id="task-1"), "agent-1", r"C:\fake\wt"
+        )
+
+    assert result.success is True
+    text = result.output or ""
+    assert "llm_failed" in text
+    assert "retry" in text.lower()
+    assert "submit_task" in text
+    assert "soft" in text.lower()
 
 
 @pytest.mark.asyncio
@@ -482,6 +537,32 @@ def test_ledger_basic():
     assert get_unaudited_lines("agent-x") == 0
 
 
+def test_submit_reminder_helper_llm_failed_vs_generic():
+    from hiveweave.services.code_audit import (
+        CODE_AUDIT_REMINDER,
+        CODE_AUDIT_REMINDER_LLM_FAILED,
+        code_audit_submit_reminder,
+        record_audit_attempt,
+        record_change,
+        reset_ledger,
+    )
+
+    reset_ledger("agent-rem")
+    record_change("agent-rem", 25)
+    assert code_audit_submit_reminder("agent-rem") == CODE_AUDIT_REMINDER
+    record_audit_attempt("agent-rem", "llm_failed", task_id="t1")
+    assert code_audit_submit_reminder("agent-rem") == CODE_AUDIT_REMINDER_LLM_FAILED
+    record_audit_attempt("agent-rem", "no_callback")
+    no_cb = code_audit_submit_reminder("agent-rem")
+    assert "no_callback" in no_cb
+    assert "attempted" in no_cb
+    record_audit_attempt("agent-rem", "no_model")
+    no_model = code_audit_submit_reminder("agent-rem")
+    assert "no_model" in no_model
+    assert "attempted" in no_model
+    reset_ledger("agent-rem")
+
+
 def test_append_notice_idempotent():
     from hiveweave.services.code_audit import CODE_AUDIT_POLICY, append_code_audit_notice
 
@@ -561,3 +642,327 @@ async def test_collect_worktree_diff_base_resolve_failure_fails_open():
 
     assert "== diff HEAD (uncommitted) ==" in diff
     assert "main...HEAD" not in diff
+
+
+# ── Peer model pick ──────────────────────────────────────────
+
+
+def test_select_peer_prefers_other_tier():
+    from hiveweave.services.code_audit import select_peer_audit_model
+
+    ark = {"id": "m-ark", "model_id": "ark-code-latest"}
+    claude = {"id": "m-claude", "model_id": "claude-sonnet"}
+    chosen = select_peer_audit_model(
+        "deepseek-v4-flash",
+        "executor",
+        [
+            {"tier": "executor", "config": claude},
+            {"tier": "management", "config": ark},
+        ],
+    )
+    assert chosen is ark
+
+
+def test_select_peer_none_when_same_family():
+    from hiveweave.services.code_audit import select_peer_audit_model
+
+    flash_b = {"id": "m2", "model_id": "DeepSeek-V4-Flash"}
+    chosen = select_peer_audit_model(
+        "deepseek-v4-flash",
+        "executor",
+        [{"tier": "management", "config": flash_b}],
+    )
+    assert chosen is None
+
+
+def test_select_peer_stable_lexicographic_same_tier():
+    from hiveweave.services.code_audit import select_peer_audit_model
+
+    zzz = {"id": "b", "model_id": "zzz-model"}
+    aaa = {"id": "a", "model_id": "aaa-model"}
+    chosen = select_peer_audit_model(
+        "own-model",
+        "executor",
+        [
+            {"tier": "executor", "config": zzz},
+            {"tier": "executor", "config": aaa},
+        ],
+    )
+    assert chosen is aaa
+
+
+@pytest.mark.asyncio
+async def test_resolve_peer_picks_teammate_other_family():
+    from hiveweave.services.code_audit import resolve_peer_audit_model
+
+    author = {
+        "id": "a1",
+        "role": "签到工程师",
+        "permission_type": "executor",
+        "status": "active",
+        "model_id": None,
+    }
+    boss = {
+        "id": "a2",
+        "role": "ceo",
+        "permission_type": "coordinator",
+        "status": "active",
+        "model_id": None,
+    }
+    flash = {"id": "m1", "model_id": "deepseek-v4-flash"}
+    ark = {"id": "m2", "model_id": "ark-code-latest"}
+
+    async def fake_resolve(*, tier, preferred=None, skip_model_ids=None):
+        return ark if tier == "management" else flash
+
+    mock_org = MagicMock()
+    mock_org.list_agents = AsyncMock(return_value=[author, boss])
+    mock_org.get_agent = AsyncMock(return_value=author)
+    mock_ms = MagicMock()
+    mock_ms.resolve_model = fake_resolve
+
+    with (
+        patch("hiveweave.services.org.OrgService", return_value=mock_org),
+        patch("hiveweave.services.model.ModelService", return_value=mock_ms),
+    ):
+        cfg, source = await resolve_peer_audit_model("proj", "a1")
+
+    assert source == "peer"
+    assert cfg["model_id"] == "ark-code-latest"
+
+
+@pytest.mark.asyncio
+async def test_resolve_peer_falls_back_own_when_team_same_family():
+    from hiveweave.services.code_audit import resolve_peer_audit_model
+
+    author = {
+        "id": "a1",
+        "role": "签到工程师",
+        "permission_type": "executor",
+        "status": "active",
+    }
+    boss = {
+        "id": "a2",
+        "role": "ceo",
+        "permission_type": "coordinator",
+        "status": "active",
+    }
+    flash = {"id": "m1", "model_id": "deepseek-v4-flash"}
+
+    async def fake_resolve(*, tier, preferred=None, skip_model_ids=None):
+        return flash
+
+    mock_org = MagicMock()
+    mock_org.list_agents = AsyncMock(return_value=[author, boss])
+    mock_ms = MagicMock()
+    mock_ms.resolve_model = fake_resolve
+
+    with (
+        patch("hiveweave.services.org.OrgService", return_value=mock_org),
+        patch("hiveweave.services.model.ModelService", return_value=mock_ms),
+    ):
+        cfg, source = await resolve_peer_audit_model("proj", "a1")
+
+    assert source == "own"
+    assert cfg is flash
+
+
+@pytest.mark.asyncio
+async def test_resolve_peer_skips_archived_teammate():
+    from hiveweave.services.code_audit import resolve_peer_audit_model
+
+    author = {
+        "id": "a1",
+        "role": "签到工程师",
+        "permission_type": "executor",
+        "status": "active",
+    }
+    archived = {
+        "id": "a2",
+        "role": "ceo",
+        "permission_type": "coordinator",
+        "status": "archived",
+    }
+    flash = {"id": "m1", "model_id": "deepseek-v4-flash"}
+    ark = {"id": "m2", "model_id": "ark-code-latest"}
+
+    async def fake_resolve(*, tier, preferred=None, skip_model_ids=None):
+        return ark if tier == "management" else flash
+
+    mock_org = MagicMock()
+    mock_org.list_agents = AsyncMock(return_value=[author, archived])
+    mock_ms = MagicMock()
+    mock_ms.resolve_model = fake_resolve
+
+    with (
+        patch("hiveweave.services.org.OrgService", return_value=mock_org),
+        patch("hiveweave.services.model.ModelService", return_value=mock_ms),
+    ):
+        cfg, source = await resolve_peer_audit_model("proj", "a1")
+
+    assert source == "own"
+    assert cfg is flash
+
+
+@pytest.mark.asyncio
+async def test_oneshot_uses_peer_model_not_author_callback():
+    from hiveweave.services.code_audit import (
+        record_change,
+        reset_ledger,
+        run_code_audit,
+    )
+
+    reset_ledger("agent-1")
+    record_change("agent-1", 25)
+
+    peer = {"id": "uuid-peer", "model_id": "ark-code-latest"}
+    oneshot = AsyncMock(return_value="VERDICT: PASS\n")
+    own_cb = AsyncMock(return_value="VERDICT: ISSUES\nshould-not-run")
+    att_svc = _attestation_service()
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=_diff_git()),
+        patch("hiveweave.services.attestation.attestation_service", att_svc),
+        patch(
+            "hiveweave.tools.executor.ToolExecutor._save_tool_output_file",
+            return_value=r"C:\fake\report.txt",
+        ),
+        patch(
+            "hiveweave.services.code_audit.resolve_peer_audit_model",
+            new_callable=AsyncMock,
+            return_value=(peer, "peer"),
+        ),
+    ):
+        result = await run_code_audit(
+            "proj", "agent-1",
+            call_llm=own_cb,
+            oneshot_llm=oneshot,
+        )
+
+    assert result["audited"] is True
+    assert result["verdict"] == "PASS"
+    assert result["audit_model_id"] == "ark-code-latest"
+    assert result["audit_model_source"] == "peer"
+    oneshot.assert_awaited()
+    sent = oneshot.await_args.args[0]
+    assert sent["model_id"] == "ark-code-latest"
+    assert sent["supports_thinking"] is False
+    assert sent is not peer
+    own_cb.assert_not_awaited()
+    reset_ledger("agent-1")
+
+
+@pytest.mark.asyncio
+async def test_oneshot_uses_own_config_when_no_peer_family():
+    """Live team shares one model family → still oneshot, author's config."""
+    from hiveweave.services.code_audit import (
+        record_change,
+        reset_ledger,
+        run_code_audit,
+    )
+
+    reset_ledger("agent-1")
+    record_change("agent-1", 25)
+
+    own = {"id": "uuid-own", "model_id": "deepseek-v4-flash"}
+    oneshot = AsyncMock(return_value="VERDICT: PASS\n")
+    own_cb = AsyncMock(return_value="should-not-run")
+    att_svc = _attestation_service()
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=_diff_git()),
+        patch("hiveweave.services.attestation.attestation_service", att_svc),
+        patch(
+            "hiveweave.tools.executor.ToolExecutor._save_tool_output_file",
+            return_value=r"C:\fake\report.txt",
+        ),
+        patch(
+            "hiveweave.services.code_audit.resolve_peer_audit_model",
+            new_callable=AsyncMock,
+            return_value=(own, "own"),
+        ),
+    ):
+        result = await run_code_audit(
+            "proj", "agent-1",
+            call_llm=own_cb,
+            oneshot_llm=oneshot,
+        )
+
+    assert result["audit_model_source"] == "own"
+    assert result["audit_model_id"] == "deepseek-v4-flash"
+    oneshot.assert_awaited()
+    sent = oneshot.await_args.args[0]
+    assert sent["model_id"] == "deepseek-v4-flash"
+    assert sent["supports_thinking"] is False
+    assert sent is not own
+    own_cb.assert_not_awaited()
+    reset_ledger("agent-1")
+
+
+@pytest.mark.asyncio
+async def test_oneshot_falls_back_to_call_llm_when_peer_resolve_fails():
+    from hiveweave.services.code_audit import (
+        record_change,
+        reset_ledger,
+        run_code_audit,
+    )
+
+    reset_ledger("agent-1")
+    record_change("agent-1", 25)
+
+    oneshot = AsyncMock(return_value="VERDICT: PASS\n")
+    own_cb = AsyncMock(return_value="VERDICT: ISSUES\nx.py:1 [low] nit\n")
+    att_svc = _attestation_service()
+    with (
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new_callable=AsyncMock,
+            return_value=r"C:\fake\wt",
+        ),
+        patch("hiveweave.services.git_worktree._git", new=_diff_git()),
+        patch("hiveweave.services.attestation.attestation_service", att_svc),
+        patch(
+            "hiveweave.tools.executor.ToolExecutor._save_tool_output_file",
+            return_value=r"C:\fake\report.txt",
+        ),
+        patch(
+            "hiveweave.services.code_audit.resolve_peer_audit_model",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("org down"),
+        ),
+    ):
+        result = await run_code_audit(
+            "proj", "agent-1",
+            call_llm=own_cb,
+            oneshot_llm=oneshot,
+        )
+
+    assert result["audited"] is True
+    assert result["verdict"] == "ISSUES"
+    assert result["audit_model_source"] == "own"
+    oneshot.assert_not_awaited()
+    own_cb.assert_awaited()
+    reset_ledger("agent-1")
+
+
+def test_format_verdict_includes_peer_model():
+    from hiveweave.tools.code_audit import _format_verdict
+
+    out = _format_verdict({
+        "verdict": "PASS",
+        "lines_audited": 21,
+        "audit_model_id": "ark-code-latest",
+        "audit_model_source": "peer",
+        "attestation_id": "att-1",
+    })
+    text = out.output if hasattr(out, "output") else str(out)
+    assert "ark-code-latest" in text
+    assert "团队其它" in text

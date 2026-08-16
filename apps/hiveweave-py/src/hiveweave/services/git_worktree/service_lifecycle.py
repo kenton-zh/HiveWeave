@@ -45,6 +45,48 @@ from .porcelain import (
 
 log = structlog.get_logger(__name__)
 
+# info() porcelain hint: first N paths, never dump the full status blob.
+_INFO_UNCOMMITTED_FILES_LIMIT = 12
+
+
+def _porcelain_uncommitted_paths(
+    st: str, *, limit: int = _INFO_UNCOMMITTED_FILES_LIMIT
+) -> list[str]:
+    """Parse ``git status --porcelain`` into a short path list.
+
+    ``_git`` strips the whole stdout, so the first record may have lost a
+    leading XY blank (``" M x"`` → ``"M x"``). Restore it the same way
+    ``_split_status_z`` does. Rename/copy lines report the destination.
+    """
+    if not (st or "").strip():
+        return []
+    paths: list[str] = []
+    for idx, line in enumerate((st or "").splitlines()):
+        if not line.strip():
+            continue
+        rec = line
+        if (
+            idx == 0
+            and len(rec) >= 3
+            and rec[0] not in (" ", "?", "!")
+            and rec[1] == " "
+            and rec[2] != " "
+        ):
+            rec = " " + rec
+        if len(rec) < 4:
+            continue
+        path = rec[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[-1]
+        if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+            path = path[1:-1]
+        path = path.replace("\\", "/")
+        if path and path not in paths:
+            paths.append(path)
+        if len(paths) >= limit:
+            break
+    return paths
+
 
 class LifecycleMixin:
     """rollback / quarantine / delete / list / info."""
@@ -388,6 +430,10 @@ class LifecycleMixin:
         TEST6 audit S9: includes mechanical merge facts
         (``tip_is_ancestor_of_main``, ``commits_ahead``, ``base_branch``)
         so agents never claim "delivered to main" from memory.
+
+        Porcelain hints (callers distinguish dirty vs git-error):
+        ``uncommitted_files`` (≤12 paths) and ``git_status_error``.
+        ``has_uncommitted`` stays True when ``git status`` fails (fail-closed).
         """
         path = await self._resolve_effective_worktree_path(
             workspace_path, short_id
@@ -401,7 +447,13 @@ class LifecycleMixin:
 
         ok2, branch = await _git(["rev-parse", "--abbrev-ref", "HEAD"], path)
         ok3, st = await _git(["status", "--porcelain"], path)
-        has_uncommitted = bool(st) if ok3 else True
+        git_status_error = not ok3
+        if ok3:
+            uncommitted_files = _porcelain_uncommitted_paths(st)
+            has_uncommitted = bool(st)
+        else:
+            uncommitted_files = []
+            has_uncommitted = True
 
         checkpoints = await self._checkpoint_list(path)
 
@@ -426,9 +478,12 @@ class LifecycleMixin:
 
         return {"success": True, "status": {
             "short_id": short_id,
+            "path": path,
             "branch": branch if ok2 else "",
             "active": True,
             "has_uncommitted": has_uncommitted,
+            "uncommitted_files": uncommitted_files,
+            "git_status_error": git_status_error,
             "head": head,
             "checkpoints": checkpoints,
             "base_branch": base or None,

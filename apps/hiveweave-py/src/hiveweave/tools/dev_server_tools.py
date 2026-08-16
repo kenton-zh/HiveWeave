@@ -1,4 +1,4 @@
-"""start_dev_server — allocate a non-reserved port and register the process."""
+"""start_dev_server / stop_dev_server / lookup_dev_server — project process registry."""
 
 from __future__ import annotations
 
@@ -18,11 +18,16 @@ from hiveweave.services.process_registry import (
     allocate_project_port,
     check_command_reserved_ports,
     hydrate_registry,
+    is_pid_alive,
     is_reserved_port,
     lookup_by_port,
     lookup_by_project,
+    pick_observed_listen_port,
+    prune_dead_processes,
     register,
     spawn_project_process,
+    stop_process_by_port,
+    terminate_spawned,
 )
 
 # Tail bytes to attach on failure (enough for vite/webpack error output)
@@ -46,6 +51,7 @@ def _with_stale(records: list[ProcessRecord]) -> list[dict]:
     for r in records:
         d = r.to_dict()
         d["stale"] = bool(r.cwd) and not Path(r.cwd).is_dir()
+        d["pid_alive"] = is_pid_alive(r.pid)
         out.append(d)
     return out
 
@@ -96,6 +102,24 @@ class LookupDevServerParams(BaseModel):
     )
 
 
+class StopDevServerParams(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    preferred_port: int = Field(
+        alias="preferredPort",
+        description=(
+            "Project port to stop (must not be 4000/5173/4173)."
+        ),
+        json_schema_extra={"aliases": ["preferredPort", "preferred_port", "port"]},
+    )
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "Optional. Must match a registered pid for this project."
+        ),
+    )
+
+
 @tool(
     "start_dev_server",
     "Start the project's Vite/dev server on a non-reserved port (never 5173/4000). "
@@ -118,7 +142,6 @@ async def start_dev_server_tool(
             "Use preferredPort=3000 (or another free project port)."
         )
 
-    port = allocate_project_port(project_id, params.preferred_port)
     work_cwd = workspace
     if params.cwd:
         from hiveweave.tools.file import _resolve_safe_detail
@@ -138,6 +161,36 @@ async def start_dev_server_tool(
         err = check_command_reserved_ports(params.command)
         if err:
             return ToolResult.blocked_err(err)
+
+    # 阻塞调用（netstat 快照 / taskkill）统一下放线程池，避免卡住事件循环
+    await asyncio.to_thread(prune_dead_processes)
+    preferred = params.preferred_port
+    own_live_pref = [
+        r for r in await asyncio.to_thread(lookup_by_port, preferred)
+        if r.project_id == project_id and is_pid_alive(r.pid)
+    ]
+    if own_live_pref:
+        # Kill-before-start: reuse this project's port. Never kill others.
+        await asyncio.to_thread(stop_process_by_port, project_id, preferred)
+
+    port = await asyncio.to_thread(allocate_project_port, project_id, preferred)
+    other_on_port = [
+        r for r in await asyncio.to_thread(lookup_by_port, port)
+        if r.project_id != project_id and is_pid_alive(r.pid)
+    ]
+    if other_on_port:
+        port = await asyncio.to_thread(
+            allocate_project_port, project_id, port + 1
+        )
+    await asyncio.to_thread(prune_dead_processes)
+    own_on_port = [
+        r for r in await asyncio.to_thread(lookup_by_port, port)
+        if r.project_id == project_id and is_pid_alive(r.pid)
+    ]
+    if own_on_port:
+        await asyncio.to_thread(stop_process_by_port, project_id, port)
+
+    if params.command:
         # Inject allocated port if command has placeholder
         cmd = params.command.replace("{port}", str(port))
     else:
@@ -160,6 +213,18 @@ async def start_dev_server_tool(
         f"{'='*60}\n"
     )
     log_file.flush()
+
+    from hiveweave.services.eval_seal import (
+        is_eval_sealed,
+        sealed_bash_deny_for_workspace,
+    )
+
+    if is_eval_sealed(workspace) and not params.command and cmd.startswith("npx "):
+        cmd = "npx --offline " + cmd[4:]
+    seal_reason = sealed_bash_deny_for_workspace(workspace, cmd)
+    if seal_reason:
+        log_file.close()
+        return ToolResult.blocked_err(f"Error: {seal_reason}")
 
     try:
         proc, spawn_err, meta = spawn_project_process(
@@ -186,8 +251,10 @@ async def start_dev_server_tool(
             msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
         return ToolResult.err(msg)
 
-    # Health: process alive + port eventually accepts TCP (pid+cwd already known)
-    listening = False
+    # Health: process alive + a non-reserved port eventually listens.
+    # Prefer the allocated port; if the app ignores PORT (app.server),
+    # register the observed LISTEN port instead of killing the process.
+    listening_port: int | None = None
     for _ in range(15):
         await asyncio.sleep(0.4)
         if proc.poll() is not None:
@@ -210,25 +277,29 @@ async def start_dev_server_tool(
             except Exception:
                 pass
             del reader
-            listening = True
+            listening_port = port
             break
         except Exception:
+            observed = await asyncio.to_thread(
+                pick_observed_listen_port, proc.pid, port
+            )
+            if observed:
+                listening_port = observed
+                break
             continue
 
-    if not listening:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+    if listening_port is None:
+        await asyncio.to_thread(terminate_spawned, proc)
         log_file.close()
         tail = _read_log_tail(log_path)
         msg = (
-            f"Dev server pid={proc.pid} started but port {port} never listened. "
-            f"Command was: {cmd}"
+            f"Dev server pid={proc.pid} started but no non-reserved LISTEN "
+            f"port was observed (tried {port}). Command was: {cmd}"
         )
         if tail:
             msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
         return ToolResult.err(msg)
+    port = listening_port
 
     # Server is listening — detach the log file (process keeps the fd).
     # Do NOT close: the child process owns the fd via inheritance.
@@ -238,7 +309,8 @@ async def start_dev_server_tool(
     try:
         from hiveweave.util.win_subprocess import windows_no_window_kwargs
 
-        r = subprocess.run(
+        r = await asyncio.to_thread(
+            subprocess.run,
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=workspace,
             capture_output=True,
@@ -253,16 +325,21 @@ async def start_dev_server_tool(
     except Exception:
         pass
 
-    rec = register(
-        ProcessRecord(
-            project_id=project_id,
-            port=port,
-            pid=proc.pid,
-            cwd=work_cwd,
-            command=cmd,
-            commit=commit,
+    try:
+        rec = await asyncio.to_thread(
+            register,
+            ProcessRecord(
+                project_id=project_id,
+                port=port,
+                pid=proc.pid,
+                cwd=work_cwd,
+                command=cmd,
+                commit=commit,
+            ),
         )
-    )
+    except Exception as e:
+        await asyncio.to_thread(terminate_spawned, proc)
+        return ToolResult.err(f"Failed to register dev server: {e}")
     return ToolResult.ok(
         f"Dev server started on http://localhost:{port}/ "
         f"(pid={proc.pid}, cwd={work_cwd}, listening=ok). "
@@ -289,10 +366,17 @@ async def start_dev_server_tool(
 async def lookup_dev_server_tool(
     params: LookupDevServerParams, agent_id: str, workspace: str
 ) -> ToolResult:
-    hydrate_registry()
+    await asyncio.to_thread(hydrate_registry)
     project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err("No project")
     if params.preferred_port and not is_reserved_port(params.preferred_port):
-        hits = lookup_by_port(params.preferred_port)
+        hits = [
+            r for r in await asyncio.to_thread(
+                lookup_by_port, params.preferred_port
+            )
+            if r.project_id == project_id
+        ]
         if hits:
             return ToolResult.ok(
                 f"Found {len(hits)} registration(s) on port {params.preferred_port}",
@@ -302,10 +386,77 @@ async def lookup_dev_server_tool(
             f"No registry entry for port {params.preferred_port}",
             servers=[],
         )
-    if not project_id:
-        return ToolResult.err("No project")
-    servers = lookup_by_project(project_id)
+    servers = await asyncio.to_thread(lookup_by_project, project_id)
     return ToolResult.ok(
         f"{len(servers)} registered server(s) for this project",
         servers=_with_stale(servers),
     )
+
+
+@tool(
+    "stop_dev_server",
+    "Stop this project's registered dev server on preferredPort. "
+    "Optional pid must match a registry pid for this project. "
+    "Uses taskkill /T /PID (never /IM or Stop-Process). Never kills "
+    "HiveWeave ports 4000/5173/4173. For bg-bash-/bg-sub- jobs use job_kill.",
+    requires_workspace=False,
+    security_level="shell",
+)
+async def stop_dev_server_tool(
+    params: StopDevServerParams, agent_id: str, workspace: str
+) -> ToolResult:
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project")
+
+    port = int(params.preferred_port)
+    if is_reserved_port(port):
+        return ToolResult.blocked_err(
+            f"Port {port} is reserved for HiveWeave. "
+            "Use stop_dev_server on a project port (3000+), never 4000/5173/4173."
+        )
+
+    await asyncio.to_thread(hydrate_registry)
+    await asyncio.to_thread(prune_dead_processes)
+
+    if params.pid is not None:
+        matches = [
+            r for r in await asyncio.to_thread(lookup_by_project, project_id)
+            if r.pid == int(params.pid)
+        ]
+        if not matches:
+            return ToolResult.err(
+                f"pid={params.pid} is not a registered server for this project. "
+                "Use lookup_dev_server. job_kill is only for bg-bash-/bg-sub- jobs."
+            )
+        rec = matches[0]
+        if rec.port != port:
+            return ToolResult.err(
+                f"pid={params.pid} is registered on port {rec.port}, "
+                f"not preferredPort={port}."
+            )
+
+    result = await asyncio.to_thread(stop_process_by_port, project_id, port)
+    failed = result.get("failed") or []
+    stopped = result.get("stopped") or []
+    if failed and not stopped:
+        err = failed[0].get("error") or "stop failed"
+        if "reserved" in str(err).lower():
+            return ToolResult.blocked_err(str(err))
+        return ToolResult.err(str(err), **result)
+    if not stopped:
+        return ToolResult.ok(
+            f"No registered server on port {port} for this project. "
+            "Use lookup_dev_server to list servers.",
+            port=port,
+            **result,
+        )
+    status = stopped[0].get("status") or "stopped"
+    pid = stopped[0].get("pid")
+    return ToolResult.ok(
+        f"Stopped project server on port {port} (pid={pid}, status={status}).",
+        port=port,
+        pid=pid,
+        **result,
+    )
+

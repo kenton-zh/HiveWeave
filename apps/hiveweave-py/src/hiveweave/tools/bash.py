@@ -67,11 +67,23 @@ _DEV_SERVER_TRIGGER_RE = re.compile(
     r"|next\s+dev(?:\s|$)"
     r"|nuxt\s+dev(?:\s|$)"
     r"|nodemon\b"
-    r"|(?:pythonw?|python3)\s+-m\s+uvicorn(?:\s|$)"
+    r"|(?:pythonw?|python3)(?:\.exe)?\s+-m\s+uvicorn(?:\s|$)"
+    r"|(?:pythonw?|python3)(?:\.exe)?\s+-m\s+app\.server(?:\s|$)"
+    r"|(?:pythonw?|python3)(?:\.exe)?(?:\s+-[^\s]+)*\s+"
+    r"(?:['\"]?)(?:\.[/\\])?app[/\\]server\.py(?:\s|$)"
+    r"|(?:pythonw?|python3)(?:\.exe)?\s+-m\s+flask\b"
+    r"(?:\s+(?:--[\w-]+(?:[=\s][^\s;|&]+)?|-[A-Za-z](?:\s+[^\s;|&]+)?))*\s+run\b"
+    r"|uv\s+run\b(?:\s+\S+)*?\s+flask\b"
+    r"(?:\s+(?:--[\w-]+(?:[=\s][^\s;|&]+)?|-[A-Za-z](?:\s+[^\s;|&]+)?))*\s+run\b"
+    r"|(?:pythonw?|python3)(?:\.exe)?\s+-m\s+gunicorn(?:\s|$)"
+    r"|uv\s+run\b(?:\s+\S+)*?\s+(?<!\s--with\s)(?<!\s--extra\s)(?<!\s--group\s)(?<!\s--package\s)gunicorn(?:\s+\S|$)"
     r"|uv\s+run\b(?:\s+\S+)*?\s+(?<!\s--with\s)(?<!\s--extra\s)(?<!\s--group\s)(?<!\s--package\s)uvicorn(?:\s+\S|$)"
     r")"
-    # 裸 uvicorn：仅段首（含 VAR=val 前缀），避免 --with uvicorn / pip show uvicorn
+    # 裸 uvicorn / gunicorn：仅段首（含 VAR=val 前缀），避免 --with uvicorn
     r"|(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*`?uvicorn(?:\s+\S)"
+    r"|(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*`?gunicorn(?:\s+\S)"
+    r"|(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*`?flask\b"
+    r"(?:\s+(?:--[\w-]+(?:[=\s][^\s;|&]+)?|-[A-Za-z](?:\s+[^\s;|&]+)?))*\s+run\b"
     r")",
     re.IGNORECASE,
 )
@@ -88,6 +100,12 @@ _UVICORN_HELP_RE = re.compile(
     re.IGNORECASE,
 )
 _UVICORN_TOKEN_RE = re.compile(r"\buvicorn\b", re.IGNORECASE)
+_APP_SERVER_TOKEN_RE = re.compile(
+    r"(?:app\.server\b|app[/\\]server\.py\b)",
+    re.IGNORECASE,
+)
+_FLASK_TOKEN_RE = re.compile(r"\bflask\b", re.IGNORECASE)
+_GUNICORN_TOKEN_RE = re.compile(r"\bgunicorn\b", re.IGNORECASE)
 
 
 def _strip_trailing_ampersand(command: str) -> str:
@@ -122,11 +140,24 @@ def _detect_dev_server_command(command: str) -> int | None:
         return None
     if not _DEV_SERVER_TRIGGER_RE.search(cmd):
         return None
+    from hiveweave.services.process_registry import uv_dep_consumed_token
+
+    if (
+        uv_dep_consumed_token(cmd, "gunicorn")
+        or uv_dep_consumed_token(cmd, "uvicorn")
+        or uv_dep_consumed_token(cmd, "flask")
+    ):
+        return None
     # Disqualify blocking verbs (vite build, npm run build:test, …).
     if _BLOCKING_VERB_RE.search(cmd):
         return None
-    # uvicorn --help / --version 会立刻退出，不当成长驻服务。
-    if _UVICORN_TOKEN_RE.search(cmd) and _UVICORN_HELP_RE.search(cmd):
+    # uvicorn / flask / gunicorn / app.server --help 会立刻退出，不当成长驻服务。
+    if (
+        _UVICORN_TOKEN_RE.search(cmd)
+        or _APP_SERVER_TOKEN_RE.search(cmd)
+        or _FLASK_TOKEN_RE.search(cmd)
+        or _GUNICORN_TOKEN_RE.search(cmd)
+    ) and _UVICORN_HELP_RE.search(cmd):
         return None
     # Disqualify commands that pipe/redirect into a finite sink, e.g.
     # `vite --port 3000 > log.txt 2>&1 & echo done` — the agent intended a
@@ -156,16 +187,63 @@ async def _run_registered_dev_server(
     from hiveweave.services.process_registry import (
         ProcessRecord,
         allocate_project_port,
+        extract_ports_from_command,
+        is_pid_alive,
         is_reserved_port,
+        lookup_by_port,
+        pick_observed_listen_port,
+        prune_dead_processes,
         register,
         spawn_project_process,
+        stop_process_by_port,
+        terminate_spawned,
+        listening_ports_for_pid,
     )
 
     command = _strip_trailing_ampersand(command)
     pid = project_id or "default"
-    port = port_hint if (port_hint and not is_reserved_port(port_hint)) else (
-        allocate_project_port(pid, 3000)
+    # 阻塞调用（netstat 快照 / taskkill）统一下放线程池，避免卡住事件循环
+    await asyncio.to_thread(prune_dead_processes)
+    preferred = (
+        port_hint
+        if (port_hint and not is_reserved_port(port_hint))
+        else 3000
     )
+    if is_reserved_port(preferred):
+        return {
+            "success": False, "output": "",
+            "error": (
+                f"Refusing to start dev server on reserved platform port "
+                f"{preferred}. Use start_dev_server or a project port (3000+)."
+            ),
+            "blocked": True,
+        }
+
+    own_live_pref = [
+        r for r in await asyncio.to_thread(lookup_by_port, preferred)
+        if r.project_id == pid and is_pid_alive(r.pid)
+    ]
+    if own_live_pref:
+        await asyncio.to_thread(stop_process_by_port, pid, preferred)
+
+    if port_hint and not is_reserved_port(port_hint):
+        port = int(port_hint)
+    else:
+        port = await asyncio.to_thread(allocate_project_port, pid, preferred)
+    other_on_port = [
+        r for r in await asyncio.to_thread(lookup_by_port, port)
+        if r.project_id != pid and is_pid_alive(r.pid)
+    ]
+    if other_on_port:
+        port = await asyncio.to_thread(allocate_project_port, pid, port + 1)
+    await asyncio.to_thread(prune_dead_processes)
+    own_on_port = [
+        r for r in await asyncio.to_thread(lookup_by_port, port)
+        if r.project_id == pid and is_pid_alive(r.pid)
+    ]
+    if own_on_port:
+        await asyncio.to_thread(stop_process_by_port, pid, port)
+
     if is_reserved_port(port):
         return {
             "success": False, "output": "",
@@ -173,8 +251,6 @@ async def _run_registered_dev_server(
                 f"Refusing to start dev server on reserved platform port "
                 f"{port}. Use start_dev_server or a project port (3000+)."
             ),
-            # H3: 平台护栏拒绝 —— 与 start_dev_server_tool 的保留端口
-            # blocked_err 口径一致（复审 P2-1）
             "blocked": True,
         }
 
@@ -202,7 +278,8 @@ async def _run_registered_dev_server(
     try:
         import subprocess as _sp
 
-        r = _sp.run(
+        r = await asyncio.to_thread(
+            _sp.run,
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=cwd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=5,
@@ -212,10 +289,55 @@ async def _run_registered_dev_server(
     except Exception:
         pass
 
+    registered_port = port
+    env_port = meta.get("env_port")
+    if env_port:
+        try:
+            ep = int(env_port)
+            if not is_reserved_port(ep):
+                registered_port = ep
+        except (TypeError, ValueError):
+            pass
+
+    observed = None
+    for _ in range(12):
+        observed = await asyncio.to_thread(
+            pick_observed_listen_port, proc.pid, registered_port
+        )
+        if observed:
+            break
+        await asyncio.sleep(0.25)
+    probed = bool(observed)
+    if observed:
+        registered_port = observed
+    else:
+        raw_listen = await asyncio.to_thread(listening_ports_for_pid, proc.pid)
+        if raw_listen and all(is_reserved_port(p) for p in raw_listen):
+            await asyncio.to_thread(terminate_spawned, proc)
+            return {
+                "success": False, "output": "",
+                "error": (
+                    f"Refusing reserved LISTEN port(s) {raw_listen} "
+                    f"(pid={proc.pid}). Use a project port (3000+)."
+                ),
+                "blocked": True,
+            }
+
+    if is_reserved_port(registered_port):
+        await asyncio.to_thread(terminate_spawned, proc)
+        return {
+            "success": False, "output": "",
+            "error": (
+                f"Refusing to register reserved platform port "
+                f"{registered_port}."
+            ),
+            "blocked": True,
+        }
+
     try:
-        register(ProcessRecord(
+        await asyncio.to_thread(register, ProcessRecord(
             project_id=project_id or "",
-            port=port,
+            port=registered_port,
             pid=proc.pid,
             cwd=cwd,
             command=meta.get("command") or command,
@@ -224,23 +346,44 @@ async def _run_registered_dev_server(
     except Exception as e:
         log.warning(
             "bash.dev_server_register_failed",
-            error=str(e), pid=proc.pid, port=port, cwd=cwd[:120],
+            error=str(e), pid=proc.pid, port=registered_port, cwd=cwd[:120],
+        )
+        await asyncio.to_thread(terminate_spawned, proc)
+        return {
+            "success": False, "output": "",
+            "error": f"Failed to register dev server: {e}",
+            "blocked": True,
+        }
+
+    port_note = ""
+    if not probed and (
+        _APP_SERVER_TOKEN_RE.search(command)
+        and not extract_ports_from_command(command)
+    ):
+        port_note = (
+            f"  NOTE: no LISTEN port observed yet for pid={proc.pid}; "
+            f"registry uses PORT={registered_port}. If lookup misses, "
+            f"call lookup_dev_server after the app binds, or pass "
+            f"--port on 3000+.\n"
         )
 
     log.info(
         "bash.dev_server_auto_registered",
-        pid=proc.pid, port=port, cwd=cwd[:120],
+        pid=proc.pid, port=registered_port, cwd=cwd[:120],
+        probed=probed,
         command=(meta.get("command") or command)[:120],
     )
     return {
         "success": True,
         "output": (
             f"[hiveweave] Dev server auto-registered from bash.\n"
-            f"  pid={proc.pid} port={port} cwd={cwd}\n"
+            f"  pid={proc.pid} port={registered_port} cwd={cwd}\n"
             f"  command: {meta.get('command') or command}\n"
-            f"  URL: http://localhost:{port}/\n"
-            f"  This process is tracked — stop_processes_for_worktree will "
-            f"kill it on worktree teardown. Use lookup_dev_server to inspect.\n"
+            f"  URL: http://localhost:{registered_port}/\n"
+            f"{port_note}"
+            f"  This process is tracked — stop_dev_server / "
+            f"lookup_dev_server to stop or inspect; "
+            f"stop_processes_for_worktree kills it on teardown.\n"
             f"  (Routed from bash because the command is a long-running dev "
             f"server; blocking on it would time out and orphan the process.)\n"
             f"\nExit code: 0"
@@ -309,11 +452,32 @@ _HIVEWEAVE_FILE_OPS = re.compile(
 )
 _HIVEWEAVE_REF = re.compile(r"\.hiveweave\b", re.IGNORECASE)
 
+# Test-runner exclude flags that only *mention* .hiveweave so pytest/vitest/jest
+# skip worktrees. Stripped before the .hiveweave + file-op guard so injected
+# `--ignore=.hiveweave` does not self-block (`import` in `python -c` is a
+# file-op token). Real ops like `cat .hiveweave/data.db` still match after.
+_HIVEWEAVE_TEST_EXCLUDE_RE = re.compile(
+    r"(?:^|\s)(?:"
+    r"--ignore(?:-glob)?(?:\s+|=)\s*['\"]?(?:\*\*/?)?\.hiveweave(?:/\*\*)?['\"]?(?=['\"\s]|$)"
+    r"|--exclude(?:\s+|=)\s*['\"]?(?:\*\*/?)?\.hiveweave(?:/\*\*)?['\"]?(?=['\"\s]|$)"
+    r"|--testPathIgnorePatterns(?:\s+|=)\s*['\"]?\\?\.hiveweave['\"]?(?=['\"\s]|$)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _strip_hiveweave_test_excludes(command: str) -> str:
+    """Remove test-runner flags whose only .hiveweave mention is an exclude."""
+    stripped = _HIVEWEAVE_TEST_EXCLUDE_RE.sub(" ", command or "")
+    return re.sub(r"[ \t]{2,}", " ", stripped).strip()
+
 # 放行的 .hiveweave 子目录 — agent 可在这些子目录内执行文件操作
 # 与 file.py 的 allowed_subdirs（_check_hiveweave_dir）保持一致:
 # shared=团队共享 / reports, drafts, worktrees=工作文件 / handoffs=交接文档
+# (?![\w.-]) 精确拒绝「路径名续字符」：放行 `git -C .hiveweave/worktrees`（尾随空格/结尾），
+# 拦 `.hiveweave/shared-evil/`、`.hiveweave/worktrees2/` 这类前缀目录（\b 会被 d- / s2 击穿）
 _ALLOWED_HW_SUBDIRS = re.compile(
-    r"\.hiveweave[\\/]+(?:shared|reports|drafts|worktrees|handoffs)[\\/]",
+    r"\.hiveweave[\\/]+(?:shared|reports|drafts|worktrees|handoffs)(?![\w.-])",
     re.IGNORECASE,
 )
 
@@ -325,6 +489,7 @@ def _check_hiveweave_command(command: str) -> bool:
     `cd .hiveweave` 和 `ls .hiveweave` 这类无害命令不拦。
     放行指向 shared/reports/drafts/worktrees/handoffs 子目录的文件操作（团队共享/工作文件）。
     """
+    command = _strip_hiveweave_test_excludes(command)
     if not _HIVEWEAVE_REF.search(command):
         return False
     if not _HIVEWEAVE_FILE_OPS.search(command):
@@ -870,6 +1035,14 @@ async def execute_bash(
         return {"success": False, "output": "",
                 "error": f"Error: {reason}", "blocked": True}
 
+    from hiveweave.services.eval_seal import sealed_bash_deny_for_workspace
+
+    seal_reason = sealed_bash_deny_for_workspace(workspace_path, command)
+    if seal_reason:
+        log.warning("bash.eval_sealed", command_preview=command[:120])
+        return {"success": False, "output": "",
+                "error": f"Error: {seal_reason}", "blocked": True}
+
     # 1.5. Auto-source .hiveweave/env.sh if the project has one.
     # The project declares its own environment setup.
     hw_dir = str(Path(workspace_path) / ".hiveweave")
@@ -994,6 +1167,14 @@ async def execute_run_command(
                     command_preview=command[:120])
         return {"success": False, "output": "",
                 "error": f"Error: {reason}", "blocked": True}
+
+    from hiveweave.services.eval_seal import sealed_bash_deny_for_workspace
+
+    seal_reason = sealed_bash_deny_for_workspace(workspace_path, command)
+    if seal_reason:
+        log.warning("run_command.eval_sealed", command_preview=command[:120])
+        return {"success": False, "output": "",
+                "error": f"Error: {seal_reason}", "blocked": True}
 
     ws = workspace_path or os.getcwd()
     if cwd:
@@ -1505,6 +1686,56 @@ async def _resolve_verify_test_workspace(
     return main_ws, note + bind_note, resolved
 
 
+_ATTESTATION_BANNER_PREFIX = "[ATTESTATION]"
+_ATTEST_FOOTER_RE = re.compile(
+    r"\[attestation_id=(?P<id>\S+) kind=(?P<kind>\S+)"
+)
+
+
+def _attestation_tool_fields(
+    aid: str, kind: str, exit_code: int
+) -> tuple[str, str, dict[str, Any]]:
+    """Return (banner, footer, extra) for a test_run attestation."""
+    banner = f"{_ATTESTATION_BANNER_PREFIX} attestation_id={aid} kind={kind}"
+    footer = f"\n\n[attestation_id={aid} kind={kind} exit={exit_code}]"
+    extra: dict[str, Any] = {
+        "attestation_id": aid,
+        "kind": kind,
+        "banner": banner,
+    }
+    return banner, footer, extra
+
+
+def _attestation_fields_from_note(note: str) -> dict[str, Any]:
+    """Parse banner + ToolResult extras from an attestation footer note."""
+    m = _ATTEST_FOOTER_RE.search(note or "")
+    if not m:
+        return {}
+    aid, kind = m.group("id"), m.group("kind")
+    return {
+        "attestation_id": aid,
+        "kind": kind,
+        "banner": (
+            f"{_ATTESTATION_BANNER_PREFIX} attestation_id={aid} kind={kind}"
+        ),
+    }
+
+
+def _combine_attestation_output(output: str, banner: str, suffix: str) -> str:
+    """Append attestation footer and prefix a first-line banner if missing."""
+    body = f"{output}{suffix}"
+    if not banner:
+        return body
+    first = body.split("\n", 1)[0]
+    if _ATTESTATION_BANNER_PREFIX in first:
+        return body
+    return f"{banner}\n{body}"
+
+
+def _attestation_public_extra(meta: dict[str, Any]) -> dict[str, Any]:
+    return {k: meta[k] for k in ("attestation_id", "kind") if k in meta}
+
+
 async def _issue_test_run_attestation(
     *,
     project_id: str,
@@ -1606,7 +1837,10 @@ async def _issue_test_run_attestation(
         stdout=str(stdout)[-8000:],
         task_id=resolved,
     )
-    note = f"\n\n[attestation_id={aid} kind=test_run exit={exit_code}]"
+    _, footer, _extra = _attestation_tool_fields(
+        aid, "test_run", int(exit_code) if exit_code is not None else 1
+    )
+    note = footer
     if resolved:
         note += f" taskId={resolved}"
     else:
@@ -1688,6 +1922,13 @@ async def _bash_background(
         log.warning("bash.blocked", reason=reason, command_preview=cmd[:120])
         return ToolResult.blocked_err(f"Error: {reason}")
 
+    from hiveweave.services.eval_seal import sealed_bash_deny_for_workspace
+
+    seal_reason = sealed_bash_deny_for_workspace(exec_ws, cmd)
+    if seal_reason:
+        log.warning("bash.eval_sealed", command_preview=cmd[:120])
+        return ToolResult.blocked_err(f"Error: {seal_reason}")
+
     port_hint = _detect_dev_server_command(cmd)
     if port_hint is not None:
         routed = await _run_registered_dev_server(
@@ -1738,13 +1979,15 @@ async def _bash_background(
                 )
         except Exception as att_err:
             log.warning("bash_attest_issue_failed", error=str(att_err))
+        meta = _attestation_fields_from_note(attest_note)
+        banner = meta.get("banner") or ""
         suffix = f"{verify_note}{attest_note}"
         if result.get("success"):
-            return True, f"{out}{suffix}".strip()
+            return True, _combine_attestation_output(
+                out, banner, suffix
+            ).strip()
         err_msg = result.get("error") or "Command failed"
-        if suffix:
-            err_msg = f"{err_msg}{suffix}"
-        return False, err_msg
+        return False, _combine_attestation_output(err_msg, banner, suffix)
 
     job_id = start_offturn_job(
         kind="bash",
@@ -1866,19 +2109,23 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
             )
     except Exception as _att_err:
         log.warning("bash_attest_issue_failed", error=str(_att_err))
+    meta = _attestation_fields_from_note(attest_note)
+    banner = meta.get("banner") or ""
+    public = _attestation_public_extra(meta)
     suffix = f"{verify_note}{attest_note}"
     if result.get("success"):
-        return ToolResult.ok(f"{out}{suffix}")
+        return ToolResult.ok(
+            _combine_attestation_output(out, banner, suffix), **public
+        )
     err_msg = result.get("error", "Command failed")
     if _streak_hint:
         err_msg = f"{err_msg}{_streak_hint}"
-    if suffix:
-        err_msg = f"{err_msg}{suffix}"
+    err_msg = _combine_attestation_output(err_msg, banner, suffix)
     if result.get("blocked"):
         # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
         # stall 检测分流，文本/exit code 语义与 err 一致。
-        return ToolResult.blocked_err(err_msg)
-    return ToolResult.err(err_msg)
+        return ToolResult.blocked_err(err_msg, **public)
+    return ToolResult.err(err_msg, **public)
 
 
 @tool(
@@ -1949,17 +2196,21 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
             )
     except Exception as _att_err:
         log.warning("bash_attest_issue_failed", error=str(_att_err))
+    meta = _attestation_fields_from_note(attest_note)
+    banner = meta.get("banner") or ""
+    public = _attestation_public_extra(meta)
     suffix = f"{verify_note}{attest_note}"
     if result.get("success"):
-        return ToolResult.ok(f"{out}{suffix}")
+        return ToolResult.ok(
+            _combine_attestation_output(out, banner, suffix), **public
+        )
     err_msg = result.get("error", "Command failed")
     if _streak_hint:
         err_msg = f"{err_msg}{_streak_hint}"
-    if suffix:
-        err_msg = f"{err_msg}{suffix}"
+    err_msg = _combine_attestation_output(err_msg, banner, suffix)
     if result.get("blocked"):
         # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
         # stall 检测分流，文本/exit code 语义与 err 一致。
-        return ToolResult.blocked_err(err_msg)
-    return ToolResult.err(err_msg)
+        return ToolResult.blocked_err(err_msg, **public)
+    return ToolResult.err(err_msg, **public)
 

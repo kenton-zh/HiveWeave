@@ -287,6 +287,11 @@ class TestSharedDirAccess:
             "echo notes > .hiveweave/shared/notes.md"
         ) is False
 
+    def test_bash_allows_shared_dir_without_trailing_slash(self):
+        from hiveweave.tools.bash import _check_hiveweave_command
+        assert _check_hiveweave_command("cat .hiveweave/shared") is False
+        assert _check_hiveweave_command("ls .hiveweave/shared") is False
+
     def test_bash_allows_shared_cat(self):
         from hiveweave.tools.bash import _check_hiveweave_command
         assert _check_hiveweave_command(
@@ -313,6 +318,83 @@ class TestSharedDirAccess:
         assert _check_hiveweave_command(
             "cat .hiveweave/tool_outputs/log.txt"
         ) is True
+
+    def test_pytest_injected_ignore_not_blocked(self):
+        from hiveweave.services.process_registry import prepare_spawn_command
+        from hiveweave.tools.bash import _check_hiveweave_command
+
+        cmd, _, err = prepare_spawn_command("pytest", project_id="t")
+        assert err is None
+        assert "--ignore=.hiveweave" in cmd
+        assert "--ignore-glob=" in cmd
+        assert _check_hiveweave_command(cmd) is False
+
+        cmd_m, _, err_m = prepare_spawn_command(
+            "python -m pytest", project_id="t"
+        )
+        assert err_m is None
+        assert _check_hiveweave_command(cmd_m) is False
+
+    def test_python_c_import_pytest_injected_ignore_not_blocked(self):
+        from hiveweave.services.process_registry import prepare_spawn_command
+        from hiveweave.tools.bash import (
+            _check_hiveweave_command,
+            _validate_command_safety,
+        )
+
+        raw = 'python -c "import pytest; pytest.main()"'
+        cmd, _, err = prepare_spawn_command(raw, project_id="t")
+        assert err is None
+        assert ".hiveweave" in cmd
+        assert _check_hiveweave_command(cmd) is False
+        blocked, reason = _validate_command_safety(cmd)
+        assert blocked is False, reason
+
+    def test_vitest_jest_exclude_flags_stripped(self):
+        from hiveweave.tools.bash import _check_hiveweave_command
+
+        # import is a file-op token — strip must drop the exclude or this blocks
+        assert _check_hiveweave_command(
+            'python -c "import os" --exclude **/.hiveweave/**'
+        ) is False
+        assert _check_hiveweave_command(
+            r'python -c "import os" --testPathIgnorePatterns=\.hiveweave'
+        ) is False
+        assert _check_hiveweave_command(
+            "vitest --exclude **/.hiveweave/**"
+        ) is False
+        # Prefix of a real path must not be stripped as an exclude flag.
+        assert _check_hiveweave_command(
+            "cat --ignore=.hiveweave/data.db"
+        ) is True
+
+    @pytest.mark.asyncio
+    async def test_execute_path_injected_pytest_not_hiveweave_blocked(
+        self, tmp_path: Path
+    ):
+        from hiveweave.services.process_registry import prepare_spawn_command
+        from hiveweave.tools.bash import (
+            _validate_command_safety,
+            execute_bash,
+        )
+
+        cmd, _, err = prepare_spawn_command("pytest", project_id="t")
+        assert err is None
+        blocked, reason = _validate_command_safety(cmd)
+        assert blocked is False, reason
+        cmd_c, _, err_c = prepare_spawn_command(
+            'python -c "import pytest; pytest.main()"', project_id="t"
+        )
+        assert err_c is None
+        blocked_c, reason_c = _validate_command_safety(cmd_c)
+        assert blocked_c is False, reason_c
+        result = await execute_bash(
+            command="cat .hiveweave/data.db",
+            workdir="",
+            workspace_path=str(tmp_path),
+        )
+        assert result["success"] is False
+        assert ".hiveweave" in (result.get("error") or "")
 
     @pytest.mark.asyncio
     async def test_file_write_shared_allowed(self, tmp_path: Path):

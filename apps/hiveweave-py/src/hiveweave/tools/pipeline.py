@@ -118,6 +118,7 @@ class ToolContext:
     task_service: Any = None
     alarm_service: Any = None
     review_llm_callback: Any = None
+    oneshot_llm_callback: Any = None
     permission: Any = None
     approval: Any = None
     extra: dict[str, Any] = field(default_factory=dict)

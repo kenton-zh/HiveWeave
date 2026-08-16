@@ -599,6 +599,7 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 turn_result,
                 wait_without_ask_refs=wait_without_ask_refs,
                 ceo_project_pending=ctx.ceo_project_pending,
+                agent_id=ctx.agent_id,
             ),
             continue_work=False,
             should_repair=repair_only,
@@ -653,6 +654,7 @@ def _build_gate_hint(
     *,
     wait_without_ask_refs: list[str] | None = None,
     ceo_project_pending: list[str] | None = None,
+    agent_id: str | None = None,
 ) -> str:
     lines = [
         "[TURN EXIT BLOCKED]",
@@ -701,10 +703,7 @@ def _build_gate_hint(
             "请立即调用 git_worktree_merge(branchName=assignee shortId 或 hw/...)。"
             "禁止口头让 executor 自己 merge；冲突则 review_task(rework) 让其在 worktree 对齐 main。"
         ),
-        "UNCOMMITTED_WORKTREE": (
-            "你的 worktree 有未提交改动 — 请先 git_worktree_checkpoint，"
-            "再 commit_turn(done_slice)"
-        ),
+        "UNCOMMITTED_WORKTREE": _format_uncommitted_worktree_label(agent_id),
         "CEO_PROJECT_PENDING": (
             "项目仍有未推进工作，CEO 不能收工 — 请逐项推进："
             "审查 submitted 任务 / 推进 VERIFY 收口 / 给待命叶子派活；"
@@ -721,11 +720,17 @@ def _build_gate_hint(
                     f"GATE=UNREPLIED_ASKS REF={name} "
                     f"MISSING={gate_actions[v]}"
                 )
-                preview = (m.get("message") or "")[:60]
+                preview = (m.get("message") or "").replace("\n", " ").strip()[:60]
                 cid = (m.get("reply_contract_id") or "")[:12]
                 # TEST18 P0-3: 附合同 ID — 用 send_message/ask_agent 的
                 # replyTo 参数原样传回即闭合；已回执过则不再重复回执。
-                cid_hint = f" contract={cid}" if cid else ""
+                if not preview:
+                    preview = (
+                        f"(body not in this turn — replyTo={cid or '?'})"
+                    )
+                    cid_hint = ""
+                else:
+                    cid_hint = f" contract={cid}" if cid else ""
                 lines.append(f"  ❌ {name}：{preview}{cid_hint}")
             lines.append(
                 "  回复方式：send_message/ask_agent/notify_agent 传 "
@@ -763,7 +768,10 @@ def _build_gate_hint(
         lines.append("未回复：")
         for m in unreplied[:8]:
             name = m.get("from_name") or (m.get("from_agent_id") or "?")[:8]
-            preview = (m.get("message") or "")[:60]
+            preview = (m.get("message") or "").replace("\n", " ").strip()[:60]
+            cid = (m.get("reply_contract_id") or "")[:12]
+            if not preview:
+                preview = f"(body not in this turn — replyTo={cid or '?'})"
             lines.append(f"  ❌ {name}：{preview}")
 
     if "MISSING_COMMIT_TURN" in violations:
@@ -806,10 +814,20 @@ async def agent_worktree_has_uncommitted(
         if not ws:
             return False
         info = await GitWorktreeService().info(ws, short_id)
-        status = info.get("status") if isinstance(info, dict) else None
-        return bool(
-            isinstance(status, dict) and status.get("has_uncommitted")
-        )
+        fallback = ""
+        try:
+            from pathlib import Path
+
+            from hiveweave.services.git_worktree.constants import WORKTREE_DIR
+
+            fallback = str(Path(ws) / WORKTREE_DIR / short_id)
+        except Exception:
+            fallback = ""
+        hinted = _hint_from_worktree_info(info, fallback)
+        _worktree_hint_details[agent_id] = hinted
+        if hinted.get("git_error"):
+            return False
+        return bool(hinted.get("dirty"))
     except Exception as e:
         log.debug("worktree_uncommitted_check_failed", error=str(e))
         return False
@@ -821,8 +839,64 @@ async def agent_worktree_has_uncommitted(
 # commit_turn 同步拒绝时拼进提示。覆写式更新，仅 advisory。
 _ceo_project_pending_details: dict[str, list[str]] = {}
 
+# UNCOMMITTED_WORKTREE hint extras (files / path / git_status_error).
+_worktree_hint_details: dict[str, dict] = {}
+
 # 叶子「待命未派活」宽限期：招聘后 10 分钟内零任务不算待派活（onboarding 抖动）
 _CEO_IDLE_LEAF_GRACE_MS = 10 * 60 * 1000
+
+
+def _hint_from_worktree_info(info: object, fallback_path: str = "") -> dict:
+    """Parse GitWorktreeService.info() via .get() — fail-open on old shape."""
+    details: dict = {
+        "dirty": False,
+        "files": [],
+        "path": fallback_path,
+        "git_error": None,
+    }
+    status = info.get("status") if isinstance(info, dict) else None
+    if not isinstance(status, dict):
+        return details
+    path = status.get("path") or status.get("worktree_path") or fallback_path
+    details["path"] = str(path or fallback_path)
+    git_err = status.get("git_status_error")
+    if git_err:
+        details["git_error"] = (
+            "git status failed"
+            if git_err is True
+            else str(git_err)
+        )
+        details["dirty"] = False
+        return details
+    files = status.get("uncommitted_files")
+    if isinstance(files, list):
+        details["files"] = [str(f) for f in files if f][:5]
+    details["dirty"] = bool(status.get("has_uncommitted"))
+    return details
+
+
+def _format_uncommitted_worktree_label(agent_id: str | None) -> str:
+    base = (
+        "你的 worktree 有未提交改动 — 请先 git_worktree_checkpoint，"
+        "再 commit_turn(done_slice)"
+    )
+    details = _worktree_hint_details.get(agent_id or "") if agent_id else None
+    if not details:
+        return base
+    git_err = details.get("git_error")
+    path = details.get("path") or ""
+    files = details.get("files") or []
+    if git_err:
+        loc = f" at {path}" if path else ""
+        return f"git status failed{loc} (not necessarily dirty): {git_err}"
+    extra: list[str] = []
+    if path:
+        extra.append(f"path={path}")
+    if files:
+        extra.append("files=" + ", ".join(str(f) for f in files[:4]))
+    if extra:
+        return f"{base} ({'; '.join(extra)})"
+    return base
 
 
 def pop_ceo_project_pending_details(agent_id: str) -> list[str]:
@@ -1162,73 +1236,116 @@ def _fmt_ids(ids: list[str], limit: int = 4) -> str:
     return "、".join(shown)
 
 
-async def _unreplied_ask_contracts(agent_id: str) -> list[str]:
-    """未完结 ask 的合约 ID 前缀（与 get_outstanding_ask_senders 同口径）。
+async def _unreplied_ask_contracts(agent_id: str) -> list[dict]:
+    """Outstanding asks with sender + body snippet (read=1 still open).
 
-    单查询：expect_report=1 且 reply_contract_id 未通过任何 reply_to 闭合
-    （legacy 无合约则按未读）。返回合约前 12 位（与 gate hint 同款
-    contract 值，agent 可直接 replyTo），无合约回退发送方 ID 前缀。
+    Same口径 as get_outstanding_ask_messages: expect_report=1 and
+    reply_contract_id not closed via reply_to (legacy unread if no
+    contract). Does not change read flags.
     """
-    from hiveweave.db import project as project_db
-    from hiveweave.services.inbox import _ensure_schema
+    from hiveweave.services.inbox import InboxService
 
-    await _ensure_schema(agent_id)
-    rows = await project_db.query(
-        agent_id,
-        "SELECT from_agent_id, reply_contract_id FROM inbox AS i "
-        "WHERE i.to_agent_id = ? AND i.expect_report = 1 "
-        "AND i.from_agent_id NOT IN ('user', 'system') "
-        "AND ("
-        "  (i.reply_contract_id IS NOT NULL AND i.reply_contract_id NOT IN ("
-        "    SELECT DISTINCT reply_to FROM inbox WHERE reply_to IS NOT NULL))"
-        "  OR (i.reply_contract_id IS NULL AND i.read = 0)"
-        ") ORDER BY i.created_at DESC LIMIT 20",
-        [agent_id],
-    )
-    out: list[str] = []
-    for r in rows:
-        cid = r["reply_contract_id"] if "reply_contract_id" in r.keys() else None
-        if cid:
-            out.append(str(cid)[:12])
-        else:
-            fid = r["from_agent_id"] if "from_agent_id" in r.keys() else ""
-            out.append((str(fid) or "?")[:8])
+    msgs = await InboxService().get_outstanding_ask_messages(agent_id, limit=20)
+    out: list[dict] = []
+    for m in msgs:
+        cid = m.get("reply_contract_id")
+        snippet = m.get("snippet") or m.get("message") or ""
+        snippet = str(snippet).replace("\n", " ").strip()[:80]
+        fid = str(m.get("from_agent_id") or "")
+        out.append({
+            "contract": (str(cid)[:12] if cid else (fid[:8] or "?")),
+            "from_agent_id": fid,
+            "from_name": str(m.get("from_name") or ""),
+            "snippet": snippet,
+        })
     return out
 
 
-async def _worktree_dirty_flag(agent_id: str, project_id: str) -> bool:
-    """Worktree 未提交标记 — 仅 porcelain，不跑 info() 重命令。
+def format_unreplied_ask_reject_suffix(asks: list[dict]) -> str:
+    """Sender + body + contract for commit_turn REJECTED (UNREPLIED_ASKS)."""
+    if not asks:
+        return ""
+    bits: list[str] = []
+    for a in asks[:4]:
+        name = a.get("from_name") or ""
+        fid = (a.get("from_agent_id") or "?")[:8]
+        who = f"{name} ({fid})" if name else fid
+        cid = a.get("contract") or ""
+        snippet = (a.get("snippet") or "").strip()
+        if not snippet:
+            snippet = f"(body not in this turn — replyTo={cid or '?'})"
+        cid_bit = f" contract={cid}" if cid else ""
+        bits.append(f"{who}{cid_bit} 「{snippet}」")
+    return " 未回复详情: " + "；".join(bits)
 
-    用 agent_router 内存路由取规范路径（0 DB 查询），只有真实存在
-    .git 的写 worktree 才跑一次 `git status --porcelain`。CEO/HR 无
-    worktree 直接跳过。标记是 advisory：gate 的
-    agent_worktree_has_uncommitted 才是权威判定。
+
+async def _worktree_dirty_flag(agent_id: str, project_id: str) -> dict:
+    """Worktree dirty details for the turn-start hint. Fail-open.
+
+    Prefers GitWorktreeService.info() fields via .get() (uncommitted_files /
+    git_status_error from a parallel agent). Old info() shape → generic
+    dirty from has_uncommitted. git_status_error means status failed, not
+    necessarily dirty.
     """
+    details: dict = {
+        "dirty": False,
+        "files": [],
+        "path": "",
+        "git_error": None,
+    }
     from pathlib import Path
 
     from hiveweave.services.agent_router import agent_router
     from hiveweave.services.git_worktree.constants import WORKTREE_DIR
-    from hiveweave.services.git_worktree.git_cmd import _git
-    from hiveweave.services.git_worktree.porcelain import _porcelain_tracked_dirty
 
     try:
         route = agent_router.get_route(agent_id)
         if not route or not route.workspace_path or not route.short_id:
-            return False
+            return details
         wt = str(Path(route.workspace_path) / WORKTREE_DIR / route.short_id)
-        if not (Path(wt) / ".git").exists():
-            return False
+        details["path"] = wt
+        try:
+            from hiveweave.services.git_worktree import GitWorktreeService
+
+            # info() resolves A010-b relocation; do not require canonical .git.
+            info = await GitWorktreeService().info(
+                route.workspace_path, route.short_id
+            )
+            if isinstance(info, dict) and isinstance(info.get("status"), dict):
+                hinted = _hint_from_worktree_info(info, wt)
+                _worktree_hint_details[agent_id] = hinted
+                return hinted
+        except Exception as e:
+            log.debug(
+                "exit_contract_worktree_info_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
+        from hiveweave.services.git_worktree.git_cmd import _git
+        from hiveweave.services.git_worktree.porcelain import (
+            _porcelain_tracked_dirty_paths,
+        )
+
         ok_st, st_out = await _git(
             ["-c", "core.quotepath=false", "status", "--porcelain", "-z"], wt
         )
-        return bool(ok_st and _porcelain_tracked_dirty(st_out or ""))
+        if not ok_st:
+            details["git_error"] = "git status failed"
+            details["dirty"] = False
+            _worktree_hint_details[agent_id] = details
+            return details
+        files = _porcelain_tracked_dirty_paths(st_out or "")
+        details["files"] = files[:5]
+        details["dirty"] = bool(files)
+        _worktree_hint_details[agent_id] = details
+        return details
     except Exception as e:
         log.debug(
             "exit_contract_worktree_flag_failed",
             agent_id=agent_id,
             error=str(e),
         )
-        return False
+        return details
 
 
 async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
@@ -1238,7 +1355,7 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
     dirty flag）。任一源失败则忽略该项；全部失败返回空串（不注入）。
     无待办时返回单行「仅需提交 commit_turn」，不膨胀上下文。
     """
-    asks: list[str] = []
+    asks: list[dict] = []
     obligations: list[dict] = []
     checked = 0
     try:
@@ -1261,7 +1378,26 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
         )
     if not checked:
         return ""
-    wt_dirty = await _worktree_dirty_flag(agent_id, project_id)
+    wt: dict = {"dirty": False, "files": [], "path": "", "git_error": None}
+    try:
+        wt_raw = await _worktree_dirty_flag(agent_id, project_id)
+        if isinstance(wt_raw, dict):
+            wt = wt_raw
+        else:
+            wt = {
+                "dirty": bool(wt_raw),
+                "files": [],
+                "path": "",
+                "git_error": None,
+            }
+    except Exception as e:
+        log.debug(
+            "exit_contract_worktree_flag_failed",
+            agent_id=agent_id,
+            error=str(e),
+        )
+    wt_dirty = bool(wt.get("dirty"))
+    wt_git_err = wt.get("git_error")
     # P0-2 疏通层：CEO 在收工决策前就可见项目级待办（与 done_slice 门禁
     # 同口径），避免撞门后才知道项目还有未推进工作。非 CEO 返回 []。
     ceo_pending: list[str] = []
@@ -1273,7 +1409,13 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
         log.debug(
             "exit_contract_ceo_pending_failed", agent_id=agent_id, error=str(e)
         )
-    if not asks and not obligations and not wt_dirty and not ceo_pending:
+    if (
+        not asks
+        and not obligations
+        and not wt_dirty
+        and not wt_git_err
+        and not ceo_pending
+    ):
         return (
             "【本轮出口条件】无未回复 ask / 未完成义务 / 未提交 worktree："
             "仅需提交 commit_turn 收尾。\n"
@@ -1285,12 +1427,33 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
         )
     items: list[str] = ["必须提交 commit_turn"]
     if asks:
-        items.append(f"未回复 ask: {len(asks)} 个（{_fmt_ids(asks)}）")
+        bits: list[str] = []
+        for a in asks[:4]:
+            name = a.get("from_name") or ""
+            fid = (a.get("from_agent_id") or "?")[:8]
+            who = f"{name} ({fid})" if name else fid
+            cid = a.get("contract") or ""
+            snippet = (a.get("snippet") or "").strip()
+            if not snippet:
+                snippet = f"(body not in this turn — replyTo={cid or '?'})"
+            cid_bit = f" contract={cid}" if cid else ""
+            bits.append(f"{who}{cid_bit} 「{snippet}」")
+        items.append(f"未回复 ask: {len(asks)} 个（{'；'.join(bits)}）")
     if obligations:
         tids = [str(o.get("id") or "")[:8] for o in obligations if o.get("id")]
         items.append(f"未完成义务: {len(obligations)} 个（{_fmt_ids(tids)}）")
+    if wt_git_err:
+        loc = f" at {wt.get('path')}" if wt.get("path") else ""
+        items.append(f"git status failed{loc} (not necessarily dirty)")
     if wt_dirty:
-        items.append("worktree 有未提交改动（done_slice 前需 checkpoint）")
+        extra_bits: list[str] = []
+        if wt.get("path"):
+            extra_bits.append(str(wt["path"]))
+        files = wt.get("files") or []
+        if files:
+            extra_bits.append(", ".join(str(f) for f in files[:4]))
+        extra = f"（{'；'.join(extra_bits)}）" if extra_bits else ""
+        items.append(f"worktree 有未提交改动{extra}（done_slice 前需 checkpoint）")
     if ceo_pending:
         items.append(
             f"项目级待办（done_slice 前须推进）: {len(ceo_pending)} 项"

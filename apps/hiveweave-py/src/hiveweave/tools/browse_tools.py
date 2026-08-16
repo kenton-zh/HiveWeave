@@ -206,8 +206,20 @@ _HEAD_ALIASES = {
     "waitfor": "wait",
     "quit": "close",
     "exit": "close",
+    "restart": "close",
+    "reset": "close",
     "shoot": "screenshot",
 }
+
+# Session recycle: close the current agent-browser daemon; the next command
+# respawns via AGENT_BROWSER_SESSION=hiveweave-<agent_id>.
+BROWSE_RESTART_OK = (
+    "browser session closed; next browse command starts fresh. "
+    "If goto/eval keep timing out, call browse restart first."
+)
+BROWSE_RESTART_HINT = (
+    'If goto/eval keep timing out, call browse(["restart"]).'
+)
 
 
 def _map_ab_argv(argv: list[str], workspace: str) -> tuple[list[str], str | None]:
@@ -456,7 +468,10 @@ async def browse_exec(
 
     rc, stdout_b, stderr_b = await _run_and_drain(proc, stdin_payload, timeout)
     if rc == -1:
-        return -1, "", f"browse timed out after {timeout}s: {' '.join(argv)}"
+        return -1, "", (
+            f"browse timed out after {timeout}s: {' '.join(argv)}. "
+            f"{BROWSE_RESTART_HINT}"
+        )
 
     stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
     stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
@@ -633,7 +648,9 @@ def _contract_snapshot_output(
     "(path-only evidence is rejected for UI submit). "
     "For H5/canvas games prefer game_run_case after goto. "
     "Example: browse(args=[\"goto\",\"http://127.0.0.1:3000\"]) then "
-    "browse(args=[\"snapshot\",\"-i\"]). On success issues a browse_e2e attestation.",
+    "browse(args=[\"snapshot\",\"-i\"]). If goto/eval keep timing out, "
+    "call browse(args=[\"restart\"]) to close the session first. "
+    "On success issues a browse_e2e attestation.",
     requires_workspace=True,
     security_level="shell",
 )
@@ -662,6 +679,7 @@ async def browse_tool(
         )
 
     head = (argv[0] or "").lower().replace("-", "_")
+    is_restart = head in ("restart", "reset")
     try:
         code, stdout, stderr = await browse_exec(
             argv, workspace, timeout_sec=params.timeout_sec or 60, agent_id=agent_id
@@ -671,13 +689,19 @@ async def browse_tool(
     except OSError as e:
         return ToolResult.err(f"browse spawn failed: {e}")
 
+    if is_restart and code == 0:
+        return ToolResult.ok(BROWSE_RESTART_OK)
+
     if code != 0:
         parts = [f"browse exit={code}: {' '.join(argv)}"]
         if stdout:
             parts.append(stdout[-4000:])
         if stderr:
             parts.append(f"stderr:\n{stderr[-2000:]}")
-        return ToolResult.err("\n".join(parts))
+        err = "\n".join(parts)
+        if code == -1 and BROWSE_RESTART_HINT not in err:
+            err = f"{err}\n{BROWSE_RESTART_HINT}"
+        return ToolResult.err(err)
 
     out = stdout or "(no output)"
     if stderr:
