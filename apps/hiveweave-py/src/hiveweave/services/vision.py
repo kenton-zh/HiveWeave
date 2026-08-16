@@ -123,8 +123,10 @@ def strip_images_from_messages(
 ) -> list[dict[str, Any]]:
     """Drop ``images`` from all but the newest ``keep_last`` image messages.
 
-    Prevents tool-loop context from accumulating multi-MB base64 blobs across
-    many screenshot rounds. Does not mutate the input list in place.
+    Compaction-only: rewriting older message bodies (pixels + the
+    ``[image stripped…]`` note) invalidates DeepSeek prefix cache from that
+    token. The tool loop must call this at overflow, not every round.
+    Does not mutate the input list in place.
     """
     if keep_last < 0:
         keep_last = 0
