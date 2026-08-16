@@ -7,6 +7,11 @@ import {
 } from "../api";
 import { roleLabels } from "../chat/constants";
 import type { TokenUsageEntry, TokenDailyEntry } from "../api";
+import {
+  billedPromptTokens,
+  cacheHitPercent,
+  formatHitPercent,
+} from "./tokenUsageStats";
 
 // ── Formatters ──────────────────────────────────────────────
 
@@ -60,15 +65,23 @@ function StatCard({
   label,
   value,
   accent,
+  hint,
 }: {
   label: string;
   value: string;
   accent: string;
+  hint?: string;
 }) {
   return (
-    <div className="flex-1 min-w-[120px] bg-white border border-g-border rounded-gmLg px-4 py-3 shadow-gm-sm hover-lift">
+    <div
+      className="flex-1 min-w-[120px] bg-white border border-g-border rounded-gmLg px-4 py-3 shadow-gm-sm hover-lift"
+      title={hint}
+    >
       <div className="text-[10px] font-medium uppercase tracking-wider text-g-fg-3">{label}</div>
       <div className={`text-xl font-semibold mt-1 font-mono num ${accent}`}>{value}</div>
+      {hint ? (
+        <div className="text-[9px] text-g-fg-4 mt-1 leading-snug">{hint}</div>
+      ) : null}
     </div>
   );
 }
@@ -137,18 +150,23 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
   }, [projectId]);
 
   const totals = useMemo(() => {
-    return entries.reduce(
-      (acc, e) => {
-        acc.llm_calls += e.llm_calls || 0;
-        acc.input += e.input_tokens || 0;
-        acc.output += e.output_tokens || 0;
-        acc.cache_read += e.cache_read_tokens || 0;
-        acc.cache_creation += e.cache_creation_tokens || 0;
-        acc.total += e.total_tokens || 0;
-        return acc;
+    const acc = entries.reduce(
+      (sum, e) => {
+        sum.llm_calls += e.llm_calls || 0;
+        sum.input += e.input_tokens || 0;
+        sum.output += e.output_tokens || 0;
+        sum.cache_read += e.cache_read_tokens || 0;
+        sum.cache_creation += e.cache_creation_tokens || 0;
+        sum.total += e.total_tokens || 0;
+        return sum;
       },
       { llm_calls: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0 },
     );
+    return {
+      ...acc,
+      billed: billedPromptTokens(acc.input, acc.cache_read, acc.cache_creation),
+      hitPct: cacheHitPercent(acc.input, acc.cache_read, acc.cache_creation),
+    };
   }, [entries]);
 
   // 按 agent 透视（折叠 request_type）
@@ -222,10 +240,43 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
           {/* 统计卡片 */}
           <div className="flex gap-3 flex-wrap">
             <StatCard label="LLM 调用" value={fmtCalls(totals.llm_calls)} accent="text-g-blue" />
-            <StatCard label="输入 tokens" value={fmtNum(totals.input)} accent="text-g-fg" />
-            <StatCard label="输出 tokens" value={fmtNum(totals.output)} accent="text-g-fg" />
-            <StatCard label="缓存读取" value={fmtNum(totals.cache_read)} accent="text-g-fg-3" />
-            <StatCard label="总计 tokens" value={fmtNum(totals.total)} accent="text-violet-600" />
+            <StatCard
+              label="未命中输入"
+              value={fmtNum(totals.input)}
+              accent="text-g-fg"
+              hint="未走缓存的新输入"
+            />
+            <StatCard label="输出" value={fmtNum(totals.output)} accent="text-g-fg" hint="模型生成" />
+            <StatCard
+              label="缓存读取"
+              value={fmtNum(totals.cache_read)}
+              accent="text-g-fg-3"
+              hint="前缀命中，不进记账合计"
+            />
+            <StatCard
+              label="缓存写入"
+              value={fmtNum(totals.cache_creation)}
+              accent="text-g-fg-3"
+              hint="写入前缀缓存（Anthropic 等）"
+            />
+            <StatCard
+              label="缓存命中率"
+              value={formatHitPercent(totals.hitPct)}
+              accent="text-g-blue"
+              hint="缓存读 ÷（未命中 + 缓存读 + 缓存写）"
+            />
+            <StatCard
+              label="计费输入"
+              value={fmtNum(totals.billed)}
+              accent="text-g-fg"
+              hint="未命中 + 缓存读 + 缓存写"
+            />
+            <StatCard
+              label="记账合计"
+              value={fmtNum(totals.total)}
+              accent="text-violet-600"
+              hint="未命中 + 输出 + 缓存写，不含缓存读"
+            />
           </div>
 
           {/* 每日趋势 */}
@@ -235,19 +286,22 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
           </div>
 
           {/* 按 Agent 汇总 */}
-          <div className="bg-white border border-g-border rounded-gmLg shadow-gm-sm overflow-hidden">
+          <div className="bg-white border border-g-border rounded-gmLg shadow-gm-sm overflow-x-auto">
             <div className="px-4 py-2.5 text-xs font-medium text-g-fg border-b border-g-border">
               按 Agent 汇总
             </div>
             <table className="w-full text-xs">
               <thead>
                 <tr className="text-left text-g-fg-3 border-b border-g-border">
-                  <th className="px-4 py-2 font-medium">Agent</th>
-                  <th className="px-2 py-2 font-medium text-right">调用</th>
-                  <th className="px-2 py-2 font-medium text-right">输入</th>
-                  <th className="px-2 py-2 font-medium text-right">输出</th>
-                  <th className="px-2 py-2 font-medium text-right">缓存读</th>
-                  <th className="px-4 py-2 font-medium text-right">总计</th>
+                  <th scope="col" className="px-4 py-2 font-medium">Agent</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">调用</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">未命中</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">输出</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">缓存读</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">缓存写</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right" title="缓存命中率">命中率</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">计费输入</th>
+                  <th scope="col" className="px-4 py-2 font-medium text-right">记账合计</th>
                 </tr>
               </thead>
               <tbody>
@@ -260,6 +314,25 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
                     <td className="px-2 py-2 text-right font-mono">{fmtNum(a.input_tokens)}</td>
                     <td className="px-2 py-2 text-right font-mono">{fmtNum(a.output_tokens)}</td>
                     <td className="px-2 py-2 text-right font-mono">{fmtNum(a.cache_read_tokens)}</td>
+                    <td className="px-2 py-2 text-right font-mono">{fmtNum(a.cache_creation_tokens)}</td>
+                    <td className="px-2 py-2 text-right font-mono">
+                      {formatHitPercent(
+                        cacheHitPercent(
+                          a.input_tokens,
+                          a.cache_read_tokens,
+                          a.cache_creation_tokens,
+                        ),
+                      )}
+                    </td>
+                    <td className="px-2 py-2 text-right font-mono">
+                      {fmtNum(
+                        billedPromptTokens(
+                          a.input_tokens,
+                          a.cache_read_tokens,
+                          a.cache_creation_tokens,
+                        ),
+                      )}
+                    </td>
                     <td className="px-4 py-2 text-right font-mono font-semibold text-violet-600">
                       {fmtNum(a.total_tokens)}
                     </td>
@@ -270,19 +343,23 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
           </div>
 
           {/* 按 agent × request_type 明细 */}
-          <div className="bg-white border border-g-border rounded-gmLg shadow-gm-sm overflow-hidden">
+          <div className="bg-white border border-g-border rounded-gmLg shadow-gm-sm overflow-x-auto">
             <div className="px-4 py-2.5 text-xs font-medium text-g-fg border-b border-g-border">
               调用来源明细（主对话 / 压缩 / 子代理）
             </div>
             <table className="w-full text-xs">
               <thead>
                 <tr className="text-left text-g-fg-3 border-b border-g-border">
-                  <th className="px-4 py-2 font-medium">Agent</th>
-                  <th className="px-2 py-2 font-medium">来源</th>
-                  <th className="px-2 py-2 font-medium text-right">调用</th>
-                  <th className="px-2 py-2 font-medium text-right">输入</th>
-                  <th className="px-2 py-2 font-medium text-right">输出</th>
-                  <th className="px-4 py-2 font-medium text-right">总计</th>
+                  <th scope="col" className="px-4 py-2 font-medium">Agent</th>
+                  <th scope="col" className="px-2 py-2 font-medium">来源</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">调用</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">未命中</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">输出</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">缓存读</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">缓存写</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right" title="缓存命中率">命中率</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">计费输入</th>
+                  <th scope="col" className="px-4 py-2 font-medium text-right">记账合计</th>
                 </tr>
               </thead>
               <tbody>
@@ -299,6 +376,26 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
                     <td className="px-2 py-1.5 text-right font-mono">{fmtCalls(e.llm_calls)}</td>
                     <td className="px-2 py-1.5 text-right font-mono">{fmtNum(e.input_tokens)}</td>
                     <td className="px-2 py-1.5 text-right font-mono">{fmtNum(e.output_tokens)}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{fmtNum(e.cache_read_tokens)}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{fmtNum(e.cache_creation_tokens)}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">
+                      {formatHitPercent(
+                        cacheHitPercent(
+                          e.input_tokens,
+                          e.cache_read_tokens,
+                          e.cache_creation_tokens,
+                        ),
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 text-right font-mono">
+                      {fmtNum(
+                        billedPromptTokens(
+                          e.input_tokens,
+                          e.cache_read_tokens,
+                          e.cache_creation_tokens,
+                        ),
+                      )}
+                    </td>
                     <td className="px-4 py-1.5 text-right font-mono font-medium">{fmtNum(e.total_tokens)}</td>
                   </tr>
                 ))}

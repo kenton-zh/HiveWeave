@@ -426,25 +426,56 @@ class OpenAIHandler(FormatHandler):
         u = chunk.get("usage")
         if not u:
             return None
-        # 提取缓存命中字段，兼容两种网关表达：
-        # 1) DeepSeek 原生: prompt_cache_hit_tokens
-        # 2) OpenAI 兼容网关(如 Volcengine ARK): prompt_tokens_details.cached_tokens
-        cache_hit_native = u.get("prompt_cache_hit_tokens", 0) or 0
-        details = u.get("prompt_tokens_details") or {}
-        openai_cached = (details.get("cached_tokens") or 0) or 0
-        cache_read = cache_hit_native or openai_cached
-        cache_miss = u.get("prompt_cache_miss_tokens", None)
-        return {
-            "input": u.get("prompt_tokens", 0),
-            "output": u.get("completion_tokens", 0),
-            "total": u.get(
-                "total_tokens",
-                u.get("prompt_tokens", 0) + u.get("completion_tokens", 0),
-            ),
-            "cache_read": cache_read,
-            "prompt_cache_hit_tokens": cache_read,
-            "prompt_cache_miss_tokens": cache_miss,
-        }
+        from hiveweave.llm.util import openai_wire_cache_read, usage_int
+
+        if not isinstance(u, dict):
+            return None
+        # Omit absent keys so a later sparse usage chunk cannot wipe cache/input.
+        out: dict = {}
+        if "prompt_tokens" in u:
+            out["input"] = usage_int(u.get("prompt_tokens"))
+        if "completion_tokens" in u:
+            out["output"] = usage_int(u.get("completion_tokens"))
+        if "input" in out or "output" in out:
+            out["total"] = out.get("input", 0) + out.get("output", 0)
+        details = u.get("prompt_tokens_details")
+        has_cache = (
+            (isinstance(details, dict) and "cached_tokens" in details)
+            or "prompt_cache_hit_tokens" in u
+            or "cache_read" in u
+            or "cached" in u
+        )
+        if has_cache:
+            cache_read = openai_wire_cache_read(u)
+            out["cache_read"] = cache_read
+            out["prompt_cache_hit_tokens"] = cache_read
+        if "prompt_cache_miss_tokens" in u:
+            out["prompt_cache_miss_tokens"] = usage_int(u.get("prompt_cache_miss_tokens"))
+        return out or None
+
+
+def _anthropic_usage_fields(u: dict) -> dict:
+    """Map Anthropic usage JSON to canonical keys; omit wire-absent fields.
+
+    message_delta often sends output-only usage. Defaulting missing cache/input
+    to 0 would wipe values merged from message_start.
+    """
+    from hiveweave.llm.util import usage_int
+
+    if not isinstance(u, dict):
+        return {}
+    out: dict = {}
+    if "input_tokens" in u:
+        out["input"] = usage_int(u.get("input_tokens"))
+    if "output_tokens" in u:
+        out["output"] = usage_int(u.get("output_tokens"))
+    if "cache_creation_input_tokens" in u:
+        out["cache_creation"] = usage_int(u.get("cache_creation_input_tokens"))
+    if "cache_read_input_tokens" in u:
+        out["cache_read"] = usage_int(u.get("cache_read_input_tokens"))
+    if "input" in out or "output" in out:
+        out["total"] = out.get("input", 0) + out.get("output", 0)
+    return out
 
 
 # ── Anthropic Messages Handler ─────────────────────────────────
@@ -747,15 +778,9 @@ class AnthropicHandler(FormatHandler):
             # Initial usage estimate
             msg = raw_json.get("message", {})
             u = msg.get("usage", {})
-            if u:
-                chunks.append({
-                    "type": "usage",
-                    "usage": {
-                        "input": u.get("input_tokens", 0),
-                        "output": u.get("output_tokens", 0),
-                        "total": (u.get("input_tokens", 0) + u.get("output_tokens", 0)),
-                    },
-                })
+            fields = _anthropic_usage_fields(u)
+            if fields:
+                chunks.append({"type": "usage", "usage": fields})
 
         elif event_type == "content_block_start":
             block = raw_json.get("content_block", {})
@@ -835,15 +860,9 @@ class AnthropicHandler(FormatHandler):
                 "reason": self.map_finish_reason(stop_reason),
             })
             u = raw_json.get("usage", {})
-            if u:
-                chunks.append({
-                    "type": "usage",
-                    "usage": {
-                        "input": u.get("input_tokens", 0),
-                        "output": u.get("output_tokens", 0),
-                        "total": (u.get("input_tokens", 0) + u.get("output_tokens", 0)),
-                    },
-                })
+            fields = _anthropic_usage_fields(u)
+            if fields:
+                chunks.append({"type": "usage", "usage": fields})
 
         elif event_type == "message_stop":
             chunks.append({"type": "message_stop"})
@@ -871,26 +890,13 @@ class AnthropicHandler(FormatHandler):
         参考 opencode anthropic-messages.ts mapUsage。
         """
         u = chunk.get("usage")
-        if u:
-            return {
-                "input": u.get("input_tokens", 0),
-                "output": u.get("output_tokens", 0),
-                "total": (u.get("input_tokens", 0) + u.get("output_tokens", 0)),
-                "cache_creation": u.get("cache_creation_input_tokens", 0),
-                "cache_read": u.get("cache_read_input_tokens", 0),
-            }
-        # Also check message-level usage
-        msg = chunk.get("message", {})
-        u2 = msg.get("usage")
-        if u2:
-            return {
-                "input": u2.get("input_tokens", 0),
-                "output": u2.get("output_tokens", 0),
-                "total": (u2.get("input_tokens", 0) + u2.get("output_tokens", 0)),
-                "cache_creation": u2.get("cache_creation_input_tokens", 0),
-                "cache_read": u2.get("cache_read_input_tokens", 0),
-            }
-        return None
+        fields = _anthropic_usage_fields(u) if u else {}
+        if fields:
+            return fields
+        msg = chunk.get("message") or {}
+        u2 = msg.get("usage") if isinstance(msg, dict) else None
+        fields = _anthropic_usage_fields(u2) if u2 else {}
+        return fields or None
 
     @staticmethod
     def map_finish_reason(reason: str) -> str:
@@ -1146,16 +1152,19 @@ class GoogleHandler(FormatHandler):
         # Usage
         usage = raw_json.get("usageMetadata")
         if usage:
-            chunks.append({
-                "type": "usage",
-                "usage": {
-                    "input": usage.get("promptTokenCount", 0),
-                    "output": usage.get("candidatesTokenCount", 0),
-                    "total": usage.get("totalTokenCount", 0),
-                    "thoughts": usage.get("thoughtsTokenCount", 0),
-                    "cached": usage.get("cachedContentTokenCount", 0),
-                },
-            })
+            from hiveweave.llm.util import usage_int
+
+            usage_out = {
+                "input": usage_int(usage.get("promptTokenCount")),
+                "output": usage_int(usage.get("candidatesTokenCount")),
+                "total": usage_int(usage.get("totalTokenCount")),
+                "thoughts": usage_int(usage.get("thoughtsTokenCount")),
+            }
+            if "cachedContentTokenCount" in usage:
+                cache_read = usage_int(usage.get("cachedContentTokenCount"))
+                usage_out["cached"] = cache_read
+                usage_out["cache_read"] = cache_read
+            chunks.append({"type": "usage", "usage": usage_out})
 
         return chunks
 
@@ -1164,11 +1173,21 @@ class GoogleHandler(FormatHandler):
         u = chunk.get("usageMetadata")
         if not u:
             return None
-        return {
-            "input": u.get("promptTokenCount", 0),
-            "output": u.get("candidatesTokenCount", 0),
-            "total": u.get("totalTokenCount", 0),
+        from hiveweave.llm.util import usage_int
+
+        prompt = usage_int(u.get("promptTokenCount"))
+        output = usage_int(u.get("candidatesTokenCount"))
+        total = usage_int(u.get("totalTokenCount")) or (prompt + output)
+        out = {
+            "input": prompt,
+            "output": output,
+            "total": total,
         }
+        if "cachedContentTokenCount" in u:
+            cache_read = usage_int(u.get("cachedContentTokenCount"))
+            out["cache_read"] = cache_read
+            out["cached"] = cache_read
+        return out
 
     @staticmethod
     def map_finish_reason(reason: str) -> str:

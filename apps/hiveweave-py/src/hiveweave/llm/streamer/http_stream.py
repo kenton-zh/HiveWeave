@@ -468,9 +468,13 @@ class HttpStreamMixin:
                 event = payload
                 if not isinstance(event, dict):
                     continue
-                extracted = provider.extract_usage(event)
+                try:
+                    extracted = provider.extract_usage(event)
+                except (TypeError, ValueError, OverflowError, AttributeError):
+                    extracted = None
                 if extracted:
-                    usage = extracted
+                    # Merge: a later sparse usageMetadata must not wipe cache_read.
+                    usage = {**(usage or {}), **extracted}
                 for c in provider.parse_stream_chunk(event):
                     ctype = c.get("type")
                     if ctype == "text":

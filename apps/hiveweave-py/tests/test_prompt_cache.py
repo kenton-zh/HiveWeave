@@ -12,11 +12,12 @@ import json
 from hiveweave.llm.provider import (
     ApiFormat,
     AnthropicHandler,
+    GoogleHandler,
     OpenAIHandler,
     ProviderConfig,
     ProviderFactory,
 )
-from hiveweave.llm.util import normalize_usage
+from hiveweave.llm.util import billed_prompt_tokens, cache_hit_percent, normalize_usage
 
 
 def _cache_count(body: dict) -> int:
@@ -276,8 +277,9 @@ class TestExtractUsageCache:
             }
         }
         usage = AnthropicHandler.extract_usage(chunk)
-        assert usage["cache_read"] == 0
-        assert usage["cache_creation"] == 0
+        assert "cache_read" not in usage
+        assert "cache_creation" not in usage
+        assert usage["input"] == 100
 
     def test_extract_usage_from_message_level(self):
         """Anthropic message_start 中的 usage 也能提取。"""
@@ -329,8 +331,9 @@ class TestOpenAIDeepSeekCacheExtraction:
             }
         }
         usage = OpenAIHandler.extract_usage(chunk)
-        assert usage["cache_read"] == 0
-        assert usage["prompt_cache_miss_tokens"] is None
+        assert "cache_read" not in usage
+        assert "prompt_cache_miss_tokens" not in usage
+        assert usage["input"] == 100
 
     def test_extract_openai_compat_gateway_cached_tokens(self):
         """OpenAI 兼容网关（Volcengine ARK）用 prompt_tokens_details.cached_tokens。"""
@@ -394,8 +397,213 @@ class TestNormalizeUsageDeepSeek:
         assert norm["total"] == (123761 - 123392) + 68
 
     def test_anthropic_not_double_subtracted(self):
-        """Anthropic input 已排除 cache，不应重复剥（cache_read 时不减 input）。"""
-        usage = {"input": 100, "output": 50, "total": 150, "cache_read": 0}
+        """Anthropic input 已排除 cache，不应再减。"""
+        usage = {"input": 100, "output": 50, "total": 150, "cache_read": 2000, "cache_creation": 0}
         norm = normalize_usage(usage, "anthropic")
         assert norm["input"] == 100
+        assert norm["cache_read"] == 2000
         assert norm["total"] == 150
+
+    def test_anthropic_uncached_ge_cache_read_not_peeled(self):
+        """Hit rate ≤50%: uncached >= cache_read must not look like inclusive prompt."""
+        norm = normalize_usage(
+            {"input": 5000, "output": 10, "cache_read": 2000},
+            "anthropic",
+        )
+        assert norm["input"] == 5000
+        assert norm["cache_read"] == 2000
+
+    def test_extract_then_normalize_low_hit_peels_once(self):
+        """ARK-style ≤50% hit: extract stays inclusive, normalize subtracts once."""
+        extracted = OpenAIHandler.extract_usage({
+            "usage": {
+                "prompt_tokens": 10000,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 3000},
+            }
+        })
+        assert extracted["input"] == 10000
+        assert extracted["cache_read"] == 3000
+        norm = normalize_usage(extracted, "openai-compatible")
+        assert norm["input"] == 7000
+        assert norm["cache_read"] == 3000
+
+    def test_extract_then_normalize_deepseek_uses_miss(self):
+        extracted = OpenAIHandler.extract_usage({
+            "usage": {
+                "prompt_tokens": 2500,
+                "completion_tokens": 120,
+                "prompt_cache_hit_tokens": 2000,
+                "prompt_cache_miss_tokens": 500,
+            }
+        })
+        assert extracted["input"] == 2500
+        norm = normalize_usage(extracted, "openai")
+        assert norm["input"] == 500
+        assert norm["cache_read"] == 2000
+
+    def test_deepseek_full_hit_miss_zero(self):
+        extracted = OpenAIHandler.extract_usage({
+            "usage": {
+                "prompt_tokens": 2000,
+                "completion_tokens": 10,
+                "prompt_cache_hit_tokens": 2000,
+                "prompt_cache_miss_tokens": 0,
+            }
+        })
+        assert extracted["prompt_cache_miss_tokens"] == 0
+        norm = normalize_usage(extracted, "openai")
+        assert norm["input"] == 0
+        assert norm["cache_read"] == 2000
+
+    def test_anthropic_extract_then_normalize_low_hit(self):
+        extracted = AnthropicHandler.extract_usage({
+            "usage": {
+                "input_tokens": 5000,
+                "output_tokens": 10,
+                "cache_read_input_tokens": 2000,
+                "cache_creation_input_tokens": 0,
+            }
+        })
+        assert extracted["input"] == 5000
+        norm = normalize_usage(extracted, "anthropic")
+        assert norm["input"] == 5000
+        assert norm["cache_read"] == 2000
+
+    def test_anthropic_provider_name_variants_not_peeled(self):
+        usage = {"input": 5000, "output": 10, "cache_read": 2000}
+        for name in ("anthropic", "Anthropic", "anthropic-messages"):
+            norm = normalize_usage(usage, name)
+            assert norm["input"] == 5000, name
+
+
+def test_normalize_peels_hit_without_miss_field():
+    extracted = OpenAIHandler.extract_usage({
+        "usage": {
+            "prompt_tokens": 2500,
+            "completion_tokens": 10,
+            "prompt_cache_hit_tokens": 2000,
+        }
+    })
+    assert extracted["input"] == 2500
+    norm = normalize_usage(extracted, "openai")
+    assert norm["input"] == 500
+    assert norm["cache_read"] == 2000
+
+
+def test_google_extract_stays_inclusive_normalize_peels_once():
+    extracted = GoogleHandler.extract_usage({
+        "usageMetadata": {
+            "promptTokenCount": 10000,
+            "candidatesTokenCount": 20,
+            "totalTokenCount": 10020,
+            "cachedContentTokenCount": 3000,
+        }
+    })
+    assert extracted["input"] == 10000
+    assert extracted["cache_read"] == 3000
+    norm = normalize_usage(extracted, "google")
+    assert norm["input"] == 7000
+    assert norm["cache_read"] == 3000
+    assert billed_prompt_tokens(norm["input"], norm["cache_read"]) == 10000
+    assert cache_hit_percent(norm["input"], norm["cache_read"]) == 30
+
+
+def _merge_google_stream_usage(events: list[dict]) -> dict:
+    """Mirror http_stream: merge extract, then parse_stream_chunk usage.update."""
+    handler = GoogleHandler()
+    usage: dict = {}
+    for event in events:
+        extracted = GoogleHandler.extract_usage(event)
+        if extracted:
+            usage = {**usage, **extracted}
+        for c in handler.parse_stream_chunk(event):
+            if c.get("type") == "usage" and c.get("usage"):
+                usage.update(c["usage"])
+    return usage
+
+
+def test_google_stream_merge_peels_once():
+    chunk = {
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {
+            "promptTokenCount": 10000,
+            "candidatesTokenCount": 20,
+            "totalTokenCount": 10020,
+            "cachedContentTokenCount": 3000,
+        },
+    }
+    usage = _merge_google_stream_usage([chunk])
+    assert usage["input"] == 10000
+    assert usage["cache_read"] == 3000
+    norm = normalize_usage(usage, "google")
+    assert norm["input"] == 7000
+    assert norm["cache_read"] == 3000
+
+
+def test_google_later_chunk_without_cache_keeps_cache_read():
+    first = {
+        "usageMetadata": {
+            "promptTokenCount": 10000,
+            "candidatesTokenCount": 20,
+            "totalTokenCount": 10020,
+            "cachedContentTokenCount": 3000,
+        }
+    }
+    second = {
+        "usageMetadata": {
+            "promptTokenCount": 10000,
+            "candidatesTokenCount": 20,
+            "totalTokenCount": 10020,
+        }
+    }
+    usage = _merge_google_stream_usage([first, second])
+    assert usage["cache_read"] == 3000
+    norm = normalize_usage(usage, "google")
+    assert norm["input"] == 7000
+
+
+def test_billed_prompt_and_hit_percent():
+    assert billed_prompt_tokens(10, 90, 0) == 100
+    assert cache_hit_percent(10, 90, 0) == 90
+    assert cache_hit_percent(0, 0, 0) is None
+    assert cache_hit_percent(100, 2000, 0) == 95
+    assert cache_hit_percent(0, 90, 0) == 100
+    assert cache_hit_percent(7000, 3000, 0) == 30
+
+
+def test_anthropic_message_delta_keeps_cache_from_start():
+    handler = AnthropicHandler()
+    start = {
+        "type": "message_start",
+        "message": {
+            "usage": {
+                "input_tokens": 5000,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 2000,
+                "cache_creation_input_tokens": 50,
+            }
+        },
+    }
+    delta = {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn"},
+        "usage": {"output_tokens": 80},
+    }
+    usage: dict = {}
+    for event in (start, delta):
+        extracted = AnthropicHandler.extract_usage(event)
+        if extracted:
+            usage = {**usage, **extracted}
+        for c in handler.parse_stream_chunk(event):
+            if c.get("type") == "usage" and c.get("usage"):
+                usage.update(c["usage"])
+    assert usage["input"] == 5000
+    assert usage["cache_read"] == 2000
+    assert usage["cache_creation"] == 50
+    assert usage["output"] == 80
+    norm = normalize_usage(usage, "anthropic")
+    assert norm["input"] == 5000
+    assert norm["cache_read"] == 2000
+    assert norm["cache_creation"] == 50
+
