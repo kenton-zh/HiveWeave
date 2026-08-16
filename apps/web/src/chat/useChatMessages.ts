@@ -10,7 +10,11 @@ import {
   isInjectedContext,
   isTeamChannelMessage,
   mapDbToChatMessages,
+  mergeStreamDraftIntoMessages,
   parseToolUsePayload,
+  sanitizeMessagesForCache,
+  shouldWriteChatCache,
+  streamEventBackgroundFlag,
 } from "./messageUtils";
 
 type UpdateStreamDraft = (
@@ -45,6 +49,7 @@ export function useChatMessages(opts: {
   }, [agentInfo]);
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messagesAgentId, setMessagesAgentId] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [teamCommsExpanded, setTeamCommsExpanded] = useState(false);
   const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
@@ -52,15 +57,37 @@ export function useChatMessages(opts: {
   const refreshOrgTree = useAppStore((s) => s.refreshOrgTree);
   const processingAgents = useAppStore((s) => s.processingAgents);
   const updateProcessingAgent = useAppStore((s) => s.updateProcessingAgent);
-  const orgTreeVersion = useAppStore((s) => s.orgTreeVersion);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const savedDraftsRef = useRef<Record<string, StreamDraft | null>>({});
   const prevAgentIdRef = useRef<string | null>(null);
+  const persistReadyRef = useRef(false);
+  const updateStreamDraftRef = useRef(updateStreamDraft);
+  updateStreamDraftRef.current = updateStreamDraft;
   const passiveSubRef = useRef<string | null>(null);
   const passiveUnsubRef = useRef<(() => void) | null>(null);
+
+  // ChatPanel is not remounted on agent switch. Adjust session during render so
+  // a committed frame never shows the previous person's 团队沟通 under a new id.
+  if (agentId !== messagesAgentId) {
+    if (!agentId) {
+      persistReadyRef.current = false;
+      setMessagesAgentId(null);
+      setMessages([]);
+    } else {
+      const cached = useAppStore.getState().chatSessions[agentId] as ChatMessage[] | undefined;
+      setMessagesAgentId(agentId);
+      if (cached && cached.length > 0) {
+        persistReadyRef.current = true;
+        setMessages(cached);
+      } else {
+        persistReadyRef.current = false;
+        setMessages([]);
+      }
+    }
+  }
 
   const handleMessagesScroll = useCallback(() => {
     const el = scrollContainerRef.current;
@@ -74,6 +101,10 @@ export function useChatMessages(opts: {
       try {
         const dbMessages = await getChatMessages(loadForAgentId);
         if (activeAgentIdRef.current !== loadForAgentId) return false;
+        if (!Array.isArray(dbMessages)) {
+          console.warn("getChatMessages returned non-array", loadForAgentId);
+          return false;
+        }
         const converted = mapDbToChatMessages(dbMessages);
         const ZOMBIE_STREAMING_MS = 12 * 60 * 1000;
         const now = Date.now();
@@ -102,20 +133,47 @@ export function useChatMessages(opts: {
               role: "assistant" as const,
               content: "",
               timestamp: Date.now(),
-              isBackground: false,
+              isBackground: streamDraftRef.current.isBackground === true,
               isRead: true,
               isStreaming: true,
             });
           }
         }
-        setMessages(deduped);
-        useAppStore.getState().setChatMessages(loadForAgentId, deduped);
+        persistReadyRef.current = true;
+        setMessagesAgentId(loadForAgentId);
         const unreadIds = deduped
           .filter((m) => !m.isRead && (m.isBackground || m.role === "team"))
           .map((m) => m.id);
+        const forStore =
+          unreadIds.length > 0
+            ? deduped.map((m) => (unreadIds.includes(m.id) ? { ...m, isRead: true } : m))
+            : deduped;
+        const existing = useAppStore.getState().chatSessions[loadForAgentId] as
+          | ChatMessage[]
+          | undefined;
+        const cacheNext = sanitizeMessagesForCache(forStore);
+        const keepCachedEmptyFetch =
+          forStore.length === 0 && !!existing && existing.length > 0;
+        if (keepCachedEmptyFetch) {
+          setMessages(existing);
+          return true;
+        }
+        setMessages(forStore);
+        if (
+          shouldWriteChatCache({
+            agentId: loadForAgentId,
+            messagesOwnerId: loadForAgentId,
+            persistReady: true,
+            next: cacheNext,
+            existing,
+          })
+        ) {
+          useAppStore.getState().setChatMessages(loadForAgentId, cacheNext);
+        }
         if (unreadIds.length > 0) {
-          markMessagesRead(unreadIds, loadForAgentId).catch(() => {});
-          refreshOrgTree();
+          void markMessagesRead(unreadIds, loadForAgentId)
+            .then(() => refreshOrgTree())
+            .catch(() => {});
         }
         return true;
       } catch (err) {
@@ -146,6 +204,8 @@ export function useChatMessages(opts: {
         try {
           const parsed = JSON.parse(event.data);
           if (parsed.role === "assistant" && parsed.id) {
+            const flag = streamEventBackgroundFlag(parsed);
+            const isBackground = flag ?? true;
             setMessages((prev) => {
               if (prev.some((m) => m.id === parsed.id)) return prev;
               return [
@@ -155,14 +215,16 @@ export function useChatMessages(opts: {
                   role: "assistant" as const,
                   content: "",
                   timestamp: Date.now(),
-                  isBackground: false,
+                  isBackground,
                   isRead: true,
                   isStreaming: true,
                 },
               ];
             });
             if (!streamDraftRef.current) {
-              updateStreamDraft({ assistantId: parsed.id, segments: [] });
+              updateStreamDraft({ assistantId: parsed.id, segments: [], isBackground });
+            } else if (flag !== undefined) {
+              updateStreamDraft((prev) => (prev ? { ...prev, isBackground: flag } : prev));
             }
           }
         } catch {
@@ -184,7 +246,7 @@ export function useChatMessages(opts: {
                 role: "assistant" as const,
                 content: "",
                 timestamp: Date.now(),
-                isBackground: false,
+                isBackground: true,
                 isRead: true,
                 isStreaming: true,
               },
@@ -193,6 +255,7 @@ export function useChatMessages(opts: {
           updateStreamDraft({
             assistantId: placeholderId,
             segments: [{ type: segType, content: event.data }],
+            isBackground: true,
           });
           return;
         }
@@ -229,7 +292,7 @@ export function useChatMessages(opts: {
                 role: "assistant" as const,
                 content: "",
                 timestamp: Date.now(),
-                isBackground: false,
+                isBackground: true,
                 isRead: true,
                 isStreaming: true,
               },
@@ -237,7 +300,7 @@ export function useChatMessages(opts: {
           });
           updateStreamDraft(
             appendToolCallSegment(
-              { assistantId: placeholderId, segments: [] },
+              { assistantId: placeholderId, segments: [], isBackground: true },
               parsed.toolCall,
               parsed.toolCallId,
             ),
@@ -293,7 +356,7 @@ export function useChatMessages(opts: {
     [releasePassiveStream],
   );
 
-  // Mount / agent / orgTreeVersion effect — MUST NOT abort stream on cleanup.
+  // Mount / agent switch — MUST NOT abort stream on cleanup.
   useEffect(() => {
     const switchingFrom = prevAgentIdRef.current;
     if (switchingFrom && switchingFrom !== agentId && streamDraftRef.current) {
@@ -302,9 +365,9 @@ export function useChatMessages(opts: {
     prevAgentIdRef.current = agentId;
 
     if (!agentId) {
+      persistReadyRef.current = false;
       setAgentInfo(null);
-      setMessages([]);
-      updateStreamDraft(null);
+      updateStreamDraftRef.current(null);
       setConfirmingDelete(false);
       setTeamCommsExpanded(false);
       setExpandedMessageId(null);
@@ -320,20 +383,13 @@ export function useChatMessages(opts: {
     const isStillProcessing = useAppStore.getState().processingAgents.includes(agentId);
 
     if (isAgentSwitch && savedDraft && isStillProcessing) {
-      updateStreamDraft(savedDraft);
+      updateStreamDraftRef.current(savedDraft);
       setIsStreaming(true);
       attachPassiveStream(agentId);
     } else if (isAgentSwitch) {
       setIsStreaming(false);
-      updateStreamDraft(null);
+      updateStreamDraftRef.current(null);
       if (savedDraft) delete savedDraftsRef.current[agentId];
-    }
-
-    const cached = useAppStore.getState().chatSessions[loadForAgentId];
-    if (cached && cached.length > 0) {
-      setMessages(cached as ChatMessage[]);
-    } else {
-      setMessages([]);
     }
 
     async function fetchAgent() {
@@ -359,21 +415,13 @@ export function useChatMessages(opts: {
     loadMessagesFromDb(loadForAgentId);
 
     return () => {
-      // Only prevent stale fetch/load results. Do NOT abort the stream here —
-      // this effect re-runs when loadMessagesFromDb or orgTreeVersion changes.
       cancelled = true;
     };
   }, [
     agentId,
     attachPassiveStream,
     loadMessagesFromDb,
-    orgTreeVersion,
-    activeAgentIdRef,
     setIsStreaming,
-    setThinkingElapsed,
-    streamDraftRef,
-    updateStreamDraft,
-    updateProcessingAgent,
   ]);
 
   // Passive live stream while parked on this agent (trigger/wake — not user streamChat).
@@ -420,44 +468,12 @@ export function useChatMessages(opts: {
     };
   }, [agentId, releasePassiveStream]);
 
-  // BUG-036: event-driven load only
-  useEffect(() => {
-    if (!agentId) return;
-    loadMessagesFromDb(agentId);
-  }, [agentId]); // eslint-disable-line react-hooks/exhaustive-deps
-
   const isAgentProcessing = agentId ? processingAgents.includes(agentId) : false;
 
   const displayMessages = useMemo(() => {
-    let merged = messages;
-    const hasPersistedDraft = streamDraft && streamDraft.persisted;
-    if ((isStreaming && streamDraft) || hasPersistedDraft) {
-      merged = messages.map((m) => {
-        const isTarget = m.id === streamDraft!.assistantId;
-        if (!isTarget && !hasPersistedDraft) {
-          return m.isStreaming ? { ...m, isStreaming: false } : m;
-        }
-        if (!isTarget && hasPersistedDraft) {
-          return m;
-        }
-        const textParts = streamDraft!.segments.filter((s) => s.type === "text").map((s) => s.content || "");
-        const thinkingParts = streamDraft!.segments
-          .filter((s) => s.type === "thinking")
-          .map((s) => s.content || "");
-        const newTools = streamDraft!.segments.filter((s) => s.type === "tool_call").map((s) => s.tool!);
-        return {
-          ...m,
-          content: textParts.join(""),
-          toolCalls: newTools.length > 0 ? newTools : m.toolCalls || [],
-          _segments: streamDraft!.segments,
-          _thinking: thinkingParts.join(""),
-          isStreaming: hasPersistedDraft ? false : true,
-        };
-      });
-    } else {
-      merged = merged.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m));
-    }
-    merged = merged.filter((m) => !isInjectedContext(m));
+    const merged = mergeStreamDraftIntoMessages(messages, streamDraft, { isStreaming }).filter(
+      (m) => !isInjectedContext(m),
+    );
     const foreground = merged.filter((m) => {
       if (m.isBackground || (m.role !== "user" && m.role !== "assistant")) return false;
       if (m.role === "assistant" && !m.isStreaming) {
@@ -511,30 +527,24 @@ export function useChatMessages(opts: {
 
   useEffect(() => {
     if (!agentId) return;
-    let cancelled = false;
-    const id = requestAnimationFrame(() => {
-      if (cancelled) return;
-      const cached = useAppStore.getState().chatSessions[agentId];
-      const sanitized = messages
-        .map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m))
-        .filter(
-          (m) =>
-            !(
-              m.role === "assistant" &&
-              !m.isStreaming &&
-              !m.content &&
-              (!m.toolCalls || m.toolCalls.length === 0)
-            )
-        );
-      if (cached && cached.length === sanitized.length && cached.every((c, i) => c === sanitized[i]))
-        return;
-      useAppStore.getState().setChatMessages(agentId, sanitized);
-    });
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(id);
-    };
-  }, [agentId, messages]);
+    // ChatPanel is not remounted: persist only after messagesAgentId caught up
+    // to agentId. A ref flipped in the switch effect would still see the previous
+    // person's messages under the new id.
+    const existing = useAppStore.getState().chatSessions[agentId] as ChatMessage[] | undefined;
+    const next = sanitizeMessagesForCache(messages);
+    if (
+      !shouldWriteChatCache({
+        agentId,
+        messagesOwnerId: messagesAgentId,
+        persistReady: persistReadyRef.current,
+        next,
+        existing,
+      })
+    ) {
+      return;
+    }
+    useAppStore.getState().setChatMessages(agentId, next);
+  }, [agentId, messages, messagesAgentId]);
 
   const { directMessages, teamMessages } = useMemo(() => {
     const team = messages.filter((m) => isTeamChannelMessage(m));

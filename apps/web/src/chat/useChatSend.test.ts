@@ -193,6 +193,7 @@ describe("useChatSend — round_start", () => {
       };
     });
     act(() => onEvent({ type: "round_start", data: "1" }));
-    expect(draft?.segments).toEqual([{ type: "tool_call", tool: { tool: "get_tasks", input: {} } }]);
+    const finalDraft = draft as StreamDraft | null;
+    expect(finalDraft?.segments).toEqual([{ type: "tool_call", tool: { tool: "get_tasks", input: {} } }]);
   });
 });

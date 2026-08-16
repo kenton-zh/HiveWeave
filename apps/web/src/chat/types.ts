@@ -42,4 +42,6 @@ export interface StreamDraft {
   segments: MsgSegment[];
   /** Set when DB load failed after done — keep draft visible as final content. */
   persisted?: boolean;
+  /** Passive/trigger stream — hide from main Chat; do not put chips in 团队沟通. */
+  isBackground?: boolean;
 }
