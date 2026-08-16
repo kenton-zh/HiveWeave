@@ -1165,11 +1165,13 @@ async def _resolve_test_attestation_task_id(
       1. explicit taskId
       2. reviewer path — sole submitted/reviewing where creator=self
          OR reviewer_id=self
-      3. VERIFY assignee path — sole open VERIFY (created|claimed|running)
+      3. in-flight VERIFY assigned to self when other VERIFYs are queued
+         (or in-flight has left created/claimed/running)
+      4. VERIFY assignee path — sole open VERIFY (created|claimed|running)
          where assignee=self (VERIFY skips assign=claim, so include created)
-      4. assignee path — sole running/claimed where assignee=self
-      5. reviewing >1 / VERIFY >1 → refuse silent bind + candidate note
-      6. 0 match but REVIEW-capable → candidate tip (do NOT auto-bind)
+      5. assignee path — sole running/claimed where assignee=self
+      6. reviewing >1 / VERIFY >1 → refuse silent bind + candidate note
+      7. 0 match but REVIEW-capable → candidate tip (do NOT auto-bind)
 
     Fallback (TEST18 P0-2): when multiple open VERIFY exist, extract
     taskId=/TASK_ID=/HW_TASK_ID= from the command text and bind only if the
@@ -1236,6 +1238,51 @@ async def _resolve_test_attestation_task_id(
         if (t.get("status") or "") in _VERIFY_OPEN
         and TaskService._is_verify_task(t)
     ]
+    # Queued created VERIFYs must not refuse/steal bind from the one occupying
+    # MAIN (s3-clone_01: multiple open → unbound test_run). Prefer in-flight
+    # even when it has already moved to submitted/reviewing (stale-baseline
+    # re-run while CEO is reviewing).
+    try:
+        from hiveweave.tools.tasks.verify_spawn import _in_flight_verify_task
+
+        holder = await _in_flight_verify_task(project_id)
+    except Exception:
+        holder = None
+    holder_id = str((holder or {}).get("id") or "")
+    holder_is_mine = (
+        bool(holder_id)
+        and str((holder or {}).get("assignee_id") or "") == str(agent_id)
+    )
+    if holder_is_mine:
+        competing = [
+            t for t in verify_open if str(t.get("id") or "") != holder_id
+        ]
+        if competing:
+            return (
+                holder_id,
+                "\n\n[attestation_bind] bound to in-flight VERIFY "
+                f"{holder_id[:8]} (queued VERIFYs ignored). Pass taskId "
+                "explicitly to bind a different task.",
+            )
+        holder_in_open = any(
+            str(t.get("id") or "") == holder_id for t in verify_open
+        )
+        if not holder_in_open:
+            # In-flight already left created/claimed/running (submitted…).
+            # Bind it only when this agent has no other active assignee work;
+            # otherwise a running implementation task would lose the stamp.
+            other_active = [
+                t for t in (mine or [])
+                if (t.get("status") or "") in ("running", "claimed")
+                and str(t.get("id") or "") != holder_id
+            ]
+            if not other_active:
+                return (
+                    holder_id,
+                    "\n\n[attestation_bind] bound to in-flight VERIFY "
+                    f"{holder_id[:8]}. Pass taskId explicitly to bind a "
+                    "different task.",
+                )
     if len(verify_open) == 1:
         return verify_open[0].get("id"), ""
     if len(verify_open) > 1:
