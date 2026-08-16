@@ -526,7 +526,7 @@ submit/approve 可能被 attestation gate 拦截。你有 bash/run_tests，可�
    `waive_attestation(taskId="<完整UUID或前8位>", reason="<可审计原因>")`  
    然后再让 assignee submit / 你 approve。reason 必填。
 3. **docs_only**：文档/调研类任务用 `testsPassed=true` + summary 注明 N/A。
-4. **VERIFY**：merge 后系统会 spawn VERIFY；缺独立 QA 时会 blocked——通知 HR 招 QA（hire 成功后系统会自动重挂 blocked VERIFY）。
+4. **VERIFY**：merge 后系统会 spawn VERIFY（实现岗的交付）。**QA 自己名下的任务合入后不再 spawn VERIFY**——测试岗已是验收方，父任务直接 closed，不要等一条「VERIFY: 测试」派给别人。缺独立 QA 时普通实现任务的 VERIFY 会 blocked——通知 HR 招 QA（hire 成功后系统会自动重挂 blocked VERIFY）。
 5. **不要**：用口头「章程豁免」或空 `attestationIds` 硬闯 gate——无效。
 
 Gate 报错会带回**完整 task UUID** 和可复制的工具调用，照抄即可。

@@ -134,6 +134,7 @@ async def _stamp_merge_fact_on_parent_tasks(
     *,
     merged_by: str,
     merge_commit: str | None,
+    merged_files: list[str] | None = None,
 ) -> None:
     """Persist merge machine facts on parent tasks after a real merge."""
     import time
@@ -158,6 +159,19 @@ async def _stamp_merge_fact_on_parent_tasks(
         if merge_commit:
             ev["merge_commit"] = str(merge_commit)
         ev["merged_at"] = now_ms
+        # Issue #5 / s3-clone_01: scope-aware VERIFY baseline reads
+        # parent evidence.files_changed. If submit left it empty, stamp
+        # this merge's paths so an unrelated later tip does not force a
+        # full re-E2E.
+        if merged_files:
+            existing = ev.get("files_changed") or ev.get("filesChanged")
+            if not (isinstance(existing, list) and existing):
+                from hiveweave.services.worktree_review import (
+                    normalize_files_changed,
+                )
+
+                ev["files_changed"] = normalize_files_changed(list(merged_files))
+        t["evidence"] = ev
         await _execute(
             project_id,
             "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
@@ -208,6 +222,7 @@ async def nudge_verify_tasks_after_merge(
                         selected,
                         merged_by=from_agent_id,
                         merge_commit=merge_commit,
+                        merged_files=merged_files,
                     )
                 except Exception as stamp_err:
                     log.warning(
@@ -224,24 +239,15 @@ async def nudge_verify_tasks_after_merge(
                     )
                     if vid:
                         spawned.append(vid)
-                    elif tid:
-                        # Spawn returned None without raising — still advance
-                        # parent out of bare approved so it cannot stall forever.
-                        try:
-                            await ts.mark_verifying(project_id, tid)
-                        except Exception:
-                            pass
+                    # None: QA delivery closed, or chain-stop. Leave approved
+                    # if still open — migrate_orphan_approved heals; verifying
+                    # without a child has no healer.
                 except Exception as spawn_err:
                     log.warning(
                         "verify_spawn_one_failed",
                         parent_id=tid,
                         error=str(spawn_err),
                     )
-                    if tid:
-                        try:
-                            await ts.mark_verifying(project_id, tid)
-                        except Exception:
-                            pass
             if spawned:
                 log.info(
                     "verify_spawned_after_merge",

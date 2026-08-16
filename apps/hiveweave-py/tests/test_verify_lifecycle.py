@@ -117,6 +117,180 @@ async def test_spawn_verify_stays_created(task_env):
 
 
 @pytest.mark.asyncio
+async def test_spawn_skips_when_parent_assignee_is_qa(task_env):
+    """QA's own delivery must not mint VERIFY-of-the-test-suite for a non-QA."""
+    from hiveweave.services.tasks.verify import is_verify_title
+
+    ts = TaskService()
+    pid = task_env["project_id"]
+    qa_id = "qa-delivery-1"
+    parent_id = await ts.create_task(
+        pid, "Integration suite", "d", creator_id=COORD, assignee_id=qa_id
+    )
+    await ts.claim_task(pid, parent_id, qa_id)
+    await ts.start_task(pid, parent_id)
+    await ts.submit_task(
+        pid, parent_id, evidence={"tests_passed": True, "test_output": "ok"}
+    )
+    await ts.start_review(pid, parent_id)
+    await ts.review_task(pid, parent_id, "approve")
+    parent = await ts.get_task(pid, parent_id)
+
+    async def fake_get(aid, *a, **k):
+        aid = str(aid)
+        if aid == qa_id:
+            return {
+                "id": qa_id,
+                "role": "qa_engineer",
+                "status": "active",
+                "permission_type": "executor",
+            }
+        return {
+            "id": aid,
+            "role": "executor",
+            "status": "active",
+            "permission_type": "executor",
+        }
+
+    with patch(
+        "hiveweave.services.org.OrgService.get_agent",
+        new=AsyncMock(side_effect=fake_get),
+    ):
+        verify_id = await _spawn_post_approve_verify_task(ts, pid, COORD, parent)
+
+    assert verify_id is None
+    parent2 = await ts.get_task(pid, parent_id)
+    assert parent2["status"] == "closed"
+    kids = [
+        t
+        for t in await ts.list_tasks(pid, include_archived=True)
+        if t.get("parent_task_id") == parent_id
+    ]
+    assert not any(is_verify_title(t.get("title")) for t in kids)
+
+
+async def _approve_task(ts, pid, assignee, title):
+    parent_id = await ts.create_task(
+        pid, title, "d", creator_id=COORD, assignee_id=assignee
+    )
+    await ts.claim_task(pid, parent_id, assignee)
+    await ts.start_task(pid, parent_id)
+    await ts.submit_task(
+        pid, parent_id, evidence={"tests_passed": True, "test_output": "ok"}
+    )
+    await ts.start_review(pid, parent_id)
+    await ts.review_task(pid, parent_id, "approve")
+    return parent_id
+
+
+def _agent_rows(*pairs: tuple[str, str]):
+    """pairs of (agent_id, role)."""
+    table = {aid: role for aid, role in pairs}
+
+    async def fake_get(aid, *a, **k):
+        aid = str(aid)
+        role = table.get(aid, "executor")
+        return {
+            "id": aid,
+            "role": role,
+            "status": "active",
+            "permission_type": "executor",
+        }
+
+    return fake_get
+
+
+@pytest.mark.asyncio
+async def test_spawn_still_when_executor_title_looks_like_tests(task_env):
+    """Do not skip VERIFY by scanning the parent title."""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    parent_id = await _approve_task(ts, pid, EXEC, "测试套件 Integration suite")
+    parent = await ts.get_task(pid, parent_id)
+    qa_id = "qa-verify-title"
+    with (
+        patch(
+            "hiveweave.services.org.OrgService.get_agent",
+            new=AsyncMock(side_effect=_agent_rows((EXEC, "executor"))),
+        ),
+        patch(
+            "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
+            AsyncMock(return_value=qa_id),
+        ),
+    ):
+        verify_id = await _spawn_post_approve_verify_task(ts, pid, COORD, parent)
+    assert verify_id
+    verify = await ts.get_task(pid, verify_id)
+    assert (verify.get("title") or "").startswith("VERIFY:")
+    parent2 = await ts.get_task(pid, parent_id)
+    assert parent2["status"] == "verifying"
+
+
+@pytest.mark.asyncio
+async def test_spawn_still_when_executor_implementer_reassigned_to_qa(task_env):
+    """Later QA assignee must not skip VERIFY for executor-written work."""
+    from hiveweave.services import task as task_module
+
+    ts = TaskService()
+    pid = task_env["project_id"]
+    qa_id = "qa-later-assignee"
+    parent_id = await _approve_task(ts, pid, EXEC, "Feature")
+    await task_module._execute(
+        pid,
+        "UPDATE tasks SET assignee_id = ? WHERE id = ?",
+        [qa_id, parent_id],
+    )
+    parent = await ts.get_task(pid, parent_id)
+    assert parent.get("implementer_id") == EXEC
+    assert parent.get("assignee_id") == qa_id
+    with (
+        patch(
+            "hiveweave.services.org.OrgService.get_agent",
+            new=AsyncMock(
+                side_effect=_agent_rows((EXEC, "executor"), (qa_id, "qa_engineer"))
+            ),
+        ),
+        patch(
+            "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
+            AsyncMock(return_value="qa-independent"),
+        ),
+    ):
+        verify_id = await _spawn_post_approve_verify_task(ts, pid, COORD, parent)
+    assert verify_id
+    parent2 = await ts.get_task(pid, parent_id)
+    assert parent2["status"] == "verifying"
+
+
+@pytest.mark.asyncio
+async def test_spawn_keeps_existing_verify_child_for_qa_parent(task_env):
+    """Open VERIFY child wins over QA-delivery skip (do not close parent under it)."""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    qa_id = "qa-delivery-existing"
+    parent_id = await _approve_task(ts, pid, qa_id, "Integration suite")
+    child = await ts.create_task(
+        pid,
+        "VERIFY: Integration suite",
+        "verify",
+        creator_id=COORD,
+        assignee_id=qa_id,
+        parent_task_id=parent_id,
+        tags=["verify", "mandatory"],
+        source="system",
+    )
+    parent = await ts.get_task(pid, parent_id)
+    with patch(
+        "hiveweave.services.org.OrgService.get_agent",
+        new=AsyncMock(side_effect=_agent_rows((qa_id, "qa_engineer"))),
+    ):
+        verify_id = await _spawn_post_approve_verify_task(ts, pid, COORD, parent)
+    assert verify_id == child
+    parent2 = await ts.get_task(pid, parent_id)
+    assert parent2["status"] == "verifying"
+    assert parent2["status"] != "closed"
+
+
+@pytest.mark.asyncio
 async def test_nudge_claims_then_obligation(task_env):
     """Merge/stale nudge claims VERIFY → then it becomes an assignee obligation."""
     ts = TaskService()
