@@ -124,6 +124,78 @@ def _verify_required_capabilities(parent_policy: str) -> list[str]:
     return ["test_run", "source_read"]
 
 
+async def _agent_is_qa(project_id: str, agent_id: str | None) -> bool:
+    """True when *agent_id* is the QA role family.
+
+    Structured only (role_family / role) — never scan the task title.
+    """
+    if not agent_id:
+        return False
+    try:
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.policy import infer_role_family
+
+        agent = await OrgService().get_agent(str(agent_id))
+        if not agent:
+            return False
+        return infer_role_family(agent) == "qa"
+    except Exception as e:
+        log.debug(
+            "verify_qa_agent_lookup_failed",
+            project_id=project_id,
+            agent_id=str(agent_id)[:12],
+            error=str(e),
+        )
+        return False
+
+
+async def _parent_implementer_is_qa(project_id: str, parent_task: dict) -> bool:
+    """Skip VERIFY only when the original implementer is QA.
+
+    ``implementer_id`` is pinned on first ``running`` and survives reassign.
+    Prefer it over ``assignee_id`` so executor work later handed to QA still
+    gets an independent VERIFY.
+    """
+    who = parent_task.get("implementer_id") or parent_task.get("assignee_id")
+    return await _agent_is_qa(project_id, who)
+
+
+async def _close_parent_without_verify(
+    ts: _task_svc.TaskService, project_id: str, parent_id: str
+) -> None:
+    """Post-merge: QA delivery needs no independent VERIFY child.
+
+    ``skip_merge_gate``: this runs only after a successful worktree merge
+    (spawn call sites are post-merge). The merge gate would otherwise
+    refuse close when the in-memory parent row still lacks merge facts.
+    """
+    try:
+        await ts.close_task(
+            project_id,
+            parent_id,
+            skip_merge_gate=True,
+            reason_code="qa_delivery_no_verify",
+        )
+    except Exception as e:
+        log.warning(
+            "verify_skip_parent_close_failed",
+            parent_id=parent_id,
+            error=str(e),
+        )
+        # Leave approved so migrate_orphan_approved can close after grace.
+        # mark_verifying without a child has no healer (stale nudge needs
+        # a VERIFY row; orphan migrate only scans approved).
+        return
+    try:
+        await nudge_pending_verify_tasks(project_id)
+    except Exception as e:
+        log.debug(
+            "verify_skip_pending_pump_failed",
+            parent_id=parent_id,
+            error=str(e),
+        )
+
+
 async def _spawn_post_approve_verify_task(
     ts: _task_svc.TaskService,
     project_id: str,
@@ -132,8 +204,11 @@ async def _spawn_post_approve_verify_task(
 ) -> str | None:
     """Create a mandatory VERIFY child after successful worktree merge.
 
-    Call sites: nudge_verify_tasks_after_merge only (not review_task approve).
+    Call sites: nudge_verify_tasks_after_merge / spawn_verify_for_approved_assignee
+    (post-merge only; not review_task approve).
     VERIFY stays created until merge/stale nudge claims it.
+    QA-family implementers skip spawn: the test delivery *is* the check;
+    parent closes instead of minting VERIFY-of-the-suite for a non-QA.
     """
     parent_id = parent_task.get("id")
     if not parent_id:
@@ -154,11 +229,12 @@ async def _spawn_post_approve_verify_task(
             reason="parent is already a VERIFY task",
         )
         return None
-    # ────────────────────────────────────────────────────────────────
     # Avoid spawning duplicate VERIFY children for the same parent.
     # B1 fix: 包含已归档任务 —— 否则已归档的 VERIFY 对去重不可见，
     # 同一父任务会重复 spawn 新 VERIFY。已归档 VERIFY 如果 status
     # 仍非 closed/approved，应阻止重复 spawn（它被取消了不代表可以无限重建）。
+    # Must run BEFORE the QA-delivery skip: an already-open child must not
+    # have its parent closed out from under it.
     existing = await ts.list_tasks(project_id, include_archived=True)
     for t in existing:
         # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不算）
@@ -173,8 +249,21 @@ async def _spawn_post_approve_verify_task(
                 pass
             return t.get("id")
 
-    title = parent_task.get("title") or "task"
     original_assignee = parent_task.get("assignee_id")
+    if await _parent_implementer_is_qa(project_id, parent_task):
+        log.info(
+            "verify_spawn_skipped_qa_delivery",
+            parent_task_id=parent_id,
+            parent_title=parent_title[:80],
+            implementer_id=parent_task.get("implementer_id"),
+            assignee_id=original_assignee,
+            reason="parent implementer is already QA; independent VERIFY would "
+            "re-test the test suite on a non-QA",
+        )
+        await _close_parent_without_verify(ts, project_id, parent_id)
+        return None
+
+    title = parent_task.get("title") or "task"
     from hiveweave.services.attestation import resolve_task_policy
 
     parent_tags = parent_task.get("tags") or []
@@ -184,11 +273,17 @@ async def _spawn_post_approve_verify_task(
         description=parent_task.get("description") or "",
     )
     required_caps = _verify_required_capabilities(parent_policy)
+    exclude_ids: set[str] = set()
+    if reviewer_id:
+        exclude_ids.add(str(reviewer_id))
+    impl_id = parent_task.get("implementer_id")
+    if impl_id:
+        exclude_ids.add(str(impl_id))
     qa_assignee = await _find_independent_qa(
         project_id,
         original_assignee=original_assignee,
-        # 合并人（通常=中层 builder）也不得自验 VERIFY
-        exclude_ids={str(reviewer_id)} if reviewer_id else None,
+        # 合并人（通常=中层 builder）与原实现者都不得自验 VERIFY
+        exclude_ids=exclude_ids or None,
         required_capabilities=required_caps,
     )
     caps_label = ", ".join(required_caps)
