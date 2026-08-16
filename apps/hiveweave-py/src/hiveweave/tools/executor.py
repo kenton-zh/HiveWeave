@@ -78,9 +78,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "`commit_turn(phase=waiting)` using that list; do not poll. "
             "Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout "
             "until done, `job_kill`, or project stop. Do not use "
-            "`background=true` for `vite` / `npm run dev` / `uvicorn`. "
-            "Long-running servers are auto-registered (tracked, killable); "
-            "prefer `start_dev_server`. Do not append `&` on a foreground "
+            "`background=true` for `vite` / `npm run dev` / `uvicorn` / "
+            "`python -m app.server`. Long-running servers are auto-registered "
+            "(tracked, killable via `stop_dev_server`); prefer "
+            "`start_dev_server`. Do not append `&` on a foreground "
             "command. Default false keeps stdout in this turn."
         ),
         "properties": {
@@ -528,11 +529,13 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "job_kill": {
         "description": (
-            "Request cancellation of a live background bash or "
-            "spawn_subagent job by job id (bg-bash-… / bg-sub-…). Returns "
-            "immediately; the job settles as killed once its work actually "
-            "stops. Woken with [BASH FAILED] / [SUBAGENT FAILED] if a wait "
-            "was armed."
+            "Cancel a live bg-bash-… or bg-sub-… job by job id only. "
+            "Registered dev servers are NOT jobs — use stop_dev_server / "
+            "lookup_dev_server. Allowed process cleanup: "
+            "`taskkill //PID <literal> //T //F` (never //IM, never "
+            "Stop-Process). Returns immediately; the job settles as killed "
+            "once its work actually stops. Woken with [BASH FAILED] / "
+            "[SUBAGENT FAILED] if a wait was armed."
         ),
         "type": "object",
         "properties": {
@@ -1461,7 +1464,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "Start the project Vite/dev server on a non-reserved port "
             "(never 4000/5173/4173). Registers pid/cwd/port. Prefer this "
-            "over bare npm run dev / vite. Extra env belongs in "
+            "over bare npm run dev / vite / python -m app.server. If this "
+            "project already has a live process on preferredPort, it is "
+            "stopped first (kill-before-start). Another project's process "
+            "on that port is never killed — a free port is chosen instead. "
+            "Stop with stop_dev_server. Extra env belongs in "
             ".hiveweave/env.sh or an inline VAR=x prefix."
         ),
         "properties": {
@@ -1480,6 +1487,29 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             },
         },
         "required": [],
+    },
+    "stop_dev_server": {
+        "description": (
+            "Stop this project's registered dev server on preferredPort. "
+            "Optional pid must match a registry pid for this project. "
+            "Uses taskkill /T /PID (never /IM or Stop-Process). Never "
+            "kills HiveWeave ports 4000/5173/4173. For bg-bash-/bg-sub- "
+            "jobs use job_kill instead."
+        ),
+        "properties": {
+            "preferredPort": {
+                "type": "integer",
+                "aliases": ["preferred_port", "port"],
+                "description": "Project port to stop. Must not be 4000/5173/4173.",
+            },
+            "pid": {
+                "type": "integer",
+                "description": (
+                    "Optional. Must match a registered pid for this project."
+                ),
+            },
+        },
+        "required": ["preferredPort"],
     },
     "lookup_dev_server": {
         "description": (
@@ -1510,7 +1540,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "One-shot LLM audit of your worktree diff. Required before "
             "submit_task when cumulative code edits exceed 20 lines. "
             "Returns VERDICT PASS/ISSUES; ISSUES do not block submit. "
-            "Runs on YOUR model (one extra LLM call)."
+            "Runs on a teammate's currently-used model when that model "
+            "differs from yours; otherwise your own model. One extra LLM call."
         ),
         "properties": {
             "taskId": {
@@ -1743,10 +1774,12 @@ class ToolExecutor:
         permission_service: PermissionService,
         approval_service: ApprovalService,
         review_llm_callback: ReviewLLMCallback | None = None,
+        oneshot_llm_callback: Any = None,
     ) -> None:
         self.permission = permission_service
         self.approval = approval_service
         self.review_llm_callback = review_llm_callback
+        self.oneshot_llm_callback = oneshot_llm_callback
         # Service instances for high-level orchestration tools
         self._org = OrgService()
         self._inbox = InboxService()
@@ -1799,6 +1832,7 @@ class ToolExecutor:
             permission=self.permission,
             approval=self.approval,
             review_llm_callback=self.review_llm_callback,
+            oneshot_llm_callback=self.oneshot_llm_callback,
             extra={"project_root": resolved_root},
         )
 

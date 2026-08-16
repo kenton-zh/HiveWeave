@@ -242,6 +242,22 @@ class ChatMessageService:
             )
             return False
 
+    _MSG_SELECT = (
+        "SELECT id, agent_id, role, content, thinking, tool_calls, "
+        "tool_call_id, is_streaming, is_background, is_read, is_context, "
+        "team_from_agent_id, team_to_agent_id, images, metadata, created_at "
+        "FROM chat_messages WHERE agent_id = ? "
+    )
+    # Chat 主栏：前台人话（真人 user + 对用户的 assistant）。
+    _PANEL_DIRECT_WHERE = (
+        "AND IFNULL(is_background, 0) = 0 AND role IN ('user', 'assistant') "
+    )
+    # 「团队沟通」信件栏：role=team 或 background user（trigger digest）。
+    # 不含 background assistant / 工具芯片。
+    _PANEL_OTHER_WHERE = (
+        "AND (role = 'team' OR (IFNULL(is_background, 0) = 1 AND role = 'user')) "
+    )
+
     async def get_messages(
         self, agent_id: str, limit: int = 200, offset: int = 0
     ) -> list[dict]:
@@ -249,24 +265,86 @@ class ChatMessageService:
 
         契约 17: DESC + reverse → 正序返回。异常返回 []（fail-empty）。
         R7 fix: 支持 offset 分页（DESC 结果上跳过 offset 条再取 limit 条）。
+
+        Mixed recency across all roles. Agent internals / debug pagination use
+        this. UI panes must use ``get_panel_messages`` so foreground chat is
+        not squeezed out by team/background traffic.
         """
         try:
-            rows = await project_db.query(
-                agent_id,
-                "SELECT id, agent_id, role, content, thinking, tool_calls, "
-                "tool_call_id, is_streaming, is_background, is_read, is_context, "
-                "team_from_agent_id, team_to_agent_id, images, metadata, created_at "
-                "FROM chat_messages WHERE agent_id = ? "
-                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                [agent_id, limit, offset])
-            return [self._row_to_msg(r) for r in reversed(rows)]
+            return await self._fetch_recent(agent_id, extra_where="", limit=limit, offset=offset)
         except Exception as e:
             log.warning("get_messages_failed", agent_id=agent_id, error=str(e))
             return []
 
+    async def get_panel_messages(
+        self,
+        agent_id: str,
+        *,
+        direct_limit: int = 100,
+        other_limit: int = 100,
+    ) -> list[dict]:
+        """Union of two capped windows for the Chat UI (chronological).
+
+        Mixed ``LIMIT 100`` on the whole table drops old foreground user/assistant
+        rows once team + background traffic fills the window — main pane empty,
+        「团队沟通」 still populated. Fetch each pane's recency independently,
+        then merge by created_at. Predicates match frontend filters
+        (displayMessages vs isTeamChannelMessage).
+        """
+        direct_limit = max(1, min(int(direct_limit), 500))
+        other_limit = max(1, min(int(other_limit), 500))
+        direct: list[dict] = []
+        other: list[dict] = []
+        try:
+            direct = await self._fetch_recent(
+                agent_id, extra_where=self._PANEL_DIRECT_WHERE, limit=direct_limit
+            )
+        except Exception as e:
+            # Direct fail must not 200 a team-only body — UI would replace
+            # the transcript with an empty main pane.
+            log.warning("get_panel_messages_direct_failed", agent_id=agent_id, error=str(e))
+            raise
+        try:
+            other = await self._fetch_recent(
+                agent_id, extra_where=self._PANEL_OTHER_WHERE, limit=other_limit
+            )
+        except Exception as e:
+            log.warning("get_panel_messages_other_failed", agent_id=agent_id, error=str(e))
+        return self._merge_panel_windows(direct, other)
+
     async def get_history(self, agent_id: str, limit: int = 200) -> list[dict]:
         """Alias for get_messages."""
         return await self.get_messages(agent_id, limit)
+
+    async def _fetch_recent(
+        self,
+        agent_id: str,
+        *,
+        extra_where: str,
+        limit: int,
+        offset: int = 0,
+    ) -> list[dict]:
+        rows = await project_db.query(
+            agent_id,
+            f"{self._MSG_SELECT}{extra_where}"
+            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            [agent_id, limit, offset],
+        )
+        return [self._row_to_msg(r) for r in reversed(rows)]
+
+    @staticmethod
+    def _merge_panel_windows(*windows: list[dict]) -> list[dict]:
+        by_id: dict[str, dict] = {}
+        for window in windows:
+            for msg in window:
+                mid = msg.get("id")
+                if mid is None:
+                    continue
+                by_id[str(mid)] = msg
+        return sorted(
+            by_id.values(),
+            key=lambda m: (int(m.get("created_at") or 0), str(m.get("id") or "")),
+        )
 
     async def update_streaming_messages_done(self, agent_id: str) -> None:
         """Mark all streaming messages for an agent as done (is_streaming=0).

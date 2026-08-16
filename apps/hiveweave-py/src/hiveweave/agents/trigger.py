@@ -88,6 +88,41 @@ async def _agent_name(agent_id: str) -> str:
     return agent_id
 
 
+def _merge_outstanding_digest_asks(
+    pending: list[dict], outstanding: list[dict]
+) -> list[dict]:
+    """Unread pending plus open-contract asks (even if read=1).
+
+    Dedup by ``reply_contract_id`` (fallback id). Does not mutate read flags;
+    caller must ACK only the original pending ids.
+    """
+    seen_cids: set[str] = set()
+    seen_ids: set[str] = set()
+    merged: list[dict] = []
+    for m in pending or []:
+        merged.append(m)
+        mid = m.get("id")
+        if mid:
+            seen_ids.add(str(mid))
+        cid = m.get("reply_contract_id")
+        if cid:
+            seen_cids.add(str(cid))
+    for m in outstanding or []:
+        cid = m.get("reply_contract_id")
+        mid = m.get("id")
+        if cid and str(cid) in seen_cids:
+            continue
+        if mid and str(mid) in seen_ids:
+            continue
+        merged.append(m)
+        if cid:
+            seen_cids.add(str(cid))
+        if mid:
+            seen_ids.add(str(mid))
+    merged.sort(key=lambda row: row.get("created_at") or 0)
+    return merged
+
+
 def _strip_goals_block(context: str) -> str:
     """Remove the Goals Workbook block from context to avoid duplicate display."""
     import re
@@ -701,18 +736,31 @@ async def build_trigger_context(
     # 获取 inbox 未读消息
     inbox_messages = await _inbox_service.get_pending_messages(agent_id)
 
+    # Ghost asks: contract still open even if completion already set read=1.
+    # Fetch BEFORE complete-skip so complete + only-ghost-asks still wakes.
+    # Inject into digest; do NOT ACK (keep original unread ids only).
+    try:
+        outstanding = await _inbox_service.get_outstanding_ask_messages(agent_id)
+    except Exception as e:
+        log.debug(
+            "trigger_outstanding_asks_failed",
+            agent_id=agent_id,
+            error=str(e),
+        )
+        outstanding = []
+
     # 获取 background 消息（wake=0 的 progress/ACK，不触发 LLM 但随本次
     # 触发捎带进上下文 —— BUGFIX: 此前这类消息写入即 read=1，永不进上下文，
     # 导致"验证通过/交付完成"等证据对接收方不可见）
     background_msgs = await _inbox_service.get_undelivered_background(agent_id)
 
-    # complete + no actionable wake=1 / handoffs → skip (don't burn quota on
-    # background-only progress/ACK 捎带)
+    # complete + no actionable wake=1 / handoffs / open ask contracts → skip
     manager = _get_agent_manager()
     live = manager.get_agent(agent_id) if manager else None
     if live is not None and getattr(live, "disposition", None) == "complete":
         if (
             not inbox_messages
+            and not outstanding
             and not pending_handoffs
             and not accepted_handoffs
         ):
@@ -722,6 +770,11 @@ async def build_trigger_context(
                 background=len(background_msgs),
             )
             return None
+
+    pending_for_ack = list(inbox_messages)
+    inbox_messages = _merge_outstanding_digest_asks(
+        inbox_messages, outstanding
+    )
 
     # Chronological inbox — no category ranking / priority digest.
     # Future: per-agent assistant model may triage; platform stays dumb.
@@ -894,7 +947,8 @@ async def build_trigger_context(
     # 收集 inbox 消息 ID（在 LLM 非空输出后标记已读 + 已交付）
     # background 消息 ID 一并并入：mark_read_by_ids 会同时置 read=1/delivered=1，
     # 输出失败/超时不标记 → 下次触发重试捎带（与 wake 消息同一可靠性语义）
-    inbox_msg_ids = [m["id"] for m in inbox_messages if m.get("id")]
+    # Ghost asks (read=1, contract still open) are digest-only — not ACK ids.
+    inbox_msg_ids = [m["id"] for m in pending_for_ack if m.get("id")]
     inbox_msg_ids += [m["id"] for m in background_msgs if m.get("id")]
 
     # 提取第一个非空 from_agent_id（用于 team chat 显示）

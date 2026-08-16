@@ -116,6 +116,8 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 
 未知 family 兜底 READONLY。CEO/HR 强制项目根（无 worktree）；executor + builder coordinator 由 `agent_gets_write_worktree()` 判定有 worktree。CEO（root）+ HR（CEO 下级）项目创建时自动创建，HR 招 expert agents。
 
+**团队开会（规格已定，未实现）：** [`docs/spec/team-meeting.md`](docs/spec/team-meeting.md)。不要用 inbox 群发或 `chat()`+skip `append_turn` 冒充开会。
+
 ## Game time
 
 `REAL_SECONDS_PER_GAME_DAY = 3600` (1 real hour per game day). 5s tick persists time + fires alarms. 每 30s 扫 orphan streaming.

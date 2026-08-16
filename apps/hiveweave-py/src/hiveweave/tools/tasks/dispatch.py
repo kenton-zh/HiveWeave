@@ -31,6 +31,30 @@ _COORDINATOR_ASSIGNEE_BLOCK = (
 # 保留常量名供旧测试/文档引用；语义已改为硬门文案前缀
 _READONLY_ASSIGNEE_REMINDER = _COORDINATOR_ASSIGNEE_BLOCK
 
+_SHARED_ARTIFACT_PREFIX = ".hiveweave/shared"
+
+
+def _is_shared_artifact_ref(ref_clean: str) -> bool:
+    """True for ``.hiveweave/shared`` itself or a file/dir under it."""
+    n = (ref_clean or "").replace("\\", "/")
+    return n == _SHARED_ARTIFACT_PREFIX or n.startswith(
+        _SHARED_ARTIFACT_PREFIX + "/"
+    )
+
+
+def _is_invisible_hiveweave_ref(ref_clean: str) -> bool:
+    """True when a ref is under ``.hiveweave/`` but not the shared draft tree.
+
+    Canonical contracts live in ``docs/``. ``.hiveweave/shared/`` is
+    git-tracked draft/collab and is visible cross-worktree.
+    """
+    n = (ref_clean or "").replace("\\", "/")
+    if ".hiveweave/" not in n and not n.startswith(".hiveweave"):
+        return False
+    if _is_shared_artifact_ref(n):
+        return False
+    return True
+
 
 async def _get_assignee_permission_type(
     agent_id: str, org_service: Any = None
@@ -240,6 +264,7 @@ async def dispatch_task_tool(
     # P1-2: artifact_refs existence validation at dispatch time.
     # Catches "spec file not visible" bugs immediately (creator-side check).
     artifact_warnings: list[str] = []
+    shared_refs_ok = False
     if params.artifact_refs:
         from pathlib import Path as _P
 
@@ -262,14 +287,17 @@ async def dispatch_task_tool(
             ref_clean = normalize_evidence_path(ref)
             if not ref_clean:
                 continue
-            # .hiveweave/ paths are gitignored → invisible cross-worktree
-            if ".hiveweave/" in ref_clean or ref_clean.startswith(".hiveweave"):
+            # Private .hiveweave/ paths are invisible cross-worktree.
+            # .hiveweave/shared/ is git-tracked draft/collab — allow + exist-check.
+            if _is_invisible_hiveweave_ref(ref_clean):
                 artifact_warnings.append(
                     f"PATH INVISIBLE: '{ref_clean}' is under .hiveweave/ "
                     f"(gitignored, not visible to other agents). "
                     f"Move shared specs to docs/ or a git-tracked path."
                 )
                 continue
+            if _is_shared_artifact_ref(ref_clean):
+                shared_refs_ok = True
             # Check existence in main workspace and/or assignee worktree
             found = False
             if main_ws and (_P(main_ws) / ref_clean).exists():
@@ -308,6 +336,11 @@ async def dispatch_task_tool(
             f"Task dispatched to {result.get('to_agent_id', resolved_id)} "
             f"(task_id={result.get('task_id', '')})"
         )
+        if shared_refs_ok:
+            output += (
+                " Note: .hiveweave/shared is draft/collab; "
+                "canonical contracts live in docs/."
+            )
         if artifact_warnings:
             output += (
                 "\n\n⚠ ARTIFACT_REF WARNINGS:\n"

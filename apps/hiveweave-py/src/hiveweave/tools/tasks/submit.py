@@ -695,7 +695,7 @@ async def submit_task_tool(
             from hiveweave.services.code_audit import (
                 CODE_AUDIT_KIND,
                 CODE_AUDIT_LINE_THRESHOLD,
-                CODE_AUDIT_REMINDER,
+                code_audit_submit_reminder,
                 get_last_change_ts,
                 get_unaudited_lines,
                 reset_ledger,
@@ -710,7 +710,7 @@ async def submit_task_tool(
                     and latest.get("created_at", 0) >= get_last_change_ts(agent_id) * 1000
                 )
                 if not audited_after_changes:
-                    audit_reminder = f"\n{CODE_AUDIT_REMINDER}"
+                    audit_reminder = f"\n{code_audit_submit_reminder(agent_id)}"
             reset_ledger(agent_id)
         except Exception as e:  # noqa: BLE001
             log.debug("submit_code_audit_reminder_failed", error=str(e))

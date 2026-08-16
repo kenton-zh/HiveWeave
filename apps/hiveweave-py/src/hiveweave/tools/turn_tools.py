@@ -260,6 +260,21 @@ async def commit_turn_tool(
                                 steps += " 项目级待办: " + "；".join(
                                     details[:6]
                                 )
+                        if "UNREPLIED_ASKS" in hard:
+                            from hiveweave.services.turn_exit import (
+                                _unreplied_ask_contracts,
+                                format_unreplied_ask_reject_suffix,
+                            )
+
+                            try:
+                                ask_bits = await _unreplied_ask_contracts(
+                                    agent_id
+                                )
+                            except Exception:
+                                ask_bits = []
+                            steps += format_unreplied_ask_reject_suffix(
+                                ask_bits
+                            )
                         return ToolResult.err(
                             f"commit_turn REJECTED (synchronous gate): "
                             + steps

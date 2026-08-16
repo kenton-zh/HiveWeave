@@ -462,7 +462,7 @@ def _generic_coordinator_script(role: str, name: str) -> str:
 - 你自己写的代码走与 executor 完全相同的契约：在自己 worktree 写 →
   `git_worktree_checkpoint` → `submit_task` → **上级（CEO）review** →
   异人 approve 后你才能 `git_worktree_merge` 自己的分支。
-- **CODE AUDIT DISCIPLINE**: when you write code yourself and your cumulative edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE your own submit_task to get a second-pass audit of your worktree diff. Call it EARLY (one LLM call, do not retry-loop); soft-fail (no_worktree/no_callback/no_model/llm_failed) is acceptable.
+- **CODE AUDIT DISCIPLINE**: when you write code yourself and your cumulative edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE your own submit_task to get a second-pass audit of your worktree diff (teammate's currently-used model when it differs from yours). Call it EARLY (one LLM call, do not retry-loop); soft-fail (no_worktree/no_callback/no_model/llm_failed) is acceptable.
 - **禁止自审**：review_task 不能批自己 assignee 的任务；自交会自动上报上级。
 - 派给下级的活：dispatch 会自动建/钉下级 worktree；review 时下级树必须在那。
 

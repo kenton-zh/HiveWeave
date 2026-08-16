@@ -18,6 +18,82 @@ from hiveweave.tools import helpers as _helpers
 
 log = structlog.get_logger(__name__)
 
+# get_tasks / claim 撞锁文案：锁在 VERIFY closed/cancelled 时释放，不是 claimed。
+VERIFY_LOCK_UNLOCK_HINT = (
+    "unlocks when that VERIFY reaches closed/cancelled (not when claimed); "
+    "no estimated duration"
+)
+
+# Executor-owned in-flight VERIFY statuses. submitted/reviewing stall is the
+# reviewer's job (LEDGER REVIEW) — reassigning QA would undo submit and still
+# not release the serial lock until close.
+_VERIFY_EXECUTOR_STALL_STATUSES = frozenset({"claimed", "running", "rework"})
+
+
+def format_assignee_lock_label(agent: dict | None, agent_id: str | None) -> str:
+    """short_id + name if present; fail-open to id prefix."""
+    aid = str(agent_id or "").strip()
+    if agent:
+        sid = str(agent.get("short_id") or "").strip()
+        name = str(agent.get("name") or "").strip()
+        if sid and name:
+            return f"{sid} ({name})"
+        if sid:
+            return sid
+        if name:
+            return f"{name} ({aid[:12] or '?'})"
+    if aid:
+        return aid[:12]
+    return "?"
+
+
+async def resolve_verify_holder_assignee_label(holder: dict | None) -> str:
+    """Resolve in-flight VERIFY assignee to short_id + name. Fail-open."""
+    if not holder:
+        return "?"
+    aid = str(holder.get("assignee_id") or "").strip()
+    if not aid:
+        return "?"
+    try:
+        from hiveweave.services.org import OrgService
+
+        agent = await OrgService().get_agent(aid)
+        return format_assignee_lock_label(agent, aid)
+    except Exception:
+        return aid[:12]
+
+
+async def verify_serialize_claim_blocked_message(
+    *,
+    task_id: str,
+    blocker: dict,
+) -> str:
+    """Failed-claim hint: who holds the serial lock and when it unlocks."""
+    bid = str(blocker.get("id") or "")[:8]
+    bstatus = blocker.get("status")
+    label = await resolve_verify_holder_assignee_label(blocker)
+    tid8 = str(task_id or "")[:8]
+    if bstatus == "blocked":
+        return (
+            f"Task {tid8} is a VERIFY task and blocked "
+            f"VERIFY {bid} (assignee={label}) currently holds the shared MAIN "
+            f"runtime (it has an auto-unblock path: "
+            f"depends_on/timer). This task stays queued as "
+            f"'created' — the platform wakes you via inbox "
+            f"when MAIN frees ({VERIFY_LOCK_UNLOCK_HINT}). Do NOT retry "
+            f"claim_task; commit_turn(waiting) or work other tasks."
+        )
+    return (
+        f"Task {tid8} is a VERIFY task and another "
+        f"VERIFY ({bid}, {bstatus}, assignee={label}) is in flight on the "
+        f"shared MAIN runtime (verification is serialized: "
+        f"one at a time). This task stays queued as 'created' "
+        f"— the platform will wake you via inbox when MAIN "
+        f"is free ({VERIFY_LOCK_UNLOCK_HINT}). Do NOT retry claim_task on it; "
+        f"commit_turn(waiting) or work on your other tasks "
+        f"meanwhile."
+    )
+
 
 class _VerifySerializeLock:
     """Per-project 验收串行化锁（同 task 可重入、跨 task 互斥）。
@@ -851,6 +927,213 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
             pending_serialized=pending,
         )
     return reattached
+
+
+async def maybe_reassign_stalled_verify(
+    project_id: str,
+    task: dict,
+    *,
+    agents_by_id: dict[str, dict] | None = None,
+) -> bool:
+    """Reassign a stalled in-flight VERIFY executor, or inbox the coordinator.
+
+    Call from TASK STALL escalation. Never auto-approves, never skips the
+    serial lock, never reassigns to the implementer / merger / current QA.
+    Returns True if this path handled the stall (reassigned or coordinator
+    notified). Fail-open: log and return False on error so generic stall
+    can still fire.
+    """
+    if not is_verify_title(task.get("title")):
+        return False
+    status = str(task.get("status") or "")
+    if status not in _VERIFY_EXECUTOR_STALL_STATUSES:
+        return False
+    tid = str(task.get("id") or "")
+    current = str(task.get("assignee_id") or "")
+    if not tid or not current:
+        return False
+
+    ts = _task_svc.TaskService()
+    by_id = dict(agents_by_id or {})
+    if not by_id:
+        try:
+            from hiveweave.services.org import OrgService
+
+            agents = await OrgService().list_agents(project_id)
+            by_id = {a.get("id"): a for a in agents if a.get("id")}
+        except Exception as e:
+            log.debug("verify_exec_stall_org_failed", error=str(e))
+
+    parent = None
+    parent_id = task.get("parent_task_id")
+    if parent_id:
+        try:
+            parent = await ts.get_task(project_id, str(parent_id))
+        except Exception:
+            parent = None
+    implementer = None
+    if parent:
+        implementer = parent.get("implementer_id") or parent.get("assignee_id")
+    ev = task.get("evidence") or {}
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except Exception:
+            ev = {}
+    if not isinstance(ev, dict):
+        ev = {}
+    exclude: set[str] = {current}
+    merged_by = ev.get("merged_by")
+    if merged_by:
+        exclude.add(str(merged_by))
+    if implementer:
+        exclude.add(str(implementer))
+    req_caps = ev.get("required_capabilities")
+    try:
+        qa = await _find_independent_qa(
+            project_id,
+            original_assignee=str(implementer) if implementer else None,
+            exclude_ids=exclude,
+            required_capabilities=(
+                req_caps if isinstance(req_caps, list) else None
+            ),
+        )
+    except Exception as e:
+        log.warning(
+            "verify_exec_stall_find_qa_failed",
+            project_id=project_id,
+            task_id=tid,
+            error=str(e),
+        )
+        return False
+
+    title = (task.get("title") or "(untitled)").split("\n")[0][:50]
+    coordinator = str((by_id.get(current) or {}).get("parent_id") or "")
+    creator = str(task.get("creator_id") or "")
+
+    from hiveweave.services.inbox import InboxService
+
+    inbox = InboxService()
+
+    if not qa or str(qa) in exclude:
+        # No other independent QA — do not invent a hire; tell coordinator.
+        dest = coordinator or creator
+        if not dest:
+            log.info(
+                "verify_exec_stall_no_qa_no_dest",
+                project_id=project_id,
+                task_id=tid,
+            )
+            return False
+        try:
+            await inbox.send_message(
+                from_agent_id="system",
+                to_agent_id=dest,
+                message=(
+                    f"[VERIFY EXECUTOR STALL] VERIFY '{title}' ({tid[:8]}) "
+                    f"stuck in {status} with assignee {current[:12]}. "
+                    f"No other independent QA (≠ implementer, ≠ current "
+                    f"assignee, ≠ merger). Serial lock still held until this "
+                    f"VERIFY is closed/cancelled — do not auto-approve. "
+                    f"Hire or reassign a QA if needed."
+                ),
+                message_type="task",
+                priority="urgent",
+                task_id=tid,
+                wake=True,
+            )
+        except Exception as e:
+            log.warning(
+                "verify_exec_stall_no_qa_inbox_failed",
+                task_id=tid,
+                error=str(e),
+            )
+            return False
+        log.info(
+            "verify_exec_stall_no_qa",
+            project_id=project_id,
+            task_id=tid,
+            notified=dest,
+        )
+        return True
+
+    try:
+        await ts.reassign_task(
+            project_id,
+            tid,
+            new_assignee_id=str(qa),
+            reassigned_by="system",
+            reason="verify_executor_stall",
+        )
+    except Exception as e:
+        log.warning(
+            "verify_exec_stall_reassign_failed",
+            project_id=project_id,
+            task_id=tid,
+            error=str(e),
+        )
+        return False
+
+    leaders = []
+    for rid in (coordinator, creator):
+        if rid and rid not in leaders and rid not in (current, str(qa)):
+            leaders.append(rid)
+    body_leaders = (
+        f"[VERIFY EXECUTOR STALL] VERIFY '{title}' ({tid[:8]}) stuck in "
+        f"{status}. Reassigned from {current[:12]} to {str(qa)[:12]} "
+        f"(independent QA). Serial lock stays on this VERIFY until "
+        f"closed/cancelled — not auto-approved."
+    )
+    try:
+        for rid in leaders:
+            await inbox.send_message(
+                from_agent_id="system",
+                to_agent_id=rid,
+                message=body_leaders,
+                message_type="task",
+                priority="urgent",
+                task_id=tid,
+                wake=True,
+            )
+        await inbox.send_message(
+            from_agent_id="system",
+            to_agent_id=str(qa),
+            message=(
+                f"[VERIFY EXECUTOR STALL] You are now the assignee of "
+                f"VERIFY '{title}' (taskId={tid}, status={status}). "
+                f"Previous assignee stalled. Continue verification on MAIN, "
+                f"then submit_task. Do not wait for the previous QA."
+            ),
+            message_type="task",
+            priority="urgent",
+            task_id=tid,
+            wake=True,
+        )
+    except Exception as e:
+        log.warning(
+            "verify_exec_stall_notify_failed",
+            task_id=tid,
+            error=str(e),
+        )
+    try:
+        from hiveweave.agents.trigger import trigger_subordinate
+
+        await trigger_subordinate(str(qa))
+    except Exception as e:
+        log.warning(
+            "verify_exec_stall_wake_failed",
+            task_id=tid,
+            qa=str(qa)[:12],
+            error=str(e),
+        )
+    log.info(
+        "verify_exec_stall_reassigned",
+        project_id=project_id,
+        task_id=tid,
+        from_assignee=current[:12],
+        to_assignee=str(qa)[:12],
+    )
+    return True
 
 
 # Stale VERIFY child under a verifying parent (ms) — matches stall cooldown scale

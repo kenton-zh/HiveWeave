@@ -523,6 +523,11 @@ async def test_build_trigger_context_wires_hook(env, monkeypatch):
     monkeypatch.setattr(trigger_module._inbox_service,
                         "get_undelivered_background",
                         fake_undelivered_background)
+    monkeypatch.setattr(
+        trigger_module._inbox_service,
+        "get_outstanding_ask_messages",
+        fake_pending_messages,
+    )
     monkeypatch.setattr(trigger_module, "_agent_name", fake_agent_name)
 
     from hiveweave.hooks import TRIGGER_CONTEXT_BUILD, hooks

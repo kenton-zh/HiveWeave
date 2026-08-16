@@ -102,6 +102,11 @@ async def ensure_executor_worktree(
     Without open tasks, missing trees stay missing — close-GC / heal must
     not fight each other.
 
+    Exception: a *broken binding* (``workspace_path`` set but the dir is
+    missing or has no ``.git``) overrides idle-skip so ensure recreates
+    instead of leaving a stale path. Empty path after merge GC still skips.
+    A healthy ``-b/-c/-d`` relocate that has git is already returned above.
+
     task_name: DEPRECATED — 保留兼容旧调用方, 不再参与分支命名;
     task_id 驱动 P0 稳定命名 (hw/<sid>/t-<id8>)。
 
@@ -200,22 +205,34 @@ async def ensure_executor_worktree(
             from .reconcile import _assignee_needs_write_worktree
 
             if not await _assignee_needs_write_worktree(ws, short_id):
-                log.info(
-                    "worktree_recreate_skipped_no_open_tasks",
-                    agent_id=agent_id,
-                    short_id=short_id,
-                    project_id=project_id,
-                    task_id=task_id,
-                )
-                return {
-                    "success": False,
-                    "skipped": True,
-                    "short_id": short_id,
-                    "message": (
-                        "worktree recreate skipped: no in-flight write tasks "
-                        f"for {short_id}"
-                    ),
-                }
+                # Broken binding (DB path set, dir missing or no .git)
+                # overrides idle-skip. Empty path after merge GC still skips.
+                if cur and not _has_git(cur):
+                    log.info(
+                        "worktree_recreate_broken_binding",
+                        agent_id=agent_id,
+                        short_id=short_id,
+                        project_id=project_id,
+                        workspace_path=cur,
+                        task_id=task_id,
+                    )
+                else:
+                    log.info(
+                        "worktree_recreate_skipped_no_open_tasks",
+                        agent_id=agent_id,
+                        short_id=short_id,
+                        project_id=project_id,
+                        task_id=task_id,
+                    )
+                    return {
+                        "success": False,
+                        "skipped": True,
+                        "short_id": short_id,
+                        "message": (
+                            "worktree recreate skipped: no in-flight write tasks "
+                            f"for {short_id}"
+                        ),
+                    }
 
     gwt = GitWorktreeService()
     name = task_name or agent.get("role") or "task"
@@ -402,9 +419,11 @@ async def heal_project_executor_worktrees(project_id: str) -> dict:
                 recovered += 1
                 bound = live
         if sid and not await _assignee_needs_write_worktree(ws, sid):
-            if await _assignee_is_verify_only(ws, sid) or not (
-                bound and _has_git(bound)
-            ):
+            # Idle skip: empty path (merge GC cleaned) or VERIFY-only.
+            # Leftover path with no .git is a broken binding — fall through
+            # so ensure_executor_worktree recreates. Live trees fall through
+            # too (ensure is idempotent / already-bound).
+            if await _assignee_is_verify_only(ws, sid) or not bound:
                 skipped_idle += 1
                 log.debug(
                     "worktree_heal_skipped_no_open_tasks",

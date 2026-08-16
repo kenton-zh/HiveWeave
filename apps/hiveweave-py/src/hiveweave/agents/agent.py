@@ -212,10 +212,8 @@ async def _review_llm_post_with_retry(
                             raise classified from exc
                         raise
             data = resp.json()
-            choices = data.get("choices", [])
-            if choices:
-                return (choices[0].get("message") or {}).get("content") or ""
-            return ""
+            from hiveweave.services.vision import extract_nonstream_text
+            return extract_nonstream_text(data) if isinstance(data, dict) else ""
         except RetryableError as exc:
             last_exc = exc
             if attempt >= max_retries:
@@ -388,6 +386,7 @@ class Agent:
         self._tool_executor = ToolExecutor(
             permission_service, approval_service,
             review_llm_callback=self._review_llm_callback,
+            oneshot_llm_callback=self._oneshot_llm,
         )
         self._conversation = conversation_store
         self._inbox = InboxService()
@@ -1500,24 +1499,17 @@ class Agent:
             log.debug("model_failover_resolve_failed", error=str(e))
             return None
 
-    async def _review_llm_callback(self, system_prompt: str, user_prompt: str) -> str:
-        """LLM callback for review tools — makes a non-streaming LLM call.
+    async def _oneshot_llm(
+        self, model_config: dict, system_prompt: str, user_prompt: str,
+    ) -> str:
+        """Non-streaming completion on an explicit model config.
 
-        Uses the agent's model config + provider to call the LLM with
-        system_prompt + user_prompt and return the text response.
-        This is used by run_code_review / run_tests / request_code_audit / etc.
-
-        持全局 LLM 信号量（与流式调用同帽；信号量只在 HTTP 请求级占槽，
-        tool 执行期间父 stream 已释放，无自死锁）。
-
-        重试（_review_llm_post_with_retry）：首读固定 90s（原单发语义），
-        重试窗口 45s + 最多额外 1 次。连接类异常 / 429+5xx 可重试；其他
-        4xx 与内容层错误直接上抛。最坏 ≈ 首读 90s + 重试读 10s ≈ 100s <
-        120s 工具预算，不会被 asyncio.wait_for 强取消。
+        Shared by review tools (author's model) and request_code_audit
+        (peer model when the live team has another family). Same HTTP
+        retry / semaphore as ``_review_llm_callback``.
         """
-        model_config = await self._get_model_config()
-        if model_config is None:
-            raise NoModelConfiguredError("No model configured for review LLM callback")
+        if not model_config:
+            raise NoModelConfiguredError("No model configured for oneshot LLM")
 
         from hiveweave.llm.provider import provider_factory
         provider = provider_factory.create(model_config)
@@ -1531,7 +1523,6 @@ class Agent:
             temperature=0.3,
         )
         headers = provider.build_headers()
-        # Non-streaming: override Accept header
         headers["Accept"] = "application/json"
 
         from hiveweave.llm.streamer.constants import _get_llm_semaphore
@@ -1539,6 +1530,27 @@ class Agent:
         return await _review_llm_post_with_retry(
             provider.build_url(), body, headers, _get_llm_semaphore()
         )
+
+    async def _review_llm_callback(self, system_prompt: str, user_prompt: str) -> str:
+        """LLM callback for review tools — makes a non-streaming LLM call.
+
+        Uses the agent's model config + provider to call the LLM with
+        system_prompt + user_prompt and return the text response.
+        This is used by run_code_review / run_tests / etc.
+        request_code_audit uses ``_oneshot_llm`` with a peer-team model.
+
+        持全局 LLM 信号量（与流式调用同帽；信号量只在 HTTP 请求级占槽，
+        tool 执行期间父 stream 已释放，无自死锁）。
+
+        重试（_review_llm_post_with_retry）：首读固定 90s（原单发语义），
+        重试窗口 45s + 最多额外 1 次。连接类异常 / 429+5xx 可重试；其他
+        4xx 与内容层错误直接上抛。最坏 ≈ 首读 90s + 重试读 10s ≈ 100s <
+        120s 工具预算，不会被 asyncio.wait_for 强取消。
+        """
+        model_config = await self._get_model_config()
+        if model_config is None:
+            raise NoModelConfiguredError("No model configured for review LLM callback")
+        return await self._oneshot_llm(model_config, system_prompt, user_prompt)
 
     async def _get_tool_definitions(self) -> list[dict]:
         """获取工具定义列表（family-aware；硬能力由 PolicyService 在 evaluate 时再挡）。"""

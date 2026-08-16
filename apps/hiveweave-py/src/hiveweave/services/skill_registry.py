@@ -1023,6 +1023,9 @@ class SkillRegistryService:
     # HR 调 list_available_skills 后，结果按序号存入此缓存。
     # hire_agent 的 skills 参数接受 "#1" 格式，从此缓存解析为真实 slug。
     _skill_search_cache: dict[str, list[str]] = {}
+    # 最近一次 list_available_skills 的市场 slug（本 call 的 remote 结果）。
+    # hire 门槛只用这个，不用上面的累计 #N 缓存。
+    _skill_search_last: dict[str, list[str]] = {}
 
     async def _search_skills_sh(self, search: str | None = None) -> list[dict] | None:
         """搜索 skills.sh marketplace（8s 超时）。
@@ -1644,7 +1647,9 @@ class SkillRegistryService:
                 candidates.append(short)
         return candidates
 
-    async def _resolve_marketplace_skill(self, slug: str) -> tuple[dict | None, str]:
+    async def _resolve_marketplace_skill(
+        self, slug: str, *, allow_remote: bool = True
+    ) -> tuple[dict | None, str]:
         """统一市场详情解析：skills.sh（国外）优先，不可达时降级 SkillHub（国内）。
 
         与 list_available_skills 的搜索路由保持同一契约，供 hire_agent 校验与
@@ -1660,6 +1665,8 @@ class SkillRegistryService:
         依次尝试 skills.sh → SkillHub；商店在探测 TTL 内已知不可达时跳过。
         成功结果写入 _resolve_cache，会话内重复解析不重复发网络请求。
         """
+        if not allow_remote:
+            return None, ""
         if slug in SkillRegistryService._resolve_cache:
             expires_at, cached_detail, cached_label = SkillRegistryService._resolve_cache[slug]
             if time.monotonic() < expires_at:
@@ -1695,7 +1702,10 @@ class SkillRegistryService:
     # ── 公共 API：技能发现 ───────────────────────────────────
 
     async def list_available_skills(
-        self, search: str | None = None, agent_id: str | None = None
+        self,
+        search: str | None = None,
+        agent_id: str | None = None,
+        workspace_path: str | None = None,
     ) -> str:
         """列出所有可用技能（外部 + 内置 + 远程商店），返回带序号的格式化字符串。
 
@@ -1703,6 +1713,7 @@ class SkillRegistryService:
         1. 优先尝试 skills.sh（国外）
         2. skills.sh 不可达 → 自动降级到 SkillHub（国内）
         3. 两者都不可用 → 仅返回 外部 + 内置
+        4. eval sealed 工作区跳过远程商店（Harbor 对照：无出站技能搜索）
 
         如果传入 agent_id，搜索结果会按序号存入 per-agent 缓存，
         之后 hire_agent 的 skills 参数可用 "#1" 格式引用。
@@ -1712,8 +1723,16 @@ class SkillRegistryService:
         # ── 远程商店自动路由 ──
         remote_skills: list[dict] = []
         remote_source_label = ""
+        sealed = False
+        if workspace_path:
+            from hiveweave.services.eval_seal import is_eval_sealed
 
-        skills_sh = await self._search_skills_sh(search)
+            sealed = is_eval_sealed(workspace_path)
+
+        if sealed:
+            skills_sh = []
+        else:
+            skills_sh = await self._search_skills_sh(search)
         if skills_sh is None:
             # skills.sh 不可达 → 自动降级到 SkillHub 国内商店
             log.debug("skills_sh_unreachable_fallback_skillhub", search=search)
@@ -1724,6 +1743,8 @@ class SkillRegistryService:
             remote_source_label = "skills.sh Marketplace"
 
         if not builtin and not remote_skills:
+            if agent_id:
+                self._skill_search_last[agent_id] = []
             return (
                 f'Available Skills'
                 f'{f" (search: {chr(34)}{search}{chr(34)})" if search else ""}:\n\n'
@@ -1731,20 +1752,15 @@ class SkillRegistryService:
                 "To bind a skill, use `bind_skill` with the slug as skillName."
             )
 
+        # Last-search market slugs for the hire gate (this call only).
+        # Numbered cache still accumulates for "#N" resolution.
+        last_market = [s["slug"] for s in remote_skills if s.get("slug")]
+        if agent_id:
+            self._skill_search_last[agent_id] = last_market
+
         # 所有结果统一编号，存入 per-agent 缓存
         # 序号从缓存已有数量 +1 开始，确保多次搜索序号连续且唯一
         existing_cache = self._skill_search_cache.get(agent_id, []) if agent_id else []
-        if not remote_skills and existing_cache:
-            # 市场不可达（或本次搜索无市场结果）：旧的市场 slug 已不可绑。
-            # 清掉避免 hire 门槛误伤——否则 tail 提示 "bind built-in skills"
-            # 但 gate 仍因缓存里的过期市场 slug 拒绝，会话内死锁。
-            # 内置 slug 保留，序号仍连续。
-            existing_cache = [
-                s for s in existing_cache
-                if SkillRegistryService._get_builtin_skill(s) is not None
-            ]
-            if agent_id:
-                self._skill_search_cache[agent_id] = existing_cache
         all_slugs: list[str] = []
         lines: list[str] = []
         idx = len(existing_cache)  # 续编号
@@ -1786,22 +1802,30 @@ class SkillRegistryService:
 
         q = chr(34)
         header = f'Available Skills{f" (search: {q}{search}{q})" if search else ""}:\n\n'
-        tail = (
-            "\n\nIMPORTANT: hire_agent REQUIRES at least one marketplace skill "
-            "when marketplace results are available. Pass market skills via "
-            '"#N" or their full slug in hire_agent skills.'
-        )
-        if remote_skills:
-            tail += (
-                " To find more, re-run list_available_skills with a keyword "
-                "describing the specialty (e.g. \"frontend\", \"testing\", "
-                '"game", "three") — the marketplace index covers ~20k skills.'
+        if sealed:
+            tail = (
+                "\n\nEval sealed: remote marketplace skipped. "
+                "Hire with built-in discipline slugs only "
+                "(self-review, incremental-implementation, …). "
+                "Do not invent skills.sh slugs."
             )
         else:
-            tail += (
-                " Marketplace is currently unreachable — search again later "
-                "or bind built-in skills for now."
+            tail = (
+                "\n\nIMPORTANT: hire_agent REQUIRES at least one marketplace skill "
+                "when marketplace results are available. Pass market skills via "
+                '"#N" or their full slug in hire_agent skills.'
             )
+            if remote_skills:
+                tail += (
+                    " To find more, re-run list_available_skills with a keyword "
+                    "describing the specialty (e.g. \"frontend\", \"testing\", "
+                    '"game", "three") — the marketplace index covers ~20k skills.'
+                )
+            else:
+                tail += (
+                    " Marketplace is currently unreachable — search again later "
+                    "or bind built-in skills for now."
+                )
         return (
             header
             + "\n".join(lines)
@@ -1868,7 +1892,10 @@ class SkillRegistryService:
         )
 
     async def read_skill(
-        self, slug: str, bound_skills: list[str] | None = None
+        self,
+        slug: str,
+        bound_skills: list[str] | None = None,
+        workspace_path: str | None = None,
     ) -> str:
         """读取技能全文（外部 → 内置 → skills.sh）。
 
@@ -1890,7 +1917,11 @@ class SkillRegistryService:
             return f"{prefix}{skill['instructions']}"
 
         # 3. 远程市场（skills.sh 优先，不可达降级 SkillHub 国内）
-        detail, _source = await self._resolve_marketplace_skill(slug)
+        from hiveweave.services.eval_seal import is_eval_sealed
+
+        detail, _source = await self._resolve_marketplace_skill(
+            slug, allow_remote=not is_eval_sealed(workspace_path)
+        )
         if detail is not None:
             return f"{prefix}{detail.get('skill_md') or detail.get('summary') or 'No instructions available.'}"
 
@@ -1926,8 +1957,13 @@ class SkillRegistryService:
             return {"ok": False, "error": f"Agent '{agent_id}' not found"}
 
         # 1. 检查技能存在（外部/内置 → 市场：skills.sh 优先，不可达降级 SkillHub）
+        from hiveweave.services.eval_seal import is_agent_eval_sealed
+
+        allow_remote = not is_agent_eval_sealed(agent)
         if self._get_builtin_skill(skill_name) is None:
-            detail, _source = await self._resolve_marketplace_skill(skill_name)
+            detail, _source = await self._resolve_marketplace_skill(
+                skill_name, allow_remote=allow_remote
+            )
             if detail is None:
                 return {"ok": False, "error": f"Skill '{skill_name}' not found"}
 

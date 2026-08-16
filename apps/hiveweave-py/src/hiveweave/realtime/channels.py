@@ -434,7 +434,7 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
     # ensure_project_booted — 崩溃恢复机制
     await _ensure_agent_running(agent_id, agent_config)
 
-    # 获取历史消息（50 条）
+    # 获取历史消息（50 条混合窗口；Chat 主栏走 REST 分栏，不在此灌胖 payload）
     chat_service = ChatMessageService()
     try:
         history = await chat_service.get_messages(agent_id, limit=JOIN_HISTORY_LIMIT)

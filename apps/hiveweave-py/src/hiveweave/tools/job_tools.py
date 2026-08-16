@@ -22,10 +22,12 @@ class JobKillParams(BaseModel):
 
 @tool(
     "job_kill",
-    "Request cancellation of a live background bash or spawn_subagent job "
-    "by job id. Returns immediately; the job settles as killed once its work "
-    "actually stops. Woken with [BASH FAILED] / [SUBAGENT FAILED] if a wait "
-    "was armed.",
+    "Cancel a live bg-bash-… or bg-sub-… job by job id only. "
+    "Registered dev servers are NOT jobs — use stop_dev_server / "
+    "lookup_dev_server. Allowed process cleanup: "
+    "`taskkill //PID <literal> //T //F` (never //IM, never Stop-Process). "
+    "Returns immediately; the job settles as killed once its work actually "
+    "stops. Woken with [BASH FAILED] / [SUBAGENT FAILED] if a wait was armed.",
     requires_workspace=False,
     security_level="standard",
 )

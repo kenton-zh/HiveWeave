@@ -76,6 +76,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     # merge/remove only — create is system-side on dispatch/hire
     "git_worktree_merge", "git_worktree_remove",
     "start_dev_server",
+    "stop_dev_server",
     # 写码/验证工具
     "edit_file", "apply_patch", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
@@ -109,6 +110,7 @@ READONLY_TOOLS = _BASE_TOOLS | frozenset({
     "generate_image",
     "bind_skill", "unbind_skill",
     "start_dev_server",
+    "stop_dev_server",
     "run_tests", "apply_patch",
     "create_directory", "delete_file", "move_file", "search_files",
     "delete_directory",

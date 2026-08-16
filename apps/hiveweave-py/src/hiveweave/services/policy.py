@@ -120,6 +120,7 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     # dev server 可执行任意命令 → 与 bash 同硬门（2026-08-13 审计：此前
     # 无 TOOL_CAPABILITY 映射，CEO 无 bash 硬门被绕过）
     "start_dev_server": frozenset({Capability.BASH_SHELL}),
+    "stop_dev_server": frozenset({Capability.BASH_SHELL}),
     "stop_processes_for_worktree": frozenset({Capability.BASH_SHELL}),
     # 只读查注册表，不是 spawn —— 用 SOURCE_READ，避免 CEO/HR 看见工具却撞 BASH 门
     "lookup_dev_server": frozenset({Capability.SOURCE_READ}),
@@ -272,6 +273,11 @@ def has_capability(agent: dict[str, Any], cap: Capability) -> bool:
 
 def tool_hard_deny(agent: dict[str, Any], tool_name: str) -> str | None:
     """Return deny reason if tool is blocked by hard capability, else None."""
+    from hiveweave.services.eval_seal import sealed_tool_deny
+
+    sealed = sealed_tool_deny(agent, tool_name)
+    if sealed:
+        return sealed
     caps = capabilities_for(agent)
     required = TOOL_CAPABILITY.get(tool_name)
     if required is None:
@@ -404,6 +410,17 @@ class PolicyService:
         reason = tool_hard_deny(agent, tool_name)
         if reason:
             return reason
+        if tool_name in ("bash", "run_command", "start_dev_server"):
+            from hiveweave.services.eval_seal import sealed_bash_deny
+
+            cmd = ""
+            if tool_args:
+                cmd = str(
+                    tool_args.get("command") or tool_args.get("cmd") or ""
+                )
+            bash_reason = sealed_bash_deny(agent, cmd)
+            if bash_reason:
+                return bash_reason
         # write_file + edit_file share path-kind / prefix scope
         if tool_name in ("write_file", "edit_file"):
             return write_path_allowed(agent, _extract_file_path(tool_args))

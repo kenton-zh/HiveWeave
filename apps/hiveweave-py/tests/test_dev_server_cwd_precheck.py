@@ -76,6 +76,9 @@ class _FakeAsyncio:
     async def wait_for(self, coro, timeout: float = 0.0):
         return await coro
 
+    async def to_thread(self, fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
 
 async def test_missing_cwd_returns_clear_error(monkeypatch, tmp_path):
     await _patch_project_id(monkeypatch)
@@ -168,6 +171,61 @@ async def test_valid_cwd_success_path_unchanged(monkeypatch, tmp_path):
     servers = result.extra["project_servers"]
     assert len(servers) == 1
     assert servers[0]["project_id"] == TEST_PROJECT
+
+
+class _FailTcpAsyncio:
+    async def sleep(self, *args, **kwargs) -> None:
+        pass
+
+    async def open_connection(self, host: str, port: int):
+        raise OSError("connection refused")
+
+    async def wait_for(self, coro, timeout: float = 0.0):
+        return await coro
+
+    async def to_thread(self, fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+
+async def test_start_dev_server_registers_observed_port(monkeypatch, tmp_path):
+    await _patch_project_id(monkeypatch)
+    workspace = str(tmp_path / "proj")
+    (tmp_path / "proj").mkdir()
+
+    class _Proc:
+        pid = 424242
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise AssertionError("must not kill a process that is listening")
+
+    def fake_spawn(cmd, *, cwd, project_id, preferred_port, stdout, stderr):
+        return _Proc(), None, {"command": cmd}
+
+    monkeypatch.setattr(
+        "hiveweave.tools.dev_server_tools.spawn_project_process", fake_spawn
+    )
+    monkeypatch.setattr(
+        "hiveweave.tools.dev_server_tools.asyncio", _FailTcpAsyncio()
+    )
+    monkeypatch.setattr(
+        "hiveweave.tools.dev_server_tools.pick_observed_listen_port",
+        lambda *_a, **_k: 8000,
+    )
+
+    result = await start_dev_server_tool(
+        StartDevServerParams(preferred_port=3000),
+        agent_id=TEST_AGENT,
+        workspace=workspace,
+    )
+
+    assert result.success, result.error
+    assert result.extra["port"] == 8000
+    assert "localhost:8000/" in result.output
+    assert result.extra["project_servers"][0]["port"] == 8000
 
 
 async def test_lookup_marks_stale_cwd(monkeypatch, tmp_path):

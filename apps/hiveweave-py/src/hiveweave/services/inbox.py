@@ -1083,6 +1083,63 @@ class InboxService:
             log.debug("inbox_outstanding_ask_senders_failed", error=str(e))
             return set()
 
+    async def get_outstanding_ask_messages(
+        self, to_agent_id: str, *, limit: int = 20
+    ) -> list[dict]:
+        """Open expect_report asks to this agent, including read=1.
+
+        Contract still open until some row's ``reply_to`` matches
+        ``reply_contract_id``. Does **not** mark unread or ACK. Structural
+        ``expect_report`` only — no intent-from-wording.
+        """
+        await _ensure_schema(to_agent_id)
+        try:
+            rows = await project_db.query(
+                to_agent_id,
+                "SELECT i.id, i.from_agent_id, i.to_agent_id, i.message, i.read, "
+                "i.created_at, i.message_type, i.expect_report, i.priority, "
+                "i.task_id, COALESCE(i.wake, 1) AS wake, i.wake_category, "
+                "i.triage_batch_id, i.reply_contract_id, "
+                "substr(i.message, 1, 80) AS snippet "
+                "FROM inbox AS i "
+                "WHERE i.to_agent_id = ? AND i.expect_report = 1 "
+                "AND i.from_agent_id NOT IN ('user', 'system') "
+                "AND ("
+                "  (i.reply_contract_id IS NOT NULL AND i.reply_contract_id NOT IN ("
+                "    SELECT DISTINCT reply_to FROM inbox WHERE reply_to IS NOT NULL))"
+                "  OR (i.reply_contract_id IS NULL AND i.read = 0)"
+                ") ORDER BY i.created_at DESC LIMIT ?",
+                [to_agent_id, int(limit)],
+            )
+            msgs = [self._row_to_msg(r) for r in rows]
+            from_ids = [
+                str(m.get("from_agent_id"))
+                for m in msgs
+                if m.get("from_agent_id")
+            ]
+            names: dict[str, str] = {}
+            if from_ids:
+                placeholders = ",".join("?" * len(from_ids))
+                agent_rows = await project_db.query(
+                    to_agent_id,
+                    f"SELECT id, name FROM agents WHERE id IN ({placeholders})",
+                    from_ids,
+                )
+                for a in agent_rows:
+                    aid = _row_val(a, "id")
+                    if aid:
+                        names[str(aid)] = str(_row_val(a, "name") or "")
+            for m in msgs:
+                fid = m.get("from_agent_id")
+                if fid and str(fid) in names:
+                    m["from_name"] = names[str(fid)]
+                if not m.get("snippet") and m.get("message"):
+                    m["snippet"] = str(m["message"]).replace("\n", " ").strip()[:80]
+            return msgs
+        except Exception as e:
+            log.debug("inbox_outstanding_ask_messages_failed", error=str(e))
+            return []
+
     async def waive_reply_contracts(
         self,
         agent_id: str,
@@ -1309,4 +1366,7 @@ class InboxService:
                 r["reply_contract_id"] if "reply_contract_id" in keys else None
             ),
             "reply_to": r["reply_to"] if "reply_to" in keys else None,
+            "snippet": (
+                r["snippet"] if "snippet" in keys and r["snippet"] is not None else None
+            ),
         }

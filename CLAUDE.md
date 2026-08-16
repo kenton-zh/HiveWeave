@@ -156,7 +156,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 | 类别 | 工具 |
 |------|------|
 | 文件操作 | `read_file`, `write_file`, `edit_file`, `list_files`, `search_files`, `create_directory`, `delete_file`, `delete_directory`, `move_file` |
-| 代码执行 | `bash`, `run_command`, `start_dev_server`, `lookup_dev_server`, `run_tests`, `run_code_review`, `run_full_review`, `run_security_audit`, `run_perf_audit` |
+| 代码执行 | `bash`, `run_command`, `start_dev_server`, `lookup_dev_server`, `stop_dev_server`, `run_tests`, `run_code_review`, `run_full_review`, `run_security_audit`, `run_perf_audit` |
 | 补丁 | `apply_patch` |
 | 搜索 | `grep`, `websearch`, `webfetch`, `browse` |
 | Git worktree | `git_worktree_create`, `git_worktree_list`, `git_worktree_remove`, `git_worktree_status`, `git_worktree_checkpoint`, `git_worktree_merge` |
@@ -202,6 +202,10 @@ MCP 集成在 `apps/hiveweave-py/src/hiveweave/services/mcp.py`。
 事件分发（`realtime/event_bus.py`）：`tool_call_start`/`tool_call_end`/`done`/`error`/`agent_health` → agent + lobby 频道；`agent_health` 事件结构 `{type, agentId, projectId, health: "error"|"ok", message, at}`，前端 OrgTree 节点据此变红/恢复。
 
 > ADR: [003-phoenix-protocol-debt](docs/adr/003-phoenix-protocol-debt.md)
+
+### 团队开会（规格已定，未实现）
+
+规范：[docs/spec/team-meeting.md](docs/spec/team-meeting.md)。盲评并行、议题串行每题最多 3 轮、过程不进 `conversation_turns`。实现必须走 `services/meetings/` 的 MeetingTurnRunner；**禁止** `agent.chat()` + skip `append_turn`，**禁止**复用 `park_pending_wakes`（ask 豁免会互等死锁）。散会回岗见该文「回岗协议」。
 
 ### Lifecycle Hooks
 

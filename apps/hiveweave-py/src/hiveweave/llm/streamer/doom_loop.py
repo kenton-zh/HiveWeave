@@ -91,6 +91,8 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
     # 副作用工具 — 最低容忍，防止真实损害
     "bash": 3,
     "job_kill": 3,
+    "start_dev_server": 3,
+    "stop_dev_server": 3,
     "apply_patch": 3,
     "spawn_subagent": 3,
     "websearch": 3,

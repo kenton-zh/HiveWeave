@@ -4,14 +4,12 @@ Agent-level (key=agent_id) in-memory change ledger + worktree diff
 collection (incl. untracked files) + one-shot LLM audit + attestation +
 report file.
 
-The audit LLM call goes through the caller's ``call_llm`` callback — the
-same one-shot sub-call path as the legacy review suites
-(``agents/agent.py:_review_llm_callback``), so the audit sub-call uses the
-**parent agent's own model config**, never a separate fixed tier.
-
-成本取舍（2026-08-12 用户钦定，有意决策）：builder coordinator 的审计会烧
-management 档模型——不再做旧的固定 executor 档成本隔离，换取与 legacy
-review 路径完全一致的行为（同一回调、同一模型、同一思考模式参数）。
+The HTTP path is the same one-shot sub-call as the legacy review suites
+(``agents/agent.py:_oneshot_llm``). Model pick (2026-08-16): use a
+**teammate's currently resolved model** whose vendor ``model_id`` differs
+from the author's. Same callback stack — not a second LLM runtime. If
+the live team only has one family, fall back to the author's own model
+(do not invent unused catalog / backup slots).
 
 Soft-gate by design: nothing here raises or blocks — every step degrades
 to a soft-fail dict with a machine-readable ``reason``.
@@ -21,6 +19,7 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -33,6 +32,8 @@ log = structlog.get_logger(__name__)
 # Declared locally (not imported from tools.review) to avoid a tools↔services
 # package import cycle.
 ReviewLLMCallback = Callable[[str, str], Awaitable[str]]
+# (model_config, system, user) -> text. Same HTTP path, caller-chosen config.
+OneshotLLMCallback = Callable[[dict, str, str], Awaitable[str]]
 
 CODE_AUDIT_LINE_THRESHOLD = 20
 CODE_AUDIT_KIND = "code_audit"
@@ -45,6 +46,17 @@ CODE_AUDIT_REMINDER = (
     "code audit attestation exists. Call request_code_audit(taskId=...) "
     "before submit_task to get a second-pass LLM audit of your worktree diff."
 )
+CODE_AUDIT_REMINDER_LLM_FAILED = (
+    "[CODE AUDIT REMINDER] Code audit was attempted but the LLM call failed "
+    "(llm_failed). Retry request_code_audit(taskId=...) once, or continue "
+    "with submit_task (soft gate — does not block)."
+)
+CODE_AUDIT_REMINDER_ATTEMPTED = (
+    "[CODE AUDIT REMINDER] Code audit was attempted but did not produce an "
+    "attestation ({reason}). Retry request_code_audit(taskId=...) once, or "
+    "continue with submit_task (soft gate — does not block)."
+)
+_SOFT_FAIL_ATTEMPT_REASONS = frozenset({"llm_failed", "no_model", "no_callback"})
 
 _DIFF_CAP_BYTES = 50 * 1024
 _DIFF_CAP_MARKER = "\n... [diff truncated at 50KB] ...\n"
@@ -57,6 +69,9 @@ _ISSUE_PARSE_CAP = 100
 
 _ledger: dict[str, int] = {}
 _ledger_ts: dict[str, float] = {}
+# Last request_code_audit attempt that did not produce an attestation.
+# Separate from the line ledger so llm_failed is not mistaken for "never audited".
+_last_attempt: dict[str, dict[str, Any]] = {}
 
 
 def record_change(agent_id: str, lines: int) -> None:
@@ -77,10 +92,47 @@ def get_last_change_ts(agent_id: str) -> float:
     return _ledger_ts.get(agent_id, 0.0)
 
 
+def record_audit_attempt(
+    agent_id: str, reason: str, task_id: str | None = None
+) -> None:
+    """Record a soft-fail audit attempt (no attestation created)."""
+    if not agent_id:
+        return
+    _last_attempt[agent_id] = {
+        "ts": time.time(),
+        "reason": reason,
+        "task_id": task_id,
+    }
+
+
+def get_last_audit_attempt(agent_id: str) -> dict[str, Any] | None:
+    """Copy of the last soft-fail attempt, or None."""
+    rec = _last_attempt.get(agent_id)
+    return dict(rec) if rec else None
+
+
+def code_audit_submit_reminder(agent_id: str) -> str:
+    """Submit-time reminder when edits exceed the threshold and no fresh attestation.
+
+    llm_failed / no_model / no_callback are worded as attempted-but-failed,
+    not "never audited".
+    HTTP retry already lives in ``agents.agent._review_llm_post_with_retry`` —
+    do not double-retry here.
+    """
+    attempt = _last_attempt.get(agent_id)
+    reason = (attempt or {}).get("reason")
+    if reason == "llm_failed":
+        return CODE_AUDIT_REMINDER_LLM_FAILED
+    if reason in _SOFT_FAIL_ATTEMPT_REASONS:
+        return CODE_AUDIT_REMINDER_ATTEMPTED.format(reason=reason)
+    return CODE_AUDIT_REMINDER
+
+
 def reset_ledger(agent_id: str) -> None:
-    """Clear the ledger entry for an agent."""
+    """Clear the ledger entry and last audit attempt for an agent."""
     _ledger.pop(agent_id, None)
     _ledger_ts.pop(agent_id, None)
+    _last_attempt.pop(agent_id, None)
 
 
 def ledger_snapshot() -> dict[str, int]:
@@ -259,6 +311,195 @@ def _parse_issues(text: str) -> list[str]:
     return issues
 
 
+# ── Peer model pick (live team, different vendor model_id) ───
+
+def model_family_key(config: dict | None) -> str:
+    """Vendor model family: ``llm_models.model_id``, case-insensitive.
+
+    Same weights behind two API keys / two DB rows still count as one
+    family — the point of a peer audit is a different model, not a
+    different quota.
+    """
+    if not config:
+        return ""
+    return (config.get("model_id") or "").strip().lower()
+
+
+def select_peer_audit_model(
+    author_family: str,
+    author_tier: str,
+    peers: list[dict[str, Any]],
+) -> dict | None:
+    """Pick one teammate config whose family ≠ author.
+
+    ``peers`` items: ``{"tier": "management"|"executor", "config": dict}``.
+    Prefer a different model tier (management ↔ executor); if several
+    remain, lexicographic ``model_id`` then DB ``id`` so the choice is
+    stable across calls. Returns None when the live team has no other
+    family.
+    """
+    family = (author_family or "").strip().lower()
+    if not family:
+        return None
+    distinct: list[dict[str, Any]] = []
+    for peer in peers:
+        cfg = peer.get("config") if isinstance(peer, dict) else None
+        key = model_family_key(cfg)
+        if not key or key == family:
+            continue
+        distinct.append(peer)
+    if not distinct:
+        return None
+    other_tier = [
+        p for p in distinct
+        if (p.get("tier") or "") != author_tier
+    ]
+    pool = other_tier or distinct
+    pool.sort(
+        key=lambda p: (
+            model_family_key(p.get("config")),
+            (p.get("config") or {}).get("id") or "",
+        )
+    )
+    return pool[0].get("config")
+
+
+async def resolve_peer_audit_model(
+    project_id: str,
+    author_id: str,
+) -> tuple[dict | None, str]:
+    """Resolve (config, source) for the audit one-shot.
+
+    ``source`` is ``"peer"`` when a live teammate's resolved model has a
+    different vendor ``model_id``, else ``"own"``. Config is the author's
+    model when no peer family exists. ``(None, "own")`` only if the
+    author themselves has no resolvable model.
+    """
+    from hiveweave.services.model import ModelService
+    from hiveweave.services.org import OrgService
+    from hiveweave.services.policy import model_tier_for_agent
+
+    org = OrgService()
+    ms = ModelService()
+    agents = await org.list_agents(project_id)
+    author = next((a for a in agents if a.get("id") == author_id), None)
+    if author is None:
+        author = await org.get_agent(author_id)
+    if not author:
+        return None, "own"
+
+    author_tier = model_tier_for_agent(author)
+    author_cfg = await ms.resolve_model(
+        tier=author_tier, preferred=author.get("model_id"),
+    )
+    if not author_cfg:
+        return None, "own"
+
+    author_family = model_family_key(author_cfg)
+    peers: list[dict[str, Any]] = []
+    for agent in agents:
+        if agent.get("id") == author_id:
+            continue
+        if (agent.get("status") or "").lower() == "archived":
+            continue
+        try:
+            tier = model_tier_for_agent(agent)
+            cfg = await ms.resolve_model(
+                tier=tier, preferred=agent.get("model_id"),
+            )
+        except Exception as exc:  # noqa: BLE001 — skip one teammate, keep picking
+            log.debug(
+                "code_audit.peer_teammate_unresolved",
+                teammate_id=agent.get("id"),
+                error=str(exc),
+            )
+            continue
+        if not cfg or model_family_key(cfg) == author_family:
+            continue
+        peers.append({"tier": tier, "config": cfg})
+
+    chosen = select_peer_audit_model(author_family, author_tier, peers)
+    if chosen:
+        log.info(
+            "code_audit.peer_model",
+            agent_id=author_id,
+            author_model=author_cfg.get("model_id"),
+            audit_model=chosen.get("model_id"),
+        )
+        return chosen, "peer"
+    log.info(
+        "code_audit.peer_model_unavailable",
+        agent_id=author_id,
+        author_model=author_cfg.get("model_id"),
+        teammate_count=sum(
+            1 for a in agents
+            if a.get("id") != author_id
+            and (a.get("status") or "").lower() != "archived"
+        ),
+    )
+    return author_cfg, "own"
+
+
+async def _invoke_audit_llm(
+    project_id: str,
+    agent_id: str,
+    system: str,
+    user: str,
+    call_llm: ReviewLLMCallback | None,
+    oneshot_llm: OneshotLLMCallback | None,
+) -> tuple[str | None, dict]:
+    """Run the audit completion. Returns (text, meta) or a soft-fail dict.
+
+    When ``oneshot_llm`` is wired, pick a live-team peer model first.
+    ``call_llm`` (author's own review callback) is the fallback used by
+    tests and when peer resolve fails.
+    """
+    chosen: dict | None = None
+    source = "own"
+    if oneshot_llm is not None:
+        try:
+            chosen, source = await resolve_peer_audit_model(
+                project_id, agent_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — fall back to own callback
+            log.warning(
+                "code_audit.peer_resolve_failed",
+                agent_id=agent_id,
+                error=str(exc),
+            )
+            chosen, source = None, "own"
+
+    try:
+        if oneshot_llm is not None and chosen:
+            # Verdict must land in ``content`` (``VERDICT: PASS|ISSUES`` on
+            # line 1). Thinking models often spend the budget on
+            # reasoning_content and return empty content → false llm_failed.
+            cfg = dict(chosen)
+            cfg["supports_thinking"] = False
+            cfg["default_reasoning_effort"] = None
+            text = await oneshot_llm(cfg, system, user)
+        elif call_llm is not None:
+            text = await call_llm(system, user)
+            source = "own"
+            chosen = None
+        elif oneshot_llm is not None:
+            return None, {"audited": False, "reason": "no_model"}
+        else:
+            return None, {"audited": False, "reason": "no_callback"}
+    except NoModelConfiguredError as exc:
+        log.warning("code_audit.no_model", agent_id=agent_id, error=str(exc))
+        return None, {"audited": False, "reason": "no_model"}
+    except Exception as exc:  # noqa: BLE001 — soft-fail contract
+        log.warning("code_audit.llm_failed", agent_id=agent_id, error=str(exc))
+        return None, {"audited": False, "reason": "llm_failed"}
+    if not text:
+        return None, {"audited": False, "reason": "llm_failed"}
+    return text, {
+        "audit_model_id": (chosen or {}).get("model_id"),
+        "audit_model_source": source,
+    }
+
+
 # ── Audit runner ─────────────────────────────────────────────
 
 async def run_code_audit(
@@ -266,14 +507,16 @@ async def run_code_audit(
     agent_id: str,
     task_id: str | None = None,
     call_llm: ReviewLLMCallback | None = None,
+    oneshot_llm: OneshotLLMCallback | None = None,
 ) -> dict:
     """Run a code audit for an agent's worktree. Never raises.
 
-    ``call_llm`` is the parent agent's one-shot review callback
-    (``Agent._review_llm_callback``: ``async (system, user) -> str``) —
-    the audit sub-call therefore runs on the agent's own model. ``None``
-    (no callback wired) soft-fails with ``no_callback`` once an LLM verdict
-    is actually needed; the auto-PASS path never touches it.
+    ``oneshot_llm`` is ``Agent._oneshot_llm(model_config, system, user)`` —
+    production path; picks a live teammate's different ``model_id``.
+    ``call_llm`` is the parent agent's review callback
+    (``async (system, user) -> str``) — tests and fallback (author's own
+    model). ``None`` for both soft-fails with ``no_callback`` once an LLM
+    verdict is actually needed; the auto-PASS path never touches either.
 
     Return contract (soft-fail dicts):
       - ``{"audited": False, "reason": "no_worktree" | "no_callback" | "no_model" | "llm_failed" | "error"}``
@@ -321,23 +564,18 @@ async def run_code_audit(
                 "attestation_id": attestation_id,
             }
 
-        # One-shot sub-call on the parent agent's own model — same path as
-        # the legacy review suites (review_llm_callback). No separate tier.
-        if call_llm is None:
-            return {"audited": False, "reason": "no_callback"}
-
         system, user = build_audit_prompt(diff, task_id)
-        try:
-            text = await call_llm(system, user)
-        except NoModelConfiguredError as exc:
-            # Agent has no resolvable model — distinct from wiring/HTTP faults.
-            log.warning("code_audit.no_model", agent_id=agent_id, error=str(exc))
-            return {"audited": False, "reason": "no_model"}
-        except Exception as exc:  # noqa: BLE001 — soft-fail contract
-            log.warning("code_audit.llm_failed", agent_id=agent_id, error=str(exc))
-            return {"audited": False, "reason": "llm_failed"}
-        if not text:
-            return {"audited": False, "reason": "llm_failed"}
+        text, meta = await _invoke_audit_llm(
+            project_id, agent_id, system, user, call_llm, oneshot_llm,
+        )
+        if text is None:
+            # No extra HTTP retry here: _oneshot_llm already retries once via
+            # _review_llm_post_with_retry. Record the attempt so submit can
+            # say "tried, LLM failed" instead of "never audited".
+            reason = str(meta.get("reason") or "")
+            if reason in _SOFT_FAIL_ATTEMPT_REASONS:
+                record_audit_attempt(agent_id, reason, task_id)
+            return meta
 
         verdict = _parse_verdict(text)
         issues = _parse_issues(text)
@@ -371,6 +609,8 @@ async def run_code_audit(
             "report_path": report_path,
             "attestation_id": attestation_id,
             "lines_audited": lines_audited,
+            "audit_model_id": meta.get("audit_model_id"),
+            "audit_model_source": meta.get("audit_model_source"),
         }
     except Exception as exc:  # noqa: BLE001 — soft-fail contract
         log.warning("code_audit.error", agent_id=agent_id, error=str(exc))

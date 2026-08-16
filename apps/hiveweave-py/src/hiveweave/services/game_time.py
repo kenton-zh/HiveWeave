@@ -1285,6 +1285,16 @@ class GameTimeService:
                 # Legally waiting — do not stall-wake (would burn quota +
                 # fight WAIT_WITHOUT_ASK if waits were cleared)
                 continue
+            # Off-turn bg-bash / bg-sub still running (even without
+            # commit_turn waiting). VERIFY serial-lock waiters who are
+            # idle with no live job and no wait contract are NOT skipped.
+            try:
+                from hiveweave.services.offturn import agent_has_live_job_for_task
+
+                if agent_has_live_job_for_task(str(assignee), tid):
+                    continue
+            except Exception:
+                pass
             # P0-3: mutual exclusion — skip agents recently stall-broken
             # (STALL BREAK already parked/escalated; nudge is redundant)
             try:
@@ -1321,6 +1331,33 @@ class GameTimeService:
             stall_count = task_stall_counts.get(tid, 0) + 1
             task_stall_counts[tid] = stall_count
             mins = thresh // 60000
+            # VERIFY executor stall at escalation: reassign to another
+            # independent QA (never auto-approve / skip serial lock /
+            # reassign to implementer). submitted/reviewing stay on the
+            # review nudge path above.
+            if (
+                stall_count > STALL_ESCALATION_THRESHOLD
+                and ts._is_verify_task(t)
+                and status in ("claimed", "running", "rework")
+            ):
+                last_vr = cooldowns.get(f"verify-exec-stall:{tid}") or 0
+                if now_ms - last_vr >= LEDGER_NUDGE_COOLDOWN_MS:
+                    try:
+                        from hiveweave.tools.tasks.verify_spawn import (
+                            maybe_reassign_stalled_verify,
+                        )
+
+                        if await maybe_reassign_stalled_verify(
+                            project_id, t, agents_by_id=by_id
+                        ):
+                            cooldowns[f"verify-exec-stall:{tid}"] = now_ms
+                            continue
+                    except Exception as e:
+                        log.warning(
+                            "verify_executor_stall_failed",
+                            task_id=tid,
+                            error=str(e),
+                        )
             body = (
                 f"[TASK STALL] Task '{title}' ({tid[:8]}) has been "
                 f"{status} for >{mins}min (progress={progress}). "
@@ -1667,6 +1704,13 @@ class GameTimeService:
             has_wake = blocked_task_has_wake_path(t, now_ms)
             if has_wake and str(assignee) in live_wait_agents:
                 continue
+            try:
+                from hiveweave.services.offturn import agent_has_live_job_for_task
+
+                if agent_has_live_job_for_task(str(assignee), tid):
+                    continue
+            except Exception:
+                pass
             last = cooldowns.get(f"blocked:{tid}") or 0
             if now_ms - last < TASK_STALL_COOLDOWN_MS:
                 continue

@@ -126,11 +126,12 @@ def _hire_market_skill_gate(
     seen_slugs: list[str],
     builtin_lookup: Any,
 ) -> str | None:
-    """市场技能强制门槛：HR 见过市场技能却全绑内置 → 返回错误消息，否则 None。
+    """市场技能门槛：最近一次 list_available_skills 的市场结果，不是累计缓存。
 
     - skills 为空 → 放行（招人不强制技能）
-    - seen_slugs 里没有市场技能（市场不可达 / HR 没搜到）→ 放行，不卡死招聘
+    - 最近一次搜索没有市场技能（空 / 不可达 / 零命中）→ 放行
     - skills 里含至少一个市场技能 → 放行
+    - 最近一次搜索有市场技能，却全绑内置 → 拒绝
     """
     if not skills:
         return None
@@ -141,14 +142,45 @@ def _hire_market_skill_gate(
         return None
     sample = ", ".join(seen_market[:3])
     return (
-        "All requested skills are built-in, but marketplace skills "
-        f"were available in your search results (e.g. {sample}). "
-        "hire_agent requires at least one marketplace skill: "
-        're-run list_available_skills (try keywords like the '
-        'specialty itself, e.g. "frontend" / "testing" / "game") '
-        'and pass one of the market results via "#N" or its full '
-        "slug in skills."
+        "All requested skills are built-in, but your last "
+        "list_available_skills returned marketplace skills "
+        f"(e.g. {sample}). Pass one of those via \"#N\" or its full "
+        "slug, or search a tighter keyword / skip marketplace by not "
+        "searching."
     )
+
+
+async def _notify_worktree_relocated(
+    agent_id: str, short_id: str, path: str
+) -> None:
+    """Same ``[WORKTREE RELOCATED]`` inbox as ``ensure_executor_worktree``."""
+    from pathlib import Path
+
+    if not path or Path(path).name == short_id:
+        return
+    try:
+        from hiveweave.services.inbox import InboxService
+
+        await InboxService().send_message(
+            from_agent_id="system",
+            to_agent_id=agent_id,
+            message=(
+                f"[WORKTREE RELOCATED] Your workspace has been moved from "
+                f"the canonical path (.hiveweave/worktrees/{short_id}) to "
+                f"{Path(path).name} due to a locked/corrupted directory. "
+                f"Your new working directory is: {path}\n"
+                f"All merge/checkpoint operations will use this path. "
+                f"If you encounter merge_precondition_no_git errors, "
+                f"report to your coordinator."
+            ),
+            message_type="system",
+        )
+    except Exception as notify_err:
+        log.warning(
+            "hire_worktree_relocation_notify_failed",
+            agent_id=agent_id,
+            error=str(notify_err),
+        )
 
 
 @tool(
@@ -323,6 +355,11 @@ async def hire_agent_tool(
             if ctx.skills._get_builtin_skill(sk) is not None:
                 valid_skills.append(sk)
             else:
+                from hiveweave.services.eval_seal import is_eval_sealed
+
+                if workspace and is_eval_sealed(workspace):
+                    invalid_skills.append(sk)
+                    continue
                 # 市场校验与 list_available_skills 同路由：skills.sh 优先，
                 # 不可达时降级 SkillHub 国内——避免国内商店技能「搜得到却绑不上」。
                 detail, _source = await ctx.skills._resolve_marketplace_skill(sk)
@@ -342,14 +379,16 @@ async def hire_agent_tool(
             )
         skills = valid_skills
 
-        # 市场技能强制：HR 本次会话已在 list_available_skills 结果里见过
-        # 市场技能（per-agent 搜索缓存含非内置 slug），却全部只绑内置技能 →
-        # 拒绝并要求至少选一个市场技能（避免"只绑纪律技能"导致市场白接）。
-        # 市场不可达时 list_available_skills 会从缓存清掉市场 slug，本检查
-        # 自动放行，不会卡死招聘（也不会与"bind built-in"提示自相矛盾）。
+        # 市场技能门槛：用最近一次 list_available_skills 的市场 slug，
+        # 不用累计 #N 缓存（搜过 "s3" 噪声后再只绑纪律技能不该被旧结果卡死）。
+        # 最近一次零市场命中 / 市场不可达 → 放行。
+        last_map = getattr(ctx.skills, "_skill_search_last", None)
+        seen_last = (
+            last_map.get(agent_id, []) if isinstance(last_map, dict) else []
+        )
         market_gate = _hire_market_skill_gate(
             skills=skills,
-            seen_slugs=ctx.skills._skill_search_cache.get(agent_id, []),
+            seen_slugs=seen_last,
             builtin_lookup=ctx.skills._get_builtin_skill,
         )
         if market_gate:
@@ -457,6 +496,9 @@ async def hire_agent_tool(
                             "workspace_path": worktree_path,
                             "worktree_error": None,
                         })
+                        await _notify_worktree_relocated(
+                            new_id, new_short, worktree_path
+                        )
                         log.info(
                             "tool.hire_agent.worktree_created",
                             agent_id=new_id,
@@ -1501,7 +1543,7 @@ async def list_available_skills_tool(
         )
 
     result = await ctx.skills.list_available_skills(
-        params.search, agent_id=agent_id
+        params.search, agent_id=agent_id, workspace_path=workspace
     )
     return ToolResult.ok(result)
 
@@ -1545,7 +1587,9 @@ async def read_skill_tool(
         return ToolResult.err("read_skill requires 'skillSlug' (skill name)")
 
     bound = await ctx.skills.get_bound_skills(agent_id)
-    result = await ctx.skills.read_skill(slug, bound)
+    result = await ctx.skills.read_skill(
+        slug, bound, workspace_path=workspace
+    )
     return ToolResult.ok(result)
 
 

@@ -2,7 +2,7 @@
 
 契约 19: Chat — 发送 + 历史 + 未读 + 收件箱 + 暂停/恢复 + 重置 + 解析模型 + SSE 流式
 - POST   /api/chat                          触发 agent 聊天（含专家命令路由 + busy 重试）
-- GET    /api/chat/history/{agentId}        历史消息（限 200 条）
+- GET    /api/chat/history/{agentId}        历史消息（UI：分栏窗口，非混合 100）
 - GET    /api/chat/unread/{agentId}         未读背景消息
 - POST   /api/chat/mark-read                批量标记已读
 - GET    /api/chat/inbox/{agentId}          收件箱
@@ -325,16 +325,32 @@ async def _route_to_expert(
     return {"ok": True, "routed": True, "expert": expert_role}
 
 
+async def _ui_chat_messages(agent_id: str, limit: int, offset: int) -> list:
+    """Chat UI load.
+
+    offset=0: union of two recency windows (up to ``limit`` foreground
+    user/assistant + ``limit`` team/background-user). ``len(rows)`` may be
+    up to 2×limit; this is not mixed ``LIMIT limit``.
+
+    offset>0: mixed get_messages pagination for debug dumps — not page 2
+    of the panel union. Frontend Chat does not paginate.
+    """
+    validate_id(agent_id, "agent_id")
+    if offset:
+        return await _chat_msg.get_messages(agent_id, limit=limit, offset=offset)
+    return await _chat_msg.get_panel_messages(
+        agent_id, direct_limit=limit, other_limit=limit
+    )
+
+
 @router.get("/history/{agent_id}")
 async def chat_history(
     agent_id: str,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
-    """历史消息（R7 fix: 分页 — limit 默认 100，offset 默认 0）。"""
-    validate_id(agent_id, "agent_id")
-    messages = await _chat_msg.get_messages(agent_id, limit=limit, offset=offset)
-    return {"messages": messages}
+    """历史消息。offset=0 分栏窗口（最多 2×limit）；offset>0 为混合调试分页。"""
+    return {"messages": await _ui_chat_messages(agent_id, limit, offset)}
 
 
 @router.get("/unread/{agent_id}")
@@ -477,9 +493,8 @@ async def chat_messages(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list:
-    """查 agent 消息（数组直返，R7 fix: 分页 — limit 默认 100，offset 默认 0）。"""
-    validate_id(agent_id, "agent_id")
-    return await _chat_msg.get_messages(agent_id, limit=limit, offset=offset)
+    """查 agent 消息（数组直返）。offset=0 时分栏取最近，避免主栏被工位流水挤空。"""
+    return await _ui_chat_messages(agent_id, limit, offset)
 
 
 @router.get("/todos/{agent_id}")
@@ -687,8 +702,7 @@ async def chat_messages_path(
 
     R7 fix: 分页参数透传。R11: COMPAT 兼容路由。
     """
-    validate_id(agent_id, "agent_id")
-    return await chat_messages(agent_id, limit=limit, offset=offset)
+    return await _ui_chat_messages(agent_id, limit, offset)
 
 
 # COMPAT: 前端 api.ts 期望的 RESTful 路径

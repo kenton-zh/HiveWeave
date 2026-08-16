@@ -212,6 +212,106 @@ async def test_ensure_skips_recreate_without_write_tasks():
 
 
 @pytest.mark.asyncio
+async def test_ensure_broken_binding_missing_path_recreates(tmp_path: Path):
+    """DB workspace_path set but dir gone → do not idle-skip; recreate."""
+    from hiveweave.services.git_worktree.ensure import ensure_executor_worktree
+
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    (ws / ".git").mkdir()
+    missing = ws / ".hiveweave" / "worktrees" / "A004"
+    new_path = str(missing)
+    agent = {
+        "id": "a1",
+        "short_id": "A004",
+        "permission_type": "executor",
+        "role": "qa",
+        "workspace_path": str(missing),
+    }
+    org = MagicMock()
+    org.resolve_agent = AsyncMock(return_value=agent)
+    org.update_agent = AsyncMock()
+    create_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "path": new_path,
+            "branch": "hw/A004/work",
+        }
+    )
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_project_workspace",
+            AsyncMock(return_value=str(ws)),
+        ),
+        patch("hiveweave.services.org.OrgService", return_value=org),
+        patch(
+            "hiveweave.services.git_worktree.reconcile._assignee_needs_write_worktree",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "hiveweave.services.git_worktree.ensure.GitWorktreeService",
+        ) as GWT,
+    ):
+        GWT.return_value.create = create_mock
+        result = await ensure_executor_worktree("p1", "a1")
+
+    assert result.get("skipped") is not True
+    assert result.get("success") is True
+    create_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_broken_binding_husk_no_git_recreates(tmp_path: Path):
+    """Dir exists but no .git → broken binding, idle-skip must not fire."""
+    from hiveweave.services.git_worktree.ensure import ensure_executor_worktree
+
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    (ws / ".git").mkdir()
+    husk = ws / ".hiveweave" / "worktrees" / "A004"
+    husk.mkdir(parents=True)
+    agent = {
+        "id": "a1",
+        "short_id": "A004",
+        "permission_type": "executor",
+        "role": "qa",
+        "workspace_path": str(husk),
+    }
+    org = MagicMock()
+    org.resolve_agent = AsyncMock(return_value=agent)
+    org.update_agent = AsyncMock()
+    create_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "path": str(husk),
+            "branch": "hw/A004/work",
+        }
+    )
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_project_workspace",
+            AsyncMock(return_value=str(ws)),
+        ),
+        patch("hiveweave.services.org.OrgService", return_value=org),
+        patch(
+            "hiveweave.services.git_worktree.reconcile._assignee_needs_write_worktree",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "hiveweave.services.git_worktree.ensure.GitWorktreeService",
+        ) as GWT,
+    ):
+        GWT.return_value.create = create_mock
+        result = await ensure_executor_worktree("p1", "a1")
+
+    assert result.get("skipped") is not True
+    assert result.get("success") is True
+    create_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_ensure_verify_task_id_does_not_bypass_gate():
     """Audit P0-1: VERIFY task_id must not recreate write worktree."""
     from hiveweave.services.git_worktree.ensure import ensure_executor_worktree

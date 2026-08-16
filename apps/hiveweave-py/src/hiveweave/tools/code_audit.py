@@ -3,12 +3,11 @@
 出口合同前置：累计代码变更超过 CODE_AUDIT_LINE_THRESHOLD(20) 行时必须先
 request_code_audit 再 submit_task。审计实现/台账在 services/code_audit.py
 （并行拆分，独立模块）——此处只做工具壳：参数解析、agent 身份/任务解析、
-结果短契约格式化。审计 LLM 走 ctx.review_llm_callback（与 review 套件同一条
-一次性子调用路径），用的是调用 agent 自己的模型配置——builder coordinator
-的审计因此烧 management 档模型（2026-08-12 用户钦定的有意取舍，不做固定
-executor 档隔离）。审计是只读分析 + 有成本 LLM 调用，软失败（无 worktree /
-无回调 / 无模型 / LLM 失败 / 内部错误）一律回 ToolResult.ok 带 reason，
-仅意外异常回 err。
+结果短契约格式化。审计 LLM 走 ctx.oneshot_llm_callback（与 review 套件同一条
+一次性 HTTP 路径），模型从本项目在职队友当前解析到的模型里选一个
+vendor model_id 与作者不同的；团队只有一种模型时退回作者自己的。
+审计是只读分析 + 有成本 LLM 调用，软失败（无 worktree / 无回调 / 无模型 /
+LLM 失败 / 内部错误）一律回 ToolResult.ok 带 reason，仅意外异常回 err。
 """
 
 from __future__ import annotations
@@ -71,6 +70,13 @@ def _format_verdict(result: dict) -> ToolResult:
         lines.append(f"问题数: {int(result.get('issues_count') or 0)}")
         for i, issue in enumerate(result.get("top_issues") or [], 1):
             lines.append(f"{i}. {issue}")
+    model_id = result.get("audit_model_id")
+    source = result.get("audit_model_source")
+    if model_id:
+        if source == "peer":
+            lines.append(f"审计模型: {model_id} (团队其它)")
+        else:
+            lines.append(f"审计模型: {model_id} (本模型；团队无其它)")
     report_path = result.get("report_path")
     if report_path:
         lines.append(f"报告: {report_path}")
@@ -85,8 +91,8 @@ def _format_verdict(result: dict) -> ToolResult:
     "One-shot second-pass LLM audit of your worktree git diff. "
     "REQUIRED before submit_task when your cumulative code edits exceed 20 lines. "
     "Returns VERDICT PASS/ISSUES + top issues; full report persisted to disk. "
-    "The audit runs as a one-shot sub-call on YOUR OWN model (same path as "
-    "the review tool), costing one extra LLM call.",
+    "The audit runs as a one-shot sub-call. It uses a teammate's currently "
+    "used model when that model differs from yours; otherwise your own model.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -108,15 +114,23 @@ async def request_code_audit_tool(
             log.info("request_code_audit.task_resolve_failed", agent_id=agent_id, error=str(e))
             task_id = None
     call_llm = getattr(ctx, "review_llm_callback", None) if ctx else None
+    oneshot_llm = getattr(ctx, "oneshot_llm_callback", None) if ctx else None
 
     try:
         result = await _code_audit.run_code_audit(
-            project_id, agent_id, task_id, call_llm=call_llm
+            project_id, agent_id, task_id,
+            call_llm=call_llm,
+            oneshot_llm=oneshot_llm,
         )
     except Exception as e:
         log.warning("request_code_audit.crashed", agent_id=agent_id, error=repr(e))
         return ToolResult.err(f"code audit failed: {e}")
 
     if not result.get("audited"):
-        return ToolResult.ok(f"审计未执行: {result.get('reason') or 'unknown'}")
+        reason = result.get("reason") or "unknown"
+        return ToolResult.ok(
+            f"审计未执行: {reason}. "
+            "Next: retry request_code_audit once, or submit_task anyway "
+            "(soft gate — does not block)."
+        )
     return _format_verdict(result)
