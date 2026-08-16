@@ -296,7 +296,8 @@ class ToolLoopMixin:
                     "round": round_num,
                 })
 
-            # 上下文溢出检查
+            # 溢出才压缩。未超窗时必须 append-only，否则 DeepSeek 前缀缓存
+            # 从第一处 replace（旧 tool 占位 / 剥旧图）整段作废。
             messages = self._trim_context_if_needed(messages, provider)
 
             # 中轮提醒: 80% 轮次时注入

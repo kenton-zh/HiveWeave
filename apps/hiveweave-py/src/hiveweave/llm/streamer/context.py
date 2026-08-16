@@ -38,10 +38,11 @@ class ContextMixin:
     _PRUNE_PLACEHOLDER = "[Old tool result content cleared]"
 
     def _prune_old_tool_outputs(self, messages: list[dict]) -> list[dict]:
-        """在 tool loop 中裁剪旧工具输出（OpenCode prune 模式，临时版）。
+        """溢出压缩点才替换旧工具正文（DSH compaction，不是每轮）。
 
         逆序遍历：跳过最近 2 轮（assistant 消息计轮次），保护窗口(40K)外的
         旧 tool 输出替换为占位符。候选总量 > 10K 时才执行。
+        同一 tool loop 内每轮 replace 会从被改的 token 起作废 DeepSeek 前缀缓存。
         """
         if len(messages) < 6:
             return messages
@@ -101,22 +102,8 @@ class ContextMixin:
         )
         return result
 
-    def _trim_context_if_needed(
-        self,
-        messages: list[dict],
-        provider: ProviderConfig,
-    ) -> list[dict]:
-        """上下文溢出检查: 先 prune 旧工具输出，再估算 token，超 usable 则硬截断。
-
-        对齐 Elixir trim_context_if_needed + OpenCode prune 模式。
-        """
-        # Step 1: Prune 旧工具输出（替换为占位符，不丢弃消息）
-        messages = self._prune_old_tool_outputs(messages)
-        # Step 1b: Keep only the newest screenshot payloads (base64 is huge)
-        from hiveweave.services.vision import strip_images_from_messages
-
-        messages = strip_images_from_messages(messages)
-
+    def _input_trim_at(self, provider: ProviderConfig) -> tuple[int, int]:
+        """Return ``(usable, trim_at)`` token budgets for this provider."""
         max_output = provider.max_output_tokens
         if provider.supports_thinking:
             max_output = max(max_output, OUTPUT_TOKEN_GLOBAL_CAP)
@@ -139,22 +126,29 @@ class ContextMixin:
         # 合法小窗口模型的兜底：input_budget > 0 但小于 8192 时，
         # 保证输入至少有 8192 可用（此时 max_output 会被 cap 到不超限）。
         usable = max(input_budget, 8_192)
-        # Hard trim near usable ceiling (95%); soft compaction is separate (50%).
+        # Overflow compact (prune/strip) and hard trim share this 95% ceiling.
+        # Cross-turn conversation compaction is a separate product policy
+        # (COMPACTION_TRIGGER_RATIO, default 70%) — not an in-loop prune.
         trim_at = max(int(usable * CONTEXT_TRIM_TRIGGER_RATIO), 8_192)
-        total = estimate_tokens_for_messages(messages)
+        return usable, trim_at
 
-        if total <= trim_at:
-            # Still scrub broken pairs (e.g. short lists that never enter hard trim).
-            return self._drop_orphan_tool_artifacts(messages)
+    def _compact_overflow_messages(self, messages: list[dict]) -> list[dict]:
+        """One-shot prefix rewrite at overflow (DSH compaction, not every round).
 
-        log.info(
-            "context_overflow_trim",
-            total=total,
-            usable=usable,
-            trim_at=trim_at,
-            ratio=CONTEXT_TRIM_TRIGGER_RATIO,
-        )
+        Large tool bodies should already be spilled at write time; this is the
+        last-resort replace when the window is actually full.
+        """
+        from hiveweave.services.vision import strip_images_from_messages
 
+        compacted = self._prune_old_tool_outputs(messages)
+        return strip_images_from_messages(compacted)
+
+    def _hard_trim_tail(
+        self,
+        messages: list[dict],
+        trim_at: int,
+    ) -> list[dict]:
+        """Drop oldest non-system turns until ``trim_at``. Keeps tool pairs intact."""
         # 只钉住开头连续的 system（identity / compacted_prefix）。
         # TEST18 根因：旧逻辑 head=messages[:2] 在无 compacted 时把历史首条
         # assistant(tool_calls) 钉进 head，随后从 tail 裁掉其 tool 回执 →
@@ -193,10 +187,47 @@ class ContextMixin:
                 drop = 1
             tail = tail[drop:]
 
-        trimmed = self._drop_orphan_tool_artifacts(head + tail)
-        log.info("context_trimmed",
-                 original=len(messages), trimmed=len(trimmed),
-                 tokens=estimate_tokens_for_messages(trimmed))
+        return self._drop_orphan_tool_artifacts(head + tail)
+
+    def _trim_context_if_needed(
+        self,
+        messages: list[dict],
+        provider: ProviderConfig,
+    ) -> list[dict]:
+        """Keep the in-loop prefix append-only unless the window overflows.
+
+        DSH KV-cache: ordinary history growth is append-only. A surface
+        replacement (placeholder prune, stripping old screenshots) invalidates
+        reuse from the first rewritten token. HiveWeave used to prune/strip
+        every tool-loop round, which pinned DeepSeek hits at ~50% (identity +
+        tool schemas only). Spill large results at write time; rewrite here
+        only at a declared compaction point (over ``trim_at``).
+        """
+        messages = self._drop_orphan_tool_artifacts(messages)
+        usable, trim_at = self._input_trim_at(provider)
+        total = estimate_tokens_for_messages(messages)
+        if total <= trim_at:
+            return messages
+
+        log.info(
+            "context_overflow_compact",
+            total=total,
+            usable=usable,
+            trim_at=trim_at,
+            ratio=CONTEXT_TRIM_TRIGGER_RATIO,
+        )
+        compacted = self._compact_overflow_messages(messages)
+        compacted_total = estimate_tokens_for_messages(compacted)
+        if compacted_total <= trim_at:
+            return self._drop_orphan_tool_artifacts(compacted)
+
+        trimmed = self._hard_trim_tail(compacted, trim_at)
+        log.info(
+            "context_trimmed",
+            original=len(messages),
+            trimmed=len(trimmed),
+            tokens=estimate_tokens_for_messages(trimmed),
+        )
         return trimmed
 
     @staticmethod
@@ -247,6 +278,8 @@ class ContextMixin:
                 continue
             out.append(m)
             i += 1
+        if len(out) == n and all(out[k] is messages[k] for k in range(n)):
+            return messages
         return out
 
     # ── 中轮提醒 ────────────────────────────────────────────
