@@ -2187,9 +2187,8 @@ class Agent:
     async def _ack_inbox_on_give_up(self, inbox_ids: list[str]) -> None:
         """ACK noisy inbox on give-up but keep review/escalation/ask wakes.
 
-        Also inject a ledger [LEDGER REVIEW] wake when this agent still owns
-        submitted/reviewing tasks as creator — so CREATOR_MUST_REVIEW survives
-        even if the original [TASK SUBMITTED] rows were somehow lost.
+        MERGE PROXY heal still runs for approved creator duties (assignment,
+        not progress催). No synthetic [LEDGER REVIEW] / [MERGE PENDING] inject.
         """
         to_ack, to_spare = await self._inbox.partition_give_up_ack(
             self.id, list(inbox_ids or [])
@@ -2208,7 +2207,11 @@ class Agent:
         await self._inject_ledger_review_wake()
 
     async def _inject_ledger_review_wake(self) -> None:
-        """If creator still has review/merge duties, force a task-class wake."""
+        """On give-up: MERGE PROXY for approved creator duties only.
+
+        Does **not** inject [LEDGER REVIEW] / [MERGE PENDING] inbox催
+        (2026-08-17). Spare/ensure_wake already keeps real task wakes.
+        """
         try:
             from hiveweave.services.task import TaskService
 
@@ -2218,93 +2221,29 @@ class Agent:
         except Exception as e:
             log.debug("ledger_obligations_lookup_failed", error=str(e))
             return
-        review = [
-            t
-            for t in (obl or [])
-            if t.get("role_hint") == "creator"
-            and t.get("status") in ("submitted", "reviewing")
-        ]
         merge = [
             t
             for t in (obl or [])
             if t.get("role_hint") == "creator" and t.get("status") == "approved"
         ]
-        if not review and not merge:
+        if not merge:
             return
+        try:
+            from hiveweave.services.merge_proxy import escalate_merge_proxy
 
-        async def _send(body: str, task_id: str | None, kind: str) -> None:
-            try:
-                await self._inbox.send_message(
-                    from_agent_id="system",
-                    to_agent_id=self.id,
-                    message=body,
-                    message_type="task",
-                    priority="urgent",
-                    task_id=task_id,
-                    wake=True,
+            for t in merge[:5]:
+                await escalate_merge_proxy(
+                    self.project_id,
+                    t,
+                    reason="creator_give_up",
+                    trigger=True,
                 )
-                log.info(
-                    f"ledger_{kind}_wake_injected",
-                    agent_id=self.id,
-                    count=(
-                        len(review) if kind == "review" else len(merge)
-                    ),
-                )
-            except Exception as e:
-                log.warning(
-                    f"ledger_{kind}_wake_failed",
-                    agent_id=self.id,
-                    error=str(e),
-                )
-
-        if review:
-            lines = []
-            for t in review[:8]:
-                tid = str(t.get("id") or "")
-                title = (t.get("title") or "(untitled)").split("\n")[0][:50]
-                lines.append(f"  - {tid[:8]} [{t.get('status')}] {title}")
-            extra = len(review) - len(lines)
-            body = (
-                f"[LEDGER REVIEW] You still have {len(review)} task(s) awaiting "
-                f"review_task (status submitted/reviewing). Do not ignore the ledger "
-                f"after an LLM error. Use review_task(taskId, decision):\n"
-                + "\n".join(lines)
-                + (f"\n  - …and {extra} more" if extra > 0 else "")
+        except Exception as e:
+            log.debug(
+                "merge_proxy_on_give_up_failed",
+                agent_id=self.id,
+                error=str(e),
             )
-            await _send(body, str(review[0].get("id") or "") or None, "review")
-
-        if merge:
-            lines = []
-            for t in merge[:8]:
-                tid = str(t.get("id") or "")
-                title = (t.get("title") or "(untitled)").split("\n")[0][:50]
-                lines.append(f"  - {tid[:8]} [approved] {title}")
-            extra = len(merge) - len(lines)
-            body = (
-                f"[MERGE PENDING] You still have {len(merge)} approved task(s) "
-                f"awaiting git_worktree_merge. Do not leave worktree-only. "
-                f"Call git_worktree_merge(branchName=shortId or hw/...):\n"
-                + "\n".join(lines)
-                + (f"\n  - …and {extra} more" if extra > 0 else "")
-            )
-            await _send(body, str(merge[0].get("id") or "") or None, "merge")
-            # Give-up + approved: escalate MERGE PROXY to parent with MERGE
-            try:
-                from hiveweave.services.merge_proxy import escalate_merge_proxy
-
-                for t in merge[:5]:
-                    await escalate_merge_proxy(
-                        self.project_id,
-                        t,
-                        reason="creator_give_up",
-                        trigger=True,
-                    )
-            except Exception as e:
-                log.debug(
-                    "merge_proxy_on_give_up_failed",
-                    agent_id=self.id,
-                    error=str(e),
-                )
 
     async def _escalate_turn_interruption(self, *, reason: str) -> None:
         """连续中断超限，给上级发一次升级消息。

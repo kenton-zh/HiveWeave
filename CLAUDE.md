@@ -374,8 +374,8 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 **Stall 检测三层机制**（区分清楚，不要混淆）：
 
 1. **Inbox stall / awaiting-reply 催办 — 已禁用**（`_check_stalled` / `_nudge_awaiting_replies` no-op）。回复义务由 turn exit 的 `expect_report` / `ask` + 收件人 ID 检查强制执行，不做周期性催办。
-2. **Task stall 催办 — 活跃**（`_nudge_stale_ledger` 内的 `TASK_STALL_THRESHOLDS` 段）。按任务状态停留时间催办：running>20min / submitted>10min / reviewing>10min / rework>10min / created>5min / claimed>5min。超过 `STALL_ESCALATION_THRESHOLD`(3) 次后升级到上级。与 P0-3 stall break 互斥：近 5 分钟内被 STALL BREAK 的 agent 不再收到 task stall nudge。
-3. **沉默观测看门狗 — 活跃**（`_check_silent_agents`）：agent **10 分钟无任何产出**（chat_messages assistant 行 / work_logs）→ 唤醒 + 红框；持续 30 分钟 → 通知上级。覆盖"接活后当场死亡、名下无待回复消息"的盲区。PROCESSING 豁免**不覆盖 streaming 僵尸**（P0-3：流式超阈值无事件者纳入沉默检测）。
+2. **Task dwell 时钟 — 平台自愈，不 inbox 催人**（`_nudge_stale_ledger`）：阈值仍按状态停留时间计（running>20min / claimed>5min 等），但**只**做 auto-submit（running 已合入）、VERIFY executor 改派、MERGE PROXY；**不**发 `[TASK STALL]` / 周期性 `[LEDGER REVIEW]` / `[ORPHAN TASK]` / 重复 `[MERGE PENDING]`。到期叫醒只走 wait 合同的 `[WAIT_TIMEOUT]`（只醒等待方）。
+3. **沉默观测看门狗 — 自醒 + 红框，不催上级**（`_check_silent_agents`）：agent **10 分钟无任何产出** → 唤醒本人 + 红框；持续 30 分钟 → **只打日志**，不 inbox 上级。PROCESSING 豁免**不覆盖 streaming 僵尸**（P0-3）。
 
 **P0-3 跨轮 STALL BREAK 账本**（`agents/agent.py`）：streamer 的 `tool_loop_stall` 检测（同轮内连续无进展工具调用）触发 `[STALL BREAK]` 结束当前 turn。跨轮账本 `_stall_break_ledger` 记录每次 stall break 时间戳；30 分钟内第 2 次 → agent disposition=blocked + `[AGENT STUCK]` 升级上级。防止"有产出但无进展"的 agent 无限空转。
 

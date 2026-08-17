@@ -107,6 +107,41 @@ class BrowseParams(BaseModel):
     )
 
 
+async def _force_main_ui_workspace(
+    agent_id: str,
+    workspace: str,
+    task_id: str | None,
+    command: str = "",
+) -> tuple[str, str]:
+    """Force VERIFY / ui_browser_e2e browse onto MAIN (same as bash tests).
+
+    Returns ``(exec_workspace, note)``. Fail-open: keep the original
+    workspace if project/task lookup fails.
+    """
+    try:
+        from hiveweave.tools.bash import _resolve_verify_main_workspace
+        from hiveweave.tools.helpers import get_project_id
+
+        project_id = await get_project_id(agent_id)
+        if not project_id:
+            return workspace or "", ""
+        exec_ws, note, _tid = await _resolve_verify_main_workspace(
+            project_id,
+            agent_id,
+            task_id,
+            workspace or "",
+            command,
+            require_test_command=False,
+            include_ui_policy=True,
+        )
+        if not exec_ws:
+            return "", note
+        return exec_ws, note
+    except Exception as e:
+        log.warning("force_main_ui_workspace_failed", error=str(e))
+        return workspace or "", ""
+
+
 def _parse_argv(params: BrowseParams) -> list[str] | None:
     if params.args:
         return [str(a) for a in params.args if str(a).strip()]
@@ -532,14 +567,16 @@ async def issue_browse_e2e_attestation(
             from hiveweave.services.worktree_review import project_main_workspace
 
             task = await TaskService().get_task(project_id, resolved_task)
-            if task and TaskService._is_verify_task(task):
+            from hiveweave.tools.bash import _task_needs_main_workspace
+
+            if _task_needs_main_workspace(task, include_ui_policy=True):
                 main_ws = await project_main_workspace(project_id)
                 if workspace and main_ws and not _is_same_workspace(workspace, main_ws):
                     return (
-                        "\n\n[browse_e2e REJECTED] VERIFY 任务的 UI 证据必须在主"
-                        f"工作区执行（当前 workspace={workspace!r} 非 main="
-                        f"{main_ws!r}）。请让 coordinator/CEO（项目根==main）"
-                        "执行 UI 验收，或由负责人 waive_attestation。"
+                        "\n\n[browse_e2e REJECTED] VERIFY / ui_browser_e2e UI "
+                        f"evidence must run on MAIN (workspace={workspace!r} "
+                        f"main={main_ws!r}). Platform should have forced "
+                        "cwd=MAIN before browse — this is a platform bug."
                         + bind_note
                     )
         except Exception:
@@ -650,7 +687,8 @@ def _contract_snapshot_output(
     "Example: browse(args=[\"goto\",\"http://127.0.0.1:3000\"]) then "
     "browse(args=[\"snapshot\",\"-i\"]). If goto/eval keep timing out, "
     "call browse(args=[\"restart\"]) to close the session first. "
-    "On success issues a browse_e2e attestation.",
+    "On success issues a browse_e2e attestation. VERIFY / ui_browser_e2e "
+    "tasks are forced onto project MAIN (same as bash tests).",
     requires_workspace=True,
     security_level="shell",
 )
@@ -666,6 +704,13 @@ async def browse_tool(
             'browse requires args or command. Example: '
             'args=["goto","http://127.0.0.1:3000"]'
         )
+
+    exec_ws, force_note = await _force_main_ui_workspace(
+        agent_id, workspace, params.task_id, command=" ".join(argv)
+    )
+    if not exec_ws and force_note:
+        return ToolResult.err(force_note.strip())
+    workspace = exec_ws or workspace
 
     # Soft guard: discourage attaching to the operator's daily profile URLs
     # that look like credential harvesting — still allow localhost / file / http(s).
@@ -735,6 +780,10 @@ async def browse_tool(
         core_interaction=core_interaction,
         screenshot_path=screenshot_abs,
     )
+    if force_note:
+        attest_note = f"{force_note}{attest_note}"
+    if "[browse_e2e REJECTED]" in attest_note:
+        return ToolResult.err(attest_note.strip())
 
     # 大快照短契约化 —— attestation 先按全量 stdout 出证（stdout_hash
     # 完整性），返回文本再收短契约；<50KB 的快照原样返回。
@@ -832,12 +881,22 @@ async def assert_visual_tool(
             "no console-error overlay.'"
         )
 
+    orig_ws = workspace
+    exec_ws, force_note = await _force_main_ui_workspace(
+        agent_id, workspace, params.task_id
+    )
+    if not exec_ws and force_note:
+        return ToolResult.err(force_note.strip())
+    workspace = exec_ws or workspace
+
     shot = resolve_screenshot_path(workspace, params.screenshot_path)
+    if shot is None and orig_ws and orig_ws != workspace:
+        shot = resolve_screenshot_path(orig_ws, params.screenshot_path)
     if shot is None:
         return ToolResult.err(
             f"Screenshot path rejected or outside workspace: "
-            f"{params.screenshot_path!r}. Use a path under your worktree "
-            f"(e.g. evidence/flow.png)."
+            f"{params.screenshot_path!r}. Use a path under MAIN / your "
+            f"worktree (e.g. evidence/flow.png)."
         )
     if not shot.is_file():
         return ToolResult.err(
@@ -893,20 +952,24 @@ async def assert_visual_tool(
                     from hiveweave.services.worktree_review import (
                         project_main_workspace,
                     )
-                    from hiveweave.tools.bash import _is_same_workspace
+                    from hiveweave.tools.bash import (
+                        _is_same_workspace,
+                        _task_needs_main_workspace,
+                    )
 
                     _task = await TaskService().get_task(project_id, task_id)
-                    if _task and TaskService._is_verify_task(_task):
+                    if _task_needs_main_workspace(
+                        _task, include_ui_policy=True
+                    ):
                         _main_ws = await project_main_workspace(project_id)
                         if workspace and _main_ws and not _is_same_workspace(
                             workspace, _main_ws
                         ):
-                            return ToolResult.ok(
-                                "\n[visual_check REJECTED] VERIFY 任务的 UI 证据"
-                                "必须在主工作区执行（当前非 main）。请让 "
-                                "coordinator/CEO 执行 UI 验收，或由负责人 "
-                                "waive_attestation。",
-                                att_id=None,
+                            return ToolResult.err(
+                                "[visual_check REJECTED] VERIFY / ui_browser_e2e "
+                                "UI evidence must run on MAIN. Platform should "
+                                "have forced cwd=MAIN — this is a platform bug."
+                                + (bind_note or "")
                             )
                 except Exception:
                     pass
@@ -949,7 +1012,7 @@ async def assert_visual_tool(
         f"Visual check recorded: verdict={params.verdict}.\n"
         f"screenshot={shot}\n"
         f"observed={observed[:500]}"
-        f"{attest_note}\n"
+        f"{force_note}{attest_note}\n"
         "[VISION] Image re-attached — confirm your observation still matches "
         "the pixels before submit_task."
     )

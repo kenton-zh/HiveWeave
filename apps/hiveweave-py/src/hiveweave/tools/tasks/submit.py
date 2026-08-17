@@ -155,7 +155,9 @@ async def _submit_preflight(
     行为一致。
     """
     from hiveweave.services.attestation import (
+        CODE_AUDIT_KIND,
         attestation_service,
+        ledger_policy_id,
         required_attestation_kinds,
         resolve_task_policy,
     )
@@ -169,26 +171,15 @@ async def _submit_preflight(
             tags = json.loads(tags)
         except Exception:
             tags = []
-    policy_id = (
-        task.get("policy_id")
-        or resolve_task_policy(
-            title=task.get("title") or "",
-            tags=tags if isinstance(tags, list) else [],
-            description=task.get("description") or "",
-        )
-    )
+    policy_id = ledger_policy_id(task)
     needed = required_attestation_kinds(policy_id)
     attest_ids = list(params.attestation_ids or [])
 
-    # 审计结论：agent 把 code_audit 凭证塞进 attestationIds 时，strict 策略
-    # 会以 "kind not in expected" 硬拒 —— 审计凭证不是交付证据，先剔除，
-    # 其它 kind 行为不变（查不到 kind 时 fail-open 保持原样）。
-    if attest_ids:
+    # Drop code_audit ids only when the policy does not require that kind
+    # (audit is not a substitute for tests/browse). When code_audit* gates
+    # require it, keep the ids so AND verify_ids can pass.
+    if attest_ids and not (needed and CODE_AUDIT_KIND in needed):
         try:
-            try:
-                from hiveweave.services.code_audit import CODE_AUDIT_KIND
-            except Exception:  # noqa: BLE001
-                CODE_AUDIT_KIND = "code_audit"
             kept = []
             for _aid in attest_ids:
                 _row = await attestation_service.get(project_id, str(_aid))
@@ -338,16 +329,29 @@ async def _submit_preflight(
                         f"files=[{{path: \"specs/...\"}}]) then "
                         f"submit_task(..., attestationIds=[...]).\n"
                     )
-                elif policy_id == "ui_browser_e2e":
+                elif policy_id in ("ui_browser_e2e", "code_audit_visual"):
+                    audit_bit = (
+                        "request_code_audit(...) then " if policy_id == "code_audit_visual"
+                        else ""
+                    )
                     opt1 = (
-                        f"1) browse(...) then browse(screenshot) then "
+                        f"1) {audit_bit}browse(...) then browse(screenshot) then "
                         f"assert_visual(screenshotPath=..., "
                         f"observed=\"what you SEE in the image\", "
                         f"verdict=\"pass\") then "
                         f"submit_task(taskId=\"{task_id}\", "
-                        f"attestationIds=[browse_e2e id, visual_check id]). "
-                        f"Need BOTH kinds; verdict=fail does not unlock submit; "
-                        f"a PNG path alone is rejected.\n"
+                        f"attestationIds=[... matching kinds ...]). "
+                        f"Need ALL required kinds; verdict=fail does not unlock submit.\n"
+                    )
+                elif needed and CODE_AUDIT_KIND in needed:
+                    extra = (
+                        " and bash(..., taskId=this task) for test_run"
+                        if "test_run" in needed
+                        else ""
+                    )
+                    opt1 = (
+                        f"1) request_code_audit(taskId=\"{task_id}\"){extra} "
+                        f"then submit_task(..., attestationIds=[code_audit id, ...]).\n"
                     )
                 else:
                     opt1 = (

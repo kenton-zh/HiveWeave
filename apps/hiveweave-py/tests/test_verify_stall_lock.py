@@ -211,7 +211,10 @@ async def test_task_stall_skips_when_has_live_jobs_for_agent():
 
 @pytest.mark.asyncio
 async def test_task_stall_nudges_when_live_job_is_other_task():
-    """A bg-bash bound to another task must not freeze THIS task's stall."""
+    """A bg-bash bound to another task must not freeze THIS task's dwell clock.
+
+    Platform records the stall clock; no [TASK STALL] inbox催.
+    """
     from hiveweave.services import game_time as gt
 
     project_id = "proj-stall-other-job"
@@ -254,17 +257,18 @@ async def test_task_stall_nudges_when_live_job_is_other_task():
     try:
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
             await svc._nudge_stale_ledger(project_id)
+        assert (gt._states[project_id].get("task_stall_counts") or {}).get(
+            "claimed-1", 0
+        ) >= 1
     finally:
         gt._states.pop(project_id, None)
 
-    assert any(
-        (m.get("message") or "").startswith("[TASK STALL]") for m in sent
-    )
+    assert sent == []
 
 
 @pytest.mark.asyncio
 async def test_task_stall_nudges_idle_verify_lock_waiter():
-    """Queued VERIFY (created) with no wait contract and no live job still stalls."""
+    """Queued VERIFY (created) with no wait / no live job: clock ticks, no inbox催."""
     from hiveweave.services import game_time as gt
 
     project_id = "proj-stall-lock-waiter"
@@ -299,12 +303,13 @@ async def test_task_stall_nudges_idle_verify_lock_waiter():
     try:
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
             await svc._nudge_stale_ledger(project_id)
+        assert (gt._states[project_id].get("task_stall_counts") or {}).get(
+            "verify-queued-1", 0
+        ) >= 1
     finally:
         gt._states.pop(project_id, None)
 
-    assert any(
-        (m.get("message") or "").startswith("[TASK STALL]") for m in sent
-    )
+    assert sent == []
 
 
 @pytest.mark.asyncio

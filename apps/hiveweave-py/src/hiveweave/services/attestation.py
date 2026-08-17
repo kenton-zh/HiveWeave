@@ -544,7 +544,7 @@ class AttestationService:
                 return False, f"Attestation missing stdout_hash: {aid}"
             # visual_check / test_run / browse_e2e with exit≠0 must NOT unlock
             # gates (failed runs are still recorded for audit — TEST6 P0-3).
-            if kind in (VISUAL_CHECK_KIND, "test_run", BROWSE_E2E_KIND):
+            if kind in (VISUAL_CHECK_KIND, "test_run", BROWSE_E2E_KIND, CODE_AUDIT_KIND):
                 ec = row.get("exit_code")
                 if ec is not None and int(ec) != 0:
                     return (
@@ -695,10 +695,56 @@ VISUAL_CHECK_KIND = "visual_check"
 # Issued by browse tool on successful CLI runs (including screenshot).
 BROWSE_E2E_KIND = "browse_e2e"
 
+CODE_AUDIT_KIND = "code_audit"
+
 # Tag tokens that hard-select docs_only policy (narrow — avoid loose "docs").
 _DOCS_TAGS = frozenset({"docs_only", "doc_review"})
-_UI_TAGS = frozenset({"ui_browser_e2e", "ui", "e2e", "browser"})
-_TEST_TAGS = frozenset({"generic_tests", "tests", "test_run"})
+_UI_TAGS = frozenset({"ui_browser_e2e", "ui", "e2e", "browser", "module_visual"})
+_TEST_TAGS = frozenset({"generic_tests", "tests", "test_run", "unit"})
+_AUDIT_TAGS = frozenset({"code_audit"})
+
+# Dispatch/create structured gate → policy_id. Tools refuse if missing.
+SUBMIT_GATE_TO_POLICY: dict[str, str] = {
+    "docs": "docs_only",
+    "unit": "generic_tests",
+    "module_visual": "ui_browser_e2e",
+    "code_audit": "code_audit",
+    "code_audit+module_visual": "code_audit_visual",
+    "code_audit+unit": "code_audit_unit",
+}
+
+_SUBMIT_GATE_ALIASES = {
+    "code_audit+visual": "code_audit+module_visual",
+    "audit+visual": "code_audit+module_visual",
+    "audit+unit": "code_audit+unit",
+    "visual": "module_visual",
+}
+
+
+def normalize_submit_gate(raw: str | None) -> str | None:
+    """Return canonical submitGate or None if empty."""
+    g = (raw or "").strip().lower().replace(" ", "")
+    if not g:
+        return None
+    g = _SUBMIT_GATE_ALIASES.get(g, g)
+    return g
+
+
+def policy_from_submit_gate(raw: str | None) -> str:
+    """Map required submitGate enum to policy_id. Raises ValueError if missing/unknown."""
+    g = normalize_submit_gate(raw)
+    if not g:
+        raise ValueError(
+            "submitGate is required. Use one of: "
+            + ", ".join(sorted(SUBMIT_GATE_TO_POLICY))
+        )
+    policy = SUBMIT_GATE_TO_POLICY.get(g)
+    if not policy:
+        raise ValueError(
+            f"unknown submitGate {raw!r}. Use one of: "
+            + ", ".join(sorted(SUBMIT_GATE_TO_POLICY))
+        )
+    return policy
 
 
 async def create_doc_review(
@@ -1028,9 +1074,18 @@ def resolve_task_policy(
     tags_l = {str(t).strip().lower() for t in (tags or []) if t}
     if tags_l & _DOCS_TAGS:
         return "docs_only"
-    if tags_l & _UI_TAGS:
+    audit = bool(tags_l & _AUDIT_TAGS)
+    ui = bool(tags_l & _UI_TAGS)
+    tests = bool(tags_l & _TEST_TAGS)
+    if audit and ui:
+        return "code_audit_visual"
+    if audit and tests:
+        return "code_audit_unit"
+    if audit:
+        return "code_audit"
+    if ui:
         return "ui_browser_e2e"
-    if tags_l & _TEST_TAGS:
+    if tests:
         return "generic_tests"
     return "coordinator_review"
 
@@ -1041,15 +1096,49 @@ POLICY_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
     # UI: live browse evidence AND pixel-grounded assert_visual (AND).
     # Path-only PNG or prose-without-browse is rejected.
     "ui_browser_e2e": frozenset({VISUAL_CHECK_KIND, BROWSE_E2E_KIND}),
-    # Soft for others — coordinator judges browse/test evidence on review
-    "generic_tests": None,
+    # unit submitGate: leaf must hang a passing test_run (not mid-level 取证)
+    "generic_tests": frozenset({"test_run"}),
     "coordinator_review": None,
+    "code_audit": frozenset({CODE_AUDIT_KIND}),
+    "code_audit_visual": frozenset(
+        {CODE_AUDIT_KIND, VISUAL_CHECK_KIND, BROWSE_E2E_KIND}
+    ),
+    "code_audit_unit": frozenset({CODE_AUDIT_KIND, "test_run"}),
 }
 
 
+def ledger_policy_id(task: dict[str, Any], *, tags: list | None = None) -> str:
+    """Policy from the task row only — ignore hung ``evidence.policy_id``."""
+    pid = str(task.get("policy_id") or "").strip()
+    if pid:
+        return pid
+    raw_tags = tags
+    if raw_tags is None:
+        raw_tags = task.get("tags") or []
+        if isinstance(raw_tags, str):
+            try:
+                raw_tags = json.loads(raw_tags)
+            except Exception:
+                raw_tags = []
+    return resolve_task_policy(
+        title=task.get("title") or "",
+        tags=raw_tags if isinstance(raw_tags, list) else [],
+        description=task.get("description") or "",
+    )
+
+
 def required_attestation_kinds(policy_id: str) -> frozenset[str] | None:
-    """Kinds required at submit/approve for ``policy_id``, or None (soft)."""
-    return POLICY_REQUIRED_KINDS.get(policy_id)
+    """Kinds required at submit/approve for ``policy_id``, or None (soft).
+
+    Unknown ``policy_id`` fail-closes (non-empty impossible kind) so a forged
+    or stale id cannot skip the gate. Empty/missing still falls through via
+    ``ledger_policy_id`` → ``resolve_task_policy``.
+    """
+    if not policy_id:
+        return None
+    if policy_id not in POLICY_REQUIRED_KINDS:
+        return frozenset({"_unknown_policy"})
+    return POLICY_REQUIRED_KINDS[policy_id]
 
 
 # ── P0-2: Reviewer-side execution evidence ──────────────────────────────
@@ -1071,6 +1160,11 @@ REVIEWER_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
     "coordinator_review": frozenset({REVIEWER_KIND}),
     # Docs: doc_review by reviewer is sufficient (or waiver)
     "docs_only": None,
+    "code_audit": frozenset({CODE_AUDIT_KIND}),
+    "code_audit_visual": frozenset(
+        {CODE_AUDIT_KIND, BROWSE_E2E_KIND, VISUAL_CHECK_KIND}
+    ),
+    "code_audit_unit": frozenset({REVIEWER_KIND}),
 }
 
 
@@ -1282,7 +1376,9 @@ def format_attestation_mismatch_hint(
     if not held:
         return (
             "You hold no fresh successful attestation (any task). "
-            "Run tests with taskId set to the task under review."
+            "Consume the assignee's hung attestations for this task, or "
+            "review_task(rework) so the leaf can produce the submitGate kinds. "
+            "Do not run full-site tests yourself to unlock a leaf gate."
         )
     lines = [
         "You hold fresh attestation(s) that do not match this task:"
@@ -1300,8 +1396,9 @@ def format_attestation_mismatch_hint(
             f"  - {kind} id={hid}… bound_task={str(bound)[:8]} ({match})"
         )
     lines.append(
-        f"Target task={str(target_task_id)[:8]}… — re-run tests with "
-        f'taskId="{target_task_id}" or consume assignee evidence on this task.'
+        f"Target task={str(target_task_id)[:8]}… — consume assignee evidence "
+        f"on this task, or review_task(rework) for the leaf to attach the "
+        f"submitGate kinds. Do not re-run tests yourself to unlock approve."
     )
     return "\n".join(lines)
 
@@ -1329,14 +1426,8 @@ async def check_task_attestations(
             evidence = json.loads(evidence)
         except Exception:
             evidence = {}
-    policy_id = (
-        (evidence.get("policy_id") if isinstance(evidence, dict) else None)
-        or task.get("policy_id")
-        or resolve_task_policy(
-            title=task.get("title") or "",
-            tags=tags if isinstance(tags, list) else [],
-            description=task.get("description") or "",
-        )
+    policy_id = ledger_policy_id(
+        task, tags=tags if isinstance(tags, list) else None
     )
     needed = required_attestation_kinds(policy_id)
     if not needed:

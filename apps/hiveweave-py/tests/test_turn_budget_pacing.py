@@ -69,6 +69,11 @@ def _make_streamer() -> Streamer:
     )
     # 上下文裁剪 / 中轮提醒与本测试无关，置为恒等避免引入依赖
     streamer._trim_context_if_needed = lambda messages, provider: messages  # type: ignore[method-assign]
+
+    async def _ident_pressure(messages, provider, **kwargs):
+        return messages
+
+    streamer._pressure_compact_if_needed = _ident_pressure  # type: ignore[method-assign]
     streamer._maybe_inject_mid_round_reminder = (  # type: ignore[method-assign]
         lambda messages, round_num, cap: messages
     )

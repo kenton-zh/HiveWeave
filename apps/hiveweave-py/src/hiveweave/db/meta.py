@@ -160,7 +160,9 @@ async def init_meta_db() -> None:
         # WAL 孤儿化/代际分叉损坏 —— TEST18 事故根因 2026-08-05）
         await _db.execute("PRAGMA encoding = 'UTF-8'")
         await _db.execute("PRAGMA journal_mode=DELETE")
-        await _db.execute("PRAGMA busy_timeout=5000")
+        from hiveweave.config import sqlite_busy_timeout_sql
+
+        await _db.execute(sqlite_busy_timeout_sql())
         await _db.execute("PRAGMA foreign_keys=ON")
 
         # Create tables

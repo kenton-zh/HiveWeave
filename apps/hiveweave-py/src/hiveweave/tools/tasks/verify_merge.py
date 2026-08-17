@@ -17,7 +17,6 @@ from hiveweave.tools.tasks.verify_spawn import (
     VERIFY_STALE_COOLDOWN_MS,
     VERIFY_STALE_MS,
     _nudge_one_verify_task,
-    _spawn_post_approve_verify_task,
     _stale_verify_cooldowns,
     nudge_pending_verify_tasks,
 )
@@ -189,10 +188,11 @@ async def nudge_verify_tasks_after_merge(
     merged_files: list[str] | None = None,
     merge_commit: str | None = None,
 ) -> int:
-    """After successful merge: spawn VERIFY for scoped tasks, then nudge.
+    """After successful merge: stamp merge facts, then nudge existing VERIFY.
 
-    VERIFY is intentionally NOT created at approve time — only here.
-    Scope is the merged work (files/branch), not every approved task.
+    Leaf merges do **not** auto-spawn VERIFY. Coordinators dispatch one MAIN
+    milestone QA task (``milestoneVerify=true``). Existing VERIFY rows that
+    belong to this merge scope may still be nudged (serial lock).
     """
     from hiveweave.services.worktree_review import select_tasks_for_merged_work
 
@@ -230,34 +230,8 @@ async def nudge_verify_tasks_after_merge(
                         project_id=project_id,
                         error=str(stamp_err),
                     )
-            spawned = []
-            for t in selected:
-                tid = t.get("id")
-                try:
-                    vid = await _spawn_post_approve_verify_task(
-                        ts, project_id, from_agent_id, t
-                    )
-                    if vid:
-                        spawned.append(vid)
-                    # None: QA delivery closed, or chain-stop. Leave approved
-                    # if still open — migrate_orphan_approved heals; verifying
-                    # without a child has no healer.
-                except Exception as spawn_err:
-                    log.warning(
-                        "verify_spawn_one_failed",
-                        parent_id=tid,
-                        error=str(spawn_err),
-                    )
-            if spawned:
-                log.info(
-                    "verify_spawned_after_merge",
-                    project_id=project_id,
-                    assignee_id=agent_id,
-                    count=len(spawned),
-                    parent_ids=list(parent_ids),
-                )
         except Exception as e:
-            log.warning("verify_spawn_after_merge_failed", error=str(e))
+            log.warning("verify_nudge_after_merge_failed", error=str(e))
             raise
 
     tasks = await ts.list_tasks(project_id)

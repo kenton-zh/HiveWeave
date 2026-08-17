@@ -3,8 +3,8 @@
 - Fix A: parked blocked VERIFY（无自动解封路径）不占串行化锁
 - Fix B: update_task_status blocked 结构化契约（dependsOnTaskIds / waitKind /
   wakeAt；无 deps 且无 wake_at 硬拒；不再从 blockedReason 文案猜意图）
-- Fix C: BLOCKED STALE 看门狗发给 creator（设卡人）+ 仅对「有 wake 路径」
-  任务跳过 live_wait_agents
+- Fix C: BLOCKED STALE inbox 已禁用；reconcile 仍解封有路径的 blocked。
+  parked（无 wake 路径）任务不再催 creator。
 - 回归：blocked_task_has_wake_path 判定本身
 """
 
@@ -449,8 +449,7 @@ def _run_watchdog(env):
 async def test_watchdog_parked_blocked_notified_to_creator_despite_live_wait(
     gt_env,
 ):
-    """parked（无 wake 路径）blocked 任务：assignee 即使持有活跃 wait contract
-    也**必须**催办，且发给 creator（设卡人）而非被 park 的 assignee。"""
+    """parked（无 wake 路径）blocked：不再发 [BLOCKED STALE]；reconcile only."""
     await _seed_agents(gt_env)
     ts = TaskService()
     pid = gt_env["project_id"]
@@ -470,12 +469,9 @@ async def test_watchdog_parked_blocked_notified_to_creator_despite_live_wait(
     ):
         await _run_watchdog(gt_env)
 
-    assert send.await_count >= 1
-    sent = send.await_args_list[0]
-    kwargs = sent.kwargs
-    assert kwargs["to_agent_id"] == CEO_ID  # creator，不是 assignee
-    assert "BLOCKED STALE" in kwargs["message"]
-    assert "NO auto-unblock path" in kwargs["message"]
+    assert send.await_count == 0
+    task = await ts.get_task(pid, tid)
+    assert task["status"] == "blocked"
 
 
 @pytest.mark.asyncio

@@ -103,7 +103,11 @@ class DispatchService:
                             session_id: str | None = None,
                             expect_report: bool = False,
                             create_handoff: bool = True,
-                            existing_task_id: str | None = None) -> dict:
+                            existing_task_id: str | None = None,
+                            policy_id: str | None = None,
+                            title: str | None = None,
+                            source: str = "agent",
+                            depends_on: list[str] | None = None) -> dict:
         """Coordinator dispatches a task to a subordinate.
 
         1. Create a Task Ledger entry via :class:`TaskService` — obtains
@@ -189,24 +193,40 @@ class DispatchService:
             await self.task_service.update_task(
                 project_id, task_id, assignee_id=to_agent_id
             )
-            try:
-                await self.task_service.ensure_assignee_claimed(
-                    project_id, task_id
-                )
-            except Exception as e:
-                log.warning(
-                    "dispatch_ensure_claimed_failed",
-                    task_id=task_id,
-                    error=str(e),
-                )
+            if depends_on:
+                try:
+                    await self.task_service.apply_depends_on(
+                        project_id, task_id, depends_on
+                    )
+                except ValueError as e:
+                    return {
+                        "success": False,
+                        "message": str(e),
+                        "from_agent_id": from_agent_id,
+                        "to_agent_id": to_agent_id,
+                    }
+            existing_after = await self.task_service.get_task(project_id, task_id)
+            if (existing_after or {}).get("status") != "blocked":
+                try:
+                    await self.task_service.ensure_assignee_claimed(
+                        project_id, task_id
+                    )
+                except Exception as e:
+                    log.warning(
+                        "dispatch_ensure_claimed_failed",
+                        task_id=task_id,
+                        error=str(e),
+                    )
         else:
             task_id = await self.task_service.create_task(
                 project_id=project_id,
-                title=description[:100],
+                title=(title or description)[:100],
                 description=description,
                 creator_id=from_agent_id,
                 assignee_id=to_agent_id,
-                source="agent",
+                source=source,
+                policy_id=policy_id,
+                depends_on=depends_on,
             )
 
         # Ensure executor/builder-coordinator worktree + pin paths in the message
@@ -364,11 +384,20 @@ class DispatchService:
         )
 
         # 4) inbox 消息携带 task_id（路径已钉到 assignee worktree）
+        task_after = None
+        try:
+            task_after = await self.task_service.get_task(project_id, task_id)
+        except Exception:
+            task_after = None
+        is_blocked = task_after is None or (
+            (task_after or {}).get("status") == "blocked"
+        )
         await self.inbox.send_message(
             from_agent_id, to_agent_id, description_out,
             message_type="task",
             expect_report=expect_report,
             task_id=task_id,
+            wake=False if is_blocked else None,
         )
 
         # 5) handoff 携带 task_id（如启用）
@@ -416,6 +445,7 @@ class DispatchService:
             "description": description_out,
             "worktree_path": wt_meta.get("path"),
             "worktree_short_id": wt_meta.get("short_id"),
+            "blocked": is_blocked,
         }
 
     # ── WORK LOG ─────────────────────────────────────────────

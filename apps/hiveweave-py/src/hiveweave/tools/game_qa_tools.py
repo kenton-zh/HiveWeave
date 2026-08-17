@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from hiveweave.config import resolve_browse_bin
 from hiveweave.tools.base import tool
 from hiveweave.tools.browse_tools import (
+    _force_main_ui_workspace,
     browse_exec,
     browse_missing_bin_hint,
     issue_browse_e2e_attestation,
@@ -165,6 +166,13 @@ async def game_run_case_tool(
 
     action = (params.action or "").strip().lower()
     timeout = max(30, min(int(params.timeout_sec or 90), 300))
+
+    exec_ws, force_note = await _force_main_ui_workspace(
+        agent_id, workspace, params.task_id
+    )
+    if not exec_ws and force_note:
+        return ToolResult.err(force_note.strip())
+    workspace = exec_ws or workspace
 
     try:
         if action == "probe":

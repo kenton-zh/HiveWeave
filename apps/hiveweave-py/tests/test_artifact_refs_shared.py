@@ -110,6 +110,7 @@ async def test_shared_artifact_ref_no_path_invisible(tmp_path: Path):
     params = DispatchTaskParams(
         target="A009",
         task="实现登录模块",
+        submitGate="unit",
         artifact_refs=[".hiveweave/shared/file.md"],
     )
     patches = _run_patches(tmp_path)
@@ -129,6 +130,7 @@ async def test_tool_outputs_artifact_ref_still_warns(tmp_path: Path):
     params = DispatchTaskParams(
         target="A009",
         task="实现登录模块",
+        submitGate="unit",
         artifact_refs=[".hiveweave/tool_outputs/out.txt"],
     )
     patches = _run_patches(tmp_path)

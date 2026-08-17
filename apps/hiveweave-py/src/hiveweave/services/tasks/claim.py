@@ -34,6 +34,8 @@ class ClaimMixin:
         require_task_id: Any
         _transition: Any
         emit_task_event: Any
+        unmet_depends_on: Any
+        _depends_on_list: Any
 
     async def ensure_assignee_claimed(
         self, project_id: str, task_id: str
@@ -221,9 +223,21 @@ class ClaimMixin:
                                    actor_id=reassigned_by)
             new_status = "running"
         elif status == "blocked":
-            await self._transition(project_id, task_id, "running",
-                                   actor_id=reassigned_by)
-            new_status = "running"
+            if self._is_verify_task(task):
+                await self._transition(project_id, task_id, "running",
+                                       actor_id=reassigned_by)
+                new_status = "running"
+            else:
+                unmet = await self.unmet_depends_on(
+                    project_id, self._depends_on_list(task.get("depends_on"))
+                )
+                if unmet:
+                    # Swap assignee, stay queued — do not start unmet-dep work.
+                    new_status = "blocked"
+                else:
+                    await self._transition(project_id, task_id, "running",
+                                           actor_id=reassigned_by)
+                    new_status = "running"
         elif status == "reviewing":
             # reviewing has no direct → claimed; force for reassignment
             new_status = "claimed"

@@ -207,7 +207,7 @@ async def test_nudge_stale_ledger_duty_session_and_off_duty():
                     ):
                         with patch("time.time", return_value=now / 1000):
                             await svc._nudge_stale_ledger(project_id)
-    assert any(m["message"].startswith("[LEDGER REVIEW]") for m in sent)
+    assert sent == [], "no periodic [LEDGER REVIEW] after duty session ages"
 
     gt._states.pop(project_id, None)
 

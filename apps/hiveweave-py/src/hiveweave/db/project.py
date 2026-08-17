@@ -4,7 +4,7 @@
 - 文件名: data.db（非 project.db — RECONCILE 修复）
 - 位置: <workspace_path>/.hiveweave/data.db
 - journal mode: DELETE（避免 Windows WAL 问题）
-- busy_timeout: 5000
+- busy_timeout: env HIVEWEAVE_SQLITE_BUSY_TIMEOUT_MS (default 5000)
 - 单连接（OpenCode Effect SqlClient 模型），asyncio 序列化
 - 缓存：per-project DB 连接缓存，evict 时关闭
 """
@@ -12,6 +12,7 @@
 import asyncio
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+import sqlite3
 
 import aiosqlite
 from pathlib import Path
@@ -105,7 +106,9 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
         # BUG-009/012/013 fix: explicitly set UTF-8 encoding to prevent CJK mojibake
         await conn.execute("PRAGMA encoding = 'UTF-8'")
         await conn.execute("PRAGMA journal_mode=DELETE")
-        await conn.execute("PRAGMA busy_timeout=5000")
+        from hiveweave.config import sqlite_busy_timeout_sql
+
+        await conn.execute(sqlite_busy_timeout_sql())
         await conn.execute("PRAGMA foreign_keys=ON")
 
         # Create tables + migrations (ALTER TABLE failures are non-fatal — column already exists)
@@ -274,7 +277,9 @@ async def _acquire_readonly_slot(ws: str) -> _ReadonlySlot | None:
                     slot = _ReadonlySlot(conn)
                     building.append(slot)  # 先入列：PRAGMA 失败也能被清理
                     conn.row_factory = aiosqlite.Row
-                    await conn.execute("PRAGMA busy_timeout=5000")
+                    from hiveweave.config import sqlite_busy_timeout_sql
+
+                    await conn.execute(sqlite_busy_timeout_sql())
             except Exception:
                 # DB 文件尚不存在 / 权限问题 → 调用方降级共享连接
                 for slot in building:
@@ -485,6 +490,43 @@ async def _get_write_lock(agent_id: str) -> asyncio.Lock:
     return await get_workspace_write_lock(ws)
 
 
+def is_sqlite_lock_error(exc: BaseException) -> bool:
+    """True for lock/busy/timeout OperationalError (clone_03 write timeouts)."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg or "timed out" in msg
+
+
+async def _execute_write_with_retry(
+    conn: aiosqlite.Connection, sql: str, params: list[Any] | None = None
+) -> None:
+    """Single-statement write with 2 extra retries on SQLite lock/busy."""
+    last: BaseException | None = None
+    for attempt in range(3):
+        try:
+            await conn.execute(sql, params or [])
+            await conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            last = e
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            if not is_sqlite_lock_error(e) or attempt >= 2:
+                raise
+            await asyncio.sleep(0.05 * (2 ** attempt))
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+    if last is not None:
+        raise last
+
+
 async def execute(
     agent_id: str, sql: str, params: list[Any] | None = None
 ) -> None:
@@ -496,19 +538,7 @@ async def execute(
     lock = await _get_write_lock(agent_id)
     async with lock:
         conn = await get_project_db_for_agent(agent_id)
-        try:
-            await conn.execute(sql, params or [])
-            await conn.commit()
-        except Exception:
-            # 语句失败时隐式事务（legacy isolation_level="" 的 DML 隐式 BEGIN）
-            # 残留在共享连接 → 后续 BEGIN IMMEDIATE 报
-            # "cannot start a transaction within a transaction"（slack-clone_03 事故）。
-            # 回滚释放（rollback 自身异常吞掉）后 re-raise，同 execute_transaction。
-            try:
-                await conn.rollback()
-            except Exception:
-                pass
-            raise
+        await _execute_write_with_retry(conn, sql, params)
 
 
 async def execute_transaction(
@@ -563,15 +593,7 @@ async def execute_by_project(
     lock = await get_workspace_write_lock(ws)
     async with lock:
         conn = await ensure_project_db(ws)
-        try:
-            await conn.execute(sql, params or [])
-            await conn.commit()
-        except Exception:
-            try:
-                await conn.rollback()
-            except Exception:
-                pass
-            raise
+        await _execute_write_with_retry(conn, sql, params)
 
 
 async def execute_transaction_by_project(

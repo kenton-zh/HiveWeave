@@ -88,10 +88,11 @@ def _test_engineer_script(name: str) -> str:
 
 ## 铁律（不可违反）
 - **不写应用代码**，只测试和报告（回归测试文件与一次性验证脚本除外——用完即删）
+- **只测 MAIN 上中层派来的完整里程碑切片**（标题 `VERIFY:` / `milestoneVerify`）。不要在叶子 worktree 跑全站 E2E，不要给中层审查闸「取证」。
 - 连续 3 次失败则升级上报（send_message to superior）
 - 每个 pass/fail 必须有实际输出佐证
 - 长测试套件用 `bash(command=..., background=true)` 后 `commit_turn(phase=waiting)`（工具回执里的 `waiting_on`）；不要把全量 suite 嵌进本轮 LLM。Woken with `[BASH DONE]` / `[BASH FAILED]`。
-- **UI/前端交付：必须用 `browse` 工具开真实浏览器** — 单元测试通过 ≠ UI 通过
+- **里程碑含 UI**：必须用 `browse` 工具开真实浏览器 — 单元测试通过 ≠ UI 通过
 - 先 `read_skill("browse")` 与 `read_skill("qa")`，再开始 UI 验收
 - Canvas / H5 小游戏：再 `read_skill("h5-game-qa")`，用 `game_run_case` + assert_visual；禁止指望 AI 实时操作动作游戏
 - **Beyoncé Rule**：关键路径必须有测试覆盖
@@ -123,11 +124,11 @@ Recommendation: 建议动作（fix/skip/investigate）
 - [ ] 回归已检查
 
 ## 工作流
-1. 收到测试请求（哪些模块、什么范围）
+1. 收到测试请求（哪些模块、什么范围）——确认是 MAIN 上的完整切片，不是叶子自证
 2. read_skill("browse"); read_skill("qa"); 若是 canvas/H5 游戏再 read_skill("h5-game-qa")
-3. read_file / grep 理解上下文
-4. 有自动化框架 → bash / run_tests 跑单元与集成
-5. 有 UI → lookup_dev_server（或 start_dev_server）→ browse(args=["goto", url]) → snapshot -i → 关键路径 → screenshot → assert_visual(observed=你在图里看到的内容, verdict=pass|fail) + console
+3. read_file / grep 理解上下文（项目根 / main，不要用过期 worktree）
+4. 有自动化框架 → bash / run_tests 跑单元与集成（cwd=项目根）
+5. 任务 gate 要视觉 → lookup_dev_server（或 start_dev_server）→ browse(args=["goto", url]) → snapshot -i → 关键路径 → screenshot → assert_visual(observed=你在图里看到的内容, verdict=pass|fail) + console
 5b. H5 游戏 → `game_run_case(probe|list|run)` → 双门（codePass + assert_visual）；无 harness（observe-only）不宣称玩法通过
 6. 按格式报告并 submit_task
 
@@ -425,8 +426,8 @@ timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检�
 
 ## 执行纪律（不可违反）
 - **CODE AUDIT DISCIPLINE（MANDATORY）**: if your cumulative code edits this task exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to get a second-pass audit of your worktree diff (one-shot sub-call on a teammate's currently-used model when it differs from yours; otherwise your own). Call it EARLY in the turn (it costs one LLM call, do not retry-loop it); submit only after verdict or if the audit soft-fails (no_worktree / no_callback / no_model / llm_failed are acceptable).
-- **提交前自审 — self-review（MANDATORY）**：在所有代码改动提交给 QA 或上级之前，先用 `read_skill("self-review")` 加载自审方法论，对代码做五轴自查（正确性/可读性/架构/安全/性能）。发现问题当场修。自审通过后再提交。被 QA 发现的低级问题 = 你没认真自审。
-- **UI 改动的 E2E（MANDATORY）**：凡改了用户可见页面/交互，submit_task 前必须：`lookup_dev_server`（或 `start_dev_server`）→ `browse` goto → 关键路径点通 → screenshot → `assert_visual(observed=图中所见, verdict=pass|fail)` + console。或明确写"已请求测试工程师做 browse/qa 验收，taskId=..."。禁止只报单元测试；禁止只交 PNG 路径。
+- **提交前自审 — self-review（MANDATORY）**：在所有代码改动提交给上级之前，先用 `read_skill("self-review")` 加载自审方法论，对代码做五轴自查（正确性/可读性/架构/安全/性能）。发现问题当场修。自审通过后再提交。
+- **按 submitGate 自证（不是全站验收）**：`unit` → 模块/单测（`bash(..., taskId=本任务)`）；`module_visual` → 本模块视觉（browse + assert_visual）。长视觉循环用 `spawn_subagent` + `commit_turn(waiting)`，不要把全站 E2E 嵌进本轮。`docs` / `code_audit` 跟对应工具。整体/里程碑测试是 QA 在 MAIN 的事，不要自己顶。
 - **先调查后修复**：no fixes without investigation。遇到 bug 先 read_file + grep 理解根因，再改代码
 - **完整实现**：边界处理和错误路径不能"以后再说"——Boil the Lake
 - **测试先行**：如果项目有测试框架，写代码前先写会失败的测试（Prove-It 模式）
@@ -439,15 +440,15 @@ timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检�
 ## 反合理化表
 | 借口 | 反驳 |
 |---|---|
-| "这个改动太小不用测" | 小改动也能引入大 bug。每个改动都需要测试 |
+| "这个改动太小不用测" | 小改动也能引入大 bug。按本任务 submitGate 出证据 |
 | "改动小不用审计" | 平台按 write_file/edit_file/apply_patch 累计行数。超过 20 行就要 request_code_audit |
-| "UI 我读代码确认过了" | 读代码不是 E2E。用户可见改动必须 browse 或交测试工程师 browse/qa |
+| "UI 我读代码确认过了" | 仅 module_visual 闸才必须 browse。unit 闸用测试输出，不要拿全站 E2E 顶叶子自证 |
 | "先跑通再说" | 能跑 ≠ 正确。先验证再扩展 |
 | "边界情况以后再说" | Boil the Lake：边界处理是代码的一部分，不是可选项 |
 
 ## 验证清单（任务完成前）
-- [ ] 代码已测试（附测试输出）
-- [ ] 若含 UI：已 browse 截图+console，或已派测试工程师 browse/qa（附 taskId）
+- [ ] 已按本任务 submitGate 出证据（unit/docs/code_audit/module_visual）
+- [ ] 若 gate 为 module_visual：已 browse 截图+assert_visual+console（长循环走 spawn_subagent）
 - [ ] 边界情况已处理（列出处理的边界）
 - [ ] 已用 read_file / grep 定向（不盲改）
 

@@ -18,8 +18,9 @@ from hiveweave.services import dispatch as dispatch_svc
 from hiveweave.services.attestation import (
     attestation_service,
     has_valid_waiver,
+    ledger_policy_id,
+    policy_from_submit_gate,
     required_attestation_kinds,
-    resolve_task_policy,
 )
 from hiveweave.services.org import OrgService
 from hiveweave.services.policy import policy_service
@@ -47,6 +48,8 @@ class TaskCreate(BaseModel):
     tags: list[str] | None = None
     source: str = "user"
     actorAgentId: str | None = None
+    submitGate: str | None = None
+    policyId: str | None = None
 
 
 class TaskUpdate(BaseModel):
@@ -96,23 +99,7 @@ async def _gate_attestation_for_task(
     # Tool-path waive_attestation must also unlock HTTP/UI approve/submit
     if await has_valid_waiver(project_id, task.get("id")):
         return
-    tags = task.get("tags") or []
-    if isinstance(tags, str):
-        import json
-
-        try:
-            tags = json.loads(tags)
-        except Exception:
-            tags = []
-    policy_id = (
-        evidence.get("policy_id")
-        or task.get("policy_id")
-        or resolve_task_policy(
-            title=task.get("title") or "",
-            tags=tags if isinstance(tags, list) else [],
-            description=task.get("description") or "",
-        )
-    )
+    policy_id = ledger_policy_id(task)
     needed = required_attestation_kinds(policy_id)
     if not needed:
         return
@@ -164,6 +151,19 @@ async def create_task(project_id: str, body: TaskCreate) -> dict:
         # 服务端强制 source 白名单：客户端不可传 "system"（否则穿透 VERIFY
         # 伪造门与平台保留 tag 剥离，可铸全权 VERIFY 任务——2026-08-13 审计）。
         source = body.source if body.source in ("agent", "user") else "user"
+        policy_id = None
+        if body.policyId and str(body.policyId).strip():
+            policy_id = str(body.policyId).strip()
+        elif body.submitGate:
+            try:
+                policy_id = policy_from_submit_gate(body.submitGate)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+        elif actor_id or (creator and creator not in ("user", "用户", "human")):
+            raise HTTPException(
+                status_code=400,
+                detail="submitGate (or policyId) is required when an agent creates a task",
+            )
         task_id = await _tasks.create_task(
             project_id,
             title=body.title,
@@ -178,6 +178,7 @@ async def create_task(project_id: str, body: TaskCreate) -> dict:
             expected_modules=body.expectedModules,
             tags=body.tags,
             source=source,
+            policy_id=policy_id,
         )
     except ValueError as e:
         _raise_from_value_error(e)

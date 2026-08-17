@@ -314,7 +314,7 @@ class InboxService:
                     t = await TaskService().get_task(pid, str(task_id))
                     if t and not t.get("is_archived"):
                         st = (t.get("status") or "").lower()
-                        if st not in ("closed", "cancelled"):
+                        if st not in ("closed", "cancelled", "blocked"):
                             open_task = True
                             assignee = t.get("assignee_id")
                             if assignee and str(assignee) != str(to_agent_id):

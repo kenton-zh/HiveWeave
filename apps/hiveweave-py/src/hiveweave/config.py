@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     # Attestation max age (ms) — Phase 3
     attestation_max_age_ms: int = 24 * 60 * 60 * 1000
 
+    # SQLite busy_timeout (ms). Journal stays DELETE; this only waits on locks.
+    sqlite_busy_timeout_ms: int = 5000
+
     model_config = {
         "env_prefix": "HIVEWEAVE_",
         "env_file": ".env",
@@ -93,6 +96,14 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def sqlite_busy_timeout_sql() -> str:
+    """PRAGMA for DELETE-mode SQLite connections (HIVEWEAVE_SQLITE_BUSY_TIMEOUT_MS)."""
+    ms = int(getattr(settings, "sqlite_busy_timeout_ms", 5000) or 5000)
+    if ms < 0:
+        ms = 0
+    return f"PRAGMA busy_timeout={ms}"
 
 
 def agent_browser_bin_name() -> str:

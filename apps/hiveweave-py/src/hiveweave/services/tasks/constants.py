@@ -4,7 +4,7 @@ from __future__ import annotations
 # 合法状态转换
 _TRANSITIONS: dict[str, set[str]] = {
     "created": {"claimed", "closed", "blocked"},    # blocked: system VERIFY w/o QA
-    "claimed": {"running", "created"},              # 开始执行或放弃认领
+    "claimed": {"running", "created", "blocked"},   # start, unclaim, or queue on deps
     # running → claimed 已移除：防止 LLM 超时后 RESUME 时误调 claim_task
     # 导致 running↔claimed 无限弹跳。如需放弃任务请用 blocked。
     "running": {"blocked", "submitted"},             # 阻塞/提交

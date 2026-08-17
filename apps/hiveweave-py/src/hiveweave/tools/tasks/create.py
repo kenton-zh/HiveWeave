@@ -95,6 +95,25 @@ class CreateTaskParams(BaseModel):
             "(same-assignee dup cannot be forced)."
         ),
     )
+    submit_gate: str = Field(
+        ...,
+        alias="submitGate",
+        description=(
+            "How this task will be evidenced at submit/review. Required. "
+            "docs | unit | module_visual | code_audit | "
+            "code_audit+module_visual | code_audit+unit."
+        ),
+        json_schema_extra={"aliases": ["submitGate", "submit_gate", "gate"]},
+    )
+    milestone_verify: bool = Field(
+        default=False,
+        alias="milestoneVerify",
+        description=(
+            "Coordinator/CEO only: mint a MAIN-serialized VERIFY: task for "
+            "a complete milestone (not per-leaf merge). Testing stays on MAIN."
+        ),
+        json_schema_extra={"aliases": ["milestoneVerify", "milestone_verify"]},
+    )
 
     @field_validator(
         "acceptance_criteria", "depends_on", "expected_modules", "tags",
@@ -108,10 +127,13 @@ class CreateTaskParams(BaseModel):
 @tool(
     "create_task",
     "Ledger entry. Unassigned → status=created (draft). With assigneeId → claimed "
-    "(assign=claim; no separate claim_task). Does NOT wake anyone — call dispatch_task to deliver. "
+    "(assign=claim; no separate claim_task) unless depends_on is unmet (blocked). "
+    "Does NOT wake anyone — call dispatch_task to deliver. "
+    "submitGate is required (docs|unit|module_visual|code_audit|…). "
     "If you are delegating/transferring an EXISTING task to someone else, prefer "
     "dispatch_task(taskId=<existing_id>) instead — it re-assigns in a single ledger "
-    "entry and avoids duplicate tasks with untracked free-text dependencies.",
+    "entry and avoids duplicate tasks with untracked free-text dependencies. "
+    "Coordinator/CEO milestone MAIN QA: milestoneVerify=true (mints VERIFY:).",
     requires_workspace=False,
     security_level="standard",
 )
@@ -248,9 +270,33 @@ async def create_task_tool(
                 force_note = (
                     " (force=true: proceeding despite cross-assignee dup)"
                 )
+        from hiveweave.services.attestation import policy_from_submit_gate
+
+        try:
+            policy_id = policy_from_submit_gate(params.submit_gate)
+        except ValueError as e:
+            return ToolResult.err(str(e))
+
+        title = params.title
+        source = "agent"
+        if params.milestone_verify:
+            from hiveweave.services.policy import infer_role_family
+            from hiveweave.services.org import OrgService
+            from hiveweave.services.tasks.verify import is_verify_title
+
+            me = await OrgService().resolve_agent(agent_id)
+            family = infer_role_family(me or {})
+            if family not in ("ceo", "coordinator"):
+                return ToolResult.err(
+                    "milestoneVerify is for coordinators/CEO arranging MAIN QA, "
+                    "not leaf self-service."
+                )
+            if not is_verify_title(title):
+                title = f"VERIFY: {title}"
+            source = "system"
         task_id = await ts.create_task(
             project_id=project_id,
-            title=params.title,
+            title=title,
             description=description,
             creator_id=agent_id,
             assignee_id=assignee_id,
@@ -261,18 +307,23 @@ async def create_task_tool(
             depends_on=params.depends_on,
             expected_modules=params.expected_modules,
             tags=params.tags,
-            source="agent",
+            source=source,
             contract_json=params.contract_json,
+            policy_id=policy_id,
         )
         task = await ts.get_task(project_id, task_id)
         st = (task or {}).get("status") or "created"
-        note = (
-            f"status={st} (assign=claim)"
-            if assignee_id and st == "claimed"
-            else f"status={st}"
-        )
+        if st == "blocked":
+            note = (
+                "status=blocked (depends_on unmet; assignee recorded, "
+                "not claimed or woken)"
+            )
+        elif assignee_id and st == "claimed":
+            note = "status=claimed (assign=claim)"
+        else:
+            note = f"status={st}"
         return ToolResult.ok(
-            f"Task created (id={task_id}, {note}): {params.title}{force_note}",
+            f"Task created (id={task_id}, {note}): {title}{force_note}",
             task_id=task_id,
             status=st,
         )

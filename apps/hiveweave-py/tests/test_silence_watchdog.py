@@ -185,8 +185,7 @@ def _started_mock(is_started=1):
 
 
 async def test_silent_agent_triggers_wake_redbox_and_superior_notify(env, monkeypatch):
-    """沉默 40 分钟（> 10 min 阈值且 > 30 min 升级线）：
-    一次唤醒 trigger + agent_health error 红框 + 上级 inbox 通知 + 上级 trigger."""
+    """沉默 40 分钟：自醒 + 红框；持续失联只打日志，不 inbox 催上级."""
     monkeypatch.setattr(
         "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
     monkeypatch.setattr(
@@ -207,12 +206,10 @@ async def test_silent_agent_triggers_wake_redbox_and_superior_notify(env, monkey
          patch("hiveweave.services.inbox.InboxService.send_message", mock_inbox):
         await svc._check_silent_agents(PROJECT_ID)
 
-    # ① 唤醒尝试（executor）+ ③ 上级通知后的 trigger（ceo）
     triggered_ids = [c.args[0] for c in mock_trigger.await_args_list]
     assert EXECUTOR_ID in triggered_ids
-    assert CEO_ID in triggered_ids
+    assert CEO_ID not in triggered_ids
 
-    # ② 红框：同构 agent.py _broadcast_agent_health 事件结构
     errors = _health_events(mock_bus, "error")
     assert len(errors) == 1
     event = errors[0]
@@ -221,18 +218,13 @@ async def test_silent_agent_triggers_wake_redbox_and_superior_notify(env, monkey
     assert "SILENCE WATCHDOG" in event["message"]
     assert isinstance(event["at"], int)
 
-    # ③ 上级通知一次
-    assert mock_inbox.await_count == 1
-    call = mock_inbox.await_args
-    assert call.args[1] == CEO_ID
-    assert "[SILENCE WATCHDOG]" in call.args[2]
-    assert "潮汐" in call.args[2]
+    assert mock_inbox.await_count == 0
 
-    # tracker 落账：flagged + wake_ts/notify_ts 已记录
     tracker = _trackers()[EXECUTOR_ID]
     assert tracker["flagged"] is True
     assert tracker["wake_ts"] > 0
     assert tracker["notify_ts"] > 0
+    assert tracker["notify_count"] >= 1
 
 
 # ── 豁免场景不误报 ──────────────────────────────────────────
@@ -420,8 +412,7 @@ async def test_recovery_broadcasts_ok_and_clears_flag(env, monkeypatch):
 
 
 async def test_cooldown_suppresses_repeat_wake_and_notify(env, monkeypatch):
-    """同一 agent：wake 冷却（15 min）与 notify 指数退避内不重复动作；
-    手动把 tracker 时间戳拨回过期后可再次触发."""
+    """同一 agent：wake 冷却内不重复自醒；notify 退避只记 tracker，不 inbox 催上级."""
     monkeypatch.setattr(
         "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
     monkeypatch.setattr(
@@ -439,27 +430,28 @@ async def test_cooldown_suppresses_repeat_wake_and_notify(env, monkeypatch):
          patch("hiveweave.agents.trigger.trigger_subordinate", mock_trigger), \
          patch.object(status_event_bus, "publish_stream_event", mock_bus), \
          patch("hiveweave.services.inbox.InboxService.send_message", mock_inbox):
-        # 第 1 轮：wake + error + notify 各一次
+        # 第 1 轮：wake + error；escalate 只落 tracker
         await svc._check_silent_agents(PROJECT_ID)
         assert len(_health_events(mock_bus, "error")) == 1
-        assert mock_inbox.await_count == 1
+        assert mock_inbox.await_count == 0
+        assert mock_trigger.await_count == 1
+        assert _trackers()[EXECUTOR_ID]["notify_count"] >= 1
 
-        # 第 2 轮（冷却内）：全部不重复
+        # 第 2 轮（冷却内）：不重复 wake / 不 inbox
         await svc._check_silent_agents(PROJECT_ID)
         assert len(_health_events(mock_bus, "error")) == 1
-        assert mock_inbox.await_count == 1
-        # trigger 总数仍是 2（executor wake + ceo notify），无新增
-        assert mock_trigger.await_count == 2
+        assert mock_inbox.await_count == 0
+        assert mock_trigger.await_count == 1
 
-        # 拨回 tracker 时间戳模拟冷却过期 → 第 3 轮再次 wake + notify
+        # 拨回 tracker 时间戳模拟冷却过期 → 第 3 轮再次 wake；仍无上级 inbox
         tracker = _trackers()[EXECUTOR_ID]
         tracker["wake_ts"] -= game_time.STALL_COOLDOWN_MS
-        # M7: after 1st notify, next cooldown is SILENCE_NOTIFY_BACKOFF_MS[1]
-        # (notify_count==1 → idx 1 → 30min)
         tracker["notify_ts"] -= game_time.SILENCE_NOTIFY_BACKOFF_MS[1]
         await svc._check_silent_agents(PROJECT_ID)
         assert len(_health_events(mock_bus, "error")) == 2
-        assert mock_inbox.await_count == 2
+        assert mock_inbox.await_count == 0
+        assert mock_trigger.await_count == 2
+        assert _trackers()[EXECUTOR_ID]["notify_count"] >= 2
 
 
 async def test_legal_idle_without_duty_skips_silence(env, monkeypatch):

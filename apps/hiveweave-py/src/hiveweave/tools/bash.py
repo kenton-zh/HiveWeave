@@ -1628,23 +1628,45 @@ def _is_under_or_same(child: str, parent: str) -> bool:
         )
 
 
-async def _resolve_verify_test_workspace(
+def _task_needs_main_workspace(
+    task: dict | None, *, include_ui_policy: bool = False
+) -> bool:
+    """VERIFY (and optionally ui_browser_e2e) must execute/attest on MAIN."""
+    if not task:
+        return False
+    from hiveweave.services.task import TaskService
+
+    if TaskService._is_verify_task(task):
+        return True
+    if include_ui_policy and (task.get("policy_id") or "") == "ui_browser_e2e":
+        return True
+    return False
+
+
+async def _resolve_verify_main_workspace(
     project_id: str,
     agent_id: str,
     explicit_task_id: str | None,
-    command: str,
     default_workspace: str,
+    command: str = "",
+    *,
+    require_test_command: bool = False,
+    include_ui_policy: bool = False,
 ) -> tuple[str, str, str | None]:
-    """Force VERIFY test runs onto project main (TEST18 P0-3 review).
+    """Force VERIFY (/ optional ui_browser_e2e) work onto project MAIN.
 
-    Returns ``(exec_workspace, note, verify_task_id | None)``.
-    Non-test / non-VERIFY → unchanged default workspace.
+    Returns ``(exec_workspace, note, bound_task_id | None)``.
+    Non-matching tasks → unchanged default workspace.
     """
-    from hiveweave.services.attestation import is_test_command
     from hiveweave.services.task import TaskService
 
-    if not project_id or not is_test_command(command or ""):
+    if not project_id:
         return default_workspace or "", "", None
+    if require_test_command:
+        from hiveweave.services.attestation import is_test_command
+
+        if not is_test_command(command or ""):
+            return default_workspace or "", "", None
 
     resolved, bind_note = await _resolve_test_attestation_task_id(
         project_id, agent_id, explicit_task_id, command=command
@@ -1658,7 +1680,7 @@ async def _resolve_verify_test_workspace(
         task = await TaskService().get_task(project_id, resolved)
     except Exception:
         task = None
-    if not task or not TaskService._is_verify_task(task):
+    if not _task_needs_main_workspace(task, include_ui_policy=include_ui_policy):
         return default_workspace or "", bind_note, resolved
 
     try:
@@ -1680,10 +1702,33 @@ async def _resolve_verify_test_workspace(
         return main_ws, bind_note, resolved
 
     note = (
-        f"\n\n[VERIFY EXEC] forced cwd=main ({main_ws}) — VERIFY tests must "
-        f"run at project root so attestation commit matches main tip."
+        f"\n\n[VERIFY EXEC] forced cwd=main ({main_ws}) — VERIFY / MAIN QA "
+        f"must run at project root so attestation commit matches main tip."
     )
     return main_ws, note + bind_note, resolved
+
+
+async def _resolve_verify_test_workspace(
+    project_id: str,
+    agent_id: str,
+    explicit_task_id: str | None,
+    command: str,
+    default_workspace: str,
+) -> tuple[str, str, str | None]:
+    """Force VERIFY test runs onto project main (TEST18 P0-3 review).
+
+    Returns ``(exec_workspace, note, verify_task_id | None)``.
+    Non-test / non-VERIFY → unchanged default workspace.
+    """
+    return await _resolve_verify_main_workspace(
+        project_id,
+        agent_id,
+        explicit_task_id,
+        default_workspace,
+        command,
+        require_test_command=True,
+        include_ui_policy=False,
+    )
 
 
 _ATTESTATION_BANNER_PREFIX = "[ATTESTATION]"

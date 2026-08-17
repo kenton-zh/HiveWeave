@@ -119,7 +119,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "goto URL → snapshot -i → click @eN → screenshot path → "
             "assert_visual. Screenshot pixels inject into the next turn; "
             "a PNG path is not UI evidence. Prefer after "
-            "start_dev_server / lookup_dev_server."
+            "start_dev_server / lookup_dev_server. VERIFY / ui_browser_e2e "
+            "is forced onto project MAIN (same as bash tests) — do not ask "
+            "coordinator/CEO to take the browser check."
         ),
         "properties": {
             "args": {
@@ -136,6 +138,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "type": "integer",
                 "aliases": ["timeout_sec", "timeout"],
                 "description": "Timeout in seconds (default 60, max 300).",
+            },
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id"],
+                "description": (
+                    "Bind browse_e2e to this task. VERIFY / ui_browser_e2e "
+                    "also forces cwd=MAIN."
+                ),
             },
         },
         "required": [],
@@ -986,9 +996,13 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "dispatch_task": {
         "description": (
-            "Assign work now: ledger entry AND inbox wake. Pass taskId to "
-            "reuse a create_task draft. create_task alone does not wake anyone. "
-            "Same-assignee duplicates cannot be forced."
+            "Assign work now: ledger + inbox. Always pass submitGate "
+            "(docs|unit|module_visual|code_audit|code_audit+module_visual|"
+            "code_audit+unit) — required for NEW tasks; ignored on taskId reuse "
+            "(ledger policy stays). Unmet dependsOn → blocked, assignee recorded, "
+            "NOT woken (also applied when reusing taskId). create_task alone "
+            "does not wake. Milestone MAIN QA: milestoneVerify=true "
+            "(coordinator/CEO). Same-assignee dups cannot be forced."
         ),
         "properties": {
             "target": {"type": "string", "aliases": ["toAgentId", "to_agent_id", "recipient", "agentId", "subordinate", "agent_id"]},
@@ -1012,8 +1026,34 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["artifact_refs", "required_paths"],
                 "description": "Paths the assignee must be able to read (checked in their worktree).",
             },
+            "submitGate": {
+                "type": "string",
+                "aliases": ["submit_gate", "gate"],
+                "description": (
+                    "Always pass. Required for NEW tasks; ignored on taskId "
+                    "reuse. docs | unit | module_visual | code_audit | "
+                    "code_audit+module_visual | code_audit+unit."
+                ),
+            },
+            "milestoneVerify": {
+                "type": "boolean",
+                "aliases": ["milestone_verify"],
+                "description": (
+                    "Coordinator/CEO: mint a MAIN-serialized VERIFY: "
+                    "milestone QA task. Not per-leaf merge."
+                ),
+            },
+            "dependsOn": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["depends_on"],
+                "description": (
+                    "Unmet deps → blocked (assignee recorded, not woken). "
+                    "VERIFY titles are never auto-blocked."
+                ),
+            },
         },
-        "required": ["target", "task"],
+        "required": ["target", "task", "submitGate"],
     },
     "review": {
         "description": "Run a local review suite (code_review|security_audit|test_review|perf_audit) on filePaths. Returns findings — not a test_run attestation.",
@@ -1081,7 +1121,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Merge a worktree branch into main and remove the worktree. "
             "Pass taskId to hit hw/<shortId>/t-<taskId[:8]>. On conflict: "
             "abort — rework the executor to rebase main in their worktree. "
-            "On success: spawn VERIFY only for tasks this merge covers."
+            "Does not auto-spawn VERIFY. After a milestone is on MAIN, "
+            "coordinators dispatch one QA task with milestoneVerify=true."
         ),
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
@@ -1146,11 +1187,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     # — Task Ledger tools (Task 4) —
     "create_task": {
         "description": (
-            "Write a Task Ledger row. Does not inbox/wake anyone. Unassigned "
-            "→ created; with assigneeId → claimed (assign=claim), except "
-            "VERIFY stays created until the serial lock is free. To wake, "
-            "call dispatch_task (pass taskId to reuse). Prefer "
-            "dispatch_task(taskId=…) to transfer an existing task."
+            "Write a Task Ledger row. Does not inbox/wake anyone. submitGate is "
+            "REQUIRED (docs|unit|module_visual|code_audit|code_audit+*). "
+            "Unassigned → created; with assigneeId → claimed unless dependsOn "
+            "is unmet (blocked, not claimed). VERIFY titles stay created. "
+            "Coordinator/CEO milestone MAIN QA: milestoneVerify=true. To wake, "
+            "call dispatch_task (pass taskId to reuse)."
         ),
         "properties": {
             "title": {"type": "string", "aliases": ["name", "summary"]},
@@ -1164,7 +1206,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["acceptance_criteria"]},
             "parentTaskId": {"type": "string", "aliases": ["parent_task_id", "parent"]},
             "dependsOn": {"type": "array", "items": {"type": "string"},
-                "aliases": ["depends_on"]},
+                "aliases": ["depends_on"],
+                "description": "Unmet deps → blocked (not claimed/woken). VERIFY titles skip auto-block."},
             "expectedModules": {"type": "array", "items": {"type": "string"},
                 "aliases": ["expected_modules"]},
             "tags": {"type": "array", "items": {"type": "string"}},
@@ -1177,8 +1220,24 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "type": "boolean",
                 "description": "Create despite a cross-assignee/structured dup. Same-assignee dup cannot be forced.",
             },
+            "submitGate": {
+                "type": "string",
+                "aliases": ["submit_gate", "gate"],
+                "description": (
+                    "Required. docs | unit | module_visual | code_audit | "
+                    "code_audit+module_visual | code_audit+unit."
+                ),
+            },
+            "milestoneVerify": {
+                "type": "boolean",
+                "aliases": ["milestone_verify"],
+                "description": (
+                    "Coordinator/CEO: mint a MAIN-serialized VERIFY: "
+                    "milestone QA task."
+                ),
+            },
         },
-        "required": ["title", "description"],
+        "required": ["title", "description", "submitGate"],
     },
     "claim_task": {
         "description": "Claim a created/unassigned task (created → claimed). Sets you as assignee.",
@@ -1192,7 +1251,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Set status to running (start or unblock) or blocked. "
             "blocked requires dependsOnTaskIds and/or wakeAt — a block "
             "with neither is rejected. Status omitted defaults to running. "
-            "blockedReason is a note only, never an unblock path."
+            "blockedReason is a note only, never an unblock path. "
+            "running/unblock is refused while depends_on are still unmet."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
@@ -1280,12 +1340,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "review_task": {
         "description": (
             "Review a submitted task: decision=approve|rework. approve needs "
-            "fresh test_run (or docs_only attest_doc_review) bound to this "
-            "taskId — not bare testsPassed. Run tests yourself with "
-            "bash(..., taskId=this) first; if rejected for missing evidence, "
-            "do not retry approve. Does not spawn VERIFY — call "
-            "git_worktree_merge next. waive_attestation: another agent must "
-            "approve (VERIFY waive is CEO-only)."
+            "fresh attestation kinds for this task's submitGate/policy — not "
+            "bare testsPassed. Prefer consuming the assignee's hung evidence "
+            "(unit→test_run, module_visual→browse/visual, docs→doc_review, "
+            "code_audit*→code_audit). CEO: review-only, do not self-test or "
+            "merge leaf trees. Mid-level: merge after approve; do NOT expect "
+            "per-leaf VERIFY spawn. Milestone QA is dispatch_task("
+            "milestoneVerify=true) after MAIN is ready. If approve is rejected "
+            "for missing evidence, do not retry — send back for the gate. "
+            "VERIFY waive is CEO-only."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},

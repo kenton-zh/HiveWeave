@@ -54,9 +54,12 @@ def test_required_kinds():
     assert required_attestation_kinds("ui_browser_e2e") == frozenset(
         {"visual_check", "browse_e2e"}
     )
-    assert required_attestation_kinds("generic_tests") is None
+    assert required_attestation_kinds("generic_tests") == frozenset({"test_run"})
     assert required_attestation_kinds("docs_only") == frozenset({"doc_review"})
     assert required_attestation_kinds("coordinator_review") is None
+    assert required_attestation_kinds("no_such_policy") == frozenset(
+        {"_unknown_policy"}
+    )
 
 
 @pytest.mark.asyncio

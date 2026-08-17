@@ -184,6 +184,7 @@ async def test_get_actionable_obligations_includes_approved():
 
 @pytest.mark.asyncio
 async def test_nudge_stale_ledger_review_and_merge():
+    """Stale submitted/approved: no periodic [LEDGER REVIEW] / [MERGE PENDING] inbox."""
     from hiveweave.services import game_time as gt
 
     project_id = "proj-ledger-1"
@@ -282,10 +283,8 @@ async def test_nudge_stale_ledger_review_and_merge():
                             with patch("time.time", return_value=now / 1000):
                                 await svc._nudge_stale_ledger(project_id)
 
-    assert any(m["message"].startswith("[LEDGER REVIEW]") for m in sent)
-    assert any(m["message"].startswith("[MERGE PENDING]") for m in sent)
-    assert not any("fresh" in m["message"] for m in sent)
-    assert svc._watchdog_trigger.await_count >= 2
+    assert sent == []
+    assert svc._watchdog_trigger.await_count == 0
     sent.clear()
     with patch(
         "hiveweave.db.meta.query_one",
@@ -377,12 +376,7 @@ async def test_peer_review_deadlock_nudge():
             )
 
     targets = {m["to_agent_id"] for m in sent}
-    assert "agent-a" in targets
-    assert "agent-b" in targets
-    assert "boss" in targets
-    assert all(
-        m["message"].startswith("[PEER_REVIEW_DEADLOCK]") for m in sent
-    )
-    assert all(m["message_type"] == "escalation" for m in sent)
+    assert sent == [], "peer-review deadlock inbox催 disabled"
+    assert targets == set()
 
     gt._states.pop(project_id, None)

@@ -124,8 +124,8 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 
 **Stall 检测三层机制**（不要混淆）：
 1. **Inbox stall / awaiting-reply 催办 — 已禁用**（`_check_stalled` / `_nudge_awaiting_replies` no-op）。回复义务由 turn exit 的 `expect_report` / `ask` + 收件人 ID 检查强制执行。
-2. **Task stall 催办 — 活跃**（`_nudge_stale_ledger` 内 `TASK_STALL_THRESHOLDS` 段）：running>20min / submitted>10min / reviewing>10min / rework>10min / created>5min / claimed>5min。超 `STALL_ESCALATION_THRESHOLD`(3) 次升级上级。
-3. **沉默观测看门狗 — 活跃**（`_check_silent_agents`）：`SILENCE_THRESHOLD_MS = 10min` 无产出 → 唤醒 + agent_health 红框；`SILENCE_NOTIFY_MS = 30min` 持续失联 → 通知上级。
+2. **Task dwell 时钟 — 平台自愈，不 inbox 催人**（`_nudge_stale_ledger`）：记 dwell / auto-submit / VERIFY 改派 / MERGE PROXY；**不**发 `[TASK STALL]` 等进度催。到期只 `[WAIT_TIMEOUT]` 醒等待方。
+3. **沉默观测看门狗 — 自醒 + 红框**（`_check_silent_agents`）：`SILENCE_THRESHOLD_MS = 10min` 无产出 → 唤醒本人 + agent_health 红框；`SILENCE_NOTIFY_MS = 30min` 持续失联 → **只打日志**，不 inbox 上级。
 
 ## Environment variables
 

@@ -515,8 +515,8 @@ async def _auto_submit_merged_running_tasks(
     "Pass taskId for an exact hit on the stable branch "
     "hw/<shortId>/t-<taskId[:8]>. "
     "On conflict: main merge is aborted; rework the executor to rebase/merge "
-    "main in THEIR worktree, then retry. On success: spawns VERIFY only for "
-    "tasks covered by this merge (post-merge only).",
+    "main in THEIR worktree, then retry. Does not auto-spawn VERIFY. After a "
+    "milestone is on MAIN, dispatch one QA task with milestoneVerify=true.",
     requires_workspace=True,
     security_level="standard",
 )
@@ -821,7 +821,7 @@ async def git_worktree_merge_tool(
             merged_by=agent_id, merge_commit=result.get("hash"),
         )
 
-        # Post-merge: spawn VERIFY scoped to this merge + nudge on main
+        # Post-merge: stamp merge fact + nudge existing MAIN VERIFY (no auto-spawn)
         try:
             from hiveweave.tools.task_tools import nudge_verify_tasks_after_merge
 
@@ -843,8 +843,8 @@ async def git_worktree_merge_tool(
                 pass
             return ToolResult.ok(
                 f"{result.get('message', 'Worktree merged and cleaned up')} "
-                f"WARNING: VERIFY spawn/nudge failed ({e}). "
-                f"Retry merge nudge or spawn VERIFY manually for the merged task."
+                f"WARNING: post-merge VERIFY nudge failed ({e}). "
+                f"Coordinators dispatch milestone QA with milestoneVerify=true."
             )
         try:
             from hiveweave.services.task import TaskService
@@ -860,13 +860,13 @@ async def git_worktree_merge_tool(
             )
         if nudged:
             msg = (
-                f"{msg} Spawned/nudged {nudged} VERIFY task(s) for this merge "
-                f"on MAIN (VERIFY is post-merge + merge-scoped)."
+                f"{msg} Nudged {nudged} existing VERIFY task(s) on MAIN."
             )
         elif files is not None:
             msg = (
-                f"{msg} No VERIFY spawned (no matching approved task for "
-                f"this merge scope)."
+                f"{msg} Merge recorded. Milestone QA is not auto-spawned "
+                f"per leaf merge; coordinators dispatch one MAIN VERIFY "
+                f"via milestoneVerify."
             )
         return ToolResult.ok(msg)
 

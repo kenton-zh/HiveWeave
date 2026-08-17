@@ -221,7 +221,7 @@ class TestVerificationGates:
         assert "attestation" in err.lower()
 
     async def test_spawn_verify_task_after_merge_helper(self, env):
-        """VERIFY spawn helper still works; production call site is post-merge."""
+        """VERIFY spawn helper still works; production no longer auto-calls it on merge."""
         ts = TaskService()
         pid = env["project_id"]
         qa_id = "loop-qa"
@@ -265,8 +265,8 @@ class TestVerificationGates:
             )
         assert again == verify_id
 
-    async def test_nudge_spawns_verify_after_merge(self, env):
-        """Approve leaves no VERIFY; merge nudge creates + claims it."""
+    async def test_nudge_does_not_spawn_verify_after_merge(self, env):
+        """Leaf merge stamps facts but does not auto-spawn VERIFY."""
         ts = TaskService()
         pid = env["project_id"]
         qa_id = "loop-qa"
@@ -283,37 +283,7 @@ class TestVerificationGates:
         await ts.start_review(pid, parent_id)
         await ts.review_task(pid, parent_id, "approve")
 
-        # No VERIFY yet after approve
-        tasks_pre = await ts.list_tasks(pid)
-        assert not any(
-            "verify" in (t.get("tags") or []) for t in tasks_pre
-        )
-
-        async def fake_get_agent(aid: str):
-            if aid in (env["executor_id"], qa_id, env["coordinator_id"]):
-                return {
-                    "id": aid,
-                    "name": "QA" if aid == qa_id else "Agent",
-                    "status": "active",
-                    "project_id": pid,
-                    "short_id": "A001" if aid == env["executor_id"] else "A002",
-                }
-            return None
-
-        async def fake_get_agent_project_id(aid: str):
-            if aid in (COORDINATOR_ID, EXECUTOR_ID, qa_id):
-                return PROJECT_ID
-            return None
-
         with (
-            patch(
-                "hiveweave.db.meta.get_agent_by_id",
-                new=fake_get_agent,
-            ),
-            patch(
-                "hiveweave.db.meta.get_agent_project_id",
-                new=fake_get_agent_project_id,
-            ),
             patch(
                 "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
                 AsyncMock(return_value=qa_id),
@@ -321,7 +291,7 @@ class TestVerificationGates:
             patch(
                 "hiveweave.agents.trigger.trigger_subordinate",
                 AsyncMock(),
-            ) as trig,
+            ),
         ):
             nudged = await nudge_verify_tasks_after_merge(
                 pid,
@@ -329,22 +299,9 @@ class TestVerificationGates:
                 merged_agent_id=env["executor_id"],
                 merged_short_id="A001",
             )
-        assert nudged == 1
-        trig.assert_awaited()
-
+        assert nudged == 0
         tasks_post = await ts.list_tasks(pid)
-        verify_tasks = [
-            t for t in tasks_post if "verify" in (t.get("tags") or [])
-        ]
-        assert len(verify_tasks) == 1
-        verify_id = verify_tasks[0]["id"]
-        assert verify_tasks[0]["assignee_id"] == qa_id
-
-        from hiveweave.services.inbox import InboxService
-        ib = InboxService()
-        msgs = await ib.get_pending_messages(qa_id)
-        assert any("POST-MERGE VERIFY" in (m.get("message") or "") for m in msgs)
-        assert any(m.get("task_id") == verify_id for m in msgs)
+        assert not any("verify" in (t.get("tags") or []) for t in tasks_post)
 
     async def test_nudge_verify_after_merge(self, env):
         ts = TaskService()
