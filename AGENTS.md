@@ -108,7 +108,7 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 
 ## Agent types & org
 
-- **CEO** (root): 行政五权 `DISPATCH`/`REVIEW`/`MERGE`/`SOURCE_READ`/`MANAGE_ORG` + `DOC_WRITE`；**无 SOURCE_WRITE/bash/test/staffing**（硬门）。定组织、审中层里程碑、终验对用户（`message_user`），不写业务代码、不日常直派叶子。
+- **CEO** (root): 行政五权 `DISPATCH`/`REVIEW`/`MERGE`/`SOURCE_READ`/`MANAGE_ORG` + `DOC_WRITE` + `BROWSE`（看产品）；可对**单条**任务 `waive_attestation` 关闸（因此可以不招测试）；禁止一次关掉所有任务。**无 SOURCE_WRITE/bash/test/staffing**（硬门）。定组织、审中层里程碑、终验对用户（`message_user`），不写业务代码、不日常直派叶子。
 - **Coordinator / 中层 (player-coach)**: 协调权 + `SOURCE_WRITE`/`BASH_SHELL`/`TEST_RUN`/`BROWSE` —— 自己搭骨架/写关键路径（有独立 worktree，同 executor 契约）；hire/dismiss/transfer。受限写白名单（`COORDINATOR_WRITE_PREFIXES`）适用于项目根。
 - **Executor** (叶子): 可读写代码、运行测试、写工作日志。不能 spawn 下级。
 - **QA** (`test_engineer`/`qa_engineer`): 含 SOURCE_WRITE（缺它 write_file 被硬门死 —— Echo 事故）。

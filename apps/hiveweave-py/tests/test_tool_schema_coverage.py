@@ -128,14 +128,11 @@ def test_validate_tool_args_reports_missing_required():
     assert "taskId" in err or "task_id" in err or "Missing" in err
 
 
-def test_validate_tool_args_reports_missing_evidence():
+def test_validate_tool_args_allows_omitting_evidence():
+    """Schema: CEO may omit evidenceAttestationId. Coordinator still gated at runtime."""
     normalized, err = validate_tool_args(
         "waive_attestation",
-        {"taskId": "abc", "reason": "x" * 8},
+        {"taskId": "abc", "reason": "x" * 20},
     )
-    assert err is not None
-    assert (
-        "evidenceAttestationId" in err
-        or "evidence_attestation_id" in err
-        or "Missing" in err
-    )
+    assert err is None
+    assert normalized is not None

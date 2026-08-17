@@ -758,6 +758,9 @@ async def _find_independent_qa(
         return has_capability(a, Capability.BROWSER_ACCEPTANCE)
 
     def matches_caps(a: dict) -> bool:
+        # CEO may have BROWSE to look; VERIFY assignee is never the CEO.
+        if infer_role_family(a) == "ceo":
+            return False
         if caps:
             return all(has_capability(a, Capability(c)) for c in caps)
         return is_qa(a)

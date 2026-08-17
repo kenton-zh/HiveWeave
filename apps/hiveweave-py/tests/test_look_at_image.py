@@ -42,7 +42,7 @@ def test_look_at_image_in_all_role_presets() -> None:
 
 
 def test_look_at_image_not_bound_to_browse_capability() -> None:
-    """Must stay out of TOOL_CAPABILITY so CEO/HR (no BROWSE) can call it."""
+    """Must stay out of TOOL_CAPABILITY so HR (no BROWSE) can still call it."""
     assert "look_at_image" not in TOOL_CAPABILITY
     # Contrast: assert_visual IS gated — regression lock for the design choice.
     assert "assert_visual" in TOOL_CAPABILITY
@@ -53,8 +53,9 @@ def test_look_at_image_hard_check_allows_ceo_and_hr() -> None:
     hr = {"role": "hr", "permission_type": "readonly", "name": "知远"}
     assert policy_service.hard_check(ceo, "look_at_image") is None
     assert policy_service.hard_check(hr, "look_at_image") is None
-    # Sanity: CEO still hard-denied on browse
-    assert policy_service.hard_check(ceo, "browse") is not None
+    # CEO can browse to look; HR still cannot.
+    assert policy_service.hard_check(ceo, "browse") is None
+    assert policy_service.hard_check(hr, "browse") is not None
 
 
 def test_extract_nonstream_text_openai() -> None:

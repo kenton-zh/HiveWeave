@@ -203,10 +203,34 @@ async def test_builder_coordinator_write_source_allowed(svc, monkeypatch):
     assert await svc.evaluate("a1", "run_tests", {}) == "allow"
 
 
+@pytest.mark.asyncio
+async def test_ceo_can_browse_but_not_bash_or_assert(svc, monkeypatch):
+    _patch_agent(monkeypatch, _ceo())
+    assert await svc.evaluate("a1", "browse", {"args": ["goto", "http://127.0.0.1:1"]}) == "allow"
+    assert await svc.evaluate(
+        "a1", "browse_main", {"args": ["goto", "http://127.0.0.1:1"]}
+    ) == "allow"
+    assert await svc.evaluate("a1", "bash", {"command": "ls"}) == "deny"
+    assert await svc.evaluate(
+        "a1",
+        "assert_visual",
+        {
+            "observed": "x" * 50,
+            "verdict": "pass",
+            "screenshotPath": "evidence/x.png",
+        },
+    ) == "deny"
+    assert await svc.evaluate("a1", "game_run_case", {}) == "deny"
+    assert await svc.evaluate("a1", "game_run_case_main", {}) == "deny"
+
+
 def test_ceo_tool_list_excludes_code_tools(svc):
     tools = svc.get_tools_for_agent(_ceo())
-    for t in ("bash", "apply_patch", "run_tests", "browse"):
+    for t in ("bash", "apply_patch", "run_tests", "game_run_case",
+              "game_run_case_main", "assert_visual"):
         assert t not in tools
+    assert "browse" in tools
+    assert "browse_main" in tools
     # edit_file 在工具表内，路径硬门拦源码
     assert "edit_file" in tools
     assert "write_file" in tools

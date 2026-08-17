@@ -8,7 +8,9 @@ Evaluation order (P0 Hard Gates):
 
 Role families: ceo | hr | coordinator | executor | qa
 
-- ceo: 行政 + 里程碑验收 + DOC_WRITE（任意文档，禁源码/配置）。无写码/bash/test。
+- ceo: 行政 + 里程碑验收 + DOC_WRITE（任意文档，禁源码/配置）+ BROWSE（看产品）。
+  无写码/bash/test 责任。可对单条任务 waive_attestation 关闸（可不附 evidence）；
+  禁止一次关掉所有任务。browse 本身不关闸；自己的浏览不算 approve 证据。
 - coordinator: 中层 builder（player-coach）— 协调权叠加写码权
   （SOURCE_WRITE / BASH_SHELL / TEST_RUN / BROWSE）。
 """
@@ -55,6 +57,9 @@ FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
         Capability.SOURCE_READ,
         Capability.MANAGE_ORG,
         Capability.DOC_WRITE,
+        # 看产品，不是测试岗。无 TEST_RUN / BROWSER_ACCEPTANCE：
+        # 自己的 browse 出证不算 approve。关闸走单条 waive_attestation。
+        Capability.BROWSE,
     }),
     "hr": frozenset({
         Capability.STAFFING,
@@ -115,6 +120,7 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "git_worktree_merge": frozenset({Capability.MERGE}),
     "git_worktree_remove": frozenset({Capability.MERGE}),
     "bash": frozenset({Capability.BASH_SHELL}),
+    "bash_main": frozenset({Capability.BASH_SHELL}),
     "job_kill": frozenset({Capability.BASH_SHELL}),
     "run_command": frozenset({Capability.BASH_SHELL}),
     # dev server 可执行任意命令 → 与 bash 同硬门（2026-08-13 审计：此前
@@ -125,8 +131,10 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     # 只读查注册表，不是 spawn —— 用 SOURCE_READ，避免 CEO/HR 看见工具却撞 BASH 门
     "lookup_dev_server": frozenset({Capability.SOURCE_READ}),
     "browse": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
+    "browse_main": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     "assert_visual": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     "game_run_case": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
+    "game_run_case_main": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),
     # Seedream text-to-image — source-writing roles only (not CEO/HR)
     "generate_image": frozenset({Capability.SOURCE_WRITE}),
     "spawn_subagent": frozenset({Capability.SOURCE_WRITE}),
@@ -271,6 +279,26 @@ def has_capability(agent: dict[str, Any], cap: Capability) -> bool:
     return cap in capabilities_for(agent)
 
 
+def has_visual_test_duty(agent: dict[str, Any]) -> bool:
+    """True if this agent produces UI/test evidence (not look-only browse).
+
+    CEO has BROWSE to look at the product but neither TEST_RUN nor
+    BROWSER_ACCEPTANCE — screenshots are inspection, not a gate.
+    """
+    return has_capability(agent, Capability.TEST_RUN) or has_capability(
+        agent, Capability.BROWSER_ACCEPTANCE
+    )
+
+
+# Stamp tools share TOOL_CAPABILITY OR {BROWSE, BROWSER_ACCEPTANCE}.
+# Look-only BROWSE (CEO) must still hard-deny these.
+_VISUAL_STAMP_TOOLS = frozenset({
+    "assert_visual",
+    "game_run_case",
+    "game_run_case_main",
+})
+
+
 def tool_hard_deny(agent: dict[str, Any], tool_name: str) -> str | None:
     """Return deny reason if tool is blocked by hard capability, else None."""
     from hiveweave.services.eval_seal import sealed_tool_deny
@@ -295,6 +323,15 @@ def tool_hard_deny(agent: dict[str, Any], tool_name: str) -> str | None:
     # Extra: hire_agent is HR-only even though STAFFING is HR-only already
     if tool_name == "hire_agent" and infer_role_family(agent) != "hr":
         return "Hard capability deny: only HR may hire_agent"
+    # BROWSE OR BROWSER_ACCEPTANCE lets CEO pass the cap check for stamp
+    # tools. Look-only browse is not test duty — allowed_tools must not elevate.
+    if tool_name in _VISUAL_STAMP_TOOLS and not has_visual_test_duty(agent):
+        family = infer_role_family(agent)
+        return (
+            f"Hard capability deny: '{tool_name}' stamps test evidence; "
+            f"role_family={family} may browse to look, not to attest. "
+            "Inspect QA screenshots with look_at_image."
+        )
     return None
 
 
@@ -410,7 +447,7 @@ class PolicyService:
         reason = tool_hard_deny(agent, tool_name)
         if reason:
             return reason
-        if tool_name in ("bash", "run_command", "start_dev_server"):
+        if tool_name in ("bash", "bash_main", "run_command", "start_dev_server"):
             from hiveweave.services.eval_seal import sealed_bash_deny
 
             cmd = ""

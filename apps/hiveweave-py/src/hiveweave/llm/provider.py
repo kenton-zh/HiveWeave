@@ -349,8 +349,9 @@ class OpenAIHandler(FormatHandler):
                         "type": "text",
                         "text": (
                             "[Screenshot pixels attached — inspect the "
-                            "image, then assert_visual before claiming "
-                            "UI pass.]"
+                            "image. Evidence roles: assert_visual before "
+                            "claiming a UI pass. Looking-only (CEO): do "
+                            "not stamp; use look_at_image on QA evidence.]"
                         ),
                     },
                     *img_parts,

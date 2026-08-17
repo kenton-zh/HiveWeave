@@ -20,6 +20,39 @@ from hiveweave.tools.result import ToolResult
 
 log = structlog.get_logger(__name__)
 
+# Structured bulk tokens — not free-text intent scanning.
+_BULK_TASK_TOKENS = frozenset({
+    "*", "all", "ALL", "every", "EVERY", "全部", "所有",
+})
+
+
+def deny_if_not_single_task_id(raw: str | None) -> str | None:
+    """Belt: one concrete task per waive. No project-wide gate shutdown."""
+    s = str(raw or "").strip()
+    if not s:
+        return (
+            "waive requires exactly one taskId. "
+            "Cannot close gates for every task at once."
+        )
+    if s in _BULK_TASK_TOKENS:
+        return (
+            "Cannot waive all tasks at once. Pass one concrete taskId "
+            "(UUID or 8-char prefix) after looking at that task."
+        )
+    if s.startswith("[") or any(ch in s for ch in ",;\n|"):
+        return (
+            "waive takes exactly one taskId per call. "
+            "Cannot close gates for multiple tasks together — "
+            "waive each task separately."
+        )
+    parts = s.split()
+    if len(parts) >= 2:
+        return (
+            "waive takes exactly one taskId per call. "
+            "Cannot close gates for multiple tasks together."
+        )
+    return None
+
 # ── waive_attestation ────────────────────────────────────────
 
 
@@ -38,11 +71,13 @@ class WaiveAttestationParams(BaseModel):
         "以 bash 验证日志替代'). Required for auditability.",
     )
     evidence_attestation_id: str = Field(
+        default="",
         alias="evidenceAttestationId",
         description=(
-            "REQUIRED: id of an execution attestation (test_run / browse_e2e / "
-            "visual_check / doc_review) that backs this waiver. Pure read_file "
-            "review is not accepted — the escape hatch must cite machine evidence."
+            "Coordinator: REQUIRED id of test_run / browse_e2e / visual_check / "
+            "doc_review bound to this task. CEO: optional — looking at this "
+            "task then waive_attestation(taskId) is enough; still one task "
+            "per call. Pure read_file is not accepted for coordinators."
         ),
         json_schema_extra={
             "aliases": [
@@ -57,11 +92,16 @@ class WaiveAttestationParams(BaseModel):
 
 @tool(
     "waive_attestation",
-    "Last-resort waiver of the attestation gate (coordinator/CEO). "
-    "Requires evidenceAttestationId citing a real test_run/browse_e2e/"
-    "visual_check/doc_review row. Max 2 waivers per task. The waiving agent "
-    "CANNOT later approve the same task (third-party isolation). "
-    "Prefer attest_doc_review for document/spec VERIFY instead of waiving.",
+    "Waive the attestation gate for ONE task (coordinator/CEO). "
+    "Always pass a single taskId — never all tasks. "
+    "CEO may omit evidenceAttestationId after looking at that task "
+    "(browse then waive this id; that is how 'no QA hire' is recorded). "
+    "Coordinators must cite evidenceAttestationId "
+    "(test_run/browse_e2e/visual_check/doc_review). "
+    "Max 2 waivers per task. The waiving agent CANNOT later approve "
+    "the same task (third-party isolation) unless small-team sole reviewer. "
+    "VERIFY waive is CEO-only. Prefer attest_doc_review for document "
+    "VERIFY unless CEO waives that one task.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -89,6 +129,10 @@ async def waive_attestation_tool(
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project")
 
+    bulk = deny_if_not_single_task_id(params.task_id)
+    if bulk:
+        return ToolResult.err(bulk)
+
     reason = (params.reason or "").strip()
     if not reason:
         return ToolResult.err(
@@ -97,15 +141,22 @@ async def waive_attestation_tool(
     if len(reason) < 20:
         return ToolResult.err(
             "waive_attestation reason too short (min 20 chars). "
-            "State what was checked and why machine attestation cannot apply."
+            "State what was checked and why this one task is exempt."
         )
 
+    try:
+        agent = await OrgService().get_agent(agent_id)
+    except Exception:
+        agent = None
+    family = infer_role_family(agent or {})
+    ceo_override = family == "ceo"
+
     evidence_id = (params.evidence_attestation_id or "").strip()
-    if not evidence_id:
+    if not evidence_id and not ceo_override:
         return ToolResult.err(
             "waive_attestation requires evidenceAttestationId — cite a "
             "test_run / browse_e2e / visual_check / doc_review attestation. "
-            "read_file-only review is not accepted (TEST6 P0-2)."
+            "Only CEO may omit evidence after looking at this one task."
         )
 
     ts = _task_svc.TaskService()
@@ -147,48 +198,50 @@ async def waive_attestation_tool(
             + tip
         )
 
-    # Evidence attestation must be a real execution kind (not another waiver)
-    try:
-        await attestation_service.ensure_schema(project_id)
-        ev = await attestation_service.get(project_id, evidence_id)
-    except Exception as e:
-        return ToolResult.err(f"Failed to load evidence attestation: {e}")
-    if not ev:
-        return ToolResult.err(
-            f"evidenceAttestationId not found: {evidence_id}"
-        )
-    ev_kind = (ev.get("kind") or "").strip()
-    if ev_kind not in WAIVER_EVIDENCE_KINDS:
-        return ToolResult.err(
-            f"evidenceAttestationId kind '{ev_kind}' is not execution evidence. "
-            f"Allowed: {sorted(WAIVER_EVIDENCE_KINDS)}."
-        )
-    ev_task = ev.get("task_id")
-    # Evidence rows created after the short-id normalization fix store the
-    # canonical dash-stripped task id; agents pass the dashed UUID or 8-char
-    # prefix shown by get_tasks. Raw string equality would REJECT both normal
-    # forms (2nd-audit C1: escape hatch sealed shut) — compare via the
-    # normalizing helper instead.
-    from hiveweave.services.attestation import _task_ids_equal
+    # Evidence attestation must be a real execution kind (not another waiver).
+    # CEO may omit evidence after looking at this one task.
+    if evidence_id:
+        try:
+            await attestation_service.ensure_schema(project_id)
+            ev = await attestation_service.get(project_id, evidence_id)
+        except Exception as e:
+            return ToolResult.err(f"Failed to load evidence attestation: {e}")
+        if not ev:
+            return ToolResult.err(
+                f"evidenceAttestationId not found: {evidence_id}"
+            )
+        ev_kind = (ev.get("kind") or "").strip()
+        if ev_kind not in WAIVER_EVIDENCE_KINDS:
+            return ToolResult.err(
+                f"evidenceAttestationId kind '{ev_kind}' is not execution evidence. "
+                f"Allowed: {sorted(WAIVER_EVIDENCE_KINDS)}."
+            )
+        ev_task = ev.get("task_id")
+        # Evidence rows created after the short-id normalization fix store the
+        # canonical dash-stripped task id; agents pass the dashed UUID or 8-char
+        # prefix shown by get_tasks. Raw string equality would REJECT both normal
+        # forms (2nd-audit C1: escape hatch sealed shut) — compare via the
+        # normalizing helper instead.
+        from hiveweave.services.attestation import _task_ids_equal
 
-    if not ev_task or not await _task_ids_equal(
-        project_id, params.task_id, str(ev_task)
-    ):
-        return ToolResult.err(
-            f"evidenceAttestationId must be bound to this task "
-            f"(attestation task_id={ev_task!r}, waive for {params.task_id}). "
-            "Null/mismatched evidence cannot unlock an arbitrary task."
-        )
-    ev_exit = ev.get("exit_code")
-    if (
-        ev_exit is not None
-        and int(ev_exit) != 0
-        and ev_kind in ("test_run", VISUAL_CHECK_KIND, BROWSE_E2E_KIND)
-    ):
-        return ToolResult.err(
-            f"evidenceAttestationId {evidence_id} is a failed {ev_kind} "
-            f"(exit_code={ev_exit}); cannot unlock waiver."
-        )
+        if not ev_task or not await _task_ids_equal(
+            project_id, params.task_id, str(ev_task)
+        ):
+            return ToolResult.err(
+                f"evidenceAttestationId must be bound to this task "
+                f"(attestation task_id={ev_task!r}, waive for {params.task_id}). "
+                "Null/mismatched evidence cannot unlock an arbitrary task."
+            )
+        ev_exit = ev.get("exit_code")
+        if (
+            ev_exit is not None
+            and int(ev_exit) != 0
+            and ev_kind in ("test_run", VISUAL_CHECK_KIND, BROWSE_E2E_KIND)
+        ):
+            return ToolResult.err(
+                f"evidenceAttestationId {evidence_id} is a failed {ev_kind} "
+                f"(exit_code={ev_exit}); cannot unlock waiver."
+            )
 
     tags = task.get("tags") or []
     if isinstance(tags, str):
@@ -203,34 +256,40 @@ async def waive_attestation_tool(
         tags=tags if isinstance(tags, list) else [],
         description=task.get("description") or "",
     )
-    if policy_id == "docs_only" or (
-        isinstance(tags, list) and "docs_only" in tags
+    if (
+        not ceo_override
+        and (
+            policy_id == "docs_only"
+            or (isinstance(tags, list) and "docs_only" in tags)
+        )
     ):
         return ToolResult.err(
             f"Cannot waive docs_only task {params.task_id}: "
             "use attest_doc_review(taskId, files=[{{path}}]) then "
-            "submit/approve with attestationIds. Waiver is blocked for "
-            "document tasks."
+            "submit/approve with attestationIds. Only CEO may waive "
+            "a document task (one taskId at a time)."
         )
 
     is_verify = ts._is_verify_task(task)
-    if is_verify:
-        agent = await OrgService().get_agent(agent_id)
-        family = infer_role_family(agent or {})
-        if family != "ceo":
-            return ToolResult.err(
-                f"VERIFY task {params.task_id}: only CEO may waive_attestation "
-                "(identity / attestation last resort). Coordinators must require "
-                "test_run / browse_e2e attestationIds, or escalate to CEO with "
-                "an auditable reason."
-            )
+    if is_verify and not ceo_override:
+        return ToolResult.err(
+            f"VERIFY task {params.task_id}: only CEO may waive_attestation "
+            "(identity / attestation last resort). Coordinators must require "
+            "test_run / browse_e2e attestationIds, or escalate to CEO with "
+            "an auditable reason."
+        )
 
+    stored_reason = (
+        f"[evidence={evidence_id}] {reason}"
+        if evidence_id
+        else f"[ceo_look] {reason}"
+    )
     try:
         waiver_id = await create_waiver(
             project_id,
             task_id=params.task_id,
             waived_by=agent_id,
-            reason=f"[evidence={evidence_id}] {reason}",
+            reason=stored_reason,
         )
     except Exception as e:
         return ToolResult.err(f"Failed to create waiver: {e}")
@@ -299,6 +358,11 @@ async def waive_attestation_tool(
         f"(waiver {waiver_id[:8]}, expires in 24h).\n"
         f"Stored reason (quote this in reports): {reason}\n"
         f"Assignee may now submit_task without attestationIds."
+        + (
+            " CEO look-waiver: this task only — other tasks keep their gates."
+            if ceo_override and not evidence_id
+            else ""
+        )
         + (
             " VERIFY waive is CEO-only and leaves an auditable verification_case."
             if is_verify
@@ -446,6 +510,10 @@ async def waive_merge_tool(
     project_id = await _helpers.get_project_id(agent_id)
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project")
+
+    bulk = deny_if_not_single_task_id(params.task_id)
+    if bulk:
+        return ToolResult.err(bulk)
 
     reason = (params.reason or "").strip()
     if not reason:
