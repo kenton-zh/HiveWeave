@@ -101,6 +101,14 @@ async def _gate_attestation_for_task(
         return
     policy_id = ledger_policy_id(task)
     needed = required_attestation_kinds(policy_id)
+    from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
+
+    needed, _ = drop_code_audit_kind_if_soft(
+        needed,
+        agent_id=str(task.get("assignee_id") or "") or None,
+        task_id=task.get("id"),
+        evidence=evidence,
+    )
     if not needed:
         return
     aids = evidence.get("attestation_ids") or []

@@ -1151,6 +1151,9 @@ REVIEWER_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
     # UI: reviewer (or consume agent) unlocks with ANY one of these —
     # find_reviewer_attestation is OR. Submit-side POLICY_REQUIRED_KINDS
     # stays AND (visual_check + browse_e2e).
+    # CEO look-only browse does not stamp browse_e2e. Approve stays
+    # consume-only because review.py sets reviewer_must_hold from TEST_RUN
+    # (CEO has none) — belt if a stamp row still exists.
     "ui_browser_e2e": frozenset(
         {REVIEWER_KIND, BROWSE_E2E_KIND, VISUAL_CHECK_KIND}
     ),
@@ -1430,6 +1433,14 @@ async def check_task_attestations(
         task, tags=tags if isinstance(tags, list) else None
     )
     needed = required_attestation_kinds(policy_id)
+    from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
+
+    needed, _ = drop_code_audit_kind_if_soft(
+        needed,
+        agent_id=expected_agent_id or str(task.get("assignee_id") or "") or None,
+        task_id=task.get("id"),
+        evidence=evidence if isinstance(evidence, dict) else None,
+    )
     if not needed:
         return None
     if await has_valid_waiver(project_id, task.get("id")):

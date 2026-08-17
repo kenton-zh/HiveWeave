@@ -48,6 +48,7 @@ _TASK_GATE_PREFIXES = (
     "[REWORK REQUESTED]",
     "[TASK APPROVED]",
     "[POST-MERGE VERIFY]",
+    "[SHIP READY]",
 )
 
 

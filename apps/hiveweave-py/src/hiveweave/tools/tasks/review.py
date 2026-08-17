@@ -51,7 +51,8 @@ class ReviewTaskParams(BaseModel):
     "docs→doc_review, code_audit*→code_audit). CEO: review-only — do not bash/self-test or merge leaf trees. "
     "If approve is rejected for missing evidence, do NOT retry approve — rework or wait for the gate. "
     "Does NOT spawn VERIFY. After a milestone is on MAIN, dispatch_task(..., milestoneVerify=true) "
-    "for one QA task. VERIFY waive is CEO-only. docs_only: attest_doc_review; waive rejected.",
+    "for one QA task. VERIFY waive is CEO-only. docs_only: coordinators use "
+    "attest_doc_review (waive rejected); CEO may waive that one taskId.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -194,6 +195,14 @@ async def review_task_tool(
                 evidence = {}
             policy_id = ledger_policy_id(task)
             needed = required_attestation_kinds(policy_id)
+            from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
+
+            needed, _ = drop_code_audit_kind_if_soft(
+                needed,
+                agent_id=str(task.get("assignee_id") or "") or None,
+                task_id=params.task_id,
+                evidence=evidence,
+            )
             from hiveweave.services.attestation import has_valid_waiver
 
             waived = await has_valid_waiver(project_id, params.task_id)
@@ -265,8 +274,11 @@ async def review_task_tool(
                         f"browse/test/doc_review attestationIds on resubmit.\n"
                         f"3) Last resort: waive_attestation(taskId=\"{tid}\", "
                         f"evidenceAttestationId=\"<test_run|browse_e2e id>\", "
-                        f"reason=\"<why exempt>\") — after waiving YOU cannot "
-                        f"approve (waived_by cannot approve); a *different* "
+                        f"reason=\"<why THIS task is exempt>\"). Coordinators "
+                        f"must cite evidence. CEO may omit evidenceAttestationId "
+                        f"after looking at this task. One taskId only — cannot "
+                        f"waive all tasks. After waiving YOU cannot approve "
+                        f"(waived_by cannot approve); a *different* "
                         f"REVIEW holder must approve. Use get_tasks to see "
                         f"current waiver state before deciding."
                     )
@@ -445,8 +457,10 @@ async def review_task_tool(
                         f"code_audit→request_code_audit).\n"
                         f"2) waive_attestation(taskId=\"{tid}\", "
                         f"evidenceAttestationId=\"<id>\", "
-                        f"reason=\"...\") as last resort — then a *different* "
-                        f"agent must approve (you cannot approve your own waiver)."
+                        f"reason=\"...\"). Coordinators must cite evidence; "
+                        f"CEO may omit it for THIS task only (not all tasks). "
+                        f"Then a *different* agent must approve "
+                        f"(you cannot approve your own waiver)."
                         + deadlock_line
                     )
 

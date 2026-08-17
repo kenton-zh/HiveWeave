@@ -133,6 +133,7 @@ ACK_SPARE_PREFIXES: tuple[str, ...] = (
     "[MERGE PROXY]",
     "[PEER_REVIEW_DEADLOCK]",
     "[POST-MERGE VERIFY]",
+    "[SHIP READY]",
     "[SUBAGENT DONE]",
     "[SUBAGENT FAILED]",
     "[BASH DONE]",
@@ -151,6 +152,7 @@ PARK_EXEMPT_PREFIXES: tuple[str, ...] = (
     "[MERGE PROXY]",
     "[PEER_REVIEW_DEADLOCK]",
     "[POST-MERGE VERIFY]",
+    "[SHIP READY]",
 )
 
 

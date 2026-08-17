@@ -161,6 +161,7 @@ async def _submit_preflight(
         required_attestation_kinds,
         resolve_task_policy,
     )
+    from hiveweave.services.code_audit import kinds_after_code_audit_soft_fail
 
     ts = _task_svc.TaskService()
     issues: list[dict] = []
@@ -173,6 +174,16 @@ async def _submit_preflight(
             tags = []
     policy_id = ledger_policy_id(task)
     needed = required_attestation_kinds(policy_id)
+    needed, audit_soft = kinds_after_code_audit_soft_fail(
+        needed, agent_id, task_id
+    )
+    if audit_soft:
+        log.info(
+            "submit_code_audit_soft_fail_accepted",
+            agent_id=agent_id,
+            task_id=str(task_id)[:8],
+            policy_id=policy_id,
+        )
     attest_ids = list(params.attestation_ids or [])
 
     # Drop code_audit ids only when the policy does not require that kind
@@ -331,7 +342,11 @@ async def _submit_preflight(
                     )
                 elif policy_id in ("ui_browser_e2e", "code_audit_visual"):
                     audit_bit = (
-                        "request_code_audit(...) then " if policy_id == "code_audit_visual"
+                        "request_code_audit(...) then "
+                        if (
+                            policy_id == "code_audit_visual"
+                            and CODE_AUDIT_KIND in needed
+                        )
                         else ""
                     )
                     opt1 = (
@@ -368,13 +383,18 @@ async def _submit_preflight(
                         f"Options:\n"
                         + opt1
                         + (
-                            f"2) Coordinator last resort: "
+                            f"2) Coordinator: "
                             f"waive_attestation(taskId=\"{task_id}\", "
-                            f"reason=\"<why exempt>\").\n"
+                            f"evidenceAttestationId=\"<test_run|browse_e2e id>\", "
+                            f"reason=\"<why THIS task>\").\n"
+                            f"CEO may omit evidenceAttestationId after looking "
+                            f"at this one task (cannot waive all tasks).\n"
                             f"Bare testsPassed is rejected."
                         )
                     ),
                 })
+    elif audit_soft:
+        pass
     elif params.tests_passed is not True:
         # docs_only still asks for explicit ack
         issues.append({
@@ -407,6 +427,17 @@ async def _submit_preflight(
         evidence["files_changed"] = normalize_files_changed(params.files_changed)
     if params.test_output:
         evidence["test_output"] = params.test_output[:4000]
+    if audit_soft:
+        from hiveweave.services.code_audit import (
+            CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY,
+            get_last_audit_attempt,
+        )
+
+        rec = get_last_audit_attempt(agent_id) or {}
+        evidence[CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY] = {
+            "reason": rec.get("reason") or "llm_failed",
+            "task_id": task_id,
+        }
 
     # P1-C/N5: code tasks require clean worktree + files_changed proof.
     tag_l = {

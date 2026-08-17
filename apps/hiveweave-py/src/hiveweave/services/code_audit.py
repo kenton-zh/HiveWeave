@@ -111,6 +111,87 @@ def get_last_audit_attempt(agent_id: str) -> dict[str, Any] | None:
     return dict(rec) if rec else None
 
 
+def _task_ref_match(left: str | None, right: str | None) -> bool:
+    """Same task id, including dashed vs compact / prefix stubs."""
+    if not left or not right:
+        return False
+    a = str(left).replace("-", "").strip().lower()
+    b = str(right).replace("-", "").strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return len(a) >= 8 and len(b) >= 8 and (a.startswith(b) or b.startswith(a))
+
+
+def code_audit_soft_fail_covers(agent_id: str, task_id: str | None) -> bool:
+    """True when this agent already attempted audit on *task_id* and soft-failed.
+
+    Aligns the code_audit* submit gate with the tool/prompt contract:
+    llm_failed / no_model / no_callback do not block submit.
+    """
+    rec = get_last_audit_attempt(agent_id)
+    if not rec:
+        return False
+    if rec.get("reason") not in _SOFT_FAIL_ATTEMPT_REASONS:
+        return False
+    rec_tid = rec.get("task_id")
+    if task_id and rec_tid:
+        return _task_ref_match(str(task_id), str(rec_tid))
+    # Unbound attempt (0/N active tasks at request_code_audit) covers
+    # this agent's next submit. Strict match only when both ids exist.
+    if task_id and not rec_tid:
+        return True
+    return not rec_tid
+
+
+CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY = "code_audit_soft_fail"
+
+
+def evidence_has_code_audit_soft_fail(evidence: dict | None) -> bool:
+    """True when submit stamped a structured code-audit soft-fail on evidence."""
+    if not isinstance(evidence, dict):
+        return False
+    stamp = evidence.get(CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY)
+    if not isinstance(stamp, dict):
+        return False
+    return str(stamp.get("reason") or "") in _SOFT_FAIL_ATTEMPT_REASONS
+
+
+def drop_code_audit_kind_if_soft(
+    needed: frozenset[str] | None,
+    *,
+    agent_id: str | None = None,
+    task_id: str | None = None,
+    evidence: dict | None = None,
+) -> tuple[frozenset[str] | None, bool]:
+    """Drop CODE_AUDIT_KIND when evidence is stamped or in-memory attempt matches.
+
+    Approve/HTTP must not re-require code_audit after submit already accepted
+    llm_failed — in-memory ``_last_attempt`` is cleared on successful submit.
+    """
+    if not needed or CODE_AUDIT_KIND not in needed:
+        return needed, False
+    if evidence_has_code_audit_soft_fail(evidence):
+        leftover = frozenset(k for k in needed if k != CODE_AUDIT_KIND)
+        return leftover, True
+    if agent_id and code_audit_soft_fail_covers(agent_id, task_id):
+        leftover = frozenset(k for k in needed if k != CODE_AUDIT_KIND)
+        return leftover, True
+    return needed, False
+
+
+def kinds_after_code_audit_soft_fail(
+    needed: frozenset[str] | None,
+    agent_id: str,
+    task_id: str | None,
+) -> tuple[frozenset[str] | None, bool]:
+    """Submit-time wrapper: in-memory attempt only (evidence not written yet)."""
+    return drop_code_audit_kind_if_soft(
+        needed, agent_id=agent_id, task_id=task_id
+    )
+
+
 def code_audit_submit_reminder(agent_id: str) -> str:
     """Submit-time reminder when edits exceed the threshold and no fresh attestation.
 
