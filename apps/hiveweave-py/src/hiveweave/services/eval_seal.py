@@ -31,6 +31,9 @@ SEALED_NET_TOOLS = frozenset({
     "websearch",
     "webfetch",
     "browse",
+    "browse_main",
+    "game_run_case",
+    "game_run_case_main",
 })
 
 _SEAL_DENY = (

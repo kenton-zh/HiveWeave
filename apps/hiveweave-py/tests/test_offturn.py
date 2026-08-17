@@ -372,9 +372,6 @@ async def test_bash_background_returns_immediately(
     async def fake_pid(_agent_id: str):
         return "proj-1"
 
-    async def fake_verify(*_a, **_k):
-        return ("/tmp/ws", "", None)
-
     monkeypatch.setattr("hiveweave.tools.bash.execute_bash", fake_exec)
     monkeypatch.setattr(
         "hiveweave.tools.bash._validate_command_safety",
@@ -384,9 +381,6 @@ async def test_bash_background_returns_immediately(
         "hiveweave.tools.bash._detect_dev_server_command", lambda _c: None
     )
     monkeypatch.setattr("hiveweave.tools.helpers.get_project_id", fake_pid)
-    monkeypatch.setattr(
-        "hiveweave.tools.bash._resolve_verify_test_workspace", fake_verify
-    )
     monkeypatch.setattr(
         "hiveweave.services.process_registry.prepare_spawn_command",
         lambda cmd, project_id=None: (cmd, {}, None),
@@ -429,14 +423,8 @@ async def test_bash_default_stays_foreground(
     async def fake_pid(_agent_id: str):
         return "proj-1"
 
-    async def fake_verify(*_a, **_k):
-        return ("/tmp/ws", "", None)
-
     monkeypatch.setattr("hiveweave.tools.bash.execute_bash", fake_exec)
     monkeypatch.setattr("hiveweave.tools.helpers.get_project_id", fake_pid)
-    monkeypatch.setattr(
-        "hiveweave.tools.bash._resolve_verify_test_workspace", fake_verify
-    )
     monkeypatch.setattr(
         "hiveweave.services.process_registry.prepare_spawn_command",
         lambda cmd, project_id=None: (cmd, {}, None),

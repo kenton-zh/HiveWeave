@@ -142,7 +142,7 @@ class VerifyMixin:
 
         TEST19 教训: agent 自由 tag ``verify`` 不再参与判定 —— 它曾被
         磐石用来标记普通模块验证任务, 使 14+ 处 VERIFY 特殊逻辑（隔离门/
-        强制 main/sibling 清扫/claim 行为等）误伤普通实施任务。系统
+        MAIN 证据闸/sibling 清扫/claim 行为等）误伤普通实施任务。系统
         spawn（verify_spawn.py）创建的 VERIFY 任务标题始终带 ``VERIFY:``
         前缀, 收敛为单通道不丢失系统任务。
         H1：判定收口到 ``is_verify_title``（同 claim.py 串行化检查与

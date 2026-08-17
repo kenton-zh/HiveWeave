@@ -1590,10 +1590,10 @@ class Agent:
         recovery）。CEO/HR 强制项目根（并清掉误绑的 worktree 路径）；
         恢复失败时回退到项目根目录。
 
-        TEST6 evening P1-3: 名下只有 VERIFY 时本轮 cwd 走项目根（VERIFY 必须
-        在 MAIN 取证）。**不要**因此清掉 agents.workspace_path：绑定是 merge/
-        reconcile 的路标；P1-5 把「本轮走 MAIN」写成「抹掉绑定」后，approved
-        未 merge 的树会从账本消失，团队只能反复撞 merge 门。
+        VERIFY 取证走 bash_main / browse_main，不在这里按任务标题改 cwd。
+        **不要**因 VERIFY 清掉 agents.workspace_path：绑定是 merge/reconcile
+        的路标；把「本轮走 MAIN」写成「抹掉绑定」后，approved 未 merge 的树
+        会从账本消失，团队只能反复撞 merge 门。
         """
         if self._workspace_path is not None:
             return self._workspace_path
@@ -1627,7 +1627,6 @@ class Agent:
                 if project_ws and short_id:
                     try:
                         from hiveweave.services.git_worktree import (
-                            _assignee_is_verify_only,
                             _assignee_needs_write_worktree,
                             heal_workspace_binding_from_disk,
                         )
@@ -1640,16 +1639,6 @@ class Agent:
                         needs_write = await _assignee_needs_write_worktree(
                             project_ws, short_id
                         )
-                        verify_only = (
-                            not needs_write
-                            and await _assignee_is_verify_only(
-                                project_ws, short_id
-                            )
-                        )
-                        if verify_only:
-                            # MAIN cwd this turn; keep durable binding
-                            self._workspace_path = project_ws
-                            return self._workspace_path
                         if not needs_write:
                             live_ok = (
                                 bool(ws)
@@ -1751,6 +1740,8 @@ class Agent:
             and ((tc.get("function") or {}).get("name") in (
                 "send_message", "ask_agent", "notify_agent", "submit_task",
                 "review_task", "claim_task", "write_file", "edit_file", "bash",
+                "bash_main", "browse", "browse_main", "assert_visual",
+                "game_run_case", "game_run_case_main",
                 "spawn_subagent",
             ))
             for tc in (tool_calls or [])
@@ -1764,7 +1755,9 @@ class Agent:
         """True when the turn only had commit_turn (or no tools) — hollow exit."""
         substantive = {
             "submit_task", "review_task", "claim_task", "create_task",
-            "hire_agent", "write_file", "edit_file", "bash", "apply_patch",
+            "hire_agent", "write_file", "edit_file", "bash", "bash_main", "apply_patch",
+            "browse", "browse_main", "assert_visual", "game_run_case",
+            "game_run_case_main", "run_tests",
             "git_worktree_merge", "ask_agent", "send_message", "approve_work",
             "reject_work", "dispatch_task", "spawn_subagent",
         }

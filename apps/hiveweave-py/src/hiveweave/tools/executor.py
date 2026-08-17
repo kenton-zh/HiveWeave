@@ -82,7 +82,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "`python -m app.server`. Long-running servers are auto-registered "
             "(tracked, killable via `stop_dev_server`); prefer "
             "`start_dev_server`. Do not append `&` on a foreground "
-            "command. Default false keeps stdout in this turn."
+            "command. Default false keeps stdout in this turn. "
+            "This tool stays in YOUR workspace. Project-root / MAIN QA: "
+            "bash_main."
         ),
         "properties": {
             "command": {
@@ -116,18 +118,21 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "browse": {
         "description": (
             "Drive Chromium via agent-browser CLI. Typical: "
-            "goto URL → snapshot -i → click @eN → screenshot path → "
-            "assert_visual. Screenshot pixels inject into the next turn; "
-            "a PNG path is not UI evidence. Prefer after "
-            "start_dev_server / lookup_dev_server. VERIFY / ui_browser_e2e "
-            "is forced onto project MAIN (same as bash tests) — do not ask "
-            "coordinator/CEO to take the browser check."
+            "goto URL → snapshot -i → click @eN → screenshot. "
+            "goto always resets viewport to 1280×900. Mobile: "
+            "viewport 390 844 AFTER goto, then screenshot. "
+            "Evidence roles (QA / executor visual gate) then assert_visual; "
+            "CEO looking at the product does not stamp. "
+            "Screenshot pixels inject into the next turn; a PNG path is not "
+            "UI evidence. Prefer after start_dev_server / lookup_dev_server. "
+            "Stays in YOUR workspace. Milestone VERIFY / full-site MAIN QA "
+            "(and CEO looking at MAIN): use browse_main."
         ),
         "properties": {
             "args": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": 'CLI argv e.g. ["goto","http://127.0.0.1:3000"] or ["snapshot","-i"]',
+                "description": 'CLI argv e.g. ["goto","http://127.0.0.1:3000"], ["viewport","390","844"], or ["snapshot","-i"]',
             },
             "command": {
                 "type": "string",
@@ -142,10 +147,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "taskId": {
                 "type": "string",
                 "aliases": ["task_id"],
-                "description": (
-                    "Bind browse_e2e to this task. VERIFY / ui_browser_e2e "
-                    "also forces cwd=MAIN."
-                ),
+                "description": "Bind browse_e2e to this task.",
             },
         },
         "required": [],
@@ -1440,21 +1442,29 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "waive_attestation": {
         "description": (
-            "Last-resort waiver of the attestation gate (coordinator/CEO). "
-            "Requires evidenceAttestationId of a real test_run / browse_e2e / "
-            "visual_check / doc_review. Max 2 per task. The waiving agent "
-            "cannot later approve. Prefer attest_doc_review for docs_only."
+            "Waive the attestation gate for ONE task. Never all tasks. "
+            "CEO may omit evidenceAttestationId after looking at that task. "
+            "Coordinators must cite a real test_run / browse_e2e / "
+            "visual_check / doc_review. Max 2 per task. Waiving agent "
+            "cannot later approve (unless small-team sole reviewer)."
         ),
         "properties": {
-            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id", "id"],
+                "description": "Exactly one task id. Not a list, not all.",
+            },
             "reason": {"type": "string"},
             "evidenceAttestationId": {
                 "type": "string",
                 "aliases": ["evidence_attestation_id"],
-                "description": "Id of a real execution attestation. Pure read_file is not enough.",
+                "description": (
+                    "Coordinator: required execution attestation id. "
+                    "CEO: optional after looking at this task."
+                ),
             },
         },
-        "required": ["taskId", "reason", "evidenceAttestationId"],
+        "required": ["taskId", "reason"],
     },
     "waive_merge": {
         "description": (
@@ -1615,6 +1625,34 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": [],
     },
+}
+
+TOOL_PARAM_SCHEMAS["bash_main"] = {
+    **TOOL_PARAM_SCHEMAS["bash"],
+    "properties": dict(TOOL_PARAM_SCHEMAS["bash"].get("properties") or {}),
+    "description": (
+        "Same as bash, but cwd is the PROJECT ROOT (shared MAIN), not your "
+        "worktree. Use for milestone VERIFY tests and anything that must see "
+        "merged HEAD. Slice unit tests stay on bash."
+    ),
+}
+TOOL_PARAM_SCHEMAS["browse_main"] = {
+    **TOOL_PARAM_SCHEMAS["browse"],
+    "properties": dict(TOOL_PARAM_SCHEMAS["browse"].get("properties") or {}),
+    "description": (
+        "Same as browse, but Chromium cwd is the PROJECT ROOT. QA: "
+        "milestone VERIFY / full-site MAIN. CEO: look at the product "
+        "(not a test duty). Module visual in your slice stays on browse."
+    ),
+}
+TOOL_PARAM_SCHEMAS["game_run_case_main"] = {
+    **TOOL_PARAM_SCHEMAS["game_run_case"],
+    "properties": dict(TOOL_PARAM_SCHEMAS["game_run_case"].get("properties") or {}),
+    "description": (
+        "Same as game_run_case, but Chromium cwd is the PROJECT ROOT. Use "
+        "for milestone VERIFY / MAIN H5 QA. Slice harness stays on "
+        "game_run_case."
+    ),
 }
 
 def _resolve_alias_for_tool(arg_name: str, props: dict) -> str | None:

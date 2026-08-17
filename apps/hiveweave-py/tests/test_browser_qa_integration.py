@@ -30,10 +30,15 @@ def test_browse_and_qa_are_builtin_skills():
 
 def test_browse_tool_registered_and_permitted():
     assert "browse" in READONLY_TOOLS
+    assert "browse_main" in READONLY_TOOLS
     assert "browse" in TOOL_PARAM_SCHEMAS
+    assert "browse_main" in TOOL_PARAM_SCHEMAS
     assert get_tool_def("browse") is not None
+    assert get_tool_def("browse_main") is not None
     assert "game_run_case" in READONLY_TOOLS
+    assert "game_run_case_main" in READONLY_TOOLS
     assert get_tool_def("game_run_case") is not None
+    assert get_tool_def("game_run_case_main") is not None
 
 
 def test_resolve_browse_bin_finds_agent_browser_install():

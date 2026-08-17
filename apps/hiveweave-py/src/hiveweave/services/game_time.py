@@ -213,7 +213,7 @@ def _tool_quiet_cap_ms(tool_name: str) -> int:
     declared = declared_timeout_s(tool_name)
     if declared is not None:
         return int((declared + 60.0) * 1000)
-    if tool_name in ("bash", "run_command"):
+    if tool_name in ("bash", "bash_main", "run_command"):
         from hiveweave.tools.bash import MAX_TIMEOUT_S
 
         return int((MAX_TIMEOUT_S + 60.0) * 1000)

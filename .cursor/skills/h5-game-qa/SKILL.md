@@ -40,8 +40,8 @@ Demo: `apps/hiveweave-py/fixtures/h5_jump_demo/`
 ## Running QA (HiveWeave / Cursor)
 
 1. Start game server (not ports 4000/5173).
-2. `browse goto` game URL (`?hw_test=1`).
-3. Prefer **`game_run_case`**:
+2. `browse` (worktree) or `browse_main` (MAIN VERIFY) `goto` game URL (`?hw_test=1`).
+3. Prefer **`game_run_case`** in your worktree; MAIN milestone QA uses **`game_run_case_main`**:
    - `action="probe"` → tier
    - `action="list"` → case ids
    - `action="run", caseId=...` → codePass + screenshot pixels
@@ -52,15 +52,19 @@ Demo: `apps/hiveweave-py/fixtures/h5_jump_demo/`
 ### HiveWeave tool sketch
 
 ```
+# worktree slice
 browse(args=["goto", "http://127.0.0.1:PORT/?hw_test=1"])
 game_run_case(action="probe")
-game_run_case(action="list")
-game_run_case(action="run", caseId="jump_cross_gap")
+# MAIN VERIFY
+browse_main(args=["goto", "http://127.0.0.1:PORT/?hw_test=1"])
+game_run_case_main(action="probe")
+game_run_case_main(action="list")
+game_run_case_main(action="run", caseId="jump_cross_gap")
 assert_visual(
-  screenshotPath="evidence/hw-game-jump_cross_gap.png",
-  observed="…what pixels show…",
-  criteria="Player standing on right platform; not in pit",
-  verdict="pass"
+    screenshotPath="evidence/hw-game-jump_cross_gap.png",
+    observed="…what pixels show…",
+    criteria="Player standing on right platform; not in pit",
+    verdict="pass"
 )
 ```
 

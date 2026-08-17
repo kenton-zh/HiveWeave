@@ -72,6 +72,7 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
     "request_code_audit": 4,
     # H5 harness — one case may need retries; mid tolerance
     "game_run_case": 6,
+    "game_run_case_main": 6,
     # 每轮强制出口 — 被出口闸门拒收后必须重试；同参指纹才计数
     # （井字棋实测：CEO 首条指令即撞 doom，无任何正常输出）
     "commit_turn": 8,
@@ -90,6 +91,7 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
     "question": 4,
     # 副作用工具 — 最低容忍，防止真实损害
     "bash": 3,
+    "bash_main": 3,
     "job_kill": 3,
     "start_dev_server": 3,
     "stop_dev_server": 3,

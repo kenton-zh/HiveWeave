@@ -12,7 +12,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from hiveweave.config import resolve_browse_bin
 from hiveweave.tools.base import tool
 from hiveweave.tools.browse_tools import (
-    _force_main_ui_workspace,
     browse_exec,
     browse_missing_bin_hint,
     issue_browse_e2e_attestation,
@@ -154,39 +153,42 @@ class GameRunCaseParams(BaseModel):
     "run() drives inputs via window.__HW_TEST__, returns codePass + visionCriteria, "
     "screenshots canvas, injects pixels — then you MUST assert_visual. "
     "No harness → observe-only; do not claim gameplay pass. "
-    "Never attempt realtime AI play of action games.",
+    "Never attempt realtime AI play of action games. "
+    "Your worktree: this tool. Milestone VERIFY on MAIN: game_run_case_main.",
     requires_workspace=True,
     security_level="shell",
 )
 async def game_run_case_tool(
-    params: GameRunCaseParams, agent_id: str, workspace: str
+    params: GameRunCaseParams,
+    agent_id: str,
+    workspace: str,
+    *,
+    hint_tool: str = "game_run_case",
 ) -> ToolResult:
     if not resolve_browse_bin():
         return ToolResult.err(browse_missing_bin_hint())
 
     action = (params.action or "").strip().lower()
     timeout = max(30, min(int(params.timeout_sec or 90), 300))
-
-    exec_ws, force_note = await _force_main_ui_workspace(
-        agent_id, workspace, params.task_id
-    )
-    if not exec_ws and force_note:
-        return ToolResult.err(force_note.strip())
-    workspace = exec_ws or workspace
+    invoked = hint_tool or "game_run_case"
 
     try:
         if action == "probe":
-            return await _action_probe(agent_id, workspace, timeout, params.task_id)
-        if action == "list":
-            return await _action_list(agent_id, workspace, timeout, params.task_id)
-        if action == "run":
+            result = await _action_probe(
+                agent_id, workspace, timeout, params.task_id, invoked
+            )
+        elif action == "list":
+            result = await _action_list(
+                agent_id, workspace, timeout, params.task_id, invoked
+            )
+        elif action == "run":
             case_id = (params.case_id or "").strip()
             if not case_id:
                 return ToolResult.err(
                     "game_run_case action=run requires caseId "
                     "(from action=list)."
                 )
-            return await _action_run(
+            result = await _action_run(
                 agent_id,
                 workspace,
                 timeout,
@@ -195,17 +197,57 @@ async def game_run_case_tool(
                 params.screenshot_selector or "canvas",
                 params.task_id,
             )
-        return ToolResult.err(
-            f"Unknown action={action!r}. Use probe | list | run."
-        )
+        else:
+            return ToolResult.err(
+                f"Unknown action={action!r}. Use probe | list | run."
+            )
+        return _fail_if_workspace_rejected(result)
     except FileNotFoundError:
         return ToolResult.err(browse_missing_bin_hint())
     except OSError as e:
         return ToolResult.err(f"game_run_case browse spawn failed: {e}")
 
 
+def _fail_if_workspace_rejected(result: ToolResult) -> ToolResult:
+    blob = f"{result.output or ''}{result.error or ''}"
+    if result.success and (
+        "[browse_e2e REJECTED]" in blob or "VERIFY ATTEST REJECTED" in blob
+    ):
+        return ToolResult.err(blob.strip())
+    return result
+
+
+@tool(
+    "game_run_case_main",
+    "Same as game_run_case, but Chromium cwd is the PROJECT ROOT (shared MAIN), "
+    "not your worktree. Use for milestone VERIFY / MAIN H5 QA so browse_e2e "
+    "stamps MAIN HEAD. Slice harness checks stay on game_run_case. "
+    "Platform does not rewrite game_run_case cwd.",
+    requires_workspace=True,
+    security_level="shell",
+)
+async def game_run_case_main_tool(
+    params: GameRunCaseParams, agent_id: str, workspace: str
+) -> ToolResult:
+    from hiveweave.tools.bash import _with_cwd_note, resolve_project_main_cwd
+    from hiveweave.tools.helpers import get_project_id
+
+    project_id = await get_project_id(agent_id)
+    main_ws, err = await resolve_project_main_cwd(project_id)
+    if not main_ws:
+        return ToolResult.err(err)
+    result = await game_run_case_tool(
+        params, agent_id, main_ws, hint_tool="game_run_case_main"
+    )
+    return _with_cwd_note(result, f"\n\n[cwd=project root] {main_ws}")
+
+
 async def _action_probe(
-    agent_id: str, workspace: str, timeout: int, task_id: str | None
+    agent_id: str,
+    workspace: str,
+    timeout: int,
+    task_id: str | None,
+    hint_tool: str = "game_run_case",
 ) -> ToolResult:
     code, stdout, stderr = await _js(workspace, _PROBE_JS, timeout, agent_id)
     if code != 0:
@@ -227,8 +269,8 @@ async def _action_probe(
     if hw:
         tier = "instrumented"
         next_hint = (
-            "Harness ready. Next: game_run_case(action=\"list\") then "
-            "game_run_case(action=\"run\", caseId=...)."
+            f"Harness ready. Next: {hint_tool}(action=\"list\") then "
+            f"{hint_tool}(action=\"run\", caseId=...)."
         )
     elif has_rgt and has_at:
         tier = "scripted"
@@ -259,7 +301,11 @@ async def _action_probe(
 
 
 async def _action_list(
-    agent_id: str, workspace: str, timeout: int, task_id: str | None
+    agent_id: str,
+    workspace: str,
+    timeout: int,
+    task_id: str | None,
+    hint_tool: str = "game_run_case",
 ) -> ToolResult:
     code, stdout, stderr = await _js(workspace, _LIST_JS, timeout, agent_id)
     if code != 0:
@@ -283,7 +329,7 @@ async def _action_list(
     )
     out = (
         f"cases={json.dumps(cases, ensure_ascii=False)}\n"
-        "Next: game_run_case(action=\"run\", caseId=\"<id>\")"
+        f"Next: {hint_tool}(action=\"run\", caseId=\"<id>\")"
         f"{attest}"
     )
     return ToolResult.ok(out, cases=cases)

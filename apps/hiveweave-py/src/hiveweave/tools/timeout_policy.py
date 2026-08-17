@@ -15,9 +15,11 @@ DECLARED_TIMEOUT_S: dict[str, float] = {
     "webfetch": 30.0,
     "websearch": 15.0,
     "browse": 90.0,
+    "browse_main": 90.0,
     "question": 200.0,
     "generate_image": 120.0,
     "game_run_case": 120.0,
+    "game_run_case_main": 120.0,
 }
 
 # Hang net while an undeclared tool is in-flight (zombie quiet cap).
@@ -27,6 +29,7 @@ UNDECLARED_ACTIVE_QUIET_S = 1800.0
 # File / shell / patch: no ToolDefinition timeout.
 UNDECLARED_SESSION_TOOLS: frozenset[str] = frozenset({
     "bash",
+    "bash_main",
     "run_command",
     "read_file",
     "write_file",
