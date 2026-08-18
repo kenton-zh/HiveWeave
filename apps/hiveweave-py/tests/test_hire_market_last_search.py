@@ -27,17 +27,14 @@ def test_hire_gate_accumulated_cache_ignored_when_last_search_empty():
     assert err is None
 
 
-def test_hire_gate_rejects_when_last_search_has_market():
-    """最近一次搜索有市场技能，hire 只绑内置 → 拒绝。"""
+def test_hire_gate_allows_builtin_only_when_last_search_has_market():
+    """最近一次搜索有市场技能，hire 只绑内置 → 仍放行。"""
     err = _hire_market_skill_gate(
         skills=["self-review"],
         seen_slugs=["vendor/s3-campaign"],
         builtin_lookup=SkillRegistryService._get_builtin_skill,
     )
-    assert err is not None
-    assert "last list_available_skills" in err
-    assert "tighter keyword" in err
-    assert "skip marketplace by not searching" in err
+    assert err is None
 
 
 @pytest.mark.asyncio
@@ -155,7 +152,7 @@ async def test_hire_agent_gate_uses_last_search_not_cache():
 
 
 @pytest.mark.asyncio
-async def test_hire_agent_gate_rejects_builtin_only_after_market_search():
+async def test_hire_agent_allows_builtin_only_after_market_search():
     ctx = MagicMock()
     ctx.org = _org_for_hire()
     ctx.skills = _skills(last=["vendor/s3-campaign"], cache=["vendor/s3-campaign"])
@@ -169,9 +166,8 @@ async def test_hire_agent_gate_rejects_builtin_only_after_market_search():
     patches = _hire_patches()
     with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
         result = await hire_agent_tool(params, "hr-1", "/tmp", ctx=ctx)
-    assert result.success is False
-    assert "last list_available_skills" in (result.error or "")
-    ctx.org.create_agent.assert_not_awaited()
+    assert result.success is True
+    ctx.org.create_agent.assert_awaited()
 
 
 @pytest.mark.asyncio

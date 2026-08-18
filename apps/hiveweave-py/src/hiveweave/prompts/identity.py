@@ -32,6 +32,18 @@ from hiveweave.prompts.coordinator import build_coordinator_script
 from hiveweave.prompts.executor import build_executor_script
 
 
+def resolve_prompt_role_type(*sources: object) -> str:
+    """First non-empty source, lowercased. Callers pass permission_type then role_type.
+
+    Hire stores ``permission_type``; restart SQL used to expose only ``role_type``.
+    """
+    for raw in sources:
+        text = str(raw or "").strip().lower()
+        if text:
+            return text
+    return "executor"
+
+
 # ── CJK 标点规范化 ───────────────────────────────────────────
 # 部分 LLM API（如 Step 3.7 Flash）在处理 system prompt 中的全角标点时
 # 会无限期挂起。将全角引号、破折号替换为 ASCII 等效字符。
@@ -193,8 +205,10 @@ _COMMUNICATION_BLOCK = """## Communication Rules
 - Messages from all sources (user or agent) arrive in a unified format: `[来自: 名称] 内容`. Treat them equally — the sender could be the user (human operator) or any agent.
 - **Talking to the user**: call `send_message(recipients=["用户"])`. Your assistant text is internal — the user does NOT see it automatically. If you want the user to see something, you MUST send it as a message. This applies equally whether you're reporting results, asking a question, giving a status update, or just saying hello. The content is up to you — the action is always `send_message`.
 - **Talking to an agent**: Prefer `ask_agent` (needs a reply) or `notify_agent` (FYI). `send_message` remains for legacy/compat. Your text is private — other agents CANNOT see it unless you send a tool message.
+- **One ask carries the work.** If you need a reply (hire report, a decision), put the request and what they must return in a **single** `ask_agent`. Do not `send_message` the work and then a second `ask_agent` that only asks them to report — the second inbox item wakes them after they already started, and both letters stay in their context.
 - **Reply Routing Rule**: when replying to a team_chat message from an agent, your reply goes ONLY to that agent. If you also need to ask the user something, call the `question` tool in the SAME turn — never mix the two channels in one message.
 - **🔴 HARD RULE — every turn MUST `commit_turn` (first turn included, no exception)**: Treat each turn like a function — return a TurnResult (`phase` + `summary`, plus `waiting_on` when waiting/blocked). A pure-text assistant reply is NOT a return value: the runtime rejects it with `[TURN EXIT BLOCKED]` and forces you to continue until you call `commit_turn`. Phases: `in_progress` = keep working; `done_slice` = work done and obligations cleared (asks replied, ledger advanced); `waiting`/`blocked` = legal pause with `waiting_on`.
+- **claimed ≠ idle.** Dispatch auto-claims. A leaf still 🔴 working stays `claimed`/`running` until `submit_task`. If you dispatched the work, `commit_turn(waiting)` on the **child task id** parks your still-claimed umbrella (`ASSIGNEE_MUST_SUBMIT` is for YOUR own execution, not theirs). Do not `ask_agent` / `notify_agent` them to submit.
 - **When you receive an ask / reply_required / [TURN EXIT BLOCKED]**: reply with `ask_agent`/`notify_agent`/`send_message`, then `commit_turn`.
 - **MANDATORY: Address other agents by their name (花名), NEVER by ID or role title.** A role may have multiple people — using a role title could send the message to the wrong person. Use list_subordinates or view_org_chart to learn names.
 - **send_message supports group send** — recipients is an array, you can message multiple people at once. E.g. recipients=["Alice","Bob","Carol"] to notify an entire squad simultaneously.
@@ -245,7 +259,7 @@ If a role script below specifies stricter rules (e.g. CAVEMAN for coordinator-to
 _ACTION_DISCIPLINE_BLOCK = """## ⚠️ ACTION DISCIPLINE (CRITICAL)
 - DO NOT output a summary or plan as your final message without executing the tools first.
 - If you say "I will save the charter" — you MUST call `save_charter` in the same turn.
-- If you say "I will instruct HR" — you MUST call `send_message` to HR in the same turn.
+- If you say "I will instruct HR" — you MUST call `ask_agent` to HR in the same turn (spec + required reply in that one message).
 - If you say "I will dispatch tasks" — you MUST call `dispatch_task` in the same turn. New tasks require `submitGate` (docs|unit|module_visual|code_audit|…). Modes: (1) do-now → `dispatch_task(..., submitGate=...)` (wakes unless blocked on dependsOn); (2) draft-then-dispatch → `create_task(..., submitGate=...)` then `dispatch_task(taskId=..., submitGate=...)`; (3) queue with unmet deps → `dependsOn` → status=blocked, assignee recorded, **not woken**. `create_task` alone never wakes. Milestone MAIN QA: `milestoneVerify=true` (coordinator/CEO).
 - A text-only response that describes actions without calling tools is a FAILURE.
 - **Task advance**: if you have claimed/running/rework/submitted obligations, leave the ledger better or `commit_turn(waiting|blocked)` with real `waiting_on`. If you truly cannot push, call `defer_task_advance(reason=…)` — that stops `[TASK ADVANCE]` loops until the next wake. Hollow `done_slice` without advance or defer will get a reminder — see `read_skill("task-advance")`.
@@ -264,13 +278,15 @@ def build_identity_prompt(
     name: str = "Agent",
     goal: str = "",
     model_id: str | None = None,
+    permission_type: str | None = None,
 ) -> str:
     """构建静态身份提示词（第 1 条 system 消息内容）。
 
     参数：
         role:       角色名（如 CEO / HR / test_engineer / developer）
-        role_type:  权限类型（"coordinator" / "executor"）；
+        role_type:  权限类型（"coordinator" / "executor"；重启 SQL 别名）；
                     决定调用 build_coordinator_script 还是 build_executor_script
+        permission_type:  招聘落库字段。live hire 的 config 往往只有这一项。
         backstory:  角色背景叙事（可为空串）
         name:       agent 花名（默认 "Agent"）
         goal:       角色目标（可选，非空时注入 "## Your Role" 段）
@@ -281,13 +297,13 @@ def build_identity_prompt(
         caller 负责包装为 `{"role": "system", "content": <返回值>}`。
 
     说明：
-        - role_type == "coordinator" → build_coordinator_script(role, name)
+        - permission_type 优先，否则 role_type；值为 coordinator → coordinator 剧本
         - 其他（含 "executor" / None / 未知值）→ build_executor_script(role, name)
         - 中文模型（deepseek/kimi/qwen/glm/yi-/doubao/ernie/hunyuan）末尾追加语言镜像规则
     """
-    permission_type = role_type or "executor"
+    family = resolve_prompt_role_type(permission_type, role_type)
 
-    if permission_type == "coordinator":
+    if family == "coordinator":
         role_block = build_coordinator_script(role, name)
     else:
         role_block = build_executor_script(role, name)
@@ -304,7 +320,7 @@ def build_identity_prompt(
     sections.append(_REALITY_BLOCK)
     sections.append(_ETHOS_BLOCK)
     sections.append(_SYSTEM_DIR_BLOCK)
-    sections.append(f"## Permission Level: {permission_type}")
+    sections.append(f"## Permission Level: {family}")
     sections.append(role_block)
     sections.append(_HONESTY_BLOCK)
     sections.append(_GROUNDING_BLOCK)

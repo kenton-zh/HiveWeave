@@ -637,16 +637,23 @@ class CrudMixin:
         """Generic PATCH update.
 
         Supports: title, description, priority, due_at, assignee_id, tags,
-        expected_modules. JSON-serializes list fields. Updates updated_at.
+        expected_modules, parent_task_id. JSON-serializes list fields.
+        Updates updated_at.
 
         Non-system writers cannot mint ``VERIFY:`` titles or reserved tags
         via PATCH (mirrors create_task hardening).
         """
         allowed = {"title", "description", "priority", "due_at", "assignee_id",
-                   "tags", "expected_modules"}
+                   "tags", "expected_modules", "parent_task_id"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
+        if updates.get("parent_task_id"):
+            resolved_parent = await self.resolve_task_id(
+                project_id, str(updates["parent_task_id"])
+            )
+            if resolved_parent:
+                updates["parent_task_id"] = resolved_parent
         # update_task has no source kw — treat as agent/user path.
         if "title" in updates:
             _reject_forged_verify_title(updates.get("title"), source="agent")

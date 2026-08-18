@@ -34,6 +34,109 @@ from hiveweave.agents.helpers.rate_limit import (
 
 log = structlog.get_logger(__name__)
 
+# Structured wake hint (not language-scanned). Injected when history ends
+# with a failed-turn assistant marker so "继续" / "retry" still see the
+# pending user instruction that never made it through a successful append.
+FAILED_TURN_MARKER = "[PLATFORM_TURN_FAILED]"
+FAILED_TURN_NEXT_WAKE_HINT = (
+    "[PLATFORM] Previous LLM turn failed before a reply. "
+    "The user's last instruction is in history and still pending. "
+    "Continue that work unless this wake is a clearly new, different request."
+)
+
+
+def history_ends_with_failed_turn(history: list | None) -> bool:
+    """True when the last assistant turn is a failed-LLM marker."""
+    for msg in reversed(history or []):
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "")
+        if role == "assistant":
+            content = str(msg.get("content") or "").lstrip()
+            return content.startswith(FAILED_TURN_MARKER)
+        if role == "user":
+            return False
+    return False
+
+
+def _same_failed_turn_already_persisted(
+    history: list | None, user_msg: str
+) -> bool:
+    if not user_msg or not history_ends_with_failed_turn(history):
+        return False
+    for msg in reversed(history or []):
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role") or "") == "user":
+            return str(msg.get("content") or "") == user_msg
+    return False
+
+
+def attach_failed_turn_hint(history: list | None, user_content: str) -> str:
+    """Append the pending-instruction hint when the last turn failed."""
+    if not history_ends_with_failed_turn(history):
+        return user_content
+    if FAILED_TURN_NEXT_WAKE_HINT in (user_content or ""):
+        return user_content
+    return f"{user_content}\n\n{FAILED_TURN_NEXT_WAKE_HINT}"
+
+
+def _job_user_message(agent: Any) -> str:
+    job = getattr(agent, "current_job", None) or {}
+    return str(job.get("message") or "").strip()
+
+
+async def persist_failed_turn(agent: Any, assistant_content: str) -> None:
+    """Write this wake's user message + error marker into conversation store.
+
+    Success path persists in handle_completion via append_turn. Error/timeout
+    used to skip that, so the next human nudge (e.g. 继续) only saw ledger
+    state and dropped the original instruction.
+    """
+    user_msg = _job_user_message(agent)
+    if not user_msg:
+        return
+    conv = getattr(agent, "_conversation", None)
+    if conv is None or not hasattr(conv, "append_turn"):
+        return
+    text = str(assistant_content or "").strip() or "[ERROR]"
+    if not text.lstrip().startswith(FAILED_TURN_MARKER):
+        text = f"{FAILED_TURN_MARKER} {text}"
+    try:
+        try:
+            existing = await conv.get_history(agent.id, agent.project_id)
+        except Exception:
+            existing = []
+        if _same_failed_turn_already_persisted(existing, user_msg):
+            return
+        from hiveweave.services.vision import messages_without_images
+
+        await conv.append_turn(
+            agent.id,
+            agent.project_id,
+            messages_without_images(
+                [
+                    {"role": "user", "content": user_msg},
+                    {"role": "assistant", "content": text},
+                ]
+            ),
+        )
+    except Exception as e:
+        log.warning(
+            "persist_failed_turn_failed",
+            agent_id=getattr(agent, "id", None),
+            error=str(e),
+        )
+        # Fail-open: next _build_messages still sees the instruction once.
+        prev = getattr(agent, "_pending_resume_hint", None)
+        fallback = (
+            f"{FAILED_TURN_NEXT_WAKE_HINT}\n\n"
+            f"[PENDING USER INSTRUCTION]\n{user_msg}"
+        )
+        agent._pending_resume_hint = (
+            f"{prev}\n\n{fallback}" if prev else fallback
+        )
+
 
 async def handle_empty_response(
     agent: Any,
@@ -111,6 +214,10 @@ async def escalate_empty_response(agent: Any) -> None:
         log.warning("empty_escalate_streaming_cleanup_failed",
                     agent_id=agent.id, error=str(e))
     agent._streaming_text_acc = ""
+    try:
+        await persist_failed_turn(agent, "[空响应超限，已升级上级处理]")
+    except Exception as e:
+        log.warning("persist_failed_turn_on_empty_failed", error=str(e))
 
     # Selective ACK — spare ask/escalation/review-critical (same as give-up).
     if agent.pending_inbox_msg_ids:
@@ -238,6 +345,11 @@ async def handle_error(agent: Any, error: Exception) -> None:
             await agent._finalize_streaming_turn()
         except Exception:
             pass
+
+    try:
+        await persist_failed_turn(agent, f"[ERROR] {error_msg}")
+    except Exception as e:
+        log.warning("persist_failed_turn_on_error_failed", error=str(e))
 
     # 连续错误计数 — 超过阈值后 ACK inbox，不再 resume
     # 429 / rate-limit: 分级 — soft 冷却 / hard 配额 park（TEST20 P0-B）
@@ -688,6 +800,11 @@ async def handle_safety_timeout(agent: Any) -> None:
                 "is_streaming": False,
             }
         )
+
+    try:
+        await persist_failed_turn(agent, timeout_msg)
+    except Exception as e:
+        log.warning("persist_failed_turn_on_timeout_failed", error=str(e))
 
     if not give_up:
         # 未超阈值: 保留未读 + CHECKPOINT + 冷却，watcher 冷却后恢复信息链

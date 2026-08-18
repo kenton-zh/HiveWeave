@@ -29,7 +29,11 @@ _SCOPE_CLOSED = frozenset(
 )
 _LEDGER_SCOPE_CAP = 40
 _NAMED_TASKS_CAP = 20
-LEDGER_MINE_NOTE = "your actionable to-dos (blocked excluded)"
+LEDGER_MINE_NOTE = (
+    "your actionable to-dos (blocked excluded). "
+    "claimed + you already dispatched a child ≠ you must submit; "
+    "wait on the child. claimed ≠ the assignee is idle."
+)
 LEDGER_SCOPE_RULE = (
     "ledger.mine empty does not mean the org has no tasks; "
     "CEO/mid look at ledger.scope before waive/complete."
@@ -80,6 +84,27 @@ def _depends_on_compact(raw: Any) -> list[str]:
     return out
 
 
+def _live_execution(agent_id: str | None) -> str | None:
+    """verified live execution: processing | idle | offline."""
+    aid = str(agent_id or "").strip()
+    if not aid:
+        return None
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+
+        live = agent_manager.get_agent(aid)
+        if live is None:
+            return "offline"
+        st = getattr(getattr(live, "status", None), "value", None)
+        if st is None:
+            st = getattr(live, "status", "")
+        if str(st).lower() == "processing":
+            return "processing"
+        return "idle"
+    except Exception:
+        return None
+
+
 def _compact_task(t: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": _slice_id(t.get("id")),
@@ -106,6 +131,8 @@ def _compact_scope_task(
         "title": t.get("title"),
         "status": t.get("status"),
         "assignee_id": assignee,
+        "assignee_execution": _live_execution(t.get("assignee_id")),
+        "parent_task_id": _slice_id(t.get("parent_task_id")) or None,
         "policy_id": t.get("policy_id"),
         "depends_on": _depends_on_compact(t.get("depends_on")),
     }
@@ -406,6 +433,47 @@ async def build_platform_state(
         short_by_id = _short_id_map(agents_for_ids)
 
         all_open = await TaskService().list_tasks(project_id)
+        children = [
+            t
+            for t in all_open
+            if t.get("creator_id") == agent_id
+            and t.get("assignee_id")
+            and t.get("assignee_id") != agent_id
+            and (t.get("status") or "").lower() not in _SCOPE_CLOSED
+            and t.get("id")
+        ]
+        claimed_full = [
+            t
+            for t in obligations
+            if t.get("role_hint") == "assignee"
+            and (t.get("status") or "").lower() == "claimed"
+            and t.get("id")
+        ]
+        unique_claimed = len(claimed_full) == 1
+        for t in claimed_full:
+            tid = str(t.get("id") or "")
+            wait_ref = None
+            for ch in children:
+                parent = str(ch.get("parent_task_id") or "")
+                if parent and (
+                    parent == tid
+                    or (len(parent) >= 8 and (tid.startswith(parent) or parent.startswith(tid)))
+                ):
+                    wait_ref = str(ch.get("id"))
+                    break
+            if wait_ref is None and unique_claimed and children:
+                wait_ref = str(children[0].get("id"))
+            if not wait_ref:
+                continue
+            sl = _slice_id(tid)
+            for row in mine_compact:
+                if (
+                    row.get("id") == sl
+                    and row.get("role_hint") == "assignee"
+                ):
+                    row["park"] = "delegated"
+                    row["wait_on"] = wait_ref
+                    break
         project_wide = _viewer_sees_project_scope(agent_row)
         descendant_ids: set[str] = set()
         if not project_wide:
@@ -748,6 +816,21 @@ def _fmt_ledger_row(row: dict[str, Any]) -> str:
     assignee = row.get("assignee_id")
     if assignee:
         extra += f" assignee={assignee}"
+    exec_st = row.get("assignee_execution")
+    if exec_st:
+        extra += f" assignee_execution={exec_st}"
+    role = row.get("role_hint")
+    if role:
+        extra += f" role={role}"
+    park = row.get("park")
+    if park:
+        extra += f" park={park}"
+    wait_on = row.get("wait_on")
+    if wait_on:
+        extra += f" wait_on={wait_on}"
+    parent = row.get("parent_task_id")
+    if parent:
+        extra += f" parent={parent}"
     policy = row.get("policy_id")
     if policy:
         extra += f" policy={policy}"

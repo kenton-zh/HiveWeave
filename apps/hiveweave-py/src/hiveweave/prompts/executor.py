@@ -379,8 +379,8 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
 5. 被要求返工（rework）后，重新执行并再次 `submit_task` 提交
 
 **合法等待（MANDATORY）**：
-- **等人（决策）**：任务保持 **running**，先 `ask_agent`，再 `commit_turn(waiting, waiting_on=[{kind:agent, ref:花名 or A100}])`。不要 `update_task_status(blocked)` 把人或本任务写进 dependsOnTaskIds。
-- **等他们的活**：`commit_turn(waiting, waiting_on=[{kind:task, ref:<回执上的任务id>}])`，不要 status-ask。
+- **等人（决策）**：任务保持 **running**，先 `ask_agent`，再 `commit_turn(waiting, waiting_on=[{{kind:agent, ref:花名 or A100}}])`。不要 `update_task_status(blocked)` 把人或本任务写进 dependsOnTaskIds。
+- **等他们的活**：`commit_turn(waiting, waiting_on=[{{kind:task, ref:<回执上的任务id>}}])`，不要 status-ask。
 - **blocked 只等其他任务或 wakeAt**：`update_task_status(taskId, "blocked", dependsOnTaskIds=["<其他任务id>"], blockedReason="简述原因")` 或 `wakeAt="<ISO-8601 或 epoch 毫秒>"`（可选 waitKind="timer"）。dependsOnTaskIds 只能是其他任务 id（本任务自己会被拒；人不是任务）。blockedReason 仅作人类可读备注。
 **block 必须带 dependsOnTaskIds 或 wakeAt 之一**，否则系统拒绝（无解封路径的任务会永久卡住整个队列）。
 timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检查项）——但 **schedule_alarm 不解封任务**，解封只靠 wakeAt 到期。

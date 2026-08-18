@@ -596,7 +596,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "ask_agent": {
         "description": (
-            "Ask agents and require a reply. Prefer over "
+            "Ask agents and require a reply. Put the request AND what they "
+            "must return in this one message. Do not also send_message a "
+            "status-only follow-up. Prefer over "
             "send_message(expectReport=true). When answering an existing ask, "
             "pass replyTo=that message's reply_contract_id (not the "
             "tool-result message id) or a new obligation is created."
@@ -723,7 +725,17 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["system_prompt", "backstory"],
                 "description": "2-4 sentence character narrative (also accepted as backstory).",
             },
-            "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills to bind. Tool skills: use \"#N\" to reference skills from list_available_skills by number (e.g. \"#1\"). Discipline skills: use full slug from matching table (e.g. \"self-review\"). NOT raw tech names like 'React 18'."},
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Skills to bind. Marketplace is optional: \"#N\" or the "
+                    "full slug from list_available_skills (that store only). "
+                    "If none match or bind fails, pass built-in discipline "
+                    "slugs only. Discipline: full slug from the matching "
+                    "table (e.g. self-review). NOT raw tech names."
+                ),
+            },
             "parentId": {"type": "string", "aliases": ["parent_id", "parent", "parentAgentId", "parent_agent_id"]},
             "templateId": {"type": "string", "aliases": ["template_id"]},
         },
@@ -781,9 +793,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "list_available_skills": {
         "description": (
-            "List marketplace skills (built-in + external + skills.sh). "
-            "Pass search to filter. Returns numbered rows (#1, #2); pass "
-            "\"#N\" or the full slug to hire_agent."
+            "List skills (built-in + marketplace). Marketplace rows are "
+            "optional and tagged with their store (skills.sh vs SkillHub); "
+            "pass \"#N\" or the full slug to hire_agent. Bind uses that "
+            "store only — the two catalogs do not share ids."
         ),
         "properties": {
             "search": {"type": "string", "description": "Optional keyword to filter skills (e.g. 'react', 'testing', 'planning'). Case-insensitive."},

@@ -81,11 +81,10 @@ class HireAgentParams(BaseModel):
     skills: list[str] | None = Field(
         default=None,
         description=(
-            'Skills to bind. REQUIRED: at least one marketplace skill (from '
-            'list_available_skills market results, via "#N" or full slug) — '
-            'hiring with only built-in discipline skills is rejected. Tool '
-            'skills: use "#N" to reference skills from list_available_skills '
-            "by number. Discipline skills: use full slug."
+            'Skills to bind. Marketplace skills are optional: pass "#N" or the '
+            "full slug from list_available_skills when a listed candidate "
+            "matches (bind uses that store only). If none match or bind fails, "
+            "hire with built-in discipline slugs only. Do not invent slugs."
         ),
     )
 
@@ -126,28 +125,14 @@ def _hire_market_skill_gate(
     seen_slugs: list[str],
     builtin_lookup: Any,
 ) -> str | None:
-    """市场技能门槛：最近一次 list_available_skills 的市场结果，不是累计缓存。
+    """Marketplace bind is optional.
 
-    - skills 为空 → 放行（招人不强制技能）
-    - 最近一次搜索没有市场技能（空 / 不可达 / 零命中）→ 放行
-    - skills 里含至少一个市场技能 → 放行
-    - 最近一次搜索有市场技能，却全绑内置 → 拒绝
+    Previously rejected builtin-only hires when the last search showed
+    market hits. That forced HR to pass listed slugs even when bind could
+    not resolve them (TEST_DSH_07: skills.sh id sent to SkillHub). Kept as
+    a no-op so call sites stay stable; do not restore the reject.
     """
-    if not skills:
-        return None
-    seen_market = [s for s in seen_slugs if builtin_lookup(s) is None]
-    if not seen_market:
-        return None
-    if any(builtin_lookup(s) is None for s in skills):
-        return None
-    sample = ", ".join(seen_market[:3])
-    return (
-        "All requested skills are built-in, but your last "
-        "list_available_skills returned marketplace skills "
-        f"(e.g. {sample}). Pass one of those via \"#N\" or its full "
-        "slug, or search a tighter keyword / skip marketplace by not "
-        "searching."
-    )
+    return None
 
 
 async def _notify_worktree_relocated(
@@ -360,9 +345,20 @@ async def hire_agent_tool(
                 if workspace and is_eval_sealed(workspace):
                     invalid_skills.append(sk)
                     continue
-                # 市场校验与 list_available_skills 同路由：skills.sh 优先，
-                # 不可达时降级 SkillHub 国内——避免国内商店技能「搜得到却绑不上」。
-                detail, _source = await ctx.skills._resolve_marketplace_skill(sk)
+                source = None
+                src_fn = getattr(ctx.skills, "market_source_for_slug", None)
+                if callable(src_fn):
+                    try:
+                        raw = src_fn(agent_id, sk)
+                    except TypeError:
+                        raw = None
+                    if isinstance(raw, str) and raw.strip():
+                        source = raw.strip()
+                # 市场校验：列出该 slug 的商店负责 bind。skills.sh 的
+                # owner/repo/skill 不得拿去打 SkillHub（405/404 假降级）。
+                detail, _source = await ctx.skills._resolve_marketplace_skill(
+                    sk, source=source
+                )
                 if detail is not None:
                     valid_skills.append(sk)
                 else:
@@ -370,12 +366,13 @@ async def hire_agent_tool(
         if invalid_skills:
             return ToolResult.err(
                 f"Unresolvable skill slugs: {invalid_skills}. "
-                "At bind time each slug is verified by fetching the "
-                "skill's actual content; these failed. The skill may "
-                "require an API key, its detail page may be temporarily "
-                "unavailable, or the slug is misspelled. Pass slugs "
-                'exactly as returned by list_available_skills ("#N" '
-                "or full slug); do not invent slugs from names alone."
+                "Each marketplace slug belongs to the store that listed it "
+                "(skills.sh uses owner/repo/skill; SkillHub uses a short name). "
+                "Bind fetches that store's detail page — the other catalog "
+                "cannot resolve it. If skills.sh listed the slug, retry the "
+                "same slug or hire with built-in discipline slugs only. "
+                "Pass slugs exactly as returned by list_available_skills "
+                '("#N" or full slug); do not invent slugs from names.'
             )
         skills = valid_skills
 
@@ -1526,10 +1523,10 @@ class ListAvailableSkillsParams(BaseModel):
 
 @tool(
     "list_available_skills",
-    "Lists all skills available in the marketplace (built-in + external + "
-    'skills.sh). Pass \'search\' to filter by keyword. Returns numbered '
-    'skills (e.g. #1, #2). Use "#N" in hire_agent\'s skills parameter to '
-    "reference by number, or use full slug.",
+    "Lists skills (built-in + marketplace). Marketplace rows are optional "
+    "and tagged with their store; pass \"#N\" or the full slug to hire_agent "
+    "(bind uses that store only). If none match, hire with built-in "
+    "discipline slugs only.",
     requires_workspace=False,
     security_level="standard",
 )

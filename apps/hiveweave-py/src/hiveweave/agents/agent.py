@@ -41,7 +41,7 @@ from hiveweave.llm.retry import (
 )
 from hiveweave.llm.streamer import Streamer
 from hiveweave.prompts.context import build_context_prompt
-from hiveweave.prompts.identity import build_identity_prompt
+from hiveweave.prompts.identity import build_identity_prompt, resolve_prompt_role_type
 from hiveweave.services.approval import approval_service
 from hiveweave.services.charter import charter_service
 from hiveweave.services.chat_message import ChatMessageService
@@ -1306,6 +1306,14 @@ class Agent:
                 agent_id=self.id,
                 error=str(e),
             )
+        # Failed LLM turns persist user+[ERROR] into history; a short nudge
+        # like 继续 must still see that pending instruction (no text scan).
+        try:
+            user_content = _agent_recovery.attach_failed_turn_hint(
+                history, user_content
+            )
+        except Exception:
+            pass
         messages.append({"role": "user", "content": user_content})
 
         # 5b. Ephemeral RESUME CHECKPOINT — once per interrupt, not into history
@@ -1326,11 +1334,12 @@ class Agent:
 
         self._identity_prompt = build_identity_prompt(
             role=self.config.get("role", "executor"),
-            role_type=self.config.get("role_type", "executor"),
+            role_type=self.config.get("role_type") or "",
             backstory=self.config.get("backstory", ""),
             name=self.config.get("name", ""),
             goal=self.config.get("goal", ""),
             model_id=self.config.get("model_id", ""),
+            permission_type=self.config.get("permission_type") or "",
         )
         return self._identity_prompt
 
@@ -1547,12 +1556,14 @@ class Agent:
     async def _get_tool_definitions(self) -> list[dict]:
         """获取工具定义列表（family-aware；硬能力由 PolicyService 在 evaluate 时再挡）。"""
         mode = await permission_service.get_permission_mode(self.id)
-        role_type = self.config.get("role_type", "executor")
+        role_type = resolve_prompt_role_type(
+            self.config.get("permission_type"),
+            self.config.get("role_type"),
+        )
         tool_names = permission_service.get_tools_for_agent({
             **self.config,
             "role": self.config.get("role") or role_type,
-            "permission_type": self.config.get("permission_type")
-            or ("coordinator" if role_type == "coordinator" else "executor"),
+            "permission_type": self.config.get("permission_type") or role_type,
             "permission_mode": mode,
         })
         if not tool_names:
@@ -2597,7 +2608,10 @@ class Agent:
             "claim_task or update_task_status again — just continue coding "
             "and call submit_task when done."
         )
-        self._pending_resume_hint = checkpoint
+        prev = getattr(self, "_pending_resume_hint", None)
+        self._pending_resume_hint = (
+            f"{prev}\n\n{checkpoint}" if prev else checkpoint
+        )
         try:
             await self._work_log.write_work_log(
                 self.project_id,

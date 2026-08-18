@@ -27,6 +27,24 @@ from hiveweave.db import meta as meta_db
 log = structlog.get_logger(__name__)
 
 
+def normalize_agent_runtime_config(config: dict | None) -> dict:
+    """Give live hire and restart SQL the same two keys.
+
+    Hire rows carry ``permission_type``. ``start_project_agents`` historically
+    selected ``permission_type AS role_type`` and dropped the real column, so
+    ``infer_role_family`` (reads permission_type) treated coordinators as
+    executors after reboot. Copy whichever is present onto both keys.
+    ``permission_type`` wins if they disagree — it is the agents-table column.
+    """
+    out = dict(config or {})
+    perm = str(out.get("permission_type") or "").strip().lower()
+    alias = str(out.get("role_type") or "").strip().lower()
+    family = perm or alias or "executor"
+    out["permission_type"] = family
+    out["role_type"] = family
+    return out
+
+
 class AgentManager:
     """管理所有 agent task。
 
@@ -85,6 +103,8 @@ class AgentManager:
         if existing is not None:
             log.debug("start_agent_exists", agent_id=agent_id)
             return existing
+
+        config = normalize_agent_runtime_config(config)
 
         # 创建新 Agent
         agent = Agent(
@@ -256,7 +276,8 @@ class AgentManager:
                 log.warning("start_agents_sync_project_id_failed", error=str(e))
 
             cursor = await conn.execute(
-                "SELECT id, project_id, name, role, permission_type as role_type, backstory, "
+                "SELECT id, project_id, name, role, permission_type, "
+                "permission_type as role_type, backstory, "
                 "model_id, goal, permission_mode, bound_skills, "
                 "allowed_tools, denied_tools, ask_tools, "
                 "short_id, status "

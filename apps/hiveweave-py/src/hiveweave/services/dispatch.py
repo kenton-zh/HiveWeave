@@ -96,6 +96,33 @@ class DispatchService:
         self.handoff = HandoffService()
         self.task_service = TaskService()
 
+    async def _infer_parent_task_id(
+        self, project_id: str, from_agent_id: str
+    ) -> str | None:
+        """Link a new child to the dispatcher's sole claimed/running task."""
+        try:
+            mine = await self.task_service.get_actionable_obligations(
+                project_id, from_agent_id
+            )
+        except Exception as e:
+            log.debug("infer_parent_task_failed", error=str(e))
+            return None
+        umbrellas = [
+            t
+            for t in mine
+            if t.get("role_hint") == "assignee"
+            and (t.get("status") or "") in ("claimed", "running")
+        ]
+        received = [
+            t
+            for t in umbrellas
+            if str(t.get("creator_id") or "") != from_agent_id
+        ]
+        if len(received) != 1:
+            return None
+        tid = str(received[0].get("id") or "").strip()
+        return tid or None
+
     # ── DISPATCH ─────────────────────────────────────────────
 
     async def dispatch_task(self, project_id: str, from_agent_id: str,
@@ -107,7 +134,8 @@ class DispatchService:
                             policy_id: str | None = None,
                             title: str | None = None,
                             source: str = "agent",
-                            depends_on: list[str] | None = None) -> dict:
+                            depends_on: list[str] | None = None,
+                            parent_task_id: str | None = None) -> dict:
         """Coordinator dispatches a task to a subordinate.
 
         1. Create a Task Ledger entry via :class:`TaskService` — obtains
@@ -193,6 +221,19 @@ class DispatchService:
             await self.task_service.update_task(
                 project_id, task_id, assignee_id=to_agent_id
             )
+            if not parent_task_id:
+                parent_task_id = (existing or {}).get("parent_task_id") or None
+            if not parent_task_id:
+                parent_task_id = await self._infer_parent_task_id(
+                    project_id, from_agent_id
+                )
+            if parent_task_id and not (existing or {}).get("parent_task_id"):
+                try:
+                    await self.task_service.update_task(
+                        project_id, task_id, parent_task_id=parent_task_id
+                    )
+                except Exception as e:
+                    log.debug("dispatch_set_parent_failed", error=str(e))
             if depends_on:
                 try:
                     await self.task_service.apply_depends_on(
@@ -218,6 +259,10 @@ class DispatchService:
                         error=str(e),
                     )
         else:
+            if not parent_task_id:
+                parent_task_id = await self._infer_parent_task_id(
+                    project_id, from_agent_id
+                )
             task_id = await self.task_service.create_task(
                 project_id=project_id,
                 title=(title or description)[:100],
@@ -227,6 +272,7 @@ class DispatchService:
                 source=source,
                 policy_id=policy_id,
                 depends_on=depends_on,
+                parent_task_id=parent_task_id,
             )
 
         # Ensure executor/builder-coordinator worktree + pin paths in the message
@@ -446,6 +492,8 @@ class DispatchService:
             "worktree_path": wt_meta.get("path"),
             "worktree_short_id": wt_meta.get("short_id"),
             "blocked": is_blocked,
+            "parent_task_id": parent_task_id
+            or (task_after or {}).get("parent_task_id"),
         }
 
     # ── WORK LOG ─────────────────────────────────────────────

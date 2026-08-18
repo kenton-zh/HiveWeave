@@ -195,7 +195,11 @@ def build_task_advance_hint(obligations: list[dict]) -> str:
         elif status == "rework":
             next_step = "按反馈返工后重新 submit_task"
         elif status == "claimed":
-            next_step = "update_task_status(running) 后继续执行 / submit_task"
+            next_step = (
+                "若已 dispatch 给下属：commit_turn(waiting, kind=task, "
+                "ref=子任务id)，不要 ask/notify 催交。"
+                "否则 update_task_status(running) 后自己执行 / submit_task"
+            )
         elif status == "verifying":
             next_step = "执行 VERIFY 后 submit_task / review"
         else:

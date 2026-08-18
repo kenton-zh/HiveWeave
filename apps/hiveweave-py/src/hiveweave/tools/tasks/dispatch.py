@@ -381,6 +381,7 @@ async def dispatch_task_tool(
         title=title,
         source=source,
         depends_on=params.depends_on,
+        parent_task_id=params.parent_task_id,
     )
     if result.get("success"):
         # Align with review_task: inbox alone is not enough — wake assignee
@@ -400,6 +401,13 @@ async def dispatch_task_tool(
             f"Task dispatched to {result.get('to_agent_id', resolved_id)} "
             f"(task_id={result.get('task_id', '')})"
         )
+        parent = result.get("parent_task_id") or ""
+        output += (
+            " Wait on this child with commit_turn(waiting, kind=task, "
+            "ref=the task_id above); do not ask_agent the assignee to submit."
+        )
+        if parent:
+            output += f" parent_task_id={parent}."
         if result.get("blocked"):
             output += (
                 " Task is blocked on unmet depends_on; assignee recorded, "

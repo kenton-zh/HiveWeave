@@ -210,7 +210,7 @@ async def test_read_skill_skips_marketplace_when_sealed(tmp_path, monkeypatch):
 
     _seal(tmp_path)
 
-    async def _boom(self, slug, *, allow_remote=True):
+    async def _boom(self, slug, *, allow_remote=True, source=None):
         if allow_remote:
             raise AssertionError("marketplace must not be contacted when sealed")
         return None, ""

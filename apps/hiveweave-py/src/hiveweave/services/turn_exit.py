@@ -83,6 +83,48 @@ def waiting_covers_task(waiting_on: list | None, tid: str) -> bool:
     return False
 
 
+def waiting_covers_assignee_task(
+    waiting_on: list | None,
+    tid: str,
+    *,
+    delegated_in_flight: list[dict] | None = None,
+    assignee_status: str | None = None,
+    claimed_assignee_ids: list[str] | None = None,
+) -> bool:
+    """True when waiting_on parks this agent's assignee obligation *tid*.
+
+    Legal parks:
+    - waiting on *tid* itself
+    - waiting on a child whose ``parent_task_id`` matches *tid*
+    - unlinked child (no parent): claimed *tid* only when it is this
+      agent's **unique** claimed assignee obligation
+
+    Linked children that point at another parent never use the fallback.
+    ``running`` / ``rework`` never use the unlinked fallback.
+    """
+    if waiting_covers_task(waiting_on, tid):
+        return True
+    status = (assignee_status or "").strip().lower()
+    claimed_ids = [
+        str(x) for x in (claimed_assignee_ids or []) if x
+    ]
+    unique_claimed = (
+        len(claimed_ids) == 1 and _task_ref_matches(claimed_ids[0], tid)
+    )
+    for child in delegated_in_flight or []:
+        cid = str(child.get("id") or "")
+        if not cid or not waiting_covers_task(waiting_on, cid):
+            continue
+        parent = str(child.get("parent_task_id") or "")
+        if parent:
+            if _task_ref_matches(parent, tid):
+                return True
+            continue
+        if status == "claimed" and unique_claimed:
+            return True
+    return False
+
+
 def waiting_on_live_external(
     waiting_on: list | None, *, agent_id: str | None = None
 ) -> bool:
@@ -145,11 +187,14 @@ def assignee_must_submit(
     waiting_on: list | None,
     *,
     agent_id: str | None = None,
+    delegated_in_flight: list[dict] | None = None,
+    assignee_status_by_id: dict[str, str] | None = None,
 ) -> bool:
     """ASSIGNEE_MUST_SUBMIT should fire for this exit.
 
-    Legal park: waiting on each assignee task, or a live off-turn job
-    bound to that task. Unbound / fake external waits do not park.
+    Legal park: waiting on each assignee task, a dispatched child of that
+    task, or a live off-turn job bound to that task. Unbound / fake
+    external waits do not park.
     """
     ids = [str(t) for t in assignee_task_ids if t]
     if not ids:
@@ -158,8 +203,19 @@ def assignee_must_submit(
         return True
     if phase != "waiting":
         return False
+    status_by_id = assignee_status_by_id or {}
+    claimed_ids = [
+        tid for tid in ids
+        if (status_by_id.get(tid) or "").strip().lower() == "claimed"
+    ]
     for tid in ids:
-        if waiting_covers_task(waiting_on, tid):
+        if waiting_covers_assignee_task(
+            waiting_on,
+            tid,
+            delegated_in_flight=delegated_in_flight,
+            assignee_status=status_by_id.get(tid),
+            claimed_assignee_ids=claimed_ids,
+        ):
             continue
         if _live_offturn_covers_task(tid, waiting_on, agent_id):
             continue
@@ -185,6 +241,9 @@ class ExitContext:
     pending_inbox_msgs: list[dict] = field(default_factory=list)
     unreplied_asks: list[dict] = field(default_factory=list)
     open_task_obligations: list[dict] = field(default_factory=list)
+    # Tasks this agent created and assigned to someone else (still open).
+    # Waiting on one of these parks a claimed parent assignee obligation.
+    delegated_in_flight: list[dict] = field(default_factory=list)
     tasks_advanced: set[str] = field(default_factory=set)
     # TEST11 #1a: recipients successfully messaged this turn (id/name/short_id)
     messaged_refs: set[str] = field(default_factory=set)
@@ -472,6 +531,13 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 wait_without_ask_refs.append(ref)
 
     remaining_obligations = list(ctx.open_task_obligations)
+    claimed_assignee_ids = [
+        str(x.get("id") or "")
+        for x in ctx.open_task_obligations
+        if x.get("role_hint") == "assignee"
+        and (x.get("status") or "") == "claimed"
+        and x.get("id")
+    ]
     if turn_result and turn_result.phase in ("done_slice", "waiting"):
         remaining = []
         for t in ctx.open_task_obligations:
@@ -495,6 +561,22 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 and status in ("running", "claimed", "rework")
                 and _live_offturn_covers_task(
                     tid, turn_result.waiting_on, ctx.agent_id
+                )
+            ):
+                remaining.append(t)
+                continue
+            # Player-coach: waiting on a dispatched child parks the
+            # coordinator's still-claimed umbrella (ASSIGNEE_MUST_SUBMIT).
+            if (
+                turn_result.phase == "waiting"
+                and role == "assignee"
+                and status in ("running", "claimed", "rework")
+                and waiting_covers_assignee_task(
+                    turn_result.waiting_on,
+                    tid,
+                    delegated_in_flight=ctx.delegated_in_flight,
+                    assignee_status=str(status or ""),
+                    claimed_assignee_ids=claimed_assignee_ids,
                 )
             ):
                 remaining.append(t)
@@ -635,7 +717,11 @@ GATE_ACTIONS: dict[str, str] = {
     "WAIT_WITHOUT_ASK": "ask_agent or send_message to REF",
     "HIRE_UNREPORTED": "send_message/ask_agent to hiring requester",
     "OPEN_TASKS_UNDECLARED": "advance tasks or declare waiting/blocked",
-    "ASSIGNEE_MUST_SUBMIT": "submit_task(taskId, summary, attestationIds)",
+    "ASSIGNEE_MUST_SUBMIT": (
+        "submit_task(taskId) if YOU are executing; if already dispatched, "
+        "commit_turn(waiting, waiting_on=[{kind:task, ref:childTaskId}]) "
+        "— do not ask_agent the assignee to submit"
+    ),
     "REVIEWER_MUST_START_REVIEW": "review_task(taskId, decision=...)",
     "REVIEWER_MUST_FINISH_REVIEW": "review_task(taskId, decision=...)",
     "CREATOR_MUST_REVIEW": "review_task(taskId, decision=...)",
@@ -679,9 +765,12 @@ def _build_gate_hint(
         "OPEN_TASKS_UNDECLARED": "仍有可行动任务 — 请推进任务，或用 phase=in_progress/waiting/blocked 声明状态（禁止假装 done_slice）",
         "ASSIGNEE_MUST_SUBMIT": (
             "有 running/claimed/rework 任务未 submit_task — "
-            "请调用 submit_task(taskId, summary, testsPassed=true)，"
-            "或 phase=waiting + waiting_on=[{kind:'task', ref:taskId}]，"
-            "或 off-turn 进行中：waiting_on 含 "
+            "若这是你自己在执行：submit_task(taskId, summary, testsPassed=true)。"
+            "若已 dispatch 给下属：commit_turn(waiting) 挂 "
+            "waiting_on=[{kind:'task', ref:子任务id}] "
+            "（等子任务即可停泊你名下仍 claimed 的总包）。"
+            "禁止 ask_agent/notify 催下属提交。"
+            "off-turn 进行中：waiting_on 含 "
             "[{kind:'external', ref:'bg-sub-|bg-bash-…'}]"
         ),
         "REVIEWER_MUST_START_REVIEW": (
@@ -1141,13 +1230,33 @@ async def pre_check_exit_gates(
         assignee_tasks = await cursor.fetchall()
         await cursor.close()
         assignee_ids: list[str] = []
+        assignee_status_by_id: dict[str, str] = {}
         for row in assignee_tasks:
             if hasattr(row, "keys") and "id" in row.keys():
-                assignee_ids.append(str(row["id"]))
+                tid = str(row["id"])
+                st = str(row["status"]) if "status" in row.keys() else ""
             else:
-                assignee_ids.append(str(row[0]))
+                tid = str(row[0])
+                st = str(row[1]) if len(row) > 1 else ""
+            assignee_ids.append(tid)
+            if st:
+                assignee_status_by_id[tid] = st
+        delegated_in_flight: list[dict] = []
+        try:
+            delegated_in_flight = (
+                await task_module.TaskService().list_delegated_in_flight(
+                    project_id, agent_id
+                )
+            )
+        except Exception as e:
+            log.debug("pre_check_delegated_in_flight_failed", error=str(e))
         if assignee_must_submit(
-            phase, assignee_ids, waiting_on, agent_id=agent_id
+            phase,
+            assignee_ids,
+            waiting_on,
+            agent_id=agent_id,
+            delegated_in_flight=delegated_in_flight,
+            assignee_status_by_id=assignee_status_by_id,
         ):
             violations.append("ASSIGNEE_MUST_SUBMIT")
 
