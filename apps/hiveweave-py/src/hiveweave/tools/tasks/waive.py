@@ -113,6 +113,7 @@ async def waive_attestation_tool(
     替代过去的 charter 口头豁免（工具层不读 charter，口头豁免无效）。
     """
     from hiveweave.services.attestation import (
+        AmbiguousAttestationId,
         BROWSE_E2E_KIND,
         MAX_WAIVERS_PER_TASK,
         VISUAL_CHECK_KIND,
@@ -204,6 +205,8 @@ async def waive_attestation_tool(
         try:
             await attestation_service.ensure_schema(project_id)
             ev = await attestation_service.get(project_id, evidence_id)
+        except AmbiguousAttestationId as e:
+            return ToolResult.err(str(e))
         except Exception as e:
             return ToolResult.err(f"Failed to load evidence attestation: {e}")
         if not ev:
@@ -217,21 +220,26 @@ async def waive_attestation_tool(
                 f"Allowed: {sorted(WAIVER_EVIDENCE_KINDS)}."
             )
         ev_task = ev.get("task_id")
-        # Evidence rows created after the short-id normalization fix store the
-        # canonical dash-stripped task id; agents pass the dashed UUID or 8-char
-        # prefix shown by get_tasks. Raw string equality would REJECT both normal
-        # forms (2nd-audit C1: escape hatch sealed shut) — compare via the
-        # normalizing helper instead.
-        from hiveweave.services.attestation import _task_ids_equal
-
-        if not ev_task or not await _task_ids_equal(
-            project_id, params.task_id, str(ev_task)
-        ):
+        # Same binding matrix as verify_ids (not "must equal waived task"):
+        # same-agent different-task OK if commit rule passes when hash present;
+        # different-agent same-task OK; different-agent different-task reject.
+        # Do not require evidence.agent_id == waiving agent.
+        if not ev_task:
             return ToolResult.err(
-                f"evidenceAttestationId must be bound to this task "
+                f"evidenceAttestationId must be bound to a task "
                 f"(attestation task_id={ev_task!r}, waive for {params.task_id}). "
-                "Null/mismatched evidence cannot unlock an arbitrary task."
+                "Null evidence cannot unlock an arbitrary task."
             )
+        from hiveweave.services.attestation import check_attestation_reuse_binding
+
+        bind_ok, bind_err = await check_attestation_reuse_binding(
+            project_id,
+            ev,
+            expected_task_id=params.task_id,
+            expected_agent_id=agent_id,
+        )
+        if not bind_ok:
+            return ToolResult.err(bind_err)
         ev_exit = ev.get("exit_code")
         if (
             ev_exit is not None

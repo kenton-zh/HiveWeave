@@ -12,6 +12,7 @@ import asyncio
 import base64
 import os
 import shlex
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Literal
@@ -202,11 +203,12 @@ async def _maybe_git_commit(workspace: str) -> str | None:
 
 
 def _screenshot_path_from_argv(argv: list[str]) -> str | None:
-    """Extract output path from ``screenshot [path]`` argv.
+    """Extract explicit output path from ``screenshot [path]`` argv.
 
     Supports both ``screenshot path.png``, ``screenshot --selector canvas path.png``
     and the agent-browser positional form ``screenshot canvas path.png``
-    (also under the ``shoot`` alias).
+    (also under the ``shoot`` alias). Returns None when the caller omitted a
+    path — callers must inject an explicit workspace-relative path before spawn.
     """
     if not argv:
         return None
@@ -228,7 +230,68 @@ def _screenshot_path_from_argv(argv: list[str]) -> str | None:
         i += 1
     if candidates:
         return candidates[-1]
-    return "screenshot.png"
+    return None
+
+
+def _screenshot_agent_dir(agent_id: str | None) -> str:
+    raw = str(agent_id or "agent").strip() or "agent"
+    safe = "".join(ch for ch in raw if ch.isalnum() or ch in "-_")
+    if not safe:
+        return "agent"
+    compact = safe.replace("-", "")
+    if len(compact) >= 32:
+        return compact[:8]
+    return safe[:40]
+
+
+def default_screenshot_relpath(
+    agent_id: str | None, *, now_ms: int | None = None
+) -> str:
+    """Workspace-relative default for a screenshot with no caller path."""
+    stamp = int(now_ms if now_ms is not None else time.time() * 1000)
+    return (
+        f".hiveweave/reports/{_screenshot_agent_dir(agent_id)}/shot-{stamp}.png"
+    )
+
+
+def ensure_screenshot_argv(
+    argv: list[str],
+    agent_id: str | None = None,
+    *,
+    now_ms: int | None = None,
+) -> list[str]:
+    """Always pass an explicit workspace-relative path to the screenshot CLI.
+
+    HiveWeave must not rely on CLI cwd/tmp defaults. If the agent omitted a
+    path, inject ``.hiveweave/reports/<agent>/shot-<ts>.png``.
+    """
+    if not argv:
+        return list(argv)
+    head = (argv[0] or "").lower().replace("-", "_")
+    if head not in ("screenshot", "shoot"):
+        return list(argv)
+    if _screenshot_path_from_argv(argv):
+        return list(argv)
+    return [*argv, default_screenshot_relpath(agent_id, now_ms=now_ms)]
+
+
+def _workspace_rel_shot_display(
+    workspace: str, shot_rel: str, shot_path: Path | None
+) -> str:
+    """Receipt path: workspace-relative posix, never a CLI tmp guess."""
+    rel = (shot_rel or "").strip().replace("\\", "/")
+    if rel and not Path(rel).is_absolute():
+        return rel
+    if shot_path and workspace:
+        try:
+            return (
+                shot_path.resolve()
+                .relative_to(Path(workspace).resolve())
+                .as_posix()
+            )
+        except ValueError:
+            pass
+    return rel or (str(shot_path or "").replace("\\", "/"))
 
 
 # gstack-style head → agent-browser head. Commands absent from this table
@@ -537,6 +600,7 @@ async def browse_exec(
             pass
 
     argv = [str(a) for a in argv]
+    argv = ensure_screenshot_argv(argv, agent_id)
     mapped, stdin_payload = _map_ab_argv(argv, workspace)
 
     timeout = max(5, min(int(timeout_sec or 60), 300))
@@ -854,6 +918,7 @@ async def browse_tool(
             'browse requires args or command. Example: '
             'args=["goto","http://127.0.0.1:3000"]'
         )
+    argv = ensure_screenshot_argv(argv, agent_id)
 
     if _is_viewport_command(argv):
         dims = parse_viewport_args(_viewport_rest(argv))
@@ -970,13 +1035,26 @@ async def browse_tool(
             extra_fields["screenshot_path"] = screenshot_abs
             # NOTE: tool_exec drops extra fields before the next LLM round —
             # the path MUST be in the text for assert_visual(screenshotPath=...).
-            shot_display = screenshot_abs.replace("\\", "/")
+            shot_display = _workspace_rel_shot_display(
+                workspace, shot_rel, shot_path
+            )
             out = (
                 f"{out}{attest_note}\n"
                 + screenshot_followup_text(shot_display, look_only=look_only)
             )
             return ToolResult.ok(out, **extra_fields)
 
+        shot_display = _workspace_rel_shot_display(
+            workspace, shot_rel, shot_path
+        )
+        missing = shot_path is None or not Path(shot_path).is_file()
+        if missing:
+            return ToolResult.err(
+                f"Screenshot file missing at {shot_display}. "
+                "Re-take the screenshot using this workspace-relative path: "
+                f'browse(args=["screenshot", "{shot_display}"]). '
+                "Do not copy from agent-browser/tmp."
+            )
         fail_hint = (
             "inspect the image with look_at_image if this is a review."
             if look_only
@@ -985,8 +1063,8 @@ async def browse_tool(
         out = (
             f"{out}{attest_note}\n"
             "[VISION] Screenshot file could not be loaded into multimodal "
-            f"context (path={shot_path}). Re-take screenshot or check path; "
-            f"{fail_hint}"
+            f"context (path={shot_display}). Re-take screenshot using "
+            f"{shot_display}; {fail_hint}"
         )
         return ToolResult.ok(out)
 

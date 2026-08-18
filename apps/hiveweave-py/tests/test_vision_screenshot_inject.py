@@ -43,7 +43,7 @@ def _tiny_png(path: Path) -> None:
 
 def test_screenshot_path_from_argv():
     assert _screenshot_path_from_argv(["screenshot", "evidence/a.png"]) == "evidence/a.png"
-    assert _screenshot_path_from_argv(["screenshot"]) == "screenshot.png"
+    assert _screenshot_path_from_argv(["screenshot"]) is None
     assert _screenshot_path_from_argv(["goto", "http://x"]) is None
 
 
@@ -79,9 +79,9 @@ async def test_browse_screenshot_success_text_includes_abs_path(tmp_path: Path, 
     )
     assert result.success is True
     text = result.output
-    abs_win = str(png.resolve()).replace("\\", "/")
-    assert abs_win in text, text
-    assert f"assert_visual(screenshotPath=\"{abs_win}\"" in text
+    rel = "evidence/flow.png"
+    assert rel in text, text
+    assert f'assert_visual(screenshotPath="{rel}"' in text
     assert result.extra.get("images")
 
 

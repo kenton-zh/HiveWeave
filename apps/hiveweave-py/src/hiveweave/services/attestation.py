@@ -351,6 +351,121 @@ async def _task_ids_equal(project_id: str, a: str | None, b: str | None) -> bool
     return _norm_task_ref(a) == _norm_task_ref(b)
 
 
+class AmbiguousAttestationId(ValueError):
+    """Prefix lookup hit 2+ tool_attestations rows; do not guess."""
+
+
+def _git_dir_present(path: str) -> bool:
+    from pathlib import Path
+
+    git = Path(path) / ".git"
+    return git.exists()
+
+
+async def _agent_worktree_cwd(project_id: str, agent_id: str) -> str | None:
+    """Resolve the agent's current worktree (workspace_path, then GitWorktreeService)."""
+    if not agent_id:
+        return None
+    try:
+        agent = await meta_db.get_agent_by_id(agent_id)
+    except Exception:
+        agent = None
+    ws = str((agent or {}).get("workspace_path") or "").strip()
+    if ws and _git_dir_present(ws):
+        return ws
+    short = str((agent or {}).get("short_id") or "").strip()
+    try:
+        project_ws = await meta_db.get_project_workspace(project_id)
+    except Exception:
+        project_ws = None
+    if project_ws and short:
+        try:
+            from hiveweave.services.git_worktree import GitWorktreeService
+
+            path = GitWorktreeService().get_worktree_path(project_ws, short)
+            if path and _git_dir_present(path):
+                return path
+        except Exception:
+            pass
+    if ws:
+        return ws
+    return None
+
+
+async def _commit_is_worktree_head_or_ancestor(
+    project_id: str, agent_id: str, commit_hash: str
+) -> bool:
+    """True iff *commit_hash* is HEAD or an ancestor of HEAD in the agent's tree.
+
+    Fail-closed: missing cwd, git errors, or empty hash → False.
+    """
+    ch = str(commit_hash or "").strip()
+    if not ch or not agent_id:
+        return False
+    cwd = await _agent_worktree_cwd(project_id, agent_id)
+    if not cwd:
+        return False
+    try:
+        from hiveweave.services.git_worktree import _git
+
+        ok, head = await _git(["rev-parse", "HEAD"], cwd)
+        if not ok:
+            return False
+        head = (head or "").strip()
+        if not head:
+            return False
+        ch_l, head_l = ch.lower(), head.lower()
+        if ch_l == head_l:
+            return True
+        # Unique git abbreviations are decided by merge-base, not string
+        # prefix (unrelated commits can share 7+ hex chars).
+        ok_anc, _ = await _git(["merge-base", "--is-ancestor", ch, "HEAD"], cwd)
+        return bool(ok_anc)
+    except Exception:
+        return False
+
+
+async def check_attestation_reuse_binding(
+    project_id: str,
+    row: dict[str, Any],
+    *,
+    expected_task_id: str | None,
+    expected_agent_id: str | None,
+) -> tuple[bool, str]:
+    """Task-binding matrix for explicit attestation ids (submit / waive).
+
+    Same task: allow (cross-agent pooling is a separate check in verify_ids).
+    Same agent, different task: allow if unexpired/exit already checked; when
+    ``commit_hash`` is present it must be the agent's worktree HEAD or an
+    ancestor (git fail → reject that dimension). Missing hash skips commit.
+    Different agent, different task: reject.
+    """
+    row_task = row.get("task_id") or ""
+    if not expected_task_id or not row_task:
+        return True, ""
+    if await _task_ids_equal(project_id, expected_task_id, str(row_task)):
+        return True, ""
+    row_agent = str(row.get("agent_id") or "")
+    same_agent = bool(expected_agent_id) and row_agent == str(expected_agent_id)
+    aid = str(row.get("id") or "")
+    if not same_agent:
+        return (
+            False,
+            f"Attestation task_id mismatch: {aid} "
+            "(different agent and different task)",
+        )
+    ch = str(row.get("commit_hash") or "").strip()
+    if not ch:
+        return True, ""
+    if await _commit_is_worktree_head_or_ancestor(project_id, row_agent, ch):
+        return True, ""
+    return (
+        False,
+        f"Attestation commit is not the agent's current worktree HEAD "
+        f"or an ancestor: {aid} commit={ch[:12]}",
+    )
+
+
 async def _conn(project_id: str) -> aiosqlite.Connection:
     """Resolve project_id to per-project DB connection.
 
@@ -468,13 +583,38 @@ class AttestationService:
             conn = await _conn(project_id)
         except ProjectDbError:
             return None
+        raw = str(attestation_id or "").strip()
+        if not raw:
+            return None
         cur = await conn.execute(
             "SELECT * FROM tool_attestations WHERE id = ? AND project_id = ?",
-            [attestation_id, project_id],
+            [raw, project_id],
         )
         row = await cur.fetchone()
         await cur.close()
-        return dict(row) if row else None
+        if row:
+            return dict(row)
+        # Unique prefix among this project's rows (8-32 hex). Exact-first
+        # above: an 8-char primary key is never LIKE-matched.
+        if not _HEX_REF_RE.fullmatch(raw):
+            return None
+        like = raw.lower() + "%"
+        cur = await conn.execute(
+            "SELECT * FROM tool_attestations WHERE project_id = ? "
+            "AND (LOWER(id) LIKE ? OR LOWER(REPLACE(id, '-', '')) LIKE ?) "
+            "LIMIT 3",
+            [project_id, like, like],
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise AmbiguousAttestationId(
+                f"Attestation id {raw!r} is ambiguous "
+                f"({len(rows)} matches). Pass the full id."
+            )
+        return dict(rows[0])
 
     async def verify_ids(
         self,
@@ -503,7 +643,10 @@ class AttestationService:
         for aid in attestation_ids:
             if not aid:
                 continue
-            row = await self.get(project_id, aid)
+            try:
+                row = await self.get(project_id, aid)
+            except AmbiguousAttestationId as e:
+                return False, str(e)
             if not row:
                 return False, f"Attestation not found: {aid}"
             exp = row.get("expires_at")
@@ -536,10 +679,14 @@ class AttestationService:
                     False,
                     f"Attestation kind '{kind}' not in expected {sorted(kinds_ok)}",
                 )
-            if task_id and row.get("task_id") and not await _task_ids_equal(
-                project_id, task_id, row.get("task_id")
-            ):
-                return False, f"Attestation task_id mismatch: {aid}"
+            bind_ok, bind_err = await check_attestation_reuse_binding(
+                project_id,
+                row,
+                expected_task_id=task_id,
+                expected_agent_id=expected_agent_id,
+            )
+            if not bind_ok:
+                return False, bind_err
             if not row.get("stdout_hash"):
                 return False, f"Attestation missing stdout_hash: {aid}"
             # visual_check / test_run / browse_e2e with exit≠0 must NOT unlock
@@ -1406,6 +1553,88 @@ def format_attestation_mismatch_hint(
     return "\n".join(lines)
 
 
+def _task_umbrella_flag(task: dict[str, Any]) -> bool:
+    """True when a structured milestoneVerify / milestone_verify flag is set.
+
+    Does not scrape titles. Checks task fields, evidence JSON, and tags.
+    """
+    if task.get("milestone_verify") or task.get("milestoneVerify"):
+        return True
+    ev = task.get("evidence") or {}
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except Exception:
+            ev = {}
+    if isinstance(ev, dict) and (
+        ev.get("milestone_verify") or ev.get("milestoneVerify")
+    ):
+        return True
+    tags = task.get("tags") or []
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            tags = []
+    if isinstance(tags, list):
+        tokens = {str(t).strip().lower().replace("-", "_") for t in tags if t}
+        if tokens & {"milestone_verify", "milestoneverify"}:
+            return True
+    return False
+
+
+async def _task_has_children(project_id: str, task_id: str | None) -> bool:
+    if not task_id:
+        return False
+    try:
+        from hiveweave.services.tasks.db import _query
+
+        rows = await _query(
+            project_id,
+            "SELECT 1 FROM tasks WHERE parent_task_id = ? "
+            "AND COALESCE(is_archived, 0) = 0 LIMIT 1",
+            [str(task_id)],
+        )
+        return bool(rows)
+    except Exception:
+        return False
+
+
+async def task_is_umbrella(project_id: str, task: dict[str, Any]) -> bool:
+    """Umbrella/parent: structured milestoneVerify flag, or root with children."""
+    if _task_umbrella_flag(task):
+        return True
+    if task.get("parent_task_id"):
+        return False
+    return await _task_has_children(project_id, task.get("id"))
+
+
+def should_hint_umbrella_gate(
+    policy_id: str,
+    needed: frozenset[str] | None,
+    err: str,
+) -> bool:
+    """True when the reject is a leaf code_audit(_unit) gate (or missing audit)."""
+    pid = (policy_id or "").strip()
+    if pid in ("code_audit_unit", "code_audit", "code_audit_visual"):
+        return True
+    if needed and CODE_AUDIT_KIND in needed:
+        return True
+    return "code_audit" in (err or "").lower()
+
+
+def format_umbrella_gate_hint(policy_id: str, err: str) -> str:
+    """≤10-line receipt: parent/milestone path, not leaf code_audit_unit + CEO waive."""
+    return (
+        f"attestation gate failed ({policy_id}): {err}\n"
+        "This is an umbrella/parent (has children) or a milestone QA task.\n"
+        "Use submitGate=docs for the package, or dispatch_task(..., "
+        "milestoneVerify=true) for MAIN QA.\n"
+        "Do not copy a leaf code_audit_unit gate onto the parent.\n"
+        "Do not ask CEO for a leaf ticket."
+    )
+
+
 async def check_task_attestations(
     project_id: str,
     task: dict[str, Any],
@@ -1457,6 +1686,10 @@ async def check_task_attestations(
     )
     if ok:
         return None
+    if should_hint_umbrella_gate(policy_id, needed, err) and await task_is_umbrella(
+        project_id, task
+    ):
+        return format_umbrella_gate_hint(policy_id, err)
     return (
         f"attestation gate failed ({policy_id}): {err}. "
         f"For docs_only: call attest_doc_review(taskId, files=[...]) then "

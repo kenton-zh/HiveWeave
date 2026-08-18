@@ -334,65 +334,79 @@ async def _submit_preflight(
                 task_id=task_id,
             )
             if not ok:
-                if policy_id == "docs_only":
-                    opt1 = (
-                        f"1) attest_doc_review(taskId=\"{task_id}\", "
-                        f"files=[{{path: \"specs/...\"}}]) then "
-                        f"submit_task(..., attestationIds=[...]).\n"
-                    )
-                elif policy_id in ("ui_browser_e2e", "code_audit_visual"):
-                    audit_bit = (
-                        "request_code_audit(...) then "
-                        if (
-                            policy_id == "code_audit_visual"
-                            and CODE_AUDIT_KIND in needed
-                        )
-                        else ""
-                    )
-                    opt1 = (
-                        f"1) {audit_bit}browse(...) then browse(screenshot) then "
-                        f"assert_visual(screenshotPath=..., "
-                        f"observed=\"what you SEE in the image\", "
-                        f"verdict=\"pass\") then "
-                        f"submit_task(taskId=\"{task_id}\", "
-                        f"attestationIds=[... matching kinds ...]). "
-                        f"Need ALL required kinds; verdict=fail does not unlock submit.\n"
-                    )
-                elif needed and CODE_AUDIT_KIND in needed:
-                    extra = (
-                        " and bash(..., taskId=this task) for test_run"
-                        if "test_run" in needed
-                        else ""
-                    )
-                    opt1 = (
-                        f"1) request_code_audit(taskId=\"{task_id}\"){extra} "
-                        f"then submit_task(..., attestationIds=[code_audit id, ...]).\n"
-                    )
+                from hiveweave.services.attestation import (
+                    format_umbrella_gate_hint,
+                    should_hint_umbrella_gate,
+                    task_is_umbrella,
+                )
+
+                if should_hint_umbrella_gate(
+                    policy_id, needed, err
+                ) and await task_is_umbrella(project_id, task):
+                    issues.append({
+                        "code": "attestation",
+                        "message": format_umbrella_gate_hint(policy_id, err),
+                    })
                 else:
-                    opt1 = (
-                        f"1) Run bash/tests as the assignee, then "
-                        f"submit_task(taskId=\"{task_id}\", "
-                        f"attestationIds=[...]).\n"
-                    )
-                full_tid = task.get("id") or task_id
-                issues.append({
-                    "code": "attestation",
-                    "message": (
-                        f"submit_task attestation gate failed ({policy_id}): {err}. "
-                        f"taskId={full_tid} (use this full id).\n"
-                        f"Options:\n"
-                        + opt1
-                        + (
-                            f"2) Coordinator: "
-                            f"waive_attestation(taskId=\"{task_id}\", "
-                            f"evidenceAttestationId=\"<test_run|browse_e2e id>\", "
-                            f"reason=\"<why THIS task>\").\n"
-                            f"CEO may omit evidenceAttestationId after looking "
-                            f"at this one task (cannot waive all tasks).\n"
-                            f"Bare testsPassed is rejected."
+                    if policy_id == "docs_only":
+                        opt1 = (
+                            f"1) attest_doc_review(taskId=\"{task_id}\", "
+                            f"files=[{{path: \"specs/...\"}}]) then "
+                            f"submit_task(..., attestationIds=[...]).\n"
                         )
-                    ),
-                })
+                    elif policy_id in ("ui_browser_e2e", "code_audit_visual"):
+                        audit_bit = (
+                            "request_code_audit(...) then "
+                            if (
+                                policy_id == "code_audit_visual"
+                                and CODE_AUDIT_KIND in needed
+                            )
+                            else ""
+                        )
+                        opt1 = (
+                            f"1) {audit_bit}browse(...) then browse(screenshot) then "
+                            f"assert_visual(screenshotPath=..., "
+                            f"observed=\"what you SEE in the image\", "
+                            f"verdict=\"pass\") then "
+                            f"submit_task(taskId=\"{task_id}\", "
+                            f"attestationIds=[... matching kinds ...]). "
+                            f"Need ALL required kinds; verdict=fail does not unlock submit.\n"
+                        )
+                    elif needed and CODE_AUDIT_KIND in needed:
+                        extra = (
+                            " and bash(..., taskId=this task) for test_run"
+                            if "test_run" in needed
+                            else ""
+                        )
+                        opt1 = (
+                            f"1) request_code_audit(taskId=\"{task_id}\"){extra} "
+                            f"then submit_task(..., attestationIds=[code_audit id, ...]).\n"
+                        )
+                    else:
+                        opt1 = (
+                            f"1) Run bash/tests as the assignee, then "
+                            f"submit_task(taskId=\"{task_id}\", "
+                            f"attestationIds=[...]).\n"
+                        )
+                    full_tid = task.get("id") or task_id
+                    issues.append({
+                        "code": "attestation",
+                        "message": (
+                            f"submit_task attestation gate failed ({policy_id}): {err}. "
+                            f"taskId={full_tid} (use this full id).\n"
+                            f"Options:\n"
+                            + opt1
+                            + (
+                                f"2) Coordinator: "
+                                f"waive_attestation(taskId=\"{task_id}\", "
+                                f"evidenceAttestationId=\"<test_run|browse_e2e id>\", "
+                                f"reason=\"<why THIS task>\").\n"
+                                f"CEO may omit evidenceAttestationId after looking "
+                                f"at this one task (cannot waive all tasks).\n"
+                                f"Bare testsPassed is rejected."
+                            )
+                        ),
+                    })
     elif audit_soft:
         pass
     elif params.tests_passed is not True:
