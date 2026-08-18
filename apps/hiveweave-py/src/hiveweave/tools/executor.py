@@ -121,6 +121,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "goto URL → snapshot -i → click @eN → screenshot. "
             "goto always resets viewport to 1280×900. Mobile: "
             "viewport 390 844 AFTER goto, then screenshot. "
+            "After screenshot, copy the relative path from the tool receipt "
+            "into assert_visual. Do not assume screenshot.png at repo root "
+            "or agent-browser/tmp. "
             "Evidence roles (QA / executor visual gate) then assert_visual; "
             "CEO looking at the product does not stamp. "
             "Screenshot pixels inject into the next turn; a PNG path is not "
@@ -639,7 +642,13 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "MANDATORY end-of-turn return value (TurnResult). Every turn is a "
             "function call — you MUST commit_turn before stopping. "
             "phase: in_progress|waiting|blocked|done_slice. "
-            "waiting/blocked require waiting_on. Assistant text is NOT a return value."
+            "waiting/blocked require waiting_on. kind is the ref type only: "
+            "person-decision = ask_agent first then kind=agent "
+            "(WAIT_WITHOUT_ASK still hard); their work = kind=task + id from "
+            "the receipt (no status-ask). notify from that person still "
+            "wakes/clears the agent wait. Do not "
+            "update_task_status(blocked) for a person or this task's own id. "
+            "Assistant text is NOT a return value."
         ),
         "properties": {
             "phase": {
@@ -655,7 +664,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "aliases": ["waiting_on"],
                 "description": (
-                    "Required for waiting/blocked. "
+                    "Required for waiting/blocked. kind is the ref type only. "
+                    "agent = person's decision (ask_agent first; "
+                    "WAIT_WITHOUT_ASK still hard; ref = 花名 or A100); "
+                    "task = their work (copy the entire task id from the "
+                    "receipt; no status-ask). A notify from that person still "
+                    "wakes/clears the agent wait (no replyTo required). "
+                    "Do not scan language. Do not put this task or a person "
+                    "in update_task_status dependsOnTaskIds. "
                     "Items: {kind: agent|task|user|timer|external, ref: string, note?: string}"
                 ),
             },
@@ -1252,7 +1268,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "Set status to running (start or unblock) or blocked. "
             "blocked requires dependsOnTaskIds and/or wakeAt — a block "
-            "with neither is rejected. Status omitted defaults to running. "
+            "with neither is rejected. dependsOnTaskIds = other task ids "
+            "only (self-id rejected). Waiting for a person keeps the task "
+            "running and uses commit_turn(waiting, waiting_on kind=agent). "
+            "Status omitted defaults to running. "
             "blockedReason is a note only, never an unblock path. "
             "running/unblock is refused while depends_on are still unmet."
         ),
@@ -1268,7 +1287,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "items": {"type": "string"},
                 "aliases": ["depends_on_task_ids", "dependsOnTaskId",
                             "depends_on_task_id", "dependsOn"],
-                "description": "Blocker task ids (auto-unblock when all approved/closed). Passing dependsOnTaskIds or wakeAt is REQUIRED when blocking."},
+                "description": "Other task ids only (auto-unblock when all approved/closed). Self-id is rejected. People-waiting is commit_turn, not this list. Passing dependsOnTaskIds or wakeAt is REQUIRED when blocking."},
             "waitKind": {"type": "string",
                 "aliases": ["wait_kind"],
                 "enum": ["dependency", "timer", "user", "external"],
@@ -1443,7 +1462,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "waive_attestation": {
         "description": (
             "Waive the attestation gate for ONE task. Never all tasks. "
-            "CEO may omit evidenceAttestationId after looking at that task. "
+            "Copy the entire taskId from the tool receipt; do not truncate. "
+            "CEO: look at ledger.scope for that task first; may omit "
+            "evidenceAttestationId after looking at that task. "
             "Coordinators must cite a real test_run / browse_e2e / "
             "visual_check / doc_review. Max 2 per task. Waiving agent "
             "cannot later approve (unless small-team sole reviewer)."
@@ -1452,7 +1473,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "taskId": {
                 "type": "string",
                 "aliases": ["task_id", "id"],
-                "description": "Exactly one task id. Not a list, not all.",
+                "description": (
+                    "Exactly one task id copied whole from the receipt. "
+                    "Not a list, not all, do not truncate."
+                ),
             },
             "reason": {"type": "string"},
             "evidenceAttestationId": {
@@ -1510,8 +1534,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "get_platform_state": {
         "description": (
             "Read-only platform ground truth (gates, ledger, org, runtime) "
-            "tagged verified/claimed/unknown. Trust this over peer chat "
-            "when they conflict."
+            "tagged verified/claimed/unknown. ledger.mine = your actionable "
+            "to-dos (empty mine ≠ org done). CEO/mid: read ledger.scope "
+            "(includes blocked) before waive/complete. Also "
+            "inbox.named_tasks. Trust this over peer chat when they conflict."
         ),
         "properties": {},
         "required": [],
@@ -1642,7 +1668,10 @@ TOOL_PARAM_SCHEMAS["browse_main"] = {
     "description": (
         "Same as browse, but Chromium cwd is the PROJECT ROOT. QA: "
         "milestone VERIFY / full-site MAIN. CEO: look at the product "
-        "(not a test duty). Module visual in your slice stays on browse."
+        "(not a test duty). Module visual in your slice stays on browse. "
+        "After screenshot, copy the relative path from the tool receipt "
+        "into assert_visual. Do not assume screenshot.png at repo root "
+        "or agent-browser/tmp."
     ),
 }
 TOOL_PARAM_SCHEMAS["game_run_case_main"] = {

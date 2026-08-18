@@ -116,6 +116,8 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 
 未知 family 兜底 READONLY。CEO/HR 强制项目根（无 worktree）；executor + builder coordinator 由 `agent_gets_write_worktree()` 判定有 worktree。CEO（root）+ HR（CEO 下级）项目创建时自动创建，HR 招 expert agents。
 
+**IDs / ledger:** copy public ids whole from tool receipts (do not truncate). `get_platform_state` `ledger.mine` is your to-dos (empty ≠ org done); CEO/mid read `ledger.scope` before waive/complete. `depends_on` must not include self — waiting on a person is `commit_turn(waiting_on kind=agent)`.
+
 **团队开会（规格已定，未实现）：** [`docs/spec/team-meeting.md`](docs/spec/team-meeting.md)。不要用 inbox 群发或 `chat()`+skip `append_turn` 冒充开会。
 
 ## Game time

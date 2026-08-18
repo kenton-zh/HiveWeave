@@ -69,8 +69,8 @@ async def get_tasks_tool(
                 pass
             return ToolResult.ok(body, tasks=[])
         lines = [
-            "Tip: claim/submit/review/cancel accept full UUID or unique "
-            "8-char prefix — prefer copying the full id= value."
+            "Tip: copy the entire id= string from this listing into "
+            "claim/submit/review/cancel. Do not truncate."
         ]
         # Prefetch verification cases for VERIFY visibility (TEST12 dogfood)
         case_by_verify: dict[str, dict] = {}

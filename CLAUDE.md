@@ -257,6 +257,7 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 
 - **reply_required 硬门**：本 turn 处理的 inbox 消息带 `reply_required`（`expect_report` / `message_type=ask`）时，agent 必须在本 turn 内对该 sender 成功调用 send_message 类工具（送达证据 `get_sent_recipients_since`）才能退出；纯文字输出不算回复 → `UNREPLIED_ASKS` **永不 soft-pass**（`commit_turn` 预检直接 REJECT，不 `end_turn`；兜底 `evaluate_turn_exit` 也不被 soft-pass 压制）。豁免 user/system/已归档/不存在的 sender（`agent.py:_handle_completion` / `turn_exit.collect_unreplied_asks`）。预检与兜底统一走 reply_contract（已读≠已回）。`WAIT_WITHOUT_ASK` 预检解析花名/short_id/UUID（不得传空 `name_by_id`）
 - **doom loop 正反馈缓解**：同 turn 内同参数 `commit_turn` 已接受时返回差异化提示（"已提交，勿再同参调用"），打破「相同结果→相同决策」循环；熔断阈值 commit_turn=8
+- **公开 id / 账本**：从 get_tasks、工具回执、gate 错误里整段复制 id，不要截断。`get_platform_state` 的 `ledger.mine` 是自己可行动待办（空 ≠ 组织完成）；CEO/中层 waive 或结案前读 `ledger.scope`（含 blocked）。`depends_on` / `dependsOnTaskIds` 不得含本任务自己；等人走 `commit_turn(waiting_on kind=agent)`，不要把人写进 dependsOn。
 
 ### Git worktree 隔离（executor + builder coordinator）
 
