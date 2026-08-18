@@ -14,6 +14,21 @@ from .verify import VerifyMixin
 log = structlog.get_logger(__name__)
 
 
+SELF_DEPENDENCY_BLOCK_ERROR = (
+    "A task cannot depend on itself — dependsOn / dependsOnTaskIds may "
+    "only be other task ids (self-dependency never unblocks). Waiting on "
+    "a person is commit_turn(waiting_on=[{kind:agent, ref:...}]); keep "
+    "the task running."
+)
+
+
+def _same_task_id(left: str, right: str) -> bool:
+    """True if two task ids name the same row (dash/case insensitive)."""
+    a = (left or "").replace("-", "").strip().casefold()
+    b = (right or "").replace("-", "").strip().casefold()
+    return bool(a) and a == b
+
+
 def blocked_task_has_wake_path(task: dict, now_ms: int | None = None) -> bool:
     """A blocked task has a live auto-unblock path iff its wait metadata says so.
 
@@ -178,6 +193,8 @@ class LifecycleMixin:
         意图) — new callers must pass it explicitly. A block with no deps and
         no timer has no auto-unblock path and parks the task forever; callers
         that need that (QA dead zone) must use the dedicated system paths.
+        ``depends_on`` that includes this task's own id is rejected before
+        the transition (self-dep never unblocks).
         """
         task_id = await self.require_task_id(project_id, task_id)
         dep_ids: list[str] = []
@@ -185,6 +202,8 @@ class LifecycleMixin:
             dep_ids.append(await self.require_task_id(project_id, d))
         if depends_on_task_id:
             dep_ids.append(await self.require_task_id(project_id, depends_on_task_id))
+        if any(_same_task_id(d, task_id) for d in dep_ids):
+            raise ValueError(SELF_DEPENDENCY_BLOCK_ERROR)
         await self._transition(project_id, task_id, "blocked")
         now_ms = int(time.time() * 1000)
         reason = (reason or "Blocked by agent").strip()

@@ -311,6 +311,8 @@ class CrudMixin:
 
         Returns True when the row is blocked after this call.
         """
+        from .lifecycle import SELF_DEPENDENCY_BLOCK_ERROR, _same_task_id
+
         task_id = await self.require_task_id(project_id, task_id)
         row = await self.get_task(project_id, task_id)
         if not row:
@@ -322,6 +324,8 @@ class CrudMixin:
                 continue
             found = await self.resolve_task_id(project_id, dep)
             resolved.append(found or dep)
+        if any(_same_task_id(d, task_id) for d in resolved):
+            raise ValueError(SELF_DEPENDENCY_BLOCK_ERROR)
         now_ms = int(time.time() * 1000)
         await _execute(
             project_id,
