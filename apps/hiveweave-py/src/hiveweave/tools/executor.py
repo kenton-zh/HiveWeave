@@ -1018,7 +1018,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "(docs|unit|module_visual|code_audit|code_audit+module_visual|"
             "code_audit+unit) — required for NEW tasks; ignored on taskId reuse "
             "(ledger policy stays). Unmet dependsOn → blocked, assignee recorded, "
-            "NOT woken (also applied when reusing taskId). create_task alone "
+            "NOT woken (also applied when reusing taskId). dependsOn = other "
+            "task ids only (self-id rejected); waiting on a person is "
+            "commit_turn(waiting, kind=agent). create_task alone "
             "does not wake. Milestone MAIN QA: milestoneVerify=true "
             "(coordinator/CEO). Same-assignee dups cannot be forced."
         ),
@@ -1066,8 +1068,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "items": {"type": "string"},
                 "aliases": ["depends_on"],
                 "description": (
-                    "Unmet deps → blocked (assignee recorded, not woken). "
-                    "VERIFY titles are never auto-blocked."
+                    "Other task ids only (self-id rejected). Unmet → blocked "
+                    "(assignee recorded, not woken). VERIFY titles skip "
+                    "auto-block. People-waiting is commit_turn, not this list."
                 ),
             },
         },
@@ -1208,7 +1211,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Write a Task Ledger row. Does not inbox/wake anyone. submitGate is "
             "REQUIRED (docs|unit|module_visual|code_audit|code_audit+*). "
             "Unassigned → created; with assigneeId → claimed unless dependsOn "
-            "is unmet (blocked, not claimed). VERIFY titles stay created. "
+            "is unmet (blocked, not claimed). dependsOn = other task ids only "
+            "(self-id rejected); waiting on a person is commit_turn. "
+            "VERIFY titles stay created. "
             "Coordinator/CEO milestone MAIN QA: milestoneVerify=true. To wake, "
             "call dispatch_task (pass taskId to reuse)."
         ),
@@ -1225,7 +1230,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "parentTaskId": {"type": "string", "aliases": ["parent_task_id", "parent"]},
             "dependsOn": {"type": "array", "items": {"type": "string"},
                 "aliases": ["depends_on"],
-                "description": "Unmet deps → blocked (not claimed/woken). VERIFY titles skip auto-block."},
+                "description": "Other task ids only (self-id rejected). Unmet → blocked (not claimed/woken). VERIFY titles skip auto-block. People-waiting is commit_turn, not this list."},
             "expectedModules": {"type": "array", "items": {"type": "string"},
                 "aliases": ["expected_modules"]},
             "tags": {"type": "array", "items": {"type": "string"}},

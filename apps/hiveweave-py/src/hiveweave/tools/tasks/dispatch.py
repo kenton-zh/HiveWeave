@@ -157,8 +157,9 @@ class DispatchTaskParams(BaseModel):
         default=None,
         alias="dependsOn",
         description=(
-            "Unmet deps → task is blocked (assignee recorded, not woken). "
-            "VERIFY titles are never auto-blocked."
+            "Other task ids only (self-id rejected). Unmet → blocked "
+            "(assignee recorded, not woken). VERIFY titles skip auto-block. "
+            "People-waiting is commit_turn, not this list."
         ),
         json_schema_extra={"aliases": ["dependsOn", "depends_on"]},
     )
@@ -174,7 +175,8 @@ class DispatchTaskParams(BaseModel):
     "Deliver work NOW: ledger entry + inbox wake (unless blocked on depends_on). "
     "Always pass submitGate (docs|unit|module_visual|code_audit|…) — required for "
     "new tasks, ignored on taskId reuse. Unmet dependsOn also applies when reusing "
-    "taskId (blocked, not woken). "
+    "taskId (blocked, not woken). dependsOn = other task ids only "
+    "(self-id rejected); waiting on a person is commit_turn. "
     "To re-assign/delegate an EXISTING task, pass taskId — this keeps a single "
     "ledger entry (assignee changes, no duplicate task). "
     "Only create a NEW task (omit taskId) when the work is genuinely new. "

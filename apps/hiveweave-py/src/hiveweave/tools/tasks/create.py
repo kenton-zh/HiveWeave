@@ -64,7 +64,11 @@ class CreateTaskParams(BaseModel):
     depends_on: list[str] | None = Field(
         default=None,
         alias="dependsOn",
-        description="List of task IDs this task depends on (optional).",
+        description=(
+            "Other task ids only (self-id rejected). Unmet → blocked "
+            "(not claimed/woken). VERIFY titles skip auto-block. "
+            "People-waiting is commit_turn, not this list."
+        ),
         json_schema_extra={"aliases": ["dependsOn", "depends_on"]},
     )
     expected_modules: list[str] | None = Field(
@@ -128,7 +132,8 @@ class CreateTaskParams(BaseModel):
     "create_task",
     "Ledger entry. Unassigned → status=created (draft). With assigneeId → claimed "
     "(assign=claim; no separate claim_task) unless depends_on is unmet (blocked). "
-    "Does NOT wake anyone — call dispatch_task to deliver. "
+    "dependsOn = other task ids only (self-id rejected); waiting on a person "
+    "is commit_turn. Does NOT wake anyone — call dispatch_task to deliver. "
     "submitGate is required (docs|unit|module_visual|code_audit|…). "
     "If you are delegating/transferring an EXISTING task to someone else, prefer "
     "dispatch_task(taskId=<existing_id>) instead — it re-assigns in a single ledger "
