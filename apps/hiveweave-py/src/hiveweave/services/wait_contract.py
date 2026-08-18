@@ -435,6 +435,43 @@ class WaitContractService:
         except ProjectDbError:
             return 0
 
+    async def clear_kind_agent_waits_for_sender(
+        self,
+        project_id: str,
+        waiter_agent_id: str,
+        sender_agent_id: str,
+    ) -> int:
+        """Clear active kind=agent waits whose ref resolves to sender.
+
+        Does not clear kind=external / task / timer / bash-job waits.
+        Match uses the same identity resolution as event_matches_waits.
+        """
+        sender = (sender_agent_id or "").strip()
+        if not sender:
+            return 0
+        await _ensure_schema(project_id)
+        waits = await self.list_active(project_id, waiter_agent_id)
+        matched = await matching_kind_agent_waits(
+            project_id,
+            waits,
+            from_agent_id=sender,
+        )
+        ids = [str(w.get("id") or "") for w in matched if w.get("id")]
+        if not ids:
+            return 0
+        now = int(time.time() * 1000)
+        placeholders = ",".join("?" * len(ids))
+        try:
+            return await _execute_rowcount(
+                project_id,
+                f"UPDATE agent_waits SET cleared_at = ? "
+                f"WHERE id IN ({placeholders}) AND agent_id = ? "
+                f"AND cleared_at IS NULL AND kind = 'agent'",
+                [now, *ids, waiter_agent_id],
+            )
+        except ProjectDbError:
+            return 0
+
     async def list_active(self, project_id: str, agent_id: str) -> list[dict]:
         await _ensure_schema(project_id)
         conn = await _conn(project_id)
@@ -728,6 +765,26 @@ class WaitContractService:
         return out
 
 
+def _norm_token(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _exact_identity_tokens(
+    *,
+    from_agent_id: str | None = None,
+    from_agent_name: str | None = None,
+    from_short_id: str | None = None,
+) -> set[str]:
+    tokens: set[str] = set()
+    for raw in (from_agent_id, from_agent_name, from_short_id):
+        t = _norm_token(raw)
+        if not t:
+            continue
+        tokens.add(t)
+        tokens.add(t.replace(" ", ""))
+    return tokens
+
+
 def _ref_matches_sender(
     ref: str,
     *,
@@ -735,42 +792,168 @@ def _ref_matches_sender(
     from_agent_name: str | None = None,
     from_short_id: str | None = None,
 ) -> bool:
-    """Match wait ref (花名 / short_id / uuid) against the sender identity."""
-    r = (ref or "").strip().lower()
+    """Fail-open exact match of wait.ref vs sender id / name / short_id.
+
+    No startswith prefix — prefix coincidence must not wake or clear.
+    """
+    r = _norm_token(ref)
     if not r:
         return False
-    candidates = [
-        (from_agent_id or "").strip().lower(),
-        (from_agent_name or "").strip().lower(),
-        (from_short_id or "").strip().lower(),
-    ]
-    for c in candidates:
-        if not c:
+    tokens = _exact_identity_tokens(
+        from_agent_id=from_agent_id,
+        from_agent_name=from_agent_name,
+        from_short_id=from_short_id,
+    )
+    return r in tokens or r.replace(" ", "") in tokens
+
+
+def _agent_accepts_ref_exact(agent: dict, ref: str) -> bool:
+    """True only when ref is exactly this agent's id, name, or short_id."""
+    return _ref_matches_sender(
+        ref,
+        from_agent_id=agent.get("id"),
+        from_agent_name=agent.get("name"),
+        from_short_id=agent.get("short_id"),
+    )
+
+
+def _wait_not_expired(wait: dict, *, now_ms: int | None = None) -> bool:
+    exp = wait.get("expiresAt") if wait.get("expiresAt") is not None else wait.get("expires_at")
+    if exp is None:
+        return True
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    try:
+        return int(exp) > now
+    except (TypeError, ValueError):
+        return True
+
+
+async def resolve_identity_to_agent_id(
+    project_id: str | None,
+    token: str,
+) -> str | None:
+    """Map 花名 / A100 / uuid → agents.id via OrgService.
+
+    Prefix-only OrgService hits (unique name prefix, uuid prefix) are
+    rejected so match and clear stay exact on identity fields.
+    Fail-open: org errors or misses return None.
+    """
+    raw = (token or "").strip()
+    if not raw or not project_id:
+        return None
+    try:
+        from hiveweave.services.org import OrgService
+
+        agent = await OrgService().resolve_agent_ref(project_id, raw)
+    except Exception:
+        return None
+    if not agent or not _agent_accepts_ref_exact(agent, raw):
+        return None
+    aid = str(agent.get("id") or "").strip()
+    return aid or None
+
+
+async def matching_kind_agent_waits(
+    project_id: str | None,
+    waits: list[dict],
+    *,
+    from_agent_id: str | None = None,
+    from_agent_name: str | None = None,
+    from_short_id: str | None = None,
+) -> list[dict]:
+    """Active kind=agent waits whose ref is the same person as the sender."""
+    if not waits:
+        return []
+    now = int(time.time() * 1000)
+    cache: dict[str, str | None] = {}
+
+    async def _resolved(token: str | None) -> str | None:
+        raw = (token or "").strip()
+        if not raw:
+            return None
+        key = raw.lower()
+        if key not in cache:
+            cache[key] = await resolve_identity_to_agent_id(project_id, raw)
+        return cache[key]
+
+    sender_id = None
+    for tok in (from_agent_id, from_agent_name, from_short_id):
+        sender_id = await _resolved(tok)
+        if sender_id:
+            break
+
+    matched: list[dict] = []
+    for w in waits:
+        if str(w.get("kind") or "").lower() != "agent":
             continue
-        if c == r:
-            return True
-        if len(r) >= 4 and (c.startswith(r) or r.startswith(c)):
-            return True
-        if r == c.replace(" ", ""):
-            return True
-    return False
+        if not _wait_not_expired(w, now_ms=now):
+            continue
+        ref = str(w.get("ref") or "")
+        wait_id = await _resolved(ref)
+        if wait_id and sender_id and wait_id == sender_id:
+            matched.append(w)
+            continue
+        if wait_id and from_agent_id and wait_id == str(from_agent_id).strip():
+            matched.append(w)
+            continue
+        # Fail-open: org miss → exact string equality only (no prefix).
+        if _ref_matches_sender(
+            ref,
+            from_agent_id=from_agent_id,
+            from_agent_name=from_agent_name,
+            from_short_id=from_short_id,
+        ):
+            matched.append(w)
+    return matched
 
 
-def event_matches_waits(
+async def kind_agent_wait_matches_sender(
+    project_id: str | None,
+    waits: list[dict],
+    *,
+    from_agent_id: str | None = None,
+    from_agent_name: str | None = None,
+    from_short_id: str | None = None,
+) -> bool:
+    found = await matching_kind_agent_waits(
+        project_id,
+        waits,
+        from_agent_id=from_agent_id,
+        from_agent_name=from_agent_name,
+        from_short_id=from_short_id,
+    )
+    return bool(found)
+
+
+async def event_matches_waits(
     waits: list[dict],
     *,
     event: str,
     from_agent_id: str | None = None,
     from_agent_name: str | None = None,
     from_short_id: str | None = None,
+    project_id: str | None = None,
 ) -> bool:
     """True if any active wait accepts this wake event."""
     if not waits:
         return True  # no contract → fall back to disposition policy
     now = int(time.time() * 1000)
+    agent_hits: list[dict] | None = None
+
+    async def _agent_hits() -> list[dict]:
+        nonlocal agent_hits
+        if agent_hits is None:
+            agent_hits = await matching_kind_agent_waits(
+                project_id,
+                waits,
+                from_agent_id=from_agent_id,
+                from_agent_name=from_agent_name,
+                from_short_id=from_short_id,
+            )
+        return agent_hits
+
     for w in waits:
-        exp = w.get("expiresAt") or w.get("expires_at")
-        if exp is not None and int(exp) <= now:
+        if not _wait_not_expired(w, now_ms=now):
             continue
         wake_on = w.get("wakeOn") or w.get("wake_on") or []
         if isinstance(wake_on, str):
@@ -786,18 +969,19 @@ def event_matches_waits(
             "ask_reply",
             "command",
         ):
-            if _ref_matches_sender(
-                ref,
-                from_agent_id=from_agent_id,
-                from_agent_name=from_agent_name,
-                from_short_id=from_short_id,
-            ):
+            hits = await _agent_hits()
+            if any(h.get("id") == w.get("id") for h in hits):
                 return True
 
         if event not in wake_on:
             continue
 
         if event == "message_from_ref":
+            if kind == "agent":
+                hits = await _agent_hits()
+                if any(h.get("id") == w.get("id") for h in hits):
+                    return True
+                continue
             if _ref_matches_sender(
                 ref,
                 from_agent_id=from_agent_id,
@@ -808,6 +992,128 @@ def event_matches_waits(
             continue
         return True
     return False
+
+
+_FULL_CLEAR_WAKE_SOURCES = frozenset({
+    "", "user", "chat",
+    "wait_timeout", "wait_cycle", "wait_satisfied",
+})
+
+
+def _is_person_sender(from_agent_id: str | None) -> bool:
+    fid = (from_agent_id or "").strip()
+    if not fid or fid.lower() == "system":
+        return False
+    from hiveweave.services.wake_policy import is_user_sender
+
+    return not is_user_sender(fid)
+
+
+def unique_agent_tokens(*groups: Any) -> list[str]:
+    """Stable unique id/name tokens (order-preserving, case-insensitive)."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                _add(item)
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        key = text.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(text)
+
+    for group in groups:
+        _add(group)
+    return out
+
+
+async def matching_sender_ids_for_waiter(
+    project_id: str,
+    waiter_agent_id: str,
+    candidate_from_ids: list[str] | None,
+) -> list[str]:
+    """Subset of *candidate_from_ids* that match an active kind=agent wait."""
+    pid = (project_id or "").strip()
+    waiter = (waiter_agent_id or "").strip()
+    tokens = unique_agent_tokens(candidate_from_ids)
+    if not pid or not waiter or not tokens:
+        return []
+    waits = await wait_contract_service.list_active(pid, waiter)
+    matched: list[str] = []
+    for fid in tokens:
+        if await kind_agent_wait_matches_sender(
+            pid, waits, from_agent_id=fid
+        ):
+            matched.append(fid)
+    return matched
+
+
+async def apply_wake_admit_wait_clear(
+    project_id: str,
+    waiter_agent_id: str,
+    *,
+    source: str = "",
+    from_agent_id: str | None = None,
+    from_agent_ids: list[str] | None = None,
+    trigger: bool = False,
+    clear_waits: bool | None = None,
+) -> str:
+    """Clear waits on chat admit. Returns ``skip`` / ``scoped`` / ``all``.
+
+    Inbox-from-person (``message_from_ref`` or a peer sender) clears only
+    matching kind=agent waits. Pass **all matching senders** in
+    ``from_agent_ids`` — ``from_agent_id`` is often the first inbox row,
+    not the person the wait names. ``wait_satisfied`` keeps
+    ``clear_waits=False`` (sibling bg-bash waits stay). Other user/timeout
+    sources still full-clear.
+    """
+    if clear_waits is False:
+        return "skip"
+    src = source or ""
+    senders = unique_agent_tokens(from_agent_ids, from_agent_id)
+    person = src == "message_from_ref" or any(
+        _is_person_sender(s) for s in senders
+    )
+    if person:
+        if src == "message_from_ref" and not senders:
+            return "skip"
+        for fid in senders:
+            if not _is_person_sender(fid):
+                continue
+            await wait_contract_service.clear_kind_agent_waits_for_sender(
+                project_id, waiter_agent_id, fid
+            )
+        return "scoped"
+    should = (
+        bool(clear_waits)
+        or not trigger
+        or src in _FULL_CLEAR_WAKE_SOURCES
+    )
+    if should:
+        await wait_contract_service.clear_waits(project_id, waiter_agent_id)
+        return "all"
+    return "skip"
+
+
+async def project_id_for_agent(agent_id: str) -> str | None:
+    """Best-effort agent_id → project_id (AgentRouter). Fail-open None."""
+    aid = (agent_id or "").strip()
+    if not aid:
+        return None
+    try:
+        from hiveweave.db import meta as meta_db
+
+        return await meta_db.get_agent_project_id(aid)
+    except Exception:
+        return None
 
 
 def category_to_wake_event(

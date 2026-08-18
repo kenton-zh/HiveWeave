@@ -689,35 +689,27 @@ class Agent:
                     clear_task_advance_deferred(self.id)
                 except Exception:
                     pass
-                # Clear wait contracts only on user wakes or wait-satisfaction
-                # wakes — NOT on stall/ledger/watchdog triggers (TEST11 audit C2).
-                # Stall nudges must not wipe a legal waiting_on agent contract.
-                _CLEAR_WAIT_SOURCES = frozenset({
-                    "", "user", "chat",
-                    "wait_timeout", "wait_cycle", "wait_satisfied",
-                    "message_from_ref",
-                })
-                # Explicit False: sibling off-turn jobs keep their waits.
-                # wait_satisfied otherwise still clears (last job).
-                if opts.get("clear_waits") is False:
-                    should_clear_waits = False
-                else:
-                    should_clear_waits = (
-                        bool(opts.get("clear_waits"))
-                        or not opts.get("trigger")
-                        or source in _CLEAR_WAIT_SOURCES
+                # Clear wait contracts on user / timeout wakes. Inbox-from-
+                # person (message_from_ref or peer from_agent_id) only clears
+                # matching kind=agent waits — never wipe sibling bg-bash.
+                # Explicit False: wait_satisfied / sibling off-turn jobs.
+                try:
+                    from hiveweave.services.wait_contract import (
+                        apply_wake_admit_wait_clear,
                     )
-                if should_clear_waits:
-                    try:
-                        from hiveweave.services.wait_contract import (
-                            wait_contract_service,
-                        )
 
-                        await wait_contract_service.clear_waits(
-                            self.project_id, self.id
-                        )
-                    except Exception as e:
-                        log.debug("clear_waits_on_wake_failed", error=str(e))
+                    await apply_wake_admit_wait_clear(
+                        self.project_id,
+                        self.id,
+                        source=source,
+                        from_agent_id=opts.get("from_agent_id"),
+                        from_agent_ids=opts.get("wait_clear_sender_ids")
+                        or opts.get("from_agent_ids"),
+                        trigger=bool(opts.get("trigger")),
+                        clear_waits=opts.get("clear_waits"),
+                    )
+                except Exception as e:
+                    log.debug("clear_waits_on_wake_failed", error=str(e))
                 if source in ("user", "chat", "") or not opts.get("trigger"):
                     # User-facing chat clears waiting_human into runnable while processing
                     if self.disposition == "waiting_human" and not opts.get("trigger"):

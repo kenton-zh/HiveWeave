@@ -441,28 +441,29 @@ async def test_bash_default_stays_foreground(
     assert "hi" in result.output
 
 
-def test_wake_source_for_subagent_and_bash_done() -> None:
+@pytest.mark.asyncio
+async def test_wake_source_for_subagent_and_bash_done() -> None:
     typed = OFFTURN_COMPLETION_MESSAGE_TYPE
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[SUBAGENT DONE] job=bg-sub-x", "message_type": typed}]
         )
         == "wait_satisfied"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[SUBAGENT FAILED] boom", "message_type": typed}]
         )
         == "wait_satisfied"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[BASH DONE] job=bg-bash-x", "message_type": typed}]
         )
         == "wait_satisfied"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[BASH FAILED] exit=1", "message_type": typed}]
         )
         == "wait_satisfied"
@@ -471,13 +472,13 @@ def test_wake_source_for_subagent_and_bash_done() -> None:
     assert not is_offturn_completion_text("[RANDOM DONE] session=x")
     # Prefix + from=system without the reserved type is not wait_satisfied.
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[BASH DONE] job=bg-bash-x", "message_type": "system"}]
         )
         == "trigger"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{
                 "message": "[BASH DONE] job=bg-bash-x",
                 "message_type": "system",
@@ -487,7 +488,7 @@ def test_wake_source_for_subagent_and_bash_done() -> None:
         == "trigger"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{
                 "message": "random body",
                 "message_type": typed,

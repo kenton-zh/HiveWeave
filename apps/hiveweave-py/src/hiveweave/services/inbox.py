@@ -544,8 +544,39 @@ class InboxService:
         # auto-close so the carve-out sees the resolved reply_to (auto-filled),
         # not only the caller's explicit value. urgent priority notifies also
         # wake — "production incident, FYI" must not wait for a natural wake.
+        # kind=agent wait: a matching notify (no replyTo) still wakes — the
+        # waiter parked on this person. Do not clear the wait here (admit).
         if wake is None and (message_type or "").lower() == "notify":
             wake_flag = reply_to is not None or (priority or "").lower() == "urgent"
+            if not wake_flag:
+                try:
+                    from hiveweave.services.wait_contract import (
+                        kind_agent_wait_matches_sender,
+                        project_id_for_agent,
+                        wait_contract_service,
+                    )
+
+                    pid = await project_id_for_agent(to_agent_id)
+                    if pid:
+                        waits = await wait_contract_service.list_active(
+                            pid, to_agent_id
+                        )
+                        if await kind_agent_wait_matches_sender(
+                            pid, waits, from_agent_id=from_agent_id
+                        ):
+                            wake_flag = True
+                            log.info(
+                                "inbox_notify_wakes_agent_wait",
+                                from_agent_id=from_agent_id,
+                                to_agent_id=to_agent_id,
+                            )
+                except Exception as e:
+                    log.debug(
+                        "inbox_wait_wake_check_failed",
+                        from_agent_id=from_agent_id,
+                        to_agent_id=to_agent_id,
+                        error=str(e),
+                    )
 
         # 在降级之后计算 DB 写入值，确保降级生效
         expect = 1 if expect_report else 0
@@ -872,10 +903,26 @@ class InboxService:
         try:
             pending = await project_db.query(
                 agent_id,
-                "SELECT id, message, message_type, expect_report FROM inbox "
+                "SELECT id, message, message_type, expect_report, "
+                "from_agent_id FROM inbox "
                 "WHERE to_agent_id = ? AND read = 0 AND COALESCE(wake, 1) = 1",
                 [agent_id],
             )
+            wait_pid = None
+            active_waits: list[dict] = []
+            try:
+                from hiveweave.services.wait_contract import (
+                    project_id_for_agent,
+                    wait_contract_service,
+                )
+
+                wait_pid = await project_id_for_agent(agent_id)
+                if wait_pid:
+                    active_waits = await wait_contract_service.list_active(
+                        wait_pid, agent_id
+                    )
+            except Exception as e:
+                log.debug("inbox_park_wait_lookup_failed", error=str(e))
             park_ids: list[str] = []
             for r in pending or []:
                 msg = {
@@ -889,9 +936,26 @@ class InboxService:
                         if "expect_report" in r.keys()
                         else False
                     ),
+                    "from_agent_id": _row_val(r, "from_agent_id") or "",
                 }
                 if should_exempt_from_park(msg):
                     continue
+                from_id = str(msg.get("from_agent_id") or "").strip()
+                if from_id and active_waits and wait_pid:
+                    try:
+                        from hiveweave.services.wait_contract import (
+                            kind_agent_wait_matches_sender,
+                        )
+
+                        if await kind_agent_wait_matches_sender(
+                            wait_pid, active_waits, from_agent_id=from_id
+                        ):
+                            continue
+                    except Exception as e:
+                        log.debug(
+                            "inbox_park_wait_match_failed",
+                            error=str(e),
+                        )
                 if msg.get("id"):
                     park_ids.append(msg["id"])
             if not park_ids:
