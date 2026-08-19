@@ -58,6 +58,19 @@ class FakeClient:
         return self.responses.pop(0)
 
 
+def _compactor_model(model_id: str = "m", **extra) -> dict:
+    row = {
+        "base_url": "https://gw.example/v1",
+        "api_key": "k",
+        "model_id": model_id,
+        "provider_type": "openai-compatible",
+        "context_window": 128_000,
+        "max_output_tokens": 8_192,
+    }
+    row.update(extra)
+    return row
+
+
 def _length_response() -> FakeResponse:
     """reasoning 模型吃光预算：finish_reason=length + content 空。"""
     return FakeResponse(
@@ -97,7 +110,7 @@ async def test_uses_model_max_output_tokens_and_retries_once():
     client = FakeClient([_length_response(), _ok_response("final summary")])
     with patch("httpx.AsyncClient", return_value=client):
         result = await _call_compactor_llm(
-            "https://gw.example/v1", "k", "reasoning-model", "prompt",
+            _compactor_model("reasoning-model"), "prompt",
             max_tokens=16_000,
         )
     assert result == "final summary"
@@ -109,13 +122,29 @@ async def test_uses_model_max_output_tokens_and_retries_once():
 
 
 @pytest.mark.asyncio
+async def test_responses_protocol_posts_to_responses_not_chat():
+    client = FakeClient([_ok_response("ok summary")])
+    with patch("httpx.AsyncClient", return_value=client):
+        result = await _call_compactor_llm(
+            _compactor_model(
+                "muse-spark-1.2",
+                provider_type="openai-responses",
+                base_url="https://opencode.ai/zen/go/v1",
+            ),
+            "prompt",
+        )
+    assert result == "ok summary"
+    assert client.posts[0]["url"] == "https://opencode.ai/zen/go/v1/responses"
+    assert "messages" not in client.posts[0]["json"]
+    assert "input" in client.posts[0]["json"]
+
+
+@pytest.mark.asyncio
 async def test_no_max_tokens_falls_back_to_default_budget():
     """未传 max_tokens（模型行无该列）→ 回退 SUMMARY_MAX_TOKENS_ESCALATED。"""
     client = FakeClient([_ok_response("ok summary")])
     with patch("httpx.AsyncClient", return_value=client):
-        result = await _call_compactor_llm(
-            "https://gw.example/v1", "k", "m", "prompt"
-        )
+        result = await _call_compactor_llm(_compactor_model(), "prompt")
     assert result == "ok summary"
     assert len(client.posts) == 1
     assert client.posts[0]["json"]["max_tokens"] == SUMMARY_MAX_TOKENS_ESCALATED
@@ -127,7 +156,7 @@ async def test_no_retry_when_content_present():
     client = FakeClient([_ok_response("ok summary")])
     with patch("httpx.AsyncClient", return_value=client):
         result = await _call_compactor_llm(
-            "https://gw.example/v1", "k", "m", "prompt", max_tokens=16_000
+            _compactor_model(), "prompt", max_tokens=16_000
         )
     assert result == "ok summary"
     assert len(client.posts) == 1
@@ -139,9 +168,7 @@ async def test_no_retry_on_http_error():
     """HTTP 非 200 → 不重试，返回 None。"""
     client = FakeClient([FakeResponse(429)])
     with patch("httpx.AsyncClient", return_value=client):
-        result = await _call_compactor_llm(
-            "https://gw.example/v1", "k", "m", "prompt"
-        )
+        result = await _call_compactor_llm(_compactor_model(), "prompt")
     assert result is None
     assert len(client.posts) == 1
 
@@ -165,9 +192,7 @@ async def test_content_present_with_length_finish_no_escalate():
         ]
     )
     with patch("httpx.AsyncClient", return_value=client):
-        result = await _call_compactor_llm(
-            "https://gw.example/v1", "k", "m", "prompt"
-        )
+        result = await _call_compactor_llm(_compactor_model(), "prompt")
     assert result == "partial"
     assert len(client.posts) == 1
 
@@ -184,9 +209,7 @@ async def test_bad_json_no_escalate():
 
     client = FakeClient([BadResp()])
     with patch("httpx.AsyncClient", return_value=client):
-        result = await _call_compactor_llm(
-            "https://gw.example/v1", "k", "m", "prompt"
-        )
+        result = await _call_compactor_llm(_compactor_model(), "prompt")
     assert result is None
     assert len(client.posts) == 1
 
@@ -196,9 +219,7 @@ async def test_double_failure_returns_none():
     """两次都 length+空 → None（两次调用都发出）。"""
     client = FakeClient([_length_response(), _length_response()])
     with patch("httpx.AsyncClient", return_value=client):
-        result = await _call_compactor_llm(
-            "https://gw.example/v1", "k", "m", "prompt"
-        )
+        result = await _call_compactor_llm(_compactor_model(), "prompt")
     assert result is None
     assert len(client.posts) == 2
 
