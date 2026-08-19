@@ -644,7 +644,7 @@ def test_identity_unbounded_has_no_kill_deadline():
         parent, description="refactor", timeout_s=None,
         subagent_type="write", workspace="/ws/exec-1")
     assert "will kill you" not in identity
-    assert "No session wall clock" in identity
+    assert "turn budget" in identity
 
 
 def test_identity_includes_workspace_for_all_types():

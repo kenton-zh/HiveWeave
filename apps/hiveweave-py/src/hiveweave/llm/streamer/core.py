@@ -15,7 +15,6 @@ from .constants import (
     DEFAULT_PLACEHOLDER,
     HARD_TOTAL_TIMEOUT_S,
     MAX_TOOL_ROUNDS,
-    session_wall_clock_enabled,
 )
 from .context import ContextMixin
 from .errors import CircuitBreakerOpenError
@@ -167,8 +166,8 @@ class Streamer(
         await self._fire_delta(on_delta, {"type": "start"})
 
         try:
-            # Session wall clock is opt-in. Default: no outer wait_for —
-            # stream idle + declared tool timeouts stop hung work.
+            # Turn budget（写死启用，见 constants.py 顶部说明）：外层
+            # wait_for 是最终兜底 — 循环内闸口应先优雅收口。
             loop_coro = self._run_tool_loop(
                 agent_id=agent_id,
                 provider=provider,
@@ -179,13 +178,10 @@ class Streamer(
                 on_tool_call=on_tool_call,
                 max_tool_rounds=effective_max_rounds,
             )
-            if session_wall_clock_enabled():
-                result = await asyncio.wait_for(
-                    loop_coro,
-                    timeout=HARD_TOTAL_TIMEOUT_S + 30.0,
-                )
-            else:
-                result = await loop_coro
+            result = await asyncio.wait_for(
+                loop_coro,
+                timeout=HARD_TOTAL_TIMEOUT_S + 30.0,
+            )
             # 熔断器成功/失败上报已移至 _stream_single_round 按轮次精确上报（C10）
             result["duration_ms"] = int((time.monotonic() - start_time) * 1000)
             return result

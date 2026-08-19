@@ -1,4 +1,4 @@
-"""Declared-tool timeouts only; no session wrap; background bash unbounded."""
+"""Declared-tool timeouts; turn budget always on; background bash unbounded."""
 from __future__ import annotations
 
 import asyncio
@@ -7,9 +7,10 @@ import pytest
 
 from hiveweave.llm.streamer.constants import (
     FIRST_CHUNK_TIMEOUT_S,
+    HARD_TOTAL_TIMEOUT_S,
     IDLE_TIMEOUT_S,
     STREAM_SOCKET_READ_TIMEOUT_S,
-    session_wall_clock_enabled,
+    TOTAL_TIMEOUT_S,
     stream_chunk_wait_s,
 )
 from hiveweave.llm.streamer.tool_exec import ToolExecMixin
@@ -29,8 +30,9 @@ from hiveweave.tools.timeout_policy import (
 )
 
 
-def test_session_wall_clock_off_by_default():
-    assert session_wall_clock_enabled() is False
+def test_turn_budget_constants_structurally_sane():
+    """Turn 预算写死启用（DSH_11 复盘）：软 < 硬 < agent SAFETY(600s)。"""
+    assert TOTAL_TIMEOUT_S < HARD_TOTAL_TIMEOUT_S < 600.0
 
 
 def test_idle_watchdog_default_is_five_minutes():
@@ -82,8 +84,7 @@ async def test_undeclared_tool_not_wait_for_wrapped():
 
 
 @pytest.mark.asyncio
-async def test_declared_tool_times_out(monkeypatch):
-    monkeypatch.setenv("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "0")
+async def test_declared_tool_times_out():
     te = ToolExecMixin()
 
     async def slow(name, arguments, tool_call_id):

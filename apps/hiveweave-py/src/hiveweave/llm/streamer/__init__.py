@@ -40,7 +40,6 @@ from .constants import (
     TOOL_LOOP_READONLY_STALL_LIMIT,
     TOOL_LOOP_STALL_LIMIT,
     TOTAL_TIMEOUT_S,
-    session_wall_clock_enabled,
     stream_chunk_wait_s,
     _LLM_MAX_CONCURRENT,
     _LLM_SEMAPHORE,

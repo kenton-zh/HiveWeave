@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 import httpx
 import structlog
 
-from hiveweave.llm.provider import ProviderConfig
+from hiveweave.llm.provider import (
+    ProviderConfig,
+    _IMAGES_OMITTED_NOTE,
+    _looks_like_image_unsupported_error,
+    mark_image_unsupported,
+)
 from hiveweave.llm.retry import (
     PermanentError,
     RetryableError,
@@ -33,6 +38,27 @@ from .sse import merge_tool_calls, parse_sse
 from .types import DeltaCallback
 
 log = structlog.get_logger(__name__)
+
+
+def _strip_images_for_retry(messages: list[dict]) -> list[dict]:
+    """降级重试用：去掉所有消息里的图片像素，正文追加缺图说明。
+
+    只改请求副本，不落持久化历史。预留 _IMAGES_OMITTED_NOTE 给模型指引
+    （文件路径去哪找、视觉判断走 look_at_image），替换 provider 内部
+    supports_images=False 时的同款文案。
+    """
+    out: list[dict] = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("images"):
+            cleaned = {k: v for k, v in m.items() if k != "images"}
+            content = cleaned.get("content") or ""
+            note = _IMAGES_OMITTED_NOTE.format(n=1)
+            base = str(content).rstrip()
+            cleaned["content"] = f"{base}\n{note}" if base else note
+            out.append(cleaned)
+        else:
+            out.append(m)
+    return out
 
 
 def classify_stream_socket_timeout(
@@ -175,6 +201,11 @@ class HttpStreamMixin:
                 *req_messages,
                 {"role": "user", "content": CONTINUE_SENTINEL},
             ]
+        # 图像能力自判定（让模型自己决定）：请求是否真的带了图 + 是否已剥图重试过。
+        had_images = any(
+            isinstance(m, dict) and bool(m.get("images")) for m in req_messages
+        )
+        stripped_retry = False
         body = provider.build_body(
             messages=req_messages,
             stream=True,
@@ -243,6 +274,57 @@ class HttpStreamMixin:
             # （客户端配置问题，非 provider 故障，不应触发熔断）
             # error_status 必须保留: agent 层靠它区分 402 余额耗尽
             # （触发全局停唤醒）与普通客户端错误（TEST19 教训）。
+            # 图像能力自判定：请求带了图、400 且错误文本确为「图像不支持」→
+            # 这是首轮探测，标记负缓存 + 剥图重试一次（让模型自己「判定」，
+            # 不再依赖人工勾选 supports_images）。仅此一次，不再递归。
+            if (
+                not stripped_retry
+                and had_images
+                and e.status == 400
+                and _looks_like_image_unsupported_error(str(e))
+            ):
+                log.info(
+                    "image_unsupported_mark_degrade",
+                    agent_id=agent_id,
+                    round=round_num,
+                    model=provider.model_name,
+                    url=provider.base_url,
+                )
+                mark_image_unsupported(provider.base_url, provider.model_name)
+                stripped_retry = True
+                req_messages = _strip_images_for_retry(req_messages)
+                body = provider.build_body(
+                    messages=req_messages,
+                    stream=True,
+                    tools=tools,
+                )
+                try:
+                    return await do_request()
+                except RetryableError as se:
+                    # 剥图重试本身遇到瞬态错误 → 归一化返回（保 error_status/headers），
+                    # 不泄漏裸异常（主路径同款契约，TEST19 教训：402 需区分）。
+                    await self._circuit_breaker.report_failure(provider_name)
+                    return {
+                        "status": "error",
+                        "text": "",
+                        "thinking": "",
+                        "tool_calls": [],
+                        "finish_reason": None,
+                        "error": str(se),
+                        "error_status": se.status,
+                        "error_headers": dict(se.headers or {}),
+                    }
+                except PermanentError as se:
+                    # 剥图后仍失败（非图像类 400/401 等）→ 归一化返回，不再剥图递归。
+                    return {
+                        "status": "error",
+                        "text": "",
+                        "thinking": "",
+                        "tool_calls": [],
+                        "finish_reason": None,
+                        "error": str(se),
+                        "error_status": se.status,
+                    }
             return {
                 "status": "error",
                 "text": "",
@@ -383,7 +465,7 @@ class HttpStreamMixin:
             while True:
                 # Idle watchdog: wait only for the next SSE event. First
                 # token uses FIRST_CHUNK; afterwards IDLE (default 5 min).
-                # Opt-in session wall clock can still cut earlier.
+                # Turn wall clock (always on) can still cut earlier.
                 wait_s = stream_chunk_wait_s(got_event=got_event)
                 if budget_deadline is not None:
                     wait_s = min(

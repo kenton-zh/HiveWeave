@@ -150,17 +150,10 @@ class ToolLoopMixin:
         # 仍收口兜底。
         blocked_stall_count = 0
 
-        # TEST21 M4: soft/hard turn budget is opt-in (session wall clock).
-        # Default off — no session budget; long coding may run long.
+        # Turn budget（写死启用，见 constants.py 顶部说明）: session wall clock。
         loop_start = time.monotonic()
-        from .constants import session_wall_clock_enabled
-
-        if session_wall_clock_enabled():
-            hard_deadline = loop_start + HARD_TOTAL_TIMEOUT_S
-            soft_deadline = loop_start + TOTAL_TIMEOUT_S
-        else:
-            hard_deadline = float("inf")
-            soft_deadline = float("inf")
+        hard_deadline = loop_start + HARD_TOTAL_TIMEOUT_S
+        soft_deadline = loop_start + TOTAL_TIMEOUT_S
         budget_hint_injected = False
         # pacing 提示一次性；记录注入轮次供 soft 提示做【同轮】去重 ——
         # 永久性压制会让 soft（临近硬截止的最后通牒）在默认常量下成死代码：

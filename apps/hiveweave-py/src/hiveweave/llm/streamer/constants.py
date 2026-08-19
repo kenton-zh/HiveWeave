@@ -5,17 +5,16 @@ import asyncio
 import os as _os
 
 
-def session_wall_clock_enabled() -> bool:
-    """Opt-in session TOTAL/HARD wrap. Default off (no turn budget).
-
-    Product: long work may run a long time. Stop on stream-idle, per-tool
-    declared timeout, job_kill / cancel — not 540/570/600. Tests that still
-    exercise the old gates set ``HIVEWEAVE_STREAM_SESSION_WALL_CLOCK=1``.
-    """
-    raw = (
-        _os.environ.get("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "0") or "0"
-    ).strip().lower()
-    return raw in ("1", "true", "yes", "on")
+# ── Turn 预算（写死启用，2026-08-19 TEST_DSH_11 复盘）──────────────
+# 历史开关 HIVEWEAVE_STREAM_SESSION_WALL_CLOCK 已移除。TEST21 M4 曾默认
+# 关闭（「长工作可以跑很久」），DSH_11 实锤其外部伤害：coordinator 单
+# turn 无界磨 44+ 轮 × 120k tokens，busy 期间 inbox 全部排队，CEO 派工
+# 令被屏蔽 40+ 分钟、executor 全程闲置 —— 长 turn 阻断管理通道，组织
+# 纠偏失灵。预算是疏导型设计（半程 pacing 提示 → 软截止留 commit_turn
+# 窗 → 硬截止优雅收口保留全部产出），agent 层对 budget_exhausted 自动
+# retrigger 续跑（completion.py），长工作仍持续，只是每 ~9.5 分钟强制
+# 经过一次 turn 边界：inbox 被处理、上下文 checkpoint、token 有帽。
+# 下方 TOTAL/HARD/ACTIVITY/PACING 数值仍可 env 微调。
 
 MAX_TOOL_ROUNDS = 1_000_000
 """最大 tool loop 轮次 — 仅作极端安全网，实际由 doom loop 按工具分级保护。峰值复现真实死循环(同参数反复调用) 。"""

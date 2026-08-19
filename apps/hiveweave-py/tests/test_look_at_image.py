@@ -313,6 +313,7 @@ async def test_analyze_image_disables_thinking() -> None:
     fake_provider.build_url.return_value = "https://example.com/v1/chat/completions"
 
     mock_resp = MagicMock()
+    mock_resp.status_code = 200
     mock_resp.raise_for_status = MagicMock()
     mock_resp.json.return_value = {
         "choices": [{"message": {"content": "ok pixels"}}]
@@ -348,3 +349,53 @@ async def test_analyze_image_disables_thinking() -> None:
     body_kw = fake_provider.build_body.call_args.kwargs
     assert body_kw["stream"] is False
     assert body_kw["messages"][0]["images"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_image_retries_on_429() -> None:
+    """视觉一次性调用遇到 429 必须指数退避重试（与流式路径同口径），
+    不能直接抛掉把视觉门禁废掉 → 团队只能 waive visual/module_visual。"""
+    from hiveweave.services.vision import analyze_image
+
+    fake_provider = MagicMock()
+    fake_provider.build_body.return_value = {"model": "x", "stream": False}
+    fake_provider.build_headers.return_value = {}
+    fake_provider.build_url.return_value = "https://example.com/v1/chat/completions"
+
+    def make_resp(status: int, payload: dict):
+        r = MagicMock()
+        r.status_code = status
+        r.headers = {"retry-after-ms": "0"} if status == 429 else {}
+        r.raise_for_status = MagicMock()
+        r.json.return_value = payload
+        r.text = "rate limit" if status == 429 else ""
+        return r
+
+    resp_429 = make_resp(429, {})
+    resp_ok = make_resp(
+        200, {"choices": [{"message": {"content": "ok after retry"}}]}
+    )
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(side_effect=[resp_429, resp_ok])
+
+    with (
+        patch("hiveweave.llm.provider.provider_factory") as mock_factory,
+        patch("httpx.AsyncClient", return_value=mock_client),
+    ):
+        mock_factory.create.return_value = fake_provider
+        text = await analyze_image(
+            image={"media_type": "image/png", "data": "QQ=="},
+            prompt="see?",
+            model_config={
+                "id": "m1",
+                "model_id": "vision",
+                "base_url": "https://example.com/v1",
+                "api_key": "sk",
+            },
+        )
+
+    assert text == "ok after retry"
+    assert mock_client.post.await_count == 2
