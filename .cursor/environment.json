@@ -1,0 +1,20 @@
+{
+  "name": "HiveWeave",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "backend",
+      "description": "FastAPI backend (uvicorn) on http://localhost:4000",
+      "command": "export PATH=\"$HOME/.local/bin:$PATH\"; export NVM_DIR=\"${NVM_DIR:-$HOME/.nvm}\"; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\" >/dev/null 2>&1; cd apps/hiveweave-py && uv run uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000"
+    },
+    {
+      "name": "frontend",
+      "description": "React/Vite dev server on http://localhost:5173 (proxies /api to backend)",
+      "command": "export PATH=\"$HOME/.local/bin:$PATH\"; export NVM_DIR=\"${NVM_DIR:-$HOME/.nvm}\"; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\" >/dev/null 2>&1; echo 'waiting for backend on :4000...'; for i in $(seq 1 60); do curl -sf http://localhost:4000/api/projects >/dev/null 2>&1 && break; sleep 1; done; pnpm dev"
+    }
+  ],
+  "ports": [
+    { "name": "backend", "port": 4000 },
+    { "name": "frontend", "port": 5173 }
+  ]
+}
