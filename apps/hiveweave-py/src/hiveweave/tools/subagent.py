@@ -31,7 +31,7 @@ from hiveweave.tools.result import ToolResult
 
 log = structlog.get_logger(__name__)
 
-SUBAGENT_TIMEOUT_S = 240  # opt-in only; default spawn has no wall clock
+SUBAGENT_TIMEOUT_S = 240  # per-subagent explicit deadline; turn budget always on
 SUBAGENT_MAX_TIMEOUT_S = 480
 SUBAGENT_MAX_TOOL_ROUNDS = 100  # 与 run_ledger 默认 budget_tool_calls 一致
 
@@ -130,10 +130,12 @@ class SpawnSubagentParams(BaseModel):
         default=None,
         description=(
             "Optional hard deadline in seconds (max "
-            f"{SUBAGENT_MAX_TIMEOUT_S}). Omit or 0: no session wall clock "
-            "(stop on commit_turn, job_kill, or stream idle). "
-            "Work expected to outlive a deadline should be dispatched via "
-            "dispatch_task instead."
+            f"{SUBAGENT_MAX_TIMEOUT_S}). Omit or 0: no *separate* subagent "
+            "clock — but the turn still hits the platform turn budget "
+            "(~9-10 min hard cap with graceful checkpoint). Finish with "
+            "commit_turn; the parent can job_kill you. Work expected to "
+            "outlive a deadline should be dispatched via dispatch_task "
+            "instead."
         ),
         json_schema_extra={"aliases": ["timeout", "timeoutSeconds"]},
     )
@@ -370,9 +372,10 @@ def _subagent_identity(
             "Budget your tool calls: watch the 'remaining calls' warning."
             if timeout_s
             else
-            "No session wall clock. Finish with commit_turn; the parent can "
-            "job_kill you. Budget your tool calls: watch the 'remaining calls' "
-            "warning."
+            "No separate subagent clock, but the platform turn budget "
+            "(~9-10 min hard cap) still applies and checkpoints your work. "
+            "Finish with commit_turn; the parent can job_kill you. Budget "
+            "your tool calls: watch the 'remaining calls' warning."
         ),
         "If the slice is too large, stop, commit_turn with phase=blocked "
         "and waiting_on the parent, and tell the parent to dispatch_task "

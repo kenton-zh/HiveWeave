@@ -118,6 +118,13 @@ def _unwrap_user_envelope(message: str) -> str:
     return message
 
 
+def _task_merge_already_recorded(task: dict | None) -> bool:
+    """approved 任务 merge 已实际落库（覆盖当前修订）→ 不再升级 merge proxy。"""
+    from hiveweave.services.tasks.verify import evidence_merge_recorded
+
+    return evidence_merge_recorded(task)
+
+
 async def broadcast_agent_health(
     agent_id: str, health: str, message: str = ""
 ) -> None:
@@ -2126,16 +2133,19 @@ class Agent:
     # ── 内部: 安全超时 ────────────────────────────────────────
 
     def _start_safety_timer(self) -> None:
-        """No session wall clock.
+        """No agent-level session wall clock.
 
-        Hung LLM is the stream idle watchdog; hung tools are declared
-        timeouts or bash's own kill; stuck agents are stall/silence.
-        Do not cancel a live turn at 10 minutes.
+        The streamer-level turn budget (always on, ~570s hard cap with
+        graceful checkpoint) enforces the wall clock. Hung LLM is the
+        stream idle watchdog; hung tools are declared timeouts or bash's
+        own kill; stuck agents are stall/silence. The agent layer does
+        not double-kill at 10 minutes.
         """
         self._cancel_safety_timer()
 
     def _extend_safety_timer(self, extra_s: float) -> None:
-        """No-op: session wall clock is off; spawn is already off-turn."""
+        """No-op: wall clock lives in the streamer turn budget; spawn is
+        already off-turn."""
         return
 
     def _cancel_safety_timer(self) -> None:
@@ -2220,7 +2230,9 @@ class Agent:
         merge = [
             t
             for t in (obl or [])
-            if t.get("role_hint") == "creator" and t.get("status") == "approved"
+            if t.get("role_hint") == "creator"
+            and t.get("status") == "approved"
+            and not _task_merge_already_recorded(t)
         ]
         if not merge:
             return

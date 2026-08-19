@@ -4,11 +4,18 @@
 per-project 连接缓存）。aiosqlite 的连接 worker 线程是**非守护线程**，
 不关闭时线程会一直阻塞在队列读取上，导致 pytest 全量单进程跑完汇总后
 无法退出（exit hang）。生产进程里这些连接本就该常驻，无需改动 db 层。
+
+会话收尾钩子额外做两件事（治「跑完不退出」的诊断盲区）：
+- 取消当前 loop 上遗留的 pending task（game_time tick / inbox watcher /
+  offturn job 等测试忘记 stop 的后台协程）；
+- 打印残留非守护线程清单 —— 若进程退出仍挂起，最后一段输出直接点名
+  元凶线程（aiosqlite worker 名字含连接路径）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,6 +37,47 @@ async def _close_db_connections_after_test():
         await close_meta_db()
     except Exception:
         pass
+    # 兜底：取消本测试 loop 上仍 pending 的后台任务（测试内 start 了
+    # game_time / watcher / offturn 却没 stop 的漏网）。loop 即将关闭，
+    # task 引用的连接已由上面 close_all 关掉，cancel 语义是纯清理。
+    try:
+        loop = asyncio.get_running_loop()
+        pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            # 5s 兜底：个别任务可能吞 cancel，不能让清扫自己变挂起点
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=5.0
+            )
+    except (RuntimeError, TimeoutError, asyncio.TimeoutError):
+        pass
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """汇总后、解释器退出前的诊断：点名残留非守护线程。
+
+    不阻止挂起（线程已启动不可转 daemon），但把「跑完不退出」从黑盒
+    变成有现场线索 —— 挂起时最后一段输出即元凶线程清单。
+    """
+    import sys
+
+    main = threading.main_thread()
+    leftovers = [
+        t for t in threading.enumerate()
+        if t is not main and t is not threading.current_thread() and not t.daemon
+    ]
+    if not leftovers:
+        return
+    print(
+        f"\n[teardown] {len(leftovers)} non-daemon thread(s) still alive "
+        "(process will hang if they never exit):",
+        file=sys.stderr,
+    )
+    for t in leftovers:
+        target = getattr(t, "_target", None)
+        name = getattr(target, "__qualname__", "") if target else ""
+        print(f"  - {t.name!r} ({t.native_id}) {name}", file=sys.stderr)
 
 
 class _FakeStdin:

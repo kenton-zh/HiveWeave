@@ -206,9 +206,31 @@ _MISSING_COLUMNS = [
 ]
 
 
+async def _schema_marker_key(agent_id: str) -> str:
+    """解析 schema 标记键：agent 当前路由到的 workspace（schema 属于
+    具体 DB 文件，不属于 agent id）。
+
+    路由失败（agent 未注册 / workspace 被驱逐）回退 agent 级键 —— 后续
+    ALTER 的 execute 同样会失败，行为与旧实现一致。
+    """
+    try:
+        await project_db.get_project_db_for_agent(agent_id)
+    except Exception:
+        return f"agent:{agent_id}"
+    return project_db._agent_cache.get(agent_id) or f"agent:{agent_id}"
+
+
 async def _ensure_schema(agent_id: str) -> None:
-    """Add missing columns to inbox table (idempotent)."""
-    if agent_id in _migrated:
+    """Add missing columns to inbox table (idempotent).
+
+    标记按 workspace 键控（非 agent id）：同一 agent id 映射到不同 DB
+    （测试跨文件复用 "exec-1" 等固定 id 切换临时 workspace）时，按
+    agent 记忆会让新库跳过补列 → wake 等列缺失 → inbox 写入/读取全部
+    静默失败（全量回归 test_archive_direct_push 0 通知事故根因，
+    2026-08-19）。
+    """
+    key = await _schema_marker_key(agent_id)
+    if key in _migrated:
         return
     for col_name, col_def in _MISSING_COLUMNS:
         try:
@@ -228,7 +250,7 @@ async def _ensure_schema(agent_id: str) -> None:
         )
     except Exception:
         pass
-    _migrated.add(agent_id)
+    _migrated.add(key)
 
 
 class InboxService:

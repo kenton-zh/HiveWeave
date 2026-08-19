@@ -50,7 +50,8 @@ start-frontend.bat        # React/Vite, 端口 5173
 uv run mypy src/hiveweave/ --ignore-missing-imports
 
 # 回归测试（提交前必须跑）
-cd apps/hiveweave-py && uv run pytest tests/ -v
+cd apps/hiveweave-py && uv run pytest tests/ -q -n auto   # 全量并行（~1min，pytest-xdist）
+uv run pytest tests/test_xxx.py -q                        # 单文件调试（串行即可）
 ```
 
 ### Node version
@@ -127,7 +128,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 - 思考模式 (thinking/reasoning): 由 `llm_models` 表的 `supports_thinking` 和 `default_reasoning_effort` 控制,所有 LLM 调用统一生效（不区分用户对话 vs agent 间对话）
 - `CONTINUE_SENTINEL`：请求末尾非 user 时追加到 **HTTP 副本**的静态 user 文案（修 gateway tool_call id 400；并写明「回合未收口故再次唤醒 / 非人类新指令」）。不写回持久化历史
 - **Doom-loop 防护**：同一工具连续重复调用触发熔断。只读轮询工具豁免 —— `DOOM_LOOP_READONLY_TOOLS`（17 个：get_tasks/read_file/list_subordinates 等）走 `DOOM_LOOP_READONLY_FUSE=15` 保险丝而非默认 3 次；唯一入口 `doom_loop_limit(tool_name)`，容忍度表 `DOOM_LOOP_TOOL_LIMITS`
-- 全局 LLM 并发上限 `_LLM_MAX_CONCURRENT`（env `HIVEWEAVE_LLM_MAX_CONCURRENT`，默认 8）；`TOTAL_TIMEOUT_S=540`（env `HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S`；给 agent safety_timeout 600s 留 60s 余量）
+- 全局 LLM 并发上限 `_LLM_MAX_CONCURRENT`（env `HIVEWEAVE_LLM_MAX_CONCURRENT`，默认 8）；**turn 预算写死启用**（2026-08-19 DSH_11 复盘，历史开关 `HIVEWEAVE_STREAM_SESSION_WALL_CLOCK` 已删除）：`TOTAL_TIMEOUT_S=540` 软截止 / `HARD_TOTAL_TIMEOUT_S=570` 硬截止（给 agent safety_timeout 600s 留余量），撞闸优雅收口保留产出 + agent 层自动 retrigger 续跑——长 turn 每 ~9-10 分钟强制过一次 turn 边界（inbox 处理 + checkpoint），防 busy 期管理消息被屏蔽。数值 env 可调
 - **连续流式总超时**：同 agent `_stream_timeout_streak ≥ 2` → `_park_after_stream_timeouts`（disposition waiting + wait `stream_total_timeout_recovery` + 升级上级，不自动 approve）
 - **模型分级 + 同级故障切换**（`services/model.py` + `services/policy.py`）：两级 tier — `management`（CEO/Coordinator，好模型）/ `executor`（Executor/QA/HR，便宜模型）。每级两槽位：primary + backup，`global_settings` 四键配置（`model_tier_{management|executor}_{primary|backup}`，值存 model_id 或 UUID）。`resolve_model(tier, skip_model_ids)` 严格按 primary→backup→tier列→legacy pool 解析，**禁跨级**。`model_tier_for_agent(agent)` 由 `infer_role_family` 映射。首次 429/5xx 同 turn 自动切同级 backup（`_resolve_failover_backup`，同 api_key 跳过）；streamer circuit fallback 校验 tier 一致性。`pick_from_pool` 全池 RR 已降级为无 tier 配置时的兼容回退。`ensure_channel_models` 仍按名 upsert Ark Plan/Coding 双渠道；`is_rate_limit_error` 命中的 429 不计入放弃、独立冷却 `RATE_LIMIT_RESUME_COOLDOWN_S=120` 后 resume（`agents/agent.py`）
 

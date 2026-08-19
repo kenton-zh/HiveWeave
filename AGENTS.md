@@ -160,7 +160,7 @@ Run services (do NOT use the `.bat` files):
 
 Gotchas:
 - Backend boots fine with no LLM key (logs `seed_default_model_no_api_key` warning, but startup completes). Agents can't actually think/act until a model+key is configured — either set `STEP_API_KEY` (plain env, NOT `HIVEWEAVE_`-prefixed; read by `seed_default_model`) before boot, or add a model in-app via Settings. Not needed just to create projects / load the UI.
-- Tests: `uv run pytest tests/` — all pass in <1s, but the process hangs at teardown (lingering game-time loop / async task), so wrap it: `timeout 120 uv run pytest tests/ -q`.
+- Tests: `uv run pytest tests/ -q -n auto` (parallel, ~1min, pytest-xdist in dev group). Teardown-hang hardening is in `tests/conftest.py` (per-test: close DB connections + cancel leftover asyncio tasks; sessionfinish prints leftover non-daemon threads; `faulthandler_timeout=120` auto-dumps stacks if a single test gets stuck). If a run still hangs at exit, the last stderr lines name the culprit thread; a stuck worker dumps stacks after 120s (dump only — kill the process manually). Legacy serial run: `timeout 300 uv run pytest tests/ -q`.
 - Typecheck: `mypy` is NOT a declared dependency. Run it with `uv run --with mypy mypy src/hiveweave/ --ignore-missing-imports` (from `apps/hiveweave-py`). There are ~56 pre-existing type errors — not a regression.
 - No ESLint/ruff config exists; frontend "build" typecheck is `pnpm --filter @hiveweave/web build` (`tsc -b && vite build`).
 - UI project creation uses a folder-picker modal: navigate to the parent dir (type the parent path, Enter) then click the target folder in the list. Typing the full target path directly resets the picker.

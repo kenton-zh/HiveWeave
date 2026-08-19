@@ -275,6 +275,51 @@ def ensure_screenshot_argv(
     return [*argv, default_screenshot_relpath(agent_id, now_ms=now_ms)]
 
 
+def _screenshot_missing_diagnostic(
+    workspace: str, shot_rel: str
+) -> str:
+    """Locate where the screenshot actually landed instead of a vague error.
+
+    With paths pinned absolute this should be an edge case, but when the file
+    still isn't where we expect, search likely roots (workspace, OS temp, the
+    agent-browser daemon cwd) by basename so the agent isn't left guessing.
+    """
+    name = Path(shot_rel).name
+    import tempfile
+
+    roots: list[str] = []
+    if workspace and Path(workspace).is_dir():
+        roots.append(workspace)
+    tmp = tempfile.gettempdir()
+    if tmp and Path(tmp).is_dir():
+        roots.append(tmp)
+    if os.getcwd():
+        roots.append(os.getcwd())
+    hits: list[str] = []
+    checked = {r for r in roots if r}
+    for root in checked:
+        try:
+            for p in Path(root).rglob(name):
+                if p.is_file():
+                    hits.append(str(p))
+        except OSError:
+            continue
+    if hits:
+        return (
+            "Screenshot was written to: "
+            f"{hits[0]} (agent-browser daemon cwd drifted from the "
+            "workspace). Do not copy from there — re-take pinned to the "
+            f"workspace: browse(args=[\"screenshot\", \"{shot_rel}\"])."
+        )
+    return (
+        "The screenshot command exited 0 but no PNG was found under the "
+        f"workspace ({shot_rel}) or the OS temp dir. The daemon may not "
+        "have flushed the file — restart the session and re-take: "
+        'browse(args=["restart"]), then '
+        f'browse(args=["screenshot", "{shot_rel}"]).'
+    )
+
+
 def _workspace_rel_shot_display(
     workspace: str, shot_rel: str, shot_path: Path | None
 ) -> str:
@@ -478,6 +523,46 @@ def _screenshot_argv(rest: list[str]) -> list[str]:
     return out
 
 
+def _inject_shot_abs_path(workspace: str, shot_rel: str) -> str:
+    """Resolve a workspace-relative screenshot path to absolute.
+
+    agent-browser persists screenshots relative to its own cwd. The CLI is
+    spawned with ``cwd=workspace``, but the long-lived daemon
+    (AGENT_BROWSER_SESSION) reuses a session whose working directory can
+    drift from the workspace — a relative path then lands in the daemon's
+    cwd/tmp and browse_tool's is_file() check misses it. Pin the output to
+    an absolute workspace path so the file always lands under the workspace.
+    """
+    if Path(shot_rel).is_absolute():
+        return str(Path(shot_rel))
+    if workspace and Path(workspace).is_dir():
+        return str(Path(workspace).resolve() / shot_rel)
+    return shot_rel
+
+
+def _pin_shot_path(
+    mapped: list[str], workspace: str, shot_rel: str
+) -> list[str]:
+    """Pin the CLI screenshot output path to an absolute workspace path.
+
+    ``mapped`` is the agent-browser argv; agent-browser takes the output
+    path as the last positional (see _screenshot_argv, which keeps the path
+    last even with ``--selector``/flags). If the tail already equals the raw
+    relative path, replace it; otherwise append the absolute path. Pinning
+    abs makes the is_file() check in browse_tool trustworthy even when the
+    daemon cwd drifts.
+    """
+    out = list(mapped)
+    if not out:
+        return out
+    abs_shot = _inject_shot_abs_path(workspace, shot_rel)
+    if out[-1] == shot_rel:
+        out[-1] = abs_shot
+    else:
+        out.append(abs_shot)
+    return out
+
+
 def _browse_child_env(agent_id: str | None = None) -> dict[str, str]:
     """Env for agent-browser — per-agent headless daemon session.
 
@@ -612,7 +697,9 @@ async def browse_exec(
         timeout = max(30, timeout)
 
     # Screenshot paths land under the workspace; make sure the parent dir
-    # exists (agents write to evidence/… which may not exist yet).
+    # exists (agents write to evidence/… which may not exist yet). Pin the
+    # CLI output to an absolute path so the daemon's cwd drift cannot
+    # misplace the file (see _inject_shot_abs_path).
     if head == "screenshot":
         shot_rel = _screenshot_path_from_argv(argv)
         if shot_rel:
@@ -627,6 +714,7 @@ async def browse_exec(
                     parent.mkdir(parents=True, exist_ok=True)
                 except OSError:
                     pass
+            mapped = _pin_shot_path(mapped, workspace, shot_rel)
 
     cmd = [str(bin_path), *mapped]
     cwd = workspace if workspace and Path(workspace).is_dir() else None
@@ -655,6 +743,106 @@ async def browse_exec(
     stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
     stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
     return rc, stdout, stderr
+
+
+async def _hard_recycle_browser() -> str:
+    """Hard-recycle the agent-browser session (kill daemon + orphan Chromium).
+
+    A wedged agent-browser daemon makes subsequent browse commands hang even
+    after the agent-browser ``close`` — the CLI cannot reach a wedged daemon,
+    so ``restart`` (→close) alone never recovers, and the agent loops on
+    timeouts until the official VERIFY visual gate gets waived. Killing the
+    daemon process tree (``taskkill /T`` recurses its Chromium children) plus
+    any orphaned agent-browser Chromium (identified by the
+    ``agent-browser-chrome-`` user-data-dir marker) forces the next browse
+    command to spawn a fresh session.
+
+    Only agent-browser-owned processes are touched — never the operator's own
+    Chrome (different user-data-dir) or the platform host. Sessions are
+    per-agent (AGENT_BROWSER_SESSION) and respawn on the next browse call, so
+    recycling is safe even if another agent's session is torn down too.
+    """
+    from hiveweave.config import agent_browser_bin_name
+    from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
+    bin_name = agent_browser_bin_name()
+    try:
+        if os.name == "nt":
+            # 1) Daemon + its Chromium tree (taskkill /T is recursive).
+            p = await asyncio.create_subprocess_exec(
+                "taskkill", "/F", "/T", "/IM", bin_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                **windows_no_window_kwargs(),
+            )
+            try:
+                await asyncio.wait_for(p.wait(), timeout=20)
+            except asyncio.TimeoutError:
+                try:
+                    p.kill()
+                except ProcessLookupError:
+                    pass
+            # 2) Reap orphaned agent-browser Chromium (daemon already gone).
+            ps = (
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                "Where-Object { $_.CommandLine -match 'agent-browser-chrome-' } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId "
+                "-Force -ErrorAction SilentlyContinue }"
+            )
+            q = await asyncio.create_subprocess_exec(
+                "powershell", "-NoProfile", "-Command", ps,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                **windows_no_window_kwargs(),
+            )
+            try:
+                await asyncio.wait_for(q.wait(), timeout=20)
+            except asyncio.TimeoutError:
+                try:
+                    q.kill()
+                except ProcessLookupError:
+                    pass
+        else:
+            # POSIX: pkill the daemon binary, then orphaned agent-browser
+            # Chromium (user-data-dir marker) — SIGKILL on the daemon does not
+            # propagate to reparented Chromium, mirroring the Windows step.
+            for pat in (bin_name, "agent-browser-chrome-"):
+                p = await asyncio.create_subprocess_exec(
+                    "pkill", "-9", "-f", pat,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    await asyncio.wait_for(p.wait(), timeout=20)
+                except asyncio.TimeoutError:
+                    try:
+                        p.kill()
+                    except ProcessLookupError:
+                        pass
+        # 3) Reap leaked Chromium profile dirs. agent-browser mints a fresh
+        #    `agent-browser-chrome-<uuid>` user-data-dir per session and never
+        #    cleans them (37 dirs / ~2.2GB after a month on TEST machines).
+        #    After killing every daemon + Chromium above, any remaining profile
+        #    is orphaned garbage — safe to delete here.
+        import tempfile as _tempfile
+
+        try:
+            _profiles = list(
+                Path(_tempfile.gettempdir()).glob("agent-browser-chrome-*")
+            )
+        except Exception:
+            _profiles = []
+        for _d in _profiles:
+            try:
+                import shutil as _shutil
+
+                _shutil.rmtree(str(_d), ignore_errors=True)
+            except Exception:
+                pass
+        return "browser session hard-recycled"
+    except Exception as e:  # pragma: no cover - defensive
+        log.warning("browse_hard_recycle_failed", error=str(e))
+        return f"browser hard-recycle attempted ({e})"
 
 
 async def _apply_default_viewport(
@@ -937,7 +1125,16 @@ async def browse_tool(
         )
 
     head = (argv[0] or "").lower().replace("-", "_")
+    # Normalize through the alias table so `wait_for`/`waitfor` count as the
+    # intentionally long-lived `wait` (the raw head is used elsewhere).
+    head_norm = _HEAD_ALIASES.get(head, head)
     is_restart = head in ("restart", "reset")
+    if is_restart:
+        # Hard-recycle instead of the CLI `close` — a wedged daemon ignores or
+        # hangs on close, so restart must not depend on it. The next browse
+        # command respawns a fresh session.
+        recycle_note = await _hard_recycle_browser()
+        return ToolResult.ok(f"{BROWSE_RESTART_OK} [{recycle_note}]")
     try:
         code, stdout, stderr = await browse_exec(
             argv, workspace, timeout_sec=params.timeout_sec or 60, agent_id=agent_id
@@ -947,9 +1144,6 @@ async def browse_tool(
     except OSError as e:
         return ToolResult.err(f"browse spawn failed: {e}")
 
-    if is_restart and code == 0:
-        return ToolResult.ok(BROWSE_RESTART_OK)
-
     if code != 0:
         parts = [f"browse exit={code}: {' '.join(argv)}"]
         if stdout:
@@ -957,7 +1151,16 @@ async def browse_tool(
         if stderr:
             parts.append(f"stderr:\n{stderr[-2000:]}")
         err = "\n".join(parts)
-        if code == -1 and BROWSE_RESTART_HINT not in err:
+        if code == -1 and head_norm != "wait":
+            # Timeout usually means a wedged daemon — recycle so the next
+            # command starts fresh instead of looping on timeouts. `wait` is
+            # intentionally long-lived, so it keeps the plain hint.
+            await _hard_recycle_browser()
+            err = (
+                f"{err}\nBrowser session hard-recycled. "
+                "Retry the command — the next call starts a fresh browser."
+            )
+        elif code == -1 and BROWSE_RESTART_HINT not in err:
             err = f"{err}\n{BROWSE_RESTART_HINT}"
         return ToolResult.err(err)
 
@@ -998,10 +1201,12 @@ async def browse_tool(
         )
 
         shot_path = resolve_screenshot_path(workspace, shot_rel)
-        img = load_image_for_llm(shot_path) if shot_path else None
-        # Persist path even when pixels fail to load (size/suffix) so
-        # look_at_image(attestation_id) can still resolve the file.
-        if shot_path:
+        # Only trust a path that actually exists on disk — do not hand the
+        # attestation a guessed absolute path before is_file() has passed
+        # (that used to mint "fake success" browse_e2e stamps on missing PNGs).
+        shot_exists = shot_path is not None and shot_path.is_file()
+        img = load_image_for_llm(shot_path) if shot_exists else None
+        if shot_path and shot_exists:
             screenshot_abs = str(shot_path)
 
     core_interaction = head in ("js", "eval", "evaluate")
@@ -1051,9 +1256,7 @@ async def browse_tool(
         if missing:
             return ToolResult.err(
                 f"Screenshot file missing at {shot_display}. "
-                "Re-take the screenshot using this workspace-relative path: "
-                f'browse(args=["screenshot", "{shot_display}"]). '
-                "Do not copy from agent-browser/tmp."
+                + _screenshot_missing_diagnostic(workspace, shot_rel)
             )
         fail_hint = (
             "inspect the image with look_at_image if this is a review."
