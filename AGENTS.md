@@ -150,16 +150,16 @@ React 19 + Zustand (`store.ts`). React Flow org chart. Key panels: ChatPanel (sh
 
 ## Cursor Cloud specific instructions
 
-Linux cloud env. Ignore the Windows `.bat` scripts and the `.nvmrc`/Node-22-portable-PATH hack from `## Node version` above — the VM already has Node 22, `pnpm`, and `uv` (uv is on the login PATH via `~/.profile`). The startup update script runs `uv sync --extra dev --directory apps/hiveweave-py` + `pnpm install`, so deps are already installed.
+Linux cloud env. Ignore the Windows `.bat` scripts and the `.nvmrc`/Node-22-portable-PATH hack from `## Node version` above. Dependency setup is driven by `.cursor/environment.json` → `.cursor/install.sh` (idempotent: bootstraps `uv` into `~/.local/bin` if missing, sources `nvm` so `uv`/`node`/`pnpm` resolve in any shell, then `uv sync --extra dev --directory apps/hiveweave-py` + `pnpm install --frozen-lockfile`). Do NOT assume deps are pre-installed on a bare VM — `node` (`/exec-daemon/node`) is always on PATH, but `uv` and `pnpm` are not guaranteed until `install` runs. If you land in a VM where `.cursor/environment.json` never ran (e.g. an override run), run `bash .cursor/install.sh` yourself.
 
-Run services (do NOT use the `.bat` files):
+Run services (`.cursor/environment.json` already declares them as terminals; do NOT use the `.bat` files):
 - Backend: `uv run uvicorn hiveweave.main:app --host 0.0.0.0 --port 4000` from `apps/hiveweave-py`.
-- Frontend: `pnpm dev` from repo root (Turbo → Vite on 5173). Vite proxies `/api` and the Phoenix WebSocket to `localhost:4000`, so start the backend first.
+- Frontend: `pnpm dev` from repo root (Turbo → Vite on 5173). Start the backend first: `vite.config.ts` proxies **only** `/api` → `localhost:4000` (there is no WebSocket proxy — the phoenix.js client connects to the backend directly).
 
 Gotchas:
 - Backend boots fine with no LLM key (logs `seed_default_model_no_api_key` warning, but startup completes). Agents can't actually think/act until a model+key is configured — either set `STEP_API_KEY` (plain env, NOT `HIVEWEAVE_`-prefixed; read by `seed_default_model`) before boot, or add a model in-app via Settings. Not needed just to create projects / load the UI.
-- Tests: `uv run pytest tests/` — all pass in <1s, but the process hangs at teardown (lingering game-time loop / async task), so wrap it: `timeout 120 uv run pytest tests/ -q`.
-- Typecheck: `mypy` is NOT a declared dependency. Run it with `uv run --with mypy mypy src/hiveweave/ --ignore-missing-imports` (from `apps/hiveweave-py`). There are ~56 pre-existing type errors — not a regression.
+- Tests: `uv run pytest tests/` — the process hangs at session end (lingering game-time loop / async task), so always wrap it: `timeout 150 uv run pytest tests/ -q`. Because of the hang the final summary/`--junitxml` never flushes; to see failures, run suspect files individually. On Linux a handful of tests fail or hang mid-run (platform-specific, this repo is Windows-first — NOT a regression): PowerShell command-rule cases in `test_slack_clone_01_retro_fixes.py`, `rmtree` retry-count cases in `test_husk_and_evidence_gate_fixes.py`, a mock-await case in `test_hire_market_last_search.py`, and the worktree-reconcile cases in `test_workspace_shared_tracking.py` / `test_worktree_p0_lifecycle.py`.
+- Typecheck: `mypy` IS a declared dev dependency (`[project.optional-dependencies].dev` + `[dependency-groups].dev`), installed by `uv sync --extra dev`. Run `uv run mypy src/hiveweave/ --ignore-missing-imports` (from `apps/hiveweave-py`). Expect pre-existing type errors — not a regression.
 - No ESLint/ruff config exists; frontend "build" typecheck is `pnpm --filter @hiveweave/web build` (`tsc -b && vite build`).
 - UI project creation uses a folder-picker modal: navigate to the parent dir (type the parent path, Enter) then click the target folder in the list. Typing the full target path directly resets the picker.
 - SQLite DBs auto-create: Meta DB at `apps/hiveweave-py/data/hiveweave.db`; per-project DB at `<workspace>/.hiveweave/data.db`.
