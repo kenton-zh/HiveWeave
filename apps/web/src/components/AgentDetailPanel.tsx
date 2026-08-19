@@ -71,6 +71,15 @@ const ROLE_LABELS: Record<string, string> = {
   devops: "DevOps",
 };
 
+/** skills.sh 下载技能 slug 为 owner/repo/skill；纪律/内置技能为无斜杠 kebab-case。 */
+function isDownloadedSkill(slug: string): boolean {
+  return slug.includes("/");
+}
+
+const SKILL_PILL = "px-2 py-0.5 text-[10px] rounded-gm max-w-full break-all";
+const SKILL_PILL_DISCIPLINE = `${SKILL_PILL} bg-purple-100 text-purple-700`;
+const SKILL_PILL_DOWNLOADED = `${SKILL_PILL} bg-teal-100 text-teal-800`;
+
 export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const [permissions, setPermissions] = useState<PermissionRules | null>(null);
@@ -474,14 +483,35 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                 </div>
               </div>
               <div>
-                <label className="text-xs font-medium text-g-fg-3 mb-1 block">绑定技能</label>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <label className="text-xs font-medium text-g-fg-3">绑定技能</label>
+                  {agent.boundSkills.length > 0 && (
+                    <span className="flex items-center gap-2 text-[10px] text-g-fg-4">
+                      <span className="inline-flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-purple-500" />
+                        纪律
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-teal-500" />
+                        下载
+                      </span>
+                    </span>
+                  )}
+                </div>
                 <div className="flex flex-wrap gap-1">
                   {agent.boundSkills.length > 0 ? (
-                    agent.boundSkills.map((s, i) => (
-                      <span key={i} className="px-2 py-0.5 text-[10px] bg-purple-100 text-purple-700 rounded-gm">
-                        {s}
-                      </span>
-                    ))
+                    agent.boundSkills.map((s) => {
+                      const downloaded = isDownloadedSkill(s);
+                      return (
+                        <span
+                          key={s}
+                          title={downloaded ? "下载技能" : "纪律技能"}
+                          className={downloaded ? SKILL_PILL_DOWNLOADED : SKILL_PILL_DISCIPLINE}
+                        >
+                          {s}
+                        </span>
+                      );
+                    })
                   ) : (
                     <span className="text-xs text-g-fg-4">未绑定</span>
                   )}
