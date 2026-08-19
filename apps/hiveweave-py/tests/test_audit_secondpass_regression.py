@@ -169,6 +169,8 @@ async def test_create_task_normalizes_depends_on():
     from hiveweave.services.tasks.crud import CrudMixin
 
     c = CrudMixin()
+    # 裸 mixin 无组合类的 VerifyMixin._is_verify_task —— 打桩为普通任务
+    c._is_verify_task = lambda draft: False  # type: ignore[method-assign]
     c.resolve_task_id = AsyncMock(return_value=FULL_UUID)
     deps = [SHORT_PREFIX, "unresolvable-ref"]
     with patch(

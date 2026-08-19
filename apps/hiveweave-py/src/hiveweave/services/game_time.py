@@ -1156,10 +1156,16 @@ class GameTimeService:
 
         # ── approved (non-VERIFY) → MERGE PROXY only (no periodic PENDING) ──
         # NOTE: the orphan/assignee stall loop ends above; do not duplicate.
+        from hiveweave.services.tasks.verify import evidence_merge_recorded
+
         for t in tasks:
             if t.get("status") != "approved":
                 continue
             if TaskService._is_verify_task(t):
+                continue
+            # merge 已实际落库（覆盖当前修订）的任务不再需要 PROXY——
+            # 它停在 approved 只差 migrate 宽限期收口，催 merge 只会制造噪音。
+            if evidence_merge_recorded(t):
                 continue
             age = _effective_age_ms(t)
             tid = str(t.get("id") or "")

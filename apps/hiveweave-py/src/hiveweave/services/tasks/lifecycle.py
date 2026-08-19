@@ -311,11 +311,17 @@ class LifecycleMixin:
         await self._transition(project_id, task_id, "running")
         now_ms = int(time.time() * 1000)
         try:
+            # 账本一致性（2026-08-19 DSH_11 复盘）：auto_block_deps 创建即
+            # blocked 的任务从未 claim —— 解封直落 running 会留下
+            # progress=0 / claimed_at=NULL 的 running 任务。补 running 地板
+            # （MAX 不降）+ 回填 claimed_at（assign=claim 语义）。
             await _execute(
                 project_id,
-                "UPDATE tasks SET blocked_reason = NULL, wait_kind = NULL, "
+                "UPDATE tasks SET progress = MAX(progress, 20), "
+                "claimed_at = COALESCE(claimed_at, ?), "
+                "blocked_reason = NULL, wait_kind = NULL, "
                 "wake_at = NULL, updated_at = ? WHERE id = ?",
-                [now_ms, task_id],
+                [now_ms, now_ms, task_id],
             )
         except Exception:
             await _execute(

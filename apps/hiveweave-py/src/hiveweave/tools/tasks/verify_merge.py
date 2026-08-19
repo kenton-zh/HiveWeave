@@ -205,6 +205,7 @@ async def nudge_verify_tasks_after_merge(
         agent_id = await resolve_agent_id_by_short_id(project_id, short)
 
     parent_ids: set[str] = set()
+    selected: list = []  # agent_id 缺失（dismissed/legacy 分支）时保持空，避免 UnboundLocalError
     if agent_id:
         try:
             all_tasks = await ts.list_tasks(project_id)
@@ -263,6 +264,33 @@ async def nudge_verify_tasks_after_merge(
             project_id, from_agent_id, t, reason="merge"
         ):
             nudged += 1
+    # 合并义务收口：approved 父任务若已有 VERIFY 子任务（预置 VERIFY —— 中层在
+    # 合 MAIN 前就派了里程碑 QA），merge 落地后必须把父任务 approved → verifying。
+    # 否则父任务停在 approved，creator 的 CREATOR_MUST_MERGE 义务永不消除（分支
+    # 已拆、无法再 merge），creator 只能被迫 waive_merge。mark_verifying 同时清掉
+    # 该任务的 [MERGE PENDING] 收件箱（_clear_merge_pending_inbox）。
+    for t in selected:
+        tid = t.get("id")
+        if not tid or t.get("status") != "approved":
+            continue
+        has_verify_child = any(
+            (c.get("parent_task_id") == tid)
+            and is_verify_title(c.get("title"))
+            # 在途 VERIFY 才算（对齐 verify_spawn._spawn_post_approve_verify_task）：
+            # 已 closed/approved 的子任务不再阻止父任务收口。
+            and c.get("status") not in ("closed", "approved")
+            for c in tasks
+        )
+        if not has_verify_child:
+            continue
+        try:
+            await ts.mark_verifying(project_id, tid, reason_code="merged")
+        except Exception as e:
+            log.warning(
+                "merge_parent_mark_verifying_failed",
+                task_id=tid,
+                error=str(e),
+            )
     if nudged:
         log.info(
             "verify_tasks_nudged_after_merge",

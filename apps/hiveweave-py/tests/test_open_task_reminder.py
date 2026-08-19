@@ -112,6 +112,9 @@ async def test_block_infers_wait_kind(env):
 
 @pytest.mark.asyncio
 async def test_dependency_wake_on_approve(env):
+    """auto_block_deps：带未满足依赖的任务创建即 blocked；approve 触发
+    解封 + 唤醒。解封直落 running 并回填账本（progress 地板 20 +
+    claimed_at，assign=claim 语义）。"""
     ts = TaskService()
     pid = env["project_id"]
 
@@ -131,9 +134,10 @@ async def test_dependency_wake_on_approve(env):
         assignee_id=AGENT_A,
         depends_on=[blocker],
     )
-    await ts.claim_task(pid, dependent, AGENT_A)
-    await ts.start_task(pid, dependent)
-    await ts.block_task(pid, dependent, f"dependency:{blocker} waiting")
+    # 新契约：未满足依赖 → 创建即 blocked（不再允许 claim）
+    dep = await ts.get_task(pid, dependent)
+    assert dep["status"] == "blocked"
+    assert dep.get("blocked_reason")
 
     with patch("hiveweave.services.inbox.InboxService.send_message",
                new_callable=AsyncMock) as send_mock, \
@@ -144,6 +148,9 @@ async def test_dependency_wake_on_approve(env):
     dep = await ts.get_task(pid, dependent)
     assert dep["status"] == "running"
     assert dep.get("blocked_reason") is None
+    # 账本一致性：从未 claim 的 auto-block 任务解封后补 running 地板与 claimed_at
+    assert int(dep.get("progress") or 0) >= 20
+    assert dep.get("claimed_at")
     send_mock.assert_awaited()
     trig_mock.assert_awaited()
 

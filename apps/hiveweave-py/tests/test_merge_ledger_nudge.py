@@ -75,6 +75,167 @@ def test_turn_exit_creator_must_merge():
     assert "git_worktree_merge" in decision.hint
 
 
+def test_evidence_merge_recorded_fresh_and_stale():
+    """merged_by 跨 rework 会残留（submit 保留 provenance），只有覆盖当前
+    修订（merged_at >= submitted_at）的 merge 才算义务满足。"""
+    from hiveweave.services.tasks.verify import evidence_merge_recorded
+
+    assert evidence_merge_recorded({"id": "t1"}) is False
+    assert evidence_merge_recorded(
+        {"id": "t1", "evidence": {"summary": "x"}, "submitted_at": 100}
+    ) is False
+    # Fresh merge：merged_at >= submitted_at
+    assert evidence_merge_recorded(
+        {
+            "id": "t1",
+            "evidence": {"merged_by": "a1", "merged_at": 200},
+            "submitted_at": 100,
+        }
+    ) is True
+    # Stale merge（rework 后重新 approved）：merged_at < submitted_at
+    assert evidence_merge_recorded(
+        {
+            "id": "t1",
+            "evidence": {"merged_by": "a1", "merged_at": 50},
+            "submitted_at": 100,
+        }
+    ) is False
+    # JSON-string evidence 形态
+    assert evidence_merge_recorded(
+        {
+            "id": "t1",
+            "evidence": '{"merged_by": "a1", "merged_at": 200}',
+            "submitted_at": 100,
+        }
+    ) is True
+    # 有 merged_by 但无 merged_at → 保守不满足（无法确认覆盖当前修订）
+    assert evidence_merge_recorded(
+        {"id": "t1", "evidence": {"merged_by": "a1"}, "submitted_at": 100}
+    ) is False
+    # auto-submit 路径：时间戳反转（merged_at < submitted_at）但 auto 标志
+    # 明确表明分支已合入 → 满足
+    assert evidence_merge_recorded(
+        {
+            "id": "t1",
+            "evidence": {
+                "merged_by": "system",
+                "merged_at": 50,
+                "auto_submitted_by_merge": True,
+            },
+            "submitted_at": 100,
+        }
+    ) is True
+    # 无 submitted_at → 有 merge 事实即满足
+    assert evidence_merge_recorded(
+        {"id": "t1", "evidence": {"merged_by": "a1", "merged_at": 200}}
+    ) is True
+    # 仅 merge_commit（无 merged_by）→ 仍走比较分支
+    assert evidence_merge_recorded(
+        {"id": "t1", "evidence": {"merge_commit": "abc", "merged_at": 200},
+         "submitted_at": 100}
+    ) is True
+    # 非法 JSON / 非 dict evidence → 不满足
+    assert evidence_merge_recorded(
+        {"id": "t1", "evidence": "{broken", "submitted_at": 100}
+    ) is False
+    assert evidence_merge_recorded(
+        {"id": "t1", "evidence": "just a string", "submitted_at": 100}
+    ) is False
+    # merged_at=0 → 无有效时间戳，保守不满足
+    assert evidence_merge_recorded(
+        {"id": "t1", "evidence": {"merged_by": "a1", "merged_at": 0},
+         "submitted_at": 100}
+    ) is False
+
+
+def test_turn_exit_creator_skips_merge_when_recorded():
+    """merge 已实际落库（覆盖当前修订）的 approved 任务不再触发
+    CREATOR_MUST_MERGE —— 任务停在 approved 只差 migrate 宽限期收口。"""
+    agent_id = "coord-merge-3"
+    set_pending_turn_result(
+        agent_id, {"phase": "done_slice", "summary": "merged already"}
+    )
+    try:
+        decision = evaluate_turn_exit(
+            ExitContext(
+                agent_id=agent_id,
+                project_id="p1",
+                tool_calls=[],
+                open_task_obligations=[
+                    {
+                        "id": "task-approved-002",
+                        "title": "engine",
+                        "status": "approved",
+                        "role_hint": "creator",
+                        "submitted_at": 100,
+                        "evidence": {"merged_by": "coord", "merged_at": 200},
+                    }
+                ],
+                tasks_advanced=set(),
+            )
+        )
+    finally:
+        clear_pending_turn_result(agent_id)
+    assert decision.ok
+    assert "CREATOR_MUST_MERGE" not in decision.violations
+
+
+@pytest.mark.asyncio
+async def test_pre_check_merge_gate_matches_backstop():
+    """commit_turn 同步预检与 backstop 同口径：已合并 approved 不再报
+    CREATOR_MUST_MERGE，未合并的 approved 仍报。"""
+    from hiveweave.services.turn_exit import pre_check_exit_gates
+
+    merged_row = {
+        "id": "t-approved-merged",
+        "status": "approved",
+        "reviewer_id": None,
+        "evidence": '{"merged_by": "coord", "merged_at": 200}',
+        "submitted_at": 100,
+    }
+    unmerged_row = {
+        "id": "t-approved-unmerged",
+        "status": "approved",
+        "reviewer_id": None,
+        "evidence": None,
+        "submitted_at": 100,
+    }
+
+    async def run_with(creator_rows):
+        def fake_execute(sql, params=None):
+            c = AsyncMock()
+            if "creator_id = ?" in str(sql):
+                c.fetchall.return_value = creator_rows
+            else:
+                c.fetchall.return_value = []
+            return c
+
+        conn = AsyncMock()
+        conn.execute = AsyncMock(side_effect=fake_execute)
+        with patch(
+            "hiveweave.db.project.get_project_db_by_project_id",
+            new=AsyncMock(return_value=conn),
+        ), patch(
+            "hiveweave.services.inbox.InboxService.get_outstanding_ask_senders",
+            new=AsyncMock(return_value=set()),
+        ), patch(
+            "hiveweave.services.inbox.InboxService.get_sent_recipients_since",
+            new=AsyncMock(return_value=set()),
+        ), patch(
+            "hiveweave.services.task._ensure_schema",
+            new=AsyncMock(),
+        ):
+            return await pre_check_exit_gates(
+                "agent", "proj", phase="done_slice"
+            )
+
+    merged_violations = await run_with([merged_row])
+    assert "CREATOR_MUST_MERGE" not in merged_violations
+
+    unmerged_violations = await run_with([unmerged_row])
+    assert "CREATOR_MUST_MERGE" in unmerged_violations
+
+
 def test_turn_exit_ok_when_approved_not_in_obligations():
     agent_id = "coord-merge-2"
     set_pending_turn_result(
@@ -314,6 +475,85 @@ async def test_nudge_stale_ledger_review_and_merge():
                                 await svc._nudge_stale_ledger(project_id)
     assert sent == []
 
+    gt._states.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_nudge_stale_ledger_skips_merged_approved():
+    """已合并（evidence 覆盖当前修订）的 approved 任务不再触发 merge PROXY ——
+    它停在 approved 只差 migrate 宽限期收口，催 merge 只会制造噪音。"""
+    from hiveweave.services import game_time as gt
+
+    project_id = "proj-merged-1"
+    now = 1_700_000_000_000
+    stale = now - gt.MERGE_PROXY_STALE_MS - 1000
+    gt._states[project_id] = {
+        "project_id": project_id,
+        "ledger_nudge_cooldowns": {},
+        "duty_session_started_at_ms": now - gt.MERGE_PROXY_STALE_MS - 1000,
+        "silence_trackers": {},
+    }
+    tasks = [
+        {
+            "id": "mrg-1",
+            "creator_id": "coord",
+            "assignee_id": "exec",
+            "status": "approved",
+            "title": "already merged",
+            "tags": [],
+            "created_at": stale,
+            "updated_at": stale,
+            "submitted_at": now - 10_000,
+            # merged_at 晚于 submitted_at → 覆盖当前修订
+            "evidence": '{"merged_by": "coord", "merged_at": ' + str(now - 5_000) + "}",
+        }
+    ]
+    escalated: list[str] = []
+
+    async def fake_escalate(project_id, task, **kwargs):
+        escalated.append(str(task.get("id")))
+
+    class FakeInbox:
+        async def send_message(self, **kwargs):
+            return {"id": "m1"}
+
+    svc = gt.GameTimeService(project_id)
+    svc._watchdog_trigger = AsyncMock()
+
+    with patch(
+        "hiveweave.services.merge_proxy.escalate_merge_proxy",
+        new=fake_escalate,
+    ):
+        with patch(
+            "hiveweave.db.meta.query_one",
+            new=AsyncMock(return_value={"is_started": 1}),
+        ):
+            with patch(
+                "hiveweave.services.system_state.system_state.paused",
+                return_value=False,
+            ):
+                with patch(
+                    "hiveweave.services.task.TaskService.list_tasks",
+                    new=AsyncMock(return_value=tasks),
+                ):
+                    with patch(
+                        "hiveweave.services.task.TaskService._is_verify_task",
+                        staticmethod(lambda t: False),
+                    ):
+                        with patch(
+                            "hiveweave.services.org.OrgService.list_agents",
+                            new=AsyncMock(return_value=[]),
+                        ):
+                            with patch(
+                                "hiveweave.services.inbox.InboxService",
+                                return_value=FakeInbox(),
+                            ):
+                                with patch("time.time", return_value=now / 1000):
+                                    await svc._nudge_stale_ledger(project_id)
+
+    assert escalated == [], (
+        "merged approved task must not escalate a merge proxy"
+    )
     gt._states.pop(project_id, None)
 
 

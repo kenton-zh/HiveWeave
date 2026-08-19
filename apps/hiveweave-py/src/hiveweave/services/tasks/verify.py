@@ -42,6 +42,54 @@ def is_verify_title(title: str | None) -> bool:
     return isinstance(title, str) and bool(_VERIFY_TITLE_RE.match(title))
 
 
+def evidence_merge_recorded(task: dict | None) -> bool:
+    """True when evidence records a merge covering the current approved revision.
+
+    ``merged_by``/``merge_commit`` alone is NOT enough — submit() preserves the
+    previous cycle's merged_by across rework (provenance), so a stale merge fact
+    on a freshly re-approved task must not satisfy CREATOR_MUST_MERGE. Only a
+    merge that happened at/after the latest submit (merged_at >= submitted_at)
+    counts as covering the current revision.
+    """
+    if not task:
+        return False
+    ev = task.get("evidence")
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except Exception:
+            return False
+    if not isinstance(ev, dict):
+        return False
+    if not (
+        ev.get("merged_by") or ev.get("merge_commit") or ev.get("merge_commit_hash")
+    ):
+        return False
+    # auto-submit 路径：merge 先行、submit 后写 submitted_at（时间戳反转，
+    # merged_at < submitted_at 恒成立），auto_submitted_by_merge 直接表明分支
+    # 已合入 main —— 该标志仅存在于 auto-submit 当次 evidence，rework 后不保留。
+    if ev.get("auto_submitted_by_merge"):
+        return True
+    merged_at = ev.get("merged_at")
+    if not merged_at:
+        # 无 merged_at 无法确认覆盖当前修订，宁可不满足（保守，让 creator 核实）
+        return False
+    submitted_at = task.get("submitted_at")
+    if not submitted_at:
+        return True
+    try:
+        return int(merged_at) >= int(submitted_at)
+    except (TypeError, ValueError):
+        # 数据异常（非数字时间戳）时保守不满足，避免未真正合并却被静默放过
+        log.warning(
+            "merge_evidence_timestamp_unparseable",
+            task_id=task.get("id"),
+            merged_at=merged_at,
+            submitted_at=submitted_at,
+        )
+        return False
+
+
 def resolve_merge_owner(task: dict, fallback: str | None) -> str | None:
     """Merge 职责方：任务 creator（排除 API 人类哨兵）→ fallback（同排除）。
 

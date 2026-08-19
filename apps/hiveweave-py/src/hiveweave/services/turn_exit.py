@@ -22,6 +22,18 @@ from hiveweave.services.turn_session import (
 
 log = structlog.get_logger(__name__)
 
+
+def _task_merge_already_recorded(task: dict | None) -> bool:
+    """CREATOR_MUST_MERGE 义务在 merge 已实际落库时视为满足。
+
+    与 ObligationLedger().fulfill 一致：merge 工具成功路径把 merged_by/
+    merged_at 写进 evidence。approved 任务在 migrate 宽限期前仍停 approved，
+    若只认状态会反复催 creator 再 merge（分支已拆）→ 被迫 waive。
+    """
+    from hiveweave.services.tasks.verify import evidence_merge_recorded
+
+    return evidence_merge_recorded(task)
+
 # Violations that warrant at most one repair retrigger
 REPAIR_VIOLATIONS = frozenset({
     "MISSING_COMMIT_TURN",
@@ -591,7 +603,11 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
                 violations.append("REVIEWER_MUST_FINISH_REVIEW")
             elif role == "creator" and status in ("submitted", "reviewing"):
                 violations.append("CREATOR_MUST_REVIEW")
-            elif role == "creator" and status == "approved":
+            elif (
+                role == "creator"
+                and status == "approved"
+                and not _task_merge_already_recorded(t)
+            ):
                 violations.append("CREATOR_MUST_MERGE")
             remaining.append(t)
         remaining_obligations = remaining
@@ -1284,7 +1300,7 @@ async def pre_check_exit_gates(
         # 4. Open task obligations: submitted/reviewing/approved as creator
         #    (skip review when designated reviewer ≠ this creator)
         cursor = await conn.execute(
-            "SELECT id, status, reviewer_id FROM tasks "
+            "SELECT id, status, reviewer_id, evidence, submitted_at FROM tasks "
             "WHERE creator_id = ? AND is_archived = 0 "
             "AND status IN ('submitted', 'reviewing', 'approved') "
             "LIMIT 20",
@@ -1303,7 +1319,11 @@ async def pre_check_exit_gates(
                 if st in ("submitted", "reviewing"):
                     if not rid or rid == agent_id:
                         need_review = True
-                if st == "approved":
+                # 与 backstop 同口径：merge 已实际落库（覆盖当前修订）的
+                # approved 任务不再催 merge（只差 migrate 宽限期收口）。
+                if st == "approved" and not _task_merge_already_recorded(
+                    dict(r)
+                ):
                     need_merge = True
             if need_review:
                 violations.append("CREATOR_MUST_REVIEW")
@@ -1549,8 +1569,20 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
             bits.append(f"{who}{cid_bit} 「{snippet}」")
         items.append(f"未回复 ask: {len(asks)} 个（{'；'.join(bits)}）")
     if obligations:
-        tids = [str(o.get("id") or "")[:8] for o in obligations if o.get("id")]
-        items.append(f"未完成义务: {len(obligations)} 个（{_fmt_ids(tids)}）")
+        # 已合并（evidence 覆盖当前修订）的 approved 义务只差 migrate 收口，
+        # 不再算「未完成义务」，避免误导 agent 去再 merge。
+        actionable = [
+            o
+            for o in obligations
+            if not (
+                o.get("role_hint") == "creator"
+                and o.get("status") == "approved"
+                and _task_merge_already_recorded(o)
+            )
+        ]
+        if actionable:
+            tids = [str(o.get("id") or "")[:8] for o in actionable if o.get("id")]
+            items.append(f"未完成义务: {len(actionable)} 个（{_fmt_ids(tids)}）")
     if wt_git_err:
         loc = f" at {wt.get('path')}" if wt.get("path") else ""
         items.append(f"git status failed{loc} (not necessarily dirty)")

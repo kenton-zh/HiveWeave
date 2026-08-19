@@ -168,6 +168,13 @@ def had_assignee_work(tool_calls: list | None) -> bool:
     return False
 
 
+def _task_merge_already_recorded(task: dict | None) -> bool:
+    """approved 任务 merge 已实际落库（覆盖当前修订）→ 不再提示 merge。"""
+    from hiveweave.services.tasks.verify import evidence_merge_recorded
+
+    return evidence_merge_recorded(task)
+
+
 def build_task_advance_hint(obligations: list[dict]) -> str:
     lines = [
         "[TASK ADVANCE]",
@@ -186,10 +193,16 @@ def build_task_advance_hint(obligations: list[dict]) -> str:
         prog = f" progress={progress}%" if progress is not None else ""
         if role == "creator":
             if status == "approved":
-                next_step = (
-                    "立即 git_worktree_merge(branchName=shortId 或 hw/...)；"
-                    "禁止让 executor 在 main 上 merge"
-                )
+                if _task_merge_already_recorded(t):
+                    next_step = (
+                        "任务已合并（evidence 已记录），停在 approved 等待平台收口；"
+                        "无需再 merge，可继续推进其他义务"
+                    )
+                else:
+                    next_step = (
+                        "立即 git_worktree_merge(branchName=shortId 或 hw/...)；"
+                        "禁止让 executor 在 main 上 merge"
+                    )
             else:
                 next_step = "用 review_task(taskId, decision, feedback) 审批"
         elif status == "rework":
