@@ -47,22 +47,10 @@ _BLOCKED_PROBE_HOSTS = frozenset({
 
 
 def _normalize_models_probe_base(base_url: str) -> str:
-    """Strip accidental chat-completions suffixes before appending /models.
+    """Strip accidental transport suffixes before appending /models."""
+    from hiveweave.llm.wire_endpoint import probe_base_url
 
-    Mirrors OpenAIHandler.build_url idempotency (TEST19 UI paste of full
-    endpoint into baseUrl).
-    """
-    base = (base_url or "").strip().rstrip("/")
-    while True:
-        lower = base.lower()
-        if lower.endswith("/chat/completions"):
-            base = base[: -len("/chat/completions")].rstrip("/")
-            continue
-        if lower.endswith("/completions"):
-            base = base[: -len("/completions")].rstrip("/")
-            continue
-        break
-    return base
+    return probe_base_url(base_url)
 
 
 def _probe_url_blocked_reason(base_url: str) -> str | None:
@@ -306,15 +294,24 @@ def _extract_usage_from_response(data: dict) -> dict:
     """
     usage = data.get("usage") or {}
     if not usage:
+        nested = data.get("response")
+        if isinstance(nested, dict):
+            usage = nested.get("usage") or {}
+    if not usage:
         return {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
 
     input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
     output_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
     total_tokens = usage.get("total_tokens") or (input_tokens + output_tokens)
 
-    # reasoning/thinking tokens (OpenRouter: completion_tokens_details.reasoning_tokens)
+    # reasoning/thinking tokens (OpenRouter: completion_tokens_details;
+    # Responses: output_tokens_details)
     reasoning_tokens = 0
-    details = usage.get("completion_tokens_details") or {}
+    details = (
+        usage.get("completion_tokens_details")
+        or usage.get("output_tokens_details")
+        or {}
+    )
     if isinstance(details, dict):
         reasoning_tokens = details.get("reasoning_tokens") or 0
 
@@ -415,48 +412,52 @@ async def _do_self_test(model: dict) -> dict:
         # 提取 usage
         usage_data = _extract_usage_from_response(data)
 
-        # Try OpenAI format
-        choices = data.get("choices") or []
-        if choices:
-            response_text = choices[0].get("message", {}).get("content", "")
+        from hiveweave.llm.wire_endpoint import (
+            extract_nonstream_text,
+            is_responses_envelope,
+        )
+
+        response_text = extract_nonstream_text(data)
+        if response_text:
             result = {"ok": True, "latencyMs": latency_ms, "response": response_text}
-        # Try Anthropic format
+        elif is_responses_envelope(data):
+            result = {"ok": True, "latencyMs": latency_ms, "response": ""}
         else:
-            content_blocks = data.get("content") or []
-            if content_blocks:
-                # 优先找 text block
-                found_text = False
-                for block in content_blocks:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        response_text = block.get("text", "")
-                        result = {"ok": True, "latencyMs": latency_ms, "response": response_text}
-                        found_text = True
-                        break
-                # 没有 text block 但有 thinking block → 推理模型，thinking 占满 token
-                if not found_text:
-                    for block in content_blocks:
-                        if isinstance(block, dict) and block.get("type") == "thinking":
-                            thinking_text = block.get("thinking", "")
-                            result = {
-                                "ok": True,
-                                "latencyMs": latency_ms,
-                                "response": f"[thinking only] {thinking_text[:100]}",
-                            }
-                            # 响应中有 thinking block = 推理模型
-                            runtime_detected_thinking = True
-                            break
-            # Try Gemini format
+            choices = data.get("choices") or []
+            if choices:
+                result = {"ok": True, "latencyMs": latency_ms, "response": ""}
             else:
-                candidates = data.get("candidates") or []
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts") or []
-                    for part in parts:
-                        if isinstance(part, dict) and "text" in part:
-                            response_text = part["text"]
+                content_blocks = data.get("content") or []
+                if content_blocks:
+                    found_text = False
+                    for block in content_blocks:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            response_text = block.get("text", "")
                             result = {"ok": True, "latencyMs": latency_ms, "response": response_text}
+                            found_text = True
                             break
+                    if not found_text:
+                        for block in content_blocks:
+                            if isinstance(block, dict) and block.get("type") == "thinking":
+                                thinking_text = block.get("thinking", "")
+                                result = {
+                                    "ok": True,
+                                    "latencyMs": latency_ms,
+                                    "response": f"[thinking only] {thinking_text[:100]}",
+                                }
+                                runtime_detected_thinking = True
+                                break
                 else:
-                    result = {"ok": True, "latencyMs": latency_ms, "response": json.dumps(data, ensure_ascii=False)[:200]}
+                    candidates = data.get("candidates") or []
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts") or []
+                        for part in parts:
+                            if isinstance(part, dict) and "text" in part:
+                                response_text = part["text"]
+                                result = {"ok": True, "latencyMs": latency_ms, "response": response_text}
+                                break
+                    else:
+                        result = {"ok": True, "latencyMs": latency_ms, "response": json.dumps(data, ensure_ascii=False)[:200]}
     else:
         result = {"ok": False, "latencyMs": latency_ms, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
 
@@ -539,10 +540,11 @@ class ModelCreate(BaseModel):
     modelId: str | None = None
     baseUrl: str | None = None
     apiKey: str | None = None
-    providerType: str | None = None  # openai/anthropic/google/openai-compatible
+    providerType: str | None = None  # openai-compatible | openai-responses | anthropic | google
     contextWindow: int | None = None
     maxOutputTokens: int | None = None
     supportsThinking: bool | None = None
+    thinkingFormat: str | None = None
     defaultReasoningEffort: str | None = None
     temperature: float | None = None
     isActive: bool | None = None
@@ -556,10 +558,11 @@ class ModelUpdate(BaseModel):
     modelId: str | None = None
     baseUrl: str | None = None
     apiKey: str | None = None
-    providerType: str | None = None  # openai/anthropic/google/openai-compatible
+    providerType: str | None = None  # openai-compatible | openai-responses | anthropic | google
     contextWindow: int | None = None
     maxOutputTokens: int | None = None
     supportsThinking: bool | None = None
+    thinkingFormat: str | None = None
     defaultReasoningEffort: str | None = None
     temperature: float | None = None
     isActive: bool | None = None
@@ -577,6 +580,7 @@ def _normalize_attrs(body: BaseModel) -> dict:
         "contextWindow": "context_window",
         "maxOutputTokens": "max_output_tokens",
         "supportsThinking": "supports_thinking",
+        "thinkingFormat": "thinking_format",
         "defaultReasoningEffort": "default_reasoning_effort",
         "isActive": "is_active",
     }
@@ -617,6 +621,8 @@ def _model_response(model: dict) -> dict:
         "maxOutputTokens": model.get("max_output_tokens"),
         "supports_thinking": model.get("supports_thinking"),
         "supportsThinking": model.get("supports_thinking"),
+        "thinking_format": model.get("thinking_format"),
+        "thinkingFormat": model.get("thinking_format"),
         "default_reasoning_effort": model.get("default_reasoning_effort"),
         "defaultReasoningEffort": model.get("default_reasoning_effort"),
         "temperature": model.get("temperature"),

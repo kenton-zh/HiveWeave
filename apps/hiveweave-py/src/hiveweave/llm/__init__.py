@@ -3,7 +3,7 @@
 契约 01: LLM 流式调用
 
 本包实现 LLM 调用的全链路:
-- provider: Provider 工厂（多格式: openai/anthropic/google/openai-compatible）
+- provider: Provider 工厂（多格式: openai/openai-responses/anthropic/google/openai-compatible）
 - retry: 重试逻辑（429/503/504/529，指数退避+jitter，Retry-After header）
 - circuit_breaker: 熔断器（连续失败 5 次熔断，30s 冷却，半开试探）
 - streamer: 核心流式调用 + tool loop（多格式 SSE 解析，最多 25 轮，空响应重试）
@@ -19,6 +19,7 @@ from hiveweave.llm.circuit_breaker import (
     CheckResult,
     circuit_breaker,
 )
+from hiveweave.llm.openai_responses import OpenAIResponsesHandler
 from hiveweave.llm.provider import (
     FORMAT_HANDLERS,
     ApiFormat,
@@ -67,6 +68,7 @@ __all__ = [
     "AnthropicHandler",
     "GoogleHandler",
     "OpenAICompatibleHandler",
+    "OpenAIResponsesHandler",
     "FORMAT_HANDLERS",
     # provider — config + factory
     "ProviderFactory",

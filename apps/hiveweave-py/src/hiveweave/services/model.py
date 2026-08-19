@@ -5,8 +5,7 @@
 - list_all 对 api_key 脱敏（前 8 字符 + '...'）；get 返回完整 api_key
 - seed_default_model / ensure_channel_models 启动种子（多渠道混用以摊配额）
 - 补全 E9/E10: create/update 支持 supports_thinking/default_reasoning_effort/temperature
-
-llm_models 表 schema 已完整，无需迁移。
+- thinking_format: 思考方言（空=跟协议推断）
 """
 
 from __future__ import annotations
@@ -19,6 +18,8 @@ import uuid
 import structlog
 
 from hiveweave.db import meta as meta_db
+from hiveweave.llm.thinking import normalize_thinking_format
+from hiveweave.llm.wire_endpoint import apply_wire_endpoint
 
 log = structlog.get_logger(__name__)
 
@@ -78,6 +79,25 @@ def _validate_invariant(context_window: int, max_output_tokens: int) -> None:
         )
 
 
+def _apply_wire_on_update(attrs: dict, existing: dict) -> None:
+    """Strip leftover endpoint suffixes when URL or protocol is patched."""
+    if "base_url" not in attrs and "provider_type" not in attrs:
+        return
+    url = (
+        attrs["base_url"]
+        if "base_url" in attrs and attrs["base_url"] is not None
+        else (existing.get("base_url") or "")
+    )
+    proto = (
+        attrs["provider_type"]
+        if "provider_type" in attrs and attrs["provider_type"] is not None
+        else (existing.get("provider_type") or "")
+    )
+    prefix, proto = apply_wire_endpoint(url, proto)
+    attrs["base_url"] = prefix
+    attrs["provider_type"] = proto
+
+
 class ModelService:
     """LLM model registry — CRUD on Meta DB.
 
@@ -98,12 +118,15 @@ class ModelService:
         now_ms = int(time.time() * 1000)
         name = attrs.get("name", "")
         model_id = attrs.get("model_id", "")
-        base_url = attrs.get("base_url", "")
+        base_url, provider_type = apply_wire_endpoint(
+            attrs.get("base_url") or "",
+            attrs.get("provider_type"),
+        )
         api_key = attrs.get("api_key", "")
-        provider_type = attrs.get("provider_type", "")
         context_window = attrs.get("context_window", _DEFAULT_CONTEXT_WINDOW)
         max_output = attrs.get("max_output_tokens", _DEFAULT_MAX_OUTPUT)
         supports_thinking = 1 if attrs.get("supports_thinking", False) else 0
+        thinking_format = normalize_thinking_format(attrs.get("thinking_format"))
         is_active = 0 if attrs.get("is_active") is False else 1
         default_reasoning_effort = attrs.get("default_reasoning_effort")
         temperature = attrs.get("temperature")
@@ -117,14 +140,14 @@ class ModelService:
             "INSERT INTO llm_models (id, name, model_id, base_url, api_key, "
             "provider_type, "
             "context_window, max_output_tokens, supports_thinking, "
-            "default_reasoning_effort, temperature, is_active, tier, "
-            "created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "thinking_format, default_reasoning_effort, temperature, "
+            "is_active, tier, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [model_pk, name, model_id, base_url, api_key,
              provider_type,
              context_window, max_output, supports_thinking,
-             default_reasoning_effort, temperature, is_active, tier,
-             now_ms, now_ms])
+             thinking_format, default_reasoning_effort, temperature,
+             is_active, tier, now_ms, now_ms])
         log.info("model_created", model_pk=model_pk, name=name, model_id=model_id)
         return {"id": model_pk, "name": name, "model_id": model_id}
 
@@ -139,7 +162,8 @@ class ModelService:
         row = await meta_db.query_one(
             "SELECT id, name, model_id, base_url, api_key, provider_type, "
             "context_window, "
-            "max_output_tokens, supports_thinking, default_reasoning_effort, "
+            "max_output_tokens, supports_thinking, thinking_format, "
+            "default_reasoning_effort, "
             "temperature, is_active, fallback, tier, created_at, updated_at "
             "FROM llm_models WHERE id = ? OR model_id = ? "
             "ORDER BY is_active DESC, updated_at DESC, id DESC LIMIT 1",
@@ -152,7 +176,8 @@ class ModelService:
         row = await meta_db.query_one(
             "SELECT id, name, model_id, base_url, api_key, provider_type, "
             "context_window, max_output_tokens, supports_thinking, "
-            "default_reasoning_effort, temperature, is_active, fallback, tier, "
+            "thinking_format, default_reasoning_effort, temperature, "
+            "is_active, fallback, tier, "
             "created_at, updated_at FROM llm_models WHERE name = ? "
             "ORDER BY is_active DESC, updated_at DESC, id DESC LIMIT 1",
             [name],
@@ -178,6 +203,10 @@ class ModelService:
         - 补全 E9: 支持 default_reasoning_effort / temperature
         Returns the model ID on success, None if no fields to update.
         """
+        existing = await self.get(model_pk)
+        if existing is not None:
+            _apply_wire_on_update(attrs, existing)
+
         fields: list[str] = []
         params: list = []
         for key in ("name", "model_id", "base_url", "api_key",
@@ -196,6 +225,9 @@ class ModelService:
         if "supports_thinking" in attrs and attrs["supports_thinking"] is not None:
             fields.append("supports_thinking = ?")
             params.append(1 if attrs["supports_thinking"] else 0)
+        if "thinking_format" in attrs and attrs["thinking_format"] is not None:
+            fields.append("thinking_format = ?")
+            params.append(normalize_thinking_format(attrs["thinking_format"]))
         if "is_active" in attrs:
             fields.append("is_active = ?")
             params.append(1 if attrs["is_active"] else 0)
@@ -206,7 +238,6 @@ class ModelService:
         # 治本：若本次 update 会把 max_output/context_window 改成非法组合，
         # 在落库前拒绝。auto-correct 走的也是这条路径，脏数据检测值若
         # 违反不变量会被这里拦住，不会流入 DB。
-        existing = await self.get(model_pk)
         if existing is not None:
             merged_ctx = attrs.get("context_window", existing.get("context_window")) or _DEFAULT_CONTEXT_WINDOW
             merged_max = attrs.get("max_output_tokens", existing.get("max_output_tokens")) or _DEFAULT_MAX_OUTPUT
@@ -237,7 +268,8 @@ class ModelService:
             rows = await meta_db.query(
                 "SELECT id, name, model_id, base_url, api_key, provider_type, "
                 "context_window, "
-                "max_output_tokens, supports_thinking, default_reasoning_effort, "
+                "max_output_tokens, supports_thinking, thinking_format, "
+                "default_reasoning_effort, "
                 "temperature, is_active, tier, created_at, updated_at "
                 "FROM llm_models ORDER BY created_at ASC")
             return [self._row_to_model(r, mask_key=True) for r in rows]
@@ -265,7 +297,8 @@ class ModelService:
             rows = await meta_db.query(
                 "SELECT id, name, model_id, base_url, api_key, provider_type, "
                 "context_window, max_output_tokens, supports_thinking, "
-                "default_reasoning_effort, temperature, is_active, fallback, tier, "
+                "thinking_format, default_reasoning_effort, temperature, "
+                "is_active, fallback, tier, "
                 "created_at, updated_at "
                 "FROM llm_models WHERE is_active = 1 ORDER BY created_at ASC"
             )
@@ -646,6 +679,7 @@ class ModelService:
     def _row_to_model(row, mask_key: bool = False) -> dict:
         d = dict(row)
         d["supports_thinking"] = bool(d.get("supports_thinking"))
+        d["thinking_format"] = normalize_thinking_format(d.get("thinking_format"))
         d["is_active"] = bool(d.get("is_active"))
         key = d.get("api_key")
         if mask_key:

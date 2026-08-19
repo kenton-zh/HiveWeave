@@ -41,6 +41,8 @@ _META_MIGRATIONS: list[tuple[str, str, str]] = [
     ("agent_templates", "discipline_suite", "TEXT DEFAULT ''"),
     # llm_models — add provider_type for multi-format LLM support
     ("llm_models", "provider_type", "TEXT DEFAULT ''"),
+    # thinking dialect (reasoning_effort / thinking.type / enable_thinking / ...)
+    ("llm_models", "thinking_format", "TEXT DEFAULT ''"),
     # Bug J fix: add fallback column for circuit breaker fallback
     ("llm_models", "fallback", "TEXT"),
     # Model tiering: management | executor (NULL = unclassified legacy)

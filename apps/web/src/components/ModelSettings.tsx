@@ -3,12 +3,24 @@ import { getModels, createModel, updateModel, deleteModel, testModel } from "../
 import type { LlmModel } from "../api";
 import { useAppStore } from "../store";
 import ConfirmDialog from "./ConfirmDialog";
+import TokenScaleField from "./TokenScaleField";
+import {
+  PROTOCOL_CHAT,
+  PROTOCOL_OPTIONS,
+  applyWireEndpoint,
+  normalizeProtocol,
+  protocolLabel,
+} from "../utils/wireEndpoint";
+import {
+  THINKING_OPTIONS_EN,
+  coerceEffort,
+  effortsForThinking,
+  normalizeThinkingFormat,
+} from "../utils/thinkingFormat";
 
 interface Props {
   onClose: () => void;
 }
-
-const REASONING_EFFORTS = ["low", "medium", "high", "max"];
 
 export default function ModelSettings({ onClose }: Props) {
   const [models, setModels] = useState<LlmModel[]>([]);
@@ -31,12 +43,16 @@ export default function ModelSettings({ onClose }: Props) {
   const [formName, setFormName] = useState("");
   const [formModelId, setFormModelId] = useState("");
   const [formBaseUrl, setFormBaseUrl] = useState("");
+  const [formProviderType, setFormProviderType] = useState(PROTOCOL_CHAT);
   const [formApiKey, setFormApiKey] = useState("");
   const [formContextWindow, setFormContextWindow] = useState(128000);
   const [formMaxOutputTokens, setFormMaxOutputTokens] = useState(8192);
   const [formSupportsThinking, setFormSupportsThinking] = useState(false);
-  const [formReasoningEffort, setFormReasoningEffort] = useState<string>("");
+  const [formThinkingFormat, setFormThinkingFormat] = useState("");
+  const [formReasoningEffort, setFormReasoningEffort] = useState<string>("high");
   const [formTemperature, setFormTemperature] = useState("");
+  const effortOptions = effortsForThinking(formThinkingFormat, formProviderType);
+  const effortValue = coerceEffort(formReasoningEffort, effortOptions);
 
   const loadModels = async () => {
     try {
@@ -55,11 +71,13 @@ export default function ModelSettings({ onClose }: Props) {
     setFormName("");
     setFormModelId("");
     setFormBaseUrl("");
+    setFormProviderType(PROTOCOL_CHAT);
     setFormApiKey("");
     setFormContextWindow(128000);
     setFormMaxOutputTokens(8192);
     setFormSupportsThinking(false);
-    setFormReasoningEffort("");
+    setFormThinkingFormat("");
+    setFormReasoningEffort("high");
     setFormTemperature("");
     setEditingId(null);
     setShowForm(false);
@@ -69,11 +87,21 @@ export default function ModelSettings({ onClose }: Props) {
     setFormName(model.name);
     setFormModelId(model.modelId);
     setFormBaseUrl(model.baseUrl);
+    setFormProviderType(normalizeProtocol(model.providerType));
     setFormApiKey(model.apiKey);
     setFormContextWindow(model.contextWindow);
     setFormMaxOutputTokens(model.maxOutputTokens);
     setFormSupportsThinking(model.supportsThinking);
-    setFormReasoningEffort(model.defaultReasoningEffort || "");
+    setFormThinkingFormat(normalizeThinkingFormat(model.thinkingFormat));
+    setFormReasoningEffort(
+      coerceEffort(
+        model.defaultReasoningEffort,
+        effortsForThinking(
+          normalizeThinkingFormat(model.thinkingFormat),
+          normalizeProtocol(model.providerType),
+        ),
+      ),
+    );
     setFormTemperature(model.temperature || "");
     setEditingId(model.id);
     setShowForm(true);
@@ -82,15 +110,23 @@ export default function ModelSettings({ onClose }: Props) {
   const handleSubmit = async () => {
     if (!formName.trim() || !formModelId.trim() || !formBaseUrl.trim() || !formApiKey.trim()) return;
 
+    const wired = applyWireEndpoint(formBaseUrl.trim(), formProviderType);
     const payload = {
       name: formName.trim(),
       modelId: formModelId.trim(),
-      baseUrl: formBaseUrl.trim(),
+      baseUrl: wired.prefix,
+      providerType: wired.protocol,
       apiKey: formApiKey.trim(),
       contextWindow: formContextWindow,
       maxOutputTokens: formMaxOutputTokens,
       supportsThinking: formSupportsThinking,
-      defaultReasoningEffort: formReasoningEffort || null,
+      thinkingFormat: formThinkingFormat,
+      defaultReasoningEffort: formSupportsThinking
+        ? coerceEffort(
+            formReasoningEffort,
+            effortsForThinking(formThinkingFormat, wired.protocol),
+          )
+        : null,
       temperature: formTemperature || null,
     };
 
@@ -204,6 +240,9 @@ export default function ModelSettings({ onClose }: Props) {
                             THINKING
                           </span>
                         )}
+                        <span className="text-[10px] px-1.5 py-0.5 bg-g-bg-muted text-g-fg-3 rounded-gm font-medium">
+                          {protocolLabel(model.providerType)}
+                        </span>
                       </div>
                       <div className="mt-1 text-xs text-g-fg-3 space-y-0.5">
                         <div>Model: <span className="text-g-fg font-mono">{model.modelId}</span></div>
@@ -275,9 +314,29 @@ export default function ModelSettings({ onClose }: Props) {
                     <input
                       value={formBaseUrl}
                       onChange={(e) => setFormBaseUrl(e.target.value)}
-                      placeholder="e.g. https://api.deepseek.com"
+                      onBlur={(e) => {
+                        const wired = applyWireEndpoint(e.target.value, formProviderType);
+                        setFormBaseUrl(wired.prefix);
+                        setFormProviderType(wired.protocol);
+                      }}
+                      placeholder="https://opencode.ai/zen/go/v1"
                       className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-md text-g-fg font-mono focus:outline-none focus:border-g-blue/40"
-                  />
+                    />
+                    <p className="mt-1 text-[11px] text-g-fg-4">
+                      Gateway prefix, stop at /v1. Protocol is selected below.
+                    </p>
+                </div>
+                <div>
+                  <label className="block text-xs text-g-fg-3 mb-1">Protocol</label>
+                  <select
+                    value={formProviderType}
+                    onChange={(e) => setFormProviderType(e.target.value)}
+                    className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-md text-g-fg focus:outline-none focus:border-g-blue/40"
+                  >
+                    {PROTOCOL_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
                 </div>
                 <div>
                   <label className="block text-xs text-g-fg-3 mb-1">API Key</label>
@@ -290,24 +349,20 @@ export default function ModelSettings({ onClose }: Props) {
                   />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs text-g-fg-3 mb-1">Context Window</label>
-                    <input
-                      type="number"
-                      value={formContextWindow}
-                      onChange={(e) => setFormContextWindow(Number(e.target.value))}
-                      className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-md text-g-fg focus:outline-none focus:border-g-blue/40"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-g-fg-3 mb-1">Max Output Tokens</label>
-                    <input
-                      type="number"
-                      value={formMaxOutputTokens}
-                      onChange={(e) => setFormMaxOutputTokens(Number(e.target.value))}
-                      className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-md text-g-fg focus:outline-none focus:border-g-blue/40"
-                    />
-                  </div>
+                  <TokenScaleField
+                    label="Context Window"
+                    value={formContextWindow}
+                    onChange={setFormContextWindow}
+                    minTokens={1_000}
+                    maxTokens={4_096_000}
+                  />
+                  <TokenScaleField
+                    label="Max Output Tokens"
+                    value={formMaxOutputTokens}
+                    onChange={setFormMaxOutputTokens}
+                    minTokens={256}
+                    maxTokens={256_000}
+                  />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
@@ -332,21 +387,36 @@ export default function ModelSettings({ onClose }: Props) {
                   </div>
                 </div>
                 {formSupportsThinking && (
-                  <div>
-                    <label className="block text-xs text-g-fg-3 mb-1">Default Reasoning Effort</label>
-                    <select
-                      value={formReasoningEffort}
-                      onChange={(e) => setFormReasoningEffort(e.target.value)}
-                      className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-md text-g-fg focus:outline-none focus:border-g-blue/40"
-                    >
-                      <option value="">None</option>
-                      {REASONING_EFFORTS.map((effort) => (
-                        <option key={effort} value={effort}>
-                          {effort.charAt(0).toUpperCase() + effort.slice(1)}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
+                  <>
+                    <div>
+                      <label className="block text-xs text-g-fg-3 mb-1">Thinking dialect</label>
+                      <select
+                        value={formThinkingFormat}
+                        onChange={(e) => setFormThinkingFormat(e.target.value)}
+                        className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-md text-g-fg focus:outline-none focus:border-g-blue/40"
+                      >
+                        {THINKING_OPTIONS_EN.map((opt) => (
+                          <option key={opt.value || "auto"} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-g-fg-3 mb-1">Default Reasoning Effort</label>
+                      <select
+                        value={effortValue}
+                        onChange={(e) => setFormReasoningEffort(e.target.value)}
+                        className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-md text-g-fg focus:outline-none focus:border-g-blue/40"
+                      >
+                        {effortOptions.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.labelEn}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </>
                 )}
                 <div className="flex items-center gap-2 pt-2">
                   <button

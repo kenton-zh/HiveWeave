@@ -2,6 +2,7 @@
 
 契约 01: LLM 流式调用 — Provider 工厂
 - openai → /chat/completions + Bearer auth + SSE (data: lines)
+- openai-responses → /responses + `input` + SSE response.* (protocol field; Base URL is /v1 prefix)
 - anthropic → /v1/messages + x-api-key + SSE (event: + data: lines)
 - google → /v1beta/models/{model}:streamGenerateContent + x-goog-api-key + SSE
 - openai-compatible → same as openai (DeepSeek, Groq, TogetherAI, ...)
@@ -25,6 +26,20 @@ from typing import Any
 import httpx
 import structlog
 
+from hiveweave.llm.thinking import (
+    apply_anthropic_thinking,
+    apply_chat_thinking,
+    apply_gemini_thinking,
+    resolve_effort,
+    resolve_thinking_format,
+    thinking_enabled,
+)
+from hiveweave.llm.wire_endpoint import (
+    PROTOCOL_ANTHROPIC,
+    PROTOCOL_RESPONSES,
+    split_wire_endpoint,
+)
+
 log = structlog.get_logger(__name__)
 
 # ── API Format Enum ───────────────────────────────────────────
@@ -36,10 +51,11 @@ class ApiFormat(str, Enum):
     ANTHROPIC = "anthropic"
     GOOGLE = "google"
     OPENAI_COMPATIBLE = "openai-compatible"
+    OPENAI_RESPONSES = "openai-responses"
 
 
 # ── Provider type (legacy, mapped to ApiFormat) ────────────────
-ProviderType = str  # "openai" | "anthropic" | "google" | "openai-compatible"
+ProviderType = str  # "openai" | "anthropic" | "google" | "openai-compatible" | "openai-responses"
 
 
 def _api_format_to_provider_type(fmt: ApiFormat) -> ProviderType:
@@ -105,6 +121,7 @@ class FormatHandler(ABC):
         extra: dict[str, Any] | None = None,
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
+        thinking_format: str | None = None,
         supports_prompt_cache: bool = False,
         supports_images: bool = True,
     ) -> dict[str, Any]:
@@ -112,6 +129,7 @@ class FormatHandler(ABC):
 
         supports_prompt_cache: 若 True，handler 可在请求体中添加缓存断点
         （如 Anthropic 的 cache_control: {type: ephemeral}）。
+        thinking_format: 思考方言；空/None 时由 supports_thinking + 协议推断。
         """
         ...
 
@@ -160,10 +178,63 @@ class FormatHandler(ABC):
 # 改为文字指引：截图没注入、文件路径去哪找、视觉判断走 look_at_image。
 _IMAGES_OMITTED_NOTE = (
     "[平台提示] 本回合有 {n} 张截图未注入：当前对话模型不支持图像输入"
-    "（模型配置 supports_images=false）。截图文件路径见相关工具结果文本；"
-    "如需视觉判断请改用 look_at_image 工具（需先在 Settings 配置 vision 模型），"
+    "（模型实际拒绝了图像请求，已自动降级，仅发文字）。截图文件路径见"
+    "相关工具结果文本；如需视觉判断请改用 look_at_image 工具"
+    "（需先在 Settings 配置 vision 模型），"
     "在未实际看到图像前不得声称视觉验证通过。"
 )
+
+# ── 图像能力负缓存（让模型自己决定）────────────────────────────
+# 不再依赖人工勾选 supports_images：默认按放行，模型/网关真正返回
+# 「图像不支持」类 400 时，由 streamer 标记负缓存并剥图重试一次。
+# key 用真实部署身份 (base_url, model_id) 而非 DB 行 id —— 切换模型行
+# 或改 model_id 时 key 变化自动重新探测，不被旧缓存锁死；同模型无论
+# 用于何种用途，视觉能力都是一样的，故按模型身份键控正确。
+# 进程内易失：后端重启即清空重新探测（换模型/网关异常不会永久锁死）。
+_image_unsupported_cache: set[tuple[str, str]] = set()
+
+
+def mark_image_unsupported(base_url: str, model_id: str) -> None:
+    """记录一个模型实际不支持图像输入（首次 400 后由 streamer 调用）。"""
+    _image_unsupported_cache.add((_norm_image_key(base_url), model_id))
+
+
+def is_image_supported(base_url: str | None, model_id: str) -> bool:
+    """默认放行；仅当(真实身份)已被 400 证明不支持图像时才返回 False。"""
+    if not base_url:
+        return True
+    return (_norm_image_key(base_url), model_id) not in _image_unsupported_cache
+
+
+def _norm_image_key(base_url: str) -> str:
+    """探测与标记统一归一化 base_url，避免与 ProviderConfig 的 rstrip 不一致
+    （带尾斜杠的 base_url 若不归一，负缓存永远不命中 → 每轮重复 400+剥图）。"""
+    return base_url.strip().rstrip("/")
+
+
+def _looks_like_image_unsupported_error(text: str) -> bool:
+    """判定 400 错误文本是否确为「图像不支持」类（非任意 400）。
+
+    用词组而非裸单词（"image"太泛），避免把无关 400 误判成降级。
+    """
+    low = (text or "").lower()
+    markers = (
+        "does not support images",
+        "does not support image",
+        "images are not supported",
+        "image is not supported",
+        "image not supported",
+        "supports text only",
+        "text only",
+        "only support text",
+        "cannot process images",
+        "not a multimodal",
+        "image_url",
+        "images is not",
+        "does not support vision",
+        "no multimodal",
+    )
+    return any(m in low for m in markers)
 
 
 # ── OpenAI Chat Handler ────────────────────────────────────────
@@ -177,13 +248,9 @@ class OpenAIHandler(FormatHandler):
     """
 
     def build_url(self, base_url: str, model_id: str) -> str:
-        base = base_url.rstrip("/")
-        # 幂等兜底（TEST19 教训）：UI 里用户可能把完整端点
-        # （…/chat/completions）填进 base_url——再拼一次会变成
-        # …/chat/completions/chat/completions → 网关 404 HTML 页。
-        if base.endswith("/chat/completions"):
-            return base
-        return f"{base}/chat/completions"
+        # Prefix only — leftover /chat/completions (or /responses) is stripped.
+        prefix, _ = split_wire_endpoint(base_url)
+        return f"{prefix}/chat/completions"
 
     def build_headers(self, api_key: str, model_config: dict | None = None) -> dict[str, str]:
         return {
@@ -205,6 +272,7 @@ class OpenAIHandler(FormatHandler):
         extra: dict[str, Any] | None = None,
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
+        thinking_format: str | None = None,
         supports_prompt_cache: bool = False,
         supports_images: bool = True,
     ) -> dict[str, Any]:
@@ -216,6 +284,12 @@ class OpenAIHandler(FormatHandler):
         normalized = self._normalize_messages_with_images(
             messages, supports_images=supports_images
         )
+        fmt = resolve_thinking_format(
+            thinking_format,
+            supports_thinking=supports_thinking,
+            protocol="openai-compatible",
+        )
+        effort = resolve_effort(reasoning_effort, fmt)
         body: dict[str, Any] = {
             "model": model_id,
             "messages": normalized,
@@ -230,7 +304,7 @@ class OpenAIHandler(FormatHandler):
         # the actual endpoint limit; we cap here to prevent first-turn 400s.
         global_cap = 32_000
         _MAX_OUTPUT_HARD_CAP = 128_000
-        if supports_thinking and max_tokens > 0:
+        if thinking_enabled(fmt) and max_tokens > 0:
             body["max_tokens"] = min(max_tokens, _MAX_OUTPUT_HARD_CAP)
         else:
             body["max_tokens"] = min(max_tokens or global_cap, global_cap)
@@ -238,10 +312,7 @@ class OpenAIHandler(FormatHandler):
         if stream and include_usage:
             body["stream_options"] = {"include_usage": True}
 
-        if supports_thinking:
-            # DeepSeek V4 / OpenCode / OpenRouter: thinking needs an explicit
-            # effort (or defaults off). Prefer configured effort, else "high".
-            body["reasoning_effort"] = reasoning_effort or "high"
+        apply_chat_thinking(body, fmt, effort, max_tokens=int(body["max_tokens"]))
 
         if tools:
             body["tools"] = tools
@@ -496,11 +567,10 @@ class AnthropicHandler(FormatHandler):
     """
 
     def build_url(self, base_url: str, model_id: str) -> str:
-        base = base_url.rstrip("/")
-        # If base_url already ends with /v1, append /messages
+        prefix, _ = split_wire_endpoint(base_url)
+        base = prefix.rstrip("/")
         if base.endswith("/v1"):
             return f"{base}/messages"
-        # If base_url is like https://api.anthropic.com, append /v1/messages
         return f"{base}/v1/messages"
 
     def build_headers(self, api_key: str, model_config: dict | None = None) -> dict[str, str]:
@@ -533,6 +603,7 @@ class AnthropicHandler(FormatHandler):
         extra: dict[str, Any] | None = None,
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
+        thinking_format: str | None = None,
         supports_prompt_cache: bool = False,
         supports_images: bool = True,
     ) -> dict[str, Any]:
@@ -627,10 +698,17 @@ class AnthropicHandler(FormatHandler):
             if supports_prompt_cache and body["tools"]:
                 body["tools"][-1]["cache_control"] = {"type": "ephemeral"}
 
-        # Thinking support
-        if supports_thinking and reasoning_effort:
-            thinking_budget = 16_000  # default
-            body["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+        # Thinking support — dialect first-class; empty effort still enables
+        # (ModelConfigPage used to omit effort and this branch never fired).
+        fmt = resolve_thinking_format(
+            thinking_format,
+            supports_thinking=supports_thinking,
+            protocol="anthropic",
+        )
+        apply_anthropic_thinking(
+            body, fmt, resolve_effort(reasoning_effort, fmt),
+            max_tokens=max_tokens,
+        )
 
         if extra:
             body.update(extra)
@@ -929,7 +1007,8 @@ class GoogleHandler(FormatHandler):
     """
 
     def build_url(self, base_url: str, model_id: str) -> str:
-        base = base_url.rstrip("/")
+        prefix, _ = split_wire_endpoint(base_url)
+        base = prefix.rstrip("/")
         return f"{base}/models/{model_id}:streamGenerateContent?alt=sse"
 
     def build_headers(self, api_key: str, model_config: dict | None = None) -> dict[str, str]:
@@ -952,6 +1031,7 @@ class GoogleHandler(FormatHandler):
         extra: dict[str, Any] | None = None,
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
+        thinking_format: str | None = None,
         supports_prompt_cache: bool = False,
         supports_images: bool = True,
     ) -> dict[str, Any]:
@@ -1018,8 +1098,17 @@ class GoogleHandler(FormatHandler):
             body["tools"] = self.normalize_tools(tools)
 
         # Thinking config
-        if supports_thinking:
-            body["generationConfig"]["thinkingConfig"] = {"includeThoughts": True}
+        fmt = resolve_thinking_format(
+            thinking_format,
+            supports_thinking=supports_thinking,
+            protocol="google",
+        )
+        apply_gemini_thinking(
+            body,
+            fmt,
+            resolve_effort(reasoning_effort, fmt),
+            max_tokens=max_tokens,
+        )
 
         if extra:
             body.update(extra)
@@ -1247,6 +1336,7 @@ class ProviderConfig:
         max_output_tokens: int = 8_192,
         supports_thinking: bool = False,
         reasoning_effort: str | None = None,
+        thinking_format: str | None = None,
         temperature: float = 0.7,
         fallback: str | None = None,
         handler: FormatHandler | None = None,
@@ -1261,6 +1351,7 @@ class ProviderConfig:
         self.context_window = context_window
         self.max_output_tokens = max_output_tokens
         self.supports_thinking = supports_thinking
+        self.thinking_format = thinking_format or ""
 
         # 物理不变量 fail-fast：输出预算 >= 窗口在物理上不可能（输入零空间）。
         # 治本：非法配置在 ProviderConfig 构造时就拒绝，不让非法对象被创建出来
@@ -1277,7 +1368,20 @@ class ProviderConfig:
         self.reasoning_effort = reasoning_effort
         self.temperature = temperature
         self.fallback = fallback
-        self._handler = handler or FORMAT_HANDLERS.get(api_format, OpenAICompatibleHandler())
+        if handler is not None:
+            self._handler = handler
+        elif api_format == ApiFormat.OPENAI_RESPONSES:
+            from hiveweave.llm.openai_responses import OpenAIResponsesHandler
+
+            existing = FORMAT_HANDLERS.get(ApiFormat.OPENAI_RESPONSES)
+            if existing is None:
+                existing = OpenAIResponsesHandler()
+                FORMAT_HANDLERS[ApiFormat.OPENAI_RESPONSES] = existing
+            self._handler = existing
+        else:
+            self._handler = FORMAT_HANDLERS.get(
+                api_format, OpenAICompatibleHandler()
+            )
         self._extra_headers = extra_headers or {}
         # Prompt cache 支持：仅 Anthropic 格式有效（OpenAI/Gemini 用隐式缓存）
         # 参考 opencode RESPECTS_INLINE_HINTS = {"anthropic-messages", "bedrock-converse"}
@@ -1332,6 +1436,7 @@ class ProviderConfig:
             extra=extra,
             supports_thinking=self.supports_thinking,
             reasoning_effort=self.reasoning_effort,
+            thinking_format=self.thinking_format,
             supports_prompt_cache=self.supports_prompt_cache,
             supports_images=self.supports_images,
         )
@@ -1372,7 +1477,8 @@ class ProviderFactory:
         Args:
             model_config: dict from ModelService.get() with keys:
                 id, name, model_id, base_url, api_key, context_window,
-                max_output_tokens, supports_thinking, default_reasoning_effort,
+                max_output_tokens, supports_thinking, thinking_format,
+                default_reasoning_effort,
                 temperature, provider_type (optional override)
 
         Returns:
@@ -1403,6 +1509,15 @@ class ProviderFactory:
         else:
             supports_cache = api_format == ApiFormat.ANTHROPIC
 
+        # 图像能力 = auto：默认放行（让模型在 400 时自行「判定」），
+        # 仅当该真实身份 (base_url, model_name) 已被负缓存证明纯文本时关。
+        # model_config 显式带 supports_images 时以显式值为准（手工覆盖）。
+        explicit_images = model_config.get("supports_images")
+        if explicit_images is None:
+            auto_images = is_image_supported(base_url, model_name)
+        else:
+            auto_images = bool(explicit_images)
+
         return ProviderConfig(
             api_format=api_format,
             base_url=base_url,
@@ -1411,36 +1526,50 @@ class ProviderFactory:
             context_window=int(model_config.get("context_window") or 128_000),
             max_output_tokens=int(model_config.get("max_output_tokens") or 8_192),
             supports_thinking=bool(model_config.get("supports_thinking", False)),
+            thinking_format=model_config.get("thinking_format") or "",
             reasoning_effort=model_config.get("default_reasoning_effort"),
             temperature=float(model_config.get("temperature") or 0.7),
             fallback=model_config.get("fallback"),
             supports_prompt_cache=supports_cache,
-            # DB 缺列/NULL → 保守按 text-only 处理（不注入图像）；
-            # 视觉模型需在 Settings 显式勾选 supports_images。
-            supports_images=bool(model_config.get("supports_images") or False),
+            supports_images=auto_images,
         )
 
     def _detect_format(self, model_config: dict) -> ApiFormat:
-        """Auto-detect API format from model config.
+        """Detect API format from model config.
 
         Priority:
-        1. Explicit provider_type field
-        2. base_url domain patterns
-        3. model_id prefix patterns
-        4. Default: openai-compatible
+        1. Leftover ``/responses`` / ``/messages`` on old rows, only when the
+           stored label is empty or generic Chat (``openai-compatible`` /
+           ``openai``). Not a model-id allowlist.
+        2. Explicit ``provider_type`` / ``provider`` (empty is not explicit).
+        3. base_url domain patterns
+        4. model_id prefix patterns
+        5. Default: openai-compatible
         """
-        # 1. Explicit field
-        explicit = (model_config.get("provider_type") or model_config.get("provider") or "").lower().strip()
+        raw_url = model_config.get("base_url") or ""
+        base_url = raw_url.lower()
+        model_id = (
+            model_config.get("model_id") or model_config.get("model") or ""
+        ).lower()
+        _, inferred = split_wire_endpoint(raw_url)
+        explicit = (
+            model_config.get("provider_type") or model_config.get("provider") or ""
+        ).lower().strip()
+        # Leftover /responses or /messages only overrides a generic Chat label
+        # (old rows). Explicit anthropic/google/openai-responses wins.
+        generic_chat = explicit in ("", "openai-compatible", "openai")
+        if inferred == PROTOCOL_RESPONSES and generic_chat:
+            return ApiFormat.OPENAI_RESPONSES
+        if inferred == PROTOCOL_ANTHROPIC and generic_chat:
+            return ApiFormat.ANTHROPIC
+
         if explicit:
             try:
                 return ApiFormat(explicit)
             except ValueError:
                 pass
 
-        base_url = (model_config.get("base_url") or "").lower()
-        model_id = (model_config.get("model_id") or "").lower()
-
-        # 2. base_url domain patterns
+        # 3. base_url domain patterns
         if "api.anthropic.com" in base_url or "anthropic.com/v1/messages" in base_url:
             return ApiFormat.ANTHROPIC
         if "api.longcat.chat/anthropic" in base_url:
@@ -1460,7 +1589,7 @@ class ProviderFactory:
         if "api.openai.com" in base_url:
             return ApiFormat.OPENAI
 
-        # 3. model_id prefix patterns
+        # 4. model_id prefix patterns
         if model_id.startswith("claude-"):
             return ApiFormat.ANTHROPIC
         if model_id.startswith("gemini-"):
@@ -1468,7 +1597,7 @@ class ProviderFactory:
         if model_id.startswith(("gpt-", "o1", "o3", "o4")):
             return ApiFormat.OPENAI
 
-        # 4. Default: OpenAI-compatible (DeepSeek, Groq, TogetherAI, ...)
+        # 5. Default: OpenAI-compatible (DeepSeek, Groq, TogetherAI, ...)
         return ApiFormat.OPENAI_COMPATIBLE
 
     def create_from_name(

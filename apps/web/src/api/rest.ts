@@ -412,10 +412,12 @@ export interface LlmModel {
   contextWindow: number;
   maxOutputTokens: number;
   supportsThinking: boolean;
+  thinkingFormat?: string | null;
   defaultReasoningEffort?: string | null;
   temperature?: string | null;
   isActive: boolean;
   tier?: string | null; // "management" | "executor" | null
+  providerType?: string | null;
 }
 
 export async function getModels(): Promise<LlmModel[]> {

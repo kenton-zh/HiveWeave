@@ -13,6 +13,20 @@ import {
 import type { LlmModel, TierConfig } from "../api";
 import { useAppStore } from "../store";
 import ConfirmDialog from "./ConfirmDialog";
+import TokenScaleField from "./TokenScaleField";
+import {
+  PROTOCOL_CHAT,
+  PROTOCOL_OPTIONS,
+  applyWireEndpoint,
+  normalizeProtocol,
+  protocolLabel,
+} from "../utils/wireEndpoint";
+import {
+  THINKING_OPTIONS,
+  coerceEffort,
+  effortsForThinking,
+  normalizeThinkingFormat,
+} from "../utils/thinkingFormat";
 
 interface Props {
   onClose: () => void;
@@ -23,9 +37,12 @@ const EMPTY_FORM = {
   modelId: "",
   baseUrl: "",
   apiKey: "",
+  providerType: PROTOCOL_CHAT,
   contextWindow: 128000,
   maxOutputTokens: 8192,
   supportsThinking: false,
+  thinkingFormat: "",
+  defaultReasoningEffort: "high",
 };
 
 const EMPTY_IMAGE_GEN = {
@@ -53,6 +70,8 @@ export default function ModelConfigPage({ onClose }: Props) {
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const effortOptions = effortsForThinking(form.thinkingFormat, form.providerType);
+  const effortValue = coerceEffort(form.defaultReasoningEffort, effortOptions);
 
   // ── Part 2: tier config ──
   const [tierConfig, setTierConfig] = useState<TierConfig>({
@@ -137,9 +156,18 @@ export default function ModelConfigPage({ onClose }: Props) {
       modelId: model.modelId,
       baseUrl: model.baseUrl,
       apiKey: "", // 列表返回的是脱敏 Key，编辑时留空 = 保持原 Key 不变
+      providerType: normalizeProtocol(model.providerType),
       contextWindow: model.contextWindow,
       maxOutputTokens: model.maxOutputTokens,
       supportsThinking: model.supportsThinking,
+      thinkingFormat: normalizeThinkingFormat(model.thinkingFormat),
+      defaultReasoningEffort: coerceEffort(
+        model.defaultReasoningEffort,
+        effortsForThinking(
+          normalizeThinkingFormat(model.thinkingFormat),
+          normalizeProtocol(model.providerType),
+        ),
+      ),
     });
     setEditingId(model.id);
     setShowForm(true);
@@ -182,6 +210,13 @@ export default function ModelConfigPage({ onClose }: Props) {
     }
   };
 
+  const applyBaseUrlPaste = (raw: string) => {
+    setForm((f) => {
+      const { prefix, protocol } = applyWireEndpoint(raw, f.providerType);
+      return { ...f, baseUrl: prefix, providerType: protocol };
+    });
+  };
+
   const handleSubmit = async () => {
     if (!form.name.trim() || !form.modelId.trim() || !form.baseUrl.trim()) {
       showToast("名称、模型 ID、Base URL 为必填项", "warning");
@@ -200,13 +235,22 @@ export default function ModelConfigPage({ onClose }: Props) {
       return;
     }
     setSaving(true);
+    const wired = applyWireEndpoint(form.baseUrl.trim(), form.providerType);
     const payload: Record<string, unknown> = {
       name: form.name.trim(),
       modelId: form.modelId.trim(),
-      baseUrl: form.baseUrl.trim(),
+      baseUrl: wired.prefix,
+      providerType: wired.protocol,
       contextWindow: form.contextWindow,
       maxOutputTokens: form.maxOutputTokens,
       supportsThinking: form.supportsThinking,
+      thinkingFormat: form.thinkingFormat,
+      defaultReasoningEffort: form.supportsThinking
+        ? coerceEffort(
+            form.defaultReasoningEffort,
+            effortsForThinking(form.thinkingFormat, wired.protocol),
+          )
+        : null,
     };
     // 仅在用户填写了 Key 时才提交，避免编辑其他字段时用脱敏值覆盖真实 Key
     if (form.apiKey.trim()) {
@@ -323,7 +367,7 @@ export default function ModelConfigPage({ onClose }: Props) {
           <div>
             <h2 className="text-xl font-semibold text-g-fg tracking-tight">模型配置</h2>
             <p className="text-[13px] text-g-fg-3 mt-1">
-              管理对话模型清单、层级槽位，以及独立的生图（Seedream）配置
+              管理对话模型清单、层级槽位，以及独立的生图（Seedream）配置。Base URL 填网关前缀，停在 /v1；协议单独选。
             </p>
           </div>
           <button
@@ -392,6 +436,9 @@ export default function ModelConfigPage({ onClose }: Props) {
                             {model.supportsThinking && (
                               <span className="shrink-0 whitespace-nowrap text-[10px] leading-none px-1.5 py-1 bg-purple-50 text-purple-600 rounded-gm font-medium">思考</span>
                             )}
+                            <span className="shrink-0 whitespace-nowrap text-[10px] leading-none px-1.5 py-1 bg-g-bg-muted text-g-fg-3 rounded-gm font-medium" title="协议">
+                              {protocolLabel(model.providerType)}
+                            </span>
                           </div>
                         </td>
                         <td className="px-3 py-3 font-mono text-xs text-g-fg-3 truncate" title={model.modelId}>{model.modelId}</td>
@@ -466,9 +513,25 @@ export default function ModelConfigPage({ onClose }: Props) {
                     <input
                       value={form.baseUrl}
                       onChange={(e) => setField("baseUrl", e.target.value)}
-                      placeholder="例如 https://openrouter.ai/api/v1"
+                      onBlur={(e) => applyBaseUrlPaste(e.target.value)}
+                      placeholder="https://opencode.ai/zen/go/v1"
                       className={`${INPUT_CLS} font-mono`}
                     />
+                    <p className="mt-1.5 text-[11px] text-g-fg-4 leading-relaxed">
+                      填网关前缀，停在 /v1。不要贴 /chat/completions 或 /responses；若粘贴了完整端点，失焦后会自动剥路径并识别协议。
+                    </p>
+                  </div>
+                  <div>
+                    <label className={LABEL_CLS}>协议 <span className="text-g-red">*</span></label>
+                    <select
+                      value={form.providerType}
+                      onChange={(e) => setField("providerType", e.target.value)}
+                      className={INPUT_CLS}
+                    >
+                      {PROTOCOL_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
                   </div>
                   <div>
                     <label className={LABEL_CLS}>API Key</label>
@@ -481,24 +544,20 @@ export default function ModelConfigPage({ onClose }: Props) {
                     />
                   </div>
                   <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className={LABEL_CLS}>上下文窗口</label>
-                      <input
-                        type="number"
-                        value={form.contextWindow}
-                        onChange={(e) => setField("contextWindow", Number(e.target.value))}
-                        className={INPUT_CLS}
-                      />
-                    </div>
-                    <div>
-                      <label className={LABEL_CLS}>最大输出</label>
-                      <input
-                        type="number"
-                        value={form.maxOutputTokens}
-                        onChange={(e) => setField("maxOutputTokens", Number(e.target.value))}
-                        className={INPUT_CLS}
-                      />
-                    </div>
+                    <TokenScaleField
+                      label="上下文窗口"
+                      value={form.contextWindow}
+                      onChange={(tokens) => setField("contextWindow", tokens)}
+                      minTokens={1_000}
+                      maxTokens={4_096_000}
+                    />
+                    <TokenScaleField
+                      label="最大输出"
+                      value={form.maxOutputTokens}
+                      onChange={(tokens) => setField("maxOutputTokens", tokens)}
+                      minTokens={256}
+                      maxTokens={256_000}
+                    />
                   </div>
                   <label className="flex items-center gap-2.5 cursor-pointer select-none pt-0.5">
                     <input
@@ -509,6 +568,37 @@ export default function ModelConfigPage({ onClose }: Props) {
                     />
                     <span className="text-sm text-g-fg-2">支持思考（推理模型）</span>
                   </label>
+                  {form.supportsThinking && (
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className={LABEL_CLS}>思考方式</label>
+                        <select
+                          value={form.thinkingFormat}
+                          onChange={(e) => setField("thinkingFormat", e.target.value)}
+                          className={INPUT_CLS}
+                        >
+                          {THINKING_OPTIONS.map((opt) => (
+                            <option key={opt.value || "auto"} value={opt.value}>{opt.label}</option>
+                          ))}
+                        </select>
+                        <p className="mt-1 text-[11px] text-g-fg-4 leading-snug">
+                          协议管 HTTP 路径；思考方式管线上字段。同一条 Chat Completions 网关也可能要 thinking.type 或 enable_thinking。
+                        </p>
+                      </div>
+                      <div>
+                        <label className={LABEL_CLS}>思考强度</label>
+                        <select
+                          value={effortValue}
+                          onChange={(e) => setField("defaultReasoningEffort", e.target.value)}
+                          className={INPUT_CLS}
+                        >
+                          {effortOptions.map((opt) => (
+                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  )}
                   <div className="flex items-center gap-2 pt-1">
                     <button
                       onClick={handleSubmit}
