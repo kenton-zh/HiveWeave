@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from hiveweave.tools.base import tool
 from hiveweave.tools.result import ToolResult
 from hiveweave.tools.helpers import get_project_id
+from hiveweave.util.tree_label import cwd_display
 from hiveweave.services.process_registry import (
     ProcessRecord,
     allocate_project_port,
@@ -188,7 +189,8 @@ async def start_dev_server_tool(
             workspace = main_ws
             verify_main_note = (
                 f"VERIFY {verify_task_id[:8]}: dev server resolved to MAIN "
-                f"project root (cwd={workspace}); worktree code is stale for QA."
+                f"project root {cwd_display(workspace)}; "
+                f"worktree code is stale for QA."
             )
 
     if is_reserved_port(params.preferred_port):
@@ -209,7 +211,8 @@ async def start_dev_server_tool(
         work_cwd = full
     if not Path(work_cwd).is_dir():
         return ToolResult.blocked_err(
-            f"Working directory does not exist: {work_cwd}"
+            f"Working directory does not exist: "
+            f"{cwd_display(work_cwd, params.cwd)}"
         )
 
     if params.command:
@@ -397,7 +400,7 @@ async def start_dev_server_tool(
         return ToolResult.err(f"Failed to register dev server: {e}")
     note = (
         f"Dev server started on http://localhost:{port}/ "
-        f"(pid={proc.pid}, cwd={work_cwd}, listening=ok). "
+        f"(pid={proc.pid}, {cwd_display(work_cwd, params.cwd)}, listening=ok). "
         f"Log: {log_path}. "
         f"Do NOT use ports 5173/4000 — those are HiveWeave."
     )

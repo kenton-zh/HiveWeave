@@ -299,15 +299,30 @@ async def dispatch_task_tool(
         from hiveweave.db import meta as meta_db
 
         main_ws = await meta_db.get_project_workspace(project_id)
-        # Resolve assignee worktree (best-effort)
-        assignee_wt: str | None = None
-        try:
-            from hiveweave.services.worktree_review import agent_worktree_path
+        from hiveweave.services.worktree_review import (
+            agent_worktree_path,
+            normalize_evidence_path,
+        )
 
+        assignee_wt: str | None = None
+        dispatcher_wt: str | None = None
+        try:
             assignee_wt = await agent_worktree_path(resolved_id)
         except Exception:
             pass
-        from hiveweave.services.worktree_review import normalize_evidence_path
+        try:
+            dispatcher_wt = await agent_worktree_path(agent_id)
+        except Exception:
+            pass
+        dispatcher_on_main = False
+        try:
+            dispatcher_on_main = bool(
+                dispatcher_wt
+                and main_ws
+                and _P(dispatcher_wt).resolve() == _P(main_ws).resolve()
+            )
+        except (OSError, ValueError):
+            dispatcher_on_main = False
 
         for ref in params.artifact_refs:
             # Do NOT use str.lstrip("./") — strips every leading '.' and breaks
@@ -332,11 +347,22 @@ async def dispatch_task_tool(
                 found = True
             if not found and assignee_wt and (_P(assignee_wt) / ref_clean).exists():
                 found = True
-            if not found:
+            on_dispatcher = bool(
+                dispatcher_wt
+                and not dispatcher_on_main
+                and (_P(dispatcher_wt) / ref_clean).exists()
+            )
+            if not found and on_dispatcher:
                 artifact_warnings.append(
-                    f"NOT FOUND: '{ref_clean}' does not exist in main "
-                    f"workspace or assignee worktree. Ensure it is committed "
-                    f"to main before the assignee starts."
+                    f"EXISTS ON YOUR TREE ONLY: '{ref_clean}' is in your "
+                    f"worktree, not MAIN. Assignee will treat it as absent "
+                    f"until git_worktree_merge. That is OK."
+                )
+            elif not found:
+                artifact_warnings.append(
+                    f"NOT FOUND: '{ref_clean}' does not exist in MAIN or "
+                    f"the assignee worktree. Assignee will treat it as "
+                    f"absent until it is on MAIN. That is OK."
                 )
 
     ds = DispatchService()
@@ -401,6 +427,9 @@ async def dispatch_task_tool(
             f"Task dispatched to {result.get('to_agent_id', resolved_id)} "
             f"(task_id={result.get('task_id', '')})"
         )
+        wt_sid = result.get("worktree_short_id")
+        if wt_sid:
+            output += f" worktree={wt_sid}."
         parent = result.get("parent_task_id") or ""
         output += (
             " Wait on this child with commit_turn(waiting, kind=task, "

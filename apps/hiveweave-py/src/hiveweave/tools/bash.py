@@ -22,6 +22,8 @@ from typing import Any
 
 import structlog
 
+from hiveweave.util.tree_label import cwd_display
+
 log = structlog.get_logger(__name__)
 
 # ── Constants ───────────────────────────────────────────────
@@ -377,7 +379,7 @@ async def _run_registered_dev_server(
         "success": True,
         "output": (
             f"[hiveweave] Dev server auto-registered from bash.\n"
-            f"  pid={proc.pid} port={registered_port} cwd={cwd}\n"
+            f"  pid={proc.pid} port={registered_port} {_cwd_style_hint(cwd)}\n"
             f"  command: {meta.get('command') or command}\n"
             f"  URL: http://localhost:{registered_port}/\n"
             f"{port_note}"
@@ -987,21 +989,11 @@ async def _run_docker(command: str, cwd: str, timeout_s: int | None) -> dict[str
     }
 
 
-def _cwd_style_hint(cwd: str) -> str:
-    """Human-readable cwd note for agents (Git Bash style on Windows)."""
-    try:
-        p = Path(cwd).resolve()
-        native = str(p)
-    except (OSError, ValueError):
-        native = cwd
-    posix = native.replace("\\", "/")
-    # D:/foo → /d/foo for Git Bash copy-paste
-    msys = posix
-    if len(posix) >= 2 and posix[1] == ":":
-        msys = "/" + posix[0].lower() + posix[2:]
+def _cwd_style_hint(cwd: str, relative: str | None = None) -> str:
+    """MAIN vs worktree label — relative path only, never dump D:\\ or /d/."""
     return (
-        f"[cwd={native} | Git Bash style: {msys} — "
-        f"use this or quoted Windows paths; never invent /workspace]"
+        f"{cwd_display(cwd, relative)} "
+        f"— relative paths; never invent /workspace"
     )
 
 
@@ -1062,7 +1054,8 @@ async def execute_bash(
 
     if not Path(cwd).exists():
         return {"success": False, "output": "",
-                "error": f"Error: Working directory does not exist: {cwd}",
+                "error": f"Error: Working directory does not exist: "
+                         f"{cwd_display(cwd, workdir)}",
                 "blocked": True}
 
     cwd_hint = _cwd_style_hint(cwd)
@@ -1189,7 +1182,8 @@ async def execute_run_command(
 
     if not Path(full_cwd).exists():
         return {"success": False, "output": "",
-                "error": f"Error: Working directory does not exist: {full_cwd}",
+                "error": f"Error: Working directory does not exist: "
+                         f"{cwd_display(full_cwd, cwd)}",
                 "blocked": True}
 
     safe_timeout = int(timeout_ms or 120_000)
@@ -2192,7 +2186,7 @@ async def bash_main_tool(
     main_ws, err = await resolve_project_main_cwd(project_id)
     if not main_ws:
         return ToolResult.err(err)
-    note = f"\n\n[cwd=project root] {main_ws}"
+    note = "\n\n[cwd=project root]"
     result = await bash_tool(params, agent_id, main_ws)
     return _with_cwd_note(result, note)
 

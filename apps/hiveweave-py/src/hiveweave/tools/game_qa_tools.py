@@ -239,7 +239,7 @@ async def game_run_case_main_tool(
     result = await game_run_case_tool(
         params, agent_id, main_ws, hint_tool="game_run_case_main"
     )
-    return _with_cwd_note(result, f"\n\n[cwd=project root] {main_ws}")
+    return _with_cwd_note(result, "\n\n[cwd=project root]")
 
 
 async def _action_probe(

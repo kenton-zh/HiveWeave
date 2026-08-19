@@ -70,6 +70,18 @@ def test_read_allows_project_via_relative(project_layout: dict[str, Path]) -> No
     assert main is not None
     assert Path(main).read_text(encoding="utf-8") == "main-content"
 
+    # Canonical review path from a sibling worktree (not ../)
+    peer_canon = resolve_for_read(
+        wt, ".hiveweave/worktrees/A002/src/peer.txt", root
+    )
+    assert peer_canon is not None
+    assert Path(peer_canon).read_text(encoding="utf-8") == "peer-content"
+    own_canon = resolve_for_read(
+        wt, ".hiveweave/worktrees/A001/src/own.txt", root
+    )
+    assert own_canon is not None
+    assert Path(own_canon).read_text(encoding="utf-8") == "own-content"
+
     # escape project denied
     assert resolve_for_read(wt, "../../../../outside.txt", root) is None
 
@@ -102,3 +114,33 @@ async def test_write_file_rejects_outside_worktree(
     )
     assert result["success"] is False
     assert "Sandbox violation" in (result["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_read_file_canonical_worktree_path(
+    project_layout: dict[str, Path],
+) -> None:
+    wt = str(project_layout["wt_a"])
+    root = str(project_layout["project"])
+    result = await read_file(
+        file_path=".hiveweave/worktrees/A002/src/peer.txt",
+        offset=0,
+        limit=50,
+        workspace_path=wt,
+        project_root=root,
+    )
+    assert result["success"] is True
+    assert "peer-content" in result["output"]
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_canonical_peer_worktree(
+    project_layout: dict[str, Path],
+) -> None:
+    wt = str(project_layout["wt_a"])
+    result = await write_file(
+        file_path=".hiveweave/worktrees/A002/hacked.txt",
+        content="nope",
+        workspace_path=wt,
+    )
+    assert result["success"] is False

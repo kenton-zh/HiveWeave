@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from .base import tool
 from .result import ToolResult
 from .helpers import get_project_id
+from hiveweave.util.tree_label import tree_relpath
 
 log = structlog.get_logger(__name__)
 
@@ -180,11 +181,13 @@ async def git_worktree_list_tool(
         wts = result.get("worktrees", result.get("entries", []))
         if not wts:
             return ToolResult.ok("No active worktrees")
-        lines = [
-            f"{w.get('short_id', '?')}: {w.get('branch', '?')} "
-            f"({w.get('status', '?')})"
-            for w in wts
-        ]
+        lines = []
+        for w in wts:
+            abs_path = str(w.get("path") or "")
+            rel = tree_relpath(abs_path) or "MAIN"
+            sid = w.get("short_id") or "?"
+            branch = w.get("branch") or "?"
+            lines.append(f"{sid}: {branch} {rel}")
         return ToolResult.ok("\n".join(lines))
     return ToolResult.err(result.get("message", "Failed to list worktrees"))
 

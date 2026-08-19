@@ -156,8 +156,13 @@ _SYSTEM_DIR_BLOCK = """## IMPORTANT: HiveWeave System Directory
 - **Team shared space (ALLOWED, read+write)**: `.hiveweave/shared/` is the team shared directory.
   All team members can read and write here — documents, plans, temp files, scripts, anything.
   Use it to collaborate: drop notes, share drafts, coordinate via files.
-- **Work files (ALLOWED)**: `.hiveweave/reports/`, `.hiveweave/drafts/`, `.hiveweave/worktrees/`
-  are for your individual drafts, reports, and test outputs.
+- **Work files (ALLOWED)**: `.hiveweave/reports/` and `.hiveweave/drafts/`
+  are for your individual reports and drafts.
+- **Implementation worktrees (ALLOWED to owners / mid-level review)**:
+  `.hiveweave/worktrees/<shortId>/` is a builder's unmerged checkout
+  (executors and player-coach coordinators). Owners write there; mid-level
+  review reads there. CEO and HR stay on MAIN and do not have a worktree.
+  Shared contracts teammates read live on MAIN (`docs/`) after merge.
 - **Official evidence location (TEST19 ⑥)**: task evidence goes to
   `.hiveweave/reports/<task-shortId>/` (`evidence*.md`, `test*.log`).
   Submit attestations with relative paths under that dir. Never put

@@ -1415,6 +1415,16 @@ class Agent:
         except Exception:
             log.debug("read_charter for project_rules failed", project_id=self.project_id, exc_info=True)
 
+        workspace_path = ""
+        try:
+            workspace_path = await self._get_workspace_path()
+        except Exception:
+            log.debug(
+                "workspace_path for context failed",
+                agent_id=self.id,
+                exc_info=True,
+            )
+
         context = build_context_prompt(
             agent_id=self.id,
             memories=None,  # memory_text 单独传（见下），不走 memories list
@@ -1424,6 +1434,8 @@ class Agent:
             bound_skills=bound_skills_json,
             memory_text=memory_text,
             project_rules=project_rules,
+            workspace_path=workspace_path,
+            role=str(self.config.get("role") or ""),
         )
 
         # 追加 skills section

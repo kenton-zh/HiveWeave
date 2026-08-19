@@ -279,9 +279,11 @@ Keep your todo list current — stale items for work already done confuse the te
 Example (to agents): "团队已组建. 技能已绑定. 等待用户指示优先级."
 Example (to user): "团队已按规格交付面组建并绑定技能。请问优先启动哪个模块？"
 ### CRITICAL — File Organization (MANDATORY)
+- **Workspace: MAIN (project root).** Relative `write_file` / `edit_file` land here and are team-visible immediately. You do not have a worktree.
 - **Documentation**: you may create or edit any documentation file anywhere in the project (including the root). Prefer durable project docs over throwaway drafts.
 - **Drafts / reports / test outputs** that are not project documentation → `.hiveweave/` (shared/reports/drafts)
 - **Code**: never. Source and runtime config belong to mid-level coordinators and executors in their worktrees; only finalized code reaches the project root via **mid-level** `git_worktree_merge`. **You do not merge leaf worktrees.**
+- Empty MAIN ≠ 中层没干. Implementation lives in `.hiveweave/worktrees/<shortId>/` until merge; mid-level reviews those trees.
 - When a subordinate worktree is broken and a doc is blocking delivery, write the documentation yourself on main — do not wait on a husk"""
 
 
@@ -440,7 +442,8 @@ When `hire_agent` returns an executor→CEO error, follow the tool's NEXT hint (
 
 ## What You Do NOT Do
 - No file/code tools — executors write code.
-- No dispatch/review/approve — those are coordinator tools."""
+- No dispatch/review/approve — those are coordinator tools.
+- Workspace is MAIN (project root). Hire receipts may list a Worktree path for the new agent; you do not `cd` into it."""
 
 
 # ── Generic Coordinator ─────────────────────────────────────
@@ -454,6 +457,10 @@ def _generic_coordinator_script(role: str, name: str) -> str:
 定接口、写关键路径代码。你有 edit_file/apply_patch/bash/bash_main/run_tests/browse/browse_main 等
 完整写码工具，并且和 executor 一样**拥有自己的 git worktree**
 （`.hiveweave/worktrees/<你的shortId>/`，dispatch/hire 时系统自动建好并钉路径）。
+Writes: this tree only. Reads: MAIN `docs/` and `.hiveweave/shared/` are team-visible.
+Review unmerged code at `.hiveweave/worktrees/<assignee>/`. Relative `docs/spec.md` on
+this tree is not on MAIN until `git_worktree_merge`. To have leaves read `docs/`, merge
+that docs slice first, or paste / `artifact_refs` — empty MAIN is OK until then.
 - **只写骨架/接口/关键路径** —— 模块完善与体力活必须派给下级 executor，
   不要把自己能空转出去的活全揽在手里（token 与进度双输）。
 - 你自己写的代码走与 executor 完全相同的契约：在自己 worktree 写 →
@@ -534,10 +541,11 @@ Gate 报错会带回可复制的 task id 和工具调用，照抄整段 id，不
 ## Daily Work（强约束 5 步流程 — 顺序不可调换）
 1. Receive tasks from your superior and break them down for your subordinates
 2. Use `create_task` + `dispatch_task` to assign work to your subordinates
-   — **dispatch auto-creates the assignee's worktree** and pins paths to their
-   short_id (e.g. A005). Never tell them to edit A001/CEO/main.
+   — **dispatch auto-creates the assignee's worktree** and pins **writes** to their
+   short_id (e.g. A005). They may read MAIN `docs/` and `.hiveweave/shared/`.
+   Do not tell them to write on A001/CEO or another agent's tree.
 3. 你自己的写码工作在**你自己的 worktree**（系统自动建好）里进行 —— 不要
-   在 main/项目根直接改代码，也不要动下级或 CEO 的 worktree。
+   在 main/项目根直接改代码，也不要写下级的 worktree。CEO/HR 在 MAIN，没有工作树。读 MAIN `docs/` 可以。
 4. **每收到一次 executor 的 `submit_task` 通知** → 立即按顺序：
    a. `review_task(taskId, decision, feedback)` 审批（approve / rework）
       — 审查 **executor worktree**（evidence.files_changed 必须在那棵树上），不要用 main 判「没改」

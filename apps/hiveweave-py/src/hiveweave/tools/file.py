@@ -19,6 +19,12 @@ from typing import Any
 
 import structlog
 
+from hiveweave.util.tree_label import (
+    READ_MISS_HINT,
+    listing_header,
+    write_tree_suffix,
+)
+
 log = structlog.get_logger(__name__)
 
 # ── Constants ───────────────────────────────────────────────
@@ -76,6 +82,10 @@ READ_PATH_TOOLS: frozenset[str] = frozenset({
 # Agents copy these from bash output into read_file/write_file; Path() on
 # Windows does not map them to the real drive, so sandbox checks false-deny.
 _MSYS_DRIVE = re.compile(r"^/([a-zA-Z])(/|$)")
+_CANONICAL_WT_READ = re.compile(
+    r"^\.hiveweave/worktrees/[A-Za-z]\d{2,}(/.*)?$",
+    re.IGNORECASE,
+)
 
 
 def normalize_input_path(p: str) -> str:
@@ -92,6 +102,14 @@ def normalize_input_path(p: str) -> str:
             lambda m: m.group(1).upper() + ":/", s, count=1
         )
     return s
+
+
+def _is_canonical_worktree_read(file_path: str) -> bool:
+    """``.hiveweave/worktrees/<sid>/…`` — review path, resolve from project root."""
+    s = (file_path or "").replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return bool(_CANONICAL_WT_READ.match(s))
 
 
 def infer_project_root(workspace_path: str) -> str:
@@ -247,6 +265,10 @@ def _resolve_for_read_detail(
         candidate = Path(file_path)
         if candidate.is_absolute():
             full = candidate.resolve()
+        elif _is_canonical_worktree_read(file_path):
+            # Mid-level review path is project-relative. From a builder
+            # worktree cwd, joining it would ghost-nest and get rejected.
+            full = (root / file_path.replace("\\", "/")).resolve()
         else:
             full = (write_ws / file_path).resolve()
         if full != root:
@@ -270,9 +292,11 @@ def resolve_for_read(
     """Resolve a path for READ access.
 
     Relative paths are resolved against the agent's write workspace (cwd),
-    but the final path may land anywhere under the project root — so an
-    executor can read main / sibling worktrees via ``../…`` while keeping
-    ``src/foo`` pointing at their own worktree copy.
+    but the final path may land anywhere under the project root. Paths that
+    start with ``.hiveweave/worktrees/<shortId>/`` are resolved from the
+    project root so mid-level review works from a builder worktree cwd.
+    Do not teach ``../`` as MAIN — from a worktree that is the sibling
+    worktrees directory.
 
     Returns None if the path escapes the project or repeats the worktree
     prefix (ghost-nest path, M4).
@@ -400,7 +424,8 @@ async def read_file(
     p = Path(full)
     if not p.exists():
         return {"success": False, "output": "",
-                "error": f"Error: File not found: {file_path}"}
+                "error": f"Error: File not found: {file_path}."
+                         f"{READ_MISS_HINT}"}
     if p.is_dir():
         return {"success": False, "output": "",
                 "error": f"Error: Path is a directory, not a file: {file_path}"}
@@ -500,7 +525,11 @@ async def write_file(
     size = len(content.encode("utf-8"))
     log.info("file.write", path=file_path, bytes=size)
     return {"success": True,
-            "output": f"Wrote {file_path} ({size} bytes)", "error": None}
+            "output": (
+                f"Wrote {file_path} ({size} bytes)"
+                f"{write_tree_suffix(workspace_path)}"
+            ),
+            "error": None}
 
 
 async def list_files(
@@ -574,7 +603,8 @@ async def list_files(
         pass
     if not p.exists():
         return {"success": False, "output": "",
-                "error": f"Error: Directory not found: {path}"}
+                "error": f"Error: Directory not found: {path}."
+                         f"{READ_MISS_HINT}"}
     if not p.is_dir():
         return {"success": False, "output": "",
                 "error": f"Error: Not a directory: {path}"}
@@ -619,7 +649,11 @@ async def list_files(
     _walk(p, "", 1)
 
     body = "\n".join(lines) if lines else "(empty directory)"
-    return {"success": True, "output": body, "error": None}
+    return {
+        "success": True,
+        "output": listing_header(full) + "\n" + body,
+        "error": None,
+    }
 
 
 # ── Pydantic models + @tool registration (Phase 2 migration) ──────
@@ -697,8 +731,8 @@ class ListFilesParams(BaseModel):
 @tool(
     "read_file",
     "Reads file contents with line numbers. Relative paths resolve from your "
-    "workspace; you may also read anywhere under the project root (e.g. main "
-    "or a peer's worktree via ../…). Writes stay confined to your workspace.",
+    "workspace. Reviewers read unmerged code at .hiveweave/worktrees/<shortId>/. "
+    "Do not use ../ for MAIN docs. Writes stay confined to your workspace.",
     requires_workspace=True,
     security_level="file_op",
 )
@@ -742,10 +776,10 @@ async def write_file_tool(params: WriteFileParams, agent_id: str, workspace: str
 
 @tool(
     "list_files",
-    "Lists files and directories. Empty path lists your workspace; other paths "
-    "may point anywhere under the project root (e.g. ../ for main, "
-    "../peerId/ for a sibling worktree). When recursive=true, maxdepth controls "
-    "how many levels to descend — capped at 3 (values above 3 are clamped to 3).",
+    "Lists files and directories. Empty path lists your workspace. Reviewers "
+    "list unmerged code at .hiveweave/worktrees/<shortId>/. Do not use ../ "
+    "for MAIN. When recursive=true, maxdepth controls how many levels to "
+    "descend — capped at 3 (values above 3 are clamped to 3).",
     requires_workspace=True,
     security_level="file_op",
 )
