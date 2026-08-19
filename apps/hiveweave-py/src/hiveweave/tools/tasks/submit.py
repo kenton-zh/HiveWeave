@@ -364,13 +364,11 @@ async def _submit_preflight(
                             else ""
                         )
                         opt1 = (
-                            f"1) {audit_bit}browse(...) then browse(screenshot) then "
-                            f"assert_visual(screenshotPath=..., "
-                            f"observed=\"what you SEE in the image\", "
-                            f"verdict=\"pass\") then "
+                            f"1) {audit_bit}browse(...) until you have a "
+                            f"browse_e2e row for this task, then "
                             f"submit_task(taskId=\"{task_id}\", "
-                            f"attestationIds=[... matching kinds ...]). "
-                            f"Need ALL required kinds; verdict=fail does not unlock submit.\n"
+                            f"attestationIds=[...]). "
+                            f"Need kinds {sorted(needed)}.\n"
                         )
                     elif needed and CODE_AUDIT_KIND in needed:
                         extra = (

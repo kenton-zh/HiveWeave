@@ -47,24 +47,10 @@ async def agent_is_look_only_browser(agent_id: str) -> bool:
 
 
 def screenshot_followup_text(shot_display: str, *, look_only: bool) -> str:
-    """Post-screenshot next-step copy. Look-only must not tell CEO to attest."""
-    if look_only:
-        return (
-            "[VISION] Screenshot pixels are attached for inspection "
-            f"(path={shot_display}). You are looking, not testing. "
-            "Do not call assert_visual / game_run_case. Formal VERIFY "
-            "stays with QA; use look_at_image on their evidence if needed."
-        )
+    """Post-screenshot copy. Pixels are attached; do not prescribe a tool."""
+    extra = " Looking-only: no test stamp." if look_only else ""
     return (
-        "[VISION] Screenshot pixels are attached to this tool result "
-        "for your next turn. Inspect the image (not the path). "
-        f"Screenshot saved at: {shot_display}\n"
-        "Then call "
-        f"assert_visual(screenshotPath=\"{shot_display}\", "
-        "observed=\"describe what you see: labels/layout/errors, "
-        "40+ chars\", "
-        "verdict=\"pass\"|\"fail\") — UI submit requires visual_check; "
-        "a bare screenshot file path is NOT enough."
+        f"[VISION] Screenshot pixels attached (path={shot_display}).{extra}"
     )
 
 # agent-browser `eval <js>` is a direct argv expression. Direct form is used
@@ -1079,10 +1065,8 @@ def _contract_snapshot_output(
     "Prefer lookup_dev_server / start_dev_server for the app URL first. "
     "goto always resets the window to 1280×900. For mobile: goto first, then "
     "browse(args=[\"viewport\",\"390\",\"844\"]), then screenshot. "
-    "After screenshot: evidence roles (QA / executor visual gate) MUST call "
-    "assert_visual(observed, verdict) on what they SEE (path-only evidence "
-    "is rejected for UI submit). Looking-only roles (CEO) inspect the image "
-    "or look_at_image — do not stamp. "
+    "After screenshot, pixels inject into the next turn. "
+    "Looking-only roles (CEO) do not stamp. "
     "For H5/canvas games, evidence roles prefer game_run_case after goto "
     "(MAIN VERIFY: game_run_case_main). "
     "Example: browse(args=[\"goto\",\"http://127.0.0.1:3000\"]) then "
@@ -1239,7 +1223,8 @@ async def browse_tool(
             extra_fields["images"] = [img]
             extra_fields["screenshot_path"] = screenshot_abs
             # NOTE: tool_exec drops extra fields before the next LLM round —
-            # the path MUST be in the text for assert_visual(screenshotPath=...).
+            # keep the path in the text so the model can re-take or optionally
+            # call assert_visual / look_at_image.
             shot_display = _workspace_rel_shot_display(
                 workspace, shot_rel, shot_path
             )
@@ -1258,11 +1243,7 @@ async def browse_tool(
                 f"Screenshot file missing at {shot_display}. "
                 + _screenshot_missing_diagnostic(workspace, shot_rel)
             )
-        fail_hint = (
-            "inspect the image with look_at_image if this is a review."
-            if look_only
-            else "assert_visual still required for UI evidence."
-        )
+        fail_hint = "re-take the screenshot; the file path is in this result."
         out = (
             f"{out}{attest_note}\n"
             "[VISION] Screenshot file could not be loaded into multimodal "
@@ -1296,7 +1277,7 @@ async def browse_main_tool(
     if not main_ws:
         return ToolResult.err(err)
     result = await browse_tool(params, agent_id, main_ws)
-    return _with_cwd_note(result, f"\n\n[cwd=project root] {main_ws}")
+    return _with_cwd_note(result, "\n\n[cwd=project root]")
 
 
 class AssertVisualParams(BaseModel):
@@ -1337,10 +1318,10 @@ class AssertVisualParams(BaseModel):
 
 @tool(
     "assert_visual",
-    "Record a visual assertion AFTER browse(screenshot). The screenshot pixels "
-    "were injected into context — describe what you actually see, then "
-    "verdict=pass|fail. Creates a visual_check attestation required for "
-    "ui_browser_e2e submit. File existence alone is not evidence.",
+    "Optional stamp: record a pixel-grounded UI assertion AFTER "
+    "browse(screenshot). Describe what you SEE, then verdict=pass|fail. "
+    "Creates a visual_check attestation if you want one — screenshots "
+    "already inject into chat, this is not a seeing ritual.",
     requires_workspace=True,
     security_level="standard",
 )

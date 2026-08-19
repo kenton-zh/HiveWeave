@@ -138,7 +138,9 @@ async def test_look_at_image_missing_vision_model(tmp_path: Path) -> None:
             workspace=str(tmp_path),
         )
     assert result.success is False
-    assert "多模态" in (result.error or "") or "vision" in (result.error or "").lower()
+    assert "no model" in (result.error or "").lower() or "optional" in (
+        result.error or ""
+    ).lower()
 
 
 @pytest.mark.asyncio
@@ -399,3 +401,101 @@ async def test_analyze_image_retries_on_429() -> None:
 
     assert text == "ok after retry"
     assert mock_client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_resolve_vision_model_falls_back_to_management() -> None:
+    from hiveweave.services.model import ModelService
+
+    svc = ModelService()
+    mgmt = {"id": "mgmt-1", "name": "muse-spark", "is_active": True}
+
+    async def _settings_get(self, key: str, *a, **k):
+        return ""
+
+    mock_resolve = AsyncMock(return_value=mgmt)
+    with (
+        patch(
+            "hiveweave.services.settings.SettingsService.get",
+            new=_settings_get,
+        ),
+        patch.object(svc, "resolve_model", new=mock_resolve),
+    ):
+        got = await svc.resolve_vision_model()
+    assert got is mgmt
+    # strict=True：management 档解析不出就返回 None，不落 emergency pool
+    # 把 executor 档模型冒充 management（审计 M2）。
+    assert mock_resolve.await_args.kwargs.get("strict") is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_vision_model_management_none_beats_pool() -> None:
+    """专用槽空 + management 严格解析为 None → 返回 None（不用任意池模型）。"""
+    from hiveweave.services.model import ModelService
+
+    svc = ModelService()
+
+    async def _settings_get(self, key: str, *a, **k):
+        return ""
+
+    mock_resolve = AsyncMock(return_value=None)
+    with (
+        patch(
+            "hiveweave.services.settings.SettingsService.get",
+            new=_settings_get,
+        ),
+        patch.object(svc, "resolve_model", new=mock_resolve),
+    ):
+        got = await svc.resolve_vision_model()
+    assert got is None
+    assert mock_resolve.await_args.kwargs.get("strict") is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_vision_model_dedicated_slot_wins() -> None:
+    from hiveweave.services.model import ModelService
+
+    svc = ModelService()
+    vision = {"id": "v1", "name": "vision-box", "is_active": True}
+    mgmt = {"id": "mgmt-1", "name": "muse-spark", "is_active": True}
+
+    async def _settings_get(self, key: str, *a, **k):
+        if key == "vision_model_primary":
+            return "v1"
+        return ""
+
+    async def _get(model_pk: str):
+        if model_pk == "v1":
+            return vision
+        return None
+
+    mock_resolve = AsyncMock(return_value=mgmt)
+    with (
+        patch(
+            "hiveweave.services.settings.SettingsService.get",
+            new=_settings_get,
+        ),
+        patch.object(svc, "get", new=_get),
+        patch.object(svc, "resolve_model", new=mock_resolve),
+    ):
+        got = await svc.resolve_vision_model()
+    assert got is vision
+    mock_resolve.assert_not_awaited()
+
+
+def test_ui_submit_gate_does_not_require_assert_visual_ritual() -> None:
+    from hiveweave.services.attestation import (
+        BROWSE_E2E_KIND,
+        CODE_AUDIT_KIND,
+        POLICY_REQUIRED_KINDS,
+        VISUAL_CHECK_KIND,
+    )
+
+    ui = POLICY_REQUIRED_KINDS["ui_browser_e2e"]
+    vis = POLICY_REQUIRED_KINDS["code_audit_visual"]
+    assert ui is not None and vis is not None
+    assert VISUAL_CHECK_KIND not in ui
+    assert BROWSE_E2E_KIND in ui
+    assert VISUAL_CHECK_KIND not in vis
+    assert CODE_AUDIT_KIND in vis
+    assert BROWSE_E2E_KIND in vis

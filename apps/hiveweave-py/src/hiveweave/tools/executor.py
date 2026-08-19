@@ -121,13 +121,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "goto URL → snapshot -i → click @eN → screenshot. "
             "goto always resets viewport to 1280×900. Mobile: "
             "viewport 390 844 AFTER goto, then screenshot. "
-            "After screenshot, copy the relative path from the tool receipt "
-            "into assert_visual. Do not assume screenshot.png at repo root "
-            "or agent-browser/tmp. "
-            "Evidence roles (QA / executor visual gate) then assert_visual; "
+            "After screenshot, pixels inject into the next turn. "
+            "Do not assume screenshot.png at repo root or agent-browser/tmp. "
             "CEO looking at the product does not stamp. "
-            "Screenshot pixels inject into the next turn; a PNG path is not "
-            "UI evidence. Prefer after start_dev_server / lookup_dev_server. "
             "Stays in YOUR workspace. Milestone VERIFY / full-site MAIN QA "
             "(and CEO looking at MAIN): use browse_main."
         ),
@@ -157,10 +153,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "assert_visual": {
         "description": (
-            "Record a pixel-grounded UI assertion AFTER browse(screenshot). "
-            "Describe what you SEE in the injected image (labels, layout, errors), "
-            "then verdict=pass|fail. Creates visual_check attestation required for "
-            "ui_browser_e2e submit. Path-only / 'looks fine' is rejected."
+            "Optional stamp: record a pixel-grounded UI assertion AFTER "
+            "browse(screenshot). Creates a visual_check row if you want one — "
+            "screenshots already inject into chat, this is not a seeing ritual."
         ),
         "properties": {
             "screenshotPath": {
@@ -194,11 +189,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "look_at_image": {
         "description": (
-            "Ask the configured vision model about a workspace image. "
-            "One-shot text answer; does not inject pixels into chat. "
-            "To inspect another agent's screenshot, pass attestation_id "
-            "from their browse_e2e / visual_check row instead of a path "
-            "under your own worktree."
+            "Optional one-shot: ask a vision-capable model about a workspace "
+            "image (dedicated vision slot, else management chat model). "
+            "Does not replace screenshots already in chat. "
+            "To inspect another agent's PNG, pass attestation_id."
         ),
         "properties": {
             "image_path": {
@@ -322,7 +316,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "filePath": {
                 "type": "string",
                 "aliases": ["path", "file_path", "file"],
-                "description": "Path to read (relative to workspace).",
+                "description": (
+                    "Path to read (relative to your workspace). Reviewers: "
+                    ".hiveweave/worktrees/<shortId>/… is the assignee tree. "
+                    "Do not use ../ for MAIN docs."
+                ),
             },
             "offset": {"type": "integer", "aliases": ["startLine"],
                 "description": "Starting line number (0-based, default: 0)."},
@@ -357,7 +355,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "grep; for a filename glob use search_files."
         ),
         "properties": {
-            "dirPath": {"type": "string", "aliases": ["path", "directory", "dir"]},
+            "dirPath": {
+                "type": "string",
+                "aliases": ["path", "directory", "dir"],
+                "description": (
+                    "Directory to list (relative to your workspace). "
+                    "Reviewers: .hiveweave/worktrees/<shortId>/. "
+                    "Do not use ../ for MAIN."
+                ),
+            },
             "recursive": {"type": "boolean", "description": "If true, list recursively. Default: false."},
             "maxdepth": {"type": "integer", "description": "Max depth when recursive (1-3). Default: 1. Values above 3 are clamped to 3."},
         },
@@ -371,7 +377,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         ),
         "properties": {
             "pattern": {"type": "string", "aliases": ["regex", "query", "search"]},
-            "path": {"type": "string", "aliases": ["filePath", "file", "directory", "dir"]},
+            "path": {
+                "type": "string",
+                "aliases": ["filePath", "file", "directory", "dir"],
+                "description": (
+                    "Directory or file to search (relative to your workspace). "
+                    "Reviewers: .hiveweave/worktrees/<shortId>/."
+                ),
+            },
             "include": {"type": "string", "aliases": ["glob", "filter"]},
             "head_limit": {"type": "integer", "aliases": ["headLimit", "maxResults", "limit"],
                 "description": "Max results to return (default: 500)."},
@@ -1381,7 +1394,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Review a submitted task: decision=approve|rework. approve needs "
             "fresh attestation kinds for this task's submitGate/policy — not "
             "bare testsPassed. Prefer consuming the assignee's hung evidence "
-            "(unit→test_run, module_visual→browse/visual, docs→doc_review, "
+            "(unit→test_run, module_visual→browse_e2e, docs→doc_review, "
             "code_audit*→code_audit). CEO: review-only, do not self-test or "
             "merge leaf trees. Mid-level: merge after approve; do NOT expect "
             "per-leaf VERIFY spawn. Milestone QA is dispatch_task("
@@ -1687,9 +1700,7 @@ TOOL_PARAM_SCHEMAS["browse_main"] = {
         "Same as browse, but Chromium cwd is the PROJECT ROOT. QA: "
         "milestone VERIFY / full-site MAIN. CEO: look at the product "
         "(not a test duty). Module visual in your slice stays on browse. "
-        "After screenshot, copy the relative path from the tool receipt "
-        "into assert_visual. Do not assume screenshot.png at repo root "
-        "or agent-browser/tmp."
+        "After screenshot, pixels inject into chat."
     ),
 }
 TOOL_PARAM_SCHEMAS["game_run_case_main"] = {

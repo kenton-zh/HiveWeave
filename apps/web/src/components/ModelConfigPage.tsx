@@ -635,7 +635,7 @@ export default function ModelConfigPage({ onClose }: Props) {
               </button>
             </div>
             <p className="text-[13px] text-g-fg-3 mb-4 leading-relaxed">
-              管理层（CEO / Coordinator）与执行层（Executor / QA / HR）各自指定主用与备用模型。主用模型故障（429 / 5xx）时自动切换到备用。多模态模型专供「帮你看图片」；识图主用失败时自动切备用（同 API Key 跳过）。生图请用下方独立「生图模型设置」面板。
+              管理层与执行层各自指定主用与备用。主用故障（429 / 5xx）时切备用。截图会注入主对话，多模态模型自己读图；「帮你看图片」是可选辅助（空则用管理层主用）。生图用下方独立面板。
             </p>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
@@ -706,7 +706,7 @@ export default function ModelConfigPage({ onClose }: Props) {
                 <div className="flex items-center gap-2 mb-4">
                   <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
                   <span className="text-sm font-semibold text-g-fg">多模态模型配置</span>
-                  <span className="text-[11px] text-g-fg-4">帮你看图片</span>
+                  <span className="text-[11px] text-g-fg-4">可选 · 帮你看图片</span>
                 </div>
                 <div className="space-y-4">
                   <div>

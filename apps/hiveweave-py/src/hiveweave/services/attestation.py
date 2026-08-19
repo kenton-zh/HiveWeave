@@ -1240,15 +1240,15 @@ def resolve_task_policy(
 POLICY_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
     # Document VERIFY/spec tasks: machine-checkable file presence + hash
     "docs_only": frozenset({DOC_REVIEW_KIND}),
-    # UI: live browse evidence AND pixel-grounded assert_visual (AND).
-    # Path-only PNG or prose-without-browse is rejected.
-    "ui_browser_e2e": frozenset({VISUAL_CHECK_KIND, BROWSE_E2E_KIND}),
+    # UI: live browse evidence. Screenshots inject into chat; visual_check /
+    # assert_visual is optional stamp, not a seeing ritual.
+    "ui_browser_e2e": frozenset({BROWSE_E2E_KIND}),
     # unit submitGate: leaf must hang a passing test_run (not mid-level 取证)
     "generic_tests": frozenset({"test_run"}),
     "coordinator_review": None,
     "code_audit": frozenset({CODE_AUDIT_KIND}),
     "code_audit_visual": frozenset(
-        {CODE_AUDIT_KIND, VISUAL_CHECK_KIND, BROWSE_E2E_KIND}
+        {CODE_AUDIT_KIND, BROWSE_E2E_KIND}
     ),
     "code_audit_unit": frozenset({CODE_AUDIT_KIND, "test_run"}),
 }
@@ -1296,8 +1296,8 @@ REVIEWER_KIND = "test_run"
 
 REVIEWER_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
     # UI: reviewer (or consume agent) unlocks with ANY one of these —
-    # find_reviewer_attestation is OR. Submit-side POLICY_REQUIRED_KINDS
-    # stays AND (visual_check + browse_e2e).
+    # find_reviewer_attestation is OR. Submit-side requires browse_e2e
+    # (they drove the browser); visual_check is optional extra.
     # CEO look-only browse does not stamp browse_e2e. Approve stays
     # consume-only because review.py sets reviewer_must_hold from TEST_RUN
     # (CEO has none) — belt if a stamp row still exists.

@@ -47,7 +47,7 @@ class ReviewTaskParams(BaseModel):
     "review_task",
     "Review a submitted task (reviewing -> approved/rework). If task is 'submitted', starts review automatically. "
     "approve requires FRESH evidence kinds for this task's submitGate/policy — not bare testsPassed. "
-    "Prefer consuming the assignee's hung attestations (unit→test_run, module_visual→browse/visual, "
+    "Prefer consuming the assignee's hung attestations (unit→test_run, module_visual→browse_e2e, "
     "docs→doc_review, code_audit*→code_audit). CEO: review-only — do not bash/self-test or merge leaf trees. "
     "If approve is rejected for missing evidence, do NOT retry approve — rework or wait for the gate. "
     "Does NOT spawn VERIFY. After a milestone is on MAIN, dispatch_task(..., milestoneVerify=true) "
@@ -453,7 +453,7 @@ async def review_task_tool(
                         f"taskId={tid}. Options:\n"
                         f"1) Consume the assignee's hung attestations; if missing, "
                         f"review_task(rework) and tell the leaf to produce the gate "
-                        f"kinds (unit→bash taskId, module_visual→browse/assert_visual, "
+                        f"kinds (unit→bash taskId, module_visual→browse screenshot, "
                         f"code_audit→request_code_audit).\n"
                         f"2) waive_attestation(taskId=\"{tid}\", "
                         f"evidenceAttestationId=\"<id>\", "

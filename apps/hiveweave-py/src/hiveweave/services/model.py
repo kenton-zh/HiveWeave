@@ -358,6 +358,8 @@ class ModelService:
         tier: str,
         preferred: str | None = None,
         skip_model_ids: set[str] | None = None,
+        *,
+        strict: bool = False,
     ) -> dict | None:
         """Resolve model config by tier: primary → backup (strict, no cross-tier).
 
@@ -371,6 +373,9 @@ class ModelService:
         skip_model_ids: DB 主键(UUID)集合，用于 failover 时排除失败的主用模型。
             仅按主键匹配——主备模型可共用同一 model_id（靠编号/记录区分），
             若按 model_id 匹配会误伤备用模型。
+        strict: True 时跳过第 4 步及 emergency pool 兜底——tier 完全
+            解析不出就返回 None，绝不把其他档位的模型冒充本档。适合
+            「辅助能力回退」场景（如 vision 回退 management），避免语义失真。
         """
         skip = skip_model_ids or set()
 
@@ -421,14 +426,14 @@ class ModelService:
 
         # Last resort: if no tier data exists at all, fall back to pool
         # (backward compat for deployments that haven't configured tiers)
-        if not primary_id and not backup_id:
+        if not primary_id and not backup_id and not strict:
             has_any_tier = any(m.get("tier") for m in active)
             if not has_any_tier:
                 log.debug("model_resolve_no_tier_configured", tier=tier)
                 return await self.pick_from_pool(preferred)
 
         # Configured models all unresolvable — try pool as emergency fallback
-        if active:
+        if active and not strict:
             for m in active:
                 if not _skipped(m):
                     log.warning(
@@ -444,10 +449,15 @@ class ModelService:
         self,
         skip_model_ids: set[str] | None = None,
     ) -> dict | None:
-        """Resolve the multimodal model for look_at_image.
+        """Resolve the model for the optional look_at_image helper.
 
-        Keys: ``vision_model_primary`` / ``vision_model_backup`` in global_settings.
-        Strict primary → backup; no fallthrough to management/executor tiers.
+        Dedicated Settings slots first (``vision_model_primary`` /
+        ``vision_model_backup``). If those are empty or stale, fall through
+        to the management chat model the operator already configured —
+        look_at_image is auxiliary, not a second required panel.
+        Management fallback is strict (no pool): if the management tier
+        itself cannot be resolved, return None instead of passing off an
+        arbitrary executor-tier model as "management".
         """
         from hiveweave.services.settings import SettingsService
 
@@ -468,6 +478,17 @@ class ModelService:
                         skipped_primary=primary,
                     )
                 return model
+
+        mgmt = await self.resolve_model(
+            "management", skip_model_ids=skip, strict=True
+        )
+        if mgmt:
+            log.info(
+                "vision_model_resolve_management_fallback",
+                model=mgmt.get("name"),
+                model_id=mgmt.get("id"),
+            )
+            return mgmt
         return None
 
     async def resolve_image_gen_model(

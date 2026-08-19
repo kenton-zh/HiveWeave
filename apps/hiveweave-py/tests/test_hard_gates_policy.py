@@ -284,10 +284,11 @@ def test_look_only_screenshot_followup_does_not_nudge_assert():
 
     look = screenshot_followup_text("/tmp/x.png", look_only=True)
     assert "Then call" not in look
-    assert "look_at_image" in look
-    assert "Do not call assert_visual" in look
+    assert "assert_visual(" not in look
+    assert "look_at_image" not in look
     stamp = screenshot_followup_text("/tmp/x.png", look_only=False)
-    assert "assert_visual(" in stamp
+    assert "assert_visual(" not in stamp
+    assert "pixels attached" in stamp.lower() or "像素" in stamp
 
 
 @pytest.mark.asyncio

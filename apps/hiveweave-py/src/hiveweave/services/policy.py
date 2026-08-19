@@ -329,8 +329,7 @@ def tool_hard_deny(agent: dict[str, Any], tool_name: str) -> str | None:
         family = infer_role_family(agent)
         return (
             f"Hard capability deny: '{tool_name}' stamps test evidence; "
-            f"role_family={family} may browse to look, not to attest. "
-            "Inspect QA screenshots with look_at_image."
+            f"role_family={family} may browse to look, not to attest."
         )
     return None
 

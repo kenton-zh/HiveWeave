@@ -43,9 +43,8 @@ log = structlog.get_logger(__name__)
 def _strip_images_for_retry(messages: list[dict]) -> list[dict]:
     """降级重试用：去掉所有消息里的图片像素，正文追加缺图说明。
 
-    只改请求副本，不落持久化历史。预留 _IMAGES_OMITTED_NOTE 给模型指引
-    （文件路径去哪找、视觉判断走 look_at_image），替换 provider 内部
-    supports_images=False 时的同款文案。
+    只改请求副本，不落持久化历史。缺图说明只陈述「图未发出去」，
+    不指挥用哪个工具。
     """
     out: list[dict] = []
     for m in messages:

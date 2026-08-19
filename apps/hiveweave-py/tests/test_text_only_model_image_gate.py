@@ -3,7 +3,7 @@
 背景：截图无条件注入主对话模型，text-only 模型网关 400
 「Model only support text input」→ 连续 LLM 错误 → agent 死亡螺旋。
 修复：build_body 链路透传 supports_images，False 时剥离全部图像，
-改写为 _IMAGES_OMITTED_NOTE 文字指引（走 look_at_image / 如实 blocked）。
+改写为 _IMAGES_OMITTED_NOTE 事实说明（400 文案匹配是猜，不点名工具）。
 2026-08 演进：不再依赖人工勾选 supports_images —— 默认 auto「放行」，
 由模型/网关在 400 时自行「判定」，streamer 标记负缓存并剥图重试一次；
 显式 supports_images 仍可手工覆盖。
@@ -16,6 +16,7 @@ import pytest
 from hiveweave.llm import provider as prov_mod
 from hiveweave.llm.provider import (
     _IMAGES_OMITTED_NOTE,
+    _looks_like_image_unsupported_error,
     AnthropicHandler,
     GoogleHandler,
     OpenAIHandler,
@@ -53,7 +54,7 @@ def test_openai_text_only_tool_images_become_note():
     note = out[-1]["content"]
     assert isinstance(note, str)
     assert "不支持图像" in note
-    assert "look_at_image" in note
+    assert "look_at_image" not in note
     # 无任何图像 part 泄漏进请求
     assert not any(
         isinstance(p, dict) and p.get("type") == "image_url"
@@ -246,7 +247,46 @@ def test_provider_config_body_strips_images_when_text_only():
     )
 
 
-def test_note_text_guides_to_look_at_image():
+def test_note_text_is_factual_not_prescriptive():
     note = _IMAGES_OMITTED_NOTE.format(n=2)
     assert "2" in note
-    assert "look_at_image" in note
+    assert "look_at_image" not in note
+    assert "assert_visual" not in note
+    assert "未注入" in note
+
+
+def test_image_unsupported_detector_capability_not_payload():
+    """Strip/cache only on capability denial — not payload or random 400s."""
+    assert _looks_like_image_unsupported_error(
+        "Model only support text input"
+    )
+    assert _looks_like_image_unsupported_error(
+        "this model does not support images"
+    )
+    assert _looks_like_image_unsupported_error(
+        "This model is not a multimodal model"
+    )
+    assert not _looks_like_image_unsupported_error(
+        "Invalid image_url: expected a data URL or https"
+    )
+    assert not _looks_like_image_unsupported_error(
+        "image is too large; max 4MB"
+    )
+    assert not _looks_like_image_unsupported_error(
+        "Please respond with text only"
+    )
+    assert not _looks_like_image_unsupported_error(
+        "does not support image/webp"
+    )
+    assert not _looks_like_image_unsupported_error(
+        "invalid_request_error: missing required parameter"
+    )
+    assert not _looks_like_image_unsupported_error(
+        "This endpoint only support text and image_url"
+    )
+    assert not _looks_like_image_unsupported_error(
+        "webp images are not supported"
+    )
+    assert not _looks_like_image_unsupported_error(
+        "cannot process images: decoded payload is truncated"
+    )

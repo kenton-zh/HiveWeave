@@ -175,13 +175,11 @@ class FormatHandler(ABC):
 # supports_images=False（text-only 模型）时替换图像注入的说明文案。
 # 背景（TEST_YLGY 潮汐事故）：截图无条件注入主对话模型，模型只支持文本时
 # 网关 400「Model only support text input」→ 连续 LLM 错误 → agent 死亡螺旋。
-# 改为文字指引：截图没注入、文件路径去哪找、视觉判断走 look_at_image。
+# 网关没有结构化「不支持图像」字段，文案匹配仍是猜 —— 剥图防死亡螺旋，
+# 不点名 look_at_image / assert_visual，用哪个工具由模型自己判断。
 _IMAGES_OMITTED_NOTE = (
     "[平台提示] 本回合有 {n} 张截图未注入：当前对话模型不支持图像输入"
-    "（模型实际拒绝了图像请求，已自动降级，仅发文字）。截图文件路径见"
-    "相关工具结果文本；如需视觉判断请改用 look_at_image 工具"
-    "（需先在 Settings 配置 vision 模型），"
-    "在未实际看到图像前不得声称视觉验证通过。"
+    "（已自动降级，仅发文字）。截图文件路径仍在相关工具结果文本里。"
 )
 
 # ── 图像能力负缓存（让模型自己决定）────────────────────────────
@@ -212,29 +210,32 @@ def _norm_image_key(base_url: str) -> str:
     return base_url.strip().rstrip("/")
 
 
-def _looks_like_image_unsupported_error(text: str) -> bool:
-    """判定 400 错误文本是否确为「图像不支持」类（非任意 400）。
+# 能力拒绝（模型不能读图），不是载荷错误（坏 base64 / 超大图 / 非法 image_url）。
+# 宁漏剥、不把多模态模型打成纯文本。无结构化字段，这仍是高精短语匹配。
+_IMAGE_CAPABILITY_DENIAL_PHRASES: tuple[str, ...] = (
+    "only support text input",
+    "only supports text input",
+    "supports text only",
+    "support text input only",
+    "text-only model",
+    "text only model",
+    "does not support images",
+    "doesn't support images",
+    "does not support image input",
+    "doesn't support image input",
+    "image input is not supported",
+    "does not support vision",
+    "doesn't support vision",
+    "not a multimodal",
+    "not multimodal",
+    "no image support",
+)
 
-    用词组而非裸单词（"image"太泛），避免把无关 400 误判成降级。
-    """
+
+def _looks_like_image_unsupported_error(text: str) -> bool:
+    """True only for capability-denial 400 copy, not arbitrary image errors."""
     low = (text or "").lower()
-    markers = (
-        "does not support images",
-        "does not support image",
-        "images are not supported",
-        "image is not supported",
-        "image not supported",
-        "supports text only",
-        "text only",
-        "only support text",
-        "cannot process images",
-        "not a multimodal",
-        "image_url",
-        "images is not",
-        "does not support vision",
-        "no multimodal",
-    )
-    return any(m in low for m in markers)
+    return any(p in low for p in _IMAGE_CAPABILITY_DENIAL_PHRASES)
 
 
 # ── OpenAI Chat Handler ────────────────────────────────────────
@@ -418,12 +419,7 @@ class OpenAIHandler(FormatHandler):
                 "content": [
                     {
                         "type": "text",
-                        "text": (
-                            "[Screenshot pixels attached — inspect the "
-                            "image. Evidence roles: assert_visual before "
-                            "claiming a UI pass. Looking-only (CEO): do "
-                            "not stamp; use look_at_image on QA evidence.]"
-                        ),
+                        "text": "[Screenshot pixels attached.]",
                     },
                     *img_parts,
                 ],

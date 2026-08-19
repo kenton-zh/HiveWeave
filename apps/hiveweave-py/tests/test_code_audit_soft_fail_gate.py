@@ -16,7 +16,7 @@ def setup_function(_fn=None):
     reset_ledger("agent-other")
 
 
-def test_llm_failed_drops_code_audit_keeps_visual():
+def test_llm_failed_drops_code_audit_keeps_browse_e2e():
     record_audit_attempt("agent-soft", "llm_failed", "19fb6fb9-183e-460c-9397")
     needed = POLICY_REQUIRED_KINDS["code_audit_visual"]
     out, dropped = kinds_after_code_audit_soft_fail(
@@ -24,7 +24,7 @@ def test_llm_failed_drops_code_audit_keeps_visual():
     )
     assert dropped is True
     assert CODE_AUDIT_KIND not in (out or frozenset())
-    assert "visual_check" in (out or frozenset())
+    assert "visual_check" not in (out or frozenset())
     assert "browse_e2e" in (out or frozenset())
 
 
@@ -79,4 +79,5 @@ def test_evidence_stamp_survives_ledger_reset():
     )
     assert dropped is True
     assert CODE_AUDIT_KIND not in (out or frozenset())
-    assert "visual_check" in (out or frozenset())
+    assert "browse_e2e" in (out or frozenset())
+    assert "visual_check" not in (out or frozenset())
