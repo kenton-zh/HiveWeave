@@ -12,6 +12,7 @@ import asyncio
 import base64
 import os
 import shlex
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -595,82 +596,6 @@ def _browse_child_env(agent_id: str | None = None) -> dict[str, str]:
     return env
 
 
-async def _drain_pipe(stream: Any, buf: bytearray) -> None:
-    """Read chunks from a subprocess pipe until EOF or cancellation."""
-    try:
-        while True:
-            chunk = await stream.read(65536)
-            if not chunk:
-                return
-            buf.extend(chunk)
-    except asyncio.CancelledError:
-        raise
-    except (OSError, ValueError):
-        pass
-
-
-async def _run_and_drain(
-    proc: asyncio.subprocess.Process,
-    stdin_payload: str | None,
-    timeout: int,
-) -> tuple[int, bytes, bytes]:
-    """Wait for CLI exit, then grace-drain buffered stdout/stderr.
-
-    agent-browser's daemon inherits the CLI's stdout/stderr pipe handles and
-    stays alive after the CLI exits, so EOF never arrives — waiting for EOF
-    (``communicate``) hangs until the outer timeout. Instead: wait for the
-    CLI process to exit, then drain whatever the daemon-hold pipe still
-    buffers (bounded by a short grace period). The outer timeout still
-    guards genuinely hung commands.
-    """
-    out, err = bytearray(), bytearray()
-    rt = asyncio.create_task(_drain_pipe(proc.stdout, out))
-    rt_err = asyncio.create_task(_drain_pipe(proc.stderr, err))
-
-    if stdin_payload is not None and proc.stdin is not None:
-        try:
-            proc.stdin.write(stdin_payload.encode("utf-8"))
-            await asyncio.wait_for(proc.stdin.drain(), timeout=10)
-        except (BrokenPipeError, OSError, ValueError):
-            pass
-        except asyncio.TimeoutError:
-            pass
-        try:
-            proc.stdin.close()
-        except (OSError, ValueError):
-            pass
-
-    try:
-        try:
-            rc = await asyncio.wait_for(proc.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            return -1, b"", b""
-
-        # CLI exited; drain the tail concurrently (daemon may keep the pipes
-        # open forever) under a single 2s grace cap.
-        try:
-            await asyncio.wait_for(asyncio.gather(rt, rt_err), timeout=2.0)
-        except asyncio.TimeoutError:
-            pass
-        return rc, bytes(out), bytes(err)
-    finally:
-        # Cleanup also on outer-task cancellation: kill a still-running CLI
-        # and cancel any drain tasks still blocked on the daemon-held pipes.
-        if proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        for t in (rt, rt_err):
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(rt, rt_err, return_exceptions=True)
-
-
 async def browse_exec(
     argv: list[str],
     workspace: str,
@@ -734,29 +659,71 @@ async def browse_exec(
     cwd = workspace if workspace and Path(workspace).is_dir() else None
     from hiveweave.util.win_subprocess import windows_no_window_kwargs
 
+    # 用临时文件重定向替代 asyncio PIPE（agent-browser Windows 已知缺陷，
+    # issue #1407/#1308：CLI spawn daemon 用 bInheritHandles=TRUE，daemon 继承
+    # stdout/stderr 管道写端 → 捕获输出的调用方永远等不到 all-writers-closed，
+    # 首条命令必挂到超时）。改文件重定向后 daemon 继承的是文件句柄，无管道
+    # EOF 语义，CLI 退出即可读回输出，从根上消除 Windows 首命令卡死。
+    stdout_f = tempfile.TemporaryFile(mode="w+b")
+    stderr_f = tempfile.TemporaryFile(mode="w+b")
+    stdin_f = None
     try:
+        if stdin_payload is not None:
+            stdin_f = tempfile.TemporaryFile(mode="w+b")
+            try:
+                stdin_f.write(stdin_payload.encode("utf-8"))
+                stdin_f.flush()
+                stdin_f.seek(0)
+            except (OSError, ValueError):
+                try:
+                    stdin_f.close()
+                except (OSError, ValueError):
+                    pass
+                stdin_f = None
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE if stdin_payload is not None else None,
+            stdout=stdout_f,
+            stderr=stderr_f,
+            stdin=stdin_f if stdin_f is not None else asyncio.subprocess.DEVNULL,
             cwd=cwd,
             env=_browse_child_env(agent_id),
             **windows_no_window_kwargs(),
         )
-    except OSError:
-        raise
-
-    rc, stdout_b, stderr_b = await _run_and_drain(proc, stdin_payload, timeout)
-    if rc == -1:
-        return -1, "", (
-            f"browse timed out after {timeout}s: {' '.join(argv)}. "
-            f"{BROWSE_RESTART_HINT}"
+        try:
+            rc = await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            # reap 防僵尸；daemon 可能仍持临时文件句柄（Windows 固有代价）。
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            return -1, "", (
+                f"browse timed out after {timeout}s: {' '.join(argv)}. "
+                f"{BROWSE_RESTART_HINT}"
+            )
+        # CLI 已退出（输出已落盘）。按 TOOL_OUTPUT_MAX_BYTES 封顶读取，
+        # 防大输出（console/network/长 eval）一次性打爆内存；返回文本
+        # 本就另有短契约截断。
+        stdout_f.seek(0)
+        stderr_f.seek(0)
+        stdout_b = stdout_f.read(TOOL_OUTPUT_MAX_BYTES + 1)
+        stderr_b = stderr_f.read(TOOL_OUTPUT_MAX_BYTES + 1)
+        return (
+            rc,
+            stdout_b.decode("utf-8", errors="replace").strip(),
+            stderr_b.decode("utf-8", errors="replace").strip(),
         )
-
-    stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
-    stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
-    return rc, stdout, stderr
+    finally:
+        for _f in (stdout_f, stderr_f, stdin_f):
+            if _f is not None:
+                try:
+                    _f.close()
+                except (OSError, ValueError):
+                    pass
 
 
 async def _hard_recycle_browser() -> str:

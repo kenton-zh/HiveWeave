@@ -71,14 +71,16 @@ async def test_restart_does_not_spawn_cli(browse_fake_proc, tmp_path, monkeypatc
 async def test_timeout_recycles_session_and_mentions_fresh(
     browse_fake_proc, tmp_path, monkeypatch
 ):
-    async def fake_drain(*_a, **_k):
-        return -1, b"", b""
+    # 模拟超时结果：browse_exec 返回 -1（真实超时由内部 proc.wait 兜底，
+    # 见 test_browse_exec_timeout_appends_restart_hint）。
+    async def fake_timeout(*_a, **_k):
+        return -1, "", "browse timed out"
 
     async def fake_recycle():
         return "hard-recycled"
 
     monkeypatch.setattr(
-        "hiveweave.tools.browse_tools._run_and_drain", fake_drain
+        "hiveweave.tools.browse_tools.browse_exec", fake_timeout
     )
     monkeypatch.setattr(
         "hiveweave.tools.browse_tools._hard_recycle_browser", fake_recycle
@@ -103,8 +105,8 @@ async def test_wait_timeout_keeps_plain_restart_hint(
     """`wait` is intentionally long-lived; a wait timeout must not hard-recycle
     the session (would tear down a healthy browser on a legit slow wait)."""
 
-    async def fake_drain(*_a, **_k):
-        return -1, b"", b""
+    async def fake_timeout(*_a, **_k):
+        return -1, "", "browse timed out"
 
     recycled = []
 
@@ -113,7 +115,7 @@ async def test_wait_timeout_keeps_plain_restart_hint(
         return "hard-recycled"
 
     monkeypatch.setattr(
-        "hiveweave.tools.browse_tools._run_and_drain", fake_drain
+        "hiveweave.tools.browse_tools.browse_exec", fake_timeout
     )
     monkeypatch.setattr(
         "hiveweave.tools.browse_tools._hard_recycle_browser", fake_recycle
@@ -135,15 +137,13 @@ async def test_wait_timeout_keeps_plain_restart_hint(
 async def test_browse_exec_timeout_appends_restart_hint(
     browse_fake_proc, tmp_path, monkeypatch
 ):
-    async def fake_drain(*_a, **_k):
-        return -1, b"", b""
-
-    monkeypatch.setattr(
-        "hiveweave.tools.browse_tools._run_and_drain", fake_drain
-    )
-    with browse_fake_proc:
+    # 不再依赖 _run_and_drain：用 wait_sleep 超过程序 timeout 触发真实
+    # 内部超时路径（临时文件重定向替代 PIPE 后，超时由 proc.wait 兜底）。
+    # 用 `goto`（→open，不在 30s floor 名单）以便短线 timeout 生效。
+    with browse_fake_proc as ctx:
+        ctx.wait_sleep = 6.0
         rc, _out, err = await browse_exec(
-            ["eval", "1+1"], str(tmp_path), timeout_sec=5, agent_id="agent-1"
+            ["goto", "about:blank"], str(tmp_path), timeout_sec=5, agent_id="agent-1"
         )
     assert rc == -1
     assert "timed out" in err

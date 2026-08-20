@@ -329,7 +329,9 @@ def test_map_ab_argv_huge_js_uses_stdin_payload():
 
 
 def test_browse_exec_forwards_stdin_payload(browse_fake_proc, tmp_path):
-    """browse_exec must pipe the huge snippet to the child via stdin=PIPE."""
+    """browse_exec must forward the huge snippet to the child via a temp file
+    (文件重定向替代 asyncio PIPE：避免 agent-browser 首次 spawn daemon 时
+    继承 PIPE 写端导致卡死；stdin 不再走管道，而写入临时文件再传给子进程)."""
     import asyncio
 
     from hiveweave.tools.browse_tools import browse_exec
@@ -342,6 +344,6 @@ def test_browse_exec_forwards_stdin_payload(browse_fake_proc, tmp_path):
         )
 
     assert code == 0
-    assert ctx.stdin_is_pipe
-    # The fake child's stdin received the exact huge payload.
-    assert ctx.stdin_written == payload.encode("utf-8")
+    # stdin 用临时文件承载，而非 asyncio PIPE。
+    assert ctx.stdin_is_pipe is False
+    assert ctx.stdin_arg is not None and hasattr(ctx.stdin_arg, "read")
