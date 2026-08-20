@@ -20,6 +20,8 @@ import pytest
 from hiveweave.services.skill_registry import (
     SKILLHUB_SOURCE_LABEL,
     SKILLS_SH_MAX_RESULTS,
+    STORE_SKILLS_SH_DETAIL,
+    STORE_SKILLS_SH_SEARCH,
     SkillRegistryService,
     _filter_skill_slugs,
     _skill_md_requires_api_key,
@@ -108,9 +110,9 @@ async def test_resolve_none_when_both_unavailable(monkeypatch):
     assert label == ""
 
 
-# ── 双商店 slug 命名空间冲突：全路径 slug 短名二次 fallback ──
-# 根因（「搜得到却绑不上」现场）：sitemap 缓存存全路径 owner/repo/skill，
-# skills.sh 实时 fetch 抖动时降级 SkillHub，而 SkillHub 只认短名。
+# ── 双商店 slug 身份：owner/repo/skill 只属 skills.sh ──────────
+# 旧契约把全路径剥成短名丢给 SkillHub，TEST_DSH_07 现场：405 + 404，
+# 而 https://www.skills.sh/{owner}/{repo}/{skill} 当时是 200。
 
 
 def _recording_fetch(result_by_slug: dict):
@@ -125,21 +127,22 @@ def _recording_fetch(result_by_slug: dict):
 
 
 @pytest.mark.asyncio
-async def test_resolve_full_path_short_name_fallback_to_skillhub(monkeypatch):
-    """核心回归：skills.sh 全路径失败（抖动）→ 短名 fallback 命中 SkillHub。"""
+async def test_resolve_full_path_does_not_hit_skillhub(monkeypatch):
+    """skills.sh 全路径失败时不得拿同一字符串去撞 SkillHub。"""
     svc = SkillRegistryService()
     monkeypatch.setattr(svc, "_fetch_skills_sh_detail", _async(None))
-    hub, hub_calls = _recording_fetch({"async-python-patterns": _hub_detail("async-python-patterns")})
+    hub, hub_calls = _recording_fetch({
+        "async-python-patterns": _hub_detail("async-python-patterns"),
+        "wshobson/agents/async-python-patterns": _hub_detail("nested"),
+    })
     monkeypatch.setattr(svc, "_fetch_skillhub_detail", hub)
 
     detail, label = await svc._resolve_marketplace_skill(
         "wshobson/agents/async-python-patterns"
     )
-    assert detail is not None and detail["summary"] == "from skillhub"
-    assert label == SKILLHUB_SOURCE_LABEL
-    assert hub_calls == ["wshobson/agents/async-python-patterns", "async-python-patterns"], (
-        "全路径首查失败后必须用短名二次 fallback"
-    )
+    assert detail is None
+    assert label == ""
+    assert hub_calls == []
 
 
 @pytest.mark.asyncio
@@ -158,25 +161,28 @@ async def test_resolve_full_path_short_name_fallback_skips_slashless(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_resolve_full_path_keeps_short_name_hit_before_skillhub(monkeypatch):
-    """短名在 skills.sh 也可达时（技能名=唯一段），仍 skills.sh 优先。"""
+async def test_resolve_full_path_uses_exact_skills_sh_id(monkeypatch):
+    """全路径只按完整 id 打 skills.sh，不剥短名、不打 SkillHub。"""
     svc = SkillRegistryService()
     sh, sh_calls = _recording_fetch({
-        "frontend-design": _sh_detail("frontend-design"),
+        "anthropics/skills/frontend-design": _sh_detail("frontend-design"),
     })
     hub, hub_calls = _recording_fetch({})
     monkeypatch.setattr(svc, "_fetch_skills_sh_detail", sh)
     monkeypatch.setattr(svc, "_fetch_skillhub_detail", hub)
 
-    detail, label = await svc._resolve_marketplace_skill("anthropics/skills/frontend-design")
+    detail, label = await svc._resolve_marketplace_skill(
+        "anthropics/skills/frontend-design"
+    )
     assert detail is not None and detail["summary"] == "from skills.sh"
     assert label == "skills.sh Marketplace"
-    assert hub_calls == ["anthropics/skills/frontend-design"]
+    assert sh_calls == ["anthropics/skills/frontend-design"]
+    assert hub_calls == []
 
 
 @pytest.mark.asyncio
-async def test_hire_validation_accepts_full_path_via_short_name(monkeypatch):
-    """现场复刻：list 给全路径 #N，hire 时 skills.sh 抖动 → 不再 invalid。"""
+async def test_hire_validation_rejects_full_path_when_skills_sh_misses(monkeypatch):
+    """list 给全路径 #N，hire 时 skills.sh 详情失败 → invalid（不能伪造成 SkillHub 命中）。"""
     svc = SkillRegistryService()
     monkeypatch.setattr(svc, "_fetch_skills_sh_detail", _async(None))
     monkeypatch.setattr(
@@ -186,11 +192,11 @@ async def test_hire_validation_accepts_full_path_via_short_name(monkeypatch):
 
     assert await _hire_validation_accepts(
         svc, "wshobson/agents/async-python-patterns"
-    ) is True
+    ) is False
 
 
 @pytest.mark.asyncio
-async def test_read_skill_full_path_via_short_name(monkeypatch):
+async def test_read_skill_full_path_stays_on_skills_sh(monkeypatch):
     svc = SkillRegistryService()
     monkeypatch.setattr(svc, "_fetch_skills_sh_detail", _async(None))
     monkeypatch.setattr(
@@ -199,8 +205,8 @@ async def test_read_skill_full_path_via_short_name(monkeypatch):
     )
 
     text = await svc.read_skill("claude-office-skills/skills/monday.com-automation")
-    assert "hub body" in text
-    assert "not found" not in text
+    assert "hub body" not in text
+    assert "not found" in text.lower()
 
 
 # ── read_skill 运行时加载（绑定后必须能读到）─────────────────
@@ -540,8 +546,8 @@ def _builtin_lookup(builtin: set[str]):
     return lookup
 
 
-def test_hire_market_gate_rejects_all_builtin_when_market_seen():
-    """HR 搜索时见过市场技能却全绑内置 → 拒绝并提示。"""
+def test_hire_market_gate_allows_builtin_only_when_market_seen():
+    """市场可见时只绑内置纪律技能 → 放行（不再强制绑市场上列出来却可能绑不上的 slug）。"""
     from hiveweave.tools.org_tools import _hire_market_skill_gate
 
     seen = ["self-review", "anthropics/skills/webapp-testing", "anthropics/skills/frontend-design"]
@@ -550,9 +556,7 @@ def test_hire_market_gate_rejects_all_builtin_when_market_seen():
         seen_slugs=seen,
         builtin_lookup=_builtin_lookup({"self-review"}),
     )
-    assert err is not None
-    assert "marketplace" in err.lower()
-    assert "webapp-testing" in err
+    assert err is None
 
 
 def test_hire_market_gate_passes_when_market_skill_included():
@@ -910,14 +914,14 @@ async def test_skill_disk_cache_ttl_expiry(monkeypatch):
 # ── 绑定链路重构：resolve 缓存 + 商店不可达探测 + slug 候选 ──
 
 
-def test_slug_candidates_full_path_to_short_name():
-    """全路径 slug → 短名候选；无 '/' 只返回原值。"""
+def test_slug_candidates_does_not_invent_short_name():
+    """全路径保持原 id；无 '/' 只返回原值。不剥最后一段给另一家店。"""
     svc = SkillRegistryService()
     assert svc._slug_candidates("wshobson/agents/async-python-patterns") == [
-        "wshobson/agents/async-python-patterns", "async-python-patterns",
+        "wshobson/agents/async-python-patterns",
     ]
     assert svc._slug_candidates("frontend") == ["frontend"]
-    assert svc._slug_candidates("a/b/c") == ["a/b/c", "c"]
+    assert svc._slug_candidates("a/b/c") == ["a/b/c"]
 
 
 @pytest.mark.asyncio
@@ -952,16 +956,16 @@ async def test_store_unreachable_skips_network(monkeypatch):
     monkeypatch.setattr(svc, "_fetch_skills_sh_detail", fake_sh)
 
     # 手动标记 skills.sh 不可达
-    svc._store_mark_unreachable("skills.sh")
-    assert svc._store_is_unreachable("skills.sh") is True
+    svc._store_mark_unreachable(STORE_SKILLS_SH_DETAIL)
+    assert svc._store_is_unreachable(STORE_SKILLS_SH_DETAIL) is True
 
     detail, _label = await svc._resolve_marketplace_skill("some-slug")
     assert sh_calls["n"] == 0, "商店不可达缓存内不应发起请求"
     assert detail is None
 
     # TTL 过期后恢复探测
-    svc._store_unreachable["skills.sh"] = time.monotonic() - 120
-    assert svc._store_is_unreachable("skills.sh") is False
+    svc._store_unreachable[STORE_SKILLS_SH_DETAIL] = time.monotonic() - 120
+    assert svc._store_is_unreachable(STORE_SKILLS_SH_DETAIL) is False
 
 
 @pytest.mark.asyncio
@@ -1017,7 +1021,8 @@ async def test_fetch_detail_network_error_marks_store_unreachable(monkeypatch):
 
     svc = SkillRegistryService()
     assert await svc._fetch_skills_sh_detail("owner/repo/x") is None
-    assert svc._store_is_unreachable("skills.sh") is True
+    assert svc._store_is_unreachable(STORE_SKILLS_SH_DETAIL) is True
+    assert svc._store_is_unreachable(STORE_SKILLS_SH_SEARCH) is False
 
 
 @pytest.mark.asyncio
@@ -1033,7 +1038,7 @@ async def test_fetch_detail_http404_does_not_mark_store(monkeypatch):
     svc = SkillRegistryService()
     # _fetch_skills_sh_detail 读 .text；404 响应在 status 分支返回 None
     assert await svc._fetch_skills_sh_detail("owner/repo/not-here") is None
-    assert svc._store_is_unreachable("skills.sh") is False
+    assert svc._store_is_unreachable(STORE_SKILLS_SH_DETAIL) is False
 
 
 @pytest.mark.asyncio
@@ -1062,7 +1067,7 @@ async def test_search_skills_sh_api_empty_results_short_circuits(monkeypatch):
 async def test_search_skills_sh_skips_when_store_unreachable(monkeypatch):
     """商店不可达标记内：_search_skills_sh 直接返回 None（触发国内降级），不请求。"""
     svc = SkillRegistryService()
-    svc._store_mark_unreachable("skills.sh")
+    svc._store_mark_unreachable(STORE_SKILLS_SH_SEARCH)
 
     api_called = {"v": False}
 
@@ -1083,7 +1088,7 @@ def test_slug_candidates_empty_and_trailing_slash():
     assert svc._slug_candidates("") == []
     assert svc._slug_candidates("   ") == []
     assert svc._slug_candidates("owner/repo/skill/") == [
-        "owner/repo/skill", "skill",
+        "owner/repo/skill",
     ]
     assert svc._slug_candidates("/") == []
 
@@ -1210,7 +1215,8 @@ async def test_search_skills_sh_api_network_failure_short_circuits_rest(monkeypa
     out = await svc._search_skills_sh("frontend")
     assert out is None, "商店网络失败 → None → 触发国内降级"
     assert sitemap_called["v"] is False, "API 网络失败标记后不应再串行走 sitemap"
-    assert svc._store_is_unreachable("skills.sh") is True
+    assert svc._store_is_unreachable(STORE_SKILLS_SH_SEARCH) is True
+    assert svc._store_is_unreachable(STORE_SKILLS_SH_DETAIL) is False
 
 
 @pytest.mark.asyncio
@@ -1235,6 +1241,8 @@ async def test_search_skills_sh_api_http_error_still_falls_back(monkeypatch):
     out = await svc._search_skills_sh("threejs")
     assert out == [{"slug": "cloudai-x/threejs-skills/threejs-animation",
                     "summary": "threejs-animation — from cloudai-x/threejs-skills",
-                    "description": "", "displayName": "threejs-animation"}]
+                    "description": "", "displayName": "threejs-animation",
+                    "source": "skills.sh"}]
     assert sitemap_called["v"] is True, "非网络失败应继续 sitemap 兜底"
-    assert svc._store_is_unreachable("skills.sh") is False
+    assert svc._store_is_unreachable(STORE_SKILLS_SH_SEARCH) is False
+    assert svc._store_is_unreachable(STORE_SKILLS_SH_DETAIL) is False

@@ -69,7 +69,7 @@ def _task():
         "id": "task-1",
         "status": "running",
         "tags": [],
-        "policy_id": "generic_tests",  # 软策略：strict attestation 门跳过
+        "policy_id": "coordinator_review",  # 软策略：strict attestation 门跳过
         "title": "impl task",
         "description": "",
         "assignee_id": _AGENT,

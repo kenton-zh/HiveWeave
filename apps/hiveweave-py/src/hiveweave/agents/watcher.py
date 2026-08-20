@@ -57,7 +57,11 @@ async def inbox_watcher_loop(agent: Any) -> None:
                         from hiveweave.agents.trigger import wake_source_for_pending
 
                         peek = await agent._inbox.get_pending_messages(agent.id)
-                        src = wake_source_for_pending(peek)
+                        src = await wake_source_for_pending(
+                            peek,
+                            project_id=getattr(agent, "project_id", None),
+                            waiter_agent_id=agent.id,
+                        )
                         if src != "trigger":
                             latch_opts["source"] = src
                             if src == "task":

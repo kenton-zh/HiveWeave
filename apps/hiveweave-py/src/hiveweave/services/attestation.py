@@ -351,6 +351,121 @@ async def _task_ids_equal(project_id: str, a: str | None, b: str | None) -> bool
     return _norm_task_ref(a) == _norm_task_ref(b)
 
 
+class AmbiguousAttestationId(ValueError):
+    """Prefix lookup hit 2+ tool_attestations rows; do not guess."""
+
+
+def _git_dir_present(path: str) -> bool:
+    from pathlib import Path
+
+    git = Path(path) / ".git"
+    return git.exists()
+
+
+async def _agent_worktree_cwd(project_id: str, agent_id: str) -> str | None:
+    """Resolve the agent's current worktree (workspace_path, then GitWorktreeService)."""
+    if not agent_id:
+        return None
+    try:
+        agent = await meta_db.get_agent_by_id(agent_id)
+    except Exception:
+        agent = None
+    ws = str((agent or {}).get("workspace_path") or "").strip()
+    if ws and _git_dir_present(ws):
+        return ws
+    short = str((agent or {}).get("short_id") or "").strip()
+    try:
+        project_ws = await meta_db.get_project_workspace(project_id)
+    except Exception:
+        project_ws = None
+    if project_ws and short:
+        try:
+            from hiveweave.services.git_worktree import GitWorktreeService
+
+            path = GitWorktreeService().get_worktree_path(project_ws, short)
+            if path and _git_dir_present(path):
+                return path
+        except Exception:
+            pass
+    if ws:
+        return ws
+    return None
+
+
+async def _commit_is_worktree_head_or_ancestor(
+    project_id: str, agent_id: str, commit_hash: str
+) -> bool:
+    """True iff *commit_hash* is HEAD or an ancestor of HEAD in the agent's tree.
+
+    Fail-closed: missing cwd, git errors, or empty hash → False.
+    """
+    ch = str(commit_hash or "").strip()
+    if not ch or not agent_id:
+        return False
+    cwd = await _agent_worktree_cwd(project_id, agent_id)
+    if not cwd:
+        return False
+    try:
+        from hiveweave.services.git_worktree import _git
+
+        ok, head = await _git(["rev-parse", "HEAD"], cwd)
+        if not ok:
+            return False
+        head = (head or "").strip()
+        if not head:
+            return False
+        ch_l, head_l = ch.lower(), head.lower()
+        if ch_l == head_l:
+            return True
+        # Unique git abbreviations are decided by merge-base, not string
+        # prefix (unrelated commits can share 7+ hex chars).
+        ok_anc, _ = await _git(["merge-base", "--is-ancestor", ch, "HEAD"], cwd)
+        return bool(ok_anc)
+    except Exception:
+        return False
+
+
+async def check_attestation_reuse_binding(
+    project_id: str,
+    row: dict[str, Any],
+    *,
+    expected_task_id: str | None,
+    expected_agent_id: str | None,
+) -> tuple[bool, str]:
+    """Task-binding matrix for explicit attestation ids (submit / waive).
+
+    Same task: allow (cross-agent pooling is a separate check in verify_ids).
+    Same agent, different task: allow if unexpired/exit already checked; when
+    ``commit_hash`` is present it must be the agent's worktree HEAD or an
+    ancestor (git fail → reject that dimension). Missing hash skips commit.
+    Different agent, different task: reject.
+    """
+    row_task = row.get("task_id") or ""
+    if not expected_task_id or not row_task:
+        return True, ""
+    if await _task_ids_equal(project_id, expected_task_id, str(row_task)):
+        return True, ""
+    row_agent = str(row.get("agent_id") or "")
+    same_agent = bool(expected_agent_id) and row_agent == str(expected_agent_id)
+    aid = str(row.get("id") or "")
+    if not same_agent:
+        return (
+            False,
+            f"Attestation task_id mismatch: {aid} "
+            "(different agent and different task)",
+        )
+    ch = str(row.get("commit_hash") or "").strip()
+    if not ch:
+        return True, ""
+    if await _commit_is_worktree_head_or_ancestor(project_id, row_agent, ch):
+        return True, ""
+    return (
+        False,
+        f"Attestation commit is not the agent's current worktree HEAD "
+        f"or an ancestor: {aid} commit={ch[:12]}",
+    )
+
+
 async def _conn(project_id: str) -> aiosqlite.Connection:
     """Resolve project_id to per-project DB connection.
 
@@ -468,13 +583,38 @@ class AttestationService:
             conn = await _conn(project_id)
         except ProjectDbError:
             return None
+        raw = str(attestation_id or "").strip()
+        if not raw:
+            return None
         cur = await conn.execute(
             "SELECT * FROM tool_attestations WHERE id = ? AND project_id = ?",
-            [attestation_id, project_id],
+            [raw, project_id],
         )
         row = await cur.fetchone()
         await cur.close()
-        return dict(row) if row else None
+        if row:
+            return dict(row)
+        # Unique prefix among this project's rows (8-32 hex). Exact-first
+        # above: an 8-char primary key is never LIKE-matched.
+        if not _HEX_REF_RE.fullmatch(raw):
+            return None
+        like = raw.lower() + "%"
+        cur = await conn.execute(
+            "SELECT * FROM tool_attestations WHERE project_id = ? "
+            "AND (LOWER(id) LIKE ? OR LOWER(REPLACE(id, '-', '')) LIKE ?) "
+            "LIMIT 3",
+            [project_id, like, like],
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise AmbiguousAttestationId(
+                f"Attestation id {raw!r} is ambiguous "
+                f"({len(rows)} matches). Pass the full id."
+            )
+        return dict(rows[0])
 
     async def verify_ids(
         self,
@@ -503,7 +643,10 @@ class AttestationService:
         for aid in attestation_ids:
             if not aid:
                 continue
-            row = await self.get(project_id, aid)
+            try:
+                row = await self.get(project_id, aid)
+            except AmbiguousAttestationId as e:
+                return False, str(e)
             if not row:
                 return False, f"Attestation not found: {aid}"
             exp = row.get("expires_at")
@@ -536,15 +679,19 @@ class AttestationService:
                     False,
                     f"Attestation kind '{kind}' not in expected {sorted(kinds_ok)}",
                 )
-            if task_id and row.get("task_id") and not await _task_ids_equal(
-                project_id, task_id, row.get("task_id")
-            ):
-                return False, f"Attestation task_id mismatch: {aid}"
+            bind_ok, bind_err = await check_attestation_reuse_binding(
+                project_id,
+                row,
+                expected_task_id=task_id,
+                expected_agent_id=expected_agent_id,
+            )
+            if not bind_ok:
+                return False, bind_err
             if not row.get("stdout_hash"):
                 return False, f"Attestation missing stdout_hash: {aid}"
             # visual_check / test_run / browse_e2e with exit≠0 must NOT unlock
             # gates (failed runs are still recorded for audit — TEST6 P0-3).
-            if kind in (VISUAL_CHECK_KIND, "test_run", BROWSE_E2E_KIND):
+            if kind in (VISUAL_CHECK_KIND, "test_run", BROWSE_E2E_KIND, CODE_AUDIT_KIND):
                 ec = row.get("exit_code")
                 if ec is not None and int(ec) != 0:
                     return (
@@ -695,10 +842,56 @@ VISUAL_CHECK_KIND = "visual_check"
 # Issued by browse tool on successful CLI runs (including screenshot).
 BROWSE_E2E_KIND = "browse_e2e"
 
+CODE_AUDIT_KIND = "code_audit"
+
 # Tag tokens that hard-select docs_only policy (narrow — avoid loose "docs").
 _DOCS_TAGS = frozenset({"docs_only", "doc_review"})
-_UI_TAGS = frozenset({"ui_browser_e2e", "ui", "e2e", "browser"})
-_TEST_TAGS = frozenset({"generic_tests", "tests", "test_run"})
+_UI_TAGS = frozenset({"ui_browser_e2e", "ui", "e2e", "browser", "module_visual"})
+_TEST_TAGS = frozenset({"generic_tests", "tests", "test_run", "unit"})
+_AUDIT_TAGS = frozenset({"code_audit"})
+
+# Dispatch/create structured gate → policy_id. Tools refuse if missing.
+SUBMIT_GATE_TO_POLICY: dict[str, str] = {
+    "docs": "docs_only",
+    "unit": "generic_tests",
+    "module_visual": "ui_browser_e2e",
+    "code_audit": "code_audit",
+    "code_audit+module_visual": "code_audit_visual",
+    "code_audit+unit": "code_audit_unit",
+}
+
+_SUBMIT_GATE_ALIASES = {
+    "code_audit+visual": "code_audit+module_visual",
+    "audit+visual": "code_audit+module_visual",
+    "audit+unit": "code_audit+unit",
+    "visual": "module_visual",
+}
+
+
+def normalize_submit_gate(raw: str | None) -> str | None:
+    """Return canonical submitGate or None if empty."""
+    g = (raw or "").strip().lower().replace(" ", "")
+    if not g:
+        return None
+    g = _SUBMIT_GATE_ALIASES.get(g, g)
+    return g
+
+
+def policy_from_submit_gate(raw: str | None) -> str:
+    """Map required submitGate enum to policy_id. Raises ValueError if missing/unknown."""
+    g = normalize_submit_gate(raw)
+    if not g:
+        raise ValueError(
+            "submitGate is required. Use one of: "
+            + ", ".join(sorted(SUBMIT_GATE_TO_POLICY))
+        )
+    policy = SUBMIT_GATE_TO_POLICY.get(g)
+    if not policy:
+        raise ValueError(
+            f"unknown submitGate {raw!r}. Use one of: "
+            + ", ".join(sorted(SUBMIT_GATE_TO_POLICY))
+        )
+    return policy
 
 
 async def create_doc_review(
@@ -1028,9 +1221,18 @@ def resolve_task_policy(
     tags_l = {str(t).strip().lower() for t in (tags or []) if t}
     if tags_l & _DOCS_TAGS:
         return "docs_only"
-    if tags_l & _UI_TAGS:
+    audit = bool(tags_l & _AUDIT_TAGS)
+    ui = bool(tags_l & _UI_TAGS)
+    tests = bool(tags_l & _TEST_TAGS)
+    if audit and ui:
+        return "code_audit_visual"
+    if audit and tests:
+        return "code_audit_unit"
+    if audit:
+        return "code_audit"
+    if ui:
         return "ui_browser_e2e"
-    if tags_l & _TEST_TAGS:
+    if tests:
         return "generic_tests"
     return "coordinator_review"
 
@@ -1038,18 +1240,52 @@ def resolve_task_policy(
 POLICY_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
     # Document VERIFY/spec tasks: machine-checkable file presence + hash
     "docs_only": frozenset({DOC_REVIEW_KIND}),
-    # UI: live browse evidence AND pixel-grounded assert_visual (AND).
-    # Path-only PNG or prose-without-browse is rejected.
-    "ui_browser_e2e": frozenset({VISUAL_CHECK_KIND, BROWSE_E2E_KIND}),
-    # Soft for others — coordinator judges browse/test evidence on review
-    "generic_tests": None,
+    # UI: live browse evidence. Screenshots inject into chat; visual_check /
+    # assert_visual is optional stamp, not a seeing ritual.
+    "ui_browser_e2e": frozenset({BROWSE_E2E_KIND}),
+    # unit submitGate: leaf must hang a passing test_run (not mid-level 取证)
+    "generic_tests": frozenset({"test_run"}),
     "coordinator_review": None,
+    "code_audit": frozenset({CODE_AUDIT_KIND}),
+    "code_audit_visual": frozenset(
+        {CODE_AUDIT_KIND, BROWSE_E2E_KIND}
+    ),
+    "code_audit_unit": frozenset({CODE_AUDIT_KIND, "test_run"}),
 }
 
 
+def ledger_policy_id(task: dict[str, Any], *, tags: list | None = None) -> str:
+    """Policy from the task row only — ignore hung ``evidence.policy_id``."""
+    pid = str(task.get("policy_id") or "").strip()
+    if pid:
+        return pid
+    raw_tags = tags
+    if raw_tags is None:
+        raw_tags = task.get("tags") or []
+        if isinstance(raw_tags, str):
+            try:
+                raw_tags = json.loads(raw_tags)
+            except Exception:
+                raw_tags = []
+    return resolve_task_policy(
+        title=task.get("title") or "",
+        tags=raw_tags if isinstance(raw_tags, list) else [],
+        description=task.get("description") or "",
+    )
+
+
 def required_attestation_kinds(policy_id: str) -> frozenset[str] | None:
-    """Kinds required at submit/approve for ``policy_id``, or None (soft)."""
-    return POLICY_REQUIRED_KINDS.get(policy_id)
+    """Kinds required at submit/approve for ``policy_id``, or None (soft).
+
+    Unknown ``policy_id`` fail-closes (non-empty impossible kind) so a forged
+    or stale id cannot skip the gate. Empty/missing still falls through via
+    ``ledger_policy_id`` → ``resolve_task_policy``.
+    """
+    if not policy_id:
+        return None
+    if policy_id not in POLICY_REQUIRED_KINDS:
+        return frozenset({"_unknown_policy"})
+    return POLICY_REQUIRED_KINDS[policy_id]
 
 
 # ── P0-2: Reviewer-side execution evidence ──────────────────────────────
@@ -1060,8 +1296,11 @@ REVIEWER_KIND = "test_run"
 
 REVIEWER_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
     # UI: reviewer (or consume agent) unlocks with ANY one of these —
-    # find_reviewer_attestation is OR. Submit-side POLICY_REQUIRED_KINDS
-    # stays AND (visual_check + browse_e2e).
+    # find_reviewer_attestation is OR. Submit-side requires browse_e2e
+    # (they drove the browser); visual_check is optional extra.
+    # CEO look-only browse does not stamp browse_e2e. Approve stays
+    # consume-only because review.py sets reviewer_must_hold from TEST_RUN
+    # (CEO has none) — belt if a stamp row still exists.
     "ui_browser_e2e": frozenset(
         {REVIEWER_KIND, BROWSE_E2E_KIND, VISUAL_CHECK_KIND}
     ),
@@ -1071,6 +1310,11 @@ REVIEWER_REQUIRED_KINDS: dict[str, frozenset[str] | None] = {
     "coordinator_review": frozenset({REVIEWER_KIND}),
     # Docs: doc_review by reviewer is sufficient (or waiver)
     "docs_only": None,
+    "code_audit": frozenset({CODE_AUDIT_KIND}),
+    "code_audit_visual": frozenset(
+        {CODE_AUDIT_KIND, BROWSE_E2E_KIND, VISUAL_CHECK_KIND}
+    ),
+    "code_audit_unit": frozenset({REVIEWER_KIND}),
 }
 
 
@@ -1282,7 +1526,9 @@ def format_attestation_mismatch_hint(
     if not held:
         return (
             "You hold no fresh successful attestation (any task). "
-            "Run tests with taskId set to the task under review."
+            "Consume the assignee's hung attestations for this task, or "
+            "review_task(rework) so the leaf can produce the submitGate kinds. "
+            "Do not run full-site tests yourself to unlock a leaf gate."
         )
     lines = [
         "You hold fresh attestation(s) that do not match this task:"
@@ -1300,10 +1546,93 @@ def format_attestation_mismatch_hint(
             f"  - {kind} id={hid}… bound_task={str(bound)[:8]} ({match})"
         )
     lines.append(
-        f"Target task={str(target_task_id)[:8]}… — re-run tests with "
-        f'taskId="{target_task_id}" or consume assignee evidence on this task.'
+        f"Target task={str(target_task_id)[:8]}… — consume assignee evidence "
+        f"on this task, or review_task(rework) for the leaf to attach the "
+        f"submitGate kinds. Do not re-run tests yourself to unlock approve."
     )
     return "\n".join(lines)
+
+
+def _task_umbrella_flag(task: dict[str, Any]) -> bool:
+    """True when a structured milestoneVerify / milestone_verify flag is set.
+
+    Does not scrape titles. Checks task fields, evidence JSON, and tags.
+    """
+    if task.get("milestone_verify") or task.get("milestoneVerify"):
+        return True
+    ev = task.get("evidence") or {}
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except Exception:
+            ev = {}
+    if isinstance(ev, dict) and (
+        ev.get("milestone_verify") or ev.get("milestoneVerify")
+    ):
+        return True
+    tags = task.get("tags") or []
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            tags = []
+    if isinstance(tags, list):
+        tokens = {str(t).strip().lower().replace("-", "_") for t in tags if t}
+        if tokens & {"milestone_verify", "milestoneverify"}:
+            return True
+    return False
+
+
+async def _task_has_children(project_id: str, task_id: str | None) -> bool:
+    if not task_id:
+        return False
+    try:
+        from hiveweave.services.tasks.db import _query
+
+        rows = await _query(
+            project_id,
+            "SELECT 1 FROM tasks WHERE parent_task_id = ? "
+            "AND COALESCE(is_archived, 0) = 0 LIMIT 1",
+            [str(task_id)],
+        )
+        return bool(rows)
+    except Exception:
+        return False
+
+
+async def task_is_umbrella(project_id: str, task: dict[str, Any]) -> bool:
+    """Umbrella/parent: structured milestoneVerify flag, or root with children."""
+    if _task_umbrella_flag(task):
+        return True
+    if task.get("parent_task_id"):
+        return False
+    return await _task_has_children(project_id, task.get("id"))
+
+
+def should_hint_umbrella_gate(
+    policy_id: str,
+    needed: frozenset[str] | None,
+    err: str,
+) -> bool:
+    """True when the reject is a leaf code_audit(_unit) gate (or missing audit)."""
+    pid = (policy_id or "").strip()
+    if pid in ("code_audit_unit", "code_audit", "code_audit_visual"):
+        return True
+    if needed and CODE_AUDIT_KIND in needed:
+        return True
+    return "code_audit" in (err or "").lower()
+
+
+def format_umbrella_gate_hint(policy_id: str, err: str) -> str:
+    """≤10-line receipt: parent/milestone path, not leaf code_audit_unit + CEO waive."""
+    return (
+        f"attestation gate failed ({policy_id}): {err}\n"
+        "This is an umbrella/parent (has children) or a milestone QA task.\n"
+        "Use submitGate=docs for the package, or dispatch_task(..., "
+        "milestoneVerify=true) for MAIN QA.\n"
+        "Do not copy a leaf code_audit_unit gate onto the parent.\n"
+        "Do not ask CEO for a leaf ticket."
+    )
 
 
 async def check_task_attestations(
@@ -1329,16 +1658,18 @@ async def check_task_attestations(
             evidence = json.loads(evidence)
         except Exception:
             evidence = {}
-    policy_id = (
-        (evidence.get("policy_id") if isinstance(evidence, dict) else None)
-        or task.get("policy_id")
-        or resolve_task_policy(
-            title=task.get("title") or "",
-            tags=tags if isinstance(tags, list) else [],
-            description=task.get("description") or "",
-        )
+    policy_id = ledger_policy_id(
+        task, tags=tags if isinstance(tags, list) else None
     )
     needed = required_attestation_kinds(policy_id)
+    from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
+
+    needed, _ = drop_code_audit_kind_if_soft(
+        needed,
+        agent_id=expected_agent_id or str(task.get("assignee_id") or "") or None,
+        task_id=task.get("id"),
+        evidence=evidence if isinstance(evidence, dict) else None,
+    )
     if not needed:
         return None
     if await has_valid_waiver(project_id, task.get("id")):
@@ -1355,6 +1686,10 @@ async def check_task_attestations(
     )
     if ok:
         return None
+    if should_hint_umbrella_gate(policy_id, needed, err) and await task_is_umbrella(
+        project_id, task
+    ):
+        return format_umbrella_gate_hint(policy_id, err)
     return (
         f"attestation gate failed ({policy_id}): {err}. "
         f"For docs_only: call attest_doc_review(taskId, files=[...]) then "

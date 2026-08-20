@@ -412,10 +412,10 @@ class RunLedger:
     ) -> tuple[bool, str]:
         """Check if the run has exceeded its call budgets.
 
-        Wall-clock elapsed is not a stop condition: long coding is expected
-        to outlive 10 minutes. Hung streams use the idle watchdog; tools use
-        declared timeouts; opt-in session wrap is
-        ``HIVEWEAVE_STREAM_SESSION_WALL_CLOCK``.
+        Wall-clock elapsed is not a stop condition here: long coding is
+        expected to outlive 10 minutes across budget-checked slices (the
+        streamer-level turn wrap handles per-slice wall clock; see
+        ``hiveweave.llm.streamer.constants``).
         """
         try:
             rows = await project_db.query(

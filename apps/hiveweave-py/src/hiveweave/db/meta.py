@@ -41,6 +41,8 @@ _META_MIGRATIONS: list[tuple[str, str, str]] = [
     ("agent_templates", "discipline_suite", "TEXT DEFAULT ''"),
     # llm_models — add provider_type for multi-format LLM support
     ("llm_models", "provider_type", "TEXT DEFAULT ''"),
+    # thinking dialect (reasoning_effort / thinking.type / enable_thinking / ...)
+    ("llm_models", "thinking_format", "TEXT DEFAULT ''"),
     # Bug J fix: add fallback column for circuit breaker fallback
     ("llm_models", "fallback", "TEXT"),
     # Model tiering: management | executor (NULL = unclassified legacy)
@@ -160,7 +162,9 @@ async def init_meta_db() -> None:
         # WAL 孤儿化/代际分叉损坏 —— TEST18 事故根因 2026-08-05）
         await _db.execute("PRAGMA encoding = 'UTF-8'")
         await _db.execute("PRAGMA journal_mode=DELETE")
-        await _db.execute("PRAGMA busy_timeout=5000")
+        from hiveweave.config import sqlite_busy_timeout_sql
+
+        await _db.execute(sqlite_busy_timeout_sql())
         await _db.execute("PRAGMA foreign_keys=ON")
 
         # Create tables

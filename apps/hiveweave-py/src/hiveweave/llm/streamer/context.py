@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import structlog
 
@@ -17,6 +17,10 @@ from .constants import (
     OUTPUT_TOKEN_GLOBAL_CAP,
     SAFETY_BUFFER_TOKENS,
     SUMMARY_MIN_BUDGET_S,
+    WORKING_SET_CHECKPOINT_MARKER,
+    WORKING_SET_PRESSURE_RATIO,
+    WORKING_SET_RETAIN_RATIO,
+    WORKING_SET_SUMMARY_MAX_TOKENS,
 )
 from .types import DeltaCallback
 
@@ -157,6 +161,10 @@ class ContextMixin:
             return self._drop_orphan_tool_artifacts(messages)
 
         head_end = self._leading_system_count(messages)
+        if head_end < len(messages):
+            pinned = str(messages[head_end].get("content") or "")
+            if WORKING_SET_CHECKPOINT_MARKER in pinned:
+                head_end += 1
         # 无 leading system 时仍要能裁；head 可为空。
         head = messages[:head_end]
         tail = messages[head_end:]
@@ -227,6 +235,226 @@ class ContextMixin:
             original=len(messages),
             trimmed=len(trimmed),
             tokens=estimate_tokens_for_messages(trimmed),
+        )
+        return trimmed
+
+    def _working_set_budgets(self, provider: ProviderConfig) -> tuple[int, int, int]:
+        """Return ``(usable, pressure_at, retain_at)`` for in-loop DSH pressure."""
+        usable, _trim_at = self._input_trim_at(provider)
+        pressure_at = max(int(usable * WORKING_SET_PRESSURE_RATIO), 8_192)
+        retain_at = max(int(usable * WORKING_SET_RETAIN_RATIO), 2_048)
+        if retain_at >= pressure_at:
+            retain_at = max(pressure_at // 5, 1_024)
+        return usable, pressure_at, retain_at
+
+    def _split_working_set_tail(
+        self,
+        messages: list[dict],
+        retain_tokens: int,
+    ) -> tuple[list[dict], list[dict], list[dict]] | None:
+        """Split into (leading system, compactable head, retained tail).
+
+        Tail is accumulated from the newest message until ``retain_tokens``.
+        Tool-call/result pairs are not split. ``None`` if there is no head
+        worth summarizing.
+        """
+        head_end = self._leading_system_count(messages)
+        prefix = messages[:head_end]
+        rest = messages[head_end:]
+        if len(rest) < 2:
+            return None
+
+        accumulated = 0
+        keep_from = len(rest)
+        for i in range(len(rest) - 1, -1, -1):
+            accumulated += estimate_tokens_for_messages([rest[i]])
+            keep_from = i
+            if accumulated >= retain_tokens:
+                break
+
+        while keep_from > 0:
+            m = rest[keep_from]
+            if m.get("role") == "tool" or m.get("tool_call_id"):
+                keep_from -= 1
+                continue
+            break
+
+        if keep_from <= 0:
+            return None
+        compactable = rest[:keep_from]
+        tail = rest[keep_from:]
+        if not compactable or not tail:
+            return None
+        return prefix, compactable, tail
+
+    @staticmethod
+    def _format_working_set_transcript(messages: list[dict]) -> str:
+        """Compact transcript for the step-boundary summarizer (not Compaction.compact)."""
+        parts: list[str] = []
+        budget = 80_000
+        used = 0
+        for m in messages:
+            role = m.get("role", "unknown")
+            content = m.get("content")
+            text = content if isinstance(content, str) else ("" if content is None else str(content))
+            tcs = m.get("tool_calls")
+            tool_info = ""
+            if isinstance(tcs, list) and tcs:
+                names = []
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    names.append(str(fn.get("name") or "unknown"))
+                if names:
+                    tool_info = " tools=" + ",".join(names)
+            if len(text) > 4096:
+                text = text[:4096] + "\n…" + text[-1024:]
+            chunk = f"[{role}{tool_info}]: {text}"
+            if used + len(chunk) > budget:
+                parts.append("[transcript truncated]")
+                break
+            parts.append(chunk)
+            used += len(chunk)
+        return "\n\n".join(parts)
+
+    def _working_set_checkpoint_message(self, summary: str) -> dict:
+        body = (summary or "").strip()
+        return {
+            "role": "user",
+            "content": (
+                f"{WORKING_SET_CHECKPOINT_MARKER}\n"
+                "Earlier tool-loop steps were summarized to keep the working "
+                "set under the pressure line. Continue from this checkpoint.\n\n"
+                f"{body}"
+            ),
+        }
+
+    async def _summarize_working_set_head(
+        self,
+        provider: ProviderConfig,
+        transcript: str,
+    ) -> str | None:
+        """One-shot non-tool LLM call. Empty/error → None (caller hard-trims)."""
+        prompt = (
+            "Summarize the following in-progress agent tool-loop history.\n"
+            "Keep: goal, constraints, files touched, commands run, errors, "
+            "decisions, and the next concrete step.\n"
+            "Do not mention that this is a summary. Use short bullets.\n\n"
+            f"{transcript}"
+        )
+        summary_messages = [{"role": "user", "content": prompt}]
+        url = provider.build_url()
+        headers = provider.build_headers()
+        body = provider.build_body(
+            messages=summary_messages,
+            stream=False,
+            temperature=0.3,
+            max_tokens=WORKING_SET_SUMMARY_MAX_TOKENS,
+            tools=None,
+        )
+        client = provider.build_client()
+        try:
+            resp = await asyncio.wait_for(
+                client.post(
+                    url,
+                    headers=headers,
+                    content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                ),
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                log.warning(
+                    "working_set_summary_http",
+                    status=resp.status_code,
+                )
+                return None
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                return None
+            content = choices[0].get("message", {}).get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            return None
+        except Exception as e:
+            log.warning("working_set_summary_error", error=str(e))
+            return None
+        finally:
+            await client.aclose()
+
+    async def _pressure_compact_if_needed(
+        self,
+        messages: list[dict],
+        provider: ProviderConfig,
+        *,
+        summarize: Callable[[str], Awaitable[str | None]] | None = None,
+    ) -> list[dict]:
+        """DSH-style step-boundary compact: prune, then LLM-summarize old head.
+
+        Below ``0.8 × usable`` this is a no-op (append-only, prefix cache).
+        Does not call ``conversation.compaction.Compaction.compact``.
+        """
+        messages = self._drop_orphan_tool_artifacts(messages)
+        _usable, pressure_at, retain_at = self._working_set_budgets(provider)
+        total = estimate_tokens_for_messages(messages)
+        if total < pressure_at:
+            return messages
+
+        log.info(
+            "working_set_pressure",
+            total=total,
+            pressure_at=pressure_at,
+            retain_at=retain_at,
+        )
+        compacted = self._compact_overflow_messages(messages)
+        compacted_total = estimate_tokens_for_messages(compacted)
+        # Hysteresis: prune-only just under 0.8 still re-crosses next round.
+        # Drop to retain_at (0.16) whenever we are still above the floor.
+        if compacted_total < retain_at:
+            return self._drop_orphan_tool_artifacts(compacted)
+
+        split = self._split_working_set_tail(compacted, retain_at)
+        summary_text: str | None = None
+        if split is not None:
+            prefix, compactable, tail = split
+            transcript = self._format_working_set_transcript(compactable)
+            try:
+                if summarize is not None:
+                    summary_text = await summarize(transcript)
+                else:
+                    summary_text = await self._summarize_working_set_head(
+                        provider, transcript
+                    )
+            except Exception as e:
+                log.warning("working_set_summarize_failed", error=str(e))
+                summary_text = None
+            if summary_text and summary_text.strip():
+                rebuilt = [
+                    *prefix,
+                    self._working_set_checkpoint_message(summary_text),
+                    *tail,
+                ]
+                rebuilt = self._drop_orphan_tool_artifacts(rebuilt)
+                after = estimate_tokens_for_messages(rebuilt)
+                log.info(
+                    "working_set_summarized",
+                    before=compacted_total,
+                    after=after,
+                    compactable=len(compactable),
+                    tail=len(tail),
+                )
+                if after < retain_at:
+                    return rebuilt
+                compacted = rebuilt
+
+        trimmed = self._hard_trim_tail(compacted, retain_at)
+        log.info(
+            "working_set_hard_trim",
+            before=estimate_tokens_for_messages(compacted),
+            after=estimate_tokens_for_messages(trimmed),
+            retain_at=retain_at,
+            had_summary=bool(summary_text),
         )
         return trimmed
 

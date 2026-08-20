@@ -1,0 +1,251 @@
+<p align="center">
+  <h1 align="center">HiveWeave</h1>
+</p>
+<p align="center"><strong>AI 工程组织</strong> — 把一个需求变成一支会自我审查、自我运行的 AI 工程师团队。</p>
+<p align="center"><em>不是 AI 编程工具，也不是框架——而是一个会自我演化的 AI 工程组织</em></p>
+
+<p align="center">
+  <a href="https://github.com/kenton-zh/HiveWeave"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kenton-zh/HiveWeave?style=flat-square" /></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" /></a>
+  <img alt="Python" src="https://img.shields.io/badge/python-3.12+-3776AB?style=flat-square&logo=python&logoColor=white" />
+  <img alt="React" src="https://img.shields.io/badge/react-19-61DAFB?style=flat-square&logo=react&logoColor=black" />
+  <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white" />
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> |
+  <a href="README.zh.md">中文</a>
+</p>
+
+[![HiveWeave 仪表盘](assets/screenshots/动画.gif)](https://github.com/kenton-zh/HiveWeave)
+
+---
+
+**[这是什么](#这是什么) · [快速开始](#快速开始) · [架构](#架构) · [核心能力](#核心能力) · [技术栈](#技术栈) · [特性](#特性) · [文档](#文档)**
+
+---
+
+**一览** —— 交付给你的是一个能跑起来的工程组织，而不是一堆零件：
+
+| 组织 | 工具与服务 | 质量与控制 |
+|:---|:---|:---|
+| 开箱即得 CEO、HR、经理、QA 与 Executor | **85+ 内置工具**、50+ 服务、18 个 API 模块 · 133 路由 | 交付到你面前前，先过 **四层把关** |
+| 按角色配模型：决策用顶级，执行用便宜 | 每个 Agent 可单独覆盖模型，可混用任意供应商 | 按 Agent 隔离上下文——永不交叉污染 |
+| 并行 Agent，各自独立 `git worktree` | 内置任务系统 + 客观真值账本 | 直接与任意模块的 Agent 对话 |
+
+---
+
+## 这是什么
+
+软件开发的本质是团队协作——HiveWeave 就按这个来。它把单 AI Agent 模式替换为**多 Agent 工程组织**：CEO、技术经理、开发工程师、QA、HR——**每个角色有自己的职责、记忆、工具和独立工作区**。他们**招聘、分配任务、审查代码、合并分支、汇报进度**。你像管理真实团队一样管理他们。
+
+> **工作模式**：你描述需求，**CEO 规划组织**——需要哪些中层角色（比如前端负责人和后端负责人，以及各自必须具备的技能），**HR Agent 再到技能市场搜索并绑定对应技能，把每个角色招聘到位**。最终得到一支为你的项目量身定制的团队——而且**你可以直接跟负责任意模块的 Agent 对话，不必事事通过 CEO 中转**。
+
+> **内置任务管理系统**：每个任务都走完完整生命周期——**创建、调度给对应角色、认领、带可见进度地执行、提交审查、验证、合并**（当某个关卡被有意跳过时也有豁免路径）。**Task Ledger 为每一项任务记录客观真值**，实时时间线展示整个团队的动态，绝不黑箱。更重要的是，**这份账本是一条单一、客观的真相线，把整个团队锚定在现实之上**——Agent 不能只是互相附和就说"完成了"，每一项声明都要对照实际产出的东西来核验，**从而避免整个团队陷入集体幻觉**。
+
+> **为什么**：单 Agent 工具（Claude Code、Codex、Cursor）**跨模块丢上下文、无法并行开发、没有质量闸门**。HiveWeave 把工作拆分给专业 Agent，**每个拥有独立的上下文和工作区，经过四层把关后才到你眼前**。
+
+|  | 单 Agent 工具（Claude Code、Cursor、Codex） | HiveWeave |
+|:---|:---|:---|
+| **上下文** | 共享一份上下文，随代码库变大而退化 | 按 Agent 隔离上下文——前端 Agent 永远看不到后端代码 |
+| **并行度** | 一次只能做一件事 | 多个 Agent 并行，各自独立 `git worktree` |
+| **质量把关** | 全靠你自己审查 | 四层把关：Executor → QA → 经理 → CEO → 你 |
+| **成本模型** | 所有任务用同一个模型 | 决策用顶级模型，执行用便宜模型 |
+| **记忆** | 每次会话重置或需手动重新铺垫 | 三层记忆（Agent 私有层激活；见 ADR-010） |
+
+## 快速开始
+
+**环境要求：** Python ≥3.12、Node 22.x（见 `.nvmrc`）、[pnpm](https://pnpm.io) 10、[uv](https://github.com/astral-sh/uv)，以及至少一个 LLM 供应商的 API key。
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/kenton-zh/HiveWeave.git
+cd HiveWeave
+
+# 2. 配置 API key
+cp apps/hiveweave-py/.env.example apps/hiveweave-py/.env
+# 编辑 apps/hiveweave-py/.env，填入 HIVEWEAVE_OPENCODE_API_KEY
+# （OpenAI / Anthropic / DeepSeek / Groq / Google 的 key 之后可在应用内 Settings 里补充）
+
+# 3. 后端（Python/FastAPI，端口 4000）
+cd apps/hiveweave-py
+uv sync
+uvicorn hiveweave.main:app --host 127.0.0.1 --port 4000
+# 注意：--host 127.0.0.1 仅绑定本机回环（安全默认值）。
+# 若要局域网访问，请显式设置 --host 0.0.0.0 并配置 HIVEWEAVE_API_KEY。
+
+# 4. 前端（React/Vite，端口 5173）—— 新开一个终端
+cd apps/web
+pnpm install
+pnpm dev
+```
+
+打开 `http://localhost:5173`，创建第一个项目，认识你的 CEO。
+
+**Windows 用户**可以直接用 `start-all.bat` / `start-backend.bat` / `start-frontend.bat`，等价于上面第 3–4 步——先确保 Node 已加入 `PATH`。
+
+## 架构
+
+```
+        你（人类操作者）
+          ↕                    ↕（通过 question 工具 / 聊天）
+        CEO ─── 专家（按需召唤，最贵模型）
+          ↕
+        技术经理 / PM / 架构师
+          ↕
+        QA + Executor（便宜模型执行）
+
+        四层把关：
+          Executor → QA（/review）→ 技术经理（规格符合）→ CEO（意图对齐）→ 你（肉眼验收）
+```
+
+| 层 | 角色 | 模型 | 职责 |
+|:---|------|:---|------|
+| 决策 | CEO | 顶级 | 方向、规格、用户汇报 |
+| 规划 | 技术经理 | 强 | 架构、任务拆解、审查 |
+| 质量 | QA | 中等 | 五轴代码审查、安全审计、E2E 测试 |
+| 执行 | Executor | 便宜 | 写代码、跑测试、自审 |
+
+## 核心能力
+
+### 多 Agent 组织
+- **动态层级** — CEO → HR → 经理 → Executor。协调者规划和审查，执行者写代码。各司其职。
+- **招聘流程** — CEO 设计组织 → HR 招人 → 经理拆分领域 → 各自向 HR 招聘下属。三轮招人，匹配真实团队增长。
+- **纪律套装** — 每个角色获得一组纪律技能（code-review-and-quality、self-review、security-and-hardening 等），定义"怎么思考"，不只是"用什么工具"。
+- **双层技能绑定** — 纪律技能（必绑，定义角色）+ 工具技能（HR 在市场匹配）。HR 服务所有协调者，不只 CEO。
+
+### 上下文隔离
+- **按 Agent 隔离** — 前端 Agent 只看前端代码。后端 Agent 只看后端代码。互不污染。
+- **按角色配模型** — CEO 用 Claude Opus，Executor 用 DeepSeek Flash。贵 token 花在决策上，便宜 token 花在执行上。
+- **直达对话** — 你可以直接跟任意层级 Agent 对话。前端有问题？直接找前端开发。不用通过 CEO 中转。
+
+### Git Worktree 开发
+- **隔离工作区** — 每个 Agent 拥有独立 `git worktree`（`hw/<shortId>/<task>`）。并行开发零冲突。
+- **检查点 + 回滚** — 风险操作前 checkpoint，随时回滚。不影响主分支。
+- **审查 → 合并关卡** — Executor 提交 → QA 审查 → 经理审批 → CEO 签字 → 合并到主分支。四关之后代码才到你面前。
+
+### 记忆与交接
+- **三层记忆** — 设计为项目记忆（共享）/ Agent 记忆（私有）/ 归档记忆（离职 Agent）三层。当前 **Agent 私有层激活**（跨会话持久化，压缩后快照注入）；项目层与归档层为设计蓝图，尚未接线（见 ADR-010）。
+- **交接继承** — 设计目标，**尚未实现**：dismiss 当前不归档离职 Agent 记忆（见 ADR-010）。
+- **持续学习** — Agent 可以把成功流程 `skillify` 固化为技能，从失败中 `learn` 经验。跨项目模式由 Boss 助理记录。
+
+### 模型预算分层
+- **按角色分模型** — 协调者用顶级模型做规划审查，执行者用便宜模型写代码。
+- **专家通道** — 团队解决不了的问题，CEO 召唤专家 Agent 使用最贵模型。AI 提炼后的问题比人直接提问更精准，同样花费得到更好答案。
+- **灵活配置** — 每个 Agent 可单独覆盖模型配置。混合使用 OpenAI、Anthropic、DeepSeek、Groq 等多供应商。
+
+### 实时可视化
+- **组织架构图** — React Flow 驱动。拖拽缩放，看清汇报关系。
+- **多面板对话** — 同时跟多个 Agent 聊天。前端开发一个面板，后端开发另一个。
+- **实时流式** — WebSocket token 级推送。实时看到 Agent 在打字。
+
+## 技术栈
+
+| 层 | 技术 | 备注 |
+|:---|------|------|
+| 后端 | Python 3.12 + FastAPI + Uvicorn | 端口 4000，133 路由，18 API 模块 |
+| 前端 | React 19 + Vite + React Flow + Zustand | 端口 5173，支持 Electron 桌面端 |
+| 数据库 | SQLite + aiosqlite | 双 DB：Meta DB（WAL）+ Per-project DB |
+| AI/LLM | httpx SSE 流式 + Provider Factory | OpenAI、Anthropic、DeepSeek、Groq、Google |
+| 实时通信 | phoenix.js + phoenix_adapter（WebSocket） | 3 频道：lobby、project、agent |
+| 沙箱 | Docker（可选） | `BASH_SANDBOX=docker` |
+| 构建 | Turbo | Monorepo 任务编排 |
+| 包管理 | pnpm 10 + uv | Monorepo + Python 包 |
+
+## 项目结构
+
+```
+hiveweave/
+├── apps/
+│   ├── hiveweave-py/                  # 后端 — Python/FastAPI（端口 4000）
+│   │   └── src/hiveweave/
+│   │       ├── agents/                # Agent 生命周期 + Supervisor + trigger
+│   │       ├── api/                   # 18 个 FastAPI 路由模块，133 路由
+│   │       ├── conversation/          # Token budget、compaction、conversation store
+│   │       ├── db/                    # Meta DB + Per-project DB（aiosqlite）
+│   │       ├── hooks/                 # 生命周期钩子
+│   │       ├── llm/                   # Streamer、provider factory、retry、circuit_breaker
+│   │       ├── prompts/               # ETHOS 提示词体系（identity + context）
+│   │       ├── realtime/              # phoenix_adapter、channels、pubsub、event_bus
+│   │       ├── services/              # 50+ 个服务（org、dispatch、memory、handoff 等）
+│   │       ├── tools/                 # 85+ 个内置工具（含 tasks/ 子包）
+│   │       └── util/                  # 通用工具
+│   └── web/                           # 前端 — React 19 + Vite + Electron（端口 5173）
+├── assets/
+│   └── screenshots/                   # README 截图
+├── docs/                              # 架构与迁移文档
+├── scripts/                           # 构建 / 工具脚本
+├── tasks/                             # 任务规格
+├── start-*.bat / *.sh                 # 跨平台启动脚本
+└── CLAUDE.md / AGENTS.md              # AI 工具指令
+```
+
+## 工作流程
+
+```
+1. 创建项目 → CEO + HR 自动生成
+2. CEO 摸底（EXPLORE）→ 读文档 → 选组织范式 → 设计纪律套装
+3. CEO → HR："招一个后端经理，纪律用 Manager Suite"
+4. HR：绑定纪律技能（必绑）→ 搜市场补工具技能 → 创建 Agent
+5. 后端经理到位 → EXPLORE 自己的领域 → 拆任务 → 向 HR 招下属
+6. Executor 写代码 → self-review 自审 → QA 审查 → 经理验收 → CEO 对齐 → 你肉眼看
+7. 每个肉眼可见的节点通过后 → 下一批任务
+```
+
+## 特性
+
+下面每一行都是以"一个运行中的组织"交付的，不是零散的库。真正的差异化不在某个单一功能——而在于它们被预接成一支会自我管理的团队。
+
+| 特性 | 说明 |
+|:---|------|
+| **按角色配模型** | CEO/专家用顶级 LLM；Executor 用便宜模型。规模化成本可控。 |
+| **Agent 可单独指定模型** | 每个 Agent 可独立覆盖模型配置。混合 OpenAI、Anthropic、DeepSeek、Groq 等多供应商。 |
+| **每个 Agent 独立工作区** | 每个 Agent 拥有自己的 `git worktree`（`hw/<shortId>/<task>`）。完整文件系统隔离。checkpoint、回滚、合并——全部通过协调者。 |
+| **提交前自审** | Executor 提交代码前先做五轴自查（正确性/可读性/架构/安全/性能）。提前发现问题，减少审查来回。 |
+| **四层把关** | Executor → QA → 经理 → CEO → 你。未经验证的代码到不了你面前。 |
+| **自然语言参与度** | 不是下拉菜单。_"我只在前端功能完成后验收，后端开发过程不参与。"_ CEO 理解并遵守你的意图。 |
+| **Agent 人格** | 每个 Agent 有花名、个人背景、性格怪癖和爱好。他们像角色，不像函数。 |
+| **纪律套装** | 角色获得定义"怎么思考"的纪律技能集，不只是"用什么工具"。预制套装（QA 套、经理套、Executor 套）或 CEO 自定义。 |
+| **双层技能绑定** | 纪律技能（必绑，定义角色）+ 工具技能（HR 市场匹配）。HR 服务所有协调者，不只 CEO。 |
+| **6 种组织范式** | 单兵、扁平小组、Tech Lead、PM+架构师、Pod、流水线。CEO 选匹配项目规模的结构。 |
+| **Phase 0.5 经理动员** | 经理到位后先摸索领域、拆分任务，再招下属。不过度招聘、不闲置 Agent。 |
+| **CAVEMAN 通信** | Agent 间消息简洁技术化。_"模块已拆分. 3人已招. 等待优先级."_ 无寒暄，零 token 浪费。 |
+| **三层记忆** | 设计为项目（共享）/ Agent（私有）/ 归档（离职）三层。Agent 私有层激活；项目层与归档层为蓝图（ADR-010）。 |
+| **交接继承** | 设计目标，尚未实现——dismiss 不归档记忆（ADR-010）。 |
+| **专家按需召唤** | 团队遇到解决不了的难题，CEO 召唤专家 Agent（最贵模型）。团队提炼后的问题 → 同样花费得到更好答案。只在真正需要时烧专家 token。 |
+| **Asyncio 任务隔离** | 每个 Agent 运行在独立 asyncio task 中。崩溃不拖垮系统。熔断器 + 指数退避应对 LLM 故障。 |
+| **游戏时间调度** | 1 真实小时 = 1 游戏天。停滞 Agent：10min 催办，~40min+ 升级到上级。基于模拟时钟的定时闹钟。 |
+| **双 DB 模式** | Meta DB（WAL，全局）+ Per-project DB（WAL，隔离）。Agent 间数据永不交叉污染。 |
+| **MCP 协议** | 通过 Model Context Protocol 扩展工具。按 Agent 绑定 MCP 服务器——不同角色获得不同外部工具。 |
+| **skills.sh 市场** | 远程技能市场。HR 动态搜索和绑定技能。无硬编码技能列表。 |
+| **85+ 内置工具** | bash、文件操作、grep、patch、review（五轴）、security audit、websearch、question、todowrite、编排、org、视觉、图像生成、MCP 工具。按角色类型权限门控。 |
+
+## 文档
+
+- [CLAUDE.md](./CLAUDE.md) — AI 工具指令与完整架构参考
+- [CHANGELOG.md](./CHANGELOG.md) — 版本化变更记录
+
+## 致谢
+
+HiveWeave 构建于以下项目的思想、代码和工作流之上：
+
+| 项目 | 我们借鉴了什么 |
+|:---|------|
+| **[OpenCode](https://github.com/anomalyco/opencode)** | LLM 流式架构、token 估算（4 字符/token）、对话压缩、工具输出截断、熔断器模式。所有核心逻辑的 P0 参考源。 |
+| **[gstack](https://github.com/garrytan/gstack)** | 工程规范流程系统 — `/spec` `/plan-eng-review` `/review` `/qa` `/ship` 管线。融入 HiveWeave 的**纪律套装**模型，用于 Agent 角色定义。技能路由规则和 ETHOS 原则同样源自于此。 |
+| **[FastAPI](https://github.com/fastapi/fastapi)** | 原生支持 WebSocket/SSE 的 Web 框架。 |
+| **[React Flow](https://github.com/xyflow/xyflow)** | 组织架构图可视化引擎。 |
+
+> **站在巨人的肩膀上**：这里列出的每个项目都解决了一个我们不需要重新解决的难题。我们组装、适配，并在其上叠加了多 Agent 协作层。
+
+## 贡献
+
+HiveWeave 正在活跃开发中，主要由它自己的 AI Agent 团队（CEO + 组织）构建，人类在关键节点做审查——如果你是通过 Claude Code 或类似的编程 Agent 来驱动开发，可以看 [CLAUDE.md](./CLAUDE.md) 了解这套工作流。
+
+人类直接参与贡献同样欢迎：有 bug 或想法直接开 issue，想改代码就 fork 后提 PR，没有额外门槛。
+
+---
+
+<p align="center">
+  <strong>由 HiveWeave 构建</strong> —— 一个会自己规划、招聘、开发、审查并发布产品的 AI 工程组织。真正构建软件的，不是工具，而是团队。<a href="https://github.com/kenton-zh/HiveWeave">给我们 Star</a>，看这个组织如何自行运转。
+</p>

@@ -48,6 +48,7 @@ _TASK_GATE_PREFIXES = (
     "[REWORK REQUESTED]",
     "[TASK APPROVED]",
     "[POST-MERGE VERIFY]",
+    "[SHIP READY]",
 )
 
 
@@ -235,7 +236,53 @@ def merge_queued_triggers(
     return message, opts
 
 
-def wake_source_for_pending(pending: list | None) -> str:
+def _pending_from_ids(pending: list | None) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for msg in pending or []:
+        if not isinstance(msg, dict):
+            continue
+        fid = str(msg.get("from_agent_id") or "").strip()
+        if not fid:
+            continue
+        key = fid.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ids.append(fid)
+    return ids
+
+
+async def _attach_wait_clear_senders(
+    latch_opts: dict,
+    pending: list | None,
+    *,
+    project_id: str | None,
+    waiter_agent_id: str | None,
+) -> None:
+    """Record inbox senders that match a kind=agent wait (not first-row only)."""
+    pid = (project_id or "").strip()
+    waiter = (waiter_agent_id or "").strip()
+    if not pid or not waiter:
+        return
+    try:
+        from hiveweave.services.wait_contract import matching_sender_ids_for_waiter
+
+        matched = await matching_sender_ids_for_waiter(
+            pid, waiter, _pending_from_ids(pending)
+        )
+    except Exception:
+        return
+    if matched:
+        latch_opts["wait_clear_sender_ids"] = matched
+
+
+async def wake_source_for_pending(
+    pending: list | None,
+    *,
+    project_id: str | None = None,
+    waiter_agent_id: str | None = None,
+) -> str:
     """Latch-exempt source for pending inbox, or ``trigger`` if none.
 
     ``message_type=offturn_completion`` is the trust gate for
@@ -245,6 +292,9 @@ def wake_source_for_pending(pending: list | None) -> str:
     with type=system/normal is a normal ``trigger`` (or ``task`` if
     ``task_id`` is set). Peer + prefix without that type stays
     ``trigger``.
+
+    A pending sender that matches an active kind=agent wait returns
+    ``message_from_ref`` so admit clears only that wait.
     """
     from hiveweave.services.offturn import is_offturn_completion_text
     from hiveweave.services.wake_policy import OFFTURN_COMPLETION_MESSAGE_TYPE
@@ -264,6 +314,28 @@ def wake_source_for_pending(pending: list | None) -> str:
             wait_ok = True
     if wait_ok:
         return "wait_satisfied"
+    pid = (project_id or "").strip() or None
+    waiter = (waiter_agent_id or "").strip() or None
+    if pid and waiter:
+        try:
+            from hiveweave.services.wait_contract import (
+                kind_agent_wait_matches_sender,
+                wait_contract_service,
+            )
+
+            waits = await wait_contract_service.list_active(pid, waiter)
+            for msg in pending or []:
+                if not isinstance(msg, dict):
+                    continue
+                from_id = str(msg.get("from_agent_id") or "").strip()
+                if not from_id:
+                    continue
+                if await kind_agent_wait_matches_sender(
+                    pid, waits, from_agent_id=from_id
+                ):
+                    return "message_from_ref"
+        except Exception:
+            pass
     if task:
         return "task"
     return "trigger"
@@ -443,11 +515,21 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
         latch_opts: dict = {"trigger": True, "source": "trigger"}
         try:
             pending_for_latch = await _inbox_service.get_pending_messages(agent_id)
-            src = wake_source_for_pending(pending_for_latch)
+            src = await wake_source_for_pending(
+                pending_for_latch,
+                project_id=project_id,
+                waiter_agent_id=agent_id,
+            )
             if src != "trigger":
                 latch_opts["source"] = src
                 if src == "task":
                     latch_opts["message_type"] = "task"
+            await _attach_wait_clear_senders(
+                latch_opts,
+                pending_for_latch,
+                project_id=project_id,
+                waiter_agent_id=agent_id,
+            )
             _guard_sibling_offturn_waits(agent_id, latch_opts)
         except Exception:
             pass
@@ -513,6 +595,9 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                         "message_type": latch_opts.get("message_type"),
                         "task_id": latch_opts.get("task_id"),
                         "clear_waits": latch_opts.get("clear_waits"),
+                        "wait_clear_sender_ids": latch_opts.get(
+                            "wait_clear_sender_ids"
+                        ),
                         "is_background": True,
                     },
                 )
@@ -543,6 +628,9 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                     "message_type": latch_opts.get("message_type"),
                     "task_id": latch_opts.get("task_id"),
                     "clear_waits": latch_opts.get("clear_waits"),
+                    "wait_clear_sender_ids": latch_opts.get(
+                        "wait_clear_sender_ids"
+                    ),
                     "is_background": True,
                 },
             )
@@ -648,6 +736,9 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
                 "message_type": latch_opts.get("message_type"),
                 "task_id": latch_opts.get("task_id"),
                 "clear_waits": latch_opts.get("clear_waits"),
+                "wait_clear_sender_ids": latch_opts.get(
+                    "wait_clear_sender_ids"
+                ),
                 "dedup_content": chat_context,
             },
         )

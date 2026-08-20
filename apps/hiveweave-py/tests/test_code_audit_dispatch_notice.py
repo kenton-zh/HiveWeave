@@ -221,7 +221,10 @@ async def test_create_task_writer_description_gets_notice():
     with _enter(_create_patches(_WRITER)):
         result = await create_task_tool(
             CreateTaskParams(
-                title="实现登录模块", description="实现登录模块", assigneeId="A009"
+                title="实现登录模块",
+                description="实现登录模块",
+                assigneeId="A009",
+                submitGate="unit",
             ),
             COORDINATOR_ID,
             "/tmp/ws",
@@ -239,7 +242,10 @@ async def test_create_task_non_writer_keeps_description():
     with _enter(_create_patches(_NON_WRITER)):
         result = await create_task_tool(
             CreateTaskParams(
-                title="整理文档", description="整理文档", assigneeId=COORDINATOR_ID
+                title="整理文档",
+                description="整理文档",
+                assigneeId=COORDINATOR_ID,
+                submitGate="docs",
             ),
             COORDINATOR_ID,
             "/tmp/ws",
@@ -256,7 +262,9 @@ async def test_create_task_non_writer_keeps_description():
 async def test_create_task_without_assignee_keeps_description():
     with _enter(_create_patches(_WRITER)):
         result = await create_task_tool(
-            CreateTaskParams(title="草稿任务", description="草稿任务"),
+            CreateTaskParams(
+                title="草稿任务", description="草稿任务", submitGate="docs"
+            ),
             COORDINATOR_ID,
             "/tmp/ws",
             None,

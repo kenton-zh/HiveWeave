@@ -156,6 +156,7 @@ async def test_park_pending_skips_escalation():
 
 @pytest.mark.asyncio
 async def test_ack_inbox_on_give_up_spares_and_injects_ledger():
+    """Spare review wakes + call merge-proxy heal hook (no synthetic LEDGER inbox)."""
     from hiveweave.agents.agent import Agent
 
     ag = MagicMock(spec=Agent)

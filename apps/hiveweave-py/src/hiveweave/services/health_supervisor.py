@@ -175,6 +175,7 @@ class HealthSupervisor:
                         project_id=project_id,
                     )
                     await self._wake_agent(aid, project_id, now_ms, now_mono)
+                    # No parent inbox催 — align with game_time silence_escalated_ui_only
                     await self._notify_superior(
                         agent, project_id, int(silent_s), now_mono
                     )
@@ -368,7 +369,7 @@ class HealthSupervisor:
         silent_s: int,
         now_mono: float,
     ) -> None:
-        """Notify org parent when agent is stuck >30 min."""
+        """Stuck >30 min: log only. Do not inbox催上级 (2026-08-17)."""
         try:
             aid = agent["id"]  # type: ignore[index]
             parent_id = agent["parent_id"]  # type: ignore[index]
@@ -376,55 +377,19 @@ class HealthSupervisor:
             short_id = agent["short_id"]  # type: ignore[index]
         except Exception:
             return
-        if not parent_id:
-            return
         last = self._notify_ts.get(aid, 0.0)
         if now_mono - last < NOTIFY_COOLDOWN_S:
             return
         self._notify_ts[aid] = now_mono
-        try:
-            from hiveweave.services.inbox import InboxService
-
-            await InboxService().send_message(
-                from_agent_id="system",
-                to_agent_id=str(parent_id),
-                message=(
-                    f"[AGENT STUCK] {name} ({short_id}) has produced no "
-                    f"output for {silent_s // 60} min. Check obligations / "
-                    f"wake them, or escalate."
-                ),
-                message_type="escalation",
-                priority="urgent",
-                wake=True,
-                idempotency_key=(
-                    f"health_stuck:{aid}:{int(now_mono) // NOTIFY_COOLDOWN_S}"
-                ),
-            )
-            from hiveweave.agents.trigger import (
-                is_coordinator,
-                trigger_coordinator,
-                trigger_subordinate,
-            )
-            from hiveweave.services.org import OrgService
-
-            parent = await OrgService().get_agent(str(parent_id))
-            role = (parent or {}).get("role") or ""
-            if is_coordinator(role):
-                await trigger_coordinator(str(parent_id))
-            else:
-                await trigger_subordinate(str(parent_id))
-            log.info(
-                "health_supervisor_notified_superior",
-                agent_id=aid,
-                parent_id=parent_id,
-                project_id=project_id,
-            )
-        except Exception as e:
-            log.warning(
-                "health_supervisor_notify_failed",
-                agent_id=aid,
-                error=str(e),
-            )
+        log.warning(
+            "health_supervisor_stuck_ui_only",
+            agent_id=aid,
+            name=name,
+            short_id=short_id,
+            parent_id=parent_id,
+            project_id=project_id,
+            silent_seconds=silent_s,
+        )
 
 
 # Singleton

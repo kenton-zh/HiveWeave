@@ -207,7 +207,7 @@ async def commit_turn_tool(
                         "UNREPLIED_ASKS": "有未回复的 ask 消息",
                         "WAIT_WITHOUT_ASK": "waiting 前须先向对方发消息",
                         "HIRE_UNREPORTED": "本轮 hire_agent 后未通知请求方",
-                        "ASSIGNEE_MUST_SUBMIT": "有 claimed/running/rework 任务未提交",
+                        "ASSIGNEE_MUST_SUBMIT": "有 claimed/running/rework 任务未提交（已派下属则 waiting 子任务，勿催交）",
                         "REVIEWER_MUST_START_REVIEW": "有 submitted 任务待开始审查",
                         "REVIEWER_MUST_FINISH_REVIEW": "有 reviewing 任务待完成审查",
                         "CREATOR_MUST_REVIEW": "有 submitted/reviewing 任务待审查",
@@ -503,7 +503,8 @@ class AskNotifyParams(BaseModel):
 @tool(
     "ask_agent",
     "Ask one or more agents and REQUIRE a reply via send_message/ask_agent/notify_agent. "
-    "Use for tool checks, opinions, reports. Prefer this over send_message(expectReport=true). "
+    "Put the request and what they must return in this one message; do not also "
+    "send a status-only follow-up. Prefer this over send_message(expectReport=true). "
     "When replying to an existing ask, pass replyTo=<the original message's "
     "reply_contract_id> to close the contract (not the message_id from a tool result).",
     requires_workspace=False,

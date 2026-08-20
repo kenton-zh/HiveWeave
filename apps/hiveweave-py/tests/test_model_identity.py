@@ -19,7 +19,7 @@ from hiveweave.services.org import OrgService
 
 _COLS = (
     "id, name, model_id, base_url, api_key, provider_type, context_window, "
-    "max_output_tokens, supports_thinking, default_reasoning_effort, "
+    "max_output_tokens, supports_thinking, thinking_format, default_reasoning_effort, "
     "temperature, is_active, fallback, tier, created_at, updated_at"
 )
 
@@ -30,7 +30,7 @@ def _mk_row(
     name = name or f"name-{uid}"
     return (
         uid, name, model_id, "https://example.test/v3", f"key-{uid}",
-        "openai-compatible", 1000, 500, 0, None, None, active, None, None,
+        "openai-compatible", 1000, 500, 0, "", None, None, active, None, None,
         1, updated_at,
     )
 
@@ -44,7 +44,7 @@ async def test_get_by_name_deterministic_latest_active():
         conn.execute(f"CREATE TABLE llm_models ({_COLS})")
         conn.executemany(
             f"INSERT INTO llm_models ({_COLS}) VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 _mk_row("uuid-old-active", "deepseek-v4-flash", 1, 100),
                 _mk_row("uuid-new-active", "deepseek-v4-flash", 1, 300),
@@ -87,7 +87,7 @@ async def test_get_by_name_tie_breaks_by_id():
         conn.execute(f"CREATE TABLE llm_models ({_COLS})")
         conn.executemany(
             f"INSERT INTO llm_models ({_COLS}) VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 _mk_row("uuid-a", "deepseek-v4-flash", 1, 100, name="平局名称"),
                 _mk_row("uuid-b", "deepseek-v4-flash", 1, 100, name="平局名称"),

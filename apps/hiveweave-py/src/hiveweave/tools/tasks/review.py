@@ -46,15 +46,13 @@ class ReviewTaskParams(BaseModel):
 @tool(
     "review_task",
     "Review a submitted task (reviewing -> approved/rework). If task is 'submitted', starts review automatically. "
-    "approve requires FRESH execution evidence bound to this taskId (or an ancestor task) — not bare testsPassed. "
-    "BEFORE approving: run the tests yourself via bash(command='<test cmd>', taskId='<this task id>') and pass them "
-    "(exit=0; failed tests do not unlock the gate) — VERIFY tasks: run on MAIN; code tasks: run in the assignee's "
-    "(or your own) worktree. Alternative: consume assignee/QA test_run evidence, or waive_attestation("
-    "taskId, evidenceAttestationId, reason) and let a DIFFERENT agent approve (sole-reviewer small team may "
-    "self-approve; VERIFY waive is CEO-only). docs_only tasks: use attest_doc_review instead — no test_run "
-    "needed and waive is rejected. If approve is rejected for missing evidence, do NOT retry approve — "
-    "run tests with taskId first. Does NOT spawn VERIFY — call git_worktree_merge next; "
-    "VERIFY is created only after merge succeeds.",
+    "approve requires FRESH evidence kinds for this task's submitGate/policy — not bare testsPassed. "
+    "Prefer consuming the assignee's hung attestations (unit→test_run, module_visual→browse_e2e, "
+    "docs→doc_review, code_audit*→code_audit). CEO: review-only — do not bash/self-test or merge leaf trees. "
+    "If approve is rejected for missing evidence, do NOT retry approve — rework or wait for the gate. "
+    "Does NOT spawn VERIFY. After a milestone is on MAIN, dispatch_task(..., milestoneVerify=true) "
+    "for one QA task. VERIFY waive is CEO-only. docs_only: coordinators use "
+    "attest_doc_review (waive rejected); CEO may waive that one taskId.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -182,8 +180,8 @@ async def review_task_tool(
         if decision == "approve":
             from hiveweave.services.attestation import (
                 attestation_service,
+                ledger_policy_id,
                 required_attestation_kinds,
-                resolve_task_policy,
             )
             from hiveweave.services.worktree_review import review_worktree_gate
 
@@ -195,22 +193,16 @@ async def review_task_tool(
                     evidence = {}
             if not isinstance(evidence, dict):
                 evidence = {}
-            tags = task.get("tags") or []
-            if isinstance(tags, str):
-                try:
-                    tags = json.loads(tags)
-                except Exception:
-                    tags = []
-            policy_id = (
-                evidence.get("policy_id")
-                or task.get("policy_id")
-                or resolve_task_policy(
-                    title=task.get("title") or "",
-                    tags=tags if isinstance(tags, list) else [],
-                    description=task.get("description") or "",
-                )
-            )
+            policy_id = ledger_policy_id(task)
             needed = required_attestation_kinds(policy_id)
+            from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
+
+            needed, _ = drop_code_audit_kind_if_soft(
+                needed,
+                agent_id=str(task.get("assignee_id") or "") or None,
+                task_id=params.task_id,
+                evidence=evidence,
+            )
             from hiveweave.services.attestation import has_valid_waiver
 
             waived = await has_valid_waiver(project_id, params.task_id)
@@ -282,8 +274,11 @@ async def review_task_tool(
                         f"browse/test/doc_review attestationIds on resubmit.\n"
                         f"3) Last resort: waive_attestation(taskId=\"{tid}\", "
                         f"evidenceAttestationId=\"<test_run|browse_e2e id>\", "
-                        f"reason=\"<why exempt>\") — after waiving YOU cannot "
-                        f"approve (waived_by cannot approve); a *different* "
+                        f"reason=\"<why THIS task is exempt>\"). Coordinators "
+                        f"must cite evidence. CEO may omit evidenceAttestationId "
+                        f"after looking at this task. One taskId only — cannot "
+                        f"waive all tasks. After waiving YOU cannot approve "
+                        f"(waived_by cannot approve); a *different* "
                         f"REVIEW holder must approve. Use get_tasks to see "
                         f"current waiver state before deciding."
                     )
@@ -436,13 +431,13 @@ async def review_task_tool(
                             f"Do NOT retry approve without new evidence — "
                             f"use option 1 (consume) or 2 (waive) below.\n"
                             f"CEO/management path is to consume assignee/QA "
-                            f"fresh test_run on this task (or its ancestors).\n"
+                            f"fresh evidence on this task (kinds follow submitGate).\n"
                             f"Required kind(s): {kinds_str}. taskId={tid}.\n"
                             f"{mismatch}\n"
                             f"Options:\n"
-                            f"1) Require assignee/QA to run tests with "
-                            f'taskId="{tid}", then approve again '
-                            f"(consume path).\n"
+                            f"1) Require the assignee to hang the gate's attestations "
+                            f"(rework if missing). Do not dispatch QA to unlock "
+                            f"this mid-level gate.\n"
                             f"2) waive_attestation(taskId=\"{tid}\", …) — "
                             f"then a *different* agent must approve, unless "
                             f"you are the sole REVIEW holder beside assignee "
@@ -450,22 +445,22 @@ async def review_task_tool(
                             + deadlock_line
                         )
                     return ToolResult.err(
-                        f"Cannot approve: YOU (the reviewer) have no fresh "
-                        f"execution evidence on this task.\n"
-                        f"Do NOT retry approve without new evidence — run "
-                        f"the tests with taskId first (option 1 below).\n"
-                        f"Required reviewer kind(s): {kinds_str}.\n"
+                        f"Cannot approve: no fresh evidence on this task matching "
+                        f"submitGate ({kinds_str}).\n"
+                        f"Do NOT retry approve. Do NOT run full-site tests yourself "
+                        f"to unlock a leaf gate, and do not dispatch QA for 取证.\n"
                         f"{mismatch}\n"
-                        f"Before approving, run the project's tests yourself "
-                        f"(e.g. `bash`/`run_command` with taskId=\"{tid}\") "
-                        f"so the platform records your attestation.\n"
                         f"taskId={tid}. Options:\n"
-                        f"1) Run tests in the assignee's worktree or on main "
-                        f"(after merge), then approve again.\n"
+                        f"1) Consume the assignee's hung attestations; if missing, "
+                        f"review_task(rework) and tell the leaf to produce the gate "
+                        f"kinds (unit→bash taskId, module_visual→browse screenshot, "
+                        f"code_audit→request_code_audit).\n"
                         f"2) waive_attestation(taskId=\"{tid}\", "
                         f"evidenceAttestationId=\"<id>\", "
-                        f"reason=\"...\") as last resort — then a *different* "
-                        f"agent must approve (you cannot approve your own waiver)."
+                        f"reason=\"...\"). Coordinators must cite evidence; "
+                        f"CEO may omit it for THIS task only (not all tasks). "
+                        f"Then a *different* agent must approve "
+                        f"(you cannot approve your own waiver)."
                         + deadlock_line
                     )
 
@@ -813,10 +808,13 @@ async def review_task_tool(
             return ToolResult.ok(
                 f"Task {params.task_id} approved against assignee worktree"
                 f"{f' ({wt})' if wt else ''}. "
-                f"VERIFY is NOT created yet. "
+                f"VERIFY is NOT auto-created on merge. "
                 f"Next (merge owner = task creator/coordinator): "
                 f"git_worktree_merge(branchName='{short or 'hw/<short_id>/...'}'). "
-                f"If you are NOT the task creator, relay this to the creator. "
+                f"After the milestone is on MAIN, dispatch_task(..., "
+                f"milestoneVerify=true, submitGate=module_visual|unit) "
+                f"to one QA. If you are NOT the task creator, relay merge "
+                f"to the creator. "
                 f"On real content conflict: rework executor to rebase/merge "
                 f"main in their worktree. On untracked-on-main: that is MAIN "
                 f"hygiene — retry merge (auto-quarantine), do NOT rework."

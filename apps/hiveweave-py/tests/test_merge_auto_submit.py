@@ -322,7 +322,7 @@ async def test_stall_auto_submits_merged_running_task(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stall_nudges_when_task_not_merged(monkeypatch):
-    """分支未合入 → 维持原 [TASK STALL] 催办（自动 submit 不触发）。"""
+    """分支未合入 → 不自动 submit；也不再发 [TASK STALL] inbox催."""
     from hiveweave.services import game_time as gt
 
     project_id = "proj-stall-nudge"
@@ -364,8 +364,9 @@ async def test_stall_nudges_when_task_not_merged(monkeypatch):
     ), patch("time.time", return_value=now / 1000):
         await svc._nudge_stale_ledger(project_id)
 
-    assert any(
-        m["message"].startswith("[TASK STALL]") for m in sent
-    ), "未合入的任务应收到 [TASK STALL] 催办"
-    assert svc._watchdog_trigger.await_count == 1
+    assert sent == [], "未合入也不发 [TASK STALL]；等 wait 合同或事件"
+    assert svc._watchdog_trigger.await_count == 0
+    assert (gt._states[project_id].get("task_stall_counts") or {}).get(
+        "abc12345-0000", 0
+    ) >= 1
     gt._states.pop(project_id, None)

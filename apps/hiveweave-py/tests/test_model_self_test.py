@@ -69,6 +69,22 @@ class TestExtractUsage:
         result = _extract_usage_from_response({"usage": None})
         assert result["total_tokens"] == 0
 
+    def test_responses_nested_usage_and_reasoning(self):
+        data = {
+            "object": "response",
+            "response": {
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 4,
+                    "output_tokens_details": {"reasoning_tokens": 3},
+                }
+            },
+        }
+        result = _extract_usage_from_response(data)
+        assert result["input_tokens"] == 10
+        assert result["output_tokens"] == 4
+        assert result["reasoning_tokens"] == 3
+
 
 # ── _detect_model_metadata（通用 /models 探测，无预制数据）─────
 

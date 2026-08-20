@@ -133,6 +133,7 @@ ACK_SPARE_PREFIXES: tuple[str, ...] = (
     "[MERGE PROXY]",
     "[PEER_REVIEW_DEADLOCK]",
     "[POST-MERGE VERIFY]",
+    "[SHIP READY]",
     "[SUBAGENT DONE]",
     "[SUBAGENT FAILED]",
     "[BASH DONE]",
@@ -151,6 +152,7 @@ PARK_EXEMPT_PREFIXES: tuple[str, ...] = (
     "[MERGE PROXY]",
     "[PEER_REVIEW_DEADLOCK]",
     "[POST-MERGE VERIFY]",
+    "[SHIP READY]",
 )
 
 
@@ -204,9 +206,31 @@ _MISSING_COLUMNS = [
 ]
 
 
+async def _schema_marker_key(agent_id: str) -> str:
+    """解析 schema 标记键：agent 当前路由到的 workspace（schema 属于
+    具体 DB 文件，不属于 agent id）。
+
+    路由失败（agent 未注册 / workspace 被驱逐）回退 agent 级键 —— 后续
+    ALTER 的 execute 同样会失败，行为与旧实现一致。
+    """
+    try:
+        await project_db.get_project_db_for_agent(agent_id)
+    except Exception:
+        return f"agent:{agent_id}"
+    return project_db._agent_cache.get(agent_id) or f"agent:{agent_id}"
+
+
 async def _ensure_schema(agent_id: str) -> None:
-    """Add missing columns to inbox table (idempotent)."""
-    if agent_id in _migrated:
+    """Add missing columns to inbox table (idempotent).
+
+    标记按 workspace 键控（非 agent id）：同一 agent id 映射到不同 DB
+    （测试跨文件复用 "exec-1" 等固定 id 切换临时 workspace）时，按
+    agent 记忆会让新库跳过补列 → wake 等列缺失 → inbox 写入/读取全部
+    静默失败（全量回归 test_archive_direct_push 0 通知事故根因，
+    2026-08-19）。
+    """
+    key = await _schema_marker_key(agent_id)
+    if key in _migrated:
         return
     for col_name, col_def in _MISSING_COLUMNS:
         try:
@@ -226,7 +250,7 @@ async def _ensure_schema(agent_id: str) -> None:
         )
     except Exception:
         pass
-    _migrated.add(agent_id)
+    _migrated.add(key)
 
 
 class InboxService:
@@ -314,7 +338,7 @@ class InboxService:
                     t = await TaskService().get_task(pid, str(task_id))
                     if t and not t.get("is_archived"):
                         st = (t.get("status") or "").lower()
-                        if st not in ("closed", "cancelled"):
+                        if st not in ("closed", "cancelled", "blocked"):
                             open_task = True
                             assignee = t.get("assignee_id")
                             if assignee and str(assignee) != str(to_agent_id):
@@ -542,8 +566,39 @@ class InboxService:
         # auto-close so the carve-out sees the resolved reply_to (auto-filled),
         # not only the caller's explicit value. urgent priority notifies also
         # wake — "production incident, FYI" must not wait for a natural wake.
+        # kind=agent wait: a matching notify (no replyTo) still wakes — the
+        # waiter parked on this person. Do not clear the wait here (admit).
         if wake is None and (message_type or "").lower() == "notify":
             wake_flag = reply_to is not None or (priority or "").lower() == "urgent"
+            if not wake_flag:
+                try:
+                    from hiveweave.services.wait_contract import (
+                        kind_agent_wait_matches_sender,
+                        project_id_for_agent,
+                        wait_contract_service,
+                    )
+
+                    pid = await project_id_for_agent(to_agent_id)
+                    if pid:
+                        waits = await wait_contract_service.list_active(
+                            pid, to_agent_id
+                        )
+                        if await kind_agent_wait_matches_sender(
+                            pid, waits, from_agent_id=from_agent_id
+                        ):
+                            wake_flag = True
+                            log.info(
+                                "inbox_notify_wakes_agent_wait",
+                                from_agent_id=from_agent_id,
+                                to_agent_id=to_agent_id,
+                            )
+                except Exception as e:
+                    log.debug(
+                        "inbox_wait_wake_check_failed",
+                        from_agent_id=from_agent_id,
+                        to_agent_id=to_agent_id,
+                        error=str(e),
+                    )
 
         # 在降级之后计算 DB 写入值，确保降级生效
         expect = 1 if expect_report else 0
@@ -870,10 +925,26 @@ class InboxService:
         try:
             pending = await project_db.query(
                 agent_id,
-                "SELECT id, message, message_type, expect_report FROM inbox "
+                "SELECT id, message, message_type, expect_report, "
+                "from_agent_id FROM inbox "
                 "WHERE to_agent_id = ? AND read = 0 AND COALESCE(wake, 1) = 1",
                 [agent_id],
             )
+            wait_pid = None
+            active_waits: list[dict] = []
+            try:
+                from hiveweave.services.wait_contract import (
+                    project_id_for_agent,
+                    wait_contract_service,
+                )
+
+                wait_pid = await project_id_for_agent(agent_id)
+                if wait_pid:
+                    active_waits = await wait_contract_service.list_active(
+                        wait_pid, agent_id
+                    )
+            except Exception as e:
+                log.debug("inbox_park_wait_lookup_failed", error=str(e))
             park_ids: list[str] = []
             for r in pending or []:
                 msg = {
@@ -887,9 +958,26 @@ class InboxService:
                         if "expect_report" in r.keys()
                         else False
                     ),
+                    "from_agent_id": _row_val(r, "from_agent_id") or "",
                 }
                 if should_exempt_from_park(msg):
                     continue
+                from_id = str(msg.get("from_agent_id") or "").strip()
+                if from_id and active_waits and wait_pid:
+                    try:
+                        from hiveweave.services.wait_contract import (
+                            kind_agent_wait_matches_sender,
+                        )
+
+                        if await kind_agent_wait_matches_sender(
+                            wait_pid, active_waits, from_agent_id=from_id
+                        ):
+                            continue
+                    except Exception as e:
+                        log.debug(
+                            "inbox_park_wait_match_failed",
+                            error=str(e),
+                        )
                 if msg.get("id"):
                     park_ids.append(msg["id"])
             if not park_ids:

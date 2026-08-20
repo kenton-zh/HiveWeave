@@ -159,7 +159,7 @@ async def test_dispatch_triggers_assignee():
         ),
     ):
         result = await dispatch_task_tool(
-            DispatchTaskParams(target="A004", task="Do the thing"),
+            DispatchTaskParams(target="A004", task="Do the thing", submitGate="unit"),
             "boss",
             "/ws",
             ctx=None,

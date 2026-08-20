@@ -24,13 +24,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from hiveweave.prompts.goals import format_goals_block
 from hiveweave.prompts.identity import _normalize_cjk_punct
 from hiveweave.prompts.involvement import (
     build_involvement_block,
     normalize_involvement_level,
 )
+from hiveweave.prompts.goals import format_goals_block
 from hiveweave.services.skill_registry import SkillRegistryService
+from hiveweave.util.tree_label import tree_relpath, tree_tag
 
 
 # memory / handoff 内容截断长度（与 memory_service._TRUNCATE_LEN 一致）
@@ -47,6 +48,8 @@ def build_context_prompt(
     bound_skills: list[str] | str | None = None,
     memory_text: str | None = None,
     project_rules: str | None = None,
+    workspace_path: str | None = None,
+    role: str = "",
 ) -> str:
     """构建动态上下文提示词（第 2 条 system 消息内容）。
 
@@ -61,14 +64,20 @@ def build_context_prompt(
         memory_text:        预构建的记忆段文本（优先于 memories 列表；
                             caller 可直接传 memory_service.build_agent_context 输出）
         project_rules:      项目特有规则（从 charter 加载）；None 或空不注入
+        workspace_path:     本轮有效 cwd（worktree 或 MAIN）；空则不加 Workspace 段
+        role:               角色名，用于 QA 后缀
 
     返回：
         上下文提示词字符串。空则返回 ""（caller 应跳过 System 2）。
         caller 负责包装为 `{"role": "system", "content": <返回值>}`。
 
-    段顺序：project_rules → involvement → goals → memory(含 handoffs) → skills
+    段顺序：workspace → project_rules → involvement → goals → memory(含 handoffs) → skills
     """
     parts: list[str] = []
+
+    ws_line = _workspace_block(workspace_path, role)
+    if ws_line:
+        parts.append(ws_line)
 
     # 0. Project Rules（项目特有约束，CEO 摸底后填入 charter）
     if project_rules and project_rules.strip():
@@ -97,6 +106,36 @@ def build_context_prompt(
 
 
 # ── Helpers ─────────────────────────────────────────────────
+
+
+def _is_qa_role(role: str) -> bool:
+    if "测试" in (role or ""):
+        return True
+    r = (role or "").strip().lower()
+    if r in {"test_engineer", "qa_engineer", "qa engineer", "qa"}:
+        return True
+    return "test_engineer" in r or "qa_engineer" in r or "qa engineer" in r or "test engineer" in r
+
+
+def _workspace_block(workspace_path: str | None, role: str = "") -> str:
+    """One relative-path Workspace line. Empty if cwd is unknown."""
+    ws = (workspace_path or "").strip()
+    if not ws:
+        return ""
+    tag = tree_tag(ws)
+    if tag == "MAIN":
+        return (
+            "Workspace: MAIN (project root). Relative writes land here "
+            "and are team-visible."
+        )
+    rel = tree_relpath(ws) or ".hiveweave/worktrees"
+    line = (
+        f"Workspace: {tag} ({rel}). Relative writes stay here until merge. "
+        f"Shared contracts: MAIN docs/ after merge (empty MAIN is OK)."
+    )
+    if _is_qa_role(role):
+        line += " VERIFY/product: bash_main / browse_main only."
+    return line
 
 
 def _format_memory_block(

@@ -82,7 +82,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "`python -m app.server`. Long-running servers are auto-registered "
             "(tracked, killable via `stop_dev_server`); prefer "
             "`start_dev_server`. Do not append `&` on a foreground "
-            "command. Default false keeps stdout in this turn."
+            "command. Default false keeps stdout in this turn. "
+            "This tool stays in YOUR workspace. Project-root / MAIN QA: "
+            "bash_main."
         ),
         "properties": {
             "command": {
@@ -116,16 +118,20 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "browse": {
         "description": (
             "Drive Chromium via agent-browser CLI. Typical: "
-            "goto URL → snapshot -i → click @eN → screenshot path → "
-            "assert_visual. Screenshot pixels inject into the next turn; "
-            "a PNG path is not UI evidence. Prefer after "
-            "start_dev_server / lookup_dev_server."
+            "goto URL → snapshot -i → click @eN → screenshot. "
+            "goto always resets viewport to 1280×900. Mobile: "
+            "viewport 390 844 AFTER goto, then screenshot. "
+            "After screenshot, pixels inject into the next turn. "
+            "Do not assume screenshot.png at repo root or agent-browser/tmp. "
+            "CEO looking at the product does not stamp. "
+            "Stays in YOUR workspace. Milestone VERIFY / full-site MAIN QA "
+            "(and CEO looking at MAIN): use browse_main."
         ),
         "properties": {
             "args": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": 'CLI argv e.g. ["goto","http://127.0.0.1:3000"] or ["snapshot","-i"]',
+                "description": 'CLI argv e.g. ["goto","http://127.0.0.1:3000"], ["viewport","390","844"], or ["snapshot","-i"]',
             },
             "command": {
                 "type": "string",
@@ -137,15 +143,19 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["timeout_sec", "timeout"],
                 "description": "Timeout in seconds (default 60, max 300).",
             },
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id"],
+                "description": "Bind browse_e2e to this task.",
+            },
         },
         "required": [],
     },
     "assert_visual": {
         "description": (
-            "Record a pixel-grounded UI assertion AFTER browse(screenshot). "
-            "Describe what you SEE in the injected image (labels, layout, errors), "
-            "then verdict=pass|fail. Creates visual_check attestation required for "
-            "ui_browser_e2e submit. Path-only / 'looks fine' is rejected."
+            "Optional stamp: record a pixel-grounded UI assertion AFTER "
+            "browse(screenshot). Creates a visual_check row if you want one — "
+            "screenshots already inject into chat, this is not a seeing ritual."
         ),
         "properties": {
             "screenshotPath": {
@@ -179,11 +189,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "look_at_image": {
         "description": (
-            "Ask the configured vision model about a workspace image. "
-            "One-shot text answer; does not inject pixels into chat. "
-            "To inspect another agent's screenshot, pass attestation_id "
-            "from their browse_e2e / visual_check row instead of a path "
-            "under your own worktree."
+            "Optional one-shot: ask a vision-capable model about a workspace "
+            "image (dedicated vision slot, else management chat model). "
+            "Does not replace screenshots already in chat. "
+            "To inspect another agent's PNG, pass attestation_id."
         ),
         "properties": {
             "image_path": {
@@ -307,7 +316,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "filePath": {
                 "type": "string",
                 "aliases": ["path", "file_path", "file"],
-                "description": "Path to read (relative to workspace).",
+                "description": (
+                    "Path to read (relative to your workspace). Reviewers: "
+                    ".hiveweave/worktrees/<shortId>/… is the assignee tree. "
+                    "Do not use ../ for MAIN docs."
+                ),
             },
             "offset": {"type": "integer", "aliases": ["startLine"],
                 "description": "Starting line number (0-based, default: 0)."},
@@ -342,7 +355,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "grep; for a filename glob use search_files."
         ),
         "properties": {
-            "dirPath": {"type": "string", "aliases": ["path", "directory", "dir"]},
+            "dirPath": {
+                "type": "string",
+                "aliases": ["path", "directory", "dir"],
+                "description": (
+                    "Directory to list (relative to your workspace). "
+                    "Reviewers: .hiveweave/worktrees/<shortId>/. "
+                    "Do not use ../ for MAIN."
+                ),
+            },
             "recursive": {"type": "boolean", "description": "If true, list recursively. Default: false."},
             "maxdepth": {"type": "integer", "description": "Max depth when recursive (1-3). Default: 1. Values above 3 are clamped to 3."},
         },
@@ -356,7 +377,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         ),
         "properties": {
             "pattern": {"type": "string", "aliases": ["regex", "query", "search"]},
-            "path": {"type": "string", "aliases": ["filePath", "file", "directory", "dir"]},
+            "path": {
+                "type": "string",
+                "aliases": ["filePath", "file", "directory", "dir"],
+                "description": (
+                    "Directory or file to search (relative to your workspace). "
+                    "Reviewers: .hiveweave/worktrees/<shortId>/."
+                ),
+            },
             "include": {"type": "string", "aliases": ["glob", "filter"]},
             "head_limit": {"type": "integer", "aliases": ["headLimit", "maxResults", "limit"],
                 "description": "Max results to return (default: 500)."},
@@ -581,7 +609,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "ask_agent": {
         "description": (
-            "Ask agents and require a reply. Prefer over "
+            "Ask agents and require a reply. Put the request AND what they "
+            "must return in this one message. Do not also send_message a "
+            "status-only follow-up. Prefer over "
             "send_message(expectReport=true). When answering an existing ask, "
             "pass replyTo=that message's reply_contract_id (not the "
             "tool-result message id) or a new obligation is created."
@@ -627,7 +657,13 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "MANDATORY end-of-turn return value (TurnResult). Every turn is a "
             "function call — you MUST commit_turn before stopping. "
             "phase: in_progress|waiting|blocked|done_slice. "
-            "waiting/blocked require waiting_on. Assistant text is NOT a return value."
+            "waiting/blocked require waiting_on. kind is the ref type only: "
+            "person-decision = ask_agent first then kind=agent "
+            "(WAIT_WITHOUT_ASK still hard); their work = kind=task + id from "
+            "the receipt (no status-ask). notify from that person still "
+            "wakes/clears the agent wait. Do not "
+            "update_task_status(blocked) for a person or this task's own id. "
+            "Assistant text is NOT a return value."
         ),
         "properties": {
             "phase": {
@@ -643,7 +679,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "aliases": ["waiting_on"],
                 "description": (
-                    "Required for waiting/blocked. "
+                    "Required for waiting/blocked. kind is the ref type only. "
+                    "agent = person's decision (ask_agent first; "
+                    "WAIT_WITHOUT_ASK still hard; ref = 花名 or A100); "
+                    "task = their work (copy the entire task id from the "
+                    "receipt; no status-ask). A notify from that person still "
+                    "wakes/clears the agent wait (no replyTo required). "
+                    "Do not scan language. Do not put this task or a person "
+                    "in update_task_status dependsOnTaskIds. "
                     "Items: {kind: agent|task|user|timer|external, ref: string, note?: string}"
                 ),
             },
@@ -695,7 +738,17 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["system_prompt", "backstory"],
                 "description": "2-4 sentence character narrative (also accepted as backstory).",
             },
-            "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills to bind. Tool skills: use \"#N\" to reference skills from list_available_skills by number (e.g. \"#1\"). Discipline skills: use full slug from matching table (e.g. \"self-review\"). NOT raw tech names like 'React 18'."},
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Skills to bind. Marketplace is optional: \"#N\" or the "
+                    "full slug from list_available_skills (that store only). "
+                    "If none match or bind fails, pass built-in discipline "
+                    "slugs only. Discipline: full slug from the matching "
+                    "table (e.g. self-review). NOT raw tech names."
+                ),
+            },
             "parentId": {"type": "string", "aliases": ["parent_id", "parent", "parentAgentId", "parent_agent_id"]},
             "templateId": {"type": "string", "aliases": ["template_id"]},
         },
@@ -753,9 +806,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "list_available_skills": {
         "description": (
-            "List marketplace skills (built-in + external + skills.sh). "
-            "Pass search to filter. Returns numbered rows (#1, #2); pass "
-            "\"#N\" or the full slug to hire_agent."
+            "List skills (built-in + marketplace). Marketplace rows are "
+            "optional and tagged with their store (skills.sh vs SkillHub); "
+            "pass \"#N\" or the full slug to hire_agent. Bind uses that "
+            "store only — the two catalogs do not share ids."
         ),
         "properties": {
             "search": {"type": "string", "description": "Optional keyword to filter skills (e.g. 'react', 'testing', 'planning'). Case-insensitive."},
@@ -986,9 +1040,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "dispatch_task": {
         "description": (
-            "Assign work now: ledger entry AND inbox wake. Pass taskId to "
-            "reuse a create_task draft. create_task alone does not wake anyone. "
-            "Same-assignee duplicates cannot be forced."
+            "Assign work now: ledger + inbox. Always pass submitGate "
+            "(docs|unit|module_visual|code_audit|code_audit+module_visual|"
+            "code_audit+unit) — required for NEW tasks; ignored on taskId reuse "
+            "(ledger policy stays). Unmet dependsOn → blocked, assignee recorded, "
+            "NOT woken (also applied when reusing taskId). dependsOn = other "
+            "task ids only (self-id rejected); waiting on a person is "
+            "commit_turn(waiting, kind=agent). create_task alone "
+            "does not wake. Milestone MAIN QA: milestoneVerify=true "
+            "(coordinator/CEO). Same-assignee dups cannot be forced."
         ),
         "properties": {
             "target": {"type": "string", "aliases": ["toAgentId", "to_agent_id", "recipient", "agentId", "subordinate", "agent_id"]},
@@ -1012,8 +1072,35 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["artifact_refs", "required_paths"],
                 "description": "Paths the assignee must be able to read (checked in their worktree).",
             },
+            "submitGate": {
+                "type": "string",
+                "aliases": ["submit_gate", "gate"],
+                "description": (
+                    "Always pass. Required for NEW tasks; ignored on taskId "
+                    "reuse. docs | unit | module_visual | code_audit | "
+                    "code_audit+module_visual | code_audit+unit."
+                ),
+            },
+            "milestoneVerify": {
+                "type": "boolean",
+                "aliases": ["milestone_verify"],
+                "description": (
+                    "Coordinator/CEO: mint a MAIN-serialized VERIFY: "
+                    "milestone QA task. Not per-leaf merge."
+                ),
+            },
+            "dependsOn": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["depends_on"],
+                "description": (
+                    "Other task ids only (self-id rejected). Unmet → blocked "
+                    "(assignee recorded, not woken). VERIFY titles skip "
+                    "auto-block. People-waiting is commit_turn, not this list."
+                ),
+            },
         },
-        "required": ["target", "task"],
+        "required": ["target", "task", "submitGate"],
     },
     "review": {
         "description": "Run a local review suite (code_review|security_audit|test_review|perf_audit) on filePaths. Returns findings — not a test_run attestation.",
@@ -1081,7 +1168,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Merge a worktree branch into main and remove the worktree. "
             "Pass taskId to hit hw/<shortId>/t-<taskId[:8]>. On conflict: "
             "abort — rework the executor to rebase main in their worktree. "
-            "On success: spawn VERIFY only for tasks this merge covers."
+            "Does not auto-spawn VERIFY. After a milestone is on MAIN, "
+            "coordinators dispatch one QA task with milestoneVerify=true."
         ),
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
@@ -1146,11 +1234,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     # — Task Ledger tools (Task 4) —
     "create_task": {
         "description": (
-            "Write a Task Ledger row. Does not inbox/wake anyone. Unassigned "
-            "→ created; with assigneeId → claimed (assign=claim), except "
-            "VERIFY stays created until the serial lock is free. To wake, "
-            "call dispatch_task (pass taskId to reuse). Prefer "
-            "dispatch_task(taskId=…) to transfer an existing task."
+            "Write a Task Ledger row. Does not inbox/wake anyone. submitGate is "
+            "REQUIRED (docs|unit|module_visual|code_audit|code_audit+*). "
+            "Unassigned → created; with assigneeId → claimed unless dependsOn "
+            "is unmet (blocked, not claimed). dependsOn = other task ids only "
+            "(self-id rejected); waiting on a person is commit_turn. "
+            "VERIFY titles stay created. "
+            "Coordinator/CEO milestone MAIN QA: milestoneVerify=true. To wake, "
+            "call dispatch_task (pass taskId to reuse)."
         ),
         "properties": {
             "title": {"type": "string", "aliases": ["name", "summary"]},
@@ -1164,7 +1255,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["acceptance_criteria"]},
             "parentTaskId": {"type": "string", "aliases": ["parent_task_id", "parent"]},
             "dependsOn": {"type": "array", "items": {"type": "string"},
-                "aliases": ["depends_on"]},
+                "aliases": ["depends_on"],
+                "description": "Other task ids only (self-id rejected). Unmet → blocked (not claimed/woken). VERIFY titles skip auto-block. People-waiting is commit_turn, not this list."},
             "expectedModules": {"type": "array", "items": {"type": "string"},
                 "aliases": ["expected_modules"]},
             "tags": {"type": "array", "items": {"type": "string"}},
@@ -1177,8 +1269,24 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "type": "boolean",
                 "description": "Create despite a cross-assignee/structured dup. Same-assignee dup cannot be forced.",
             },
+            "submitGate": {
+                "type": "string",
+                "aliases": ["submit_gate", "gate"],
+                "description": (
+                    "Required. docs | unit | module_visual | code_audit | "
+                    "code_audit+module_visual | code_audit+unit."
+                ),
+            },
+            "milestoneVerify": {
+                "type": "boolean",
+                "aliases": ["milestone_verify"],
+                "description": (
+                    "Coordinator/CEO: mint a MAIN-serialized VERIFY: "
+                    "milestone QA task."
+                ),
+            },
         },
-        "required": ["title", "description"],
+        "required": ["title", "description", "submitGate"],
     },
     "claim_task": {
         "description": "Claim a created/unassigned task (created → claimed). Sets you as assignee.",
@@ -1191,8 +1299,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "Set status to running (start or unblock) or blocked. "
             "blocked requires dependsOnTaskIds and/or wakeAt — a block "
-            "with neither is rejected. Status omitted defaults to running. "
-            "blockedReason is a note only, never an unblock path."
+            "with neither is rejected. dependsOnTaskIds = other task ids "
+            "only (self-id rejected). Waiting for a person keeps the task "
+            "running and uses commit_turn(waiting, waiting_on kind=agent). "
+            "Status omitted defaults to running. "
+            "blockedReason is a note only, never an unblock path. "
+            "running/unblock is refused while depends_on are still unmet."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
@@ -1206,7 +1318,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "items": {"type": "string"},
                 "aliases": ["depends_on_task_ids", "dependsOnTaskId",
                             "depends_on_task_id", "dependsOn"],
-                "description": "Blocker task ids (auto-unblock when all approved/closed). Passing dependsOnTaskIds or wakeAt is REQUIRED when blocking."},
+                "description": "Other task ids only (auto-unblock when all approved/closed). Self-id is rejected. People-waiting is commit_turn, not this list. Passing dependsOnTaskIds or wakeAt is REQUIRED when blocking."},
             "waitKind": {"type": "string",
                 "aliases": ["wait_kind"],
                 "enum": ["dependency", "timer", "user", "external"],
@@ -1280,12 +1392,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "review_task": {
         "description": (
             "Review a submitted task: decision=approve|rework. approve needs "
-            "fresh test_run (or docs_only attest_doc_review) bound to this "
-            "taskId — not bare testsPassed. Run tests yourself with "
-            "bash(..., taskId=this) first; if rejected for missing evidence, "
-            "do not retry approve. Does not spawn VERIFY — call "
-            "git_worktree_merge next. waive_attestation: another agent must "
-            "approve (VERIFY waive is CEO-only)."
+            "fresh attestation kinds for this task's submitGate/policy — not "
+            "bare testsPassed. Prefer consuming the assignee's hung evidence "
+            "(unit→test_run, module_visual→browse_e2e, docs→doc_review, "
+            "code_audit*→code_audit). CEO: review-only, do not self-test or "
+            "merge leaf trees. Mid-level: merge after approve; do NOT expect "
+            "per-leaf VERIFY spawn. Milestone QA is dispatch_task("
+            "milestoneVerify=true) after MAIN is ready. If approve is rejected "
+            "for missing evidence, do not retry — send back for the gate. "
+            "VERIFY waive is CEO-only."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
@@ -1377,21 +1492,34 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "waive_attestation": {
         "description": (
-            "Last-resort waiver of the attestation gate (coordinator/CEO). "
-            "Requires evidenceAttestationId of a real test_run / browse_e2e / "
-            "visual_check / doc_review. Max 2 per task. The waiving agent "
-            "cannot later approve. Prefer attest_doc_review for docs_only."
+            "Waive the attestation gate for ONE task. Never all tasks. "
+            "Copy the entire taskId from the tool receipt; do not truncate. "
+            "CEO: look at ledger.scope for that task first; may omit "
+            "evidenceAttestationId after looking at that task. "
+            "Coordinators must cite a real test_run / browse_e2e / "
+            "visual_check / doc_review. Max 2 per task. Waiving agent "
+            "cannot later approve (unless small-team sole reviewer)."
         ),
         "properties": {
-            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id", "id"],
+                "description": (
+                    "Exactly one task id copied whole from the receipt. "
+                    "Not a list, not all, do not truncate."
+                ),
+            },
             "reason": {"type": "string"},
             "evidenceAttestationId": {
                 "type": "string",
                 "aliases": ["evidence_attestation_id"],
-                "description": "Id of a real execution attestation. Pure read_file is not enough.",
+                "description": (
+                    "Coordinator: required execution attestation id. "
+                    "CEO: optional after looking at this task."
+                ),
             },
         },
-        "required": ["taskId", "reason", "evidenceAttestationId"],
+        "required": ["taskId", "reason"],
     },
     "waive_merge": {
         "description": (
@@ -1437,8 +1565,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "get_platform_state": {
         "description": (
             "Read-only platform ground truth (gates, ledger, org, runtime) "
-            "tagged verified/claimed/unknown. Trust this over peer chat "
-            "when they conflict."
+            "tagged verified/claimed/unknown. ledger.mine = your actionable "
+            "to-dos (empty mine ≠ org done). CEO/mid: read ledger.scope "
+            "(includes blocked) before waive/complete. Also "
+            "inbox.named_tasks. Trust this over peer chat when they conflict."
         ),
         "properties": {},
         "required": [],
@@ -1552,6 +1682,35 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": [],
     },
+}
+
+TOOL_PARAM_SCHEMAS["bash_main"] = {
+    **TOOL_PARAM_SCHEMAS["bash"],
+    "properties": dict(TOOL_PARAM_SCHEMAS["bash"].get("properties") or {}),
+    "description": (
+        "Same as bash, but cwd is the PROJECT ROOT (shared MAIN), not your "
+        "worktree. Use for milestone VERIFY tests and anything that must see "
+        "merged HEAD. Slice unit tests stay on bash."
+    ),
+}
+TOOL_PARAM_SCHEMAS["browse_main"] = {
+    **TOOL_PARAM_SCHEMAS["browse"],
+    "properties": dict(TOOL_PARAM_SCHEMAS["browse"].get("properties") or {}),
+    "description": (
+        "Same as browse, but Chromium cwd is the PROJECT ROOT. QA: "
+        "milestone VERIFY / full-site MAIN. CEO: look at the product "
+        "(not a test duty). Module visual in your slice stays on browse. "
+        "After screenshot, pixels inject into chat."
+    ),
+}
+TOOL_PARAM_SCHEMAS["game_run_case_main"] = {
+    **TOOL_PARAM_SCHEMAS["game_run_case"],
+    "properties": dict(TOOL_PARAM_SCHEMAS["game_run_case"].get("properties") or {}),
+    "description": (
+        "Same as game_run_case, but Chromium cwd is the PROJECT ROOT. Use "
+        "for milestone VERIFY / MAIN H5 QA. Slice harness stays on "
+        "game_run_case."
+    ),
 }
 
 def _resolve_alias_for_tool(arg_name: str, props: dict) -> str | None:

@@ -48,6 +48,7 @@ META_DB_TABLES = [
         context_window INTEGER DEFAULT 128000,
         max_output_tokens INTEGER DEFAULT 4096,
         supports_thinking INTEGER DEFAULT 0,
+        thinking_format TEXT DEFAULT '',
         default_reasoning_effort TEXT,
         temperature REAL DEFAULT 1.0,
         is_active INTEGER DEFAULT 1,

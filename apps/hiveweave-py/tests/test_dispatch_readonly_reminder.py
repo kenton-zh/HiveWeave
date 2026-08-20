@@ -34,7 +34,9 @@ _DISPATCH_OK: dict = {
 
 
 def _params() -> DispatchTaskParams:
-    return DispatchTaskParams(target="A009", task="实现登录模块")
+    return DispatchTaskParams(
+        target="A009", task="实现登录模块", submitGate="unit"
+    )
 
 
 def _get_agent_side_effect(assignee: dict | None, lookup_error: bool = False):

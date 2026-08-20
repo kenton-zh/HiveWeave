@@ -26,12 +26,6 @@ from hiveweave.llm.streamer.core import Streamer
 from hiveweave.llm.streamer.tool_exec import ToolExecMixin
 
 
-@pytest.fixture(autouse=True)
-def _enable_session_wall_clock(monkeypatch):
-    """These tests exercise the opt-in TOTAL/HARD gates."""
-    monkeypatch.setenv("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "1")
-
-
 class _FakeClock:
     """工具可控的 monotonic 时钟（只替换 tool_loop 模块命名空间里的 time）。"""
 
@@ -69,6 +63,11 @@ def _make_streamer() -> Streamer:
     )
     # 上下文裁剪 / 中轮提醒与本测试无关，置为恒等避免引入依赖
     streamer._trim_context_if_needed = lambda messages, provider: messages  # type: ignore[method-assign]
+
+    async def _ident_pressure(messages, provider, **kwargs):
+        return messages
+
+    streamer._pressure_compact_if_needed = _ident_pressure  # type: ignore[method-assign]
     streamer._maybe_inject_mid_round_reminder = (  # type: ignore[method-assign]
         lambda messages, round_num, cap: messages
     )
@@ -270,8 +269,7 @@ def test_budget_exhausted_result_explains_even_without_text():
 # ── 3. 预算帽收紧的工具超时：文案区分「预算耗尽」 ────────────────
 
 
-async def test_budget_capped_timeout_message_explains_budget(monkeypatch):
-    monkeypatch.setenv("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "1")
+async def test_budget_capped_timeout_message_explains_budget():
     te = ToolExecMixin()
 
     async def slow_tool(name, arguments, tool_call_id):
@@ -290,8 +288,7 @@ async def test_budget_capped_timeout_message_explains_budget(monkeypatch):
     assert "do NOT retry the same long call" in content
 
 
-async def test_natural_timeout_message_has_no_budget_note(monkeypatch):
-    monkeypatch.setenv("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "1")
+async def test_natural_timeout_message_has_no_budget_note():
     te = ToolExecMixin()
 
     async def slow_tool(name, arguments, tool_call_id):
@@ -317,8 +314,7 @@ async def test_natural_timeout_message_has_no_budget_note(monkeypatch):
     assert "remaining turn budget" not in content
 
 
-async def test_budget_capped_timeout_message_question(monkeypatch):
-    monkeypatch.setenv("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "1")
+async def test_budget_capped_timeout_message_question():
     te = ToolExecMixin()
 
     async def slow_tool(name, arguments, tool_call_id):

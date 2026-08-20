@@ -43,15 +43,15 @@ def _tiny_png(path: Path) -> None:
 
 def test_screenshot_path_from_argv():
     assert _screenshot_path_from_argv(["screenshot", "evidence/a.png"]) == "evidence/a.png"
-    assert _screenshot_path_from_argv(["screenshot"]) == "screenshot.png"
+    assert _screenshot_path_from_argv(["screenshot"]) is None
     assert _screenshot_path_from_argv(["goto", "http://x"]) is None
 
 
 @pytest.mark.asyncio
 async def test_browse_screenshot_success_text_includes_abs_path(tmp_path: Path, monkeypatch):
     """Regression: screenshot_path extra field is dropped by tool_exec — the
-    injected-text note MUST carry the resolved absolute path so the agent can
-    call assert_visual(screenshotPath=...) next round."""
+    injected-text note MUST carry the path so the next turn still knows the file.
+    """
     from hiveweave.tools.browse_tools import browse_tool
 
     ws = tmp_path / "ws"
@@ -79,9 +79,10 @@ async def test_browse_screenshot_success_text_includes_abs_path(tmp_path: Path, 
     )
     assert result.success is True
     text = result.output
-    abs_win = str(png.resolve()).replace("\\", "/")
-    assert abs_win in text, text
-    assert f"assert_visual(screenshotPath=\"{abs_win}\"" in text
+    rel = "evidence/flow.png"
+    assert rel in text, text
+    assert "assert_visual(" not in text
+    assert "pixels attached" in text.lower() or "[VISION]" in text
     assert result.extra.get("images")
 
 
@@ -222,9 +223,9 @@ def test_anthropic_tool_result_includes_image_blocks():
     assert found_image
 
 
-def test_ui_policy_requires_visual_check_and_browse_e2e():
+def test_ui_policy_requires_browse_e2e_not_assert_visual_ritual():
     assert required_attestation_kinds("ui_browser_e2e") == frozenset(
-        {VISUAL_CHECK_KIND, BROWSE_E2E_KIND}
+        {BROWSE_E2E_KIND}
     )
 
 
@@ -364,8 +365,11 @@ async def test_verify_ids_requires_all_kinds():
     assert "browse_e2e" in err.lower() or "missing" in err.lower()
 
 
-def test_browse_skill_mentions_assert_visual():
+def test_browse_skill_does_not_prescribe_assert_visual_ritual():
     from hiveweave.services.skill_registry import BUILTIN_SKILLS
 
     browse = next(s for s in BUILTIN_SKILLS if s["slug"] == "browse")
-    assert "assert_visual" in browse["instructions"]
+    text = browse["instructions"]
+    assert "screenshot" in text.lower()
+    assert "assert_visual" not in text
+    assert "look_at_image" not in text

@@ -450,7 +450,10 @@ async def test_watchdog_force_wakes_complete_agent():
 
 @pytest.mark.asyncio
 async def test_wait_timeout_renudges_outstanding_debtor(env):
-    """P1b: expired agent-wait with open ask → ASK_OUTSTANDING + force wake."""
+    """Expired agent-wait: [WAIT_TIMEOUT] to waiter only (ask_outstanding flag).
+
+    No [ASK_OUTSTANDING] / force-wake of the debtor — platform does not催人.
+    """
     from hiveweave.services.game_time import GameTimeService
     from hiveweave.services.inbox import InboxService
 
@@ -514,14 +517,14 @@ async def test_wait_timeout_renudges_outstanding_debtor(env):
         # get_outstanding_ask_recipients must see real DB ask
         await gt._process_wait_contracts(PROJECT_ID)
 
-    assert any(
+    assert not any(
         "[ASK_OUTSTANDING]" in str(s.get("message") or "") for s in sent
     )
-    assert any(
-        aid == COORD and kw.get("force") is True for aid, kw in force_calls
-    )
+    assert not any(aid == COORD for aid, _kw in force_calls)
     assert any(
         "[WAIT_TIMEOUT]" in str(s.get("message") or "")
         and "ask_outstanding=True" in str(s.get("message") or "")
+        and s.get("to_agent_id") == CEO
         for s in sent
     )
+    assert any(aid == CEO for aid, _kw in force_calls)

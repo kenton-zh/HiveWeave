@@ -12,6 +12,7 @@ import asyncio
 import base64
 import os
 import shlex
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Literal
@@ -29,6 +30,28 @@ log = structlog.get_logger(__name__)
 # Minimum structured observation length for assert_visual (not free-text scrape —
 # the field itself is the structured assertion evidence).
 _VISUAL_OBSERVED_MIN = 40
+
+
+async def agent_is_look_only_browser(agent_id: str) -> bool:
+    """CEO (BROWSE, no test duty) looks; do not nudge assert_visual / stamp."""
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.policy import has_visual_test_duty
+
+        agent = await meta_db.get_agent_by_id(agent_id)
+        if not agent:
+            return False
+        return not has_visual_test_duty(agent)
+    except Exception:
+        return False
+
+
+def screenshot_followup_text(shot_display: str, *, look_only: bool) -> str:
+    """Post-screenshot copy. Pixels are attached; do not prescribe a tool."""
+    extra = " Looking-only: no test stamp." if look_only else ""
+    return (
+        f"[VISION] Screenshot pixels attached (path={shot_display}).{extra}"
+    )
 
 # agent-browser `eval <js>` is a direct argv expression. Direct form is used
 # for short snippets; base64 (-b) avoids shell/argv escaping for the rest;
@@ -166,11 +189,12 @@ async def _maybe_git_commit(workspace: str) -> str | None:
 
 
 def _screenshot_path_from_argv(argv: list[str]) -> str | None:
-    """Extract output path from ``screenshot [path]`` argv.
+    """Extract explicit output path from ``screenshot [path]`` argv.
 
     Supports both ``screenshot path.png``, ``screenshot --selector canvas path.png``
     and the agent-browser positional form ``screenshot canvas path.png``
-    (also under the ``shoot`` alias).
+    (also under the ``shoot`` alias). Returns None when the caller omitted a
+    path — callers must inject an explicit workspace-relative path before spawn.
     """
     if not argv:
         return None
@@ -192,7 +216,113 @@ def _screenshot_path_from_argv(argv: list[str]) -> str | None:
         i += 1
     if candidates:
         return candidates[-1]
-    return "screenshot.png"
+    return None
+
+
+def _screenshot_agent_dir(agent_id: str | None) -> str:
+    raw = str(agent_id or "agent").strip() or "agent"
+    safe = "".join(ch for ch in raw if ch.isalnum() or ch in "-_")
+    if not safe:
+        return "agent"
+    compact = safe.replace("-", "")
+    if len(compact) >= 32:
+        return compact[:8]
+    return safe[:40]
+
+
+def default_screenshot_relpath(
+    agent_id: str | None, *, now_ms: int | None = None
+) -> str:
+    """Workspace-relative default for a screenshot with no caller path."""
+    stamp = int(now_ms if now_ms is not None else time.time() * 1000)
+    return (
+        f".hiveweave/reports/{_screenshot_agent_dir(agent_id)}/shot-{stamp}.png"
+    )
+
+
+def ensure_screenshot_argv(
+    argv: list[str],
+    agent_id: str | None = None,
+    *,
+    now_ms: int | None = None,
+) -> list[str]:
+    """Always pass an explicit workspace-relative path to the screenshot CLI.
+
+    HiveWeave must not rely on CLI cwd/tmp defaults. If the agent omitted a
+    path, inject ``.hiveweave/reports/<agent>/shot-<ts>.png``.
+    """
+    if not argv:
+        return list(argv)
+    head = (argv[0] or "").lower().replace("-", "_")
+    if head not in ("screenshot", "shoot"):
+        return list(argv)
+    if _screenshot_path_from_argv(argv):
+        return list(argv)
+    return [*argv, default_screenshot_relpath(agent_id, now_ms=now_ms)]
+
+
+def _screenshot_missing_diagnostic(
+    workspace: str, shot_rel: str
+) -> str:
+    """Locate where the screenshot actually landed instead of a vague error.
+
+    With paths pinned absolute this should be an edge case, but when the file
+    still isn't where we expect, search likely roots (workspace, OS temp, the
+    agent-browser daemon cwd) by basename so the agent isn't left guessing.
+    """
+    name = Path(shot_rel).name
+    import tempfile
+
+    roots: list[str] = []
+    if workspace and Path(workspace).is_dir():
+        roots.append(workspace)
+    tmp = tempfile.gettempdir()
+    if tmp and Path(tmp).is_dir():
+        roots.append(tmp)
+    if os.getcwd():
+        roots.append(os.getcwd())
+    hits: list[str] = []
+    checked = {r for r in roots if r}
+    for root in checked:
+        try:
+            for p in Path(root).rglob(name):
+                if p.is_file():
+                    hits.append(str(p))
+        except OSError:
+            continue
+    if hits:
+        return (
+            "Screenshot was written to: "
+            f"{hits[0]} (agent-browser daemon cwd drifted from the "
+            "workspace). Do not copy from there — re-take pinned to the "
+            f"workspace: browse(args=[\"screenshot\", \"{shot_rel}\"])."
+        )
+    return (
+        "The screenshot command exited 0 but no PNG was found under the "
+        f"workspace ({shot_rel}) or the OS temp dir. The daemon may not "
+        "have flushed the file — restart the session and re-take: "
+        'browse(args=["restart"]), then '
+        f'browse(args=["screenshot", "{shot_rel}"]).'
+    )
+
+
+def _workspace_rel_shot_display(
+    workspace: str, shot_rel: str, shot_path: Path | None
+) -> str:
+    """Receipt path: workspace-relative posix, never a CLI tmp guess."""
+    rel = (shot_rel or "").strip().replace("\\", "/")
+    if rel and not Path(rel).is_absolute():
+        return rel
+    if shot_path and workspace:
+        try:
+            return (
+                shot_path.resolve()
+                .relative_to(Path(workspace).resolve())
+                .as_posix()
+            )
+        except ValueError:
+            pass
+    return rel or (str(shot_path or "").replace("\\", "/"))
 
 
 # gstack-style head → agent-browser head. Commands absent from this table
@@ -221,6 +351,80 @@ BROWSE_RESTART_HINT = (
     'If goto/eval keep timing out, call browse(["restart"]).'
 )
 
+# Desktop default. goto always applies this so a leftover mobile session
+# cannot stamp "desktop" screenshots (TEST_DSH_05). Narrow checks: viewport
+# AFTER goto.
+DEFAULT_VIEWPORT = (1280, 900)
+_GOTO_HEADS = frozenset({"goto", "navigate", "open"})
+_VIEWPORT_HEADS = frozenset({"viewport", "set_viewport"})
+_VIEWPORT_MIN, _VIEWPORT_MAX = 32, 4096
+VIEWPORT_USAGE = (
+    'viewport needs width height. Example: args=["viewport","390","844"] '
+    'or args=["viewport","390x844"]. Optional scale: '
+    'args=["viewport","1280","900","2"].'
+)
+
+
+def parse_viewport_args(rest: list[str]) -> tuple[int, int, int | None] | None:
+    """Parse ``390 844 [scale]`` or ``390x844 [scale]``. None if invalid."""
+    if not rest:
+        return None
+    tokens = [str(t).strip() for t in rest if str(t).strip()]
+    if not tokens:
+        return None
+    first = tokens[0].lower().replace("*", "x")
+    w = h = None
+    extra: list[str] = []
+    if "x" in first:
+        parts = first.split("x")
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            return None
+        w, h = int(parts[0]), int(parts[1])
+        extra = tokens[1:]
+    elif len(tokens) >= 2 and tokens[0].lstrip("-").isdigit() and tokens[1].lstrip("-").isdigit():
+        w, h = int(tokens[0]), int(tokens[1])
+        extra = tokens[2:]
+    else:
+        return None
+    if w is None or h is None:
+        return None
+    if not (_VIEWPORT_MIN <= w <= _VIEWPORT_MAX and _VIEWPORT_MIN <= h <= _VIEWPORT_MAX):
+        return None
+    scale = None
+    if extra:
+        if not extra[0].isdigit():
+            return None
+        scale = int(extra[0])
+        if scale < 1 or scale > 4:
+            return None
+    return w, h, scale
+
+
+def _viewport_cli_argv(dims: tuple[int, int, int | None]) -> list[str]:
+    w, h, scale = dims
+    out = ["set", "viewport", str(w), str(h)]
+    if scale is not None:
+        out.append(str(scale))
+    return out
+
+
+def _is_viewport_command(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    head = (argv[0] or "").lower().replace("-", "_")
+    if head in _VIEWPORT_HEADS:
+        return True
+    if head == "set" and len(argv) > 1 and str(argv[1]).lower() == "viewport":
+        return True
+    return False
+
+
+def _viewport_rest(argv: list[str]) -> list[str]:
+    head = (argv[0] or "").lower().replace("-", "_")
+    if head in _VIEWPORT_HEADS:
+        return [str(a) for a in argv[1:]]
+    return [str(a) for a in argv[2:]]
+
 
 def _map_ab_argv(argv: list[str], workspace: str) -> tuple[list[str], str | None]:
     """Translate browse (gstack-style) argv to agent-browser argv.
@@ -239,6 +443,11 @@ def _map_ab_argv(argv: list[str], workspace: str) -> tuple[list[str], str | None
         return _eval_argv(head, rest, workspace)
     if head in ("screenshot", "shoot"):
         return _screenshot_argv(rest), None
+    if _is_viewport_command(argv):
+        dims = parse_viewport_args(_viewport_rest(argv))
+        if dims is None:
+            return ["set", "viewport"], None
+        return _viewport_cli_argv(dims), None
 
     head = _HEAD_ALIASES.get(head, head)
     return [head, *rest], None
@@ -300,6 +509,46 @@ def _screenshot_argv(rest: list[str]) -> list[str]:
     return out
 
 
+def _inject_shot_abs_path(workspace: str, shot_rel: str) -> str:
+    """Resolve a workspace-relative screenshot path to absolute.
+
+    agent-browser persists screenshots relative to its own cwd. The CLI is
+    spawned with ``cwd=workspace``, but the long-lived daemon
+    (AGENT_BROWSER_SESSION) reuses a session whose working directory can
+    drift from the workspace — a relative path then lands in the daemon's
+    cwd/tmp and browse_tool's is_file() check misses it. Pin the output to
+    an absolute workspace path so the file always lands under the workspace.
+    """
+    if Path(shot_rel).is_absolute():
+        return str(Path(shot_rel))
+    if workspace and Path(workspace).is_dir():
+        return str(Path(workspace).resolve() / shot_rel)
+    return shot_rel
+
+
+def _pin_shot_path(
+    mapped: list[str], workspace: str, shot_rel: str
+) -> list[str]:
+    """Pin the CLI screenshot output path to an absolute workspace path.
+
+    ``mapped`` is the agent-browser argv; agent-browser takes the output
+    path as the last positional (see _screenshot_argv, which keeps the path
+    last even with ``--selector``/flags). If the tail already equals the raw
+    relative path, replace it; otherwise append the absolute path. Pinning
+    abs makes the is_file() check in browse_tool trustworthy even when the
+    daemon cwd drifts.
+    """
+    out = list(mapped)
+    if not out:
+        return out
+    abs_shot = _inject_shot_abs_path(workspace, shot_rel)
+    if out[-1] == shot_rel:
+        out[-1] = abs_shot
+    else:
+        out.append(abs_shot)
+    return out
+
+
 def _browse_child_env(agent_id: str | None = None) -> dict[str, str]:
     """Env for agent-browser — per-agent headless daemon session.
 
@@ -315,6 +564,34 @@ def _browse_child_env(agent_id: str | None = None) -> dict[str, str]:
     if agent_id:
         env["AGENT_BROWSER_SESSION"] = f"hiveweave-{agent_id[:40]}"
         env.setdefault("AGENT_BROWSER_IDLE_TIMEOUT_MS", str(2 * 60 * 60 * 1000))
+    # 代理剥离：dev 机后端常带 HTTP(S)_PROXY 启动，agent-browser 会自动读它。
+    # browse 的目标是本机前端 dev server（localhost/127.0.0.1），本就不该走
+    # LLM 用的远程代理；且该代理不稳，导航常挂死到超时 → 回收 → 重试仍挂
+    # （“browse 反复起不来”，A155 连 example.com 都 60s 超时）。这里直接从
+    # 子进程环境里剥掉全部代理变量，导航永远直连，行为确定可复现。
+    for _k in (
+        "HTTP_PROXY", "http_proxy",
+        "HTTPS_PROXY", "https_proxy",
+        "ALL_PROXY", "all_proxy",
+        "AGENT_BROWSER_PROXY",
+    ):
+        env.pop(_k, None)
+    # 双保险：即便进程外仍有代理设置，也强制本地/回环/主机别名直连。
+    # 合并而非覆盖既有 NO_PROXY（企业内网常配 *.internal.corp 等旁路）。
+    _bypass = "localhost,127.0.0.1,::1"
+    _bypass_list = ("localhost", "127.0.0.1", "::1")
+    existing = env.get("NO_PROXY") or env.get("no_proxy") or ""
+    if existing:
+        parts = [p.strip() for p in existing.split(",") if p.strip()]
+        for _h in _bypass_list:
+            if _h not in parts:
+                parts.append(_h)
+        merged = ",".join(parts)
+    else:
+        merged = _bypass
+    env["NO_PROXY"] = merged
+    env["no_proxy"] = merged
+    env["AGENT_BROWSER_PROXY_BYPASS"] = _bypass
     return env
 
 
@@ -422,6 +699,7 @@ async def browse_exec(
             pass
 
     argv = [str(a) for a in argv]
+    argv = ensure_screenshot_argv(argv, agent_id)
     mapped, stdin_payload = _map_ab_argv(argv, workspace)
 
     timeout = max(5, min(int(timeout_sec or 60), 300))
@@ -433,7 +711,9 @@ async def browse_exec(
         timeout = max(30, timeout)
 
     # Screenshot paths land under the workspace; make sure the parent dir
-    # exists (agents write to evidence/… which may not exist yet).
+    # exists (agents write to evidence/… which may not exist yet). Pin the
+    # CLI output to an absolute path so the daemon's cwd drift cannot
+    # misplace the file (see _inject_shot_abs_path).
     if head == "screenshot":
         shot_rel = _screenshot_path_from_argv(argv)
         if shot_rel:
@@ -448,6 +728,7 @@ async def browse_exec(
                     parent.mkdir(parents=True, exist_ok=True)
                 except OSError:
                     pass
+            mapped = _pin_shot_path(mapped, workspace, shot_rel)
 
     cmd = [str(bin_path), *mapped]
     cwd = workspace if workspace and Path(workspace).is_dir() else None
@@ -476,6 +757,131 @@ async def browse_exec(
     stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
     stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
     return rc, stdout, stderr
+
+
+async def _hard_recycle_browser() -> str:
+    """Hard-recycle the agent-browser session (kill daemon + orphan Chromium).
+
+    A wedged agent-browser daemon makes subsequent browse commands hang even
+    after the agent-browser ``close`` — the CLI cannot reach a wedged daemon,
+    so ``restart`` (→close) alone never recovers, and the agent loops on
+    timeouts until the official VERIFY visual gate gets waived. Killing the
+    daemon process tree (``taskkill /T`` recurses its Chromium children) plus
+    any orphaned agent-browser Chromium (identified by the
+    ``agent-browser-chrome-`` user-data-dir marker) forces the next browse
+    command to spawn a fresh session.
+
+    Only agent-browser-owned processes are touched — never the operator's own
+    Chrome (different user-data-dir) or the platform host. Sessions are
+    per-agent (AGENT_BROWSER_SESSION) and respawn on the next browse call, so
+    recycling is safe even if another agent's session is torn down too.
+    """
+    from hiveweave.config import agent_browser_bin_name
+    from hiveweave.util.win_subprocess import windows_no_window_kwargs
+
+    bin_name = agent_browser_bin_name()
+    try:
+        if os.name == "nt":
+            # 1) Daemon + its Chromium tree (taskkill /T is recursive).
+            p = await asyncio.create_subprocess_exec(
+                "taskkill", "/F", "/T", "/IM", bin_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                **windows_no_window_kwargs(),
+            )
+            try:
+                await asyncio.wait_for(p.wait(), timeout=20)
+            except asyncio.TimeoutError:
+                try:
+                    p.kill()
+                except ProcessLookupError:
+                    pass
+            # 2) Reap orphaned agent-browser Chromium (daemon already gone).
+            ps = (
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                "Where-Object { $_.CommandLine -match 'agent-browser-chrome-' } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId "
+                "-Force -ErrorAction SilentlyContinue }"
+            )
+            q = await asyncio.create_subprocess_exec(
+                "powershell", "-NoProfile", "-Command", ps,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                **windows_no_window_kwargs(),
+            )
+            try:
+                await asyncio.wait_for(q.wait(), timeout=20)
+            except asyncio.TimeoutError:
+                try:
+                    q.kill()
+                except ProcessLookupError:
+                    pass
+        else:
+            # POSIX: pkill the daemon binary, then orphaned agent-browser
+            # Chromium (user-data-dir marker) — SIGKILL on the daemon does not
+            # propagate to reparented Chromium, mirroring the Windows step.
+            for pat in (bin_name, "agent-browser-chrome-"):
+                p = await asyncio.create_subprocess_exec(
+                    "pkill", "-9", "-f", pat,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    await asyncio.wait_for(p.wait(), timeout=20)
+                except asyncio.TimeoutError:
+                    try:
+                        p.kill()
+                    except ProcessLookupError:
+                        pass
+        # 3) Reap leaked Chromium profile dirs. agent-browser mints a fresh
+        #    `agent-browser-chrome-<uuid>` user-data-dir per session and never
+        #    cleans them (37 dirs / ~2.2GB after a month on TEST machines).
+        #    After killing every daemon + Chromium above, any remaining profile
+        #    is orphaned garbage — safe to delete here.
+        import tempfile as _tempfile
+
+        try:
+            _profiles = list(
+                Path(_tempfile.gettempdir()).glob("agent-browser-chrome-*")
+            )
+        except Exception:
+            _profiles = []
+        for _d in _profiles:
+            try:
+                import shutil as _shutil
+
+                _shutil.rmtree(str(_d), ignore_errors=True)
+            except Exception:
+                pass
+        return "browser session hard-recycled"
+    except Exception as e:  # pragma: no cover - defensive
+        log.warning("browse_hard_recycle_failed", error=str(e))
+        return f"browser hard-recycle attempted ({e})"
+
+
+async def _apply_default_viewport(
+    workspace: str, agent_id: str | None, timeout_sec: int
+) -> tuple[bool, str]:
+    """Force desktop viewport after goto. Fail-open: goto still succeeds."""
+    w, h = DEFAULT_VIEWPORT
+    code, stdout, stderr = await browse_exec(
+        ["set", "viewport", str(w), str(h)],
+        workspace,
+        timeout_sec=min(30, max(5, timeout_sec)),
+        agent_id=agent_id,
+    )
+    if code != 0:
+        err = (stderr or stdout or "").strip()[:200]
+        return False, (
+            f"viewport reset to {w}×{h} failed ({err or f'exit={code}'}). "
+            f'Call browse(args=["viewport","{w}","{h}"]) before screenshot.'
+        )
+    return True, (
+        f"viewport reset to {w}×{h} (desktop default). "
+        "For narrow/mobile: "
+        'browse(args=["viewport","390","844"]) then screenshot — '
+        "do not set viewport before goto; goto always resets."
+    )
 
 
 def browse_missing_bin_hint() -> str:
@@ -508,6 +914,7 @@ async def issue_browse_e2e_attestation(
     ``screenshot_path`` (abs) is merged into ``artifact_hashes`` so a
     reviewer can load the PNG via ``look_at_image(attestation_id=...)``.
     """
+    needs_main = False
     try:
         from hiveweave.services.attestation import (
             attestation_service,
@@ -518,6 +925,15 @@ async def issue_browse_e2e_attestation(
         project_id = await get_project_id(agent_id)
         if not project_id:
             return ""
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.policy import has_visual_test_duty
+
+        agent_row = await meta_db.get_agent_by_id(agent_id)
+        if agent_row and not has_visual_test_duty(agent_row):
+            return (
+                "\n\n[look-only] No browse_e2e stamp — looking at the "
+                "product is not test evidence. Formal VERIFY stays with QA.\n"
+            )
         from hiveweave.tools.bash import _is_same_workspace
 
         resolved_task, bind_note = await _resolve_task_id(
@@ -527,23 +943,50 @@ async def issue_browse_e2e_attestation(
             return bind_note or ""
         # TEST18 P0-2: VERIFY 任务的 browse 证据必须在 main 工作区执行 —
         # worktree 嵌在项目根下，「在根下面」会放行，必须目录等值（同 bash）。
-        try:
-            from hiveweave.services.task import TaskService
-            from hiveweave.services.worktree_review import project_main_workspace
+        # Fail-closed: bound task that cannot be loaded / MAIN unresolved
+        # must not stamp worktree evidence as MAIN.
+        from hiveweave.services.task import TaskService
+        from hiveweave.services.worktree_review import project_main_workspace
+        from hiveweave.tools.bash import _task_needs_main_workspace
 
+        try:
             task = await TaskService().get_task(project_id, resolved_task)
-            if task and TaskService._is_verify_task(task):
+        except Exception as e:
+            return (
+                "\n\n[browse_e2e REJECTED] cannot load bound task for "
+                f"MAIN check: {e}"
+                + bind_note
+            )
+        if task is None:
+            return (
+                "\n\n[browse_e2e REJECTED] bound task not found — "
+                "no attestation issued."
+                + bind_note
+            )
+        needs_main = _task_needs_main_workspace(task)
+        if needs_main:
+            try:
                 main_ws = await project_main_workspace(project_id)
-                if workspace and main_ws and not _is_same_workspace(workspace, main_ws):
-                    return (
-                        "\n\n[browse_e2e REJECTED] VERIFY 任务的 UI 证据必须在主"
-                        f"工作区执行（当前 workspace={workspace!r} 非 main="
-                        f"{main_ws!r}）。请让 coordinator/CEO（项目根==main）"
-                        "执行 UI 验收，或由负责人 waive_attestation。"
-                        + bind_note
-                    )
-        except Exception:
-            pass
+            except Exception as e:
+                return (
+                    "\n\n[browse_e2e REJECTED] cannot resolve MAIN workspace: "
+                    f"{e}"
+                    + bind_note
+                )
+            if not main_ws:
+                return (
+                    "\n\n[browse_e2e REJECTED] cannot resolve MAIN workspace. "
+                    "Use browse_main (project root)."
+                    + bind_note
+                )
+            if not workspace or not _is_same_workspace(workspace, main_ws):
+                return (
+                    "\n\n[browse_e2e REJECTED] VERIFY UI "
+                    f"evidence must run on MAIN (workspace={workspace!r} "
+                    f"main={main_ws!r}). Use browse_main (project root), "
+                    "not browse (your worktree)."
+                    + bind_note
+                )
         commit = await _maybe_git_commit(workspace or "")
         cmd_url = " ".join(argv)[:500]
         if core_interaction:
@@ -568,7 +1011,12 @@ async def issue_browse_e2e_attestation(
         )
         extra = " core_interaction=1" if core_interaction else ""
         return f"\n[attestation_id={att_id} kind=browse_e2e{extra}]{bind_note}"
-    except Exception:
+    except Exception as e:
+        if needs_main:
+            return (
+                "\n\n[browse_e2e REJECTED] attestation failed after MAIN "
+                f"check: {e}"
+            )
         return ""
 
 
@@ -640,17 +1088,21 @@ def _contract_snapshot_output(
 @tool(
     "browse",
     "Drive a real Chromium browser via agent-browser (goto/click/fill/snapshot/"
-    "screenshot/console/network/js/eval). Use js/eval for canvas MouseEvent "
+    "screenshot/viewport/console/network/js/eval). Use js/eval for canvas MouseEvent "
     "injection when snapshot refs are insufficient. "
     "Prefer lookup_dev_server / start_dev_server for the app URL first. "
-    "After screenshot the PNG pixels are injected into your next LLM turn — "
-    "you MUST call assert_visual(observed, verdict) based on what you SEE "
-    "(path-only evidence is rejected for UI submit). "
-    "For H5/canvas games prefer game_run_case after goto. "
+    "goto always resets the window to 1280×900. For mobile: goto first, then "
+    "browse(args=[\"viewport\",\"390\",\"844\"]), then screenshot. "
+    "After screenshot, pixels inject into the next turn. "
+    "Looking-only roles (CEO) do not stamp. "
+    "For H5/canvas games, evidence roles prefer game_run_case after goto "
+    "(MAIN VERIFY: game_run_case_main). "
     "Example: browse(args=[\"goto\",\"http://127.0.0.1:3000\"]) then "
     "browse(args=[\"snapshot\",\"-i\"]). If goto/eval keep timing out, "
     "call browse(args=[\"restart\"]) to close the session first. "
-    "On success issues a browse_e2e attestation.",
+    "On success, evidence roles issue a browse_e2e attestation. Your "
+    "worktree UI checks use this tool. Milestone VERIFY / full-site MAIN "
+    "QA: use browse_main. CEO looking at MAIN may also use browse_main.",
     requires_workspace=True,
     security_level="shell",
 )
@@ -666,6 +1118,12 @@ async def browse_tool(
             'browse requires args or command. Example: '
             'args=["goto","http://127.0.0.1:3000"]'
         )
+    argv = ensure_screenshot_argv(argv, agent_id)
+
+    if _is_viewport_command(argv):
+        dims = parse_viewport_args(_viewport_rest(argv))
+        if dims is None:
+            return ToolResult.err(VIEWPORT_USAGE)
 
     # Soft guard: discourage attaching to the operator's daily profile URLs
     # that look like credential harvesting — still allow localhost / file / http(s).
@@ -679,7 +1137,16 @@ async def browse_tool(
         )
 
     head = (argv[0] or "").lower().replace("-", "_")
+    # Normalize through the alias table so `wait_for`/`waitfor` count as the
+    # intentionally long-lived `wait` (the raw head is used elsewhere).
+    head_norm = _HEAD_ALIASES.get(head, head)
     is_restart = head in ("restart", "reset")
+    if is_restart:
+        # Hard-recycle instead of the CLI `close` — a wedged daemon ignores or
+        # hangs on close, so restart must not depend on it. The next browse
+        # command respawns a fresh session.
+        recycle_note = await _hard_recycle_browser()
+        return ToolResult.ok(f"{BROWSE_RESTART_OK} [{recycle_note}]")
     try:
         code, stdout, stderr = await browse_exec(
             argv, workspace, timeout_sec=params.timeout_sec or 60, agent_id=agent_id
@@ -689,9 +1156,6 @@ async def browse_tool(
     except OSError as e:
         return ToolResult.err(f"browse spawn failed: {e}")
 
-    if is_restart and code == 0:
-        return ToolResult.ok(BROWSE_RESTART_OK)
-
     if code != 0:
         parts = [f"browse exit={code}: {' '.join(argv)}"]
         if stdout:
@@ -699,13 +1163,43 @@ async def browse_tool(
         if stderr:
             parts.append(f"stderr:\n{stderr[-2000:]}")
         err = "\n".join(parts)
-        if code == -1 and BROWSE_RESTART_HINT not in err:
+        if code == -1 and head_norm != "wait":
+            # Timeout usually means a wedged daemon — recycle so the next
+            # command starts fresh instead of looping on timeouts. `wait` is
+            # intentionally long-lived, so it keeps the plain hint.
+            await _hard_recycle_browser()
+            err = (
+                f"{err}\nBrowser session hard-recycled. "
+                "Retry the command — the next call starts a fresh browser."
+            )
+        elif code == -1 and BROWSE_RESTART_HINT not in err:
             err = f"{err}\n{BROWSE_RESTART_HINT}"
         return ToolResult.err(err)
+
+    viewport_note = ""
+    if head in _GOTO_HEADS:
+        _ok, viewport_note = await _apply_default_viewport(
+            workspace, agent_id, params.timeout_sec or 60
+        )
+    elif _is_viewport_command(argv):
+        dims = parse_viewport_args(_viewport_rest(argv))
+        if dims:
+            w, h, scale = dims
+            scale_bit = f" scale={scale}" if scale else ""
+            viewport_note = (
+                f"viewport is now {w}×{h}{scale_bit}. "
+                f"The next goto resets to {DEFAULT_VIEWPORT[0]}×{DEFAULT_VIEWPORT[1]}; "
+                "set viewport AFTER goto for mobile checks."
+            )
 
     out = stdout or "(no output)"
     if stderr:
         out = f"{out}\n--- stderr ---\n{stderr}"
+    if viewport_note:
+        out = f"{out}\n[{viewport_note}]"
+
+    if _is_viewport_command(argv):
+        return ToolResult.ok(out)
 
     extra_fields: dict[str, Any] = {}
     screenshot_abs: str | None = None
@@ -719,22 +1213,33 @@ async def browse_tool(
         )
 
         shot_path = resolve_screenshot_path(workspace, shot_rel)
-        img = load_image_for_llm(shot_path) if shot_path else None
-        # Persist path even when pixels fail to load (size/suffix) so
-        # look_at_image(attestation_id) can still resolve the file.
-        if shot_path:
+        # Only trust a path that actually exists on disk — do not hand the
+        # attestation a guessed absolute path before is_file() has passed
+        # (that used to mint "fake success" browse_e2e stamps on missing PNGs).
+        shot_exists = shot_path is not None and shot_path.is_file()
+        img = load_image_for_llm(shot_path) if shot_exists else None
+        if shot_path and shot_exists:
             screenshot_abs = str(shot_path)
 
     core_interaction = head in ("js", "eval", "evaluate")
-    attest_note = await issue_browse_e2e_attestation(
-        agent_id=agent_id,
-        workspace=workspace,
-        argv=argv,
-        stdout=out,
-        task_id=params.task_id,
-        core_interaction=core_interaction,
-        screenshot_path=screenshot_abs,
-    )
+    look_only = await agent_is_look_only_browser(agent_id)
+    if look_only:
+        attest_note = (
+            "\n\n[look-only] No browse_e2e stamp — looking at the product "
+            "is not test evidence. Formal VERIFY stays with QA.\n"
+        )
+    else:
+        attest_note = await issue_browse_e2e_attestation(
+            agent_id=agent_id,
+            workspace=workspace,
+            argv=argv,
+            stdout=out,
+            task_id=params.task_id,
+            core_interaction=core_interaction,
+            screenshot_path=screenshot_abs,
+        )
+        if "[browse_e2e REJECTED]" in attest_note:
+            return ToolResult.err(attest_note.strip())
 
     # 大快照短契约化 —— attestation 先按全量 stdout 出证（stdout_hash
     # 完整性），返回文本再收短契约；<50KB 的快照原样返回。
@@ -746,31 +1251,61 @@ async def browse_tool(
             extra_fields["images"] = [img]
             extra_fields["screenshot_path"] = screenshot_abs
             # NOTE: tool_exec drops extra fields before the next LLM round —
-            # the path MUST be in the text for assert_visual(screenshotPath=...).
-            shot_display = screenshot_abs.replace("\\", "/")
+            # keep the path in the text so the model can re-take or optionally
+            # call assert_visual / look_at_image.
+            shot_display = _workspace_rel_shot_display(
+                workspace, shot_rel, shot_path
+            )
             out = (
                 f"{out}{attest_note}\n"
-                "[VISION] Screenshot pixels are attached to this tool result "
-                "for your next turn. Inspect the image (not the path). "
-                f"Screenshot saved at: {shot_display}\n"
-                "Then call "
-                f"assert_visual(screenshotPath=\"{shot_display}\", "
-                "observed=\"describe what you see: labels/layout/errors, "
-                "40+ chars\", "
-                "verdict=\"pass\"|\"fail\") — UI submit requires visual_check; "
-                "a bare screenshot file path is NOT enough."
+                + screenshot_followup_text(shot_display, look_only=look_only)
             )
             return ToolResult.ok(out, **extra_fields)
 
+        shot_display = _workspace_rel_shot_display(
+            workspace, shot_rel, shot_path
+        )
+        missing = shot_path is None or not Path(shot_path).is_file()
+        if missing:
+            return ToolResult.err(
+                f"Screenshot file missing at {shot_display}. "
+                + _screenshot_missing_diagnostic(workspace, shot_rel)
+            )
+        fail_hint = "re-take the screenshot; the file path is in this result."
         out = (
             f"{out}{attest_note}\n"
             "[VISION] Screenshot file could not be loaded into multimodal "
-            f"context (path={shot_path}). Re-take screenshot or check path; "
-            "assert_visual still required for UI evidence."
+            f"context (path={shot_display}). Re-take screenshot using "
+            f"{shot_display}; {fail_hint}"
         )
         return ToolResult.ok(out)
 
     return ToolResult.ok(out + attest_note)
+
+
+@tool(
+    "browse_main",
+    "Drive Chromium at the PROJECT ROOT (shared MAIN), not your worktree. "
+    "Same params as browse. QA: milestone VERIFY / full-site so browse_e2e "
+    "stamps MAIN HEAD. CEO: look at the shipped product on MAIN (not a "
+    "test duty). goto resets viewport to 1280×900; viewport AFTER goto "
+    "for mobile. Module visual in your slice stays on browse. "
+    "Platform does not rewrite browse cwd.",
+    requires_workspace=True,
+    security_level="shell",
+)
+async def browse_main_tool(
+    params: BrowseParams, agent_id: str, workspace: str
+) -> ToolResult:
+    from hiveweave.tools.bash import _with_cwd_note, resolve_project_main_cwd
+    from hiveweave.tools.helpers import get_project_id
+
+    project_id = await get_project_id(agent_id)
+    main_ws, err = await resolve_project_main_cwd(project_id)
+    if not main_ws:
+        return ToolResult.err(err)
+    result = await browse_tool(params, agent_id, main_ws)
+    return _with_cwd_note(result, "\n\n[cwd=project root]")
 
 
 class AssertVisualParams(BaseModel):
@@ -811,10 +1346,10 @@ class AssertVisualParams(BaseModel):
 
 @tool(
     "assert_visual",
-    "Record a visual assertion AFTER browse(screenshot). The screenshot pixels "
-    "were injected into context — describe what you actually see, then "
-    "verdict=pass|fail. Creates a visual_check attestation required for "
-    "ui_browser_e2e submit. File existence alone is not evidence.",
+    "Optional stamp: record a pixel-grounded UI assertion AFTER "
+    "browse(screenshot). Describe what you SEE, then verdict=pass|fail. "
+    "Creates a visual_check attestation if you want one — screenshots "
+    "already inject into chat, this is not a seeing ritual.",
     requires_workspace=True,
     security_level="standard",
 )
@@ -832,12 +1367,28 @@ async def assert_visual_tool(
             "no console-error overlay.'"
         )
 
+    orig_ws = workspace
     shot = resolve_screenshot_path(workspace, params.screenshot_path)
+    if shot is None:
+        try:
+            from hiveweave.tools.bash import resolve_project_main_cwd
+            from hiveweave.tools.helpers import get_project_id
+
+            project_id = await get_project_id(agent_id)
+            main_ws, _err = await resolve_project_main_cwd(project_id)
+            if main_ws:
+                shot = resolve_screenshot_path(main_ws, params.screenshot_path)
+                if shot is not None:
+                    workspace = main_ws
+        except Exception:
+            pass
+    if shot is None and orig_ws and orig_ws != workspace:
+        shot = resolve_screenshot_path(orig_ws, params.screenshot_path)
     if shot is None:
         return ToolResult.err(
             f"Screenshot path rejected or outside workspace: "
-            f"{params.screenshot_path!r}. Use a path under your worktree "
-            f"(e.g. evidence/flow.png)."
+            f"{params.screenshot_path!r}. Use a path under MAIN / your "
+            f"worktree (e.g. evidence/flow.png)."
         )
     if not shot.is_file():
         return ToolResult.err(
@@ -888,28 +1439,54 @@ async def assert_visual_tool(
             # 必须在 main 工作区执行，否则拒发（baseline gate 的 kind 查询
             # 含 visual_check，留这个旁路等于白堵）。
             if task_id:
-                try:
-                    from hiveweave.services.task import TaskService
-                    from hiveweave.services.worktree_review import (
-                        project_main_workspace,
-                    )
-                    from hiveweave.tools.bash import _is_same_workspace
+                from hiveweave.services.task import TaskService
+                from hiveweave.services.worktree_review import (
+                    project_main_workspace,
+                )
+                from hiveweave.tools.bash import (
+                    _is_same_workspace,
+                    _task_needs_main_workspace,
+                )
 
+                try:
                     _task = await TaskService().get_task(project_id, task_id)
-                    if _task and TaskService._is_verify_task(_task):
+                except Exception as e:
+                    return ToolResult.err(
+                        "[visual_check REJECTED] cannot load bound task "
+                        f"for MAIN check: {e}"
+                        + (bind_note or "")
+                    )
+                if _task is None:
+                    return ToolResult.err(
+                        "[visual_check REJECTED] bound task not found."
+                        + (bind_note or "")
+                    )
+                if _task_needs_main_workspace(_task):
+                    try:
                         _main_ws = await project_main_workspace(project_id)
-                        if workspace and _main_ws and not _is_same_workspace(
-                            workspace, _main_ws
-                        ):
-                            return ToolResult.ok(
-                                "\n[visual_check REJECTED] VERIFY 任务的 UI 证据"
-                                "必须在主工作区执行（当前非 main）。请让 "
-                                "coordinator/CEO 执行 UI 验收，或由负责人 "
-                                "waive_attestation。",
-                                att_id=None,
-                            )
-                except Exception:
-                    pass
+                    except Exception as e:
+                        return ToolResult.err(
+                            "[visual_check REJECTED] cannot resolve MAIN: "
+                            f"{e}"
+                            + (bind_note or "")
+                        )
+                    if not _main_ws:
+                        return ToolResult.err(
+                            "[visual_check REJECTED] cannot resolve MAIN. "
+                            "Take the screenshot with browse_main "
+                            "(project root)."
+                            + (bind_note or "")
+                        )
+                    if not workspace or not _is_same_workspace(
+                        workspace, _main_ws
+                    ):
+                        return ToolResult.err(
+                            "[visual_check REJECTED] VERIFY "
+                            "UI evidence must run on MAIN. Take the "
+                            "screenshot with browse_main (project root), "
+                            "not browse (your worktree)."
+                            + (bind_note or "")
+                        )
             commit = await _maybe_git_commit(workspace or "")
             payload = {
                 "kind": VISUAL_CHECK_KIND,

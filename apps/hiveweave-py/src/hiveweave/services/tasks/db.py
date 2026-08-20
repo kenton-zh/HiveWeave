@@ -11,6 +11,7 @@ import structlog
 from hiveweave.db import meta as meta_db
 from hiveweave.db.project import (
     ProjectDbError,
+    _execute_write_with_retry,
     ensure_project_db,
     get_workspace_write_lock,
 )
@@ -48,19 +49,7 @@ async def _execute(project_id: str, sql: str, params: list | None = None) -> Non
     lock = await get_workspace_write_lock(workspace)
     async with lock:
         conn = await ensure_project_db(workspace)
-        try:
-            await conn.execute(sql, params or [])
-            await conn.commit()
-        except Exception:
-            # 语句失败时隐式事务（legacy isolation_level="" 的 DML 隐式 BEGIN）
-            # 残留在共享连接 → 后续 BEGIN IMMEDIATE 报
-            # "cannot start a transaction within a transaction"（slack-clone_03 事故）。
-            # 回滚释放（rollback 自身异常吞掉）后 re-raise，同 _execute_tx。
-            try:
-                await conn.rollback()
-            except Exception:
-                pass
-            raise
+        await _execute_write_with_retry(conn, sql, params)
 
 
 async def _execute_tx(

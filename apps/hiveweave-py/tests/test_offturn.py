@@ -372,9 +372,6 @@ async def test_bash_background_returns_immediately(
     async def fake_pid(_agent_id: str):
         return "proj-1"
 
-    async def fake_verify(*_a, **_k):
-        return ("/tmp/ws", "", None)
-
     monkeypatch.setattr("hiveweave.tools.bash.execute_bash", fake_exec)
     monkeypatch.setattr(
         "hiveweave.tools.bash._validate_command_safety",
@@ -384,9 +381,6 @@ async def test_bash_background_returns_immediately(
         "hiveweave.tools.bash._detect_dev_server_command", lambda _c: None
     )
     monkeypatch.setattr("hiveweave.tools.helpers.get_project_id", fake_pid)
-    monkeypatch.setattr(
-        "hiveweave.tools.bash._resolve_verify_test_workspace", fake_verify
-    )
     monkeypatch.setattr(
         "hiveweave.services.process_registry.prepare_spawn_command",
         lambda cmd, project_id=None: (cmd, {}, None),
@@ -429,14 +423,8 @@ async def test_bash_default_stays_foreground(
     async def fake_pid(_agent_id: str):
         return "proj-1"
 
-    async def fake_verify(*_a, **_k):
-        return ("/tmp/ws", "", None)
-
     monkeypatch.setattr("hiveweave.tools.bash.execute_bash", fake_exec)
     monkeypatch.setattr("hiveweave.tools.helpers.get_project_id", fake_pid)
-    monkeypatch.setattr(
-        "hiveweave.tools.bash._resolve_verify_test_workspace", fake_verify
-    )
     monkeypatch.setattr(
         "hiveweave.services.process_registry.prepare_spawn_command",
         lambda cmd, project_id=None: (cmd, {}, None),
@@ -453,28 +441,29 @@ async def test_bash_default_stays_foreground(
     assert "hi" in result.output
 
 
-def test_wake_source_for_subagent_and_bash_done() -> None:
+@pytest.mark.asyncio
+async def test_wake_source_for_subagent_and_bash_done() -> None:
     typed = OFFTURN_COMPLETION_MESSAGE_TYPE
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[SUBAGENT DONE] job=bg-sub-x", "message_type": typed}]
         )
         == "wait_satisfied"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[SUBAGENT FAILED] boom", "message_type": typed}]
         )
         == "wait_satisfied"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[BASH DONE] job=bg-bash-x", "message_type": typed}]
         )
         == "wait_satisfied"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[BASH FAILED] exit=1", "message_type": typed}]
         )
         == "wait_satisfied"
@@ -483,13 +472,13 @@ def test_wake_source_for_subagent_and_bash_done() -> None:
     assert not is_offturn_completion_text("[RANDOM DONE] session=x")
     # Prefix + from=system without the reserved type is not wait_satisfied.
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{"message": "[BASH DONE] job=bg-bash-x", "message_type": "system"}]
         )
         == "trigger"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{
                 "message": "[BASH DONE] job=bg-bash-x",
                 "message_type": "system",
@@ -499,7 +488,7 @@ def test_wake_source_for_subagent_and_bash_done() -> None:
         == "trigger"
     )
     assert (
-        wake_source_for_pending(
+        await wake_source_for_pending(
             [{
                 "message": "random body",
                 "message_type": typed,

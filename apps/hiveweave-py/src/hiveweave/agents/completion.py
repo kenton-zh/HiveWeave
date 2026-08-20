@@ -354,12 +354,24 @@ async def handle_completion(
         agent._unreplied_asks_streak = 0
 
     open_obligations: list[dict] = []
+    delegated_in_flight: list[dict] = []
     try:
         from hiveweave.services.task import TaskService
 
-        open_obligations = await TaskService().get_actionable_obligations(
+        ts = TaskService()
+        open_obligations = await ts.get_actionable_obligations(
             agent.project_id, agent.id
         )
+        try:
+            delegated_in_flight = await ts.list_delegated_in_flight(
+                agent.project_id, agent.id
+            )
+        except Exception as e:
+            log.debug(
+                "turn_exit_delegated_in_flight_failed",
+                agent_id=agent.id,
+                error=str(e),
+            )
     except Exception as e:
         log.warning(
             "turn_exit_obligations_failed",
@@ -404,6 +416,7 @@ async def handle_completion(
             pending_inbox_msgs=pending_msgs,
             unreplied_asks=unreplied_asks,
             open_task_obligations=open_obligations,
+            delegated_in_flight=delegated_in_flight,
             tasks_advanced=tasks_advanced,
             messaged_refs=messaged_refs,
             outbound_ask_refs=outbound_ask_refs,

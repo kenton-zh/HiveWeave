@@ -54,9 +54,15 @@ _ASSIGNEE_WORK_TOOLS = frozenset({
     "write_file",
     "edit_file",
     "bash",
+    "bash_main",
     "run_command",
     "apply_patch",
     "run_tests",
+    "browse",
+    "browse_main",
+    "assert_visual",
+    "game_run_case",
+    "game_run_case_main",
     "git_worktree_checkpoint",
     "git_worktree_merge",
     "claim_task",
@@ -162,6 +168,13 @@ def had_assignee_work(tool_calls: list | None) -> bool:
     return False
 
 
+def _task_merge_already_recorded(task: dict | None) -> bool:
+    """approved 任务 merge 已实际落库（覆盖当前修订）→ 不再提示 merge。"""
+    from hiveweave.services.tasks.verify import evidence_merge_recorded
+
+    return evidence_merge_recorded(task)
+
+
 def build_task_advance_hint(obligations: list[dict]) -> str:
     lines = [
         "[TASK ADVANCE]",
@@ -180,16 +193,26 @@ def build_task_advance_hint(obligations: list[dict]) -> str:
         prog = f" progress={progress}%" if progress is not None else ""
         if role == "creator":
             if status == "approved":
-                next_step = (
-                    "立即 git_worktree_merge(branchName=shortId 或 hw/...)；"
-                    "禁止让 executor 在 main 上 merge"
-                )
+                if _task_merge_already_recorded(t):
+                    next_step = (
+                        "任务已合并（evidence 已记录），停在 approved 等待平台收口；"
+                        "无需再 merge，可继续推进其他义务"
+                    )
+                else:
+                    next_step = (
+                        "立即 git_worktree_merge(branchName=shortId 或 hw/...)；"
+                        "禁止让 executor 在 main 上 merge"
+                    )
             else:
                 next_step = "用 review_task(taskId, decision, feedback) 审批"
         elif status == "rework":
             next_step = "按反馈返工后重新 submit_task"
         elif status == "claimed":
-            next_step = "update_task_status(running) 后继续执行 / submit_task"
+            next_step = (
+                "若已 dispatch 给下属：commit_turn(waiting, kind=task, "
+                "ref=子任务id)，不要 ask/notify 催交。"
+                "否则 update_task_status(running) 后自己执行 / submit_task"
+            )
         elif status == "verifying":
             next_step = "执行 VERIFY 后 submit_task / review"
         else:

@@ -524,10 +524,11 @@ async def _assignee_needs_write_worktree(
 async def _assignee_is_verify_only(
     workspace_path: str, short_id: str
 ) -> bool:
-    """True when the only in-flight work is VERIFY (cwd must be MAIN).
+    """True when the only in-flight work is VERIFY.
 
     Idle / approved-unmerged return False — those still need the personal
-    tree if it exists. Do not use this as a signal to wipe workspace_path.
+    tree if it exists. Do not use this as a signal to wipe workspace_path
+    or to rewrite tool cwd; VERIFY evidence uses bash_main / browse_main.
     """
     conn = await _project_db_if_exists(workspace_path)
     close_raw = False

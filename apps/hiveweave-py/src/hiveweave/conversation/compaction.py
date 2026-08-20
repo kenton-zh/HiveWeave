@@ -279,7 +279,9 @@ async def resolve_compactor_callback(
         # 1. 专用压缩模型（配置优先；须 active 且带 key）
         if settings.compactor_model_id:
             model = await meta_db.query_one(
-                "SELECT model_id, base_url, api_key, max_output_tokens "
+                "SELECT model_id, base_url, api_key, max_output_tokens, "
+                "provider_type, supports_thinking, thinking_format, "
+                "default_reasoning_effort, context_window "
                 "FROM llm_models "
                 "WHERE id = ? AND is_active = 1 LIMIT 1",
                 [settings.compactor_model_id],
@@ -294,7 +296,9 @@ async def resolve_compactor_callback(
         model_id = agent_row["model_id"] if agent_row else None
         if model_id:
             model = await meta_db.query_one(
-                "SELECT model_id, base_url, api_key, max_output_tokens "
+                "SELECT model_id, base_url, api_key, max_output_tokens, "
+                "provider_type, supports_thinking, thinking_format, "
+                "default_reasoning_effort, context_window "
                 "FROM llm_models WHERE id = ? LIMIT 1",
                 [model_id],
             )
@@ -302,7 +306,9 @@ async def resolve_compactor_callback(
                 return dict(model), "agent"
         # 3. 首个活跃模型
         model = await meta_db.query_one(
-            "SELECT model_id, base_url, api_key, max_output_tokens "
+            "SELECT model_id, base_url, api_key, max_output_tokens, "
+            "provider_type, supports_thinking, thinking_format, "
+            "default_reasoning_effort, context_window "
             "FROM llm_models "
             "WHERE is_active = 1 ORDER BY created_at ASC LIMIT 1",
             [],
@@ -322,8 +328,6 @@ async def resolve_compactor_callback(
             )
             return None
 
-        base_url = str(model["base_url"]).rstrip("/")
-        api_key = str(model["api_key"] or "")
         model_name = str(model["model_id"])
         # 对齐 opencode：max_tokens 用模型配置的输出上限（无该列/为 0 时
         # 由 _call_compactor_llm 回退 SUMMARY_MAX_TOKENS_ESCALATED）
@@ -338,10 +342,9 @@ async def resolve_compactor_callback(
 
         async def callback(prompt: str) -> str | None:
             return await _call_compactor_llm(
-                base_url, api_key, model_name, prompt,
+                model, prompt,
                 max_tokens=max_output or None,
                 agent_id=agent_id,
-                provider=provider_type_from_model(model),
                 kind=kind,
             )
 
@@ -352,42 +355,46 @@ async def resolve_compactor_callback(
 
 
 async def _call_compactor_llm(
-    base_url: str,
-    api_key: str,
-    model: str,
+    model: dict,
     prompt: str,
     max_tokens: int | None = None,
     agent_id: str | None = None,
-    provider: str | None = None,
     kind: str = "conversation",
 ) -> str | None:
-    """调用 OpenAI 兼容 API 生成摘要。
+    """Call the configured provider (Chat / Responses / Anthropic / Gemini).
 
     预算 = 模型配置的输出上限（resolve_compactor_callback 传入）；
-    未传时回退 SUMMARY_MAX_TOKENS_ESCALATED。命中 finish_reason=length +
-    content 空（预算被 reasoning 吃光/偶发截断）时用相同预算幂等重试
-    一次兜偶发失败——预算已是模型上限，升级无意义（TEST18 巡检 P0 修复）。
+    未传时回退 SUMMARY_MAX_TOKENS_ESCALATED。命中截断且 content 空时
+    用相同预算幂等重试一次。
 
     agent_id 非空时做 token metering（F3：压缩绕过 Streamer，需单独打点）。
     """
     import httpx
 
+    from hiveweave.llm.provider import provider_factory
+    from hiveweave.llm.util import normalize_usage
+    from hiveweave.llm.wire_endpoint import extract_nonstream_text
     from hiveweave.services.token_meter import token_meter
 
-    url = f"{base_url}/chat/completions"
+    model_name = str(model.get("model_id") or "")
+    try:
+        config = provider_factory.create(model)
+    except ValueError as e:
+        logger.warning("compactor_provider_invalid", error=str(e), model=model_name)
+        return None
+    provider = config.api_format.value
+    url = config.build_url()
+    headers = config.build_headers()
     budget = max_tokens if max_tokens is not None else SUMMARY_MAX_TOKENS_ESCALATED
 
     for attempt in (1, 2):
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": SUMMARY_TEMPERATURE,
-            "max_tokens": budget,
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
+        body = config.build_body(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+            temperature=SUMMARY_TEMPERATURE,
+            max_tokens=budget,
+            tools=None,
+        )
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(url, json=body, headers=headers)
@@ -402,33 +409,30 @@ async def _call_compactor_llm(
         except Exception as e:
             logger.warning("compactor_llm_bad_json", error=str(e))
             return None
-        choices = data.get("choices") or []
-        if not choices:
-            return None
-        choice = choices[0]
-        content = (choice.get("message") or {}).get("content")
-        # Token metering: 压缩调用落库（best-effort，不阻塞）。
-        # 只要用了 usage 就记录（content 为空可能因 finish_reason=length 吃光预算，
-        # 此时仍消耗了 token），并走 normalize_usage 拆解缓存命中，与主/子代理口径一致。
-        if agent_id and data.get("usage"):
-            u = data["usage"]
+        content = extract_nonstream_text(data)
+        usage = data.get("usage")
+        if not usage and isinstance(data.get("response"), dict):
+            usage = data["response"].get("usage")
+        if agent_id and usage:
             try:
-                from hiveweave.llm.util import normalize_usage
-
+                details = (
+                    usage.get("prompt_tokens_details")
+                    or usage.get("input_tokens_details")
+                )
                 norm = normalize_usage(
                     {
-                        "input": u.get("prompt_tokens", 0),
-                        "output": u.get("completion_tokens", 0),
-                        "prompt_tokens_details": u.get("prompt_tokens_details"),
-                        "prompt_cache_hit_tokens": u.get("prompt_cache_hit_tokens"),
-                        "prompt_cache_miss_tokens": u.get("prompt_cache_miss_tokens"),
+                        "input": usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
+                        "output": usage.get("completion_tokens") or usage.get("output_tokens") or 0,
+                        "prompt_tokens_details": details,
+                        "prompt_cache_hit_tokens": usage.get("prompt_cache_hit_tokens"),
+                        "prompt_cache_miss_tokens": usage.get("prompt_cache_miss_tokens"),
                     },
                     provider,
                 )
                 if norm:
                     await token_meter.record_compaction(
                         agent_id=agent_id,
-                        model_id=model,
+                        model_id=model_name,
                         input_tokens=norm["input"],
                         output_tokens=norm["output"],
                         cache_read_tokens=norm["cache_read"],
@@ -441,17 +445,30 @@ async def _call_compactor_llm(
                                agent_id=agent_id, error=str(meter_err))
         if content:
             return content
-        # content 空：仅当 reasoning 吃光预算（finish_reason=length）才重试
-        if choice.get("finish_reason") == "length" and attempt == 1:
+        truncated = _compaction_looks_truncated(data)
+        if truncated and attempt == 1:
             logger.info(
                 "compactor_llm_retry",
-                model=model,
+                model=model_name,
                 max_tokens=budget,
-                reason="finish_reason=length with empty content",
+                reason="truncated with empty content",
             )
             continue
         return None
     return None
+
+
+def _compaction_looks_truncated(data: dict) -> bool:
+    choices = data.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        return choices[0].get("finish_reason") == "length"
+    status = data.get("status")
+    if not status and isinstance(data.get("response"), dict):
+        status = data["response"].get("status")
+    if status == "incomplete":
+        return True
+    stop = data.get("stop_reason")
+    return stop == "max_tokens"
 
 
 def provider_type_from_model(model: dict) -> str | None:

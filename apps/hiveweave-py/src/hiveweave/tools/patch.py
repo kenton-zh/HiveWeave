@@ -15,6 +15,7 @@ from typing import Any
 import structlog
 
 from hiveweave.tools.file import _resolve_safe_detail
+from hiveweave.util.tree_label import write_tree_suffix
 from hiveweave.tools.security import check_sensitive_access
 
 log = structlog.get_logger(__name__)
@@ -305,6 +306,8 @@ async def apply_patch(
         except Exception as exc:  # noqa: BLE001
             status = f"ERROR: {type(exc).__name__}: {exc}"
             has_error = True
+        if not status.startswith("ERROR"):
+            status = status + write_tree_suffix(workspace_path)
         results.append(status)
         if status.startswith("ERROR"):
             has_error = True

@@ -22,6 +22,8 @@ from typing import Any
 
 import structlog
 
+from hiveweave.util.tree_label import cwd_display
+
 log = structlog.get_logger(__name__)
 
 # ── Constants ───────────────────────────────────────────────
@@ -377,7 +379,7 @@ async def _run_registered_dev_server(
         "success": True,
         "output": (
             f"[hiveweave] Dev server auto-registered from bash.\n"
-            f"  pid={proc.pid} port={registered_port} cwd={cwd}\n"
+            f"  pid={proc.pid} port={registered_port} {_cwd_style_hint(cwd)}\n"
             f"  command: {meta.get('command') or command}\n"
             f"  URL: http://localhost:{registered_port}/\n"
             f"{port_note}"
@@ -987,21 +989,11 @@ async def _run_docker(command: str, cwd: str, timeout_s: int | None) -> dict[str
     }
 
 
-def _cwd_style_hint(cwd: str) -> str:
-    """Human-readable cwd note for agents (Git Bash style on Windows)."""
-    try:
-        p = Path(cwd).resolve()
-        native = str(p)
-    except (OSError, ValueError):
-        native = cwd
-    posix = native.replace("\\", "/")
-    # D:/foo → /d/foo for Git Bash copy-paste
-    msys = posix
-    if len(posix) >= 2 and posix[1] == ":":
-        msys = "/" + posix[0].lower() + posix[2:]
+def _cwd_style_hint(cwd: str, relative: str | None = None) -> str:
+    """MAIN vs worktree label — relative path only, never dump D:\\ or /d/."""
     return (
-        f"[cwd={native} | Git Bash style: {msys} — "
-        f"use this or quoted Windows paths; never invent /workspace]"
+        f"{cwd_display(cwd, relative)} "
+        f"— relative paths; never invent /workspace"
     )
 
 
@@ -1062,7 +1054,8 @@ async def execute_bash(
 
     if not Path(cwd).exists():
         return {"success": False, "output": "",
-                "error": f"Error: Working directory does not exist: {cwd}",
+                "error": f"Error: Working directory does not exist: "
+                         f"{cwd_display(cwd, workdir)}",
                 "blocked": True}
 
     cwd_hint = _cwd_style_hint(cwd)
@@ -1189,7 +1182,8 @@ async def execute_run_command(
 
     if not Path(full_cwd).exists():
         return {"success": False, "output": "",
-                "error": f"Error: Working directory does not exist: {full_cwd}",
+                "error": f"Error: Working directory does not exist: "
+                         f"{cwd_display(full_cwd, cwd)}",
                 "blocked": True}
 
     safe_timeout = int(timeout_ms or 120_000)
@@ -1448,7 +1442,7 @@ async def _resolve_test_attestation_task_id(
 
     # TEST18 P0-3 re-audit: VERIFY is often still `created` (skips
     # assign=claim). Prefer sole open VERIFY over generic running tasks so
-    # force-cwd=main and stamp can fire without an explicit taskId.
+    # stamp can bind without an explicit taskId (cwd is still the tool's).
     _VERIFY_OPEN = frozenset({"created", "claimed", "running"})
     verify_open = [
         t for t in (mine or [])
@@ -1531,7 +1525,8 @@ async def _resolve_test_attestation_task_id(
             st = t.get("status") or "?"
             lines.append(f"  - taskId={tid} status={st} title={title!r}")
         lines.append(
-            "VERIFY tests must run on MAIN — re-run with taskId=<id>."
+            "VERIFY tests must run via bash_main on MAIN — "
+            "re-run with taskId=<id>."
         )
         return None, "\n".join(lines)
 
@@ -1612,6 +1607,22 @@ def _is_same_workspace(a: str, b: str) -> bool:
     return _norm_ws(a) == _norm_ws(b)
 
 
+def _is_project_root_tree(path: str, main_ws: str) -> bool:
+    """True when *path* is the project root or a non-worktree descendant.
+
+    ``main/apps/web`` is still MAIN. ``main/.hiveweave/worktrees/A093`` is not.
+    """
+    if not _is_under_or_same(path, main_ws):
+        return False
+    n = _norm_ws(path).replace("\\", "/").lower()
+    m = _norm_ws(main_ws).replace("\\", "/").lower().rstrip("/")
+    rel = n[len(m):].lstrip("/") if n.startswith(m) else n
+    return not (
+        rel.startswith(".hiveweave/worktrees/")
+        or "/.hiveweave/worktrees/" in f"/{rel}/"
+    )
+
+
 def _is_under_or_same(child: str, parent: str) -> bool:
     """True when child path equals parent or is nested under it."""
     if not child or not parent:
@@ -1628,62 +1639,46 @@ def _is_under_or_same(child: str, parent: str) -> bool:
         )
 
 
-async def _resolve_verify_test_workspace(
-    project_id: str,
-    agent_id: str,
-    explicit_task_id: str | None,
-    command: str,
-    default_workspace: str,
-) -> tuple[str, str, str | None]:
-    """Force VERIFY test runs onto project main (TEST18 P0-3 review).
+def _task_needs_main_workspace(
+    task: dict | None, *, include_ui_policy: bool = False
+) -> bool:
+    """VERIFY (and optionally ui_browser_e2e) evidence must stamp project root.
 
-    Returns ``(exec_workspace, note, verify_task_id | None)``.
-    Non-test / non-VERIFY → unchanged default workspace.
+    Used only as a reject belt after the agent picked a workspace tool.
+    Do not silently rewrite cwd from this.
     """
-    from hiveweave.services.attestation import is_test_command
+    if not task:
+        return False
     from hiveweave.services.task import TaskService
 
-    if not project_id or not is_test_command(command or ""):
-        return default_workspace or "", "", None
+    if TaskService._is_verify_task(task):
+        return True
+    if include_ui_policy and (task.get("policy_id") or "") == "ui_browser_e2e":
+        return True
+    return False
 
-    resolved, bind_note = await _resolve_test_attestation_task_id(
-        project_id, agent_id, explicit_task_id, command=command
-    )
-    if not resolved:
-        # Keep existing bind tip (multi VERIFY / multi active / REVIEW helper);
-        # do not spam a generic VERIFY tip on every unbound test run.
-        return default_workspace or "", bind_note, None
 
-    try:
-        task = await TaskService().get_task(project_id, resolved)
-    except Exception:
-        task = None
-    if not task or not TaskService._is_verify_task(task):
-        return default_workspace or "", bind_note, resolved
+async def resolve_project_main_cwd(project_id: str | None) -> tuple[str, str]:
+    """Project-root cwd for explicit *_main tools. Never infers from the task.
 
+    Returns ``(cwd, error)``. ``cwd`` is empty when the root cannot be resolved.
+    """
+    if not project_id:
+        return "", "no project_id — cannot resolve project root cwd."
     try:
         from hiveweave.services.worktree_review import project_main_workspace
 
         main_ws = await project_main_workspace(project_id)
-    except Exception:
-        main_ws = None
-
+    except Exception as e:
+        return "", f"cannot resolve project root workspace: {e}"
     if not main_ws:
-        note = (
-            "\n\n[VERIFY EXEC] cannot resolve project main workspace — "
-            "refusing to run/attest tests from a write-worktree. Fix project "
-            "workspace binding, then re-run on main."
+        return (
+            "",
+            "cannot resolve project root workspace — "
+            "bash_main / browse_main / game_run_case_main need the "
+            "project workspace binding.",
         )
-        return "", note + bind_note, resolved
-
-    if _norm_ws(main_ws) == _norm_ws(default_workspace or ""):
-        return main_ws, bind_note, resolved
-
-    note = (
-        f"\n\n[VERIFY EXEC] forced cwd=main ({main_ws}) — VERIFY tests must "
-        f"run at project root so attestation commit matches main tip."
-    )
-    return main_ws, note + bind_note, resolved
+    return main_ws, ""
 
 
 _ATTESTATION_BANNER_PREFIX = "[ATTESTATION]"
@@ -1764,6 +1759,13 @@ async def _issue_test_run_attestation(
     resolved, bind_note = await _resolve_test_attestation_task_id(
         project_id, agent_id, task_id, command=command
     )
+    if not resolved and "VERIFY" in (bind_note or ""):
+        return (
+            "\n\n[VERIFY ATTEST REJECTED] cannot stamp unbound VERIFY "
+            "test_run. Use bash_main (project root) with an explicit "
+            "taskId."
+            + bind_note
+        )
 
     # TEST18 P0-3 / NEW-3: VERIFY attestation must stamp MAIN workspace HEAD,
     # and the test must have executed there (not stamp-only while running in
@@ -1773,8 +1775,21 @@ async def _issue_test_run_attestation(
     if resolved:
         try:
             task = await TaskService().get_task(project_id, resolved)
-            if task and TaskService._is_verify_task(task):
-                is_verify = True
+        except Exception as e:
+            return (
+                "\n\n[VERIFY ATTEST REJECTED] cannot load bound task for "
+                f"MAIN check: {e}"
+                + bind_note
+            )
+        if task is None:
+            return (
+                "\n\n[VERIFY ATTEST REJECTED] bound task not found — "
+                "no attestation issued."
+                + bind_note
+            )
+        is_verify = TaskService._is_verify_task(task)
+        if is_verify:
+            try:
                 from hiveweave.services.worktree_review import (
                     project_main_workspace,
                 )
@@ -1789,16 +1804,14 @@ async def _issue_test_run_attestation(
                     )
                 stamp_workspace = main_ws
                 check_path = exec_cwd or workspace or ""
-                if not _is_under_or_same(check_path, main_ws):
+                if not _is_project_root_tree(check_path, main_ws):
                     return (
-                        "\n\n[VERIFY ATTEST REJECTED] tests ran outside main "
-                        f"(exec={check_path!r} main={main_ws!r}). Re-run with "
-                        "cwd at project root (platform forces this for VERIFY "
-                        "via bash/run_command when taskId binds a VERIFY task)."
+                        "\n\n[VERIFY ATTEST REJECTED] tests ran outside project "
+                        f"root (exec={check_path!r} main={main_ws!r}). "
+                        "Use bash_main (project root), not bash (your worktree)."
                         + bind_note
                     )
-        except Exception as e:
-            if is_verify:
+            except Exception as e:
                 return (
                     f"\n\n[VERIFY ATTEST REJECTED] main stamp failed: {e}"
                     + bind_note
@@ -1905,7 +1918,6 @@ async def _bash_background(
     cmd: str,
     exec_ws: str,
     project_id: str | None,
-    verify_note: str,
     verify_tid: str | None,
 ) -> ToolResult:
     """Run bash off the org turn; attestations still issue when the job finishes."""
@@ -1981,13 +1993,15 @@ async def _bash_background(
             log.warning("bash_attest_issue_failed", error=str(att_err))
         meta = _attestation_fields_from_note(attest_note)
         banner = meta.get("banner") or ""
-        suffix = f"{verify_note}{attest_note}"
+        combined = _combine_attestation_output(out, banner, attest_note)
+        if _note_is_attest_rejected(attest_note) or _note_is_attest_rejected(
+            combined
+        ):
+            return False, combined.strip()
         if result.get("success"):
-            return True, _combine_attestation_output(
-                out, banner, suffix
-            ).strip()
+            return True, combined.strip()
         err_msg = result.get("error") or "Command failed"
-        return False, _combine_attestation_output(err_msg, banner, suffix)
+        return False, _combine_attestation_output(err_msg, banner, attest_note)
 
     job_id = start_offturn_job(
         kind="bash",
@@ -2011,13 +2025,15 @@ async def _bash_background(
 
 @tool(
     "bash",
-    "Execute a shell command and return stdout/stderr. Fresh shell each call "
-    "(cwd does not persist). Check Exit code: N. Long scripts: background=true "
-    "returns waiting_on — then commit_turn(waiting); woken with [BASH DONE] / "
-    "[BASH FAILED]. Stop with job_kill. Not PowerShell; prefer Git Bash, "
-    "tail -n N, uv run python. Do not background=true for vite / npm run dev / "
-    "uvicorn — long-running servers are auto-registered; prefer "
-    "start_dev_server. Do not append & on a foreground command.",
+    "Execute a shell command in YOUR workspace (worktree if you have one). "
+    "Fresh shell each call (cwd does not persist). Check Exit code: N. "
+    "Project-root tests / MAIN QA: use bash_main, not this tool. "
+    "Long scripts: background=true returns waiting_on — then "
+    "commit_turn(waiting); woken with [BASH DONE] / [BASH FAILED]. "
+    "Stop with job_kill. Not PowerShell; prefer Git Bash, tail -n N, "
+    "uv run python. Do not background=true for vite / npm run dev / "
+    "uvicorn — prefer start_dev_server. Do not append & on a foreground "
+    "command.",
     requires_workspace=True,
     security_level="shell",
 )
@@ -2037,22 +2053,7 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
     cmd = _strip_trailing_ampersand(cmd)
 
     exec_ws = workspace or ""
-    verify_note = ""
-    verify_tid: str | None = None
-    try:
-        if project_id:
-            exec_ws, verify_note, verify_tid = await _resolve_verify_test_workspace(
-                project_id,
-                agent_id,
-                getattr(params, "task_id", None),
-                params.command or "",
-                workspace or "",
-            )
-            if verify_note and not exec_ws:
-                return ToolResult.err(verify_note.strip())
-    except Exception as e:
-        log.debug("verify_exec_workspace_resolve_failed", error=str(e))
-        exec_ws = workspace or ""
+    verify_tid: str | None = getattr(params, "task_id", None)
 
     if getattr(params, "background", False):
         return await _bash_background(
@@ -2061,7 +2062,6 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
             cmd=cmd,
             exec_ws=exec_ws,
             project_id=project_id,
-            verify_note=verify_note,
             verify_tid=verify_tid,
         )
 
@@ -2073,7 +2073,6 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
             cmd=cmd,
             exec_ws=exec_ws,
             project_id=project_id,
-            verify_note=verify_note,
             verify_tid=verify_tid,
         )
 
@@ -2112,20 +2111,84 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
     meta = _attestation_fields_from_note(attest_note)
     banner = meta.get("banner") or ""
     public = _attestation_public_extra(meta)
-    suffix = f"{verify_note}{attest_note}"
-    if result.get("success"):
-        return ToolResult.ok(
-            _combine_attestation_output(out, banner, suffix), **public
-        )
-    err_msg = result.get("error", "Command failed")
-    if _streak_hint:
-        err_msg = f"{err_msg}{_streak_hint}"
+    return _shell_tool_result(
+        success=bool(result.get("success")),
+        blocked=bool(result.get("blocked")),
+        output=out,
+        error=result.get("error") or "Command failed",
+        banner=banner,
+        suffix=attest_note,
+        public=public,
+        streak_hint=_streak_hint,
+    )
+
+
+def _note_is_attest_rejected(text: str) -> bool:
+    return "VERIFY ATTEST REJECTED" in (text or "")
+
+
+def _shell_tool_result(
+    *,
+    success: bool,
+    blocked: bool,
+    output: str,
+    error: str,
+    banner: str,
+    suffix: str,
+    public: dict[str, Any],
+    streak_hint: str = "",
+) -> ToolResult:
+    """Command ok + VERIFY belt reject must fail the tool, not look like a pass."""
+    if success:
+        combined = _combine_attestation_output(output, banner, suffix)
+        if _note_is_attest_rejected(suffix) or _note_is_attest_rejected(combined):
+            return ToolResult.err(combined.strip(), **public)
+        return ToolResult.ok(combined, **public)
+    err_msg = error or "Command failed"
+    if streak_hint:
+        err_msg = f"{err_msg}{streak_hint}"
     err_msg = _combine_attestation_output(err_msg, banner, suffix)
-    if result.get("blocked"):
+    if blocked:
         # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
         # stall 检测分流，文本/exit code 语义与 err 一致。
         return ToolResult.blocked_err(err_msg, **public)
     return ToolResult.err(err_msg, **public)
+
+
+def _with_cwd_note(result: ToolResult, note: str) -> ToolResult:
+    if not note:
+        return result
+    if result.output:
+        result.output = f"{result.output}{note}"
+    elif result.error:
+        result.error = f"{result.error}{note}"
+    else:
+        result.output = note.strip()
+    return result
+
+
+@tool(
+    "bash_main",
+    "Execute a shell command at the PROJECT ROOT (shared MAIN), not your "
+    "worktree. Same params as bash. Use this for milestone VERIFY tests, "
+    "MAIN git/log, or anything that must see merged HEAD. Your own slice "
+    "unit tests stay on bash (worktree). Platform does not rewrite bash cwd.",
+    requires_workspace=True,
+    security_level="shell",
+)
+async def bash_main_tool(
+    params: BashParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """bash at project root — agent chose MAIN explicitly."""
+    from hiveweave.tools.helpers import get_project_id
+
+    project_id = await get_project_id(agent_id)
+    main_ws, err = await resolve_project_main_cwd(project_id)
+    if not main_ws:
+        return ToolResult.err(err)
+    note = "\n\n[cwd=project root]"
+    result = await bash_tool(params, agent_id, main_ws)
+    return _with_cwd_note(result, note)
 
 
 @tool(
@@ -2148,22 +2211,7 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         return ToolResult.blocked_err(reserved_err)
 
     exec_ws = workspace or ""
-    verify_note = ""
-    verify_tid: str | None = None
-    try:
-        if project_id:
-            exec_ws, verify_note, verify_tid = await _resolve_verify_test_workspace(
-                project_id,
-                agent_id,
-                getattr(params, "task_id", None),
-                params.command or "",
-                workspace or "",
-            )
-            if verify_note and not exec_ws:
-                return ToolResult.err(verify_note.strip())
-    except Exception as e:
-        log.debug("verify_exec_workspace_resolve_failed", error=str(e))
-        exec_ws = workspace or ""
+    verify_tid: str | None = getattr(params, "task_id", None)
 
     result = await execute_run_command(
         command=cmd,
@@ -2199,18 +2247,14 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
     meta = _attestation_fields_from_note(attest_note)
     banner = meta.get("banner") or ""
     public = _attestation_public_extra(meta)
-    suffix = f"{verify_note}{attest_note}"
-    if result.get("success"):
-        return ToolResult.ok(
-            _combine_attestation_output(out, banner, suffix), **public
-        )
-    err_msg = result.get("error", "Command failed")
-    if _streak_hint:
-        err_msg = f"{err_msg}{_streak_hint}"
-    err_msg = _combine_attestation_output(err_msg, banner, suffix)
-    if result.get("blocked"):
-        # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
-        # stall 检测分流，文本/exit code 语义与 err 一致。
-        return ToolResult.blocked_err(err_msg, **public)
-    return ToolResult.err(err_msg, **public)
+    return _shell_tool_result(
+        success=bool(result.get("success")),
+        blocked=bool(result.get("blocked")),
+        output=out,
+        error=result.get("error") or "Command failed",
+        banner=banner,
+        suffix=attest_note,
+        public=public,
+        streak_hint=_streak_hint,
+    )
 

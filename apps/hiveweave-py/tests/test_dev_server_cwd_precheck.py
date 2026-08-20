@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -226,6 +227,144 @@ async def test_start_dev_server_registers_observed_port(monkeypatch, tmp_path):
     assert result.extra["port"] == 8000
     assert "localhost:8000/" in result.output
     assert result.extra["project_servers"][0]["port"] == 8000
+
+
+async def test_agent_active_verify_task_detects_inflight(monkeypatch):
+    from hiveweave.tools.dev_server_tools import _agent_active_verify_task
+
+    verify_row = {
+        "id": "t-verify-1",
+        "title": "VERIFY: milestone QA",
+        "status": "claimed",
+        "assignee_id": TEST_AGENT,
+        "policy_id": "verify",
+    }
+    monkeypatch.setattr(
+        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        AsyncMock(return_value=[verify_row]),
+    )
+    assert await _agent_active_verify_task(TEST_PROJECT, TEST_AGENT) == "t-verify-1"
+
+    # 不是 assignee → 不判定
+    monkeypatch.setattr(
+        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        AsyncMock(return_value=[{**verify_row, "assignee_id": "other"}]),
+    )
+    assert await _agent_active_verify_task(TEST_PROJECT, TEST_AGENT) is None
+
+    # 非 VERIFY 任务 → 不判定
+    monkeypatch.setattr(
+        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": "t-x",
+                    "title": "engine",
+                    "status": "claimed",
+                    "assignee_id": TEST_AGENT,
+                    "policy_id": "generic",
+                }
+            ]
+        ),
+    )
+    assert await _agent_active_verify_task(TEST_PROJECT, TEST_AGENT) is None
+
+    # 异常 → None（不阻断启动）
+    monkeypatch.setattr(
+        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    assert await _agent_active_verify_task(TEST_PROJECT, TEST_AGENT) is None
+
+
+async def test_start_dev_server_resolves_main_for_verify(monkeypatch, tmp_path):
+    """VERIFY agent 起 dev server 时工作区解析到 MAIN 项目根（而非 worktree）。"""
+    await _patch_project_id(monkeypatch)
+    main_ws = str(tmp_path / "proj")
+    worktree_ws = str(tmp_path / "proj" / ".hiveweave" / "worktrees" / "A118")
+    main_ws_path = Path(main_ws)
+    main_ws_path.mkdir(parents=True)
+    Path(worktree_ws).mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "hiveweave.tools.dev_server_tools._agent_active_verify_task",
+        AsyncMock(return_value="t-verify-task-001"),
+    )
+    monkeypatch.setattr(
+        "hiveweave.services.worktree_review.project_main_workspace",
+        AsyncMock(return_value=main_ws),
+    )
+
+    def fake_spawn(cmd, *, cwd, project_id, preferred_port, stdout, stderr):
+        return _FakeProc(), None, {"command": cmd}
+
+    monkeypatch.setattr(
+        "hiveweave.tools.dev_server_tools.spawn_project_process", fake_spawn
+    )
+    monkeypatch.setattr("hiveweave.tools.dev_server_tools.asyncio", _FakeAsyncio())
+
+    result = await start_dev_server_tool(
+        StartDevServerParams(preferred_port=3000),
+        agent_id=TEST_AGENT,
+        workspace=worktree_ws,
+    )
+
+    assert result.success, result.error
+    assert result.extra["cwd"] == main_ws
+    assert "MAIN" in result.output
+    assert "VERIFY" in result.output
+
+
+async def test_start_dev_server_verify_main_unavailable_falls_back(
+    monkeypatch, tmp_path
+):
+    """project_main_workspace 返回 None / 抛异常 → 回退 worktree，不阻断启动。"""
+    await _patch_project_id(monkeypatch)
+    main_ws = str(tmp_path / "proj")
+    worktree_ws = str(tmp_path / "proj" / ".hiveweave" / "worktrees" / "A118")
+    Path(main_ws).mkdir(parents=True)
+    Path(worktree_ws).mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "hiveweave.tools.dev_server_tools._agent_active_verify_task",
+        AsyncMock(return_value="t-verify-task-001"),
+    )
+
+    def fake_spawn(cmd, *, cwd, project_id, preferred_port, stdout, stderr):
+        return _FakeProc(), None, {"command": cmd}
+
+    monkeypatch.setattr(
+        "hiveweave.tools.dev_server_tools.spawn_project_process", fake_spawn
+    )
+    monkeypatch.setattr("hiveweave.tools.dev_server_tools.asyncio", _FakeAsyncio())
+
+    # 返回 None
+    monkeypatch.setattr(
+        "hiveweave.services.worktree_review.project_main_workspace",
+        AsyncMock(return_value=None),
+    )
+    result = await start_dev_server_tool(
+        StartDevServerParams(preferred_port=3000),
+        agent_id=TEST_AGENT,
+        workspace=worktree_ws,
+    )
+    assert result.success, result.error
+    assert result.extra["cwd"] == worktree_ws
+    assert "MAIN" not in result.output
+
+    # 抛异常
+    monkeypatch.setattr(
+        "hiveweave.services.worktree_review.project_main_workspace",
+        AsyncMock(side_effect=RuntimeError("db down")),
+    )
+    result = await start_dev_server_tool(
+        StartDevServerParams(preferred_port=3000),
+        agent_id=TEST_AGENT,
+        workspace=worktree_ws,
+    )
+    assert result.success, result.error
+    assert result.extra["cwd"] == worktree_ws
+    assert "MAIN" not in result.output
 
 
 async def test_lookup_marks_stale_cwd(monkeypatch, tmp_path):

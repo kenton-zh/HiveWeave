@@ -52,16 +52,19 @@ def test_resolve_task_policy():
 
 def test_required_kinds():
     assert required_attestation_kinds("ui_browser_e2e") == frozenset(
-        {"visual_check", "browse_e2e"}
+        {"browse_e2e"}
     )
-    assert required_attestation_kinds("generic_tests") is None
+    assert required_attestation_kinds("generic_tests") == frozenset({"test_run"})
     assert required_attestation_kinds("docs_only") == frozenset({"doc_review"})
     assert required_attestation_kinds("coordinator_review") is None
+    assert required_attestation_kinds("no_such_policy") == frozenset(
+        {"_unknown_policy"}
+    )
 
 
 @pytest.mark.asyncio
-async def test_check_task_ui_requires_visual_check():
-    """UI policy hard-requires visual_check — bare tests_passed is not enough."""
+async def test_check_task_ui_requires_browse_e2e():
+    """UI policy requires browse_e2e — bare tests_passed is not enough."""
     task = {
         "id": "t1",
         "title": "UI button",
@@ -76,7 +79,7 @@ async def test_check_task_ui_requires_visual_check():
     ):
         err = await check_task_attestations("p1", task, None)
     assert err is not None
-    assert "visual_check" in err or "attestation" in err.lower()
+    assert "browse_e2e" in err or "attestation" in err.lower()
 
 
 @pytest.mark.asyncio

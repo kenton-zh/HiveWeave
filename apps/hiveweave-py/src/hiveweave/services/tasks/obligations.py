@@ -89,3 +89,35 @@ class ObligationsMixin:
             out.append(d)
         return out
 
+    async def list_delegated_in_flight(
+        self, project_id: str, agent_id: str
+    ) -> list[dict]:
+        """Open tasks this agent created and assigned to someone else.
+
+        Used so ``commit_turn(waiting, kind=task, ref=child)`` parks the
+        creator's still-claimed parent (ASSIGNEE_MUST_SUBMIT).
+        """
+        await _ensure_schema(project_id)
+        rows = await _query(
+            project_id,
+            f"SELECT {self._COLUMNS} FROM tasks WHERE is_archived = 0 "
+            "AND creator_id = ? AND assignee_id IS NOT NULL "
+            "AND assignee_id != ? "
+            "AND status IN ('claimed', 'running', 'rework', 'blocked') "
+            "ORDER BY updated_at DESC LIMIT 40",
+            [agent_id, agent_id],
+        )
+        out: list[dict] = []
+        for r in rows:
+            d = self._row(r)
+            out.append(
+                {
+                    "id": d.get("id"),
+                    "parent_task_id": d.get("parent_task_id"),
+                    "assignee_id": d.get("assignee_id"),
+                    "creator_id": d.get("creator_id"),
+                    "status": d.get("status"),
+                }
+            )
+        return out
+

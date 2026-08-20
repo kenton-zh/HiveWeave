@@ -8,11 +8,13 @@ import subprocess
 import time
 from pathlib import Path
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from hiveweave.tools.base import tool
 from hiveweave.tools.result import ToolResult
 from hiveweave.tools.helpers import get_project_id
+from hiveweave.util.tree_label import cwd_display
 from hiveweave.services.process_registry import (
     ProcessRecord,
     allocate_project_port,
@@ -32,6 +34,8 @@ from hiveweave.services.process_registry import (
 
 # Tail bytes to attach on failure (enough for vite/webpack error output)
 _LOG_TAIL_BYTES = 4096
+
+log = structlog.get_logger(__name__)
 
 
 def _dev_server_log_path(workspace: str, port: int) -> Path:
@@ -120,12 +124,41 @@ class StopDevServerParams(BaseModel):
     )
 
 
+async def _agent_active_verify_task(
+    project_id: str, agent_id: str
+) -> str | None:
+    """Return the agent's in-flight (claimed/running) VERIFY task id, if any.
+
+    Milestone VERIFY must validate MAIN: when an agent with an active VERIFY
+    starts a dev server, the server must run against the project root, not its
+    worktree (worktree code is stale for milestone QA). Cheap: called only on
+    dev-server start; obligations re-read from DB each time.
+    """
+    try:
+        from hiveweave.services.task import TaskService
+
+        ts = TaskService()
+        obligations = await ts.get_actionable_obligations(project_id, agent_id)
+    except Exception:
+        return None
+    for t in obligations or []:
+        if (
+            t.get("assignee_id") == agent_id
+            and t.get("status") in ("claimed", "running", "rework")
+            and TaskService._is_verify_task(t)
+        ):
+            return str(t.get("id"))
+    return None
+
+
 @tool(
     "start_dev_server",
     "Start the project's Vite/dev server on a non-reserved port (never 5173/4000). "
     "Registers pid/cwd/port for URL lookup. Prefer this over bare `npm run dev` / `vite`. "
     "The spawned child process inherits only a whitelisted environment — project-specific "
-    "variables must come from `.hiveweave/env.sh` or an inline `VAR=x cmd` command prefix.",
+    "variables must come from `.hiveweave/env.sh` or an inline `VAR=x cmd` command prefix. "
+    "VERIFY agents: when you hold an in-flight VERIFY task, this resolves to the MAIN "
+    "project root (never your worktree) so milestone QA runs against merged code.",
     requires_workspace=True,
     security_level="shell",
 )
@@ -135,6 +168,30 @@ async def start_dev_server_tool(
     project_id = await get_project_id(agent_id)
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project")
+
+    # VERIFY 取证必须在 MAIN 跑：agent 持有在途 VERIFY 任务时，把工作区解析到
+    # 项目 MAIN 根，而不是其 worktree（worktree 代码对里程碑 QA 是陈旧的）。
+    verify_main_note = ""
+    verify_task_id = await _agent_active_verify_task(project_id, agent_id)
+    if verify_task_id:
+        from hiveweave.services.worktree_review import project_main_workspace
+
+        try:
+            main_ws = await project_main_workspace(project_id)
+        except Exception as e:
+            main_ws = None
+            log.warning(
+                "dev_server_verify_main_resolve_failed",
+                project_id=project_id,
+                error=str(e),
+            )
+        if main_ws:
+            workspace = main_ws
+            verify_main_note = (
+                f"VERIFY {verify_task_id[:8]}: dev server resolved to MAIN "
+                f"project root {cwd_display(workspace)}; "
+                f"worktree code is stale for QA."
+            )
 
     if is_reserved_port(params.preferred_port):
         return ToolResult.blocked_err(
@@ -154,7 +211,8 @@ async def start_dev_server_tool(
         work_cwd = full
     if not Path(work_cwd).is_dir():
         return ToolResult.blocked_err(
-            f"Working directory does not exist: {work_cwd}"
+            f"Working directory does not exist: "
+            f"{cwd_display(work_cwd, params.cwd)}"
         )
 
     if params.command:
@@ -340,11 +398,16 @@ async def start_dev_server_tool(
     except Exception as e:
         await asyncio.to_thread(terminate_spawned, proc)
         return ToolResult.err(f"Failed to register dev server: {e}")
-    return ToolResult.ok(
+    note = (
         f"Dev server started on http://localhost:{port}/ "
-        f"(pid={proc.pid}, cwd={work_cwd}, listening=ok). "
+        f"(pid={proc.pid}, {cwd_display(work_cwd, params.cwd)}, listening=ok). "
         f"Log: {log_path}. "
-        f"Do NOT use ports 5173/4000 — those are HiveWeave.",
+        f"Do NOT use ports 5173/4000 — those are HiveWeave."
+    )
+    if verify_main_note:
+        note = f"{note}\n{verify_main_note}"
+    return ToolResult.ok(
+        note,
         port=port,
         pid=proc.pid,
         cwd=work_cwd,

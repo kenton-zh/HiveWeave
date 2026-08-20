@@ -41,7 +41,7 @@ from hiveweave.llm.retry import (
 )
 from hiveweave.llm.streamer import Streamer
 from hiveweave.prompts.context import build_context_prompt
-from hiveweave.prompts.identity import build_identity_prompt
+from hiveweave.prompts.identity import build_identity_prompt, resolve_prompt_role_type
 from hiveweave.services.approval import approval_service
 from hiveweave.services.charter import charter_service
 from hiveweave.services.chat_message import ChatMessageService
@@ -116,6 +116,13 @@ def _unwrap_user_envelope(message: str) -> str:
     if isinstance(parsed, dict) and parsed.get("from") == "用户" and "content" in parsed:
         return str(parsed["content"] or "")
     return message
+
+
+def _task_merge_already_recorded(task: dict | None) -> bool:
+    """approved 任务 merge 已实际落库（覆盖当前修订）→ 不再升级 merge proxy。"""
+    from hiveweave.services.tasks.verify import evidence_merge_recorded
+
+    return evidence_merge_recorded(task)
 
 
 async def broadcast_agent_health(
@@ -689,35 +696,27 @@ class Agent:
                     clear_task_advance_deferred(self.id)
                 except Exception:
                     pass
-                # Clear wait contracts only on user wakes or wait-satisfaction
-                # wakes — NOT on stall/ledger/watchdog triggers (TEST11 audit C2).
-                # Stall nudges must not wipe a legal waiting_on agent contract.
-                _CLEAR_WAIT_SOURCES = frozenset({
-                    "", "user", "chat",
-                    "wait_timeout", "wait_cycle", "wait_satisfied",
-                    "message_from_ref",
-                })
-                # Explicit False: sibling off-turn jobs keep their waits.
-                # wait_satisfied otherwise still clears (last job).
-                if opts.get("clear_waits") is False:
-                    should_clear_waits = False
-                else:
-                    should_clear_waits = (
-                        bool(opts.get("clear_waits"))
-                        or not opts.get("trigger")
-                        or source in _CLEAR_WAIT_SOURCES
+                # Clear wait contracts on user / timeout wakes. Inbox-from-
+                # person (message_from_ref or peer from_agent_id) only clears
+                # matching kind=agent waits — never wipe sibling bg-bash.
+                # Explicit False: wait_satisfied / sibling off-turn jobs.
+                try:
+                    from hiveweave.services.wait_contract import (
+                        apply_wake_admit_wait_clear,
                     )
-                if should_clear_waits:
-                    try:
-                        from hiveweave.services.wait_contract import (
-                            wait_contract_service,
-                        )
 
-                        await wait_contract_service.clear_waits(
-                            self.project_id, self.id
-                        )
-                    except Exception as e:
-                        log.debug("clear_waits_on_wake_failed", error=str(e))
+                    await apply_wake_admit_wait_clear(
+                        self.project_id,
+                        self.id,
+                        source=source,
+                        from_agent_id=opts.get("from_agent_id"),
+                        from_agent_ids=opts.get("wait_clear_sender_ids")
+                        or opts.get("from_agent_ids"),
+                        trigger=bool(opts.get("trigger")),
+                        clear_waits=opts.get("clear_waits"),
+                    )
+                except Exception as e:
+                    log.debug("clear_waits_on_wake_failed", error=str(e))
                 if source in ("user", "chat", "") or not opts.get("trigger"):
                     # User-facing chat clears waiting_human into runnable while processing
                     if self.disposition == "waiting_human" and not opts.get("trigger"):
@@ -1314,6 +1313,14 @@ class Agent:
                 agent_id=self.id,
                 error=str(e),
             )
+        # Failed LLM turns persist user+[ERROR] into history; a short nudge
+        # like 继续 must still see that pending instruction (no text scan).
+        try:
+            user_content = _agent_recovery.attach_failed_turn_hint(
+                history, user_content
+            )
+        except Exception:
+            pass
         messages.append({"role": "user", "content": user_content})
 
         # 5b. Ephemeral RESUME CHECKPOINT — once per interrupt, not into history
@@ -1334,11 +1341,12 @@ class Agent:
 
         self._identity_prompt = build_identity_prompt(
             role=self.config.get("role", "executor"),
-            role_type=self.config.get("role_type", "executor"),
+            role_type=self.config.get("role_type") or "",
             backstory=self.config.get("backstory", ""),
             name=self.config.get("name", ""),
             goal=self.config.get("goal", ""),
             model_id=self.config.get("model_id", ""),
+            permission_type=self.config.get("permission_type") or "",
         )
         return self._identity_prompt
 
@@ -1407,6 +1415,16 @@ class Agent:
         except Exception:
             log.debug("read_charter for project_rules failed", project_id=self.project_id, exc_info=True)
 
+        workspace_path = ""
+        try:
+            workspace_path = await self._get_workspace_path()
+        except Exception:
+            log.debug(
+                "workspace_path for context failed",
+                agent_id=self.id,
+                exc_info=True,
+            )
+
         context = build_context_prompt(
             agent_id=self.id,
             memories=None,  # memory_text 单独传（见下），不走 memories list
@@ -1416,6 +1434,8 @@ class Agent:
             bound_skills=bound_skills_json,
             memory_text=memory_text,
             project_rules=project_rules,
+            workspace_path=workspace_path,
+            role=str(self.config.get("role") or ""),
         )
 
         # 追加 skills section
@@ -1555,12 +1575,14 @@ class Agent:
     async def _get_tool_definitions(self) -> list[dict]:
         """获取工具定义列表（family-aware；硬能力由 PolicyService 在 evaluate 时再挡）。"""
         mode = await permission_service.get_permission_mode(self.id)
-        role_type = self.config.get("role_type", "executor")
+        role_type = resolve_prompt_role_type(
+            self.config.get("permission_type"),
+            self.config.get("role_type"),
+        )
         tool_names = permission_service.get_tools_for_agent({
             **self.config,
             "role": self.config.get("role") or role_type,
-            "permission_type": self.config.get("permission_type")
-            or ("coordinator" if role_type == "coordinator" else "executor"),
+            "permission_type": self.config.get("permission_type") or role_type,
             "permission_mode": mode,
         })
         if not tool_names:
@@ -1590,10 +1612,10 @@ class Agent:
         recovery）。CEO/HR 强制项目根（并清掉误绑的 worktree 路径）；
         恢复失败时回退到项目根目录。
 
-        TEST6 evening P1-3: 名下只有 VERIFY 时本轮 cwd 走项目根（VERIFY 必须
-        在 MAIN 取证）。**不要**因此清掉 agents.workspace_path：绑定是 merge/
-        reconcile 的路标；P1-5 把「本轮走 MAIN」写成「抹掉绑定」后，approved
-        未 merge 的树会从账本消失，团队只能反复撞 merge 门。
+        VERIFY 取证走 bash_main / browse_main，不在这里按任务标题改 cwd。
+        **不要**因 VERIFY 清掉 agents.workspace_path：绑定是 merge/reconcile
+        的路标；把「本轮走 MAIN」写成「抹掉绑定」后，approved 未 merge 的树
+        会从账本消失，团队只能反复撞 merge 门。
         """
         if self._workspace_path is not None:
             return self._workspace_path
@@ -1627,7 +1649,6 @@ class Agent:
                 if project_ws and short_id:
                     try:
                         from hiveweave.services.git_worktree import (
-                            _assignee_is_verify_only,
                             _assignee_needs_write_worktree,
                             heal_workspace_binding_from_disk,
                         )
@@ -1640,16 +1661,6 @@ class Agent:
                         needs_write = await _assignee_needs_write_worktree(
                             project_ws, short_id
                         )
-                        verify_only = (
-                            not needs_write
-                            and await _assignee_is_verify_only(
-                                project_ws, short_id
-                            )
-                        )
-                        if verify_only:
-                            # MAIN cwd this turn; keep durable binding
-                            self._workspace_path = project_ws
-                            return self._workspace_path
                         if not needs_write:
                             live_ok = (
                                 bool(ws)
@@ -1751,6 +1762,8 @@ class Agent:
             and ((tc.get("function") or {}).get("name") in (
                 "send_message", "ask_agent", "notify_agent", "submit_task",
                 "review_task", "claim_task", "write_file", "edit_file", "bash",
+                "bash_main", "browse", "browse_main", "assert_visual",
+                "game_run_case", "game_run_case_main",
                 "spawn_subagent",
             ))
             for tc in (tool_calls or [])
@@ -1764,7 +1777,9 @@ class Agent:
         """True when the turn only had commit_turn (or no tools) — hollow exit."""
         substantive = {
             "submit_task", "review_task", "claim_task", "create_task",
-            "hire_agent", "write_file", "edit_file", "bash", "apply_patch",
+            "hire_agent", "write_file", "edit_file", "bash", "bash_main", "apply_patch",
+            "browse", "browse_main", "assert_visual", "game_run_case",
+            "game_run_case_main", "run_tests",
             "git_worktree_merge", "ask_agent", "send_message", "approve_work",
             "reject_work", "dispatch_task", "spawn_subagent",
         }
@@ -2130,16 +2145,19 @@ class Agent:
     # ── 内部: 安全超时 ────────────────────────────────────────
 
     def _start_safety_timer(self) -> None:
-        """No session wall clock.
+        """No agent-level session wall clock.
 
-        Hung LLM is the stream idle watchdog; hung tools are declared
-        timeouts or bash's own kill; stuck agents are stall/silence.
-        Do not cancel a live turn at 10 minutes.
+        The streamer-level turn budget (always on, ~570s hard cap with
+        graceful checkpoint) enforces the wall clock. Hung LLM is the
+        stream idle watchdog; hung tools are declared timeouts or bash's
+        own kill; stuck agents are stall/silence. The agent layer does
+        not double-kill at 10 minutes.
         """
         self._cancel_safety_timer()
 
     def _extend_safety_timer(self, extra_s: float) -> None:
-        """No-op: session wall clock is off; spawn is already off-turn."""
+        """No-op: wall clock lives in the streamer turn budget; spawn is
+        already off-turn."""
         return
 
     def _cancel_safety_timer(self) -> None:
@@ -2187,9 +2205,8 @@ class Agent:
     async def _ack_inbox_on_give_up(self, inbox_ids: list[str]) -> None:
         """ACK noisy inbox on give-up but keep review/escalation/ask wakes.
 
-        Also inject a ledger [LEDGER REVIEW] wake when this agent still owns
-        submitted/reviewing tasks as creator — so CREATOR_MUST_REVIEW survives
-        even if the original [TASK SUBMITTED] rows were somehow lost.
+        MERGE PROXY heal still runs for approved creator duties (assignment,
+        not progress催). No synthetic [LEDGER REVIEW] / [MERGE PENDING] inject.
         """
         to_ack, to_spare = await self._inbox.partition_give_up_ack(
             self.id, list(inbox_ids or [])
@@ -2208,7 +2225,11 @@ class Agent:
         await self._inject_ledger_review_wake()
 
     async def _inject_ledger_review_wake(self) -> None:
-        """If creator still has review/merge duties, force a task-class wake."""
+        """On give-up: MERGE PROXY for approved creator duties only.
+
+        Does **not** inject [LEDGER REVIEW] / [MERGE PENDING] inbox催
+        (2026-08-17). Spare/ensure_wake already keeps real task wakes.
+        """
         try:
             from hiveweave.services.task import TaskService
 
@@ -2218,93 +2239,31 @@ class Agent:
         except Exception as e:
             log.debug("ledger_obligations_lookup_failed", error=str(e))
             return
-        review = [
-            t
-            for t in (obl or [])
-            if t.get("role_hint") == "creator"
-            and t.get("status") in ("submitted", "reviewing")
-        ]
         merge = [
             t
             for t in (obl or [])
-            if t.get("role_hint") == "creator" and t.get("status") == "approved"
+            if t.get("role_hint") == "creator"
+            and t.get("status") == "approved"
+            and not _task_merge_already_recorded(t)
         ]
-        if not review and not merge:
+        if not merge:
             return
+        try:
+            from hiveweave.services.merge_proxy import escalate_merge_proxy
 
-        async def _send(body: str, task_id: str | None, kind: str) -> None:
-            try:
-                await self._inbox.send_message(
-                    from_agent_id="system",
-                    to_agent_id=self.id,
-                    message=body,
-                    message_type="task",
-                    priority="urgent",
-                    task_id=task_id,
-                    wake=True,
+            for t in merge[:5]:
+                await escalate_merge_proxy(
+                    self.project_id,
+                    t,
+                    reason="creator_give_up",
+                    trigger=True,
                 )
-                log.info(
-                    f"ledger_{kind}_wake_injected",
-                    agent_id=self.id,
-                    count=(
-                        len(review) if kind == "review" else len(merge)
-                    ),
-                )
-            except Exception as e:
-                log.warning(
-                    f"ledger_{kind}_wake_failed",
-                    agent_id=self.id,
-                    error=str(e),
-                )
-
-        if review:
-            lines = []
-            for t in review[:8]:
-                tid = str(t.get("id") or "")
-                title = (t.get("title") or "(untitled)").split("\n")[0][:50]
-                lines.append(f"  - {tid[:8]} [{t.get('status')}] {title}")
-            extra = len(review) - len(lines)
-            body = (
-                f"[LEDGER REVIEW] You still have {len(review)} task(s) awaiting "
-                f"review_task (status submitted/reviewing). Do not ignore the ledger "
-                f"after an LLM error. Use review_task(taskId, decision):\n"
-                + "\n".join(lines)
-                + (f"\n  - …and {extra} more" if extra > 0 else "")
+        except Exception as e:
+            log.debug(
+                "merge_proxy_on_give_up_failed",
+                agent_id=self.id,
+                error=str(e),
             )
-            await _send(body, str(review[0].get("id") or "") or None, "review")
-
-        if merge:
-            lines = []
-            for t in merge[:8]:
-                tid = str(t.get("id") or "")
-                title = (t.get("title") or "(untitled)").split("\n")[0][:50]
-                lines.append(f"  - {tid[:8]} [approved] {title}")
-            extra = len(merge) - len(lines)
-            body = (
-                f"[MERGE PENDING] You still have {len(merge)} approved task(s) "
-                f"awaiting git_worktree_merge. Do not leave worktree-only. "
-                f"Call git_worktree_merge(branchName=shortId or hw/...):\n"
-                + "\n".join(lines)
-                + (f"\n  - …and {extra} more" if extra > 0 else "")
-            )
-            await _send(body, str(merge[0].get("id") or "") or None, "merge")
-            # Give-up + approved: escalate MERGE PROXY to parent with MERGE
-            try:
-                from hiveweave.services.merge_proxy import escalate_merge_proxy
-
-                for t in merge[:5]:
-                    await escalate_merge_proxy(
-                        self.project_id,
-                        t,
-                        reason="creator_give_up",
-                        trigger=True,
-                    )
-            except Exception as e:
-                log.debug(
-                    "merge_proxy_on_give_up_failed",
-                    agent_id=self.id,
-                    error=str(e),
-                )
 
     async def _escalate_turn_interruption(self, *, reason: str) -> None:
         """连续中断超限，给上级发一次升级消息。
@@ -2673,7 +2632,10 @@ class Agent:
             "claim_task or update_task_status again — just continue coding "
             "and call submit_task when done."
         )
-        self._pending_resume_hint = checkpoint
+        prev = getattr(self, "_pending_resume_hint", None)
+        self._pending_resume_hint = (
+            f"{prev}\n\n{checkpoint}" if prev else checkpoint
+        )
         try:
             await self._work_log.write_work_log(
                 self.project_id,

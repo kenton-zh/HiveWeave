@@ -60,12 +60,11 @@ class LookAtImageParams(BaseModel):
 
 @tool(
     "look_at_image",
-    "帮你看图片 — Load an image and ask the configured multimodal model to "
-    "describe or analyze it. Stateless one-shot: waits for the full answer "
-    "(non-streaming) then returns text only. Pass image_path + prompt, or "
-    "attestation_id to inspect another agent's screenshot (project root / "
-    "worktree sandbox). Does NOT inject pixels into your chat history. "
-    "Configure the vision model in Settings → 多模态模型配置.",
+    "帮你看图片 — Optional one-shot: load an image and ask a vision-capable "
+    "model (dedicated vision slot, else the management chat model). "
+    "Does not replace screenshots already injected into your chat. "
+    "Pass image_path + prompt, or attestation_id for another agent's PNG. "
+    "Returns text only; does not inject pixels into chat history.",
     requires_workspace=True,
     security_level="standard",
 )
@@ -97,8 +96,10 @@ async def look_at_image_tool(
     model = await svc.resolve_vision_model()
     if model is None:
         return ToolResult.err(
-            "No multimodal model configured. Open Settings → 模型配置 → "
-            "多模态模型配置, set 主用模型 (vision_model_primary), then retry."
+            "look_at_image has no model to call (dedicated vision slots "
+            "empty/stale, and the management chat model could not be "
+            "resolved). Browse screenshots still inject into the main "
+            "chat when that model accepts images; this tool is optional."
         )
 
     try:
@@ -157,8 +158,8 @@ async def _resolve_look_at_image_path(
         if not shot:
             return (
                 f"Attestation {att_id} has no screenshot_path in "
-                "artifact_hashes. Re-run browse screenshot / assert_visual "
-                "so the path is stored."
+                "artifact_hashes. Re-run browse screenshot so the path "
+                "is stored."
             )
         project_root = await meta_db.get_project_workspace(project_id)
         resolved = resolve_screenshot_under_project(project_root, shot)

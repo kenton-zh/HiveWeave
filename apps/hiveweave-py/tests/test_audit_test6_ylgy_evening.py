@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -691,7 +692,11 @@ async def test_issue_test_run_attestation_records_commit_hash(tmp_path: Path):
         ),
         patch(
             "hiveweave.services.task.TaskService.get_task",
-            AsyncMock(return_value=None),
+            # ae6386c 起必须能加载 bound task（普通任务，非 VERIFY）；
+            # 缺行 → 拒签（见 test_..._rejects_missing_bound_task）
+            AsyncMock(return_value={
+                "id": "task-1", "title": "普通任务", "tags": [],
+            }),
         ),
         patch(
             "hiveweave.services.task.TaskService.emit_task_event",
@@ -713,6 +718,49 @@ async def test_issue_test_run_attestation_records_commit_hash(tmp_path: Path):
     kwargs = create.await_args.kwargs
     assert kwargs.get("commit_hash")
     assert kwargs["commit_hash"].startswith(head[:12])
+
+
+@pytest.mark.asyncio
+async def test_issue_test_run_attestation_rejects_missing_bound_task():
+    """ae6386c 契约：bound task 行不存在（如已归档竞态）→ 拒签，不留悬空证据。"""
+    from hiveweave.tools.bash import _issue_test_run_attestation
+
+    create = AsyncMock(return_value="att-1")
+    with (
+        patch(
+            "hiveweave.services.attestation.is_test_command",
+            return_value=True,
+        ),
+        patch(
+            "hiveweave.tools.bash._resolve_test_attestation_task_id",
+            AsyncMock(return_value=("task-1", "")),
+        ),
+        patch(
+            "hiveweave.services.attestation.attestation_service.create",
+            create,
+        ),
+        patch(
+            "hiveweave.services.task.TaskService.get_task",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "hiveweave.services.task.TaskService.emit_task_event",
+            AsyncMock(),
+        ),
+    ):
+        note = await _issue_test_run_attestation(
+            project_id="p1",
+            agent_id="a1",
+            command="npx vitest run",
+            workspace=str(Path(tempfile.mkdtemp())),
+            stdout="ok",
+            exit_code=0,
+            task_id="task-1",
+        )
+
+    assert "bound task not found" in note
+    assert "VERIFY ATTEST REJECTED" in note
+    create.assert_not_awaited()
 
 
 def test_gitignore_generated_includes_agent_browser():

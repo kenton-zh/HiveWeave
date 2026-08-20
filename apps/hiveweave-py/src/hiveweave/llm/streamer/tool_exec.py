@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from .constants import session_wall_clock_enabled
 from .doom_loop import doom_loop_limit
 from .poll import (
     _POLL_HARD_REJECT_LIMIT,
@@ -45,7 +44,8 @@ class ToolExecMixin:
         duplicate_ids 标识"同参数已执行过、本次无新效果"的工具调用，供 doom
         tracker 做强制 +1 计数加速触顶。
         end_turn=True 表示本批含已接受的 commit_turn，应硬断工具循环（BUG-3）。
-        budget_s 只在 session wall clock 开启且工具声明了超时时收紧预算。
+        budget_s 在工具声明了超时时收紧预算（turn 预算写死启用，
+        见 constants.py 顶部说明）。
         bash/read/write/edit 不声明，不被 wait_for 包裹。
         """
         counts = poll_turn_counts if poll_turn_counts is not None else {}
@@ -182,12 +182,7 @@ class ToolExecMixin:
 
         tool_timeout = declared_timeout_s(tool_name)
         budget_capped = False
-        if (
-            tool_timeout is not None
-            and budget_s is not None
-            and budget_s != float("inf")
-            and session_wall_clock_enabled()
-        ):
+        if tool_timeout is not None and budget_s is not None:
             capped = min(tool_timeout, max(3.0, budget_s))
             budget_capped = capped < tool_timeout
             tool_timeout = capped

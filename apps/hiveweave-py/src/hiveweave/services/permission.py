@@ -44,15 +44,17 @@ _BASE_TOOLS = frozenset({
     "get_tasks",
     "claim_task", "update_task_status", "submit_task", "update_progress",
     "attest_doc_review",
-    "assert_visual",
     "look_at_image",
 })
 
 CEO_TOOLS = _BASE_TOOLS | frozenset({
     # CEO: 行政 + 里程碑验收 + 文档权（DOC_WRITE）。无写码/bash/test。
+    # browse 可看产品。关闸走 waive_attestation(单条 taskId)；
+    # 自己的出证仍不算 approve。不能一次关掉所有任务。
     "check_agent_progress",
     # write/edit 任意文档；源码/配置由 policy classify_write_kind 硬拒
     "write_file", "edit_file",
+    "browse", "browse_main",
     "create_task", "dispatch_task", "review_task",
     "cancel_task", "unclaim_task", "reassign_task", "waive_attestation",
     "waive_merge",
@@ -80,7 +82,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     # 写码/验证工具
     "edit_file", "apply_patch", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
-    "bash", "run_command", "run_tests", "browse", "game_run_case",
+    "bash", "bash_main", "run_command", "run_tests", "browse", "browse_main", "game_run_case", "game_run_case_main",
     "job_kill",
     "spawn_subagent",
     "generate_image",
@@ -88,6 +90,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     "run_code_review", "run_security_audit", "run_perf_audit",
     "run_full_review",
     "request_code_audit",
+    "assert_visual",
 })
 
 # Legacy alias — builder coordinator 即原 COORDINATOR_TOOLS 语义的超集。
@@ -104,7 +107,7 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
 # Do NOT include hire/dispatch/bash elevation here for "readonly" meaning;
 # PolicyService still hard-denies based on role family.
 READONLY_TOOLS = _BASE_TOOLS | frozenset({
-    "bash", "write_file", "browse", "assert_visual", "game_run_case", "edit_file",
+    "bash", "bash_main", "write_file", "browse", "browse_main", "assert_visual", "game_run_case", "game_run_case_main", "edit_file",
     "job_kill",
     "spawn_subagent",
     "generate_image",
@@ -332,7 +335,7 @@ class PermissionService:
     def _extract_args_string(self, tool_name: str, tool_args: dict | None) -> str:
         if tool_args is None:
             return ""
-        if tool_name == "bash":
+        if tool_name in ("bash", "bash_main"):
             return str(tool_args.get("command", tool_args.get("cmd", "")))
         parts = []
         for v in tool_args.values():

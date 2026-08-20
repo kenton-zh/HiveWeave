@@ -155,10 +155,13 @@ async def _submit_preflight(
     行为一致。
     """
     from hiveweave.services.attestation import (
+        CODE_AUDIT_KIND,
         attestation_service,
+        ledger_policy_id,
         required_attestation_kinds,
         resolve_task_policy,
     )
+    from hiveweave.services.code_audit import kinds_after_code_audit_soft_fail
 
     ts = _task_svc.TaskService()
     issues: list[dict] = []
@@ -169,26 +172,25 @@ async def _submit_preflight(
             tags = json.loads(tags)
         except Exception:
             tags = []
-    policy_id = (
-        task.get("policy_id")
-        or resolve_task_policy(
-            title=task.get("title") or "",
-            tags=tags if isinstance(tags, list) else [],
-            description=task.get("description") or "",
-        )
-    )
+    policy_id = ledger_policy_id(task)
     needed = required_attestation_kinds(policy_id)
+    needed, audit_soft = kinds_after_code_audit_soft_fail(
+        needed, agent_id, task_id
+    )
+    if audit_soft:
+        log.info(
+            "submit_code_audit_soft_fail_accepted",
+            agent_id=agent_id,
+            task_id=str(task_id)[:8],
+            policy_id=policy_id,
+        )
     attest_ids = list(params.attestation_ids or [])
 
-    # 审计结论：agent 把 code_audit 凭证塞进 attestationIds 时，strict 策略
-    # 会以 "kind not in expected" 硬拒 —— 审计凭证不是交付证据，先剔除，
-    # 其它 kind 行为不变（查不到 kind 时 fail-open 保持原样）。
-    if attest_ids:
+    # Drop code_audit ids only when the policy does not require that kind
+    # (audit is not a substitute for tests/browse). When code_audit* gates
+    # require it, keep the ids so AND verify_ids can pass.
+    if attest_ids and not (needed and CODE_AUDIT_KIND in needed):
         try:
-            try:
-                from hiveweave.services.code_audit import CODE_AUDIT_KIND
-            except Exception:  # noqa: BLE001
-                CODE_AUDIT_KIND = "code_audit"
             kept = []
             for _aid in attest_ids:
                 _row = await attestation_service.get(project_id, str(_aid))
@@ -332,45 +334,79 @@ async def _submit_preflight(
                 task_id=task_id,
             )
             if not ok:
-                if policy_id == "docs_only":
-                    opt1 = (
-                        f"1) attest_doc_review(taskId=\"{task_id}\", "
-                        f"files=[{{path: \"specs/...\"}}]) then "
-                        f"submit_task(..., attestationIds=[...]).\n"
-                    )
-                elif policy_id == "ui_browser_e2e":
-                    opt1 = (
-                        f"1) browse(...) then browse(screenshot) then "
-                        f"assert_visual(screenshotPath=..., "
-                        f"observed=\"what you SEE in the image\", "
-                        f"verdict=\"pass\") then "
-                        f"submit_task(taskId=\"{task_id}\", "
-                        f"attestationIds=[browse_e2e id, visual_check id]). "
-                        f"Need BOTH kinds; verdict=fail does not unlock submit; "
-                        f"a PNG path alone is rejected.\n"
-                    )
+                from hiveweave.services.attestation import (
+                    format_umbrella_gate_hint,
+                    should_hint_umbrella_gate,
+                    task_is_umbrella,
+                )
+
+                if should_hint_umbrella_gate(
+                    policy_id, needed, err
+                ) and await task_is_umbrella(project_id, task):
+                    issues.append({
+                        "code": "attestation",
+                        "message": format_umbrella_gate_hint(policy_id, err),
+                    })
                 else:
-                    opt1 = (
-                        f"1) Run bash/tests as the assignee, then "
-                        f"submit_task(taskId=\"{task_id}\", "
-                        f"attestationIds=[...]).\n"
-                    )
-                full_tid = task.get("id") or task_id
-                issues.append({
-                    "code": "attestation",
-                    "message": (
-                        f"submit_task attestation gate failed ({policy_id}): {err}. "
-                        f"taskId={full_tid} (use this full id).\n"
-                        f"Options:\n"
-                        + opt1
-                        + (
-                            f"2) Coordinator last resort: "
-                            f"waive_attestation(taskId=\"{task_id}\", "
-                            f"reason=\"<why exempt>\").\n"
-                            f"Bare testsPassed is rejected."
+                    if policy_id == "docs_only":
+                        opt1 = (
+                            f"1) attest_doc_review(taskId=\"{task_id}\", "
+                            f"files=[{{path: \"specs/...\"}}]) then "
+                            f"submit_task(..., attestationIds=[...]).\n"
                         )
-                    ),
-                })
+                    elif policy_id in ("ui_browser_e2e", "code_audit_visual"):
+                        audit_bit = (
+                            "request_code_audit(...) then "
+                            if (
+                                policy_id == "code_audit_visual"
+                                and CODE_AUDIT_KIND in needed
+                            )
+                            else ""
+                        )
+                        opt1 = (
+                            f"1) {audit_bit}browse(...) until you have a "
+                            f"browse_e2e row for this task, then "
+                            f"submit_task(taskId=\"{task_id}\", "
+                            f"attestationIds=[...]). "
+                            f"Need kinds {sorted(needed)}.\n"
+                        )
+                    elif needed and CODE_AUDIT_KIND in needed:
+                        extra = (
+                            " and bash(..., taskId=this task) for test_run"
+                            if "test_run" in needed
+                            else ""
+                        )
+                        opt1 = (
+                            f"1) request_code_audit(taskId=\"{task_id}\"){extra} "
+                            f"then submit_task(..., attestationIds=[code_audit id, ...]).\n"
+                        )
+                    else:
+                        opt1 = (
+                            f"1) Run bash/tests as the assignee, then "
+                            f"submit_task(taskId=\"{task_id}\", "
+                            f"attestationIds=[...]).\n"
+                        )
+                    full_tid = task.get("id") or task_id
+                    issues.append({
+                        "code": "attestation",
+                        "message": (
+                            f"submit_task attestation gate failed ({policy_id}): {err}. "
+                            f"taskId={full_tid} (use this full id).\n"
+                            f"Options:\n"
+                            + opt1
+                            + (
+                                f"2) Coordinator: "
+                                f"waive_attestation(taskId=\"{task_id}\", "
+                                f"evidenceAttestationId=\"<test_run|browse_e2e id>\", "
+                                f"reason=\"<why THIS task>\").\n"
+                                f"CEO may omit evidenceAttestationId after looking "
+                                f"at this one task (cannot waive all tasks).\n"
+                                f"Bare testsPassed is rejected."
+                            )
+                        ),
+                    })
+    elif audit_soft:
+        pass
     elif params.tests_passed is not True:
         # docs_only still asks for explicit ack
         issues.append({
@@ -403,6 +439,17 @@ async def _submit_preflight(
         evidence["files_changed"] = normalize_files_changed(params.files_changed)
     if params.test_output:
         evidence["test_output"] = params.test_output[:4000]
+    if audit_soft:
+        from hiveweave.services.code_audit import (
+            CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY,
+            get_last_audit_attempt,
+        )
+
+        rec = get_last_audit_attempt(agent_id) or {}
+        evidence[CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY] = {
+            "reason": rec.get("reason") or "llm_failed",
+            "task_id": task_id,
+        }
 
     # P1-C/N5: code tasks require clean worktree + files_changed proof.
     tag_l = {

@@ -76,8 +76,8 @@ async def test_wait_contract_persist_and_match(wait_env):
     active = await svc.list_active(pid, AGENT_ID)
     assert len(active) == 1
 
-    assert event_matches_waits(active, event="user_message") is True
-    assert event_matches_waits(active, event="ask_reply") is False
+    assert await event_matches_waits(active, event="user_message") is True
+    assert await event_matches_waits(active, event="ask_reply") is False
 
     # Wake policy with contracts
     assert (
@@ -104,7 +104,8 @@ async def test_wait_contract_persist_and_match(wait_env):
     assert await svc.list_active(pid, AGENT_ID) == []
 
 
-def test_wait_ref_matches_flower_name_not_just_uuid():
+@pytest.mark.asyncio
+async def test_wait_ref_matches_flower_name_not_just_uuid():
     """Regression: commit_turn stores 花名; inbox from_agent_id is UUID."""
     waits = [
         {
@@ -115,7 +116,7 @@ def test_wait_ref_matches_flower_name_not_just_uuid():
     ]
     # UUID alone must NOT match 花名
     assert (
-        event_matches_waits(
+        await event_matches_waits(
             waits,
             event="message_from_ref",
             from_agent_id="c9dd2fad-299c-409a-9a93-236324f7d9d5",
@@ -124,7 +125,7 @@ def test_wait_ref_matches_flower_name_not_just_uuid():
     )
     # With name → wake
     assert (
-        event_matches_waits(
+        await event_matches_waits(
             waits,
             event="message_from_ref",
             from_agent_id="c9dd2fad-299c-409a-9a93-236324f7d9d5",

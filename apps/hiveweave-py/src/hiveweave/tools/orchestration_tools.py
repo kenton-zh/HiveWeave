@@ -319,8 +319,10 @@ async def _send_message_core(
     from hiveweave.services.team_chat import TeamChatService
 
     team_chat = TeamChatService()
+    working_names: list[str] = []
     for target in resolved:
         recipient_disposition = None
+        live = None
         try:
             from hiveweave.agents.supervisor import agent_manager
 
@@ -328,7 +330,7 @@ async def _send_message_core(
             if live is not None:
                 recipient_disposition = getattr(live, "disposition", None)
         except Exception:
-            pass
+            live = None
         try:
             msg = await ctx.inbox.send_message(
                 from_agent_id=agent_id,
@@ -353,6 +355,10 @@ async def _send_message_core(
             # 否则会生成新的回复义务链（TEST18 柚子回执风暴教训）。
             "reply_contract_id": msg.get("reply_contract_id") or "",
         })
+        if live is not None:
+            st = getattr(getattr(live, "status", None), "value", None)
+            if str(st).lower() == "processing":
+                working_names.append(target["name"])
         # Record for sender so team comms panel shows outgoing
         # messages (BUG-034 fix).
         await team_chat.record_message(
@@ -419,9 +425,18 @@ async def _send_message_core(
             log.debug("reply_contract_auto_close_failed", error=str(e))
 
     not_found_str = f" (not found: {not_found})" if not_found else ""
+    working_note = ""
+    if working_names:
+        who = ", ".join(working_names)
+        working_note = (
+            f" NOTE: {who} is 🔴 working (processing). This message steals "
+            "their next turn. If you already dispatched them a task, re-arm "
+            "commit_turn(waiting, kind=task, ref=that task id) instead of "
+            "chasing submit/status."
+        )
     return ToolResult.ok(
         f"Message sent to {len(resolved)} agent(s): "
-        f"{', '.join(r['to'] for r in results)}{not_found_str}",
+        f"{', '.join(r['to'] for r in results)}{not_found_str}{working_note}",
     )
 
 

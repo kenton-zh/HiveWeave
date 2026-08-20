@@ -5,17 +5,16 @@ import asyncio
 import os as _os
 
 
-def session_wall_clock_enabled() -> bool:
-    """Opt-in session TOTAL/HARD wrap. Default off (no turn budget).
-
-    Product: long work may run a long time. Stop on stream-idle, per-tool
-    declared timeout, job_kill / cancel — not 540/570/600. Tests that still
-    exercise the old gates set ``HIVEWEAVE_STREAM_SESSION_WALL_CLOCK=1``.
-    """
-    raw = (
-        _os.environ.get("HIVEWEAVE_STREAM_SESSION_WALL_CLOCK", "0") or "0"
-    ).strip().lower()
-    return raw in ("1", "true", "yes", "on")
+# ── Turn 预算（写死启用，2026-08-19 TEST_DSH_11 复盘）──────────────
+# 历史开关 HIVEWEAVE_STREAM_SESSION_WALL_CLOCK 已移除。TEST21 M4 曾默认
+# 关闭（「长工作可以跑很久」），DSH_11 实锤其外部伤害：coordinator 单
+# turn 无界磨 44+ 轮 × 120k tokens，busy 期间 inbox 全部排队，CEO 派工
+# 令被屏蔽 40+ 分钟、executor 全程闲置 —— 长 turn 阻断管理通道，组织
+# 纠偏失灵。预算是疏导型设计（半程 pacing 提示 → 软截止留 commit_turn
+# 窗 → 硬截止优雅收口保留全部产出），agent 层对 budget_exhausted 自动
+# retrigger 续跑（completion.py），长工作仍持续，只是每 ~9.5 分钟强制
+# 经过一次 turn 边界：inbox 被处理、上下文 checkpoint、token 有帽。
+# 下方 TOTAL/HARD/ACTIVITY/PACING 数值仍可 env 微调。
 
 MAX_TOOL_ROUNDS = 1_000_000
 """最大 tool loop 轮次 — 仅作极端安全网，实际由 doom loop 按工具分级保护。峰值复现真实死循环(同参数反复调用) 。"""
@@ -38,6 +37,14 @@ EMPTY_RESPONSE_BACKOFF_MS = [5_000, 15_000, 45_000]
 
 NO_TEXT_ROUNDS_THRESHOLD = 3
 """连续无文字轮次阈值: 3 轮后注入系统提示。"""
+
+TRUNCATED_TOOL_CALL_ROUNDS_LIMIT = 3
+"""连续「tool_call arguments 截断」轮上限（TEST_DSH_16 实证）。
+
+SSE 提前断流（网关丢 response.completed，finish=None）时 tool_call
+arguments 只收到半截 JSON。畸形调用进历史回传 → 网关 400
+"`arguments` must be valid JSON" 杀死整个 turn。丢弃畸形 + 注入提示
+让模型重发；连续 N 轮仍畸形说明链路持续劣化，优雅收口保产出。"""
 
 NO_TEXT_HINT_MAX = 5
 """无文字提示注入上限: 超过 5 次后强制结束 tool loop 走总结。
@@ -68,6 +75,21 @@ SAFETY_BUFFER_TOKENS = 20_000
 # Leave a small headroom so one large tool result does not immediately 400.
 CONTEXT_TRIM_TRIGGER_RATIO = 0.95
 """输入预算占用达到该比例时才硬截断历史（保留 system 头 + 最近 turn）。"""
+
+# DSH compaction-basic: pressure at 0.8 × window, retain tail 0.16 × window.
+# HiveWeave scales against *usable input* (window − thinking − safety buffer)
+# because 0.8 × 1M would 400 before we compact.
+WORKING_SET_PRESSURE_RATIO = 0.8
+"""循环内工作集压力线：input ≥ usable × 此值才改写前缀（prune / 摘要）。"""
+
+WORKING_SET_RETAIN_RATIO = 0.16
+"""压力压缩后从尾按 token 保留的原文比例（滞回，避免每步都压）。"""
+
+WORKING_SET_SUMMARY_MAX_TOKENS = 8192
+"""步边界摘要输出帽（对齐 DSH compaction-basic maxTokens）。"""
+
+WORKING_SET_CHECKPOINT_MARKER = "[Working-set checkpoint]"
+"""循环内摘要节点标记。不要用跨回合 SUMMARY_MARKER，以免写入 compacted_prefix。"""
 
 OUTPUT_TOKEN_GLOBAL_CAP = 32_000
 """非 reasoning 模型的 max_tokens 全局上限。"""

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from typing import Any
 
 import structlog
@@ -22,6 +23,21 @@ import structlog
 log = structlog.get_logger(__name__)
 
 Epistemic = str  # "verified" | "claimed" | "unknown"
+
+_SCOPE_CLOSED = frozenset(
+    {"closed", "cancelled", "completed", "done", "archived"}
+)
+_LEDGER_SCOPE_CAP = 40
+_NAMED_TASKS_CAP = 20
+LEDGER_MINE_NOTE = (
+    "your actionable to-dos (blocked excluded). "
+    "claimed + you already dispatched a child ≠ you must submit; "
+    "wait on the child. claimed ≠ the assignee is idle."
+)
+LEDGER_SCOPE_RULE = (
+    "ledger.mine empty does not mean the org has no tasks; "
+    "CEO/mid look at ledger.scope before waive/complete."
+)
 
 
 def _entry(
@@ -43,16 +59,118 @@ def _entry(
     return row
 
 
+def _slice_id(value: Any) -> str:
+    """Existing compact slice: full id if ≤12 chars, else first 12. No minting."""
+    s = str(value or "")
+    return s[:12] if s else ""
+
+
+def _depends_on_compact(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    parsed = raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[str] = []
+    for item in parsed:
+        sid = _slice_id(item)
+        if sid:
+            out.append(sid)
+    return out
+
+
+def _live_execution(agent_id: str | None) -> str | None:
+    """verified live execution: processing | idle | offline."""
+    aid = str(agent_id or "").strip()
+    if not aid:
+        return None
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+
+        live = agent_manager.get_agent(aid)
+        if live is None:
+            return "offline"
+        st = getattr(getattr(live, "status", None), "value", None)
+        if st is None:
+            st = getattr(live, "status", "")
+        if str(st).lower() == "processing":
+            return "processing"
+        return "idle"
+    except Exception:
+        return None
+
+
 def _compact_task(t: dict[str, Any]) -> dict[str, Any]:
     return {
-        "id": (t.get("id") or "")[:12],
+        "id": _slice_id(t.get("id")),
         "title": t.get("title"),
         "status": t.get("status"),
         "role_hint": t.get("role_hint"),
         "progress": t.get("progress"),
-        "assignee_id": (t.get("assignee_id") or "")[:12] or None,
-        "reviewer_id": (t.get("reviewer_id") or "")[:12] or None,
+        "assignee_id": _slice_id(t.get("assignee_id")) or None,
+        "reviewer_id": _slice_id(t.get("reviewer_id")) or None,
     }
+
+
+def _compact_scope_task(
+    t: dict[str, Any],
+    *,
+    short_by_id: dict[str, str],
+) -> dict[str, Any]:
+    aid = t.get("assignee_id") or ""
+    assignee = None
+    if aid:
+        assignee = short_by_id.get(str(aid)) or _slice_id(aid) or None
+    return {
+        "id": _slice_id(t.get("id")),
+        "title": t.get("title"),
+        "status": t.get("status"),
+        "assignee_id": assignee,
+        "assignee_execution": _live_execution(t.get("assignee_id")),
+        "parent_task_id": _slice_id(t.get("parent_task_id")) or None,
+        "policy_id": t.get("policy_id"),
+        "depends_on": _depends_on_compact(t.get("depends_on")),
+    }
+
+
+def _viewer_sees_project_scope(agent_row: dict[str, Any] | None) -> bool:
+    """CEO-family viewers see every open task, including blocked."""
+    if not agent_row:
+        return False
+    from hiveweave.services.policy import infer_role_family
+
+    if infer_role_family(agent_row) == "ceo":
+        return True
+    if (agent_row.get("role") or "").strip().lower() == "ceo":
+        return True
+    return False
+
+
+def _scope_sort_key(t: dict[str, Any]) -> tuple[int, int]:
+    blocked_rank = 0 if (t.get("status") or "").lower() == "blocked" else 1
+    ts = t.get("updated_at")
+    if ts is None:
+        ts = t.get("created_at") or 0
+    try:
+        ts_i = int(ts)
+    except (TypeError, ValueError):
+        ts_i = 0
+    return (blocked_rank, -ts_i)
+
+
+def _short_id_map(agents: list[dict[str, Any]]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for a in agents:
+        aid = a.get("id")
+        sid = a.get("short_id")
+        if aid and sid:
+            out[str(aid)] = str(sid)
+    return out
 
 
 async def build_platform_state(
@@ -248,26 +366,221 @@ async def build_platform_state(
             )
         )
 
-    # ── Task ledger obligations (verified) ───────────────
+    # ── Task ledger: mine (actionable) vs scope (open, incl. blocked)
     obligations: list[dict[str, Any]] = []
+    mine_compact: list[dict[str, Any]] = []
+    scope_compact: list[dict[str, Any]] = []
+    scope_truncated = False
+    scope_status_counts: dict[str, int] = {}
+    named_tasks: list[dict[str, Any]] = []
     try:
         from hiveweave.services.task import TaskService
 
         obligations = await TaskService().get_actionable_obligations(
             project_id, agent_id
         )
+        mine_compact = [_compact_task(t) for t in obligations]
+        verified.append(
+            _entry(
+                "ledger.mine",
+                mine_compact,
+                epistemic="verified",
+                source="tasks",
+                note=LEDGER_MINE_NOTE,
+            )
+        )
+        # Alias: existing consumers (and identity copy) still read obligations.
         verified.append(
             _entry(
                 "ledger.obligations",
-                [_compact_task(t) for t in obligations],
+                mine_compact,
                 epistemic="verified",
                 source="tasks",
+                note=LEDGER_MINE_NOTE,
             )
         )
     except Exception as e:
         unknown.append(
             _entry(
+                "ledger.mine",
+                None,
+                epistemic="unknown",
+                source="tasks",
+                note=str(e),
+            )
+        )
+        unknown.append(
+            _entry(
                 "ledger.obligations",
+                None,
+                epistemic="unknown",
+                source="tasks",
+                note=str(e),
+            )
+        )
+
+    try:
+        from hiveweave.db import project as project_db
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.task import TaskService
+
+        org_svc = OrgService()
+        agents_for_ids: list[dict[str, Any]] = []
+        try:
+            agents_for_ids = await org_svc.list_agents(project_id)
+        except Exception:
+            agents_for_ids = []
+        short_by_id = _short_id_map(agents_for_ids)
+
+        all_open = await TaskService().list_tasks(project_id)
+        children = [
+            t
+            for t in all_open
+            if t.get("creator_id") == agent_id
+            and t.get("assignee_id")
+            and t.get("assignee_id") != agent_id
+            and (t.get("status") or "").lower() not in _SCOPE_CLOSED
+            and t.get("id")
+        ]
+        claimed_full = [
+            t
+            for t in obligations
+            if t.get("role_hint") == "assignee"
+            and (t.get("status") or "").lower() == "claimed"
+            and t.get("id")
+        ]
+        unique_claimed = len(claimed_full) == 1
+        for t in claimed_full:
+            tid = str(t.get("id") or "")
+            wait_ref = None
+            for ch in children:
+                parent = str(ch.get("parent_task_id") or "")
+                if parent and (
+                    parent == tid
+                    or (len(parent) >= 8 and (tid.startswith(parent) or parent.startswith(tid)))
+                ):
+                    wait_ref = str(ch.get("id"))
+                    break
+            if wait_ref is None and unique_claimed and children:
+                wait_ref = str(children[0].get("id"))
+            if not wait_ref:
+                continue
+            sl = _slice_id(tid)
+            for row in mine_compact:
+                if (
+                    row.get("id") == sl
+                    and row.get("role_hint") == "assignee"
+                ):
+                    row["park"] = "delegated"
+                    row["wait_on"] = wait_ref
+                    break
+        project_wide = _viewer_sees_project_scope(agent_row)
+        descendant_ids: set[str] = set()
+        if not project_wide:
+            try:
+                descendants = await org_svc.get_all_descendants(agent_id)
+                descendant_ids = {
+                    str(d["id"]) for d in descendants if d.get("id")
+                }
+            except Exception as e:
+                log.warning(
+                    "platform_state.descendants_failed",
+                    agent_id=agent_id[:12],
+                    error=str(e),
+                )
+        assignee_ok = {agent_id} | descendant_ids
+
+        scoped: list[dict[str, Any]] = []
+        for t in all_open:
+            status = (t.get("status") or "").lower()
+            if status in _SCOPE_CLOSED:
+                continue
+            if project_wide:
+                scoped.append(t)
+                continue
+            if t.get("creator_id") == agent_id:
+                scoped.append(t)
+                continue
+            if t.get("assignee_id") in assignee_ok:
+                scoped.append(t)
+        scope_status_counts = dict(
+            Counter((t.get("status") or "unknown") for t in scoped)
+        )
+        scoped.sort(key=_scope_sort_key)
+        scope_truncated = len(scoped) > _LEDGER_SCOPE_CAP
+        scope_compact = [
+            _compact_scope_task(t, short_by_id=short_by_id)
+            for t in scoped[:_LEDGER_SCOPE_CAP]
+        ]
+        verified.append(
+            _entry(
+                "ledger.scope",
+                scope_compact,
+                epistemic="verified",
+                source="tasks",
+                note=LEDGER_SCOPE_RULE,
+            )
+        )
+        if scope_truncated:
+            verified.append(
+                _entry(
+                    "ledger.scope_truncated",
+                    True,
+                    epistemic="verified",
+                    source="tasks",
+                )
+            )
+            verified.append(
+                _entry(
+                    "ledger.scope_status_counts",
+                    scope_status_counts,
+                    epistemic="verified",
+                    source="tasks",
+                    note="Counts for the full untruncated scope set.",
+                )
+            )
+
+        try:
+            conn = await project_db.get_project_db_by_project_id(project_id)
+            cur = await conn.execute(
+                "SELECT from_agent_id, task_id, message_type FROM inbox "
+                "WHERE to_agent_id = ? AND COALESCE(read, 0) = 0 "
+                "AND task_id IS NOT NULL AND TRIM(task_id) != '' "
+                "ORDER BY created_at DESC LIMIT ?",
+                [agent_id, _NAMED_TASKS_CAP],
+            )
+            inbox_rows = await cur.fetchall()
+            await cur.close()
+            for r in inbox_rows:
+                d = dict(r)
+                fid = d.get("from_agent_id") or ""
+                named_tasks.append(
+                    {
+                        "from": short_by_id.get(str(fid))
+                        or (_slice_id(fid) or None),
+                        "task_id": d.get("task_id"),
+                        "message_type": d.get("message_type"),
+                    }
+                )
+        except Exception as e:
+            log.warning(
+                "platform_state.named_tasks_failed",
+                agent_id=agent_id[:12],
+                error=str(e),
+            )
+        verified.append(
+            _entry(
+                "inbox.named_tasks",
+                named_tasks,
+                epistemic="verified",
+                source="inbox",
+                note="Unread rows with structured task_id; body text is ignored.",
+            )
+        )
+    except Exception as e:
+        unknown.append(
+            _entry(
+                "ledger.scope",
                 None,
                 epistemic="unknown",
                 source="tasks",
@@ -477,7 +790,14 @@ async def build_platform_state(
         },
         "gates": {"pending_phase": pending_phase, "gates": gates},
         "ledger": {
-            "obligations": [_compact_task(t) for t in obligations],
+            "obligations": mine_compact,
+            "mine": mine_compact,
+            "scope": scope_compact,
+            "scope_truncated": scope_truncated,
+            "scope_status_counts": scope_status_counts,
+        },
+        "inbox": {
+            "named_tasks": named_tasks,
         },
         "org": org_summary,
         "rule": (
@@ -488,9 +808,47 @@ async def build_platform_state(
     }
 
 
+def _fmt_ledger_row(row: dict[str, Any]) -> str:
+    title = row.get("title") or "(untitled)"
+    status = row.get("status") or "?"
+    tid = row.get("id") or ""
+    extra = ""
+    assignee = row.get("assignee_id")
+    if assignee:
+        extra += f" assignee={assignee}"
+    exec_st = row.get("assignee_execution")
+    if exec_st:
+        extra += f" assignee_execution={exec_st}"
+    role = row.get("role_hint")
+    if role:
+        extra += f" role={role}"
+    park = row.get("park")
+    if park:
+        extra += f" park={park}"
+    wait_on = row.get("wait_on")
+    if wait_on:
+        extra += f" wait_on={wait_on}"
+    parent = row.get("parent_task_id")
+    if parent:
+        extra += f" parent={parent}"
+    policy = row.get("policy_id")
+    if policy:
+        extra += f" policy={policy}"
+    deps = row.get("depends_on")
+    if deps:
+        extra += f" depends_on={deps}"
+    return f"[{status}] {title} id={tid}{extra}"
+
+
 def format_platform_state(snapshot: dict[str, Any]) -> str:
     """Render snapshot as LLM-readable markdown with epistemology sections."""
     epi = snapshot.get("epistemology") or {}
+    ledger = snapshot.get("ledger") or {}
+    mine = ledger.get("mine")
+    if mine is None:
+        mine = ledger.get("obligations") or []
+    scope = ledger.get("scope") or []
+    named = (snapshot.get("inbox") or {}).get("named_tasks") or []
     lines = [
         "# Platform State",
         f"project={snapshot.get('project_id')} agent={str(snapshot.get('agent_id') or '')[:12]}",
@@ -498,8 +856,46 @@ def format_platform_state(snapshot: dict[str, Any]) -> str:
         "",
         snapshot.get("rule") or "",
         "",
-        "## VERIFIED (trust these)",
+        "## Ledger",
+        LEDGER_SCOPE_RULE,
+        f"- mine ({len(mine)}): {LEDGER_MINE_NOTE}",
     ]
+    if not mine:
+        lines.append("  (empty)")
+    else:
+        for row in mine[:_LEDGER_SCOPE_CAP]:
+            lines.append(f"  - {_fmt_ledger_row(row)}")
+    trunc = bool(ledger.get("scope_truncated"))
+    counts = ledger.get("scope_status_counts") or {}
+    scope_hdr = f"- scope ({len(scope)}"
+    if trunc:
+        scope_hdr += ", truncated=true"
+        if counts:
+            scope_hdr += f", status_counts={counts}"
+    scope_hdr += "): open tasks you should see, including blocked"
+    lines.append(scope_hdr)
+    if not scope:
+        lines.append("  (empty)")
+    else:
+        for row in scope[:_LEDGER_SCOPE_CAP]:
+            lines.append(f"  - {_fmt_ledger_row(row)}")
+    lines.append(
+        f"- named_tasks ({len(named)}): unread inbox rows with structured task_id"
+    )
+    if not named:
+        lines.append("  (none)")
+    else:
+        for row in named[:_NAMED_TASKS_CAP]:
+            lines.append(
+                f"  - from={row.get('from')} task_id={row.get('task_id')} "
+                f"type={row.get('message_type')}"
+            )
+    lines.extend(
+        [
+            "",
+            "## VERIFIED (trust these)",
+        ]
+    )
     for row in epi.get("verified") or []:
         lines.append(
             f"- `{row.get('key')}` ← {row.get('source')}: "

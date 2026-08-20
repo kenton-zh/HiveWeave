@@ -32,10 +32,11 @@ def test_reviewer_coordinator_review_is_test_run_only():
     )
 
 
-def test_submit_ui_kinds_remain_and_of_browse_and_visual():
-    """Submit-side ui_browser_e2e stays AND (visual_check + browse_e2e)."""
+def test_submit_ui_kinds_require_browse_not_visual_check_ritual():
+    """Submit-side ui_browser_e2e is browse_e2e; visual_check is optional."""
     needed = required_attestation_kinds("ui_browser_e2e")
-    assert needed == frozenset({VISUAL_CHECK_KIND, BROWSE_E2E_KIND})
+    assert needed == frozenset({BROWSE_E2E_KIND})
+    assert VISUAL_CHECK_KIND not in (needed or frozenset())
     assert REVIEWER_KIND not in (needed or frozenset())
 
 

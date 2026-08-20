@@ -103,6 +103,17 @@ class CloseMixin:
                 error=str(e),
             )
 
+        try:
+            from .ship_nudge import maybe_nudge_ceo_ship_ready
+
+            await maybe_nudge_ceo_ship_ready(project_id, task)
+        except Exception as e:
+            log.warning(
+                "ship_nudge_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+
         # 任务完成记忆：异步 best-effort 为 assignee LLM 总结并写一条记忆。
         # 绝不影响 close 主流程与账本；失败只记日志（内含幂等与降级）。
         try:

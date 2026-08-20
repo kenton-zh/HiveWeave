@@ -55,7 +55,7 @@ AWAITING_REPLY_MS = 3 * 60 * 1000     # 3 min
 
 # 潮汐事故: agent 沉默观测 — 无任何产出的失联检测（消息轴/任务轴看门狗的盲区）
 SILENCE_THRESHOLD_MS = 10 * 60 * 1000        # 10 min 无任何产出判定失联
-SILENCE_NOTIFY_MS = 30 * 60 * 1000           # 失联持续 30 min 升级通知上级
+SILENCE_NOTIFY_MS = 30 * 60 * 1000           # 失联持续 30 min：只打日志，不 inbox 上级
 SILENCE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000  # legacy floor; M7 uses backoff below
 # TEST21 M7: exponential notify cooldown 10min → 30min → 2h
 SILENCE_NOTIFY_BACKOFF_MS = (
@@ -71,24 +71,26 @@ _WAITING_DISPOSITIONS = frozenset({
     "waiting_human", "waiting_agent", "waiting_timer", "blocked",
 })
 
-# Bug K: task 状态停留超时阈值（毫秒）
-# 每个 task 状态有一个"合理停留时间"，超过则催办负责人
+# Ledger dwell clocks (ms). These do **not** inbox-wake anyone to hurry up
+# (2026-08-17: 平台催人已关). They still drive platform-owned heals:
+# auto-submit if already merged, VERIFY reassign, MERGE PROXY.
 TASK_STALL_THRESHOLDS = {
-    "running":   20 * 60 * 1000,   # 20 min: assignee 该提交或更新进度
-    "submitted": 10 * 60 * 1000,   # 10 min: creator 该审查
-    "reviewing": 10 * 60 * 1000,   # 10 min: reviewer 该审批
-    "rework":    10 * 60 * 1000,   # 10 min: assignee 该返工
-    "created":    5 * 60 * 1000,   # 5 min: assignee 该认领
-    "claimed":    5 * 60 * 1000,   # 5 min: assignee 该开始
+    "running":   20 * 60 * 1000,
+    "submitted": 10 * 60 * 1000,
+    "reviewing": 10 * 60 * 1000,
+    "rework":    10 * 60 * 1000,
+    "created":    5 * 60 * 1000,
+    "claimed":    5 * 60 * 1000,
 }
-TASK_STALL_COOLDOWN_MS = 15 * 60 * 1000  # 15 min: 同一 task 不重复催
-BLOCKED_STALE_MS = 30 * 60 * 1000        # 30 min: blocked 无法判定依赖时催办
+TASK_STALL_COOLDOWN_MS = 15 * 60 * 1000  # heal / reassign cadence, not inbox
+BLOCKED_STALE_MS = 30 * 60 * 1000        # reconcile only; no stale inbox
 WAIT_CYCLE_ESCALATION_MS = 30 * 60 * 1000  # 同成员集合 30min 内第 2 次成环升级
 DEAD_AGENT_WAKE_COOLDOWN_MS = 15 * 60 * 1000  # same agent dead-check at most every 15 min
 
-# Ledger re-nudge (replaces disabled stall NL nudges) — structured fields only
-LEDGER_REVIEW_STALE_MS = 10 * 60 * 1000   # submitted|reviewing
-MERGE_PENDING_STALE_MS = 5 * 60 * 1000    # approved awaiting merge
+# Ledger re-nudge windows — MERGE PROXY still fires; review/merge/orphan
+# inbox re-nudges do not (expiry is wait-contract [WAIT_TIMEOUT] only).
+LEDGER_REVIEW_STALE_MS = 10 * 60 * 1000   # retained for tests / metrics
+MERGE_PENDING_STALE_MS = 5 * 60 * 1000    # one-shot on approve still exists
 LEDGER_NUDGE_COOLDOWN_MS = 15 * 60 * 1000
 PEER_REVIEW_DEADLOCK_MS = 10 * 60 * 1000
 PEER_REVIEW_DEADLOCK_COOLDOWN_MS = 30 * 60 * 1000
@@ -101,21 +103,22 @@ _alarm_project: dict[str, str] = {}    # alarm_id → project_id
 _tombstoned_projects: set[str] = set()
 
 
-# P2-5 (slack-clone_01)：BLOCKED STALE 的 upstream 状态分组。
-# 已交付进审查管线 / 终态 —— blocked 方无可行动，催办是纯噪声
-# （毛糙点：upstream 已 submit 却仍收到 stale 催办）。
+# P2-5 (slack-clone_01)：曾用于 BLOCKED STALE inbox 过滤。
+# 周期性 [BLOCKED STALE] 已禁用；helper 仍供单测 / 将来 reconcile 策略复用。
 _UPSTREAM_DELIVERED_OR_DONE = frozenset(
     {"submitted", "reviewing", "approved", "verifying", "closed"}
 )
 
 
 def upstream_nudge_relevant(task: dict, by_id: dict[str, dict]) -> bool:
-    """P2-5: BLOCKED STALE 是否值得发 —— 只看 structured upstream 引用。
+    """Whether a blocked task's upstream still looks actionable (structured refs).
 
-    - 无 upstream 引用（手动 blocked / wait contract）→ True（维持现状催办）；
-    - 任一 upstream 处于交付前状态（created/claimed/running/rework/blocked），
-      或已 archived，或行缺失（需重新定向/升级）→ True；
-    - 全部 upstream 已交付（submitted…closed，复审管线在走）→ False。
+    Historically gated [BLOCKED STALE] inbox. That nag is gone; kept as a
+    pure predicate for unit tests and possible future heal policy.
+
+    - 无 upstream 引用 → True；
+    - 任一 upstream 交付前 / archived / 行缺失 → True；
+    - 全部 upstream 已交付（submitted…closed）→ False。
     """
     deps = task.get("depends_on") or []
     if isinstance(deps, str):
@@ -210,7 +213,7 @@ def _tool_quiet_cap_ms(tool_name: str) -> int:
     declared = declared_timeout_s(tool_name)
     if declared is not None:
         return int((declared + 60.0) * 1000)
-    if tool_name in ("bash", "run_command"):
+    if tool_name in ("bash", "bash_main", "run_command"):
         from hiveweave.tools.bash import MAX_TIMEOUT_S
 
         return int((MAX_TIMEOUT_S + 60.0) * 1000)
@@ -671,7 +674,6 @@ class GameTimeService:
         inbox = InboxService()
         agents = await OrgService().list_agents(project_id)
         by_key: dict[str, str] = {}
-        name_by_id: dict[str, str] = {}
         for a in agents:
             aid = a.get("id") or ""
             if not aid:
@@ -681,7 +683,6 @@ class GameTimeService:
                 by_key[str(a["short_id"]).lower()] = aid
             if a.get("name"):
                 by_key[str(a["name"]).lower()] = aid
-                name_by_id[aid] = str(a["name"])
 
         def resolve_ref(ref: str) -> str | None:
             r = (ref or "").strip().lower()
@@ -756,54 +757,8 @@ class GameTimeService:
                     agent_id=aid,
                     error=str(e),
                 )
-
-            # Re-nudge debtor when wait was on an agent and ask still open
-            if ask_outstanding and ref_agent_id and ref_agent_id != aid:
-                waiter_name = name_by_id.get(aid) or aid[:8]
-                try:
-                    # Supersede prior ASK_OUTSTANDING nudges to avoid spam
-                    from hiveweave.db import project as project_db
-
-                    try:
-                        await project_db.execute(
-                            ref_agent_id,
-                            "UPDATE inbox SET read = 1, delivered = 1, wake = 0 "
-                            "WHERE to_agent_id = ? AND from_agent_id = 'system' "
-                            "AND COALESCE(read, 0) = 0 "
-                            "AND message LIKE '[ASK_OUTSTANDING]%'",
-                            [ref_agent_id],
-                        )
-                    except Exception as e:
-                        log.debug("ask_outstanding_supersede_failed", error=str(e))
-
-                    await inbox.send_message(
-                        from_agent_id="system",
-                        to_agent_id=ref_agent_id,
-                        message=(
-                            f"[ASK_OUTSTANDING] {waiter_name} is still waiting "
-                            f"on your reply (wait ref={ref}). "
-                            "An expect_report/ask contract to them is still open — "
-                            "call send_message/ask_agent to them now. "
-                            "Assistant text alone does not close the contract."
-                        ),
-                        message_type="system",
-                        priority="urgent",
-                        wake=True,
-                    )
-                    await self._watchdog_trigger(ref_agent_id, force=True)
-                    log.info(
-                        "wait_timeout_ask_renudge",
-                        waiter=aid,
-                        debtor=ref_agent_id,
-                        ref=ref,
-                    )
-                except Exception as e:
-                    log.warning(
-                        "wait_timeout_renudge_failed",
-                        waiter=aid,
-                        debtor=ref_agent_id,
-                        error=str(e),
-                    )
+            # Do not [ASK_OUTSTANDING] the other agent — that is platform催人.
+            # The waiter owns the clock; they re-arm wait or act after timeout.
 
         breaks = await wait_contract_service.break_wait_cycles(
             project_id,
@@ -1013,13 +968,13 @@ class GameTimeService:
         await self._nudge_peer_review_deadlocks(project_id, agents=agents)
 
     async def _nudge_stale_ledger(self, project_id: str) -> None:
-        """Ledger-only re-nudge: stale review / merge / peer_review cross-wait.
+        """Platform-owned ledger heals. No progress-nudge inbox.
 
-        Does **not** restore NL stall nudges. Uses tasks.status/tags/updated_at
-        and org parent_id only. Age is capped to the current duty session so
-        overnight off-duty wall-clock does not stampede on activate.
+        Still: auto-submit running-if-merged, VERIFY executor reassign,
+        MERGE PROXY. Does **not** send [TASK STALL] / [LEDGER REVIEW] /
+        [ORPHAN TASK] / periodic [MERGE PENDING]. Wait clocks are
+        ``[WAIT_TIMEOUT]`` to the waiter only.
         """
-        from hiveweave.services.inbox import InboxService
         from hiveweave.services.org import OrgService
         from hiveweave.services.task import TaskService
 
@@ -1045,7 +1000,6 @@ class GameTimeService:
 
         ts = TaskService()
         tasks = await ts.list_tasks(project_id)
-        inbox = InboxService()
         agents = await OrgService().list_agents(project_id)
         by_id = {a.get("id"): a for a in agents if a.get("id")}
 
@@ -1081,120 +1035,10 @@ class GameTimeService:
                 return True
             return False
 
-        # ── submitted|reviewing → [LEDGER REVIEW] + escalation (修 #5) ──
-        review_nudge_counts: dict[str, int] = state.setdefault(
-            "review_nudge_counts", {}
-        )
-        for t in tasks:
-            status = t.get("status")
-            if status not in ("submitted", "reviewing"):
-                # 任务已离开 submitted/reviewing，重置计数
-                review_nudge_counts.pop(str(t.get("id") or ""), None)
-                continue
-            if _effective_age_ms(t) < LEDGER_REVIEW_STALE_MS:
-                continue
-            creator = t.get("creator_id")
-            tid = str(t.get("id") or "")
-            if not creator or not tid:
-                continue
-            if not _cooled(f"review:{tid}", LEDGER_NUDGE_COOLDOWN_MS):
-                continue
-            title = (t.get("title") or "(untitled)").split("\n")[0][:50]
+        # submitted|reviewing: one-shot [TASK SUBMITTED] on submit is enough.
+        # No periodic [LEDGER REVIEW] / [REVIEW ESCALATION] inbox.
 
-            # TEST11 #3: prefer designated reviewer when ≠ creator
-            reviewer = t.get("reviewer_id")
-            nudge_target = str(creator)
-            if reviewer and str(reviewer) != str(creator):
-                nudge_target = str(reviewer)
-
-            # 修 #5: nudge 计数升级 — 超过阈值后 escalate 给 creator 上级
-            nudge_count = review_nudge_counts.get(tid, 0) + 1
-            review_nudge_counts[tid] = nudge_count
-
-            if nudge_count > STALL_ESCALATION_THRESHOLD:
-                # 升级：通知 creator 的上级（参照 merge-proxy 先例）
-                creator_agent = by_id.get(str(creator))
-                parent_id = (
-                    creator_agent.get("parent_id") if creator_agent else None
-                )
-                if parent_id and parent_id != creator:
-                    esc_body = (
-                        f"[REVIEW ESCALATION] Task '{title}' ({tid[:8]}) "
-                        f"has been {status} for "
-                        f">{LEDGER_REVIEW_STALE_MS // 60000}min and received "
-                        f"{nudge_count - 1} review nudges without action. "
-                        f"Reviewer/creator {nudge_target[:12]} has not reviewed. "
-                        f"Please reassign the reviewer or handle the review."
-                    )
-                    try:
-                        await inbox.send_message(
-                            from_agent_id="system",
-                            to_agent_id=parent_id,
-                            message=esc_body,
-                            message_type="task",
-                            priority="urgent",
-                            task_id=tid,
-                            wake=True,
-                        )
-                        await self._watchdog_trigger(parent_id)
-                        log.info(
-                            "review_escalation",
-                            project_id=project_id,
-                            task_id=tid,
-                            creator=creator,
-                            escalated_to=parent_id,
-                            nudge_count=nudge_count,
-                        )
-                    except Exception as e:
-                        log.warning(
-                            "review_escalation_failed",
-                            task_id=tid,
-                            error=str(e),
-                        )
-                # 继续发常规 nudge 给 reviewer/creator（上级介入不替代常规催办）
-                body = (
-                    f"[LEDGER REVIEW] Task '{title}' ({tid[:8]}) has been "
-                    f"{status} for >{LEDGER_REVIEW_STALE_MS // 60000}min "
-                    f"(on-duty, nudge #{nudge_count}). Use "
-                    f"review_task(taskId='{tid}', "
-                    f"decision='approve'/'rework')."
-                )
-            else:
-                body = (
-                    f"[LEDGER REVIEW] Task '{title}' ({tid[:8]}) has been "
-                    f"{status} for >{LEDGER_REVIEW_STALE_MS // 60000}min "
-                    f"(on-duty). Use review_task(taskId='{tid}', "
-                    f"decision='approve'/'rework')."
-                )
-            try:
-                await inbox.send_message(
-                    from_agent_id="system",
-                    to_agent_id=nudge_target,
-                    message=body,
-                    message_type="task",
-                    priority="urgent",
-                    task_id=tid,
-                    wake=True,
-                )
-                await self._watchdog_trigger(nudge_target)
-                log.info(
-                    "ledger_stale_review_nudge",
-                    project_id=project_id,
-                    task_id=tid,
-                    target=nudge_target,
-                    creator=creator,
-                    reviewer=reviewer,
-                    status=status,
-                    nudge_count=nudge_count,
-                )
-            except Exception as e:
-                log.warning(
-                    "ledger_stale_review_nudge_failed",
-                    task_id=tid,
-                    error=str(e),
-                )
-
-        # ── TEST11 #8: activate TASK_STALL_THRESHOLDS (running/claimed/…) ──
+        # ── dwell clocks: auto-submit / VERIFY reassign; no [TASK STALL] ──
         task_stall_counts: dict[str, int] = state.setdefault(
             "task_stall_counts", {}
         )
@@ -1222,61 +1066,9 @@ class GameTimeService:
             assignee = t.get("assignee_id")
             if not tid:
                 continue
-            # TEST6 P1-4: unassigned created orphans — nudge creator to
-            # dispatch_task / claim / archive (stall previously skipped them).
+            # Unassigned created: no [ORPHAN TASK] inbox. Creator already
+            # knows; dispatch/cancel is their ledger, not a platform nag.
             if not assignee:
-                if status != "created":
-                    continue
-                creator = t.get("creator_id")
-                if not creator:
-                    continue
-                if t.get("owner_parked"):
-                    continue
-                age = _effective_age_ms(t)
-                if age < thresh:
-                    task_stall_counts.pop(tid, None)
-                    continue
-                if not _cooled(f"orphan:{tid}", TASK_STALL_COOLDOWN_MS):
-                    continue
-                title = (t.get("title") or "(untitled)").split("\n")[0][:50]
-                stall_count = task_stall_counts.get(tid, 0) + 1
-                task_stall_counts[tid] = stall_count
-                mins = thresh // 60000
-                body = (
-                    f"[ORPHAN TASK] Task '{title}' ({tid[:8]}) is still "
-                    f"created with no assignee after >{mins}min. "
-                    f"Call dispatch_task(taskId=\"{tid}\", ...) to assign, "
-                    f"or cancel_task if obsolete. send_message alone does "
-                    f"NOT enter the ledger."
-                )
-                try:
-                    await inbox.send_message(
-                        from_agent_id="system",
-                        to_agent_id=str(creator),
-                        message=body,
-                        message_type="task",
-                        priority="urgent",
-                        task_id=tid,
-                        wake=True,
-                        idempotency_key=(
-                            f"orphan_task:{tid}:"
-                            f"{int(time.time() * 1000) // TASK_STALL_COOLDOWN_MS}"
-                        ),
-                    )
-                    await self._watchdog_trigger(str(creator))
-                    log.info(
-                        "orphan_task_stall_nudge",
-                        project_id=project_id,
-                        task_id=tid,
-                        creator=creator,
-                        stall_count=stall_count,
-                    )
-                except Exception as e:
-                    log.warning(
-                        "orphan_task_stall_nudge_failed",
-                        task_id=tid,
-                        error=str(e),
-                    )
                 continue
             # TEST21 M5: owner parked — stall mute until agent recovers
             if t.get("owner_parked"):
@@ -1327,14 +1119,9 @@ class GameTimeService:
                         )
                         continue
             title = (t.get("title") or "(untitled)").split("\n")[0][:50]
-            progress = t.get("progress")
             stall_count = task_stall_counts.get(tid, 0) + 1
             task_stall_counts[tid] = stall_count
-            mins = thresh // 60000
-            # VERIFY executor stall at escalation: reassign to another
-            # independent QA (never auto-approve / skip serial lock /
-            # reassign to implementer). submitted/reviewing stay on the
-            # review nudge path above.
+            # VERIFY executor stall: platform reassigns. No [TASK STALL] inbox.
             if (
                 stall_count > STALL_ESCALATION_THRESHOLD
                 and ts._is_verify_task(t)
@@ -1351,73 +1138,34 @@ class GameTimeService:
                             project_id, t, agents_by_id=by_id
                         ):
                             cooldowns[f"verify-exec-stall:{tid}"] = now_ms
-                            continue
                     except Exception as e:
                         log.warning(
                             "verify_executor_stall_failed",
                             task_id=tid,
                             error=str(e),
                         )
-            body = (
-                f"[TASK STALL] Task '{title}' ({tid[:8]}) has been "
-                f"{status} for >{mins}min (progress={progress}). "
-                f"Update progress, submit_task, or block with a typed reason."
+            log.info(
+                "task_stall_clock_tick",
+                project_id=project_id,
+                task_id=tid,
+                status=status,
+                assignee=(assignee or "")[:8],
+                stall_count=stall_count,
+                title=title[:40],
             )
-            try:
-                await inbox.send_message(
-                    from_agent_id="system",
-                    to_agent_id=assignee,
-                    message=body,
-                    message_type="task",
-                    priority="urgent",
-                    task_id=tid,
-                    wake=True,
-                )
-                await self._watchdog_trigger(assignee)
-                log.info(
-                    "task_stall_nudge",
-                    project_id=project_id,
-                    task_id=tid,
-                    status=status,
-                    assignee=assignee,
-                    stall_count=stall_count,
-                )
-            except Exception as e:
-                log.warning("task_stall_nudge_failed", task_id=tid, error=str(e))
 
-            if stall_count > STALL_ESCALATION_THRESHOLD:
-                asg_agent = by_id.get(str(assignee))
-                parent_id = asg_agent.get("parent_id") if asg_agent else None
-                if parent_id and parent_id != assignee:
-                    try:
-                        await inbox.send_message(
-                            from_agent_id="system",
-                            to_agent_id=parent_id,
-                            message=(
-                                f"[TASK STALL ESCALATION] Task '{title}' "
-                                f"({tid[:8]}) stuck in {status} after "
-                                f"{stall_count} nudges. Assignee "
-                                f"{assignee[:12]} not progressing."
-                            ),
-                            message_type="task",
-                            priority="urgent",
-                            task_id=tid,
-                            wake=True,
-                        )
-                        await self._watchdog_trigger(parent_id)
-                    except Exception as e:
-                        log.warning(
-                            "task_stall_escalation_failed",
-                            task_id=tid,
-                            error=str(e),
-                        )
-
-        # ── approved (non-VERIFY) → [MERGE PENDING] and/or [MERGE PROXY] ──
+        # ── approved (non-VERIFY) → MERGE PROXY only (no periodic PENDING) ──
         # NOTE: the orphan/assignee stall loop ends above; do not duplicate.
+        from hiveweave.services.tasks.verify import evidence_merge_recorded
+
         for t in tasks:
             if t.get("status") != "approved":
                 continue
             if TaskService._is_verify_task(t):
+                continue
+            # merge 已实际落库（覆盖当前修订）的任务不再需要 PROXY——
+            # 它停在 approved 只差 migrate 宽限期收口，催 merge 只会制造噪音。
+            if evidence_merge_recorded(t):
                 continue
             age = _effective_age_ms(t)
             tid = str(t.get("id") or "")
@@ -1433,44 +1181,7 @@ class GameTimeService:
 
             unavailable = _creator_unavailable(str(owner))
             need_proxy = age >= MERGE_PROXY_STALE_MS or unavailable
-            need_pending = age >= MERGE_PENDING_STALE_MS
-
-            if need_pending and not unavailable:
-                if _cooled(f"merge:{tid}", LEDGER_NUDGE_COOLDOWN_MS):
-                    title = (t.get("title") or "(untitled)").split("\n")[0][:50]
-                    short = ""
-                    asg = t.get("assignee_id")
-                    if asg and asg in by_id:
-                        short = (by_id[asg] or {}).get("short_id") or ""
-                    branch = short or "hw/<short_id>/..."
-                    body = (
-                        f"[MERGE PENDING] Task '{title}' ({tid[:8]}) approved for "
-                        f">{MERGE_PENDING_STALE_MS // 60000}min without merge "
-                        f"(on-duty). Call git_worktree_merge(branchName='{branch}') now."
-                    )
-                    try:
-                        await inbox.send_message(
-                            from_agent_id="system",
-                            to_agent_id=owner,
-                            message=body,
-                            message_type="task",
-                            priority="urgent",
-                            task_id=tid,
-                            wake=True,
-                        )
-                        await self._watchdog_trigger(owner)
-                        log.info(
-                            "ledger_stale_merge_nudge",
-                            project_id=project_id,
-                            task_id=tid,
-                            owner=owner,
-                        )
-                    except Exception as e:
-                        log.warning(
-                            "ledger_stale_merge_nudge_failed",
-                            task_id=tid,
-                            error=str(e),
-                        )
+            # One-shot [MERGE PENDING] is sent on approve. Do not re-nudge.
 
             if need_proxy and _cooled(f"proxy:{tid}", MERGE_PROXY_COOLDOWN_MS):
                 from hiveweave.services.merge_proxy import escalate_merge_proxy
@@ -1503,131 +1214,15 @@ class GameTimeService:
         tasks: list[dict] | None = None,
         now_ms: int | None = None,
     ) -> None:
-        """Cross peer_review submitted pairs → wake both + common superior."""
-        from hiveweave.services.inbox import InboxService
-        from hiveweave.services.org import OrgService
-        from hiveweave.services.task import TaskService
+        """Peer-review deadlock inbox — disabled.
 
-        now = now_ms if now_ms is not None else int(time.time() * 1000)
-        state = _states.get(project_id)
-        if not state:
-            return
-        cooldowns: dict[str, int] = state.setdefault("ledger_nudge_cooldowns", {})
-        session_start = int(state.get("duty_session_started_at_ms") or now)
-
-        if agents is None:
-            agents = await OrgService().list_agents(project_id)
-        if tasks is None:
-            tasks = await TaskService().list_tasks(project_id)
-
-        by_id = {a.get("id"): a for a in agents if a.get("id")}
-        inbox = InboxService()
-
-        def _tags(t: dict) -> list[str]:
-            raw = t.get("tags") or []
-            if isinstance(raw, list):
-                return [str(x).lower() for x in raw]
-            if isinstance(raw, str):
-                return [raw.lower()]
-            return []
-
-        def _effective_age_ms(t: dict) -> int:
-            updated = int(t.get("updated_at") or t.get("created_at") or 0)
-            if not updated:
-                return 0
-            wall = max(0, now - updated)
-            since_duty = max(0, now - session_start)
-            return min(wall, since_duty)
-
-        # Edges: creator must review assignee's submitted peer_review task
-        edges: dict[tuple[str, str], dict] = {}
-        for t in tasks:
-            if t.get("status") not in ("submitted", "reviewing"):
-                continue
-            if "peer_review" not in _tags(t):
-                continue
-            if _effective_age_ms(t) < PEER_REVIEW_DEADLOCK_MS:
-                continue
-            c, a = t.get("creator_id"), t.get("assignee_id")
-            if not c or not a or c == a:
-                continue
-            edges[(c, a)] = t
-
-        seen_pairs: set[frozenset[str]] = set()
-        for (a, b), t_ab in list(edges.items()):
-            t_ba = edges.get((b, a))
-            if not t_ba:
-                continue
-            pair = frozenset({a, b})
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            key = f"peer:{':'.join(sorted(pair))}"
-            last = cooldowns.get(key) or 0
-            if now - last < PEER_REVIEW_DEADLOCK_COOLDOWN_MS:
-                continue
-            cooldowns[key] = now
-
-            parent_a = (by_id.get(a) or {}).get("parent_id")
-            parent_b = (by_id.get(b) or {}).get("parent_id")
-            superior = parent_a if parent_a == parent_b else (parent_a or parent_b)
-
-            tid_ab = str(t_ab.get("id") or "")[:8]
-            tid_ba = str(t_ba.get("id") or "")[:8]
-            body_pair = (
-                f"[PEER_REVIEW_DEADLOCK] Cross peer_review stuck: "
-                f"{a[:8]}↔{b[:8]} (tasks {tid_ab}/{tid_ba}). "
-                f"Break the wait: review_task one side or escalate."
-            )
-            for member in (a, b):
-                try:
-                    await inbox.send_message(
-                        from_agent_id="system",
-                        to_agent_id=member,
-                        message=body_pair,
-                        message_type="escalation",
-                        priority="urgent",
-                        wake=True,
-                    )
-                    await self._watchdog_trigger(member)
-                except Exception as e:
-                    log.warning(
-                        "peer_review_deadlock_wake_failed",
-                        member=member,
-                        error=str(e),
-                    )
-            if superior and superior not in (a, b):
-                try:
-                    await inbox.send_message(
-                        from_agent_id="system",
-                        to_agent_id=superior,
-                        message=(
-                            f"[PEER_REVIEW_DEADLOCK] Subordinates {a[:8]}↔{b[:8]} "
-                            f"cross-waiting on peer_review tasks "
-                            f"{tid_ab}/{tid_ba}. Please break the deadlock."
-                        ),
-                        message_type="escalation",
-                        priority="urgent",
-                        wake=True,
-                    )
-                    await self._watchdog_trigger(superior)
-                except Exception as e:
-                    log.warning(
-                        "peer_review_deadlock_superior_failed",
-                        superior=superior,
-                        error=str(e),
-                    )
-            log.info(
-                "peer_review_deadlock_broken",
-                project_id=project_id,
-                pair=sorted(pair),
-                superior=superior,
-            )
+        Mutual wait is a wait-contract concern. Do not催 both sides.
+        Leadership sees the ledger; ``[WAIT_TIMEOUT]`` wakes waiters.
+        """
+        return
 
     async def _reconcile_blocked_tasks(self, project_id: str) -> None:
-        """TEST11 #8: unblock met deps / expired timers; nudge stale blocked."""
-        from hiveweave.services.inbox import InboxService
-        from hiveweave.services.org import OrgService
+        """Unblock met deps / expired timers. No [BLOCKED STALE] inbox."""
         from hiveweave.services.task import TaskService
 
         proj = await meta_db.query_one(
@@ -1645,142 +1240,8 @@ class GameTimeService:
             await ts.reconcile_blocked_tasks(project_id)
         except Exception as e:
             log.warning("reconcile_blocked_tasks_failed", error=str(e))
-
-        # Stale blocked with no auto-wake path → nudge assignee / escalate creator
-        now_ms = int(time.time() * 1000)
-        state = _states.get(project_id)
-        if not state:
-            return
-        cooldowns: dict[str, int] = state.setdefault("ledger_nudge_cooldowns", {})
-        session_start = int(state.get("duty_session_started_at_ms") or now_ms)
-        blocked_counts: dict[str, int] = state.setdefault(
-            "blocked_stall_counts", {}
-        )
-        tasks = await ts.list_tasks(project_id)
-        inbox = InboxService()
-        agents = await OrgService().list_agents(project_id)
-        by_id = {a.get("id"): a for a in agents if a.get("id")}
-        by_task_id = {str(t.get("id")): t for t in tasks if t.get("id")}
-
-        # Batch live waits once (avoid per-task list_active N+1)
-        live_wait_agents: set[str] = set()
-        try:
-            from hiveweave.services.wait_contract import wait_contract_service
-
-            for w in await wait_contract_service.list_all_active(project_id):
-                aid = w.get("agentId")
-                if aid:
-                    live_wait_agents.add(str(aid))
-        except Exception:
-            pass
-
-        for t in tasks:
-            if t.get("status") != "blocked":
-                blocked_counts.pop(str(t.get("id") or ""), None)
-                continue
-            tid = str(t.get("id") or "")
-            assignee = t.get("assignee_id")
-            if not tid or not assignee:
-                continue
-            updated = int(t.get("updated_at") or t.get("created_at") or 0)
-            wall = max(0, now_ms - updated) if updated else 0
-            since_duty = max(0, now_ms - session_start)
-            age = min(wall, since_duty)
-            if age < BLOCKED_STALE_MS:
-                continue
-            # P2-5: upstream 全部已交付（submitted…closed）时 blocked 方无可
-            # 行动，跳过 stale 催办；仍有交付前/失联 upstream 或无引用时才催。
-            if not upstream_nudge_relevant(t, by_task_id):
-                continue
-            # 2026-08-11 slack-clone_01 死锁复盘：live_wait_agents 跳过只对
-            # 「有自动解封路径」的任务生效（reconcile 会接管）；无路径的
-            # parked 任务若 assignee 恰好被 claim 门禁指示 commit_turn
-            # (waiting) 而持有 wait contract，跳过会让看门狗永久沉默 ——
-            # 死等必须催。
-            from hiveweave.services.tasks.lifecycle import (
-                blocked_task_has_wake_path,
-            )
-
-            has_wake = blocked_task_has_wake_path(t, now_ms)
-            if has_wake and str(assignee) in live_wait_agents:
-                continue
-            try:
-                from hiveweave.services.offturn import agent_has_live_job_for_task
-
-                if agent_has_live_job_for_task(str(assignee), tid):
-                    continue
-            except Exception:
-                pass
-            last = cooldowns.get(f"blocked:{tid}") or 0
-            if now_ms - last < TASK_STALL_COOLDOWN_MS:
-                continue
-            cooldowns[f"blocked:{tid}"] = now_ms
-            count = blocked_counts.get(tid, 0) + 1
-            blocked_counts[tid] = count
-            title = (t.get("title") or "(untitled)").split("\n")[0][:50]
-            reason = (t.get("blocked_reason") or "")[:80]
-            # 能解卡的是设卡/建任务的人（creator），不是被 park 的 assignee
-            # （assignee 往往已被门禁指示 commit_turn(waiting)，无能为力）。
-            # creator 缺失或等于 assignee 时回退 assignee。
-            recipient = t.get("creator_id") or assignee
-            parked_note = ""
-            if not has_wake:
-                parked_note = (
-                    f" NO auto-unblock path (no dependsOnTaskIds, no wakeAt) "
-                    f"— it will never wake itself; give it dependsOnTaskIds/"
-                    f"wakeAt first, or unblock it (update_task_status running) "
-                    f"when no other VERIFY is running."
-                )
-            try:
-                await inbox.send_message(
-                    from_agent_id="system",
-                    to_agent_id=recipient,
-                    message=(
-                        f"[BLOCKED STALE] Task '{title}' ({tid[:8]}) blocked "
-                        f">{BLOCKED_STALE_MS // 60000}min "
-                        f"(reason={reason or 'n/a'}).{parked_note} "
-                        f"Unblock, retarget dependsOnTaskIds, or escalate."
-                    ),
-                    message_type="task",
-                    priority="urgent",
-                    task_id=tid,
-                    wake=True,
-                )
-                await self._watchdog_trigger(recipient)
-            except Exception as e:
-                log.warning("blocked_stale_nudge_failed", task_id=tid, error=str(e))
-
-            if count > STALL_ESCALATION_THRESHOLD:
-                # 催办已发 recipient（通常是 creator）；再未行动则向其上级升级
-                escalate_to = None
-                sup = by_id.get(str(recipient))
-                if sup:
-                    escalate_to = sup.get("parent_id") or recipient
-                if not escalate_to or escalate_to == assignee:
-                    asg = by_id.get(str(assignee))
-                    escalate_to = asg.get("parent_id") if asg else None
-                if escalate_to and escalate_to != assignee:
-                    try:
-                        await inbox.send_message(
-                            from_agent_id="system",
-                            to_agent_id=escalate_to,
-                            message=(
-                                f"[BLOCKED ESCALATION] Task '{title}' "
-                                f"({tid[:8]}) stuck blocked after {count} "
-                                f"nudges. Please reassign or close."
-                            ),
-                            message_type="task",
-                            priority="urgent",
-                            task_id=tid,
-                            wake=True,
-                        )
-                        await self._watchdog_trigger(escalate_to)
-                    except Exception as e:
-                        log.warning(
-                            "blocked_escalation_failed",
-                            task_id=tid,
-                            error=str(e),
-                        )
+        # No [BLOCKED STALE] / [BLOCKED ESCALATION] inbox. Waiters use
+        # wait contracts; platform unblocks when depends_on / wakeAt fire.
 
     async def _sweep_orphan_streaming(self, project_id: str) -> None:
         """Clear is_streaming=1 rows whose agent is not actively PROCESSING.
@@ -2224,30 +1685,11 @@ class GameTimeService:
                     escalate_to = ceo[0]["id"] if ceo else None
 
                 if escalate_to:
-                    try:
-                        await inbox.send_message(
-                            from_agent_id="system",
-                            to_agent_id=escalate_to,
-                            message=(
-                                f"[DEAD AGENT] Agent '{name}' ({aid[:12]}) "
-                                f"was created >{DEAD_AGENT_THRESHOLD_MS // 60000}min ago "
-                                f"but never activated after {retries} retry attempts. "
-                                f"Consider dismiss_agent + hire_agent or investigate."
-                            ),
-                            message_type="task",
-                            priority="urgent",
-                            wake=True,
-                        )
-                        log.info(
-                            "dead_agent_escalated",
-                            agent_id=aid, name=name,
-                            escalated_to=escalate_to, retries=retries,
-                        )
-                    except Exception as e:
-                        log.warning(
-                            "dead_agent_escalate_failed",
-                            agent_id=aid, error=str(e),
-                        )
+                    log.warning(
+                        "dead_agent_escalated_ui_only",
+                        agent_id=aid, name=name,
+                        escalated_to=escalate_to, retries=retries,
+                    )
                 # Hold escalated agents: don't reset to infinite retry loops
                 wake_cooldowns[aid] = now_ms
                 continue
@@ -2303,7 +1745,7 @@ class GameTimeService:
         动作：① trigger_subordinate 唤醒（STALL_COOLDOWN_MS 冷却，不每次扫都触发）
               ② 经 event_bus 广播 agent_health error 红框（同构 agent.py
                 _broadcast_agent_health 的事件结构，前端组织树节点变红）
-              ③ 失联持续超 SILENCE_NOTIFY_MS 通知上级（30 min 冷却）
+              ③ 失联持续超 SILENCE_NOTIFY_MS：**只打日志 + 红框**，不 inbox 催上级
         恢复：重新产出后广播 agent_health ok 解除红框。
 
         豁免（复用既有判断）：processing 中（P0-3：streaming 僵尸除外——
@@ -2330,11 +1772,13 @@ class GameTimeService:
 
         now_ms = int(time.time() * 1000)
 
-        agents = await _query(project_id,
+        agents_raw = await _query(project_id,
             "SELECT id, name, parent_id, created_at, last_active_at FROM agents "
             "WHERE status = 'active'", [])
-        if not agents:
+        if not agents_raw:
             return
+        # aiosqlite.Row has no .get() — coerce once for the rest of this pass
+        agents = [dict(a) for a in agents_raw]
 
         # 豁免 3: processing 中的 agent（复用 supervisor 既有判断）
         from hiveweave.agents.supervisor import agent_manager
@@ -2361,7 +1805,7 @@ class GameTimeService:
         # 最后活跃：优先 last_active_at，再 assistant/work_logs，再 created_at
         last_output: dict[str, int] = {}
         for a in agents:
-            la = a["last_active_at"]
+            la = a.get("last_active_at")
             if la:
                 last_output[a["id"]] = int(la)
         rows = await _query(project_id,
@@ -2549,7 +1993,7 @@ class GameTimeService:
                     log.error("silence_wake_failed",
                               agent_id=aid, error=str(e))
 
-            # ③ 失联持续超阈值 → 通知上级（指数退避，TEST21 M7）
+            # ③ 失联持续超阈值：红框 + 日志。不 inbox 催上级。
             notify_count = int(tracker.get("notify_count") or 0)
             backoff_idx = min(notify_count, len(SILENCE_NOTIFY_BACKOFF_MS) - 1)
             notify_cooldown = SILENCE_NOTIFY_BACKOFF_MS[backoff_idx]
@@ -2557,32 +2001,15 @@ class GameTimeService:
                     and now_ms - tracker["notify_ts"] >= notify_cooldown):
                 tracker["notify_ts"] = now_ms
                 tracker["notify_count"] = notify_count + 1
-                parent_id = a["parent_id"]
-                if parent_id:
-                    log.warning("silence_escalated",
-                                project_id=project_id, agent_id=aid,
-                                parent_id=parent_id, silent_minutes=minutes,
-                                notify_count=tracker["notify_count"],
-                                cooldown_ms=notify_cooldown)
-                    try:
-                        from hiveweave.services.inbox import InboxService
-                        await InboxService().send_message(
-                            "system", parent_id,
-                            f"[SILENCE WATCHDOG] 你的下属 {a['name']} 已 "
-                            f"{minutes} 分钟无任何产出（chat/work_log），"
-                            "唤醒尝试未恢复，请介入检查。"
-                            f"（第 {tracker['notify_count']} 次上报；"
-                            "若确认为合法 idle，可忽略——平台下次会拉长间隔）",
-                            message_type="system", priority="urgent")
-                        await self._watchdog_trigger(parent_id)
-                    except Exception as e:
-                        log.error("silence_notify_failed",
-                                  agent_id=aid, parent_id=parent_id,
-                                  error=str(e))
-                else:
-                    # 没有上级（CEO）— 仅记录，对齐 stall 看门狗的不可升级路径
-                    log.warning("silence_unescalatable",
-                                agent_id=aid, name=a["name"])
+                log.warning(
+                    "silence_escalated_ui_only",
+                    project_id=project_id,
+                    agent_id=aid,
+                    parent_id=a.get("parent_id"),
+                    silent_minutes=minutes,
+                    notify_count=tracker["notify_count"],
+                    cooldown_ms=notify_cooldown,
+                )
 
             trackers[aid] = tracker
 
@@ -2672,7 +2099,8 @@ async def _auto_submit_stalled_running_task_if_merged(
     """running 滞留任务的分支已合入 main → 自动 submit（里程碑结转治愈）。
 
     只处理稳定命名分支 hw/<sid>/t-<taskid8>；分支不存在 / 未合入 /
-    任务非 running → False，维持原 [TASK STALL] 催办。失败仅记日志。
+    任务非 running → False（平台不再发 [TASK STALL]，仅记 clock tick）。
+    失败仅记日志。
     """
     tid = str(task.get("id") or "")
     assignee = task.get("assignee_id")

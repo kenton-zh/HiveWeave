@@ -333,52 +333,22 @@ def test_resume_cooldown_ignores_circuit_open():
     assert agent._in_resume_cooldown() is True
 
 
-# ── P0-3: VERIFY force main cwd + refuse worktree stamp ─────────────────────
+# ── P0-3: VERIFY evidence belt; cwd is the agent's chosen tool ──────────────
 
 
 @pytest.mark.asyncio
-async def test_verify_test_workspace_forced_to_main():
-    from hiveweave.tools.bash import _resolve_verify_test_workspace
+async def test_verify_test_workspace_no_longer_rewrites_cwd():
+    """bash never infers MAIN from VERIFY: — agent must pick bash_main."""
+    from hiveweave.tools.bash import resolve_project_main_cwd
 
-    verify_task = {
-        "id": "v-1",
-        "title": "[VERIFY] parent",
-        "status": "running",
-        "assignee_id": "qa-1",
-    }
-    with (
-        patch(
-            "hiveweave.tools.bash._resolve_test_attestation_task_id",
-            AsyncMock(return_value=("v-1", "")),
-        ),
-        patch(
-            "hiveweave.services.task.TaskService.get_task",
-            AsyncMock(return_value=verify_task),
-        ),
-        patch(
-            "hiveweave.services.task.TaskService._is_verify_task",
-            return_value=True,
-        ),
-        patch(
-            "hiveweave.services.worktree_review.project_main_workspace",
-            AsyncMock(return_value="D:/proj/main"),
-        ),
-        patch(
-            "hiveweave.services.attestation.is_test_command",
-            return_value=True,
-        ),
+    with patch(
+        "hiveweave.services.worktree_review.project_main_workspace",
+        AsyncMock(return_value="D:/proj/main"),
     ):
-        exec_ws, note, tid = await _resolve_verify_test_workspace(
-            "p1",
-            "qa-1",
-            "v-1",
-            "npm test",
-            "D:/proj/.hiveweave/worktrees/A009",
-        )
+        cwd, err = await resolve_project_main_cwd("p1")
 
-    assert tid == "v-1"
-    assert exec_ws.replace("\\", "/") == "D:/proj/main"
-    assert "forced cwd=main" in note
+    assert err == ""
+    assert cwd.replace("\\", "/") == "D:/proj/main"
 
 
 @pytest.mark.asyncio
@@ -428,6 +398,7 @@ async def test_verify_attestation_rejects_worktree_exec():
         )
 
     assert "VERIFY ATTEST REJECTED" in note
+    assert "bash_main" in note
     create.assert_not_awaited()
 
 
@@ -617,50 +588,54 @@ async def test_multi_verify_command_text_ignores_unknown():
 
 
 @pytest.mark.asyncio
-async def test_force_main_via_real_bind_created_verify():
-    """End-to-end: created VERIFY + no taskId → force main (no bind mock)."""
-    from hiveweave.tools.bash import _resolve_verify_test_workspace
+async def test_bash_main_uses_project_root_not_worktree():
+    """Explicit bash_main cwd is project root; bind still works."""
+    from hiveweave.tools.bash import BashParams, bash_main_tool, bash_tool
 
-    verify = {
-        "id": "v-created",
-        "title": "VERIFY: parent",
-        "status": "created",
-        "assignee_id": "qa-1",
-        "tags": ["verify"],
-    }
+    seen: list[str] = []
+
+    async def fake_exec(**kwargs):
+        seen.append(kwargs.get("workspace_path") or "")
+        return {
+            "success": True,
+            "output": "ok",
+            "error": None,
+            "exit_code": 0,
+        }
+
     with (
-        patch(
-            "hiveweave.services.attestation.is_test_command",
-            return_value=True,
-        ),
-        patch(
-            "hiveweave.services.task.TaskService.list_tasks",
-            AsyncMock(side_effect=[[], [verify]]),
-        ),
-        patch(
-            "hiveweave.services.task.TaskService.get_task",
-            AsyncMock(return_value=verify),
-        ),
-        patch(
-            "hiveweave.services.task.TaskService._is_verify_task",
-            side_effect=lambda t: "verify" in (t.get("tags") or []),
-        ),
+        patch("hiveweave.tools.helpers.get_project_id", AsyncMock(return_value="p1")),
         patch(
             "hiveweave.services.worktree_review.project_main_workspace",
             AsyncMock(return_value="D:/proj/main"),
         ),
+        patch("hiveweave.tools.bash.execute_bash", fake_exec),
+        patch(
+            "hiveweave.services.process_registry.prepare_spawn_command",
+            lambda cmd, project_id=None: (cmd, {}, None),
+        ),
+        patch(
+            "hiveweave.tools.bash._issue_test_run_attestation",
+            AsyncMock(return_value=""),
+        ),
     ):
-        exec_ws, note, tid = await _resolve_verify_test_workspace(
-            "p1",
+        wt = "D:/proj/.hiveweave/worktrees/A013"
+        leaf = await bash_tool(
+            BashParams(command="npm test", task_id="v-created"),
             "qa-1",
-            None,  # no explicit taskId
-            "npm test",
-            "D:/proj/.hiveweave/worktrees/A013",
+            wt,
+        )
+        main = await bash_main_tool(
+            BashParams(command="npm test", task_id="v-created"),
+            "qa-1",
+            wt,
         )
 
-    assert tid == "v-created"
-    assert exec_ws.replace("\\", "/") == "D:/proj/main"
-    assert "forced cwd=main" in note
+    assert leaf.success is True
+    assert main.success is True
+    assert seen[0].replace("\\", "/") == wt.replace("\\", "/")
+    assert seen[1].replace("\\", "/") == "D:/proj/main"
+    assert "cwd=project root" in (main.output or "")
 
 
 @pytest.mark.asyncio

@@ -50,7 +50,8 @@ start-frontend.bat        # React/Vite, 端口 5173
 uv run mypy src/hiveweave/ --ignore-missing-imports
 
 # 回归测试（提交前必须跑）
-cd apps/hiveweave-py && uv run pytest tests/ -v
+cd apps/hiveweave-py && uv run pytest tests/ -q -n auto   # 全量并行（~1min，pytest-xdist）
+uv run pytest tests/test_xxx.py -q                        # 单文件调试（串行即可）
 ```
 
 ### Node version
@@ -127,7 +128,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 - 思考模式 (thinking/reasoning): 由 `llm_models` 表的 `supports_thinking` 和 `default_reasoning_effort` 控制,所有 LLM 调用统一生效（不区分用户对话 vs agent 间对话）
 - `CONTINUE_SENTINEL`：请求末尾非 user 时追加到 **HTTP 副本**的静态 user 文案（修 gateway tool_call id 400；并写明「回合未收口故再次唤醒 / 非人类新指令」）。不写回持久化历史
 - **Doom-loop 防护**：同一工具连续重复调用触发熔断。只读轮询工具豁免 —— `DOOM_LOOP_READONLY_TOOLS`（17 个：get_tasks/read_file/list_subordinates 等）走 `DOOM_LOOP_READONLY_FUSE=15` 保险丝而非默认 3 次；唯一入口 `doom_loop_limit(tool_name)`，容忍度表 `DOOM_LOOP_TOOL_LIMITS`
-- 全局 LLM 并发上限 `_LLM_MAX_CONCURRENT`（env `HIVEWEAVE_LLM_MAX_CONCURRENT`，默认 8）；`TOTAL_TIMEOUT_S=540`（env `HIVEWEAVE_STREAM_TOTAL_TIMEOUT_S`；给 agent safety_timeout 600s 留 60s 余量）
+- 全局 LLM 并发上限 `_LLM_MAX_CONCURRENT`（env `HIVEWEAVE_LLM_MAX_CONCURRENT`，默认 8）；**turn 预算写死启用**（2026-08-19 DSH_11 复盘，历史开关 `HIVEWEAVE_STREAM_SESSION_WALL_CLOCK` 已删除）：`TOTAL_TIMEOUT_S=540` 软截止 / `HARD_TOTAL_TIMEOUT_S=570` 硬截止（给 agent safety_timeout 600s 留余量），撞闸优雅收口保留产出 + agent 层自动 retrigger 续跑——长 turn 每 ~9-10 分钟强制过一次 turn 边界（inbox 处理 + checkpoint），防 busy 期管理消息被屏蔽。数值 env 可调
 - **连续流式总超时**：同 agent `_stream_timeout_streak ≥ 2` → `_park_after_stream_timeouts`（disposition waiting + wait `stream_total_timeout_recovery` + 升级上级，不自动 approve）
 - **模型分级 + 同级故障切换**（`services/model.py` + `services/policy.py`）：两级 tier — `management`（CEO/Coordinator，好模型）/ `executor`（Executor/QA/HR，便宜模型）。每级两槽位：primary + backup，`global_settings` 四键配置（`model_tier_{management|executor}_{primary|backup}`，值存 model_id 或 UUID）。`resolve_model(tier, skip_model_ids)` 严格按 primary→backup→tier列→legacy pool 解析，**禁跨级**。`model_tier_for_agent(agent)` 由 `infer_role_family` 映射。首次 429/5xx 同 turn 自动切同级 backup（`_resolve_failover_backup`，同 api_key 跳过）；streamer circuit fallback 校验 tier 一致性。`pick_from_pool` 全池 RR 已降级为无 tier 配置时的兼容回退。`ensure_channel_models` 仍按名 upsert Ark Plan/Coding 双渠道；`is_rate_limit_error` 命中的 429 不计入放弃、独立冷却 `RATE_LIMIT_RESUME_COOLDOWN_S=120` 后 resume（`agents/agent.py`）
 
@@ -171,7 +172,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 | 其他 | `question`, `todowrite`, `review`, `list_agent_templates` |
 
 权限矩阵（`services/policy.py`，按 role family 授予 Capability，硬门在 `hard_check`）:
-- **CEO** (`role=ceo`，`infer_role_family` 优先于 permission_type): 行政五权 `DISPATCH`/`REVIEW`/`MERGE`（升级兜底）/`SOURCE_READ`/`MANAGE_ORG` + **`DOC_WRITE`**（任意文档；`classify_write_kind` 硬拒源码/配置）；**无 SOURCE_WRITE/bash/test/staffing**。终验对用户走 `message_user`（在 `CEO_TOOLS` 表内）。派工硬门：create/dispatch 的 assignee 只能是**直属中层**（`validate_ceo_dispatch_target`）
+- **CEO** (`role=ceo`，`infer_role_family` 优先于 permission_type): 行政五权 `DISPATCH`/`REVIEW`/`MERGE`（升级兜底）/`SOURCE_READ`/`MANAGE_ORG` + **`DOC_WRITE`**（任意文档；`classify_write_kind` 硬拒源码/配置）+ **`BROWSE`**（看产品）。可对**单条**任务 `waive_attestation` 关闸（可不附 evidence；因此可以不招测试）；禁止一次关掉所有任务。browse 本身不关闸。**无 SOURCE_WRITE/bash/test/staffing**。终验对用户走 `message_user`（在 `CEO_TOOLS` 表内）。派工硬门：create/dispatch 的 assignee 只能是**直属中层**（`validate_ceo_dispatch_target`）
 - **Coordinator / 中层 (player-coach)**: 协调权 + `SOURCE_WRITE`/`BASH_SHELL`/`TEST_RUN`/`BROWSE`——可自己搭骨架/写关键路径，有独立 worktree（同 executor 契约）；受限写白名单（`COORDINATOR_WRITE_PREFIXES`）仍适用于项目根
 - **Executor**: 可读写代码,运行测试,不能 spawn 下级
 - **QA** (`test_engineer`/`qa_engineer`): 含 SOURCE_WRITE（缺它 write_file 会被硬门死 —— Echo 事故）
@@ -257,6 +258,7 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 
 - **reply_required 硬门**：本 turn 处理的 inbox 消息带 `reply_required`（`expect_report` / `message_type=ask`）时，agent 必须在本 turn 内对该 sender 成功调用 send_message 类工具（送达证据 `get_sent_recipients_since`）才能退出；纯文字输出不算回复 → `UNREPLIED_ASKS` **永不 soft-pass**（`commit_turn` 预检直接 REJECT，不 `end_turn`；兜底 `evaluate_turn_exit` 也不被 soft-pass 压制）。豁免 user/system/已归档/不存在的 sender（`agent.py:_handle_completion` / `turn_exit.collect_unreplied_asks`）。预检与兜底统一走 reply_contract（已读≠已回）。`WAIT_WITHOUT_ASK` 预检解析花名/short_id/UUID（不得传空 `name_by_id`）
 - **doom loop 正反馈缓解**：同 turn 内同参数 `commit_turn` 已接受时返回差异化提示（"已提交，勿再同参调用"），打破「相同结果→相同决策」循环；熔断阈值 commit_turn=8
+- **公开 id / 账本**：从 get_tasks、工具回执、gate 错误里整段复制 id，不要截断。`get_platform_state` 的 `ledger.mine` 是自己可行动待办（空 ≠ 组织完成）；CEO/中层 waive 或结案前读 `ledger.scope`（含 blocked）。`depends_on` / `dependsOnTaskIds` 不得含本任务自己；等人走 `commit_turn(waiting_on kind=agent)`，不要把人写进 dependsOn。
 
 ### Git worktree 隔离（executor + builder coordinator）
 
@@ -374,8 +376,8 @@ CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 
 **Stall 检测三层机制**（区分清楚，不要混淆）：
 
 1. **Inbox stall / awaiting-reply 催办 — 已禁用**（`_check_stalled` / `_nudge_awaiting_replies` no-op）。回复义务由 turn exit 的 `expect_report` / `ask` + 收件人 ID 检查强制执行，不做周期性催办。
-2. **Task stall 催办 — 活跃**（`_nudge_stale_ledger` 内的 `TASK_STALL_THRESHOLDS` 段）。按任务状态停留时间催办：running>20min / submitted>10min / reviewing>10min / rework>10min / created>5min / claimed>5min。超过 `STALL_ESCALATION_THRESHOLD`(3) 次后升级到上级。与 P0-3 stall break 互斥：近 5 分钟内被 STALL BREAK 的 agent 不再收到 task stall nudge。
-3. **沉默观测看门狗 — 活跃**（`_check_silent_agents`）：agent **10 分钟无任何产出**（chat_messages assistant 行 / work_logs）→ 唤醒 + 红框；持续 30 分钟 → 通知上级。覆盖"接活后当场死亡、名下无待回复消息"的盲区。PROCESSING 豁免**不覆盖 streaming 僵尸**（P0-3：流式超阈值无事件者纳入沉默检测）。
+2. **Task dwell 时钟 — 平台自愈，不 inbox 催人**（`_nudge_stale_ledger`）：阈值仍按状态停留时间计（running>20min / claimed>5min 等），但**只**做 auto-submit（running 已合入）、VERIFY executor 改派、MERGE PROXY；**不**发 `[TASK STALL]` / 周期性 `[LEDGER REVIEW]` / `[ORPHAN TASK]` / 重复 `[MERGE PENDING]`。到期叫醒只走 wait 合同的 `[WAIT_TIMEOUT]`（只醒等待方）。
+3. **沉默观测看门狗 — 自醒 + 红框，不催上级**（`_check_silent_agents`）：agent **10 分钟无任何产出** → 唤醒本人 + 红框；持续 30 分钟 → **只打日志**，不 inbox 上级。PROCESSING 豁免**不覆盖 streaming 僵尸**（P0-3）。
 
 **P0-3 跨轮 STALL BREAK 账本**（`agents/agent.py`）：streamer 的 `tool_loop_stall` 检测（同轮内连续无进展工具调用）触发 `[STALL BREAK]` 结束当前 turn。跨轮账本 `_stall_break_ledger` 记录每次 stall break 时间戳；30 分钟内第 2 次 → agent disposition=blocked + `[AGENT STUCK]` 升级上级。防止"有产出但无进展"的 agent 无限空转。
 

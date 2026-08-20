@@ -320,6 +320,11 @@ async def analyze_image(
     import httpx
 
     from hiveweave.llm.provider import provider_factory
+    from hiveweave.llm.retry import (
+        RetryHandler,
+        RetryableError,
+        is_retryable_status,
+    )
 
     # Vision one-shot wants visible content, not a thinking-only body.
     cfg = dict(model_config)
@@ -345,19 +350,39 @@ async def analyze_image(
     headers = provider.build_headers()
     headers["Accept"] = "application/json"
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=10.0, pool=10.0),
-    ) as client:
-        resp = await client.post(
-            provider.build_url(),
-            json=body,
-            headers=headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    async def _once() -> str:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=10.0, read=timeout_s, write=10.0, pool=10.0
+            ),
+        ) as client:
+            resp = await client.post(
+                provider.build_url(),
+                json=body,
+                headers=headers,
+            )
+            # 与流式路径同口径：429/5xx 瞬态错误交给 RetryHandler 指数退避重试
+            # （含 Retry-After）。之前 raise_for_status 直接抛，视觉门禁一遇到
+            # 限流就废掉 → 团队只能 waive visual/module_visual。
+            if is_retryable_status(resp.status_code):
+                raise RetryableError(
+                    f"vision HTTP {resp.status_code}: {resp.text[:500]}",
+                    status=resp.status_code,
+                    headers=dict(resp.headers),
+                )
+            resp.raise_for_status()
+            data = resp.json()
+        text = extract_nonstream_text(data).strip()
+        if not text:
+            raise RuntimeError("Vision model returned empty content")
+        return text
 
-    text = extract_nonstream_text(data).strip()
-    if not text:
-        raise RuntimeError("Vision model returned empty content")
-    return text
+    return await RetryHandler(
+        on_retry=lambda attempt, delay_ms, exc: log.info(
+            "vision_http_retry",
+            attempt=attempt,
+            delay_ms=delay_ms,
+            error=str(exc)[:200],
+        )
+    ).with_retry(_once)
 

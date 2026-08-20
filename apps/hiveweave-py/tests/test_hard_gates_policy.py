@@ -10,6 +10,7 @@ from hiveweave.services.policy import (
     Capability,
     capabilities_for,
     classify_write_kind,
+    has_visual_test_duty,
     infer_role_family,
     policy_service,
     tool_hard_deny,
@@ -54,17 +55,27 @@ def test_hr_caps_no_dispatch_or_bash():
     assert tool_hard_deny(hr, "dispatch_task")
     assert tool_hard_deny(hr, "bash")
     assert tool_hard_deny(hr, "browse")
+    assert tool_hard_deny(hr, "browse_main")
     assert tool_hard_deny(hr, "hire_agent") is None
 
 
-def test_ceo_no_bash_browse_hire_or_source_write():
-    """CEO 行政 family：派审合/org + DOC_WRITE；写码/bash/test/staffing 全拒。"""
+def test_ceo_has_browse_not_test_duty():
+    """CEO 可 browse 看产品；无 bash / TEST_RUN / 写码。自己的出证不算审批。"""
     ceo = _agent(role="ceo", permission_type="coordinator", name="归零")
     assert infer_role_family(ceo) == "ceo"
-    assert Capability.DOC_WRITE in capabilities_for(ceo)
-    assert Capability.SOURCE_WRITE not in capabilities_for(ceo)
+    caps = capabilities_for(ceo)
+    assert Capability.DOC_WRITE in caps
+    assert Capability.BROWSE in caps
+    assert Capability.SOURCE_WRITE not in caps
+    assert Capability.BASH_SHELL not in caps
+    assert Capability.TEST_RUN not in caps
+    assert Capability.BROWSER_ACCEPTANCE not in caps
     assert tool_hard_deny(ceo, "bash")
-    assert tool_hard_deny(ceo, "browse")
+    assert tool_hard_deny(ceo, "browse") is None
+    assert tool_hard_deny(ceo, "browse_main") is None
+    assert tool_hard_deny(ceo, "assert_visual")
+    assert tool_hard_deny(ceo, "game_run_case")
+    assert tool_hard_deny(ceo, "game_run_case_main")
     assert tool_hard_deny(ceo, "run_tests")
     assert tool_hard_deny(ceo, "hire_agent")
     assert tool_hard_deny(ceo, "apply_patch")
@@ -125,7 +136,7 @@ async def test_allowed_tools_cannot_elevate_async(monkeypatch):
     agent = _agent(
         role="ceo",
         permission_type="coordinator",
-        allowed_tools='["bash", "edit_file"]',
+        allowed_tools='["bash", "edit_file", "assert_visual", "game_run_case"]',
     )
 
     async def fake_get(_aid):
@@ -135,6 +146,8 @@ async def test_allowed_tools_cannot_elevate_async(monkeypatch):
         "hiveweave.services.permission.meta_db.get_agent_by_id", fake_get
     )
     assert await svc.evaluate("a1", "bash", {}) == "deny"
+    assert await svc.evaluate("a1", "assert_visual", {}) == "deny"
+    assert await svc.evaluate("a1", "game_run_case", {}) == "deny"
     assert await svc.evaluate("a1", "dispatch_task", {}) == "allow"
 
 
@@ -257,3 +270,84 @@ def test_bootstrap_allows_reserved_ceo_hr():
         bootstrap=True,
     )
     assert err is None
+
+
+def test_ceo_has_browse_without_visual_test_duty():
+    ceo = _agent(role="ceo", permission_type="coordinator", name="归零")
+    qa = _agent(role="测试工程师", permission_type="executor")
+    assert has_visual_test_duty(ceo) is False
+    assert has_visual_test_duty(qa) is True
+
+
+def test_look_only_screenshot_followup_does_not_nudge_assert():
+    from hiveweave.tools.browse_tools import screenshot_followup_text
+
+    look = screenshot_followup_text("/tmp/x.png", look_only=True)
+    assert "Then call" not in look
+    assert "assert_visual(" not in look
+    assert "look_at_image" not in look
+    stamp = screenshot_followup_text("/tmp/x.png", look_only=False)
+    assert "assert_visual(" not in stamp
+    assert "pixels attached" in stamp.lower() or "像素" in stamp
+
+
+@pytest.mark.asyncio
+async def test_ceo_own_browse_e2e_does_not_unlock_approve(tmp_path):
+    """reviewer_must_hold=False skips CEO's own browse_e2e; consume QA works."""
+    from unittest.mock import AsyncMock, patch
+
+    from hiveweave.services.attestation import (
+        BROWSE_E2E_KIND,
+        attestation_service,
+        find_reviewer_attestation,
+    )
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    project_id = "p-ceo-browse"
+    kinds = frozenset({BROWSE_E2E_KIND, "visual_check", "test_run"})
+    with patch(
+        "hiveweave.db.meta.get_project_workspace",
+        AsyncMock(return_value=str(ws)),
+    ):
+        await attestation_service.ensure_schema(project_id)
+        own_id = await attestation_service.create(
+            project_id,
+            agent_id="ceo1",
+            kind=BROWSE_E2E_KIND,
+            command_or_url="browse goto",
+            exit_code=0,
+            workspace=str(ws),
+            stdout="ok",
+            task_id="task-ui",
+        )
+        assert own_id
+        own = await find_reviewer_attestation(
+            project_id,
+            "task-ui",
+            "ceo1",
+            kinds,
+            consume_agent_ids=None,
+            reviewer_must_hold=False,
+        )
+        assert own is False
+        qa_id = await attestation_service.create(
+            project_id,
+            agent_id="qa1",
+            kind=BROWSE_E2E_KIND,
+            command_or_url="browse_main goto",
+            exit_code=0,
+            workspace=str(ws),
+            stdout="ok",
+            task_id="task-ui",
+        )
+        assert qa_id
+        consumed = await find_reviewer_attestation(
+            project_id,
+            "task-ui",
+            "ceo1",
+            kinds,
+            consume_agent_ids=["qa1"],
+            reviewer_must_hold=False,
+        )
+        assert consumed is True

@@ -108,13 +108,15 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 
 ## Agent types & org
 
-- **CEO** (root): 行政五权 `DISPATCH`/`REVIEW`/`MERGE`/`SOURCE_READ`/`MANAGE_ORG` + `DOC_WRITE`；**无 SOURCE_WRITE/bash/test/staffing**（硬门）。定组织、审中层里程碑、终验对用户（`message_user`），不写业务代码、不日常直派叶子。
+- **CEO** (root): 行政五权 `DISPATCH`/`REVIEW`/`MERGE`/`SOURCE_READ`/`MANAGE_ORG` + `DOC_WRITE` + `BROWSE`（看产品）；可对**单条**任务 `waive_attestation` 关闸（因此可以不招测试）；禁止一次关掉所有任务。**无 SOURCE_WRITE/bash/test/staffing**（硬门）。定组织、审中层里程碑、终验对用户（`message_user`），不写业务代码、不日常直派叶子。
 - **Coordinator / 中层 (player-coach)**: 协调权 + `SOURCE_WRITE`/`BASH_SHELL`/`TEST_RUN`/`BROWSE` —— 自己搭骨架/写关键路径（有独立 worktree，同 executor 契约）；hire/dismiss/transfer。受限写白名单（`COORDINATOR_WRITE_PREFIXES`）适用于项目根。
 - **Executor** (叶子): 可读写代码、运行测试、写工作日志。不能 spawn 下级。
 - **QA** (`test_engineer`/`qa_engineer`): 含 SOURCE_WRITE（缺它 write_file 被硬门死 —— Echo 事故）。
 - **HR**: 同受限写白名单，无源码写。
 
 未知 family 兜底 READONLY。CEO/HR 强制项目根（无 worktree）；executor + builder coordinator 由 `agent_gets_write_worktree()` 判定有 worktree。CEO（root）+ HR（CEO 下级）项目创建时自动创建，HR 招 expert agents。
+
+**IDs / ledger:** copy public ids whole from tool receipts (do not truncate). `get_platform_state` `ledger.mine` is your to-dos (empty ≠ org done); CEO/mid read `ledger.scope` before waive/complete. `depends_on` must not include self — waiting on a person is `commit_turn(waiting_on kind=agent)`.
 
 **团队开会（规格已定，未实现）：** [`docs/spec/team-meeting.md`](docs/spec/team-meeting.md)。不要用 inbox 群发或 `chat()`+skip `append_turn` 冒充开会。
 
@@ -124,8 +126,8 @@ apps/web/            @hiveweave/web  React 19 + Vite + React Flow (port 5173)
 
 **Stall 检测三层机制**（不要混淆）：
 1. **Inbox stall / awaiting-reply 催办 — 已禁用**（`_check_stalled` / `_nudge_awaiting_replies` no-op）。回复义务由 turn exit 的 `expect_report` / `ask` + 收件人 ID 检查强制执行。
-2. **Task stall 催办 — 活跃**（`_nudge_stale_ledger` 内 `TASK_STALL_THRESHOLDS` 段）：running>20min / submitted>10min / reviewing>10min / rework>10min / created>5min / claimed>5min。超 `STALL_ESCALATION_THRESHOLD`(3) 次升级上级。
-3. **沉默观测看门狗 — 活跃**（`_check_silent_agents`）：`SILENCE_THRESHOLD_MS = 10min` 无产出 → 唤醒 + agent_health 红框；`SILENCE_NOTIFY_MS = 30min` 持续失联 → 通知上级。
+2. **Task dwell 时钟 — 平台自愈，不 inbox 催人**（`_nudge_stale_ledger`）：记 dwell / auto-submit / VERIFY 改派 / MERGE PROXY；**不**发 `[TASK STALL]` 等进度催。到期只 `[WAIT_TIMEOUT]` 醒等待方。
+3. **沉默观测看门狗 — 自醒 + 红框**（`_check_silent_agents`）：`SILENCE_THRESHOLD_MS = 10min` 无产出 → 唤醒本人 + agent_health 红框；`SILENCE_NOTIFY_MS = 30min` 持续失联 → **只打日志**，不 inbox 上级。
 
 ## Environment variables
 
@@ -158,7 +160,7 @@ Run services (do NOT use the `.bat` files):
 
 Gotchas:
 - Backend boots fine with no LLM key (logs `seed_default_model_no_api_key` warning, but startup completes). Agents can't actually think/act until a model+key is configured — either set `STEP_API_KEY` (plain env, NOT `HIVEWEAVE_`-prefixed; read by `seed_default_model`) before boot, or add a model in-app via Settings. Not needed just to create projects / load the UI.
-- Tests: `uv run pytest tests/` — all pass in <1s, but the process hangs at teardown (lingering game-time loop / async task), so wrap it: `timeout 120 uv run pytest tests/ -q`.
+- Tests: `uv run pytest tests/ -q -n auto` (parallel, ~1min, pytest-xdist in dev group). Teardown-hang hardening is in `tests/conftest.py` (per-test: close DB connections + cancel leftover asyncio tasks; sessionfinish prints leftover non-daemon threads; `faulthandler_timeout=120` auto-dumps stacks if a single test gets stuck). If a run still hangs at exit, the last stderr lines name the culprit thread; a stuck worker dumps stacks after 120s (dump only — kill the process manually). Legacy serial run: `timeout 300 uv run pytest tests/ -q`.
 - Typecheck: `mypy` is NOT a declared dependency. Run it with `uv run --with mypy mypy src/hiveweave/ --ignore-missing-imports` (from `apps/hiveweave-py`). There are ~56 pre-existing type errors — not a regression.
 - No ESLint/ruff config exists; frontend "build" typecheck is `pnpm --filter @hiveweave/web build` (`tsc -b && vite build`).
 - UI project creation uses a folder-picker modal: navigate to the parent dir (type the parent path, Enter) then click the target folder in the list. Typing the full target path directly resets the picker.

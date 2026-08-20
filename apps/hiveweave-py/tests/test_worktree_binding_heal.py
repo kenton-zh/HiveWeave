@@ -121,7 +121,7 @@ async def test_empty_db_heals_binding_from_disk(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_verify_only_uses_main_without_wiping_binding(tmp_path: Path):
+async def test_verify_only_keeps_worktree_without_wiping_binding(tmp_path: Path):
     project = tmp_path.resolve()
     wt = _make_tree(project, "A011")
     agent = _make_agent()
@@ -138,16 +138,17 @@ async def test_verify_only_uses_main_without_wiping_binding(tmp_path: Path):
             AsyncMock(return_value=False),
         ),
         patch(
-            "hiveweave.services.git_worktree._assignee_is_verify_only",
-            AsyncMock(return_value=True),
-        ),
+            "hiveweave.services.git_worktree.ensure_executor_worktree",
+            AsyncMock(),
+        ) as ensure,
     ):
         org = Org.return_value
         org.get_agent = AsyncMock(return_value=row)
         org.update_agent = AsyncMock()
         result = await agent._get_workspace_path()
 
-    assert result == str(project)
+    assert Path(result).resolve() == wt.resolve()
+    ensure.assert_not_awaited()
     _no_wipe(org.update_agent)
 
 

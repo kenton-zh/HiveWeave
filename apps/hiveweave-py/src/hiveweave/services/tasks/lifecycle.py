@@ -14,6 +14,21 @@ from .verify import VerifyMixin
 log = structlog.get_logger(__name__)
 
 
+SELF_DEPENDENCY_BLOCK_ERROR = (
+    "A task cannot depend on itself — dependsOn / dependsOnTaskIds may "
+    "only be other task ids (self-dependency never unblocks). Waiting on "
+    "a person is commit_turn(waiting_on=[{kind:agent, ref:...}]); keep "
+    "the task running."
+)
+
+
+def _same_task_id(left: str, right: str) -> bool:
+    """True if two task ids name the same row (dash/case insensitive)."""
+    a = (left or "").replace("-", "").strip().casefold()
+    b = (right or "").replace("-", "").strip().casefold()
+    return bool(a) and a == b
+
+
 def blocked_task_has_wake_path(task: dict, now_ms: int | None = None) -> bool:
     """A blocked task has a live auto-unblock path iff its wait metadata says so.
 
@@ -50,8 +65,11 @@ class LifecycleMixin:
         emit_task_event: Any
         get_task: Any
         find_task_by_slice_id: Any
+        unmet_depends_on: Any
+        _depends_on_list: Any
         _transition: Any
         _persist_contract_json: Any
+        _is_verify_task: Any
         _COLUMNS: Any
         _row: Any
 
@@ -87,6 +105,16 @@ class LifecycleMixin:
 
         # READY GATE (slice-driven)
         task = await self.get_task(project_id, task_id)
+        if task and not self._is_verify_task(task):
+            unmet = await self.unmet_depends_on(
+                project_id, self._depends_on_list(task.get("depends_on"))
+            )
+            if unmet:
+                raise ValueError(
+                    "Cannot start while depends_on are unmet: "
+                    + ", ".join(u[:8] for u in unmet[:5])
+                    + ". Wait for blockers to be approved/closed."
+                )
         if task and task.get("contract_json"):
             from hiveweave.services.task_contract import (
                 check_ready_gate,
@@ -165,6 +193,8 @@ class LifecycleMixin:
         意图) — new callers must pass it explicitly. A block with no deps and
         no timer has no auto-unblock path and parks the task forever; callers
         that need that (QA dead zone) must use the dedicated system paths.
+        ``depends_on`` that includes this task's own id is rejected before
+        the transition (self-dep never unblocks).
         """
         task_id = await self.require_task_id(project_id, task_id)
         dep_ids: list[str] = []
@@ -172,6 +202,8 @@ class LifecycleMixin:
             dep_ids.append(await self.require_task_id(project_id, d))
         if depends_on_task_id:
             dep_ids.append(await self.require_task_id(project_id, depends_on_task_id))
+        if any(_same_task_id(d, task_id) for d in dep_ids):
+            raise ValueError(SELF_DEPENDENCY_BLOCK_ERROR)
         await self._transition(project_id, task_id, "blocked")
         now_ms = int(time.time() * 1000)
         reason = (reason or "Blocked by agent").strip()
@@ -243,6 +275,17 @@ class LifecycleMixin:
         """
         task_id = await self.require_task_id(project_id, task_id)
         row = await self.get_task(project_id, task_id)
+        if row and not VerifyMixin._is_verify_task(row):
+            unmet = await self.unmet_depends_on(
+                project_id, self._depends_on_list(row.get("depends_on"))
+            )
+            if unmet:
+                raise ValueError(
+                    "Cannot unblock while depends_on are unmet: "
+                    + ", ".join(u[:8] for u in unmet[:5])
+                    + ". Wait for blockers to be approved/closed "
+                    "(reconcile will wake you)."
+                )
         if row and VerifyMixin._is_verify_task(row):
             from hiveweave.tools.tasks.verify_spawn import (
                 _in_flight_verify_task,
@@ -268,11 +311,17 @@ class LifecycleMixin:
         await self._transition(project_id, task_id, "running")
         now_ms = int(time.time() * 1000)
         try:
+            # 账本一致性（2026-08-19 DSH_11 复盘）：auto_block_deps 创建即
+            # blocked 的任务从未 claim —— 解封直落 running 会留下
+            # progress=0 / claimed_at=NULL 的 running 任务。补 running 地板
+            # （MAX 不降）+ 回填 claimed_at（assign=claim 语义）。
             await _execute(
                 project_id,
-                "UPDATE tasks SET blocked_reason = NULL, wait_kind = NULL, "
+                "UPDATE tasks SET progress = MAX(progress, 20), "
+                "claimed_at = COALESCE(claimed_at, ?), "
+                "blocked_reason = NULL, wait_kind = NULL, "
                 "wake_at = NULL, updated_at = ? WHERE id = ?",
-                [now_ms, task_id],
+                [now_ms, now_ms, task_id],
             )
         except Exception:
             await _execute(

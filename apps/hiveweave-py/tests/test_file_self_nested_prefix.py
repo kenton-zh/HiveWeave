@@ -133,6 +133,9 @@ def test_resolve_for_read_sibling_unaffected(
 
 
 # ── read/list double-prefix also rejected with clear error ───────────
+# 注意：单前缀 `.hiveweave/worktrees/<sid>/…` 现在是合法的 canonical
+# 复读路径（从项目根解析，中层 review 用，见 test_path_sandbox_read_write.py
+# 的 canonical 用例）；ghost 拒绝只针对真正的双重前缀嵌套。
 
 
 @pytest.mark.asyncio
@@ -141,7 +144,7 @@ async def test_read_double_prefix_rejected(
 ) -> None:
     wt = worktree_layout["wt_a"]
     result = await read_file(
-        file_path=".hiveweave/worktrees/A044/notes.md",
+        file_path=".hiveweave/worktrees/A044/.hiveweave/worktrees/A044/notes.md",
         offset=0,
         limit=50,
         workspace_path=str(wt),
@@ -157,7 +160,7 @@ async def test_list_files_double_prefix_rejected(
 ) -> None:
     wt = worktree_layout["wt_a"]
     result = await list_files(
-        path=".hiveweave/worktrees/A044",
+        path=".hiveweave/worktrees/A044/.hiveweave/worktrees/A044",
         workspace_path=str(wt),
         project_root=str(worktree_layout["project"]),
     )

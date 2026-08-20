@@ -67,8 +67,9 @@ def _reject_forged_verify_title(title: str | None, *, source: str) -> None:
     raw = (title or "").lstrip()
     if _FORGED_VERIFY_RE.match(raw):
         raise ValueError(
-            "title prefix 'VERIFY:' is reserved for system-spawned verification "
-            "tasks; use a normal title (verify_spawn mints VERIFY: tasks)"
+            "title prefix 'VERIFY:' is reserved for platform milestone QA. "
+            "Coordinators/CEO: create_task/dispatch_task with milestoneVerify=true "
+            "(source=system). Do not type VERIFY: yourself."
         )
 
 
@@ -79,6 +80,8 @@ class CrudMixin:
         _is_verify_task: Any
         emit_task_event: Any
         ensure_assignee_claimed: Any
+        require_task_id: Any
+        _transition: Any
 
     # 列顺序与 tasks 表一致（含 due_at / wait_kind / wake_at / policy_id / reviewer_id）
     _COLUMNS = (
@@ -100,7 +103,8 @@ class CrudMixin:
                           tags: list[str] | None = None,
                           source: str = "agent",
                           evidence: dict | None = None,
-                          contract_json: dict | None = None) -> str:
+                          contract_json: dict | None = None,
+                          policy_id: str | None = None) -> str:
         """Create a task. JSON-serializes list/dict fields. Returns task_id.
 
         Assign = claim: if ``assignee_id`` is set and the task is not VERIFY,
@@ -119,7 +123,15 @@ class CrudMixin:
         _reject_forged_verify_title(title, source=source)
         tags = _strip_platform_reserved_tags(tags, source=source, title=title)
 
-        policy_id = resolve_task_policy(title, tags, description)
+        explicit_policy = (policy_id or "").strip() or None
+        if explicit_policy:
+            from hiveweave.services.attestation import POLICY_REQUIRED_KINDS
+
+            if explicit_policy not in POLICY_REQUIRED_KINDS:
+                raise ValueError(f"unknown policy_id {explicit_policy!r}")
+            policy_id = explicit_policy
+        else:
+            policy_id = resolve_task_policy(title, tags, description)
 
         # Normalize parent_task_id: agents may pass 8-char prefixes; always
         # store the full UUID so downstream queries (siblings, umbrella) match.
@@ -143,6 +155,27 @@ class CrudMixin:
                 _r = await self.resolve_task_id(project_id, dep)
                 _resolved_deps.append(_r or dep)
             depends_on = _resolved_deps
+
+        wait_kind: str | None = None
+        blocked_reason: str | None = None
+        draft_for_verify = {"title": title, "tags": tags or []}
+        auto_block_deps = bool(depends_on) and not self._is_verify_task(
+            draft_for_verify
+        )
+        if auto_block_deps:
+            unmet: list[str] = []
+            _done = frozenset({"approved", "closed"})
+            for dep_id in depends_on or []:
+                dep_row = await self.get_task(project_id, dep_id)
+                st = (dep_row or {}).get("status")
+                if st not in _done:
+                    unmet.append(dep_id)
+            if unmet:
+                wait_kind = "dependency"
+                blocked_reason = (
+                    f"Waiting on {len(unmet)} dependenc"
+                    f"{'y' if len(unmet) == 1 else 'ies'}"
+                )
 
         contract_blob = None
         if contract_json is not None:
@@ -189,8 +222,14 @@ class CrudMixin:
             "title": title,
             "tags": tags or [],
         }
-        assign_is_claim = bool(assignee_id) and not self._is_verify_task(draft)
-        status = "claimed" if assign_is_claim else "created"
+        assign_is_claim = (
+            bool(assignee_id)
+            and not self._is_verify_task(draft)
+            and wait_kind != "dependency"
+        )
+        status = "blocked" if wait_kind == "dependency" else (
+            "claimed" if assign_is_claim else "created"
+        )
         claimed_at = now_ms if assign_is_claim else None
         event_type = "task.claimed" if assign_is_claim else "task.created"
         payload = json.dumps({
@@ -208,16 +247,17 @@ class CrudMixin:
             "creator_id, status, priority, progress, tags, parent_task_id, depends_on, "
             "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
             "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
-            "is_archived, due_at, policy_id, contract_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, NULL, ?, "
-            "0, ?, ?, NULL, NULL, ?, 0, ?, ?, ?)",
+            "is_archived, due_at, wait_kind, policy_id, contract_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "0, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?)",
             [task_id, project_id, title, description, assignee_id, creator_id,
              status, priority, json.dumps(tags) if tags else None, parent_task_id,
              json.dumps(depends_on) if depends_on else None,
              json.dumps(acceptance_criteria) if acceptance_criteria else None,
              json.dumps(evidence) if evidence else None,
              json.dumps(expected_modules) if expected_modules else None,
-             source, now_ms, claimed_at, now_ms, due_at, policy_id, contract_blob]),
+             blocked_reason, source, now_ms, claimed_at, now_ms, due_at,
+             wait_kind, policy_id, contract_blob]),
             (event_sql, event_params),
         ])
         await publish_task_event(project_id, task_id, event_type, status, event_ts)
@@ -234,6 +274,92 @@ class CrudMixin:
                 summary=f"[claimed] task {task_id[:8]} on assign",
             )
         return task_id
+
+    _DEP_DONE = frozenset({"approved", "closed"})
+
+    @staticmethod
+    def _depends_on_list(raw: Any) -> list[str]:
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return []
+        if not isinstance(raw, list):
+            return []
+        return [str(x).strip() for x in raw if str(x).strip()]
+
+    async def unmet_depends_on(
+        self, project_id: str, depends_on: list[str] | None
+    ) -> list[str]:
+        """Return dependency ids that are not approved/closed."""
+        unmet: list[str] = []
+        for dep_id in depends_on or []:
+            dep = str(dep_id or "").strip()
+            if not dep:
+                continue
+            dep_row = await self.get_task(project_id, dep)
+            if (dep_row or {}).get("status") not in self._DEP_DONE:
+                unmet.append(dep)
+        return unmet
+
+    async def apply_depends_on(
+        self, project_id: str, task_id: str, depends_on: list[str]
+    ) -> bool:
+        """Persist depends_on. Auto-block created/claimed if unmet (non-VERIFY).
+
+        Returns True when the row is blocked after this call.
+        """
+        from .lifecycle import SELF_DEPENDENCY_BLOCK_ERROR, _same_task_id
+
+        task_id = await self.require_task_id(project_id, task_id)
+        row = await self.get_task(project_id, task_id)
+        if not row:
+            raise ValueError(f"Task not found: {task_id}")
+        resolved: list[str] = []
+        for dep in depends_on:
+            dep = str(dep or "").strip()
+            if not dep:
+                continue
+            found = await self.resolve_task_id(project_id, dep)
+            resolved.append(found or dep)
+        if any(_same_task_id(d, task_id) for d in resolved):
+            raise ValueError(SELF_DEPENDENCY_BLOCK_ERROR)
+        now_ms = int(time.time() * 1000)
+        await _execute(
+            project_id,
+            "UPDATE tasks SET depends_on = ?, updated_at = ? WHERE id = ?",
+            [json.dumps(resolved) if resolved else None, now_ms, task_id],
+        )
+        if self._is_verify_task(row):
+            return (row.get("status") or "") == "blocked"
+        unmet = await self.unmet_depends_on(project_id, resolved)
+        if not unmet:
+            return (row.get("status") or "") == "blocked"
+        st = (row.get("status") or "").lower()
+        if st in (
+            "running", "submitted", "reviewing", "approved", "verifying", "rework"
+        ):
+            raise ValueError(
+                f"dependsOn cannot park a {st} task; queue the draft before start"
+            )
+        reason = (
+            f"Waiting on {len(unmet)} dependenc"
+            f"{'y' if len(unmet) == 1 else 'ies'}"
+        )
+        if st != "blocked":
+            await self._transition(project_id, task_id, "blocked")
+        try:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET blocked_reason = ?, wait_kind = ?, "
+                "claimed_at = NULL, updated_at = ? WHERE id = ?",
+                [reason, "dependency", now_ms, task_id],
+            )
+        except Exception as e:
+            log.warning("apply_depends_on_wait_meta_failed", task_id=task_id, error=str(e))
+        return True
 
     async def find_task_by_slice_id(
         self, project_id: str, slice_id: str
@@ -511,16 +637,23 @@ class CrudMixin:
         """Generic PATCH update.
 
         Supports: title, description, priority, due_at, assignee_id, tags,
-        expected_modules. JSON-serializes list fields. Updates updated_at.
+        expected_modules, parent_task_id. JSON-serializes list fields.
+        Updates updated_at.
 
         Non-system writers cannot mint ``VERIFY:`` titles or reserved tags
         via PATCH (mirrors create_task hardening).
         """
         allowed = {"title", "description", "priority", "due_at", "assignee_id",
-                   "tags", "expected_modules"}
+                   "tags", "expected_modules", "parent_task_id"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
+        if updates.get("parent_task_id"):
+            resolved_parent = await self.resolve_task_id(
+                project_id, str(updates["parent_task_id"])
+            )
+            if resolved_parent:
+                updates["parent_task_id"] = resolved_parent
         # update_task has no source kw — treat as agent/user path.
         if "title" in updates:
             _reject_forged_verify_title(updates.get("title"), source="agent")

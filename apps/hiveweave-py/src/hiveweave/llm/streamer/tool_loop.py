@@ -1,6 +1,7 @@
 """Tool-loop orchestration mixin."""
 from __future__ import annotations
 
+import json
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,7 @@ from .constants import (
     TOOL_LOOP_READONLY_STALL_LIMIT,
     TOOL_LOOP_STALL_LIMIT,
     TOTAL_TIMEOUT_S,
+    TRUNCATED_TOOL_CALL_ROUNDS_LIMIT,
     TURN_STREAM_CUT_GRACE_S,
 )
 from .doom_loop import (
@@ -35,6 +37,25 @@ from .types import DeltaCallback, ToolCallCallback
 log = structlog.get_logger(__name__)
 
 
+def _is_valid_json_arguments(arguments: Any) -> bool:
+    """tool_call arguments 合法性（截断检测）。
+
+    空串/None = 无参调用，合法；非字符串（已结构化）合法；
+    非空字符串必须可 json.loads —— SSE 提前断流时 arguments 只收到
+    半截 JSON（TEST_DSH_16 实证：round 1 finish=None，round 2 网关
+    400 "`arguments` must be valid JSON"）。
+    """
+    if arguments is None or arguments == "":
+        return True
+    if not isinstance(arguments, str):
+        return True
+    try:
+        json.loads(arguments)
+        return True
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+
 class ToolLoopMixin:
     """Tool loop main cycle for Streamer."""
 
@@ -44,6 +65,7 @@ class ToolLoopMixin:
         _fire_delta: Any
         _error_result: Any
         _trim_context_if_needed: Any
+        _pressure_compact_if_needed: Any
         _maybe_inject_mid_round_reminder: Any
         _stream_with_empty_retry: Any
         _detect_doom_loop: Any
@@ -149,17 +171,13 @@ class ToolLoopMixin:
         # 仍收口兜底。
         blocked_stall_count = 0
 
-        # TEST21 M4: soft/hard turn budget is opt-in (session wall clock).
-        # Default off — no session budget; long coding may run long.
-        loop_start = time.monotonic()
-        from .constants import session_wall_clock_enabled
+        # 连续「arguments 截断」轮计数（TRUNCATED_TOOL_CALL_ROUNDS_LIMIT 兜底）
+        truncated_rounds = 0
 
-        if session_wall_clock_enabled():
-            hard_deadline = loop_start + HARD_TOTAL_TIMEOUT_S
-            soft_deadline = loop_start + TOTAL_TIMEOUT_S
-        else:
-            hard_deadline = float("inf")
-            soft_deadline = float("inf")
+        # Turn budget（写死启用，见 constants.py 顶部说明）: session wall clock。
+        loop_start = time.monotonic()
+        hard_deadline = loop_start + HARD_TOTAL_TIMEOUT_S
+        soft_deadline = loop_start + TOTAL_TIMEOUT_S
         budget_hint_injected = False
         # pacing 提示一次性；记录注入轮次供 soft 提示做【同轮】去重 ——
         # 永久性压制会让 soft（临近硬截止的最后通牒）在默认常量下成死代码：
@@ -296,8 +314,10 @@ class ToolLoopMixin:
                     "round": round_num,
                 })
 
-            # 溢出才压缩。未超窗时必须 append-only，否则 DeepSeek 前缀缓存
-            # 从第一处 replace（旧 tool 占位 / 剥旧图）整段作废。
+            # 溢出才改写前缀。未过 0.8×usable 必须 append-only，否则 DeepSeek
+            # 前缀缓存从第一处 replace 整段作废。压力线先 DSH 锯齿（prune /
+            # 摘要旧头），0.95 硬裁仍是 API 安全网。
+            messages = await self._pressure_compact_if_needed(messages, provider)
             messages = self._trim_context_if_needed(messages, provider)
 
             # 中轮提醒: 80% 轮次时注入
@@ -342,12 +362,14 @@ class ToolLoopMixin:
             new_thinking = round_result["thinking"] or ""
             tool_calls = round_result["tool_calls"]
             finish_reason = round_result["finish_reason"]
+
             # budget_cut 的流几乎必无 usage 事件（usage 在流末尾 chunk），
             # 无条件覆盖会把上一轮的记账抹成 None（审计 2026-08-08）。
             last_usage = round_result.get("usage") or last_usage
 
             # Token metering: 归一化本轮 usage 并累加（错误轮无 usage 则跳过）
             # best-effort：畸形 provider 数据不得中断主流程，异常时跳过该轮计费
+            # （记账放在截断防御之前 —— 全畸形 continue 路径不漏计）
             try:
                 usage = self._normalize_usage(
                     round_result.get("usage"), provider.provider_type
@@ -358,6 +380,80 @@ class ToolLoopMixin:
                 usage = None
             if usage:
                 usage_rounds.append(usage)
+
+            # ── 截断 tool_calls 防御（TEST_DSH_16 实证）─────────────
+            # SSE 提前断流（网关丢 response.completed，finish=None）时
+            # arguments 只收到半截 JSON。畸形调用一旦写进 assistant
+            # (tool_calls) 历史回传，网关 400 "`arguments` must be valid
+            # JSON" 杀死整个 turn。丢弃畸形 + 注入提示让模型重发。
+            combined_text_pre = text_acc + new_text
+            malformed_names = [
+                str(tc.get("name") or "?") for tc in tool_calls
+                if not _is_valid_json_arguments(tc.get("arguments"))
+            ]
+            if malformed_names:
+                truncated_rounds += 1
+                log.warning(
+                    "drop_truncated_tool_calls",
+                    agent_id=agent_id,
+                    round=round_num,
+                    finish=finish_reason,
+                    names=malformed_names,
+                    consecutive=truncated_rounds,
+                )
+                if truncated_rounds >= TRUNCATED_TOOL_CALL_ROUNDS_LIMIT:
+                    # 链路持续劣化：继续重发只会继续截断。保产出收口。
+                    # FIX(text-acc)：只用末轮文本 —— 中间轮文本已通过
+                    # per-round assistant 消息保存，拼接会重复（审计）。
+                    real_text = self._strip_placeholder(new_text)
+                    warning = (
+                        "\n\n⚠️ 响应流连续 "
+                        f"{truncated_rounds} 轮截断（工具调用参数不完整），"
+                        "已丢弃未执行。请稍后重试该调用。"
+                    )
+                    tool_turn_acc.append({
+                        "role": "assistant",
+                        "content": real_text + warning,
+                    })
+                    return {
+                        "status": "ok",
+                        "content": real_text + warning,
+                        "thinking": thinking_acc + new_thinking,
+                        "tool_calls": tool_history,
+                        "tool_turn_messages": tool_turn_acc,
+                        "rounds": round_num + 1,
+                        "usage": last_usage,
+                        "usage_rounds": usage_rounds,
+                    }
+                tool_calls = [
+                    tc for tc in tool_calls
+                    if _is_valid_json_arguments(tc.get("arguments"))
+                ]
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "[STREAM TRUNCATED] Your tool call(s) arrived "
+                        "incomplete (arguments JSON cut off mid-stream): "
+                        f"{', '.join(malformed_names)}. Discarded, NOT "
+                        "executed. Re-send the complete call(s)."
+                    ),
+                })
+                if not tool_calls:
+                    # 全部畸形：本轮文本留作中间轮，继续循环让模型看到
+                    # 提示后立即重发（不走 turn 收口）。
+                    if new_text:
+                        tool_turn_acc.append({
+                            "role": "assistant", "content": new_text,
+                        })
+                    text_acc = self._strip_placeholder(combined_text_pre)
+                    thinking_acc = (
+                        f"{thinking_acc}\n\n---\n\n{new_thinking}"
+                        if thinking_acc and new_thinking
+                        else thinking_acc + new_thinking
+                    )
+                    continue
+            else:
+                truncated_rounds = 0
 
             combined_text = text_acc + new_text
             combined_thinking = (

@@ -135,25 +135,53 @@ class DispatchTaskParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["artifactRefs", "artifact_refs", "required_paths"]},
     )
+    submit_gate: str | None = Field(
+        default=None,
+        alias="submitGate",
+        description=(
+            "Required when creating a NEW task (omit taskId). "
+            "docs | unit | module_visual | code_audit | "
+            "code_audit+module_visual | code_audit+unit."
+        ),
+        json_schema_extra={"aliases": ["submitGate", "submit_gate", "gate"]},
+    )
+    milestone_verify: bool = Field(
+        default=False,
+        alias="milestoneVerify",
+        description=(
+            "Coordinator/CEO: mint a MAIN-serialized VERIFY: milestone QA task."
+        ),
+        json_schema_extra={"aliases": ["milestoneVerify", "milestone_verify"]},
+    )
+    depends_on: list[str] | None = Field(
+        default=None,
+        alias="dependsOn",
+        description=(
+            "Other task ids only (self-id rejected). Unmet → blocked "
+            "(assignee recorded, not woken). VERIFY titles skip auto-block. "
+            "People-waiting is commit_turn, not this list."
+        ),
+        json_schema_extra={"aliases": ["dependsOn", "depends_on"]},
+    )
 
-    @field_validator("expected_modules", mode="before")
+    @field_validator("expected_modules", "artifact_refs", "depends_on", mode="before")
     @classmethod
-    def _coerce_dispatch_modules(cls, v: Any) -> Any:
-        return _coerce_to_list(v)
-
-    @field_validator("artifact_refs", mode="before")
-    @classmethod
-    def _coerce_artifact_refs(cls, v: Any) -> Any:
+    def _coerce_dispatch_lists(cls, v: Any) -> Any:
         return _coerce_to_list(v)
 
 
 @tool(
     "dispatch_task",
-    "Deliver work NOW: ledger entry + inbox wake. "
+    "Deliver work NOW: ledger entry + inbox wake (unless blocked on depends_on). "
+    "Always pass submitGate (docs|unit|module_visual|code_audit|…) — required for "
+    "new tasks, ignored on taskId reuse. Unmet dependsOn also applies when reusing "
+    "taskId (blocked, not woken). dependsOn = other task ids only "
+    "(self-id rejected); waiting on a person is commit_turn. "
     "To re-assign/delegate an EXISTING task, pass taskId — this keeps a single "
     "ledger entry (assignee changes, no duplicate task). "
     "Only create a NEW task (omit taskId) when the work is genuinely new. "
-    "Only direct reports; never assign coordinators code work.",
+    "Only direct reports; never assign coordinators code work. "
+    "Milestone MAIN QA: milestoneVerify=true (coordinator/CEO).",
     requires_workspace=False,
     security_level="standard",
 )
@@ -271,15 +299,30 @@ async def dispatch_task_tool(
         from hiveweave.db import meta as meta_db
 
         main_ws = await meta_db.get_project_workspace(project_id)
-        # Resolve assignee worktree (best-effort)
-        assignee_wt: str | None = None
-        try:
-            from hiveweave.services.worktree_review import agent_worktree_path
+        from hiveweave.services.worktree_review import (
+            agent_worktree_path,
+            normalize_evidence_path,
+        )
 
+        assignee_wt: str | None = None
+        dispatcher_wt: str | None = None
+        try:
             assignee_wt = await agent_worktree_path(resolved_id)
         except Exception:
             pass
-        from hiveweave.services.worktree_review import normalize_evidence_path
+        try:
+            dispatcher_wt = await agent_worktree_path(agent_id)
+        except Exception:
+            pass
+        dispatcher_on_main = False
+        try:
+            dispatcher_on_main = bool(
+                dispatcher_wt
+                and main_ws
+                and _P(dispatcher_wt).resolve() == _P(main_ws).resolve()
+            )
+        except (OSError, ValueError):
+            dispatcher_on_main = False
 
         for ref in params.artifact_refs:
             # Do NOT use str.lstrip("./") — strips every leading '.' and breaks
@@ -304,14 +347,55 @@ async def dispatch_task_tool(
                 found = True
             if not found and assignee_wt and (_P(assignee_wt) / ref_clean).exists():
                 found = True
-            if not found:
+            on_dispatcher = bool(
+                dispatcher_wt
+                and not dispatcher_on_main
+                and (_P(dispatcher_wt) / ref_clean).exists()
+            )
+            if not found and on_dispatcher:
                 artifact_warnings.append(
-                    f"NOT FOUND: '{ref_clean}' does not exist in main "
-                    f"workspace or assignee worktree. Ensure it is committed "
-                    f"to main before the assignee starts."
+                    f"EXISTS ON YOUR TREE ONLY: '{ref_clean}' is in your "
+                    f"worktree, not MAIN. Assignee will treat it as absent "
+                    f"until git_worktree_merge. That is OK."
+                )
+            elif not found:
+                artifact_warnings.append(
+                    f"NOT FOUND: '{ref_clean}' does not exist in MAIN or "
+                    f"the assignee worktree. Assignee will treat it as "
+                    f"absent until it is on MAIN. That is OK."
                 )
 
     ds = DispatchService()
+    policy_id: str | None = None
+    title: str | None = None
+    source = "agent"
+    if not params.task_id:
+        from hiveweave.services.attestation import policy_from_submit_gate
+
+        try:
+            policy_id = policy_from_submit_gate(params.submit_gate)
+        except ValueError as e:
+            return ToolResult.err(str(e))
+        if params.milestone_verify:
+            from hiveweave.services.org import OrgService
+            from hiveweave.services.policy import infer_role_family
+            from hiveweave.services.tasks.verify import is_verify_title
+
+            me = await OrgService().resolve_agent(agent_id)
+            family = infer_role_family(me or {})
+            if family not in ("ceo", "coordinator"):
+                return ToolResult.err(
+                    "milestoneVerify is for coordinators/CEO arranging MAIN QA, "
+                    "not leaf self-service."
+                )
+            title = (params.task or "")[:100]
+            if not is_verify_title(title):
+                title = f"VERIFY: {title}"
+            source = "system"
+    elif params.milestone_verify:
+        return ToolResult.err(
+            "milestoneVerify only applies when creating a new task (omit taskId)."
+        )
     result = await ds.dispatch_task(
         project_id=project_id,
         from_agent_id=agent_id,
@@ -319,23 +403,45 @@ async def dispatch_task_tool(
         description=params.task,
         expect_report=params.expect_report,
         existing_task_id=params.task_id,
+        policy_id=policy_id,
+        title=title,
+        source=source,
+        depends_on=params.depends_on,
+        parent_task_id=params.parent_task_id,
     )
     if result.get("success"):
         # Align with review_task: inbox alone is not enough — wake assignee
-        try:
-            from hiveweave.agents.trigger import trigger_subordinate
+        # unless the ledger parked the task on unmet depends_on.
+        if not result.get("blocked"):
+            try:
+                from hiveweave.agents.trigger import trigger_subordinate
 
-            await trigger_subordinate(resolved_id)
-        except Exception as e:
-            log.warning(
-                "dispatch_trigger_failed",
-                target=resolved_id,
-                error=str(e),
-            )
+                await trigger_subordinate(resolved_id)
+            except Exception as e:
+                log.warning(
+                    "dispatch_trigger_failed",
+                    target=resolved_id,
+                    error=str(e),
+                )
         output = (
             f"Task dispatched to {result.get('to_agent_id', resolved_id)} "
             f"(task_id={result.get('task_id', '')})"
         )
+        wt_sid = result.get("worktree_short_id")
+        if wt_sid:
+            output += f" worktree={wt_sid}."
+        parent = result.get("parent_task_id") or ""
+        output += (
+            " Wait on this child with commit_turn(waiting, kind=task, "
+            "ref=the task_id above); do not ask_agent the assignee to submit."
+        )
+        if parent:
+            output += f" parent_task_id={parent}."
+        if result.get("blocked"):
+            output += (
+                " Task is blocked on unmet depends_on; assignee recorded, "
+                "not woken."
+            )
         if shared_refs_ok:
             output += (
                 " Note: .hiveweave/shared is draft/collab; "

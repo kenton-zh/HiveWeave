@@ -42,7 +42,7 @@ def test_look_at_image_in_all_role_presets() -> None:
 
 
 def test_look_at_image_not_bound_to_browse_capability() -> None:
-    """Must stay out of TOOL_CAPABILITY so CEO/HR (no BROWSE) can call it."""
+    """Must stay out of TOOL_CAPABILITY so HR (no BROWSE) can still call it."""
     assert "look_at_image" not in TOOL_CAPABILITY
     # Contrast: assert_visual IS gated — regression lock for the design choice.
     assert "assert_visual" in TOOL_CAPABILITY
@@ -53,8 +53,9 @@ def test_look_at_image_hard_check_allows_ceo_and_hr() -> None:
     hr = {"role": "hr", "permission_type": "readonly", "name": "知远"}
     assert policy_service.hard_check(ceo, "look_at_image") is None
     assert policy_service.hard_check(hr, "look_at_image") is None
-    # Sanity: CEO still hard-denied on browse
-    assert policy_service.hard_check(ceo, "browse") is not None
+    # CEO can browse to look; HR still cannot.
+    assert policy_service.hard_check(ceo, "browse") is None
+    assert policy_service.hard_check(hr, "browse") is not None
 
 
 def test_extract_nonstream_text_openai() -> None:
@@ -137,7 +138,9 @@ async def test_look_at_image_missing_vision_model(tmp_path: Path) -> None:
             workspace=str(tmp_path),
         )
     assert result.success is False
-    assert "多模态" in (result.error or "") or "vision" in (result.error or "").lower()
+    assert "no model" in (result.error or "").lower() or "optional" in (
+        result.error or ""
+    ).lower()
 
 
 @pytest.mark.asyncio
@@ -312,6 +315,7 @@ async def test_analyze_image_disables_thinking() -> None:
     fake_provider.build_url.return_value = "https://example.com/v1/chat/completions"
 
     mock_resp = MagicMock()
+    mock_resp.status_code = 200
     mock_resp.raise_for_status = MagicMock()
     mock_resp.json.return_value = {
         "choices": [{"message": {"content": "ok pixels"}}]
@@ -347,3 +351,151 @@ async def test_analyze_image_disables_thinking() -> None:
     body_kw = fake_provider.build_body.call_args.kwargs
     assert body_kw["stream"] is False
     assert body_kw["messages"][0]["images"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_image_retries_on_429() -> None:
+    """视觉一次性调用遇到 429 必须指数退避重试（与流式路径同口径），
+    不能直接抛掉把视觉门禁废掉 → 团队只能 waive visual/module_visual。"""
+    from hiveweave.services.vision import analyze_image
+
+    fake_provider = MagicMock()
+    fake_provider.build_body.return_value = {"model": "x", "stream": False}
+    fake_provider.build_headers.return_value = {}
+    fake_provider.build_url.return_value = "https://example.com/v1/chat/completions"
+
+    def make_resp(status: int, payload: dict):
+        r = MagicMock()
+        r.status_code = status
+        r.headers = {"retry-after-ms": "0"} if status == 429 else {}
+        r.raise_for_status = MagicMock()
+        r.json.return_value = payload
+        r.text = "rate limit" if status == 429 else ""
+        return r
+
+    resp_429 = make_resp(429, {})
+    resp_ok = make_resp(
+        200, {"choices": [{"message": {"content": "ok after retry"}}]}
+    )
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(side_effect=[resp_429, resp_ok])
+
+    with (
+        patch("hiveweave.llm.provider.provider_factory") as mock_factory,
+        patch("httpx.AsyncClient", return_value=mock_client),
+    ):
+        mock_factory.create.return_value = fake_provider
+        text = await analyze_image(
+            image={"media_type": "image/png", "data": "QQ=="},
+            prompt="see?",
+            model_config={
+                "id": "m1",
+                "model_id": "vision",
+                "base_url": "https://example.com/v1",
+                "api_key": "sk",
+            },
+        )
+
+    assert text == "ok after retry"
+    assert mock_client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_resolve_vision_model_falls_back_to_management() -> None:
+    from hiveweave.services.model import ModelService
+
+    svc = ModelService()
+    mgmt = {"id": "mgmt-1", "name": "muse-spark", "is_active": True}
+
+    async def _settings_get(self, key: str, *a, **k):
+        return ""
+
+    mock_resolve = AsyncMock(return_value=mgmt)
+    with (
+        patch(
+            "hiveweave.services.settings.SettingsService.get",
+            new=_settings_get,
+        ),
+        patch.object(svc, "resolve_model", new=mock_resolve),
+    ):
+        got = await svc.resolve_vision_model()
+    assert got is mgmt
+    # strict=True：management 档解析不出就返回 None，不落 emergency pool
+    # 把 executor 档模型冒充 management（审计 M2）。
+    assert mock_resolve.await_args.kwargs.get("strict") is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_vision_model_management_none_beats_pool() -> None:
+    """专用槽空 + management 严格解析为 None → 返回 None（不用任意池模型）。"""
+    from hiveweave.services.model import ModelService
+
+    svc = ModelService()
+
+    async def _settings_get(self, key: str, *a, **k):
+        return ""
+
+    mock_resolve = AsyncMock(return_value=None)
+    with (
+        patch(
+            "hiveweave.services.settings.SettingsService.get",
+            new=_settings_get,
+        ),
+        patch.object(svc, "resolve_model", new=mock_resolve),
+    ):
+        got = await svc.resolve_vision_model()
+    assert got is None
+    assert mock_resolve.await_args.kwargs.get("strict") is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_vision_model_dedicated_slot_wins() -> None:
+    from hiveweave.services.model import ModelService
+
+    svc = ModelService()
+    vision = {"id": "v1", "name": "vision-box", "is_active": True}
+    mgmt = {"id": "mgmt-1", "name": "muse-spark", "is_active": True}
+
+    async def _settings_get(self, key: str, *a, **k):
+        if key == "vision_model_primary":
+            return "v1"
+        return ""
+
+    async def _get(model_pk: str):
+        if model_pk == "v1":
+            return vision
+        return None
+
+    mock_resolve = AsyncMock(return_value=mgmt)
+    with (
+        patch(
+            "hiveweave.services.settings.SettingsService.get",
+            new=_settings_get,
+        ),
+        patch.object(svc, "get", new=_get),
+        patch.object(svc, "resolve_model", new=mock_resolve),
+    ):
+        got = await svc.resolve_vision_model()
+    assert got is vision
+    mock_resolve.assert_not_awaited()
+
+
+def test_ui_submit_gate_does_not_require_assert_visual_ritual() -> None:
+    from hiveweave.services.attestation import (
+        BROWSE_E2E_KIND,
+        CODE_AUDIT_KIND,
+        POLICY_REQUIRED_KINDS,
+        VISUAL_CHECK_KIND,
+    )
+
+    ui = POLICY_REQUIRED_KINDS["ui_browser_e2e"]
+    vis = POLICY_REQUIRED_KINDS["code_audit_visual"]
+    assert ui is not None and vis is not None
+    assert VISUAL_CHECK_KIND not in ui
+    assert BROWSE_E2E_KIND in ui
+    assert VISUAL_CHECK_KIND not in vis
+    assert CODE_AUDIT_KIND in vis
+    assert BROWSE_E2E_KIND in vis
