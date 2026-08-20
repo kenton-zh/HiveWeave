@@ -14,9 +14,15 @@ function formatUnitValue(tokens: number, unit: TokenUnit): string {
 }
 
 function parseUnitValue(raw: string, unit: TokenUnit): number | null {
-  const n = Number(raw);
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return null;
+  // 支持带单位后缀输入（如 "1M" / "1000k" / "2.5m"），无后缀则按当前单位
+  const m = /^(\d*\.?\d+)\s*([km])?$/.exec(trimmed);
+  if (!m) return null;
+  const n = Number(m[1]);
   if (!Number.isFinite(n) || n <= 0) return null;
-  return Math.max(1, Math.round(n * SCALE[unit]));
+  const suffixScale = m[2] === "k" ? 1_000 : m[2] === "m" ? 1_000_000 : SCALE[unit];
+  return Math.max(1, Math.round(n * suffixScale));
 }
 
 interface Props {
@@ -71,7 +77,13 @@ export default function TokenScaleField({
           type="text"
           inputMode="decimal"
           value={shown}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            const raw = e.target.value;
+            setDraft(raw);
+            // 输入有效值即同步父组件，避免「直接点保存」时 blur 未触发导致旧值提交
+            const next = parseUnitValue(raw, unit);
+            if (next != null) onChange(next);
+          }}
           onBlur={() => {
             if (draft == null) return;
             commit(draft);

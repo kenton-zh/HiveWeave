@@ -38,6 +38,14 @@ EMPTY_RESPONSE_BACKOFF_MS = [5_000, 15_000, 45_000]
 NO_TEXT_ROUNDS_THRESHOLD = 3
 """连续无文字轮次阈值: 3 轮后注入系统提示。"""
 
+TRUNCATED_TOOL_CALL_ROUNDS_LIMIT = 3
+"""连续「tool_call arguments 截断」轮上限（TEST_DSH_16 实证）。
+
+SSE 提前断流（网关丢 response.completed，finish=None）时 tool_call
+arguments 只收到半截 JSON。畸形调用进历史回传 → 网关 400
+"`arguments` must be valid JSON" 杀死整个 turn。丢弃畸形 + 注入提示
+让模型重发；连续 N 轮仍畸形说明链路持续劣化，优雅收口保产出。"""
+
 NO_TEXT_HINT_MAX = 5
 """无文字提示注入上限: 超过 5 次后强制结束 tool loop 走总结。
 

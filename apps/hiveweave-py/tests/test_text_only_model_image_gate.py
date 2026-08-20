@@ -193,9 +193,10 @@ def _model_row(supports_images) -> dict:
 
 def test_factory_supports_images_auto_and_override():
     f = ProviderFactory()
-    # 显式覆盖优先
+    # 对齐 opencode：显式 supports_images 不再预剥，统一默认放行，
+    # 能不能读图由真实 400 + 负缓存自判定（防误标纯文本时静默剥图）。
     assert f.create(_model_row(1)).supports_images is True
-    assert f.create(_model_row(0)).supports_images is False
+    assert f.create(_model_row(0)).supports_images is True  # 显式 0 也放行
     # NULL / 缺列 → auto（默认放行，让模型在 400 时自行判定）
     assert f.create(_model_row(None)).supports_images is True
     row = _model_row(1)
@@ -225,8 +226,11 @@ def test_negative_cache_normalizes_trailing_slash():
 
 
 def test_provider_config_body_strips_images_when_text_only():
+    # 对齐 opencode：显式 supports_images 不再剥图（默认放行）；只有真实 400
+    # 触发负缓存 mark_image_unsupported → 该模型身份才剥图。
+    prov_mod.mark_image_unsupported("https://example.com/v1", "m")
     f = ProviderFactory()
-    provider = f.create(_model_row(0))
+    provider = f.create(_model_row(None))
     body = provider.build_body(
         [
             {"role": "assistant", "content": "", "tool_calls": [{}]},

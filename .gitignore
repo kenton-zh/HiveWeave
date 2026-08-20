@@ -58,6 +58,7 @@ __pycache__/
 *$py.class
 
 # Temp patch/fix scripts
+_probe*.py
 _fix*.mjs
 _fix*.py
 _fix*.cjs

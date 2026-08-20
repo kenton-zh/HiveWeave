@@ -7,6 +7,7 @@ time belt; model-id allowlists are not the authority.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from hiveweave.llm.provider import FORMAT_HANDLERS, ApiFormat, FormatHandler, OpenAIHandler
@@ -340,8 +341,28 @@ def _function_call_item(tc: Any) -> dict | None:
     arguments = (fn or {}).get("arguments") if fn else tc.get("arguments")
     if not name:
         return None
-    if not isinstance(arguments, str):
-        arguments = "" if arguments is None else str(arguments)
+    # 必须产出能被网关 json.loads 的合法 JSON（Console Go 对空串 400
+    # "`arguments` must be valid JSON"）。空参调用模型不一定发 "{}"，
+    # 可能发 "" / None；dict 直接 str() 会变成非法 Python repr。
+    if arguments is None or arguments == "":
+        arguments = "{}"
+    elif not isinstance(arguments, str):
+        try:
+            arguments = json.dumps(arguments)
+        except (TypeError, ValueError):
+            arguments = "{}"
+    else:
+        # 防御纵深：非空字符串也校验 JSON 合法性（SSE 截断产生半截 JSON、
+        # 空白串等直通网关会 400 "must be valid JSON"）。tool_loop 已在
+        # 历史写入前拦截，此处兜底 DB 回放/其他 provider 路径的畸形。
+        trimmed = arguments.strip()
+        if not trimmed:
+            arguments = "{}"
+        else:
+            try:
+                json.loads(arguments)
+            except (json.JSONDecodeError, ValueError):
+                arguments = "{}"
     return {
         "type": "function_call",
         "call_id": tc.get("id") or tc.get("call_id") or "",

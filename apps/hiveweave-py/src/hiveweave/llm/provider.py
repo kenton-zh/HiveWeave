@@ -1505,14 +1505,10 @@ class ProviderFactory:
         else:
             supports_cache = api_format == ApiFormat.ANTHROPIC
 
-        # 图像能力 = auto：默认放行（让模型在 400 时自行「判定」），
-        # 仅当该真实身份 (base_url, model_name) 已被负缓存证明纯文本时关。
-        # model_config 显式带 supports_images 时以显式值为准（手工覆盖）。
-        explicit_images = model_config.get("supports_images")
-        if explicit_images is None:
-            auto_images = is_image_supported(base_url, model_name)
-        else:
-            auto_images = bool(explicit_images)
+        # 对齐 opencode：不预判、不用 supports_images 配置标志剥图。
+        # 默认放行所有模型带图，能不能读图由上游真实 400 + 负缓存自判定
+        # （防误标纯文本时静默剥图）。负缓存按 (base_url, model_name) 键控、进程内易失。
+        auto_images = is_image_supported(base_url, model_name)
 
         return ProviderConfig(
             api_format=api_format,

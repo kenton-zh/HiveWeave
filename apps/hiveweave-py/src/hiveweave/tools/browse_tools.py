@@ -564,6 +564,34 @@ def _browse_child_env(agent_id: str | None = None) -> dict[str, str]:
     if agent_id:
         env["AGENT_BROWSER_SESSION"] = f"hiveweave-{agent_id[:40]}"
         env.setdefault("AGENT_BROWSER_IDLE_TIMEOUT_MS", str(2 * 60 * 60 * 1000))
+    # 代理剥离：dev 机后端常带 HTTP(S)_PROXY 启动，agent-browser 会自动读它。
+    # browse 的目标是本机前端 dev server（localhost/127.0.0.1），本就不该走
+    # LLM 用的远程代理；且该代理不稳，导航常挂死到超时 → 回收 → 重试仍挂
+    # （“browse 反复起不来”，A155 连 example.com 都 60s 超时）。这里直接从
+    # 子进程环境里剥掉全部代理变量，导航永远直连，行为确定可复现。
+    for _k in (
+        "HTTP_PROXY", "http_proxy",
+        "HTTPS_PROXY", "https_proxy",
+        "ALL_PROXY", "all_proxy",
+        "AGENT_BROWSER_PROXY",
+    ):
+        env.pop(_k, None)
+    # 双保险：即便进程外仍有代理设置，也强制本地/回环/主机别名直连。
+    # 合并而非覆盖既有 NO_PROXY（企业内网常配 *.internal.corp 等旁路）。
+    _bypass = "localhost,127.0.0.1,::1"
+    _bypass_list = ("localhost", "127.0.0.1", "::1")
+    existing = env.get("NO_PROXY") or env.get("no_proxy") or ""
+    if existing:
+        parts = [p.strip() for p in existing.split(",") if p.strip()]
+        for _h in _bypass_list:
+            if _h not in parts:
+                parts.append(_h)
+        merged = ",".join(parts)
+    else:
+        merged = _bypass
+    env["NO_PROXY"] = merged
+    env["no_proxy"] = merged
+    env["AGENT_BROWSER_PROXY_BYPASS"] = _bypass
     return env
 
 
