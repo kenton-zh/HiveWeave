@@ -347,3 +347,61 @@ def test_browse_exec_forwards_stdin_payload(browse_fake_proc, tmp_path):
     # stdin 用临时文件承载，而非 asyncio PIPE。
     assert ctx.stdin_is_pipe is False
     assert ctx.stdin_arg is not None and hasattr(ctx.stdin_arg, "read")
+
+
+def test_browse_exec_chrom_args_layout_preserved(browse_fake_proc, tmp_path):
+    """browse_exec 收到 [--args, flags, open, url] 布局：--args 前缀剥离后
+    goto 仍映射为 open，且 flag 前缀保持全局布局传给 agent-browser CLI. 回归
+    防护：剥皮只作用于 _map_ab_argv 内，上层（browse_exec）不能再拿 mapped[0]
+    当子命令，否则 screenshot/视口判断全部失配."""
+    import asyncio
+
+    from hiveweave.tools.browse_tools import browse_exec
+
+    with browse_fake_proc as ctx:
+        ctx.out = b"ok"
+        code, _out, _err = asyncio.run(
+            browse_exec(
+                ["--args", "--disable-http-cache,--disk-cache-size=1",
+                 "goto", "http://127.0.0.1:3000"],
+                str(tmp_path),
+            )
+        )
+
+    assert code == 0
+    assert ctx.spawn_argv == [
+        "fake-ab.exe",
+        "--args",
+        "--disable-http-cache,--disk-cache-size=1",
+        "open",
+        "http://127.0.0.1:3000",
+    ]
+
+
+def test_browse_exec_chrom_args_screenshot_pins_abs_path(browse_fake_proc, tmp_path):
+    """--args+screenshot 时仍须：剥离前缀定位真实相对路径、父目录已建、CLI
+    末位被 pin 成绝对路径且 --args 前缀保留。回归防护上轮【高】项（前缀导致
+    截图路径固定/父目录 mkdir 失效）。"""
+    import asyncio
+
+    from hiveweave.tools.browse_tools import browse_exec
+
+    with browse_fake_proc as ctx:
+        ctx.out = b"ok"
+        code, _out, _err = asyncio.run(
+            browse_exec(
+                ["--args", "--disable-http-cache,--disk-cache-size=1",
+                 "screenshot", "evidence/bug.png"],
+                str(tmp_path),
+            )
+        )
+
+    assert code == 0
+    assert ctx.spawn_argv[0] == "fake-ab.exe"
+    assert ctx.spawn_argv[1:3] == [
+        "--args",
+        "--disable-http-cache,--disk-cache-size=1",
+    ]
+    # 末位被 pin 成工作区内的绝对路径（保留 --args 前缀的布局）。
+    assert str(tmp_path.resolve()) in ctx.spawn_argv[-1]
+    assert ctx.spawn_argv[-1].endswith("bug.png")

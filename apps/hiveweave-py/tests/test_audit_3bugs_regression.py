@@ -181,6 +181,40 @@ def test_browse_passthrough_command_untouched():
     assert stdin is None
 
 
+def test_browse_chrom_args_peeled_and_prepended_to_goto():
+    """Leading [--args, flags] must be peeled so the real subcommand still
+    maps (goto -> open) normally, then re-prefixed for agent-browser layout."""
+    from hiveweave.tools.browse_tools import _map_ab_argv
+
+    argv, stdin = _map_ab_argv(
+        ["--args", "--disable-http-cache,--disk-cache-size=1", "goto", "http://127.0.0.1:3000"], ""
+    )
+    assert argv == [
+        "--args",
+        "--disable-http-cache,--disk-cache-size=1",
+        "open",
+        "http://127.0.0.1:3000",
+    ]
+    assert stdin is None
+
+
+def test_browse_chrom_args_screenshot_only_without_args():
+    from hiveweave.tools.browse_tools import _map_ab_argv
+
+    argv, _stdin = _map_ab_argv(["screenshot", "evidence/x.png"], "")
+    assert argv == ["screenshot", "evidence/x.png"]
+
+
+def test_browse_chrom_args_set_viewport_detected():
+    """--args 前缀 + set viewport 组合：_is_viewport_command 须剥离前缀后
+    识别 set viewport，而非拿 argv[1]（=--flag）误判。"""
+    from hiveweave.tools.browse_tools import _is_viewport_command, _viewport_rest
+
+    argv = ["--args", "--disable-http-cache", "set", "viewport", "390", "844"]
+    assert _is_viewport_command(argv) is True
+    assert _viewport_rest(argv) == ["390", "844"]
+
+
 # ── check_verify_baseline canonical query key ─────────────────────────────
 # Regression from the short-id normalization audit: `create()` now stores
 # task_id in canonical (dash-stripped) form, but check_verify_baseline queried

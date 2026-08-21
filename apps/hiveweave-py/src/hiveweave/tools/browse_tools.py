@@ -105,7 +105,13 @@ class BrowseParams(BaseModel):
         description=(
             "browse CLI argv, e.g. [\"goto\", \"http://127.0.0.1:3000\"] "
             "or [\"snapshot\", \"-i\"] or [\"screenshot\", \"evidence/bug.png\"]. "
-            "Prefer this over free-form shell."
+            "Prefer this over free-form shell. Any Chromium CLI flag can be "
+            "injected via the universal passthrough [\"--args\", \"<flags>\", ...] "
+            "placed BEFORE the subcommand (applies at browser cold-start only, so "
+            "use after browse(args=[\"restart\"]) for a long-lived session). "
+            "Common: pass [\"--args\", \"--disable-http-cache,--disk-cache-size=1\"] "
+            "before goto to defeat stale HTTP cache when a hot-fixed page keeps "
+            "showing the old build."
         ),
     )
     command: str | None = Field(
@@ -199,8 +205,10 @@ def _screenshot_path_from_argv(argv: list[str]) -> str | None:
     """
     if not argv:
         return None
-    if (argv[0] or "").lower().replace("-", "_") not in ("screenshot", "shoot"):
+    if _subcommand_of(argv) not in ("screenshot", "shoot"):
         return None
+    # Skip a leading Chromium-flag passthrough so path positions stay aligned.
+    argv = _strip_chrom_prefix(argv)
     # Last non-flag positional that looks like a path wins.
     candidates: list[str] = []
     i = 1
@@ -254,7 +262,7 @@ def ensure_screenshot_argv(
     """
     if not argv:
         return list(argv)
-    head = (argv[0] or "").lower().replace("-", "_")
+    head = _subcommand_of(argv)
     if head not in ("screenshot", "shoot"):
         return list(argv)
     if _screenshot_path_from_argv(argv):
@@ -412,16 +420,18 @@ def _viewport_cli_argv(dims: tuple[int, int, int | None]) -> list[str]:
 def _is_viewport_command(argv: list[str]) -> bool:
     if not argv:
         return False
-    head = (argv[0] or "").lower().replace("-", "_")
+    stripped = _strip_chrom_prefix(argv)
+    head = _subcommand_of(argv)
     if head in _VIEWPORT_HEADS:
         return True
-    if head == "set" and len(argv) > 1 and str(argv[1]).lower() == "viewport":
+    if head == "set" and len(stripped) > 1 and str(stripped[1]).lower() == "viewport":
         return True
     return False
 
 
 def _viewport_rest(argv: list[str]) -> list[str]:
-    head = (argv[0] or "").lower().replace("-", "_")
+    argv = _strip_chrom_prefix(argv)
+    head = _subcommand_of(argv)
     if head in _VIEWPORT_HEADS:
         return [str(a) for a in argv[1:]]
     return [str(a) for a in argv[2:]]
@@ -437,21 +447,60 @@ def _map_ab_argv(argv: list[str], workspace: str) -> tuple[list[str], str | None
     """
     if not argv:
         return [], None
-    head = (argv[0] or "").lower().replace("-", "_")
+    # Universal Chromium-flag passthrough: `--args` (as a leading element)
+    # carries comma-joined flags that apply at browser cold-start. Peel it
+    # off so the real subcommand still goes through normal mapping, then
+    # re-prefix the result so the global flag layout (`[--args, flags, cmd]`)
+    # is preserved for agent-browser.
+    chrom_args: list[str] | None = None
+    if argv and (argv[0] or "").lower() in ("--args", "_args"):
+        if len(argv) >= 2:
+            chrom_args = ["--args", str(argv[1])]
+            argv = [str(a) for a in argv[2:]]
+        else:
+            argv = argv[1:]
+    head = (argv[0] or "").lower().replace("-", "_") if argv else ""
     rest = [str(a) for a in argv[1:]]
 
     if head in ("js", "eval", "evaluate"):
-        return _eval_argv(head, rest, workspace)
+        argv, stdin = _eval_argv(head, rest, workspace)
+        return _prepend_chrom_args(argv, stdin, chrom_args)
     if head in ("screenshot", "shoot"):
-        return _screenshot_argv(rest), None
+        return _prepend_chrom_args(_screenshot_argv(rest), None, chrom_args)
     if _is_viewport_command(argv):
         dims = parse_viewport_args(_viewport_rest(argv))
         if dims is None:
-            return ["set", "viewport"], None
-        return _viewport_cli_argv(dims), None
+            return _prepend_chrom_args(["set", "viewport"], None, chrom_args)
+        return _prepend_chrom_args(_viewport_cli_argv(dims), None, chrom_args)
 
     head = _HEAD_ALIASES.get(head, head)
-    return [head, *rest], None
+    return _prepend_chrom_args([head, *rest], None, chrom_args)
+
+
+def _prepend_chrom_args(
+    argv: list[str], stdin_payload, chrom_args: list[str] | None
+) -> tuple[list[str], str | None]:
+    """Re-prefix the peeled Chromium flag passthrough (returns ``(argv, payload)``)."""
+    if chrom_args:
+        return [*chrom_args, *argv], stdin_payload
+    return argv, stdin_payload
+
+
+def _strip_chrom_prefix(argv: list[str]) -> list[str]:
+    """Drop a leading ``--args <flags>`` passthrough (``--args`` becomes
+    another subcommand only if a flag value is absent)."""
+    a = list(argv)
+    if a and (a[0] or "").lower() in ("--args", "_args"):
+        a = a[2:] if len(a) >= 2 else a[1:]
+    return a
+
+
+def _subcommand_of(argv: list[str]) -> str:
+    """Return the effective subcommand token, ignoring a leading Chromium
+    flag passthrough (``--args <flags>``). Upper layers must derive the real
+    command from this, never from ``argv[0]``/``mapped[0]``."""
+    a = _strip_chrom_prefix(argv)
+    return (a[0] or "").lower().replace("-", "_") if a else ""
 
 
 def _eval_argv(head: str, rest: list[str], workspace: str) -> tuple[list[str], str | None]:
@@ -628,7 +677,7 @@ async def browse_exec(
     mapped, stdin_payload = _map_ab_argv(argv, workspace)
 
     timeout = max(5, min(int(timeout_sec or 60), 300))
-    head = (mapped[0] or "").lower().replace("-", "_") if mapped else ""
+    head = _subcommand_of(mapped)
     if head in (
         "click", "wait", "fill", "press", "type", "select", "eval",
         "close", "reload",
@@ -1103,7 +1152,7 @@ async def browse_tool(
             "--domain. Import cookies manually, or pass an explicit --domain."
         )
 
-    head = (argv[0] or "").lower().replace("-", "_")
+    head = _subcommand_of(argv)
     # Normalize through the alias table so `wait_for`/`waitfor` count as the
     # intentionally long-lived `wait` (the raw head is used elsewhere).
     head_norm = _HEAD_ALIASES.get(head, head)

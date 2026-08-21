@@ -149,6 +149,7 @@ def browse_fake_proc():
 
     async def fake_exec(*_a, **_k):
         state["kwargs"] = _k
+        state["argv"] = [str(x) for x in _a]
         # Read the ctx's CURRENT attributes at spawn time — assignments made
         # inside the `with` block (or before it) both take effect.
         p = _FakeProc(
@@ -179,6 +180,10 @@ def browse_fake_proc():
         @property
         def spawn_env(self):
             return state.get("kwargs", {}).get("env")
+
+        @property
+        def spawn_argv(self) -> list[str]:
+            return list(state.get("argv", []))
 
         @property
         def stdin_written(self) -> bytes:
