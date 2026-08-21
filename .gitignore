@@ -129,6 +129,10 @@ reports/
 
 # One-off per-project DB audit scripts (external absolute paths, snapshot-bound)
 tasks/_tmp_*
+tasks/diag_*.py
+tasks/dsh*.py
+apps/hiveweave-py/scripts/mechanism_attribution.py
+apps/hiveweave-py/scripts/strip_reserved_tags.py
 
 # Misc
 after-select.yaml
