@@ -116,6 +116,11 @@ apps/web/frontend-e2e-test.mjs
 AI_MEMORY.local.md
 *.local.md
 
+# AI-agent instruction / tool docs (local working guidance, not project source)
+AGENTS.md
+CLAUDE.md
+.claude/
+
 # Local experiment/observation snapshots (复盘用，不入库)
 observations/
 
