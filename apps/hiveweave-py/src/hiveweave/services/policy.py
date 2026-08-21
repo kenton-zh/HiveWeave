@@ -11,8 +11,8 @@ Role families: ceo | hr | coordinator | executor | qa
 - ceo: 行政 + 里程碑验收 + DOC_WRITE（任意文档，禁源码/配置）+ BROWSE（看产品）。
   无写码/bash/test 责任。可对单条任务 waive_attestation 关闸（可不附 evidence）；
   禁止一次关掉所有任务。browse 本身不关闸；自己的浏览不算 approve 证据。
-- coordinator: 中层 builder（player-coach）— 协调权叠加写码权
-  （SOURCE_WRITE / BASH_SHELL / TEST_RUN / BROWSE）。
+- coordinator: 中层（设计者+接缝工）— 协调权叠加写码权
+  （SOURCE_WRITE / BASH_SHELL / TEST_RUN / BROWSE；写码收敛到叶子间接缝）。
 """
 
 from __future__ import annotations
@@ -74,8 +74,8 @@ FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
         Capability.SOURCE_READ,
         Capability.BIND_SKILL,  # bind skills on subordinates via tools
         Capability.MANAGE_ORG,  # dismiss/transfer within span
-        # 中层 builder（player-coach）：协调权叠加写码权 —— 自己搭骨架/写
-        # 关键路径，与 executor 同契约拥有独立 worktree。
+        # 中层（设计者+接缝工）：协调权叠加写码权 —— 写码收敛到叶子
+        # 间接缝，与 executor 同契约拥有独立 worktree。
         Capability.SOURCE_WRITE,
         Capability.BASH_SHELL,
         Capability.TEST_RUN,

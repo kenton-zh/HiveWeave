@@ -65,6 +65,64 @@ def test_ceo_hire_flow_is_one_ask_not_two_letters():
     assert "message HR with specific hiring requests" not in text
 
 
+def test_ceo_script_embeds_plan_prodding_discipline():
+    """一期鞭策纪律：CEO 剧本必须内嵌 Coverage/Challenge/Bottom-line + 2 轮封顶。"""
+    text = build_coordinator_script("CEO", "归零")
+    assert "计划鞭策纪律" in text
+    assert "Coverage" in text
+    assert "Challenge" in text
+    assert "Bottom-line" in text
+    assert "2 轮" in text
+    assert "不能为了你自以为的提升而改变用户的初衷" in text
+
+
+def test_ceo_script_requires_design_before_hiring():
+    """设计先行：中层设计定稿前不得招人派活；Phase 0.5 走设计→鞭策→定稿→招人。"""
+    text = build_coordinator_script("CEO", "归零")
+    assert "design/plan document" in text
+    assert "定稿前中层不得招人、不得派活" in text
+    assert "Manager Design & Mobilization" in text
+
+
+def test_generic_coordinator_is_designer_and_seamer():
+    """中层职责收敛：设计文档 + 接缝；接缝时机自定；不再 player-coach 写骨架。"""
+    text = build_coordinator_script(ARCHITECT, "青梧")
+    assert "设计者 + 接缝工" in text
+    assert "接缝时机你自定" in text
+    assert "定稿前不得向 HR 招人、不得派活" in text
+    assert "player-coach" not in text
+    assert "自己写骨架" not in text
+    # 接缝之外的实现必须下派；solo 单兵例外保留
+    assert "接缝之外的实现必须派给下级 executor" in text
+    assert "solo 单兵例外" in text
+    # Phase 0.5 改为设计先行 + 分两段汇报
+    assert "Domain Design" in text
+    assert "待鞭策定稿" in text
+
+
+def test_ceo_script_no_player_coach_leftover():
+    """CEO 剧本也不残留 player-coach 语义（小 UI 由接缝带过，不是 tech lead 自己写）。"""
+    text = build_coordinator_script("CEO", "归零")
+    assert "player-coach" not in text
+    assert "自己写骨架" not in text
+    assert "由技术负责人写" not in text
+    assert "以接缝方式带过" in text
+
+
+def test_identity_prompt_no_player_coach_leftover():
+    """共享 identity 块不残留 player-coach/骨架术语；worktree 描述含 seam work。"""
+    for role in ("CEO", ARCHITECT, "HR", "前端工程师"):
+        text = build_identity_prompt(
+            role=role,
+            role_type="coordinator" if role in ("CEO", ARCHITECT, "HR") else "executor",
+            backstory="",
+        )
+        assert "player-coach" not in text, role
+        assert "骨架任务" not in text, role
+    coord_text = build_identity_prompt(role=ARCHITECT, role_type="coordinator", backstory="")
+    assert "seam work" in coord_text
+
+
 def test_identity_instruct_hr_uses_ask_agent():
     text = build_identity_prompt(
         role="ceo",

@@ -66,8 +66,8 @@ CEO_TOOLS = _BASE_TOOLS | frozenset({
 })
 
 COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
-    # 中层 builder（player-coach）：协调权 + 写码权（与 executor 同契约
-    # 拥有独立 worktree，自己搭骨架/写关键路径）。
+    # 中层（设计者+接缝工）：协调权 + 写码权（写码收敛到叶子间接缝；
+    # 与 executor 同契约拥有独立 worktree）。
     "write_file",
     "bind_skill", "unbind_skill",
     "create_task", "dispatch_task", "review_task",

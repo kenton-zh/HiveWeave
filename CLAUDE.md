@@ -173,7 +173,7 @@ FastAPI + uvicorn,运行在端口 4000。核心模块:
 
 权限矩阵（`services/policy.py`，按 role family 授予 Capability，硬门在 `hard_check`）:
 - **CEO** (`role=ceo`，`infer_role_family` 优先于 permission_type): 行政五权 `DISPATCH`/`REVIEW`/`MERGE`（升级兜底）/`SOURCE_READ`/`MANAGE_ORG` + **`DOC_WRITE`**（任意文档；`classify_write_kind` 硬拒源码/配置）+ **`BROWSE`**（看产品）。可对**单条**任务 `waive_attestation` 关闸（可不附 evidence；因此可以不招测试）；禁止一次关掉所有任务。browse 本身不关闸。**无 SOURCE_WRITE/bash/test/staffing**。终验对用户走 `message_user`（在 `CEO_TOOLS` 表内）。派工硬门：create/dispatch 的 assignee 只能是**直属中层**（`validate_ceo_dispatch_target`）
-- **Coordinator / 中层 (player-coach)**: 协调权 + `SOURCE_WRITE`/`BASH_SHELL`/`TEST_RUN`/`BROWSE`——可自己搭骨架/写关键路径，有独立 worktree（同 executor 契约）；受限写白名单（`COORDINATOR_WRITE_PREFIXES`）仍适用于项目根
+- **Coordinator / 中层 (设计者+接缝工)**: 协调权 + `SOURCE_WRITE`/`BASH_SHELL`/`TEST_RUN`/`BROWSE`——职责 = 出设计/计划文档（CEO 鞭策 ≤2 轮定稿，定稿前不招人不派活）+ 叶子间接缝（时机自定）；写码收敛到接缝，模块实现派叶子（solo 单兵例外）；有独立 worktree（同 executor 契约）；受限写白名单（`COORDINATOR_WRITE_PREFIXES`）仍适用于项目根
 - **Executor**: 可读写代码,运行测试,不能 spawn 下级
 - **QA** (`test_engineer`/`qa_engineer`): 含 SOURCE_WRITE（缺它 write_file 会被硬门死 —— Echo 事故）
 - **HR**: 同受限写白名单，无源码写
@@ -234,7 +234,7 @@ MCP 集成在 `apps/hiveweave-py/src/hiveweave/services/mcp.py`。
 ### Agent 类型与组织
 
 - **CEO** (root): 行政与里程碑终审——定组织、审中层里程碑、终验对用户（`message_user`）。不写业务代码、不日常直派叶子（硬门）。
-- **Coordinator / 中层** (架构师/经理, player-coach): 拆派审 + 自己搭骨架/写关键路径（有独立 worktree）；hire/dismiss/transfer agent。自交任务 wake 上级而非自己。
+- **Coordinator / 中层** (架构师/经理, 设计者+接缝工): 拆派审 + 出设计文档（CEO 鞭策定稿）+ 叶子间接缝（有独立 worktree）；hire/dismiss/transfer agent。自交任务 wake 上级而非自己。
 - **Executor** (叶子 Agent): 可读写代码,运行测试,写工作日志。不能 spawn 下级。
 
 CEO (root) 和 HR (CEO 下级) 在项目创建时自动创建。HR 负责招聘 expert agents。HR 根据角色匹配表绑定纪律技能（MANDATORY），搜索 skills.sh 绑定工具技能。hire 时 permission_mode 按 family 选定（builder coordinator/executor 可写，CEO/HR readonly）。
