@@ -108,10 +108,14 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
   const counterpartIds = useMemo(() => {
     const ids = new Set<string>();
     for (const msg of teamMessages) {
-      if (msg.teamFromAgentId) ids.add(msg.teamFromAgentId);
-      if (msg.teamToAgentId) ids.add(msg.teamToAgentId);
+      // "system" 是虚拟系统通知源（见 resolveAgentInfo），非真实 agent——
+      // 跳过它，避免对 /api/org/agents/system 发起无效请求（404 循环轰炸）。
+      if (msg.teamFromAgentId && msg.teamFromAgentId !== "system")
+        ids.add(msg.teamFromAgentId);
+      if (msg.teamToAgentId && msg.teamToAgentId !== "system")
+        ids.add(msg.teamToAgentId);
       const targetId = getDirectedAgentId(msg, agentInfo?.parentId);
-      if (targetId) ids.add(targetId);
+      if (targetId && targetId !== "system") ids.add(targetId);
     }
     return ids;
   }, [teamMessages, agentInfo]);
