@@ -48,6 +48,16 @@ _PORT_ENV_RE = re.compile(
     r"(?:PORT|VITE_PORT)\s*=\s*(\d{2,5})",
     re.IGNORECASE,
 )
+# python -m http.server [flags] <port>：位置参数端口（http.server 无 --port
+# 旗标；argparse 允许 --cgi/-b/--bind/-d/--directory/-p/--protocol 等旗标
+# 出现在位置端口之前，须按 arity 跳过再取端口）
+_HTTP_SERVER_POS_PORT_RE = re.compile(
+    r"\bhttp\.server\s+"
+    r"(?:(?:--cgi|--bind\s+\S+|--directory\s+\S+|--protocol\s+\S+"
+    r"|-[bdp]\s+\S+)\s+)*"
+    r"(\d{2,5})\b",
+    re.IGNORECASE,
+)
 # gunicorn --bind 0.0.0.0:3000 / -b :3000 / --bind 8000
 _GUNICORN_BIND_PORT_RE = re.compile(
     r"(?:--bind|-b)[= ]\s*(?:(?:\[[^\]]+\]|[\w.-]+):|:)?(\d{2,5})\b",
@@ -580,6 +590,8 @@ def extract_ports_from_command(command: str) -> list[int]:
     for m in _PORT_FLAG_RE.finditer(command or ""):
         ports.append(int(m.group(1)))
     for m in _PORT_ENV_RE.finditer(command or ""):
+        ports.append(int(m.group(1)))
+    for m in _HTTP_SERVER_POS_PORT_RE.finditer(command or ""):
         ports.append(int(m.group(1)))
     if re.search(r"\bgunicorn\b", command or "", re.IGNORECASE):
         for m in _GUNICORN_BIND_PORT_RE.finditer(command or ""):

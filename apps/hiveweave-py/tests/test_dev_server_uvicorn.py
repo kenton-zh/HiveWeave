@@ -304,6 +304,72 @@ def test_prepare_spawn_keeps_explicit_gunicorn_bind():
     assert "--port" not in cmd
 
 
+def test_detect_http_server():
+    """DSH-18 事故回归：`python -m http.server 8787` 曾绕过触发正则 →
+    bg-bash offturn job → 对永不结束的进程挂 waiting_on 契约 → 死等。
+    现在必须识别为长驻服务并提取位置参数端口。"""
+    assert _detect_dev_server_command("python -m http.server 8787") == 8787
+    assert _detect_dev_server_command("python -m http.server") == 0
+    assert _detect_dev_server_command("python3 -m http.server 8000") == 8000
+    assert _detect_dev_server_command("python -m http.server 8787 &") == 8787
+    assert _detect_dev_server_command("uv run python -m http.server 9000") == 9000
+    assert _detect_dev_server_command("python -m http.server 5173") == 5173
+    # Windows py 启动器 / 版本号后缀写法
+    assert _detect_dev_server_command("py -m http.server 8787") == 8787
+    assert _detect_dev_server_command("python3.11 -m http.server 8787") == 8787
+    # 旗标前置的位置端口
+    assert _detect_dev_server_command(
+        "python -m http.server --directory pub 8787"
+    ) == 8787
+    assert _detect_dev_server_command("python -m http.server -b 127.0.0.1 8787") == 8787
+    # --help 立即退出，不是长驻服务
+    assert _detect_dev_server_command("python -m http.server --help") is None
+    assert _detect_dev_server_command("npx serve --help") is None
+
+
+def test_detect_http_server_non_server():
+    assert _detect_dev_server_command("pip install http.server") is None
+    assert _detect_dev_server_command("pytest tests/http_server_test.py") is None
+    assert _detect_dev_server_command("cat http.server.log") is None
+
+
+def test_detect_npx_static_servers():
+    assert _detect_dev_server_command("npx serve") is not None
+    assert _detect_dev_server_command("npx serve dist") is not None
+    assert _detect_dev_server_command("npx -y serve") is not None
+    assert _detect_dev_server_command("npx http-server -p 8080") == 8080
+    assert _detect_dev_server_command("npx live-server") is not None
+    assert _detect_dev_server_command("npm run serve") is not None
+    assert _detect_dev_server_command("pnpm run serve") is not None
+    assert _detect_dev_server_command("npx serve-handler") is None
+
+
+def test_extract_http_server_positional_port():
+    from hiveweave.services.process_registry import (
+        check_command_reserved_ports,
+        extract_ports_from_command,
+    )
+
+    assert extract_ports_from_command("python -m http.server 8787") == [8787]
+    assert extract_ports_from_command("python -m http.server") == []
+    # 旗标前置的位置端口也要提取（argparse 允许 -b/-d/--cgi 在端口前）
+    assert extract_ports_from_command(
+        "python -m http.server --directory pub 8787"
+    ) == [8787]
+    assert extract_ports_from_command(
+        "python -m http.server -b 127.0.0.1 9000"
+    ) == [9000]
+    # 位置参数指定的保留端口必须被拦下（与 --port 5173 同罪）
+    assert check_command_reserved_ports("python -m http.server 5173")
+    assert check_command_reserved_ports("python -m http.server --cgi 5173")
+    assert check_command_reserved_ports("python -m http.server 8787") is None
+
+
+def test_http_server_trailing_amp_routes_to_dev_server():
+    # 前台 `cmd &`：识别为长驻服务 → 不走 offturn job（禁止 shell 脱管）
+    assert _should_offturn_trailing_amp("python -m http.server 8787 &") is False
+
+
 def test_prepare_spawn_gunicorn_reserved_bind_rejected():
     clear_registry_for_tests()
     _cmd, _env, err = prepare_spawn_command(

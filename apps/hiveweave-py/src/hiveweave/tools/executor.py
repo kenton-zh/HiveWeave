@@ -79,7 +79,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout "
             "until done, `job_kill`, or project stop. Do not use "
             "`background=true` for `vite` / `npm run dev` / `uvicorn` / "
-            "`python -m app.server`. Long-running servers are auto-registered "
+            "`python -m app.server` / `http.server` / `npx serve` — "
+            "long-running servers never finish, so waiting_on would never "
+            "fire. They are auto-registered "
             "(tracked, killable via `stop_dev_server`); prefer "
             "`start_dev_server`. Do not append `&` on a foreground "
             "command. Default false keeps stdout in this turn. "
@@ -101,7 +103,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "Run off the org turn and return a job id immediately. "
                     "No timeout. Then commit_turn(waiting) with waiting_on; "
                     "woken with [BASH DONE]/[BASH FAILED]. Stop with "
-                    "job_kill. Default false."
+                    "job_kill. Default false. Do not use for vite / "
+                    "npm run dev / uvicorn / http.server — servers never "
+                    "finish (waiting_on would never fire)."
                 ),
             },
             "taskId": {

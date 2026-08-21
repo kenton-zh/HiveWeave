@@ -64,7 +64,9 @@ _DEV_SERVER_TRIGGER_RE = re.compile(
     r"(?:"
     r"(?:^|\s|;|&|\|)`?(?:"
     r"(?:npx\s+)?vite(?:\s|$)"               # vite / npx vite (bare = dev server)
-    r"|(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|start)(?:\s|$)"
+    r"|(?:pythonw?|python3(?:\.\d+)?|py)(?:\.exe)?\s+-m\s+http\.server(?:\s|$)"
+    r"|npx\s+(?:-y\s+)?(?:http-server|live-server|serve)(?:\s|$)"
+    r"|(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|start|serve)(?:\s|$)"
     r"|bun\s+(?:run\s+)?(?:dev|start)(?:\s|$)"
     r"|next\s+dev(?:\s|$)"
     r"|nuxt\s+dev(?:\s|$)"
@@ -108,6 +110,10 @@ _APP_SERVER_TOKEN_RE = re.compile(
 )
 _FLASK_TOKEN_RE = re.compile(r"\bflask\b", re.IGNORECASE)
 _GUNICORN_TOKEN_RE = re.compile(r"\bgunicorn\b", re.IGNORECASE)
+_STATIC_SERVER_TOKEN_RE = re.compile(
+    r"\b(?:http\.server|http-server|live-server|serve)\b",
+    re.IGNORECASE,
+)
 
 
 def _strip_trailing_ampersand(command: str) -> str:
@@ -153,12 +159,14 @@ def _detect_dev_server_command(command: str) -> int | None:
     # Disqualify blocking verbs (vite build, npm run build:test, …).
     if _BLOCKING_VERB_RE.search(cmd):
         return None
-    # uvicorn / flask / gunicorn / app.server --help 会立刻退出，不当成长驻服务。
+    # uvicorn / flask / gunicorn / app.server / 静态服务器 --help 会立刻
+    # 退出，不当成长驻服务。
     if (
         _UVICORN_TOKEN_RE.search(cmd)
         or _APP_SERVER_TOKEN_RE.search(cmd)
         or _FLASK_TOKEN_RE.search(cmd)
         or _GUNICORN_TOKEN_RE.search(cmd)
+        or _STATIC_SERVER_TOKEN_RE.search(cmd)
     ) and _UVICORN_HELP_RE.search(cmd):
         return None
     # Disqualify commands that pipe/redirect into a finite sink, e.g.
@@ -1261,9 +1269,9 @@ class BashParams(BaseModel):
 
     command: str = Field(
         description=(
-            "The bash command to execute. Long-running uvicorn/vite: prefer "
-            "start_dev_server (bash auto-registers them). Do not "
-            "`uvicorn … &` in the foreground."
+            "The bash command to execute. Long-running uvicorn/vite/"
+            "http.server: prefer start_dev_server (bash auto-registers "
+            "them). Do not `uvicorn … &` in the foreground."
         ),
         json_schema_extra={"aliases": ["cmd", "run"]},
     )
@@ -1286,7 +1294,8 @@ class BashParams(BaseModel):
             "No timeout. Then commit_turn(waiting) with waiting_on; "
             "do not poll. Woken with [BASH DONE]/[BASH FAILED]. "
             "Stop with job_kill. Default false keeps stdout in this turn. "
-            "Do not use for vite / npm run dev / uvicorn."
+            "Do not use for vite / npm run dev / uvicorn / http.server — "
+            "servers never finish (waiting_on would never fire)."
         ),
         json_schema_extra={"aliases": ["bg"]},
     )
@@ -2032,7 +2041,8 @@ async def _bash_background(
     "commit_turn(waiting); woken with [BASH DONE] / [BASH FAILED]. "
     "Stop with job_kill. Not PowerShell; prefer Git Bash, tail -n N, "
     "uv run python. Do not background=true for vite / npm run dev / "
-    "uvicorn — prefer start_dev_server. Do not append & on a foreground "
+    "uvicorn / http.server — servers never finish, so waiting_on never "
+    "fires; prefer start_dev_server. Do not append & on a foreground "
     "command.",
     requires_workspace=True,
     security_level="shell",
