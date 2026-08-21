@@ -347,7 +347,7 @@ def _guard_sibling_offturn_waits(agent_id: str, latch_opts: dict) -> None:
         latch_opts["clear_waits"] = False
 
 
-async def trigger_subordinate(agent_id: str) -> None:
+async def trigger_subordinate(agent_id: str, *, force: bool = False) -> None:
     """触发下属 executor 处理待处理内容。
 
     在 dispatch_task 或 rework 请求后调用。
@@ -355,23 +355,26 @@ async def trigger_subordinate(agent_id: str) -> None:
 
     对齐 Elixir agent.ex:157 trigger_subordinate/1。
     """
-    await _do_trigger(agent_id, "subordinate")
+    await _do_trigger(agent_id, "subordinate", force=force)
 
 
-async def trigger_coordinator(agent_id: str) -> None:
+async def trigger_coordinator(agent_id: str, *, force: bool = False) -> None:
     """触发 coordinator 处理待处理 inbox 消息。
 
     仅当 coordinator 有未读消息时才执行（避免浪费 token）。
+    ``force=True`` 穿透未读守卫——看门狗穿透唤醒用（欠债必醒：
+    inbox 全读但 ledger 有 creator/reviewer 义务或未解除回复契约）。
 
     对齐 Elixir agent.ex:168 trigger_coordinator/1。
     """
-    await _do_trigger(agent_id, "coordinator")
+    await _do_trigger(agent_id, "coordinator", force=force)
 
 
 # ── 内部实现 ────────────────────────────────────────────────
 
 
-async def _do_trigger(agent_id: str, trigger_type: str) -> None:
+async def _do_trigger(agent_id: str, trigger_type: str, *,
+                      force: bool = False) -> None:
     """触发 agent 的内部实现。
 
     流程（对齐 Elixir agent.ex:177 do_trigger/2）：
@@ -416,7 +419,8 @@ async def _do_trigger(agent_id: str, trigger_type: str) -> None:
         # 4. coordinator：检查是否有 pending inbox 消息
         # Also proceed when undelivered background holds task-gate notices
         # (historical wake=0 TASK SUBMITTED / REWORK — TEST3 Phase C starve).
-        if trigger_type == "coordinator":
+        # force=True 穿透守卫（看门狗穿透唤醒：欠债必醒，inbox 全读也醒）。
+        if trigger_type == "coordinator" and not force:
             from hiveweave.services.inbox import (
                 filter_actionable_pending,
                 is_fyi_task_event,
@@ -855,12 +859,28 @@ async def build_trigger_context(
             and not pending_handoffs
             and not accepted_handoffs
         ):
-            log.info(
-                "trigger_complete_skip_background_only",
-                agent_id=agent_id,
-                background=len(background_msgs),
-            )
-            return None
+            # creator/reviewer 待审（submitted/reviewing）及 creator 待
+            # merge（approved = CREATOR_MUST_MERGE）义务都构成唤醒理由
+            # （与看门狗穿透口径一致——欠债必醒）；查询失败 fail-open 不跳过
+            try:
+                from hiveweave.services.task import TaskService
+
+                _obs = await TaskService().get_actionable_obligations(
+                    project_id, agent_id, promote=False)
+                _ledger_duty = any(
+                    o.get("role_hint") in ("reviewer", "creator")
+                    and o.get("status") in ("submitted", "reviewing", "approved")
+                    for o in _obs
+                )
+            except Exception:
+                _ledger_duty = True
+            if not _ledger_duty:
+                log.info(
+                    "trigger_complete_skip_background_only",
+                    agent_id=agent_id,
+                    background=len(background_msgs),
+                )
+                return None
 
     pending_for_ack = list(inbox_messages)
     inbox_messages = _merge_outstanding_digest_asks(
@@ -1018,6 +1038,55 @@ async def build_trigger_context(
 
     # ── 4. Coordinator 专属 blocks ──
     if trigger_type == "coordinator":
+        # 4a. Pending Review — creator/reviewer 名下待审任务（ledger 义务）。
+        # 穿透唤醒的行动指引：inbox 可能全读（ghost ask 已 ACK、
+        # [TASK SUBMITTED] 被 triage 扫掉），义务只在 ledger 里——没有
+        # 这个块，被穿透唤醒的 coordinator 醒来无事可做，会再次
+        # commit_turn(waiting) 进入循环。审完任务状态离开 submitted，
+        # 块自动消失。
+        try:
+            from hiveweave.services.task import TaskService
+
+            obs = await TaskService().get_actionable_obligations(
+                project_id, agent_id, promote=False)
+        except Exception as e:
+            log.debug("trigger_review_obligations_failed",
+                      agent_id=agent_id, error=str(e))
+            obs = []
+        review_pending = [
+            o for o in obs
+            if o.get("role_hint") in ("reviewer", "creator")
+            and o.get("status") in ("submitted", "reviewing", "approved")
+        ]
+        if review_pending:
+            import json as _json
+            lines = []
+            has_merge = False
+            for o in review_pending[:10]:
+                status = o.get("status")
+                if status == "approved":
+                    has_merge = True
+                lines.append(_json.dumps({
+                    "task_id": str(o.get("id") or "")[:8],
+                    "title": (o.get("title") or "")[:60],
+                    "status": status,
+                    "you_are": o.get("role_hint"),
+                }, ensure_ascii=False))
+            guidance = (
+                "Use review_task(taskId, decision='approve'/'rework') to review."
+            )
+            if has_merge:
+                # approved = CREATOR_MUST_MERGE：审已过、账未清，还差 merge
+                guidance += (
+                    "\napproved tasks await YOUR git_worktree_merge"
+                    " (CREATOR_MUST_MERGE) — merge them to clear the ledger."
+                )
+            blocks.append(
+                "## Pending Review — 名下任务待办（ledger 义务，与 inbox 读态无关）\n"
+                + guidance + "\n"
+                + "\n".join(lines)
+            )
+
         # 4. Report Required
         if unreported:
             blocks.append(

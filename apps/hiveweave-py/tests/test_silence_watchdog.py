@@ -50,7 +50,14 @@ async def env():
     """真实 per-project DB（temp workspace）+ meta_db 路由 patch.
 
     清理时先弹出并关闭缓存连接再删临时目录（Windows 文件占用）。
+    - task_mod._migrated 键控 project_id：同 PROJECT_ID 跨 temp workspace
+      复用时必须 discard，否则新库 tasks 表跳过补列（due_at 等），
+      探针查询炸 schema（fail-open 穿透误唤醒）。
+    - project_db._agent_cache 预填：inbox 探针按 agent_id 路由 DB，
+      测试未注册 Meta DB，须直接映射到 temp workspace。
     """
+    from hiveweave.services import task as task_mod
+
     with tempfile.TemporaryDirectory() as tmpdir:
         workspace_path = str(Path(tmpdir).resolve())
 
@@ -58,6 +65,9 @@ async def env():
             return workspace_path if pid == PROJECT_ID else None
 
         wait_contract_module._migrated.discard(PROJECT_ID)
+        task_mod._migrated.discard(PROJECT_ID)
+        project_db._agent_cache[CEO_ID] = workspace_path
+        project_db._agent_cache[EXECUTOR_ID] = workspace_path
 
         with patch("hiveweave.db.meta.get_project_workspace",
                    fake_get_project_workspace):
@@ -65,6 +75,8 @@ async def env():
 
         async with project_db._ensure_lock:
             conn = project_db._cache.pop(workspace_path, None)
+            project_db._agent_cache.pop(CEO_ID, None)
+            project_db._agent_cache.pop(EXECUTOR_ID, None)
         if conn is not None:
             try:
                 await conn.close()
@@ -632,4 +644,173 @@ async def test_complete_ceo_exempt_when_no_pending_work(env, monkeypatch):
     assert mock_trigger_coord.await_count == 0
     assert mock_trigger_sub.await_count == 0
     assert _health_events(mock_bus) == []
-    assert mock_inbox.await_count == 0
+
+
+# ── wait 豁免穿透（resubmit 唤醒丢失事故回归）─────────────────
+
+
+async def _insert_inbox_ask(env, from_id, to_id, *, read=1,
+                            reply_contract_id=None):
+    """raw INSERT 一条 expect_report ask（先触发 _ensure_schema 补列）.
+
+    read 默认 1：ghost ask 场景 —— 已读但契约未解除。
+    """
+    from hiveweave.services.inbox import InboxService
+
+    await InboxService().get_pending_messages(to_id)
+    conn = await ensure_project_db(env["workspace_path"])
+    await conn.execute(
+        "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, read, "
+        "created_at, message_type, expect_report, wake, reply_contract_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'ask', 1, 1, ?)",
+        [str(uuid.uuid4()), from_id, to_id, "请回复此 ask", read,
+         _now_ms() - 30 * 60 * 1000,
+         reply_contract_id or str(uuid.uuid4())])
+    await conn.commit()
+
+
+async def _insert_inbox_reply(env, from_id, to_id, reply_to):
+    """插一条 reply 行闭合契约（reply_to 指向原 ask 的 contract id）."""
+    conn = await ensure_project_db(env["workspace_path"])
+    await conn.execute(
+        "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, read, "
+        "created_at, message_type, expect_report, wake, reply_to) "
+        "VALUES (?, ?, ?, ?, 1, ?, 'normal', 0, 0, ?)",
+        [str(uuid.uuid4()), from_id, to_id, "回复", _now_ms(), reply_to])
+    await conn.commit()
+
+
+def _trigger_mocks():
+    return (AsyncMock(), AsyncMock())
+
+
+def _triggered_ids(mock_coord, mock_sub, *, force: bool | None = None):
+    """收集被唤醒的 agent id；force 非 None 时只统计 force 匹配的调用."""
+    calls = list(mock_coord.await_args_list) + list(mock_sub.await_args_list)
+    ids = []
+    for c in calls:
+        if force is not None and c.kwargs.get("force", False) != force:
+            continue
+        ids.append(c.args[0])
+    return ids
+
+
+def _waiting_ceo_agent(aid):
+    """生产口径的 waiting agent mock：有效 disposition + config.role，
+    确保 CEO 走 trigger_coordinator（未读守卫）路径而非 subordinate."""
+    return SimpleNamespace(
+        disposition="waiting_agent",
+        config={"role": "ceo"},
+        project_id=PROJECT_ID,
+    )
+
+
+async def test_wait_exemption_penetrated_by_creator_submitted_task(
+        env, monkeypatch):
+    """事故核心回归：CEO waiting + live wait contract + 名下(creator)有
+    submitted 任务且 inbox 全读 → wait 豁免被义务穿透：沉默超阈值
+    红框 + 唤醒，且唤醒带 force=True 穿透 coordinator 未读守卫
+    （修复前：豁免短路，CEO 只能等 TTL）。"""
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent",
+        _waiting_ceo_agent)
+    old = _now_ms() - 40 * 60 * 1000
+    await _insert_agent(env, CEO_ID, "归零", role="ceo", created_at=old)
+    await _insert_wait(env, CEO_ID, expires_at=_now_ms() + 3600_000)
+    await _insert_task(env, status="submitted", creator_id=CEO_ID,
+                       assignee_id=EXECUTOR_ID)
+    _seed_state()
+
+    mock_coord, mock_sub = _trigger_mocks()
+    mock_bus = AsyncMock()
+    with _started_mock(1), \
+         patch("hiveweave.agents.trigger.trigger_coordinator", mock_coord), \
+         patch("hiveweave.agents.trigger.trigger_subordinate", mock_sub), \
+         patch.object(status_event_bus, "publish_stream_event", mock_bus), \
+         patch("hiveweave.services.inbox.InboxService.send_message",
+               AsyncMock()):
+        await GameTimeService()._check_silent_agents(PROJECT_ID)
+
+    errors = _health_events(mock_bus, "error")
+    assert len(errors) == 1
+    assert errors[0]["agentId"] == CEO_ID
+    # CEO（coordinator 路径）必须带 force=True 被穿透唤醒——
+    # force=False 会被未读守卫拦截，穿透修复形同虚设
+    assert CEO_ID in _triggered_ids(mock_coord, mock_sub, force=True)
+    assert any(c.args[0] == CEO_ID for c in mock_coord.await_args_list)
+
+
+async def test_wait_exemption_penetrated_by_ghost_ask(env, monkeypatch):
+    """ghost ask 穿透：waiting + live wait + 收到 expect_report ask 已读
+    未回复（契约未解除）→ 不豁免；补 reply 闭合契约后恢复豁免。"""
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent",
+        _waiting_ceo_agent)
+    old = _now_ms() - 40 * 60 * 1000
+    await _insert_agent(env, CEO_ID, "归零", role="ceo", created_at=old)
+    await _insert_agent(env, EXECUTOR_ID, "潮汐", parent_id=CEO_ID,
+                        created_at=old)
+    await _insert_wait(env, CEO_ID, expires_at=_now_ms() + 3600_000)
+    contract_id = str(uuid.uuid4())
+    await _insert_inbox_ask(env, EXECUTOR_ID, CEO_ID, read=1,
+                            reply_contract_id=contract_id)
+    _seed_state()
+
+    svc = GameTimeService()
+    mock_coord, mock_sub = _trigger_mocks()
+    mock_bus = AsyncMock()
+    with _started_mock(1), \
+         patch("hiveweave.agents.trigger.trigger_coordinator", mock_coord), \
+         patch("hiveweave.agents.trigger.trigger_subordinate", mock_sub), \
+         patch.object(status_event_bus, "publish_stream_event", mock_bus), \
+         patch("hiveweave.services.inbox.InboxService.send_message",
+               AsyncMock()):
+        # 第 1 轮：ghost ask（已读未回）→ 穿透 → 红框 + force 唤醒
+        await svc._check_silent_agents(PROJECT_ID)
+        assert len(_health_events(mock_bus, "error")) == 1
+        assert CEO_ID in _triggered_ids(mock_coord, mock_sub, force=True)
+
+        # 补 reply 闭合契约 → 第 2 轮：恢复 wait 豁免（无债不醒）
+        mock_bus.reset_mock()
+        mock_coord.reset_mock()
+        mock_sub.reset_mock()
+        await _insert_inbox_reply(env, CEO_ID, EXECUTOR_ID, contract_id)
+        await svc._check_silent_agents(PROJECT_ID)
+
+    assert _health_events(mock_bus, "error") == []
+    assert _triggered_ids(mock_coord, mock_sub) == []
+
+
+async def test_ghost_ask_counts_as_duty_even_when_read(env, monkeypatch):
+    """无 wait 场景的口径回归：inbox 全读但 ask 契约未解除 → 不算合法
+    idle，沉默超阈值照样红框唤醒（read ≠ replied）。"""
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent", lambda aid: None)
+    old = _now_ms() - 40 * 60 * 1000
+    await _insert_agent(env, CEO_ID, "归零", role="ceo", created_at=old)
+    await _insert_agent(env, EXECUTOR_ID, "潮汐", parent_id=CEO_ID,
+                        created_at=old)
+    await _insert_inbox_ask(env, EXECUTOR_ID, CEO_ID, read=1)
+    _seed_state()
+
+    mock_coord, mock_sub = _trigger_mocks()
+    mock_bus = AsyncMock()
+    with _started_mock(1), \
+         patch("hiveweave.agents.trigger.trigger_coordinator", mock_coord), \
+         patch("hiveweave.agents.trigger.trigger_subordinate", mock_sub), \
+         patch.object(status_event_bus, "publish_stream_event", mock_bus), \
+         patch("hiveweave.services.inbox.InboxService.send_message",
+               AsyncMock()):
+        await GameTimeService()._check_silent_agents(PROJECT_ID)
+
+    errors = _health_events(mock_bus, "error")
+    assert len(errors) == 1
+    assert errors[0]["agentId"] == CEO_ID
+    # 沉默唤醒统一带 force=True（无 wait 场景同一调用点）
+    assert CEO_ID in _triggered_ids(mock_coord, mock_sub, force=True)

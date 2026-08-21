@@ -269,7 +269,8 @@ class GameTimeService:
         self._project_id = project_id
 
     async def _watchdog_trigger(
-        self, agent_id: str, *, role: str | None = None, force: bool = False
+        self, agent_id: str, *, role: str | None = None, force: bool = False,
+        penetrate: bool = False,
     ) -> None:
         """Wake an agent after a watchdog nudge.
 
@@ -277,6 +278,8 @@ class GameTimeService:
         unless ``force=True`` (e.g. TEST14 ask-outstanding re-nudge).
         Uses ``trigger_coordinator`` for coordinator roles so empty-pending
         backgrounds do not start an LLM turn.
+        ``penetrate=True`` 透传 force 给 trigger——穿透 coordinator 未读
+        守卫（看门狗穿透唤醒：inbox 全读但 ledger 有债也醒）。
         """
         from hiveweave.agents.supervisor import agent_manager
         from hiveweave.agents.trigger import (
@@ -307,9 +310,9 @@ class GameTimeService:
         if r is None and inst is not None:
             r = (getattr(inst, "config", None) or {}).get("role", "")
         if is_coordinator(r or ""):
-            await trigger_coordinator(agent_id)
+            await trigger_coordinator(agent_id, force=penetrate)
         else:
-            await trigger_subordinate(agent_id)
+            await trigger_subordinate(agent_id, force=penetrate)
 
     async def get_current_time(self, project_id: str) -> dict:
         state = _states.get(project_id) or await self._load_state(project_id)
@@ -1750,9 +1753,11 @@ class GameTimeService:
 
         豁免（复用既有判断）：processing 中（P0-3：streaming 僵尸除外——
         PROCESSING 但流式超时无事件者不豁免，纳入沉默检测）/ waiting_*、
-        blocked disposition 且有未过期 wait contract / 项目 is_started=0 /
+        blocked disposition 且有未过期 wait contract（**可被义务穿透**：
+        有 ledger 义务或未解除回复契约者不豁免——kind=task wait 不被
+        下属 submit 清除，穿透保证 creator 欠审必醒）/ 项目 is_started=0 /
         系统 paused / **无义务的合法 idle**（TEST21 M7：无 actionable
-        obligations、无入站 unreplied ask、无 wait、或 idle_acknowledged）。
+        obligations、无未解除 ask 契约、无 wait、或 idle_acknowledged）。
         """
         state = _states.get(project_id)
         if not state:
@@ -1850,6 +1855,10 @@ class GameTimeService:
 
         task_svc = TaskService()
 
+        # wait 豁免穿透探针缓存（有 live wait 且有债的 agent 落入检测时，
+        # 复用探针结果避免下方重复查 obligations）
+        duty_probes: dict[str, dict] = {}
+
         for a in agents:
             aid = a["id"]
             if aid in processing_ids:
@@ -1873,7 +1882,36 @@ class GameTimeService:
                 inst = agent_manager.get_agent(aid)
                 disp = getattr(inst, "disposition", None) if inst else None
                 if disp is None or disp in _WAITING_DISPOSITIONS:
-                    continue
+                    # BUG(resubmit 唤醒丢失): kind=task wait 不被下属 submit 清除
+                    # （event_matches_waits 只认 message/ask_reply/command 事件）。
+                    # creator 挂 waiting 后下属 resubmit → wait 豁免 + inbox 全读
+                    # → 永久沉默到 TTL。穿透：有未履约义务（ledger 义务 / 未解除
+                    # 回复契约）者不豁免，落入沉默检测兜底唤醒（欠债必醒，还债即清）。
+                    probe = await self._open_duty_probe(
+                        project_id, aid, task_svc)
+                    if not probe["has_duty"]:
+                        # 还债后恢复豁免——若此前穿透举过红框，广播 ok
+                        # 解除（kind=task wait 不被审阅动作清除，红框不能
+                        # 挂到 TTL）
+                        prev = trackers.get(aid) or {}
+                        if prev.get("flagged"):
+                            prev["flagged"] = False
+                            trackers[aid] = prev
+                            try:
+                                await status_event_bus.publish_stream_event(aid, {
+                                    "type": "agent_health",
+                                    "agentId": aid,
+                                    "projectId": project_id,
+                                    "health": "ok",
+                                    "message": "",
+                                    "at": now_ms,
+                                })
+                            except Exception:
+                                pass
+                            log.info("silence_recovered",
+                                     project_id=project_id, agent_id=aid)
+                        continue
+                    duty_probes[aid] = probe
             else:
                 # No active wait contracts — check project completeness before skipping complete
                 inst = agent_manager.get_agent(aid)
@@ -1906,23 +1944,29 @@ class GameTimeService:
                 trackers[aid] = tracker
                 continue
             try:
-                obligations = await task_svc.get_actionable_obligations(
-                    project_id, aid
-                )
+                if aid in duty_probes:
+                    obligations = duty_probes[aid]["obligations"]
+                else:
+                    obligations = await task_svc.get_actionable_obligations(
+                        project_id, aid
+                    )
             except Exception:
                 obligations = []
+            # 契约口径（TEST14 P1a 同源）：ask 未解除 = reply_contract_id 无
+            # 对应 reply_to。read=1 但未回复（ghost ask）同样算欠债——
+            # read ≠ replied，读遍不回不能清义务。
             inbound_ask = False
-            try:
-                ask_rows = await _query(
-                    project_id,
-                    "SELECT COUNT(*) AS c FROM inbox "
-                    "WHERE to_agent_id = ? AND expect_report = 1 "
-                    "AND COALESCE(read, 0) = 0",
-                    [aid],
-                )
-                inbound_ask = bool(ask_rows and int(ask_rows[0]["c"] or 0) > 0)
-            except Exception:
-                inbound_ask = False
+            if aid in duty_probes:
+                inbound_ask = bool(duty_probes[aid]["ask_senders"])
+            else:
+                try:
+                    from hiveweave.services.inbox import InboxService
+
+                    inbound_ask = bool(
+                        await InboxService().get_outstanding_ask_senders(aid)
+                    )
+                except Exception:
+                    inbound_ask = False
             if not obligations and not inbound_ask and not waits:
                 if tracker["flagged"]:
                     tracker["flagged"] = False
@@ -1988,7 +2032,12 @@ class GameTimeService:
                     log.warning("silence_health_broadcast_failed",
                                 agent_id=aid, error=str(e))
                 try:
-                    await self._watchdog_trigger(aid)
+                    # penetrate=True：沉默穿透唤醒不发 inbox 消息，必须
+                    # 穿透 coordinator 未读守卫，否则 inbox 全读时唤醒
+                    # 静默失效（CEO resubmit 事故的根因之一）。
+                    # 756/822/859 的调用点先发了 urgent inbox（未读守卫
+                    # 自然通过），不需要穿透。
+                    await self._watchdog_trigger(aid, penetrate=True)
                 except Exception as e:
                     log.error("silence_wake_failed",
                               agent_id=aid, error=str(e))
@@ -2012,6 +2061,57 @@ class GameTimeService:
                 )
 
             trackers[aid] = tracker
+
+    async def _open_duty_probe(
+        self, project_id: str, agent_id: str, task_svc: "TaskService"
+    ) -> dict:
+        """wait 豁免穿透探针：该 agent 是否有未履约义务。
+
+        口径与 turn-exit 履约门同源：
+        - ledger 义务（get_actionable_obligations：assignee/reviewer/creator，
+          含 creator+submitted —— 下属 resubmit 后 creator 必须审）
+        - 未解除回复契约（outstanding ask contracts，含 read=1 —— read≠replied）
+
+        返回 ``{"has_duty", "obligations", "ask_senders"}``；
+        fail-open：查询异常按有债处理（宁可多醒，不可漏醒）。
+        """
+        probe: dict = {
+            "has_duty": False,
+            "obligations": [],
+            "ask_senders": set(),
+        }
+        try:
+            probe["obligations"] = (
+                await task_svc.get_actionable_obligations(
+                    project_id, agent_id, promote=False)
+                or []
+            )
+        except Exception as e:
+            log.warning(
+                "wait_penetration_obligations_failed",
+                project_id=project_id, agent_id=agent_id, error=str(e),
+            )
+            probe["has_duty"] = True
+            return probe
+        if probe["obligations"]:
+            probe["has_duty"] = True
+            return probe
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            probe["ask_senders"] = (
+                await InboxService().get_outstanding_ask_senders(agent_id)
+                or set()
+            )
+        except Exception as e:
+            log.warning(
+                "wait_penetration_asks_failed",
+                project_id=project_id, agent_id=agent_id, error=str(e),
+            )
+            probe["has_duty"] = True
+            return probe
+        probe["has_duty"] = bool(probe["ask_senders"])
+        return probe
 
     async def _project_has_pending_work(self, project_id: str) -> bool:
         """检查项目是否有未推进的工作（complete 态协调者的豁免判断）。

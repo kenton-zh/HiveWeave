@@ -440,7 +440,7 @@ async def test_watchdog_force_wakes_complete_agent():
     ), patch(
         "hiveweave.agents.trigger.trigger_subordinate",
         new_callable=AsyncMock,
-        side_effect=lambda aid: calls.append(aid),
+        side_effect=lambda aid, force=False: calls.append(aid),
     ):
         await gt._watchdog_trigger("debtor-1")  # skipped
         assert calls == []

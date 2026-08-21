@@ -23,7 +23,7 @@ class ObligationsMixin:
         _is_verify_task: Any
 
     async def get_actionable_obligations(
-        self, project_id: str, agent_id: str
+        self, project_id: str, agent_id: str, *, promote: bool = True
     ) -> list[dict]:
         """Tasks this agent must act on now (open-task reminder / stall helpers).
 
@@ -38,17 +38,21 @@ class ObligationsMixin:
           VERIFY children never stay as creator merge obligations.
         Excludes blocked / closed / archived.
         Each dict includes role_hint: 'assignee' | 'reviewer' | 'creator'.
+
+        ``promote=False``：跳过 promote_assigned_created 自愈写（只读口径，
+        供看门狗探针等观测热路径复用，避免与业务写入竞争写锁）。
         """
         await _ensure_schema(project_id)
         # Heal legacy assign-without-claim rows so obligations stay consistent
-        try:
-            await self.promote_assigned_created(project_id, agent_id)
-        except Exception as e:
-            log.warning(
-                "promote_assigned_created_on_obligations_failed",
-                agent_id=agent_id,
-                error=str(e),
-            )
+        if promote:
+            try:
+                await self.promote_assigned_created(project_id, agent_id)
+            except Exception as e:
+                log.warning(
+                    "promote_assigned_created_on_obligations_failed",
+                    agent_id=agent_id,
+                    error=str(e),
+                )
         rows = await _query(
             project_id,
             f"SELECT {self._COLUMNS} FROM tasks WHERE is_archived = 0 AND ("

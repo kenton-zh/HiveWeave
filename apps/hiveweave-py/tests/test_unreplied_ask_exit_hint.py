@@ -316,9 +316,85 @@ async def test_trigger_complete_skips_without_ghost_ask(monkeypatch):
         "get_outstanding_ask_messages",
         empty,
     )
+    # complete-skip 的 ledger 义务检查（无债才跳过）——不 mock 会真实
+    # 查 workspace → fail-open 不跳过 → 后续 handoff 调用炸 DB
+    monkeypatch.setattr(
+        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        empty,
+    )
 
     result = await trigger_module.build_trigger_context(
         {"id": "agent-1", "project_id": "p1", "name": "Me"},
         "subordinate",
     )
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_trigger_complete_wakes_for_creator_approved_task(monkeypatch):
+    """complete + creator/approved（CREATOR_MUST_MERGE）→ 不走 complete-skip，
+    Pending Review 块给 git_worktree_merge 指引（欠债必醒，醒来有事做）。"""
+    from types import SimpleNamespace
+
+    async def empty(*_a, **_k):
+        return []
+
+    async def approved_obligations(*_a, **_k):
+        return [{
+            "id": "task-uuid-1234",
+            "title": "实现登录模块",
+            "status": "approved",
+            "role_hint": "creator",
+        }]
+
+    class _Mgr:
+        def get_agent(self, _aid):
+            return SimpleNamespace(disposition="complete")
+
+    monkeypatch.setattr(trigger_module, "_get_agent_manager", lambda: _Mgr())
+    monkeypatch.setattr(
+        trigger_module._handoff_service, "get_pending_handoffs", empty
+    )
+    monkeypatch.setattr(
+        trigger_module._handoff_service, "get_accepted_handoffs", empty
+    )
+    monkeypatch.setattr(
+        trigger_module._handoff_service,
+        "get_unreported_accepted_handoffs",
+        empty,
+    )
+    monkeypatch.setattr(
+        trigger_module._handoff_service, "mark_delivered", empty
+    )
+    monkeypatch.setattr(
+        trigger_module._inbox_service, "get_pending_messages", empty
+    )
+    monkeypatch.setattr(
+        trigger_module._inbox_service, "get_undelivered_background", empty
+    )
+    monkeypatch.setattr(
+        trigger_module._inbox_service,
+        "get_outstanding_ask_messages",
+        empty,
+    )
+    monkeypatch.setattr(
+        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        approved_obligations,
+    )
+
+    with patch(
+        "hiveweave.services.charter.charter_service.goals_dirty",
+        return_value=False,
+    ):
+        result = await trigger_module.build_trigger_context(
+            {"id": "agent-1", "project_id": "p1", "name": "Me"},
+            "coordinator",
+        )
+    assert result is not None
+    context = result[0]
+    # complete-skip 被穿透：context 非空，含 Pending Review 块
+    assert "Pending Review" in context
+    # approved 的行动指引是 merge，不是只 review
+    assert "CREATOR_MUST_MERGE" in context
+    assert "git_worktree_merge" in context
+    assert "task-uuid-1234"[:8] in context
