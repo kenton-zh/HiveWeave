@@ -614,6 +614,12 @@ def _browse_child_env(agent_id: str | None = None) -> dict[str, str]:
     if agent_id:
         env["AGENT_BROWSER_SESSION"] = f"hiveweave-{agent_id[:40]}"
         env.setdefault("AGENT_BROWSER_IDLE_TIMEOUT_MS", str(2 * 60 * 60 * 1000))
+    # 默认禁缓存：agent-browser 用 AGENT_BROWSER_ARGS 提供全局 Chromium 启动
+    # 参数（README: `--args` 的 env 对应）。关闭 HTTP/disk 缓存免去调试时反复
+    # 手动 ?cb=/?v= 整页重载绕过旧页面；调用方显式设 AGENT_BROWSER_ARGS 覆盖它。
+    env.setdefault(
+        "AGENT_BROWSER_ARGS", "--disable-http-cache,--disk-cache-size=1"
+    )
     # 代理剥离：dev 机后端常带 HTTP(S)_PROXY 启动，agent-browser 会自动读它。
     # browse 的目标是本机前端 dev server（localhost/127.0.0.1），本就不该走
     # LLM 用的远程代理；且该代理不稳，导航常挂死到超时 → 回收 → 重试仍挂
