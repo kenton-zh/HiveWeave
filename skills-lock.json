@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": {
+    "byted-ark-seedream-skill": {
+      "source": "skills.volces.com",
+      "sourceUrl": "https://skills.volces.com/skills/volcengine/agentplan",
+      "sourceType": "well-known",
+      "computedHash": "4a150ace8b7d8ffa28e7fab87ec0398e5dff72221a032ee41a3013a617329798",
+      "wellKnownDigest": "sha256:7f35a0e55aba36471a3095877f49319a2d2ab7e9e17cafbce02a9d054ddc6c70"
+    }
+  }
+}
