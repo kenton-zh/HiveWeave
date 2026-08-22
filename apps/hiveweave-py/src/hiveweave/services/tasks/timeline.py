@@ -34,7 +34,11 @@ _BUSY_STATUSES = frozenset({"claimed", "running", "rework"})
 _WAITING_STATUSES = frozenset(
     {"blocked", "submitted", "reviewing", "approved", "verifying"}
 )
-_TERMINAL_STATUSES = frozenset({"closed", "cancelled"})
+# ADR-001 R1：终态判定收敛到唯一常量（原窄口径 {closed, cancelled} 吸收；
+# completed/done/cancelled 任务同样不该出现在活跃 assignment/开放线段里）
+from hiveweave.services.tasks.constants import TERMINAL_STATUSES
+
+_TERMINAL_STATUSES = TERMINAL_STATUSES
 
 # event_type → 中文标题（单一来源，前端直接渲染）
 _EVENT_TITLES: dict[str, str] = {

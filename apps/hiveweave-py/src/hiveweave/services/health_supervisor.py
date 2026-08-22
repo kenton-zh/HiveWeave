@@ -255,7 +255,32 @@ class HealthSupervisor:
             inst = None
         disp = getattr(inst, "disposition", None) if inst else None
         if disp == "complete":
-            return True
+            # ADR-001 §2：与 game_time silent watchdog 同构——complete 豁免
+            # 只信闭式 has_open_work；项目根（无 parent）组合项目级
+            # "无人推进"判定。查询异常 fail-closed（不豁免，纳入检测）。
+            try:
+                from hiveweave.services.task import TaskService
+
+                busy = await TaskService().has_open_work(
+                    project_id, agent_id
+                )
+                if not busy:
+                    parent_id = (getattr(inst, "config", None) or {}).get(
+                        "parent_id"
+                    )
+                    if not parent_id:
+                        from hiveweave.services.game_time import (
+                            GameTimeService,
+                        )
+
+                        busy = await GameTimeService(
+                            project_id
+                        ).project_has_unresolved_work(project_id)
+            except Exception:
+                busy = True
+            if not busy:
+                return True
+            return False
 
         waits: list[dict] = []
         try:
@@ -346,10 +371,14 @@ class HealthSupervisor:
 
             agent = await OrgService().get_agent(agent_id)
             role = (agent or {}).get("role") or ""
+            # ADR-001 R2a：force=True——走到这里的 agent 已通过
+            # _should_skip_agent 的 has_open_work 检查（complete+busy），
+            # 不带 force 会在 _watchdog_trigger/trigger complete-skip
+            # 出口被再次吞掉（第二入口与 game_time 同构）。
             if is_coordinator(role):
-                await trigger_coordinator(agent_id)
+                await trigger_coordinator(agent_id, force=True)
             else:
-                await trigger_subordinate(agent_id)
+                await trigger_subordinate(agent_id, force=True)
             log.info(
                 "health_supervisor_woke_agent",
                 agent_id=agent_id,

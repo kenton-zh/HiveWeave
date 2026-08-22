@@ -24,9 +24,10 @@ log = structlog.get_logger(__name__)
 
 Epistemic = str  # "verified" | "claimed" | "unknown"
 
-_SCOPE_CLOSED = frozenset(
-    {"closed", "cancelled", "completed", "done", "archived"}
-)
+# ADR-001 R1：终态判定收敛到唯一常量（原 _SCOPE_CLOSED 五成员等价迁移）
+from hiveweave.services.tasks.constants import TERMINAL_STATUSES
+
+_SCOPE_CLOSED = TERMINAL_STATUSES
 _LEDGER_SCOPE_CAP = 40
 _NAMED_TASKS_CAP = 20
 LEDGER_MINE_NOTE = (

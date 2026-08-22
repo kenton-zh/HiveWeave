@@ -8,12 +8,17 @@ from __future__ import annotations
 
 import structlog
 
+from .constants import TERMINAL_STATUSES
 from .db import _query
 from .verify import is_verify_title
 
 log = structlog.get_logger(__name__)
 
 SHIP_READY_PREFIX = "[SHIP READY]"
+
+# ADR-001 R1：终态判定引用唯一常量（原窄口径 {closed, cancelled} 漏
+# completed/done——未归档的这类行会被误当"剩余开放任务"，CEO 永不收 ship 提醒）
+_SHIP_OPEN_EXCLUDE = tuple(TERMINAL_STATUSES)
 
 
 def ship_anchor_id(task: dict | None) -> str:
@@ -48,11 +53,12 @@ async def _active_ceo_id(project_id: str) -> str | None:
 
 
 async def _has_remaining_open_tasks(project_id: str) -> bool:
+    ph = ",".join("?" for _ in _SHIP_OPEN_EXCLUDE)
     rows = await _query(
         project_id,
         "SELECT id FROM tasks WHERE is_archived = 0 "
-        "AND status NOT IN ('closed', 'cancelled') LIMIT 1",
-        [],
+        f"AND status NOT IN ({ph}) LIMIT 1",
+        list(_SHIP_OPEN_EXCLUDE),
     )
     return bool(rows)
 

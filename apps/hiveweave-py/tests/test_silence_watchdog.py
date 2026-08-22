@@ -134,6 +134,8 @@ async def _insert_open_task(env, assignee_id, *, status="running"):
 
     Raw INSERT (no TaskService.start_task) so we do not write a fresh work_log
     that would reset the silence baseline to "just now".
+    ADR-001：claimed_at 必填——闭式义务判定以 claimed_at 为锚点（生产
+    claim/unblock 路径必写），raw INSERT 不带会让 assignee 义务漏判。
     """
     from hiveweave.services import task as task_mod
 
@@ -147,10 +149,10 @@ async def _insert_open_task(env, assignee_id, *, status="running"):
     await conn.execute(
         "INSERT INTO tasks (id, project_id, title, description, status, "
         "progress, creator_id, assignee_id, created_at, updated_at, "
-        "is_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        "claimed_at, is_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
         [tid, PROJECT_ID, "Silence duty task", "keep agent on duty",
          status, 20 if status == "running" else 10,
-         CEO_ID, assignee_id, old, old],
+         CEO_ID, assignee_id, old, old, old],
     )
     await conn.commit()
     return tid
@@ -503,20 +505,20 @@ async def _insert_task(env, *, status, creator_id=CEO_ID, assignee_id=None):
 
 
 async def test_pending_work_submitted_and_verifying(env):
-    """_project_has_pending_work：submitted / verifying 任务各自独立判为 pending."""
+    """project_has_unresolved_work：submitted / verifying 任务各自独立判为 pending."""
     svc = GameTimeService()
     # 空项目（无任务、无执行层 agent）→ 无 pending work
-    assert await svc._project_has_pending_work(PROJECT_ID) is False
+    assert await svc.project_has_unresolved_work(PROJECT_ID) is False
 
     tid = await _insert_task(env, status="submitted", assignee_id=EXECUTOR_ID)
-    assert await svc._project_has_pending_work(PROJECT_ID) is True
+    assert await svc.project_has_unresolved_work(PROJECT_ID) is True
 
     # submitted 消失、仅剩 verifying → 仍 pending
     conn = await ensure_project_db(env["workspace_path"])
     await conn.execute(
         "UPDATE tasks SET status = 'verifying' WHERE id = ?", [tid])
     await conn.commit()
-    assert await svc._project_has_pending_work(PROJECT_ID) is True
+    assert await svc.project_has_unresolved_work(PROJECT_ID) is True
 
 
 async def test_pending_work_idle_leaf_with_cooldown(env):
@@ -526,18 +528,18 @@ async def test_pending_work_idle_leaf_with_cooldown(env):
     # 冷却期内（5 min）的零任务叶子 → 不算 pending（给 CEO 派活时间）
     await _insert_agent(env, EXECUTOR_ID, "柚子", role="executor",
                         created_at=now - 5 * 60 * 1000)
-    assert await svc._project_has_pending_work(PROJECT_ID) is False
+    assert await svc.project_has_unresolved_work(PROJECT_ID) is False
 
     # 叶子创建超过 10 min 仍零任务 → pending
     conn = await ensure_project_db(env["workspace_path"])
     await conn.execute("UPDATE agents SET created_at = ? WHERE id = ?",
                        [now - 20 * 60 * 1000, EXECUTOR_ID])
     await conn.commit()
-    assert await svc._project_has_pending_work(PROJECT_ID) is True
+    assert await svc.project_has_unresolved_work(PROJECT_ID) is True
 
     # 叶子名下有过任务（含 closed，NOT EXISTS 不按状态过滤）→ 非待命
     await _insert_task(env, status="closed", assignee_id=EXECUTOR_ID)
-    assert await svc._project_has_pending_work(PROJECT_ID) is False
+    assert await svc.project_has_unresolved_work(PROJECT_ID) is False
 
 
 async def test_pending_work_coordinator_not_counted_as_leaf(env):
@@ -548,7 +550,7 @@ async def test_pending_work_coordinator_not_counted_as_leaf(env):
     await _insert_agent(env, "coord-1", "协调", role="技术协调员",
                         permission_type="coordinator",
                         created_at=now - 20 * 60 * 1000)
-    assert await svc._project_has_pending_work(PROJECT_ID) is False
+    assert await svc.project_has_unresolved_work(PROJECT_ID) is False
 
 
 async def test_pending_work_hr_chinese_role_not_counted_as_leaf(env):
@@ -558,7 +560,7 @@ async def test_pending_work_hr_chinese_role_not_counted_as_leaf(env):
     now = _now_ms()
     await _insert_agent(env, "hr-1", "人事", role="人力资源",
                         created_at=now - 20 * 60 * 1000)
-    assert await svc._project_has_pending_work(PROJECT_ID) is False
+    assert await svc.project_has_unresolved_work(PROJECT_ID) is False
 
 
 async def test_pending_work_leaf_beyond_ten_coordinators(env):
@@ -573,7 +575,7 @@ async def test_pending_work_leaf_beyond_ten_coordinators(env):
                             role="技术协调员", permission_type="coordinator",
                             created_at=old)
     await _insert_agent(env, "leaf-r2", "叶子", role="executor", created_at=old)
-    assert await svc._project_has_pending_work(PROJECT_ID) is True
+    assert await svc.project_has_unresolved_work(PROJECT_ID) is True
 
 
 async def test_complete_ceo_not_exempt_when_submitted_pending(env, monkeypatch):

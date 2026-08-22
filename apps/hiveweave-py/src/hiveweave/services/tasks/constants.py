@@ -1,6 +1,15 @@
 """Task ledger constants (transitions, progress floors, schema cols)."""
 from __future__ import annotations
 
+# ADR-001 R1：唯一终态常量。所有"任务是否终结"的消费点统一引用这里，
+# 禁止再各写一套终态集合（收敛 platform_state._SCOPE_CLOSED 与
+# timeline._TERMINAL_STATUSES 两套旧口径）。未来新增终态只改这一处。
+# completed/done 为防御性成员：状态机不产出，但存量数据可能残留，
+# 不列入会令闭式 has_open_work 对这类行永真（fail-safe → fail-stuck）。
+TERMINAL_STATUSES = frozenset(
+    {"closed", "cancelled", "completed", "done", "archived"}
+)
+
 # 合法状态转换
 _TRANSITIONS: dict[str, set[str]] = {
     "created": {"claimed", "closed", "blocked"},    # blocked: system VERIFY w/o QA

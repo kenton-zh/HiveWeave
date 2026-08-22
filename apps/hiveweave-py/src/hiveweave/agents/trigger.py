@@ -561,7 +561,8 @@ async def _do_trigger(agent_id: str, trigger_type: str, *,
         # 5. If busy → enqueue wake (P1 single-flight) instead of drop
         if agent.status.value == "processing":
             await _handoff_service.accept_pending_handoffs(project_id, agent_id)
-            result = await build_trigger_context(agent_record, trigger_type)
+            result = await build_trigger_context(
+                agent_record, trigger_type, force=force)
             if result is None:
                 # Placeholder wake only — do NOT latch real inbox ids.
                 # Hard invariant: never ACK messages the model did not see.
@@ -650,8 +651,9 @@ async def _do_trigger(agent_id: str, trigger_type: str, *,
         # 6. Accept pending handoffs
         await _handoff_service.accept_pending_handoffs(project_id, agent_id)
 
-        # 7. Build trigger context
-        result = await build_trigger_context(agent_record, trigger_type)
+        # 7. Build trigger context（ADR-001 R2a：force 穿透 complete-skip）
+        result = await build_trigger_context(
+            agent_record, trigger_type, force=force)
         if result is None:
             log.info("trigger_no_context", agent_id=agent_id)
             return
@@ -796,6 +798,8 @@ async def _do_trigger(agent_id: str, trigger_type: str, *,
 async def build_trigger_context(
     agent: dict,
     trigger_type: str,
+    *,
+    force: bool = False,
 ) -> tuple[str, list[str], str | None, str | None] | None:
     """构建触发上下文消息。
 
@@ -850,9 +854,13 @@ async def build_trigger_context(
     background_msgs = await _inbox_service.get_undelivered_background(agent_id)
 
     # complete + no actionable wake=1 / handoffs / open ask contracts → skip
+    # ADR-001 R2a：force（看门狗穿透唤醒）时不得 skip——否则 force 在
+    # _watchdog_trigger 出口放行后，在 trigger 上下文构建处再蒸发一次
+    # （Orion 场景：complete + 已读 inbox + 仅 assignee 义务）。
     manager = _get_agent_manager()
     live = manager.get_agent(agent_id) if manager else None
-    if live is not None and getattr(live, "disposition", None) == "complete":
+    if live is not None and getattr(live, "disposition", None) == "complete" \
+            and not force:
         if (
             not inbox_messages
             and not outstanding
@@ -862,6 +870,16 @@ async def build_trigger_context(
             # creator/reviewer 待审（submitted/reviewing）及 creator 待
             # merge（approved = CREATOR_MUST_MERGE）义务都构成唤醒理由
             # （与看门狗穿透口径一致——欠债必醒）；查询失败 fail-open 不跳过
+            #
+            # ADR-001 §2 分工注记（不改行为）：本口是 has_open_work 之外的
+            # **唯一显式例外**——只认 reviewer/creator 审/merge 债，assignee
+            # 义务不在此判定。前提：assignee 侧兜底 = inbox 任务类消息在
+            # agent.py chat 入口的穿透（is_task_wake）+ silent watchdog 的
+            # has_open_work/R2 force 接线。穿透依赖**未读**任务类消息；
+            # 已读后 complete assignee 的兜底只剩 watchdog 与 turn-exit
+            # requeue。实现者不得按"单一判定源"字面把本口改写成
+            # has_open_work——那会让 background-only 路径对派活中协调者
+            # 失去克制（R4 例外的存在理由）。
             try:
                 from hiveweave.services.task import TaskService
 
@@ -1035,6 +1053,39 @@ async def build_trigger_context(
             blocks.insert(0, f"## Goals Workbook (updated)\n{goals_entry}")
             cur_ver = _cs.get_goals_version(project_id)
             await _cs.set_agent_goals_version(agent_id, cur_ver)
+
+    # ── 3.6. Open Work（ADR-001 R2a 终局：force 穿透唤醒的兜底指引）──
+    # force 唤醒（沉默看门狗/兜底看门狗）已通过 has_open_work 检查，
+    # 但 complete agent 的 inbox 常已全读、无 handoff——上面各块全空时
+    # 返回 None 会让唤醒在最后一米蒸发（Orion 终局形态）。用闭式清单
+    # 生成行动指引，保证"醒了一定有事可做"。
+    if force and not blocks:
+        try:
+            from hiveweave.services.task import TaskService
+
+            _open_obs = await TaskService().get_open_work_obligations(
+                project_id, agent_id)
+        except Exception as e:
+            log.debug("trigger_open_work_block_failed",
+                      agent_id=agent_id, error=str(e))
+            _open_obs = []
+        if _open_obs:
+            import json as _json
+            lines = []
+            for o in _open_obs[:10]:
+                lines.append(_json.dumps({
+                    "task_id": str(o.get("id") or "")[:8],
+                    "title": (o.get("title") or "")[:60],
+                    "status": o.get("status"),
+                    "you_are": o.get("role_hint"),
+                }, ensure_ascii=False))
+            blocks.append(
+                "## Open Work — 你名下有未收口的开放工作"
+                "（沉默看门狗穿透唤醒；与 inbox 读态无关）\n"
+                "继续推进或用 commit_turn 正确声明状态；"
+                "完成后 submit_task / 解除阻塞清账。\n"
+                + "\n".join(lines)
+            )
 
     # ── 4. Coordinator 专属 blocks ──
     if trigger_type == "coordinator":

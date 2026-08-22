@@ -753,6 +753,16 @@ class ToolLoopMixin:
                             doom_tracker.get("count", 0) + 1
                         )
 
+                # ADR-001 补丁：失败调用在 tool_history 条目上落 ok=False
+                # （条目在执行前已 append，失败也留账）。完成闸窄集
+                # _task_ids_gate_resolved_this_turn 只认未失败调用——
+                # 否则"submit 被证据门拒收 → commit done_slice"以失败
+                # 调用解除义务，逃逸口换壳复活。无标记 = 成功（兼容）。
+                if error_ids:
+                    for _e in tool_history:
+                        if _e.get("id") in error_ids:
+                            _e["ok"] = False
+
                 # 追加 assistant + tool_results 到 messages
                 messages = messages + [assistant_msg] + tool_results
                 tool_turn_acc.extend(tool_results)

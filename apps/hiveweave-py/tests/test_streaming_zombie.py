@@ -498,7 +498,10 @@ async def _insert_agent(env, agent_id, name, parent_id=None, created_at=None):
 
 
 async def _insert_open_task(env, assignee_id):
-    """落账一条 running 任务（让沉默检测有义务可查；对齐 test_silence_watchdog）."""
+    """落账一条 running 任务（让沉默检测有义务可查；对齐 test_silence_watchdog）.
+
+    ADR-001：claimed_at 必填——闭式义务判定以 claimed_at 为锚点。
+    """
     from hiveweave.services import task as task_mod
 
     task_mod._migrated.discard(PROJECT_ID)
@@ -508,9 +511,9 @@ async def _insert_open_task(env, assignee_id):
     await conn.execute(
         "INSERT INTO tasks (id, project_id, title, description, status, "
         "progress, creator_id, assignee_id, created_at, updated_at, "
-        "is_archived) VALUES (?, ?, ?, ?, 'running', 20, ?, ?, ?, ?, 0)",
+        "claimed_at, is_archived) VALUES (?, ?, ?, ?, 'running', 20, ?, ?, ?, ?, ?, 0)",
         [str(uuid.uuid4()), PROJECT_ID, "duty", "keep on duty",
-         CEO_ID, assignee_id, old, old])
+         CEO_ID, assignee_id, old, old, old])
     await conn.commit()
 
 

@@ -646,20 +646,39 @@ class Agent:
                     "inbox_task",
                     "verify",
                 ) or o.get("message_type") == "task" or bool(o.get("task_id"))
-                # Reminder / wait-timeout must not burn tokens after complete
+                # Reminder / wait-timeout must not burn tokens after complete.
+                # ADR-001 §2：complete 不再是无条件免死金牌——名下有开放
+                # 工作（闭式 has_open_work，含 running/blocked/未来状态）
+                # 时不得 skip（Orion 事故：19:32 半截回合被静默终结后
+                # 无人认领 running 任务 80min）。查询 fail-closed（异常按
+                # 有活，不 skip）。
                 if source in (
                     "open_task_reminder",
                     "wait_timeout",
                     "turn_exit_gate",
                 ):
-                    log.info(
-                        "chat_complete_skip_trigger",
-                        agent_id=self.id,
-                        source=source,
-                        wake_category=wake_cat,
-                        admit_reason="complete_no_reminder",
-                    )
-                    return {"ok": True, "skipped": "complete"}
+                    _complete_has_work = True
+                    try:
+                        from hiveweave.services.task import TaskService
+
+                        _complete_has_work = await TaskService().has_open_work(
+                            self.project_id, self.id
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "complete_open_work_check_failed",
+                            agent_id=self.id,
+                            error=str(e),
+                        )
+                    if not _complete_has_work:
+                        log.info(
+                            "chat_complete_skip_trigger",
+                            agent_id=self.id,
+                            source=source,
+                            wake_category=wake_cat,
+                            admit_reason="complete_no_reminder",
+                        )
+                        return {"ok": True, "skipped": "complete"}
                 if not admit.ok and not is_task_wake and not o.get("from_user"):
                     log.info(
                         "chat_complete_skip_trigger",
@@ -2450,7 +2469,12 @@ class Agent:
         return {}
 
     def _task_ids_advanced_this_turn(self, tool_calls: list) -> set[str]:
-        """Task IDs that this turn already progressed (submit/review/block)."""
+        """Task IDs that this turn already progressed (submit/review/block).
+
+        宽集：任何推进信号（claim/start/block/progress）都算——供
+        失速豁免（stall break forgive）与 progress fingerprint 用。
+        **不供 turn-exit 完成闸用**（见 _task_ids_gate_resolved_this_turn）。
+        """
         advanced: set[str] = set()
         for tc in tool_calls or []:
             name = self._tool_call_name(tc)
@@ -2473,6 +2497,37 @@ class Agent:
                 advanced.add(tid)
         return advanced
 
+    def _task_ids_gate_resolved_this_turn(self, tool_calls: list) -> set[str]:
+        """完成闸专用窄集：本轮**实际解除义务**的任务 ID（ADR-001 补丁）。
+
+        只认成功的义务解除动作：submit_task / review_task / close_task。
+        排除项及理由：
+        - claim / 拨 running / blocked / update_progress / dispatch：
+          活动不是义务解除（DSH_22 场景A 逃逸口——宽集把"刚认领"当
+          "已推进"，exit backstop 豁免 assignee 义务 → 持 running 任务
+          合法 complete）。
+        - update_task_status 分支整体删除：该工具运行时只接受
+          running/blocked（lifecycle 硬拒 review 窗口状态），到不了
+          义务解除态——保留分支只会给"失败的幻影调用"留逃逸口。
+        - 条目 ok=False（执行失败，tool_loop 落账）：失败的 submit/review
+          不解除义务（submit 被证据门拒收后 commit done_slice 同样
+          是逃逸）。无标记 = 成功。
+        宽集（_task_ids_advanced_this_turn）继续承担活动量语义
+        （fingerprint / stall forgive），两集不得混用。
+        """
+        resolved: set[str] = set()
+        for tc in tool_calls or []:
+            if not isinstance(tc, dict) or tc.get("ok") is False:
+                continue
+            name = self._tool_call_name(tc)
+            args = self._tool_call_args(tc)
+            tid = args.get("taskId") or args.get("task_id") or args.get("id")
+            if not tid:
+                continue
+            if name in ("submit_task", "review_task", "close_task"):
+                resolved.add(str(tid))
+        return resolved
+
     def _build_open_task_hint(self, obligations: list[dict]) -> str:
         """Deprecated wrapper — hint text lives in hooks.handlers.task_advance."""
         from hiveweave.hooks.handlers.task_advance import build_task_advance_hint
@@ -2488,12 +2543,28 @@ class Agent:
             return
         # Dogfood 2026-07-24: complete agents were still woken into
         # open_task_reminder → stall burn after ledger close.
+        # ADR-001 §2：complete 豁免只信闭式 has_open_work——名下有
+        # running/blocked/未来状态任务时仍要 retrigger（不静默蒸发）。
         if self.disposition == "complete":
-            log.info(
-                "open_task_retrigger_skip_complete",
-                agent_id=self.id,
-            )
-            return
+            _complete_has_work = True
+            try:
+                from hiveweave.services.task import TaskService
+
+                _complete_has_work = await TaskService().has_open_work(
+                    self.project_id, self.id
+                )
+            except Exception as e:
+                log.warning(
+                    "complete_open_work_check_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
+            if not _complete_has_work:
+                log.info(
+                    "open_task_retrigger_skip_complete",
+                    agent_id=self.id,
+                )
+                return
         # 修 #2: retrigger 前查 inbox，把未读消息摘要拼进 hint
         hint = await self._enrich_hint_with_inbox(hint)
         log.info("open_task_retrigger", agent_id=self.id)
@@ -2529,8 +2600,24 @@ class Agent:
                 return
 
         if self.disposition == "complete":
-            log.info("self_retrigger_complete_skip", agent_id=self.id)
-            return
+            # ADR-001 §2：complete 豁免只信闭式 has_open_work——名下有
+            # 开放工作（含 blocked/未来状态）仍自检 retrigger。
+            _complete_has_work = True
+            try:
+                from hiveweave.services.task import TaskService
+
+                _complete_has_work = await TaskService().has_open_work(
+                    self.project_id, self.id
+                )
+            except Exception as e:
+                log.warning(
+                    "complete_open_work_check_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
+            if not _complete_has_work:
+                log.info("self_retrigger_complete_skip", agent_id=self.id)
+                return
 
         if self._in_resume_cooldown():
             log.info(

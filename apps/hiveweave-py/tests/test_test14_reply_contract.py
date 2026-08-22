@@ -431,9 +431,11 @@ async def test_watchdog_force_wakes_complete_agent():
         "hiveweave.agents.supervisor.agent_manager.get_agent",
         return_value=FakeInst(),
     ), patch(
-        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        # ADR-001 R2b：skip 判定源已从 get_actionable_obligations 换成
+        # 闭式 has_open_work（单一判定源）
+        "hiveweave.services.task.TaskService.has_open_work",
         new_callable=AsyncMock,
-        return_value=[],
+        return_value=False,
     ), patch(
         "hiveweave.agents.trigger.is_coordinator",
         return_value=False,

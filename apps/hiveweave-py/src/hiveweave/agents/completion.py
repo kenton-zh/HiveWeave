@@ -359,7 +359,11 @@ async def handle_completion(
         from hiveweave.services.task import TaskService
 
         ts = TaskService()
-        open_obligations = await ts.get_actionable_obligations(
+        # ADR-001 R4（硬性改造）：完成闸的义务清单消费闭式单一判定源
+        # get_open_work_obligations（assignee 负空间：blocked 及未来新增
+        # 状态计入——白名单 get_actionable_obligations 漏掉它们会让
+        # done_slice 在名下仅 blocked 任务时被放行）。
+        open_obligations = await ts.get_open_work_obligations(
             agent.project_id, agent.id
         )
         try:
@@ -380,6 +384,11 @@ async def handle_completion(
         )
 
     tasks_advanced = agent._task_ids_advanced_this_turn(tool_calls)
+    # ADR-001 补丁（DSH_22 场景A 逃逸口）：完成闸只认"义务已解除"窄集。
+    # 宽集把同轮 claim/拨 running 当"已推进"→ exit backstop 豁免 assignee
+    # 义务 → 持 running 任务合法 complete。宽集继续喂 fingerprint /
+    # stall forgive / telemetry（活动量语义），闸语义 = 义务解除。
+    gate_resolved = agent._task_ids_gate_resolved_this_turn(tool_calls)
     worktree_uncommitted = False
     try:
         from hiveweave.services.turn_exit import agent_worktree_has_uncommitted
@@ -417,7 +426,7 @@ async def handle_completion(
             unreplied_asks=unreplied_asks,
             open_task_obligations=open_obligations,
             delegated_in_flight=delegated_in_flight,
-            tasks_advanced=tasks_advanced,
+            tasks_advanced=gate_resolved,
             messaged_refs=messaged_refs,
             outbound_ask_refs=outbound_ask_refs,
             name_by_id=name_by_id,

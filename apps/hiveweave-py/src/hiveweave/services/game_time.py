@@ -10,7 +10,10 @@ import os
 import shlex
 import time
 import uuid
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hiveweave.services.task import TaskService
 
 import aiosqlite
 import structlog
@@ -294,13 +297,18 @@ class GameTimeService:
             and inst is not None
             and getattr(inst, "disposition", None) == "complete"
         ):
+            # ADR-001 R2b：skip 判定换闭式 has_open_work（原
+            # get_actionable_obligations 白名单漏 blocked/未来状态——
+            # complete + 名下 running/blocked 在本出口被债务判空吞掉，
+            # 事故从叶子平移到 CEO 的最后一环）。wait 停泊仍豁免
+            # （has_open_work 内置 wait 负项）。查询异常 fail-closed 不跳过。
             try:
                 from hiveweave.services.task import TaskService
 
-                obs = await TaskService().get_actionable_obligations(
+                busy = await TaskService().has_open_work(
                     inst.project_id, agent_id
                 )
-                if not obs:
+                if not busy:
                     log.info("watchdog_skip_complete", agent_id=agent_id)
                     return
             except Exception as e:
@@ -1878,6 +1886,10 @@ class GameTimeService:
                     name=a["name"], stuck_minutes=stuck_ms // 60000,
                 )
             waits = live_waits.get(aid) or []
+            # ADR-001 §2：complete 项目根经项目级"无人推进"判定放行后，
+            # 必须穿透下方"无个人义务→idle"闸门（否则 P0-1 唤醒在闸门
+            # 二次蒸发——CEO 非义务人，个人清单恒空）。
+            root_arbitration = False
             if waits:
                 inst = agent_manager.get_agent(aid)
                 disp = getattr(inst, "disposition", None) if inst else None
@@ -1913,23 +1925,28 @@ class GameTimeService:
                         continue
                     duty_probes[aid] = probe
             else:
-                # No active wait contracts — check project completeness before skipping complete
+                # No active wait contracts — check open work before skipping complete
                 inst = agent_manager.get_agent(aid)
                 disp = getattr(inst, "disposition", None) if inst else None
                 if disp == "complete":
-                    # P0-1：项目仍有未推进工作（submitted/verifying 任务、待命叶子）
-                    # → 不豁免，纳入沉默检测，防止 CEO 收工后项目卡死
+                    # ADR-001 §2：complete 豁免只信 has_open_work（闭式单一
+                    # 判定源）；项目根（无 parent）组合项目级"无人推进"判定
+                    # （P0-1 保护：submitted/verifying/待命叶子 → 醒 CEO 仲裁）。
+                    # 查询失败不静默豁免（fail-closed）——落入沉默检测。
                     try:
-                        has_pending = await self._project_has_pending_work(
-                            project_id)
+                        busy = await task_svc.has_open_work(project_id, aid)
+                        if not busy and not a.get("parent_id"):
+                            busy = await self.project_has_unresolved_work(
+                                project_id)
+                            if busy:
+                                root_arbitration = True
                     except Exception as e:
-                        # 查询失败不静默豁免（fail-closed）——落入后续义务检查
-                        log.warning("pending_work_check_failed",
+                        log.warning("complete_open_work_check_failed",
                                     project_id=project_id, agent_id=aid,
                                     error=str(e))
-                        has_pending = True
-                    if not has_pending:
-                        continue   # 项目无待推进工作 → 合法 idle 豁免
+                        busy = True
+                    if not busy:
+                        continue   # 无开放工作 → 合法 idle 豁免
 
             tracker = trackers.get(aid) or {
                 "flagged": False,
@@ -1947,8 +1964,14 @@ class GameTimeService:
                 if aid in duty_probes:
                     obligations = duty_probes[aid]["obligations"]
                 else:
-                    obligations = await task_svc.get_actionable_obligations(
-                        project_id, aid
+                    # ADR-001 §2：沉默检测的义务口径统一为闭式单一判定源
+                    # get_open_work_obligations（原 get_actionable_obligations
+                    # 白名单漏 blocked/未来状态——complete 项目根走项目级
+                    # 判定放行后，会在下方"无义务→idle"闸门被白名单空清单
+                    # 再次吞掉；blocked-only assignee 同理永远沉默）。
+                    obligations = (
+                        await task_svc.get_open_work_obligations(
+                            project_id, aid)
                     )
             except Exception:
                 obligations = []
@@ -1967,7 +1990,8 @@ class GameTimeService:
                     )
                 except Exception:
                     inbound_ask = False
-            if not obligations and not inbound_ask and not waits:
+            if not obligations and not inbound_ask and not waits \
+                    and not root_arbitration:
                 if tracker["flagged"]:
                     tracker["flagged"] = False
                     try:
@@ -2037,7 +2061,13 @@ class GameTimeService:
                     # 静默失效（CEO resubmit 事故的根因之一）。
                     # 756/822/859 的调用点先发了 urgent inbox（未读守卫
                     # 自然通过），不需要穿透。
-                    await self._watchdog_trigger(aid, penetrate=True)
+                    # ADR-001 R2a：force=True——走到这里的 agent 都已通过
+                    # 上方豁免检查（有义务/ask，或 complete+has_open_work/
+                    # 项目根未收口），必须真唤醒；否则 complete+项目级
+                    # 信号（CEO 非 assignee，义务为空）会在 _watchdog_trigger
+                    # 出口被再次吞掉，升级链路冻结。
+                    await self._watchdog_trigger(
+                        aid, penetrate=True, force=True)
                 except Exception as e:
                     log.error("silence_wake_failed",
                               agent_id=aid, error=str(e))
@@ -2113,10 +2143,20 @@ class GameTimeService:
         probe["has_duty"] = bool(probe["ask_senders"])
         return probe
 
-    async def _project_has_pending_work(self, project_id: str) -> bool:
-        """检查项目是否有未推进的工作（complete 态协调者的豁免判断）。
+    async def project_has_unresolved_work(self, project_id: str) -> bool:
+        """ADR-001 §1：项目级"无人推进"判定（供 complete 项目根仲裁）。
 
-        返回 True 表示有 pending work，不应豁免 complete 态协调者。
+        形态：submitted/reviewing 待审收口、verifying 待 VERIFY 收口、
+        待命叶子（active executor/qa 零任务且超招聘冷却——等派活）。
+        **显式不含**有活跃 assignee 推进的 claimed/running/rework/blocked
+        子任务——那些由 owner 自己的 has_open_work 兜底，项目根不为
+        "有人推的活"醒来（守 F1：派活中协调者不误醒）。
+
+        R3 诚实标注：这是**枚举近似非闭式**——未来新增"无人推进"形态
+        （如 escalated/on_hold）不会自动触发，漏项由 dwell 时钟
+        （_nudge_stale_ledger，15min 粒度）兜底补位。已知近似误差：
+        submitted 正被活跃 reviewer 审着仍会醒项目根，由
+        STALL_COOLDOWN_MS 冷却压制。
         """
         # 1. 检查是否有 submitted 任务（待审查）
         rows = await _query(project_id,
