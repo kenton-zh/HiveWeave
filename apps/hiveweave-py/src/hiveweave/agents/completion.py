@@ -977,6 +977,10 @@ async def handle_completion(
         try:
             from hiveweave.services.task import TaskService
 
+            # TEST_DSH_24：补偿范围扩 claimed——dispatch=claim 的总包与
+            # 刚认领未拨 running 的任务（视界 M1 事故：断流后 claimed 任务
+            # 无任何补偿，纯等 10min watchdog）。认领即义务（ADR-001 闭式
+            # 同口径），断流必有人推。
             _stall_resume_refs = [
                 str(t.get("id") or "")[:8]
                 for t in (
@@ -985,7 +989,8 @@ async def handle_completion(
                     )
                     or []
                 )
-                if t.get("status") == "running" and t.get("id")
+                if t.get("status") in ("running", "claimed")
+                and t.get("id")
             ]
         except Exception as e:
             log.debug(

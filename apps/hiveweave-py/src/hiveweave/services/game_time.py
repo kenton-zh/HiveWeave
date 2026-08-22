@@ -51,14 +51,23 @@ WORKTREE_RECONCILE_TICKS = 72  # 72 * 5s = 6min — retry orphan worktree cleanu
 TASK_EVENT_RELAY_TICKS = 6   # 6 * 5s = 30s — process undelivered task events
 OBLIGATION_SCAN_TICKS = 12   # 12 * 5s = 60s — TEST16 D2: scan overdue obligations
 STALL_IDLE_MS = 10 * 60 * 1000        # 10 min idle threshold
-STALL_COOLDOWN_MS = 15 * 60 * 1000    # 15 min cooldown (避免重复触发)
+# 2026-08-22 env 化：看门狗节奏可调（TEST_DSH_24 复盘）。默认不变。
+# 注意耦合：SILENCE 阈值若下调，应 ≥ STREAMING_ZOMBIE_TIMEOUT_MS 的 1/2
+# 且冷却 ≥3× 阈值（防健康长回合被误扰 + 紧缠）。
+STALL_COOLDOWN_MS = int(
+    os.environ.get("HIVEWEAVE_STALL_COOLDOWN_MS", "900000") or "900000"
+)  # 15 min cooldown (避免重复触发)
 STALL_ESCALATION_THRESHOLD = 3        # 同一对未回复触发 3 次后升级到上级
 # Sender asked for a reply but got silence — wake waiter sooner than recipient stall
 AWAITING_REPLY_MS = 3 * 60 * 1000     # 3 min
 
 # 潮汐事故: agent 沉默观测 — 无任何产出的失联检测（消息轴/任务轴看门狗的盲区）
-SILENCE_THRESHOLD_MS = 10 * 60 * 1000        # 10 min 无任何产出判定失联
-SILENCE_NOTIFY_MS = 30 * 60 * 1000           # 失联持续 30 min：只打日志，不 inbox 上级
+SILENCE_THRESHOLD_MS = int(
+    os.environ.get("HIVEWEAVE_SILENCE_THRESHOLD_MS", "600000") or "600000"
+)        # 10 min 无任何产出判定失联（兜底层；主力恢复 = recovery 补偿秒级）
+SILENCE_NOTIFY_MS = int(
+    os.environ.get("HIVEWEAVE_SILENCE_NOTIFY_MS", "1800000") or "1800000"
+)           # 失联持续 30 min：只打日志，不 inbox 上级
 SILENCE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000  # legacy floor; M7 uses backoff below
 # TEST21 M7: exponential notify cooldown 10min → 30min → 2h
 SILENCE_NOTIFY_BACKOFF_MS = (

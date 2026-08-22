@@ -502,6 +502,40 @@ async def handle_error(agent: Any, error: Exception) -> None:
         except Exception as e:
             log.debug("ledger_rewake_on_give_up_failed", error=str(e))
         await agent._escalate_turn_interruption(reason=f"llm_error:{error_type}")
+    else:
+        # TEST_DSH_24 视界事故：续跑轮断流（无未读 inbox）时原三条分支全不
+        # 进 → 直接 _go_idle 零补偿，名下开放任务裸奔到 10min watchdog。
+        # 补法：按 ADR-001 闭式判定查名下开放工作，有活则挂 ~45s 补偿唤醒
+        # （复用 _arm_interrupted_resume，秒级恢复，watchdog 退为兜底）。
+        # 无活（真收工后断流）不挂——保持安静。
+        try:
+            from hiveweave.services.task import TaskService
+
+            _open_refs = [
+                str(t.get("id") or "")[:8]
+                for t in (
+                    await TaskService().get_open_work_obligations(
+                        agent.project_id, agent.id
+                    )
+                    or []
+                )
+                if t.get("assignee_id") == agent.id and t.get("id")
+            ]
+        except Exception as e:
+            log.warning(
+                "llm_error_open_work_scan_failed",
+                agent_id=agent.id,
+                error=str(e),
+            )
+            _open_refs = []
+        if _open_refs:
+            agent._arm_interrupted_resume(_open_refs)
+            log.warning(
+                "llm_error_open_work_resume_armed",
+                agent_id=agent.id,
+                task_refs=_open_refs[:8],
+                consecutive_errors=agent._consecutive_errors,
+            )
 
     agent._cancel_safety_timer()
     await agent._go_idle()

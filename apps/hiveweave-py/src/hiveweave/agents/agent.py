@@ -1988,12 +1988,17 @@ class Agent:
             self._interrupted_resume_timer = None
             if self.status != AgentState.IDLE:
                 return
-            if self.disposition == "blocked":
-                # 补偿期内被停泊/升级 —— 不唤醒，避免与 park 语义打架
+            # TEST_DSH_24 审计：守卫扩全停泊 disposition——commit_turn(waiting)
+            # 映射 waiting_agent/waiting_human/waiting_timer（不止 blocked）。
+            # 已合法停泊的 agent 不补偿唤醒（绕过 wait contract 匹配 + 空烧）；
+            # 断流路径 disposition 停留在 chat 进入时的 "runnable"，不受影响。
+            _parked = {"blocked", "waiting_human", "waiting_agent",
+                       "waiting_timer", "complete"}
+            if self.disposition in _parked:
                 return
             hint = (
                 f"[TASK INTERRUPTED] Previous turn ended early (tool-loop "
-                f"stall). Tasks still running under you: {refs_blob}. "
+                f"stall). Tasks still open under you: {refs_blob}. "
                 f"Verify current state from disk/ledger first, then resume "
                 f"with smaller steps; commit_turn(in_progress) to keep "
                 f"working, or commit_turn(waiting/blocked) with a ref if "
