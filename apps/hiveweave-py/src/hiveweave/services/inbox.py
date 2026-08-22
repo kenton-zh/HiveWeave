@@ -374,35 +374,95 @@ class InboxService:
                 [to_agent_id, key],
             )
             if existing:
-                log.info(
-                    "inbox_deduped",
-                    to_agent_id=to_agent_id,
-                    category=category,
-                    key=key[:12],
-                )
-                try:
-                    from hiveweave.services.telemetry import telemetry
+                # TEST_DSH_26 竞态：rework→快速 re-submit 的 [TASK SUBMITTED]
+                # 直推与上一轮同键（from/to/task/message 全同）。若旧行
+                # **已读**（reviewer 已消费过上一轮通知），本轮是状态变化
+                # 的重申——判重吞掉会让 submitted 卡 60s 无人审（relay
+                # 补投窗口）。降级为改投新行（新 key 加序号防再撞）。
+                # 旧行未读 = 真重复投递，维持吞掉（防风暴）。
+                # 审计 D：仅限**自动生成键**的直推——显式 idempotency_key
+                # 调用方（ship_nudge「同 anchor 只提醒一次」、verify_spawn
+                # 时间桶限频）的"只通知一次"契约不得被击穿。
+                if (
+                    bool(existing["read"])
+                    and message_type == "task"
+                    and task_id
+                    and not idempotency_key
+                ):
+                    # 审计 B/F 收敛：上轮 rearm 行（:re{ts}）若仍未读，
+                    # 说明 reviewer 还没消费上一轮重申——不再叠加（吞）。
+                    try:
+                        unread_variant = await project_db.query_one(
+                            to_agent_id,
+                            "SELECT id FROM inbox "
+                            "WHERE to_agent_id = ? AND read = 0 "
+                            "AND (idempotency_key = ? "
+                            "     OR idempotency_key LIKE ? || ':re%') "
+                            "LIMIT 1",
+                            [to_agent_id, key, key],
+                        )
+                    except Exception:
+                        unread_variant = None
+                    if unread_variant is None:
+                        log.info(
+                            "inbox_deduped_rearm_task_notice",
+                            to_agent_id=to_agent_id,
+                            task_id=str(task_id)[:8],
+                            old_row=existing["id"][:8],
+                        )
+                        key = f"{key}:re{int(time.time() * 1000)}"
+                        # 落到下方 INSERT（不走 dedupe return）
+                    else:
+                        log.info(
+                            "inbox_deduped_rearm_suppressed_unread",
+                            to_agent_id=to_agent_id,
+                            task_id=str(task_id)[:8],
+                        )
+                        return {
+                            "id": unread_variant["id"],
+                            "from_agent_id": from_agent_id,
+                            "to_agent_id": to_agent_id,
+                            "message": message,
+                            "message_type": message_type,
+                            "priority": priority,
+                            "expect_report": expect_report,
+                            "read": False,
+                            "created_at": int(time.time() * 1000),
+                            "task_id": task_id,
+                            "should_wake": False,
+                            "category": category,
+                            "deduped": True,
+                        }
+                else:
+                    log.info(
+                        "inbox_deduped",
+                        to_agent_id=to_agent_id,
+                        category=category,
+                        key=key[:12],
+                    )
+                    try:
+                        from hiveweave.services.telemetry import telemetry
 
-                    telemetry.inbox_deduped(to_agent_id, category)
-                except Exception:
-                    pass
-                return {
-                    "id": existing["id"],
-                    "from_agent_id": from_agent_id,
-                    "to_agent_id": to_agent_id,
-                    "message": message,
-                    "message_type": message_type,
-                    "priority": priority,
-                    "expect_report": expect_report,
-                    # Row 对象无 .get（此前这里抛异常 → 落入 INSERT 撞 UNIQUE
-                    # → 返回未落库的幻影 id；修复后正确返回已存在行的 id）
-                    "read": bool(existing["read"]),
-                    "created_at": int(time.time() * 1000),
-                    "task_id": task_id,
-                    "should_wake": False,
-                    "category": category,
-                    "deduped": True,
-                }
+                        telemetry.inbox_deduped(to_agent_id, category)
+                    except Exception:
+                        pass
+                    return {
+                        "id": existing["id"],
+                        "from_agent_id": from_agent_id,
+                        "to_agent_id": to_agent_id,
+                        "message": message,
+                        "message_type": message_type,
+                        "priority": priority,
+                        "expect_report": expect_report,
+                        # Row 对象无 .get（此前这里抛异常 → 落入 INSERT 撞 UNIQUE
+                        # → 返回未落库的幻影 id；修复后正确返回已存在行的 id）
+                        "read": bool(existing["read"]),
+                        "created_at": int(time.time() * 1000),
+                        "task_id": task_id,
+                        "should_wake": False,
+                        "category": category,
+                        "deduped": True,
+                    }
         except Exception as e:
             log.debug("inbox_idempotency_lookup_failed", error=str(e))
 
