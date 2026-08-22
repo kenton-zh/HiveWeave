@@ -170,3 +170,9 @@ tictactoe-game/
 tictactoe-game3/
 .trae-html-share-packages
 shoulabridge-audit
+
+# Browser-automation artifacts (agent-browser/devtools downloads & temp files)
+gargantua/
+_dl_*.js
+_lib_*.js
+[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
