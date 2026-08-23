@@ -21,8 +21,9 @@ observations/slack-clone_01/RETRO.md 定案）：
    kill/taskkill/Stop-Process/tskill/wmic 命中受保护 PID 一律 deny；
    kill 族命令经变量/命令替换间接引用 PID（无法审计展开值）同样降级 deny。
    **防意外不防蓄意**：本层挡的是事故型误杀（taskkill //IM、rm -rf 越界），
-   字符串混淆/`.bat`/`.ps1` 文件间接执行仍可绕过——完全隔离（容器沙箱）
-   才是真正的底线，属后续方向（`BASH_SANDBOX=docker` 预留）。
+   字符串混淆/`.bat`/`.ps1` 文件间接执行仍可绕过——完全隔离
+   由 ACL 写受限令牌沙箱（`services/acl_sandbox`，`HIVEWEAVE_ACL_SANDBOX=on`）
+   提供内核级强制写边界。
 
 挂点：`tools/bash.py::_validate_command_safety`（execute_bash /
 execute_run_command / game_time alarm 三处共用）+

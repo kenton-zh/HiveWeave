@@ -58,6 +58,12 @@ class ProjectCreate(BaseModel):
     orgPattern: str | None = None
     operatorName: str | None = None
     language: str | None = None
+    # P1 (§5.5b①)：外部只读参考目录（仅读工具生效，不授予任何写）
+    additionalReadDirs: list[str] | None = None
+    # P2 (§5.5b②)：附加可写目录（ACL 沙箱 extra SID 授予写权）
+    additionalWritableDirs: list[str] | None = None
+    # P3 (§9)：项目级沙箱模式（'' 继承 env；danger-full-access 逃生门）
+    sandboxMode: str | None = None
 
 
 class ProjectUpdate(BaseModel):
@@ -67,6 +73,12 @@ class ProjectUpdate(BaseModel):
     workspacePath: str | None = None
     description: str | None = None
     operatorName: str | None = None
+    # P1 (§5.5b①)：外部只读参考目录
+    additionalReadDirs: list[str] | None = None
+    # P2 (§5.5b②)：附加可写目录
+    additionalWritableDirs: list[str] | None = None
+    # P3 (§9)：项目级沙箱模式
+    sandboxMode: str | None = None
 
 
 class CharterGoalsUpdate(BaseModel):
@@ -275,6 +287,137 @@ def _validate_workspace_path(raw: str) -> Path:
     return resolved
 
 
+def _is_within_worktrees(
+    candidate: Path, existing_rows: list[dict], *, exclude_project_id: str | None = None
+) -> tuple[bool, str]:
+    """ACL 沙箱 m-1：拒绝把 workspace 建在另一项目的 .hiveweave/worktrees/ 之内。
+
+    防 SID 身份别名：若项目 B 的 workspace 落在项目 A 的 worktree 内，
+    B 的 worktree SID 将与 A 的 worktree 同路径同 SID，破坏项目间写隔离。
+    大小写不敏感比较（Windows 文件系统）。
+    """
+    cand_norm = str(candidate).replace("\\", "/").rstrip("/").lower()
+    for row in existing_rows:
+        row_dict = dict(row) if not isinstance(row, dict) else row
+        pid = row_dict.get("id")
+        if exclude_project_id and pid == exclude_project_id:
+            continue
+        ws = (row_dict.get("workspace_path") or "").replace("\\", "/").rstrip("/")
+        if not ws:
+            continue
+        wt_prefix = f"{ws.lower()}/.hiveweave/worktrees"
+        if cand_norm == ws.lower():
+            continue  # 同路径已由唯一性检查处理
+        # 需 `/` 边界：防 <ws>/.hiveweave/worktreesX/… 前缀假阳性
+        if cand_norm == wt_prefix or cand_norm.startswith(wt_prefix + "/"):
+            return True, (row_dict.get("name") or pid or "另一项目")
+    return False, ""
+
+
+def _additional_read_dirs_json(dirs: list[str] | None) -> str:
+    """§5.5b①：additionalReadDirs → projects 表 JSON 列（默认空数组）。"""
+    if not dirs:
+        return "[]"
+    cleaned = [d.strip() for d in dirs if d and d.strip()]
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
+def _additional_read_dirs_parse(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(d) for d in parsed if str(d).strip()]
+
+
+def _additional_writable_dirs_json(dirs: list[str] | None) -> str:
+    """P2 (§5.5b②)：additionalWritableDirs → projects 表 JSON 列（默认空数组）。"""
+    if not dirs:
+        return "[]"
+    cleaned = [d.strip() for d in dirs if d and d.strip()]
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
+def _additional_writable_dirs_parse(raw: Any) -> list[str]:
+    return _additional_read_dirs_parse(raw)
+
+
+def _validate_additional_writable_dirs(
+    dirs: list[str] | None,
+    project_root: str | None,
+    all_rows: list[dict],
+) -> list[str]:
+    """P2 (§5.5b②) 校验：绝对路径、非系统目录、不落在任何项目 .hiveweave/ 内、
+    不与其他项目 workspace 重叠（防 G6 跨项目写隔离被击穿）。
+
+    拒绝嵌套（位于任意项目 `.hiveweave/` 或 `worktrees/` 子树 → SID 身份别名 /
+    误授权平台系统区）；拒绝系统目录/盘根；拒绝与任何其他项目 workspace 根
+    相等/包含/被包含（否则项目 A 的受限 agent 被授予项目 B 源码树写权）。
+    校验用 resolve() 后的规范化路径，落库也存 resolve() 后路径（防 `..` 绕过
+    与校验/授权目标不一致）。
+    """
+    if not dirs:
+        return []
+    win_dir = (os.environ.get("WINDIR") or r"C:\Windows").lower()
+    out: list[str] = []
+    for raw in dirs:
+        d = (raw or "").strip()
+        if not d:
+            continue
+        expanded = _expand_windows_env_vars(d)
+        p = Path(expanded)
+        if not p.is_absolute():
+            raise HTTPException(
+                status_code=400,
+                detail=f"附加可写目录必须是绝对路径: {d}",
+            )
+        try:
+            resolved = str(p.resolve())
+        except (OSError, ValueError):
+            resolved = os.path.normpath(str(p))
+        norm = os.path.normcase(os.path.normpath(resolved))
+        # 系统目录 / 盘根拒绝
+        drive, tail = os.path.splitdrive(norm)
+        is_root = bool(drive) and (tail in ("\\", "/") or tail == "")
+        if is_root or norm == win_dir or norm.startswith(win_dir + "\\") \
+                or "\\program files" in norm or "\\program files (x86)" in norm:
+            raise HTTPException(
+                status_code=400,
+                detail=f"附加可写目录不能是系统目录或盘根: {d}",
+            )
+        for row in all_rows:
+            other_ws = (row.get("workspace_path") or "").strip()
+            if not other_ws:
+                continue
+            # 嵌套校验：不得位于任何项目 .hiveweave/（含 worktrees/）子树内
+            hw_prefix = os.path.normcase(os.path.normpath(other_ws)) + "\\.hiveweave"
+            if norm == hw_prefix or norm.startswith(hw_prefix + "\\"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"附加可写目录不得位于项目 .hiveweave/ 或 worktrees/ 内: {d}",
+                )
+            # M-2：不得与其他项目 workspace 根重叠（相等/包含/被包含）
+            other_norm = os.path.normcase(os.path.normpath(other_ws))
+            if (
+                norm == other_norm
+                or norm.startswith(other_norm + "\\")
+                or other_norm.startswith(norm + "\\")
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"附加可写目录不得与另一项目 workspace 重叠: {d} "
+                        f"（{other_ws}）"
+                    ),
+                )
+        out.append(resolved)
+    return out
+
+
 def _project_response(row: dict, active_id: str | None = None) -> dict:
     """把 DB 行转为响应 dict（同时含 snake_case 与 camelCase）。"""
     charter_raw = row.get("charter_json")
@@ -286,6 +429,11 @@ def _project_response(row: dict, active_id: str | None = None) -> dict:
             charter = None
     is_active = (row.get("id") == active_id) if active_id is not None else False
     is_started = bool(row.get("is_started") or 0)
+    additional_read = _additional_read_dirs_parse(row.get("additional_read_dirs"))
+    additional_writable = _additional_writable_dirs_parse(
+        row.get("additional_writable_dirs")
+    )
+    sandbox_mode = (row.get("sandbox_mode") or "").strip()
     return {
         "id": row.get("id"),
         "name": row.get("name"),
@@ -296,6 +444,12 @@ def _project_response(row: dict, active_id: str | None = None) -> dict:
         "orgParadigm": row.get("org_paradigm"),
         "language": row.get("language"),
         "charter": charter,
+        "additional_read_dirs": additional_read,
+        "additionalReadDirs": additional_read,
+        "additional_writable_dirs": additional_writable,
+        "additionalWritableDirs": additional_writable,
+        "sandbox_mode": sandbox_mode,
+        "sandboxMode": sandbox_mode,
         "is_active": is_active,
         "isActive": is_active,
         "is_started": is_started,
@@ -491,7 +645,8 @@ async def list_projects(status: str | None = Query(default=None)) -> dict:
     前端可通过 GET /api/projects/{id} 获取完整详情（含 charter 等）。
     """
     rows = await meta_db.query(
-        "SELECT id, name, workspace_path, is_started, created_at FROM projects ORDER BY created_at DESC"
+        "SELECT id, name, workspace_path, is_started, additional_read_dirs, "
+        "additional_writable_dirs, sandbox_mode, created_at FROM projects ORDER BY created_at DESC"
     )
     active_id = await _get_active_project_id()
     projects = [_project_response(dict(r), active_id) for r in rows]
@@ -534,6 +689,17 @@ async def create_project(body: ProjectCreate) -> dict:
                        f"(id: {row_dict.get('id')}). Delete it first or choose a "
                        f"different directory.",
             )
+
+    # ACL 沙箱 m-1：拒绝嵌套 workspace（防 SID 身份别名 —— 建在他人
+    # .hiveweave/worktrees/ 内会让两个项目共享同一 worktree SID）
+    nested_ws, nested_name = _is_within_worktrees(ws, existing_rows)
+    if nested_ws:
+        raise HTTPException(
+            status_code=400,
+            detail=f"workspace_path is inside project '{nested_name}' worktree "
+                   f"area (.hiveweave/worktrees). Choose a directory outside "
+                   f"other projects' worktrees.",
+        )
 
     # 清除可能的旧驱逐标记 — 同路径重建项目时恢复 DB 访问
     project_db.clear_evicted_workspace(str(ws))
@@ -661,6 +827,28 @@ async def create_project(body: ProjectCreate) -> dict:
         log.warning("project_git_init_failed", workspace=str(ws), error=str(e))
         # 非致命 — 项目仍可正常工作，只是 worktree 功能不可用
 
+    # P1 (spec §7.1)：ACL 沙箱 standing 授予后台铺设 —— .hiveweave PROTECTED
+    # 裁剪 + 项目根/cache/git ACE。用户既有目录可能十万级文件，分钟级一次性
+    # 传播，后台跑不进创建路径（沙箱 off 时 ensure_standing_grants 立即返回）。
+    try:
+        from hiveweave.services.acl_sandbox.service import ensure_standing_grants
+
+        async def _bg_acl_grant() -> None:
+            try:
+                await ensure_standing_grants(
+                    workspace_path=str(ws), project_workspace_path=str(ws)
+                )
+            except Exception as e:  # 铺授失败只告警，不阻断项目创建
+                log.warning(
+                    "acl_sandbox_project_grant_failed",
+                    workspace=str(ws), error=str(e),
+                )
+
+        asyncio.create_task(_bg_acl_grant())
+    except Exception as e:
+        log.warning("acl_sandbox_project_grant_spawn_failed",
+                    workspace=str(ws), error=str(e))
+
     charter = _build_charter_dict(body)
     # ── 收养路径的 id 决策 ─────────────────────────────────────
     # 正常收养：沿用旧 project_id（数据表全部无需迁移）。
@@ -693,14 +881,27 @@ async def create_project(body: ProjectCreate) -> dict:
             project_id = adopted_project_id
     now_ms = int(time.time() * 1000)
 
+    # P2 (§5.5b②)：附加可写目录校验（绝对路径/非系统/嵌套拒绝）
+    all_proj_rows = [dict(r) for r in await meta_db.query(
+        "SELECT id, name, workspace_path FROM projects"
+    )]
+    writable_dirs = _validate_additional_writable_dirs(
+        getattr(body, "additionalWritableDirs", None), str(ws), all_proj_rows
+    )
+
     try:
         await meta_db.execute(
-            "INSERT INTO projects (id, name, workspace_path, created_at) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO projects "
+            "(id, name, workspace_path, additional_read_dirs, "
+            "additional_writable_dirs, sandbox_mode, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             [
                 project_id,
                 body.name,
                 str(ws),
+                _additional_read_dirs_json(getattr(body, "additionalReadDirs", None)),
+                _additional_writable_dirs_json(writable_dirs),
+                (getattr(body, "sandboxMode", None) or "").strip(),
                 now_ms,
             ],
         )
@@ -767,7 +968,8 @@ async def create_project(body: ProjectCreate) -> dict:
         log.warning("start_game_time_after_create_failed", project_id=project_id, error=str(e))
 
     row = await meta_db.query_one(
-        "SELECT id, name, workspace_path, is_started, created_at FROM projects WHERE id = ?",
+        "SELECT id, name, workspace_path, is_started, additional_read_dirs, "
+        "additional_writable_dirs, sandbox_mode, created_at FROM projects WHERE id = ?",
         [project_id],
     )
     # 合并 project_meta (per-project DB) 到响应中
@@ -803,7 +1005,8 @@ async def get_project(project_id: str) -> dict:
     其余字段（description, charter_json, language 等）从 per-project DB project_meta 表读取。
     """
     row = await meta_db.query_one(
-        "SELECT id, name, workspace_path, is_started, created_at FROM projects WHERE id = ?",
+        "SELECT id, name, workspace_path, is_started, additional_read_dirs, "
+        "additional_writable_dirs, sandbox_mode, created_at FROM projects WHERE id = ?",
         [project_id],
     )
     if row is None:
@@ -838,7 +1041,8 @@ async def get_project(project_id: str) -> dict:
 
 async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
     row = await meta_db.query_one(
-        "SELECT id, name, workspace_path, is_started, created_at FROM projects WHERE id = ?",
+        "SELECT id, name, workspace_path, is_started, additional_read_dirs, "
+        "additional_writable_dirs, sandbox_mode, created_at FROM projects WHERE id = ?",
         [project_id],
     )
     if row is None:
@@ -852,10 +1056,42 @@ async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
     if body.name is not None:
         meta_sets.append("name = ?")
         meta_vals.append(body.name)
+    # P1 (§5.5b①)：外部只读参考目录
+    if body.additionalReadDirs is not None:
+        meta_sets.append("additional_read_dirs = ?")
+        meta_vals.append(_additional_read_dirs_json(body.additionalReadDirs))
+    # P2 (§5.5b②)：附加可写目录（校验嵌套/系统目录后落库）
+    if body.additionalWritableDirs is not None:
+        all_proj_rows = [dict(r) for r in await meta_db.query(
+            "SELECT id, name, workspace_path FROM projects"
+        )]
+        writable_dirs = _validate_additional_writable_dirs(
+            body.additionalWritableDirs, old_workspace, all_proj_rows
+        )
+        meta_sets.append("additional_writable_dirs = ?")
+        meta_vals.append(_additional_writable_dirs_json(writable_dirs))
+    # P3 (§9)：项目级沙箱模式
+    if body.sandboxMode is not None:
+        meta_sets.append("sandbox_mode = ?")
+        meta_vals.append((body.sandboxMode or "").strip())
     if body.workspacePath is not None and body.workspacePath != old_workspace:
         # 迁移工作空间
         # R2 fix: 校验新 workspace_path 安全性
         new_ws_dir = _validate_workspace_path(body.workspacePath)
+        # ACL 沙箱 m-1：迁移目标不得落在其他项目的 worktrees 内（防 SID 别名）
+        other_rows = await meta_db.query(
+            "SELECT id, name, workspace_path FROM projects"
+        )
+        nested_ws, nested_name = _is_within_worktrees(
+            new_ws_dir, other_rows, exclude_project_id=project_id
+        )
+        if nested_ws:
+            raise HTTPException(
+                status_code=400,
+                detail=f"workspace_path is inside project '{nested_name}' worktree "
+                       f"area (.hiveweave/worktrees). Choose a directory outside "
+                       f"other projects' worktrees.",
+            )
         new_ws = str(new_ws_dir)
         # 新路径清除驱逐标记（旧路径的标记保留，防止 rename 过程中旧 DB 被重连）
         project_db.clear_evicted_workspace(new_ws)
@@ -932,7 +1168,8 @@ async def _do_update_project(project_id: str, body: ProjectUpdate) -> dict:
 
     # ── Build response ─────────────────────────────────────
     updated = await meta_db.query_one(
-        "SELECT id, name, workspace_path, is_started, created_at FROM projects WHERE id = ?",
+        "SELECT id, name, workspace_path, is_started, additional_read_dirs, "
+        "additional_writable_dirs, sandbox_mode, created_at FROM projects WHERE id = ?",
         [project_id],
     )
     row_dict = dict(updated) if updated else {}
@@ -1528,3 +1765,4 @@ async def update_project_goals(project_id: str, body: CharterGoalsUpdate) -> dic
 @router.post("/{project_id}/goals")
 async def update_project_goals_post(project_id: str, body: CharterGoalsUpdate) -> dict:
     return await update_project_goals(project_id, body)
+

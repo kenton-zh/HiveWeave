@@ -17,6 +17,16 @@ import tempfile
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _sandbox_off(monkeypatch):
+    """P3 默认 on 后：本文件测敏感路径拦截（非沙箱）—— 显式关沙箱，
+    否则 OWNER_RIGHTS-only 临时目录会触发 SandboxUnavailableError。"""
+    from hiveweave.config import settings
+
+    monkeypatch.setattr(settings, "acl_sandbox", False)
+
+
 from hiveweave.tools.bash import execute_bash, execute_run_command
 from hiveweave.tools.security import is_sensitive_path
 

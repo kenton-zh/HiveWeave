@@ -25,6 +25,7 @@ export {
   activateProject,
   deactivateProject,
   createProject,
+  updateProject,
   deleteProject,
   getProjectGameTime,
   getProjectGoals,

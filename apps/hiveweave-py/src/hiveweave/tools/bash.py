@@ -7,7 +7,6 @@
 - 路径沙箱：workdir 必须在 workspace_path 内
 - 自毁命令拦截：7 个正则模式（rm -rf /, format, diskpart, shutdown, reboot, poweroff, halt）
 - 输出截断：> 1MB 截断并追加标记（轻量截断，不存盘）
-- Docker sandbox 选项（BASH_SANDBOX=docker，预留接口）
 - 环境变量注入 HIVEWEAVE_BASH=1 + HIVEWEAVE_WORKSPACE=<cwd>
 """
 
@@ -53,7 +52,6 @@ _CWD_FAILURE_HINT = (
 # ANSI 转义序列（颜色 / 光标控制）。Windows 下 Git Bash、cmd 及许多 CLI 会
 # 输出 VT 颜色码，原样回传给 LLM 会污染上下文，需在尾部截断后剥离。
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
-DOCKER_SANDBOX_IMAGE = "hiveweave/sandbox:latest"
 
 # P0-3 增量2 (audit 2026-07-28): long-running dev-server commands run forever
 # and lock node_modules. When spawned via bash they were never registered, so
@@ -186,6 +184,7 @@ async def _run_registered_dev_server(
     workspace_path: str,
     project_id: str | None,
     port_hint: int,
+    agent_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Spawn a dev server via the registered path (non-blocking, tracked).
 
@@ -202,6 +201,7 @@ async def _run_registered_dev_server(
         is_reserved_port,
         lookup_by_port,
         pick_observed_listen_port,
+        prepare_spawn_command,
         prune_dead_processes,
         register,
         spawn_project_process,
@@ -209,6 +209,8 @@ async def _run_registered_dev_server(
         terminate_spawned,
         listening_ports_for_pid,
     )
+    from hiveweave.services.acl_sandbox.integration import acl_sandbox_active
+    from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
 
     command = _strip_trailing_ampersand(command)
     pid = project_id or "default"
@@ -265,12 +267,61 @@ async def _run_registered_dev_server(
         }
 
     try:
-        proc, spawn_err, meta = spawn_project_process(
-            command,
-            cwd=cwd,
-            project_id=project_id,
-            preferred_port=port,
+        if acl_sandbox_active():
+            # P1 §5.7：dev server 收编 —— 受限长驻 spawn，注册 process_registry。
+            from hiveweave.services.acl_sandbox.integration import (
+                build_confined_command,
+                resolve_project_root,
+            )
+            from hiveweave.services.acl_sandbox.service import spawn_confined
+
+            cmd2, extra_env, prep_err = prepare_spawn_command(
+                command, project_id=project_id, preferred_port=port
+            )
+            if prep_err:
+                return {
+                    "success": False, "output": "",
+                    "error": prep_err, "blocked": True,
+                }
+            project_root = await resolve_project_root(project_id)
+            sres = await spawn_confined(
+                command=build_confined_command(cmd2),
+                workdir=cwd,
+                workspace_path=cwd,
+                agent_id=agent_id or "unknown",
+                project_id=project_id,
+                project_workspace_path=project_root,
+                entry="dev_server",
+                long_running=True,
+                env_extra=extra_env,
+            )
+            if sres is not None:
+                proc = _ConfinedDevProc(sres["job"])
+                spawn_err = None
+                meta = {
+                    "command": cmd2,
+                    "cwd": cwd,
+                    "pid": proc.pid,
+                    "env_port": extra_env.get("PORT") or extra_env.get("VITE_PORT"),
+                }
+            else:
+                proc, spawn_err, meta = spawn_project_process(
+                    command, cwd=cwd, project_id=project_id, preferred_port=port
+                )
+        else:
+            proc, spawn_err, meta = spawn_project_process(
+                command,
+                cwd=cwd,
+                project_id=project_id,
+                preferred_port=port,
+            )
+    except SandboxUnavailableError as e:
+        # fail-closed：沙箱不可用 → 直接干净拒绝，不重复 spawn / 不落原生。
+        log.warning(
+            "bash.dev_server_sandbox_unavailable",
+            error=str(e), command=command[:120], cwd=cwd[:120],
         )
+        return e.to_tool_dict()
     except Exception as e:
         log.warning(
             "bash.dev_server_spawn_failed",
@@ -425,6 +476,77 @@ def _build_safe_env(cwd: str) -> dict[str, str]:
     from hiveweave.util.safe_env import build_child_env
 
     return build_child_env(cwd, bash_markers=True)
+
+
+# ── P1: ACL 沙箱接线（spec §5.7） ─────────────────────────────
+def _native_shaped(result: dict) -> dict[str, Any]:
+    """把 spawn_confined 的 {exit_code,stdout,stderr,timed_out} 归一为 native 形态。"""
+    stdout = result.get("stdout", "") or ""
+    stderr = result.get("stderr", "") or ""
+    combined = stdout + ("\n" + stderr if stdout and stderr else stderr)
+    return {
+        "output": combined,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": result.get("exit_code"),
+        "timed_out": bool(result.get("timed_out", False)),
+        "error": None,
+    }
+
+
+async def _run_sandboxed(
+    command: str,
+    cwd: str,
+    timeout_s: float | None,
+    *,
+    workspace_path: str,
+    agent_id: str | None,
+    project_id: str | None,
+    entry: str,
+    long_running: bool = False,
+    env_extra: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """沙箱 on 时受限执行；返回 None = 沙箱未启用（调用方回退 native）。"""
+    from hiveweave.services.acl_sandbox.integration import (
+        acl_sandbox_active,
+        build_confined_command,
+        resolve_project_root,
+    )
+    from hiveweave.services.acl_sandbox.service import spawn_confined
+
+    if not acl_sandbox_active():
+        return None
+    project_root = await resolve_project_root(project_id)
+    confined = build_confined_command(command)
+    result = await spawn_confined(
+        command=confined,
+        workdir=cwd,
+        workspace_path=workspace_path,
+        agent_id=agent_id or "unknown",
+        project_id=project_id,
+        project_workspace_path=project_root,
+        timeout_s=timeout_s or 0,
+        entry=entry,
+        long_running=long_running,
+        env_extra=env_extra,
+    )
+    if result is None or result.get("long_running"):
+        return result
+    return _native_shaped(result)
+
+
+class _ConfinedDevProc:
+    """Popen-like shim for a sandboxed long-running dev server（pid + terminate）。"""
+
+    def __init__(self, job):
+        self.job = job
+        self.pid = job.pid
+
+    def terminate(self) -> None:
+        try:
+            self.job.terminate()
+        except Exception:  # noqa: BLE001
+            pass
 
 # Self-destructive command patterns (契约 02 — 7 patterns)
 # Match semantics mirror Elixir check_self_destructive/1:
@@ -803,6 +925,91 @@ def _map_unix_to_cmd(cmd: str) -> str:
     return re.sub(pattern, _replacer, cmd)
 
 
+def _map_unix_to_pwsh(cmd: str) -> str:
+    """bash 惯用法命令 → pwsh 等价（受限 shell 方言适配，spec §18.3）。
+
+    与 ``_map_unix_to_cmd``（cmd 兜底路径）不同，这里处理**带 unix flag** 的
+    常见命令（pwsh 别名无 POSIX flag 语义，`ls -la` 会报参数错误）——只匹配
+    明确模式，不误伤 pwsh 本就兼容的调用。
+    """
+    import re
+
+    # ls -la / ls -l / ls -a → Get-ChildItem -Force（近似列出全部）
+    cmd = re.sub(r'\bls\s+(-la|-l|--long|-al)\b', 'Get-ChildItem -Force', cmd)
+    cmd = re.sub(r'\bls\s+-a\b', 'Get-ChildItem -Force', cmd)
+    # head -N file → Get-Content file -TotalCount N
+    cmd = re.sub(
+        r'\bhead\s+-(\d+)\s+([^\s|;&]+)',
+        r"Get-Content \2 -TotalCount \1", cmd)
+    # tail -N file → Get-Content file -Tail N
+    cmd = re.sub(
+        r'\btail\s+-(\d+)\s+([^\s|;&]+)',
+        r"Get-Content \2 -Tail \1", cmd)
+    # mkdir -p dir → New-Item -ItemType Directory -Force -Path dir
+    cmd = re.sub(
+        r'\bmkdir\s+-p\s+([^\s|;&]+)',
+        r"New-Item -ItemType Directory -Force -Path \1", cmd)
+    # grep pattern file → Select-String -Pattern pattern file
+    cmd = re.sub(
+        r'\bgrep\s+([^\s|;&]+)\s+([^\s|;&]+)',
+        r"Select-String -Pattern \1 \2", cmd)
+    return cmd
+
+
+def _normalize_for_pwsh(command: str) -> str:
+    """受限 shell 方言适配（spec §18.3）：bash 惯用法 → pwsh 语法。
+
+    受限模式 shell = pwsh 优先（Git Bash 不可用，S1），而 agent 习惯写 bash
+    语法。只转换**明确**的 bash 惯用法；pwsh 本就兼容的（git/echo/pwd/重定向
+    /``&&``/``||``/``$?``）不动：
+    - ``export A=B [C=D]`` → ``$env:A='B'; $env:C='D';``（尾部 ``&&``/``||``/``;``
+      一并吞掉 —— 赋值语句后不允许 pipeline-chain 运算符）
+    - ``$VAR`` / ``${VAR}`` → ``$env:VAR``（排除 pwsh 保留变量）
+    - ``source file`` → ``. file``（pwsh dot-source）
+    - 带 unix flag 的常见命令（``ls -la`` / ``head -N`` / ``tail -N`` /
+      ``mkdir -p`` / ``grep``）→ pwsh 等价
+    - python3/pip3 → python/pip（与 native 一致）
+    """
+    import re
+
+    # 排除 pwsh 保留/常用变量 —— 这些是 PowerShell 语言量，不能当 env 引用。
+    # ``env`` 必须排除：`$env:X` 已限定 env，裸转 `$env:env:X` 会坏。
+    _PWSH_RESERVED = {
+        "_", "args", "input", "host", "PID", "HOME", "null", "true", "false",
+        "LASTEXITCODE", "PSVersionTable", "MyInvocation", "Error", "Matches",
+        "env", "PSScriptRoot", "PSCommandPath", "ExecutionContext", "ShellId",
+    }
+
+    # export A=B [C=D]（吞掉语句边界 `;`/`&&`/`||` —— 赋值后不能跟 chain 运算符）
+    def _export_replacer(m: re.Match) -> str:
+        body = m.group(1)
+        pairs = re.findall(
+            r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|([^\s;|&]+))',
+            body)
+        return "".join(
+            f"$env:{k}='{v1 or v2}'; " for k, v1, v2 in pairs if k
+        )
+
+    cmd = re.sub(
+        r'\bexport\s+([^;|&\n]+)\s*(?:&&|\|\||;)?\s*',
+        _export_replacer, command)
+    # ${VAR} → $env:VAR
+    cmd = re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}', r'$env:\1', cmd)
+    # 裸 $VAR → $env:VAR（bash 语义 = 环境变量）；排除 pwsh 保留量
+    cmd = re.sub(
+        r'(?<![$\w])\$([A-Za-z_][A-Za-z0-9_]*)',
+        lambda m: m.group(0) if m.group(1) in _PWSH_RESERVED else f'$env:{m.group(1)}',
+        cmd)
+    # source file → . file
+    cmd = re.sub(r'\bsource\s+', '. ', cmd)
+    # python3/pip3
+    cmd = re.sub(r'\bpython3\b', 'python', cmd)
+    cmd = re.sub(r'\bpip3\b', 'pip', cmd)
+    # 带 flag 的 unix 命令 → pwsh 等价
+    cmd = _map_unix_to_pwsh(cmd)
+    return cmd
+
+
 def _decode_output(raw: bytes) -> str:
     """P2 fix(TEST10): 解码子进程输出。
 
@@ -936,67 +1143,6 @@ async def _run_native(command: str, cwd: str, timeout_s: int | None) -> dict[str
     }
 
 
-async def _run_docker(command: str, cwd: str, timeout_s: int | None) -> dict[str, Any]:
-    """Execute command inside a Docker sandbox container.
-
-    BASH_SANDBOX=docker enables this path. Mounts the workspace read-write
-    at /workspace inside the container. Best-effort: if docker is unavailable,
-    falls back to native execution with a warning.
-    """
-    docker_cmd = [
-        "docker", "run", "--rm",
-        "-w", "/workspace",
-        "-v", f"{cwd}:/workspace",
-        "-e", "HIVEWEAVE_BASH=1",
-        "-e", "HIVEWEAVE_WORKSPACE=/workspace",
-        "--network", "host",
-        DOCKER_SANDBOX_IMAGE,
-        "sh", "-c", command,
-    ]
-
-    try:
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
-
-        proc = await asyncio.create_subprocess_exec(
-            *docker_cmd,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.DEVNULL,
-            **windows_no_window_kwargs(),
-        )
-    except FileNotFoundError:
-        log.warning("bash.docker_unavailable", reason="docker binary not found")
-        return await _run_native(command, cwd, timeout_s)
-
-    try:
-        if timeout_s is None or timeout_s <= 0:
-            stdout_bytes, stderr_bytes = await proc.communicate()
-        else:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout_s
-            )
-    except asyncio.TimeoutError:
-        await _kill_subprocess(proc)
-        return {"output": "", "stdout": "", "stderr": "",
-                "exit_code": None, "timed_out": True, "error": None}
-    except asyncio.CancelledError:
-        await _kill_subprocess(proc)
-        raise
-
-    stdout = _decode_output(stdout_bytes) if stdout_bytes else ""
-    stderr = _decode_output(stderr_bytes) if stderr_bytes else ""
-    combined = stdout + ("\n" + stderr if stdout and stderr else stderr)
-    return {
-        "output": combined,
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": proc.returncode,
-        "timed_out": False,
-        "error": None,
-    }
-
-
 def _cwd_style_hint(cwd: str, relative: str | None = None) -> str:
     """MAIN vs worktree label — relative path only, never dump D:\\ or /d/."""
     return (
@@ -1010,8 +1156,8 @@ async def execute_bash(
     workdir: str,
     workspace_path: str,
     timeout_ms: int | None = None,
-    use_docker: bool | None = None,
     project_id: str | None = None,
+    agent_id: str | None = None,
     unbounded: bool = False,
 ) -> dict[str, Any]:
     """Execute a bash command and return {success, output, error}.
@@ -1021,7 +1167,7 @@ async def execute_bash(
       2. Sandbox validation (workdir must be within workspace)
       3. Timeout: foreground clamped 5s..600s; unbounded/timeout_ms=0 waits
          until the process exits (background bash / job_kill).
-      4. Execute (persistent sandbox > one-shot docker > native)
+      4. Execute (ACL sandbox > native)
       5. Truncate output at 1MB (layer 2, bash-specific)
     """
     if not command or not command.strip():
@@ -1046,7 +1192,13 @@ async def execute_bash(
     # 1.5. Auto-source .hiveweave/env.sh if the project has one.
     # The project declares its own environment setup.
     hw_dir = str(Path(workspace_path) / ".hiveweave")
-    command = _source_env_sh(command, hw_dir)
+    # P1：沙箱 on 时受限 shell 是 pwsh/cmd，无法 source bash 语法的 env.sh ——
+    # 跳过前缀（否则所有命令被 `source` 掐死），项目环境由 .hiveweave 之外
+    # 的机制声明（见 spec §18.3 受限 shell 方言适配）。
+    from hiveweave.services.acl_sandbox.integration import acl_sandbox_active
+
+    if not acl_sandbox_active():
+        command = _source_env_sh(command, hw_dir)
 
     # 2. Resolve cwd and validate sandbox
     ws = workspace_path or os.getcwd()
@@ -1072,9 +1224,10 @@ async def execute_bash(
     # the registered spawn path so stop_processes_for_worktree can kill them.
     # Bash-spawned dev servers were unregistered → WinError 32 on teardown.
     port_hint = _detect_dev_server_command(command)
-    if port_hint is not None and not use_docker:
+    if port_hint is not None:
         routed = await _run_registered_dev_server(
-            command, cwd, workspace_path, project_id, port_hint
+            command, cwd, workspace_path, project_id, port_hint,
+            agent_id=agent_id,
         )
         if routed is not None:
             return routed
@@ -1094,13 +1247,14 @@ async def execute_bash(
         timeout_ms = max(5000, min(timeout_ms, MAX_TIMEOUT_S * 1000))
         timeout_s = timeout_ms / 1000
 
-    # 4. Choose execution backend (priority: persistent sandbox > one-shot docker > native)
-    result = None
-
     # 4. Choose execution backend
-    if use_docker:
-        result = await _run_docker(command, cwd, int(timeout_s or 0))
-    else:
+    # P1 (spec §5.7): ACL 沙箱 on 时受限执行；None = 未启用 → native。
+    result = await _run_sandboxed(
+        command, cwd, timeout_s,
+        workspace_path=ws, agent_id=agent_id, project_id=project_id,
+        entry="bash",
+    )
+    if result is None:
         result = await _run_native(command, cwd, int(timeout_s or 0))
 
     if result.get("error"):
@@ -1150,6 +1304,8 @@ async def execute_run_command(
     cwd: str,
     timeout_ms: int,
     workspace_path: str,
+    agent_id: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Lower-level escape hatch with self-destructive guard (A3 fix).
 
@@ -1203,7 +1359,14 @@ async def execute_run_command(
     log.info("run_command.execute", cwd=full_cwd, timeout_s=timeout_s,
              command_preview=command[:120])
 
-    result = await _run_native(command, full_cwd, timeout_s)
+    # P1 (spec §5.7): run_command 收编进沙箱；None = 未启用 → native。
+    result = await _run_sandboxed(
+        command, full_cwd, timeout_s,
+        workspace_path=ws, agent_id=agent_id, project_id=project_id,
+        entry="run_command",
+    )
+    if result is None:
+        result = await _run_native(command, full_cwd, timeout_s)
 
     if result.get("error"):
         return {"success": False, "output": "",
@@ -1953,7 +2116,8 @@ async def _bash_background(
     port_hint = _detect_dev_server_command(cmd)
     if port_hint is not None:
         routed = await _run_registered_dev_server(
-            cmd, exec_ws, exec_ws, project_id, port_hint
+            cmd, exec_ws, exec_ws, project_id, port_hint,
+            agent_id=agent_id,
         )
         if routed is not None:
             if routed.get("success"):
@@ -1976,6 +2140,7 @@ async def _bash_background(
             workspace_path=exec_ws,
             timeout_ms=0,
             project_id=project_id,
+            agent_id=agent_id,
             unbounded=True,
         )
         _update_cwd_failure_streak(
@@ -2092,6 +2257,7 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
         workspace_path=exec_ws,
         timeout_ms=params.timeout,
         project_id=project_id,
+        agent_id=agent_id,
     )
     # D4: track consecutive failures per (agent_id, cwd)
     _streak_hint = _update_cwd_failure_streak(
@@ -2228,6 +2394,8 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         cwd=params.cwd,
         timeout_ms=params.timeout,
         workspace_path=exec_ws,
+        agent_id=agent_id,
+        project_id=project_id,
     )
     # D4: track consecutive failures per (agent_id, cwd)
     _effective_cwd = str(Path(exec_ws) / params.cwd) if params.cwd else exec_ws

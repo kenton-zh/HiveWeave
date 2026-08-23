@@ -12,6 +12,9 @@ dependencies = [
     "httpx>=0.27.0",
     "websockets>=12.0",
     "structlog>=24.0",
+    # ACL 沙箱依赖（§10.2）：pywin32 仅 Windows 有 wheel —— 平台 marker 防
+    # Linux/macOS `uv sync` 拉取失败（代码层 try/except 已跨平台）。
+    "pywin32>=312; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +36,9 @@ packages = ["src/hiveweave"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "win32: ACL 沙箱集成测试（真实受限令牌，仅 Windows 运行；非 Windows 自动 skip）",
+]
 # 单测卡死 120s 自动 dump 全线程栈（定位 teardown/loop 挂起用；
 # 正常套件最慢单测远低于此值，不会误触发）
 faulthandler_timeout = 120

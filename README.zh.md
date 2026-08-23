@@ -148,7 +148,7 @@ pnpm dev
 | 数据库 | SQLite + aiosqlite | 双 DB：Meta DB（WAL）+ Per-project DB |
 | AI/LLM | httpx SSE 流式 + Provider Factory | OpenAI、Anthropic、DeepSeek、Groq、Google |
 | 实时通信 | phoenix.js + phoenix_adapter（WebSocket） | 3 频道：lobby、project、agent |
-| 沙箱 | Docker（可选） | `BASH_SANDBOX=docker` |
+| 沙箱 | ACL 写受限令牌（Windows） | `HIVEWEAVE_ACL_SANDBOX=on` |
 | 构建 | Turbo | Monorepo 任务编排 |
 | 包管理 | pnpm 10 + uv | Monorepo + Python 包 |
 

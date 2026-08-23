@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -126,6 +127,36 @@ def infer_project_root(workspace_path: str) -> str:
                 return str(p)
             return str(Path(parts[0]).joinpath(*parts[1:i]))
     return str(p)
+
+
+async def fetch_additional_read_dirs(project_root: str) -> list[str]:
+    """P1 (§5.5b①)：项目级配置的外部只读目录（projects.additional_read_dirs）。
+
+    大小写不敏感匹配 workspace_path（Windows）。无配置/查询失败 → 空列表
+    （fail-open 到现状行为，不阻断读）。
+    """
+    import json as _json
+
+    try:
+        from hiveweave.db import meta as meta_db
+
+        rows = await meta_db.query(
+            "SELECT workspace_path, additional_read_dirs FROM projects"
+        )
+        target = os.path.normcase(os.path.normpath(project_root))
+        for r in rows:
+            ws = r["workspace_path"] or ""
+            if os.path.normcase(os.path.normpath(ws)) != target:
+                continue
+            raw = r["additional_read_dirs"] or "[]"
+            try:
+                parsed = _json.loads(raw)
+            except (ValueError, TypeError):
+                return []
+            return [str(d) for d in parsed if str(d).strip()]
+    except Exception:
+        return []
+    return []
 
 
 def _double_worktree_prefix(workspace_path: str, full_path: str) -> str | None:
@@ -249,15 +280,26 @@ def _resolve_for_read_detail(
     write_workspace: str,
     file_path: str,
     project_root: str | None = None,
+    extra_read_dirs: list[str] | None = None,
 ) -> tuple[str | None, str | None]:
     """Like resolve_for_read, but reports *why* resolution failed.
 
     hint is non-None only when the path repeats the worktree prefix (ghost
     nest) — callers surface it as a clear error instead of a generic sandbox
     violation.
+
+    P1 (§5.5b①)：可读范围 = 项目根 ∪ ``extra_read_dirs``（外部只读参考）。
     """
     root = Path(project_root or infer_project_root(write_workspace)).resolve()
     write_ws = Path(write_workspace).resolve()
+    bases = [root]
+    for d in extra_read_dirs or []:
+        if not d:
+            continue
+        try:
+            bases.append(Path(d).resolve())
+        except OSError:
+            continue
     if not file_path:
         return str(write_ws), None
     file_path = normalize_input_path(file_path)
@@ -271,8 +313,8 @@ def _resolve_for_read_detail(
             full = (root / file_path.replace("\\", "/")).resolve()
         else:
             full = (write_ws / file_path).resolve()
-        if full != root:
-            full.relative_to(root)
+        if not _inside_any(full, bases):
+            raise ValueError("outside allowed read scope")
         # 报错优先于 _check_hiveweave_dir 放行：双重 worktree 前缀 → 拒绝（M4）
         if _double_worktree_prefix(str(write_ws), str(full)) is not None:
             return None, (
@@ -284,10 +326,24 @@ def _resolve_for_read_detail(
         return None, None
 
 
+def _inside_any(candidate: Path, bases: list[Path]) -> bool:
+    """``candidate`` 落在任一 ``base`` 内（含 base 自身）。"""
+    for base in bases:
+        if candidate == base:
+            return True
+        try:
+            candidate.relative_to(base)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def resolve_for_read(
     write_workspace: str,
     file_path: str,
     project_root: str | None = None,
+    extra_read_dirs: list[str] | None = None,
 ) -> str | None:
     """Resolve a path for READ access.
 
@@ -298,10 +354,14 @@ def resolve_for_read(
     Do not teach ``../`` as MAIN — from a worktree that is the sibling
     worktrees directory.
 
+    P1 (§5.5b①)：``extra_read_dirs`` 追加为可读范围（外部只读参考）。
+
     Returns None if the path escapes the project or repeats the worktree
     prefix (ghost-nest path, M4).
     """
-    full, hint = _resolve_for_read_detail(write_workspace, file_path, project_root)
+    full, hint = _resolve_for_read_detail(
+        write_workspace, file_path, project_root, extra_read_dirs
+    )
     if hint is not None:
         return None
     return full
@@ -390,19 +450,22 @@ async def read_file(
     limit: int,
     workspace_path: str,
     project_root: str | None = None,
+    extra_read_dirs: list[str] | None = None,
 ) -> dict[str, Any]:
     """Read a file with line numbers. Refuses binary files.
 
     Returns {success, output, error} where output is line-numbered text.
-    Reads may resolve anywhere under the project root; writes stay sandboxed
-    to workspace_path (see write_file).
+    Reads may resolve anywhere under the project root (∪ extra_read_dirs, P1);
+    writes stay sandboxed to workspace_path (see write_file).
     """
     if not file_path:
         return {"success": False, "output": "",
                 "error": "Error: filePath is required"}
 
     root = project_root or infer_project_root(workspace_path)
-    full, hint = _resolve_for_read_detail(workspace_path, file_path, root)
+    full, hint = _resolve_for_read_detail(
+        workspace_path, file_path, root, extra_read_dirs
+    )
     if hint is not None:
         return {"success": False, "output": "", "error": f"Error: {hint}",
                 "blocked": True}
@@ -539,6 +602,7 @@ async def list_files(
     maxdepth: int = 1,
     include_ignored: bool = False,
     project_root: str | None = None,
+    extra_read_dirs: list[str] | None = None,
 ) -> dict[str, Any]:
     """List directory contents with [DIR]/[FILE] tags and sizes.
 
@@ -556,7 +620,9 @@ async def list_files(
     depth = max(1, min(maxdepth, 3)) if recursive else 1
 
     if path:
-        full, hint = _resolve_for_read_detail(workspace_path, path, root)
+        full, hint = _resolve_for_read_detail(
+            workspace_path, path, root, extra_read_dirs
+        )
         if hint is not None:
             return {"success": False, "output": "", "error": f"Error: {hint}",
                     "blocked": True}
@@ -738,11 +804,14 @@ class ListFilesParams(BaseModel):
 )
 async def read_file_tool(params: ReadFileParams, agent_id: str, workspace: str) -> ToolResult:
     """Read a file with line numbers. Refuses binary files."""
+    # P1 (§5.5b①)：外部只读参考目录（仅读工具生效，写仍锁 workspace）
+    extra = await fetch_additional_read_dirs(infer_project_root(workspace))
     result = await read_file(
         file_path=params.file_path,
         offset=params.offset,
         limit=params.limit,
         workspace_path=workspace,
+        extra_read_dirs=extra,
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])
@@ -785,12 +854,15 @@ async def write_file_tool(params: WriteFileParams, agent_id: str, workspace: str
 )
 async def list_files_tool(params: ListFilesParams, agent_id: str, workspace: str) -> ToolResult:
     """List directory contents with [DIR]/[FILE] tags and sizes."""
+    # P1 (§5.5b①)：外部只读参考目录（仅读工具生效）
+    extra = await fetch_additional_read_dirs(infer_project_root(workspace))
     result = await list_files(
         path=params.dir_path or "",
         workspace_path=workspace,
         recursive=params.recursive,
         maxdepth=params.maxdepth,
         include_ignored=params.include_ignored,
+        extra_read_dirs=extra,
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])

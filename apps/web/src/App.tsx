@@ -27,7 +27,7 @@ const ConfirmDialog = lazyRetry(() => import("./components/ConfirmDialog"));
 const TimelineView = lazyRetry(() => import("./components/timeline/TimelineView"));
 const TaskTimelinePanel = lazyRetry(() => import("./components/timeline/TaskTimelinePanel"));
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend } from "./api";
+import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend, updateProject } from "./api";
 import type { DeleteProjectResponse, Project } from "./api";
 
 function App() {
@@ -75,6 +75,13 @@ function App() {
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
   const [projectStarting, setProjectStarting] = useState(false);
+  // P1 (§5.5b①)：项目设置 —— 外部只读参考目录
+  const [showProjectSettings, setShowProjectSettings] = useState(false);
+  const [readDirsDraft, setReadDirsDraft] = useState("");
+  const [savingReadDirs, setSavingReadDirs] = useState(false);
+  const [writableDirsDraft, setWritableDirsDraft] = useState("");
+  const [savingWritableDirs, setSavingWritableDirs] = useState(false);
+  const [sandboxModeDraft, setSandboxModeDraft] = useState("");
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [queuedDeleteIds, setQueuedDeleteIds] = useState<string[]>([]);
@@ -206,6 +213,45 @@ function App() {
   };
 
   const currentProject = projects.find((p) => p.id === selectedProjectId);
+
+  // P1/P2 (§5.5b)：打开项目设置 —— 编辑外部只读参考 / 附加可写目录
+  const openProjectSettings = () => {
+    if (!currentProject) return;
+    setReadDirsDraft((currentProject.additionalReadDirs ?? []).join(", "));
+    setWritableDirsDraft((currentProject.additionalWritableDirs ?? []).join(", "));
+    setSandboxModeDraft((currentProject.sandboxMode ?? "").trim());
+    setShowProjectSettings(true);
+    setShowProjectMenu(false);
+  };
+
+  const saveProjectDirs = async () => {
+    if (!selectedProjectId) return;
+    setSavingReadDirs(true);
+    try {
+      const readDirs = readDirsDraft
+        .split(/[,，\n]/)
+        .map((d) => d.trim())
+        .filter(Boolean);
+      const writableDirs = writableDirsDraft
+        .split(/[,，\n]/)
+        .map((d) => d.trim())
+        .filter(Boolean);
+      await updateProject(selectedProjectId, {
+        additionalReadDirs: readDirs,
+        additionalWritableDirs: writableDirs,
+        sandboxMode: sandboxModeDraft.trim(),
+      });
+      const list = await getProjects();
+      setProjects(list);
+      setShowProjectSettings(false);
+      showToast("项目目录设置已保存", "success");
+    } catch (err) {
+      console.error("Save project dirs failed:", err);
+      showToast("保存失败", "error");
+    } finally {
+      setSavingReadDirs(false);
+    }
+  };
 
   const handleSwitchProject = (id: string) => {
     const st = useAppStore.getState();
@@ -457,6 +503,18 @@ function App() {
               ))}
 
               <div className="border-t border-g-border mt-1 pt-1">
+                {selectedProjectId && (
+                  <button
+                    onClick={openProjectSettings}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-gm transition-colors"
+                  >
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    </svg>
+                    项目设置
+                  </button>
+                )}
                 <button
                   onClick={() => setShowFolderPicker(true)}
                   className="w-full flex items-center gap-2 px-3 py-2 text-sm text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-gm transition-colors"
@@ -824,6 +882,60 @@ function App() {
             onConfirm={handleConfirmDelete}
             onCancel={() => setConfirmDelete(null)}
           />
+        )}
+
+        {showProjectSettings && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4 animate-fade-in" onClick={() => setShowProjectSettings(false)}>
+            <div className="w-full max-w-md bg-white rounded-gmLg border border-g-border shadow-gm-pop p-5 animate-scale-in" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-[15px] font-semibold text-g-fg">项目设置 — {currentProject?.name}</h3>
+                <button type="button" onClick={() => setShowProjectSettings(false)} className="text-g-fg-4 hover:text-g-fg rounded-full p-1 transition-colors">
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <label className="block text-xs text-g-fg-2 mb-1">
+                外部参考目录（只读，逗号分隔；agent 的 read_file/grep/list 可读，不授予写）
+              </label>
+              <textarea
+                value={readDirsDraft}
+                onChange={(e) => setReadDirsDraft(e.target.value)}
+                rows={4}
+                placeholder={"D:\\参考资料\nD:\\共享组件库"}
+                className="w-full px-3 py-2 text-[13px] text-g-fg bg-g-bg-muted border border-g-border rounded-gm focus:border-g-blue focus:ring-1 focus:ring-g-blue/30 outline-none resize-y"
+              />
+              <label className="block text-xs text-g-fg-2 mb-1 mt-3">
+                附加可写目录（仅 ACL 沙箱 on 时生效；逗号分隔；agent 受限令牌可写，拒绝系统目录/项目 .hiveweave 内）
+              </label>
+              <textarea
+                value={writableDirsDraft}
+                onChange={(e) => setWritableDirsDraft(e.target.value)}
+                rows={4}
+                placeholder={"D:\\素材库\nD:\\共享可写目录"}
+                className="w-full px-3 py-2 text-[13px] text-g-fg bg-g-bg-muted border border-g-border rounded-gm focus:border-g-blue focus:ring-1 focus:ring-g-blue/30 outline-none resize-y"
+              />
+              <label className="block text-xs text-g-fg-2 mb-1 mt-3">
+                沙箱模式（ACL 沙箱 on 时生效；默认继承环境，危险全开放=信任项目跳过沙箱）
+              </label>
+              <select
+                value={sandboxModeDraft}
+                onChange={(e) => setSandboxModeDraft(e.target.value)}
+                className="w-full px-3 py-2 text-[13px] text-g-fg bg-g-bg-muted border border-g-border rounded-gm focus:border-g-blue focus:ring-1 focus:ring-g-blue/30 outline-none"
+              >
+                <option value="">继承环境（默认启用沙箱）</option>
+                <option value="danger-full-access">danger-full-access（逃生门，跳过沙箱）</option>
+              </select>
+              <div className="flex justify-end gap-2 mt-4">
+                <button type="button" onClick={() => setShowProjectSettings(false)} className="px-3 py-1.5 text-[13px] text-g-fg-2 hover:text-g-fg rounded-gm transition-colors">
+                  取消
+                </button>
+                <button type="button" disabled={savingReadDirs} onClick={saveProjectDirs} className="px-3 py-1.5 text-[13px] text-white bg-g-blue hover:bg-g-blue/90 rounded-gm transition-all disabled:opacity-50">
+                  {savingReadDirs ? "保存中..." : "保存"}
+                </button>
+              </div>
+            </div>
+          </div>
         )}
 
         <QuestionDialog />

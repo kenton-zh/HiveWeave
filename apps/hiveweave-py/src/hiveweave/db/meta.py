@@ -49,6 +49,12 @@ _META_MIGRATIONS: list[tuple[str, str, str]] = [
     ("llm_models", "tier", "TEXT"),
     # Bug K fix: per-project is_started flag (上班/下班)
     ("projects", "is_started", "INTEGER DEFAULT 0"),
+    # P1 (spec §5.5b①)：外部只读参考目录（JSON 数组；file.py 读白名单扩展）
+    ("projects", "additional_read_dirs", "TEXT DEFAULT '[]'"),
+    # P2 (spec §5.5b②)：附加可写目录（JSON 数组；acl_sandbox extra SID grant）
+    ("projects", "additional_writable_dirs", "TEXT DEFAULT '[]'"),
+    # P3 (spec §9)：项目级沙箱模式（'' = 继承 env；danger-full-access = 逃生门）
+    ("projects", "sandbox_mode", "TEXT DEFAULT ''"),
     # 注: 不再添加 projects.language — 该列的真相源在 per-project DB
     # 的 project_meta 表（见 db/schema.py PROJECT_DB_TABLES），见
     # api/projects.py:_fetch_project_meta 注释。旧 DB 残留的 language 列

@@ -16,7 +16,7 @@
 | **包管理** | pnpm 10.31 (前端) + uv (后端) | monorepo |
 | **构建工具** | Turbo | 前端任务编排 |
 | **运行时** | Node.js >=22 <24 + Python >=3.12 | |
-| **沙箱** | Docker (可选, BASH_SANDBOX=docker) | |
+| **沙箱** | ACL 写受限令牌（Windows） | `HIVEWEAVE_ACL_SANDBOX=on` |
 
 ## 目录结构
 

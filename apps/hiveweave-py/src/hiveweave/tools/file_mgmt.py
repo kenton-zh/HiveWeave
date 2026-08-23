@@ -193,14 +193,16 @@ async def search_files_tool(params: SearchFilesParams, agent_id: str, workspace:
     from .file import (
         _check_hiveweave_dir,
         _is_sensitive,
+        fetch_additional_read_dirs,
         infer_project_root,
         resolve_for_read,
     )
 
     root = Path(infer_project_root(workspace)).resolve()
     ws = Path(workspace).resolve()
+    extra = await fetch_additional_read_dirs(str(root))
     if params.directory != ".":
-        resolved = resolve_for_read(workspace, params.directory, str(root))
+        resolved = resolve_for_read(workspace, params.directory, str(root), extra)
         if resolved is None:
             return ToolResult.err(f"Path traversal denied: {params.directory}")
         search_dir = Path(resolved)

@@ -301,8 +301,16 @@ async def execute_registered_tool(
         project_root = None
         if ctx is not None:
             project_root = ctx.extra.get("project_root")
+        # P1 (§5.5b①)：读工具白名单需在 pipeline 层一并放行外部只读目录
+        # （否则在 file.py 之前就被 `path must be within project` 拦下）。
+        from .file import fetch_additional_read_dirs, infer_project_root
+
+        extra_read_dirs = await fetch_additional_read_dirs(
+            project_root or infer_project_root(workspace_path)
+        )
         security_error = _check_file_security(
-            params, workspace_path, tool_name=tool_name, project_root=project_root
+            params, workspace_path, tool_name=tool_name, project_root=project_root,
+            extra_read_dirs=extra_read_dirs,
         )
         if security_error:
             return ToolResult.blocked_err(security_error).to_dict()
@@ -354,6 +362,7 @@ def _check_file_security(
     workspace_path: str,
     tool_name: str = "",
     project_root: str | None = None,
+    extra_read_dirs: list[str] | None = None,
 ) -> str | None:
     """Unified file operation security check.
 
@@ -377,7 +386,9 @@ def _check_file_security(
 
     def _resolve_detail(path: str) -> tuple[str | None, str | None]:
         if allow_project_read:
-            return _resolve_for_read_detail(workspace_path, path, root)
+            return _resolve_for_read_detail(
+                workspace_path, path, root, extra_read_dirs
+            )
         return _resolve_safe_detail(workspace_path, path)
 
     # Extract file path from params — try common field names

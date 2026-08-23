@@ -141,3 +141,19 @@ async def restart_frontend() -> dict:
     except Exception as e:
         log.error("system_restart_frontend_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/acl-sandbox-stats")
+async def acl_sandbox_stats() -> dict:
+    """ACL 沙箱遥测快照（spec §13 P1/P3：fail-closed/拒绝命中/传播/mint P95）。
+
+    同时返回最近一轮哨兵探针结果（若有）与沙箱开关状态，供管理 UI / 测试判据。
+    """
+    from hiveweave.services.acl_sandbox import telemetry
+    from hiveweave.services.acl_sandbox.integration import acl_sandbox_active
+    from hiveweave.services.acl_sandbox.sentinel import sentinel_last
+
+    stats = telemetry.snapshot()
+    stats["active"] = acl_sandbox_active()
+    stats["sentinel_last"] = sentinel_last()
+    return stats

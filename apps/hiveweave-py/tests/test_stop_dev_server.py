@@ -435,6 +435,9 @@ async def test_bash_app_server_kills_preferred_before_allocate(
     monkeypatch, tmp_path
 ):
     """No --port restart must kill this project's live 3000, not allocate 3001."""
+    from hiveweave.config import settings
+
+    monkeypatch.setattr(settings, "acl_sandbox", False)
     from hiveweave.services import process_registry as pr
     from hiveweave.tools.bash import _run_registered_dev_server
 
@@ -489,6 +492,9 @@ async def test_bash_app_server_kills_preferred_before_allocate(
 
 async def test_bash_registers_observed_listen_port(monkeypatch, tmp_path):
     """app.server that ignores PORT is registered on the observed LISTEN port."""
+    from hiveweave.config import settings
+
+    monkeypatch.setattr(settings, "acl_sandbox", False)
     from hiveweave.services import process_registry as pr
     from hiveweave.tools.bash import _run_registered_dev_server
 

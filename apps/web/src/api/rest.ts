@@ -65,6 +65,12 @@ export interface Project {
   language?: string | null;
   isStarted?: boolean;
   createdAt: number;
+  /** P1 (§5.5b①)：外部只读参考目录（仅读工具生效） */
+  additionalReadDirs?: string[] | null;
+  /** P2 (§5.5b②)：附加可写目录（ACL 沙箱 extra SID 授予写权） */
+  additionalWritableDirs?: string[] | null;
+  /** P3 (§9)：项目级沙箱模式（'' 继承 env；danger-full-access 逃生门） */
+  sandboxMode?: string | null;
 }
 
 export interface KeyResult {
@@ -118,11 +124,20 @@ export interface CreateProjectResponse {
   adopted?: boolean;
 }
 
-export async function createProject(name: string, workspacePath?: string, description?: string, orgParadigm?: string, language?: string): Promise<CreateProjectResponse> {
+export async function createProject(name: string, workspacePath?: string, description?: string, orgParadigm?: string, language?: string, additionalReadDirs?: string[], additionalWritableDirs?: string[], sandboxMode?: string): Promise<CreateProjectResponse> {
   return fetchJSON<CreateProjectResponse>(`${BASE}/projects`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, workspacePath, description, orgParadigm, language: language || "zh" }),
+    body: JSON.stringify({ name, workspacePath, description, orgParadigm, language: language || "zh", additionalReadDirs, additionalWritableDirs, sandboxMode }),
+  });
+}
+
+/** P1/P2/P3 (§5.5b/§9)：更新项目（外部只读参考 + 附加可写 + 沙箱模式）。 */
+export async function updateProject(projectId: string, body: { name?: string; workspacePath?: string; description?: string; additionalReadDirs?: string[]; additionalWritableDirs?: string[]; sandboxMode?: string }) {
+  return fetchJSON(`${BASE}/projects/${projectId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 

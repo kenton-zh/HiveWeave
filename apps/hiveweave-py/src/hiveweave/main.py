@@ -429,6 +429,77 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("worktree_recovery_init_failed", error=str(e))
 
+    # P1 (spec §7.1 M-5)：ACL 沙箱启动回填 —— 存量项目 + worktree 逐个后台
+    # verify-then-skip（串行防 IO 风暴；沙箱 off 时 no-op）。
+    try:
+        from hiveweave.services.acl_sandbox.integration import acl_sandbox_active
+        from hiveweave.services.acl_sandbox.service import ensure_standing_grants
+
+        if acl_sandbox_active():
+            import asyncio as _asyncio
+
+            async def _acl_backfill() -> None:
+                try:
+                    from hiveweave.db import project as project_db
+
+                    projs = await meta_db.query(
+                        "SELECT id, workspace_path FROM projects WHERE 1=1"
+                    )
+                    backfilled = 0
+                    for p in projs:
+                        root = p["workspace_path"]
+                        if not root or not (Path(root) / ".git").exists():
+                            continue
+                        try:
+                            await ensure_standing_grants(
+                                workspace_path=root, project_workspace_path=root
+                            )
+                            try:
+                                conn = await project_db.get_project_db_by_project_id(
+                                    p["id"]
+                                )
+                                cur = await conn.execute(
+                                    "SELECT workspace_path, short_id FROM agents "
+                                    "WHERE project_id=? AND status='active'",
+                                    [p["id"]],
+                                )
+                                rows = await cur.fetchall()
+                                await cur.close()
+                            except Exception:
+                                rows = []
+                            for a in rows:
+                                wt = a["workspace_path"]
+                                if wt and Path(wt).exists():
+                                    await ensure_standing_grants(
+                                        workspace_path=wt,
+                                        project_workspace_path=root,
+                                        agent_id=a["short_id"] or "system",
+                                    )
+                            backfilled += 1
+                        except Exception as e:
+                            log.warning(
+                                "acl_sandbox_backfill_failed",
+                                project_id=p["id"], error=str(e),
+                            )
+                    log.info("acl_sandbox_backfill_done", projects=backfilled)
+                except Exception as e:
+                    log.warning("acl_sandbox_backfill_error", error=str(e))
+
+            _asyncio.create_task(_acl_backfill())
+    except Exception as e:
+        log.warning("acl_sandbox_backfill_spawn_failed", error=str(e))
+
+    # P1 (spec §13)：哨兵探针循环 —— 沙箱 on 时周期注入 S-1-4 探针，断言
+    # 各入口走受限令牌（任一入口未过 = 判据未达，log.error + 遥测）。
+    try:
+        from hiveweave.services.acl_sandbox.integration import acl_sandbox_active
+        from hiveweave.services.acl_sandbox.sentinel import start_sentinel_loop
+
+        if acl_sandbox_active():
+            start_sentinel_loop()
+    except Exception as e:
+        log.warning("acl_sandbox_sentinel_start_failed", error=str(e))
+
     # 2b. TEST13 P1-3: reconcile orphan verification_cases
     try:
         from hiveweave.services.task import VerificationCaseService
@@ -590,6 +661,21 @@ async def lifespan(app: FastAPI):
     # Close DBs
     await close_project_dbs()
     await close_meta_db()
+
+    # P1 (spec §7.1)：ACL 沙箱 runner/watcher/sentinel 线程回收 —— 受限子进程
+    # 已由 KILL_ON_CLOSE Job 全灭，此处只回收排空池/watcher/探针（非守护线程
+    # 不回收会阻塞进程退出）。
+    try:
+        from hiveweave.services.acl_sandbox.service import shutdown_runner
+        from hiveweave.services.acl_sandbox.sentinel import stop_sentinel_loop
+        from hiveweave.services.acl_sandbox.spawn import stop_watcher
+
+        stop_sentinel_loop()
+        stop_watcher()
+        shutdown_runner()
+    except Exception as e:
+        log.warning("acl_sandbox_shutdown_failed", error=str(e))
+
     log.info("app_stopped")
 
 

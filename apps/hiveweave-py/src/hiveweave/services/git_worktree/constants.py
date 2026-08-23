@@ -69,6 +69,10 @@ GITIGNORE_GENERATED_ENTRIES: tuple[str, ...] = (
     "test-results/",
     "playwright-report/",
     ".agent-browser/",
+    # ACL 沙箱项目级共享缓存（spec §8）：checkpoint 是无条件 git add -A，
+    # 缓存必须排除在提交外。放 .hiveweave-cache/ 而非 .hiveweave/ 内侧，
+    # 防 _HIVEWEAVE_FILE_OPS 前缀误伤 + 不受 §4.9 PROTECTED 裁剪影响。
+    ".hiveweave-cache/",
 )
 
 # BUG-4: serialize create per (workspace, short_id) so hire + lazy-ensure

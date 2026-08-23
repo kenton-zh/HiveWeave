@@ -163,6 +163,10 @@ async def test_kill_offturn_job_rejects_other_agent():
 
 @pytest.mark.asyncio
 async def test_unbounded_bash_does_not_clamp_timeout(monkeypatch, tmp_path):
+    # P3 默认 on：本测试测超时钳制（native 路径），显式关沙箱
+    from hiveweave.config import settings
+
+    monkeypatch.setattr(settings, "acl_sandbox", False)
     captured: dict = {}
 
     async def fake_native(command, cwd, timeout_s):

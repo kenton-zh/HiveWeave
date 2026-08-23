@@ -78,6 +78,17 @@ class Settings(BaseSettings):
     # SQLite busy_timeout (ms). Journal stays DELETE; this only waits on locks.
     sqlite_busy_timeout_ms: int = 5000
 
+    # ACL 写受限令牌沙箱（spec docs/spec/windows-acl-sandbox.md）。
+    # P3 默认 on：受限 shell 方言适配层（§18.3 `_normalize_for_pwsh`）已落地，
+    # agent 的 bash 惯用法经 pwsh 适配可执行；确需关闭用 env HIVEWEAVE_ACL_SANDBOX=off。
+    acl_sandbox: bool = True
+    # 专用排空线程池大小（§5.4）。
+    acl_max_concurrent: int = 32
+    # JS 工具链降级开关：confined=受限 / native=白名单命令走 native（显式 fail-open）。
+    acl_js_toolchain: str = "confined"
+    # 哨兵探针周期（秒，P1 §13 判据；沙箱 on 时后端周期注入 S-1-4 探针）。
+    acl_sentinel_interval_s: int = 300
+
     model_config = {
         "env_prefix": "HIVEWEAVE_",
         "env_file": ".env",

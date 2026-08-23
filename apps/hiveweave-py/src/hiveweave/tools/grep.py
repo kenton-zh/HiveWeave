@@ -241,6 +241,7 @@ async def execute_grep(
     max_results: int = 500,
     include_ignored: bool = False,
     project_root: str | None = None,
+    extra_read_dirs: list[str] | None = None,
 ) -> dict[str, Any]:
     """Search files for a regex pattern. Returns {success, output, error}.
 
@@ -262,7 +263,9 @@ async def execute_grep(
     if not path:
         search_path = str(Path(workspace_path).resolve())
     else:
-        search_path = resolve_for_read(workspace_path, path, root)  # type: ignore[assignment]
+        search_path = resolve_for_read(  # type: ignore[assignment]
+            workspace_path, path, root, extra_read_dirs
+        )
     if search_path is None:
         return {"success": False, "output": "",
                 "error": "Error: Sandbox violation - "
@@ -409,6 +412,9 @@ class GrepParams(BaseModel):
 )
 async def grep_tool(params: GrepParams, agent_id: str, workspace: str) -> ToolResult:
     """Search files for a regex pattern."""
+    from hiveweave.tools.file import fetch_additional_read_dirs, infer_project_root
+
+    extra = await fetch_additional_read_dirs(infer_project_root(workspace))
     result = await execute_grep(
         pattern=params.pattern,
         path=params.path,
@@ -418,6 +424,7 @@ async def grep_tool(params: GrepParams, agent_id: str, workspace: str) -> ToolRe
         multiline=params.multiline,
         workspace_path=workspace,
         include_ignored=params.include_ignored,
+        extra_read_dirs=extra,
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])

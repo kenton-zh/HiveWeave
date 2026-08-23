@@ -1512,22 +1512,78 @@ class GameTimeService:
                             alarm_id=alarm["id"],
                         )
                     else:
-                        proc = await asyncio.create_subprocess_exec(
-                            *cmd_parts,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            env=safe_env,
-                            **windows_no_window_kwargs(),
+                        stdout = stderr = b""
+                        rc = None
+                        # P1 (spec §5.7)：alarm 收编进 ACL 沙箱（项目根边界）。
+                        # 顺带修复现状缺陷：native 路径继承后端 cwd（HiveWeave
+                        # 源码树）且不受限 —— 受限路径以项目根为 workdir。
+                        project_id_here = _alarm_project.get(alarm["id"], "")
+                        agent_here = (
+                            alarm.get("to_agent_id") or alarm.get("from_agent_id")
+                            or "alarm"
                         )
-                        stdout, stderr = await asyncio.wait_for(
-                            proc.communicate(), timeout=120
+                        confined = None
+                        project_root = None
+                        from hiveweave.services.acl_sandbox.integration import (
+                            acl_sandbox_active,
+                            resolve_project_root,
                         )
-                        if proc.returncode != 0:
+
+                        if acl_sandbox_active():
+                            from hiveweave.services.acl_sandbox.service import (
+                                spawn_confined,
+                            )
+                            import subprocess as _sp
+
+                            project_root = await resolve_project_root(project_id_here)
+                            if not project_root:
+                                # fail-closed：沙箱 on 但项目根解析失败 → 跳过脚本，
+                                # 绝不回退原生（原生会继承后端 cwd 且不受限）。
+                                log.warning(
+                                    "alarm_script_sandbox_unresolved_skipped",
+                                    alarm_id=alarm["id"],
+                                    project_id=project_id_here,
+                                )
+                            else:
+                                sres = await spawn_confined(
+                                    command=_sp.list2cmdline(cmd_parts),
+                                    workdir=project_root,
+                                    workspace_path=project_root,
+                                    agent_id=agent_here,
+                                    project_id=project_id_here,
+                                    project_workspace_path=project_root,
+                                    entry="alarm",
+                                    timeout_s=120,
+                                )
+                                if sres is not None:
+                                    confined = sres
+                                    stdout = (sres.get("stdout") or "").encode()
+                                    stderr = (sres.get("stderr") or "").encode()
+                                    rc = sres.get("exit_code")
+
+                        if confined is None:
+                            safe_env = filtered_environ()
+                            from hiveweave.util.win_subprocess import (
+                                windows_no_window_kwargs,
+                            )
+
+                            proc = await asyncio.create_subprocess_exec(
+                                *cmd_parts,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                                env=safe_env,
+                                **windows_no_window_kwargs(),
+                            )
+                            stdout, stderr = await asyncio.wait_for(
+                                proc.communicate(), timeout=120
+                            )
+                            rc = proc.returncode
+                        if rc not in (0, None):
                             log.warning(
                                 "alarm_script_failed",
                                 alarm_id=alarm["id"],
-                                rc=proc.returncode,
-                                stderr=stderr.decode()[:200],
+                                rc=rc,
+                                stderr=stderr.decode(errors="replace")[:200],
                             )
             except Exception as e:
                 log.error("alarm_script_error", alarm_id=alarm["id"], error=str(e))

@@ -154,7 +154,7 @@ Four-Layer Review Gate:
 | Database | SQLite + aiosqlite | Dual-DB: Meta DB (WAL) + Per-project DB |
 | AI/LLM | httpx SSE streaming + Provider Factory | OpenAI, Anthropic, DeepSeek, Groq, Google |
 | Realtime | phoenix.js + phoenix_adapter (WebSocket) | 3 channels: lobby, project, agent |
-| Sandbox | Docker (optional) | `BASH_SANDBOX=docker` |
+| Sandbox | ACL write-restricted token (Windows) | `HIVEWEAVE_ACL_SANDBOX=on` |
 | Build | Turbo | Monorepo task orchestration |
 | Package | pnpm 10 + uv | Monorepo + Python packages |
 

@@ -549,7 +549,38 @@ yarn.lock merge=union
             result = await self._create_unlocked(
                 workspace_path, short_id, task_name, base_branch, task_id=task_id
             )
+        # P1 (§7.1)：worktree standing ACE 后台铺设（幂等；沙箱 off 时 no-op）。
+        # 首命令不再背传播成本。删→同路径重建走 verify-then-skip 兜底。
+        if result.get("success") and result.get("path"):
+            self._schedule_sandbox_grant(workspace_path, result["path"], short_id)
         return result
+
+    def _schedule_sandbox_grant(
+        self, project_root: str, worktree_path: str, short_id: str
+    ) -> None:
+        """后台铺 worktree 根的能力 SID ACE（§4.4/§7.1，fail-quiet）。"""
+        try:
+            from hiveweave.services.acl_sandbox.service import ensure_standing_grants
+
+            async def _bg() -> None:
+                try:
+                    await ensure_standing_grants(
+                        workspace_path=worktree_path,
+                        project_workspace_path=project_root,
+                        agent_id=short_id,
+                    )
+                except Exception as e:  # 铺授失败只告警，verify-then-skip 兜底
+                    log.warning(
+                        "acl_sandbox_worktree_grant_failed",
+                        worktree=worktree_path, error=str(e),
+                    )
+
+            asyncio.create_task(_bg())
+        except Exception as e:
+            log.warning(
+                "acl_sandbox_worktree_grant_spawn_failed",
+                worktree=worktree_path, error=str(e),
+            )
 
     async def _create_unlocked(
         self,

@@ -440,6 +440,13 @@ class TestShellWrapperUnwrap:
 class TestBashToolIntegration:
     """execute_run_command / _check_shell_security 必须过命令护栏."""
 
+    @pytest.fixture(autouse=True)
+    def _sandbox_off(self, monkeypatch):
+        """P3 默认 on：本类测护栏（非沙箱）—— 显式关沙箱。"""
+        from hiveweave.config import settings
+
+        monkeypatch.setattr(settings, "acl_sandbox", False)
+
     def setup_method(self):
         self.workspace = tempfile.mkdtemp(prefix="hiveweave_guard_test_")
 
