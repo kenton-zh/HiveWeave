@@ -40,6 +40,16 @@ class ContextMixin:
     _PRUNE_MINIMUM_TOKENS = 10_000
     #: Prune 占位符
     _PRUNE_PLACEHOLDER = "[Old tool result content cleared]"
+    #: 本 run 是否改写过请求前缀（prune/trim/summary 任一实际生效）。
+    #: run 结束后据此决定是否把等价裁剪回写 DB（见 completion.py 3.5 节）：
+    #: 改写点即前缀缓存断点，回写不产生额外缓存代价；未改写则 DB 必须
+    #: append-only，否则下一 run 首请求从改写点全 miss（星轨 91% 根因）。
+    #: 注：仅 strip_images 而未 prune/trim 的改写**故意不打标**——images
+    #: 从不落 DB（completion append_turn 前剥离），漏标不产生 DB 漂移。
+    _context_rewrote = False
+
+    def _mark_context_rewrite(self) -> None:
+        self._context_rewrote = True
 
     def _prune_old_tool_outputs(self, messages: list[dict]) -> list[dict]:
         """溢出压缩点才替换旧工具正文（DSH compaction，不是每轮）。
@@ -97,6 +107,7 @@ class ContextMixin:
             # once the observation text is gone, and they blow the context.
             pruned.pop("images", None)
             result[i] = pruned
+        self._mark_context_rewrite()
 
         log.info(
             "tool_loop_prune",
@@ -170,6 +181,7 @@ class ContextMixin:
         tail = messages[head_end:]
 
         # 从 tail 前端逐步裁剪直到 token 数回到阈值以下
+        dropped = False
         while len(tail) > 2 and estimate_tokens_for_messages(head + tail) > trim_at:
             # R3: 保持 tool_calls + tool_result 对的完整性，避免产生孤儿 tool_result
             # （没有对应 tool_calls 的 tool_result 会导致 API 400 错误）。
@@ -194,7 +206,10 @@ class ContextMixin:
             if drop <= 0:
                 drop = 1
             tail = tail[drop:]
+            dropped = True
 
+        if dropped:
+            self._mark_context_rewrite()
         return self._drop_orphan_tool_artifacts(head + tail)
 
     def _trim_context_if_needed(
@@ -445,6 +460,7 @@ class ContextMixin:
                     tail=len(tail),
                 )
                 if after < retain_at:
+                    self._mark_context_rewrite()
                     return rebuilt
                 compacted = rebuilt
 

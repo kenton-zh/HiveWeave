@@ -23,7 +23,10 @@ PRESERVE_RECENT_MIN = 10
 PRESERVE_RECENT_MAX = 30
 TAIL_TURNS = 2
 PRUNE_PROTECT_TOKENS = 40_000
-PRUNE_MINIMUM_TOKENS = 20_000
+# 与 streamer ContextMixin._PRUNE_MINIMUM_TOKENS(10k) 对齐：持久化裁剪只在
+# 溢出改写点回写（completion 3.5 节），阈值必须覆盖 in-loop prune 的触发带
+# （10k-20k），否则 DB 回写 no-op → 下一 run 读到未裁剪原文 → 前缀 miss。
+PRUNE_MINIMUM_TOKENS = 10_000
 TOOL_OUTPUT_MAX_CHARS = 2_000
 
 # 工具输出智能截断限制（镜像 OpenCode ToolOutputStore）

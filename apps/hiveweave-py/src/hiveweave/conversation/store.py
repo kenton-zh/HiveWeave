@@ -566,11 +566,13 @@ class ConversationStore:
     async def prune_persisted(self, agent_id: str, project_id: str) -> None:
         """持久化裁剪旧工具输出 — OpenCode prune() 模式。
 
-        每轮结束后调用。逆序遍历 cache 中的消息：
+        只在溢出改写点调用（completion 3.5：result.context_rewritten 时），
+        不再每 run 结束都跑——每次改写历史中段都会作废下一 run 首请求的
+        前缀缓存（星轨 91% vs 稳态 99% 根因，2026-08-23）。逆序遍历 cache：
         1. 跳过最近 2 轮（保护当前上下文）
         2. 停在压缩摘要边界
         3. 累积 tool 输出 token；保护窗口(40K)外的旧 tool 输出标记为裁剪候选
-        4. 候选总量 > 20K 时，永久替换 cache + DB 中的内容为占位符
+        4. 候选总量 > 10K 时，永久替换 cache + DB 中的内容为占位符
 
         与 _prune_tool_outputs（读时临时裁剪）的区别：
         - 本方法写入 cache 和 DB，后续请求永远看不到旧工具输出

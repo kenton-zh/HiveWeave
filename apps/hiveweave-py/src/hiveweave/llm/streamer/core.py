@@ -71,6 +71,9 @@ class Streamer(
         self._circuit_breaker = circuit_breaker_inst or circuit_breaker
         self._retry_handler = retry_handler or RetryHandler()
         self.max_tool_rounds = max_tool_rounds
+        # 初值；每次 stream() 入口重置（同一实例可能因 empty 重试/failover
+        # 被连续调用，跨 attempt 不得携带脏标志）
+        self._context_rewrote = False
 
     # ── 主入口 ──────────────────────────────────────────────
 
@@ -101,6 +104,9 @@ class Streamer(
             结果 dict（见类文档字符串）
         """
         start_time = time.monotonic()
+        # 每次 stream() 调用重置：empty 重试 / 同层 failover 会复用同一实例
+        # 连续调用 stream()，上一 attempt 的改写标志不得泄漏到下一 attempt。
+        self._context_rewrote = False
         provider = self._provider_factory.create(model_config)
         provider_name = model_config.get("name") or "primary"
 
@@ -184,6 +190,8 @@ class Streamer(
             )
             # 熔断器成功/失败上报已移至 _stream_single_round 按轮次精确上报（C10）
             result["duration_ms"] = int((time.monotonic() - start_time) * 1000)
+            # 前缀改写信号：completion 据此决定是否把等价裁剪回写 DB。
+            result["context_rewritten"] = self._context_rewrote
             return result
         except TimeoutError:
             # Ultimate safety net — loop should have exited gracefully first.

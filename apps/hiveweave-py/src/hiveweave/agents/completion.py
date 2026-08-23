@@ -710,11 +710,17 @@ async def handle_completion(
     except Exception as e:
         log.debug("clear_owner_parked_on_ok_failed", error=str(e))
 
-    # 3.5 持久化裁剪旧工具输出（OpenCode prune 模式）
-    try:
-        await agent._conversation.prune_persisted(agent.id, agent.project_id)
-    except Exception as e:
-        log.warning("prune_persisted_failed", agent_id=agent.id, error=str(e))
+    # 3.5 持久化裁剪旧工具输出 — 仅当本 run 内 tool loop 实际改写过请求前缀
+    # （溢出 prune / hard trim / working-set 摘要，见 streamer/context.py）。
+    # 每个 run 结束都裁剪会改写历史中段 → 下一 run 首请求前缀从改写点全 miss
+    # （星轨 A206 命中率 91% vs 稳态 99% 的根因，2026-08-23）。改写点处前缀
+    # 缓存已断，此时回写 DB 不额外扩大失配（仅有保护窗边界一带的有界 miss），
+    # 且保证下一 run 读到的历史与本 run 末尾请求使用的前缀一致。
+    if result.get("context_rewritten"):
+        try:
+            await agent._conversation.prune_persisted(agent.id, agent.project_id)
+        except Exception as e:
+            log.warning("prune_persisted_failed", agent_id=agent.id, error=str(e))
 
     # 4. 状态 → idle (先取消 safety timer，再 reset；残留 streaming 再 finalize 一次)
     agent._cancel_safety_timer()
