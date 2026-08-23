@@ -148,6 +148,9 @@ docs/*
 # Local .opencode skills (user/local-only, not shared upstream)
 .opencode/skills/
 
+# byted-ark-seedream skill — kept local-only plaintext on disk; NOT pushed (holds Ark API key)
+skills/byted-ark-seedream-skill/
+
 # Generated assets
 image/
 apps/web/public/sprites/
