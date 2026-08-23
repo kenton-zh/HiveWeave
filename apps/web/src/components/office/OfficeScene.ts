@@ -34,10 +34,10 @@ import {
   getDesk,
   ASSET_URLS,
   ASSET_LOAD_LIST,
-  SHEET_STAND_FRAME_RECT,
-  SHEET_STAND_ORIG_RECT,
-  SHEET_FRAME_W,
-  SHEET_FRAME_H,
+  SHEET_LAYOUTS,
+  DEV_ANIM_SEQS,
+  SIT_OFFSET_A,
+  SIT_OFFSET_B,
   roleSheetUrl,
 } from "./constants";
 import { isRoamingFrame, isChatteringFrame } from "./state-machine";
@@ -58,8 +58,7 @@ export class OfficeScene {
   /** 预载纹理（URL → Texture）；mount 时填充 */
   private tex: Record<string, PIXI.Texture> = {};
 
-  /** 每张 agent sheet 的站立帧纹理（URL → Texture）。
-   *  sheet 12 帧完全相同，只用左上角第 0 帧。 */
+  /** 每张 agent sheet 的整张纹理（URL → Texture）；帧切片在 OfficeActor 内按 SHEET_LAYOUTS 完成 */
   private sheetFrames: Record<string, PIXI.Texture> = {};
 
   // Ambient animation targets (visual only)
@@ -93,10 +92,8 @@ export class OfficeScene {
     );
     this.tex = tex as Record<string, PIXI.Texture>;
 
-    // 切出每张 agent sheet 的站立帧。
-    // 用 sheet 自身作为 Texture（128×144 全图，无裁剪），由 OfficeActor 内部按
-    // 128/4=32 宽、144/3=48 高 截取左上角第 0 帧显示。避免在场景构造期调用
-    // new PIXI.Texture({source,frame,orig}) 时的 UV/frame 未更新导致渲染空。
+    // agent sheet 的帧切片由 OfficeActor 内部完成（按 SHEET_LAYOUTS 的 cols×rows 切 32×48 帧），
+    // dev 为 5×4 动画帧表，manager/qa 为旧 4×3 单帧表；此处只保留整张 Texture。
     for (const url of [ASSET_URLS.AGENT_DEV, ASSET_URLS.AGENT_MANAGER, ASSET_URLS.AGENT_QA]) {
       const sheet = tex[url];
       if (!sheet) continue;
@@ -246,19 +243,26 @@ export class OfficeScene {
     visible.forEach((agent, index) => {
       if (!this.actorMap.has(agent.id)) {
         const desk = getDesk(index, agent.role);
-        const standTex =
-          this.sheetFrames[roleSheetUrl(agent.role)] ?? this.sheetFrames[ASSET_URLS.AGENT_DEV];
+        const sheetUrl = roleSheetUrl(agent.role);
+        const sheetTex =
+          this.sheetFrames[sheetUrl] ?? this.sheetFrames[ASSET_URLS.AGENT_DEV];
+        const hasFrameSeqs = sheetUrl === ASSET_URLS.AGENT_DEV;
         const actor = new OfficeActor(
           agent,
           (id) => {
             this.onInteraction({ type: "select-agent", agentId: id });
           },
-          standTex ?? null,
+          sheetTex ?? null,
+          hasFrameSeqs ? SHEET_LAYOUTS[sheetUrl] : null,
+          hasFrameSeqs ? DEV_ANIM_SEQS : null,
           this.tex[ASSET_URLS.SPEECH_BUBBLE] ?? null,
         );
         actor.container.x = desk.x;
-        // 放大后的桌（desk y+2 + 72×1.8/2 = desk.y+66.8），人坐在桌前腿底之前
-        actor.container.y = desk.y + 78;
+        // 落座点：按坐姿朝向分配（A=桌后左椅 SE 朝向 / B=桌前右椅 NW 朝向，两种椅子场景里都有）
+        const variant: "A" | "B" = index % 2 === 0 ? "A" : "B";
+        const off = variant === "B" ? SIT_OFFSET_B : SIT_OFFSET_A;
+        actor.container.x += off.x;
+        actor.container.y = desk.y + 54 + off.y;
         actorsLayer.addChild(actor.container);
         this.actorMap.set(agent.id, actor);
       }
@@ -284,6 +288,8 @@ export class OfficeScene {
       // Determine target position
       let tx: number;
       let ty: number;
+      let atDesk = false;
+      const sitVariant: "A" | "B" = index % 2 === 0 ? "A" : "B";
 
       if (talking) {
         const spot = COMMON_TARGETS[index % COMMON_TARGETS.length];
@@ -294,8 +300,10 @@ export class OfficeScene {
         tx = wp.x;
         ty = wp.y;
       } else {
-        tx = desk.x;
-        ty = desk.y + 54;
+        const off = sitVariant === "B" ? SIT_OFFSET_B : SIT_OFFSET_A;
+        tx = desk.x + off.x;
+        ty = desk.y + 54 + off.y;
+        atDesk = true;
       }
 
       actor.setTarget(
@@ -307,6 +315,8 @@ export class OfficeScene {
           ping: this.snapshot.userPingIds.has(agent.id),
         },
         this.snapshot.selectedAgentId === agent.id,
+        atDesk,
+        sitVariant,
       );
 
       actor.update(delta);

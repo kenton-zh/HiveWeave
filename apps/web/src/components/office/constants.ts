@@ -4,7 +4,7 @@
  */
 
 import * as PIXI from "pixi.js";
-import type { DeskSlot } from "./types";
+import type { AgentVisualState, DeskSlot } from "./types";
 
 // ── World ─────────────────────────────────────────────────────────
 
@@ -58,7 +58,7 @@ export const COMMON_TARGETS = [
  *  蓝沙发+黄豆袋休息区 / 弧形前台 / 玻璃会议室外 / 厨房吧台 / 电视会客区  */
 export const ROAM_WAYPOINTS = [
   { x: 238, y: 462 },  // 左下 蓝双人沙发 + 黄豆袋
-  { x: 470, y: 262 },  // KAIROSOFT 弧形前台 前
+  { x: 532, y: 575 },  // HiveWeave 弧形前台 前（前台已移至正门内侧，面向大门）
   { x: 305, y: 210 },  // 玻璃会议室门外 白板旁
   { x: 735, y: 150 },  // 右上 厨房吧台 高脚凳前
   { x: 935, y: 178 },  // 右上 灰色沙发+电视+会客区 地毯边
@@ -85,7 +85,7 @@ export const DEFAULT_ROLE_COLOR = 0x64748b; // slate
 // ── Agent Visual Parameters ───────────────────────────────────────
 
 /** Walk speed factor (units per tick * delta) */
-export const WALK_SPEED = 0.12;
+export const WALK_SPEED = 0.16;
 /** Bob amplitude in pixels */
 export const BOB_AMPLITUDE = 1.4;
 /** Bob frequency (radians per tick) */
@@ -130,7 +130,9 @@ export const ASSET_URLS = {
   SPEECH_BUBBLE: "/office-assets/speech-bubble.png",
   WALL_WINDOW: "/office-assets/wall-window.png",
   WHITEBOARD: "/office-assets/whiteboard.png",
-  /** 整间办公室背景（AI 图生图 1:1 复刻，3840×2400 4K → 缩到 WORLD_W×WORLD_H = 1280×800，比例 16:10 完全对齐） */
+  /** 整间办公室背景（apimart gpt-image-2-official 4K 图生图 + mask 局部重绘：
+   *  原图 1:1 复刻 → 去人物 → 前台移至正门 → 远侧椅后移留座。3840×2160（16:9），
+   *  场景内缩到 WORLD_W×WORLD_H = 1280×720。 */
   OFFICE_BG: "/office-assets/office-scene-bg.png",
 } as const;
 
@@ -140,41 +142,79 @@ export const ASSET_LOAD_LIST: string[] = Object.values(ASSET_URLS);
 // ── Agent Spritesheet Layout ──────────────────────────────────────
 
 /**
- * Agent sheet 为 128×144，内部 32×48 网格 4 列 × 3 行 = 12 帧。
- * ⚠️ 图像验证：12 帧**完全相同**（站立静止图的重复平铺，无动画帧）。
- *  3 张 sheet 的唯一差异是角色上衣配色：
- *    agent-dev-sheet     → 红衫（developer / executor 池）
- *    agent-manager-sheet → 蓝衫（manager / coordinator / ceo 池）
- *    agent-qa-sheet      → 黄衫（qa / reviewer / auditor 池）
- *
- * 角色内容在帧内 y≈42 处触底（脚底 y=42，头顶 y≈5），脚底 anchor = 42/48 ≈ 0.875。
- * 由于 sheet 本身无动画帧，行走/呼吸/打字通过**程序缩放摆动**叠加在 sprite 上实现。
- *
- * 参考 walk.png (3840×1632 / 6 帧循环 = 640×1632 每帧) 为另一套横版像素小人，
- * 比例 / 视角 / 风格与当前 isometric 办公室不一致，暂不接入本场景。
+ * 角色 sheet 布局（按 URL 区分）：cols×rows 帧网格，frame 尺寸 frameW×frameH，
+ * 显示缩放 scale（world 显示尺寸 ≈ frameH×scale），采样模式 scaleMode。
+ * - agent-dev-sheet（2026-08-22 v2）→ 512×384 = 8 列 × 4 行 × 64×96 帧（2K 图生图切片，
+ *   高清柔和 Q 版 32 格：呼吸/行走/打字/喝咖啡/点头/跳跃/问号/坐下/坐姿/起身/冒烟/递卡），
+ *   linear 平滑采样与办公室背景同质感，scale 0.8。
+ * - agent-manager/qa-sheet（旧）→ 128×144 = 4×3 × 32×48 单帧表，nearest 保持像素锐利。
+ * 角色内容在帧内 87.5% 处触底（脚底 anchor = 0.875）。
  */
-export const SHEET_FRAME_W = 32;
-export const SHEET_FRAME_H = 48;
-export const SHEET_FOOT_ANCHOR_Y = 42 / 48;
+export interface SheetLayout {
+  cols: number;
+  rows: number;
+  frameW: number;
+  frameH: number;
+  scale: number;
+  scaleMode: "nearest" | "linear";
+}
 
-/** 只用 sheet 左上角第 0 帧（其他 11 帧完全相同） */
-export const SHEET_STAND_FRAME = { x: 0, y: 0 } as const;
+export const SHEET_LAYOUTS: Record<string, SheetLayout> = {
+  [ASSET_URLS.AGENT_DEV]: { cols: 8, rows: 4, frameW: 64, frameH: 96, scale: 0.8, scaleMode: "linear" },
+  [ASSET_URLS.AGENT_MANAGER]: { cols: 4, rows: 3, frameW: 32, frameH: 48, scale: 1.6, scaleMode: "nearest" },
+  [ASSET_URLS.AGENT_QA]: { cols: 4, rows: 3, frameW: 32, frameH: 48, scale: 1.6, scaleMode: "nearest" },
+};
 
-/** 模块级 Rectangle 实例（复用以避免 new Rectangle 分配 / GC 压力）。
- * 注意：切 frame 必须同步传 orig = 同尺寸 Rectangle，否则 PixiJS v8 下
- * texture.width / getBounds / pointertap 命中检测会按整图 128×144 计算。 */
-export const SHEET_STAND_FRAME_RECT = new PIXI.Rectangle(
-  SHEET_STAND_FRAME.x,
-  SHEET_STAND_FRAME.y,
-  SHEET_FRAME_W,
-  SHEET_FRAME_H,
-);
-export const SHEET_STAND_ORIG_RECT = new PIXI.Rectangle(
-  0,
-  0,
-  SHEET_FRAME_W,
-  SHEET_FRAME_H,
-);
+/** 动画键 = FSM 视觉态 + actor 派生动作（坐 A/B 两朝向 + 起身；冒烟/递卡暂无事件源未接线） */
+export type AgentAnimKey =
+  | AgentVisualState
+  | "sitdown"
+  | "sitdown_b"
+  | "sitting"
+  | "sitting_b"
+  | "getup";
+
+/**
+ * dev 女孩动画帧序（0 基、行优先、8 列：1-8 呼吸/行走/打字、9-16 打字/咖啡/点头、
+ * 17-24 跳/问号/坐下A、25-32 坐姿A/坐下B/坐姿B）。
+ * FSM 映射：idle→呼吸，walking→行走，working→打字，talking→点头，alert→问号；
+ * 到桌坐下：sitdown(A朝向)/sitdown_b(B朝向)（一次性）→ sitting/sitting_b（循环）；
+ * 离桌：getup（一次性，= 当前朝向坐下序列的倒序播放）。
+ */
+export const DEV_ANIM_SEQS: Record<AgentAnimKey, number[]> = {
+  idle: [0, 1],
+  walking: [2, 3, 4, 5],
+  working: [6, 7, 8, 9],
+  talking: [14, 15],
+  alert: [18, 19],
+  sitdown: [20, 21, 22, 23],
+  sitting: [24, 25],
+  sitdown_b: [26, 27, 28, 29],
+  sitting_b: [30, 31],
+  getup: [23, 22, 21, 20],
+};
+
+/** 各动作帧率（fps）：行走快、呼吸/坐姿慢循环 */
+export const DEV_ANIM_FPS: Record<AgentAnimKey, number> = {
+  idle: 3,
+  walking: 10,
+  working: 7,
+  talking: 4,
+  alert: 3,
+  sitdown: 7,
+  sitting: 2,
+  sitdown_b: 7,
+  sitting_b: 2,
+  getup: 7,
+};
+
+/** 一次性播放（播完停在末帧，不回卷）；其余为循环帧 */
+export const DEV_ANIM_ONESHOT: AgentAnimKey[] = ["sitdown", "sitdown_b", "getup"];
+
+/** 到桌落座的视觉偏移（world px，2K 切片与背景椅对位实测）：
+ * A = 桌后左侧椅（面朝右下 45°）；B = 桌前右侧椅（面朝左上 45°，= A + 椅位差(85,38)） */
+export const SIT_OFFSET_A = { x: 35, y: 35 } as const;
+export const SIT_OFFSET_B = { x: 120, y: 73 } as const;
 
 /** 程序动画参数（无内置帧 → 靠 Sprite scale/rotation/skew 摆动模拟） */
 export const AGENT_PROC_ANIM = {

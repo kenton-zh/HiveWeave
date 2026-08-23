@@ -21,12 +21,14 @@ import {
   BOB_AMPLITUDE,
   BOB_FREQ,
   AGENT_PROC_ANIM,
-  SHEET_FOOT_ANCHOR_Y,
-  SHEET_FRAME_W,
-  SHEET_FRAME_H,
-  SHEET_STAND_FRAME,
+  DEV_ANIM_FPS,
+  DEV_ANIM_ONESHOT,
+  type AgentAnimKey,
+  type SheetLayout,
 } from "./constants";
-import type { AgentAnimKind } from "./constants";
+
+/** 帧内脚底锚点（87.5% 帧高），切片时脚底对齐该比例 */
+const FOOT_ANCHOR_Y = 0.875;
 
 // ── Label Factory ─────────────────────────────────────────────────
 
@@ -66,8 +68,22 @@ export class OfficeActor {
   private fsm = new AgentStateMachine();
   private shadow = new PIXI.Graphics();
   private ring = new PIXI.Graphics();
-  /** 像素 sprite（站立帧，32×48）；无贴图时走程序化 body/face */
-  private sprite: PIXI.Sprite | PIXI.AnimatedSprite | null = null;
+  /** 像素 sprite（32×48 帧，整表切片自管切换）；无贴图时走程序化 body/face */
+  private sprite: PIXI.Sprite | null = null;
+  /** sheet 帧纹理（32×48/帧，整表切片）；无帧动画时为空 */
+  private frameTextures: PIXI.Texture[] = [];
+  /** 状态 → 帧序（null = 旧单帧 sheet，走程序摆动） */
+  private animSeqs: Record<AgentAnimKey, number[]> | null = null;
+  private animSeqKey: AgentAnimKey | null = null;
+  private frameIdx = 0;
+  private frameTimer = 0;
+  /** 当前激活的帧序（getup 为坐下序列倒序；推进循环用它，避免读到静态 getup 表） */
+  private activeFrames: number[] = [];
+  /** 目标是否为本人工位（决定坐下/起身） */
+  private atDesk = false;
+  /** 坐姿朝向（对应场景两种椅子朝向） */
+  private sitVariant: "A" | "B" = "A";
+  private sitPhase: "standing" | "sitdown" | "sitting" | "getup" = "standing";
   // 程序化回退（缺贴图时）
   private body: PIXI.Graphics | null = null;
   private face: PIXI.Graphics | null = null;
@@ -83,18 +99,19 @@ export class OfficeActor {
   private _lastSel = false;
   /** alert 进入时的 start timestamp，-1 表示未在脉冲 */
   private _pulseStart = -1;
-  private standTex: PIXI.Texture | null;
   private bubbleTex: PIXI.Texture | null;
 
   constructor(
     agent: OfficeAgent,
     onSelect: (id: string) => void,
-    standTex: PIXI.Texture | null,
+    sheetTex: PIXI.Texture | null,
+    layout: SheetLayout | null,
+    animSeqs: Record<AgentAnimKey, number[]> | null,
     bubbleTex: PIXI.Texture | null,
   ) {
     this.agent = agent;
-    this.standTex = standTex;
     this.bubbleTex = bubbleTex;
+    this.animSeqs = animSeqs;
     this.label = this._buildLabel(agent.name);
     this.bubble = this._buildBubble(bubbleTex);
 
@@ -105,34 +122,37 @@ export class OfficeActor {
 
     // Layer children (bottom → top)
     this.container.addChild(this.shadow, this.ring);
-    // shadow 只画一次（脚底位置不变，bounce 只改变 scale）
-    this._drawShadow();
-    if (standTex) {
-      // standTex 是整张 sheet（128×144 = 4列×3行 × 32×48）。
-      // 用 AnimatedSprite 做单帧裁剪，frame = 左上角 (0,0,32,48)。
-      // AnimatedSprite 即使只有一帧也工作正常，帧切换直接改 textures[0]。
-      const frameTex = new PIXI.Texture({
-        source: standTex.source,
-        frame: new PIXI.Rectangle(
-          SHEET_STAND_FRAME.x,
-          SHEET_STAND_FRAME.y,
-          SHEET_FRAME_W,
-          SHEET_FRAME_H,
-        ),
-        orig: new PIXI.Rectangle(0, 0, SHEET_FRAME_W, SHEET_FRAME_H),
-      });
-      // 手动更新 UV（PixiJS v8 中 new Texture(frame,orig) 后需要调用一次，否则默认 UV 是整图）
-      frameTex.updateUvs();
-
-      const anim = new PIXI.AnimatedSprite([frameTex]);
-      anim.anchor.set(0.5, SHEET_FOOT_ANCHOR_Y);
-      // 32×48 像素小人 → 放大到 1.6x 约 51×77，和放大家具 (1.6-1.8x) 比例协调
-      anim.scale.set(1.6);
-      anim.alpha = 1;
-      anim.autoUpdate = false; // 只有一帧，不跑 ticker
-      anim.gotoAndStop(0);
-      this.sprite = anim;
-      this.container.addChild(anim);
+    if (sheetTex) {
+      // 采样模式按布局：旧 16-bit 表用 nearest 保像素锐利；新 2K 高清表与背景同质感用 linear
+      if (layout) sheetTex.source.scaleMode = layout.scaleMode;
+      // sheetTex 是整张 sheet；按 layout 切片出全部帧（frameW×frameH），供 Sprite 按状态切换帧。
+      const cols = layout?.cols ?? 1;
+      const rows = layout?.rows ?? 1;
+      const fw = layout?.frameW ?? 32;
+      const fh = layout?.frameH ?? 48;
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const t = new PIXI.Texture({
+            source: sheetTex.source,
+            frame: new PIXI.Rectangle(c * fw, r * fh, fw, fh),
+            orig: new PIXI.Rectangle(0, 0, fw, fh),
+          });
+          // 手动更新 UV（PixiJS v8 中 new Texture(frame,orig) 后需要调用一次，否则默认 UV 是整图）
+          t.updateUvs();
+          this.frameTextures.push(t);
+        }
+      }
+      const firstSeq = (animSeqs?.idle ?? [0])
+        .map((i) => this.frameTextures[i])
+        .filter(Boolean);
+      const spr = new PIXI.Sprite(firstSeq.length ? firstSeq[0] : this.frameTextures[0]);
+      spr.anchor.set(0.5, FOOT_ANCHOR_Y);
+      // 显示尺寸 = 帧高 × scale：旧表 48×1.6 ≈ 77；新表 96×0.8 ≈ 77（与放大家具 1.6-1.8x 比例协调）
+      spr.scale.set(layout?.scale ?? 1.6);
+      spr.alpha = 1;
+      this.sprite = spr;
+      this.animSeqKey = "idle";
+      this.container.addChild(spr);
     } else {
       this.body = new PIXI.Graphics();
       this.face = new PIXI.Graphics();
@@ -141,6 +161,8 @@ export class OfficeActor {
       this.container.addChild(this.body, this.face);
       this._drawBody();
     }
+    // shadow 只画一次（脚底位置不变，bounce 只改变 scale）；须在 sprite/body 定案后调用
+    this._drawShadow();
     this.container.addChild(this.workDots, this.bubble, this.label);
     this.label.y = 40;
     this.bubble.visible = false;
@@ -154,9 +176,18 @@ export class OfficeActor {
   // ── Public API ────────────────────────────────────────────────
 
   /** Set the desired state for this frame. Called every tick. */
-  setTarget(x: number, y: number, input: StateInput, selected: boolean): void {
+  setTarget(
+    x: number,
+    y: number,
+    input: StateInput,
+    selected: boolean,
+    atDesk = false,
+    sitVariant: "A" | "B" = "A",
+  ): void {
     this.target = { x, y };
     this._selected = selected;
+    this.atDesk = atDesk;
+    this.sitVariant = sitVariant;
 
     const output = this.fsm.evaluate(input);
     this.bubble.visible = output.showBubble;
@@ -180,30 +211,96 @@ export class OfficeActor {
       this.walkPhase *= 0.85; // decay when stationary
     }
 
-    // Position interpolation
-    const dx = this.target.x - this.container.x;
-    const dy = this.target.y - this.container.y;
-    this.container.x += dx * Math.min(1, delta * WALK_SPEED);
-    this.container.y += dy * Math.min(1, delta * WALK_SPEED);
+    // Position interpolation（一次性坐/起身期间暂停插值，防止起身过程中滑走）
+    const paused = !!this.animSeqs && (this.sitPhase === "sitdown" || this.sitPhase === "getup");
+    if (!paused) {
+      const dx = this.target.x - this.container.x;
+      const dy = this.target.y - this.container.y;
+      this.container.x += dx * Math.min(1, delta * WALK_SPEED);
+      this.container.y += dy * Math.min(1, delta * WALK_SPEED);
+    }
 
     // zIndex = y for isometric depth sort
     this.container.zIndex = Math.round(this.container.y);
 
-    // 选定程序动画参数（因为 sheet 本身无动画帧）
+    // 动画选型：帧动画（dev 女孩 sheet）优先，旧单帧 sheet/程序化 body 走摆动兜底
     const state = this.fsm.current;
-    const animKind: AgentAnimKind =
-      state === "walking" || walking ? "walking" : state === "working" ? "working" : "idle";
-    const p = AGENT_PROC_ANIM[animKind];
+    // 到桌坐下 / 离桌起身（仅帧动画模式）：坐下一次性动作 → 坐姿循环；离桌起身一次性 → 行走
+    if (this.animSeqs) {
+      if (this.atDesk && !walking && this.sitPhase === "standing") this.sitPhase = "sitdown";
+      if (!this.atDesk && (this.sitPhase === "sitting" || this.sitPhase === "sitdown")) {
+        this.sitPhase = "getup";
+      }
+    }
+    const animKey: AgentAnimKey = this.animSeqs
+      ? state === "alert" || state === "talking"
+        ? state   // ping/聊天优先：坐姿时被 ping 也弹出问号帧
+        : this.sitPhase === "sitdown"
+          ? this.sitVariant === "B"
+            ? "sitdown_b"
+            : "sitdown"
+          : this.sitPhase === "getup"
+            ? "getup"
+            : this.sitPhase === "sitting" && !walking
+              ? state === "working" && this.sitVariant === "A"
+                ? "working"   // 打字帧 = 坐着朝右打（匹配 A 朝向的桌右）；B 朝向保持坐姿循环
+                : this.sitVariant === "B"
+                  ? "sitting_b"
+                  : "sitting"
+              : state === "walking" || walking
+                ? "walking"
+                : state === "working"
+                  ? "working"
+                  : "idle"
+      : state === "walking" || walking
+        ? "walking"
+        : state === "working"
+          ? "working"
+          : "idle";
+    // talk/alert/坐系列无独立程序参数，借 idle 的摆动
+    const p =
+      AGENT_PROC_ANIM[animKey === "walking" || animKey === "working" ? animKey : "idle"];
 
-    // Bob animation（程序化角色 body/face；sprite 整体位移）
+    // Bob 位移（程序化 body/face）；帧动画模式下站立循环减半、关 rotation（帧自带姿态）
     const bob = Math.sin(this.walkPhase * (p.bobHz / BOB_FREQ)) * p.bobAmp;
     if (this.body && this.face) {
       this.body.y = bob;
       this.face.y = bob;
     }
     if (this.sprite) {
-      this.sprite.y = bob;
-      this.sprite.rotation = Math.sin(this.walkPhase * (p.bobHz / BOB_FREQ) * 2) * p.leanAmp;
+      if (this.animSeqs) {
+        this._setAnim(animKey);
+        // 自管帧计时器：以场景 delta（帧≈1/60s）推进，fps 由 DEV_ANIM_FPS 控制；
+        // 大 delta（切后台回来）一次消耗多帧，避免动画变慢
+        const fps = DEV_ANIM_FPS[animKey] ?? 4;
+        this.frameTimer += (delta * fps) / 60;
+        const adv = Math.floor(this.frameTimer);
+        if (adv > 0) {
+          this.frameTimer -= adv;
+          let moved = 0;
+          while (moved < adv && moved < this.activeFrames.length * 2) {
+            const next = (this.frameIdx + 1) % this.activeFrames.length;
+            if (next === 0 && DEV_ANIM_ONESHOT.includes(animKey)) {
+              // 一次性动作播完：转入后续 phase（sitting / standing），末帧保留显示
+              if (animKey === "sitdown" || animKey === "sitdown_b") this.sitPhase = "sitting";
+              if (animKey === "getup") this.sitPhase = "standing";
+              break;
+            }
+            this.frameIdx = next;
+            this.sprite.texture = this.frameTextures[this.activeFrames[this.frameIdx]];
+            moved++;
+          }
+        }
+        // 坐下/起身/坐姿帧不叠加 bob，站立循环微幅 bob
+        this.sprite.y =
+          animKey === "idle" || animKey === "walking" || animKey === "working"
+            ? bob * 0.5
+            : 0;
+        this.sprite.rotation = 0;
+      } else {
+        this.sprite.y = bob;
+        this.sprite.rotation = Math.sin(this.walkPhase * (p.bobHz / BOB_FREQ) * 2) * p.leanAmp;
+      }
     }
 
     // Shadow stays grounded — squash slightly while bobbing
@@ -233,8 +330,9 @@ export class OfficeActor {
     // Selection ring — soft pulsing ellipse at the feet
     if (this._selected) {
       const pulse = (Math.sin(now / 260) + 1) / 2;
+      const ry = this.sprite ? 4 : 34;
       this.ring.clear();
-      this.ring.ellipse(0, 34, 21 + pulse * 3.5, 7.5 + pulse * 1.2);
+      this.ring.ellipse(0, ry, 21 + pulse * 3.5, 7.5 + pulse * 1.2);
       this.ring.stroke({ width: 2, color: 0x60a5fa, alpha: 0.5 + pulse * 0.4 });
       this.ring.visible = true;
     } else if (this.ring.visible) {
@@ -292,10 +390,13 @@ export class OfficeActor {
     return c;
   }
 
+  /** 接触阴影：贴住脚底消除悬浮感（程序化 body 的脚在 y≈34，sprite 帧的脚在 y≈0） */
   private _drawShadow(): void {
+    const sy = this.sprite ? 3 : 34;
+    const rx = this.sprite ? 15 : 17;
     this.shadow.clear();
-    this.shadow.ellipse(0, 34, 17, 5.5);
-    this.shadow.fill({ color: 0x0f172a, alpha: 0.18 });
+    this.shadow.ellipse(0, sy, rx, 5.5);
+    this.shadow.fill({ color: 0x0f172a, alpha: 0.22 });
   }
 
   private _buildBubble(tex: PIXI.Texture | null): PIXI.Container {
@@ -337,6 +438,25 @@ export class OfficeActor {
   private _pulseBubble(): void {
     this._pulseStart = performance.now();
     this.bubble.scale.set(1.2);
+  }
+
+  /** 按状态切换帧序列（dev 动画表；旧单帧 sheet 不走到这里） */
+  private _setAnim(key: AgentAnimKey): void {
+    if (this.animSeqKey === key || !this.animSeqs) return;
+    let seq: number[] = this.animSeqs[key];
+    if (key === "getup") {
+      // 起身 = 当前坐姿朝向的「坐下」序列倒序播放（动作方向一致、服装一致）
+      const sitKey = this.sitVariant === "B" ? "sitdown_b" : "sitdown";
+      seq = [...this.animSeqs[sitKey]].reverse();
+    }
+    const frames = seq.map((i) => this.frameTextures[i]).filter(Boolean);
+    if (!frames.length) return;
+    this.animSeqKey = key;
+    this.activeFrames = seq;
+    this.frameIdx = 0;
+    this.frameTimer = 0;
+    // 先切到新序列的帧 0，下一步 timer 推进到帧 1
+    this.sprite!.texture = frames[0];
   }
 
   private _drawBody(): void {
