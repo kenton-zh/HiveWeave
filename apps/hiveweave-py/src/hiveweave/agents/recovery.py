@@ -44,6 +44,57 @@ FAILED_TURN_NEXT_WAKE_HINT = (
     "Continue that work unless this wake is a clearly new, different request."
 )
 
+# ── E5 断流降级记账（复盘致命链二：断流不自证，直接诱发 waiver 收口）──
+#
+# agent 是长驻服务，进程内 registry 跨 turn 存活；被断流（SSL EOF / stream
+# idle / tool-loop stall / safety_timeout 等）打断时置位，成功完成一轮
+# （complete_run）后清除。工具层（waive / VERIFY submit）在「降级 ∧ 名下有
+# 未闭环 VERIFY」时拒绝 waiver 型收口，强制续跑或升级 coordinator。
+# 说明：这是判段出处（P2）前的兜底补丁——registry 为进程内态，后端重启
+# 即清零；不建完整「判断出处」系统，只堵最危险的就地收口路径。
+_DEGRADED_AGENTS: dict[str, int] = {}  # agent_id -> set_at_ms
+
+
+def mark_degraded(agent_id: str) -> None:
+    """断流/stall 打断时置位降级标志。"""
+    if agent_id:
+        _DEGRADED_AGENTS[agent_id] = int(time.time() * 1000)
+
+
+def clear_degraded(agent_id: str) -> None:
+    """成功续跑一轮（run 完成）后清除降级标志。"""
+    if agent_id:
+        _DEGRADED_AGENTS.pop(agent_id, None)
+
+
+def is_degraded(agent_id: str) -> bool:
+    """降级标志是否仍置位（供工具层收口入口检查）。"""
+    return agent_id in _DEGRADED_AGENTS
+
+
+def _is_interruption_break(error: Exception) -> bool:
+    """是否断流类打断（SSL EOF / stream idle / tool-loop stall 等）。
+
+    这类错误意味着 turn 被打断而非可恢复的瞬时抖动，被打断后 agent 面临
+    「续跑重验 vs 就地收口」的选择——正是它们需要一个降级标记来拦截
+    waiver 捷径。普通限流 / 业务错误不计入。
+    """
+    msg = str(error).lower()
+    markers = (
+        "ssl",
+        "eof",
+        "readtimeout",
+        "serverdisconnected",
+        "server disconnected",
+        "stream idle",
+        "write timeout",
+        "tool-loop stalled",
+        "tool loop stalled",
+        "turn ended early",
+        "valueerror: stream",
+    )
+    return any(m in msg for m in markers)
+
 
 def history_ends_with_failed_turn(history: list | None) -> bool:
     """True when the last assistant turn is a failed-LLM marker."""
@@ -796,6 +847,9 @@ async def handle_safety_timeout(agent: Any) -> None:
     - 记录 work_log，便于监控/stall watchdog 关联
     """
     inbox_ids = list(agent.pending_inbox_msg_ids or [])
+
+    # E5: safety_timeout 打断 → 置位降级标志（与 handle_error 断流同口径）。
+    mark_degraded(agent.id)
 
     # ── Durable Run Ledger: mark run interrupted ──
     _run_id = getattr(agent, "_current_run_id", None)

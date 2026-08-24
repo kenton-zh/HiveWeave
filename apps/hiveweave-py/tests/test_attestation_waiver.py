@@ -15,7 +15,7 @@ from __future__ import annotations
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -261,6 +261,132 @@ async def test_waive_non_fail_verdict_unaffected(env):
         )
     text = (result.output or "") + (result.error or "")
     assert "结论不合格不可豁免" not in text
+
+
+# ── E5 断流收口纪律：降级 + open VERIFY → 禁就地 waiver 收口 ─────────
+
+
+@pytest.mark.asyncio
+async def test_waive_degraded_with_open_verify_rejected(env):
+    """E5-①断流降级中且名下有未闭环 VERIFY → waive 被拒，指引续跑/升级。"""
+    from hiveweave.agents.recovery import clear_degraded, mark_degraded
+    from hiveweave.tools.task_tools import (
+        WaiveAttestationParams,
+        waive_attestation_tool,
+    )
+
+    task = {
+        "id": "t-verify-e5",
+        "title": "VERIFY: feature",
+        "tags": ["verify", "mandatory"],
+        "assignee_id": "qa1",
+        "evidence": {"verdict": "PASS", "tests_passed": True},
+    }
+    open_verify = {
+        "id": "t-verify-open",
+        "title": "VERIFY: other",
+        "tags": ["verify"],
+        "assignee_id": "qa1",
+    }
+    mark_degraded("qa1")  # 模拟刚被打断（SSL EOF / stall）的降级态
+    try:
+        with (
+            patch(
+                "hiveweave.tools.helpers.get_project_id",
+                AsyncMock(return_value=PROJECT_ID),
+            ),
+            patch("hiveweave.services.task.TaskService") as TS,
+            patch("hiveweave.services.org.OrgService") as Org,
+            patch(
+                "hiveweave.services.policy.infer_role_family",
+                return_value="ceo",
+            ),
+            patch(
+                "hiveweave.services.attestation.count_waivers",
+                AsyncMock(return_value=0),
+            ),
+            patch(
+                "hiveweave.services.attestation.has_valid_waiver",
+                AsyncMock(return_value=False),
+            ),
+        ):
+            TS.return_value.get_task = AsyncMock(return_value=task)
+            TS.return_value.get_open_work_obligations = AsyncMock(
+                return_value=[open_verify]
+            )
+            TS.return_value._is_verify_task = MagicMock(return_value=True)
+            Org.return_value.get_agent = AsyncMock(
+                return_value={"id": "ceo1", "role": "CEO"}
+            )
+            result = await waive_attestation_tool(
+                WaiveAttestationParams(
+                    taskId="t-verify-e5",
+                    reason="该终验已通过并附机器验证记录，豁免其余凭证要求以便收口归档",
+                ),
+                agent_id="qa1",
+                workspace=env["workspace_path"],
+            )
+    finally:
+        clear_degraded("qa1")
+
+    assert result.success is False
+    text = (result.output or "") + (result.error or "")
+    assert "断流" in text and "禁止就地 waiver 收口" in text
+
+
+@pytest.mark.asyncio
+async def test_waive_normal_not_blocked_by_e5(env):
+    """E5-②非降级（断流已恢复）→ E5 不拦，waive 走其他闸门。"""
+    from hiveweave.tools.task_tools import (
+        WaiveAttestationParams,
+        waive_attestation_tool,
+    )
+
+    task = {
+        "id": "t-verify-e5b",
+        "title": "VERIFY: feature",
+        "tags": ["verify", "mandatory"],
+        "assignee_id": "qa1",
+        "evidence": {"verdict": "PASS", "tests_passed": True},
+    }
+    with (
+        patch(
+            "hiveweave.tools.helpers.get_project_id",
+            AsyncMock(return_value=PROJECT_ID),
+        ),
+        patch("hiveweave.services.task.TaskService") as TS,
+        patch("hiveweave.services.org.OrgService") as Org,
+        patch(
+            "hiveweave.services.policy.infer_role_family",
+            return_value="ceo",
+        ),
+        patch(
+            "hiveweave.services.attestation.count_waivers",
+            AsyncMock(return_value=0),
+        ),
+        patch(
+            "hiveweave.services.attestation.has_valid_waiver",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        TS.return_value.get_task = AsyncMock(return_value=task)
+        TS.return_value.get_open_work_obligations = AsyncMock(
+            return_value=[{"id": "t-open", "title": "普通任务"}]
+        )
+        TS.return_value._is_verify_task = MagicMock(return_value=False)
+        Org.return_value.get_agent = AsyncMock(
+            return_value={"id": "ceo1", "role": "CEO"}
+        )
+        result = await waive_attestation_tool(
+            WaiveAttestationParams(
+                taskId="t-verify-e5b",
+                reason="该终验已通过并附机器验证记录，豁免其余凭证要求以便收口归档",
+            ),
+            agent_id="qa1",
+            workspace=env["workspace_path"],
+        )
+    text = (result.output or "") + (result.error or "")
+    assert "禁止就地 waiver 收口" not in text
 
 
 # ── P0-2: rework 时 invalidate valid waiver ─────────────────

@@ -46,6 +46,19 @@ class SubmitMixin:
         # 带强制判定字段，否则硬拒提交（transition 之前拦截）。
         if task and self._is_verify_task(task):
             self._validate_verdict_evidence(evidence)
+            # E5 断流收口纪律：降级中提交 verdict=FAIL 属「waiver 型就地
+            # 收口」——必须续跑重验或升级 coordinator，不许抢在续跑前
+            # 用 FAIL 提交替豁免收口（复盘终验三连打断后 waiver 收口）。
+            if (
+                isinstance(evidence, dict)
+                and evidence.get("verdict") == "FAIL"
+                and self._is_degraded_assignee(task)
+            ):
+                raise ValueError(
+                    "SUBMIT REJECTED (degraded verify): 你所在 turn 刚被断流/"
+                    "打断（降级中）且正提交 FAIL 终验——禁止就地收口，"
+                    "请续跑完成重新验证，或显式升级 coordinator。"
+                )
 
         # SUBMITTED MACHINE PRE-RUN (slice-driven L0)
         if task and task.get("contract_json"):
@@ -200,6 +213,25 @@ class SubmitMixin:
                     "verdict=FAIL 时 blocking_issues 必须为非空 list "
                     "（当前缺失或为空）"
                 )
+
+    @staticmethod
+    def _is_degraded_assignee(task: dict | None) -> bool:
+        """E5: 提交者（assignee）是否处于断流降级标志。
+
+        惰性 import 规避 agents→services 循环依赖；registry 读取失败按
+        False 处理（fail-open，不误伤正常提交）。
+        """
+        if not task:
+            return False
+        agent_id = str(task.get("assignee_id") or "")
+        if not agent_id:
+            return False
+        try:
+            from hiveweave.agents.recovery import is_degraded
+
+            return is_degraded(agent_id)
+        except Exception:
+            return False
 
     async def _resolve_evidence_workspace(
         self, project_id: str, task: dict

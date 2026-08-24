@@ -90,6 +90,19 @@ class WaiveAttestationParams(BaseModel):
     )
 
 
+async def _agent_has_open_verify(project_id: str, agent_id: str) -> bool:
+    """名下有未闭环 VERIFY 验收义务（E5 收口纪律判定用）。"""
+    try:
+        ts = _task_svc.TaskService()
+        open_tasks = await ts.get_open_work_obligations(project_id, agent_id)
+        if not open_tasks:
+            return False
+        return any(ts._is_verify_task(t) for t in open_tasks)
+    except Exception as e:
+        log.warning("open_verify_scan_failed", agent_id=agent_id, error=str(e))
+        return False
+
+
 @tool(
     "waive_attestation",
     "Waive the attestation gate for ONE task (coordinator/CEO). "
@@ -176,6 +189,20 @@ async def waive_attestation_tool(
         return ToolResult.err(
             "waive_attestation rejected: task evidence verdict=FAIL——"
             "结论不合格不可豁免（waiver 只豁免凭证缺失，请走 rework 返修）"
+        )
+
+    # E5 断流收口纪律（复盘致命链二）：turn 刚被打断（降级中）且名下有
+    # 未闭环 VERIFY → 拒绝就地 waiver 收口——强制续跑重验或显式升级
+    # coordinator，不许带着未闭环的验收义务走豁免捷径。
+    from hiveweave.agents.recovery import is_degraded
+
+    if is_degraded(agent_id) and await _agent_has_open_verify(
+        project_id, agent_id
+    ):
+        return ToolResult.err(
+            "waive_attestation rejected: 你所在 turn 刚被断流/打断（降级中）"
+            "且名下仍有未闭环 VERIFY 验收义务——禁止就地 waiver 收口。"
+            "请先续跑完成验收，或显式升级 coordinator 处理。"
         )
 
     # Lifetime cap — escape hatch must stay narrower than the front door

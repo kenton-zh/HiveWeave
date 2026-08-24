@@ -163,6 +163,10 @@ async def handle_completion(
                 run_id=_run_id,
                 result_summary=summary,
             )
+            # E5: 成功续跑一轮（run 完成）→ 清除断流降级标志。
+            from hiveweave.agents.recovery import clear_degraded
+
+            clear_degraded(agent.id)
         except Exception as e:
             log.debug("run_ledger.complete_run_failed", error=str(e))
     tool_turn_messages = result.get("tool_turn_messages", [])
@@ -1126,6 +1130,9 @@ async def handle_completion(
     elif _stall_resume_refs:
         # P1-3: 补偿唤醒优先于通用 retrigger 分支 —— 用卡死的同一上下文立刻
         # 重入只会再 stall；延迟唤醒 + 引导先核实状态再续跑/收口。
+        from hiveweave.agents.recovery import mark_degraded
+
+        mark_degraded(agent.id)  # E5: stall 打断 → 置位降级标志
         agent._arm_interrupted_resume(_stall_resume_refs)
     elif gate_retrigger_hint:
         await agent._retrigger_for_turn_gate(

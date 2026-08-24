@@ -182,3 +182,64 @@ async def test_legacy_no_verdict_approve_normal(task_env):
     after = await ts.get_task(pid, vid)
     assert after["status"] in ("approved", "closed")
     assert after["status"] != "running"
+
+
+# ── E5 断流收口纪律（submit 侧）：降级中提交 FAIL 终验被拒 ──────────
+
+
+async def _mk_verify_running_for(ts: TaskService, pid: str, agent: str) -> str:
+    """同 _mk_verify_running，但 assignee 可指定（E5 降级判定按 assignee）。"""
+    verify_id = await ts.create_task(
+        pid,
+        "VERIFY: UI",
+        "verify",
+        creator_id=COORD,
+        assignee_id=agent,
+        tags=["verify", "mandatory"],
+        source="system",
+    )
+    await ts.claim_task(pid, verify_id, agent, bypass_verify_serialize=True)
+    await ts.start_task(pid, verify_id)
+    assert (await ts.get_task(pid, verify_id))["status"] == "running"
+    return verify_id
+
+
+@pytest.mark.asyncio
+async def test_fail_submit_rejected_when_assignee_degraded(task_env):
+    """E5-④降级中提交 verdict=FAIL → 硬拒（禁止就地收口），状态不推进。"""
+    from hiveweave.agents.recovery import clear_degraded, mark_degraded
+
+    ts = TaskService()
+    pid = task_env["project_id"]
+    vid = await _mk_verify_running_for(ts, pid, EXEC)
+    mark_degraded(EXEC)
+    try:
+        with pytest.raises(ValueError) as ei:
+            await ts.submit_task(
+                pid,
+                vid,
+                evidence={"verdict": "FAIL", "blocking_issues": ["/_admin 404"]},
+            )
+        assert "degraded" in str(ei.value)
+    finally:
+        clear_degraded(EXEC)
+    # transition 之前拦截 → 状态未被推进
+    assert (await ts.get_task(pid, vid))["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_pass_submit_allowed_when_assignee_degraded(task_env):
+    """E5-⑤降级中提交 verdict=PASS（真实续跑完成）→ 不受 E5 影响。"""
+    from hiveweave.agents.recovery import clear_degraded, mark_degraded
+
+    ts = TaskService()
+    pid = task_env["project_id"]
+    vid = await _mk_verify_running_for(ts, pid, EXEC)
+    mark_degraded(EXEC)
+    try:
+        await ts.submit_task(
+            pid, vid, evidence={"verdict": "PASS", "tests_passed": True}
+        )
+    finally:
+        clear_degraded(EXEC)
+    assert (await ts.get_task(pid, vid))["status"] == "submitted"
