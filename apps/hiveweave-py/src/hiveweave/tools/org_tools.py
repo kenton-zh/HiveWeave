@@ -111,9 +111,11 @@ def _hire_permission_mode(perm_type: str, role: str) -> str:
     builder coordinator（中层，family=coordinator）须可写 —— 固定 readonly
     会让 evaluate 的 mode 兜底把写工具变 ask，SOURCE_WRITE 形同虚设；
     CEO 保持偏只读协调 mode（有 DOC_WRITE，无 SOURCE_WRITE）。
+
+    以 infer_role_family 为唯一判定源（C1 审计）：显式 permType=ceo/hr 与
+    coordinator+role 归入 CEO/HR 族的两条路径必须产出同一个 readonly，避免
+    显式 perm_type 因绕过 coordinator 分支而回落到 readwrite。
     """
-    if perm_type != "coordinator":
-        return "readwrite"
     from hiveweave.services.policy import infer_role_family
 
     family = infer_role_family({"role": role, "permission_type": perm_type})
@@ -239,21 +241,31 @@ async def hire_agent_tool(
             parent_id = ceo["id"]
 
     # Determine permission_type
-    if perm_type_arg in ("coordinator", "executor"):
+    # 结构化角色 ID：显式 permissionType（ceo/hr/coordinator/executor/qa）优先；
+    # 否则按 role 精确推断 —— ceo/hr/qa 各自成族，不再把 ceo/hr 归进 coordinator
+    # （历史 bug：CEO/HR 被存成 coordinator，2026-08 修复）。
+    if perm_type_arg in ("ceo", "hr", "coordinator", "executor", "qa"):
         perm_type = perm_type_arg
     else:
-        coordinator_roles = {
-            "ceo", "hr", "qa", "cto", "architect", "manager", "pm",
-        }
-        perm_type = (
-            "coordinator" if role.lower() in coordinator_roles else "executor"
-        )
+        from hiveweave.services.policy import is_test_engineer_role
+
+        role_l = (role or "").strip().lower()
+        if role_l == "ceo":
+            perm_type = "ceo"
+        elif role_l in ("hr", "人力资源"):
+            perm_type = "hr"
+        elif is_test_engineer_role(role):
+            perm_type = "qa"
+        elif role_l in {"cto", "architect", "manager", "pm"}:
+            perm_type = "coordinator"
+        else:
+            perm_type = "executor"
         log.warning(
             "tool.hire_agent.permission_type_inferred",
             role=role,
             inferred=perm_type,
-            hint="HR should pass explicit permissionType; role-string "
-            "inference is unreliable for non-English/unknown roles",
+            hint="HR should pass explicit permissionType for non-standard roles; "
+            "role-string inference is unreliable for non-English/unknown roles",
         )
     perm_mode = _hire_permission_mode(perm_type, role)
 

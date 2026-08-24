@@ -38,7 +38,11 @@ _INSPECTOR_ALIASES: frozenset[str] = frozenset({
 
 
 def _is_test_engineer_role(role: str) -> bool:
-    """Match 测试工程师 / Test Engineer / Evidence Collector / E2E QA roles."""
+    """Match 测试工程师 / Test Engineer / Evidence Collector / 浏览器 QA roles.
+
+    **不**匹配裸词 ``e2e``（role 名带 e2e 的协调员/开发岗不应路由到测试脚本，
+    与 policy.is_test_engineer_role 对齐，2026-08）。
+    """
     original = role or ""
     r = original.strip().lower()
     if r in {"test_engineer", "qa_engineer", "qa engineer"}:
@@ -47,7 +51,7 @@ def _is_test_engineer_role(role: str) -> bool:
         return True
     if "测试工程师" in original or "测试专员" in original:
         return True
-    if "浏览器测试" in original or "e2e" in r:
+    if "浏览器测试" in original:
         return True
     if "evidence collector" in r:
         return True

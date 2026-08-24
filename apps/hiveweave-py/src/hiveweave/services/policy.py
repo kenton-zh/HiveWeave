@@ -210,7 +210,13 @@ _DOCUMENT_BASENAMES_NO_EXT = frozenset({
 
 
 def is_test_engineer_role(role: str) -> bool:
-    """Match QA / 测试工程师 roles (shared with prompts.executor)."""
+    """Match QA / 测试工程师 roles (shared with prompts.executor).
+
+    只认结构化/语义明确的测试角色：exact 键、test/qa engineer 短语、
+    测试工程师/测试专员、浏览器测试（浏览器 QA 语义明确）。
+    **不**匹配裸词 ``e2e`` —— role 名里带 e2e 的协调员/开发岗（如
+    "S3 e2e 数据面"）不应被判成 qa（E2E 实测误判，2026-08）。
+    """
     original = role or ""
     r = original.strip().lower()
     if r in {"test_engineer", "qa_engineer", "qa engineer", "qa"}:
@@ -219,7 +225,7 @@ def is_test_engineer_role(role: str) -> bool:
         return True
     if "测试工程师" in original or "测试专员" in original:
         return True
-    if "浏览器测试" in original or "e2e" in r:
+    if "浏览器测试" in original:
         return True
     if "evidence collector" in r:
         return True
@@ -229,7 +235,16 @@ def is_test_engineer_role(role: str) -> bool:
 
 
 def infer_role_family(agent: dict[str, Any]) -> RoleFamily:
-    """Derive role family from agent row (role / permission_type / explicit)."""
+    """Derive role family from agent row.
+
+    优先级（结构化角色 ID 优先，松散 role 名仅兜底）：
+    1. 显式 role_family
+    2. 精确机器可读角色键 hr/ceo（历史 permission_type 可能被存成 coordinator）
+    3. 精确 QA 角色键（qa / qa_engineer / test_engineer）—— 角色名即角色 ID
+    4. permission_type==coordinator —— 协调员不会被 role 名松散子串带偏成 qa
+    5. 测试工程师松散 role 名兜底（Echo 事故：测试工程师常无 qa permission_type）
+    6. 其余 permission_type 角色 ID；兜底 executor
+    """
     explicit = (agent.get("role_family") or "").strip().lower()
     if explicit in FAMILY_CAPABILITIES:
         return explicit
@@ -240,14 +255,20 @@ def infer_role_family(agent: dict[str, Any]) -> RoleFamily:
 
     if role_l == "hr" or role == "人力资源" or "人力资源" in role:
         return "hr"
-    if is_test_engineer_role(role):
-        return "qa"
     # role==ceo 优先于 permission_type=coordinator —— CEO 是独立行政 family，
     # 不享受中层 builder 的写码权。
     if role_l == "ceo":
         return "ceo"
+    # 精确 QA 角色键：role 名即角色 ID，优先于 permission_type
+    if role_l in ("qa", "qa_engineer", "qa engineer", "test_engineer"):
+        return "qa"
+    # 结构化角色 ID：协调员不被 role 名松散子串（e2e 等）带偏成 qa
     if perm == "coordinator" or role_l == "coordinator":
         return "coordinator"
+    if is_test_engineer_role(role):
+        return "qa"
+    if perm in FAMILY_CAPABILITIES:
+        return perm
     return "executor"
 
 

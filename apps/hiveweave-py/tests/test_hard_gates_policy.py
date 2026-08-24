@@ -16,6 +16,7 @@ from hiveweave.services.policy import (
     tool_hard_deny,
     write_path_allowed,
 )
+from hiveweave.tools.org_tools import _hire_permission_mode
 
 
 def _agent(**kwargs) -> dict:
@@ -44,6 +45,42 @@ def test_infer_families():
         _agent(role="前端架构师", permission_type="coordinator")
     ) == "coordinator"
     assert infer_role_family(_agent(role="前端模块工程师")) == "executor"
+
+
+def test_infer_families_e2e_coordinator_not_qa():
+    """role 名带 e2e 的协调员（permission_type=coordinator）→ coordinator，非 qa。
+
+    E2E 实测误判：`is_test_engineer_role` 裸词 `e2e` 把协调员带偏成 qa，
+    导致 CEO 无法派发给他们 —— 结构化角色 ID（permission_type=coordinator）
+    须优先于 role 名扫描。
+    """
+    assert infer_role_family(
+        _agent(role="S3 e2e 数据面负责人", permission_type="coordinator")
+    ) == "coordinator"
+    # 浏览器测试 / 测试工程师 语义明确，仍按 role 名兜底识别为 qa（Echo 事故）
+    assert infer_role_family(
+        _agent(role="浏览器测试工程师", permission_type="executor")
+    ) == "qa"
+    assert infer_role_family(
+        _agent(role="前端测试工程师", permission_type="executor")
+    ) == "qa"
+    # permission_type 作为角色 ID 可直接表达 qa（无需 role 名）
+    assert infer_role_family(
+        _agent(role="验收专员", permission_type="qa")
+    ) == "qa"
+
+
+def test_hire_permission_mode_explicit_ceo_hr_readonly():
+    """显式 permType=ceo/hr 与 coordinator+role 归族产出同一个 readonly（C1）。
+
+    修复前：显式 permType 直接返回 readwrite，与"CEO 偏只读协调"意图相悖。
+    """
+    assert _hire_permission_mode("ceo", "CEO") == "readonly"
+    assert _hire_permission_mode("hr", "HR经理") == "readonly"
+    # builder coordinator 与叶子仍可写（SOURCE_WRITE 依赖 readwrite mode）
+    assert _hire_permission_mode("coordinator", "架构师") == "readwrite"
+    assert _hire_permission_mode("executor", "后端开发") == "readwrite"
+    assert _hire_permission_mode("qa", "验收专员") == "readwrite"
 
 
 def test_hr_caps_no_dispatch_or_bash():
