@@ -1438,6 +1438,93 @@ class MessageUserParams(BaseModel):
     )
 
 
+# E4 补（复盘 P0-1 G4「CEO 出口核验」）：完结断言词表——CEO 发布这些措辞
+# 时视为「交付结论」，须先通过账本一致性核验。自由文本用词表启发式
+# （与 submitGate 词表同风格）；平时进度汇报不受影响。
+_COMPLETION_ASSERT_NEEDLES: tuple[str, ...] = (
+    "交付完成",
+    "全部完成",
+    "已完成全部",
+    "交付完毕",
+    "发布完成",
+    "圆满完成",
+    "全部搞定",
+    "ship ready",
+)
+
+
+async def _ceo_exit_assertion_block(agent_id: str, message: str) -> str | None:
+    """E4 补：CEO 完结断言前账本一致性核验（复盘致命链一 G4）。
+
+    命中「交付完成」类措辞且发送者为 CEO 时，检查项目账本：
+    open FAIL 终验 / approved 未 closed 任务 / CEO 自身未读 inbox——
+    任一命中即拒绝这条交付结论，要求先推动收口或如实说明现状
+    （不得声称全部完成）。非 CEO、非完结断言、查询失败 → fail-open 放行。
+    """
+    m = (message or "").strip()
+    if not m or not any(n in m.lower() for n in _COMPLETION_ASSERT_NEEDLES):
+        return None
+    try:
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.policy import infer_role_family
+
+        agent = await OrgService().get_agent(agent_id)
+        if not agent or infer_role_family(agent) != "ceo":
+            return None
+
+        from hiveweave.tools.helpers import get_project_id
+
+        project_id = await get_project_id(agent_id)
+        if not project_id:
+            return None
+
+        from hiveweave.db import project as project_db
+
+        conn = await project_db.get_project_db_by_project_id(project_id)
+
+        blockers: list[str] = []
+        try:
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS c FROM tasks "
+                "WHERE is_archived = 0 AND status NOT IN ('closed','cancelled') "
+                "AND upper(json_extract(evidence, '$.verdict')) = 'FAIL'"
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if row and int(row["c"] or 0) > 0:
+                blockers.append(f"{row['c']} 个未解决的 FAIL 终验")
+        except Exception:
+            pass
+        try:
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS c FROM tasks "
+                "WHERE is_archived = 0 AND status = 'approved'"
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if row and int(row["c"] or 0) > 0:
+                blockers.append(f"{row['c']} 个 approved 未 closed 任务")
+        except Exception:
+            pass
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            unread = int(await InboxService().get_unread_count(agent_id) or 0)
+            if unread > 0:
+                blockers.append(f"你还有 {unread} 条未读消息")
+        except Exception:
+            pass
+        if blockers:
+            return (
+                "message_user rejected（账本一致性核验）: 发布『全部完成』类"
+                "交付结论时项目账本仍不干净——" + "；".join(blockers)
+                + "。请先推动收口，或如实向用户说明现状（不得声称全部完成）。"
+            )
+    except Exception as e:
+        log.debug("ceo_exit_assertion_check_failed", agent_id=agent_id, error=str(e))
+    return None
+
+
 @tool(
     "message_user",
     "Send a message directly to the human user. The message appears in "
@@ -1451,6 +1538,11 @@ async def message_user_tool(
     """Send a message to the human user."""
     if not params.message:
         return ToolResult.err("message_user requires 'message' (body text)")
+
+    # E4 补：CEO 完结断言前账本一致性核验（复盘 G4）——先拦再发。
+    block = await _ceo_exit_assertion_block(agent_id, params.message)
+    if block:
+        return ToolResult.err(block)
 
     from hiveweave.services.chat_message import ChatMessageService
 

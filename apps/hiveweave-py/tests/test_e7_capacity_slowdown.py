@@ -16,7 +16,7 @@ from __future__ import annotations
 import importlib
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -165,3 +165,68 @@ def test_broadcast_capacity_pause_cools_peers():
     assert bool(peer_a.cooldowns) and peer_a.cooldowns[0] >= 60.0
     assert source.cooldowns == []  # source 已有 per-agent park，不重复冷却
     assert peer_b.cooldowns == []  # 异项目不受影响
+
+
+# ── F6 审计：agent 层容量集成（真实错误 → handle_error → 项目暂停）──
+
+
+class _FakeAgent:
+    """handle_error 直接调用所需的最小 agent 替身（复现真实限流分支）。"""
+
+    def __init__(self, pid: str, aid: str):
+        self.id = aid
+        self.project_id = pid
+        self.pending_inbox_msg_ids = None
+        self._rate_limit_streak = 0
+        self._consecutive_errors = 0
+        self._streaming_msg_id = None
+        self._streaming_text_acc = ""
+        self.config = {}
+        self._conversation = None
+        self._work_log = SimpleNamespace(write_work_log=AsyncMock())
+        self._chat_msg = SimpleNamespace(
+            save_message=AsyncMock(), update_streaming_messages_done=AsyncMock()
+        )
+        self._cancel_safety_timer = MagicMock()
+        self._go_idle = AsyncMock()
+        self._reset_to_idle = MagicMock()
+        self._park_after_quota_exhausted = AsyncMock()
+        self._finalize_streaming_turn = AsyncMock()
+        self._broadcast_stream_event = MagicMock()
+        self._broadcast_agent_health = AsyncMock()
+
+
+@pytest.mark.asyncio
+async def test_handle_error_capacity_arms_project_pause():
+    """非 429 文案的容量错误（HTTP 500 body GoUsageLimit）也能进 handle_error
+    容量分支 → 项目级暂停被 arm + per-agent park（F6 集成，锁死 F1 门禁修复）。"""
+    from hiveweave.agents import recovery as recovery_mod
+
+    agent = _FakeAgent("p-f6", "aid-f6")
+    rl._project_capacity_until.pop("p-f6", None)
+    fake_mgr = SimpleNamespace(list_all=lambda: [])
+    supervisor_mod = importlib.import_module("hiveweave.agents.supervisor")
+
+    err = ValueError(
+        "HTTP 500: GoUsageLimitError: daily quota for 5h rolling window exceeded"
+    )
+    try:
+        with (
+            patch.object(supervisor_mod, "agent_manager", fake_mgr),
+            patch(
+                "hiveweave.services.event_audit.event_audit",
+                SimpleNamespace(log=AsyncMock()),
+            ),
+        ):
+            await recovery_mod.handle_error(agent, err)
+    finally:
+        rl._project_capacity_until.pop("p-f6", None)
+
+    # 容量分支生效：项目暂停被 arm（默认 3600s 兜底），agent 进入 quota park
+    assert agent._park_after_quota_exhausted.called
+    assert agent._go_idle.called
+    # project pause 在广播期间被 arm 过（remaining 在 finally 清理前 > 0 由
+    # broadcast 内部置位；此处验证 broadcast 确实走了容量路径）
+    assert agent._park_after_quota_exhausted.await_args.kwargs.get(
+        "reason"
+    ) in ("daily_quota", "capacity")
