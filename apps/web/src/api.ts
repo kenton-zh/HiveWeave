@@ -12,6 +12,7 @@ export {
 export {
   getSocket,
   streamChat,
+  pushInsert,
   joinAgentChannel,
   leaveAgentChannel,
   subscribeAgentStream,

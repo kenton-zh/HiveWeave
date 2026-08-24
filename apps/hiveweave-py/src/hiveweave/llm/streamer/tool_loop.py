@@ -1,6 +1,7 @@
 """Tool-loop orchestration mixin."""
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import TYPE_CHECKING, Any
@@ -135,8 +136,14 @@ class ToolLoopMixin:
         on_delta: DeltaCallback | None,
         on_tool_call: ToolCallCallback | None,
         max_tool_rounds: int | None = None,
+        steer_queue: asyncio.Queue | None = None,
     ) -> dict:
-        """Tool loop: 流式请求 → 检查 tool_calls → 执行工具 → 重复。"""
+        """Tool loop: 流式请求 → 检查 tool_calls → 执行工具 → 重复。
+
+        ``steer_queue``：插话通道。每轮开头的 next-step 窗口 poll 其中消息，
+        作为 user 消息注入本轮 LLM 请求（参考 DSH session.prompt(mode='steer')），
+        让运行中的 turn 不必等整轮结束即可响应用户插话。
+        """
         # 使用调用方传入的上限，回退到实例默认值
         rounds_cap = max_tool_rounds if max_tool_rounds else self.max_tool_rounds
         text_acc = ""
@@ -328,6 +335,28 @@ class ToolLoopMixin:
             log.info("tool_loop_round",
                      agent_id=agent_id, round=round_num,
                      msg_count=len(messages))
+
+            # 插话注入：poll steer 队列，把用户插话作为 user 消息塞进本轮
+            # 请求的 next-step 窗口（参考 DSH steer）。上一轮的工具
+            # assistant+tool_results 已在 messages 尾部，追加 user 顺序合法。
+            # 注意：只进本轮内存 messages，不写 tool_turn_acc —— 持久化由
+            # phoenix_adapter 的 _save_user_and_ack 以纯文本落库到历史，
+            # 避免把 {"from":...} JSON 信封写进对话历史污染下一轮上下文。
+            if steer_queue is not None:
+                try:
+                    while True:
+                        _steer_msg = steer_queue.get_nowait()
+                        messages.append(
+                            {"role": "user", "content": _steer_msg}
+                        )
+                        await self._fire_delta(on_delta, {
+                            "type": "insert_accepted",
+                            "content": _steer_msg,
+                        })
+                        log.info("steer_injected",
+                                 agent_id=agent_id, round=round_num)
+                except asyncio.QueueEmpty:
+                    pass
 
             # 单轮流式请求（带空响应重试）。预算截止提前
             # TURN_STREAM_CUT_GRACE_S —— 给 merge/记账/返回留出时间，

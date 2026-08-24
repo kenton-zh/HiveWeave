@@ -337,6 +337,9 @@ class Agent:
         self.current_job: dict | None = None
         self._cancel_reason: str | None = None
         self._message_queue: list[tuple[str, dict, int]] = []
+        # 插话（steer）队列：turn 运行期间由 streamer 每轮 poll 注入 next-step 窗口，
+        # 不等待整轮结束（参考 DSH session.prompt(mode='steer')）。None = 无活跃 turn。
+        self._steer_q: asyncio.Queue | None = None
         self._streaming_msg_id: str | None = None
         # P0-3 streaming 僵尸检测信号：streamer 事件（delta/round/tool 起止）
         # 时间戳（ms epoch；0 = 本回合尚无活动）。健康长流的静默间隔上限为
@@ -883,6 +886,21 @@ class Agent:
 
             return {"ok": True}
 
+    async def steer(self, message: str, opts: dict | None = None) -> dict:
+        """插话：向正在运行的 turn 注入用户消息，不等整轮结束。
+
+        - PROCESSING 且存在活跃 steer 队列 → 入队，由 streamer 的 tool_loop 在
+          下一轮 LLM 请求前注入 next-step 窗口，AI 随即「看到并响应」。
+        - 否则退化为普通 chat()：idle 时即时处理；busy 但无队列时走普通排队。
+        """
+        opts = opts or {}
+        q = self._steer_q
+        if self.status == AgentState.PROCESSING and q is not None:
+            q.put_nowait(message)
+            log.info("steer_queued", agent_id=self.id, preview=message[:80])
+            return {"ok": True, "steer": True}
+        return await self.chat(message, opts)
+
     async def cancel(self, *, reason: str = "cancelled") -> None:
         """取消当前对话。
 
@@ -1040,6 +1058,8 @@ class Agent:
         # finally never clears a newer turn's streaming row.
         owned_streaming_id = self._streaming_msg_id
         try:
+            # 插话通道：本 turn 内由 streamer 的 tool_loop 每轮轮询注入。
+            self._steer_q = asyncio.Queue()
             # 构建 messages（读取全部压缩后历史，无读预算）
             messages = await self._build_messages(message, opts)
 
@@ -1122,6 +1142,7 @@ class Agent:
                     on_delta=self._on_delta,
                     on_tool_call=self._on_tool_call,
                     max_tool_rounds=max_rounds,
+                    steer_queue=self._steer_q,
                 )
 
                 # Token metering: 主对话路径落库（best-effort，不阻塞主流程）。
@@ -1251,6 +1272,26 @@ class Agent:
         finally:
             # 确保心跳停止（所有退出路径的兜底）
             self._stop_heartbeat()
+            # 插话通道收尾：残留消息回填普通队列，避免 turn 结束后丢失。
+            steer_q = self._steer_q
+            self._steer_q = None
+            if steer_q is not None:
+                reclaimed = 0
+                try:
+                    while True:
+                        _rest = steer_q.get_nowait()
+                        self._message_queue.append(
+                            (_rest, {}, int(time.time() * 1000))
+                        )
+                        reclaimed += 1
+                except asyncio.QueueEmpty:
+                    pass
+                if reclaimed:
+                    log.info(
+                        "steer_reclaimed",
+                        agent_id=self.id,
+                        reclaimed=reclaimed,
+                    )
             # 只有当前 task 仍是 self._llm_task 时才清理状态
             # （cancel() 后若新 chat() 启动了新 task，不应清理新 task 的状态）
             if self._llm_task is current_task:

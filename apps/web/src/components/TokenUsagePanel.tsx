@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { Fragment, useState, useEffect, useMemo } from "react";
 import {
   getProjectTokenUsage,
   getProjectTokenDaily,
@@ -56,6 +56,29 @@ function AgentCell({ id, meta }: { id: string; meta: AgentMeta | undefined }) {
       <div className="text-g-fg">{agentLabel(id, meta)}</div>
       <div className="text-[10px] text-g-fg-4">{role}</div>
     </div>
+  );
+}
+
+/** 数值单元格，按总/子渠道两套间距样式渲染。 */
+function NumCell({
+  value,
+  fmt,
+  dense,
+  strong,
+}: {
+  value: number | null | undefined;
+  fmt: (n: number | null | undefined) => string;
+  dense?: boolean;
+  strong?: boolean;
+}) {
+  return (
+    <td
+      className={`font-mono text-right ${
+        strong ? "font-semibold text-violet-600 " : ""
+      }${dense ? "px-2 py-1.5" : "px-2 py-2"}`}
+    >
+      {fmt(value)}
+    </td>
   );
 }
 
@@ -173,25 +196,39 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
     };
   }, [entries]);
 
-  // 按 agent 透视（折叠 request_type）
-  const byAgent = useMemo(() => {
-    const map = new Map<string, TokenUsageEntry>();
+  // 按 agent 分组：每行汇总 + 来源拆分（request_type）明细
+  const grouped = useMemo(() => {
+    type Group = { agent_id: string; summary: TokenUsageEntry; rows: TokenUsageEntry[] };
+    const map = new Map<string, Group>();
     for (const e of entries) {
-      const cur = map.get(e.agent_id);
-      if (!cur) {
-        map.set(e.agent_id, { ...e });
-        continue;
+      let g = map.get(e.agent_id);
+      if (!g) {
+        g = { agent_id: e.agent_id, summary: { ...e }, rows: [] };
+        map.set(e.agent_id, g);
+      } else {
+        const s = g.summary;
+        s.llm_calls += e.llm_calls || 0;
+        s.input_tokens += e.input_tokens || 0;
+        s.output_tokens += e.output_tokens || 0;
+        s.cache_read_tokens += e.cache_read_tokens || 0;
+        s.cache_creation_tokens += e.cache_creation_tokens || 0;
+        s.total_tokens += e.total_tokens || 0;
       }
-      cur.llm_calls += e.llm_calls || 0;
-      cur.input_tokens += e.input_tokens || 0;
-      cur.output_tokens += e.output_tokens || 0;
-      cur.cache_read_tokens += e.cache_read_tokens || 0;
-      cur.cache_creation_tokens += e.cache_creation_tokens || 0;
-      cur.total_tokens += e.total_tokens || 0;
-      cur.duration_ms += e.duration_ms || 0;
+      g.rows.push(e);
     }
-    return [...map.values()].sort((a, b) => b.total_tokens - a.total_tokens);
+    return [...map.values()].sort(
+      (a, b) => b.summary.total_tokens - a.summary.total_tokens,
+    );
   }, [entries]);
+
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (agentId: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(agentId)) next.delete(agentId);
+      else next.add(agentId);
+      return next;
+    });
 
   const noData = !loading && !error && entries.length === 0;
 
@@ -240,44 +277,32 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
         <>
           {/* 统计卡片 */}
           <div className="flex gap-3 flex-wrap">
-            <StatCard label="LLM 调用" value={fmtCalls(totals.llm_calls)} accent="text-g-blue" />
             <StatCard
-              label="未命中输入"
-              value={fmtNum(totals.input)}
-              accent="text-g-fg"
-              hint="未走缓存的新输入"
-            />
-            <StatCard label="输出" value={fmtNum(totals.output)} accent="text-g-fg" hint="模型生成" />
-            <StatCard
-              label="缓存读取"
-              value={fmtNum(totals.cache_read)}
-              accent="text-g-fg-3"
-              hint="前缀命中，不进记账合计"
-            />
-            <StatCard
-              label="缓存写入"
-              value={fmtNum(totals.cache_creation)}
-              accent="text-g-fg-3"
-              hint="写入前缀缓存（Anthropic 等）"
-            />
-            <StatCard
-              label="缓存命中率"
-              value={formatHitPercent(totals.hitPct)}
-              accent="text-g-blue"
-              hint="缓存读 ÷（未命中 + 缓存读 + 缓存写）"
-            />
-            <StatCard
-              label="计费输入"
-              value={fmtNum(totals.billed)}
-              accent="text-g-fg"
-              hint="未命中 + 缓存读 + 缓存写"
-            />
-            <StatCard
-              label="记账合计"
+              label="总 Token"
               value={fmtNum(totals.total)}
               accent="text-violet-600"
               hint="未命中 + 输出 + 缓存写，不含缓存读"
             />
+            <StatCard label="输出" value={fmtNum(totals.output)} accent="text-g-fg" hint="模型生成" />
+            <StatCard
+              label="输入（命中）"
+              value={fmtNum(totals.cache_read)}
+              accent="text-g-fg"
+              hint="前缀命中，不进记账合计"
+            />
+            <StatCard
+              label="输入（未命中）"
+              value={fmtNum(totals.input)}
+              accent="text-g-fg"
+              hint="未走缓存的新输入"
+            />
+            <StatCard
+              label="命中率"
+              value={formatHitPercent(totals.hitPct)}
+              accent="text-g-blue"
+              hint="缓存读 ÷（未命中 + 缓存读 + 缓存写）"
+            />
+            <StatCard label="LLM 调用" value={fmtCalls(totals.llm_calls)} accent="text-g-blue" />
           </div>
 
           {/* 每日趋势 */}
@@ -286,120 +311,112 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
             <DailyBarChart entries={daily} />
           </div>
 
-          {/* 按 Agent 汇总 */}
+          {/* 按 Agent 汇总（可展开来源明细） */}
           <div className="bg-white border border-g-border rounded-gmLg shadow-gm-sm overflow-x-auto">
             <div className="px-4 py-2.5 text-xs font-medium text-g-fg border-b border-g-border">
               按 Agent 汇总
+              <span className="ml-2 text-g-fg-4 font-normal">
+                （点击来源可展开主对话 / 压缩 / 子代理拆分）
+              </span>
             </div>
             <table className="w-full text-xs">
               <thead>
                 <tr className="text-left text-g-fg-3 border-b border-g-border">
                   <th scope="col" className="px-4 py-2 font-medium">Agent</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">调用</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">未命中</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">LLM 调用</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">输入（未命中）</th>
                   <th scope="col" className="px-2 py-2 font-medium text-right">输出</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">缓存读</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">缓存写</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right" title="缓存命中率">命中率</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">计费输入</th>
-                  <th scope="col" className="px-4 py-2 font-medium text-right">记账合计</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">输入（命中）</th>
+                  <th scope="col" className="px-2 py-2 font-medium text-right">命中率</th>
+                  <th scope="col" className="px-4 py-2 font-medium text-right">总 Token</th>
                 </tr>
               </thead>
               <tbody>
-                {byAgent.map((a) => (
-                  <tr key={a.agent_id} className="border-b border-g-border/60 hover:bg-g-bg-muted/50">
-                    <td className="px-4 py-1.5">
-                      <AgentCell id={a.agent_id} meta={agentMeta.get(a.agent_id)} />
-                    </td>
-                    <td className="px-2 py-2 text-right font-mono">{fmtCalls(a.llm_calls)}</td>
-                    <td className="px-2 py-2 text-right font-mono">{fmtNum(a.input_tokens)}</td>
-                    <td className="px-2 py-2 text-right font-mono">{fmtNum(a.output_tokens)}</td>
-                    <td className="px-2 py-2 text-right font-mono">{fmtNum(a.cache_read_tokens)}</td>
-                    <td className="px-2 py-2 text-right font-mono">{fmtNum(a.cache_creation_tokens)}</td>
-                    <td className="px-2 py-2 text-right font-mono">
-                      {formatHitPercent(
-                        cacheHitPercent(
-                          a.input_tokens,
-                          a.cache_read_tokens,
-                          a.cache_creation_tokens,
-                        ),
+                {grouped.map((g) => {
+                  const a = g.summary;
+                  const isOpen = expanded.has(a.agent_id);
+                  return (
+                    <Fragment key={a.agent_id}>
+                      <tr
+                        className={`border-b border-g-border/60 hover:bg-g-bg-muted/50 ${
+                          isOpen ? "bg-g-bg-muted/30" : ""
+                        }`}
+                      >
+                        <td className="px-4 py-1.5">
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => toggle(a.agent_id)}
+                              aria-label={isOpen ? "收起来源明细" : "展开来源明细"}
+                              aria-expanded={isOpen}
+                              aria-controls={isOpen ? `token-detail-${a.agent_id}` : undefined}
+                              className="shrink-0 text-g-fg-4 hover:text-g-blue transition-colors p-0.5 -ml-0.5"
+                            >
+                              <svg
+                                className={`w-3 h-3 transition-transform ${isOpen ? "rotate-90" : ""}`}
+                                viewBox="0 0 16 16"
+                                fill="currentColor"
+                                aria-hidden
+                              >
+                                <path d="M6 3l5 5-5 5V3z" />
+                              </svg>
+                            </button>
+                            <AgentCell id={a.agent_id} meta={agentMeta.get(a.agent_id)} />
+                          </div>
+                        </td>
+                        <NumCell value={a.llm_calls} fmt={fmtCalls} />
+                        <NumCell value={a.input_tokens} fmt={fmtNum} />
+                        <NumCell value={a.output_tokens} fmt={fmtNum} />
+                        <NumCell value={a.cache_read_tokens} fmt={fmtNum} />
+                        <NumCell
+                          value={cacheHitPercent(a.input_tokens, a.cache_read_tokens, a.cache_creation_tokens)}
+                          fmt={formatHitPercent}
+                        />
+                        <NumCell value={a.total_tokens} fmt={fmtNum} strong />
+                      </tr>
+                      {isOpen && (
+                        <tr id={`token-detail-${a.agent_id}`} className="border-b border-g-border/60 bg-g-bg-muted/20">
+                          <td colSpan={7} className="px-4 py-2">
+                            <table className="w-full border-collapse text-[11px]">
+                              <thead>
+                                <tr className="text-left text-g-fg-3">
+                                  <th scope="col" className="pl-6 pr-2 py-1 font-medium">来源</th>
+                                  <th scope="col" className="px-2 py-1 font-medium text-right">LLM 调用</th>
+                                  <th scope="col" className="px-2 py-1 font-medium text-right">输入（未命中）</th>
+                                  <th scope="col" className="px-2 py-1 font-medium text-right">输出</th>
+                                  <th scope="col" className="px-2 py-1 font-medium text-right">输入（命中）</th>
+                                  <th scope="col" className="px-2 py-1 font-medium text-right">命中率</th>
+                                  <th scope="col" className="px-4 py-1 font-medium text-right">总 Token</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {g.rows.map((r, i) => (
+                                  <tr key={`${r.agent_id}-${r.request_type}-${i}`} className="hover:bg-g-bg-muted/30">
+                                    <td className="pl-6 pr-2 py-1 text-left">
+                                      <span className="inline-block text-[10px] text-g-fg-2 bg-g-bg-muted px-1.5 py-0.5 rounded">
+                                        {tokenRequestTypeLabel(r.request_type)}
+                                      </span>
+                                    </td>
+                                    <NumCell dense value={r.llm_calls} fmt={fmtCalls} />
+                                    <NumCell dense value={r.input_tokens} fmt={fmtNum} />
+                                    <NumCell dense value={r.output_tokens} fmt={fmtNum} />
+                                    <NumCell dense value={r.cache_read_tokens} fmt={fmtNum} />
+                                    <NumCell
+                                      dense
+                                      value={cacheHitPercent(r.input_tokens, r.cache_read_tokens, r.cache_creation_tokens)}
+                                      fmt={formatHitPercent}
+                                    />
+                                    <NumCell dense value={r.total_tokens} fmt={fmtNum} />
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
                       )}
-                    </td>
-                    <td className="px-2 py-2 text-right font-mono">
-                      {fmtNum(
-                        billedPromptTokens(
-                          a.input_tokens,
-                          a.cache_read_tokens,
-                          a.cache_creation_tokens,
-                        ),
-                      )}
-                    </td>
-                    <td className="px-4 py-2 text-right font-mono font-semibold text-violet-600">
-                      {fmtNum(a.total_tokens)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          {/* 按 agent × request_type 明细 */}
-          <div className="bg-white border border-g-border rounded-gmLg shadow-gm-sm overflow-x-auto">
-            <div className="px-4 py-2.5 text-xs font-medium text-g-fg border-b border-g-border">
-              调用来源明细（主对话 / 压缩 / 子代理）
-            </div>
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="text-left text-g-fg-3 border-b border-g-border">
-                  <th scope="col" className="px-4 py-2 font-medium">Agent</th>
-                  <th scope="col" className="px-2 py-2 font-medium">来源</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">调用</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">未命中</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">输出</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">缓存读</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">缓存写</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right" title="缓存命中率">命中率</th>
-                  <th scope="col" className="px-2 py-2 font-medium text-right">计费输入</th>
-                  <th scope="col" className="px-4 py-2 font-medium text-right">记账合计</th>
-                </tr>
-              </thead>
-              <tbody>
-                {entries.map((e, i) => (
-                  <tr key={`${e.agent_id}-${e.request_type}-${i}`} className="border-b border-g-border/60 hover:bg-g-bg-muted/50">
-                    <td className="px-4 py-1.5">
-                      <AgentCell id={e.agent_id} meta={agentMeta.get(e.agent_id)} />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <span className="inline-block text-[10px] text-g-fg-2 bg-g-bg-muted px-1.5 py-0.5 rounded">
-                        {tokenRequestTypeLabel(e.request_type)}
-                      </span>
-                    </td>
-                    <td className="px-2 py-1.5 text-right font-mono">{fmtCalls(e.llm_calls)}</td>
-                    <td className="px-2 py-1.5 text-right font-mono">{fmtNum(e.input_tokens)}</td>
-                    <td className="px-2 py-1.5 text-right font-mono">{fmtNum(e.output_tokens)}</td>
-                    <td className="px-2 py-1.5 text-right font-mono">{fmtNum(e.cache_read_tokens)}</td>
-                    <td className="px-2 py-1.5 text-right font-mono">{fmtNum(e.cache_creation_tokens)}</td>
-                    <td className="px-2 py-1.5 text-right font-mono">
-                      {formatHitPercent(
-                        cacheHitPercent(
-                          e.input_tokens,
-                          e.cache_read_tokens,
-                          e.cache_creation_tokens,
-                        ),
-                      )}
-                    </td>
-                    <td className="px-2 py-1.5 text-right font-mono">
-                      {fmtNum(
-                        billedPromptTokens(
-                          e.input_tokens,
-                          e.cache_read_tokens,
-                          e.cache_creation_tokens,
-                        ),
-                      )}
-                    </td>
-                    <td className="px-4 py-1.5 text-right font-mono font-medium">{fmtNum(e.total_tokens)}</td>
-                  </tr>
-                ))}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>

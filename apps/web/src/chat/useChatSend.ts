@@ -7,7 +7,7 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
-import { streamChat, joinAgentChannel } from "../api";
+import { streamChat, joinAgentChannel, pushInsert } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
 import { useAppStore } from "../store";
 import type { ChatMessage, StreamDraft } from "./types";
@@ -607,6 +607,23 @@ export function useChatSend(opts: {
     handleSend();
   }, [agentId, isStreaming, isAgentProcessing, handleSend]);
 
+  // 插话：AI 工作期间把消息直接注入运行中 turn 的 next-step 窗口，不排队。
+  const handleInsert = useCallback(() => {
+    if (!agentId) return;
+    if (!input.trim()) return;
+    const text = input.trim();
+    const sendingImages = images;
+    setInput("");
+    setImages([]);
+    pushInsert(agentId, text, sendingImages.length ? sendingImages : undefined);
+    // 后端落库 user 消息后 reload，插入消息即时上屏。
+    setTimeout(() => {
+      if (activeAgentIdRef.current === agentId) {
+        loadMessagesFromDb(agentId);
+      }
+    }, 300);
+  }, [agentId, input, images, loadMessagesFromDb]);
+
   /** 输入框 auto-grow：内容撑高到 MAX 封顶后内部滚动，参考 deepseek-harness 的 composer。 */
   const autoResizeTextarea = useCallback(() => {
     const el = textareaRef.current;
@@ -692,6 +709,7 @@ export function useChatSend(opts: {
     handleFileInput,
     removeImage,
     handleSend,
+    handleInsert,
     handleStop,
     handleKeyDown,
     streamAbortRef,

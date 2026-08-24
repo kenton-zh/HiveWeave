@@ -124,49 +124,81 @@ function SourceBadge({ source }: { source: "agent" | "system" | "watchdog" }) {
   );
 }
 
-/** 非真人入站消息（agent 来信 / 系统注入 / 看门狗唤醒 digest）。 */
+/** 来源视觉样式：右缘色条 + 琥珀系淡底（输入侧统一色系，靠右微信式）。
+ * 三个来源同底色系（bg-amber-50），只以色条+徽章区分来源——
+ * "发给 AI 的消息"整体一种背景，与 AI 绿底输出成对照。
+ */
+const SOURCE_STYLES: Record<"agent" | "system" | "watchdog", { bar: string }> = {
+  watchdog: { bar: "border-r-orange-400" },
+  agent: { bar: "border-r-indigo-400" },
+  system: { bar: "border-r-slate-400" },
+};
+
+/** 非真人入站消息（agent 来信 / 系统注入 / 看门狗唤醒 digest）。
+ *
+ * 微信式靠右（与用户气泡同侧）+ 琥珀底 + 右缘来源色条；
+ * 默认折叠单行摘要，点击展开全文。
+ */
 function InboundLetter({ msg, sourceName }: { msg: ChatMessage; sourceName?: string }) {
-  const long = (msg.content?.length || 0) > 600 || msg.isContext === true;
-  const [open, setOpen] = useState(!long);
+  const [open, setOpen] = useState(false);
   const source: "agent" | "system" | "watchdog" =
     msg.source === "agent" || msg.source === "watchdog" ? msg.source : "system";
+  const style = SOURCE_STYLES[source];
   const time = new Date(msg.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  // 摘要：压空白 + 剥 markdown 标题/列表记号（digest 常为 "## 标题\n{json}" 格式）
+  const preview = (msg.content || "（无正文）")
+    .replace(/\s+/g, " ")
+    .replace(/(^|\s)#+\s*/g, "$1")
+    .replace(/(^|\s)[-•]\s+/g, "$1")
+    .trim();
   return (
-    <div className="flex justify-start my-2 hw-msg-in">
-      <div className="w-full max-w-full rounded-2xl rounded-bl-md border border-g-border bg-white shadow-gm-sm overflow-hidden">
-        <div className="flex items-center gap-2 px-3 py-1.5 bg-g-bg-soft border-b border-g-border">
+    <div className="flex justify-end my-1.5 hw-msg-in">
+      <div
+        className={`w-full max-w-[78%] rounded-2xl rounded-tr-md border border-r-4 ${style.bar} bg-amber-50 border-amber-200 overflow-hidden cursor-pointer transition-colors hover:bg-amber-100/70`}
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setOpen(!open);
+          }
+        }}
+      >
+        <div className="flex items-center gap-2 px-3 py-1.5 min-w-0">
           <SourceBadge source={source} />
-          {sourceName && (
-            <span className="text-xs font-medium text-g-fg-2 truncate">{sourceName}</span>
-          )}
-          <span className="text-[10px] text-g-fg-4 ml-auto shrink-0">{time}</span>
+          <span className="text-xs font-semibold text-g-fg-2 shrink-0 truncate max-w-[10rem]">
+            {sourceName || (source === "watchdog" ? "看门狗唤醒" : source === "agent" ? "Agent 来信" : "系统消息")}
+          </span>
+          <span className={`text-[11px] text-g-fg-3 truncate min-w-0 ${open ? "hidden" : ""}`}>
+            {preview.slice(0, 60)}{preview.length > 60 ? "…" : ""}
+          </span>
+          <span className="text-[10px] text-g-fg-4 ml-auto shrink-0 flex items-center gap-1">
+            {time}
+            <svg className={`w-3 h-3 transition-transform duration-200 ${open ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+            </svg>
+          </span>
         </div>
-        <div className="px-3.5 py-2">
-          <div
-            className={`text-[13px] text-g-fg-2 leading-relaxed whitespace-pre-wrap break-words ${open ? "" : "line-clamp-4"}`}
-          >
-            {msg.content || "（无正文）"}
+        {open && (
+          <div className="px-3.5 pb-2.5 pt-1 border-t border-amber-200/70 select-text">
+            <div className="text-[13px] text-g-fg-2 leading-relaxed whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto">
+              {msg.content || "（无正文）"}
+            </div>
           </div>
-          {long && (
-            <button
-              type="button"
-              onClick={() => setOpen(!open)}
-              className="mt-1 text-[11px] font-medium text-g-blue hover:text-indigo-700"
-            >
-              {open ? "收起" : "展开全文"}
-            </button>
-          )}
-        </div>
+        )}
       </div>
     </div>
   );
 }
 
-function MessageBubbleInner({ msg, isStreaming, thinkingElapsed, sourceName }: {
+function MessageBubbleInner({ msg, isStreaming, thinkingElapsed, sourceName, agentName }: {
   msg: ChatMessage;
   isStreaming?: boolean;
   thinkingElapsed?: number | null;
   sourceName?: string;
+  agentName?: string;
 }) {
   if (msg.role === "system") {
     return (
@@ -202,10 +234,26 @@ function MessageBubbleInner({ msg, isStreaming, thinkingElapsed, sourceName }: {
       <div
         className={isUser
           ? "max-w-[78%] rounded-2xl rounded-br-md px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-gm-sm"
-          : "w-full max-w-full text-[15px] leading-relaxed text-g-fg"
+          : "w-full max-w-[92%] rounded-2xl rounded-tl-md border border-emerald-200/80 bg-emerald-50/60 px-4 py-3 text-[15px] leading-relaxed text-g-fg shadow-gm-sm"
         }
         style={isUser ? { background: "linear-gradient(135deg, #5b54e8 0%, #4f46e5 55%, #4338ca 100%)" } : undefined}
       >
+        {!isUser && (
+          <div className="flex items-center gap-1.5 mb-1.5">
+            <span
+              className="w-5 h-5 rounded-md flex items-center justify-center text-[9px] font-bold text-white shadow-gm-sm shrink-0"
+              style={{ background: "linear-gradient(135deg, #10b981 0%, #059669 100%)" }}
+            >
+              AI
+            </span>
+            <span className="text-[11px] font-semibold text-g-fg-3 truncate">
+              {agentName || "回复"}
+            </span>
+            {isStreaming && !isEmpty && (
+              <span className="text-[10px] text-emerald-600 font-medium shrink-0">· 生成中</span>
+            )}
+          </div>
+        )}
         {msg.images && msg.images.length > 0 && (
           <div className="flex gap-1.5 flex-wrap mb-3">
             {msg.images.map((url, i) => (

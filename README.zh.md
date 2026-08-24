@@ -29,7 +29,7 @@
 
 | 组织 | 工具与服务 | 质量与控制 |
 |:---|:---|:---|
-| 开箱即得 CEO、HR、经理、QA 与 Executor | **85+ 内置工具**、50+ 服务、18 个 API 模块 · 133 路由 | 交付到你面前前，先过 **四层把关** |
+| 开箱即得 CEO、HR、经理、QA 与 Executor | **90+ 内置工具**、60+ 服务、18 个 API 模块 · 130+ 路由 | 交付到你面前前，先过 **四层把关** |
 | 按角色配模型：决策用顶级，执行用便宜 | 每个 Agent 可单独覆盖模型，可混用任意供应商 | 按 Agent 隔离上下文——永不交叉污染 |
 | 并行 Agent，各自独立 `git worktree` | 内置任务系统 + 客观真值账本 | 直接与任意模块的 Agent 对话 |
 
@@ -120,7 +120,7 @@ pnpm dev
 - **直达对话** — 你可以直接跟任意层级 Agent 对话。前端有问题？直接找前端开发。不用通过 CEO 中转。
 
 ### Git Worktree 开发
-- **隔离工作区** — 每个 Agent 拥有独立 `git worktree`（`hw/<shortId>/<task>`）。并行开发零冲突。
+- **隔离工作区** — 每个 Agent 拥有独立 `git worktree`（`hw/<shortId>/t-<taskId>`）。并行开发零冲突。
 - **检查点 + 回滚** — 风险操作前 checkpoint，随时回滚。不影响主分支。
 - **审查 → 合并关卡** — Executor 提交 → QA 审查 → 经理审批 → CEO 签字 → 合并到主分支。四关之后代码才到你面前。
 
@@ -143,11 +143,11 @@ pnpm dev
 
 | 层 | 技术 | 备注 |
 |:---|------|------|
-| 后端 | Python 3.12 + FastAPI + Uvicorn | 端口 4000，133 路由，18 API 模块 |
+| 后端 | Python 3.12 + FastAPI + Uvicorn | 端口 4000，130+ 路由，18 API 模块 |
 | 前端 | React 19 + Vite + React Flow + Zustand | 端口 5173，支持 Electron 桌面端 |
-| 数据库 | SQLite + aiosqlite | 双 DB：Meta DB（WAL）+ Per-project DB |
+| 数据库 | SQLite + aiosqlite | 双 DB：Meta DB + Per-project DB（DELETE journal） |
 | AI/LLM | httpx SSE 流式 + Provider Factory | OpenAI、Anthropic、DeepSeek、Groq、Google |
-| 实时通信 | phoenix.js + phoenix_adapter（WebSocket） | 3 频道：lobby、project、agent |
+| 实时通信 | phoenix.js + phoenix_adapter（WebSocket） | 2 频道：`lobby:status`、`agent:<id>` |
 | 沙箱 | ACL 写受限令牌（Windows） | `HIVEWEAVE_ACL_SANDBOX=on` |
 | 构建 | Turbo | Monorepo 任务编排 |
 | 包管理 | pnpm 10 + uv | Monorepo + Python 包 |
@@ -160,15 +160,15 @@ hiveweave/
 │   ├── hiveweave-py/                  # 后端 — Python/FastAPI（端口 4000）
 │   │   └── src/hiveweave/
 │   │       ├── agents/                # Agent 生命周期 + Supervisor + trigger
-│   │       ├── api/                   # 18 个 FastAPI 路由模块，133 路由
+│   │       ├── api/                   # 18 个 FastAPI 路由模块，130+ 路由
 │   │       ├── conversation/          # Token budget、compaction、conversation store
 │   │       ├── db/                    # Meta DB + Per-project DB（aiosqlite）
 │   │       ├── hooks/                 # 生命周期钩子
 │   │       ├── llm/                   # Streamer、provider factory、retry、circuit_breaker
 │   │       ├── prompts/               # ETHOS 提示词体系（identity + context）
 │   │       ├── realtime/              # phoenix_adapter、channels、pubsub、event_bus
-│   │       ├── services/              # 50+ 个服务（org、dispatch、memory、handoff 等）
-│   │       ├── tools/                 # 85+ 个内置工具（含 tasks/ 子包）
+│   │       ├── services/              # 60+ 个服务（org、dispatch、memory、handoff 等）
+│   │       ├── tools/                 # 90+ 个内置工具（含 tasks/ 子包）
 │   │       └── util/                  # 通用工具
 │   └── web/                           # 前端 — React 19 + Vite + Electron（端口 5173）
 ├── assets/
@@ -200,7 +200,7 @@ hiveweave/
 |:---|------|
 | **按角色配模型** | CEO/专家用顶级 LLM；Executor 用便宜模型。规模化成本可控。 |
 | **Agent 可单独指定模型** | 每个 Agent 可独立覆盖模型配置。混合 OpenAI、Anthropic、DeepSeek、Groq 等多供应商。 |
-| **每个 Agent 独立工作区** | 每个 Agent 拥有自己的 `git worktree`（`hw/<shortId>/<task>`）。完整文件系统隔离。checkpoint、回滚、合并——全部通过协调者。 |
+| **每个 Agent 独立工作区** | 每个 Agent 拥有自己的 `git worktree`（`hw/<shortId>/t-<taskId>`）。完整文件系统隔离。checkpoint、回滚、合并——全部通过协调者。 |
 | **提交前自审** | Executor 提交代码前先做五轴自查（正确性/可读性/架构/安全/性能）。提前发现问题，减少审查来回。 |
 | **四层把关** | Executor → QA → 经理 → CEO → 你。未经验证的代码到不了你面前。 |
 | **自然语言参与度** | 不是下拉菜单。_"我只在前端功能完成后验收，后端开发过程不参与。"_ CEO 理解并遵守你的意图。 |
@@ -214,11 +214,11 @@ hiveweave/
 | **交接继承** | 设计目标，尚未实现——dismiss 不归档记忆（ADR-010）。 |
 | **专家按需召唤** | 团队遇到解决不了的难题，CEO 召唤专家 Agent（最贵模型）。团队提炼后的问题 → 同样花费得到更好答案。只在真正需要时烧专家 token。 |
 | **Asyncio 任务隔离** | 每个 Agent 运行在独立 asyncio task 中。崩溃不拖垮系统。熔断器 + 指数退避应对 LLM 故障。 |
-| **游戏时间调度** | 1 真实小时 = 1 游戏天。停滞 Agent：10min 催办，~40min+ 升级到上级。基于模拟时钟的定时闹钟。 |
-| **双 DB 模式** | Meta DB（WAL，全局）+ Per-project DB（WAL，隔离）。Agent 间数据永不交叉污染。 |
+| **游戏时间调度** | 1 真实小时 = 1 游戏天。沉默看门狗：闲置 ≥10min → 自醒 + 健康标记；≥30min 失联 → 仅打日志（不再 inbox 轰炸）。任务驻留时钟自动自愈停滞任务（auto-submit / 改派 / merge proxy）。 |
+| **双 DB 模式** | Meta DB（全局）+ Per-project DB（隔离）。Agent 间数据永不交叉污染。 |
 | **MCP 协议** | 通过 Model Context Protocol 扩展工具。按 Agent 绑定 MCP 服务器——不同角色获得不同外部工具。 |
-| **skills.sh 市场** | 远程技能市场。HR 动态搜索和绑定技能。无硬编码技能列表。 |
-| **85+ 内置工具** | bash、文件操作、grep、patch、review（五轴）、security audit、websearch、question、todowrite、编排、org、视觉、图像生成、MCP 工具。按角色类型权限门控。 |
+| **skills.sh 市场** | 远程技能市场（skills.sh，不可达时降级 SkillHub）。HR 动态搜索和绑定技能。无硬编码技能列表。 |
+| **90+ 内置工具** | bash、文件操作、grep、patch、review（五轴）、security audit、websearch、question、todowrite、编排、org、视觉、图像生成、MCP 工具。按角色类型权限门控。 |
 
 ## 文档
 

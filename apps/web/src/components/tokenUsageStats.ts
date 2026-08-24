@@ -19,6 +19,6 @@ export function cacheHitPercent(
   return Math.round(((cacheRead || 0) / denom) * 100);
 }
 
-export function formatHitPercent(pct: number | null): string {
+export function formatHitPercent(pct: number | null | undefined): string {
   return pct == null ? "—" : `${pct}%`;
 }

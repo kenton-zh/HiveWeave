@@ -298,6 +298,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     handleFileInput,
     removeImage,
     handleSend,
+    handleInsert,
     handleStop,
     handleKeyDown,
   } = sendApi;
@@ -385,6 +386,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                 ? resolveAgentInfo(msg.fromAgentId).name
                 : undefined
             }
+            agentName={agentInfo && agentInfo.id === agentId ? agentInfo.name : undefined}
           />
         ))}
         {pendingApprovalTool && isStreaming && (
@@ -629,12 +631,21 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             onCompositionEnd={onCompositionEnd}
             placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 支持粘贴图片)"
             className="flex-1 bg-transparent border-0 px-1 py-3 text-sm text-g-fg leading-relaxed resize-none outline-none overflow-y-auto min-h-[46px] max-h-[200px] placeholder:text-g-fg-4/60"
-            disabled={isStreaming}
           />
           </div>
+          {(isStreaming || isAgentProcessing) && (
+            <button
+              onClick={handleInsert}
+              disabled={!input.trim()}
+              className="px-4 py-2.5 bg-g-bg-soft border border-g-blue/40 text-g-blue hover:bg-g-blue/10 rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+              title="立即插入对话，不等待当前工作完成"
+            >
+              插入
+            </button>
+          )}
           <button
             onClick={handleSend}
-            disabled={(!input.trim() && images.length === 0) || isStreaming}
+            disabled={!input.trim() && images.length === 0}
             className="px-5 py-2.5 bg-g-blue hover:bg-indigo-700 text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm active:scale-95 disabled:opacity-40 disabled:shadow-none"
           >
             发送

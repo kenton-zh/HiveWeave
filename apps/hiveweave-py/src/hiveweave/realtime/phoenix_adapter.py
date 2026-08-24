@@ -549,6 +549,36 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
         return
 
     if agent.status.value == "processing":
+        # 插话：不排队等整轮结束，直接把消息注入运行中 turn 的 next-step 窗口。
+        if payload.get("mode") == "insert":
+            await _save_user_and_ack()
+            import json as _json
+            user_msg = _json.dumps(
+                {"from": "用户", "content": message}, ensure_ascii=False
+            )
+            result = await agent.steer(user_msg)
+            if result.get("steer") or (
+                result.get("ok") and not result.get("queued")
+            ):
+                await send_fn(
+                    [None, None, topic, "inserted",
+                     {"message": "Interjected into running turn",
+                      "agentId": agent_id}]
+                )
+            elif result.get("ok"):
+                # 无活跃 turn/窗口未及接纳 → 退化为普通排队，如实告知。
+                await send_fn(
+                    [None, None, topic, "queued_message",
+                     {"message": "Agent busy — insert fell back to queue",
+                      "agentId": agent_id}]
+                )
+            else:
+                await send_fn(
+                    [None, None, topic, "error",
+                     {"message": "Interject failed", "agentId": agent_id}]
+                )
+            return
+
         # Agent busy — queue via inbox. Save to chat so user sees it,
         # send to inbox so agent picks it up when idle.
         # Store PLAIN text only: from_agent_id + message_type already identify

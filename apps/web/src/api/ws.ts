@@ -200,6 +200,44 @@ export function streamChat(
   };
 }
 
+/**
+ * 插话：向正在运行的 agent turn 推送一条消息（mode="insert"），不覆盖现有
+ * 流式 handler，也不走排队 —— 后端把它注入运行中 turn 的 next-step 窗口。
+ */
+export function pushInsert(
+  agentId: string,
+  message: string,
+  images: string[] | undefined
+): void {
+  const socket = getSocket();
+  const push = (ch: any) => {
+    ch.push("chat", {
+      message,
+      images: images?.length ? images : undefined,
+      mode: "insert",
+    });
+  };
+
+  const channel = _agentChannels.get(agentId);
+  if (channel && channel.state === "joined") {
+    push(channel);
+    return;
+  }
+  if (channel && channel.state === "joining") {
+    joinChannelOnce(agentId, channel).then(() => push(channel)).catch(() => {});
+    return;
+  }
+  if (channel) {
+    try { channel.leave(); } catch {}
+    _agentChannels.delete(agentId);
+    _agentJoinPromises.delete(agentId);
+  }
+  const fresh = socket.channel(`agent:${agentId}`);
+  _agentChannels.set(agentId, fresh);
+  bindAgentChannelEvents(fresh, agentId);
+  joinChannelOnce(agentId, fresh).then(() => push(fresh)).catch(() => {});
+}
+
 
 function bindAgentChannelEvents(channel: any, agentId: string) {
   channel.on("init", () => { dbg("ws", `init event for ${agentId}`); });

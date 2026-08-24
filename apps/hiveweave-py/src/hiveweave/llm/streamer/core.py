@@ -86,6 +86,7 @@ class Streamer(
         on_delta: DeltaCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
         max_tool_rounds: int | None = None,
+        steer_queue: asyncio.Queue | None = None,
     ) -> dict:
         """流式调用 LLM，执行 tool loop，返回最终结果。
 
@@ -161,6 +162,7 @@ class Streamer(
                                 on_delta=on_delta,
                                 on_tool_call=on_tool_call,
                                 max_tool_rounds=max_tool_rounds,
+                                steer_queue=steer_queue,
                             )
                 except Exception as fb_err:
                     log.warning("circuit_fallback_failed",
@@ -183,6 +185,7 @@ class Streamer(
                 on_delta=on_delta,
                 on_tool_call=on_tool_call,
                 max_tool_rounds=effective_max_rounds,
+                steer_queue=steer_queue,
             )
             result = await asyncio.wait_for(
                 loop_coro,

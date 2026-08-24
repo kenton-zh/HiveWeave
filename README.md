@@ -35,7 +35,7 @@
 
 | Organization | Tools & services | Quality & control |
 |:---|:---|:---|
-| CEO, HR, managers, QA & executors out of the box | **85+ built-in tools**, 50+ services, 18 API modules · 133 routes | **4-layer review gate** before anything reaches you |
+| CEO, HR, managers, QA & executors out of the box | **90+ built-in tools**, 60+ services, 18 API modules · 130+ routes | **4-layer review gate** before anything reaches you |
 | Role-based models: premium for decisions, cheap for execution | Per-agent model override, mix any provider | Per-agent context isolation — no cross-contamination |
 | Parallel agents on isolated `git worktrees` | Built-in task system with a ground-truth ledger | Direct chat with the agent behind any module |
 
@@ -126,7 +126,7 @@ Four-Layer Review Gate:
 - **Direct chat** — You can talk directly to any agent at any level. Frontend issue? Talk to the frontend dev. Don't route through CEO.
 
 ### Git Worktree Development
-- **Isolated worktrees** — Each agent gets its own `git worktree` (`hw/<shortId>/<task>`). No conflicts between parallel agents.
+- **Isolated worktrees** — Each agent gets its own `git worktree` (`hw/<shortId>/t-<taskId>`). No conflicts between parallel agents.
 - **Checkpoint + rollback** — Agents checkpoint before risky changes. Rollback without polluting main.
 - **Review → Merge gate** — Executor reports completion → QA reviews → Manager approves → CEO signs off → Merge to main. Four gates before code reaches you.
 
@@ -149,11 +149,11 @@ Four-Layer Review Gate:
 
 | Layer | Stack | Notes |
 |:---|------|------|
-| Backend | Python 3.12 + FastAPI + Uvicorn | Port 4000, 133 routes, 18 API modules |
+| Backend | Python 3.12 + FastAPI + Uvicorn | Port 4000, 130+ routes, 18 API modules |
 | Frontend | React 19 + Vite + React Flow + Zustand | Port 5173, Electron desktop support |
-| Database | SQLite + aiosqlite | Dual-DB: Meta DB (WAL) + Per-project DB |
+| Database | SQLite + aiosqlite | Dual-DB: Meta DB + Per-project DB (DELETE journal) |
 | AI/LLM | httpx SSE streaming + Provider Factory | OpenAI, Anthropic, DeepSeek, Groq, Google |
-| Realtime | phoenix.js + phoenix_adapter (WebSocket) | 3 channels: lobby, project, agent |
+| Realtime | phoenix.js + phoenix_adapter (WebSocket) | 2 channels: `lobby:status`, `agent:<id>` |
 | Sandbox | ACL write-restricted token (Windows) | `HIVEWEAVE_ACL_SANDBOX=on` |
 | Build | Turbo | Monorepo task orchestration |
 | Package | pnpm 10 + uv | Monorepo + Python packages |
@@ -166,15 +166,15 @@ hiveweave/
 │   ├── hiveweave-py/                  # Backend — Python/FastAPI (port 4000)
 │   │   └── src/hiveweave/
 │   │       ├── agents/                # Agent lifecycle + Supervisor + trigger
-│   │       ├── api/                   # 18 FastAPI router modules, 133 routes
+│   │       ├── api/                   # 18 FastAPI router modules, 130+ routes
 │   │       ├── conversation/          # Token budget, compaction, conversation store
 │   │       ├── db/                    # Meta DB + Per-project DB (aiosqlite)
 │   │       ├── hooks/                 # Lifecycle hooks
 │   │       ├── llm/                   # Streamer, provider factory, retry, circuit_breaker
 │   │       ├── prompts/               # ETHOS prompt system (identity + context)
 │   │       ├── realtime/              # phoenix_adapter, channels, pubsub, event_bus
-│   │       ├── services/              # 50+ services (org, dispatch, memory, handoff, ...)
-│   │       ├── tools/                 # 85+ built-in tools (incl. tasks/ subpackage)
+│   │       ├── services/              # 60+ services (org, dispatch, memory, handoff, ...)
+│   │       ├── tools/                 # 90+ built-in tools (incl. tasks/ subpackage)
 │   │       └── util/                  # Shared utilities
 │   └── web/                           # Frontend — React 19 + Vite + Electron (port 5173)
 ├── assets/
@@ -206,7 +206,7 @@ Everything below is delivered as a running organization, not a library. The diff
 |:---|------|
 | **Role-based models** | CEO/Expert get premium LLMs; Executors get cheap ones. Cost-effective at scale. |
 | **Per-agent model override** | Any agent can individually specify its model. Mix providers — OpenAI, Anthropic, DeepSeek, Groq. |
-| **Git worktree per agent** | Every agent gets its own `git worktree` (`hw/<shortId>/<task>`). Full filesystem isolation. Checkpoint, rollback, merge — all through the coordinator. |
+| **Git worktree per agent** | Every agent gets its own `git worktree` (`hw/<shortId>/t-<taskId>`). Full filesystem isolation. Checkpoint, rollback, merge — all through the coordinator. |
 | **Self-review before QA** | Executors run five-axis self-review (correctness/readability/architecture/security/performance) BEFORE submitting. Catches issues early, reduces review churn. |
 | **4-layer review gate** | Executor → QA → Manager → CEO → You. Nothing reaches you unverified. |
 | **Natural language user involvement** | Not an enum dropdown. "I only verify after frontend features are done. Backend — I don't want to see it." CEO interprets and honors your intent. |
@@ -220,11 +220,11 @@ Everything below is delivered as a running organization, not a library. The diff
 | **Handoff inheritance** | Design goal, not yet implemented — dismiss does not archive memory (ADR-010). |
 | **Expert on-demand** | When the team hits a wall, CEO summons an Expert agent (most expensive model). Team-refined questions → better answers per dollar. Only burns expert tokens when truly needed. |
 | **Asyncio task isolation** | Each agent runs in its own asyncio task. Crash doesn't crash the system. Circuit breaker + exponential backoff for LLM outages. |
-| **Game time scheduling** | 1 real hour = 1 game day. Stalled agents: 10min stall → nudge, ~40min+ → escalate to superiors. Timed alarms on simulated clock. |
-| **Dual-DB pattern** | Meta DB (WAL, global) + Per-project DB (WAL, isolated). Agents never cross-contaminate data. |
+| **Game time scheduling** | 1 real hour = 1 game day. Silence watchdog: idle ≥10min → self-wake + health flag; ≥30min unresponsive → log only (no inbox spam). A task dwell clock auto-heals stalled tasks (auto-submit / re-dispatch / merge proxy). |
+| **Dual-DB pattern** | Meta DB (global) + Per-project DB (isolated). Agents never cross-contaminate data. |
 | **MCP protocol** | Tool extension via Model Context Protocol. Bind MCP servers per agent — different agents get different external tools. |
 | **skills.sh marketplace** | Remote skill marketplace. HR searches and binds skills dynamically. No hardcoded skill lists. |
-| **85+ built-in tools** | bash, file ops, grep, patch, review (5-axis), security audit, websearch, question, todowrite, orchestration, org, vision, image generation, MCP tools. Permission-gated per role type. |
+| **90+ built-in tools** | bash, file ops, grep, patch, review (5-axis), security audit, websearch, question, todowrite, orchestration, org, vision, image generation, MCP tools. Permission-gated per role type. |
 
 ## Documentation
 
