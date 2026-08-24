@@ -679,6 +679,12 @@ async def create_model(body: ModelCreate) -> dict:
                 attrs["max_output_tokens"] = meta["max_output_tokens"]
 
         result = await _model.create(attrs)
+        # 用户手动创建 = 撤销此前的删除决定，清除同名 tombstone（恢复 ensure
+        # 渠道更新）。只在本 API 入口清除——seed/ensure 的 create 不清（防止
+        # 删光模型后重启时 seed 复活并永久清掉 tombstone，S1 审计）。
+        name = (attrs.get("name") or "").strip()
+        if name:
+            await _model._clear_tombstone(name)
 
         # ── 创建后自动触发自检（连通性 + 运行时推理 token 检测 + DB 修正）──
         created_model = await _model.get(result["id"])

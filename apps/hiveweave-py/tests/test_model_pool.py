@@ -106,8 +106,11 @@ async def test_ensure_channel_models_dual_key_upserts_both():
         with patch.object(
             svc, "list_active", new=AsyncMock(return_value=[])
         ):
-            with patch("hiveweave.config.settings", FakeSettings()):
-                out = await svc.ensure_channel_models()
+            with patch.object(
+                svc, "_is_tombstoned", new=AsyncMock(return_value=False)
+            ):
+                with patch("hiveweave.config.settings", FakeSettings()):
+                    out = await svc.ensure_channel_models()
 
     assert len(upserts) == 2
     plan, coding = upserts
@@ -141,8 +144,11 @@ async def test_ensure_channel_models_same_key_skips_coding():
         with patch.object(
             svc, "list_active", new=AsyncMock(return_value=[])
         ):
-            with patch("hiveweave.config.settings", FakeSettings()):
-                out = await svc.ensure_channel_models()
+            with patch.object(
+                svc, "_is_tombstoned", new=AsyncMock(return_value=False)
+            ):
+                with patch("hiveweave.config.settings", FakeSettings()):
+                    out = await svc.ensure_channel_models()
 
     assert len(upserts) == 1
     assert upserts[0]["api_key"] == "same-key"
@@ -170,8 +176,167 @@ async def test_ensure_channel_models_no_plan_key_noop():
             with patch.object(
                 svc, "list_active", new=AsyncMock(return_value=[])
             ):
-                with patch("hiveweave.config.settings", FakeSettings()):
-                    out = await svc.ensure_channel_models()
+                with patch.object(
+                    svc, "_is_tombstoned", new=AsyncMock(return_value=False)
+                ):
+                    with patch("hiveweave.config.settings", FakeSettings()):
+                        out = await svc.ensure_channel_models()
 
     up.assert_not_called()
     assert out["ensured"] == []
+
+
+# ── Tombstone：删除即永久（2026-08-24）────────────────────────
+# UI 删除渠道模型后，启动 ensure_channel_models 不得再按 .env 配置重建。
+# delete 写 tombstone → _is_tombstoned 返回 True → ensure 跳过；create 撤销。
+
+
+@pytest.mark.asyncio
+async def test_delete_writes_tombstone():
+    """delete 硬删行后把渠道名写入 global_settings tombstone。"""
+    svc = ModelService()
+    plan_name = "DeepSeek V4 Flash (ARK Plan)"
+    model = {"id": "m1", "name": plan_name, "model_id": "deepseek-v4-flash"}
+    set_calls: list[tuple[str, str]] = []
+
+    class FakeSettingsSvc:
+        async def set(self, key, value):
+            set_calls.append((key, str(value)))
+            return str(value)
+
+    with patch.object(svc, "get", new=AsyncMock(return_value=model)):
+        with patch(
+            "hiveweave.services.settings.SettingsService", FakeSettingsSvc
+        ):
+            with patch(
+                "hiveweave.services.model.meta_db.execute", new=AsyncMock()
+            ):
+                await svc.delete("m1")
+
+    assert set_calls[0][0] == f"model_tombstone:{plan_name}"
+
+
+@pytest.mark.asyncio
+async def test_ensure_skips_tombstoned_channel():
+    """tombstone 渠道在 ensure_channel_models 里被跳过（不再重建）。"""
+    svc = ModelService()
+    upserts: list[dict] = []
+
+    async def fake_upsert(attrs: dict) -> dict:
+        upserts.append(attrs)
+        return {"id": "id-1", **attrs}
+
+    class FakeSettings:
+        ark_api_key = "plan-key"
+        ark_base_url = "https://ark.example/api/plan/v3"
+        ark_model_id = "model-x"
+        ark_coding_api_key = ""
+        ark_coding_base_url = ""
+        ark_coding_model_id = ""
+
+    async def fake_is_tombstoned(name: str) -> bool:
+        return name == "DeepSeek V4 Flash (ARK Plan)"
+
+    with patch.object(svc, "upsert_by_name", side_effect=fake_upsert):
+        with patch.object(svc, "list_active", new=AsyncMock(return_value=[])):
+            with patch.object(
+                svc, "_is_tombstoned", side_effect=fake_is_tombstoned
+            ):
+                with patch("hiveweave.config.settings", FakeSettings()):
+                    out = await svc.ensure_channel_models()
+
+    assert upserts == []
+    assert out["ensured"] == []
+
+
+@pytest.mark.asyncio
+async def test_create_keeps_tombstone():
+    """服务层 create 不清 tombstone——防止 seed 删光后复活并永久清标记（S1）。
+
+    清除 tombstone 只发生在 API 层用户手动创建入口（撤销删除）。
+    """
+    svc = ModelService()
+    name = "DeepSeek V4 Flash (ARK Plan)"
+    delete_keys: list[str] = []
+
+    class FakeSettingsSvc:
+        async def delete(self, key):
+            delete_keys.append(key)
+
+    async def fake_execute(*_args, **_kwargs):
+        return None
+
+    with patch(
+        "hiveweave.services.settings.SettingsService", FakeSettingsSvc
+    ):
+        with patch(
+            "hiveweave.services.model.meta_db.execute", side_effect=fake_execute
+        ):
+            await svc.create(
+                {
+                    "name": name,
+                    "model_id": "deepseek-v4-flash",
+                    "base_url": "https://ark.example/api/plan/v3",
+                    "api_key": "k",
+                    "provider_type": "openai-compatible",
+                    "is_active": True,
+                }
+            )
+
+    assert delete_keys == []
+
+
+@pytest.mark.asyncio
+async def test_delete_renamed_channel_not_tombstoned():
+    """改名后的模型不再命中渠道名集合 → 普通删除，不落 tombstone（B1）。"""
+    svc = ModelService()
+    # 用户把渠道模型改名后再删除 —— DB name 已不等于渠道常量名
+    model = {"id": "m1", "name": "我的ARK", "model_id": "deepseek-v4-flash"}
+    set_calls: list[tuple[str, str]] = []
+
+    class FakeSettingsSvc:
+        async def set(self, key, value):
+            set_calls.append((key, str(value)))
+            return str(value)
+
+    with patch.object(svc, "get", new=AsyncMock(return_value=model)):
+        with patch(
+            "hiveweave.services.settings.SettingsService", FakeSettingsSvc
+        ):
+            with patch(
+                "hiveweave.services.model.meta_db.execute", new=AsyncMock()
+            ):
+                await svc.delete("m1")
+
+    assert set_calls == []
+
+
+@pytest.mark.asyncio
+async def test_seed_step_skips_tombstoned():
+    """Step 渠道同样受 tombstone 保护，删除后 seed 不再重建（B2）。"""
+    svc = ModelService()
+
+    class FakeSettingsSvc:
+        async def get(self, key):
+            return None
+
+    async def fake_is_tombstoned(name: str) -> bool:
+        return name == svc._STEP_NAME
+
+    with patch("hiveweave.services.settings.SettingsService", FakeSettingsSvc):
+        with patch.object(svc, "_is_tombstoned", side_effect=fake_is_tombstoned):
+            with patch.object(svc, "list_active", new=AsyncMock(return_value=[])):
+                with patch(
+                    "hiveweave.services.model.meta_db.query_one",
+                    new=AsyncMock(return_value={"cnt": 0}),
+                ):
+                    with patch.dict(
+                        "os.environ", {"STEP_API_KEY": "step-key"}, clear=False
+                    ):
+                        with patch.object(
+                            svc, "create", new=AsyncMock()
+                        ) as create:
+                            out = await svc.seed_default_model()
+
+    create.assert_not_called()
+    assert out == {"error": "no_api_key"}

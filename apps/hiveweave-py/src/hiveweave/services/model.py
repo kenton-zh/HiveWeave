@@ -254,9 +254,68 @@ class ModelService:
         return model_pk
 
     async def delete(self, model_pk: str) -> None:
-        """Delete a model by ID."""
-        await meta_db.execute("DELETE FROM llm_models WHERE id = ?", [model_pk])
-        log.info("model_deleted", model_pk=model_pk)
+        """Delete a model by ID.
+
+        2026-08-24：删除即永久——同时写入 tombstone（global_settings），
+        阻止启动时 ensure_channel_models 按渠道名自动重建。用户从模型清单
+        删除的渠道模型不再因 .env 残留配置而复活。
+        - get 按 id 或 model_id 命中，删除统一用解析出的 ``id``（M2 审计）。
+        - 先写 tombstone 再删行，删行失败回滚 tombstone（A1 审计：避免
+          "行已删但无 tombstone"导致重启后静默复活）。
+        """
+        model = await self.get(model_pk)
+        if model is None:
+            log.info("model_delete_missing", model_pk=model_pk)
+            return
+        # 只对渠道模型落 tombstone，键锁定为渠道常量名（防改名后与 ensure 查询脱钩）
+        name = model.get("name") or ""
+        channel_name = name if name in self._CHANNEL_NAMES else None
+        if channel_name:
+            await self._set_tombstone(channel_name)
+        try:
+            await meta_db.execute(
+                "DELETE FROM llm_models WHERE id = ?", [model["id"]]
+            )
+        except Exception:
+            if channel_name:
+                await self._clear_tombstone(channel_name)
+            raise
+        log.info("model_deleted", model_pk=model_pk, name=name)
+
+    # ── Tombstone（删除即永久，2026-08-24）─────────────────────
+    # ensure_channel_models 会在启动时按 .env 的 key 自动 upsert 渠道模型。
+    # 若用户已从模型清单删除该渠道，删除动作写 tombstone，启动 ensure 跳过
+    # 重建；用户手动重新创建（create）则清除同名 tombstone 恢复正常渠道更新。
+    #
+    # tombstone 键必须用**渠道常量名**（而非 DB 中的可编辑展示名）：若用户先把
+    # 渠道模型改名再删除，按 DB 名写 tombstone 会与 ensure 用常量名查询脱钩，
+    # 导致删除的渠道在重启后被静默重建（B1 审计）。只对渠道模型落 tombstone，
+    # 改名后的模型不再命中渠道名集合 → 属普通删除，不阻塞下次 .env 重建。
+
+    _TOMBSTONE_PREFIX = "model_tombstone:"
+    _ARK_PLAN_NAME = "DeepSeek V4 Flash (ARK Plan)"
+    _ARK_CODING_NAME = "DeepSeek V4 Flash (ARK Coding)"
+    _STEP_NAME = "Step 3.7 Flash"
+    _CHANNEL_NAMES = frozenset({_ARK_PLAN_NAME, _ARK_CODING_NAME, _STEP_NAME})
+
+    async def _set_tombstone(self, name: str) -> None:
+        """记录某渠道模型已被用户删除（阻止 ensure 自动重建）。"""
+        from hiveweave.services.settings import SettingsService
+        await SettingsService().set(
+            f"{self._TOMBSTONE_PREFIX}{name}", int(time.time() * 1000)
+        )
+
+    async def _clear_tombstone(self, name: str) -> None:
+        """清除某渠道模型的删除标记（用户手动重新创建时撤销删除）。"""
+        from hiveweave.services.settings import SettingsService
+        await SettingsService().delete(f"{self._TOMBSTONE_PREFIX}{name}")
+
+    async def _is_tombstoned(self, name: str) -> bool:
+        """该渠道模型是否曾被用户删除（tombstone 存在即永久跳过重建）。"""
+        from hiveweave.services.settings import SettingsService
+        return bool(
+            await SettingsService().get(f"{self._TOMBSTONE_PREFIX}{name}")
+        )
 
     async def list_all(self) -> list[dict]:
         """List all models (api_key masked). ORDER BY created_at ASC.
@@ -551,10 +610,10 @@ class ModelService:
             (settings.ark_model_id or "").strip()
             or os.environ.get("HIVEWEAVE_ARK_MODEL_ID", "deepseek-v4-flash")
         )
-        if plan_key:
+        if plan_key and not await self._is_tombstoned(self._ARK_PLAN_NAME):
             row = await self.upsert_by_name(
                 {
-                    "name": "DeepSeek V4 Flash (ARK Plan)",
+                    "name": self._ARK_PLAN_NAME,
                     "model_id": plan_model,
                     "base_url": plan_url.rstrip("/"),
                     "api_key": plan_key,
@@ -588,19 +647,22 @@ class ModelService:
             (settings.ark_coding_model_id or "").strip()
             or os.environ.get("HIVEWEAVE_ARK_CODING_MODEL_ID", "deepseek-v4-flash")
         )
-        if not coding_key:
-            existing_coding = await self.find_by_name(
-                "DeepSeek V4 Flash (ARK Coding)"
-            )
+        coding_tombstoned = await self._is_tombstoned(self._ARK_CODING_NAME)
+        if not coding_key and not coding_tombstoned:
+            existing_coding = await self.find_by_name(self._ARK_CODING_NAME)
             if existing_coding and existing_coding.get("api_key"):
                 coding_key = existing_coding["api_key"]
                 coding_url = existing_coding.get("base_url") or coding_url
                 coding_model = existing_coding.get("model_id") or coding_model
 
-        if coding_key and coding_key != plan_key:
+        if (
+            coding_key
+            and coding_key != plan_key
+            and not coding_tombstoned
+        ):
             row = await self.upsert_by_name(
                 {
-                    "name": "DeepSeek V4 Flash (ARK Coding)",
+                    "name": self._ARK_CODING_NAME,
                     "model_id": coding_model,
                     "base_url": coding_url.rstrip("/"),
                     "api_key": coding_key,
@@ -653,9 +715,9 @@ class ModelService:
             os.environ.get("HIVEWEAVE_ARK_API_KEY", "")
             or os.environ.get("ARK_API_KEY", "")
         )
-        if ark_key:
+        if ark_key and not await self._is_tombstoned(self._ARK_PLAN_NAME):
             attrs = {
-                "name": "DeepSeek V4 Flash (ARK Plan)",
+                "name": self._ARK_PLAN_NAME,
                 "model_id": os.environ.get(
                     "HIVEWEAVE_ARK_MODEL_ID", "deepseek-v4-flash"
                 ),
@@ -675,9 +737,9 @@ class ModelService:
             return result
 
         api_key = os.environ.get("STEP_API_KEY", "")
-        if api_key:
+        if api_key and not await self._is_tombstoned(self._STEP_NAME):
             attrs = {
-                "name": "Step 3.7 Flash",
+                "name": self._STEP_NAME,
                 "model_id": "step-3.7-flash",
                 "base_url": "https://api.stepfun.com/step_plan/v1",
                 "api_key": api_key,
