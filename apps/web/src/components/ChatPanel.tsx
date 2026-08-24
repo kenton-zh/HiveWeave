@@ -291,6 +291,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     pendingApprovalTool,
     setPendingApprovalTool,
     fileInputRef,
+    textareaRef,
+    onCompositionStart,
+    onCompositionEnd,
     handlePaste,
     handleFileInput,
     removeImage,
@@ -585,7 +588,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             已排队 {queuedCount} 条消息，将在当前回复完成后自动发送
           </p>
         )}
-        <div className="flex gap-2 items-end">
+        <div className="flex items-end gap-2">
           <input
             type="file"
             ref={fileInputRef}
@@ -594,12 +597,13 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             multiple
             className="hidden"
           />
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={images.length >= 5 || isStreaming}
-            className="px-2.5 py-2.5 rounded-gm text-g-fg-3 hover:text-g-blue hover:bg-g-bg-muted disabled:opacity-30 transition-colors"
-            title="添加图片 (支持粘贴/拖拽)"
-          >
+          <div className="flex flex-1 items-end rounded-gmLg border border-g-border bg-g-bg-soft transition-all focus-within:border-g-blue focus-within:ring-2 focus-within:ring-g-blue/20">
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={images.length >= 5 || isStreaming}
+              className="shrink-0 px-2.5 py-3 rounded-l-gmLg text-g-fg-3 hover:text-g-blue hover:bg-g-bg-muted disabled:opacity-30 transition-colors"
+              title="添加图片 (支持粘贴/拖拽)"
+            >
             <svg
               width="20"
               height="20"
@@ -616,15 +620,18 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             </svg>
           </button>
           <textarea
+            ref={textareaRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
+            onCompositionStart={onCompositionStart}
+            onCompositionEnd={onCompositionEnd}
             placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 支持粘贴图片)"
-            className="flex-1 bg-g-bg-soft border border-g-border rounded-gm px-3.5 py-2.5 text-sm text-g-fg resize-none transition-all focus:outline-none focus:bg-g-bg focus:border-g-blue focus:ring-2 focus:ring-g-blue/20"
-            rows={1}
+            className="flex-1 bg-transparent border-0 px-1 py-3 text-sm text-g-fg leading-relaxed resize-none outline-none overflow-y-auto min-h-[46px] max-h-[200px] placeholder:text-g-fg-4/60"
             disabled={isStreaming}
           />
+          </div>
           <button
             onClick={handleSend}
             disabled={(!input.trim() && images.length === 0) || isStreaming}

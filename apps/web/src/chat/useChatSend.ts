@@ -75,6 +75,10 @@ export function useChatSend(opts: {
   const abortControllerRef = useRef<AbortController | null>(null);
   /** streamChat's cancel handle — AbortController alone does not push WS cancel. */
   const streamAbortRef = useRef<(() => void) | null>(null);
+  /** 输入框 auto-grow：随内容撑高，封顶后内部滚动。 */
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  /** IME 组合期保护：Enter 用于选候选词，绝不误发。Safari 在 compositionend 之后才收 keydown，故延迟复位。 */
+  const composingRef = useRef(false);
   const responseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -603,11 +607,55 @@ export function useChatSend(opts: {
     handleSend();
   }, [agentId, isStreaming, isAgentProcessing, handleSend]);
 
+  /** 输入框 auto-grow：内容撑高到 MAX 封顶后内部滚动，参考 deepseek-harness 的 composer。 */
+  const autoResizeTextarea = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    const MAX_GROW_PX = 200;
+    el.style.removeProperty("height");
+    el.style.height = `${Math.min(el.scrollHeight, MAX_GROW_PX)}px`;
+  }, []);
+
+  useEffect(() => {
+    autoResizeTextarea();
+  }, [input, autoResizeTextarea]);
+
+  // Safari 在 compositionend 之后才交付闭合 keydown，延迟一个 tick 复位，避免闭合 Enter 被误发。
+  const resetComposing = useCallback(() => {
+    setTimeout(() => {
+      composingRef.current = false;
+    }, 10);
+  }, []);
+
+  const onCompositionStart = useCallback(() => {
+    composingRef.current = true;
+  }, []);
+
+  const onCompositionEnd = useCallback(() => {
+    resetComposing();
+  }, [resetComposing]);
+
+  // 部分 IME 在点击别处/Esc/中断时只触发 compositioncancel 而不触发 compositionend，
+  // 若不复位 composingRef 会让后续 Enter 永远无法发送。React 未映射该事件，用原生监听挂到 textarea。
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (el === null) return;
+    const onCancel = () => {
+      composingRef.current = false;
+    };
+    el.addEventListener("compositioncancel", onCancel);
+    return () => {
+      el.removeEventListener("compositioncancel", onCancel);
+    };
+  }, []);
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
+    if (e.key !== "Enter" || e.shiftKey) return; // Shift+Enter 原生换行
+    const composing =
+      composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229;
+    if (composing || e.repeat) return; // IME 选候选 / 长按连发 → 走原生
+    e.preventDefault();
+    handleSend();
   };
 
   const handleStop = useCallback(() => {
@@ -637,6 +685,9 @@ export function useChatSend(opts: {
     pendingApprovalTool,
     setPendingApprovalTool,
     fileInputRef,
+    textareaRef,
+    onCompositionStart,
+    onCompositionEnd,
     handlePaste,
     handleFileInput,
     removeImage,
