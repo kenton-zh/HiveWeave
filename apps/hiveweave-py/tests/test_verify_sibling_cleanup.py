@@ -191,7 +191,11 @@ async def test_cleanup_spares_rework_duplicate(task_env):
     )
     await ts.claim_task(pid, dup, EXEC)
     await ts.start_task(pid, dup)
-    await ts.submit_task(pid, dup, evidence={"tests_passed": True, "test_output": "ok"})
+    await ts.submit_task(
+        pid,
+        dup,
+        evidence={"verdict": "PASS", "tests_passed": True, "test_output": "ok"},
+    )
     await ts.start_review(pid, dup)
     await ts.review_task(pid, dup, "rework")
     verify_ok = await ts.create_task(

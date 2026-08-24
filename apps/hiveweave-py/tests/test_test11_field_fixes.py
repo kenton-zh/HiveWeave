@@ -265,6 +265,7 @@ async def test_verify_submit_forces_creator_as_reviewer(task_env):
         pid,
         tid,
         evidence={
+            "verdict": "PASS",
             "tests_passed": True,
             "test_output": "ok",
             "reviewer_id": QA,  # attempt self-review — must be ignored

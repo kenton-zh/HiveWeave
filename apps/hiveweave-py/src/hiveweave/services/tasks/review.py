@@ -84,6 +84,22 @@ class ReviewMixin:
                 raise ValueError(
                     f"Illegal transition: {current_status} → approved"
                 )
+            # E2: 终验（VERIFY / milestoneVerify）任务 evidence verdict=FAIL
+            # → 验收工作合格但结论不合格，强制走 rework（不复用 close）。
+            if evidence.get("verdict") == "FAIL":
+                task = await self.get_task(project_id, task_id)
+                if task and self._is_verify_task(task):
+                    await self._force_rework(
+                        project_id,
+                        task_id,
+                        evidence,
+                        feedback,
+                        reviewer_id,
+                        reason_code="verdict_fail_rework",
+                        detail=(feedback or ""),
+                        current_status=current_status,
+                    )
+                    return
             # reviewing → approved
             await self._transition(project_id, task_id, "approved",
                                    actor_id=reviewer_id)
@@ -134,71 +150,106 @@ class ReviewMixin:
                 raise ValueError(
                     f"Illegal transition: {current_status} → rework"
                 )
-            # P0-2: invalidate unexpired waivers on rework so waived_by
-            # third-party isolation does not persist across review rounds.
-            # A rework starts a fresh submit/review cycle; the prior waiver
-            # was tied to the now-rejected submission. Lifetime count is
-            # preserved for the MAX_WAIVERS_PER_TASK cap.
-            try:
-                from hiveweave.services.attestation import (
-                    invalidate_valid_waivers,
-                )
-
-                await invalidate_valid_waivers(project_id, task_id)
-            except Exception as e:
-                log.warning(
-                    "rework_waiver_invalidate_failed",
-                    task_id=task_id,
-                    error=str(e),
-                )
-            await self._transition_multi(project_id, task_id, "rework", "running",
-                                         actor_id=reviewer_id or "system",
-                                         reason_code=reason_code or "review_rework",
-                                         detail=(feedback or "")[:500])
-            await _execute(project_id,
-                "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
-                [json.dumps(evidence), now_ms, task_id])
-            try:
-                task_row = await self.get_task(project_id, task_id)
-                if task_row and self._is_verify_task(task_row):
-                    await VerificationCaseService().mark_failed(
-                        project_id,
-                        task_id,
-                        notes=str(feedback or "")[:500],
-                    )
-            except Exception:
-                pass
-            try:
-                task_row = await self.get_task(project_id, task_id)
-                from hiveweave.services.task_contract import (
-                    ensure_slice_status,
-                    parse_contract,
-                )
-
-                c = parse_contract((task_row or {}).get("contract_json"))
-                if c:
-                    c = ensure_slice_status(c, "failed")
-                    await self._persist_contract_json(project_id, task_id, c)
-            except Exception as e:
-                log.warning(
-                    "slice_mark_failed_failed",
-                    task_id=task_id,
-                    error=str(e),
-                )
-            log.info("task_reviewed", task_id=task_id, decision=decision,
-                     has_feedback=feedback is not None,
-                     from_status=current_status)
-            rows2 = await _query(
-                project_id,
-                "SELECT assignee_id FROM tasks WHERE id = ?",
-                [task_id],
-            )
-            aid = rows2[0]["assignee_id"] if rows2 else None
-            await self.emit_task_event(
+            await self._force_rework(
                 project_id,
                 task_id,
-                "rework",
-                agent_id=aid,
-                summary=f"[rework] task {task_id[:8]}",
+                evidence,
+                feedback,
+                reviewer_id,
+                reason_code=reason_code or "review_rework",
+                detail=(feedback or ""),
+                current_status=current_status,
             )
+
+    async def _force_rework(
+        self,
+        project_id: str,
+        task_id: str,
+        evidence: dict,
+        feedback: str | None,
+        reviewer_id: str | None,
+        *,
+        reason_code: str,
+        detail: str,
+        current_status: str,
+    ) -> None:
+        """E2 复用收口：把任务打回 rework→running（原子两步）。
+
+        reviewing|approved → rework → running，reason_code 可区分触发来源
+        （normal ``review_rework`` / 终验 FAIL ``verdict_fail_rework``）。
+        走既有 rework 收尾：invalidate waivers、VERIFY case mark_failed、
+        slice mark failed，并把 blocking_issues 附进 assignee 通知。
+        """
+        now_ms = int(time.time() * 1000)
+        # P0-2: invalidate unexpired waivers on rework so waived_by
+        # third-party isolation does not persist across review rounds.
+        # A rework starts a fresh submit/review cycle; the prior waiver
+        # was tied to the now-rejected submission. Lifetime count is
+        # preserved for the MAX_WAIVERS_PER_TASK cap.
+        try:
+            from hiveweave.services.attestation import invalidate_valid_waivers
+
+            await invalidate_valid_waivers(project_id, task_id)
+        except Exception as e:
+            log.warning(
+                "rework_waiver_invalidate_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+        await self._transition_multi(project_id, task_id, "rework", "running",
+                                     actor_id=reviewer_id or "system",
+                                     reason_code=reason_code,
+                                     detail=(detail or feedback or "")[:500])
+        await _execute(project_id,
+            "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
+            [json.dumps(evidence), now_ms, task_id])
+        try:
+            task_row = await self.get_task(project_id, task_id)
+            if task_row and self._is_verify_task(task_row):
+                await VerificationCaseService().mark_failed(
+                    project_id,
+                    task_id,
+                    notes=str(feedback or "")[:500],
+                )
+        except Exception:
+            pass
+        try:
+            task_row = await self.get_task(project_id, task_id)
+            from hiveweave.services.task_contract import (
+                ensure_slice_status,
+                parse_contract,
+            )
+
+            c = parse_contract((task_row or {}).get("contract_json"))
+            if c:
+                c = ensure_slice_status(c, "failed")
+                await self._persist_contract_json(project_id, task_id, c)
+        except Exception as e:
+            log.warning(
+                "slice_mark_failed_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+        log.info("task_reviewed", task_id=task_id, decision="rework",
+                 has_feedback=feedback is not None,
+                 from_status=current_status, reason_code=reason_code)
+        rows2 = await _query(
+            project_id,
+            "SELECT assignee_id FROM tasks WHERE id = ?",
+            [task_id],
+        )
+        aid = rows2[0]["assignee_id"] if rows2 else None
+        summary = f"[rework] task {task_id[:8]}"
+        blocking = evidence.get("blocking_issues")
+        if isinstance(blocking, list) and blocking:
+            summary += " | blocking_issues: " + json.dumps(
+                blocking, ensure_ascii=False
+            )
+        await self.emit_task_event(
+            project_id,
+            task_id,
+            "rework",
+            agent_id=aid,
+            summary=summary,
+        )
 

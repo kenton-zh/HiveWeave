@@ -59,7 +59,9 @@ async def test_bind_does_not_steal_running_impl_when_verify_submitted(task_env):
     await ts.claim_task(pid, flying, EXEC)
     await ts.start_task(pid, flying)
     await ts.submit_task(
-        pid, flying, evidence={"tests_passed": True, "test_output": "ok"}
+        pid,
+        flying,
+        evidence={"verdict": "PASS", "tests_passed": True, "test_output": "ok"},
     )
     # _mint_verify also leaves the parent claimed on EXEC — park it so the
     # only active assignee work is the implementation task under test.

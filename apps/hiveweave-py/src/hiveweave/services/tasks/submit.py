@@ -42,6 +42,11 @@ class SubmitMixin:
         task_id = await self.require_task_id(project_id, task_id)
         task = await self.get_task(project_id, task_id)
 
+        # E1 verdict gate：终验（VERIFY / milestoneVerify）任务 evidence 必须
+        # 带强制判定字段，否则硬拒提交（transition 之前拦截）。
+        if task and self._is_verify_task(task):
+            self._validate_verdict_evidence(evidence)
+
         # SUBMITTED MACHINE PRE-RUN (slice-driven L0)
         if task and task.get("contract_json"):
             from hiveweave.services.task_contract import (
@@ -165,6 +170,36 @@ class SubmitMixin:
                 task_id=task_id,
                 error=str(e),
             )
+
+    @staticmethod
+    def _validate_verdict_evidence(evidence: dict) -> None:
+        """E1: 终验任务 evidence 硬校验 —— verdict 强制判定字段。
+
+        verdict ∈ {PASS, FAIL}；verdict=FAIL 时 blocking_issues 必须为非空
+        list。缺失或非法 → ValueError，点名缺什么（对齐 SUBMIT PRE-RUN
+        FAILED 硬拒风格）。非终验任务无需这些字段，由调用方按谓词筛选。
+        """
+        if not isinstance(evidence, dict):
+            raise ValueError(
+                "SUBMIT VERDICT REJECTED (verify task): "
+                "evidence 必须是 dict 才能判定 verdict"
+            )
+        verdict = evidence.get("verdict")
+        if verdict not in ("PASS", "FAIL"):
+            missing = "verdict" if verdict is None else f"verdict={verdict!r}"
+            raise ValueError(
+                "SUBMIT VERDICT REJECTED (verify task): "
+                f"evidence 缺判定字段（缺：{missing}），"
+                "期望 verdict ∈ {PASS, FAIL}"
+            )
+        if verdict == "FAIL":
+            blocking = evidence.get("blocking_issues")
+            if not isinstance(blocking, list) or not blocking:
+                raise ValueError(
+                    "SUBMIT VERDICT REJECTED (verify task): "
+                    "verdict=FAIL 时 blocking_issues 必须为非空 list "
+                    "（当前缺失或为空）"
+                )
 
     async def _resolve_evidence_workspace(
         self, project_id: str, task: dict

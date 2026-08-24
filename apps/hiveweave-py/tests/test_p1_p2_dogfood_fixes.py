@@ -143,7 +143,9 @@ async def _make_verify_task(pid: str) -> str:
     await ts.claim_task(pid, verify_id, QA)
     await ts.start_task(pid, verify_id)
     await ts.submit_task(
-        pid, verify_id, evidence={"tests_passed": True, "test_output": "ok"}
+        pid,
+        verify_id,
+        evidence={"verdict": "PASS", "tests_passed": True, "test_output": "ok"},
     )
     await ts.start_review(pid, verify_id)
     return verify_id
@@ -252,7 +254,9 @@ async def test_submit_task_preserves_merged_by(task_env):
     await ts.claim_task(pid, tid, QA)
     await ts.start_task(pid, tid)
     await ts.submit_task(
-        pid, tid, evidence={"tests_passed": True, "summary": "32/32 pass"}
+        pid,
+        tid,
+        evidence={"verdict": "PASS", "tests_passed": True, "summary": "32/32 pass"},
     )
     task = await ts.get_task(pid, tid)
     ev = task["evidence"]

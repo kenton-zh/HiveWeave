@@ -227,7 +227,9 @@ async def test_verify_parent_close_failure_notifies_creator(task_env):
     )
     await ts.claim_task(pid, verify_id, EXEC)
     await ts.start_task(pid, verify_id)
-    await ts.submit_task(pid, verify_id, evidence={"tests_passed": True})
+    await ts.submit_task(
+        pid, verify_id, evidence={"verdict": "PASS", "tests_passed": True}
+    )
     await ts.start_review(pid, verify_id)
 
     with (

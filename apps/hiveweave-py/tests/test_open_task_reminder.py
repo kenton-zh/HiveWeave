@@ -247,7 +247,9 @@ async def test_verify_approve_auto_closes(env):
     )
     await ts.claim_task(pid, tid, AGENT_A)
     await ts.start_task(pid, tid)
-    await ts.submit_task(pid, tid, {"summary": "ok", "tests_passed": True})
+    await ts.submit_task(
+        pid, tid, {"verdict": "PASS", "summary": "ok", "tests_passed": True}
+    )
     await ts.start_review(pid, tid)
 
     with patch("hiveweave.services.inbox.InboxService.send_message",

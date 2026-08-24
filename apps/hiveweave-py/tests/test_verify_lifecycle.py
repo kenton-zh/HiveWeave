@@ -889,7 +889,13 @@ async def test_verify_pump_wakes_next_after_first_closes(task_env):
         # 前置收口：VERIFY 走完 submit → review approve → 自动 close（真实路径）
         await ts.start_task(pid, first_id)
         await ts.submit_task(
-            pid, first_id, evidence={"tests_passed": True, "test_output": "ok"}
+            pid,
+            first_id,
+            evidence={
+                "verdict": "PASS",
+                "tests_passed": True,
+                "test_output": "ok",
+            },
         )
         await ts.start_review(pid, first_id)
         await ts.review_task(pid, first_id, "approve")

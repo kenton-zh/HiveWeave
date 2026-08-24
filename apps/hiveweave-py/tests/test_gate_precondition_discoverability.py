@@ -187,7 +187,9 @@ async def test_get_tasks_reviewing_verify_baseline_ok(env):
     await svc.claim_task(env["project_id"], tid, env["executor_id"],
                          bypass_verify_serialize=True)
     await svc.start_task(env["project_id"], tid)
-    await svc.submit_task(env["project_id"], tid, {"files": ["a.py"]})
+    await svc.submit_task(
+        env["project_id"], tid, {"verdict": "PASS", "files": ["a.py"]}
+    )
     await svc.start_review(env["project_id"], tid)
 
     result = await _run_get_tasks(env)
@@ -208,7 +210,9 @@ async def test_get_tasks_reviewing_verify_baseline_stale(env):
                          bypass_verify_serialize=True)
     await svc.start_task(env["project_id"], tid)
     await svc.submit_task(
-        env["project_id"], tid, {"target_merge_commit": "abc123"}
+        env["project_id"],
+        tid,
+        {"verdict": "PASS", "target_merge_commit": "abc123"},
     )
     await svc.start_review(env["project_id"], tid)
     await attestation_service.create(
