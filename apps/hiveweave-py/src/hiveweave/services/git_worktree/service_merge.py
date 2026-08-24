@@ -1063,6 +1063,22 @@ async def auto_submit_running_task_after_merge(
     if not candidates:
         return 0, []
 
+    # E8: merge 后整体性检查槽——软件实例静态扫描，merge 成功路径统一入口
+    # （semantic：合成的整体不允许从未被整体性地看过一眼就放行）。FAIL 时
+    # auto-submit evidence 前置 verdict=FAIL + blocking_issues，由 E2 强制
+    # 路由转到 rework；扫描本身只进回执，绝不中断/回滚 merge。
+    integrity = None
+    try:
+        from hiveweave.services.git_worktree.integrity import (
+            run_integrity_checks,
+        )
+
+        integrity = await run_integrity_checks(workspace_path, branch)
+    except Exception as e:
+        log.debug(
+            "git_worktree.integrity_scan_failed", branch=branch, error=str(e)
+        )
+
     now_ms = int(time.time() * 1000)
     submitted: list[str] = []
     submitted_ids: list[str] = []
@@ -1076,6 +1092,14 @@ async def auto_submit_running_task_after_merge(
             "merged_at": now_ms,
             "auto_submitted_by_merge": True,
         }
+        if integrity is not None and not integrity.passed:
+            evidence["verdict"] = "FAIL"
+            evidence["blocking_issues"] = list(integrity.issues)
+            evidence["integrity_check"] = "fail"
+        else:
+            # E1 schema：VERIFY 类候选也必须带 verdict；整体性检查通过 → PASS。
+            evidence["verdict"] = "PASS"
+            evidence["integrity_check"] = "pass"
         try:
             await ts.submit_task(project_id, tid, evidence)
         except Exception as e:
