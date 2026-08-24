@@ -58,3 +58,10 @@ STALL_BREAK_RECENT_OK_MS = 5 * 60 * 1000
 
 DEFAULT_MAX_TOOL_ROUNDS = 600
 """所有角色统一的 tool loop 最大轮次。不再按角色区别对待。"""
+
+# ── 工具结果展示截断（Chat 面板块序列渲染契约）──────────────
+# 唯二截断点：落库（metadata.segments）用 PERSIST，流式广播
+# （tool_call_end / tool_result 事件）用 STREAM。前端 ToolCallRow
+# 再做一次 PERSIST 级二次截断兜底。改阈值须三处同步（本处为唯一来源）。
+TOOL_RESULT_PERSIST_EXCERPT = 2000
+TOOL_RESULT_STREAM_EXCERPT = 500

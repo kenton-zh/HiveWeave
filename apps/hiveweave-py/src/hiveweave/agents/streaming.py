@@ -14,6 +14,7 @@ from typing import Any
 import structlog
 
 from hiveweave.db import meta as meta_db
+from hiveweave.agents.constants import TOOL_RESULT_STREAM_EXCERPT
 from hiveweave.agents.helpers.tools_def import _short_hash
 
 log = structlog.get_logger(__name__)
@@ -26,6 +27,7 @@ async def finalize_streaming_turn(
     content: str | None = None,
     thinking: object | None = None,
     tool_calls_json: str | None = None,
+    metadata: dict | None = None,
     allow_agent_wide_fallback: bool = True,
 ) -> bool:
     """Close this turn's streaming placeholder — never leave a DB orphan.
@@ -42,6 +44,8 @@ async def finalize_streaming_turn(
         attrs["thinking"] = thinking
     if tool_calls_json is not None:
         attrs["tool_calls"] = tool_calls_json
+    if metadata is not None:
+        attrs["metadata"] = metadata
 
     # Never agent-wide-clear if a newer turn already owns another placeholder
     fallback = allow_agent_wide_fallback
@@ -271,7 +275,7 @@ async def on_tool_call(
     if result.get("error") and not content:
         content = f"Error: {result['error']}"
 
-    # 广播工具调用结束
+    # 广播工具调用结束（result 摘要随事件推送，前端折叠行展开用）
     broadcast_stream_event(
         agent,
         {
@@ -279,6 +283,7 @@ async def on_tool_call(
             "tool_name": tool_name,
             "tool_call_id": tool_call_id,
             "success": result.get("success", False),
+            "result": (content or "")[:TOOL_RESULT_STREAM_EXCERPT],
         },
     )
 

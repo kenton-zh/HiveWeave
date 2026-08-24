@@ -148,7 +148,8 @@ class ChatMessageService:
         fields: list[str] = []
         params: list = []
         for key in ("content", "thinking", "tool_calls", "tool_call_id",
-                    "is_read", "is_streaming", "is_context", "is_background"):
+                    "is_read", "is_streaming", "is_context", "is_background",
+                    "metadata"):
             if key in attrs and attrs[key] is not None:
                 val = attrs[key]
                 if key in ("is_read", "is_streaming", "is_context", "is_background"):
@@ -248,9 +249,11 @@ class ChatMessageService:
         "team_from_agent_id, team_to_agent_id, images, metadata, created_at "
         "FROM chat_messages WHERE agent_id = ? "
     )
-    # Chat 主栏：前台人话（真人 user + 对用户的 assistant）。
+    # Chat 主栏：全部 user/assistant（含 background trigger 消息与后台
+    # assistant 回复）。来源区分由 metadata.source / team_from_agent_id
+    # 供前端渲染徽章（用户 / AGENT / 系统 / 看门狗）。
     _PANEL_DIRECT_WHERE = (
-        "AND IFNULL(is_background, 0) = 0 AND role IN ('user', 'assistant') "
+        "AND role IN ('user', 'assistant') "
     )
     # 「团队沟通」信件栏：role=team 或 background user（trigger digest）。
     # 不含 background assistant / 工具芯片。
@@ -311,6 +314,29 @@ class ChatMessageService:
         except Exception as e:
             log.warning("get_panel_messages_other_failed", agent_id=agent_id, error=str(e))
         return self._merge_panel_windows(direct, other)
+
+    async def get_direct_window_messages(
+        self, agent_id: str, limit: int = 100, offset: int = 0
+    ) -> list[dict]:
+        """Main-pane window pagination (same predicate as panel direct window).
+
+        前端「加载更早」用：与 get_panel_messages 的 direct 窗同谓词
+        （role IN user/assistant），offset 向后翻页无缺口；team 不混入。
+        """
+        try:
+            return await self._fetch_recent(
+                agent_id,
+                extra_where=self._PANEL_DIRECT_WHERE,
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as e:
+            log.warning(
+                "get_direct_window_messages_failed",
+                agent_id=agent_id,
+                error=str(e),
+            )
+            return []
 
     async def get_history(self, agent_id: str, limit: int = 200) -> list[dict]:
         """Alias for get_messages."""
@@ -532,10 +558,13 @@ class ChatMessageService:
         # BUG-034 fix: add camelCase aliases — frontend mapDbToChatMessages()
         # reads camelCase but DB columns are snake_case. Without these aliases,
         # isTeamChannelMessage() always returns false and "团队沟通" never shows.
+        # toolCalls 别名（BUG-034 遗漏）：历史消息无 metadata.segments 补偿，
+        # 前端工具行渲染依赖该字段。
         d["isBackground"] = d["is_background"]
         d["isStreaming"] = d["is_streaming"]
         d["isRead"] = d["is_read"]
         d["isContext"] = d["is_context"]
         d["teamFromAgentId"] = d.get("team_from_agent_id")
         d["teamToAgentId"] = d.get("team_to_agent_id")
+        d["toolCalls"] = d.get("tool_calls")
         return d

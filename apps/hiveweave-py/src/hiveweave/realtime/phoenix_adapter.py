@@ -41,6 +41,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from hiveweave.config import settings
 from hiveweave.realtime.event_bus import StatusEventBus, status_event_bus
 
+# 展示截断阈值唯一来源（agents/constants.py）——realtime 只依赖常量，
+# 无环（constants 不 import 任何 hiveweave 模块）。
+from hiveweave.agents.constants import TOOL_RESULT_STREAM_EXCERPT
+
 log = structlog.get_logger(__name__)
 
 # ── 常量 ────────────────────────────────────────────────────
@@ -82,6 +86,12 @@ _EVENT_NAME_MAP: dict[str, str] = {
     "thinking_delta": "stream_chunk",
     "tool_call_start": "stream_tool",
     "tool_call_end": "stream_tool",
+    # streamer 直连路径（solo / 无 agent on_tool_call 包装）广播的原始
+    # 事件——同样归一到 stream_tool，否则前端不监听同名 channel event，
+    # 工具行永远停在 running。agent 正常路径两套广播并存：前端按
+    # tool_call_id 去重（tool_use）+ running-only 更新（tool_result）。
+    "tool_use": "stream_tool",
+    "tool_result": "stream_tool",
     "round_start": "round_start",
     "agent_created": "org_changed",
     "agent_dismissed": "org_changed",
@@ -133,6 +143,34 @@ def _map_event(event: dict) -> tuple[str, dict]:
             "tool_call_id": event.get("tool_call_id", ""),
             "toolCallId": event.get("tool_call_id", ""),
             "success": event.get("success", False),
+            "result": (event.get("result") or "")[:TOOL_RESULT_STREAM_EXCERPT],
+        }
+        return event_name, payload
+
+    # streamer 直连路径的原始 tool_use / tool_result → 归一为与
+    # tool_call_start / tool_call_end 完全相同的 payload 形状。
+    if raw_type == "tool_use":
+        payload = {
+            "type": "tool_use",
+            "toolName": event.get("tool_name", ""),
+            "tool_name": event.get("tool_name", ""),
+            "arguments": event.get("arguments", ""),
+            "tool_call_id": event.get("tool_call_id", ""),
+            "toolCallId": event.get("tool_call_id", ""),
+        }
+        return event_name, payload
+
+    if raw_type == "tool_result":
+        payload = {
+            "type": "tool_result",
+            "toolName": event.get("tool_name", ""),
+            "tool_name": event.get("tool_name", ""),
+            "tool_call_id": event.get("tool_call_id", ""),
+            "toolCallId": event.get("tool_call_id", ""),
+            "success": event.get("success", True),
+            "result": (event.get("content") or event.get("result") or "")[
+                :TOOL_RESULT_STREAM_EXCERPT
+            ],
         }
         return event_name, payload
 
@@ -470,6 +508,7 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
                     "content": message,
                     "is_streaming": False,
                     "is_read": True,
+                    "metadata": {"source": "user"},
                 }
             )
             await send_fn(
@@ -537,6 +576,7 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
                 "role": "user",
                 "content": message,
                 "is_streaming": False,
+                "metadata": {"source": "user"},
             }
         )
         await send_fn(

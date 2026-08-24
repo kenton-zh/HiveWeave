@@ -7,7 +7,11 @@ foreground user/assistant rows sat outside the window. Main pane empty,
 
 Fix: get_panel_messages unions two capped windows that match the frontend
 filters (displayMessages vs isTeamChannelMessage). Mixed get_messages stays
-for agent internals / offset pagination.
+for agent internals.
+
+2026-08 契约更新：direct 窗含 background user/assistant（全量时间线，
+来源由 metadata.source 区分）；offset>0 分页走 direct 窗同谓词
+（get_direct_window_messages），翻页无缺口且不混入 team。
 """
 
 from __future__ import annotations
@@ -78,11 +82,7 @@ def _fake_query(corpus: list[dict]):
         offset = int(params[2]) if len(params) > 2 else 0
         rows = [r for r in corpus if r["agent_id"] == agent_id]
         if _sql_matches(sql, "role IN ('user', 'assistant')"):
-            rows = [
-                r
-                for r in rows
-                if not r["is_background"] and r["role"] in ("user", "assistant")
-            ]
+            rows = [r for r in rows if r["role"] in ("user", "assistant")]
         elif "role = 'team'" in sql:
             rows = [
                 r
@@ -114,9 +114,11 @@ async def test_panel_keeps_old_foreground_when_mixed_window_is_full():
     assert "fg-asst" not in mixed_ids
     assert "fg-user" in panel_ids
     assert "fg-asst" in panel_ids
-    assert "bg-asst" not in panel_ids
-    others = [m for m in panel if m["id"] not in ("fg-user", "fg-asst")]
-    assert len(others) == 100
+    # 新契约：direct 窗含 background user/assistant（全量时间线）
+    assert "bg-asst" in panel_ids
+    assert "bg-user-1" in panel_ids
+    # other 窗（team+bg-user 共 120 行）limit=100 截断：丢最旧 20 → team 50
+    assert sum(1 for m in panel if m["role"] == "team") == 50
     blob = "\n".join(sqls)
     assert ChatMessageService._PANEL_DIRECT_WHERE in blob
     assert ChatMessageService._PANEL_OTHER_WHERE in blob
@@ -126,7 +128,8 @@ async def test_panel_keeps_old_foreground_when_mixed_window_is_full():
     )
 
 
-async def test_panel_direct_window_does_not_include_background_user():
+async def test_panel_direct_window_includes_background_digest():
+    """digest（background user）在主栏可见且 background 标志保留（前端折叠/徽章用）。"""
     corpus = [
         _row("fg", "user", 1, content="human"),
         _row("digest", "user", 2, bg=1, content="trigger"),
@@ -156,16 +159,19 @@ async def test_ui_endpoint_offset_zero_uses_panel_not_mixed():
         mixed.assert_not_called()
 
 
-async def test_ui_endpoint_offset_keeps_mixed_pagination():
+async def test_ui_endpoint_offset_uses_direct_window_pagination():
+    """offset>0 与 direct 窗同谓词翻页（加载更早）——不混 team、无缺口。"""
     with (
         patch.object(chat_api._chat_msg, "get_panel_messages", new_callable=AsyncMock) as panel,
+        patch.object(chat_api._chat_msg, "get_direct_window_messages", new_callable= AsyncMock) as direct,
         patch.object(chat_api._chat_msg, "get_messages", new_callable=AsyncMock) as mixed,
     ):
-        mixed.return_value = [{"id": "page2"}]
+        direct.return_value = [{"id": "page2"}]
         out = await chat_api.chat_messages("a1", limit=100, offset=100)
         assert out == [{"id": "page2"}]
-        mixed.assert_awaited_once_with("a1", limit=100, offset=100)
+        direct.assert_awaited_once_with("a1", limit=100, offset=100)
         panel.assert_not_called()
+        mixed.assert_not_called()
 
 
 async def test_panel_direct_failure_does_not_return_team_only():
@@ -180,3 +186,4 @@ async def test_panel_direct_failure_does_not_return_team_only():
     with patch("hiveweave.services.chat_message.project_db.query", side_effect=boom):
         with pytest.raises(RuntimeError, match="direct db down"):
             await svc.get_panel_messages(AGENT, direct_limit=100, other_limit=100)
+

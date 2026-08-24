@@ -112,10 +112,15 @@ class ToolExecMixin:
             if images:
                 tool_msg["images"] = images
             tool_results.append(tool_msg)
-            # 广播 tool_result
+            # 广播 tool_result（solo/streamer 直连路径的唯一完成信号——
+            # 字段对齐 canonical 的 tool_call_end：name/success 必带，
+            # 否则 adapter 归一化后前端无法落 ✓/✗。error_ids 在本循环
+            # 内先于广播累加，此处读取即最终成败。）
             await self._fire_delta(on_delta, {
                 "type": "tool_result",
                 "tool_call_id": tc["id"],
+                "tool_name": tc["name"],
+                "success": tc["id"] not in error_ids,
                 "content": content,
             })
 

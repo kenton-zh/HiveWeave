@@ -216,6 +216,7 @@ async def send_chat(body: ChatSendBody) -> dict:
                 "is_streaming": False,
                 "is_read": True,
                 "images": body.images,
+                "metadata": {"source": "user"},
             }
         )
         asst = await send_off_duty_auto_reply(agent_id)
@@ -247,6 +248,7 @@ async def send_chat(body: ChatSendBody) -> dict:
             "is_streaming": False,
             "is_read": True,
             "images": body.images,
+            "metadata": {"source": "user"},
         }
     )
 
@@ -320,6 +322,7 @@ async def _route_to_expert(
             "role": "assistant",
             "content": f"[ROUTED] Message routed to {expert_role}.",
             "is_background": True,
+            "metadata": {"source": "system", "kind": "routed"},
         }
     )
     return {"ok": True, "routed": True, "expert": expert_role}
@@ -328,16 +331,19 @@ async def _route_to_expert(
 async def _ui_chat_messages(agent_id: str, limit: int, offset: int) -> list:
     """Chat UI load.
 
-    offset=0: union of two recency windows (up to ``limit`` foreground
+    offset=0: union of two recency windows (up to ``limit`` main-pane
     user/assistant + ``limit`` team/background-user). ``len(rows)`` may be
     up to 2×limit; this is not mixed ``LIMIT limit``.
 
-    offset>0: mixed get_messages pagination for debug dumps — not page 2
-    of the panel union. Frontend Chat does not paginate.
+    offset>0: 主栏同谓词分页（user/assistant 窗口向后翻页）——前端
+    滚动到顶「加载更早」用。与 offset=0 的 direct 窗谓词一致，翻页
+    不会产生缺口；team 消息不混入（团队沟通栏不走此分页）。
     """
     validate_id(agent_id, "agent_id")
     if offset:
-        return await _chat_msg.get_messages(agent_id, limit=limit, offset=offset)
+        return await _chat_msg.get_direct_window_messages(
+            agent_id, limit=limit, offset=offset
+        )
     return await _chat_msg.get_panel_messages(
         agent_id, direct_limit=limit, other_limit=limit
     )

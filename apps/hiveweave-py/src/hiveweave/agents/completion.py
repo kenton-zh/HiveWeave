@@ -17,6 +17,7 @@ from hiveweave.agents.constants import (
     STALL_BREAK_WINDOW_MS,
     STALL_BREAK_PARK_THRESHOLD,
     STALL_BREAK_RECENT_OK_MS,
+    TOOL_RESULT_PERSIST_EXCERPT,
 )
 from hiveweave.agents.helpers.stall import (
     _stall_break_ledger,
@@ -25,6 +26,110 @@ from hiveweave.agents.helpers.stall import (
 )
 
 log = structlog.get_logger(__name__)
+
+# 早收口尾注去重的长度卫兵：预算/截断告警类尾注典型为短文本（≤300 字）。
+# 更长的差量视为正常旁白（如第二条旁白恰好以前一条开头），不折叠——
+# 防止把合法旁白误截成"尾注"。
+_FINAL_TAIL_NOTE_MAX = 300
+
+
+def build_display_segments(
+    tool_turn_messages: list | None,
+    final_content: str,
+    tool_history: list | None,
+) -> list[dict]:
+    """把一个 turn 的 tool_turn_messages 展平为有序展示块序列。
+
+    供前端 Chat 主栏做 DSH 风格整轮渲染（旁白→工具→旁白→…按时间序）。
+    - assistant(content) → text 块
+    - assistant(tool_calls) → 每个调用一个 tool_call 块
+    - tool 结果 → 按 tool_call_id 回填到对应块（result 截断 + ok/error）
+    - final_content 兜底：若末尾 text 块与之不同则追加（部分提前收口
+      路径 final 不在 tool_turn_messages 里）
+    """
+    segs: list[dict] = []
+    ok_map: dict[str, bool] = {}
+    for e in tool_history or []:
+        if isinstance(e, dict) and e.get("id"):
+            ok_map[str(e["id"])] = bool(e.get("ok", True))
+
+    def _attach_result(tc_id: str | None, text: str) -> None:
+        if not tc_id:
+            return
+        for seg in reversed(segs):
+            if seg["type"] == "tool_call" and seg.get("id") == tc_id:
+                seg["result"] = text[:TOOL_RESULT_PERSIST_EXCERPT]
+                seg["status"] = "ok" if ok_map.get(tc_id, True) else "error"
+                return
+
+    for m in tool_turn_messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "assistant":
+            content = m.get("content")
+            if content:
+                segs.append({"type": "text", "content": content})
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = (
+                        json.loads(raw_args)
+                        if isinstance(raw_args, str)
+                        else (raw_args or {})
+                    )
+                except Exception:
+                    args = {"_raw": str(raw_args)[:500]}
+                segs.append({
+                    "type": "tool_call",
+                    "tool": fn.get("name", "?"),
+                    "id": tc.get("id"),
+                    "input": args,
+                    "status": "running",
+                })
+        elif role == "tool":
+            _attach_result(
+                m.get("tool_call_id"), str(m.get("content") or "")
+            )
+
+    for seg in segs:
+        if seg["type"] == "tool_call" and seg.get("status") == "running":
+            seg["status"] = (
+                "ok" if ok_map.get(str(seg.get("id")), True) else "error"
+            )
+
+    # 提前收口路径（budget_exhausted 等）final = 各轮文本拼接 + 尾注，
+    # 且该拼接段已作为最后一条 assistant 消息进入 tool_turn_messages ——
+    # 直接保留会整轮复述。识别「最后 text 段 == 前段拼接 + 短尾注」结构，
+    # 只保留尾注差量。
+    # 文本一致性：尾注保留原文（含前导 \n\n 分隔符），各 text 段拼接后
+    # 与 content 列逐字一致；前端按块渲染，分隔符自然呈现为段间留白。
+    text_idx = [i for i, s in enumerate(segs) if s["type"] == "text"]
+    if text_idx and final_content:
+        last_i = text_idx[-1]
+        last_text = segs[last_i]["content"]
+        joined_prev = "".join(segs[i]["content"] for i in text_idx[:-1])
+        if final_content == last_text and joined_prev and last_text.startswith(joined_prev):
+            tail = last_text[len(joined_prev):]
+            if not tail.strip():
+                segs.pop(last_i)
+            elif len(tail) <= _FINAL_TAIL_NOTE_MAX:
+                segs[last_i] = {"type": "text", "content": tail}
+            # 长差量 = 正常旁白复述结构不成立 → 原样保留（final==last 无重复）
+        elif final_content != last_text:
+            joined_all = joined_prev + last_text
+            if joined_all and final_content.startswith(joined_all):
+                # final = 已有全部段落拼接 + 差量：只追加差量（任意长度），
+                # 总拼接仍与 content 列逐字一致，且零复述。
+                tail = final_content[len(joined_all):]
+                if tail.strip():
+                    segs.append({"type": "text", "content": tail})
+            else:
+                segs.append({"type": "text", "content": final_content})
+    elif final_content and not text_idx:
+        segs.append({"type": "text", "content": final_content})
+    return segs
 
 
 async def handle_completion(
@@ -110,11 +215,20 @@ async def handle_completion(
         tool_calls_json = (
             json.dumps(tool_calls, ensure_ascii=False) if tool_calls else "[]"
         )
+        # 整轮块序列（旁白/工具按时间序 + 工具结果摘要）→ metadata.segments，
+        # 前端 done 后 reload 仍按流式期间的完整时间线渲染。
+        display_segments = build_display_segments(
+            tool_turn_messages, content, tool_calls
+        )
+        save_metadata = (
+            {"segments": display_segments} if display_segments else None
+        )
         if agent._streaming_msg_id:
             cleared = await agent._finalize_streaming_turn(
                 content=content,
                 thinking=thinking if thinking is not None else None,
                 tool_calls_json=tool_calls_json,
+                metadata=save_metadata,
             )
             if not cleared:
                 _save_failed = True
@@ -129,6 +243,7 @@ async def handle_completion(
                     "tool_calls": tool_calls_json,
                     "is_streaming": False,
                     "is_background": True if is_trigger else False,
+                    **({"metadata": save_metadata} if save_metadata else {}),
                 }
             )
     except Exception as e:
