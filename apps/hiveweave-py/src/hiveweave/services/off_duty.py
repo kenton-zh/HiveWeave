@@ -49,6 +49,7 @@ async def send_off_duty_auto_reply(agent_id: str) -> dict:
             "is_streaming": False,
             "is_background": False,
             "is_read": True,
+            "metadata": {"source": "system", "kind": "off_duty_auto_reply"},
         }
     )
 

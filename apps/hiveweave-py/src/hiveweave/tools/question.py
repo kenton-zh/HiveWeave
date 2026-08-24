@@ -160,6 +160,7 @@ async def execute_question(
                 "is_streaming": False,
                 "is_background": False,
                 "is_read": True,
+                "metadata": {"source": "user", "kind": "question_answer"},
             })
         except Exception as exc:
             log.warning("question.answer_chat_failed", error=str(exc))

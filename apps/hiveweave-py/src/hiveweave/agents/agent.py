@@ -565,15 +565,28 @@ class Agent:
                     # 落库标志一致（background + context + team 归属），否则
                     # 前端会把它渲染成主聊用户气泡（蓝泡泄漏）。
                     is_trigger_wake = bool(opts.get("trigger"))
+                    _from_agent = opts.get("from_agent_id")
+                    if is_trigger_wake:
+                        # lazy import — trigger.py 顶部依赖 agent 模块，顶层互导成环
+                        from hiveweave.agents.trigger import classify_digest_source
+                        _digest_source = classify_digest_source(
+                            _from_agent, display_message
+                        )
+                    else:
+                        _digest_source = "user"
                     await self._chat_msg.save_message({
                         "agent_id": self.id, "role": "user",
                         "content": display_message,
                         "is_background": is_trigger_wake, "is_read": False,
                         **({
                             "is_context": True,
-                            "team_from_agent_id": opts.get("from_agent_id"),
+                            "team_from_agent_id": _from_agent,
                             "team_to_agent_id": self.id,
-                        } if is_trigger_wake else {}),
+                            "metadata": {
+                                "source": _digest_source,
+                                "from_agent_id": _from_agent,
+                            },
+                        } if is_trigger_wake else {"metadata": {"source": "user"}}),
                     })
                 log.info("chat_queued", agent_id=self.id,
                          queue_len=len(self._message_queue),
@@ -2857,6 +2870,7 @@ class Agent:
         content: str | None = None,
         thinking: object | None = None,
         tool_calls_json: str | None = None,
+        metadata: dict | None = None,
         allow_agent_wide_fallback: bool = True,
     ) -> bool:
         """Close this turn's streaming placeholder — never leave a DB orphan.
@@ -2865,7 +2879,7 @@ class Agent:
         Callers used to clear ``_streaming_msg_id`` anyway → true orphans.
         This helper only drops the in-memory pointer after a confirmed clear.
         """
-        return await _agent_streaming.finalize_streaming_turn(self, msg_id=msg_id, content=content, thinking=thinking, tool_calls_json=tool_calls_json, allow_agent_wide_fallback=allow_agent_wide_fallback)
+        return await _agent_streaming.finalize_streaming_turn(self, msg_id=msg_id, content=content, thinking=thinking, tool_calls_json=tool_calls_json, metadata=metadata, allow_agent_wide_fallback=allow_agent_wide_fallback)
 
     def _reset_to_idle(self) -> None:
         """重置到 idle 状态。
@@ -2941,6 +2955,7 @@ class Agent:
                 "tool_calls": "[]",
                 "is_streaming": False,
                 "is_background": False,
+                "metadata": {"source": "system", "kind": "platform_notice"},
             })
             from hiveweave.realtime.event_bus import status_event_bus
 

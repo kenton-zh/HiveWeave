@@ -39,6 +39,24 @@ TRIGGER_DELAY_MS = 100
 CHAT_CALL_TIMEOUT_MS = 30_000
 """trigger 调用 chat 的超时（对齐 Elixir agent.ex:264 GenServer.call 30_000）。"""
 
+# digest 来源分类标记：命中即视为平台看门狗/定时器唤醒（区别于普通系统
+# 触发），供前端 Chat 主栏徽章区分。新 watchdog 文案需同步此表。
+_WATCHDOG_CONTEXT_MARKERS = ("看门狗", "[SILENCE]", "[WAIT_TIMEOUT]")
+
+
+def classify_digest_source(from_agent_id: str | None, context: str) -> str:
+    """digest 消息来源分类（metadata.source）。
+
+    - 具名 agent（非 system）来信 → agent
+    - 无来信但 digest 含 watchdog 标记 → watchdog
+    - 其余（定时/平台/自触发）→ system
+    """
+    if from_agent_id and from_agent_id != "system":
+        return "agent"
+    if any(k in (context or "") for k in _WATCHDOG_CONTEXT_MARKERS):
+        return "watchdog"
+    return "system"
+
 SELF_RETRIGGER_DELAY_MS = 500
 """自检 retrigger 前的延迟（对齐 Elixir agent.ex:900 Process.sleep(500)）。"""
 
@@ -719,6 +737,12 @@ async def _do_trigger(agent_id: str, trigger_type: str, *,
                     "is_context": True,
                     "team_from_agent_id": from_agent_id,
                     "team_to_agent_id": agent_id,
+                    "metadata": {
+                        "source": classify_digest_source(
+                            from_agent_id, chat_context
+                        ),
+                        "from_agent_id": from_agent_id,
+                    },
                 }
             )
             digest_msg_id = saved.get("id") if isinstance(saved, dict) else None
