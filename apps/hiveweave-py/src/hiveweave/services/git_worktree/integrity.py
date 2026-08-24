@@ -10,8 +10,15 @@ admin 路由导入失败被静默吞掉后挂空 router，启动零报错 → F1
 - FAIL → merge 回执带 blocking_issues；auto-submit 时 evidence 前置
   verdict=FAIL，由既有 E2 强制路由转到 rework（消费方是代码不是提示词）。
 
-领域扩展位：``INTEGRITY_CHECKERS`` 按仓库类型注册——小说 = 并稿一致性 /
-伏笔回收（LLM 审校任务承担）；视频 = 拉通播放抽检。本轮只交付软件实例。
+领域扩展位：后续按仓库类型注册 checker（小说 = 并稿一致性；视频 = 拉通
+播放抽检）。本轮只交付软件实例。
+
+审计修正（2026-08-25 code review）：
+- except 块识别鲁棒化：覆盖 ``except Exception as e:`` / 多异常 / 跨行括号；
+- 判定行序无关：先扫完整块再统一判定（显式 log/raise 放行，不依赖行位置）；
+- 显式标记只匹配语句（去行尾注释），避免 ``pass  # log.x`` / 字符串误放行；
+- merge 后文件列表用 ``git diff HEAD^1 HEAD``（diff-tree 对 merge commit
+  输出为空、``main...HEAD`` 在 main==HEAD 时无差异——两个实测空路径）。
 """
 
 from __future__ import annotations
@@ -24,12 +31,10 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-_SILENT_EXCEPT_RE = re.compile(
-    r"^\s*except(\s+\(?(Exception|BaseException)\)?)?\s*:"
-)
-_PASS_ONLY_RE = re.compile(r"^\s*pass\s*(#.*)?$")
+_EXCEPT_START_RE = re.compile(r"^\s*except\b")
+_PASS_ONLY_RE = re.compile(r"^\s*pass\s*$")
 _FALLBACK_ASSIGN_RE = re.compile(
-    r"^\s*[\w.]+\s*=\s*(APIRouter\s*\(\s*\)|\[\s*\]|\{\s*\}|None)\s*(#.*)?$"
+    r"^\s*[\w.]+\s*=\s*(APIRouter\s*\(\s*\)|\[\s*\]|\{\s*\}|None)\s*$"
 )
 _EXPLICIT_MARKERS = ("log.", "logger.", "raise ")
 
@@ -39,24 +44,38 @@ _EXCEPT_BLOCK_LOOKAHEAD = 6
 
 @dataclass
 class IntegrityReport:
-    """整体性检查回执。``passed=False`` ⇒ ``issues`` 即 blocking 清单。"""
+    """整体性检查回执。
+
+    - ``passed=False`` ⇒ ``issues`` 即 blocking 清单。
+    - ``skipped=True`` ⇒ 未扫描（如无 workspace），**不视为 FAIL**——调用方
+      不得据 skipped 注入 verdict，宁可保持无字段由既有闸门兜底。
+    """
 
     checks: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
+    skipped: bool = False
 
     @property
     def passed(self) -> bool:
         return not self.issues
 
 
+def _strip_comment(line: str) -> str:
+    """去行尾注释——显式标记判定只看语句，不看注释。"""
+    return re.sub(r"#.*$", "", line).rstrip()
+
+
 def scan_silent_swallow(text: str, path_label: str) -> list[str]:
     """扫描单文件：``except`` 收敛块内的静默降级兜底。
 
-    判定口径（对齐 F1 指纹）：
+    判定口径（对齐 F1 指纹 + 审计修正）：
     - except 块内含 ``x = APIRouter()`` / 空 list/dict / ``None`` 兜底 → 红牌
       （启动零报错，合成整体被换成一个空壳）。
     - except 块内仅 ``pass``、无日志/上抛 → 红牌（静默吞错）。
-    - except 块内含 ``log.*`` / ``logger.*`` / ``raise`` → 显式降级，放行。
+    - except 块内含 ``log.*`` / ``logger.*`` / ``raise`` → 显式降级，放行；
+      **先扫完整块再统一判定**，与行顺序无关。注释里的 ``log.``/``raise``
+      不参与判定。跨行括号 except（``except (A,\n B):``）识别后块从 ``:`` 行
+      之后开始。
     """
     issues: list[str] = []
     lines = (text or "").splitlines()
@@ -64,53 +83,66 @@ def scan_silent_swallow(text: str, path_label: str) -> list[str]:
     i = 0
     while i < n:
         line = lines[i]
-        if not _SILENT_EXCEPT_RE.match(line):
+        if not _EXCEPT_START_RE.match(line):
             i += 1
             continue
-        base_indent = len(line) - len(line.lstrip())
+        # 跨行 except 签名：吞到包含 ':' 的行
+        j = i
+        while ":" not in line and j + 1 < n:
+            j += 1
+            line = lines[j]
+        base_indent = len(lines[i]) - len(lines[i].lstrip())
         block_found: list[str] = []
         explicit = False
-        j = i + 1
-        while j < n and j <= i + _EXCEPT_BLOCK_LOOKAHEAD:
-            bl = lines[j]
+        k = j + 1
+        while k < n and k <= j + _EXCEPT_BLOCK_LOOKAHEAD:
+            bl = lines[k]
             if not bl.strip():
-                j += 1
+                k += 1
                 continue
             indent = len(bl) - len(bl.lstrip())
             if indent <= base_indent:
                 break  # dedent，except 块结束
-            if _FALLBACK_ASSIGN_RE.match(bl):
+            code = _strip_comment(bl)
+            if not code.strip():
+                k += 1
+                continue
+            if _FALLBACK_ASSIGN_RE.match(code):
                 block_found.append(
-                    f"{path_label}:{j + 1} 静默降级兜底（except 内挂空 "
+                    f"{path_label}:{k + 1} 静默降级兜底（except 内挂空 "
                     "APIRouter/空值）；请 fail-fast 或显式降级日志"
                 )
-                break
-            if _PASS_ONLY_RE.match(bl):
+            elif _PASS_ONLY_RE.match(code):
                 block_found.append(
-                    f"{path_label}:{j + 1} 静默吞错（except 内仅 pass）"
+                    f"{path_label}:{k + 1} 静默吞错（except 内仅 pass）"
                 )
-            if any(mk in bl for mk in _EXPLICIT_MARKERS):
+            if any(mk in code for mk in _EXPLICIT_MARKERS):
                 explicit = True
-                break
-            j += 1
+            k += 1
         if block_found and not explicit:
             issues.extend(block_found)
-        i += 1
+        i = j + 1
     return issues
 
 
 async def _changed_python_files(workspace_path: str) -> list[str]:
-    """merge 落 MAIN 引入的 .py 文件（复用处：merge success 后 HEAD 即 merge commit）。"""
+    """merge 落 MAIN 引入的 .py 文件。
+
+    审计修正：merge 成功且 worktree 停靠于 merge commit 时，
+    ``git diff --name-only HEAD^1 HEAD`` 精确列出「相对第一父」的变更
+    （即被合并分支引入的文件）；``git diff-tree -r HEAD`` 对 2 父 merge
+    输出为空、``git diff main...HEAD`` 在 main==HEAD 时无差异——两条旧路
+    径均实测返回空。non-merge 提交或首个提交时回退到 diff-tree。
+    """
     from hiveweave.services.git_worktree.git_cmd import _git as _run_git
 
     rels: list[str] = []
     try:
         ok, out = await _run_git(
-            ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-            workspace_path,
+            ["diff", "--name-only", "HEAD^1", "HEAD"], workspace_path
         )
     except Exception as e:
-        log.debug("integrity_diff_tree_failed", error=str(e))
+        log.debug("integrity_diff_first_parent_failed", error=str(e))
         ok, out = False, ""
     if ok and out:
         rels = [
@@ -119,10 +151,10 @@ async def _changed_python_files(workspace_path: str) -> list[str]:
             if ln.strip().endswith(".py")
         ]
     if not rels:
-        # 兜底：差集扫描（no-op merge / 已合入场景）
         try:
             ok2, out2 = await _run_git(
-                ["diff", "--name-only", "main...HEAD"], workspace_path
+                ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+                workspace_path,
             )
         except Exception:
             ok2, out2 = False, ""
@@ -141,11 +173,13 @@ async def run_integrity_checks(
     """merge 后整体性检查（软件实例：静默吞错扫描）。
 
     纯静态、同步 IO、毫秒级；失败只进回执，绝不中断 merge 本身。
-    领域扩展位在这里：后续按仓库类型选择 checker 集合。
+    审计修正：无 workspace → ``skipped=True``（fail-open 口径与文档一致，
+    不把「未扫描」误判为 FAIL）。
     """
     report = IntegrityReport(checks=["software: silent-swallow scan"])
     if not workspace_path:
-        report.issues.append("integrity scan skipped: no workspace")
+        report.skipped = True
+        report.checks.append("skipped: no workspace")
         return report
     files = await _changed_python_files(workspace_path)
     for rel in files:

@@ -116,6 +116,30 @@ def is_capacity_error(message: str) -> bool:
     return any(n in m for n in _CAPACITY_NEEDLES)
 
 
+# 窗口词：容量错误触发「项目级暂停」需要重置窗口信号（daily/hourly/window/
+# reset 或中文 日/小时/窗口/滚动），避免把普通每分钟限流误判成 1 小时暂停。
+_WINDOW_NEEDLES: tuple[str, ...] = (
+    "window", "daily", "hourly", "reset",
+    "滚动", "窗口", "日配额", "每日", "小时",
+)
+
+
+def is_window_quota_error(message: str, *, is_daily: bool = False) -> bool:
+    """容量错误且带明确窗口重置信号（可安全做项目级暂停）。
+
+    比 ``is_capacity_error`` 更窄：后者只用于 RetryHandler「不逐次重试」
+    （宽判防白撞），前者用于「组织级降速到重置窗口」（窄判防过度冷却）。
+    """
+    if is_daily:
+        return True
+    if not message:
+        return False
+    m = str(message).lower()
+    if not is_capacity_error(m):
+        return False
+    return any(w in m for w in _WINDOW_NEEDLES)
+
+
 def matches_retryable_message(value: str) -> bool:
     """判断错误文本是否命中可重试内容模式（厂商无关）。
 

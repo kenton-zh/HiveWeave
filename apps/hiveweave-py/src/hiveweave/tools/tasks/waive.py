@@ -183,9 +183,12 @@ async def waive_attestation_tool(
 
     # E3 waiver 治理（复盘致命链一）：verdict=FAIL 的结论不可豁免。
     # waiver 的豁免边界是「凭证缺失」，永不覆盖「结论不合格」——FAIL 只能
-    # 走 rework 修复翻转 verdict。get_task 已把 evidence 反序列化为 dict。
-    verdict = task.get("evidence") or {}
-    if isinstance(verdict, dict) and verdict.get("verdict") == "FAIL":
+    # 走 rework 修复翻转 verdict。get_task 已把 evidence 反序列化为 dict，
+    # normalize_verdict 统一大小写（存量小写形态同样拦截）。
+    from hiveweave.services.tasks.verify import normalize_verdict
+
+    ev = task.get("evidence") or {}
+    if isinstance(ev, dict) and normalize_verdict(ev.get("verdict")) == "FAIL":
         return ToolResult.err(
             "waive_attestation rejected: task evidence verdict=FAIL——"
             "结论不合格不可豁免（waiver 只豁免凭证缺失，请走 rework 返修）"
@@ -202,7 +205,8 @@ async def waive_attestation_tool(
         return ToolResult.err(
             "waive_attestation rejected: 你所在 turn 刚被断流/打断（降级中）"
             "且名下仍有未闭环 VERIFY 验收义务——禁止就地 waiver 收口。"
-            "请先续跑完成验收，或显式升级 coordinator 处理。"
+            "可执行两步：① 续跑完成这一轮（正常完成一轮后平台自动清除降级"
+            "标志），完成验收后再提交；② 或显式升级 coordinator/CEO 处理。"
         )
 
     # Lifetime cap — escape hatch must stay narrower than the front door

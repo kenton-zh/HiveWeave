@@ -42,6 +42,20 @@ def is_verify_title(title: str | None) -> bool:
     return isinstance(title, str) and bool(_VERIFY_TITLE_RE.match(title))
 
 
+def normalize_verdict(value: Any) -> str | None:
+    """verdict 唯一权威入口：归一到大写 ``PASS``/``FAIL``。
+
+    E1–E4 四道闸门统一走这里（复盘审计：exact "FAIL" 比较会让存量小写
+    形态穿透 E2 approve → 自动 close，复现「吞 FAIL」事故）。非法值/非
+    字符串 → None（由 E1 的硬校验负责拒绝，E2/E3/E4 对 None 视为无 verdict）。
+    """
+    if isinstance(value, str):
+        v = value.strip().upper()
+        if v in ("PASS", "FAIL"):
+            return v
+    return None
+
+
 def evidence_merge_recorded(task: dict | None) -> bool:
     """True when evidence records a merge covering the current approved revision.
 

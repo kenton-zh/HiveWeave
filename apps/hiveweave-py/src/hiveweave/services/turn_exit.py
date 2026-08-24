@@ -1118,7 +1118,7 @@ async def ceo_project_pending_obligations(
         cursor = await conn.execute(
             "SELECT COUNT(*) AS c FROM tasks "
             "WHERE is_archived = 0 AND status NOT IN ('closed','cancelled') "
-            "AND json_extract(evidence, '$.verdict') = 'FAIL'"
+            "AND upper(json_extract(evidence, '$.verdict')) = 'FAIL'"
         )
         row = await cursor.fetchone()
         await cursor.close()

@@ -1092,14 +1092,23 @@ async def auto_submit_running_task_after_merge(
             "merged_at": now_ms,
             "auto_submitted_by_merge": True,
         }
-        if integrity is not None and not integrity.passed:
-            evidence["verdict"] = "FAIL"
-            evidence["blocking_issues"] = list(integrity.issues)
-            evidence["integrity_check"] = "fail"
-        else:
-            # E1 schema：VERIFY 类候选也必须带 verdict；整体性检查通过 → PASS。
-            evidence["verdict"] = "PASS"
-            evidence["integrity_check"] = "pass"
+        if integrity is not None:
+            if integrity.skipped:
+                # 未扫描：不写 verdict/integrity 字段（VERIFY 候选会被 E1
+                # 硬拒——fail-safe，宁可拒勿假 PASS；非 VERIFY 正常提交）。
+                pass
+            elif not integrity.passed:
+                # E8 整体性 FAIL → FAIL verdict + blocking_issues，E2 强制
+                # rework（对非 VERIFY 实现任务同样生效——integrity_check=fail）。
+                evidence["verdict"] = "FAIL"
+                evidence["blocking_issues"] = list(integrity.issues)
+                evidence["integrity_check"] = "fail"
+            else:
+                # 通过：VERIFY 候选需带 verdict（E1 schema），非 VERIFY
+                # 只记回执不写终验语义字段（审计修正：避免污染证据链）。
+                evidence["integrity_check"] = "pass"
+                if bool(ts._is_verify_task(t)):
+                    evidence["verdict"] = "PASS"
         try:
             await ts.submit_task(project_id, tid, evidence)
         except Exception as e:

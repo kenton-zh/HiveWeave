@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
+from .verify import normalize_verdict
 
 log = structlog.get_logger(__name__)
 
@@ -51,13 +52,14 @@ class SubmitMixin:
             # 用 FAIL 提交替豁免收口（复盘终验三连打断后 waiver 收口）。
             if (
                 isinstance(evidence, dict)
-                and evidence.get("verdict") == "FAIL"
+                and normalize_verdict(evidence.get("verdict")) == "FAIL"
                 and self._is_degraded_assignee(task)
             ):
                 raise ValueError(
                     "SUBMIT REJECTED (degraded verify): 你所在 turn 刚被断流/"
-                    "打断（降级中）且正提交 FAIL 终验——禁止就地收口，"
-                    "请续跑完成重新验证，或显式升级 coordinator。"
+                    "打断（降级中）且正提交 FAIL 终验——禁止就地收口。可执行"
+                    "两步：① 续跑完成这一轮（正常完成一轮后平台自动清除降级"
+                    "标志），完成重新验证后再提交；② 或显式升级 coordinator/CEO。"
                 )
 
         # SUBMITTED MACHINE PRE-RUN (slice-driven L0)
@@ -197,13 +199,14 @@ class SubmitMixin:
                 "SUBMIT VERDICT REJECTED (verify task): "
                 "evidence 必须是 dict 才能判定 verdict"
             )
-        verdict = evidence.get("verdict")
-        if verdict not in ("PASS", "FAIL"):
-            missing = "verdict" if verdict is None else f"verdict={verdict!r}"
+        verdict = normalize_verdict(evidence.get("verdict"))
+        if verdict is None:
+            raw = evidence.get("verdict")
+            missing = "verdict" if raw in (None, "") else f"verdict={raw!r}"
             raise ValueError(
                 "SUBMIT VERDICT REJECTED (verify task): "
                 f"evidence 缺判定字段（缺：{missing}），"
-                "期望 verdict ∈ {PASS, FAIL}"
+                "期望 verdict ∈ {PASS, FAIL}（大小写不敏感）"
             )
         if verdict == "FAIL":
             blocking = evidence.get("blocking_issues")

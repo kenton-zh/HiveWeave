@@ -103,6 +103,28 @@ class SubmitTaskParams(BaseModel):
             ]
         },
     )
+    verdict: str | None = Field(
+        default=None,
+        description=(
+            "VERIFY tasks ONLY (title starts with 'VERIFY:'): structured "
+            "conclusion — exactly 'PASS' or 'FAIL' (case-insensitive). "
+            "Missing verdict on a VERIFY task is hard-rejected by E1. "
+            "verdict=FAIL additionally requires blockingIssues."
+        ),
+        json_schema_extra={"aliases": ["verdict", "conclusion"]},
+    )
+    blocking_issues: list[str] | None = Field(
+        default=None,
+        alias="blockingIssues",
+        description=(
+            "VERIFY tasks ONLY: when verdict=FAIL, the blocking defect list "
+            "that must be fixed (non-empty required — E1 hard gate). "
+            "Routes the task to rework on approve (E2)."
+        ),
+        json_schema_extra={
+            "aliases": ["blockingIssues", "blocking_issues", "blocking"]
+        },
+    )
     commit_hash: str | None = Field(
         default=None,
         alias="commitHash",
@@ -431,6 +453,15 @@ async def _submit_preflight(
         evidence["core_interaction_executed"] = True
     if getattr(params, "failures_acknowledged", None):
         evidence["failures_acknowledged"] = params.failures_acknowledged
+    # E1 通道：VERIFY 任务的 verdict / blockingIssues 透传进 evidence
+    # （service 层硬校验依赖这两个字段；缺失时由 E1 硬拒并给出明确文案）。
+    from hiveweave.services.tasks.verify import normalize_verdict
+
+    if getattr(params, "verdict", None):
+        nv = normalize_verdict(params.verdict)
+        evidence["verdict"] = nv if nv else str(params.verdict).strip()
+    if getattr(params, "blocking_issues", None):
+        evidence["blocking_issues"] = list(params.blocking_issues)
     if getattr(params, "env_snapshot", None):
         evidence["env_snapshot"] = str(params.env_snapshot)[:4000]
     if params.files_changed:

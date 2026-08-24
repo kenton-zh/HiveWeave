@@ -83,6 +83,102 @@ async def test_verify_submit_rejects_invalid_verdict(task_env):
 
 
 @pytest.mark.asyncio
+async def test_verify_submit_rejects_non_dict_evidence(task_env):
+    """E1-审计：evidence 非 dict（str/None）→ 硬拒。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    vid = await _mk_verify_running(ts, pid)
+    with pytest.raises(ValueError) as ei:
+        await ts.submit_task(pid, vid, evidence="not-a-dict")  # type: ignore[arg-type]
+    assert "dict" in str(ei.value)
+    assert (await ts.get_task(pid, vid))["status"] == "running"
+    with pytest.raises(ValueError):
+        await ts.submit_task(pid, vid, evidence=None)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_verify_submit_accepts_lowercase_verdict(task_env):
+    """E1-审计归一：verdict 大小写不敏感（fail/pass 归一后判定）。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    vid = await _mk_verify_running(ts, pid)
+    await ts.submit_task(pid, vid, evidence={"verdict": "pass", "done": True})
+    assert (await ts.get_task(pid, vid))["status"] == "submitted"
+
+    vid2 = await _mk_verify_running(ts, pid)
+    await ts.submit_task(
+        pid, vid2, evidence={"verdict": "FAIL", "blocking_issues": ["f"]}
+    )
+    assert (await ts.get_task(pid, vid2))["status"] == "submitted"
+
+
+# ── G1 审计：工具层 verdict 通道（submit_task_tool → evidence）───
+
+
+@pytest.mark.asyncio
+async def test_submit_tool_carries_verdict_into_evidence(task_env):
+    """submit_task_tool 带 verdict/blockingIssues → service 收到含 verdict 的 evidence。"""
+    from hiveweave.tools.task_tools import SubmitTaskParams, submit_task_tool
+
+    ts = TaskService()
+    pid = task_env["project_id"]
+    vid = await _mk_verify_running(ts, pid)
+
+    from pathlib import Path
+
+    (Path(task_env["workspace"]) / "a.py").write_text("x = 1\n")
+
+    captured: dict = {}
+
+    async def _capture_submit(self, p, tid, evidence):
+        captured["evidence"] = dict(evidence)
+
+    with (
+        patch(
+            "hiveweave.tools.helpers.get_project_id",
+            new=AsyncMock(return_value=pid),
+        ),
+        patch(
+            "hiveweave.db.meta.get_agent_project_id",
+            new=AsyncMock(return_value=pid),
+        ),
+        patch(
+            "hiveweave.services.attestation.required_attestation_kinds",
+            return_value=frozenset(),
+        ),
+        patch(
+            "hiveweave.services.attestation.has_valid_waiver",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "hiveweave.services.attestation.attestation_service.find_recent_for_agent",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "hiveweave.services.attestation.attestation_service.verify_ids",
+            new=AsyncMock(return_value=(True, "")),
+        ),
+        patch(
+            "hiveweave.services.task.TaskService.submit_task",
+            new=_capture_submit,
+        ),
+    ):
+        params = SubmitTaskParams(
+            taskId=vid,
+            summary="终验完成",
+            testsPassed=True,
+            verdict="FAIL",
+            blockingIssues=["/_admin 全线 404"],
+            filesChanged=["a.py"],
+        )
+        result = await submit_task_tool(params, EXEC, task_env["workspace"])
+
+    assert result.success is True, result.error
+    assert captured["evidence"].get("verdict") == "FAIL"
+    assert captured["evidence"].get("blocking_issues") == ["/_admin 全线 404"]
+
+
+@pytest.mark.asyncio
 async def test_verify_submit_accepts_valid_verdict(task_env):
     """E1-③合法 evidence 通过：PASS（无 blocking_issues）与 FAIL（带清单）均可提交。"""
     ts = TaskService()

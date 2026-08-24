@@ -52,15 +52,38 @@ def _run_sync(coro):
 
 
 def test_fallback_uses_configured_row_fallback():
-    """E6-①模型行显式 fallback 优先，且不绕过 tried 防环。"""
+    """E6-①模型行显式 fallback 优先（active + 异 key），且不绕过 tried 防环。"""
     provider = _FakeProvider()
     provider.fallback = "row-backup"
-    config = {"name": "A", "tier": "executor", "api_key": "k", "id": "u"}
-    assert _run_sync(Streamer._resolve_fallback_name(provider, config, set())) == "row-backup"
+    config = {"name": "A", "tier": "executor", "api_key": "key-A", "id": "u"}
+    with patch("hiveweave.services.model.ModelService") as MS:
+        MS.return_value.get = AsyncMock(
+            return_value={"name": "row-backup", "api_key": "key-B", "is_active": True}
+        )
+        assert _run_sync(
+            Streamer._resolve_fallback_name(provider, config, set())
+        ) == "row-backup"
     # 已在 tried（递归防环内）→ 不再返回
-    assert _run_sync(
-        Streamer._resolve_fallback_name(provider, config, {"row-backup"})
-    ) is None
+    with patch("hiveweave.services.model.ModelService") as MS2:
+        MS2.return_value.get = AsyncMock(
+            return_value={"name": "row-backup", "api_key": "key-B", "is_active": True}
+        )
+        assert _run_sync(
+            Streamer._resolve_fallback_name(provider, config, {"row-backup"})
+        ) is None
+
+
+def test_fallback_configured_row_same_key_rejected():
+    """E6-审计：手填 fallback 与推导路径同守 same-key 闸（共享配额切换无意义）。"""
+    provider = _FakeProvider()
+    provider.fallback = "row-backup"
+    config = {"name": "A", "tier": "executor", "api_key": "shared-1", "id": "u"}
+    with patch("hiveweave.services.model.ModelService") as MS:
+        MS.return_value.get = AsyncMock(
+            return_value={"name": "row-backup", "api_key": "shared-1", "is_active": True}
+        )
+        fb = _run_sync(Streamer._resolve_fallback_name(provider, config, set()))
+    assert fb is None
 
 
 def test_fallback_derives_tier_backup():

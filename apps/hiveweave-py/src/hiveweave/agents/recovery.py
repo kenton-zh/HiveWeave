@@ -81,10 +81,35 @@ def _is_interruption_break(error: Exception) -> bool:
     waiver 捷径。普通限流 / 业务错误不计入。
     """
     msg = str(error).lower()
+    # 类型级判定优先（比消息子串稳——避免 "SSL certificate" 等配置类文案
+    # 误标降级）：httpx 流层 / ssl / 读超时 / asyncio 超时（stream idle）。
+    try:
+        import asyncio as _aio
+        import http.client as _http
+
+        import httpx
+        import ssl
+
+        if isinstance(
+            error,
+            (
+                ssl.SSLError,
+                httpx.RemoteProtocolError,
+                httpx.ReadError,
+                httpx.ReadTimeout,
+                httpx.WriteTimeout,
+                httpx.ConnectError,
+                httpx.PoolTimeout,
+                _aio.TimeoutError,
+                _http.IncompleteRead,
+            ),
+        ):
+            return True
+    except Exception:
+        pass
+    # 消息子串兜底（tool-loop stall / Turn ended early 等服务层文案无专用类型）。
     markers = (
-        "ssl",
-        "eof",
-        "readtimeout",
+        "socket connection was closed",
         "serverdisconnected",
         "server disconnected",
         "stream idle",
@@ -93,6 +118,8 @@ def _is_interruption_break(error: Exception) -> bool:
         "tool loop stalled",
         "turn ended early",
         "valueerror: stream",
+        "ssl eof",
+        "read eof",
     )
     return any(m in msg for m in markers)
 
@@ -319,6 +346,14 @@ async def handle_error(agent: Any, error: Exception) -> None:
     error_msg = str(error)
     error_type = type(error).__name__
 
+    # E5: 断流类打断（SSL EOF / stream idle / tool-loop stalled …）置位降级
+    # 标志——被打断后「续跑重验 vs 就地收口」的选择需要一个标记来拦截
+    # waiver 捷径（复盘：终验被三连打断后选择 waiver 提交收口）。
+    # 审计修正：置位必须在 handle_error 主通道（SSL EOF 正是走这里），
+    # _is_interruption_break 才是断流判定唯一入口。
+    if _is_interruption_break(error):
+        mark_degraded(agent.id)
+
     # ── Durable Run Ledger: mark run errored ──
     _run_id = getattr(agent, "_current_run_id", None)
     if _run_id:
@@ -404,8 +439,14 @@ async def handle_error(agent: Any, error: Exception) -> None:
         log.warning("persist_failed_turn_on_error_failed", error=str(e))
 
     # 连续错误计数 — 超过阈值后 ACK inbox，不再 resume
-    # 429 / rate-limit: 分级 — soft 冷却 / hard 配额 park（TEST20 P0-B）
-    if is_rate_limit_error(error):
+    # 429 / rate-limit: 分级 — soft 冷却 / hard 配额 park（TEST20 P0-B）。
+    # E7 审计修正：容量判定独立于 rate-limit 门禁——非 429 文案（HTTP 500
+    # body / 200-body 包 GoUsageLimitError）同样必须进门禁，否则组织级
+    # 暂停永远不触发，回到连环撞墙。
+    from hiveweave.llm.retry import is_window_quota_error
+
+    is_window_capacity = is_window_quota_error(error_msg)
+    if is_rate_limit_error(error) or is_window_capacity:
         inbox_ids = list(agent.pending_inbox_msg_ids or [])
         headers: dict = {}
         try:
@@ -427,9 +468,10 @@ async def handle_error(agent: Any, error: Exception) -> None:
 
         # E7: 容量错误（daily_quota / GoUsageLimitError）→ 组织级降速 + park，
         # 不进 429 退避阶梯（秒级退避救不了窗口级配额，白撞只会烧预算）。
-        from hiveweave.llm.retry import is_capacity_error
-
-        if is_capacity_error(error_msg):
+        # 审计修正：触发项目级暂停用「窄判 is_window_quota_error」（容量词 +
+        # 窗口重置信号），避免把普通每分钟限流行判定成 1 小时组织暂停。
+        is_capacity = is_window_quota_error(error_msg, is_daily=is_daily)
+        if is_capacity:
             reset_at_epoch = float(reset_at) if reset_at else None
             try:
                 await broadcast_project_capacity_pause(

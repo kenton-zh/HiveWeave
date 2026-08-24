@@ -153,6 +153,13 @@ async def handle_completion(
     thinking = result.get("thinking")
     tool_calls = result.get("tool_calls", [])
 
+    # E5: 成功一轮（收到正常 LLM 完成结果）即清除断流降级标志 —— 与
+    # _run_id/ledger 写库解耦（审计修正：挂在 complete_run 成功副作用后，
+    # 无 run 或 DB 抖动会把脏旗永远留在 registry 里，误拦后续合法收口）。
+    from hiveweave.agents.recovery import clear_degraded
+
+    clear_degraded(agent.id)
+
     # ── Durable Run Ledger: mark run completed ──
     _run_id = getattr(agent, "_current_run_id", None)
     if _run_id:
@@ -163,10 +170,6 @@ async def handle_completion(
                 run_id=_run_id,
                 result_summary=summary,
             )
-            # E5: 成功续跑一轮（run 完成）→ 清除断流降级标志。
-            from hiveweave.agents.recovery import clear_degraded
-
-            clear_degraded(agent.id)
         except Exception as e:
             log.debug("run_ledger.complete_run_failed", error=str(e))
     tool_turn_messages = result.get("tool_turn_messages", [])

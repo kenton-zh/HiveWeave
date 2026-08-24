@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
-from .verify import VerificationCaseService  # noqa: F401
+from .verify import VerificationCaseService, normalize_verdict  # noqa: F401
 
 log = structlog.get_logger(__name__)
 
@@ -86,9 +86,17 @@ class ReviewMixin:
                 )
             # E2: 终验（VERIFY / milestoneVerify）任务 evidence verdict=FAIL
             # → 验收工作合格但结论不合格，强制走 rework（不复用 close）。
-            if evidence.get("verdict") == "FAIL":
+            # E8: merge 后整体性检查 FAIL（integrity_check=fail + blocking_issues）
+            # 对非 VERIFY 实现任务同样强制 rework——合成整体的整体性违例必须返修。
+            verdict = normalize_verdict(evidence.get("verdict"))
+            integrity_fail = (
+                evidence.get("integrity_check") == "fail"
+                and isinstance(evidence.get("blocking_issues"), list)
+                and bool(evidence.get("blocking_issues"))
+            )
+            if verdict == "FAIL":
                 task = await self.get_task(project_id, task_id)
-                if task and self._is_verify_task(task):
+                if task and (self._is_verify_task(task) or integrity_fail):
                     await self._force_rework(
                         project_id,
                         task_id,
@@ -96,7 +104,6 @@ class ReviewMixin:
                         feedback,
                         reviewer_id,
                         reason_code="verdict_fail_rework",
-                        detail=(feedback or ""),
                         current_status=current_status,
                     )
                     return
@@ -157,7 +164,6 @@ class ReviewMixin:
                 feedback,
                 reviewer_id,
                 reason_code=reason_code or "review_rework",
-                detail=(feedback or ""),
                 current_status=current_status,
             )
 
@@ -170,7 +176,6 @@ class ReviewMixin:
         reviewer_id: str | None,
         *,
         reason_code: str,
-        detail: str,
         current_status: str,
     ) -> None:
         """E2 复用收口：把任务打回 rework→running（原子两步）。
@@ -199,7 +204,7 @@ class ReviewMixin:
         await self._transition_multi(project_id, task_id, "rework", "running",
                                      actor_id=reviewer_id or "system",
                                      reason_code=reason_code,
-                                     detail=(detail or feedback or "")[:500])
+                                     detail=(feedback or "")[:500])
         await _execute(project_id,
             "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
             [json.dumps(evidence), now_ms, task_id])

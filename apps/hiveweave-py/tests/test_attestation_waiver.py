@@ -389,6 +389,27 @@ async def test_waive_normal_not_blocked_by_e5(env):
     assert "禁止就地 waiver 收口" not in text
 
 
+# ── E5 审计：断流判定分类器（B5——置位源正确性）──────────────
+
+
+def test_interruption_break_classifier_types():
+    """类型级判定：httpx 流层 / ssl / 超时 → 断流（降级信号源）。"""
+    import asyncio
+
+    import httpx
+    import ssl
+
+    from hiveweave.agents.recovery import _is_interruption_break
+
+    assert _is_interruption_break(httpx.RemoteProtocolError("stream reset")) is True
+    assert _is_interruption_break(ssl.SSLError("SSL: WRONG_VERSION_NUMBER")) is True
+    assert _is_interruption_break(asyncio.TimeoutError()) is True
+    assert _is_interruption_break(ValueError("Turn ended early: tool-loop stalled")) is True
+    # 普通限流 / 业务错误不视为断流
+    assert _is_interruption_break(ValueError("HTTP 429: rate limit")) is False
+    assert _is_interruption_break(ValueError("GoUsageLimitError: daily quota")) is False
+
+
 # ── P0-2: rework 时 invalidate valid waiver ─────────────────
 # TEST18 死锁根因：rework 不清 waiver，waived_by 第三人隔离 24h 内
 # 不可恢复。修复后 rework 立即退役 active waiver，新 submit/review

@@ -280,7 +280,21 @@ class Streamer(
         """
         configured = getattr(provider, "fallback", None)
         if isinstance(configured, str) and configured and configured not in tried:
-            return configured
+            # 审计修正：手填 fallback 与推导路径同守 same-key 闸（同 key =
+            # 共享配额池，切换无意义，事故主备同 key 即此情形）。
+            try:
+                from hiveweave.services.model import ModelService
+
+                fb_cfg = await ModelService().get(configured)
+                if not fb_cfg or not fb_cfg.get("is_active"):
+                    return None
+                fb_key = str(fb_cfg.get("api_key") or "")[:16]
+                failed_key = str(model_config.get("api_key") or "")[:16]
+                if failed_key and fb_key and fb_key == failed_key:
+                    return None
+                return configured
+            except Exception:
+                return None
         tier = model_config.get("tier")
         if not tier:
             return None

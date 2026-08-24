@@ -184,8 +184,162 @@ async def test_auto_submit_clean_passes_without_verdict(task_env):
 
 
 @pytest.mark.asyncio
-async def test_run_integrity_checks_no_workspace_fail_open():
-    """无 workspace → 回执标记 NOT scanned 但 fail-open（不炸）。"""
+async def test_run_integrity_checks_no_workspace_skips_not_fails():
+    """无 workspace → skipped=True（未扫描≠FAIL，调用方不得注入 verdict）。"""
     report = await run_integrity_checks(None, branch="hw/EXEC/t-abc")
+    assert report.skipped is True
+    assert report.passed is True  # fail-open：不把 skipped 当 FAIL
+    assert report.issues == []
+
+
+# ── 审计追加：except as e / 多异常 / 行序 / 真实 git ────────────
+
+
+def test_scan_flags_as_e_swallow():
+    """主流写法 ``except Exception as e:`` + pass / 挂空兜底 → 红牌。"""
+    code = (
+        "try:\n"
+        "    from app.admin.router import router as admin_router\n"
+        "except Exception as e:\n"
+        "    admin_router = APIRouter()\n"
+    )
+    issues = scan_silent_swallow(code, "app/main.py")
+    assert any("静默降级兜底" in i for i in issues)
+
+    code2 = "try:\n    x = risky()\nexcept Exception as e:\n    pass\n"
+    issues2 = scan_silent_swallow(code2, "s.py")
+    assert any("仅 pass" in i for i in issues2)
+
+
+def test_scan_flags_multi_exception_forms():
+    """多异常 / 跨行括号 except 形态同样识别。"""
+    code = (
+        "try:\n"
+        "    x = risky()\n"
+        "except (RuntimeError, ValueError):\n"
+        "    x = None\n"
+    )
+    issues = scan_silent_swallow(code, "a.py")
+    assert any("静默降级兜底" in i for i in issues)
+
+    multi = (
+        "try:\n"
+        "    x = risky()\n"
+        "except (\n"
+        "    RuntimeError,\n"
+        "    ValueError,\n"
+        "):\n"
+        "    x = {}\n"
+    )
+    issues2 = scan_silent_swallow(multi, "b.py")
+    assert any("静默降级兜底" in i for i in issues2)
+
+
+def test_scan_order_independent_with_explicit_log():
+    """赋值行先于日志行 → 显式降级仍放行（行序无关，审计修正）。"""
+    code = (
+        "try:\n"
+        "    from app.admin.router import router as admin_router\n"
+        "except Exception:\n"
+        "    admin_router = APIRouter()\n"
+        "    log.warning('degraded admin router', exc_info=True)\n"
+    )
+    assert scan_silent_swallow(code, "app/main.py") == []
+
+
+def test_scan_comment_log_does_not_mask_pass_only():
+    """``pass  # log.would_help`` 的注释不算显式处理（审计修正）。"""
+    code = "try:\n    x = risky()\nexcept Exception:\n    pass  # log.would_help\n"
+    issues = scan_silent_swallow(code, "s.py")
+    assert any("仅 pass" in i for i in issues)
+
+
+@pytest.mark.asyncio
+async def test_changed_python_files_real_git_first_parent():
+    """真实 git：merge 后 HEAD^1..HEAD 恰列出被引入的 .py（审计实证路径）。"""
+    import asyncio
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from hiveweave.services.git_worktree.integrity import _changed_python_files
+    from tests.test_idle_architecture_p0 import task_env  # noqa: F401
+
+    def _git(cwd: str, *args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=cwd, check=True,
+            capture_output=True, text=True,
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _git(tmpdir, "init", "-q")
+        _git(tmpdir, "config", "user.email", "t@t")
+        _git(tmpdir, "config", "user.name", "t")
+        (Path(tmpdir) / "main.py").write_text("print(1)\n")
+        _git(tmpdir, "add", ".")
+        _git(tmpdir, "commit", "-qm", "c1")
+        # 第二个提交引入一个带吞错的 .py —— HEAD^1..HEAD 应扫到它
+        (Path(tmpdir) / "admin.py").write_text(
+            "try:\n    import risky\nexcept Exception:\n    admin = []\n"
+        )
+        _git(tmpdir, "add", ".")
+        _git(tmpdir, "commit", "-qm", "c2")
+        files = await _changed_python_files(tmpdir)
+        assert "admin.py" in files
+        assert "main.py" not in files  # 上一提交的不算本次引入
+
+
+@pytest.mark.asyncio
+async def test_integrity_real_git_fail_via_scan(tmpdir):
+    """端到端（审计 E8-1+E8-2 合并）：merge 场景 run_integrity_checks 扫到吞错。"""
+    import subprocess
+    from pathlib import Path
+
+    from hiveweave.services.git_worktree.integrity import run_integrity_checks
+
+    def _git(cwd: str, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+    _git(tmpdir, "init", "-q")
+    _git(tmpdir, "config", "user.email", "t@t")
+    _git(tmpdir, "config", "user.name", "t")
+    (Path(tmpdir) / "main.py").write_text("# ok\n")
+    _git(tmpdir, "add", ".")
+    _git(tmpdir, "commit", "-qm", "c1")
+    (Path(tmpdir) / "app.py").write_text(
+        "try:\n    import x\nexcept Exception as e:\n    x = APIRouter()\n"
+    )
+    _git(tmpdir, "add", ".")
+    _git(tmpdir, "commit", "-qm", "c2")
+    report = await run_integrity_checks(tmpdir, branch="hw/EXEC/t-abc")
     assert report.passed is False
-    assert any("skipped" in i for i in report.issues)
+    assert any("app.py" in i for i in report.issues)
+
+
+# ── 审计 E8-3：非 VERIFY 实现任务 integrity FAIL → E2 rework 闭环 ───
+
+
+@pytest.mark.asyncio
+async def test_non_verify_task_integrity_fail_routes_rework(task_env):
+    """普通实现任务带 integrity_check=fail → approve 强制 rework（E8-3 闭环）。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    tid = await ts.create_task(
+        pid, "Feature impl", "d", creator_id=COORD, assignee_id=EXEC
+    )
+    await ts.claim_task(pid, tid, EXEC)
+    await ts.start_task(pid, tid)
+    await ts.submit_task(
+        pid,
+        tid,
+        evidence={
+            "verdict": "FAIL",
+            "blocking_issues": ["app.py:3 静默降级兜底"],
+            "integrity_check": "fail",
+        },
+    )
+    await ts.start_review(pid, tid)
+    await ts.review_task(pid, tid, "approve")
+    after = await ts.get_task(pid, tid)
+    assert after["status"] == "running"
+    assert after["status"] not in ("approved", "closed")

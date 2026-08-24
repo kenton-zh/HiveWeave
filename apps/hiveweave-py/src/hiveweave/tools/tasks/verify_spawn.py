@@ -1339,7 +1339,8 @@ async def _nudge_one_verify_task(
             f"[POST-MERGE VERIFY] Stale verification — parent is still "
             f"'verifying'. Confirm merge landed, then run final tests on MAIN "
             f"for task '{title}' (id={tid}). "
-            f"Run tests, then submit_task(testsPassed=true, testOutput=...)."
+            f"Run tests, then submit_task(testsPassed=true, testOutput=..., "
+            f"verdict=\"PASS\" — or \"FAIL\" with blockingIssues=[...])."
         )
     else:
         body = (
@@ -1347,7 +1348,8 @@ async def _nudge_one_verify_task(
             f"Run final verification NOW on main for task "
             f"'{title}' (id={tid}). "
             f"Run tests on main, then "
-            f"submit_task(testsPassed=true, testOutput=...)."
+            f"submit_task(testsPassed=true, testOutput=..., "
+            f"verdict=\"PASS\" — or \"FAIL\" with blockingIssues=[...])."
         )
     try:
         # TEST6 P1-2: time-bucketed idempotency so stale re-nudges can land
