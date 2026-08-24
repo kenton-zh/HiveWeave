@@ -123,7 +123,7 @@ Four-Layer Review Gate:
 ### Context Isolation
 - **Per-agent context** — Frontend agent only loads frontend code. Backend agent only loads backend. No cross-contamination.
 - **Per-agent model routing** — CEO uses Claude Opus. Executor uses DeepSeek Flash. Expensive tokens on decisions; cheap tokens on execution.
-- **Direct chat** — You can talk directly to any agent at any level. Frontend issue? Talk to the frontend dev. Don't route through CEO.
+- **Direct chat + delegation** — You can talk directly to any agent at any level, assign it work on its own, and track it — no aggregator in between. Frontend issue? Talk to the frontend dev and hand them the task directly. Don't route through CEO.
 
 ### Git Worktree Development
 - **Isolated worktrees** — Each agent gets its own `git worktree` (`hw/<shortId>/t-<taskId>`). No conflicts between parallel agents.
@@ -142,6 +142,7 @@ Four-Layer Review Gate:
 
 ### Real-time Dashboard
 - **Org chart** — React Flow-powered visualization. Drag, zoom, see who reports to whom.
+- **Office scene** — a PixiJS-rendered office floor where every agent is a visible desk; watch who's coding, reviewing, or stuck in real time and click any agent to chat.
 - **Multi-panel chat** — Talk to multiple agents simultaneously.
 - **Live streaming** — Token-level streaming via WebSocket. Watch agents type in real-time.
 
@@ -222,6 +223,8 @@ Everything below is delivered as a running organization, not a library. The diff
 | **Asyncio task isolation** | Each agent runs in its own asyncio task. Crash doesn't crash the system. Circuit breaker + exponential backoff for LLM outages. |
 | **Game time scheduling** | 1 real hour = 1 game day. Silence watchdog: idle ≥10min → self-wake + health flag; ≥30min unresponsive → log only (no inbox spam). A task dwell clock auto-heals stalled tasks (auto-submit / re-dispatch / merge proxy). |
 | **Dual-DB pattern** | Meta DB (global) + Per-project DB (isolated). Agents never cross-contaminate data. |
+| **Token metering** | TokenMeter records every LLM call (main / compaction / sub-agent) bucketed agent → run → task → project, with a live dashboard for per-agent/project spend and cache hit rate. |
+| **ACL isolation sandbox (Windows)** | Each agent runs on a least-privilege restricted token with per-command ACL verification (verify-then-skip), sentinel monitoring and telemetry. Fail-closed: any anomaly blocks the write path rather than silently degrading to full access. |
 | **MCP protocol** | Tool extension via Model Context Protocol. Bind MCP servers per agent — different agents get different external tools. |
 | **skills.sh marketplace** | Remote skill marketplace. HR searches and binds skills dynamically. No hardcoded skill lists. |
 | **90+ built-in tools** | bash, file ops, grep, patch, review (5-axis), security audit, websearch, question, todowrite, orchestration, org, vision, image generation, MCP tools. Permission-gated per role type. |

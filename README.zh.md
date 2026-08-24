@@ -117,7 +117,7 @@ pnpm dev
 ### 上下文隔离
 - **按 Agent 隔离** — 前端 Agent 只看前端代码。后端 Agent 只看后端代码。互不污染。
 - **按角色配模型** — CEO 用 Claude Opus，Executor 用 DeepSeek Flash。贵 token 花在决策上，便宜 token 花在执行上。
-- **直达对话** — 你可以直接跟任意层级 Agent 对话。前端有问题？直接找前端开发。不用通过 CEO 中转。
+- **直达对话 + 单独派活** — 你可以直接跟任意层级 Agent 对话、单独给它布置任务并跟进，无需经过中转。前端有问题？直接找前端开发，把任务亲手交给他。不用通过 CEO 中转。
 
 ### Git Worktree 开发
 - **隔离工作区** — 每个 Agent 拥有独立 `git worktree`（`hw/<shortId>/t-<taskId>`）。并行开发零冲突。
@@ -136,6 +136,7 @@ pnpm dev
 
 ### 实时可视化
 - **组织架构图** — React Flow 驱动。拖拽缩放，看清汇报关系。
+- **办公室场景** — PixiJS 渲染的办公室楼层，每个 Agent 对应一张可见工位；实时看到谁在写码、谁在审查、谁卡住了，点任意 Agent 即可对话。
 - **多面板对话** — 同时跟多个 Agent 聊天。前端开发一个面板，后端开发另一个。
 - **实时流式** — WebSocket token 级推送。实时看到 Agent 在打字。
 
@@ -216,6 +217,8 @@ hiveweave/
 | **Asyncio 任务隔离** | 每个 Agent 运行在独立 asyncio task 中。崩溃不拖垮系统。熔断器 + 指数退避应对 LLM 故障。 |
 | **游戏时间调度** | 1 真实小时 = 1 游戏天。沉默看门狗：闲置 ≥10min → 自醒 + 健康标记；≥30min 失联 → 仅打日志（不再 inbox 轰炸）。任务驻留时钟自动自愈停滞任务（auto-submit / 改派 / merge proxy）。 |
 | **双 DB 模式** | Meta DB（全局）+ Per-project DB（隔离）。Agent 间数据永不交叉污染。 |
+| **token 用量计量** | TokenMeter 记录每次 LLM 调用（主对话 / 压缩 / 子代理），按 agent → run → task → project 四级归属；实时面板展示各 Agent/项目消耗与缓存命中率。 |
+| **ACL 隔离沙箱（Windows）** | 每个 Agent 跑在最小权限的受限令牌上，命令级 ACL 先验验证（verify-then-skip），配哨兵监控与遥测。Fail-closed：任何异常都阻断写入路径，绝不静默降级为完整权限。 |
 | **MCP 协议** | 通过 Model Context Protocol 扩展工具。按 Agent 绑定 MCP 服务器——不同角色获得不同外部工具。 |
 | **skills.sh 市场** | 远程技能市场（skills.sh，不可达时降级 SkillHub）。HR 动态搜索和绑定技能。无硬编码技能列表。 |
 | **90+ 内置工具** | bash、文件操作、grep、patch、review（五轴）、security audit、websearch、question、todowrite、编排、org、视觉、图像生成、MCP 工具。按角色类型权限门控。 |
