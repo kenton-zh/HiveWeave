@@ -194,6 +194,12 @@ describe("useChatSend — round_start", () => {
     });
     act(() => onEvent({ type: "round_start", data: "1" }));
     const finalDraft = draft as StreamDraft | null;
-    expect(finalDraft?.segments).toEqual([{ type: "tool_call", tool: { tool: "get_tasks", input: {} } }]);
+    // 新契约：round_start 不再丢弃前轮旁白/thinking（整轮块序列视图），
+    // draft 原样保留，新轮文本由后续 text_delta 追加。
+    expect(finalDraft?.segments).toEqual([
+      { type: "thinking", content: "plan" },
+      { type: "text", content: "用户选了方案2" },
+      { type: "tool_call", tool: { tool: "get_tasks", input: {} } },
+    ]);
   });
 });

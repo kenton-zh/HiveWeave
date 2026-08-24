@@ -1,11 +1,13 @@
-import type { ChatMessage, MsgSegment, StreamDraft, ToolCall } from "./types";
+import type { ChatMessage, MsgSegment, StreamDraft, ToolCall, MessageSource } from "./types";
 
-/** Drop prior-round narration; keep tool chips. Matches backend round_start text-acc reset. */
+/**
+ * Keep the FULL block timeline across tool-loop rounds (DSH-style whole-turn
+ * view): prior narration/thinking segments stay visible; tools dedup by id in
+ * appendToolCallSegment. Backend round_start still resets its own DB text
+ * accumulator — that only affects the mid-stream DB snapshot, not this draft.
+ */
 export function beginStreamRound(draft: StreamDraft): StreamDraft {
-  return {
-    ...draft,
-    segments: draft.segments.filter((s) => s.type === "tool_call"),
-  };
+  return draft;
 }
 
 /**
@@ -57,10 +59,47 @@ export function parseToolUsePayload(
     const idRaw = toolData.toolCallId || toolData.tool_call_id || "";
     const toolCallId =
       typeof idRaw === "string" && idRaw.trim() ? idRaw.trim() : undefined;
-    return { toolCall: { tool: toolName || "unknown", input: args }, toolCallId };
+    return { toolCall: { tool: toolName || "unknown", input: args, status: "running" }, toolCallId };
   } catch {
     return null;
   }
+}
+
+/**
+ * tool_result 事件 → 更新 draft 中对应工具段的状态与结果摘要。
+ * 匹配规则：tool_call_id 优先；缺失才按工具名兜底，且只更新最后一个
+ * 匹配的 running 段（并行同名工具不写串）。事件里的工具名可能带
+ * hiveweave__ 前缀（与段内已剥离名对齐）。已完结（ok/error）的段
+ * 不覆盖 —— 重复事件（双广播路径）天然幂等。
+ */
+export function applyToolResult(
+  draft: StreamDraft,
+  toolCallId: string | undefined,
+  toolName: string | undefined,
+  success: boolean,
+  result: string,
+): StreamDraft {
+  const name = toolName ? toolName.replace(/^hiveweave__/, "") : undefined;
+  let idx = -1;
+  for (let i = draft.segments.length - 1; i >= 0; i--) {
+    const s = draft.segments[i];
+    if (s.type !== "tool_call" || !s.tool || s.tool.status !== "running") continue;
+    if (toolCallId ? s.tool.id === toolCallId : name !== undefined && s.tool.tool === name) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx === -1) return draft;
+  const seg = draft.segments[idx];
+  const next: StreamDraft = {
+    ...draft,
+    segments: [
+      ...draft.segments.slice(0, idx),
+      { ...seg, tool: { ...seg.tool!, status: success ? ("ok" as const) : ("error" as const), result } },
+      ...draft.segments.slice(idx + 1),
+    ],
+  };
+  return next;
 }
 
 /**
@@ -170,11 +209,21 @@ export function tryParseToolCalls(raw: string): ToolCall[] {
     // Normalize OpenAI tool_call format to our ToolCall interface.
     // Backend stores: [{"function": {"name": "list_files", "arguments": "{\"path\": \".\"}"}, "id": "...", "type": "function"}]
     // Frontend expects: [{tool: "list_files", input: {path: "."}}]
+    // status 默认 "ok"：走此解析的是已落库历史消息（无 metadata.segments），
+    // 工具必然已执行完——缺省会让 ToolCallRow 永久渲染 spinner。
     return parsed.map((tc: any): ToolCall => {
       const id = typeof tc.id === "string" && tc.id.trim() ? tc.id.trim() : undefined;
+      // 显式 status 优先；缺省时 ok:false（tool_history 失败标记）→ error，
+      // 否则 ok（历史消息工具已执行完）。
+      const status: ToolCall["status"] =
+        tc.status === "error" || tc.status === "running"
+          ? tc.status
+          : tc.ok === false
+            ? "error"
+            : "ok";
       // Already in our format
       if (tc.tool && tc.input) {
-        return id ? { tool: tc.tool, input: tc.input, id } : { tool: tc.tool, input: tc.input };
+        return id ? { tool: tc.tool, input: tc.input, id, status } : { tool: tc.tool, input: tc.input, status };
       }
       // OpenAI format: {function: {name, arguments}}
       if (tc.function) {
@@ -189,13 +238,13 @@ export function tryParseToolCalls(raw: string): ToolCall[] {
           input = tc.function.arguments;
         }
         return id
-          ? { tool: tc.function.name || "unknown", input, id }
-          : { tool: tc.function.name || "unknown", input };
+          ? { tool: tc.function.name || "unknown", input, id, status }
+          : { tool: tc.function.name || "unknown", input, status };
       }
       // Unknown format — best effort
       return id
-        ? { tool: tc.name || tc.tool || "unknown", input: tc.input || tc.arguments || {}, id }
-        : { tool: tc.name || tc.tool || "unknown", input: tc.input || tc.arguments || {} };
+        ? { tool: tc.name || tc.tool || "unknown", input: tc.input || tc.arguments || {}, id, status }
+        : { tool: tc.name || tc.tool || "unknown", input: tc.input || tc.arguments || {}, status };
     });
   } catch {
     return [];
@@ -212,23 +261,90 @@ export function tryParseImages(raw: string): string[] {
   }
 }
 
+function tryParseMeta(raw: unknown): Record<string, any> | null {
+  if (!raw) return null;
+  if (typeof raw === "object") return raw as Record<string, any>;
+  if (typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 落库 metadata.segments（后端 build_display_segments）→ 前端 MsgSegment。 */
+function normalizePersistedSegments(raw: unknown): MsgSegment[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const segs: MsgSegment[] = [];
+  for (const s of raw) {
+    if (!s || typeof s !== "object") continue;
+    if (s.type === "text" && typeof s.content === "string" && s.content) {
+      segs.push({ type: "text", content: s.content });
+    } else if (s.type === "tool_call" && s.tool) {
+      segs.push({
+        type: "tool_call",
+        tool: {
+          tool: String(s.tool),
+          input: (s.input && typeof s.input === "object" ? s.input : {}) as Record<string, any>,
+          id: typeof s.id === "string" ? s.id : undefined,
+          status: s.status === "error" ? "error" : s.status === "running" ? "running" : "ok",
+          result: typeof s.result === "string" ? s.result : undefined,
+        },
+      });
+    }
+  }
+  return segs.length > 0 ? segs : undefined;
+}
+
+const WATCHDOG_MARKERS = ["看门狗", "[SILENCE]", "[WAIT_TIMEOUT]"];
+
+/** metadata.source 缺失（legacy 消息）时的回退推断。 */
+export function inferMessageSource(
+  m: any,
+  meta: Record<string, any> | null,
+): MessageSource | undefined {
+  if (meta?.source === "user" || meta?.source === "agent" || meta?.source === "system" || meta?.source === "watchdog") {
+    return meta.source;
+  }
+  const from = meta?.from_agent_id ?? m.teamFromAgentId ?? m.team_from_agent_id;
+  const role = m.role;
+  if (role === "user") {
+    const bg = !!(m.isBackground ?? m.is_background);
+    if (!bg) return "user";
+    if (from && from !== "system") return "agent";
+    const content = typeof m.content === "string" ? m.content : "";
+    if (WATCHDOG_MARKERS.some((k) => content.includes(k))) return "watchdog";
+    return "system";
+  }
+  return undefined;
+}
+
 export function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
   if (!Array.isArray(dbMessages)) return [];
-  return dbMessages.map((m: any) => ({
-    id: m.id,
-    role: m.role,
-    content: m.content,
-    _thinking: m.thinking || undefined,
-    images: typeof m.images === "string" ? tryParseImages(m.images) : m.images,
-    timestamp: m.createdAt ?? m.created_at ?? Date.now(),
-    toolCalls: m.toolCalls ? tryParseToolCalls(m.toolCalls) : undefined,
-    isBackground: !!(m.isBackground ?? m.is_background),
-    isRead: !!(m.isRead ?? m.is_read),
-    isStreaming: !!(m.isStreaming ?? m.is_streaming),
-    isContext: !!(m.isContext ?? m.is_context),
-    teamFromAgentId: m.teamFromAgentId ?? m.team_from_agent_id ?? undefined,
-    teamToAgentId: m.teamToAgentId ?? m.team_to_agent_id ?? undefined,
-  }));
+  return dbMessages.map((m: any) => {
+    const meta = tryParseMeta(m.metadata);
+    return {
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      _thinking: m.thinking || undefined,
+      images: typeof m.images === "string" ? tryParseImages(m.images) : m.images,
+      timestamp: m.createdAt ?? m.created_at ?? Date.now(),
+      toolCalls: m.toolCalls ?? m.tool_calls
+        ? tryParseToolCalls(m.toolCalls ?? m.tool_calls)
+        : undefined,
+      isBackground: !!(m.isBackground ?? m.is_background),
+      isRead: !!(m.isRead ?? m.is_read),
+      isStreaming: !!(m.isStreaming ?? m.is_streaming),
+      isContext: !!(m.isContext ?? m.is_context),
+      teamFromAgentId: m.teamFromAgentId ?? m.team_from_agent_id ?? undefined,
+      teamToAgentId: m.teamToAgentId ?? m.team_to_agent_id ?? undefined,
+      source: inferMessageSource(m, meta),
+      fromAgentId: meta?.from_agent_id ?? m.teamFromAgentId ?? m.team_from_agent_id ?? null,
+      _segments: normalizePersistedSegments(meta?.segments),
+    };
+  });
 }
 
 export function getDirectedAgentId(msg: ChatMessage, agentParentId?: string | null): string | null {

@@ -410,8 +410,12 @@ export async function getPermissionRules(agentId: string) {
 // Chat messages (alias for getChatHistory)
 // ---------------------------------------------------------------------------
 
-export async function getChatMessages(agentId: string) {
-  return fetchJSON(`${BASE}/chat/messages/${agentId}`);
+export async function getChatMessages(agentId: string, opts?: { limit?: number; offset?: number }) {
+  const q = new URLSearchParams();
+  if (opts?.limit) q.set("limit", String(opts.limit));
+  if (opts?.offset) q.set("offset", String(opts.offset));
+  const qs = q.toString();
+  return fetchJSON(`${BASE}/chat/messages/${agentId}${qs ? `?${qs}` : ""}`);
 }
 
 // ---------------------------------------------------------------------------

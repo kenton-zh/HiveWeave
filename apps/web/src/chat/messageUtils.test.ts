@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   appendToolCallSegment,
+  applyToolResult,
   beginStreamRound,
   draftFromStreamingMessage,
   isTeamChannelMessage,
@@ -11,11 +12,12 @@ import {
   shouldWriteChatCache,
   streamEventBackgroundFlag,
   streamEventIsBackground,
+  tryParseToolCalls,
 } from "./messageUtils";
 import type { StreamDraft } from "./types";
 
 describe("beginStreamRound", () => {
-  it("keeps tool chips and drops prior-round narration", () => {
+  it("keeps the full block timeline across rounds (whole-turn view)", () => {
     const draft: StreamDraft = {
       assistantId: "a1",
       segments: [
@@ -29,10 +31,10 @@ describe("beginStreamRound", () => {
     };
     const next = beginStreamRound(draft);
     expect(next.assistantId).toBe("a1");
-    expect(next.segments).toEqual([
-      { type: "tool_call", tool: { tool: "get_tasks", input: {} } },
-      { type: "tool_call", tool: { tool: "bash", input: { command: "git rev-parse HEAD" } } },
-    ]);
+    // 新契约：旁白/thinking/tool 全量保留（DSH 整轮视图）；新轮文本由
+    // 后续 text_delta 事件追加，不再丢弃前轮旁白。
+    expect(next.segments).toEqual(draft.segments);
+    expect(next).toBe(draft);
   });
 
   it("is a no-op when the draft has only tools", () => {
@@ -67,6 +69,78 @@ describe("appendToolCallSegment", () => {
     const twice = appendToolCallSegment(once, { tool: "read_file", input: { path: "b" } }, "tc-b");
     expect(twice.segments).toHaveLength(2);
     expect(twice.segments.map((s) => s.tool?.id)).toEqual(["tc-a", "tc-b"]);
+  });
+});
+
+describe("applyToolResult", () => {
+  const draft: StreamDraft = {
+    assistantId: "a1",
+    segments: [
+      { type: "tool_call", tool: { tool: "bash", input: {}, id: "c1", status: "running" } },
+      { type: "tool_call", tool: { tool: "bash", input: {}, id: "c2", status: "running" } },
+      { type: "tool_call", tool: { tool: "read_file", input: {}, status: "running" } },
+    ],
+  };
+
+  it("updates the segment matched by tool_call_id (id path, no name needed)", () => {
+    const next = applyToolResult(draft, "c1", undefined, false, "boom");
+    expect(next.segments[0].tool?.status).toBe("error");
+    expect(next.segments[0].tool?.result).toBe("boom");
+    expect(next.segments[1].tool?.status).toBe("running");
+    // 非 target 段对象不可变（浅拷贝更新）
+    expect(next.segments[1]).toBe(draft.segments[1]);
+  });
+
+  it("falls back to name with hiveweave__ prefix stripped, last running match only", () => {
+    const two: StreamDraft = {
+      assistantId: "a1",
+      segments: [
+        { type: "tool_call", tool: { tool: "bash", input: {}, status: "running" } },
+        { type: "tool_call", tool: { tool: "bash", input: {}, status: "running" } },
+      ],
+    };
+    const next = applyToolResult(two, undefined, "hiveweave__bash", true, "done");
+    // 只更新最后一个 running 段（并行同名不写串）
+    expect(next.segments[0].tool?.status).toBe("running");
+    expect(next.segments[1].tool?.status).toBe("ok");
+    expect(next.segments[1].tool?.result).toBe("done");
+  });
+
+  it("is idempotent on duplicate tool_result events (finished segments untouched)", () => {
+    const once = applyToolResult(draft, "c1", undefined, true, "ok");
+    const twice = applyToolResult(once, "c1", "bash", false, "second event");
+    // 已完结段不被第二个完成信号覆盖（双广播路径幂等）
+    expect(twice.segments[0].tool?.status).toBe("ok");
+    expect(twice.segments[0].tool?.result).toBe("ok");
+  });
+
+  it("does not mis-write when id is missing but segments have ids", () => {
+    // 事件无 id、段全带 id：按名称兜底仅在段无 id 或名称匹配时命中——
+    // 此处段名 bash/read_file 与事件名 bash 匹配 → 更新最后一个 bash 段
+    const next = applyToolResult(draft, undefined, "bash", true, "r");
+    expect(next.segments[1].tool?.status).toBe("ok");
+    expect(next.segments[0].tool?.status).toBe("running");
+  });
+
+  it("returns the same draft when nothing matches", () => {
+    const next = applyToolResult(draft, "nope", undefined, true, "x");
+    expect(next).toBe(draft);
+  });
+});
+
+describe("tryParseToolCalls", () => {
+  it("defaults legacy persisted calls to ok (no eternal spinner)", () => {
+    const calls = tryParseToolCalls(
+      JSON.stringify([{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" } }]),
+    );
+    expect(calls[0].status).toBe("ok");
+  });
+
+  it("maps ok:false (tool_history failure mark) to error", () => {
+    const calls = tryParseToolCalls(
+      JSON.stringify([{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" }, ok: false }]),
+    );
+    expect(calls[0].status).toBe("error");
   });
 });
 

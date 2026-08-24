@@ -11,7 +11,7 @@ import { streamChat, joinAgentChannel } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
 import { useAppStore } from "../store";
 import type { ChatMessage, StreamDraft } from "./types";
-import { appendToolCallSegment, beginStreamRound, parseToolUsePayload } from "./messageUtils";
+import { appendToolCallSegment, applyToolResult, beginStreamRound, parseToolUsePayload } from "./messageUtils";
 
 type UpdateStreamDraft = (
   updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)
@@ -419,6 +419,22 @@ export function useChatSend(opts: {
           updateStreamDraft((prev) =>
             prev ? appendToolCallSegment(prev, parsed.toolCall, parsed.toolCallId) : prev
           );
+        } else if (event.type === "tool_result") {
+          // 工具完成 → spinner 即时转 ✓/✗（与被动订阅路径一致）
+          try {
+            const p = JSON.parse(event.data);
+            const id = p.toolCallId || p.tool_call_id || undefined;
+            const name = p.toolName || p.tool_name || undefined;
+            if (id || name) {
+              updateStreamDraft((prev) =>
+                prev
+                  ? applyToolResult(prev, id, name, p.success !== false, String(p.result || ""))
+                  : prev,
+              );
+            }
+          } catch {
+            /* ignore */
+          }
         } else if (event.type === "approval_request") {
           try {
             const data = JSON.parse(event.data);

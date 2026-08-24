@@ -12,7 +12,14 @@ export interface ToolCall {
   input: Record<string, any>;
   /** Stream tool_call_id — used to dedup replayed chips. */
   id?: string;
+  /** 执行状态：流式期间由 tool_use/tool_result 事件维护。 */
+  status?: "running" | "ok" | "error";
+  /** 工具结果摘要（流式事件 500 字 / 落库 segments 2000 字截断）。 */
+  result?: string;
 }
+
+/** 消息来源（metadata.source；legacy 消息由前端推断）。 */
+export type MessageSource = "user" | "agent" | "system" | "watchdog";
 
 export interface ChatMessage {
   id: string;
@@ -27,6 +34,8 @@ export interface ChatMessage {
   isContext?: boolean;
   teamFromAgentId?: string;
   teamToAgentId?: string;
+  source?: MessageSource;
+  fromAgentId?: string | null;
   _thinking?: string;
   _segments?: MsgSegment[];
 }

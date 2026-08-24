@@ -5,9 +5,9 @@ import { useAppStore } from "../store";
 import type { AgentInfo, ChatMessage, MsgSegment, StreamDraft } from "./types";
 import {
   appendToolCallSegment,
+  applyToolResult,
   beginStreamRound,
   draftFromStreamingMessage,
-  isInjectedContext,
   isTeamChannelMessage,
   mapDbToChatMessages,
   mergeStreamDraftIntoMessages,
@@ -89,12 +89,7 @@ export function useChatMessages(opts: {
     }
   }
 
-  const handleMessagesScroll = useCallback(() => {
-    const el = scrollContainerRef.current;
-    if (!el) return;
-    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    stickToBottomRef.current = distFromBottom <= 72;
-  }, []);
+  // handleMessagesScroll 定义在后（依赖 loadOlderMessages 分页加载）。
 
   const loadMessagesFromDb = useCallback(
     async (loadForAgentId: string): Promise<boolean> => {
@@ -175,6 +170,10 @@ export function useChatMessages(opts: {
             .then(() => refreshOrgTree())
             .catch(() => {});
         }
+        // done/reload 全量替换回默认窗口 → 历史分页状态复位（分页
+        // state 声明在本 callback 之后，回调执行时已初始化，闭包安全）
+        historyOffsetRef.current = 0;
+        setHasMoreHistory(true);
         return true;
       } catch (err) {
         if (activeAgentIdRef.current !== loadForAgentId) return false;
@@ -312,6 +311,24 @@ export function useChatMessages(opts: {
         );
         return;
       }
+      if (event.type === "tool_result") {
+        // 工具执行完成 → 更新对应工具段状态（running→ok/error）+ 结果摘要
+        try {
+          const p = JSON.parse(event.data);
+          const id = p.toolCallId || p.tool_call_id || undefined;
+          const name = p.toolName || p.tool_name || undefined;
+          if (id || name) {
+            updateStreamDraft((prev) =>
+              prev
+                ? applyToolResult(prev, id, name, p.success !== false, String(p.result || ""))
+                : prev,
+            );
+          }
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
       if (event.type === "done") {
         setThinkingElapsed(null);
         loadMessagesFromDb(forAgentId).then((ok) => {
@@ -363,6 +380,9 @@ export function useChatMessages(opts: {
       savedDraftsRef.current[switchingFrom] = streamDraftRef.current;
     }
     prevAgentIdRef.current = agentId;
+    // 历史分页状态重置（分页 state 声明在本 effect 之后——回调执行时已初始化）
+    historyOffsetRef.current = 0;
+    setHasMoreHistory(true);
 
     if (!agentId) {
       persistReadyRef.current = false;
@@ -471,21 +491,25 @@ export function useChatMessages(opts: {
   const isAgentProcessing = agentId ? processingAgents.includes(agentId) : false;
 
   const displayMessages = useMemo(() => {
-    const merged = mergeStreamDraftIntoMessages(messages, streamDraft, { isStreaming }).filter(
-      (m) => !isInjectedContext(m),
-    );
+    // 全量时间线：真人用户、后台 trigger digest（agent/system/watchdog）、
+    // 全部 assistant 回复（含后台）。role=team 仍归「团队沟通」栏。
+    // digest（isContext）不再隐藏——由 MessageBubble 折叠展示。
+    const merged = mergeStreamDraftIntoMessages(messages, streamDraft, { isStreaming });
     const foreground = merged.filter((m) => {
-      if (m.isBackground || (m.role !== "user" && m.role !== "assistant")) return false;
+      if (m.role !== "user" && m.role !== "assistant") return false;
       if (m.role === "assistant" && !m.isStreaming) {
         const hasContent = m.content && m.content.trim().length > 0;
         const hasToolCalls = m.toolCalls && m.toolCalls.length > 0;
-        if (!hasContent && !hasToolCalls) return false;
+        const hasSegments = m._segments && m._segments.length > 0;
+        if (!hasContent && !hasToolCalls && !hasSegments) return false;
       }
       return true;
     });
+    const isHumanUser = (m: ChatMessage) =>
+      m.role === "user" && (m.source === "user" || (!m.isBackground && !m.source));
     let trailingUserCount = 0;
     for (let i = foreground.length - 1; i >= 0; i--) {
-      if (foreground[i].role === "user") trailingUserCount++;
+      if (isHumanUser(foreground[i])) trailingUserCount++;
       else break;
     }
     const hasStreamingPlaceholder = foreground.some((m) => m.isStreaming && m.role === "assistant");
@@ -493,7 +517,7 @@ export function useChatMessages(opts: {
     const now = Date.now();
     const lastUser = foreground[foreground.length - 1];
     const userMsgAge =
-      lastUser?.role === "user" && lastUser?.timestamp ? now - lastUser.timestamp : Infinity;
+      lastUser && isHumanUser(lastUser) && lastUser.timestamp ? now - lastUser.timestamp : Infinity;
     if (
       trailingUserCount >= 1 &&
       !isAgentProcessing &&
@@ -501,7 +525,7 @@ export function useChatMessages(opts: {
       !isStreaming &&
       userMsgAge > ORPHAN_WARN_DELAY_MS
     ) {
-      if (lastUser?.role === "user") {
+      if (lastUser && isHumanUser(lastUser)) {
         const warn =
           trailingUserCount >= 2
             ? "你已发送多条消息但 Agent 尚未回复。请等待当前任务完成，或检查网络/API 配置后重试。"
@@ -555,12 +579,67 @@ export function useChatMessages(opts: {
         (t) =>
           t.teamFromAgentId === m.teamFromAgentId &&
           t.teamToAgentId === m.teamToAgentId &&
-          Math.abs(t.timestamp - m.timestamp) < 60_000
+          Math.abs(t.timestamp - m.timestamp) < 60_000,
       );
     });
-    const direct = displayMessages.filter((m) => !isTeamChannelMessage(m));
-    return { directMessages: direct, teamMessages: dedupedTeam };
+    // 主栏 = 全量时间线（user/assistant 含 background）；team 角色只在团队栏。
+    return { directMessages: displayMessages, teamMessages: dedupedTeam };
   }, [messages, displayMessages]);
+
+  // ── 历史分页（滚动到顶自动加载更早消息）──────────────────
+  // 分页状态复位在 loadMessagesFromDb 成功路径内联执行（done/agent 切换
+  // 都会走到）；agent 切换 effect 内亦有一份 inline 复位兜底。
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [hasMoreHistory, setHasMoreHistory] = useState(true);
+  const historyOffsetRef = useRef(0);
+  const loadingOlderRef = useRef(false);
+
+  const loadOlderMessages = useCallback(async () => {
+    const owner = messagesAgentId;
+    if (!owner || loadingOlderRef.current || !hasMoreHistory) return;
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    const el = scrollContainerRef.current;
+    const prevHeight = el?.scrollHeight ?? 0;
+    try {
+      const PAGE = 100;
+      const nextOffset = historyOffsetRef.current + PAGE;
+      const older = await getChatMessages(owner, { limit: PAGE, offset: nextOffset });
+      if (!Array.isArray(older)) return;
+      historyOffsetRef.current = nextOffset;
+      if (older.length < PAGE) setHasMoreHistory(false);
+      const converted = mapDbToChatMessages(older).map((m) =>
+        m.isStreaming ? { ...m, isStreaming: false } : m,
+      );
+      setMessages((prev) => {
+        if (prev.length === 0) return converted;
+        const seen = new Set(prev.map((m) => m.id));
+        const fresh = converted.filter((m) => !seen.has(m.id));
+        if (fresh.length === 0) return prev;
+        return [...fresh, ...prev].sort((a, b) => a.timestamp - b.timestamp);
+      });
+      // 保持视口钉在原内容位置（prepend 不跳顶）
+      requestAnimationFrame(() => {
+        const el2 = scrollContainerRef.current;
+        if (el2) el2.scrollTop = el2.scrollHeight - prevHeight;
+      });
+    } catch {
+      /* 尽力而为 */
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlder(false);
+    }
+  }, [messagesAgentId, hasMoreHistory, scrollContainerRef]);
+
+  const handleMessagesScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    if (el.scrollTop <= 48 && el.scrollHeight > el.clientHeight) {
+      void loadOlderMessages();
+    }
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distFromBottom <= 72;
+  }, [loadOlderMessages]);
 
   const hasTeamComms = teamMessages.length > 0;
 
@@ -581,6 +660,9 @@ export function useChatMessages(opts: {
     scrollContainerRef,
     stickToBottomRef,
     handleMessagesScroll,
+    loadingOlder,
+    hasMoreHistory,
+    loadOlderMessages,
     isAgentProcessing,
     displayMessages,
     directMessages,

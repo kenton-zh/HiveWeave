@@ -38,6 +38,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     scrollContainerRef,
     stickToBottomRef,
     handleMessagesScroll,
+    loadingOlder,
     isAgentProcessing,
     directMessages,
     teamMessages,
@@ -107,18 +108,28 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
 
   const counterpartIds = useMemo(() => {
     const ids = new Set<string>();
+    // 主栏入站信件（digest 来源 agent）名字解析。"用户"是 message_user
+    // 收据信件的虚拟来源（非真实 agent id），请求会 400——与 system 一同排除
+    for (const msg of directMessages) {
+      if (
+        msg.fromAgentId &&
+        msg.fromAgentId !== "system" &&
+        msg.fromAgentId !== "用户"
+      )
+        ids.add(msg.fromAgentId);
+    }
     for (const msg of teamMessages) {
-      // "system" 是虚拟系统通知源（见 resolveAgentInfo），非真实 agent——
-      // 跳过它，避免对 /api/org/agents/system 发起无效请求（404 循环轰炸）。
-      if (msg.teamFromAgentId && msg.teamFromAgentId !== "system")
+      // "system"/"用户" 是虚拟通知源（见 resolveAgentInfo），非真实 agent——
+      // 跳过，避免对 /api/org/agents/{虚拟名} 发起无效请求（400 循环轰炸）。
+      if (msg.teamFromAgentId && msg.teamFromAgentId !== "system" && msg.teamFromAgentId !== "用户")
         ids.add(msg.teamFromAgentId);
-      if (msg.teamToAgentId && msg.teamToAgentId !== "system")
+      if (msg.teamToAgentId && msg.teamToAgentId !== "system" && msg.teamToAgentId !== "用户")
         ids.add(msg.teamToAgentId);
       const targetId = getDirectedAgentId(msg, agentInfo?.parentId);
-      if (targetId && targetId !== "system") ids.add(targetId);
+      if (targetId && targetId !== "system" && targetId !== "用户") ids.add(targetId);
     }
     return ids;
-  }, [teamMessages, agentInfo]);
+  }, [directMessages, teamMessages, agentInfo]);
 
   useEffect(() => {
     if (agentInfo && agentId && agentInfo.id === agentId) {
@@ -353,6 +364,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         {directMessages.length === 0 && !hasTeamComms && (
           <div className="text-center text-g-fg-4 text-sm mt-12">发送消息开始对话</div>
         )}
+        {loadingOlder && (
+          <div className="text-center text-g-fg-4 text-xs py-2">加载更早消息…</div>
+        )}
         {directMessages.map((msg) => (
           <MessageBubble
             key={msg.id}
@@ -362,6 +376,11 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             }
             thinkingElapsed={
               isStreaming && streamDraft?.assistantId === msg.id ? thinkingElapsed : null
+            }
+            sourceName={
+              msg.fromAgentId && msg.fromAgentId !== "system" && msg.fromAgentId !== "用户"
+                ? resolveAgentInfo(msg.fromAgentId).name
+                : undefined
             }
           />
         ))}
