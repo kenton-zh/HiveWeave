@@ -215,7 +215,9 @@ async def test_verify_approve_closes_parent(task_env):
     await ts.claim_task(pid, verify_id, EXEC)
     await ts.start_task(pid, verify_id)
     await ts.submit_task(
-        pid, verify_id, evidence={"tests_passed": True, "test_output": "ok"}
+        pid,
+        verify_id,
+        evidence={"verdict": "PASS", "tests_passed": True, "test_output": "ok"},
     )
     await ts.start_review(pid, verify_id)
     await ts.review_task(pid, verify_id, "approve")
