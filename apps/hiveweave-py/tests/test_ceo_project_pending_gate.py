@@ -7,6 +7,7 @@ CEO「无待办」不能只看自己名下任务：项目有 submitted 待审 / 
 
 from __future__ import annotations
 
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -198,6 +199,7 @@ async def _insert_task(
     status: str,
     creator_id: str = "someone-else",
     assignee_id: str | None = None,
+    evidence: dict | None = None,
 ):
     conn = await project_db.ensure_project_db(ws)
     now = int(time.time() * 1000)
@@ -207,6 +209,11 @@ async def _insert_task(
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [task_id, PROJECT_ID, "t", creator_id, assignee_id, status, now, now],
     )
+    if evidence is not None:
+        await conn.execute(
+            "UPDATE tasks SET evidence = ? WHERE id = ?",
+            [json.dumps(evidence), task_id],
+        )
     await conn.commit()
 
 
@@ -501,3 +508,87 @@ async def test_commit_turn_hard_reject_composes_details_then_clears():
     assert "REJECTED" in (r.error or "")
     assert "项目有 1 个 submitted 任务待审查" in (r.error or "")
     assert pop_ceo_project_pending_details(agent) == []
+
+
+# ── E4: 未解决的 FAIL 判定（复盘致命链一：FAIL 不许被收工吞掉）──────
+
+
+@pytest.mark.asyncio
+async def test_ceo_open_fail_verdict_pending(env):
+    """项目有 open 的 verdict=FAIL 终验 → pending 明细含 FAIL。"""
+    await _insert_task(
+        env["workspace_path"],
+        "t-fail",
+        status="running",
+        evidence={"verdict": "FAIL", "blocking_issues": ["/_admin 404"]},
+    )
+    with patch(
+        "hiveweave.services.org.OrgService.get_agent",
+        new=AsyncMock(return_value=_ceo_row()),
+    ):
+        pending = await ceo_project_pending_obligations(PROJECT_ID, CEO_ID)
+    assert any("FAIL" in p and "verdict" in p for p in pending)
+
+
+@pytest.mark.asyncio
+async def test_ceo_closed_fail_verdict_not_pending(env):
+    """FAIL 终验已 closed/cancelled → 不拦 CEO 收工。"""
+    await _insert_task(
+        env["workspace_path"],
+        "t-fail-closed",
+        status="closed",
+        evidence={"verdict": "FAIL", "blocking_issues": ["x"]},
+    )
+    with patch(
+        "hiveweave.services.org.OrgService.get_agent",
+        new=AsyncMock(return_value=_ceo_row()),
+    ):
+        pending = await ceo_project_pending_obligations(PROJECT_ID, CEO_ID)
+    assert not any("FAIL" in p and "verdict" in p for p in pending)
+
+
+@pytest.mark.asyncio
+async def test_ceo_pass_or_unverdict_verdict_not_pending(env):
+    """verdict=PASS 或无 verdict → 不触发 FAIL 检查。"""
+    await _insert_task(
+        env["workspace_path"],
+        "t-pass",
+        status="running",
+        evidence={"verdict": "PASS", "tests_passed": True},
+    )
+    await _insert_task(
+        env["workspace_path"], "t-legacy", status="running", evidence={}
+    )
+    with patch(
+        "hiveweave.services.org.OrgService.get_agent",
+        new=AsyncMock(return_value=_ceo_row()),
+    ):
+        pending = await ceo_project_pending_obligations(PROJECT_ID, CEO_ID)
+    assert not any("FAIL" in p and "verdict" in p for p in pending)
+
+
+@pytest.mark.asyncio
+async def test_pre_check_done_slice_flags_open_fail_verdict(env):
+    """预检层：open FAIL 时 CEO done_slice 同步预检被拒并带明细。"""
+    await _insert_task(
+        env["workspace_path"],
+        "t-fail-pre",
+        status="running",
+        evidence={"verdict": "FAIL", "blocking_issues": ["/x"]},
+    )
+    with patch(
+        "hiveweave.services.org.OrgService.get_agent",
+        new=AsyncMock(return_value=_ceo_row()),
+    ), patch(
+        "hiveweave.services.inbox.InboxService.get_outstanding_ask_senders",
+        new=AsyncMock(return_value=set()),
+    ), patch(
+        "hiveweave.services.inbox.InboxService.get_sent_recipients_since",
+        new=AsyncMock(return_value=set()),
+    ):
+        violations = await pre_check_exit_gates(
+            CEO_ID, PROJECT_ID, phase="done_slice"
+        )
+    assert "CEO_PROJECT_PENDING" in violations
+    details = pop_ceo_project_pending_details(CEO_ID)
+    assert any("FAIL" in d for d in details)

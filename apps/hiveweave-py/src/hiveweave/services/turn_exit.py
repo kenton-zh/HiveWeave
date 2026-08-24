@@ -1111,6 +1111,26 @@ async def ceo_project_pending_obligations(
     except Exception as e:
         log.debug("ceo_project_pending_idle_leaves_failed", error=str(e))
 
+    # 4. 未解决的 FAIL 判定（终验 verdict=FAIL，复盘致命链一）：项目有
+    #    未翻转的 FAIL 终验时 CEO 收工必须被拦——FAIL 不许被 approve/waiver
+    #    静默吞掉，verdict 数据化（E1）后这里就是它的强制出口。
+    try:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks "
+            "WHERE is_archived = 0 AND status NOT IN ('closed','cancelled') "
+            "AND json_extract(evidence, '$.verdict') = 'FAIL'"
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        count = int(row["c"] or 0) if row else 0
+        if count > 0:
+            pending.append(
+                f"项目有 {count} 个未解决的 FAIL 终验判定（verdict=FAIL，"
+                "禁止收工放行，请先走 rework 修复）"
+            )
+    except Exception as e:
+        log.debug("ceo_project_pending_open_fail_failed", error=str(e))
+
     return pending
 
 

@@ -168,6 +168,16 @@ async def waive_attestation_tool(
     if not task:
         return ToolResult.err(f"Task not found: {params.task_id}")
 
+    # E3 waiver 治理（复盘致命链一）：verdict=FAIL 的结论不可豁免。
+    # waiver 的豁免边界是「凭证缺失」，永不覆盖「结论不合格」——FAIL 只能
+    # 走 rework 修复翻转 verdict。get_task 已把 evidence 反序列化为 dict。
+    verdict = task.get("evidence") or {}
+    if isinstance(verdict, dict) and verdict.get("verdict") == "FAIL":
+        return ToolResult.err(
+            "waive_attestation rejected: task evidence verdict=FAIL——"
+            "结论不合格不可豁免（waiver 只豁免凭证缺失，请走 rework 返修）"
+        )
+
     # Lifetime cap — escape hatch must stay narrower than the front door
     prior = await count_waivers(project_id, params.task_id)
     if prior >= MAX_WAIVERS_PER_TASK:

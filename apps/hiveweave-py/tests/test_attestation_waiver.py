@@ -15,7 +15,7 @@ from __future__ import annotations
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -151,6 +151,116 @@ async def test_waiver_expires(env):
     await attestation_service.ensure_schema(PROJECT_ID)
     # 刚创建就过期
     assert await has_valid_waiver(PROJECT_ID, "t-exp") is False
+
+
+# ── E3 waiver 治理：verdict=FAIL 的结论不可豁免（复盘致命链一）──────
+
+
+@pytest.mark.asyncio
+async def test_waive_fail_verdict_rejected(env):
+    """E3-①verdict=FAIL 的任务 waive → 硬拒，文案点名结论不可豁免 + rework。"""
+    from hiveweave.tools.task_tools import (
+        WaiveAttestationParams,
+        waive_attestation_tool,
+    )
+
+    task = {
+        "id": "t-verify-fail",
+        "title": "VERIFY: feature",
+        "tags": ["verify", "mandatory"],
+        "assignee_id": "qa1",
+        "evidence": {
+            "verdict": "FAIL",
+            "blocking_issues": ["/_admin 全线 404"],
+        },
+    }
+    with (
+        patch(
+            "hiveweave.tools.helpers.get_project_id",
+            AsyncMock(return_value=PROJECT_ID),
+        ),
+        patch("hiveweave.services.task.TaskService") as TS,
+        patch("hiveweave.services.org.OrgService") as Org,
+        patch(
+            "hiveweave.services.policy.infer_role_family",
+            return_value="ceo",
+        ),
+        patch(
+            "hiveweave.services.attestation.count_waivers",
+            AsyncMock(return_value=0),
+        ),
+        patch(
+            "hiveweave.services.attestation.has_valid_waiver",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        TS.return_value.get_task = AsyncMock(return_value=task)
+        Org.return_value.get_agent = AsyncMock(
+            return_value={"id": "ceo1", "role": "CEO"}
+        )
+        result = await waive_attestation_tool(
+            WaiveAttestationParams(
+                taskId="t-verify-fail",
+                reason="终验 FAIL 但用户催交付，申请豁免放行该终验",
+            ),
+            agent_id="ceo1",
+            workspace=env["workspace_path"],
+        )
+    assert result.success is False
+    text = (result.output or "") + (result.error or "")
+    assert "结论不合格不可豁免" in text
+    assert "rework" in text
+
+
+@pytest.mark.asyncio
+async def test_waive_non_fail_verdict_unaffected(env):
+    """E3-②PASS / 无 verdict 的任务不触发 E3 硬拒（其他闸门照常）。"""
+    from hiveweave.tools.task_tools import (
+        WaiveAttestationParams,
+        waive_attestation_tool,
+    )
+
+    task = {
+        "id": "t-verify-pass",
+        "title": "VERIFY: feature",
+        "tags": ["verify", "mandatory"],
+        "assignee_id": "qa1",
+        "evidence": {"verdict": "PASS", "tests_passed": True},
+    }
+    with (
+        patch(
+            "hiveweave.tools.helpers.get_project_id",
+            AsyncMock(return_value=PROJECT_ID),
+        ),
+        patch("hiveweave.services.task.TaskService") as TS,
+        patch("hiveweave.services.org.OrgService") as Org,
+        patch(
+            "hiveweave.services.policy.infer_role_family",
+            return_value="ceo",
+        ),
+        patch(
+            "hiveweave.services.attestation.count_waivers",
+            AsyncMock(return_value=0),
+        ),
+        patch(
+            "hiveweave.services.attestation.has_valid_waiver",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        TS.return_value.get_task = AsyncMock(return_value=task)
+        Org.return_value.get_agent = AsyncMock(
+            return_value={"id": "ceo1", "role": "CEO"}
+        )
+        result = await waive_attestation_tool(
+            WaiveAttestationParams(
+                taskId="t-verify-pass",
+                reason="无 UI 模块走 bash 验证日志替代，豁免该终验凭证",
+            ),
+            agent_id="ceo1",
+            workspace=env["workspace_path"],
+        )
+    text = (result.output or "") + (result.error or "")
+    assert "结论不合格不可豁免" not in text
 
 
 # ── P0-2: rework 时 invalidate valid waiver ─────────────────
