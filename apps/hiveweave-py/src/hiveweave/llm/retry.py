@@ -85,6 +85,37 @@ def is_retryable_status(status: int) -> bool:
     return status in RETRYABLE_STATUSES
 
 
+# ── E7: 容量错误分类（vs 瞬时限流）─────────────────────────────
+# 复盘致命链二：daily_quota / GoUsageLimitError 是**容量耗尽**（5 小时滚动
+# 配额 / 日配额），秒级退避重试无济于事，只会白撞 75 个 error runs。容量
+# 错误的恢复钥匙是「配额窗口重置」，应进项目级暂停/排队，而不是逐次重试。
+_CAPACITY_NEEDLES: tuple[str, ...] = (
+    "gousagelimiterror",        # muse / ox 5 小时滚动配额
+    "usage_limit_reached",
+    "usage limit exceeded",
+    "daily_quota",
+    "daily quota",
+    "quota exhausted",
+    "quota_exhausted",
+    "quota exceeded",
+    "quota_exceeded",
+    "insufficient quota",
+)
+
+
+def is_capacity_error(message: str) -> bool:
+    """是否容量类错误（配额耗尽）。
+
+    与瞬时限流（typical 429 rate limit）区分：容量错误的重置以「窗口」计，
+    进重试只会白撞；is_daily_quota（header 解析 > 10min）在此之上给出
+    确定的重置时刻。
+    """
+    if not message:
+        return False
+    m = str(message).lower()
+    return any(n in m for n in _CAPACITY_NEEDLES)
+
+
 def matches_retryable_message(value: str) -> bool:
     """判断错误文本是否命中可重试内容模式（厂商无关）。
 
@@ -385,6 +416,16 @@ class RetryHandler:
                 # 不可重试 — 直接抛出
                 raise
             except RetryableError as e:
+                # E7: 容量错误（配额耗尽）不进逐次重试——退避解决不了窗口级
+                # 问题，白撞只会更快烧完上下文/预算。立即上抛，交给 agent 层
+                # 项目级暂停/排队（配额窗口恢复后再批量唤醒）。
+                if is_capacity_error(str(e)):
+                    log.warning(
+                        "capacity_error_no_retry",
+                        status=e.status,
+                        error=str(e)[:200],
+                    )
+                    raise
                 last_exc = e
                 if attempt >= self.max_retries:
                     log.warning(

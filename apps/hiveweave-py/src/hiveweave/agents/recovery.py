@@ -27,6 +27,7 @@ from hiveweave.agents.constants import (
     RATE_LIMIT_SOFT_STREAK_ESCALATE,
 )
 from hiveweave.agents.helpers.rate_limit import (
+    broadcast_project_capacity_pause,
     broadcast_project_rate_limit,
     is_account_rate_limit,
     is_rate_limit_error,
@@ -423,6 +424,32 @@ async def handle_error(agent: Any, error: Exception) -> None:
         retry_after_s = quota.get("retry_after_s")
         is_daily = bool(quota.get("is_daily_quota"))
         reset_at = quota.get("reset_at_epoch")
+
+        # E7: 容量错误（daily_quota / GoUsageLimitError）→ 组织级降速 + park，
+        # 不进 429 退避阶梯（秒级退避救不了窗口级配额，白撞只会烧预算）。
+        from hiveweave.llm.retry import is_capacity_error
+
+        if is_capacity_error(error_msg):
+            reset_at_epoch = float(reset_at) if reset_at else None
+            try:
+                await broadcast_project_capacity_pause(
+                    agent.project_id,
+                    reset_at_epoch,
+                    source_agent_id=agent.id,
+                )
+            except Exception as e:
+                log.debug(
+                    "project_capacity_broadcast_error", error=str(e)
+                )
+            await agent._park_after_quota_exhausted(
+                inbox_ids=inbox_ids,
+                error_msg=error_msg,
+                reset_at_epoch=reset_at_epoch,
+                reason="daily_quota" if is_daily else "capacity",
+            )
+            agent._cancel_safety_timer()
+            await agent._go_idle()
+            return
 
         # No header → count soft streak with backoff ladder
         if retry_after_s is None:

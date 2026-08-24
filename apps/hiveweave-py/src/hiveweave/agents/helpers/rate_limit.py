@@ -28,6 +28,17 @@ _balance_exhausted_until: float = 0.0
 # 402 熔断持续时间：余额耗尽需要人工充值，给足时间（默认 1 小时）。
 BALANCE_EXHAUSTED_COOLDOWN_S = 3_600.0
 
+# ── E7 项目级容量暂停（配额风暴组织级降速）────────────────────
+# 与短时 account 上限（_project_rate_limit_until）不同：容量错误
+# （daily_quota / GoUsageLimitError）的恢复钥匙是「配额窗口重置」，
+# 暂停到确定的 reset_at 时刻，恢复后由既有 watcher/cooldown 批量唤醒。
+# 无确定重置时刻时的兜底暂停时长（对齐 402 熔断粒度，1 小时，唤醒后
+# 若仍失败会重新暂停）。
+CAPACITY_PROJECT_COOLDOWN_S = 3_600.0
+
+# project_id -> reset_at epoch（配额窗口重置时刻）
+_project_capacity_until: dict[str, float] = {}
+
 
 def is_balance_error(error: BaseException | None) -> bool:
     """True when the failure is account balance exhaustion (HTTP 402).
@@ -206,6 +217,79 @@ def arm_project_rate_limit(project_id: str, cooldown_s: float) -> float:
     if until > prev:
         _project_rate_limit_until[project_id] = until
     return project_rate_limit_remaining(project_id)
+
+
+# ── E7: 项目级容量暂停（配额风暴）────────────────────────────
+
+
+def project_capacity_remaining(project_id: str | None) -> float:
+    """距项目容量暂停解除的秒数（0 = 未暂停/已恢复）。"""
+    if not project_id:
+        return 0.0
+    until = _project_capacity_until.get(project_id, 0.0)
+    left = until - time.time()
+    if left <= 0:
+        _project_capacity_until.pop(project_id, None)
+        return 0.0
+    return left
+
+
+def arm_project_capacity_pause(
+    project_id: str, reset_at_epoch: float | None
+) -> float:
+    """把项目的容量暂停设立到配额窗口重置时刻。"""
+    if not project_id:
+        return 0.0
+    if not reset_at_epoch or float(reset_at_epoch) <= time.time():
+        return project_capacity_remaining(project_id)
+    until = float(reset_at_epoch)
+    prev = _project_capacity_until.get(project_id, 0.0)
+    if until > prev:
+        _project_capacity_until[project_id] = until
+    return project_capacity_remaining(project_id)
+
+
+def broadcast_project_capacity_pause(
+    project_id: str,
+    reset_at_epoch: float | None,
+    *,
+    source_agent_id: str | None = None,
+) -> int:
+    """配额风暴组织级降速：冷却本项目全部活体 agent 到配额窗口重置。
+
+    容量错误是整个组织共享的墙（同 key 共享配额）——一个 agent 撞到
+    daily_quota / GoUsageLimitError，其余 agent 的唤醒请求同样必败。
+    参照 402 熔断模式，但粒度是项目级。恢复 = cooldown 到期 + 既有
+    watcher/补偿机制批量唤醒（无需跳闸逻辑，自动生效）。
+    Returns number of peer agents cooled.
+    """
+    if not reset_at_epoch:
+        reset_at_epoch = time.time() + CAPACITY_PROJECT_COOLDOWN_S
+    remaining = arm_project_capacity_pause(project_id, reset_at_epoch)
+    cooled = 0
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+
+        peers = list(agent_manager.list_all())
+        for peer in peers:
+            if getattr(peer, "project_id", None) != project_id:
+                continue
+            if source_agent_id and getattr(peer, "id", None) == source_agent_id:
+                continue
+            try:
+                peer._arm_resume_cooldown(max(remaining, 60.0))
+                cooled += 1
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug("project_capacity_broadcast_failed", error=str(e))
+    log.warning(
+        "project_capacity_paused",
+        project_id=project_id,
+        reset_in_s=round(remaining, 1),
+        peers_cooled=cooled,
+    )
+    return cooled
 
 
 def circuit_open_for_agent(agent: Any) -> bool:
