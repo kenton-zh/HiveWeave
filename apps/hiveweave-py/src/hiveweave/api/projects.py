@@ -849,6 +849,16 @@ async def create_project(body: ProjectCreate) -> dict:
         log.warning("acl_sandbox_project_grant_spawn_failed",
                     workspace=str(ws), error=str(e))
 
+    # E9 (复盘 P1)：venv 产品化 —— 后台铺设 workspace 内 .venv（best-effort，
+    # 失败仅告警不阻断创建；gitignore 兜底条目 + 解释器定位由 venv_setup 提供）。
+    try:
+        from hiveweave.services.venv_setup import ensure_project_venv_async
+
+        asyncio.create_task(ensure_project_venv_async(str(ws)))
+    except Exception as e:
+        log.warning("project_venv_init_spawn_failed",
+                    workspace=str(ws), error=str(e))
+
     charter = _build_charter_dict(body)
     # ── 收养路径的 id 决策 ─────────────────────────────────────
     # 正常收养：沿用旧 project_id（数据表全部无需迁移）。

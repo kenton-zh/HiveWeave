@@ -291,7 +291,8 @@ def _maybe_append_rejection_hint(agent_id: str, boundary: str, result: dict) -> 
 
 async def spawn_confined(
     *,
-    command: str,
+    command: str | None = None,
+    argv: list[str] | None = None,
     workdir: str,
     workspace_path: str,
     agent_id: str,
@@ -307,7 +308,10 @@ async def spawn_confined(
     ``project_workspace_path`` = 项目根（git/cache SID 派生源 §4.8/§8）；
     缺省回退到 workspace_path（P0 单目录形态）。
     ``env_extra`` = 调用方增量 env（dev server 端口注入等）。
+    E10：优先 ``argv``（逐元素引用修剥引号根因）；不传回退整串 ``command``。
     """
+    if argv is None and command is None:
+        raise ValueError("spawn_confined requires command or argv")
     if not _is_windows():
         return None
     if not settings.acl_sandbox:
@@ -352,7 +356,10 @@ async def spawn_confined(
                 workdir, policy.cache_dir, policy.temp_dir, env_extra)
             runner = _ensure_runner()
             if long_running:
-                job = await runner.run_long_running(token, command, workdir, env)
+                job = await runner.run_long_running(
+                    token, command, workdir, env,
+                    **({"argv": argv} if argv is not None else {}),
+                )
                 return {
                     "long_running": True,
                     "job": job,
@@ -360,7 +367,10 @@ async def spawn_confined(
                     "temp_dir": policy.temp_dir,
                     "cache_dir": policy.cache_dir,
                 }
-            result = await runner.run_foreground(token, command, workdir, env, timeout_s)
+            result = await runner.run_foreground(
+                token, command, workdir, env, timeout_s,
+                **({"argv": argv} if argv is not None else {}),
+            )
         finally:
             token.Close()
     except SandboxUnavailableError:

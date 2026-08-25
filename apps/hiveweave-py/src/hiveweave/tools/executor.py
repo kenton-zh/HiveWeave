@@ -119,10 +119,45 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["command"],
     },
+    "python_script": {
+        "description": (
+            "Run Python code in your workspace (first-class tool). "
+            "Provide 'script' (source) or 'scriptPath' (workspace-relative "
+            ".py file). Runs in a fresh process using the project .venv "
+            "interpreter when available. cwd = workspace. "
+            "Check Exit code / error on every result (0 = ok). "
+            "Long output truncated to head+tail. "
+            "Use for data munging / one-off logic / scripted automation — "
+            "avoid bash + python -c quoting pain. "
+            "Set timeout ms (5s–10min, default 120000) for heavy loops."
+        ),
+        "properties": {
+            "script": {
+                "type": "string",
+                "aliases": ["code"],
+                "description": "Python source to run (multi-line OK).",
+            },
+            "scriptPath": {
+                "type": "string",
+                "aliases": ["script_path", "path", "file"],
+                "description": "Workspace-relative path to an existing .py file.",
+            },
+            "timeout": {
+                "type": "integer",
+                "aliases": ["timeout_ms", "timeoutMs"],
+                "description": "Timeout ms (5s–10min). Default 120000. Values 1-600 treated as seconds.",
+            },
+        },
+        "required": ["script"],
+    },
     "browse": {
         "description": (
             "Drive Chromium via agent-browser CLI. Typical: "
             "goto URL → snapshot -i → click @eN → screenshot. "
+            "Click reliability: if native click triggers no UI change "
+            "(cross-instance flaky), use eval to run JS el.click() — "
+            "the productized E12 fallback, e.g. "
+            "browse eval \"document.querySelector('x').click();\". "
             "goto always resets viewport to 1280×900. Mobile: "
             "viewport 390 844 AFTER goto, then screenshot. "
             "After screenshot, pixels inject into the next turn. "

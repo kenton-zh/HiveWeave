@@ -463,3 +463,41 @@ class RunLedger:
 
 # Singleton
 run_ledger = RunLedger()
+
+
+async def sweep_stale_agent_runs(workspace_path: str | None) -> int:
+    """E16 (复盘 P2)：启动收尾 sweep —— 清算上次进程残留的 running runs。
+
+    Agent 长驻服务在 turn 中途被杀时，agent_runs 会残留 ``status='running'``
+    的孤儿行（无 ended_at），污染查询/统计并掩盖真实收尾语义。启动时把
+    workspace 内所有仍为 running 的 run 归并为 ``interrupted``（预留步骤，
+    与现有 interrupt_run 语义一致，供恢复/审计读取）。返回清理行数。
+    """
+    if not workspace_path:
+        return 0
+    now = _now_ms()
+    reason = "startup_sweep: stale running run from prior process"
+    try:
+        conn = await project_db.ensure_project_db(workspace_path)
+        cursor = await conn.execute(
+            "SELECT id FROM agent_runs WHERE status = 'running'"
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        cursor = await conn.execute(
+            "UPDATE agent_runs SET status = 'interrupted', ended_at = ?, "
+            "error_reason = ? WHERE status = 'running'",
+            [now, reason],
+        )
+        await cursor.close()
+        if rows:
+            log.info(
+                "run_ledger.startup_sweep",
+                workspace=str(workspace_path),
+                primary_count=len(rows),
+            )
+        return len(rows)
+    except Exception as e:
+        log.debug("run_ledger.startup_sweep_failed",
+                  workspace=str(workspace_path), error=str(e))
+        return 0

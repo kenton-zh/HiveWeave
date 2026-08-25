@@ -107,7 +107,7 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
 # Do NOT include hire/dispatch/bash elevation here for "readonly" meaning;
 # PolicyService still hard-denies based on role family.
 READONLY_TOOLS = _BASE_TOOLS | frozenset({
-    "bash", "bash_main", "write_file", "browse", "browse_main", "assert_visual", "game_run_case", "game_run_case_main", "edit_file",
+    "bash", "bash_main", "python_script", "write_file", "browse", "browse_main", "assert_visual", "game_run_case", "game_run_case_main", "edit_file",
     "job_kill",
     "spawn_subagent",
     "generate_image",

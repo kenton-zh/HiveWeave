@@ -14,6 +14,8 @@ from .constants import (
     ACTIVITY_EXTEND_S,
     BUDGET_PACING_HINT_S,
     DEFAULT_PLACEHOLDER,
+    FORCE_COMMIT_GRACE_ROUNDS,
+    FORCE_COMMIT_ROUNDS,
     HARD_TOTAL_TIMEOUT_S,
     MAX_TOOLS_PER_ROUND,
     MIN_ROUND_BUDGET_S,
@@ -92,6 +94,8 @@ class ToolLoopMixin:
         round_num: int,
         last_usage: dict | None,
         usage_rounds: list[dict],
+        note: str | None = None,
+        reason: str = "hard_budget",
     ) -> dict:
         """硬预算耗尽的优雅收口（所有预算闸口共用）。
 
@@ -103,15 +107,19 @@ class ToolLoopMixin:
         wake 的 agent 能从历史中读懂「上轮为何结束、如何继续」；否则
         它面对一截突兀的半截文本，不知预算耗尽，容易重试同款重型
         操作再次撞闸。
+
+        E14：``note``/``reason`` 可覆盖默认措辞 —— 轮次疏导上限
+        （force_commit_rounds）宽限轮用尽后同样走本收口，仅文案区分。
         """
         base = self._strip_placeholder(text_acc)
-        note = (
-            "[TURN BUDGET] Hard turn budget exhausted — all progress so "
-            "far is kept. Call commit_turn(phase='in_progress') to "
-            "checkpoint, then continue next wake with smaller slices "
-            "(split large operations; prefer background + polling over "
-            "long blocking calls)."
-        )
+        if note is None:
+            note = (
+                "[TURN BUDGET] Hard turn budget exhausted — all progress so "
+                "far is kept. Call commit_turn(phase='in_progress') to "
+                "checkpoint, then continue next wake with smaller slices "
+                "(split large operations; prefer background + polling over "
+                "long blocking calls)."
+            )
         final_text = f"{base}\n\n{note}" if base else note
         tool_turn_acc.append({"role": "assistant", "content": final_text})
         return {
@@ -124,6 +132,7 @@ class ToolLoopMixin:
             "usage": last_usage,
             "usage_rounds": usage_rounds,
             "budget_exhausted": True,
+            "steering_reason": reason,
         }
 
     async def _run_tool_loop(
@@ -192,6 +201,8 @@ class ToolLoopMixin:
         # turn 必然已注入 pacing（审计 2026-08-08 P1）。
         pacing_hint_injected = False
         pacing_hint_round = -1
+        # E14: 轮次疏导线提示一次性（不重复塞系统消息浪费 token）
+        force_commit_hint_injected = False
 
         # Token metering: 累加每轮归一化 usage（供 agent 层落库）。
         # 每轮只保留末轮 usage 在 last_usage，中间轮在这里累积。
@@ -311,6 +322,63 @@ class ToolLoopMixin:
                 # One more soft slice to allow commit_turn
                 soft_deadline = min(
                     now_mono + ACTIVITY_EXTEND_S, hard_deadline
+                )
+
+            # E14 (复盘 P2): turn 工具轮次疏导上限 —— 单 turn 磨了太多
+            # 工具轮次（S7 根源：44+ 轮无界磨，管理通道被屏蔽）时主动疏导：
+            # 1) 首达 FORCE_COMMIT_ROUNDS → 注入强制 commit 提示（一次性，
+            #    不打断当前轮，给模型主动收口机会）；
+            # 2) 过 GRACE 宽限仍未 commit → 优雅收口（保留全部产出，
+            #    语义同 budget_exhausted → completion.py 自动 retrigger 续跑）。
+            if (
+                tool_history
+                and round_num >= FORCE_COMMIT_ROUNDS
+                and not force_commit_hint_injected
+            ):
+                force_commit_hint_injected = True
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"[TURN ROUND CAP] 已达单 turn 工具轮次疏导线 "
+                        f"({FORCE_COMMIT_ROUNDS} 轮)。本轮已足够：停止继续"
+                        "调用工具，立即调用 commit_turn(phase='in_progress') "
+                        "收束当前 slice —— 平台会自动续跑，上下文与产出全部"
+                        "保留。不要启动新的重型操作 / 全量测试 / 长轮询。"
+                    ),
+                })
+                log.info(
+                    "stream_round_cap_hint",
+                    agent_id=agent_id,
+                    round=round_num,
+                    reason="force_commit_steering",
+                )
+            if (
+                tool_history
+                and round_num >= FORCE_COMMIT_ROUNDS + FORCE_COMMIT_GRACE_ROUNDS
+            ):
+                log.warning(
+                    "stream_round_cap_forced_commit",
+                    agent_id=agent_id,
+                    round=round_num,
+                    tools=len(tool_history),
+                    force_commit_rounds=FORCE_COMMIT_ROUNDS,
+                )
+                return self._budget_exhausted_result(
+                    text_acc=text_acc,
+                    thinking_acc=thinking_acc,
+                    tool_history=tool_history,
+                    tool_turn_acc=tool_turn_acc,
+                    round_num=round_num,
+                    last_usage=last_usage,
+                    usage_rounds=usage_rounds,
+                    note=(
+                        f"[TURN ROUND CAP] 单 turn 工具轮次超过疏导线"
+                        f"（{FORCE_COMMIT_ROUNDS}+{FORCE_COMMIT_GRACE_ROUNDS}"
+                        " 轮仍未被 commit_turn 收口）。全部产出已保留。"
+                        "立即调用 commit_turn(phase='in_progress') 收束，"
+                        "平台会自动续跑；后续避免单 turn 内无限调用工具。"
+                    ),
+                    reason="force_commit_rounds",
                 )
 
             # 通知回调：新一轮开始（用于重置流式文本累积器）

@@ -269,8 +269,9 @@ async def _run_registered_dev_server(
     try:
         if acl_sandbox_active():
             # P1 §5.7：dev server 收编 —— 受限长驻 spawn，注册 process_registry。
+            # E10：传 argv（逐元素引用，修剥引号根因）。
             from hiveweave.services.acl_sandbox.integration import (
-                build_confined_command,
+                build_confined_argv,
                 resolve_project_root,
             )
             from hiveweave.services.acl_sandbox.service import spawn_confined
@@ -285,7 +286,7 @@ async def _run_registered_dev_server(
                 }
             project_root = await resolve_project_root(project_id)
             sres = await spawn_confined(
-                command=build_confined_command(cmd2),
+                argv=build_confined_argv(cmd2),
                 workdir=cwd,
                 workspace_path=cwd,
                 agent_id=agent_id or "unknown",
@@ -479,6 +480,30 @@ def _build_safe_env(cwd: str) -> dict[str, str]:
 
 
 # ── P1: ACL 沙箱接线（spec §5.7） ─────────────────────────────
+def _maybe_append_venv_hint(workspace: str | None, error_msg: str) -> str:
+    """E9: python 依赖缺失失败时提示项目 .venv 解释器（官方依赖路径）。
+
+    命中 ``ModuleNotFoundError`` / ``No module named`` 且项目已初始化 .venv
+    时追加一行指引；未命中/无 venv → 原样返回（fail-open，零扰动）。
+    """
+    low = error_msg.lower()
+    if "module not found error" not in low and "no module named" not in low:
+        return error_msg
+    try:
+        from hiveweave.services.venv_setup import project_venv_python
+
+        venv_py = project_venv_python(workspace)
+        if not venv_py:
+            return error_msg
+        return error_msg + (
+            f"\n\n[venv hint] 项目已提供虚拟环境，缺的依赖请装进 .venv "
+            f"(uv pip install --python \"{venv_py}\" <包>)，再用 "
+            f"\"{venv_py}\" 运行以生效（勿用 --target 装进源码树）。"
+        )
+    except Exception:
+        return error_msg
+
+
 def _native_shaped(result: dict) -> dict[str, Any]:
     """把 spawn_confined 的 {exit_code,stdout,stderr,timed_out} 归一为 native 形态。"""
     stdout = result.get("stdout", "") or ""
@@ -509,7 +534,7 @@ async def _run_sandboxed(
     """沙箱 on 时受限执行；返回 None = 沙箱未启用（调用方回退 native）。"""
     from hiveweave.services.acl_sandbox.integration import (
         acl_sandbox_active,
-        build_confined_command,
+        build_confined_argv,
         resolve_project_root,
     )
     from hiveweave.services.acl_sandbox.service import spawn_confined
@@ -517,9 +542,8 @@ async def _run_sandboxed(
     if not acl_sandbox_active():
         return None
     project_root = await resolve_project_root(project_id)
-    confined = build_confined_command(command)
     result = await spawn_confined(
-        command=confined,
+        argv=build_confined_argv(command),
         workdir=cwd,
         workspace_path=workspace_path,
         agent_id=agent_id or "unknown",
@@ -1291,6 +1315,7 @@ async def execute_bash(
     error_msg = f"Command exited with code {exit_code}"
     if detail:
         error_msg = f"{error_msg}\n{detail}"
+    error_msg = _maybe_append_venv_hint(ws, error_msg)
     return {
         "success": False,  # non-zero exit is not success
         "output": f"{body}\n\n{cwd_hint}\nExit code: {exit_code}",
@@ -1397,6 +1422,7 @@ async def execute_run_command(
     error_msg = f"Command exited with code {exit_code}"
     if detail:
         error_msg = f"{error_msg}\n{detail}"
+    error_msg = _maybe_append_venv_hint(ws, error_msg)
     return {
         "success": False,
         "output": f"{body}\n\nExit code: {exit_code}",

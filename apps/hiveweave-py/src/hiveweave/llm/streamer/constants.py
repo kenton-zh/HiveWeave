@@ -19,6 +19,19 @@ import os as _os
 MAX_TOOL_ROUNDS = 1_000_000
 """最大 tool loop 轮次 — 仅作极端安全网，实际由 doom loop 按工具分级保护。峰值复现真实死循环(同参数反复调用) 。"""
 
+# ── E14 (复盘 P2): turn 工具轮次疏导上限 ───────────────────────
+# 复盘 S7 根源：单 turn 无界磨工具轮次（44+ 轮 × 120k tokens），busy 期
+# 间管理通道被屏蔽。疏导设计：单 turn 内工具轮次过 FORCE_COMMIT_ROUNDS →
+# 注入强制 commit_turn 提示；再过 GRACE 轮仍未 commit → 优雅收口（复用
+# budget_exhausted 收口 + agent 层自动 retrigger 续跑，零产出损失）。
+# 与 MAX_TOOL_ROUNDS（安全网）不同：本阈值是主动疏导，默认远低于安全网。
+FORCE_COMMIT_ROUNDS = int(_os.environ.get("HIVEWEAVE_FORCE_COMMIT_ROUNDS", "40"))
+"""单 turn 工具轮次疏导线：达到该轮数强制提示 commit_turn(in_progress)。"""
+FORCE_COMMIT_GRACE_ROUNDS = int(
+    _os.environ.get("HIVEWEAVE_FORCE_COMMIT_GRACE_ROUNDS", "8")
+)
+"""疏导线后的宽限轮数：仍未 commit → 优雅收口强制续跑。"""
+
 # DESIGN-2 / Magentic-One Progress Ledger: consecutive no-progress rounds
 # force an outer-loop exit (commit / replan) instead of burning tokens.
 TOOL_LOOP_STALL_LIMIT = 2

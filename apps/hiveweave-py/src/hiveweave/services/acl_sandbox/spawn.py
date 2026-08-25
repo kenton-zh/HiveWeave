@@ -149,16 +149,25 @@ class _Spawned:
 _SPAWN_INHERIT_LOCK = threading.Lock()
 
 
-def _spawn_sync(token, command: str, cwd: str, env: dict | None) -> _Spawned:
+def _spawn_sync(token, command: str | None = None, cwd: str = ".", env: dict | None = None, *, argv: list[str] | None = None) -> _Spawned:
     """受限 spawn：匿名管道 + CreateProcessAsUserW + KILL_ON_CLOSE Job。
 
     同步阻塞（微秒级）+ 继承窗口全局串行。子进程以 CREATE_SUSPENDED 启动，
     AssignProcessToJobObject 后 ResumeThread —— 避免子进程抢先 fork 孙进程
     逃逸出 Job。
+
+    E10（argv 化）：传 ``argv`` 时逐元素按 CommandLineToArgvW 规则引用
+    （修剥引号根因）；不传则沿用整串 ``command``（兼容 sentinel/game_time）。
     """
     _require()
     sa = win32security.SECURITY_ATTRIBUTES()
     sa.bInheritHandle = 1
+    if argv is not None:
+        from hiveweave.services.acl_sandbox.integration import quote_windows_argv
+
+        command = quote_windows_argv(argv)
+    elif command is None:
+        command = ""
     with _SPAWN_INHERIT_LOCK:
         out_r, out_w = win32pipe.CreatePipe(sa, 0)
         err_r, err_w = win32pipe.CreatePipe(sa, 0)
@@ -212,17 +221,17 @@ class ConfinedRunner:
 
     # ── 前台命令 ────────────────────────────────────────────
     async def run_foreground(
-        self, token, command: str, cwd: str, env: dict | None,
-        timeout_s: float | None,
+        self, token, command: str | None = None, cwd: str = ".", env: dict | None = None,
+        timeout_s: float | None = None, *, argv: list[str] | None = None,
     ) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._drain_pool,
-            self._run_foreground_sync, token, command, cwd, env, timeout_s,
+            self._run_foreground_sync, token, command, cwd, env, timeout_s, argv,
         )
 
-    def _run_foreground_sync(self, token, command, cwd, env, timeout_s) -> dict[str, Any]:
-        spawned = _spawn_sync(token, command, cwd, env)
+    def _run_foreground_sync(self, token, command, cwd, env, timeout_s, argv=None) -> dict[str, Any]:
+        spawned = _spawn_sync(token, command, cwd, env, argv=argv)
         timed_out = False
         start = time.monotonic()
         out_buf: list[bytes] = []
@@ -251,10 +260,13 @@ class ConfinedRunner:
 
     # ── 长驻命令（dev server / unbounded job） ──────────────
     async def run_long_running(
-        self, token, command: str, cwd: str, env: dict | None,
+        self, token, command: str | None = None, cwd: str = ".", env: dict | None = None, *, argv: list[str] | None = None,
     ) -> "LongRunningJob":
         loop = asyncio.get_running_loop()
-        spawned = await asyncio.to_thread(_spawn_sync, token, command, cwd, env)
+        spawned = await asyncio.to_thread(
+            _spawn_sync, token, command, cwd, env,
+            **({"argv": argv} if argv is not None else {}),
+        )
         job = LongRunningJob(spawned, loop)
         with _ACTIVE_LOCK:
             _ACTIVE.append(job)

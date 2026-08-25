@@ -23,22 +23,78 @@ def acl_sandbox_active() -> bool:
     return bool(settings.acl_sandbox) and sys.platform.startswith("win")
 
 
-def build_confined_command(command: str) -> str:
-    """把 bash 语法命令包装成受限 shell 的命令行（CreateProcessAsUserW 直收）。
+def _quote_windows_arg(arg: str) -> str:
+    """单个 argv 元素的 Windows 引号（CommandLineToArgvW / list2cmdline 规则）。
+
+    含空格/引号/反斜杠即整体加引号，并按标准算法转义：
+    - 引号前的反斜杠翻倍再补一个（``\\"`` → 字面引号）；
+    - 行尾反斜杠翻倍（避免与闭合引号合成转义）；
+    - 其余反斜杠原样（2n 段不再被目标进程减半）。
+
+    这正是 E10 修剥引号根因的核心：每个参数独立引用，用户输入里的
+    引号/空格/UNC 反斜杠不再被整串命令行的外层解析误剥。
+    """
+    if arg == "":
+        return '""'
+    if not any(c.isspace() for c in arg) and '"' not in arg and "\\" not in arg:
+        return arg
+    out: list[str] = ['"']
+    i = 0
+    n = len(arg)
+    while i < n:
+        backslashes = 0
+        while i < n and arg[i] == "\\":
+            backslashes += 1
+            i += 1
+        if i == n:
+            # 行尾反斜杠：翻倍（闭合引号前不参与转义）
+            out.append("\\" * (backslashes * 2))
+        elif arg[i] == '"':
+            out.append("\\" * (backslashes * 2 + 1))
+            out.append('"')
+            i += 1
+        else:
+            out.append("\\" * backslashes)
+            out.append(arg[i])
+            i += 1
+    out.append('"')
+    return "".join(out)
+
+
+def quote_windows_argv(argv: list[str]) -> str:
+    """argv 数组 → CreateProcessAsUserW 可直收的命令行（逐元素独立引用）。"""
+    return " ".join(_quote_windows_arg(a) for a in argv)
+
+
+def build_confined_argv(command: str) -> list[str]:
+    """把 bash 语法命令包装成受限 shell 的 argv 数组（E10 argv 化）。
 
     - pwsh 优先（受限下可用，S1 实测通过）：经 ``_normalize_for_pwsh`` 做
       bash 惯用法适配（§18.3 —— export/``${VAR}``/source/带 flag 的 unix 命令）；
-    - cmd 兜底：套 ``/s /c`` 并做 unix→cmd 命令映射（``_normalize_command``）。
+    - cmd 兜底：``/s /c`` + unix→cmd 命令映射（``_normalize_command``）。
+
+    与 ``build_confined_command`` 的区别：返回 argv 数组，由 spawn 侧用
+    ``quote_windows_argv`` 逐元素引用 → 避免整串转发时外壳二次剥引号。
     """
     pwsh = shutil.which("pwsh")
     if pwsh:
         from hiveweave.tools.bash import _normalize_for_pwsh  # 惰性，避免循环导入
 
-        return f'"{pwsh}" -NoProfile -NonInteractive -Command {_normalize_for_pwsh(command)}'
+        return [pwsh, "-NoProfile", "-NonInteractive", "-Command",
+                _normalize_for_pwsh(command)]
     cmd = os.environ.get("COMSPEC", "cmd.exe")
     from hiveweave.tools.bash import _normalize_command  # 惰性，避免循环导入
 
-    return f'"{cmd}" /s /c {_normalize_command(command)}'
+    return [cmd, "/s", "/c", _normalize_command(command)]
+
+
+def build_confined_command(command: str) -> str:
+    """把 bash 语法命令包装成受限 shell 的命令行（CreateProcessAsUserW 直收）。
+
+    E10 后为 argv 化结果的字符串形态（逐元素引用），保留给仅接受字符串的
+    调用方（sentinel / game_time）；新调用方优先用 ``build_confined_argv``。
+    """
+    return quote_windows_argv(build_confined_argv(command))
 
 
 async def resolve_project_root(project_id: str | None) -> str | None:

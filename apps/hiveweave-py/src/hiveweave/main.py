@@ -271,6 +271,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("zombie_streaming_clear_failed", error=str(e))
 
+    # 2a. E16 (复盘 P2): 数据卫生 —— 启动收尾 sweep，清算上次进程残留的
+    # status='running' agent_runs 孤儿行（归并为 interrupted，语义同既有
+    # interrupt_run，供恢复/审计读取）。
+    try:
+        from hiveweave.services.run_ledger import sweep_stale_agent_runs
+
+        projects = await meta_db.query("SELECT id, workspace_path FROM projects WHERE 1=1")
+        swept = 0
+        for p in projects:
+            swept += await sweep_stale_agent_runs(p["workspace_path"])
+        if swept:
+            log.info("stale_agent_runs_swept", count=swept)
+    except Exception as e:
+        log.warning("stale_agent_runs_sweep_failed", error=str(e))
+
     # 2b. R12 fix: 清理过期工具输出临时文件（7 天保留期）
     try:
         from hiveweave.tools.executor import ToolExecutor
