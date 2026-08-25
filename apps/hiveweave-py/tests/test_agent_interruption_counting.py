@@ -401,3 +401,141 @@ class TestResumeSuppressedLatch:
         assert agent._resume_suppressed is False
         assert result.get("ok") is True
         assert result.get("suppressed") is not True
+
+
+# ── STALL BREAK 补偿（ADR-001 闭式口径，2026-08-25 审计）────────
+# completion section 8b：stall 收口后按 get_open_work_obligations 判名下
+# assignee 义务（负空间：claimed/running/rework/blocked…；created/
+# submitted/reviewing 仅经 reviewer/creator 重叠车道可达，本过滤按
+# assignee 收敛）——审石 E4 claimed 停摆案例由此自动续跑。
+
+
+def _stall_break_result() -> dict:
+    return {
+        "status": "ok",
+        "content": "[STALL BREAK] no progress",
+        "thinking": None,
+        "tool_calls": [],
+        "tool_turn_messages": [],
+        "rounds": 2,
+        "usage": None,
+        "stall_break": True,
+    }
+
+
+class TestStallBreakResumeScope:
+    @pytest.fixture(autouse=True)
+    def _reset_stall_ledger(self):
+        """_stall_break_ledger 是模块级计数：每用例清理，防跨用例累计到
+        STALL_BREAK_PARK_THRESHOLD(2) 误触发 park（污染后续用例断言）。"""
+        from hiveweave.agents import completion as completion_mod
+
+        completion_mod._stall_break_ledger.pop(AGENT_ID, None)
+        yield
+        completion_mod._stall_break_ledger.pop(AGENT_ID, None)
+
+    async def test_arms_resume_for_claimed_open_work(self):
+        """变异锚：stall_break 且名下有 claimed（E4 本体场景）→
+        _arm_interrupted_resume 被调用（回退 running+claimed 窄口径也过，
+        换回 submit 侧「created 白名单」口径 → 失败：claimed 被负空间排除）。"""
+        from unittest.mock import MagicMock
+
+        from hiveweave.agents.agent import Agent
+
+        agent = _make_agent([])
+        set_pending_turn_result(
+            AGENT_ID, {"phase": "in_progress", "summary": "stall then resume"}
+        )
+        agent._arm_interrupted_resume = MagicMock()  # 实例级覆盖，只验调用
+        try:
+            with patch(
+                "hiveweave.services.task.TaskService.get_actionable_obligations",
+                AsyncMock(return_value=[]),
+            ), patch(
+                "hiveweave.services.task.TaskService.get_open_work_obligations",
+                AsyncMock(
+                    return_value=[
+                        {"id": "t-claimed", "assignee_id": AGENT_ID,
+                         "status": "claimed", "title": "VERIFY: E4"},
+                    ]
+                ),
+            ), patch.object(
+                Agent, "_maybe_self_retrigger", AsyncMock()
+            ):
+                await agent._handle_completion(
+                    _stall_break_result(), "user msg", {}
+                )
+        finally:
+            clear_pending_turn_result(AGENT_ID)
+
+        agent._arm_interrupted_resume.assert_called_once()
+        refs = agent._arm_interrupted_resume.call_args.args[0]
+        assert any(r.startswith("t-claim") for r in refs)
+
+    async def test_arms_resume_for_creator_overlap_submitted(self):
+        """宽口径守卫：submitted 行仅经 creator 重叠车道返回时同样续跑。"""
+        from unittest.mock import MagicMock
+
+        from hiveweave.agents.agent import Agent
+
+        agent = _make_agent([])
+        set_pending_turn_result(
+            AGENT_ID, {"phase": "in_progress", "summary": "stall, creator"}
+        )
+        agent._arm_interrupted_resume = MagicMock()
+        try:
+            with patch(
+                "hiveweave.services.task.TaskService.get_actionable_obligations",
+                AsyncMock(return_value=[]),
+            ), patch(
+                "hiveweave.services.task.TaskService.get_open_work_obligations",
+                AsyncMock(
+                    return_value=[
+                        {"id": "t-submitted", "assignee_id": AGENT_ID,
+                         "status": "submitted", "title": "VERIFY: x"},
+                    ]
+                ),
+            ), patch.object(
+                Agent, "_maybe_self_retrigger", AsyncMock()
+            ):
+                await agent._handle_completion(
+                    _stall_break_result(), "user msg", {}
+                )
+        finally:
+            clear_pending_turn_result(AGENT_ID)
+
+        agent._arm_interrupted_resume.assert_called_once()
+
+    async def test_no_arm_without_open_work(self):
+        """名下无开放义务 → stall 收口后不补偿（保持安静）。
+
+        负例防空转：同时断言未停泊（_gate_parked/_stall_parked 均为 False），
+        确保 not_called 来自「真无义务」而非「被停泊闸拦住」。"""
+        from unittest.mock import MagicMock
+
+        from hiveweave.agents.agent import Agent
+
+        agent = _make_agent([])
+        set_pending_turn_result(
+            AGENT_ID, {"phase": "in_progress", "summary": "stall, no work"}
+        )
+        agent._arm_interrupted_resume = MagicMock()
+        try:
+            with patch(
+                "hiveweave.services.task.TaskService.get_actionable_obligations",
+                AsyncMock(return_value=[]),
+            ), patch(
+                "hiveweave.services.task.TaskService.get_open_work_obligations",
+                AsyncMock(return_value=[]),
+            ), patch.object(
+                Agent, "_maybe_self_retrigger", AsyncMock()
+            ):
+                await agent._handle_completion(
+                    _stall_break_result(), "user msg", {}
+                )
+        finally:
+            clear_pending_turn_result(AGENT_ID)
+
+        agent._arm_interrupted_resume.assert_not_called()
+        # 未停泊（非 blocked）→ 未武装确由「无义务」导致，而非停泊拦截
+        assert agent.disposition != "blocked"

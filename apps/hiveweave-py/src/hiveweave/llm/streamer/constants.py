@@ -136,7 +136,24 @@ TEST21 M4: 不再用这一值对整段 tool loop 做硬杀；活跃长 turn 在�
 HARD_TOTAL_TIMEOUT_S = float(
     _os.environ.get("HIVEWEAVE_STREAM_HARD_TIMEOUT_S", "570") or "570"
 )
-"""Turn 绝对硬上限（秒），须 < agent SAFETY_TIMEOUT（600s）。"""
+"""Turn 绝对硬上限（秒），须 < agent 侧墙钟天花板（默认 600s，见下）。
+
+可通过 env ``HIVEWEAVE_STREAM_HARD_TIMEOUT_S`` 覆盖（默认 570）。长 turn
+场景（如近似无限 turn：set 30min 左右）同步放大
+``HIVEWEAVE_STREAM_AGENT_CEILING_S`` 即可，两值只受结构断言约束（见下）。
+"""
+
+# 结构约束的「天花板」：agent 层的墙钟（_start_safety_timer 已是 no-op，
+# 墙钟全在 streamer 预算）曾以 600s 硬杀；该约束随定时器退役而陈旧化，
+# 现改为 env 可调天花板，仅作「HARD 必须留余量」的断言参照。
+AGENT_SAFETY_CEILING_S = float(
+    _os.environ.get("HIVEWEAVE_STREAM_AGENT_CEILING_S", "600") or "600"
+)
+"""墙钟天花板（秒）：HARD_TOTAL_TIMEOUT_S 必须严格小于它。
+
+默认 600（历史 SAFETY 语义）；近似无限 turn（如 30min）建议
+HARD=1710 / CEILING=1800（.env 已配）。
+"""
 
 ACTIVITY_EXTEND_S = float(
     _os.environ.get("HIVEWEAVE_STREAM_ACTIVITY_EXTEND_S", "180") or "180"
@@ -149,8 +166,9 @@ ACTIVITY_EXTEND_S = float(
 # 工具（bash 120s / question 200s；spawn_subagent 已改为 off-turn 立即返回）。在 t≈560s 进入一轮可冲到
 # 700s+，越过 agent SAFETY_TIMEOUT(600s) 被整体 cancel（run interrupted →
 # 90s 冷却 → resume 重建上下文）。实测 Aria 两次 run 在恰好 600s 被杀，
-# 且所有长 turn 都贴着 570~600s 边缘运行。HARD↔SAFETY 仅 30s 余量，远小于
-# 单轮最坏时长 —— 只靠轮间检查，「HARD < SAFETY」是统计成立而非结构成立。
+# 且所有长 turn 都贴着 570~600s 边缘运行。HARD↔天花板 仅 30s 默认余量
+# （实际余量 = AGENT_SAFETY_CEILING_S − HARD，动态），远小于
+# 单轮最坏时长 —— 只靠轮间检查，「HARD < 天花板」是统计成立而非结构成立。
 # 以下三个闸口把硬截止变成结构保证：streamer 承诺在 HARD 之前返回。
 MIN_ROUND_BUDGET_S = float(
     _os.environ.get("HIVEWEAVE_STREAM_MIN_ROUND_BUDGET_S", "120") or "120"
@@ -190,18 +208,18 @@ SUMMARY_MIN_BUDGET_S = float(
 把三道闸口建立的结构保证打穿（2026-08-08 多子代审计发现）。"""
 
 # ── 结构约束断言：env 误配直接 import 失败，不许静默破坏 ──────────
-# 「HARD < SAFETY」「切断提前量 < HARD↔SAFETY 余量」是本文件的结构性承诺；
+# 「HARD < 天花板」「切断提前量 < 余量」是本文件的结构性承诺；
 # 只靠注释约束会被 env 覆盖静默击穿（审计 2026-08-08）。
-# 注意：余量不是常量 30s，而是 600 − HARD_TOTAL_TIMEOUT_S（HARD 本身 env
-# 可调）——断言必须引用实际余量，否则 HARD=590 时 grace=20 落在 SAFETY
-# 之后，assert 全绿但结构保证已击穿（审计 2026-08-08 P2）。
-assert HARD_TOTAL_TIMEOUT_S < 600.0, (
-    "HARD_TOTAL_TIMEOUT_S 必须 < agent SAFETY_TIMEOUT(600s)，"
+# 注意：余量不是常量 30s，而是 CEILING − HARD（HARD/CEILING 本身 env
+# 可调）——断言必须引用实际余量，否则 HARD=CEILING−10 时 grace 落在
+# 天花板之后，assert 全绿但结构保证已击穿（审计 2026-08-08 P2）。
+assert HARD_TOTAL_TIMEOUT_S < AGENT_SAFETY_CEILING_S, (
+    "HARD_TOTAL_TIMEOUT_S 必须 < AGENT_SAFETY_CEILING_S，"
     "否则轮间硬检查失去意义"
 )
-assert 0 < TURN_STREAM_CUT_GRACE_S < 600.0 - HARD_TOTAL_TIMEOUT_S, (
-    "TURN_STREAM_CUT_GRACE_S 必须为正且 < HARD↔SAFETY 的实际余量 "
-    "(600 - HARD_TOTAL_TIMEOUT_S)"
+assert 0 < TURN_STREAM_CUT_GRACE_S < AGENT_SAFETY_CEILING_S - HARD_TOTAL_TIMEOUT_S, (
+    "TURN_STREAM_CUT_GRACE_S 必须为正且 < 硬上限↔天花板 的实际余量 "
+    "(AGENT_SAFETY_CEILING_S - HARD_TOTAL_TIMEOUT_S)"
 )
 assert 0 < MIN_ROUND_BUDGET_S < HARD_TOTAL_TIMEOUT_S, (
     "MIN_ROUND_BUDGET_S 必须在 (0, HARD) 内 —— ≥HARD 轮闸门恒关、"

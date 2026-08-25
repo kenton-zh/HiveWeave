@@ -363,6 +363,23 @@ class DispatchService:
                 from hiveweave.services.code_audit import append_code_audit_notice
 
                 description_out = append_code_audit_notice(description_out)
+
+                # DELIVERY CONTRACT: 写树 assignee 的代码任务默认生成轻量
+                # slice 契约（复用 contract_json 机制，非再造文本模板）。
+                # 幂等：任务已有契约（含协调者自建 slice）不覆盖；无 inputs
+                # 不触发 ready-gate，普通任务流转零侵入。
+                try:
+                    from hiveweave.services.delivery_contract import (
+                        build_default_contract,
+                    )
+
+                    _trow = await self.task_service.get_task(project_id, task_id)
+                    if _trow and not _trow.get("contract_json"):
+                        await self.task_service._persist_contract_json(
+                            project_id, task_id, build_default_contract(task_id)
+                        )
+                except Exception as e:
+                    log.warning("dispatch_contract_setup_failed", error=str(e))
             elif assignee and not agent_gets_write_worktree(assignee):
                 log.warning(
                     "dispatch_to_non_writer",

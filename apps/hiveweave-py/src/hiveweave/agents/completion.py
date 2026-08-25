@@ -914,7 +914,7 @@ async def handle_completion(
     # parking re-check recent successful run; escalation messages state
     # facts only (no reassign/dismiss prescription).
     _stall_parked = False
-    _stall_resume_refs: list[str] = []  # P1-3: stall 补偿唤醒候选（running 任务）
+    _stall_resume_refs: list[str] = []  # P1-3: stall 补偿唤醒候选（开放义务）
     if result.get("stall_break"):
         import time as _time
 
@@ -1096,9 +1096,9 @@ async def handle_completion(
                     # Clear the ledger after parking
                     _stall_break_ledger.pop(agent.id, None)
 
-    # 8b. P1-3 (slack-clone_01): stall_break 未停泊 → 收集 running 任务短号，
-    # 交给 section 9 补偿唤醒。缺口：首轮 stall 后 agent 直接 idle，running
-    # 任务冻结到 20min task-stall 催办（A020 M6 卡 30min）。
+    # 8b. P1-3 (slack-clone_01): stall_break 未停泊 → 收集开放义务短号，
+    # 交给 section 9 补偿唤醒。缺口：首轮 stall 后 agent 直接 idle，运行/
+    # 认领任务冻结到 20min task-stall 催办（A020 M6 卡 30min）。
     # M4: gate 已停泊（_gate_parked，不自动续跑语义）时不补偿唤醒——
     # 两套安全机制互不知情会削弱 gate-park 的「不自动续跑」保证。
     if result.get("stall_break") and not _stall_parked and not _gate_parked:
@@ -1109,16 +1109,22 @@ async def handle_completion(
             # 刚认领未拨 running 的任务（视界 M1 事故：断流后 claimed 任务
             # 无任何补偿，纯等 10min watchdog）。认领即义务（ADR-001 闭式
             # 同口径），断流必有人推。
+            # 审计（2026-08-25）：统一改用 ADR-001 闭式判定
+            # get_open_work_obligations（与 recovery.handle_error 的断流
+            # 补偿同源）——assignee 车道按负空间覆盖 claimed/running/rework/
+            # blocked 等持有义务状态（created/submitted/reviewing 经
+            # reviewer/creator 重叠车道返回，本过滤按 assignee 收敛），
+            # stall 收口后凡名下还有 assignee 义务就给补偿续跑，不再只认
+            # running/claimed（审石 E4 claimed 停摆案例）。
             _stall_resume_refs = [
                 str(t.get("id") or "")[:8]
                 for t in (
-                    await TaskService().list_tasks(
-                        agent.project_id, assignee_id=agent.id
+                    await TaskService().get_open_work_obligations(
+                        agent.project_id, agent.id
                     )
                     or []
                 )
-                if t.get("status") in ("running", "claimed")
-                and t.get("id")
+                if t.get("assignee_id") == agent.id and t.get("id")
             ]
         except Exception as e:
             log.debug(

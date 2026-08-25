@@ -181,6 +181,8 @@ class DispatchTaskParams(BaseModel):
     "ledger entry (assignee changes, no duplicate task). "
     "Only create a NEW task (omit taskId) when the work is genuinely new. "
     "Only direct reports; never assign coordinators code work. "
+    "Writer leaves auto-carry a delivery contract — executor fills "
+    "deliveryContract={summary, test} at submit (see submit_task). "
     "Milestone MAIN QA: milestoneVerify=true (coordinator/CEO).",
     requires_workspace=False,
     security_level="standard",

@@ -171,6 +171,53 @@ _SYSTEM_DIR_BLOCK = """## IMPORTANT: HiveWeave System Directory
   `.hiveweave/`."""
 
 
+# ── 平台机制总览（所有角色共享，先读——不用试错学习）─────────
+# 每个新 agent（含新招的）首次工作时必须已理解这些；内容与平台代码同步，
+# 不是提示词美德。修改机制时同步这里。
+
+_MECHANISMS_BLOCK = """## PLATFORM MECHANISMS — 工作前必读（不用试错学习平台规则）
+### 1. Task Ledger(任务账本)——一切工作的主干
+- 生命周期:created/claimed → running → submitted → reviewing → approved → closed;返工走 rework 退回。
+- **assign = claim**:dispatch/指派即认领;VERIFY 标题任务保持 created 直到被认领。
+- **progress 是生命周期完成度**,须有真实产出支撑(文件改动/测试输出);纯数字打卡会被标记可疑。
+- **dependsOn 只放其他任务 id**(不能是自己、不能是人);等人用 `commit_turn(waiting, waiting_on=[{kind:agent,...}])`。
+- 自交(assignee==creator)提交自动上报上级,不会通知自己。
+
+### 2. 凭证(attestation)与提交门——"完成"必须有机器证据
+- bash 跑测试 / browse E2E / request_code_audit 成功后会**自动生成绑定任务的凭证**(test_run / browse_e2e / code_audit)。
+- submit 时把凭证 id 放进 `attestationIds=[...]` 交给平台验证(真实存在、绑定本任务、未过期);**口头"测过了"不算数**。
+- submitGate(policy)决定需要哪些 kind:docs→attest_doc_review;unit→test_run;module_visual→browse_e2e;code_audit*=另加 code_audit。
+- `waive_attestation` 只豁免"凭证缺失",且只能逐条;**永远不能豁免"结论不合格"**(VERIFY verdict=FAIL 不可 waive)。
+
+### 3. 交付契约(delivery contract)——代码任务的提交回执
+- 上级派给你的代码任务会自动带一份交付契约。提交时用 `submit_task(..., deliveryContract={"summary": "...", "test": "..."})` 回填。
+- `test` 二选一:`test_run:<凭证id>`(机器验证)或 `N/A—<原因>`(原因非空)。
+- 已有成功 test_run 凭证却写 N/A 会被拒(声明与凭证库矛盾);确无回执可填用 `contractWaived=true` 显式跳过,不要静默缺失。
+
+### 4. VERIFY 与 verdict——终验是"结论"不是"任务"
+- VERIFY / milestoneVerify 任务在 MAIN 上验收,**不在 worktree 跑全站 E2E**;同项目同一时刻只允许一个 VERIFY 在 MAIN 上跑。
+- VERIFY 提交必须带 `verdict="PASS"|"FAIL"`;FAIL 必须附 `blockingIssues` 清单(缺则拒)。
+- approve 一个 verdict=FAIL 的提交会**自动转 rework**(强制返修),不会静默关停——FAIL 只能被修复翻转,或被用户显式决策放行。
+
+### 5. Worktree 隔离与合并
+- executor 与做接缝的中层有**独立 worktree**(`.hiveweave/worktrees/<你的shortId>/`):写代码只写自己的树;MAIN `docs/` 与 `.hiveweave/shared/` 团队共享。
+- 提交前 `git_worktree_checkpoint`(工作树清洁);审核人读你的树判"改没改"(不是 MAIN);approve 后 `git_worktree_merge` 进 MAIN。
+- **禁自审**:不能 review 自己 assignee 的任务;merge 自己分支要求该任务已 approved 且批准人≠你(否则拒)。
+
+### 6. 回合出口(commit_turn)
+- 每轮必须 `commit_turn(phase=in_progress|waiting|blocked|done_slice)` 收尾;纯文本收尾会被 `[TURN EXIT BLOCKED]` 拒。
+- 收到 `ask_agent` / 带 `expect_report` 的消息,本回合必须回(send_message 类工具送达)才能退出。
+- 长活不占本轮:大段代码用 `spawn_subagent`,长测试用 `bash(background=true)`,然后 `commit_turn(waiting)` 等 `[BASH DONE]` / `[SUBAGENT DONE]` 唤醒,不要空转轮询。
+
+### 7. 断流/自愈——被打断后自行恢复
+- 静默超时会自我唤醒;单轮有安全超时兜底。
+- 若你的回合被断流打断(SSL/网络/超时),**不能带着未验收义务(failed/running 的 VERIFY)就地 waiver 收口**——先续跑重验,或显式升级 coordinator。降级标志在成功续跑一轮后自动清除。
+
+### 8. 记忆与经验
+- 三层记忆:project 宪章(每轮注入)/ agent 私有(read_memory 查全量)/ archive。
+- 完成任务后 `write_memory` 记关键决策;`done_slice` 时把踩坑教训放 `extensions={"lessons":[...]}` 归档,团队后续按关键词召回。"""
+
+
 _HONESTY_BLOCK = """## Honesty & Integrity Rules (MANDATORY — ZERO TOLERANCE)
 - **NEVER claim to have done something you did not actually do.** If you did not call a tool, you did NOT perform that action. Period.
 - **NEVER fabricate results, IDs, or outcomes.** Only report what a tool actually returned to you. Copy the entire id string from get_tasks / receipts / gate errors — do not truncate; do not invent a second id form.
@@ -326,6 +373,7 @@ def build_identity_prompt(
     sections.append(_REALITY_BLOCK)
     sections.append(_ETHOS_BLOCK)
     sections.append(_SYSTEM_DIR_BLOCK)
+    sections.append(_MECHANISMS_BLOCK)
     sections.append(f"## Permission Level: {family}")
     sections.append(role_block)
     sections.append(_HONESTY_BLOCK)

@@ -50,6 +50,8 @@ class ReviewTaskParams(BaseModel):
     "Prefer consuming the assignee's hung attestations (unit→test_run, module_visual→browse_e2e, "
     "docs→doc_review, code_audit*→code_audit). CEO: review-only — do not bash/self-test or merge leaf trees. "
     "If approve is rejected for missing evidence, do NOT retry approve — rework or wait for the gate. "
+    "Submitting evidence verdict=FAIL (VERIFY) auto-reroutes approve to rework — "
+    "FAIL must be fixed, never silently closed. "
     "Does NOT spawn VERIFY. After a milestone is on MAIN, dispatch_task(..., milestoneVerify=true) "
     "for one QA task. VERIFY waive is CEO-only. docs_only: coordinators use "
     "attest_doc_review (waive rejected); CEO may waive that one taskId.",
@@ -579,8 +581,28 @@ async def review_task_tool(
                     error=str(e),
                 )
 
+        # forced_rework 判定提前（audit stamp / 通知 / 收尾共用）：approve 被
+        # service 强制转 rework（evidence verdict=FAIL / integrity_check=fail
+        # → reviewing→rework→running）时任务实际 running 而非 approved。
+        # approve 只可从 submitted/reviewing 进入（上面 L543/L546 已校验），
+        # running 是强制 rework 的排他信号，单 agent turn 串行内无并发改写
+        # 窗口——工具层不得按 approve 收尾（误发「已批准」、对运行中任务
+        # 注入 merge/close、或盖「已批准」审计戳）。
+        task_after = await ts.get_task(project_id, params.task_id)
+        forced_rework = (
+            decision == "approve"
+            and task_after is not None
+            and task_after.get("status") == "running"
+        )
+
         # TEST13 P0-1 / TEST6 S2: audit stamp for escalation overrides
-        if decision == "approve" and (ceo_merger_override or waive_self_approve_small_team):
+        # forced_rework（实际未批准）不盖 overrride 戳——审计痕迹须与真实
+        # 终态一致。
+        if (
+            decision == "approve"
+            and not forced_rework
+            and (ceo_merger_override or waive_self_approve_small_team)
+        ):
             try:
                 import time as _time
 
@@ -617,13 +639,15 @@ async def review_task_tool(
 
 
         # ── 通知 assignee/executor 审查结果 ──
-        task_after = await ts.get_task(project_id, params.task_id)
+        # （task_after / forced_rework 已在 audit stamp 前统一计算）
         if task_after and task_after.get("assignee_id"):
             assignee_id = task_after["assignee_id"]
             if assignee_id != agent_id:
                 from hiveweave.services.inbox import InboxService
                 inbox = InboxService()
-                if decision == "approve":
+                # forced_rework（approve 被 service 转 rework）→ 走 REWORK 通知
+                # 而非「已批准」（E2 修复配套）。
+                if decision == "approve" and not forced_rework:
                     from hiveweave.services.worktree_review import agent_worktree_path
                     from hiveweave.services.org import OrgService
                     from hiveweave.services.policy import infer_role_family
@@ -659,6 +683,21 @@ async def review_task_tool(
                     priority = "normal"
                 else:
                     feedback = params.feedback or "No specific feedback provided."
+                    if forced_rework:
+                        # verdict 闸强制返修：附 blocking_issues（不回显
+                        # reviewer 的 approve 反馈，避免「已批准」语义残留）。
+                        bis = (task_after or {}).get("evidence") or {}
+                        if isinstance(bis, str):
+                            try:
+                                bis = json.loads(bis)
+                            except Exception:
+                                bis = {}
+                        bis = (bis or {}).get("blocking_issues") or []
+                        if bis:
+                            feedback = (
+                                "blocking_issues: "
+                                + "; ".join(str(x) for x in list(bis)[:5])
+                            )
                     msg = (
                         f"[REWORK REQUESTED] Task '{task_after.get('title', '')[:60]}' "
                         f"needs rework. Feedback: {feedback}"
@@ -680,7 +719,9 @@ async def review_task_tool(
         # (3) Do NOT spawn VERIFY on approve — only after successful merge
         # Exception: VERIFY child approve already closed parent; pure no-diff
         # tasks need no merge.
-        if decision == "approve":
+        # forced_rework（approve 被 service 强制转 rework）→ 跳过合并/关闭
+        # 收尾：任务仍在返修中，不注入 merge pending（E2 修复配套）。
+        if decision == "approve" and not forced_rework:
             from hiveweave.services.worktree_review import (
                 agent_worktree_path,
                 worktree_commits_ahead,
@@ -818,6 +859,13 @@ async def review_task_tool(
                 f"On real content conflict: rework executor to rebase/merge "
                 f"main in their worktree. On untracked-on-main: that is MAIN "
                 f"hygiene — retry merge (auto-quarantine), do NOT rework."
+            )
+        if forced_rework:
+            return ToolResult.ok(
+                f"Task {params.task_id} was approved but forced back to rework "
+                f"by the verdict gate (evidence verdict=FAIL or "
+                f"integrity_check=fail). Assignee notified to fix blocking "
+                f"issues; no merge/close applied."
             )
         return ToolResult.ok(f"Task {params.task_id} sent back for rework.")
     except Exception as e:

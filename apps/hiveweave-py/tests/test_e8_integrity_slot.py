@@ -321,7 +321,10 @@ async def test_integrity_real_git_fail_via_scan(tmpdir):
 
 @pytest.mark.asyncio
 async def test_non_verify_task_integrity_fail_routes_rework(task_env):
-    """普通实现任务带 integrity_check=fail → approve 强制 rework（E8-3 闭环）。"""
+    """普通实现任务带 integrity_check=fail → approve 强制 rework（E8-3 闭环）。
+
+    evidence 不含 verdict——锁定 integrity 触发路径（2026-08-25 审计：
+    原用例带 verdict=FAIL，实际测的是 verdict 分支，integrity 分支被掩盖）。"""
     ts = TaskService()
     pid = task_env["project_id"]
     tid = await ts.create_task(
@@ -333,7 +336,6 @@ async def test_non_verify_task_integrity_fail_routes_rework(task_env):
         pid,
         tid,
         evidence={
-            "verdict": "FAIL",
             "blocking_issues": ["app.py:3 静默降级兜底"],
             "integrity_check": "fail",
         },

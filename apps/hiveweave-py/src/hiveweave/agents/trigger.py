@@ -17,7 +17,8 @@ build_trigger_context/2, run_triggered_agent/2, do_trigger/2。
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -42,6 +43,72 @@ CHAT_CALL_TIMEOUT_MS = 30_000
 # digest 来源分类标记：命中即视为平台看门狗/定时器唤醒（区别于普通系统
 # 触发），供前端 Chat 主栏徽章区分。新 watchdog 文案需同步此表。
 _WATCHDOG_CONTEXT_MARKERS = ("看门狗", "[SILENCE]", "[WAIT_TIMEOUT]")
+
+# ── 长 turn 插话（近似无限 turn 配套）────────────────────────
+# 长 turn 期间「可唤醒消息」（wake=1 且非 task_event FYI）经
+# agent.steer() 注入运行中 turn 的 next-step 窗口，让 AI 下一轮就看到并能
+# 响应（CEO 派工 / ask / 任务通知不排队）。enqueue_wake 闭锁保留为「turn
+# 结束后兜底处理」不变——插话只是前置可见性，不替代任何既有语义。
+# 每 agent 每 60s 至多插话一次，防聊天密集消息刷爆 next-step 窗口。
+_STEER_INBOX_MIN_INTERVAL_S = 60.0
+_steer_inbox_last: dict[str, float] = {}
+
+
+async def _try_steer_busy_inbox(agent: Any, agent_id: str) -> bool:
+    """turn 进行中把可唤醒 inbox 摘要插入 steer 队列（限频）。
+
+    - 先过限频/PROCESSING 守卫再查 DB —— 限频窗口内零查询开销；
+    - 仅当 agent PROCESSING 且活跃 steer 队列存在时插话；否则跳过
+      （enqueue_wake 已闭锁，turn 结束后照常处理，双保险不双触发）。
+    - 沿用 watcher/trigger 同一 pending 口径（filter_actionable_pending
+      剔除 task_event FYI）；文本截到 ~400 字符（防长清单半截）。
+    """
+    if getattr(agent, "status", None) is None or getattr(agent, "_steer_q", None) is None:
+        return False
+    status = getattr(agent.status, "value", None)
+    if status != "processing":
+        return False
+    now = time.monotonic()
+    last = _steer_inbox_last.get(agent_id, 0.0)
+    if now - last < _STEER_INBOX_MIN_INTERVAL_S:
+        return False
+    from hiveweave.services.inbox import (
+        filter_actionable_pending,
+        inbox_digest_content,
+    )
+
+    try:
+        _pool = await _inbox_service.get_pending_messages(agent_id)
+        _bg = await _inbox_service.get_undelivered_background(agent_id)
+    except Exception as e:
+        log.debug("trigger_busy_steer_inbox_query_failed", agent_id=agent_id, error=str(e))
+        return False
+    actionable = filter_actionable_pending(list(_pool) + list(_bg))
+    if not actionable:
+        return False
+    lines: list[str] = []
+    for m in actionable[:5]:
+        body = inbox_digest_content(m) or ""
+        lines.append(f"- from={str(m.get('from_agent_id') or 'system')[:12]}: {body[:90]}")
+    text = (
+        "[INBOX] 你 turn 进行中有新消息待响应（turn 结束后仍会正式处理，"
+        "现在按需优先插队处理即可）：\n" + "\n".join(lines)
+    )[:400]
+    try:
+        # steer 仅做上下文注入，不落库已读/不回执；agent 看到后可自行决定
+        # 「先插队处理」或「继续当前工作、稍后处理」。
+        r = await agent.steer(text)
+        if r.get("steer"):
+            _steer_inbox_last[agent_id] = now
+            log.info(
+                "trigger_busy_steered_inbox",
+                agent_id=agent_id,
+                count=len(actionable),
+            )
+            return True
+    except Exception as e:
+        log.warning("trigger_busy_steer_failed", agent_id=agent_id, error=str(e))
+    return False
 
 
 def classify_digest_source(from_agent_id: str | None, context: str) -> str:
@@ -579,6 +646,13 @@ async def _do_trigger(agent_id: str, trigger_type: str, *,
         # 5. If busy → enqueue wake (P1 single-flight) instead of drop
         if agent.status.value == "processing":
             await _handoff_service.accept_pending_handoffs(project_id, agent_id)
+            # 长 turn 插话：把可唤醒 inbox 摘要注进运行中 turn 的 next-step
+            # 窗口（限频、fail-open，DB 查询在守卫之后；enqueue_wake 闭锁仍
+            # 作为 turn 结束后兜底）。
+            try:
+                await _try_steer_busy_inbox(agent, agent_id)
+            except Exception as e:
+                log.debug("trigger_busy_steer_skip", agent_id=agent_id, error=str(e))
             result = await build_trigger_context(
                 agent_record, trigger_type, force=force)
             if result is None:

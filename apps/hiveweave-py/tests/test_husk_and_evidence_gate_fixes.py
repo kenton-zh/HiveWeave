@@ -380,3 +380,91 @@ async def test_auto_rework_on_evidence_gate_direct(task_env):
             "bad files_changed",
         )
     assert (await ts.get_task(pid, tid))["status"] == "running"
+
+
+# ── E2 工具层配套（2026-08-25 TEST_DSH_28 实锤）───────────────
+# approve 被 service 强制 rework（verdict=FAIL）后，工具层不得按 approve
+# 收尾：不发 [TASK APPROVED]、不注入 merge/close；按 rework 通知+短路。
+
+
+@pytest.mark.asyncio
+async def test_tool_approve_forced_rework_no_approved_notice(task_env):
+    """非 VERIFY 任务 + verdict=FAIL → review_task_tool(approve) 后任务
+    running、assignee 收到 REWORK REQUESTED（非 TASK APPROVED）、无
+    merge/close 注入、返回文案点名 verdict gate。
+
+    变异: 删掉工具层 forced_rework 短路 → 通知变 [TASK APPROVED] →
+    本测试失败（误发「已批准」+ 对运行中任务注入 merge pending 复现）。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    tid = await ts.create_task(
+        pid, "[probe] 非 VERIFY 的 FAIL 探针", "d",
+        creator_id=COORD, assignee_id=EXEC,
+    )
+    await ts.claim_task(pid, tid, EXEC)
+    await ts.start_task(pid, tid)
+    await ts.submit_task(
+        pid,
+        tid,
+        evidence={
+            "verdict": "FAIL",
+            "blocking_issues": ["/_admin 404"],
+            "tests_passed": True,  # 满足 approve 前 attestation 软校验
+        },
+    )
+    await ts.start_review(pid, tid)
+
+    with (
+        patch(
+            "hiveweave.services.attestation.required_attestation_kinds",
+            return_value=[],
+        ),
+        patch(
+            "hiveweave.services.attestation.has_valid_waiver",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "hiveweave.services.attestation.reviewer_required_kinds",
+            return_value=[],
+        ),
+        patch(
+            "hiveweave.tools.helpers.get_project_id",
+            new=AsyncMock(return_value=pid),
+        ),
+        patch(
+            "hiveweave.services.inbox.InboxService.send_message",
+            new=AsyncMock(),
+        ) as send,
+        patch(
+            "hiveweave.agents.trigger.trigger_subordinate",
+            new=AsyncMock(),
+        ),
+        patch(
+            "hiveweave.services.worktree_review.agent_worktree_path",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "hiveweave.services.worktree_review.worktree_commits_ahead",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "hiveweave.services.worktree_review.project_main_workspace",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            # 加固（审计 m4）：forced_rework 时 merge pending 不得注入
+            "hiveweave.tools.tasks.review._inject_merge_pending_wake",
+            new=AsyncMock(),
+        ) as merge_wake,
+    ):
+        params = ReviewTaskParams(task_id=tid, decision="approve")
+        result = await review_task_tool(params, COORD, "/tmp/ws")
+
+    assert result.success is True
+    assert "forced back to rework" in (result.output or "")
+    assert (await ts.get_task(pid, tid))["status"] == "running"
+    msgs = [c.kwargs.get("message") or "" for c in send.await_args_list]
+    assert any("REWORK REQUESTED" in m for m in msgs), msgs
+    assert not any("TASK APPROVED" in m for m in msgs), msgs
+    assert not any("MERGE PENDING" in m for m in msgs), msgs
+    merge_wake.assert_not_awaited()

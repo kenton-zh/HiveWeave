@@ -88,25 +88,34 @@ class ReviewMixin:
             # → 验收工作合格但结论不合格，强制走 rework（不复用 close）。
             # E8: merge 后整体性检查 FAIL（integrity_check=fail + blocking_issues）
             # 对非 VERIFY 实现任务同样强制 rework——合成整体的整体性违例必须返修。
+            # E2 修复（2026-08-25 TEST_DSH_28 实锤）：FAIL 强制路由不再依赖
+            # 任务类型/标题前缀——任何 evidence.verdict=FAIL 的提交，approve 即
+            # 强制 rework（探针「非 VERIFY 标题 + verdict=FAIL 被直接 approved」）。
+            # integrity_check=fail 为并列触发条件。存量数据（无 verdict 字段）
+            # → 不触发，向后兼容。
             verdict = normalize_verdict(evidence.get("verdict"))
             integrity_fail = (
                 evidence.get("integrity_check") == "fail"
                 and isinstance(evidence.get("blocking_issues"), list)
                 and bool(evidence.get("blocking_issues"))
             )
-            if verdict == "FAIL":
-                task = await self.get_task(project_id, task_id)
-                if task and (self._is_verify_task(task) or integrity_fail):
-                    await self._force_rework(
-                        project_id,
-                        task_id,
-                        evidence,
-                        feedback,
-                        reviewer_id,
-                        reason_code="verdict_fail_rework",
-                        current_status=current_status,
-                    )
-                    return
+            if verdict == "FAIL" or integrity_fail:
+                await self._force_rework(
+                    project_id,
+                    task_id,
+                    evidence,
+                    feedback,
+                    reviewer_id,
+                    # 按来源拆分 reason_code（审计 2026-08-25 m-1）：终验结论
+                    # FAIL 与合成整体性 FAIL 是两条修复链，事件/通知须可区分。
+                    reason_code=(
+                        "verdict_fail_rework"
+                        if verdict == "FAIL"
+                        else "integrity_check_fail"
+                    ),
+                    current_status=current_status,
+                )
+                return
             # reviewing → approved
             await self._transition(project_id, task_id, "approved",
                                    actor_id=reviewer_id)

@@ -114,7 +114,9 @@ async def _agent_has_open_verify(project_id: str, agent_id: str) -> bool:
     "Max 2 waivers per task. The waiving agent CANNOT later approve "
     "the same task (third-party isolation) unless small-team sole reviewer. "
     "VERIFY waive is CEO-only. Prefer attest_doc_review for document "
-    "VERIFY unless CEO waives that one task.",
+    "VERIFY unless CEO waives that one task. "
+    "Never waive a verdict=FAIL conclusion — waiver covers MISSING attestation "
+    "only; a FAIL result must be reworked, not excused.",
     requires_workspace=False,
     security_level="standard",
 )

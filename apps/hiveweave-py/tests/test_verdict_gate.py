@@ -280,6 +280,77 @@ async def test_legacy_no_verdict_approve_normal(task_env):
     assert after["status"] != "running"
 
 
+@pytest.mark.asyncio
+async def test_non_verify_fail_verdict_approve_routes_rework(task_env):
+    """E2-④（2026-08-25 实锤修复）非 VERIFY 标题任务 + verdict=FAIL →
+    approve 同样强制 rework，不依赖任务类型路由。
+
+    变异: 恢复旧条件 ``task and (self._is_verify_task(task) or integrity_fail)``
+    → 本测试失败（探针 f400fbf6「非终验标题 + FAIL 被直接 approved」复现）。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    tid = await ts.create_task(
+        pid,
+        "[probe] 非 VERIFY 前缀的 FAIL 探针（docs）",
+        "d",
+        creator_id=COORD,
+        assignee_id=EXEC,
+    )
+    await ts.claim_task(pid, tid, EXEC)
+    await ts.start_task(pid, tid)
+    # 非终验任务不受 E1 submit 硬校验限制，直接携带 verdict=FAIL
+    await ts.submit_task(
+        pid, tid, evidence={"verdict": "FAIL", "blocking_issues": ["/_admin 404"]}
+    )
+    await ts.start_review(pid, tid)
+    await ts.review_task(pid, tid, "approve", feedback="FAIL 结论不可放行")
+
+    after = await ts.get_task(pid, tid)
+    assert after["status"] == "running"  # 强制 rework 回跑
+    assert after["status"] not in ("approved", "closed")
+
+    evs = await task_module._query(
+        pid,
+        "SELECT payload FROM task_events WHERE task_id = ? ORDER BY created_at DESC",
+        [tid],
+    )
+    assert any("verdict_fail_rework" in (r["payload"] or "") for r in evs)
+
+
+@pytest.mark.asyncio
+async def test_integrity_fail_alone_routes_rework_with_reason_code(task_env):
+    """E8 拆分（2026-08-25 审计）：无 verdict 纯 integrity_check=fail →
+    approve 强制 rework 且 reason_code=integrity_check_fail（与 verdict
+    分支可区分）。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    tid = await ts.create_task(
+        pid, "Feature impl（integrity 违例）", "d",
+        creator_id=COORD, assignee_id=EXEC,
+    )
+    await ts.claim_task(pid, tid, EXEC)
+    await ts.start_task(pid, tid)
+    await ts.submit_task(
+        pid,
+        tid,
+        evidence={"integrity_check": "fail", "blocking_issues": ["静默吞错"]},
+    )
+    await ts.start_review(pid, tid)
+    await ts.review_task(pid, tid, "approve")
+
+    after = await ts.get_task(pid, tid)
+    assert after["status"] == "running"
+    assert after["status"] not in ("approved", "closed")
+
+    evs = await task_module._query(
+        pid,
+        "SELECT payload FROM task_events WHERE task_id = ? ORDER BY created_at DESC",
+        [tid],
+    )
+    assert any("integrity_check_fail" in (r["payload"] or "") for r in evs)  # 非 verdict_fail_rework
+    assert not any("verdict_fail_rework" in (r["payload"] or "") for r in evs)
+
+
 # ── E5 断流收口纪律（submit 侧）：降级中提交 FAIL 终验被拒 ──────────
 
 

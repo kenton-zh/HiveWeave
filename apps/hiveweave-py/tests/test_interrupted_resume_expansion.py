@@ -167,13 +167,18 @@ async def test_interrupted_resume_fire_skips_parked_dispositions():
 
 
 def test_stall_break_resume_includes_claimed():
-    """stall_break 补偿范围含 claimed（source pin：过滤条件钉死）.
+    """stall_break 补偿范围对齐 ADR-001 闭式口径（assignee 负空间）.
 
-    变异: 换回 `== "running"` → 本测试失败（视界形态裸奔复现）."""
+    变异: 换回 ``list_tasks + in ("running","claimed")`` 窄口径 → 本测试
+    失败（负空间判定被 replace 后 claimed/负空间语义丢失，审石 E4 停摆案例）。"""
     from hiveweave.agents import completion as completion_mod
 
     src = inspect.getsource(completion_mod)
-    assert 'in ("running", "claimed")' in src
+    # 8b 段必须走 ADR-001 闭式判定 + assignee 过滤（与断流补偿同源）
+    assert "TaskService().get_open_work_obligations(" in src
+    assert 't.get("assignee_id") == agent.id' in src
+    # 旧窄口径（list_tasks + running/claimed）不得残留
+    assert 'in ("running", "claimed")' not in src
 
 
 # ── game_time.py: 看门狗节奏 env 化 ────────────────────────

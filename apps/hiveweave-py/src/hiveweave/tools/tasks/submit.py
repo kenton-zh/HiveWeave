@@ -137,6 +137,28 @@ class SubmitTaskParams(BaseModel):
         description="Optional environment snapshot for VERIFY evidence.",
         json_schema_extra={"aliases": ["envSnapshot", "env_snapshot"]},
     )
+    delivery_contract: dict[str, Any] | None = Field(
+        default=None,
+        alias="deliveryContract",
+        description=(
+            "Delivery contract 回执 {summary, test}——仅当任务带 delivery "
+            "contract（slice_type=delivery_contract）时必填。test 引用 "
+            "test_run:<id>（平台机器验证）或写 N/A—原因。"
+        ),
+        json_schema_extra={
+            "aliases": ["deliveryContract", "delivery_contract", "contract"]
+        },
+    )
+    contract_waived: bool = Field(
+        default=False,
+        alias="contractWaived",
+        description=(
+            "Delivery contract 显式跳过：当任务确实无交付回执可填（非代码/"
+            "紧急 hotfix 等）且需通过 submit 时置 true。拒绝沉默缺失——绕过"
+            "必须显式、留痕进 evidence.contract_waived=true。"
+        ),
+        json_schema_extra={"aliases": ["contractWaived", "contract_waived"]},
+    )
     dry_run: bool = Field(
         default=False,
         alias="dryRun",
@@ -464,6 +486,11 @@ async def _submit_preflight(
         evidence["blocking_issues"] = list(params.blocking_issues)
     if getattr(params, "env_snapshot", None):
         evidence["env_snapshot"] = str(params.env_snapshot)[:4000]
+    _delivery_contract = getattr(params, "delivery_contract", None)
+    if _delivery_contract:
+        evidence["delivery_contract"] = _delivery_contract
+    if getattr(params, "contract_waived", False):
+        evidence["contract_waived"] = True
     if params.files_changed:
         from hiveweave.services.worktree_review import normalize_files_changed
 
@@ -641,6 +668,93 @@ async def _submit_preflight(
                 # Warning only — don't block, but inform the agent
                 evidence["_hiveweave_invisible_warning"] = invisible_at_submit[:5]
 
+    # ── DELIVERY CONTRACT 预检（普通代码任务回执完整性 + 测试凭证机器验证）──
+    # 只检查带 delivery_contract 类型契约的任务；非 dc 契约（协调者自建 slice）
+    # 与 verify 类（走 E1）天然不受影响。contractWaived 显式跳过留痕。
+    from hiveweave.services.delivery_contract import (
+        delivery_contract_missing,
+        has_successful_test_run,
+        parse_delivery_contract,
+        parse_test_evidence_attestation_id,
+        test_evidence_is_na,
+        test_evidence_reason,
+    )
+
+    # 豁免出口与主 attestation 门一致:协调者显式 waiver 后,交付契约回执
+    # 不再拦截(豁免 = "凭证缺失/结构完整度暂时让位",语义对齐既有 waiver)。
+    from hiveweave.services.attestation import has_valid_waiver
+
+    _dc_contract = parse_delivery_contract(task)
+    _dc_waived = bool(evidence.get("contract_waived")) or await has_valid_waiver(
+        project_id, task_id
+    )
+    if _dc_contract and not _dc_waived:
+        missing = delivery_contract_missing(evidence)
+        if missing:
+            issues.append({
+                "code": "delivery_contract_incomplete",
+                "message": (
+                    "Delivery contract 回执未填齐：缺 "
+                    + ", ".join(missing)
+                    + "。请补入 submit_task(..., deliveryContract={"
+                    "'summary': '<实现摘要>', 'test': 'test_run:<id> | N/A—原因'})。"
+                    "test 引用 test_run 凭证 id 由平台机器验证；无法跑测试写 "
+                    "N/A—原因。非代码交付可显式 contractWaived=true 跳过"
+                    "（不静默缺失）。"
+                ),
+            })
+        else:
+            test_v = str(
+                (evidence.get("delivery_contract") or {}).get("test") or ""
+            )
+            if test_evidence_is_na(test_v):
+                if len(test_evidence_reason(test_v).strip()) < 2:
+                    issues.append({
+                        "code": "delivery_contract_incomplete",
+                        "message": (
+                            "Delivery contract 测试证据 N/A 声明缺原因：写 "
+                            "N/A—为什么跑不了（原因非空）。"
+                        ),
+                    })
+                elif await has_successful_test_run(project_id, task_id):
+                    # R1 回执一致性：声明 N/A"跑不了测试"，但库里有该任务的
+                    # 成功 test_run 凭证——声明与机器事实矛盾，应引用凭证。
+                    issues.append({
+                        "code": "delivery_contract_inconsistent",
+                        "message": (
+                            "Delivery contract 测试证据写 N/A，但本任务已存在"
+                            "成功（exit_code=0）的 test_run 凭证。声明与凭证库"
+                            "矛盾——应引用 test_run:<id>；确无关联请说明理由。"
+                        ),
+                    })
+            else:
+                aid = parse_test_evidence_attestation_id(test_v)
+                if not aid:
+                    issues.append({
+                        "code": "delivery_contract_incomplete",
+                        "message": (
+                            "Delivery contract 测试证据格式无法识别：期望 "
+                            "'test_run:<attestationId>' 或 'N/A—原因'，"
+                            f"实际：{test_v[:80]!r}。"
+                        ),
+                    })
+                else:
+                    _tok, _terr = await attestation_service.verify_ids(
+                        project_id,
+                        [aid],
+                        expected_kinds=["test_run"],
+                        task_id=task_id,
+                    )
+                    if not _tok:
+                        issues.append({
+                            "code": "delivery_contract_incomplete",
+                            "message": (
+                                "Delivery contract 测试凭证不可验证："
+                                f"test_run:{aid} —— {_terr}。"
+                                "请用真实 test_run 凭证 id（bash 跑测试自动落库）。"
+                            ),
+                        })
+
     return {
         "ok": not issues,
         "issues": issues,
@@ -656,8 +770,12 @@ async def _submit_preflight(
     "submit_task",
     "Submit a task for review (running -> submitted). Requires server "
     "attestationIds from browse (UI) or bash test runs (code). "
+    "VERIFY task: MUST pass verdict=PASS|FAIL (+blockingIssues when FAIL). "
+    "Tasks with a delivery contract (写树代码任务): MUST pass "
+    "deliveryContract={summary, test:'test_run:<id>' | 'N/A—<原因>'}. "
     "docs/explore tasks may use tags docs/explore. "
-    "If taskId omitted, auto-detects your current running task.",
+    "If taskId omitted, auto-detects your current running task. "
+    "See PLATFORM MECHANISMS (system prompt) for gate semantics.",
     requires_workspace=False,
     security_level="standard",
 )

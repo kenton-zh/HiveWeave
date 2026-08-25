@@ -382,6 +382,16 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
    - testsPassed: 测试通过情况
 5. 被要求返工（rework）后，重新执行并再次 `submit_task` 提交
 
+**交付契约（DELIVERY CONTRACT）— 代码任务提交回执（MANDATORY）**
+上级派发的代码任务会**自动携带**一份交付契约（任务详情的 `[DELIVERY CONTRACT]` 段），要求你提交时回填两段证据：
+- `submit_task(..., deliveryContract={{"summary": "<实现摘要>", "test": "<测试证据>"}})`
+  - `summary`：实际改了什么、与预期偏差。空白 / `<占位>` / pending 等视为未填，会被拒。
+  - `test`：两种合法形态——
+    ① `test_run:<凭证id>`：bash 跑测试会自动生成 test_run 凭证，回填其 id，平台**机器验证**（真实存在且绑定本任务，不存在/不绑定会被拒）；
+    ② `N/A—<原因>`：确实无法跑测试时写显式声明，原因非空才放行。
+- **有凭证别写 N/A**：本任务已存在成功 test_run 凭证时写 N/A 会被拒（声明与凭证库矛盾）。
+- **非代码交付**（紧急修复 / 无交付回执可填）：`submit_task(..., contractWaived=true)` 显式跳过；上级已对该任务 waiver 则自动豁免。不要静默缺失。
+
 **合法等待（MANDATORY）**：
 - **等人（决策）**：任务保持 **running**，先 `ask_agent`，再 `commit_turn(waiting, waiting_on=[{{kind:agent, ref:花名 or A100}}])`。不要 `update_task_status(blocked)` 把人或本任务写进 dependsOnTaskIds。
 - **等他们的活**：`commit_turn(waiting, waiting_on=[{{kind:task, ref:<回执上的任务id>}}])`，不要 status-ask。
