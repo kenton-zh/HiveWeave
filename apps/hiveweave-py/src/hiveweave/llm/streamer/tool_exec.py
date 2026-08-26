@@ -19,6 +19,42 @@ from .types import DeltaCallback, ToolCallCallback
 
 log = structlog.get_logger(__name__)
 
+# 副作用工具：执行中抛异常时可能已产生外部副作用（写文件/跑命令/发消息），
+# 结果无法确认。参考 DSH TOOL_OUTCOME_UNKNOWN —— 明确告诉模型「结果未知」，
+# 只读/幂等可安全重试，可能有副作用的操作需先验证实际状态，避免盲目重试
+# 造成重复副作用。与 doom_loop 的「重试容忍度」分组语义不同：这里按
+# 「写/命令/外发/外部状态变更」界定，而非按重试次数。
+_SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
+    # 命令/代码执行（可能执行一半产生副作用）
+    "bash", "bash_main", "run_command", "python_script",
+    "start_dev_server", "stop_dev_server", "job_kill",
+    # 文件/目录写入
+    "apply_patch", "write_file", "edit_file", "move_file",
+    "delete_file", "create_directory", "delete_directory",
+    # 外发消息/外部副作用（DB 已写入后抛异常 = 最高危重复副作用）
+    "send_message", "ask_agent", "notify_agent", "message_user",
+    "browse", "browse_main", "spawn_subagent", "generate_image",
+})
+
+
+def _unknown_outcome_content(
+    tool_name: str, err_type: str, err_msg: str
+) -> str:
+    """工具执行中抛异常时的回执文案。
+
+    - 副作用工具：注入 [TOOL OUTCOME UNKNOWN]，提示模型先验证再行动；
+    - 其余工具：保留既有 [Tool Error] 语义（未执行，可安全重试）。
+    """
+    base = f"[Tool Error] {err_type}: {err_msg}"
+    if tool_name in _SIDE_EFFECT_TOOLS:
+        return (
+            f"{base}\n\n[TOOL OUTCOME UNKNOWN] 工具 '{tool_name}' 在执行中"
+            "抛异常，无法确认是否已产生副作用。请先验证实际状态（文件是否"
+            "已写、命令是否已跑、消息是否已发）再做下一步：只读/幂等操作可"
+            "安全重试，可能有副作用的操作不要盲目重试。"
+        )
+    return base
+
 
 class ToolExecMixin:
     """Tool execution methods for Streamer."""
@@ -80,7 +116,9 @@ class ToolExecMixin:
                           agent_id=agent_id,
                           tool=tc["name"],
                           error=str(result))
-                content = f"[Tool Error] {type(result).__name__}: {result}"
+                content = _unknown_outcome_content(
+                    tc["name"], type(result).__name__, str(result)
+                )
                 error_ids.add(tc["id"])
             else:
                 content = result.get("content", "")
