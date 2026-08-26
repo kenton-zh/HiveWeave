@@ -1114,7 +1114,6 @@ class Agent:
 
             # 空响应重试循环
             current_messages = list(messages)
-            failover_attempted = False  # 同 turn 只切一次 backup
             while True:
                 # Unified activation budget check — stop before exceeding limits
                 _run_id = getattr(self, "_current_run_id", None)
@@ -1191,31 +1190,10 @@ class Agent:
                         or (isinstance(err_headers, dict) and err_headers)
                     )
 
-                    # ── Same-tier failover: try backup once before error park ──
-                    if is_retryable and not failover_attempted:
-                        failover_attempted = True
-                        backup = await self._resolve_failover_backup(model_config)
-                        if backup:
-                            failed_model_id = model_config.get("model_id")
-                            log.warning(
-                                "model_failover",
-                                agent_id=self.id,
-                                failed_model=failed_model_id,
-                                backup_model=backup.get("model_id"),
-                                error_status=err_status,
-                            )
-                            model_config = backup
-                            self._streaming_text_acc = ""
-                            # 通知前端模型已因故障切换
-                            self._broadcast_stream_event({
-                                "type": "model_resolved",
-                                "agentId": self.id,
-                                "modelName": backup.get("name"),
-                                "modelId": backup.get("model_id"),
-                                "source": "failover",
-                                "failedModel": failed_model_id,
-                            })
-                            continue  # retry stream with backup
+                    # 同 tier 自动切换备用模型已移除（对标 DSH，2026-08-26）：
+                    # 换 model = 换缓存域，整条前缀缓存作废；且静默改变模型
+                    # 身份会掩盖真实故障。可重试错误已由 llm/retry.py 在 HTTP
+                    # 层处理（含退避 + Retry-After），此处直接走错误治理。
 
                     # ── Existing error handling ──
                     # 402 余额耗尽优先判断：账号级、重试必败、全局熔断。
@@ -1247,7 +1225,10 @@ class Agent:
                             )
                         )
                     else:
-                        await self._handle_error(ValueError(error_msg))
+                        await self._handle_error(
+                            ValueError(error_msg),
+                            partial_result=result,
+                        )
 
                 break
 
@@ -1548,50 +1529,6 @@ class Agent:
             return None
         return await self._model_service.get(model_id)
 
-    async def _resolve_failover_backup(self, failed_config: dict) -> dict | None:
-        """Resolve same-tier backup after a model fault.
-
-        Returns backup config if:
-        - A backup exists in the same tier
-        - Backup has a DIFFERENT api_key (same key = shared quota, skip)
-        - Backup is active
-
-        Returns None otherwise (caller falls through to error park).
-        """
-        try:
-            from hiveweave.services.policy import model_tier_for_agent
-
-            tier = model_tier_for_agent(self.config)
-            failed_id = failed_config.get("id") or ""
-            failed_key = (failed_config.get("api_key") or "")[:16]
-
-            # 仅按 DB 主键(UUID)跳过失败模型。主备允许共用同一 model_id
-            # （靠编号/记录与 API Key 区分），若按 model_id 跳过会误伤备用模型。
-            skip_ids = {failed_id} if failed_id else set()
-
-            backup = await self._model_service.resolve_model(
-                tier=tier,
-                skip_model_ids=skip_ids or None,
-            )
-            if not backup:
-                return None
-
-            # Same api_key fingerprint → shared quota, failover pointless
-            backup_key = (backup.get("api_key") or "")[:16]
-            if failed_key and backup_key == failed_key:
-                log.info(
-                    "model_failover_skip_same_key",
-                    agent_id=self.id,
-                    tier=tier,
-                    failed_model=failed_config.get("model_id"),
-                )
-                return None
-
-            return backup
-        except Exception as e:
-            log.debug("model_failover_resolve_failed", error=str(e))
-            return None
-
     async def _oneshot_llm(
         self, model_config: dict, system_prompt: str, user_prompt: str,
     ) -> str:
@@ -1853,8 +1790,8 @@ class Agent:
             "hire_agent", "write_file", "edit_file", "bash", "bash_main", "apply_patch",
             "browse", "browse_main", "assert_visual", "game_run_case",
             "game_run_case_main", "run_tests",
-            "git_worktree_merge", "ask_agent", "send_message", "approve_work",
-            "reject_work", "dispatch_task", "spawn_subagent",
+            "git_worktree_merge", "ask_agent", "send_message",
+            "dispatch_task", "spawn_subagent",
         }
         names: set[str] = set()
         for tc in tool_calls or []:
@@ -2115,7 +2052,9 @@ class Agent:
         """
         return await _agent_recovery.escalate_empty_response(self)
 
-    async def _handle_error(self, error: Exception) -> None:
+    async def _handle_error(
+        self, error: Exception, partial_result: dict | None = None
+    ) -> None:
         """错误处理。
 
         对齐 Elixir agent.ex:644 handle_info({:DOWN, ref, :process, ...})。
@@ -2124,8 +2063,12 @@ class Agent:
         前端先收到 status→idle 再收到 error，错误信息可能因 streamDraft
         已被清理而无法展示。参考 OpenCode SSE 错误模式：错误事件作为终止
         信号先于状态变更到达。
+
+        ``partial_result``：断流时 streamer 返回的 error result（含已产出
+        的 tool_turn_messages），透传给 recovery 持久化中间轮，避免断流
+        丢失已完成产出（参考 DSH 事件溯源）。
         """
-        return await _agent_recovery.handle_error(self, error)
+        return await _agent_recovery.handle_error(self, error, partial_result)
 
     async def _park_after_quota_exhausted(
         self,

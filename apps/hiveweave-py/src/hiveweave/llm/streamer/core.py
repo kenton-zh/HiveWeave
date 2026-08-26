@@ -128,59 +128,17 @@ class Streamer(
             tool_count=len(tools or []),
         )
 
-        # 注册熔断器（如果未注册）。E6: fallback 覆盖从「模型行手填字段」扩展到
-        # 「同 tier 备份」——模型行 fallback 为空时由 tier 主备配置推导注入。
-        effective_fallback = await self._resolve_fallback_name(
-            provider, model_config, tried
-        )
-        await self._circuit_breaker.register(
-            provider_name, fallback=effective_fallback
-        )
+        # 熔断器注册（不再注册 fallback —— 自动模型切换已整体移除）。
+        await self._circuit_breaker.register(provider_name)
 
-        # 熔断器检查（C9: fallback 不再是无操作死代码 — 直接抛出明确异常）
+        # 熔断器检查。按 DSH 纪律移除全部自动 provider/模型切换，理由：
+        # 1) 换 model = 换缓存域，前缀缓存整条作废（TEST_DSH_29 实测长闲置
+        #    请求 100% 零命中，占全价 input token 的 90%）；
+        # 2) 切换会在无核算的情况下静默改变模型身份，掩盖真实故障。
+        # 熔断打开直接返回 error result（error_status=503），由重试 /
+        # park / 容量治理接手。
         cb_result = await self._circuit_breaker.check(provider_name)
         if not cb_result.allowed:
-            # Bug J fix: 如果有 fallback provider，自动切换重试
-            if cb_result.fallback and cb_result.fallback not in tried:
-                log.info("circuit_fallback_switch",
-                         from_provider=provider_name,
-                         to_provider=cb_result.fallback)
-                try:
-                    from hiveweave.services.model import ModelService
-                    model_svc = ModelService()
-                    fallback_config = await model_svc.get(
-                        cb_result.fallback)
-                    if fallback_config and fallback_config.get("is_active"):
-                        # Tier guard: refuse cross-tier fallback
-                        orig_tier = model_config.get("tier")
-                        fb_tier = fallback_config.get("tier")
-                        if orig_tier and fb_tier and orig_tier != fb_tier:
-                            log.warning(
-                                "circuit_fallback_tier_mismatch",
-                                from_provider=provider_name,
-                                orig_tier=orig_tier,
-                                fallback_tier=fb_tier,
-                            )
-                        else:
-                            # 用 fallback model config 递归调用 stream
-                            return await self.stream(
-                                agent_id=agent_id,
-                                messages=messages,
-                                model_config=fallback_config,
-                                tools=tools,
-                                on_delta=on_delta,
-                                on_tool_call=on_tool_call,
-                                max_tool_rounds=max_tool_rounds,
-                                steer_queue=steer_queue,
-                                skip_providers=tried,
-                            )
-                except Exception as fb_err:
-                    log.warning("circuit_fallback_failed",
-                                fallback=cb_result.fallback,
-                                error=str(fb_err))
-            # E6: 无有效 fallback 不再裸抛 —— 返回 error result（error_status=503），
-            # 让 agent 层 is_retryable=True → 走既有同 tier failover 通道；
-            # failover 无解 → 正常 handle_error（配额风暴落到 E7 容量处理）。
             return self._breaker_open_error(provider_name, start_time, tried)
 
         # 广播 start 事件
@@ -266,63 +224,6 @@ class Streamer(
         result = on_delta(event)
         if asyncio.iscoroutine(result):
             await result
-
-    @staticmethod
-    async def _resolve_fallback_name(
-        provider: Any, model_config: dict, tried: set[str]
-    ) -> str | None:
-        """E6: 有效熔断 fallback —— 模型行 fallback 为空时从同 tier 备份推导。
-
-        语义对齐 agent._resolve_failover_backup：skip 当前模型 + same-api-key
-        守卫（同 key = 共享配额，切换无意义，事故主备同 key 即此情形）。
-        已在 tried（递归防环）内的 provider 不再返回。推导失败 fail-open 返回
-        None（维持「no fallback available」语义，不改变既有行为）。
-        """
-        configured = getattr(provider, "fallback", None)
-        if isinstance(configured, str) and configured and configured not in tried:
-            # 审计修正：手填 fallback 与推导路径同守 same-key 闸（同 key =
-            # 共享配额池，切换无意义，事故主备同 key 即此情形）。
-            try:
-                from hiveweave.services.model import ModelService
-
-                fb_cfg = await ModelService().get(configured)
-                if not fb_cfg or not fb_cfg.get("is_active"):
-                    return None
-                fb_key = str(fb_cfg.get("api_key") or "")[:16]
-                failed_key = str(model_config.get("api_key") or "")[:16]
-                if failed_key and fb_key and fb_key == failed_key:
-                    return None
-                return configured
-            except Exception:
-                return None
-        tier = model_config.get("tier")
-        if not tier:
-            return None
-        try:
-            from hiveweave.services.model import ModelService
-
-            current_id = model_config.get("id")
-            failed_key = str(model_config.get("api_key") or "")[:16]
-            svc = ModelService()
-            skip = {current_id} if current_id else None
-            backup = await svc.resolve_model(tier=tier, skip_model_ids=skip)
-            if not backup:
-                return None
-            name = backup.get("name")
-            if not name or name in tried:
-                return None
-            backup_key = str(backup.get("api_key") or "")[:16]
-            if failed_key and backup_key == failed_key:
-                log.info(
-                    "fallback_skip_same_key",
-                    model=model_config.get("model_id"),
-                    tier=tier,
-                )
-                return None
-            return str(name)
-        except Exception as e:
-            log.debug("fallback_derive_failed", error=str(e))
-            return None
 
     @staticmethod
     def _breaker_open_error(

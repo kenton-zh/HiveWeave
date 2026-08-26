@@ -182,7 +182,12 @@ async def test_look_at_image_success(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_look_at_image_failover_to_backup(tmp_path: Path) -> None:
+async def test_look_at_image_reports_failure_without_switching(tmp_path: Path) -> None:
+    """主模型失败即如实上报 —— 自动切换备用视觉模型已移除（对标 DSH）。
+
+    静默换模型会掩盖真实故障并把结果归因到错误的模型上；且换 model =
+    换缓存域。即便存在可用的、不同 api_key 的备用模型也不再调用。
+    """
     img = tmp_path / "shot.png"
     _tiny_png(img)
     primary = {
@@ -224,14 +229,17 @@ async def test_look_at_image_failover_to_backup(tmp_path: Path) -> None:
             agent_id="a1",
             workspace=str(tmp_path),
         )
-    assert result.success is True
-    assert "cat" in result.output
-    assert result.extra.get("model_name") == "Vision-Backup"
-    assert mock_analyze.await_count == 2
+    assert result.success is False
+    # 失败归因到实际调用的模型，并带上原始错误
+    assert "Vision-Primary" in (result.error or "")
+    assert "429 rate limit" in (result.error or "")
+    # 关键断言：备用模型从未被调用（旧 failover 行为会是 2）
+    mock_analyze.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_look_at_image_skips_backup_same_api_key(tmp_path: Path) -> None:
+async def test_look_at_image_same_key_backup_also_unused(tmp_path: Path) -> None:
+    """备用与主模型同 api_key 时同样不被调用（切换整体已移除）。"""
     img = tmp_path / "shot.png"
     _tiny_png(img)
     primary = {
@@ -272,7 +280,9 @@ async def test_look_at_image_skips_backup_same_api_key(tmp_path: Path) -> None:
             workspace=str(tmp_path),
         )
     assert result.success is False
-    assert "same api_key" in (result.error or "")
+    # same-api-key 守卫随切换一并移除：现在根本不解析备用模型
+    assert "Vision-Primary" in (result.error or "")
+    assert "429" in (result.error or "")
     mock_analyze.assert_awaited_once()
 
 

@@ -420,21 +420,12 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                   })()}
                 </div>
               )}
-              {/* Live model indicator — reflects actual model in use (updates on turn start / failover) */}
+              {/* Live model indicator — updates on turn start.
+                  自动故障切换已移除（对标 DSH），source 恒为 tier_resolved。 */}
               {agentActiveModel[agentId] && (
-                <div className={`mt-2 px-2.5 py-1.5 rounded-md text-[11px] flex items-center gap-1.5 ${
-                  agentActiveModel[agentId].source === "failover"
-                    ? "bg-amber-500/10 text-amber-600 border border-amber-500/20"
-                    : "bg-g-blue/5 text-g-fg-3 border border-g-border/50"
-                }`}>
-                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                    agentActiveModel[agentId].source === "failover" ? "bg-amber-500 animate-pulse" : "bg-green-500"
-                  }`} />
-                  {agentActiveModel[agentId].source === "failover" ? (
-                    <span>故障切换: {agentActiveModel[agentId].failedModel} → <b>{agentActiveModel[agentId].modelName}</b></span>
-                  ) : (
-                    <span>当前使用: <b>{agentActiveModel[agentId].modelName}</b></span>
-                  )}
+                <div className="mt-2 px-2.5 py-1.5 rounded-md text-[11px] flex items-center gap-1.5 bg-g-blue/5 text-g-fg-3 border border-g-border/50">
+                  <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-green-500" />
+                  <span>当前使用: <b>{agentActiveModel[agentId].modelName}</b></span>
                 </div>
               )}
             </div>

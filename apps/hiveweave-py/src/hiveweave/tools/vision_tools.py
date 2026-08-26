@@ -109,15 +109,12 @@ async def look_at_image_tool(
             model_config=model,
         )
     except Exception as primary_err:
-        text, model, failover_err = await _try_vision_backup(  # type: ignore[assignment]
-            svc,
-            primary=model,
-            image=image,
-            prompt=prompt,
-            primary_err=primary_err,
+        # 自动切换备用视觉模型已移除（对标 DSH，2026-08-26）：静默换模型会
+        # 掩盖真实故障，且把结果归因到错误的模型上。失败即如实上报。
+        return ToolResult.err(
+            f"look_at_image failed on "
+            f"{model.get('name') or 'vision model'}: {primary_err}"
         )
-        if failover_err is not None:
-            return ToolResult.err(failover_err)
 
     assert text is not None and model is not None
     return ToolResult.ok(
@@ -185,51 +182,3 @@ async def _resolve_look_at_image_path(
         )
     return resolved
 
-
-async def _try_vision_backup(
-    svc: ModelService,
-    *,
-    primary: dict,
-    image: dict[str, str],
-    prompt: str,
-    primary_err: BaseException,
-) -> tuple[str | None, dict | None, str | None]:
-    """On primary failure, try backup once. Returns (text, model, error)."""
-    primary_id = primary.get("id")
-    skip: set[str] = {primary_id} if primary_id else set()
-    backup = await svc.resolve_vision_model(skip_model_ids=skip)
-    primary_label = primary.get("name") or primary.get("model_id") or primary_id
-
-    if backup is None:
-        return None, None, (
-            f"Vision model call failed ({primary_label}): {primary_err}"
-        )
-
-    primary_key = primary.get("api_key") or ""
-    backup_key = backup.get("api_key") or ""
-    if primary_key and backup_key == primary_key:
-        return None, None, (
-            f"Vision model call failed ({primary_label}): {primary_err}. "
-            "Backup shares the same api_key — skipped (would not help quota)."
-        )
-
-    backup_label = backup.get("name") or backup.get("model_id") or backup.get("id")
-    log.info(
-        "vision_failover_backup",
-        primary=primary_label,
-        backup=backup_label,
-        error=str(primary_err)[:200],
-    )
-    try:
-        text = await analyze_image(
-            image=image,
-            prompt=prompt,
-            model_config=backup,
-        )
-        return text, backup, None
-    except Exception as backup_err:
-        return None, None, (
-            f"Vision primary and backup failed. "
-            f"primary ({primary_label}): {primary_err}; "
-            f"backup ({backup_label}): {backup_err}"
-        )
