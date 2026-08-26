@@ -79,8 +79,12 @@ class CommitTurnParams(BaseModel):
 
     phase: Literal["in_progress", "waiting", "blocked", "done_slice"] = Field(
         description=(
-            "Control plane: in_progress=keep working; waiting=legal wait; "
-            "blocked=stuck; done_slice=obligations for this slice cleared"
+            "Control plane. Pick one: in_progress = keep working (does NOT "
+            "trigger the exit gate; allowed to 5 per 90s before forced to "
+            "converge); waiting = legal wait on someone/something and requires "
+            "waiting_on with {kind, ref}; blocked = stuck, cannot advance and "
+            "requires waiting_on; done_slice = this slice's obligations are "
+            "cleared, triggers the exit gate and hard-stops the tool loop."
         ),
     )
     summary: str = Field(

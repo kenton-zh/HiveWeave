@@ -296,7 +296,7 @@ def test_subagent_type_whitelist_audit_shape():
     """§6.1 audit：有 bash/run_tests/browse；无 write_file/edit_file/dispatch_task/attest。"""
     s = _SUBAGENT_TYPE_TOOLS["audit"]
     for required in ("bash", "run_tests", "browse", "claim_task",
-                     "submit_task", "request_review", "read_file"):
+                     "submit_task", "read_file"):
         assert required in s, f"audit missing {required}"
     for forbidden in ("write_file", "edit_file", "apply_patch",
                       "dispatch_task", "create_task", "review_task",

@@ -67,7 +67,7 @@ _SUBAGENT_AUDIT_EXTRA = frozenset({
     # 跑测试 + browse 看页面（视觉 QA），任务流转（不含 attest/waive）
     "bash", "bash_main", "run_command", "run_tests", "browse", "browse_main",
     "game_run_case", "game_run_case_main", "assert_visual",
-    "claim_task", "submit_task", "request_review", "update_task_status",
+    "claim_task", "submit_task", "update_task_status",
 })
 
 _SUBAGENT_WRITE_EXTRA = frozenset({
@@ -78,7 +78,7 @@ _SUBAGENT_WRITE_EXTRA = frozenset({
     "bash", "bash_main", "run_command", "run_tests",
     "git_worktree_status", "git_worktree_checkpoint",
     "git_worktree_list",  # merge/remove stay parent-owned (not subagent)
-    "claim_task", "submit_task", "request_review", "update_task_status",
+    "claim_task", "submit_task", "update_task_status",
 })
 
 _SUBAGENT_TYPE_TOOLS: dict[str, frozenset[str]] = {

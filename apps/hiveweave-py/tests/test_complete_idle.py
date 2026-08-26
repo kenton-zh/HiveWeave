@@ -8,8 +8,8 @@ def _is_empty_done_slice_turn(tool_calls: list) -> bool:
     substantive = {
         "submit_task", "review_task", "claim_task", "create_task",
         "hire_agent", "write_file", "edit_file", "bash", "apply_patch",
-        "git_worktree_merge", "ask_agent", "send_message", "approve_work",
-        "reject_work", "dispatch_task",
+        "git_worktree_merge", "ask_agent", "send_message",
+        "dispatch_task",
     }
     names: set[str] = set()
     for tc in tool_calls or []:

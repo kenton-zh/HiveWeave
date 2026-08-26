@@ -73,6 +73,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "first, else cmd — not PowerShell. Prefer `tail -n N`, "
             "`uv run python` (bare `python` may be missing). Never invent "
             "`/workspace` or strip backslashes (`D:PC_AI...` is invalid). "
+            "Commands may be blocked outright (self-destructive `rm -rf /`, "
+            "sensitive files like `.env`/`*.pem`/`id_rsa`, or the "
+            "`.hiveweave` system dir) — treat `blocked=true` as a hard "
+            "denial, read the reason, and change approach rather than retry "
+            "variations. If the project has `.hiveweave/env.sh`, it is "
+            "sourced automatically before every command. "
             "Set `background=true` for long scripts/tests: the call returns "
             "immediately with `waiting_on` (job id `bg-bash-…`). Then "
             "`commit_turn(phase=waiting)` using that list; do not poll. "
@@ -123,19 +129,21 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "Run Python code in your workspace (first-class tool). "
             "Provide 'script' (source) or 'scriptPath' (workspace-relative "
-            ".py file). Runs in a fresh process using the project .venv "
-            "interpreter when available. cwd = workspace. "
+            ".py file); either suffices. Runs in a fresh process using the "
+            "project .venv interpreter when available. cwd = workspace. "
+            "Runs from a temp file (no `-c` quoting issues). "
             "Check Exit code / error on every result (0 = ok). "
             "Long output truncated to head+tail. "
-            "Use for data munging / one-off logic / scripted automation — "
-            "avoid bash + python -c quoting pain. "
+            "Use for data munging / one-off logic / scripted automation. "
+            "Background/off-turn execution is NOT supported — for "
+            "long-running work use bash(background=true). "
             "Set timeout ms (5s–10min, default 120000) for heavy loops."
         ),
         "properties": {
             "script": {
                 "type": "string",
                 "aliases": ["code"],
-                "description": "Python source to run (multi-line OK).",
+                "description": "Python source to run (multi-line OK). Mutually exclusive with scriptPath; either suffices. If both given, script wins.",
             },
             "scriptPath": {
                 "type": "string",
@@ -148,7 +156,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": "Timeout ms (5s–10min). Default 120000. Values 1-600 treated as seconds.",
             },
         },
-        "required": ["script"],
+        "required": [],
     },
     "browse": {
         "description": (
@@ -170,7 +178,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "args": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": 'CLI argv e.g. ["goto","http://127.0.0.1:3000"], ["viewport","390","844"], or ["snapshot","-i"]',
+                "description": 'CLI argv, e.g. ["goto","http://127.0.0.1:3000"], ["viewport","390","844"], ["snapshot","-i"], ["screenshot","evidence/bug.png"]. Chromium flags go BEFORE the subcommand via ["--args","<flags,comma-sep>",...] (cold-start; use after a ["restart"] for a hot-fixed page). If goto/eval keep timing out, call ["restart"] first.',
             },
             "command": {
                 "type": "string",
@@ -200,7 +208,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "screenshotPath": {
                 "type": "string",
                 "aliases": ["screenshot_path", "path"],
-                "description": "PNG/JPEG path from browse screenshot.",
+                "description": (
+                    "Path to the PNG produced by browse screenshot. Copy it "
+                    "verbatim from the browse result text after 'Screenshot "
+                    "saved at:' — do not guess the path."
+                ),
             },
             "observed": {
                 "type": "string",
@@ -238,8 +250,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "type": "string",
                 "aliases": ["path", "file", "screenshot", "image"],
                 "description": (
-                    "Image path relative to workspace or absolute under it. "
-                    "Optional if attestation_id is set."
+                    "Image path (PNG/JPEG/GIF/WebP/BMP), workspace-relative or "
+                    "absolute under the workspace, ≤2MB. Optional if "
+                    "attestation_id is set."
                 ),
             },
             "attestation_id": {
@@ -264,7 +277,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "generate_image": {
         "description": (
             "Generate a PNG via Seedream (text-to-image) under the workspace. "
-            "Requires SOURCE_WRITE."
+            "Requires SOURCE_WRITE AND a configured image-gen model under "
+            "Settings → 模型配置 → 生图模型配置; if not configured the call "
+            "errors out. Always outputs PNG; pass output_path to control the "
+            "save location."
         ),
         "properties": {
             "prompt": {
@@ -293,10 +309,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "game_run_case": {
         "description": (
-            "H5/canvas game harness runner. After browse(goto) to the game: "
+            "H5/canvas game harness runner. FIRST browse(goto) the game URL "
+            "WITH ?hw_test=1 so the harness exposes window.__HW_TEST__. Then "
             "probe → list → run(caseId). run() executes window.__HW_TEST__, "
             "screenshots canvas, returns codePass + visionCriteria; then "
-            "assert_visual. No harness → observe-only (no gameplay pass)."
+            "assert_visual. No harness (probe=observe-only) → do not claim "
+            "gameplay pass. Never attempt realtime AI play of action games."
         ),
         "properties": {
             "action": {
@@ -405,6 +423,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             },
             "recursive": {"type": "boolean", "description": "If true, list recursively. Default: false."},
             "maxdepth": {"type": "integer", "description": "Max depth when recursive (1-3). Default: 1. Values above 3 are clamped to 3."},
+            "include_ignored": {"type": "boolean", "aliases": ["includeIgnored"],
+                "description": "Also list .hiveweave subdirectories (e.g. worktrees when reviewing executor code). Default: false."},
         },
         "required": [],
     },
@@ -430,6 +450,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "context": {"type": "integer", "aliases": ["contextLines", "contextAround"],
                 "description": "Number of context lines around each match (default: 0)."},
             "multiline": {"type": "boolean", "aliases": ["multiLine", "dotAll"]},
+            "include_ignored": {"type": "boolean", "aliases": ["includeIgnored"],
+                "description": "Also search .hiveweave subdirectories (e.g. worktrees when reviewing executor code). Default: false."},
         },
         "required": ["pattern"],
     },
@@ -450,7 +472,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "old_string must match exactly (whitespace included). When "
             "replace_all is false (default), it must appear exactly once — "
             "include enough context to make it unique. Empty new_string "
-            "deletes the match. Read the file first."
+            "deletes the match. If exact match fails, a whitespace/"
+            "indentation-tolerant fuzzy match is attempted before erroring. "
+            "Read the file first."
         ),
         "properties": {
             "filePath": {
@@ -479,7 +503,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "apply_patch": {
         "description": (
             "Apply file patch operations (add/update/delete). Prefer this "
-            "or edit_file for a small change; write_file fully replaces a file."
+            "or edit_file for a small change; write_file fully replaces a file. "
+            "Either pass patches[] (array of ops) or a single change as direct "
+            "filePath + oldString/newString/content."
         ),
         "properties": {
             "patches": {
@@ -523,23 +549,34 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "question": {
         "description": (
-            "Ask the human a question; optional choices. Blocks until they "
-            "answer. Assistant text is not delivered — only this tool is."
+            "Ask the human a question and block until they answer or ~180s "
+            "elapse; optional options (each a string or {label, text}). "
+            "Returns 'User answered: …' on an answer, or a timeout/cancel "
+            "message and proceeds without user input (not an error). If you "
+            "already have one pending question unanswered, a new call is "
+            "skipped (30-min dedup) — wait for the prior answer. This is the "
+            "ONLY channel that delivers a question to the user; assistant "
+            "text is not delivered."
         ),
         "properties": {
             "question": {"type": "string", "aliases": ["message", "content", "query", "text"]},
-            "options": {"type": "array", "aliases": ["choices"]},
+            "options": {"type": "array", "aliases": ["choices"],
+                "description": "Each item: a string, or an object {label, text}. Up to 6 shown as choices."},
         },
         "required": ["question"],
     },
     "todowrite": {
         "description": (
-            "Update this turn's personal todo list; mark items completed "
-            "when done. Not the Task Ledger — durable notes go in "
+            "Replace the agent's persisted todo list wholesale — pass ALL "
+            "todos each call (unlisted old ones are dropped). Each item: "
+            "content, status (pending/in_progress/completed/cancelled), "
+            "priority (low/medium/high). Mark finished items completed rather "
+            "than omitting them. Not the Task Ledger — durable records go in "
             "write_work_log."
         ),
         "properties": {
-            "todos": {"type": "array", "aliases": ["tasks", "items", "list"]},
+            "todos": {"type": "array", "aliases": ["tasks", "items", "list"],
+                "description": "Full list; each item {content, status?, priority?}."},
         },
         "required": ["todos"],
     },
@@ -624,7 +661,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "reply_contract_id. End the turn with commit_turn."
         ),
         "properties": {
-            "recipients": {"type": "array", "aliases": ["recipient", "to", "targets"]},
+            "recipients": {"type": "array", "aliases": ["recipient", "to", "targets"],
+                "description": "Recipients as 花名 / short_id / UUID / name (or the literal 'user' for the human)."},
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
             "expectReport": {
                 "type": "boolean",
@@ -653,7 +691,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "status-only follow-up. Prefer over "
             "send_message(expectReport=true). When answering an existing ask, "
             "pass replyTo=that message's reply_contract_id (not the "
-            "tool-result message id) or a new obligation is created."
+            "tool-result message id) or a new obligation is created. To just "
+            "close an ask WITHOUT opening a new reply obligation, use "
+            "notify_agent (ask_agent forces a reply contract, so replying "
+            "with it may open a fresh ask)."
         ),
         "properties": {
             "recipients": {"type": "array", "aliases": ["recipient", "to", "targets", "target"]},
@@ -708,6 +749,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "phase": {
                 "type": "string",
                 "enum": ["in_progress", "waiting", "blocked", "done_slice"],
+                "description": (
+                    "in_progress = keep working (no exit gate). waiting = "
+                    "lawful wait on someone/something (needs waiting_on; can be "
+                    "timer/user/external). blocked = stuck with no wait target "
+                    "(if you CAN wait, use waiting, not blocked). done_slice = "
+                    "this slice's obligations are cleared (triggers the exit "
+                    "gate hard-check; not cleared → rejected)."
+                ),
             },
             "summary": {
                 "type": "string",
@@ -744,7 +793,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "Declare this turn cannot advance actionable tasks. Stops "
             "[TASK ADVANCE] nudges until the next wake. Requires a concrete "
-            "reason. Does not replace commit_turn."
+            "reason. Does not replace commit_turn — after declaring, still "
+            "end the turn with commit_turn(phase=waiting/blocked, "
+            "waiting_on=[...])."
         ),
         "properties": {
             "reason": {
@@ -759,17 +810,23 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "Hire and deploy an agent. Returns the new agent id. role is a "
             "display title (executors: module+job, not bare 前端工程师). "
-            "permissionType=coordinator|executor sets authority. Skills: "
-            "\"#N\" from list_available_skills or a full slug — not raw "
-            "tech names."
+            "permissionType optional — if omitted it is inferred from role "
+            "(ceo/hr/qa/coordinator/executor); pass an explicit value only for "
+            "non-standard roles. coordinator manages subordinates "
+            "(dispatch_task/review_task); executor does hands-on work "
+            "(claim_task/submit_task). Skills: \"#N\" from list_available_skills "
+            "or a full slug — not raw tech names. parentId defaults to CEO, "
+            "but an executor MUST attach under a coordinator (cannot report "
+            "directly to CEO) — otherwise hire fails with the eligible "
+            "coordinators to use."
         ),
         "properties": {
             "name": {"type": "string"},
             "role": {"type": "string", "description": "Chinese job title (display label — does NOT set permission; use permissionType). For executors MUST include owned module, e.g. 签到排行榜工程师 / 认证API工程师 — NOT bare 前端工程师."},
             "permissionType": {
                 "type": "string",
-                "enum": ["coordinator", "executor"],
-                "description": "coordinator = manages subordinates (dispatch_task/review_task); executor = hands-on work (claim_task/submit_task). Pass through the requester's value.",
+                "enum": ["ceo", "hr", "qa", "coordinator", "executor"],
+                "description": "Optional. ceo/hr/qa/coordinator/executor. Omitted → inferred from role. coordinator manages subordinates (dispatch_task/review_task); executor does hands-on work (claim_task/submit_task).",
             },
             "goal": {"type": "string"},
             "systemPrompt": {
@@ -907,14 +964,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "a blocked task — that needs wakeAt on update_task_status."
         ),
         "properties": {
-            "toAgentId": {"type": "string", "aliases": ["to_agent_id", "target"]},
+            "toAgentId": {"type": "string", "aliases": ["to_agent_id", "target"],
+                "description": "Agent to deliver the alarm to. Defaults to self if omitted."},
             "purpose": {"type": "string", "aliases": ["message", "description"]},
             "fireInGameSeconds": {"type": "integer", "aliases": ["fire_in_game_seconds", "delay"],
                 "description": "Delay in game-time seconds before the alarm fires."},
             "repeatIntervalSeconds": {"type": "integer", "aliases": ["repeat_interval_seconds", "interval"],
                 "description": "If set, alarm repeats every N game-time seconds. Omit for one-shot."},
         },
-        "required": ["toAgentId", "purpose", "fireInGameSeconds"],
+        "required": ["purpose", "fireInGameSeconds"],
     },
     "read_work_logs": {
         "description": (
@@ -928,7 +986,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "run_code_review": {
-        "description": "LLM review of files for quality, correctness, and style. Returns findings — not a test_run attestation.",
+        "description": "LLM review of files for quality, correctness, and style. Returns findings — not a test_run attestation and does NOT satisfy a code_audit submit gate. For the audited diff gate (cumulative >20 lines edits) use request_code_audit.",
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
@@ -948,7 +1006,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["filePaths"],
     },
     "run_tests": {
-        "description": "Run the project's tests for the given files. For review evidence prefer bash(..., taskId=...).",
+        "description": (
+            "LLM review of test files for coverage, test quality, and edge cases. "
+            "Returns findings — it does NOT execute tests and produces NO test_run "
+            "attestation. To actually run tests AND mint a test_run attestation for "
+            "submit evidence, use bash(..., taskId=<task>), not this tool."
+        ),
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module", "testPath"]},
@@ -1087,7 +1150,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "task ids only (self-id rejected); waiting on a person is "
             "commit_turn(waiting, kind=agent). create_task alone "
             "does not wake. Milestone MAIN QA: milestoneVerify=true "
-            "(coordinator/CEO). Same-assignee dups cannot be forced."
+            "(coordinator/CEO). Same-assignee dups cannot be forced. "
+            "milestoneVerify=true only applies when creating a NEW task "
+            "(must omit taskId); it is rejected on taskId reuse. Note "
+            "submitGate is still required by the arg schema even when "
+            "reusing taskId — pass any allowed value."
         ),
         "properties": {
             "target": {"type": "string", "aliases": ["toAgentId", "to_agent_id", "recipient", "agentId", "subordinate", "agent_id"]},
@@ -1142,46 +1209,20 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["target", "task", "submitGate"],
     },
     "review": {
-        "description": "Run a local review suite (code_review|security_audit|test_review|perf_audit) on filePaths. Returns findings — not a test_run attestation.",
+        "description": (
+            "Run one review axis on filePaths. Select the axis with reviewType "
+            "(default code_review). For ALL four axes in one call use "
+            "run_full_review. Returns findings — not a test_run attestation "
+            "and does NOT satisfy a code_audit submit gate."
+        ),
         "properties": {
             "filePaths": {"type": "array", "items": {"type": "string"},
                 "aliases": ["files", "target", "path", "file", "module"]},
             "reviewType": {"type": "string",
                 "aliases": ["review_type", "type"],
-                "description": "Review type: 'code_review', 'security_audit', 'test_review', or 'perf_audit'. Default: code_review."},
+                "description": "Review axis: 'code_review', 'security_audit', 'test_review', or 'perf_audit'. Default: code_review."},
         },
         "required": ["filePaths"],
-    },
-    "request_review": {
-        "description": "DEPRECATED. Use review_task(taskId, decision=...).",
-        "properties": {
-            "reviewerId": {"type": "string", "aliases": ["reviewer_id", "reviewer", "target", "agentId"]},
-            "target": {"type": "string", "aliases": ["file", "path", "module", "description"]},
-            "reviewType": {"type": "string", "aliases": ["review_type", "type"]},
-        },
-        "required": ["reviewerId", "target"],
-    },
-    "report_completion": {
-        "description": "REMOVED. Use submit_task(taskId, summary, testsPassed=true) instead.",
-        "properties": {
-            "summary": {"type": "string", "aliases": ["message", "content", "report", "description"]},
-        },
-        "required": ["summary"],
-    },
-    "approve_work": {
-        "description": "REMOVED. Use review_task(taskId, decision='approve') instead.",
-        "properties": {
-            "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
-        },
-        "required": ["subordinate"],
-    },
-    "reject_work": {
-        "description": "REMOVED. Use review_task(taskId, decision='rework', feedback=...) instead.",
-        "properties": {
-            "subordinate": {"type": "string", "aliases": ["subordinateId", "subordinate_id", "agentId", "agent_id", "target"]},
-            "reason": {"type": "string", "aliases": ["feedback", "review", "comment", "message"]},
-        },
-        "required": ["subordinate", "reason"],
     },
     "write_work_log": {
         "description": "Append a durable record of work just done. todowrite is only this-turn planning.",
@@ -1328,7 +1369,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["title", "description", "submitGate"],
     },
     "claim_task": {
-        "description": "Claim a created/unassigned task (created → claimed). Sets you as assignee.",
+        "description": "Claim a created/unassigned task (created → claimed). Sets you as assignee. Claiming a VERIFY may be refused while a serialized VERIFY is in flight — check get_tasks verify_lock lines first.",
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
         },
@@ -1379,9 +1420,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     "submit_task": {
         "description": (
-            "Submit for review (running → submitted). testsPassed must be "
-            "true after real tests. Pass attestationIds from bash/browse. "
-            "dryRun=true lists missing items without submitting."
+            "Submit for review (running → submitted). testsPassed must be true "
+            "after real tests. Pass attestationIds from bash/browse. dryRun=true "
+            "lists missing items without submitting. VERIFY tasks MUST pass "
+            "verdict=PASS|FAIL (blockingIssues when FAIL, E1 hard gate); "
+            "delivery-contract tasks MUST pass deliveryContract={summary, test}. "
+            "Only the assignee can submit."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
@@ -1425,6 +1469,41 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["env_snapshot"],
                 "description": "Optional environment snapshot for VERIFY evidence.",
             },
+            "verdict": {
+                "type": "string",
+                "aliases": ["verdict"],
+                "description": (
+                    "VERIFY tasks only (title starts with 'VERIFY:'): 'PASS' or "
+                    "'FAIL'. A missing verdict on a VERIFY task is hard-rejected "
+                    "(E1); FAIL additionally requires blockingIssues."
+                ),
+            },
+            "blockingIssues": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["blocking_issues"],
+                "description": (
+                    "VERIFY tasks only: non-empty list of defect identifiers/"
+                    "strings when verdict=FAIL — hard gate, routes to rework."
+                ),
+            },
+            "deliveryContract": {
+                "type": "object",
+                "aliases": ["delivery_contract", "contract"],
+                "description": (
+                    "Required for delivery-contract (写树代码) tasks: "
+                    "{summary, test: 'test_run:<id>' | 'N/A—<原因>'}. Missing is "
+                    "a hard rejection."
+                ),
+            },
+            "contractWaived": {
+                "type": "boolean",
+                "aliases": ["contract_waived"],
+                "description": (
+                    "Explicit skip of the delivery contract when honestly nothing "
+                    "to fill (non-code / emergency hotfix). Never omit silently."
+                ),
+            },
         },
         "required": ["summary", "testsPassed"],
     },
@@ -1439,7 +1518,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "per-leaf VERIFY spawn. Milestone QA is dispatch_task("
             "milestoneVerify=true) after MAIN is ready. If approve is rejected "
             "for missing evidence, do not retry — send back for the gate. "
-            "VERIFY waive is CEO-only."
+            "VERIFY waive is CEO-only. You cannot approve your own "
+            "deliverable (self-review is hard-blocked). A submitted "
+            "evidence verdict=FAIL (VERIFY) auto-reroutes approve to "
+            "rework — FAIL must be fixed, never silently closed."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
@@ -1454,7 +1536,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "get_tasks": {
         "description": (
             "List Task Ledger rows. Optional status or assigneeId. "
-            "Excludes archived."
+            "Excludes archived. Output includes per-task verify_serial_lock / "
+            "waiver / attestation_baseline / latest_audit_verdict hints — read "
+            "them before claim/approve to avoid stalls."
         ),
         "properties": {
             "status": {"type": "string"},
@@ -1537,7 +1621,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "evidenceAttestationId after looking at that task. "
             "Coordinators must cite a real test_run / browse_e2e / "
             "visual_check / doc_review. Max 2 per task. Waiving agent "
-            "cannot later approve (unless small-team sole reviewer)."
+            "cannot later approve (unless small-team sole reviewer). "
+            "Must be CEO-only for VERIFY and docs_only tasks (coordinators: "
+            "use attest_doc_review for docs). Never waive a verdict=FAIL "
+            "conclusion — waiver covers MISSING attestation only, not a "
+            "failed result. reason must be ≥20 chars and state what was "
+            "checked."
         ),
         "properties": {
             "taskId": {
@@ -1637,6 +1726,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "project already has a live process on preferredPort, it is "
             "stopped first (kill-before-start). Another project's process "
             "on that port is never killed — a free port is chosen instead. "
+            "If you hold an in-flight VERIFY task, the server is started "
+            "against the MAIN project root (not your worktree) so milestone "
+            "QA hits merged code. A custom `command` may contain `{port}`, "
+            "replaced with the allocated project port. "
             "Stop with stop_dev_server. Extra env belongs in "
             ".hiveweave/env.sh or an inline VAR=x prefix."
         ),
@@ -1696,7 +1789,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "message_user": {
         "description": (
             "Send a message to the human operator. Assistant text is not "
-            "delivered — only this tool is. CEO终验 uses this."
+            "delivered — only this tool is. CEO终验 uses this. "
+            "CEO only: posting a '全部完成/交付完成' conclusion triggers a "
+            "ledger consistency gate — if any open FAIL 终验, approved-not-"
+            "closed task, or your own unread inbox remain, the message is "
+            "REJECTED; finish those first or state the real status (never "
+            "claim all-done prematurely)."
         ),
         "properties": {
             "message": {"type": "string", "aliases": ["content", "body", "text"]},

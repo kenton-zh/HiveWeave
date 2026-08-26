@@ -249,7 +249,14 @@ class QuestionParams(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     question: str = Field(
-        description="The question to ask the user.",
+        description=(
+            "The question to ask the user. Blocking: this call waits up to "
+            "~180s for an answer. If the same agent already has a pending "
+            "question within the last 30 minutes, this ask is skipped and the "
+            "call returns immediately. On timeout or cancellation the call "
+            "returns success and the agent continues WITHOUT taking the "
+            "user's input."
+        ),
         json_schema_extra={"aliases": ["prompt", "text"]},
     )
     options: Optional[list[Any]] = Field(

@@ -65,8 +65,11 @@ class HireAgentParams(BaseModel):
         default=None,
         alias="permissionType",
         description=(
-            "MANDATORY. coordinator = manages subordinates; "
-            "executor = hands-on work."
+            "Optional. One of: ceo / hr / qa / coordinator / executor "
+            "(coordinator manages subordinates; executor does hands-on work). "
+            "If omitted, it is inferred from the role string — pass it "
+            "explicitly for non-standard/unknown roles where role-based "
+            "inference is unreliable."
         ),
         json_schema_extra={"aliases": ["permissionType", "permission_type"]},
     )
