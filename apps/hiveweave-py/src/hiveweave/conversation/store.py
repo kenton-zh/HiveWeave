@@ -35,6 +35,16 @@ logger = structlog.get_logger()
 
 DEFAULT_CONTEXT_WINDOW = 128_000
 
+# 上下文边界标记（DSH compaction/summary 事件的等价物）。
+# conversation_turns（模型真实上下文）与 chat_messages（UI 展示）是两套
+# 独立存储：压缩/裁剪重写前者，后者只追加 —— UI 因此会显示模型早已
+# 忘记的历史（用户实证「CHAT 面板上下文与实际不一致」）。DSH 的做法是
+# 单一 append-only log + surfaceOp 遮蔽区间，UI 能画出压缩分界线。
+# 此处不重构存储，改为在压缩/裁剪实际落地后往 chat_messages 落一条
+# role="system" 的标记消息，让 UI 至少能准确画出「模型记忆从此处开始」。
+CONTEXT_MARKER_KIND_COMPACTION = "compaction"
+CONTEXT_MARKER_KIND_PRUNE = "prune"
+
 # 压缩失败冷却（TEST18 巡检 P1）：LLM 摘要失败后 N 秒内不重新触发——
 # 否则超阈值 agent 每次 append 都空耗一次 ~20s 失败调用（16 次回退实证）。
 COMPACTION_COOLDOWN_S = 300
@@ -296,6 +306,60 @@ class ConversationStore:
                 self._compaction_pending.discard(key)
                 raise
 
+    async def _emit_context_marker(
+        self,
+        agent_id: str,
+        kind: str,
+        *,
+        kept: int | None = None,
+        has_summary: bool | None = None,
+        pruned_count: int | None = None,
+        pruned_tokens: int | None = None,
+    ) -> None:
+        """往 chat_messages 落一条上下文边界标记，供 UI 画分界线。
+
+        DSH 纪律：标记只在操作**实际落地后**发出（compaction noop /
+        prune 无候选都不落），且失败绝不影响已完成的压缩/裁剪 —— 标记
+        是展示层补充，不是上下文正确性的一部分。
+        """
+        try:
+            from hiveweave.services.chat_message import ChatMessageService
+
+            meta: dict = {"source": "system", "context_marker": kind}
+            if kind == CONTEXT_MARKER_KIND_COMPACTION:
+                content = (
+                    "上下文已压缩 — 此前的对话已被摘要替换，"
+                    "模型不再逐字记得分界线以上的内容。"
+                )
+                if kept is not None:
+                    meta["kept"] = kept
+                if has_summary is not None:
+                    meta["has_summary"] = has_summary
+            else:
+                content = (
+                    "旧工具输出已从模型上下文移除 — "
+                    "分界线以上的工具结果模型已不可见（此处仍保留供你查阅）。"
+                )
+                if pruned_count is not None:
+                    meta["pruned_count"] = pruned_count
+                if pruned_tokens is not None:
+                    meta["pruned_tokens"] = pruned_tokens
+
+            await ChatMessageService().save_message({
+                "agent_id": agent_id,
+                "role": "system",
+                "content": content,
+                "is_read": True,
+                "metadata": meta,
+            })
+        except Exception as e:
+            logger.warning(
+                "context_marker_emit_failed",
+                agent_id=agent_id,
+                kind=kind,
+                error=str(e),
+            )
+
     async def _do_compaction(self, agent_id, project_id, key, messages, budget) -> None:
         lock = self._get_compaction_lock(key)
         if lock.locked():
@@ -410,6 +474,14 @@ class ConversationStore:
                 logger.info(
                     "compaction_applied",
                     agent_id=agent_id,
+                    kept=len(history),
+                    has_summary=summary_text is not None,
+                )
+                # 标记在持久化成功后才落 —— _persist_compaction 抛异常时
+                # 历史已整体回滚，不存在边界，不得画线。
+                await self._emit_context_marker(
+                    agent_id,
+                    CONTEXT_MARKER_KIND_COMPACTION,
                     kept=len(history),
                     has_summary=summary_text is not None,
                 )
@@ -655,6 +727,16 @@ class ConversationStore:
             pruned_tokens=prune_tokens,
             protected_tokens=protected,
         )
+        # 标记依据的是 cache（模型的活上下文）已被 in-place 改写成占位符 ——
+        # 这一步在上面已完成且不可失败，所以画线此刻就是准确的，无需等
+        # _persist_pruned 落库。compaction 相反：它的 cache 替换与 DB 重写
+        # 是一体的，DB 回滚即无边界，故那边必须等持久化成功。
+        await self._emit_context_marker(
+            agent_id,
+            CONTEXT_MARKER_KIND_PRUNE,
+            pruned_count=len(to_prune_indices),
+            pruned_tokens=prune_tokens,
+        )
 
     async def _persist_pruned(self, agent_id: str, key: tuple[str, str]) -> None:
         """持久化裁剪后的历史到 DB — 单事务删除所有旧 turn + 写入当前 cache。
@@ -704,17 +786,43 @@ class ConversationStore:
         return ConversationStore._trim_turns(messages, budget, total)
 
     @staticmethod
+    def _split_leading_system(messages: list[dict]) -> tuple[list[dict], list[dict]]:
+        """把开头的连续 system 消息拆出，作为不可裁剪的前缀。
+
+        DSH KV-cache：system（身份/工具定义/上下文提示）是前缀缓存命中的
+        主体；裁剪若从头部丢弃 system，整段前缀作废、命中率骤降。因此
+        trim 时 prefix 恒保留，只对剩余消息做轮次裁剪。
+        """
+        n = 0
+        while n < len(messages) and messages[n].get("role") == "system":
+            n += 1
+        return messages[:n], messages[n:]
+
+    @staticmethod
     def _trim_turns(messages: list[dict], budget: int, total: int) -> list[dict]:
-        """Turn-level 裁剪：保留最近 TAIL_TURNS 轮完整。"""
-        turns = ConversationStore._split_into_turns(messages)
+        """Turn-level 裁剪：保留最近 TAIL_TURNS 轮完整 + 系统前缀不丢。"""
+        prefix, rest = ConversationStore._split_leading_system(messages)
+        turns = ConversationStore._split_into_turns(rest)
+        if not turns:
+            return prefix
         if len(turns) <= TAIL_TURNS:
-            return ConversationStore._trim_messages(messages, budget, total)
+            # cur 从含 prefix 的 total 起算、只丢 rest，恰好满足
+            # prefix+rest <= budget，无需额外扣减（审计确认）。
+            return prefix + ConversationStore._trim_messages(
+                rest, budget, total
+            )
+        # prefix 非空时预算必须扣减：prefix 恒保留占预算，剩余预算才
+        # 能分给 rest（否则 prefix+fitting+recent 会超窗溢出上下文）。
+        prefix_tokens = estimate_tokens_for_messages(prefix)
+        effective = max(0, budget - prefix_tokens)
         recent = [m for t in turns[-TAIL_TURNS:] for m in t]
         recent_tokens = estimate_tokens_for_messages(recent)
-        if recent_tokens > budget:
-            return ConversationStore._trim_messages(recent, budget, recent_tokens)
+        if recent_tokens > effective:
+            return prefix + ConversationStore._trim_messages(
+                recent, effective, recent_tokens
+            )
         # 尝试塞入更旧的 turn
-        remaining = budget - recent_tokens
+        remaining = effective - recent_tokens
         fitting: list[list[dict]] = []
         for turn in reversed(turns[:-TAIL_TURNS]):
             tt = estimate_tokens_for_messages(turn)
@@ -723,7 +831,7 @@ class ConversationStore:
                 remaining -= tt
             else:
                 break
-        return [m for t in fitting for m in t] + recent
+        return prefix + [m for t in fitting for m in t] + recent
 
     @staticmethod
     def _split_into_turns(messages: list[dict]) -> list[list[dict]]:

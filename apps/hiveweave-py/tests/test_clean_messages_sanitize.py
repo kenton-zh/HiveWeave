@@ -119,3 +119,31 @@ class TestSanitizeToolCallArguments:
         for m in cleaned:
             for tc in m.get("tool_calls") or []:
                 json.loads(tc["function"]["arguments"])
+
+
+class TestTrimKeepsSystemPrefix:
+    """_trim_turns 保留 system 前缀（DSH KV-cache：裁剪不从头丢 system）。"""
+
+    def _msgs(self, n_turns: int) -> list[dict]:
+        msgs: list[dict] = [
+            {"role": "system", "content": "你是 CEO，身份+工具定义"},
+        ]
+        for i in range(n_turns):
+            msgs.append({"role": "user", "content": f"任务{i}"})
+            msgs.append({"role": "assistant", "content": f"处理{i}"})
+        return msgs
+
+    def test_extreme_budget_keeps_system_prefix(self) -> None:
+        msgs = self._msgs(n_turns=5)  # > TAIL_TURNS(2)
+        out = ConversationStore._trim_turns(msgs, budget=1, total=10_000)
+        # system 前缀恒保留在开头
+        assert out and out[0] == {"role": "system", "content": "你是 CEO，身份+工具定义"}
+        # 预算极小 → 非 system 内容被裁到最少（_trim_messages 尾部保留，最多 1 条）
+        non_system = [m for m in out if m.get("role") != "system"]
+        assert len(non_system) <= 1
+
+    def test_normal_budget_keeps_recent_turns_and_prefix(self) -> None:
+        msgs = self._msgs(n_turns=5)
+        out = ConversationStore._trim_turns(msgs, budget=10_000, total=10_000)
+        # 预算充足 → 不丢任何消息
+        assert out == msgs

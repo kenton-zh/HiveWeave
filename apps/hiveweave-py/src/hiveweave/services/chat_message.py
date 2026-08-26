@@ -250,10 +250,19 @@ class ChatMessageService:
         "FROM chat_messages WHERE agent_id = ? "
     )
     # Chat 主栏：全部 user/assistant（含 background trigger 消息与后台
-    # assistant 回复）。来源区分由 metadata.source / team_from_agent_id
+    # assistant 回复）+ 上下文边界标记（role=system + context_marker）。
+    # 来源区分由 metadata.source / team_from_agent_id
     # 供前端渲染徽章（用户 / AGENT / 系统 / 看门狗）。
+    # 边界标记必须进主栏：它标出模型记忆起点，滤掉则 UI 显示模型早已
+    # 压缩掉的历史（「上下文与实际不一致」根因）。其他 system 行不进主栏。
+    # json_extract 按键名精确锚定 + kind 白名单与前端 normalizeContextMarker
+    # 对齐：LIKE '%"context_marker"%' 会放行未知 kind，那种行前端判 false
+    # 丢弃，却已占掉 direct_limit 配额 = 静默吃掉一条真实历史。
     _PANEL_DIRECT_WHERE = (
-        "AND role IN ('user', 'assistant') "
+        "AND (role IN ('user', 'assistant') "
+        "OR (role = 'system' AND json_valid(metadata) "
+        "AND json_extract(metadata, '$.context_marker') "
+        "IN ('compaction', 'prune'))) "
     )
     # 「团队沟通」信件栏：role=team 或 background user（trigger digest）。
     # 不含 background assistant / 工具芯片。

@@ -494,8 +494,11 @@ export function useChatMessages(opts: {
     // 全量时间线：真人用户、后台 trigger digest（agent/system/watchdog）、
     // 全部 assistant 回复（含后台）。role=team 仍归「团队沟通」栏。
     // digest（isContext）不再隐藏——由 MessageBubble 折叠展示。
+    // 上下文边界标记（role=system + _contextMarker）也留在主栏：它标出
+    // 「模型记忆从此处开始」，滤掉就回到了"显示与实际不一致"。
     const merged = mergeStreamDraftIntoMessages(messages, streamDraft, { isStreaming });
     const foreground = merged.filter((m) => {
+      if (m.role === "system") return !!m._contextMarker;
       if (m.role !== "user" && m.role !== "assistant") return false;
       if (m.role === "assistant" && !m.isStreaming) {
         const hasContent = m.content && m.content.trim().length > 0;
