@@ -142,6 +142,9 @@ export function draftFromStreamingMessage(
     assistantId: msg.id,
     segments,
     isBackground: msg.isBackground === true,
+    // 被动接入（hydrate）时没有真实流起点，用 streaming 行创建时间近似，
+    // 让 tok/s 在该路径下也有（略保守的）显示。
+    startedAt: msg.timestamp || undefined,
   };
 }
 

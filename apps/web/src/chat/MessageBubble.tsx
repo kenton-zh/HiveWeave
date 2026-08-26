@@ -2,6 +2,7 @@ import { memo, useState } from "react";
 import type { ChatMessage, ContextMarkerKind, ToolCall } from "./types";
 import { CHAT_MOTION_CSS, toolCategories } from "./constants";
 import { formatToolInputHint } from "./messageUtils";
+import { estimateMessageTokens, estimateTokens } from "./tokenEstimate";
 
 /**
  * DSH 风格思考行：单行 `Think · 摘要`，点击展开全文。
@@ -41,7 +42,9 @@ function ThinkingBlock({ content }: { content: string }) {
           {preview}
         </span>
         {open && (
-          <span className="text-[10px] text-g-fg-4 ml-auto shrink-0">{content.length} 字</span>
+          <span className="text-[10px] text-g-fg-4 ml-auto shrink-0">
+            {estimateTokens(content)} tokens
+          </span>
         )}
       </button>
       {open && (
@@ -324,12 +327,15 @@ function MessageBubbleInner({
   thinkingElapsed,
   sourceName,
   agentName,
+  streamStartedAt,
 }: {
   msg: ChatMessage;
   isStreaming?: boolean;
   thinkingElapsed?: number | null;
   sourceName?: string;
   agentName?: string;
+  /** 本轮流开始时间（仅流式中的目标气泡有值）——实时 tok/s 用。 */
+  streamStartedAt?: number;
 }) {
   // 上下文边界标记优先于普通 system 气泡：它是分界线，不是消息。
   if (msg._contextMarker) {
@@ -367,6 +373,20 @@ function MessageBubbleInner({
   const isEmpty =
     !msg.content && !thinking && !hasSegments && (!msg.toolCalls || msg.toolCalls.length === 0);
 
+  // 生成统计：tokens 用与后端一致的 char-ratio 估算；速率流式期间实时
+  // （draft.startedAt 起算），完成后用冻结的 _genStats.ms 做分母——分子
+  // 恒为渲染时的估算，与显示的 "~N tok" 同口径。
+  const genTokens = !isUser ? estimateMessageTokens(msg) : 0;
+  let genRate: number | null = null;
+  if (!isUser && genTokens > 0) {
+    if (isStreaming && streamStartedAt) {
+      const elapsedS = Math.max(0.5, (Date.now() - streamStartedAt) / 1000);
+      genRate = genTokens / elapsedS;
+    } else if (msg._genStats && msg._genStats.ms > 0) {
+      genRate = genTokens / (msg._genStats.ms / 1000);
+    }
+  }
+
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"} my-2 hw-msg-in`}>
       <div
@@ -389,11 +409,17 @@ function MessageBubbleInner({
             >
               AI
             </span>
-            <span className="text-[11px] font-semibold text-g-fg-2 truncate">
+            <span className="text-[11px] font-semibold text-g-fg-2 truncate min-w-0">
               {agentName || "回复"}
             </span>
             {isStreaming && !isEmpty && (
               <span className="text-[10px] text-emerald-600 font-medium shrink-0">· 生成中</span>
+            )}
+            {genTokens > 0 && (
+              <span className="text-[10px] text-g-fg-4 ml-auto shrink-0 font-mono">
+                ~{genTokens.toLocaleString()} tok
+                {genRate != null && ` · ${genRate.toFixed(1)} tok/s`}
+              </span>
             )}
           </div>
         )}

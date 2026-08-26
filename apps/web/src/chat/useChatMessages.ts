@@ -153,7 +153,19 @@ export function useChatMessages(opts: {
           setMessages(existing);
           return true;
         }
-        setMessages(forStore);
+        // _genStats 是会话内易失数据（DB 不存生成耗时）：DB 重载整体替换
+        // messages 前按 id 从现有行携带，否则连续对话中上一条的 tok/s
+        // 会被下一轮 done 的重载抹掉。
+        setMessages((prev) => {
+          const prevStats = new Map(
+            prev.filter((m) => m._genStats).map((m) => [m.id, m._genStats!]),
+          );
+          if (prevStats.size === 0) return forStore;
+          return forStore.map((m) => {
+            const stats = prevStats.get(m.id);
+            return stats ? { ...m, _genStats: stats } : m;
+          });
+        });
         if (
           shouldWriteChatCache({
             agentId: loadForAgentId,
@@ -221,7 +233,19 @@ export function useChatMessages(opts: {
               ];
             });
             if (!streamDraftRef.current) {
-              updateStreamDraft({ assistantId: parsed.id, segments: [], isBackground });
+              updateStreamDraft({ assistantId: parsed.id, segments: [], isBackground, startedAt: Date.now() });
+            } else if (streamDraftRef.current.assistantId.startsWith("draft-")) {
+              // placeholder 流（passive 接入先于 message_id）：迁移到真实 id，
+              // 否则 done 结算的 _genStats 会打在幻影 placeholder 行上丢失。
+              const cur = streamDraftRef.current;
+              const oldId = cur.assistantId;
+              updateStreamDraft({
+                ...cur,
+                assistantId: parsed.id,
+                ...(flag !== undefined ? { isBackground: flag } : {}),
+              });
+              // 本 handler 上方已为 parsed.id 建行，删掉旧 placeholder 行避免重 id。
+              setMessages((prev) => prev.filter((m) => m.id !== oldId));
             } else if (flag !== undefined) {
               updateStreamDraft((prev) => (prev ? { ...prev, isBackground: flag } : prev));
             }
@@ -255,6 +279,7 @@ export function useChatMessages(opts: {
             assistantId: placeholderId,
             segments: [{ type: segType, content: event.data }],
             isBackground: true,
+            startedAt: Date.now(),
           });
           return;
         }
@@ -299,7 +324,7 @@ export function useChatMessages(opts: {
           });
           updateStreamDraft(
             appendToolCallSegment(
-              { assistantId: placeholderId, segments: [], isBackground: true },
+              { assistantId: placeholderId, segments: [], isBackground: true, startedAt: Date.now() },
               parsed.toolCall,
               parsed.toolCallId,
             ),
@@ -331,8 +356,21 @@ export function useChatMessages(opts: {
       }
       if (event.type === "done") {
         setThinkingElapsed(null);
+        // done 先于 draft 清空：结算本轮端到端耗时冻结到消息上，气泡头部
+        // 据此显示 tok/s（tokens 分子用渲染时的估算，口径一致）。
+        const finishedDraft = streamDraftRef.current;
+        const genStats =
+          finishedDraft && finishedDraft.startedAt
+            ? { ms: Math.max(1, Date.now() - finishedDraft.startedAt) }
+            : null;
+        const finishedId = finishedDraft?.assistantId;
         loadMessagesFromDb(forAgentId).then((ok) => {
           if (ok) updateStreamDraft(null);
+          if (genStats && finishedId) {
+            setMessages((prev) =>
+              prev.map((m) => (m.id === finishedId ? { ...m, _genStats: genStats } : m)),
+            );
+          }
         });
         setIsStreaming(false);
         updateProcessingAgent(forAgentId, false);

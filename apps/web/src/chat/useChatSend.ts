@@ -292,7 +292,12 @@ export function useChatSend(opts: {
                   },
                 ];
               });
-              updateStreamDraft({ assistantId: parsed.id, segments: [], isBackground: false });
+              updateStreamDraft({
+                assistantId: parsed.id,
+                segments: [],
+                isBackground: false,
+                startedAt: Date.now(),
+              });
               console.log(`[SSE] streamDraft initialized: assistantId=${parsed.id}`);
             }
           } catch {
@@ -319,7 +324,14 @@ export function useChatSend(opts: {
               },
             ];
           });
-          updateStreamDraft({ assistantId: placeholderId, segments: [], isBackground: false });
+          updateStreamDraft({
+            assistantId: placeholderId,
+            // 修复：首个 delta 曾被丢弃（segments 空 + 分支无后续合并），
+            // 现在直接入 segment，否则气泡首字缺失。
+            segments: [{ type: "text", content: event.data }],
+            isBackground: false,
+            startedAt: Date.now(),
+          });
           console.log(`[SSE] streamDraft lazy-initialized: assistantId=${placeholderId}`);
         } else if (event.type === "thinking") {
           setThinkingElapsed(event.elapsed_s ?? null);
@@ -353,6 +365,7 @@ export function useChatSend(opts: {
               assistantId: placeholderId,
               segments: [{ type: "text", content: event.data }],
               isBackground: false,
+              startedAt: Date.now(),
             });
             console.log(`[SSE] streamDraft lazy-initialized: assistantId=${placeholderId}`);
             return;
@@ -395,6 +408,7 @@ export function useChatSend(opts: {
               assistantId: placeholderId,
               segments: [{ type: "thinking", content: event.data }],
               isBackground: false,
+              startedAt: Date.now(),
             });
             return;
           }
@@ -505,11 +519,25 @@ export function useChatSend(opts: {
               )
             );
           }
+          // done 先于 draft 清空：结算本轮端到端耗时冻结到消息（与被动订阅
+          // 路径 useChatMessages 的 done 结算同款）。DB 重载后由
+          // loadMessagesFromDb 按 id 携带，会话内持续显示 tok/s。
+          const finishedDraft = streamDraftRef.current;
+          const genStats =
+            finishedDraft && finishedDraft.startedAt
+              ? { ms: Math.max(1, Date.now() - finishedDraft.startedAt) }
+              : null;
+          const finishedId = finishedDraft?.assistantId;
           loadMessagesFromDb(sendingForAgentId).then((ok) => {
             if (ok) {
               updateStreamDraft(null);
             } else {
               updateStreamDraft((prev) => (prev ? { ...prev, persisted: true } : prev));
+            }
+            if (genStats && finishedId) {
+              setMessages((prev) =>
+                prev.map((m) => (m.id === finishedId ? { ...m, _genStats: genStats } : m)),
+              );
             }
             setIsStreaming(false);
           });

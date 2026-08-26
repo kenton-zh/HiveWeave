@@ -381,6 +381,11 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             thinkingElapsed={
               isStreaming && streamDraft?.assistantId === msg.id ? thinkingElapsed : null
             }
+            streamStartedAt={
+              isStreaming && streamDraft?.assistantId === msg.id
+                ? streamDraft.startedAt
+                : undefined
+            }
             sourceName={
               msg.fromAgentId && msg.fromAgentId !== "system" && msg.fromAgentId !== "用户"
                 ? resolveAgentInfo(msg.fromAgentId).name
