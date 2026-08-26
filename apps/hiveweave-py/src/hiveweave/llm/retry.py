@@ -26,9 +26,14 @@ import structlog
 log = structlog.get_logger(__name__)
 
 # ── 常量 ────────────────────────────────────────────────────
-MAX_RETRIES = 2
-"""最大重试次数（不含首次请求）。契约 01。"""
+MAX_RETRIES = 5
+"""最大重试次数（不含首次请求）。对标 DSH 的 5 次预算（2026-08-26）。
 
+原值 2。TEST_DSH_29 实测 10/57 重试链（18%）打光预算失败，且失败原因
+100% 是 SSL UNEXPECTED_EOF（上游连接被截断）—— 这类瞬态故障多退避一两次
+即可恢复，2 次过紧。退避指数 + jitter 且硬顶 30s，5 次最坏累计约
+1+2+4+8+16≈31s，仍远低于 turn 预算。
+"""
 BASE_DELAY_MS = 1_000
 """基础退避延迟（1 秒）。用户指定 base=1s。"""
 
@@ -64,6 +69,14 @@ _RETRYABLE_MESSAGE_PATTERNS: tuple[str, ...] = (
     r"enotfound|eai_again|econnrefused|econnreset|etimedout",
     r"^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b",
     r"try your request|retry your request|resource exhausted|resource_exhausted",
+    # TLS / 连接被上游截断：TEST_DSH_29 实测 57 次重试 100% 属这一类
+    # （"[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of
+    # protocol"）。httpx 通常包成 ConnectError/ReadError（已由
+    # should_retry_exception 覆盖），但走 body/消息分类路径时也必须命中，
+    # 否则被误判为永久错误直接炸掉整个 turn。
+    r"unexpected_eof|unexpected eof|eof occurred|violation of protocol|"
+    r"sslerror|ssl error|tlsv\d|decryption failed|bad record mac|"
+    r"handshake failure|stream ended|incomplete ?read",
     # 中文厂商文案（ARK / 火山引擎 / 字节豆包 / 通义等常见 on-line 网关）：
     # 英文模式对中文错误文本 miss，导致瞬态错误被误判为永久错误。
     r"限流|请求过于频繁|访问频率过高|触发(?:了)?限流",
@@ -176,13 +189,21 @@ def should_retry_exception(exc: BaseException) -> bool:
 
     httpx.ConnectError / ReadTimeout / PoolTimeout / RemoteProtocolError
     等瞬时网络故障都应重试。参考 Elixir should_retry?/1。
+
+    ssl.SSLError 显式列入：TEST_DSH_29 实测全部重试都源于
+    ``[SSL: UNEXPECTED_EOF_WHILE_READING]``。httpx 多数情况会把它包成
+    ConnectError/ReadError，但直连/裸 socket 路径可能原样抛出。
     """
     # 延迟导入避免循环依赖
+    import ssl
+
     import httpx
 
     if isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout,
                         httpx.WriteTimeout, httpx.PoolTimeout,
                         httpx.RemoteProtocolError, httpx.ReadError)):
+        return True
+    if isinstance(exc, ssl.SSLError):
         return True
     # asyncio.TimeoutError 是 streamer 的 idle watchdog 抛出的
     if isinstance(exc, asyncio.TimeoutError):
@@ -424,6 +445,10 @@ class RetryHandler:
     async def with_retry(
         self,
         fn: Callable[[], Awaitable[T]],
+        *,
+        persist: (
+            Callable[[int, int, BaseException, bool], Awaitable[None]] | None
+        ) = None,
     ) -> T:
         """执行带重试的异步函数。
 
@@ -431,6 +456,10 @@ class RetryHandler:
         - 指数退避 + jitter，Retry-After header 优先。
         - PermanentError 立即抛出，不重试。
         - 非可重试异常也不重试（直接抛出）。
+        - ``persist``：可选持久化回调 ``(attempt, delay_ms, exc, exhausted)``
+          —— 每次决定重试（exhausted=False）与重试耗尽（exhausted=True）时
+          调用，供调用方把重试事件落库（参考 DSH 把 retry 写入持久事件流，
+          重启后仍可查/可审计）。
         """
         last_exc: BaseException | None = None
         for attempt in range(self.max_retries + 1):  # 0..max_retries
@@ -458,6 +487,8 @@ class RetryHandler:
                         status=e.status,
                         error=str(e),
                     )
+                    if persist is not None:
+                        await self._safe_persist(persist, attempt + 1, 0, e, True)
                     raise
                 delay = compute_backoff(attempt, parse_retry_after_ms(e.headers))
                 log.info(
@@ -467,6 +498,10 @@ class RetryHandler:
                     status=e.status,
                     reason=str(e),
                 )
+                if persist is not None:
+                    await self._safe_persist(
+                        persist, attempt + 1, delay, e, False
+                    )
                 await self._fire_retry(attempt + 1, delay, e)
                 await asyncio.sleep(delay / 1000.0)
             except Exception as e:
@@ -475,6 +510,10 @@ class RetryHandler:
                     last_exc = e
                     if attempt >= self.max_retries:
                         log.warning("retry_exhausted_network", attempt=attempt, error=str(e))
+                        if persist is not None:
+                            await self._safe_persist(
+                                persist, attempt + 1, 0, e, True
+                            )
                         raise
                     delay = compute_backoff(attempt)
                     log.info(
@@ -483,6 +522,10 @@ class RetryHandler:
                         delay_ms=delay,
                         reason=type(e).__name__,
                     )
+                    if persist is not None:
+                        await self._safe_persist(
+                            persist, attempt + 1, delay, e, False
+                        )
                     await self._fire_retry(attempt + 1, delay, e)
                     await asyncio.sleep(delay / 1000.0)
                 else:
@@ -491,6 +534,24 @@ class RetryHandler:
         # 理论上不可达（循环内必返回或抛出），保险起见
         assert last_exc is not None
         raise last_exc
+
+    @staticmethod
+    async def _safe_persist(
+        persist: Callable[[int, int, BaseException, bool], Awaitable[None]],
+        attempt: int,
+        delay_ms: int,
+        exc: BaseException,
+        exhausted: bool,
+    ) -> None:
+        """持久化回调 best-effort：持久化失败不得中断重试主流程。"""
+        try:
+            await persist(attempt, delay_ms, exc, exhausted)
+        except Exception as _p:
+            log.warning(
+                "retry_persist_failed",
+                attempt=attempt,
+                error=str(_p)[:200],
+            )
 
     async def _fire_retry(
         self, attempt: int, delay_ms: int, exc: BaseException

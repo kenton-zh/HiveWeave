@@ -164,6 +164,53 @@ class HttpStreamMixin:
 
     # ── 单轮流式请求（带 HTTP 重试）──────────────────────────
 
+    def _persist_retry(
+        self,
+        agent_id: str,
+        provider_name: str,
+        on_delta: DeltaCallback | None = None,
+    ):
+        """重试持久化 + 实时广播（参考 DSH 把 retry 写入持久事件流并可见）。
+
+        1) 落 agent_events，供监控/审计（重启后仍可查）。
+        2) 广播 ``retry`` 事件到前端 —— 前端 useChatSend 一直在监听该事件
+           并渲染「重试中 attempt/max」，但此前后端从不发送，导致 56 次真实
+           重试（TEST_DSH_29 实测）对用户完全不可见，表现为"卡住"。
+        两者都是 best-effort，失败不影响重试主流程。
+        """
+        async def _cb(attempt: int, delay_ms: int, exc, exhausted: bool) -> None:
+            try:
+                from hiveweave.services.event_audit import event_audit
+
+                await event_audit.log(
+                    agent_id=agent_id,
+                    project_id="",
+                    event_type=(
+                        "llm_retry_exhausted" if exhausted else "llm_retry"
+                    ),
+                    payload={
+                        "attempt": attempt,
+                        "delay_ms": delay_ms,
+                        "provider": provider_name,
+                        "error": str(exc)[:300],
+                    },
+                )
+            except Exception:
+                pass
+            if not exhausted:
+                try:
+                    await self._fire_delta(on_delta, {
+                        "type": "retry",
+                        "attempt": attempt,
+                        "maxRetries": self._retry_handler.max_retries,
+                        "delayMs": delay_ms,
+                        "reason": str(exc)[:200],
+                    })
+                except Exception:
+                    pass
+
+        return _cb
+
     async def _stream_single_round(
         self,
         agent_id: str,
@@ -250,7 +297,10 @@ class HttpStreamMixin:
                 sem.release()
 
         try:
-            result = await self._retry_handler.with_retry(do_request)
+            result = await self._retry_handler.with_retry(
+                do_request,
+                persist=self._persist_retry(agent_id, provider_name, on_delta),
+            )
             # 成功完成 → 报告熔断器成功（C10: 按轮次精确上报）
             await self._circuit_breaker.report_success(provider_name)
             return result

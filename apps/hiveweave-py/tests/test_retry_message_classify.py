@@ -17,6 +17,7 @@ import pytest
 
 from hiveweave.llm.retry import (
     PermanentError,
+    RetryHandler,
     RetryableError,
     classify_http_error,
     is_retryable_status,
@@ -166,3 +167,49 @@ class TestClassifyHttpError:
         err = classify_http_error(402, "insufficient_quota")
         assert isinstance(err, PermanentError)
         assert err.status == 402
+
+
+# ── RetryHandler.with_retry persist 持久化回调 ─────────────────
+
+class _FakeRetryClient:
+    """每次都抛 RetryableError 的客户端，统计调用次数。"""
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    async def call(self):
+        self.n += 1
+        raise RetryableError("boom", status=503)
+
+
+@pytest.mark.asyncio
+async def test_with_retry_persist_called_on_schedule_and_exhausted():
+    """persist 回调在每次调度（False）与耗尽（True）时都被调用。"""
+    calls: list[tuple[int, int, bool]] = []
+
+    async def persist(attempt, delay_ms, exc, exhausted):
+        calls.append((attempt, delay_ms, exhausted))
+
+    client = _FakeRetryClient()
+    handler = RetryHandler(max_retries=2)
+    with pytest.raises(RetryableError):
+        await handler.with_retry(client.call, persist=persist)
+    # 2 次调度 + 1 次耗尽 = 3 次回调；attempt 递增；exhausted 末位为 True
+    assert len(calls) == 3
+    assert [c[2] for c in calls] == [False, False, True]
+    assert [c[0] for c in calls] == [1, 2, 3]
+    assert client.n == 3  # 首次 + 2 次重试
+
+
+@pytest.mark.asyncio
+async def test_with_retry_persist_failure_does_not_break_retry():
+    """持久化失败（best-effort）不得中断重试主流程。"""
+
+    async def persist(attempt, delay_ms, exc, exhausted):
+        raise RuntimeError("db down")
+
+    client = _FakeRetryClient()
+    handler = RetryHandler(max_retries=2)
+    with pytest.raises(RetryableError):
+        await handler.with_retry(client.call, persist=persist)
+    assert client.n == 3

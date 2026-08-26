@@ -296,7 +296,7 @@ async def test_llm_queue_ping_while_waiting_on_semaphore(monkeypatch):
         def __init__(self) -> None:
             self.events: list[dict] = []
 
-            async def wr(fn):
+            async def wr(fn, **kwargs):
                 return await fn()
 
             self._retry_handler = SimpleNamespace(with_retry=wr)

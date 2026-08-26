@@ -319,6 +319,16 @@ function bindAgentChannelEvents(channel: any, agentId: string) {
     handler?.({ type: "error", data: payload?.message || "Unknown error" });
   });
 
+  // LLM 请求重试（后端 _persist_retry 广播）。此前既无后端广播也无这条
+  // 绑定，56 次真实重试（TEST_DSH_29 实测）对用户完全不可见，表现为
+  // "卡住不动"。对标 DSH 把重试作为一等可见事件呈现。
+  channel.on("retry", (payload: any) => {
+    const handler = _agentHandlers.get(agentId);
+    if (!handler) return;
+    dbg("ws", `retry for ${agentId}`, payload);
+    handler({ type: "retry", data: JSON.stringify(payload ?? {}) });
+  });
+
   channel.on("busy", (payload: any) => {
     dbg("ws", `busy event for ${agentId}: ${payload?.message || "busy"}`, payload);
     const handler = _agentHandlers.get(agentId);
