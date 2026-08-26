@@ -221,7 +221,11 @@ def apply_anthropic_thinking(
         return
     emit_thinking_fields(body, fmt, effort, max_tokens=max_tokens)
     if "thinking" in body:
+        # 扩展思考与采样参数修改互斥：temperature 只能为 1（不发），
+        # top_k 只能为 1、top_p 只能 0.95~1 —— 与其钳制不如直接不发。
         body.pop("temperature", None)
+        body.pop("top_p", None)
+        body.pop("top_k", None)
 
 
 def apply_gemini_thinking(

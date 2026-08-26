@@ -115,6 +115,8 @@ class FormatHandler(ABC):
         *,
         stream: bool = True,
         temperature: float = 0.7,
+        top_p: float | None = None,
+        top_k: int | None = None,
         max_tokens: int = 8192,
         tools: list[dict] | None = None,
         include_usage: bool = True,
@@ -130,6 +132,7 @@ class FormatHandler(ABC):
         supports_prompt_cache: 若 True，handler 可在请求体中添加缓存断点
         （如 Anthropic 的 cache_control: {type: ephemeral}）。
         thinking_format: 思考方言；空/None 时由 supports_thinking + 协议推断。
+        top_p/top_k: 可选采样参数；None = 不发（模型配置未设置时行为不变）。
         """
         ...
 
@@ -267,6 +270,8 @@ class OpenAIHandler(FormatHandler):
         *,
         stream: bool = True,
         temperature: float = 0.7,
+        top_p: float | None = None,
+        top_k: int | None = None,
         max_tokens: int = 8192,
         tools: list[dict] | None = None,
         include_usage: bool = True,
@@ -297,6 +302,12 @@ class OpenAIHandler(FormatHandler):
             "stream": stream,
             "temperature": temperature,
         }
+        if top_p is not None:
+            body["top_p"] = top_p
+        if top_k is not None:
+            # 兼容网关（OpenRouter/国产系）普遍认 top_k；官方 OpenAI 不认
+            # 会显式 400 —— 用户显式配置即随用户，不设不发。
+            body["top_k"] = top_k
 
         # max_tokens: reasoning models use full cap, others capped at 32k.
         # P1-3: hard cap at 128K for ALL models — many API endpoints reject
@@ -593,6 +604,8 @@ class AnthropicHandler(FormatHandler):
         *,
         stream: bool = True,
         temperature: float = 0.7,
+        top_p: float | None = None,
+        top_k: int | None = None,
         max_tokens: int = 8192,
         tools: list[dict] | None = None,
         include_usage: bool = True,
@@ -687,6 +700,11 @@ class AnthropicHandler(FormatHandler):
 
         if temperature is not None:
             body["temperature"] = temperature
+        if top_p is not None:
+            body["top_p"] = top_p
+        if top_k is not None:
+            # 扩展思考激活时由 apply_anthropic_thinking 统一剥离（互斥约束）。
+            body["top_k"] = top_k
 
         if tools:
             body["tools"] = self.normalize_tools(tools)
@@ -1021,6 +1039,8 @@ class GoogleHandler(FormatHandler):
         *,
         stream: bool = True,
         temperature: float = 0.7,
+        top_p: float | None = None,
+        top_k: int | None = None,
         max_tokens: int = 8192,
         tools: list[dict] | None = None,
         include_usage: bool = True,
@@ -1079,12 +1099,18 @@ class GoogleHandler(FormatHandler):
                     "parts": parts,
                 })
 
+        generation_config: dict[str, Any] = {
+            "maxOutputTokens": max_tokens,
+            "temperature": temperature,
+        }
+        if top_p is not None:
+            generation_config["topP"] = top_p
+        if top_k is not None:
+            generation_config["topK"] = top_k
+
         body: dict[str, Any] = {
             "contents": contents,
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-                "temperature": temperature,
-            },
+            "generationConfig": generation_config,
         }
 
         if system_instruction:
@@ -1334,6 +1360,8 @@ class ProviderConfig:
         reasoning_effort: str | None = None,
         thinking_format: str | None = None,
         temperature: float = 0.7,
+        top_p: float | None = None,
+        top_k: int | None = None,
         fallback: str | None = None,
         handler: FormatHandler | None = None,
         extra_headers: dict[str, str] | None = None,
@@ -1363,6 +1391,9 @@ class ProviderConfig:
 
         self.reasoning_effort = reasoning_effort
         self.temperature = temperature
+        # 可选采样参数：None = 模型配置未设置 → 请求体不带（行为不变）
+        self.top_p = top_p
+        self.top_k = top_k
         self.fallback = fallback
         if handler is not None:
             self._handler = handler
@@ -1426,6 +1457,8 @@ class ProviderConfig:
             model_id=self.model_name,
             stream=stream,
             temperature=temperature if temperature is not None else self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
             max_tokens=max_tokens if max_tokens is not None else self.max_output_tokens,
             tools=tools,
             include_usage=include_usage,
@@ -1458,6 +1491,32 @@ class ProviderConfig:
 
 
 # ── ProviderFactory ────────────────────────────────────────────
+
+
+def _opt_float(value: Any) -> float | None:
+    """可选数值容错转换：None/空串/非法 → None（不发），不抛异常。
+
+    与 temperature 的 or-回退防御对齐；脏数据（手工 SQL/旧客户端）不该
+    让 streamer 主链路在 ProviderConfig 构造处崩掉整轮 agent 回合。
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        log.warning("sampling_param_dirty_value", kind="float", value=repr(value))
+        return None
+
+
+def _opt_int(value: Any) -> int | None:
+    """同 _opt_float，整数版。"""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        log.warning("sampling_param_dirty_value", kind="int", value=repr(value))
+        return None
 
 
 class ProviderFactory:
@@ -1510,6 +1569,11 @@ class ProviderFactory:
         # （防误标纯文本时静默剥图）。负缓存按 (base_url, model_name) 键控、进程内易失。
         auto_images = is_image_supported(base_url, model_name)
 
+        # 可选采样参数：显式 None 判断（0 也是合法值，不能用 or 短路）；
+        # 容错转换防脏数据炸 streamer 主链路（见 _opt_float）
+        top_p = _opt_float(model_config.get("top_p"))
+        top_k = _opt_int(model_config.get("top_k"))
+
         return ProviderConfig(
             api_format=api_format,
             base_url=base_url,
@@ -1521,6 +1585,8 @@ class ProviderFactory:
             thinking_format=model_config.get("thinking_format") or "",
             reasoning_effort=model_config.get("default_reasoning_effort"),
             temperature=float(model_config.get("temperature") or 0.7),
+            top_p=top_p,
+            top_k=top_k,
             fallback=model_config.get("fallback"),
             supports_prompt_cache=supports_cache,
             supports_images=auto_images,

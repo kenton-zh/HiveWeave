@@ -76,6 +76,8 @@ class OpenAIResponsesHandler(FormatHandler):
         *,
         stream: bool = True,
         temperature: float = 0.7,
+        top_p: float | None = None,
+        top_k: int | None = None,
         max_tokens: int = 8192,
         tools: list[dict] | None = None,
         include_usage: bool = True,
@@ -86,7 +88,8 @@ class OpenAIResponsesHandler(FormatHandler):
         supports_prompt_cache: bool = False,
         supports_images: bool = True,
     ) -> dict[str, Any]:
-        del include_usage, supports_prompt_cache  # usage arrives on completed
+        del include_usage, supports_prompt_cache, top_k  # usage arrives on completed;
+        # top_k: Responses API 无此参数（统一签名收下，不发）
         normalized = OpenAIHandler._normalize_messages_with_images(
             messages, supports_images=supports_images
         )
@@ -102,6 +105,10 @@ class OpenAIResponsesHandler(FormatHandler):
             "stream": stream,
             "store": False,
         }
+        if top_p is not None and not thinking_enabled(fmt):
+            # 推理方言激活时不发采样参数（o 系对 top_p 修改直接 400，
+            # 与 temperature 的 apply_responses_thinking 策略一致）
+            body["top_p"] = top_p
         if thinking_enabled(fmt) and max_tokens > 0:
             body["max_output_tokens"] = min(max_tokens, _MAX_OUTPUT_HARD_CAP)
         else:
