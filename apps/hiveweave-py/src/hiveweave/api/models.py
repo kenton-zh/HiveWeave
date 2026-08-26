@@ -323,10 +323,11 @@ def _extract_usage_from_response(data: dict) -> dict:
     }
 
 
-async def _do_self_test(model: dict) -> dict:
+async def _do_self_test(model: dict, *, persist: bool = True) -> dict:
     """统一自检函数：连通性测试 + 自动检测 + 自动修正 DB 配置。
 
-    被 create_model 和 test_model 共用。
+    被 create_model、test_model 和 test_connection 共用。
+    persist=False 时只做检测与告警，不写 DB（未保存配置的测试连接场景）。
     返回完整的检测结果 dict。
     """
     model_pk = model.get("id", "")
@@ -497,7 +498,8 @@ async def _do_self_test(model: dict) -> dict:
         if configured_thinking is not None and configured_thinking != detected_thinking:
             result["thinkingWarning"] = (
                 f"配置的 supports_thinking={configured_thinking} 与检测值"
-                f"={detected_thinking} 不一致，已自动修正。"
+                f"={detected_thinking} 不一致，"
+                + ("已自动修正。" if persist else "保存时将按检测值修正。")
             )
 
     if detected_max_output is not None:
@@ -522,13 +524,16 @@ async def _do_self_test(model: dict) -> dict:
         # 配置值不一致就修正——包括 configured 过大（如历史脏数据 262144）和过小。
         updates["max_output_tokens"] = detected_max_output
 
-    if updates:
+    if updates and persist and model_pk:
         try:
             await _model.update(model_pk, updates)
             result["autoCorrected"] = updates
             log.info("model_auto_corrected", model_pk=model_pk, updates=updates)
         except Exception as e:
             log.warning("model_auto_correct_failed", model_pk=model_pk, error=str(e))
+    elif updates and not persist:
+        # 未保存配置的测试连接：只回显建议值，不落库。
+        result["suggestedUpdates"] = updates
 
     return result
 
@@ -547,6 +552,12 @@ class ModelCreate(BaseModel):
     thinkingFormat: str | None = None
     defaultReasoningEffort: str | None = None
     temperature: float | None = None
+    supportsVision: bool | None = None
+    topP: float | None = None
+    topK: int | None = None
+    toolCallRounds: int | None = None
+    modelFamily: str | None = None
+    thinkingMode: str | None = None  # ''=跟随默认 | 'on' | 'off'
     isActive: bool | None = None
     tier: str | None = None  # management | executor (None = 未分类)
 
@@ -565,6 +576,12 @@ class ModelUpdate(BaseModel):
     thinkingFormat: str | None = None
     defaultReasoningEffort: str | None = None
     temperature: float | None = None
+    supportsVision: bool | None = None
+    topP: float | None = None
+    topK: int | None = None
+    toolCallRounds: int | None = None
+    modelFamily: str | None = None
+    thinkingMode: str | None = None  # ''=跟随默认 | 'on' | 'off'
     isActive: bool | None = None
     tier: str | None = None  # management | executor (None = 未分类)
 
@@ -582,6 +599,12 @@ def _normalize_attrs(body: BaseModel) -> dict:
         "supportsThinking": "supports_thinking",
         "thinkingFormat": "thinking_format",
         "defaultReasoningEffort": "default_reasoning_effort",
+        "supportsVision": "supports_vision",
+        "topP": "top_p",
+        "topK": "top_k",
+        "toolCallRounds": "tool_call_rounds",
+        "modelFamily": "model_family",
+        "thinkingMode": "thinking_mode",
         "isActive": "is_active",
     }
     out: dict = {}
@@ -626,6 +649,18 @@ def _model_response(model: dict) -> dict:
         "default_reasoning_effort": model.get("default_reasoning_effort"),
         "defaultReasoningEffort": model.get("default_reasoning_effort"),
         "temperature": model.get("temperature"),
+        "supports_vision": model.get("supports_vision"),
+        "supportsVision": model.get("supports_vision"),
+        "top_p": model.get("top_p"),
+        "topP": model.get("top_p"),
+        "top_k": model.get("top_k"),
+        "topK": model.get("top_k"),
+        "tool_call_rounds": model.get("tool_call_rounds"),
+        "toolCallRounds": model.get("tool_call_rounds"),
+        "model_family": model.get("model_family"),
+        "modelFamily": model.get("model_family"),
+        "thinking_mode": model.get("thinking_mode"),
+        "thinkingMode": model.get("thinking_mode"),
         "is_active": model.get("is_active"),
         "isActive": model.get("is_active"),
         "tier": model.get("tier"),
@@ -773,6 +808,55 @@ async def test_model(model_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Model not found")
 
     return await _do_self_test(model)
+
+
+class TestConnectionRequest(BaseModel):
+    """未保存配置的连通性测试请求体 — 表单直连测试，不落库。"""
+
+    baseUrl: str
+    apiKey: str | None = None
+    modelId: str
+    providerType: str | None = None  # 显式协议优先，空则按 URL/域名推断
+    contextWindow: int | None = None
+    maxOutputTokens: int | None = None
+    supportsThinking: bool | None = None
+    thinkingFormat: str | None = None
+
+
+@router.post("/test-connection")
+async def test_connection(body: TestConnectionRequest) -> dict:
+    """测试一份尚未保存的模型配置（真实发一条 chat，不落库、不自动修正 DB）。
+
+    与 /{id}/test 的区别：后者要求模型已落库且会把检测值自动修正进 DB；
+    本端点供「添加模型」表单在保存前验证配置可用性。检测出的建议值通过
+    suggestedUpdates 回显，由用户决定是否采纳。
+    """
+    base_url = (body.baseUrl or "").strip()
+    model_id = (body.modelId or "").strip()
+    if not base_url or not model_id:
+        raise HTTPException(status_code=400, detail="baseUrl and modelId are required")
+
+    probe_base = _normalize_models_probe_base(base_url.rstrip("/"))
+    blocked = _probe_url_blocked_reason(probe_base or base_url)
+    if blocked:
+        return {
+            "ok": False,
+            "latencyMs": 0,
+            "error": f"自检被拒绝：{blocked}。请使用合法的 http(s) 网关地址。",
+        }
+
+    model = {
+        "id": "",  # 未落库：persist 路径天然跳过
+        "base_url": base_url,
+        "api_key": (body.apiKey or "").strip(),
+        "model_id": model_id,
+        "provider_type": (body.providerType or "").strip(),
+        "context_window": body.contextWindow or 0,
+        "max_output_tokens": body.maxOutputTokens or 0,
+        "supports_thinking": body.supportsThinking,
+        "thinking_format": body.thinkingFormat or "",
+    }
+    return await _do_self_test(model, persist=False)
 
 
 class DetectCapabilitiesRequest(BaseModel):

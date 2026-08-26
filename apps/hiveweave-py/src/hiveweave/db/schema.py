@@ -51,6 +51,12 @@ META_DB_TABLES = [
         thinking_format TEXT DEFAULT '',
         default_reasoning_effort TEXT,
         temperature REAL DEFAULT 1.0,
+        supports_vision INTEGER DEFAULT 0,
+        top_p REAL,
+        top_k INTEGER,
+        tool_call_rounds INTEGER,
+        model_family TEXT DEFAULT '',
+        thinking_mode TEXT DEFAULT '',
         is_active INTEGER DEFAULT 1,
         created_at INTEGER,
         updated_at INTEGER

@@ -17,7 +17,6 @@ const DebugPanel = lazyRetry(() => import("./components/DebugPanel"));
 const AddAgentDialog = lazyRetry(() => import("./components/AddAgentDialog"));
 const FolderPicker = lazyRetry(() => import("./components/FolderPicker"));
 const OfficeView = lazyRetry(() => import("./components/OfficeView"));
-const ModelSettings = lazyRetry(() => import("./components/ModelSettings"));
 const ModelConfigPage = lazyRetry(() => import("./components/ModelConfigPage"));
 const ApiKeyDialog = lazyRetry(() => import("./components/ApiKeyDialog"));
 const GoalsPanel = lazyRetry(() => import("./components/GoalsPanel"));
@@ -68,7 +67,6 @@ function App() {
     const params = new URLSearchParams(window.location.search);
     return params.get("folderPath") ?? undefined;
   });
-  const [showModelSettings, setShowModelSettings] = useState(false);
   const [showModelConfig, setShowModelConfig] = useState(false);
   const [showApiKeyDialog, setShowApiKeyDialog] = useState(false);
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
@@ -578,17 +576,6 @@ function App() {
             </svg>
             模型配置
           </button>
-          {/* Model Settings gear icon */}
-          <button
-            onClick={() => setShowModelSettings(true)}
-            className="text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-full p-1.5 transition-all duration-200 active:scale-90 active:rotate-45"
-            title="Model Settings"
-          >
-            <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
-          </button>
           {/* API Key 设置 */}
           <button
             onClick={() => setShowApiKeyDialog(true)}
@@ -859,10 +846,6 @@ function App() {
             }}
             onCancel={() => setShowFolderPicker(false)}
           />
-        )}
-
-        {showModelSettings && (
-          <ModelSettings onClose={() => setShowModelSettings(false)} />
         )}
 
         {showModelConfig && (

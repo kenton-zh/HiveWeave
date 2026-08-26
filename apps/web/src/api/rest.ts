@@ -433,10 +433,77 @@ export interface LlmModel {
   supportsThinking: boolean;
   thinkingFormat?: string | null;
   defaultReasoningEffort?: string | null;
-  temperature?: string | null;
+  /** 后端原样返回 SQLite float；历史类型标注为 string 是错的 */
+  temperature?: number | string | null;
+  supportsVision?: boolean;
+  topP?: number | null;
+  topK?: number | null;
+  toolCallRounds?: number | null;
+  modelFamily?: string | null;
+  /** ''=跟随默认 | 'on' | 'off' */
+  thinkingMode?: string | null;
   isActive: boolean;
   tier?: string | null; // "management" | "executor" | null
   providerType?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Provider presets (known providers: only an API key is needed)
+// ---------------------------------------------------------------------------
+
+export interface PresetModel {
+  id: string;
+  name: string;
+  context_window: number;
+  max_output_tokens: number;
+  reasoning: boolean;
+  vision: boolean;
+  thinking_format: string;
+}
+
+export interface ProviderPreset {
+  id: string;
+  name: string;
+  base_url: string;
+  api_format: string; // "openai-compatible" | "anthropic"
+  models: PresetModel[];
+}
+
+export async function getProviderPresets(): Promise<ProviderPreset[]> {
+  const data = await fetchJSON(`${BASE}/provider-presets`);
+  return data?.presets ?? [];
+}
+
+export interface TestConnectionResult {
+  ok: boolean;
+  latencyMs: number;
+  response?: string;
+  error?: string;
+  detectedContextWindow?: number;
+  detectedSupportsThinking?: boolean | null;
+  detectedMaxOutputTokens?: number;
+  suggestedUpdates?: Record<string, unknown>;
+  contextWindowWarning?: string;
+  thinkingWarning?: string;
+  maxOutputWarning?: string;
+}
+
+/** Test an unsaved model config (real chat probe, nothing persisted). */
+export async function testModelConnection(payload: {
+  baseUrl: string;
+  apiKey?: string;
+  modelId: string;
+  providerType?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  supportsThinking?: boolean;
+  thinkingFormat?: string;
+}): Promise<TestConnectionResult> {
+  return fetchJSON(`${BASE}/llm-models/test-connection`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function getModels(): Promise<LlmModel[]> {

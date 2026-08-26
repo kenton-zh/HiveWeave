@@ -17,6 +17,7 @@ import structlog
 from hiveweave.api.health import router as health_router
 from hiveweave.api.settings import router as settings_router
 from hiveweave.api.models import router as models_router
+from hiveweave.api.provider_presets import router as provider_presets_router
 from hiveweave.api.templates import router as templates_router
 from hiveweave.api.projects import router as projects_router
 from hiveweave.api.org import router as org_router
@@ -40,6 +41,7 @@ _SUB_ROUTERS = [
     health_router,
     settings_router,
     models_router,
+    provider_presets_router,  # /api/provider-presets — 知名服务商预设（只填 Key）
     templates_router,
     projects_router,
     org_router,

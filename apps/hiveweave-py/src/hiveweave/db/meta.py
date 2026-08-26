@@ -47,6 +47,14 @@ _META_MIGRATIONS: list[tuple[str, str, str]] = [
     ("llm_models", "fallback", "TEXT"),
     # Model tiering: management | executor (NULL = unclassified legacy)
     ("llm_models", "tier", "TEXT"),
+    # 模型配置重构（2026-08-26）：图片输入能力 + 采样参数 + 工具轮数 + 系列 + 思考三态
+    ("llm_models", "supports_vision", "INTEGER DEFAULT 0"),
+    ("llm_models", "top_p", "REAL"),
+    ("llm_models", "top_k", "INTEGER"),
+    ("llm_models", "tool_call_rounds", "INTEGER"),
+    ("llm_models", "model_family", "TEXT DEFAULT ''"),
+    # '' = 跟随默认(现状) / 'on' / 'off'；用户意图，与 supports_thinking 能力位分离
+    ("llm_models", "thinking_mode", "TEXT DEFAULT ''"),
     # Bug K fix: per-project is_started flag (上班/下班)
     ("projects", "is_started", "INTEGER DEFAULT 0"),
     # P1 (spec §5.5b①)：外部只读参考目录（JSON 数组；file.py 读白名单扩展）

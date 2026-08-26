@@ -18,7 +18,7 @@ import uuid
 import structlog
 
 from hiveweave.db import meta as meta_db
-from hiveweave.llm.thinking import normalize_thinking_format
+from hiveweave.llm.thinking import FORMAT_OFF, normalize_thinking_format
 from hiveweave.llm.wire_endpoint import apply_wire_endpoint
 
 log = structlog.get_logger(__name__)
@@ -26,6 +26,19 @@ log = structlog.get_logger(__name__)
 # Default values (契约 18)
 _DEFAULT_CONTEXT_WINDOW = 128_000
 _DEFAULT_MAX_OUTPUT = 8_192
+
+_VALID_THINKING_MODES = ("", "on", "off")
+
+# SELECT 列表共用的扩展列（2026-08-26 模型配置重构新增）
+_EXT_COLUMNS = (
+    "supports_vision, top_p, top_k, tool_call_rounds, model_family, thinking_mode"
+)
+
+
+def _normalize_thinking_mode(value) -> str:
+    """思考三态：'' = 跟随默认 / 'on' / 'off'。非法值归一为 ''。"""
+    v = (value or "").strip().lower()
+    return v if v in _VALID_THINKING_MODES else ""
 
 # Round-robin counter for active model pool (process-local).
 # 限制说明：计数器只在单进程内单调递增。后端本就按单进程设计
@@ -131,6 +144,17 @@ class ModelService:
         default_reasoning_effort = attrs.get("default_reasoning_effort")
         temperature = attrs.get("temperature")
         tier = attrs.get("tier") or None  # "management" | "executor" | None（"" 视为未分类）
+        supports_vision = 1 if attrs.get("supports_vision", False) else 0
+        top_p = attrs.get("top_p")
+        top_k = attrs.get("top_k")
+        tool_call_rounds = attrs.get("tool_call_rounds")
+        model_family = attrs.get("model_family") or ""
+        # 思考三态（用户意图）：'on' 点亮能力位；'off' 落方言 off；'' 不动既有字段
+        thinking_mode = _normalize_thinking_mode(attrs.get("thinking_mode"))
+        if thinking_mode == "on":
+            supports_thinking = 1
+        elif thinking_mode == "off":
+            thinking_format = FORMAT_OFF
 
         # 物理不变量：max_output_tokens 必须严格小于 context_window。
         # 治本：非法配置在落库前拒绝，绝不 clamp 后悄悄写入。
@@ -141,12 +165,16 @@ class ModelService:
             "provider_type, "
             "context_window, max_output_tokens, supports_thinking, "
             "thinking_format, default_reasoning_effort, temperature, "
+            "supports_vision, top_p, top_k, tool_call_rounds, "
+            "model_family, thinking_mode, "
             "is_active, tier, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [model_pk, name, model_id, base_url, api_key,
              provider_type,
              context_window, max_output, supports_thinking,
              thinking_format, default_reasoning_effort, temperature,
+             supports_vision, top_p, top_k, tool_call_rounds,
+             model_family, thinking_mode,
              is_active, tier, now_ms, now_ms])
         log.info("model_created", model_pk=model_pk, name=name, model_id=model_id)
         return {"id": model_pk, "name": name, "model_id": model_id}
@@ -164,7 +192,7 @@ class ModelService:
             "context_window, "
             "max_output_tokens, supports_thinking, thinking_format, "
             "default_reasoning_effort, "
-            "temperature, is_active, fallback, tier, created_at, updated_at "
+            "temperature, " + _EXT_COLUMNS + ", is_active, fallback, tier, created_at, updated_at "
             "FROM llm_models WHERE id = ? OR model_id = ? "
             "ORDER BY is_active DESC, updated_at DESC, id DESC LIMIT 1",
             [model_pk, model_pk])
@@ -177,7 +205,7 @@ class ModelService:
             "SELECT id, name, model_id, base_url, api_key, provider_type, "
             "context_window, max_output_tokens, supports_thinking, "
             "thinking_format, default_reasoning_effort, temperature, "
-            "is_active, fallback, tier, "
+            + _EXT_COLUMNS + ", is_active, fallback, tier, "
             "created_at, updated_at FROM llm_models WHERE name = ? "
             "ORDER BY is_active DESC, updated_at DESC, id DESC LIMIT 1",
             [name],
@@ -222,12 +250,36 @@ class ModelService:
         if "tier" in attrs:
             fields.append("tier = ?")
             params.append(attrs["tier"] or None)
+        # 可空数值：键存在即写入（None = 清空回默认）。
+        # 注意：API 层 _normalize_attrs 用 exclude_none，null 到不了这里——
+        # "清空"语义只对 service 直调方可达；falsy 的 0/0.0 不受影响的。
+        for key in ("top_p", "top_k", "tool_call_rounds"):
+            if key in attrs:
+                fields.append(f"{key} = ?")
+                params.append(attrs[key])
+        if "model_family" in attrs and attrs["model_family"] is not None:
+            fields.append("model_family = ?")
+            params.append(attrs["model_family"] or "")
+        if "supports_vision" in attrs and attrs["supports_vision"] is not None:
+            fields.append("supports_vision = ?")
+            params.append(1 if attrs["supports_vision"] else 0)
         if "supports_thinking" in attrs and attrs["supports_thinking"] is not None:
             fields.append("supports_thinking = ?")
             params.append(1 if attrs["supports_thinking"] else 0)
         if "thinking_format" in attrs and attrs["thinking_format"] is not None:
             fields.append("thinking_format = ?")
             params.append(normalize_thinking_format(attrs["thinking_format"]))
+        # 思考三态放在能力位/方言之后：同一次 update 里用户意图优先
+        if "thinking_mode" in attrs and attrs["thinking_mode"] is not None:
+            mode = _normalize_thinking_mode(attrs["thinking_mode"])
+            fields.append("thinking_mode = ?")
+            params.append(mode)
+            if mode == "on":
+                fields.append("supports_thinking = ?")
+                params.append(1)
+            elif mode == "off":
+                fields.append("thinking_format = ?")
+                params.append(FORMAT_OFF)
         if "is_active" in attrs:
             fields.append("is_active = ?")
             params.append(1 if attrs["is_active"] else 0)
@@ -329,7 +381,7 @@ class ModelService:
                 "context_window, "
                 "max_output_tokens, supports_thinking, thinking_format, "
                 "default_reasoning_effort, "
-                "temperature, is_active, tier, created_at, updated_at "
+                "temperature, " + _EXT_COLUMNS + ", is_active, tier, created_at, updated_at "
                 "FROM llm_models ORDER BY created_at ASC")
             return [self._row_to_model(r, mask_key=True) for r in rows]
         except Exception as e:
@@ -357,7 +409,7 @@ class ModelService:
                 "SELECT id, name, model_id, base_url, api_key, provider_type, "
                 "context_window, max_output_tokens, supports_thinking, "
                 "thinking_format, default_reasoning_effort, temperature, "
-                "is_active, fallback, tier, "
+                + _EXT_COLUMNS + ", is_active, fallback, tier, "
                 "created_at, updated_at "
                 "FROM llm_models WHERE is_active = 1 ORDER BY created_at ASC"
             )
@@ -764,6 +816,10 @@ class ModelService:
         d["supports_thinking"] = bool(d.get("supports_thinking"))
         d["thinking_format"] = normalize_thinking_format(d.get("thinking_format"))
         d["is_active"] = bool(d.get("is_active"))
+        if "supports_vision" in d:
+            d["supports_vision"] = bool(d.get("supports_vision"))
+        if "thinking_mode" in d:
+            d["thinking_mode"] = _normalize_thinking_mode(d.get("thinking_mode"))
         key = d.get("api_key")
         if mask_key:
             if key:
