@@ -21,6 +21,13 @@ export interface ToolCall {
 /** 消息来源（metadata.source；legacy 消息由前端推断）。 */
 export type MessageSource = "user" | "agent" | "system" | "watchdog";
 
+/**
+ * 上下文边界标记（后端 store.py 压缩/裁剪落地后发出）。
+ * conversation_turns 被重写而 chat_messages 只追加 —— 没有这个标记时
+ * UI 会显示模型早已忘记的历史。渲染为一条分界线而非普通系统气泡。
+ */
+export type ContextMarkerKind = "compaction" | "prune";
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system" | "team";
@@ -38,6 +45,8 @@ export interface ChatMessage {
   fromAgentId?: string | null;
   _thinking?: string;
   _segments?: MsgSegment[];
+  /** 非空 → 该消息是上下文边界标记，渲染为分界线。 */
+  _contextMarker?: ContextMarkerKind;
 }
 
 export interface MsgSegment {

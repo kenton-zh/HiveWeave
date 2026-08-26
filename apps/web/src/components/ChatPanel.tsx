@@ -363,7 +363,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       <div
         ref={scrollContainerRef}
         onScroll={handleMessagesScroll}
-        className="flex-1 min-h-0 overflow-y-auto px-5 py-5 space-y-6"
+        className="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-1"
       >
         {directMessages.length === 0 && !hasTeamComms && (
           <div className="text-center text-g-fg-4 text-sm mt-12">发送消息开始对话</div>

@@ -286,6 +286,33 @@ describe("mapDbToChatMessages", () => {
     expect(isTeamChannelMessage(mapped[0])).toBe(true);
     expect(isTeamChannelMessage(mapped[1])).toBe(true);
   });
+
+  it("restores thinking + tool_call segments from metadata.segments (DSH block timeline)", () => {
+    const mapped = mapDbToChatMessages([
+      {
+        id: "a1",
+        role: "assistant",
+        content: "答复",
+        metadata: JSON.stringify({
+          segments: [
+            { type: "thinking", content: "先分析" },
+            { type: "text", content: "开始处理" },
+            { type: "tool_call", tool: "read_file", id: "c1", input: { path: "a.py" }, status: "ok", result: "body" },
+            { type: "thinking", content: "再总结" },
+          ],
+        }),
+      },
+    ]);
+    expect(mapped[0]._segments?.map((s) => s.type)).toEqual([
+      "thinking",
+      "text",
+      "tool_call",
+      "thinking",
+    ]);
+    expect(mapped[0]._segments?.[0]).toEqual({ type: "thinking", content: "先分析" });
+    expect(mapped[0]._segments?.[3]).toEqual({ type: "thinking", content: "再总结" });
+    expect(mapped[0]._segments?.[2].tool?.tool).toBe("read_file");
+  });
 });
 
 describe("shouldWriteChatCache", () => {

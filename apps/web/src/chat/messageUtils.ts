@@ -1,4 +1,11 @@
-import type { ChatMessage, MsgSegment, StreamDraft, ToolCall, MessageSource } from "./types";
+import type {
+  ChatMessage,
+  ContextMarkerKind,
+  MsgSegment,
+  StreamDraft,
+  ToolCall,
+  MessageSource,
+} from "./types";
 
 /**
  * Keep the FULL block timeline across tool-loop rounds (DSH-style whole-turn
@@ -281,6 +288,8 @@ function normalizePersistedSegments(raw: unknown): MsgSegment[] | undefined {
     if (!s || typeof s !== "object") continue;
     if (s.type === "text" && typeof s.content === "string" && s.content) {
       segs.push({ type: "text", content: s.content });
+    } else if (s.type === "thinking" && typeof s.content === "string" && s.content) {
+      segs.push({ type: "thinking", content: s.content });
     } else if (s.type === "tool_call" && s.tool) {
       segs.push({
         type: "tool_call",
@@ -298,6 +307,11 @@ function normalizePersistedSegments(raw: unknown): MsgSegment[] | undefined {
 }
 
 const WATCHDOG_MARKERS = ["看门狗", "[SILENCE]", "[WAIT_TIMEOUT]"];
+
+/** metadata.context_marker → 上下文边界类型（未知值忽略）。 */
+function normalizeContextMarker(raw: unknown): ContextMarkerKind | undefined {
+  return raw === "compaction" || raw === "prune" ? raw : undefined;
+}
 
 /** metadata.source 缺失（legacy 消息）时的回退推断。 */
 export function inferMessageSource(
@@ -343,6 +357,7 @@ export function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
       source: inferMessageSource(m, meta),
       fromAgentId: meta?.from_agent_id ?? m.teamFromAgentId ?? m.team_from_agent_id ?? null,
       _segments: normalizePersistedSegments(meta?.segments),
+      _contextMarker: normalizeContextMarker(meta?.context_marker),
     };
   });
 }
