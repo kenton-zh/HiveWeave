@@ -13,6 +13,7 @@ from hiveweave.agents.recovery import (
     attach_failed_turn_hint,
     history_ends_with_failed_turn,
     persist_failed_turn,
+    persist_partial_turn,
 )
 
 USER_TEXT = "做个互动网页 帮我学习 PYTHON 的基本知识 我有C和C++经验"
@@ -142,3 +143,90 @@ async def test_persist_failed_turn_fallback_hint_on_append_failure():
     hint = agent._pending_resume_hint or ""
     assert FAILED_TURN_NEXT_WAKE_HINT in hint
     assert USER_TEXT in hint
+
+
+@pytest.mark.asyncio
+async def test_persist_partial_turn_keeps_mid_round_messages():
+    """断流时持久化中间轮 assistant+tool，断流标记带 FAILED_TURN_MARKER 前缀。"""
+    conv = _FakeConv()
+    agent = SimpleNamespace(
+        id="ceo-1",
+        project_id="proj-1",
+        current_job={"message": ENVELOPE},
+        _conversation=conv,
+        _pending_resume_hint=None,
+    )
+    partial = {
+        "status": "error",
+        "content": "已完成的半截分析",
+        "tool_turn_messages": [
+            {"role": "assistant", "content": "第一步", "tool_calls": []},
+            {"role": "tool", "content": "结果", "tool_call_id": "t1"},
+        ],
+    }
+    persisted = await persist_partial_turn(agent, partial)
+    assert persisted is True
+    roles = [m["role"] for m in conv.turns]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    assert USER_TEXT in conv.turns[0]["content"]
+    assert conv.turns[1]["content"] == "第一步"
+    assert conv.turns[2]["content"] == "结果"
+    # 断流标记带 FAILED_TURN_MARKER，供 history_ends_with_failed_turn 识别
+    assert conv.turns[3]["content"].startswith(FAILED_TURN_MARKER)
+    assert "[TURN INTERRUPTED]" in conv.turns[3]["content"]
+    assert history_ends_with_failed_turn(conv.turns)
+    # 不重复：content（已完成轮累积文本）不重嵌
+    assert conv.turns.count({"role": "assistant", "content": "第一步", "tool_calls": []}) == 1
+    assert "已完成的半截分析" not in conv.turns[3]["content"]
+
+
+@pytest.mark.asyncio
+async def test_persist_partial_turn_noop_without_mid_messages():
+    conv = _FakeConv()
+    agent = SimpleNamespace(
+        id="ceo-1",
+        project_id="proj-1",
+        current_job={"message": ENVELOPE},
+        _conversation=conv,
+        _pending_resume_hint=None,
+    )
+    assert (
+        await persist_partial_turn(
+            agent, {"status": "error", "content": "", "tool_turn_messages": []}
+        )
+        is False
+    )
+    assert conv.turns == []
+    # 只有 system 消息（不可回传）→ False
+    assert (
+        await persist_partial_turn(
+            agent,
+            {"status": "error", "content": "半截", "tool_turn_messages": [{"role": "system", "content": "x"}]},
+        )
+        is False
+    )
+    assert conv.turns == []
+
+
+@pytest.mark.asyncio
+async def test_persist_partial_turn_skips_duplicate_failed_turn():
+    """历史末尾已是失败 turn（persist_failed_turn 已写）时不重复追加。"""
+    conv = _FakeConv()
+    agent = SimpleNamespace(
+        id="ceo-1",
+        project_id="proj-1",
+        current_job={"message": ENVELOPE},
+        _conversation=conv,
+        _pending_resume_hint=None,
+    )
+    await persist_failed_turn(agent, "[ERROR] HTTP 403:")
+    persisted = await persist_partial_turn(
+        agent,
+        {
+            "status": "error",
+            "content": "x",
+            "tool_turn_messages": [{"role": "assistant", "content": "中间"}],
+        },
+    )
+    assert persisted is False
+    assert len(conv.turns) == 2

@@ -217,6 +217,71 @@ async def persist_failed_turn(agent: Any, assistant_content: str) -> None:
         )
 
 
+async def persist_partial_turn(agent: Any, partial_result: dict) -> bool:
+    """断流时持久化已产出的中间轮消息。
+
+    参考 DSH 事件溯源：模型请求失败时不丢弃已 durable 的产出 ——
+    streamer 的 error result 携带 ``tool_turn_messages``（本 turn 已
+    完成的多轮 assistant+tool 对），断流前若直接丢弃，resume 时模型
+    读不到这些中间产出，只能重想。此处把它们连同 user 指令一并写入
+    conversation store，下个 wake 重建历史时完整可见。
+
+    与 ``persist_failed_turn`` 的关系：后者只写 user + [ERROR] 标记
+    （保留指令但不保留中间产出）；本函数是它的替代 —— 有中间产出时
+    用更完整的一版，无中间产出时返回 False，由调用方回退。
+
+    Returns:
+        True 表示成功持久化中间产出；False 表示无可持久化内容或已由
+        persist_failed_turn 写过（调用方应回退/跳过）。
+    """
+    tool_msgs = partial_result.get("tool_turn_messages") or []
+    if not tool_msgs:
+        return False
+    conv = getattr(agent, "_conversation", None)
+    if conv is None or not hasattr(conv, "append_turn"):
+        return False
+    user_msg = _job_user_message(agent)
+    if not user_msg:
+        return False
+    # 幂等：若历史末尾已是失败 turn（persist_failed_turn 已写过
+    # user + [ERROR]），跳过，避免重复追加同一条 user 指令。
+    try:
+        existing = await conv.get_history(agent.id, agent.project_id)
+    except Exception:
+        existing = []
+    if _same_failed_turn_already_persisted(existing, user_msg):
+        return False
+    # 只保留可回传的角色消息（assistant/tool/user），丢弃无关字段。
+    partial = [
+        m for m in tool_msgs
+        if isinstance(m, dict) and m.get("role") in ("assistant", "tool", "user")
+    ]
+    if not partial:
+        return False
+    # 断流标记统一用 FAILED_TURN_MARKER 前缀，保证 history_ends_with_
+    # failed_turn / attach_failed_turn_hint / 幂等检查都能识别。
+    # 注意：不再重嵌 streamer 的 content —— error result 的 content 是
+    # 已完成轮累积文本（已逐轮以 assistant 消息进入 tool_turn_messages），
+    # 重嵌会整段重复（tool_loop FIX(text-acc) 同源问题）。
+    partial.append({
+        "role": "assistant",
+        "content": (
+            f"{FAILED_TURN_MARKER} [TURN INTERRUPTED] 本回合被断流打断，"
+            "以上为已完成的中间产出；剩余工作请在下一轮继续。"
+        ),
+    })
+    from hiveweave.services.vision import messages_without_images
+
+    await conv.append_turn(
+        agent.id,
+        agent.project_id,
+        messages_without_images(
+            [{"role": "user", "content": user_msg}] + partial
+        ),
+    )
+    return True
+
+
 async def handle_empty_response(
     agent: Any,
     result: dict,
@@ -333,7 +398,9 @@ async def escalate_empty_response(agent: Any) -> None:
     agent._cancel_safety_timer()
     agent._reset_to_idle()
 
-async def handle_error(agent: Any, error: Exception) -> None:
+async def handle_error(
+    agent: Any, error: Exception, partial_result: dict | None = None
+) -> None:
     """错误处理。
 
     对齐 Elixir agent.ex:644 handle_info({:DOWN, ref, :process, ...})。
@@ -433,10 +500,30 @@ async def handle_error(agent: Any, error: Exception) -> None:
         except Exception:
             pass
 
-    try:
-        await persist_failed_turn(agent, f"[ERROR] {error_msg}")
-    except Exception as e:
-        log.warning("persist_failed_turn_on_error_failed", error=str(e))
+    # 断流类打断且携带已产出的中间轮消息时，持久化完整中间产出
+    # （参考 DSH 事件溯源：失败时已 durable 的内容也保留，resume 时
+    # 模型完整读到中间轮，不再只留 user+[ERROR] 导致中间产出丢失）。
+    # 注意：persist_partial_turn 在无中间产出/已写过失败标记时返回
+    # False，此时必须回退 persist_failed_turn，保证「原始指令仍保留」
+    # 的既有语义不被静默绕过（审计修复）。
+    if _is_interruption_break(error) and partial_result is not None:
+        _persisted = False
+        try:
+            _persisted = await persist_partial_turn(agent, partial_result)
+        except Exception as e:
+            log.warning("persist_partial_turn_failed", error=str(e))
+        if not _persisted:
+            try:
+                await persist_failed_turn(agent, f"[ERROR] {error_msg}")
+            except Exception as e2:
+                log.warning(
+                    "persist_failed_turn_on_error_failed", error=str(e2)
+                )
+    else:
+        try:
+            await persist_failed_turn(agent, f"[ERROR] {error_msg}")
+        except Exception as e:
+            log.warning("persist_failed_turn_on_error_failed", error=str(e))
 
     # 连续错误计数 — 超过阈值后 ACK inbox，不再 resume
     # 429 / rate-limit: 分级 — soft 冷却 / hard 配额 park（TEST20 P0-B）。
