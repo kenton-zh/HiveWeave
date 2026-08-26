@@ -59,6 +59,22 @@ def _is_valid_json_arguments(arguments: Any) -> bool:
         return False
 
 
+def _assistant_with_reasoning(
+    content: str, supports_thinking: bool, reasoning: str
+) -> dict:
+    """Final assistant 消息：reasoning 模型把本轮 thinking 一并落账。
+
+    供 build_display_segments 原位保留 thinking 块（DSH 整轮视图）——
+    主收口与预算/截断/内容过滤等提前收口路径统一，避免末轮思考在
+    done reload 后因 segments 缺 thinking 块而丢失（segments 含
+    中间轮 thinking 时 MessageBubble 会隐藏 _thinking 列）。
+    """
+    msg: dict = {"role": "assistant", "content": content}
+    if supports_thinking and reasoning:
+        msg["reasoning_content"] = reasoning
+    return msg
+
+
 class ToolLoopMixin:
     """Tool loop main cycle for Streamer."""
 
@@ -96,6 +112,7 @@ class ToolLoopMixin:
         usage_rounds: list[dict],
         note: str | None = None,
         reason: str = "hard_budget",
+        current_reasoning: str = "",
     ) -> dict:
         """硬预算耗尽的优雅收口（所有预算闸口共用）。
 
@@ -110,6 +127,10 @@ class ToolLoopMixin:
 
         E14：``note``/``reason`` 可覆盖默认措辞 —— 轮次疏导上限
         （force_commit_rounds）宽限轮用尽后同样走本收口，仅文案区分。
+
+        ``current_reasoning``：当前（被切断）轮的 thinking，仅补本轮
+        （不是 accumulated）—— 中间轮 thinking 已由各轮 assistant
+        消息的 reasoning_content 落账，避免重复。
         """
         base = self._strip_placeholder(text_acc)
         if note is None:
@@ -121,7 +142,12 @@ class ToolLoopMixin:
                 "long blocking calls)."
             )
         final_text = f"{base}\n\n{note}" if base else note
-        tool_turn_acc.append({"role": "assistant", "content": final_text})
+        final_msg = {"role": "assistant", "content": final_text}
+        # 仅补当前被切断轮的 thinking（调用方已按 provider.supports_thinking
+        # 门控 current_reasoning）；中间轮已由各轮 reasoning_content 落账。
+        if current_reasoning:
+            final_msg["reasoning_content"] = current_reasoning
+        tool_turn_acc.append(final_msg)
         return {
             "status": "ok",
             "content": final_text,
@@ -508,10 +534,11 @@ class ToolLoopMixin:
                         f"{truncated_rounds} 轮截断（工具调用参数不完整），"
                         "已丢弃未执行。请稍后重试该调用。"
                     )
-                    tool_turn_acc.append({
-                        "role": "assistant",
-                        "content": real_text + warning,
-                    })
+                    tool_turn_acc.append(_assistant_with_reasoning(
+                        real_text + warning,
+                        provider.supports_thinking,
+                        new_thinking,
+                    ))
                     return {
                         "status": "ok",
                         "content": real_text + warning,
@@ -539,9 +566,9 @@ class ToolLoopMixin:
                     # 全部畸形：本轮文本留作中间轮，继续循环让模型看到
                     # 提示后立即重发（不走 turn 收口）。
                     if new_text:
-                        tool_turn_acc.append({
-                            "role": "assistant", "content": new_text,
-                        })
+                        tool_turn_acc.append(_assistant_with_reasoning(
+                            new_text, provider.supports_thinking, new_thinking
+                        ))
                     text_acc = self._strip_placeholder(combined_text_pre)
                     thinking_acc = (
                         f"{thinking_acc}\n\n---\n\n{new_thinking}"
@@ -589,6 +616,9 @@ class ToolLoopMixin:
                     round_num=round_num + 1,
                     last_usage=last_usage,
                     usage_rounds=usage_rounds,
+                    current_reasoning=(
+                        new_thinking if provider.supports_thinking else ""
+                    ),
                 )
 
             # 处理截断的响应
@@ -599,7 +629,9 @@ class ToolLoopMixin:
                             finish=finish_reason)
                 real_text = self._strip_placeholder(combined_text)
                 warning = f"\n\n⚠️ 响应被截断（{finish_reason}），部分工具调用可能不完整。"
-                tool_turn_acc.append({"role": "assistant", "content": real_text + warning})
+                tool_turn_acc.append(_assistant_with_reasoning(
+                    real_text + warning, provider.supports_thinking, new_thinking
+                ))
                 return {
                     "status": "ok",
                     "content": real_text + warning,
@@ -615,7 +647,9 @@ class ToolLoopMixin:
                 log.warning("response_truncated_length", round=round_num)
                 real_text = self._strip_placeholder(combined_text)
                 warning = "\n\n⚠️ 回复被截断（达到最大输出长度），请继续以完成。"
-                tool_turn_acc.append({"role": "assistant", "content": real_text + warning})
+                tool_turn_acc.append(_assistant_with_reasoning(
+                    real_text + warning, provider.supports_thinking, new_thinking
+                ))
                 return {
                     "status": "ok",
                     "content": real_text + warning,
@@ -631,7 +665,9 @@ class ToolLoopMixin:
                 log.warning("content_filtered", round=round_num)
                 real_text = self._strip_placeholder(combined_text)
                 warning = "\n\n⚠️ 回复被内容过滤器截断。"
-                tool_turn_acc.append({"role": "assistant", "content": real_text + warning})
+                tool_turn_acc.append(_assistant_with_reasoning(
+                    real_text + warning, provider.supports_thinking, new_thinking
+                ))
                 return {
                     "status": "ok",
                     "content": real_text + warning,
@@ -783,6 +819,9 @@ class ToolLoopMixin:
                         round_num=round_num + 1,
                         last_usage=last_usage,
                         usage_rounds=usage_rounds,
+                        current_reasoning=(
+                            new_thinking if provider.supports_thinking else ""
+                        ),
                     )
 
                 # 构建 assistant 消息（含 tool_calls）
@@ -987,6 +1026,8 @@ class ToolLoopMixin:
                             f"{max(stall_count, readonly_stall_count, blocked_stall_count)} rounds — "
                             "turn ended."
                         )
+                    # 本轮 assistant_msg（含 reasoning_content）已在上方
+                    # append（line 847），此处只追加 summary 文本，不重复附 thinking。
                     tool_turn_acc.append(
                         {"role": "assistant", "content": final_text}
                     )
@@ -1020,6 +1061,8 @@ class ToolLoopMixin:
                             )
                             # FIX(text-acc): 同 max_rounds 路径，只用 summary
                             final_text = self._strip_placeholder(summary)
+                            # 本轮 assistant_msg 已含 reasoning_content（line 847），
+                            # 此处不重复附 thinking。
                             tool_turn_acc.append(
                                 {"role": "assistant", "content": final_text}
                             )
@@ -1075,7 +1118,12 @@ class ToolLoopMixin:
             # 会拼接所有轮的文本，导致同一分析语句在最终消息中重复 3-5 次，
             # 进而污染 conversation_turns 和下一轮的 LLM 上下文。
             final_text = self._strip_placeholder(new_text)
-            final_msg = {"role": "assistant", "content": final_text}
+            # reasoning 模型末轮 thinking 一并写入 tool_turn_messages →
+            # build_display_segments 原位保留 thinking 块（DSH 整轮视图：
+            # 末轮思考在 done reload 后仍可见）。
+            final_msg = _assistant_with_reasoning(
+                final_text, provider.supports_thinking, new_thinking
+            )
             tool_turn_acc.append(final_msg)
 
             log.info("stream_complete",

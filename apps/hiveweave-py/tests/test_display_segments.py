@@ -43,6 +43,48 @@ def test_interleaved_narration_and_tools_in_order():
     assert sum(1 for s in segs if s["type"] == "text") == 3
 
 
+def test_reasoning_content_becomes_inline_thinking_blocks():
+    """DSH 整轮视图：每轮 reasoning 作为 thinking 块原位保留（含末轮）。
+
+    对齐 deepseek-harness 把 reasoning 作为有序块持久化 —— done reload
+    后流式期间可见的思考段不丢失。
+    """
+    turn = [
+        {"role": "assistant", "content": "先看文件", "reasoning_content": "我要先读文件"},
+        {"role": "assistant", "content": None, "tool_calls": [_tc("c1", "read_file", '{"path":"a.py"}')], "reasoning_content": "分析路径"},
+        {"role": "tool", "tool_call_id": "c1", "content": "file body"},
+        {"role": "assistant", "content": "完成", "reasoning_content": "总结结果"},
+    ]
+    segs = build_display_segments(turn, "完成", [])
+    kinds = [(s["type"], s.get("tool")) for s in segs]
+    assert kinds == [
+        ("thinking", None),
+        ("text", None),
+        ("thinking", None),
+        ("tool_call", "read_file"),
+        ("thinking", None),
+        ("text", None),
+    ]
+    assert segs[0]["content"] == "我要先读文件"
+    assert segs[4]["content"] == "总结结果"
+
+
+def test_final_round_thinking_persisted_via_final_msg():
+    """末轮 thinking 由 tool_loop 写入 final assistant 的 reasoning_content。
+
+    流式期间 thinking_delta 段在 done reload 后仍以 thinking 块呈现，
+    不再只靠 thinking 列（且 MessageBubble 在 segments 含 thinking 时
+    会隐藏 _thinking，若不写 segments 末轮思考即丢失）。
+    """
+    turn = [
+        {"role": "assistant", "content": "中间旁白", "reasoning_content": "中间推理"},
+        {"role": "assistant", "content": "最终回答", "reasoning_content": "末轮推理"},
+    ]
+    segs = build_display_segments(turn, "最终回答", [])
+    assert [s["type"] for s in segs] == ["thinking", "text", "thinking", "text"]
+    assert segs[2]["content"] == "末轮推理"
+
+
 def test_failed_tool_marked_error_via_tool_history():
     turn = [
         {"role": "assistant", "content": None, "tool_calls": [_tc("c1", "bash", "{}")]},

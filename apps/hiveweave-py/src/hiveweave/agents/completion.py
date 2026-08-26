@@ -41,6 +41,9 @@ def build_display_segments(
     """把一个 turn 的 tool_turn_messages 展平为有序展示块序列。
 
     供前端 Chat 主栏做 DSH 风格整轮渲染（旁白→工具→旁白→…按时间序）。
+    - assistant(reasoning_content/thinking) → thinking 块（原位保留——
+      流式期间的 thinking_delta 段在 done 后 reload 不再丢失，对齐 DSH
+      持久化 reasoning 块的做法）
     - assistant(content) → text 块
     - assistant(tool_calls) → 每个调用一个 tool_call 块
     - tool 结果 → 按 tool_call_id 回填到对应块（result 截断 + ok/error）
@@ -67,6 +70,11 @@ def build_display_segments(
             continue
         role = m.get("role")
         if role == "assistant":
+            # DSH 整轮视图：每轮 reasoning 作为 thinking 块原位保留，
+            # 流式期间前端可见的思考段在 done reload 后不丢失。
+            reasoning = m.get("reasoning_content") or m.get("thinking")
+            if reasoning:
+                segs.append({"type": "thinking", "content": str(reasoning)})
             content = m.get("content")
             if content:
                 segs.append({"type": "text", "content": content})

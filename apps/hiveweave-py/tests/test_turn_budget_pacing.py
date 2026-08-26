@@ -48,6 +48,12 @@ class _FakeProvider:
     context_window = 128_000
 
 
+class _FakeThinkingProvider(_FakeProvider):
+    """reasoning 模型：supports_thinking=True，验证 thinking 落账到
+    tool_turn_messages（_assistant_with_reasoning 门控）。"""
+    supports_thinking = True
+
+
 def _make_streamer() -> Streamer:
     provider_factory = MagicMock()
     provider_factory.create.return_value = _FakeProvider()
@@ -264,6 +270,108 @@ def test_budget_exhausted_result_explains_even_without_text():
     assert result["budget_exhausted"] is True
     assert result["content"].startswith("[TURN BUDGET] Hard turn budget exhausted")
     assert "commit_turn" in result["content"]
+
+
+def test_budget_exhausted_result_preserves_current_round_thinking():
+    """预算收口把当前被切断轮的 thinking 写入 final assistant 的
+    reasoning_content → build_display_segments 原位保留末轮 thinking 块
+    （segments 含中间轮 thinking 时 MessageBubble 隐藏 _thinking，
+    不写 segments 末轮思考即丢失）。"""
+    streamer = _make_streamer()
+    tool_turn_acc: list[dict] = [
+        {"role": "assistant", "content": "中间旁白", "reasoning_content": "中间推理"},
+    ]
+    result = streamer._budget_exhausted_result(
+        text_acc="",
+        thinking_acc="中间推理",
+        tool_history=[],
+        tool_turn_acc=tool_turn_acc,
+        round_num=2,
+        last_usage=None,
+        usage_rounds=[],
+        current_reasoning="被切断轮的思考",
+    )
+    final_msg = result["tool_turn_messages"][-1]
+    assert final_msg["reasoning_content"] == "被切断轮的思考"
+    from hiveweave.agents.completion import build_display_segments
+
+    segs = build_display_segments(result["tool_turn_messages"], result["content"], [])
+    assert [s["type"] for s in segs] == ["thinking", "text", "thinking", "text"]
+    assert segs[2]["content"] == "被切断轮的思考"
+
+
+# ── 2b. reasoning 模型：thinking 经 _assistant_with_reasoning 落账 ────────
+
+
+async def test_normal_completion_writes_thinking_to_tool_turn_messages():
+    """主收口路径（reasoning 模型）：末轮 thinking 以 reasoning_content
+    写入 tool_turn_messages，build_display_segments 产 thinking 块——
+    流式期间可见的思考在 done reload 后不丢失。"""
+    streamer = _make_streamer()
+    provider = _FakeThinkingProvider()
+
+    async def fake_stream(*, messages, **kwargs):
+        return {
+            "status": "ok",
+            "text": "最终答复",
+            "thinking": "末轮思考",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "usage": None,
+        }
+
+    streamer._stream_with_empty_retry = fake_stream  # type: ignore[method-assign]
+
+    result = await streamer._run_tool_loop(
+        agent_id="a1",
+        provider=provider,
+        provider_name="fake",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        on_delta=None,
+        on_tool_call=AsyncMock(),
+        max_tool_rounds=10,
+    )
+    assert result["status"] == "ok"
+    assert result["tool_turn_messages"][-1]["reasoning_content"] == "末轮思考"
+    from hiveweave.agents.completion import build_display_segments
+
+    segs = build_display_segments(result["tool_turn_messages"], result["content"], [])
+    assert segs[0] == {"type": "thinking", "content": "末轮思考"}
+    assert segs[1] == {"type": "text", "content": "最终答复"}
+
+
+async def test_length_truncation_writes_thinking_to_warning_message():
+    """finish_reason=length 提前收口：截断告警消息也带本轮 thinking，
+    不会因 segments 含中间轮 thinking 而把末轮思考整个隐藏。"""
+    streamer = _make_streamer()
+    provider = _FakeThinkingProvider()
+
+    async def fake_stream(*, messages, **kwargs):
+        return {
+            "status": "ok",
+            "text": "部分回复",
+            "thinking": "被截断轮的思考",
+            "tool_calls": [],
+            "finish_reason": "length",
+            "usage": None,
+        }
+
+    streamer._stream_with_empty_retry = fake_stream  # type: ignore[method-assign]
+
+    result = await streamer._run_tool_loop(
+        agent_id="a1",
+        provider=provider,
+        provider_name="fake",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        on_delta=None,
+        on_tool_call=AsyncMock(),
+        max_tool_rounds=10,
+    )
+    assert result["status"] == "ok"
+    assert "⚠️ 回复被截断" in result["content"]
+    assert result["tool_turn_messages"][-1]["reasoning_content"] == "被截断轮的思考"
 
 
 # ── 3. 预算帽收紧的工具超时：文案区分「预算耗尽」 ────────────────
