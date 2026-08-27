@@ -17,7 +17,7 @@
   <a href="README.zh.md">中文</a>
 </p>
 
-[![HiveWeave Dashboard](assets/screenshots/动画.gif)](https://github.com/kenton-zh/HiveWeave)
+[![HiveWeave Dashboard](assets/screenshots/dashboard.png)](https://github.com/kenton-zh/HiveWeave)
 
 ---
 
