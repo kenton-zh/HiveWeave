@@ -87,17 +87,22 @@ async def _try_steer_busy_inbox(agent: Any, agent_id: str) -> bool:
     if not actionable:
         return False
     lines: list[str] = []
-    for m in actionable[:5]:
+    shown = actionable[:5]  # 正文只展示前 5 条——签收登记同口径（审计 P2-3）
+    for m in shown:
         body = inbox_digest_content(m) or ""
-        lines.append(f"- from={str(m.get('from_agent_id') or 'system')[:12]}: {body[:90]}")
+        # TEST_DSH_32 P2：90 字符会把 REWORK 反馈腰斩成「前半句」——
+        # 放宽到 240/条、1200 总长（仍防长清单刷屏），全文走正式 digest。
+        lines.append(f"- from={str(m.get('from_agent_id') or 'system')[:12]}: {body[:240]}")
     text = (
         "[INBOX] 你 turn 进行中有新消息待响应（turn 结束后仍会正式处理，"
         "现在按需优先插队处理即可）：\n" + "\n".join(lines)
-    )[:400]
+    )[:1200]
     try:
         # steer 仅做上下文注入，不落库已读/不回执；agent 看到后可自行决定
         # 「先插队处理」或「继续当前工作、稍后处理」。
-        r = await agent.steer(text)
+        # platform_preview=True：队列已失效（turn 恰好结束）时直接丢弃，
+        # 不回退 chat()——那会造出无签收的 [INBOX] 幻影回合（审计 P3-4）。
+        r = await agent.steer(text, platform_preview=True)
         if r.get("steer"):
             _steer_inbox_last[agent_id] = now
             log.info(
@@ -105,6 +110,27 @@ async def _try_steer_busy_inbox(agent: Any, agent_id: str) -> bool:
                 agent_id=agent_id,
                 count=len(actionable),
             )
+            # TEST_DSH_32 P1（微回合继承签收语义）：预览已注入运行中
+            # turn → 引用的未读并入 pending_inbox_msg_ids，本轮成功
+            # 完成后一并 ACK；若 turn 结束时预览仍残留，agent.py
+            # _settle_steer_channel 会按 _steer_preview_ids 回滚
+            # （不误签收，且在 ACK 之前执行——审计 P1-2）。
+            try:
+                pend = getattr(agent, "pending_inbox_msg_ids", None)
+                if pend:
+                    seen = set(pend)
+                    for m in shown:
+                        mid = m.get("id")
+                        if mid and mid not in seen:
+                            seen.add(mid)
+                            pend.append(str(mid))
+                            agent._steer_preview_ids.add(str(mid))
+            except Exception as e:
+                log.debug(
+                    "steer_preview_ack_register_failed",
+                    agent_id=agent_id,
+                    error=str(e),
+                )
             return True
     except Exception as e:
         log.warning("trigger_busy_steer_failed", agent_id=agent_id, error=str(e))
@@ -315,6 +341,10 @@ def merge_queued_triggers(
         return "\n\n".join(parts), opts
     message = triggers[-1][0]
     opts = dict(triggers[-1][1] or {})
+    # last-wins 保留正文与 inbox_msg_ids（ACK=seen：合并窗内正文只保留
+    # 最后一条，早到 trigger 引用的未读若不在最后 digest 里则未展示，
+    # 并集 ACK 会「没看见却被签收」——见 test_idle_architecture_p12）。
+    # 早到 trigger 的未读仍保持 read=0，由下一轮 trigger 正式投递。
     opts["inbox_msg_ids"] = list(opts.get("inbox_msg_ids") or [])
     opts["merged_wakes"] = len(triggers)
     opts.setdefault("source", "merged_trigger")

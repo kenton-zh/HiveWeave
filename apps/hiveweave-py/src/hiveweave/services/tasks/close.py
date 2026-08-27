@@ -74,6 +74,20 @@ class CloseMixin:
             "closed",
             summary=f"[closed] task {task_id[:8]}",
         )
+        # TEST_DSH_32 P1（closed 事件作废）：终态任务名下残留的
+        # unread wake=1 通知降级为背景——义务已消失，不得继续唤醒。
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().demote_wake_for_task(
+                project_id, task_id, reason="task_closed"
+            )
+        except Exception as e:
+            log.debug(
+                "close_demote_inbox_wake_failed",
+                task_id=task_id,
+                error=str(e),
+            )
         await self._wake_dependent_tasks(project_id, task_id)
         try:
             await self._maybe_close_umbrella_parent(project_id, task_id)
@@ -774,6 +788,21 @@ class CloseMixin:
         await publish_task_event(
             project_id, task_id, "task.archived", "cancelled", event_ts
         )
+        # TEST_DSH_32 P1（closed 事件作废）：归档同理——残留的
+        # [REWORK REQUESTED]/[TASK APPROVED] 等未读唤醒降级为背景
+        # （「其实不用补交」却反复被叫醒的空转根因之一）。
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().demote_wake_for_task(
+                project_id, task_id, reason="task_archived"
+            )
+        except Exception as e:
+            log.debug(
+                "archive_demote_inbox_wake_failed",
+                task_id=task_id,
+                error=str(e),
+            )
         log.info(
             "task_archived",
             project_id=project_id,

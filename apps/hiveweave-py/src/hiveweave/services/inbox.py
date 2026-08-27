@@ -1097,6 +1097,60 @@ class InboxService:
             )
             return 0
 
+    async def demote_wake_for_task(
+        self, project_id: str, task_id: str, *, reason: str = ""
+    ) -> int:
+        """TEST_DSH_32 P1（closed 事件作废）：任务达终态时，降级其名下
+        残留的 unread wake=1 通知（[REWORK REQUESTED]/[TASK APPROVED]/
+        [MERGE PENDING] 等）为 wake=0 背景——义务已消失，不得继续唤醒
+        agent 签到空转。read 保持 0（审计可见），只摘除唤醒语义。
+        """
+        if not task_id:
+            return 0
+        try:
+            from hiveweave.db import meta as meta_db
+
+            ws = await meta_db.get_project_workspace(project_id)
+            lock = (
+                await project_db.get_workspace_write_lock(str(ws))
+                if ws else None
+            )
+            conn = await project_db.get_project_db_by_project_id(project_id)
+
+            async def _demote() -> int:
+                cursor = await conn.execute(
+                    "UPDATE inbox SET wake = 0 "
+                    "WHERE task_id = ? AND read = 0 AND COALESCE(wake, 1) = 1",
+                    [task_id],
+                )
+                n = cursor.rowcount or 0
+                await conn.commit()
+                await cursor.close()
+                return int(n)
+
+            if lock is not None:
+                async with lock:
+                    n = await _demote()
+            else:
+                n = await _demote()
+            if n:
+                log.info(
+                    "inbox_wake_demoted_for_task",
+                    project_id=project_id,
+                    task_id=task_id[:12],
+                    count=n,
+                    reason=reason or "",
+                )
+            return n
+        except Exception as e:
+            log.warning(
+                "inbox_demote_wake_for_task_failed",
+                project_id=project_id,
+                task_id=task_id[:12],
+                error=str(e),
+            )
+            return 0
+
     async def get_outstanding_ask_recipients(
         self, from_agent_id: str
     ) -> set[str]:

@@ -334,6 +334,13 @@ class Agent:
         self.status = AgentState.IDLE
         self.empty_retry_count = 0
         self.pending_inbox_msg_ids: list[str] | None = None
+        # TEST_DSH_32 P1：[INBOX] 预览 steer 注入成功时登记其引用的
+        # inbox id（并入 pending_inbox_msg_ids，微回合继承签收语义）；
+        # 若 turn 结束时预览残留未消费，finally 里据此回滚，防止
+        # 「没看见却被 ACK」。
+        self._steer_preview_ids: set[str] = set()
+        # TEST_DSH_32 O2：llm_usage.task_id 归属（turn 内懒解析，见 _run_llm）
+        self._current_task_id: str | None = None
         self.current_job: dict | None = None
         self._cancel_reason: str | None = None
         self._message_queue: list[tuple[str, dict, int]] = []
@@ -788,6 +795,8 @@ class Agent:
 
             # 保存 inbox_msg_ids（在 LLM 非空输出后标记已读）
             self.pending_inbox_msg_ids = opts.get("inbox_msg_ids")
+            # TEST_DSH_32 O2：每回合重置任务归属（跨回合任务会切换）
+            self._current_task_id = None
 
             # 记录当前 job
             self.current_job = {
@@ -886,12 +895,21 @@ class Agent:
 
             return {"ok": True}
 
-    async def steer(self, message: str, opts: dict | None = None) -> dict:
+    async def steer(
+        self,
+        message: str,
+        opts: dict | None = None,
+        *,
+        platform_preview: bool = False,
+    ) -> dict:
         """插话：向正在运行的 turn 注入用户消息，不等整轮结束。
 
         - PROCESSING 且存在活跃 steer 队列 → 入队，由 streamer 的 tool_loop 在
           下一轮 LLM 请求前注入 next-step 窗口，AI 随即「看到并响应」。
         - 否则退化为普通 chat()：idle 时即时处理；busy 但无队列时走普通排队。
+        - platform_preview=True（TEST_DSH_32 P1）：平台 [INBOX] 预览专用——
+          队列失效时**禁止**回退 chat()（会造出无签收的幻影回合），
+          直接丢弃返回 {"ok": False}，未读交由正式 trigger 投递。
         """
         opts = opts or {}
         q = self._steer_q
@@ -899,7 +917,69 @@ class Agent:
             q.put_nowait(message)
             log.info("steer_queued", agent_id=self.id, preview=message[:80])
             return {"ok": True, "steer": True}
+        if platform_preview:
+            log.info(
+                "steer_preview_dropped_queue_gone",
+                agent_id=self.id,
+                preview=message[:60],
+            )
+            return {"ok": False, "steer": False, "dropped": True}
         return await self.chat(message, opts)
+
+    async def _settle_steer_channel(self) -> None:
+        """插话通道收尾（幂等，TEST_DSH_32 P1）。
+
+        - 平台 [INBOX] 预览残留 → 丢弃不回放：其引用的未读仍在库，由正式
+          trigger 路径（带 inbox_msg_ids → ACK 语义）投递；回放成普通用户
+          消息会造出无签收的幻影回合（18 回合空转根因）。
+        - 残留即未消费 → 回滚 _steer_preview_ids 登记的签收 id（防
+          「没看见却被 ACK」）。ok 路径在 _handle_completion 之前调用，
+          error/cancel 路径由 finally 兜底（那些路径本就不 ACK）。
+        - 真实用户 steer 残留 → 保留回放（不可丢数据）。
+        """
+        steer_q = self._steer_q
+        self._steer_q = None
+        if steer_q is None:
+            return
+        reclaimed = 0
+        dropped = 0
+        try:
+            while True:
+                _rest = steer_q.get_nowait()
+                if isinstance(_rest, str) and _rest.startswith("[INBOX]"):
+                    dropped += 1
+                    continue
+                self._message_queue.append(
+                    (_rest, {}, int(time.time() * 1000))
+                )
+                reclaimed += 1
+        except asyncio.QueueEmpty:
+            pass
+        if dropped:
+            log.info(
+                "steer_inbox_preview_dropped",
+                agent_id=self.id,
+                dropped=dropped,
+            )
+            # 预览未被消费 → 回滚其登记的签收 id，保持未读，
+            # 交由正式 trigger 路径投递（防「没看见却被 ACK」）。
+            if self._steer_preview_ids:
+                rolled = self._steer_preview_ids
+                self.pending_inbox_msg_ids = [
+                    i for i in (self.pending_inbox_msg_ids or [])
+                    if i not in rolled
+                ] or None
+                self._steer_preview_ids = set()
+        else:
+            # 全部已消费：登记 id 留在 pending_inbox_msg_ids，
+            # 本轮成功完成后一并 ACK（微回合继承签收语义）。
+            self._steer_preview_ids = set()
+        if reclaimed:
+            log.info(
+                "steer_reclaimed",
+                agent_id=self.id,
+                reclaimed=reclaimed,
+            )
 
     async def cancel(self, *, reason: str = "cancelled") -> None:
         """取消当前对话。
@@ -1146,6 +1226,31 @@ class Agent:
 
                 # Token metering: 主对话路径落库（best-effort，不阻塞主流程）。
                 # usage_rounds 由 streamer 在全部 return 分支携带。
+                # TEST_DSH_32 O2（测量补齐）：task_id 归属——此前
+                # _current_task_id 从未赋值导致 llm_usage.task_id 全空。
+                # best-effort 解析当前 assignee 活动任务（running/claimed）。
+                if getattr(self, "_current_task_id", None) is None:
+                    try:
+                        from hiveweave.services.task import TaskService
+
+                        _my_tasks = await TaskService().list_tasks(
+                            self.project_id, assignee_id=self.id
+                        )
+                        self._current_task_id = next(
+                            (
+                                str(t.get("id"))
+                                for t in _my_tasks
+                                if (t.get("status") or "") in ("running", "claimed")
+                                and not t.get("is_archived")
+                            ),
+                            None,
+                        )
+                    except Exception as _te:
+                        log.debug(
+                            "token_meter_task_resolve_failed",
+                            agent_id=self.id,
+                            error=str(_te),
+                        )
                 await token_meter.record_rounds(
                     agent_id=self.id,
                     project_id=self.project_id,
@@ -1176,6 +1281,11 @@ class Agent:
                     continue
 
                 if status == "ok":
+                    # TEST_DSH_32 P1 补（审计 P1-2）：steer 收尾必须在
+                    # _handle_completion 的 ACK 之前——否则未消费的
+                    # [INBOX] 预览 id 已被 mark_read，finally 回滚失效
+                    # （消息静默丢失）。幂等：finally 里再调一次是 no-op。
+                    await self._settle_steer_channel()
                     await self._handle_completion(result, message, opts)
                 else:
                     error_msg = result.get("error") or "Unknown LLM error"
@@ -1253,26 +1363,9 @@ class Agent:
         finally:
             # 确保心跳停止（所有退出路径的兜底）
             self._stop_heartbeat()
-            # 插话通道收尾：残留消息回填普通队列，避免 turn 结束后丢失。
-            steer_q = self._steer_q
-            self._steer_q = None
-            if steer_q is not None:
-                reclaimed = 0
-                try:
-                    while True:
-                        _rest = steer_q.get_nowait()
-                        self._message_queue.append(
-                            (_rest, {}, int(time.time() * 1000))
-                        )
-                        reclaimed += 1
-                except asyncio.QueueEmpty:
-                    pass
-                if reclaimed:
-                    log.info(
-                        "steer_reclaimed",
-                        agent_id=self.id,
-                        reclaimed=reclaimed,
-                    )
+            # 插话通道收尾（幂等；ok 路径已在 ACK 前调用过，此处兜底
+            # error/cancel 路径的队列清理）
+            await self._settle_steer_channel()
             # 只有当前 task 仍是 self._llm_task 时才清理状态
             # （cancel() 后若新 chat() 启动了新 task，不应清理新 task 的状态）
             if self._llm_task is current_task:
