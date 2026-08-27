@@ -192,6 +192,18 @@ async def _send_message_core(
 
     results: list[dict[str, Any]] = []
     if user_recipients:
+        # TEST_DSH_32 P10（核验下沉通道层）：send_message(to user) 与
+        # message_user 走同一道 CEO 完结断言门——正门侧门一把锁，消灭
+        # 「5 连拒后旁路送达」的通道不对称。
+        try:
+            from hiveweave.tools.misc_tools import _ceo_exit_assertion_block
+
+            gate = await _ceo_exit_assertion_block(agent_id, message)
+            if gate:
+                return ToolResult.err(gate)
+        except Exception as gate_err:
+            log.debug("send_message_user_gate_check_failed", error=str(gate_err))
+
         from hiveweave.services.chat_message import ChatMessageService
 
         chat_service = ChatMessageService()

@@ -16,6 +16,7 @@ to a soft-fail dict with a machine-readable ``reason``.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -26,6 +27,10 @@ import structlog
 from hiveweave.services.model import NoModelConfiguredError
 
 log = structlog.get_logger(__name__)
+
+# TEST_DSH_32 P7：审计是软门——LLM 故障不应烧满共享重试的 ~90s 才降级。
+# 单次审计 one-shot 帽 45s，超时按 llm_failed 软放行（此前 90.9s×2 实锤）。
+CODE_AUDIT_LLM_TIMEOUT_S = 45
 
 # One-shot review callback contract — same shape as
 # ``agents/agent.py:_review_llm_callback`` / tools/review.py ReviewLLMCallback.
@@ -558,15 +563,28 @@ async def _invoke_audit_llm(
             cfg = dict(chosen)
             cfg["supports_thinking"] = False
             cfg["default_reasoning_effort"] = None
-            text = await oneshot_llm(cfg, system, user)
+            text = await asyncio.wait_for(
+                oneshot_llm(cfg, system, user),
+                timeout=CODE_AUDIT_LLM_TIMEOUT_S,
+            )
         elif call_llm is not None:
-            text = await call_llm(system, user)
+            text = await asyncio.wait_for(
+                call_llm(system, user),
+                timeout=CODE_AUDIT_LLM_TIMEOUT_S,
+            )
             source = "own"
             chosen = None
         elif oneshot_llm is not None:
             return None, {"audited": False, "reason": "no_model"}
         else:
             return None, {"audited": False, "reason": "no_callback"}
+    except asyncio.TimeoutError:
+        log.warning(
+            "code_audit.llm_timeout",
+            agent_id=agent_id,
+            timeout_s=CODE_AUDIT_LLM_TIMEOUT_S,
+        )
+        return None, {"audited": False, "reason": "llm_failed"}
     except NoModelConfiguredError as exc:
         log.warning("code_audit.no_model", agent_id=agent_id, error=str(exc))
         return None, {"audited": False, "reason": "no_model"}
@@ -624,10 +642,10 @@ async def run_code_audit(
 
         # Auto-PASS without an LLM call: nothing changed and the ledger is
         # within the soft threshold.
-        if (
-            not diff.strip()
-            and get_unaudited_lines(agent_id) <= CODE_AUDIT_LINE_THRESHOLD
-        ):
+        # TEST_DSH_32 P7（空 diff 短路）：diff 为空 = 无可审计内容——
+        # 无论台账如何（编辑后回滚也算无净变更），直接 auto-PASS，
+        # 不再为空 diff 烧一次 LLM（此前实锤 34s 空跑）。
+        if not diff.strip():
             attestation_id = await attestation_service.create(
                 project_id,
                 agent_id=agent_id,
@@ -638,11 +656,14 @@ async def run_code_audit(
                 commit_hash=commit_hash,
                 stdout_hash=hash_stdout("no changes to audit"),
             )
+            # 台账同步清零（审计 P3-6）：无净变更也视为已审计口径
+            reset_ledger(agent_id)
             return {
                 "audited": True,
                 "verdict": "PASS",
                 "lines_audited": 0,
                 "attestation_id": attestation_id,
+                "auto_pass_reason": "empty_diff",
             }
 
         system, user = build_audit_prompt(diff, task_id)

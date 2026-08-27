@@ -455,6 +455,8 @@ class ToolLoopMixin:
             # 单轮流式请求（带空响应重试）。预算截止提前
             # TURN_STREAM_CUT_GRACE_S —— 给 merge/记账/返回留出时间，
             # 保证 streamer 总在 agent SAFETY_TIMEOUT 之前返回。
+            # TEST_DSH_32 O2（测量补齐）：实测本轮耗时，供 llm_usage.duration_ms。
+            _round_t0 = time.monotonic()
             round_result = await self._stream_with_empty_retry(
                 agent_id=agent_id,
                 provider=provider,
@@ -464,6 +466,9 @@ class ToolLoopMixin:
                 on_delta=on_delta,
                 round_num=round_num,
                 budget_deadline=hard_deadline - TURN_STREAM_CUT_GRACE_S,
+            )
+            round_result["round_duration_ms"] = int(
+                (time.monotonic() - _round_t0) * 1000
             )
 
             if round_result["status"] == "error":
@@ -502,6 +507,12 @@ class ToolLoopMixin:
                             agent_id=agent_id, round=round_num)
                 usage = None
             if usage:
+                # TEST_DSH_32 O2（测量补齐）：provider 不报 duration——
+                # 用本轮实测耗时补齐（此前 294/294 全空）。
+                if not usage.get("duration_ms"):
+                    usage["duration_ms"] = int(
+                        round_result.get("round_duration_ms") or 0
+                    )
                 usage_rounds.append(usage)
 
             # ── 截断 tool_calls 防御（TEST_DSH_16 实证）─────────────
