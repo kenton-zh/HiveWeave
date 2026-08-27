@@ -22,13 +22,14 @@ from hiveweave.services.acl_sandbox.sid import (
 
 
 def test_entry_boundary_covers_all_six_rows() -> None:
-    """§5.7 六入口全部登记（bash 两行共享 bash 键）。"""
+    """§5.7 六入口全部登记（bash 两行共享 bash 键）＋ E11 python_script（P11 接线）。"""
     assert ENTRY_BOUNDARY == {
         "bash": "boundary",
         "bash_main": "project_root",
         "run_command": "boundary",
         "dev_server": "boundary",
         "alarm": "project_root",
+        "python_script": "boundary",
     }
 
 

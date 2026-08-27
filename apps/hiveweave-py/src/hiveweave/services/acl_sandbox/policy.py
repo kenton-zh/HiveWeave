@@ -34,6 +34,7 @@ ENTRY_BOUNDARY: dict[str, str] = {
     "run_command": "boundary",
     "dev_server": "boundary",
     "alarm": "project_root",
+    "python_script": "boundary",  # E11 工具与 bash 同边界语义（注册面/白名单脱节修复，TEST_DSH_32 P11）
 }
 
 
