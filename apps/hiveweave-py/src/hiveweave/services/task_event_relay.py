@@ -143,7 +143,8 @@ class TaskEventRelay:
         # Build message content (title from task row — event payload is "{}"
         # for transition events, so falling back to payload would be empty)
         message = self._build_message(
-            event_type, task_id, payload, title=task.get("title") or ""
+            event_type, task_id, payload, title=task.get("title") or "",
+            evidence=task.get("evidence"),
         )
 
         # P2-4 直推去重：工具层已 wake=True 直推的事件（submit/review 工具
@@ -267,13 +268,18 @@ class TaskEventRelay:
         return recipients
 
     def _build_message(
-        self, event_type: str, task_id: str, payload: dict, *, title: str = ""
+        self, event_type: str, task_id: str, payload: dict, *, title: str = "",
+        evidence: object = None,
     ) -> str:
         """Build inbox message text for the event.
 
         Title comes from the task row (``_get_task``), not the event payload —
         transition events store ``{}`` payload and archived events store only
         the archive meta (no title).
+
+        TEST_DSH_32 P2（反馈通路）：task.rework 兜底通知附 review_feedback
+        全文（evidence 里一等可达），REST 逃生门路径不再只给一句「去看反馈」
+        却无处可看。
         """
         title = (title or payload.get("title") or "")[:80]
         short_id = task_id[:8]
@@ -296,7 +302,18 @@ class TaskEventRelay:
             ),
             "task.verifying": f"[TASK VERIFYING] {title} ({short_id}) verification started.",
         }
-        return messages.get(event_type, f"[{event_type}] task {short_id}")
+        msg = messages.get(event_type, f"[{event_type}] task {short_id}")
+        if event_type == "task.rework":
+            ev = evidence
+            if isinstance(ev, str):
+                try:
+                    ev = json.loads(ev)
+                except (json.JSONDecodeError, TypeError):
+                    ev = None
+            fb = (ev or {}).get("review_feedback") if isinstance(ev, dict) else None
+            if fb:
+                msg += f" Feedback: {fb}"
+        return msg
 
     async def _direct_already_sent(
         self,
@@ -345,7 +362,7 @@ class TaskEventRelay:
 
             rows = await _query(
                 project_id,
-                "SELECT assignee_id, creator_id, title FROM tasks WHERE id = ?",
+                "SELECT assignee_id, creator_id, title, evidence FROM tasks WHERE id = ?",
                 [task_id],
             )
             if rows:
@@ -354,6 +371,7 @@ class TaskEventRelay:
                     "assignee_id": r["assignee_id"] if "assignee_id" in r.keys() else None,
                     "creator_id": r["creator_id"] if "creator_id" in r.keys() else None,
                     "title": r["title"] if "title" in r.keys() else "",
+                    "evidence": r["evidence"] if "evidence" in r.keys() else None,
                 }
         except Exception as e:
             log.debug("relay_get_task_failed", task_id=task_id[:12], error=str(e))

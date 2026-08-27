@@ -357,6 +357,18 @@ async def get_tasks_tool(
                     ev = json.loads(ev)
                 except Exception:
                     ev = {}
+            # TEST_DSH_32 P2（反馈通路）：review feedback 一等可达——
+            # 返工后 assignee 靠本字段自助取全文，不再人肉找 reviewer 复述。
+            rf = ev.get("review_feedback") if isinstance(ev, dict) else None
+            if rf:
+                # 全文放结构化字段；行内截 400 防长反馈撑爆 listing
+                #（审计 P3-7，同表其他字段的截断纪律）。
+                t["review_feedback"] = rf
+                reviewed_by = ev.get("reviewed_by") or "?"
+                lines.append(
+                    f"    review_feedback (from {str(reviewed_by)[:12]}): "
+                    f"{str(rf)[:400]}"
+                )
             if isinstance(ev, dict) and ev.get("verification_case") and not case:
                 vc = ev["verification_case"]
                 if isinstance(vc, dict):
