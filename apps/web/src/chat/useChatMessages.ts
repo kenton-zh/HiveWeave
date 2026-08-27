@@ -21,6 +21,13 @@ type UpdateStreamDraft = (
   updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)
 ) => void;
 
+/**
+ * status=idle 早于 done 抵达时，保留被动订阅的宽限窗口。done 是「按
+ * metadata.segments 权威重载」的唯一入口，必须等到；但它也可能永远不来
+ * （后端崩溃 / WS 断开），到期强制收口以免 draft 永久留屏。
+ */
+const DONE_AFTER_IDLE_GRACE_MS = 8000;
+
 export function useChatMessages(opts: {
   agentId: string | null;
   streamDraft: StreamDraft | null;
@@ -68,6 +75,13 @@ export function useChatMessages(opts: {
   updateStreamDraftRef.current = updateStreamDraft;
   const passiveSubRef = useRef<string | null>(null);
   const passiveUnsubRef = useRef<(() => void) | null>(null);
+  // idle-先于-done 宽限窗口的绝对截止点（按 agent + 轮次锚定，见下方
+  // 被动订阅 effect）。存 ref 而非每次重算，防止邻居 agent 的状态抖动
+  // 把窗口无限续期。
+  const graceDeadlineRef = useRef<{ agentId: string; roundId: string; at: number } | null>(null);
+  // 已被 done/error 正常收口的轮次 id。draft 的清空要等 DB 重载往返，
+  // 这个标记让宽限逻辑能立刻识别「本轮已收口，无需兜底」。
+  const settledRoundRef = useRef<string | null>(null);
 
   // ChatPanel is not remounted on agent switch. Adjust session during render so
   // a committed frame never shows the previous person's 团队沟通 under a new id.
@@ -356,6 +370,13 @@ export function useChatMessages(opts: {
       }
       if (event.type === "done") {
         setThinkingElapsed(null);
+        // 本轮已由 done 正常收口 —— 记下轮次 id 并作废宽限窗口。draft 要
+        // 等 DB 重载回来才清空，这期间 idle 引发的 effect 重跑仍会看到非空
+        // draft；没有这个标记就会为一个已收口的轮次白起 8s 定时器。
+        graceDeadlineRef.current = null;
+        if (streamDraftRef.current) {
+          settledRoundRef.current = streamDraftRef.current.assistantId;
+        }
         // done 先于 draft 清空：结算本轮端到端耗时冻结到消息上，气泡头部
         // 据此显示 tok/s（tokens 分子用渲染时的估算，口径一致）。
         const finishedDraft = streamDraftRef.current;
@@ -380,6 +401,10 @@ export function useChatMessages(opts: {
       }
       if (event.type === "error") {
         setThinkingElapsed(null);
+        graceDeadlineRef.current = null;
+        if (streamDraftRef.current) {
+          settledRoundRef.current = streamDraftRef.current.assistantId;
+        }
         setIsStreaming(false);
         updateProcessingAgent(forAgentId, false);
         delete savedDraftsRef.current[forAgentId];
@@ -491,11 +516,56 @@ export function useChatMessages(opts: {
       return;
     }
     if (!processingAgents.includes(agentId)) {
+      // idle 可能早于 done 抵达（两者走不同频道、不同 forward task，投递
+      // 先后由事件循环决定 —— 后端把 done 提前只是提高胜率，不是硬序）。
+      // 此时若立刻摘掉 handler，随后的 done 就没人接 —— 而 done 是「按
+      // metadata.segments 权威重载」的唯一入口，丢了它气泡会永久停在流式
+      // 中途的 DB 快照上（只剩最后一轮 content，think/旁白/工具块全消失）。
+      // 有 draft 在飞 = 本轮尚未收口，宽限一段等 done 自行收尾；done 真的
+      // 不来（后端崩/WS 断/park 路径只发 idle）则到期强制收口。
+      const draft = streamDraftRef.current;
+      if (draft && settledRoundRef.current !== draft.assistantId) {
+        // deadline 存 ref：processingAgents 每次翻转都是新数组引用，邻居
+        // agent 的状态抖动会让本 effect 反复重跑。若每次重置满窗口，多
+        // agent 并发下宽限可被无限续期，「到期强制收口」的承诺就失效了。
+        const graceForAgentId = agentId;
+        const roundId = draft.assistantId;
+        const pending = graceDeadlineRef.current;
+        if (!pending || pending.agentId !== graceForAgentId || pending.roundId !== roundId) {
+          graceDeadlineRef.current = {
+            agentId: graceForAgentId,
+            roundId,
+            at: Date.now() + DONE_AFTER_IDLE_GRACE_MS,
+          };
+        }
+        const remaining = Math.max(0, graceDeadlineRef.current!.at - Date.now());
+        const timer = window.setTimeout(() => {
+          if (activeAgentIdRef.current !== graceForAgentId) return;
+          if (useAppStore.getState().processingAgents.includes(graceForAgentId)) return;
+          // 轮次校验：done 已正常收口（draft 清空）或新一轮已开始（换了
+          // assistantId）时必须放弃 —— 否则会把下一轮的 draft 误清、把
+          // 别人拥有的流式态抹平。
+          const cur = streamDraftRef.current;
+          if (!cur || cur.assistantId !== roundId) return;
+          graceDeadlineRef.current = null;
+          const wasPassive = passiveSubRef.current === graceForAgentId;
+          releasePassiveStream(graceForAgentId);
+          if (wasPassive) setIsStreaming(false);
+          void loadMessagesFromDb(graceForAgentId).then((ok) => {
+            if (!ok) return;
+            const latest = streamDraftRef.current;
+            if (latest && latest.assistantId === roundId) updateStreamDraft(null);
+          });
+        }, remaining);
+        return () => window.clearTimeout(timer);
+      }
+      graceDeadlineRef.current = null;
       const wasPassive = passiveSubRef.current === agentId;
       releasePassiveStream(agentId);
       if (wasPassive) setIsStreaming(false);
       return;
     }
+    graceDeadlineRef.current = null;
     if (isStreaming) return;
     attachPassiveStream(agentId);
     if (!streamDraftRef.current) {
@@ -512,7 +582,9 @@ export function useChatMessages(opts: {
     agentId,
     isStreaming,
     processingAgents,
+    activeAgentIdRef,
     attachPassiveStream,
+    loadMessagesFromDb,
     releasePassiveStream,
     streamDraftRef,
     updateStreamDraft,

@@ -326,6 +326,9 @@ class MergeMixin:
                     f"No-op merge: branch {branch} has 0 commits ahead of "
                     f"{target_branch} — nothing to merge. The worktree is "
                     f"already up to date with {target_branch}."
+                    " The merge is COMPLETE — do not call "
+                    "git_worktree_merge again; the task auto-closes after "
+                    "the grace period."
                 ),
                 "branch": branch,
                 "ahead": 0,
@@ -624,7 +627,9 @@ class MergeMixin:
             result["already_up_to_date"] = True
             result["message"] = (
                 f"Branch {branch} already on {target_branch} "
-                f"(no new commits) — treated as merged."
+                f"(no new commits) — treated as merged. "
+                "The merge is COMPLETE — do not call git_worktree_merge "
+                "again; the task auto-closes after the grace period."
             )
         if cleanup_note:
             result["cleanup_warning"] = cleanup_note.strip()
@@ -955,7 +960,9 @@ class MergeMixin:
             result["already_up_to_date"] = True
             result["message"] = (
                 f"Branch {branch} already on {target_branch} "
-                f"(no new commits) — treated as merged."
+                f"(no new commits) — treated as merged. "
+                "The merge is COMPLETE — do not call git_worktree_merge "
+                "again; the task auto-closes after the grace period."
             )
         if cleanup_note:
             result["cleanup_warning"] = cleanup_note.strip()

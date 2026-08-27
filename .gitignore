@@ -160,7 +160,7 @@ apps/web/scripts/refactor-*
 .trae/
 .agent-browser/
 .e2e-sandbox/
-.cursor/better-harness/
+.cursor/
 .superpowers/
 
 # Agent test playgrounds (nested git repos used by agent teams during tests —

@@ -255,6 +255,10 @@ async def test_merge_same_commit_with_unrelated_untracked_ok(tmp_path: Path):
     )
     assert result.get("success") is True, result
     assert result.get("already_up_to_date") is True
+    # noop 回执必须带"勿重复调用"指引（TEST_DSH_31: 云栖 noop 后 10 分钟内
+    # 重复调 merge 4 次，换姿势重试浪费 4 个 LLM 轮次）
+    msg = str(result.get("message") or "")
+    assert "COMPLETE" in msg and "do not call git_worktree_merge again" in msg
 
 
 @pytest.mark.asyncio

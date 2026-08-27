@@ -852,17 +852,25 @@ async def handle_completion(
         except Exception as e:
             log.warning("prune_persisted_failed", agent_id=agent.id, error=str(e))
 
-    # 4. 状态 → idle (先取消 safety timer，再 reset；残留 streaming 再 finalize 一次)
+    # 4. 发送 done 事件（前端 streamChat 等待此事件停止 loading）
+    # 必须早于 _go_idle：_go_idle → _reset_to_idle 会广播 status=idle，
+    # 前端据此把 agent 从 processingAgents 摘掉，进而拆掉被动流订阅的
+    # handler。done 是前端触发「按 metadata.segments 权威重载」的唯一
+    # 入口，若 idle 先到，done 落到已删除的 handler 上被丢弃，气泡就停在
+    # 流式中途的 DB 快照（content 只含最后一轮、无 segments/thinking/
+    # tool_calls）——整轮思考与旁白在收口瞬间凭空消失。
+    # 此处安全：步骤 2 已把 content/thinking/tool_calls/metadata 一次性
+    # 落库，done 之后 _go_idle 的 finalize 仅为残留兜底。
     agent._cancel_safety_timer()
-    await agent._go_idle()
-
-    # 5. 发送 done 事件（前端 streamChat 等待此事件停止 loading）
     agent._broadcast_stream_event({
         "type": "done",
         "content": content,
         "agentId": agent.id,
         "disposition": agent.disposition,
     })
+
+    # 5. 状态 → idle（残留 streaming 再 finalize 一次）
+    await agent._go_idle()
 
     # 5.5 广播健康事件 — 成功完成一轮 LLM 调用 → health="ok"
     agent._broadcast_agent_health("ok")
