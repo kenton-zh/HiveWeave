@@ -543,6 +543,30 @@ async def git_worktree_merge_tool(
         return wt_ctx
     workspace_path, caller_short_id, project_id = wt_ctx
 
+    # TEST_DSH_32 P6（merge 时机报错化）：任务还在 submitted/reviewing
+    # （未 approved）时 merge，git 会成功但账本义务在 approve 时才生成——
+    # 先合后批会把 merge 义务留在账上，事后 MERGE PENDING 循环催办、
+    # 重试只会 dry-run/no-op。此处当场报错，把顺序讲清楚。
+    if params.task_id:
+        try:
+            from hiveweave.services.task import TaskService
+
+            _mt = await TaskService().get_task(project_id, params.task_id)
+            if _mt and not _mt.get("is_archived"):
+                _mst = (_mt.get("status") or "").lower()
+                if _mst in ("submitted", "reviewing"):
+                    return ToolResult.err(
+                        f"Task {params.task_id[:8]} is '{_mst}' (not approved "
+                        "yet). Do NOT merge before approve — the merge "
+                        "obligation only exists after approve, so merging now "
+                        "lands the code but leaves the ledger dirty (you "
+                        "would be nudged to merge forever with nothing to "
+                        "merge). Order: review_task(approve) FIRST, then "
+                        "git_worktree_merge."
+                    )
+        except Exception as e:
+            log.debug("merge_task_status_prefetch_failed", error=str(e))
+
     gwt = GitWorktreeService()
     await gwt.ensure_git_repo(workspace_path)
 
@@ -744,6 +768,40 @@ async def git_worktree_merge_tool(
     short = result.get("short_id") or merged_short or caller_short_id
     branch = result.get("branch") or merged_branch
     files = result.get("files") or result.get("conflicts")
+
+    # TEST_DSH_32 P8（隔离必发通知）：merge 把 MAIN 未提交文件搬进
+    # 隔离区时，向调用者发紧急通知（此前 0 通知、纯静默搬移）。
+    # 不依赖 success——隔离后重试失败的路径同样要通知（审计 P3-5）。
+    q_events = result.get("quarantined")
+    if isinstance(q_events, list) and q_events:
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            qf = [f for e in q_events for f in (e.get("files") or [])]
+            dest = q_events[0].get("dest") or ".hiveweave/merge-quarantine"
+            await InboxService().send_message(
+                from_agent_id="system",
+                to_agent_id=agent_id,
+                message=(
+                    f"[MERGE QUARANTINE] git_worktree_merge 检测到 "
+                    f"{target_branch} 上有未提交的本地改动，已搬移到 "
+                    f"{dest}（未丢弃，可恢复）：\n- "
+                    + "\n- ".join(qf[:20])
+                    + "\n恢复指引：进入该目录对比/取回文件后重新提交；"
+                    "若改动已无价值可忽略。"
+                    + (
+                        "本次 merge 最终失败，请先处理冲突后重试。"
+                        if not result.get("success")
+                        else "合并本体不受影响。"
+                    )
+                ),
+                message_type="task",
+                priority="urgent",
+                task_id=params.task_id,
+                wake=True,
+            )
+        except Exception as qe:
+            log.warning("merge_quarantine_notify_failed", error=str(qe))
 
     if result.get("success"):
         # Defense in depth: conflict markers must never be treated as success.
@@ -1213,6 +1271,11 @@ async def _ceo_exit_assertion_block(agent_id: str, message: str) -> str | None:
     open FAIL 终验 / approved 未 closed 任务 / CEO 自身未读 inbox——
     任一命中即拒绝这条交付结论，要求先推动收口或如实说明现状
     （不得声称全部完成）。非 CEO、非完结断言、查询失败 → fail-open 放行。
+
+    TEST_DSH_32 P3/P10：本核验为「对用户发送」通道层共用门
+    （message_user 与 send_message(recipients=[user]) 同一入口）；
+    未读计数只计**人工消息**（from≠system），系统 FYI 副本不污染
+    计数，且拒绝文案附未读清单一键收口。
     """
     m = (message or "").strip()
     if not m or not any(n in m.lower() for n in _COMPLETION_ASSERT_NEEDLES):
@@ -1259,12 +1322,26 @@ async def _ceo_exit_assertion_block(agent_id: str, message: str) -> str | None:
                 blockers.append(f"{row['c']} 个 approved 未 closed 任务")
         except Exception:
             pass
+        # TEST_DSH_32 P3：未读只计人工消息（from≠system）——系统副本
+        # （含平台自身投递失败回执）不是 CEO 的账；并列出可操作清单一键收口。
         try:
-            from hiveweave.services.inbox import InboxService
-
-            unread = int(await InboxService().get_unread_count(agent_id) or 0)
-            if unread > 0:
-                blockers.append(f"你还有 {unread} 条未读消息")
+            cur = await conn.execute(
+                "SELECT id, from_agent_id, substr(message, 1, 80) AS preview "
+                "FROM inbox WHERE to_agent_id = ? AND read = 0 "
+                "AND COALESCE(from_agent_id, '') NOT IN ('system', '用户') "
+                "ORDER BY created_at ASC LIMIT 5",
+                [agent_id],
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            if rows:
+                listing = "; ".join(
+                    f"{str(r['from_agent_id'])[:8]}: {r['preview']}"
+                    for r in rows
+                )
+                blockers.append(
+                    f"你还有 {len(rows)}+ 条未读人工消息（{listing}）"
+                )
         except Exception:
             pass
         if blockers:
@@ -1272,6 +1349,8 @@ async def _ceo_exit_assertion_block(agent_id: str, message: str) -> str | None:
                 "message_user rejected（账本一致性核验）: 发布『全部完成』类"
                 "交付结论时项目账本仍不干净——" + "；".join(blockers)
                 + "。请先推动收口，或如实向用户说明现状（不得声称全部完成）。"
+                "（本核验对 message_user 与 send_message(to user) 一视同仁，"
+                "无旁路。）"
             )
     except Exception as e:
         log.debug("ceo_exit_assertion_check_failed", agent_id=agent_id, error=str(e))

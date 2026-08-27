@@ -73,7 +73,7 @@ async def _insert_task(ws, task_id, *, status, evidence=None):
 
 
 def _send_patch(**overrides):
-    """message_user 通路的最小 mock 集。overrides: unread / role 判定可覆盖。"""
+    """message_user 通路的最小 mock 集。overrides: role 判定可覆盖。"""
     return [
         patch(
             "hiveweave.tools.helpers.get_project_id",
@@ -88,10 +88,6 @@ def _send_patch(**overrides):
             return_value=overrides.get("role", "ceo"),
         ),
         patch(
-            "hiveweave.services.inbox.InboxService.get_unread_count",
-            new=AsyncMock(return_value=overrides.get("unread", 0)),
-        ),
-        patch(
             "hiveweave.services.chat_message.ChatMessageService.save_message",
             new=AsyncMock(),
         ),
@@ -102,11 +98,25 @@ def _send_patch(**overrides):
     ]
 
 
-async def _send(message: str, ws: str, *, role: str = "ceo", unread: int = 0) -> object:
+async def _send(
+    message: str, ws: str, *, role: str = "ceo", unread: int = 0
+) -> object:
+    """unread > 0 → 插入真实未读 inbox 行（TEST_DSH_32 P3 后直查 inbox 表，
+    from=system 的行不计入人工未读——用真人发件人构造阻塞场景）。"""
+    if unread > 0:
+        conn = await project_db.ensure_project_db(ws)
+        now = int(time.time() * 1000)
+        for i in range(unread):
+            await conn.execute(
+                "INSERT INTO inbox (id, from_agent_id, to_agent_id, message,"
+                " read, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+                [f"unread-{i}", "peer-agent-x", CEO_ID, "pending reply", now],
+            )
+        await conn.commit()
     from contextlib import ExitStack
 
     with ExitStack() as stack:
-        for cm in _send_patch(role=role, unread=unread):
+        for cm in _send_patch(role=role):
             stack.enter_context(cm)
         return await message_user_tool(
             MessageUserParams(message=message), CEO_ID, ws
@@ -136,12 +146,30 @@ async def test_ceo_completion_assertion_blocked_on_dirty_ledger(env):
 
 @pytest.mark.asyncio
 async def test_ceo_completion_assertion_blocks_on_unread_inbox(env):
-    """仅 CEO 自身未读 inbox 也足以拦截完结断言。"""
+    """仅 CEO 自身未读（人工消息）inbox 也足以拦截完结断言。"""
     result = await _send(
         "交付完成，全部搞定", env["workspace_path"], unread=3
     )
     assert result.success is False
-    assert "3 条未读消息" in (result.error or "")
+    assert "3+ 条未读人工消息" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_ceo_completion_assertion_system_unread_not_polluting(env):
+    """TEST_DSH_32 P3：from=system 的未读副本（平台投递回执）不阻塞
+    CEO 完结断言——未读计数只计人工消息，消灭「系统副本污染计数」。"""
+    conn = await project_db.ensure_project_db(env["workspace_path"])
+    now = int(time.time() * 1000)
+    for i in range(2):
+        await conn.execute(
+            "INSERT INTO inbox (id, from_agent_id, to_agent_id, message,"
+            " read, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+            [f"sys-{i}", "system", CEO_ID, "[BASH FAILED] delivery", now],
+        )
+    await conn.commit()
+
+    result = await _send("交付完成，全部搞定", env["workspace_path"])
+    assert result.success is True, result.error
 
 
 @pytest.mark.asyncio

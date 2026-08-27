@@ -853,6 +853,24 @@ async def submit_task_tool(
             f"Use create_task or dispatch_task for new work."
         )
 
+    # TEST_DSH_32 P5：approved 后重交（Illegal transition approved→submitted）
+    # 此前会裸抛状态机异常。提前给明确指引：等 merge；确有新工作要走
+    # rework 循环或新任务。
+    _st = (task.get("status") or "").lower()
+    if _st == "approved":
+        return ToolResult.err(
+            f"Task {task_id[:8]} is already APPROVED — submit is closed for "
+            "this round. The reviewer/creator will git_worktree_merge it. "
+            "Do NOT resubmit. If you have NEW changes that must be reviewed, "
+            "ask the reviewer to review_task(rework) first, or create a new "
+            "task referencing this one."
+        )
+    if _st in ("closed", "cancelled"):
+        return ToolResult.err(
+            f"Task {task_id[:8]} is {_st} (terminal) — it cannot be "
+            "submitted. Create a new task for further work."
+        )
+
     # B4: 只有 assignee 可以提交任务。creator==assignee 的自交任务
     # 在 task_assignee == agent_id 时已经通过，不需要 creator 例外。
     # creator 例外会让 CEO 代 assignee 提交（代交+自审一条龙），

@@ -49,6 +49,55 @@ from .reconcile import _assignee_has_open_tasks, _try_reattach_worktree
 log = structlog.get_logger(__name__)
 
 
+def _quarantine_stamps(workspace_path: str) -> set[str]:
+    """Snapshot of existing merge-quarantine stamp dirs (TEST_DSH_32 P8)."""
+    root = Path(workspace_path) / QUARANTINE_DIR
+    if not root.exists():
+        return set()
+    return {p.name for p in root.iterdir() if p.is_dir()}
+
+
+async def _new_quarantine_events(
+    workspace_path: str, before: set[str]
+) -> list[dict]:
+    """Quarantine dirs created during this merge call, with their files."""
+    events: list[dict] = []
+    root = Path(workspace_path) / QUARANTINE_DIR
+    for name in sorted(_quarantine_stamps(workspace_path) - before):
+        d = root / name
+        files = [
+            str(p.relative_to(d)).replace("\\", "/")
+            for p in sorted(d.rglob("*")) if p.is_file()
+        ]
+        events.append({"stamp": name, "dest": str(d), "files": files})
+    return events
+
+
+async def _attach_quarantine_events(
+    workspace_path: str, before: set[str], result: dict
+) -> dict:
+    """TEST_DSH_32 P8：任何返回路径（成功或失败）都透出本次隔离事件。
+
+    隔离后重试又失败的路径（如先 untracked 隔离、重试撞真冲突）此前
+    会把已搬进隔离区的文件静默丢掉——统一在返回前补附（审计 P3-5）。
+    """
+    try:
+        q_events = await _new_quarantine_events(workspace_path, before)
+        if q_events:
+            result.setdefault("quarantined", q_events)
+            qf = [f for e in q_events for f in e["files"]]
+            base = result.get("message") or ""
+            result["message"] = (
+                f"{base}\n[QUARANTINE] {len(qf)} uncommitted file(s) on "
+                "target were moved to merge-quarantine: "
+                + ", ".join(qf[:12])
+                + " — see the [MERGE QUARANTINE] inbox notice."
+            ).strip()
+    except Exception as e:
+        log.debug("attach_quarantine_events_failed", error=str(e))
+    return result
+
+
 class MergeMixin:
     """merge / merge_by_branch / branch resolution."""
 
@@ -487,6 +536,9 @@ class MergeMixin:
             workspace_path, short_id, task_name, task_id
         )
 
+        # TEST_DSH_32 P8：跟踪本次 merge 新建的隔离目录（静默搬移 → 必发通知）
+        _q_before = _quarantine_stamps(workspace_path)
+
         # D3 precondition validation: reject husk/corrupted worktrees early
         precond = await self._validate_merge_preconditions(
             workspace_path, short_id, branch, target_branch
@@ -552,9 +604,14 @@ class MergeMixin:
                         auto_quarantine=False,
                     )
                     assert fail is not None
-                    return fail
+                    # 隔离后重试失败：隔离事件也必须透出（审计 P3-5）
+                    return await _attach_quarantine_events(
+                        workspace_path, _q_before, fail
+                    )
             else:
-                return fail
+                return await _attach_quarantine_events(
+                    workspace_path, _q_before, fail
+                )
 
         ok, head = await _git(["rev-parse", "--short", "HEAD"], workspace_path)
 
@@ -635,7 +692,9 @@ class MergeMixin:
             result["cleanup_warning"] = cleanup_note.strip()
             base = result.get("message") or "Worktree merged"
             result["message"] = f"{base}{cleanup_note}"
-        return result
+        # TEST_DSH_32 P8：隔离不静默——本次 merge 搬移的 MAIN 未提交文件
+        # 必须随结果透出（工具层据此发通知），杜绝「悄悄搬进隔离区」。
+        return await _attach_quarantine_events(workspace_path, _q_before, result)
     async def merge_by_branch(self, workspace_path: str, branch: str,
                               target_branch: str = "main") -> dict:
         """Merge a specific branch by full name (Bug G fix + Bug L enhancement).
@@ -652,6 +711,9 @@ class MergeMixin:
         """
         import json as _json
         from pathlib import Path as _Path
+
+        # TEST_DSH_32 P8：跟踪本次 merge 新建的隔离目录（静默搬移 → 必发通知）
+        _q_before = _quarantine_stamps(workspace_path)
 
         # D3 precondition validation: reject husk/corrupted worktrees early
         parts = branch.split("/", 2)
@@ -758,20 +820,24 @@ class MergeMixin:
                             format_untracked_on_target_message,
                         )
 
-                        return {
-                            "success": False,
-                            "reason": "untracked_on_target",
-                            "message": format_untracked_on_target_message(
-                                branch=branch,
-                                target=target_branch,
-                                untracked=still or untracked,
-                            ),
-                            "untracked": still or untracked,
-                            "conflicts": [],
-                            "branch": branch,
-                            "files": branch_files,
-                            "short_id": short_id,
-                        }
+                        return await _attach_quarantine_events(
+                            workspace_path,
+                            _q_before,
+                            {
+                                "success": False,
+                                "reason": "untracked_on_target",
+                                "message": format_untracked_on_target_message(
+                                    branch=branch,
+                                    target=target_branch,
+                                    untracked=still or untracked,
+                                ),
+                                "untracked": still or untracked,
+                                "conflicts": [],
+                                "branch": branch,
+                                "files": branch_files,
+                                "short_id": short_id,
+                            },
+                        )
                     # Quarantine worked but retry failed for another reason
                     # (e.g. real content conflict) — fall through to 3b.
 
@@ -864,7 +930,10 @@ class MergeMixin:
                                 conflicts=conflict_files,
                             ),
                         }
-                    return fail2
+                    # 失败路径同样透出隔离事件（审计 P3-5）
+                    return await _attach_quarantine_events(
+                        workspace_path, _q_before, fail2
+                    )
 
         # Step 4: Post-merge verification
         verification_errors = []
@@ -970,7 +1039,8 @@ class MergeMixin:
             result["message"] = f"{base}{cleanup_note}"
         if verification_errors:
             result["verification_warnings"] = verification_errors
-        return result
+        # TEST_DSH_32 P8：隔离不静默（merge_by_branch 同样透出）
+        return await _attach_quarantine_events(workspace_path, _q_before, result)
 
 
 # ── merge → 任务结转：同分支 running 任务自动置 submitted ─────

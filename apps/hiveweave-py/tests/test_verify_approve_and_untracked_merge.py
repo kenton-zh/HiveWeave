@@ -166,6 +166,8 @@ async def test_gate_allows_empty_files_when_zero_ahead(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_gate_blocks_empty_files_when_ahead(tmp_path: Path):
+    """TEST_DSH_32 P4：清单空但 worktree 有实际交付 → git 指纹自动生成
+    清单（不再打回原样重交）。deny 为 None，meta 记录 autoderived。"""
     main = tmp_path / "main"
     main.mkdir()
     _init_repo(main)
@@ -193,9 +195,9 @@ async def test_gate_blocks_empty_files_when_ahead(tmp_path: Path):
     ):
         deny, meta = await review_worktree_gate("p1", task, {})
 
-    assert deny is not None
-    assert "files_changed is empty" in deny
+    assert deny is None, deny
     assert meta.get("commitsAhead") == 1
+    assert meta.get("files_changed_autoderived") == ["new.py"]
 
 
 # ── merge untracked quarantine ───────────────────────────

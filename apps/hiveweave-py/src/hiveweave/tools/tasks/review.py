@@ -541,9 +541,31 @@ async def review_task_tool(
                 return ToolResult.err(baseline_err)
 
         current_status = task["status"]
+        if current_status == "running":
+            # TEST_DSH_32 P5（差两秒钟的家法）：评审与提交同秒到达时，
+            # 评审先读到 running（提交正在落库）。等待后重读账本真值，
+            # 落库为 submitted 即继续；仍 running 才报错并附重试指引。
+            import asyncio
+
+            await asyncio.sleep(2.5)
+            task = await ts.get_task(project_id, params.task_id) or task
+            current_status = task["status"]
+            if current_status == "submitted":
+                log.info(
+                    "review_race_resubmit_read",
+                    task_id=params.task_id,
+                    reviewer=agent_id,
+                )
         if decision == "approve":
             if current_status == "submitted":
                 await ts.start_review(project_id, params.task_id, reviewer_id=agent_id)
+            elif current_status == "running":
+                return ToolResult.err(
+                    "Task is 'running' — a submission is likely still landing "
+                    "(review/submit race). WAIT a few seconds and retry the "
+                    "same review_task call; do NOT rework or punish the "
+                    "assignee based on this state."
+                )
             elif current_status != "reviewing":
                 return ToolResult.err(
                     f"Task must be 'submitted' or 'reviewing' to approve, "
@@ -553,6 +575,13 @@ async def review_task_tool(
             # rework from reviewing (normal) or approved (post-approve merge conflict)
             if current_status == "submitted":
                 await ts.start_review(project_id, params.task_id, reviewer_id=agent_id)
+            elif current_status == "running":
+                return ToolResult.err(
+                    "Task is 'running' — a submission is likely still landing "
+                    "(review/submit race). WAIT a few seconds and retry the "
+                    "same review_task call; do NOT rework or punish the "
+                    "assignee based on this state."
+                )
             elif current_status not in ("reviewing", "approved"):
                 return ToolResult.err(
                     f"Task must be 'submitted', 'reviewing', or 'approved' "

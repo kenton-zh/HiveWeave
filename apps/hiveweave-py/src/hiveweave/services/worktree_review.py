@@ -401,6 +401,59 @@ def _is_no_code_evidence(evidence: dict[str, Any]) -> bool:
     return False
 
 
+async def autoderive_changed_files(
+    main_ws: str,
+    worktree_ws: str,
+    *,
+    target_branch: str = "main",
+) -> list[str]:
+    """TEST_DSH_32 P4：用 git 指纹自动生成变更清单。
+
+    worktree 相对 main 的全部变更文件（committed diff + dirty + untracked），
+    排除 ``.hiveweave/`` 内部路径。判定「改没改」看文件指纹，不逼人自填
+    清单格子（verify-plan 空格仪式根因）。
+    """
+    try:
+        from hiveweave.services.git_worktree import _git, _resolve_base_branch
+
+        base = await _resolve_base_branch(main_ws) or target_branch
+        files: list[str] = []
+        ok_d, diff_out = await _git(
+            ["diff", "--name-only", f"{base}...HEAD"], worktree_ws
+        )
+        if ok_d:
+            files += [
+                l.strip().replace("\\", "/")
+                for l in (diff_out or "").splitlines()
+                if l.strip()
+            ]
+        ok_s, st_out = await _git(
+            ["status", "--porcelain"], worktree_ws
+        )
+        if ok_s:
+            for line in (st_out or "").splitlines():
+                if len(line) < 4:
+                    continue
+                path = line[3:].strip()
+                # rename "old -> new" 取新路径
+                if " -> " in path:
+                    path = path.split(" -> ")[-1]
+                path = path.strip('"').replace("\\", "/")
+                if path:
+                    files.append(path)
+        seen: set[str] = set()
+        out: list[str] = []
+        for f in files:
+            if f.startswith(".hiveweave") or f in seen:
+                continue
+            seen.add(f)
+            out.append(f)
+        return out[:40]
+    except Exception as e:
+        log.warning("autoderive_changed_files_failed", error=str(e))
+        return []
+
+
 async def review_worktree_gate(
     project_id: str,
     task: dict[str, Any],
@@ -473,6 +526,18 @@ async def review_worktree_gate(
             if isinstance(aids, list) and aids:
                 allow_empty = True
                 meta["skipped"] = "attestation_only_unknown_ahead"
+        if not allow_empty:
+            # TEST_DSH_32 P4（变更加密签名判定）：清单空但 worktree 有
+            # 实际交付 → 用 git 指纹自动生成清单，不再打回原样重交。
+            derived = await autoderive_changed_files(main_ws, wt)
+            if derived:
+                files = derived
+                meta["files_changed_autoderived"] = derived
+                log.info(
+                    "evidence.files_changed_autoderived",
+                    task_id=task.get("id"),
+                    count=len(derived),
+                )
 
     deny, cmp_meta = compare_worktree_to_main(
         main_ws=main_ws,
