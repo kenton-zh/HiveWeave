@@ -132,8 +132,16 @@ reports/
 tasks/_tmp_*
 tasks/diag_*.py
 tasks/dsh*.py
+scripts/_tmp_*
 apps/hiveweave-py/scripts/mechanism_attribution.py
 apps/hiveweave-py/scripts/strip_reserved_tags.py
+
+# Test postmortems / audit reports (process artifacts, local only)
+deliverables/
+audit_task_id_normalization.md
+
+# Local self-contained competitive-analysis report site (vendored fonts/js)
+hiveweave-competitive-analysis-2026/
 
 # Misc
 after-select.yaml
