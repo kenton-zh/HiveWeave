@@ -668,6 +668,41 @@ async def _submit_preflight(
                 # Warning only — don't block, but inform the agent
                 evidence["_hiveweave_invisible_warning"] = invisible_at_submit[:5]
 
+    # ── 冲突左移门(2026-08-26): 分支与 main 冲突时拒绝提交 ──
+    # executor 在自己上下文还热着时解决冲突, 而不是 merge 瞬间撞墙打回
+    # 重审。放在脏工作区门之后(此时工作区已 commit, 预演的是已提交状态)。
+    # fail-open: 无 worktree / git 过旧 / 预演失败一律放行, 唯一阻塞条件
+    # = merge-tree 明确报冲突。
+    try:
+        from hiveweave.services.git_worktree.conflict_predict import (
+            predict_merge_conflicts as _predict,
+        )
+        from hiveweave.services.worktree_review import (
+            agent_worktree_path as _cwt,
+        )
+
+        _wt = await _cwt(agent_id)
+        if _wt:
+            _pred = await _predict(_wt)
+            if _pred.status == "conflict":
+                issues.append({
+                    "code": "merge_conflict_with_main",
+                    "message": (
+                        "submit_task rejected: 你的分支与 main 存在合并冲突"
+                        f"(main 领先 {_pred.behind} 个提交, 冲突文件: "
+                        + (", ".join(_pred.conflicts[:8])
+                           if _pred.conflicts else "(清单解析失败, 以 rebase 实际输出为准)")
+                        + ("…" if len(_pred.conflicts) > 8 else "")
+                        + ")。请在你的 worktree 内执行 `git rebase main`"
+                          "(或 `git merge main`), 解决冲突后 "
+                          "git_worktree_checkpoint, 再重新 submit_task。"
+                          "不要让 coordinator 在合并时替你解冲突。"
+                    ),
+                })
+    except Exception as _ce:  # noqa: BLE001
+        log.debug("submit_conflict_gate_failed", task_id=task_id,
+                  error=str(_ce))
+
     # ── DELIVERY CONTRACT 预检（普通代码任务回执完整性 + 测试凭证机器验证）──
     # 只检查带 delivery_contract 类型契约的任务；非 dc 契约（协调者自建 slice）
     # 与 verify 类（走 E1）天然不受影响。contractWaived 显式跳过留痕。

@@ -185,8 +185,10 @@ _MECHANISMS_BLOCK = """## PLATFORM MECHANISMS — 工作前必读（不用试错
 
 ### 2. 凭证(attestation)与提交门——"完成"必须有机器证据
 - bash 跑测试 / browse E2E / request_code_audit 成功后会**自动生成绑定任务的凭证**(test_run / browse_e2e / code_audit)。
+- 自动判定只认 test_/verify_/check_ 命名(如 `node verify_x.mjs`)。**自定义校验脚本**(如 validate-suite.mjs、跑 lint/构建断言)用 `bash(..., testEvidence=true)` 显式声明——声明即落 test_run 凭证(exit 0 = 绿),不看文件名;命令与输出全程记录,供 reviewer 审。
 - submit 时把凭证 id 放进 `attestationIds=[...]` 交给平台验证(真实存在、绑定本任务、未过期);**口头"测过了"不算数**。
 - submitGate(policy)决定需要哪些 kind:docs→attest_doc_review;unit→test_run;module_visual→browse_e2e;code_audit*=另加 code_audit。
+- **分支与 main 冲突会被拒**(merge_conflict_with_main):先在自己的 worktree `git rebase main` 解冲突、checkpoint、再提交;checkpoint 回执出现冲突 WARNING 时尽早处理,不要攒到提交时。
 - `waive_attestation` 只豁免"凭证缺失",且只能逐条;**永远不能豁免"结论不合格"**(VERIFY verdict=FAIL 不可 waive)。
 
 ### 3. 交付契约(delivery contract)——代码任务的提交回执

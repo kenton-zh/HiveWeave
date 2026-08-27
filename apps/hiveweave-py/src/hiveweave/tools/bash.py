@@ -1439,6 +1439,19 @@ from .base import tool
 from .result import ToolResult
 
 
+def _coerce_bool_flag(v: Any) -> bool:
+    """宽容布尔转换(LLM 常传 "true"/"yes"/1)。"""
+    if v is None or v is False:
+        return False
+    if v is True:
+        return True
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
 def _coerce_timeout_ms(v: Any) -> Any:
     """LLM often passes seconds (1-600). Scale before ge=5000, matching execute_bash."""
     if v is None or isinstance(v, bool):
@@ -1497,6 +1510,19 @@ class BashParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["taskId", "task_id"]},
     )
+    test_evidence: bool = Field(
+        default=False,
+        alias="testEvidence",
+        description=(
+            "Declare this command as test evidence: ALWAYS issue a "
+            "test_run attestation (exit 0 = green) regardless of command "
+            "text. Use when running custom validation scripts whose names "
+            "don't match test_/verify_/check_ patterns (e.g. "
+            "validate-suite.mjs). The full command+output is still "
+            "recorded for reviewer inspection."
+        ),
+        json_schema_extra={"aliases": ["testEvidence", "test_evidence"]},
+    )
 
     @field_validator("timeout", mode="before")
     @classmethod
@@ -1515,6 +1541,11 @@ class BashParams(BaseModel):
         if isinstance(v, str):
             return v.strip().lower() in ("1", "true", "yes", "on")
         return bool(v)
+
+    @field_validator("test_evidence", mode="before")
+    @classmethod
+    def _coerce_test_evidence(cls, v: Any) -> bool:
+        return _coerce_bool_flag(v)
 
 
 class RunCommandParams(BaseModel):
@@ -1551,6 +1582,23 @@ class RunCommandParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["taskId", "task_id"]},
     )
+    test_evidence: bool = Field(
+        default=False,
+        alias="testEvidence",
+        description=(
+            "Declare this command as test evidence: ALWAYS issue a "
+            "test_run attestation (exit 0 = green) regardless of command "
+            "text. Use when running custom validation scripts whose names "
+            "don't match test_/verify_/check_ patterns. The full "
+            "command+output is still recorded for reviewer inspection."
+        ),
+        json_schema_extra={"aliases": ["testEvidence", "test_evidence"]},
+    )
+
+    @field_validator("test_evidence", mode="before")
+    @classmethod
+    def _coerce_test_evidence_rc(cls, v: Any) -> bool:
+        return _coerce_bool_flag(v)
 
 
 # LLM 常把 taskId 写进命令文本而非工具参数（TEST18 第二轮实锤：Vera 写
@@ -1939,12 +1987,20 @@ async def _issue_test_run_attestation(
     exit_code: int,
     task_id: str | None,
     exec_cwd: str | None = None,
+    declared_test: bool = False,
 ) -> str:
     """Create test_run attestation (success or failure). Return note fragment.
 
     ``workspace`` is the stamp/root workspace. ``exec_cwd`` (optional) is the
     actual directory the command ran in (e.g. workspace/params.cwd) — used for
     VERIFY under-main checks.
+
+    ``declared_test`` (bash testEvidence=true): 意图声明式凭证通道 —
+    无条件落凭证，不依赖 is_test_command 正则猜测。正则对 agent 是
+    不可见的命名暗号（TEST_DSH_31: validate-suite.mjs 每次全绿却永不
+    落凭证，agent 循环 1h 找"免派生校验"）。防伪不靠文件名（伪造
+    verify_fake.py 照样过正则），靠凭证记录的 command+stdout+exit_code
+    交 reviewer 审。
     """
     from hiveweave.services.attestation import (
         attestation_service,
@@ -1952,7 +2008,7 @@ async def _issue_test_run_attestation(
     )
     from hiveweave.services.task import TaskService
 
-    if not is_test_command(command or ""):
+    if not declared_test and not is_test_command(command or ""):
         return ""
     resolved, bind_note = await _resolve_test_attestation_task_id(
         project_id, agent_id, task_id, command=command
@@ -2188,6 +2244,7 @@ async def _bash_background(
                     exit_code=int(exit_code),
                     task_id=attest_task,
                     exec_cwd=exec_ws or "",
+                    declared_test=bool(getattr(params, "test_evidence", False)),
                 )
         except Exception as att_err:
             log.warning("bash_attest_issue_failed", error=str(att_err))
@@ -2228,7 +2285,10 @@ async def _bash_background(
     "Execute a shell command in YOUR workspace (worktree if you have one). "
     "Fresh shell each call (cwd does not persist). Check Exit code: N. "
     "Project-root tests / MAIN QA: use bash_main, not this tool. "
-    "Long scripts: background=true returns waiting_on — then "
+    "Test runs matching test_/verify_/check_ patterns auto-issue a "
+    "test_run attestation; for custom validation scripts with other "
+    "names pass testEvidence=true to force the attestation (exit 0 = "
+    "green). Long scripts: background=true returns waiting_on — then "
     "commit_turn(waiting); woken with [BASH DONE] / [BASH FAILED]. "
     "Stop with job_kill. Not PowerShell; prefer Git Bash, tail -n N, "
     "uv run python. Do not background=true for vite / npm run dev / "
@@ -2307,6 +2367,7 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
                 exit_code=int(exit_code),
                 task_id=attest_task,
                 exec_cwd=exec_ws or "",
+                declared_test=bool(getattr(params, "test_evidence", False)),
             )
     except Exception as _att_err:
         log.warning("bash_attest_issue_failed", error=str(_att_err))
@@ -2395,7 +2456,12 @@ async def bash_main_tool(
 
 @tool(
     "run_command",
-    "Executes a command and returns the output. Similar to bash but with explicit working directory support. Use for running scripts, builds, tests, or any system command. For reviewer test_run binding pass taskId.",
+    "Executes a command and returns the output. Similar to bash but with "
+    "explicit working directory support. Use for running scripts, builds, "
+    "tests, or any system command. For reviewer test_run binding pass "
+    "taskId; for custom validation scripts whose names don't match "
+    "test_/verify_/check_ patterns pass testEvidence=true to force the "
+    "attestation (exit 0 = green).",
     requires_workspace=True,
     security_level="shell",
 )
@@ -2445,6 +2511,7 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
                 exit_code=int(exit_code),
                 task_id=attest_task,
                 exec_cwd=_effective_cwd or exec_ws or "",
+                declared_test=bool(getattr(params, "test_evidence", False)),
             )
     except Exception as _att_err:
         log.warning("bash_attest_issue_failed", error=str(_att_err))

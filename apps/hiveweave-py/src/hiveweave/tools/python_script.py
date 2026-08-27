@@ -269,7 +269,9 @@ async def python_script_execute(
     "Provide 'script' (source) or 'scriptPath' (workspace-relative .py file). "
     "Runs in a fresh process with the project .venv interpreter when "
     "available. cwd = workspace. Check Exit code / error on every result. "
-    "Long output truncated. Set timeout ms (max 10min) for heavy loops.",
+    "Long output truncated. Set timeout ms (max 10min) for heavy loops. "
+    "Note: this tool issues NO test_run attestation — for validation "
+    "scripts that must count as test evidence use bash(testEvidence=true).",
     requires_workspace=True,
     security_level="shell",
 )

@@ -122,6 +122,18 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "(reviewers: pass the task under review)."
                 ),
             },
+            "testEvidence": {
+                "type": "boolean",
+                "aliases": ["test_evidence"],
+                "description": (
+                    "Declare this command as test evidence: ALWAYS issue a "
+                    "test_run attestation (exit 0 = green) regardless of "
+                    "command text. Use when running custom validation "
+                    "scripts whose names don't match test_/verify_/check_ "
+                    "patterns (e.g. validate-suite.mjs). Command+output are "
+                    "recorded for reviewer inspection."
+                ),
+            },
         },
         "required": ["command"],
     },
@@ -361,6 +373,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "cwd": {"type": "string", "description": "Working directory (relative to workspace). Default: workspace root."},
             "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"],
                         "description": "Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds."},
+            "taskId": {"type": "string", "aliases": ["task_id"],
+                        "description": "Optional task id to bind test_run attestation."},
+            "testEvidence": {"type": "boolean", "aliases": ["test_evidence"],
+                        "description": "Declare this command as test evidence: ALWAYS issue a test_run attestation (exit 0 = green) regardless of command text. Use for custom validation scripts whose names don't match test_/verify_/check_ patterns. Command+output are recorded for reviewer inspection."},
         },
         "required": ["command"],
     },
@@ -1249,7 +1265,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Pass taskId to hit hw/<shortId>/t-<taskId[:8]>. On conflict: "
             "abort — rework the executor to rebase main in their worktree. "
             "Does not auto-spawn VERIFY. After a milestone is on MAIN, "
-            "coordinators dispatch one QA task with milestoneVerify=true."
+            "coordinators dispatch one QA task with milestoneVerify=true. "
+            "already_up_to_date=true means the merge is COMPLETE — do NOT "
+            "call this tool again; the task auto-closes after the grace "
+            "period."
         ),
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
@@ -1285,7 +1304,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": [],
     },
     "git_worktree_checkpoint": {
-        "description": "Stage all changes and create a checkpoint commit in the active worktree.",
+        "description": (
+            "Stage all changes and create a checkpoint commit in the active "
+            "worktree. Receipt may include a WARNING about conflicts with "
+            "main — resolve early via `git rebase main` to avoid submit-time "
+            "rejection."
+        ),
         "properties": {
             "message": {"type": "string", "aliases": ["commitMessage", "commit_message", "summary"]},
         },
@@ -1425,7 +1449,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "lists missing items without submitting. VERIFY tasks MUST pass "
             "verdict=PASS|FAIL (blockingIssues when FAIL, E1 hard gate); "
             "delivery-contract tasks MUST pass deliveryContract={summary, test}. "
-            "Only the assignee can submit."
+            "Branch conflicting with main is rejected (merge_conflict_with_main) "
+            "— run `git rebase main` in your worktree, resolve, checkpoint, "
+            "then resubmit. Only the assignee can submit."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},

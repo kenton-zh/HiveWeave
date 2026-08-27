@@ -942,21 +942,52 @@ yarn.lock merge=union
         ok, status = await _git(["status", "--porcelain"], path)
         if ok and status == "":
             ok2, head = await _git(["rev-parse", "--short", "HEAD"], path)
+            conflict_warning = await self._conflict_warning(path)
             return {"success": True, "hash": head if ok2 else "",
                     "count": 0,
-                    "message": "no changes to commit" + ignored_warning + regen_note}
+                    "message": "no changes to commit" + ignored_warning
+                               + regen_note + conflict_warning}
 
         commit_msg = f"{CHECKPOINT_PREFIX} {message}"
         ok, _ = await _git(["commit", "-m", commit_msg], path)
         if not ok:
             return {"success": False, "message": "Failed to create checkpoint commit"}
 
+        # 冲突预警在 commit 之后算: 本次存档新引入的变更参与预演(审计 P2-1),
+        # 否则新写出的冲突要滞后一轮才暴露。
+        conflict_warning = await self._conflict_warning(path)
         ok, head = await _git(["rev-parse", "--short", "HEAD"], path)
         count = await self._count_checkpoints(path)
         log.info("git_worktree.checkpoint", short_id=short_id,
                  hash=head if ok else "", count=count)
         return {"success": True, "hash": head if ok else "", "count": count,
-                "message": (ignored_warning + regen_note) or None}
+                "message": (ignored_warning + regen_note + conflict_warning) or None}
+
+    async def _conflict_warning(self, path: str) -> str:
+        """checkpoint 回执的冲突预警文案(只提示, 绝不拦截——checkpoint 语义
+        = 过程存档/回滚保险, 预警 fail-quiet)。"""
+        try:
+            from .conflict_predict import predict_merge_conflicts
+
+            pred = await predict_merge_conflicts(path)
+            if pred.status == "conflict":
+                return (
+                    f" WARNING: main 已领先 {pred.behind} 个提交, 且合并时将"
+                    f"冲突: "
+                    + (", ".join(pred.conflicts[:5])
+                       if pred.conflicts else "(文件清单解析失败)")
+                    + ("…" if len(pred.conflicts) > 5 else "")
+                    + "。建议尽快在你的 worktree 执行 `git rebase main`"
+                      "解决冲突后再继续。"
+                )
+            if pred.degraded and pred.behind > 0 and pred.ahead > 0:
+                return (
+                    f" NOTE: main 已领先 {pred.behind} 个提交(本机 git 过旧,"
+                    f"无法预演冲突)。建议 `git rebase main` 后再继续。"
+                )
+        except Exception:
+            pass  # fail-quiet: 预警绝不影响存档
+        return ""
 
     async def _count_checkpoints(self, path: str) -> int:
         """Count checkpoint commits in the last 7 days."""
