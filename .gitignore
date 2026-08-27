@@ -48,6 +48,7 @@ tmp/
 temp/
 tmp_*.py
 tmp_*.txt
+.tmp_*
 _research/
 .research/
 .uploads/
