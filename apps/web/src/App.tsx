@@ -81,6 +81,7 @@ function App() {
   const [savingWritableDirs, setSavingWritableDirs] = useState(false);
   const [sandboxModeDraft, setSandboxModeDraft] = useState("");
   const projectMenuRef = useRef<HTMLDivElement>(null);
+  const projectListRef = useRef<HTMLDivElement>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [queuedDeleteIds, setQueuedDeleteIds] = useState<string[]>([]);
   const deleteQueueRef = useRef<Array<{ id: string; name: string }>>([]);
@@ -136,6 +137,13 @@ function App() {
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
   }, []);
+
+  // Open the project menu with the selected project scrolled into view
+  // (list area is height-capped and scrolls internally once projects grow).
+  useEffect(() => {
+    if (!showProjectMenu) return;
+    projectListRef.current?.querySelector('[data-selected="true"]')?.scrollIntoView({ block: "nearest" });
+  }, [showProjectMenu]);
 
 
   useEffect(() => {
@@ -472,35 +480,38 @@ function App() {
             </div>
           )}
           {showProjectMenu && (
-            <div className="absolute top-full left-0 mt-1.5 w-56 bg-white border border-g-border rounded-gmLg shadow-gm-pop z-50 py-1.5 px-1 animate-scale-in origin-top-left">
-              {projects.map((p) => (
-                <div
-                  key={p.id}
-                  className={`flex items-center justify-between px-3 py-2 text-sm cursor-pointer rounded-gm hover:bg-g-bg-muted transition-colors ${
-                    p.id === selectedProjectId ? "text-g-blue bg-g-blue-bg" : "text-g-fg"
-                  }`}
-                >
-                  <span
-                    className="flex-1 truncate"
-                    onClick={() => handleSwitchProject(p.id)}
+            <div className="absolute top-full left-0 mt-1.5 w-56 max-h-[calc(100vh-5rem)] flex flex-col bg-white border border-g-border rounded-gmLg shadow-gm-pop z-50 py-1.5 px-1 animate-scale-in origin-top-left">
+              <div ref={projectListRef} className="overflow-y-auto min-h-0">
+                {projects.map((p) => (
+                  <div
+                    key={p.id}
+                    data-selected={p.id === selectedProjectId}
+                    className={`flex items-center justify-between px-3 py-2 text-sm cursor-pointer rounded-gm hover:bg-g-bg-muted transition-colors ${
+                      p.id === selectedProjectId ? "text-g-blue bg-g-blue-bg" : "text-g-fg"
+                    }`}
                   >
-                    {p.name}
-                  </span>
-                  <button
-                    type="button"
-                    disabled={deletingProjectId === p.id || queuedDeleteIds.includes(p.id)}
-                    onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
-                    className="ml-2 text-g-fg-4 hover:text-red-600 hover:bg-red-50 rounded-full p-1 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-                    title={deletingProjectId === p.id ? "删除中..." : "删除项目"}
-                  >
-                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                    </svg>
-                  </button>
-                </div>
-              ))}
+                    <span
+                      className="flex-1 truncate"
+                      onClick={() => handleSwitchProject(p.id)}
+                    >
+                      {p.name}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={deletingProjectId === p.id || queuedDeleteIds.includes(p.id)}
+                      onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
+                      className="ml-2 text-g-fg-4 hover:text-red-600 hover:bg-red-50 rounded-full p-1 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                      title={deletingProjectId === p.id ? "删除中..." : "删除项目"}
+                    >
+                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
+                    </button>
+                  </div>
+                ))}
+              </div>
 
-              <div className="border-t border-g-border mt-1 pt-1">
+              <div className="border-t border-g-border mt-1 pt-1 shrink-0">
                 {selectedProjectId && (
                   <button
                     onClick={openProjectSettings}
