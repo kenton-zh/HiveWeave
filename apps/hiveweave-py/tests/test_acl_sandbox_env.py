@@ -17,13 +17,21 @@ def test_sandbox_env_redirects_temp(monkeypatch) -> None:
 
 
 def test_sandbox_env_cache_overrides() -> None:
-    """§8 缓存覆盖：UV/PIP/NPM/pnpm 全部指进项目级共享缓存。"""
+    """T3.3: UV/PIP/NPM/pnpm 缓存改指 **agent 私有** temp 子目录。
+
+    项目级共享 ``.hiveweave-cache`` 上的并发 ``npm install`` 互相持文件锁
+    导致 EPERM · unlink（TEST_DSH_35 实测 46 min 可消除税）；私有目录复用
+    temp 的 per-agent 生命周期（可撤销 SID + dismiss 撤销 + 孤儿清扫），
+    写入天然放行。"""
     cache = r"D:\ws\.hiveweave-cache"
-    env = _build_sandbox_env(r"D:\ws", cache, r"D:\ws\tmp")
-    assert env["UV_CACHE_DIR"] == os.path.join(cache, "uv")
-    assert env["PIP_CACHE_DIR"] == os.path.join(cache, "pip")
-    assert env["NPM_CONFIG_CACHE"] == os.path.join(cache, "npm")
-    assert env["npm_config_store_dir"] == os.path.join(cache, "pnpm")
+    temp = r"D:\ws\tmp"
+    env = _build_sandbox_env(r"D:\ws", cache, temp)
+    assert env["UV_CACHE_DIR"] == os.path.join(temp, "cache", "uv")
+    assert env["PIP_CACHE_DIR"] == os.path.join(temp, "cache", "pip")
+    assert env["NPM_CONFIG_CACHE"] == os.path.join(temp, "cache", "npm")
+    assert env["npm_config_store_dir"] == os.path.join(temp, "cache", "pnpm")
+    # 共享缓存路径不得再注入 env（否则又回到共享锁竞争）
+    assert env["UV_CACHE_DIR"] != os.path.join(cache, "uv")
 
 
 def test_sandbox_env_no_secret_key(monkeypatch) -> None:

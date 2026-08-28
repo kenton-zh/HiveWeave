@@ -74,16 +74,23 @@ def _build_sandbox_env(
     绝不继承父进程环境（HIVEWEAVE_OPENCODE_API_KEY 等密钥全量挡在
     build_child_env 白名单外）；PATH/PATHEXT 继承白名单原值（§5.4 v3）。
     ``env_extra`` = 调用方增量（dev server 的 PORT 注入等，白名单之上）。
+
+    T3.3: 包管理器缓存从项目级共享 ``<project>/.hiveweave-cache/<sub>``
+    改为 **agent 私有** ``<temp_dir>/cache/<sub>`` —— 共享缓存上的并发
+    ``npm install`` 互相持文件锁导致 EPERM · unlink（TEST_DSH_35 实测
+    46 min 可消除税）。私有目录复用既有 temp 生命周期（per-agent、可撤销
+    SID、dismiss 撤销 + R11 孤儿清扫），写入天然放行。共享 ``.hiveweave-cache``
+    目录与其授权保留在盘（回滚位 / 将来做只读 warm 层），不再注入 env。
     """
     env = build_child_env(cwd, bash_markers=True)
     if env_extra:
         env.update({str(k): str(v) for k, v in env_extra.items()})
     # 沙箱不变量（TEMP/TMP/缓存覆盖）在 env_extra 之后强制写回 —— 调用方
-    # 增量不得覆盖受限 temp / 项目缓存指针。
+    # 增量不得覆盖受限 temp / 私有缓存指针。
     env["TEMP"] = temp_dir
     env["TMP"] = temp_dir
     for var, sub in _CACHE_ENV_OVERRIDES.items():
-        env[var] = os.path.join(cache_dir, sub)
+        env[var] = os.path.join(temp_dir, "cache", sub)
     return env
 
 
@@ -366,6 +373,10 @@ async def spawn_confined(
                     "pid": job.pid,
                     "temp_dir": policy.temp_dir,
                     "cache_dir": policy.cache_dir,
+                    # T3.3: 实际注入 env 的包管理器缓存根（agent 私有）
+                    "private_cache_dir": os.path.join(
+                        policy.temp_dir, "cache"
+                    ),
                 }
             result = await runner.run_foreground(
                 token, command, workdir, env, timeout_s,
