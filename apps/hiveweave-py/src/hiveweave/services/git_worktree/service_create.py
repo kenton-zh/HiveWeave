@@ -845,12 +845,12 @@ yarn.lock merge=union
         # are stripped too — and de-tracked when already tracked, so they stop
         # dirtying every future checkout (merge-blocking main dirt).
         regen_stripped: list[str] = []
+        gen_stripped: list[str] = []
         try:
             ok_st, staged_out = await _git(
                 ["diff", "--cached", "--name-only"], path
             )
             if ok_st and staged_out:
-                gen_stripped: list[str] = []
                 for ln in staged_out.splitlines():
                     fname = ln.strip()
                     if not fname:
@@ -884,6 +884,18 @@ yarn.lock merge=union
                     )
         except Exception:
             pass  # best-effort: don't fail checkpoint on strip
+
+        # T1.2: 剥离说明进返回 message（此前只写 log.info，Agent 看不到）。
+        # 措辞对齐 dirty 门禁新口径（T1.1）：生成物不再计入 dirty。
+        generated_note = ""
+        if gen_stripped:
+            generated_note = (
+                f" NOTE: {len(gen_stripped)} generated file(s) stripped by "
+                f"policy (regenerated post-merge, never committed; the dirty "
+                f"gate no longer counts them): "
+                f"{', '.join(gen_stripped[:5])}"
+                f"{'...' if len(gen_stripped) > 5 else ''}."
+            )
 
         # Regenerable files get their own note — the generic ignored-files
         # warning below advises `git add -f`, which for this class just gets
@@ -946,12 +958,51 @@ yarn.lock merge=union
             return {"success": True, "hash": head if ok2 else "",
                     "count": 0,
                     "message": "no changes to commit" + ignored_warning
-                               + regen_note + conflict_warning}
+                               + generated_note + regen_note + conflict_warning}
+
+        # T1.2/P0-1: 剥离后暂存区为空 = 剩余变更全是生成物/被忽略 —— 这是
+        # 「按策略无事可提交」，不是失败。此前落到 git commit「nothing to
+        # commit」→「Failed to create checkpoint commit」无原因失败（死锁
+        # 的 checkpoint 侧）。
+        ok_cached, cached_out = await _git(
+            ["diff", "--cached", "--name-only"], path
+        )
+        if ok_cached and not (cached_out or "").strip():
+            ok2, head = await _git(["rev-parse", "--short", "HEAD"], path)
+            conflict_warning = await self._conflict_warning(path)
+            return {
+                "success": True,
+                "hash": head if ok2 else "",
+                "count": 0,
+                "message": (
+                    "no committable changes"
+                    + ignored_warning + generated_note + regen_note
+                    + conflict_warning
+                ).strip(),
+            }
 
         commit_msg = f"{CHECKPOINT_PREFIX} {message}"
-        ok, _ = await _git(["commit", "-m", commit_msg], path)
+        ok, commit_out = await _git(["commit", "-m", commit_msg], path)
         if not ok:
-            return {"success": False, "message": "Failed to create checkpoint commit"}
+            # T1.2: 失败带 git commit 的 stderr/stdout（此前无原因失败），
+            # 剥离清单非空时附上，便于区分「没东西可提交」与「真失败」。
+            fail_detail = (commit_out or "").strip()
+            stripped_all = gen_stripped + regen_stripped
+            if stripped_all:
+                stripped_note = (
+                    "stripped-by-policy: " + ", ".join(stripped_all[:10])
+                )
+                fail_detail = (
+                    f"{fail_detail} | {stripped_note}" if fail_detail
+                    else stripped_note
+                )
+            return {
+                "success": False,
+                "message": (
+                    "Failed to create checkpoint commit"
+                    + (f": {fail_detail}" if fail_detail else "")
+                ),
+            }
 
         # 冲突预警在 commit 之后算: 本次存档新引入的变更参与预演(审计 P2-1),
         # 否则新写出的冲突要滞后一轮才暴露。
@@ -961,7 +1012,8 @@ yarn.lock merge=union
         log.info("git_worktree.checkpoint", short_id=short_id,
                  hash=head if ok else "", count=count)
         return {"success": True, "hash": head if ok else "", "count": count,
-                "message": (ignored_warning + regen_note + conflict_warning) or None}
+                "message": (ignored_warning + generated_note + regen_note
+                            + conflict_warning) or None}
 
     async def _conflict_warning(self, path: str) -> str:
         """checkpoint 回执的冲突预警文案(只提示, 绝不拦截——checkpoint 语义

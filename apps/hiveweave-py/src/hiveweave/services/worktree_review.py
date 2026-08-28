@@ -209,36 +209,109 @@ async def worktree_commits_ahead(
         return None
 
 
-async def worktree_dirty_counts(worktree_ws: str) -> dict[str, int]:
+def _is_generated_untracked(path: str) -> bool:
+    """True 当路径属于生成物（checkpoint 会剥离的那类）。
+
+    生成物两套都算（T1.1 口径修正）：``GENERATED_FILES``（7 个 lockfile 名）
+    + ``is_regenerable_path``（.tsbuildinfo / test_output*.json）。只排除
+    这类路径，**不是排除全部 ``??``** —— untracked 新源码必须继续计入
+    dirty，否则「零 commit + 纯 untracked 交付」会绕过 Rita escape 防线，
+    且 ``org._in_progress_keep_status`` 会把 worktree 连同未提交源码删掉。
+    """
+    from hiveweave.services.git_worktree.constants import (
+        GENERATED_FILES,
+        is_regenerable_path,
+    )
+
+    norm = (path or "").strip().strip('"').replace("\\", "/")
+    base = norm.rsplit("/", 1)[-1]
+    return base in GENERATED_FILES or is_regenerable_path(norm)
+
+
+#: porcelain XY 前缀 + 路径。``_git`` 对整段输出做了 strip()，首行的
+#: 前导空格（X 位 = 未修改）可能被吃掉（`` M a`` → ``M a``），所以用
+#: 容错正则而不是固定 [3:] 切片（审计修复过程中实测复现）。
+_PORCELAIN_LINE_RE = re.compile(r"^[ MADRC?!UTXB]{0,2}\s+(.+)$")
+
+
+def _porcelain_paths(ln: str) -> list[str]:
+    """取 porcelain 行的路径。rename 行 ``R  old -> new`` 两侧都算。"""
+    rest = (ln or "").strip()
+    if not rest:
+        return []
+    m = _PORCELAIN_LINE_RE.match(rest)
+    if not m:
+        return []
+    body = m.group(1).strip()
+    if " -> " in body:
+        old, new = body.split(" -> ", 1)
+        return [old.strip().strip('"'), new.strip().strip('"')]
+    return [body.strip().strip('"')]
+
+
+async def worktree_dirty_counts(worktree_ws: str) -> dict[str, Any]:
     """Count dirty paths via ``git status --porcelain``.
 
-    Returns ``{dirty_count, untracked_count, modified_count}``.
+    T1.1 口径（P0-1 审计后扩展到 tracked 侧）：``dirty_count`` = 可提交的
+    变更数。**生成物**（``GENERATED_FILES`` / ``REGENERABLE_PATTERNS``，
+    即 checkpoint 必然剥离、merge 后重新生成、永远不可能落进提交的那类）
+    无论 untracked 还是 tracked-修改 都不计入 dirty —— 只计它们就是纯噪音，
+    且会造成「checkpoint 报剥离、dirty 门禁又计数」的死锁闭环（tracked
+    变体实测复现）。其余变更（tracked 修改 + 非生成物 untracked）正常计数，
+    Rita-style 零 commit + untracked 源码交付仍被拦住。
+    Returns ``{dirty_count, untracked_count, modified_count,
+    generated_untracked, generated_paths}``.
     On git error, treats as dirty_count=1 so fail-closed callers stay safe.
     """
-    empty = {"dirty_count": 0, "untracked_count": 0, "modified_count": 0}
+    empty_fail = {
+        "dirty_count": 1,
+        "untracked_count": 0,
+        "modified_count": 1,
+        "generated_untracked": 0,
+        "generated_paths": [],
+    }
     try:
         from hiveweave.services.git_worktree import _git
 
         ok, st = await _git(["status", "--porcelain"], worktree_ws)
         if not ok:
-            return {"dirty_count": 1, "untracked_count": 0, "modified_count": 1}
+            return dict(empty_fail, generated_paths=[])
         lines = [ln for ln in (st or "").splitlines() if ln.strip()]
         untracked = 0
         modified = 0
+        generated = 0
+        generated_paths: list[str] = []
+        dirty = 0
         for ln in lines:
-            # porcelain v1: XY PATH — ?? = untracked
+            # porcelain v1: XY PATH — ?? = untracked, !! = ignored
             if ln.startswith("??") or ln.startswith("!!"):
                 untracked += 1
+                path = ln[2:].strip()
+                if _is_generated_untracked(path):
+                    generated += 1
+                    generated_paths.append(path)
+                else:
+                    dirty += 1
             else:
-                modified += 1
+                paths = _porcelain_paths(ln)
+                if paths and all(_is_generated_untracked(p) for p in paths):
+                    # tracked 生成物修改：checkpoint 必剥离（reset/checkout），
+                    # 不可提交 → 与 untracked 生成物同口径，不计 dirty。
+                    generated += 1
+                    generated_paths.extend(paths)
+                else:
+                    modified += 1
+                    dirty += 1
         return {
-            "dirty_count": len(lines),
+            "dirty_count": dirty,
             "untracked_count": untracked,
             "modified_count": modified,
+            "generated_untracked": generated,
+            "generated_paths": generated_paths,
         }
     except Exception as e:
         log.warning("worktree_dirty_counts_failed", error=str(e))
-        return {"dirty_count": 1, "untracked_count": 0, "modified_count": 1}
+        return dict(empty_fail, generated_paths=[])
 
 
 async def effective_delivery(
@@ -263,6 +336,8 @@ async def effective_delivery(
         "dirty_count": dirty["dirty_count"],
         "untracked_count": dirty["untracked_count"],
         "modified_count": dirty["modified_count"],
+        "generated_untracked": dirty.get("generated_untracked", 0),
+        "generated_paths": list(dirty.get("generated_paths", [])),
         "has_effective_output": has_output,
     }
 

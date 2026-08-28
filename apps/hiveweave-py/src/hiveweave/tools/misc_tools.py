@@ -1219,9 +1219,16 @@ async def git_worktree_checkpoint_tool(
     message = params.message or "checkpoint"
     result = await gwt.checkpoint(workspace_path, short_id, str(message))
     if result.get("success"):
-        return ToolResult.ok(
-            f"Checkpoint saved: {result.get('commit', result.get('hash', 'unknown'))}"
-        )
+        # T1.2: message 必须一并透出（剥离说明 / 忽略文件警告都在里面）——
+        # 只回 hash 的话 service 层写的说明 Agent 一个字也看不到。
+        parts = [
+            f"Checkpoint saved: "
+            f"{result.get('commit', result.get('hash', 'unknown'))}"
+        ]
+        result_message = (result.get("message") or "").strip()
+        if result_message:
+            parts.append(result_message)
+        return ToolResult.ok("\n".join(parts))
     return ToolResult.err(result.get("message", "Failed to checkpoint"))
 
 
