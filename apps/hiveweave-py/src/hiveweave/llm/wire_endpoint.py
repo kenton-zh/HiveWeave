@@ -98,6 +98,24 @@ def extract_nonstream_text(data: dict) -> str:
             text = _content_to_text(msg.get("content"))
             if text:
                 return text
+            # Loose fallback: some providers emit content parts with no `type`
+            # field, which the strict _content_to_text above skips entirely.
+            raw = msg.get("content")
+            if isinstance(raw, list):
+                bits = [
+                    str(part.get("text"))
+                    for part in raw
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                ]
+                if bits and "".join(bits).strip():
+                    return "".join(bits)
+            # NOTE: 刻意不回退 reasoning_content / reasoning / thinking ——
+            # reasoning 不是可见内容通道。compactor 的 length 守卫依赖
+            # 「content 空 = 失败 → 重试」（test_compaction_hardening）：
+            # 若把 reasoning 当文本返回，reasoning 模型吃光输出预算时会把
+            # "thinking..." 存成团队摘要（全量回归实测复现）。vision 版有
+            # 此回退，但 wire 版是 compactor 的解析器，必须保持该契约 ——
+            # 这是与 vision 的**有意差异**，不是待合并的缺口。
     texts = _responses_output_text(data.get("output"))
     if not texts:
         nested = data.get("response")
@@ -105,7 +123,11 @@ def extract_nonstream_text(data: dict) -> str:
             texts = _responses_output_text(nested.get("output"))
     if texts:
         return texts
-    blocks = data.get("content") or []
+    blocks = data.get("content")
+    # Plain-string content (mirrors services/vision); Anthropic-style block
+    # lists are handled just below.
+    if isinstance(blocks, str) and blocks.strip():
+        return blocks
     if isinstance(blocks, list):
         parts: list[str] = []
         for block in blocks:

@@ -78,3 +78,54 @@ def test_extract_responses_output_text():
         }],
     }
     assert extract_nonstream_text(data) == "OK"
+
+
+def test_extract_does_not_fall_back_to_reasoning_when_content_empty():
+    """T2.3 修订：reasoning 字段**不**作为文本回退（与 vision 的有意差异）。
+
+    reasoning 不是可见内容通道。compactor 的 length 守卫依赖「content 空 =
+    失败 → 重试」（test_compaction_hardening）：若把 reasoning 当文本返回，
+    reasoning 模型吃光输出预算时会把 "thinking..." 存成团队摘要（全量回归
+    实测复现）。此测试钉住「不回退」，防止未来又被当缺口补回来。
+    """
+    data = {
+        "choices": [{
+            "message": {"content": "", "reasoning_content": "step by step"},
+        }],
+    }
+    assert extract_nonstream_text(data) == ""
+
+
+def test_extract_content_parts_without_type_field():
+    """services/vision joins any part carrying `text`, type field or not.
+
+    _content_to_text is strict (`type == "text"`), so the shared extractor
+    needs this loose pass to stay a superset of the vision copy.
+    """
+    data = {
+        "choices": [{
+            "message": {"content": [{"text": "hello "}, {"text": "world"}]},
+        }],
+    }
+    assert extract_nonstream_text(data) == "hello world"
+
+
+def test_extract_top_level_string_content():
+    """services/vision accepts a plain-string `content`; the shared extractor
+    must too, or switching callers over regresses that shape to empty."""
+    assert extract_nonstream_text({"content": "hi"}) == "hi"
+
+
+def test_agent_uses_shared_extractor_not_vision_copy():
+    """P0-6 regression guard.
+
+    agents/agent.py imported ``extract_nonstream_text`` from services/vision,
+    which predates Responses API support — every request_code_audit call
+    parsed to an empty string and soft-failed (6/6 in TEST_DSH_35).
+    """
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "hiveweave" / "agents" / "agent.py"
+    text = src.read_text(encoding="utf-8")
+    assert "from hiveweave.services.vision import extract_nonstream_text" not in text
+    assert "from hiveweave.llm.wire_endpoint import extract_nonstream_text" in text

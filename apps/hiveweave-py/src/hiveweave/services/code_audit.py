@@ -592,6 +592,19 @@ async def _invoke_audit_llm(
         log.warning("code_audit.llm_failed", agent_id=agent_id, error=str(exc))
         return None, {"audited": False, "reason": "llm_failed"}
     if not text:
+        # Empty text is as fatal as a raised exception, but was previously
+        # swallowed with no log at all — the 6/6 llm_failed in TEST_DSH_35
+        # came through this branch with an empty `error` field.
+        # Reason stays "llm_failed": _SOFT_FAIL_ATTEMPT_REASONS (:64) is a
+        # whitelist and drives the non-blocking wording at :136/:203/:210.
+        log.warning(
+            "code_audit.empty_text",
+            agent_id=agent_id,
+            project_id=project_id,
+            provider=(chosen or {}).get("provider"),
+            model_id=(chosen or {}).get("model_id"),
+            source=source,
+        )
         return None, {"audited": False, "reason": "llm_failed"}
     return text, {
         "audit_model_id": (chosen or {}).get("model_id"),

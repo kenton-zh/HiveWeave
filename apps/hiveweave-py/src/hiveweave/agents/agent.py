@@ -219,8 +219,28 @@ async def _review_llm_post_with_retry(
                             raise classified from exc
                         raise
             data = resp.json()
-            from hiveweave.services.vision import extract_nonstream_text
-            return extract_nonstream_text(data) if isinstance(data, dict) else ""
+            # Use the shared extractor: it understands Chat, Responses and
+            # Anthropic shapes. The services/vision copy predates Responses
+            # API support (audit P0-6: 6/6 request_code_audit llm_failed).
+            from hiveweave.llm.wire_endpoint import extract_nonstream_text
+            text = extract_nonstream_text(data) if isinstance(data, dict) else ""
+            if text:
+                return text
+            # Review 回调专属的 reasoning 回退：审查结论可能被 reasoning 模型
+            # 写进 reasoning_content（test_review_llm_callback_retry 钉住）。
+            # 共享解析器刻意不做这一步 —— compactor 的 length 守卫依赖
+            # 「content 空 = 失败」（见 wire_endpoint.extract_nonstream_text
+            # 的 NOTE），两个消费方语义相反，回退必须留在消费方。
+            if isinstance(data, dict):
+                choices = data.get("choices") or []
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                    msg = choices[0].get("message")
+                    if isinstance(msg, dict):
+                        for key in ("reasoning_content", "reasoning", "thinking"):
+                            fallback = msg.get(key)
+                            if isinstance(fallback, str) and fallback.strip():
+                                return fallback
+            return text
         except RetryableError as exc:
             last_exc = exc
             if attempt >= max_retries:
