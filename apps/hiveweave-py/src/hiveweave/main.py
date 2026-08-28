@@ -19,6 +19,7 @@ Shutdown sequence:
 4. Close Meta DB
 """
 
+import asyncio
 import logging
 import os
 import sys
@@ -233,6 +234,24 @@ async def lifespan(app: FastAPI):
         init_process_protection()
     except Exception as e:
         log.warning("command_guard_init_failed", error=str(e))
+
+    # 0b. 宿主环境探测（platform-issue-remediation Phase 0：T3.2/T3.3 前置）。
+    #    启动时把「这台宿主能做什么」探成不可变结果；单条探测失败不炸启动
+    #    （fail-closed 落在消费方 get_capability，不在这里）。
+    try:
+        from hiveweave.services.host_env import (
+            register_builtin_probes,
+            run_startup_probes,
+        )
+
+        register_builtin_probes()
+        startup_probes = await asyncio.to_thread(run_startup_probes)
+        log.info(
+            "host_env_probed",
+            ok=sorted(startup_probes),
+        )
+    except Exception as e:
+        log.warning("host_env_probe_failed", error=str(e))
 
     # 1. Init Meta DB
     # Security/Fail-fast: Meta DB 是整个系统的基石 — 路由表、projects、llm_models
