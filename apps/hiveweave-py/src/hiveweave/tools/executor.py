@@ -792,7 +792,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "aliases": ["waiting_on"],
                 "description": (
-                    "Required for waiting/blocked. kind is the ref type only. "
+                    "Required for waiting/blocked — omitting it makes "
+                    "commit_turn fail with WAITING_ON_REQUIRED / "
+                    "BLOCKED_WAITING_ON_REQUIRED (hard gate, not a warning). "
+                    "kind is the ref type only. "
                     "agent = person's decision (ask_agent first; "
                     "WAIT_WITHOUT_ASK still hard; ref = 花名 or A100); "
                     "task = their work (copy the entire task id from the "

@@ -889,6 +889,7 @@ async def git_worktree_merge_tool(
                 merged_branch=branch,
                 merged_files=files if isinstance(files, list) else None,
                 merge_commit=result.get("hash"),
+                target_branch=target_branch,
             )
         except Exception as e:
             log.warning("verify_nudge_after_merge_failed", error=str(e))

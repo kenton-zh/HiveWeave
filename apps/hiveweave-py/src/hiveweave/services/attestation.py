@@ -1288,6 +1288,19 @@ def required_attestation_kinds(policy_id: str) -> frozenset[str] | None:
     return POLICY_REQUIRED_KINDS[policy_id]
 
 
+def policy_required_kinds_label(policy_id: str) -> str:
+    """T4.3: policy → 人可读的「提交时所需证据 kind」清单标签。
+
+    供 ``get_tasks`` / ``get_platform_state`` 每行透出（``evidence=``），
+    把 submitGate 契约前置到任务列表可见 —— 而不是等提交被拒才看到。
+    soft policy（无 kind 要求）返回空串（行上不显示）。
+    """
+    kinds = required_attestation_kinds(policy_id or "")
+    if kinds is None:
+        return ""
+    return ",".join(sorted(kinds))
+
+
 # ── P0-2: Reviewer-side execution evidence ──────────────────────────────
 # The submitter's attestation proves THEY ran tests. The reviewer must
 # ALSO execute independently — "12-second approve" without running a single

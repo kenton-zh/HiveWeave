@@ -134,11 +134,19 @@ async def _stamp_merge_fact_on_parent_tasks(
     merged_by: str,
     merge_commit: str | None,
     merged_files: list[str] | None = None,
+    target_branch: str | None = None,
 ) -> None:
-    """Persist merge machine facts on parent tasks after a real merge."""
+    """Persist merge machine facts on parent tasks after a real merge.
+
+    T4.4: 每个 parent task 同步落一条 ``task.merged`` 事件（此前只有裸
+    ``UPDATE tasks SET evidence``，零事件零通知 —— 下游只能靠反复跑
+    「核验主分支落地状态」的 run 确认，等待—超时—重建循环的根源之一）。
+    回执内容：commit hash + 涉及文件 + 目标分支。
+    """
     import time
 
     from hiveweave.services.task import _execute
+    from hiveweave.services.tasks.db import insert_task_event
 
     now_ms = int(time.time() * 1000)
     for t in tasks:
@@ -176,6 +184,30 @@ async def _stamp_merge_fact_on_parent_tasks(
             "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
             [json.dumps(ev), now_ms, tid],
         )
+        # T4.4: 事件 + lobby publish（relay 依 event_type 转 inbox）。
+        try:
+            await insert_task_event(
+                project_id,
+                str(tid),
+                "task.merged",
+                from_status=None,
+                to_status=None,
+                actor_id=str(merged_by) if merged_by else None,
+                payload={
+                    "merge_commit": str(merge_commit or ""),
+                    "files": list(merged_files or [])[:20],
+                    "files_total": len(merged_files or []),
+                    "target_branch": str(target_branch or "main"),
+                },
+                now_ms=now_ms,
+            )
+        except Exception as e:
+            log.warning(
+                "task_merged_event_failed",
+                project_id=project_id,
+                task_id=str(tid)[:12],
+                error=str(e),
+            )
 
 
 async def nudge_verify_tasks_after_merge(
@@ -187,6 +219,7 @@ async def nudge_verify_tasks_after_merge(
     merged_branch: str | None = None,
     merged_files: list[str] | None = None,
     merge_commit: str | None = None,
+    target_branch: str | None = None,
 ) -> int:
     """After successful merge: stamp merge facts, then nudge existing VERIFY.
 
@@ -224,6 +257,7 @@ async def nudge_verify_tasks_after_merge(
                         merged_by=from_agent_id,
                         merge_commit=merge_commit,
                         merged_files=merged_files,
+                        target_branch=target_branch,
                     )
                 except Exception as stamp_err:
                     log.warning(

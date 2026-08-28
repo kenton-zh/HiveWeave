@@ -260,6 +260,13 @@ class TaskEventRelay:
             # Creator knows verification began
             if creator:
                 recipients.append(creator)
+        elif event_type == "task.merged":
+            # T4.4: MERGE_LANDED 回执 —— assignee（工作已落地，别再核验
+            # 主分支状态）+ creator（等待闭环）。
+            if assignee:
+                recipients.append(assignee)
+            if creator and creator not in recipients:
+                recipients.append(creator)
 
         # Don't notify the actor themselves
         if actor_id and actor_id in recipients:
@@ -301,6 +308,11 @@ class TaskEventRelay:
                 "dependencies / waiting contracts to unblock."
             ),
             "task.verifying": f"[TASK VERIFYING] {title} ({short_id}) verification started.",
+            # T4.4: 首句不带分支名 —— 分支在下方按 payload 补（非 main 目标也一致）
+            "task.merged": (
+                f"[MERGE LANDED] {title} ({short_id}) merge receipt — no need "
+                "to re-verify landing state on the target branch."
+            ),
         }
         msg = messages.get(event_type, f"[{event_type}] task {short_id}")
         if event_type == "task.rework":
@@ -313,6 +325,22 @@ class TaskEventRelay:
             fb = (ev or {}).get("review_feedback") if isinstance(ev, dict) else None
             if fb:
                 msg += f" Feedback: {fb}"
+        if event_type == "task.merged":
+            # T4.4 回执正文：commit hash + 涉及文件 + 目标分支
+            commit = str(payload.get("merge_commit") or "")
+            branch = str(payload.get("target_branch") or "main")
+            files = payload.get("files") or []
+            total = payload.get("files_total")
+            files_txt = ", ".join(str(f) for f in files[:12])
+            if commit:
+                msg += f" commit={commit[:12]} target={branch}"
+            if files_txt:
+                msg += f" files: {files_txt}"
+                shown = len(files)
+                if total is not None and int(total) > shown:
+                    msg += f" (+{int(total) - shown} more)"
+                elif total is None and shown > 12:
+                    msg += f" (+{shown - 12} more)"
         return msg
 
     async def _direct_already_sent(

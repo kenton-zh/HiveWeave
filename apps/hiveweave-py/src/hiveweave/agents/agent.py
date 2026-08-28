@@ -1533,24 +1533,24 @@ class Agent:
             self.project_id
         )
 
-        # Goals — only inject when dirty (CEO/user modified since last read).
-        # Saves tokens: unchanged goals skip the ~200-token workbook block.
-        goals = None
+        # Goals — ALWAYS inject (byte-stable per turn).
+        # T4.1（run 首请求零命中根因）：旧「dirty 才注入、注入后清标记」让
+        # 同一 run 第 1 轮带 goals 块、第 2 轮没有 → system 段逐轮变化 →
+        # 前缀缓存从 System 2 起整体失配（TEST_DSH_35：1,994,408 tokens 浪费）。
+        # 改为每轮注入当前内容：内容未变时逐轮字节一致（前缀稳定命中）；
+        # 内容变更时缓存本就该失效。dirty 标记仍按版本记录清掉 —— 它是
+        # agents/trigger.py 后台「目标更新」通知的独立信号，不能停摆。
+        goals = await charter_service.read_goals(self.project_id)
         if charter_service.goals_dirty(self.id, self.project_id):
-            goals = await charter_service.read_goals(self.project_id)
-            if goals:
-                cur_ver = charter_service.get_goals_version(self.project_id)
-                await charter_service.set_agent_goals_version(self.id, cur_ver)
+            cur_ver = charter_service.get_goals_version(self.project_id)
+            await charter_service.set_agent_goals_version(self.id, cur_ver)
 
-        # Org directory — only inject when dirty (org chart changed since last read).
-        # 仿照 goals_dirty: create/dismiss/transfer agent 时 bump version,
-        # agent 首次对话注入一次精简通讯录后清除标记, 避免重复注入浪费 token.
-        org_directory = ""
+        # Org directory — ALWAYS inject (同 T4.1；org_dirty 标记同理保留给
+        # 其既有消费方，注入本身不再受其门控)。
+        org_directory = await self._org.build_org_directory(self.project_id) or ""
         if self._org.org_dirty(self.id, self.project_id):
-            org_directory = await self._org.build_org_directory(self.project_id)
-            if org_directory:
-                cur_org_ver = self._org.get_org_version(self.project_id)
-                await self._org.set_agent_org_version(self.id, cur_org_ver)
+            cur_org_ver = self._org.get_org_version(self.project_id)
+            await self._org.set_agent_org_version(self.id, cur_org_ver)
 
         # Involvement level
         involvement = self.config.get("involvement_level", "medium")

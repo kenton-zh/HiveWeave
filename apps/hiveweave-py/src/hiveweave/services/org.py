@@ -318,7 +318,10 @@ class OrgService:
             return []
         cursor = await conn.execute(
             "SELECT * FROM agents WHERE project_id = ? "
-            "ORDER BY created_at ASC",
+            # T4.1: id 次级排序 —— 同毫秒创建（项目初始化 CEO+HR 并建）时
+            # created_at 并列会落到 SQLite 扫描序兜底，org directory 的
+            # 逐轮字节稳定性（前缀缓存命中前提）不允许这种不确定性。
+            "ORDER BY created_at ASC, id ASC",
             [project_id],
         )
         rows = await cursor.fetchall()

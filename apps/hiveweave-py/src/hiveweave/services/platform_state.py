@@ -135,8 +135,23 @@ def _compact_scope_task(
         "assignee_execution": _live_execution(t.get("assignee_id")),
         "parent_task_id": _slice_id(t.get("parent_task_id")) or None,
         "policy_id": t.get("policy_id"),
+        # T4.3: submitGate 所需证据 kind 前置可见
+        "required_evidence": _policy_required_evidence(t.get("policy_id")),
         "depends_on": _depends_on_compact(t.get("depends_on")),
     }
+
+
+def _policy_required_evidence(policy_id: Any) -> list[str] | None:
+    """T4.3: policy → 排序后的所需证据 kind 清单（soft → None）。"""
+    if not policy_id:
+        return None
+    try:
+        from hiveweave.services.attestation import required_attestation_kinds
+
+        kinds = required_attestation_kinds(str(policy_id))
+        return sorted(kinds) if kinds is not None else None
+    except Exception:
+        return None
 
 
 def _viewer_sees_project_scope(agent_row: dict[str, Any] | None) -> bool:
@@ -873,6 +888,9 @@ def _fmt_ledger_row(row: dict[str, Any]) -> str:
     policy = row.get("policy_id")
     if policy:
         extra += f" policy={policy}"
+    ev = row.get("required_evidence")
+    if ev:
+        extra += f" evidence={','.join(ev)}"
     deps = row.get("depends_on")
     if deps:
         extra += f" depends_on={deps}"

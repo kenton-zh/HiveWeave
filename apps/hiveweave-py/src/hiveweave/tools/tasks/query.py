@@ -70,7 +70,11 @@ async def get_tasks_tool(
             return ToolResult.ok(body, tasks=[])
         lines = [
             "Tip: copy the entire id= string from this listing into "
-            "claim/submit/review/cancel. Do not truncate."
+            "claim/submit/review/cancel. Do not truncate.",
+            # T4.3: evidence= 字段说明（submitGate 所需凭证 kind 前置可见）
+            "evidence= lists the attestation kinds this task's submitGate "
+            "requires — attach matching attestation ids at submit_task; "
+            "soft policies show none.",
         ]
         # Prefetch verification cases for VERIFY visibility (TEST12 dogfood)
         case_by_verify: dict[str, dict] = {}
@@ -294,11 +298,17 @@ async def get_tasks_tool(
             )
         for t in tasks:
             tk = str(t.get("id") or "")
+            # T4.3: submitGate 所需证据 kind 前置可见（契约写了没人看见 →
+            # 3 个 Agent 各踩一遍的修复；软 policy 无要求则不显示）
+            from hiveweave.services.attestation import policy_required_kinds_label
+
+            _ev = policy_required_kinds_label(str(t.get("policy_id") or ""))
             lines.append(
                 f"- [{t.get('status', '?')}] {t.get('title', '?')} "
                 f"(id={tk}, short={tk[:8]}, "
                 f"progress={t.get('progress', 0)}%, "
                 f"assignee={t.get('assignee_id') or 'unassigned'})"
+                + (f" evidence={_ev}" if _ev else "")
             )
             if t.get("verify_in_flight"):
                 _blk = str(t.get("verify_in_flight_id") or "")[:8]
