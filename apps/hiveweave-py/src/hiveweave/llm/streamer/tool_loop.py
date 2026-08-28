@@ -31,9 +31,14 @@ from .constants import (
 )
 from .doom_loop import (
     BLOCKED_STALL_LIMIT,
+    STALL_REASON_BLOCKED,
+    STALL_REASON_NO_PROGRESS,
+    STALL_REASON_READONLY,
+    STALL_REASON_RUNNER_FAILED,
+    STALL_REASON_TOOL_FAILED,
+    TOOL_FAIL_STALL_LIMIT,
+    classify_stall_round,
     doom_loop_limit,
-    round_made_progress,
-    round_was_readonly_only,
 )
 from .types import DeltaCallback, ToolCallCallback
 
@@ -212,6 +217,12 @@ class ToolLoopMixin:
         # 不是模型空转，不累计普通 stall_count；超过 BLOCKED_STALL_LIMIT
         # 仍收口兜底。
         blocked_stall_count = 0
+        # DSH_33: 工具自身执行失败轮独立计数 —— 与 blocked_stall_count 同为
+        # 正交事实位。收口时机不变（限值同 TOOL_LOOP_STALL_LIMIT），但归因
+        # 落到工具层，文案不再说「模型无进展」。
+        tool_fail_stall_count = 0
+        # 触发收口那一轮的归因（供文案 / 返回值 stall_reason）。
+        last_stall_reason: str | None = None
 
         # 连续「arguments 截断」轮计数（TRUNCATED_TOOL_CALL_ROUNDS_LIMIT 兜底）
         truncated_rounds = 0
@@ -873,6 +884,7 @@ class ToolLoopMixin:
                 error_ids: set[str] = set()
                 blocked_ids: set[str] = set()
                 duplicate_ids: set[str] = set()
+                runner_failed = False
                 if on_tool_call is None:
                     log.error("no_tool_executor", agent_id=agent_id)
                     tool_results = [
@@ -881,6 +893,8 @@ class ToolLoopMixin:
                         for tc in tool_calls
                     ]
                     error_ids = {tc["id"] for tc in tool_calls}
+                    # 执行器缺失 = runner 故障，不是工具体报错、更不是模型空转。
+                    runner_failed = True
                 else:
                     tool_results, error_ids, blocked_ids, duplicate_ids, end_turn = (
                         await self._execute_tools(
@@ -936,47 +950,85 @@ class ToolLoopMixin:
                         "end_turn": True,
                     }
 
-                # DESIGN-2: stall counter — no mutating progress → force outer loop
-                # Pure-readonly polling uses a higher limit (dogfood retune).
-                # H3: 护栏拒绝（blocked）≠ 模型空转 —— 全 blocked 轮走独立
-                # blocked_stall_count，不累计普通 stall_count；混有非 blocked
-                # 错误仍按原 stall 逻辑。
-                if round_made_progress(
+                # DESIGN-2: stall counter — no mutating progress → force outer
+                # loop exit. Pure-readonly polling uses a higher limit.
+                # 归因与计数分离（DSH_33）：classify_stall_round 先摘出
+                # 「工具/runner 没跑成」的轮次，再判护栏拒绝 / 只读 / 空转 ——
+                # 顺序不可换（DSH: runner failure outranks denial）。
+                # H3: 护栏拒绝（blocked）≠ 模型空转 —— 走独立
+                # blocked_stall_count；工具执行失败同理走 tool_fail_stall_count。
+                round_reason = classify_stall_round(
                     tool_calls,
                     error_ids=error_ids,
+                    blocked_ids=blocked_ids,
                     duplicate_ids=duplicate_ids,
-                ):
+                )
+                if round_reason == STALL_REASON_TOOL_FAILED and runner_failed:
+                    round_reason = STALL_REASON_RUNNER_FAILED
+                if round_reason is None:
                     stall_count = 0
                     readonly_stall_count = 0
                     blocked_stall_count = 0
+                    tool_fail_stall_count = 0
+                    last_stall_reason = None
                     # TEST21 M4: activity renews soft budget within hard cap
                     soft_deadline = min(
                         time.monotonic() + ACTIVITY_EXTEND_S, hard_deadline
                     )
-                elif round_was_readonly_only(
-                    tool_calls,
-                    error_ids=error_ids,
-                    duplicate_ids=duplicate_ids,
-                ):
+                elif round_reason == STALL_REASON_READONLY:
                     readonly_stall_count += 1
                     stall_count = 0
                     blocked_stall_count = 0
-                elif error_ids and blocked_ids >= error_ids:
+                    tool_fail_stall_count = 0
+                    last_stall_reason = round_reason
+                elif round_reason == STALL_REASON_BLOCKED:
                     # 全部失败都是平台护栏拒绝（blocked）→ 独立计数，
                     # 不给模型判空转（H3）。不清零普通 stall_count：
                     # [error, blocked] 交替轮必须仍能累计到 STALL BREAK
                     # （2026-08-13 审计：清零会让交替序列永不触顶）。
                     blocked_stall_count += 1
+                    last_stall_reason = round_reason
+                elif round_reason in (
+                    STALL_REASON_TOOL_FAILED, STALL_REASON_RUNNER_FAILED
+                ):
+                    # 工具自身执行失败（非护栏拒绝、非模型空转）→ 独立归因位。
+                    # 同时累计 stall_count 保持既有收口时机与交替序列可触顶。
+                    tool_fail_stall_count += 1
+                    stall_count += 1
+                    readonly_stall_count = 0
+                    blocked_stall_count = 0
+                    last_stall_reason = round_reason
                 else:
                     stall_count += 1
                     readonly_stall_count = 0
                     blocked_stall_count = 0
+                    tool_fail_stall_count = 0
+                    last_stall_reason = STALL_REASON_NO_PROGRESS
                 stalled = (
                     stall_count >= TOOL_LOOP_STALL_LIMIT
                     or readonly_stall_count >= TOOL_LOOP_READONLY_STALL_LIMIT
                     or blocked_stall_count >= BLOCKED_STALL_LIMIT
+                    or tool_fail_stall_count >= TOOL_FAIL_STALL_LIMIT
                 )
                 if stalled:
+                    # 收口归因：工具失败优先（DSH 顺序），其次护栏，
+                    # 再退回本轮观测到的原因。
+                    if tool_fail_stall_count >= TOOL_FAIL_STALL_LIMIT:
+                        stall_reason = (
+                            last_stall_reason
+                            if last_stall_reason == STALL_REASON_RUNNER_FAILED
+                            else STALL_REASON_TOOL_FAILED
+                        )
+                    elif (
+                        blocked_stall_count >= BLOCKED_STALL_LIMIT
+                        and stall_count < TOOL_LOOP_STALL_LIMIT
+                        and readonly_stall_count < TOOL_LOOP_READONLY_STALL_LIMIT
+                    ):
+                        stall_reason = STALL_REASON_BLOCKED
+                    elif readonly_stall_count >= TOOL_LOOP_READONLY_STALL_LIMIT:
+                        stall_reason = STALL_REASON_READONLY
+                    else:
+                        stall_reason = last_stall_reason or STALL_REASON_NO_PROGRESS
                     log.warning(
                         "tool_loop_stall",
                         agent_id=agent_id,
@@ -984,6 +1036,8 @@ class ToolLoopMixin:
                         stall_count=stall_count,
                         readonly_stall_count=readonly_stall_count,
                         blocked_stall_count=blocked_stall_count,
+                        tool_fail_stall_count=tool_fail_stall_count,
+                        stall_reason=stall_reason,
                     )
                     try:
                         from hiveweave.services.telemetry import telemetry
@@ -994,15 +1048,31 @@ class ToolLoopMixin:
                                 stall_count,
                                 readonly_stall_count,
                                 blocked_stall_count,
+                                tool_fail_stall_count,
                             ),
                         )
                     except Exception:
                         pass
-                    if (
-                        blocked_stall_count >= BLOCKED_STALL_LIMIT
-                        and stall_count < TOOL_LOOP_STALL_LIMIT
-                        and readonly_stall_count < TOOL_LOOP_READONLY_STALL_LIMIT
+                    if stall_reason in (
+                        STALL_REASON_TOOL_FAILED, STALL_REASON_RUNNER_FAILED
                     ):
+                        # 计数如实：触发闸口可能是普通 stall_count（[无进展,
+                        # 工具失败] 混合序列），此时补报总轮数，避免只写工具
+                        # 失败连续数让模型误判收口时机。
+                        scope = (
+                            f"（最近 {stall_count} 轮均无进展）"
+                            if stall_count > tool_fail_stall_count
+                            else ""
+                        )
+                        break_text = (
+                            f"[STALL BREAK] 连续 {tool_fail_stall_count} 轮工具"
+                            f"调用失败（非模型空转）{scope}—— 工具自身返回了执行"
+                            "失败，不是你没动作。先读失败回执的具体报错：检查工具"
+                            "名与参数用法是否正确、前置条件是否满足；换一种方式或"
+                            "换工具达成同一目标，或用 commit_turn 提交已完成的"
+                            "部分并说明卡点。不要原样重发同一个失败调用。"
+                        )
+                    elif stall_reason == STALL_REASON_BLOCKED:
                         break_text = (
                             f"[STALL BREAK] {blocked_stall_count} consecutive "
                             "tool-loop rounds were refused by platform guards "
@@ -1029,14 +1099,23 @@ class ToolLoopMixin:
                         agent_id, provider, messages, on_delta,
                         reason="stall_break",
                         budget_deadline=hard_deadline,
+                        stall_reason=stall_reason,
                     )
                     final_text = self._strip_placeholder(summary)
                     if not final_text:
-                        final_text = (
-                            "[STALL BREAK] No progress for "
-                            f"{max(stall_count, readonly_stall_count, blocked_stall_count)} rounds — "
-                            "turn ended."
-                        )
+                        if stall_reason in (
+                            STALL_REASON_TOOL_FAILED, STALL_REASON_RUNNER_FAILED
+                        ):
+                            final_text = (
+                                f"[STALL BREAK] 连续 {tool_fail_stall_count} 轮"
+                                "工具调用失败（非模型空转）—— 回合结束。"
+                            )
+                        else:
+                            final_text = (
+                                "[STALL BREAK] No progress for "
+                                f"{max(stall_count, readonly_stall_count, blocked_stall_count)} rounds — "
+                                "turn ended."
+                            )
                     # 本轮 assistant_msg（含 reasoning_content）已在上方
                     # append（line 847），此处只追加 summary 文本，不重复附 thinking。
                     tool_turn_acc.append(
@@ -1052,6 +1131,7 @@ class ToolLoopMixin:
                         "usage": last_usage,
                         "usage_rounds": usage_rounds,
                         "stall_break": True,
+                        "stall_reason": stall_reason,
                     }
 
                 # 连续无文字轮次检测

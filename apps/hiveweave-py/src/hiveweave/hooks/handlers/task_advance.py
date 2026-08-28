@@ -10,6 +10,8 @@ Skip (no false positives):
    or submit; fake-blocked with open claimed tasks was a TEST7 failure mode)
 - higher-priority retrigger already scheduled (gate repair / continue slice)
 - agent called ``defer_task_advance`` (不推进) or wake-cycle defer flag is set
+  (unless the same-reason defer breaker tripped — see
+  ``turn_session.DEFER_REASON_STREAK_LIMIT``)
 - every remaining obligation was advanced this turn
 
 Writing code without ledger movement (submit / update_progress / …) still
@@ -181,7 +183,8 @@ def build_task_advance_hint(obligations: list[dict]) -> str:
         "本轮结束时你仍有可行动任务，但没有推动它们。"
         "请用工具推进账本，或显式 commit_turn(phase=waiting|blocked)+waiting_on。"
         "若此刻确实无法推进：调用 defer_task_advance(reason=…)（不推进）——"
-        "之后不会再循环提醒，直到你被再次唤醒。",
+        "之后不会再循环提醒，直到你被再次唤醒。"
+        "注意：同一理由连发会触发断路器，届时 defer 被拒，需上报上级。",
         "可先 `read_skill(\"task-advance\")`。",
     ]
     for t in obligations[:8]:
@@ -195,8 +198,10 @@ def build_task_advance_hint(obligations: list[dict]) -> str:
             if status == "approved":
                 if _task_merge_already_recorded(t):
                     next_step = (
-                        "任务已合并（evidence 已记录），停在 approved 等待平台收口；"
-                        "无需再 merge，可继续推进其他义务"
+                        "任务已合并（evidence 已记录），无需再 merge；"
+                        "平台每约 2 分钟扫一轮 approved，最后一次变更满 "
+                        "10 分钟宽限后自动收 closed——期间请继续推进其他义务，"
+                        "不要反复 defer 同一条理由"
                     )
                 else:
                     next_step = (
@@ -237,13 +242,18 @@ def decide_task_advance_nudge(
     deferred: bool = False,
     reminder_count: int = 0,
     reminder_max: int = 2,
+    defer_breaker_tripped: bool = False,
 ) -> tuple[str | None, str]:
     """Return (hint_or_None, skip_reason). skip_reason is '' when nudging."""
     if gate_repairing:
         return None, "gate_repairing"
     if continue_slice:
         return None, "continue_slice"
-    if deferred or called_defer_task_advance(tool_calls):
+    # P0-4: same-reason defer streak hit the limit — the defer no longer buys
+    # silence (see turn_session.DEFER_REASON_STREAK_LIMIT).
+    if not defer_breaker_tripped and (
+        deferred or called_defer_task_advance(tool_calls)
+    ):
         return None, "deferred"
     if not open_obligations:
         return None, "no_obligations"
@@ -270,8 +280,19 @@ async def on_agent_turn_after(
     output: MutableMapping[str, Any],
 ) -> None:
     """Mutate output with optional ``hint`` / ``skip_reason``."""
+    from hiveweave.services.turn_session import (
+        clear_defer_reason_streak,
+        defer_breaker_tripped,
+    )
+
     advanced_raw = input.get("tasks_advanced") or []
     advanced = {str(x) for x in advanced_raw} if advanced_raw else set()
+    agent_id = input.get("agent_id")
+    # Real ledger movement ends the "same excuse forever" streak.
+    moved = advanced or task_ids_advanced(input.get("tool_calls"))
+    if agent_id and moved:
+        clear_defer_reason_streak(str(agent_id))
+    tripped = bool(agent_id) and defer_breaker_tripped(str(agent_id))
     hint, skip = decide_task_advance_nudge(
         open_obligations=list(input.get("open_obligations") or []),
         tool_calls=input.get("tool_calls"),
@@ -283,6 +304,7 @@ async def on_agent_turn_after(
         deferred=bool(input.get("deferred")),
         reminder_count=int(input.get("reminder_count") or 0),
         reminder_max=int(input.get("reminder_max") or 2),
+        defer_breaker_tripped=tripped,
     )
     output["skip_reason"] = skip
     if hint:

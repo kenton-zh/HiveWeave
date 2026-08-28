@@ -500,6 +500,29 @@ async def _fetch_project_meta(project_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+async def _resolve_seed_language(project_id: str) -> str:
+    """项目级 language（真相源 = per-project DB project_meta）。
+
+    与 hire 路径（tools/org_tools.hire_agent）同口径：读不到时回落 "zh"。
+    此前 seed 不读该列，CEO/HR 落 schema 默认 'en'，而 hire 出来的下属是
+    'zh' —— 同一项目内语言分裂（A267/A268 vs A269–A274 实证）。
+    """
+    try:
+        conn = await project_db.get_project_db_by_project_id(project_id)
+        cursor = await conn.execute(
+            "SELECT language FROM project_meta WHERE project_id = ?",
+            [project_id],
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row and row["language"]:
+            return str(row["language"])
+    except Exception as e:
+        log.warning("seed_read_language_failed",
+                    project_id=project_id, error=str(e))
+    return "zh"
+
+
 async def _seed_default_agents(project_id: str) -> list[str]:
     """新项目自动创建 CEO + HR 两个初始角色（幂等）。
 
@@ -599,6 +622,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
         return [existing[0]["id"]] if existing else []
 
     created_ids: list[str] = []
+    seed_language = await _resolve_seed_language(project_id)
     try:
         ceo = await org.create_agent(
             {
@@ -610,6 +634,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "permission_type": "coordinator",
                 "status": "active",
                 "model_id": default_model_id,
+                "language": seed_language,
                 "skills": ["spec-driven-development", "planning-and-task-breakdown", "context-engineering", "task-advance"],
             },
             bootstrap=True,
@@ -628,6 +653,7 @@ async def _seed_default_agents(project_id: str) -> list[str]:
                 "status": "active",
                 "parent_id": ceo_id,
                 "model_id": exec_model_id,
+                "language": seed_language,
                 "skills": ["interview-me", "documentation-and-adrs", "task-advance"],
             },
             bootstrap=True,
@@ -927,17 +953,11 @@ async def create_project(body: ProjectCreate) -> dict:
     except Exception:
         pass
 
-    # 自动创建默认 agent
-    import sys
-    sys.stderr.write(f"[CREATE] calling _seed_default_agents for project={project_id}\n")
-    sys.stderr.flush()
-    agent_ids = await _seed_default_agents(project_id)
-    sys.stderr.write(f"[CREATE] _seed_default_agents returned {len(agent_ids)} agents\n")
-    sys.stderr.flush()
-
     # 写入 per-project 元数据到 project_meta 表
     # (description, org_paradigm, charter_json, language 等字段从 Meta DB 迁移到 per-project DB)
     # 收养路径：project_meta 已存在（含旧 charter/language/game_time 进度）— INSERT OR IGNORE 保留原样
+    # 必须先于 _seed_default_agents：CEO/HR 的 language 继承读的就是这行
+    # （此前顺序颠倒 → seed 读不到 → 落 schema 默认 'en'，与 hire 路径的 'zh' 分裂）。
     try:
         conn = await project_db.ensure_project_db(str(ws))
         await conn.execute(
@@ -957,6 +977,9 @@ async def create_project(body: ProjectCreate) -> dict:
         await conn.commit()
     except Exception as e:
         log.warning("create_project_meta_failed", project_id=project_id, error=str(e))
+
+    # 自动创建默认 agent
+    agent_ids = await _seed_default_agents(project_id)
 
     # 启动 agent + game time（C3/C4 fix: 新项目创建后立即启动运行时资源）
     # 同时设置 is_started=1 — 创建项目即"上班"，后端重启后自动恢复

@@ -169,8 +169,9 @@ async def test_unbounded_bash_does_not_clamp_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "acl_sandbox", False)
     captured: dict = {}
 
-    async def fake_native(command, cwd, timeout_s):
+    async def fake_native(command, cwd, timeout_s, *, dialect="bash"):
         captured["timeout_s"] = timeout_s
+        captured["dialect"] = dialect
         return {
             "output": "ok",
             "stdout": "ok",

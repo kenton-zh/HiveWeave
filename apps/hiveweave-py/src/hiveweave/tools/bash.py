@@ -530,9 +530,11 @@ async def _run_sandboxed(
     entry: str,
     long_running: bool = False,
     env_extra: dict[str, str] | None = None,
+    dialect: str = "bash",
 ) -> dict[str, Any] | None:
     """沙箱 on 时受限执行；返回 None = 沙箱未启用（调用方回退 native）。"""
     from hiveweave.services.acl_sandbox.integration import (
+        PwshUnavailableError,
         acl_sandbox_active,
         build_confined_argv,
         resolve_project_root,
@@ -541,9 +543,14 @@ async def _run_sandboxed(
 
     if not acl_sandbox_active():
         return None
+    try:
+        argv = build_confined_argv(command, dialect=dialect)
+    except PwshUnavailableError as exc:
+        return {"output": "", "stdout": "", "stderr": "",
+                "exit_code": None, "timed_out": False, "error": str(exc)}
     project_root = await resolve_project_root(project_id)
     result = await spawn_confined(
-        argv=build_confined_argv(command),
+        argv=argv,
         workdir=cwd,
         workspace_path=workspace_path,
         agent_id=agent_id or "unknown",
@@ -955,29 +962,244 @@ def _map_unix_to_pwsh(cmd: str) -> str:
     与 ``_map_unix_to_cmd``（cmd 兜底路径）不同，这里处理**带 unix flag** 的
     常见命令（pwsh 别名无 POSIX flag 语义，`ls -la` 会报参数错误）——只匹配
     明确模式，不误伤 pwsh 本就兼容的调用。
+
+    只翻译能 1:1 对上的形态；对不上的一律留给 ``detect_untranslated_unix``
+    出可操作错误，**不得**猜译（`grep -rn P dir` 曾被译成
+    `Select-String -Pattern -rn "P" dir`，把方言失败变成静默错译）。
     """
     import re
 
-    # ls -la / ls -l / ls -a → Get-ChildItem -Force（近似列出全部）
-    cmd = re.sub(r'\bls\s+(-la|-l|--long|-al)\b', 'Get-ChildItem -Force', cmd)
-    cmd = re.sub(r'\bls\s+-a\b', 'Get-ChildItem -Force', cmd)
-    # head -N file → Get-Content file -TotalCount N
+    # ls -la / ls -l / ls -a / ls -lh … → Get-ChildItem -Force
     cmd = re.sub(
-        r'\bhead\s+-(\d+)\s+([^\s|;&]+)',
+        r'\bls\s+-(?:l|a|h|la|al|lh|hl|lah|alh)\b(?=\s|$)',
+        'Get-ChildItem -Force', cmd)
+    cmd = re.sub(r'\bls\s+--long\b(?=\s|$)', 'Get-ChildItem -Force', cmd)
+    # head -N file / head -n N file → Get-Content file -TotalCount N
+    cmd = re.sub(
+        r'\bhead\s+-n\s*(\d+)\s+([^\s|;&<>]+)',
         r"Get-Content \2 -TotalCount \1", cmd)
-    # tail -N file → Get-Content file -Tail N
     cmd = re.sub(
-        r'\btail\s+-(\d+)\s+([^\s|;&]+)',
+        r'\bhead\s+-(\d+)\s+([^\s|;&<>]+)',
+        r"Get-Content \2 -TotalCount \1", cmd)
+    # tail -N file / tail -n N file → Get-Content file -Tail N
+    cmd = re.sub(
+        r'\btail\s+-n\s*(\d+)\s+([^\s|;&<>]+)',
         r"Get-Content \2 -Tail \1", cmd)
+    cmd = re.sub(
+        r'\btail\s+-(\d+)\s+([^\s|;&<>]+)',
+        r"Get-Content \2 -Tail \1", cmd)
+    # wc -l file → (Get-Content file).Count
+    cmd = re.sub(
+        r'\bwc\s+-l\s+([^\s|;&<>]+)',
+        r"(Get-Content \1).Count", cmd)
     # mkdir -p dir → New-Item -ItemType Directory -Force -Path dir
     cmd = re.sub(
-        r'\bmkdir\s+-p\s+([^\s|;&]+)',
+        r'\bmkdir\s+-p\s+([^\s|;&<>]+)',
         r"New-Item -ItemType Directory -Force -Path \1", cmd)
-    # grep pattern file → Select-String -Pattern pattern file
+    # grep -r/-rn/-nr PATTERN DIR → Get-ChildItem -Recurse | Select-String
+    # （Select-String 自身无 -Recurse —— 递归必须由 Get-ChildItem 供给）
     cmd = re.sub(
-        r'\bgrep\s+([^\s|;&]+)\s+([^\s|;&]+)',
-        r"Select-String -Pattern \1 \2", cmd)
+        r'\bgrep\s+-(?:rn|nr|r|R|rni|rin)\s+([^\s|;&<>]+)\s+([^\s|;&<>]+)',
+        r"Get-ChildItem -Recurse -File \2 | "
+        r"Select-String -Pattern \1", cmd)
+    # grep -n/-i PATTERN FILE → Select-String -Pattern P -Path F
+    # （行号/大小写不敏感是 Select-String 默认行为，flag 直接吸收）
+    cmd = re.sub(
+        r'\bgrep\s+-(?:n|i|in|ni)\s+([^\s|;&<>]+)\s+([^\s|;&<>]+)',
+        r"Select-String -Pattern \1 -Path \2", cmd)
+    # grep PATTERN FILE（无 flag）→ Select-String -Pattern P -Path F
+    cmd = re.sub(
+        r'\bgrep\s+(?!-)([^\s|;&<>]+)\s+(?!-)([^\s|;&<>]+)',
+        r"Select-String -Pattern \1 -Path \2", cmd)
+    # 管道下游的 grep（cmd | grep P）→ Select-String P（不需要 -Path）
+    cmd = re.sub(
+        r'\bgrep\s+(?:-(?:n|i|in|ni)\s+)?(?!-)([^\s|;&<>]+)(?=\s*(?:\||;|$))',
+        r"Select-String -Pattern \1", cmd)
     return cmd
+
+
+# ── unix-only 命令 fast-fail（DSH_33 P0：126 次方言失败 41.9%）─────
+# 翻译表只覆盖能 1:1 对上的形态。剩下的**必须**在这里拦住并给等价写法 ——
+# 直接丢给 pwsh 只会得到「不是内部或外部命令」，模型无法从中反推方言，
+# 于是同一条命令换着 flag 重试到跨 422 分钟不收敛。
+#
+# 每条建议都在 pwsh 7.6 实测过（见 commit 说明）；不确定的不写建议，
+# 只报「pwsh 下不可用」并指向 pwsh 工具。
+
+# 类 1：pwsh 里根本不存在的命令（PATH 上无同名 exe）。
+_UNIX_ONLY_HINTS: dict[str, str] = {
+    "sed": "逐行替换用 (Get-Content f) -replace 'A','B' | Set-Content f；"
+           "取行区间用 Get-Content f | Select-Object -Skip N -First M",
+    "awk": "取列用 Get-Content f | ForEach-Object { ($_ -split '\\s+')[0] }",
+    "wc": "行数用 (Get-Content f).Count",
+    "xargs": "用管道 + ForEach-Object：Get-ChildItem … | ForEach-Object { … $_ }",
+    "head": "Get-Content f -TotalCount N",
+    "tail": "Get-Content f -Tail N（跟随写入加 -Wait）",
+    "grep": "Select-String -Pattern P -Path f；递归 "
+            "Get-ChildItem -Recurse -File dir | Select-String -Pattern P",
+    "touch": "New-Item -ItemType File -Force -Path f",
+    "which": "Get-Command <名> | Select-Object -ExpandProperty Source",
+    "cut": "($line -split ',')[0] 或 Import-Csv",
+    "tr": "-replace 运算符：$s -replace 'a','b'",
+    "uniq": "Select-Object -Unique 或 Sort-Object -Unique",
+    "du": "(Get-ChildItem -Recurse -File . | Measure-Object Length -Sum).Sum",
+    "df": "Get-PSDrive -PSProvider FileSystem",
+    "basename": "Split-Path -Leaf <路径>",
+    "dirname": "Split-Path -Parent <路径>",
+    "realpath": "Resolve-Path <路径>",
+    "readlink": "Resolve-Path <路径>",
+    "chmod": "Windows 无 POSIX 权限位；用 icacls（通常不需要）",
+    "chown": "Windows 无 POSIX 属主；用 icacls（通常不需要）",
+    "printf": "Write-Output 或 -f 格式化：'{0}' -f $v",
+    "stat": "Get-Item f | Format-List *",
+    "seq": "范围运算符：1..3",
+    "ln": "New-Item -ItemType SymbolicLink -Path L -Target T",
+    "nl": "Get-Content f | ForEach-Object { \"$($_.ReadCount): $_\" }",
+    "less": "Get-Content f（分页无必要，输出已截断）",
+    "env": "Get-ChildItem Env:",
+    "md5sum": "Get-FileHash f -Algorithm MD5",
+    "sha256sum": "Get-FileHash f -Algorithm SHA256",
+    "mktemp": "New-TemporaryFile",
+    "pgrep": "Get-Process -Name <名>",
+    "pkill": "Stop-Process -Name <名>",
+    "sudo": "Windows 无 sudo；平台已按需授权，去掉 sudo 直接跑",
+    "man": "Get-Help <命令>",
+    "dos2unix": "(Get-Content f -Raw) -replace \"`r`n\",\"`n\" | "
+                "Set-Content f -NoNewline",
+}
+
+# 类 2：pwsh 有同名别名/同名 exe，但 unix flag 语义对不上 —— 会报参数错误
+# 或（更糟）静默做别的事。仅当带 unix 短 flag 时才拦。
+_ALIAS_FLAG_HINTS: dict[str, str] = {
+    "ls": "Get-ChildItem -Force（-l/-h 无对应；要长格式用 "
+          "Format-Table 或 Select-Object）",
+    "cat": "Get-Content f（-n 无对应，行号用 "
+           "ForEach-Object { \"$($_.ReadCount): $_\" }）",
+    "rm": "Remove-Item -Recurse -Force <路径>（-rf 会被当成 -Filter 歧义拒绝）",
+    "cp": "Copy-Item -Recurse -Force <源> <目标>",
+    "mv": "Move-Item -Force <源> <目标>",
+    "echo": "Write-Output（-e 会被当成 -ErrorAction 歧义拒绝；"
+            "换行用双引号里的 `n）",
+    "sort": "Sort-Object -Unique（system32\\sort.exe 不认 -u，会静默排错）",
+    "find": "Get-ChildItem -Recurse -File -Filter '*.py'"
+            "（system32\\find.exe 是查字符串，不是查文件）",
+    "kill": "Stop-Process -Id <pid> -Force",
+    "ps": "Get-Process（ps aux 会把 aux 当进程名）",
+    "tee": "Tee-Object -FilePath f（-a 用 -Append）",
+    "diff": "Compare-Object (Get-Content a) (Get-Content b)",
+}
+
+# unix 短 flag：`-l` / `-rf` / `-9`（kill -9）。长名（`-Force`/`-Recurse`）不算
+# —— 那是 pwsh 自己的参数；`--long` 也不算（pwsh cmdlet 不用双横线）。
+_UNIX_SHORT_FLAG_RE = re.compile(r"(?<![\w-])-(?!-)(?:[A-Za-z]{1,4}|\d+)(?=\s|$)")
+
+# 类 2 里少数命令的 unix 用法不带 flag（`ps aux`），靠首参数字面量识别。
+_ALIAS_BARE_ARG_HINTS: dict[str, tuple[frozenset[str], str]] = {
+    "ps": (frozenset({"aux", "ax", "-ef", "auxww"}),
+           "Get-Process（ps aux 会把 aux 当进程名）"),
+}
+
+# 命令段分隔符：; | && || 换行。段首 token 才算「命令」。引号内的分隔符
+# **不**分段 —— 否则 `git commit -m "fix: parse; sed edge case"` 会被切出
+# 一个假的 `sed` 段而误拦（审计实测）。
+
+
+def _split_command_segments(command: str) -> list[str]:
+    """按未被引号包裹的 ; | && || 换行 切分命令段。"""
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if command.startswith("&&", i) or command.startswith("||", i):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in (";", "|", "\n"):
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return segments
+
+
+def _segment_head_token(segment: str) -> str:
+    """取命令段的首个 token（跳过 VAR=val 前缀与前导空白/括号）。"""
+    seg = segment.strip().lstrip("(").strip()
+    while True:
+        m = re.match(r"^[A-Za-z_][\w]*=\S*\s+", seg)
+        if not m:
+            break
+        seg = seg[m.end():]
+    m = re.match(r"^[\"']?([\w./\\:-]+)", seg)
+    if not m:
+        return ""
+    head = m.group(1)
+    # 去掉路径前缀与 .exe 后缀：/usr/bin/sed → sed
+    head = head.replace("\\", "/").rsplit("/", 1)[-1]
+    if head.lower().endswith(".exe"):
+        head = head[:-4]
+    return head
+
+
+def detect_untranslated_unix(command: str) -> str | None:
+    """残留 unix-only 命令 → 可操作错误文案；干净则 None。
+
+    在 ``_normalize_for_pwsh`` **之后**调用：翻译表已尽力覆盖，此处只处理
+    翻译不了的形态。返回的文案给出实测可用的 pwsh 等价写法 + pwsh 工具指引,
+    把「不是内部或外部命令」的困惑型失败变成一次性可纠正的明确指引。
+    """
+    if not command or not command.strip():
+        return None
+    hits: list[str] = []
+    seen: set[str] = set()
+    for segment in _split_command_segments(command):
+        head = _segment_head_token(segment)
+        if not head or head in seen:
+            continue
+        low = head.lower()
+        hint = _UNIX_ONLY_HINTS.get(low)
+        if hint is None:
+            args = segment.strip()[len(head):]
+            bare = _ALIAS_BARE_ARG_HINTS.get(low)
+            if bare is not None and args.strip().split(" ")[0] in bare[0]:
+                hint = bare[1]
+            elif low in _ALIAS_FLAG_HINTS and _UNIX_SHORT_FLAG_RE.search(args):
+                # 类 2 只在带 unix 短 flag 时才判失败（裸 ls/cat/rm 走 pwsh 别名 OK）
+                hint = _ALIAS_FLAG_HINTS[low]
+            else:
+                continue
+        seen.add(head)
+        hits.append(f"  {head} → {hint}")
+    if not hits:
+        return None
+    return (
+        "Error: unix-only command(s) not available in this shell — "
+        "on Windows the sandbox executes bash via pwsh, and these have no "
+        "POSIX equivalent there (running them yields "
+        "\"not recognized as ... cmdlet\" or wrong results):\n"
+        + "\n".join(hits)
+        + "\n\nRewrite using the pwsh form above, or call the `pwsh` tool "
+        "with PowerShell syntax directly (same permissions as bash). "
+        "Do not retry the same unix command with different flags."
+    )
 
 
 def _normalize_for_pwsh(command: str) -> str:
@@ -1092,15 +1314,31 @@ async def _kill_subprocess(proc) -> None:
         pass
 
 
-async def _run_native(command: str, cwd: str, timeout_s: int | None) -> dict[str, Any]:
+async def _run_native(
+    command: str, cwd: str, timeout_s: int | None, *, dialect: str = "bash"
+) -> dict[str, Any]:
     """Execute command via the OS native shell.
 
     P1 fix(TEST11-R3): Windows 下优先使用 Git Bash（bash -c），
     根治 cmd 不支持管道/变量赋值/&&复合/bash script.sh 的固有限制。
     无 Git Bash 时降级为 cmd /s /c + 命令映射兜底。
+
+    ``dialect="pwsh"``（pwsh 工具）：命令已是 PowerShell 方言 —— 直接交给
+    pwsh，不做 unix 规范化（沙箱 off 时也要与受限路径同语义）。
     """
     is_windows = sys.platform.startswith("win")
-    if is_windows:
+    if dialect == "pwsh":
+        import shutil as _shutil
+
+        pwsh_exe = _shutil.which("pwsh")
+        if not pwsh_exe:
+            return {"output": "", "stdout": "", "stderr": "",
+                    "exit_code": None, "timed_out": False,
+                    "error": "pwsh (PowerShell 7+) not found on PATH — "
+                             "the pwsh tool requires it. Use bash instead."}
+        shell_args = [pwsh_exe, "-NoProfile", "-NonInteractive",
+                      "-Command", command]
+    elif is_windows:
         bash_exe = _find_bash_exe()
         if bash_exe:
             # Git Bash 可用 — 直接执行，仅做 python3→python 等基础规范化
@@ -1175,6 +1413,33 @@ def _cwd_style_hint(cwd: str, relative: str | None = None) -> str:
     )
 
 
+def _pwsh_is_effective_shell() -> bool:
+    """True when a bash-dialect command will actually be run by pwsh.
+
+    受限沙箱（Windows + acl_sandbox on）走 ``build_confined_argv`` → pwsh 优先；
+    native 路径有 Git Bash 时是真 bash，方言门必须闭嘴（否则误伤合法 unix 命令）。
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    import shutil as _shutil
+
+    if not _shutil.which("pwsh"):
+        return False  # cmd 兜底路径走 _map_unix_to_cmd，不是 pwsh 方言
+    from hiveweave.services.acl_sandbox.integration import acl_sandbox_active
+
+    if acl_sandbox_active():
+        return True
+    # 沙箱 off：native 优先 Git Bash；无 Git Bash 时才落 cmd（同样非 pwsh）
+    return False
+
+
+def _pwsh_dialect_gate(command: str) -> str | None:
+    """翻译后仍残留 unix-only 命令 → 可操作错误；否则 None（放行执行）。"""
+    if not _pwsh_is_effective_shell():
+        return None
+    return detect_untranslated_unix(_normalize_for_pwsh(command))
+
+
 async def execute_bash(
     command: str,
     workdir: str,
@@ -1183,6 +1448,7 @@ async def execute_bash(
     project_id: str | None = None,
     agent_id: str | None = None,
     unbounded: bool = False,
+    dialect: str = "bash",
 ) -> dict[str, Any]:
     """Execute a bash command and return {success, output, error}.
 
@@ -1193,6 +1459,9 @@ async def execute_bash(
          until the process exits (background bash / job_kill).
       4. Execute (ACL sandbox > native)
       5. Truncate output at 1MB (layer 2, bash-specific)
+
+    ``dialect="pwsh"`` (the ``pwsh`` tool) skips unix→pwsh translation and the
+    unix-only gate: the command is already PowerShell.
     """
     if not command or not command.strip():
         return {"success": False, "output": "",
@@ -1223,6 +1492,16 @@ async def execute_bash(
 
     if not acl_sandbox_active():
         command = _source_env_sh(command, hw_dir)
+
+    # 1.6. 方言 fast-fail（DSH_33 P0）：受限 shell = pwsh 时，翻译表覆盖不到的
+    # unix-only 命令直接给等价写法，而不是让 pwsh 回「不是内部或外部命令」——
+    # 后者不含方言信息，模型只会换 flag 重试（实测 126 次占失败步 41.9%）。
+    if dialect != "pwsh":
+        dialect_err = _pwsh_dialect_gate(command)
+        if dialect_err:
+            log.info("bash.dialect_gate", command_preview=command[:120])
+            return {"success": False, "output": "",
+                    "error": dialect_err, "blocked": True}
 
     # 2. Resolve cwd and validate sandbox
     ws = workspace_path or os.getcwd()
@@ -1276,10 +1555,12 @@ async def execute_bash(
     result = await _run_sandboxed(
         command, cwd, timeout_s,
         workspace_path=ws, agent_id=agent_id, project_id=project_id,
-        entry="bash",
+        entry="bash", dialect=dialect,
     )
     if result is None:
-        result = await _run_native(command, cwd, int(timeout_s or 0))
+        result = await _run_native(
+            command, cwd, int(timeout_s or 0), dialect=dialect
+        )
 
     if result.get("error"):
         return {"success": False, "output": "",
@@ -2173,6 +2454,7 @@ async def _bash_background(
     exec_ws: str,
     project_id: str | None,
     verify_tid: str | None,
+    dialect: str = "bash",
 ) -> ToolResult:
     """Run bash off the org turn; attestations still issue when the job finishes."""
     from hiveweave.services.offturn import (
@@ -2224,6 +2506,7 @@ async def _bash_background(
             project_id=project_id,
             agent_id=agent_id,
             unbounded=True,
+            dialect=dialect,
         )
         _update_cwd_failure_streak(
             agent_id, exec_ws, bool(result.get("success"))
@@ -2290,8 +2573,12 @@ async def _bash_background(
     "names pass testEvidence=true to force the attestation (exit 0 = "
     "green). Long scripts: background=true returns waiting_on — then "
     "commit_turn(waiting); woken with [BASH DONE] / [BASH FAILED]. "
-    "Stop with job_kill. Not PowerShell; prefer Git Bash, tail -n N, "
-    "uv run python. Do not background=true for vite / npm run dev / "
+    "Stop with job_kill. Windows: under the sandbox your command is actually "
+    "run by pwsh, and only a few unix idioms are translated (ls -l, "
+    "head/tail -n N, wc -l, mkdir -p, grep) — the rest (sed/awk/xargs/cut/"
+    "find/touch/which…) fast-fail with the pwsh equivalent. When you want "
+    "PowerShell semantics, call the pwsh tool directly instead. "
+    "Prefer uv run python. Do not background=true for vite / npm run dev / "
     "uvicorn / http.server — servers never finish, so waiting_on never "
     "fires; prefer start_dev_server. Do not append & on a foreground "
     "command.",
@@ -2300,6 +2587,17 @@ async def _bash_background(
 )
 async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolResult:
     """Execute a bash command."""
+    return await _shell_tool_impl(params, agent_id, workspace, dialect="bash")
+
+
+async def _shell_tool_impl(
+    params: BashParams, agent_id: str, workspace: str, *, dialect: str
+) -> ToolResult:
+    """bash / pwsh 共用执行体 —— 唯一差别是交给哪种 shell 方言。
+
+    两个工具共享同一条管线（保留端口守卫 / 尾部 & 收编 / offturn / 截断 /
+    test_run attestation / cwd 失败连击提示），避免出现第二套 subprocess 逻辑。
+    """
     from hiveweave.services.process_registry import prepare_spawn_command
     from hiveweave.tools.helpers import get_project_id
 
@@ -2324,6 +2622,7 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
             exec_ws=exec_ws,
             project_id=project_id,
             verify_tid=verify_tid,
+            dialect=dialect,
         )
 
     # 前台尾部 &：长驻服务走注册 spawn；其余必须 offturn job，禁止 shell 脱管。
@@ -2335,6 +2634,7 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
             exec_ws=exec_ws,
             project_id=project_id,
             verify_tid=verify_tid,
+            dialect=dialect,
         )
 
     result = await execute_bash(
@@ -2344,6 +2644,7 @@ async def bash_tool(params: BashParams, agent_id: str, workspace: str) -> ToolRe
         timeout_ms=params.timeout,
         project_id=project_id,
         agent_id=agent_id,
+        dialect=dialect,
     )
     # D4: track consecutive failures per (agent_id, cwd)
     _streak_hint = _update_cwd_failure_streak(
@@ -2416,6 +2717,62 @@ def _shell_tool_result(
         # stall 检测分流，文本/exit code 语义与 err 一致。
         return ToolResult.blocked_err(err_msg, **public)
     return ToolResult.err(err_msg, **public)
+
+
+# ── pwsh 工具（DSH_33 P0：声明式双 Consumer，不做方言转译）──────────
+# 描述是**方言契约**本身：说清「无状态 / workdir 而非 cd / 原生 Windows 路径 /
+# $env:NAME / 非零退出如何呈现 / 输出截断与落盘」，模型据此一次写对，而不是
+# 靠平台猜译 unix 惯用法（猜译 = 静默错译，见 _map_unix_to_pwsh docstring）。
+PWSH_TOOL_DESCRIPTION = (
+    "Execute a PowerShell command (pwsh -Command) in YOUR workspace "
+    "(worktree if you have one) and return stdout/stderr. "
+    "This is the PowerShell-dialect sibling of bash — same permissions, "
+    "same sandbox, same truncation. Use it whenever you want PowerShell "
+    "semantics (cmdlets, objects, $env:, -replace) instead of writing unix "
+    "commands that this platform would have to translate.\n"
+    "Dialect contract:\n"
+    "- Each call is a FRESH pwsh process: no state (cwd, variables, "
+    "functions, imported modules) persists between calls. Do not `cd` "
+    "expecting the next call to stay there — the command already starts in "
+    "your workspace.\n"
+    "- Paths use native Windows form (D:\\proj\\src\\app.py) or "
+    "workspace-relative form. Never invent /workspace and never strip "
+    "backslashes (D:PC_AI... is invalid).\n"
+    "- Read environment variables with $env:NAME (not $NAME). Set them with "
+    "$env:NAME='value' — export is bash syntax and does not exist here.\n"
+    "- Your command is passed to pwsh VERBATIM: no unix→pwsh translation is "
+    "applied. head/sed/awk/grep/wc do not exist in pwsh — use Get-Content "
+    "-TotalCount/-Tail, -replace, Select-String, (Get-Content f).Count.\n"
+    "- Call an external program with the & call operator when the name or "
+    "path is quoted: & \"python\" \"script.py\" (bare \"python\" \"x.py\" is "
+    "a pwsh ParserError).\n"
+    "- Non-zero exits are reported as `Exit code: N` with the stdout/stderr "
+    "tails; check it on every result before moving on. A blocked=true result "
+    "is a platform denial (self-destructive command, sensitive file, "
+    ".hiveweave system dir) — read the reason and change approach, do not "
+    "retry variations.\n"
+    "- Long output is truncated to head+tail; the full text is saved and the "
+    "path is reported.\n"
+    "Long scripts: background=true returns waiting_on — then "
+    "commit_turn(waiting); woken with [BASH DONE] / [BASH FAILED]; stop with "
+    "job_kill. Do not use background=true for vite / npm run dev / uvicorn / "
+    "http.server (servers never finish, so waiting_on never fires) — prefer "
+    "start_dev_server. Do not append & on a foreground command. "
+    "Project-root tests / MAIN QA: use bash_main."
+)
+
+
+@tool(
+    "pwsh",
+    PWSH_TOOL_DESCRIPTION,
+    requires_workspace=True,
+    security_level="shell",
+)
+async def pwsh_tool(
+    params: BashParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """First-class PowerShell tool — verbatim pwsh, no dialect translation."""
+    return await _shell_tool_impl(params, agent_id, workspace, dialect="pwsh")
 
 
 def _with_cwd_note(result: ToolResult, note: str) -> ToolResult:

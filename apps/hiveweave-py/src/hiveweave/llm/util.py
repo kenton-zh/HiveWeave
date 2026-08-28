@@ -71,6 +71,35 @@ def _provider_reports_disjoint_input(provider: str | None) -> bool:
     return p == "anthropic" or p.startswith("anthropic")
 
 
+#: Wire fields ``normalize_usage`` reads for a cache-write (cache creation)
+#: count. Anthropic's ``cache_creation_input_tokens`` is already mapped onto
+#: ``cache_creation`` by the provider handler, so it is not listed here.
+CACHE_CREATION_WIRE_FIELDS = (
+    "cache_creation",
+    "cache_creation_tokens",
+)
+
+
+def provider_reports_cache_creation(provider: str | None) -> bool:
+    """Whether this provider family reports cache **writes** at all.
+
+    Only Anthropic Messages exposes ``cache_creation_input_tokens``. The
+    OpenAI wire families (openai / openai-compatible / openai-responses /
+    ARK / DeepSeek / Google) report cache *reads* only — a 0 there means
+    "not reported", not "no cache was written". Without this distinction a
+    cache-hit-rate analysis cannot state its denominator (TEST_DSH_33: the
+    91.42% figure was unattributable because cache_creation was silently 0).
+    """
+    return _provider_reports_disjoint_input(provider)
+
+
+def usage_has_cache_creation_field(usage: dict[str, Any] | None) -> bool:
+    """Whether the raw usage payload actually carried a cache-write count."""
+    if not usage:
+        return False
+    return any(f in usage for f in CACHE_CREATION_WIRE_FIELDS)
+
+
 def normalize_usage(
     usage: dict[str, Any] | None,
     provider: str | None = None,
@@ -78,17 +107,25 @@ def normalize_usage(
     """归一化一轮 usage，返回统一字段的 dict。
 
     返回 None 表示无可用 usage（HTTP 错误轮次 / 异常路径）。
-    字段：input, output, cache_read, cache_creation, total, duration_ms。
+    字段：input, output, cache_read, cache_creation, total, duration_ms,
+    cache_creation_reported。
 
     只在这里剥一次缓存。OpenAI/ARK/Google 的 prompt 含命中；Anthropic 已是
     未命中桶，禁止再减。不要用 ``input >= cache_read`` 当「尚未剥」——
     命中率 ≤50% 时已剥过的 input 仍会 ≥ cache_read。
+
+    ``cache_creation_reported`` = 1/0 量程位：0 表示该 provider 根本不上报
+    cache 写入，此时 ``cache_creation`` 的 0 是「无数据」而非「确实为 0」，
+    命中率分母只覆盖 input + cache_read。
     """
     if not usage:
         return None
     cache_read = openai_wire_cache_read(usage)
     cache_creation = usage_int(
         usage.get("cache_creation") or usage.get("cache_creation_tokens")
+    )
+    reported = usage_has_cache_creation_field(usage) or (
+        provider_reports_cache_creation(provider)
     )
     ds_miss = usage.get("prompt_cache_miss_tokens")
     input_tokens = usage_int(
@@ -110,4 +147,5 @@ def normalize_usage(
         "cache_creation": cache_creation,
         "total": total,
         "duration_ms": usage_int(usage.get("duration_ms")),
+        "cache_creation_reported": 1 if reported else 0,
     }

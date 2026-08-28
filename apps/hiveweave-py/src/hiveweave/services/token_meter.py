@@ -10,6 +10,11 @@
 
 聚合路径:
 - agent_summary / project_by_agent / daily_summary / run_summary / platform_overview
+
+缓存量程（P2-⑨）: ``cache_creation_tokens`` 只有 Anthropic 系上报，OpenAI 系
+线上根本不带该字段。因此聚合结果附 ``cache_creation_scope``
+（reported/unreported/mixed）+ ``cache_hit_basis``，让命中率能说清分母 ——
+不新增列，能力位由既有 ``provider`` 列按 ``llm.util`` 的单一判据现算。
 """
 
 from __future__ import annotations
@@ -22,12 +27,77 @@ import structlog
 
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
+from hiveweave.llm.util import (
+    cache_hit_percent,
+    provider_reports_cache_creation,
+)
 
 log = structlog.get_logger()
+
+#: 聚合 SQL 共用的 provider 收集列 — 能力位在 Python 侧按单一判据现算，
+#: 不把 "anthropic" 之类的字面量复写进 SQL。
+_PROVIDERS_AGG = "GROUP_CONCAT(DISTINCT provider) AS providers"
+
+#: cache 写入量程：全部上报 / 全部不上报 / 混合。
+CACHE_SCOPE_REPORTED = "reported"
+CACHE_SCOPE_UNREPORTED = "unreported"
+CACHE_SCOPE_MIXED = "mixed"
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _row_get(row: Any, key: str) -> Any:
+    """读聚合行的某列 — sqlite3.Row 无 .get()，缺列时返回 None。"""
+    if isinstance(row, dict):
+        return row.get(key)
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
+
+
+def cache_creation_scope(providers: Any) -> str:
+    """按聚合内出现过的 provider 判定 cache 写入量程。
+
+    ``providers`` 为 GROUP_CONCAT 的 CSV（可能为 None/空）。无 provider 记录
+    时按 unreported 处理 —— 未知不得当成「确实为 0」。
+    """
+    names = [
+        p.strip() for p in str(providers or "").split(",") if p and p.strip()
+    ]
+    if not names:
+        return CACHE_SCOPE_UNREPORTED
+    flags = {provider_reports_cache_creation(p) for p in names}
+    if flags == {True}:
+        return CACHE_SCOPE_REPORTED
+    if flags == {False}:
+        return CACHE_SCOPE_UNREPORTED
+    return CACHE_SCOPE_MIXED
+
+
+#: 命中率分母口径说明 — 与 cache_creation_scope 一一对应。
+_CACHE_HIT_BASIS = {
+    CACHE_SCOPE_REPORTED: "input+cache_read+cache_creation",
+    CACHE_SCOPE_UNREPORTED:
+        "input+cache_read (cache_creation not reported by provider)",
+    CACHE_SCOPE_MIXED:
+        "input+cache_read+cache_creation (partial: mixed providers)",
+}
+
+
+def _with_cache_scope(row: dict[str, Any]) -> dict[str, Any]:
+    """把 providers CSV 换成量程字段 + 命中率（含分母口径说明）。"""
+    scope = cache_creation_scope(row.pop("providers", None))
+    row["cache_creation_scope"] = scope
+    row["cache_hit_percent"] = cache_hit_percent(
+        int(row.get("input_tokens") or 0),
+        int(row.get("cache_read_tokens") or 0),
+        int(row.get("cache_creation_tokens") or 0),
+    )
+    row["cache_hit_basis"] = _CACHE_HIT_BASIS[scope]
+    return row
 
 
 class TokenMeter:
@@ -155,9 +225,9 @@ class TokenMeter:
     # ── 聚合查询 ─────────────────────────────────────────────
 
     @staticmethod
-    def _row_to_summary(r: Any) -> dict[str, int]:
-        """把聚合行转成统一响应口径。"""
-        return {
+    def _row_to_summary(r: Any) -> dict[str, Any]:
+        """把聚合行转成统一响应口径（含缓存量程口径）。"""
+        summary: dict[str, Any] = {
             "llm_calls": int(r["llm_calls"] or 0),
             "input_tokens": int(r["input_tokens"] or 0),
             "output_tokens": int(r["output_tokens"] or 0),
@@ -165,7 +235,9 @@ class TokenMeter:
             "cache_creation_tokens": int(r["cache_creation_tokens"] or 0),
             "total_tokens": int(r["total_tokens"] or 0),
             "duration_ms": int(r["duration_ms"] or 0),
+            "providers": _row_get(r, "providers"),
         }
+        return _with_cache_scope(summary)
 
     async def agent_summary(
         self,
@@ -182,7 +254,8 @@ class TokenMeter:
             "SUM(cache_read_tokens) AS cache_read_tokens, "
             "SUM(cache_creation_tokens) AS cache_creation_tokens, "
             "SUM(total_tokens) AS total_tokens, "
-            "SUM(duration_ms) AS duration_ms "
+            "SUM(duration_ms) AS duration_ms, "
+            f"{_PROVIDERS_AGG} "
             "FROM llm_usage WHERE project_id = ? AND agent_id = ?"
         )
         params: list[Any] = [project_id, agent_id]
@@ -212,7 +285,8 @@ class TokenMeter:
             "SUM(cache_read_tokens) AS cache_read_tokens, "
             "SUM(cache_creation_tokens) AS cache_creation_tokens, "
             "SUM(total_tokens) AS total_tokens, "
-            "SUM(duration_ms) AS duration_ms "
+            "SUM(duration_ms) AS duration_ms, "
+            f"{_PROVIDERS_AGG} "
             "FROM llm_usage WHERE project_id = ?"
         )
         params: list[Any] = [project_id]
@@ -226,7 +300,7 @@ class TokenMeter:
             log.warning("token_meter.project_by_agent_failed",
                         project_id=project_id, error=str(e))
             return []
-        return [dict(r) for r in rows]
+        return [_with_cache_scope(dict(r)) for r in rows]
 
     async def daily_summary(
         self, project_id: str, since_days: int = 30
@@ -240,7 +314,8 @@ class TokenMeter:
             "SUM(output_tokens) AS output_tokens, "
             "SUM(cache_read_tokens) AS cache_read_tokens, "
             "SUM(cache_creation_tokens) AS cache_creation_tokens, "
-            "SUM(total_tokens) AS total_tokens "
+            "SUM(total_tokens) AS total_tokens, "
+            f"{_PROVIDERS_AGG} "
             "FROM llm_usage WHERE project_id = ? AND created_at >= ? "
             "GROUP BY day ORDER BY day ASC"
         )
@@ -252,7 +327,7 @@ class TokenMeter:
             log.warning("token_meter.daily_summary_failed",
                         project_id=project_id, error=str(e))
             return []
-        return [dict(r) for r in rows]
+        return [_with_cache_scope(dict(r)) for r in rows]
 
     async def run_summary(self, run_id: str) -> dict[str, Any] | None:
         """单次 run 的 token 归因（跨项目扫描按 run_id 定位）。"""
@@ -269,7 +344,8 @@ class TokenMeter:
                     "SUM(cache_read_tokens) AS cache_read_tokens, "
                     "SUM(cache_creation_tokens) AS cache_creation_tokens, "
                     "SUM(total_tokens) AS total_tokens, "
-                    "SUM(duration_ms) AS duration_ms "
+                    "SUM(duration_ms) AS duration_ms, "
+                    f"{_PROVIDERS_AGG} "
                     "FROM llm_usage WHERE run_id = ? "
                     "GROUP BY agent_id, request_type",
                     [run_id],
@@ -279,11 +355,11 @@ class TokenMeter:
                             project_id=pid, run_id=run_id, error=str(e))
                 continue
             for r in rows:
-                out.append({
+                out.append(_with_cache_scope({
                     "project_id": pid,
                     "project_name": proj.get("name"),
                     **dict(r),
-                })
+                }))
         if not out:
             return None
         return {"run_id": run_id, "entries": out}
@@ -301,7 +377,8 @@ class TokenMeter:
                 "SUM(output_tokens) AS output_tokens, "
                 "SUM(cache_read_tokens) AS cache_read_tokens, "
                 "SUM(cache_creation_tokens) AS cache_creation_tokens, "
-                "SUM(total_tokens) AS total_tokens "
+                "SUM(total_tokens) AS total_tokens, "
+                f"{_PROVIDERS_AGG} "
                 "FROM llm_usage WHERE 1=1"
             )
             params: list[Any] = []
@@ -316,7 +393,7 @@ class TokenMeter:
                             project_id=pid, error=str(e))
                 continue
             for r in rows:
-                out.append({
+                out.append(_with_cache_scope({
                     "project_id": pid,
                     "project_name": proj.get("name"),
                     "agent_id": r["agent_id"],
@@ -326,7 +403,8 @@ class TokenMeter:
                     "cache_read_tokens": int(r["cache_read_tokens"] or 0),
                     "cache_creation_tokens": int(r["cache_creation_tokens"] or 0),
                     "total_tokens": int(r["total_tokens"] or 0),
-                })
+                    "providers": _row_get(r, "providers"),
+                }))
         out.sort(key=lambda x: x["total_tokens"], reverse=True)
         return out
 

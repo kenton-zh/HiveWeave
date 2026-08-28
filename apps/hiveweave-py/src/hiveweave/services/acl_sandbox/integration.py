@@ -16,6 +16,10 @@ import structlog
 log = structlog.get_logger(__name__)
 
 
+class PwshUnavailableError(RuntimeError):
+    """``dialect="pwsh"`` 但 PATH 上无 pwsh —— 调用方应回执可操作错误。"""
+
+
 def acl_sandbox_active() -> bool:
     """沙箱启用判定：HIVEWEAVE_ACL_SANDBOX=on 且 Windows。"""
     from hiveweave.config import settings
@@ -66,17 +70,26 @@ def quote_windows_argv(argv: list[str]) -> str:
     return " ".join(_quote_windows_arg(a) for a in argv)
 
 
-def build_confined_argv(command: str) -> list[str]:
-    """把 bash 语法命令包装成受限 shell 的 argv 数组（E10 argv 化）。
+def build_confined_argv(command: str, *, dialect: str = "bash") -> list[str]:
+    """把命令包装成受限 shell 的 argv 数组（E10 argv 化）。
 
-    - pwsh 优先（受限下可用，S1 实测通过）：经 ``_normalize_for_pwsh`` 做
+    - ``dialect="bash"``（默认）：pwsh 优先，经 ``_normalize_for_pwsh`` 做
       bash 惯用法适配（§18.3 —— export/``${VAR}``/source/带 flag 的 unix 命令）；
-    - cmd 兜底：``/s /c`` + unix→cmd 命令映射（``_normalize_command``）。
+      无 pwsh 时 cmd 兜底（``/s /c`` + ``_normalize_command`` 映射）。
+    - ``dialect="pwsh"``：命令**已是 PowerShell 方言**（pwsh 工具），原样直传，
+      不做任何 unix→pwsh 转译（转译会破坏合法 pwsh 语法，DSH_33 P0）。
 
     与 ``build_confined_command`` 的区别：返回 argv 数组，由 spawn 侧用
     ``quote_windows_argv`` 逐元素引用 → 避免整串转发时外壳二次剥引号。
     """
     pwsh = shutil.which("pwsh")
+    if dialect == "pwsh":
+        if not pwsh:
+            raise PwshUnavailableError(
+                "pwsh (PowerShell 7+) not found on PATH — the pwsh tool "
+                "requires it. Use the bash tool instead."
+            )
+        return [pwsh, "-NoProfile", "-NonInteractive", "-Command", command]
     if pwsh:
         from hiveweave.tools.bash import _normalize_for_pwsh  # 惰性，避免循环导入
 

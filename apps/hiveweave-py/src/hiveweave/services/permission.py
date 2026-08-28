@@ -83,6 +83,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     "edit_file", "apply_patch", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
     "bash", "bash_main", "run_command", "run_tests", "browse", "browse_main", "game_run_case", "game_run_case_main",
+    "pwsh",
     "job_kill",
     "spawn_subagent",
     "generate_image",
@@ -108,6 +109,7 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
 # PolicyService still hard-denies based on role family.
 READONLY_TOOLS = _BASE_TOOLS | frozenset({
     "bash", "bash_main", "python_script", "write_file", "browse", "browse_main", "assert_visual", "game_run_case", "game_run_case_main", "edit_file",
+    "pwsh",
     "job_kill",
     "spawn_subagent",
     "generate_image",

@@ -32,6 +32,45 @@ log = structlog.get_logger(__name__)
 # 防止把合法旁白误截成"尾注"。
 _FINAL_TAIL_NOTE_MAX = 300
 
+# result_summary 的语义是「一句话摘要」，不是本轮全文的前 200 字。
+# 早收口路径（budget_exhausted / max_rounds 续跑）的 content = 各轮旁白拼接
+# + 平台尾注，取前 200 字会把最早那几句同义旁白连堆在一起（实证：8/8 agent
+# 该字段长度精确等于 200，最长样本 9 个同义句）。改取**末条**旁白 —— 最近
+# 一句才代表 run 结束时的状态。
+RESULT_SUMMARY_MAX = 200
+
+#: 平台尾注的结构形状：段首 ``[TAG]`` 标签（如 [TURN BUDGET] / [HiveWeave
+#: runtime]）。按形状识别而非文案匹配；仅当没有任何 agent 旁白时才回落到它。
+_PLATFORM_NOTE_TAG_MAX = 40
+
+
+def _is_platform_note(paragraph: str) -> bool:
+    if not paragraph.startswith("["):
+        return False
+    end = paragraph.find("]")
+    return 0 < end <= _PLATFORM_NOTE_TAG_MAX
+
+
+def build_run_result_summary(content: str, max_chars: int = RESULT_SUMMARY_MAX) -> str:
+    """从一轮 content 提取单句 run 摘要（取末条旁白，非全文头部）。
+
+    content 在续跑/早收口路径是「各轮旁白 + 平台尾注」的拼接（段间 \\n\\n）。
+    取最后一段非空 agent 旁白；若全是平台尾注则取最后一段尾注（仍带信息，
+    如预算耗尽原因）。超长时从**尾部**截断保留末尾语义。
+    """
+    if not content:
+        return ""
+    paragraphs = [p.strip() for p in content.split("\n\n")]
+    paragraphs = [p for p in paragraphs if p]
+    if not paragraphs:
+        return ""
+    narration = [p for p in paragraphs if not _is_platform_note(p)]
+    tail = (narration or paragraphs)[-1]
+    tail = " ".join(tail.split())
+    if len(tail) <= max_chars:
+        return tail
+    return "…" + tail[-(max_chars - 1):]
+
 
 def build_display_segments(
     tool_turn_messages: list | None,
@@ -172,7 +211,7 @@ async def handle_completion(
     _run_id = getattr(agent, "_current_run_id", None)
     if _run_id:
         try:
-            summary = (content or "")[:200]
+            summary = build_run_result_summary(content or "")
             await agent._run_ledger.complete_run(
                 agent_id=agent.id,
                 run_id=_run_id,

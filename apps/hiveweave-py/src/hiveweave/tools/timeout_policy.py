@@ -30,6 +30,7 @@ UNDECLARED_ACTIVE_QUIET_S = 1800.0
 UNDECLARED_SESSION_TOOLS: frozenset[str] = frozenset({
     "bash",
     "bash_main",
+    "pwsh",
     "run_command",
     "read_file",
     "write_file",

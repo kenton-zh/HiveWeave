@@ -43,7 +43,12 @@ def _agent(**kwargs) -> dict:
 
 @pytest.mark.asyncio
 async def test_legacy_executor_deny_marks_blocked():
-    """未注册工具走 legacy 权限路径，deny 结果必须带 blocked=True。"""
+    """未注册工具走 legacy 权限路径，deny 结果必须带 blocked=True。
+
+    工具名必须选真实可达的 legacy 分发工具（run_tests 属评审套件：未进
+    @tool 注册表，由 _dispatch 兜住）—— 用不存在的名字会被未知工具
+    fast-fail 拦在权限评估之前（DSH_33），根本走不到 deny 分支。
+    """
     from hiveweave.tools.executor import ToolExecutor
 
     class _Perm:
@@ -60,10 +65,99 @@ async def test_legacy_executor_deny_marks_blocked():
         ws = str(Path(tmp) / "ws")
         Path(ws).mkdir()
         executor = ToolExecutor(_Perm(), object())
-        result = await executor.execute("a1", "no_such_legacy_tool", {}, ws)
+        result = await executor.execute(
+            "a1", "run_tests", {"filePaths": ["a.py"]}, ws
+        )
 
     assert result.get("success") is False
     assert result.get("blocked") is True
+
+
+# ── 1b. 未知工具 fast-fail：早于权限评估，且不标 blocked ──────────────
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_fast_fails_before_permission():
+    """DSH_33：幻觉工具名必须在权限评估之前失败，且归因工具层（非 blocked）。
+
+    修复前：权限层对未注册名落 mode 兜底 "ask" → 120s 审批超时才失败，
+    legacy 的 Unknown tool 分支一次都没执行到。
+    """
+    from hiveweave.tools.executor import ToolExecutor
+
+    evaluated: list[str] = []
+
+    class _Perm:
+        async def evaluate_detailed(self, agent_id, tool_name, args):
+            evaluated.append(tool_name)
+            return ("ask", None)
+
+    class _Approval:
+        async def request_permission(self, **kwargs):
+            raise AssertionError("未知工具不得进入审批流程")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = str(Path(tmp) / "ws")
+        Path(ws).mkdir()
+        executor = ToolExecutor(_Perm(), _Approval())
+        result = await executor.execute("a1", "self.bash", {"command": "ls"}, ws)
+
+    # 权限评估从未被调用 —— 可达性判定先于授权判定
+    assert evaluated == []
+    assert result["success"] is False
+    # blocked 语义专指护栏拒绝；未知工具是工具层查找失败
+    assert result.get("blocked") is not True
+    # 错误消息必须带确切纠正路径（DSH reachableFrom）
+    assert "self.bash" in result["error"]
+    assert "'bash'" in result["error"]
+
+
+def test_unknown_tool_error_carries_reachable_path():
+    """DSH_33 实测的 5 个幻觉名都必须给出确切纠正建议，真实工具不误伤。"""
+    from hiveweave.tools.executor import ToolExecutor
+
+    for hallucinated, real in (
+        ("self.bash", "bash"),
+        ("self.get_tasks", "get_tasks"),
+        ("self.commit_turn", "commit_turn"),
+        ("self.browse", "browse"),
+        ("self.get_platform_state", "get_platform_state"),
+    ):
+        msg = ToolExecutor._unknown_tool_error(hallucinated)
+        assert msg is not None
+        assert f"Did you mean '{real}'?" in msg
+        assert "self." in msg  # 明确指出前缀是问题
+
+    # 拼写错误 → 近似匹配，但话术不提前缀
+    typo = ToolExecutor._unknown_tool_error("bahs")
+    assert typo is not None and "Did you mean 'bash'?" in typo
+
+    # 完全查无此名 → 不瞎猜，改指引查能力范围
+    nonsense = ToolExecutor._unknown_tool_error("totally_made_up_tool")
+    assert nonsense is not None
+    assert "Did you mean" not in nonsense
+    assert "get_platform_state" in nonsense
+
+    # 可达工具不得被拦：注册表 + legacy _dispatch 两条路径
+    assert ToolExecutor._unknown_tool_error("bash") is None
+    assert ToolExecutor._unknown_tool_error("run_tests") is None
+    assert ToolExecutor._unknown_tool_error("review") is None
+
+
+def test_legacy_dispatch_tools_match_actual_dispatch_branches():
+    """LEGACY_DISPATCH_TOOLS 必须与 _dispatch 的实际分支一致。
+
+    漏登记 → 真实工具被 fast-fail 误拦；多登记 → 未知工具漏过 fast-fail
+    再落到 _dispatch 的 Unknown tool。两种都必须在测试期显形。
+    """
+    import inspect
+
+    from hiveweave.tools.executor import ToolExecutor
+    from hiveweave.tools.pipeline import LEGACY_DISPATCH_TOOLS
+
+    src = inspect.getsource(ToolExecutor._dispatch)
+    for name in LEGACY_DISPATCH_TOOLS:
+        assert f'"{name}"' in src, f"{name} 已登记但 _dispatch 无对应分支"
 
 
 # ── 2. pipeline 权限三分支 ───────────────────────────────────────────

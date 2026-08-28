@@ -130,10 +130,15 @@ class ContextMixin:
         # （输出预算吃掉整个窗口），ProviderConfig 构造时本应已拦住。
         # 此处若仍触发 = DB 有脏数据绕过了构造校验，硬失败暴露问题，
         # 绝不静默 floor 到 8192 后带病发请求（那会导致 400 且原因难定位）。
-        input_budget = provider.context_window - max_output - SAFETY_BUFFER_TOKENS
+        # 声明值先过有效封顶（DSH_33：ctx=1M 让压缩线抬到 686k，实测峰值
+        # 409k 永不触发压缩）。<= 0 由该函数原样透传，下面的硬失败不受影响。
+        from hiveweave.conversation import resolve_effective_context_window
+
+        context_window = resolve_effective_context_window(provider.context_window)
+        input_budget = context_window - max_output - SAFETY_BUFFER_TOKENS
         if input_budget <= 0:
             raise ValueError(
-                f"非法模型配置：context_window={provider.context_window:,} - "
+                f"非法模型配置：context_window={context_window:,} - "
                 f"max_output={max_output:,} - safety_buffer={SAFETY_BUFFER_TOKENS:,} "
                 f"= {input_budget}（输入预算 <= 0）。输出预算吃掉整个窗口，"
                 f"请修复模型配置的 max_output_tokens。"
@@ -560,8 +565,25 @@ class ContextMixin:
         "no_text": "no text output",
     }
 
-    def _summary_fallback(self, reason: str) -> str:
-        label = self._SUMMARY_FALLBACK_BY_REASON.get(reason, reason)
+    # stall_break 的归因细分（DSH_33）：工具失败不得笼统报 "stalled" ——
+    # 那会让模型把工具层故障读成自己空转。键对齐 doom_loop.STALL_REASON_*。
+    _SUMMARY_FALLBACK_BY_STALL_REASON = {
+        "tool_failed": "consecutive tool-call failures (not model idling)",
+        "runner_failed": "tool runner failure (not model idling)",
+        "blocked": "calls refused by platform guards (not model idling)",
+        "readonly": "stalled on readonly polling",
+        "no_progress": "stalled",
+    }
+
+    def _summary_fallback(
+        self, reason: str, stall_reason: str | None = None
+    ) -> str:
+        if reason == "stall_break" and stall_reason:
+            label = self._SUMMARY_FALLBACK_BY_STALL_REASON.get(
+                stall_reason, self._SUMMARY_FALLBACK_BY_REASON[reason]
+            )
+        else:
+            label = self._SUMMARY_FALLBACK_BY_REASON.get(reason, reason)
         return (
             f"⚠️ Turn ended early: tool-loop {label}. "
             "Some tasks may be incomplete."
@@ -575,12 +597,17 @@ class ContextMixin:
         on_delta: DeltaCallback | None,
         reason: str = "max_rounds",
         budget_deadline: float | None = None,
+        stall_reason: str | None = None,
     ) -> str:
         """回合强制收尾的总结调用（真实原因由 ``reason`` 说明）。
 
         三种场景共用：max_rounds（达到工具轮数上限）/ stall_break（tool
         loop 停滞，只调只读工具无进展）/ no_text（连续只调工具不说话）。
         fallback 文案必须如实反映 ``reason`` —— 不要冒充"达到轮数上限"。
+
+        ``stall_reason``（reason="stall_break" 时）进一步细分归因，取值见
+        ``doom_loop.STALL_REASON_*``：工具执行失败的轮次不得报成模型空转
+        （DSH_33 实测 90.4% 的 stall 属此类误报）。
 
         ``budget_deadline``（monotonic 刻度）是 turn 硬预算截止：总结也是
         LLM 调用（非流式 read=95s），无帽可在 t≈560s 触发时冲过 HARD 直至
@@ -597,7 +624,7 @@ class ContextMixin:
                     reason=reason,
                     remain_s=round(remain_s, 1),
                 )
-                return self._summary_fallback(reason)
+                return self._summary_fallback(reason, stall_reason)
         if reason == "max_rounds":
             summary_prompt = (
                 "CRITICAL — MAXIMUM TOOL ROUNDS REACHED\n\n"
@@ -610,16 +637,46 @@ class ContextMixin:
                 "Respond with text ONLY. Do NOT attempt any tool calls."
             )
         elif reason == "stall_break":
-            summary_prompt = (
-                "CRITICAL — TOOL LOOP STALLED\n\n"
-                "Your last several tool calls made no progress (only readonly / "
-                "failed / duplicate calls). Tools are now disabled.\n\n"
-                "You MUST respond with a text summary. Include:\n"
-                "1. What you have accomplished so far\n"
-                "2. What is blocking progress\n"
-                "3. Recommended next steps\n\n"
-                "Respond with text ONLY. Do NOT attempt any tool calls."
-            )
+            if stall_reason in ("tool_failed", "runner_failed"):
+                summary_prompt = (
+                    "CRITICAL — CONSECUTIVE TOOL-CALL FAILURES\n\n"
+                    "Your last several tool calls failed at the tool layer "
+                    "(the tools returned execution failures) — this is not "
+                    "you idling. Tools are now disabled.\n\n"
+                    "You MUST respond with a text summary. Include:\n"
+                    "1. What you have accomplished so far\n"
+                    "2. Which tool calls failed and the actual error they "
+                    "returned (wrong tool name / wrong arguments / unmet "
+                    "precondition?)\n"
+                    "3. Recommended next steps — a different approach or "
+                    "tool, not a retry of the same failing call\n\n"
+                    "Respond with text ONLY. Do NOT attempt any tool calls."
+                )
+            elif stall_reason == "blocked":
+                summary_prompt = (
+                    "CRITICAL — CALLS REFUSED BY PLATFORM GUARDS\n\n"
+                    "Your last several tool calls were refused by platform "
+                    "guards (permission / sandbox / security rules) — not "
+                    "model errors. Tools are now disabled.\n\n"
+                    "You MUST respond with a text summary. Include:\n"
+                    "1. What you have accomplished so far\n"
+                    "2. Which permission or guard is blocking you\n"
+                    "3. Recommended next steps (change approach, or request "
+                    "the missing permission from your superior)\n\n"
+                    "Respond with text ONLY. Do NOT attempt any tool calls."
+                )
+            else:
+                summary_prompt = (
+                    "CRITICAL — TOOL LOOP STALLED\n\n"
+                    "Your last several tool calls made no progress (only "
+                    "readonly / failed / duplicate calls). Tools are now "
+                    "disabled.\n\n"
+                    "You MUST respond with a text summary. Include:\n"
+                    "1. What you have accomplished so far\n"
+                    "2. What is blocking progress\n"
+                    "3. Recommended next steps\n\n"
+                    "Respond with text ONLY. Do NOT attempt any tool calls."
+                )
         else:  # no_text
             summary_prompt = (
                 "CRITICAL — NO TEXT OUTPUT\n\n"
@@ -668,10 +725,10 @@ class ContextMixin:
                         })
                         return content
             log.warning("summary_request_failed", status=resp.status_code, reason=reason)
-            return self._summary_fallback(reason)
+            return self._summary_fallback(reason, stall_reason)
         except Exception as e:
             log.warning("summary_request_error", error=str(e), reason=reason)
-            return self._summary_fallback(reason)
+            return self._summary_fallback(reason, stall_reason)
         finally:
             await client.aclose()
 

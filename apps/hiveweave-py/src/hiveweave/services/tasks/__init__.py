@@ -25,7 +25,11 @@ from .db import (
 )
 from .errors import MergeRequiredError
 from .events import TaskEventService
-from .policy import resolve_task_policy
+from .policy import (
+    format_submit_expectations,
+    resolve_task_policy,
+    submit_expectations,
+)
 from .service import TaskService
 from .verify import VerificationCaseService
 
@@ -59,6 +63,8 @@ _PATCH_NAMES = frozenset({
     "_MISSING_COLUMNS",
     "MergeRequiredError",
     "resolve_task_policy",
+    "submit_expectations",
+    "format_submit_expectations",
     "TaskService",
     "TaskEventService",
     "VerificationCaseService",

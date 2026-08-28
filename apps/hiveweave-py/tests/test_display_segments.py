@@ -202,3 +202,58 @@ def test_empty_tail_pops_last_segment():
     segs = build_display_segments(turn, "A", [])
     texts = [s["content"] for s in segs if s["type"] == "text"]
     assert texts == ["A"]
+
+
+# ── P2-⑩：result_summary 恢复「一句话摘要」语义 ────────────────────
+
+
+def test_result_summary_takes_last_narration_not_head():
+    """续跑拼接的 content 取**末条**旁白，不再堆同义句。
+
+    实测形态：8/8 agent 该字段长度精确等于 200，最长样本 9 个同义句
+    （「正在收尾…收尾冲刺中…正在修复构建链…」）——根因是取 content[:200]，
+    而 content 是各轮旁白拼接。
+    """
+    from hiveweave.agents.completion import (
+        RESULT_SUMMARY_MAX,
+        build_run_result_summary,
+    )
+
+    content = (
+        "正在收尾，准备提交。\n\n"
+        "收尾冲刺中，还差两个测试。\n\n"
+        "正在修复构建链，预计一轮内完成。"
+    )
+    summary = build_run_result_summary(content)
+    assert summary == "正在修复构建链，预计一轮内完成。"
+    assert len(summary) <= RESULT_SUMMARY_MAX
+    # 关键回归：旧口径会把最早那句放在头部并堆到 200 字
+    assert not summary.startswith("正在收尾，准备提交。")
+
+
+def test_result_summary_skips_platform_note_but_keeps_it_as_fallback():
+    """平台尾注不冒充 agent 摘要；但无旁白时仍保留其信息。"""
+    from hiveweave.agents.completion import build_run_result_summary
+
+    note = "[TURN BUDGET] Hard turn budget exhausted — all progress is kept."
+    assert build_run_result_summary(f"模块 A 已联调通过。\n\n{note}") == (
+        "模块 A 已联调通过。"
+    )
+    assert build_run_result_summary(note).startswith("[TURN BUDGET]")
+
+
+def test_result_summary_edges():
+    """空内容 / 纯空白 / 超长单句（尾部截断保留结束语义）。"""
+    from hiveweave.agents.completion import (
+        RESULT_SUMMARY_MAX,
+        build_run_result_summary,
+    )
+
+    assert build_run_result_summary("") == ""
+    assert build_run_result_summary("\n\n   \n\n") == ""
+    # 单行内的换行被折叠成空格（一句话语义）
+    assert build_run_result_summary("第一行\n第二行") == "第一行 第二行"
+    long_tail = "x" * 50 + "结论在这里"
+    summary = build_run_result_summary("前情。\n\n" + long_tail, max_chars=20)
+    assert len(summary) == 20
+    assert summary.endswith("结论在这里")

@@ -188,8 +188,14 @@ async def python_script_execute(
         if acl_sandbox_active():
             project_id = await get_project_id(agent_id)
             project_root = await resolve_project_root(project_id)
+            # DSH_33 P0：受限路径经 pwsh 承载，`"interp" "script"` 在 pwsh 里是
+            # ParserError（第二个引号串没有调用运算符）——实测 7/7 全失败。
+            # 用 dialect="pwsh" 直传并显式加 `&` 调用运算符，且**不**再经
+            # _normalize_for_pwsh（那会把路径里的 $ 之类当 bash 变量改写）。
             result = await spawn_confined(
-                argv=build_confined_argv(f'"{interp}" "{script_file}"'),
+                argv=build_confined_argv(
+                    f'& "{interp}" "{script_file}"', dialect="pwsh"
+                ),
                 workdir=workspace,
                 workspace_path=workspace,
                 agent_id=agent_id,

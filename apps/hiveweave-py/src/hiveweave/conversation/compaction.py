@@ -20,6 +20,7 @@ from hiveweave.conversation.token_utils import (
     TOOL_OUTPUT_MAX_CHARS,
     estimate_tokens,
     estimate_tokens_for_messages,
+    resolve_effective_context_window,
 )
 
 logger = structlog.get_logger()
@@ -68,12 +69,14 @@ class Compaction:
     def check_overflow(self, total_tokens: int, context_window: int) -> int | None:
         """检查是否需要压缩，返回目标 budget 或 None。
 
-        当 total_tokens > (context_window - COMPACTION_BUFFER) * ratio 时触发，
+        当 total_tokens > (effective_window - COMPACTION_BUFFER) * ratio 时触发，
         ratio 默认 0.70（可用 HIVEWEAVE_COMPACTION_TRIGGER_RATIO 覆盖）。
+        effective_window = min(声明 context_window, HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW)
+        —— 1M 之类的声明值不得把压缩线抬到永不触发（TEST_DSH_33）。
         """
         if context_window <= 0:
             return None
-        budget = context_window - COMPACTION_BUFFER
+        budget = resolve_effective_context_window(context_window) - COMPACTION_BUFFER
         if budget <= 0:
             return None
         if total_tokens > budget * _compaction_ratio():

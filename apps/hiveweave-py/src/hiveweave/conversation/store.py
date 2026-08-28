@@ -26,6 +26,7 @@ from hiveweave.conversation.token_utils import (
     PRUNE_PROTECT_TOKENS,
     TAIL_TURNS,
     estimate_tokens_for_messages,
+    resolve_effective_context_window,
 )
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
@@ -241,9 +242,11 @@ class ConversationStore:
         current_tokens: int = 0,
     ) -> bool:
         """模型切换时检查是否需要紧急压缩。返回 True 表示已压缩。"""
-        if new_context_window >= old_context_window:
+        old_effective = resolve_effective_context_window(old_context_window)
+        new_effective = resolve_effective_context_window(new_context_window)
+        if new_effective >= old_effective:
             return False
-        budget = self._compaction.check_overflow(current_tokens, new_context_window)
+        budget = self._compaction.check_overflow(current_tokens, new_effective)
         if budget is None:
             return False
         key = (project_id, agent_id)
@@ -251,7 +254,7 @@ class ConversationStore:
         if not messages:
             return False
         # 压缩目标压到新窗口的一半，给系统提示/工具/输出留余量
-        read_budget = max(new_context_window // 2, 16_000)
+        read_budget = max(new_effective // 2, 16_000)
         target_budget = min(budget, read_budget)
         logger.info("model_switch_compact", agent_id=agent_id, budget=target_budget)
         await self._do_compaction(agent_id, project_id, key, messages, target_budget)
@@ -536,6 +539,11 @@ class ConversationStore:
             raise
 
     async def _get_agent_context_window(self, agent_id: str) -> int:
+        """Agent 模型的**有效**上下文窗口（已按封顶收敛）。
+
+        声明值只是 API 上限；压缩预算与 read_budget 都按 min(声明, 封顶) 走，
+        否则 1M 声明会让压缩线（686K）高于实际 prompt 峰值 → 永不触发。
+        """
         try:
             # agents 表在 per-project DB，llm_models 在 meta DB — 无法 JOIN
             agent_row = await project_db.query_one(
@@ -549,10 +557,12 @@ class ConversationStore:
                     [agent_row["model_id"]],
                 )
                 if model_row and model_row["context_window"] and model_row["context_window"] > 0:
-                    return model_row["context_window"]
+                    return resolve_effective_context_window(
+                        model_row["context_window"]
+                    )
         except Exception as e:
             logger.warning("get_context_window_failed", error=str(e))
-        return DEFAULT_CONTEXT_WINDOW
+        return resolve_effective_context_window(DEFAULT_CONTEXT_WINDOW)
 
     # ── 消息清理 ─────────────────────────────────────────────
 

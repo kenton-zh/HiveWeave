@@ -8,6 +8,7 @@
 
 import hashlib
 import math
+import os
 import re
 import tempfile
 import time
@@ -28,6 +29,16 @@ PRUNE_PROTECT_TOKENS = 40_000
 # （10k-20k），否则 DB 回写 no-op → 下一 run 读到未裁剪原文 → 前缀 miss。
 PRUNE_MINIMUM_TOKENS = 10_000
 TOOL_OUTPUT_MAX_CHARS = 2_000
+
+# 有效上下文封顶（HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW，0 = 关闭封顶）。
+# TEST_DSH_33 实证：模型行声明 context_window=1M，压缩线
+# (1M - COMPACTION_BUFFER) * 0.70 ≈ 686K，而实测单请求 prompt 峰值仅 409K ——
+# 压缩/裁剪链路整轮不触发，compacted_prefix 恒为空。声明值是计费上限，不是
+# 「能有效利用」的上限；预算按 min(声明值, 本封顶) 取。
+# 默认 256_000：与主流大窗口档位（262144）同量级，且减去 COMPACTION_BUFFER
+# 后压缩线落在 165K 附近（远高于 PRUNE_PROTECT_TOKENS 40K，压缩早于 in-loop
+# prune 生效）；同时对 max_output=128K 的模型仍留出正输入预算。
+EFFECTIVE_CONTEXT_CAP = 256_000
 
 # 工具输出智能截断限制（镜像 OpenCode ToolOutputStore）
 # 分层：工具侧先收成短契约；此处只是最后兜底（须按行+字节双封顶）
@@ -115,15 +126,53 @@ def estimate_tokens_for_messages(messages: list) -> int:
     return total
 
 
+def effective_context_cap() -> int:
+    """当前生效的有效上下文封顶（0 = 不封顶）。
+
+    读 ``HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW``（每次调用读环境，便于测试与
+    运行时调整）。非法/负值回退默认；显式 0 表示关闭封顶（信任声明值）。
+    """
+    raw = os.environ.get("HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW")
+    if raw is None or not raw.strip():
+        return EFFECTIVE_CONTEXT_CAP
+    try:
+        cap = int(raw.strip())
+    except ValueError:
+        logger.warning("effective_context_cap_invalid", value=raw)
+        return EFFECTIVE_CONTEXT_CAP
+    if cap < 0:
+        logger.warning("effective_context_cap_negative", value=cap)
+        return EFFECTIVE_CONTEXT_CAP
+    return cap
+
+
+def resolve_effective_context_window(context_window: int) -> int:
+    """把模型声明的 context_window 收敛到有效上限。
+
+    声明值 = 计费/API 上限；封顶 = 平台愿意真正填满的上限。压缩与裁剪
+    的预算一律走本函数，避免 1M 之类的声明把整条压缩链路抬到永不触发
+    （TEST_DSH_33：实测 prompt 峰值 409K < 686K 压缩线，压缩零触发）。
+
+    ``context_window <= 0`` 原样返回，交由调用方的既有非法配置语义处理
+    （streamer ``_input_budget`` 硬失败不得被本函数吞掉）。
+    """
+    if context_window <= 0:
+        return context_window
+    cap = effective_context_cap()
+    if cap <= 0:
+        return context_window
+    return min(context_window, cap)
+
+
 def calculate_history_budget(messages: list, context_window: int) -> int:
     """计算对话历史可用 token 预算。
 
-    budget = context_window - COMPACTION_BUFFER
+    budget = effective(context_window) - COMPACTION_BUFFER
     messages 参数预留给未来按静态 prompt 扣减的扩展（当前仅减 buffer）。
     """
     if context_window <= 0:
         return 0
-    return max(context_window - COMPACTION_BUFFER, 0)
+    return max(resolve_effective_context_window(context_window) - COMPACTION_BUFFER, 0)
 
 
 def truncate_tool_output(

@@ -69,10 +69,19 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "do not `cd` expecting the next call to stay there (cwd is your "
             "workspace). Check `Exit code: N` on every result before moving "
             "on. Long output is truncated to head+tail; the full text is "
-            "saved and the path is reported. Windows: Git Bash (`bash -c`) "
-            "first, else cmd — not PowerShell. Prefer `tail -n N`, "
-            "`uv run python` (bare `python` may be missing). Never invent "
-            "`/workspace` or strip backslashes (`D:PC_AI...` is invalid). "
+            "saved and the path is reported. Windows: without the sandbox "
+            "Git Bash (`bash -c`) runs it; under the ACL sandbox (the "
+            "default) the command is actually executed by **pwsh**, and only "
+            "a few unix idioms are translated for you (`ls -l`, `head/tail "
+            "-n N`, `wc -l`, `mkdir -p`, `grep`). Anything else unix-only "
+            "(`sed`, `awk`, `xargs`, `cut`, `find`, `touch`, `which`, "
+            "`sort -u`, `rm -rf`, `echo -e`, …) is rejected up front with the "
+            "pwsh equivalent instead of a confusing \"not recognized\" "
+            "error — rewrite it as suggested, or call the `pwsh` tool and "
+            "write PowerShell directly (same permissions as bash). "
+            "Prefer `uv run python` (bare `python` may be missing). Never "
+            "invent `/workspace` or strip backslashes (`D:PC_AI...` is "
+            "invalid). "
             "Commands may be blocked outright (self-destructive `rm -rf /`, "
             "sensitive files like `.env`/`*.pem`/`id_rsa`, or the "
             "`.hiveweave` system dir) — treat `blocked=true` as a hard "
@@ -1856,6 +1865,28 @@ TOOL_PARAM_SCHEMAS["bash_main"] = {
         "merged HEAD. Slice unit tests stay on bash."
     ),
 }
+# DSH_33 P0: pwsh 一等工具 —— 与 bash 同参数面（command/timeout/background/
+# taskId/testEvidence），描述换成 PowerShell 方言契约（单一真源在 bash.py 的
+# PWSH_TOOL_DESCRIPTION，避免「bash 描述双副本」那种改一处漏一处）。
+from hiveweave.tools.bash import PWSH_TOOL_DESCRIPTION as _PWSH_SCHEMA_DESCRIPTION
+
+TOOL_PARAM_SCHEMAS["pwsh"] = {
+    **TOOL_PARAM_SCHEMAS["bash"],
+    "properties": {
+        **dict(TOOL_PARAM_SCHEMAS["bash"].get("properties") or {}),
+        "command": {
+            "type": "string",
+            "aliases": ["cmd", "run"],
+            "description": (
+                "The PowerShell command to execute, passed to pwsh verbatim "
+                "(no unix→pwsh translation). Use $env:NAME for environment "
+                "variables and the & call operator for quoted programs: "
+                "& \"python\" \"script.py\"."
+            ),
+        },
+    },
+    "description": _PWSH_SCHEMA_DESCRIPTION,
+}
 TOOL_PARAM_SCHEMAS["browse_main"] = {
     **TOOL_PARAM_SCHEMAS["browse"],
     "properties": dict(TOOL_PARAM_SCHEMAS["browse"].get("properties") or {}),
@@ -2112,6 +2143,25 @@ class ToolExecutor:
 
     # ── Public API ────────────────────────────────────────
 
+    @staticmethod
+    def _unknown_tool_error(name: str) -> str | None:
+        """工具名不可达时返回带纠正建议的错误文案，可达返回 ``None``。
+
+        可达 = ``@tool`` 注册表 ∪ ``LEGACY_DISPATCH_TOOLS``（_dispatch 分支）。
+        """
+        # 先导入 hiveweave.tools 触发注册表填充（@tool 装饰器在导入时执行）。
+        import hiveweave.tools  # noqa: F401
+        from hiveweave.tools.base import _TOOL_REGISTRY
+        from hiveweave.tools.pipeline import (
+            LEGACY_DISPATCH_TOOLS,
+            build_unknown_tool_error,
+        )
+
+        known = set(_TOOL_REGISTRY) | set(LEGACY_DISPATCH_TOOLS)
+        if name in known:
+            return None
+        return build_unknown_tool_error(name, known)
+
     async def execute(
         self,
         agent_id: str,
@@ -2132,6 +2182,19 @@ class ToolExecutor:
 
         log.info("tool.execute", agent_id=agent_id, tool=name,
                  args_preview=str(tool_args)[:200])
+
+        # ── 1.2 未知工具 fast-fail（必须早于权限评估）────────
+        # DSH_33 实测：19 次模型幻觉工具名（self.bash / self.get_tasks …）
+        # 全部走完 120s 审批超时才失败 —— 权限层对未注册名落 mode 兜底
+        # "ask"，legacy _dispatch 的 Unknown tool 分支一次都没执行到。
+        # 顺序即修复：可达性先于授权判定 —— 不存在的工具没有"是否允许"
+        # 的问题（对齐 DSH：runner/lookup 失败先于 denial 归因）。
+        unknown_error = self._unknown_tool_error(name)
+        if unknown_error is not None:
+            log.info("tool.unknown", agent_id=agent_id, tool=name)
+            # tool_failed 归因（非 blocked）：blocked 语义专指护栏拒绝，
+            # 未知工具是工具层查找失败，供 stall 检测走 tool_fail 计数。
+            return self._error(unknown_error)
 
         # ── New pipeline path (Phase 2 migration) ──────────
         # Try the registered tool pipeline first. If the tool is registered
@@ -2305,8 +2368,12 @@ class ToolExecutor:
                 call_llm=self.review_llm_callback,
             )
 
-        # Unknown tool — contract 02 error handling
-        return self._error(f"Unknown tool: {name}")
+        # Unknown tool — contract 02 error handling. 正常已被 execute() 的
+        # fast-fail 拦在权限评估之前；此处兜底 _dispatch 的直接调用者，
+        # 文案同样带纠正路径（不留裸 "Unknown tool"）。
+        return self._error(
+            self._unknown_tool_error(name) or f"Unknown tool: {name}"
+        )
 
     # SSRF 防护：禁止访问内网地址
     _SSRF_BLOCKED_HOSTS = frozenset({

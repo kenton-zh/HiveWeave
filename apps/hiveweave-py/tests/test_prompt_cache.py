@@ -572,6 +572,69 @@ def test_billed_prompt_and_hit_percent():
     assert cache_hit_percent(7000, 3000, 0) == 30
 
 
+# ── P2-⑨：cache_creation 量程可观测（区分「不上报」与「确实为 0」）───
+
+
+def test_cache_creation_reported_flag_by_provider():
+    """OpenAI 系不上报 cache 写入 → reported=0；Anthropic 系 → 1。
+
+    修复前 cache_creation 恒为 0，无法区分「provider 不报」与「真的没写」，
+    命中率分母口径不可归因（TEST_DSH_33 的 91.42% 无法定根因）。
+    """
+    from hiveweave.llm.util import provider_reports_cache_creation
+
+    wire = {"prompt_tokens": 10_000, "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 9_000}}
+    for p in ("openai", "openai-compatible", "openai-responses", "google"):
+        assert provider_reports_cache_creation(p) is False, p
+        norm = normalize_usage(wire, p)
+        assert norm["cache_creation"] == 0
+        assert norm["cache_creation_reported"] == 0, p
+    for p in ("anthropic", "Anthropic", "anthropic-messages"):
+        assert provider_reports_cache_creation(p) is True, p
+        assert normalize_usage({"input": 10, "output": 1}, p)[
+            "cache_creation_reported"
+        ] == 1, p
+
+
+def test_cache_creation_reported_when_wire_carries_field():
+    """payload 明确带 cache_creation=0 → reported=1（确实为 0，非缺数据）。"""
+    norm = normalize_usage(
+        {"prompt_tokens": 100, "completion_tokens": 5, "cache_creation": 0},
+        "openai",
+    )
+    assert norm["cache_creation"] == 0
+    assert norm["cache_creation_reported"] == 1
+
+
+def test_cache_creation_scope_aggregation():
+    """聚合按 provider 集合定量程；未知 provider 不得当成「确实为 0」。"""
+    from hiveweave.services.token_meter import (
+        CACHE_SCOPE_MIXED,
+        CACHE_SCOPE_REPORTED,
+        CACHE_SCOPE_UNREPORTED,
+        _with_cache_scope,
+        cache_creation_scope,
+    )
+
+    assert cache_creation_scope("anthropic") == CACHE_SCOPE_REPORTED
+    assert cache_creation_scope("openai,google") == CACHE_SCOPE_UNREPORTED
+    assert cache_creation_scope("anthropic,openai") == CACHE_SCOPE_MIXED
+    assert cache_creation_scope(None) == CACHE_SCOPE_UNREPORTED
+    assert cache_creation_scope("") == CACHE_SCOPE_UNREPORTED
+
+    row = _with_cache_scope({
+        "input_tokens": 1_000,
+        "cache_read_tokens": 9_000,
+        "cache_creation_tokens": 0,
+        "providers": "openai-responses",
+    })
+    assert row["cache_creation_scope"] == CACHE_SCOPE_UNREPORTED
+    assert row["cache_hit_percent"] == 90
+    assert "not reported by provider" in row["cache_hit_basis"]
+    assert "providers" not in row
+
+
 def test_anthropic_message_delta_keeps_cache_from_start():
     handler = AnthropicHandler()
     start = {

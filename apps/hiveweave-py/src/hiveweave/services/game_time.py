@@ -50,6 +50,11 @@ STREAMING_ZOMBIE_TIMEOUT_MS = int(
 WORKTREE_RECONCILE_TICKS = 72  # 72 * 5s = 6min — retry orphan worktree cleanup
 TASK_EVENT_RELAY_TICKS = 6   # 6 * 5s = 30s — process undelivered task events
 OBLIGATION_SCAN_TICKS = 12   # 12 * 5s = 60s — TEST16 D2: scan overdue obligations
+# P0-4 (TEST_DSH_33): approved 收口此前只在 restart / hire / merge 三个事件上
+# 搭便车 —— merge 已 fulfilled 后无人再来看，任务永久停在 approved（M-C
+# 13b71e0d 停 75min 到会话结束）。装定时器；门槛仍由 migrate_orphan_approved
+# 自持（VERIFY 另走 _close_verify_and_parent、10min 宽限、pending merge 义务跳过）。
+ORPHAN_APPROVED_SWEEP_TICKS = 24  # 24 * 5s = 120s
 STALL_IDLE_MS = 10 * 60 * 1000        # 10 min idle threshold
 # 2026-08-22 env 化：看门狗节奏可调（TEST_DSH_24 复盘）。默认不变。
 # 注意耦合：SILENCE 阈值若下调，应 ≥ STREAMING_ZOMBIE_TIMEOUT_MS 的 1/2
@@ -547,6 +552,16 @@ class GameTimeService:
                     project_id=project_id,
                     error=str(e),
                 )
+        # P0-4: approved ledger closure — periodic sweep (was event-only)
+        if state["tick_count"] % ORPHAN_APPROVED_SWEEP_TICKS == 0:
+            try:
+                await self._sweep_orphan_approved(project_id)
+            except Exception as e:
+                log.error(
+                    "orphan_approved_sweep_failed",
+                    project_id=project_id,
+                    error=str(e),
+                )
         # Watchdog: 每 2 分钟检查停滞 agent，直接触发（不经过上级）
         if state["tick_count"] % STALL_CHECK_TICKS == 0:
             await self._check_stalled(project_id)
@@ -681,6 +696,24 @@ class GameTimeService:
                 "worktree_reconcile_tick",
                 project_id=project_id,
                 result=result,
+            )
+
+    async def _sweep_orphan_approved(self, project_id: str) -> None:
+        """Periodic approved-task closure (P0-4, TEST_DSH_33).
+
+        Delegates to ``migrate_orphan_approved`` — all safety gates stay
+        there (VERIFY → ``_close_verify_and_parent``, ``ORPHAN_APPROVED_
+        GRACE_MS`` window, pending merge obligation skip). This only
+        supplies the missing clock; it must not relax any gate.
+        """
+        from hiveweave.services.task import TaskService
+
+        migrated = await TaskService().migrate_orphan_approved(project_id)
+        if migrated.get("verifying") or migrated.get("closed"):
+            log.info(
+                "orphan_approved_sweep_tick",
+                project_id=project_id,
+                **migrated,
             )
 
     async def _process_wait_contracts(self, project_id: str) -> None:

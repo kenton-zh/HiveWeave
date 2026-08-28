@@ -4,6 +4,14 @@ from __future__ import annotations
 DOOM_LOOP_DEFAULT_LIMIT = 3
 """默认 doom loop 阈值 — 同一工具+同一参数连续 N 次中断。"""
 
+TOOL_FAIL_STALL_LIMIT = 2
+"""工具执行失败轮的独立 stall 上限（DSH_33 归因修复）。
+
+刻意与 ``TOOL_LOOP_STALL_LIMIT`` 同值：本次只修**归因**（谁失败了），
+不动**容忍度**（第几轮收口）—— 收口时机与修复前逐轮一致，只有文案与
+``stall_reason`` 改为如实指向工具层。要调容忍度请单独论证。
+"""
+
 BLOCKED_STALL_LIMIT = 3
 """平台护栏拒绝轮（blocked）的独立 stall 上限（H3）。
 
@@ -12,6 +20,24 @@ BLOCKED_STALL_LIMIT = 3
 BLOCKED_STALL_LIMIT 轮全被拒说明当前方案不可执行，仍应收口兜底。
 取值对齐 DOOM_LOOP_DEFAULT_LIMIT=3 的容忍度（同参 blocked 会先被
 doom loop 同参阈值拦住；此处兜底"换着参数试、全被拒"的情形）。
+"""
+
+STALL_REASON_NO_PROGRESS = "no_progress"
+STALL_REASON_TOOL_FAILED = "tool_failed"
+STALL_REASON_RUNNER_FAILED = "runner_failed"
+STALL_REASON_BLOCKED = "blocked"
+STALL_REASON_READONLY = "readonly"
+"""Stall 归因（正交事实位）—— 收口时「谁没动」的唯一口径。
+
+TEST_DSH_33 实测：52 次 tool-loop stall 中 47 次（90.4%）末尾两轮工具
+status=failed —— 护栏判定正确，但文案把「工具执行失败」报成「模型无
+进展」，模型据此反省自己空转，而真正该改的是工具用法。归因必须与计数
+分离：``no_progress``（模型真没动/纯重复）、``tool_failed``（工具执行
+返回失败）、``blocked``（平台护栏拒绝）、``readonly``（只读轮询）。
+
+``runner_failed``（执行器/运行时自身故障，如 [No tool executor]）当前
+与 ``tool_failed`` 同口径计数——两者都「不是模型空转」，且对模型的建议
+一致；保留独立取值位，供后续把运行时故障单独上报/重试时无需改契约。
 """
 
 # ── 只读/幂等轮询工具豁免集合 ──────────────────────────────
@@ -172,4 +198,35 @@ def round_was_readonly_only(
             return False
         saw_ok_readonly = True
     return saw_ok_readonly
+
+
+def classify_stall_round(
+    tool_calls: list[dict],
+    *,
+    error_ids: set[str] | None = None,
+    blocked_ids: set[str] | None = None,
+    duplicate_ids: set[str] | None = None,
+) -> str | None:
+    """本轮 stall 归因，``None`` = 本轮有进展。
+
+    归因顺序对齐 DSH 戒律「先查 runner/tool failure 再判 denial/无进展」
+    （bash-sandbox/src/index.ts:107 "Runner failure outranks denial because
+    the command did not run"）：工具没跑成的轮次，既不是模型空转也不是护栏
+    拒绝，必须先摘出去 —— 否则文案会让模型去反省它并没犯的错。
+    """
+    if round_made_progress(
+        tool_calls, error_ids=error_ids, duplicate_ids=duplicate_ids
+    ):
+        return None
+    errs = error_ids or set()
+    blocked = blocked_ids or set()
+    if errs - blocked:
+        return STALL_REASON_TOOL_FAILED
+    if errs and blocked >= errs:
+        return STALL_REASON_BLOCKED
+    if round_was_readonly_only(
+        tool_calls, error_ids=error_ids, duplicate_ids=duplicate_ids
+    ):
+        return STALL_REASON_READONLY
+    return STALL_REASON_NO_PROGRESS
 

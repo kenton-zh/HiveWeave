@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import difflib
 import inspect
 import structlog
 
@@ -122,6 +123,88 @@ class ToolContext:
     permission: Any = None
     approval: Any = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+LEGACY_DISPATCH_TOOLS = frozenset({
+    "review",
+    "run_code_review",
+    "run_security_audit",
+    "run_tests",
+    "run_perf_audit",
+    "run_full_review",
+})
+"""未注册但由 ``ToolExecutor._dispatch`` 兜住的 legacy 评审套件。
+
+可达性 = 注册表 ∪ 本集合。新增 legacy 分支必须同步登记，否则会被
+未知工具 fast-fail 拦下（这正是我们要的失败模式：漏登记立刻显形，
+而不是静默走 120s 审批再报 "Unknown tool"）。
+"""
+
+_HALLUCINATED_TOOL_PREFIXES = (
+    "self.", "this.", "agent.", "hive.", "hiveweave.", "tools.", "functions.",
+)
+"""模型幻觉前缀 —— 把工具当成自身方法调用（``self.bash``）。
+
+DSH_33 实测 19 次全部形如 ``self.<真实工具名>``：名字本身是对的，只是多
+了个前缀。剥前缀即可给出确切纠正路径，不必让模型去猜。
+"""
+
+
+_TOOL_NAME_FUZZY_CUTOFF = 0.75
+"""拼写纠正的相似度下限（difflib）。0.75 实测可救 ``bahs``→``bash``、
+``get_task``→``get_tasks``；再低会开始给无关名字乱配。"""
+
+
+def suggest_tool_name(tool_name: str, known: set[str]) -> tuple[str, str] | None:
+    """未知工具名 → ``(建议名, 归因)``，无把握时返回 ``None``。
+
+    归因 ``"prefix"`` = 幻觉前缀（``self.bash`` → ``bash``，名字本身没错）；
+    ``"typo"`` = 近似拼写。两者给模型的纠正话术不同，不能混为一谈。
+    """
+    lowered = tool_name.lower()
+    for prefix in _HALLUCINATED_TOOL_PREFIXES:
+        if lowered.startswith(prefix):
+            stripped = tool_name[len(prefix):]
+            if stripped in known:
+                return stripped, "prefix"
+            if stripped.lower() in known:
+                return stripped.lower(), "prefix"
+            break
+    bare = tool_name.rsplit(".", 1)[-1]
+    for candidate in (tool_name, bare):
+        matches = difflib.get_close_matches(
+            candidate, sorted(known), n=1, cutoff=_TOOL_NAME_FUZZY_CUTOFF
+        )
+        if matches:
+            return matches[0], "typo"
+    return None
+
+
+def build_unknown_tool_error(tool_name: str, known: set[str]) -> str:
+    """未知工具的回执 —— 必须带「正确路径」，不能只报裸 unknown tool。
+
+    对齐 DSH ``ToolNotFoundError(toolName, reachableFrom)``（core/tools/
+    src/index.ts:494）：模型读到裸 "unknown tool" 会以为部署坏了，于是
+    重试或改道，而不是纠正自己的调用方式。
+    """
+    # 不加 "[Tool Error] " 前缀：agents/streaming.py 回传时已拼 "Error: "，
+    # 与同层 "Parameter error in '...'" 的无前缀风格一致。
+    base = f"Unknown tool '{tool_name}'."
+    suggested = suggest_tool_name(tool_name, known)
+    if suggested is None:
+        return (
+            f"{base} 该名字没有注册在本平台的任何工具上。请只调用本次对话里"
+            "声明给你的工具名（可用 get_platform_state 查看你当前的能力范围），"
+            "不要自造工具名或调用别的 agent 的工具。"
+        )
+    name, kind = suggested
+    if kind == "prefix":
+        return (
+            f"{base} Did you mean '{name}'? "
+            f"直接用不带 self. 前缀的工具名 '{name}' 调用 —— 工具是平台提供的"
+            "调用项，不是你的方法，不要写成 self./this./agent. 形式。"
+        )
+    return f"{base} Did you mean '{name}'? 请用准确的工具名 '{name}' 重新调用。"
 
 
 async def _refuse_project_root_write(

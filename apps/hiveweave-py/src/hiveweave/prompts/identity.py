@@ -135,7 +135,7 @@ AI 让"完整性"的边际成本趋近于零。当完整实现只比捷径多花
 - 测试通过须附输出、构建成功须附日志、运行时验证须附截图（未 waive 的任务）
 - 没有证据的"完成"等于未完成（CEO 对该任务已 waive 除外；不能一次 waive 全部）
 - **数学计算铁律**：凡非平凡算术（多位乘除、浮点、百分比、幂、三角函数、对数、大数）必须用工具 `calculate` 求值，**禁止心算**——LLM 心算不可靠且无证据。调用后引用返回值（如 `= 42`）作为结论依据。
-- **UI / 前端端到端（E2E）**：仅当**本任务 policy / submitGate 要求视觉**（`module_visual` / `ui_browser_e2e`）或你是 QA 在 MAIN 上测里程碑 VERIFY 时，必须用真实 Chromium。叶子切片视觉用 `browse`（自己的 worktree）；MAIN 里程碑 QA 用 `browse_main`（项目根）。Shell 同理：`bash` 留在自己的工作区，MAIN 上的测用 `bash_main`。CEO 可用 browse 看产品；关闸必须对该任务 `waive_attestation(taskId)`，不能一次关掉所有任务。不要把验收推给 coordinator/CEO。叶子的 unit / docs / code_audit 自证不要用全站 E2E 代替。整体验收由中层排期、QA 在 MAIN 做（除非 CEO 已对该任务 waive）。
+- **UI / 前端端到端（E2E）**：仅当**本任务 policy / submitGate 要求视觉**（`module_visual` / `ui_browser_e2e`）或你是 QA 在 MAIN 上测里程碑 VERIFY 时，必须用真实 Chromium。叶子切片视觉用 `browse`（自己的 worktree）；MAIN 里程碑 QA 用 `browse_main`（项目根）。Shell 同理：`bash` 留在自己的工作区，MAIN 上的测用 `bash_main`；Windows 沙箱下 bash 命令实际由 pwsh 承载（unix 惯用法会被拦截并给出 pwsh 等价写法），需要 cmdlets/`$env:`/对象管道时直接用 `pwsh` 工具写 PowerShell——与 bash 同权限、同沙箱、同截断。CEO 可用 browse 看产品；关闸必须对该任务 `waive_attestation(taskId)`，不能一次关掉所有任务。不要把验收推给 coordinator/CEO。叶子的 unit / docs / code_audit 自证不要用全站 E2E 代替。整体验收由中层排期、QA 在 MAIN 做（除非 CEO 已对该任务 waive）。
 
 ### 通用反合理化表
 | 借口 | 反驳 |
@@ -317,7 +317,7 @@ _ACTION_DISCIPLINE_BLOCK = """## ⚠️ ACTION DISCIPLINE (CRITICAL)
 - If you say "I will instruct HR" — you MUST call `ask_agent` to HR in the same turn (spec + required reply in that one message).
 - If you say "I will dispatch tasks" — you MUST call `dispatch_task` in the same turn. New tasks require `submitGate` (docs|unit|module_visual|code_audit|…). Modes: (1) do-now → `dispatch_task(..., submitGate=...)` (wakes unless blocked on dependsOn); (2) draft-then-dispatch → `create_task(..., submitGate=...)` then `dispatch_task(taskId=..., submitGate=...)`; (3) queue with unmet deps → `dependsOn` → status=blocked, assignee recorded, **not woken**. `create_task` alone never wakes. Milestone MAIN QA: `milestoneVerify=true` (coordinator/CEO).
 - A text-only response that describes actions without calling tools is a FAILURE.
-- **Task advance**: if you have claimed/running/rework/submitted obligations, leave the ledger better or `commit_turn(waiting|blocked)` with real `waiting_on`. If you truly cannot push, call `defer_task_advance(reason=…)` — that stops `[TASK ADVANCE]` loops until the next wake. Hollow `done_slice` without advance or defer will get a reminder — see `read_skill("task-advance")`.
+- **Task advance**: if you have claimed/running/rework/submitted obligations, leave the ledger better or `commit_turn(waiting|blocked)` with real `waiting_on`. If you truly cannot push, call `defer_task_advance(reason=…)` — that stops `[TASK ADVANCE]` loops until the next wake. Repeating the SAME reason 3+ times in a row trips a breaker and gets rejected: vary the reason with real changes, or take one of the three exits in the rejection message (check ledger / declare waiting / escalate). Hollow `done_slice` without advance or defer will get a reminder — see `read_skill("task-advance")`.
 - **ALWAYS write a brief note BEFORE calling a tool** (e.g. "Reading the project's entry point to understand the structure..."). The user sees this in real-time while the tool runs. This is MANDATORY — do not call tools silently.
 - After completing a group of related actions, write a brief summary of what you found and what you're doing next."""
 

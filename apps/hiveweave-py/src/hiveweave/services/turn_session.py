@@ -115,3 +115,48 @@ def is_task_advance_deferred(agent_id: str) -> bool:
 def clear_task_advance_deferred(agent_id: str) -> None:
     with _lock:
         _defer_advance.pop(agent_id, None)
+
+
+# ── defer 连发断路器（P0-4, TEST_DSH_33）──────────────────
+# 砚舟在 257 分钟内 defer 17 次，reason 几乎一字不差，平台无限静默接受。
+# 同一 agent 连续用语义相同的 reason 关催办 = 停滞而非等待：达阈值后
+# defer 不再静默接受（工具侧升级 + work_log 留痕），且 [TASK ADVANCE]
+# 恢复提醒。streak 故意**不**随外部唤醒清除（跨唤醒复读正是本例形态），
+# 只在 reason 变化或本轮真正推动了账本时清零。
+
+DEFER_REASON_STREAK_LIMIT = 3
+# 归一化后取前 N 字符做 key：容忍尾部细微改写，抓住"同一句话"复读。
+DEFER_REASON_KEY_CHARS = 80
+
+_defer_reason_streak: dict[str, tuple[str, int]] = {}
+
+
+def normalize_defer_reason(reason: str) -> str:
+    """Semantic key for a defer reason — whitespace/case-insensitive prefix."""
+    compact = "".join(str(reason or "").split()).lower()
+    return compact[:DEFER_REASON_KEY_CHARS]
+
+
+def record_defer_reason(agent_id: str, reason: str) -> int:
+    """Count consecutive defers carrying the same reason key. Returns the count."""
+    key = normalize_defer_reason(reason)
+    with _lock:
+        prev_key, prev_n = _defer_reason_streak.get(agent_id, ("", 0))
+        n = prev_n + 1 if key and key == prev_key else 1
+        _defer_reason_streak[agent_id] = (key, n)
+        return n
+
+
+def defer_reason_streak(agent_id: str) -> int:
+    with _lock:
+        return _defer_reason_streak.get(agent_id, ("", 0))[1]
+
+
+def defer_breaker_tripped(agent_id: str) -> bool:
+    """True once the same reason has been deferred ``LIMIT`` times in a row."""
+    return defer_reason_streak(agent_id) >= DEFER_REASON_STREAK_LIMIT
+
+
+def clear_defer_reason_streak(agent_id: str) -> None:
+    with _lock:
+        _defer_reason_streak.pop(agent_id, None)

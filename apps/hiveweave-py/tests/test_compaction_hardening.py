@@ -619,21 +619,29 @@ async def test_concurrent_execute_transaction_serialized(task_env):
 
 
 def test_compaction_trigger_ratio_default_070():
-    """默认压缩阈值 = 70%（512K 窗口：budget≈504288，70%≈353K）。
+    """默认压缩阈值 = 70%，量纲 = **有效**窗口（min(声明, 256K 封顶)）。
 
-    300K（<70%）不触发；360K（>70%）触发。回归 50%→70% 的调高。
+    512K 声明 → 有效 256K → budget=236000，70%≈165.2K。
+    150K（<70%）不触发；180K（>70%）触发。回归 50%→70% 的调高，
+    同时锁住 P1-⑤：声明值不再直接决定压缩线。
     """
     from hiveweave.conversation import compaction as comp
+    from hiveweave.conversation.token_utils import (
+        EFFECTIVE_CONTEXT_CAP,
+        resolve_effective_context_window,
+    )
 
     assert comp.COMPACTION_TRIGGER_RATIO == 0.70
+    assert resolve_effective_context_window(524_288) == EFFECTIVE_CONTEXT_CAP
     c = comp.Compaction()
+    effective_budget = EFFECTIVE_CONTEXT_CAP - comp.COMPACTION_BUFFER
     # <70% → 不压缩
-    assert c.check_overflow(300_000, 524_288) is None
-    assert c.should_compact(300_000, 524_288) is False
-    # >70% → 压缩，返回 budget
-    budget = c.check_overflow(360_000, 524_288)
-    assert budget == 524_288 - comp.COMPACTION_BUFFER
-    assert c.should_compact(360_000, 524_288) is True
+    assert c.check_overflow(150_000, 524_288) is None
+    assert c.should_compact(150_000, 524_288) is False
+    # >70% → 压缩，返回按有效窗口算的 budget
+    budget = c.check_overflow(180_000, 524_288)
+    assert budget == effective_budget
+    assert c.should_compact(180_000, 524_288) is True
 
 
 def test_compaction_trigger_ratio_env_override():
@@ -646,13 +654,72 @@ def test_compaction_trigger_ratio_env_override():
         comp = importlib.import_module("hiveweave.conversation.compaction")
         importlib.reload(comp)
         c = comp.Compaction()
-        # budget≈504288, 85%≈428K
-        assert c.check_overflow(400_000, 524_288) is None
-        assert c.should_compact(450_000, 524_288) is True
+        # 有效窗口 256K → budget=236000, 85%≈200.6K
+        assert c.check_overflow(190_000, 524_288) is None
+        assert c.should_compact(210_000, 524_288) is True
     # 恢复默认（重载）
     comp = importlib.import_module("hiveweave.conversation.compaction")
     importlib.reload(comp)
     assert comp.COMPACTION_TRIGGER_RATIO == 0.70
+
+
+# ── P1-⑤：有效上下文封顶（1M 声明不得让压缩永不触发） ─────────────
+
+
+def test_effective_context_cap_clamps_million_window():
+    """1M 声明 → 有效 256K；实测 409K 峰值必须触发压缩。
+
+    修复前：压缩线 = (1M − 20K) × 0.70 ≈ 686K > 409K，全项目零压缩。
+    修复后：压缩线 = (256K − 20K) × 0.70 = 165.2K，409K 远超线。
+    """
+    from hiveweave.conversation.compaction import Compaction
+    from hiveweave.conversation.token_utils import (
+        EFFECTIVE_CONTEXT_CAP,
+        calculate_history_budget,
+        resolve_effective_context_window,
+    )
+
+    assert resolve_effective_context_window(1_000_000) == EFFECTIVE_CONTEXT_CAP
+    # 声明值小于封顶时原样透传（不抬高小窗口）
+    assert resolve_effective_context_window(128_000) == 128_000
+    assert calculate_history_budget([], 1_000_000) == EFFECTIVE_CONTEXT_CAP - 20_000
+
+    c = Compaction()
+    assert c.should_compact(409_299, 1_000_000) is True
+    # 修复前的旧压缩线之下、新压缩线之上的区间同样触发
+    assert c.should_compact(257_000, 1_000_000) is True
+    # 低于新压缩线仍不触发（未把压缩变成常态）
+    assert c.should_compact(100_000, 1_000_000) is False
+
+
+def test_effective_context_cap_env_override_and_disable():
+    """HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW 可调；显式 0 = 关闭封顶。"""
+    from hiveweave.conversation.token_utils import (
+        EFFECTIVE_CONTEXT_CAP,
+        effective_context_cap,
+        resolve_effective_context_window,
+    )
+
+    with patch.dict("os.environ", {"HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW": "200000"}):
+        assert effective_context_cap() == 200_000
+        assert resolve_effective_context_window(1_000_000) == 200_000
+    with patch.dict("os.environ", {"HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW": "0"}):
+        assert resolve_effective_context_window(1_000_000) == 1_000_000
+    # 非法值回退默认，不静默变成 0（那等于关闭封顶）
+    with patch.dict("os.environ", {"HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW": "abc"}):
+        assert effective_context_cap() == EFFECTIVE_CONTEXT_CAP
+    with patch.dict("os.environ", {"HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW": "-5"}):
+        assert effective_context_cap() == EFFECTIVE_CONTEXT_CAP
+
+
+def test_effective_cap_preserves_illegal_window_semantics():
+    """context_window <= 0 原样透传 —— 非法配置的硬失败语义不被封顶吞掉。"""
+    from hiveweave.conversation.compaction import Compaction
+    from hiveweave.conversation.token_utils import resolve_effective_context_window
+
+    assert resolve_effective_context_window(0) == 0
+    assert resolve_effective_context_window(-1) == -1
+    assert Compaction().check_overflow(999_999, 0) is None
 
 
 def test_compaction_trigger_ratio_env_clamped():

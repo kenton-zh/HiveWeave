@@ -57,6 +57,69 @@ async def test_seed_arrays_include_task_advance():
         )
 
 
+# ── P2-⑪: seed CEO/HR 继承项目级 language（与 hire 路径同口径）────────────
+
+
+@pytest.mark.asyncio
+async def test_seed_agents_inherit_project_language():
+    """CEO/HR 的 language 必须读 project_meta.language。
+
+    实证：project_meta.language='zh'，但 seed 出来的 A267(CEO)/A268(HR) 是
+    'en'（schema 默认），而 hire 出来的 A269–A274 是 'zh' —— 同项目语言分裂。
+    """
+    from hiveweave.api.projects import _seed_default_agents
+    from hiveweave.services.model import ModelService
+    from hiveweave.services.org import OrgService
+
+    created: list[dict] = []
+
+    async def fake_create(attrs, bootstrap=False):
+        created.append(attrs)
+        return {"id": f"id-{attrs['role']}"}
+
+    stale_cursor = AsyncMock()
+    stale_cursor.fetchall = AsyncMock(return_value=[])
+    lang_cursor = AsyncMock()
+    lang_cursor.fetchone = AsyncMock(return_value={"language": "zh"})
+
+    fake_conn = AsyncMock()
+    fake_conn.execute = AsyncMock(side_effect=[stale_cursor, lang_cursor])
+    fake_conn.commit = AsyncMock()
+
+    with (
+        patch(
+            "hiveweave.api.projects.project_db.get_project_db_by_project_id",
+            new=AsyncMock(return_value=fake_conn),
+        ),
+        patch.object(OrgService, "list_agents", new=AsyncMock(return_value=[])),
+        patch.object(
+            ModelService, "resolve_model", new=AsyncMock(return_value=None)
+        ),
+        patch.object(ModelService, "list_active", new=AsyncMock(return_value=[])),
+        patch.object(OrgService, "create_agent", side_effect=fake_create),
+    ):
+        await _seed_default_agents("proj-1")
+
+    assert created, "seed 应至少创建默认 agent"
+    by_role = {a["role"]: a for a in created}
+    for role in ("ceo", "hr"):
+        assert by_role[role]["language"] == "zh", (
+            f"{role} 未继承项目 language: {by_role[role].get('language')}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_seed_language_falls_back_to_zh_when_meta_missing():
+    """读不到 project_meta 时回落 'zh' —— 与 hire 路径一致，不落 'en'。"""
+    from hiveweave.api.projects import _resolve_seed_language
+
+    with patch(
+        "hiveweave.api.projects.project_db.get_project_db_by_project_id",
+        new=AsyncMock(side_effect=RuntimeError("no db")),
+    ):
+        assert await _resolve_seed_language("proj-x") == "zh"
+
+
 # ── H8: commit_turn hard rule present in identity + executor prompts ────────
 
 

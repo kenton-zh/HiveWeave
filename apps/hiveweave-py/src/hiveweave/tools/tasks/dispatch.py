@@ -454,6 +454,22 @@ async def dispatch_task_tool(
                 "\n\n⚠ ARTIFACT_REF WARNINGS:\n"
                 + "\n".join(f"- {w}" for w in artifact_warnings)
             )
+        # P1-7: 同一份收口期望回显给派单方 —— 派完就知道对方要交什么凭证，
+        # 便于同轮补 waive / 改 submitGate，而不是等 submit 被拒才发现。
+        try:
+            from hiveweave.services.tasks.policy import (
+                format_submit_expectations,
+            )
+
+            block = format_submit_expectations(
+                await _task_svc.TaskService().get_task(
+                    project_id, str(result.get("task_id") or "")
+                )
+            )
+            if block:
+                output += f"\n\n{block}"
+        except Exception as e:
+            log.debug("dispatch_expectations_echo_failed", error=str(e))
         return ToolResult.ok(output + force_note, task_id=result.get("task_id"))
     return ToolResult.err(result.get("message", "Dispatch failed"))
 

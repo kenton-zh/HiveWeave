@@ -380,6 +380,36 @@ class DispatchService:
                         )
                 except Exception as e:
                     log.warning("dispatch_contract_setup_failed", error=str(e))
+
+                # P1-7 (TEST_DSH_33): 收口期望前置下发 —— submit 侧本来就能
+                # 算出 attestation kind 与 deliveryContract 必填项，此前只在
+                # submit 被拒时才反推（13 次调用失败 6 次，5 次是"撞了才知道
+                # 规则"）。这里复用同一份推导（services/tasks/policy.py），
+                # 钉进 assignee 可见的任务描述。放在 contract 落库之后，
+                # 否则 delivery_contract_fields 读不到刚建的契约。
+                try:
+                    from hiveweave.services.tasks.policy import (
+                        format_submit_expectations,
+                    )
+
+                    _trow2 = await self.task_service.get_task(
+                        project_id, task_id
+                    )
+                    block = format_submit_expectations(_trow2)
+                    if block and block not in description_out:
+                        description_out += f"\n\n{block}"
+                        # 回写账本：dispatch 自动认领的 assignee 不会再调
+                        # claim_task（那里也回显同一块），inbox 消息读过即走，
+                        # 任务描述是它日后唯一能重读到期望的地方。
+                        await self.task_service.update_task(
+                            project_id, task_id, description=description_out
+                        )
+                except Exception as e:
+                    log.warning(
+                        "dispatch_submit_expectations_failed",
+                        task_id=task_id,
+                        error=str(e),
+                    )
             elif assignee and not agent_gets_write_worktree(assignee):
                 log.warning(
                     "dispatch_to_non_writer",

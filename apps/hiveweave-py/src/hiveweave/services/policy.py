@@ -121,6 +121,9 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "git_worktree_remove": frozenset({Capability.MERGE}),
     "bash": frozenset({Capability.BASH_SHELL}),
     "bash_main": frozenset({Capability.BASH_SHELL}),
+    # pwsh = bash 的 PowerShell 方言同胞（DSH_33 P0）：同一条执行管线、同一
+    # 硬门。不新造能力位 —— 凡有 BASH_SHELL 者可用，CEO/HR 照旧撞门。
+    "pwsh": frozenset({Capability.BASH_SHELL}),
     "job_kill": frozenset({Capability.BASH_SHELL}),
     "run_command": frozenset({Capability.BASH_SHELL}),
     # dev server 可执行任意命令 → 与 bash 同硬门（2026-08-13 审计：此前
@@ -467,7 +470,9 @@ class PolicyService:
         reason = tool_hard_deny(agent, tool_name)
         if reason:
             return reason
-        if tool_name in ("bash", "bash_main", "run_command", "start_dev_server"):
+        if tool_name in (
+            "bash", "bash_main", "pwsh", "run_command", "start_dev_server"
+        ):
             from hiveweave.services.eval_seal import sealed_bash_deny
 
             cmd = ""

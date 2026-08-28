@@ -6,6 +6,7 @@ import time
 
 from typing import Any, Literal
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from hiveweave.tools.helpers import coerce_to_list
@@ -21,6 +22,8 @@ from hiveweave.services.turn_session import (
     get_pending_turn_result,
     set_pending_turn_result,
 )
+
+log = structlog.get_logger(__name__)
 
 
 async def _archive_turn_lessons(agent_id: str, tr: Any, ctx: Any) -> None:
@@ -429,7 +432,11 @@ async def defer_task_advance_tool(
     params: DeferTaskAdvanceParams, agent_id: str, workspace: str, ctx=None
 ) -> ToolResult:
     """Mark this wake cycle as intentional no-advance — stops nudge loop."""
-    from hiveweave.services.turn_session import set_task_advance_deferred
+    from hiveweave.services.turn_session import (
+        DEFER_REASON_STREAK_LIMIT,
+        record_defer_reason,
+        set_task_advance_deferred,
+    )
 
     reason = (params.reason or "").strip()
     if not reason:
@@ -438,7 +445,12 @@ async def defer_task_advance_tool(
             "(why you cannot advance now)."
         )
 
-    set_task_advance_deferred(agent_id, True)
+    streak = record_defer_reason(agent_id, reason)
+    tripped = streak >= DEFER_REASON_STREAK_LIMIT
+    # Tripped: also lift the standing suppression, otherwise a flag set by an
+    # earlier defer keeps [TASK ADVANCE] muted through every platform
+    # self-continue (no external wake ⇒ nothing clears it).
+    set_task_advance_deferred(agent_id, not tripped)
 
     try:
         from hiveweave.db import meta as meta_db
@@ -448,21 +460,54 @@ async def defer_task_advance_tool(
         if not project_id and ctx is not None:
             project_id = getattr(ctx, "project_id", None)
         if project_id:
+            prefix = "[不推进复读]" if tripped else "[不推进]"
             await WorkLogService().write_work_log(
                 project_id,
                 agent_id,
                 None,
-                "task_advance_deferred",
-                f"[不推进] {reason}"[:140],
-                details={"reason": reason},
+                (
+                    "task_advance_defer_breaker"
+                    if tripped
+                    else "task_advance_deferred"
+                ),
+                f"{prefix} {reason}"[:140],
+                details={
+                    "reason": reason,
+                    "same_reason_streak": streak,
+                    "breaker_tripped": tripped,
+                },
             )
     except Exception:
         pass
+
+    if tripped:
+        log.warning(
+            "defer_task_advance_breaker_tripped",
+            agent_id=agent_id,
+            streak=streak,
+            reason=reason[:120],
+        )
+        return ToolResult.err(
+            f"defer_task_advance 已被断路器拦下：同一理由连续第 {streak} 次"
+            f"（阈值 {DEFER_REASON_STREAK_LIMIT}）。复读同一句"
+            f"「不推进」不是等待，是停滞——催办不再关闭。请择一：\n"
+            f"1) 若任务其实已具备收口条件（已 approved 且 merge 已落库），"
+            f"检查 get_platform_state 的 ledger，不必再 merge；approved 由"
+            f"平台定时收口（约 2 分钟一轮，超 10 分钟宽限即关闭）。\n"
+            f"2) 若确在等人：commit_turn(phase=waiting, "
+            f"waiting_on={{kind:'agent'|'task', ref:'<id>'}})，让等待可被"
+            f"超时唤醒与成环检测看见。\n"
+            f"3) 若已无路可走：向上级/CEO 上报阻塞点（ask_agent 写清缺什么、"
+            f"需要谁决策），不要再 defer。\n"
+            f"换一个真实变化的理由重试才会被接受。 reason={reason[:200]}"
+        )
 
     return ToolResult.ok(
         "已声明不推进。平台不会再因「未推动任务」循环提醒你，"
         "直到你被再次唤醒。请接着 commit_turn"
         "(通常 phase=waiting 或 blocked，并写清 waiting_on)。"
+        f" 同一理由已连续 {streak}/{DEFER_REASON_STREAK_LIMIT} 次——"
+        f"到阈值将不再接受，届时请上报上级或复核任务是否已可收口。"
         f" reason={reason[:200]}"
     )
 

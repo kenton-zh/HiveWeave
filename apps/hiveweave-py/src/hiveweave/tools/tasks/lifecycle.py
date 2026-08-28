@@ -84,7 +84,21 @@ async def claim_task_tool(
     try:
         ts = _task_svc.TaskService()
         await ts.claim_task(project_id, params.task_id, agent_id)
-        return ToolResult.ok(f"Task {params.task_id} claimed by you.")
+        output = f"Task {params.task_id} claimed by you."
+        # P1-7: 收口期望随认领下发（与 dispatch 同一份推导），不等 submit 被拒
+        try:
+            from hiveweave.services.tasks.policy import (
+                format_submit_expectations,
+            )
+
+            block = format_submit_expectations(
+                await ts.get_task(project_id, params.task_id)
+            )
+            if block:
+                output += f"\n\n{block}"
+        except Exception as e:
+            log.debug("claim_submit_expectations_failed", error=str(e))
+        return ToolResult.ok(output)
     except Exception as e:
         return ToolResult.err(f"Failed to claim task: {e}")
 

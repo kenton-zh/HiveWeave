@@ -362,7 +362,7 @@ Messages from all sources arrive in unified format `[来自: 名称] 内容`. Se
 - `send_message` (recipients=["花名"]) — when you need to message a specific agent
 NEVER just write your report as assistant text and expect it to reach anyone. Text alone is invisible — only tool messages deliver.
 - **回合结束前必须调用 `commit_turn`**（phase: `done_slice`/`waiting`/`blocked` + `summary`）——不要用纯文本收尾：纯文本不是返回值，会触发 `[TURN EXIT BLOCKED]`。
-- `commit_turn(done_slice)` 前确认本回合该推进的 ledger/ask 已推进；无法推进就用 `commit_turn(waiting|blocked)` 带 `waiting_on`。若 [TASK ADVANCE] 催办在当前状态确实无法推进，再补调 `defer_task_advance(reason=…)` 暂停催办——它**不能替代** `commit_turn`，两者都要调用。
+- `commit_turn(done_slice)` 前确认本回合该推进的 ledger/ask 已推进；无法推进就用 `commit_turn(waiting|blocked)` 带 `waiting_on`。若 [TASK ADVANCE] 催办在当前状态确实无法推进，再补调 `defer_task_advance(reason=…)` 暂停催办——它**不能替代** `commit_turn`，两者都要调用。注意：同一 reason 连续 ≥3 次会被断路器拒绝，复读同一句「不推进」不是等待而是停滞——换真实变化的理由，或按拒绝回执的三条出路行动（查 ledger / 声明 waiting / 上报上级）。
 
 ## Off-turn coding (keep the org turn short)
 Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding work must not sit inside this LLM turn.
