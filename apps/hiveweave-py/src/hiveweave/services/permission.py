@@ -83,7 +83,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     "edit_file", "apply_patch", "delete_file", "move_file",
     "create_directory", "delete_directory", "search_files",
     "bash", "bash_main", "run_command", "run_tests", "browse", "browse_main", "game_run_case", "game_run_case_main",
-    "pwsh",
+    "pwsh", "pwsh_main",
     "job_kill",
     "spawn_subagent",
     "generate_image",
@@ -109,7 +109,7 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
 # PolicyService still hard-denies based on role family.
 READONLY_TOOLS = _BASE_TOOLS | frozenset({
     "bash", "bash_main", "python_script", "write_file", "browse", "browse_main", "assert_visual", "game_run_case", "game_run_case_main", "edit_file",
-    "pwsh",
+    "pwsh", "pwsh_main",
     "job_kill",
     "spawn_subagent",
     "generate_image",
@@ -285,6 +285,12 @@ class PermissionService:
             names = READONLY_TOOLS
         # 工具表可见性跟硬门对齐：列在表里但 capability 不够的不要发给模型（撞门）。
         visible = {n for n in names if tool_hard_deny(agent, n) is None}
+        # T3.2: 宿主不暴露的工具（Windows pwsh 宿主上的 bash/bash_main）
+        # 不发给模型 —— tool_hard_deny 的 host 段已含同一判定，这里再过滤
+        # 一道保证清单干净。
+        from hiveweave.services.host_env import filter_tools_for_host
+
+        visible = set(filter_tools_for_host(visible))
         return sorted(visible)
 
     def _parse_list(self, raw: Any) -> list[str]:
@@ -337,7 +343,7 @@ class PermissionService:
     def _extract_args_string(self, tool_name: str, tool_args: dict | None) -> str:
         if tool_args is None:
             return ""
-        if tool_name in ("bash", "bash_main"):
+        if tool_name in ("bash", "bash_main", "pwsh", "pwsh_main"):
             return str(tool_args.get("command", tool_args.get("cmd", "")))
         parts = []
         for v in tool_args.values():

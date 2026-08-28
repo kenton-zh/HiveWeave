@@ -1720,7 +1720,11 @@ class Agent:
             except (json.JSONDecodeError, TypeError):
                 tool_names = []
 
-        return _build_tool_definitions(tool_names)
+        # T3.2: 宿主不暴露的工具（Windows pwsh 宿主上的 bash/bash_main）
+        # 不进模型工具表 —— custom 模式的存量 allowed_tools 也一并过滤。
+        from hiveweave.services.host_env import filter_tools_for_host
+
+        return _build_tool_definitions(filter_tools_for_host(tool_names))
 
     def _get_max_tool_rounds(self) -> int:
         """获取 tool loop 最大轮次。所有角色统一 600 次。"""

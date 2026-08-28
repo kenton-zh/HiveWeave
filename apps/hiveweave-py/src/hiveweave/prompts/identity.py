@@ -388,4 +388,9 @@ def build_identity_prompt(
 
     prompt = "\n\n".join(sections).strip()
     prompt = _normalize_cjk_punct(prompt)
+    # T3.2: 角色脚本里的 bash 系工具名替换为本宿主实际暴露的名字
+    # （Windows pwsh 宿主 → pwsh / pwsh_main），与工具表过滤同步。
+    from hiveweave.prompts.host_shells import apply_host_shell_names
+
+    prompt = apply_host_shell_names(prompt)
     return prompt + _language_rule_suffix(model_id)

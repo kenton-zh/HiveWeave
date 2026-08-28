@@ -2853,7 +2853,7 @@ PWSH_TOOL_DESCRIPTION = (
     "job_kill. Do not use background=true for vite / npm run dev / uvicorn / "
     "http.server (servers never finish, so waiting_on never fires) — prefer "
     "start_dev_server. Do not append & on a foreground command. "
-    "Project-root tests / MAIN QA: use bash_main."
+    "Project-root tests / MAIN QA: use pwsh_main."
 )
 
 
@@ -2903,6 +2903,31 @@ async def bash_main_tool(
         return ToolResult.err(err)
     note = "\n\n[cwd=project root]"
     result = await bash_tool(params, agent_id, main_ws)
+    return _with_cwd_note(result, note)
+
+
+@tool(
+    "pwsh_main",
+    "Execute a PowerShell command at the PROJECT ROOT (shared MAIN), not "
+    "your worktree. Same params as pwsh. Use this for milestone VERIFY "
+    "tests, MAIN git/log, or anything that must see merged HEAD. Your own "
+    "slice unit tests stay on pwsh (worktree). Platform does not rewrite "
+    "pwsh cwd.",
+    requires_workspace=True,
+    security_level="shell",
+)
+async def pwsh_main_tool(
+    params: BashParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """pwsh at project root — agent chose MAIN explicitly (T3.2)."""
+    from hiveweave.tools.helpers import get_project_id
+
+    project_id = await get_project_id(agent_id)
+    main_ws, err = await resolve_project_main_cwd(project_id)
+    if not main_ws:
+        return ToolResult.err(err)
+    note = "\n\n[cwd=project root]"
+    result = await pwsh_tool(params, agent_id, main_ws)
     return _with_cwd_note(result, note)
 
 

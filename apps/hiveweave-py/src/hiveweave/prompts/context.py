@@ -173,7 +173,10 @@ def _format_memory_block(
 
     if not blocks:
         return ""
-    return "\n\n".join(blocks)
+    # T3.2: 上下文段里的 bash 系工具名与工具表过滤同步（Windows pwsh 宿主）。
+    from hiveweave.prompts.host_shells import apply_host_shell_names
+
+    return apply_host_shell_names("\n\n".join(blocks))
 
 
 def _build_skills_section(bound_skills: list[str] | str | None) -> str:

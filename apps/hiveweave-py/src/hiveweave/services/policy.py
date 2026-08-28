@@ -124,6 +124,8 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     # pwsh = bash 的 PowerShell 方言同胞（DSH_33 P0）：同一条执行管线、同一
     # 硬门。不新造能力位 —— 凡有 BASH_SHELL 者可用，CEO/HR 照旧撞门。
     "pwsh": frozenset({Capability.BASH_SHELL}),
+    # T3.2: MAIN 位（pwsh 宿主顶替 bash_main），同硬门。
+    "pwsh_main": frozenset({Capability.BASH_SHELL}),
     "job_kill": frozenset({Capability.BASH_SHELL}),
     "run_command": frozenset({Capability.BASH_SHELL}),
     # dev server 可执行任意命令 → 与 bash 同硬门（2026-08-13 审计：此前
@@ -330,6 +332,16 @@ def tool_hard_deny(agent: dict[str, Any], tool_name: str) -> str | None:
     sealed = sealed_tool_deny(agent, tool_name)
     if sealed:
         return sealed
+    # T3.2 纵深防御：Windows pwsh 宿主上 bash/bash_main 不暴露 —— 模型按
+    # 陈旧提示直调时给出可操作错误（指向 pwsh / pwsh_main），而不是执行。
+    try:
+        from hiveweave.services.host_env import host_tool_deny_reason
+
+        host_deny = host_tool_deny_reason(tool_name)
+        if host_deny:
+            return host_deny
+    except Exception:
+        pass  # 过滤层故障不改变能力判定结果（fail-open 到能力门）
     caps = capabilities_for(agent)
     required = TOOL_CAPABILITY.get(tool_name)
     if required is None:
@@ -471,7 +483,8 @@ class PolicyService:
         if reason:
             return reason
         if tool_name in (
-            "bash", "bash_main", "pwsh", "run_command", "start_dev_server"
+            "bash", "bash_main", "pwsh", "pwsh_main", "run_command",
+            "start_dev_server",
         ):
             from hiveweave.services.eval_seal import sealed_bash_deny
 

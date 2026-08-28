@@ -1887,6 +1887,18 @@ TOOL_PARAM_SCHEMAS["pwsh"] = {
     },
     "description": _PWSH_SCHEMA_DESCRIPTION,
 }
+# T3.2: pwsh_main = MAIN 位（pwsh 宿主上顶替 bash_main 的第四格）。
+# Windows 下 bash/bash_main 被宿主过滤移除，MAIN 里程碑测试 / QA 凭证签发
+# 走 pwsh_main（同参数面，test_run 凭证链不受影响）。
+TOOL_PARAM_SCHEMAS["pwsh_main"] = {
+    **TOOL_PARAM_SCHEMAS["pwsh"],
+    "properties": dict(TOOL_PARAM_SCHEMAS["pwsh"].get("properties") or {}),
+    "description": (
+        "Same as pwsh, but cwd is the PROJECT ROOT (shared MAIN), not your "
+        "worktree. Use for milestone VERIFY tests and anything that must see "
+        "merged HEAD. Slice unit tests stay on pwsh."
+    ),
+}
 TOOL_PARAM_SCHEMAS["browse_main"] = {
     **TOOL_PARAM_SCHEMAS["browse"],
     "properties": dict(TOOL_PARAM_SCHEMAS["browse"].get("properties") or {}),
