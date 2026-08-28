@@ -166,19 +166,62 @@ def parse_test_evidence_attestation_id(value: str) -> str | None:
     return v or None
 
 
-async def has_successful_test_run(project_id: str, task_id: str) -> bool:
+async def has_successful_test_run(
+    project_id: str, task_id: str, *, task: dict[str, Any] | None = None
+) -> bool:
     """该任务是否存在任一成功(exit_code=0)的 test_run 凭证(任务级 pooling)。
 
     供回执一致性检查(R1)使用:executor 在测试证据写 ``N/A`` 声明"跑不了
     测试"时,若库里有该任务的成功 test_run 凭证,声明与机器事实矛盾——
     应引导其引用凭证而非否认存在(S3 复盘"软信号未成闸"的护栏之一)。
 
+    T2.4: 与 ``verify_ids`` 口径对齐 —— 任务 policy 的 required kinds 不含
+    ``test_run`` 时（如 ``docs_only`` / ``ui_browser_e2e`` 只认文档/浏览
+    凭证），库里有成功 test_run 也**不构成矛盾**（被 policy 排除的 kind
+    不得参与矛盾判定；此前两门禁对同一凭证给相反评价：attestation 门不认
+    它、这里又拿它打回 N/A 声明）。policy 未要求 test_run 的情形
+    （soft / 未知 policy → ``_unknown_policy``，与 ``verify_ids`` 的
+    fail-close 同向）同样不构成矛盾；拿不到任务行时跳过 policy 预检、
+    直接看凭证库（fail-open 不误伤）。
+
     fail-open:任何查询失败返回 False(视为无凭证,不误伤正常提交)。
     """
     try:
         from hiveweave.db import meta as meta_db
         from hiveweave.db.project import ensure_project_db
-        from hiveweave.services.attestation import canonical_task_id
+        from hiveweave.services.attestation import (
+            canonical_task_id,
+            ledger_policy_id,
+            required_attestation_kinds,
+        )
+
+        # T2.4 policy 口径预检：task 行由调用方透传（submit 预检本来就有），
+        # 兜底自查一次；拿不到 → 旧行为。
+        if not isinstance(task, dict):
+            try:
+                from hiveweave.services.task import TaskService
+
+                task = await TaskService().get_task(project_id, task_id)
+            except Exception as te:
+                log.debug(
+                    "delivery_contract_task_lookup_failed", error=str(te)
+                )
+                task = None
+        if isinstance(task, dict):
+            try:
+                policy_id = ledger_policy_id(task)
+                kinds = required_attestation_kinds(policy_id)
+                if kinds is not None and "test_run" not in kinds:
+                    log.info(
+                        "delivery_contract_test_run_policy_excluded",
+                        project_id=project_id, task_id=str(task_id or ""),
+                        policy_id=policy_id,
+                    )
+                    return False
+            except Exception as pe:
+                log.debug(
+                    "delivery_contract_policy_lookup_failed", error=str(pe)
+                )
 
         tid = await canonical_task_id(project_id, task_id) or str(task_id or "")
         workspace_path = await meta_db.get_project_workspace(project_id)

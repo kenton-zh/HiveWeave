@@ -175,14 +175,24 @@ class TestEvaluateCommandRules:
         )
         assert v.blocked is True
 
-    def test_rm_rf_ask_degrades_to_deny(self):
-        """rm -rf 是 ask → 无在线审批降级 deny + 疏通提示."""
+    def test_rm_rf_ask_survives_and_degrade_helper_keeps_old_shape(self):
+        """T2.2: rm -rf 是 ask → guard 判定原样上浮；降级语义移到消费方.
+
+        evaluate_command 不再降级（返回 ask）；非交互路径用 degrade_ask
+        保持历史降级文案（疏通提示 delete_directory 仍在）。
+        """
         v = evaluate_command("rm -rf build")
         assert v.blocked is True
-        assert v.action == "deny"
+        assert v.action == "ask"
         assert v.rule == "rm"
-        assert "ask" in v.reason and "deny" in v.reason
         assert "delete_directory" in v.reason  # 疏通替代方案
+        # 非交互路径（game_time 定时器等）的降级形态
+        from hiveweave.services.command_guard import degrade_ask
+
+        d = degrade_ask(v)
+        assert d.blocked is True and d.action == "deny"
+        assert "ask" in d.reason and "deny" in d.reason
+        assert "delete_directory" in d.reason
 
     def test_rm_recursive_without_force_allowed(self):
         """rm -r（无 -f）不命中递归+强制谓词 → 放行."""
@@ -456,6 +466,8 @@ class TestBashToolIntegration:
         shutil.rmtree(self.workspace, ignore_errors=True)
 
     async def test_rm_rf_blocked_in_run_command(self):
+        """T2.2: 无 agent_id（非交互测试环境）→ 审批通道故障 → fail-closed
+        降级 deny，文案保持「Command blocked」形态，命令不执行."""
         from hiveweave.tools.bash import execute_run_command
 
         result = await execute_run_command(
@@ -494,23 +506,42 @@ class TestBashToolIntegration:
         )
         assert "Command blocked" not in (result.get("error") or "")
 
-    def test_pipeline_shell_security_precheck(self):
-        """rm -rf 只被命令护栏拦（不经自毁/镜像护栏）→ 走 Command blocked 文案."""
+    async def test_pipeline_shell_security_precheck(self):
+        """T2.2: rm -rf 是 ask → funnel 工具预检放行（执行器内弹审批）；
+        非 funnel 工具（start_dev_server）在预检层走审批 —— 测试环境通道
+        故障 → fail-closed 降级，文案保持「Command blocked」."""
         from hiveweave.tools.pipeline import _check_shell_security
 
-        err = _check_shell_security(SimpleNamespace(command="rm -rf build"))
-        assert err is not None and "Command blocked" in err
+        # funnel 工具：ask 归执行器解析 → 预检放行
+        err = await _check_shell_security(
+            SimpleNamespace(command="rm -rf build"),
+            agent_id="agent-x", tool_name="run_command",
+        )
+        assert err is None
+        # 非 funnel 工具：预检层解析；通道故障 → 降级 deny
+        err2 = await _check_shell_security(
+            SimpleNamespace(command="rm -rf build"),
+            agent_id="agent-x", tool_name="start_dev_server",
+        )
+        assert err2 is not None and "Command blocked" in err2
 
-    def test_pipeline_shell_security_blocks_image_kill(self):
+    async def test_pipeline_shell_security_blocks_image_kill(self):
+        """pkill 是 deny 规则（非 ask）—— 任何工具预检都直接拦."""
         from hiveweave.tools.pipeline import _check_shell_security
 
-        err = _check_shell_security(SimpleNamespace(command="pkill node"))
+        err = await _check_shell_security(
+            SimpleNamespace(command="pkill node"),
+            agent_id="agent-x", tool_name="run_command",
+        )
         assert err is not None and ("Refusing" in err or "Command blocked" in err)
 
-    def test_pipeline_shell_security_allows_safe(self):
+    async def test_pipeline_shell_security_allows_safe(self):
         from hiveweave.tools.pipeline import _check_shell_security
 
-        assert _check_shell_security(SimpleNamespace(command="git status")) is None
+        assert await _check_shell_security(
+            SimpleNamespace(command="git status"),
+            agent_id="agent-x", tool_name="run_command",
+        ) is None
 
 
 # ════════════════════════════════════════════════════════════════════

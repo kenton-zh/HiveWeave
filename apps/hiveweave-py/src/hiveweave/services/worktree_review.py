@@ -651,6 +651,43 @@ UNTRACKED_ON_TARGET_HINT = (
     "If branch tip already equals main tip, merge is a no-op after cleanup."
 )
 
+# T2.1: 分支查找零匹配 ≠ 冲突。此前该场景无条件拼 MERGE_CONFLICT_HINT，
+# 引导 coordinator 对不存在的冲突 rework（审计实测 merge 文案错位）。
+BRANCH_LOOKUP_FAILED_HINT = (
+    "[BRANCH LOOKUP FAILED — NOT A MERGE CONFLICT] "
+    "No worktree branch matched the requested name, so nothing was merged. "
+    "This is NOT a merge conflict — do NOT rework the assignee. "
+    "Next steps: check `git branch --list 'hw/*/*'` for what actually "
+    "exists; check git log / task evidence for a merge commit — the branch "
+    "may already have been merged by another merge owner and the worktree "
+    "torn down (contract 09). If the merge already landed, fulfill/cancel "
+    "the merge obligation instead of re-merging."
+)
+
+# T2.1: precondition_failed（husk / 未注册 worktree / detached HEAD 等）
+# 被错标成冲突 → coordinator 走 rework 死路。专属文案指向修前置。
+PRECONDITION_FAILED_HINT = (
+    "[MERGE PRECONDITION FAILED — NOT A MERGE CONFLICT] "
+    "A merge precondition was not satisfied (worktree husk / unregistered "
+    "worktree / detached HEAD / missing evidence gate). Nothing was merged. "
+    "This is NOT a merge conflict — do NOT rework the assignee. "
+    "Next steps: re-run git_worktree_merge with dry_run=true to list the "
+    "missing preconditions, fix the specific item (worktree repair / "
+    "evidence), then retry. The merge obligation stays open until a real "
+    "merge lands — do not waive it to force a close."
+)
+
+# T2.1: 未知/杂项失败原因（merge_failed 等）一律不再冒充冲突。
+MERGE_FAILED_HINT = (
+    "[MERGE FAILED — CAUSE NOT CONFIRMED AS CONFLICT] "
+    "The merge failed without a recognized conflict reason. Nothing may "
+    "have been merged; verify main's state before assuming. "
+    "Next steps: re-run git_worktree_merge with dry_run=true for a "
+    "read-only preflight, check backend logs for the underlying git error. "
+    "Only follow the conflict rework path if a later error explicitly "
+    "reports CONFLICT."
+)
+
 # Back-compat alias for older imports / messages
 COORDINATOR_MERGE_OWNERSHIP = MERGE_CONFLICT_HINT
 
@@ -678,6 +715,47 @@ def format_untracked_on_target_message(
     return (
         f"Merge blocked for {branch} into {target}: untracked files on "
         f"{target} would be overwritten: {files}.\n\n{UNTRACKED_ON_TARGET_HINT}"
+    )
+
+
+# ── T2.1: 失败归因选择器（单点 if/elif，绝不拼接冲突文案） ──────────────
+
+#: 视为真冲突的原因（与 misc_tools 的 auto-rework 判据同口径）
+_CONFLICT_REASONS = frozenset({"merge_conflict", "conflict_markers_landed"})
+
+
+def format_merge_failure_message(
+    *,
+    reason: str,
+    branch: str,
+    target: str,
+    conflicts: list[str] | None = None,
+    untracked: list[str] | None = None,
+) -> str:
+    """按失败原因选专属文案（deepseek-harness render.ts:85-92 纪律）。
+
+    每个分支一条文案，if/elif 排他 —— 决不把冲突提示拼进其他失败场景。
+    misc_tools 的 merge 工具失败兜底与测试共用此单点。
+    """
+    r = (reason or "").strip()
+    if r == "untracked_on_target":
+        return format_untracked_on_target_message(
+            branch=branch, target=target, untracked=untracked
+        )
+    if r == "precondition_failed":
+        return (
+            f"Merge precondition failed for {branch} into {target}.\n\n"
+            f"{PRECONDITION_FAILED_HINT}"
+        )
+    if r in _CONFLICT_REASONS or (
+        not r and conflicts
+    ):
+        return format_merge_conflict_message(
+            branch=branch, target=target, conflicts=conflicts
+        )
+    return (
+        f"Merge failed for {branch} into {target}"
+        f"{f' (reason: {r})' if r else ''}.\n\n{MERGE_FAILED_HINT}"
     )
 
 

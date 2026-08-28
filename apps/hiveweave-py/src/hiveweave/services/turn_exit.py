@@ -929,6 +929,7 @@ async def agent_worktree_has_uncommitted(
         except Exception:
             fallback = ""
         hinted = _hint_from_worktree_info(info, fallback)
+        _attach_quarantine_info(hinted, ws)
         _worktree_hint_details[agent_id] = hinted
         if hinted.get("git_error"):
             return False
@@ -980,6 +981,20 @@ def _hint_from_worktree_info(info: object, fallback_path: str = "") -> dict:
     return details
 
 
+def _attach_quarantine_info(details: dict, ws: str | None) -> None:
+    """T2.5: 详情里附上待处理 merge-quarantine 清单（quarantine_ref 来源）。"""
+    if not ws:
+        return
+    try:
+        from hiveweave.services.git_worktree.merge_support import (
+            list_pending_quarantine_dirs,
+        )
+
+        details["quarantine"] = list_pending_quarantine_dirs(ws)
+    except Exception as e:
+        log.debug("quarantine_info_attach_failed", error=str(e))
+
+
 def _format_uncommitted_worktree_label(agent_id: str | None) -> str:
     base = (
         "你的 worktree 有未提交改动 — 请先 git_worktree_checkpoint，"
@@ -999,6 +1014,14 @@ def _format_uncommitted_worktree_label(agent_id: str | None) -> str:
         extra.append(f"path={path}")
     if files:
         extra.append("files=" + ", ".join(str(f) for f in files[:4]))
+    # T2.5: UNCOMMITTED_WORKTREE 提示附 quarantine_ref —— 此前被隔离的
+    # 未提交文件对 Agent 完全不可见（P0-2 静默隔离）。
+    q = details.get("quarantine") or []
+    for entry in q[:2]:
+        extra.append(
+            f"quarantine_ref={entry.get('path', '')} "
+            f"({entry.get('file_count', 0)} files, recoverable)"
+        )
     if extra:
         return f"{base} ({'; '.join(extra)})"
     return base
@@ -1462,6 +1485,7 @@ async def _worktree_dirty_flag(agent_id: str, project_id: str) -> dict:
             )
             if isinstance(info, dict) and isinstance(info.get("status"), dict):
                 hinted = _hint_from_worktree_info(info, wt)
+                _attach_quarantine_info(hinted, route.workspace_path)
                 _worktree_hint_details[agent_id] = hinted
                 return hinted
         except Exception as e:
@@ -1481,11 +1505,13 @@ async def _worktree_dirty_flag(agent_id: str, project_id: str) -> dict:
         if not ok_st:
             details["git_error"] = "git status failed"
             details["dirty"] = False
+            _attach_quarantine_info(details, route.workspace_path)
             _worktree_hint_details[agent_id] = details
             return details
         files = _porcelain_tracked_dirty_paths(st_out or "")
         details["files"] = files[:5]
         details["dirty"] = bool(files)
+        _attach_quarantine_info(details, route.workspace_path)
         _worktree_hint_details[agent_id] = details
         return details
     except Exception as e:

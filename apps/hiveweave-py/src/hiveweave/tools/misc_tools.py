@@ -629,16 +629,14 @@ async def git_worktree_merge_tool(
         )
         branches = _parse_branch_list(branch_out)
         if not branches:
-            from hiveweave.services.worktree_review import MERGE_CONFLICT_HINT
+            # T2.1: 分支查找零匹配 ≠ 冲突 —— 对照组（task_name 零匹配路径）
+            # 从不拼冲突提示，这里此前却无条件拼 MERGE_CONFLICT_HINT，把
+            # coordinator 引导去 rework 不存在的冲突。改用专属 hint。
+            from hiveweave.services.worktree_review import BRANCH_LOOKUP_FAILED_HINT
 
             return ToolResult.err(
                 f"No worktree branch found for agent {branch_name}\n\n"
-                f"Hint: the branch may already have been merged by another "
-                f"merge owner, and the worktree torn down (contract 09). "
-                f"Check git log / task evidence for a merge commit before "
-                f"retrying. If merge already landed, fulfill/cancel the "
-                f"merge obligation instead of re-merging.\n\n"
-                f"{MERGE_CONFLICT_HINT}"
+                f"{BRANCH_LOOKUP_FAILED_HINT}"
             )
         merged_short = branch_name
         merged_branch = branches[0]
@@ -953,29 +951,24 @@ async def git_worktree_merge_tool(
             log.warning("merge_conflict_rework_failed", error=str(e))
             reworked = 0
 
-    from hiveweave.services.worktree_review import (
-        format_merge_conflict_message,
-        format_untracked_on_target_message,
-    )
+    # T2.1: 失败归因选择器单点（worktree_review.format_merge_failure_message）
+    # —— reason 非 untracked_on_target 一律走冲突文案的旧兜底把
+    # precondition_failed / merge_failed 错标成冲突。
+    from hiveweave.services.worktree_review import format_merge_failure_message
 
     err = result.get("message")
     if not err:
-        if reason == "untracked_on_target":
-            err = format_untracked_on_target_message(
-                branch=str(branch or branch_name),
-                target=target_branch,
-                untracked=result.get("untracked")
-                if isinstance(result.get("untracked"), list)
-                else None,
-            )
-        else:
-            err = format_merge_conflict_message(
-                branch=str(branch or branch_name),
-                target=target_branch,
-                conflicts=result.get("conflicts")
-                if isinstance(result.get("conflicts"), list)
-                else None,
-            )
+        err = format_merge_failure_message(
+            reason=str(reason or ""),
+            branch=str(branch or branch_name),
+            target=target_branch,
+            conflicts=result.get("conflicts")
+            if isinstance(result.get("conflicts"), list)
+            else None,
+            untracked=result.get("untracked")
+            if isinstance(result.get("untracked"), list)
+            else None,
+        )
     if reworked:
         err = f"{err}\n\nAuto-reworked {reworked} approved task(s) → executor."
 

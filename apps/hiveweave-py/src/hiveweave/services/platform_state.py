@@ -335,6 +335,44 @@ async def build_platform_state(
             )
         )
 
+    # ── T2.5: 待处理 merge-quarantine（verified） ─────────
+    # P0-2「静默隔离」的可发现面：隔离目录存在但从未通知到的场合，
+    # Agent 通过 get_platform_state 也能看到待处理隔离。
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.git_worktree.merge_support import (
+            list_pending_quarantine_dirs,
+        )
+
+        _ws = await meta_db.get_project_workspace(project_id)
+        q_dirs = list_pending_quarantine_dirs(str(_ws or ""))
+        verified.append(
+            _entry(
+                "merge_quarantine.pending",
+                {
+                    "count": len(q_dirs),
+                    "total_files": sum(q.get("file_count", 0) for q in q_dirs),
+                    "recent": q_dirs,
+                },
+                epistemic="verified",
+                source="merge_support",
+                note=(
+                    "Uncommitted files moved aside by git_worktree_merge "
+                    "(recoverable, not lost). Inspect and recover or ignore."
+                ) if q_dirs else "No pending merge-quarantine directories.",
+            )
+        )
+    except Exception as e:
+        unknown.append(
+            _entry(
+                "merge_quarantine.pending",
+                None,
+                epistemic="unknown",
+                source="merge_support",
+                note=str(e),
+            )
+        )
+
     # ── Wait contracts (verified) ────────────────────────
     waits: list[dict[str, Any]] = []
     try:

@@ -15,7 +15,6 @@ from .constants import (
     CHECKPOINT_PREFIX,
     GENERATED_FILES,
     GIT_TIMEOUT,
-    QUARANTINE_DIR,
     WORKTREE_DIR,
     _RELOCATION_SUFFIXES,
     _WT_LIST_RE,
@@ -50,8 +49,14 @@ log = structlog.get_logger(__name__)
 
 
 def _quarantine_stamps(workspace_path: str) -> set[str]:
-    """Snapshot of existing merge-quarantine stamp dirs (TEST_DSH_32 P8)."""
-    root = Path(workspace_path) / QUARANTINE_DIR
+    """Snapshot of existing merge-quarantine stamp dirs (TEST_DSH_32 P8).
+
+    P1-1 审计修复：merge 隔离区实际是 ``.hiveweave/merge-quarantine/<stamp>``
+    （merge_support.quarantine_untracked_on_target 写入），此前误监听
+    ``QUARANTINE_DIR``（worktree 整体搬迁隔离区）→ 差集永远为空 →
+    ``[MERGE QUARANTINE]`` inbox 从未发出（P0-2 静默隔离的根因之一）。
+    """
+    root = Path(workspace_path) / ".hiveweave" / "merge-quarantine"
     if not root.exists():
         return set()
     return {p.name for p in root.iterdir() if p.is_dir()}
@@ -62,7 +67,7 @@ async def _new_quarantine_events(
 ) -> list[dict]:
     """Quarantine dirs created during this merge call, with their files."""
     events: list[dict] = []
-    root = Path(workspace_path) / QUARANTINE_DIR
+    root = Path(workspace_path) / ".hiveweave" / "merge-quarantine"
     for name in sorted(_quarantine_stamps(workspace_path) - before):
         d = root / name
         files = [

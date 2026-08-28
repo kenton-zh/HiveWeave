@@ -245,6 +245,51 @@ def parse_untracked_overwrite(git_output: str) -> list[str]:
     return files
 
 
+def list_pending_quarantine_dirs(
+    workspace_path: str, limit: int = 3, max_files: int = 500
+) -> list[dict]:
+    """T2.5: 清点待处理的 merge-quarantine 目录（只读， Newest first）。
+
+    供 ``get_platform_state`` 挂待处理隔离计数与 UNCOMMITTED_WORKTREE
+    提示附 ``quarantine_ref`` —— 隔离副作用必须可发现（P0-2），不能只存在
+    于文件系统里。返回 ``[{stamp, path, file_count}]``；单目录文件数封顶
+    ``max_files``（审计 P2-2：隔离区可能搬进整棵 node_modules，每次 turn
+    exit 全量遍历不可接受），超过即停止计数（值为下限）。
+    """
+    qroot = Path(workspace_path) / ".hiveweave" / "merge-quarantine"
+    if not qroot.is_dir():
+        return []
+    out: list[dict] = []
+    try:
+        stamps = sorted(
+            (d for d in qroot.iterdir() if d.is_dir()),
+            key=lambda d: d.name,
+            reverse=True,  # stamp 名即时间戳， newest first
+        )
+    except OSError:
+        return []
+    for d in stamps[: max(0, int(limit))]:
+        n = 0
+        truncated = False
+        try:
+            for _ in d.rglob("*"):
+                if not _.is_file():
+                    continue
+                n += 1
+                if n >= max_files:
+                    truncated = True
+                    break
+        except OSError:
+            pass
+        out.append({
+            "stamp": d.name,
+            "path": str(d),
+            "file_count": n,
+            **({"file_count_truncated": True} if truncated else {}),
+        })
+    return out
+
+
 async def quarantine_untracked_on_target(
     workspace_path: str, files: list[str]
 ) -> list[str]:

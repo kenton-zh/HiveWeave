@@ -652,10 +652,16 @@ def init_process_protection(extra_pids: Sequence[int] | None = None) -> frozense
 
 @dataclass(frozen=True)
 class GuardVerdict:
-    """命令护栏判定结果。``action`` 为最终态（ask 已降级为 deny）。"""
+    """命令护栏判定结果。
+
+    ``action`` 三值（T2.2）：``"allow"`` / ``"deny"`` / ``"ask"``。
+    ask 不再在 guard 内降级 —— 判定保持 ask 原样上浮，由消费方决定走
+    :func:`resolve_ask_with_approval`（在线审批）还是 :func:`degrade_ask`
+    （非交互路径，如 game_time 定时器）。
+    """
 
     blocked: bool
-    action: str  # "allow" | "deny"
+    action: str  # "allow" | "deny" | "ask"
     reason: str = ""
     rule: str = ""  # 命中的 pattern（遥测/审计用）
 
@@ -699,22 +705,20 @@ def evaluate_command(
 
         # 1. shell 包装解包（内层命令递归评估）
         if first in _WRAPPER_SHELLS:
-            # L7：嵌套包装超深 → 无法审计内层 → 降级（与编码命令同一原则，
-            # 不能「无法审计即放行」）
+            # L7：嵌套包装超深 → 无法审计内层 → 拒绝（与编码命令同一原则，
+            # 不能「无法审计即放行」）。这是真 deny，不是 ask 降级。
             if _depth >= _MAX_WRAP_DEPTH:
                 return GuardVerdict(
                     True,
                     "deny",
                     f"shell 包装嵌套超过 {_MAX_WRAP_DEPTH} 层，无法审计内层命令，"
-                    f"请展开为直接命令。 {_ASK_DEGRADE}",
+                    f"请展开为直接命令。",
                     "wrapper:too_deep",
                 )
             inner = _wrapper_inner(tokens[0], tokens)
             if inner == "":
                 hint = _ENCODED_HINT
-                return GuardVerdict(
-                    True, "deny", f"{hint} {_ASK_DEGRADE}", "wrapper:encoded"
-                )
+                return GuardVerdict(True, "deny", hint, "wrapper:encoded")
             if inner:
                 inner_verdict = evaluate_command(
                     inner,
@@ -723,9 +727,11 @@ def evaluate_command(
                     _depth=_depth + 1,
                 )
                 if inner_verdict.blocked:
+                    # T2.2: 内层 ask 保持 ask（包装内的 ask 命令仍可走审批），
+                    # deny 照常传播。
                     return GuardVerdict(
                         True,
-                        "deny",
+                        inner_verdict.action,
                         f"(经由 {tokens[0]} 包装) {inner_verdict.reason}",
                         inner_verdict.rule,
                     )
@@ -773,13 +779,93 @@ def evaluate_command(
                 command_head=norm_text[:80],
             )
             return GuardVerdict(True, "deny", reason, matched.pattern)
-        # ask → 无在线审批 → 降级 deny + 疏通提示
-        reason = f"{matched.hint or '该命令需审批。'} {_ASK_DEGRADE}"
+        # T2.2: ask 判定原样上浮（不再降级）。消费方二选一：
+        # resolve_ask_with_approval（在线审批）/ degrade_ask（非交互降级）。
+        reason = matched.hint or "该命令需审批。"
         log.info(
-            "command_guard_ask_downgrade",
+            "command_guard_ask",
             rule=matched.pattern,
             command_head=norm_text[:80],
         )
-        return GuardVerdict(True, "deny", reason, matched.pattern)
+        return GuardVerdict(True, "ask", reason, matched.pattern)
 
     return _ALLOW
+
+
+async def resolve_ask_with_approval(
+    verdict: GuardVerdict,
+    *,
+    agent_id: str,
+    tool_name: str,
+    tool_args: dict | None = None,
+) -> GuardVerdict:
+    """T2.2: ask 判定接已有的在线审批通道（ApprovalService，复用不走新建）。
+
+    - 用户批准 → allow（本次放行；remember 规则由 ApprovalService 落库）；
+    - PermissionTimeout → deny（超时文案与 executor/pipeline 注册路径一致）；
+    - PermissionRejected → deny（用户主动拒绝）；
+    - 审批通道本身故障 → fail-closed 降级 deny（原 _ASK_DEGRADE 语义）。
+    非 ask 判定原样返回。
+    """
+    if verdict.action != "ask":
+        return verdict
+    try:
+        from hiveweave.services.approval import (
+            PermissionRejected,
+            PermissionTimeout,
+            approval_service,
+        )
+
+        await approval_service.request_permission(
+            agent_id=agent_id,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            description=(
+                f"Command guard asks approval ({verdict.rule}): "
+                f"{verdict.reason[:160]}"
+            ),
+        )
+        log.info(
+            "command_guard_ask_approved",
+            rule=verdict.rule,
+            agent_id=agent_id,
+        )
+        return GuardVerdict(False, "allow", "", verdict.rule)
+    except PermissionTimeout:
+        return GuardVerdict(
+            True,
+            "deny",
+            "Permission request timed out (120s). The user may be away.",
+            verdict.rule,
+        )
+    except PermissionRejected as exc:
+        return GuardVerdict(
+            True, "deny", f"Permission rejected: {exc}", verdict.rule
+        )
+    except Exception as exc:  # noqa: BLE001 — 通道故障 fail-closed
+        log.warning(
+            "command_guard_ask_channel_error",
+            rule=verdict.rule,
+            error=str(exc),
+        )
+        return GuardVerdict(
+            True,
+            "deny",
+            f"{verdict.reason} {_ASK_DEGRADE}",
+            verdict.rule,
+        )
+
+
+def degrade_ask(verdict: GuardVerdict) -> GuardVerdict:
+    """非交互路径（game_time 定时器等无审批通道）把 ask 降级回 deny。
+
+    保持原降级语义（降级说明 + 疏通提示），供无法 await 审批的消费方。
+    """
+    if verdict.action != "ask":
+        return verdict
+    return GuardVerdict(
+        True,
+        "deny",
+        f"{verdict.reason} {_ASK_DEGRADE}",
+        verdict.rule,
+    )

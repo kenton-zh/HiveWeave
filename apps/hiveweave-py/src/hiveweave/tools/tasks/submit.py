@@ -751,7 +751,9 @@ async def _submit_preflight(
                             "N/A—为什么跑不了（原因非空）。"
                         ),
                     })
-                elif await has_successful_test_run(project_id, task_id):
+                elif await has_successful_test_run(
+                    project_id, task_id, task=task
+                ):
                     # R1 回执一致性：声明 N/A"跑不了测试"，但库里有该任务的
                     # 成功 test_run 凭证——声明与机器事实矛盾，应引用凭证。
                     issues.append({

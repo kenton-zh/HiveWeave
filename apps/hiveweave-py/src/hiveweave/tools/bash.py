@@ -728,14 +728,39 @@ def _validate_command_safety(command: str) -> tuple[bool, str]:
     不再检查整个命令字符串。避免代码内容中包含 password/token
     等词时被误判为敏感文件引用。
     """
+    from hiveweave.services.command_guard import degrade_ask
+
+    verdict = _validate_command_safety_verdict(command)
+    if verdict.action == "ask":
+        # 非交互路径（game_time 定时器等）：ask 降级，文案保持历史形态
+        # 「Command blocked: <hint> [ask→deny: …]」
+        verdict = degrade_ask(verdict)
+        return True, f"Command blocked: {verdict.reason}"
+    if verdict.blocked:
+        return True, verdict.reason
+    return False, ""
+
+
+def _validate_command_safety_verdict(command: str) -> "GuardVerdict":
+    """统一命令安全校验的 verdict 形式（T2.2）。
+
+    与 :func:`_validate_command_safety` 同一条链，reason 文本与历史完全
+    一致；区别仅在 ask 判定**原样上浮**不降级 —— 交互式执行入口
+    （execute_bash / execute_run_command / _bash_background）拿到 ask 后走
+    ``resolve_ask_with_approval``；非交互路径（game_time 定时器）经兼容
+    包装 :func:`_validate_command_safety` 自动降级，行为与历史一致。
+    """
+    from hiveweave.services.command_guard import GuardVerdict, evaluate_command
+
     blocked, reason = check_self_destructive(command)
     if blocked:
-        return True, f"Command blocked: {reason}"
+        return GuardVerdict(True, "deny", f"Command blocked: {reason}",
+                            "__self_destructive__")
     from hiveweave.services.process_registry import check_platform_process_kill
 
     plat_err = check_platform_process_kill(command)
     if plat_err:
-        return True, plat_err
+        return GuardVerdict(True, "deny", plat_err, "__platform_process_kill__")
     from hiveweave.tools.security import is_sensitive_path
     # Bug C fix: 只检查命令中的文件路径参数，不检查整个命令字符串
     # 目标型护栏（敏感文件 / .hiveweave）先于命令模式护栏：同一命令多重命中时
@@ -743,20 +768,66 @@ def _validate_command_safety(command: str) -> tuple[bool, str]:
     file_paths = _extract_file_paths_from_command(command)
     for fp in file_paths:
         if is_sensitive_path(fp):
-            return True, (f"Command references a sensitive file: {fp} "
-                          f"(e.g. .env, *.pem, id_rsa, credentials). "
-                          f"Use read_file with explicit approval instead.")
+            return GuardVerdict(
+                True, "deny",
+                (f"Command references a sensitive file: {fp} "
+                 f"(e.g. .env, *.pem, id_rsa, credentials). "
+                 f"Use read_file with explicit approval instead."),
+                "__sensitive_path__",
+            )
     if _check_hiveweave_command(command):
-        return True, ("Command targets `.hiveweave` system directory. "
-                      "System files (data.db, tool_outputs/) are managed by "
-                      "HiveWeave internals.")
+        return GuardVerdict(
+            True, "deny",
+            ("Command targets `.hiveweave` system directory. "
+             "System files (data.db, tool_outputs/) are managed by "
+             "HiveWeave internals."),
+            "__hiveweave_dir__",
+        )
     # slack-clone_01 P0: 命令模式护栏（taskkill //IM / rm -rf / pkill …）
-    # + 受保护 PID 硬层。ask 无在线审批 → 降级 deny + 疏通提示。
-    from hiveweave.services.command_guard import evaluate_command
-
+    # + 受保护 PID 硬层。ask 判定原样上浮（T2.2），由调用方决定审批或降级。
     verdict = evaluate_command(command)
-    if verdict.blocked:
+    if verdict.blocked and verdict.action != "ask":
+        # 历史文案：模式护栏拒绝统一加 "Command blocked: " 前缀
+        return GuardVerdict(True, "deny",
+                            f"Command blocked: {verdict.reason}", verdict.rule)
+    return verdict
+
+
+async def _validate_command_safety_resolved(
+    command: str,
+    *,
+    agent_id: str,
+    tool_name: str,
+    tool_args: dict | None = None,
+    ask_already_resolved: bool = False,
+) -> tuple[bool, str]:
+    """交互式执行入口用：校验 + ask 在线审批解析（T2.2）。
+
+    返回 (blocked, reason)。ask 判定先走
+    :func:`resolve_ask_with_approval`（批准 → 放行 / 拒绝·超时 → 拒绝 /
+    通道故障 → 降级）；``ask_already_resolved=True`` 表示上游
+    （``_bash_background`` → ``execute_bash`` 链）已解析过同一命令的 ask
+    并获批 —— 直接放行，避免二次弹审批。
+    """
+    from hiveweave.services.command_guard import resolve_ask_with_approval
+
+    verdict = _validate_command_safety_verdict(command)
+    if verdict.action == "ask" and not ask_already_resolved:
+        verdict = await resolve_ask_with_approval(
+            verdict,
+            agent_id=agent_id,
+            tool_name=tool_name,
+            tool_args=tool_args,
+        )
+        if not verdict.blocked:
+            return False, ""
+        # 保持历史 ask 文案形态：「Command blocked: <hint> [ask→deny/审批结果]」
         return True, f"Command blocked: {verdict.reason}"
+    if verdict.action == "ask":
+        # 上游已获批（同一命令同一判定），放行。
+        return False, ""
+    if verdict.blocked:
+        return True, verdict.reason
     return False, ""
 
 
@@ -1449,6 +1520,7 @@ async def execute_bash(
     agent_id: str | None = None,
     unbounded: bool = False,
     dialect: str = "bash",
+    guard_ask_resolved: bool = False,
 ) -> dict[str, Any]:
     """Execute a bash command and return {success, output, error}.
 
@@ -1468,7 +1540,15 @@ async def execute_bash(
                 "error": "Error: command is required"}
 
     # 1. 统一命令安全校验 — 自毁命令 + 敏感路径 + .hiveweave 系统目录
-    blocked, reason = _validate_command_safety(command)
+    # T2.2: ask 判定走在线审批（agent_id 在场时）；guard_ask_resolved=上游
+    # 已解析放行，不重复弹审批。
+    blocked, reason = await _validate_command_safety_resolved(
+        command,
+        agent_id=agent_id or "",
+        tool_name="bash" if dialect != "pwsh" else "pwsh",
+        tool_args={"command": command[:200]},
+        ask_already_resolved=guard_ask_resolved,
+    )
     if blocked:
         log.warning("bash.blocked", reason=reason, command_preview=command[:120])
         return {"success": False, "output": "",
@@ -1624,7 +1704,13 @@ async def execute_run_command(
                 "error": "Error: command is required"}
 
     # 统一命令安全校验 — 自毁命令 + 敏感路径 + .hiveweave 系统目录（A3 + 旁路修复）
-    blocked, reason = _validate_command_safety(command)
+    # T2.2: ask 判定走在线审批
+    blocked, reason = await _validate_command_safety_resolved(
+        command,
+        agent_id=agent_id or "",
+        tool_name="run_command",
+        tool_args={"command": command[:200]},
+    )
     if blocked:
         log.warning("run_command.blocked", reason=reason,
                     command_preview=command[:120])
@@ -2465,10 +2551,18 @@ async def _bash_background(
     )
 
     cmd = _strip_trailing_ampersand(cmd)
-    blocked, reason = _validate_command_safety(cmd)
+    # T2.2: ask 判定走在线审批；获批后传 guard_ask_resolved 给 execute_bash，
+    # 同一命令不重复弹审批。
+    blocked, reason = await _validate_command_safety_resolved(
+        cmd,
+        agent_id=agent_id,
+        tool_name="bash" if dialect != "pwsh" else "pwsh",
+        tool_args={"command": cmd[:200]},
+    )
     if blocked:
         log.warning("bash.blocked", reason=reason, command_preview=cmd[:120])
         return ToolResult.blocked_err(f"Error: {reason}")
+    ask_resolved = True
 
     from hiveweave.services.eval_seal import sealed_bash_deny_for_workspace
 
@@ -2507,6 +2601,7 @@ async def _bash_background(
             agent_id=agent_id,
             unbounded=True,
             dialect=dialect,
+            guard_ask_resolved=ask_resolved,
         )
         _update_cwd_failure_streak(
             agent_id, exec_ws, bool(result.get("success"))

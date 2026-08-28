@@ -398,7 +398,9 @@ async def execute_registered_tool(
         if security_error:
             return ToolResult.blocked_err(security_error).to_dict()
     elif tool_def.security_level == "shell":
-        security_error = _check_shell_security(params)
+        security_error = await _check_shell_security(
+            params, agent_id=agent_id, tool_name=tool_name
+        )
         if security_error:
             return ToolResult.blocked_err(security_error).to_dict()
 
@@ -572,14 +574,27 @@ def _check_single_file(
     return None
 
 
-def _check_shell_security(params: Any) -> str | None:
+async def _check_shell_security(
+    params: Any, agent_id: str, tool_name: str
+) -> str | None:
     """Shell command security check.
 
     Checks self-destructive patterns, .hiveweave ops, and platform kill guards.
+
+    T2.2: ask 判定的归属按 tool_name 分流 —— bash/bash_main/pwsh/run_command
+    四个 funnel 的执行器内部会再次求值并弹在线审批（单一审批点在执行器，
+    避免本预检与执行器对同一命令重复弹窗）；其余 shell 工具（如
+    start_dev_server，执行器内无护栏）在预检层直接走在线审批。
     """
     from hiveweave.services.process_registry import check_platform_process_kill
 
     from .bash import check_self_destructive, _check_hiveweave_command
+
+    # 执行器内部已做完整校验并解析 ask 的 funnel 工具（T3.2 含 pwsh_main，
+    # 漏了会对同一 ask 命令弹两次审批 —— 审计 P1-2）
+    _GUARD_RESOLVED_IN_EXECUTOR = frozenset({
+        "bash", "bash_main", "pwsh", "pwsh_main", "run_command",
+    })
 
     command = getattr(params, "command", None) or getattr(params, "cmd", None)
     if not command:
@@ -600,9 +615,21 @@ def _check_shell_security(params: Any) -> str | None:
 
     # slack-clone_01 P0: 与 bash.py 同一套命令模式护栏，预检早失败
     # （排在 .hiveweave 目标型护栏之后：多重命中时报更具体的原因，同 bash.py）
-    from hiveweave.services.command_guard import evaluate_command
+    from hiveweave.services.command_guard import evaluate_command, resolve_ask_with_approval
 
     verdict = evaluate_command(command)
+    if verdict.action == "ask":
+        if tool_name in _GUARD_RESOLVED_IN_EXECUTOR:
+            # 执行器内解析（在线审批）—— 预检放行，不在此拦截
+            return None
+        verdict = await resolve_ask_with_approval(
+            verdict,
+            agent_id=agent_id,
+            tool_name=tool_name,
+            tool_args={"command": str(command)[:200]},
+        )
+        if not verdict.blocked:
+            return None
     if verdict.blocked:
         return f"Error: Command blocked: {verdict.reason}"
 
