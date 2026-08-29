@@ -23,6 +23,17 @@ logger = structlog.get_logger()
 
 APPROVAL_TIMEOUT_S = 120
 
+# A-1 P0-3 降级路径文案：审批/ask 超时（用户离开/长期未审）后返回给 agent 的
+# 明确指引 —— 不再"永久卡死/静默等待"，而是让 agent 转向可审计替代。三处消费方
+# （tools/pipeline.py、tools/executor.py、services/command_guard.py）统一引用，
+# 保证文案与语义一致。
+APPROVAL_TIMEOUT_HINT = (
+    "审批请求超时：用户暂不可达（长时间未审批，未批准也未拒绝）。"
+    "不要原地空转或反复重试同一审批 —— 请换方向或调整参数后重试；"
+    "若该操作是平台不可绕过的硬门，转为提交可审计的替代方案"
+    "（说明原因、替代步骤与产出）并走 review/汇报。"
+)
+
 
 class PermissionRejected(Exception):
     """Raised when a permission request is rejected."""

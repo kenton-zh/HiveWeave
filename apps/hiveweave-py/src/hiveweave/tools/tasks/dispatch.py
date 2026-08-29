@@ -240,6 +240,7 @@ async def dispatch_task_tool(
                     f"parent={struct_dup.get('parent_task_id', '')[:8]}。"
                     f"请复用 taskId=\"{struct_dup['id']}\"，"
                     f"或 force=true 强制新建。"
+                    f"（force 是工具参数；写在标题里的 [force] 不生效。）"
                 )
         except Exception as e:
             log.warning("dispatch_structured_dedup_failed", error=str(e))

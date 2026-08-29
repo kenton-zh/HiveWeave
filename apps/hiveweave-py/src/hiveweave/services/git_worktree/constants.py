@@ -73,6 +73,9 @@ GITIGNORE_GENERATED_ENTRIES: tuple[str, ...] = (
     # 缓存必须排除在提交外。放 .hiveweave-cache/ 而非 .hiveweave/ 内侧，
     # 防 _HIVEWEAVE_FILE_OPS 前缀误伤 + 不受 §4.9 PROTECTED 裁剪影响。
     ".hiveweave-cache/",
+    # B-2 平台审计产物：首轮审计遗留 .audit/ untracked 噪音；git ignore 后平台
+    # Remove-Item -Recurse 清理流程不再碰它，避免撞 120s 权限超时。
+    ".audit/",
 )
 
 # BUG-4: serialize create per (workspace, short_id) so hire + lazy-ensure

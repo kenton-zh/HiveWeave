@@ -1144,6 +1144,37 @@ async def git_worktree_status_tool(
     # GitWorktreeService.info returns {success, status: {...}} — not "info"
     info = result.get("status")
     if info is None:
+        # P2-6: 无 worktree 角色（CEO/HR/新 agent）回 MAIN 项目根视角 ——
+        # 合并职责者恰恰最需要看 MAIN 状态；不再裸报 "No worktree found"。
+        if target_sid == short_id:
+            try:
+                from hiveweave.services.git_worktree.git_cmd import (
+                    _current_branch,
+                    _git,
+                )
+
+                mb = await _current_branch(workspace_path)
+                ok_dirty, _porc = await _git(
+                    ["-c", "core.quotepath=false", "status",
+                     "--porcelain", "-z"],
+                    workspace_path,
+                )
+                main_dirty = bool(_porc and _porc.strip())
+                ok_head, head = await _git(
+                    ["rev-parse", "--short", "HEAD"], workspace_path
+                )
+                return ToolResult.ok(
+                    f"[MAIN] ({target_sid} has no worktree — project root)\n"
+                    f"Branch: {mb or '?'} | dirty={main_dirty} | "
+                    f"head={head or '?'} | base=main\n"
+                    "Tip is 'on main' by definition. Use git_worktree_list "
+                    "to see all agent worktrees."
+                )
+            except Exception as e:
+                return ToolResult.err(
+                    f"No worktree found for short_id={target_sid} "
+                    f"(MAIN inspect failed: {e})"
+                )
         return ToolResult.err(
             f"No worktree found for short_id={target_sid}. "
             f"Expected path under .hiveweave/worktrees/{target_sid}/"

@@ -899,6 +899,10 @@ class Agent:
                 "is_background": True if is_trigger else False,
             })
             self._streaming_msg_id = saved["id"]
+            # turn 起点重置文本累积器：round_start 不再清零（turn 级累计，
+            # 见 streaming.on_delta），跨 turn 残留必须在这里丢弃，否则
+            # 上一 turn 的全文会泄进本 turn placeholder 的 DB 快照。
+            self._streaming_text_acc = ""
             # P0-3: 回合流式活动起点（placeholder 落库时刻）——之后由
             # on_delta / _on_tool_call 持续刷新，供 streaming 僵尸判定。
             self._last_stream_activity_at = time.time() * 1000
@@ -1177,6 +1181,42 @@ class Agent:
             # 获取工具定义
             tools = await self._get_tool_definitions()
 
+            # P1-3 Phase 0：前缀漂移探针（纯观测，best-effort 不阻塞）。
+            # 对相邻两 run 首请求做逐段指纹对比，分类漂移源
+            # （identity/compacted/history/model），报告见
+            # docs/platform-issue-research/P1-3-run-cache-prefix-plan.md。
+            try:
+                from hiveweave.llm.streamer.probe import (
+                    clear_verdict,
+                    compare_and_record,
+                )
+
+                probe_verdict = compare_and_record(
+                    self.id,
+                    messages,
+                    model_key=(
+                        f"{model_config.get('model_id') or ''}"
+                        f"@{model_config.get('base_url') or ''}"
+                    ),
+                )
+                log.info(
+                    "prompt_prefix_probe",
+                    agent_id=self.id,
+                    **probe_verdict,
+                )
+            except Exception as probe_err:
+                log.debug(
+                    "prefix_probe_failed",
+                    agent_id=self.id,
+                    error=str(probe_err),
+                )
+                # compare 失败 → 清待消费 verdict，防止 readout 用上一
+                # run 的陈旧指纹合成错误分类。
+                try:
+                    clear_verdict(self.id)
+                except Exception:
+                    pass
+
             # ── Durable Run Ledger: create run ──
             try:
                 self._current_run_id = await self._run_ledger.create_run(
@@ -1233,6 +1273,12 @@ class Agent:
                     except Exception:
                         pass  # best-effort
 
+                # P1-6：取消路径记账 —— streamer 每轮 usage 实时推到这里，
+                # 用户取消（stream 不返回 result）时 handle_cancel 仍能 flush。
+                if getattr(self, "_pending_usage", None) is None:
+                    self._pending_usage = []
+                pending_sink = self._pending_usage.append
+
                 result = await streamer.stream(
                     agent_id=self.id,
                     messages=current_messages,
@@ -1242,6 +1288,7 @@ class Agent:
                     on_tool_call=self._on_tool_call,
                     max_tool_rounds=max_rounds,
                     steer_queue=self._steer_q,
+                    usage_sink=pending_sink,
                 )
 
                 # Token metering: 主对话路径落库（best-effort，不阻塞主流程）。
@@ -1281,6 +1328,32 @@ class Agent:
                     provider=model_config.get("provider_type"),
                     request_type="main",
                 )
+                # P1-6：正常路径已整批落库，清空实时 sink —— 否则后续
+                # turn 被取消时会 flush 到跨 turn 的陈旧 usage 造成双计。
+                self._pending_usage.clear()
+
+                # P1-3 Phase 0：首请求 usage 回读，与前缀指纹 verdict
+                # 联合合成最终分类（hit_ok / cache_window_expired /
+                # drift_zero_hit）。best-effort。
+                try:
+                    from hiveweave.llm.streamer.probe import report_cache_readout
+
+                    _first_round = (result.get("usage_rounds") or [None])[0]
+                    if _first_round:
+                        report_cache_readout(
+                            self.id,
+                            input_tokens=int(_first_round.get("input") or 0),
+                            cache_read=int(_first_round.get("cache_read") or 0),
+                            cache_creation=int(
+                                _first_round.get("cache_creation") or 0
+                            ),
+                        )
+                except Exception as probe_err:
+                    log.debug(
+                        "prefix_probe_readout_failed",
+                        agent_id=self.id,
+                        error=str(probe_err),
+                    )
 
                 status = result.get("status", "error")
 

@@ -30,6 +30,7 @@ from hiveweave.services.permission import PermissionService
 from hiveweave.services.roster import RosterService
 from hiveweave.services.skill_registry import SkillRegistryService
 from hiveweave.services.template import TemplateService
+from hiveweave.tools.bash import TOOL_DEFAULT_TIMEOUT_MS
 from hiveweave.tools.review import execute_review, ReviewLLMCallback
 
 log = structlog.get_logger(__name__)
@@ -71,14 +72,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "on. Long output is truncated to head+tail; the full text is "
             "saved and the path is reported. Windows: without the sandbox "
             "Git Bash (`bash -c`) runs it; under the ACL sandbox (the "
-            "default) the command is actually executed by **pwsh**, and only "
-            "a few unix idioms are translated for you (`ls -l`, `head/tail "
-            "-n N`, `wc -l`, `mkdir -p`, `grep`). Anything else unix-only "
-            "(`sed`, `awk`, `xargs`, `cut`, `find`, `touch`, `which`, "
-            "`sort -u`, `rm -rf`, `echo -e`, …) is rejected up front with the "
-            "pwsh equivalent instead of a confusing \"not recognized\" "
-            "error — rewrite it as suggested, or call the `pwsh` tool and "
-            "write PowerShell directly (same permissions as bash). "
+            "default) the command is actually executed by **pwsh** "
+            "**verbatim — no unix→pwsh translation is applied**. unix-only "
+            "commands (`head`, `tail`, `grep`, `wc`, `sed`, `awk`, `xargs`, "
+            "`cut`, `find`, `touch`, `which`, `sort -u`, `echo -e`, …) are "
+            "rejected up front with the pwsh equivalent — rewrite it as "
+            "suggested, or call the `pwsh` tool and write PowerShell directly "
+            "(same permissions as bash). Plain non-unix commands (git, "
+            "python, uv, node, npm, pip) run fine. Note: python3 does not "
+            "exist here — use python. "
             "Prefer `uv run python` (bare `python` may be missing). Never "
             "invent `/workspace` or strip backslashes (`D:PC_AI...` is "
             "invalid). "
@@ -110,7 +112,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": "The bash command to execute.",
             },
             "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"],
-                        "description": "Foreground only (5s–10min). Ignored when background=true. Default: 120000 (2 min). Max: 600000 (10 min). Values 1-600 are treated as seconds (e.g. 30 = 30s). The executor kills the command on expiry."},
+                        "description": f"Foreground only (5s–10min). Ignored when background=true. Default: {TOOL_DEFAULT_TIMEOUT_MS['bash']} ms (8 min). Max: 600000 (10 min). Values 1-600 are treated as seconds (e.g. 30 = 30s). The executor kills the command on expiry."},
             "background": {
                 "type": "boolean",
                 "aliases": ["bg"],
@@ -158,7 +160,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Use for data munging / one-off logic / scripted automation. "
             "Background/off-turn execution is NOT supported — for "
             "long-running work use bash(background=true). "
-            "Set timeout ms (5s–10min, default 120000) for heavy loops."
+            f"Set timeout ms (5s–10min, default {TOOL_DEFAULT_TIMEOUT_MS['python_script']}) for heavy loops."
         ),
         "properties": {
             "script": {
@@ -174,7 +176,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "timeout": {
                 "type": "integer",
                 "aliases": ["timeout_ms", "timeoutMs"],
-                "description": "Timeout ms (5s–10min). Default 120000. Values 1-600 treated as seconds.",
+                "description": f"Timeout ms (5s–10min). Default {TOOL_DEFAULT_TIMEOUT_MS['python_script']} (5 min). Values 1-600 treated as seconds.",
             },
         },
         "required": [],
@@ -1192,7 +1194,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": "Optional: reuse an existing task instead of creating a new one"},
             "force": {
                 "type": "boolean",
-                "description": "Create despite a cross-assignee/structured dup. Same-assignee dup cannot be forced.",
+                "description": (
+                    "Create despite a cross-assignee/structured duplicate. "
+                    "TRIGGER: only when the previous attempt was rejected "
+                    "with 'structured duplicate' / 'similar open task' / "
+                    "cross-assignee — pass force=true as a PARAMETER. "
+                    "FAILURE: a same-assignee duplicate CANNOT be forced — "
+                    "cancel_task the old one instead. TYPICAL ERROR: writing "
+                    "[force] into the title does nothing."
+                ),
             },
             "parentTaskId": {"type": "string", "aliases": ["parent_task_id"]},
             "expectedModules": {
@@ -1383,7 +1393,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             },
             "force": {
                 "type": "boolean",
-                "description": "Create despite a cross-assignee/structured dup. Same-assignee dup cannot be forced.",
+                "description": (
+                    "Create despite a cross-assignee/structured duplicate. "
+                    "TRIGGER: only when the previous attempt was rejected "
+                    "with 'structured duplicate' / 'similar open task' / "
+                    "cross-assignee — pass force=true as a PARAMETER. "
+                    "FAILURE: a same-assignee duplicate CANNOT be forced — "
+                    "cancel_task the old one instead. TYPICAL ERROR: writing "
+                    "[force] into the title does nothing."
+                ),
             },
             "submitGate": {
                 "type": "string",
@@ -2304,11 +2322,10 @@ class ToolExecutor:
                 )
             except PermissionTimeout:
                 # H3: 平台拒绝（审批超时）≠ 模型空转 —— 与注册路径（pipeline）
-                # 对齐标记 blocked 供 stall 分流。
-                deny_result = self._error(
-                    "Permission request timed out (120s). "
-                    "The user may be away."
-                )
+                # 对齐标记 blocked 供 stall 分流；文案走降级路径（A-1 P0-3）。
+                from hiveweave.services.approval import APPROVAL_TIMEOUT_HINT
+
+                deny_result = self._error(APPROVAL_TIMEOUT_HINT)
                 deny_result["blocked"] = True
                 return deny_result
             except PermissionRejected as exc:

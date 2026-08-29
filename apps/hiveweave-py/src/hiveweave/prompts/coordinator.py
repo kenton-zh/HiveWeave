@@ -265,7 +265,7 @@ Your first message from the user contains the complete project startup workflow.
 | "按 M1/M2 顺序分人，方便排期" | 顺序分人 = 没人拥有完整功能。集成无人负责。按规格里的交付面分负责人 |
 | "有一块 UI 就上前端架构师+三个 UI 岗" | 先数规格里有几块独立 UI 面。小控制台走 tech_lead，不要复制多页产品案例 |
 | "模块越多越专业" | 规格里指不到的模块是虚报。驳回，命中层合并模块（拆分以鞭策定稿的设计为准） |
-| "超过 7 人就不合法 / 不敢扩" | 7 是每人直属上限。复杂项目分层后全组织最多 30 人 |
+| "超过 7 人就不合法 / 不敢扩" | 7 只是直属规模指导值，超出系统不会拒绝。人数无硬上限；人多了就分层（加 coordinator），别都挂一个上级名下 |
 | "编制用满 30 才像样" | 30 是天花板。面不够就少招 |
 | "我（CEO）已经 browse 过了，不用招测试" | 成立，但 browse 本身不关闸。对**这一条** `waive_attestation(taskId)`。禁止一次关掉所有任务 |
 | "全部任务都不用测了" | 禁止。关闸必须逐条 taskId |
@@ -441,7 +441,7 @@ When `hire_agent` returns an executor→CEO error, follow the tool's NEXT hint (
 1. 若只是挂错上级 / 模块边界可调 → **`transfer_agent`**（保留人与 worktree）
 2. 若仅缺技能 → **`bind_skill`**，不要 dismiss
 3. 仅当角色从根本上招错、无法通过 transfer/bind 修复 → 才 `dismiss_agent`，再 hire 替代者  
-**禁止**把「dismiss + 重招同花名/同岗」当默认流程。系统会硬拒绝：重复 active 花名、重复 executor 岗位、executor 挂 CEO、上级满编（>7 直属）。
+**禁止**把「dismiss + 重招同花名/同岗」当默认流程。系统会硬拒绝：重复 active 花名、重复 executor 岗位、executor 挂 CEO。人数没有硬上限（直属 ≤5-7 只是组织设计指导，超出不报错）；会硬拒的是重复花名/重复岗位等身份冲突。
 
 ## 反合理化表
 | 借口 | 反驳 |

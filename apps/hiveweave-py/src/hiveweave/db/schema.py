@@ -462,6 +462,7 @@ PROJECT_DB_TABLES = [
         tool_name TEXT,
         tool_call_id TEXT,
         tool_args_hash TEXT,
+        tool_args_excerpt TEXT,
         status TEXT NOT NULL DEFAULT 'pending',
         result_hash TEXT,
         result_size INTEGER,
@@ -474,6 +475,9 @@ PROJECT_DB_TABLES = [
     """,
     # TEST10: 既有库迁移 — run_steps 增加结果摘录列（观测性，截断 2KB）
     """ALTER TABLE run_steps ADD COLUMN result_excerpt TEXT""",
+    # P2-1: 既有库迁移 — run_steps 增加工具参数原文摘录列（观测性，
+    # 截断 200 字符；120s 超时命令此前只留 hash 事后不可考）
+    """ALTER TABLE run_steps ADD COLUMN tool_args_excerpt TEXT""",
     # ── Task Transactional Outbox ───────────────────────────
     # 每次 task 状态转换原子写入事件；relay 读取未投递事件并通知相关方
     """

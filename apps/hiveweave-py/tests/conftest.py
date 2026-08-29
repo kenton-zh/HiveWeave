@@ -15,11 +15,35 @@ per-project 连接缓存）。aiosqlite 的连接 worker 线程是**非守护线
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+# ── 超长环境变量剔除（import 早期执行一次）────────────────────
+# Windows putenv 单变量上限 32767 字符。外部工具注入的巨型配置
+# （实例：ACC_PRODUCT_CONFIG_V3 ≈ 500KB JSON，某 AI CLI 产品配置）
+# 会让所有 ``patch.dict(os.environ, ...)`` 的退出恢复直接 ValueError
+# （_unpatch_dict 逐键 setitem 撞上限），污染面是全库任意 environ
+# 测试。这类变量测试永不消费，import 时移除即永绝后患。
+_ENV_VALUE_HARD_CAP = 32000
+_poisoned = [
+    k
+    for k, v in os.environ.items()
+    if len(v) > _ENV_VALUE_HARD_CAP
+]
+for _k in _poisoned:
+    del os.environ[_k]
+if _poisoned:
+    import sys
+
+    print(
+        f"[conftest] dropped oversize env vars (> {_ENV_VALUE_HARD_CAP} "
+        f"chars): {_poisoned}",
+        file=sys.stderr,
+    )
 
 
 @pytest.fixture(autouse=True)

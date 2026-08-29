@@ -113,6 +113,26 @@ async def test_list_files_header_main(layout: dict[str, Path]) -> None:
     assert result["output"].startswith("Listing: MAIN\n")
 
 
+@pytest.mark.asyncio
+async def test_list_files_shared_miss_hints_write_path(
+    layout: dict[str, Path],
+) -> None:
+    """P1-1 回归：worktree 里探 `.hiveweave/shared/` 不存在（空目录不物化）
+    必须分支化提示——教 write→checkpoint→merge 与可见时机，而不是用通用
+    READ_MISS_HINT 把它说成"不在树内 / 去 MAIN docs"（曾两次误报通道不存在）。"""
+    result = await list_files(
+        path=str(layout["wt"] / ".hiveweave" / "shared"),
+        workspace_path=str(layout["wt"]),
+        project_root=str(layout["project"]),
+    )
+    assert result["success"] is False
+    err = result["error"] or ""
+    assert "Directory not found" in err
+    assert "write_file to .hiveweave/shared/<file>" in err
+    assert "checkpoint" in err
+    assert "Not in this tree" not in err
+
+
 def test_system2_workspace_lines(layout: dict[str, Path]) -> None:
     main = build_context_prompt(
         "id", None, None, workspace_path=str(layout["project"]),

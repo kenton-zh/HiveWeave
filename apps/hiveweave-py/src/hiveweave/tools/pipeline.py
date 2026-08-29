@@ -351,7 +351,11 @@ async def execute_registered_tool(
         ).to_dict()
 
     if decision == "ask":
-        from hiveweave.services.approval import PermissionRejected, PermissionTimeout
+        from hiveweave.services.approval import (
+            APPROVAL_TIMEOUT_HINT,
+            PermissionRejected,
+            PermissionTimeout,
+        )
 
         try:
             await approval.request_permission(
@@ -361,9 +365,7 @@ async def execute_registered_tool(
                 description=f"Agent {agent_id} wants to use {tool_name}",
             )
         except PermissionTimeout:
-            return ToolResult.blocked_err(
-                "Permission request timed out (120s). The user may be away."
-            ).to_dict()
+            return ToolResult.blocked_err(APPROVAL_TIMEOUT_HINT).to_dict()
         except PermissionRejected as exc:
             return ToolResult.blocked_err(f"Permission rejected: {exc}").to_dict()
         except Exception as exc:  # noqa: BLE001

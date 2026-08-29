@@ -137,6 +137,9 @@ test_output*.json
 test-results/
 playwright-report/
 
+# 平台审计产物 (B-2: .audit 首轮审计遗留 untracked 噪音 + 不被 Remove-Item -Recurse 撞权限超时)
+.audit/
+
 # IDE
 .idea/
 .vscode/
@@ -226,6 +229,31 @@ yarn.lock merge=union
                 count=len([l for l in ls_out.splitlines() if l.strip()]),
             )
             return
+        # P1-4：用户/外部 dirty 避让 —— 维护提交会与未保存的人工编辑赛跑
+        # （report 实测：平台 05:55:47 自动提交 82d84a6 与用户手工编辑争同一
+        # .gitignore，Agent stash 吞掉用户工作）。检测到 MAIN tracked dirty
+        # 时跳过本次迁移，留到工作区干净后再试（幂等 no-op，下次启动重试）。
+        ok_mig_st, mig_st_out = await _git(
+            ["-c", "core.quotepath=false", "status", "--porcelain", "-z"],
+            workspace_path,
+        )
+        if ok_mig_st:
+            from .porcelain import _porcelain_tracked_dirty_paths
+
+            migrate_dirty = _porcelain_tracked_dirty_paths(mig_st_out)
+            # 只对 .gitignore/.gitattributes 自身 dirty 避让（迁移正写入的文件）；
+            # 其它无关 dirty 不推迟迁移 —— 迁移提交 pathspec 只碰这两个文件，
+            # 不会 sweep 用户其它未保存编辑。
+            if migrate_dirty and any(
+                p in (".gitignore", ".gitattributes") for p in migrate_dirty
+            ):
+                log.warning(
+                    "git_worktree.ignore_migrate_deferred_user_dirty",
+                    workspace=workspace_path,
+                    paths=migrate_dirty[:5],
+                    reason="human/external edits to the files being migrated",
+                )
+                return
         new_block = (
             "# HiveWeave 平台目录: 私有资产不入库 (worktrees/tool_outputs/)\n"
             "# logs/data.db 等)。shared/reports/drafts/handoffs 四目录为 agent\n"
@@ -552,8 +580,92 @@ yarn.lock merge=union
         # P1 (§7.1)：worktree standing ACE 后台铺设（幂等；沙箱 off 时 no-op）。
         # 首命令不再背传播成本。删→同路径重建走 verify-then-skip 兜底。
         if result.get("success") and result.get("path"):
+            # Per-agent git 身份（同步写，先于 agent 首个 checkpoint）。
+            await self._apply_agent_git_identity(result["path"], short_id)
             self._schedule_sandbox_grant(workspace_path, result["path"], short_id)
         return result
+
+    async def _apply_agent_git_identity(
+        self, worktree_path: str, short_id: str
+    ) -> None:
+        """Per-agent git 身份（用户需求：每个 agent 在 git 内有自己的名字）。
+
+        worktree-local config 覆盖该 agent 的 checkpoint commit 与自发
+        bash commit——fast-forward merge 后 main 的 git log 直接显示
+        作者花名（「判断带出处」不变式的 git 侧落地）。
+
+        - user.name  = agent 花名（resolve_agent 查不到时 fallback
+          ``HiveWeave Agent <short_id>``，仍可与其它 agent 区分）
+        - user.email = ``<short_id>@agents.hiveweave.local``（合成、
+          ASCII、可从 email 反查 agent）
+        - 前置：repo 级 ``extensions.worktreeConfig=true``（幂等开启）
+          必须先于 ``--worktree`` 写入，顺序不可颠倒。
+        - fail-quiet：身份写失败不阻塞 worktree 创建，回退 repo 级
+          统一身份（HiveWeave Agent）。
+        """
+        try:
+            ok, _ = await _git(
+                ["config", "extensions.worktreeConfig", "true"],
+                worktree_path,
+            )
+            if not ok:
+                log.warning(
+                    "git_worktree.agent_identity_worktree_config_off",
+                    short_id=short_id,
+                )
+                return
+            name: str | None = None
+            try:
+                from hiveweave.services.org import OrgService
+
+                agent = await OrgService().resolve_agent(short_id)
+                raw = (agent or {}).get("name")
+                # 脏数据防御：非 str 或空白一律走 fallback（审计 P1-2）
+                name = raw if isinstance(raw, str) and raw.strip() else None
+            except Exception:
+                name = None
+            git_name = name or f"HiveWeave Agent {short_id}"
+            email = f"{short_id}@agents.hiveweave.local"
+            ok_n, _ = await _git(
+                ["config", "--worktree", "user.name", git_name],
+                worktree_path,
+            )
+            ok_e, _ = await _git(
+                ["config", "--worktree", "user.email", email],
+                worktree_path,
+            )
+            if not (ok_n and ok_e):
+                # 审计 P1-1：--worktree 写失败时确保 repo 级至少有 fallback
+                # 身份（存量/收养仓库可能完全没有 user.name）——否则
+                # checkpoint 会以 "Please tell me who you are" 硬失败。
+                # 只在缺失时补写，不覆盖既有身份。
+                ok_chk, cur = await _git(
+                    ["config", "user.name"], worktree_path
+                )
+                if not ok_chk or not (cur or "").strip():
+                    await _git(
+                        ["config", "user.name", git_name], worktree_path
+                    )
+                    await _git(
+                        ["config", "user.email", email], worktree_path
+                    )
+                log.warning(
+                    "git_worktree.agent_identity_worktree_write_failed",
+                    short_id=short_id,
+                    repo_level_fallback=True,
+                )
+            else:
+                log.info(
+                    "git_worktree.agent_identity_applied",
+                    short_id=short_id,
+                    git_name=git_name,
+                )
+        except Exception as e:
+            log.warning(
+                "git_worktree.agent_identity_failed",
+                short_id=short_id,
+                error=str(e),
+            )
 
     def _schedule_sandbox_grant(
         self, project_root: str, worktree_path: str, short_id: str
@@ -582,6 +694,29 @@ yarn.lock merge=union
                 worktree=worktree_path, error=str(e),
             )
 
+    async def _materialize_shared_dir(self, path: str) -> None:
+        """P1-1: 物化 ``.hiveweave/shared/`` —— 空目录 git 不跟踪，worktree
+        checkout 里不会物化，agent list_files 探路误报"不在树内"（report
+        P1-1：两次被当"真不在树内"）。放一个 ``.keep.md`` 让 git 可跟踪：
+        首个 checkpoint 后该目录在全部 worktree 常驻。best-effort 不阻塞创建。
+        """
+        try:
+            from .constants import SHARED_DIR
+
+            _sd = Path(path) / SHARED_DIR
+            _sd.mkdir(parents=True, exist_ok=True)
+            _keep = _sd / ".keep.md"
+            if not _keep.exists():
+                _keep.write_text(
+                    "# HiveWeave shared workspace\n\n"
+                    "Team-visible channel (read/write). Write: write_file to "
+                    "this dir → checkpoint → merge; members see it after "
+                    "their next worktree merge. Never put secrets here.\n",
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass  # best-effort: don't fail worktree creation
+
     async def _create_unlocked(
         self,
         workspace_path: str,
@@ -606,6 +741,7 @@ yarn.lock merge=union
         # 新算 (新算名与检出分支可能不同: task_id 变化 / legacy slug 分支)。
         if _has_git(path):
             actual = await _current_branch(path)
+            await self._materialize_shared_dir(path)
             return {
                 "success": True,
                 "path": path,
@@ -711,6 +847,7 @@ yarn.lock merge=union
             if ok:
                 log.info("git_worktree.create", short_id=short_id,
                          branch=branch, base="existing-branch")
+                await self._materialize_shared_dir(path)
                 return {
                     "success": True,
                     "path": path,
@@ -735,6 +872,7 @@ yarn.lock merge=union
                         short_id=short_id,
                         branch=branch,
                     )
+                    await self._materialize_shared_dir(path)
                     return {
                         "success": True,
                         "path": path,
@@ -764,6 +902,7 @@ yarn.lock merge=union
             if ok:
                 log.info("git_worktree.create", short_id=short_id,
                          branch=branch, base=base_branch)
+                await self._materialize_shared_dir(path)
                 return {
                     "success": True,
                     "path": path,
@@ -789,6 +928,7 @@ yarn.lock merge=union
                         short_id=short_id,
                         branch=branch,
                     )
+                    await self._materialize_shared_dir(path)
                     return {
                         "success": True,
                         "path": path,
@@ -803,6 +943,7 @@ yarn.lock merge=union
         # Final heal: another path may have created a valid tree during races
         if _has_git(path):
             actual = await _current_branch(path)
+            await self._materialize_shared_dir(path)
             log.info(
                 "git_worktree.create_healed_existing",
                 short_id=short_id,
@@ -835,9 +976,17 @@ yarn.lock merge=union
             return {"success": False,
                     "message": f"Worktree for {short_id} does not exist."}
 
-        ok, _ = await _git(["add", "-A"], path)
+        ok, add_out = await _git(["add", "-A"], path)
         if not ok:
-            return {"success": False, "message": "Failed to stage files"}
+            # P1-2: 失败必须透传 git 原始输出（此前丢 stderr 只回"Failed to
+            # stage files"，agent 只能盲试 —— platform-issue-report P1-2 的
+            # 19.1 分钟自救马拉松根因）。
+            add_detail = (add_out or "").strip()
+            detail = f" | git: {add_detail[:400]}" if add_detail else ""
+            return {
+                "success": False,
+                "message": f"Failed to stage files{detail}",
+            }
 
         # P1-1: strip GENERATED_FILES from staging (lockfiles cause predictable
         # merge conflicts; they should be regenerated post-merge, not committed).
@@ -846,6 +995,11 @@ yarn.lock merge=union
         # dirtying every future checkout (merge-blocking main dirt).
         regen_stripped: list[str] = []
         gen_stripped: list[str] = []
+        # P1-2: 平台私有时运行时目录（.hiveweave/* 中非 TRACKED_WS_DIRS）绝不
+        # 提交 —— npm 缓存等 untracked 运行时目录曾导致 git add -A 失败，
+        # 触发 agent 19 分钟自救马拉松（platform-issue-report P1-2）。
+        runtime_stripped: list[str] = []
+        _keep_prefixes = tuple(f"{d}/" for d in TRACKED_WS_DIRS)
         try:
             ok_st, staged_out = await _git(
                 ["diff", "--cached", "--name-only"], path
@@ -861,6 +1015,10 @@ yarn.lock merge=union
                         gen_stripped.append(fname)
                     elif is_regenerable_path(fname):
                         regen_stripped.append(fname)
+                    elif fname.startswith(".hiveweave/") and not any(
+                        fname.startswith(kp) for kp in _keep_prefixes
+                    ):
+                        runtime_stripped.append(fname)
                 if gen_stripped:
                     await _git(
                         ["reset", "HEAD", "--"] + gen_stripped, path
@@ -882,6 +1040,26 @@ yarn.lock merge=union
                         short_id=short_id,
                         files=regen_stripped[:10],
                     )
+                if runtime_stripped:
+                    ok_rst, _ = await _git(
+                        ["reset", "HEAD", "--"] + runtime_stripped, path
+                    )
+                    if not ok_rst:
+                        # 兜底：reset 失败则 runtime 文件仍会进提交 —— 摘出
+                        # 清单避免回执"声称已排除"而实际已提交（口径失真）；
+                        # runtime_note 在函数后续 `if runtime_stripped:` 一并置空。
+                        log.warning(
+                            "checkpoint_platform_dirs_reset_failed",
+                            short_id=short_id,
+                            files=runtime_stripped[:10],
+                        )
+                        runtime_stripped = []
+                    else:
+                        log.info(
+                            "checkpoint_platform_dirs_stripped",
+                            short_id=short_id,
+                            files=runtime_stripped[:10],
+                        )
         except Exception:
             pass  # best-effort: don't fail checkpoint on strip
 
@@ -909,6 +1087,18 @@ yarn.lock merge=union
                 f"{'...' if len(regen_stripped) > 5 else ''}. To keep one "
                 f"as evidence, rename it with your short_id prefix (e.g. "
                 f"{short_id}-evidence.txt) and checkpoint again."
+            )
+
+        # P1-2: 平台运行时目录剥离也进返回 message（agent 可见，避免改
+        # .gitignore 自救 —— report 歪招典藏①）。
+        runtime_note = ""
+        if runtime_stripped:
+            runtime_note = (
+                f" NOTE: {len(runtime_stripped)} platform runtime path(s) "
+                f"under .hiveweave/ excluded from this commit (platform "
+                f"private; never commit them): "
+                f"{', '.join(runtime_stripped[:5])}"
+                f"{'...' if len(runtime_stripped) > 5 else ''}."
             )
 
         # P1 fix(TEST10): 检测被 .gitignore 屏蔽的产物文件
@@ -977,7 +1167,7 @@ yarn.lock merge=union
                 "message": (
                     "no committable changes"
                     + ignored_warning + generated_note + regen_note
-                    + conflict_warning
+                    + runtime_note + conflict_warning
                 ).strip(),
             }
 
@@ -1013,7 +1203,7 @@ yarn.lock merge=union
                  hash=head if ok else "", count=count)
         return {"success": True, "hash": head if ok else "", "count": count,
                 "message": (ignored_warning + generated_note + regen_note
-                            + conflict_warning) or None}
+                            + runtime_note + conflict_warning) or None}
 
     async def _conflict_warning(self, path: str) -> str:
         """checkpoint 回执的冲突预警文案(只提示, 绝不拦截——checkpoint 语义

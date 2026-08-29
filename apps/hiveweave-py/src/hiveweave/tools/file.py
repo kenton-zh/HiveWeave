@@ -668,9 +668,31 @@ async def list_files(
     except ValueError:
         pass
     if not p.exists():
+        # P1-1: 对 .hiveweave/shared 的探路失败要分支化提示 —— 共享区在
+        # worktree 里"空目录不物化"，报"不在树内"会误导 agent 判定通道
+        # 不存在（platform-issue-report P1-1：两次把它当"真不在树内"）。
+        shared_hint = READ_MISS_HINT
+        try:
+            _rel = p.resolve().relative_to(Path(root).resolve()).parts
+            # 匹配 rel 路径中任意位置的 `.hiveweave` 紧随 `shared` 段对：
+            # 同时覆盖 MAIN（.hiveweave/shared/...）与叶子 worktree 嵌套
+            # （.hiveweave/worktrees/<sid>/.hiveweave/shared/...）两种布局。
+            if any(
+                _rel[i] == HIVEWEAVE_DIR and i + 1 < len(_rel) and _rel[i + 1] == "shared"
+                for i in range(len(_rel) - 1)
+            ):
+                shared_hint = (
+                    " The .hiveweave/shared/ chain may not be materialized "
+                    "in your worktree yet (empty shared/ is not tracked). "
+                    "Write: write_file to .hiveweave/shared/<file> → "
+                    "checkpoint → merge; members see it after their next "
+                    "worktree merge. Do not search other agents' trees."
+                )
+        except Exception:
+            pass
         return {"success": False, "output": "",
                 "error": f"Error: Directory not found: {path}."
-                         f"{READ_MISS_HINT}"}
+                         f"{shared_hint}"}
     if not p.is_dir():
         return {"success": False, "output": "",
                 "error": f"Error: Not a directory: {path}"}

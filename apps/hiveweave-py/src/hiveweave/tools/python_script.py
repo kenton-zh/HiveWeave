@@ -22,7 +22,11 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from hiveweave.tools.base import tool
-from hiveweave.tools.bash import MAX_TIMEOUT_S, _truncate_output
+from hiveweave.tools.bash import (
+    MAX_TIMEOUT_S,
+    TOOL_DEFAULT_TIMEOUT_MS,
+    _truncate_output,
+)
 from hiveweave.tools.result import ToolResult
 
 
@@ -48,7 +52,7 @@ class PythonScriptParams(BaseModel):
     timeout: int | None = Field(
         default=None,
         description=(
-            "Timeout ms (5s–10min). Default 120000 (2min). Values 1-600 "
+            "Timeout ms (5s–10min). Default 300000 (5min). Values 1-600 "
             "are treated as seconds (30 = 30s)."
         ),
     )
@@ -134,7 +138,8 @@ async def python_script_execute(
         )
 
     # 解析超时（数值 1-600 视为秒）
-    timeout_ms = int(params.timeout or 120_000)
+    # A-2 (P1-4): 未显式给超时时按工具声明取默认（python_script 300s）。
+    timeout_ms = int(params.timeout or TOOL_DEFAULT_TIMEOUT_MS["python_script"])
     if 1 <= timeout_ms <= 600:
         timeout_ms = timeout_ms * 1000
     timeout_ms = max(5_000, min(timeout_ms, MAX_TIMEOUT_S * 1000))

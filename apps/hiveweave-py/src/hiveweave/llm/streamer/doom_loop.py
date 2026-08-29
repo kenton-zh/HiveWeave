@@ -1,6 +1,8 @@
 """Doom-loop thresholds and progress helpers."""
 from __future__ import annotations
 
+import json
+
 DOOM_LOOP_DEFAULT_LIMIT = 3
 """默认 doom loop 阈值 — 同一工具+同一参数连续 N 次中断。"""
 
@@ -173,6 +175,34 @@ def round_made_progress(
     return False
 
 
+def _canonical_tool_args(args: object) -> str:
+    """Canonical fingerprint for tool-call arguments (str-JSON or dict).
+
+    P0-1：readonly stall 只用「参数是否重复」判 polling —— 读不同文件/
+    不同参数轮差异必须体现在指纹里，否则合法阅读流会被误判为空转。
+    """
+    if isinstance(args, dict):
+        try:
+            return json.dumps(args, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return repr(args)
+    if isinstance(args, str):
+        try:
+            obj = json.loads(args)
+            return json.dumps(obj, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return args
+    return repr(args)
+
+
+def readonly_fingerprint(tc: dict) -> tuple[str, str] | None:
+    """``(tool_name, canonical_args)`` for a readonly tool call, else ``None``."""
+    name = tc.get("name") or ""
+    if name not in DOOM_LOOP_READONLY_TOOLS:
+        return None
+    return name, _canonical_tool_args(tc.get("arguments"))
+
+
 def round_was_readonly_only(
     tool_calls: list[dict],
     *,
@@ -200,12 +230,36 @@ def round_was_readonly_only(
     return saw_ok_readonly
 
 
+def fail_signature_for_round(
+    tool_calls: list[dict],
+    error_ids: set[str] | None = None,
+    duplicate_ids: set[str] | None = None,
+) -> tuple[str, str] | None:
+    """本轮第一个失败调用 ``(tool_name, args 指纹前 60 字符)``；None = 无失败。
+
+    P0-1（R3 收敛判据）：tool-failed stall 是否「原地踏步」—— 同工具+同参
+    失败 = 同源（撞同一面墙），继续计入 2 轮快速收口；换参/换工具失败 =
+    方向在变（试错），不得按 2 轮快速收口（R2/R3 实证：pytest 反复
+    no-cacheprovider/basetemp/icacls 全是被试错判死）。
+    """
+    errs = error_ids or set()
+    dups = duplicate_ids or set()
+    for tc in tool_calls:
+        tid = tc.get("id") or ""
+        if tid in errs or tid in dups:
+            name = tc.get("name") or ""
+            args = _canonical_tool_args(tc.get("arguments"))
+            return name, args[:60]
+    return None
+
+
 def classify_stall_round(
     tool_calls: list[dict],
     *,
     error_ids: set[str] | None = None,
     blocked_ids: set[str] | None = None,
     duplicate_ids: set[str] | None = None,
+    seen_readonly_fingerprints: set[tuple[str, str]] | None = None,
 ) -> str | None:
     """本轮 stall 归因，``None`` = 本轮有进展。
 
@@ -213,6 +267,11 @@ def classify_stall_round(
     （bash-sandbox/src/index.ts:107 "Runner failure outranks denial because
     the command did not run"）：工具没跑成的轮次，既不是模型空转也不是护栏
     拒绝，必须先摘出去 —— 否则文案会让模型去反省它并没犯的错。
+
+    P0-1：readonly 归因只在「本轮只读调用命中历史重复指纹」时返回 ——
+    连续读**不同**文件/不同参数的合法只读工作流视为有进展（``None``），
+    stall 阈值只对同参轮询生效（``seen_readonly_fingerprints`` 由调用方
+    逐轮维护，注意调用方应在判定**之后**才把本轮新指纹并入历史）。
     """
     if round_made_progress(
         tool_calls, error_ids=error_ids, duplicate_ids=duplicate_ids
@@ -227,6 +286,22 @@ def classify_stall_round(
     if round_was_readonly_only(
         tool_calls, error_ids=error_ids, duplicate_ids=duplicate_ids
     ):
+        # 空轮（无调用）保持历史语义：归 readonly 累计，与"纯只读轮询"同收口。
+        if not tool_calls:
+            return STALL_REASON_READONLY
+        seen = seen_readonly_fingerprints
+        if seen is not None:
+            repeated = False
+            for tc in tool_calls:
+                tid = tc.get("id") or ""
+                if tid in errs or tid in (duplicate_ids or set()):
+                    continue
+                fp = readonly_fingerprint(tc)
+                if fp is not None and fp in seen:
+                    repeated = True
+            if not repeated:
+                # 本轮只读调用的参数全部是新的 → 合法阅读/巡检，不算空转。
+                return None
         return STALL_REASON_READONLY
     return STALL_REASON_NO_PROGRESS
 

@@ -140,9 +140,11 @@ async def on_delta(agent: Any, event: dict) -> None:
        placeholder 一直空），不会误判为 [对话被中断]
     2. 后端崩溃/重启时，部分输出已持久化
 
-    FIX(text-acc): 收到 round_start 时重置 DB 文本累积器。前端 stream
-    draft 必须同步丢掉上一轮 text/thinking 段（保留 tool_call），否则
-    工具循环会把每轮复述叠在同一气泡里。
+    文本累积器是 turn 级：round_start 不再清空。此前每轮把 DB content
+    清零重写，重连/刷新后从 DB 恢复只能看到「当前轮」文本，用户已看到的
+    前几轮叙述整段消失（表现为「回答变成一句话」）。前端 beginStreamRound
+    现为 no-op（整轮时间线口径），DB 快照与直播 draft 对齐后，任何时刻
+    从 DB 恢复都不会回退已见内容；finalize 仍按全量 segments 重写。
     """
     # P0-3: 任何 streamer 事件都算流式活动（僵尸判定信号）。
     # 本地 thinking 心跳不经此回调（agent._heartbeat 直接广播），
@@ -156,17 +158,10 @@ async def on_delta(agent: Any, event: dict) -> None:
     agent._stop_heartbeat()
     broadcast_stream_event(agent, event)
 
-    # 工具循环新一轮 → 重置文本累积器 + BUG-7 按轮次累加 LLM 调用
+    # 工具循环新一轮 → BUG-7 按轮次累加 LLM 调用。
+    # 注意：round_start 不清空 _streaming_text_acc / DB content ——
+    # turn 级累计（见 docstring）。
     if event.get("type") == "round_start":
-        agent._streaming_text_acc = ""
-        if agent._streaming_msg_id:
-            try:
-                await agent._chat_msg.update_message(
-                    agent.id, agent._streaming_msg_id,
-                    {"content": ""},
-                )
-            except Exception:
-                pass
         _run_id = getattr(agent, "_current_run_id", None)
         if _run_id:
             try:
@@ -226,6 +221,13 @@ async def on_tool_call(
     _run_id = getattr(agent, "_current_run_id", None)
     if _run_id:
         args_hash = _short_hash(arguments) if arguments else None
+        # P2-1: 参数原文摘录截断落库 —— 超时命令此前只留 hash 事后不可考
+        # （report P2-1/P2-3：120s 超时 ×2 命令内容无法还原）。
+        _args_raw = arguments or ""
+        args_excerpt = (
+            (_args_raw[:200] + "…[truncated]" if len(_args_raw) > 200 else _args_raw)
+            or None
+        )
         # P2 fix(TEST10): 预分配 index 再 await，避免并行工具调用竞态
         # （多个并行 call 同时读 counter → 同 index）。先自增再落库。
         current_index = agent._run_step_counter
@@ -239,6 +241,7 @@ async def on_tool_call(
                 tool_name=tool_name,
                 tool_call_id=tool_call_id,
                 tool_args_hash=args_hash,
+                tool_args_excerpt=args_excerpt,
             )
             # BUG-7: increment tool counter at step start (covers interrupt path)
             await agent._run_ledger.increment_tool_calls(agent.id, _run_id)

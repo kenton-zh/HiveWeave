@@ -73,7 +73,10 @@ async def test_resolve_ask_timeout_is_distinguishable():
             _ask_verdict(), agent_id="a1", tool_name="bash",
         )
     assert v.blocked is True and v.action == "deny"
-    assert "timed out" in v.reason
+    # R3 批次 P0-3：超时降级文案单源 APPROVAL_TIMEOUT_HINT（中文），
+    # 可区分性锚定其关键词（≠ 用户拒绝 ≠ 通道故障的通用文案）。
+    assert "审批请求超时" in v.reason
+    assert "用户暂不可达" in v.reason
 
 
 async def test_resolve_ask_channel_error_fails_closed():

@@ -1019,6 +1019,9 @@ async def handle_safety_timeout(agent: Any) -> None:
         except Exception as e:
             log.debug("run_ledger.interrupt_run_failed", error=str(e))
 
+    # P1-6：卡死中断同样不丢账（safety timer / force interrupt 两路都汇到这）。
+    await _flush_pending_usage(agent, reason="safety_timeout")
+
     # 连续中断计数 — 与 _handle_error 共用同一阈值
     agent._consecutive_errors += 1
     give_up = agent._consecutive_errors > agent._CONSECUTIVE_ERROR_MAX
@@ -1197,6 +1200,55 @@ async def escalate_turn_interruption(agent: Any, *, reason: str) -> None:
             "interruption_escalate_failed", agent_id=agent.id, error=str(e)
         )
 
+async def _flush_pending_usage(agent: Any, *, reason: str = "interrupted") -> None:
+    """P1-6：把 agent._pending_usage（streamer 实时推送的每轮 usage）补落库。
+
+    覆盖所有中断面（用户 cancel / safety timeout / force interrupt）——
+    stream 被中断时 result 永不返回，正常路径的 record_rounds 不会执行，
+    sink 里已累积的 usage 若不补写会蒸发。best-effort 不阻塞恢复流程。
+    """
+    _pending = getattr(agent, "_pending_usage", None)
+    if not _pending:
+        # R3 P2-3：流零 chunk 即被掐（请求已发起、无 round 返回）时 flush 为空。
+        # 该次调用已在请求层计费但不进 llm_usage —— 留痕供观测/审计归因
+        # （R3 已实证此类缺口量小：仅 1 次调用）。
+        log.info(
+            "interrupted_usage_flush_empty",
+            agent_id=agent.id,
+            reason=reason,
+            note="request started but zero chunks arrived; not metered",
+        )
+        return
+    try:
+        from hiveweave.services.token_meter import token_meter
+
+        _mc = None
+        try:
+            _mc = await agent._get_model_config()
+        except Exception:
+            pass
+        await token_meter.record_rounds(
+            agent_id=agent.id,
+            project_id=agent.project_id,
+            run_id=getattr(agent, "_current_run_id", None),
+            task_id=getattr(agent, "_current_task_id", None),
+            rounds=list(_pending),
+            model_id=(_mc or {}).get("model_id"),
+            provider=(_mc or {}).get("provider_type"),
+            request_type="main",
+        )
+        log.info(
+            "interrupted_usage_flushed",
+            agent_id=agent.id,
+            reason=reason,
+            rounds=len(_pending),
+        )
+    except Exception as e:
+        log.warning("interrupted_usage_flush_failed", agent_id=agent.id, error=str(e))
+    finally:
+        agent._pending_usage = []
+
+
 async def handle_cancel(agent: Any) -> None:
     """用户取消处理。
 
@@ -1213,6 +1265,9 @@ async def handle_cancel(agent: Any) -> None:
             )
         except Exception as e:
             log.debug("run_ledger.interrupt_cancel_failed", error=str(e))
+
+    # P1-6：取消不丢账 —— 已累积的每轮 usage 补落库（覆盖 cancel 全路径）。
+    await _flush_pending_usage(agent, reason="cancelled_by_user")
 
     await agent._finalize_streaming_turn(content="[对话被中断]")
 

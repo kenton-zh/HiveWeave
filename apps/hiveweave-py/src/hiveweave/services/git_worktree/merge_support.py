@@ -21,10 +21,14 @@ log = structlog.get_logger(__name__)
 async def classify_main_dirt(workspace_path: str) -> dict:
     """只读判定 main 脏状态（不清理、不提交）。
 
-    Returns ``{"dirty_paths": [...], "hard_blockers": [...]}`` —
+    Returns ``{"dirty_paths": [...], "hard_blockers": [...],
+    "user_suspect": [...]}`` —
     ``hard_blockers`` = tracked 脏路径中「非可再生且不在 tracked ws 目录」
-    的集合（merge 会硬拒的集合）。供 merge 预检（dry-run）与
-    ``restore_regenerable_dirt_or_reject`` 共享同一判定。
+    的集合（merge 会硬拒的集合）；``user_suspect`` = 其中**疑似人工/外部
+    编辑**的路径（P1-4 author 事实位：Agent 产出应经 worktree+merge，MAIN
+    上遗留的未提交 tracked 改动 = 人类编辑/外部进程嫌疑 —— 与平台托管目录
+    .hiveweave/* 及可再生产物互斥后取 hard_blockers）。供 merge 预检
+    （dry-run）与 ``restore_regenerable_dirt_or_reject`` 共享同一判定。
     """
     ok_st, st_out = await _git(
         ["-c", "core.quotepath=false", "status", "--porcelain", "-z"],
@@ -35,7 +39,11 @@ async def classify_main_dirt(workspace_path: str) -> dict:
         p for p in dirty_paths
         if not is_regenerable_path(p) and not _in_tracked_ws_dir(p)
     ]
-    return {"dirty_paths": dirty_paths, "hard_blockers": hard}
+    return {
+        "dirty_paths": dirty_paths,
+        "hard_blockers": hard,
+        "user_suspect": list(hard),  # P1-4 author 事实位
+    }
 
 
 async def restore_regenerable_dirt_or_reject(

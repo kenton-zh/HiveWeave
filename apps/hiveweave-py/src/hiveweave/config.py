@@ -79,8 +79,9 @@ class Settings(BaseSettings):
     sqlite_busy_timeout_ms: int = 5000
 
     # ACL 写受限令牌沙箱（spec docs/spec/windows-acl-sandbox.md）。
-    # P3 默认 on：受限 shell 方言适配层（§18.3 `_normalize_for_pwsh`）已落地，
-    # agent 的 bash 惯用法经 pwsh 适配可执行；确需关闭用 env HIVEWEAVE_ACL_SANDBOX=off。
+    # P3 默认 on：受限 shell = pwsh 承载，命令 verbatim（P1-3 B 结构解，
+    # 词典翻译 _normalize_for_pwsh 已退役，unix-only 前置拒绝给 pwsh 等价）；
+    # 确需关闭用 env HIVEWEAVE_ACL_SANDBOX=off。
     acl_sandbox: bool = True
     # 专用排空线程池大小（§5.4）。
     acl_max_concurrent: int = 32

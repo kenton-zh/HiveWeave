@@ -120,6 +120,124 @@ describe("useChatMessages agent switch cache", () => {
   });
 });
 
+// WS 重连对账：断连窗口内错过的 done 已成过去（replay 被挤出/后端重启）
+// 时，重连必须主动拉一次 DB 对账；agent 已不在处理中时冻结 draft 让位给
+// DB 行，否则面板永远停在断连时刻的中途快照上。
+describe("useChatMessages — socket reconnect reconcile", () => {
+  function useReconcileHarness(
+    agentId: string,
+    draftRef: { current: StreamDraft | null },
+    nullWrites: () => void,
+  ) {
+    const activeAgentIdRef = useRef<string | null>(agentId);
+    activeAgentIdRef.current = agentId;
+    const [isStreaming, setIsStreaming] = useState(false);
+    // spy 身份稳定（vi.fn）；否则 updateStreamDraft 每渲染换引用，
+    // 对账 effect 的 cleanup 会在 fetch 往返前把 cancelled 置真。
+    const nullWritesRef = useRef(nullWrites);
+    nullWritesRef.current = nullWrites;
+    const updateStreamDraft = useCallback(
+      (u: any) => {
+        const next = typeof u === "function" ? u(draftRef.current) : u;
+        if (next === null) nullWritesRef.current();
+        draftRef.current = next;
+      },
+      [draftRef],
+    );
+    const setThinkingElapsed = useCallback(() => {}, []);
+    return useChatMessages({
+      agentId,
+      streamDraft: draftRef.current,
+      streamDraftRef: draftRef as any,
+      updateStreamDraft,
+      isStreaming,
+      setIsStreaming,
+      setThinkingElapsed,
+      activeAgentIdRef,
+    });
+  }
+
+  beforeEach(() => {
+    useAppStore.getState().clearChatSessions();
+    useAppStore.getState().setProcessingAgents([]);
+    vi.mocked(getChatMessages).mockReset();
+    vi.mocked(getChatMessages).mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    useAppStore.getState().setProcessingAgents([]);
+    useAppStore.getState().clearChatSessions();
+  });
+
+  it("reloads from DB and clears the dead draft after a reconnect", async () => {
+    const draftRef: { current: StreamDraft | null } = { current: null };
+    const nullWrites = vi.fn();
+    vi.mocked(getChatMessages).mockResolvedValue([
+      {
+        id: "assist-1",
+        role: "assistant",
+        content: "完整整轮文本",
+        created_at: 1,
+        is_streaming: 0,
+        metadata: JSON.stringify({
+          segments: [
+            { type: "text", content: "第一段。" },
+            { type: "tool_call", tool: "list_files", id: "t1", status: "ok" },
+            { type: "text", content: "第二段。" },
+          ],
+        }),
+      },
+    ]);
+
+    renderHook(() => useReconcileHarness("A", draftRef, nullWrites));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // 模拟断连时刻的在飞 draft（真实链路由 message_id/text_delta 建立；
+    // 挂载 effect 本身会做一次初始化清理，先丢弃）
+    draftRef.current = { assistantId: "assist-1", segments: [{ type: "text", content: "残留半句" }] };
+    nullWrites.mockClear();
+    const callsAfterMount = vi.mocked(getChatMessages).mock.calls.length;
+
+    // socketReconnectVersion 只由真实重连发出（App onOpen 钩子，首连不
+    // bump），生产里 version 0 → 1 就是第一次重连；挂载晚于重连由
+    // reconnectSeenRef 挡住，无需额外哨兵。
+    await act(async () => {
+      useAppStore.getState().bumpSocketReconnect();
+      await Promise.resolve();
+    });
+    expect(vi.mocked(getChatMessages).mock.calls.length).toBeGreaterThan(callsAfterMount);
+    // agent 不在处理中 → 死 draft 清空，DB 权威行接管
+    expect(nullWrites).toHaveBeenCalled();
+    expect(draftRef.current).toBeNull();
+  });
+
+  it("keeps the live draft when the agent is still processing after reconnect", async () => {
+    const draftRef: { current: StreamDraft | null } = { current: null };
+    const nullWrites = vi.fn();
+    vi.mocked(getChatMessages).mockResolvedValue([]);
+    useAppStore.getState().setProcessingAgents(["A"]);
+
+    renderHook(() => useReconcileHarness("A", draftRef, nullWrites));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    draftRef.current = { assistantId: "assist-1", segments: [{ type: "text", content: "在飞" }] };
+    nullWrites.mockClear();
+
+    await act(async () => {
+      useAppStore.getState().bumpSocketReconnect();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      useAppStore.getState().bumpSocketReconnect();
+      await Promise.resolve();
+    });
+    expect(nullWrites).not.toHaveBeenCalled();
+    expect(draftRef.current).not.toBeNull();
+  });
+});
+
 // idle 可能早于 done 抵达（两者走不同频道）。done 是「按 metadata.segments
 // 权威重载」的唯一入口，被丢弃就会让气泡永久停在流式中途的 DB 快照上
 // （只剩最后一轮 content，think/旁白/工具块全消失）。

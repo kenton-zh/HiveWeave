@@ -13,8 +13,13 @@ from typing import Any
 
 from hiveweave.services.policy import is_test_engineer_role
 
-# Align with coordinator IRON span prompt (5–7). Use 7 as hard max.
-MAX_DIRECT_REPORTS = 7
+# Span of control (直属 ≤5-7) is prompt-level IRON guidance only
+# (prompts/coordinator.py) — NO code hard cap on headcount (2026-08-29):
+# the old MAX_DIRECT_REPORTS=7 hire gate stranded QA hires (TEST_DSH_36)
+# and froze HR when the 8th report was rejected. Beyond the guidance the
+# system still succeeds but returns span_advisory() — add a coordinator
+# layer and regroup leaves by functional module.
+SPAN_GUIDANCE = 7
 
 _RESERVED_FLOWER_NAMES = frozenset({
     "归零", "知远",
@@ -169,17 +174,6 @@ def validate_hire(
                     "transfer_agent or dismiss before hiring a duplicate."
                 )
 
-    # Span of control
-    if parent_id:
-        pid = parent.get("id") if parent else parent_id
-        kids = [a for a in active if (a.get("parent_id") or "") == pid]
-        if len(kids) >= MAX_DIRECT_REPORTS:
-            return (
-                f"Parent already has {len(kids)} active direct reports "
-                f"(max {MAX_DIRECT_REPORTS}). Add a coordinator layer, or "
-                "transfer/dismiss someone first."
-            )
-
     return None
 
 
@@ -200,6 +194,52 @@ def _executor_under_ceo_error(parent: dict[str, Any] | None) -> str | None:
     return None
 
 
+def span_advisory(
+    *,
+    agents: list[dict[str, Any]],
+    parent_id: str,
+    exclude_id: str | None = None,
+    adding_coordinator: bool = False,
+) -> str | None:
+    """Non-blocking hint when a parent would exceed the span guidance.
+
+    Hire/transfer always succeed; the caller appends the returned text to
+    the tool receipt so the agent knows to layer the org instead of piling
+    more direct reports onto one parent. Returns None within guidance or
+    when the added person is themselves a coordinator (that IS the remedy).
+    """
+    if adding_coordinator:
+        return None
+    parent_id = (parent_id or "").strip()
+    if not parent_id:
+        return None
+    pid = parent_id
+    parent_name = parent_id
+    for a in agents:
+        if a.get("id") == parent_id or a.get("short_id") == parent_id:
+            pid = a["id"]
+            parent_name = a.get("name") or pid
+            break
+    # exclude_id = the moved agent in a transfer (may already sit under
+    # this parent); the caller always counts it back in via +1 below.
+    kids = [
+        a
+        for a in _active(agents)
+        if (a.get("parent_id") or "") == pid and a.get("id") != exclude_id
+    ]
+    resulting = len(kids) + 1
+    if resulting <= SPAN_GUIDANCE:
+        return None
+    return (
+        f"⚠️ SPAN ADVISORY（非阻塞提示，本次操作已生效）：{parent_name} "
+        f"的直属将达 {resulting} 人（组织设计指导值 ≤{SPAN_GUIDANCE}）。"
+        "人数没有硬上限，但直属偏多时更好的结构是再加一层 coordinator 中层、"
+        "把叶子按功能模块分组挂靠：先 hire_agent 一名 coordinator"
+        "（permissionType=coordinator，parentId=现上级），再用 transfer_agent "
+        "把相关模块的叶子挂到新中层名下。请在回报中带上这个分层建议。"
+    )
+
+
 def validate_transfer(
     *,
     agents: list[dict[str, Any]],
@@ -208,10 +248,9 @@ def validate_transfer(
 ) -> str | None:
     """Return error if transfer would break org invariants, else None.
 
-    Mirrors hire gates that apply to re-parenting (executor↛CEO, no HR parent,
-    span max). Does not re-check flower-name uniqueness.
+    Mirrors hire gates that apply to re-parenting (executor↛CEO, no HR
+    parent). Does not re-check flower-name uniqueness.
     """
-    active = _active(agents)
     target: dict[str, Any] | None = None
     for a in agents:
         if a.get("id") == agent_id or a.get("short_id") == agent_id:
@@ -250,19 +289,6 @@ def validate_transfer(
             return (
                 "Executors cannot be root / report to no one. "
                 "Set newParentId to a coordinator (architect / tech lead / manager)."
-            )
-
-    if new_parent_id and parent:
-        pid = parent.get("id") or new_parent_id
-        kids = [
-            a for a in active
-            if (a.get("parent_id") or "") == pid and a.get("id") != agent_id
-        ]
-        if len(kids) >= MAX_DIRECT_REPORTS:
-            return (
-                f"Parent already has {len(kids)} active direct reports "
-                f"(max {MAX_DIRECT_REPORTS}). Add a coordinator layer, or "
-                "transfer/dismiss someone first."
             )
 
     return None

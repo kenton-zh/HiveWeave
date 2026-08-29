@@ -10,8 +10,10 @@ import type {
 /**
  * Keep the FULL block timeline across tool-loop rounds (DSH-style whole-turn
  * view): prior narration/thinking segments stay visible; tools dedup by id in
- * appendToolCallSegment. Backend round_start still resets its own DB text
- * accumulator — that only affects the mid-stream DB snapshot, not this draft.
+ * appendToolCallSegment. Backend text accumulator is turn-scoped too
+ * (streaming.on_delta keeps DB content across round_start; reset moves to the
+ * turn-start placeholder creation), so the mid-stream DB snapshot matches
+ * this draft instead of under-reporting prior rounds.
  */
 export function beginStreamRound(draft: StreamDraft): StreamDraft {
   return draft;

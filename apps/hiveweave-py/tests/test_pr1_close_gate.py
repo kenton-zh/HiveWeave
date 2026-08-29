@@ -80,8 +80,10 @@ async def test_git_worktree_status_missing_worktree():
             "/proj",
         )
 
-    assert result.success is False
-    assert "No worktree" in (result.error or "")
+    # R3 批次行为变更：无 worktree 角色不再报错，回退 MAIN 视角
+    # （实测回执 [MAIN] (A001 has no worktree — project root)）。
+    assert result.success is True
+    assert "[MAIN]" in (result.output or "")
 
 
 @pytest.mark.asyncio

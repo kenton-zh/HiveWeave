@@ -178,6 +178,43 @@ def _assert_log_vital_sign() -> None:
     log.info("log_vital_sign", path=log_path)
 
 
+async def _scan_legacy_stash_warnings() -> None:
+    """P1-2 行为层补：启动后提醒遗留 git stash（r2/r3 实证 stash@{0}
+    滞留两轮、.gitignore 人机拉锯重演）。只读扫描 + 聚合 warning，不阻塞。"""
+    import sqlite3
+    import subprocess
+
+    try:
+        conn = sqlite3.connect(settings.get_meta_db_path())
+        rows = conn.execute(
+            "SELECT name, workspace_path, is_started FROM projects "
+            "WHERE is_started=1"
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        log.debug("legacy_stash_meta_read_failed", error=str(e))
+        return
+    for name, ws, _started in rows:
+        if not ws or not Path(ws).exists():
+            continue
+        try:
+            out = subprocess.run(
+                ["git", "-C", ws, "stash", "list"],
+                capture_output=True, text=True, timeout=10,
+                encoding="utf-8", errors="replace",
+            ).stdout or ""
+            if out.strip():
+                log.warning(
+                    "legacy_stash_pending",
+                    project=name,
+                    workspace=ws,
+                    stash_head=out.strip().splitlines()[0][:120],
+                    hint="merge 会硬拒 MAIN dirty；请 pop/清点遗留工作再重启组织",
+                )
+        except Exception as e:
+            log.debug("legacy_stash_git_failed", project=name, error=str(e))
+
+
 def _code_version() -> str:
     """TEST6 P3: surface the running code's git short hash in startup logs.
 
@@ -206,6 +243,109 @@ def _code_version() -> str:
         return "unknown"
 
 
+def _install_console_signal_guard() -> None:
+    """Windows 隐藏 conhost 场景的 Ctrl 信号守卫（误伤不停机）。
+
+    背景（审计 2026-08-29 停机根因）：工具子进程（pwsh/bash 等，经
+    tools/bash.py _run_native spawn）与后端共享同一个隐藏 conhost 且同进程组；
+    子进程内 `os.kill(pid, 0)` 探活会被 Windows 当作 CTRL_C_EVENT 广播
+    （CTRL_C_EVENT == 0，conhost 对 pid/pgid 处理有已知 bug），命中整个
+    控制台 → uvicorn 默认 SIGINT handler 把后端优雅停机。
+
+    deepseek-harness 同款防御（sandbox-windows-acl runner SetConsoleCtrlHandler
+    忽略自身 CTRL+C + 保留子进程自理）。两个豁免保证「停得掉也停得掉」：
+    1) env 逃生门：``HIVEWEAVE_IGNORE_CTRL_SIGNALS=off`` 恢复 uvicorn 默认
+       handler（任何场景都能显式关守卫）；
+    2) 交互可见控制台不装守卫（前台 start-backend.bat / 可见终端直跑）：物理
+       可按 Ctrl+C，保留优雅停机；仅隐藏 conhost（start-all.bat / VBS，按键
+       不可达）才吞信号，防误伤广播停全栈。
+    停平台恒保留硬通道：stop.bat / taskkill /F、关闭控制台（CTRL_CLOSE=硬杀）。
+    """
+    if not sys.platform.startswith("win"):
+        return
+
+    # 方案 2：env 逃生门 —— 显式关守卫，恢复 uvicorn 默认 handler。
+    flag = os.getenv("HIVEWEAVE_IGNORE_CTRL_SIGNALS", "on").strip().lower()
+    if flag in ("off", "0", "false", "no", "disabled"):
+        log.info("console_signal_guard_disabled_by_env", value=flag)
+        return
+
+    import ctypes  # noqa: PLC0415
+    import signal  # noqa: PLC0415
+
+    # 方案 1：可见控制台 = 交互开发，保留默认 Ctrl+C 优雅停机；隐藏 conhost
+    # （VBS SW_HIDE，物理按键不可达）才装守卫。无控制台窗口（GetConsoleWindow=0）
+    # 按隐藏处理——脚本/集成终端类场景同样要防误伤广播。
+    try:
+        from ctypes import wintypes  # noqa: PLC0415
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # 64 位 Python 下 HWND 是 64 位句柄：不设 restype 会按 c_int 截断
+        # （高位被截 → hwnd 变 0/负数 → 可见控制台被误判为隐藏而误装守卫）。
+        get_console_window = kernel32.GetConsoleWindow
+        get_console_window.restype = wintypes.HWND
+        is_window_visible = user32.IsWindowVisible
+        is_window_visible.argtypes = [wintypes.HWND]
+        is_window_visible.restype = wintypes.BOOL
+        hwnd = get_console_window()
+        if hwnd and is_window_visible(hwnd):
+            log.info(
+                "console_signal_guard_skipped_visible_console",
+                note="visible console: Ctrl+C keeps graceful stop",
+            )
+            return
+    except Exception:
+        pass
+
+    # 信号上下文避免 import/分配/stdio 流重入：ctypes 原语与缓冲一次性预取，
+    # 日志用 os.write 走 fd 直写，绕过 TextIOWrapper/_TeeStream 锁。
+    get_console_process_list = None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_console_process_list = kernel32.GetConsoleProcessList
+        get_console_process_list.argtypes = [
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.c_uint,
+        ]
+        get_console_process_list.restype = ctypes.c_uint
+    except Exception:
+        pass
+    pid_buf = (ctypes.c_uint * 16)()
+
+    def _on_ctrl_signal(signum: int, _frame: object) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        pids: list[int] = []
+        if get_console_process_list is not None:
+            try:
+                got = int(get_console_process_list(pid_buf, len(pid_buf)))
+                pids = [int(p) for p in pid_buf[:got]]
+            except Exception:
+                pass
+        line = (
+            '{"event":"console_signal_ignored","signum":%d,"name":"%s",'
+            '"console_pids":[%s]}\n' % (signum, name, ",".join(str(p) for p in pids))
+        ).encode("utf-8", errors="replace")
+        for stream in (sys.stdout, sys.stderr, _LOG_FILE_STREAM):
+            if stream is None:
+                continue
+            try:
+                os.write(stream.fileno(), line)
+            except Exception:
+                pass
+
+    signal.signal(signal.SIGINT, _on_ctrl_signal)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _on_ctrl_signal)
+    log.info(
+        "console_signal_guard_installed",
+        note="SIGINT/SIGBREAK logged but ignored; stop platform via stop.bat",
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — startup and shutdown.
@@ -223,6 +363,12 @@ async def lifespan(app: FastAPI):
 
     # ── Startup ──────────────────────────────────────────────
     _assert_log_vital_sign()
+    # 覆盖 uvicorn 的 SIGINT/SIGBREAK handler（serve 内 capture_signals 先注册，
+    # lifespan startup 晚于它，此处覆盖生效）——共享控制台误伤只记录不退出。
+    try:
+        _install_console_signal_guard()
+    except Exception as e:
+        log.warning("console_signal_guard_failed", error=str(e))
     log.info("app_starting", port=settings.port, code_version=_code_version())
 
     # 0. slack-clone_01 P0-2: 登记平台宿主进程保护集（自身 + 祖先链 +
@@ -647,6 +793,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("security_warn_failed", error=str(e))
 
+    def _spawn_legacy_stash_scan() -> None:
+        async def _task() -> None:
+            try:
+                await _scan_legacy_stash_warnings()
+            except Exception as e:
+                log.warning("legacy_stash_scan_failed", error=str(e))
+
+        _asyncio.create_task(_task())
+
+    _spawn_legacy_stash_scan()
     log.info("app_started")
 
     yield

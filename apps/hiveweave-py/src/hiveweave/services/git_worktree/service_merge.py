@@ -449,11 +449,22 @@ class MergeMixin:
                             })
         dirt = await classify_main_dirt(workspace_path)
         if dirt["hard_blockers"]:
+            # P1-4 author 事实位：MAIN 上未提交的 tracked 改动默认视为
+            # 人工/外部编辑（Agent 产出应经 worktree+merge）——文案引导
+            # 通知用户确认，禁止 Agent 用 stash 吞掉用户未保存的工作。
+            _dirty = dirt["hard_blockers"][:8]
+            _author_hint = (
+                "（疑似人工/外部编辑 —— 请通知用户确认后再合，勿 stash/"
+                "删除吞掉未保存工作）"
+                if dirt.get("user_suspect")
+                else ""
+            )
             missing.append({
                 "code": "main_dirty",
                 "message": (
-                    "MAIN 有未提交变更（merge 会硬拒）："
-                    + ", ".join(dirt["hard_blockers"][:8])
+                    "MAIN 有未提交变更（merge 会硬拒）"
+                    + _author_hint
+                    + "：" + ", ".join(_dirty)
                 ),
             })
         ok_b, b_out = await _git(["branch", "--list", branch], workspace_path)

@@ -811,6 +811,7 @@ async def resolve_ask_with_approval(
         return verdict
     try:
         from hiveweave.services.approval import (
+            APPROVAL_TIMEOUT_HINT,
             PermissionRejected,
             PermissionTimeout,
             approval_service,
@@ -835,7 +836,7 @@ async def resolve_ask_with_approval(
         return GuardVerdict(
             True,
             "deny",
-            "Permission request timed out (120s). The user may be away.",
+            APPROVAL_TIMEOUT_HINT,
             verdict.rule,
         )
     except PermissionRejected as exc:

@@ -6,6 +6,10 @@ declare module 'phoenix' {
     channel(topic: string, params?: any): Channel;
     on(event: string, callback: (...args: any[]) => void): void;
     remove(event: string, callback?: (...args: any[]) => void): void;
+    /** 连接建立（含重连）回调；运行时由 phoenix.mjs 提供，返回内部 ref。 */
+    onOpen(callback: () => void): number;
+    /** 已建立的连接次数（onConnOpen 内自增，先于 open 回调触发）。 */
+    establishedConnections: number;
   }
 
   export class Channel {

@@ -129,6 +129,16 @@ async def _insert_work_log(env, agent_id, created_at):
     await conn.commit()
 
 
+async def _insert_error_log(env, agent_id, summary, created_at):
+    """P0-4: type='error' 的 work_log —— 沉默看门狗的「失败签名」来源."""
+    conn = await ensure_project_db(env["workspace_path"])
+    await conn.execute(
+        "INSERT INTO work_logs (id, agent_id, project_id, type, summary, "
+        "created_at) VALUES (?, ?, ?, 'error', ?, ?)",
+        [str(uuid.uuid4()), agent_id, PROJECT_ID, summary, created_at])
+    await conn.commit()
+
+
 async def _insert_open_task(env, assignee_id, *, status="running"):
     """TEST21 M7: silence only fires when agent has duty — seed an open task.
 
@@ -479,6 +489,123 @@ async def test_legal_idle_without_duty_skips_silence(env, monkeypatch):
     _seed_state()
     with _started_mock(1):
         await _assert_no_action(env, GameTimeService())
+
+
+# ── P0-4 看门狗叫错人：legal idle 组织上下文 + 6+ 次同类终止升级上级 ──
+
+
+async def test_legal_idle_with_healthy_subordinate_stays_exempt(env, monkeypatch):
+    """P0-4 ①: 中层名下无义务、直属下级也未深陷（error 终止 < 阈值）→
+    仍合法空闲，不误唤醒（防误报）。"""
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent", lambda aid: None)
+    now = _now_ms()
+    old = now - 40 * 60 * 1000
+    await _insert_agent(env, "coord-3", "中层", role="技术协调员",
+                        permission_type="coordinator", created_at=old)
+    await _insert_agent(env, "leaf-3", "叶子", parent_id="coord-3",
+                        created_at=old)
+    # 下级仅 2 次 error（< 阈值 6），不算深陷
+    for i in range(2):
+        await _insert_error_log(env, "leaf-3", "tool_failed: x",
+                                created_at=now - 60 * 1000)
+    _seed_state()
+    with _started_mock(1):
+        await _assert_no_action(env, GameTimeService())
+
+
+async def test_legal_idle_with_distressed_subordinate_triggers_manager(
+        env, monkeypatch):
+    """P0-4 ①: 中层名下无义务但其直属下级反复同签名失败（≥ 阈值）→
+    不再判合法空闲，走唤醒 + 红框（看门狗叫错人回归）。"""
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent", lambda aid: None)
+    now = _now_ms()
+    old = now - 40 * 60 * 1000
+    await _insert_agent(env, "coord-2", "中层", role="技术协调员",
+                        permission_type="coordinator", created_at=old)
+    await _insert_agent(env, "leaf-2", "叶子", parent_id="coord-2",
+                        created_at=old)
+    for i in range(game_time.DISTRESS_SAME_SIG_REPEAT + 2):
+        await _insert_error_log(env, "leaf-2", "tool_failed: fix",
+                                created_at=now - 20 * 60 * 1000 + i * 1000)
+    _seed_state()
+
+    mock_trigger_coord = AsyncMock()
+    mock_trigger_sub = AsyncMock()
+    mock_bus = AsyncMock()
+    mock_inbox = AsyncMock()
+    with _started_mock(1), \
+         patch("hiveweave.agents.trigger.trigger_coordinator",
+               mock_trigger_coord), \
+         patch("hiveweave.agents.trigger.trigger_subordinate",
+               mock_trigger_sub), \
+         patch.object(status_event_bus, "publish_stream_event", mock_bus), \
+         patch("hiveweave.services.inbox.InboxService.send_message",
+               mock_inbox):
+        await GameTimeService()._check_silent_agents(PROJECT_ID)
+
+    errors = _health_events(mock_bus, "error")
+    # 中层被唤醒 + 红框（不再豁免为 legal idle）
+    assert any(e["agentId"] == "coord-2" for e in errors)
+    triggered = ([c.args[0] for c in mock_trigger_coord.await_args_list]
+                 + [c.args[0] for c in mock_trigger_sub.await_args_list])
+    assert "coord-2" in triggered
+    # 中层尚无 parent / wake_count 未达阈值 → 未 inbox 上级
+    assert mock_inbox.await_count == 0
+
+
+async def test_subordinate_repeated_failure_escalates_to_superior(env, monkeypatch):
+    """P0-4 ②: 下级 wake_count ≥ 阈值且仍重复同签名失败 → inbox 上级 + 唤醒上级."""
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.list_processing", lambda: [])
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent", lambda aid: None)
+    now = _now_ms()
+    # 错误集中在 20 min 前：落在 30min 窗口内，且距现在 ≥10min（够沉默）
+    err_ts = now - 20 * 60 * 1000
+    await _insert_agent(env, "sub-2", "反复失败", parent_id="mgmt-2",
+                        created_at=now - 120 * 60 * 1000)
+    await _insert_open_task(env, "sub-2")  # 有义务，非 legal idle
+    for i in range(game_time.DISTRESS_SAME_SIG_REPEAT + 1):
+        await _insert_error_log(env, "sub-2", "tool_failed: same",
+                                created_at=err_ts + i * 1000)
+    _seed_state()
+    # 预置 wake_count = 阈值：本轮唤醒即触发升级上级
+    trackers = game_time._states[PROJECT_ID].setdefault("silence_trackers", {})
+    trackers["sub-2"] = {
+        "flagged": False, "wake_ts": 0, "notify_ts": 0, "notify_count": 0,
+        "idle_acknowledged": False,
+        "wake_count": game_time.DISTRESS_SAME_SIG_REPEAT,
+        "superior_informed": False,
+    }
+
+    mock_trigger_sub = AsyncMock()
+    mock_inbox = AsyncMock()
+    mock_bus = AsyncMock()
+    with _started_mock(1), \
+         patch("hiveweave.agents.trigger.trigger_subordinate",
+               mock_trigger_sub), \
+         patch("hiveweave.agents.trigger.trigger_coordinator",
+               AsyncMock()), \
+         patch.object(status_event_bus, "publish_stream_event", mock_bus), \
+         patch("hiveweave.services.inbox.InboxService.send_message",
+               mock_inbox):
+        await GameTimeService()._check_silent_agents(PROJECT_ID)
+
+    # inbox 上级（含正文特征）且唤醒上级
+    assert mock_inbox.await_count == 1
+    args = mock_inbox.await_args
+    assert args.kwargs["to_agent_id"] == "mgmt-2"
+    assert "SILENCE WATCHDOG" in args.kwargs["message"]
+    assert args.kwargs["priority"] == "urgent"
+    # 单次触发：superior_informed 置位后不再重复 inbox
+    assert _trackers()["sub-2"]["superior_informed"] is True
+    assert _trackers()["sub-2"]["wake_count"] >= game_time.DISTRESS_SAME_SIG_REPEAT
 
 
 # ── P0-1: complete 豁免前的项目完整性闸门 ─────────────────────

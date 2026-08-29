@@ -64,6 +64,7 @@ export function useChatMessages(opts: {
   const refreshOrgTree = useAppStore((s) => s.refreshOrgTree);
   const processingAgents = useAppStore((s) => s.processingAgents);
   const updateProcessingAgent = useAppStore((s) => s.updateProcessingAgent);
+  const socketReconnectVersion = useAppStore((s) => s.socketReconnectVersion);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -82,6 +83,9 @@ export function useChatMessages(opts: {
   // 已被 done/error 正常收口的轮次 id。draft 的清空要等 DB 重载往返，
   // 这个标记让宽限逻辑能立刻识别「本轮已收口，无需兜底」。
   const settledRoundRef = useRef<string | null>(null);
+  // 重连对账 effect 用：记录已处理过的 socketReconnectVersion，挂载晚于
+  // 重连（切 agent / 开面板）时不回放历史重连。
+  const reconnectSeenRef = useRef(socketReconnectVersion);
 
   // ChatPanel is not remounted on agent switch. Adjust session during render so
   // a committed frame never shows the previous person's 团队沟通 under a new id.
@@ -582,6 +586,7 @@ export function useChatMessages(opts: {
     agentId,
     isStreaming,
     processingAgents,
+    socketReconnectVersion,
     activeAgentIdRef,
     attachPassiveStream,
     loadMessagesFromDb,
@@ -589,6 +594,45 @@ export function useChatMessages(opts: {
     streamDraftRef,
     updateStreamDraft,
     setIsStreaming,
+  ]);
+
+  // WS 重连对账：断连窗口内错过的 done 是「按 DB 权威重载」的唯一触发器，
+  // 若重连时该 done 已成为过去（replay 环被后续轮次挤出 / 后端重启清空），
+  // 面板会永远停在断连时刻的快照上。重连即拉一次 DB。socketReconnectVersion
+  // 只由真实 socket 重连发出（App 的 onOpen 钩子）；reconnectSeenRef 保证
+  // 挂载晚于重连时不回放。draft 清空判据双路：DB 行已收口（is_streaming=0，
+  // 快照可能滞后时的权威信号）或 agent 已不在处理中——在飞的用户流两者
+  // 皆不满足，draft 保留，done 仍做最终对账。
+  useEffect(() => {
+    if (socketReconnectVersion === reconnectSeenRef.current) return;
+    reconnectSeenRef.current = socketReconnectVersion;
+    const id = agentId;
+    if (!id) return;
+    let cancelled = false;
+    void loadMessagesFromDb(id).then((ok) => {
+      if (cancelled || !ok) return;
+      const cur = streamDraftRef.current;
+      if (!cur) return;
+      const row = useAppStore
+        .getState()
+        .chatSessions[id]?.find((m) => m.id === cur.assistantId);
+      const turnDoneInDb = !!row && !row.isStreaming;
+      if (
+        turnDoneInDb ||
+        !useAppStore.getState().processingAgents.includes(id)
+      ) {
+        updateStreamDraft(null);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    socketReconnectVersion,
+    agentId,
+    loadMessagesFromDb,
+    streamDraftRef,
+    updateStreamDraft,
   ]);
 
   // Drop the passive handler on agent switch. Never push WS cancel (BUG-034).

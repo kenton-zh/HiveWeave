@@ -26,7 +26,7 @@ const ConfirmDialog = lazyRetry(() => import("./components/ConfirmDialog"));
 const TimelineView = lazyRetry(() => import("./components/timeline/TimelineView"));
 const TaskTimelinePanel = lazyRetry(() => import("./components/timeline/TaskTimelinePanel"));
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend, updateProject } from "./api";
+import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend, updateProject, getSocket } from "./api";
 import type { DeleteProjectResponse, Project } from "./api";
 
 function App() {
@@ -159,6 +159,28 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [deletingProjectId, queuedDeleteIds.length]);
 
+  // WebSocket 重连信号 — socket 层无条件触发，不依赖 lobby 快照内容变化。
+  // 此前 bump 只在 processing 集合快照 key 变化时发出：断连前后集合恰好
+  // 相同（如重连横跨一个完整轮次）时聊天层永远不知道发生过重连，错过
+  // 的 done/整轮不会补偿，面板停在断连时刻的快照上。
+  useEffect(() => {
+    const g = globalThis as any;
+    if (g.__hw_socketReconnectHooked) return;
+    let socket: ReturnType<typeof getSocket>;
+    try {
+      socket = getSocket();
+    } catch {
+      return; // 构造失败不置位，下次 effect 重试注册
+    }
+    g.__hw_socketReconnectHooked = true;
+    // establishedConnections 在 open 回调前自增：首连=1，重连≥2。
+    socket.onOpen(() => {
+      if ((socket as any).establishedConnections > 1) {
+        useAppStore.getState().bumpSocketReconnect();
+      }
+    });
+  }, []);
+
   // Subscribe to real-time agent processing status
   useEffect(() => {
     let lastSnapshotKey = "";
@@ -168,7 +190,9 @@ function App() {
         if (key === lastSnapshotKey) return;
         lastSnapshotKey = key;
         setProcessingAgents(agentIds);
-        useAppStore.getState().bumpSocketReconnect();
+        // 重连信号不再由快照发出：断连前后集合恰好相同时（重连横跨一个
+        // 完整轮次）这里永远不触发。唯一信号源是上方 socket.onOpen 的
+        // bump —— socketReconnectVersion 因此只统计真实重连。
       },
       (agentId, processing, disposition) => {
         updateProcessingAgent(agentId, processing);

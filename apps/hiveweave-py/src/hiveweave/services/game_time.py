@@ -42,8 +42,8 @@ STALL_CHECK_TICKS = 24        # 24 * 5s = 120s = 2min
 STREAMING_SWEEP_TICKS = 6     # 6 * 5s = 30s — auto-heal orphan is_streaming=1
 # P0-3: 「卡住中的流」判定阈值 — PROCESSING 但流式超此时长无任何事件
 # （delta/round/tool 起止）即视为 streaming 僵尸。健康长流的静默上限为
-# max(READ_TIMEOUT 95s, 工具超时 ≤200s)，5min 默认高于除 question
-# 外的一切正常间隔（执行中工具按其超时+60s 单独放宽，见 _streaming_stuck_ms）。
+# max(READ_TIMEOUT 95s, 工具超时 — bash/pwsh 默认 500s、python_script 240s
+# (P1-4 A-2))，执行中工具按其超时+60s 单独放宽，见 _streaming_stuck_ms。
 STREAMING_ZOMBIE_TIMEOUT_MS = int(
     os.environ.get("HIVEWEAVE_STREAMING_ZOMBIE_TIMEOUT_MS", "300000") or "300000"
 )
@@ -79,6 +79,19 @@ SILENCE_NOTIFY_BACKOFF_MS = (
     10 * 60 * 1000,
     30 * 60 * 1000,
     2 * 60 * 60 * 1000,
+)
+# P0-4 看门狗叫错人：沉默观测看门狗「深陷」判定 —— 同签名 error 终止达
+# 该阈值才算 agent 深陷（默认 6）。用于两处：
+#   ① legal idle 豁免加组织上下文：直属下级窗口内同签名 error 终止 ≥ 阈值
+#      时，中层不再判合法空闲（应被唤醒介入而非豁免沉默）。
+#   ② 下级被唤醒 wake_count ≥ 阈值且仍重复同签名终止 → inbox 上级
+#      （SILENCE_NOTIFY_MS 只打日志不 inbox 的缺口，据此升级上级）。
+DISTRESS_SAME_SIG_REPEAT = int(
+    os.environ.get("HIVEWEAVE_DISTRESS_SAME_SIG_REPEAT", "6") or "6"
+)
+# 同签名 error 终止的观测窗口（默认 30min，与 SILENCE_NOTIFY_MS 同量级）。
+DISTRESS_LOOKBACK_MS = int(
+    os.environ.get("HIVEWEAVE_DISTRESS_LOOKBACK_MS", "1800000") or "1800000"
 )
 # 修 #4: 未激活 agent 检测 — created_at 超过阈值且 activated_at IS NULL
 DEAD_AGENT_THRESHOLD_MS = 5 * 60 * 1000   # 5 min 未激活 → 重试 start_agent
@@ -1854,7 +1867,10 @@ class GameTimeService:
         动作：① trigger_subordinate 唤醒（STALL_COOLDOWN_MS 冷却，不每次扫都触发）
               ② 经 event_bus 广播 agent_health error 红框（同构 agent.py
                 _broadcast_agent_health 的事件结构，前端组织树节点变红）
-              ③ 失联持续超 SILENCE_NOTIFY_MS：**只打日志 + 红框**，不 inbox 催上级
+              ③ 失联持续超 SILENCE_NOTIFY_MS：只打日志 + 红框（原有，不 inbox）；
+                **P0-4 ②：wake_count ≥ 阈值且仍重复同签名失败终止时，
+                额外 inbox 上级 + 穿透唤醒上级**（SILENCE_NOTIFY_MS 只打
+                日志不 inbox 的缺口，据此升级上级）
         恢复：重新产出后广播 agent_health ok 解除红框。
 
         豁免（复用既有判断）：processing 中（P0-3：streaming 僵尸除外——
@@ -1864,6 +1880,8 @@ class GameTimeService:
         下属 submit 清除，穿透保证 creator 欠审必醒）/ 项目 is_started=0 /
         系统 paused / **无义务的合法 idle**（TEST21 M7：无 actionable
         obligations、无未解除 ask 契约、无 wait、或 idle_acknowledged）。
+        **P0-4 ①：合法 idle 加组织上下文——直属下级近期深陷（同签名
+        error 终止 ≥ 阈值）时不再豁免，走唤醒/红框**。
         """
         state = _states.get(project_id)
         if not state:
@@ -1999,7 +2017,13 @@ class GameTimeService:
                     # 回复契约）者不豁免，落入沉默检测兜底唤醒（欠债必醒，还债即清）。
                     probe = await self._open_duty_probe(
                         project_id, aid, task_svc)
-                    if not probe["has_duty"]:
+                    # P0-4① 补全：wait 派深陷也不豁免 —— 中层虽挂 kind=task
+                    # wait（无个人义务），但其直属下级已同签名深陷（≥6 次）时
+                    # 仍应被唤醒介入（否则"唯一能救它的人合法睡着"在 wait
+                    # 场景重演：下级反复撞墙，上级等 wait TTL）。
+                    if not probe["has_duty"] and not await self._has_distressed_subordinate(
+                        project_id, agents, aid, now_ms
+                    ):
                         # 还债后恢复豁免——若此前穿透举过红框，广播 ok
                         # 解除（kind=task wait 不被审阅动作清除，红框不能
                         # 挂到 TTL）
@@ -2052,6 +2076,9 @@ class GameTimeService:
                 "notify_ts": 0,
                 "notify_count": 0,
                 "idle_acknowledged": False,
+                # P0-4: 沉默唤醒累计次数 / 是否已 inbox 上级（≥阈值且仍重复失败时）
+                "wake_count": 0,
+                "superior_informed": False,
             }
 
             # TEST21 M7: legal idle — no duty → never red-box / escalate
@@ -2090,21 +2117,31 @@ class GameTimeService:
                     inbound_ask = False
             if not obligations and not inbound_ask and not waits \
                     and not root_arbitration:
-                if tracker["flagged"]:
-                    tracker["flagged"] = False
-                    try:
-                        await status_event_bus.publish_stream_event(aid, {
-                            "type": "agent_health",
-                            "agentId": aid,
-                            "projectId": project_id,
-                            "health": "ok",
-                            "message": "",
-                            "at": now_ms,
-                        })
-                    except Exception:
-                        pass
-                trackers[aid] = tracker
-                continue
+                # P0-4 ①组织上下文：直属下级近期深陷（同签名 error 终止 ≥
+                # 阈值）时不判合法空闲 —— 中层「名下无开放工作」但其下级反复
+                # 失败时仍应被唤醒介入，否则看门狗叫错人（下级深陷却不升级）。
+                if not await self._has_distressed_subordinate(
+                        project_id, agents, aid, now_ms):
+                    if tracker["flagged"]:
+                        tracker["flagged"] = False
+                        try:
+                            await status_event_bus.publish_stream_event(aid, {
+                                "type": "agent_health",
+                                "agentId": aid,
+                                "projectId": project_id,
+                                "health": "ok",
+                                "message": "",
+                                "at": now_ms,
+                            })
+                        except Exception:
+                            pass
+                        log.info("silence_recovered",
+                                 project_id=project_id, agent_id=aid)
+                    # 真正空闲：清空深陷计数，维持豁免
+                    tracker["wake_count"] = 0
+                    tracker["superior_informed"] = False
+                    trackers[aid] = tracker
+                    continue
 
             baseline = last_output.get(aid) or int(a["created_at"] or now_ms)
             silent_ms = now_ms - baseline
@@ -2127,6 +2164,9 @@ class GameTimeService:
                                     agent_id=aid, error=str(e))
                     log.info("silence_recovered",
                              project_id=project_id, agent_id=aid)
+                # 恢复产出：深陷计数清零（新活动 = 未卡死）
+                tracker["wake_count"] = 0
+                tracker["superior_informed"] = False
                 trackers[aid] = tracker
                 continue
 
@@ -2136,6 +2176,9 @@ class GameTimeService:
             if now_ms - tracker["wake_ts"] >= STALL_COOLDOWN_MS:
                 tracker["wake_ts"] = now_ms
                 tracker["flagged"] = True
+                tracker["wake_count"] = (
+                    int(tracker.get("wake_count") or 0) + 1
+                )
                 log.warning("silence_watchdog_trigger",
                             project_id=project_id, agent_id=aid,
                             name=a["name"], silent_minutes=minutes)
@@ -2169,6 +2212,25 @@ class GameTimeService:
                 except Exception as e:
                     log.error("silence_wake_failed",
                               agent_id=aid, error=str(e))
+
+            # P0-4 ②：wake_count ≥ 阈值 且 仍重复同签名失败 → inbox 上级
+            #（SILENCE_NOTIFY_MS 只打日志不 inbox 的缺口）。6+ 次同类终止说明
+            # 唤醒本人无效，须上级介入排查/重新派活。only-self 判定用 aid 自己
+            # 的 error work_log 签名；已上报一次（superior_informed）即止，防刷。
+            parent_id = a.get("parent_id")
+            if (parent_id
+                    and not tracker.get("superior_informed")
+                    and int(tracker.get("wake_count") or 0)
+                        >= DISTRESS_SAME_SIG_REPEAT):
+                repeats = await self._agent_distress(project_id, aid, now_ms)
+                if repeats >= DISTRESS_SAME_SIG_REPEAT:
+                    tracker["superior_informed"] = True
+                    trackers[aid] = tracker
+                    await self._escalate_to_superior(
+                        project_id, aid, parent_id,
+                        name=a.get("name") or aid, minutes=minutes,
+                        repeats=repeats,
+                    )
 
             # ③ 失联持续超阈值：红框 + 日志。不 inbox 催上级。
             notify_count = int(tracker.get("notify_count") or 0)
@@ -2240,6 +2302,102 @@ class GameTimeService:
             return probe
         probe["has_duty"] = bool(probe["ask_senders"])
         return probe
+
+    async def _agent_distress(self, project_id: str, agent_id: str,
+                              now_ms: int) -> int:
+        """窗口内该 agent 同签名 error 终止的重复数（0 = 未深陷）。
+
+        P0-4 ②：以 error work_log 的 ``summary`` 视为失败签名，同 summary
+        记同一签名。查询异常 fail-open 按 0（不过度升级上级）。
+        """
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT summary, COUNT(*) AS c FROM work_logs "
+                "WHERE agent_id = ? AND type = 'error' AND created_at > ? "
+                "GROUP BY summary",
+                [agent_id, now_ms - DISTRESS_LOOKBACK_MS],
+            )
+        except Exception:
+            return 0
+        best = 0
+        for r in rows:
+            c = int(r["c"] or 0)
+            if c > best:
+                best = c
+        return best
+
+    async def _has_distressed_subordinate(
+        self, project_id: str, agents: list[dict], agent_id: str,
+        now_ms: int,
+    ) -> bool:
+        """P0-4 ①组织上下文：直属下级是否近期深陷（同签名 error 终止 ≥ 阈值）。
+
+        仅当该 agent 有 active 直属下级，且窗口内任一下级同签名失败 ≥
+        DISTRESS_SAME_SIG_REPEAT 时返回 True（中层应被唤醒介入）。查询异常
+        fail-open 按 False（不误唤醒正常空闲中层）。
+        """
+        children = [
+            a["id"] for a in agents if (a.get("parent_id") or "") == agent_id
+        ]
+        if not children:
+            return False
+        ph = ",".join("?" for _ in children)
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT agent_id, summary, COUNT(*) AS c FROM work_logs "
+                "WHERE agent_id IN (" + ph + ") AND type = 'error' "
+                "AND created_at > ? GROUP BY agent_id, summary",
+                [*children, now_ms - DISTRESS_LOOKBACK_MS],
+            )
+        except Exception:
+            return False
+        for r in rows:
+            if int(r["c"] or 0) >= DISTRESS_SAME_SIG_REPEAT:
+                return True
+        return False
+
+    async def _escalate_to_superior(self, project_id: str, agent_id: str,
+                                    parent_id: str, name: str,
+                                    minutes: int, repeats: int) -> None:
+        """P0-4 ②：沉默看门狗唤醒本人无效（6+ 次同签名失败）→ inbox 提醒上级。
+
+        用 InboxService system 消息 + force 穿透唤醒上级（对齐
+        _check_stalled / wait-cycle 的上级升级模式）。单次触发（调用方以
+        superior_informed 防刷），失败仅记日志。
+        """
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            body = (
+                f"[SILENCE WATCHDOG] 直属下级 {name} 已 {minutes} 分钟无产出，"
+                f"同签名失败终止 ≥{repeats} 次且唤醒无效。请介入排查/重新派活。"
+            )
+            await InboxService().send_message(
+                from_agent_id="system",
+                to_agent_id=parent_id,
+                message=body[:400],
+                message_type="system",
+                priority="urgent",
+                wake=True,
+            )
+            await self._watchdog_trigger(parent_id, force=True)
+            log.warning(
+                "silence_escalated_to_superior",
+                project_id=project_id,
+                subordinate_id=agent_id,
+                superior_id=parent_id,
+                silent_minutes=minutes,
+                same_sig_repeats=repeats,
+            )
+        except Exception as e:
+            log.warning(
+                "silence_superior_escalation_failed",
+                subordinate_id=agent_id,
+                superior_id=parent_id,
+                error=str(e),
+            )
 
     async def project_has_unresolved_work(self, project_id: str) -> bool:
         """ADR-001 §1：项目级"无人推进"判定（供 complete 项目根仲裁）。
@@ -2316,6 +2474,8 @@ class GameTimeService:
             "notify_ts": 0,
             "notify_count": 0,
             "idle_acknowledged": False,
+            "wake_count": 0,
+            "superior_informed": False,
         }
         tracker["idle_acknowledged"] = bool(acknowledged)
         if acknowledged:

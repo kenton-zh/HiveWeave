@@ -149,8 +149,13 @@ class RunLedger:
         tool_name: str | None = None,
         tool_call_id: str | None = None,
         tool_args_hash: str | None = None,
+        tool_args_excerpt: str | None = None,
     ) -> str | None:
-        """Record the start of a step (LLM round or tool call)."""
+        """Record the start of a step (LLM round or tool call).
+
+        ``tool_args_excerpt``：P2-1 工具参数原文摘录（截断 200 字符）——
+        120s 超时命令此前只存 hash，事后不可考。
+        """
         step_id = str(uuid.uuid4())
         now = _now_ms()
         try:
@@ -158,8 +163,8 @@ class RunLedger:
                 agent_id,
                 "INSERT INTO run_steps "
                 "(id, run_id, step_index, step_type, tool_name, tool_call_id, "
-                "tool_args_hash, status, started_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)",
+                "tool_args_hash, tool_args_excerpt, status, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)",
                 [
                     step_id,
                     run_id,
@@ -168,6 +173,7 @@ class RunLedger:
                     tool_name,
                     tool_call_id,
                     tool_args_hash,
+                    tool_args_excerpt,
                     now,
                 ],
             )

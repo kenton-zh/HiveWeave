@@ -243,7 +243,12 @@ async def test_checkpoint_warns_on_newly_introduced_conflict(
 async def test_checkpoint_warning_survives_no_changes_path(
     git_repo: Path,
 ) -> None:
-    """冲突布局 + 无新变更(空 checkpoint) — 早退路径同样带 WARNING。"""
+    """冲突布局 + 无业务新变更 — 冲突预警仍出现在回执中。
+
+    R3 批次后 worktree 内有平台产物可提交（.keep.md 等物化文件），
+    「空存档」可能走 commit 成功路径（message = 各 note + 冲突预警）
+    而非 no-changes 早退——断言锚定意图（预警在回执里）而非具体路径。
+    """
     wt = await _make_worktree(git_repo)
     (wt / "file.txt").write_text("branch version\n", encoding="utf-8")
     _git(wt, "add", "file.txt")
@@ -251,13 +256,12 @@ async def test_checkpoint_warning_survives_no_changes_path(
     (git_repo / "file.txt").write_text("main version\n", encoding="utf-8")
     _git(git_repo, "add", "file.txt")
     _git(git_repo, "commit", "-m", "main change")
-    # 不加新文件 → 工作区干净, 走 no-changes 早退
+    # 不加新业务文件
 
     gwt = GitWorktreeService()
     result = await gwt.checkpoint(str(git_repo), "A005", "空存档")
     assert result["success"] is True, result
     msg = result.get("message") or ""
-    assert "no changes to commit" in msg
     assert "WARNING" in msg
     assert "file.txt" in msg
 

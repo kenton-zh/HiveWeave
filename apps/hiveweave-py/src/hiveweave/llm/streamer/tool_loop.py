@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
 
@@ -39,6 +39,8 @@ from .doom_loop import (
     TOOL_FAIL_STALL_LIMIT,
     classify_stall_round,
     doom_loop_limit,
+    fail_signature_for_round,
+    readonly_fingerprint,
 )
 from .types import DeltaCallback, ToolCallCallback
 
@@ -177,6 +179,7 @@ class ToolLoopMixin:
         on_tool_call: ToolCallCallback | None,
         max_tool_rounds: int | None = None,
         steer_queue: asyncio.Queue | None = None,
+        usage_sink: Callable[[dict], None] | None = None,
     ) -> dict:
         """Tool loop: 流式请求 → 检查 tool_calls → 执行工具 → 重复。
 
@@ -213,6 +216,9 @@ class ToolLoopMixin:
         # DESIGN-2: Magentic-One stall counter — consecutive no-progress rounds
         stall_count = 0
         readonly_stall_count = 0
+        # P0-1: 跨轮历史只读指纹（工具名, 规范化参数）—— readonly stall 只
+        # 计「同参重复」轮，读不同文件/参数的合法只读轮不算空转。
+        seen_readonly_fingerprints: set[tuple[str, str]] = set()
         # H3: 平台护栏拒绝轮（blocked）独立计数 —— 护栏拒绝是平台拒环境，
         # 不是模型空转，不累计普通 stall_count；超过 BLOCKED_STALL_LIMIT
         # 仍收口兜底。
@@ -221,6 +227,10 @@ class ToolLoopMixin:
         # 正交事实位。收口时机不变（限值同 TOOL_LOOP_STALL_LIMIT），但归因
         # 落到工具层，文案不再说「模型无进展」。
         tool_fail_stall_count = 0
+        # P0-1（R3）：同源失败判据 —— 上轮失败指纹（tool_name, args[:60]）。
+        # 同指纹 = 原地撞同一面墙（2 轮快收口）；指纹变化 = 试错/方向在变
+        # （不快速掐，交给普通 stall_count 总限兜底）。
+        last_fail_signature: tuple[str, str] | None = None
         # 触发收口那一轮的归因（供文案 / 返回值 stall_reason）。
         last_stall_reason: str | None = None
 
@@ -524,7 +534,17 @@ class ToolLoopMixin:
                     usage["duration_ms"] = int(
                         round_result.get("round_duration_ms") or 0
                     )
+                # cache_creation 上报 vs 真 0 的区分已由 llm/util.normalize_usage
+                # 统一处理（cache_creation_reported 位）——勿在此重复。
                 usage_rounds.append(usage)
+                # P1-6：usage 实时推给调用方（取消/中断路径不依赖最终 return ——
+                # 用户取消时 result 永不返回，账本会蒸发）。与 append 同域，
+                # 保证 sink 只收有效 usage。
+                if usage_sink is not None:
+                    try:
+                        usage_sink(usage)
+                    except Exception:
+                        log.warning("usage_sink_failed", agent_id=agent_id)
 
             # ── 截断 tool_calls 防御（TEST_DSH_16 实证）─────────────
             # SSE 提前断流（网关丢 response.completed，finish=None）时
@@ -962,7 +982,18 @@ class ToolLoopMixin:
                     error_ids=error_ids,
                     blocked_ids=blocked_ids,
                     duplicate_ids=duplicate_ids,
+                    seen_readonly_fingerprints=seen_readonly_fingerprints,
                 )
+                # P0-1：判定之后再并入本轮成功只读指纹（判定期历史不含本轮，
+                # 否则新指纹会被误判为"已见过"）。readonly_fingerprint 内部
+                # 自带容错（json 失败回退 repr），不再包宽 except。
+                for tc in tool_calls:
+                    tid = tc.get("id") or ""
+                    if tid in (error_ids or set()) or tid in (duplicate_ids or set()):
+                        continue
+                    fp = readonly_fingerprint(tc)
+                    if fp is not None:
+                        seen_readonly_fingerprints.add(fp)
                 if round_reason == STALL_REASON_TOOL_FAILED and runner_failed:
                     round_reason = STALL_REASON_RUNNER_FAILED
                 if round_reason is None:
@@ -992,8 +1023,23 @@ class ToolLoopMixin:
                     STALL_REASON_TOOL_FAILED, STALL_REASON_RUNNER_FAILED
                 ):
                     # 工具自身执行失败（非护栏拒绝、非模型空转）→ 独立归因位。
-                    # 同时累计 stall_count 保持既有收口时机与交替序列可触顶。
-                    tool_fail_stall_count += 1
+                    # P0-1（R3）：只对「同源失败」快速收口 —— 同工具同参同墙
+                    # 才算原地位；换参/换工具失败 = 试错在收敛，不得 2 轮掐死
+                    # （R2/R3 实证 10+4 次被掐均是被试错判死）。同时累计
+                    # stall_count 保持总限兜底与交替序列可触顶。
+                    fail_sig = fail_signature_for_round(
+                        tool_calls,
+                        error_ids=error_ids,
+                        duplicate_ids=duplicate_ids,
+                    )
+                    if fail_sig is not None and fail_sig == last_fail_signature:
+                        tool_fail_stall_count += 1  # 同墙原地：连续累计
+                    else:
+                        # 方向在变/首轮建立：重置为「本次失败」（=1）——
+                        # 收敛判据下连续 2 轮同源才快速收口；发散轮本身不
+                        # 涨到这个计数（只贡献普通 stall_count 总限）。
+                        tool_fail_stall_count = 1
+                    last_fail_signature = fail_sig
                     stall_count += 1
                     readonly_stall_count = 0
                     blocked_stall_count = 0
@@ -1086,10 +1132,11 @@ class ToolLoopMixin:
                         break_text = (
                             f"[STALL BREAK] {max(stall_count, readonly_stall_count)} "
                             "consecutive tool-loop "
-                            "rounds made no progress (only readonly / failed / "
-                            "duplicate tools). Stop polling. Call commit_turn "
-                            "now (waiting/blocked/done_slice) or change approach "
-                            "— do not repeat the same readonly loop."
+                            "rounds repeated identical readonly calls (same tool + "
+                            "same args) with no mutating progress. Stop polling the "
+                            "same state: call commit_turn now (waiting/blocked/"
+                            "done_slice) or change approach — do not repeat the "
+                            "same readonly call."
                         )
                     messages.append({
                         "role": "system",

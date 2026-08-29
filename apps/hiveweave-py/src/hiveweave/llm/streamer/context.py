@@ -571,7 +571,7 @@ class ContextMixin:
         "tool_failed": "consecutive tool-call failures (not model idling)",
         "runner_failed": "tool runner failure (not model idling)",
         "blocked": "calls refused by platform guards (not model idling)",
-        "readonly": "stalled on readonly polling",
+        "readonly": "stalled on repeated readonly polling (identical args)",
         "no_progress": "stalled",
     }
 

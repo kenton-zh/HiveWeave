@@ -38,47 +38,22 @@ def test_build_confined_command_wraps_shell() -> None:
     assert "echo hi" in cmd
 
 
-# ── 受限 shell 方言适配（§18.3） ─────────────────────────────
-def test_normalize_for_pwsh_export_and_var() -> None:
-    from hiveweave.tools.bash import _normalize_for_pwsh
+# ── P1-3（B 结构解）：受限 bash 不再词典翻译，命令 verbatim ────────
+def test_confined_bash_is_verbatim_pwsh_plus_encoding_pin() -> None:
+    """受限 bash 命令原样交给 pwsh（不再经 _normalize_for_pwsh 翻译）；
+    pwsh 分支带 UTF-8 编码钉；unix-only 由 gate 前置拒绝（test_pwsh_dialect_gate）。
+    旧 _normalize_for_pwsh 翻译断言已随 P1-3 退役删除。"""
+    from hiveweave.tools.bash import PWSH_ENCODING_PREAMBLE
+    from hiveweave.services.acl_sandbox.integration import build_confined_argv
 
-    out = _normalize_for_pwsh("export FOO=bar")
-    assert "$env:FOO='bar';" in out
-    out2 = _normalize_for_pwsh("export A=1 B=2 && echo $A")
-    assert "$env:A='1';" in out2
-    assert "$env:B='2';" in out2
-    assert "$env:A" in out2  # ${A} 也适配
+    for cmd in ("git status", "ls -la", "head -5 f.txt"):
+        argv = build_confined_argv(cmd, dialect="bash")
+        assert argv[-1].endswith(cmd), (cmd, argv[-1])  # verbatim 无翻译
+        if str(argv[0]).lower().find("pwsh") != -1:
+            assert argv[-1].startswith(PWSH_ENCODING_PREAMBLE)
 
-
-def test_normalize_for_pwsh_source_and_flags() -> None:
-    from hiveweave.tools.bash import _normalize_for_pwsh
-
-    assert _normalize_for_pwsh("source env.sh") == ". env.sh"
-    assert "Get-ChildItem -Force" in _normalize_for_pwsh("ls -la")
-    assert "Get-Content f.txt -TotalCount 5" in _normalize_for_pwsh("head -5 f.txt")
-    assert "Get-Content f.txt -Tail 3" in _normalize_for_pwsh("tail -3 f.txt")
-    assert "New-Item -ItemType Directory -Force -Path d" in _normalize_for_pwsh(
-        "mkdir -p d")
-
-
-def test_normalize_for_pwsh_preserves_pwsh_compatible() -> None:
-    from hiveweave.tools.bash import _normalize_for_pwsh
-
-    # git / echo / pwd / 重定向 / && 保持原样
-    assert "git status" in _normalize_for_pwsh("git status")
-    assert "echo '# TEST' > README.md" in _normalize_for_pwsh(
-        "echo '# TEST' > README.md")
-    assert "pwd" in _normalize_for_pwsh("pwd")
-    assert "python3" not in _normalize_for_pwsh("python3 --version")
-    assert "python --version" in _normalize_for_pwsh("python3 --version")
-    # $env: 已限定 env 不再裸转；保留量不动
-    assert "$env:FOO" in _normalize_for_pwsh("echo $env:FOO")
-    assert "LASTEXITCODE" in _normalize_for_pwsh("echo $LASTEXITCODE")
-    # export + && 链：吞掉 &&，赋值后不残留非法 ; &&
-    assert "&&" not in _normalize_for_pwsh("export A=1 && echo hi")
-    assert "$env:A='1'; echo hi" == _normalize_for_pwsh("export A=1 && echo hi")
-    # 裸 $VAR → $env:VAR（bash 语义）
-    assert "$env:FOO" in _normalize_for_pwsh("echo $FOO > out.txt")
+    argv2 = build_confined_argv("Get-Content x.txt", dialect="pwsh")
+    assert argv2[-1].endswith("Get-Content x.txt")
 
 
 # ── bash 接线 ───────────────────────────────────────────────

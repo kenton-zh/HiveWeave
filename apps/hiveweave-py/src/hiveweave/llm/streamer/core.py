@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import structlog
@@ -89,6 +89,7 @@ class Streamer(
         max_tool_rounds: int | None = None,
         steer_queue: asyncio.Queue | None = None,
         skip_providers: set[str] | None = None,
+        usage_sink: Callable[[dict], None] | None = None,
     ) -> dict:
         """流式调用 LLM，执行 tool loop，返回最终结果。
 
@@ -157,6 +158,7 @@ class Streamer(
                 on_tool_call=on_tool_call,
                 max_tool_rounds=effective_max_rounds,
                 steer_queue=steer_queue,
+                usage_sink=usage_sink,
             )
             result = await asyncio.wait_for(
                 loop_coro,

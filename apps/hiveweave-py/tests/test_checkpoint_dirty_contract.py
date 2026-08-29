@@ -281,3 +281,58 @@ async def test_dirty_and_checkpoint_agree_across_states(tmp_path: Path):
     assert (
         "no changes to commit" in c_msg or "no committable changes" in c_msg
     )
+
+
+# ── P1-2 回归防线：平台运行时目录剥离 + add 失败透传 ────────────────────
+
+
+async def test_platform_runtime_dirs_stripped_from_checkpoint(tmp_path: Path):
+    """`.hiveweave/` 下非共享目录（npm-cache/sandbox-temp 等）不进提交；
+    共享四目录保留；回执 message 带剥离说明（platform-issue-report P1-2：
+    untracked 平台目录曾让 git add 失败 → 19 分钟自救马拉松）。"""
+    main, wt = _make_worktree(tmp_path, "runtime-strip")
+    (wt / ".hiveweave").mkdir()
+    (wt / ".hiveweave" / "npm-cache").mkdir(parents=True)
+    (wt / ".hiveweave" / "npm-cache" / "dep.bin").write_bytes(b"x" * 64)
+    (wt / ".hiveweave" / "shared").mkdir(parents=True)
+    (wt / ".hiveweave" / "shared" / "contract.md").write_text(
+        "# shared\n", encoding="utf-8"
+    )
+    (wt / "src").mkdir()
+    (wt / "src" / "app.ts").write_text("export 1;\n", encoding="utf-8")
+
+    svc = _service_with_worktree(wt)
+    result = await svc.checkpoint(str(main), "t8", "runtime strip")
+    assert result["success"] is True
+    assert result["count"] == 1
+    msg = result.get("message") or ""
+    assert "platform runtime path(s) under .hiveweave/" in msg
+    assert "npm-cache" in msg
+    committed = _git(wt, "diff", "--name-only", "HEAD~1", "HEAD")
+    assert "src/app.ts" in committed
+    assert ".hiveweave/shared/contract.md" in committed
+    assert "npm-cache" not in committed
+
+
+async def test_checkpoint_add_failure_carries_git_output(tmp_path: Path, monkeypatch):
+    """`git add -A` 失败必须透传 git 原始输出，而不是只回八字盲盒
+    （此前 stderr 被 `_` 丢弃 —— platform-issue-report P1-2 根因）。"""
+    main, wt = _make_worktree(tmp_path, "add-fail")
+    (wt / "src").mkdir()
+    (wt / "src" / "a.ts").write_text("x\n", encoding="utf-8")
+
+    real_git = sc_module._git
+
+    async def failing_add(args, cwd, timeout=30.0):
+        if args[:2] == ["add", "-A"]:
+            return False, "fatal: index.lock already held (simulated)"
+        return await real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(sc_module, "_git", failing_add)
+
+    svc = _service_with_worktree(wt)
+    result = await svc.checkpoint(str(main), "t9", "fail")
+    assert result["success"] is False
+    msg = result.get("message") or ""
+    assert "Failed to stage files" in msg
+    assert "simulated" in msg

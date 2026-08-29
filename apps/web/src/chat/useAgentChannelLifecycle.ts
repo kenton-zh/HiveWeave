@@ -69,10 +69,12 @@ export function useAgentChannelLifecycle(opts: {
   // Reset stale streaming state when WebSocket reconnects.
   // BUG-033: Don't clear streamDraft entirely — persist it so the streamed
   // content doesn't vanish. The DB load on next user action will reconcile it.
+  // socketReconnectVersion 只由真实 socket 重连 bump（App onOpen 钩子），
+  // 0 = 尚未发生过重连，任何 ≥1 的变化都是重连信号。
   useEffect(() => {
     if (socketReconnectVersion === prevReconnectVersion.current) return;
     prevReconnectVersion.current = socketReconnectVersion;
-    if (socketReconnectVersion > 1) {
+    if (socketReconnectVersion > 0) {
       const stillProcessing = agentId ? processingAgents.includes(agentId) : false;
       if (!stillProcessing && isStreaming) {
         updateStreamDraft((prev) => (prev ? { ...prev, persisted: true } : prev));

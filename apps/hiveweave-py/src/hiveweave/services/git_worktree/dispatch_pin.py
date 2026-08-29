@@ -48,7 +48,12 @@ def pin_dispatch_message_to_worktree(
 
     footer = (
         f"\n\n[WORKTREE PIN] Writes: this tree only ({sid}): {rel}\n"
-        f"Reads: MAIN docs/ and .hiveweave/shared/ are team-visible."
+        f"Shared: write_file to .hiveweave/shared/<file> in your tree, then "
+        f"checkpoint -> merge; once merged it lands in MAIN and becomes "
+        f"team-visible. Kept worktrees pick it up via git rebase main / "
+        f"recreate — do not promise reads before it is merged.\n"
+        f"Reads: MAIN docs/ and .hiveweave/shared/ (post-merge) are "
+        f"team-visible."
     )
     if "[WORKTREE PIN]" not in text:
         text = text.rstrip() + footer

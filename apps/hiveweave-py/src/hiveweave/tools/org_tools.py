@@ -406,7 +406,7 @@ async def hire_agent_tool(
         if market_gate:
             return ToolResult.err(market_gate)
 
-    # Hard org invariants (name / role / parent / span)
+    # Hard org invariants (name / role / parent) — headcount has no cap
     from hiveweave.services.org_invariants import validate_hire
 
     hire_err = validate_hire(
@@ -703,6 +703,19 @@ async def hire_agent_tool(
             "  Assistant text / work_log alone is NOT a notification (fabrication).\n"
         )
 
+        # Non-blocking span guidance: hire succeeds regardless, but when
+        # direct reports pile up past the guidance value, nudge toward a
+        # coordinator layer with leaves grouped by functional module.
+        from hiveweave.services.org_invariants import span_advisory
+
+        span_note = span_advisory(
+            agents=existing_agents,
+            parent_id=parent_id,
+            adding_coordinator=(perm_type == "coordinator"),
+        ) or ""
+        if span_note:
+            span_note = f"\n{span_note}\n"
+
         return ToolResult.ok(
             f"Agent hired successfully.\n"
             f"  Name: {name}\n"
@@ -717,6 +730,7 @@ async def hire_agent_tool(
             f"  Backstory: {backstory[:100] if backstory else '(none)'}"
             f"{retry_note}"
             f"{next_action}"
+            f"{span_note}"
         )
     except Exception as e:
         return ToolResult.err(f"Failed to hire agent: {e}")
@@ -851,8 +865,27 @@ async def transfer_agent_tool(
     if isinstance(result, dict) and result.get("success") is False:
         return ToolResult.err(result.get("message", "Unknown error"))
 
+    # Non-blocking span guidance on the new parent (post-move snapshot;
+    # exclude_id + the +1 inside span_advisory cancel out correctly whether
+    # or not the mover already sat under this parent).
+    span_note = ""
+    if resolved_parent:
+        from hiveweave.services.org_invariants import span_advisory
+
+        note = span_advisory(
+            agents=await ctx.org.list_agents(project_id),
+            parent_id=resolved_parent,
+            exclude_id=target_agent["id"],
+            adding_coordinator=(
+                (target_agent.get("permission_type") or "") == "coordinator"
+            ),
+        )
+        if note:
+            span_note = f"\n{note}\n"
+
     return ToolResult.ok(
         f"Agent {target_agent['name']} transferred to new parent."
+        f"{span_note}"
     )
 
 

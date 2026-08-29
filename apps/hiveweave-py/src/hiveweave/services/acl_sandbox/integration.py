@@ -73,28 +73,32 @@ def quote_windows_argv(argv: list[str]) -> str:
 def build_confined_argv(command: str, *, dialect: str = "bash") -> list[str]:
     """把命令包装成受限 shell 的 argv 数组（E10 argv 化）。
 
-    - ``dialect="bash"``（默认）：pwsh 优先，经 ``_normalize_for_pwsh`` 做
-      bash 惯用法适配（§18.3 —— export/``${VAR}``/source/带 flag 的 unix 命令）；
-      无 pwsh 时 cmd 兜底（``/s /c`` + ``_normalize_command`` 映射）。
+    - ``dialect="bash"``（默认）：pwsh 优先，**verbatim** 交给 pwsh ——
+      P1-3（B 结构解）词典翻译层（``_normalize_for_pwsh``）退役：bash 命令
+      在受限模式以 PowerShell 语义原样执行；unix-only 命令由
+      ``tools/bash._pwsh_dialect_gate`` 在执行前拒绝并给 pwsh 等价（不再
+      静默错译/混血参数）。无 pwsh 时 cmd 兜底（``/s /c`` + ``_normalize_command``）。
     - ``dialect="pwsh"``：命令**已是 PowerShell 方言**（pwsh 工具），原样直传，
       不做任何 unix→pwsh 转译（转译会破坏合法 pwsh 语法，DSH_33 P0）。
+    - 两分支都注入 ``PWSH_ENCODING_PREAMBLE``（UTF-8 钉），防中文乱码（P1-3）。
 
     与 ``build_confined_command`` 的区别：返回 argv 数组，由 spawn 侧用
     ``quote_windows_argv`` 逐元素引用 → 避免整串转发时外壳二次剥引号。
     """
     pwsh = shutil.which("pwsh")
+    from hiveweave.tools.bash import PWSH_ENCODING_PREAMBLE  # 惰性，避免循环导入
+
     if dialect == "pwsh":
         if not pwsh:
             raise PwshUnavailableError(
                 "pwsh (PowerShell 7+) not found on PATH — the pwsh tool "
                 "requires it. Use the bash tool instead."
             )
-        return [pwsh, "-NoProfile", "-NonInteractive", "-Command", command]
-    if pwsh:
-        from hiveweave.tools.bash import _normalize_for_pwsh  # 惰性，避免循环导入
-
         return [pwsh, "-NoProfile", "-NonInteractive", "-Command",
-                _normalize_for_pwsh(command)]
+                f"{PWSH_ENCODING_PREAMBLE}{command}"]
+    if pwsh:
+        return [pwsh, "-NoProfile", "-NonInteractive", "-Command",
+                f"{PWSH_ENCODING_PREAMBLE}{command}"]
     cmd = os.environ.get("COMSPEC", "cmd.exe")
     from hiveweave.tools.bash import _normalize_command  # 惰性，避免循环导入
 

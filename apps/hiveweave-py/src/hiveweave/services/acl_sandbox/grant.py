@@ -48,6 +48,10 @@ _OWNER_RIGHTS_SID = "S-1-3-4"
 # LUA_TOKEN 下 Administrators 是 deny-only —— 只授 Admins 写位的目录对受限
 # 令牌不可用，探测时必须排除（§4.12 探测防误通过）
 _ADMINISTRATORS_SID = "S-1-5-32-544"
+# §P1-1 共享缓存：Authenticated Users（AU）组。受限（LUA）令牌不过滤该启用组，
+# 给工作区内缓存类目录补授 AU 写即让**同一工作区的所有受限代理**可共享写入，
+# 供测试运行器（.pytest_cache/__pycache__/node_modules/.cache）多 agent 并发复用。
+_AUTHENTICATED_USERS_SID = "S-1-5-11"
 
 
 def _require_win32() -> None:
@@ -175,6 +179,34 @@ class WriteGrant:
                     except Exception:
                         pass
             raise
+
+    @staticmethod
+    def grant_shared_cache_write(path: str, mask: int = CACHE_MASK) -> bool:
+        """§P1-1 工作区内共享缓存目录补授 AU 写（多 agent 共享测试缓存）。
+
+        受限进程用 Path.mkdir / pytest 创建的缓存目录（.pytest_cache /
+        __pycache__ / node_modules/.cache）常是 OWNER_RIGHTS-only 且因令牌
+        DefaultDacl 不继承父目录可继承 ACE —— 同一缓存目录（如 MAIN 下
+        .pytest_cache，bash_main 共享项目根）被多个 worktree 的受限令牌
+        互相写/删时 EPERM（M1 沙箱临时目录墙的共享侧）。对工作区内存现的
+        缓存类目录补授 Authenticated Users 写（OI/CI 继承）：受限令牌保留
+        AU 组，写进该目录一律放行；`mask` 默认 CACHE_MASK（去 DELETE /
+        FILE_DELETE_CHILD，禁单代理删共享产物）。verify-then-skip，幂等。
+        """
+        _require_win32()
+        if WriteGrant.ace_present(path, _AUTHENTICATED_USERS_SID, mask):
+            return False
+        flags = OI_CI if os.path.isdir(path) else 0
+        dacl = WriteGrant._read_dacl(path)
+        if dacl is None:
+            raise SandboxUnavailableError(
+                f"shared-cache grant target has no DACL (NULL DACL): {path}",
+                api_name="GetSecurityDescriptorDacl")
+        sid_obj = win32security.ConvertStringSidToSid(_AUTHENTICATED_USERS_SID)
+        dacl.SetEntriesInAcl([_explicit_access(
+            sid_obj, mask, win32security.GRANT_ACCESS, flags)])
+        WriteGrant._write_dacl(path, dacl)
+        return True
 
     @staticmethod
     def break_inheritance(path: str) -> None:

@@ -26,6 +26,7 @@ import structlog
 from pydantic import BaseModel, Field
 
 from hiveweave.llm.streamer import Streamer
+from hiveweave.services.run_ledger import run_ledger as _rl
 from hiveweave.tools.base import tool
 from hiveweave.tools.result import ToolResult
 
@@ -216,6 +217,13 @@ async def spawn_subagent_tool(
         if deny_main:
             return ToolResult.err(deny_main)
 
+    # P2-5：**在这里**（父 turn 确定活跃）快照 run 上下文 —— 子代理
+    # off-turn 执行时父 turn 已收口、属性会被清空；若在 _work 内部读会
+    # 得到 None（审计实证竞态：start_offturn_job 经 create_task 延迟调度，
+    # 可能晚于父 commit_turn(waiting) 收口），步骤记录又静默跳过。
+    snap_run_id = getattr(parent, "_current_run_id", None)
+    snap_counter = getattr(parent, "_run_step_counter", 0)
+
     async def _work() -> tuple[bool, str]:
         result = await _run_subagent(
             parent,
@@ -224,6 +232,8 @@ async def spawn_subagent_tool(
             timeout_s,
             subagent_type,
             workspace=resolved_ws,
+            snap_run_id=snap_run_id,
+            snap_step_counter=snap_counter,
         )
         if result.get("status") != "ok":
             return False, str(result.get("error") or "unknown error")
@@ -396,6 +406,49 @@ def _subagent_identity(
     return "\n".join(lines)
 
 
+async def _record_subagent_step(
+    parent: Any,
+    status: str = "completed",
+    *,
+    run_id: str | None = None,
+    counter: int | None = None,
+) -> None:
+    """P1-6/P2-5：子代理在父 run 的 run_steps 留一条步骤。
+
+    spawn_subagent 是 **off-turn**（父 turn 立即返回 waiting_on，子代理在
+    后台执行）——执行时 ``parent._current_run_id`` 已被父 turn 收口清空，
+    若直接读 parent 属性会静默跳过（R2 P2-5 实锤：线上 0 条子代理步骤）。
+    因此由 spawn 侧在父 turn 活跃时**快照** run_id/counter，子代理完成后
+    用模块级 ``run_ledger`` 单例落账（不依赖父对象存活）。
+    best-effort 不阻塞子代理返回。
+    """
+    if run_id is None:
+        run_id = getattr(parent, "_current_run_id", None)
+    if not run_id:
+        return
+    try:
+        idx = counter if counter is not None else getattr(parent, "_run_step_counter", 0)
+        if counter is not None:
+            # 快照路径：计数器由 spawn 侧递增，避免回写已收口父对象
+            pass
+        step_id = await _rl.record_step_start(
+            getattr(parent, "id", None) or getattr(parent, "short_id", None),
+            run_id,
+            idx,
+            "subagent",
+            tool_name="spawn_subagent",
+        )
+        if step_id:
+            await _rl.record_step_end(
+                getattr(parent, "id", None) or getattr(parent, "short_id", None),
+                step_id,
+                status=status,
+                error="subagent failed" if status != "completed" else None,
+            )
+    except Exception:
+        pass  # best-effort
+
+
 async def _run_subagent(
     parent: Any,
     prompt: str,
@@ -403,6 +456,8 @@ async def _run_subagent(
     timeout_s: float | None,
     subagent_type: str,
     workspace: str | None = None,
+    snap_run_id: str | None = None,
+    snap_step_counter: int | None = None,
 ) -> dict[str, Any]:
     """Run the subagent's own Streamer loop. Returns Streamer result dict."""
     # 1. 工作区：优先用 spawn 时已校验的路径（write 已拒绝 MAIN）
@@ -462,6 +517,10 @@ async def _run_subagent(
     )
 
     streamer = Streamer(max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS)
+    # P1-6：子代理 usage 与父共享 sink —— 子代理 token 归父账户；父被取消时
+    # 子代理协程一并中断（自身 record_rounds 不会执行），父 flush 兜住。
+    if getattr(parent, "_pending_usage", None) is None:
+        parent._pending_usage = []
     stream_coro = streamer.stream(
         agent_id=sub_id,
         messages=messages,
@@ -469,6 +528,7 @@ async def _run_subagent(
         tools=tools,
         on_tool_call=on_tool_call,
         max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS,
+        usage_sink=parent._pending_usage.append,
     )
     try:
         if timeout_s is None or timeout_s <= 0:
@@ -476,11 +536,19 @@ async def _run_subagent(
         else:
             result = await asyncio.wait_for(stream_coro, timeout=timeout_s)
     except asyncio.TimeoutError:
+        await _record_subagent_step(
+            parent, status="failed",
+            run_id=snap_run_id, counter=snap_step_counter,
+        )
         return {
             "status": "error",
             "error": f"subagent timed out after {timeout_s:g}s",
         }
     except Exception as e:  # 网络/熔断等 — 转 err，不炸父
+        await _record_subagent_step(
+            parent, status="failed",
+            run_id=snap_run_id, counter=snap_step_counter,
+        )
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
     # Token metering (F4): 子代理的 LLM usage 归属到父代理
@@ -503,6 +571,14 @@ async def _run_subagent(
         except Exception as meter_err:
             log.warning("subagent_token_meter_failed",
                         parent_id=parent.id, error=str(meter_err))
+
+    # P1-6/P2-5：子代理步骤留痕（父 run 的 run_steps，off-turn 用快照落账）
+    await _record_subagent_step(
+        parent,
+        status="completed" if result.get("status") == "ok" else "failed",
+        run_id=snap_run_id,
+        counter=snap_step_counter,
+    )
 
     if result.get("status") != "ok":
         return result

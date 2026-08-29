@@ -185,3 +185,6 @@ gargantua/
 _dl_*.js
 _lib_*.js
 [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
+
+# Platform-issue research reports (本地归档，不进远程)
+docs/platform-issue-research/

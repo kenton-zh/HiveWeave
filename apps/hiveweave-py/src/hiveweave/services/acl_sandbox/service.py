@@ -17,6 +17,8 @@ import asyncio
 import os
 import sys
 import threading
+from collections import deque
+from pathlib import Path
 from typing import Any
 
 from hiveweave.config import settings
@@ -52,6 +54,59 @@ _CACHE_ENV_OVERRIDES = {
     "NPM_CONFIG_CACHE": "npm",
     "npm_config_store_dir": "pnpm",
 }
+
+# §P1-1 共享缓存目录收集：测试运行器会写入的同名缓存目录，跨 worktree 共享时
+# 须补授 AU 写（受限进程自建的 OWNER_RIGHTS-only 目录不继承父 ACE → 互相
+# EPERM，M1 死因）。只匹配工作区内固定集合，浅层受控；绝不递归 node_modules
+# 主体（只取 node_modules/.cache 一层），跳过平台私有/.git 大目录。
+_STD_CACHE_DIR_NAMES = frozenset({
+    ".pytest_cache", "__pycache__", ".cache", "coverage", "htmlcov",
+    ".tmp", ".tox", ".nyc_output",
+})
+_SHARED_CACHE_MAX_DEPTH = 6
+_SHARED_CACHE_SKIP_DIRS = frozenset({
+    ".git", ".hiveweave", ".venv", "venv", "env", "dist", "build",
+    ".next", ".nuxt", ".turbo", "out", ".idea", ".vscode",
+})
+
+
+def _collect_shared_cache_dirs(boundary: str) -> list[str]:
+    """广度优先受控扫描工作区，返回需补授 AU 写的缓存类目录（已有直接子级先返回）。
+
+    不进入 node_modules 主体（巨型），仅探测其直接子 ``node_modules/.cache``。
+    任何为目录读取/越界都 fail-open 跳过 —— 本收集纯增量辅助，绝不阻塞 grant。
+    """
+    found: list[str] = []
+    try:
+        root = Path(boundary)
+        if not root.is_dir():
+            return found
+        queue = deque([(root, 0)])
+        while queue:
+            d, depth = queue.popleft()
+            if depth >= _SHARED_CACHE_MAX_DEPTH:
+                continue
+            try:
+                children = [c for c in d.iterdir() if c.is_dir()]
+            except OSError:
+                continue
+            for c in children:
+                name = c.name.lower()
+                if name in _STD_CACHE_DIR_NAMES:
+                    found.append(str(c))
+                    continue
+                if name == "node_modules":
+                    nmc = c / ".cache"
+                    if nmc.is_dir():
+                        found.append(str(nmc))
+                    continue  # 不深钻 node_modules 主体
+                if name in _SHARED_CACHE_SKIP_DIRS:
+                    continue
+                if depth + 1 < _SHARED_CACHE_MAX_DEPTH:
+                    queue.append((c, depth + 1))
+    except Exception:  # 收集失败不阻断 grant 主线
+        return found
+    return found
 
 
 def is_rejection(stderr: str, exit_code: Any) -> bool:
@@ -253,6 +308,14 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
     if not os.path.isdir(cache_dir):
         os.makedirs(cache_dir, exist_ok=True)
     await _grant_if_missing(cache_dir, cache_sid(project), CACHE_MASK, agrant)
+
+    # §P1-1 工作区共享缓存目录补授 AU 写（M1 测试类命令 EPERM 根因之一）：
+    # pytest/vitest/node 会写 .pytest_cache/__pycache__/node_modules/.cache 等，
+    # 受限进程自建时是 OWNER_RIGHTS-only 且不继承父 ACE → 多 worktree 写同一
+    # 目录互斥。对已存在的缓存类目录补授 AU 写（verify-then-skip，幂等）。
+    # 不影响任何受限代理的**外部**写能力（AU ACE 只作用于工作区内这些缓存目录）。
+    for cdir in await asyncio.to_thread(_collect_shared_cache_dirs, root):
+        await asyncio.to_thread(WriteGrant.grant_shared_cache_write, cdir)
 
     # §5.5b②（P2）：附加可写目录 —— 每目录独立 extra SID（"extra\0" 域派生），
     # standing 授予 GRANT_MASK + OI/CI。§4.12 部署前提同样适用：目录必须已存在
