@@ -57,3 +57,13 @@ async def _resolve_base_branch(workspace_path: str) -> str | None:
         if ok:
             return name
     return None
+
+
+async def _target_tip_short(workspace_path: str, target_branch: str) -> str | None:
+    """目标分支当前 tip 的短 hash（F13b 幂等重入回执用）。best-effort。"""
+    ok, out = await _git(
+        ["rev-parse", "--short", target_branch], workspace_path
+    )
+    if ok and out:
+        return out.strip()[:12]
+    return None

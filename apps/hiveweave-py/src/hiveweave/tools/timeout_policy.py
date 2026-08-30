@@ -11,15 +11,21 @@ stop (httpx timeout, bash process kill). Undeclared tools are not wrapped.
 from __future__ import annotations
 
 # Seconds. Absent name → no streamer-side deadline.
+# F7（平台修复计划 2026-08-30）：统一三档 —— 30s（快/网络）/ 120s（中）/
+# 600s（重）。此前 15/90/120/200/240/500 多档并存、按出现顺序随手定值，
+# 超时错误不可机检分类。三档语义：
+#   30s   —— 短查询 / 网络（websearch、webfetch）
+#   120s  —— 典型工具面（browse、question、生成类）
+#   600s  —— 重计算 / 严格上限（game 用例、超长 question）
 DECLARED_TIMEOUT_S: dict[str, float] = {
     "webfetch": 30.0,
-    "websearch": 15.0,
-    "browse": 90.0,
-    "browse_main": 90.0,
-    "question": 200.0,
+    "websearch": 30.0,
+    "browse": 120.0,
+    "browse_main": 120.0,
+    "question": 600.0,
     "generate_image": 120.0,
-    "game_run_case": 120.0,
-    "game_run_case_main": 120.0,
+    "game_run_case": 600.0,
+    "game_run_case_main": 600.0,
 }
 
 # Hang net while an undeclared tool is in-flight (zombie quiet cap).

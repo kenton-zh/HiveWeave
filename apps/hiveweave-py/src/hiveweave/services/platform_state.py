@@ -763,6 +763,93 @@ async def build_platform_state(
             )
         )
 
+    # ── F9 ②：可调配池 —— 闲置叶子（idle > 30min 且无未收口工作） ──
+    # r4：两名叶子闲置约 7h，最终靠 CEO 手动发消息催派活才被处理。闲置人力
+    # 主动进可调配池提示，派活/审查时中层不再依赖人工消息（看门狗只负责
+    # 唤醒「有钥匙的人」，这里是「有活但没人派」一侧的主动可见度）。
+    try:
+        pool_rows: list[dict[str, Any]] = []
+        for a in agents:
+            if (a.get("status") or "active") != "active":
+                continue
+            if str(a.get("parent_id") or "") == "":
+                continue  # 项目根（CEO/HR）不在可调配池语义内
+            aid = a.get("id") or ""
+            if not aid:
+                continue
+            exec_st = "offline"
+            try:
+                from hiveweave.agents.supervisor import agent_manager
+
+                _live = agent_manager.get_agent(aid)
+                if _live is not None:
+                    _st = getattr(getattr(_live, "status", None), "value", None)
+                    exec_st = "processing" if _st == "processing" else "idle"
+                else:
+                    # 未加载实例（进程重启后未唤醒）也是闲置 —— 不能只算
+                    # 已加载且 idle 的叶子（r4：闲置 7h 的叶子若未加载会漏报）
+                    exec_st = "idle"
+            except Exception:
+                exec_st = "unknown"
+            if exec_st != "idle":
+                continue
+            last_out = 0
+            try:
+                conn2 = await project_db.get_project_db_by_project_id(project_id)
+                cur2 = await conn2.execute(
+                    "SELECT COALESCE(MAX(created_at), 0) AS t FROM chat_messages "
+                    "WHERE agent_id = ? AND role = 'assistant'",
+                    [aid],
+                )
+                row2 = await cur2.fetchone()
+                await cur2.close()
+                last_out = int(row2["t"] if row2 else 0)
+            except Exception:
+                last_out = 0
+            if not last_out:
+                continue
+            idle_min = int((time.time() * 1000 - last_out) / 60000)
+            if idle_min < 30:
+                continue
+            # 无未收口工作（防把合法等待的 agent 标成「可调配」）
+            try:
+                from hiveweave.services.task import TaskService
+
+                busy = await TaskService().has_open_work(project_id, aid)
+            except Exception:
+                busy = True
+            if busy:
+                continue
+            pool_rows.append({
+                "short_id": a.get("short_id") or aid[:12],
+                "name": a.get("name"),
+                "role": a.get("role"),
+                "idle_min": idle_min,
+            })
+        if pool_rows:
+            verified.append(
+                _entry(
+                    "org.idle_pool",
+                    pool_rows,
+                    epistemic="verified",
+                    source="agents+chat_messages",
+                    note=(
+                        "闲置叶子（idle>30min 且无未收口工作）—— 派活时优先"
+                        "考虑这些人力，不必等他们来讨活。"
+                    ),
+                )
+            )
+    except Exception as e:
+        unknown.append(
+            _entry(
+                "org.idle_pool",
+                None,
+                epistemic="unknown",
+                source="org",
+                note=str(e),
+            )
+        )
+
     # ── Slices (contract_json) ───────────────────────────
     try:
         from hiveweave.services.task import TaskService
@@ -813,6 +900,44 @@ async def build_platform_state(
                 None,
                 epistemic="unknown",
                 source="contract_json",
+                note=str(e),
+            )
+        )
+
+    # ── F14: 平台源码指纹 — 变更未重载显著告警（verified） ──
+    # r4 审计实证：修复代码已写对但进程未重载，旧代码继续跑。此处把
+    # 「已重载」做成可查询事实位：源码自启动以来被改动 → 显著告警，
+    # 任何人都能回答「当前跑的是不是磁盘上的代码」。
+    try:
+        from hiveweave.services.code_fingerprint import (
+            code_drift,
+            startup_at_ms,
+            startup_fingerprint,
+        )
+
+        drift = code_drift(detail=True)
+        verified.append(
+            _entry(
+                "platform.code_drift",
+                {
+                    "drift": bool(drift.get("drift")),
+                    "startup_at_ms": startup_at_ms(),
+                    "startup_fingerprint": startup_fingerprint(),
+                    "current_fingerprint": drift.get("current"),
+                    "changed_files": drift.get("changed_files") or [],
+                },
+                epistemic="verified",
+                source="code_fingerprint",
+                note=drift.get("reason") or "No source change since process start.",
+            )
+        )
+    except Exception as e:
+        unknown.append(
+            _entry(
+                "platform.code_drift",
+                None,
+                epistemic="unknown",
+                source="code_fingerprint",
                 note=str(e),
             )
         )
@@ -954,6 +1079,20 @@ def format_platform_state(snapshot: dict[str, Any]) -> str:
         ]
     )
     for row in epi.get("verified") or []:
+        # F14：源码变更未重载 = 平台级显著告警，置顶 + 大写醒目。
+        if row.get("key") == "platform.code_drift" and (
+            (row.get("value") or {}).get("drift")
+        ):
+            changed = (row.get("value") or {}).get("changed_files") or []
+            lines.append(
+                "## [PLATFORM CODE DRIFT] source changed on disk since "
+                "process start — the running backend may NOT include these "
+                "changes. Restart the platform backend to load them."
+            )
+            if changed:
+                lines.append(f"  changed_files={changed[:10]}")
+            lines.append(f"  note: {row.get('note')}")
+            continue
         lines.append(
             f"- `{row.get('key')}` ← {row.get('source')}: "
             f"{_fmt_value(row.get('value'))}"

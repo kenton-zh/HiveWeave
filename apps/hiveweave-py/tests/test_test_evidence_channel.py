@@ -144,7 +144,7 @@ async def test_run_command_tool_wires_test_evidence(tmp_path) -> None:
         new=AsyncMock(return_value="proj"),
     ), patch(
         "hiveweave.services.process_registry.prepare_spawn_command",
-        return_value=("node validate-suite.mjs", None, None),
+        return_value=("node validate-suite.mjs", None, None, None),
     ), patch(
         "hiveweave.tools.bash.execute_run_command",
         new=AsyncMock(return_value={
@@ -182,7 +182,7 @@ async def test_bash_tool_wires_test_evidence(tmp_path) -> None:
         new=AsyncMock(return_value="proj"),
     ), patch(
         "hiveweave.services.process_registry.prepare_spawn_command",
-        return_value=("node validate-suite.mjs", None, None),
+        return_value=("node validate-suite.mjs", None, None, None),
     ), patch(
         "hiveweave.tools.bash.execute_bash",
         new=AsyncMock(return_value={

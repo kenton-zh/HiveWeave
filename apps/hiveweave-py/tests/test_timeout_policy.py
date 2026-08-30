@@ -59,9 +59,14 @@ def test_bash_read_write_edit_undeclared():
 
 
 def test_webfetch_declares_cooperative_timeout():
+    # F7（平台修复计划 2026-08-30）：超时统一三档 30/120/600 ——
+    # websearch 从 15s 归并到 30s 档（网络型短查询），question 归 600s，
+    # game_run_case 归 600s。
     assert declared_timeout_s("webfetch") == 30.0
-    assert declared_timeout_s("websearch") == 15.0
-    assert declared_timeout_s("question") == 200.0
+    assert declared_timeout_s("websearch") == 30.0
+    assert declared_timeout_s("question") == 600.0
+    assert declared_timeout_s("game_run_case") == 600.0
+    assert declared_timeout_s("game_run_case_main") == 600.0
 
 
 @pytest.mark.asyncio

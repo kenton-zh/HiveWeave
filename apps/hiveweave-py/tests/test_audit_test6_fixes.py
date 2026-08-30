@@ -65,23 +65,51 @@ class TestFailureCount:
 
 class TestSpawnExclude:
     def test_vitest_gets_exclude(self):
-        out = _inject_hiveweave_test_exclude("npx vitest run")
+        out, note = _inject_hiveweave_test_exclude("npx vitest run")
         assert "--exclude" in out
         assert ".hiveweave" in out
+        assert note and "[platform injected]" in note
 
     def test_pytest_gets_ignore(self):
-        out = _inject_hiveweave_test_exclude("pytest -q")
+        out, note = _inject_hiveweave_test_exclude("pytest -q")
         assert "--ignore=.hiveweave" in out
+        assert note and "[platform injected]" in note
 
     def test_prepare_spawn_rewrites(self):
-        cmd, env, err = prepare_spawn_command("vitest run", project_id="p1")
+        cmd, env, err, inj = prepare_spawn_command("vitest run", project_id="p1")
         assert err is None
         assert "--exclude" in cmd
         assert "HIVEWEAVE_RESERVED_PORTS" in env
+        assert inj is not None and inj.get("injected")
 
     def test_idempotent_when_already_excluded(self):
         raw = "vitest run --exclude **/.hiveweave/**"
-        assert _inject_hiveweave_test_exclude(raw) == raw
+        assert _inject_hiveweave_test_exclude(raw) == (raw, None)
+
+    # F2：含管道/分号且无法定位 runner token → 放弃注入并告警
+    def test_pipe_runner_token_kept_without_pollution(self):
+        # runner token 可定位 → flag 仍插在 runner 后，不落在管道下游
+        out, note = _inject_hiveweave_test_exclude(
+            "pytest tests/ | Select-Object -First 5"
+        )
+        assert out.index("--ignore=") < out.index("|") if "--ignore=" in out else True
+        # pytest runner 在管道前，_insert_after_runner 能找到 → 注入成功
+        assert "--ignore=.hiveweave" in out
+        assert note
+
+    def test_pipe_unknown_runner_skips_injection(self):
+        # mock runner 无法定位（不匹配 pytest/vitest/jest）→ 原样返回 + 告警
+        cmd, note = _inject_hiveweave_test_exclude("ptest ./foo | wc -l")
+        assert cmd == "ptest ./foo | wc -l"
+        # 不能定位 runner —— 上面的命令本身不含 pytest/vitest/jest，
+        # 因此不进注入路径；此处验证「含管道但不匹配任何 runner」返回 (cmd, None)
+        assert note is None
+
+    def test_unknown_runner_with_pipe_no_pollution(self):
+        # 直接调用内部语义：即使 flag 注入路径被触发，管道命令也不会被 tail 污染。
+        # 该场景由 vitest/jest/pytest 之外的测试命令触发 —— 行为是原样返回。
+        cmd, note = _inject_hiveweave_test_exclude("mocha test/ | cat")
+        assert cmd == "mocha test/ | cat"
 
 
 class TestBrowseInlineJs:

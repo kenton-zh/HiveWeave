@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -23,16 +24,24 @@ logger = structlog.get_logger()
 
 APPROVAL_TIMEOUT_S = 120
 
-# A-1 P0-3 降级路径文案：审批/ask 超时（用户离开/长期未审）后返回给 agent 的
-# 明确指引 —— 不再"永久卡死/静默等待"，而是让 agent 转向可审计替代。三处消费方
-# （tools/pipeline.py、tools/executor.py、services/command_guard.py）统一引用，
-# 保证文案与语义一致。
+# F5（平台修复计划 2026-08-30）：审批超时是**能力缺失**（没有门铃），不是
+# 操作被否决。平台观测不到用户是否在线，却在文案里断言「用户暂不可达」把
+# 能力缺失记成操作被否决 —— 凌晨无人值守时段 6 次「用户暂不可达」全部是
+# 项目的既定运行方式，不是用户失职。拆出：
+#   - `approval_channel_unavailable`（通道无人应答/无审批通道）→ 走替代方案
+#   - `operation_denied`（用户实际拒绝）→ 才记被拒绝
+# 同一审批指纹（tool + args hash）超时一次后，同 run 内拒绝再次发起——
+# 「不要重试」从文案变成机制（详见 pipeline/command_guard 的
+# _approval_fingerprint_seen，消费方在工具调用前置检查里拒绝重发）。
 APPROVAL_TIMEOUT_HINT = (
-    "审批请求超时：用户暂不可达（长时间未审批，未批准也未拒绝）。"
-    "不要原地空转或反复重试同一审批 —— 请换方向或调整参数后重试；"
-    "若该操作是平台不可绕过的硬门，转为提交可审计的替代方案"
-    "（说明原因、替代步骤与产出）并走 review/汇报。"
-)
+    "[approval_channel_unavailable] 审批请求超时：审批通道无应答 "
+    "（超时 %ds，未批准也未拒绝；项目的无人值守运行方式是既定方式，"
+    "不是审核人失职）。平台无法观测到审核人是否在线。"
+    "请勿原地空转或反复重试同一审批 —— 同一请求在本回合内已被平台"
+    "禁止重发。改走可审计的替代方案：说明原因、替代步骤与产出，"
+    "走 review/汇报；若该操作是平台不可绕过的硬门，请把目标拆小或"
+    "调整参数后再发起一次不同的请求。"
+) % APPROVAL_TIMEOUT_S
 
 
 class PermissionRejected(Exception):
@@ -41,6 +50,92 @@ class PermissionRejected(Exception):
 
 class PermissionTimeout(Exception):
     """Raised when a permission request times out."""
+
+
+# ── F5：审批超时的指纹去重 + 无人值守模式 ─────────────────────────
+# 同一审批指纹（tool + args hash）超时一次后，同 run 内拒绝再次发起——
+# 「不要重试」从文案变成机制（r4：文案已写"不要重试"，仍重试 6 次）。
+# 进程内 per-(agent, tool, args_hash) 记一次超时，TTL 内同指纹再次 request
+# 直接短路返回超时（不再等 120s）。周期惰性清理，防内存泄漏。
+_APPROVAL_TIMEOUT_MARK: dict[str, int] = {}  # key -> first_timeout_ms
+_APPROVAL_TIMEOUT_TTL_MS = 10 * 60 * 1000  # 10min 记忆窗口（一次 turn 内足够）
+_FINGERPRINT_CACHE_MAX = 512
+
+
+def approval_fingerprint(tool_name: str, tool_args: dict | None) -> str:
+    """(tool_name, canonical args) 的稳定指纹 —— F5 同指纹拒重试的键。"""
+    try:
+        args_repr = json.dumps(
+            tool_args or {}, sort_keys=True, ensure_ascii=False, default=str
+        )
+    except Exception:
+        args_repr = repr(tool_args or {})
+    return hashlib.sha256(
+        f"{tool_name}\n{args_repr}".encode("utf-8", errors="replace")
+    ).hexdigest()[:24]
+
+
+def _prune_approval_marks(now_ms: int | None = None) -> None:
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    if len(_APPROVAL_TIMEOUT_MARK) < _FINGERPRINT_CACHE_MAX:
+        stale = [
+            k for k, ts in _APPROVAL_TIMEOUT_MARK.items()
+            if now_ms - ts > _APPROVAL_TIMEOUT_TTL_MS
+        ]
+        for k in stale:
+            _APPROVAL_TIMEOUT_MARK.pop(k, None)
+    else:
+        _APPROVAL_TIMEOUT_MARK.clear()  # 满上限保守清空，避免膨胀
+
+
+def approval_timeout_marked(agent_id: str, tool_name: str, tool_args: dict | None) -> bool:
+    """True = 同指纹最近已超时一次，本 run 内拒绝再次发起（F5）。"""
+    key = f"{agent_id}:{approval_fingerprint(tool_name, tool_args)}"
+    ts = _APPROVAL_TIMEOUT_MARK.get(key)
+    if ts is None:
+        return False
+    now_ms = int(time.time() * 1000)
+    if now_ms - ts > _APPROVAL_TIMEOUT_TTL_MS:
+        _APPROVAL_TIMEOUT_MARK.pop(key, None)
+        return False
+    return True
+
+
+def mark_approval_timeout(agent_id: str, tool_name: str, tool_args: dict | None) -> None:
+    """记录一次审批超时（供同 run 内拒重试）。"""
+    _prune_approval_marks()
+    key = f"{agent_id}:{approval_fingerprint(tool_name, tool_args)}"
+    _APPROVAL_TIMEOUT_MARK.setdefault(key, int(time.time() * 1000))
+
+
+# 无人值守模式开关：项目级 global_settings key。开启后审批类请求直接走
+# 可审计的替代方案通道（返回超时语义），不再等待 120s —— 凌晨无人值守是
+# 项目的既定运行方式，不是用户失职（r4 F5）。
+UNATTENDED_MODE_SETTING = "unattended_mode"
+
+
+async def is_unattended_mode(project_id: str | None) -> bool:
+    """True = 项目开启无人值守模式（审批请求不再等通道）。
+
+    读取 Meta DB ``global_settings`` 的 ``unattended_mode:<project_id>``
+    与全局 ``unattended_mode``。best-effort：读失败返回 False（视为有人值守，
+    不因配置读取失败而放行审批）。
+    """
+    if not project_id:
+        return False
+    try:
+        from hiveweave.services.settings import SettingsService
+        svc = SettingsService()
+        for key in (
+            f"{UNATTENDED_MODE_SETTING}:{project_id}",
+            UNATTENDED_MODE_SETTING,
+        ):
+            v = await svc.get(key)
+            if v and str(v).strip().lower() in ("1", "true", "yes", "on"):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 class _PendingEntry:
@@ -103,6 +198,8 @@ class ApprovalService:
             )
             self._pending.pop(request_id, None)
             logger.warning("approval.timeout", request_id=request_id)
+            # F5：同指纹超时留痕 —— 同 run 内拒重试（「不要重试」机制化）。
+            mark_approval_timeout(agent_id, tool_name, tool_args)
             raise PermissionTimeout(
                 f"Approval request {request_id} timed out"
             )

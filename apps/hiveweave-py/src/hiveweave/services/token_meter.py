@@ -125,7 +125,19 @@ class TokenMeter:
             return
         now = _now_ms()
         statements: list[tuple[str, list[Any]]] = []
-        for r in rounds:
+        # F11：首请求冷启动标记 —— 该 run 第一条 usage 记录 cache_read=0 且
+        # cache_creation=0（cache 全未命中，前缀重建成本无账）→ 打 cold_start=1。
+        # provider 不上报 cache_creation 时（OpenAI 系），cache_read=0 且
+        # input>0 即冷启动。让 r4 的「20 run 首请求零命中 / 1.7M tokens 无账」
+        # 变成可查数字。
+        first_round = rounds[0] if isinstance(rounds[0], dict) else None
+        is_cold_start = bool(
+            first_round
+            and int(first_round.get("cache_read", 0) or 0) == 0
+            and int(first_round.get("cache_creation", 0) or 0) == 0
+            and int(first_round.get("input", 0) or 0) > 0
+        )
+        for i, r in enumerate(rounds):
             if not isinstance(r, dict):
                 continue
             statements.append((
@@ -133,8 +145,8 @@ class TokenMeter:
                 "(id, agent_id, project_id, run_id, task_id, model_id, "
                 "request_type, provider, input_tokens, output_tokens, "
                 "cache_read_tokens, cache_creation_tokens, total_tokens, "
-                "duration_ms, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "duration_ms, cold_start, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     str(uuid.uuid4()),
                     agent_id,
@@ -150,6 +162,7 @@ class TokenMeter:
                     int(r.get("cache_creation", 0) or 0),
                     int(r.get("total", 0) or 0),
                     int(r.get("duration_ms", 0) or 0),
+                    1 if (i == 0 and is_cold_start) else 0,
                     now,
                 ],
             ))

@@ -686,52 +686,87 @@ _PYTEST_RE = re.compile(
 )
 
 
-def _insert_after_runner(cmd: str, pattern: re.Pattern[str], flags: str) -> str:
-    """Splice runner flags in right after the runner token, not at string end.
+# 管道/分号分隔符 — 注入位置敏感标记。注入 flag 必须插在 runner 之后、
+# 分隔符之前；无法定位 runner token 时 tail-append 会把 flag 交给管道
+# 下游 cmdlet（F2 根因：`pytest … | Select-Object` 的尾部 --ignore 被
+# Select-Object 当位置参数拒收）。
 
-    Tail-appending corrupts piped commands — ``pytest … | Select-Object``
-    would receive the flags as Select-Object positional args. Runner
-    options are position-free, so insert after the matched token; fall
-    back to tail-append if no clean token exists.
 
-    Token discipline beyond ``\\b``: a match followed by ``-``/``.``/``/``
-    is part of a longer name (``pytest-cov``, ``vitest.config.ts``), not a
-    runner invocation. Among clean tokens the LAST one wins — compound
-    commands put the real invocation after setup segments
-    (``pip install pytest && python -m pytest tests/``).
+def _has_pipe_or_seq(command: str) -> bool:
+    """命令含管道 / 分号分隔（未加引号段）。F2：含则注入位置必须敏感。"""
+    cmd = command or ""
+    quote: str | None = None
+    for ch in cmd:
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+        elif ch in ("|", ";"):
+            return True
+    return False
+
+
+def _inject_hiveweave_test_exclude(command: str) -> tuple[str, str | None]:
+    """Inject runner-specific excludes so .hiveweave/ worktrees don't pollute.
+
+    Returns ``(rewritten_command, injection_note)`` — ``injection_note`` is
+    None when no injection was attempted, otherwise a human-readable note
+    describing what the platform rewrote (F2：让 Agent 看得见这双手)。
+
+    Runner 定位纪律（audit P2 沿革）：
+    - 在**全部**匹配里挑「后跟空白」的干净 token，取**最后一个** —— 复合
+      命令把真正的 runner 调用放在前面的安装段之后（``pip install pytest
+      && python -m pytest tests/`` → 注入 pytest 段，不碰 pytest-cov）。
+    - 一个匹配后跟 ``-``/``.``/``;``/``/`` 是长名的一部分（pytest-cov、
+      pytest.main()、import pytest;），不算 runner 调用，跳过继续找。
+    - 找不到干净 token 时：命令含管道/分号 → **放弃注入并告警**（F2：tail
+      会把 flag 交给管道下游 cmdlet，宁可不注入）；无管道 → tail-append
+      依旧安全，保留历史 fallback。
     """
-    chosen: re.Match[str] | None = None
-    for m in pattern.finditer(cmd):
-        nxt = cmd[m.end() : m.end() + 1]
-        if nxt == "" or nxt in " \t\n":
-            chosen = m
-    if chosen is None:
-        return f"{cmd.rstrip()} {flags}"
-    return (
-        f"{cmd[: chosen.end()].rstrip()} {flags} {cmd[chosen.end() :].lstrip()}"
-    ).strip()
-
-
-def _inject_hiveweave_test_exclude(command: str) -> str:
-    """Inject runner-specific excludes so .hiveweave/ worktrees don't pollute."""
     cmd = command or ""
     if ".hiveweave" in cmd.lower() and (
         "--exclude" in cmd or "--ignore" in cmd or "testPathIgnore" in cmd
     ):
-        return cmd
+        return cmd, None
+
+    def _try_inject(match_re: re.Pattern[str], flags: str, tool: str) -> tuple[str, str | None]:
+        # 最后一个「后跟空白」的干净 runner 匹配
+        chosen: re.Match[str] | None = None
+        for m in match_re.finditer(cmd):
+            nxt = cmd[m.end() : m.end() + 1]
+            if nxt == "" or nxt in " \t\n":
+                chosen = m
+        if chosen is None:
+            # F2：找不到干净 runner token —— 含管道/分号时放弃注入并告警；
+            # 无管道时 tail-append 安全（历史 fallback 保留）。
+            if _has_pipe_or_seq(cmd):
+                return cmd, (
+                    f"[platform injection skipped] cannot locate a clean "
+                    f"{tool} runner token to insert `{flags}` before a "
+                    f"pipe/separator — left the command untouched rather "
+                    f"than corrupt it."
+                )
+            return f"{cmd.rstrip()} {flags}", None
+        return (
+            f"{cmd[: chosen.end()].rstrip()} {flags} "
+            f"{cmd[chosen.end() :].lstrip()}"
+        ).strip(), f"[platform injected] {flags} after {tool} runner."
+
     if _VITEST_RE.search(cmd) and "--exclude" not in cmd:
-        return _insert_after_runner(
-            cmd, _VITEST_RE, f"--exclude {_HIVEWEAVE_EXCLUDE_GLOB}"
-        )
+        return _try_inject(_VITEST_RE, f"--exclude {_HIVEWEAVE_EXCLUDE_GLOB}", "vitest")
     if _JEST_RE.search(cmd) and "testPathIgnorePatterns" not in cmd:
-        return _insert_after_runner(
-            cmd, _JEST_RE, "--testPathIgnorePatterns=\\.hiveweave"
+        return _try_inject(
+            _JEST_RE, "--testPathIgnorePatterns=\\.hiveweave", "jest"
         )
     if _PYTEST_RE.search(cmd) and "--ignore" not in cmd and "--ignore-glob" not in cmd:
-        return _insert_after_runner(
-            cmd, _PYTEST_RE, "--ignore=.hiveweave --ignore-glob=**/.hiveweave/**"
+        return _try_inject(
+            _PYTEST_RE,
+            "--ignore=.hiveweave --ignore-glob=**/.hiveweave/**",
+            "pytest",
         )
-    return cmd
+    return cmd, None
 
 
 def prepare_spawn_command(
@@ -739,10 +774,13 @@ def prepare_spawn_command(
     *,
     project_id: str | None = None,
     preferred_port: int = 3000,
-) -> tuple[str, dict[str, str], str | None]:
+) -> tuple[str, dict[str, str], str | None, dict | None]:
     """P2 process proxy: rewrite/guard command + inject reserved-port env.
 
-    Returns (command, extra_env, error_message).
+    Returns ``(command, extra_env, error_message, injection_meta)``.
+    ``injection_meta``（F2）: ``{note, injected, final_command}`` 描述平台
+    对命令的改写 —— 让调用方把「平台动了什么」回显给 Agent
+    （result_excerpt），改写可见才不会被当成模型/命令自身的问题。
     """
     extra_env = {
         "HIVEWEAVE_RESERVED_PORTS": ",".join(
@@ -767,14 +805,24 @@ def prepare_spawn_command(
                     f"(API/UI). Use a project port (e.g. 3000+) via "
                     f"start_dev_server, not --port {port}."
                 ),
+                None,
             )
 
     # TEST6 P0-3: exclude in-tree worktrees from glob test runners
-    command = _inject_hiveweave_test_exclude(command)
+    pre_inject_command = command
+    injected_command, injection_note = _inject_hiveweave_test_exclude(command)
+    command = injected_command
+    injection_meta: dict | None = None
+    if injection_note:
+        injection_meta = {
+            "note": injection_note,
+            "injected": injected_command != pre_inject_command,
+            "final_command": command,
+        }
 
     ports = extract_ports_from_command(command)
     if ports:
-        return command, extra_env, None
+        return command, extra_env, None, injection_meta
 
     # Bare vite/npm run dev → allocate project port (don't leave as 5173)
     if _VITE_BARE_RE.search(command or ""):
@@ -792,7 +840,7 @@ def prepare_spawn_command(
             port=port,
             original=(command or "")[:80],
         )
-        return rewritten, extra_env, None
+        return rewritten, extra_env, None, injection_meta
 
     # 裸 uvicorn 默认 8000，不在 reserved 内，但仍分配 3000+ 并注入 --port
     # （与 vite 一样走 allocate_project_port；已有 --port/-p/PORT= 的上面已 return）。
@@ -812,7 +860,7 @@ def prepare_spawn_command(
             port=port,
             original=(command or "")[:80],
         )
-        return rewritten, extra_env, None
+        return rewritten, extra_env, None, injection_meta
 
     # python -m app.server: long-running, killable via registry. Do NOT
     # inject --port (app.server may not accept uvicorn flags). PORT env only
@@ -831,7 +879,7 @@ def prepare_spawn_command(
             port=port,
             original=(command or "")[:80],
         )
-        return command, extra_env, None
+        return command, extra_env, None, injection_meta
 
     # flask run: default 5000. Inject --port (flask accepts it) + PORT env.
     if (
@@ -850,7 +898,7 @@ def prepare_spawn_command(
             port=port,
             original=(command or "")[:80],
         )
-        return rewritten, extra_env, None
+        return rewritten, extra_env, None, injection_meta
 
     # gunicorn: default 8000. Inject --bind, not --port.
     if (
@@ -869,9 +917,9 @@ def prepare_spawn_command(
             port=port,
             original=(command or "")[:80],
         )
-        return rewritten, extra_env, None
+        return rewritten, extra_env, None, injection_meta
 
-    return command, extra_env, None
+    return command, extra_env, None, injection_meta
 
 
 def spawn_project_process(
@@ -884,7 +932,7 @@ def spawn_project_process(
     **popen_kwargs: Any,
 ) -> tuple[subprocess.Popen | None, str | None, dict[str, Any]]:
     """Spawn with reserved-port proxy. Returns (proc, error, meta)."""
-    cmd, extra_env, err = prepare_spawn_command(
+    cmd, extra_env, err, _inj_meta = prepare_spawn_command(
         command, project_id=project_id, preferred_port=preferred_port
     )
     if err:

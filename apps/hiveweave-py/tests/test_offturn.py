@@ -383,7 +383,7 @@ async def test_bash_background_returns_immediately(
     monkeypatch.setattr("hiveweave.tools.helpers.get_project_id", fake_pid)
     monkeypatch.setattr(
         "hiveweave.services.process_registry.prepare_spawn_command",
-        lambda cmd, project_id=None: (cmd, {}, None),
+        lambda cmd, project_id=None: (cmd, {}, None, None),
     )
 
     result = await bash_tool(
@@ -427,7 +427,7 @@ async def test_bash_default_stays_foreground(
     monkeypatch.setattr("hiveweave.tools.helpers.get_project_id", fake_pid)
     monkeypatch.setattr(
         "hiveweave.services.process_registry.prepare_spawn_command",
-        lambda cmd, project_id=None: (cmd, {}, None),
+        lambda cmd, project_id=None: (cmd, {}, None, None),
     )
 
     result = await bash_tool(

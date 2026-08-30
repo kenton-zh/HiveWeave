@@ -145,6 +145,15 @@ class ToolExecMixin:
                 "content": content,
                 "tool_call_id": tc["id"],
             }
+            # F4（平台修复计划 2026-08-30）：正交事实位透传到 tool_results
+            # —— blocke/runner_failed/command_failed 是 F8 advisory 归因的
+            # 数据源。这些键不会进 LLM 消息体（下游组装时剥离），只供
+            # tool_loop 的 _round_fact_flags 做归因聚合。
+            if not isinstance(result, BaseException):
+                for _fk in ("blocked", "runner_failed", "command_failed"):
+                    if result.get(_fk):
+                        tool_msg[_fk] = True
+                tool_msg["success"] = tc["id"] not in error_ids
             # Multimodal: preserve screenshot pixels for the next LLM round.
             images = None if isinstance(result, BaseException) else result.get("images")
             if images:

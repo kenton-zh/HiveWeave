@@ -61,7 +61,7 @@ def _bash_exec_patches(seen: list[str], execute_result: dict | None = None):
         patch("hiveweave.tools.helpers.get_project_id", AsyncMock(return_value="p1")),
         patch(
             "hiveweave.services.process_registry.prepare_spawn_command",
-            return_value=("npm test", {}, None),
+            return_value=("npm test", {}, None, None),
         ),
         patch(
             "hiveweave.services.task.TaskService.get_task",

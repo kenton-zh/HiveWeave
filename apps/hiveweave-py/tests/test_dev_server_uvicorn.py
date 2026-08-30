@@ -101,7 +101,7 @@ def test_foreground_amp_routes_non_server_to_offturn():
 
 def test_prepare_spawn_injects_uvicorn_port():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "uvicorn app:app", project_id="p-uvicorn"
     )
     assert err is None
@@ -118,7 +118,7 @@ def test_prepare_spawn_injects_uvicorn_port():
 
 def test_prepare_spawn_keeps_explicit_uvicorn_port():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "uvicorn app:app --port 8102", project_id="p-uvicorn-fixed"
     )
     assert err is None
@@ -130,7 +130,7 @@ def test_prepare_spawn_keeps_explicit_uvicorn_port():
 
 def test_prepare_spawn_strips_amp_before_uvicorn_inject():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "uvicorn app:app &", project_id="p-uvicorn-amp"
     )
     assert err is None
@@ -141,7 +141,7 @@ def test_prepare_spawn_strips_amp_before_uvicorn_inject():
 
 def test_prepare_spawn_python_m_uvicorn_injects_port():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "python -m uvicorn app:app", project_id="p-uvicorn-pym"
     )
     assert err is None
@@ -153,13 +153,13 @@ def test_prepare_spawn_python_m_uvicorn_injects_port():
 def test_prepare_spawn_does_not_rewrite_uvicorn_as_dependency():
     """`--with uvicorn` is a dep, not a server — do not inject --port."""
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "uv run --with uvicorn pytest", project_id="p-uvicorn-dep"
     )
     assert err is None
     assert "--port" not in cmd
     assert env.get("PORT") is None
-    cmd2, env2, err2 = prepare_spawn_command(
+    cmd2, env2, err2, _inj2 = prepare_spawn_command(
         "uv run --group uvicorn pytest", project_id="p-uvicorn-group"
     )
     assert err2 is None
@@ -169,13 +169,13 @@ def test_prepare_spawn_does_not_rewrite_uvicorn_as_dependency():
 
 def test_prepare_spawn_does_not_rewrite_flask_as_dependency():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "uv run --with flask pytest", project_id="p-flask-dep"
     )
     assert err is None
     assert "--port" not in cmd
     assert env.get("PORT") is None
-    cmd2, env2, err2 = prepare_spawn_command(
+    cmd2, env2, err2, _inj2 = prepare_spawn_command(
         "flask shell", project_id="p-flask-shell"
     )
     assert err2 is None
@@ -211,7 +211,7 @@ def test_detect_app_server_help_not_a_server():
 
 def test_prepare_spawn_app_server_does_not_inject_port_flag():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "python -m app.server", project_id="p-app-server"
     )
     assert err is None
@@ -223,7 +223,7 @@ def test_prepare_spawn_app_server_does_not_inject_port_flag():
 
 def test_prepare_spawn_app_server_keeps_explicit_port():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "python -m app.server --port 8102", project_id="p-app-fixed"
     )
     assert err is None
@@ -269,7 +269,7 @@ def test_detect_gunicorn_non_server():
 
 def test_prepare_spawn_injects_flask_port():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "flask run", project_id="p-flask"
     )
     assert err is None
@@ -282,7 +282,7 @@ def test_prepare_spawn_injects_flask_port():
 
 def test_prepare_spawn_injects_gunicorn_bind_not_port():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "gunicorn app:app", project_id="p-gunicorn"
     )
     assert err is None
@@ -295,7 +295,7 @@ def test_prepare_spawn_injects_gunicorn_bind_not_port():
 
 def test_prepare_spawn_keeps_explicit_gunicorn_bind():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "gunicorn app:app --bind 0.0.0.0:8102", project_id="p-gunicorn-fixed"
     )
     assert err is None
@@ -372,7 +372,7 @@ def test_http_server_trailing_amp_routes_to_dev_server():
 
 def test_prepare_spawn_gunicorn_reserved_bind_rejected():
     clear_registry_for_tests()
-    _cmd, _env, err = prepare_spawn_command(
+    _cmd, _env, err, _inj = prepare_spawn_command(
         "gunicorn app:app --bind 0.0.0.0:4000", project_id="p-gunicorn-rsv"
     )
     assert err
@@ -395,7 +395,7 @@ def test_prepare_spawn_does_not_rewrite_gunicorn_as_dependency():
         "uv run --with  gunicorn pytest",
         "uv run --extra gunicorn pytest",
     ):
-        cmd, env, err = prepare_spawn_command(cmd0, project_id="p-gdep")
+        cmd, env, err, _inj = prepare_spawn_command(cmd0, project_id="p-gdep")
         assert err is None
         assert "--bind" not in cmd
         assert "--port" not in cmd

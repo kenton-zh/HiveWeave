@@ -355,7 +355,40 @@ async def execute_registered_tool(
             APPROVAL_TIMEOUT_HINT,
             PermissionRejected,
             PermissionTimeout,
+            approval_timeout_marked,
+            is_unattended_mode,
         )
+        from hiveweave.db import meta as meta_db
+
+        # F5：同指纹最近已超时一次 → 同 run 内不再发起第二次（「不要重试」
+        # 机制化），直接返回超时语义，不再空等 120s。
+        _pid = None
+        try:
+            _row = await meta_db.query_one(
+                "SELECT project_id FROM agents WHERE id = ?", [agent_id]
+            )
+            _pid = _row["project_id"] if _row else None
+        except Exception:
+            _pid = None
+        if approval_timeout_marked(agent_id, tool_name, raw_args):
+            return (
+                ToolResult.blocked_err(
+                    APPROVAL_TIMEOUT_HINT
+                    + "\n[approval fingerprint re-try blocked] 同一审批请求在"
+                    "本回合内已超时一次，不再重复等待。请改走可审计的替代方案。"
+                )
+                .to_dict()
+            )
+        # 无人值守模式：审批通道直接走替代方案（不再等 120s 空转）。
+        if await is_unattended_mode(_pid):
+            return (
+                ToolResult.blocked_err(
+                    APPROVAL_TIMEOUT_HINT
+                    + "\n[unattended mode] 项目为无人值守模式，审批请求不"
+                    "等待审核。请改走可审计的替代方案通道或拆分目标。"
+                )
+                .to_dict()
+            )
 
         try:
             await approval.request_permission(

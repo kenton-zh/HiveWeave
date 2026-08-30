@@ -629,6 +629,33 @@ async def git_worktree_merge_tool(
         )
         branches = _parse_branch_list(branch_out)
         if not branches:
+            # F13b（平台修复计划 2026-08-30）：分支查找零匹配 ≠ 冲突，也
+            # ≠ 必须出错 —— 分支可能已在上次 merge 后被清理，但 main 已经
+            # 包含它。幂等重入直接给成功态（r4：两个 Agent 各踩一次
+            # "No worktree branch found" 才弄清不是冲突）。
+            # 前缀纪律：branch_name 是 short_id（本分支）→ 拼 hw/<sid>；
+            # 已带 hw/ 前缀则直接用（防 hw/hw/ 双拼）。
+            _candidate = branch_name if str(branch_name).startswith("hw/") else (
+                f"hw/{branch_name}"
+            )
+            _already, _anc = await _git(
+                ["merge-base", "--is-ancestor", _candidate, target_branch],
+                workspace_path,
+            )
+            if not _already:
+                # ref 已删：退而按 merge commit 历史判定
+                _already, _anc = await _git(
+                    ["log", "-1", "--oneline", "--merges",
+                     f"--grep=^Merge branch '{_candidate}'"],
+                    workspace_path,
+                )
+            if _already:
+                return ToolResult.ok(
+                    f"Branch {_candidate} was already merged into "
+                    f"{target_branch} by a prior merge — idempotent success. "
+                    "Nothing to do; the worktree branch was cleaned up. "
+                    "Do not re-merge."
+                )
             # T2.1: 分支查找零匹配 ≠ 冲突 —— 对照组（task_name 零匹配路径）
             # 从不拼冲突提示，这里此前却无条件拼 MERGE_CONFLICT_HINT，把
             # coordinator 引导去 rework 不存在的冲突。改用专属 hint。

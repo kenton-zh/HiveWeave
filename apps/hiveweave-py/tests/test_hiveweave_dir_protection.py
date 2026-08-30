@@ -323,13 +323,13 @@ class TestSharedDirAccess:
         from hiveweave.services.process_registry import prepare_spawn_command
         from hiveweave.tools.bash import _check_hiveweave_command
 
-        cmd, _, err = prepare_spawn_command("pytest", project_id="t")
+        cmd, _, err, _inj = prepare_spawn_command("pytest", project_id="t")
         assert err is None
         assert "--ignore=.hiveweave" in cmd
         assert "--ignore-glob=" in cmd
         assert _check_hiveweave_command(cmd) is False
 
-        cmd_m, _, err_m = prepare_spawn_command(
+        cmd_m, _, err_m, _inj_m = prepare_spawn_command(
             "python -m pytest", project_id="t"
         )
         assert err_m is None
@@ -345,7 +345,7 @@ class TestSharedDirAccess:
         from hiveweave.services.process_registry import prepare_spawn_command
 
         raw = "uv --project sidecar run python -m pytest tests/ -q 2>&1 | Select-Object -First 80"
-        cmd, _, err = prepare_spawn_command(raw, project_id="t")
+        cmd, _, err, _inj = prepare_spawn_command(raw, project_id="t")
         assert err is None
         assert "--ignore=.hiveweave" in cmd
         pipe_pos = cmd.index("|")
@@ -357,7 +357,7 @@ class TestSharedDirAccess:
         from hiveweave.services.process_registry import prepare_spawn_command
 
         raw = "npx vitest run 2>&1 | Out-String -Width 200"
-        cmd, _, err = prepare_spawn_command(raw, project_id="t")
+        cmd, _, err, _inj = prepare_spawn_command(raw, project_id="t")
         assert err is None
         pipe_pos = cmd.index("|")
         assert cmd.index("--exclude") < pipe_pos
@@ -372,7 +372,7 @@ class TestSharedDirAccess:
         from hiveweave.services.process_registry import prepare_spawn_command
 
         raw = "pip install pytest-cov && python -m pytest tests/ -q"
-        cmd, _, err = prepare_spawn_command(raw, project_id="t")
+        cmd, _, err, _inj = prepare_spawn_command(raw, project_id="t")
         assert err is None
         seg2 = cmd.split("&&", 1)[1]
         assert "--ignore=.hiveweave" in seg2
@@ -386,7 +386,7 @@ class TestSharedDirAccess:
         )
 
         raw = 'python -c "import pytest; pytest.main()"'
-        cmd, _, err = prepare_spawn_command(raw, project_id="t")
+        cmd, _, err, _inj = prepare_spawn_command(raw, project_id="t")
         assert err is None
         assert ".hiveweave" in cmd
         assert _check_hiveweave_command(cmd) is False
@@ -421,11 +421,11 @@ class TestSharedDirAccess:
             execute_bash,
         )
 
-        cmd, _, err = prepare_spawn_command("pytest", project_id="t")
+        cmd, _, err, _inj = prepare_spawn_command("pytest", project_id="t")
         assert err is None
         blocked, reason = _validate_command_safety(cmd)
         assert blocked is False, reason
-        cmd_c, _, err_c = prepare_spawn_command(
+        cmd_c, _, err_c, _inj_c = prepare_spawn_command(
             'python -c "import pytest; pytest.main()"', project_id="t"
         )
         assert err_c is None

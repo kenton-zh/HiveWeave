@@ -391,6 +391,38 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["command"],
     },
+    # F12（平台修复计划 2026-08-30）：跨仓补丁交付通道 — 正式渠道代替
+    # 「写补丁文件放那儿」人肉通路。
+    "deliver_patch": {
+        "description": (
+            "Deliver a cross-repo patch through the official channel. The "
+            "sandbox forbids writing platform repos directly; this tool "
+            "hands your patch (inline diff or file path) to an authorized "
+            "party with reason and persists it under "
+            ".hiveweave/patch-deliveries/ for review and application."
+        ),
+        "properties": {
+            "diff": {
+                "type": "string",
+                "aliases": ["patch", "diff_content", "content"],
+                "description": "The patch/diff content (unified diff) being delivered. Required if filePath is not provided.",
+            },
+            "filePath": {
+                "type": "string",
+                "aliases": ["patch_file", "file", "path"],
+                "description": "Path (relative to your workspace) of an existing patch file to deliver.",
+            },
+            "targetRepo": {
+                "type": "string",
+                "aliases": ["target_repo", "target"],
+                "description": "Which repo the patch targets (e.g. 'hiveweave-platform', 'project-<name>').",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why this change is needed and what it does.",
+            },
+        },
+    },
     "read_file": {
         "description": (
             "Read a UTF-8 text file and return line-numbered content. "
@@ -2142,6 +2174,51 @@ async def _emit_tool_execute_after(
         log.debug("tool_execute_after_hook_failed", error=str(e))
 
 
+# F10（平台修复计划 2026-08-30）：失败签名广播 —— 撞到新失败签名写入项目
+# 共享空间（供其他 Agent 前置检索）；命中已知签名的错误回执附 shared-fix 提示
+# （让「先查共享空间」从文案变成行为）。
+async def _f10_result_hooks(
+    result: dict[str, Any],
+    tool_name: str,
+    tool_args: dict[str, Any],
+    agent_id: str,
+) -> dict[str, Any]:
+    if not result or result.get("success"):
+        return result
+    try:
+        from hiveweave.db.meta import get_agent_project_id
+        from hiveweave.services.failure_signature import (
+            known_signature_hint,
+            record_failure_signature,
+        )
+
+        project_id = await get_agent_project_id(agent_id) or None
+        error = result.get("error") or ""
+        if not error:
+            return result
+        # 归因一句话（供共享条目 / 前置提示使用）
+        _attr = ""
+        if result.get("runner_failed"):
+            _attr = "runner_failed: 命令未执行（执行器/方言/权限/审批）"
+        elif result.get("command_failed"):
+            _attr = "command_failed: 命令执行了但失败（业务/测试未过）"
+        elif result.get("blocked"):
+            _attr = "blocked: 平台护栏拒绝（权限/沙箱/安全）"
+        await record_failure_signature(
+            project_id=project_id,
+            agent_id=agent_id,
+            tool_name=tool_name,
+            error=error,
+            attribution=_attr,
+        )
+        hint = await known_signature_hint(project_id, error)
+        if hint:
+            result["error"] = f"{result['error']}\n\n{hint}"
+    except Exception as e:  # noqa: BLE001
+        log.debug("f10_failure_signature_hook_failed", error=str(e))
+    return result
+
+
 # ── ToolExecutor ───────────────────────────────────────────
 
 class ToolExecutor:
@@ -2194,6 +2271,44 @@ class ToolExecutor:
         if name in known:
             return None
         return build_unknown_tool_error(name, known)
+
+    @staticmethod
+    def audit_registered_tools() -> list[dict]:
+        """F3 死工具对账：注册清单 ↔ 可调用实现。
+
+        启动自检用。返回未接线/不可调用的工具名单（空 = 全部可用）：
+        - ``@tool`` 注册表：execute_fn 缺失或不可调用 → 死工具
+          （出现在工具表 = 对 Agent 的承诺，未接线 = 承诺不兑现）。
+        - legacy 评审套件：必须仍由 ``_dispatch`` 兜底 —— 这里是静态对账
+          注册集合本身（6 个 legacy 名是否都登记在 LEGACY_DISPATCH_TOOLS）；
+          实际接线由 ``_dispatch`` 的分支覆盖验证。调用方（main.py 启动）
+          把结果写入启动日志 —— 有「已注册但不可调用」即红线告警。
+        """
+        import hiveweave.tools  # noqa: F401
+        from hiveweave.tools.base import _TOOL_REGISTRY
+        from hiveweave.tools.pipeline import LEGACY_DISPATCH_TOOLS
+
+        problems: list[dict] = []
+        for name, td in _TOOL_REGISTRY.items():
+            fn = getattr(td, "execute_fn", None)
+            if fn is None or not callable(fn):
+                problems.append({
+                    "name": name,
+                    "kind": "registered_no_impl",
+                    "note": "registered in @tool registry but execute_fn missing",
+                })
+        legacy_handled = frozenset({
+            "review", "run_code_review", "run_security_audit", "run_tests",
+            "run_perf_audit", "run_full_review",
+        })
+        for name in sorted(LEGACY_DISPATCH_TOOLS):
+            if name not in legacy_handled:
+                problems.append({
+                    "name": name,
+                    "kind": "legacy_not_dispatched",
+                    "note": "declared legacy tool but _dispatch has no branch",
+                })
+        return problems
 
     async def execute(
         self,
@@ -2269,6 +2384,9 @@ class ToolExecutor:
                 registered_result["output"] = self._maybe_save_large_output(
                     registered_result["output"], agent_id, name, workspace_path
                 )
+            registered_result = await _f10_result_hooks(
+                registered_result, name, tool_args, agent_id
+            )
             await _emit_tool_execute_after(
                 agent_id, name, tool_args, registered_result
             )
@@ -2312,6 +2430,36 @@ class ToolExecutor:
             return deny_result
 
         if decision == "ask":
+            # F5：同指纹最近已超时一次 → 同 run 内不再发起第二次；无人值守
+            # 模式直接走替代方案（不再空等 120s）。
+            from hiveweave.services.approval import (
+                APPROVAL_TIMEOUT_HINT,
+                approval_timeout_marked,
+                is_unattended_mode,
+            )
+
+            _pid = None
+            try:
+                _agent_row = await meta_db.get_agent_by_id(agent_id)
+                _pid = (_agent_row or {}).get("project_id")
+            except Exception:
+                _pid = None
+            if approval_timeout_marked(agent_id, name, tool_args):
+                _deny = self._error(
+                    APPROVAL_TIMEOUT_HINT
+                    + "\n[approval fingerprint re-try blocked] 同一审批请求在"
+                    "本回合内已超时一次，不再重复等待。请改走可审计的替代方案。"
+                )
+                _deny["blocked"] = True
+                return _deny
+            if await is_unattended_mode(_pid):
+                _deny = self._error(
+                    APPROVAL_TIMEOUT_HINT
+                    + "\n[unattended mode] 项目为无人值守模式，审批请求不"
+                    "等待审核。请改走可审计的替代方案通道或拆分目标。"
+                )
+                _deny["blocked"] = True
+                return _deny
             # Request approval (120s timeout)
             try:
                 await self.approval.request_permission(
@@ -2362,6 +2510,8 @@ class ToolExecutor:
                 result["output"], agent_id, name, workspace_path
             )
             result["output"] = truncated
+
+        result = await _f10_result_hooks(result, name, tool_args, agent_id)
 
         await _emit_tool_execute_after(agent_id, name, tool_args, result)
 

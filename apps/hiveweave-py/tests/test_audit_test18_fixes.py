@@ -612,7 +612,7 @@ async def test_bash_main_uses_project_root_not_worktree():
         patch("hiveweave.tools.bash.execute_bash", fake_exec),
         patch(
             "hiveweave.services.process_registry.prepare_spawn_command",
-            lambda cmd, project_id=None: (cmd, {}, None),
+            lambda cmd, project_id=None: (cmd, {}, None, None),
         ),
         patch(
             "hiveweave.tools.bash._issue_test_run_attestation",

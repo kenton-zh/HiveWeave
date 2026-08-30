@@ -22,7 +22,7 @@ from .constants import (
     _create_locks_guard,
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
-from .git_cmd import _current_branch, _git, _resolve_base_branch
+from .git_cmd import _current_branch, _git, _resolve_base_branch, _target_tip_short
 from .merge_support import (
     _auto_checkpoint_dirty_target,
     _merge_failure_result,
@@ -746,6 +746,57 @@ class MergeMixin:
                         "worktree_detached",
                     },
                 )
+
+        # F13b（平台修复计划 2026-08-30）：merge 幂等重入 —— 「已合入并清理
+        # 的分支再次 merge」必须是成功态，不再走错误的冲突通道。判据：
+        # main 的提交历史已经包含该分支（git merge-base --is-ancestor）——
+        # 分支可能已被上个 merge 删除/清理（r4：两个 Agent 各踩一次
+        # "No worktree branch found → not a merge conflict" 澄清文案）。
+        # 注意：precondition 的 "ahead==0" 已经覆盖「分支还在但无新提交」；
+        # 本判据覆盖「分支已删但合并已发生」的尾声。
+        _branch_ref_exists, _ref_out = await _git(
+            ["rev-parse", "--verify", f"refs/heads/{branch}"],
+            workspace_path,
+        )
+        # ref 已删除时 `--is-ancestor` 直接 128；改为按合并历史判定「同名分支
+        # 曾经存在且已合入」—— 用 --merged 不可能（ref 没了），退而看 merge
+        # 提交消息（git 对合入的 `branch -d` 分支会在 main 留下 merge commit，
+        # 消息形如 "Merge branch '<branch>'"）。
+        if _branch_ref_exists:
+            ok_anc, _anc_out = await _git(
+                ["merge-base", "--is-ancestor", branch, target_branch],
+                workspace_path,
+            )
+        else:
+            ok_anc, _anc_out = await _git(
+                ["log", "-1", "--oneline", "--merges", f"--grep=^Merge branch '{branch}'"],
+                workspace_path,
+            )
+            if not ok_anc:
+                # main 或分支在不同命名（legacy slug）时 grepmatch 兜底空态
+                ok_anc, _anc_out = await _git(
+                    ["merge-base", "--is-ancestor", branch, target_branch],
+                    workspace_path,
+                )
+        if ok_anc:
+            log.info(
+                "git_worktree.merge_idempotent_already_merged",
+                branch=branch, target=target_branch,
+            )
+            return {
+                "success": True,
+                "merged": True,
+                "already_merged": True,
+                "hash": await _target_tip_short(workspace_path, target_branch),
+                "branch": branch,
+                "short_id": short_id,
+                "already_up_to_date": True,
+                "message": (
+                    f"Branch {branch} was already merged into "
+                    f"{target_branch} in a prior merge — treated as success."
+                    " Nothing to do. (Idempotent re-entry; do not re-merge.)"
+                ),
+            }
 
         # Step 0: Fetch latest target_branch
         ok, _ = await _git(["checkout", target_branch], workspace_path)

@@ -52,7 +52,7 @@ class PythonScriptParams(BaseModel):
     timeout: int | None = Field(
         default=None,
         description=(
-            "Timeout ms (5s–10min). Default 300000 (5min). Values 1-600 "
+            "Timeout ms (5s–10min). Default 120000 (2 min). Values 1-600 "
             "are treated as seconds (30 = 30s)."
         ),
     )
@@ -235,7 +235,12 @@ async def python_script_execute(
     if result["timed_out"]:
         return ToolResult.err(
             f"python_script: timed out after {int(timeout_s)}s; "
-            f"trim loops / raise timeout"
+            f"trim loops / raise timeout",
+            # F7：超时统一分类 —— python_script 自身的执行超时属 command
+            # 超时（脚本跑起来了但没按时完成）。与 bash/run_command 同形状，
+            # 供 run_steps.timeout_kind/timeout_ms 统一分组统计。
+            timeout_kind="command",
+            timeout_ms=int(timeout_s * 1000),
         )
 
     stdout = result.get("stdout") or ""

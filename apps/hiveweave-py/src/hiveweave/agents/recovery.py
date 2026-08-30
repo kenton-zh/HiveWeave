@@ -433,6 +433,17 @@ async def handle_error(
         except Exception as e:
             log.debug("run_ledger.error_run_failed", error=str(e))
 
+    # F6（平台修复计划 2026-08-30）：error 路径的用量同样要落账 ——
+    # LLM 层出错时 streamer 返回 error result，正常路径的 record_rounds
+    # 不会执行（agent.py 只在 status 分支前统落一次 success 侧 usage）……
+    # 实测 r4：04:00–05:00 四 run 全 error、llm_usage 0 条，成本账本在故障
+    # 时段完全失明。此处把 streamer 已推送到 _pending_usage 的每轮 usage
+    # 补落库（与 cancel / safety_timeout 路径共用 _flush_pending_usage）。
+    try:
+        await _flush_pending_usage(agent, reason="error")
+    except Exception as e:
+        log.warning("usage_flush_on_error_failed", agent_id=agent.id, error=str(e))
+
     log.error(
         "llm_error",
         agent_id=agent.id,

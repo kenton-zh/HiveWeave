@@ -42,9 +42,36 @@ from .doom_loop import (
     fail_signature_for_round,
     readonly_fingerprint,
 )
+# F8：advisory 重复提醒（3/5/8，never block，per-agent 计数）
+from .advisory import advisory_guard
 from .types import DeltaCallback, ToolCallCallback
 
 log = structlog.get_logger(__name__)
+
+
+def _round_fact_flags(
+    tool_results: list[dict[str, Any]], error_ids: set[str]
+) -> dict[str, bool]:
+    """F4：从本轮工具回执聚合正交事实位（runner_failed / command_failed /
+    blocked）。供 F8 advisory 生成归因一句话。best-effort：任何失败回执带
+    blocked=true 即 blocked；优先 runner_failed（DSH 顺序：runner 失败优先
+    于 denial —— 命令没跑起来时只能记 runner）。
+    """
+    flags = {"runner_failed": False, "command_failed": False, "blocked": False}
+    try:
+        for tr in tool_results:
+            tid = tr.get("tool_call_id") or ""
+            if tid and tid not in error_ids:
+                continue
+            if tr.get("blocked"):
+                flags["blocked"] = True
+            if tr.get("runner_failed"):
+                flags["runner_failed"] = True
+            elif tr.get("command_failed"):
+                flags["command_failed"] = True
+    except Exception:
+        pass
+    return flags
 
 
 def _is_valid_json_arguments(arguments: Any) -> bool:
@@ -189,6 +216,9 @@ class ToolLoopMixin:
         """
         # 使用调用方传入的上限，回退到实例默认值
         rounds_cap = max_tool_rounds if max_tool_rounds else self.max_tool_rounds
+        # F8：新 run（新一轮用户消息/唤醒）重置 advisory 计数 —— 计数只在
+        # 同一轮内追踪连续失败（对齐 DSH「new user prompt resets」）。
+        advisory_guard.reset_for_user_message(agent_id)
         text_acc = ""
         thinking_acc = ""
         tool_history: list[dict] = []
@@ -1180,6 +1210,57 @@ class ToolLoopMixin:
                         "stall_break": True,
                         "stall_reason": stall_reason,
                     }
+
+                # F8（平台修复计划 2026-08-30）：advisory 重复工具失败提醒 —
+                # 硬门（doom/stall）之前先给软提醒（3/5/8，never block）。
+                # 计数按 (agent, tool, canonical args)；提醒附上次失败归因
+                # （来自本轮工具回执的 F4 事实位），注入 messages 让下一轮
+                # LLM 请求看到。per-agent 独立，不阻断本轮。
+                if error_ids:
+                    _advisory_attribution = ""
+                    try:
+                        # F4 事实位 → 一句话归因（先 runner 后 command）
+                        _rf = _round_fact_flags(tool_results, error_ids)
+                        if _rf.get("runner_failed"):
+                            _advisory_attribution = (
+                                "runner_failed: 命令未执行（执行器/方言/权限/审批）"
+                            )
+                        elif _rf.get("command_failed"):
+                            _advisory_attribution = (
+                                "command_failed: 命令执行了但失败（业务/测试未过）"
+                            )
+                        elif _rf.get("blocked"):
+                            _advisory_attribution = (
+                                "blocked: 平台护栏拒绝（权限/沙箱/安全）"
+                            )
+                    except Exception:
+                        _advisory_attribution = ""
+                    _adv_hits = []
+                    for _tc in tool_calls:
+                        _tid = _tc.get("id") or ""
+                        if _tid not in (error_ids or set()):
+                            continue
+                        _at = advisory_guard.record_failure(
+                            agent_id,
+                            _tc.get("name") or "",
+                            _tc.get("arguments"),
+                            _advisory_attribution,
+                        )
+                        if _at:
+                            _adv_hits.append(_at)
+                            log.info(
+                                "advisory_repeat_tool_reminder",
+                                agent_id=agent_id,
+                                tool=_tc.get("name") or "",
+                                round=round_num,
+                            )
+                    if _adv_hits:
+                        messages.append(
+                            {"role": "system", "content": " ".join(_adv_hits)}
+                        )
+                        tool_turn_acc.append(
+                            {"role": "assistant", "content": " ".join(_adv_hits)}
+                        )
 
                 # 连续无文字轮次检测
                 if not new_text:

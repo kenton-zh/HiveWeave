@@ -44,14 +44,21 @@ MAX_CAPTURE_BYTES = 1_048_576    # 1MB — bash 专用轻量截断阈值
 # Pydantic 模型默认值、execute_bash/run_command/python_script 的兜底分支、
 # 以及 executor.py 的 TOOL_PARAM_SCHEMAS 说明都从这里取数，避免"声明"与
 # "实际执行"两处漂移。bash/pwsh 共享 BashParams → 同为 500s。
+# F7（平台修复计划 2026-08-30）：统一三档阈值 —— bash/pwsh/脚本/命令
+# 全部对齐 30s / 120s / 600s 三档，不再按出现顺序随手定值：
+#   bash/pwsh/bash_main/pwsh_main : 600s（重档 —— 慢 build/test 面给足时间）
+#   python_script                 : 120s（中档 —— 早于 streaming-zombie 收口，
+#                                     脚本超时下放给 command 超时分类）
+#   run_command                   : 120s（中档 —— 显式 cwd 逃生口）
+# 5s-600s 的输入钳制与既有一致；MAX_TIMEOUT_S=600 即档位上限。
 TOOL_DEFAULT_TIMEOUT_MS: dict[str, int] = {
-    "bash": 500_000,          # 慢 build/test 面给足时间
-    "pwsh": 500_000,
-    "bash_main": 500_000,
-    "pwsh_main": 500_000,
-    "python_script": 240_000,  # 脚本 240s —— 低于 STREAMING_ZOMBIE_TIMEOUT_MS(300s)
-    # 留 60s 余量：静默跑满 300s 的脚本不会与 streaming-zombie 同刻被误判中断。
-    "run_command": 120_000,    # 显式 cwd 逃生口保持默认 120s
+    "bash": 600_000,          # 重档：慢 build/test 面给足时间
+    "pwsh": 600_000,
+    "bash_main": 600_000,
+    "pwsh_main": 600_000,
+    "python_script": 120_000,  # 中档 —— 低于 STREAMING_ZOMBIE_TIMEOUT_MS(300s)
+    # 留足余量：静默跑满 300s 的脚本不会与 streaming-zombie 同刻被误判中断。
+    "run_command": 120_000,    # 中档：显式 cwd 逃生口保持默认 120s
 }
 # P2-1 fix: 非零退出时返回 stdout/stderr 各自的尾部 4KB（tail 而非 head），
 # 让 agent 看到真正的报错信息（编译错误、堆栈通常在输出末尾），避免盲目重试。
@@ -328,7 +335,7 @@ async def _run_registered_dev_server(
             )
             from hiveweave.services.acl_sandbox.service import spawn_confined
 
-            cmd2, extra_env, prep_err = prepare_spawn_command(
+            cmd2, extra_env, prep_err, _inj_meta = prepare_spawn_command(
                 command, project_id=project_id, preferred_port=port
             )
             if prep_err:
@@ -1648,13 +1655,24 @@ async def execute_bash(
         )
 
     if result.get("error"):
-        return {"success": False, "output": "",
-                "error": f"Error: {result['error']}\n{cwd_hint}"}
+        # F4：runner 失败（命令没跑起来）—— spawn 失败 / 方言 / 沙箱拒绝。
+        # 错误已带原因，标记 runner_failed 供收纳事实位（stall 归因先于
+        # denial，对齐 DSH RunnerFailureRule 顺序）。
+        return {
+            "success": False, "output": "",
+            "error": f"Error: {result['error']}\n{cwd_hint}",
+            "runner_failed": True,
+        }
 
     if result["timed_out"]:
-        return {"success": False, "output": "",
-                "error": "Error: Command timed out after "
-                         f"{int(timeout_s)} seconds\n{cwd_hint}"}
+        # F7：超时统一分类 —— command 超时（命令跑起来但没按时完成）。
+        return {
+            "success": False, "output": "",
+            "error": "Error: Command timed out after "
+                     f"{int(timeout_s or 0)} seconds\n{cwd_hint}",
+            "timeout_kind": "command",
+            "timeout_ms": int((timeout_s or 0) * 1000),
+        }
 
     output = _truncate_output(result["output"])
     exit_code = result["exit_code"]
@@ -1688,6 +1706,8 @@ async def execute_bash(
         "output": f"{body}\n\n{cwd_hint}\nExit code: {exit_code}",
         "error": error_msg,
         "exit_code": exit_code,
+        # F4：命令执行了但失败（非零退出 = command_failed，不是 runner 失败）
+        "command_failed": True,
     }
 
 
@@ -1776,12 +1796,17 @@ async def execute_run_command(
         result = await _run_native(command, full_cwd, timeout_s)
 
     if result.get("error"):
+        # F4：runner 失败（命令没跑起来）—— spawn 失败 / 沙箱拒绝。
         return {"success": False, "output": "",
-                "error": f"Error: {result['error']}"}
+                "error": f"Error: {result['error']}",
+                "runner_failed": True}
 
     if result["timed_out"]:
+        # F7：command 超时（命令跑起来但未按时完成）。
         return {"success": False, "output": "",
-                "error": f"Error: Command timed out after {timeout_s} seconds"}
+                "error": f"Error: Command timed out after {timeout_s} seconds",
+                "timeout_kind": "command",
+                "timeout_ms": int((timeout_s or 0) * 1000)}
 
     output = _truncate_output(result["output"])
     exit_code = result["exit_code"]
@@ -1811,6 +1836,8 @@ async def execute_run_command(
         "output": f"{body}\n\nExit code: {exit_code}",
         "error": error_msg,
         "exit_code": exit_code,
+        # F4：命令执行了但失败（非零退出 = command_failed）
+        "command_failed": True,
     }
 
 
@@ -1866,7 +1893,7 @@ class BashParams(BaseModel):
         le=600000,
         description=(
             "Foreground only (5s–10min). Ignored when background=true. "
-            "Default: 500000 (8min). Max: 600000 (10 min). Values 1-600 "
+            "Default: 600000 (10min). Max: 600000 (10 min). Values 1-600 "
             "are treated as seconds (e.g. 30 = 30s). The executor kills "
             "the command on expiry."
         ),
@@ -2557,6 +2584,7 @@ async def _bash_background(
     project_id: str | None,
     verify_tid: str | None,
     dialect: str = "bash",
+    injection_meta: dict | None = None,
 ) -> ToolResult:
     """Run bash off the org turn; attestations still issue when the job finishes."""
     from hiveweave.services.offturn import (
@@ -2619,6 +2647,14 @@ async def _bash_background(
             dialect=dialect,
             guard_ask_resolved=ask_resolved,
         )
+        # F2：off-turn 后台同前台——平台改写命令一并回显给 Agent
+        if injection_meta:
+            _inote = injection_meta.get("note") or ""
+            if result.get("output"):
+                result["output"] = f"{result['output']}\n\n{_inote}"
+            elif result.get("error"):
+                result["error"] = f"{result['error']}\n\n{_inote}"
+            result["injection_applied"] = bool(injection_meta.get("injected"))
         _update_cwd_failure_streak(
             agent_id, exec_ws, bool(result.get("success"))
         )
@@ -2716,7 +2752,7 @@ async def _shell_tool_impl(
 
     project_id = await get_project_id(agent_id)
     raw_cmd = params.command or ""
-    cmd, _env, reserved_err = prepare_spawn_command(
+    cmd, _env, reserved_err, inj_meta = prepare_spawn_command(
         raw_cmd, project_id=project_id
     )
     if reserved_err:
@@ -2736,6 +2772,7 @@ async def _shell_tool_impl(
             project_id=project_id,
             verify_tid=verify_tid,
             dialect=dialect,
+            injection_meta=inj_meta,
         )
 
     # 前台尾部 &：长驻服务走注册 spawn；其余必须 offturn job，禁止 shell 脱管。
@@ -2748,6 +2785,7 @@ async def _shell_tool_impl(
             project_id=project_id,
             verify_tid=verify_tid,
             dialect=dialect,
+            injection_meta=inj_meta,
         )
 
     result = await execute_bash(
@@ -2759,6 +2797,15 @@ async def _shell_tool_impl(
         agent_id=agent_id,
         dialect=dialect,
     )
+    # F2：平台改写后的最终命令回显 —— 让 Agent 看得见这双手
+    # （既有 result_excerpt 落的是 stdout，命令改写只能显式拼接）。
+    if inj_meta:
+        note = inj_meta.get("note") or ""
+        if result.get("output"):
+            result["output"] = f"{result['output']}\n\n{note}"
+        elif result.get("error"):
+            result["error"] = f"{result['error']}\n\n{note}"
+        result["injection_applied"] = bool(inj_meta.get("injected"))
     # D4: track consecutive failures per (agent_id, cwd)
     _streak_hint = _update_cwd_failure_streak(
         agent_id, exec_ws, bool(result.get("success"))
@@ -2788,6 +2835,15 @@ async def _shell_tool_impl(
     meta = _attestation_fields_from_note(attest_note)
     banner = meta.get("banner") or ""
     public = _attestation_public_extra(meta)
+    # F4/F7：工具执行事实位透传到 ToolResult（runner/command/注入/超时）
+    _ff = {
+        k: result.get(k)
+        for k in (
+            "runner_failed", "command_failed", "injection_applied",
+            "timeout_kind", "timeout_ms",
+        )
+        if result.get(k) is not None
+    }
     return _shell_tool_result(
         success=bool(result.get("success")),
         blocked=bool(result.get("blocked")),
@@ -2797,6 +2853,7 @@ async def _shell_tool_impl(
         suffix=attest_note,
         public=public,
         streak_hint=_streak_hint,
+        fact_flags=_ff or None,
     )
 
 
@@ -2814,6 +2871,7 @@ def _shell_tool_result(
     suffix: str,
     public: dict[str, Any],
     streak_hint: str = "",
+    fact_flags: dict[str, Any] | None = None,
 ) -> ToolResult:
     """Command ok + VERIFY belt reject must fail the tool, not look like a pass."""
     if success:
@@ -2829,7 +2887,13 @@ def _shell_tool_result(
         # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
         # stall 检测分流，文本/exit code 语义与 err 一致。
         return ToolResult.blocked_err(err_msg, **public)
-    return ToolResult.err(err_msg, **public)
+    # F4/F7：事实位透传（runner_failed / command_failed / injection_applied /
+    # timeout_kind / timeout_ms）—— 供 run_steps 收纳，stall 归因不再靠
+    # 猜退出码。
+    _kw: dict[str, Any] = dict(public)
+    if fact_flags:
+        _kw.update(fact_flags)
+    return ToolResult.err(err_msg, **_kw)
 
 
 # ── pwsh 工具（DSH_33 P0：声明式双 Consumer，不做方言转译）──────────
@@ -2967,7 +3031,7 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
     from hiveweave.tools.helpers import get_project_id
 
     project_id = await get_project_id(agent_id)
-    cmd, _env, reserved_err = prepare_spawn_command(
+    cmd, _env, reserved_err, inj_meta = prepare_spawn_command(
         params.command, project_id=project_id
     )
     if reserved_err:
@@ -2985,6 +3049,14 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         agent_id=agent_id,
         project_id=project_id,
     )
+    # F2：平台改写后的最终命令回显 —— 让 Agent 看得见这双手
+    if inj_meta:
+        note = inj_meta.get("note") or ""
+        if result.get("output"):
+            result["output"] = f"{result['output']}\n\n{note}"
+        elif result.get("error"):
+            result["error"] = f"{result['error']}\n\n{note}"
+        result["injection_applied"] = bool(inj_meta.get("injected"))
     # D4: track consecutive failures per (agent_id, cwd)
     _effective_cwd = str(Path(exec_ws) / params.cwd) if params.cwd else exec_ws
     _streak_hint = _update_cwd_failure_streak(
@@ -3014,6 +3086,15 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
     meta = _attestation_fields_from_note(attest_note)
     banner = meta.get("banner") or ""
     public = _attestation_public_extra(meta)
+    # F4/F7：工具执行事实位透传到 ToolResult
+    _ff = {
+        k: result.get(k)
+        for k in (
+            "runner_failed", "command_failed", "injection_applied",
+            "timeout_kind", "timeout_ms",
+        )
+        if result.get(k) is not None
+    }
     return _shell_tool_result(
         success=bool(result.get("success")),
         blocked=bool(result.get("blocked")),
@@ -3023,5 +3104,6 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         suffix=attest_note,
         public=public,
         streak_hint=_streak_hint,
+        fact_flags=_ff or None,
     )
 

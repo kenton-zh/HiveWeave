@@ -478,6 +478,25 @@ PROJECT_DB_TABLES = [
     # P2-1: 既有库迁移 — run_steps 增加工具参数原文摘录列（观测性，
     # 截断 200 字符；120s 超时命令此前只留 hash 事后不可考）
     """ALTER TABLE run_steps ADD COLUMN tool_args_excerpt TEXT""",
+    # F4（平台修复计划 2026-08-30）：三组正交事实位 — 退出码非零本身永远
+    # 不足以区分「runner 失败（命令没跑起来）」与「command 失败（跑了但没过）」。
+    # 错误文案按事实位合成而非按退出码推断（对齐 DSH RunnerFailureRule）：
+    #   runner_failed    — 命令未执行（参数注入破坏 / 方言不支持 / 权限 / 审批 /
+    #                       runner 自身故障，如 [No tool executor]）
+    #   command_failed   — 命令执行了但失败（测试未过 / 断言失败 / 业务错误）
+    #   injection_applied— 平台是否改写/尝试改写这条命令（改写内容记录在
+    #                       result_excerpt，回显给 Agent 看得见这双手）
+    """ALTER TABLE run_steps ADD COLUMN runner_failed INTEGER DEFAULT 0""",
+    """ALTER TABLE run_steps ADD COLUMN command_failed INTEGER DEFAULT 0""",
+    """ALTER TABLE run_steps ADD COLUMN injection_applied INTEGER DEFAULT 0""",
+    # F7（平台修复计划 2026-08-30）：超时统一分类 — timeout_kind ∈
+    # （runner / command / wait）+ timeout_ms，与 F4 事实位正交可组合。
+    """ALTER TABLE run_steps ADD COLUMN timeout_kind TEXT""",
+    """ALTER TABLE run_steps ADD COLUMN timeout_ms INTEGER""",
+    # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记。run 首请求
+    # cache_read=0 且 cache_creation=0 时打 cold_start=1，让「前缀重建成本」
+    # 可见可统计（r4：20 run 首请求零命中，合计 ~1.7M tokens 前缀重建无账）。
+    """ALTER TABLE llm_usage ADD COLUMN cold_start INTEGER DEFAULT 0""",
     # ── Task Transactional Outbox ───────────────────────────
     # 每次 task 状态转换原子写入事件；relay 读取未投递事件并通知相关方
     """

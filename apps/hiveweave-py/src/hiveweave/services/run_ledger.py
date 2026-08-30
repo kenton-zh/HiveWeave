@@ -191,12 +191,24 @@ class RunLedger:
         result_size: int | None = None,
         error: str | None = None,
         result_excerpt: str | None = None,
+        *,
+        runner_failed: bool | None = None,
+        command_failed: bool | None = None,
+        injection_applied: bool | None = None,
+        timeout_kind: str | None = None,
+        timeout_ms: int | None = None,
     ) -> None:
         """Record the end of a step.
 
         result_excerpt: TEST10 观测性修复 — 截断 2KB 的结果摘录。
         此前 run_steps 只存 result_hash/size，conversation 裁剪后
         约 12% 的工具结果在 DB 中完全不可找回，审计/排障无据可查。
+
+        F4（平台修复计划 2026-08-30）：三组正交事实位 + F7 超时分类。
+        ``runner_failed`` / ``command_failed`` / ``injection_applied`` /
+        ``timeout_kind`` / ``timeout_ms`` 均 best-effort 落库；
+        None = 不写（保持既有缺省），调用方只在能确定时传值 —— 未确定
+        不得臆断，宁可留空也不给错误归因（对齐 DSH「致命证据优先于拒绝」）。
         """
         now = _now_ms()
         if result_excerpt and len(result_excerpt) > 2048:
@@ -222,6 +234,34 @@ class RunLedger:
             )
             params = [status, result_hash, result_size, result_excerpt, error,
                       now, duration, step_id]
+            # F4 事实位 / F7 超时分类 —— 允许为主更新字段拼接。
+            if any(v is not None for v in (
+                runner_failed, command_failed, injection_applied,
+                timeout_kind, timeout_ms,
+            )):
+                sql = (
+                    "UPDATE run_steps SET status = ?, result_hash = ?, "
+                    "result_size = ?, result_excerpt = ?, error = ?, "
+                    "ended_at = ?, duration_ms = ?, "
+                    "runner_failed = COALESCE(?, runner_failed), "
+                    "command_failed = COALESCE(?, command_failed), "
+                    "injection_applied = COALESCE(?, injection_applied), "
+                    "timeout_kind = COALESCE(?, timeout_kind), "
+                    "timeout_ms = COALESCE(?, timeout_ms) "
+                    "WHERE id = ?"
+                )
+                params = [
+                    status, result_hash, result_size, result_excerpt, error,
+                    now, duration,
+                    # None = 未确定 → 传 SQL NULL，COALESCE 保留既有值
+                    # （否则 COALESCE(0, existing) 会覆盖先前写入的 1）。
+                    None if runner_failed is None else (1 if runner_failed else 0),
+                    None if command_failed is None else (1 if command_failed else 0),
+                    None if injection_applied is None else (1 if injection_applied else 0),
+                    timeout_kind,
+                    timeout_ms,
+                    step_id,
+                ]
             # M3 有界重试：仅对 sqlite3.OperationalError（锁竞争/瞬断，db 层
             # busy_timeout=5s 之后的第二道保险）重试 2 次，50/100ms 退避。
             # ProjectDbError（workspace 驱逐等）重试无意义，直接交给外层

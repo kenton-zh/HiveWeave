@@ -198,7 +198,7 @@ def test_category_to_wake_event():
 
 def test_spawn_proxy_rewrites_bare_vite():
     clear_registry_for_tests()
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "npx vite --host 0.0.0.0", project_id="p-spawn"
     )
     assert err is None
@@ -210,7 +210,7 @@ def test_spawn_proxy_rewrites_bare_vite():
 
 
 def test_spawn_proxy_rejects_reserved_explicit():
-    cmd, env, err = prepare_spawn_command(
+    cmd, env, err, _inj = prepare_spawn_command(
         "npx vite --port 5173", project_id="p-spawn"
     )
     assert err is not None

@@ -47,7 +47,7 @@ from .paths import (
     _worktree_binding_under_project,
     _worktree_path,
 )
-from .git_cmd import _current_branch, _git, _resolve_base_branch
+from .git_cmd import _current_branch, _git, _resolve_base_branch, _target_tip_short
 from .porcelain import (
     _porcelain_non_hiveweave_dirty,
     _porcelain_tracked_dirty,
@@ -109,6 +109,7 @@ _PATCH_NAMES = frozenset({
     "_try_reattach_worktree",
     "_project_db_if_exists",
     "_resolve_base_branch",
+    "_target_tip_short",
     "_has_git",
     "_worktree_path",
     "_slugify",

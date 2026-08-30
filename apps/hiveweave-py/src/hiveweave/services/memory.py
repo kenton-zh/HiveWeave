@@ -646,6 +646,16 @@ class MemoryService:
         project_mems = await self.get_project_memories(project_id)
         if not project_mems:
             return None
+        # F10（平台修复计划 2026-08-30）：失败签名不进 Project Constitution
+        # （签名是工具调用期经 known_signature_hint 前置检索的，不需要每轮
+        # 注入；且签名条目随项目运行单调增长，进 constitution 会挤占合法
+        # 内容、浪费每轮 token）。
+        project_mems = [
+            m for m in project_mems
+            if (m.get("type") or "") != "failure_signature"
+        ]
+        if not project_mems:
+            return None
         items = "\n".join(
             f"- [{m['type']}] {self._truncate(m['content'])}" for m in project_mems)
         return f"## Project Constitution (Shared)\n{items}"

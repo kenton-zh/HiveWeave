@@ -371,6 +371,19 @@ async def lifespan(app: FastAPI):
         log.warning("console_signal_guard_failed", error=str(e))
     log.info("app_starting", port=settings.port, code_version=_code_version())
 
+    # 0a. F14（平台修复计划 2026-08-30）：记录源码树指纹 —— 把「已重载」
+    #     变成可查询事实位。进程存活期间启动指纹不变；源码在磁盘上被改动
+    #     后 code_drift() 立即能探测出「变更未重载」，由 get_platform_state
+    #     与 CEO 视图显著告警（r4 审计：修复写了进程没重载，旧代码继续跑）。
+    try:
+        from hiveweave.services.code_fingerprint import (
+            record_startup_fingerprint,
+        )
+
+        record_startup_fingerprint()
+    except Exception as e:
+        log.warning("code_fingerprint_startup_failed", error=str(e))
+
     # 0. slack-clone_01 P0-2: 登记平台宿主进程保护集（自身 + 祖先链 +
     #    HIVEWEAVE_PROTECTED_PIDS）。kill 族命令命中受保护 PID 一律 deny，
     #    不受规则开关影响（底线层，防 taskkill //PID 误杀后端）。
@@ -380,6 +393,24 @@ async def lifespan(app: FastAPI):
         init_process_protection()
     except Exception as e:
         log.warning("command_guard_init_failed", error=str(e))
+
+    # 0b. F3（平台修复计划 2026-08-30）：启动自检 —— 注册清单 ↔ 可调用
+    #     实现的对账。出现「已注册但不可调用」的工具 = 对 Agent 的承诺
+    #     不兑现（r4 观察：工具表有、调用必死），启动即红线告警。
+    try:
+        from hiveweave.tools.executor import ToolExecutor
+
+        dead = ToolExecutor.audit_registered_tools()
+        if dead:
+            log.warning(
+                "tool_registry_dead_tools",
+                count=len(dead),
+                tools=dead,
+            )
+        else:
+            log.info("tool_registry_audit_ok", registered="all_wired")
+    except Exception as e:
+        log.warning("tool_registry_audit_failed", error=str(e))
 
     # 0b. 宿主环境探测（platform-issue-remediation Phase 0：T3.2/T3.3 前置）。
     #    启动时把「这台宿主能做什么」探成不可变结果；单条探测失败不炸启动

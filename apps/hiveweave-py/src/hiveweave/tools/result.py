@@ -32,6 +32,16 @@ class ToolResult:
     error: str | None = None
     blocked: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+    # F4（平台修复计划 2026-08-30）：正交事实位 —— 退出码非零本身不足以
+    # 区分「runner 失败（命令没跑起来）」与「command 失败（跑了但没过）」。
+    # 工具层能确定时填真；未确定保持 None（缺省），由上层按证据合成，
+    # 绝不臆断。None → 不落库（run_steps 保持缺省）。
+    runner_failed: bool | None = None
+    command_failed: bool | None = None
+    injection_applied: bool | None = None
+    # F7：超时分类（runner / command / wait）+ 超时毫秒。
+    timeout_kind: str | None = None
+    timeout_ms: int | None = None
 
     # ── constructors ─────────────────────────────────────
 
@@ -75,6 +85,15 @@ class ToolResult:
         d.update(self.extra)
         # extra 不得覆盖 blocked（平台护栏标记不是工具自由字段）
         d["blocked"] = self.blocked
+        # F4/F7：事实位随 dict 透传（仅非 None —— None 表示「未确定」，
+        # 上层不应据此落库臆断的归因）。
+        for _k in (
+            "runner_failed", "command_failed", "injection_applied",
+            "timeout_kind", "timeout_ms",
+        ):
+            _v = getattr(self, _k, None)
+            if _v is not None:
+                d[_k] = _v
         return d
 
     def __repr__(self) -> str:

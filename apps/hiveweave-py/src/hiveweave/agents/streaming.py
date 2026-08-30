@@ -261,6 +261,9 @@ async def on_tool_call(
     if step_id:
         try:
             result_content = result.get("output") or ""
+            # F4（平台修复计划 2026-08-30）：正交事实位落库 —— 工具层能确定
+            # 时透传（runner_failed / command_failed / injection_applied），
+            # F7：超时分类（timeout_kind / timeout_ms）。None = 未确定，不写。
             await agent._run_ledger.record_step_end(
                 agent_id=agent.id,
                 step_id=step_id,
@@ -269,6 +272,11 @@ async def on_tool_call(
                 result_size=len(result_content),
                 error=result.get("error"),
                 result_excerpt=result_content or result.get("error"),
+                runner_failed=result.get("runner_failed"),
+                command_failed=result.get("command_failed"),
+                injection_applied=result.get("injection_applied"),
+                timeout_kind=result.get("timeout_kind"),
+                timeout_ms=result.get("timeout_ms"),
             )
         except Exception as e:
             log.debug("run_ledger.step_end_failed", error=str(e))

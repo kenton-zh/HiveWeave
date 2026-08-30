@@ -47,6 +47,7 @@ import hiveweave.tools.orchestration_tools  # noqa: F401 — registers messaging
 import hiveweave.tools.org_tools  # noqa: F401 — registers hire_agent, dismiss_agent, skills, etc.
 import hiveweave.tools.task_tools  # noqa: F401 — registers dispatch/submit/waive/cancel/…
 import hiveweave.tools.misc_tools  # noqa: F401 — registers git_worktree, legacy tasks, webfetch, etc.
+import hiveweave.tools.patch_delivery  # noqa: F401 — registers deliver_patch (F12 cross-repo channel)
 import hiveweave.tools.turn_tools  # noqa: F401 — commit_turn, defer_task_advance, ask/notify
 import hiveweave.tools.dev_server_tools  # noqa: F401 — start/stop/lookup_dev_server
 import hiveweave.tools.browse_tools  # noqa: F401 — browse (agent-browser Chromium CLI)
