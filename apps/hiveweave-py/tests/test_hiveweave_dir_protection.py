@@ -335,6 +335,49 @@ class TestSharedDirAccess:
         assert err_m is None
         assert _check_hiveweave_command(cmd_m) is False
 
+    def test_pytest_injected_ignore_before_pipe(self):
+        """Piped pytest must receive the excludes before the pipe, not after.
+
+        Tail-appending put them behind ``| Select-Object`` — PowerShell
+        then rejected them as positional args and the (green) test run
+        died (2026-08-30 DSH T1 evidence grind).
+        """
+        from hiveweave.services.process_registry import prepare_spawn_command
+
+        raw = "uv --project sidecar run python -m pytest tests/ -q 2>&1 | Select-Object -First 80"
+        cmd, _, err = prepare_spawn_command(raw, project_id="t")
+        assert err is None
+        assert "--ignore=.hiveweave" in cmd
+        pipe_pos = cmd.index("|")
+        assert cmd.index("--ignore=.hiveweave") < pipe_pos
+        assert "Select-Object -First 80" in cmd
+
+    def test_vitest_exclude_before_pipe(self):
+        """Same splice rule for vitest behind a pipe."""
+        from hiveweave.services.process_registry import prepare_spawn_command
+
+        raw = "npx vitest run 2>&1 | Out-String -Width 200"
+        cmd, _, err = prepare_spawn_command(raw, project_id="t")
+        assert err is None
+        pipe_pos = cmd.index("|")
+        assert cmd.index("--exclude") < pipe_pos
+
+    def test_pytest_flags_not_injected_into_earlier_segment(self):
+        """`pip install pytest-cov && pytest` must not be polluted (audit P2).
+
+        The runner token only counts at a segment boundary; a bare name
+        match inside an earlier segment (package name, file name) is
+        ignored, so the last true invocation gets the excludes.
+        """
+        from hiveweave.services.process_registry import prepare_spawn_command
+
+        raw = "pip install pytest-cov && python -m pytest tests/ -q"
+        cmd, _, err = prepare_spawn_command(raw, project_id="t")
+        assert err is None
+        seg2 = cmd.split("&&", 1)[1]
+        assert "--ignore=.hiveweave" in seg2
+        assert "--ignore" not in cmd.split("&&", 1)[0]
+
     def test_python_c_import_pytest_injected_ignore_not_blocked(self):
         from hiveweave.services.process_registry import prepare_spawn_command
         from hiveweave.tools.bash import (

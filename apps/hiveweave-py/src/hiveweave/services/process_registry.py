@@ -686,21 +686,51 @@ _PYTEST_RE = re.compile(
 )
 
 
+def _insert_after_runner(cmd: str, pattern: re.Pattern[str], flags: str) -> str:
+    """Splice runner flags in right after the runner token, not at string end.
+
+    Tail-appending corrupts piped commands — ``pytest … | Select-Object``
+    would receive the flags as Select-Object positional args. Runner
+    options are position-free, so insert after the matched token; fall
+    back to tail-append if no clean token exists.
+
+    Token discipline beyond ``\\b``: a match followed by ``-``/``.``/``/``
+    is part of a longer name (``pytest-cov``, ``vitest.config.ts``), not a
+    runner invocation. Among clean tokens the LAST one wins — compound
+    commands put the real invocation after setup segments
+    (``pip install pytest && python -m pytest tests/``).
+    """
+    chosen: re.Match[str] | None = None
+    for m in pattern.finditer(cmd):
+        nxt = cmd[m.end() : m.end() + 1]
+        if nxt == "" or nxt in " \t\n":
+            chosen = m
+    if chosen is None:
+        return f"{cmd.rstrip()} {flags}"
+    return (
+        f"{cmd[: chosen.end()].rstrip()} {flags} {cmd[chosen.end() :].lstrip()}"
+    ).strip()
+
+
 def _inject_hiveweave_test_exclude(command: str) -> str:
-    """Append runner-specific excludes so .hiveweave/ worktrees don't pollute."""
+    """Inject runner-specific excludes so .hiveweave/ worktrees don't pollute."""
     cmd = command or ""
     if ".hiveweave" in cmd.lower() and (
         "--exclude" in cmd or "--ignore" in cmd or "testPathIgnore" in cmd
     ):
         return cmd
     if _VITEST_RE.search(cmd) and "--exclude" not in cmd:
-        return f"{cmd.rstrip()} --exclude {_HIVEWEAVE_EXCLUDE_GLOB}"
+        return _insert_after_runner(
+            cmd, _VITEST_RE, f"--exclude {_HIVEWEAVE_EXCLUDE_GLOB}"
+        )
     if _JEST_RE.search(cmd) and "testPathIgnorePatterns" not in cmd:
-        return (
-            f"{cmd.rstrip()} --testPathIgnorePatterns=\\.hiveweave"
+        return _insert_after_runner(
+            cmd, _JEST_RE, "--testPathIgnorePatterns=\\.hiveweave"
         )
     if _PYTEST_RE.search(cmd) and "--ignore" not in cmd and "--ignore-glob" not in cmd:
-        return f"{cmd.rstrip()} --ignore=.hiveweave --ignore-glob=**/.hiveweave/**"
+        return _insert_after_runner(
+            cmd, _PYTEST_RE, "--ignore=.hiveweave --ignore-glob=**/.hiveweave/**"
+        )
     return cmd
 
 

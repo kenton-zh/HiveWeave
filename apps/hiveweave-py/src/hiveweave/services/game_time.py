@@ -231,7 +231,8 @@ async def _execute(project_id, sql, params=None):
 def _tool_quiet_cap_ms(tool_name: str) -> int:
     """执行中工具允许的最大静默间隔。
 
-    Declared tools: their budget + 60s. Foreground bash: MAX_TIMEOUT + 60s.
+    Declared tools: their budget + 60s. Foreground shells (bash / pwsh
+    family): MAX_TIMEOUT + 60s.
     Undeclared read/write/edit: long hang net (not the 5 min stream-idle /
     zombie default) so a live coding tool is not treated as a dead stream.
     """
@@ -243,7 +244,7 @@ def _tool_quiet_cap_ms(tool_name: str) -> int:
     declared = declared_timeout_s(tool_name)
     if declared is not None:
         return int((declared + 60.0) * 1000)
-    if tool_name in ("bash", "bash_main", "run_command"):
+    if tool_name in ("bash", "bash_main", "run_command", "pwsh", "pwsh_main"):
         from hiveweave.tools.bash import MAX_TIMEOUT_S
 
         return int((MAX_TIMEOUT_S + 60.0) * 1000)
