@@ -65,6 +65,60 @@ def make_module_id(project_id: str, sig: str) -> str:
 #: 稳定 —— 同签名只存一行，首个撞到的 agent 记在 source_agent_id 字段。
 _SIGNATURE_WRITER = "__failure_signature_pool__"
 
+#: 签名条目保留上限（P2 复审 2026-08-30）：签名单调累积，compaction/
+#: archive 只碰 scope='agent'，永不清理签名行。get_project_memories
+#: LIMIT 100，签名逼近上限会物理挤掉合法 constitution 条目。写入时
+#: 顺带裁剪到该上限（只删最老签名行，best-effort）。
+_SIGNATURE_MAX_ROWS = 50
+
+
+async def _trim_signature_rows(project_id: str) -> None:
+    """删最老签名行到 _SIGNATURE_MAX_ROWS 以内（幂等 best-effort）。"""
+    try:
+        from hiveweave.db import project as project_db
+        from hiveweave.services.memory import get_workspace_write_lock
+        from hiveweave.db import meta as meta_db
+
+        workspace = await meta_db.get_project_workspace(project_id)
+        if not workspace:
+            return
+        lock = await get_workspace_write_lock(workspace)
+        async with lock:
+            conn = await project_db.ensure_project_db(workspace)
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                cur = await conn.execute(
+                    "SELECT COUNT(*) AS n FROM memories "
+                    "WHERE scope = 'project' AND type = 'failure_signature'"
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                total = int(row["n"] or 0) if row else 0
+                excess = total - _SIGNATURE_MAX_ROWS
+                if excess > 0:
+                    cur = await conn.execute(
+                        "SELECT id FROM memories "
+                        "WHERE scope = 'project' AND type = 'failure_signature' "
+                        "ORDER BY created_at ASC, rowid ASC LIMIT ?",
+                        [excess],
+                    )
+                    ids = [r["id"] for r in await cur.fetchall()]
+                    await cur.close()
+                    if ids:
+                        ph = ",".join("?" * len(ids))
+                        await conn.execute(
+                            f"DELETE FROM memories WHERE id IN ({ph})", ids
+                        )
+                await conn.commit()
+            except Exception:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    pass
+                raise
+    except Exception as e:
+        log.warning("failure_signature.trim_failed", error=str(e))
+
 
 async def record_failure_signature(
     *,
@@ -120,6 +174,9 @@ async def record_failure_signature(
             sig=sig[:60],
             mem_id=mem_id,
         )
+        # P2 复审：写入顺带裁剪最老签名行到上限（防单调累积挤掉合法
+        # constitution；best-effort 不阻断）。
+        await _trim_signature_rows(project_id)
         return True
     except Exception as e:
         log.warning("failure_signature.broadcast_failed", error=str(e))
@@ -144,7 +201,6 @@ async def known_signature_hint(
 
         memory_service = MemoryService()
         mems = await memory_service.get_project_memories(project_id)
-        prefix = f"[失敗签名]" if False else "[失败签名]"
         for m in mems or []:
             if m.get("type") != "failure_signature":
                 continue
