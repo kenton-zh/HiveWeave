@@ -308,11 +308,18 @@ async def on_tool_call(
         # - end_turn: commit_turn 已接受 → 硬断本轮工具循环（BUG-3）
         # - blocked: 平台护栏/沙箱/权限拒绝（H3 stall 分流）——必须透传，
         #   否则 tool_exec 的 blocked_ids 永远为空（2026-08-13 审计 P0）。
-        # 这些键不会进入发给 LLM 的消息体 —— _execute_tools 重新组包时剥离。
+        # - runner_failed / command_failed / timeout_kind / timeout_ms：
+        #   F4/F7 事实位（修复计划 2026-08-30）——必须透传给 tool_exec，
+        #   否则 F8 advisory 归因拿不到「是墙的问题还是自己的问题」。
+        #   这些键不会进入发给 LLM 的消息体 —— provider 组包时白名单剥离。
         "success": result.get("success", False),
         "duplicate": result.get("duplicate", False),
         "end_turn": bool(result.get("end_turn")),
         "blocked": bool(result.get("blocked")),
+        "runner_failed": result.get("runner_failed"),
+        "command_failed": result.get("command_failed"),
+        "timeout_kind": result.get("timeout_kind"),
+        "timeout_ms": result.get("timeout_ms"),
         # Multimodal screenshot pixels (browse / assert_visual)
         "images": result.get("images"),
     }

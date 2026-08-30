@@ -643,10 +643,11 @@ async def git_worktree_merge_tool(
                 workspace_path,
             )
             if not _already:
-                # ref 已删：退而按 merge commit 历史判定
+                # ref 已删：退而按 merge commit 历史判定（P2 边界审计：
+                # --fixed-strings 字面匹配，防分支名含正则元字符误判）
                 _already, _anc = await _git(
-                    ["log", "-1", "--oneline", "--merges",
-                     f"--grep=^Merge branch '{_candidate}'"],
+                    ["log", "-1", "--oneline", "--merges", "--fixed-strings",
+                     f"--grep=Merge branch '{_candidate}'"],
                     workspace_path,
                 )
             if _already:

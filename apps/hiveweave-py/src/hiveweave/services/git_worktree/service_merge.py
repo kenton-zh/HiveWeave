@@ -537,10 +537,16 @@ class MergeMixin:
                     task_name: str | None = None,
                     target_branch: str = "main", *,
                     task_id: str | None = None) -> dict:
-        """Merge agent branch into target (git merge --no-edit), then cleanup.
+        """Merge agent branch into target (git merge --no-edit --no-ff), then cleanup.
 
         契约 09 RECONCILE: 用 --no-edit (非 ff-only), 成功后自动 remove worktree+分支.
         冲突时 abort, worktree 保留 — executor 在自己的 worktree 里合 main 解冲突.
+
+        F13b（修复计划 2026-08-30）：强制 --no-ff —— 短功能分支若被
+        fast-forward 合入则不产生 merge commit；删除 ref 后 merge 幂等
+        判据（git log --grep ^Merge branch 'X'）无法识别「已合入」，FF
+        盲区会让再次 merge 落入错误通道（边界审计 P1）。--no-ff 保证
+        每次实际合入留 merge commit，幂等判据闭环。
 
         task_name: DEPRECATED — 不再用于命名; 分支以 worktree 实际检出
         为准 (legacy slug 分支通吃), 仅作无 worktree 时的 legacy 兜底。
@@ -593,7 +599,7 @@ class MergeMixin:
             f.strip() for f in (files_out or "").split("\n") if f.strip()
         ] if ok_f else []
 
-        ok, merge_out = await _git(["merge", branch, "--no-edit"], workspace_path)
+        ok, merge_out = await _git(["merge", branch, "--no-edit", "--no-ff"], workspace_path)
         if not ok:
             fail = await _merge_failure_result(
                 workspace_path=workspace_path,
@@ -607,7 +613,7 @@ class MergeMixin:
             if fail is None:
                 # Quarantined untracked — retry once
                 ok, merge_out = await _git(
-                    ["merge", branch, "--no-edit"], workspace_path
+                    ["merge", branch, "--no-edit", "--no-ff"], workspace_path
                 )
                 if not ok:
                     fail = await _merge_failure_result(
@@ -768,8 +774,13 @@ class MergeMixin:
                 workspace_path,
             )
         else:
+            # P2（边界审计 2026-08-30）：--grep 用 --fixed-strings 字面匹配
+            # —— 分支名含正则元字符（. [ ] + 等）时，基本正则模式会误命中
+            # 其他分支的 merge 消息（false-positive → 跳过真实 merge、工作
+            # 丢失），或 `[` 不配对让 grep 报错。fixed-strings 只看字面。
             ok_anc, _anc_out = await _git(
-                ["log", "-1", "--oneline", "--merges", f"--grep=^Merge branch '{branch}'"],
+                ["log", "-1", "--oneline", "--merges", "--fixed-strings",
+                 f"--grep=Merge branch '{branch}'"],
                 workspace_path,
             )
             if not ok_anc:
@@ -863,7 +874,7 @@ class MergeMixin:
         ] if ok_f else []
 
         # Step 2: Merge with target_branch
-        ok, merge_out = await _git(["merge", branch, "--no-edit"], workspace_path)
+        ok, merge_out = await _git(["merge", branch, "--no-edit", "--no-ff"], workspace_path)
 
         if not ok:
             # Step 3a: Untracked on MAIN — quarantine + retry (NOT executor rework)
@@ -875,7 +886,7 @@ class MergeMixin:
                 )
                 if moved:
                     ok, merge_out = await _git(
-                        ["merge", branch, "--no-edit"], workspace_path
+                        ["merge", branch, "--no-edit", "--no-ff"], workspace_path
                     )
                 if not ok:
                     still = parse_untracked_overwrite(merge_out or "")

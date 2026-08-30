@@ -110,6 +110,17 @@ async def _trim_signature_rows(project_id: str) -> None:
                             f"DELETE FROM memories WHERE id IN ({ph})", ids
                         )
                 await conn.commit()
+                # P3（边界审计 2026-08-30）：trim 删行后失效 project 记忆
+                # 缓存 —— 否则 get_project_memories 30s 快照仍含已删签名，
+                # known_signature_hint 30s 内对已删签名仍返回 shared-fix。
+                try:
+                    from hiveweave.services.memory import MemoryService
+
+                    MemoryService.invalidate(
+                        project_id, scope="project"
+                    )
+                except Exception:
+                    pass
             except Exception:
                 try:
                     await conn.rollback()

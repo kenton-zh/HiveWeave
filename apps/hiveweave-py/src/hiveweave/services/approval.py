@@ -57,6 +57,10 @@ class PermissionTimeout(Exception):
 # 「不要重试」从文案变成机制（r4：文案已写"不要重试"，仍重试 6 次）。
 # 进程内 per-(agent, tool, args_hash) 记一次超时，TTL 内同指纹再次 request
 # 直接短路返回超时（不再等 120s）。周期惰性清理，防内存泄漏。
+# 语义更正（P3 边界审计 2026-08-30）：实现是「10min 进程窗口」而非严格
+# 「同 run」——标记不随 turn/run 边界清除。10min 窗口比单 run 更保守
+# （跨 run 的合法重发也会被挡），对 r4 的「同一审批反复空等」打击更彻底；
+# 若未来需要严格 run 作用域，在 tool_loop 首轮清空该 agent marks。
 _APPROVAL_TIMEOUT_MARK: dict[str, int] = {}  # key -> first_timeout_ms
 _APPROVAL_TIMEOUT_TTL_MS = 10 * 60 * 1000  # 10min 记忆窗口（一次 turn 内足够）
 _FINGERPRINT_CACHE_MAX = 512

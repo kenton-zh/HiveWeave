@@ -446,19 +446,16 @@ class OpenAIHandler(FormatHandler):
 
             if role == "tool":
                 # 白名单键（F8 复审 2026-08-30）：tool_msg 组包时携带的
-                # blocked/runner_failed/command_failed/success 只是 tool_loop
-                # 内部归因的侧信道（_round_fact_flags 用），**绝不能进 LLM
+                # blocked/runner_failed/command_failed 只是 tool_loop 内部
+                # 归因的侧信道（_round_fact_flags 用），**绝不能进 LLM
                 # 请求体** —— 严格网关对 tool 消息 schema 校验，未知键可能
                 # 整包 400（gateway-tool-id-400 先例）。只保留 OpenAI 兼容
-                # 通道要求的角色契约三键 + images（images 在下方转 pending）。
+                # 通道要求的角色契约三键；images 在下方转 pending。
                 cleaned = {
                     "role": role,
                     "content": msg.get("content", ""),
                     "tool_call_id": msg.get("tool_call_id", ""),
                 }
-                for _extra in ("name", "id"):
-                    if msg.get(_extra):
-                        cleaned[_extra] = msg[_extra]
                 out.append(cleaned)
                 if isinstance(images, list):
                     for img in images:

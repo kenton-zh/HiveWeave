@@ -83,6 +83,12 @@ class ToolExecMixin:
         budget_s 在工具声明了超时时收紧预算（turn 预算写死启用，
         见 constants.py 顶部说明）。
         bash/read/write/edit 不声明，不被 wait_for 包裹。
+
+        F4/F7（平台修复计划 2026-08-30）：事实位（blocked/runner_failed/
+        command_failed/…）**经返回的 tool_results 同步聚合** —— tool_msg 内
+        只保留 role/content/tool_call_id/images（消息契约纯净），事实位
+        由调用方 `_round_fact_flags(tool_results...)` 从每条 tool_msg 读取。
+        注意：tool_results 里的每条只携带能确定的位，未确定不写（None 不落）。
         """
         counts = poll_turn_counts if poll_turn_counts is not None else {}
         # 广播 tool_use 事件
@@ -146,14 +152,14 @@ class ToolExecMixin:
                 "tool_call_id": tc["id"],
             }
             # F4（平台修复计划 2026-08-30）：正交事实位透传到 tool_results
-            # —— blocke/runner_failed/command_failed 是 F8 advisory 归因的
-            # 数据源。这些键不会进 LLM 消息体（下游组装时剥离），只供
-            # tool_loop 的 _round_fact_flags 做归因聚合。
+            # —— blocked/runner_failed/command_failed 是 F8 advisory 归因的
+            # 数据源。这里**选择性**添加（只加证据充分的位；不给成功的调用
+            # 乱贴 success 键 —— 持久化 JSON 纯净度同消息契约）。下游
+            # provider 组包时白名单剥离；_round_fact_flags 消费它们。
             if not isinstance(result, BaseException):
                 for _fk in ("blocked", "runner_failed", "command_failed"):
                     if result.get(_fk):
                         tool_msg[_fk] = True
-                tool_msg["success"] = tc["id"] not in error_ids
             # Multimodal: preserve screenshot pixels for the next LLM round.
             images = None if isinstance(result, BaseException) else result.get("images")
             if images:
