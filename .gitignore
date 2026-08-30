@@ -132,6 +132,7 @@ reports/
 tasks/_tmp_*
 tasks/diag_*.py
 tasks/dsh*.py
+tasks/dsh-watch-state.json
 scripts/_tmp_*
 apps/hiveweave-py/scripts/mechanism_attribution.py
 apps/hiveweave-py/scripts/strip_reserved_tags.py
