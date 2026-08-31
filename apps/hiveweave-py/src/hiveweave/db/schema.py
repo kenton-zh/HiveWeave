@@ -493,10 +493,12 @@ PROJECT_DB_TABLES = [
     # （runner / command / wait）+ timeout_ms，与 F4 事实位正交可组合。
     """ALTER TABLE run_steps ADD COLUMN timeout_kind TEXT""",
     """ALTER TABLE run_steps ADD COLUMN timeout_ms INTEGER""",
-    # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记。run 首请求
-    # cache_read=0 且 cache_creation=0 时打 cold_start=1，让「前缀重建成本」
-    # 可见可统计（r4：20 run 首请求零命中，合计 ~1.7M tokens 前缀重建无账）。
-    """ALTER TABLE llm_usage ADD COLUMN cold_start INTEGER DEFAULT 0""",
+    # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记的 ALTER 已移至
+    # CREATE TABLE llm_usage 之后（见列表末尾）。迁移顺序铁律：任何
+    # ALTER TABLE <表> ADD COLUMN 必须排在该表的 CREATE TABLE 之后 ——
+    # 本列表按序执行，建表循环对 ALTER 异常静默吞（project.py），排错位
+    # 的 ALTER 在新库上报 "no such table" 被吞 → 列永远缺失 → 记账全断
+    # （TEST_DSH_37 六轮审计 P0-①：274 次调用零记账）。
     # ── Task Transactional Outbox ───────────────────────────
     # 每次 task 状态转换原子写入事件；relay 读取未投递事件并通知相关方
     """
@@ -589,6 +591,8 @@ PROJECT_DB_TABLES = [
     # ── LLM Token Metering ───────────────────────────────────
     # 每行 = 一次 LLM 请求。归属 agent/run/task/project 四级，
     # 覆盖主对话 / 压缩 / 子代理三条调用路径。best-effort 写入。
+    # F11 cold_start 直接进建表语句（新库原生带列）；旧库由紧随其后的
+    # ALTER 补列（旧库表已存在，ALTER 不会触发 "no such table"）。
     """
     CREATE TABLE IF NOT EXISTS llm_usage (
         id TEXT PRIMARY KEY,
@@ -605,10 +609,28 @@ PROJECT_DB_TABLES = [
         cache_creation_tokens INTEGER DEFAULT 0,
         total_tokens INTEGER DEFAULT 0,
         duration_ms INTEGER DEFAULT 0,
+        cold_start INTEGER DEFAULT 0,
         created_at INTEGER NOT NULL
     )
     """,
+    # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记。run 首请求
+    # cache_read=0 且 cache_creation=0 时打 cold_start=1，让「前缀重建成本」
+    # 可见可统计（r4：20 run 首请求零命中，合计 ~1.7M tokens 前缀重建无账）。
+    # 旧库迁移（新库由上方 CREATE 直接带列；ALTER 必须排在 CREATE 之后）。
+    """ALTER TABLE llm_usage ADD COLUMN cold_start INTEGER DEFAULT 0""",
 ]
+
+# ── Per-project DB 建表自检（迁移顺序缺陷防护）────────────────
+# ensure_project_db 建表后逐项核验：关键列缺失 = 迁移断裂 = 记账/事实位
+# 静默丢失，必须 fail-loud（启动即崩比静默断账好——TEST_DSH_37 P0-①
+# 教训：F11 的 ALTER 曾排在 CREATE 前，新库缺列导致 274 次调用零记账、
+# R3 命中率 0% 伪影、Token 页面只显示 2 行压缩数据）。
+# DSH 对照：deepseek-harness invariant 框架的启动自检同构
+# （packages/llm/token-meter/src/invariant.ts）。
+PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
+    "llm_usage": {"cold_start"},
+    "run_steps": {"runner_failed", "command_failed", "injection_applied", "timeout_kind", "timeout_ms"},
+}
 
 # ── Meta DB 索引 ────────────────────────────────────────────
 

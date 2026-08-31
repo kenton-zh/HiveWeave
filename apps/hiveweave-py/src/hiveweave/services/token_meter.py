@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any
@@ -171,12 +172,43 @@ class TokenMeter:
         try:
             await project_db.execute_transaction(agent_id, statements)  # type: ignore[arg-type]
         except Exception as e:
-            log.warning(
+            # 正交结果独立上报（DSH defensive-patterns:7-9 戒律）：记账失败
+            # 不得随 best-effort 静默蒸发 —— 升级 error 日志 + agent_events 落
+            # usage_recorder_failed 告警事件。TEST_DSH_37 P0-① 曾让 274 次调用
+            # 零记账且无任何痕迹，Token 页/命中率/税率全盲。
+            log.error(
                 "token_meter.record_rounds_failed",
                 agent_id=agent_id,
                 n=len(statements),
+                request_type=request_type,
+                run_id=run_id,
                 error=str(e),
             )
+            try:
+                await project_db.execute(
+                    agent_id,
+                    "INSERT INTO agent_events "
+                    "(id, agent_id, event_type, payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [
+                        str(uuid.uuid4()),
+                        agent_id,
+                        "usage_recorder_failed",
+                        json.dumps({
+                            "n_rounds": len(statements),
+                            "request_type": request_type,
+                            "run_id": run_id,
+                            "error": str(e)[:500],
+                        }),
+                        _now_ms(),
+                    ],
+                )
+            except Exception as ev_err:
+                log.error(
+                    "token_meter.failure_event_write_failed",
+                    agent_id=agent_id,
+                    error=str(ev_err),
+                )
 
     async def record_compaction(
         self,
@@ -232,8 +264,39 @@ class TokenMeter:
                 ],
             )
         except Exception as e:
-            log.warning("token_meter.record_compaction_failed",
-                        agent_id=agent_id, error=str(e))
+            # 与 record_rounds 同口径（正交结果独立上报）：压缩记账失败也
+            # 不得静默蒸发 —— error 日志 + agent_events 落告警事件。
+            log.error(
+                "token_meter.record_compaction_failed",
+                agent_id=agent_id,
+                kind=kind,
+                error=str(e),
+            )
+            try:
+                await project_db.execute(
+                    agent_id,
+                    "INSERT INTO agent_events "
+                    "(id, agent_id, event_type, payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [
+                        str(uuid.uuid4()),
+                        agent_id,
+                        "usage_recorder_failed",
+                        json.dumps({
+                            "n_rounds": 1,
+                            "request_type": f"compaction_{kind}",
+                            "run_id": None,
+                            "error": str(e)[:500],
+                        }),
+                        _now_ms(),
+                    ],
+                )
+            except Exception as ev_err:
+                log.error(
+                    "token_meter.failure_event_write_failed",
+                    agent_id=agent_id,
+                    error=str(ev_err),
+                )
 
     # ── 聚合查询 ─────────────────────────────────────────────
 

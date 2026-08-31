@@ -18,7 +18,11 @@ import aiosqlite
 from pathlib import Path
 from typing import Any
 
-from hiveweave.db.schema import PROJECT_DB_TABLES, PROJECT_DB_INDEXES
+from hiveweave.db.schema import (
+    PROJECT_DB_TABLES,
+    PROJECT_DB_INDEXES,
+    PROJECT_DB_COLUMN_CHECKS,
+)
 from hiveweave.db import meta as meta_db
 
 
@@ -119,6 +123,25 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
                 # ALTER TABLE ADD COLUMN fails if column exists — safe to ignore
                 if not sql.strip().upper().startswith("ALTER"):
                     raise
+
+        # 建表自检（TEST_DSH_37 P0-① 防护）：关键列缺失 = 迁移断裂（如 ALTER
+        # 排在 CREATE 前被上面的吞异常吃掉），后续 INSERT 会全部静默失败 ——
+        # 记账/事实位丢失必须 fail-loud，启动即崩比静默断账好。
+        for table, required_cols in PROJECT_DB_COLUMN_CHECKS.items():
+            cur = await conn.execute(f"PRAGMA table_info({table})")
+            rows = await cur.fetchall()
+            cols = {row[1] for row in rows}
+            missing = required_cols - cols
+            if missing:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass  # best-effort：连接关闭失败不掩盖根因
+                raise ProjectDbError(
+                    f"schema self-check failed: table '{table}' missing "
+                    f"column(s) {sorted(missing)} — migration broken, "
+                    f"INSERTs would fail silently (TEST_DSH_37 P0-1)"
+                )
 
         # Create indexes
         for sql in PROJECT_DB_INDEXES:
