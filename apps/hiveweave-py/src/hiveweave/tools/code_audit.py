@@ -128,9 +128,14 @@ async def request_code_audit_tool(
 
     if not result.get("audited"):
         reason = result.get("reason") or "unknown"
+        # s3-clone_06 P0-1/P0-3：fail-loud 之后"直接 submit"会被门禁拒——
+        # 旧文案（soft gate — does not block）误导 Agent 走一条必然失败的路。
         return ToolResult.ok(
             f"审计未执行: {reason}. "
-            "Next: retry request_code_audit once, or submit_task anyway "
-            "(soft gate — does not block)."
+            "Next: retry request_code_audit（审计对真实 diff 需 30-90s，"
+            "超时帽见 CODE_AUDIT_LLM_TIMEOUT_S）；若反复失败，submit_task "
+            "会被门禁拦下，需请 coordinator 走 "
+            "waive_attestation(taskId=..., reason=...) 并附上你已有的替代"
+            "证据（如 test_run）。"
         )
     return _format_verdict(result)

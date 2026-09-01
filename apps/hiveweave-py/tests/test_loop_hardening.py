@@ -21,7 +21,8 @@ import pytest
 from hiveweave.db import project as project_db
 from hiveweave.services import inbox as inbox_module
 from hiveweave.services import task as task_module
-from hiveweave.services.game_time import GameTimeService, _states
+from hiveweave.services import game_time
+from hiveweave.services.game_time import GameTimeService
 from hiveweave.services.permission import (
     COORDINATOR_ONLY_TOOLS,
     COORDINATOR_TOOLS,
@@ -82,7 +83,7 @@ async def env():
                 pass
         project_db._agent_cache.pop(COORDINATOR_ID, None)
         project_db._agent_cache.pop(EXECUTOR_ID, None)
-        _states.pop(PROJECT_ID, None)
+        game_time._states.pop(PROJECT_ID, None)
 
 
 # ── GameTime idempotency ─────────────────────────────────────
@@ -99,11 +100,11 @@ class TestGameTimeStartIdempotent:
             "alarms": [],
         })):
             await svc.start(pid)
-            first_task = _states[pid]["task"]
+            first_task = game_time._states[pid]["task"]
             assert first_task is not None and not first_task.done()
 
             await svc.start(pid)
-            second_task = _states[pid]["task"]
+            second_task = game_time._states[pid]["task"]
             assert second_task is first_task
 
             await svc.stop(pid)

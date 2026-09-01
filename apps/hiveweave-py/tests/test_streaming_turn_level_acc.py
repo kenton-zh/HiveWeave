@@ -4,7 +4,11 @@
 一起清零重写：重连/刷新后前端从 DB 恢复只能看到「当前轮」文本，用户已
 看到的前几轮叙述整段消失。前端 beginStreamRound 已是 no-op（整轮时间线
 口径），DB 快照与直播 draft 对齐后任何时刻恢复都不回退。
-"""
+
+2026-09-01 契约升级（s3-clone_06「大段旁白」反馈）：turn 级累计保留，
+但 round_start（round>=1）在 acc 尾部插入轮次分隔行并同步 DB——content
+兜底渲染从此有轮次结构；finalize content 由 segments 重建，标记不泄进
+终稿。"""
 
 from __future__ import annotations
 
@@ -58,16 +62,34 @@ async def test_round_start_keeps_accumulated_text() -> None:
     await on_delta(agent, {"type": "round_start", "round": 1})
     await on_delta(agent, {"type": "text_delta", "content": "第二轮正文。"})
 
-    # turn 级累计：跨轮文本都保留，content 单调收敛到最终全量文本
-    assert agent._streaming_text_acc == "第一轮旁白。第二轮正文。"
+    # turn 级累计 + 轮次分隔标记：跨轮文本都保留，轮边界插入分隔行
+    assert agent._streaming_text_acc == "第一轮旁白。\n\n—— 第 2 轮 ——\n\n第二轮正文。"
     content_writes = [
         attrs.get("content")
         for (_, _, attrs) in agent._chat_msg.updates
         if "content" in attrs
     ]
-    assert content_writes == ["第一轮旁白。", "第一轮旁白。第二轮正文。"]
+    assert content_writes == [
+        "第一轮旁白。",
+        "第一轮旁白。\n\n—— 第 2 轮 ——\n\n",
+        "第一轮旁白。\n\n—— 第 2 轮 ——\n\n第二轮正文。",
+    ]
     # 不再有 round_start 触发的 content="" 清空写
     assert "" not in content_writes
+
+
+@pytest.mark.asyncio
+async def test_round_0_and_invalid_round_insert_no_marker() -> None:
+    """首轮（round 0）与缺号/非法轮号都不插分隔标记。"""
+    agent = _make_agent()
+
+    await on_delta(agent, {"type": "round_start", "round": 0})
+    assert agent._streaming_text_acc == ""
+    assert agent._chat_msg.updates == []
+
+    await on_delta(agent, {"type": "round_start"})  # 缺 round 字段
+    await on_delta(agent, {"type": "round_start", "round": "x"})  # 非法
+    assert agent._streaming_text_acc == ""
 
 
 @pytest.mark.asyncio

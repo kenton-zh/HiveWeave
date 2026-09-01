@@ -26,6 +26,7 @@ import structlog
 from hiveweave.api.auth import validate_id
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
+from hiveweave.services.agent_activity import live_status
 from hiveweave.services.org import OrgService
 
 log = structlog.get_logger(__name__)
@@ -223,6 +224,26 @@ async def list_agents(
     agents = await _org.list_agents(pid)
     pl = await _resolve_project_language(pid)
     return {"agents": [_agent_response(a, project_language=pl) for a in agents]}
+
+
+@router.get("/agents/live-status")
+async def agents_live_status(
+    projectId: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+) -> dict:
+    """Per-agent 实时活动相位（tool/llm/subagent/working/waiting/idle）。
+
+    注意路由顺序：必须注册在 /agents/{agent_id} 之前，否则 "live-status"
+    会被当作 agent_id 捕获。
+    """
+    pid = projectId or project_id
+    if not pid:
+        return {"agents": [], "generated_at": 0}
+    try:
+        return await live_status(pid)
+    except Exception as e:
+        log.warning("agents_live_status_failed", project_id=pid, error=str(e))
+        return {"agents": [], "generated_at": 0}
 
 
 @router.get("/agents/{agent_id}")

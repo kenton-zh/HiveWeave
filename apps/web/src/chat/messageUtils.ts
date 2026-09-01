@@ -15,8 +15,21 @@ import type {
  * turn-start placeholder creation), so the mid-stream DB snapshot matches
  * this draft instead of under-reporting prior rounds.
  */
-export function beginStreamRound(draft: StreamDraft): StreamDraft {
-  return draft;
+export function beginStreamRound(draft: StreamDraft, round?: number): StreamDraft {
+  // 轮次分隔（turn 级累计口径的配套结构，2026-09-01）：
+  // 后端 round_start 自 BUG-7 起全轮广播（round 0 起号），此前本函数是
+  // no-op——新轮旁白直接续写进上一轮 text 段，多轮 run 的旁白拼成一堵
+  // 无结构墙。修法不回到旧的「清空重写」（那会丢已见内容），而是插入
+  // 一个独立 text 段承载分隔标记：后续 text_delta 并入该段，每轮旁白
+  // 各自成段，工具块仍按时间线穿插。round>=1（即第 2 轮起）才插标记。
+  if (!round || round < 1) return draft;
+  return {
+    ...draft,
+    segments: [
+      ...draft.segments,
+      { type: "text", content: `\n\n—— 第 ${round + 1} 轮 ——\n\n` },
+    ],
+  };
 }
 
 /**
@@ -155,6 +168,26 @@ function coerceBoolFlag(value: unknown): boolean | undefined {
   if (typeof value === "boolean") return value;
   if (value === 0 || value === 1) return value === 1;
   return undefined;
+}
+
+/**
+ * 八轮收口竞态修复（fetch-then-swap 判据）：done 后 refetch 到的消息必须
+ * 带 metadata.segments（后端 build_display_segments 的整轮块序列）才允许
+ * 换掉流式 draft。中途快照的 content 是各轮旁白拼接的平文本——拿它换掉
+ * draft 就把整轮渲染退化成「一大段旁白的总和」。
+ *
+ * - 目标消息不存在（纯 message_user 终报等未走流式的路径）→ 放行
+ * - 目标消息带非空 _segments → 放行
+ * - 其余（快照过旧 / segments 未写）→ 不放行，draft 留屏等下一次
+ */
+export function settledMessageHasSegments(
+  msgs: ChatMessage[],
+  targetId: string | null | undefined,
+): boolean {
+  if (!targetId) return true;
+  const m = msgs.find((x) => x.id === targetId);
+  if (!m) return true;
+  return Array.isArray(m._segments) && m._segments.length > 0;
 }
 
 export function streamEventBackgroundFlag(payload: unknown): boolean | undefined {

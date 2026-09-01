@@ -2,7 +2,7 @@ import {
   useEffect, useState, useCallback, useRef, useMemo, useLayoutEffect,
 } from "react";
 import ApprovalDialog from "./ApprovalDialog";
-import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings, getProjectAlarms } from "../api";
+import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings, getProjectAlarms, getAgentsLiveStatus, type AgentLiveStatus } from "../api";
 import { useAppStore, type AgentAlarmInfo } from "../store";
 import { getPositionLabel } from "../utils/role-styles";
 import { realMsToGameSeconds, gameSecondsToRealMs, decomposeGameSeconds } from "../utils/game-time";
@@ -339,10 +339,28 @@ function formatAlarmCountdown(realMs: number): string {
   return `${s}秒`;
 }
 
+/** 八轮观测：实时活动相位的徽标文案与配色（正交上报，不合成一个 busy）。 */
+const LIVE_PHASE_LABEL: Record<NonNullable<AgentLiveStatus["phase"]>, string> = {
+  tool: "工具",
+  llm: "LLM",
+  subagent: "子代理",
+  working: "运行中",
+  waiting: "等待",
+  idle: "空闲",
+};
+const LIVE_PHASE_STYLE: Record<NonNullable<AgentLiveStatus["phase"]>, string> = {
+  tool: "bg-g-yellow-bg text-g-yellow",
+  llm: "bg-emerald-500/15 text-emerald-700",
+  subagent: "bg-purple-100 text-purple-700",
+  working: "bg-gray-100 text-gray-600",
+  waiting: "bg-g-blue-bg text-g-blue",
+  idle: "bg-g-fg-4/10 text-g-fg-4",
+};
+
 function TreeNodeCard({
   node, isSelected, onSelect, onAddChild, onApproval, onToggle,
   expanded, pendingCount, hasUserPing, isProcessing, nodeH, alarm,
-  healthError,
+  healthError, live,
 }: {
   node: LayoutNode;
   isSelected: boolean;
@@ -358,6 +376,8 @@ function TreeNodeCard({
   alarm?: AgentAlarmInfo;
   /** Health-error message (LLM/model call failure); null/undefined = healthy. */
   healthError?: string | null;
+  /** 实时活动相位（tool/llm/subagent/working/waiting），idle 不传。 */
+  live?: AgentLiveStatus;
 }) {
   const compact = nodeH < 50;
   const hasError = !!healthError;
@@ -486,6 +506,17 @@ function TreeNodeCard({
             {positionLabel}
           </span>
         ) : <span />}
+        {live && (
+          <span
+            title={`${LIVE_PHASE_LABEL[live.phase]}${live.detail ? `：${live.detail}` : ""}${live.since_ms ? ` · ${Math.max(1, Math.floor((Date.now() - live.since_ms) / 1000))}s` : ""}`}
+            className={`shrink-0 font-medium rounded-md leading-none flex items-center gap-0.5 ${
+              compact ? "text-[8px] px-1" : "text-[10px] px-1.5 py-px"
+            } ${LIVE_PHASE_STYLE[live.phase]}`}
+          >
+            <span className={`rounded-full bg-current ${compact ? "w-1 h-1" : "w-1.5 h-1.5"} ${live.phase === "llm" || live.phase === "subagent" ? "animate-pulse" : ""}`} />
+            {LIVE_PHASE_LABEL[live.phase]}
+          </span>
+        )}
         <span className="flex-1" />
         {alarmLabel && (
           <span
@@ -601,6 +632,27 @@ function OrgTree() {
   const [roots, setRoots] = useState<OrgNodeData[]>([]);
   const [approvalAgentId, setApprovalAgentId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // 八轮观测缺口：per-agent 实时活动相位（LLM/工具/子代理），4s 轮询
+  const [liveMap, setLiveMap] = useState<Record<string, AgentLiveStatus>>({});
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    let alive = true;
+    const poll = async () => {
+      const rows = await getAgentsLiveStatus(selectedProjectId);
+      if (!alive) return;
+      const map: Record<string, AgentLiveStatus> = {};
+      for (const r of rows) map[r.agent_id] = r;
+      setLiveMap(map);
+    };
+    void poll();
+    const i = setInterval(poll, 4000);
+    return () => {
+      alive = false;
+      clearInterval(i);
+    };
+  }, [selectedProjectId]);
+
 
   // Canvas transform
   const [transform, setTransform] = useState({ scale: 1, tx: 0, ty: 0 });
@@ -1041,6 +1093,7 @@ function OrgTree() {
                     onSelect={handleSelect}
                     onAddChild={openAddAgent}
                     onApproval={(id) => setApprovalAgentId(id)}
+                    live={liveMap[n.id]?.phase && liveMap[n.id].phase !== "idle" ? liveMap[n.id] : undefined}
                     onToggle={() => {
                       setCollapsed((prev) => {
                         const next = new Set(prev);

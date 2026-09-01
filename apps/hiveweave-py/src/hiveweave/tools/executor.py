@@ -88,8 +88,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "sensitive files like `.env`/`*.pem`/`id_rsa`, or the "
             "`.hiveweave` system dir) — treat `blocked=true` as a hard "
             "denial, read the reason, and change approach rather than retry "
-            "variations. If the project has `.hiveweave/env.sh`, it is "
-            "sourced automatically before every command. "
+            "variations. On sandboxed Windows hosts `.hiveweave/env.sh` is "
+            "NOT sourced (bash syntax is incompatible with the pwsh/cmd "
+            "shell) — set per-process env inside your command via PowerShell "
+            "(`$env:VAR='v'; <cmd>`) or use start_dev_server's `env` param. "
             "Set `background=true` for long scripts/tests: the call returns "
             "immediately with `waiting_on` (job id `bg-bash-…`). Then "
             "`commit_turn(phase=waiting)` using that list; do not poll. "
@@ -1818,8 +1820,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "against the MAIN project root (not your worktree) so milestone "
             "QA hits merged code. A custom `command` may contain `{port}`, "
             "replaced with the allocated project port. "
-            "Stop with stop_dev_server. Extra env belongs in "
-            ".hiveweave/env.sh or an inline VAR=x prefix."
+            "Stop with stop_dev_server. Extra env goes in the `env` param "
+            "(object) — an inline `VAR=x cmd` prefix FAILS here (spawn shell "
+            "is cmd.exe on Windows), and `.hiveweave/env.sh` is NOT sourced "
+            "on sandboxed Windows hosts."
         ),
         "properties": {
             "command": {
@@ -1834,6 +1838,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "cwd": {
                 "type": "string",
                 "description": "Working directory relative to workspace. Default: workspace root.",
+            },
+            "env": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": (
+                    "Extra environment variables for the dev-server process "
+                    "(e.g. {\"HALYARD_DATA_DIR\": \"D:/.../data\"}). The only "
+                    "supported way to set project env for the spawned server."
+                ),
             },
         },
         "required": [],
@@ -2196,14 +2209,11 @@ async def _f10_result_hooks(
         error = result.get("error") or ""
         if not error:
             return result
-        # 归因一句话（供共享条目 / 前置提示使用）
-        _attr = ""
-        if result.get("runner_failed"):
-            _attr = "runner_failed: 命令未执行（执行器/方言/权限/审批）"
-        elif result.get("command_failed"):
-            _attr = "command_failed: 命令执行了但失败（业务/测试未过）"
-        elif result.get("blocked"):
-            _attr = "blocked: 平台护栏拒绝（权限/沙箱/安全）"
+        # 归因一句话（供共享条目 / 前置提示使用）。判定顺序见
+        # failure_signature.attribution_of —— 方言不兼容必须先于 blocked。
+        from hiveweave.services.failure_signature import attribution_of
+
+        _attr = attribution_of(result)
         await record_failure_signature(
             project_id=project_id,
             agent_id=agent_id,
@@ -2211,7 +2221,8 @@ async def _f10_result_hooks(
             error=error,
             attribution=_attr,
         )
-        hint = await known_signature_hint(project_id, error)
+        # agent_id 传入供自指抑制留日志；条目无解法信息时不广播（镜子提示）
+        hint = await known_signature_hint(project_id, error, agent_id=agent_id)
         if hint:
             result["error"] = f"{result['error']}\n\n{hint}"
     except Exception as e:  # noqa: BLE001
@@ -2415,7 +2426,11 @@ class ToolExecutor:
                 )
         except Exception as exc:  # noqa: BLE001
             log.error("permission.evaluate_failed", error=str(exc))
-            return self._error(f"Error: Permission check failed: {exc}")
+            # 同属「命令从未派发」——与本批五处 deny 对称置 runner_failed
+            # （审计 [4]；否则 (0,0) 桶继续残留不可机器区分的失败）。
+            _err = self._error(f"Error: Permission check failed: {exc}")
+            _err["runner_failed"] = True
+            return _err
 
         if decision == "deny":
             # 如实提示：硬门 / 用户 deny / 工具表 原因 + 角色指引
@@ -2426,7 +2441,10 @@ class ToolExecutor:
             family = infer_role_family(agent_info or {})
             deny_result = self._error(build_deny_hint(name, family, deny_reason))
             # H3: 权限拒绝是平台护栏，不是模型空转 —— 标记 blocked 供 stall 分流
+            # s3-clone_06 P0-4：命令从未派发（runner 未执行）→ 一并置
+            # runner_failed，否则落 (0,0) 桶与"未知失败"不可机器区分。
             deny_result["blocked"] = True
+            deny_result["runner_failed"] = True
             return deny_result
 
         if decision == "ask":
@@ -2451,6 +2469,7 @@ class ToolExecutor:
                     "本回合内已超时一次，不再重复等待。请改走可审计的替代方案。"
                 )
                 _deny["blocked"] = True
+                _deny["runner_failed"] = True
                 return _deny
             if await is_unattended_mode(_pid):
                 _deny = self._error(
@@ -2459,6 +2478,7 @@ class ToolExecutor:
                     "等待审核。请改走可审计的替代方案通道或拆分目标。"
                 )
                 _deny["blocked"] = True
+                _deny["runner_failed"] = True
                 return _deny
             # Request approval (120s timeout)
             try:
@@ -2475,15 +2495,18 @@ class ToolExecutor:
 
                 deny_result = self._error(APPROVAL_TIMEOUT_HINT)
                 deny_result["blocked"] = True
+                deny_result["runner_failed"] = True
                 return deny_result
             except PermissionRejected as exc:
                 deny_result = self._error(f"Permission rejected: {exc}")
                 deny_result["blocked"] = True
+                deny_result["runner_failed"] = True
                 return deny_result
             except Exception as exc:  # noqa: BLE001
-                return self._error(
-                    f"Error: Approval request failed: {exc}"
-                )
+                # 同上：审批通道自身异常也是「从未派发」→ 对称置位（审计 [4]）
+                _err = self._error(f"Error: Approval request failed: {exc}")
+                _err["runner_failed"] = True
+                return _err
 
         # 3. Dispatch to the tool implementation
         try:

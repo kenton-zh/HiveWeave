@@ -327,8 +327,12 @@ async def create_task_tool(
             note = "status=claimed (assign=claim)"
         else:
             note = f"status={st}"
+        dod_hint = "" if params.acceptance_criteria else (
+            " hint: acceptance_criteria is empty — reviewers will have no "
+            "per-item DoD to check against (free-text review only)."
+        )
         return ToolResult.ok(
-            f"Task created (id={task_id}, {note}): {title}{force_note}",
+            f"Task created (id={task_id}, {note}): {title}{force_note}{dod_hint}",
             task_id=task_id,
             status=st,
         )

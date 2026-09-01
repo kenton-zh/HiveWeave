@@ -163,8 +163,22 @@ class DispatchTaskParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["dependsOn", "depends_on"]},
     )
+    acceptance_criteria: list[Any] | None = Field(
+        default=None,
+        alias="acceptanceCriteria",
+        description=(
+            "Structured per-item DoD for NEW tasks, e.g. "
+            "[{id: 'ac1', description: '外景≥12项', evidenceHint: 'browse_e2e'}]. "
+            "Stored on the task row; reviewers check submissions against it. "
+            "Omitting it = free-text review only (no machine-checkable DoD)."
+        ),
+        json_schema_extra={"aliases": ["acceptanceCriteria", "acceptance_criteria"]},
+    )
 
-    @field_validator("expected_modules", "artifact_refs", "depends_on", mode="before")
+    @field_validator(
+        "expected_modules", "artifact_refs", "depends_on", "acceptance_criteria",
+        mode="before",
+    )
     @classmethod
     def _coerce_dispatch_lists(cls, v: Any) -> Any:
         return _coerce_to_list(v)
@@ -174,7 +188,9 @@ class DispatchTaskParams(BaseModel):
     "dispatch_task",
     "Deliver work NOW: ledger entry + inbox wake (unless blocked on depends_on). "
     "Always pass submitGate (docs|unit|module_visual|code_audit|…) — required for "
-    "new tasks, ignored on taskId reuse. Unmet dependsOn also applies when reusing "
+    "new tasks, ignored on taskId reuse. New tasks SHOULD also carry "
+    "acceptanceCriteria=[{id, description, …}] (per-item DoD; without it review "
+    "is free-text only). Unmet dependsOn also applies when reusing "
     "taskId (blocked, not woken). dependsOn = other task ids only "
     "(self-id rejected); waiting on a person is commit_turn. "
     "To re-assign/delegate an EXISTING task, pass taskId — this keeps a single "
@@ -411,6 +427,7 @@ async def dispatch_task_tool(
         source=source,
         depends_on=params.depends_on,
         parent_task_id=params.parent_task_id,
+        acceptance_criteria=params.acceptance_criteria,
     )
     if result.get("success"):
         # Align with review_task: inbox alone is not enough — wake assignee

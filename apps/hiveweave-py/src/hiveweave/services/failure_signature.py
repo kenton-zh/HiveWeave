@@ -195,11 +195,19 @@ async def record_failure_signature(
 
 
 async def known_signature_hint(
-    project_id: str | None, error: str | None
+    project_id: str | None, error: str | None, agent_id: str | None = None
 ) -> str | None:
     """同项目共享空间里是否已有该失败签名 —— 供工具调用前置检查注入。
 
-    Returns ``"[shared fix] …"`` 提示文案或 None（未命中/不可用）。
+    Returns ``"[shared fix] …"`` 提示文案或 None（未命中/不可用/自指）。
+
+    **自指抑制（2026-09-01，s3-clone_06）**：F10 的 hook 是「先写签名、后取提
+    示」——同一次失败写入的条目会被自己立刻命中，而该条目内容只有错误原文 +
+    占位根因（``见错误原文``）。提示它去「先读它」等于指它读自己刚写的一面镜子，
+    零信息量，且因为看起来在工作而极难被发现（TEST_DSH_38 实测 18/18 失败步
+    全部收到该提示，dev server 同一堵墙连撞 3 次）。
+
+    因此：命中的签名条目**必须携带超出错误原文的信息**（根因提示非占位）才广播。
     只读、best-effort —— 查询失败仅返回 None，绝不阻断工具执行。
     """
     if not project_id:
@@ -221,6 +229,13 @@ async def known_signature_hint(
                 continue
             # 签名行格式：`[失败签名] tool=xxx | <sig>`
             if f"| {sig}" in first_line or sig[:48] in first_line:
+                if not _signature_has_solution(content):
+                    log.debug(
+                        "failure_signature.hint_suppressed_self_reference",
+                        agent_id=(agent_id or "")[:12],
+                        sig=sig[:60],
+                    )
+                    return None
                 return (
                     "[shared fix] 团队共享空间已有该失败签名条目 —— 先读它，"
                     "别重复撞同一个坑。"
@@ -228,3 +243,48 @@ async def known_signature_hint(
         return None
     except Exception:
         return None
+
+
+def attribution_of(result: dict) -> str:
+    """从工具回执推导一句话归因（供共享签名条目使用）。
+
+    判定顺序按「信息量从具体到笼统」——s3-clone_06 P0-3：方言不兼容必须先
+    于 blocked 判定，否则"bash 写法在受限 shell 不认"会被报成"平台护栏拒绝
+    （权限/沙箱/安全）"，把撞坑 Agent 指向错误的排查方向（DSH postmortem
+    0004：宽泛签名 → 误归因，同构缺陷）。
+    """
+    try:
+        if result.get("dialect_failed"):
+            return (
+                "runner_failed: shell 方言不兼容 —— 命令从未执行。"
+                "改写为 pwsh 写法（见错误原文的等价表）或直接调 pwsh 工具；"
+                "不要用不同的 unix flag 重试"
+            )
+        if result.get("runner_failed"):
+            return "runner_failed: 命令未执行（执行器/方言/权限/审批）"
+        if result.get("command_failed"):
+            return "command_failed: 命令执行了但失败（业务/测试未过）"
+        if result.get("blocked"):
+            return "blocked: 平台护栏拒绝（权限/沙箱/安全）"
+    except Exception:  # noqa: BLE001 — 归因是旁支，绝不能因它挂掉工具回执
+        return ""
+    return ""
+
+
+# ``record_failure_signature`` 写入根因提示时的占位值 —— 表示「没有可用根因，
+# 去看错误原文」。条目停留在占位状态 = 它只是错误原文的副本（自指镜子）。
+_ROOT_CAUSE_PLACEHOLDER = "见错误原文"
+
+
+def _signature_has_solution(content: str) -> bool:
+    """签名条目是否携带超出错误原文的信息（可指导下一步动作）。
+
+    判定只看「根因提示:」那一行：缺失 / 空 / 等于占位值 → 无信息量。
+    未来若新增结构化解法字段，应在此一并纳入判定。
+    """
+    for line in (content or "").splitlines():
+        if not line.startswith("根因提示:"):
+            continue
+        value = line.split(":", 1)[1].strip()
+        return bool(value) and value != _ROOT_CAUSE_PLACEHOLDER
+    return False

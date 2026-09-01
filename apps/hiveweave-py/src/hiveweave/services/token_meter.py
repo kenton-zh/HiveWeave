@@ -164,7 +164,9 @@ class TokenMeter:
                     int(r.get("total", 0) or 0),
                     int(r.get("duration_ms", 0) or 0),
                     1 if (i == 0 and is_cold_start) else 0,
-                    now,
+                    # P2 观测（八轮 TEST_DSH_38）：优先用 streamer 逐次记录
+                    # 的真实时刻；缺失（旧路径/异常分支）才退回批量盖章时刻。
+                    int(r.get("ts") or now),
                 ],
             ))
         if not statements:

@@ -566,6 +566,10 @@ class ToolLoopMixin:
                     )
                 # cache_creation 上报 vs 真 0 的区分已由 llm/util.normalize_usage
                 # 统一处理（cache_creation_reported 位）——勿在此重复。
+                # P2 观测（八轮 TEST_DSH_38）：逐次真实时间戳随行——批量落库
+                # 在 run 结束，created_at 若统一盖 end 章，按小时指标与时间
+                # 对齐分析全部失真（本轮审计两度被误导）。写路径不变，仅补时刻。
+                usage["ts"] = int(time.time() * 1000)
                 usage_rounds.append(usage)
                 # P1-6：usage 实时推给调用方（取消/中断路径不依赖最终 return ——
                 # 用户取消时 result 永不返回，账本会蒸发）。与 append 同域，

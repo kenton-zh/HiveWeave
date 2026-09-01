@@ -158,6 +158,9 @@ docs/*
 # Local .opencode skills (user/local-only, not shared upstream)
 .opencode/skills/
 
+# Local project skills (user 2026-08-31 钦定: 不进远程, 本地唯一权威位置)
+skills/
+
 # Generated assets
 image/
 apps/web/public/sprites/

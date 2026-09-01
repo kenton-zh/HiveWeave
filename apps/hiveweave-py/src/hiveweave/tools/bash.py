@@ -687,12 +687,22 @@ def check_self_destructive(command: str) -> tuple[bool, str]:
 
 # .hiveweave 系统目录保护的文件操作命令前缀。
 # cd .hiveweave 不拦（无害），只拦真正会读/写/删/复制文件的命令。
+# 2026-09-01 补 PowerShell cmdlet：本平台强制走 pwsh（unix-only 一律拒绝），
+# 而原表只有 POSIX/DOS 动词 —— 于是 `Remove-Item .hiveweave/data.db`、
+# `Out-File .hiveweave/data.db` 这类用平台指定方言写的破坏命令**整条绕过**
+# 护栏（实测确认）。方言既然是强制的，护栏就必须覆盖该方言的动词。
+# 只读 cmdlet（Get-Content / Get-ChildItem / Select-String）**不**入表，
+# 否则 .hiveweave/logs 的只读放行会被自己关掉。
 _HIVEWEAVE_FILE_OPS = re.compile(
     r"\b(?:rm|del|erase|cat|type|cp|copy|mv|move|xcopy|robocopy|"
     r"echo|printf|tee|dd|truncate|strings|xxd|hexdump|od|base64|"
     r"touch|mkdir|rmdir|rd|ln|link|chmod|chown|attrib|cacls|"
     r"sqlite3|\.sqlite3|open|export|tar|zip|unzip|gzip|gunzip|"
-    r"7z|rar|dump|backup|restore|import|load)\b",
+    r"7z|rar|dump|backup|restore|import|load|"
+    r"remove-item|ri\b|erase-item|clear-content|clc|"
+    r"out-file|set-content|sc\b|add-content|ac\b|new-item|ni\b|"
+    r"move-item|mi\b|rename-item|ren\b|rni|copy-item|ci\b|cpi|"
+    r"tee-object|export-clixml|import-clixml)\b",
     re.IGNORECASE,
 )
 _HIVEWEAVE_REF = re.compile(r"\.hiveweave\b", re.IGNORECASE)
@@ -726,6 +736,28 @@ _ALLOWED_HW_SUBDIRS = re.compile(
     re.IGNORECASE,
 )
 
+# s3-clone_06 P1-7：`.hiveweave/logs` 是 **只读** 例外——agent 唯一的诊断
+# 出口（dev-server 崩没崩只能看这里）。此前被一刀切禁触，霁岚/汐然/栖迟
+# 三人共撞 8 次，每次都拿不到失败原因，只能盲重试 start_dev_server。
+# 仅放行「不产生写入」的读取：任何重定向 / 删除 / 复制 / 写入动词仍拦。
+_HW_LOGS_REF = re.compile(
+    r"\.hiveweave[\\/]+logs(?![\w.-])", re.IGNORECASE
+)
+# fd 复制（`2>&1` / `1>&2`：`>` 后紧跟 `&`）不是写入，必须排除——否则无害的
+# stderr 合并也会被当成写操作，把 `cat .hiveweave/logs/a.log 2>&1 | head` 拦掉。
+# 真正的写重定向（`> file` / `>> file`）后跟的不是 `&`，照常命中。
+_HW_WRITE_MARKERS = re.compile(
+    r"(?:>>|(?<![<=!>-])>)(?!&)"
+    r"|\b(?:rm|del|erase|rmdir|rd|mv|move|cp|copy|"
+    r"xcopy|robocopy|echo|tee|truncate|mkdir|touch|"
+    r"remove-item|clear-content|out-file|set-content|add-content|new-item|"
+    r"move-item|rename-item|copy-item|tee-object|"
+    # 别名必须与 _HIVEWEAVE_FILE_OPS 对齐（审计 [3]）：`… | ri` 能命中
+    # FILE_OPS + LOGS_REF，若此处缺别名就会被只读门放行而真删除。
+    r"ri|mi|cpi)\b",
+    re.IGNORECASE,
+)
+
 
 def _check_hiveweave_command(command: str) -> bool:
     """Return True if the command targets `.hiveweave` with a file operation.
@@ -733,6 +765,7 @@ def _check_hiveweave_command(command: str) -> bool:
     拦截 agent 通过 bash 读写/删除/复制 .hiveweave 内系统文件（data.db 等）。
     `cd .hiveweave` 和 `ls .hiveweave` 这类无害命令不拦。
     放行指向 shared/reports/drafts/worktrees/handoffs 子目录的文件操作（团队共享/工作文件）。
+    放行 .hiveweave/logs 下的**只读**操作（诊断出口，P1-7）；写/删仍拦。
     """
     command = _strip_hiveweave_test_excludes(command)
     if not _HIVEWEAVE_REF.search(command):
@@ -741,6 +774,9 @@ def _check_hiveweave_command(command: str) -> bool:
         return False
     # 放行明确指向允许子目录的操作
     if _ALLOWED_HW_SUBDIRS.search(command):
+        return False
+    # 只读诊断日志：无写入标记才放行
+    if _HW_LOGS_REF.search(command) and not _HW_WRITE_MARKERS.search(command):
         return False
     return True
 
@@ -1588,8 +1624,12 @@ async def execute_bash(
     dialect_err = _pwsh_dialect_gate(command)
     if dialect_err:
         log.info("bash.dialect_gate", command_preview=command[:120])
+        # s3-clone_06 P0-3/P0-4：命令从未执行（方言不认）→ runner_failed=1。
+        # 此前只有 blocked=1，被 F10 归因成「平台护栏拒绝（权限/沙箱/安全）」，
+        # 把"方言不兼容"错指为"安全拦截"，撞坑 Agent 拿到的是错的排查方向。
         return {"success": False, "output": "",
-                "error": dialect_err, "blocked": True}
+                "error": dialect_err, "blocked": True,
+                "runner_failed": True, "dialect_failed": True}
 
     # 2. Resolve cwd and validate sandbox
     ws = workspace_path or os.getcwd()
@@ -1757,7 +1797,8 @@ async def execute_run_command(
     if run_dialect_err:
         log.info("run_command.dialect_gate", command_preview=command[:120])
         return {"success": False, "output": "",
-                "error": run_dialect_err, "blocked": True}
+                "error": run_dialect_err, "blocked": True,
+                "runner_failed": True, "dialect_failed": True}
 
     ws = workspace_path or os.getcwd()
     if cwd:
@@ -2835,12 +2876,16 @@ async def _shell_tool_impl(
     meta = _attestation_fields_from_note(attest_note)
     banner = meta.get("banner") or ""
     public = _attestation_public_extra(meta)
-    # F4/F7：工具执行事实位透传到 ToolResult（runner/command/注入/超时）
+    # F4/F7：工具执行事实位透传到 ToolResult（runner/command/注入/超时/方言）
+    # **新增事实位必须同时登记进这个白名单**（2026-09-01 实战抓到两次）：
+    # 只加进 execute_bash 的返回字典而不登记此处，字段会在这一层被过滤掉，
+    # 结果是单测全绿、生产里字段恒 None —— runner_failed 与 dialect_failed
+    # 都踩过（后者直接导致 F10 方言归因回落到通用文案）。
     _ff = {
         k: result.get(k)
         for k in (
             "runner_failed", "command_failed", "injection_applied",
-            "timeout_kind", "timeout_ms",
+            "timeout_kind", "timeout_ms", "dialect_failed",
         )
         if result.get(k) is not None
     }
@@ -2883,16 +2928,18 @@ def _shell_tool_result(
     if streak_hint:
         err_msg = f"{err_msg}{streak_hint}"
     err_msg = _combine_attestation_output(err_msg, banner, suffix)
-    if blocked:
-        # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
-        # stall 检测分流，文本/exit code 语义与 err 一致。
-        return ToolResult.blocked_err(err_msg, **public)
     # F4/F7：事实位透传（runner_failed / command_failed / injection_applied /
     # timeout_kind / timeout_ms）—— 供 run_steps 收纳，stall 归因不再靠
-    # 猜退出码。
+    # 猜退出码。**blocked 分支也必须带上**（2026-09-01 实战抓到）：方言门
+    # 与护栏拒绝都是 blocked=True，此前只传 public 把 runner_failed 整个
+    # 丢掉 —— 报告 #4「runner_failed 恒 0」在 blocked 类失败上原样残留。
     _kw: dict[str, Any] = dict(public)
     if fact_flags:
         _kw.update(fact_flags)
+    if blocked:
+        # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
+        # stall 检测分流，文本/exit code 语义与 err 一致。
+        return ToolResult.blocked_err(err_msg, **_kw)
     return ToolResult.err(err_msg, **_kw)
 
 

@@ -12,6 +12,11 @@ dependencies = [
     "httpx>=0.27.0",
     "websockets>=12.0",
     "structlog>=24.0",
+    # hiveweave/__init__.py 的 _bootstrap_dotenv() 直接依赖它：把 .env 灌进
+    # os.environ，让 34 处 os.environ.get("HIVEWEAVE_…") 与 pydantic-settings
+    # 看到同一份配置。此前只作为 pydantic-settings 的传递依赖存在，依赖树
+    # 一变就会让预算配置静默回退到代码默认值 —— 必须显式声明。
+    "python-dotenv>=1.0",
     # ACL 沙箱依赖（§10.2）：pywin32 仅 Windows 有 wheel —— 平台 marker 防
     # Linux/macOS `uv sync` 拉取失败（代码层 try/except 已跨平台）。
     "pywin32>=312; sys_platform == 'win32'",

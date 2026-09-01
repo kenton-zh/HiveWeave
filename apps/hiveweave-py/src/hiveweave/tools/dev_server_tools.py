@@ -91,6 +91,18 @@ class StartDevServerParams(BaseModel):
         default=None,
         description="Working directory relative to workspace (default: workspace root).",
     )
+    env: dict[str, str] | None = Field(
+        default=None,
+        alias="env",
+        description=(
+            "Extra environment variables for the dev-server process, e.g. "
+            '{\"HALYARD_DATA_DIR\": \"D:/proj/.hiveweave/worktrees/A318/data\"}. '
+            "This is the ONLY supported way to set project env — do NOT use a "
+            "`VAR=x cmd` prefix (bash syntax; fails under the Windows spawn "
+            "shell) and do NOT rely on .hiveweave/env.sh (not sourced on "
+            "sandboxed Windows hosts)."
+        ),
+    )
 
 
 class LookupDevServerParams(BaseModel):
@@ -155,8 +167,14 @@ async def _agent_active_verify_task(
     "start_dev_server",
     "Start the project's Vite/dev server on a non-reserved port (never 5173/4000). "
     "Registers pid/cwd/port for URL lookup. Prefer this over bare `npm run dev` / `vite`. "
-    "The spawned child process inherits only a whitelisted environment — project-specific "
-    "variables must come from `.hiveweave/env.sh` or an inline `VAR=x cmd` command prefix. "
+    "The spawned child process inherits only a whitelisted environment — pass "
+    "project-specific variables via the `env` param (object), e.g. "
+    "env={\"HALYARD_DATA_DIR\": \"D:/.../data\"}. Do NOT use a `VAR=x cmd` "
+    "prefix (bash syntax; the spawn shell is cmd.exe on Windows — such "
+    "commands fail 100%) and do NOT rely on `.hiveweave/env.sh` (not sourced "
+    "on sandboxed Windows hosts). "
+    "On failure the result includes the log tail; the full log lives at "
+    ".hiveweave/logs/dev-server-<port>.log (readable). "
     "VERIFY agents: when you hold an in-flight VERIFY task, this resolves to the MAIN "
     "project root (never your worktree) so milestone QA runs against merged code.",
     requires_workspace=True,
@@ -285,6 +303,7 @@ async def start_dev_server_tool(
         return ToolResult.blocked_err(f"Error: {seal_reason}")
 
     try:
+        # env 只在显式传入时转发（旧测试桩签名无 env；None 传下去也无意义）
         proc, spawn_err, meta = spawn_project_process(
             cmd,
             cwd=work_cwd,
@@ -292,6 +311,7 @@ async def start_dev_server_tool(
             preferred_port=port,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            **({"env": params.env} if params.env else {}),
         )
         if spawn_err or proc is None:
             log_file.close()

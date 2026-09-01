@@ -503,6 +503,54 @@ def _subcommand_of(argv: list[str]) -> str:
     return (a[0] or "").lower().replace("-", "_") if a else ""
 
 
+def top_level_await_rewrite(argv: list[str], stderr: str) -> str | None:
+    """顶层 await 的确定性 SyntaxError → 返回可直接复制的改写建议。
+
+    agent-browser 的 ``eval`` 在**非 async 作用域**求值，`await new Promise(...)`
+    这类等渲染写法必然 `SyntaxError: await is only valid in async functions`。
+    agent 普遍以为这是 flake 而反复重试（s3-clone_06 实测 ≥4 次、每次
+    75–200ms 失败，直接挡住 M5 的 E2E 取证）。这里按最常见的
+    ``await <expr>; <取值表达式>`` 形态生成等价的 async IIFE 改写。
+
+    只给建议、不改脚本：静默重写会让 agent 学不到契约，且无法覆盖所有形态。
+    """
+    if not stderr or "await is only valid in async" not in stderr:
+        return None
+    if not argv or (argv[0] or "").lower() != "eval":
+        return None
+    src = ""
+    for tok in argv[1:]:
+        if tok in ("-b", "--stdin"):
+            continue
+        if len(tok) > len(src):
+            src = tok
+    src = (src or "").strip()
+    if not src or "await" not in src:
+        return (
+            "[browse eval] 脚本用了顶层 await，但 eval 在非 async 作用域求值。"
+            "把整段包进 async IIFE：`(async () => { <你的脚本> })()`，"
+            "并把最后的取值表达式写成 `return ...`（否则拿到 undefined）。"
+        )
+    # 常见形态：首句 await ...;  之后是取值表达式
+    head, sep, tail = src.partition(";")
+    if sep and "await" in head and tail.strip():
+        fixed = f"(async () => {{\n  {head.strip()};\n  return ({tail.strip()});\n}})()"
+        return (
+            "[browse eval] 顶层 await 不受支持（非 async 作用域），这不是 flake —— "
+            "同样的脚本每次都会失败。改写为：\n"
+            f"{fixed}\n"
+            "然后作为一条 eval 重新提交。"
+        )
+    return (
+        "[browse eval] 顶层 await 不受支持（非 async 作用域），这不是 flake。"
+        "改写为 `(async () => { <脚本> })()` 并把取值表达式写成 `return ...`。"
+    )
+
+
+# 内部别名保留（调用点用短名）
+_top_level_await_rewrite = top_level_await_rewrite
+
+
 def _eval_argv(head: str, rest: list[str], workspace: str) -> tuple[list[str], str | None]:
     """agent-browser eval semantics: inline JS only (direct / -b / --stdin).
 
@@ -1113,6 +1161,13 @@ def _contract_snapshot_output(
     "screenshot/viewport/console/network/js/eval). Use js/eval for canvas MouseEvent "
     "injection when snapshot refs are insufficient. "
     "Prefer lookup_dev_server / start_dev_server for the app URL first. "
+    "EVAL CONTRACT (read before writing js/eval): the script is evaluated in a "
+    "NON-async scope — top-level `await` is a SyntaxError (not a flake; it "
+    "fails in <200ms every time). To wait for rendering, wrap your script: "
+    "browse(args=[\"eval\", \"(async () => { await new Promise(r=>setTimeout(r,900)); "
+    "return (JSON.stringify({rows: document.querySelectorAll('[data-testid=\\\"row\\\"]').length})); "
+    "})()\"]) — the final value expression MUST be `return (...)`, otherwise you get "
+    "undefined. Do NOT retry the same unwrapped script with different delays. "
     "goto always resets the window to 1280×900. For mobile: goto first, then "
     "browse(args=[\"viewport\",\"390\",\"844\"]), then screenshot. "
     "After screenshot, pixels inject into the next turn. "
@@ -1196,6 +1251,14 @@ async def browse_tool(
             )
         elif code == -1 and BROWSE_RESTART_HINT not in err:
             err = f"{err}\n{BROWSE_RESTART_HINT}"
+        # s3-clone_06 #9：agent 惯用的 `await new Promise(r=>setTimeout(r,N)); …`
+        # 在 agent-browser 的 eval 里是**确定性 SyntaxError**（非 async 作用域），
+        # 每次 75–200ms 就失败，Agent 却当 flake 反复重试（本项目 ≥4 次，挡住
+        # M5 的 E2E 取证）。这里给出**可直接复制的改写**，不静默重写脚本
+        # （静默翻译是坑，见 _map_unix_to_pwsh 退役注）。
+        _await_fix = _top_level_await_rewrite(argv, stderr)
+        if _await_fix:
+            err = f"{err}\n{_await_fix}"
         return ToolResult.err(err)
 
     viewport_note = ""
@@ -1312,6 +1375,9 @@ async def browse_tool(
     "stamps MAIN HEAD. CEO: look at the shipped product on MAIN (not a "
     "test duty). goto resets viewport to 1280×900; viewport AFTER goto "
     "for mobile. Module visual in your slice stays on browse. "
+    "Same EVAL CONTRACT as browse: js/eval runs in a NON-async scope, so "
+    "top-level `await` is a SyntaxError — wrap in (async () => { ... return "
+    "(...); })() instead of retrying. "
     "Platform does not rewrite browse cwd.",
     requires_workspace=True,
     security_level="shell",

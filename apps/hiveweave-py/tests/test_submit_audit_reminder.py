@@ -159,6 +159,7 @@ async def test_reminder_when_over_threshold_without_audit(code_audit_env):
 async def test_reminder_after_llm_failed_says_attempted(code_audit_env):
     from hiveweave.services.code_audit import (
         CODE_AUDIT_REMINDER_LLM_FAILED,
+        effective_audit_timeout_s,
         record_audit_attempt,
     )
 
@@ -170,7 +171,12 @@ async def test_reminder_after_llm_failed_says_attempted(code_audit_env):
     assert "attempted" in result.output
     assert "llm_failed" in result.output
     assert "no fresh" not in result.output
-    assert CODE_AUDIT_REMINDER_LLM_FAILED in result.output
+    # 报有效帽（agent 侧首读帽内），不报配置值
+    eff = effective_audit_timeout_s()
+    shown = int(eff) if float(eff).is_integer() else eff
+    assert CODE_AUDIT_REMINDER_LLM_FAILED.format(timeout_s=shown) in result.output
+    # s3-clone_06 P0-1/P0-3：fail-loud 后不得再宣称"不阻断"
+    assert "does not block" not in result.output
     assert code_audit_env["reset_count"] == 1
 
 

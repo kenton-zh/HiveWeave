@@ -9,40 +9,57 @@ import {
   mergeStreamDraftIntoMessages,
   nextBadgePopToken,
   sanitizeMessagesForCache,
+  settledMessageHasSegments,
   shouldWriteChatCache,
   streamEventBackgroundFlag,
   streamEventIsBackground,
   tryParseToolCalls,
 } from "./messageUtils";
-import type { StreamDraft } from "./types";
+import type { ChatMessage, StreamDraft } from "./types";
 
 describe("beginStreamRound", () => {
-  it("keeps the full block timeline across rounds (whole-turn view)", () => {
+  it("round>=1 时插入轮次分隔段，且不丢弃任何已有内容", () => {
     const draft: StreamDraft = {
       assistantId: "a1",
       segments: [
         { type: "thinking", content: "plan v1" },
         { type: "text", content: "用户选了方案2" },
         { type: "tool_call", tool: { tool: "get_tasks", input: {} } },
-        { type: "thinking", content: "plan v2" },
-        { type: "text", content: "用户选了方案2" },
-        { type: "tool_call", tool: { tool: "bash", input: { command: "git rev-parse HEAD" } } },
       ],
     };
-    const next = beginStreamRound(draft);
+    const next = beginStreamRound(draft, 1);
     expect(next.assistantId).toBe("a1");
-    // 新契约：旁白/thinking/tool 全量保留（DSH 整轮视图）；新轮文本由
-    // 后续 text_delta 事件追加，不再丢弃前轮旁白。
-    expect(next.segments).toEqual(draft.segments);
-    expect(next).toBe(draft);
+    // 全量保留（DSH 整轮视图）+ 尾部分隔段
+    expect(next.segments.slice(0, 3)).toEqual(draft.segments);
+    expect(next.segments[3]).toEqual({
+      type: "text",
+      content: "\n\n—— 第 2 轮 ——\n\n",
+    });
+    // 原 draft 不被突变
+    expect(draft.segments).toHaveLength(3);
   });
 
-  it("is a no-op when the draft has only tools", () => {
+  it("round 0（首轮）与缺号 no-op——首轮无需分隔", () => {
     const draft: StreamDraft = {
       assistantId: "a1",
-      segments: [{ type: "tool_call", tool: { tool: "send_message", input: { recipients: ["Vera"] } } }],
+      segments: [{ type: "text", content: "首轮旁白" }],
     };
-    expect(beginStreamRound(draft).segments).toEqual(draft.segments);
+    expect(beginStreamRound(draft, 0)).toBe(draft);
+    expect(beginStreamRound(draft, undefined)).toBe(draft);
+  });
+
+  it("分隔段是 text 段——后续 text_delta 自然并入，轮内旁白连续", () => {
+    let draft: StreamDraft = {
+      assistantId: "a1",
+      segments: [{ type: "text", content: "第一轮旁白" }],
+    };
+    draft = beginStreamRound(draft, 1);
+    // 模拟 text_delta 合并逻辑（last 为 text → merge）
+    const last = draft.segments[draft.segments.length - 1];
+    expect(last.type).toBe("text");
+    const merged = ((last as { content?: string }).content || "") + "第二轮旁白开始";
+    expect(merged).toContain("—— 第 2 轮 ——");
+    expect(merged.endsWith("第二轮旁白开始")).toBe(true);
   });
 });
 
@@ -384,3 +401,28 @@ describe("sanitizeMessagesForCache", () => {
   });
 });
 
+
+describe("settledMessageHasSegments（八轮收口竞态 fetch-then-swap 判据）", () => {
+  const mk = (over: Partial<ChatMessage> & { id: string }): ChatMessage => ({
+    role: "assistant",
+    content: "",
+    timestamp: Date.now(),
+    ...over,
+  });
+
+  it("带非空 _segments 的消息放行", () => {
+    const msgs = [mk({ id: "m1", _segments: [{ type: "text", content: "hi" }] })];
+    expect(settledMessageHasSegments(msgs, "m1")).toBe(true);
+  });
+
+  it("无 _segments 的中途快照不放行（旁白拼接平文本）", () => {
+    const msgs = [mk({ id: "m1", content: "旁白旁白旁白" })];
+    expect(settledMessageHasSegments(msgs, "m1")).toBe(false);
+    expect(settledMessageHasSegments(msgs, "m1")).toBe(false);
+  });
+
+  it("目标消息不存在（未走流式的纯文本路径）放行", () => {
+    expect(settledMessageHasSegments([mk({ id: "other" })], "m1")).toBe(true);
+    expect(settledMessageHasSegments([], null)).toBe(true);
+  });
+});

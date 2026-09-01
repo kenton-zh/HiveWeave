@@ -46,6 +46,29 @@ if _poisoned:
     )
 
 
+# ── 开发机 .env 与测试解耦（2026-08-30）───────────────────────
+# ``hiveweave/__init__.py`` 在包导入时把 apps/hiveweave-py/.env 灌进
+# os.environ，于是开发机 .env 的值会渗进测试，而大量用例断言的是**代码
+# 默认值** —— 结果随开发机 .env 漂移就失去基线意义。两类实测失败：
+#   · 预算类：用例只 delenv 自己 set 过的三个变量后 reload，残留的
+#     PACING=600 撞上回到默认的 HARD=570，constants.py 结构 assert 挂掉；
+#   · 凭据类：``services/model.py`` 的 Ark 取值链是
+#     ``settings.X or os.environ["HIVEWEAVE_ARK_*"]``，os.environ 一有真 key
+#     就绕过测试用 FakeSettings 造的空凭据（3 个 model_pool 用例挂掉）。
+# 因此在**每个用例前**剥离整个 ``HIVEWEAVE_`` 前缀（不只是预算类），让
+# os.environ 回到改动前的干净状态。``settings`` 对象在 config 导入时已固化
+# .env 值，不受影响 —— 最终状态与基线一致；需要覆盖的用例在自己作用域内
+# monkeypatch.setenv 即可。
+_ISOLATED_ENV_PREFIX = "HIVEWEAVE_"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hiveweave_env(monkeypatch):
+    """Strip locally-injected ``HIVEWEAVE_*`` env so tests start from defaults."""
+    for key in [k for k in os.environ if k.startswith(_ISOLATED_ENV_PREFIX)]:
+        monkeypatch.delenv(key, raising=False)
+
+
 @pytest.fixture(autouse=True)
 async def _close_db_connections_after_test():
     yield

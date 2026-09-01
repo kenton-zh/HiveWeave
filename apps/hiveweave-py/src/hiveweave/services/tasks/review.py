@@ -117,8 +117,12 @@ class ReviewMixin:
                 )
                 return
             # reviewing → approved
+            # P0-3 观测补丁：approve 事件 payload 落评审意见（rework 路径
+            # 本就带 detail=feedback，这里补对称，task.approved 不再是空壳）
             await self._transition(project_id, task_id, "approved",
-                                   actor_id=reviewer_id)
+                                   actor_id=reviewer_id,
+                                   detail=((feedback or "").strip()[:500]
+                                           or None))
             await _execute(project_id,
                 "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
                 [json.dumps(evidence), now_ms, task_id])

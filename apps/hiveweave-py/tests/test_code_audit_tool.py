@@ -418,8 +418,9 @@ async def test_tool_shell_ctx_none_soft_fails():
 
 
 @pytest.mark.asyncio
-async def test_tool_shell_llm_failed_next_action_is_soft():
-    """llm_failed 工具回执提示可重试一次或直接 submit（软门）。"""
+async def test_tool_shell_llm_failed_next_action_points_to_waive():
+    """s3-clone_06 P0-1/P0-3：llm_failed 回执必须指路「重试 → 否则走 waive」，
+    不得再宣称 soft gate（fail-loud 后直接 submit 会被门禁拒）。"""
     from hiveweave.tools.code_audit import RequestCodeAuditParams, request_code_audit_tool
 
     run_mock = AsyncMock(return_value={"audited": False, "reason": "llm_failed"})
@@ -440,7 +441,9 @@ async def test_tool_shell_llm_failed_next_action_is_soft():
     assert "llm_failed" in text
     assert "retry" in text.lower()
     assert "submit_task" in text
-    assert "soft" in text.lower()
+    # 新契约：明确告知会被门禁拦下 + 指路 waive，且不再有 "soft gate"
+    assert "soft" not in text.lower()
+    assert "waive_attestation" in text
 
 
 @pytest.mark.asyncio
@@ -539,9 +542,11 @@ def test_ledger_basic():
 
 def test_submit_reminder_helper_llm_failed_vs_generic():
     from hiveweave.services.code_audit import (
+        CODE_AUDIT_LLM_TIMEOUT_S,
         CODE_AUDIT_REMINDER,
         CODE_AUDIT_REMINDER_LLM_FAILED,
         code_audit_submit_reminder,
+        effective_audit_timeout_s,
         record_audit_attempt,
         record_change,
         reset_ledger,
@@ -551,7 +556,16 @@ def test_submit_reminder_helper_llm_failed_vs_generic():
     record_change("agent-rem", 25)
     assert code_audit_submit_reminder("agent-rem") == CODE_AUDIT_REMINDER
     record_audit_attempt("agent-rem", "llm_failed", task_id="t1")
-    assert code_audit_submit_reminder("agent-rem") == CODE_AUDIT_REMINDER_LLM_FAILED
+    llm_failed_msg = code_audit_submit_reminder("agent-rem")
+    # 提示必须报**有效**帽（≤ agent 侧首读帽），不是配置值 ——
+    # 否则 Agent 会以为还有余量（审计 [2]）。
+    eff = effective_audit_timeout_s()
+    shown = int(eff) if float(eff).is_integer() else eff
+    assert llm_failed_msg == CODE_AUDIT_REMINDER_LLM_FAILED.format(timeout_s=shown)
+    assert eff <= CODE_AUDIT_LLM_TIMEOUT_S
+    # s3-clone_06 P0-1/P0-3：fail-loud 后不得再宣称"不阻断"，且须指路 waive
+    assert "does not block" not in llm_failed_msg
+    assert "waive_attestation" in llm_failed_msg
     record_audit_attempt("agent-rem", "no_callback")
     no_cb = code_audit_submit_reminder("agent-rem")
     assert "no_callback" in no_cb

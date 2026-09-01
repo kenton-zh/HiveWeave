@@ -205,7 +205,7 @@ async def _submit_preflight(
         required_attestation_kinds,
         resolve_task_policy,
     )
-    from hiveweave.services.code_audit import kinds_after_code_audit_soft_fail
+    from hiveweave.services.code_audit import code_audit_soft_fail_pending
 
     ts = _task_svc.TaskService()
     issues: list[dict] = []
@@ -218,12 +218,13 @@ async def _submit_preflight(
             tags = []
     policy_id = ledger_policy_id(task)
     needed = required_attestation_kinds(policy_id)
-    needed, audit_soft = kinds_after_code_audit_soft_fail(
-        needed, agent_id, task_id
-    )
+    # P0-3 fail-loud (TEST_DSH_38): an llm_failed attempt no longer drops the
+    # kind at submit. The kind stays required; a passing attestation satisfies
+    # verify_ids, otherwise the submit is rejected with an explicit-waive hint.
+    audit_soft = code_audit_soft_fail_pending(needed, agent_id, task_id)
     if audit_soft:
         log.info(
-            "submit_code_audit_soft_fail_accepted",
+            "submit_code_audit_soft_fail_gate",
             agent_id=agent_id,
             task_id=str(task_id)[:8],
             policy_id=policy_id,
@@ -449,8 +450,20 @@ async def _submit_preflight(
                             )
                         ),
                     })
-    elif audit_soft:
-        pass
+                if audit_soft:
+                    issues.append({
+                        "code": "audit_soft_fail_gate",
+                        "message": (
+                            "A previous request_code_audit attempt ended "
+                            "llm_failed — silent skip is no longer allowed "
+                            "(P0-3 fail-loud). Either retry "
+                            "request_code_audit until an attestation is "
+                            "issued, or have a coordinator run "
+                            "waive_attestation(taskId=\""
+                            f"{task_id}\", reason=\"audit unavailable\") — "
+                            "the waive is logged and expires in 24h."
+                        ),
+                    })
     elif params.tests_passed is not True:
         # docs_only still asks for explicit ack
         issues.append({
@@ -810,6 +823,13 @@ async def _submit_preflight(
     "VERIFY task: MUST pass verdict=PASS|FAIL (+blockingIssues when FAIL). "
     "Tasks with a delivery contract (写树代码任务): MUST pass "
     "deliveryContract={summary, test:'test_run:<id>' | 'N/A—<原因>'}. "
+    "GATE CONTRACT (code_audit_unit policy): if your code edits exceed 20 "
+    "lines, a PASSING code_audit attestation (exit_code=0) is REQUIRED — "
+    "submit without one is rejected (dry-run lists the missing kinds). If "
+    "request_code_audit soft-fails (llm_failed/no_model/no_callback), the "
+    "gate stays CLOSED: retry once; if it keeps failing, ask your "
+    "coordinator/superior to run waive_attestation(taskId, reason) — a "
+    "silent re-submit just gets rejected again. "
     "docs/explore tasks may use tags docs/explore. "
     "If taskId omitted, auto-detects your current running task. "
     "See PLATFORM MECHANISMS (system prompt) for gate semantics.",

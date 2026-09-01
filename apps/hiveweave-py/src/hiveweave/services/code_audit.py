@@ -17,6 +17,7 @@ to a soft-fail dict with a machine-readable ``reason``.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -28,9 +29,55 @@ from hiveweave.services.model import NoModelConfiguredError
 
 log = structlog.get_logger(__name__)
 
-# TEST_DSH_32 P7：审计是软门——LLM 故障不应烧满共享重试的 ~90s 才降级。
-# 单次审计 one-shot 帽 45s，超时按 llm_failed 软放行（此前 90.9s×2 实锤）。
-CODE_AUDIT_LLM_TIMEOUT_S = 45
+# s3-clone_06 P0-1：45s 帽是「审计为软门」时代的取舍——那时超时只意味着
+# 「没审计也放行」，宁可快失败。P0-3（fail-loud）之后语义反转：超时 =
+# 提交被门禁拦下或走显式 waive 流程，代价比多等 60 秒高得多。实测本项目
+# 成功调用耗时 27–41s、失败全部精确停在 452xx ms（撞 45s 顶），说明审计
+# 本就贴着上限跑，上游一抖即全灭（34 次 27 次 llm_failed = 79%）。
+#
+# **实际可达上限（审计 [2]，勿再自欺）**：本值只是外层 ``asyncio.wait_for``
+# 的帽，真正决定成败的是 agents.agent._review_llm_post_with_retry：
+#   首读固定 ``_REVIEW_LLM_READ_TIMEOUT_MAX_S``（90s）→ 重试窗
+#   ``_REVIEW_LLM_RETRY_WINDOW_S``（45s）→ 首读超时后 remaining = 45-90 < 0
+#   直接上抛，第二次尝试根本不会发生。
+# 因此 > 90s 的配置**不可达**（调 env 到 300 也只跑 90s）。这里夹到
+# agent 侧的真实帽子（取不到则按 90 兜底），并在提示文案里用有效值，
+# 杜绝"改了配置没变化"的假象。想真正放宽须改 agent 侧首读帽/重试窗。
+def _timeout_from_env(name: str, default: int) -> int:
+    """环境变量读取超时秒数——非法值回退默认，绝不在**模块导入期**抛异常。
+
+    ``int(os.environ.get(...))`` 遇到 "60s"/"abc"/"" 会 ValueError，而这是
+    模块级常量：一炸就是整个 code_audit 服务不可用（连带 submit 门禁）。
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning("code_audit.bad_timeout_env", key=name, value=raw, default=default)
+        return default
+    return value if value > 0 else default
+
+
+CODE_AUDIT_LLM_TIMEOUT_S = _timeout_from_env("HIVEWEAVE_CODE_AUDIT_TIMEOUT_S", 120)
+
+
+def effective_audit_timeout_s() -> float:
+    """审计实际能等到的秒数 = 请求值 ∩ agent 侧首读帽。
+
+    agent 侧重试助手的首读帽是硬顶（见上注）：外层 wait_for 再大也没用。
+    这里**运行时**读取该帽子（不在模块导入期 import agents，避免
+    services ↔ agents 循环导入），取不到时按 90 兜底。
+    """
+    try:
+        from hiveweave.agents.agent import (  # noqa: PLC0415 — 见上：避免循环导入
+            _REVIEW_LLM_READ_TIMEOUT_MAX_S as cap,
+        )
+
+        return float(min(CODE_AUDIT_LLM_TIMEOUT_S, cap))
+    except Exception:  # noqa: BLE001 — best-effort，取不到用兜底值
+        return float(min(CODE_AUDIT_LLM_TIMEOUT_S, 90))
 
 # One-shot review callback contract — same shape as
 # ``agents/agent.py:_review_llm_callback`` / tools/review.py ReviewLLMCallback.
@@ -51,15 +98,23 @@ CODE_AUDIT_REMINDER = (
     "code audit attestation exists. Call request_code_audit(taskId=...) "
     "before submit_task to get a second-pass LLM audit of your worktree diff."
 )
+# P0-3（fail-loud）后 llm_failed 不再"静默放行"：code_audit 仍是必需证据，
+# submit 会被门禁拦下，出路只有两条——重试到审计成功，或由 coordinator 显式
+# waive。旧文案"soft gate — does not block"是 fail-loud 之前的残留，会误导
+# Agent 以为可以直接提交（s3-clone_06 实测）。
 CODE_AUDIT_REMINDER_LLM_FAILED = (
     "[CODE AUDIT REMINDER] Code audit was attempted but the LLM call failed "
-    "(llm_failed). Retry request_code_audit(taskId=...) once, or continue "
-    "with submit_task (soft gate — does not block)."
+    "(llm_failed). Retry request_code_audit(taskId=...) — {timeout_s}s "
+    "timeout, the audit takes 30-90s on real diffs. If it keeps failing, the "
+    "submit gate stays CLOSED: ask a coordinator to run "
+    "waive_attestation(taskId=..., reason=...) with the fallback evidence "
+    "you do have (test_run results). Silently submitting will be rejected."
 )
 CODE_AUDIT_REMINDER_ATTEMPTED = (
     "[CODE AUDIT REMINDER] Code audit was attempted but did not produce an "
-    "attestation ({reason}). Retry request_code_audit(taskId=...) once, or "
-    "continue with submit_task (soft gate — does not block)."
+    "attestation ({reason}). Retry request_code_audit(taskId=...) once; if it "
+    "still fails, submit stays BLOCKED until a coordinator runs "
+    "waive_attestation(taskId=..., reason=...)."
 )
 _SOFT_FAIL_ATTEMPT_REASONS = frozenset({"llm_failed", "no_model", "no_callback"})
 
@@ -132,8 +187,11 @@ def _task_ref_match(left: str | None, right: str | None) -> bool:
 def code_audit_soft_fail_covers(agent_id: str, task_id: str | None) -> bool:
     """True when this agent already attempted audit on *task_id* and soft-failed.
 
-    Aligns the code_audit* submit gate with the tool/prompt contract:
-    llm_failed / no_model / no_callback do not block submit.
+    **只表示"有过失败尝试记录"**，不代表放行 —— P0-3（fail-loud）之后本谓词
+    服务于 ``code_audit_soft_fail_pending`` 的**拦截**判定：命中即说明该
+    agent 在本任务上审计没跑成，submit 会被门禁拦下（出路：重试到成功，或
+    coordinator 显式 waive）。旧 docstring「do not block submit」是 fail-loud
+    之前的语义残留，勿再据此推断（审计 [1]）。
     """
     rec = get_last_audit_attempt(agent_id)
     if not rec:
@@ -170,31 +228,41 @@ def drop_code_audit_kind_if_soft(
     task_id: str | None = None,
     evidence: dict | None = None,
 ) -> tuple[frozenset[str] | None, bool]:
-    """Drop CODE_AUDIT_KIND when evidence is stamped or in-memory attempt matches.
+    """Approve/HTTP-time compat: drop CODE_AUDIT_KIND ONLY on a stamped soft-fail.
 
-    Approve/HTTP must not re-require code_audit after submit already accepted
-    llm_failed — in-memory ``_last_attempt`` is cleared on successful submit.
+    P0-3 (TEST_DSH_38) fail-loud: an in-memory llm_failed attempt no longer
+    drops the kind anywhere — submit rejects and demands a retry or an
+    explicit coordinator waive. This drop survives ONLY for the approve/HTTP
+    re-check of a task whose evidence carries the stamp (i.e. submitted under
+    legacy rules, or submitted under a valid waiver), so an approve is never
+    re-blocked on history the submit gate already decided. The ``agent_id`` /
+    ``task_id`` params are kept for signature compat but no longer trigger a
+    drop by themselves.
     """
     if not needed or CODE_AUDIT_KIND not in needed:
         return needed, False
     if evidence_has_code_audit_soft_fail(evidence):
         leftover = frozenset(k for k in needed if k != CODE_AUDIT_KIND)
         return leftover, True
-    if agent_id and code_audit_soft_fail_covers(agent_id, task_id):
-        leftover = frozenset(k for k in needed if k != CODE_AUDIT_KIND)
-        return leftover, True
     return needed, False
 
 
-def kinds_after_code_audit_soft_fail(
+def code_audit_soft_fail_pending(
     needed: frozenset[str] | None,
-    agent_id: str,
+    agent_id: str | None,
     task_id: str | None,
-) -> tuple[frozenset[str] | None, bool]:
-    """Submit-time wrapper: in-memory attempt only (evidence not written yet)."""
-    return drop_code_audit_kind_if_soft(
-        needed, agent_id=agent_id, task_id=task_id
-    )
+) -> bool:
+    """Submit-time detection: code_audit required and only soft-fail coverage.
+
+    True means the submit gate must NOT silently pass — the agent must retry
+    request_code_audit until an attestation exists, or obtain an explicit
+    coordinator waive_attestation (logged, 24h expiry).
+    """
+    if not needed or CODE_AUDIT_KIND not in needed:
+        return False
+    if not agent_id:
+        return False
+    return code_audit_soft_fail_covers(agent_id, task_id)
 
 
 def code_audit_submit_reminder(agent_id: str) -> str:
@@ -208,7 +276,11 @@ def code_audit_submit_reminder(agent_id: str) -> str:
     attempt = _last_attempt.get(agent_id)
     reason = (attempt or {}).get("reason")
     if reason == "llm_failed":
-        return CODE_AUDIT_REMINDER_LLM_FAILED
+        # 报**有效**帽（≤ agent 侧首读帽），不报配置值——否则 Agent 会以为
+        # 还有余量而盲目重试。
+        _eff = effective_audit_timeout_s()
+        _shown = int(_eff) if float(_eff).is_integer() else _eff
+        return CODE_AUDIT_REMINDER_LLM_FAILED.format(timeout_s=_shown)
     if reason in _SOFT_FAIL_ATTEMPT_REASONS:
         return CODE_AUDIT_REMINDER_ATTEMPTED.format(reason=reason)
     return CODE_AUDIT_REMINDER
@@ -555,6 +627,8 @@ async def _invoke_audit_llm(
             )
             chosen, source = None, "own"
 
+    # 用**有效**帽（请求值 ∩ agent 侧首读帽），参见 effective_audit_timeout_s
+    _timeout_s = effective_audit_timeout_s()
     try:
         if oneshot_llm is not None and chosen:
             # Verdict must land in ``content`` (``VERDICT: PASS|ISSUES`` on
@@ -565,12 +639,12 @@ async def _invoke_audit_llm(
             cfg["default_reasoning_effort"] = None
             text = await asyncio.wait_for(
                 oneshot_llm(cfg, system, user),
-                timeout=CODE_AUDIT_LLM_TIMEOUT_S,
+                timeout=_timeout_s,
             )
         elif call_llm is not None:
             text = await asyncio.wait_for(
                 call_llm(system, user),
-                timeout=CODE_AUDIT_LLM_TIMEOUT_S,
+                timeout=_timeout_s,
             )
             source = "own"
             chosen = None
@@ -582,7 +656,7 @@ async def _invoke_audit_llm(
         log.warning(
             "code_audit.llm_timeout",
             agent_id=agent_id,
-            timeout_s=CODE_AUDIT_LLM_TIMEOUT_S,
+            timeout_s=_timeout_s,
         )
         return None, {"audited": False, "reason": "llm_failed"}
     except NoModelConfiguredError as exc:

@@ -10,6 +10,7 @@ import {
   draftFromStreamingMessage,
   isTeamChannelMessage,
   mapDbToChatMessages,
+  settledMessageHasSegments,
   mergeStreamDraftIntoMessages,
   parseToolUsePayload,
   sanitizeMessagesForCache,
@@ -226,7 +227,12 @@ export function useChatMessages(opts: {
     (event: ChatEvent, forAgentId: string) => {
       if (activeAgentIdRef.current !== forAgentId) return;
       if (event.type === "round_start") {
-        updateStreamDraft((prev) => (prev ? beginStreamRound(prev) : prev));
+        // round 号由 ws 层放在 data（0 起轮号，字符串）——交给
+        // beginStreamRound 插入轮次分隔（首轮/缺号 no-op）。
+        const roundNum = parseInt(event.data, 10);
+        updateStreamDraft((prev) =>
+          prev ? beginStreamRound(prev, Number.isFinite(roundNum) ? roundNum : undefined) : prev,
+        );
         return;
       }
       if (event.type === "message_id") {
@@ -389,14 +395,28 @@ export function useChatMessages(opts: {
             ? { ms: Math.max(1, Date.now() - finishedDraft.startedAt) }
             : null;
         const finishedId = finishedDraft?.assistantId;
-        loadMessagesFromDb(forAgentId).then((ok) => {
-          if (ok) updateStreamDraft(null);
+        // fetch-then-swap（八轮收口竞态修复）：done 后只有当重载回来的消息
+        // 带 metadata.segments（整轮块序列）才清 draft 换正式渲染；中途快照
+        // 的 content 是旁白拼接平文本，拿它换 draft 会退化成「旁白总和」。
+        // 有界重试（5×400ms）兜底，超限按旧行为放行，UI 不可能卡死。
+        const swapDraftWhenReady = async (attempt = 0): Promise<void> => {
+          if (activeAgentIdRef.current !== forAgentId) return; // 已切走，放弃
+          const ok = await loadMessagesFromDb(forAgentId);
+          const sessionMsgs =
+            (useAppStore.getState().chatSessions[forAgentId] as ChatMessage[] | undefined) ?? [];
+          const ready = ok && settledMessageHasSegments(sessionMsgs, finishedId);
+          if (!ready && attempt < 4) {
+            window.setTimeout(() => void swapDraftWhenReady(attempt + 1), 400);
+            return; // draft 留屏（流式整轮视图），等带分段的快照
+          }
+          updateStreamDraft(null);
           if (genStats && finishedId) {
             setMessages((prev) =>
               prev.map((m) => (m.id === finishedId ? { ...m, _genStats: genStats } : m)),
             );
           }
-        });
+        };
+        void swapDraftWhenReady();
         setIsStreaming(false);
         updateProcessingAgent(forAgentId, false);
         delete savedDraftsRef.current[forAgentId];
