@@ -55,6 +55,9 @@ export function useChatMessages(opts: {
   useEffect(() => {
     agentInfoRef.current = agentInfo;
   }, [agentInfo]);
+  // 瞬时失败重试计数 / 消息是否已成功加载（fetchAgent 成功后补载用）
+  const agentRetryRef = useRef(0);
+  const agentMsgLoadedRef = useRef(false);
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [messagesAgentId, setMessagesAgentId] = useState<string | null>(null);
@@ -484,6 +487,11 @@ export function useChatMessages(opts: {
     let cancelled = false;
     const loadForAgentId = agentId;
     stickToBottomRef.current = true;
+    // 瞬时失败重试（s3-clone_07 实测：点击瞬间请求失败 → 兜底 "Agent/Developer"
+    // 占位 + 空消息**永久卡死**，因为 fetchAgent 与 loadMessagesFromDb 均无重试）。
+    // 有界 3 次、线性退避（1.5s×次数）；成功即停。切 agent 时随 effect 重置。
+    agentRetryRef.current = 0;
+    agentMsgLoadedRef.current = false;
 
     const isAgentSwitch = switchingFrom !== agentId;
     const savedDraft = savedDraftsRef.current[agentId];
@@ -509,17 +517,33 @@ export function useChatMessages(opts: {
         if (cancelled || activeAgentIdRef.current !== loadForAgentId) return;
         if (data && typeof data === "object" && data.id) {
           setAgentInfo(data);
-        } else {
-          setAgentInfo({ id: loadForAgentId, name: "Agent", role: "module_dev", status: "idle" });
+          // agent 信息成功 = 网络/后端已可用；若首轮消息加载失败过，这里补一次
+          if (!agentMsgLoadedRef.current) {
+            agentMsgLoadedRef.current = await loadMessagesFromDb(loadForAgentId);
+          }
+          return;
         }
+        // 无 id 的载荷 = 同款失败，走重试而不是直接钉死占位
+        throw new Error("agent payload missing id");
       } catch (err) {
         if (cancelled || activeAgentIdRef.current !== loadForAgentId) return;
         console.error("Failed to fetch agent:", err);
         setAgentInfo({ id: loadForAgentId, name: "Agent", role: "module_dev", status: "idle" });
+        if (agentRetryRef.current < 3) {
+          agentRetryRef.current += 1;
+          const delay = 1500 * agentRetryRef.current;
+          window.setTimeout(() => {
+            if (!cancelled && activeAgentIdRef.current === loadForAgentId) {
+              void fetchAgent();
+            }
+          }, delay);
+        }
       }
     }
     fetchAgent();
-    loadMessagesFromDb(loadForAgentId);
+    void loadMessagesFromDb(loadForAgentId).then((ok) => {
+      agentMsgLoadedRef.current = ok;
+    });
 
     return () => {
       cancelled = true;
