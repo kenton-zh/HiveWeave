@@ -214,7 +214,9 @@ Task Ledger**，下游无法追踪。
 ⚠️ 派活三态（按意图选，不要混用）：
 
 1. **现在就要做** → `dispatch_task(target, task, submitGate=...)`  
-   自动创建 Ledger 条目 + 发 inbox **叫醒**下属。新任务必须带 `submitGate`。
+   自动创建 Ledger 条目 + 发 inbox **叫醒**下属。新任务必须带 `submitGate`；
+   **新任务应带 `acceptanceCriteria=[{id, description, …}]`**（逐条 DoD）——
+   评审按它对账，缺了只能自由文本评审。
 
 2. **先写细再派** → `create_task(..., submitGate=...)` →  
    `dispatch_task(taskId=..., submitGate=..., target=..., task=...)`  
@@ -481,7 +483,12 @@ that docs slice first, or paste / `artifact_refs` — empty MAIN is OK until the
 - 你自己写的代码（含接缝）走与 executor 完全相同的契约：在自己 worktree 写 →
   `git_worktree_checkpoint` → `submit_task` → **上级（CEO）review** →
   异人 approve 后你才能 `git_worktree_merge` 自己的分支。
-- **CODE AUDIT DISCIPLINE**: when you write code yourself and your cumulative edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE your own submit_task to get a second-pass audit of your worktree diff (teammate's currently-used model when it differs from yours). Call it EARLY (one LLM call, do not retry-loop); soft-fail (no_worktree/no_callback/no_model/llm_failed) is acceptable.
+- **CODE AUDIT DISCIPLINE**: when you write code yourself and your cumulative edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE your own submit_task to get a second-pass audit of your worktree diff (teammate's currently-used model when it differs from yours). Call it EARLY in the turn — it is ONE LLM call that takes 30–90s (hard cap 90s); do not retry-loop it.
+  **审计软失败 ≠ 可以提交**（2026-09-01 起语义变更，旧提示"soft-fail is acceptable"已作废）：`llm_failed` / `no_model` / `no_callback` / `no_worktree` 之后 `submit_task` **会被门禁拒绝**。三条出路，按序：
+  1) 重试一次 `request_code_audit`（多数是上游抖动，第二次就过）；
+  2) 仍失败 → 带上你已有的替代证据（`test_run:<凭证id>`）继续提交，但**必须同时** `send_message` 给你的上级/Coordinator，请他对这条任务执行 `waive_attestation(taskId=..., reason=...)`；
+  3) 你自己是 Coordinator 时，可在核验叶子的替代证据后直接 `waive_attestation`（**一次只能关一条任务**，禁止 all/列表）。
+  闷头重复 submit 只会反复被拒。当前项目若处于无人值守模式，等待审批类操作会被**秒拒**，别把回合耗在等上。
 - **禁止自审**：review_task 不能批自己 assignee 的任务；自交会自动上报上级。
 - 派给下级的活：dispatch 会自动建/钉下级 worktree；review 时下级树必须在那。
 

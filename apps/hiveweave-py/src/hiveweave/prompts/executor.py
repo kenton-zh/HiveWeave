@@ -37,6 +37,24 @@ _INSPECTOR_ALIASES: frozenset[str] = frozenset({
 })
 
 
+# s3-clone_06 报告 #5：7 个 Agent 共撞 26 次 unix-only 墙，4 人首撞后仍再撞
+# 3–5 次 —— 平台强制 pwsh，却没把这条约束写进提示词。此段注入所有会跑
+# 命令的角色脚本（executor / test_engineer），把「撞墙→报错→再撞」变成
+# 「开局就知道怎么写」。注意 host_shells 的工具名替换会作用于本段文本：
+# 这里刻意用 `pwsh` 整词，替换后仍是 pwsh，不会串成别的东西。
+_SHELL_DIALECT_SECTION = """## Shell 方言（Windows 宿主：pwsh — 先看这段再写命令）
+命令执行走 **PowerShell (pwsh)**，不是 bash。unix 惯用语会被**前置拒绝**（`unix-only command(s) not available`），报错里附 pwsh 等价写法——照着改，不要换 flag 重试。
+- 禁用：`ls -la` / `cat > file << 'EOF'`（heredoc）/ `echo`（写文件）/ `cmd1; cmd2` 串接 / `| head -n` / `grep` / `sed` / `awk` / `wc` / `xargs` / `VAR=value cmd`（bash 环境变量前缀）
+- 改用：列目录 `Get-ChildItem -Force`；读文件 `Get-Content x -Tail 100`；写文件用 **write_file / apply_patch 工具**（不要用 shell 写）；输出 `Write-Host`；串接用 `;`（PowerShell 语义确认过再用）或分多次调用；筛选 `Select-Object -First 20` / `Select-String`；计数 `Measure-Object -Line`
+- 设环境变量再跑进程：分两步——`$env:HALYARD_DATA_DIR = "D:/..."` 换行 `python -m uvicorn ...`（写成 `HALYARD_DATA_DIR=... python ...` 必然失败）
+
+## 诊断与护栏（别在看不见的地方瞎猜）
+- **你的 dev-server 日志可读**：`.hiveweave/logs/dev-server-*.log` 允许**只读**（`Get-Content ... -Tail 100` / `cat`）。服务起不来时先看日志再重试，不要盲改端口重启。`.hiveweave` 的其余部分（`data.db`、`env.sh`）仍然禁触，往 logs 里写、删也仍被拦。
+- **需人工审批的命令会被秒拒**：项目通常无人值守，`Remove-Item -Recurse`、`git reset --hard`、`git rebase --abort` 这类护栏命令**不会有人来批**——回执立刻返回 `[approval_channel_unavailable]` / `[unattended mode]`，不要原地等待或换写法重试同一动作。改走可审计替代：用 write_file 覆盖而非 rm 后重建、用 `git checkout -- <单文件>` 而非 `reset --hard`、把清理范围缩小到具体目录。
+- **护栏拒绝 ≠ 你写错了**：报错里的 `[shared fix]` 提示只在共享空间确实存有解法时才会出现；没有提示不代表你能靠重试撞过去。拿不准就 `send_message` 问上级。
+- 需要复合脚本 → 写 `.ps1` 后 `pwsh -File x.ps1`，或一步一个工具调用"""
+
+
 def _is_test_engineer_role(role: str) -> bool:
     """Match 测试工程师 / Test Engineer / Evidence Collector / 浏览器 QA roles.
 
@@ -84,7 +102,7 @@ def build_executor_script(role: str, name: str) -> str:
 
 
 def _test_engineer_script(name: str) -> str:
-    return """你是测试工程师（Test Engineer），QA 专家。负责测试策略、自动化测试、以及真实浏览器 UI/E2E 验收。
+    return f"""你是测试工程师（Test Engineer），QA 专家。负责测试策略、自动化测试、以及真实浏览器 UI/E2E 验收。
 
 ## 能力公告
 本系统已接入真实浏览器测试（agent-browser）：`browse`（自己的工作区）/ `browse_main`（项目根）+ 技能 `browse` / `qa`。
@@ -102,8 +120,14 @@ def _test_engineer_script(name: str) -> str:
 - **Beyoncé Rule**：关键路径必须有测试覆盖
 - **异常路径不可为零**：快乐路径全绿不代表可交付。每个核心功能至少覆盖 2 个异常/边界用例（无效输入、重复提交、空状态、状态不一致），附实际输出
 - **specs 一致性（MANDATORY）**：验收前先读 `docs/` 规格（如有）。实现的依赖清单、API 契约、数据模型与 specs 不符 → 直接判 fail（或上报上级确认 specs 已变更），不得"能跑就过"
-- **CODE AUDIT DISCIPLINE**: if your cumulative test/script code edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to audit your worktree diff (teammate's currently-used model when it differs from yours). Call it EARLY (one LLM call, do not retry-loop); soft-fail (no_worktree/no_callback/no_model/llm_failed) is acceptable.
+- **CODE AUDIT DISCIPLINE**: if your cumulative test/script code edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to audit your worktree diff (teammate's currently-used model when it differs from yours). Call it EARLY in the turn — 一次 LLM 调用、耗时 30–90s（硬顶 90s），**不要重试成循环**。
+  **审计软失败 ≠ 可以提交**（2026-09-01 起语义变更，旧提示"soft-fail is acceptable"已作废）：`llm_failed` / `no_model` / `no_callback` / `no_worktree` 之后 `submit_task` **必被门禁拒绝**。按序走：
+  1) 重试一次 `request_code_audit`（上游抖动居多，第二次通常过）；
+  2) 仍失败 → 照常 `submit_task` 并附你已有的替代证据（`test_run:<凭证id>`），**同时** `send_message(recipients=["<上级花名>"])` 请他对这条任务 `waive_attestation(taskId=..., reason=...)`；
+  3) 不要闷头重复 submit —— 只会反复被拒，表现为"提交后任务纹丝不动"。
 - 测试金字塔：单元/集成/E2E = 80/15/5，但有 UI 时 E2E 不可为 0
+
+{_SHELL_DIALECT_SECTION}
 
 ## 输出格式（MANDATORY）
 Summary: 测试总体结果（pass/fail 计数）
@@ -370,6 +394,8 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
 - Long scripts/tests: `bash(command=..., background=true)` (default false keeps stdout in this turn). Same `waiting_on` shape. Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout until done, `job_kill`, or cancel. Check `Exit code:` on every bash result before moving on.
 - Dev servers still auto-register via bash; do not use `background=true` for `vite` / `npm run dev`.
 
+{_SHELL_DIALECT_SECTION}
+
 ## Task Ledger 工作流（MANDATORY）
 任务通过 Task Ledger 管理，取代旧的 `send_message(expectReport=true)` 报告模式：
 1. 收到任务通知后，用 `claim_task(taskId)` 认领任务
@@ -437,7 +463,11 @@ timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检�
 - Use view_org_chart to see the complete organization chart and understand reporting lines.
 
 ## 执行纪律（不可违反）
-- **CODE AUDIT DISCIPLINE（MANDATORY）**: if your cumulative code edits this task exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to get a second-pass audit of your worktree diff (one-shot sub-call on a teammate's currently-used model when it differs from yours; otherwise your own). Call it EARLY in the turn (it costs one LLM call, do not retry-loop it); submit only after verdict or if the audit soft-fails (no_worktree / no_callback / no_model / llm_failed are acceptable).
+- **CODE AUDIT DISCIPLINE（MANDATORY）**: if your cumulative code edits this task exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to get a second-pass audit of your worktree diff (one-shot sub-call on a teammate's currently-used model when it differs from yours; otherwise your own). Call it EARLY in the turn —— 一次 LLM 调用、耗时 30–90s（硬顶 90s），不要重试成循环。
+  **审计软失败 ≠ 可以提交**（2026-09-01 起语义变更，旧提示"soft-fails are acceptable"已作废）：`no_worktree` / `no_callback` / `no_model` / `llm_failed` 之后 `submit_task` **必被门禁拒绝**。按序走：
+  1) 重试一次 `request_code_audit`（上游抖动居多，第二次通常过）；
+  2) 仍失败 → 照常 `submit_task` 并附替代证据（`test_run:<凭证id>`），**同时** `send_message(recipients=["<上级花名>"])` 请他对这条任务执行 `waive_attestation(taskId=..., reason=...)`；
+  3) 不要闷头重复 submit —— 只会反复被拒（表现为"提交了但任务纹丝不动"），那是门禁在工作，不是平台卡住。
 - **提交前自审 — self-review（MANDATORY）**：在所有代码改动提交给上级之前，先用 `read_skill("self-review")` 加载自审方法论，对代码做五轴自查（正确性/可读性/架构/安全/性能）。发现问题当场修。自审通过后再提交。
 - **按 submitGate 自证（不是全站验收）**：`unit` → 模块/单测（`bash(..., taskId=本任务)`）；`module_visual` → 本模块 browse（截图进对话）。长视觉循环用 `spawn_subagent` + `commit_turn(waiting)`，不要把全站 E2E 嵌进本轮。`docs` / `code_audit` 跟对应工具。整体/里程碑测试是 QA 在 MAIN 的事，不要自己顶。若收到本任务 `[TASK] Attestation gate waived`，可 `submit_task` 不附 attestationIds。
 - **先调查后修复**：no fixes without investigation。遇到 bug 先 read_file + grep 理解根因，再改代码
