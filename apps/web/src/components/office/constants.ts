@@ -16,32 +16,19 @@ export const TILE_H = 32;
 // ── Desk Layout ───────────────────────────────────────────────────
 
 /**
- * 9 desk slots grouped by role，对应 1:1 复刻背景图（9 张白桌 2+3+4 三排）。
- *   领导席（lead）= 顶排 2 张（管理层坐在后排，靠近厨房/前台）
- *   开发（build）= 中排 3 张 + 底排前 2 张 = 5
- *   评审/QA（review）= 底排后 2 张
- *
- * 坐标基准：desk (x, y) 是「桌子上表面」在世界坐标系的中间-ish 位置。
- * OfficeScene 中 agent 容器 y = desk.y + 78，即脚底正好落在「桌前地面」。
- * 椅子 sprite y = desk.y + 44（靠背底部大约在 agent 脚底上方 34 px）。
- *
- * 校准方式：读取 3840×2160 gpt-image-2-official 4K 原图 → 用画图圈出每
- * 张桌前空椅的靠背中心 → 缩到 world 1280×720（除以 3），
- * desk.y = chair_center_y − 44，desk.x 与椅子靠背中心 x 对齐（±3px）。
+ * 7 个桌位，按背景图 office-scene-bg.png（1672×941，world = px / 1.30625）标定：
+ *   中排 3 桌 + 下排 3 桌 + 前台柜台。坐标 = 该桌「落座基准点」，
+ *   桌套件/椅位全部由 DESK_SET 的相对偏移从此点推出（角色腰线对齐桌远缘）。
+ * 顺序即分配顺序，前台柜台放最后（6 agent 时不占用，留给 F 视角接待员）。
  */
 export const DESKS: DeskSlot[] = [
-  // 顶排 2 张（后排领导桌）
-  { id: "lead-1",   x: 586, y: 180, role: "lead" },   // CEO (top-left)
-  { id: "lead-2",   x: 693, y: 206, role: "lead" },   // Architect / Manager (top-right)
-  // 中排 3 张
-  { id: "build-1",  x: 439, y: 282, role: "build" },  // middle-left (close to meeting room)
-  { id: "build-2",  x: 604, y: 310, role: "build" },  // middle-center
-  { id: "build-3",  x: 843, y: 299, role: "build" },  // middle-right (near right plant)
-  // 底排 4 张
-  { id: "build-4",  x: 504, y: 421, role: "build" },  // bottom row 1st (front-left)
-  { id: "build-5",  x: 605, y: 450, role: "build" },  // bottom row 2nd
-  { id: "review-1", x: 768, y: 444, role: "review" }, // bottom row 3rd
-  { id: "review-2", x: 871, y: 474, role: "review" }, // bottom row 4th (front-right close to entry)
+  { id: "lead-1",   x: 747, y: 326, role: "lead" },   // 中排中桌
+  { id: "lead-2",   x: 966, y: 379, role: "lead" },   // 中排右桌
+  { id: "build-1",  x: 510, y: 278, role: "build" },  // 中排左桌
+  { id: "build-2",  x: 510, y: 433, role: "build" },  // 下排左桌
+  { id: "build-3",  x: 794, y: 510, role: "build" },  // 下排中桌
+  { id: "review-1", x: 1019, y: 581, role: "review" },// 下排右桌
+  { id: "review-2", x: 563, y: 547, role: "review" }, // 前台柜台（F 视角接待员预留）
 ];
 
 // ── Common Area (talking / roaming targets) ───────────────────────
@@ -130,10 +117,20 @@ export const ASSET_URLS = {
   SPEECH_BUBBLE: "/office-assets/speech-bubble.png",
   WALL_WINDOW: "/office-assets/wall-window.png",
   WHITEBOARD: "/office-assets/whiteboard.png",
-  /** 整间办公室背景（apimart gpt-image-2-official 4K 图生图 + mask 局部重绘：
-   *  原图 1:1 复刻 → 去人物 → 前台移至正门 → 远侧椅后移留座。3840×2160（16:9），
-   *  场景内缩到 WORLD_W×WORLD_H = 1280×720。 */
+  /** 整间办公室背景（PIL 逐行插值去桌椅版，1672×941：地板/墙/沙发/吧台/绿植等
+   *  不与角色交互的陈设；桌椅全部改由引擎 sprite 渲染。原带桌版备份
+   *  office-scene-bg.with-desks.bak.png）。场景内缩到 WORLD_W×WORLD_H = 1280×720。 */
   OFFICE_BG: "/office-assets/office-scene-bg.png",
+  /** 分层家具 sprite（2026-08-30 差分抠图：带桌原图 − 去桌背景 = 前景，
+   *  100% 原场景像素/风格/光影）。桌套件按桌面上缘水平切两片：
+   *  BACK = 后椅+桌远侧（画在角色之下），FRONT = 桌面+显示器+前椅（画在角色之上，遮住躯干下半） */
+  OFFICE_DESK_BACK: "/office-assets/office-desk-back.png",
+  OFFICE_DESK_FRONT: "/office-assets/office-desk-front.png",
+  OFFICE_FRONTDESK_SET: "/office-assets/office-frontdesk-set.png",
+  /** 紫衣女孩打字动画表（2026-08-30：参考图锚定生成，2×2 = 4 帧打字循环。
+   *  实测为全身坐姿帧（非腰截断）：内容底 y=83 ≈ anchor 0.875×96=84，即 0.875 处是鞋底；
+   *  腿部由桌套件 front 片在运行时遮挡） */
+  AGENT_PURPLE: "/office-assets/agent-purple-typing-sheet.png",
 } as const;
 
 /** 全部需预载的资产 URL（OfficeScene.mount 中统一 Assets.load） */
@@ -160,10 +157,191 @@ export interface SheetLayout {
 }
 
 export const SHEET_LAYOUTS: Record<string, SheetLayout> = {
-  [ASSET_URLS.AGENT_DEV]: { cols: 8, rows: 4, frameW: 64, frameH: 96, scale: 0.8, scaleMode: "linear" },
+  // scaleMode 一律 nearest：linear 会在帧边界采样到相邻帧像素（frame bleeding），
+  // 浏览器实拍表现为角色周围半透明矩形"面纱"（2026-09-01 实测，nearest 后消失）
+  [ASSET_URLS.AGENT_DEV]: { cols: 8, rows: 4, frameW: 64, frameH: 96, scale: 0.8, scaleMode: "nearest" },
   [ASSET_URLS.AGENT_MANAGER]: { cols: 4, rows: 3, frameW: 32, frameH: 48, scale: 1.6, scaleMode: "nearest" },
   [ASSET_URLS.AGENT_QA]: { cols: 4, rows: 3, frameW: 32, frameH: 48, scale: 1.6, scaleMode: "nearest" },
+  [ASSET_URLS.AGENT_PURPLE]: { cols: 2, rows: 2, frameW: 96, frameH: 96, scale: 0.8, scaleMode: "nearest" },
 };
+
+/**
+ * 紫衣女孩动画帧表（2×2 = 4 帧打字循环；只有 A 朝向坐姿）。
+ * 演示模式：idle 也循环打字帧（每张桌的女孩持续打字）；
+ * 坐下/起身系列指向静态帧 0（该 sheet 无此动作，sitPhase 不产生视觉跳变）。
+ */
+export const PURPLE_ANIM_SEQS: Record<AgentAnimKey, number[]> = {
+  idle: [0, 1, 2, 3],
+  walking: [0],
+  working: [0, 1, 2, 3],
+  talking: [0],
+  alert: [0],
+  sitdown: [0],
+  sitting: [0, 1, 2, 3],
+  sitdown_b: [0],
+  sitting_b: [0],
+  getup: [0],
+};
+
+/** 演示开关：所有 agent 默认都用紫衣女孩 sheet（视觉统一） */
+export const PURPLE_DEMO_ALL_AGENTS = true;
+
+/**
+ * 单角色动画演示开关：指定 `startIndex` 起的 1 个角色（按 org tree id 排序后）
+ * 切回 dev 满帧 sheet（呼吸/行走/打字/喝咖啡/点头/跳跃/问号/坐下/坐姿/起身），
+ * 让其能基于 FSM 状态驱动出可见的多姿态切换。
+ *
+ * 设计动机：紫衣女孩 sheet 只有 4 帧打字循环，没有 idle/walking/talking/alert 分态；
+ * 单一 sprite 永远「卡在打字」无法体现整个动画系统的能力。先让一名角色跑起来 →
+ * 验证 dev sheet + FSM + DEV_ANIM_SEQS 全链路通畅 → 后续按角色正式上线时
+ * 把 PURPLE_DEMO_ALL_AGENTS = false 即可全员就位。
+ */
+/**
+ * 单角色动画演示开关：指定索引 0 的角色（按 org tree id 排序后）切回 dev 满帧 sheet
+ * （呼吸/行走/打字/喝咖啡/点头/跳跃/问号/坐下/坐姿/起身），让其基于 FSM 状态驱动出
+ * 可见的多姿态切换；其余角色仍用紫衣 sheet 保持视觉统一。
+ *
+ * 设计动机：紫衣 sheet 只有 4 帧打字循环，且 idle/working 指向同一序列，
+ * 角色永远「卡在打字」，无法体现整个动画系统的能力。先让一名角色跑通
+ * dev sheet + FSM + DEV_ANIM_SEQS 全链路，后续全员上线时把
+ * PURPLE_DEMO_ALL_AGENTS = false 即可按角色就位。
+ *
+ * ── 视角 / 遮挡硬约束（改动前务必读）─────────────────────────
+ * 1. 演示角色强制 A 朝向（rearChair 后椅），与其余紫衣角色同朝向。
+ *    B 朝向（frontChair）角色落在 front 片高度区间内且 zIndex 更低，
+ *    会被「桌面+显示器+前椅」整片盖死，不可用于坐姿演示。
+ * 2. 演示循环只在**坐姿系**状态间切换（working 打字 ↔ idle 坐姿呼吸），
+ *    绝不触发 walking / talking / alert：
+ *      - walking 序列会驱动角色离座平移，坐姿与桌面的遮挡关系当场失效；
+ *      - talking/alert 序列在 dev sheet 中是站姿/跳跃帧，一旦播放人物会
+ *        整个浮到桌面之上（A 位遮挡只有约 7.8px，压不住站立姿态）。
+ * 3. 角色位置冻结在座位上（atDesk 恒 true），不做 roaming / 聚集位移。
+ */
+export const FIRST_AGENT_FULL_ANIMATIONS = true;
+/** 演示模式：一个完整「打字 → 停歇呼吸」周期的时长（毫秒） */
+export const FIRST_AGENT_DEMO_CYCLE_MS = 9000;
+/** 演示模式：周期内处于「打字」状态的时长（毫秒）；剩余时间走坐姿呼吸 */
+export const FIRST_AGENT_TYPE_MS = 5500;
+
+/**
+ * dev sheet 落座 y 校正（world 单位，正值 = 向下移）。
+ *
+ * 2026-08-31 重标定：当前两套 sheet 的锚点语义一致 ——
+ *   紫衣 sheet（2026-08-30 版）：全身坐姿帧，内容底 y=83 ≈ anchor(0.875×96=84)，0.875 处是**鞋底**；
+ *   dev  sheet（v2）：全身坐姿帧（实测帧 8/9 bottom=84），0.875 处同样是**鞋底**。
+ * 两套 sheet 共用 seatPos() 时无需再互相校正，本常量归零。
+ * （旧值 +12 是按「紫衣=腰截断帧」的旧 sheet 标定的，已失效。）
+ * 若后续替换 sheet 且锚点语义变化，在这里加回校正，不要改 seatPos
+ * （seatPos 是三池共用的几何标定，改它会影响全部角色）。
+ */
+export const DEV_SHEET_SEAT_Y_OFFSET = 0;
+
+// ── Furniture Layer（2026-08-30 分层化：桌套件由引擎 sprite 渲染，
+//    桌套件 → 角色（躯干露桌面、腿被桌面遮）按锚点 y 画家算法排序） ─────────
+
+/** 家具 sprite 单片：显示尺寸 + 左上角相对槽位偏移 */
+export interface FurniturePiece {
+  w: number;
+  h: number;
+  leftTop: { x: number; y: number };
+}
+
+/**
+ * 桌套件几何（差分抠图 + 地板色清理 + 按桌面上缘切两片；world = px / 1.30625）。
+ * 抠图取自 build-1 槽位（DESKS[2] = 510,278），偏移量均相对该槽位实测。
+ * 深度三层：back（角色之下）→ 角色 → front（角色之上，桌面/显示器遮住躯干下半与前臂）。
+ */
+export const DESK_SET: {
+  back: FurniturePiece | null;
+  front: FurniturePiece;
+  rearChair: { dx: number; dy: number };
+  frontChair: { dx: number; dy: number };
+} = {
+  back: { w: 153.9, h: 41.3, leftTop: { x: -75.9, y: -62.1 } },   // 桌远侧+显示器背（原座椅已抠除，见 rearChair 注）
+  front: { w: 159.2, h: 88.8, leftTop: { x: -78.2, y: -20.8 } },
+  /**
+   * 后椅（A 位）：锚点 x / 鞋底锚点 y（相对槽位，world 单位）。
+   * 2026-09-01 三次修正（扫参 + 浏览器实拍复核）：
+   *   dx=-55 → 人坐桌面左缘之外、腿悬空（用户截图①）；
+   *   dx=-15 → 人正落在隔板后面，front 片的隔板/桌面远缘在胸口横切躯干，
+   *             头与身体之间出现"割裂"缝（用户截图②）；
+   *   dx=-40, dy=-7 → 躯干完整无横切，但人偏高、腿露在桌外；
+   *   dx=-40, dy=8 → 隔板左侧不切身 + 桌面远缘切腰、腿隐入桌下
+   *             （.workbuddy/tmp/office_scan3.png 中排左格实测；行=dx{-48,-40,-32}、
+   *             列=dy{8,16,24}；dx>-32 会压到隔板（隔板世界 x≈-4 起），
+   *             dy>=16 头部沉到桌面线）。
+   */
+  rearChair: { dx: -40.0, dy: 8.0 },
+  /**
+   * 前椅（B 位）椅面中心 x / 鞋底锚点 y（相对槽位）。
+   * 2026-08-31 实测：前椅完整可见，bbox rel_x 22.8..64.2（中心 43.5）、
+   * 椅背顶 -7.8、椅脚底 +55.8；按后椅「椅背顶→椅面顶 ≈ +19.5」的比例推得
+   * 椅面顶 ≈ +11.7，鞋底锚点 = 椅面顶 + 16.8（帧内臀底到鞋底距离 ×0.8）≈ +28.5。
+   * 旧值 (27.4, 61.2) 把鞋底放到椅脚处，坐姿会沉进椅子 33px。
+   */
+  frontChair: { dx: 43.5, dy: 28.5 },
+};
+
+/** 前台套件（顶部残影带已切除；柜台整体为一片，无椅 —— 接待员躯干从柜台上缘露出）
+ *  rearChair dy：锚点(鞋底)放 -14 时腰线（锚点上方 19.2px）恰好压柜台上缘 -33.3+3，
+ *  头肩完整露出柜台；旧值 +26 会让整个人沉到柜台后只露头顶。 */
+export const FRONTDESK_SET: typeof DESK_SET = {
+  back: null,
+  front: { w: 208.2, h: 71.2, leftTop: { x: -101.4, y: -33.3 } },
+  rearChair: { dx: -20.0, dy: -14.0 },
+  frontChair: { dx: 50.9, dy: 37.1 },
+};
+
+export type FurnitureSet = typeof DESK_SET;
+
+/** 槽位 → 家具套件（前台槽位用前台几何，其余用标准桌套件） */
+export function furnitureSet(desk: DeskSlot): FurnitureSet {
+  return desk.id === "review-2" ? FRONTDESK_SET : DESK_SET;
+}
+
+/**
+ * 深度基准线（world y）：取 front 片底边。
+ * front 片 zIndex = base，落座角色 = base - 1，back 片 = base - 2 →
+ * 「back → 角色 → front」三层顺序固定，且跨桌用同一基准线不产生穿插。
+ */
+export function deskDepthBase(desk: DeskSlot): number {
+  const set = furnitureSet(desk);
+  return desk.y + set.front.leftTop.y + set.front.h;
+}
+
+/**
+ * 落座位（锚点 0.875 = 角色 sheet 的鞋底）。角色 sheet 是全身坐姿帧，
+ * 腰线（锚点上方 19.2 world px）对齐桌远缘，大腿及以下由 front 片遮挡。
+ */
+export function seatPos(desk: DeskSlot, variant: "A" | "B" = "A") {
+  const set = furnitureSet(desk);
+  const c = variant === "B" ? set.frontChair : set.rearChair;
+  return { x: desk.x + c.dx, y: desk.y + c.dy };
+}
+
+/**
+ * 落座位（含 sheet 锚点语义校正）—— 建角与每帧驱动都应走这个入口。
+ *
+ * 2026-08-31 实测：两种 sheet 的 FOOT_ANCHOR_Y(0.875) 处内容一致 ——
+ * 都是全身坐姿帧的**鞋底**（紫衣内容底 y=83、dev 坐姿帧 bottom=84），
+ * 故 DEV_SHEET_SEAT_Y_OFFSET = 0，共用 seatPos() 即可。
+ *
+ * 若未来替换 sheet 且锚点语义不同（如回到腰截断帧），在此处按 sheet 加回
+ * y 校正（正 = 下压），不要改 seatPos（三池共用的几何标定）。
+ * 只校正 y，不动 x（各 sheet 横向中心一致）。
+ */
+export function seatPosFor(
+  sheetUrl: string,
+  desk: DeskSlot,
+  variant: "A" | "B" = "A",
+) {
+  const base = seatPos(desk, variant);
+  const isDevSheet = sheetUrl === ASSET_URLS.AGENT_DEV;
+  return {
+    x: base.x,
+    y: base.y + (isDevSheet ? DEV_SHEET_SEAT_Y_OFFSET : 0),
+  };
+}
 
 /** 动画键 = FSM 视觉态 + actor 派生动作（坐 A/B 两朝向 + 起身；冒烟/递卡暂无事件源未接线） */
 export type AgentAnimKey =
@@ -184,7 +362,18 @@ export type AgentAnimKey =
 export const DEV_ANIM_SEQS: Record<AgentAnimKey, number[]> = {
   idle: [0, 1],
   walking: [2, 3, 4, 5],
-  working: [6, 7, 8, 9],
+  /**
+   * 打字：2026-08-31 修正 —— 原 [6,7,8,9] 混入了 2 帧站姿，已改为纯坐姿帧 [8,9]。
+   *
+   * 实测（scripts/analyze-frames.mjs，逐帧内容包围盒；脚底基准线 = 0.875×96 = 84）：
+   *   帧 6 top=10 bottom=69 ／ 帧 7 top=11 bottom=69  ← bottom ≠ 84，是站姿，
+   *        按 FOOT_ANCHOR_Y 对齐到椅脚后会**浮空 15px**，且整个上半身浮到桌面之上
+   *        （A 位遮挡只有约 7.8px，压不住站立姿态）；
+   *   帧 8 top=26 bottom=84 ／ 帧 9 top=27 bottom=84  ← bottom = 84，确认坐姿，
+   *        且 top 比 sitting(17/19) 低约 9px = 身体前倾敲键盘，正是打字姿态。
+   * 混入序列会让角色「站-坐-站-坐」上下跳 15px，视角与遮挡同时失效。
+   */
+  working: [8, 9],
   talking: [14, 15],
   alert: [18, 19],
   sitdown: [20, 21, 22, 23],
@@ -210,11 +399,6 @@ export const DEV_ANIM_FPS: Record<AgentAnimKey, number> = {
 
 /** 一次性播放（播完停在末帧，不回卷）；其余为循环帧 */
 export const DEV_ANIM_ONESHOT: AgentAnimKey[] = ["sitdown", "sitdown_b", "getup"];
-
-/** 到桌落座的视觉偏移（world px，2K 切片与背景椅对位实测）：
- * A = 桌后左侧椅（面朝右下 45°）；B = 桌前右侧椅（面朝左上 45°，= A + 椅位差(85,38)） */
-export const SIT_OFFSET_A = { x: 35, y: 35 } as const;
-export const SIT_OFFSET_B = { x: 120, y: 73 } as const;
 
 /** 程序动画参数（无内置帧 → 靠 Sprite scale/rotation/skew 摆动模拟） */
 export const AGENT_PROC_ANIM = {
@@ -274,4 +458,4 @@ export type AssetId = (typeof ASSET_IDS)[keyof typeof ASSET_IDS];
 
 // ── Max Visible Agents ────────────────────────────────────────────
 
-export const MAX_VISIBLE_AGENTS = DESKS.length; // 9（与背景图 9 张白桌对齐）
+export const MAX_VISIBLE_AGENTS = DESKS.length; // 7（6 张白桌 + 前台柜台）

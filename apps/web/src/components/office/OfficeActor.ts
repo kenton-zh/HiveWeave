@@ -199,6 +199,15 @@ export class OfficeActor {
     if (this.sprite) this.sprite.alpha = a;
   }
 
+  /** 落座时的深度覆盖值（= 所属桌套件 base - 1，保证被自己的桌面遮住）；
+   *  null = 走动/离桌，按自身 y 排序 */
+  private depthOverride: number | null = null;
+
+  /** 设置落座深度基准（由 OfficeScene 每帧传入；离桌传 null 回落到自身 y） */
+  setDepth(value: number | null): void {
+    this.depthOverride = value;
+  }
+
   /** Advance simulation by `delta` frames. Call every tick. */
   update(delta: number): void {
     const walking = shouldWalk(
@@ -220,8 +229,9 @@ export class OfficeActor {
       this.container.y += dy * Math.min(1, delta * WALK_SPEED);
     }
 
-    // zIndex = y for isometric depth sort
-    this.container.zIndex = Math.round(this.container.y);
+    // 深度排序：落座时用所属桌套件的基准（被自己的桌面遮住），否则按自身 y
+    this.container.zIndex =
+      this.depthOverride ?? Math.round(this.container.y);
 
     // 动画选型：帧动画（dev 女孩 sheet）优先，旧单帧 sheet/程序化 body 走摆动兜底
     const state = this.fsm.current;

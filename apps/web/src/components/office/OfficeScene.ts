@@ -36,9 +36,17 @@ import {
   ASSET_LOAD_LIST,
   SHEET_LAYOUTS,
   DEV_ANIM_SEQS,
-  SIT_OFFSET_A,
-  SIT_OFFSET_B,
+  PURPLE_ANIM_SEQS,
+  PURPLE_DEMO_ALL_AGENTS,
+  FIRST_AGENT_FULL_ANIMATIONS,
+  FIRST_AGENT_DEMO_CYCLE_MS,
+  FIRST_AGENT_TYPE_MS,
+  FRONTDESK_SET,
+  furnitureSet,
+  deskDepthBase,
+  seatPosFor,
   roleSheetUrl,
+  type FurniturePiece,
 } from "./constants";
 import { isRoamingFrame, isChatteringFrame } from "./state-machine";
 import { OfficeActor } from "./OfficeActor";
@@ -52,6 +60,12 @@ export class OfficeScene {
   private world = new PIXI.Container();         // scaled & centered world
   private layers: Record<string, PIXI.Container> = {};
   private actorMap = new Map<string, OfficeActor>();
+  /**
+   * agent id → 实际生效的 sheet URL。
+   * 选片涉及 404 回退（wanted → AGENT_DEV），每帧重算不可靠也不必要，
+   * 因此在 _syncActors 建角时定稿，_tick 直接查表用于落座锚点校正。
+   */
+  private agentSheetUrl = new Map<string, string>();
   private _ready = false;
   private _destroyed = false;
 
@@ -92,9 +106,9 @@ export class OfficeScene {
     );
     this.tex = tex as Record<string, PIXI.Texture>;
 
-    // agent sheet 的帧切片由 OfficeActor 内部完成（按 SHEET_LAYOUTS 的 cols×rows 切 32×48 帧），
-    // dev 为 5×4 动画帧表，manager/qa 为旧 4×3 单帧表；此处只保留整张 Texture。
-    for (const url of [ASSET_URLS.AGENT_DEV, ASSET_URLS.AGENT_MANAGER, ASSET_URLS.AGENT_QA]) {
+    // agent sheet 的帧切片由 OfficeActor 内部完成（按 SHEET_LAYOUTS 的 cols×rows 切帧），
+    // 此处只保留整张 Texture。
+    for (const url of [ASSET_URLS.AGENT_DEV, ASSET_URLS.AGENT_MANAGER, ASSET_URLS.AGENT_QA, ASSET_URLS.AGENT_PURPLE]) {
       const sheet = tex[url];
       if (!sheet) continue;
       this.sheetFrames[url] = sheet;
@@ -137,13 +151,9 @@ export class OfficeScene {
       const bgTex = this.tex[ASSET_URLS.OFFICE_BG];
       if (bgTex) {
         this._drawBgScene(this.layers.floor);
-        // ⚠️ 此模式下**不**叠任何程序化家具 sprite：
-        //   1. 现有 office-chair.png 资产其实是"小棕桌+黑显示器底座+空椅座"连体 48×56，
-        //      不是单张空椅。scale 后叠在背景图白桌前会变成错位的深色大块（用户看到的"黑块"）。
-        //   2. gpt-image-2-official 4K 背景图里 9 张白桌前已经自带**普通黑色空办公椅**（在桌子
-        //      左右两侧，空位没人坐）。不需要再额外叠椅。
-        //   3. 后续如果要替换空椅造型，直接改生图 prompt 重跑 4K 背景图，不要在这里叠 sprite。
-        // actors 层保留 sortableChildren 给 agent 小人/未来家具精灵做 y 深度排序。
+        // 桌套件 sprite（桌+双椅+显示器连体，差分抠图自原图）放进 actors 层，
+        // 与角色共用 deskDepthBase 深度基准做画家算法排序（几何见 constants.DESK_SET）
+        this._drawFurnitureSprites(this.layers.actors);
         this.layers.actors.sortableChildren = true;
       } else {
         this._drawRoom(this.layers.floor);
@@ -168,6 +178,11 @@ export class OfficeScene {
 
       mounted = true;
       this._ready = true;
+      // 竞态补偿：mount 完成前（Assets.load 比 org tree API 慢）到达的快照
+      // 只被 setSnapshot 暂存、未建角色；ready 后立即补一次同步。
+      this._syncActors();
+      // 调试钩子（dev 专用）：浏览器 console 可遍历场景图定位渲染问题
+      if (import.meta.env.DEV) (window as any).__officeScene = this;
     } finally {
       // 任何一步抛错（Assets.load 单条 catch 不会到这里；只在 app.init / appendChild / _drawRoom 抛错时触发）
       // 都要避免泄漏未 ready 的 Application（内部 WebGLRenderer/资源）。
@@ -225,8 +240,15 @@ export class OfficeScene {
 
   // ── Private: Actor Sync ───────────────────────────────────────
 
+  /** 稳定排序后的可见 agent：按 id 排序，避免组织树刷新顺序变化导致换桌漂移 */
+  private _orderedAgents() {
+    return [...this.snapshot.agents]
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .slice(0, MAX_VISIBLE_AGENTS);
+  }
+
   private _syncActors(): void {
-    const visible = this.snapshot.agents.slice(0, MAX_VISIBLE_AGENTS);
+    const visible = this._orderedAgents();
     const keep = new Set(visible.map((a) => a.id));
 
     // Remove actors no longer present
@@ -235,6 +257,7 @@ export class OfficeScene {
         this.layers.actors.removeChild(actor.container);
         actor.container.destroy({ children: true });
         this.actorMap.delete(id);
+        this.agentSheetUrl.delete(id);
       }
     }
 
@@ -242,11 +265,28 @@ export class OfficeScene {
     const actorsLayer = this.layers.actors;
     visible.forEach((agent, index) => {
       if (!this.actorMap.has(agent.id)) {
-        const desk = getDesk(index, agent.role);
-        const sheetUrl = roleSheetUrl(agent.role);
-        const sheetTex =
-          this.sheetFrames[sheetUrl] ?? this.sheetFrames[ASSET_URLS.AGENT_DEV];
-        const hasFrameSeqs = sheetUrl === ASSET_URLS.AGENT_DEV;
+        const desk = PURPLE_DEMO_ALL_AGENTS
+          ? DESKS[index % DESKS.length]
+          : getDesk(index, agent.role);
+        // 单角色动画演示：索引 0 切回 dev 满帧 sheet（FSM 全状态可播：
+        // 呼吸/坐下/坐姿/打字/起身…），其余角色沿用紫衣 sheet 保持视觉统一。
+        const isDemoAgent = FIRST_AGENT_FULL_ANIMATIONS && index === 0;
+        const wantedUrl = isDemoAgent
+          ? ASSET_URLS.AGENT_DEV
+          : PURPLE_DEMO_ALL_AGENTS
+            ? ASSET_URLS.AGENT_PURPLE
+            : roleSheetUrl(agent.role);
+        // 实际加载成功的 URL（404 时回退 dev，布局/帧表按实际 URL 推导，避免错配）
+        const sheetUrl = this.sheetFrames[wantedUrl] ? wantedUrl : ASSET_URLS.AGENT_DEV;
+        const sheetTex = this.sheetFrames[sheetUrl] ?? null;
+        const isPurple = sheetUrl === ASSET_URLS.AGENT_PURPLE;
+        const hasFrameSeqs = sheetUrl === ASSET_URLS.AGENT_DEV || isPurple;
+        // 落座锚定：脚底坐到椅面（紫衣/dev 表都是全身坐姿帧），下半身靠桌套件 zIndex 遮挡。
+        // 朝向：演示角色与紫衣角色统一走 A 朝向（后椅）。B 朝向角色落在 front 片高度
+        // 区间内、zIndex 更低，会被「桌面+显示器+前椅」整片盖死，不可用于坐姿演示。
+        const variant: "A" | "B" = isPurple || isDemoAgent ? "A" : index % 2 === 0 ? "A" : "B";
+        const seat = seatPosFor(sheetUrl, desk, variant);
+        this.agentSheetUrl.set(agent.id, sheetUrl);
         const actor = new OfficeActor(
           agent,
           (id) => {
@@ -254,15 +294,11 @@ export class OfficeScene {
           },
           sheetTex ?? null,
           hasFrameSeqs ? SHEET_LAYOUTS[sheetUrl] : null,
-          hasFrameSeqs ? DEV_ANIM_SEQS : null,
+          hasFrameSeqs ? (isPurple ? PURPLE_ANIM_SEQS : DEV_ANIM_SEQS) : null,
           this.tex[ASSET_URLS.SPEECH_BUBBLE] ?? null,
         );
-        actor.container.x = desk.x;
-        // 落座点：按坐姿朝向分配（A=桌后左椅 SE 朝向 / B=桌前右椅 NW 朝向，两种椅子场景里都有）
-        const variant: "A" | "B" = index % 2 === 0 ? "A" : "B";
-        const off = variant === "B" ? SIT_OFFSET_B : SIT_OFFSET_A;
-        actor.container.x += off.x;
-        actor.container.y = desk.y + 54 + off.y;
+        actor.container.x = seat.x;
+        actor.container.y = seat.y;
         actorsLayer.addChild(actor.container);
         this.actorMap.set(agent.id, actor);
       }
@@ -273,36 +309,68 @@ export class OfficeScene {
 
   private _tick(delta: number): void {
     const now = performance.now();
-    const agents = this.snapshot.agents.slice(0, MAX_VISIBLE_AGENTS);
+    const agents = this._orderedAgents();
 
     agents.forEach((agent, index) => {
       const actor = this.actorMap.get(agent.id);
       if (!actor) return;
 
-      const desk = getDesk(index, agent.role);
-      const processing = this.snapshot.processingIds.has(agent.id);
-      const talking =
+      const desk = PURPLE_DEMO_ALL_AGENTS
+        ? DESKS[index % DESKS.length]
+        : getDesk(index, agent.role);
+      const sheetUrl = this.agentSheetUrl.get(agent.id) ?? ASSET_URLS.AGENT_DEV;
+      const isDemoAgent = FIRST_AGENT_FULL_ANIMATIONS && index === 0;
+
+      let processing = this.snapshot.processingIds.has(agent.id);
+      let talking =
         this.snapshot.communicatingIds.has(agent.id) ||
         (!processing && isChatteringFrame(index, now));
+
+      // ── 单角色动画演示 ────────────────────────────────────────
+      // 位置冻结在座位上，FSM 在「打字 ↔ 坐姿呼吸」间周期性切换。
+      // 刻意不参与 talking / 聚集 / 散步：dev sheet 里点头与行走是站姿/位移序列，
+      // 一旦播放人物会浮到桌面之上或走出座位 —— A 位遮挡只有约 7.8px，
+      // 压不住站立姿态，视角与遮挡关系当场失效。
+      // （ping 触发的 alert 是用户主动点击的瞬时反馈，保留。）
+      if (isDemoAgent) {
+        processing = now % FIRST_AGENT_DEMO_CYCLE_MS < FIRST_AGENT_TYPE_MS;
+        talking = false;
+      }
 
       // Determine target position
       let tx: number;
       let ty: number;
       let atDesk = false;
-      const sitVariant: "A" | "B" = index % 2 === 0 ? "A" : "B";
+      const purpleDemo = PURPLE_DEMO_ALL_AGENTS;
+      // 演示角色强制 A 朝向（后椅）：B 朝向角色落在 front 片高度区间内且 zIndex
+      // 更低，会被「桌面+显示器+前椅」整片盖死，不可用于坐姿演示。
+      const sitVariant: "A" | "B" =
+        purpleDemo || isDemoAgent || index % 2 === 0 ? "A" : "B";
 
-      if (talking) {
+      if (isDemoAgent) {
+        // 演示角色：常驻 A 椅位，不挪位
+        const seat = seatPosFor(sheetUrl, desk, "A");
+        tx = seat.x;
+        ty = seat.y;
+        atDesk = true;
+      } else if (!purpleDemo && talking) {
         const spot = COMMON_TARGETS[index % COMMON_TARGETS.length];
         tx = spot.x;
         ty = spot.y;
-      } else if (!processing && !talking && isRoamingFrame(index, now)) {
+      } else if (!purpleDemo && !processing && !talking && isRoamingFrame(index, now)) {
         const wp = ROAM_WAYPOINTS[index % ROAM_WAYPOINTS.length];
         tx = wp.x;
         ty = wp.y;
+      } else if (purpleDemo) {
+        // 紫衣女孩演示：常驻 A 椅位打字，聊天只弹气泡不挪位
+        const seat = seatPosFor(sheetUrl, desk, "A");
+        tx = seat.x;
+        ty = seat.y;
+        atDesk = true;
       } else {
-        const off = sitVariant === "B" ? SIT_OFFSET_B : SIT_OFFSET_A;
-        tx = desk.x + off.x;
-        ty = desk.y + 54 + off.y;
+        const seat = seatPosFor(sheetUrl, desk, sitVariant);
+        tx = seat.x;
+        ty = seat.y;
         atDesk = true;
       }
 
@@ -318,6 +386,9 @@ export class OfficeScene {
         atDesk,
         sitVariant,
       );
+
+      // 落座时把深度钉在桌套件基准之下（被自己的桌面遮住）；走动/离桌回落自身 y
+      actor.setDepth(atDesk ? Math.round(deskDepthBase(desk)) - 1 : null);
 
       actor.update(delta);
     });
@@ -365,12 +436,45 @@ export class OfficeScene {
   // ── Private: Environment Drawing ──────────────────────────────
 
   /**
-   * 1:1 复刻模式：直接把 office-scene-bg.png（apimart gpt-image-2-official 4K，
-   * 3840×2160，比例 16:9）缩放到 WORLD_W×WORLD_H（1280×720）当作整层 floor，
-   * nearest 近邻保持边缘锐利。地板/墙/家具/装饰已经全画在背景里，agent 直接
-   * "贴在图上"走位即可。gpt-image-2 输出里 9 张普通办公椅本身是空的没有
-   * 人物，已经符合要求；额外再叠一层 office-chair.png sprite 给它更明确
-   * 的"标准空椅"轮廓（见 mount 分支）。
+   * 桌套件 sprite（bg 模式专用）：每桌两片（back = 后椅+桌远侧，front = 桌面+显示器+前椅），
+   * 前台槽位只有 front 片。深度：back = base-2，角色 = base-1，front = base
+   * → 「back → 角色 → front」三层固定顺序，桌面/显示器遮住角色躯干下半与前臂。
+   */
+  private _drawFurnitureSprites(parent: PIXI.Container): void {
+    for (const desk of DESKS) {
+      const set = furnitureSet(desk);
+      const base = Math.round(deskDepthBase(desk));
+      const isFront = set === FRONTDESK_SET;
+      const pieces: [string, FurniturePiece, number][] = [];
+      if (set.back) {
+        pieces.push([ASSET_URLS.OFFICE_DESK_BACK, set.back, base - 2]);
+      }
+      pieces.push([
+        isFront ? ASSET_URLS.OFFICE_FRONTDESK_SET : ASSET_URLS.OFFICE_DESK_FRONT,
+        set.front,
+        base,
+      ]);
+      for (const [url, piece, z] of pieces) {
+        const tex = this.tex[url];
+        if (!tex) continue;
+        // 与背景同为 nearest：sprite 是原图像素，避免线性重采样产生边缘光晕
+        tex.source.scaleMode = "nearest";
+        const s = new PIXI.Sprite(tex);
+        s.width = piece.w;
+        s.height = piece.h;
+        s.x = desk.x + piece.leftTop.x;
+        s.y = desk.y + piece.leftTop.y;
+        s.zIndex = z;
+        parent.addChild(s);
+      }
+    }
+  }
+
+  /**
+   * 背景层：office-scene-bg.png（PIL 去桌椅版，1672×941 ≈ 16:9）缩放到
+   * WORLD_W×WORLD_H（1280×720）整层铺底，nearest 近邻保持像素边缘。
+   * 背景只含不与角色交互的陈设（地板/墙/沙发/吧台/绿植/前台区地板）；
+   * 桌/椅/显示器/前台由 _drawFurnitureSprites 以 sprite 分层渲染。
    */
   private _drawBgScene(floor: PIXI.Container): void {
     const tex = this.tex[ASSET_URLS.OFFICE_BG];
