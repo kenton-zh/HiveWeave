@@ -95,6 +95,12 @@ export {
   getProjectTokenDaily,
   getPlatformTokenUsage,
   tokenRequestTypeLabel,
+  getAgentsLiveStatus,
+} from "./api/rest";
+
+export type {
+  AgentLiveStatus,
+  AgentLivePhase,
 } from "./api/rest";
 
 export type {

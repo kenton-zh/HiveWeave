@@ -186,6 +186,28 @@ export async function getAgent(id: string) {
   return (raw && typeof raw === "object" && "agent" in raw && raw.agent) ? raw.agent : raw;
 }
 
+export type AgentLivePhase = "tool" | "llm" | "subagent" | "working" | "waiting" | "idle";
+
+export interface AgentLiveStatus {
+  agent_id: string;
+  status: string;
+  phase: AgentLivePhase;
+  detail: string | null;
+  since_ms: number | null;
+}
+
+/** Per-agent 实时活动相位（八轮观测缺口）：LLM 输出中 / 工具执行中 / 子代理工作中。 */
+export async function getAgentsLiveStatus(projectId: string): Promise<AgentLiveStatus[]> {
+  try {
+    const raw = await fetchJSON(
+      `${BASE}/org/agents/live-status?projectId=${encodeURIComponent(projectId)}`,
+    );
+    return Array.isArray(raw?.agents) ? raw.agents : [];
+  } catch {
+    return []; // 面板宁缺勿炸
+  }
+}
+
 export async function createAgent(data: any) {
   return fetchJSON(`${BASE}/org/agents`, {
     method: "POST",
