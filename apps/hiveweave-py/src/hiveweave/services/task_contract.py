@@ -44,6 +44,7 @@ _MACHINE_TYPES = frozenset({
     "hash_match",  # reserved; not fully implemented in P0
     "test_command",  # reserved P2
     "json_schema",  # reserved P2
+    "service_smoke",  # s3-clone_07 GAP：交付级冒烟——启动服务+真协议客户端探主链路
     "manual_review",
 })
 
@@ -126,6 +127,16 @@ def validate_contract(contract: dict[str, Any]) -> str | None:
             return (
                 f"acceptance[{i}] manual_review requires note (review focus)"
             )
+        if ctype == "service_smoke":
+            # s3-clone_07 GAP：交付级冒烟条款必须声明启动命令与探针脚本——
+            # 两者缺一 = 这道交付门形同虚设，创建期就拒绝而不是提交期才发现
+            if not (clause.get("script") or "").strip():
+                return f"acceptance[{i}] service_smoke requires script (probe path)"
+            if not (clause.get("startCommand") or clause.get("start_command")):
+                return (
+                    f"acceptance[{i}] service_smoke requires startCommand "
+                    "(service boot command, supports {port}/{python} placeholders)"
+                )
     return None
 
 
@@ -310,6 +321,11 @@ def run_machine_acceptance(
                 )
             )
             continue
+        if ctype == "service_smoke":
+            # s3-clone_07 GAP：异步条款——同步引擎跳过（不计结果），由
+            # services/smoke_gate.run_service_smoke_clause 在 submit 流程里
+            # 执行并追加真实结果（启动服务+真协议客户端）。
+            continue
         if ctype == "file_exists":
             results.append(
                 _check_file_exists(cid, str(clause.get("path") or ""), root)
@@ -444,6 +460,11 @@ def format_prerun_failure(prerun: PreRunResult) -> str:
     parts = ["SUBMIT PRE-RUN FAILED (machine clauses):"]
     for r in prerun.blocking_failures():
         parts.append(f"- [{r.id}] {r.type}: {r.message}")
+        # 疏导：失败条款的 evidence（探针输出/文件路径）直接进拒收回执——
+        # 07 的教训是拒收文案只有"失败"没有"复现材料"，agent 只能盲修
+        if r.evidence:
+            tail = r.evidence.strip()[-400:]
+            parts.append(f"  evidence: {tail}")
     deferred = [r for r in prerun.results if r.deferred]
     if deferred:
         parts.append(

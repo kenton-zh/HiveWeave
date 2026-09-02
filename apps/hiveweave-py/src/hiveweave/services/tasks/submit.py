@@ -80,6 +80,28 @@ class SubmitMixin:
                     contract, workspace_root=ws_root
                 )
                 contract = dict(contract)
+                # s3-clone_07 GAP：service_smoke 异步条款——同步文件条款通过后，
+                # 启动服务跑交付级冒烟（真协议客户端）。失败 = 拒绝提交。
+                # 这是 07 轮 0/22 事故的对应门：内部门禁全绿 ≠ 交付物可用。
+                smoke_clause = None
+                for _c in contract.get("acceptance") or []:
+                    if isinstance(_c, dict) and _c.get("type") == "service_smoke":
+                        smoke_clause = _c
+                        break
+                if smoke_clause and prerun.passed:
+                    from hiveweave.services.smoke_gate import (
+                        run_service_smoke_clause,
+                    )
+
+                    smoke_result, smoke_freeze = await run_service_smoke_clause(
+                        smoke_clause,
+                        workspace_root=str(ws_root),
+                        frozen=contract.get("smoke_freeze"),
+                    )
+                    prerun.results.append(smoke_result)
+                    prerun.passed = prerun.passed and smoke_result.passed
+                    if smoke_freeze:
+                        contract["smoke_freeze"] = smoke_freeze
                 contract["machine_pre_run"] = {
                     **prerun.to_dict(),
                     "at_ms": int(time.time() * 1000),
