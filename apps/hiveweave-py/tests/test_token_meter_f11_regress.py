@@ -190,3 +190,39 @@ async def test_record_rounds_failure_emits_warning_event(env):
     assert payload["n_rounds"] == 1
     assert payload["request_type"] == "main"
     assert "cold_start" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_per_round_ts_preferred_over_bulk_stamp(env):
+    """八轮 P2：record_rounds 应优先使用 streamer 逐次记录的 ts 字段，
+    落库 created_at 反映真实调用时刻而非 run 结束的批量盖章时刻；
+    缺 ts 的轮次回退 now（旧行为兼容）。"""
+    from hiveweave.services.token_meter import token_meter
+
+    conn = await project_db.ensure_project_db(env["ws"])
+    t0, t1 = 1788150000000, 1788150060000
+    rounds = [
+        {"input": 100, "output": 20, "cache_read": 0,
+         "cache_creation": 0, "total": 120, "duration_ms": 1500,
+         "ts": t0},
+        {"input": 50, "output": 10, "cache_read": 80,
+         "cache_creation": 0, "total": 60, "duration_ms": 900,
+         "ts": t1},
+        {"input": 30, "output": 5, "cache_read": 40,
+         "cache_creation": 0, "total": 35},  # 无 ts → 回退 now
+    ]
+    await token_meter.record_rounds(
+        agent_id=AGENT, project_id=PROJECT_ID, run_id="run-ts-1",
+        rounds=rounds, model_id="m", provider="openai-responses",
+        request_type="main",
+    )
+    cur = await conn.execute(
+        "SELECT input_tokens, created_at FROM llm_usage "
+        "WHERE run_id='run-ts-1' ORDER BY created_at"
+    )
+    rows = await cur.fetchall()
+    assert len(rows) == 3
+    assert (rows[0]["input_tokens"], rows[0]["created_at"]) == (100, t0)
+    assert (rows[1]["input_tokens"], rows[1]["created_at"]) == (50, t1)
+    # 无 ts 的轮次回退到当下（远大于测试里的历史时刻即视为回退生效）
+    assert rows[2]["input_tokens"] == 30 and rows[2]["created_at"] > t1
