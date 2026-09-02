@@ -26,11 +26,28 @@ MAX_TOOL_ROUNDS = 1_000_000
 # budget_exhausted 收口 + agent 层自动 retrigger 续跑，零产出损失）。
 # 与 MAX_TOOL_ROUNDS（安全网）不同：本阈值是主动疏导，默认远低于安全网。
 FORCE_COMMIT_ROUNDS = int(_os.environ.get("HIVEWEAVE_FORCE_COMMIT_ROUNDS", "40"))
-"""单 turn 工具轮次疏导线：达到该轮数强制提示 commit_turn(in_progress)。"""
+"""单 turn 工具轮次疏导线：达到该轮数强制提示 commit_turn(in_progress)。
+
+09-02 双触发修正：纯轮数线在现实预算下永不触发（07 实测 ~52s/轮，
+40 轮 ≈ 35min >> 1710s 硬顶；.env 一度被调到 400 当静音）——现与
+FORCE_COMMIT_WALL_PCT 墙钟线**任一越线即进入疏导**。轮数线抓快轮 churn
+（短轮 agents），墙钟线抓慢轮无界磨。"""
 FORCE_COMMIT_GRACE_ROUNDS = int(
     _os.environ.get("HIVEWEAVE_FORCE_COMMIT_GRACE_ROUNDS", "8")
 )
 """疏导线后的宽限轮数：仍未 commit → 优雅收口强制续跑。"""
+FORCE_COMMIT_WALL_PCT = float(
+    _os.environ.get("HIVEWEAVE_FORCE_COMMIT_WALL_PCT", "0.85")
+)
+"""累计墙钟疏导线：硬预算走过该比例即进入疏导（无论轮数）。
+
+默认 0.85 × hard(1710s) = 1453s，落在 pacing 提示（1410s）之后、硬闸口
+（1710s）之前，与 soft(1500s) 同窗口——疏导两阶段（提示→宽限→优雅收口）
+在长预算下真的参与 turn 收口，而非全死于墙钟闸口。"""
+FORCE_COMMIT_GRACE_WALL_S = float(
+    _os.environ.get("HIVEWEAVE_FORCE_COMMIT_GRACE_WALL_S", "120")
+)
+"""墙钟线触发后的宽限秒数：仍未 commit → 优雅收口强制续跑。"""
 
 # DESIGN-2 / Magentic-One Progress Ledger: consecutive no-progress rounds
 # force an outer-loop exit (commit / replan) instead of burning tokens.

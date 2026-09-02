@@ -15,7 +15,9 @@ from .constants import (
     BUDGET_PACING_HINT_S,
     DEFAULT_PLACEHOLDER,
     FORCE_COMMIT_GRACE_ROUNDS,
+    FORCE_COMMIT_GRACE_WALL_S,
     FORCE_COMMIT_ROUNDS,
+    FORCE_COMMIT_WALL_PCT,
     HARD_TOTAL_TIMEOUT_S,
     MAX_TOOLS_PER_ROUND,
     MIN_ROUND_BUDGET_S,
@@ -47,6 +49,55 @@ from .advisory import advisory_guard
 from .types import DeltaCallback, ToolCallCallback
 
 log = structlog.get_logger(__name__)
+
+
+def e14_steering_decision(
+    *,
+    round_num: int,
+    elapsed_s: float,
+    hard_budget_s: float,
+    hint_injected: bool,
+) -> tuple[str, str]:
+    """E14 双触发判定（纯函数，便于单测）：轮数线 OR 累计墙钟线。
+
+    09-02 修正：纯轮数线在现实预算下永不触发（07 实测 ~52s/轮，40 轮
+    ≈35min >> 1710s 硬顶，.env 一度被调到 400 当静音）——疏导两阶段
+    （提示 → 宽限 → 优雅收口）全部死于墙钟闸口之前，turn 边界全由墙钟
+    决定。双触发后：轮数线抓快轮 churn，墙钟线（硬预算 FORCE_COMMIT_WALL_PCT）
+    抓慢轮无界磨，任一越线即进入疏导。
+
+    调用方契约（审计[1]）：本判定必须位于循环体内**轮闸检查之前**——
+    否则越过墙钟宽限点后的轮边界会被轮闸（MIN_ROUND_BUDGET_S）先行收走，
+    疏导的 note/归因全部漂移成 hard_budget，宽限期名存实亡。
+
+    Returns:
+        (decision, trigger)：
+        - decision: ``"hint"``（注入疏导提示）/ ``"force"``（宽限已过，
+          优雅收口）/ ``"none"``
+        - trigger: ``"rounds"`` / ``"wall_clock"`` / ``"-"``；force 时
+          标签跟随**实际过宽限的那条线**（审计[6]：两线同越但仅墙钟宽限
+          到时不得误报 rounds）
+    """
+    rounds_hit = round_num >= FORCE_COMMIT_ROUNDS
+    wall_at = hard_budget_s * FORCE_COMMIT_WALL_PCT
+    wall_hit = elapsed_s >= wall_at
+    if not (rounds_hit or wall_hit):
+        return ("none", "-")
+    trigger = "rounds" if rounds_hit else "wall_clock"
+    grace_rounds_hit = round_num >= FORCE_COMMIT_ROUNDS + FORCE_COMMIT_GRACE_ROUNDS
+    grace_wall_hit = elapsed_s >= wall_at + FORCE_COMMIT_GRACE_WALL_S
+    if (rounds_hit and grace_rounds_hit) or (wall_hit and grace_wall_hit):
+        # force 标签跟随实际过宽限的那条线（审计[6]：仅墙钟宽限先到时
+        # 不得误报 rounds——churn 信号与墙钟信号要可区分）
+        force_trigger = (
+            "rounds"
+            if (rounds_hit and grace_rounds_hit)
+            else "wall_clock"
+        )
+        return ("force", force_trigger)
+    if hint_injected:
+        return ("none", trigger)  # 提示已注入，宽限中
+    return ("hint", trigger)
 
 
 def _round_fact_flags(
@@ -316,6 +367,70 @@ class ToolLoopMixin:
                     "content": f"请求总超时（{HARD_TOTAL_TIMEOUT_S}s）",
                 })
                 return self._error_result("请求总超时", loop_start)
+            # E14 (复盘 P2) + 09-02 双触发修正：轮数线 OR 累计墙钟线——
+            # 纯轮数线在现实预算下永不触发（07 实测 ~52s/轮，40 轮 ≈35min
+            # >> 1710s 硬顶，.env 一度被调到 400 当静音），疏导两阶段
+            # （提示 → 宽限 → 优雅收口）全部死于墙钟闸口之前，turn 边界
+            # 全由墙钟决定。双触发：轮数线抓快轮 churn，墙钟线（硬预算
+            # FORCE_COMMIT_WALL_PCT，默认 85%）抓慢轮无界磨。
+            decision, trigger = e14_steering_decision(
+                round_num=round_num,
+                elapsed_s=now_mono - loop_start,
+                hard_budget_s=HARD_TOTAL_TIMEOUT_S,
+                hint_injected=force_commit_hint_injected,
+            )
+            if tool_history and decision == "hint":
+                force_commit_hint_injected = True
+                line_desc = (
+                    f"轮数疏导线（{FORCE_COMMIT_ROUNDS} 轮）"
+                    if trigger == "rounds"
+                    else f"墙钟疏导线（硬预算 {int(FORCE_COMMIT_WALL_PCT * 100)}%）"
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"[TURN ROUND CAP] 已达单 turn {line_desc}。"
+                        "本轮已足够：停止继续调用工具，立即调用 "
+                        "commit_turn(phase='in_progress') 收束当前 slice "
+                        "—— 平台会自动续跑，上下文与产出全部保留。"
+                        "不要启动新的重型操作 / 全量测试 / 长轮询。"
+                    ),
+                })
+                log.info(
+                    "stream_round_cap_hint",
+                    agent_id=agent_id,
+                    round=round_num,
+                    reason="force_commit_steering",
+                    trigger=trigger,
+                )
+            elif tool_history and decision == "force":
+                log.warning(
+                    "stream_round_cap_forced_commit",
+                    agent_id=agent_id,
+                    round=round_num,
+                    tools=len(tool_history),
+                    force_commit_rounds=FORCE_COMMIT_ROUNDS,
+                    trigger=trigger,
+                )
+                return self._budget_exhausted_result(
+                    text_acc=text_acc,
+                    thinking_acc=thinking_acc,
+                    tool_history=tool_history,
+                    tool_turn_acc=tool_turn_acc,
+                    round_num=round_num,
+                    last_usage=last_usage,
+                    usage_rounds=usage_rounds,
+                    note=(
+                        f"[TURN ROUND CAP] 单 turn 超过疏导线宽限"
+                        f"（{trigger} 线触发：{FORCE_COMMIT_ROUNDS} 轮或"
+                        f" {int(FORCE_COMMIT_WALL_PCT * 100)}% 硬预算，"
+                        "宽限内仍未被 commit_turn 收口）。全部产出已保留。"
+                        "立即调用 commit_turn(phase='in_progress') 收束，"
+                        "平台会自动续跑；后续避免单 turn 内无限调用工具。"
+                    ),
+                    reason="force_commit_rounds",
+                )
+
             # 新轮预算闸门（结构性修复 2026-08-07）：硬截止只在轮间检查
             # 不够 —— 单轮（流式 + 工具批）时长无界，可冲过 HARD 直至 agent
             # SAFETY_TIMEOUT 强杀。剩余预算买不起一轮有意义的 LLM 请求时
@@ -399,63 +514,6 @@ class ToolLoopMixin:
                 # One more soft slice to allow commit_turn
                 soft_deadline = min(
                     now_mono + ACTIVITY_EXTEND_S, hard_deadline
-                )
-
-            # E14 (复盘 P2): turn 工具轮次疏导上限 —— 单 turn 磨了太多
-            # 工具轮次（S7 根源：44+ 轮无界磨，管理通道被屏蔽）时主动疏导：
-            # 1) 首达 FORCE_COMMIT_ROUNDS → 注入强制 commit 提示（一次性，
-            #    不打断当前轮，给模型主动收口机会）；
-            # 2) 过 GRACE 宽限仍未 commit → 优雅收口（保留全部产出，
-            #    语义同 budget_exhausted → completion.py 自动 retrigger 续跑）。
-            if (
-                tool_history
-                and round_num >= FORCE_COMMIT_ROUNDS
-                and not force_commit_hint_injected
-            ):
-                force_commit_hint_injected = True
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"[TURN ROUND CAP] 已达单 turn 工具轮次疏导线 "
-                        f"({FORCE_COMMIT_ROUNDS} 轮)。本轮已足够：停止继续"
-                        "调用工具，立即调用 commit_turn(phase='in_progress') "
-                        "收束当前 slice —— 平台会自动续跑，上下文与产出全部"
-                        "保留。不要启动新的重型操作 / 全量测试 / 长轮询。"
-                    ),
-                })
-                log.info(
-                    "stream_round_cap_hint",
-                    agent_id=agent_id,
-                    round=round_num,
-                    reason="force_commit_steering",
-                )
-            if (
-                tool_history
-                and round_num >= FORCE_COMMIT_ROUNDS + FORCE_COMMIT_GRACE_ROUNDS
-            ):
-                log.warning(
-                    "stream_round_cap_forced_commit",
-                    agent_id=agent_id,
-                    round=round_num,
-                    tools=len(tool_history),
-                    force_commit_rounds=FORCE_COMMIT_ROUNDS,
-                )
-                return self._budget_exhausted_result(
-                    text_acc=text_acc,
-                    thinking_acc=thinking_acc,
-                    tool_history=tool_history,
-                    tool_turn_acc=tool_turn_acc,
-                    round_num=round_num,
-                    last_usage=last_usage,
-                    usage_rounds=usage_rounds,
-                    note=(
-                        f"[TURN ROUND CAP] 单 turn 工具轮次超过疏导线"
-                        f"（{FORCE_COMMIT_ROUNDS}+{FORCE_COMMIT_GRACE_ROUNDS}"
-                        " 轮仍未被 commit_turn 收口）。全部产出已保留。"
-                        "立即调用 commit_turn(phase='in_progress') 收束，"
-                        "平台会自动续跑；后续避免单 turn 内无限调用工具。"
-                    ),
-                    reason="force_commit_rounds",
                 )
 
             # 通知回调：新一轮开始（用于重置流式文本累积器）

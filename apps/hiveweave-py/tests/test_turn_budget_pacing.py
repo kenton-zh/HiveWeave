@@ -515,11 +515,15 @@ async def test_round_gate_blocks_new_round_when_budget_low(monkeypatch):
         max_tool_rounds=10,
     )
 
-    # 轮闸门在第 2 轮顶部触发：不再发起新 LLM 请求，优雅收口
+    # 第 2 轮顶部优雅收口：不再发起新 LLM 请求，产出保留。
+    # 09-02 E14 双触发：本场景墙钟宽限（85%+120s=1573.5s）已过（1600s），
+    # 边界归因归 E14 疏导（note 注明触发线），轮闸降级为 E14 未配置时的
+    # 兜底（wall 线 1573.5s 恒早于轮闸 1590s，tool-using turn 必走 E14）。
     assert stream_calls == 1
     assert result["status"] == "ok"
     assert result.get("budget_exhausted") is True
-    assert "[TURN BUDGET] Hard turn budget exhausted" in result["content"]
+    assert "[TURN ROUND CAP]" in result["content"]
+    assert "wall_clock" in result["content"]
     # 第 1 轮的 tool 产出保留在历史里
     assert len(result["tool_calls"]) == 1
 
