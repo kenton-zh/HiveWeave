@@ -96,8 +96,11 @@ def test_resolve_policy_full(tmp_path) -> None:
     assert p.boundary_root == str(tmp_path)
     assert p.project_root == str(tmp_path)  # 缺省 project_workspace_path → 回退边界
     assert p.temp_dir == resolve_temp_dir(str(tmp_path), "A001")
-    assert p.temp_sid == p.write_sids[-1]
-    assert len(p.write_sids) == 4
+    # 39 审计 P0-1：write_sids 顺序 = [worktree, cache, git, temp, venv]
+    assert p.temp_sid == p.write_sids[3]
+    assert p.venv_sid_str in p.write_sids
+    assert p.venv_dir == str(tmp_path / ".venv")
+    assert len(p.write_sids) == 5
 
 
 def test_resolve_policy_project_root_override(tmp_path) -> None:

@@ -309,6 +309,16 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
         os.makedirs(cache_dir, exist_ok=True)
     await _grant_if_missing(cache_dir, cache_sid(project), CACHE_MASK, agrant)
 
+    # 39 审计 P0-1：项目 .venv 是依赖安装的**官方落点**（venv_setup 在项目创建
+    # 时铺设；本处补 ACL 授予）。GRANT_MASK 全权（agent 经 uv pip 往里装包 =
+    # 与写工作区代码同等信任，DSH 同构：workspaceRoot 全可写）。目录不存在时
+    # makedirs 兜底（老项目/venv_setup 失败的形态——空目录仍可被 agent 用
+    # `python -m venv` 或 `uv venv` 补建）。
+    venv_dir = policy.venv_dir
+    if not os.path.isdir(venv_dir):
+        os.makedirs(venv_dir, exist_ok=True)
+    await _grant_if_missing(venv_dir, policy.venv_sid_str, GRANT_MASK, agrant)
+
     # §P1-1 工作区共享缓存目录补授 AU 写（M1 测试类命令 EPERM 根因之一）：
     # pytest/vitest/node 会写 .pytest_cache/__pycache__/node_modules/.cache 等，
     # 受限进程自建时是 OWNER_RIGHTS-only 且不继承父 ACE → 多 worktree 写同一

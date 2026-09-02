@@ -20,12 +20,17 @@ from hiveweave.services.acl_sandbox.sid import (
     extra_sid,
     git_sid,
     temp_sid,
+    venv_sid,
     worktree_sid,
 )
 
 # 私有 temp 与项目级共享缓存在 workspace 内的相对路径
 SANDBOX_TEMP_REL = ".hiveweave/sandbox-temp"
 CACHE_REL = ".hiveweave-cache"
+# 项目 .venv（39 审计 P0-1）：依赖安装的官方落点——项目根下，全 agent 共享。
+# 可写（GRANT_MASK）：agent 经 uv pip 往里装包 = 与写工作区代码同等信任
+# （DSH 同构：workspaceRoot 全可写）。
+VENV_REL = ".venv"
 
 # §5.7 六入口 → 边界语义（全部以工具传入的 workspace_path 为边界源）
 ENTRY_BOUNDARY: dict[str, str] = {
@@ -48,6 +53,8 @@ class SandboxPolicy:
     temp_dir: str                           # agent 私有 temp（workspace 内）
     temp_sid: str
     cache_dir: str                          # 项目级共享缓存
+    venv_dir: str                           # 项目 .venv（依赖环境，可写）
+    venv_sid_str: str
     extra_dirs: list[str] = field(default_factory=list)   # §5.5b②：附加可写目录（realpath）
     extra_sids: list[str] = field(default_factory=list)
 
@@ -67,17 +74,23 @@ def resolve_cache_dir(project_root: str) -> str:
     return str(Path(os.path.realpath(project_root)) / CACHE_REL)
 
 
+def resolve_venv_dir(project_root: str) -> str:
+    """项目 .venv 目录（39 审计 P0-1：依赖安装官方落点，全 agent 共享）。"""
+    return str(Path(os.path.realpath(project_root)) / VENV_REL)
+
+
 def build_write_sids(
     boundary_root: str,
     project_root: str,
     temp_sid_str: str,
     extra_dirs: tuple[str, ...] = (),
+    venv_sid_str: str | None = None,
 ) -> list[str]:
     """按边界源组装 restricting 写 SID 集。
 
     - boundary SID：空前缀，派生自边界根（worktree 或项目根），路径即边界；
-    - cache\\0 / git\\0：**派生自项目根**（§4.8/§8）—— 同项目全 agent 共享
-      同一 git/cache 能力，跨项目 SID 不同（域前缀 + 路径）；
+    - cache\\0 / git\\0 / venv\\0：**派生自项目根**（§4.8/§8）—— 同项目全 agent 共享
+      同一 git/cache/venv 能力，跨项目 SID 不同（域前缀 + 路径）；
     - temp\\0 / extra\\0 各自域分离。跨项目同 SID 撞车需全 60-bit 碰撞（~2⁻⁵⁴）。
     """
     boundary = os.path.realpath(boundary_root)
@@ -88,6 +101,8 @@ def build_write_sids(
         git_sid(project),
         temp_sid_str,
     ]
+    if venv_sid_str:
+        sids.append(venv_sid_str)
     for d in extra_dirs:
         sids.append(extra_sid(d))
     return sids
@@ -113,13 +128,19 @@ def resolve_policy(
     temp_dir = resolve_temp_dir(root, agent_id)
     temp_sid_str = resolve_temp_sid(temp_dir)
     extra_paths = [os.path.realpath(d) for d in extra_dirs]
+    venv_dir = resolve_venv_dir(project)
+    venv_sid_str = venv_sid(project)
     return SandboxPolicy(
         boundary_root=root,
         project_root=project,
-        write_sids=build_write_sids(root, project, temp_sid_str, extra_paths),
+        write_sids=build_write_sids(
+            root, project, temp_sid_str, extra_paths, venv_sid_str
+        ),
         temp_dir=temp_dir,
         temp_sid=temp_sid_str,
         cache_dir=resolve_cache_dir(project),
+        venv_dir=venv_dir,
+        venv_sid_str=venv_sid_str,
         extra_dirs=extra_paths,
         extra_sids=[extra_sid(d) for d in extra_paths],
     )

@@ -52,3 +52,12 @@ def temp_sid(temp_dir: str) -> str:
 def extra_sid(path: str) -> str:
     """附加可写目录（§5.5b② P2）。"""
     return _digest_sid("extra", path)
+
+
+def venv_sid(workspace_path: str) -> str:
+    """项目 `.venv` 依赖环境（39 审计 P0-1：依赖安装官方落点）。
+
+    域分离自 cache/git —— .venv 内的 site-packages 是 agent 可写面，
+    与共享缓存（只写缓存类）和 git 元数据（只写元数据）能力不同。
+    """
+    return _digest_sid("venv", workspace_path)
