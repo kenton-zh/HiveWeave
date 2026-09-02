@@ -253,6 +253,17 @@ async def _ensure_schema(agent_id: str) -> None:
     _migrated.add(key)
 
 
+
+# 39 审计 P1-3/P2-1（确认洪水折叠去抖）：可折叠的消息类型白名单——
+# 普通进度 chat/normal 可折叠（TTL 兜底）；notify（ask-reply 唤醒例外）、
+# ask、system 简报的唤醒语义不碰。
+FOLDABLE_WAIT_MESSAGE_TYPES = frozenset({"chat", "normal"})
+
+
+def is_foldable_wait_message(message_type: str | None) -> bool:
+    return (message_type or "").strip().lower() in FOLDABLE_WAIT_MESSAGE_TYPES
+
+
 class InboxService:
     """Agent inbox — message delivery with priority, wake flag, read tracking."""
 
@@ -659,6 +670,48 @@ class InboxService:
                         to_agent_id=to_agent_id,
                         error=str(e),
                     )
+
+        # 39 审计 P1-1（确认洪水折叠去抖）：kind=agent 等待被同 ref 唤醒后
+        # 冷却窗（默认 5min）内的同 ref 普通 chat 消息只入 inbox 不再唤醒——
+        # 等待方由 TTL 超时/冷却窗后的下一条消息兜底（永不饿死）。仅折叠
+        # 普通 chat；notify（ask-reply 唤醒例外）与 ask 语义不碰。
+        if (
+            wake_flag
+            and is_foldable_wait_message(message_type)
+            and from_agent_id
+            and from_agent_id != to_agent_id
+        ):
+            try:
+                from hiveweave.services.wait_contract import (
+                    WAIT_FOLD_COOLDOWN_MS,
+                    kind_agent_wait_matches_sender,
+                    project_id_for_agent,
+                    wait_contract_service,
+                )
+
+                pid = await project_id_for_agent(to_agent_id)
+                if pid:
+                    waits = await wait_contract_service.list_active(
+                        pid, to_agent_id
+                    )
+                    if await kind_agent_wait_matches_sender(
+                        pid, waits, from_agent_id=from_agent_id
+                    ):
+                        recent = await wait_contract_service.has_recent_cleared_agent_wait(
+                            pid,
+                            to_agent_id,
+                            [from_agent_id, str(from_agent_name or "")],
+                        )
+                        if recent:
+                            wake_flag = False
+                            log.info(
+                                "inbox_wait_wake_folded",
+                                from_agent_id=from_agent_id,
+                                to_agent_id=to_agent_id,
+                                cooldown_ms=WAIT_FOLD_COOLDOWN_MS,
+                            )
+            except Exception as e:
+                log.debug("inbox_wait_fold_check_failed", error=str(e))
 
         # 在降级之后计算 DB 写入值，确保降级生效
         expect = 1 if expect_report else 0

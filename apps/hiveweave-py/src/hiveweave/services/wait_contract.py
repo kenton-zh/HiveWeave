@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import uuid
 from collections.abc import Callable
@@ -125,6 +126,15 @@ CREATE TABLE IF NOT EXISTS agent_waits (
     cleared_at INTEGER
 )
 """
+
+
+# 39 审计 P1-1（确认洪水折叠去抖）：kind=agent 等待被同 ref 唤醒后该冷却窗内
+# 的同 ref 消息只入 inbox 不再唤醒（折叠）——TTL 兜底钟保证等待方永不饿死。
+WAIT_FOLD_COOLDOWN_MS = int(
+    os.environ.get("HIVEWEAVE_WAIT_FOLD_COOLDOWN_MS", "300000") or "300000"
+)
+"""同 ref 消息折叠冷却窗（默认 5 分钟）：冷却窗内的后续消息只入 inbox，
+等待方由 TTL 超时或冷却窗后的下一条消息唤醒。"""
 
 
 def default_ttl_ms(kind: str, agent_id: str | None = None) -> int:
@@ -481,6 +491,65 @@ class WaitContractService:
                     error=str(e),
                 )
         return created
+
+    async def has_recent_cleared_agent_wait(
+        self,
+        project_id: str,
+        agent_id: str,
+        sender_refs: list[str],
+        *,
+        within_ms: int | None = None,
+    ) -> bool:
+        """39 审计 P1-1（确认洪水折叠去抖）：同 ref 的 kind=agent 等待在冷却窗
+        内被清除过 → True（本次同 ref 消息应折叠：只入 inbox 不再唤醒）。
+
+        ``sender_refs`` 为发送者身份变体（UUID/花名/short_id）——等待行的
+        ref 存的是 commit_turn 时的原始写法（UUID 或花名都可能），审计[应修]
+        要求按变体集合匹配，否则 ref=花名 的行永远查不到（假阴性）。
+        best-effort：查询失败返回 False（退化为每次都唤醒——旧行为）。
+        """
+        await _ensure_schema(project_id)
+        conn = await _conn(project_id)
+        if conn is None:
+            return False
+        cooldown = (
+            within_ms if within_ms is not None else WAIT_FOLD_COOLDOWN_MS
+        )
+        now = int(time.time() * 1000)
+        # 身份变体集合：原始写法 + 解析后的完整 UUID + 8 位前缀
+        cands: list[str] = []
+        for tok in sender_refs or []:
+            tok = str(tok or "").strip()
+            if not tok:
+                continue
+            cands.append(tok)
+            try:
+                from hiveweave.services.org import OrgService
+
+                resolved = await OrgService().resolve_agent(project_id, tok)
+                rid = str((resolved or {}).get("id") or "")
+                if rid:
+                    cands.append(rid)
+                    if len(rid) >= 8:
+                        cands.append(rid[:8])
+            except Exception:  # noqa: BLE001 — 解析失败用原始 token
+                cands.append(tok)
+        uniq = [x for i, x in enumerate(cands) if x and x not in cands[:i]]
+        if not uniq:
+            return False
+        placeholders = ",".join("?" * len(uniq))
+        try:
+            cur = await conn.execute(
+                f"SELECT COUNT(*) FROM agent_waits "
+                f"WHERE agent_id = ? AND kind = 'agent' AND ref IN ({placeholders}) "
+                f"AND cleared_at IS NOT NULL AND cleared_at >= ?",
+                [agent_id, *uniq, now - cooldown],
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            return bool(row and row[0])
+        except Exception:  # noqa: BLE001 — 退化旧行为
+            return False
 
     async def clear_waits(self, project_id: str, agent_id: str) -> int:
         await _ensure_schema(project_id)
