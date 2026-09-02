@@ -809,6 +809,36 @@ async def resolve_ask_with_approval(
     """
     if verdict.action != "ask":
         return verdict
+    # s3-clone_07 报告 P0-2：无人值守下 ask 必须**确定性秒拒**，绝不入队等满 120s。
+    # executor/pipeline 注册路径已 honored（F5），但本函数是 shell 命令护栏的 ask
+    # 出口，此前直连 request_permission 绕过了 unattended 检查——实测 18 次
+    # Remove-Item -Recurse 审批 ≈28 分钟墙钟烧在无人应答的等待上。
+    # 查询失败则静默回落到原审批路径（行为不变），不因本检查引入新故障面。
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.approval import is_unattended_mode
+
+        agent_row = await meta_db.get_agent_by_id(agent_id)
+        project_id = (agent_row or {}).get("project_id")
+        if project_id and await is_unattended_mode(project_id):
+            log.info(
+                "command_guard_ask_unattended_reject",
+                rule=verdict.rule,
+                agent_id=agent_id,
+            )
+            return GuardVerdict(
+                True,
+                "deny",
+                (
+                    "[unattended mode] 命中命令护栏 ask 类规则（"
+                    f"{verdict.rule}），无人值守下不等待人工审批、直接拒绝。"
+                    "请改用专用工具（如 delete_directory 清理目录）或缩小"
+                    "命令作用范围后重试；不要原样重试。"
+                ),
+                verdict.rule,
+            )
+    except Exception:  # noqa: BLE001 — best-effort 前置检查
+        pass
     try:
         from hiveweave.services.approval import (
             APPROVAL_TIMEOUT_HINT,

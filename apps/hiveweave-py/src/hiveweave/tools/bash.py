@@ -732,7 +732,7 @@ def _strip_hiveweave_test_excludes(command: str) -> str:
 # (?![\w.-]) 精确拒绝「路径名续字符」：放行 `git -C .hiveweave/worktrees`（尾随空格/结尾），
 # 拦 `.hiveweave/shared-evil/`、`.hiveweave/worktrees2/` 这类前缀目录（\b 会被 d- / s2 击穿）
 _ALLOWED_HW_SUBDIRS = re.compile(
-    r"\.hiveweave[\\/]+(?:shared|reports|drafts|worktrees|handoffs)(?![\w.-])",
+    r"\.hiveweave[\\/]+(?:shared|reports|drafts|worktrees|handoffs|sandbox-temp)(?![\w.-])",
     re.IGNORECASE,
 )
 

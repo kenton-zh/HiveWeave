@@ -387,8 +387,11 @@ def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
         except ValueError:
             return False  # Not in .hiveweave — allowed
 
-        # 放行的 agent 工作子目录（shared = 团队共享空间）
-        allowed_subdirs = {"shared", "reports", "drafts", "worktrees", "handoffs"}
+        # 放行的 agent 工作子目录（shared = 团队共享空间；sandbox-temp = 沙箱
+        # TEMP 指向的私有 scratch——平台自己教 agent 往里写，护栏不能再封死它，
+        # s3-clone_07 报告 P0-1：7 Agent 撞 11 次）
+        allowed_subdirs = {"shared", "reports", "drafts", "worktrees", "handoffs",
+                           "sandbox-temp"}
         for sub in allowed_subdirs:
             try:
                 target.relative_to(hw_root / sub)
