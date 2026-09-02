@@ -122,7 +122,14 @@ async def test_pacing_hint_injected_when_budget_half_used(monkeypatch):
     async def fake_stream(*, messages, **kwargs):
         captured_messages.append([dict(m) for m in messages])
         if len(captured_messages) == 1:
-            clock.advance(280)  # 第一轮流式耗到剩余 ~290s（< 300 阈值）
+            # 前进到「剩余硬预算首次低于 pacing 阈值」。不写死 280s ——
+            # 硬预算与 pacing 阈值均 env 可调（30min 长 turn 场景），
+            # 写死会让开发机 .env 一改就误报。
+            clock.advance(
+                tool_loop_module.HARD_TOTAL_TIMEOUT_S
+                - tool_loop_module.BUDGET_PACING_HINT_S
+                + 20
+            )
             return _tool_round_result()
         return _text_round_result("slice done")
 
@@ -218,7 +225,13 @@ async def test_tool_gate_exhaustion_keeps_text_and_explains(monkeypatch):
     provider = _FakeProvider()
 
     async def fake_stream(*, messages, **kwargs):
-        clock.advance(560)  # 流式回来时已贴硬截止（剩 ~10s < 工具批地板）
+        # 流式回来时已贴硬截止（剩余低于工具批地板）。由硬预算推导而非
+        # 写死 560s —— 硬预算 env 可调，写死会让本地 .env 一改就误报。
+        clock.advance(
+            tool_loop_module.HARD_TOTAL_TIMEOUT_S
+            - tool_loop_module.MIN_TOOL_BUDGET_S
+            + 5
+        )
         return {
             "status": "ok",
             "text": "partial analysis",
@@ -468,11 +481,18 @@ async def test_round_gate_blocks_new_round_when_budget_low(monkeypatch):
     async def fake_stream(*, messages, **kwargs):
         nonlocal stream_calls
         stream_calls += 1
-        clock.advance(100)  # 流式耗 100s（剩 ~470s，工具闸门放行）
+        clock.advance(100)  # 流式耗 100s（工具闸门放行）
         return _tool_round_result()
 
     async def fake_execute(**kwargs):
-        clock.advance(360)  # 工具批耗到剩余 ~110s（< MIN_ROUND_BUDGET 120）
+        # 工具批耗到剩余低于轮预算地板。由硬预算推导而非写死 360s ——
+        # 硬预算 env 可调，写死会让本地 .env 一改就误报。
+        clock.advance(
+            tool_loop_module.HARD_TOTAL_TIMEOUT_S
+            - tool_loop_module.MIN_ROUND_BUDGET_S
+            - 100
+            + 10
+        )
         return (
             [{"role": "tool", "content": "ok", "tool_call_id": "tc-1"}],
             set(),

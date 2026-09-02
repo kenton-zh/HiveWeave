@@ -31,8 +31,19 @@ from hiveweave.tools.timeout_policy import (
 
 
 def test_turn_budget_constants_structurally_sane():
-    """Turn 预算写死启用（DSH_11 复盘）：软 < 硬 < agent SAFETY(600s)。"""
-    assert TOTAL_TIMEOUT_S < HARD_TOTAL_TIMEOUT_S < 600.0
+    """Turn 预算写死启用（DSH_11 复盘）：软 < 硬 < agent SAFETY 天花板。
+
+    上界用 ``AGENT_SAFETY_CEILING_S`` 而非写死 600 —— 天花板自 30min 长
+    turn 场景起已 env 可调（``HIVEWEAVE_STREAM_AGENT_CEILING_S``），写死
+    会让开发机 .env 一改就误报。本用例校验的是三者结构关系，不是具体数值。
+
+    三个值都在函数内**经模块对象**读取：文件顶部 ``from … import`` 会在
+    import 期固化快照，而别的用例可能 `importlib.reload` 过本模块，混用
+    "固化旧值"与"reload 后的新值"会得出 1710 < 600 这种自相矛盾的断言。
+    """
+    from hiveweave.llm.streamer import constants as c
+
+    assert c.TOTAL_TIMEOUT_S < c.HARD_TOTAL_TIMEOUT_S < c.AGENT_SAFETY_CEILING_S
 
 
 def test_idle_watchdog_default_is_five_minutes():
