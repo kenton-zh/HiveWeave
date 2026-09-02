@@ -861,6 +861,20 @@ async def git_worktree_merge_tool(
             result.get("files") if isinstance(result.get("files"), list) else None
         )
         if result.get("already_up_to_date") and not branch_files:
+            # 事实短路（07 报告 #4）：no-op merge（分支已在 main）也必须结算
+            # merge 义务——这是 07 实测 3 条义务僵尸 4.5h 的最可能路径
+            # （no-op 早退 → 从不 fulfill → 只能等 dwell 超时）。
+            try:
+                from hiveweave.services.obligation import ObligationLedger
+
+                for _br in {branch, branch_name} - {None, ""}:
+                    m = re.match(r"^hw/([^/]+)/t-([0-9a-fA-F]{8})$", str(_br))
+                    if m:
+                        await ObligationLedger().fulfill(
+                            project_id, m.group(2), "merge"
+                        )
+            except Exception as e:
+                log.warning("merge_obligation_fulfill_failed", error=str(e))
             auto_titles = await _auto_submit_merged_running_tasks(
                 project_id, workspace_path,
                 branch=branch or branch_name, short_id=short,
@@ -883,16 +897,29 @@ async def git_worktree_merge_tool(
                 )
             return ToolResult.ok(msg)
 
-        # TEST16 D2: fulfill merge obligation — merge landed, stop escalation
+        # TEST16 D2: fulfill merge obligation — merge landed, stop escalation.
+        # 事实短路（07 报告 #4）：分支名编码模块任务 id（hw/<sid>/t-<8>）。
+        # 统建合并多个模块分支时 params.task_id 指向统建任务，模块级 merge
+        # 义务会漏掉——07 实测 3 条义务僵尸 4.5h。按分支反查逐分支清义务；
+        # 分支与 task_id 都没匹配上才退回按 owner 清（旧行为兜底）。
         try:
             from hiveweave.services.obligation import ObligationLedger
 
+            fulfilled = 0
+            seen_branch_tasks: set[str] = set()
+            for _br in {branch, branch_name} - {None, ""}:
+                m = re.match(r"^hw/([^/]+)/t-([0-9a-fA-F]{8})$", str(_br))
+                if m and m.group(2).lower() not in seen_branch_tasks:
+                    seen_branch_tasks.add(m.group(2).lower())
+                    fulfilled += await ObligationLedger().fulfill(
+                        project_id, m.group(2), "merge"
+                    )
             if params.task_id:
-                await ObligationLedger().fulfill(
+                fulfilled += await ObligationLedger().fulfill(
                     project_id, params.task_id, "merge"
                 )
-            else:
-                # No task_id — fulfill by owner (the caller did the merge)
+            if not fulfilled:
+                # No branch/task match — fulfill by owner (the caller did the merge)
                 await ObligationLedger().fulfill_by_owner(
                     project_id, agent_id, "merge"
                 )

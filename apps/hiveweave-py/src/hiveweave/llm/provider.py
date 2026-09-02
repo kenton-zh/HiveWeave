@@ -539,7 +539,14 @@ class OpenAIHandler(FormatHandler):
             out["cache_read"] = cache_read
             out["prompt_cache_hit_tokens"] = cache_read
         if "prompt_cache_miss_tokens" in u:
-            out["prompt_cache_miss_tokens"] = usage_int(u.get("prompt_cache_miss_tokens"))
+            miss = usage_int(u.get("prompt_cache_miss_tokens"))
+            out["prompt_cache_miss_tokens"] = miss
+            # DeepSeek 语义：prompt = hit + miss，miss 即本请求新写缓存
+            # （计费 1.25x，等价 Anthropic 的 cache_creation）。
+            # s3-clone_07 报告 P1-1：此字段此前未映射进账本，3764 行
+            # cache_creation_tokens 恒 0，命中率分母缺分量。
+            if miss:
+                out.setdefault("cache_creation", miss)
         return out or None
 
 

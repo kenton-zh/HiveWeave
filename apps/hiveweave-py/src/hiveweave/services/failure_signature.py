@@ -155,6 +155,7 @@ async def record_failure_signature(
         content = (
             f"[失败签名] tool={tool_name or '?'} | {sig}\n"
             f"根因提示: {attribution or '见错误原文'}\n"
+            f"原文尾(含等价写法/修复线索): {(error or '').strip()[-320:]}\n"
             f"首个撞到的 Agent: {agent_id}"
             f"（撞到该签名后请先检索本项目共享空间是否已有解法）"
         )

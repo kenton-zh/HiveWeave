@@ -152,6 +152,75 @@ async def _conn(project_id: str) -> aiosqlite.Connection:
     return await project_db.get_project_db_by_project_id(project_id)
 
 
+# kind=task 等待的"已满足"终态集合：任务一旦处于这些状态，任何
+# task_transition 唤醒事件都不会再来（没有后继转换），等待即僵尸。
+_TASK_WAIT_SATISFIED_STATUSES = frozenset({"approved", "closed", "cancelled"})
+
+
+async def _short_circuit_satisfied_task_waits(
+    project_id: str, task_waits: list[dict]
+) -> int:
+    """新建的 kind=task 等待若引用的任务已处于终态 → 当场清等待并唤醒。
+
+    07 实测：M3/M4/M5 早已 approved，凛川 20:34 才挂 task_transition 等待
+    ——事件在等待创建前就已发生，唤醒永远不会触发，只能等 TTL 超时
+    （僵尸 4.5h）。此函数在 wait 创建后立即核对任务状态，已终态则：
+    清除等待行 + trigger_subordinate 唤醒 agent（与任务转换唤醒同路径）。
+    """
+    if not task_waits:
+        return 0
+    await _ensure_schema(project_id)
+    conn = await _conn(project_id)
+    if conn is None:
+        return 0
+    from hiveweave.agents.trigger import trigger_subordinate
+
+    now = int(time.time() * 1000)
+    woken = 0
+    for w in task_waits:
+        ref = str(w.get("ref") or "")
+        if not ref:
+            continue
+        try:
+            cur = await conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", [ref]
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        except Exception:  # noqa: BLE001 — 查不到按未满足处理
+            continue
+        status = (row[0] if row else "") or ""
+        if status not in _TASK_WAIT_SATISFIED_STATUSES:
+            continue
+        # 审计[1]：UPDATE rowcount 守卫——与任务转换路径并发时，转换可能已清
+        # 同一行并唤醒过；0 行 = 这次短路没有"清"到任何东西，不重复唤醒。
+        cur = await conn.execute(
+            "UPDATE agent_waits SET cleared_at = ? "
+            "WHERE id = ? AND cleared_at IS NULL",
+            [now, w["id"]],
+        )
+        cleared = cur.rowcount
+        await conn.commit()
+        if not cleared:
+            continue
+        woken += 1
+        log.info(
+            "task_wait_short_circuited",
+            agent_id=w.get("agentId"),
+            task_ref=ref,
+            task_status=status,
+        )
+        try:
+            await trigger_subordinate(str(w.get("agentId") or ""))
+        except Exception as e:  # noqa: BLE001 — 唤醒失败退化为 TTL
+            log.warning(
+                "task_wait_short_circuit_trigger_failed",
+                agent_id=w.get("agentId"),
+                error=str(e),
+            )
+    return woken
+
+
 async def _ensure_schema(project_id: str) -> None:
     if project_id in _migrated:
         return
@@ -398,6 +467,19 @@ class WaitContractService:
             phase=phase,
             obligation_version=ver,
         )
+        # 事实短路（07 报告 #5）：kind=task 的等待若引用的任务**已经**处于
+        # 终态，唤醒事件永远不会再来——当场清等待并唤醒，避免僵尸等待只能
+        # 靠 TTL 超时（07 实测：M3/M4/M5 已 approved，凛川仍挂等待 4.5h）。
+        task_waits = [w for w in created if w["kind"] == "task"]
+        if task_waits:
+            try:
+                await _short_circuit_satisfied_task_waits(project_id, task_waits)
+            except Exception as e:  # noqa: BLE001 — 短路失败退化为 TTL 超时
+                log.warning(
+                    "task_wait_short_circuit_failed",
+                    agent_id=agent_id,
+                    error=str(e),
+                )
         return created
 
     async def clear_waits(self, project_id: str, agent_id: str) -> int:

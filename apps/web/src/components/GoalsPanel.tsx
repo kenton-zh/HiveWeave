@@ -79,7 +79,13 @@ export default function GoalsPanel({ projectId }: Props) {
   const handleSave = async () => {
     setSaving(true);
     try {
-      const res = await updateProjectGoals(projectId, goals);
+      // 审计[4]：保存时丢弃空白 keyResult 行——否则空模板行越积越多，
+      // 进度统计与下轮加载都被污染
+      const cleaned: GoalsData = {
+        ...goals,
+        keyResults: goals.keyResults.filter((k) => (k.text || "").trim()),
+      };
+      const res = await updateProjectGoals(projectId, cleaned);
       if (res.goals) setGoals(res.goals);
       setDirty(false);
     } catch (err) {
@@ -170,8 +176,12 @@ export default function GoalsPanel({ projectId }: Props) {
     );
   }
 
-  const done = goals.keyResults.filter((k) => k.status === "done").length;
-  const total = goals.keyResults.length;
+  // 事实联动（07 反馈：空模板渲染 0/4 假读数，18 任务交付后进度恒 0）：
+  // 进度只统计**有内容**的 keyResult，空白行不计数。真正的"目标↔任务"
+  // 自动推导见 repair-plan #6（待产品设计），当前先消灭假读数。
+  const meaningfulKRs = goals.keyResults.filter((k) => (k.text || "").trim());
+  const done = meaningfulKRs.filter((k) => k.status === "done").length;
+  const total = meaningfulKRs.length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
   return (
