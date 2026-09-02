@@ -214,6 +214,38 @@ async def test_execute_bash_mounts_dialect_gate(
     assert result["blocked"] is True
     assert "Select-Object" in result["error"]  # 等价写法在场
     assert "pwsh" in result["error"]
+    # s3-clone_06 P0-3/P0-4：命令从未执行 → runner_failed=1（不只 blocked）。
+    # 否则 (runner_failed=0, command_failed=0) 桶与"未知失败"不可区分，
+    # 且 F10 归因会把"方言不兼容"错报成"平台护栏拒绝（安全拦截）"。
+    assert result["runner_failed"] is True
+    assert result["dialect_failed"] is True
+    assert result.get("command_failed") is not True
+
+
+@pytest.mark.asyncio
+async def test_dialect_gate_fact_flags_survive_tool_result(
+    gate_on, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    """事实位必须一路活到 ToolResult，**包括 blocked 分支**。
+
+    2026-09-01 实战抓到：`_shell_tool_result` 的 blocked 分支走
+    `ToolResult.blocked_err(err_msg, **public)`，只传 public 把 `fact_flags`
+    （runner_failed / command_failed / timeout_*）整个丢掉 —— 方言门与护栏
+    拒绝恰恰都是 blocked=True，于是报告 #4「runner_failed 恒 0」在**最该
+    置位的那类失败**上原样残留。单测 execute_bash 全绿也发现不了。
+    """
+    from hiveweave.tools.bash import BashParams, bash_tool
+
+    params = BashParams(command='sed -n "1,40p" R.md')
+    tr = await bash_tool(params, "agent-1", str(tmp_path))
+    payload = tr.to_dict()
+
+    assert payload.get("success") is False
+    assert payload.get("blocked") is True
+    assert payload.get("runner_failed") is True, (
+        "blocked 路径丢了 runner_failed → run_steps 事实位失效"
+    )
+    assert payload.get("dialect_failed") is True
 
 
 @pytest.mark.asyncio
