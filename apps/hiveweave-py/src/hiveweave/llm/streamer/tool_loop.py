@@ -33,7 +33,9 @@ from .constants import (
 )
 from .doom_loop import (
     BLOCKED_STALL_LIMIT,
+    GATE_REJECT_STALL_LIMIT,
     STALL_REASON_BLOCKED,
+    STALL_REASON_GATE_REJECT,
     STALL_REASON_NO_PROGRESS,
     STALL_REASON_READONLY,
     STALL_REASON_RUNNER_FAILED,
@@ -308,6 +310,9 @@ class ToolLoopMixin:
         # 正交事实位。收口时机不变（限值同 TOOL_LOOP_STALL_LIMIT），但归因
         # 落到工具层，文案不再说「模型无进展」。
         tool_fail_stall_count = 0
+        # 39 审计 P2-1: submit 门禁按设计拒收轮（gate_reject）独立计数 ——
+        # 负样本演练/正常打回是流程回执，不进 tool_fail 连败。
+        gate_reject_stall_count = 0
         # P0-1（R3）：同源失败判据 —— 上轮失败指纹（tool_name, args[:60]）。
         # 同指纹 = 原地撞同一面墙（2 轮快收口）；指纹变化 = 试错/方向在变
         # （不快速掐，交给普通 stall_count 总限兜底）。
@@ -1092,6 +1097,7 @@ class ToolLoopMixin:
                     stall_count = 0
                     readonly_stall_count = 0
                     blocked_stall_count = 0
+                    gate_reject_stall_count = 0
                     tool_fail_stall_count = 0
                     last_stall_reason = None
                     # TEST21 M4: activity renews soft budget within hard cap
@@ -1102,6 +1108,7 @@ class ToolLoopMixin:
                     readonly_stall_count += 1
                     stall_count = 0
                     blocked_stall_count = 0
+                    gate_reject_stall_count = 0
                     tool_fail_stall_count = 0
                     last_stall_reason = round_reason
                 elif round_reason == STALL_REASON_BLOCKED:
@@ -1110,6 +1117,13 @@ class ToolLoopMixin:
                     # [error, blocked] 交替轮必须仍能累计到 STALL BREAK
                     # （2026-08-13 审计：清零会让交替序列永不触顶）。
                     blocked_stall_count += 1
+                    last_stall_reason = round_reason
+                elif round_reason == STALL_REASON_GATE_REJECT:
+                    # 39 审计 P2-1：submit 门禁按设计拒收（负样本演练/正常
+                    # 打回）→ 正交事实位 gate_reject，独立计数不进 tool_fail
+                    # 连败（演练语义：被拒 = 成功）。普通 stall_count 仍累计
+                    # 兜底，防无限故意撞门；超 GATE_REJECT_STALL_LIMIT 收口。
+                    gate_reject_stall_count += 1
                     last_stall_reason = round_reason
                 elif round_reason in (
                     STALL_REASON_TOOL_FAILED, STALL_REASON_RUNNER_FAILED
@@ -1135,11 +1149,13 @@ class ToolLoopMixin:
                     stall_count += 1
                     readonly_stall_count = 0
                     blocked_stall_count = 0
+                    gate_reject_stall_count = 0
                     last_stall_reason = round_reason
                 else:
                     stall_count += 1
                     readonly_stall_count = 0
                     blocked_stall_count = 0
+                    gate_reject_stall_count = 0
                     tool_fail_stall_count = 0
                     last_stall_reason = STALL_REASON_NO_PROGRESS
                 stalled = (
@@ -1147,6 +1163,7 @@ class ToolLoopMixin:
                     or readonly_stall_count >= TOOL_LOOP_READONLY_STALL_LIMIT
                     or blocked_stall_count >= BLOCKED_STALL_LIMIT
                     or tool_fail_stall_count >= TOOL_FAIL_STALL_LIMIT
+                    or gate_reject_stall_count >= GATE_REJECT_STALL_LIMIT
                 )
                 if stalled:
                     # 收口归因：工具失败优先（DSH 顺序），其次护栏，

@@ -450,6 +450,14 @@ async def dispatch_task_tool(
         wt_sid = result.get("worktree_short_id")
         if wt_sid:
             output += f" worktree={wt_sid}."
+            # 39 审计 P2-3：叶子开工第一步撞「app/ 不在树里」三连——切树时
+            # 上游产物还没合入 main。派单回执里直接把正确姿势说掉。
+            output += (
+                " Note: your worktree was cut from current main — upstream "
+                "deliverables may not be merged yet. Build from the design "
+                "doc now; do NOT read main's implementation files (they "
+                "arrive via merge)."
+            )
         parent = result.get("parent_task_id") or ""
         output += (
             " Wait on this child with commit_turn(waiting, kind=task, "

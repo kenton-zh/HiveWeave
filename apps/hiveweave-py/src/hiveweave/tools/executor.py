@@ -2236,7 +2236,7 @@ async def _f10_result_hooks(
         from hiveweave.services.failure_signature import attribution_of
 
         _attr = attribution_of(result)
-        await record_failure_signature(
+        rec = await record_failure_signature(
             project_id=project_id,
             agent_id=agent_id,
             tool_name=tool_name,
@@ -2244,9 +2244,16 @@ async def _f10_result_hooks(
             attribution=_attr,
         )
         # agent_id 传入供自指抑制留日志；条目无解法信息时不广播（镜子提示）
-        hint = await known_signature_hint(project_id, error, agent_id=agent_id)
-        if hint:
-            result["error"] = f"{result['error']}\n\n{hint}"
+        # 39 审计 P1-3：首撞者不发自指提示——"先读它"只指向**别人**的条目
+        # （首撞者刚写完条目，内容是自己 2 秒前的错误原文，读了零信息量）。
+        preexisting = bool(isinstance(rec, dict) and rec.get("preexisting"))
+        pre_source = (
+            (rec or {}).get("preexisting_source") if isinstance(rec, dict) else None
+        )
+        if preexisting and pre_source != agent_id:
+            hint = await known_signature_hint(project_id, error, agent_id=agent_id)
+            if hint:
+                result["error"] = f"{result['error']}\n\n{hint}"
     except Exception as e:  # noqa: BLE001
         log.debug("f10_failure_signature_hook_failed", error=str(e))
     return result

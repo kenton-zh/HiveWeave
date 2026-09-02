@@ -141,17 +141,41 @@ async def record_failure_signature(
 ) -> bool:
     """把新失败签名写入项目共享空间（R7 → 0 的可机检支撑）。
 
-    Returns True 当写入/更新发生（含已存在仅刷新）。best-effort。
+    Returns ``{"written": bool, "preexisting": bool, "preexisting_source": str|None}``：
+    ``preexisting``=该签名在本次失败**之前**已存在（39 审计 P1-3：首撞者不该收
+    "先读它"自指提示——executor 据此门控 hint）；``preexisting_source``=首撞者。
+    best-effort。
     """
     if not project_id:
         return False
     sig = signature_of(error)
     if sig is None:
-        return False
+        return {"written": False, "preexisting": False, "preexisting_source": None}
     try:
         from hiveweave.services.memory import MemoryService
 
         memory_service = MemoryService()
+        # 39 审计 P1-3（签名自指 8 连发）：首撞者不该收到"先读它"提示——
+        # 条目内容就是自己 2 秒前写的错误原文。先查签名是否**早已存在**及
+        # 其首撞者，调用方（executor）据此门控 hint：只给"别人的坑"发提示。
+        preexisting = False
+        preexisting_source: str | None = None
+        try:
+            for m in (await memory_service.get_project_memories(project_id)) or []:
+                if m.get("type") != "failure_signature":
+                    continue
+                fl = (m.get("content") or "").split("\n", 1)[0]
+                if fl.startswith("[失败签名]") and (
+                    f"| {sig}" in fl or sig[:48] in fl
+                ):
+                    preexisting = True
+                    preexisting_source = (
+                        str((m.get("metadata") or {}).get("source_agent_id") or "")
+                        or None
+                    )
+                    break
+        except Exception:  # noqa: BLE001 — 前查失败按"新签名"处理
+            pass
         content = (
             f"[失败签名] tool={tool_name or '?'} | {sig}\n"
             f"根因提示: {attribution or '见错误原文'}\n"
@@ -188,11 +212,18 @@ async def record_failure_signature(
         )
         # P2 复审：写入顺带裁剪最老签名行到上限（防单调累积挤掉合法
         # constitution；best-effort 不阻断）。
-        await _trim_signature_rows(project_id)
-        return True
+        try:
+            await _trim_signature_rows(project_id)
+        except Exception as trim_err:  # noqa: BLE001 — 裁剪 best-effort
+            log.warning("failure_signature.trim_failed", error=str(trim_err))
+        return {
+            "written": True,
+            "preexisting": preexisting,
+            "preexisting_source": preexisting_source,
+        }
     except Exception as e:
         log.warning("failure_signature.broadcast_failed", error=str(e))
-        return False
+        return {"written": False, "preexisting": False, "preexisting_source": None}
 
 
 async def known_signature_hint(

@@ -24,11 +24,26 @@ BLOCKED_STALL_LIMIT 轮全被拒说明当前方案不可执行，仍应收口兜
 doom loop 同参阈值拦住；此处兜底"换着参数试、全被拒"的情形）。
 """
 
+GATE_REJECT_STALL_LIMIT = 12
+"""submit 门禁按设计拒收轮（gate_reject）的独立 stall 上限（39 审计 P2-1）。
+
+门禁拒收（冒烟门/审计/契约 prerun 的「正常打回」）是流程回执，不是工具
+故障也不是模型空转——不计入 tool_fail 连败。但无限故意撞门仍需兜底：
+连续 GATE_REJECT_STALL_LIMIT 轮全被拒说明当前方案不可执行，收口交给
+普通 stall_count/预算闸口。取值放宽到 12：负样本演练一轮 3 次拒收 +
+正常打回若干次都应留有余量。
+"""
+
 STALL_REASON_NO_PROGRESS = "no_progress"
 STALL_REASON_TOOL_FAILED = "tool_failed"
 STALL_REASON_RUNNER_FAILED = "runner_failed"
 STALL_REASON_BLOCKED = "blocked"
 STALL_REASON_READONLY = "readonly"
+# 39 审计 P2-1：submit 门禁按设计拒收（负样本演练/正常打回）——正交于
+# tool_failed，不进连续失败计数（演练语义：被拒 = 成功）。
+STALL_REASON_GATE_REJECT = "gate_reject"
+#: 门禁按设计拒收的工具集合——它们的失败是「流程回执」而非「工具故障」。
+GATE_REJECT_TOOLS = frozenset({"submit_task"})
 """Stall 归因（正交事实位）—— 收口时「谁没动」的唯一口径。
 
 TEST_DSH_33 实测：52 次 tool-loop stall 中 47 次（90.4%）末尾两轮工具
@@ -279,6 +294,16 @@ def classify_stall_round(
         return None
     errs = error_ids or set()
     blocked = blocked_ids or set()
+    # 39 审计 P2-1：submit 门禁按设计拒收（负样本演练/正常打回）→ 正交事实位
+    # gate_reject，不计入 tool_failed 连败（演练语义：被拒 = 成功）。仅当本轮
+    # 全部失败都是门禁拒收时才归此类；与其它失败混轮仍归 tool_failed。
+    gate_calls = [
+        tc for tc in tool_calls
+        if (tc.get("id") or "") in errs
+        and (tc.get("name") or "") in GATE_REJECT_TOOLS
+    ]
+    if errs and gate_calls and len(gate_calls) == len(errs):
+        return STALL_REASON_GATE_REJECT
     if errs - blocked:
         return STALL_REASON_TOOL_FAILED
     if errs and blocked >= errs:

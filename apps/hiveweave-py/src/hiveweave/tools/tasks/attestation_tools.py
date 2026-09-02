@@ -126,9 +126,24 @@ async def attest_doc_review_tool(
     source = (params.source or "auto").strip().lower()
     if source in ("worktree", "wt", "agent"):
         if not wt_ws:
+            # 39 审计 P2-2：CEO 设计上永无 worktree——"ensure worktree exists"
+            # 对它是死路提示。按角色给可执行的替代通道。
+            role_note = ""
+            try:
+                from hiveweave.db.meta import get_agent_by_id
+
+                agent_row = await get_agent_by_id(agent_id)
+                if (agent_row or {}).get("role") == "ceo":
+                    role_note = (
+                        " CEO has no worktree by design — use source=main "
+                        "(the merged design doc lives on main)."
+                    )
+            except Exception:  # noqa: BLE001 — 角色查询失败不影响原提示
+                pass
             return ToolResult.err(
                 "source=worktree but caller has no valid write worktree. "
                 "Use source=main after merge, or ensure worktree exists."
+                + role_note
             )
         if not _all_files_exist(wt_ws):
             return ToolResult.err(

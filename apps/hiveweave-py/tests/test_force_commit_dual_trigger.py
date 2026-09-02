@@ -104,3 +104,57 @@ def test_constants_env_tunable_docs():
 
     assert 0 < c.FORCE_COMMIT_WALL_PCT < 1
     assert c.FORCE_COMMIT_GRACE_WALL_S > 0
+
+
+# ── 39 审计 P2-1：gate_reject 正交归类（演练语义：被拒 = 成功）──────────
+
+
+def test_all_submit_errors_classified_gate_reject():
+    from hiveweave.llm.streamer.doom_loop import STALL_REASON_GATE_REJECT
+    from hiveweave.llm.streamer.doom_loop import classify_stall_round
+
+    tool_calls = [
+        {"id": "t1", "name": "submit_task", "arguments": "{}"},
+        {"id": "t2", "name": "submit_task", "arguments": "{}"},
+    ]
+    d = classify_stall_round(
+        tool_calls,
+        error_ids={"t1", "t2"},
+        blocked_ids=set(),
+        duplicate_ids=set(),
+        seen_readonly_fingerprints=set(),
+    )
+    assert d == STALL_REASON_GATE_REJECT
+
+
+def test_mixed_errors_still_tool_failed():
+    from hiveweave.llm.streamer.doom_loop import STALL_REASON_TOOL_FAILED
+    from hiveweave.llm.streamer.doom_loop import classify_stall_round
+
+    tool_calls = [
+        {"id": "t1", "name": "submit_task", "arguments": "{}"},
+        {"id": "t2", "name": "bash", "arguments": "{}"},
+    ]
+    d = classify_stall_round(
+        tool_calls,
+        error_ids={"t1", "t2"},
+        blocked_ids=set(),
+        duplicate_ids=set(),
+        seen_readonly_fingerprints=set(),
+    )
+    assert d == STALL_REASON_TOOL_FAILED
+
+
+def test_no_error_round_not_gate_reject():
+    from hiveweave.llm.streamer.doom_loop import STALL_REASON_GATE_REJECT
+    from hiveweave.llm.streamer.doom_loop import classify_stall_round
+
+    tool_calls = [{"id": "t1", "name": "submit_task", "arguments": "{}"}]
+    d = classify_stall_round(
+        tool_calls,
+        error_ids=set(),  # submit 成功（未被拒）
+        blocked_ids=set(),
+        duplicate_ids=set(),
+        seen_readonly_fingerprints=set(),
+    )
+    assert d != STALL_REASON_GATE_REJECT
