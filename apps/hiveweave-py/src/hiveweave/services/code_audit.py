@@ -732,7 +732,48 @@ async def run_code_audit(
         # TEST_DSH_32 P7（空 diff 短路）：diff 为空 = 无可审计内容——
         # 无论台账如何（编辑后回滚也算无净变更），直接 auto-PASS，
         # 不再为空 diff 烧一次 LLM（此前实锤 34s 空跑）。
+        # TEST_DSH_39 P0-3（审计翻转）：空 diff ≠ 安全。同任务上一轮审计若为
+        # ISSUES（exit_code=1），回滚后的 auto-PASS 会把结论 4min 内翻转成
+        # PASS，且新 PASS 凭证顶掉旧 ISSUES 凭证——门禁自己跟自己打架。
+        # 改为：上一轮 ISSUES 在案时发显式「回滚标注」（不发 PASS 凭证，旧
+        # ISSUES 凭证继续生效），要求人工复核/重新指派/取消任务；
+        # 无 ISSUES 前科时保留原 auto-PASS（P7 优化不回退）。
         if not diff.strip():
+            from hiveweave.services.attestation import (
+                find_latest_attestation_by_kind,
+                parse_audit_verdict,
+            )
+
+            prior = None
+            try:
+                prior = await find_latest_attestation_by_kind(
+                    project_id, agent_id=agent_id, kind=CODE_AUDIT_KIND
+                )
+            except Exception:  # noqa: BLE001 — 查询失败按无前科处理（P7 优化不回退）
+                prior = None
+            prior_issues = bool(
+                prior
+                and parse_audit_verdict(prior) == "ISSUES"
+                and _task_ref_match(task_id, prior.get("task_id"))
+            )
+            if prior_issues:
+                reset_ledger(agent_id)
+                log.warning(
+                    "code_audit.empty_diff_after_issues",
+                    agent_id=agent_id,
+                    task_id=task_id,
+                )
+                return {
+                    "audited": True,
+                    "verdict": "ROLLED_BACK",
+                    "lines_audited": 0,
+                    "auto_pass_reason": "empty_diff_after_issues",
+                    "message": (
+                        "[code audit] diff 为空（变更已回滚），但同任务上一轮"
+                        "审计结论为 ISSUES——不发新的 PASS 凭证。请人工复核："
+                        "确认回滚后重新指派任务，或取消任务；不要原样重复提交。"
+                    ),
+                }
             attestation_id = await attestation_service.create(
                 project_id,
                 agent_id=agent_id,

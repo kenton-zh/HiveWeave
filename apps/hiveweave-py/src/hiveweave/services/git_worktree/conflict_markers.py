@@ -122,6 +122,37 @@ async def _reject_if_markers_landed(
                 if ln.strip()
             ]
         else:
+            # 39 轮审计 P0-2：零差异 merge（branch 已合入 main，branch_files 与
+            # diff-tree -m 双空）此前被 fail-closed 报「Merge aborted」——但 merge
+            # commit 已落地，出现「重试→No-op→再重试」×3（178K tok）。修复：报失败
+            # 前先查 is-ancestor，已合入 → 返回 no-op 成功（merged_already 事实位），
+            # 调用方走 already_up_to_date 既有路径（义务结算/自动 submit 已覆盖）。
+            # 扫描跳过是安全的：diff-tree 全空说明没有 merge 引入的文件可扫。
+            ok_anc, _ = await _git(
+                ["merge-base", "--is-ancestor", branch, target_branch],
+                workspace_path,
+            )
+            if ok_anc:
+                log.info(
+                    "git_worktree.merge_zero_diff_noop",
+                    short_id=short_id,
+                    target=target_branch,
+                    branch=branch,
+                )
+                return {
+                    "success": True,
+                    "already_up_to_date": True,
+                    "merged_already": True,
+                    "reason": "no_op_zero_diff",
+                    "conflicts": [],
+                    "message": (
+                        f"No-op merge: branch already merged into {target_branch} "
+                        "(zero diff after merge) — conflict scan not needed."
+                    ),
+                    "branch": branch,
+                    "files": branch_files,
+                    "short_id": short_id,
+                }
             return {
                 "success": False,
                 "reason": "conflict_scan_unscoped",
