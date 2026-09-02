@@ -1851,6 +1851,28 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": [],
     },
+    "run_smoke": {
+        "description": (
+            "Pre-submit delivery smoke check (自查通道，疏导设计). Boots the "
+            "project service per the task's frozen service_smoke contract and "
+            "runs the probe script (true protocol client, e.g. boto3) against "
+            "it. Call BEFORE submit_task on milestone tasks — a broken "
+            "delivery caught here costs 10 seconds, caught by the submit gate "
+            "it costs a rejection, caught by the verifier it costs the whole "
+            "round. Does NOT change task status."
+        ),
+        "properties": {
+            "taskId": {
+                "type": "string",
+                "aliases": ["task_id"],
+                "description": (
+                    "Milestone task id (copy whole from get_tasks). The task "
+                    "contract must contain a service_smoke clause."
+                ),
+            },
+        },
+        "required": ["taskId"],
+    },
     "stop_dev_server": {
         "description": (
             "Stop this project's registered dev server on preferredPort. "
