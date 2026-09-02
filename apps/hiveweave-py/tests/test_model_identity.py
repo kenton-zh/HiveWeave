@@ -159,4 +159,4 @@ async def test_seed_default_agents_stores_uuid_not_name():
     ):
         await _seed_default_agents("proj-1")
 
-    assert created_models == ["uuid-mgmt", "uuid-exec"], created_models
+    assert created_models == ["uuid-mgmt", "uuid-exec", "uuid-exec"], created_models # 09-02: +QA 主管验真（exec tier）

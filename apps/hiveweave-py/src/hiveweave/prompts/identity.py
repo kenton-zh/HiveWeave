@@ -360,6 +360,12 @@ def build_identity_prompt(
 
     if family == "coordinator":
         role_block = build_coordinator_script(role, name)
+        # QA 主管（qa_lead）：coordinator 权（staffing/dispatch）+ 验收纪律块。
+        # 契约驱动验收、装配级探针、招叶子 QA 扩编——见 prompts/qa_lead.py。
+        if role == "qa_lead":
+            from hiveweave.prompts.qa_lead import QA_LEAD_BLOCK
+
+            role_block = f"{role_block}\n\n{QA_LEAD_BLOCK}"
     else:
         role_block = build_executor_script(role, name)
 

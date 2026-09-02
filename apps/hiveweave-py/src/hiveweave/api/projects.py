@@ -658,6 +658,27 @@ async def _seed_default_agents(project_id: str) -> list[str]:
             },
             bootstrap=True,
         )
+        # 用户钦定（09-01）：项目创建即有的 QA 主管——验收权独立（契约驱动）。
+        # 从 spec 写装配级验收测试（拉起服务+真协议客户端，tests/smoke/），
+        # 禁直调内部函数作验收结论；与架构师共同维护 service_smoke 冻结探针
+        # （repair-plan #1）；测试面大可招叶子 QA 扩编。
+        qa_lead = await org.create_agent(
+            {
+                "project_id": project_id,
+                "name": "验真",
+                "role": "qa_lead",
+                "goal": "契约驱动验收：从 instruction.md 与设计文档派生装配级验收测试——拉起服务+真协议客户端走主链路（探针写 tests/smoke/），禁止以直调内部函数作为验收结论；与架构师共同维护 service_smoke 冻结探针；测试面大时招聘叶子 QA 扩编。",
+                "backstory": "前 SRE 值班工程师，见过太多『零件全绿、整机趴窝』的事故——每个组件单独测都过，装一起就趴。信条：没有从公共入口走通一遍的交付都不算交付。审别人的实现六亲不认，但每个 FAIL 必附复现步骤。",
+                "permission_type": "coordinator",
+                "status": "active",
+                "parent_id": ceo_id,
+                "model_id": exec_model_id,
+                "language": seed_language,
+                "skills": ["planning-and-task-breakdown", "code-review-and-quality", "task-advance"],
+            },
+            bootstrap=True,
+        )
+        created_ids.append(qa_lead["id"])
     except Exception as e:
         log.warning("seed_default_agents_failed", project_id=project_id, error=str(e))
     return created_ids

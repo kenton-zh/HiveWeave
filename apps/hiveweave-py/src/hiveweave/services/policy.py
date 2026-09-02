@@ -165,6 +165,7 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
 COORDINATOR_WRITE_PREFIXES = (
     "docs/",
     "doc/",
+    "tests/",  # QA 主管（qa_lead）：契约驱动验收探针写在 tests/smoke/
     ".hiveweave/shared/",
     ".hiveweave/reports/",
     ".hiveweave/drafts/",
