@@ -521,29 +521,60 @@ async def _run_subagent(
     # 子代理协程一并中断（自身 record_rounds 不会执行），父 flush 兜住。
     if getattr(parent, "_pending_usage", None) is None:
         parent._pending_usage = []
-    stream_coro = streamer.stream(
-        agent_id=sub_id,
-        messages=messages,
-        model_config=model_config,
-        tools=tools,
-        on_tool_call=on_tool_call,
-        max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS,
-        usage_sink=parent._pending_usage.append,
-    )
+
+    def _new_stream_coro():
+        # 39 审计 P1-1 修复的姊妹语义（对齐主 agent 的 auto-retrigger）：
+        # 协程只能 await 一次——重试必须重建。_ssl 风暴期 LLM 重试耗尽会把
+        # 整个窗口吃光，单次超时即 FAILED 对子代理是"一次失败即终局"。
+        return streamer.stream(
+            agent_id=sub_id,
+            messages=messages,
+            model_config=model_config,
+            tools=tools,
+            on_tool_call=on_tool_call,
+            max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS,
+            usage_sink=parent._pending_usage.append,
+        )
+
     try:
         if timeout_s is None or timeout_s <= 0:
-            result = await stream_coro
+            result = await _new_stream_coro()
         else:
-            result = await asyncio.wait_for(stream_coro, timeout=timeout_s)
+            result = await asyncio.wait_for(_new_stream_coro(), timeout=timeout_s)
     except asyncio.TimeoutError:
-        await _record_subagent_step(
-            parent, status="failed",
-            run_id=snap_run_id, counter=snap_step_counter,
+        # 对齐主 agent 恢复语义（39 审计）：主 agent turn 失败后平台自动
+        # retrigger 续跑；子代理此前一次超时即 [SUBAGENT FAILED] 终局。
+        # 自动重试一次（全新窗口）——SSL 风暴/网关抖动类瞬时故障两次窗口
+        # 连乘后仍失败，才真正 FAILED 通知父。
+        log.warning(
+            "subagent_timeout_retry_once",
+            sub_id=sub_id,
+            timeout_s=timeout_s,
         )
-        return {
-            "status": "error",
-            "error": f"subagent timed out after {timeout_s:g}s",
-        }
+        try:
+            result = await asyncio.wait_for(_new_stream_coro(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            await _record_subagent_step(
+                parent, status="failed",
+                run_id=snap_run_id, counter=snap_step_counter,
+            )
+            return {
+                "status": "error",
+                "error": (
+                    f"subagent timed out after {timeout_s:g}s "
+                    "(auto-retried once; upstream gateway likely degraded — "
+                    "check provider/proxy, then re-spawn)"
+                ),
+            }
+        except Exception as retry_err:  # noqa: BLE001 — 重试轮的基础设施错误
+            await _record_subagent_step(
+                parent, status="failed",
+                run_id=snap_run_id, counter=snap_step_counter,
+            )
+            return {
+                "status": "error",
+                "error": f"subagent retry failed: {retry_err}",
+            }
     except Exception as e:  # 网络/熔断等 — 转 err，不炸父
         await _record_subagent_step(
             parent, status="failed",
