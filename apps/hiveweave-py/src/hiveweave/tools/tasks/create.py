@@ -327,12 +327,38 @@ async def create_task_tool(
             note = "status=claimed (assign=claim)"
         else:
             note = f"status={st}"
+        # 39 审计 P0-1 第二步：契约 deps 代装——平台以宿主令牌把
+        # contractJson.deps 安装进项目 .venv（agent 沙箱写不进依赖树，
+        # venv_setup 的 E9 只铺壳）。best-effort：失败不阻断建任务，
+        # 结果写进建任务回执供派单方即时看到。
+        deps_note = ""
+        _cj = params.contract_json if isinstance(params.contract_json, dict) else {}
+        _deps = _cj.get("deps")
+        if isinstance(_deps, list) and _deps:
+            try:
+                from hiveweave.db import meta as _meta_db
+                from hiveweave.services.venv_setup import (
+                    install_project_deps_async,
+                )
+
+                _ws = await _meta_db.get_project_workspace(project_id) or ""
+                dep_res = await install_project_deps_async(_ws, _deps)
+                if dep_res.get("ok"):
+                    deps_note = " deps installed into project .venv ✓"
+                else:
+                    deps_note = (
+                        f" ⚠ deps install FAILED: {dep_res.get('reason') or ''}"
+                        f"{str(dep_res.get('output') or '')[-300:]}"
+                    )
+            except Exception as dep_err:  # noqa: BLE001 — 代装失败不阻断建任务
+                deps_note = f" ⚠ deps install error: {dep_err}"
         dod_hint = "" if params.acceptance_criteria else (
             " hint: acceptance_criteria is empty — reviewers will have no "
             "per-item DoD to check against (free-text review only)."
         )
         return ToolResult.ok(
-            f"Task created (id={task_id}, {note}): {title}{force_note}{dod_hint}",
+            f"Task created (id={task_id}, {note}): {title}"
+            f"{force_note}{deps_note}{dod_hint}",
             task_id=task_id,
             status=st,
         )

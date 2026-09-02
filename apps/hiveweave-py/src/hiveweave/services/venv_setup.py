@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -131,3 +132,97 @@ async def ensure_project_venv_async(workspace: str | Path | None) -> bool:
         return ok
     except Exception:
         return False
+
+
+# ── 39 审计 P0-1 第二步：契约 deps 代装 ─────────────────────────────
+# 平台以宿主令牌把契约声明的依赖装进项目 .venv——agent 沙箱写不进依赖树
+# 是缺路（EPERM），代装 = 平台代跑不靠自觉（与冒烟门同哲学）。
+# 安全边界：命令由平台拼装（每个 dep 过安全正则，禁 flag/URL），uv 从
+# 官方 index 拉——不执行项目侧提供的任意命令行。
+
+_SAFE_DEP_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]*(\[[a-zA-Z0-9_,\-]+\])?([=<>!~]+[A-Za-z0-9._\-*,]+([=<>!~]+[A-Za-z0-9._\-*,]+)*)?")
+
+
+def validate_deps(deps: list) -> tuple[list[str], list[str]]:
+    """拆分安全/不安全的依赖声明。禁 flag（-e/--index-url）与 URL 形态。"""
+    ok: list[str] = []
+    bad: list[str] = []
+    for d in deps or []:
+        d = str(d).strip()
+        if d and not d.startswith("-") and _SAFE_DEP_RE.fullmatch(d):
+            ok.append(d)
+        else:
+            bad.append(d)
+    return ok, bad
+
+
+async def install_project_deps_async(
+    workspace: str | Path | None, deps: list, *, timeout_s: float = 300.0
+) -> dict:
+    """契约 deps 代装：``uv pip install --python <project .venv> <deps>``。
+
+    宿主令牌执行（与 venv_setup 同信任级）；输出尾部随结果返回。
+    Returns ``{"ok": bool, "exit": int|None, "output": str, "reason": str}``。
+    """
+    import asyncio
+
+    ok_deps, bad = validate_deps(deps)
+    if bad:
+        return {
+            "ok": False,
+            "exit": None,
+            "output": "",
+            "reason": f"unsafe dep spec rejected: {bad}",
+        }
+    if not ok_deps:
+        return {"ok": True, "exit": 0, "output": "", "reason": "no deps"}
+    venv_dir = project_venv_dir(workspace)
+    if not _venv_python(venv_dir).exists():
+        return {
+            "ok": False,
+            "exit": None,
+            "output": "",
+            "reason": "project .venv 不存在（venv_setup 未完成或失败）",
+        }
+    cmd = ["uv", "pip", "install", "--python", str(_venv_python(venv_dir)), *ok_deps]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(venv_dir.parent),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return {
+                "ok": False,
+                "exit": None,
+                "output": "",
+                "reason": f"deps install timeout (>{timeout_s:.0f}s)",
+            }
+        output = (out or b"").decode("utf-8", errors="replace")
+        ok = proc.returncode == 0
+        log.info(
+            "project_deps_installed",
+            workspace=str(venv_dir.parent),
+            deps=ok_deps,
+            ok=ok,
+            exit_code=proc.returncode,
+        )
+        return {
+            "ok": ok,
+            "exit": proc.returncode,
+            "output": output[-2000:],
+            "reason": "" if ok else f"uv pip install failed (exit={proc.returncode})",
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "exit": None,
+            "output": "",
+            "reason": "uv 不在 PATH——宿主需安装 uv（venv_setup 同前置）",
+        }
+    except Exception as e:  # noqa: BLE001 — 代装失败不阻断建任务
+        return {"ok": False, "exit": None, "output": "", "reason": str(e)}
