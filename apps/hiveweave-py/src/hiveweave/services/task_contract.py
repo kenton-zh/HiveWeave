@@ -110,6 +110,17 @@ def validate_contract(contract: dict[str, Any]) -> str | None:
     acceptance = contract.get("acceptance") or []
     if not isinstance(acceptance, list):
         return "contract_json.acceptance must be a list"
+    # 审计[4]：service_smoke 条款最多一条（冻结指纹按脚本粒度记，多条款需
+    # 指纹表；需求上单探针脚本可承载全部断言，无多条款场景）
+    smoke_clauses = [
+        c for c in acceptance
+        if isinstance(c, dict) and (c.get("type") or "").strip() == "service_smoke"
+    ]
+    if len(smoke_clauses) > 1:
+        return (
+            "multiple service_smoke clauses not supported — merge all "
+            "assertions into one probe script"
+        )
     for i, clause in enumerate(acceptance):
         if not isinstance(clause, dict):
             return f"acceptance[{i}] must be an object"

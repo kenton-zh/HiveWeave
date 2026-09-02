@@ -121,6 +121,20 @@ async def run_service_smoke_clause(
 
     # ── 冻结校验：首次运行后脚本被改动 = 立即失败（防削弱验收探针）──────
     current_sha = _sha256_file(script_abs)
+
+    # ── 设计者钉扎（审计[3]）：契约可带 scriptSha256（设计者提交探针时计算）。
+    # 有钉且不匹配 → 第一时间失败，不给"首次运行冻结弱化版"留任何窗口。
+    # （钉扎由架构师在 dispatch 前对探针文件计算 sha256 写进契约；无钉时退化
+    # 为首次运行冻结，存在"首次冻结前被削弱"的已知窗口——见计划文档。）
+    pinned_sha = str(clause.get("scriptSha256") or "").strip().lower()
+    if pinned_sha and pinned_sha != current_sha:
+        return _fail(
+            clause,
+            "探针脚本与设计者钉扎的 sha256 不一致——探针在派单后被改动。"
+            f"钉扎 {pinned_sha[:12]}… ≠ 当前 {current_sha[:12]}…。"
+            "恢复设计者版本，或由设计者重新计算并更新契约。",
+        )
+
     if frozen and frozen.get("sha256") and frozen["sha256"] != current_sha:
         log.warning(
             "smoke_script_modified_after_freeze",
@@ -152,16 +166,21 @@ async def run_service_smoke_clause(
     )
     os.close(log_fd)
     service_proc: asyncio.subprocess.Process | None = None
+    log_f = None
     try:
         # ── 1. 启动服务 ──────────────────────────────────────────────
         env = os.environ.copy()
         env[port_env] = str(port)
+        log_f = open(log_path, "ab")
+        # POSIX: start_new_session=True 让服务带独立进程组，清理时可 killpg
+        # 整树；Windows 走 taskkill /T（见 finally）。
         service_proc = await asyncio.create_subprocess_shell(
             start_cmd,
             cwd=str(root),
-            stdout=open(log_path, "ab"),
+            stdout=log_f,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
+            start_new_session=(os.name != "nt"),
         )
 
         # ── 2. 等端口 LISTEN（TCP 探测）─────────────────────────────
@@ -253,12 +272,14 @@ async def run_service_smoke_clause(
         log.error("service_smoke_runner_error", clause=cid, error=str(exc))
         return _fail(clause, f"冒烟执行器故障：{type(exc).__name__}: {exc}")
     finally:
-        # ── 清理：杀服务进程树（Windows taskkill /T；POSIX terminate）────
-        # 必须等杀完再返回：Windows 下存活子进程的 cwd 会锁住工作区目录，
-        # 导致外层 TemporaryDirectory 清理报 WinError 32（测试实证）。
-        if service_proc is not None and service_proc.returncode is None:
-            try:
-                if os.name == "nt":
+        # ── 清理（审计[1][2]）：无条件做，且必须**等待完成**──────────────
+        # ① create_subprocess_shell 的 shell 可能先退而孙进程存活（returncode
+        #    非 None 但端口仍被占）——所以清理不能以 returncode is None 为前提；
+        # ② Windows 存活子进程的 cwd 会锁工作区目录（TemporaryDirectory
+        #    清理 WinError 32，测试实证）；③ taskkill /T 必须等待完成。
+        try:
+            if os.name == "nt":
+                if service_proc is not None:
                     killer = await asyncio.create_subprocess_exec(
                         "taskkill", "/PID", str(service_proc.pid), "/T", "/F",
                         stdout=asyncio.subprocess.DEVNULL,
@@ -268,19 +289,35 @@ async def run_service_smoke_clause(
                         await asyncio.wait_for(killer.wait(), timeout=10)
                     except asyncio.TimeoutError:
                         killer.kill()
-                    try:
-                        await asyncio.wait_for(service_proc.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        service_proc.kill()
-                else:
-                    service_proc.terminate()
-                    try:
-                        await asyncio.wait_for(service_proc.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        service_proc.kill()
-            except Exception:  # noqa: BLE001 — 清理尽力而为
+                # 孤儿兜底：netstat 找仍占冒烟端口的 PID，整树杀
+                await _kill_port_holder(port)
+            elif service_proc is not None:
+                # POSIX: start_new_session → killpg 整树
                 try:
+                    import signal
+
+                    os.killpg(os.getpgid(service_proc.pid), signal.SIGTERM)
+                    try:
+                        await asyncio.wait_for(service_proc.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        os.killpg(os.getpgid(service_proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            if service_proc is not None and service_proc.returncode is None:
+                try:
+                    await asyncio.wait_for(service_proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
                     service_proc.kill()
+        except Exception:  # noqa: BLE001 — 清理尽力而为
+            try:
+                if service_proc is not None:
+                    service_proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            if log_f is not None:
+                try:
+                    log_f.close()
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -292,6 +329,41 @@ def _read_tail(log_path: str, chars: int = _LOG_TAIL_CHARS) -> str:
         return data.decode("utf-8", errors="replace")[-chars:]
     except Exception:  # noqa: BLE001
         return ""
+
+
+async def _kill_port_holder(port: int) -> None:
+    """孤儿兜底（审计[1]）：shell 退出后孙进程仍可能占着冒烟端口。
+
+    Windows 用 netstat 找 LISTENING 在该端口上的 PID 并整树杀；POSIX 走
+    killpg 已覆盖，此函数为 no-op。
+    """
+    if os.name != "nt":
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "netstat", "-ano", "-p", "TCP",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except Exception:  # noqa: BLE001
+        return
+    pids: set[str] = set()
+    suffix = f":{port}"
+    for line in (out or b"").decode("utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[3] == "LISTENING" and parts[1].endswith(suffix):
+            pids.add(parts[4])
+    for pid in pids:
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", pid, "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(killer.wait(), timeout=10)
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def find_smoke_clause(contract: dict[str, Any] | None) -> dict[str, Any] | None:

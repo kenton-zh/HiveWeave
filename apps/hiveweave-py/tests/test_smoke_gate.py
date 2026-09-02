@@ -146,3 +146,25 @@ def test_find_smoke_clause():
     assert find_smoke_clause(contract)["id"] == "smoke-1"
     assert find_smoke_clause({"acceptance": []}) is None
     assert find_smoke_clause(None) is None
+
+
+def test_validate_rejects_multiple_smoke_clauses():
+    contract = {"id": "s", "acceptance": [
+        _clause(Path(".")),
+        _clause(Path("."), id="smoke-2"),
+    ]}
+    err = validate_contract(contract)
+    assert err and "multiple service_smoke" in err
+
+
+@pytest.mark.asyncio
+async def test_designer_pinned_sha_mismatch_fails(tmp_path):
+    """设计者钉扎（scriptSha256）：派单后脚本被改动 → 第一时间失败。"""
+    ws = _mk_workspace(tmp_path, GOOD_SCRIPT)
+    clause = _clause(ws, scriptSha256="0" * 64)
+    result, freeze = await run_service_smoke_clause(
+        clause, workspace_root=str(ws)
+    )
+    assert not result.passed
+    assert "钉扎" in result.message or "sha256" in result.message
+    assert freeze is None  # 不给被改动的脚本立基线
