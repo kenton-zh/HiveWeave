@@ -37,9 +37,19 @@ def cache_hit_percent(
     input_tokens: int,
     cache_read: int = 0,
     cache_write: int = 0,
+    *,
+    input_inclusive: bool = False,
 ) -> int | None:
-    """Rounded cache-hit share of prompt-side input; None when nothing was billed."""
-    denom = billed_prompt_tokens(input_tokens, cache_read, cache_write)
+    """Rounded cache-hit share of prompt-side input; None when nothing was billed.
+
+    ``input_inclusive=True``（DeepSeek 系）：prompt_tokens 已包含 cache
+    hit+miss（prompt = hit + miss），分母就是 input 本身——再加 read/write
+    会把分子双计（39 审计 P1-2：命中率被腰斩的根因）。
+    """
+    if input_inclusive:
+        denom = int(input_tokens or 0)
+    else:
+        denom = billed_prompt_tokens(input_tokens, cache_read, cache_write)
     if denom <= 0:
         return None
     return round(int(cache_read or 0) / denom * 100)
@@ -69,6 +79,15 @@ def _provider_reports_disjoint_input(provider: str | None) -> bool:
     """Anthropic ``input_tokens`` already excludes cache read/write."""
     p = (provider or "").strip().lower()
     return p == "anthropic" or p.startswith("anthropic")
+
+
+def provider_input_inclusive(provider: str | None) -> bool:
+    """DeepSeek 系：prompt_tokens = cache_hit + cache_miss（已含缓存读写）。
+
+    命中率分母 = input 本身；再加 read/creation 会双计（39 审计 P1-2）。
+    """
+    p = (provider or "").strip().lower()
+    return p.startswith("deepseek")
 
 
 #: Wire fields ``normalize_usage`` reads for a cache-write (cache creation)

@@ -89,15 +89,32 @@ _CACHE_HIT_BASIS = {
 
 
 def _with_cache_scope(row: dict[str, Any]) -> dict[str, Any]:
-    """把 providers CSV 换成量程字段 + 命中率（含分母口径说明）。"""
-    scope = cache_creation_scope(row.pop("providers", None))
+    """把 providers CSV 换成量程字段 + 命中率（含分母口径说明）。
+
+    39 审计 P1-2：DeepSeek 系 prompt_tokens = hit + miss（input-inclusive），
+    分母必须用 input 本身；exclusive 系（Anthropic）分母 = input+read+creation。
+    混合场景取保守口径（disjoint 公式，命中率只低不高）。
+    """
+    providers_csv = row.pop("providers", None)
+    scope = cache_creation_scope(providers_csv)
     row["cache_creation_scope"] = scope
+    names = [
+        p.strip() for p in str(providers_csv or "").split(",") if p and p.strip()
+    ]
+    from hiveweave.llm.util import provider_input_inclusive
+
+    inclusive = bool(names) and all(provider_input_inclusive(p) for p in names)
     row["cache_hit_percent"] = cache_hit_percent(
         int(row.get("input_tokens") or 0),
         int(row.get("cache_read_tokens") or 0),
         int(row.get("cache_creation_tokens") or 0),
+        input_inclusive=inclusive,
     )
-    row["cache_hit_basis"] = _CACHE_HIT_BASIS[scope]
+    row["cache_hit_basis"] = (
+        "cache_read/input (provider prompt includes cache hit+miss)"
+        if inclusive
+        else _CACHE_HIT_BASIS[scope]
+    )
     return row
 
 
