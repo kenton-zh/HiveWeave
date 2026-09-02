@@ -918,6 +918,26 @@ async def git_worktree_merge_tool(
                 fulfilled += await ObligationLedger().fulfill(
                     project_id, params.task_id, "merge"
                 )
+            # 审计[1]：分支/task 结算后，caller 名下若仍有 pending merge 义务
+            # （如历史非规范分支名遗留、或 caller 自身其它任务的义务），
+            # 记 warning 供观测——这些义务不会再被本次 merge 事件短路，
+            # 只能等 dwell 超时兜底。
+            if fulfilled:
+                leftovers = [
+                    o for o in await ObligationLedger().get_pending_for_agent(
+                        project_id, agent_id
+                    )
+                    if o.get("obligation_type") == "merge"
+                ]
+                if leftovers:
+                    log.warning(
+                        "merge_obligation_leftover_pending",
+                        agent_id=agent_id,
+                        count=len(leftovers),
+                        task_ids=[
+                            str(o.get("task_id"))[:8] for o in leftovers
+                        ],
+                    )
             if not fulfilled:
                 # No branch/task match — fulfill by owner (the caller did the merge)
                 await ObligationLedger().fulfill_by_owner(
