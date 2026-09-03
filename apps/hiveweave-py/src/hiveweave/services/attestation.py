@@ -249,6 +249,21 @@ CREATE TABLE IF NOT EXISTS tool_attestations (
 )
 """
 
+# 40 轮报告第 4 步：code_audit commit/diff 级缓存表——同 agent + 同被审内容
+# （diff 哈希）复用审计结论，不重烧 LLM。key 用 diff 内容哈希（不是 HEAD
+# commit：HEAD 相同但工作区改动不同的两次审计不可互代——审计子代理[阻断]项）。
+CREATE_AUDIT_CACHE_SQL = """
+CREATE TABLE IF NOT EXISTS audit_cache (
+    agent_id TEXT NOT NULL,
+    diff_hash TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    exit_code INTEGER NOT NULL,
+    attestation_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, diff_hash)
+)
+"""
+
 # npm test, pytest, vitest, yarn/pnpm test, go test, cargo test, etc.
 # 以及 CLI 脚本验证（井字棋实测暴露的盲区）：
 #   python verify_ai.py / python test_game.py / python -m unittest / bash check_xx.sh
@@ -497,9 +512,78 @@ class AttestationService:
                 "CREATE INDEX IF NOT EXISTS idx_tool_attestations_task "
                 "ON tool_attestations(task_id, kind)",
             )
+            await execute_by_project(project_id, CREATE_AUDIT_CACHE_SQL)
         except Exception:
             pass
         _migrated.add(project_id)
+
+    async def audit_cache_lookup(
+        self, project_id: str, *, agent_id: str, diff_hash: str
+    ) -> dict[str, Any] | None:
+        """40 轮报告第 4 步：同 agent + 同 diff 哈希 → 复用审计结论。
+
+        被审内容 = worktree diff（含未提交改动），diff 哈希相同即被审内容
+        相同。Fail-open：任何失败返回 None（退化为正常 LLM 审计）。
+        """
+        dh = str(diff_hash or "").strip()
+        if not dh or not agent_id:
+            return None
+        try:
+            conn = await _conn(project_id)
+        except ProjectDbError:
+            return None
+        if conn is None:
+            return None
+        try:
+            cur = await conn.execute(
+                "SELECT verdict, exit_code, attestation_id, created_at "
+                "FROM audit_cache WHERE agent_id = ? AND diff_hash = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                [agent_id, dh],
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            return dict(row) if row else None
+        except Exception:
+            return None
+
+    async def audit_cache_store(
+        self,
+        project_id: str,
+        *,
+        agent_id: str,
+        diff_hash: str,
+        verdict: str,
+        exit_code: int,
+        attestation_id: str,
+    ) -> None:
+        """写入审计缓存（best-effort，失败不影响审计主流程）。"""
+        dh = str(diff_hash or "").strip()
+        if not dh or not agent_id:
+            return
+        try:
+            conn = await _conn(project_id)
+        except ProjectDbError:
+            return
+        if conn is None:
+            return
+        try:
+            await conn.execute(
+                "INSERT OR REPLACE INTO audit_cache "
+                "(agent_id, diff_hash, verdict, exit_code, attestation_id, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    agent_id,
+                    dh,
+                    verdict,
+                    int(exit_code),
+                    str(attestation_id),
+                    int(time.time() * 1000),
+                ],
+            )
+            await conn.commit()
+        except Exception:
+            pass
 
     async def create(
         self,

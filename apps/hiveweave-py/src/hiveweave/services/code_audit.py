@@ -770,8 +770,10 @@ async def run_code_audit(
                     "auto_pass_reason": "empty_diff_after_issues",
                     "message": (
                         "[code audit] diff 为空（变更已回滚），但同任务上一轮"
-                        "审计结论为 ISSUES——不发新的 PASS 凭证。请人工复核："
-                        "确认回滚后重新指派任务，或取消任务；不要原样重复提交。"
+                        "审计结论为 ISSUES——不发新的 PASS 凭证。可执行出口："
+                        "① reassign_task 改派（现已支持花名）给其他成员重做；"
+                        "② message_user 请求用户裁决；③ 与上级确认后取消任务。"
+                        "不要原样重复提交。"
                     ),
                 }
             attestation_id = await attestation_service.create(
@@ -792,6 +794,54 @@ async def run_code_audit(
                 "lines_audited": 0,
                 "attestation_id": attestation_id,
                 "auto_pass_reason": "empty_diff",
+            }
+
+        # 40 轮报告第 4 步（diff 级缓存）：同 agent + 同 diff 哈希 = 同被审
+        # 内容，审计结论可复用（霞光对 683bf23f 审 6 次纯属浪费）。key 用
+        # diff 内容哈希而非 HEAD commit——HEAD 相同但工作区改动不同的两次
+        # 审计不可互代（审计子代理[阻断]项：干净 worktree 的 PASS 凭证不得
+        # 给新未审代码放行）。复用时仍发新凭证（门禁时效性不变），不烧 LLM。
+        diff_hash = hash_stdout(diff)
+        cached_hit = None
+        if diff_hash:
+            try:
+                cached_hit = await attestation_service.audit_cache_lookup(
+                    project_id, agent_id=agent_id, diff_hash=diff_hash
+                )
+            except Exception:  # noqa: BLE001 — 缓存查询失败退化为正常审计
+                cached_hit = None
+        if cached_hit is not None:
+            cached_exit = int(cached_hit.get("exit_code") or 1)
+            verdict_cached = "PASS" if cached_exit == 0 else "ISSUES"
+            attestation_id = await attestation_service.create(
+                project_id,
+                agent_id=agent_id,
+                kind=CODE_AUDIT_KIND,
+                task_id=task_id,
+                exit_code=cached_exit,
+                workspace=worktree,
+                commit_hash=commit_hash,
+                stdout_hash=hash_stdout(f"cached audit reuse {diff_hash}"),
+                command_or_url=f"[verdict={verdict_cached}] cached-reuse",
+            )
+            reset_ledger(agent_id)
+            log.info(
+                "code_audit.cached_reuse",
+                agent_id=agent_id,
+                diff_hash=diff_hash[:12],
+                verdict=verdict_cached,
+            )
+            return {
+                "audited": True,
+                "verdict": verdict_cached,
+                "lines_audited": 0,
+                "attestation_id": attestation_id,
+                "cached_diff_hash": diff_hash[:12],
+                "message": (
+                    "[code audit] 同一 diff 内容已有审计结论 "
+                    f"{verdict_cached}，本次复用未重烧 LLM。若代码有新改动，"
+                    "diff 随之变化，将触发全新审计。"
+                ),
             }
 
         system, user = build_audit_prompt(diff, task_id)
@@ -828,6 +878,19 @@ async def run_code_audit(
             commit_hash=commit_hash,
             stdout_hash=hash_stdout(text),
         )
+
+        # 40 轮报告第 4 步：审计结论入缓存（同 agent + 同 diff 哈希复用）
+        try:
+            await attestation_service.audit_cache_store(
+                project_id,
+                agent_id=agent_id,
+                diff_hash=diff_hash,
+                verdict=verdict,
+                exit_code=exit_code,
+                attestation_id=str(attestation_id),
+            )
+        except Exception:  # noqa: BLE001 — 缓存写入失败不影响审计主流程
+            pass
 
         lines_audited = get_unaudited_lines(agent_id)
         reset_ledger(agent_id)
