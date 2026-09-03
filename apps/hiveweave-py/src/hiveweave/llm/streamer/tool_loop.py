@@ -313,7 +313,8 @@ class ToolLoopMixin:
         # 39 审计 P2-1: submit 门禁按设计拒收轮（gate_reject）独立计数 ——
         # 负样本演练/正常打回是流程回执，不进 tool_fail 连败。
         gate_reject_stall_count = 0
-        # P0-1（R3）：同源失败判据 —— 上轮失败指纹（tool_name, args[:60]）。
+        # P0-1（R3）：同源失败判据 —— 上轮失败指纹（tool_name, 全参 SHA-256
+        # 前 16 位；40 轮修正：args[:60] 前缀对 pwsh 命令互相碰撞误判同墙）。
         # 同指纹 = 原地撞同一面墙（2 轮快收口）；指纹变化 = 试错/方向在变
         # （不快速掐，交给普通 stall_count 总限兜底）。
         last_fail_signature: tuple[str, str] | None = None

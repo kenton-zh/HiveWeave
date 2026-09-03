@@ -1,6 +1,7 @@
 """Doom-loop thresholds and progress helpers."""
 from __future__ import annotations
 
+import hashlib
 import json
 
 DOOM_LOOP_DEFAULT_LIMIT = 3
@@ -250,12 +251,18 @@ def fail_signature_for_round(
     error_ids: set[str] | None = None,
     duplicate_ids: set[str] | None = None,
 ) -> tuple[str, str] | None:
-    """本轮第一个失败调用 ``(tool_name, args 指纹前 60 字符)``；None = 无失败。
+    """本轮第一个失败调用 ``(tool_name, 全参哈希前 16 位)``；None = 无失败。
 
     P0-1（R3 收敛判据）：tool-failed stall 是否「原地踏步」—— 同工具+同参
     失败 = 同源（撞同一面墙），继续计入 2 轮快速收口；换参/换工具失败 =
     方向在变（试错），不得按 2 轮快速收口（R2/R3 实证：pytest 反复
     no-cacheprovider/basetemp/icacls 全是被试错判死）。
+
+    40 轮修正（P1 实测）：旧实现取 args[:60] 前缀——pwsh/bash 命令的 args
+    JSON 以 ``{"command": "`` 开头占 13 字符，多条不同诊断链共享 ~47 字符
+    命令前缀即碰撞成「同源」，合法试错被 2 轮误杀（岚生 file:// 热修连续
+    early-end 的根因之一）。改为全参 SHA-256 前 16 位：真·重试同一命令
+    仍判同源，参数有任何实质差异都视为方向在变。
     """
     errs = error_ids or set()
     dups = duplicate_ids or set()
@@ -264,7 +271,7 @@ def fail_signature_for_round(
         if tid in errs or tid in dups:
             name = tc.get("name") or ""
             args = _canonical_tool_args(tc.get("arguments"))
-            return name, args[:60]
+            return name, hashlib.sha256(args.encode("utf-8")).hexdigest()[:16]
     return None
 
 
