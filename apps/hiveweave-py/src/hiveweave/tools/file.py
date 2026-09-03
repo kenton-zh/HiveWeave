@@ -276,6 +276,18 @@ def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
     return full
 
 
+def _is_platform_reports_read(file_path: str) -> bool:
+    """40 轮 P0-1：`.hiveweave/reports/**` 是平台自管共享产物（契约/取证/截图）。
+
+    写入方是平台宿主（写契约、browse 写截图），落在 MAIN 的
+    ``.hiveweave/reports/<task_id>/``——从叶子 worktree cwd 用相对路径读取时，
+    旧解析只拼 worktree 前缀 → 永远 File not found（40 轮实测：4 人 3 通道
+    76 次读取 0 成功，225min 契约税）。本判定命中后解析改走项目根。
+    """
+    p = file_path.replace("\\", "/").lstrip("./")
+    return p == ".hiveweave/reports" or p.startswith(".hiveweave/reports/")
+
+
 def _resolve_for_read_detail(
     write_workspace: str,
     file_path: str,
@@ -307,9 +319,11 @@ def _resolve_for_read_detail(
         candidate = Path(file_path)
         if candidate.is_absolute():
             full = candidate.resolve()
-        elif _is_canonical_worktree_read(file_path):
+        elif _is_canonical_worktree_read(file_path) or _is_platform_reports_read(file_path):
             # Mid-level review path is project-relative. From a builder
             # worktree cwd, joining it would ghost-nest and get rejected.
+            # 40 轮 P0-1：.hiveweave/reports/** 同理——平台自管产物在 MAIN，
+            # 从 worktree cwd 相对读取必须走项目根。
             full = (root / file_path.replace("\\", "/")).resolve()
         else:
             full = (write_ws / file_path).resolve()

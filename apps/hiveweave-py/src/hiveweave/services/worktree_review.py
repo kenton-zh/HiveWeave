@@ -572,15 +572,47 @@ async def review_worktree_gate(
         wt = None
     if not wt:
         wt = await agent_worktree_path(str(evidence_agent))
-    meta["worktreeWorkspace"] = wt
     if not wt:
-        return (
-            "Approve blocked: implementer/assignee has no worktree path. "
-            "Executor worktrees are created on hire/dispatch — re-dispatch "
-            "or wait for worktree heal, then review that tree (not main). "
-            f"evidenceAgent={str(evidence_agent)[:8]}",
-            meta,
+        # 40 轮 P0-2（归档工位 approve 死锁）：implementer 被归档时其 worktree
+        # 已物理回收，27 次 approve 全被挡且三条出路全不可行。回退链：
+        #   implementer_worktree → evidence_agent worktree → 当前 assignee
+        #   worktree → 取消/作废单走「账面关账」（凭证指向已合入 MAIN 的 blob）
+        assignee_wt = (
+            await agent_worktree_path(str(assignee)) if assignee else None
         )
+        if assignee_wt and Path(assignee_wt).is_dir():
+            wt = assignee_wt
+            meta["worktreeWorkspace"] = wt
+            meta["skipped"] = "evidence_agent_archived_fallback_assignee"
+        elif (task.get("status") or "").lower() in ("cancelled", "voided"):
+            meta["worktreeWorkspace"] = main_ws
+            meta["skipped"] = "ledger_close_cancelled_task"
+            return None, meta
+        else:
+            ev_archived = False
+            try:
+                from hiveweave.db import meta as _meta_db
+
+                _row = await _meta_db.get_agent_by_id(str(evidence_agent))
+                ev_archived = (_row or {}).get("status") == "archived"
+            except Exception:
+                ev_archived = False
+            hint = (
+                "该证据签发成员已归档，其工作树已回收。此单请走 "
+                "cancel/reclaim + create_task 重建，或由当前 assignee 的"
+                "工树复核；不要等待工作树自愈。"
+                if ev_archived
+                else "Executor worktrees are created on hire/dispatch — "
+                "re-dispatch or wait for worktree heal, then review that "
+                "tree (not main)."
+            )
+            return (
+                "Approve blocked: implementer/assignee has no worktree path. "
+                + hint
+                + f" evidenceAgent={str(evidence_agent)[:8]}",
+                meta,
+            )
+    meta["worktreeWorkspace"] = wt
 
     files = evidence.get("files_changed") or evidence.get("filesChanged") or []
     ahead = await worktree_commits_ahead(main_ws, wt)

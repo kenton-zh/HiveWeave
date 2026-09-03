@@ -61,4 +61,6 @@ def cwd_display(cwd: str, relative: str | None = None) -> str:
 READ_MISS_HINT = (
     " Not in this tree. Shared contracts are MAIN docs/ after merge "
     "(empty MAIN is OK). Do not search other agents' trees."
+    " 平台自管共享产物（.hiveweave/reports/**）会自动从 MAIN 读取——"
+    "若仍报缺失，说明该产物确实不存在或已随取消任务归档。"
 )

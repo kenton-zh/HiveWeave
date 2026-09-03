@@ -250,8 +250,18 @@ async def reassign_task_tool(
     from hiveweave.services.org import OrgService
 
     org = OrgService()
-    target = await org.resolve_agent(params.assignee_id)
+    # 40 轮 P0-4：改派必须接 resolve_agent_ref（id/short_id/花名/唯一前缀）——
+    # 旧实现用 resolve_agent 只认 id/short_id，传花名报「Assignee not found」
+    # 而同秒隔壁工具传花名成功（3 次失败 vs dispatch 4 次成功）。
+    target = await org.resolve_agent_ref(project_id, params.assignee_id)
     if not target or target.get("project_id") != project_id:
+        # 审计收尾：归档者单独识别，不复用 not-found 措辞
+        legacy = await org.resolve_agent(params.assignee_id)
+        if legacy and (legacy.get("project_id") or "") == project_id \
+                and (legacy.get("status") or "") == "archived":
+            return ToolResult.err(
+                f"该成员已归档，不可作为改派目标: {params.assignee_id}"
+            )
         return ToolResult.err(
             f"Assignee not found in this project: {params.assignee_id}"
         )
