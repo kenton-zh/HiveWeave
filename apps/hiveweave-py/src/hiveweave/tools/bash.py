@@ -1317,6 +1317,17 @@ def detect_untranslated_unix(command: str) -> str | None:
     """
     if not command or not command.strip():
         return None
+
+    # 40 轮 P0-3（方言税 98.2min）：语法层门禁——heredoc（<< / <<<）在 pwsh
+    # 是 ParserError，词典层拦不住（它不是命令名）。12 次 heredoc 失败连提示
+    # 都收不到。here-string 等价写法直接给出。
+    if re.search(r"<<", command):
+        return (
+            "  << / <<< (bash heredoc) → pwsh 无 heredoc（直接 ParserError）。"
+            "用 here-string：@'\n  …多行内容…\n  '@ | python -\n"
+            "  或先把内容写临时文件（write_file 工具）再按文件处理。"
+        )
+
     hits: list[str] = []
     seen: set[str] = set()
     for segment in _split_command_segments(command):

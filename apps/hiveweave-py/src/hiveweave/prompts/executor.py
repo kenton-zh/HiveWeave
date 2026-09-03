@@ -44,7 +44,7 @@ _INSPECTOR_ALIASES: frozenset[str] = frozenset({
 # 这里刻意用 `pwsh` 整词，替换后仍是 pwsh，不会串成别的东西。
 _SHELL_DIALECT_SECTION = """## Shell 方言（Windows 宿主：pwsh — 先看这段再写命令）
 命令执行走 **PowerShell (pwsh)**，不是 bash。unix 惯用语会被**前置拒绝**（`unix-only command(s) not available`），报错里附 pwsh 等价写法——照着改，不要换 flag 重试。
-- 禁用：`ls -la` / `cat > file << 'EOF'`（heredoc）/ `echo`（写文件）/ `cmd1; cmd2` 串接 / `| head -n` / `grep` / `sed` / `awk` / `wc` / `xargs` / `VAR=value cmd`（bash 环境变量前缀）
+- 禁用：`ls -la` / `cat > file << 'EOF'`（heredoc——多行内容改用 here-string `@'…'@ | 命令` 或 write_file 写临时文件）/ `echo`（写文件）/ `cmd1; cmd2` 串接 / `| head -n` / `grep` / `sed` / `awk` / `wc` / `xargs` / `VAR=value cmd`（bash 环境变量前缀）
 - 改用：列目录 `Get-ChildItem -Force`；读文件 `Get-Content x -Tail 100`；写文件用 **write_file / apply_patch 工具**（不要用 shell 写）；输出 `Write-Host`；串接用 `;`（PowerShell 语义确认过再用）或分多次调用；筛选 `Select-Object -First 20` / `Select-String`；计数 `Measure-Object -Line`
 - 设环境变量再跑进程：分两步——`$env:HALYARD_DATA_DIR = "D:/..."` 换行 `python -m uvicorn ...`（写成 `HALYARD_DATA_DIR=... python ...` 必然失败）
 
