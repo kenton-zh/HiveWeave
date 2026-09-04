@@ -142,9 +142,14 @@ class TaskEventRelay:
 
         # Build message content (title from task row — event payload is "{}"
         # for transition events, so falling back to payload would be empty)
+        # duty 增强（41 轮 P0-1 后续）：blocked 通知带结构化解封路径——
+        # 被唤醒的创建者拿到行动指引而非待查状态。
+        unblock_hint = (
+            self._blocked_unblock_hint(task) if event_type == "task.blocked" else ""
+        )
         message = self._build_message(
             event_type, task_id, payload, title=task.get("title") or "",
-            evidence=task.get("evidence"),
+            evidence=task.get("evidence"), unblock_hint=unblock_hint,
         )
 
         # P2-4 直推去重：工具层已 wake=True 直推的事件（submit/review 工具
@@ -279,9 +284,44 @@ class TaskEventRelay:
 
         return recipients
 
+    @staticmethod
+    def _blocked_unblock_hint(task: dict) -> str:
+        """blocked 任务的结构化解封路径说明（duty 增强第一部分）。
+
+        与 lifecycle.blocked_task_has_wake_path 同口径：deps → 依赖解封；
+        timer → wake_at 到期；两者皆无 → 无自动解封（需人工介入）。
+        """
+        deps = task.get("depends_on") or []
+        if isinstance(deps, str):
+            try:
+                deps = json.loads(deps) if deps else []
+            except (json.JSONDecodeError, TypeError):
+                deps = []
+        kind = (task.get("wait_kind") or "").lower()
+        wake_at = task.get("wake_at")
+        if isinstance(deps, list) and deps:
+            dep_short = ", ".join(str(d)[:8] for d in deps[:3])
+            more = f" 等 {len(deps)} 项" if len(deps) > 3 else ""
+            return (
+                f"解封路径：依赖 {dep_short}{more} 全部 approved/closed 后"
+                " reconcile 自动解封——可等待或提前改派。"
+            )
+        if kind == "timer" and wake_at:
+            try:
+                when = time.strftime(
+                    "%m-%d %H:%M", time.localtime(int(wake_at) / 1000)
+                )
+            except Exception:
+                when = str(wake_at)
+            return f"解封路径：timer 到期（{when}）自动解封——assignee 会被唤醒。"
+        return (
+            "解封路径：无自动解封——需要你 reassign / unblock / cancel，"
+            "否则任务将永久 parked。"
+        )
+
     def _build_message(
         self, event_type: str, task_id: str, payload: dict, *, title: str = "",
-        evidence: object = None,
+        evidence: object = None, unblock_hint: str = "",
     ) -> str:
         """Build inbox message text for the event.
 
@@ -320,6 +360,10 @@ class TaskEventRelay:
             ),
         }
         msg = messages.get(event_type, f"[{event_type}] task {short_id}")
+        # duty 增强（41 轮 P0-1 后续）：blocked 通知附结构化解封路径——
+        # 被唤醒的创建者拿到行动指引而非待查状态。
+        if event_type == "task.blocked" and unblock_hint:
+            msg += f" {unblock_hint}"
         if event_type == "task.rework":
             ev = evidence
             if isinstance(ev, str):
