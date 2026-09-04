@@ -199,8 +199,7 @@ export class OfficeActor {
     if (this.sprite) this.sprite.alpha = a;
   }
 
-  /** 落座时的深度覆盖值（= 所属桌套件 base - 1，保证被自己的桌面遮住）；
-   *  null = 走动/离桌，按自身 y 排序 */
+  /** 落座深度覆盖（A = base-1 挡腿；B = base+1 坐进近侧椅）；null = 走动按自身 y */
   private depthOverride: number | null = null;
 
   /** 设置落座深度基准（由 OfficeScene 每帧传入；离桌传 null 回落到自身 y） */
@@ -233,6 +232,12 @@ export class OfficeActor {
     this.container.zIndex =
       this.depthOverride ?? Math.round(this.container.y);
 
+    // B 位近侧椅：水平翻转朝向桌子（紫衣/dev 帧默认朝右）
+    if (this.sprite) {
+      const sx = Math.abs(this.sprite.scale.x);
+      this.sprite.scale.x = this.atDesk && this.sitVariant === "B" ? -sx : sx;
+    }
+
     // 动画选型：帧动画（dev 女孩 sheet）优先，旧单帧 sheet/程序化 body 走摆动兜底
     const state = this.fsm.current;
     // 到桌坐下 / 离桌起身（仅帧动画模式）：坐下一次性动作 → 坐姿循环；离桌起身一次性 → 行走
@@ -252,8 +257,8 @@ export class OfficeActor {
           : this.sitPhase === "getup"
             ? "getup"
             : this.sitPhase === "sitting" && !walking
-              ? state === "working" && this.sitVariant === "A"
-                ? "working"   // 打字帧 = 坐着朝右打（匹配 A 朝向的桌右）；B 朝向保持坐姿循环
+              ? state === "working"
+                ? "working"
                 : this.sitVariant === "B"
                   ? "sitting_b"
                   : "sitting"

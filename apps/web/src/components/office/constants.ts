@@ -19,7 +19,8 @@ export const TILE_H = 32;
  * 7 个桌位，按背景图 office-scene-bg.png（1672×941，world = px / 1.30625）标定：
  *   中排 3 桌 + 下排 3 桌 + 前台柜台。坐标 = 该桌「落座基准点」，
  *   桌套件/椅位全部由 DESK_SET 的相对偏移从此点推出（角色腰线对齐桌远缘）。
- * 顺序即分配顺序，前台柜台放最后（6 agent 时不占用，留给 F 视角接待员）。
+ * 顺序即 getDesk() 的分配顺序；紫衣演示走 purpleDemoSeat()（0 号占前台柜台，
+ * 其余按工作位顺序坐 B 位近侧椅）。
  */
 export const DESKS: DeskSlot[] = [
   { id: "lead-1",   x: 747, y: 326, role: "lead" },   // 中排中桌
@@ -91,6 +92,21 @@ export function getDesk(agentIndex: number, role: string): DeskSlot {
   return pool[agentIndex % Math.max(pool.length, 1)] ?? DESKS[agentIndex % DESKS.length];
 }
 
+/**
+ * 紫衣演示落座：0 号接待员 A（柜台后），其余工位 B（近侧可见椅）。
+ * 近侧椅完整出现在画面里，人 zIndex 高于 front 才能「坐进椅子」；
+ * 远侧后椅只作空位（角色比椅背大，后座上看不见坐姿）。
+ */
+export function purpleDemoSeat(index: number): { desk: DeskSlot; variant: "A" | "B" } {
+  const reception = DESKS.find((d) => d.id === "review-2") ?? DESKS[DESKS.length - 1];
+  const work = DESKS.filter((d) => d.id !== "review-2");
+  if (index === 0) return { desk: reception, variant: "A" };
+  return {
+    desk: work[(index - 1) % Math.max(work.length, 1)],
+    variant: "B",
+  };
+}
+
 // ── Isometric Projection ──────────────────────────────────────────
 
 export function isoToScreen(tx: number, ty: number) {
@@ -121,11 +137,10 @@ export const ASSET_URLS = {
    *  不与角色交互的陈设；桌椅全部改由引擎 sprite 渲染。原带桌版备份
    *  office-scene-bg.with-desks.bak.png）。场景内缩到 WORLD_W×WORLD_H = 1280×720。 */
   OFFICE_BG: "/office-assets/office-scene-bg.png",
-  /** 分层家具 sprite（2026-08-30 差分抠图：带桌原图 − 去桌背景 = 前景，
-   *  100% 原场景像素/风格/光影）。桌套件按桌面上缘水平切两片：
-   *  BACK = 后椅+桌远侧（画在角色之下），FRONT = 桌面+显示器+前椅（画在角色之上，遮住躯干下半） */
-  OFFICE_DESK_BACK: "/office-assets/office-desk-back.png",
-  OFFICE_DESK_FRONT: "/office-assets/office-desk-front.png",
+  /** 分层家具 sprite。BACK = 后椅+远侧显示器；FRONT = 近侧桌面/前椅（挡腿）。
+   *  白桌面楔必须留在 FRONT。query 只为强刷 public/ 无 hash 的 PNG。 */
+  OFFICE_DESK_BACK: "/office-assets/office-desk-back.png?v=chair2",
+  OFFICE_DESK_FRONT: "/office-assets/office-desk-front.png?v=chair2",
   OFFICE_FRONTDESK_SET: "/office-assets/office-frontdesk-set.png",
   /** 紫衣女孩打字动画表（2026-08-30：参考图锚定生成，2×2 = 4 帧打字循环。
    *  实测为全身坐姿帧（非腰截断）：内容底 y=83 ≈ anchor 0.875×96=84，即 0.875 处是鞋底；
@@ -207,14 +222,14 @@ export const PURPLE_DEMO_ALL_AGENTS = true;
  * PURPLE_DEMO_ALL_AGENTS = false 即可按角色就位。
  *
  * ── 视角 / 遮挡硬约束（改动前务必读）─────────────────────────
- * 1. 演示角色强制 A 朝向（rearChair 后椅），与其余紫衣角色同朝向。
- *    B 朝向（frontChair）角色落在 front 片高度区间内且 zIndex 更低，
- *    会被「桌面+显示器+前椅」整片盖死，不可用于坐姿演示。
+ * 1. 接待员走 A（柜台后，无椅）。工位紫衣走 B（近侧可见椅）：zIndex = base+1
+ *    画在 front 片前面，人坐进那把空着的黑椅；scale.x 翻转朝向桌子。
+ *    远侧后椅留在 BACK，空着（角色比椅背大，后座上看不见「坐进椅子」）。
  * 2. 演示循环只在**坐姿系**状态间切换（working 打字 ↔ idle 坐姿呼吸），
  *    绝不触发 walking / talking / alert：
  *      - walking 序列会驱动角色离座平移，坐姿与桌面的遮挡关系当场失效；
  *      - talking/alert 序列在 dev sheet 中是站姿/跳跃帧，一旦播放人物会
- *        整个浮到桌面之上（A 位遮挡只有约 7.8px，压不住站立姿态）。
+ *        整个浮到桌面之上。
  * 3. 角色位置冻结在座位上（atDesk 恒 true），不做 roaming / 聚集位移。
  */
 export const FIRST_AGENT_FULL_ANIMATIONS = true;
@@ -247,9 +262,10 @@ export interface FurniturePiece {
 }
 
 /**
- * 桌套件几何（差分抠图 + 地板色清理 + 按桌面上缘切两片；world = px / 1.30625）。
- * 抠图取自 build-1 槽位（DESKS[2] = 510,278），偏移量均相对该槽位实测。
- * 深度三层：back（角色之下）→ 角色 → front（角色之上，桌面/显示器遮住躯干下半与前臂）。
+ * 桌套件几何（world = 原图像素 / 1.30625）。抠图取自 build-1 槽位（DESKS[2]）。
+ * 深度三层：back（后椅 + 远侧显示器，角色之下）→ 角色 → front（近侧桌面/前椅，挡腿）。
+ * FRONT 顶边按列走等距远缘 `y = -20.8 + 0.5*|rel_x|`；白桌面楔留在 FRONT，
+ * 禁止放进 BACK（人会坐到桌面上）。后椅整把在 BACK，椅背从肩后露出。
  */
 export const DESK_SET: {
   back: FurniturePiece | null;
@@ -257,27 +273,20 @@ export const DESK_SET: {
   rearChair: { dx: number; dy: number };
   frontChair: { dx: number; dy: number };
 } = {
-  back: { w: 153.9, h: 41.3, leftTop: { x: -75.9, y: -62.1 } },   // 桌远侧+显示器背（原座椅已抠除，见 rearChair 注）
+  back: { w: 159.2, h: 127.8, leftTop: { x: -78.2, y: -62.1 } },  // 208×167：后椅+远侧显示器
   front: { w: 159.2, h: 88.8, leftTop: { x: -78.2, y: -20.8 } },
   /**
    * 后椅（A 位）：锚点 x / 鞋底锚点 y（相对槽位，world 单位）。
-   * 2026-09-01 三次修正（扫参 + 浏览器实拍复核）：
-   *   dx=-55 → 人坐桌面左缘之外、腿悬空（用户截图①）；
-   *   dx=-15 → 人正落在隔板后面，front 片的隔板/桌面远缘在胸口横切躯干，
-   *             头与身体之间出现"割裂"缝（用户截图②）；
-   *   dx=-40, dy=-7 → 躯干完整无横切，但人偏高、腿露在桌外；
-   *   dx=-40, dy=8 → 隔板左侧不切身 + 桌面远缘切腰、腿隐入桌下
-   *             （.workbuddy/tmp/office_scan3.png 中排左格实测；行=dx{-48,-40,-32}、
-   *             列=dy{8,16,24}；dx>-32 会压到隔板（隔板世界 x≈-4 起），
-   *             dy>=16 头部沉到桌面线）。
+   * 2026-09-04：后椅从 BACK 抠除后人看起来坐在桌面上、近侧空椅才像「椅子」。
+   * 椅背加回 BACK 后扫参：dx=-50 对准椅心，dy=18 腰线贴近该列远缘（腿被 FRONT 挡住）。
+   * dx=-40 偏右离开椅背；dy=8 整个人压在桌面上。
    */
-  rearChair: { dx: -40.0, dy: 8.0 },
+  rearChair: { dx: -50.0, dy: 18.0 },
   /**
    * 前椅（B 位）椅面中心 x / 鞋底锚点 y（相对槽位）。
+   * 紫衣演示工位走这个座位：z 在 front 之上，人水平翻转朝向桌子。
    * 2026-08-31 实测：前椅完整可见，bbox rel_x 22.8..64.2（中心 43.5）、
-   * 椅背顶 -7.8、椅脚底 +55.8；按后椅「椅背顶→椅面顶 ≈ +19.5」的比例推得
-   * 椅面顶 ≈ +11.7，鞋底锚点 = 椅面顶 + 16.8（帧内臀底到鞋底距离 ×0.8）≈ +28.5。
-   * 旧值 (27.4, 61.2) 把鞋底放到椅脚处，坐姿会沉进椅子 33px。
+   * 椅背顶 -7.8、椅脚底 +55.8；椅面顶 ≈ +11.7，鞋底 = 椅面顶 + 16.8 ≈ +28.5。
    */
   frontChair: { dx: 43.5, dy: 28.5 },
 };
@@ -301,8 +310,8 @@ export function furnitureSet(desk: DeskSlot): FurnitureSet {
 
 /**
  * 深度基准线（world y）：取 front 片底边。
- * front 片 zIndex = base，落座角色 = base - 1，back 片 = base - 2 →
- * 「back → 角色 → front」三层顺序固定，且跨桌用同一基准线不产生穿插。
+ * front 片 zIndex = base；A 位角色 = base-1（被桌面挡腿），B 位 = base+1（坐进近侧椅）；
+ * back 片 = base-2。跨桌用同一基准线不产生穿插。
  */
 export function deskDepthBase(desk: DeskSlot): number {
   const set = furnitureSet(desk);

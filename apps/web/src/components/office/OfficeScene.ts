@@ -32,6 +32,7 @@ import {
   MAX_VISIBLE_AGENTS,
   isoToScreen,
   getDesk,
+  purpleDemoSeat,
   ASSET_URLS,
   ASSET_LOAD_LIST,
   SHEET_LAYOUTS,
@@ -265,8 +266,9 @@ export class OfficeScene {
     const actorsLayer = this.layers.actors;
     visible.forEach((agent, index) => {
       if (!this.actorMap.has(agent.id)) {
-        const desk = PURPLE_DEMO_ALL_AGENTS
-          ? DESKS[index % DESKS.length]
+        const demoSeat = PURPLE_DEMO_ALL_AGENTS ? purpleDemoSeat(index) : null;
+        const desk = demoSeat
+          ? demoSeat.desk
           : getDesk(index, agent.role);
         // 单角色动画演示：索引 0 切回 dev 满帧 sheet（FSM 全状态可播：
         // 呼吸/坐下/坐姿/打字/起身…），其余角色沿用紫衣 sheet 保持视觉统一。
@@ -281,10 +283,14 @@ export class OfficeScene {
         const sheetTex = this.sheetFrames[sheetUrl] ?? null;
         const isPurple = sheetUrl === ASSET_URLS.AGENT_PURPLE;
         const hasFrameSeqs = sheetUrl === ASSET_URLS.AGENT_DEV || isPurple;
-        // 落座锚定：脚底坐到椅面（紫衣/dev 表都是全身坐姿帧），下半身靠桌套件 zIndex 遮挡。
-        // 朝向：演示角色与紫衣角色统一走 A 朝向（后椅）。B 朝向角色落在 front 片高度
-        // 区间内、zIndex 更低，会被「桌面+显示器+前椅」整片盖死，不可用于坐姿演示。
-        const variant: "A" | "B" = isPurple || isDemoAgent ? "A" : index % 2 === 0 ? "A" : "B";
+        // 落座：紫衣演示工位走 B（近侧可见椅，z 在 front 之上）；接待员/演示 0 号走 A。
+        const variant: "A" | "B" = demoSeat
+          ? demoSeat.variant
+          : isPurple || isDemoAgent
+            ? "A"
+            : index % 2 === 0
+              ? "A"
+              : "B";
         const seat = seatPosFor(sheetUrl, desk, variant);
         this.agentSheetUrl.set(agent.id, sheetUrl);
         const actor = new OfficeActor(
@@ -315,9 +321,8 @@ export class OfficeScene {
       const actor = this.actorMap.get(agent.id);
       if (!actor) return;
 
-      const desk = PURPLE_DEMO_ALL_AGENTS
-        ? DESKS[index % DESKS.length]
-        : getDesk(index, agent.role);
+      const demoSeat = PURPLE_DEMO_ALL_AGENTS ? purpleDemoSeat(index) : null;
+      const desk = demoSeat ? demoSeat.desk : getDesk(index, agent.role);
       const sheetUrl = this.agentSheetUrl.get(agent.id) ?? ASSET_URLS.AGENT_DEV;
       const isDemoAgent = FIRST_AGENT_FULL_ANIMATIONS && index === 0;
 
@@ -328,10 +333,7 @@ export class OfficeScene {
 
       // ── 单角色动画演示 ────────────────────────────────────────
       // 位置冻结在座位上，FSM 在「打字 ↔ 坐姿呼吸」间周期性切换。
-      // 刻意不参与 talking / 聚集 / 散步：dev sheet 里点头与行走是站姿/位移序列，
-      // 一旦播放人物会浮到桌面之上或走出座位 —— A 位遮挡只有约 7.8px，
-      // 压不住站立姿态，视角与遮挡关系当场失效。
-      // （ping 触发的 alert 是用户主动点击的瞬时反馈，保留。）
+      // 刻意不参与 talking / 聚集 / 散步：dev sheet 里点头与行走是站姿/位移序列。
       if (isDemoAgent) {
         processing = now % FIRST_AGENT_DEMO_CYCLE_MS < FIRST_AGENT_TYPE_MS;
         talking = false;
@@ -342,14 +344,14 @@ export class OfficeScene {
       let ty: number;
       let atDesk = false;
       const purpleDemo = PURPLE_DEMO_ALL_AGENTS;
-      // 演示角色强制 A 朝向（后椅）：B 朝向角色落在 front 片高度区间内且 zIndex
-      // 更低，会被「桌面+显示器+前椅」整片盖死，不可用于坐姿演示。
-      const sitVariant: "A" | "B" =
-        purpleDemo || isDemoAgent || index % 2 === 0 ? "A" : "B";
+      const sitVariant: "A" | "B" = demoSeat
+        ? demoSeat.variant
+        : isDemoAgent || index % 2 === 0
+          ? "A"
+          : "B";
 
       if (isDemoAgent) {
-        // 演示角色：常驻 A 椅位，不挪位
-        const seat = seatPosFor(sheetUrl, desk, "A");
+        const seat = seatPosFor(sheetUrl, desk, sitVariant);
         tx = seat.x;
         ty = seat.y;
         atDesk = true;
@@ -362,8 +364,7 @@ export class OfficeScene {
         tx = wp.x;
         ty = wp.y;
       } else if (purpleDemo) {
-        // 紫衣女孩演示：常驻 A 椅位打字，聊天只弹气泡不挪位
-        const seat = seatPosFor(sheetUrl, desk, "A");
+        const seat = seatPosFor(sheetUrl, desk, sitVariant);
         tx = seat.x;
         ty = seat.y;
         atDesk = true;
@@ -387,8 +388,9 @@ export class OfficeScene {
         sitVariant,
       );
 
-      // 落座时把深度钉在桌套件基准之下（被自己的桌面遮住）；走动/离桌回落自身 y
-      actor.setDepth(atDesk ? Math.round(deskDepthBase(desk)) - 1 : null);
+      // A 位：z = base-1，被自己的桌面挡腿；B 位：z = base+1，坐在近侧可见椅里
+      const base = Math.round(deskDepthBase(desk));
+      actor.setDepth(atDesk ? (sitVariant === "B" ? base + 1 : base - 1) : null);
 
       actor.update(delta);
     });
@@ -436,9 +438,10 @@ export class OfficeScene {
   // ── Private: Environment Drawing ──────────────────────────────
 
   /**
-   * 桌套件 sprite（bg 模式专用）：每桌两片（back = 后椅+桌远侧，front = 桌面+显示器+前椅），
-   * 前台槽位只有 front 片。深度：back = base-2，角色 = base-1，front = base
-   * → 「back → 角色 → front」三层固定顺序，桌面/显示器遮住角色躯干下半与前臂。
+   * 桌套件 sprite（bg 模式专用）：每桌两片。
+   * back = 后椅 + 远侧显示器（角色之下）；front = 近侧桌面/前椅（角色之上，只挡腿）。
+   * 白桌面楔必须在 front，不能进 back。前台槽位只有 front 片。
+   * 深度：back = base-2，A 角色 = base-1，front = base，B 角色 = base+1。
    */
   private _drawFurnitureSprites(parent: PIXI.Container): void {
     for (const desk of DESKS) {
