@@ -347,12 +347,14 @@ async def execute_registered_tool(
             family = ""
 
         return ToolResult.blocked_err(
-            build_deny_hint(tool_name, family, deny_reason)
+            build_deny_hint(tool_name, family, deny_reason),
+            runner_failed=True,
         ).to_dict()
 
     if decision == "ask":
         from hiveweave.services.approval import (
             APPROVAL_TIMEOUT_HINT,
+            APPROVAL_TIMEOUT_S,
             PermissionRejected,
             PermissionTimeout,
             approval_timeout_marked,
@@ -375,7 +377,10 @@ async def execute_registered_tool(
                 ToolResult.blocked_err(
                     APPROVAL_TIMEOUT_HINT
                     + "\n[approval fingerprint re-try blocked] 同一审批请求在"
-                    "本回合内已超时一次，不再重复等待。请改走可审计的替代方案。"
+                    "本回合内已超时一次，不再重复等待。请改走可审计的替代方案。",
+                    runner_failed=True,
+                    timeout_kind="wait",
+                    timeout_ms=APPROVAL_TIMEOUT_S * 1000,
                 )
                 .to_dict()
             )
@@ -385,7 +390,10 @@ async def execute_registered_tool(
                 ToolResult.blocked_err(
                     APPROVAL_TIMEOUT_HINT
                     + "\n[unattended mode] 项目为无人值守模式，审批请求不"
-                    "等待审核。请改走可审计的替代方案通道或拆分目标。"
+                    "等待审核。请改走可审计的替代方案通道或拆分目标。",
+                    runner_failed=True,
+                    timeout_kind="wait",
+                    timeout_ms=APPROVAL_TIMEOUT_S * 1000,
                 )
                 .to_dict()
             )
@@ -398,9 +406,17 @@ async def execute_registered_tool(
                 description=f"Agent {agent_id} wants to use {tool_name}",
             )
         except PermissionTimeout:
-            return ToolResult.blocked_err(APPROVAL_TIMEOUT_HINT).to_dict()
+            # F7：wait 超时事实位落库（审批 120s 空等是可机检的超时事件）
+            return ToolResult.blocked_err(
+                APPROVAL_TIMEOUT_HINT,
+                runner_failed=True,
+                timeout_kind="wait",
+                timeout_ms=APPROVAL_TIMEOUT_S * 1000,
+            ).to_dict()
         except PermissionRejected as exc:
-            return ToolResult.blocked_err(f"Permission rejected: {exc}").to_dict()
+            return ToolResult.blocked_err(
+                f"Permission rejected: {exc}", runner_failed=True
+            ).to_dict()
         except Exception as exc:  # noqa: BLE001
             return ToolResult.err(f"Error: Approval request failed: {exc}").to_dict()
 
@@ -412,7 +428,7 @@ async def execute_registered_tool(
             agent_id, workspace_path, tool_name, ctx
         )
         if refuse:
-            return ToolResult.blocked_err(refuse).to_dict()
+            return ToolResult.blocked_err(refuse, runner_failed=True).to_dict()
 
     # 4. Security checks (auto-injected based on security_level)
     if tool_def.security_level == "file_op":

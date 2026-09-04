@@ -1607,7 +1607,8 @@ async def execute_bash(
     if blocked:
         log.warning("bash.blocked", reason=reason, command_preview=command[:120])
         return {"success": False, "output": "",
-                "error": f"Error: {reason}", "blocked": True}
+                "error": f"Error: {reason}", "blocked": True,
+                "runner_failed": True}
 
     from hiveweave.services.eval_seal import sealed_bash_deny_for_workspace
 
@@ -1615,7 +1616,8 @@ async def execute_bash(
     if seal_reason:
         log.warning("bash.eval_sealed", command_preview=command[:120])
         return {"success": False, "output": "",
-                "error": f"Error: {seal_reason}", "blocked": True}
+                "error": f"Error: {seal_reason}", "blocked": True,
+                "runner_failed": True}
 
     # 1.5. Auto-source .hiveweave/env.sh if the project has one.
     # The project declares its own environment setup.
@@ -1792,7 +1794,8 @@ async def execute_run_command(
         log.warning("run_command.blocked", reason=reason,
                     command_preview=command[:120])
         return {"success": False, "output": "",
-                "error": f"Error: {reason}", "blocked": True}
+                "error": f"Error: {reason}", "blocked": True,
+                "runner_failed": True}
 
     from hiveweave.services.eval_seal import sealed_bash_deny_for_workspace
 
@@ -1800,7 +1803,7 @@ async def execute_run_command(
     if seal_reason:
         log.warning("run_command.eval_sealed", command_preview=command[:120])
         return {"success": False, "output": "",
-                "error": f"Error: {seal_reason}", "blocked": True}
+                "error": f"Error: {seal_reason}", "blocked": True, "runner_failed": True}
 
     # R3 P0-2：run_command 同样是被方言混血走的后门（attestation 测试步）。
     # 与 bash/pwsh 工具同一 unix-only gate；native 环境（无 pwsh）gate 闭口。
