@@ -1614,12 +1614,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "VERIFY waive is CEO-only. You cannot approve your own "
             "deliverable (self-review is hard-blocked). A submitted "
             "evidence verdict=FAIL (VERIFY) auto-reroutes approve to "
-            "rework — FAIL must be fixed, never silently closed."
+            "rework — FAIL must be fixed, never silently closed. Receipt "
+            "starts with VERDICT: APPROVE or VERDICT: REWORK — always read "
+            "it; approve=release-only, rework=needs changes."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
             "decision": {"type": "string",
-                "description": "'approve' or 'rework'",
+                "description": "'approve' (release-only) or 'rework' (needs changes)",
                 "aliases": ["verdict"]},
             "feedback": {"type": "string",
                 "aliases": ["comment", "reason"]},
