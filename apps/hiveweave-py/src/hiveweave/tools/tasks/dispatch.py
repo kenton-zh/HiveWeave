@@ -174,9 +174,20 @@ class DispatchTaskParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["acceptanceCriteria", "acceptance_criteria"]},
     )
+    verified_facts: list[str] | None = Field(
+        default=None,
+        alias="verifiedFacts",
+        description=(
+            "已核事实（40 轮 verifiedFacts L1）：派单方**亲自核验过**的现场"
+            "事实，逐条注入任务卡（执行者免盲探索）。只写你亲自确认过的："
+            "文件状态/路径/服务端口/上游结论。带不确定性的事实不要写。"
+        ),
+        json_schema_extra={"aliases": ["verifiedFacts", "verified_facts"]},
+    )
 
     @field_validator(
         "expected_modules", "artifact_refs", "depends_on", "acceptance_criteria",
+        "verified_facts",
         mode="before",
     )
     @classmethod
@@ -415,11 +426,22 @@ async def dispatch_task_tool(
         return ToolResult.err(
             "milestoneVerify only applies when creating a new task (omit taskId)."
         )
+    # verifiedFacts L1：派单方核验过的现场事实钉进任务描述——执行者免盲
+    # 探索（40 轮实测：事实打包直派效率高一个数量级）。
+    dispatch_description = params.task
+    if params.verified_facts:
+        facts = [str(f).strip() for f in params.verified_facts if str(f).strip()]
+        if facts:
+            block = "\n\n## 已核事实（派单方核验，可直接采信；与你的观察冲突时先复核再行动）\n" + "\n".join(
+                f"- {fact}" for fact in facts
+            )
+            dispatch_description = dispatch_description.rstrip() + block
+
     result = await ds.dispatch_task(
         project_id=project_id,
         from_agent_id=agent_id,
         to_agent_id=resolved_id,
-        description=params.task,
+        description=dispatch_description,
         expect_report=params.expect_report,
         existing_task_id=params.task_id,
         policy_id=policy_id,

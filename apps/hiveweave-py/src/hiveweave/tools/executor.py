@@ -1420,6 +1420,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "expectedModules": {"type": "array", "items": {"type": "string"},
                 "aliases": ["expected_modules"]},
             "tags": {"type": "array", "items": {"type": "string"}},
+            "verifiedFacts": {"type": "array", "items": {"type": "string"},
+                "aliases": ["verified_facts"],
+                "description": "已核事实：你亲自核验过的现场事实逐条列出，注入任务卡（执行者免盲探索）。只写亲自确认过的。"},
             "contractJson": {
                 "type": "object",
                 "aliases": ["contract_json", "contract"],
