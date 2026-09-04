@@ -437,6 +437,20 @@ async def dispatch_task_tool(
             )
             dispatch_description = dispatch_description.rstrip() + block
 
+    # L2：平台自动核验快照（廉价机器探测：MAIN HEAD/未提交改动/交付物文件），
+    # 与派单方手写事实互补。best-effort，失败静默。
+    try:
+        from hiveweave.services.dispatch_facts import collect_and_format
+
+        main_ws_for_facts = await meta_db.get_project_workspace(project_id)
+        auto_block = collect_and_format(main_ws_for_facts)
+        if auto_block:
+            dispatch_description = (
+                dispatch_description.rstrip() + "\n\n" + auto_block
+            )
+    except Exception as e:  # noqa: BLE001 — 快照失败不阻塞派单
+        log.debug("dispatch_auto_facts_failed", error=str(e))
+
     result = await ds.dispatch_task(
         project_id=project_id,
         from_agent_id=agent_id,
