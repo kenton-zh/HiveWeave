@@ -33,7 +33,7 @@ class ReviewTaskParams(BaseModel):
         json_schema_extra={"aliases": ["taskId", "task_id"]},
     )
     decision: str = Field(
-        description="Review decision: 'approve' or 'rework'.",
+        description="Review decision: 'approve' (release-only) or 'rework' (needs changes).",
         json_schema_extra={"aliases": ["decision", "verdict"]},
     )
     feedback: str | None = Field(
@@ -759,6 +759,7 @@ async def review_task_tool(
 
             if ts._is_verify_task(task_after or task):
                 return ToolResult.ok(
+                    "VERDICT: APPROVE. "
                     f"VERIFY task {params.task_id} approved — parent closed. "
                     "No git_worktree_merge needed."
                 )
@@ -858,6 +859,7 @@ async def review_task_tool(
                     reason="uncommitted_files_changed",
                 )
                 return ToolResult.ok(
+                    "VERDICT: APPROVE. "
                     f"Task {params.task_id} approved against assignee worktree"
                     f"{f' ({wt})' if wt else ''}, but HEAD is 0 commits ahead "
                     f"of main while files_changed is non-empty or worktree is "
@@ -876,6 +878,7 @@ async def review_task_tool(
                 reason="approved_needs_merge",
             )
             return ToolResult.ok(
+                "VERDICT: APPROVE. "
                 f"Task {params.task_id} approved against assignee worktree"
                 f"{f' ({wt})' if wt else ''}. "
                 f"VERIFY is NOT auto-created on merge. "
@@ -891,12 +894,18 @@ async def review_task_tool(
             )
         if forced_rework:
             return ToolResult.ok(
-                f"Task {params.task_id} was approved but forced back to rework "
-                f"by the verdict gate (evidence verdict=FAIL or "
-                f"integrity_check=fail). Assignee notified to fix blocking "
-                f"issues; no merge/close applied."
+                "VERDICT: REWORK — your approve was overridden by the "
+                f"verdict gate. Task {params.task_id} forced back to rework "
+                "(evidence verdict=FAIL or integrity_check=fail). Assignee "
+                "notified to fix blocking issues; no merge/close applied. "
+                "Next: you (reviewer) re-review when a new submission lands. "
+                "Do NOT treat this receipt as an approve success."
             )
-        return ToolResult.ok(f"Task {params.task_id} sent back for rework.")
+        return ToolResult.ok(
+            "VERDICT: REWORK. Task "
+            f"{params.task_id} sent back for rework — not approved. "
+            "Next: assignee fixes and re-submits; you re-review then."
+        )
     except Exception as e:
         return ToolResult.err(f"Failed to review task: {e}")
 

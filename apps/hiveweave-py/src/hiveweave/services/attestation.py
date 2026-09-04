@@ -613,6 +613,32 @@ class AttestationService:
         att_id = str(uuid.uuid4())
         if stdout_hash is None and stdout is not None:
             stdout_hash = hash_stdout(stdout)
+
+        # 40 轮第 4 步（凭证 task_id 写入侧校验）：UUID 形态的截断 id 必须
+        # 补全为完整 UUID 后落库——门禁按 task_id 比对凭证归属，截断值会
+        # 「凭证属于别的任务」误判（41 实测 4 次）。补全失败（任务不存在/
+        # 歧义）→ fail-loud 拒绝写入，回执给 expected/actual 两侧值。
+        # 非 UUID 形态（合成 id 如 "task-1"）保持原样（canonical 既有语义）。
+        if task_id:
+            raw_tid = str(task_id).strip()
+            if _HEX_REF_RE.fullmatch(raw_tid) and not _is_full_uuid(raw_tid):
+                from hiveweave.services.task import TaskService
+
+                resolved = None
+                resolve_err = None
+                try:
+                    resolved = await TaskService().require_task_id(
+                        project_id, raw_tid
+                    )
+                except Exception as e:  # noqa: BLE001
+                    resolve_err = str(e)
+                if not resolved:
+                    raise ValueError(
+                        "attestation task_id unresolvable — expected full "
+                        f"UUID in project, actual '{raw_tid}'"
+                        + (f" ({resolve_err})" if resolve_err else "")
+                    )
+                task_id = resolved
         art = None
         if artifact_hashes is not None:
             art = (
