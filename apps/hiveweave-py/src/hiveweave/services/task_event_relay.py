@@ -168,6 +168,11 @@ class TaskEventRelay:
         # Send to each recipient (idempotent via event-based key)
         inbox = InboxService()
         event_id = event.get("id", "")
+        # 41+08 双跑 P0-1（duty 模型）：task.blocked 是**职责信号**而非 FYI——
+        # 创建者（reviewer/上级）是唯一能改派/解封/取消的人，必须被唤醒
+        # （41 实测：VERIFY blocked 后 192min 死寂，creator 的 [TASK BLOCKED]
+        # 以 wake=0 躺在收件箱里无人看见）。其余事件维持 FYI。
+        wake_flag = event_type == "task.blocked"
         for recipient_id in recipients:
             idem_key = f"task_event:{event_id}:{recipient_id}"
             try:
@@ -179,7 +184,7 @@ class TaskEventRelay:
                     priority="normal",
                     task_id=task_id,
                     idempotency_key=idem_key,
-                    wake=False,  # relay messages are FYI by default
+                    wake=wake_flag,
                 )
             except Exception as e:
                 log.debug(
