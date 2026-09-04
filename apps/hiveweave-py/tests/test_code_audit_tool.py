@@ -196,7 +196,13 @@ async def test_llm_failed_soft_fail():
             "proj", "agent-1", call_llm=AsyncMock(return_value=None)
         )
 
-    assert result == {"audited": False, "reason": "llm_failed"}
+    # 41+08 P0-2：llm_failed 携带 audit_upstream_unavailable 事实位
+    # （上游能力不可用 ≠ 执行者证据缺失）
+    assert result == {
+        'audited': False,
+        'reason': 'llm_failed',
+        'audit_upstream_unavailable': True,
+    }
     att_svc.create.assert_not_awaited()
     assert get_unaudited_lines("agent-1") == 25  # ledger untouched on failure
     attempt = get_last_audit_attempt("agent-1")
@@ -301,7 +307,13 @@ async def test_callback_generic_error_maps_llm_failed():
             "proj", "agent-1",
             call_llm=AsyncMock(side_effect=RuntimeError("HTTP 500 boom")),
         )
-    assert result == {"audited": False, "reason": "llm_failed"}
+    # 41+08 P0-2：llm_failed 携带 audit_upstream_unavailable 事实位
+    # （上游能力不可用 ≠ 执行者证据缺失）
+    assert result == {
+        'audited': False,
+        'reason': 'llm_failed',
+        'audit_upstream_unavailable': True,
+    }
 
 
 @pytest.mark.asyncio
@@ -321,7 +333,13 @@ async def test_callback_empty_text_maps_llm_failed():
         result = await run_code_audit(
             "proj", "agent-1", call_llm=AsyncMock(return_value="")
         )
-    assert result == {"audited": False, "reason": "llm_failed"}
+    # 41+08 P0-2：llm_failed 携带 audit_upstream_unavailable 事实位
+    # （上游能力不可用 ≠ 执行者证据缺失）
+    assert result == {
+        'audited': False,
+        'reason': 'llm_failed',
+        'audit_upstream_unavailable': True,
+    }
 
 
 @pytest.mark.asyncio

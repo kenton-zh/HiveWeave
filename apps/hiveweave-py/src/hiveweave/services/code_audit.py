@@ -29,6 +29,18 @@ from hiveweave.services.model import NoModelConfiguredError
 
 log = structlog.get_logger(__name__)
 
+# 41+08 双跑 P0-2：审计 LLM 无并发整形——15 人并发下 llm_failed 19.5%
+# （另一项目同期仅 4%）。闸门限流 + 失败不重试风暴。
+_AUDIT_LLM_CONCURRENCY = max(1, int(os.environ.get("HIVEWEAVE_AUDIT_LLM_CONCURRENCY", "2") or "2"))
+_audit_llm_gate: asyncio.Semaphore | None = None
+
+
+def _get_audit_gate() -> asyncio.Semaphore:
+    global _audit_llm_gate
+    if _audit_llm_gate is None:
+        _audit_llm_gate = asyncio.Semaphore(_AUDIT_LLM_CONCURRENCY)
+    return _audit_llm_gate
+
 # s3-clone_06 P0-1：45s 帽是「审计为软门」时代的取舍——那时超时只意味着
 # 「没审计也放行」，宁可快失败。P0-3（fail-loud）之后语义反转：超时 =
 # 提交被门禁拦下或走显式 waive 流程，代价比多等 60 秒高得多。实测本项目
@@ -658,13 +670,21 @@ async def _invoke_audit_llm(
             agent_id=agent_id,
             timeout_s=_timeout_s,
         )
-        return None, {"audited": False, "reason": "llm_failed"}
+        return None, {
+            "audited": False,
+            "reason": "llm_failed",
+            "audit_upstream_unavailable": True,
+        }
     except NoModelConfiguredError as exc:
         log.warning("code_audit.no_model", agent_id=agent_id, error=str(exc))
         return None, {"audited": False, "reason": "no_model"}
     except Exception as exc:  # noqa: BLE001 — soft-fail contract
         log.warning("code_audit.llm_failed", agent_id=agent_id, error=str(exc))
-        return None, {"audited": False, "reason": "llm_failed"}
+        return None, {
+            "audited": False,
+            "reason": "llm_failed",
+            "audit_upstream_unavailable": True,
+        }
     if not text:
         # Empty text is as fatal as a raised exception, but was previously
         # swallowed with no log at all — the 6/6 llm_failed in TEST_DSH_35
@@ -679,7 +699,11 @@ async def _invoke_audit_llm(
             model_id=(chosen or {}).get("model_id"),
             source=source,
         )
-        return None, {"audited": False, "reason": "llm_failed"}
+        return None, {
+            "audited": False,
+            "reason": "llm_failed",
+            "audit_upstream_unavailable": True,
+        }
     return text, {
         "audit_model_id": (chosen or {}).get("model_id"),
         "audit_model_source": source,
@@ -812,7 +836,11 @@ async def run_code_audit(
                 cached_hit = None
         if cached_hit is not None:
             cached_exit = int(cached_hit.get("exit_code") or 1)
-            verdict_cached = "PASS" if cached_exit == 0 else "ISSUES"
+            # 用缓存行存的真实判定（可能是 warnings-only 的 ISSUES+exit 0）
+            verdict_cached = (
+                str(cached_hit.get("verdict") or "").strip()
+                or ("PASS" if cached_exit == 0 else "ISSUES")
+            )
             attestation_id = await attestation_service.create(
                 project_id,
                 agent_id=agent_id,
@@ -845,9 +873,12 @@ async def run_code_audit(
             }
 
         system, user = build_audit_prompt(diff, task_id)
-        text, meta = await _invoke_audit_llm(
-            project_id, agent_id, system, user, call_llm, oneshot_llm,
-        )
+        # P0-2：并发整形——多 agent 同时触发审计时排队（默认并发 2），
+        # 避免全员直打上游网关在风暴期互相放大失败。
+        async with _get_audit_gate():
+            text, meta = await _invoke_audit_llm(
+                project_id, agent_id, system, user, call_llm, oneshot_llm,
+            )
         if text is None:
             # No extra HTTP retry here: _oneshot_llm already retries once via
             # _review_llm_post_with_retry. Record the attempt so submit can
@@ -859,7 +890,12 @@ async def run_code_audit(
 
         verdict = _parse_verdict(text)
         issues = _parse_issues(text)
-        exit_code = 0 if verdict == "PASS" else 1
+        # 41+08 双跑 P0-2（审计门 27.3%）：只有 high 级问题才锁门——
+        # medium/low 记录为警告不阻塞（41 实测 24 次 ISSUES 中 4 次无 high
+        # 仍被锁死）。ISSUES 判定保留诚实；门禁语义 = 「有 high 才拦」。
+        high_count = sum(1 for i in issues if "[high]" in i.lower())
+        blocking = verdict == "ISSUES" and high_count > 0
+        exit_code = 1 if blocking else 0
 
         # Lazy import: tools.executor pulls the whole tool registry.
         from hiveweave.tools.executor import ToolExecutor
@@ -877,6 +913,11 @@ async def run_code_audit(
             workspace=worktree,
             commit_hash=commit_hash,
             stdout_hash=hash_stdout(text),
+            command_or_url=(
+                f"[verdict={verdict}] high={high_count}"
+                if verdict == "ISSUES"
+                else f"[verdict={verdict}]"
+            ),
         )
 
         # 40 轮报告第 4 步：审计结论入缓存（同 agent + 同 diff 哈希复用）
