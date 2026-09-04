@@ -586,9 +586,20 @@ class ModelUpdate(BaseModel):
     tier: str | None = None  # management | executor (None = 未分类)
 
 
-def _normalize_attrs(body: BaseModel) -> dict:
-    """将 camelCase 请求体转为 service 层期望的 snake_case dict。"""
-    data = body.model_dump(exclude_none=True)
+def _normalize_attrs(body: BaseModel, *, for_update: bool = False) -> dict:
+    """将 camelCase 请求体转为 service 层期望的 snake_case dict。
+
+    40 轮待办 #14：update 端点用 exclude_unset——显式传 null 的可空字段
+    （topP/topK/toolCallRound 等）穿透到 service 层执行「清空回默认」，
+    不再被静默丢弃（此前设置过就无法经 API 置空回「不发送」）。未传字段
+    仍不更新（部分更新语义不变）。create 端点维持 exclude_none（null 走
+    存储默认值，语义不变）。
+    """
+    data = (
+        body.model_dump(exclude_unset=True)
+        if for_update
+        else body.model_dump(exclude_none=True)
+    )
     mapping = {
         "modelId": "model_id",
         "baseUrl": "base_url",
@@ -753,7 +764,7 @@ async def _update_model(model_id: str, body: ModelUpdate) -> dict:
     model = await _model.get(model_id)
     if model is None:
         raise HTTPException(status_code=404, detail="Model not found")
-    attrs = _normalize_attrs(body)
+    attrs = _normalize_attrs(body, for_update=True)
     try:
         await _model.update(model_id, attrs)
     except Exception as e:

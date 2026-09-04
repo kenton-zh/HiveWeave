@@ -24,6 +24,7 @@ from hiveweave.api.org import router as org_router
 from hiveweave.api.chat import router as chat_router
 from hiveweave.api.permissions import router as permissions_router
 from hiveweave.api.communications import router as communications_router
+from hiveweave.api.llm_ops import router as llm_ops_router
 from hiveweave.api.logs import router as logs_router
 from hiveweave.api.alarms import router as alarms_router
 from hiveweave.api.filesystem import router as filesystem_router
@@ -49,6 +50,7 @@ _SUB_ROUTERS = [
     permissions_router,
     communications_router,
     logs_router,
+    llm_ops_router,
     alarms_router,
     filesystem_router,
     fs_browse_router,  # /api/fs/browse — 全局文件系统浏览（新建项目用）

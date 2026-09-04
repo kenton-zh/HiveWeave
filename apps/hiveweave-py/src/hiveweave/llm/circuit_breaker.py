@@ -292,6 +292,30 @@ class CircuitBreaker:
                 if breaker_state:
                     breaker_state.reset()
 
+    def snapshot(self) -> list[dict]:
+        """全部 provider 的熔断状态快照（40 轮 #13：诊断 API / 手动解除前置）。
+
+        返回 [{provider, state, fail_count, fail_threshold,
+              cooldown_left_s, fallback}]；冷却剩余按秒向下取整。
+        """
+        now = time.monotonic()
+        out: list[dict] = []
+        for name, b in self._breakers.items():
+            cooldown_left = 0
+            if b.state == CircuitState.OPEN and b.opened_at is not None:
+                cooldown_left = max(
+                    0, int((self.cooldown_ms / 1000) - (now - b.opened_at))
+                )
+            out.append({
+                "provider": name,
+                "state": b.state.value,
+                "fail_count": b.fail_count,
+                "fail_threshold": self.fail_threshold,
+                "cooldown_left_s": cooldown_left,
+                "fallback": b.fallback,
+            })
+        return out
+
 
 # ── 模块级单例 ──────────────────────────────────────────────
 

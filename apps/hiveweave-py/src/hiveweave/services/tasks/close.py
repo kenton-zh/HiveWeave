@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -803,6 +804,36 @@ class CloseMixin:
                 task_id=task_id,
                 error=str(e),
             )
+
+        # 40 轮待办 #3（qwen 补充，reports 工件生命周期）：取消/归档任务时，
+        # 在 MAIN 的 .hiveweave/reports/<task_id>/ 落一个 CANCELLED 标记——
+        # 读取通道（40 轮 P0-1 已放开）的读者能看到生命周期状态，不会把
+        # 取消单的预研/取证当仍然有效的验收依据。best-effort，绝不阻塞。
+        try:
+            from hiveweave.db import meta as _meta_db
+
+            _ws = await _meta_db.get_project_workspace(project_id)
+            if _ws:
+                _rdir = Path(_ws) / ".hiveweave" / "reports" / task_id
+                if _rdir.is_dir():
+                    _marker = _rdir / "CANCELLED.md"
+                    if not _marker.exists():
+                        _marker.write_text(
+                            f"# 任务已取消/归档\n\n"
+                            f"- task_id: {task_id}\n"
+                            f"- cancelled_at: {now_ms}\n"
+                            f"- reason_code: {code}\n"
+                            f"- reason: {reason[:300]}\n\n"
+                            f"本目录下的取证/预研材料属已取消任务，"
+                            f"不作为有效验收依据。\n",
+                            encoding="utf-8",
+                        )
+                        log.info(
+                            "reports_lifecycle_marker_written",
+                            task_id=task_id[:12],
+                        )
+        except Exception as e:  # noqa: BLE001 — 标记失败不阻塞归档
+            log.debug("reports_lifecycle_marker_failed", error=str(e))
         log.info(
             "task_archived",
             project_id=project_id,
