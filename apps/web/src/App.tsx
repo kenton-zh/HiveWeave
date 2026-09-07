@@ -4,6 +4,7 @@ import ChatPanel from "./components/ChatPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import ToastContainer from "./components/Toast";
 import TokenUsagePanel from "./components/TokenUsagePanel";
+import AssistantBall from "./components/AssistantBall";
 import { lazyRetry, resolveLeftPanel } from "./mainPanel";
 
 // Lazy-loaded: only fetched when the user navigates to them.
@@ -953,6 +954,7 @@ function App() {
           />
         )}
       </Suspense>
+      <AssistantBall />
       <ToastContainer />
     </div>
   );

@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
 
 import structlog
@@ -109,7 +109,22 @@ def register_routes(app: FastAPI) -> None:
     log.info("api_routes_registered", routers=len(_SUB_ROUTERS))
 
 
-async def _root() -> HTMLResponse:
+async def _root() -> Response:
+    """根端点：web dist 已构建/已挂载时服务主前端 index.html（打包税 #2，
+    UI 统一从 :4000 加载）；未构建时回落 API 状态页。根路由在导入期注册、
+    优先于 lifespan 里 Mount("/") 的静态挂载，故 "/" 必须在这里分流。"""
+    try:
+        from fastapi.responses import FileResponse
+
+        from hiveweave.config import resolve_web_dist
+
+        web_dist = resolve_web_dist()
+        # is_file 先验：FileResponse 的 stat 懒到响应期，dist 运行中被换
+        # （robocopy /MIR 更新中）会变 500，这里必须当场回落
+        if web_dist is not None and (web_dist / "index.html").is_file():
+            return FileResponse(web_dist / "index.html")
+    except Exception:
+        pass  # 解析/读文件失败 → 回落 API 状态页
     return HTMLResponse(_root_html())
 
 

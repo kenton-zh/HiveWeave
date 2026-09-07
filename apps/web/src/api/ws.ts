@@ -10,11 +10,27 @@ import { dbg, getApiKey } from "./shared";
  *   - "project:<id>"  - per-project game time + status
  */
 
+// Socket URL 策略：
+// - Vite dev/preview 页面（:5173/:4173）——Vite 不代理 WS，直连后端 :4000；
+//   VITE_WS_URL 仍可整体覆盖（自托管/远程部署用）。
+// - 其它一切来源（打包 EXE 任意端口、:4000 自身、远程域名）——同源
+//   /socket。此前 "hostname===localhost → ws://localhost:4000" 的写死分支
+//   会把打包版 localhost:4010 的 WS 打到 4000 的 dev 后端（2026-09-07
+//   端口回退改造时发现），已废。
+const _isViteDevPage =
+  typeof window !== "undefined" &&
+  (window.location.port === "5173" || window.location.port === "4173");
 const SOCKET_URL =
   (import.meta.env.VITE_WS_URL as string | undefined) ||
-  (typeof window !== "undefined" && window.location.hostname === "localhost"
-    ? "ws://localhost:4000/socket"
-    : "/socket");
+  (_isViteDevPage
+    ? // hostname 用 location.hostname：同机场景等价 localhost，且局域网
+      // IP 访问 dev 页（http://192.168.x.x:5173）时指向后端机而非浏览者
+      // 自己。注意 dev/preview 跑非标端口（--port 5199）时 WS 仍打 4000，
+      // 该场景请设 VITE_WS_URL。
+      `ws://${window.location.hostname}:4000/socket`
+    : typeof window !== "undefined"
+      ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/socket`
+      : "/socket");
 
 let _socket: Socket | null = null;
 

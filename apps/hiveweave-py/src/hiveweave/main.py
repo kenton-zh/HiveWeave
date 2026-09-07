@@ -959,6 +959,27 @@ async def lifespan(app: FastAPI):
         _asyncio.create_task(_task())
 
     _spawn_legacy_stash_scan()
+
+    # 打包税 #2（spec §11）：本进程托管主前端 dist/ —— UI 统一从 :4000 加载
+    # （开发模式仍走 Vite :5173；dist 未构建则纯 API 模式）。挂在 lifespan
+    # 而非模块导入：include_router 的 API/WS 路由先注册，Mount("/") 排在
+    # 路由表末尾天然垫底；pytest 不跑 lifespan，测试行为零影响。
+    try:
+        from fastapi.staticfiles import StaticFiles
+
+        from hiveweave.config import resolve_web_dist
+
+        web_dist = resolve_web_dist()
+        if web_dist is not None:
+            app.mount(
+                "/", StaticFiles(directory=str(web_dist), html=True), name="web"
+            )
+            log.info("web_dist_mounted", dist=str(web_dist))
+        else:
+            log.info("web_dist_absent", mode="api_only")
+    except Exception as e:
+        log.warning("web_dist_mount_failed", error=str(e))
+
     log.info("app_started")
 
     yield

@@ -48,6 +48,38 @@ def get_ball_position_file() -> Path:
     return get_data_root() / "ball_position.json"
 
 
+def resolve_web_dist() -> Path | None:
+    """主前端静态产物目录解析（spec §11 打包税 #2：打包版 FastAPI 托管 dist/）。
+
+    优先级：``HIVEWEAVE_WEB_DIST_DIR`` 显式指定 → frozen: EXE 同级 ``web/``
+    （与 ``resolve_ball_static_dir`` 的 frozen 口径一致）→ 脚本模式：仓库
+    ``apps/web/dist``。目录不存在或缺 ``index.html`` 一律返回 None ——
+    调用方按「未构建=纯 API 模式」处理，绝不抛异常阻断启动。
+    """
+    import os
+
+    explicit = (os.environ.get("HIVEWEAVE_WEB_DIST_DIR") or "").strip()
+    if explicit:
+        p = Path(os.path.expandvars(explicit)).expanduser()
+        return p if (p / "index.html").is_file() else None
+
+    candidates: list[Path] = []
+    if is_frozen():
+        candidates.append(Path(sys.executable).resolve().parent / "web")
+    else:
+        try:
+            candidates.append(_repo_root() / "apps" / "web" / "dist")
+        except Exception:
+            pass
+    for c in candidates:
+        try:
+            if (c / "index.html").is_file():
+                return c
+        except Exception:
+            continue
+    return None
+
+
 class Settings(BaseSettings):
     # Server
     # Security: 默认仅监听 loopback，避免暴露可执行 bash 的 Agent 平台到局域网。

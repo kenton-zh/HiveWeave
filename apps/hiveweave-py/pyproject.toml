@@ -29,6 +29,9 @@ dev = [
     "pytest-xdist>=3.8.0",
     "httpx>=0.27.0",
     "mypy>=2.2.0",
+    # Windows EXE 打包（apps/desktop/hiveweave.spec，build-exe.bat）；
+    # 非 Windows 装了也无害（无 wheel 时 uv 可能跳过，仅构建机需要）
+    "pyinstaller>=6.10; sys_platform == 'win32'",
 ]
 # 桌面悬浮球壳（spec §10 / D8，打包税 F4）：pywebview 官方 PyInstaller
 # hook（pyinstaller40 entry point）自动收集 WebView2 loader DLL + 桥接 JS。
