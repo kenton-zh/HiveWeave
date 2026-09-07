@@ -84,6 +84,22 @@ META_DB_TABLES = [
 
 PROJECT_DB_TABLES = [
     """
+    CREATE TABLE IF NOT EXISTS facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        payload TEXT,
+        source TEXT,
+        project_id TEXT,
+        verified_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_facts_kind_time
+    ON facts (kind, verified_at)
+    """,
+
+    """
     CREATE TABLE IF NOT EXISTS agents (
         id TEXT PRIMARY KEY,
         short_id TEXT,

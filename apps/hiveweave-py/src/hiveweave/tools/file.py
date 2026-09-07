@@ -540,6 +540,9 @@ async def read_file(
     workspace_path: str,
     project_root: str | None = None,
     extra_read_dirs: list[str] | None = None,
+    *,
+    agent_id: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Read a file with line numbers. Refuses binary files.
 
@@ -577,12 +580,23 @@ async def read_file(
     if not p.exists():
         # 46/11 #4：reports 路径区分「证据未产生」vs「id 错误」
         reports_hint = _reports_evidence_hint(file_path, root or "")
+        # FS 错误码分类学 + 观察到缺席事件（编排层区分「漏步」vs「不可读」；
+        # 带 project_id 的事实才会进 L3 总线触发按事实唤醒——审计 P1-2）
+        from hiveweave.services import fs_errors
+
+        fs_errors.observed_absent(
+            full, agent_id=agent_id, project_id=project_id
+        )
         return {"success": False, "output": "",
                 "error": f"Error: File not found: {file_path}."
-                         f"{reports_hint}{READ_MISS_HINT}"}
+                         f"{reports_hint}{READ_MISS_HINT}",
+                fs_errors.ERROR_CODE_KEY: fs_errors.NOT_FOUND}
     if p.is_dir():
+        from hiveweave.services import fs_errors
+
         return {"success": False, "output": "",
-                "error": f"Error: Path is a directory, not a file: {file_path}"}
+                "error": f"Error: Path is a directory, not a file: {file_path}",
+                fs_errors.ERROR_CODE_KEY: fs_errors.IS_A_DIRECTORY}
 
     if _is_binary(full):
         size = p.stat().st_size
@@ -605,8 +619,11 @@ async def read_file(
         else:
             content = p.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
+        from hiveweave.services import fs_errors
+
         return {"success": False, "output": "",
-                "error": f"Error: {type(exc).__name__}: {exc}"}
+                "error": f"Error: {type(exc).__name__}: {exc}",
+                fs_errors.ERROR_CODE_KEY: fs_errors.classify_oserror(exc)}
 
     # Split keeping line semantics
     lines = content.split("\n")
@@ -927,13 +944,39 @@ async def read_file_tool(params: ReadFileParams, agent_id: str, workspace: str) 
         limit=params.limit,
         workspace_path=workspace,
         extra_read_dirs=extra,
+        agent_id=agent_id,
+        project_id=await _project_id_for_workspace(workspace),
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])
     # 复审 P2-2：包装器必须透传 blocked（护栏拒绝语义），与 bash_tool 对齐
     if result.get("blocked"):
         return ToolResult.blocked_err(result.get("error", "Unknown error"))
-    return ToolResult.err(result.get("error", "Unknown error"))
+    # FS 错误码分类学（46/11 #4）：稳定错误码随回执透传（extra 合并）
+    err_extra: dict = {}
+    code = result.get("error_code")
+    if code:
+        err_extra["error_code"] = code
+    return ToolResult.err(result.get("error", "Unknown error"), **err_extra)
+
+
+async def _project_id_for_workspace(workspace: str) -> str | None:
+    """workspace → project_id（read 缺席事实的归属；审计 P1-2）。
+
+    仅在 read miss 路径消费——查询频度低，直接全表 normcase 比对即可，
+    不引缓存。fail-open None（事实退化为平台级，不落库不唤醒）。"""
+    try:
+        from hiveweave.db import meta as meta_db
+
+        want = os.path.normcase(os.path.normpath(workspace))
+        rows = await meta_db.query("SELECT id, workspace_path FROM projects")
+        for r in rows:
+            ws = r["workspace_path"] or ""
+            if ws and os.path.normcase(os.path.normpath(ws)) == want:
+                return str(r["id"])
+    except Exception:
+        pass
+    return None
 
 
 @tool(
@@ -945,11 +988,20 @@ async def read_file_tool(params: ReadFileParams, agent_id: str, workspace: str) 
 )
 async def write_file_tool(params: WriteFileParams, agent_id: str, workspace: str) -> ToolResult:
     """Write a file (overwrite). Auto-creates parent directories."""
-    result = await write_file(
-        file_path=params.file_path,
-        content=params.content,
-        workspace_path=workspace,
-    )
+    # 写路径闸（46/11 #6）：同路径并发写（父/子代理共享 worktree）advisory
+    # 冲突，advice never a block；try/finally 配对防异常泄漏持有。
+    from hiveweave.tools import write_gate
+
+    if not write_gate.try_acquire(params.file_path, workspace):
+        return ToolResult.err(write_gate.conflict_message(params.file_path))
+    try:
+        result = await write_file(
+            file_path=params.file_path,
+            content=params.content,
+            workspace_path=workspace,
+        )
+    finally:
+        write_gate.release(params.file_path, workspace)
     if result.get("success"):
         return ToolResult.ok(result["output"])
     # 复审 P2-2：包装器必须透传 blocked（护栏拒绝语义），与 bash_tool 对齐

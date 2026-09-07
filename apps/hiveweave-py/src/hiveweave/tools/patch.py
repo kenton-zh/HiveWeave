@@ -495,12 +495,35 @@ class EditFileParams(BaseModel):
 )
 async def apply_patch_tool(params: ApplyPatchParams, agent_id: str, workspace: str) -> ToolResult:
     """Apply a list of patch operations."""
-    # Convert Pydantic models back to dicts for the existing implementation
-    patches_raw = [p.model_dump(by_alias=True, exclude_none=True) for p in params.patches]
-    result = await apply_patch(
-        patches=patches_raw,
-        workspace_path=workspace,
-    )
+    from hiveweave.tools import write_gate
+
+    # 写路径闸（46/11 #6）：多文件 patch 全部路径**全有或全无**获取，防
+    # 半持有状态；同路径并发写（共享 worktree 的父/子代理）advisory 冲突。
+    # 去重（审计 P1-3）：同一 patch 多处改同一文件是合法输入，不去重会
+    # 自己撞自己的闸被误拒。
+    targets = list(dict.fromkeys(p.file_path for p in params.patches))
+    acquired: list[str] = []
+    blocked_path: str | None = None
+    for fp in targets:
+        if write_gate.try_acquire(fp, workspace):
+            acquired.append(fp)
+        else:
+            blocked_path = fp
+            break
+    if blocked_path is not None:
+        for fp in acquired:
+            write_gate.release(fp, workspace)
+        return ToolResult.err(write_gate.conflict_message(blocked_path))
+    try:
+        # Convert Pydantic models back to dicts for the existing implementation
+        patches_raw = [p.model_dump(by_alias=True, exclude_none=True) for p in params.patches]
+        result = await apply_patch(
+            patches=patches_raw,
+            workspace_path=workspace,
+        )
+    finally:
+        for fp in acquired:
+            write_gate.release(fp, workspace)
     if result.get("success"):
         return ToolResult.ok(result["output"])
     # Include detailed output in error so LLM can understand WHY a patch failed
@@ -522,17 +545,25 @@ async def apply_patch_tool(params: ApplyPatchParams, agent_id: str, workspace: s
 )
 async def edit_file_tool(params: EditFileParams, agent_id: str, workspace: str) -> ToolResult:
     """Single-file edit via apply_patch."""
-    patch_dict = {
-        "op": "update",
-        "filePath": params.file_path,
-        "oldString": params.old_string,
-        "newString": params.new_string,
-        "replace_all": params.replace_all,
-    }
-    result = await apply_patch(
-        patches=[patch_dict],
-        workspace_path=workspace,
-    )
+    from hiveweave.tools import write_gate
+
+    # 写路径闸（46/11 #6）：同路径并发写 advisory 冲突（共享 worktree）。
+    if not write_gate.try_acquire(params.file_path, workspace):
+        return ToolResult.err(write_gate.conflict_message(params.file_path))
+    try:
+        patch_dict = {
+            "op": "update",
+            "filePath": params.file_path,
+            "oldString": params.old_string,
+            "newString": params.new_string,
+            "replace_all": params.replace_all,
+        }
+        result = await apply_patch(
+            patches=[patch_dict],
+            workspace_path=workspace,
+        )
+    finally:
+        write_gate.release(params.file_path, workspace)
     if result.get("success"):
         return ToolResult.ok(result["output"])
     error_msg = result.get("error", "Unknown error")

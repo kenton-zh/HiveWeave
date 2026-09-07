@@ -19,7 +19,7 @@ VALID_PHASES: frozenset[str] = frozenset(
     {"in_progress", "waiting", "blocked", "done_slice"}
 )
 
-WaitingKind = Literal["agent", "task", "user", "timer", "external"]
+WaitingKind = Literal["agent", "task", "user", "timer", "external", "fact"]
 
 
 class WaitingOnItem(BaseModel):

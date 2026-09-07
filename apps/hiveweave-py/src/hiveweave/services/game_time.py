@@ -47,6 +47,22 @@ STREAMING_SWEEP_TICKS = 6     # 6 * 5s = 30s — auto-heal orphan is_streaming=1
 STREAMING_ZOMBIE_TIMEOUT_MS = int(
     os.environ.get("HIVEWEAVE_STREAMING_ZOMBIE_TIMEOUT_MS", "300000") or "300000"
 )
+# 审计 P2-2（2026-09-08）：streamer idle 判死（+socket read 30s）必须早于
+# orphan 扫描——env 误配（IDLE ≥ zombie-30s）在 import 期就报出来。
+from hiveweave.llm.streamer.constants import (  # noqa: E402
+    IDLE_TIMEOUT_S as _IDLE_TIMEOUT_S,
+    STREAM_SOCKET_READ_TIMEOUT_S as _STREAM_SOCKET_READ_TIMEOUT_S,
+)
+
+assert (
+    _STREAM_SOCKET_READ_TIMEOUT_S * 1000 < STREAMING_ZOMBIE_TIMEOUT_MS
+), (
+    f"STREAM_SOCKET_READ_TIMEOUT_S({_STREAM_SOCKET_READ_TIMEOUT_S}s) 必须 < "
+    f"STREAMING_ZOMBIE_TIMEOUT_MS({STREAMING_ZOMBIE_TIMEOUT_MS}ms)——"
+    "否则 orphan 扫描先于 idle 看门狗误杀健康流（两层机制勿混）"
+)
+assert _IDLE_TIMEOUT_S > 0, "IDLE_TIMEOUT_S 必须为正"
+del _IDLE_TIMEOUT_S, _STREAM_SOCKET_READ_TIMEOUT_S
 WORKTREE_RECONCILE_TICKS = 72  # 72 * 5s = 6min — retry orphan worktree cleanup
 TASK_EVENT_RELAY_TICKS = 6   # 6 * 5s = 30s — process undelivered task events
 OBLIGATION_SCAN_TICKS = 12   # 12 * 5s = 60s — TEST16 D2: scan overdue obligations
@@ -2580,3 +2596,73 @@ async def _auto_submit_stalled_running_task_if_merged(
     except Exception as e:
         log.warning("task_stall_auto_submit_failed", task_id=tid, error=str(e))
         return False
+
+
+# ── L3 事实总线 → 按事实唤醒订阅（2026-09-08，repair-plan-20260902 §L3）──
+_FACT_WAKE_SUBSCRIBED = False
+_FACT_WAKE_TASKS: set = set()  # P2-4：持住 fire-and-forget task 引用防 GC
+
+
+def ensure_fact_wake_subscription() -> None:
+    """订阅事实总线：kind=fact 的等待由事实发布事件唤醒（进程内一次性）。
+
+    事实是参考上下文：唤醒信附核验时间戳与来源，等待方可复核；未匹配的
+    等待继续等，TTL 兜底饿死保险不变。lifespan 启动时调用。
+    """
+    global _FACT_WAKE_SUBSCRIBED
+    if _FACT_WAKE_SUBSCRIBED:
+        return
+    from hiveweave.services import fact_bus
+
+    def _on_fact(fact: "fact_bus.Fact") -> None:
+        if not getattr(fact, "project_id", None):
+            return  # 平台级事实不参与项目内等待唤醒
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # 同步上下文发布：不投递，等待方 TTL 兜底
+        task = loop.create_task(_wake_fact_waiters_for(fact))
+        _FACT_WAKE_TASKS.add(task)
+        task.add_done_callback(_FACT_WAKE_TASKS.discard)
+
+    fact_bus.subscribe(_on_fact)
+    _FACT_WAKE_SUBSCRIBED = True
+    log.info("fact_wake_subscription_started")
+
+
+async def _wake_fact_waiters_for(fact) -> None:
+    from hiveweave.services.wait_contract import wake_fact_waiters
+
+    payload = fact.payload if isinstance(fact.payload, dict) else {}
+    try:
+        woken = await wake_fact_waiters(
+            fact.project_id,
+            fact.kind,
+            fact.subject,
+            value=str(payload.get("value") or ""),
+            verified_by=fact.source,
+            verified_at=fact.verified_at,
+        )
+    except Exception as e:
+        log.warning("fact_wake_failed", fact_kind=fact.kind, error=str(e))
+        return
+    if not woken:
+        return
+    from hiveweave.agents.supervisor import agent_manager
+    from hiveweave.agents.trigger import (
+        is_coordinator,
+        trigger_coordinator,
+        trigger_subordinate,
+    )
+
+    for aid in woken:
+        inst = agent_manager.get_agent(aid)
+        if inst is None:
+            continue
+        try:
+            if is_coordinator(getattr(inst, "role", "")):
+                await trigger_coordinator(aid)
+            else:
+                await trigger_subordinate(aid)
+        except Exception as e:
+            log.warning("fact_wake_trigger_failed", agent_id=aid, error=str(e))

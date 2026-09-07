@@ -42,6 +42,85 @@ def _item_kind_ref(item: Any) -> tuple[str, str]:
     return "external", ""
 
 
+def _item_note(item: Any) -> str | None:
+    if isinstance(item, WaitingOnItem):
+        note = item.note
+    elif isinstance(item, dict):
+        note = item.get("note")
+    else:
+        return None
+    return str(note) if note is not None else None
+
+
+def _item_expires_at(item: Any) -> int | None:
+    if isinstance(item, dict) and item.get("expires_at") is not None:
+        try:
+            return int(item["expires_at"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _dedup_waiting_on(waiting_on: list[Any]) -> list[Any]:
+    """审计 #11：同 agent 同 kind+ref 的 waiting_on 去重。
+
+    保留首条；expires_at 取组内最早（仅 dict 项可携带，若可比）；
+    note 拼接去重（首条优先）。ref 为空的项原样透传（插入循环本就跳过）。
+    """
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+    passthrough: list[Any] = []
+    for it in waiting_on or []:
+        kind, ref = _item_kind_ref(it)
+        key = (str(kind).lower(), str(ref).strip())
+        if not key[1]:
+            passthrough.append(it)
+            continue
+        if key not in groups:
+            groups[key] = {
+                "item": it,
+                "expires_at": _item_expires_at(it),
+                "notes": [n for n in [_item_note(it)] if n],
+            }
+            order.append(key)
+            continue
+        g = groups[key]
+        exp = _item_expires_at(it)
+        if exp is not None and (
+            g["expires_at"] is None or exp < g["expires_at"]
+        ):
+            g["expires_at"] = exp
+        note = _item_note(it)
+        if note and note not in g["notes"]:
+            g["notes"].append(note)
+    out: list[Any] = list(passthrough)
+    for key in order:
+        g = groups[key]
+        it = g["item"]
+        note = " | ".join(g["notes"]) or None
+        if g["expires_at"] is None and note == _item_note(it):
+            out.append(it)
+            continue
+        if isinstance(it, WaitingOnItem):
+            merged: dict[str, Any] = {
+                "kind": it.kind,
+                "ref": it.ref,
+                "note": note,
+            }
+            if g["expires_at"] is not None:
+                merged["expires_at"] = g["expires_at"]
+            out.append(merged)
+        elif isinstance(it, dict):
+            it = dict(it)
+            it["note"] = note
+            if g["expires_at"] is not None:
+                it["expires_at"] = g["expires_at"]
+            out.append(it)
+        else:
+            out.append(it)
+    return out
+
+
 def looks_unbounded_external(kind: str, ref: str) -> bool:
     """Native bg job refs — no 30-minute wait TTL."""
     if str(kind or "").lower() != "external":
@@ -134,6 +213,9 @@ DEFAULT_WAKE_ON: dict[str, list[str]] = {
         "ask_reply",
         "user_message",
     ],
+    # L3 按事实唤醒（2026-09-08）：ref = "<fact_kind>[:<subject 子串>]"，
+    # 事实发布时由 fact_bus 订阅方（game_time）匹配投递 [FACT_OBSERVED]。
+    "fact": ["fact", "timeout", "message_from_ref"],
 }
 
 CREATE_SQL = """
@@ -518,11 +600,12 @@ class WaitContractService:
 
         ver = obligation_version(obligations or [])
         created: list[dict] = []
+        deduped_items = _dedup_waiting_on(list(waiting_on or []))
         batch_unbounded = any(
             looks_unbounded_external(*_item_kind_ref(it))
-            for it in (waiting_on or [])
+            for it in deduped_items
         )
-        for item in waiting_on or []:
+        for item in deduped_items:
             if isinstance(item, WaitingOnItem):
                 kind: str = item.kind
                 ref = item.ref
@@ -1434,6 +1517,108 @@ async def project_id_for_agent(agent_id: str) -> str | None:
         return await meta_db.get_agent_project_id(aid)
     except Exception:
         return None
+
+
+def _fact_ref_matches(wait_ref: str, fact_kind: str, subject: str) -> bool:
+    """fact 等待 ref 语义：``"<fact_kind>[:<subject 子串>]"``。
+
+    - 无 ``:`` → 只按事实类型匹配（任意主体）
+    - 有 ``:`` → 类型相同**且** subject 子串命中（大小写不敏感）
+    空串/通配 ``*`` 视为只匹配类型。 """
+    r = (wait_ref or "").strip()
+    if not r or r == "*":
+        return False  # 裸 '*' 等所有事实 = 无界等待，不合法，按不匹配处理
+    kind_part, _, subject_part = r.partition(":")
+    if str(kind_part or "").strip().lower() != str(fact_kind or "").strip().lower():
+        return False
+    want = subject_part.strip().lower()
+    return not want or want in str(subject or "").lower()
+
+
+async def wake_fact_waiters(
+    project_id: str,
+    fact_kind: str,
+    subject: str,
+    *,
+    value: str | None = None,
+    verified_by: str = "platform",
+    verified_at: int | None = None,
+) -> list[str]:
+    """按事实唤醒（L3 完整形态，2026-09-08）：匹配 kind=fact 等待并投递。
+
+    由 fact_bus 订阅方（game_time）在事实发布时调用；返回被唤醒的
+    agent id 列表（调用方负责 watchdog 触发）。匹配的等待行就地关闭
+    （cleared_at），未匹配的等待继续等（TTL 兜底饿死保险不变）。
+    """
+    waits = await wait_contract_service.list_all_active(project_id)
+    fact_waits = [
+        w for w in waits if str(w.get("kind") or "").lower() == "fact"
+    ]
+    if not fact_waits:
+        return []
+
+    now = int(time.time() * 1000)
+    at_iso = time.strftime(
+        "%Y-%m-%d %H:%M:%S", time.localtime((verified_at or now) / 1000)
+    )
+    woken: list[str] = []
+    matched_ids: list[str] = []
+    for w in fact_waits:
+        aid = str(w.get("agentId") or w.get("agent_id") or "")
+        wid = str(w.get("id") or "")
+        if not aid or not wid:
+            continue
+        if not _fact_ref_matches(str(w.get("ref") or ""), fact_kind, subject):
+            continue
+        matched_ids.append(wid)
+        if aid not in woken:
+            woken.append(aid)
+    if not matched_ids:
+        return []
+
+    for wid in matched_ids:
+        try:
+            await _execute_rowcount(
+                project_id,
+                "UPDATE agent_waits SET cleared_at = ? WHERE id = ? "
+                "AND cleared_at IS NULL",
+                [now, wid],
+            )
+        except Exception as e:
+            log.warning("fact_wait_clear_failed", wait_id=wid, error=str(e))
+
+    # 投递唤醒信（与 [WAIT_TIMEOUT] 同通道：system urgent + watchdog）
+    try:
+        from hiveweave.services.inbox import InboxService
+
+        body = (
+            f"[FACT_OBSERVED] 你等待的事实已出现：kind={fact_kind} "
+            f"subject={subject} value={value or ''} "
+            f"verified_by={verified_by} at={at_iso}。"
+            "事实是参考上下文——行动前可自行复核。Resume work."
+        )
+        inbox = InboxService()
+        for aid in woken:
+            try:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=aid,
+                    message=body,
+                    message_type="system",
+                    priority="urgent",
+                )
+            except Exception as e:
+                log.warning("fact_wake_notify_failed", agent_id=aid, error=str(e))
+    except Exception as e:
+        log.warning("fact_wake_inbox_unavailable", error=str(e))
+    log.info(
+        "fact_waiters_woken",
+        project_id=project_id,
+        fact_kind=fact_kind,
+        subject=subject[:80],
+        woken=len(woken),
+    )
+    return woken
 
 
 def category_to_wake_event(

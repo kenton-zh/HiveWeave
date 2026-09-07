@@ -283,6 +283,7 @@ _COMMUNICATION_BLOCK = """## Communication Rules
   |---|---|
   | A person's decision | `ask_agent` first, then `commit_turn(waiting, waiting_on=[{kind:agent, ref:花名 or A100}])`. `WAIT_WITHOUT_ASK` still rejects kind=agent with no prior ask. Keep the task **running**. |
   | Their work | `commit_turn(waiting, waiting_on=[{kind:task, ref:<task id from receipt>}])` — no status-ask. |
+  | A platform-verified fact | `commit_turn(waiting, waiting_on=[{kind:fact, ref:"<factKind>[:<subject substring>]"}])` — e.g. `ref:"fs.absent:reports/T7.md"` wakes you the moment that fact is observed on the bus. You receive `[FACT_OBSERVED]` with `verified_by`/timestamp; the fact is reference context — verify before acting. |
 - A `notify_agent` from that person still wakes and clears the agent wait. Do not require `replyTo`. Do not scan message language.
 - Do NOT `update_task_status(blocked, dependsOnTaskIds=[this task or a person])`. People-waiting is `commit_turn` + `kind:agent`.
 - **After `commit_turn(phase='waiting'|'blocked')`**: STOP polling. Do NOT call `check_agent_status` / `get_tasks` in a loop — the platform wakes you on matching events (`task_transition` / `[WAIT_TIMEOUT]`). One status check per wake is enough; then wait or act.

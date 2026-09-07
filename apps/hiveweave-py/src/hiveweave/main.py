@@ -882,6 +882,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("agent_router_rebuild_failed", error=str(e))
 
+    # 4b-2. L3 事实总线 → 按事实唤醒订阅（一次性；kind=fact 等待靠它投递）
+    try:
+        from hiveweave.services.game_time import ensure_fact_wake_subscription
+
+        ensure_fact_wake_subscription()
+    except Exception as e:
+        log.warning("fact_wake_subscription_failed", error=str(e))
+
     # 4c. P1(TEST9): 重启重建 wait 超时"闹钟"。agent_waits 持久化了 parked
     # wait 的 expires_at，但超时唤醒依赖 tick；重启后项目 off-duty、tick
     # 不跑，parked agent 会永久停摆。此处对所有项目：已到期 wait 立即
