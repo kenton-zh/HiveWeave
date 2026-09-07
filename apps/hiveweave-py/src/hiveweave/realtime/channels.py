@@ -560,7 +560,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                         "role": "user",
                         "content": message,
                         "is_streaming": False,
-                        "metadata": {"source": "user"},
+                        "metadata": {"source": "web"},  # WS 面统一 web 口径
                     }
                 )
                 # 推送 message_id 给客户端

@@ -216,7 +216,7 @@ async def send_chat(body: ChatSendBody) -> dict:
                 "is_streaming": False,
                 "is_read": True,
                 "images": body.images,
-                "metadata": {"source": "user"},
+                "metadata": {"source": "web"},  # REST 面统一 web 口径（原 user，381dbe5 P1 备忘）
             }
         )
         asst = await send_off_duty_auto_reply(agent_id)
@@ -248,7 +248,7 @@ async def send_chat(body: ChatSendBody) -> dict:
             "is_streaming": False,
             "is_read": True,
             "images": body.images,
-            "metadata": {"source": "user"},
+            "metadata": {"source": "web"},  # REST 面统一 web 口径（原 user，381dbe5 P1 备忘）
         }
     )
 

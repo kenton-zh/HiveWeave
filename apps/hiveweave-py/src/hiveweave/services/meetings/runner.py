@@ -319,6 +319,10 @@ async def run_meeting_turn(
                     profile=tool_profile, timeout_s=timeout_s)
         return _finish(agent, prev_status, _timeout_outcome(tool_profile))
     except asyncio.CancelledError:
+        # 泵重启/停机取消：先释放排他槽状态再上抛——否则 agent 行状态滞留
+        # PROCESSING 只能等泵自愈（遗留 P3：runner CancelledError 滞留）。
+        # 心跳由 finally 统一停，这里只还状态。
+        _finish(agent, prev_status, {"action": "none", "content": "cancelled"})
         raise
     except Exception as e:
         log.warning("meeting_turn_error", agent_id=agent_id,

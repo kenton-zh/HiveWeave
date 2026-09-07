@@ -1784,14 +1784,17 @@ async def _inject_kr_progress(project_id: str, goals: dict) -> dict:
     krs = goals.get("keyResults")
     if not isinstance(krs, list):
         return goals
-    all_tids = set()
+    all_tids: set[str] = set()
     for kr in krs:
         if isinstance(kr, dict):
             all_tids.update(str(t) for t in (kr.get("taskIds") or []))
     if not all_tids:
         return goals
     try:
-        from hiveweave.db.project import query as _pq
+        # 审计 P1-4（2026-09-08）：首参必须是 project_id —— query() 走
+        # agent 路由（get_project_db_for_agent），传 project_id 永远查不到
+        # → except 吞掉 return goals，KR 进度注入此前从未生效。
+        from hiveweave.db.project import query_by_project as _pq
         tid_list = list(all_tids)
         ph = ",".join("?" * len(tid_list))
         rows = await _pq(project_id,

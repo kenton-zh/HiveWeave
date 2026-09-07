@@ -244,6 +244,28 @@ async def resolve_project_ceo(project_id: str) -> dict | None:
     return dict(agent_row) if agent_row else None
 
 
+def _ceo_from_router(project_id: str) -> dict | None:
+    """内存路由直取 CEO（381dbe5 P1 备忘：/api/ball/state 轮询热路径消 N+1）。
+
+    前端红点轮询周期性打该端点；原先每项目 2 条 DB 查询（53 项目 ≈ 106
+    条/轮）。路由未命中（收养未重启/路由降级）回落 resolve_project_ceo。
+    """
+    try:
+        from hiveweave.services.agent_router import agent_router
+
+        for aid in agent_router.get_project_agent_ids(project_id):
+            route = agent_router.get_route(aid)
+            if (
+                route is not None
+                and str(route.role or "").lower() == "ceo"
+                and str(route.status or "") == "active"
+            ):
+                return {"id": route.agent_id, "name": route.name or route.agent_id}
+    except Exception:
+        pass
+    return None
+
+
 async def list_ball_targets() -> dict:
     """悬浮球展开态的对话目标（spec §10 顶部切换标签）。
 
@@ -263,7 +285,7 @@ async def list_ball_targets() -> dict:
     projects: list[dict] = []
     for r in rows:
         pid = r["id"]
-        ceo = await resolve_project_ceo(pid)
+        ceo = _ceo_from_router(pid) or await resolve_project_ceo(pid)
         projects.append(
             {
                 "projectId": pid,

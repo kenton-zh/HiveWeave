@@ -21,6 +21,7 @@ export interface ToolCall {
 /** 消息来源（metadata.source；legacy 消息由前端推断）。 */
 export type MessageSource =
   | "user"
+  | "web"
   | "agent"
   | "agent_to_user"
   | "system"

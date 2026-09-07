@@ -80,7 +80,7 @@ def expand_windows_env(path: str) -> str:
     """%VAR% 展开（与 api/filesystem 同款最小实现，避免跨模块耦合）。"""
     import re as _re
 
-    def _replacer(m: "re.Match[str]") -> str:
+    def _replacer(m: "_re.Match[str]") -> str:
         return os.environ.get(m.group(1), m.group(0))
 
     return _re.sub(r"%([A-Za-z_][A-Za-z0-9_]*)%", _replacer, path)

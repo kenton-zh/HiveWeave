@@ -371,6 +371,7 @@ export function inferMessageSource(
 ): MessageSource | undefined {
   if (
     meta?.source === "user" ||
+    meta?.source === "web" ||
     meta?.source === "agent" ||
     meta?.source === "agent_to_user" ||
     meta?.source === "system" ||

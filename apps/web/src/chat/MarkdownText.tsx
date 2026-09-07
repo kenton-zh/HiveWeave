@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { isValidElement, memo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
@@ -49,6 +49,7 @@ function remoteHttpUrl(url: string | undefined): string | undefined {
 }
 
 const components: Components = {
+  pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
   // href 已过 urlTransform：空 = 协议被拒/相对地址 → 降级纯文本（不留 <a href="">）。
   a: ({ children, href }) => {
     if (!href) return <span>{children}</span>;
@@ -66,6 +67,57 @@ const components: Components = {
     );
   },
 };
+
+/** 从 pre>code 子元素提取 ``` 围栏语言（react-markdown 塞进 code.className）。 */
+function codeLanguage(node: ReactNode): string {
+  if (isValidElement(node)) {
+    const cls = (node.props as { className?: string }).className ?? "";
+    const m = /language-([\w+-]+)/.exec(cls);
+    if (m) return m[1];
+  }
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const lang = codeLanguage(child);
+      if (lang) return lang;
+    }
+  }
+  return "";
+}
+
+/**
+ * P2 代码块（2026-09-08）：语言标签 + 一键复制。复制走
+ * navigator.clipboard；无权限/不可用（旧 WebView2、jsdom）静默失败——
+ * 不弹错、不崩 UI，按钮回落「复制」态。语法高亮（shiki）按设计稿 P2
+ * 另行评估（重依赖 + 异步高亮器，与本组件同步渲染模型不合，未纳入）。
+ */
+function CodeBlock({ children }: { children?: ReactNode }) {
+  const preRef = useRef<HTMLPreElement>(null);
+  const [copied, setCopied] = useState(false);
+  const lang = codeLanguage(children);
+
+  async function onCopy() {
+    const text = preRef.current?.textContent ?? "";
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      return;
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  }
+
+  return (
+    <div className="hw-md-code">
+      <div className="hw-md-code-bar">
+        <span className="hw-md-code-lang">{lang || "text"}</span>
+        <button type="button" className="hw-md-code-copy" onClick={onCopy}>
+          {copied ? "已复制" : "复制"}
+        </button>
+      </div>
+      <pre ref={preRef}>{children}</pre>
+    </div>
+  );
+}
 
 /**
  * P1-2 性能兜底（审计 2026-09-05）：text_delta 每个 delta 触发整段 O(n)
