@@ -115,6 +115,9 @@ def _with_cache_scope(row: dict[str, Any]) -> dict[str, Any]:
     providers_csv = row.pop("providers", None)
     scope = cache_creation_scope(providers_csv)
     row["cache_creation_scope"] = scope
+    # 乐观上限标注（审计 #7）：cache_creation 未全量上报时分母缺分量，
+    # 命中率只可能是乐观上限 —— 与 cache_creation_scope 同 schema 一并输出。
+    row["cache_hit_optimistic"] = scope != CACHE_SCOPE_REPORTED
     names = [
         p.strip() for p in str(providers_csv or "").split(",") if p and p.strip()
     ]

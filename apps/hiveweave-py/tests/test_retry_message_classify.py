@@ -20,6 +20,7 @@ from hiveweave.llm.retry import (
     RetryHandler,
     RetryableError,
     classify_http_error,
+    is_region_unavailable_error,
     is_retryable_status,
     matches_retryable_message,
 )
@@ -213,3 +214,27 @@ async def test_with_retry_persist_failure_does_not_break_retry():
     with pytest.raises(RetryableError):
         await handler.with_retry(client.call, persist=persist)
     assert client.n == 3
+
+
+# ── TEST_DSH_47 #8: 地域类 fast-fail ────────────────────────────
+
+
+class TestRegionFastFail:
+    """RegionError 系确定性不可重试 —— 首遇即 PermanentError，不进退避。"""
+
+    def test_is_region_unavailable_error(self):
+        assert is_region_unavailable_error(
+            "RegionError: This model is not available in your country")
+        assert not is_region_unavailable_error("HTTP 400 MissingSessionID")
+        assert not is_region_unavailable_error("rate limit reached")
+
+    def test_classify_region_is_permanent(self):
+        err = classify_http_error(
+            403, "RegionError: This model is not available in your country")
+        assert isinstance(err, PermanentError)
+
+    def test_classify_region_beats_retryable_words(self):
+        # body 夹带可重试词（server error）仍 fast-fail —— 地域优先。
+        err = classify_http_error(
+            500, "RegionError: unsupported region, upstream server error")
+        assert isinstance(err, PermanentError)

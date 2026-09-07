@@ -21,6 +21,7 @@ from hiveweave.llm.retry import (
     PermanentError,
     RetryableError,
     classify_http_error,
+    is_region_unavailable_error,
 )
 
 from .constants import (
@@ -230,7 +231,9 @@ class HttpStreamMixin:
         SSE 消费循环做中途预算切断。
         """
         url = provider.build_url()
-        headers = provider.build_headers()
+        # opencode Go 网关按 agent 会话稳定键发 x-opencode-session（缺失
+        # 即 400 MissingSessionID）；其他网关在 build_headers 内 no-op。
+        headers = provider.build_headers(session_id=agent_id)
 
         # FIX(gateway-tool-id-400): opencode zen go 网关（Console Go）在请求
         # 尾部为 tool/system 消息时，会校验尾部 tool_call id 链的签名；
@@ -575,9 +578,14 @@ class HttpStreamMixin:
                             raw.get("body", ""),
                             headers=raw.get("headers", {}),
                         )
-                    raise RetryableError(
-                        raw.get("error", "Unknown HTTP error")
-                    )
+                    # 无 http_status 的异常文本形态：仅 region/不可用类
+                    # 确定性永久失败 fast-fail（403 地域类误入退避曾慢死
+                    # 476s，TEST_DSH_47 #8）；未知措辞保持可重试，避免
+                    # opaque 网关瞬态错误被误判成 Permanent 秒死。
+                    err_text = raw.get("error", "Unknown HTTP error")
+                    if is_region_unavailable_error(err_text):
+                        raise PermanentError(err_text)
+                    raise RetryableError(err_text)
 
                 got_event = True
 

@@ -269,18 +269,21 @@ FIRST_CHUNK_TIMEOUT_S = 90.0
 """首 chunk 超时（TS 防线②，thinking 模型首 token 可能 60-90s）。"""
 
 IDLE_TIMEOUT_S = float(
-    _os.environ.get("HIVEWEAVE_STREAM_IDLE_TIMEOUT_S", "75") or "75"
+    _os.environ.get("HIVEWEAVE_STREAM_IDLE_TIMEOUT_S", "150") or "150"
 )
-"""后续 chunk 空闲看门狗（默认 75s，2026-09 42 轮 P1-7 残余下调）。
+"""后续 chunk 空闲看门狗（默认 150s，2026-09-08 46/11 #2 重审上调）。
 
-旧值 300s：上游 429 全员退避风暴期，一条已开口的流静默 5min 才判死，
-单次检测烧满 5min（42 轮实测全场 100min 空窗/9 次）。首 token 前的
-思考等待由 FIRST_CHUNK_TIMEOUT_S(90s) 单独承担；已出字后 >1min 无任何
-SSE 事件（长连接下连 keepalive/空帧都没有）按链路半死处理，75s 取
-60-90s 快速重发带的中位，并为 socket read（idle+30=105s）留余量。
-到点语义不变（判死 → 既有重试/收口接管），只调阈值。必须仍显著低于
-STREAMING_ZOMBIE_TIMEOUT_MS（game_time orphan 扫描，默认 300s）——
-两层是不同机制，勿混。"""
+历史三档：300s（42 轮前）→ 75s（42 轮 P1-7：429 风暴期一条已开口的流
+静默判死要等 5min，单次检测烧满 5min，全场实测 100min 空窗/9 次）→
+150s（本次）。再上调理由：当年风暴经济学已变——主循环上游重试缝
+（6219cb3）+ 退避/熔断在库，判死后重试已是常态路径，75s 对中转/弱网
+下的健康慢流误杀率偏高（46/11 #2 idle 死亡 4/11）；而 DSH 默认 300s
+不适配本平台多 agent 并发（52 项目级）——僵尸检测代价按 agent 数放大，
+且「必须显著低于 STREAMING_ZOMBIE_TIMEOUT_MS（默认 300s）」的既有约束
+会把改动级联到 orphan 扫描。150s = 误杀耐心翻倍、socket read
+（idle+30=180s）自动跟涨、对 zombie 层仍留 120s 余量。首 token 前的
+思考等待仍由 FIRST_CHUNK_TIMEOUT_S(90s) 单独承担。到点语义不变
+（判死 → 既有重试/收口接管），只调阈值。两层机制勿混。"""
 
 # Socket read must outlive the idle watchdog so httpx does not kill first.
 STREAM_SOCKET_READ_TIMEOUT_S = IDLE_TIMEOUT_S + 30.0

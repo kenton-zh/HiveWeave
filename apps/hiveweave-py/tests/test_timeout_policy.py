@@ -46,11 +46,15 @@ def test_turn_budget_constants_structurally_sane():
     assert c.TOTAL_TIMEOUT_S < c.HARD_TOTAL_TIMEOUT_S < c.AGENT_SAFETY_CEILING_S
 
 
-def test_idle_watchdog_default_is_75s_fast_redelivery():
-    """42 轮 P1-7：流式 idle 判死 300s→75s 快速重发（429 风暴期单次检测
-    不再烧 5min）。首 token 前仍由 FIRST_CHUNK(90s) 承担；socket read
-    (idle+30) 必须留在看门狗之后。"""
-    assert IDLE_TIMEOUT_S == 75.0
+def test_idle_watchdog_default_is_150s_balanced():
+    """46/11 #2 重审（2026-09-08）：75s→150s。
+
+    42 轮 P1-7 的 75s 快速重发以误杀健康慢流为代价（中转/弱网下 <75s 静默
+    常见）；主循环重试缝+退避在库后判死重试已是常态路径，耐心翻倍到 150s。
+    不取 DSH 的 300s：多 agent 并发放大僵尸检测代价，且必须低于 orphan
+    扫描阈值（150*1000 < STREAMING_ZOMBIE_TIMEOUT_MS）。首 token 前仍由
+    FIRST_CHUNK(90s) 承担；socket read (idle+30) 必须留在看门狗之后。"""
+    assert IDLE_TIMEOUT_S == 150.0
     assert stream_chunk_wait_s(got_event=False) == FIRST_CHUNK_TIMEOUT_S
     assert stream_chunk_wait_s(got_event=True) == IDLE_TIMEOUT_S
     assert STREAM_SOCKET_READ_TIMEOUT_S == IDLE_TIMEOUT_S + 30.0
@@ -339,7 +343,7 @@ async def test_llm_queue_ping_while_waiting_on_semaphore(monkeypatch):
     h = _H()
     provider = SimpleNamespace(
         build_url=lambda: "http://example.invalid/v1",
-        build_headers=lambda: {},
+        build_headers=lambda session_id=None: {},
         build_body=lambda **_k: {"model": "x"},
     )
     task = asyncio.create_task(

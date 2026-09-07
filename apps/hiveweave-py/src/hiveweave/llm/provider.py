@@ -19,13 +19,16 @@ Inspired by OpenCode's Protocol/Endpoint/Auth/Framing separation
 from __future__ import annotations
 
 import json
+import uuid
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import structlog
 
+from hiveweave import __version__
 from hiveweave.llm.thinking import (
     apply_anthropic_thinking,
     apply_chat_thinking,
@@ -80,6 +83,42 @@ def build_timeout() -> httpx.Timeout:
         read=READ_TIMEOUT_S,
         write=WRITE_TIMEOUT_S,
         pool=POOL_TIMEOUT_S,
+    )
+
+
+# ── opencode Go 网关会话头 ─────────────────────────────────────
+# opencode Go 网关（base_url host 为 opencode.ai，如 muse-spark 的
+# https://opencode.ai/zen/go/v1）自 2026-09-07 起强制校验 x-opencode-session：
+# 缺失即 400 MissingSessionID（上游灰度生效——同一配置当日上午仍 200，
+# 12:21 起全量 400，TEST_DSH_47 实锤）。官方契约：每个会话带稳定 id，
+# 供网关做路由与提示缓存优化（https://opencode.ai/docs/go）。
+# 会话键：agent 主对话流传 agent_id（长会话稳定）；压缩/审计/视觉/探针等
+# 平台一次性调用无会话主，退化为进程级稳定 UUID（重启换新，可接受）。
+# 顺带按文档建议带自定义 User-Agent——通用 python-httpx UA 是其
+# problem client 判定特征之一。
+
+_OPENCODE_SESSION_HEADER = "x-opencode-session"
+# 进程级兜底会话键：一次性调用共用一个稳定键，不按请求换（换太勤
+# 等于告诉网关全是新会话，路由/缓存亲和全废）。
+_opencode_fallback_session = str(uuid.uuid4())
+
+
+def _is_opencode_gateway(base_url: str | None) -> bool:
+    if not base_url:
+        return False
+    host = (urlparse(base_url).hostname or "").lower()
+    return host == "opencode.ai" or host.endswith(".opencode.ai")
+
+
+def _apply_opencode_gateway_headers(
+    headers: dict[str, str], base_url: str | None, session_id: str | None
+) -> None:
+    """opencode Go 网关请求补会话头 + 自定义 UA；其他网关 no-op。"""
+    if not _is_opencode_gateway(base_url):
+        return
+    headers.setdefault("User-Agent", f"hiveweave/{__version__}")
+    headers[_OPENCODE_SESSION_HEADER] = (
+        (session_id or "").strip() or _opencode_fallback_session
     )
 
 
@@ -1465,7 +1504,7 @@ class ProviderConfig:
     def build_url(self) -> str:
         return self._handler.build_url(self.base_url, self.model_name)
 
-    def build_headers(self) -> dict[str, str]:
+    def build_headers(self, session_id: str | None = None) -> dict[str, str]:
         headers = self._handler.build_headers(self.api_key)
         # Merge in default format headers (e.g., anthropic-version)
         defaults = self._handler.get_default_headers()
@@ -1474,6 +1513,8 @@ class ProviderConfig:
                 headers[k] = v
         # Merge in extra headers from model config
         headers.update(self._extra_headers)
+        # opencode Go 网关：补 x-opencode-session + 自定义 UA（其余网关 no-op）
+        _apply_opencode_gateway_headers(headers, self.base_url, session_id)
         return headers
 
     def build_body(

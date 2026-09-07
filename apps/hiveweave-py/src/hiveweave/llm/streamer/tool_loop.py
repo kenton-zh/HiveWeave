@@ -560,7 +560,9 @@ class ToolLoopMixin:
             # 溢出才改写前缀。未过 0.8×usable 必须 append-only，否则 DeepSeek
             # 前缀缓存从第一处 replace 整段作废。压力线先 DSH 锯齿（prune /
             # 摘要旧头），0.95 硬裁仍是 API 安全网。
-            messages = await self._pressure_compact_if_needed(messages, provider)
+            messages = await self._pressure_compact_if_needed(
+                messages, provider, session_id=agent_id
+            )
             messages = self._trim_context_if_needed(messages, provider)
 
             # 中轮提醒: 80% 轮次时注入

@@ -354,6 +354,7 @@ class ContextMixin:
         self,
         provider: ProviderConfig,
         transcript: str,
+        session_id: str | None = None,
     ) -> str | None:
         """One-shot non-tool LLM call. Empty/error → None (caller hard-trims)."""
         prompt = (
@@ -365,7 +366,7 @@ class ContextMixin:
         )
         summary_messages = [{"role": "user", "content": prompt}]
         url = provider.build_url()
-        headers = provider.build_headers()
+        headers = provider.build_headers(session_id=session_id)
         body = provider.build_body(
             messages=summary_messages,
             stream=False,
@@ -409,6 +410,7 @@ class ContextMixin:
         provider: ProviderConfig,
         *,
         summarize: Callable[[str], Awaitable[str | None]] | None = None,
+        session_id: str | None = None,
     ) -> list[dict]:
         """DSH-style step-boundary compact: prune, then LLM-summarize old head.
 
@@ -444,7 +446,7 @@ class ContextMixin:
                     summary_text = await summarize(transcript)
                 else:
                     summary_text = await self._summarize_working_set_head(
-                        provider, transcript
+                        provider, transcript, session_id=session_id
                     )
             except Exception as e:
                 log.warning("working_set_summarize_failed", error=str(e))
@@ -691,7 +693,7 @@ class ContextMixin:
         summary_messages = messages + [{"role": "user", "content": summary_prompt}]
 
         url = provider.build_url()
-        headers = provider.build_headers()
+        headers = provider.build_headers(session_id=agent_id)
         body = provider.build_body(
             messages=summary_messages,
             stream=False,

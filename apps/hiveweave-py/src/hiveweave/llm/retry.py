@@ -163,6 +163,35 @@ def matches_retryable_message(value: str) -> bool:
     return any(pattern.search(value) for pattern in _COMPILED_RETRYABLE_PATTERNS)
 
 
+# ── 地域/不可用类 fast-fail（TEST_DSH_47 #8）────────────────────
+# RegionError（模型在当前地域不可用）是确定性不可重试错误：退避重试只会
+# 把一次 7s 快死拖成 476s 慢死。必须在分类层显式 fast-fail（PermanentError），
+# 不进指数退避、不换重试预算。匹配语义与网关透传文案对齐：
+# "RegionError" / "not available in your country/region" / 地域不可用。
+_REGION_FASTFAIL_PATTERNS: tuple[str, ...] = (
+    r"regionerror",
+    r"not available in your (country|region)",
+    r"region[^a-z]{0,10}not (available|supported)",
+    r"unsupported (country|region)",
+    r"地域不可用|当前地区不可用|所在地区不支持",
+)
+
+_COMPILED_REGION_PATTERNS = tuple(
+    re.compile(p, re.IGNORECASE) for p in _REGION_FASTFAIL_PATTERNS
+)
+
+
+def is_region_unavailable_error(message: str) -> bool:
+    """是否地域/不可用类错误（确定性 fast-fail，不重试）。
+
+    TEST_DSH_47 #8：快门三遇 RegionError（476s / 7s / 10s）——首遇慢死
+    8 分钟。地域不可用是上游主责，平台侧唯一优化点是首遇 fast-fail。
+    """
+    if not message:
+        return False
+    return any(p.search(message) for p in _COMPILED_REGION_PATTERNS)
+
+
 def classify_http_error(
     status: int | None,
     body: str,
@@ -170,15 +199,21 @@ def classify_http_error(
 ) -> RetryableError | PermanentError:
     """把一次 HTTP/流错误分类为可重试或永久错误。
 
-    优先级：状态码（429 + 5xx）或 body 内容命中可重试模式 → RetryableError；
-    否则 PermanentError。用于 ``streamer/http_stream.py`` 的非 200 分支
-    和流中 error chunk —— 兜住多厂商「状态码正常但 body 包瞬态错误」的情况。
+    优先级：地域不可用（fast-fail, TEST_DSH_47 #8）> 状态码（429 + 5xx）
+    或 body 内容命中可重试模式 → RetryableError；否则 PermanentError。
+    用于 ``streamer/http_stream.py`` 的非 200 分支和流中 error chunk ——
+    兜住多厂商「状态码正常但 body 包瞬态错误」的情况。
     """
     snippet = body[:500]
     if status is not None:
         message = f"HTTP {status}: {snippet}"
     else:
         message = snippet
+    # 地域类错误确定性不可恢复：即使状态码/文案恰好命中可重试模式
+    # （如 body 里夹带 "server error"），也不重试 —— 退避只会把 7s
+    # 快死拖成 476s 慢死。
+    if is_region_unavailable_error(body):
+        return PermanentError(message, status=status)
     if (status is not None and is_retryable_status(status)) or matches_retryable_message(body):
         return RetryableError(message, status=status, headers=headers or {})
     return PermanentError(message, status=status)
