@@ -43,10 +43,10 @@ SUBAGENT_MAX_TOOL_ROUNDS = 100  # 与 run_ledger 默认 budget_tool_calls 一致
 # FAILED] 终局，父级只能空等到 wait TTL。upstream 类错误现在由
 # _run_subagent 的 attempt 循环自动退避重试。上限很小：重试窗（每次 ≤90s
 # idle 窗 + 秒级退避）必须远小于父 wait TTL（15min）与 zombie 帽（300s）。
-_SUBAGENT_STREAM_RETRIES = 1
+_SUBAGENT_STREAM_RETRIES = 2
 try:
     _SUBAGENT_STREAM_RETRIES = max(
-        0, int(os.getenv("HIVEWEAVE_SUBAGENT_STREAM_RETRIES", "1"))
+        0, int(os.getenv("HIVEWEAVE_SUBAGENT_STREAM_RETRIES", "2"))
     )
 except ValueError:
     pass

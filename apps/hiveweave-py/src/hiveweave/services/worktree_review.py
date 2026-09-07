@@ -986,6 +986,25 @@ def _looks_like_real_path(token: str) -> bool:
     return False
 
 
+def rework_feedback_missing_prescription(feedback: str | None) -> bool:
+    """Structured-only check: does rework feedback carry a way out?
+
+    Missing = no path token (via _PATH_TOKEN_RE + _looks_like_real_path)
+    AND no explicit filesChanged keyword. Over-accept by design — only
+    flag feedback with neither concrete paths nor a filesChanged
+    reference, so legitimate rework is never bounced.
+    """
+    if not feedback or not str(feedback).strip():
+        return True
+    text = str(feedback).replace("\\", "/")
+    if "fileschanged" in text.lower():
+        return False
+    for m in _PATH_TOKEN_RE.finditer(text):
+        if _looks_like_real_path(m.group(0)):
+            return False
+    return True
+
+
 def extract_acceptance_path_refs(criteria: Any) -> list[str]:
     """Extract filesystem path tokens from acceptance_criteria.
 

@@ -424,10 +424,9 @@ def test_spawn_child_env_strips_secrets_not_bash_marker(monkeypatch, tmp_path):
         def __init__(self, *args, **kwargs):
             captured["env"] = dict(kwargs.get("env") or {})
 
-    monkeypatch.setattr(
-        "hiveweave.services.process_registry.subprocess.Popen",
-        _FakePopen,
-    )
+    from hiveweave.util import win_subprocess as _wsub
+
+    monkeypatch.setattr(_wsub.subprocess, "Popen", _FakePopen)
     from hiveweave.services.process_registry import spawn_project_process
 
     proc, err, _meta = spawn_project_process(

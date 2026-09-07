@@ -14,12 +14,42 @@ import uuid
 
 import structlog
 
+from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
 
 log = structlog.get_logger(__name__)
 
 # ── Locked writes（per-workspace 写锁纪律，TEST18 审计 S1）─────────────
-from hiveweave.db.project import execute_by_project
+from hiveweave.db.project import (  # noqa: E402
+    ProjectDbError,
+    ensure_project_db,
+    execute_by_project,
+    get_workspace_write_lock,
+)
+
+
+async def _execute_rowcount(
+    project_id: str, sql: str, params: list | None = None
+) -> int:
+    """同纪律单语句写 + 返回 rowcount（execute_by_project 不返回 rowcount）。"""
+    workspace = await meta_db.get_project_workspace(project_id)
+    if not workspace:
+        raise ProjectDbError(f"Workspace not found for project {project_id}")
+    lock = await get_workspace_write_lock(workspace)
+    async with lock:
+        conn = await ensure_project_db(workspace)
+        try:
+            cur = await conn.execute(sql, params or [])
+            n = cur.rowcount or 0
+            await conn.commit()
+            await cur.close()
+            return n
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
 
 
 class StaffingDemandService:
@@ -110,15 +140,56 @@ class StaffingDemandService:
     ) -> None:
         """Cancel a staffing demand (e.g., task was abandoned)."""
         now_ms = int(time.time() * 1000)
+        suffix = f" [cancelled: {reason[:200]}]" if reason else ""
         try:
             await execute_by_project(
                 project_id,
                 "UPDATE staffing_demands SET status = 'cancelled', "
-                "fulfilled_at = ? WHERE id = ?",
-                [now_ms, demand_id],
+                "fulfilled_at = ?, reason = COALESCE(reason, '') || ? "
+                "WHERE id = ?",
+                [now_ms, suffix, demand_id],
+            )
+            log.info(
+                "staffing_demand_cancelled",
+                demand_id=demand_id,
+                reason=reason[:120],
             )
         except Exception as e:
             log.warning("staffing_demand_cancel_failed", error=str(e))
+
+    async def cancel_open_demands_for_task(
+        self, project_id: str, task_id: str,
+        reason: str = "task_closed",
+    ) -> int:
+        """Cancel all open demands tied to a task (closed/archived cleanup).
+
+        Fulfilled demands (an actual hire) are left untouched.
+        """
+        now_ms = int(time.time() * 1000)
+        suffix = f" [cancelled: {reason[:200]}]" if reason else ""
+        try:
+            n = await _execute_rowcount(
+                project_id,
+                "UPDATE staffing_demands SET status = 'cancelled', "
+                "fulfilled_at = ?, reason = COALESCE(reason, '') || ? "
+                "WHERE task_id = ? AND status = 'open'",
+                [now_ms, suffix, task_id],
+            )
+            if n:
+                log.info(
+                    "staffing_demands_cancelled_for_task",
+                    task_id=task_id,
+                    count=n,
+                    reason=reason[:120],
+                )
+            return n
+        except Exception as e:
+            log.warning(
+                "staffing_demand_cancel_for_task_failed",
+                task_id=task_id,
+                error=str(e),
+            )
+            return 0
 
 
 # Singleton

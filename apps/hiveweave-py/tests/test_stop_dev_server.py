@@ -293,9 +293,8 @@ def test_kill_pid_refuses_self(monkeypatch):
     from hiveweave.services import process_registry as pr
 
     ran: list = []
-    monkeypatch.setattr(
-        pr.subprocess, "run", lambda *a, **k: ran.append(a)
-    )
+    from hiveweave.util import win_subprocess as _wsub
+    monkeypatch.setattr(_wsub.subprocess, "run", lambda *a, **k: ran.append(a))
     with pytest.raises(PermissionError, match="protected pid"):
         pr._kill_pid(os.getpid())
     assert ran == []
@@ -311,9 +310,8 @@ def test_stop_process_by_port_refuses_protected_pid(monkeypatch):
 
     ran: list = []
     monkeypatch.setattr(pr, "_is_pid_alive", lambda pid: True)
-    monkeypatch.setattr(
-        pr.subprocess, "run", lambda *a, **k: ran.append(a)
-    )
+    from hiveweave.util import win_subprocess as _wsub
+    monkeypatch.setattr(_wsub.subprocess, "run", lambda *a, **k: ran.append(a))
     pr._registry["p1:3000"] = ProcessRecord(
         project_id="p1", port=3000, pid=os.getpid()
     )
@@ -407,7 +405,8 @@ def test_pid_is_protected_fail_closed_on_lookup_error(monkeypatch):
     )
     assert pr._pid_is_protected(424242) is True
     ran: list = []
-    monkeypatch.setattr(pr.subprocess, "run", lambda *a, **k: ran.append(a))
+    from hiveweave.util import win_subprocess as _wsub
+    monkeypatch.setattr(_wsub.subprocess, "run", lambda *a, **k: ran.append(a))
     with pytest.raises(PermissionError, match="protected pid"):
         pr._kill_pid(424242)
     assert ran == []

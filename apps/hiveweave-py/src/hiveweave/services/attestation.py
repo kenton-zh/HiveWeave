@@ -463,6 +463,49 @@ async def _commit_is_worktree_head_or_ancestor(
         return False
 
 
+async def _code_audit_attestation_stale(
+    project_id: str, agent_id: str, ch: str
+) -> tuple[bool, str]:
+    """(is_stale, reason) for a same-task code_audit attestation commit.
+
+    Stale only on positive proof: the author worktree still resolves HEAD and
+    git proves the audit commit is neither HEAD nor an ancestor (audit ran,
+    code kept moving → re-audit). When the worktree is gone (e.g. GC'd after
+    merge), fall back to the project repo: a commit merged into MAIN remains
+    valid evidence; anything git cannot prove (unknown revision, repo error)
+    is allowed rather than rejected.
+    """
+    if not ch:
+        return False, ""
+    if await _commit_is_worktree_head_or_ancestor(project_id, agent_id, ch):
+        return False, ""
+    try:
+        project_ws = await meta_db.get_project_workspace(project_id)
+    except Exception:
+        project_ws = None
+    if not project_ws or not _git_dir_present(project_ws):
+        return False, ""
+    try:
+        from hiveweave.services.git_worktree import _git
+
+        ok, _ = await _git(["cat-file", "-e", f"{ch}^{{commit}}"], project_ws)
+        if not ok:
+            return False, ""
+        ok_anc, _ = await _git(
+            ["merge-base", "--is-ancestor", ch, "HEAD"], project_ws
+        )
+        if ok_anc:
+            return False, ""
+    except Exception:
+        return False, ""
+    return (
+        True,
+        f"code_audit attestation is stale: audit commit "
+        f"{ch[:12]} is not current worktree HEAD/ancestor; "
+        "re-run request_code_audit on the current state",
+    )
+
+
 async def check_attestation_reuse_binding(
     project_id: str,
     row: dict[str, Any],
@@ -472,7 +515,10 @@ async def check_attestation_reuse_binding(
 ) -> tuple[bool, str]:
     """Task-binding matrix for explicit attestation ids (submit / waive).
 
-    Same task: allow (cross-agent pooling is a separate check in verify_ids).
+    Same task: allow, except code_audit attestations provably stale (audit
+    commit is neither the author's worktree HEAD/ancestor nor merged into the
+    project repo → audit ran, code kept moving → re-audit). Cross-agent
+    pooling is a separate check in verify_ids.
     Same agent, different task: allow if unexpired/exit already checked; when
     ``commit_hash`` is present it must be the agent's worktree HEAD or an
     ancestor (git fail → reject that dimension). Missing hash skips commit.
@@ -482,6 +528,14 @@ async def check_attestation_reuse_binding(
     if not expected_task_id or not row_task:
         return True, ""
     if await _task_ids_equal(project_id, expected_task_id, str(row_task)):
+        if row.get("kind") == "code_audit":
+            ch = str(row.get("commit_hash") or "").strip()
+            if ch:
+                stale, reason = await _code_audit_attestation_stale(
+                    project_id, str(row.get("agent_id") or ""), ch
+                )
+                if stale:
+                    return False, reason
         return True, ""
     row_agent = str(row.get("agent_id") or "")
     same_agent = bool(expected_agent_id) and row_agent == str(expected_agent_id)

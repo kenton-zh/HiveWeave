@@ -275,7 +275,9 @@ def start_offturn_job(
                 wake = _job_wake_on_complete(job_id)
                 try:
                     await await_even_if_cancelled(
-                        deliver(agent_id, job_id, body, ok=False, wake=wake)
+                        deliver(
+                            agent_id, job_id, body, ok=False, wake=wake, kind=kind
+                        )
                     )
                 except Exception as exc:
                     log.warning(
@@ -300,7 +302,9 @@ def start_offturn_job(
                 wake = _job_wake_on_complete(job_id)
                 try:
                     await await_even_if_cancelled(
-                        deliver(agent_id, job_id, body, ok=False, wake=wake)
+                        deliver(
+                            agent_id, job_id, body, ok=False, wake=wake, kind=kind
+                        )
                     )
                 except Exception as deliver_exc:
                     log.warning(
@@ -315,7 +319,9 @@ def start_offturn_job(
             wake = _job_wake_on_complete(job_id)
             try:
                 await await_even_if_cancelled(
-                    deliver(agent_id, job_id, body, ok=ok, wake=wake)
+                    deliver(
+                        agent_id, job_id, body, ok=ok, wake=wake, kind=kind
+                    )
                 )
             except Exception as deliver_exc:
                 log.warning(
@@ -410,10 +416,46 @@ async def deliver(
     *,
     ok: bool,
     wake: bool = True,
+    kind: str | None = None,
 ) -> None:
     await notify_completion(
-        agent_id, message, wake=wake, clear_ref=job_id, ok=ok
+        agent_id, message, wake=wake, clear_ref=job_id, ok=ok, kind=kind
     )
+
+
+async def _record_offturn_failure_signature(
+    agent_id: str, message: str, kind: str, clear_ref: str | None
+) -> None:
+    """Off-turn job 失败也进项目共享签名池（审计 #4：F10 hook 只包同步工具）。
+
+    best-effort：签名写入失败绝不影响投递。project_id 优先取注册表里的
+    OffturnJob.project_id（deliver 时 job 尚未 pop），兜底按 agent 反查。
+    """
+    try:
+        from hiveweave.services.failure_signature import record_failure_signature
+
+        project_id = ""
+        job = _JOBS.get((clear_ref or "").strip())
+        if job is not None:
+            project_id = job.project_id or ""
+        if not project_id:
+            project_id = (await _project_id_for(agent_id)) or ""
+        lines = (message or "").split("\n", 1)
+        error_payload = lines[1].strip() if len(lines) > 1 and lines[1].strip() else (message or "").strip()
+        await record_failure_signature(
+            project_id=project_id or None,
+            agent_id=agent_id,
+            tool_name="spawn_subagent" if kind == "subagent" else f"offturn:{kind}",
+            error=error_payload or None,
+            attribution="off-turn job failure",
+        )
+    except Exception as exc:
+        log.warning(
+            "offturn_failure_signature_failed",
+            agent_id=agent_id,
+            kind=kind,
+            error=str(exc),
+        )
 
 
 async def notify_completion(
@@ -423,6 +465,7 @@ async def notify_completion(
     wake: bool = True,
     clear_ref: str | None = None,
     ok: bool = True,
+    kind: str | None = None,
 ) -> None:
     """Land inbox + clear matching wait + one wake path (busy enqueue XOR trigger).
 
@@ -433,6 +476,8 @@ async def notify_completion(
     """
     sent: dict = {}
     busy = False
+    if not ok and kind:
+        await _record_offturn_failure_signature(agent_id, message, kind, clear_ref)
     try:
         from hiveweave.agents.supervisor import agent_manager
         from hiveweave.agents.types import AgentState

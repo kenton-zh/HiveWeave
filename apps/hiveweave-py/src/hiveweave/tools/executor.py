@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -2531,6 +2532,71 @@ async def _f10_pending_success_backfill(
 # F10（平台修复计划 2026-08-30）：失败签名广播 —— 撞到新失败签名写入项目
 # 共享空间（供其他 Agent 前置检索）；命中已知签名的错误回执附 shared-fix 提示
 # （让「先查共享空间」从文案变成行为）。
+#
+# TEST_DSH_47 #6（run 内同签名即时去重）：首撞者按 39 P1-3 设计被抑制提示
+# （正确 —— 条目是自己 2 秒前的错误原文），但 105s 后重撞同一堵墙时连
+# 「自己刚撞过」都不说。进程内记 (agent_id, sig) → 上次时间戳/次数，
+# 短窗内同签名复撞即附即时去重提示（「你 X 秒前刚问过」）。
+_LAST_SEEN_SIG: dict[str, dict[str, Any]] = {}
+_LAST_SEEN_SIG_LOCK = threading.Lock()
+#: 同签名复撞提示窗口 —— 窗内复撞视为"刚撞过"，窗外视为新一轮尝试。
+_LAST_SEEN_SIG_WINDOW_S = 600
+_LAST_SEEN_SIG_MAX_KEYS = 2000
+
+
+def _note_self_repeat_hit(agent_id: str, tool_name: str, sig: str | None) -> str:
+    """登记一次失败签名；短窗内同 agent 同签名复撞返回去重提示，否则 ""。
+
+    键 = (agent_id, run_id, sig)：签名含上下文（工具/路径），天然按"同一堵墙"
+    计数；agent_id + run id 并键防跨 agent / 跨 run 误标（105s 后同 run 复撞
+    即时去重；run_id 不可得时退回旧键结构）。纯内存 best-effort（复撞发生在
+    分钟级窗口，重启丢失无碍），容量有界。
+    """
+    if not sig:
+        return ""
+    run_id: str | None = None
+    try:
+        from hiveweave.agents.supervisor import agent_manager
+
+        agent = agent_manager.get_agent(agent_id)
+        run_id = getattr(agent, "_current_run_id", None)
+    except Exception:  # noqa: BLE001 — run id 不可得退回旧键结构
+        run_id = None
+    key = f"{agent_id}|{run_id or 'norun'}|{sig}"
+    now = time.time()
+    with _LAST_SEEN_SIG_LOCK:
+        if len(_LAST_SEEN_SIG) >= _LAST_SEEN_SIG_MAX_KEYS:
+            stale = sorted(
+                _LAST_SEEN_SIG.items(), key=lambda kv: kv[1].get("ts", 0)
+            )[: _LAST_SEEN_SIG_MAX_KEYS // 2]
+            for k, _ in stale:
+                _LAST_SEEN_SIG.pop(k, None)
+        entry = _LAST_SEEN_SIG.get(key)
+        if entry is None:
+            _LAST_SEEN_SIG[key] = {"ts": now, "count": 1, "tool": tool_name}
+            return ""
+        elapsed = now - float(entry.get("ts", now))
+        count = int(entry.get("count", 1)) + 1
+        entry.update({"ts": now, "count": count, "tool": tool_name})
+    if elapsed > _LAST_SEEN_SIG_WINDOW_S:
+        return ""
+    if elapsed < 60:
+        ago = f"{int(elapsed)} 秒前"
+    else:
+        ago = f"{elapsed / 60:.1f} 分钟前"
+    return (
+        f"[SELF REPEAT #{count} via {tool_name}] 你 {ago}刚撞过同一失败"
+        f"（{sig[:80]}）—— 同一写法原样重试无效，先读团队共享空间条目"
+        f"解法或换路执行，勿再撞同一堵墙。"
+    )
+
+
+def reset_self_repeat_hits_for_tests() -> None:
+    """测试用：清空复撞记忆。"""
+    with _LAST_SEEN_SIG_LOCK:
+        _LAST_SEEN_SIG.clear()
+
+
 async def _f10_result_hooks(
     result: dict[str, Any],
     tool_name: str,
@@ -2592,6 +2658,13 @@ async def _f10_result_hooks(
             hint = await known_signature_hint(project_id, error, agent_id=agent_id)
             if hint:
                 result["error"] = f"{result['error']}\n\n{hint}"
+        # TEST_DSH_47 #6：run 内同签名即时去重 —— 首撞者被抑制 shared-fix
+        # 提示是正确的，但复撞时至少要告诉它"自己刚撞过"。
+        _self_note = _note_self_repeat_hit(
+            agent_id, tool_name, signature_of(error)
+        )
+        if _self_note:
+            result["error"] = f"{result['error']}\n\n{_self_note}"
     except Exception as e:  # noqa: BLE001
         log.debug("f10_failure_signature_hook_failed", error=str(e))
     return result

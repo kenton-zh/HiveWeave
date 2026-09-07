@@ -864,7 +864,7 @@ async def test_job_still_live_during_deliver(
 
     live_during: list[bool] = []
 
-    async def slow_deliver(agent_id, job_id, body, *, ok, wake=True):
+    async def slow_deliver(agent_id, job_id, body, *, ok, wake=True, kind=None):
         live_during.append(ot.is_live_job(job_id))
         await asyncio.sleep(0.05)
 

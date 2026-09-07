@@ -243,10 +243,6 @@ def browse_fake_proc():
                     "hiveweave.tools.browse_tools.resolve_browse_bin",
                     return_value=Path("fake-ab.exe"),
                 ),
-                patch(
-                    "hiveweave.util.win_subprocess.windows_no_window_kwargs",
-                    return_value={},
-                ),
                 patch("asyncio.create_subprocess_exec", new=fake_exec),
             ]
             for m in self._patches:

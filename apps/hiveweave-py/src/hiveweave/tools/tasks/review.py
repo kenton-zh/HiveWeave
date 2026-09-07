@@ -679,6 +679,27 @@ async def review_task_tool(
                 "violated). Fact bit: feedback_absent=true. "
                 "RETRY[action=restate_feedback_then_rework]"
             )
+        # 审计 #10（L8）：rework 理由只断言状态（「设计文档在 MAIN 不可见」）
+        # 不给出路 → 多轮拉扯。feedback 非空但既无路径 token 也无
+        # filesChanged 关键字时硬拒，强制附处方（结构化判定，不做 NL 猜测）。
+        from hiveweave.services.worktree_review import (
+            rework_feedback_missing_prescription,
+        )
+
+        if decision == "rework" and rework_feedback_missing_prescription(
+            params.feedback
+        ):
+            return ToolResult.err(
+                "REWORK REJECTED (prescription_absent): rework feedback "
+                "states a verdict without a way out — the assignee "
+                "cannot act on it. Review the assignee worktree, not "
+                "MAIN, then rework with the concrete prescription: "
+                "name the file paths to change, e.g. "
+                "review_task(decision='rework', feedback=<what fails + "
+                "files to fix>, filesChanged=[<paths you actually "
+                "reviewed>]). Fact bit: prescription_absent=true. "
+                "RETRY[action=add_prescription_then_rework]"
+            )
         await ts.review_task(
             project_id, params.task_id, decision, params.feedback,
             reviewer_id=agent_id,
@@ -827,6 +848,14 @@ async def review_task_tool(
                                 "blocking_issues: "
                                 + "; ".join(str(x) for x in list(bis)[:5])
                             )
+                    if rework_feedback_missing_prescription(feedback):
+                        feedback = (
+                            feedback
+                            + " Prescription: the review channel is your "
+                            "worktree (not MAIN) — name the exact files to "
+                            "fix and resubmit with their real paths "
+                            "(filesChanged=[...])."
+                        )
                     msg = (
                         f"[REWORK REQUESTED] Task '{task_after.get('title', '')[:60]}' "
                         f"needs rework. Feedback: {feedback}"

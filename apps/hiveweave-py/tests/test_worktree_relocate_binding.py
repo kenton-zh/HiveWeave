@@ -324,7 +324,7 @@ async def test_vision_analyze_image_forces_supports_images() -> None:
         def build_body(self, **kwargs):
             return {"ok": True}
 
-        def build_headers(self):
+        def build_headers(self, session_id=None):
             return {}
 
         def build_url(self):

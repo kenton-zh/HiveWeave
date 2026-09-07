@@ -300,7 +300,7 @@ class _FakeProvider:
     def build_url(self) -> str:
         return "http://fake"
 
-    def build_headers(self) -> dict:
+    def build_headers(self, session_id: str | None = None) -> dict:
         return {}
 
     def build_body(self, messages=None, stream=True, tools=None) -> dict:

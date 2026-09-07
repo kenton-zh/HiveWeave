@@ -188,7 +188,7 @@ async def test_verify_gate_ceo_rework_succeeds(task_env):
     ):
         r = await review_task_tool(
             ReviewTaskParams(taskId=verify_id, decision="rework",
-                             feedback="please rerun"),
+                             feedback="please rerun tests/test_main.py"),
             agent_id=CEO, workspace=task_env["workspace"],
         )
     assert r.success, r.error

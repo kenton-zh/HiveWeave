@@ -117,6 +117,20 @@ class CloseMixin:
                 task_id=task_id,
                 error=str(e),
             )
+        # 审计 #9: 任务终态后回收悬空 staffing demand（如 VERIFY 停摆看门狗
+        # 建的 open 需求）；已 hire 兑现的 fulfilled 记录不受影响。
+        try:
+            from hiveweave.services.staffing import staffing_demand_service
+
+            await staffing_demand_service.cancel_open_demands_for_task(
+                project_id, task_id, reason="task_closed"
+            )
+        except Exception as e:
+            log.warning(
+                "staffing_demand_cancel_on_close_failed",
+                task_id=task_id,
+                error=str(e),
+            )
 
         try:
             from .ship_nudge import maybe_nudge_ceo_ship_ready
@@ -927,6 +941,20 @@ class CloseMixin:
             await ObligationLedger().cancel_for_task(project_id, task_id)
         except Exception:
             pass
+
+        # 审计 #9: 归档同理——回收任务名下悬空的 open staffing demand。
+        try:
+            from hiveweave.services.staffing import staffing_demand_service
+
+            await staffing_demand_service.cancel_open_demands_for_task(
+                project_id, task_id, reason=f"task_archived: {code}"
+            )
+        except Exception as e:
+            log.warning(
+                "staffing_demand_cancel_on_archive_failed",
+                task_id=task_id,
+                error=str(e),
+            )
 
         # TEST19 ③: 归档后立即向 assignee + creator 推送恢复指引。
         # task_event_relay 对 task.archived 跳过（避免 tick 抢跑占

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import random
 from typing import Any
@@ -111,6 +112,12 @@ from hiveweave.agents import recovery as _agent_recovery
 _MAIN_LOOP_UPSTREAM_KEYWORDS = (
     "stream idle", "ssl", "eof", "connection", "connect",
     "timed out", "timeout", "reset by peer", "broken pipe",
+)
+
+#: 主循环上游类 stream error 每 turn 重试上限（审计 #8：1 次不够，
+#: auto-retry 2 连败后仍可由既有的 429/5xx / 空响应路径接管）。
+_MAIN_LOOP_STREAM_RETRIES = int(
+    os.environ.get("HIVEWEAVE_MAIN_LOOP_STREAM_RETRIES", "2")
 )
 
 
@@ -1299,9 +1306,10 @@ class Agent:
             # 空响应重试循环
             current_messages = list(messages)
             # 46 轮 #2：上游类 stream error（75s idle / SSL EOF）主循环
-            # 边界重试——每 turn 一次（子代理侧同款语义，批次 1 已落）。
+            # 边界重试——每 turn 至多 _MAIN_LOOP_STREAM_RETRIES 次
+            # （子代理侧同款语义，批次 1 已落）。
             # 46/11 实测主循环 idle 死亡 3+8 run / 68min error run。
-            self._main_upstream_retried = False
+            self._main_upstream_attempt = 0
             while True:
                 # Unified activation budget check — stop before exceeding limits
                 _run_id = getattr(self, "_current_run_id", None)
@@ -1412,16 +1420,16 @@ class Agent:
                 if (
                     status == "error"
                     and result.get("error_status") is None
-                    and not self._main_upstream_retried
+                    and self._main_upstream_attempt < _MAIN_LOOP_STREAM_RETRIES
                 ):
                     # error_status 为 None：流内判死（idle/EOF）而非 HTTP 码——
                     # 429/5xx 有专属治理路径（quota park/熔断），勿被此缝截胡
                     err_text = str(result.get("error") or "")
                     if _is_upstream_stream_error(err_text):
-                        self._main_upstream_retried = True
+                        self._main_upstream_attempt += 1
                         from hiveweave.llm.retry import compute_backoff
 
-                        delay_s = compute_backoff(1) / 1000.0
+                        delay_s = compute_backoff(self._main_upstream_attempt) / 1000.0
                         log.warning(
                             "main_loop_stream_retry",
                             agent_id=self.id,
@@ -1828,7 +1836,7 @@ class Agent:
             stream=False,
             temperature=0.3,
         )
-        headers = provider.build_headers()
+        headers = provider.build_headers(session_id=self.id)
         headers["Accept"] = "application/json"
 
         from hiveweave.llm.streamer.constants import _get_llm_semaphore

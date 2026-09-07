@@ -216,6 +216,9 @@ async def record_failure_signature(
             for _k in ("solved_at_ms", "solution_tool"):
                 if _k in (prev_meta or {}):
                     metadata[_k] = prev_meta[_k]
+            metadata["hit_count"] = int((prev_meta or {}).get("hit_count") or 1) + 1
+        else:
+            metadata["hit_count"] = 1
         # 首撞者写入 metadata（自指抑制门的读取源）：此前只在列里存最新
         # 撞到者、metadata 不落 → 首撞者信息在 rehit 后丢失，门退化为
         # 永远放行（hint 又指回自己刚写的条目）。首撞者须跨 rehit 稳定。

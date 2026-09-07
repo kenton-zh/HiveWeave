@@ -873,6 +873,7 @@ async def run_code_audit(
                 return {
                     "audited": True,
                     "verdict": "ROLLED_BACK",
+                    "commit_hash": commit_hash,
                     "lines_audited": 0,
                     "auto_pass_reason": "empty_diff_after_issues",
                     "message": (
@@ -898,6 +899,7 @@ async def run_code_audit(
             return {
                 "audited": True,
                 "verdict": "PASS",
+                "commit_hash": commit_hash,
                 "lines_audited": 0,
                 "attestation_id": attestation_id,
                 "auto_pass_reason": "empty_diff",
@@ -957,6 +959,7 @@ async def run_code_audit(
             return {
                 "audited": True,
                 "verdict": verdict_cached,
+                "commit_hash": commit_hash,
                 "issues_count": len(cached_issues),
                 "top_issues": cached_issues[:_TOP_ISSUES_MAX],
                 "lines_audited": lines_now,
@@ -1070,6 +1073,7 @@ async def run_code_audit(
         return {
             "audited": True,
             "verdict": verdict,
+            "commit_hash": commit_hash,
             "issues_count": len(issues),
             "top_issues": issues[:_TOP_ISSUES_MAX],
             "report_path": report_path,

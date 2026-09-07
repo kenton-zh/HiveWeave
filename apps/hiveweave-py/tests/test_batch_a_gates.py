@@ -165,7 +165,8 @@ async def test_rework_with_feedback_passes(task_env, monkeypatch):
     )
     result = await review_task_tool(
         ReviewTaskParams(
-            taskId=tid, decision="rework", feedback="file X line 3 wrong"
+            taskId=tid, decision="rework",
+            feedback="src/main.py line 3 wrong"
         ),
         agent_id="reviewer-1",
         workspace=task_env["workspace"],

@@ -36,6 +36,17 @@ def _short_hash(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()[:16]
 
 
+def _summary_from_reason(result_summary: str, error_reason: str) -> str:
+    """空摘要兜底：取 error_reason 首个非空行，截 200 字符。"""
+    summary = (result_summary or "").strip()
+    if summary:
+        return summary
+    for _line in (error_reason or "").splitlines():
+        if _line.strip():
+            return _line.strip()
+    return (error_reason or "")[:200]
+
+
 class RunLedger:
     """Per-project run ledger service.
 
@@ -331,6 +342,7 @@ class RunLedger:
         run_id: str,
         reason: str,
         checkpoint_data: dict | None = None,
+        result_summary: str = "",
     ) -> None:
         """Mark a run as interrupted (timeout/error/cancel).
 
@@ -338,12 +350,13 @@ class RunLedger:
         """
         now = _now_ms()
         checkpoint_json = json.dumps(checkpoint_data, ensure_ascii=False) if checkpoint_data else None
+        summary = _summary_from_reason(result_summary, reason)
         try:
             await project_db.execute(
                 agent_id,
                 "UPDATE agent_runs SET status = 'interrupted', ended_at = ?, "
-                "error_reason = ?, checkpoint_data = ? WHERE id = ?",
-                [now, reason[:500], checkpoint_json, run_id],
+                "error_reason = ?, result_summary = ?, checkpoint_data = ? WHERE id = ?",
+                [now, reason[:500], summary[:500], checkpoint_json, run_id],
             )
         except Exception as e:
             log.warning("run_ledger.interrupt_run_failed", error=str(e))
@@ -353,15 +366,22 @@ class RunLedger:
         agent_id: str,
         run_id: str,
         error_reason: str,
+        result_summary: str = "",
     ) -> None:
-        """Mark a run as errored."""
+        """Mark a run as errored.
+
+        TEST_DSH_47 #2: error runs previously left ``result_summary`` NULL,
+        making idle/400-class deaths invisible to token/wall-clock tax
+        accounting. Always land a one-line summary alongside the reason.
+        """
         now = _now_ms()
+        summary = _summary_from_reason(result_summary, error_reason)
         try:
             await project_db.execute(
                 agent_id,
                 "UPDATE agent_runs SET status = 'error', ended_at = ?, "
-                "error_reason = ? WHERE id = ?",
-                [now, error_reason[:500], run_id],
+                "error_reason = ?, result_summary = ? WHERE id = ?",
+                [now, error_reason[:500], summary[:500], run_id],
             )
         except Exception as e:
             log.warning("run_ledger.error_run_failed", error=str(e))
