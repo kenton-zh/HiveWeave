@@ -142,10 +142,12 @@ export const ASSET_URLS = {
   OFFICE_DESK_BACK: "/office-assets/office-desk-back.png?v=chair2",
   OFFICE_DESK_FRONT: "/office-assets/office-desk-front.png?v=chair2",
   OFFICE_FRONTDESK_SET: "/office-assets/office-frontdesk-set.png",
-  /** 紫衣女孩打字动画表（2026-08-30：参考图锚定生成，2×2 = 4 帧打字循环。
-   *  实测为全身坐姿帧（非腰截断）：内容底 y=83 ≈ anchor 0.875×96=84，即 0.875 处是鞋底；
-   *  腿部由桌套件 front 片在运行时遮挡） */
-  AGENT_PURPLE: "/office-assets/agent-purple-typing-sheet.png",
+  /** 紫衣女孩动画表 v2（2026-09-08：MiniMax H3 本地视频生成抽帧，4×2 = 8 帧全
+   *  身坐姿 96×96：帧 0-3 打字循环、帧 4-7 坐姿呼吸。侧视朝左（与 v1 同向），
+   *  内容底 y=84 = anchor 0.875 鞋底；打字/坐姿两组共用同一联合 bbox 摆放，
+   *  切换动作不缩放不跳动。腿部仍由桌套件 front 片运行时遮挡。）
+   *  v1（4 帧打字）备份于 agent-purple-typing-sheet.png。 */
+  AGENT_PURPLE: "/office-assets/agent-purple-anim-sheet.png?v=h3v1",
 } as const;
 
 /** 全部需预载的资产 URL（OfficeScene.mount 中统一 Assets.load） */
@@ -177,24 +179,23 @@ export const SHEET_LAYOUTS: Record<string, SheetLayout> = {
   [ASSET_URLS.AGENT_DEV]: { cols: 8, rows: 4, frameW: 64, frameH: 96, scale: 0.8, scaleMode: "nearest" },
   [ASSET_URLS.AGENT_MANAGER]: { cols: 4, rows: 3, frameW: 32, frameH: 48, scale: 1.6, scaleMode: "nearest" },
   [ASSET_URLS.AGENT_QA]: { cols: 4, rows: 3, frameW: 32, frameH: 48, scale: 1.6, scaleMode: "nearest" },
-  [ASSET_URLS.AGENT_PURPLE]: { cols: 2, rows: 2, frameW: 96, frameH: 96, scale: 0.8, scaleMode: "nearest" },
+  [ASSET_URLS.AGENT_PURPLE]: { cols: 4, rows: 2, frameW: 96, frameH: 96, scale: 0.8, scaleMode: "nearest" },
 };
 
 /**
- * 紫衣女孩动画帧表（2×2 = 4 帧打字循环；只有 A 朝向坐姿）。
- * 演示模式：idle 也循环打字帧（每张桌的女孩持续打字）；
- * 坐下/起身系列指向静态帧 0（该 sheet 无此动作，sitPhase 不产生视觉跳变）。
+ * 紫衣女孩动画帧表 v2（4×2 = 8 帧：0-3 打字循环、4-7 坐姿呼吸，均侧视朝左）。
+ * working/idle/working→呼吸 在两套坐姿动作间切换；坐下/起身无独立帧，指向静态帧。
  */
 export const PURPLE_ANIM_SEQS: Record<AgentAnimKey, number[]> = {
-  idle: [0, 1, 2, 3],
+  idle: [4, 5, 6, 7],
   walking: [0],
   working: [0, 1, 2, 3],
-  talking: [0],
+  talking: [4, 5, 6, 7],
   alert: [0],
   sitdown: [0],
-  sitting: [0, 1, 2, 3],
+  sitting: [4, 5, 6, 7],
   sitdown_b: [0],
-  sitting_b: [0],
+  sitting_b: [4, 5, 6, 7],
   getup: [0],
 };
 
@@ -202,24 +203,12 @@ export const PURPLE_ANIM_SEQS: Record<AgentAnimKey, number[]> = {
 export const PURPLE_DEMO_ALL_AGENTS = true;
 
 /**
- * 单角色动画演示开关：指定 `startIndex` 起的 1 个角色（按 org tree id 排序后）
- * 切回 dev 满帧 sheet（呼吸/行走/打字/喝咖啡/点头/跳跃/问号/坐下/坐姿/起身），
- * 让其能基于 FSM 状态驱动出可见的多姿态切换。
+ * 单角色动画演示开关（历史：true 时索引 0 切回 dev 满帧 sheet 跑 FSM 全状态）。
  *
- * 设计动机：紫衣女孩 sheet 只有 4 帧打字循环，没有 idle/walking/talking/alert 分态；
- * 单一 sprite 永远「卡在打字」无法体现整个动画系统的能力。先让一名角色跑起来 →
- * 验证 dev sheet + FSM + DEV_ANIM_SEQS 全链路通畅 → 后续按角色正式上线时
- * 把 PURPLE_DEMO_ALL_AGENTS = false 即可全员就位。
- */
-/**
- * 单角色动画演示开关：指定索引 0 的角色（按 org tree id 排序后）切回 dev 满帧 sheet
- * （呼吸/行走/打字/喝咖啡/点头/跳跃/问号/坐下/坐姿/起身），让其基于 FSM 状态驱动出
- * 可见的多姿态切换；其余角色仍用紫衣 sheet 保持视觉统一。
- *
- * 设计动机：紫衣 sheet 只有 4 帧打字循环，且 idle/working 指向同一序列，
- * 角色永远「卡在打字」，无法体现整个动画系统的能力。先让一名角色跑通
- * dev sheet + FSM + DEV_ANIM_SEQS 全链路，后续全员上线时把
- * PURPLE_DEMO_ALL_AGENTS = false 即可按角色就位。
+ * 2026-09-08 起恒为 **false**：紫衣 sheet v2（H3 本地视频生成，4×2=8 帧）已有
+ * 打字 / 坐姿呼吸两套坐姿动作，0 号角色直接穿紫衣 v2，由 OfficeScene._tick 的
+ * index===0 演示周期驱动「打字 ↔ 呼吸」切换，dev 满帧演示下线。
+ * （若要恢复 dev 演示，改回 true 即可——_syncActors/_tick 两处按此常量分支。）
  *
  * ── 视角 / 遮挡硬约束（改动前务必读）─────────────────────────
  * 1. 接待员走 A（柜台后，无椅）。工位紫衣走 B（近侧可见椅）：zIndex = base+1
@@ -228,11 +217,11 @@ export const PURPLE_DEMO_ALL_AGENTS = true;
  * 2. 演示循环只在**坐姿系**状态间切换（working 打字 ↔ idle 坐姿呼吸），
  *    绝不触发 walking / talking / alert：
  *      - walking 序列会驱动角色离座平移，坐姿与桌面的遮挡关系当场失效；
- *      - talking/alert 序列在 dev sheet 中是站姿/跳跃帧，一旦播放人物会
- *        整个浮到桌面之上。
+ *      - walking 表项当前指向静态帧 0（紫衣 v2 无行走帧；行走 sheet 已入库
+ *        agent-purple-walk-*.png，未接线——接线前必须先做漫游状态机）。
  * 3. 角色位置冻结在座位上（atDesk 恒 true），不做 roaming / 聚集位移。
  */
-export const FIRST_AGENT_FULL_ANIMATIONS = true;
+export const FIRST_AGENT_FULL_ANIMATIONS = false;
 /** 演示模式：一个完整「打字 → 停歇呼吸」周期的时长（毫秒） */
 export const FIRST_AGENT_DEMO_CYCLE_MS = 9000;
 /** 演示模式：周期内处于「打字」状态的时长（毫秒）；剩余时间走坐姿呼吸 */
