@@ -10,12 +10,13 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from hiveweave.util.win_subprocess import Popen
 
 import structlog
 
@@ -375,8 +376,10 @@ def listening_ports_for_pid(pid: int | None) -> list[int]:
     if not tree:
         tree = {n}
     try:
+        from hiveweave.util.win_subprocess import hidden_run
+
         if os.name == "nt":
-            r = subprocess.run(
+            r = hidden_run(
                 ["netstat", "-ano", "-p", "tcp"],
                 capture_output=True,
                 text=True,
@@ -386,7 +389,7 @@ def listening_ports_for_pid(pid: int | None) -> list[int]:
             )
             return parse_netstat_listen_ports(r.stdout or "", tree)
         pid_list = ",".join(str(p) for p in sorted(tree))
-        r = subprocess.run(
+        r = hidden_run(
             [
                 "lsof", "-nP", "-a", "-p", pid_list,
                 "-iTCP", "-sTCP:LISTEN",
@@ -485,7 +488,9 @@ def _kill_pid(pid: int) -> None:
         log.warning("process_kill_refused_protected_pid", pid=n)
         raise PermissionError(f"refusing to kill protected pid {n}")
     if os.name == "nt":
-        subprocess.run(
+        from hiveweave.util.win_subprocess import hidden_run
+
+        hidden_run(
             ["taskkill", "/F", "/T", "/PID", str(n)],
             capture_output=True,
             timeout=10,
@@ -496,7 +501,7 @@ def _kill_pid(pid: int) -> None:
         os.kill(n, signal.SIGTERM)
 
 
-def terminate_spawned(proc: subprocess.Popen | None) -> None:
+def terminate_spawned(proc: Popen | None) -> None:
     """Kill a spawn_project_process tree. Best-effort; never raises."""
     if proc is None:
         return
@@ -930,7 +935,7 @@ def spawn_project_process(
     preferred_port: int = 3000,
     env: dict[str, str] | None = None,
     **popen_kwargs: Any,
-) -> tuple[subprocess.Popen | None, str | None, dict[str, Any]]:
+) -> tuple[Popen | None, str | None, dict[str, Any]]:
     """Spawn with reserved-port proxy. Returns (proc, error, meta)."""
     cmd, extra_env, err, _inj_meta = prepare_spawn_command(
         command, project_id=project_id, preferred_port=preferred_port
@@ -941,6 +946,7 @@ def spawn_project_process(
     # 白名单 env：不 copy 父进程（会把 API 密钥带进 dev server）。
     # 不用 bash 的 HIVEWEAVE_BASH 标记 —— spawn 不是 bash 工具。
     from hiveweave.util.safe_env import build_child_env
+    from hiveweave.util.win_subprocess import hidden_popen
 
     child_env = build_child_env(cwd or "", bash_markers=False)
     if env:
@@ -949,21 +955,18 @@ def spawn_project_process(
     creationflags = popen_kwargs.pop("creationflags", 0)
     if os.name == "nt":
         from hiveweave.util.win_subprocess import (
+            CREATE_NEW_PROCESS_GROUP,
             merge_creationflags,
-            windows_no_window_kwargs,
         )
-        import subprocess as _sp
 
-        base = creationflags or getattr(_sp, "CREATE_NEW_PROCESS_GROUP", 0)
+        base = creationflags or CREATE_NEW_PROCESS_GROUP
         creationflags = merge_creationflags(base)
         # Hidden console for the whole tree — CREATE_NO_WINDOW alone would
         # let console grandchildren (node/bun/vite) allocate visible windows.
-        popen_kwargs.setdefault(
-            "startupinfo", windows_no_window_kwargs().get("startupinfo")
-        )
+        # hidden_popen injects the SW_HIDE startupinfo when none is supplied.
 
     try:
-        proc = subprocess.Popen(
+        proc = hidden_popen(
             cmd,
             cwd=cwd,
             shell=True,

@@ -1590,7 +1590,6 @@ class GameTimeService:
                     # 跳过脚本执行，继续后续 inbox 通知
                 else:
                     safe_env = filtered_environ()
-                    from hiveweave.util.win_subprocess import windows_no_window_kwargs
 
                     # Security: 用 create_subprocess_exec + shlex.split 取代
                     # create_subprocess_shell，避免 shell=True 的 prompt injection
@@ -1634,7 +1633,7 @@ class GameTimeService:
                             from hiveweave.services.acl_sandbox.service import (
                                 spawn_confined,
                             )
-                            import subprocess as _sp
+                            from hiveweave.util.win_subprocess import list2cmdline
 
                             project_root = await resolve_project_root(project_id_here)
                             if not project_root:
@@ -1664,16 +1663,13 @@ class GameTimeService:
 
                         if confined is None:
                             safe_env = filtered_environ()
-                            from hiveweave.util.win_subprocess import (
-                                windows_no_window_kwargs,
-                            )
+                            from hiveweave.util.win_subprocess import hidden_exec
 
-                            proc = await asyncio.create_subprocess_exec(
+                            proc = await hidden_exec(
                                 *cmd_parts,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                                 env=safe_env,
-                                **windows_no_window_kwargs(),
                             )
                             stdout, stderr = await asyncio.wait_for(
                                 proc.communicate(), timeout=120

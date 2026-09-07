@@ -1463,7 +1463,6 @@ async def delete_project(project_id: str) -> dict:
             import gc
             import shutil
             import stat
-            import subprocess
             import time as _time
 
             def _on_error(func, path, exc_info):
@@ -1502,17 +1501,14 @@ async def delete_project(project_id: str) -> dict:
                     # ignore_errors=True: 即使部分文件失败也继续，避免中途退出
                     shutil.rmtree(str(hw_dir), ignore_errors=True)
                     # 再用 rmdir 清理残留的空目录结构
-                    from hiveweave.util.win_subprocess import (
-                        windows_no_window_kwargs,
-                    )
+                    from hiveweave.util.win_subprocess import hidden_run
 
-                    result = subprocess.run(
+                    result = hidden_run(
                         ["cmd", "/c", "rmdir", "/s", "/q", str(hw_dir)],
                         capture_output=True, text=True, timeout=30,
                         # cmd 输出跟随系统 ANSI 代码页（中文机为 GBK），
                         # 显式 locale 解码 + replace 防 illegal sequence 崩线程
                         errors="replace",
-                        **windows_no_window_kwargs(),
                     )
                     if not hw_dir.exists():
                         _rmtree_ok = True

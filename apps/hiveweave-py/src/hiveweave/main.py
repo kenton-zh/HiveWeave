@@ -227,7 +227,6 @@ async def _scan_legacy_stash_warnings() -> None:
     """P1-2 行为层补：启动后提醒遗留 git stash（r2/r3 实证 stash@{0}
     滞留两轮、.gitignore 人机拉锯重演）。只读扫描 + 聚合 warning，不阻塞。"""
     import sqlite3
-    import subprocess
 
     try:
         conn = sqlite3.connect(settings.get_meta_db_path())
@@ -243,7 +242,9 @@ async def _scan_legacy_stash_warnings() -> None:
         if not ws or not Path(ws).exists():
             continue
         try:
-            out = subprocess.run(
+            from hiveweave.util.win_subprocess import hidden_run
+
+            out = hidden_run(
                 ["git", "-C", ws, "stash", "list"],
                 capture_output=True, text=True, timeout=10,
                 encoding="utf-8", errors="replace",

@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import time
 from pathlib import Path
 
@@ -24,8 +23,10 @@ _GIT_TIMEOUT_S = 10
 
 def _git(args: list[str], cwd: str) -> tuple[bool, str]:
     """Run a git command, return (ok, stripped stdout)."""
+    from hiveweave.util.win_subprocess import hidden_run
+
     try:
-        r = subprocess.run(
+        r = hidden_run(
             ["git", *args],
             cwd=cwd,
             capture_output=True,

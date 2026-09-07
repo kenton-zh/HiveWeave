@@ -86,13 +86,12 @@ async def _try_ripgrep(
     args.extend(["-e", pattern, cwd])
 
     try:
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+        from hiveweave.util.win_subprocess import hidden_exec
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await hidden_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **windows_no_window_kwargs(),
         )
     except FileNotFoundError:
         return None

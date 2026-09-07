@@ -76,16 +76,15 @@ async def _resolve_interpreter(workspace: str) -> str:
 async def _run_native_argv(argv: list[str], cwd: str, timeout_s: int | None) -> dict[str, Any]:
     """native 执行：create_subprocess_exec 直传 argv（不经过壳层）。"""
     try:
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+        from hiveweave.util.win_subprocess import hidden_exec
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await hidden_exec(
             *argv,
             cwd=cwd,
             env=os.environ.copy(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
-            **windows_no_window_kwargs(),
         )
     except (FileNotFoundError, OSError) as exc:
         return {"output": "", "stdout": "", "stderr": "",

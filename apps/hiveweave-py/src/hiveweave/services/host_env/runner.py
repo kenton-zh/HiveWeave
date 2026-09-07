@@ -17,11 +17,12 @@
 from __future__ import annotations
 
 import asyncio
-import subprocess
 import threading
 from typing import Any
 
 import structlog
+
+from hiveweave.util.win_subprocess import CompletedProcess, TimeoutExpired
 
 from .registry import all_entries, get_entry
 from .types import CapabilityUnavailableError, ProbeResult, ProbeTiming
@@ -92,7 +93,7 @@ def run_command(
     timeout_s: float,
     cwd: str | None = None,
     encoding: str = "utf-8",
-) -> subprocess.CompletedProcess:
+) -> CompletedProcess:
     """探测用子进程执行（同步，带超时）。探不到/超时 → CapabilityUnavailableError。
 
     这是探测函数的唯一执行缝 —— 测试 monkeypatch 这里即可模拟任意命令结果，
@@ -105,22 +106,21 @@ def run_command(
     reject_bad_timeout(timeout_s, argv[0] if argv else "run_command")
     # SW_HIDE startupinfo（不用 CREATE_NO_WINDOW —— 孙进程会弹新控制台，
     # 见 util/win_subprocess.py 顶部注释）。
-    from hiveweave.util.win_subprocess import windows_no_window_kwargs
+    from hiveweave.util.win_subprocess import hidden_run
 
     try:
-        raw = subprocess.run(
+        raw = hidden_run(
             argv,
             capture_output=True,
             timeout=timeout_s,
             cwd=cwd,
             check=False,
-            **windows_no_window_kwargs(),
         )
     except FileNotFoundError as e:
         raise CapabilityUnavailableError(
             f"{argv[0]} not found on PATH", probe=argv[0], reason="not-found"
         ) from e
-    except subprocess.TimeoutExpired as e:
+    except TimeoutExpired as e:
         raise CapabilityUnavailableError(
             f"{argv[0]} timed out after {timeout_s}s",
             probe=argv[0],
@@ -131,7 +131,7 @@ def run_command(
     # 抓字节自己 replace 解码（与 git_cmd.py 同款）；ASCII 版本号无损，
     # 本地化输出的解码页由调用方用 encoding 指定（icacls → mbcs）。
     dec = encoding or "utf-8"
-    return subprocess.CompletedProcess(
+    return CompletedProcess(
         argv,
         raw.returncode,
         stdout=(raw.stdout or b"").decode(dec, errors="replace"),

@@ -177,9 +177,9 @@ class _StdioTransport:
         from hiveweave.util.safe_env import filtered_environ
 
         env = filtered_environ(self.env)
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+        from hiveweave.util.win_subprocess import hidden_exec
 
-        self._proc = await asyncio.create_subprocess_exec(
+        self._proc = await hidden_exec(
             self.command,
             *self.args,
             stdin=asyncio.subprocess.PIPE,
@@ -187,7 +187,6 @@ class _StdioTransport:
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=self.cwd or None,
-            **windows_no_window_kwargs(),
         )
         log.info(
             "mcp_stdio_spawned",

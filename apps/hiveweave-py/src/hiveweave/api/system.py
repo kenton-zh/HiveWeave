@@ -12,12 +12,13 @@ from __future__ import annotations
 import os
 import platform
 import shlex
-import subprocess
 import sys
 import tempfile
 
 from fastapi import APIRouter, HTTPException, Query
 import structlog
+
+from hiveweave.util.win_subprocess import DEVNULL
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 log = structlog.get_logger(__name__)
@@ -62,22 +63,26 @@ def _spawn_detached(argv: list[str], cwd: str) -> None:
     """跨平台 detached 启动包装器。"""
     kwargs: dict = {
         "cwd": cwd,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "stdin": subprocess.DEVNULL,
+        "stdout": DEVNULL,
+        "stderr": DEVNULL,
+        "stdin": DEVNULL,
     }
     if _IS_WINDOWS:
-        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP 仅在 Windows subprocess 上存在
-        detached = getattr(subprocess, "DETACHED_PROCESS", 0)
-        new_pgrp = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        kwargs["creationflags"] = detached | new_pgrp
+        from hiveweave.util.win_subprocess import (
+            CREATE_NEW_PROCESS_GROUP,
+            DETACHED_PROCESS,
+        )
+
+        kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
         # POSIX: start_new_session=True → setsid() 脱离父进程组，
         # 行为等价于 nohup + & ，父进程退出不影响子进程
         kwargs["start_new_session"] = True
         # close_fds=True 释放继承的 fd
         kwargs["close_fds"] = True
-    subprocess.Popen(argv, **kwargs)
+    from hiveweave.util.win_subprocess import hidden_popen
+
+    hidden_popen(argv, **kwargs)
 
 
 @router.post("/restart-backend")

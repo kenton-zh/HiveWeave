@@ -43,6 +43,10 @@ from typing import Any
 import structlog
 
 from hiveweave.services.task_contract import ClauseResult
+from hiveweave.util.win_subprocess import (
+    hidden_exec,
+    hidden_shell,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -174,7 +178,7 @@ async def run_service_smoke_clause(
         log_f = open(log_path, "ab")
         # POSIX: start_new_session=True 让服务带独立进程组，清理时可 killpg
         # 整树；Windows 走 taskkill /T（见 finally）。
-        service_proc = await asyncio.create_subprocess_shell(
+        service_proc = await hidden_shell(
             start_cmd,
             cwd=str(root),
             stdout=log_f,
@@ -221,7 +225,7 @@ async def run_service_smoke_clause(
         if deps:
             with_flags = " ".join(f"--with {d}" for d in deps)
             script_cmd = f'uv run {with_flags} python "{script_abs}"'
-            probe = await asyncio.create_subprocess_shell(
+            probe = await hidden_shell(
                 script_cmd,
                 cwd=str(root),
                 stdout=asyncio.subprocess.PIPE,
@@ -229,7 +233,7 @@ async def run_service_smoke_clause(
                 env=env2,
             )
         else:
-            probe = await asyncio.create_subprocess_exec(
+            probe = await hidden_exec(
                 sys.executable, str(script_abs),
                 cwd=str(root),
                 stdout=asyncio.subprocess.PIPE,
@@ -280,7 +284,7 @@ async def run_service_smoke_clause(
         try:
             if os.name == "nt":
                 if service_proc is not None:
-                    killer = await asyncio.create_subprocess_exec(
+                    killer = await hidden_exec(
                         "taskkill", "/PID", str(service_proc.pid), "/T", "/F",
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
@@ -340,7 +344,7 @@ async def _kill_port_holder(port: int) -> None:
     if os.name != "nt":
         return
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await hidden_exec(
             "netstat", "-ano", "-p", "TCP",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -356,7 +360,7 @@ async def _kill_port_holder(port: int) -> None:
             pids.add(parts[4])
     for pid in pids:
         try:
-            killer = await asyncio.create_subprocess_exec(
+            killer = await hidden_exec(
                 "taskkill", "/PID", pid, "/T", "/F",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,

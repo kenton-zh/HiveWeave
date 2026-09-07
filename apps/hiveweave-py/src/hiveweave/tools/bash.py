@@ -403,10 +403,10 @@ async def _run_registered_dev_server(
 
     commit = ""
     try:
-        import subprocess as _sp
+        from hiveweave.util.win_subprocess import hidden_run
 
         r = await asyncio.to_thread(
-            _sp.run,
+            hidden_run,
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=cwd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=5,
@@ -1493,9 +1493,9 @@ async def _kill_subprocess(proc) -> None:
     pid = getattr(proc, "pid", None)
     try:
         if pid and sys.platform.startswith("win"):
-            from hiveweave.util.win_subprocess import windows_no_window_kwargs
+            from hiveweave.util.win_subprocess import hidden_exec
 
-            killer = await asyncio.create_subprocess_exec(
+            killer = await hidden_exec(
                 "taskkill",
                 "/F",
                 "/T",
@@ -1503,7 +1503,6 @@ async def _kill_subprocess(proc) -> None:
                 str(pid),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
-                **windows_no_window_kwargs(),
             )
             try:
                 await asyncio.wait_for(killer.wait(), timeout=2.0)
@@ -1565,16 +1564,15 @@ async def _run_native(
     env = _build_safe_env(cwd)
 
     try:
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+        from hiveweave.util.win_subprocess import hidden_exec
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await hidden_exec(
             *shell_args,
             cwd=cwd,
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
-            **windows_no_window_kwargs(),
         )
     except FileNotFoundError as exc:
         return {"output": "", "stdout": "", "stderr": "",
@@ -2662,16 +2660,15 @@ async def _issue_test_run_attestation(
     commit_hash: str | None = None
     if stamp_workspace:
         try:
-            from hiveweave.util.win_subprocess import windows_no_window_kwargs
+            from hiveweave.util.win_subprocess import hidden_exec
 
-            proc = await asyncio.create_subprocess_exec(
+            proc = await hidden_exec(
                 "git",
                 "rev-parse",
                 "HEAD",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
                 cwd=stamp_workspace,
-                **windows_no_window_kwargs(),
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             if proc.returncode == 0 and out:

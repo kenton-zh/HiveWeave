@@ -44,6 +44,13 @@ from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
 
 CREATE_SUSPENDED = win32con.CREATE_SUSPENDED if win32con is not None else 0
 STARTF_USESTDHANDLES = win32con.STARTF_USESTDHANDLES if win32con is not None else 0
+# frozen EXE 是 GUI 子系统进程（console=False），自身无控制台：受限子进程若
+# 不带 USESHOWWINDOW|SW_HIDE，conhost 每次都新开一个可见控制台窗口（闪黑框，
+# 命令结束才消失——2026-09-07 EXE 首包实锤）。与 util/win_subprocess 同款
+# 语义：用 SW_HIDE 而非 CREATE_NO_WINDOW，孙进程（node/git/uv）继承的是
+# 隐藏控制台，整棵进程树都不出窗。
+STARTF_USESHOWWINDOW = win32con.STARTF_USESHOWWINDOW if win32con is not None else 0
+SW_HIDE = win32con.SW_HIDE if win32con is not None else 0
 HANDLE_FLAG_INHERIT = win32con.HANDLE_FLAG_INHERIT if win32con is not None else 0
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _JOB_INFO_CLASS = 9  # JobObjectExtendedLimitInformation
@@ -181,7 +188,8 @@ def _spawn_sync(token, command: str | None = None, cwd: str = ".", env: dict | N
 
         job = _make_kill_on_close_job()
         si = win32process.STARTUPINFO()
-        si.dwFlags = STARTF_USESTDHANDLES
+        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW
+        si.wShowWindow = SW_HIDE
         si.hStdInput = in_r
         si.hStdOutput = out_w
         si.hStdError = err_w

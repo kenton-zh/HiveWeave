@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 import time
 from pathlib import Path
 
@@ -12,6 +11,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from hiveweave.tools.base import tool
+from hiveweave.util.win_subprocess import STDOUT
 from hiveweave.tools.result import ToolResult
 from hiveweave.tools.helpers import get_project_id
 from hiveweave.util.tree_label import cwd_display
@@ -310,7 +310,7 @@ async def start_dev_server_tool(
             project_id=project_id,
             preferred_port=port,
             stdout=log_file,
-            stderr=subprocess.STDOUT,
+            stderr=STDOUT,
             **({"env": params.env} if params.env else {}),
         )
         if spawn_err or proc is None:
@@ -385,10 +385,10 @@ async def start_dev_server_tool(
 
     commit = ""
     try:
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+        from hiveweave.util.win_subprocess import hidden_run
 
         r = await asyncio.to_thread(
-            subprocess.run,
+            hidden_run,
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=workspace,
             capture_output=True,
@@ -396,7 +396,6 @@ async def start_dev_server_tool(
             encoding="utf-8",
             errors="replace",
             timeout=5,
-            **windows_no_window_kwargs(),
         )
         if r.returncode == 0:
             commit = (r.stdout or "").strip()

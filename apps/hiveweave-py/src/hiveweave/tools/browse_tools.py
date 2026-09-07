@@ -177,16 +177,15 @@ async def _maybe_git_commit(workspace: str) -> str | None:
     if not workspace or not Path(workspace).is_dir():
         return None
     try:
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+        from hiveweave.util.win_subprocess import hidden_exec
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await hidden_exec(
             "git",
             "rev-parse",
             "HEAD",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=workspace,
-            **windows_no_window_kwargs(),
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         if proc.returncode == 0 and out:
@@ -761,7 +760,7 @@ async def browse_exec(
 
     cmd = [str(bin_path), *mapped]
     cwd = workspace if workspace and Path(workspace).is_dir() else None
-    from hiveweave.util.win_subprocess import windows_no_window_kwargs
+    from hiveweave.util.win_subprocess import hidden_exec
 
     # 用临时文件重定向替代 asyncio PIPE（agent-browser Windows 已知缺陷，
     # issue #1407/#1308：CLI spawn daemon 用 bInheritHandles=TRUE，daemon 继承
@@ -784,14 +783,13 @@ async def browse_exec(
                 except (OSError, ValueError):
                     pass
                 stdin_f = None
-        proc = await asyncio.create_subprocess_exec(
+        proc = await hidden_exec(
             *cmd,
             stdout=stdout_f,
             stderr=stderr_f,
             stdin=stdin_f if stdin_f is not None else asyncio.subprocess.DEVNULL,
             cwd=cwd,
             env=_browse_child_env(agent_id),
-            **windows_no_window_kwargs(),
         )
         try:
             rc = await asyncio.wait_for(proc.wait(), timeout=timeout)
@@ -848,7 +846,7 @@ async def _hard_recycle_browser() -> str:
     recycling is safe even if another agent's session is torn down too.
     """
     from hiveweave.config import agent_browser_bin_name
-    from hiveweave.util.win_subprocess import windows_no_window_kwargs
+    from hiveweave.util.win_subprocess import hidden_exec
 
     bin_name = agent_browser_bin_name()
     # taskkill /IM (或 pkill -f) 杀掉的是**所有** agent-browser daemon ——
@@ -858,11 +856,10 @@ async def _hard_recycle_browser() -> str:
     try:
         if os.name == "nt":
             # 1) Daemon + its Chromium tree (taskkill /T is recursive).
-            p = await asyncio.create_subprocess_exec(
+            p = await hidden_exec(
                 "taskkill", "/F", "/T", "/IM", bin_name,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
-                **windows_no_window_kwargs(),
             )
             try:
                 await asyncio.wait_for(p.wait(), timeout=20)
@@ -878,11 +875,10 @@ async def _hard_recycle_browser() -> str:
                 "ForEach-Object { Stop-Process -Id $_.ProcessId "
                 "-Force -ErrorAction SilentlyContinue }"
             )
-            q = await asyncio.create_subprocess_exec(
+            q = await hidden_exec(
                 "powershell", "-NoProfile", "-Command", ps,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
-                **windows_no_window_kwargs(),
             )
             try:
                 await asyncio.wait_for(q.wait(), timeout=20)
@@ -896,7 +892,7 @@ async def _hard_recycle_browser() -> str:
             # Chromium (user-data-dir marker) — SIGKILL on the daemon does not
             # propagate to reparented Chromium, mirroring the Windows step.
             for pat in (bin_name, "agent-browser-chrome-"):
-                p = await asyncio.create_subprocess_exec(
+                p = await hidden_exec(
                     "pkill", "-9", "-f", pat,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,

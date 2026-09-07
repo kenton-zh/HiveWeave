@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -94,7 +93,9 @@ def ensure_project_venv(workspace: str | Path | None) -> bool:
         if not venv_dir.exists():
             uv = shutil.which("uv")
             if uv:
-                subprocess.run(
+                from hiveweave.util.win_subprocess import hidden_run
+
+                hidden_run(
                     [uv, "venv", str(venv_dir), "--quiet"],
                     check=True,
                     capture_output=True,
@@ -186,7 +187,9 @@ async def install_project_deps_async(
         }
     cmd = ["uv", "pip", "install", "--python", str(_venv_python(venv_dir)), *ok_deps]
     try:
-        proc = await asyncio.create_subprocess_exec(
+        from hiveweave.util.win_subprocess import hidden_exec
+
+        proc = await hidden_exec(
             *cmd,
             cwd=str(venv_dir.parent),
             stdout=asyncio.subprocess.PIPE,

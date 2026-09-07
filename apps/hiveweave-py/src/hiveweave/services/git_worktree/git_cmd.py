@@ -11,15 +11,14 @@ async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT) -> tuple
     stderr merged into stdout (mirrors Elixir stderr_to_stdout: true).
     """
     try:
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+        from hiveweave.util.win_subprocess import hidden_exec
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await hidden_exec(
             "git",
             *args,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            **windows_no_window_kwargs(),
         )
     except FileNotFoundError:
         return False, "git not found on PATH"
