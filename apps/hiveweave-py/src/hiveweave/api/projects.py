@@ -20,6 +20,7 @@ import re
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -970,6 +971,25 @@ async def create_project(body: ProjectCreate) -> dict:
     except Exception as e:
         log.error("create_project_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to create project")
+
+    # 收养路径补注册（2026-09-08 EXE 收养老项目实锤）：旧 agent 不经过
+    # create_agent，内存 agent_router 无路由 → chat/todos/inbox 等一切按
+    # agent_id 路由的查询抛 ProjectDbError，前端表现为「团队在、聊天空白」。
+    if adopted_project_id:
+        try:
+            from hiveweave.services.agent_router import agent_router
+
+            registered = await agent_router.register_project(project_id)
+            if registered:
+                log.info(
+                    "adopt_agents_registered",
+                    project_id=project_id,
+                    registered=registered,
+                )
+        except Exception as e:
+            log.warning(
+                "adopt_agents_register_failed", project_id=project_id, error=str(e)
+            )
 
     # 清除旧墓碑 — 该 workspace 已重新登记为项目
     try:

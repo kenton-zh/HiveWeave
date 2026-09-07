@@ -121,6 +121,11 @@ class _FakeMeta:
 @pytest.fixture
 async def fake_meta():
     fake = _FakeMeta()
+    # agent_router 是模块级单例：收养测试会往里注册旧 agent id，
+    # 不复位则跨用例污染（断言撞上前序用例的 tmp workspace）。
+    from hiveweave.services.agent_router import agent_router as _router
+
+    _router.reset_for_tests()
     with (
         patch.object(meta_module, "query", fake.query),
         patch.object(meta_module, "query_one", fake.query_one),
@@ -139,6 +144,7 @@ async def fake_meta():
         ),
     ):
         yield fake
+    _router.reset_for_tests()
 
 
 # ── 1) _probe_existing_project_id 判定 ──────────────────────
@@ -324,3 +330,55 @@ class TestNonAdoptableCleanup:
         remaining = {p.name for p in (ws / ".hiveweave").iterdir()}
         assert {"data.db", "shared"} <= remaining
         assert "leftover.txt" not in remaining
+
+
+# ── 4) 收养后 agent_router 注册（chat 空白回归，2026-09-08 EXE 实锤）──
+
+
+class TestAdoptRegistersAgentRouter:
+    async def test_adopt_registers_old_agents_for_id_routing(self, tmp_path, fake_meta):
+        """收养后旧 agent 必须可按 agent_id 路由——否则 chat/todos/inbox
+        等一切 get_project_db_for_agent 查询抛 ProjectDbError，前端
+        ChatPanel 表现为「团队在、聊天空白」。"""
+        from hiveweave.services.agent_router import agent_router
+
+        ws = tmp_path / "copied"
+        ws.mkdir()
+        _make_copied_workspace(ws)
+
+        resp = await create_project(
+            ProjectCreate(name="adopt-router", workspacePath=str(ws))
+        )
+        assert resp["adopted"] is True
+
+        # 旧 agent 进了内存路由表
+        assert agent_router.get_project_id(OLD_CEO) == OLD_ID
+        assert agent_router.get_project_id(OLD_HR) == OLD_ID
+        assert agent_router.get_workspace_path(OLD_CEO) == str(ws)
+
+        # 真实取数链路可达：agent_id → workspace DB → 老聊天还在
+        conn = await project_db.get_project_db_for_agent(OLD_CEO)
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE agent_id = ?", [OLD_CEO]
+        )
+        assert (await cur.fetchone())[0] == 1
+
+    async def test_register_project_is_idempotent(self, tmp_path, fake_meta):
+        from hiveweave.services.agent_router import agent_router
+
+        ws = tmp_path / "copied"
+        ws.mkdir()
+        _make_copied_workspace(ws)
+        fake_meta.projects[OLD_ID] = {
+            "id": OLD_ID,
+            "name": "x",
+            "workspace_path": str(ws),
+            "is_started": 1,
+            "created_at": 1,
+        }
+
+        first = await agent_router.register_project(OLD_ID)
+        second = await agent_router.register_project(OLD_ID)
+        assert first == 2  # OLD_CEO + OLD_HR
+        assert second == 0  # 幂等：已注册跳过
+        assert agent_router.get_project_agent_ids(OLD_ID) == [OLD_CEO, OLD_HR]

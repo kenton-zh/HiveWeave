@@ -95,6 +95,76 @@ class AgentRouter:
         log.info("agent_router_rebuilt", total_agents=total, projects=len(projects))
         return total
 
+    async def register_project(self, project_id: str) -> int:
+        """把项目 DB 里已存在但路由表缺失的 agent 幂等补注册（收养路径）。
+
+        收养（跨机搬迁/新 Meta DB 重新登记）沿用旧 agent id 且 seed 幂等
+        跳过 create_agent → 路由表无人登记旧 id → 一切按 agent_id 路由的
+        查询（chat/todos/inbox/记忆…）抛 ProjectDbError，前端表现为
+        「团队在、聊天空白」（2026-09-08 EXE 收养老项目实锤）。
+
+        幂等：已在表中的 agent 跳过（不覆盖 create_agent 登记的字段）。
+        Returns: 本次新注册数量。
+        """
+        from hiveweave.db import meta as meta_db
+        from hiveweave.db import project as project_db
+
+        ws_row = await meta_db.query_one(
+            "SELECT workspace_path FROM projects WHERE id = ?", [project_id]
+        )
+        if not ws_row or not ws_row["workspace_path"]:
+            return 0
+        ws = ws_row["workspace_path"]
+        try:
+            conn = await project_db.get_project_db_by_project_id(project_id)
+            cursor = await conn.execute(
+                "SELECT id, short_id, name, role, status FROM agents "
+                "WHERE status = 'active'",
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        except Exception as e:
+            log.warning(
+                "agent_router_register_project_failed",
+                project_id=project_id,
+                error=str(e),
+            )
+            return 0
+
+        added = 0
+        for row in rows:
+            r = dict(row)
+            aid = r["id"]
+            if aid in self._routes:
+                continue
+            sid = r.get("short_id") or ""
+            self._routes[aid] = AgentRoute(
+                agent_id=aid,
+                project_id=project_id,
+                workspace_path=ws,
+                short_id=sid,
+                name=r.get("name", ""),
+                role=r.get("role", ""),
+                status=r.get("status", "active"),
+            )
+            if sid:
+                self._short_ids[sid] = aid
+            self._project_agents.setdefault(project_id, []).append(aid)
+            added += 1
+        if added:
+            log.info(
+                "agent_router_project_registered",
+                project_id=project_id,
+                registered=added,
+            )
+        return added
+
+    def reset_for_tests(self) -> None:
+        """清空全部路由（仅测试用——生产路由生命周期由 rebuild/register 管理）。"""
+        self._routes.clear()
+        self._short_ids.clear()
+        self._project_agents.clear()
+
     def get_project_id(self, agent_id: str) -> str | None:
         """agent_id → project_id，O(1) 查找。"""
         route = self._routes.get(agent_id)
