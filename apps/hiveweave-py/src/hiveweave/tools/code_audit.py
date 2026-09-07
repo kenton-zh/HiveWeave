@@ -78,10 +78,20 @@ def _format_verdict(result: dict) -> ToolResult:
     豁免。现在缓存命中回放原 issue 列表 / 行数，并透出 message 与
     「缓存复用自凭证 X」——cached ISSUES 回执绝不能再出现「0 行/0 问题」。
     """
+    # 遗留显示瑕疵（09-06 审计）：lines_audited 缺数据时显示「未知」而不是
+    # 0——「0 行」会被 agent 误读为「审计了 0 行 = 空转」，触发无谓重审。
+    _la = result.get("lines_audited")
+    try:
+        _la_shown: int | str = int(_la) if _la is not None else "未知（无数据，勿当 0 解读）"
+    except (TypeError, ValueError):
+        _la_shown = "未知（无数据，勿当 0 解读）"
     lines = [
         f"审计结论: {result.get('verdict') or 'UNKNOWN'}",
-        f"审计行数: {int(result.get('lines_audited') or 0)}",
+        f"审计行数: {_la_shown}",
     ]
+    commit_hash = str(result.get("commit_hash") or "").strip()
+    if commit_hash:
+        lines.append(f"基于版本: HEAD {commit_hash[:12]}")
     if result.get("verdict") == "ISSUES":
         top = result.get("top_issues") or []
         if top:

@@ -77,14 +77,13 @@ async def _merge_tree(base: str, branch: str, cwd: str) -> tuple[int, str]:
     fail-closed 判定必须看退出码, 这里单独跑子进程。
     """
     try:
-        from hiveweave.util.win_subprocess import windows_no_window_kwargs
+        from hiveweave.util.win_subprocess import hidden_exec
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await hidden_exec(
             "git", "merge-tree", "--write-tree", base, branch,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            **windows_no_window_kwargs(),
         )
     except FileNotFoundError:
         return -1, "git not found on PATH"

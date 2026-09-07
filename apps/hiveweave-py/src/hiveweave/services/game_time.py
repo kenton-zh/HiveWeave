@@ -800,12 +800,18 @@ class GameTimeService:
                     return v
             return None
 
+        # 审计 #11：同 agent 同 kind+ref 的重复 wait 行合并为一条
+        # [WAIT_TIMEOUT]，watchdog 对同一 agent 整轮只触发一次。
+        groups: dict[tuple[str, str, str], list[dict]] = {}
         for w in cleared:
-            aid = w.get("agentId") or ""
+            aid = str(w.get("agentId") or "")
             if not aid:
                 continue
-            kind = w.get("kind") or "?"
-            ref = w.get("ref") or "?"
+            gkey = (aid, str(w.get("kind") or "?"), str(w.get("ref") or "?"))
+            groups.setdefault(gkey, []).append(w)
+
+        watchdog_agents: set[str] = set()
+        for (aid, kind, ref), group in groups.items():
             ask_outstanding = False
             ref_agent_id: str | None = None
             ref_last_active: str | None = None
@@ -841,6 +847,9 @@ class GameTimeService:
                     "ask_outstanding": ask_outstanding,
                     "ref_agent_id": ref_agent_id,
                     "ref_last_active": ref_last_active,
+                    "merged_wait_ids": [
+                        w.get("id") for w in group if w.get("id")
+                    ],
                 }
                 # P2-8（42 轮报告）：timer wait 唤醒文案区分目标到点 vs TTL 封顶。
                 ttl_cap_target = ""
@@ -851,11 +860,17 @@ class GameTimeService:
                         wait_wakeup_reason,
                     )
 
-                    wakeup_reason = wait_wakeup_reason(w) or ""
+                    for w in group:
+                        reason = wait_wakeup_reason(w) or ""
+                        if not reason:
+                            continue
+                        wakeup_reason = reason
+                        if wakeup_reason == "ttl_cap":
+                            ttl_cap_target = wait_target_iso(w) or "?"
+                        break
                     if wakeup_reason:
                         struct["wakeup_reason"] = wakeup_reason
                     if wakeup_reason == "ttl_cap":
-                        ttl_cap_target = wait_target_iso(w) or "?"
                         struct["wait_target"] = ttl_cap_target
                 if wakeup_reason == "ttl_cap":
                     body = (
@@ -887,7 +902,9 @@ class GameTimeService:
                     message_type="system",
                     priority="urgent",
                 )
-                await self._watchdog_trigger(aid)
+                if aid not in watchdog_agents:
+                    watchdog_agents.add(aid)
+                    await self._watchdog_trigger(aid)
             except Exception as e:
                 log.warning(
                     "wait_timeout_notify_failed",
@@ -1662,7 +1679,7 @@ class GameTimeService:
                                 )
                             else:
                                 sres = await spawn_confined(
-                                    command=_sp.list2cmdline(cmd_parts),
+                                    command=list2cmdline(cmd_parts),
                                     workdir=project_root,
                                     workspace_path=project_root,
                                     agent_id=agent_here,

@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 import structlog
 
+from hiveweave.llm.provider import _apply_opencode_gateway_headers
 from hiveweave.services.model import ModelService
 
 log = structlog.get_logger(__name__)
@@ -114,6 +115,9 @@ async def _fetch_models_metadata(
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    # opencode Go 网关按 host 补会话头（强制范围未知，/models 探测一并带上；
+    # 其他网关 no-op）。一次性探测无会话主，走进程级兜底键。
+    _apply_opencode_gateway_headers(headers, base, None)
     try:
         async with httpx.AsyncClient(
             timeout=_MODELS_API_TIMEOUT, follow_redirects=False

@@ -332,9 +332,11 @@ export class OfficeScene {
         (!processing && isChatteringFrame(index, now));
 
       // ── 单角色动画演示 ────────────────────────────────────────
-      // 位置冻结在座位上，FSM 在「打字 ↔ 坐姿呼吸」间周期性切换。
-      // 刻意不参与 talking / 聚集 / 散步：dev sheet 里点头与行走是站姿/位移序列。
-      if (isDemoAgent) {
+      // 位置冻结在座位上，0 号 FSM 在「打字 ↔ 坐姿呼吸」间周期性切换。
+      // 2026-09-08：FIRST_AGENT_FULL_ANIMATIONS=false 后 0 号也穿紫衣 v2 sheet
+      // （帧 0-3 打字 / 4-7 坐姿呼吸，全坐姿序列），循环对遮挡安全，故
+      // 演示周期按 index===0 生效，不再依赖 dev sheet。
+      if (index === 0) {
         processing = now % FIRST_AGENT_DEMO_CYCLE_MS < FIRST_AGENT_TYPE_MS;
         talking = false;
       }
