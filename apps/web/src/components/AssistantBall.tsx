@@ -4,14 +4,18 @@
  * 独立窗口；网页端与打包 EXE 共用同一份。
  *
  * 数据管道与 pywebview 桌面球（apps/desktop/ball）完全同源：
- *   GET  /api/ball/state            → 助理 + 各项目 CEO 的 agentId/未读
+ *   GET  /api/ball/state            → 助理的 agentId/未读
  *   GET  /api/chat/history/{id}     → 消息流（轮询）
  *   POST /api/ball/unread/clear     → 展开即清未读
  *   POST /api/ball/chat             → 发送（source: "ball"）
  *
- * 交互：球态（56px + 未读徽章）⇄ 展开态（360×520 面板，助理/项目 CEO
- * 标签）；拖拽 = pointer 位移 > 6px，松开未位移 = 展开/收起；位置记忆
- * 存 localStorage（应用内坐标，与 OS 球的 ball_position.json 无关）。
+ * 交互：球态（56px + 未读徽章）⇄ 展开态（360×520 面板）；拖拽 = pointer
+ * 位移 > 6px，松开未位移 = 展开/收起；位置记忆存 localStorage（应用内
+ * 坐标，与 OS 球的 ball_position.json 无关）。
+ *
+ * 面板只承载助理对话（用户 2026-09-08 拍板「助理面板里只有助理」）——
+ * /api/ball/state 里的项目 CEO 分支此处不消费，CEO 对话走网页端项目
+ * 切换器；设计稿 assistant-and-feishu-design.md §10 已同步修订。
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -39,10 +43,7 @@ interface ChatMsg {
 
 interface StateResp {
   assistant?: { agentId: string; name?: string; unread?: number };
-  projects?: Array<{
-    name?: string;
-    ceo?: { agentId: string; name?: string; unread?: number };
-  }>;
+  // /api/ball/state 仍会返回 projects[].ceo，但球面板按 09-08 拍板不消费
 }
 
 function clamp(v: number, lo: number, hi: number) {
@@ -155,15 +156,6 @@ export default function AssistantBall() {
               unread: data.assistant.unread || 0,
             });
           }
-          (data.projects || []).forEach((p) => {
-            if (p.ceo) {
-              t.push({
-                agentId: p.ceo.agentId,
-                name: `${p.name || "项目"} · ${p.ceo.name || "CEO"}`,
-                unread: p.ceo.unread || 0,
-              });
-            }
-          });
           setTargets(t);
           setActiveId((cur) => {
             if (cur && t.some((x) => x.agentId === cur)) return cur;
@@ -197,7 +189,7 @@ export default function AssistantBall() {
     if (nearBottom) box.scrollTop = box.scrollHeight;
   }, [messages]);
 
-  // 切换目标（含项目删除自动回落）即清空旧消息流
+  // 助理目标消失/重现（如后端重启）时回落，并清空旧消息流
   useEffect(() => {
     setMessages([]);
   }, [activeId]);
@@ -338,28 +330,13 @@ export default function AssistantBall() {
             >
               −
             </button>
-            <div className="flex items-center gap-1 flex-1 min-w-0 overflow-x-auto">
-              {targets.map((t) => (
-                <button
-                  key={t.agentId}
-                  onClick={() => {
-                    setActiveId(t.agentId);
-                    setMessages([]);
-                    clearUnread(t.agentId);
-                    loadMessages(t.agentId);
-                  }}
-                  className={`px-2 py-1 rounded text-[12px] whitespace-nowrap ${
-                    t.agentId === activeId
-                      ? "bg-white border border-g-border text-g-fg shadow-gm-sm"
-                      : "text-g-fg-3 hover:text-g-fg"
-                  }`}
-                >
-                  {t.name}
-                  {t.unread > 0 && (
-                    <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500 ml-1 align-middle" />
-                  )}
-                </button>
-              ))}
+            <div className="flex items-center gap-1.5 flex-1 min-w-0 px-1">
+              <span className="text-[12px] font-medium text-g-fg truncate">
+                {targets[0]?.name || "助理"}
+              </span>
+              {(targets[0]?.unread || 0) > 0 && (
+                <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />
+              )}
             </div>
           </div>
 
@@ -401,7 +378,7 @@ export default function AssistantBall() {
             />
             <button
               onClick={send}
-              disabled={sending || !input.trim()}
+              disabled={sending || !activeId || !input.trim()}
               className="px-3 py-1.5 text-[13px] rounded bg-g-blue text-white disabled:opacity-40 hover:opacity-90"
             >
               发送
