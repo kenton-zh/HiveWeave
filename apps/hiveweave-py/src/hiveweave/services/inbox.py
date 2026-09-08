@@ -228,6 +228,13 @@ async def _ensure_schema(agent_id: str) -> None:
     agent 记忆会让新库跳过补列 → wake 等列缺失 → inbox 写入/读取全部
     静默失败（全量回归 test_archive_direct_push 0 通知事故根因，
     2026-08-19）。
+
+    补列失败不再无条件标记完成（09-08 office-godot 实测事故）：ALTER
+    撞上「database is locked」等瞬态错误曾被 `except: pass` 吞掉后照
+    标 `_migrated`，收养项目整个进程生命周期 send_message/inbox_watcher
+    全断（wake 列永不补）。现在区分「列已存在」（良性，静默）与其余
+    错误（warning 留痕），并以 PRAGMA 实测列齐为准——不齐不标记，下
+    次调用重试。
     """
     key = await _schema_marker_key(agent_id)
     if key in _migrated:
@@ -238,8 +245,15 @@ async def _ensure_schema(agent_id: str) -> None:
                 agent_id,
                 f"ALTER TABLE inbox ADD COLUMN {col_name} {col_def}",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            msg = str(e).lower()
+            if "duplicate column" not in msg and "already exists" not in msg:
+                log.warning(
+                    "inbox_schema_alter_failed",
+                    agent_id=agent_id,
+                    column=col_name,
+                    error=str(e)[:200],
+                )
     # Unique-ish index for idempotency (best-effort)
     try:
         await project_db.execute(
@@ -250,6 +264,28 @@ async def _ensure_schema(agent_id: str) -> None:
         )
     except Exception:
         pass
+    # 验列后才标记：吞错/瞬态锁导致补列不齐时保持未标记，下次重试
+    missing: list[str] = []
+    try:
+        rows = await project_db.query(agent_id, "PRAGMA table_info(inbox)")
+        present = {
+            name
+            for name in (_row_val(r, "name") for r in rows)
+            if name is not None
+        }
+        missing = [c for c, _ in _MISSING_COLUMNS if c not in present]
+    except Exception as e:
+        log.warning(
+            "inbox_schema_verify_failed", agent_id=agent_id, error=str(e)[:200]
+        )
+        return
+    if missing:
+        log.warning(
+            "inbox_schema_ensure_incomplete",
+            agent_id=agent_id,
+            missing=missing,
+        )
+        return
     _migrated.add(key)
 
 
