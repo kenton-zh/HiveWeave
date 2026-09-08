@@ -668,20 +668,14 @@ def _browse_child_env(agent_id: str | None = None) -> dict[str, str]:
     env.setdefault(
         "AGENT_BROWSER_ARGS", "--disable-http-cache,--disk-cache-size=1"
     )
-    # 代理剥离：dev 机后端常带 HTTP(S)_PROXY 启动，agent-browser 会自动读它。
-    # browse 的目标是本机前端 dev server（localhost/127.0.0.1），本就不该走
-    # LLM 用的远程代理；且该代理不稳，导航常挂死到超时 → 回收 → 重试仍挂
-    # （“browse 反复起不来”，A155 连 example.com 都 60s 超时）。这里直接从
-    # 子进程环境里剥掉全部代理变量，导航永远直连，行为确定可复现。
-    for _k in (
-        "HTTP_PROXY", "http_proxy",
-        "HTTPS_PROXY", "https_proxy",
-        "ALL_PROXY", "all_proxy",
-        "AGENT_BROWSER_PROXY",
-    ):
-        env.pop(_k, None)
-    # 双保险：即便进程外仍有代理设置，也强制本地/回环/主机别名直连。
-    # 合并而非覆盖既有 NO_PROXY（企业内网常配 *.internal.corp 等旁路）。
+    # 代理策略（09-08 修订）：**保留**进程里的 HTTP(S)_PROXY/ALL_PROXY/
+    # AGENT_BROWSER_PROXY，回环直连交给下方 NO_PROXY 合并 + BYPASS 变量。
+    # 历史（A155）：旧版这里把代理变量全剥——browse 只测本地 dev server
+    # 的年代，代理吃 loopback 流量导致「browse 反复起不来」，全剥求确定。
+    # 但 agent 现在用 browse 做外部调研（搜索引擎/GitHub），全剥=永远直
+    # 连，用户网络环境下搜索必超时（「搜索通道不稳」root cause）。bypass
+    # 机制正是 A155 的正解：loopback 例外已声明，代理对本地导航不再生效，
+    # 对外部导航则恢复可用（用户代理 7890 等）。
     _bypass = "localhost,127.0.0.1,::1"
     _bypass_list = ("localhost", "127.0.0.1", "::1")
     existing = env.get("NO_PROXY") or env.get("no_proxy") or ""
