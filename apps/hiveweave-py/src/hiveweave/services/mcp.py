@@ -510,8 +510,10 @@ class McpService:
         return (
             "Available MCP Servers:\n\n"
             + "\n".join(lines)
-            + "\n\nTo bind an MCP server to an agent, use `bind_mcp` "
-            "with the server name."
+            + "\n\nTo attach a server to yourself (or a teammate), call the "
+            "`bind_mcp` tool with the server name; its tools become visible "
+            "next turn. Servers can only be added/removed by the operator "
+            "via Settings."
         )
 
     # ── 行转换 ───────────────────────────────────────────────

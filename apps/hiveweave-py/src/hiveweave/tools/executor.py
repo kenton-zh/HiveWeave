@@ -1182,6 +1182,29 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["agentId", "skill"],
     },
+    "bind_mcp": {
+        "description": (
+            "Bind a configured MCP server (see list_available_mcp) to an "
+            "agent; its mcp__<server>__* tools become visible next turn. "
+            "agentId defaults to yourself."
+        ),
+        "properties": {
+            "agentId": {"type": "string", "aliases": ["agent_id", "id", "target"]},
+            "serverName": {"type": "string", "aliases": ["server", "server_name", "mcpServer"]},
+        },
+        "required": ["serverName"],
+    },
+    "unbind_mcp": {
+        "description": (
+            "Remove an MCP server binding from an agent; its tools disappear "
+            "next turn. agentId defaults to yourself."
+        ),
+        "properties": {
+            "agentId": {"type": "string", "aliases": ["agent_id", "id", "target"]},
+            "serverName": {"type": "string", "aliases": ["server", "server_name", "mcpServer"]},
+        },
+        "required": ["serverName"],
+    },
     # — Messaging —
     "message_subordinate": {
         "description": (
@@ -2752,8 +2775,10 @@ class ToolExecutor:
         if not await mcp_supervisor.agent_can_use(agent_id, public_name):
             return self._error(
                 f"MCP tool '{public_name}' belongs to server "
-                f"'{entry.server}', which is not bound to this agent. "
-                "RETRY[action=bind_mcp_server_via_settings]"
+                f"'{entry.server}', which is not bound to this agent. Bind "
+                "it with the bind_mcp tool; if the server is not in "
+                "list_available_mcp, the operator must configure it first. "
+                "RETRY[action=use_bind_mcp_tool]"
             )
         decision, reason = await self.permission.evaluate_detailed(
             agent_id, public_name, tool_args

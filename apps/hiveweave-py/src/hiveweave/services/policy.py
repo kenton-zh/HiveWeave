@@ -32,6 +32,10 @@ class Capability(str, Enum):
     STAFFING = "staffing"
     MANAGE_ORG = "manage_org"
     BIND_SKILL = "bind_skill"
+    # MCP 服务器绑定/目录（bind_mcp/unbind_mcp/list_available_mcp）。
+    # 与 BIND_SKILL 分开：四族工作角色均持（含 executor/qa 自助绑定），
+    # 但 CEO 不持 —— 绑定 stdio server 等于开执行通道，CEO 无执行通道。
+    MCP_BIND = "mcp_bind"
     DISPATCH = "dispatch"
     REVIEW = "review"
     MERGE = "merge"
@@ -65,6 +69,7 @@ FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
         Capability.STAFFING,
         Capability.MANAGE_ORG,
         Capability.BIND_SKILL,
+        Capability.MCP_BIND,
         Capability.SOURCE_READ,
     }),
     "coordinator": frozenset({
@@ -73,6 +78,7 @@ FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
         Capability.MERGE,
         Capability.SOURCE_READ,
         Capability.BIND_SKILL,  # bind skills on subordinates via tools
+        Capability.MCP_BIND,  # bind MCP servers (self or subordinates)
         Capability.MANAGE_ORG,  # dismiss/transfer within span
         # 中层（设计者+接缝工）：协调权叠加写码权 —— 写码收敛到叶子
         # 间接缝，与 executor 同契约拥有独立 worktree。
@@ -87,6 +93,7 @@ FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
         Capability.SOURCE_READ,
         Capability.BASH_SHELL,
         Capability.BROWSE,  # self-check OK; attestation gate is Phase 3
+        Capability.MCP_BIND,  # self-bind configured MCP servers (叶子自助)
     }),
     "qa": frozenset({
         Capability.BROWSER_ACCEPTANCE,
@@ -97,6 +104,7 @@ FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
         Capability.SOURCE_READ,
         Capability.BASH_SHELL,
         Capability.BROWSE,
+        Capability.MCP_BIND,  # 与 executor 同自助绑定权
     }),
 }
 
@@ -160,9 +168,15 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     # Seedream text-to-image — source-writing roles only (not CEO/HR)
     "generate_image": frozenset({Capability.SOURCE_WRITE}),
     "spawn_subagent": frozenset({Capability.SOURCE_WRITE}),
-    # 45 轮 #9：MCP 目录只读——仅 HR（能力矩阵里 STAFFING 只有 hr 族有；
-    # coordinator 族无）。调用方是 HR 招聘提示（coordinator.py:384/409）。
-    "list_available_mcp": frozenset({Capability.STAFFING}),
+    # 45 轮 #9：MCP 目录只读。原映射 STAFFING（仅 HR）——MCP_BIND 自助
+    # 绑定落地后放宽为 MCP_BIND（四族工作角色均可发现可绑 server；
+    # HR 招聘提示调用方不受影响，hr 亦持 MCP_BIND）。
+    "list_available_mcp": frozenset({Capability.MCP_BIND}),
+    # MCP 自助绑定（09-08）：绑定的前提是 server 已由用户在设置里配置，
+    # agent 只是把自己/下属挂上去 —— 不给注册新 server 的能力（stdio
+    # 注册=将来会 spawn 任意进程，仍属用户专属操作）。
+    "bind_mcp": frozenset({Capability.MCP_BIND}),
+    "unbind_mcp": frozenset({Capability.MCP_BIND}),
     # ── 45 轮批次6 收编：只读观测类（五族均有 SOURCE_READ，映射零行为
     # 变化；原 EXEMPT 豁免收回，启动断言从此对它们有真实覆盖）──
     "grep": frozenset({Capability.SOURCE_READ}),

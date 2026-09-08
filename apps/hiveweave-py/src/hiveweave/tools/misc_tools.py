@@ -2156,9 +2156,8 @@ class ListAvailableMcpParams(BaseModel):
 
 @tool(
     "list_available_mcp",
-    "List MCP servers configured for this project (name / transport / "
-    "enabled). Read-only directory — binding is done in Settings or via "
-    "the operator.",
+    "List MCP servers configured for this deployment (name / transport / "
+    "enabled). Read-only directory — attach one with the bind_mcp tool.",
     requires_workspace=False,
     security_level="read",
 )

@@ -12,6 +12,7 @@ Tools:
                     check_agent_status
     Skills:         list_available_skills, read_skill, bind_skill,
                     unbind_skill
+    MCP:            bind_mcp, unbind_mcp (server config stays operator-side)
 """
 
 from __future__ import annotations
@@ -1825,3 +1826,135 @@ async def unbind_skill_tool(
             f"Skill '{skill_name}' unbound from agent {target_id}."
         )
     return ToolResult.err(result.get("error", "Unknown error"))
+
+
+# ── bind_mcp / unbind_mcp（09-08 MCP 自助绑定）────────────
+
+
+class BindMcpParams(BaseModel):
+    """Parameters for bind_mcp tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    target: str = Field(
+        default="",
+        description=(
+            "Agent to bind the MCP server to (name, short_id, or UUID). "
+            "Defaults to yourself."
+        ),
+        json_schema_extra={
+            "aliases": ["target", "agentId", "agent_id", "id"]
+        },
+    )
+    server: str = Field(
+        alias="serverName",
+        description="MCP server name to bind (see list_available_mcp).",
+        json_schema_extra={
+            "aliases": ["serverName", "server_name", "server", "mcpServer"]
+        },
+    )
+
+
+class UnbindMcpParams(BindMcpParams):
+    """Parameters for unbind_mcp tool (same shape as bind_mcp)."""
+
+
+async def _resolve_mcp_target(
+    target: str, agent_id: str, ctx
+) -> tuple[str | None, str | None]:
+    """Resolve bind target; defaults to self. Returns (target_id, error).
+
+    CEO 目标硬拒（审计 M1）：MCP 绑定=开执行通道，而 mcp__ 工具是
+    「绑定即 allow」不走家族硬门——不在这里拦，任何持 MCP_BIND 的
+    agent 都能把 server 绑到 CEO 行上，第三方穿透「CEO 无执行通道」。
+    """
+    if not target or target == agent_id:
+        return agent_id, None
+    if not ctx or not getattr(ctx, "org", None):
+        return None, "OrgService not available (ctx.org is missing)"
+    target_agent = await ctx.org.resolve_agent(target)
+    if not target_agent:
+        return None, f"Agent not found: {target}"
+    from hiveweave.services.policy import infer_role_family
+
+    if infer_role_family(target_agent) == "ceo":
+        return None, (
+            "MCP servers cannot be bound to the CEO — the CEO has no "
+            "execution channel by org charter."
+        )
+    return target_agent["id"], None
+
+
+@tool(
+    "bind_mcp",
+    "Bind a configured MCP server to an agent. Its mcp__<server>__* tools "
+    "become visible on the agent's next turn. Servers are configured by the "
+    "operator (see list_available_mcp); this only attaches them.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def bind_mcp_tool(
+    params: BindMcpParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """Bind an MCP server to an agent (self by default)."""
+    if not params.server:
+        return ToolResult.err(
+            "bind_mcp requires 'serverName' (see list_available_mcp)"
+        )
+
+    from hiveweave.services.mcp import mcp_service
+    from hiveweave.services import mcp_supervisor
+
+    target_id, err = await _resolve_mcp_target(params.target, agent_id, ctx)
+    if err:
+        return ToolResult.err(err)
+
+    result = await mcp_service.bind_mcp(target_id, params.server)
+    if not result.get("ok"):
+        return ToolResult.err(result.get("error", "Unknown error"))
+    await mcp_supervisor.invalidate_agent(target_id)
+
+    tools = mcp_supervisor.server_tool_names(params.server)
+    if tools:
+        return ToolResult.ok(
+            f"MCP server '{params.server}' bound to agent {target_id}; "
+            f"{len(tools)} tools visible next turn."
+        )
+    return ToolResult.ok(
+        f"MCP server '{params.server}' bound to agent {target_id}, but its "
+        "tools are not synced yet (server unreachable or still starting); "
+        "they will appear once the server syncs."
+    )
+
+
+@tool(
+    "unbind_mcp",
+    "Remove an MCP server binding from an agent. Its mcp__<server>__* tools "
+    "disappear from the agent's next turn.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def unbind_mcp_tool(
+    params: UnbindMcpParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """Unbind an MCP server from an agent (self by default)."""
+    if not params.server:
+        return ToolResult.err(
+            "unbind_mcp requires 'serverName' (see list_available_mcp)"
+        )
+
+    from hiveweave.services.mcp import mcp_service
+    from hiveweave.services import mcp_supervisor
+
+    target_id, err = await _resolve_mcp_target(params.target, agent_id, ctx)
+    if err:
+        return ToolResult.err(err)
+
+    result = await mcp_service.unbind_mcp(target_id, params.server)
+    if not result.get("ok"):
+        return ToolResult.err(result.get("error", "Unknown error"))
+    await mcp_supervisor.invalidate_agent(target_id)
+    return ToolResult.ok(
+        f"MCP server '{params.server}' unbound from agent {target_id}."
+    )
+

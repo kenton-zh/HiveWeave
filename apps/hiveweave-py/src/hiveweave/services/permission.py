@@ -72,6 +72,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     # 与 executor 同契约拥有独立 worktree）。
     "write_file",
     "bind_skill", "unbind_skill",
+    "bind_mcp", "unbind_mcp", "list_available_mcp",
     "create_task", "dispatch_task", "review_task",
     # 台账出口：废弃/释放误绑任务 + 豁免 attestation（policy 已映射 DISPATCH/REVIEW）
     "cancel_task", "unclaim_task", "reassign_task", "waive_attestation",
@@ -106,6 +107,7 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
     "hire_agent", "dismiss_agent", "transfer_agent",
     "list_agent_templates",
     "bind_skill", "unbind_skill",
+    "bind_mcp", "unbind_mcp",
     "list_available_mcp",
     "write_file",
 })
@@ -121,6 +123,8 @@ EXECUTOR_BASE_TOOLS = _BASE_TOOLS | frozenset({
     "spawn_subagent",
     "generate_image",
     "bind_skill", "unbind_skill",
+    # MCP 自助绑定（09-08）：叶子/qa 可见，capability 硬门 MCP_BIND 见 policy
+    "bind_mcp", "unbind_mcp", "list_available_mcp",
     "start_dev_server",
     "stop_dev_server",
     "run_tests", "apply_patch",
@@ -231,7 +235,8 @@ class PermissionService:
             return (
                 "deny",
                 f"MCP tool '{tool_name}' is not bound to this agent "
-                "(bind the MCP server first, or check server degraded state)",
+                "(bind it with the bind_mcp tool first, or check server "
+                "degraded state)",
             )
 
         family = infer_role_family(agent)
