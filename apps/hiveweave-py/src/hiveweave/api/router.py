@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 import structlog
 
@@ -87,6 +88,32 @@ def _root_html() -> str:
 </html>"""
 
 
+class WebDistStaticFiles(StaticFiles):
+    """带缓存纪律的 web dist 静态托管（EXE 白屏根因修复，09-08）。
+
+    实测根因链：StaticFiles 只发 ETag/Last-Modified、无 Cache-Control →
+    WebView2/浏览器启发式缓存跨构建直出旧 index.html → 页面按旧 hash 懒
+    加载 chunk → 服务器已换代 404 → React.lazy 拒绝卸根白屏。因此：
+
+    - ``*.html``（含 index.html）→ ``no-cache``：每次协商复验，构建换代
+      立即可见；
+    - ``/assets/*`` → 内容 hash 寻址、不可变 → ``immutable`` 一年长缓存。
+    """
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):  # type: ignore[override]
+        response = super().file_response(
+            full_path, stat_result, scope, status_code
+        )
+        path = str(full_path).replace("\\", "/").lower()
+        if path.endswith(".html"):
+            response.headers["Cache-Control"] = "no-cache"
+        elif "/assets/" in path:
+            response.headers["Cache-Control"] = (
+                "public, max-age=31536000, immutable"
+            )
+        return response
+
+
 def register_routes(app: FastAPI) -> None:
     """把所有子路由注册到 FastAPI app。
 
@@ -122,10 +149,17 @@ async def _root() -> Response:
         # is_file 先验：FileResponse 的 stat 懒到响应期，dist 运行中被换
         # （robocopy /MIR 更新中）会变 500，这里必须当场回落
         if web_dist is not None and (web_dist / "index.html").is_file():
-            return FileResponse(web_dist / "index.html")
+            # no-cache：index.html 每次协商复验（EXE 白屏根因修复 09-08，
+            # 同 WebDistStaticFiles 口径）；避免启发式缓存直出跨构建旧页
+            return FileResponse(
+                web_dist / "index.html",
+                headers={"Cache-Control": "no-cache"},
+            )
     except Exception:
         pass  # 解析/读文件失败 → 回落 API 状态页
-    return HTMLResponse(_root_html())
+    return HTMLResponse(
+        _root_html(), headers={"Cache-Control": "no-cache"}
+    )
 
 
 # ── Handoffs 路由（内联）──────────────────────────────────────

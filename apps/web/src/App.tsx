@@ -4,6 +4,7 @@ import ChatPanel from "./components/ChatPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import ToastContainer from "./components/Toast";
 import TokenUsagePanel from "./components/TokenUsagePanel";
+import ErrorBoundary from "./components/ErrorBoundary";
 import AssistantBall from "./components/AssistantBall";
 import { lazyRetry, resolveLeftPanel } from "./mainPanel";
 
@@ -716,9 +717,11 @@ function App() {
               {leftPanel === "tree" ? (
                 <OrgTree />
               ) : leftPanel === "timeline" ? (
-                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                  <TimelineView />
-                </Suspense>
+                <ErrorBoundary label="Timeline">
+                  <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                    <TimelineView />
+                  </Suspense>
+                </ErrorBoundary>
               ) : leftPanel === "token" && selectedProjectId ? (
                 <TokenUsagePanel key={selectedProjectId} projectId={selectedProjectId} />
               ) : leftPanel === "token-empty" ? (
@@ -726,9 +729,11 @@ function App() {
                   请先选择一个项目
                 </div>
               ) : (
-                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                  <OfficeView />
-                </Suspense>
+                <ErrorBoundary label="Office">
+                  <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                    <OfficeView />
+                  </Suspense>
+                </ErrorBoundary>
               )}
             </div>
           </div>
@@ -795,11 +800,13 @@ function App() {
           {/* Tab content */}
           <div className="flex-1 overflow-hidden">
             {rightPanelTab === "task" && selectedTaskId ? (
-              <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                <div key="panel-task" className="hw-tab-in h-full">
-                  <TaskTimelinePanel />
-                </div>
-              </Suspense>
+              <ErrorBoundary label="任务">
+                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                  <div key="panel-task" className="hw-tab-in h-full">
+                    <TaskTimelinePanel />
+                  </div>
+                </Suspense>
+              </ErrorBoundary>
             ) : !selectedAgentId ? (
               <div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-fade-in">
                 <div className="text-center">
@@ -815,7 +822,9 @@ function App() {
             ) : (
               <>
                 <ChatPanel key="panel-chat" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
-                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                {/* key=tab：错误不跨 tab sticky（boundary 随 tab 重挂载清 error state） */}
+                <ErrorBoundary key={rightPanelTab} label="右栏面板">
+                  <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
                   {rightPanelTab === "goals" && selectedProjectId && (
                     <div key="panel-goals" className="hw-tab-in h-full">
                       <GoalsPanel projectId={selectedProjectId} />
@@ -846,7 +855,8 @@ function App() {
                       <WorkLogPanel agentId={selectedAgentId} />
                     </div>
                   )}
-                </Suspense>
+                  </Suspense>
+                </ErrorBoundary>
               </>
             )}
           </div>
@@ -854,6 +864,7 @@ function App() {
       </div>
 
       {/* Lazy-loaded dialogs — wrapped in Suspense, fallback=null since they're overlays */}
+      <ErrorBoundary label="对话框" fallback={null}>
       <Suspense fallback={null}>
         {showFolderPicker && (
           <FolderPicker
@@ -954,6 +965,7 @@ function App() {
           />
         )}
       </Suspense>
+      </ErrorBoundary>
       <AssistantBall />
       <ToastContainer />
     </div>

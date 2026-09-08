@@ -973,14 +973,15 @@ async def lifespan(app: FastAPI):
     # 而非模块导入：include_router 的 API/WS 路由先注册，Mount("/") 排在
     # 路由表末尾天然垫底；pytest 不跑 lifespan，测试行为零影响。
     try:
-        from fastapi.staticfiles import StaticFiles
-
+        from hiveweave.api.router import WebDistStaticFiles
         from hiveweave.config import resolve_web_dist
 
         web_dist = resolve_web_dist()
         if web_dist is not None:
             app.mount(
-                "/", StaticFiles(directory=str(web_dist), html=True), name="web"
+                "/",
+                WebDistStaticFiles(directory=str(web_dist), html=True),
+                name="web",
             )
             log.info("web_dist_mounted", dist=str(web_dist))
         else:
