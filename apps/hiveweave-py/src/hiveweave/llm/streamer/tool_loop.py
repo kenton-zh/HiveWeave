@@ -214,6 +214,7 @@ class ToolLoopMixin:
         note: str | None = None,
         reason: str = "hard_budget",
         current_reasoning: str = "",
+        current_round_text: str = "",
     ) -> dict:
         """硬预算耗尽的优雅收口（所有预算闸口共用）。
 
@@ -232,8 +233,40 @@ class ToolLoopMixin:
         ``current_reasoning``：当前（被切断）轮的 thinking，仅补本轮
         （不是 accumulated）—— 中间轮 thinking 已由各轮 assistant
         消息的 reasoning_content 落账，避免重复。
+
+        结构化收口（09-08 去复读，替代被用户否决的文本相似度折叠——
+        那条路线靠猜文案语义，换语言/换措辞即失效）：content 不再把
+        text_acc 全量拼接 blob 塞进正文（每轮同义复述的旁白会堆成「收
+        到：…」×N 复读串，还会作为下轮上下文自我强化）。选取顺序：
+        ``current_round_text``（流中被切断的当前轮文本，尚未入
+        tool_turn_acc——调用方 :824/:1027 传 new_text）→ 倒序找
+        tool_turn_acc 里最近一条带正文的 assistant 消息（轮间闸口）→
+        兜底 text_acc。轮次结构自 tool_turn_acc 读取，语言无关、零猜
+        测；完整逐轮时间线仍由 tool_turn_acc / metadata.segments 承载。
         """
-        base = self._strip_placeholder(text_acc)
+        # 结构化收口（09-08 去复读，替代被否决的文本相似度折叠——那条路
+        # 线靠猜文案语义，换语言/换措辞即失效）：content 只取**最后一轮**
+        # 的旁白 + 收口说明，不把 text_acc 全量拼接 blob 塞进正文。轮次
+        # 结构就在 tool_turn_acc 里（每轮一条 assistant 消息），倒序找最
+        # 近一条带正文的即是，语言无关、零猜测。完整逐轮时间线仍由
+        # tool_turn_acc / metadata.segments 承载；下一轮模型上下文里也
+        # 不再出现 N 连同义复述（复读不会被自己强化）。
+        current = self._strip_placeholder(current_round_text or "")
+        if current.strip():
+            # 流中被切断：当前轮部分文本只在 text_acc/combined_text 里，
+            # 调用方已把它作为 current_round_text 显式传入
+            base = current
+        else:
+            base = ""
+            for _m in reversed(tool_turn_acc):
+                if _m.get("role") != "assistant":
+                    continue
+                _c = _m.get("content")
+                if isinstance(_c, str) and self._strip_placeholder(_c).strip():
+                    base = self._strip_placeholder(_c)
+                    break
+            if not base:
+                base = self._strip_placeholder(text_acc)
         if note is None:
             note = (
                 "[TURN BUDGET] Hard turn budget exhausted — all progress so "
@@ -815,6 +848,7 @@ class ToolLoopMixin:
                     round_num=round_num + 1,
                     last_usage=last_usage,
                     usage_rounds=usage_rounds,
+                    current_round_text=new_text,
                     current_reasoning=(
                         new_thinking if provider.supports_thinking else ""
                     ),
@@ -1018,6 +1052,7 @@ class ToolLoopMixin:
                         round_num=round_num + 1,
                         last_usage=last_usage,
                         usage_rounds=usage_rounds,
+                        current_round_text=new_text,
                         current_reasoning=(
                             new_thinking if provider.supports_thinking else ""
                         ),

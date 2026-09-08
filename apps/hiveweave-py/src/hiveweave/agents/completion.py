@@ -33,10 +33,9 @@ log = structlog.get_logger(__name__)
 _FINAL_TAIL_NOTE_MAX = 300
 
 # result_summary 的语义是「一句话摘要」，不是本轮全文的前 200 字。
-# 早收口路径（budget_exhausted / max_rounds 续跑）的 content = 各轮旁白拼接
-# + 平台尾注，取前 200 字会把最早那几句同义旁白连堆在一起（实证：8/8 agent
-# 该字段长度精确等于 200，最长样本 9 个同义句）。改取**末条**旁白 —— 最近
-# 一句才代表 run 结束时的状态。
+# 收口路径的 content 以末轮旁白为主体（09-08 结构化收口后更是只含末轮
+# + 尾注），取前 200 字会把多段旁白连堆在一起。改取**末条**旁白 —— 最
+# 近一句才代表 run 结束时的状态。
 RESULT_SUMMARY_MAX = 200
 
 #: 平台尾注的结构形状：段首 ``[TAG]`` 标签（如 [TURN BUDGET] / [HiveWeave
@@ -160,25 +159,49 @@ def build_display_segments(
                 "ok" if ok_map.get(str(seg.get("id")), True) else "error"
             )
 
-    # 提前收口路径（budget_exhausted 等）final = 各轮文本拼接 + 尾注，
-    # 且该拼接段已作为最后一条 assistant 消息进入 tool_turn_messages ——
-    # 直接保留会整轮复述。识别「最后 text 段 == 前段拼接 + 短尾注」结构，
-    # 只保留尾注差量。
-    # 文本一致性：尾注保留原文（含前导 \n\n 分隔符），各 text 段拼接后
-    # 与 content 列逐字一致；前端按块渲染，分隔符自然呈现为段间留白。
+    # 提前收口路径的末段去重（两种形状，按结构识别、零文案猜测）：
+    # ①旧 blob 形状：final == 全部 text 段拼接 + 短尾注 → 只保留尾注差量；
+    # ②结构化收口形状（09-08，tool_loop 结构化 content）：final text 段 =
+    #   上一 text 段（末轮旁白）+ 短尾注 → 上一段原样保留，末段折叠为
+    #   尾注差量（不折叠会把末轮旁白显示两遍）。长差量 = 真实新内容 →
+    #   原样保留（前段已在，信息无损失）。
     text_idx = [i for i, s in enumerate(segs) if s["type"] == "text"]
     if text_idx and final_content:
         last_i = text_idx[-1]
         last_text = segs[last_i]["content"]
-        joined_prev = "".join(segs[i]["content"] for i in text_idx[:-1])
-        if final_content == last_text and joined_prev and last_text.startswith(joined_prev):
-            tail = last_text[len(joined_prev):]
-            if not tail.strip():
-                segs.pop(last_i)
-            elif len(tail) <= _FINAL_TAIL_NOTE_MAX:
-                segs[last_i] = {"type": "text", "content": tail}
-            # 长差量 = 正常旁白复述结构不成立 → 原样保留（final==last 无重复）
+        folded = False
+        if final_content == last_text:
+            joined_prev = "".join(segs[i]["content"] for i in text_idx[:-1])
+            if joined_prev and last_text.startswith(joined_prev):
+                # ①旧 blob 形状：final = 前段拼接 + 尾注
+                tail = last_text[len(joined_prev):]
+                if not tail.strip():
+                    segs.pop(last_i)
+                    folded = True
+                elif len(tail) <= _FINAL_TAIL_NOTE_MAX:
+                    segs[last_i] = {"type": "text", "content": tail}
+                    folded = True
+            # ②结构化收口形状：末段 = 上一 text 段 + 短尾注
+            if not folded and len(text_idx) >= 2:
+                prev_text = segs[text_idx[-2]]["content"]
+                if (
+                    isinstance(prev_text, str)
+                    and prev_text
+                    and last_text.startswith(prev_text)
+                ):
+                    tail = last_text[len(prev_text):]
+                    if not tail.strip():
+                        segs.pop(last_i)
+                        folded = True
+                    elif len(tail.strip()) <= _FINAL_TAIL_NOTE_MAX:
+                        segs[last_i] = {
+                            "type": "text",
+                            "content": tail.strip(),
+                        }
+                        folded = True
+            # 长差量/形状不成立 → 原样保留
         elif final_content != last_text:
+            joined_prev = "".join(segs[i]["content"] for i in text_idx[:-1])
             joined_all = joined_prev + last_text
             if joined_all and final_content.startswith(joined_all):
                 # final = 已有全部段落拼接 + 差量：只追加差量（任意长度），
