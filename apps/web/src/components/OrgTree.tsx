@@ -2,9 +2,10 @@ import {
   useEffect, useState, useCallback, useRef, useMemo, useLayoutEffect,
 } from "react";
 import ApprovalDialog from "./ApprovalDialog";
-import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings, getProjectAlarms, getAgentsLiveStatus, type AgentLiveStatus } from "../api";
+import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings, getProjectAlarms, type AgentLiveStatus } from "../api";
 import { useAppStore, MEETING_ACTIVE_STATUSES, type AgentAlarmInfo } from "../store";
 import { getPositionLabel } from "../utils/role-styles";
+import { LIVE_PHASE_LABEL, LIVE_PHASE_STYLE } from "../utils/livePhase";
 import { realMsToGameSeconds, gameSecondsToRealMs, decomposeGameSeconds } from "../utils/game-time";
 
 // ── Types ──────────────────────────────────────────────────────
@@ -339,23 +340,8 @@ function formatAlarmCountdown(realMs: number): string {
   return `${s}秒`;
 }
 
-/** 八轮观测：实时活动相位的徽标文案与配色（正交上报，不合成一个 busy）。 */
-const LIVE_PHASE_LABEL: Record<NonNullable<AgentLiveStatus["phase"]>, string> = {
-  tool: "工具",
-  llm: "LLM",
-  subagent: "子代理",
-  working: "运行中",
-  waiting: "等待",
-  idle: "空闲",
-};
-const LIVE_PHASE_STYLE: Record<NonNullable<AgentLiveStatus["phase"]>, string> = {
-  tool: "bg-g-yellow-bg text-g-yellow",
-  llm: "bg-emerald-500/15 text-emerald-700",
-  subagent: "bg-purple-100 text-purple-700",
-  working: "bg-gray-100 text-gray-600",
-  waiting: "bg-g-blue-bg text-g-blue",
-  idle: "bg-g-fg-4/10 text-g-fg-4",
-};
+// 实时活动相位的徽标文案与配色已抽到 utils/livePhase（ChatPanel 头部共
+// 用同一份，09-08 #9 状态同源改造）。
 
 function TreeNodeCard({
   node, isSelected, onSelect, onApproval, onToggle,
@@ -624,26 +610,9 @@ function OrgTree() {
   const [roots, setRoots] = useState<OrgNodeData[]>([]);
   const [approvalAgentId, setApprovalAgentId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  // 八轮观测缺口：per-agent 实时活动相位（LLM/工具/子代理），4s 轮询
-  const [liveMap, setLiveMap] = useState<Record<string, AgentLiveStatus>>({});
-
-  useEffect(() => {
-    if (!selectedProjectId) return;
-    let alive = true;
-    const poll = async () => {
-      const rows = await getAgentsLiveStatus(selectedProjectId);
-      if (!alive) return;
-      const map: Record<string, AgentLiveStatus> = {};
-      for (const r of rows) map[r.agent_id] = r;
-      setLiveMap(map);
-    };
-    void poll();
-    const i = setInterval(poll, 4000);
-    return () => {
-      alive = false;
-      clearInterval(i);
-    };
-  }, [selectedProjectId]);
+  // 八轮观测缺口：per-agent 实时活动相位（LLM/工具/子代理）——轮询已上移
+  // 到 App 根的 useLiveStatusPoll（单一数据源，ChatPanel 头部共用）。
+  const liveMap = useAppStore((s) => s.liveMap);
 
 
   // Canvas transform

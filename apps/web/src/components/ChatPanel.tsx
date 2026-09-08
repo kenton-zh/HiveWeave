@@ -6,6 +6,7 @@ import TodoBar from "./TodoBar";
 import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
 import { roleLabels, statusLabels } from "../chat/constants";
 import { getDirectedAgentId, nextBadgePopToken } from "../chat/messageUtils";
+import { livePhaseLabel } from "../utils/livePhase";
 import { MessageBubble, ChatMotionStyles } from "../chat/MessageBubble";
 import { useStreamDraft } from "../chat/useStreamDraft";
 import { useChatMessages } from "../chat/useChatMessages";
@@ -101,6 +102,32 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     setIsStreaming,
     setRetryInfo: sendApi.setRetryInfo,
   });
+
+  // #11 兜底对账：phoenix 重连窗口内发布的流事件会永久丢失，此前只有
+  // 发消息（useChatSend 里的 loadMessagesFromDb）才会全量补显——用户看到
+  // 的就是「很久没输出，一发消息全出来」。现在：①WS 每次重连成功立即对
+  // 账一次；②面板可见期间 10s 低频对账。守卫=面板隐藏（hidden=切到其他
+  // tab，对账会把未读提前标已读）/流式中/后端处理中/页面隐藏/用户上翻
+  // 读史（非贴底），避免打断直播、重置阅读位置或偷跑已读。
+  useEffect(() => {
+    if (!agentId || hidden) return;
+    const reconcile = () => {
+      if (hidden || document.hidden) return;
+      if (isStreaming) return;
+      if (useAppStore.getState().processingAgents.includes(agentId)) return;
+      if (!stickToBottomRef.current) return;
+      void loadMessagesFromDb(agentId);
+    };
+    const onWsReconnected = () => {
+      if (agentId) reconcile();
+    };
+    window.addEventListener("hw-ws-reconnected", onWsReconnected);
+    const i = setInterval(reconcile, 10_000);
+    return () => {
+      window.removeEventListener("hw-ws-reconnected", onWsReconnected);
+      clearInterval(i);
+    };
+  }, [agentId, hidden, isStreaming, loadMessagesFromDb, stickToBottomRef]);
 
   const [agentInfoCache, setAgentInfoCache] = useState<
     Record<string, { name: string; position?: string; role?: string }>
@@ -246,13 +273,22 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     text: agentInfo?.status || "Unknown",
     color: "text-g-fg-3",
   };
+  // #9 状态同源：本面板看不到流式（isAgentProcessing 假）≠ agent 空闲——
+  // 后端可能仍在 LLM 重试/工具轮里（节点徽章同帧显示 LLM 的真相）。
+  // 头部文案对齐到与 OrgTree 徽章同一份 live-status 相位，消除两处矛盾。
+  const livePhase = useAppStore(
+    (s) => (agentId ? s.liveMap[agentId]?.phase : undefined),
+  );
+  const liveLabelText = livePhaseLabel(livePhase);
   const runtimeStatusInfo =
     disposition && statusLabels[disposition]
       ? statusLabels[disposition]
       : agentInfo?.status === "active"
         ? isAgentProcessing
           ? { text: "实现中", color: "text-emerald-600" }
-          : { text: "空闲", color: "text-g-fg-3" }
+          : liveLabelText
+            ? { text: liveLabelText, color: "text-emerald-600" }
+            : { text: "空闲", color: "text-g-fg-3" }
         : statusInfo;
 
   const resolveAgentInfo = (id: string) => {

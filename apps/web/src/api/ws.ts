@@ -131,6 +131,11 @@ export function getSocket(): Socket {
       reconnectAfterMs: (tries: number) => [1000, 2000, 5000, 10000][tries - 1] ?? 10000,
       heartbeatIntervalMs: 30_000,
     });
+    // 重连广播（#11）：断线窗口内发布的流事件 phoenix 不补投，面板听到
+    // 该事件后从 DB 对一次账（ChatPanel reconcile）。
+    socket.onOpen(() => {
+      window.dispatchEvent(new CustomEvent("hw-ws-reconnected"));
+    });
     socket.connect();
     (globalThis as any).__hw_socket = socket;
     _socket = socket;

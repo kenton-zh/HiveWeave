@@ -5,6 +5,7 @@ import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import ToastContainer from "./components/Toast";
 import TokenUsagePanel from "./components/TokenUsagePanel";
 import ErrorBoundary from "./components/ErrorBoundary";
+import { useLiveStatusPoll } from "./hooks/useLiveStatusPoll";
 import AssistantBall from "./components/AssistantBall";
 import { lazyRetry, resolveLeftPanel } from "./mainPanel";
 
@@ -42,6 +43,8 @@ function App() {
   const setProjects = useAppStore((s) => s.setProjects);
   const selectedProjectId = useAppStore((s) => s.selectedProjectId);
   const setSelectedProjectId = useAppStore((s) => s.setSelectedProjectId);
+  // per-agent 活动相位轮询（App 根挂载一次；OrgTree 徽章 + ChatPanel 头部共用）
+  useLiveStatusPoll(selectedProjectId);
   const socketReconnectVersion = useAppStore((s) => s.socketReconnectVersion);
   const activeView = useAppStore((s) => s.activeView);
   const setActiveView = useAppStore((s) => s.setActiveView);

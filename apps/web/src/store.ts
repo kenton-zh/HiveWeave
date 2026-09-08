@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { mergeDeltaContent } from "./utils/mergeDelta";
-import type { Project } from "./api";
+import type { Project, AgentLiveStatus } from "./api";
 import { parseDeepLink } from "./components/timeline/useDeepLink";
 
 // 深链恢复：#view=timeline&task=<id> 直接同视角打开（v4 §5.5.1）
@@ -147,6 +147,10 @@ interface AppState {
   // Agent active model — live "model_resolved" events track actual model in use
   agentActiveModel: Record<string, AgentActiveModelInfo>;
   setAgentActiveModel: (agentId: string, info: AgentActiveModelInfo | null) => void;
+  // Per-agent 实时活动相位（LLM/工具/子代理…，4s 轮询一份）——OrgTree 徽章
+  // 与 ChatPanel 头部共用同一数据源（09-08 #9：两处状态同帧矛盾根因）
+  liveMap: Record<string, AgentLiveStatus>;
+  setLiveMap: (map: Record<string, AgentLiveStatus>) => void;
   // 团队开会 — lobby "meeting_updated"（seq 幂等合并；见 MeetingStatusInfo）
   activeMeeting: MeetingStatusInfo | null;
   setActiveMeeting: (info: MeetingStatusInfo | null) => void;
@@ -393,6 +397,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return { agentActiveModel: next };
     }),
+  // Per-agent 实时活动相位（useLiveStatusPoll 每 4s 整表刷新）
+  liveMap: {},
+  setLiveMap: (map) => set({ liveMap: map }),
   // Pending initial message
   pendingInitialMessage: null,
   setPendingInitialMessage: (msg) => set({ pendingInitialMessage: msg }),
