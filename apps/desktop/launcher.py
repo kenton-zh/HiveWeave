@@ -370,6 +370,31 @@ def _resolve_port(requested: int, host: str) -> int:
     return requested
 
 
+_single_instance_mutex = None
+
+
+def _acquire_single_instance_mutex() -> bool:
+    """GUI 单实例守护（09-08 B7）：命名互斥体随进程消亡、无陈旧锁。
+
+    双 GUI 实例会端口回退 4001 形成同数据根双后端，SQLite（DELETE 日
+    志）双写有代际分叉损坏风险。仅 GUI 分支调用；headless/selfcheck
+    不受闸限。返回 False = 已有实例在运行，调用方应立即退出。
+    """
+    global _single_instance_mutex
+    if sys.platform != "win32":
+        return True
+    import ctypes
+
+    handle = ctypes.windll.kernel32.CreateMutexW(
+        None, False, "HiveWeave.Platform.SingleInstance"
+    )
+    # ERROR_ALREADY_EXISTS = 183：互斥体已存在 → 已有实例
+    if ctypes.windll.kernel32.GetLastError() == 183:
+        return False
+    _single_instance_mutex = handle  # 保活到进程退出，防止互斥体消亡
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="HiveWeave 桌面悬浮球启动器")
     parser.add_argument("--headless", action="store_true", help="只跑后端，不开球窗口")
@@ -435,6 +460,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # GUI 模式：子线程 uvicorn，主线程 pywebview（D9：GUI 循环必须主线程）
+
+    # 单实例守护（09-08 B7 实测）：GUI 实例双开会端口回退 4001 形成
+    # 同数据根双后端——SQLite（DELETE 日志）双写有代际分叉损坏风险。
+    # 命名互斥体随进程消亡、无陈旧锁问题；headless/selfcheck 不受此
+    # 闸限制（CI 需要与运行中实例并存探测）。
+    if not _acquire_single_instance_mutex():
+        print(
+            "HiveWeave is already running — this instance will exit. "
+            "（HiveWeave 已在运行，本实例退出。）",
+            flush=True,
+        )
+        return 2
+
     server = uvicorn.Server(config)
     server_thread = threading.Thread(target=server.run, name="uvicorn", daemon=True)
     server_thread.start()
