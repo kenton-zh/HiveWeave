@@ -501,6 +501,16 @@ def main(argv: list[str] | None = None) -> int:
         server.should_exit = True
         return 1
 
+    # WebView2 直连（09-09 用户实测：切系统代理后 EXE 静默消失，ProxyEnable
+    # 注册表开关注册表层无法复现——触发在代理工具更深的动作，但修法不必依
+    # 赖触发器）：平台窗/球窗内容全部来自回环 127.0.0.1，WebView2 不需要
+    # 任何代理。绑定直连后系统代理开/关/换工具都影响不到窗口进程；页面唯
+    # 一外链是 Google Fonts，直连失败仅回退系统字体，无功能影响。用户显式
+    # 设置过的浏览器参数优先（setdefault）。
+    os.environ.setdefault(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--no-proxy-server"
+    )
+
     # DRAG_REGION_SELECTOR（§10）：球体与面板头都标 data-drag-region。
     # 必须 webview.settings["DRAG_REGION_SELECTOR"] —— pywebview 6.x 把它
     # 改成只读 module_property，老的 `webview.DRAG_REGION_SELECTOR = x`
@@ -556,13 +566,16 @@ def main(argv: list[str] | None = None) -> int:
                 width=1600,
                 height=1000,
                 min_size=(1024, 700),
+                text_select=True,  # 划词选择+Ctrl+C（pywebview 默认注入
+                # body{user-select:none} 全页禁选——09-09 用户实测 EXE
+                # 无法划词复制的根因；网页端无此注入故正常）
             )
 
     # 兜底：MAIN_WINDOW=0 + BALL=0 会一个窗口都没有（webview.start 空窗
     # 报错）——至少保一个平台窗。
     if not webview.windows:
         platform_win = webview.create_window(
-            "HiveWeave 平台", f"http://127.0.0.1:{port}/"
+            "HiveWeave 平台", f"http://127.0.0.1:{port}/", text_select=True
         )
 
     # private_mode=False + storage_path：WebView2 localStorage 持久化
