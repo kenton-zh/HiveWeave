@@ -334,6 +334,52 @@ _DELETE_FAMILY = frozenset({
     "rm", "del", "erase", "rd", "rmdir", "remove-item", "remove_item",
 })
 
+# 删除族的**已知开关**（不取值的布尔/递归开关）。
+#
+# P0-2（2026-09-12）：这张表决定「未知开关」判定 —— `_extract_delete_targets`
+# 遇到不在 value_switches、也不在本表里的 `-` token，会标记
+# `skipped_suspicious=True`（无法证明它不是目标）。**表不全的后果是误报**
+# （正常 `rm -rf` 被当成"解析不了"），所以宁可收全。
+#
+# 组合形态（`-rf`/`-Rf`）按字符拆解判定，见 `_is_known_delete_switch`。
+_KNOWN_DELETE_SWITCHES = frozenset({
+    # unix rm / rmdir
+    "r", "R", "f", "i", "d", "v", "rf", "fr", "irf", "rif", "rfi", "fir", "fri",
+    "recursive", "force", "interactive", "dir", "verbose", "no-preserve-root",
+    "preserve-root", "one-file-system", "dry-run",
+    # PowerShell Remove-Item（长名 + 常见简写）
+    "recurse", "force", "whatif", "confirm", "verbose", "debug", "erroraction",
+    "warningaction", "errorvariable", "warningvariable", "outvariable",
+    "outbuffer", "pipelinevariable", "ea", "wa", "ev", "wv", "ov", "ob", "pv",
+    # cmd del / erase / rd / rmdir
+    "s", "q", "a", "p", "n", "c", "y", "ah", "as", "ar", "ash",
+})
+
+
+def _is_known_delete_switch(tok: str) -> bool:
+    """`-`/`--` 开头的 token 是否属**已知**删除开关。
+
+    判据：剥前缀后（单破折号可能带短名拼接，如 `-rf`）在已知集合里，或
+    **每个字符都是已知单字母**（覆盖 `-rf`/`-Rf`/`-irf` 这类拼接）。
+
+    **误判方向**：把已知当未知 → 多一次 fail-closed deny 且文案偏保守
+    （安全，但噪音）；把未知当已知 → 可疑目标被静默跳过（危险）。
+    所以这里**只在真的能解释每个字符时才认定已知**，否则如实报"可疑"。
+    """
+    if not tok.startswith("-"):
+        return False
+    body = tok.lstrip("-")
+    if not body:
+        return False  # 裸 `-`/`--` 不是开关
+    if body.lower() in _KNOWN_DELETE_SWITCHES:
+        return True
+    # 拼接形态：每个字符都得是已知单字母（`-rf` → r,f）
+    if len(body) > 1 and all(
+        ch.lower() in _KNOWN_DELETE_SWITCHES for ch in body
+    ):
+        return True
+    return False
+
 _REMOVE_ITEM_HINT = (
     "Remove-Item 目标越出你的授权树（boundary_root ∪ temp_dir ∪ extra_dirs）。"
     "改用 delete_directory 工具清理你自己 worktree 内的目录；"
@@ -369,11 +415,26 @@ def _is_within_any(path: str, roots: list[str]) -> bool:
     return False
 
 
-def _extract_delete_targets(tokens: list[str]) -> tuple[list[str], bool]:
-    """从删除命令 token 里取**目标路径**；返回 ``(targets, has_indirect)``。
+def _extract_delete_targets(tokens: list[str]) -> tuple[list[str], bool, bool]:
+    """从删除命令 token 里取**目标路径**。
 
-    只取删除族的**位置参数**（跳过开关与其值）。``has_indirect=True`` 表示
-    出现变量/命令替换等无法静态审计的引用 —— 调用方必须 fail-closed。
+    返回 ``(targets, has_indirect, skipped_suspicious)``。
+
+    - ``has_indirect=True``：出现变量/命令替换等无法静态审计的引用 ⇒ 调用方
+      必须 fail-closed。
+    - ``skipped_suspicious=True``（P0-2，2026-09-12）：解析器**认出了某个
+      token 但主动跳过它**，且无法证明它一定不是目标（未知开关、带值开关的
+      取值歧义等）。
+
+    为什么要第三个返回值：``targets=[]`` 有两种成因 —— 「命令真的没有目标」
+    与「解析器把目标吃掉了」。**两者都必须 fail-closed（都是 deny）**，但
+    typed code 与文案必须不同，否则诊断信息是错的：把「我解析不出来」说成
+    「你没有目标」，会让执行者按错误方向重写命令。
+
+    判据来源：我们自己的既有实现 + DSH `ApprovalOutcome` 的**判据**（
+    `unavailable ≠ rejected`，两者各有专属文案，绝不共用）。**注意只借判据
+    不借字段**：DSH 的实现细节（哪个错误码、哪个 stat 字段）强依赖其运行时
+    前提，照抄必错（MEMORY.md 纪律 #13）。
 
     覆盖 unix（rm -r / rm -rf）与 PowerShell（Remove-Item -Recurse -Force）：
     后者此前**完全没被覆盖**（fixplan §6 #15 的「实现坑」：
@@ -382,6 +443,7 @@ def _extract_delete_targets(tokens: list[str]) -> tuple[list[str], bool]:
     """
     targets: list[str] = []
     has_indirect = False
+    skipped_suspicious = False
     # 取值型开关（下一个 token 是它的值，不是目标路径）
     value_switches = {"-filter", "-include", "-exclude", "-path", "-literalpath"}
     i, n = 1, len(tokens)
@@ -419,6 +481,12 @@ def _extract_delete_targets(tokens: list[str]) -> tuple[list[str], bool]:
             ):
                 i += 2
                 continue
+            # ── 未知 `-` 开关：**无法证明它不是目标**（P0-2）────────────
+            # 已知开关（含 `-rf` 拼接形态）→ 正常跳过，不算可疑。
+            # 未知 → 如实标记「我跳过了可疑 token」，让调用方在 targets
+            # 为空时能给出正确归因（P2-4.3 值开关表不全的收口点）。
+            if not _is_known_delete_switch(tok):
+                skipped_suspicious = True
             i += 1
             continue
         if tok.startswith("/"):
@@ -434,7 +502,7 @@ def _extract_delete_targets(tokens: list[str]) -> tuple[list[str], bool]:
             continue
         targets.append(tok)
         i += 1
-    return targets, has_indirect
+    return targets, has_indirect, skipped_suspicious
 
 
 # cmd.exe 删除族的已知单字母/短开关（`del /s /q /f /a /p` 等）。
@@ -509,7 +577,7 @@ def resolve_delete_landing(
         first = tokens[0].lower()
         if first not in _DELETE_FAMILY:
             continue
-        targets, has_indirect = _extract_delete_targets(tokens)
+        targets, has_indirect, skipped_suspicious = _extract_delete_targets(tokens)
         if has_indirect:
             return GuardVerdict(
                 True, "deny",
@@ -519,11 +587,24 @@ def resolve_delete_landing(
                 "__delete_indirect__",
             )
         if not targets:
-            # 目标无法提取（如纯通配/无参数）→ 无法证明在边界内 → deny
+            # P0-2（2026-09-12）：空目标两态分开 —— 两者都 fail-closed（都
+            # deny），但 typed code 与文案不同，否则「我解析不出来」被说成
+            # 「你没有目标」，执行者会按错误方向重写命令。
+            # 判据借 DSH `ApprovalOutcome` 的「unavailable ≠ rejected，各有
+            # 专属文案」，**只借判据不借字段**。
             hint = (
                 _REMOVE_ITEM_HINT if first.startswith("remove")
                 else _DELETE_BOUNDARY_HINT
             )
+            if skipped_suspicious:
+                return GuardVerdict(
+                    True, "deny",
+                    f"{hint} 命令里含**无法归类的开关**，解析器跳过了它 —— "
+                    "无法证明该 token 不是删除目标（可能是某个带值开关的值）。"
+                    "已 fail-closed 拒绝。请用字面路径重写，或改用专用工具"
+                    "（如 delete_directory）。",
+                    "__delete_target_unparsed__",
+                )
             return GuardVerdict(True, "deny", hint, "__delete_no_target__")
         for t in targets:
             cand = t

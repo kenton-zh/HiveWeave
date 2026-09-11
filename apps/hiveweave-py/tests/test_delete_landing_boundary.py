@@ -49,26 +49,26 @@ class TestRemoveItemPathExtraction:
 
 class TestDeleteTargetExtraction:
     def test_powershell_flags_skipped(self):
-        targets, indirect = _extract_delete_targets(
+        targets, indirect, _skipped = _extract_delete_targets(
             ["remove-item", "-Recurse", "-Force", "D:/proj/tmp/x"]
         )
         assert targets == ["D:/proj/tmp/x"]
         assert indirect is False
 
     def test_path_switch_value_is_target(self):
-        targets, _ = _extract_delete_targets(
+        targets, _, _skipped = _extract_delete_targets(
             ["remove-item", "-Path", "D:/proj/tmp", "-Recurse"]
         )
         assert targets == ["D:/proj/tmp"]
 
     def test_unix_recursive_force(self):
-        targets, _ = _extract_delete_targets(["rm", "-rf", "frontend"])
+        targets, _, _skipped = _extract_delete_targets(["rm", "-rf", "frontend"])
         assert targets == ["frontend"]
 
     def test_indirect_reference_flagged(self):
         for cmd in (["rm", "-rf", "$TARGET"], ["rm", "-rf", "%TMP%"],
                     ["rm", "-rf", "`$x"], ["rm", "-rf", "$(pwd)/x"]):
-            _t, indirect = _extract_delete_targets(cmd)
+            _t, indirect, _skipped = _extract_delete_targets(cmd)
             assert indirect is True, cmd
 
 
@@ -262,23 +262,23 @@ class TestAgentDeleteLandingCwd:
 
 class TestSlashLeadingAbsolutePaths:
     def test_posix_absolute_survives_with_sibling_target(self):
-        targets, indirect = _extract_delete_targets(
+        targets, indirect, _skipped = _extract_delete_targets(
             ["rm", "-rf", "-q", "/etc/passwd", "D:/proj/build"]
         )
         assert indirect is False
         assert "/etc/passwd" in targets, f"绝对路径被当开关吞掉：{targets}"
 
     def test_posix_absolute_alone_survives(self):
-        targets, _ = _extract_delete_targets(["rm", "-rf", "/outside"])
+        targets, _, _skipped = _extract_delete_targets(["rm", "-rf", "/outside"])
         assert targets == ["/outside"]
 
     def test_root_slash_survives(self):
-        targets, _ = _extract_delete_targets(["rm", "-rf", "/"])
+        targets, _, _skipped = _extract_delete_targets(["rm", "-rf", "/"])
         assert "/" in targets
 
     def test_cmd_single_letter_switches_still_skipped(self):
         """cmd 的 `/s /q /f` 仍是开关 —— 修复不能把开关当路径。"""
-        targets, _ = _extract_delete_targets(
+        targets, _, _skipped = _extract_delete_targets(
             ["del", "/s", "/q", "D:/proj/build"]
         )
         assert targets == ["D:/proj/build"]
@@ -291,7 +291,7 @@ class TestSlashLeadingAbsolutePaths:
         """
         from hiveweave.services.command_guard import resolve_delete_landing
 
-        targets, _ = _extract_delete_targets(
+        targets, _, _skipped = _extract_delete_targets(
             ["del", "/s", "/q", "/outside", "D:/proj/build"]
         )
         assert "/outside" in targets
@@ -301,3 +301,63 @@ class TestSlashLeadingAbsolutePaths:
             boundary_root="D:/proj", temp_dir="D:/proj/.hiveweave/sandbox-temp/a1",
         )
         assert v is not None and v.action == "deny", "混合场景必须 deny"
+
+
+# ── P0-2（2026-09-12）：空目标两态必须可区分 ────────────────────────
+#
+# 两者都 fail-closed（都 deny），但 typed code 与文案不同：把「我解析不出来」
+# 说成「你没有目标」，执行者会按错误方向重写命令。
+# 判据借 DSH `ApprovalOutcome` 的「unavailable ≠ rejected，各有专属文案」。
+
+
+class TestEmptyTargetsTwoStates:
+    def test_unknown_switch_marks_skipped_suspicious(self):
+        """未知 `-` 开关 → 解析器如实标记"我跳过了可疑 token"。"""
+        targets, indirect, skipped = _extract_delete_targets(
+            ["rm", "-rf", "--some-unknown-flag"]
+        )
+        assert targets == []
+        assert indirect is False
+        assert skipped is True, "未知开关必须标记为 skipped_suspicious"
+
+    def test_known_flags_do_not_mark_skipped(self):
+        """已知开关（-r/-f/-Recurse/-Force）不算可疑 —— 否则误报成灾。"""
+        _t, _i, skipped = _extract_delete_targets(
+            ["rm", "-rf", "D:/proj/x"]
+        )
+        assert skipped is False
+
+    def test_no_args_at_all_is_genuinely_no_target(self):
+        """裸 `rm` 无参数 → 真·无目标，不是解析失败。"""
+        targets, indirect, skipped = _extract_delete_targets(["rm"])
+        assert targets == []
+        assert indirect is False
+        assert skipped is False
+
+    def test_typed_codes_differ_between_the_two_empty_states(self):
+        """核心断言：两种空态的 typed code **必须不同**。"""
+        from hiveweave.services.command_guard import resolve_delete_landing
+
+        v_no_target = resolve_delete_landing(
+            "rm -rf", boundary_root="D:/proj"
+        )
+        v_unparsed = resolve_delete_landing(
+            "rm -rf --unknown-flag", boundary_root="D:/proj"
+        )
+        assert v_no_target is not None and v_unparsed is not None
+        # 两者都是 fail-closed
+        assert v_no_target.action == "deny"
+        assert v_unparsed.action == "deny"
+        # 但 code 不同 —— 这正是 P0-2 的修复点
+        assert v_no_target.rule != v_unparsed.rule, (
+            "两种空目标共用了同一 typed code —— 诊断信息会是错的（P0-2）"
+        )
+        assert v_no_target.rule == "__delete_no_target__"
+        assert v_unparsed.rule == "__delete_target_unparsed__"
+
+    def test_unparsed_message_tells_you_it_could_not_parse(self):
+        from hiveweave.services.command_guard import resolve_delete_landing
+
+        v = resolve_delete_landing("rm -rf --unknown-flag", boundary_root="D:/proj")
+        # 文案必须说明是"解析不出来"，而不是"你没有目标"
+        assert "解析" in v.reason or "无法归类" in v.reason
