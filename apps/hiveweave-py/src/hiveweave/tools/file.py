@@ -58,7 +58,22 @@ def record_file_version(path: str | Path) -> None:
 
 
 def check_file_version(path: str | Path) -> str | None:
-    """返回「已变」描述；无历史记录或未变化返回 None。"""
+    """返回「已变」的**动作指引**；无历史记录或未变化返回 None。
+
+    #10（2026-09-11，用户拍板「只给动作，别叠加证据」）：**停止打印版本证据**。
+
+    原实现返回 `f"size {known[1]}B → {cur[1]}B"` —— 但版本元组是
+    `(st_mtime_ns, st_size)`，只印 size ⇒ **同长度内容改动时打印
+    `size 1077B → 1077B`，两个相等的数字**。那不是证据，是**伪造证据**：
+    它声称"文件变了"却给出一个看不出变化的量，模型既无法据此判断、又会
+    得到一个自相矛盾的信号（DSH `fs-observation-policy/src/index.ts:61-88`
+    的设计立场正是**版本对模型不透明**、失败只抛 typed code、**绝不打印
+    `(mtime,size)`**）。
+
+    ⇒ 现在只回**动作**（重读后再改），不伪装成"我给你看了差异"。
+    差异维度（mtime / hash）对**平台诊断**仍有用，但它属于日志，
+    **不属于给模型的回执** —— 两处混用正是原 bug 的来源。
+    """
     try:
         st = Path(path).stat()
         key = str(Path(path).resolve())
@@ -69,7 +84,8 @@ def check_file_version(path: str | Path) -> str | None:
         known = _version_cache.get(key)
     if known is None or known == cur:
         return None
-    return f"size {known[1]}B → {cur[1]}B since your last access"
+    # typed code（DSH 风格：可机检、可路由，而不是自由文本）
+    return "FS_NOT_OBSERVED"
 
 
 def clear_file_versions_for_tests() -> None:

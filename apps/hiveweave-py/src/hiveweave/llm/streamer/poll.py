@@ -57,11 +57,21 @@ async def _build_obligations_snapshot(agent_id: str) -> str:
             return "\nCurrent obligations: none — safe to commit_turn(waiting)."
         lines = ["\nCurrent obligations (act directly, do NOT re-poll):"]
         for ob in obligations[:8]:
-            tid = str(ob.get("id") or "")[:8]
+            # #9（2026-09-11）：此前这里印的是 `taskId=<前 8 位>` —— **把一个
+            # 被截断的 id 标成了权威字段名 `taskId=`**。模型照抄去 claim/submit
+            # 会失败（解析器只认完整 id 或唯一前缀），然后这次失败被归因成
+            # "模型幻觉 id"。**平台展示既要给可回填的值，又不能谎报它的身份。**
+            #
+            # 现在：给**完整 id**（`taskId=` 名副其实），另用 `shortId=` 显式
+            # 标注缩写身份 —— 名字不同，模型就不会把缩写当权威值用。
+            _tid_full = str(ob.get("id") or "")
             title = (ob.get("title") or "")[:40].replace("\n", " ")
             status = ob.get("status") or "?"
             role = ob.get("role_hint") or "?"
-            lines.append(f"  - [{role}/{status}] taskId={tid} {title}")
+            lines.append(
+                f"  - [{role}/{status}] taskId={_tid_full} "
+                f"(shortId={_tid_full[:8]}) {title}"
+            )
         if len(obligations) > 8:
             lines.append(f"  ... and {len(obligations) - 8} more")
         return "\n".join(lines)

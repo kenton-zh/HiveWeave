@@ -68,9 +68,21 @@ async def get_tasks_tool(
             except Exception:
                 pass
             return ToolResult.ok(body, tasks=[])
+        # #9（2026-09-11）：Tip 与**同屏展示**必须自洽。
+        #
+        # 原先的形态是平台自造矛盾：Tip 写「Do not truncate」，紧接着每行却
+        # 同时印 `id=<完整>` 与 `short=<前 8 位>` —— 同一份列表里给模型**两种**
+        # 可回填 id，且其中一个（`short=`）不告诉它"这是缩写"。实测后果：模型
+        # 抄 short= 去 claim/submit 失败，然后被当成"幻觉"。**这不是纯幻觉，
+        # 是平台给的输入自相矛盾。**
+        #
+        # 现在：**同屏只给一种可回填形态**（完整 id），Tip 宣传 = 实现。
+        # 8 位前缀解析**保留**（`resolve_task_id` 的既有能力，且有唯一性回退
+        # 与歧义候选报错），只是**不再在同屏主动推销第二种写法**。
         lines = [
             "Tip: copy the entire id= string from this listing into "
-            "claim/submit/review/cancel. Do not truncate.",
+            "claim/submit/review/cancel. An 8+ char unique prefix also "
+            "resolves, but the full id is always unambiguous.",
             # T4.3: evidence= 字段说明（submitGate 所需凭证 kind 前置可见）
             "evidence= lists the attestation kinds this task's submitGate "
             "requires — attach matching attestation ids at submit_task; "
@@ -305,7 +317,7 @@ async def get_tasks_tool(
             _ev = policy_required_kinds_label(str(t.get("policy_id") or ""))
             lines.append(
                 f"- [{t.get('status', '?')}] {t.get('title', '?')} "
-                f"(id={tk}, short={tk[:8]}, "
+                f"(id={tk}, "
                 f"progress={t.get('progress', 0)}%, "
                 f"assignee={t.get('assignee_id') or 'unassigned'})"
                 + (f" evidence={_ev}" if _ev else "")

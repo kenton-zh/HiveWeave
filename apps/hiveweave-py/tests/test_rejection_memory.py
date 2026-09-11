@@ -130,6 +130,33 @@ def test_stale_view_rejected_after_external_change(tmp_path):
     assert f.read_text(encoding="utf-8").startswith("v2")
 
 
+def test_stale_view_carries_typed_code_not_fake_evidence(tmp_path):
+    """#10（2026-09-11）：stale 回执**只给动作 + typed code，不给版本证据**。
+
+    原实现打印 `size {known}B → {cur}B` —— 但版本元组是 `(mtime_ns, size)`，
+    只印 size ⇒ 同长度内容改动时打印 `size 1077B → 1077B`（**两个相等的数字**）。
+    那不是证据，是**伪造证据**：声称"变了"却给出看不出变化的量。
+
+    ⇒ 现断言两件事：
+    1. **typed code `FS_NOT_OBSERVED` 在**（可机检、可路由，DSH 风格）；
+    2. **不再出现 `size ... B → ... B` 这种伪差异**（含相等数字的形态）。
+    """
+    f = _write(tmp_path, "same_len.txt", "aaaa\n")
+    record_file_version(f)
+    # 同长度内容改动 —— 正是原 bug 打印"两个相等 size"的场景
+    f.write_text("bbbb\n", encoding="utf-8")
+    msg = _apply_single(
+        {"op": "update", "filePath": "same_len.txt",
+         "oldString": "bbbb", "newString": "x"},
+        str(tmp_path),
+    )
+    assert "FS_NOT_OBSERVED" in msg, f"缺少 typed code：{msg!r}"
+    assert "RETRY[action=reread_file_then_reapply]" in msg
+    assert "size" not in msg, (
+        f"不得再打印版本证据（同长度改动会给出两个相等数字）：{msg!r}"
+    )
+
+
 def test_edit_after_read_allowed_and_updates_version(tmp_path):
     f = _write(tmp_path, "c.txt", "one two\n")
     record_file_version(f)

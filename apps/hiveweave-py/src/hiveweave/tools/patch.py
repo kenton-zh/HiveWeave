@@ -187,12 +187,16 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
         # 45 轮 P1「拒绝无记忆」③：edit 前版本戳——文件在最近一次读/写
         # 访问后被外部改动 → 陈旧视图早拒（逼重读），而不是烧在
         # oldString not found 上。
+        #
+        # #10（2026-09-11）：只给**动作**，不给版本证据（见
+        # `check_file_version` 的 docstring —— 印两个相等的 size 是伪造
+        # 证据）。typed code `FS_NOT_OBSERVED` 保留在文案里，便于机检/路由。
         stale = check_file_version(p)
         if stale:
             return (
                 f"ERROR: stale view: {file_path} changed since your last "
-                f"read ({stale}). Re-read the file, then re-apply. "
-                "RETRY[action=reread_file_then_reapply]"
+                f"read. Re-read the file, then re-apply. "
+                f"RETRY[action=reread_file_then_reapply] ({stale})"
             )
         try:
             content = p.read_text(encoding="utf-8", errors="replace")

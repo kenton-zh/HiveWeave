@@ -399,7 +399,18 @@ class CrudMixin:
     async def resolve_task_id(self, project_id: str, ref: str) -> str | None:
         """Resolve a task reference to a full UUID.
 
-        Accepts: full UUID, 8-char prefix (UI short id).
+        **契约（#9，2026-09-11 显式化）**——解析侧接受两种形态，且只有两种：
+
+        1. **完整 id**（权威形态，展示侧只推销这一种）；
+        2. **≥8 字符的前缀**（UI/回执里的缩写），要求**唯一**命中；
+           多义时返回 ``None``（由 ``require_task_id`` 抛出带候选列表的
+           可行动错误），**不做任意挑一个**。
+
+        ⚠️ <8 字符一律不解析（`len(raw) >= 8` 门槛）：前缀太短时碰撞概率显著
+        上升，"唯一命中"不再能证明是同一个任务 —— 宁可让调用方补全 id，
+        不可给一个可能是错的解。这条门槛与展示侧（`query.py` / `poll.py`）
+        的 `shortId=` 长度**必须一致**，否则又会出现"平台给的能填、解析器不认"。
+
         Returns None if not found / ambiguous.
         """
         await _ensure_schema(project_id)
