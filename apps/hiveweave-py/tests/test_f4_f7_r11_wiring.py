@@ -219,6 +219,49 @@ class _AllowAllPermission:
         return ("allow", None)
 
 
+class TestProjectRootRefusalAttribution:
+    """L19（2026-09-11，TEST_DSH_52_B 实测）：project-root 写入拒绝**是模型错误**，
+    不得置 `blocked` / `runner_failed`。
+
+    两者的语义都是「不是你的问题」——`ToolResult` docstring 明写 blocked =
+    「the platform refused to execute — **not a model mistake**」；runner_failed →
+    归因文案「命令未执行（执行器/方言/权限/审批）」。实测后果：agent 写错树后收到
+    「不是你的 bug」的信号 → 同一 run 连撞 2 次（青崖 11:20:39），还被 R7 记一笔。
+    """
+
+    @pytest.mark.asyncio
+    async def test_refusal_carries_no_platform_side_fact_bits(self, monkeypatch):
+        from hiveweave.tools import pipeline
+
+        monkeypatch.setattr(
+            pipeline,
+            "_refuse_project_root_write",
+            AsyncMock(return_value="Refusing apply_patch on project root …"),
+        )
+        result = await pipeline.execute_registered_tool(
+            tool_name="apply_patch",
+            raw_args={"patches": [{"filePath": "a.txt", "op": "add", "content": "x"}]},
+            agent_id="a1",
+            workspace_path=tempfile.mkdtemp(prefix="hw_root_"),
+            permission=_AllowAllPermission(),
+            approval=AsyncMock(),
+            ctx=None,
+        )
+        assert result is not None and result["success"] is False
+        # ⚠️ 必须先证明**确实走到了这个分支**：只断言 blocked/runner_failed 为空，
+        # 会在「参数校验失败 → 提前 return 一个无事实位的错误」时**假绿**
+        # （本用例第一版就是这样：摘掉 pipeline.py 后仍通过）。
+        assert "Refusing apply_patch on project root" in (result.get("error") or ""), (
+            f"没走到 project-root 拒分支（实际错误：{result.get('error')!r}）"
+        )
+        assert not result.get("blocked"), (
+            "写错树是模型错误，不能标 blocked（blocked 的定义是「不是模型错误」）"
+        )
+        assert not result.get("runner_failed"), (
+            "runner 侧无责；标了会给模型「不是你的 bug」的错误归因"
+        )
+
+
 class TestPipelineShellChokePoint:
     """`tools/pipeline.py` 的 shell 预检收口 —— 「命令从未执行」的统一出口。
 

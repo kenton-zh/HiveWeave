@@ -421,14 +421,26 @@ async def execute_registered_tool(
             return ToolResult.err(f"Error: Approval request failed: {exc}").to_dict()
 
     # BUG-9: writers must not silently dump files on project root when their
-    # worktree is missing — refuse and point them at ensure/heal.
-    # 平台路由护栏拒绝 → blocked_err（H3 分流），与权限/沙箱拒绝一致。
+    # worktree is missing — refuse and point them at ensure/heal。
+    #
+    # ⚠️ 事实位归属（2026-09-11 TEST_DSH_52_B 实测，L19）：这一拒**是模型错误**，
+    #   不能置 blocked / runner_failed —— 两者的语义都是「不是你的问题」：
+    #   · blocked（result.py docstring）："the platform refused to execute —
+    #     **not a model mistake** — so stall detection must not treat it as
+    #     model spinning"；
+    #   · runner_failed → 归因文案「命令未执行（执行器/方言/权限/审批）」。
+    #   实测后果：agent 把文件写到 project root 被拒后，收到「不是你的 bug」的
+    #   信号 → 同一 run 连撞 2 次（青崖 11:20:39）→ 还被 R7 记成「同人复撞」。
+    #   改判「普通工具失败」后，stall 归因落到 tool_failed（= 你自己的问题），
+    #   与拒绝文案给出的出路（写进自己的 worktree）方向一致。
+    #   （注意：bash 层的「cwd 不存在 / 沙箱越界」**不适用**同一判断 ——
+    #   那里可能是平台没把 worktree 建好，站在 agent 视角仍是平台前提缺失。）
     if tool_name in _WRITE_REQUIRE_WORKTREE_TOOLS:
         refuse = await _refuse_project_root_write(
             agent_id, workspace_path, tool_name, ctx
         )
         if refuse:
-            return ToolResult.blocked_err(refuse, runner_failed=True).to_dict()
+            return ToolResult.err(refuse).to_dict()
 
     # 4. Security checks (auto-injected based on security_level)
     if tool_def.security_level == "file_op":
