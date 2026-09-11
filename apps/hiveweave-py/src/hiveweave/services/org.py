@@ -1028,6 +1028,9 @@ class OrgService:
                 short_id=str(agent_before.get("short_id") or ""),
                 role=str(agent_before.get("role") or ""),
                 parent_id=parent_id or None,
+                # 批次 7 · 蓝图 :299：归档记忆挂到被解散 agent 的**真实模块**
+                # （不是 M3 的 agent_id 兜底），使继任者能按模块取回前任经验。
+                module_id=agent_before.get("module_id") or None,
             )
             if parent_id and dismissal.get("document_path"):
                 try:

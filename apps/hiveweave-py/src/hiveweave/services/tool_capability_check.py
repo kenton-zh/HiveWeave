@@ -64,6 +64,7 @@ EXEMPT_TOOLS = frozenset({
     "update_goals",
     "update_roster",
     "write_memory",
+    "consolidate_memories",
     "write_work_log",
     # ── 杂项只读/工具性 ──
     # （git_worktree_checkpoint 已收编 → SOURCE_WRITE，45 轮批次6）

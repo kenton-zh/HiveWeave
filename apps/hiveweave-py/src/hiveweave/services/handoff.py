@@ -391,10 +391,15 @@ class HandoffService:
         short_id: str = "",
         role: str = "",
         parent_id: str | None = None,
+        module_id: str | None = None,
     ) -> dict:
         """Dismissal handoff: write an agent's private memories to a doc,
         archive them (scope agent → archive), and record a handoff that
         REFERENCES the doc.
+
+        ``module_id``（批次 7 · 蓝图 :299）：被解散 agent 所属模块。
+        给了就写进归档记忆的 ``module_id``（接通「继任者按模块取前任经验」），
+        未给则沿用 M3 兜底（填 agent_id）。调用方应从 agents.module_id 传入。
 
         核心取向（用户定 2026-08-05）：交接只把文档引用交给上级，
         不把记忆内容灌进上级上下文——是否 read_file 读文档由上级决定。
@@ -508,6 +513,7 @@ class HandoffService:
                 try:
                     archived = await mem.archive_agent_memories(
                         agent_id, project_id, _write_lock=lock,
+                        module_id=module_id,
                     )
                 except Exception as e:
                     log.warning("dismissal_archive_failed",

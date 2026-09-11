@@ -404,6 +404,80 @@ class MemoryService:
                         error=str(e))
             return False
 
+    async def consolidate_memories(
+        self, agent_id: str, project_id: str, *, force: bool = False
+    ) -> dict:
+        """**主动/按需**压缩 agent 私有记忆 —— 不依赖对话压缩被动触发。
+
+        ## 为什么需要这个入口（批次 7 的最大缺口）
+
+        此前 `compacted_prefix`（持久化列）与 archive 层**只有对话压缩被动
+        触发**（唯一的调用点是 `conversation/store.py:454` 的
+        `maybe_compact_agent_memories`）。于是：
+
+        - agent 想「在长活开始前把旧记忆压一遍、给窗口腾地方」做不到；
+        - 中层在解散下属**之前**想把下属经验先整理成可检索形态，做不到；
+        - 想验证压缩是否有效（LLM 回调在不在、摘要质量如何）只能靠真实对话
+          撞到触发阈值。
+
+        本方法把同一条压缩路径（`_compact_agent_memories`，含 LLM 摘要 +
+        硬裁剪回退）**暴露成可按需调用的操作**。
+
+        **落点说明（避免过度承诺）**：本方法写的是 `memories` 表里的
+        `compressed_summary` 条目 + 旧条目的 `compressed` 标记（这正是
+        `build_agent_context` 快照的输入）。`agents.compacted_prefix` 列由
+        `conversation/store.py::_persist_compaction` 写入 —— 它同时要重写
+        conversation_turns，**不能**从记忆侧单独调用。因此主动压完之后，
+        快照会随**下一次**对话压缩写进 `compacted_prefix`（持久化，重启仍
+        生效）；在那之前快照经 `build_agent_context` 即时可读。
+        这条边界是真实的，写在这里免得调用方以为调一次就落了前缀。
+
+        ``force=False``（默认）：沿用 `_COMPACT_TRIGGER` 阈值（未到阈值不动，
+        与被动路径完全一致 —— 主动不是「无条件」）。
+        ``force=True``：跳过阈值，立刻压一次（用于「我知道我现在要整理记忆」
+        的场景，如长活前 / 交接前）。
+
+        返回诊断 dict（**不只返回 bool**：主动入口的调用方需要知道「到底做没做、
+        为什么没做」，否则「调了但无事发生」会成为新的静默点）：
+          - ``compacted``: bool —— 是否执行了压缩
+          - ``reason``: str —— 未压缩时的原因（``below_trigger`` / ``error``）
+          - ``fresh_before``: int —— 压缩前未压缩条数
+          - ``success``: bool —— 压缩是否走了 LLM 摘要（False = 硬裁剪回退）
+        """
+        try:
+            fresh_before = await self._count_fresh(agent_id, project_id)
+        except Exception as e:
+            log.warning("memory_consolidate_count_failed", agent_id=agent_id,
+                        error=str(e))
+            return {"compacted": False, "reason": "error",
+                    "fresh_before": 0, "success": False}
+
+        if not force and fresh_before < _COMPACT_TRIGGER:
+            return {"compacted": False, "reason": "below_trigger",
+                    "fresh_before": fresh_before, "success": False}
+
+        try:
+            async with _compact_lock(project_id, agent_id):
+                if not force and await self._count_fresh(
+                    agent_id, project_id
+                ) < _COMPACT_TRIGGER:
+                    # 等锁期间可能已被被动压缩压下去了 —— 不重复压。
+                    return {"compacted": False, "reason": "below_trigger",
+                            "fresh_before": fresh_before, "success": False}
+                result = await self._compact_agent_memories(agent_id, project_id)
+                log.info(
+                    "memory_consolidated_on_demand",
+                    agent_id=agent_id, force=force,
+                    fresh_before=fresh_before, success=result,
+                )
+                return {"compacted": True, "reason": "ok",
+                        "fresh_before": fresh_before, "success": result}
+        except Exception as e:
+            log.warning("memory_consolidate_failed", agent_id=agent_id,
+                        error=str(e))
+            return {"compacted": False, "reason": "error",
+                    "fresh_before": fresh_before, "success": False}
+
     async def _count_fresh(self, agent_id: str, project_id: str) -> int:
         """未压缩记忆条数（排除 compressed_summary 条目）。"""
         conn = await self._conn(project_id)
@@ -582,18 +656,30 @@ class MemoryService:
         return False
 
     async def archive_agent_memories(self, agent_id: str, project_id: str,
-                                     _write_lock: asyncio.Lock | None = None) -> int:
+                                     _write_lock: asyncio.Lock | None = None,
+                                     module_id: str | None = None) -> int:
         """Archive an agent's private memories (scope: agent → archive).
 
         ``_write_lock``：可选，调用方已持有的 per-workspace 写锁（解散交接时
         读快照→归档需在同一次锁内原子完成，审计 2026-08-05 H2）。未传则自行获取。
 
-        M3 (审计 2026-08-05)：工具写入的记忆多为 NULL module_id，归档时兜底
-        记为 agent_id，使继任者可经 get_archived_memories(project_id, agent_id)
-        按前任检索，不依赖文档为唯一存续载体。
+        ``module_id``（批次 7 · 蓝图 :299）：把归档记忆**归属到真实模块**。
+        - 给了 → 无 module_id 的条目填该模块 id；已有 module_id 的条目保留原值
+          （写入时若已挂真模块，那是更精确的归属，不该被归档动作覆盖）。
+        - 未给 → 回退 M3 兜底（填 ``agent_id``），使继任者可经
+          ``get_archived_memories(project_id, agent_id)`` 按前任检索，不依赖
+          文档为唯一存续载体。
+
+        **为什么要这个参数**：M3 的兜底让 ``memories.module_id`` 里存的是前任的
+        ``agent_id``（不是模块 id），于是蓝图 :299 的「按模块取前任经验」实际
+        退化成「按前任 id 取」—— 模块树建起来后仍是断的。批次 7 提供真实模块
+        实体后，归档时把真 module_id 传进来即可接通整条链路
+        （服务端消费端口见 ``services/modules.py:get_archived_memories_for_module``）。
         """
         now_ms = int(time.time() * 1000)
         conn = await self._conn(project_id)
+        # 归档归属：优先真模块 id，缺失才回退 agent_id（M3）。
+        fallback = module_id or agent_id
         # 写事务互斥（TEST18 审计 S1）：整段持 per-workspace 锁，同 save_memory。
         workspace = await meta_db.get_project_workspace(project_id)
         if not workspace:
@@ -606,7 +692,7 @@ class MemoryService:
                     "UPDATE memories SET scope = 'archive', "
                     "module_id = CASE WHEN module_id IS NULL THEN ? ELSE module_id END, "
                     "updated_at = ? WHERE agent_id = ? AND scope = 'agent'",
-                    [agent_id, now_ms, agent_id])
+                    [fallback, now_ms, agent_id])
                 await conn.commit()
             except Exception:
                 try:
@@ -621,7 +707,7 @@ class MemoryService:
                         "UPDATE memories SET scope = 'archive', "
                         "module_id = CASE WHEN module_id IS NULL THEN ? ELSE module_id END, "
                         "updated_at = ? WHERE agent_id = ? AND scope = 'agent'",
-                        [agent_id, now_ms, agent_id])
+                        [fallback, now_ms, agent_id])
                     await conn.commit()
                 except Exception:
                     try:
@@ -633,7 +719,8 @@ class MemoryService:
         await cursor.close()
         # R5: 只清该 agent 的私有缓存（archive 层由 TTL 自然过期）
         self.invalidate(project_id, agent_id=agent_id, scope="agent")
-        log.info("memory_archived", agent_id=agent_id, count=count)
+        log.info("memory_archived", agent_id=agent_id, count=count,
+                 module_id=module_id)
         return count
 
     async def build_project_context(self, project_id: str) -> str | None:

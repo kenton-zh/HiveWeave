@@ -31,7 +31,7 @@ _BASE_TOOLS = frozenset({
     "calculate",
     "schedule_alarm", "list_alarms", "cancel_alarm",
     "review", "read_file", "list_files", "read_skill", "list_available_skills",
-    "read_memory", "write_memory",
+    "read_memory", "write_memory", "consolidate_memories",
     "send_message", "message_superior", "message_subordinate",
     "message_peer", "message_team",
     "ask_agent", "notify_agent", "commit_turn", "defer_task_advance",

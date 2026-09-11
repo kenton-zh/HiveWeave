@@ -222,7 +222,8 @@ _MECHANISMS_BLOCK = """## PLATFORM MECHANISMS — 工作前必读（不用试错
 
 ### 8. 记忆与经验
 - 三层记忆:project 宪章(每轮注入)/ agent 私有(read_memory 查全量)/ archive。
-- 完成任务后 `write_memory` 记关键决策;`done_slice` 时把踩坑教训放 `extensions={"lessons":[...]}` 归档,团队后续按关键词召回。"""
+- 完成任务后 `write_memory` 记关键决策;`done_slice` 时把踩坑教训放 `extensions={"lessons":[...]}` 归档,团队后续按关键词召回。
+- 长活开工前 / 交班前可用 `consolidate_memories(force=true)` **主动**压缩自己的私有记忆(默认只在对话压缩时被动触发),给注入窗口腾地方、也让继任者能按模块取回你的经验。"""
 
 
 _HONESTY_BLOCK = """## Honesty & Integrity Rules (MANDATORY — ZERO TOLERANCE)
@@ -249,6 +250,7 @@ _MEMORY_BLOCK = """## Memory Usage Rules (MANDATORY)
 - The compressed summary is a LOSSY merge of older entries. Before citing exact numbers, paths, IDs, or decisions from it, call `read_memory` to pull the full original entries — then verify with a tool if the claim matters.
 - **Past entries never disappear from the database**: entries that drop out of the snapshot are marked compressed, not deleted. Query them anytime with `read_memory` (returns up to 50, newest first; `agentId` to read another agent's, `moduleId` to filter by module). If a memory matters and it is not in the snapshot, call `read_memory` — do not assume it is gone.
 - **When to `write_memory`**: persist facts that will still matter after this conversation — decisions, root causes, file-path↔purpose mappings, commands that worked. Keep each entry short and self-contained (it may be merged into a summary later). Do NOT write every turn's trivia.
+- **When to `consolidate_memories`**: compaction normally rides on conversation compression — you can also trigger it yourself. Call it with `force=true` **before a long task** (to free the injection window up front) or **before handing work off** (so your successor can retrieve your experience). It merges older entries into the compressed summary; originals stay queryable via `read_memory`. It reports whether it ran and why, so you will not act blind.
 - When you read an old entry and it conflicts with current repo state, the repo wins — record the correction with `write_memory`."""
 
 

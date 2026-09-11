@@ -1114,6 +1114,74 @@ async def write_memory_tool(
         return ToolResult.err(f"Failed to write memory: {e}")
 
 
+# ── consolidate_memories ─────────────────────────────────
+
+
+class ConsolidateMemoriesParams(BaseModel):
+    """Parameters for consolidate_memories tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    force: bool = Field(
+        default=False,
+        description=(
+            "false (default): only compact if the uncompressed count has "
+            "reached the trigger threshold — same as the passive path. "
+            "true: compact now regardless (use before a long task or a handoff)."
+        ),
+        json_schema_extra={"aliases": ["now", "always"]},
+    )
+
+
+@tool(
+    "consolidate_memories",
+    "Actively compacts your own private memory NOW, instead of waiting for "
+    "conversation compaction to trigger it. Older entries get merged into a "
+    "compressed summary (originals are kept and remain queryable via "
+    "read_memory; nothing is deleted unless the summarizer is unavailable, in "
+    "which case the oldest entries are trimmed to keep the window bounded). "
+    "Use it before starting a long task (to free the injection window) or "
+    "before handing off (so your successor can retrieve your experience). "
+    "Returns whether compaction ran, why, and how many entries were fresh.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def consolidate_memories_tool(
+    params: ConsolidateMemoriesParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """On-demand compaction of the caller's own private memory."""
+    from hiveweave.services.memory import MemoryService
+
+    project_id = await get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project")
+
+    mem = MemoryService()
+    try:
+        diag = await mem.consolidate_memories(
+            agent_id, project_id, force=bool(params.force)
+        )
+    except Exception as e:
+        return ToolResult.err(f"Failed to consolidate memories: {e}")
+
+    if not diag.get("compacted"):
+        reason = diag.get("reason") or "unknown"
+        if reason == "below_trigger":
+            return ToolResult.ok(
+                f"Not compacted: only {diag.get('fresh_before', 0)} fresh "
+                "entr(ies) — below the trigger threshold. Pass force=true to "
+                "compact anyway."
+            )
+        return ToolResult.ok(f"Not compacted ({reason}).")
+
+    mode = "LLM summary" if diag.get("success") else "hard-trim fallback"
+    return ToolResult.ok(
+        f"Memory compacted ({mode}); {diag.get('fresh_before', 0)} fresh "
+        "entr(ies) were in the window before compaction. Originals remain "
+        "queryable via read_memory."
+    )
+
+
 # ── read_work_logs ───────────────────────────────────────
 
 

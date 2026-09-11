@@ -990,6 +990,16 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["content"],
     },
+    "consolidate_memories": {
+        "description": (
+            "Actively compact your own private memory now (instead of waiting "
+            "for conversation compaction). force=true bypasses the threshold."
+        ),
+        "properties": {
+            "force": {"type": "boolean", "aliases": ["now", "always"]},
+        },
+        "required": [],
+    },
     "list_available_skills": {
         "description": (
             "List skills (built-in + marketplace). Marketplace rows are "
