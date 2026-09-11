@@ -278,7 +278,6 @@ def test_budget_exhausted_result_explains_even_without_text():
         tool_turn_acc=[],
         round_num=1,
         last_usage=None,
-        usage_rounds=[],
     )
     assert result["budget_exhausted"] is True
     assert result["content"].startswith("[TURN BUDGET] Hard turn budget exhausted")
@@ -301,7 +300,6 @@ def test_budget_exhausted_result_preserves_current_round_thinking():
         tool_turn_acc=tool_turn_acc,
         round_num=2,
         last_usage=None,
-        usage_rounds=[],
         current_reasoning="被切断轮的思考",
     )
     final_msg = result["tool_turn_messages"][-1]

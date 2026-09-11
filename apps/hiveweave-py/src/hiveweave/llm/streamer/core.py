@@ -268,7 +268,14 @@ class Streamer(
         error_status: int | None = None,
         error_headers: dict[str, str] | None = None,
     ) -> dict:
-        """构建错误结果 dict。"""
+        """构建错误结果 dict。
+
+        L4（2026-09-11）：**不再携带 ``usage_rounds``**。原键恒为 ``[]`` 且注释
+        自称「错误路径无成功轮次数据」—— 那是**越界断言**：整轮硬超时时轮次
+        早已跑完，数据就在调用方的 ``usage_sink`` 里。该键的存在正是「两个
+        权威源」分叉的根（R11 实测 7/7 终止 run 零账）。
+        现在 usage **只经 sink** 推送，本函数不参与记账，也不许声明「没有」。
+        """
         return {
             "status": "error",
             "content": "",
@@ -277,7 +284,6 @@ class Streamer(
             "tool_turn_messages": [],
             "rounds": 0,
             "usage": None,
-            "usage_rounds": [],  # token metering: 错误路径无成功轮次数据
             "error": message,
             "duration_ms": int((time.monotonic() - start_time) * 1000),
             **(

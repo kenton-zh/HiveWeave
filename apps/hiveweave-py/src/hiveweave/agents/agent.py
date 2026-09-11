@@ -121,29 +121,6 @@ _MAIN_LOOP_STREAM_RETRIES = int(
 )
 
 
-def _usage_rounds_delivered(result: object) -> bool:
-    """P1-6 / R11（TEST_DSH_50/51，2026-09-10）：streamer 是否真的把本轮 usage 交出来了。
-
-    只有交出来（``usage_rounds`` 非空）才允许清空 ``agent._pending_usage``。
-
-    为什么不能无条件清空：``llm/streamer/core.py::_error_result`` 构造的
-    error 结果里 ``usage_rounds`` 恒为 ``[]``（该函数注释自称「错误路径无
-    成功轮次数据」，实为越界断言——整轮硬超时时轮次早已跑完，数据就在
-    ``_pending_usage`` 这个 sink 里）。而 ``token_meter.record_rounds`` 遇到
-    空列表直接 ``return`` 什么都不写，此时再 clear() 就把 sink 里已累积的
-    usage 销毁 —— 而 ``recovery.py::_flush_pending_usage``（F6，08-30）
-    正是靠它给终止 run 补账，拿到空列表只能记一条
-    ``interrupted_usage_flush_empty`` 然后放弃。
-
-    实测后果：50 的 9 个终止 run 中 7 个零账、51 的 7 个全零账，
-    4 个 600s 硬杀 run 无一例外（regression_check R11 = 7 / 7）。
-    """
-    if not isinstance(result, dict):
-        return False
-    rounds = result.get("usage_rounds")
-    return bool(rounds)
-
-
 async def _flush_usage_at_loop_exit(agent: object, *, reason: str) -> None:
     """循环出口前把 sink 里「已推进但尚未落库」的 usage 交接给恢复路径落账。
 
@@ -1403,7 +1380,11 @@ class Agent:
                 )
 
                 # Token metering: 主对话路径落库（best-effort，不阻塞主流程）。
-                # usage_rounds 由 streamer 在全部 return 分支携带。
+                # L4（2026-09-11）：**从 sink 取，不从 result 取** —— sink 是
+                # usage 的唯一权威源（result 里的 usage_rounds 已退役）。
+                # 原设计有两个源且会分叉：error 路径的 result 恒空，而轮次
+                # 早已推入 sink → 紧跟着的 clear() 把账销毁（R11 实测 7/7）。
+                # 现在「有没有账」只有 sink 能回答，分叉从根上消失。
                 # TEST_DSH_32 O2（测量补齐）：task_id 归属——此前
                 # _current_task_id 从未赋值导致 llm_usage.task_id 全空。
                 # best-effort 解析当前 assignee 活动任务（running/claimed）。
@@ -1429,52 +1410,40 @@ class Agent:
                             agent_id=self.id,
                             error=str(_te),
                         )
+                _rounds_this_attempt = list(self._pending_usage)
                 await token_meter.record_rounds(
                     agent_id=self.id,
                     project_id=self.project_id,
                     run_id=self._current_run_id,
                     task_id=getattr(self, "_current_task_id", None),
-                    rounds=result.get("usage_rounds", []),
+                    rounds=_rounds_this_attempt,
                     model_id=model_config.get("model_id"),
                     provider=model_config.get("provider_type"),
                     request_type="main",
                 )
-                # P1-6：正常路径已整批落库，清空实时 sink —— 否则后续
-                # turn 被取消时会 flush 到跨 turn 的陈旧 usage 造成双计。
+                # P1-6：正常路径已整批落库 —— 清空 sink，否则后续 turn 被
+                # 取消时会 flush 到跨 turn 的陈旧 usage 造成双计。
                 #
-                # TEST_DSH_50/51 R11 修复（2026-09-10）：**必须带条件**。
-                # error / 整轮硬超时兜底路径的 result 由
-                # `llm/streamer/core.py::_error_result` 构造，其 usage_rounds
-                # 恒为空列表（该函数注释自称「错误路径无成功轮次数据」，实为
-                # 越界断言：硬超时时轮次早已跑完，数据就在下面的 sink 里）。
-                # 此时 record_rounds 因 `if not rounds: return` 什么都没写，
-                # 紧跟着无条件 clear() 就把 sink 里已累积的 usage 销毁 ——
-                # 而 `recovery.py::_flush_pending_usage`（F6，08-30）正是靠
-                # 这个 sink 给终止 run 补账，拿到空列表只能记一条
-                # `interrupted_usage_flush_empty` 然后放弃。
-                # 实测：50 的 9 个终止 run 中 7 个零账、51 的 7 个全零账，
-                # 4 个 600s 硬杀 run 无一例外（R11 = 7 / 7）。
-                if _usage_rounds_delivered(result):
-                    self._pending_usage.clear()
-                else:
-                    # 留给 _flush_pending_usage 兜（error / safety_timeout /
-                    # cancel 三条恢复路径都会调它）。若这里 sink 也是空的，
-                    # 说明流零 chunk 即被掐，那条路径自身会留痕。
-                    log.info(
-                        "pending_usage_kept_for_recovery",
-                        agent_id=self.id,
-                        run_id=self._current_run_id,
-                        status=result.get("status"),
-                        pending=len(self._pending_usage),
-                    )
+                # L4（2026-09-11）根因修复：**清空的条件不再是「result 交了没」**
+                # （那个 gate 本身就是在补偿分叉），而是「本 attempt 的轮次是否
+                # 已全部推完」——而 sink 快照被 record_rounds 消费这件事就是
+                # 那个事实本身。record_rounds 对空列表只留 info 日志（留痕），
+                # 所以这里无条件 clear 是安全的：**没有账可丢**。
+                # 历史（供回溯）：原 `_usage_rounds_delivered(result)` 门控 +
+                # `_error_result` 恒空键的组合曾把 sink 里已累积的 usage 销毁，
+                # 导致 50 的 9 个终止 run 中 7 个零账、51 的 7 个全零账。
+                self._pending_usage.clear()
 
                 # P1-3 Phase 0：首请求 usage 回读，与前缀指纹 verdict
                 # 联合合成最终分类（hit_ok / cache_window_expired /
                 # drift_zero_hit）。best-effort。
+                # L4：首轮取自上一步的 sink 快照（不再是 result 的键）。
                 try:
                     from hiveweave.llm.streamer.probe import report_cache_readout
 
-                    _first_round = (result.get("usage_rounds") or [None])[0]
+                    _first_round = (
+                        _rounds_this_attempt[0] if _rounds_this_attempt else None
+                    )
                     if _first_round:
                         _probe = report_cache_readout(
                             self.id,

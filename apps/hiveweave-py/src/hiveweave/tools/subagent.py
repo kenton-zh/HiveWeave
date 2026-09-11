@@ -619,8 +619,13 @@ async def _run_subagent(
     streamer = Streamer(max_tool_rounds=SUBAGENT_MAX_TOOL_ROUNDS)
     # P1-6：子代理 usage 与父共享 sink —— 子代理 token 归父账户；父被取消时
     # 子代理协程一并中断（自身 record_rounds 不会执行），父 flush 兜住。
+    # L4（2026-09-11）：sink 是唯一权威源（result 里的 usage_rounds 已退役）。
+    # 子代理与父**共用**同一个 sink，但要按 `request_type="subagent"` 单独归属
+    # ⇒ 记下进入时的下标，结束时切片取「本子代理新增的那一段」——
+    # 这样父的 main 段落与子的 subagent 段落互不重叠、不会双计。
     if getattr(parent, "_pending_usage", None) is None:
         parent._pending_usage = []
+    _sink_base = len(parent._pending_usage)
 
     def _new_stream_coro():
         # 39 审计 P1-1 修复的姊妹语义（对齐主 agent 的 auto-retrigger）：
@@ -754,7 +759,8 @@ async def _run_subagent(
     # Token metering (F4): 子代理的 LLM usage 归属到父代理
     # （token 由父的模型配置/账户消耗），request_type="subagent" 标记来源，
     # run/task 沿用父的当前上下文，便于成本归因。best-effort 不阻塞。
-    rounds = result.get("usage_rounds") or []
+    # L4：取共享 sink 里**本子代理新增的那一段**（切片而非 result 键）。
+    rounds = list(parent._pending_usage[_sink_base:])
     if rounds:
         try:
             from hiveweave.services.token_meter import token_meter
@@ -771,6 +777,15 @@ async def _run_subagent(
         except Exception as meter_err:
             log.warning("subagent_token_meter_failed",
                         parent_id=parent.id, error=str(meter_err))
+        else:
+            # L4：已自行落库的轮次**从共享 sink 里摘掉** —— 否则父 attempt
+            # 失败重试时会把这一段当自己的账再记一遍（双计）。
+            # 按**元素身份**摘（不是按下标切片）：`await record_rounds` 会让出
+            # 控制权，期间可能有别的协程往同一个 sink 里追加，下标会漂。
+            _delivered_ids = {id(r) for r in rounds}
+            parent._pending_usage = [
+                r for r in parent._pending_usage if id(r) not in _delivered_ids
+            ]
 
     # P1-6/P2-5：子代理步骤留痕（父 run 的 run_steps，off-turn 用快照落账）
     child_ok = result.get("status") == "ok"

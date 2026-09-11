@@ -22,7 +22,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hiveweave.agents.agent import _usage_rounds_delivered
 from hiveweave.llm.streamer.core import Streamer
 from hiveweave.tools.bash import execute_run_command
 
@@ -41,37 +40,64 @@ def _sandbox_off(monkeypatch):
 
 
 class TestPendingUsageClearGate:
-    """`agent._pending_usage` 的清空门控 —— 终止 run 零账的直接原因。
+    """`agent._pending_usage` 清空 —— 终止 run 零账的根因（L4 已根治）。
 
-    链路：streamer 每轮把 usage 推进 sink → 硬超时走 `_error_result`
+    旧链路：streamer 每轮把 usage 推进 sink → 硬超时走 `_error_result`
     （`usage_rounds` 硬编码为空）→ `record_rounds([])` 静默 return →
     旧代码**无条件** `clear()` 把 sink 销毁 → `_flush_pending_usage`
     拿空 → 该 run 零账。
+
+    旧修法是加门控 `_usage_rounds_delivered(result)` 补偿分叉。
+    **L4（2026-09-11）的修法是删掉分叉本身**：result 不再携带 `usage_rounds`，
+    sink 成为唯一权威源，门控连同 `_error_result` 的空键一起退役。
+    本类改为钉住「分叉已消失」这一事实（原三条门控断言全部作废）。
     """
 
-    def test_real_error_result_does_not_count_as_delivered(self):
-        """用**真实的** `_error_result` 输出形状钉住门控语义。
+    def test_error_result_no_longer_declares_usage(self):
+        """L4 的有意行为变更：`_error_result` **不再**携带 `usage_rounds` 键。
 
-        若哪天后端让它带上 usage_rounds（那才是根治），本测试会失败并提醒
-        同步门控 —— 这是有意为之的「形状契约」测试。
+        原断言（`err["usage_rounds"] == []`）钉的是「越界断言的现状」——
+        即 error 路径自称"没有账"，而轮次其实就在 sink 里。该键正是分叉的
+        载体，现已删除。留此断言防止有人"顺手加回去"。
         """
         err = Streamer._error_result("请求总超时", time.monotonic())
-        assert err["usage_rounds"] == [], "预期 error 结果不带 usage（越界断言的现状）"
-        assert _usage_rounds_delivered(err) is False, (
-            "error 结果必须**不**触发清空 —— 否则 _flush_pending_usage 拿不到数据"
+        assert "usage_rounds" not in err, (
+            "L4：error 结果不得再声明 usage —— 记账权威源只有调用方的 sink"
         )
 
-    def test_normal_result_with_rounds_is_delivered(self):
-        """正常路径：streamer 交出了 usage → 允许清空（防止跨 turn 双计）。"""
-        ok = {"status": "ok", "usage_rounds": [{"input": 100, "output": 10}]}
-        assert _usage_rounds_delivered(ok) is True
+    def test_delivered_gate_is_gone(self):
+        """门控函数与它的补偿对象一起退役（无分叉则无需门控）。"""
+        import hiveweave.agents.agent as agent_mod
 
-    def test_empty_and_malformed_results_are_not_delivered(self):
-        """空列表 / 缺键 / 非 dict 一律不清空（保守侧，宁可留待 flush）。"""
-        assert _usage_rounds_delivered({"status": "ok", "usage_rounds": []}) is False
-        assert _usage_rounds_delivered({"status": "ok"}) is False
-        assert _usage_rounds_delivered(None) is False
-        assert _usage_rounds_delivered("not-a-dict") is False
+        assert not hasattr(agent_mod, "_usage_rounds_delivered"), (
+            "L4：门控是补偿分叉的贴丁，分叉删掉后它必须一起走"
+        )
+
+    def test_agent_records_from_sink_not_result(self):
+        """结构性绊线：主循环的记账取 sink 快照，不再读 result 的键。
+
+        用 AST 而非文本断言 —— 注释里也提到了 `usage_rounds`，文本匹配会
+        把注释当命中（假绿/假红都可能）。
+        """
+        import ast
+        import inspect
+
+        import hiveweave.agents.agent as agent_mod
+
+        src = inspect.getsource(agent_mod)
+        tree = ast.parse(src)
+        # 全文件不允许再出现对 result 的 usage_rounds 取值
+        hits = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Subscript)
+            and isinstance(n.slice, ast.Constant)
+            and n.slice.value == "usage_rounds"
+        ]
+        assert not hits, f"仍有 {len(hits)} 处从 dict 取 usage_rounds（应改读 sink）"
+        # 且必须真的从 sink 取快照
+        assert "_rounds_this_attempt = list(self._pending_usage)" in src, (
+            "记账必须取 sink 快照（sink = 唯一权威源）"
+        )
 
 
 class TestLoopExitUsageHandoff:

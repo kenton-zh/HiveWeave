@@ -38,7 +38,6 @@ def test_budget_close_content_is_last_round_plus_note():
         tool_turn_acc=tool_turn_acc,
         round_num=3,
         last_usage=None,
-        usage_rounds=[],
     )
     assert result["status"] == "ok"
     # content 只含末轮正文 + 收口说明，不再整轮拼接
@@ -62,7 +61,6 @@ def test_budget_close_with_empty_history_falls_back_to_note():
         tool_turn_acc=tool_turn_acc,
         round_num=1,
         last_usage=None,
-        usage_rounds=[],
     )
     assert result["content"].startswith("[TURN BUDGET]")
     assert result["content"] == tool_turn_acc[-1]["content"]
@@ -80,7 +78,6 @@ def test_budget_close_custom_note_respected():
         tool_turn_acc=tool_turn_acc,
         round_num=2,
         last_usage=None,
-        usage_rounds=[],
         note="[TURN BUDGET] custom guidance",
     )
     assert result["content"] == (
@@ -103,7 +100,6 @@ def test_budget_close_skips_tool_and_empty_messages():
         tool_turn_acc=tool_turn_acc,
         round_num=3,
         last_usage=None,
-        usage_rounds=[],
     )
     assert result["content"].startswith("第三轮：结论已得出。")
 
@@ -128,7 +124,6 @@ async def test_budget_close_content_never_repeats_earlier_rounds():
         tool_turn_acc=tool_turn_acc,
         round_num=2,
         last_usage=None,
-        usage_rounds=[],
     )
     assert "Reçu :" not in result["content"]
     assert result["content"].startswith("Structure vue")

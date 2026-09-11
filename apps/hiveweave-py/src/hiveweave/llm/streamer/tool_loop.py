@@ -210,7 +210,6 @@ class ToolLoopMixin:
         tool_turn_acc: list[dict],
         round_num: int,
         last_usage: dict | None,
-        usage_rounds: list[dict],
         note: str | None = None,
         reason: str = "hard_budget",
         current_reasoning: str = "",
@@ -290,7 +289,6 @@ class ToolLoopMixin:
             "tool_turn_messages": tool_turn_acc,
             "rounds": round_num,
             "usage": last_usage,
-            "usage_rounds": usage_rounds,
             "budget_exhausted": True,
             "steering_reason": reason,
         }
@@ -398,9 +396,6 @@ class ToolLoopMixin:
         # E14: 轮次疏导线提示一次性（不重复塞系统消息浪费 token）
         force_commit_hint_injected = False
 
-        # Token metering: 累加每轮归一化 usage（供 agent 层落库）。
-        # 每轮只保留末轮 usage 在 last_usage，中间轮在这里累积。
-        usage_rounds: list[dict] = []
 
         for round_num in range(rounds_cap):
             now_mono = time.monotonic()
@@ -426,7 +421,6 @@ class ToolLoopMixin:
                         tool_turn_acc=tool_turn_acc,
                         round_num=round_num,
                         last_usage=last_usage,
-                        usage_rounds=usage_rounds,
                     )
                 await self._fire_delta(on_delta, {
                     "type": "error",
@@ -493,7 +487,6 @@ class ToolLoopMixin:
                     tool_turn_acc=tool_turn_acc,
                     round_num=round_num,
                     last_usage=last_usage,
-                    usage_rounds=usage_rounds,
                     note=(
                         f"[TURN ROUND CAP] 单 turn 超过疏导线宽限"
                         f"（{trigger} 线触发：{FORCE_COMMIT_ROUNDS} 轮或"
@@ -534,7 +527,6 @@ class ToolLoopMixin:
                     tool_turn_acc=tool_turn_acc,
                     round_num=round_num,
                     last_usage=last_usage,
-                    usage_rounds=usage_rounds,
                 )
             # 预算 pacing 提示（疏通层 2026-08-08）：在撞任何闸口【之前】
             # 把预算状态告诉 agent —— 剩余硬预算首次低于阈值（默认 300s，
@@ -673,7 +665,8 @@ class ToolLoopMixin:
                                 )
                             p_usage["ts"] = int(time.time() * 1000)
                             p_usage["partial"] = True
-                            usage_rounds.append(p_usage)
+                            # L4（2026-09-11）：**只经 sink**推送 —— result 里
+                            # 的 usage_rounds 已退役（两个权威源会分叉）。
                             if usage_sink is not None:
                                 try:
                                     usage_sink(p_usage)
@@ -695,7 +688,6 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
-                    "usage_rounds": usage_rounds,
                     "error": round_result.get("error"),
                     "error_status": round_result.get("error_status"),
                     "error_headers": round_result.get("error_headers"),
@@ -734,10 +726,11 @@ class ToolLoopMixin:
                 # 在 run 结束，created_at 若统一盖 end 章，按小时指标与时间
                 # 对齐分析全部失真（本轮审计两度被误导）。写路径不变，仅补时刻。
                 usage["ts"] = int(time.time() * 1000)
-                usage_rounds.append(usage)
                 # P1-6：usage 实时推给调用方（取消/中断路径不依赖最终 return ——
-                # 用户取消时 result 永不返回，账本会蒸发）。与 append 同域，
-                # 保证 sink 只收有效 usage。
+                # 用户取消时 result 永不返回，账本会蒸发）。
+                # L4（2026-09-11）：sink 是**唯一权威源** —— 原 `usage_rounds`
+                # 本地累加器与 result 键全部退役，两处记录同一件事必然分叉
+                # （`_error_result` 恒空 vs sink 有数据，即 R11 的 7/7 零账）。
                 if usage_sink is not None:
                     try:
                         usage_sink(usage)
@@ -787,7 +780,6 @@ class ToolLoopMixin:
                         "tool_turn_messages": tool_turn_acc,
                         "rounds": round_num + 1,
                         "usage": last_usage,
-                        "usage_rounds": usage_rounds,
                     }
                 tool_calls = [
                     tc for tc in tool_calls
@@ -855,7 +847,6 @@ class ToolLoopMixin:
                     tool_turn_acc=tool_turn_acc,
                     round_num=round_num + 1,
                     last_usage=last_usage,
-                    usage_rounds=usage_rounds,
                     current_round_text=new_text,
                     current_reasoning=(
                         new_thinking if provider.supports_thinking else ""
@@ -881,7 +872,6 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
-                    "usage_rounds": usage_rounds,
                 }
 
             if finish_reason == "length":
@@ -899,7 +889,6 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
-                    "usage_rounds": usage_rounds,
                 }
 
             if finish_reason == "content_filter":
@@ -917,7 +906,6 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
-                    "usage_rounds": usage_rounds,
                 }
 
             # 有 tool_calls → 执行工具，继续循环
@@ -1023,7 +1011,6 @@ class ToolLoopMixin:
                             "tool_turn_messages": tool_turn_acc,
                             "rounds": round_num + 1,
                             "usage": last_usage,
-                            "usage_rounds": usage_rounds,
                             "error": f"Doom loop detected: tool '{doom}' called "
                                      f"{limit}+ times with same args (after warning)",
                         }
@@ -1059,7 +1046,6 @@ class ToolLoopMixin:
                         tool_turn_acc=tool_turn_acc,
                         round_num=round_num + 1,
                         last_usage=last_usage,
-                        usage_rounds=usage_rounds,
                         current_round_text=new_text,
                         current_reasoning=(
                             new_thinking if provider.supports_thinking else ""
@@ -1166,7 +1152,6 @@ class ToolLoopMixin:
                         "tool_turn_messages": tool_turn_acc,
                         "rounds": round_num + 1,
                         "usage": last_usage,
-                        "usage_rounds": usage_rounds,
                         "end_turn": True,
                     }
 
@@ -1386,7 +1371,6 @@ class ToolLoopMixin:
                         "tool_turn_messages": tool_turn_acc,
                         "rounds": round_num + 1,
                         "usage": last_usage,
-                        "usage_rounds": usage_rounds,
                         "stall_break": True,
                         "stall_reason": stall_reason,
                     }
@@ -1471,7 +1455,6 @@ class ToolLoopMixin:
                                 "tool_turn_messages": tool_turn_acc,
                                 "rounds": round_num + 1,
                                 "usage": last_usage,
-                                "usage_rounds": usage_rounds,
                             }
                         log.info("inject_no_text_hint", round=round_num,
                                  no_text_rounds=no_text_rounds,
@@ -1505,7 +1488,6 @@ class ToolLoopMixin:
                     "tool_turn_messages": tool_turn_acc,
                     "rounds": round_num + 1,
                     "usage": last_usage,
-                    "usage_rounds": usage_rounds,
                 }
 
             # 有真实文本 — 剥离占位符，结束
@@ -1536,7 +1518,6 @@ class ToolLoopMixin:
                 "tool_turn_messages": tool_turn_acc,
                 "rounds": round_num + 1,
                 "usage": last_usage,
-                "usage_rounds": usage_rounds,
             }
 
         # 达到最大轮次 — 做一次无工具的总结调用
@@ -1563,6 +1544,5 @@ class ToolLoopMixin:
             "tool_turn_messages": tool_turn_acc,
             "rounds": rounds_cap,
             "usage": last_usage,
-            "usage_rounds": usage_rounds,
         }
 

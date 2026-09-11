@@ -122,7 +122,11 @@ async def test_no_partial_usage_key_when_absent():
 
 @pytest.mark.asyncio
 async def test_stream_merges_partial_usage_into_rounds_and_sink():
-    """端到端：stream() 错误收口把 partial usage 并入 usage_rounds + sink。"""
+    """端到端：stream() 错误收口把 partial usage 并入 sink。
+
+    L4（2026-09-11）：断言从 `result["usage_rounds"]` 改为 **sink** ——
+    result 携带 usage 的通道已退役（两个权威源会分叉），sink 是唯一权威源。
+    """
     exc = PermanentError("Stream idle timeout (75s)")
     exc.partial_usage = {"input": 200, "output": 10, "cache_read": 150}
     streamer = _mk_streamer(exc)
@@ -136,12 +140,13 @@ async def test_stream_merges_partial_usage_into_rounds_and_sink():
         usage_sink=sunk.append,
     )
     assert result["status"] == "error"
-    rounds = result.get("usage_rounds") or []
-    assert rounds, "partial usage 必须进 usage_rounds（此前整轮丢弃）"
-    entry = rounds[-1]
+    assert "usage_rounds" not in result, (
+        "L4：result 不得再携带 usage（sink 是唯一权威源）"
+    )
+    assert sunk, "partial usage 必须进 sink（此前整轮丢弃）"
+    entry = sunk[-1]
     assert entry.get("partial") is True
     # 平台口径：input = 总 prompt 剥离命中后的未命中部分（200-150=50）
     assert entry.get("input") == 50
     assert entry.get("cache_read") == 150
     assert entry.get("ts") > 0
-    assert sunk and sunk[-1] is entry
