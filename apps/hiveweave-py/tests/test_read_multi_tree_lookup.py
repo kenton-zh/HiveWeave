@@ -32,7 +32,7 @@ from hiveweave.tools.file import (
     read_file,
     strip_dot_slash_prefix,
 )
-from hiveweave.util.tree_label import READ_MISS_HINT
+from hiveweave.util.tree_label import READ_MISS_HINT, tree_tag
 
 
 @pytest.fixture
@@ -214,10 +214,19 @@ def test_reports_read_scope_orders_and_dedupes(trees: dict[str, Path]) -> None:
         str(trees["wt_a"]),
     )
     tags = [tag for tag, _ in scope]
-    assert tags[0] == "worktree A044"      # 本树先查
-    assert "MAIN" in tags                  # 共享落点必在候选里
+    # fixplan:351 读侧顺序 = MAIN → 请求者树 → assignee 树：
+    # 共享产物权威落点在 MAIN（service_create.py:99-105），故 MAIN 排第一。
+    # 旧实现本树优先，与 fixplan 偏离 —— 本断言即该偏离的守卫。
+    assert tags[0] == "MAIN"
+    assert "worktree A044" in tags         # 请求者树必在候选里
     assert "worktree A045" in tags         # 兄弟树兜底
+    assert tags.index("MAIN") < tags.index("worktree A044")
     assert len(tags) == len(set(tags))     # 去重
+    # 与 vision 侧候选序必须一致（两处各写一套会漂移）
+    from hiveweave.services.vision import _multi_tree_bases
+
+    vision_bases = _multi_tree_bases(str(trees["wt_a"]), str(trees["project"]))
+    assert [t for t, _ in scope] == [tree_tag(b) for b in vision_bases]
     # 项目根即 workspace 时不得重复
     scope2 = _reports_read_scope(
         ".hiveweave/reports/T123/x.png",
