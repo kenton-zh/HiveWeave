@@ -1476,7 +1476,7 @@ class Agent:
 
                     _first_round = (result.get("usage_rounds") or [None])[0]
                     if _first_round:
-                        report_cache_readout(
+                        _probe = report_cache_readout(
                             self.id,
                             input_tokens=int(_first_round.get("input") or 0),
                             cache_read=int(_first_round.get("cache_read") or 0),
@@ -1484,6 +1484,16 @@ class Agent:
                                 _first_round.get("cache_creation") or 0
                             ),
                         )
+                        # 批次 1（2026-09-11）：把前缀 verdict **落库**。
+                        # R3 判据需要在 DB 里分清 hit_ok / cache_window_expired /
+                        # drift_zero_hit —— 只有后者是"平台自己改写了前缀"的实锤；
+                        # 混成一个命中率数字会把 provider 缓存窗口过期也算到我们头上。
+                        if _probe and self._current_run_id:
+                            await self._run_ledger.set_run_fact(
+                                self.id,
+                                self._current_run_id,
+                                cache_verdict=_probe.get("final"),
+                            )
                 except Exception as probe_err:
                     log.debug(
                         "prefix_probe_readout_failed",

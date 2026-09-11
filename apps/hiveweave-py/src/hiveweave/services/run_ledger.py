@@ -36,6 +36,50 @@ def _short_hash(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()[:16]
 
 
+# ── agent_runs 事实位列的懒迁移（2026-09-11 批次 1）────────────────
+# 键 = (workspace, 连接世代)：与 tasks / inbox 的补列**同族**（库整代重建后
+# 旧标记必须失效，否则补列被静默跳过、下游 no such column）。
+_FACT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("empty_stream", "INTEGER DEFAULT 0"),
+    ("cache_verdict", "TEXT"),
+)
+_fact_columns_ready: set[tuple[str, int]] = set()
+
+
+async def _ensure_fact_columns(agent_id: str) -> None:
+    """给**存量库**补 agent_runs 的两个事实位列（新库由正典 DDL 直接建）。
+
+    失败**不标记**、下次重试；只把 `duplicate column` 当正常幂等路径。
+    """
+    key = await project_db.schema_marker_key_for_agent(agent_id)
+    if key in _fact_columns_ready:
+        return
+    pending = False
+    for col, ddl in _FACT_COLUMNS:
+        try:
+            await project_db.execute(
+                agent_id, f"ALTER TABLE agent_runs ADD COLUMN {col} {ddl}"
+            )
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" in str(exc).lower():
+                continue  # 列已存在 —— 正常幂等路径
+            pending = True
+            log.warning(
+                "run_ledger.fact_column_migration_failed",
+                column=col,
+                error=str(exc),
+            )
+        except Exception as exc:  # noqa: BLE001 — 非 OperationalError 同样重试
+            pending = True
+            log.warning(
+                "run_ledger.fact_column_migration_failed",
+                column=col,
+                error=str(exc),
+            )
+    if not pending:
+        _fact_columns_ready.add(key)
+
+
 def _summary_from_reason(result_summary: str, error_reason: str) -> str:
     """空摘要兜底：取 error_reason 首个非空行，截 200 字符。"""
     summary = (result_summary or "").strip()
@@ -145,6 +189,9 @@ class RunLedger:
         budget_elapsed_ms: int = 600_000,
     ) -> str:
         """Create a run record when _run_llm starts."""
+        # 保证事实位列存在（存量库迁移）—— 放在 try 之外：即便 INSERT 失败，
+        # 列也必须已就位，否则回归脚本的 R11/R3 查询会 no such column。
+        await _ensure_fact_columns(agent_id)
         run_id = str(uuid.uuid4())
         now = _now_ms()
         lease_expires = now + budget_elapsed_ms
@@ -343,6 +390,34 @@ class RunLedger:
             )
         except Exception as e:
             log.warning("run_ledger.increment_tool_calls_failed", error=str(e))
+
+    async def set_run_fact(self, agent_id: str, run_id: str, **facts: Any) -> None:
+        """写 run 级**事实位**（best-effort，不影响主流程）。
+
+        2026-09-11 批次 1：`empty_stream` / `cache_verdict` 两个事实位的落库口。
+
+        **为什么需要它**：回归清单的 R11 / R3 两条判据此前**只能靠日志猜** ——
+        · R11 分不清「usage=0 是丢账」还是「usage=0 是正确记账（0 chunk 无 token
+          可记）」⇒ 只能把这类标成"未排除"（漏报）或放宽判据（错报）；
+        · R3 把 `hit_ok` / `cache_window_expired` / `drift_zero_hit` 混成一个
+          命中率数字 ⇒ 「provider 缓存窗口过期」与「平台自己改写了前缀」被当成
+          同一件事，而只有后者是平台侧可修的。
+        把事实落库后，口径才能在**判定**层收窄，而不是在**解释**层打补丁。
+        """
+        allowed = {"empty_stream", "cache_verdict"}
+        cols = {k: v for k, v in facts.items() if k in allowed and v is not None}
+        if not cols:
+            return
+        try:
+            await _ensure_fact_columns(agent_id)
+            sets = ", ".join(f"{k} = ?" for k in cols)
+            await project_db.execute(
+                agent_id,
+                f"UPDATE agent_runs SET {sets} WHERE id = ?",
+                [*cols.values(), run_id],
+            )
+        except Exception as e:
+            log.warning("run_ledger.set_run_fact_failed", error=str(e))
 
     async def complete_run(
         self,

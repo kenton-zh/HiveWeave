@@ -1233,6 +1233,15 @@ async def _flush_pending_usage(agent: Any, *, reason: str = "interrupted") -> No
             reason=reason,
             note="request started but zero chunks arrived; not metered",
         )
+        # 批次 1（2026-09-11）：把「明确空流」落成 **DB 事实位**。
+        # 它区分「usage=0 是丢账」与「usage=0 是**正确**记账（0 chunk 无 token
+        # 可记）」。此前只有上面这行日志 —— 回归脚本读不到，于是 R11 只能把这批
+        # 标成"未排除"（漏报），或放宽判据把 window 内的行都算成"记了账"
+        # （错报：v5 就是这么错的，压缩调用的账被算到了对话 run 头上）。
+        # `set_run_fact` 自带 best-effort 兜底，不阻塞恢复流程。
+        _rid = getattr(agent, "_current_run_id", None)
+        if _rid:
+            await agent._run_ledger.set_run_fact(agent.id, _rid, empty_stream=1)
         return
     try:
         from hiveweave.services.token_meter import token_meter

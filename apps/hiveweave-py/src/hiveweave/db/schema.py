@@ -524,7 +524,22 @@ PROJECT_DB_TABLES = [
         ended_at INTEGER,
         result_summary TEXT,
         error_reason TEXT,
-        checkpoint_data TEXT
+        checkpoint_data TEXT,
+        -- ── 事实位列（2026-09-11 批次 1）───────────────────────────
+        -- 存在的理由：回归清单的两条判据**只能靠日志猜**，因为平台没把
+        -- 可机检的事实落库 —— 于是口径只能放宽（错）或漏报（也错）。
+        --
+        -- empty_stream：该 run 是否收到过**明确的空流**（request started but
+        --   zero chunks arrived）。有它 ⇒ usage=0 是**正确记账**，不是丢账
+        --   （0 chunk 无 token 可记）。此前只有 recovery.py 的一行日志，
+        --   回归脚本读不到 ⇒ R11 只能把这类"秒杀型"标为"未排除"。
+        -- cache_verdict：首请求的前缀指纹分类（hit_ok / cache_window_expired /
+        --   drift_zero_hit），由 llm/streamer/probe.py 计算、此前只落日志。
+        --   有它 ⇒ R3 能只在 `drift_zero_hit`（漂移实锤、平台侧可修）判 FAIL，
+        --   而不是把三者混成一个命中率数字（那会把"provider 缓存窗口过期"
+        --   和"平台自己把前缀改写了"当成同一件事）。
+        empty_stream INTEGER DEFAULT 0,
+        cache_verdict TEXT
     )
     """,
     """
