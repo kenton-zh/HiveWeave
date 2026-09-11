@@ -475,6 +475,15 @@ PROJECT_DB_TABLES = [
         id TEXT PRIMARY KEY,
         project_id TEXT,
         name TEXT NOT NULL,
+        -- 注：`path`（模块拥有的代码路径）**刻意保持可空**。旧 DDL 曾写
+        -- `path TEXT NOT NULL`，但那张表**全仓零写入方**（批次 5 实测），
+        -- 该约束从未被执行过、也从未被验证过。恢复时按**实际已落地的写侧**
+        -- 对齐：`services/modules.py::create_module(path=None)` 默认不传，
+        -- `api/org.py:433` 的 Pydantic 契约也是 `path: str | None = None`。
+        -- 若此处写 NOT NULL，会让「按蓝图建模块树」的合法调用（只给 name）
+        -- 直接 IntegrityError —— 那是把一条**没人用过**的旧约束凌驾于现行契约。
+        -- 审计意见（恢复丢了 NOT NULL）已收到；此处是**显式取舍**不是遗漏，
+        -- 取舍依据 = 已落地的写侧契约 + 蓝图（:283-287）本就不含 path 列。
         path TEXT,
         description TEXT,
         parent_module_id TEXT,

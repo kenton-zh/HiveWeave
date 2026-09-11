@@ -303,3 +303,37 @@ async def test_archived_memories_empty_for_module_without_history(project):
     svc = ModuleService()
     m = await svc.create_module(project_id, "fresh")
     assert await svc.get_archived_memories_for_module(project_id, m["id"]) == []
+
+
+# ── 8 · DDL 空约束与写侧契约一致（批次 5 审计 P1-5）────────
+
+
+async def test_module_path_is_optional_matching_api_contract(project):
+    """``path`` 必须可缺省 —— DDL 的可空性要与**已落地的写侧契约**一致。
+
+    背景（批次 5 审计 P1-5）：旧正典 DDL 写的是 ``path TEXT NOT NULL``，
+    但那张表**全仓零写入方**（批次 5 实测），该约束从未被执行/验证过。
+    恢复 modules 时按实际写侧对齐为可空：``create_module(path=None)`` 默认
+    不传，``api/org.py`` 的 Pydantic 契约也是 ``path: str | None = None``。
+
+    本用例用**行为**守卫这条取舍（不看 docstring）：只给 name 建模块必须
+    成功并落行。若有人把 DDL 改回 ``path NOT NULL``，本用例会在真实 INSERT
+    上 IntegrityError 打红 —— 在它炸到生产之前。
+    """
+    project_id, ws = project
+    svc = ModuleService()
+    mod = await svc.create_module(project_id, "no-path-module")  # 刻意不传 path
+
+    conn = await ensure_project_db(ws)
+    cursor = await conn.execute(
+        "SELECT name, path FROM modules WHERE id = ?", [mod["id"]]
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    assert row is not None, "缺省 path 的模块必须能落行（DDL 不得强制 NOT NULL）"
+    assert row["name"] == "no-path-module"
+    assert row["path"] is None
+
+    # 反向锚：给了 path 时也要能落（证明上面不是"path 被忽略"）
+    with_path = await svc.create_module(project_id, "with-path", path="src/x")
+    assert with_path["path"] == "src/x"
