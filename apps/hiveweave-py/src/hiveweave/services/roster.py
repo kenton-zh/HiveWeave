@@ -8,6 +8,7 @@
 schema.py 的 personnel_records 表缺 hire_date 列，首次访问时 ALTER TABLE 补齐（幂等）。
 """
 
+import sqlite3
 import time
 import uuid
 
@@ -49,8 +50,8 @@ async def _execute_rowcount(
             raise
 
 
-# Idempotent migration tracking: project_ids whose schema has been checked
-_migrated: set[str] = set()
+# Idempotent migration tracking: (workspace, 连接世代) keys whose schema is checked
+_migrated: set[tuple[str, int]] = set()
 
 
 async def _conn(project_id: str) -> aiosqlite.Connection:
@@ -62,17 +63,33 @@ async def _conn(project_id: str) -> aiosqlite.Connection:
 
 
 async def _ensure_schema(project_id: str) -> None:
-    """Add missing hire_date column to personnel_records table (idempotent)."""
-    if project_id in _migrated:
+    """Add missing hire_date column to personnel_records table (idempotent).
+
+    标记键 = ``(workspace, 连接世代)``（机制见
+    :func:`db.project.schema_marker_key_for_project`），并修掉原来
+    「``except: pass`` + 无条件 ``_migrated.add()``」——那会让一次锁/IO 失败
+    变成进程内永久短路，hire_date 列永不补。
+    """
+    key = await project_db.schema_marker_key_for_project(project_id)
+    if key in _migrated:
         return
     try:
         await execute_by_project(
             project_id,
             "ALTER TABLE personnel_records ADD COLUMN hire_date TEXT",
         )
-    except Exception:
-        pass  # Column already exists — safe to ignore
-    _migrated.add(project_id)
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" in str(exc).lower():
+            pass  # 列已存在 —— 正常幂等路径
+        else:
+            log.warning(
+                "roster_column_migration_failed", error=str(exc)
+            )
+            return  # 不标记：下次调用重试
+    except Exception as exc:  # noqa: BLE001 — 非 OperationalError 同样重试
+        log.warning("roster_column_migration_failed", error=str(exc))
+        return
+    _migrated.add(key)
 
 
 class RosterService:

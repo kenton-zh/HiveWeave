@@ -45,9 +45,9 @@ async def env():
         from hiveweave.services import inbox as inbox_mod
         from hiveweave.services import task as task_mod
 
-        task_mod._migrated.discard(PROJECT_ID)
+        task_mod._migrated.clear()
         for aid in (CREATOR, WORKER):
-            inbox_mod._migrated.discard(aid)
+            inbox_mod._migrated.clear()
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             await project_db.ensure_project_db(workspace_path)
             yield {
@@ -58,8 +58,8 @@ async def env():
         agent_router.clear_project(PROJECT_ID)
         for aid in (CREATOR, WORKER):
             project_db._agent_cache.pop(aid, None)
-            inbox_mod._migrated.discard(aid)
-        task_mod._migrated.discard(PROJECT_ID)
+            inbox_mod._migrated.clear()
+        task_mod._migrated.clear()
         async with project_db._ensure_lock:
             conn = project_db._cache.pop(workspace_path, None)
         if conn is not None:

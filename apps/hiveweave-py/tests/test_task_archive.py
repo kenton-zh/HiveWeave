@@ -34,7 +34,7 @@ async def env():
         async def fake_get_agent_project_id(aid: str):
             return PROJECT_ID if aid in (COORD_ID, EXEC_A, EXEC_B) else None
 
-        task_module._migrated.discard(PROJECT_ID)
+        task_module._migrated.clear()
         for aid in (COORD_ID, EXEC_A, EXEC_B):
             project_db._agent_cache.pop(aid, None)
 

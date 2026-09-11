@@ -198,7 +198,7 @@ async def task_env():
 
         from hiveweave.services import task as task_module
 
-        task_module._migrated.discard(PROJECT_ID)
+        task_module._migrated.clear()
         project_db._agent_cache.pop(COORDINATOR_ID, None)
         project_db._agent_cache.pop(EXECUTOR_ID, None)
 

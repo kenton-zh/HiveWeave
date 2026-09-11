@@ -225,7 +225,7 @@ async def test_dismiss_submitted_escalates_reviewer_past_parent(
     async def fake_ws(p: str):
         return ws if p == pid else None
 
-    task_module._migrated.discard(pid)
+    task_module._migrated.clear()
     try:
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             org = OrgService()
@@ -281,7 +281,7 @@ async def test_dismiss_submitted_keeps_external_reviewer(
     async def fake_ws(p: str):
         return ws if p == pid else None
 
-    task_module._migrated.discard(pid)
+    task_module._migrated.clear()
     try:
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             org = OrgService()
@@ -342,7 +342,7 @@ async def test_dismiss_submitted_no_grandparent_keeps_assignee(
     async def fake_ws(p: str):
         return ws if p == pid else None
 
-    task_module._migrated.discard(pid)
+    task_module._migrated.clear()
     try:
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             org = OrgService()

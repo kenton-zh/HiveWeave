@@ -43,7 +43,7 @@ _MISSING_COLUMNS = [
     ("artifact_path", "TEXT"),
     ("context_refs", "TEXT"),
 ]
-_migrated: set[str] = set()
+_migrated: set[tuple[str, int]] = set()
 
 
 async def _conn(project_id: str) -> aiosqlite.Connection:
@@ -96,8 +96,15 @@ async def _ensure_schema(project_id: str) -> None:
     H3 (审计 2026-08-05)：区分「重复列」（预期，新库 schema.py 已建）与
     「真实失败」（如锁死）——真实失败不 mark migrated，下次调用重试；
     只有全部列就绪才缓存 project，避免后续写 artifact_path 时 no such column。
+
+    标记键 = ``(workspace, 连接世代)``（机制见
+    :func:`db.project.schema_marker_key_for_project`）——「缓存 project」这件事
+    本身要绑到库的生命周期上：同路径库整代重建后旧标记必须失效。
     """
-    if project_id in _migrated:
+    from hiveweave.db import project as project_db
+
+    key = await project_db.schema_marker_key_for_project(project_id)
+    if key in _migrated:
         return
     ok = True
     for col_name, col_def in _MISSING_COLUMNS:
@@ -111,7 +118,7 @@ async def _ensure_schema(project_id: str) -> None:
                         column=col_name, error=str(e))
             ok = False
     if ok:
-        _migrated.add(project_id)
+        _migrated.add(key)
 
 
 class HandoffService:

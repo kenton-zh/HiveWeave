@@ -198,7 +198,7 @@ async def _execute_rowcount(
             raise
 
 
-_migrated: set[str] = set()
+_migrated: set[tuple[str, int]] = set()
 
 # Default wake_on events by waiting kind
 DEFAULT_WAKE_ON: dict[str, list[str]] = {
@@ -502,7 +502,15 @@ async def _short_circuit_satisfied_task_waits(
 
 
 async def _ensure_schema(project_id: str) -> None:
-    if project_id in _migrated:
+    """建 agent_waits 表 + 索引。
+
+    标记键 = ``(workspace, 连接世代)``（机制见
+    :func:`db.project.schema_marker_key_for_project`）：按 project_id 记忆的
+    旧标记在库整代重建后会继续命中，`CREATE TABLE` 被跳过 → 下游
+    `no such table: agent_waits`（与 inbox 的 TEST_DSH_52_A 同形）。
+    """
+    key = await project_db.schema_marker_key_for_project(project_id)
+    if key in _migrated:
         return
     try:
         await execute_by_project(project_id, CREATE_SQL)
@@ -514,9 +522,10 @@ async def _ensure_schema(project_id: str) -> None:
             "CREATE INDEX IF NOT EXISTS idx_agent_waits_agent "
             "ON agent_waits(agent_id, cleared_at)",
         )
-    except Exception:
-        pass
-    _migrated.add(project_id)
+    except Exception as exc:
+        # 具名：索引缺失只影响查询性能，不影响等待的正确性（DSH AGENTS.md:122）
+        log.debug("wait_contract_index_create_failed", error=str(exc))
+    _migrated.add(key)
 
 
 def obligation_version(obligations: list[dict]) -> str:

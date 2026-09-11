@@ -26,7 +26,7 @@ async def env():
             return workspace_path if pid == PROJECT_ID else None
 
         # 重置迁移缓存，确保本次测试真实走 ALTER 迁移
-        handoff_module._migrated.discard(PROJECT_ID)
+        handoff_module._migrated.clear()
 
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             yield {
@@ -190,7 +190,7 @@ async def test_ensure_schema_migrates_old_handoffs_table(env):
     )
     await conn.commit()
     # 清缓存强制重跑 _ensure_schema → 走真实 ADD COLUMN 路径
-    handoff_module._migrated.discard(pid)
+    handoff_module._migrated.clear()
     await handoff_module._ensure_schema(pid)
 
     cols = await handoff_module._query(

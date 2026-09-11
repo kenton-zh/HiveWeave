@@ -64,8 +64,8 @@ async def env():
         async def fake_get_project_workspace(pid: str):
             return workspace_path if pid == PROJECT_ID else None
 
-        wait_contract_module._migrated.discard(PROJECT_ID)
-        task_mod._migrated.discard(PROJECT_ID)
+        wait_contract_module._migrated.clear()
+        task_mod._migrated.clear()
         project_db._agent_cache[CEO_ID] = workspace_path
         project_db._agent_cache[EXECUTOR_ID] = workspace_path
 
@@ -149,7 +149,7 @@ async def _insert_open_task(env, assignee_id, *, status="running"):
     """
     from hiveweave.services import task as task_mod
 
-    task_mod._migrated.discard(PROJECT_ID)
+    task_mod._migrated.clear()
     await task_mod._ensure_schema(PROJECT_ID)
     tid = str(uuid.uuid4())
     now = _now_ms()
@@ -615,7 +615,7 @@ async def _insert_task(env, *, status, creator_id=CEO_ID, assignee_id=None):
     """P0-1 场景用：最小任务行（raw INSERT，无工作日志副作用）."""
     from hiveweave.services import task as task_mod
 
-    task_mod._migrated.discard(PROJECT_ID)
+    task_mod._migrated.clear()
     await task_mod._ensure_schema(PROJECT_ID)
     tid = str(uuid.uuid4())
     # 老时间戳，避免任务行本身被当成近期产出

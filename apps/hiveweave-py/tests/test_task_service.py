@@ -77,9 +77,9 @@ async def env():
         # Reset migration tracking + agent cache so the fresh DB is fully set up.
         # (task._migrated gates the due_at ALTER TABLE; without clearing it the
         #  second test would skip migration on a brand-new DB missing due_at.)
-        task_module._migrated.discard(PROJECT_ID)
-        dispatch_module._migrated.discard(PROJECT_ID)
-        handoff_module._migrated.discard(PROJECT_ID)
+        task_module._migrated.clear()
+        dispatch_module._migrated.clear()
+        handoff_module._migrated.clear()
         inbox_module._migrated.clear()
         project_db._agent_cache.pop(COORDINATOR_ID, None)
         project_db._agent_cache.pop(EXECUTOR_ID, None)

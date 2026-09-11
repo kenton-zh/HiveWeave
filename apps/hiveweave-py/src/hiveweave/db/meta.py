@@ -109,8 +109,12 @@ async def _migrate_meta_schema(conn: aiosqlite.Connection) -> None:
     for table_name in _LEGACY_TABLES_TO_DROP:
         try:
             await conn.execute(f"DROP TABLE IF EXISTS [{table_name}]")
-        except Exception:
-            pass  # Table doesn't exist — fine
+        except Exception as exc:
+            # 具名：`DROP ... IF EXISTS` 自身幂等，这里吞的是锁/IO 之类的瞬时
+            # 错误 —— 遗留表残留不阻塞启动，但要留痕（DSH AGENTS.md:122）
+            log.debug(
+                "meta_legacy_table_drop_failed", table=table_name, error=str(exc)
+            )
 
     # 2. Drop legacy indexes that reference dropped tables
     legacy_indexes = [
@@ -121,8 +125,11 @@ async def _migrate_meta_schema(conn: aiosqlite.Connection) -> None:
     for idx_name in legacy_indexes:
         try:
             await conn.execute(f"DROP INDEX IF EXISTS [{idx_name}]")
-        except Exception:
-            pass
+        except Exception as exc:
+            # 具名：同上的遗留索引 best-effort 清理
+            log.debug(
+                "meta_legacy_index_drop_failed", index=idx_name, error=str(exc)
+            )
 
     # 3. Add missing columns to remaining tables
     for table, column, col_def in _META_MIGRATIONS:

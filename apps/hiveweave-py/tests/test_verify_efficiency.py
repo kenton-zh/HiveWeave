@@ -37,8 +37,8 @@ async def task_env():
 
         from hiveweave.services.tasks import db as tasks_db
 
-        task_module._migrated.discard(PROJECT_ID)
-        tasks_db._migrated.discard(PROJECT_ID)
+        task_module._migrated.clear()
+        tasks_db._migrated.clear()
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             yield {"project_id": PROJECT_ID, "workspace": workspace_path}
 

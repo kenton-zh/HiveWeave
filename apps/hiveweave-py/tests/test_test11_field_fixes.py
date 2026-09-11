@@ -38,7 +38,7 @@ async def task_env():
         async def fake_ws(pid: str):
             return workspace_path if pid == PROJECT_ID else None
 
-        task_module._migrated.discard(PROJECT_ID)
+        task_module._migrated.clear()
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             yield {"project_id": PROJECT_ID, "workspace": workspace_path}
 
@@ -410,7 +410,7 @@ async def test_break_wait_cycles_wakes_earliest_waiter(task_env):
 
     pid = task_env["project_id"]
     ws = task_env["workspace"]
-    wc_mod._migrated.discard(pid)
+    wc_mod._migrated.clear()
     await wait_contract_service.list_all_active(pid)
     conn = await ensure_project_db(ws)
     now = int(time.time() * 1000)
@@ -454,7 +454,7 @@ async def test_break_wait_cycles_skips_superior_subordinate_chain(task_env):
 
     pid = task_env["project_id"]
     ws = task_env["workspace"]
-    wc_mod._migrated.discard(pid)
+    wc_mod._migrated.clear()
     await wait_contract_service.list_all_active(pid)
     conn = await ensure_project_db(ws)
     now = int(time.time() * 1000)
@@ -499,7 +499,7 @@ async def test_break_wait_cycles_sibling_deadlock_still_detected(task_env):
 
     pid = task_env["project_id"]
     ws = task_env["workspace"]
-    wc_mod._migrated.discard(pid)
+    wc_mod._migrated.clear()
     await wait_contract_service.list_all_active(pid)
     conn = await ensure_project_db(ws)
     now = int(time.time() * 1000)
@@ -545,7 +545,7 @@ async def test_break_wait_cycles_task_edge_hierarchy_suppressed(task_env):
 
     pid = task_env["project_id"]
     ws = task_env["workspace"]
-    wc_mod._migrated.discard(pid)
+    wc_mod._migrated.clear()
     await wait_contract_service.list_all_active(pid)
     conn = await ensure_project_db(ws)
     now = int(time.time() * 1000)

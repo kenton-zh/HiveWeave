@@ -14,6 +14,7 @@
 """
 
 import json
+import sqlite3
 import time
 import uuid
 
@@ -64,20 +65,46 @@ from hiveweave.db.project import execute_by_project
 _MISSING_COLUMNS = [
     ("task_id", "TEXT"),
 ]
-_migrated: set[str] = set()
+_migrated: set[tuple[str, int]] = set()
 
 
 async def _ensure_schema(project_id: str) -> None:
-    """Add missing columns to work_logs table (idempotent)."""
-    if project_id in _migrated:
+    """Add missing columns to work_logs table (idempotent).
+
+    标记键 = ``(workspace, 连接世代)``（机制见
+    :func:`db.project.schema_marker_key_for_project`）：project_id 只是槽位，
+    库才是载体 —— 同路径库被整代重建后按 project_id 记忆的旧标记会继续命中，
+    补列被静默跳过、下游炸 ``no such column``（与 inbox 的 TEST_DSH_52_A 同形）。
+
+    顺带修掉本处原有的「补列失败也标记完成」：``except: pass`` 后无条件
+    ``_migrated.add()``，撞上锁/IO 一次就在进程内永久短路。
+    """
+    from hiveweave.db import project as project_db
+
+    key = await project_db.schema_marker_key_for_project(project_id)
+    if key in _migrated:
         return
+    pending = False
     for col_name, col_def in _MISSING_COLUMNS:
         try:
             await _execute(project_id,
                            f"ALTER TABLE work_logs ADD COLUMN {col_name} {col_def}")
-        except Exception:
-            pass  # Column already exists
-    _migrated.add(project_id)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" in str(exc).lower():
+                continue  # 列已存在 —— 正常幂等路径
+            pending = True
+            log.warning(
+                "dispatch_column_migration_failed",
+                column=col_name, error=str(exc),
+            )
+        except Exception as exc:  # noqa: BLE001 — 非 OperationalError 同样重试
+            pending = True
+            log.warning(
+                "dispatch_column_migration_failed",
+                column=col_name, error=str(exc),
+            )
+    if not pending:
+        _migrated.add(key)
 
 
 class DispatchService:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 import uuid
 
@@ -20,7 +21,7 @@ from .constants import _MISSING_COLUMNS
 
 log = structlog.get_logger(__name__)
 
-_migrated: set[str] = set()
+_migrated: set[tuple[str, int]] = set()
 
 async def _resolve_workspace(project_id: str) -> str:
     workspace = await meta_db.get_project_workspace(project_id)
@@ -82,16 +83,38 @@ async def _execute_tx(
 
 
 async def _ensure_schema(project_id: str) -> None:
-    """Add missing columns to tasks table (idempotent)."""
-    if project_id in _migrated:
+    """Add missing columns to tasks table (idempotent).
+
+    标记键 = ``(workspace, 连接世代)``（机制见
+    :func:`db.project.schema_marker_key_for_project`）—— tasks 是最核心的表，
+    按 project_id 记忆的旧标记在库整代重建后会继续命中，补列被静默跳过、
+    随后所有任务操作一起炸 ``no such column``（与 inbox 的 TEST_DSH_52_A 同形）。
+
+    顺带修掉原来的「``except: pass`` + 无条件标记」：一次锁/IO 失败就会让补列
+    在进程内永久短路。
+    """
+    from hiveweave.db import project as project_db
+
+    key = await project_db.schema_marker_key_for_project(project_id)
+    if key in _migrated:
         return
+    pending = False
     for col_name, col_def in _MISSING_COLUMNS:
         try:
             await _execute(project_id,
                            f"ALTER TABLE tasks ADD COLUMN {col_name} {col_def}")
-        except Exception:
-            pass  # Column already exists
-    _migrated.add(project_id)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" in str(exc).lower():
+                continue  # 列已存在 —— 正常幂等路径
+            pending = True
+            log.warning("tasks_column_migration_failed",
+                        column=col_name, error=str(exc))
+        except Exception as exc:  # noqa: BLE001 — 非 OperationalError 同样重试
+            pending = True
+            log.warning("tasks_column_migration_failed",
+                        column=col_name, error=str(exc))
+    if not pending:
+        _migrated.add(key)
 
 
 # ── Shared task_events write helper (Timeline v4 §4.1) ─────

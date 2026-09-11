@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS audit_retry (
 )
 """
 
-_retry_migrated: set[str] = set()
+_retry_migrated: set[tuple[str, int]] = set()
 
 
 async def ensure_schema(project_id: str) -> None:
@@ -81,8 +81,15 @@ async def ensure_schema(project_id: str) -> None:
 
     project 不存在（ProjectDbError）时跳过且**不**记迁移标记——调用方可能在
     project 尚未完全初始化时调用，下次再补（同 attestation.ensure_schema）。
+
+    标记键 = ``(workspace, 连接世代)``（机制见
+    :func:`db.project.schema_marker_key_for_project`）—— 按 project_id 记忆的
+    旧标记在库整代重建后会继续命中，建表被跳过 → 下游 ``no such table``。
     """
-    if project_id in _retry_migrated:
+    from hiveweave.db import project as project_db
+
+    key = await project_db.schema_marker_key_for_project(project_id)
+    if key in _retry_migrated:
         return
     try:
         await execute_by_project(project_id, CREATE_AUDIT_RETRY_SQL)
@@ -91,7 +98,7 @@ async def ensure_schema(project_id: str) -> None:
     except Exception as e:  # noqa: BLE001 — 建表失败不影响审计主流程
         log.warning("audit_retry_schema_failed", project_id=project_id, error=str(e))
         return
-    _retry_migrated.add(project_id)
+    _retry_migrated.add(key)
 
 
 def _backoff_ms(attempts: int) -> int:

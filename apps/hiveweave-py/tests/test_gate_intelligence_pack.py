@@ -111,8 +111,8 @@ async def env():
         async def fake_get_agent_by_id(aid: str):
             return _FAKE_AGENTS.get(aid)
 
-        att_module._migrated.discard(PROJECT_ID)
-        task_module._migrated.discard(PROJECT_ID)
+        att_module._migrated.clear()
+        task_module._migrated.clear()
         project_db._agent_cache.pop(COORD_ID, None)
         project_db._agent_cache.pop(EXEC_ID, None)
 

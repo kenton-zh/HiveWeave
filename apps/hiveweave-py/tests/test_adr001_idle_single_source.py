@@ -67,8 +67,8 @@ async def env():
         async def fake_get_project_workspace(pid: str):
             return workspace_path if pid == PROJECT_ID else None
 
-        wait_contract_module._migrated.discard(PROJECT_ID)
-        task_mod_._migrated.discard(PROJECT_ID)
+        wait_contract_module._migrated.clear()
+        task_mod_._migrated.clear()
         for aid in (CEO_ID, COORD_ID, EXECUTOR_ID, OTHER_EXECUTOR_ID):
             project_db._agent_cache[aid] = workspace_path
 
@@ -117,7 +117,7 @@ async def _insert_agent(env, agent_id, name, parent_id=None,
 async def _insert_task(env, *, status, assignee_id=None, creator_id=CEO_ID,
                        reviewer_id=None, claimed_at=-1, title="ADR-001 task"):
     """Raw INSERT 任务行。claimed_at=-1 表示 NULL（未认领）。"""
-    task_mod._migrated.discard(PROJECT_ID)
+    task_mod._migrated.clear()
     await task_mod._ensure_schema(PROJECT_ID)
     tid = str(uuid.uuid4())
     old = _now_ms() - 40 * 60 * 1000
@@ -140,7 +140,7 @@ async def _insert_task(env, *, status, assignee_id=None, creator_id=CEO_ID,
 
 
 async def _insert_wait(env, agent_id, expires_at):
-    wait_contract_module._migrated.discard(PROJECT_ID)
+    wait_contract_module._migrated.clear()
     from hiveweave.services.wait_contract import wait_contract_service
 
     await wait_contract_service.list_all_active(PROJECT_ID)

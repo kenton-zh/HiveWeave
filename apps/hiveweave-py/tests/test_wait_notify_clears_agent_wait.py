@@ -42,9 +42,9 @@ async def env():
         async def fake_ws(pid: str):
             return workspace_path if pid == PROJECT_ID else None
 
-        wait_mod._migrated.discard(PROJECT_ID)
+        wait_mod._migrated.clear()
         for aid in (WAITER_ID, QINGWU_ID, OTHER_ID):
-            inbox_mod._migrated.discard(aid)
+            inbox_mod._migrated.clear()
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             await project_db.ensure_project_db(workspace_path)
             yield {"project_id": PROJECT_ID, "workspace": workspace_path}
@@ -52,8 +52,8 @@ async def env():
         agent_router.clear_project(PROJECT_ID)
         for aid in (WAITER_ID, QINGWU_ID, OTHER_ID):
             project_db._agent_cache.pop(aid, None)
-            inbox_mod._migrated.discard(aid)
-        wait_mod._migrated.discard(PROJECT_ID)
+            inbox_mod._migrated.clear()
+        wait_mod._migrated.clear()
         async with project_db._ensure_lock:
             conn = project_db._cache.pop(workspace_path, None)
         if conn is not None:

@@ -11,6 +11,22 @@
 # Meta DB 只存全局路由和配置，不存任何 per-project 业务数据
 # agent_index 已移除 — 路由由 AgentRouter 内存映射替代
 
+# mcp_servers 的单一 DDL 定义 —— Meta 建表清单与 services/mcp.py 的幂等兜底
+# 共用这一份，避免两处漂移（此前 mcp.py 自持一份 + 进程级标记）。
+MCP_SERVERS_DDL = """
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    transport TEXT NOT NULL DEFAULT 'http',
+    command TEXT DEFAULT '',
+    args TEXT DEFAULT '[]',
+    env TEXT DEFAULT '{}',
+    url TEXT DEFAULT '',
+    enabled INTEGER DEFAULT 1,
+    created_at INTEGER
+)
+"""
+
 META_DB_TABLES = [
     """
     CREATE TABLE IF NOT EXISTS projects (
@@ -76,6 +92,14 @@ META_DB_TABLES = [
         updated_at INTEGER
     )
     """,
+    # mcp_servers 曾由 services/mcp.py 的懒创建 + 进程级布尔 `_schema_ready`
+    # 维护。那个标记是「按槽位记忆、不随载体换代失效」的又一例（L18 同族）：
+    # close_meta_db 会重置 meta 的迁移标记，却不会重置它 → Meta DB 整代重建后
+    # 本表被跳过 → 下游 `no such table: mcp_servers`；而 tests/test_mcp_api.py
+    # 必须手工把该布尔复位才能过，正是这个陷阱存在的证据。
+    # 归位到统一建表路径后标记语义消失 —— 状态集中在权威源（DSH packages/
+    # AGENTS.md:15「Publish state only at its commit point」同旨）。
+    MCP_SERVERS_DDL,
 ]
 
 # ── Per-project DB 表 ──────────────────────────────────────

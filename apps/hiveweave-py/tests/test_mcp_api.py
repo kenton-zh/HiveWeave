@@ -47,8 +47,11 @@ async def mcp_env(tmp_path: Path, monkeypatch):
     await meta_db.close_meta_db()
     await meta_db.init_meta_db()
 
-    # ── 数据层模块状态复位（schema 幂等标记 / 连接缓存 / 工具表）──
-    mcp_mod._schema_ready = False
+    # ── 数据层模块状态复位（连接缓存 / 工具表）──
+    # 注：mcp_servers 已归位到 `db/schema.META_DB_TABLES`（建库即建表），
+    # 不再需要手工复位 schema 标记 —— 原来那行 `mcp_mod._schema_ready = False`
+    # 恰恰是「标记跨库世代存活」缺陷存在的证据（换 Meta DB 后必须人工清标记，
+    # 漏一次就 no such table）。
     mcp_mod.mcp_service._connections.clear()
     mcp_supervisor.reset_for_tests()
 

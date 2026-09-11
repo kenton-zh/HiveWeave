@@ -37,35 +37,23 @@ MCP_CALL_TIMEOUT = 30.0
 # stdio 子进程关闭超时
 _STDIO_CLOSE_TIMEOUT = 5.0
 
-# mcp_servers 表 schema（契约 10；schema.py 未定义，本服务懒创建）
-_MCP_SERVERS_DDL = """
-CREATE TABLE IF NOT EXISTS mcp_servers (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    transport TEXT NOT NULL DEFAULT 'http',
-    command TEXT DEFAULT '',
-    args TEXT DEFAULT '[]',
-    env TEXT DEFAULT '{}',
-    url TEXT DEFAULT '',
-    enabled INTEGER DEFAULT 1,
-    created_at INTEGER
-)
-"""
-
-# 幂等迁移标记：mcp_servers 表是否已确认存在
-_schema_ready = False
-
-
+# mcp_servers 的 DDL 已归位到 `db/schema.py::MCP_SERVERS_DDL`，与 Meta 建表
+# 清单（META_DB_TABLES）**共用同一份**，避免两处漂移。
+#
+# 同时去掉原来的进程级布尔 `_schema_ready`：那是「按槽位记忆、不随载体换代
+# 失效」的又一例（与 L17/L18 同族）—— `close_meta_db` 会重置 meta 自己的
+# 迁移标记，却不会复位它，于是 Meta DB 整代重建后本表被跳过、下游炸
+# `no such table: mcp_servers`（`tests/test_mcp_api.py` 必须手工复位该布尔
+# 才能过，正是这个陷阱存在的证据）。
 async def _ensure_schema() -> None:
-    """创建 mcp_servers 表（幂等）。
+    """幂等兜底建表：mcp_servers（正常路径已由 META_DB_TABLES 建好）。
 
-    schema.py 未包含此表定义，本服务首次访问时 CREATE TABLE IF NOT EXISTS。
+    不依赖「建库先于本服务调用」的顺序，但**不做**任何进程内记忆：
+    `CREATE TABLE IF NOT EXISTS` 本身就是幂等的，且永远对着当前这个库执行。
     """
-    global _schema_ready
-    if _schema_ready:
-        return
-    await meta_db.execute(_MCP_SERVERS_DDL)
-    _schema_ready = True
+    from hiveweave.db.schema import MCP_SERVERS_DDL
+
+    await meta_db.execute(MCP_SERVERS_DDL)
 
 
 # ── JSON 解析辅助 ───────────────────────────────────────────

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 import uuid
 from typing import Any
@@ -81,7 +82,7 @@ CREATE TABLE IF NOT EXISTS inbox_triage_batches (
 )
 """
 
-_migrated: set[str] = set()
+_migrated: set[tuple[str, int]] = set()
 # Per-agent asyncio locks — serialize prepare_ready flights
 _agent_locks: dict[str, asyncio.Lock] = {}
 
@@ -108,13 +109,31 @@ def derive_wake_category(messages: list[dict]) -> str | None:
 
 
 async def ensure_triage_schema(agent_id: str) -> None:
-    """Ensure triage batch table + inbox.triage_batch_id column."""
-    if agent_id in _migrated:
+    """Ensure triage batch table + inbox.triage_batch_id column.
+
+    标记按 ``(workspace, 连接世代)`` 键控（**非** agent id）——机制与理由见
+    :func:`db.project.schema_marker_key_for_agent`；这是同一模式在本仓的第 3~4 处，
+    所以改的是机制而不是再抄一份点位。
+
+    两处与 ``inbox.py`` 同源的修复：
+      1. **补列失败不得标记完成**（09-08 收养项目事故的形态）：ALTER 撞上
+         锁/IO 时原来 ``except: pass`` 后照样 ``_migrated.add()`` → 进程内永久
+         短路、列永不补 → 下游炸 ``no such column``；
+      2. **空 catch 必须具名它吞掉了什么**（DSH ``AGENTS.md:122``）：原来三处
+         ``except Exception: pass`` 把「建表失败/补列失败/建索引失败」混为一谈，
+         失败后完全无痕。
+    """
+    key = await project_db.schema_marker_key_for_agent(agent_id)
+    if key in _migrated:
         return
+    migration_pending = False
     try:
         await project_db.execute(agent_id, _BATCH_TABLE)
-    except Exception as e:
-        log.debug("inbox_triage_table_create_failed", error=str(e))
+    except Exception as exc:  # noqa: BLE001 — 建表失败视为未完成，下次重试
+        migration_pending = True
+        log.warning(
+            "inbox_triage_table_create_failed", agent_id=agent_id, error=str(exc)
+        )
     for col_name, col_def in (
         ("triage_batch_id", "TEXT"),
         ("wake_category", "TEXT"),
@@ -124,17 +143,35 @@ async def ensure_triage_schema(agent_id: str) -> None:
                 agent_id,
                 f"ALTER TABLE inbox ADD COLUMN {col_name} {col_def}",
             )
-        except Exception:
-            pass
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" in str(exc).lower():
+                continue  # 列已存在 —— 正常幂等路径，不算失败
+            migration_pending = True
+            log.warning(
+                "inbox_triage_column_migration_failed",
+                agent_id=agent_id,
+                column=col_name,
+                error=str(exc),
+            )
+        except Exception as exc:  # noqa: BLE001 — 非 OperationalError 同样重试
+            migration_pending = True
+            log.warning(
+                "inbox_triage_column_migration_failed",
+                agent_id=agent_id,
+                column=col_name,
+                error=str(exc),
+            )
     try:
         await project_db.execute(
             agent_id,
             "CREATE INDEX IF NOT EXISTS idx_inbox_triage_batch "
             "ON inbox(to_agent_id, triage_batch_id)",
         )
-    except Exception:
-        pass
-    _migrated.add(agent_id)
+    except Exception as exc:
+        # 索引缺失只影响查询性能、不影响正确性 → 具名吞掉且不阻塞标记
+        log.debug("inbox_triage_index_create_failed", error=str(exc))
+    if not migration_pending:
+        _migrated.add(key)
 
 
 def _score_message(category: str, priority: str, created_at: int | None) -> int:

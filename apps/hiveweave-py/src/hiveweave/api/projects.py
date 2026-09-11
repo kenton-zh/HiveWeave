@@ -797,21 +797,25 @@ async def create_project(body: ProjectCreate) -> dict:
     if hw_old.exists() and adopted_project_id is None:
         try:
             await project_db.evict_project_db(str(ws))
-        except Exception:
-            pass
+        except Exception as exc:
+            # 具名：驱逐失败只影响后续能否重连（删除流程自带 _evicted_workspaces
+            # 拒连标记），不阻塞删除本身
+            log.debug("delete_project_evict_failed", workspace=str(ws), error=str(exc))
         await asyncio.sleep(0.3)
         import shutil as _shutil
         import stat as _stat
 
         def _rmtree_on_error(func, path, exc_info):
+            # 具名（两处）：这是 shutil.rmtree 的 onerror 回调，本来就是
+            # 「尽力重试」语义。但删除失败会留下脏目录，所以失败要留路径线索。
             try:
                 os.chmod(path, _stat.S_IWRITE)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("rmtree_chmod_failed", path=path, error=str(exc))
             try:
                 func(path)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("rmtree_remove_failed", path=path, error=str(exc))
 
         for _attempt in range(3):
             try:
@@ -996,8 +1000,10 @@ async def create_project(body: ProjectCreate) -> dict:
         await meta_db.execute(
             "DELETE FROM meta_index WHERE key = ?", [tombstone_key]
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        # 具名：tombstone 清理是 best-effort（下次删除会重试），但静默会让
+        # 「为何还有残留标记」无从追查
+        log.debug("delete_project_tombstone_cleanup_failed", error=str(exc))
 
     # 写入 per-project 元数据到 project_meta 表
     # (description, org_paradigm, charter_json, language 等字段从 Meta DB 迁移到 per-project DB)

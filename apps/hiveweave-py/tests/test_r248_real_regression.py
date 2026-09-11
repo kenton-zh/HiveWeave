@@ -136,7 +136,7 @@ async def test_r4_get_tasks_tool_appends_live_obligations():
         async def fake_ws(p: str):
             return ws if p == pid else None
 
-        task_module._migrated.discard(pid)
+        task_module._migrated.clear()
         try:
             with (
                 patch("hiveweave.db.meta.get_project_workspace", fake_ws),
@@ -175,7 +175,7 @@ async def test_r4_get_tasks_tool_appends_live_obligations():
                     await conn.close()
                 except Exception:
                     pass
-            task_module._migrated.discard(pid)
+            task_module._migrated.clear()
 
 
 # ── R7: browse click timeout floor ≥30s ──────────────────────

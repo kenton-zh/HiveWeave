@@ -16,6 +16,7 @@ import aiosqlite
 
 from hiveweave.config import settings
 from hiveweave.db import meta as meta_db
+from hiveweave.db import project as project_db
 from hiveweave.db.project import (
     ProjectDbError,
     ensure_project_db,
@@ -53,7 +54,7 @@ async def _execute_rowcount(
             raise
 
 
-_migrated: set[str] = set()
+_migrated: set[tuple[str, int]] = set()
 
 
 # ── Issue #5 (P2, audit): per-workspace git scope state cache ────────────
@@ -575,7 +576,17 @@ class AttestationService:
     """CRUD + verify for tool_attestations rows."""
 
     async def ensure_schema(self, project_id: str) -> None:
-        if project_id in _migrated:
+        """建 tool_attestations / audit_cache 表并补齐列迁移。
+
+        标记键为 **(workspace, 连接世代)** 而非 project_id —— project_id 只是
+        槽位，库才是载体：同一 project 名下的库被整代重建后，按 project_id
+        记忆的旧标记会继续命中，于是 `CREATE TABLE` 与列迁移被跳过、下游炸
+        `no such column/table`（与 `inbox.py` 的 TEST_DSH_52_A 事故同形；本文件
+        :279 的注释自陈过这个跳过）。机制见
+        :func:`db.project.schema_marker_key_for_project`。
+        """
+        key = await project_db.schema_marker_key_for_project(project_id)
+        if key in _migrated:
             return
         # project 不存在（ProjectDbError）时静默跳过 schema 创建 —
         # 调用方可能在 project 尚未完全初始化时调用
@@ -590,8 +601,13 @@ class AttestationService:
                 "ON tool_attestations(task_id, kind)",
             )
             await execute_by_project(project_id, CREATE_AUDIT_CACHE_SQL)
-        except Exception:
-            pass
+        except Exception as exc:
+            # 具名：索引与 audit_cache 缺失只影响查询性能 / 审计结论复用，
+            # 不影响 attestation 写入正确性，所以吞掉但不留无名 catch
+            # （DSH AGENTS.md:122）。
+            log.debug(
+                "attestation_index_or_cache_create_failed", error=str(exc)
+            )
         # 列级迁移（审计 P1-3 修复）：只吞 duplicate-column（幂等判存）；
         # 其他异常（锁/IO）不落 _migrated——进程内下次调用重试，且不向上抛
         # （沿用本函数外层容错语义）。旧行为 except Exception: pass + 无条件
@@ -622,7 +638,7 @@ class AttestationService:
                     error=str(exc),
                 )
         if not migration_pending:
-            _migrated.add(project_id)
+            _migrated.add(key)
 
     async def audit_cache_lookup(
         self, project_id: str, *, agent_id: str, diff_hash: str

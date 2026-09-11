@@ -206,30 +206,6 @@ _MISSING_COLUMNS = [
 ]
 
 
-async def _schema_marker_key(agent_id: str) -> tuple[str, int]:
-    """解析 schema 标记键：``(workspace, 连接世代)``。
-
-    schema 属于**具体 DB 文件**，不属于 agent id；而且属于该文件的**这一代**
-    —— 同一路径上的库可能被整代重建（项目目录被删/重建），此时旧标记必须失效。
-
-    09-11 `TEST_DSH_52_A` 事故：标记曾只按 workspace 路径记忆，路径上的库被
-    重建回「只有基础 10 列」后标记仍存活 → `_ensure_schema` 静默早退、永不补列
-    （三条失败分支都会打 warning，而日志里 0 条 → 只能是从早退走的），
-    最终只在**下游**以 `no such column: wake` 炸开，归因完全错位。
-    世代由 `db/project.py` 在**每次新建连接**时递增（新建连接即「我们不再
-    知道这个库的状态」：新库 / LRU 重连 / 驱逐重连都算）。
-
-    路由失败（agent 未注册 / workspace 被驱逐）回退 agent 级键 + 世代 0 —— 后续
-    ALTER 的 execute 同样会失败，行为与旧实现一致。
-    """
-    try:
-        await project_db.get_project_db_for_agent(agent_id)
-    except Exception:
-        return f"agent:{agent_id}", 0
-    ws = project_db._agent_cache.get(agent_id) or f"agent:{agent_id}"
-    return ws, project_db.workspace_generation(ws)
-
-
 async def _ensure_schema(agent_id: str) -> None:
     """Add missing columns to inbox table (idempotent).
 
@@ -238,8 +214,10 @@ async def _ensure_schema(agent_id: str) -> None:
     agent 记忆会让新库跳过补列 → wake 等列缺失 → inbox 写入/读取全部
     静默失败（全量回归 test_archive_direct_push 0 通知事故根因，
     2026-08-19）。**世代维度是 2026-09-11 补的**：只按路径记忆时，同一路径上
-    的库被整代重建仍会命中旧标记 → 永不补列（TEST_DSH_52_A 事故，见
-    `_schema_marker_key` 注释）。
+    的库被整代重建仍会命中旧标记 → 永不补列（TEST_DSH_52_A 事故）。
+
+    键的算法院在 :func:`db.project.schema_marker_key_for_agent`（同一模式在
+    本仓共 9 处，抽成机制而不是逐点抄），此处直接调用、不再包一层同义函数。
 
     补列失败不再无条件标记完成（09-08 office-godot 实测事故）：ALTER
     撞上「database is locked」等瞬态错误曾被 `except: pass` 吞掉后照
@@ -248,7 +226,7 @@ async def _ensure_schema(agent_id: str) -> None:
     错误（warning 留痕），并以 PRAGMA 实测列齐为准——不齐不标记，下
     次调用重试。
     """
-    key = await _schema_marker_key(agent_id)
+    key = await project_db.schema_marker_key_for_agent(agent_id)
     if key in _migrated:
         return
     for col_name, col_def in _MISSING_COLUMNS:
@@ -274,8 +252,14 @@ async def _ensure_schema(agent_id: str) -> None:
             "ON inbox(to_agent_id, idempotency_key) "
             "WHERE idempotency_key IS NOT NULL AND idempotency_key != ''",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        # 具名：这是「unique-ish」幂等索引的 best-effort 创建，失败只降低去重
+        # 强度、不影响正确性 —— 补列的完成判定在下面的 PRAGMA 验列。
+        log.debug(
+            "inbox_schema_index_create_failed",
+            agent_id=agent_id,
+            error=str(exc)[:200],
+        )
     # 验列后才标记：吞错/瞬态锁导致补列不齐时保持未标记，下次重试
     missing: list[str] = []
     try:

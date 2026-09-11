@@ -149,7 +149,7 @@ async def task_env():
         async def fake_ws(pid: str):
             return workspace_path if pid == PROJECT_ID else None
 
-        task_module._migrated.discard(PROJECT_ID)
+        task_module._migrated.clear()
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             yield {"project_id": PROJECT_ID, "workspace": workspace_path}
 

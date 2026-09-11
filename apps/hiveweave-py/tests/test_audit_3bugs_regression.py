@@ -244,7 +244,7 @@ async def test_check_verify_baseline_canonical_query_key(tmp_path):
         async def fake_get_project_workspace(pid: str):
             return workspace_path if pid == project_id else None
 
-        att_module._migrated.discard(project_id)
+        att_module._migrated.clear()
 
         with patch("hiveweave.db.meta.get_project_workspace",
                    fake_get_project_workspace):
@@ -383,8 +383,8 @@ async def test_waive_binding_accepts_short_prefix_and_dashed(tmp_path):
         async def fake_get_agent_by_id(aid: str):
             return _FAKE_AGENTS.get(aid)
 
-        att_module._migrated.discard(project_id)
-        task_module._migrated.discard(project_id)
+        att_module._migrated.clear()
+        task_module._migrated.clear()
         project_db._agent_cache.pop(coord_id, None)
         project_db._agent_cache.pop(exec_id, None)
 

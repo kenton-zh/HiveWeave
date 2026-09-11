@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 import sqlite3
 
 import aiosqlite
+import structlog
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,8 @@ from hiveweave.db.schema import (
     PROJECT_DB_COLUMN_CHECKS,
 )
 from hiveweave.db import meta as meta_db
+
+log = structlog.get_logger(__name__)
 
 
 class ProjectDbError(RuntimeError):
@@ -66,6 +69,76 @@ def workspace_generation(workspace: str) -> int:
     代价仅是随路径数增长的一个 int，可忽略。
     """
     return _ws_generation.get(str(Path(workspace).resolve()), 0)
+
+
+def schema_marker_key_for_workspace(workspace: str) -> tuple[str, int]:
+    """给「本对象已迁移」标记定键：**(workspace, 连接世代)**（已知路径）。
+
+    ws 分量显式规范化（与 :func:`workspace_generation` 内部的解析口径一致），
+    否则同一条路径的两种写法会各占一个键、互相看不见对方的标记。
+    """
+    if not workspace:
+        return "", 0
+    ws = str(Path(workspace).resolve())
+    return ws, workspace_generation(ws)
+
+
+async def schema_marker_key_for_agent(agent_id: str) -> tuple[str, int]:
+    """给「本对象已迁移」标记定键：**(workspace, 连接世代)**（agent 侧）。
+
+    DSH 判据（``packages/session/session-projection-cache/src/spec.ts:33-40``）：
+    **a session id names a slot, not a lifecycle** —— 只按槽位（路径 / id）
+    记忆的标记，在承载它的库换了一代之后仍然命中，于是迁移被静默跳过、最终
+    只在**下游**以 ``no such column`` 炸开（L17 实况事故；``attestation`` /
+    ``inbox_triage`` / ``inbox`` 是同一模式的四处 —— 所以判据是**改机制**，
+    不是再抄一份点位）。
+
+    新建连接即「我们不再知道这个库的状态」（新库 / LRU 重连 / 驱逐重连都算），
+    所以键里带世代：同路径库被整代重建后旧标记自动失效、下次调用重新迁移。
+
+    路由失败（agent 未注册 / workspace 被驱逐）回退 ``("agent:<id>", 0)`` ——
+    后续 ALTER 的 execute 同样会失败，行为与旧实现一致。
+    """
+    try:
+        await get_project_db_for_agent(agent_id)
+    except Exception:
+        return f"agent:{agent_id}", 0
+    ws = _agent_cache.get(agent_id)
+    if ws is None:
+        return f"agent:{agent_id}", 0
+    # 复用 workspace 侧访问器：ws 分量必须同样规范化，否则同一个库在 agent 侧
+    # 与 project 侧会各算出一个键（迁移被重复执行 —— 虽幂等，但违背"机制集中
+    # 一处"的初衷，且会让"该库已迁移"的判定在两侧不一致）。
+    return schema_marker_key_for_workspace(ws)
+
+
+# project_id → workspace 的解析缓存。**只服务 schema 标记键**。
+# 存在的理由：`_ensure_schema` 家族在每个任务 / 交接 / 等待操作前都会被调用
+# （仅 tasks 包内就有 29 处调用点），而旧实现 `if project_id in _migrated` 是
+# **零 I/O** 的快路径。引入 (ws, 世代) 键后若每次都查 Meta DB，等于把记忆化
+# 的意义整个抵消掉（还都压在共享 Meta 连接上）。
+# 缓存的是 project_id→ws（**不是**最终键）：世代仍实时取自
+# workspace_generation，所以「同路径库整代重建」依旧失效。
+_project_ws_cache: dict[str, str] = {}
+
+
+async def schema_marker_key_for_project(project_id: str) -> tuple[str, int]:
+    """给「本对象已迁移」标记定键：**(workspace, 连接世代)**（project 侧）。
+
+    project_id 是槽位、workspace 上的库才是载体 —— 与 agent 侧同理：库整代
+    重建后按 project_id 记忆的标记必须失效（``attestation.ensure_schema``
+    原来的形态）。
+    """
+    ws = _project_ws_cache.get(project_id)
+    if ws is None:
+        try:
+            ws = await meta_db.get_project_workspace(project_id)
+        except Exception:
+            ws = None
+        if not ws:
+            return f"project:{project_id}", 0
+        _project_ws_cache[project_id] = ws
+    return schema_marker_key_for_workspace(ws)
 
 # R2: 保护 ensure_project_db 的懒初始化，避免并发创建多个连接到同一 DB
 _ensure_lock = asyncio.Lock()
@@ -158,8 +231,10 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
             if missing:
                 try:
                     await conn.close()
-                except Exception:
-                    pass  # best-effort：连接关闭失败不掩盖根因
+                except Exception as exc:
+                    # 具名：连接关闭失败**不掩盖根因** —— 下面抛出的
+                    # ProjectDbError（schema 自检失败）才是要报出去的
+                    log.debug("project_db_close_failed", error=str(exc))
                 raise ProjectDbError(
                     f"schema self-check failed: table '{table}' missing "
                     f"column(s) {sorted(missing)} — migration broken, "
@@ -179,8 +254,10 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
             _, old_conn = _cache.popitem(last=False)
             try:
                 await old_conn.close()
-            except Exception:
-                pass  # best-effort
+            except Exception as exc:
+                # LRU 驱逐时的 best-effort 关闭：失败不改变"该 ws 已不在缓存"
+                # 这一事实，但要留痕（否则连接泄漏无痕可查）
+                log.debug("project_db_lru_close_failed", error=str(exc))
 
         return conn
 
@@ -420,6 +497,10 @@ async def evict_project_db(workspace_path: str) -> None:
     to_remove = [aid for aid, w in _agent_cache.items() if w == ws]
     for aid in to_remove:
         del _agent_cache[aid]
+    # 同步清 project_id→ws 解析缓存：否则项目被重映射到新 ws 后，键的槽位
+    # 分量会陈旧，同一个库被算出两个键（迁移被重复执行）。
+    for pid in [p for p, w in _project_ws_cache.items() if w == ws]:
+        del _project_ws_cache[pid]
 
 
 async def evict_project_db_for_agent(agent_id: str) -> None:
@@ -454,6 +535,7 @@ async def close_all() -> None:
     _agent_cache.clear()
     _evicted_workspaces.clear()
     _write_locks.clear()
+    _project_ws_cache.clear()  # 与 _agent_cache 同进退，避免关停后残留陈旧解析
     # Timeline v4 §4.4: 关停只读池
     for ws in list(_readonly_pools.keys()):
         await _close_readonly_pool(ws)

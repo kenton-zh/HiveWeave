@@ -372,7 +372,7 @@ async def gt_env():
 
         from hiveweave.services import task as task_mod
 
-        task_mod._migrated.discard(PROJECT_ID)
+        task_mod._migrated.clear()
         with (
             patch("hiveweave.db.meta.get_project_workspace",
                   fake_get_project_workspace),

@@ -573,8 +573,10 @@ class VerifyMixin:
                 if pending and int(pending[0]["c"] or 0) > 0:
                     # merge 流程进行中（obligation 未 fulfill）——不 close
                     continue
-            except Exception:
-                pass  # 表缺失等：不阻塞判定（保守继续）
+            except Exception as exc:
+                # 具名：表缺失 / 查询失败时保守继续（不 close、不阻塞判定），
+                # 但沉默会让「状态机为何没推进」彻底失去线索
+                log.debug("migrate_orphan_pending_check_failed", error=str(exc))
             children = await _query(
                 project_id,
                 f"SELECT {self._COLUMNS} FROM tasks "

@@ -29,7 +29,7 @@ async def env():
         async def fake_get_agent_project_id(aid: str):
             return PROJECT_ID if aid == CREATOR else None
 
-        task_module._migrated.discard(PROJECT_ID)
+        task_module._migrated.clear()
         await ensure_project_db(workspace_path)
         ts = TaskService()
         with patch(

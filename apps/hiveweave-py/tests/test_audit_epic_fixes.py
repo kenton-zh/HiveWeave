@@ -49,8 +49,8 @@ async def env():
         async def fake_get_project_workspace(pid: str):
             return workspace_path if pid == PROJECT_ID else None
 
-        att_module._migrated.discard(PROJECT_ID)
-        retry_module._retry_migrated.discard(PROJECT_ID)
+        att_module._migrated.clear()
+        retry_module._retry_migrated.clear()
 
         with patch("hiveweave.db.meta.get_project_workspace",
                    fake_get_project_workspace):
@@ -1087,10 +1087,15 @@ async def test_column_migration_retries_after_non_duplicate_error():
 
     with patch("hiveweave.services.attestation.execute_by_project",
                new=locked_exec):
-        att_module._migrated.discard("mig-proj-locked")
+        att_module._migrated.clear()
+        # 标记键 = (workspace, 连接世代)，不再是裸 project_id —— 断言必须走
+        # 同一个 key 函数，否则键形状一变就变成静默失真的假绿。
+        from hiveweave.db import project as project_db
+
+        key = await project_db.schema_marker_key_for_project("mig-proj-locked")
         # 不得抛异常
         await attestation_service.ensure_schema("mig-proj-locked")
-        assert "mig-proj-locked" not in att_module._migrated
+        assert key not in att_module._migrated
 
 
 @pytest.mark.asyncio
@@ -1107,9 +1112,12 @@ async def test_column_migration_duplicate_is_idempotent():
 
     with patch("hiveweave.services.attestation.execute_by_project",
                new=dup_exec):
-        att_module._migrated.discard("mig-proj-dup")
+        att_module._migrated.clear()
+        from hiveweave.db import project as project_db
+
+        key = await project_db.schema_marker_key_for_project("mig-proj-dup")
         await attestation_service.ensure_schema("mig-proj-dup")
-        assert "mig-proj-dup" in att_module._migrated
+        assert key in att_module._migrated
 
 
 # ── P1-4：appeal_notes 贯穿入队与重跑 ────────────────────────────

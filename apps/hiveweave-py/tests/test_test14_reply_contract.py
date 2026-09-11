@@ -53,9 +53,9 @@ async def env():
             return workspace_path if pid == PROJECT_ID else None
 
         # Fresh temp DB — clear module migration marks so ALTER runs again
-        inbox_mod._migrated.discard(CEO)
-        inbox_mod._migrated.discard(COORD)
-        task_mod._migrated.discard(PROJECT_ID)
+        # （一次即够：原来按 CEO/COORD 各 discard 一次，但两者同 ws 共用一个键）
+        inbox_mod._migrated.clear()
+        task_mod._migrated.clear()
 
         with patch("hiveweave.db.meta.get_project_workspace", fake_ws):
             conn = await project_db.ensure_project_db(workspace_path)
@@ -91,9 +91,8 @@ async def env():
             finally:
                 project_db._agent_cache.pop(CEO, None)
                 project_db._agent_cache.pop(COORD, None)
-                inbox_mod._migrated.discard(CEO)
-                inbox_mod._migrated.discard(COORD)
-                task_mod._migrated.discard(PROJECT_ID)
+                inbox_mod._migrated.clear()
+                task_mod._migrated.clear()
                 async with project_db._ensure_lock:
                     c = project_db._cache.pop(workspace_path, None)
                 if c is not None:

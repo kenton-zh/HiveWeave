@@ -60,7 +60,7 @@ async def env():
         async def fake_get_project_workspace(pid: str):
             return workspace_path if pid == PROJECT_ID else None
 
-        wait_contract_module._migrated.discard(PROJECT_ID)
+        wait_contract_module._migrated.clear()
 
         with patch("hiveweave.db.meta.get_project_workspace",
                    fake_get_project_workspace):
@@ -504,7 +504,7 @@ async def _insert_open_task(env, assignee_id):
     """
     from hiveweave.services import task as task_mod
 
-    task_mod._migrated.discard(PROJECT_ID)
+    task_mod._migrated.clear()
     await task_mod._ensure_schema(PROJECT_ID)
     old = _now_ms() - 40 * 60 * 1000
     conn = await ensure_project_db(env["workspace_path"])
