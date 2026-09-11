@@ -9,14 +9,16 @@
 - PATCH  /api/org/agents/{id}           更新 agent
 - PUT    /api/org/agents/{id}           同 PATCH
 - DELETE /api/org/agents/{id}           删除 agent
-- GET    /api/org/modules               列出项目模块
+- GET    /api/org/modules               列出项目模块（query: rootId 取子树 / status 过滤）
+- POST   /api/org/modules               创建模块（支持 parentModuleId 建树）
+- PATCH  /api/org/modules/{id}          更新模块（改名/换父（带环检测）/改 status）
+- DELETE /api/org/modules/{id}          删模块（有子模块默认拒绝，cascade=true 才级联）
+- POST   /api/org/modules/{id}/bind     绑定/解绑模块负责人
 - POST   /api/org/agents/{id}/dismiss   软删除（归档）
 - POST   /api/org/agents/{id}/transfer  转移上级
 """
 
 from __future__ import annotations
-
-import json
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -24,9 +26,9 @@ from pydantic import BaseModel
 import structlog
 
 from hiveweave.api.auth import validate_id
-from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
 from hiveweave.services.agent_activity import live_status
+from hiveweave.services.modules import ModuleService
 from hiveweave.services.org import OrgService
 
 log = structlog.get_logger(__name__)
@@ -34,6 +36,7 @@ log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/org", tags=["org"])
 
 _org = OrgService()
+_modules = ModuleService()
 
 
 class AgentCreate(BaseModel):
@@ -399,30 +402,134 @@ async def transfer_agent(agent_id: str, body: TransferBody) -> dict:
 
 
 @router.get("/modules")
-async def list_modules(projectId: str = Query(...)) -> dict:
+async def list_modules(
+    projectId: str = Query(...),
+    status: str | None = Query(default=None),
+    rootId: str | None = Query(default=None),
+) -> dict:
     """列出项目模块（per-project DB modules 表，支持嵌套）。
 
     形状按 `docs/AI工程组织_MVP蓝图.md:283-287`：`parentModuleId` 为自引用
     层级；`status` = active|completed|archived；`currentAgentId` = 当前负责人。
-    写侧由批次 7 接管（本路由只读）。
+
+    - 不给 ``rootId``：列全部（可选 ``status`` 过滤）。
+    - 给 ``rootId``：递归返回该模块的**子树**（含自身，父先于子）。
     """
-    workspace = await meta_db.get_project_workspace(projectId)
-    if not workspace:
-        return {"modules": []}
     try:
-        conn = await project_db.ensure_project_db(workspace)
-        cursor = await conn.execute(
-            "SELECT id, project_id, name, path, description, parent_module_id, "
-            "status, current_agent_id, created_at, updated_at FROM modules "
-            "WHERE project_id = ? ORDER BY name",
-            [projectId],
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        return {"modules": [dict(r) for r in rows]}
+        if rootId:
+            return {"modules": await _modules.get_subtree(projectId, rootId)}
+        return {"modules": await _modules.list_modules(projectId, status=status)}
     except Exception as e:
         log.warning("list_modules_failed", project_id=projectId, error=str(e))
         return {"modules": []}
+
+
+class ModuleCreate(BaseModel):
+    """创建模块请求体。"""
+
+    name: str
+    projectId: str
+    parentModuleId: str | None = None
+    path: str | None = None
+    description: str | None = None
+    currentAgentId: str | None = None
+    status: str = "active"
+    actorAgentId: str | None = None
+
+
+class ModuleUpdate(BaseModel):
+    """更新模块请求体（所有字段可选）。"""
+
+    name: str | None = None
+    parentModuleId: str | None = None
+    path: str | None = None
+    description: str | None = None
+    currentAgentId: str | None = None
+    status: str | None = None
+    actorAgentId: str | None = None
+
+
+@router.post("/modules")
+async def create_module(body: ModuleCreate) -> dict:
+    """创建模块（支持 ``parentModuleId`` 建树）。
+
+    权限门与 agent 写路由一致：需要 ``actorAgentId`` 且具备组织变更能力
+    （``transfer_agent`` 能力位）。模块树是组织编制的一部分，不能由任意
+    agent 改 —— 与 `create_agent` 的 staffing gate 同一纪律。
+    """
+    await _require_org_actor(body.actorAgentId, "transfer_agent")
+    try:
+        module = await _modules.create_module(
+            body.projectId,
+            body.name,
+            parent_module_id=body.parentModuleId,
+            path=body.path,
+            description=body.description,
+            current_agent_id=body.currentAgentId,
+            status=body.status,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        log.error("create_module_failed", error=str(e))
+        raise HTTPException(status_code=422, detail=f"Failed to create module: {e}")
+    return {"module": module}
+
+
+@router.patch("/modules/{module_id}")
+async def update_module(module_id: str, body: ModuleUpdate) -> dict:
+    """更新模块（改名 / 换父（带环检测）/ 改 status / 换负责人）。"""
+    validate_id(module_id, "module_id")
+    await _require_org_actor(body.actorAgentId, "transfer_agent")
+    fields = body.model_dump(exclude_none=True)
+    fields.pop("actorAgentId", None)
+    try:
+        updated = await _modules.update_module(
+            body.projectId, module_id, **fields
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Module not found")
+    return {"module": updated}
+
+
+@router.delete("/modules/{module_id}")
+async def delete_module(
+    module_id: str,
+    projectId: str = Query(...),
+    cascade: bool = Query(default=False),
+    actorAgentId: str | None = Query(default=None),
+) -> dict:
+    """删模块。有子模块时默认拒绝，``cascade=true`` 才连子树删。"""
+    validate_id(module_id, "module_id")
+    await _require_org_actor(actorAgentId, "transfer_agent")
+    try:
+        ok = await _modules.delete_module(projectId, module_id, cascade=cascade)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=404, detail="Module not found")
+    return {"ok": True}
+
+
+class ModuleBind(BaseModel):
+    """绑定/解绑模块负责人请求体。"""
+
+    projectId: str
+    agentId: str | None = None
+    actorAgentId: str | None = None
+
+
+@router.post("/modules/{module_id}/bind")
+async def bind_module_agent(module_id: str, body: ModuleBind) -> dict:
+    """把模块的当前负责人绑到 agent（``agentId=null`` 解绑）。"""
+    validate_id(module_id, "module_id")
+    await _require_org_actor(body.actorAgentId, "transfer_agent")
+    updated = await _modules.bind_agent(body.projectId, module_id, body.agentId)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Module not found")
+    return {"module": updated}
 
 
 # ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────

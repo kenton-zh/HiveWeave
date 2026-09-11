@@ -99,3 +99,26 @@ def test_attestation_migration_columns_are_in_the_canonical_ddl():
         )
         checked += 1
     assert checked, "迁移清单里没有 tool_attestations 的条目？（口径已变，请复核）"
+
+
+def test_modules_migration_columns_are_in_the_canonical_ddl():
+    """modules 的懒迁移列必须在正典 DDL 里（三件套纪律，批次 7）。
+
+    批次 7 给 modules 补了三列（``parent_module_id`` / ``status`` /
+    ``current_agent_id``），按纪律必须是**正典 + 懒迁移 + 守卫**三件套：
+    正典管新库（建表即完整），懒迁移管存量老库。只写迁移不写正典 =
+    每个新库都为历史欠账多跑 ALTER（本仓已实测过这条代价，见本文件顶部）。
+    """
+    from hiveweave.services.modules import _MISSING_COLUMNS
+
+    canon = _canonical_columns("modules")
+    assert canon, "正典里找不到 modules 表"
+    missing = [col for col, _ in _MISSING_COLUMNS if col not in canon]
+    assert not missing, (
+        f"modules 的懒迁移清单里有 {missing} 不在正典 DDL —— "
+        "新库不该靠 ALTER 补它们。"
+    )
+    # 批次 7 的核心列（交付面本身）也在正典里
+    for col in ("parent_module_id", "status", "current_agent_id"):
+        assert col in canon, f"modules.{col} 是批次 7 交付面，必须在正典 DDL 里"
+

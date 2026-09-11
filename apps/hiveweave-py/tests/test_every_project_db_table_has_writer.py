@@ -17,12 +17,11 @@ per-project DB 的唯一权威源，见 ``db/project.py:215`` 的建表循环）
   ``INSERT OR REPLACE/IGNORE`` 与 ``REPLACE INTO``）。
 - 回退代码（删掉某张表的 INSERT）会让本测试**打红**，这是它存在的全部意义。
 
-**交接状态（批次 5 ⇄ 批次 7）**：``modules`` 表按 A 方案保留（形状见
+**交接状态（批次 5 ⇄ 批次 7 · 已收口）**：``modules`` 表按 A 方案保留（形状见
 ``docs/AI工程组织_MVP蓝图.md:283-287``，含 ``parent_module_id`` 自引用模块树），
-写侧由**批次 7** 接管。在写侧落地前，``modules`` 显式列在
-``_KNOWN_WRITERLESS_PENDING`` 白名单里 —— 这**不是**为了变绿而放水：
-白名单有两条防腐测试（已接写入方必须移出 / 条目必须是真表），批次 7 落地
-INSERT 后必须把 ``modules`` 移出白名单。
+写侧由**批次 7** 在 ``services/modules.py::create_module`` 落地（INSERT INTO
+modules）。因此 ``modules`` 已从 ``_KNOWN_WRITERLESS_PENDING`` 白名单**移出**，
+白名单现在为空 —— 门禁覆盖全部正典表，无豁免。
 """
 
 from __future__ import annotations
@@ -127,10 +126,10 @@ def test_canonical_tables_extracted():
 # 这些表的存在是有意为之（先建对形状、接线随后），不是遗漏；
 # 门禁对它们放行，但仍会在它们之外的任何新死表上打红。
 #
-# - ``modules``：形状按 docs/AI工程组织_MVP蓝图.md:283-287（parent_module_id
-#   自引用模块树），**批次 7 接管写侧**。本条目是批次 5 与批次 7 的交接点：
-#   批次 7 落地 INSERT 后请把 ``modules`` 从本集合删掉，让门禁重新覆盖它。
-_KNOWN_WRITERLESS_PENDING: frozenset[str] = frozenset({"modules"})
+# **当前为空**：批次 7 已在 ``services/modules.py`` 落地 ``modules`` 的写入方
+# （``create_module`` 的 INSERT INTO modules），按批次 5 的交接约定把它移出。
+# 空集合 = 门禁覆盖全部正典表，没有豁免。
+_KNOWN_WRITERLESS_PENDING: frozenset[str] = frozenset()
 
 
 def test_every_project_db_table_has_a_writer():
