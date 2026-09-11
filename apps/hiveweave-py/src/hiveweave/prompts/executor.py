@@ -424,7 +424,10 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
 - **等他们的活**：`commit_turn(waiting, waiting_on=[{{kind:task, ref:<回执上的任务id>}}])`，不要 status-ask。
 - **blocked 只等其他任务或 wakeAt**：`update_task_status(taskId, "blocked", dependsOnTaskIds=["<其他任务id>"], blockedReason="简述原因")` 或 `wakeAt="<ISO-8601 或 epoch 毫秒>"`（可选 waitKind="timer"）。dependsOnTaskIds 只能是其他任务 id（本任务自己会被拒；人不是任务）。blockedReason 仅作人类可读备注。
 **block 必须带 dependsOnTaskIds 或 wakeAt 之一**，否则系统拒绝（无解封路径的任务会永久卡住整个队列）。
-timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检查项）——但 **schedule_alarm 不解封任务**，解封只靠 wakeAt 到期。目标超 15 分钟的等待会被 TTL 封顶提前唤醒（回执标 `wakeup_reason=ttl_cap`），按唤醒文案续等即可。
+- **长周期挂账只靠任务 `wakeAt`**：`blocked` + `wakeAt` 本身就是一条完整时钟，到期平台自动解封。**不要再**在 `commit_turn(waiting_on)` 里叠一个指同一时刻的 `kind=timer` -- 两套钟语义重叠，会话侧那套只会换来没有产出的 TTL 唤醒。
+- **等外部世界（真人 / 审批 / 回款）就等那个能观测到它的人**：用 `kind=agent` 等同事，不要自己折算成一个日期。平台看不见平台外的事件，编出来的日期不会真的到点。
+- 确需 `kind=timer` 时：目标超 TTL 会被封顶，且封顶额度按**连续超时轮次指数退避**（逐档放大、末档饱和，且永不越过目标）；回执标 `wakeup_reason=ttl_cap` 属正常兜底。确认没有新信息后重新 `commit_turn` 即可，**不要**连着刷 `get_tasks` / `check_agent_status` 打转。
+- timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检查项）-- 但 **schedule_alarm 不解封任务**，解封只靠 `wakeAt` 到期。
 
 注意：`send_message` 仍用于向上级咨询问题或与同事协调，但不再用于报告任务完成。
 

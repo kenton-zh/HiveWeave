@@ -147,6 +147,10 @@ class Settings(BaseSettings):
     wait_ttl_task_ms: int = 30 * 60 * 1000
     wait_ttl_external_ms: int = 30 * 60 * 1000
     wait_ttl_timer_ms: int = 15 * 60 * 1000
+    # timer 长挂账指数退避（B 方案，2026-09-11）：目标远超 TTL 时，按该轮次
+    # 阶梯放大续等 TTL，末档饱和。默认 ×1/×4/×24/×96 → 15min/1h/6h/24h。
+    # 逗号分隔正整数，首项应为 1（第 0 轮 = 基础 TTL）。
+    wait_timer_backoff_multipliers: str = "1,4,24,96"
 
     # Attestation max age (ms) — Phase 3
     attestation_max_age_ms: int = 24 * 60 * 60 * 1000

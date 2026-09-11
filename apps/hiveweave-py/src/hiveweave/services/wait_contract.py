@@ -368,6 +368,66 @@ def wait_target_iso(wait: dict) -> str | None:
     return rest.split("]", 1)[0].split(" ", 1)[0].strip() or None
 
 
+# ── B 方案（2026-09-11）：timer 长挂账指数退避 ────────────────────────────
+# 病：目标远超 TTL 的 timer 等待，每次 ttl_cap 唤醒后「原样续等」都重置成
+# 15min —— 目标 7 天 ≈ 672 次零产出空转（实测 雾屿/a728cba5：15:44 挂账，
+# 16:00 被 ttl_cap 唤醒，16:01 原样续等两轮，无任何产出）。
+# 药：同一 (agent, timer, ref) **真正超时过**的轮次越多，续等 TTL 越长
+# （默认 15min → 1h → 6h → 24h 饱和）。
+#   - 只数「真超时」行（cleared_at >= expires_at）：被 replace_waits 提前
+#     清掉的行不算，所以频繁重挂不会虚增档位。
+#   - 退避**永不越过目标**：目标一旦落入退避窗就转按目标排队并标
+#     target_reached，因此只会少醒、不会漏醒。
+#   - 事件唤醒不受影响：timer 的 wake_on 仍含 message_from_ref / ask_reply /
+#     user_message，退避只放大「始终没人理」时的兜底间隔。
+WAIT_TIMER_BACKOFF_HISTORY_MS = 30 * 24 * 60 * 60 * 1000
+# 退避窗上限：防止 env 配出超大乘数导致 now+eff_ttl 溢出 SQLite int64。
+# 那条路径只捕 ProjectDbError，OverflowError 会让等待**静默不落库**。
+WAIT_TIMER_BACKOFF_MAX_MS = 30 * 24 * 60 * 60 * 1000
+_DEFAULT_TIMER_BACKOFF_MULTIPLIERS: tuple[int, ...] = (1, 4, 24, 96)
+
+
+def _timer_backoff_multipliers() -> tuple[int, ...]:
+    """解析 ``HIVEWEAVE_WAIT_TIMER_BACKOFF_MULTIPLIERS``（逗号分隔正整数）。"""
+    raw = str(getattr(settings, "wait_timer_backoff_multipliers", "") or "")
+    out: list[int] = []
+    for part in raw.split(","):
+        try:
+            v = int(part.strip())
+        except ValueError:
+            continue
+        if v > 0:
+            out.append(v)
+    return tuple(out) or _DEFAULT_TIMER_BACKOFF_MULTIPLIERS
+
+
+def timer_backoff_ttl_ms(base_ttl_ms: int, level: int) -> int:
+    """第 ``level`` 轮续等的 TTL（level=0 即基础 TTL）；末档饱和。
+
+    结果 clamp 到 ``[base, WAIT_TIMER_BACKOFF_MAX_MS]``。
+    """
+    base = max(1, int(base_ttl_ms))
+    muls = _timer_backoff_multipliers()
+    idx = min(max(int(level), 0), len(muls) - 1)
+    return max(base, min(base * muls[idx], WAIT_TIMER_BACKOFF_MAX_MS))
+
+
+def _timer_rounds_key(ref: str) -> str:
+    """退避档位的归一键：绝对时刻 ref 归一成目标 epoch ms。
+
+    agent 重挂时 ref 可能变形（``Z`` vs ``+00:00``、精度不同），按原串计数会
+    历史归零、退避失效 —— 归一成目标时刻即稳定。纯 ``HH:MM`` 这类**相对**
+    时刻每次解析结果都变，按原串计（归一会恒不匹配）。
+    """
+    text = str(ref or "").strip()
+    if not text:
+        return ""
+    if _TIME_ONLY_RE.match(text):
+        return f"r:{text}"
+    ms = parse_timer_target_ms(text)
+    return f"t:{ms}" if ms is not None else f"r:{text}"
+
+
 async def _conn(project_id: str) -> aiosqlite.Connection:
     return await project_db.get_project_db_by_project_id(project_id)
 
@@ -534,6 +594,41 @@ def _scc(graph: dict[str, set[str]]) -> list[list[str]]:
 class WaitContractService:
     """CRUD for active agent wait contracts."""
 
+    async def _timer_timeout_rounds(
+        self, project_id: str, agent_id: str, now: int
+    ) -> dict[str, int]:
+        """该 agent 各 timer 目标**真正超时过**的轮次（``_timer_rounds_key`` → n，近 30 天）。
+
+        供 B 方案指数退避取档。判据 ``cleared_at >= expires_at``：只有
+        ``clear_expired`` 到点清的行算数；被 ``replace_waits`` 提前清掉的
+        （agent 主动重挂 / 事件唤醒后重挂）不算 —— 否则快速连挂会虚增档位。
+        分组在 Python 侧做（ref 需归一化，SQL 表达不了）。查询失败返回空
+        dict（退基础 TTL，不拦主流程）。
+        """
+        conn = await _conn(project_id)
+        if conn is None:
+            return {}
+        cur = await conn.execute(
+            "SELECT ref FROM agent_waits "
+            "WHERE agent_id = ? AND kind = 'timer' "
+            "AND cleared_at IS NOT NULL AND cleared_at >= ? "
+            "AND expires_at IS NOT NULL AND cleared_at >= expires_at "
+            "AND note LIKE ?",
+            [
+                agent_id,
+                now - WAIT_TIMER_BACKOFF_HISTORY_MS,
+                f"%{_WAKEUP_REASON_TAG}ttl_cap%",
+            ],
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        counts: dict[str, int] = {}
+        for row in rows:
+            key = _timer_rounds_key(str((row and row[0]) or ""))
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
     async def replace_waits(
         self,
         project_id: str,
@@ -605,6 +700,18 @@ class WaitContractService:
             looks_unbounded_external(*_item_kind_ref(it))
             for it in deduped_items
         )
+        # B 退避档位：循环内不能 await（见上方「全有或全无」注释），故先
+        # 一次查完该 agent 各 timer ref 的真超时轮次。
+        timer_timeout_rounds: dict[str, int] = {}
+        if any(
+            str(_item_kind_ref(it)[0]).lower() == "timer" for it in deduped_items
+        ):
+            try:
+                timer_timeout_rounds = await self._timer_timeout_rounds(
+                    project_id, agent_id, now
+                )
+            except Exception:  # noqa: BLE001 — 退避是优化，查不到退基础 TTL
+                timer_timeout_rounds = {}
         for item in deduped_items:
             if isinstance(item, WaitingOnItem):
                 kind: str = item.kind
@@ -654,12 +761,17 @@ class WaitContractService:
                     # P2-8：timer 有可解析目标时刻 —— ≤TTL 按目标排队；
                     # >TTL 封顶 TTL 并打 ttl_cap 标记（唤醒文案区分，
                     # 见 game_time._process_wait_contracts）。
-                    ttl_deadline = now + ttl_ms
-                    if target_ms <= ttl_deadline:
+                    # B 方案：封顶额度按「真超时轮次」指数退避
+                    # （15min→1h→6h→24h）。退避窗够到目标即转按目标排队，
+                    # 故只会少醒、不会漏醒。
+                    eff_ttl = timer_backoff_ttl_ms(
+                        ttl_ms, timer_timeout_rounds.get(_timer_rounds_key(ref), 0)
+                    )
+                    if target_ms <= now + eff_ttl:
                         exp = target_ms
                         note = _mark_wait_note(note, "target_reached", target_ms)
                     else:
-                        exp = ttl_deadline
+                        exp = now + eff_ttl
                         note = _mark_wait_note(note, "ttl_cap", target_ms)
             statements.append(
                 (
