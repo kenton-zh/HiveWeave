@@ -176,7 +176,20 @@ PROJECT_DB_TABLES = [
         message_type TEXT,
         expect_report INTEGER DEFAULT 0,
         priority TEXT DEFAULT 'normal',
-        task_id TEXT
+        task_id TEXT,
+        -- 2026-09-11 正典化（同 tasks，见其注释）：这 9 列此前只靠
+        -- `services/inbox._ensure_schema` 的 ALTER 补，于是**每个新建库**都要
+        -- 跑 9 条 ALTER（在 Windows 上首次 schema 变更 ~1.5s + 每条 ~11ms）。
+        -- 保留 `_MISSING_COLUMNS` 给存量老库；新库建表即完整。
+        wake INTEGER DEFAULT 1,
+        idempotency_key TEXT,
+        delivered INTEGER DEFAULT 1,
+        parked INTEGER DEFAULT 0,
+        triage_batch_id TEXT,
+        wake_category TEXT,
+        delivery_state TEXT DEFAULT 'delivered',
+        reply_contract_id TEXT,
+        reply_to TEXT
     )
     """,
     """
@@ -283,7 +296,27 @@ PROJECT_DB_TABLES = [
         submitted_at INTEGER,
         closed_at INTEGER,
         updated_at INTEGER NOT NULL,
-        is_archived INTEGER DEFAULT 0
+        is_archived INTEGER DEFAULT 0,
+        -- 2026-09-11 正典化：这 11 列此前**只**靠
+        -- `services/tasks/db._ensure_schema` 的 ALTER 补（正典 DDL 落后于
+        -- 实际 schema）。后果不只是"老库要迁移" —— **每个新建库**都要跑 11 条
+        -- ALTER，而第一条 schema 变更在 Windows 上要 ~1.5s（首次写页 + 实时
+        -- 扫描）；全量测试因此从 8min 涨到 16min（实测 `ALTER due_at`
+        -- = 1456ms，其余每条 ~11ms）。
+        -- 保留 `_MISSING_COLUMNS` 的 ALTER 路径给**存量老库**，但新库不再需要它
+        -- —— 这才是「状态集中在权威源」（DSH packages/AGENTS.md:15）。
+        -- 守卫见 tests/test_schema_ddl_migration_sync.py。
+        due_at INTEGER,
+        wait_kind TEXT,
+        wake_at INTEGER,
+        policy_id TEXT,
+        archived_by TEXT,
+        archived_reason TEXT,
+        archived_at INTEGER,
+        reviewer_id TEXT,
+        implementer_id TEXT,
+        implementer_worktree TEXT,
+        owner_parked INTEGER DEFAULT 0
     )
     """,
     """
