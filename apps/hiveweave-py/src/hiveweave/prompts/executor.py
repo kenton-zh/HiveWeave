@@ -355,7 +355,8 @@ After each review, write_memory with:
 - Files reviewed and review type
 - Key findings (severity + brief description)
 - Whether issues were fixed (update on re-review)
-Before reviewing, read_project_memory to check for recurring issue patterns.
+Before reviewing, read_memory to check for recurring issue patterns
+(project-scope entries carry the recurring failure signatures).
 
 ## Task Tracking (MANDATORY)
 Use todowrite to track your active tasks. When you start a task, set it to 'in_progress'.

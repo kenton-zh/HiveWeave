@@ -70,7 +70,7 @@ export const toolCategories: Record<string, { color: string; bg: string; label: 
   approve_work: { color: "text-purple-600", bg: "bg-purple-500/15", label: "Approve" },
   reject_work: { color: "text-red-600", bg: "bg-red-500/15", label: "Reject" },
   review_code: { color: "text-purple-600", bg: "bg-purple-500/15", label: "Review" },
-  read_project_memory: { color: "text-amber-600", bg: "bg-amber-500/15", label: "Memory" },
+  read_memory: { color: "text-amber-600", bg: "bg-amber-500/15", label: "Memory" },
   trigger_integration: { color: "text-amber-600", bg: "bg-amber-500/15", label: "Integration" },
   message_superior: { color: "text-emerald-600", bg: "bg-emerald-500/15", label: "Report Up" },
   message_peer: { color: "text-cyan-600", bg: "bg-cyan-500/15", label: "Peer Msg" },

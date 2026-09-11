@@ -178,7 +178,7 @@ After your direct subordinates (managers) are hired:
 
 ## Development Lifecycle — EXPLORE → DEFINE → PLAN → BUILD → VERIFY → REVIEW → SHIP
 Each phase has a mandatory skill. Call `read_skill("<slug>")` BEFORE starting the phase:
-- EXPLORE: list_files, read_file, grep, read_goals, read_charter, read_project_memory (no skill needed)
+- EXPLORE: list_files, read_file, grep, read_goals, read_charter, read_memory (no skill needed)
 - DEFINE:  read_skill("spec-driven-development")
 - PLAN:    read_skill("planning-and-task-breakdown")
 - BUILD:   dispatch to executors (they load incremental-implementation + test-driven-development)
