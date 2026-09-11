@@ -87,6 +87,80 @@ class TestRawDictExitsAreFunneled:
             f"→ 下游 result['runner_failed'] 会 KeyError"
         )
 
+    def test_no_raw_dict_declares_derived_keys(self):
+        """**P0 护栏**：裸字典出口**不得**声明派生键 `runner_failed`/`command_failed`。
+
+        2026-09-11 独立审计抓到的真缺陷：`execute_bash` / `execute_run_command`
+        的**普通非零退出**出口写的是 `"command_failed": True`（**派生键**，
+        无 `fact`）。该出口未经漏斗 ⇒ `finalize_fact_dict` 不会在它身上跑 ⇒
+        键**保留**了下来。看似正常，实则：
+
+        - 一旦该结果流经**任何**漏斗（`pipeline`/`executor` 的 normalize 尾、
+          `ToolResult` 往返），`finalize_fact_dict` 会**先 pop 掉**这两个键再
+          按 `fact` 重算 —— 而此处 `fact is None` ⇒ 两个键**一起消失**；
+        - 于是全平台**流量最大**的失败出口（普通非零退出）**没有事实位**。
+
+        判据：派生键只能由 `fact` 展开；**裸写派生键 = 绕过唯一权威**。
+        故这里断言：任何裸字典 return 里出现这两个键即为违规。
+        """
+        _DERIVED = ("runner_failed", "command_failed")
+        for mod in (bash_mod,):
+            tree = _parse(mod)
+            offenders = []
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Return):
+                    continue
+                if not isinstance(node.value, ast.Dict):
+                    continue
+                keys = [
+                    k.value for k in node.value.keys if isinstance(k, ast.Constant)
+                ]
+                hit = [k for k in keys if k in _DERIVED]
+                if hit:
+                    offenders.append((node.lineno, hit))
+            assert not offenders, (
+                f"{mod.__name__}:{offenders} 的裸字典出口直接声明了派生键 "
+                f"{_DERIVED} —— 派生键必须由权威 `fact` 展开（经 "
+                f"finalize_fact_dict），裸写会被漏斗 pop 掉而静默丢失"
+            )
+
+    def test_nonzero_exit_declares_command_failed_end_to_end(self):
+        """端到端：普通非零退出的结果字典必须可判定为 `command_failed`。
+
+        这是上面那条 AST 护栏的**行为对照** —— 结构断言说"没裸写派生键"，
+        这里说"事实位确实到位"，两者缺一不可。
+        """
+        from hiveweave.tools.result import finalize_fact_dict
+
+        raw = {
+            "success": False, "output": "x", "error": "Command exited with code 1",
+            "exit_code": 1, "fact": "command_failed",
+        }
+        out = finalize_fact_dict(dict(raw))
+        assert out["command_failed"] is True
+        assert out["runner_failed"] is False
+        # 且经漏斗往返后仍稳定（幂等）
+        again = finalize_fact_dict(dict(out))
+        assert again["command_failed"] is True
+        assert again["runner_failed"] is False
+
+    def test_bare_derived_key_without_fact_is_stripped(self):
+        """反例固化：裸 `command_failed`（无 fact）经漏斗后**确实**消失。
+
+        此用例把"为什么必须改"钉死在测试里 —— 若未来有人把 `fact` 从某个出口
+        拿掉，这里会提醒他派生键不会自愈。
+        """
+        from hiveweave.tools.result import finalize_fact_dict
+
+        stripped = finalize_fact_dict({
+            "success": False, "output": "", "error": "e", "command_failed": True,
+        })
+        assert "command_failed" not in stripped, (
+            "无 fact 时派生键必须被剥除（这正是 P0 的成因）"
+        )
+        assert "runner_failed" not in stripped
+        assert stripped.get("fact") is None
+
     def test_finalize_fact_dict_expands_derived_keys(self):
         """漏斗的核心契约：fact → 派生键展开；None 保持「未确定」。"""
         from hiveweave.tools.result import finalize_fact_dict

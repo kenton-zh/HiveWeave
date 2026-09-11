@@ -88,6 +88,20 @@ def effective_budget() -> dict[str, float]:
     missing referent」）。
 
     自检失败不得拖垮启动，故整体兜底；返回空 dict 表示"读不到"，不表示"没预算"。
+
+    项 2 补键（2026-09-11）—— 分项判断，不一刀切：
+
+    - ``soft_s``：公开常量、同单位（秒）、同失败面，**还能识别「部分覆盖」**
+      （`.env` 只设 HARD 没设 SOFT ⇒ 两者比值失真）；加。
+    - ``llm_concurrency``：**单位不是秒**，故**不混进「秒预算」的语义**
+      —— 但它是**独立失败面**（吞吐/限流）且**有已记录事故**（见
+      `constants.LLM_MAX_CONCURRENT` 注释：12 从未生效，13 次 hard timeout
+      烧约 123.5 分钟）。故仍纳入，靠**键名自述单位**区分。
+
+    ⚠️ 键一旦增加，**冒烟断言必须按键级同步泛化**：`effective_budget()` 只在
+    返回**空 dict** 时触发 `unreadable`，只补部分键时 dict 非空 ⇒ 缺失的键
+    会**静默通过**。故 `scripts/smoke_release.py` 的期望值解析是同批改动，
+    不可只加键不加断言（那是"只取证、无门禁价值"）。
     """
     out: dict[str, float] = {}
     try:
@@ -95,6 +109,10 @@ def effective_budget() -> dict[str, float]:
 
         out["hard_s"] = float(streamer_constants.HARD_TOTAL_TIMEOUT_S)
         out["ceiling_s"] = float(streamer_constants.AGENT_SAFETY_CEILING_S)
+        # 项 2：SOFT 与 HARD 同单位同失败面 —— 补上才能看出"只覆盖了一半"。
+        out["soft_s"] = float(streamer_constants.TOTAL_TIMEOUT_S)
+        # 项 2：并发是**另一类**失败面（吞吐/限流），无结构断言覆盖。
+        out["llm_concurrency"] = float(streamer_constants.LLM_MAX_CONCURRENT)
     except Exception as exc:  # noqa: BLE001 — 自检失败不阻塞启动
         log.warning("effective_budget_unavailable", error=str(exc))
     return out

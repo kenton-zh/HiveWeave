@@ -1887,14 +1887,17 @@ async def execute_bash(
         error_msg = f"{error_msg}\n{detail}"
     error_msg = _maybe_append_venv_hint(ws, error_msg)
     error_msg = _maybe_append_test_anchor_hint(command, error_msg)
-    return {
+    # ⚠️ 必须经漏斗：`command_failed` 已是**派生键**，裸写它会被
+    # `finalize_fact_dict` 当作陈旧值 pop 掉（权威是 `fact`）。这是全平台
+    # **流量最大**的失败出口 —— 漏了它等于「普通非零退出」永远拿不到事实位。
+    return finalize_fact_dict({
         "success": False,  # non-zero exit is not success
         "output": f"{body}\n\n{cwd_hint}\nExit code: {exit_code}",
         "error": error_msg,
         "exit_code": exit_code,
         # F4：命令执行了但失败（非零退出 = command_failed，不是 runner 失败）
-        "command_failed": True,
-    }
+        "fact": "command_failed",
+    })
 
 
 async def execute_run_command(
@@ -2032,14 +2035,15 @@ async def execute_run_command(
         error_msg = f"{error_msg}\n{detail}"
     error_msg = _maybe_append_venv_hint(ws, error_msg)
     error_msg = _maybe_append_test_anchor_hint(command, error_msg)
-    return {
+    # 同上：`run_command` 的普通非零退出，同样必须经漏斗。
+    return finalize_fact_dict({
         "success": False,
         "output": f"{body}\n\nExit code: {exit_code}",
         "error": error_msg,
         "exit_code": exit_code,
         # F4：命令执行了但失败（非零退出 = command_failed）
-        "command_failed": True,
-    }
+        "fact": "command_failed",
+    })
 
 
 # ── Pydantic models + @tool registration (Phase 2 migration) ──────

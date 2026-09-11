@@ -25,7 +25,11 @@ MAX_TOOL_ROUNDS = 1_000_000
 # 注入强制 commit_turn 提示；再过 GRACE 轮仍未 commit → 优雅收口（复用
 # budget_exhausted 收口 + agent 层自动 retrigger 续跑，零产出损失）。
 # 与 MAX_TOOL_ROUNDS（安全网）不同：本阈值是主动疏导，默认远低于安全网。
-FORCE_COMMIT_ROUNDS = int(_os.environ.get("HIVEWEAVE_FORCE_COMMIT_ROUNDS", "40"))
+# `or "40"` 兜空值：`HIVEWEAVE_FORCE_COMMIT_ROUNDS=`（空）会让 `int("")`
+# 在 import 期炸掉整个后端（同 `_LLM_MAX_CONCURRENT` 的坑）。
+FORCE_COMMIT_ROUNDS = int(
+    _os.environ.get("HIVEWEAVE_FORCE_COMMIT_ROUNDS", "40") or "40"
+)
 """单 turn 工具轮次疏导线：达到该轮数强制提示 commit_turn(in_progress)。
 
 09-02 双触发修正：纯轮数线在现实预算下永不触发（07 实测 ~52s/轮，
@@ -302,7 +306,26 @@ def stream_chunk_wait_s(*, got_event: bool) -> float:
 # ── Bug B fix: 全局 LLM 并发控制 ───────────────────────────
 # 防止多 agent 同时打 LLM API 超过 provider 并发限制（默认 8）。
 # Semaphore 在 HTTP 请求级别获取/释放，tool 执行期间不占槽。
-_LLM_MAX_CONCURRENT = int(_os.environ.get("HIVEWEAVE_LLM_MAX_CONCURRENT", "8"))
+# `or "8"` 不可省：`HIVEWEAVE_LLM_MAX_CONCURRENT=`（空值）时 `.get` 返回 `""`
+# 而非默认值 ⇒ `int("")` 在 **import 期**抛 ValueError ⇒ 后端根本起不来。
+# 本文件其余 11 处 env 读取都用 `or "N"` 兜空值，此处曾漏。
+_LLM_MAX_CONCURRENT = int(
+    _os.environ.get("HIVEWEAVE_LLM_MAX_CONCURRENT", "8") or "8"
+)
+
+#: 公开别名（`effective_budget()` / 冒烟断言 / 运维都要读它）。
+#:
+#: 为什么不直接改私有名：`_LLM_MAX_CONCURRENT` 已被 `llm/streamer/__init__.py`
+#: 再导出、且下游有 `from ... import _LLM_MAX_CONCURRENT` 的既有引用。加 alias
+#: 而非改名，是「先给它一等可读出口」而不制造一处沉默的行为变化
+#: （DSH `AGENTS.md:118`「No hardcoded tunables in plugins」）。
+#:
+#: ⚠️ 该值曾**从未生效**：`llm/streamer/__init__.py:18-20` 自陈
+#: `LLM_MAX_CONCURRENT=12` 未被读到 ⇒ 13 次 hard timeout 烧掉约 123.5 分钟
+#:（≈总墙钟 40%）。独立失败面（吞吐/限流）、无结构断言覆盖 ——
+#: 故必须进 `effective_budget()` 并**在冒烟里按键级断言**。
+LLM_MAX_CONCURRENT = _LLM_MAX_CONCURRENT
+
 _LLM_SEMAPHORE: asyncio.Semaphore | None = None
 
 

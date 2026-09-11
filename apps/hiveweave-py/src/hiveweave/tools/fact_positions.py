@@ -34,7 +34,11 @@ from __future__ import annotations
 
 import re
 
+import structlog
+
 from hiveweave.tools.result import FactKind
+
+log = structlog.get_logger(__name__)
 
 #: runner 失败的**专属签名**（命令从未执行）。
 #:
@@ -218,13 +222,42 @@ def finalize_tool_result(
     else:
         return ToolResult.ok(str(raw)).to_dict()
 
-    # 事实位归因：blocked 却无 fact ⇒ 按签名表判；判不出来就 fail loud。
+    # 事实位归因：blocked 却无 fact ⇒ 按签名表判。
+    #
+    # ⚠️ 判不出来时**不能把 AssertionError 抛到运行时**（独立审计 P1，2026-09-11）：
+    # 本函数在 executor 的第 4 步、**dispatch 的 try/except 之外**被调用
+    # （`executor.py:3112`），未捕获异常会**直接炸掉这次工具调用**，
+    # agent 拿到的是「平台崩了」而不是「这个工具被拦住了」——
+    # 这比"归错格"更糟。反例：`file.py` 的 `"Unknown error"` 不命中任何签名。
+    #
+    # 故此处 **fail loud 但不 fail hard**：签名表失配是**平台侧需修**的信号，
+    # 记 ERROR 日志（可被 CI/审计捞），但运行时归到保守的 `runner_failed`
+    # （语义 =「命令从未执行」，对 agent 而言是「不是你的 bug」——
+    # 保守方向：宁可让它重试，不可让它误以为环境已损坏而放弃）。
+    #
+    # **严格性由 commit gate 保留**：`test_fact_positions_coverage.py` 对
+    # 签名表本身的失配仍以断言封死；`classify_blocked_fact()` 作为**纯测试
+    # 入口**依旧 fail loud（生产路径走本函数的兜底）。
     if judge_blocked and r.blocked and r.fact is None:
-        r.fact = classify_blocked_fact(
-            tool_name,
-            r.error or "",
-            timeout_kind=getattr(r, "timeout_kind", None),
-        )
+        try:
+            r.fact = classify_blocked_fact(
+                tool_name,
+                r.error or "",
+                timeout_kind=getattr(r, "timeout_kind", None),
+            )
+        except AssertionError:
+            log.error(
+                "fact_position_signature_miss",
+                tool=tool_name,
+                error_preview=(r.error or "")[:200],
+                fallback="runner_failed",
+                action=(
+                    "签名表未命中 —— 请把该文案补进 "
+                    "RUNNER_FAILURE_SIGNATURES / BAD_ARGS_SIGNATURES，"
+                    "或在构造点显式声明 fact（fixplan 批次 2 §1.4c）"
+                ),
+            )
+            r.fact = "runner_failed"
 
     out = r.to_dict()
     if tool_name in SHELL_SECURITY_LEVEL_TOOLS or judge_blocked:
