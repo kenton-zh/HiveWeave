@@ -465,6 +465,29 @@ PROJECT_DB_TABLES = [
         updated_at INTEGER
     )
     """,
+    # 模块表（支持嵌套）—— 形状按 docs/AI工程组织_MVP蓝图.md:283-287。
+    # 批次 7 交付面：`parent_module_id` 自引用建模块树；`current_agent_id`
+    # 记录当前负责人；`memories.module_id` 在归档时回指本表（见蓝图 :299）。
+    # 注：本表**当前无写入方**（批次 7 接管写侧），
+    # tests/test_every_project_db_table_has_writer.py 会因此合法变红 —— 预期。
+    """
+    CREATE TABLE IF NOT EXISTS modules (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        name TEXT NOT NULL,
+        path TEXT,
+        description TEXT,
+        parent_module_id TEXT,
+        status TEXT DEFAULT 'active',
+        current_agent_id TEXT,
+        created_at INTEGER,
+        updated_at INTEGER
+    )
+    """,
+    # 存量库补批次 7 需要的三列（懒迁移；正典已含，新库不跑）。
+    """ALTER TABLE modules ADD COLUMN parent_module_id TEXT""",
+    """ALTER TABLE modules ADD COLUMN status TEXT DEFAULT 'active'""",
+    """ALTER TABLE modules ADD COLUMN current_agent_id TEXT""",
     """
     CREATE TABLE IF NOT EXISTS tool_attestations (
         id TEXT PRIMARY KEY,

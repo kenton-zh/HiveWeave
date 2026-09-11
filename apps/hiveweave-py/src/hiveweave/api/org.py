@@ -24,6 +24,7 @@ from pydantic import BaseModel
 import structlog
 
 from hiveweave.api.auth import validate_id
+from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
 from hiveweave.services.agent_activity import live_status
 from hiveweave.services.org import OrgService
@@ -399,8 +400,29 @@ async def transfer_agent(agent_id: str, body: TransferBody) -> dict:
 
 @router.get("/modules")
 async def list_modules(projectId: str = Query(...)) -> dict:
-    """已摘除：modules 是死表（零写入方、零消费者），见 fixplan §6 #13。"""
-    return {"modules": []}
+    """列出项目模块（per-project DB modules 表，支持嵌套）。
+
+    形状按 `docs/AI工程组织_MVP蓝图.md:283-287`：`parentModuleId` 为自引用
+    层级；`status` = active|completed|archived；`currentAgentId` = 当前负责人。
+    写侧由批次 7 接管（本路由只读）。
+    """
+    workspace = await meta_db.get_project_workspace(projectId)
+    if not workspace:
+        return {"modules": []}
+    try:
+        conn = await project_db.ensure_project_db(workspace)
+        cursor = await conn.execute(
+            "SELECT id, project_id, name, path, description, parent_module_id, "
+            "status, current_agent_id, created_at, updated_at FROM modules "
+            "WHERE project_id = ? ORDER BY name",
+            [projectId],
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return {"modules": [dict(r) for r in rows]}
+    except Exception as e:
+        log.warning("list_modules_failed", project_id=projectId, error=str(e))
+        return {"modules": []}
 
 
 # ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────

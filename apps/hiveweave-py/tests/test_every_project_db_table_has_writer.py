@@ -16,6 +16,13 @@ per-project DB 的唯一权威源，见 ``db/project.py:215`` 的建表循环）
 - 写入方判定 = 字符串字面量里出现 ``INSERT ... INTO <table>``（含
   ``INSERT OR REPLACE/IGNORE`` 与 ``REPLACE INTO``）。
 - 回退代码（删掉某张表的 INSERT）会让本测试**打红**，这是它存在的全部意义。
+
+**交接状态（批次 5 ⇄ 批次 7）**：``modules`` 表按 A 方案保留（形状见
+``docs/AI工程组织_MVP蓝图.md:283-287``，含 ``parent_module_id`` 自引用模块树），
+写侧由**批次 7** 接管。在写侧落地前，``modules`` 显式列在
+``_KNOWN_WRITERLESS_PENDING`` 白名单里 —— 这**不是**为了变绿而放水：
+白名单有两条防腐测试（已接写入方必须移出 / 条目必须是真表），批次 7 落地
+INSERT 后必须把 ``modules`` 移出白名单。
 """
 
 from __future__ import annotations
@@ -116,17 +123,53 @@ def test_canonical_tables_extracted():
     assert len(names) >= 20, f"只抽到 {len(names)} 张表？抽取口径变了请复核"
 
 
+# 已知的「表已建、写侧未落地」白名单（**必须随写侧落地而清空**）。
+# 这些表的存在是有意为之（先建对形状、接线随后），不是遗漏；
+# 门禁对它们放行，但仍会在它们之外的任何新死表上打红。
+#
+# - ``modules``：形状按 docs/AI工程组织_MVP蓝图.md:283-287（parent_module_id
+#   自引用模块树），**批次 7 接管写侧**。本条目是批次 5 与批次 7 的交接点：
+#   批次 7 落地 INSERT 后请把 ``modules`` 从本集合删掉，让门禁重新覆盖它。
+_KNOWN_WRITERLESS_PENDING: frozenset[str] = frozenset({"modules"})
+
+
 def test_every_project_db_table_has_a_writer():
     """每张 per-project DB 表都必须有 INSERT 写入方（防下一个 modules 死表）。"""
     names = _canonical_table_names()
     writers = _writers_by_table()
-    dead = sorted(t for t in names if not writers.get(t))
+    dead = sorted(
+        t for t in names
+        if not writers.get(t) and t not in _KNOWN_WRITERLESS_PENDING
+    )
     assert not dead, (
         f"这些表建在 PROJECT_DB_TABLES 里但**全仓零 INSERT**：{dead}。\n"
-        "「建了表没人写」= 死表（`modules` 就是这样：读取路由永远返回空）。\n"
+        "「建了表没人写」= 死表（`modules` 曾长期如此：读取路由永远返回空）。\n"
         "请二选一：① 接上写入方；② 若确认无消费者，从 DDL 摘除"
         "（并同步 db/meta.py 的 _LEGACY_TABLES_TO_DROP 与读取路由）。"
+        f"（若确属「形状先建、写侧随后」的交接状态，请显式加入"
+        f" _KNOWN_WRITERLESS_PENDING 并写明接管方。）"
     )
+
+
+def test_known_writerless_allowlist_does_not_rot():
+    """白名单不得腐烂：已接上写入方的表必须从白名单移出。
+
+    防「白名单变成垃圾桶」—— 某张表其实早已有 writer，却还挂在豁免里，
+    让门禁对它永久失明（这是我们加门禁要防的同一类病）。
+    """
+    writers = _writers_by_table()
+    stale = sorted(t for t in _KNOWN_WRITERLESS_PENDING if writers.get(t))
+    assert not stale, (
+        f"这些表已在 _KNOWN_WRITERLESS_PENDING 里，但**已经有写入方**了："
+        f"{stale} —— 请把它们从白名单删掉，让门禁恢复覆盖。"
+    )
+
+
+def test_known_writerless_allowlist_entries_are_real_tables():
+    """白名单里的每张表都必须是正典里的真表（防打错字造成假豁免）。"""
+    names = _canonical_table_names()
+    unknown = sorted(t for t in _KNOWN_WRITERLESS_PENDING if t not in names)
+    assert not unknown, f"白名单里有正典中不存在的表名：{unknown}"
 
 
 def test_gate_detects_a_simulated_dead_table():
