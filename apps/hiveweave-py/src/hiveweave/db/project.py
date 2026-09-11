@@ -49,6 +49,24 @@ _cache: OrderedDict[str, aiosqlite.Connection] = OrderedDict()
 # agent_id → workspace_path cache (avoids Meta DB lookup on every query)
 _agent_cache: dict[str, str] = {}
 
+# workspace → 连接世代计数。每次 ensure_project_db **新建连接**时 +1。
+# 用途：调用方（services/inbox.py 的懒补列标记）需要区分「同一路径、新一代库」——
+# 库被整代重建后，按路径记忆的缓存必须失效（09-11 TEST_DSH_52_A 事故）。
+_ws_generation: dict[str, int] = {}
+
+
+def workspace_generation(workspace: str) -> int:
+    """该 workspace 当前的连接世代（0 = 从未建连）。
+
+    新建连接即「我们不再知道这个库的状态」（新库 / LRU 重连 / 驱逐重连），
+    故每次建连递增；持有按路径键控缓存的调用方应把世代并入键。
+
+    **只增不减、永不重置**（审计确认的纪律）：把计数器清零会让「新一代」与
+    仍存活的旧标记键 ``(ws, 1)`` 相撞 → 静默早退复发，正是本函数要防的那个事故。
+    代价仅是随路径数增长的一个 int，可忽略。
+    """
+    return _ws_generation.get(str(Path(workspace).resolve()), 0)
+
 # R2: 保护 ensure_project_db 的懒初始化，避免并发创建多个连接到同一 DB
 _ensure_lock = asyncio.Lock()
 
@@ -97,6 +115,11 @@ async def ensure_project_db(workspace_path: str) -> aiosqlite.Connection:
             return _cache[ws]
 
         db_path = _db_path_for_workspace(workspace_path)
+        # 连接世代 +1（在 connect 之前，保证「建连」与「世代变化」原子对应）。
+        # 09-11 TEST_DSH_52_A 事故：同一路径上的库被整代重建（项目目录被删/重建）
+        # 后，按路径记忆的懒补列标记仍存活 → 永不补列且静默，只在**下游**
+        # 以 `no such column: wake` 炸开。世代让这类缓存能随库换代失效。
+        _ws_generation[ws] = _ws_generation.get(ws, 0) + 1
         conn = await aiosqlite.connect(db_path)
         conn.row_factory = aiosqlite.Row
 

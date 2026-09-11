@@ -51,8 +51,7 @@ async def env():
         async def fake_publish(*args, **kwargs):
             return None
 
-        inbox_module._migrated.discard(CEO_ID)
-        inbox_module._migrated.discard(DEV_ID)
+        inbox_module._migrated.clear()
         project_db._agent_cache.pop(CEO_ID, None)
         project_db._agent_cache.pop(DEV_ID, None)
 

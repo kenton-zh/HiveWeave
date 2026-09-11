@@ -56,9 +56,7 @@ async def env():
             return PROJECT_ID if aid in (COORDINATOR_ID, EXECUTOR_ID) else None
 
         task_module._migrated.discard(PROJECT_ID)
-        inbox_module._migrated.discard(COORDINATOR_ID)
-        inbox_module._migrated.discard(EXECUTOR_ID)
-        inbox_module._migrated.discard("loop-qa")
+        inbox_module._migrated.clear()
         project_db._agent_cache.pop(COORDINATOR_ID, None)
         project_db._agent_cache.pop(EXECUTOR_ID, None)
         project_db._agent_cache.pop("loop-qa", None)

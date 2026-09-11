@@ -20,7 +20,7 @@ from hiveweave.services.wake_policy import (
 
 log = structlog.get_logger(__name__)
 
-_migrated: set[str] = set()
+_migrated: set[tuple[str, int]] = set()
 
 
 async def _execute_rowcount_by_agent(
@@ -206,28 +206,40 @@ _MISSING_COLUMNS = [
 ]
 
 
-async def _schema_marker_key(agent_id: str) -> str:
-    """解析 schema 标记键：agent 当前路由到的 workspace（schema 属于
-    具体 DB 文件，不属于 agent id）。
+async def _schema_marker_key(agent_id: str) -> tuple[str, int]:
+    """解析 schema 标记键：``(workspace, 连接世代)``。
 
-    路由失败（agent 未注册 / workspace 被驱逐）回退 agent 级键 —— 后续
+    schema 属于**具体 DB 文件**，不属于 agent id；而且属于该文件的**这一代**
+    —— 同一路径上的库可能被整代重建（项目目录被删/重建），此时旧标记必须失效。
+
+    09-11 `TEST_DSH_52_A` 事故：标记曾只按 workspace 路径记忆，路径上的库被
+    重建回「只有基础 10 列」后标记仍存活 → `_ensure_schema` 静默早退、永不补列
+    （三条失败分支都会打 warning，而日志里 0 条 → 只能是从早退走的），
+    最终只在**下游**以 `no such column: wake` 炸开，归因完全错位。
+    世代由 `db/project.py` 在**每次新建连接**时递增（新建连接即「我们不再
+    知道这个库的状态」：新库 / LRU 重连 / 驱逐重连都算）。
+
+    路由失败（agent 未注册 / workspace 被驱逐）回退 agent 级键 + 世代 0 —— 后续
     ALTER 的 execute 同样会失败，行为与旧实现一致。
     """
     try:
         await project_db.get_project_db_for_agent(agent_id)
     except Exception:
-        return f"agent:{agent_id}"
-    return project_db._agent_cache.get(agent_id) or f"agent:{agent_id}"
+        return f"agent:{agent_id}", 0
+    ws = project_db._agent_cache.get(agent_id) or f"agent:{agent_id}"
+    return ws, project_db.workspace_generation(ws)
 
 
 async def _ensure_schema(agent_id: str) -> None:
     """Add missing columns to inbox table (idempotent).
 
-    标记按 workspace 键控（非 agent id）：同一 agent id 映射到不同 DB
-    （测试跨文件复用 "exec-1" 等固定 id 切换临时 workspace）时，按
+    标记按 ``(workspace, 连接世代)`` 键控（非 agent id）：同一 agent id 映射到
+    不同 DB（测试跨文件复用 "exec-1" 等固定 id 切换临时 workspace）时，按
     agent 记忆会让新库跳过补列 → wake 等列缺失 → inbox 写入/读取全部
     静默失败（全量回归 test_archive_direct_push 0 通知事故根因，
-    2026-08-19）。
+    2026-08-19）。**世代维度是 2026-09-11 补的**：只按路径记忆时，同一路径上
+    的库被整代重建仍会命中旧标记 → 永不补列（TEST_DSH_52_A 事故，见
+    `_schema_marker_key` 注释）。
 
     补列失败不再无条件标记完成（09-08 office-godot 实测事故）：ALTER
     撞上「database is locked」等瞬态错误曾被 `except: pass` 吞掉后照
