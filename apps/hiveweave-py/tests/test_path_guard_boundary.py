@@ -62,6 +62,42 @@ def test_non_worktree_path_never_flagged_as_cross_tree(trees: dict[str, str]) ->
     assert path_guard.is_foreign_worktree_ref("", trees["wt_a"]) is False
 
 
+# ── ①b P1-2：平台自管 `_quarantine` 不得被当"别的树" ────────────────
+#
+# 审计实测：`is_foreign_worktree_ref` 不豁免平台自管的 `_quarantine`
+# （`constants.py:9`）⇒ 该目录是**平台自己**搬迁隔离用的，不属任何 agent，
+# 却被 shell 预检判成"越出授权树"拒发。file/vision 侧早已跳过 `_` 前缀
+# （`file.py:548` / `vision.py:204`），shell 侧此前没有 —— 三处口径不一。
+
+
+def test_quarantine_dir_is_not_a_foreign_worktree(trees: dict[str, str]) -> None:
+    """`_quarantine` 路径不得被判成跨树引用（平台自管，非任何 agent 的树）。"""
+    q = trees["project"] + "/.hiveweave/worktrees/_quarantine/A044-20260912"
+    assert path_guard.is_foreign_worktree_ref(q, trees["wt_a"]) is False
+
+
+def test_other_underscore_prefixed_platform_dirs_exempt(trees: dict[str, str]) -> None:
+    """任何 `_` 前缀 id 都是平台自管命名空间（与 file/vision 同一豁免口径）。"""
+    p = trees["project"] + "/.hiveweave/worktrees/_tmp_purge/x"
+    assert path_guard.is_foreign_worktree_ref(p, trees["wt_a"]) is False
+
+
+def test_normal_sibling_tree_still_flagged_after_exemption(
+    trees: dict[str, str],
+) -> None:
+    """豁免不得扩大到正常兄弟树（`A045` 仍必须判越界）—— 防放水。"""
+    assert path_guard.is_foreign_worktree_ref(
+        trees["wt_b"] + "/src/x.py", trees["wt_a"]
+    ) is True
+
+
+def test_precheck_allows_quarantine_path(trees: dict[str, str]) -> None:
+    """shell 预检必须与豁免一致：`_quarantine` 命令不被拒发。"""
+    q = trees["project"] + "/.hiveweave/worktrees/_quarantine/x/src"
+    assert precheck_command_string(f"Remove-Item -Recurse -Force {q}",
+                                  trees["wt_a"]) is None
+
+
 # ── ② 幽灵树判定抽到 path_guard 后**行为不变**（file 侧是薄封装）───
 
 
