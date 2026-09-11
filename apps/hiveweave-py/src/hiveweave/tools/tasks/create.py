@@ -282,6 +282,16 @@ async def create_task_tool(
         except ValueError as e:
             return ToolResult.err(str(e))
 
+        # fixplan §6 #12：交付物平面降档（视觉门遇非 web 平面 → 降档 + 留痕）。
+        # 留痕 tag 追加到任务 tags；原因进回执 —— 降档不许静默。
+        from hiveweave.services.delivery_plane import resolve_and_downgrade
+
+        policy_id, _plane_tag, _plane_reason = await resolve_and_downgrade(
+            policy_id, project_id=project_id, tags=params.tags
+        )
+        if _plane_tag:
+            params.tags = sorted({*(params.tags or []), _plane_tag})
+
         title = params.title
         source = "agent"
         if params.milestone_verify:
@@ -367,9 +377,10 @@ async def create_task_tool(
                 qa_note = qa_depth_advisory(agents=_agents, tasks=_tasks) or ""
             except Exception as qa_err:  # noqa: BLE001 — fail-open
                 log.debug("qa_depth_advisory_failed", error=str(qa_err))
+        plane_note = f" ⚠ {_plane_reason}" if _plane_reason else ""
         return ToolResult.ok(
             f"Task created (id={task_id}, {note}): {title}"
-            f"{force_note}{deps_note}{dod_hint}{qa_note}",
+            f"{force_note}{deps_note}{dod_hint}{qa_note}{plane_note}",
             task_id=task_id,
             status=st,
         )

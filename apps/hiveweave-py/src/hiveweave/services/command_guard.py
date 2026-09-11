@@ -315,6 +315,226 @@ def _pred_rm_recursive_force(tokens: list[str]) -> bool:
     return recursive and force
 
 
+# ════════════════════════════════════════════════════════════════════
+# #15 删除命令「效果落点」判定（挂到 acl_sandbox 授权树）
+#
+# 判据来源（fixplan §6 #15 / §10.1，**不是 DSH**：DSH 只有「一棵树 + 全共享」，
+# 无 per-agent worktree 维度，对「谁在哪个树里」无立场）：
+#   services/acl_sandbox/policy.py:54  boundary_root  # 授权树根（executor=worktree）
+#   services/acl_sandbox/policy.py:57  temp_dir       # agent 私有 temp
+#   services/acl_sandbox/policy.py:63  extra_dirs     # §5.5b② 附加可写目录
+#
+# 判据 = 「效果落点是否在本 agent 被授予的能力集内」：
+#   全部落在 boundary_root ∪ temp_dir ∪ extra_dirs → allow（自己创建的路径自己删）
+#   越界 → deny（fail-closed，非 ask —— 无通道时挂起等审批本身是事故）
+# ════════════════════════════════════════════════════════════════════
+
+# 删除族命令（首 token）——只对这些命令做落点判定
+_DELETE_FAMILY = frozenset({
+    "rm", "del", "erase", "rd", "rmdir", "remove-item", "remove_item",
+})
+
+_REMOVE_ITEM_HINT = (
+    "Remove-Item 目标越出你的授权树（boundary_root ∪ temp_dir ∪ extra_dirs）。"
+    "改用 delete_directory 工具清理你自己 worktree 内的目录；"
+    "确需越界删除请把需求交派单方，不要自己扩大作用范围。"
+)
+_DELETE_BOUNDARY_HINT = (
+    "删除目标越出你的授权树（boundary_root ∪ temp_dir ∪ extra_dirs）—— "
+    "效果落点不在本 agent 被授予的能力集内，已 fail-closed 拒绝（非审批等待）。"
+    "改用 delete_directory / delete_file 工具，或把目标收敛到你自己的 worktree。"
+)
+
+
+def _is_within_any(path: str, roots: list[str]) -> bool:
+    """``path``（已 realpath）是否落在任一 ``roots``（已 realpath）之内。"""
+    try:
+        p = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    for r in roots:
+        if not r:
+            continue
+        try:
+            rp = os.path.realpath(r)
+        except (OSError, ValueError):
+            continue
+        if p == rp:
+            return True
+        try:
+            if os.path.commonpath([p, rp]) == rp:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _extract_delete_targets(tokens: list[str]) -> tuple[list[str], bool]:
+    """从删除命令 token 里取**目标路径**；返回 ``(targets, has_indirect)``。
+
+    只取删除族的**位置参数**（跳过开关与其值）。``has_indirect=True`` 表示
+    出现变量/命令替换等无法静态审计的引用 —— 调用方必须 fail-closed。
+
+    覆盖 unix（rm -r / rm -rf）与 PowerShell（Remove-Item -Recurse -Force）：
+    后者此前**完全没被覆盖**（fixplan §6 #15 的「实现坑」：
+    ``tools/bash.py::_extract_file_paths_from_command`` 的 ``file_cmds``
+    只认 unix 命令、不含 ``remove-item``）。
+    """
+    targets: list[str] = []
+    has_indirect = False
+    # 取值型开关（下一个 token 是它的值，不是目标路径）
+    value_switches = {"-filter", "-include", "-exclude", "-path", "-literalpath"}
+    i, n = 1, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        tl = tok.lower()
+        # 间接引用（$VAR / %VAR% / `...` / $(...)）→ 无法静态判定落点
+        if (
+            tok.startswith("$")
+            or tok.startswith("%")
+            or tok.startswith("`")
+            or "$(" in tok
+            or "%" in tok
+        ):
+            has_indirect = True
+            i += 1
+            continue
+        if tl.startswith("-") or tl.startswith("/"):
+            # PowerShell 的 `-,` 逗号分隔也在此；`:foo` 参数值型开关
+            if tl.replace("-", "").replace("/", "").startswith("path"):
+                if i + 1 < n:
+                    targets.append(tokens[i + 1])
+                    i += 2
+                    continue
+            if tl.lstrip("-/") in value_switches or tl.lstrip("-/").startswith(
+                ("filter", "include", "exclude")
+            ):
+                i += 2
+                continue
+            i += 1
+            continue
+        if tok in ("|", "&&", "||", ";", "&"):
+            i += 1
+            continue
+        targets.append(tok)
+        i += 1
+    return targets, has_indirect
+
+
+def resolve_delete_landing(
+    command: str,
+    *,
+    boundary_root: str | None = None,
+    temp_dir: str | None = None,
+    extra_dirs: tuple[str, ...] = (),
+    cwd: str | None = None,
+) -> GuardVerdict | None:
+    """删除命令「效果落点」判定（#15）。返回 None = 无意见（交给规则表）。
+
+    - 非删除族命令 → None
+    - 无边界信息（boundary_root 缺失）→ None（不发明规则，退回规则表）
+    - 出现无法审计的间接引用 → deny（fail-closed）
+    - 全部目标落在 boundary_root ∪ temp_dir ∪ extra_dirs → allow
+    - 有目标越界 → deny + 中文处方
+    """
+    if not (boundary_root or "").strip():
+        return None
+    subs = split_compound(command)
+    roots: list[str] = [boundary_root]
+    if temp_dir:
+        roots.append(temp_dir)
+    roots.extend(d for d in extra_dirs if d)
+
+    for sub in subs:
+        _norm, tokens = _normalize_sub(sub)
+        if not tokens:
+            continue
+        first = tokens[0].lower()
+        if first not in _DELETE_FAMILY:
+            continue
+        targets, has_indirect = _extract_delete_targets(tokens)
+        if has_indirect:
+            return GuardVerdict(
+                True, "deny",
+                "删除命令含变量/命令替换引用，展开值执行期才定 —— 无法判定"
+                "效果落点是否越出你的授权树，已 fail-closed 拒绝（非审批等待）。"
+                " 请用字面路径重写。",
+                "__delete_indirect__",
+            )
+        if not targets:
+            # 目标无法提取（如纯通配/无参数）→ 无法证明在边界内 → deny
+            hint = (
+                _REMOVE_ITEM_HINT if first.startswith("remove")
+                else _DELETE_BOUNDARY_HINT
+            )
+            return GuardVerdict(True, "deny", hint, "__delete_no_target__")
+        for t in targets:
+            cand = t
+            if cwd and not os.path.isabs(cand):
+                cand = os.path.join(cwd, cand)
+            if not _is_within_any(cand, roots):
+                hint = (
+                    _REMOVE_ITEM_HINT if first.startswith("remove")
+                    else _DELETE_BOUNDARY_HINT
+                )
+                return GuardVerdict(
+                    True, "deny",
+                    f"{hint} 越界目标：{t}",
+                    "__delete_out_of_boundary__",
+                )
+    return None
+
+
+async def resolve_delete_landing_for_agent(
+    command: str, *, agent_id: str
+) -> GuardVerdict | None:
+    """#15：以本 agent 的**授权树**判定删除命令落点（授权事实与沙箱同源）。
+
+    授权事实来源（与 ``acl_sandbox`` 完全同一套，fixplan §10.1 出处表）：
+    - ``boundary_root`` = agent 的 worktree（``worktree_review.agent_worktree_path``），
+      无 worktree（项目根角色，如 CEO/HR）→ 项目根（``project_main_workspace``）；
+    - ``temp_dir`` = ``acl_sandbox.policy.resolve_temp_dir(root, agent_id)``
+      （``.hiveweave/sandbox-temp/<agent>``）；
+    - ``extra_dirs`` = ``acl_sandbox.integration.fetch_additional_writable_dirs``。
+
+    解析失败/无 agent → None（不发明规则，退回规则表既有行为）。
+    """
+    aid = (agent_id or "").strip()
+    if not aid:
+        return None
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.services.acl_sandbox.integration import (
+            fetch_additional_writable_dirs,
+            resolve_project_root,
+        )
+        from hiveweave.services.acl_sandbox.policy import resolve_temp_dir
+        from hiveweave.services.worktree_review import agent_worktree_path
+
+        row = await meta_db.get_agent_by_id(aid)
+        project_id = (row or {}).get("project_id")
+        worktree = await agent_worktree_path(aid)
+        if worktree:
+            boundary = worktree
+        else:
+            boundary = await resolve_project_root(str(project_id) if project_id else None)
+        if not boundary:
+            return None
+        temp_dir = resolve_temp_dir(boundary, aid)
+        extra = tuple(
+            await fetch_additional_writable_dirs(boundary)
+        )
+        return resolve_delete_landing(
+            command,
+            boundary_root=boundary,
+            temp_dir=temp_dir,
+            extra_dirs=extra,
+        )
+    except Exception:  # noqa: BLE001 — 解析失败不引入新故障面（退回规则表）
+        log.debug("delete_landing_resolve_failed", agent_id=aid)
+        return None
+
+
 _KILL_DANGER_SIGNALS = frozenset({"9", "kill", "sigkill"})
 
 

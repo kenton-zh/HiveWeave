@@ -399,6 +399,7 @@ async def dispatch_task_tool(
     policy_id: str | None = None
     title: str | None = None
     source = "agent"
+    plane_reason: str | None = None
     if not params.task_id:
         from hiveweave.services.attestation import policy_from_submit_gate
 
@@ -406,6 +407,14 @@ async def dispatch_task_tool(
             policy_id = policy_from_submit_gate(params.submit_gate)
         except ValueError as e:
             return ToolResult.err(str(e))
+        # fixplan §6 #12：交付物平面降档（视觉门遇非 web 平面 → 降档 + 留痕）。
+        # dispatch 无 tags 入参 ⇒ 留痕只能进回执（下方 plane_note）；
+        # 任务账本侧的留痕由 create 路径写 tag 承担。
+        from hiveweave.services.delivery_plane import resolve_and_downgrade
+
+        policy_id, _plane_tag, plane_reason = await resolve_and_downgrade(
+            policy_id, project_id=project_id
+        )
         if params.milestone_verify:
             from hiveweave.services.org import OrgService
             from hiveweave.services.policy import infer_role_family
@@ -545,6 +554,8 @@ async def dispatch_task_tool(
                 output += f"\n\n{block}"
         except Exception as e:
             log.debug("dispatch_expectations_echo_failed", error=str(e))
+        if plane_reason:
+            output += f"\n\n⚠ {plane_reason}"
         return ToolResult.ok(output + force_note, task_id=result.get("task_id"))
     return ToolResult.err(result.get("message", "Dispatch failed"))
 

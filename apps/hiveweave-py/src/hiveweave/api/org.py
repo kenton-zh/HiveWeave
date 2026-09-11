@@ -24,7 +24,6 @@ from pydantic import BaseModel
 import structlog
 
 from hiveweave.api.auth import validate_id
-from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
 from hiveweave.services.agent_activity import live_status
 from hiveweave.services.org import OrgService
@@ -400,23 +399,8 @@ async def transfer_agent(agent_id: str, body: TransferBody) -> dict:
 
 @router.get("/modules")
 async def list_modules(projectId: str = Query(...)) -> dict:
-    """列出项目模块（per-project DB modules 表）。"""
-    workspace = await meta_db.get_project_workspace(projectId)
-    if not workspace:
-        return {"modules": []}
-    try:
-        conn = await project_db.ensure_project_db(workspace)
-        cursor = await conn.execute(
-            "SELECT id, project_id, name, path, description, created_at, "
-            "updated_at FROM modules WHERE project_id = ? ORDER BY name",
-            [projectId],
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        return {"modules": [dict(r) for r in rows]}
-    except Exception as e:
-        log.warning("list_modules_failed", project_id=projectId, error=str(e))
-        return {"modules": []}
+    """已摘除：modules 是死表（零写入方、零消费者），见 fixplan §6 #13。"""
+    return {"modules": []}
 
 
 # ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────

@@ -162,9 +162,15 @@ PROJECT_DB_TABLES = [
         goals_json TEXT DEFAULT '[]',
         language TEXT DEFAULT 'en',
         game_time_accumulated_seconds INTEGER DEFAULT 0,
+        -- fixplan §6 #12 交付物平面：web|native-desktop|game-engine|cli|library
+        -- （权威定义见 services/delivery_plane.py::DELIVERY_PLANES）。
+        -- 视觉门（ui_browser_e2e / code_audit_visual）遇非 web 平面降档。
+        delivery_plane TEXT DEFAULT '',
         updated_at INTEGER
     )
     """,
+    # fixplan §6 #12：存量库补 delivery_plane（懒迁移；正典已含该列，新库不跑）。
+    """ALTER TABLE project_meta ADD COLUMN delivery_plane TEXT DEFAULT ''""",
     """
     CREATE TABLE IF NOT EXISTS inbox (
         id TEXT PRIMARY KEY,
@@ -456,17 +462,6 @@ PROJECT_DB_TABLES = [
         id TEXT PRIMARY KEY,
         project_id TEXT,
         game_seconds INTEGER DEFAULT 0,
-        updated_at INTEGER
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS modules (
-        id TEXT PRIMARY KEY,
-        project_id TEXT,
-        name TEXT NOT NULL,
-        path TEXT NOT NULL,
-        description TEXT,
-        created_at INTEGER,
         updated_at INTEGER
     )
     """,

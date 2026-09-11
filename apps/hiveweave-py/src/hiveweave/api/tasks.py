@@ -170,6 +170,7 @@ async def create_task(project_id: str, body: TaskCreate) -> dict:
         # 伪造门与平台保留 tag 剥离，可铸全权 VERIFY 任务——2026-08-13 审计）。
         source = body.source if body.source in ("agent", "user") else "user"
         policy_id = None
+        downgrade_tag_v: str | None = None
         if body.policyId and str(body.policyId).strip():
             policy_id = str(body.policyId).strip()
         elif body.submitGate:
@@ -177,11 +178,23 @@ async def create_task(project_id: str, body: TaskCreate) -> dict:
                 policy_id = policy_from_submit_gate(body.submitGate)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
+            # fixplan §6 #12：交付物平面降档（视觉门遇非 web 平面）。
+            # 降档留痕 tag 追进 tags（任务账本可见）——不许静默。
+            from hiveweave.services.delivery_plane import resolve_and_downgrade
+
+            policy_id, downgrade_tag_v, _plane_reason = (
+                await resolve_and_downgrade(
+                    policy_id, project_id=project_id, tags=body.tags
+                )
+            )
         elif actor_id or (creator and creator not in ("user", "用户", "human")):
             raise HTTPException(
                 status_code=400,
                 detail="submitGate (or policyId) is required when an agent creates a task",
             )
+        _body_tags = list(body.tags or [])
+        if downgrade_tag_v and downgrade_tag_v not in _body_tags:
+            _body_tags.append(downgrade_tag_v)
         task_id = await _tasks.create_task(
             project_id,
             title=body.title,
@@ -194,7 +207,7 @@ async def create_task(project_id: str, body: TaskCreate) -> dict:
             parent_task_id=body.parentTaskId,
             depends_on=body.dependsOn,
             expected_modules=body.expectedModules,
-            tags=body.tags,
+            tags=_body_tags,
             source=source,
             policy_id=policy_id,
         )

@@ -30,6 +30,7 @@ from typing import Any
 
 import structlog
 
+from hiveweave.util import path_guard
 from hiveweave.util.tree_label import cwd_display
 from hiveweave.tools.fact_positions import classify_error_text
 from hiveweave.tools.result import finalize_fact_dict
@@ -843,9 +844,16 @@ def _extract_file_paths_from_command(command: str) -> list[str]:
         if not parts:
             continue
         # 检查行首是否是文件操作命令
+        # #15 补齐：`remove-item` 此前**不在** file_cmds ⇒ PowerShell 删除
+        # 命令的目标路径完全不被提取，敏感路径/.hiveweave 护栏对它**静默
+        # no-op**（fixplan §6 #15 的「实现坑」）。一并补 PowerShell 别名族。
         file_cmds = {'cat', 'cp', 'mv', 'rm', 'touch', 'mkdir', 'chmod',
                      'chown', 'source', 'head', 'tail', 'less', 'more',
-                     'tee', 'dd', 'ln'}
+                     'tee', 'dd', 'ln',
+                     'remove-item', 'remove_item', 'del', 'erase', 'rd',
+                     'rmdir', 'move-item', 'move_item', 'copy-item',
+                     'copy_item', 'get-item', 'get_item', 'set-content',
+                     'set_content', 'out-file', 'out_file'}
         cmd = parts[0].lower()
         # 处理 sudo 前缀
         if cmd == 'sudo' and len(parts) > 1:
@@ -885,7 +893,9 @@ def _validate_command_safety(command: str) -> tuple[bool, str]:
     return False, ""
 
 
-def _validate_command_safety_verdict(command: str) -> "GuardVerdict":
+def _validate_command_safety_verdict(
+    command: str, *, delete_in_boundary: bool = False
+) -> "GuardVerdict":
     """统一命令安全校验的 verdict 形式（T2.2）。
 
     与 :func:`_validate_command_safety` 同一条链，reason 文本与历史完全
@@ -893,6 +903,11 @@ def _validate_command_safety_verdict(command: str) -> "GuardVerdict":
     （execute_bash / execute_run_command / _bash_background）拿到 ask 后走
     ``resolve_ask_with_approval``；非交互路径（game_time 定时器）经兼容
     包装 :func:`_validate_command_safety` 自动降级，行为与历史一致。
+
+    ``delete_in_boundary``（#15）：删除族命令的**授权树落点判定**已在 async
+    包装里做完（``resolve_delete_landing_for_agent``），结果为「全在授权树内」
+    时置 True —— 此处直接 allow，不再落到 ``rm``/``remove-item`` 的 ask 规则，
+    从而自建路径删除**零审批行**。判定与 ``acl_sandbox`` 授权事实同源。
     """
     from hiveweave.services.command_guard import GuardVerdict, evaluate_command
 
@@ -929,6 +944,10 @@ def _validate_command_safety_verdict(command: str) -> "GuardVerdict":
         )
     # slack-clone_01 P0: 命令模式护栏（taskkill //IM / rm -rf / pkill …）
     # + 受保护 PID 硬层。ask 判定原样上浮（T2.2），由调用方决定审批或降级。
+    # #15：删除族命令的授权树落点判定已在 async 包装里完成；全在授权树内
+    # → 直接 allow，跳过 `rm`/`remove-item` 的 ask 规则（自建路径删除零审批行）。
+    if delete_in_boundary:
+        return GuardVerdict(False, "allow", "", "__delete_in_boundary__")
     verdict = evaluate_command(command)
     if verdict.blocked and verdict.action != "ask":
         # 历史文案：模式护栏拒绝统一加 "Command blocked: " 前缀
@@ -952,10 +971,25 @@ async def _validate_command_safety_resolved(
     通道故障 → 降级）；``ask_already_resolved=True`` 表示上游
     （``_bash_background`` → ``execute_bash`` 链）已解析过同一命令的 ask
     并获批 —— 直接放行，避免二次弹审批。
-    """
-    from hiveweave.services.command_guard import resolve_ask_with_approval
 
-    verdict = _validate_command_safety_verdict(command)
+    #15：删除族命令先做**授权树落点判定**（``resolve_delete_landing_for_agent``）
+    —— 全落在 ``boundary_root ∪ temp_dir ∪ extra_dirs`` 内 → allow（自建路径
+    自己删，零审批行）；越界 → 直接 deny（fail-closed，**不挂起等审批**）。
+    """
+    from hiveweave.services.command_guard import (
+        resolve_ask_with_approval,
+        resolve_delete_landing_for_agent,
+    )
+
+    # #15：删除命令落点判定（越界 → deny，不进入 ask 等待）
+    landing = await resolve_delete_landing_for_agent(command, agent_id=agent_id)
+    if landing is not None and landing.blocked:
+        return True, landing.reason
+    delete_in_boundary = landing is not None and not landing.blocked
+
+    verdict = _validate_command_safety_verdict(
+        command, delete_in_boundary=delete_in_boundary
+    )
     if verdict.action == "ask" and not ask_already_resolved:
         verdict = await resolve_ask_with_approval(
             verdict,
@@ -1638,6 +1672,116 @@ def _cwd_style_hint(cwd: str, relative: str | None = None) -> str:
     )
 
 
+# ── #6 · 失败出口统一 cwd_display 头（多树归因的必要条件）─────────────
+#
+# 判据（**多树特有**，fixplan §10.5）：DSH 是单 checkout，"命令在哪跑的"
+# 无歧义；我们有多棵树 + per-agent 授权树根（``acl_sandbox/policy.py:54``）
+# ⇒ **缺 ``cwd_display`` 就是归因错位**（L17/L20 同族）——agent 看到
+# "Working directory does not exist" 却不知道是哪棵树的哪个相对路径。
+#
+# 实测缺口：``bash.py`` 内 ``"blocked": True`` 出口 16 处，而
+# ``cwd_display(`` 仅 3 处（含定义）⇒ 仅 2 处带回执头。逐个手改会复发
+# （约束写在调用方看得见的地方）⇒ 用**统一装饰器**在出口处施加，
+# 与 L3「单一漏斗」同一思路。
+def with_cwd_display(fn):
+    """把失败出口的 ``error`` 统一补上 ``cwd_display`` 头（幂等）。
+
+    被装饰的 async 函数返回裸 dict（bash.py 既有形态）。装饰器只在
+    **失败**结果上追加 ``_cwd_style_hint``，且：
+    - 已有 ``[MAIN``/``[worktree `` 头（成功路径或已手加）**不重复追加**；
+    - 成功结果、无 ``error`` 的结果**原样返回**（零行为变化）。
+
+    与 ``finalize_fact_dict`` 正交：那个管**事实位**，这个管**归因头**。
+    """
+    import functools
+
+    @functools.wraps(fn)
+    async def _wrapped(*args, **kwargs):
+        result = await fn(*args, **kwargs)
+        if not isinstance(result, dict) or result.get("success"):
+            return result
+        err = result.get("error")
+        if not isinstance(err, str) or not err:
+            return result
+        # 幂等：已带回执头就不再叠加
+        if "[MAIN " in err or "[worktree " in err or "[cwd unknown]" in err:
+            return result
+        cwd = ""
+        # 位置/关键字两种取法都试（各出口签名不同：workdir / cwd / workspace_path）
+        for key in ("workdir", "cwd"):
+            if key in kwargs and kwargs[key]:
+                cwd = str(kwargs[key])
+                break
+        if not cwd:
+            ws = kwargs.get("workspace_path") or ""
+            cwd = str(ws)
+        if not cwd:
+            return result
+        result["error"] = f"{err}\n{_cwd_style_hint(cwd)}"
+        return result
+
+    return _wrapped
+
+
+# ── #6 · spawn 前命令串预检（越出授权树 + unix 命令）──────────────
+#
+# 两件事，都是**发车前**判定（fail-fast，不是等 pwsh 报错才归因）：
+#
+# ① **越出授权树**：命令里出现 `.hiveweave/worktrees/<非本树 id>/` ⇒ 效果落点
+#    越出 ``boundary_root``（``acl_sandbox/policy.py:54``）。判据复用
+#    ``util/path_guard``，与 file 侧**同一函数、同一处方**（fixplan §10.3）。
+#    注意共用的是"越出授权树"的判定，**不是** DSH 那种单树内 sandbox。
+#
+# ② **unix-only 命令**：受限跑在 pwsh 上的命令串里出现
+#    ``head/tail/grep/wc/sed/awk/xargs/find`` 等 ⇒ pwsh 直接
+#    「不是内部或外部命令」，白烧一轮。既有 ``_pwsh_dialect_gate`` 只查
+#    **段首 token**，**管道尾/参数位**的 unix 命令漏网（`git log | head -5`
+#    曾是 5 小时照抄的形态）⇒ 本预检是它的**位置无关补齐**。
+#
+# 平台纪律：**不猜译、不改写**用户命令 —— 拒发 + 同款中文处方。
+_UNIX_ONLY_PRECHECK_RE = re.compile(
+    r"(?:^|[\s|;&(])(?:head|tail|grep|wc|sed|awk|xargs|find|"
+    r"nl|tr|uniq|cut|basename|dirname|realpath|readlink|df|du|seq|which|env)"
+    r"(?=\s|$|\|)"
+)
+
+
+def precheck_command_string(
+    command: str, workspace_path: str = ""
+) -> str | None:
+    """spawn 前命令串预检：返回拒绝文案（含处方）或 None（放行）。
+
+    与 ``_pwsh_dialect_gate`` 的分工：后者按**段首 token** 判 unix-only
+    命令并给等价写法（教学）；本函数补**位置无关**的兜底 + **越出授权树**
+    这一维（后者 DSH 无此概念，判据来自我们自己的 boundary_root）。
+
+    仅当受限 shell 实际是 pwsh 时才做 unix 命令预检（native Git Bash 下
+    这些命令合法，误拒会造成回归）；跨树引用预检**无条件**生效
+    （它判的是「效果落点」，与 shell 方言无关）。
+    """
+    if not command or not command.strip():
+        return None
+    # ① 越出授权树（无条件；判据 = boundary_root，见 path_guard 模块 docstring）
+    for seg in _split_command_segments(command):
+        for tok in seg.split():
+            t = tok.strip("\"'")
+            if not t or t.startswith("-"):
+                continue
+            if path_guard.is_foreign_worktree_ref(t, workspace_path):
+                return f"Command blocked: {path_guard.OUT_OF_BOUNDARY_HINT}"
+    # ② unix-only 命令（仅 pwsh 生效；位置无关，补 dialect gate 的盲区）
+    if _pwsh_is_effective_shell() and _UNIX_ONLY_PRECHECK_RE.search(command):
+        return (
+            "Command blocked: 命令串里出现了 unix-only 命令"
+            "（head/tail/grep/wc/sed/awk/xargs/find 等），"
+            "在 Windows 沙箱里 bash 命令由 pwsh 执行，这些在 pwsh 里"
+            "**不是内部或外部命令**（即便段首是合法命令，管道尾/参数位同样会炸）。"
+            "改用 pwsh 等价（Get-Content -TotalCount / Select-String / "
+            "Select-Object -First 等），或直接用 `pwsh` 工具写 PowerShell 语法。"
+        )
+    return None
+
+
 def _pwsh_is_effective_shell() -> bool:
     """True when a bash-dialect command will actually be run by pwsh.
 
@@ -1701,6 +1845,15 @@ async def execute_bash(
     if not command or not command.strip():
         return {"success": False, "output": "",
                 "error": "Error: command is required"}
+
+    # #6 · spawn 前命令串预检（越出授权树 + 位置无关的 unix-only）。
+    # 在安全校验**之前**：越界/方言问题不需要先弹审批（fail-fast 省一轮墙钟）。
+    precheck = precheck_command_string(command, workspace_path)
+    if precheck:
+        log.warning("bash.precheck_blocked", command_preview=command[:120])
+        return finalize_fact_dict({"success": False, "output": "",
+                "error": f"Error: {precheck}", "blocked": True,
+                "fact": "runner_failed"})
 
     # 1. 统一命令安全校验 — 自毁命令 + 敏感路径 + .hiveweave 系统目录
     # T2.2: ask 判定走在线审批（agent_id 在场时）；guard_ask_resolved=上游
@@ -1917,6 +2070,15 @@ async def execute_run_command(
     if not command or not command.strip():
         return {"success": False, "output": "",
                 "error": "Error: command is required"}
+
+    # #6 · spawn 前命令串预检（与 execute_bash 同一条链，不可旁路 ——
+    # 守卫只在 file.py 不算 enforcement：run_command 是 bash 的逃生口）。
+    precheck = precheck_command_string(command, workspace_path)
+    if precheck:
+        log.warning("run_command.precheck_blocked", command_preview=command[:120])
+        return finalize_fact_dict({"success": False, "output": "",
+                "error": f"Error: {precheck}", "blocked": True,
+                "fact": "runner_failed"})
 
     # 统一命令安全校验 — 自毁命令 + 敏感路径 + .hiveweave 系统目录（A3 + 旁路修复）
     # T2.2: ask 判定走在线审批
