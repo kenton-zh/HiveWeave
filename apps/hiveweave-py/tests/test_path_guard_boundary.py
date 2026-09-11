@@ -447,3 +447,68 @@ async def test_cwd_display_decorator_is_idempotent_and_success_passthrough() -> 
     ok = await _ok(workdir=r"D:\proj\.hiveweave\worktrees\A044")
     assert ok["output"] == "done"
     assert ok["error"] is None
+
+
+# ── P2-4.1 归因必须指向真病根（2026-09-12） ────────────────────────
+#
+# 病因：`x=$(head -3 f)` 段首是 `x=$(head`，既不像纯 unix-only 命令名，
+# 又让 `_segment_head_token` 把首 token 认成 `-3` ⇒ **内层真病根从未被检查**。
+# 旧实现命中了「环境变量前缀」正则（`bash.py:1475`），于是给出
+# 「改成 $env:X=…」的处方 —— 而 `$env:X=$(head -3 f)` 里 `head` 照样不存在，
+# **agent 按提示改完仍然失败**，白烧一轮，正是这条 gate 本来要避免的。
+#
+# 判据（**不引 DSH 实现**）：DSH 不做方言翻译、连这个 gate 都没有
+# （decision-brief §4.1）—— 照它抄 = 取消 gate = 收到 pwsh 原生报错白烧一轮。
+# 只借它的同族判据：`packages/AGENTS.md:117`「never silently skip a missing
+# referent」⇒ **给出的原因必须是真原因**。
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "x=$(head -3 f)",
+        "x=$(tail -5 f)",
+        "x=$(wc -l f)",
+        "OUT=`sed -n 1p f`",
+        "x=$(head -3 $(cat f))",  # 嵌套
+    ],
+)
+def test_inner_unix_cmd_is_blamed_not_env_prefix(command: str) -> None:
+    """命令替换内的 unix 命令 → 归因到 **它**，不得归因成环境变量前缀。"""
+    from hiveweave.tools.bash import detect_untranslated_unix
+
+    msg = detect_untranslated_unix(command)
+    assert msg is not None, f"整条漏网（内层命令未被检查）：{command!r}"
+    assert "environment-prefix" not in msg, (
+        "误归因：内层真病根是 unix 命令，却报了环境变量前缀处方 —— "
+        f"agent 照改仍会失败。命令={command!r} 文案={msg!r}"
+    )
+    assert "unix-only command(s)" in msg, f"未落到 unix 命令分支：{msg!r}"
+    # 处方必须点名真病根命令
+    assert "head" in msg or "tail" in msg or "wc" in msg or "sed" in msg, (
+        f"文案未点名内层命令：{msg!r}"
+    )
+
+
+def test_env_prefix_without_substitution_still_rejected() -> None:
+    """反向保护：**没有**命令替换的真·环境前缀写法，仍必须报环境前缀。"""
+    from hiveweave.tools.bash import detect_untranslated_unix
+
+    for cmd in ("VAR=val cmd", "FOO=bar echo hi"):
+        msg = detect_untranslated_unix(cmd)
+        assert msg is not None, f"真·环境前缀漏放行：{cmd!r}"
+        assert "environment-prefix" in msg, f"归因丢失：{cmd!r} → {msg!r}"
+
+
+def test_cmd_substitution_bodies_boundaries() -> None:
+    """`_cmd_substitution_bodies` 边界：无替换/不平衡括号 → 空，不得抛异常。"""
+    from hiveweave.tools.bash import _cmd_substitution_bodies
+
+    assert _cmd_substitution_bodies("head -3 f") == []
+    assert _cmd_substitution_bodies("x=$(unclosed") == []  # 不平衡 → 丢弃
+    assert _cmd_substitution_bodies("x=$(head -3 f)") == ["head -3 f"]
+    assert _cmd_substitution_bodies("a=`wc -l f` b") == ["wc -l f"]
+    # 嵌套取外层整体；内层由后续段扫描展开覆盖
+    assert _cmd_substitution_bodies("x=$(head -3 $(cat f))") == [
+        "head -3 $(cat f)"
+    ]

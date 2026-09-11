@@ -1413,6 +1413,62 @@ def _split_command_segments(command: str) -> list[str]:
     return segments
 
 
+def _cmd_substitution_bodies(segment: str) -> list[str]:
+    """抽出段内 `$( … )` / 反引号命令替换的**内层命令体**（best-effort）。
+
+    为什么必须抽（P2-4.1 根因）：`x=$(head -3 f)` 这类写法，段首是
+    `x=$(head` —— 既不是纯 unix-only 命令名，也让 `_segment_head_token`
+    把首 token 认成 `-3`。于是**内层真正的病根命令从未被检查**。
+    若不抽，要么误归因到「环境变量前缀」（现状 bug），要么直接放行
+    （改坏的形态）—— 两条路都是错的。
+
+    只做**平衡括号**的单层扫描，不追求 shell 完整语义：找不到配对就丢弃。
+    嵌套 `$( … $( … ) … )` 由深度计数覆盖。
+    """
+    bodies: list[str] = []
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if segment.startswith("$(", i):
+            depth = 1
+            j = i + 2
+            start = j
+            while j < n and depth:
+                c = segment[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if segment.startswith("$(", j):
+                    depth += 1
+                    j += 2
+                    continue
+                if c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if depth == 0:
+                bodies.append(segment[start:j])
+                i = j + 1
+                continue
+            i += 2
+            continue
+        if ch == "`":
+            j = segment.find("`", i + 1)
+            if j != -1:
+                bodies.append(segment[i + 1 : j])
+                i = j + 1
+                continue
+            i += 1
+            continue
+        i += 1
+    return bodies
+
+
 def _segment_head_token(segment: str) -> str:
     """取命令段的首个 token（跳过 VAR=val 前缀、前导空白/括号、复合语句关键字）。
 
@@ -1471,19 +1527,39 @@ def detect_untranslated_unix(command: str) -> str | None:
     # 此前放行 → 白烧一轮才收到 pwsh 原生报错。语法层前置拒绝。
     # 锚定段首 token，段内引号串不受影响（`python -c "a=1"` 首 token
     # 是 python，不命中；$env:/& 开头的 pwsh 原生形式也不命中）。
+    #
+    # P2-4.1（2026-09-12）：**赋值右侧含命令替换时不得走本分支**。
+    # `x=$(head -3 f)` 的真实病根是 `head`（就算改成 `$env:X=$(head -3 f)`
+    # 也照样不存在），而旧实现把它归因成「环境变量前缀写法错」并让 agent
+    # 改成 `$env:X=…` —— **改完仍然失败**，白烧一轮，正是本 gate 要避免的。
+    # 判据：文案指出的原因必须是**真原因**（借 DSH `packages/AGENTS.md:117`
+    # 「never silently skip a missing referent」同族思路；DSH 自身不做方言
+    # 翻译、连这个 gate 都没有，故只借判据不借实现）。
+    # ⇒ 交给下面的 unix-only 分支，由 `_cmd_substitution_bodies` 把内层命令
+    #   喂进同一套检测（那段文案给的处方是对的）。
     for segment in _split_command_segments(command):
-        if re.match(r"^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s+\S", segment):
-            return (
-                "Error: bash environment-prefix idiom fails in pwsh — "
-                "assignment is not a command there:\n"
-                "  VAR=val cmd → $env:VAR='val'; cmd（或 $env:VAR='val' "
-                "换行后再跑命令）\n"
-                "Rewrite with $env: assignments, then rerun."
-            )
+        m = re.match(r"^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s+\S", segment)
+        if not m:
+            continue
+        if _cmd_substitution_bodies(segment):
+            # 右值里有命令替换 → 真病根在**内层**，不在此处归因
+            continue
+        return (
+            "Error: bash environment-prefix idiom fails in pwsh — "
+            "assignment is not a command there:\n"
+            "  VAR=val cmd → $env:VAR='val'; cmd（或 $env:VAR='val' "
+            "换行后再跑命令）\n"
+            "Rewrite with $env: assignments, then rerun."
+        )
 
     hits: list[str] = []
     seen: set[str] = set()
+    # 先扫命令替换的**内层**：`x=$(head -3 f)` 的病根在内层，而外层的
+    # 首 token 是 `-3`（被 `x=$(head` 吃掉），不展开就整条漏网。
+    inner_segments: list[str] = []
     for segment in _split_command_segments(command):
+        inner_segments.extend(_cmd_substitution_bodies(segment))
+    for segment in [*inner_segments, *_split_command_segments(command)]:
         head = _segment_head_token(segment)
         if not head or head in seen:
             continue
