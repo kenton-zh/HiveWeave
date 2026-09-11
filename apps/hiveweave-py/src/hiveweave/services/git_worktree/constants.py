@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from pathlib import Path
 
 WORKTREE_DIR = ".hiveweave/worktrees"
 QUARANTINE_DIR = ".hiveweave/worktrees/_quarantine"
@@ -51,6 +52,12 @@ GENERATED_FILES: frozenset[str] = frozenset({
 REGENERABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:^|/)[^/]*\.tsbuildinfo$"),
     re.compile(r"(?:^|/)test_output[^/]*\.json$"),
+    # 引擎自生成缓存（fixlist #7）：这不是团队写的东西 —— 报成「main 脏」会
+    # 让门禁建议 commit，而 commit 那一路会把引擎缓存**正式入库**、反向制造
+    # 下一个坑（TEST_DSH_51 实测：`.godot/global_script_class_cache.cfg` 被拒
+    # 2 次；同引擎同版本同一天的 50 因叶子补了 .gitignore 而零复发）。
+    # 注意与 `ENGINE_GITIGNORE_SEEDS` 互补：种子防新增入库，本模式治**已有**脏。
+    re.compile(r"(?:^|/)\.godot/(?:.*)$"),
 )
 
 
@@ -87,6 +94,43 @@ GITIGNORE_GENERATED_ENTRIES: tuple[str, ...] = (
     "!.hiveweave/drafts/",
     "!.hiveweave/handoffs/",
 )
+
+# ── 引擎自生成产物种子（fixlist #7）────────────────────────────
+# 会自生成缓存的引擎类项目，其缓存必须尽早被排除，否则 MAIN 常脏 → merge 被
+# 拒；而 merge 门禁处方「clean 或 commit」的 commit 那一路会把引擎缓存**正式
+# 入库**，反向制造下一个坑。
+#
+# 实测依据（TEST_DSH_50/51，同引擎同版本同一天）：51 被拒 2 次
+# （`.godot/global_script_class_cache.cfg`，`.gitignore` 自建项目起未改、
+# `.godot/**` 已被 9399bb3 入库）；50 因叶子补了 `.gitignore` 而**零复发**。
+# 定性纪律：这是**模板缺失**，不是「团队不小心」。
+#
+# 探测口径 = 目录里出现引擎标记文件，所以在每次幂等补条时重新探测即可 ——
+# agent 写出 `project.godot` 之后的第一次 ensure 就会补上，不依赖"建项目那一刻"。
+ENGINE_GITIGNORE_SEEDS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    # (标记文件, 额外排除条目)
+    (
+        ("project.godot",),
+        # 只排缓存目录。`*.import` / `*.uid` **必须保持版本化** —— 把它们忽略
+        # 掉会让资源引用断链（50 号在 5054b7d 已踩过这一层）。
+        (".godot/",),
+    ),
+)
+
+
+def detect_engine_gitignore_entries(workspace_path: str) -> tuple[str, ...]:
+    """探测 workspace 里出现的引擎标记文件，返回应额外排除的条目（去重保序）。"""
+    root = Path(workspace_path)
+    found: list[str] = []
+    for markers, entries in ENGINE_GITIGNORE_SEEDS:
+        try:
+            if any((root / marker).exists() for marker in markers):
+                found.extend(entries)
+        except OSError:
+            # 目录不可读时当作未探测到：种子是**加分项**，不该让 ensure 失败
+            continue
+    return tuple(dict.fromkeys(found))
+
 
 # BUG-4: serialize create per (workspace, short_id) so hire + lazy-ensure
 # cannot race and leave a false worktree_error while the tree is healthy.

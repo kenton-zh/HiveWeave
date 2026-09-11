@@ -73,6 +73,33 @@ def _hash_snapshot(snap: dict[str, tuple[int, int]]) -> str:
     return dig.hexdigest()[:16]
 
 
+def effective_budget() -> dict[str, float]:
+    """平台**实际生效**的预算值（秒）—— fixlist #4 的启动自检。
+
+    事故背景（P0-4）：打包 EXE 不带 `.env`，而 `launcher._frozen_bootstrap_env`
+    只在文件存在时加载 → **静默**回落到代码默认值。实测
+    `stream_hard_timeout timeout_s=570.0`（`.env` 里写的是 1710），4 个 run
+    精确死在 600.0s（= 570 + 30 的整轮兜底）；行为指纹就是「run 墙钟恰好等于
+    HARD+30」。
+
+    根因是「**用文件不存在表达用默认值**」—— 缺配置既不报错也不留痕。所以这里
+    把生效值显式暴露，让启动日志与指纹记录都能被断言
+    （DSH `AGENTS.md:117`「Misconfiguration fails loud … never silently skip a
+    missing referent」）。
+
+    自检失败不得拖垮启动，故整体兜底；返回空 dict 表示"读不到"，不表示"没预算"。
+    """
+    out: dict[str, float] = {}
+    try:
+        from hiveweave.llm.streamer import constants as streamer_constants
+
+        out["hard_s"] = float(streamer_constants.HARD_TOTAL_TIMEOUT_S)
+        out["ceiling_s"] = float(streamer_constants.AGENT_SAFETY_CEILING_S)
+    except Exception as exc:  # noqa: BLE001 — 自检失败不阻塞启动
+        log.warning("effective_budget_unavailable", error=str(exc))
+    return out
+
+
 def record_startup_fingerprint() -> str | None:
     """Record the startup fingerprint. Call from lifespan startup."""
     global _startup_fingerprint, _startup_at_ms, _startup_snapshot
@@ -85,6 +112,8 @@ def record_startup_fingerprint() -> str | None:
             fingerprint=_startup_fingerprint,
             src_root=str(_SRC_ROOT),
             file_count=len(_startup_snapshot),
+            # 生效预算随启动指纹一起落日志：缺 .env 的静默回落在这里现形
+            budget=effective_budget(),
         )
     except Exception as e:  # noqa: BLE001
         log.warning("code_fingerprint.record_failed", error=str(e))

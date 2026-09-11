@@ -15,6 +15,7 @@ from .constants import (
     GENERATED_FILES,
     GIT_TIMEOUT,
     GITIGNORE_GENERATED_ENTRIES,
+    detect_engine_gitignore_entries,
     QUARANTINE_DIR,
     TRACKED_WS_DIRS,
     WORKTREE_DIR,
@@ -145,8 +146,15 @@ playwright-report/
 .vscode/
 """
             gitignore_path.write_text(gitignore_content, encoding="utf-8")
-        else:
-            await self._ensure_gitignore_entries(workspace_path)
+
+        # 无论模板是新写的还是已存在的，都在这里补一次「平台保证条目 + 引擎
+        # 种子」（审计 M2）。收养项目常见形态是**磁盘上已有 project.godot +
+        # .godot/**（可能已被引擎生成）**；若只在新写模板的分支里不补，紧接着
+        # 的 `git add -A` 就会把 `.godot/**` **正式入库** —— 正是 51 号的形态，
+        # 而一旦入库，ignore 规则对它就永久无效（git 硬语义：ignore 只作用于
+        # untracked 文件）。`_ensure_gitignore_entries` 写 `.git/info/exclude`，
+        # 对 untracked 生效，所以必须**在下面的 add -A 之前**调用。
+        await self._ensure_gitignore_entries(workspace_path)
 
 # P1-1: .gitattributes — lockfile union merge strategy.
         # package-lock.json conflicts are 100% predictable (every executor
@@ -525,10 +533,14 @@ yarn.lock merge=union
             existing_lines = {
                 ln.strip() for ln in existing.splitlines() if ln.strip()
             }
-            missing = [
-                e for e in GITIGNORE_GENERATED_ENTRIES
-                if e not in existing_lines
-            ]
+            # 平台保证条目 + 按引擎探测的种子（fixlist #7）：后者只在目录里
+            # 出现相应引擎标记文件时才生效，新项目/收养项目走同一条幂等路径，
+            # 所以 agent 写出 project.godot 之后的第一次 ensure 就会补上。
+            entries = (
+                GITIGNORE_GENERATED_ENTRIES
+                + detect_engine_gitignore_entries(workspace_path)
+            )
+            missing = [e for e in entries if e not in existing_lines]
             if not missing:
                 return
             with open(exclude, "a", encoding="utf-8") as f:

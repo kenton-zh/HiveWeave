@@ -316,6 +316,30 @@ def _run_selfcheck() -> int:
     except Exception:
         print("pywebview=NOT installed (GUI disabled; --headless still works)")
 
+    # ── 生效配置自检（fixlist #4 / P0-4）──────────────────────────────
+    # 打包 EXE 不带 `.env` 时 `_frozen_bootstrap_env` 只在文件存在时加载 →
+    # **静默**回落到代码默认值（事故实测 `stream_hard_timeout timeout_s=570.0`，
+    # 而 `.env` 写的是 1710，4 个 run 精确死在 600.0s）。
+    # 「文件不存在」表达「用默认值」是问题本身，所以这里把它**显式打出来**：
+    # 分发形态下缺 .env 记 WARN 而非 fail（开源分发可能刻意用默认值），
+    # 但绝不允许它是静默的。严格模式由 scripts/smoke_release.py 施加。
+    from hiveweave.services.code_fingerprint import effective_budget
+
+    budget = effective_budget()
+    print(f"effective_budget={budget}")
+    if not budget:
+        failures.append("effective_budget_unreadable")
+
+    env_file = Path(sys.executable).resolve().parent / ".env"
+    print(f"frozen_env_file={env_file}")
+    print(f"frozen_env_file_present={env_file.is_file()}")
+    if is_frozen() and not env_file.is_file():
+        print(
+            "WARN: frozen build without .env — deployment tunables fall back to "
+            "code defaults (this is exactly the P0-4 shape; ship a .env or "
+            "assert the fallback is intended)"
+        )
+
     if failures:
         print("SELFCHECK FAIL: " + ", ".join(failures))
         return 1
