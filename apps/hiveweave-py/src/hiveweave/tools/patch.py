@@ -240,6 +240,14 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
                 return (f"Updated {file_path} ({sign}{line_diff} lines, fuzzy match)")
             # 45 轮 P1：machine-readable 出路标记 + 同因连拒计数（s3c10
             # 同文件 4 败夹 3 成的陈旧视图形态）。
+            #
+            # ⚠️ 本处**有意保留** `annotate_repeat_rejection` 的就地拼接
+            # （批次 4 附项 2026-09-11 的例外）：`_apply_edit` 的签名里没有
+            # agent_id，返回的是**裸字符串**（调用方只能当消息文本用），
+            # 拿不到投递通道所需的收件人。此处的连拒提示因此退化为进程级
+            # 共享 + 与文案同处 —— 已知代价，不是遗漏。
+            # 迁移前提：把 agent_id 穿过 `edit_file` 的调用链（5+ 处签名），
+            # 那属于工具契约改动，与本批次（知识共享）不同源，故留待后续。
             from hiveweave.services.rejection_memory import (
                 annotate_repeat_rejection,
             )

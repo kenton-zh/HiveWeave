@@ -30,10 +30,19 @@ _counts: dict[str, dict] = {}
 # entry: {count, tool, last_error, last_ts}
 
 
-def annotate_repeat_rejection(
+def repeat_rejection_notice(
     tool_name: str, error_text: str, agent_id: str | None = None
 ) -> str:
-    """登记一次拒绝；返回追加标注文本，首次拒绝返回 ""（不标注）。
+    """登记一次拒绝；返回**提示正文**（首次拒绝返回 ""）。
+
+    ⚠️ **与 ``annotate_repeat_rejection`` 的区别（批次 4 附项 2026-09-11）**：
+    本函数返回的是**独立通道的正文**（不带前导换行），调用方应把它交给
+    ``services.health_notice.deliver_notice``，而**不是**拼进工具回执的
+    ``error``。把提示拼进 `error` 会让回执对「工具返回了什么」撒谎
+    （DSH 设计笔记 2026-07-08-repeat-tool-guard.md:58 明确否决），
+    且与真错误同格 ⇒ 被习得性跳读（R7 恶化项的机制）。
+    ``annotate_repeat_rejection`` 是**旧接口**，仍返回 `"\\n\\n" + 正文`
+    的形式以便尚未迁移的调用点保持行为不变；新代码一律用本函数。
 
     计数键 = (agent_id, 签名前 160 字符)。签名含上下文（gate code / 文件
     路径），天然按因计数；agent_id 并入键防跨 agent 误标（「已第 N 次」
@@ -42,7 +51,7 @@ def annotate_repeat_rejection(
 
     第 2 次起返回形如::
 
-        \\n\\n[REPEAT REJECTION #2 via submit_task] 同因拒绝已第 2 次。
+        [REPEAT REJECTION #2 via submit_task] 同因拒绝已第 2 次。
         上次拒绝摘要: …。同一写法反复被拒说明改写无效——按上文
         RETRY[...] 标记或出路步骤换路执行，勿原样重试。
     """
@@ -76,10 +85,23 @@ def annotate_repeat_rejection(
         return ""
     prev = f"上次拒绝摘要: {prev_error}。" if prev_error else ""
     return (
-        f"\n\n[REPEAT REJECTION #{count} via {tool_name}] 同因拒绝已第 "
+        f"[REPEAT REJECTION #{count} via {tool_name}] 同因拒绝已第 "
         f"{count} 次。{prev}同一写法反复被拒说明原样改写无效——"
         "按上文 RETRY[...] 标记或出路步骤换路执行，勿原样重试。"
     )
+
+
+def annotate_repeat_rejection(
+    tool_name: str, error_text: str, agent_id: str | None = None
+) -> str:
+    """**旧接口**：登记一次拒绝并返回可 `+=` 到文案上的标注（首次返回 ""）。
+
+    新代码请改用 ``repeat_rejection_notice`` + `health_notice.deliver_notice`
+    —— 见该函数 docstring 的通道说明。本函数保留给小范围、拿不到 agent_id、
+    且提示必须与拒绝文案同处的场景（如 `edit_file` 返回裸字符串）。
+    """
+    notice = repeat_rejection_notice(tool_name, error_text, agent_id=agent_id)
+    return f"\n\n{notice}" if notice else ""
 
 
 def rejection_count(

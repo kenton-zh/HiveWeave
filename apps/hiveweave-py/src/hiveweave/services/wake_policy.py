@@ -23,7 +23,21 @@ _USER_IDS = frozenset({"user", "human", "operator", "用户"})
 HUMAN_MESSAGE_TYPES = frozenset({"user_message", "user"})
 
 OFFTURN_COMPLETION_MESSAGE_TYPE = "offturn_completion"
-PLATFORM_RESERVED_MESSAGE_TYPES = frozenset({OFFTURN_COMPLETION_MESSAGE_TYPE})
+#: 平台健康提示消息类型（批次 4 附项 2026-09-11）。
+#:
+#: 承载三类**模型可见但不属于工具输出**的提示：`[SELF REPEAT]`（同 agent
+#: 短窗复撞）、`[REPEAT REJECTION]`（同因连拒）、跨 agent 组织级升级。
+#: 它们此前被 `+=` 追加进 `result["error"]`，于是**工具回执对"工具返回了
+#: 什么"撒谎**（DSH 设计笔记 `2026-07-08-repeat-tool-guard.md:58` 明确否决
+#: 这种做法），且与真错误同格 → 被习得性跳读。
+#:
+#: 落成 **platform-reserved** 类型（与 `offturn_completion` 同待遇）是因为
+#: 该名字可被**任何 agent 用普通 `send_message` 伪造** —— 保留类型 + 发送侧
+#: `trusted_platform=True` 强制是防止"假平台提示"的必要条件，不是洁癖。
+PLATFORM_NOTICE_MESSAGE_TYPE = "platform_notice"
+PLATFORM_RESERVED_MESSAGE_TYPES = frozenset(
+    {OFFTURN_COMPLETION_MESSAGE_TYPE, PLATFORM_NOTICE_MESSAGE_TYPE}
+)
 
 
 def is_user_sender(from_agent_id: str | None) -> bool:

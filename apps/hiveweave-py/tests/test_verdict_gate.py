@@ -419,7 +419,15 @@ async def test_pass_submit_allowed_when_assignee_degraded(task_env):
 
 @pytest.mark.asyncio
 async def test_degraded_fail_rejection_carries_marker_and_repeat(task_env):
-    """首次拒带 RETRY 出路标记；第二连拒追加 REPEAT REJECTION 事实位。"""
+    """首次拒带 RETRY 出路标记；第二连拒把 REPEAT REJECTION 投到**独立通道**。
+
+    ⚠️ **行为变更（批次 4 附项，2026-09-11，有意）**：连拒提示不再拼进拒绝
+    文案，改走 platform_notice 的 inbox 投递 —— 拒绝文案此前既对"工具返回了
+    什么"撒谎（DSH 设计笔记 2026-07-08-repeat-tool-guard.md:58 明确否决），
+    又与真错误同格导致被习得性跳读。所以本用例断言两件事：
+    ① 文案**只含** RETRY 标记（不再含提示）；② 提示确实出了独立通道（用
+    ``repeat_rejection_notice`` 直接验证计数与正文齐备）。
+    """
     from hiveweave.agents.recovery import clear_degraded, mark_degraded
     from hiveweave.services import rejection_memory as rm
 
@@ -442,7 +450,15 @@ async def test_degraded_fail_rejection_carries_marker_and_repeat(task_env):
                 )
             texts.append(str(ei.value))
         assert "RETRY[action=resume_turn_then_resubmit" in texts[0]
-        assert "[REPEAT REJECTION #2 via submit_task]" in texts[1]
+        # 拒绝文案干净：提示已不走这条通道
+        for t in texts:
+            assert "[REPEAT REJECTION" not in t
+        # 计数确实累到 2：第三次调用会拿到 #3 正文（独立通道的内容源）
+        assert rm.rejection_count(texts[0], agent_id=EXEC) == 2
+        notice = rm.repeat_rejection_notice(
+            "submit_task", texts[0], agent_id=EXEC
+        )
+        assert "[REPEAT REJECTION #3 via submit_task]" in notice
     finally:
         clear_degraded(EXEC)
         rm.reset_for_tests()

@@ -27,6 +27,12 @@ from hiveweave.services.approval import (
     ApprovalService, PermissionRejected, PermissionTimeout,
 )
 from hiveweave.services.charter import CharterService
+from hiveweave.services.health_notice import (
+    KIND_ORG_ESCALATION,
+    KIND_SELF_REPEAT,
+    combine_pending_text,
+    deliver_notice,
+)
 from hiveweave.services.inbox import InboxService
 from hiveweave.services.org import OrgService
 from hiveweave.services.permission import PermissionService
@@ -2476,10 +2482,13 @@ async def _emit_tool_execute_after(
         log.debug("tool_execute_after_hook_failed", error=str(e))
 
 
-# 件1（R7 恶化项处置 2026-09-05）：失败→同 agent 同工具成功后回填解法。
-# pending 键 (agent_id, tool_name) → {"project_id", "sig", "ts"}；进程级
-# 并发用 asyncio.Lock 保护（照 db/meta.py _init_lock 模式）。
-_PENDING_SOLUTIONS: dict[tuple[str, str], dict[str, Any]] = {}
+# 件1（R7 恶化项处置 2026-09-05）：失败→同 agent 同**调用身份**成功后回填解法。
+# pending 键 (agent_id, tool_name, call_identity) → {"project_id", "sig", "ts"}；
+# 进程级并发用 asyncio.Lock 保护（照 db/meta.py _init_lock 模式）。
+# #11（2026-09-11）：键含 call_identity —— 旧键 (agent_id, tool_name) 让
+# 「同工具的下一次成功」冒充「同一问题的解」，实测把 read_file 另一个参数
+# 的摘要回填进了不存在的 docs/spec.md 条目（错解比无解更贵）。
+_PENDING_SOLUTIONS: dict[tuple[str, str, str], dict[str, Any]] = {}
 _PENDING_SOLUTIONS_LOCK = asyncio.Lock()
 #: pending 兑现窗口 —— 超时视为该失败已被放弃/换路，丢弃防 dict 单调膨胀。
 _PENDING_SOLUTIONS_TTL_S = 6 * 3600
@@ -2493,6 +2502,21 @@ _SENSITIVE_KEY_RE = re.compile(
     r"token|secret|password|passwd|authorization|auth|credential|api[-_]?key|env",
     re.IGNORECASE,
 )
+
+
+def _pending_solutions_key(
+    agent_id: str, tool_name: str, tool_args: Any
+) -> tuple[str, str, str]:
+    """pending 身份键 —— 读写两侧**必须**走同一个函数（#11 单一漏斗）。
+
+    键 = ``(agent_id, tool_name, call_identity(tool_name, tool_args))``。
+    读写两处各写一次 ``call_identity(...)`` 是"两份实现"，任一侧改动
+    （如原地排序 vs 深排序）都会让 pending **永不命中**，而症状是
+    「回填静默失效」—— 没有任何报错。集中到此函数，两侧共用。
+    """
+    from hiveweave.services.failure_signature import call_identity
+
+    return (agent_id or "", tool_name or "", call_identity(tool_name, tool_args))
 
 
 def _redact_for_shared_solution(value: Any) -> Any:
@@ -2529,12 +2553,25 @@ async def _f10_pending_success_backfill(
     tool_args: dict[str, Any],
     agent_id: str,
 ) -> None:
-    """同 agent 同工具失败后的首次成功 → 把成功参数摘要回填进签名条目。
+    """同 agent **同调用身份**失败后的首次成功 → 把成功参数摘要回填进条目。
 
     42 轮实测 18/18 hint 无效的根因：条目只有错误原文没有解法，且常由
     失败者自己刚写。解法 = 本次成功调用的参数摘要（≤200 字符，纯机械
     回填，无 LLM 总结；先按键名脱敏，见 _redact_for_shared_solution）。
     命中即清 pending；无 pending 的成功只花一次 dict 查询。
+
+    **#11 调用身份（2026-09-11）**：pending 键从 ``(agent_id, tool_name)``
+    改为 ``(agent_id, tool_name, call_identity(tool_name, tool_args))``。
+    旧键把「同一工具的下一次成功」当成「同一问题的解」—— 实测
+    ``read_file docs/spec.md``（不存在，写 pending）随后一次
+    ``read_file {filePath: scripts/main.gd, offset: 440}``（成功）就把后者的
+    参数摘要回填进了前者的条目，条目从"镜子"恶化成"错解"。身份 = 操作身份，
+    由 ``call_identity`` 定义（详见其 docstring 的三条不变式）。
+
+    **#11-(d) 无 key 时不清 pending（2026-09-11）**：参数为 ``{}`` 时
+    ``call_identity`` 恒为 ``tool::{}`` —— 那是"占位身份"而非真实身份，
+    用它 pop 会把别人的真 pending 顺手吃掉。此时**直接返回，什么都不动**。
+
     P1-3（审计）：空参数（{} / 全空值）不回填 ——「已验证解法: {}」会让
     _signature_has_solution 恢复对全员广播「先读它」，正是自指抑制闸要防
     的镜子条目换马甲；无实质参数即消费 pending 后直接弃。
@@ -2543,16 +2580,17 @@ async def _f10_pending_success_backfill(
     if not result or not result.get("success"):
         return
     try:
+        # 无参数 ⇒ 没有身份可键（#11-(d)）：不动 pending。
+        if not _has_nonempty_param_value(tool_args):
+            return
+        identity = _pending_solutions_key(agent_id, tool_name, tool_args)
         async with _PENDING_SOLUTIONS_LOCK:
-            pending = _PENDING_SOLUTIONS.pop((agent_id, tool_name), None)
+            pending = _PENDING_SOLUTIONS.pop(identity, None)
         if not pending:
             return
         # 备注①（审计 2026-09-05）：pop 后补 TTL 检查 —— 超窗口的 pending
         # 不兑现（失败方早已换路，迟到的"解法"只会误导）。
         if time.time() - float(pending.get("ts") or 0) > _PENDING_SOLUTIONS_TTL_S:
-            return
-        # P1-3：至少一个非空参数值才值得回填
-        if not _has_nonempty_param_value(tool_args):
             return
         try:
             summary = json.dumps(
@@ -2658,6 +2696,7 @@ async def _f10_result_hooks(
         from hiveweave.db.meta import get_agent_project_id
         from hiveweave.services.failure_signature import (
             known_signature_hint,
+            note_distinct_hitter,
             record_failure_signature,
             signature_of,
         )
@@ -2678,11 +2717,24 @@ async def _f10_result_hooks(
             error=error,
             attribution=_attr,
         )
-        # 件1（R7 处置）：写入成功即记 pending —— 同 agent 同工具随后一次
-        # 成功执行时回填成功参数摘要作为解法（_f10_pending_success_backfill）。
-        if isinstance(rec, dict) and rec.get("written") and project_id:
+        # 件1（R7 处置）：写入成功即记 pending —— 同 agent **同调用身份**
+        # 随后一次成功执行时回填成功参数摘要作为解法
+        # （_f10_pending_success_backfill）。
+        # #11（2026-09-11）：键含 call_identity(tool_name, tool_args)。
+        # 无实质参数（{} / 全空值）**不记 pending** —— 它的 call_identity 恒为
+        # `tool::{}`（共享的占位身份），既不可能被自己精确兑现，又会让所有
+        # 无参数失败互相覆盖。无参数失败本就无解法可回填（P1-3），不记最干净。
+        if (
+            isinstance(rec, dict)
+            and rec.get("written")
+            and project_id
+            and _has_nonempty_param_value(tool_args)
+        ):
             _sig_for_pending = signature_of(error)
             if _sig_for_pending:
+                _pending_key = _pending_solutions_key(
+                    agent_id, tool_name, tool_args
+                )
                 async with _PENDING_SOLUTIONS_LOCK:
                     _now_s = time.time()
                     for _k in [
@@ -2691,7 +2743,7 @@ async def _f10_result_hooks(
                         if _now_s - v.get("ts", 0) > _PENDING_SOLUTIONS_TTL_S
                     ]:
                         _PENDING_SOLUTIONS.pop(_k, None)
-                    _PENDING_SOLUTIONS[(agent_id, tool_name)] = {
+                    _PENDING_SOLUTIONS[_pending_key] = {
                         "project_id": project_id,
                         "sig": _sig_for_pending,
                         "ts": _now_s,
@@ -2703,17 +2755,52 @@ async def _f10_result_hooks(
         pre_source = (
             (rec or {}).get("preexisting_source") if isinstance(rec, dict) else None
         )
+        # ── 提示改走独立通道（批次 4 附项，2026-09-11）────────────
+        # 此前两类提示都 `result["error"] +=` —— 工具回执于是对"工具返回了
+        # 什么"撒谎（DSH 设计笔记 2026-07-08-repeat-tool-guard.md:58 明确
+        # 否决），且与真错误同格 ⇒ 被习得性跳读（R7 恶化项的机制）。
+        # 现在合并成 **一条** platform_notice 投递；`error` 字段只保留真错误。
+        _notice_parts: list[str] = []
         if preexisting and pre_source != agent_id:
             hint = await known_signature_hint(project_id, error, agent_id=agent_id)
             if hint:
-                result["error"] = f"{result['error']}\n\n{hint}"
+                _notice_parts.append(hint)
         # TEST_DSH_47 #6：run 内同签名即时去重 —— 首撞者被抑制 shared-fix
         # 提示是正确的，但复撞时至少要告诉它"自己刚撞过"。
         _self_note = _note_self_repeat_hit(
             agent_id, tool_name, signature_of(error)
         )
         if _self_note:
-            result["error"] = f"{result['error']}\n\n{_self_note}"
+            _notice_parts.append(_self_note)
+        _notice_text = combine_pending_text(*_notice_parts)
+        if _notice_text:
+            # wake=False：本提示由**当前 turn 的下一轮**自然读到（此刻正在
+            # 工具执行中，再唤醒一次只会打断当前 turn）。落库即有 id，可重放。
+            await deliver_notice(
+                agent_id,
+                _notice_text,
+                kind=KIND_SELF_REPEAT,
+                project_id=project_id,
+                wake=False,
+            )
+        # #16-③ 组织级升级：撞到者并入 distinct_hitters，精确命中 3/5/8
+        # 档时向**该 agent** 投递一条组织级信号（诊断「N 人各撞一遍却无
+        # 任何反应」的 R7 恶化项）。与上面的提示同走独立通道。
+        if project_id:
+            org_text = await note_distinct_hitter(
+                project_id=project_id,
+                signature_key=signature_of(error) or "",
+                tool_name=tool_name,
+                agent_id=agent_id,
+            )
+            if org_text:
+                await deliver_notice(
+                    agent_id,
+                    org_text,
+                    kind=KIND_ORG_ESCALATION,
+                    project_id=project_id,
+                    wake=False,
+                )
     except Exception as e:  # noqa: BLE001
         log.debug("f10_failure_signature_hook_failed", error=str(e))
     return result

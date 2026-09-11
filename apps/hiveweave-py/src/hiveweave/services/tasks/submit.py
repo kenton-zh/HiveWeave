@@ -68,7 +68,7 @@ class SubmitMixin:
                 # 45 轮 P1「拒绝无记忆」①②：machine-readable 出路标记 +
                 # 同因连拒计数（45 轮降级终验 3 连拒同文案）。
                 from hiveweave.services.rejection_memory import (
-                    annotate_repeat_rejection, rejection_count,
+                    repeat_rejection_notice, rejection_count,
                 )
 
                 msg = (
@@ -79,10 +79,27 @@ class SubmitMixin:
                     "CEO。 RETRY[action=resume_turn_then_resubmit|"
                     "alt=escalate_coordinator]"
                 )
-                msg += annotate_repeat_rejection(
-                    "submit_task", msg,
-                    agent_id=str(task.get("assignee_id") or "") or None,
+                # 计数**必须照旧登记**（annotate 的副作用就是计数）：把它的
+                # 返回值丢掉即可 —— 提示改走独立通道，不再污染拒绝文案本身。
+                _agent_for_notice = str(task.get("assignee_id") or "") or None
+                _repeat_notice = repeat_rejection_notice(
+                    "submit_task", msg, agent_id=_agent_for_notice
                 )
+                if _repeat_notice and _agent_for_notice:
+                    from hiveweave.services.health_notice import (
+                        KIND_REPEAT_REJECTION,
+                        deliver_notice,
+                    )
+
+                    # 通道与回执物理分离：模型在自己的下一轮读到它，而
+                    # 拒绝文案保持纯粹可取证（批次 4 附项三问 ②）。
+                    await deliver_notice(
+                        _agent_for_notice,
+                        _repeat_notice,
+                        kind=KIND_REPEAT_REJECTION,
+                        project_id=project_id,
+                        wake=False,
+                    )
                 # 46/11 #8 平台动作：第 2 次连拒时自动把 VERIFY 回队
                 # running——QA 获得 fresh turn 重验再提交，不再卡死在
                 # 「提交→拒→提交」循环（356min 项目 8 连拒烧 VERIFY 的

@@ -301,8 +301,12 @@ async def commit_turn_tool(
                             )
                         # 45 轮 P1「拒绝无记忆」①②：machine-readable 出路
                         # 标记 + 同因连拒计数（45 轮账本拒 2×/50 秒同文案）。
+                        # 批次 4 附项（2026-09-11）：提示改走**独立通道**
+                        # （health_notice → platform_notice inbox），拒绝文案
+                        # 保持纯粹 —— 拼接会让回执对"工具返回了什么"撒谎，
+                        # 且与真错误同格被跳读。
                         from hiveweave.services.rejection_memory import (
-                            annotate_repeat_rejection,
+                            repeat_rejection_notice,
                         )
 
                         msg = (
@@ -315,9 +319,21 @@ async def commit_turn_tool(
                             + " RETRY[action=process_obligations_then_commit"
                             "|alt=continue_in_progress]"
                         )
-                        msg += annotate_repeat_rejection(
+                        _repeat_notice = repeat_rejection_notice(
                             "commit_turn", msg, agent_id=agent_id
                         )
+                        if _repeat_notice:
+                            from hiveweave.services.health_notice import (
+                                KIND_REPEAT_REJECTION,
+                                deliver_notice,
+                            )
+
+                            await deliver_notice(
+                                agent_id,
+                                _repeat_notice,
+                                kind=KIND_REPEAT_REJECTION,
+                                wake=False,
+                            )
                         return ToolResult.err(
                             msg,
                             gates=list(hard),
