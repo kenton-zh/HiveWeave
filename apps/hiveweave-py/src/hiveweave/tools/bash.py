@@ -293,7 +293,10 @@ async def _run_registered_dev_server(
                 f"Refusing to start dev server on reserved platform port "
                 f"{preferred}. Use start_dev_server or a project port (3000+)."
             ),
-            "blocked": True,
+            # F4：拒绝发生在任何 spawn 之前 —— 命令从未执行，属 runner_failed
+            # 定义域（交付后审计复核确认：下面 :450/:461/:482 那三处不同，
+            # 它们已经 spawn 过再 terminate_spawned，故不置此位）。
+            "blocked": True, "runner_failed": True,
         }
 
     own_live_pref = [
@@ -328,7 +331,8 @@ async def _run_registered_dev_server(
                 f"Refusing to start dev server on reserved platform port "
                 f"{port}. Use start_dev_server or a project port (3000+)."
             ),
-            "blocked": True,
+            # F4：同上，spawn 之前拒绝 = 命令从未执行。
+            "blocked": True, "runner_failed": True,
         }
 
     try:
@@ -345,9 +349,11 @@ async def _run_registered_dev_server(
                 command, project_id=project_id, preferred_port=port
             )
             if prep_err:
+                # F4：spawn 准备失败 = 命令从未执行（runner_failed）。
                 return {
                     "success": False, "output": "",
                     "error": prep_err, "blocked": True,
+                    "runner_failed": True,
                 }
             project_root = await resolve_project_root(project_id)
             sres = await spawn_confined(
@@ -1761,15 +1767,22 @@ async def execute_bash(
         cwd = ws
 
     if not _is_within_workspace(cwd, ws):
+        # F4 补接线（TEST_DSH_50/51 实测 runner_failed 仅 38.5%/20%）：
+        # schema.py 里 F4 的定义域明写「命令未执行（参数注入破坏 / 方言不支持 /
+        # **权限** / 审批 / runner 自身故障）」——沙箱拒绝属「权限」，命令
+        # 从未执行，必须置 runner_failed，否则归因链缺事实位。
         return {"success": False, "output": "",
                 "error": "Error: Sandbox violation - workdir must be within workspace",
-                "blocked": True}
+                "blocked": True, "runner_failed": True}
 
     if not Path(cwd).exists():
+        # F4 补接线：cwd 不存在 = 命令从未执行（runner_failed）。
+        # 该签名在 TEST_DSH_50/51 各出现 2~3 次（幽灵 worktree 前缀路径），
+        # 全部因未置位而落在观测盲区里。
         return {"success": False, "output": "",
                 "error": f"Error: Working directory does not exist: "
                          f"{cwd_display(cwd, workdir)}",
-                "blocked": True}
+                "blocked": True, "runner_failed": True}
 
     cwd_hint = _cwd_style_hint(cwd)
 
@@ -1941,15 +1954,17 @@ async def execute_run_command(
         full_cwd = ws
 
     if not _is_within_workspace(full_cwd, ws):
+        # F4 补接线：同 workdir 侧，权限拒绝 = 命令从未执行。
         return {"success": False, "output": "",
                 "error": "Error: Sandbox violation - cwd must be within workspace",
-                "blocked": True}
+                "blocked": True, "runner_failed": True}
 
     if not Path(full_cwd).exists():
+        # F4 补接线：run_command 侧的同一签名（与上面 pwsh 侧对称）。
         return {"success": False, "output": "",
                 "error": f"Error: Working directory does not exist: "
                          f"{cwd_display(full_cwd, cwd)}",
-                "blocked": True}
+                "blocked": True, "runner_failed": True}
 
     # A-2 (P1-4): 未显式给超时时按工具声明取默认（run_command 保持 120s）。
     safe_timeout = int(timeout_ms or TOOL_DEFAULT_TIMEOUT_MS["run_command"])

@@ -506,8 +506,18 @@ PROJECT_DB_TABLES = [
     """ALTER TABLE run_steps ADD COLUMN runner_failed INTEGER DEFAULT 0""",
     """ALTER TABLE run_steps ADD COLUMN command_failed INTEGER DEFAULT 0""",
     """ALTER TABLE run_steps ADD COLUMN injection_applied INTEGER DEFAULT 0""",
-    # F7（平台修复计划 2026-08-30）：超时统一分类 — timeout_kind ∈
-    # （runner / command / wait）+ timeout_ms，与 F4 事实位正交可组合。
+    # F7（平台修复计划 2026-08-30）：超时统一分类 + timeout_ms，与 F4 事实位正交可组合。
+    # 取值域（2026-09-10 补 `turn`）：
+    #   command — 工具**自身声明**的超时（tool_exec.py 的 `Command timed out
+    #             after Ns`，帽来自 DECLARED_TIMEOUT_MS / MAX_TIMEOUT_S）
+    #   runner  — runner 层超时（进程没起来即超时）〔**预留**：全仓无写入点，
+    #             TEST_DSH_50/51 审计实测 `grep 'timeout_kind.*runner'` 为空；
+    #             当前该语义由 runner_failed 事实位承担。要么接线要么删，
+    #             由 tests/test_prompt_fact_sync.py 的绊线盯着〕
+    #   wait    — 等待类（question/spawn 的等待窗口）
+    #   turn    — **整轮兜底**超时（core.py 的 asyncio.wait_for(HARD+30) 掐断），
+    #             由 run_ledger 的孤儿步骤清扫补写（TEST_DSH_50/51 实测：该出口
+    #             此前完全未接线，4 个 600s 硬杀 run 的 timeout_kind 全 NULL）
     """ALTER TABLE run_steps ADD COLUMN timeout_kind TEXT""",
     """ALTER TABLE run_steps ADD COLUMN timeout_ms INTEGER""",
     # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记的 ALTER 已移至

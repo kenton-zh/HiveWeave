@@ -85,6 +85,32 @@ class RunLedger:
             )
         except Exception as e:
             log.warning("run_ledger.orphan_step_sweep_failed", agent_id=agent_id, error=str(e))
+
+        # F7 补出口（TEST_DSH_50/51：timeout_kind 在真超时+悬挂上实测 50% / 0%）。
+        # 上面 swept 的孤儿步骤，其 run 是被整轮兜底（HARD_TOTAL_TIMEOUT_S + 30
+        # 的 asyncio.wait_for）掐断的 —— 那是**整轮级超时**，与工具自身声明的
+        # 超时（`Command timed out after Ns` → timeout_kind='command'）不是一回事。
+        # 只对「run 的 error_reason 明确是总超时」的行置位，避免把
+        # startup_sweep / cancel 造成的孤儿误标成超时。
+        # 注：`schema.py` 里 F7 原注释的取值域是 (runner/command/wait)，本处新增
+        # `turn`（整轮兜底），注释已同步。
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE run_steps SET timeout_kind = 'turn' "
+                "WHERE status = 'error' "
+                "AND error LIKE 'orphan step swept%' "
+                "AND timeout_kind IS NULL "
+                "AND run_id IN (SELECT id FROM agent_runs "
+                "WHERE agent_id = ? AND (error_reason LIKE '%请求总超时%' "
+                "OR error_reason LIKE '%total timeout%'))",
+                [agent_id],
+            )
+        except Exception as e:
+            log.warning(
+                "run_ledger.orphan_step_timeout_kind_failed",
+                agent_id=agent_id, error=str(e),
+            )
         activation_id = str(uuid.uuid4())
         now = _now_ms()
         try:

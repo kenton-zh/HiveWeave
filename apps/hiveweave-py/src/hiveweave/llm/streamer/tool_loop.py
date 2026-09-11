@@ -432,7 +432,15 @@ class ToolLoopMixin:
                     "type": "error",
                     "content": f"请求总超时（{HARD_TOTAL_TIMEOUT_S}s）",
                 })
-                return self._error_result("请求总超时", loop_start)
+                # F7：与 core.py 的同名出口保持一致 —— 整轮兜底超时必须可机检
+                # 分类。**注意落点**：这两键只在 turn 级 result 上，供日志与上层
+                # 判断；`run_steps.timeout_kind` 的落点在
+                # `run_ledger.py` 的孤儿步骤清扫（那里的 `'turn'` 才是落库值），
+                # 别以为这里写上就等于步骤级事实位已覆盖。
+                _r = self._error_result("请求总超时", loop_start)
+                _r["timeout_kind"] = "turn"
+                _r["timeout_ms"] = int((HARD_TOTAL_TIMEOUT_S + 30.0) * 1000)
+                return _r
             # E14 (复盘 P2) + 09-02 双触发修正：轮数线 OR 累计墙钟线——
             # 纯轮数线在现实预算下永不触发（07 实测 ~52s/轮，40 轮 ≈35min
             # >> 1710s 硬顶，.env 一度被调到 400 当静音），疏导两阶段

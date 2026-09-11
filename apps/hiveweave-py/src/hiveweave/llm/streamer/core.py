@@ -175,6 +175,7 @@ class Streamer(
                 "stream_hard_timeout",
                 agent_id=agent_id,
                 timeout_s=HARD_TOTAL_TIMEOUT_S,
+                timeout_kind="turn",  # F7：与工具自身超时（'command'）区分
             )
             try:
                 from hiveweave.services.telemetry import telemetry
@@ -185,7 +186,23 @@ class Streamer(
                 "type": "error",
                 "content": f"请求总超时（{HARD_TOTAL_TIMEOUT_S}s）",
             })
-            return self._error_result("请求总超时", start_time)
+            result = self._error_result("请求总超时", start_time)
+            # F7 补出口（TEST_DSH_50/51：真超时+悬挂上 timeout_kind 实测
+            # 50% / 0%）。这条是**整轮兜底**超时（外层 wait_for），与工具
+            # 自身声明的超时（tool_exec.py 的 `Command timed out after Ns`
+            # → timeout_kind='command'）是两类，必须能机检区分。
+            # 之前该分支只返回裸 error result，run_steps.timeout_kind 恒 NULL
+            # → 「超时不可分类」这件事在 4 个 600s 硬杀 run 上原样残留。
+            # 取值 `turn` 为本次新增，schema.py 的 F7 注释已同步。
+            #
+            # **落点边界（交付后审计指出）**：这两键在 turn 级 result 上，
+            # 目前没有消费方会把它写进 run_steps —— `agents/streaming.py:284`
+            # 读的是**工具执行结果**，不是本 result。`run_steps.timeout_kind
+            # = 'turn'` 的真正落点是 `run_ledger.py` 的孤儿步骤清扫。
+            # 这里置位是为了日志可分类 + 给上层留判断入口，不代表步骤级已覆盖。
+            result["timeout_kind"] = "turn"
+            result["timeout_ms"] = int((HARD_TOTAL_TIMEOUT_S + 30.0) * 1000)
+            return result
         except Exception as e:
             await self._circuit_breaker.report_failure(provider_name)
             log.exception("stream_error", agent_id=agent_id, error=str(e))

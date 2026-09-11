@@ -121,6 +121,61 @@ _MAIN_LOOP_STREAM_RETRIES = int(
 )
 
 
+def _usage_rounds_delivered(result: object) -> bool:
+    """P1-6 / R11（TEST_DSH_50/51，2026-09-10）：streamer 是否真的把本轮 usage 交出来了。
+
+    只有交出来（``usage_rounds`` 非空）才允许清空 ``agent._pending_usage``。
+
+    为什么不能无条件清空：``llm/streamer/core.py::_error_result`` 构造的
+    error 结果里 ``usage_rounds`` 恒为 ``[]``（该函数注释自称「错误路径无
+    成功轮次数据」，实为越界断言——整轮硬超时时轮次早已跑完，数据就在
+    ``_pending_usage`` 这个 sink 里）。而 ``token_meter.record_rounds`` 遇到
+    空列表直接 ``return`` 什么都不写，此时再 clear() 就把 sink 里已累积的
+    usage 销毁 —— 而 ``recovery.py::_flush_pending_usage``（F6，08-30）
+    正是靠它给终止 run 补账，拿到空列表只能记一条
+    ``interrupted_usage_flush_empty`` 然后放弃。
+
+    实测后果：50 的 9 个终止 run 中 7 个零账、51 的 7 个全零账，
+    4 个 600s 硬杀 run 无一例外（regression_check R11 = 7 / 7）。
+    """
+    if not isinstance(result, dict):
+        return False
+    rounds = result.get("usage_rounds")
+    return bool(rounds)
+
+
+async def _flush_usage_at_loop_exit(agent: object, *, reason: str) -> None:
+    """循环出口前把 sink 里「已推进但尚未落库」的 usage 交接给恢复路径落账。
+
+    P1-6 / R11 补（TEST_DSH_50/51，2026-09-10）。交付后子代理审计发现的残留：
+    修好「error 路径不再销毁 sink」之后，仍有三条出口没交接 ——
+    `status == "error"` 的上游重试 `continue`、`status == "empty"` 的重试
+    `continue` 与放弃 `break`。
+
+    为什么必须交接：`agent._pending_usage` 是**跨 attempt** 的累积器（stream
+    重试 / empty 重试共用同一个 sink）。这几条出口上，本轮推进 sink 的轮次
+    既没有落库（`record_rounds` 只在拿到非空 `usage_rounds` 时才写），也不该
+    被静默丢弃 —— 那些 LLM 调用**确实发生过、也确实计费**。不交接的后果：
+      - 下一次成功 attempt 的 `clear()` 会把它们连带丢掉（**漏账**）；或
+      - 在随后的 cancel / timeout 里与本轮混在一起落账（**错账**）。
+
+    不变式：**凡推进 sink 却没落库的轮次，退出循环前必须先落账。**
+    与 `_handle_error` / `handle_safety_timeout` / `handle_cancel` 三条恢复
+    路径共用同一个 `_flush_pending_usage`（它落库后重建 sink，保证不残留）。
+
+    best-effort：失败只记 warning，绝不因记账问题打断 turn 控制流。
+    """
+    try:
+        await _agent_recovery._flush_pending_usage(agent, reason=reason)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "usage_flush_on_loop_exit_failed",
+            agent_id=getattr(agent, "id", None),
+            reason=reason,
+            error=str(e),
+        )
+
+
 def _is_upstream_stream_error(error_text: str, error_status: int | None = None) -> bool:
     """status=error 的 result 是否属上游/环境瞬断（可原样重试）。"""
     if error_status is not None:
@@ -1386,7 +1441,32 @@ class Agent:
                 )
                 # P1-6：正常路径已整批落库，清空实时 sink —— 否则后续
                 # turn 被取消时会 flush 到跨 turn 的陈旧 usage 造成双计。
-                self._pending_usage.clear()
+                #
+                # TEST_DSH_50/51 R11 修复（2026-09-10）：**必须带条件**。
+                # error / 整轮硬超时兜底路径的 result 由
+                # `llm/streamer/core.py::_error_result` 构造，其 usage_rounds
+                # 恒为空列表（该函数注释自称「错误路径无成功轮次数据」，实为
+                # 越界断言：硬超时时轮次早已跑完，数据就在下面的 sink 里）。
+                # 此时 record_rounds 因 `if not rounds: return` 什么都没写，
+                # 紧跟着无条件 clear() 就把 sink 里已累积的 usage 销毁 ——
+                # 而 `recovery.py::_flush_pending_usage`（F6，08-30）正是靠
+                # 这个 sink 给终止 run 补账，拿到空列表只能记一条
+                # `interrupted_usage_flush_empty` 然后放弃。
+                # 实测：50 的 9 个终止 run 中 7 个零账、51 的 7 个全零账，
+                # 4 个 600s 硬杀 run 无一例外（R11 = 7 / 7）。
+                if _usage_rounds_delivered(result):
+                    self._pending_usage.clear()
+                else:
+                    # 留给 _flush_pending_usage 兜（error / safety_timeout /
+                    # cancel 三条恢复路径都会调它）。若这里 sink 也是空的，
+                    # 说明流零 chunk 即被掐，那条路径自身会留痕。
+                    log.info(
+                        "pending_usage_kept_for_recovery",
+                        agent_id=self.id,
+                        run_id=self._current_run_id,
+                        status=result.get("status"),
+                        pending=len(self._pending_usage),
+                    )
 
                 # P1-3 Phase 0：首请求 usage 回读，与前缀指纹 verdict
                 # 联合合成最终分类（hit_ok / cache_window_expired /
@@ -1440,6 +1520,11 @@ class Agent:
                         current_messages = await self._build_messages(
                             message, opts
                         )
+                        # 出口交接：本轮 sink 里的 usage 先落账再重试，
+                        # 否则会被下一次 attempt 的 clear() 连带丢弃。
+                        await _flush_usage_at_loop_exit(
+                            self, reason="upstream_retry"
+                        )
                         continue
 
                 if status == "empty":
@@ -1448,7 +1533,10 @@ class Agent:
                         result, current_messages
                     )
                     if not should_retry:
-                        # 已升级上级，退出循环
+                        # 已升级上级，退出循环 —— 出口交接（同上游重试）。
+                        await _flush_usage_at_loop_exit(
+                            self, reason="empty_giveup"
+                        )
                         break
                     # 重置文本累积器 — 防止跨重试轮次堆叠"（收到空响应…）"
                     self._streaming_text_acc = ""
@@ -1456,6 +1544,8 @@ class Agent:
                     current_messages = await self._build_messages(
                         message, opts, retry_hint=True
                     )
+                    # 出口交接（同上游重试）。
+                    await _flush_usage_at_loop_exit(self, reason="empty_retry")
                     continue
 
                 if status == "ok":

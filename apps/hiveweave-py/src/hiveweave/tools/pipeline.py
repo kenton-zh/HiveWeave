@@ -453,7 +453,17 @@ async def execute_registered_tool(
             params, agent_id=agent_id, tool_name=tool_name
         )
         if security_error:
-            return ToolResult.blocked_err(security_error).to_dict()
+            # F4 补接线（TEST_DSH_50/51：runner_failed 实测仅 38.5% / 20%）。
+            # schema.py 里 F4 的定义域明写「命令未执行（… / **权限** / 审批 / …）」；
+            # shell 预检拒绝（self-destructive / .hiveweave 目标 / 平台进程 kill /
+            # ask→deny）全部是「命令从未执行」，必须置 runner_failed，
+            # 否则这些签名在 run_steps.runner_failed 上恒 0，stall 归因缺事实位
+            # （实测漏网：`Command blocked - cannot access .hiveweave` 50 ×3 / 51 ×2）。
+            # 注意：**只加在 shell 分支**——file 分支的 security_level 不是 "shell"，
+            # 文件工具没有 runner/command 之分，不该借这个位（见上方 elif）。
+            return ToolResult.blocked_err(
+                security_error, runner_failed=True
+            ).to_dict()
 
     # 5. Execute tool
     try:

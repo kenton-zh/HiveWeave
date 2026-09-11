@@ -20,13 +20,19 @@ _SCHEMA = [
     "checkpoint_summary TEXT, created_at INTEGER)",
     "CREATE TABLE agent_runs ("
     "id TEXT PRIMARY KEY, agent_id TEXT, activation_id TEXT, "
-    "status TEXT NOT NULL DEFAULT 'running', started_at INTEGER)",
+    "status TEXT NOT NULL DEFAULT 'running', started_at INTEGER, "
+    # F7 补出口（TEST_DSH_50/51）：孤儿步骤的 timeout_kind 归属要看 run 的
+    # error_reason 是否总超时，所以 fake schema 必须带上这一列。
+    "error_reason TEXT)",
     "CREATE TABLE run_steps ("
     "id TEXT PRIMARY KEY, run_id TEXT, step_index INTEGER, step_type TEXT, "
     "tool_name TEXT, tool_call_id TEXT, tool_args_hash TEXT, "
     "status TEXT NOT NULL DEFAULT 'pending', result_hash TEXT, result_size INTEGER, "
     "result_excerpt TEXT, error TEXT, started_at INTEGER, ended_at INTEGER, "
-    "duration_ms INTEGER)",
+    "duration_ms INTEGER, "
+    # F4/F7 事实位（2026-08-30 加列；本文件 2026-09-10 补进 schema）
+    "runner_failed INTEGER DEFAULT 0, command_failed INTEGER DEFAULT 0, "
+    "injection_applied INTEGER DEFAULT 0, timeout_kind TEXT, timeout_ms INTEGER)",
 ]
 
 
@@ -56,11 +62,12 @@ class _FakeDb:
         self.conn.commit()
 
     def seed_run_step(self, run_id: str, step_id: str, run_status: str,
-                      step_status: str = "running") -> None:
+                      step_status: str = "running",
+                      error_reason: str | None = None) -> None:
         self.conn.execute(
-            "INSERT OR IGNORE INTO agent_runs (id, agent_id, status, started_at) "
-            "VALUES (?, 'a1', ?, 1000)",
-            [run_id, run_status],
+            "INSERT OR IGNORE INTO agent_runs (id, agent_id, status, started_at, "
+            "error_reason) VALUES (?, 'a1', ?, 1000, ?)",
+            [run_id, run_status, error_reason],
         )
         self.conn.execute(
             "INSERT INTO run_steps (id, run_id, step_index, step_type, status, "
@@ -80,6 +87,11 @@ class _FakeDb:
     def activation_count(self) -> int:
         return self.conn.execute(
             "SELECT COUNT(*) FROM agent_activations"
+        ).fetchone()[0]
+
+    def step_timeout_kind(self, step_id: str):
+        return self.conn.execute(
+            "SELECT timeout_kind FROM run_steps WHERE id = ?", [step_id]
         ).fetchone()[0]
 
 
@@ -118,6 +130,41 @@ def test_create_activation_keeps_steps_of_running_run():
     assert fake.step_status("s-running")[0] == "running"
     assert fake.step_status("s-done")[0] == "error"
     assert fake.activation_count() == 1
+
+
+def test_swept_orphan_of_hard_timeout_run_gets_timeout_kind_turn():
+    """F7 补出口（TEST_DSH_50/51）：整轮兜底超时的 run，其孤儿步骤要带
+    timeout_kind='turn' —— 这是「超时不可分类」的唯一漏网出口。
+
+    实测基线：4 个 600s 硬杀 run（50 ×1 / 51 ×3）的末步 timeout_kind 全 NULL。
+    """
+    fake = _FakeDb()
+    fake.seed_run_step("r-timeout", "s-timeout", "error",
+                       error_reason="ValueError: 请求总超时")
+    ledger = RunLedger()
+
+    with _patched_db(fake):
+        asyncio.run(ledger.create_activation("a1", "wake"))
+
+    assert fake.step_status("s-timeout")[0] == "error"
+    assert fake.step_timeout_kind("s-timeout") == "turn"
+
+
+def test_swept_orphan_of_non_timeout_run_keeps_timeout_kind_null():
+    """反向：startup_sweep / cancel 造成的孤儿**不是**超时，不得误标。
+
+    否则 timeout_kind 会变成「所有孤儿都算超时」的噪声位。
+    """
+    fake = _FakeDb()
+    fake.seed_run_step("r-restart", "s-restart", "interrupted",
+                       error_reason="startup_sweep: stale running run from prior process")
+    ledger = RunLedger()
+
+    with _patched_db(fake):
+        asyncio.run(ledger.create_activation("a1", "wake"))
+
+    assert fake.step_status("s-restart")[0] == "error"
+    assert fake.step_timeout_kind("s-restart") is None
 
 
 def test_record_step_end_retries_after_update_failure():

@@ -539,7 +539,9 @@ docs_only 中层不可 waive；仅 CEO 可对该一条 waive。
 被证据门拒绝时**禁止连续重试 approve**——先按 1) 补证据，再批；补不到证据 → 升级上级。
 
 **禁止**在 `commit_turn(waiting)` 之后反复刷 `get_tasks` / `check_agent_status` — 等事件唤醒；每轮最多查一次。
-长实现用 spawn_subagent；长命令/测试用 bash(background=true)，本轮 commit_turn(waiting)；平台不对整轮写码设墙钟。模型流卡住（约 5 分钟无 token）才会掐。要停后台命令用 job_kill。
+长实现用 spawn_subagent；长命令/测试用 bash(background=true) 后本轮 commit_turn(waiting)，等 `[BASH DONE]` / `[BASH FAILED]` 唤醒。**记下每个后台 job id**：完成时平台主动唤醒你，**不要轮询、不要 sleep 等它**——等的时候去做别的独立步骤；收尾前把仍然要紧的 job 结果收回来，不再需要的用 job_kill 停掉。
+**若你的回合被掐断**：步骤记录里会带 `timeout_kind` —— `turn` = 整轮兜底超时（这轮话说得太久，**或某条前台命令挂住把预算吃光**）、`command` = 某条命令自身超时。**两者别混**：前者要收紧本轮产出、把长活挪到后台；后者要改那条命令（换写法或加自身超时）。
+**护栏 / 沙箱 / 权限拒绝（工具回执里的 `runner_failed`）是平台策略，不是你的 bug**：按拒绝文案给出的出路走，不要换写法绕过。
 
 注意：`send_message` 仍用于通知、协调、咨询场景，但不再用于任务派发或工作审批。
 **要人做决定 → `ask_agent`**；**单向通知 → `notify_agent`**；**等他们干活 → `commit_turn(waiting)` 挂 `kind:task`**，不要 status-ask。不要依赖文案猜意图。

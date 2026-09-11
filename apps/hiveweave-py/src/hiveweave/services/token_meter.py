@@ -166,6 +166,17 @@ class TokenMeter:
         input/output/cache_read/cache_creation/total/duration_ms。
         """
         if not rounds:
+            # TEST_DSH_50/51 R11（2026-09-10）：静默 return 会让「零账」在
+            # 任何日志里都无迹可寻 —— 调用方刚经历 error / 整轮硬超时兜底
+            # 路径时（result 由 _error_result 构造，usage_rounds 恒为空），
+            # 这里什么都不写，下游 flush 也只能拿到空，整条链没有一处留痕。
+            # 加一行 info：谁、哪个 run、哪类请求调了空批次。
+            log.info(
+                "record_rounds_empty",
+                agent_id=agent_id,
+                run_id=run_id,
+                request_type=request_type,
+            )
             return
         now = _now_ms()
         statements: list[tuple[str, list[Any]]] = []
