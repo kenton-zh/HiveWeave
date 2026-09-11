@@ -348,7 +348,7 @@ async def execute_registered_tool(
 
         return ToolResult.blocked_err(
             build_deny_hint(tool_name, family, deny_reason),
-            runner_failed=True,
+            fact="runner_failed",
         ).to_dict()
 
     if decision == "ask":
@@ -378,7 +378,7 @@ async def execute_registered_tool(
                     APPROVAL_TIMEOUT_HINT
                     + "\n[approval fingerprint re-try blocked] 同一审批请求在"
                     "本回合内已超时一次，不再重复等待。请改走可审计的替代方案。",
-                    runner_failed=True,
+                    fact="runner_failed",
                     timeout_kind="wait",
                     timeout_ms=APPROVAL_TIMEOUT_S * 1000,
                 )
@@ -391,7 +391,7 @@ async def execute_registered_tool(
                     APPROVAL_TIMEOUT_HINT
                     + "\n[unattended mode] 项目为无人值守模式，审批请求不"
                     "等待审核。请改走可审计的替代方案通道或拆分目标。",
-                    runner_failed=True,
+                    fact="runner_failed",
                     timeout_kind="wait",
                     timeout_ms=APPROVAL_TIMEOUT_S * 1000,
                 )
@@ -409,13 +409,13 @@ async def execute_registered_tool(
             # F7：wait 超时事实位落库（审批 120s 空等是可机检的超时事件）
             return ToolResult.blocked_err(
                 APPROVAL_TIMEOUT_HINT,
-                runner_failed=True,
+                fact="runner_failed",
                 timeout_kind="wait",
                 timeout_ms=APPROVAL_TIMEOUT_S * 1000,
             ).to_dict()
         except PermissionRejected as exc:
             return ToolResult.blocked_err(
-                f"Permission rejected: {exc}", runner_failed=True
+                f"Permission rejected: {exc}", fact="runner_failed"
             ).to_dict()
         except Exception as exc:  # noqa: BLE001
             return ToolResult.err(f"Error: Approval request failed: {exc}").to_dict()
@@ -474,7 +474,7 @@ async def execute_registered_tool(
             # 注意：**只加在 shell 分支**——file 分支的 security_level 不是 "shell"，
             # 文件工具没有 runner/command 之分，不该借这个位（见上方 elif）。
             return ToolResult.blocked_err(
-                security_error, runner_failed=True
+                security_error, fact="runner_failed"
             ).to_dict()
 
     # 5. Execute tool
@@ -490,26 +490,17 @@ async def execute_registered_tool(
         log.error("pipeline.execute_failed", tool=tool_name, error=str(exc))
         return ToolResult.err(f"Error: {type(exc).__name__}: {exc}").to_dict()
 
-    # 6. Normalize result shape
-    if isinstance(result, ToolResult):
-        return result.to_dict()
-    elif isinstance(result, dict):
-        # Forward compat: wrap legacy dict returns.
-        # blocked 必须显式透传：进 extra 会被 ToolResult 字段恒胜覆盖抹掉
-        # （审计 P2，潜伏陷阱）。
-        return ToolResult(
-            success=result.get("success", True),
-            output=result.get("output", ""),
-            error=result.get("error"),
-            blocked=bool(result.get("blocked")),
-            extra={
-                k: v
-                for k, v in result.items()
-                if k not in ("success", "output", "error", "blocked")
-            },
-        ).to_dict()
-    else:
-        return ToolResult.ok(str(result)).to_dict()
+    # 6. Normalize result shape — **单一漏斗**（L3，2026-09-11）
+    #
+    # 收口点必须是**共享函数**而非各处自建 ToolResult：blocked 结果的事实位
+    # 归因（按签名表判、判不出 fail loud）只有一处实现，新增护栏分支时
+    # 无法绕过。见 tools/fact_positions.py::finalize_tool_result。
+    #
+    # ⚠️ 不能只挂 `_emit_tool_execute_after`（executor.py:2446）：它明写
+    # pre-execution 失败不 emit，而事实位构造点里 17 处正好是 pre-execution。
+    from hiveweave.tools.fact_positions import finalize_tool_result
+
+    return finalize_tool_result(tool_name, result)
 
 
 # ── Security helpers ─────────────────────────────────────

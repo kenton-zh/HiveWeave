@@ -559,8 +559,13 @@ async def read_file(
         workspace_path, file_path, root, extra_read_dirs
     )
     if hint is not None:
-        return {"success": False, "output": "", "error": f"Error: {hint}",
-                "blocked": True}
+        # L6（2026-09-11）：hint 只可能是「幽灵 worktree 前缀路径」——那是
+        # **模型自己写错了路径**，平台无责。此前用 blocked=True 表达，
+        # 而 blocked 的语义是「平台拒绝执行 —— not a model mistake」
+        # （result.py 的 docstring）⇒ agent 收到「不是你的 bug」信号后
+        # 在同一 run 里原地重撞（52_B 实测）。
+        # 改判 bad_args：归因落到调用方，stall 走 tool_failed。
+        return ToolResult.err(f"Error: {hint}", fact="bad_args").to_dict()
     if full is None:
         return {"success": False, "output": "",
                 "error": f'Error: Sandbox violation — "{file_path}" '
@@ -667,8 +672,8 @@ async def write_file(
 
     full, hint = _resolve_safe_detail(workspace_path, file_path)
     if hint is not None:
-        return {"success": False, "output": "", "error": f"Error: {hint}",
-                "blocked": True}
+        # L6：幽灵 worktree 前缀 = 模型写错路径（见 read_file 处的长注释）。
+        return ToolResult.err(f"Error: {hint}", fact="bad_args").to_dict()
     if full is None:
         return {"success": False, "output": "",
                 "error": f'Error: Sandbox violation — "{file_path}" '
@@ -734,8 +739,8 @@ async def list_files(
             workspace_path, path, root, extra_read_dirs
         )
         if hint is not None:
-            return {"success": False, "output": "", "error": f"Error: {hint}",
-                    "blocked": True}
+            # L6：幽灵 worktree 前缀 = 模型写错路径（见 read_file 处注释）。
+            return ToolResult.err(f"Error: {hint}", fact="bad_args").to_dict()
         if full is None:
             return {"success": False, "output": "",
                     "error": "Error: Sandbox violation - "
@@ -953,11 +958,17 @@ async def read_file_tool(params: ReadFileParams, agent_id: str, workspace: str) 
     if result.get("blocked"):
         return ToolResult.blocked_err(result.get("error", "Unknown error"))
     # FS 错误码分类学（46/11 #4）：稳定错误码随回执透传（extra 合并）
+    # L6：fact 同为内核判定的事实位，必须一起透传（否则幽灵路径的
+    # bad_args 归因在包装层丢失，退回「无位」）。
     err_extra: dict = {}
     code = result.get("error_code")
     if code:
         err_extra["error_code"] = code
-    return ToolResult.err(result.get("error", "Unknown error"), **err_extra)
+    return ToolResult.err(
+        result.get("error", "Unknown error"),
+        fact=result.get("fact"),
+        **err_extra,
+    )
 
 
 async def _project_id_for_workspace(workspace: str) -> str | None:
@@ -1007,7 +1018,10 @@ async def write_file_tool(params: WriteFileParams, agent_id: str, workspace: str
     # 复审 P2-2：包装器必须透传 blocked（护栏拒绝语义），与 bash_tool 对齐
     if result.get("blocked"):
         return ToolResult.blocked_err(result.get("error", "Unknown error"))
-    return ToolResult.err(result.get("error", "Unknown error"))
+    # L6：fact 一并透传（幽灵路径的 bad_args 归因不得在包装层丢失）
+    return ToolResult.err(
+        result.get("error", "Unknown error"), fact=result.get("fact")
+    )
 
 
 @tool(
@@ -1036,4 +1050,7 @@ async def list_files_tool(params: ListFilesParams, agent_id: str, workspace: str
     # 复审 P2-2：包装器必须透传 blocked（护栏拒绝语义），与 bash_tool 对齐
     if result.get("blocked"):
         return ToolResult.blocked_err(result.get("error", "Unknown error"))
-    return ToolResult.err(result.get("error", "Unknown error"))
+    # L6：fact 一并透传（幽灵路径的 bad_args 归因不得在包装层丢失）
+    return ToolResult.err(
+        result.get("error", "Unknown error"), fact=result.get("fact")
+    )

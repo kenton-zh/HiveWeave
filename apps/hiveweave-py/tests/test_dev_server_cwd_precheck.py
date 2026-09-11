@@ -455,7 +455,13 @@ def test_filtered_environ_excludes_node_options(monkeypatch):
     assert child.get("NODE_OPTIONS") == "--require ./evil.js"
 
 
-async def test_ghost_cwd_rejected_blocked(monkeypatch, tmp_path):
+async def test_ghost_cwd_rejected_bad_args(monkeypatch, tmp_path):
+    """L6（2026-09-11 有意行为变更）：幽灵 worktree 前缀 = 模型写错路径。
+
+    原断言 `blocked is True`（旧行为）已被推翻：`blocked` 语义是「不是调用方的
+    锅」，而重复前缀恰恰是调用方把 worktree 段重复拼了一遍，标 blocked 会让
+    agent 收到「不是你的 bug」并原地重撞。现改为 `bad_args`。
+    """
     await _patch_project_id(monkeypatch)
     wt = tmp_path / "project" / ".hiveweave" / "worktrees" / "A044"
     wt.mkdir(parents=True)
@@ -472,5 +478,6 @@ async def test_ghost_cwd_rejected_blocked(monkeypatch, tmp_path):
         workspace=str(wt),
     )
     assert not result.success
-    assert result.blocked is True
+    assert result.blocked is False
+    assert result.fact == "bad_args"
     assert "疑似重复 worktree 前缀路径" in (result.error or "")

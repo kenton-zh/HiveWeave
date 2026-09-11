@@ -16,13 +16,21 @@ class SandboxUnavailableError(RuntimeError):
         self.win32_code = win32_code
 
     def to_tool_dict(self) -> dict:
-        """对齐 DSH Win32Error：工具层把错误对象转换为对 agent 的提示。"""
+        """对齐 DSH Win32Error：工具层把错误对象转换为对 agent 的提示。
+
+        L6（2026-09-11）：沙箱自身不可用 = 命令从未执行 = runner 故障（平台侧），
+        不是模型参数错，故显式携带 ``fact="runner_failed"``，并经
+        ``finalize_fact_dict`` 展开派生键（否则下游读 ``runner_failed`` KeyError）。
+        """
+        from hiveweave.tools.result import finalize_fact_dict
+
         detail = self.win32_code if self.win32_code is not None else "n/a"
-        return {
+        return finalize_fact_dict({
             "success": False,
             "blocked": True,
+            "fact": "runner_failed",
             "error": (
                 f"沙箱不可用，已拒绝执行（fail-closed）：{self}"
                 f"{f' [API={self.api_name}, Win32Err={detail}]' if self.api_name else ''}"
             ),
-        }
+        })

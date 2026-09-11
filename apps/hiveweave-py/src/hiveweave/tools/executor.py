@@ -3007,7 +3007,8 @@ class ToolExecutor:
             # 同属「命令从未派发」——与本批五处 deny 对称置 runner_failed
             # （审计 [4]；否则 (0,0) 桶继续残留不可机器区分的失败）。
             _err = self._error(f"Error: Permission check failed: {exc}")
-            _err["runner_failed"] = True
+            _err["blocked"] = True
+            _err["fact"] = "runner_failed"
             return _err
 
         if decision == "deny":
@@ -3022,7 +3023,7 @@ class ToolExecutor:
             # s3-clone_06 P0-4：命令从未派发（runner 未执行）→ 一并置
             # runner_failed，否则落 (0,0) 桶与"未知失败"不可机器区分。
             deny_result["blocked"] = True
-            deny_result["runner_failed"] = True
+            deny_result["fact"] = "runner_failed"
             return deny_result
 
         if decision == "ask":
@@ -3047,7 +3048,7 @@ class ToolExecutor:
                     "本回合内已超时一次，不再重复等待。请改走可审计的替代方案。"
                 )
                 _deny["blocked"] = True
-                _deny["runner_failed"] = True
+                _deny["fact"] = "runner_failed"
                 return _deny
             if await is_unattended_mode(_pid):
                 _deny = self._error(
@@ -3056,7 +3057,7 @@ class ToolExecutor:
                     "等待审核。请改走可审计的替代方案通道或拆分目标。"
                 )
                 _deny["blocked"] = True
-                _deny["runner_failed"] = True
+                _deny["fact"] = "runner_failed"
                 return _deny
             # Request approval (120s timeout)
             try:
@@ -3073,17 +3074,18 @@ class ToolExecutor:
 
                 deny_result = self._error(APPROVAL_TIMEOUT_HINT)
                 deny_result["blocked"] = True
-                deny_result["runner_failed"] = True
+                deny_result["fact"] = "runner_failed"
                 return deny_result
             except PermissionRejected as exc:
                 deny_result = self._error(f"Permission rejected: {exc}")
                 deny_result["blocked"] = True
-                deny_result["runner_failed"] = True
+                deny_result["fact"] = "runner_failed"
                 return deny_result
             except Exception as exc:  # noqa: BLE001
                 # 同上：审批通道自身异常也是「从未派发」→ 对称置位（审计 [4]）
                 _err = self._error(f"Error: Approval request failed: {exc}")
-                _err["runner_failed"] = True
+                _err["blocked"] = True
+                _err["fact"] = "runner_failed"
                 return _err
 
         # 3. Dispatch to the tool implementation
@@ -3099,11 +3101,15 @@ class ToolExecutor:
         # 所有工具必须返回 {success, output, error} 三字段。此处作为单一保障点，
         # 为任何遗漏字段的工具补默认值（success=True / output="" / error=None），
         # 确保下游消费方（agent / conversation store）总能拿到一致结构。
-        if not isinstance(result, dict):
-            result = {"success": True, "output": str(result), "error": None}
-        result.setdefault("success", True)
-        result.setdefault("output", "")
-        result.setdefault("error", None)
+        #
+        # L3（2026-09-11）：**两条执行器的 normalize 尾共用同一漏斗**
+        # （`tools/fact_positions.py::finalize_tool_result`）—— 事实位归因
+        # 只有一处实现，新增护栏分支时无论走哪条执行器都无法绕过。
+        # 此前 pipeline 与 executor 各写一份归一逻辑，事实位只能靠"对称"
+        # 维持（executor.py:3007 的旧注释自己承认了这点），修一处必漏另一处。
+        from hiveweave.tools.fact_positions import finalize_tool_result
+
+        result = finalize_tool_result(name, result)
 
         # 5. Apply large-output truncation (layer 1)
         if result.get("output"):

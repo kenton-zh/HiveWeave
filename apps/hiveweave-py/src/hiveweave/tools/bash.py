@@ -31,6 +31,8 @@ from typing import Any
 import structlog
 
 from hiveweave.util.tree_label import cwd_display
+from hiveweave.tools.fact_positions import classify_error_text
+from hiveweave.tools.result import finalize_fact_dict
 
 log = structlog.get_logger(__name__)
 
@@ -281,23 +283,25 @@ async def _run_registered_dev_server(
     pid = project_id or "default"
     # 阻塞调用（netstat 快照 / taskkill）统一下放线程池，避免卡住事件循环
     await asyncio.to_thread(prune_dead_processes)
+    # ⚠️ 保留端口的**权威守卫不在这里**（2026-09-11 实测修正）。
+    #
+    # 曾经此处有两处 `if is_reserved_port(...)` 守卫（本处 + 分配后复查），
+    # 但它们**恒不可达**：`preferred` 在 hint 保留时回落到 3000，而 3000
+    # 永不保留（`RESERVED_PORTS = {4000, 4173, 5173}`）；随后
+    # `prepare_spawn_command` 会再次改写端口。已删除，避免"看似有守卫"
+    # 的假安全感。
+    #
+    # 真正的拦截点（含 `fact=bad_args` 归因）：
+    # - `process_registry.check_command_reserved_ports`（命令文本直检，
+    #   经 `prepare_spawn_command:803` 返回 `prep_err`）——
+    #   `start_dev_server` / `run_command` 入口在 bash.py:2958 / :3256 消费；
+    #   本函数的 `prep_err` 分支（:354）也会按证据归类。
+    # 回归直测见 `tests/test_fact_positions_coverage.py::TestDevServerGuardsDirect`。
     preferred = (
         port_hint
         if (port_hint and not is_reserved_port(port_hint))
         else 3000
     )
-    if is_reserved_port(preferred):
-        return {
-            "success": False, "output": "",
-            "error": (
-                f"Refusing to start dev server on reserved platform port "
-                f"{preferred}. Use start_dev_server or a project port (3000+)."
-            ),
-            # F4：拒绝发生在任何 spawn 之前 —— 命令从未执行，属 runner_failed
-            # 定义域（交付后审计复核确认：下面 :450/:461/:482 那三处不同，
-            # 它们已经 spawn 过再 terminate_spawned，故不置此位）。
-            "blocked": True, "runner_failed": True,
-        }
 
     own_live_pref = [
         r for r in await asyncio.to_thread(lookup_by_port, preferred)
@@ -324,16 +328,10 @@ async def _run_registered_dev_server(
     if own_on_port:
         await asyncio.to_thread(stop_process_by_port, pid, port)
 
-    if is_reserved_port(port):
-        return {
-            "success": False, "output": "",
-            "error": (
-                f"Refusing to start dev server on reserved platform port "
-                f"{port}. Use start_dev_server or a project port (3000+)."
-            ),
-            # F4：同上，spawn 之前拒绝 = 命令从未执行。
-            "blocked": True, "runner_failed": True,
-        }
+    # 同理，此处原先的 `if is_reserved_port(port)` 守卫也**恒不可达**：
+    # `allocate_project_port` / `lookup_by_port` 只产出项目端口（3000+），
+    # 不可能返回 RESERVED_PORTS 里的值。已删除（保留端口在更早的
+    # `prepare_spawn_command` 就被拦下，见上方注释）。
 
     try:
         if acl_sandbox_active():
@@ -349,12 +347,22 @@ async def _run_registered_dev_server(
                 command, project_id=project_id, preferred_port=port
             )
             if prep_err:
-                # F4：spawn 准备失败 = 命令从未执行（runner_failed）。
-                return {
+                # F4/L3 → L6 修正（2026-09-11）：`prepare_spawn_command` 的
+                # prep_err **不只有 spawn 自身故障** —— 它内部（process_registry
+                # :803）还兜着「命令文本里出现保留端口」的直检，那一条是**调用方
+                # 参数错**（换 3000+ 即可）。原先此处无条件声明 runner_failed，
+                # 会让 agent 收到「不是你的 bug」而原地重撞同一端口。
+                #
+                # 判据改为**按证据归类**：签名表命中哪格就是哪格（与
+                # `classify_blocked_fact` 同源，顺序也是先 runner 再 bad_args）；
+                # 只有两侧都不命中时才落回「spawn 准备失败 = 命令从未执行」
+                # 的默认格，且此时是**真·runner 故障**。
+                _prep_fact = classify_error_text(prep_err) or "runner_failed"
+                return finalize_fact_dict({
                     "success": False, "output": "",
                     "error": prep_err, "blocked": True,
-                    "runner_failed": True,
-                }
+                    "fact": _prep_fact,
+                })
             project_root = await resolve_project_root(project_id)
             sres = await spawn_confined(
                 argv=build_confined_argv(cmd2),
@@ -447,25 +455,27 @@ async def _run_registered_dev_server(
         raw_listen = await asyncio.to_thread(listening_ports_for_pid, proc.pid)
         if raw_listen and all(is_reserved_port(p) for p in raw_listen):
             await asyncio.to_thread(terminate_spawned, proc)
-            return {
+            return finalize_fact_dict({
                 "success": False, "output": "",
                 "error": (
                     f"Refusing reserved LISTEN port(s) {raw_listen} "
                     f"(pid={proc.pid}). Use a project port (3000+)."
                 ),
                 "blocked": True,
-            }
+                "fact": "runner_failed",
+            })
 
     if is_reserved_port(registered_port):
         await asyncio.to_thread(terminate_spawned, proc)
-        return {
+        return finalize_fact_dict({
             "success": False, "output": "",
             "error": (
                 f"Refusing to register reserved platform port "
                 f"{registered_port}."
             ),
             "blocked": True,
-        }
+            "fact": "runner_failed",
+        })
 
     try:
         await asyncio.to_thread(register, ProcessRecord(
@@ -482,11 +492,12 @@ async def _run_registered_dev_server(
             error=str(e), pid=proc.pid, port=registered_port, cwd=cwd[:120],
         )
         await asyncio.to_thread(terminate_spawned, proc)
-        return {
+        return finalize_fact_dict({
             "success": False, "output": "",
             "error": f"Failed to register dev server: {e}",
             "blocked": True,
-        }
+            "fact": "runner_failed",
+        })
 
     port_note = ""
     if not probed and (
@@ -1703,18 +1714,18 @@ async def execute_bash(
     )
     if blocked:
         log.warning("bash.blocked", reason=reason, command_preview=command[:120])
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": f"Error: {reason}", "blocked": True,
-                "runner_failed": True}
+                "fact": "runner_failed"})
 
     from hiveweave.services.eval_seal import sealed_bash_deny_for_workspace
 
     seal_reason = sealed_bash_deny_for_workspace(workspace_path, command)
     if seal_reason:
         log.warning("bash.eval_sealed", command_preview=command[:120])
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": f"Error: {seal_reason}", "blocked": True,
-                "runner_failed": True}
+                "fact": "runner_failed"})
 
     # 1.5. Auto-source .hiveweave/env.sh if the project has one.
     # The project declares its own environment setup.
@@ -1751,9 +1762,9 @@ async def execute_bash(
         # s3-clone_06 P0-3/P0-4：命令从未执行（方言不认）→ runner_failed=1。
         # 此前只有 blocked=1，被 F10 归因成「平台护栏拒绝（权限/沙箱/安全）」，
         # 把"方言不兼容"错指为"安全拦截"，撞坑 Agent 拿到的是错的排查方向。
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": dialect_err, "blocked": True,
-                "runner_failed": True, "dialect_failed": True}
+                "fact": "runner_failed", "dialect_failed": True})
 
     # 尾注在 gate 之后追加（gate 对注释里的原文词条会误抓 head/tail）
     if translated_pair is not None:
@@ -1771,18 +1782,18 @@ async def execute_bash(
         # schema.py 里 F4 的定义域明写「命令未执行（参数注入破坏 / 方言不支持 /
         # **权限** / 审批 / runner 自身故障）」——沙箱拒绝属「权限」，命令
         # 从未执行，必须置 runner_failed，否则归因链缺事实位。
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": "Error: Sandbox violation - workdir must be within workspace",
-                "blocked": True, "runner_failed": True}
+                "blocked": True, "fact": "runner_failed"})
 
     if not Path(cwd).exists():
         # F4 补接线：cwd 不存在 = 命令从未执行（runner_failed）。
         # 该签名在 TEST_DSH_50/51 各出现 2~3 次（幽灵 worktree 前缀路径），
         # 全部因未置位而落在观测盲区里。
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": f"Error: Working directory does not exist: "
                          f"{cwd_display(cwd, workdir)}",
-                "blocked": True, "runner_failed": True}
+                "blocked": True, "fact": "runner_failed"})
 
     cwd_hint = _cwd_style_hint(cwd)
 
@@ -1831,13 +1842,13 @@ async def execute_bash(
 
     if result.get("error"):
         # F4：runner 失败（命令没跑起来）—— spawn 失败 / 方言 / 沙箱拒绝。
-        # 错误已带原因，标记 runner_failed 供收纳事实位（stall 归因先于
+        # 错误已带原因，标记事实位供收纳（stall 归因先于
         # denial，对齐 DSH RunnerFailureRule 顺序）。
-        return {
+        return finalize_fact_dict({
             "success": False, "output": "",
             "error": f"Error: {result['error']}\n{cwd_hint}",
-            "runner_failed": True,
-        }
+            "fact": "runner_failed",
+        })
 
     if result["timed_out"]:
         # F7：超时统一分类 —— command 超时（命令跑起来但没按时完成）。
@@ -1915,17 +1926,17 @@ async def execute_run_command(
     if blocked:
         log.warning("run_command.blocked", reason=reason,
                     command_preview=command[:120])
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": f"Error: {reason}", "blocked": True,
-                "runner_failed": True}
+                "fact": "runner_failed"})
 
     from hiveweave.services.eval_seal import sealed_bash_deny_for_workspace
 
     seal_reason = sealed_bash_deny_for_workspace(workspace_path, command)
     if seal_reason:
         log.warning("run_command.eval_sealed", command_preview=command[:120])
-        return {"success": False, "output": "",
-                "error": f"Error: {seal_reason}", "blocked": True, "runner_failed": True}
+        return finalize_fact_dict({"success": False, "output": "",
+                "error": f"Error: {seal_reason}", "blocked": True, "fact": "runner_failed"})
 
     # R3 P0-2：run_command 同样是被方言混血走的后门（attestation 测试步）。
     # 与 bash/pwsh 工具同一 unix-only gate；native 环境（无 pwsh）gate 闭口。
@@ -1943,9 +1954,9 @@ async def execute_run_command(
     run_dialect_err = _pwsh_dialect_gate(command)
     if run_dialect_err:
         log.info("run_command.dialect_gate", command_preview=command[:120])
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": run_dialect_err, "blocked": True,
-                "runner_failed": True, "dialect_failed": True}
+                "fact": "runner_failed", "dialect_failed": True})
 
     ws = workspace_path or os.getcwd()
     if cwd:
@@ -1955,16 +1966,16 @@ async def execute_run_command(
 
     if not _is_within_workspace(full_cwd, ws):
         # F4 补接线：同 workdir 侧，权限拒绝 = 命令从未执行。
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": "Error: Sandbox violation - cwd must be within workspace",
-                "blocked": True, "runner_failed": True}
+                "blocked": True, "fact": "runner_failed"})
 
     if not Path(full_cwd).exists():
         # F4 补接线：run_command 侧的同一签名（与上面 pwsh 侧对称）。
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": f"Error: Working directory does not exist: "
                          f"{cwd_display(full_cwd, cwd)}",
-                "blocked": True, "runner_failed": True}
+                "blocked": True, "fact": "runner_failed"})
 
     # A-2 (P1-4): 未显式给超时时按工具声明取默认（run_command 保持 120s）。
     safe_timeout = int(timeout_ms or TOOL_DEFAULT_TIMEOUT_MS["run_command"])
@@ -1987,9 +1998,9 @@ async def execute_run_command(
 
     if result.get("error"):
         # F4：runner 失败（命令没跑起来）—— spawn 失败 / 沙箱拒绝。
-        return {"success": False, "output": "",
+        return finalize_fact_dict({"success": False, "output": "",
                 "error": f"Error: {result['error']}",
-                "runner_failed": True}
+                "fact": "runner_failed"})
 
     if result["timed_out"]:
         # F7：command 超时（命令跑起来但未按时完成）。
@@ -2814,9 +2825,13 @@ async def _bash_background(
             if routed.get("success"):
                 return ToolResult.ok(routed.get("output") or "")
             err_msg = routed.get("error") or "Dev server spawn failed"
+            # L3 收口：`routed` 已带权威 fact（保留端口=bad_args / spawn 故障=
+            # runner_failed），重新包成 ToolResult 时**必须原样透传** ——
+            # 丢掉它会退回「无证据的默认分类」，本批要消灭的正是这个。
+            _routed_fact = routed.get("fact")
             if routed.get("blocked"):
-                return ToolResult.blocked_err(err_msg)
-            return ToolResult.err(err_msg)
+                return ToolResult.blocked_err(err_msg, fact=_routed_fact)
+            return ToolResult.err(err_msg, fact=_routed_fact)
 
     attest_task = getattr(params, "task_id", None) or verify_tid
     orig_command = params.command or ""
@@ -2946,7 +2961,9 @@ async def _shell_tool_impl(
     )
     if reserved_err:
         # H3: 保留端口是平台护栏拒绝（复审 P2-1）
-        return ToolResult.blocked_err(reserved_err)
+        # L6（2026-09-11）：改判 **bad_args** —— 模型换个 3000+ 端口即可通过，
+        # 判 runner_failed 会让它收到「不是你的 bug」并原地重撞同一端口。
+        return ToolResult.blocked_err(reserved_err, fact="bad_args")
     cmd = _strip_trailing_ampersand(cmd)
 
     exec_ws = workspace or ""
@@ -3032,7 +3049,7 @@ async def _shell_tool_impl(
     _ff = {
         k: result.get(k)
         for k in (
-            "runner_failed", "command_failed", "injection_applied",
+            "fact", "runner_failed", "command_failed", "injection_applied",
             "timeout_kind", "timeout_ms", "dialect_failed",
         )
         if result.get(k) is not None
@@ -3076,19 +3093,32 @@ def _shell_tool_result(
     if streak_hint:
         err_msg = f"{err_msg}{streak_hint}"
     err_msg = _combine_attestation_output(err_msg, banner, suffix)
-    # F4/F7：事实位透传（runner_failed / command_failed / injection_applied /
-    # timeout_kind / timeout_ms）—— 供 run_steps 收纳，stall 归因不再靠
-    # 猜退出码。**blocked 分支也必须带上**（2026-09-01 实战抓到）：方言门
-    # 与护栏拒绝都是 blocked=True，此前只传 public 把 runner_failed 整个
-    # 丢掉 —— 报告 #4「runner_failed 恒 0」在 blocked 类失败上原样残留。
+    # F4/F7/L3：事实位透传（fact / runner_failed / command_failed /
+    # injection_applied / timeout_kind / timeout_ms）—— 供 run_steps 收纳，
+    # stall 归因不再靠猜退出码。**blocked 分支也必须带上**（2026-09-01 实战
+    # 抓到）：方言门与护栏拒绝都是 blocked=True，此前只传 public 把
+    # runner_failed 整个丢掉 —— 报告 #4「runner_failed 恒 0」在 blocked
+    # 类失败上原样残留。
     _kw: dict[str, Any] = dict(public)
     if fact_flags:
         _kw.update(fact_flags)
+    # L3：fact 走具名参数（不再是 extra 里的裸键），避免与派生属性打架。
+    _fact = _kw.pop("fact", None)
+    # 兼容旧调用方残留的 runner_failed 裸键 → 归一为 fact
+    if _fact is None and _kw.pop("runner_failed", None):
+        _fact = "runner_failed"
+    else:
+        _kw.pop("runner_failed", None)
+    _kw.pop("command_failed", None)
     if blocked:
         # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
         # stall 检测分流，文本/exit code 语义与 err 一致。
-        return ToolResult.blocked_err(err_msg, **_kw)
-    return ToolResult.err(err_msg, **_kw)
+        # blocked 只接受平台侧成因的格；未给或给了调用方成因的格时回落
+        # runner_failed（护栏类出口默认就是「命令从未执行」）。
+        if _fact not in ("runner_failed", "outcome_unknown"):
+            _fact = "runner_failed"
+        return ToolResult.blocked_err(err_msg, fact=_fact, **_kw)
+    return ToolResult.err(err_msg, fact=_fact, **_kw)
 
 
 # ── pwsh 工具（DSH_33 P0：声明式双 Consumer，不做方言转译）──────────
@@ -3231,7 +3261,9 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
     )
     if reserved_err:
         # H3: 保留端口是平台护栏拒绝（复审 P2-1）
-        return ToolResult.blocked_err(reserved_err)
+        # L6（2026-09-11）：改判 **bad_args** —— 模型换个 3000+ 端口即可通过，
+        # 判 runner_failed 会让它收到「不是你的 bug」并原地重撞同一端口。
+        return ToolResult.blocked_err(reserved_err, fact="bad_args")
 
     exec_ws = workspace or ""
     verify_tid: str | None = getattr(params, "task_id", None)
@@ -3285,7 +3317,7 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
     _ff = {
         k: result.get(k)
         for k in (
-            "runner_failed", "command_failed", "injection_applied",
+            "fact", "runner_failed", "command_failed", "injection_applied",
             "timeout_kind", "timeout_ms",
         )
         if result.get(k) is not None

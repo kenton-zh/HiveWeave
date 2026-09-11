@@ -212,9 +212,12 @@ async def start_dev_server_tool(
             )
 
     if is_reserved_port(params.preferred_port):
-        return ToolResult.blocked_err(
+        # L6（2026-09-11）：保留端口 = 调用方参数错（换 3000+ 即可），
+        # 标 blocked+runner_failed 会让 agent 收到「不是你的 bug」并原地重撞。
+        return ToolResult.err(
             f"Port {params.preferred_port} is reserved for HiveWeave. "
-            "Use preferredPort=3000 (or another free project port)."
+            "Use preferredPort=3000 (or another free project port).",
+            fact="bad_args",
         )
 
     work_cwd = workspace
@@ -223,20 +226,25 @@ async def start_dev_server_tool(
 
         full, hint = _resolve_safe_detail(workspace, params.cwd)
         if hint is not None:
-            return ToolResult.blocked_err(f"Error: {hint}")
+            # L6：幽灵 worktree 前缀 = 模型写错路径。
+            return ToolResult.err(f"Error: {hint}", fact="bad_args")
         if full is None:
             return ToolResult.blocked_err("cwd must stay inside workspace")
         work_cwd = full
     if not Path(work_cwd).is_dir():
+        # 保持 blocked/runner_failed：cwd 不存在站在 agent 视角是平台没把
+        # worktree 建好（与「模型写错路径」不同，见 L19 的判据）。
         return ToolResult.blocked_err(
             f"Working directory does not exist: "
-            f"{cwd_display(work_cwd, params.cwd)}"
+            f"{cwd_display(work_cwd, params.cwd)}",
+            fact="runner_failed",
         )
 
     if params.command:
         err = check_command_reserved_ports(params.command)
         if err:
-            return ToolResult.blocked_err(err)
+            # L6：同上 —— 命令里写了保留端口，改命令即可。
+            return ToolResult.err(err, fact="bad_args")
 
     # 阻塞调用（netstat 快照 / taskkill）统一下放线程池，避免卡住事件循环
     await asyncio.to_thread(prune_dead_processes)
