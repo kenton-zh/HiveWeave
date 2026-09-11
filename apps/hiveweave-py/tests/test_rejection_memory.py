@@ -157,6 +157,88 @@ def test_stale_view_carries_typed_code_not_fake_evidence(tmp_path):
     )
 
 
+def test_same_length_same_tick_rewrite_is_still_detected(tmp_path, monkeypatch):
+    """根因回归（2026-09-12）：`(mtime_ns, size)` 同刻度同长度改写必须仍被检出。
+
+    **这是原来那个 flake 的根因**，而它不是 flake：实测「连续无间改写 100 次」
+    两元组漏检 **56/100**（本机 mtime 刻度约 1ms，两次连续写几乎必然同刻度 +
+    同长度 ⇒ 元组逐字节相同）。
+
+    ⚠ 本用例**必须冻结 stat**，不能靠"碰运气撞同刻度"：
+    首版用循环跑 30 次连续改写，实测只有 **2/50** 轮真的落在同一刻度
+    （`record_file_version` 自己在两次写之间做了文件 I/O，把那个毫秒吃掉了），
+    结果把内容摘要比较整段删掉它**照样全绿** —— 是一张假的"已验证"证书。
+    最紧的循环形态也只到 13/100，仍然赌概率。
+
+    ⇒ 改为 **monkeypatch `_stat_segments` 返回冻结的 (mtime_ns, size)**：
+    前两段必然相同（这正是要测的分支），而内容**真的变了**。
+    此时唯一能救回"检出"的只有第三段内容摘要 —— 删掉它就必然红。
+    """
+    from hiveweave.tools import file as file_mod
+
+    f = _write(tmp_path, "tick.txt", "aaaa\n")
+    frozen = file_mod._stat_segments(f)
+
+    def _frozen_stat(_path):
+        return frozen  # mtime 与 size 都冻住：前两段永远"看起来没变"
+
+    # record 与 check 走同一把尺 → 两侧都冻，模拟"同一刻度内的改写"
+    monkeypatch.setattr(file_mod, "_stat_segments", _frozen_stat)
+
+    record_file_version(f)
+    f.write_text("bbbb\n", encoding="utf-8")  # 同长度，内容真变
+
+    assert file_mod.check_file_version(f) == "FS_NOT_OBSERVED", (
+        "前两段相同但内容已变 —— 必须靠第三段内容摘要检出；"
+        "此处返回 None 说明版本戳退回了不比较内容的形态（陈旧检测形同虚设）"
+    )
+
+
+def test_same_tick_branch_really_reads_content(tmp_path, monkeypatch):
+    """护栏的护栏：证明上面那条用例**真的走到了第三段**，不是碰巧前两段就不同。
+
+    直接验"前两段被冻住"这一前提成立 —— 否则上面那条会在错误的位置变绿/变红。
+    """
+    from hiveweave.tools import file as file_mod
+
+    f = _write(tmp_path, "frozen.txt", "aaaa\n")
+    frozen = file_mod._stat_segments(f)
+
+    monkeypatch.setattr(file_mod, "_stat_segments", lambda _p: frozen)
+    record_file_version(f)
+    before = file_mod._content_digest(f)
+    f.write_text("bbbb\n", encoding="utf-8")
+    after = file_mod._content_digest(f)
+
+    assert file_mod._stat_segments(f) == frozen, "stat 未被冻住，用例前提失效"
+    assert before != after, "内容摘要对同长度改写不敏感 —— 第三段也是假的"
+
+
+def test_unchanged_file_is_not_flagged(tmp_path):
+    """反向保护：真的没改就不能报 stale（否则每次都逼重读）。"""
+    from hiveweave.tools.file import check_file_version
+
+    f = _write(tmp_path, "same.txt", "content\n")
+    record_file_version(f)
+    assert check_file_version(f) is None
+    # 连读多次仍然稳定
+    for _ in range(5):
+        assert check_file_version(f) is None
+
+
+def test_record_and_check_use_same_token_shape(tmp_path):
+    """两端必须用同一把尺 —— 登记侧不算摘要则比对失去判据。"""
+    from hiveweave.tools import file as file_mod
+
+    f = _write(tmp_path, "shape.txt", "xyz\n")
+    record_file_version(f)
+    key = str(Path(f).resolve())
+    entry = file_mod._version_cache.get(key)
+    assert entry is not None
+    assert len(entry) == 3, "版本戳必须是 (mtime_ns, size, digest) 三段"
+    assert entry[2], "登记侧的内容摘要不能为空 —— 否则比对无意义"
+
+
 def test_edit_after_read_allowed_and_updates_version(tmp_path):
     f = _write(tmp_path, "c.txt", "one two\n")
     record_file_version(f)

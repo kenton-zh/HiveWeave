@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import threading
@@ -31,26 +32,64 @@ from hiveweave.util.tree_label import (
 
 log = structlog.get_logger(__name__)
 
-# ── 文件版本戳（45 轮 P1「拒绝无记忆」③）───────────────────────────
-# 记录本进程内最近一次成功 read/write 访问后的 (mtime_ns, size)；patch 的
-# update op 写盘前比对——文件在最近访问后被外部（git 同步/其他 agent/平台
-# 工具）改过 → 陈旧视图早拒逼重读。进程内即可：陈旧窗口是 turn 级的。
+# ── 文件版本戳（45 轮 P1「拒绝无记忆」③；2026-09-12 换三段短路）─────
+# 记录本进程内最近一次成功访问后的版本戳；patch 的 update op 写盘前比对——
+# 文件在最近访问后被外部（git 同步/其他 agent/平台工具）改过 → 陈旧视图
+# 早拒逼重读。进程内即可：陈旧窗口是 turn 级的。
 # 键是进程级路径（非 per-agent）：A 读 → B 写 → A edit 的场景 B 的写已
 # 刷新戳，A 仍会漏判——已知的精度换简（audit P3-1），edit 本身对新读内容
 # 锚定不会写坏。
+#
+# **2026-09-12：`(mtime_ns, size)` 两元组有 56% 确定性漏检**（不是 flake）。
+# 实测「连续无间改写 100 次」漏检 56/100：本机文件系统 mtime 刻度约 1ms，
+# 两次连续写几乎必然落在同一刻度 + 同长度 ⇒ 元组**逐字节相同** ⇒ 陈旧
+# 检测形同虚设（sha256 在同批数据上漏检 0/100）。
+#
+# 修法 = 三段**短路**（`_version_token`）：先比 (mtime_ns, size)，**只在前
+# 两段相同时才算内容摘要**。这样「明显变了」的常见情形仍是 O(1) stat，
+# 只在「看起来没变」时才付 hash 代价 —— 而那恰好就是原来会漏检的分支。
+#
+# 为什么不照 DSH `fsio.ts:74-76 versionOf` 用 `ctimeNs`：**Windows 上
+# `st_ctime_ns` 是创建时间**（`st_birthtime` 别名），实测同长度/变长度改写
+# 后**都不变** —— 加了等于加个常量，是「改了但无效」的假修复。DSH 的
+# `versionOf` 是 POSIX 视角（其主体跑 Linux/macOS）。**借判据不借字段**
+# （MEMORY.md 纪律 #13）。
 _version_lock = threading.Lock()
 _VERSION_CACHE_CAP = 4096
-_version_cache: dict[str, tuple[int, int]] = {}
+# 值 = (mtime_ns, size, digest)；digest 仅在"前两段相同"时才算，否则为 ""。
+_version_cache: dict[str, tuple[int, int, str]] = {}
+_HASH_CHUNK = 1 << 20  # 1MiB
+
+
+def _content_digest(path: str | Path) -> str:
+    """文件内容摘要；读失败返回 ""（best-effort，不因它引入新故障面）。"""
+    try:
+        h = hashlib.blake2b(digest_size=8)
+        with open(path, "rb") as fh:
+            while chunk := fh.read(_HASH_CHUNK):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def _stat_segments(path: str | Path) -> tuple[int, int]:
+    st = Path(path).stat()
+    return st.st_mtime_ns, st.st_size
 
 
 def record_file_version(path: str | Path) -> None:
-    """登记一次成功访问后的文件版本（stat 失败静默跳过）。"""
+    """登记一次成功访问后的文件版本（stat 失败静默跳过）。
+
+    **记录时必须带内容摘要** —— 登记侧是"我看到了什么"，此处若懒惰不算
+    hash，后面比对就失去了判据（两端都要有同一把尺）。
+    """
     try:
-        st = Path(path).stat()
-        key = str(Path(path).resolve())
-        cur = (st.st_mtime_ns, st.st_size)
+        mtime_ns, size = _stat_segments(path)
     except OSError:
         return
+    key = str(Path(path).resolve())
+    cur = (mtime_ns, size, _content_digest(path))
     with _version_lock:
         if len(_version_cache) >= _VERSION_CACHE_CAP and key not in _version_cache:
             # 插入序淘汰最旧一半（dict 保插入序；audit P2-2 防无界增长）
@@ -75,19 +114,28 @@ def check_file_version(path: str | Path) -> str | None:
     ⇒ 现在只回**动作**（重读后再改），不伪装成"我给你看了差异"。
     差异维度（mtime / hash）对**平台诊断**仍有用，但它属于日志，
     **不属于给模型的回执** —— 两处混用正是原 bug 的来源。
+
+    三段短路（2026-09-12）：先比 `(mtime_ns, size)`；**只有前两段相同
+    才算内容摘要**。理由见上方版本戳注释 —— 两元组在同刻度同长度改写时
+    有 56% 漏检，必须靠内容兜底；而常见的"明显变了"仍走 O(1) stat。
     """
     try:
-        st = Path(path).stat()
-        key = str(Path(path).resolve())
-        cur = (st.st_mtime_ns, st.st_size)
+        mtime_ns, size = _stat_segments(path)
     except OSError:
         return None
+    key = str(Path(path).resolve())
     with _version_lock:
         known = _version_cache.get(key)
-    if known is None or known == cur:
+    if known is None:
         return None
-    # typed code（DSH 风格：可机检、可路由，而不是自由文本）
-    return "FS_NOT_OBSERVED"
+    # 前两段（廉价、O(1)）：不同即"确实变了"，无需读内容
+    if (known[0], known[1]) != (mtime_ns, size):
+        return "FS_NOT_OBSERVED"
+    # 前两段相同 → 可能是"真的没变"，也可能是**同刻度同长度改写**。
+    # 只有这里才付内容摘要的代价（原来会漏检的正是这个分支）。
+    if known[2] != _content_digest(path):
+        return "FS_NOT_OBSERVED"
+    return None
 
 
 def clear_file_versions_for_tests() -> None:
