@@ -146,3 +146,158 @@ class TestBoundaryLanding:
             boundary_root=ROOT, temp_dir=TEMP,
         )
         assert v is not None and v.action == "deny"
+
+
+# ── P0-1：相对路径删除必须有正确的 cwd 解析基准 ──────────────────────
+#
+# 审计实测：`resolve_delete_landing_for_agent` 从不传 cwd ⇒ 相对目标按
+# **后端进程 CWD** 解析 ⇒ 一律判越界 ⇒ agent「自己建的自己删」全部被误杀
+# （且是 deny 不是 ask，连审批机会都没有 —— 比不做落点判定更糟）。
+#
+# 下面**走真实调用形态** `resolve_delete_landing_for_agent`（审计要求：
+# 不能只直调 `resolve_delete_landing` 绕过 cwd 装配），只 mock 授权树事实。
+
+
+class TestAgentDeleteLandingCwd:
+    """P0-1 守卫：经真实调用形态验证 cwd 装配。"""
+
+    @staticmethod
+    def _patch_tree(monkeypatch, *, worktree: str):
+        """把 agent 的授权树事实钉死为 ``worktree``（其余沿用真实实现）。"""
+        from unittest.mock import AsyncMock
+
+        import hiveweave.db.meta as meta_mod
+        import hiveweave.services.acl_sandbox.integration as integ
+        import hiveweave.services.worktree_review as wr
+
+        monkeypatch.setattr(
+            meta_mod, "get_agent_by_id",
+            AsyncMock(return_value={"project_id": "p1"}),
+        )
+        monkeypatch.setattr(
+            wr, "agent_worktree_path", AsyncMock(return_value=worktree),
+        )
+        monkeypatch.setattr(
+            integ, "fetch_additional_writable_dirs",
+            AsyncMock(return_value=()),
+        )
+
+    async def test_relative_delete_without_cwd_is_allowed(
+        self, monkeypatch, tmp_path
+    ):
+        """审计复现点：相对路径删除**不传 cwd** 时不得被误杀。
+
+        boundary 即该 agent 的授权树根、也是它的执行根 ⇒ 缺省回退 boundary
+        后 `sub/x` 落在树内 → None（allow）。旧实现（无 cwd 回退、按进程 CWD
+        解析）会判越界 —— 本用例即该回归的守卫。
+        """
+        from hiveweave.services.command_guard import (
+            resolve_delete_landing_for_agent,
+        )
+
+        wt = tmp_path / ".hiveweave" / "worktrees" / "A044"
+        wt.mkdir(parents=True)
+        self._patch_tree(monkeypatch, worktree=str(wt))
+
+        v = await resolve_delete_landing_for_agent("rm -rf sub", agent_id="a1")
+        assert v is None, f"相对路径删除被误杀：{v}"
+
+    async def test_relative_delete_with_explicit_cwd_is_allowed(
+        self, monkeypatch, tmp_path
+    ):
+        """显式传入执行目录（= 授权树根）→ 同样放行。"""
+        from hiveweave.services.command_guard import (
+            resolve_delete_landing_for_agent,
+        )
+
+        wt = tmp_path / ".hiveweave" / "worktrees" / "A044"
+        wt.mkdir(parents=True)
+        self._patch_tree(monkeypatch, worktree=str(wt))
+
+        v = await resolve_delete_landing_for_agent(
+            "rm -rf sub", agent_id="a1", cwd=str(wt)
+        )
+        assert v is None
+
+    async def test_relative_escape_is_denied(self, monkeypatch, tmp_path):
+        """相对路径逃逸（`../outside`）必须 deny —— 放宽不能变成拆隔离。"""
+        from hiveweave.services.command_guard import (
+            resolve_delete_landing_for_agent,
+        )
+
+        wt = tmp_path / ".hiveweave" / "worktrees" / "A044"
+        wt.mkdir(parents=True)
+        self._patch_tree(monkeypatch, worktree=str(wt))
+
+        v = await resolve_delete_landing_for_agent(
+            "rm -rf ../outside", agent_id="a1"
+        )
+        assert v is not None
+        assert v.blocked is True and v.action == "deny"
+
+    async def test_absolute_outside_is_denied(self, monkeypatch, tmp_path):
+        """绝对路径越界仍 deny。"""
+        from hiveweave.services.command_guard import (
+            resolve_delete_landing_for_agent,
+        )
+
+        wt = tmp_path / ".hiveweave" / "worktrees" / "A044"
+        wt.mkdir(parents=True)
+        self._patch_tree(monkeypatch, worktree=str(wt))
+
+        outside = tmp_path / "other-place"
+        outside.mkdir(parents=True)
+        v = await resolve_delete_landing_for_agent(
+            f"rm -rf {outside.as_posix()}", agent_id="a1"
+        )
+        assert v is not None and v.action == "deny"
+
+
+# ── P0-2：`/` 开头的绝对 POSIX 路径不得被当开关吞掉 ──────────────────
+#
+# 审计实测：`_extract_delete_targets(["rm","-rf","-q","/outside",
+# "D:/proj/build"])` 返回 `(["D:/proj/build"], False)` —— `/outside`
+# **静默丢弃** ⇒ 混入一个界内目标即整体 allow，真越界目标被放行。
+
+
+class TestSlashLeadingAbsolutePaths:
+    def test_posix_absolute_survives_with_sibling_target(self):
+        targets, indirect = _extract_delete_targets(
+            ["rm", "-rf", "-q", "/etc/passwd", "D:/proj/build"]
+        )
+        assert indirect is False
+        assert "/etc/passwd" in targets, f"绝对路径被当开关吞掉：{targets}"
+
+    def test_posix_absolute_alone_survives(self):
+        targets, _ = _extract_delete_targets(["rm", "-rf", "/outside"])
+        assert targets == ["/outside"]
+
+    def test_root_slash_survives(self):
+        targets, _ = _extract_delete_targets(["rm", "-rf", "/"])
+        assert "/" in targets
+
+    def test_cmd_single_letter_switches_still_skipped(self):
+        """cmd 的 `/s /q /f` 仍是开关 —— 修复不能把开关当路径。"""
+        targets, _ = _extract_delete_targets(
+            ["del", "/s", "/q", "D:/proj/build"]
+        )
+        assert targets == ["D:/proj/build"]
+
+    def test_mixed_cmd_switch_and_absolute_denies(self, ):
+        """`del /s /q /outside D:/proj/build`：开关跳过，两个目标都要参与判定。
+
+        这是审计给的原始反例：修复前 `D:/proj/build` 在界内 ⇒ 整体 allow，
+        `/outside` 的真越界被静默放行。
+        """
+        from hiveweave.services.command_guard import resolve_delete_landing
+
+        targets, _ = _extract_delete_targets(
+            ["del", "/s", "/q", "/outside", "D:/proj/build"]
+        )
+        assert "/outside" in targets
+        assert "D:/proj/build" in targets
+        v = resolve_delete_landing(
+            "del /s /q /outside D:/proj/build",
+            boundary_root="D:/proj", temp_dir="D:/proj/.hiveweave/sandbox-temp/a1",
+        )
+        assert v is not None and v.action == "deny", "混合场景必须 deny"

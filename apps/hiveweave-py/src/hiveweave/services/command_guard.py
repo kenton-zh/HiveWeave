@@ -399,7 +399,15 @@ def _extract_delete_targets(tokens: list[str]) -> tuple[list[str], bool]:
             has_indirect = True
             i += 1
             continue
-        if tl.startswith("-") or tl.startswith("/"):
+        # ── P0-2：`/` 开头**不必然是开关** ────────────────────────────
+        # 绝对 POSIX 路径（`/etc/passwd`、`/`）与 cmd 单字母开关（`/s` `/q`）
+        # 都以 `/` 开头。此前一律当开关跳过 ⇒ 界外目标被**静默丢弃**，
+        # 混入一个界内目标即整体 allow（真越界目标放行，比不判更危险）。
+        if tl.startswith("-"):
+            if _looks_like_path_token(tok):
+                targets.append(tok)  # 防御：`-` 开头但确像路径（罕见）
+                i += 1
+                continue
             # PowerShell 的 `-,` 逗号分隔也在此；`:foo` 参数值型开关
             if tl.replace("-", "").replace("/", "").startswith("path"):
                 if i + 1 < n:
@@ -413,12 +421,61 @@ def _extract_delete_targets(tokens: list[str]) -> tuple[list[str], bool]:
                 continue
             i += 1
             continue
+        if tok.startswith("/"):
+            if _is_cmd_style_switch(tok, tokens[0]):
+                i += 1
+                continue
+            # `/` 开头的绝对路径候选 → **必须**参与边界判定（宁保守勿放行）
+            targets.append(tok)
+            i += 1
+            continue
         if tok in ("|", "&&", "||", ";", "&"):
             i += 1
             continue
         targets.append(tok)
         i += 1
     return targets, has_indirect
+
+
+# cmd.exe 删除族的已知单字母/短开关（`del /s /q /f /a /p` 等）。
+# 只在删除族命令上下文里把 `/x` 当开关 —— 否则 `/etc` 这类路径会被误吞。
+_CMD_DELETE_SWITCHES = frozenset(
+    {"s", "q", "f", "a", "p", "r", "n", "d", "c", "y", "?"}
+)
+
+
+def _is_cmd_style_switch(tok: str, first_token: str) -> bool:
+    """`/x` 是否属 cmd 风格开关（而非 POSIX 绝对路径）。
+
+    判据（误判方向刻意保守 —— 宁可把开关当路径候选 → deny，也不把路径当
+    开关 → 放行）：
+    - 命令必须是 cmd/del/rmdir 族（`rm` 的 `/` 参数在 POSIX 语义下不是开关）；
+    - token 形如 `/` + **单个字母**（可选尾随 `:` 或 `-`），且该字母在已知集合里。
+    含再一个 `/`（`/etc/passwd`）、长度 >2 的单段（`/outside`）都**不是**开关。
+    """
+    if first_token.lower() not in _CMD_DELETE_FAMILY_CMDS:
+        return False
+    body = tok[1:]
+    if len(body) == 1 and body.lower() in _CMD_DELETE_SWITCHES:
+        return True
+    # `/s:` / `/a:-` 这类带值形态（cmd 允许 `/a:attributes`）
+    head = body.split(":", 1)[0].split("-", 1)[0]
+    return len(head) == 1 and head.lower() in _CMD_DELETE_SWITCHES
+
+
+# cmd 语义下 `/x` 可能是开关的命令（POSIX 的 rm 不在此 —— 它的 `/x` 是路径）
+_CMD_DELETE_FAMILY_CMDS = frozenset({"del", "erase", "rd", "rmdir"})
+
+
+def _looks_like_path_token(tok: str) -> bool:
+    """`-` 开头的 token 是否确像路径（防御性；用于避免误判）。
+
+    只认强信号：含路径分隔符组合（`-/`、`-\\`、`:\\`）或 Windows 盘符形态
+    （`-:/`）。普通开关（`-rf`、`-Recurse`、`-Force`）不命中。
+    """
+    return bool(
+        re.search(r"^-[\\/]|^-[A-Za-z]:[\\/]", tok)
+    )
 
 
 def resolve_delete_landing(
@@ -486,7 +543,7 @@ def resolve_delete_landing(
 
 
 async def resolve_delete_landing_for_agent(
-    command: str, *, agent_id: str
+    command: str, *, agent_id: str, cwd: str | None = None
 ) -> GuardVerdict | None:
     """#15：以本 agent 的**授权树**判定删除命令落点（授权事实与沙箱同源）。
 
@@ -496,6 +553,15 @@ async def resolve_delete_landing_for_agent(
     - ``temp_dir`` = ``acl_sandbox.policy.resolve_temp_dir(root, agent_id)``
       （``.hiveweave/sandbox-temp/<agent>``）；
     - ``extra_dirs`` = ``acl_sandbox.integration.fetch_additional_writable_dirs``。
+
+    ``cwd``（P0-1 修复）：**命令的实际执行目录**，是相对路径目标的解析基准。
+    调用方（``tools/bash.py``）必须传与 bash 真实解析一致的目录
+    （``workspace_path / workdir``）—— 不传会让相对目标按**后端进程 CWD**
+    解析 ⇒ 一律判越界，把「自己建的自己删」变成「全都删不了」（比不做落点
+    判定更糟，且进不了 ask，用户连审批机会都没有）。
+    缺省回退 ``boundary``：boundary 就是该 agent 的授权树根，也是它的执行根
+    （worktree agent 的 workspace_path 即 worktree；项目根角色即项目根），
+    在调用方未提供时这是最保守且与沙箱一致的选择。
 
     解析失败/无 agent → None（不发明规则，退回规则表既有行为）。
     """
@@ -529,6 +595,8 @@ async def resolve_delete_landing_for_agent(
             boundary_root=boundary,
             temp_dir=temp_dir,
             extra_dirs=extra,
+            # P0-1：相对目标的解析基准 = 实际执行目录；缺省回退授权树根。
+            cwd=(cwd or "").strip() or boundary,
         )
     except Exception:  # noqa: BLE001 — 解析失败不引入新故障面（退回规则表）
         log.debug("delete_landing_resolve_failed", agent_id=aid)
